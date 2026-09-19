@@ -5,6 +5,8 @@
 //! byte-identical with and without the wrapper.
 #![cfg(unix)]
 
+use std::ffi::OsString;
+use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::PermissionsExt;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -71,6 +73,42 @@ fn exec_preserves_exit_codes_args_and_streams() {
 }
 
 #[test]
+fn exec_preserves_non_utf8_argv_and_compiler_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let compiler = write_script(
+        dir.path(),
+        "compiler",
+        "printf '%s\\n' \"$@\"\necho compiler-stderr >&2\nexit 23\n",
+    );
+    let raw_compiler = dir.path().join(OsString::from_vec(b"compiler-\xff".to_vec()));
+    std::fs::copy(&compiler, &raw_compiler).unwrap();
+    let raw_arg = OsString::from_vec(b"source-\xfe.rs".to_vec());
+    let cases = [
+        (&compiler, vec![raw_arg.clone(), OsString::new(), "café".into()]),
+        (&raw_compiler, vec!["source.rs".into()]),
+        (&raw_compiler, vec![raw_arg]),
+    ];
+
+    for (executable, args) in cases {
+        let direct = Command::new(executable).args(&args).output().unwrap();
+        assert_eq!(direct.status.code(), Some(23));
+        let wrapped = Command::new(wrap())
+            .arg(executable)
+            .args(&args)
+            .envs(wrap_env(dir.path()))
+            .output()
+            .unwrap();
+        assert_eq!(wrapped.status, direct.status, "wrapper must not panic");
+        assert_eq!(wrapped.stdout, direct.stdout, "argv bytes changed");
+        assert_eq!(wrapped.stderr, direct.stderr, "compiler stderr changed");
+        assert!(
+            !dir.path().join("breaker").exists(),
+            "unrepresentable argv must bypass observation, not alter breaker state"
+        );
+    }
+}
+
+#[test]
 fn exec_preserves_death_by_signal() {
     let dir = tempfile::tempdir().unwrap();
     let fake = write_script(dir.path(), "fake-rustc", "kill -TERM $$\n");
@@ -125,6 +163,72 @@ fn probes_skip_state_entirely() {
     assert!(
         !breaker.exists(),
         "a probe must not touch breaker state at all"
+    );
+}
+
+#[test]
+fn busy_breaker_in_another_process_does_not_block_compiler_exec() {
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("compiler-ran");
+    let fake = write_script(
+        dir.path(),
+        "fake-rustc",
+        "printf ran > \"$RABS_TEST_COMPILER_MARKER\"\nexit 42\n",
+    );
+    let guard = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(dir.path().join("breaker.lock"))
+        .unwrap();
+    guard.try_lock().unwrap();
+
+    let mut child = Command::new(wrap())
+        .arg(&fake)
+        .args(["--crate-name", "fx"])
+        .envs(wrap_env(dir.path()))
+        .env("RABS_TEST_COMPILER_MARKER", &marker)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    // A watchdog, not a latency benchmark: a blocking lock must not hang
+    // the whole test runner. The parent retains the lock until child exit.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            drop(guard);
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("wrapper waited for another process's breaker lock");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(status.code(), Some(42));
+    assert_eq!(std::fs::read(&marker).unwrap(), b"ran");
+    assert!(!dir.path().join("breaker").exists());
+    drop(guard);
+
+    // After the holder exits, a fresh wrapper may consult and record the
+    // absent daemon normally. A stale lock file must not strand it open.
+    let status = Command::new(wrap())
+        .arg(&fake)
+        .args(["--crate-name", "fx"])
+        .envs(wrap_env(dir.path()))
+        .env("RABS_TEST_COMPILER_MARKER", &marker)
+        .status()
+        .unwrap();
+    assert_eq!(status.code(), Some(42));
+    let state = std::fs::read(dir.path().join("breaker")).unwrap();
+    assert_eq!(
+        rabs_protocol::wrapper_breaker::decode_state(&state).unwrap(),
+        rabs_protocol::wrapper_breaker::BreakerState::Closed {
+            consecutive_failures: 1,
+        }
     );
 }
 
@@ -196,14 +300,27 @@ fn daemon_alive_consult_succeeds_and_breaker_stays_closed() {
         std::thread::sleep(Duration::from_millis(10));
     }
 
-    let fake = write_script(dir.path(), "fake-rustc", "exit 0\n");
+    let fake = write_script(
+        dir.path(),
+        "fake-rustc",
+        "printf '%s' \"$RABS_TEST_BINARY_ENV\"\nexit 0\n",
+    );
     let breaker = dir.path().join("breaker");
+    let raw_value = b"binary-\xff\xfe";
     for _ in 0..5 {
         let mut command = Command::new(wrap());
         command.arg(&fake).args(["--crate-name", "fx"]);
         command.env("RABS_BREAKER_FILE", &breaker);
         command.env("RABS_SOCKET_PATH", &socket);
-        assert!(command.status().unwrap().success());
+        // Exercise observation, not merely the daemon-dead early return.
+        // Neither unrelated values, Cargo values, nor non-UTF-8 names
+        // may make enumeration panic or rewrite the compiler environment.
+        command.env("RABS_TEST_BINARY_ENV", OsString::from_vec(raw_value.to_vec()));
+        command.env("CARGO_RABS_BINARY_ENV", OsString::from_vec(raw_value.to_vec()));
+        command.env(OsString::from_vec(b"RABS_TEST_\xff".to_vec()), "untouched");
+        let output = command.output().unwrap();
+        assert!(output.status.success(), "{:?}", output.stderr);
+        assert_eq!(output.stdout.as_slice(), raw_value);
     }
     let decoded =
         rabs_protocol::wrapper_breaker::decode_state(&std::fs::read(&breaker).unwrap()).unwrap();
