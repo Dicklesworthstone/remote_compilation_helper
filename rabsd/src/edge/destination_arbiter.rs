@@ -310,7 +310,7 @@ mod tests {
                     Ok(InstallScope::OwnedSubtree)
                 );
                 assert_eq!(
-                    arbiter.authorize_install(&owner, &format!("{alias}/gen.rs")),
+                    arbiter.authorize_install(&owner, format!("{alias}/gen.rs")),
                     Ok(InstallScope::OwnedFile)
                 );
             }
