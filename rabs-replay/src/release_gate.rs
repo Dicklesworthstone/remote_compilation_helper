@@ -386,10 +386,25 @@ mod tests {
         // no public constructor, so the ONLY way to reach a verdict is
         // through a passing gate. A refusal is an `Err` carrying a
         // `ReleaseRefusal`, which has no path to one.
-        let served_divergence = report(vec![row("cargo build", true, true)], 0, 0);
+        // Enough rows to clear `minimum_replayed`, so what refuses is
+        // the served divergence itself and not thin coverage — the
+        // checks run strictest-first, and an under-covered run would
+        // refuse earlier for an unrelated reason.
+        let served_divergence = report(
+            vec![
+                row("cargo build", true, true),
+                row("cargo test", false, true),
+                row("cargo check", false, false),
+            ],
+            0,
+            0,
+        );
         let refusal = evaluate_release_gate(&served_divergence, &policy())
             .expect_err("a served divergence must refuse");
-        assert!(matches!(refusal, ReleaseRefusal::ServedDivergence { .. }));
+        assert!(
+            matches!(refusal, ReleaseRefusal::ServedDivergence { .. }),
+            "expected a served divergence, got {refusal:?}"
+        );
         // If a future edit gave `PromotionAuthorized` public fields or a
         // constructor, this comment is the thing that was violated; the
         // compiler cannot say so on its own.
