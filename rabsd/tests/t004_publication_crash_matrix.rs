@@ -58,8 +58,10 @@ use rabs_cas::publication::{
 };
 use rabs_cas::serving_state::{ServeDecision, serving_gate};
 use rabs_cas::test_support::{
-    divergent_offer_with_manifest_bytes, install_admission_world, install_offer_closure,
-    offer_serving_object, sample_action_key, sample_expected_descriptor,
+    FixtureAttemptIds, divergent_offer_with_manifest_bytes, install_admission_world,
+    install_admission_world_with_ids, install_offer_closure, offer_serving_object,
+    offer_with_manifest_bytes, offer_with_manifest_bytes_with_ids, sample_action_key,
+    sample_expected_descriptor,
 };
 use rabs_protocol::result_identity::ObjectId;
 use rabsd::coord::live::{CoordLive, ExpectedOutputs, ServeOutcome, cluster_id};
@@ -88,6 +90,26 @@ const PHASES: [&str; 4] = [
 /// The artifact bytes the committed action serves.
 fn artifact() -> Vec<u8> {
     b"the compiled rlib bytes a worker uploaded".repeat(64)
+}
+
+/// Put the artifact bytes in the byte store and return their identity.
+fn put_artifact(cas: &LiveCas) -> ObjectId {
+    let bytes = artifact();
+    let mut store = cas.store().lock().expect("store lock");
+    let declared = digest_set(&bytes, DigestRequest::default(), None)
+        .expect("digest")
+        .atp_content_id;
+    let mut reader: &[u8] = &bytes;
+    put_if_absent(
+        cas.layout(),
+        &mut *store,
+        &declared,
+        &mut reader,
+        PutLimits::default(),
+        DurabilityPolicy::FULL,
+    )
+    .expect("put artifact");
+    ObjectId(declared)
 }
 
 fn store_manifest_object(cas: &LiveCas, offer: &OfferPreparedActionResult, bytes: &[u8]) {
@@ -129,25 +151,20 @@ fn drive_to(phase: &str, state_dir: &Path) -> ! {
         .acquire_boot_authority(&cluster_id())
         .expect("authority");
 
-    let object = {
-        let bytes = artifact();
-        let mut store = cas.store().lock().expect("store lock");
-        let declared = digest_set(&bytes, DigestRequest::default(), None)
-            .expect("digest")
-            .atp_content_id;
-        let mut reader: &[u8] = &bytes;
-        put_if_absent(
-            cas.layout(),
-            &mut *store,
-            &declared,
-            &mut reader,
-            PutLimits::default(),
-            DurabilityPolicy::FULL,
-        )
-        .expect("put artifact");
-        ObjectId(declared)
+    // Only the serve phase needs an offer whose output is real bytes on
+    // disk. The others use the id-parameterisable fixture, because
+    // `t004_a_retry_after_a_crash_converges_and_never_double_commits`
+    // has to re-offer the IDENTICAL manifest under fresh attempt ids —
+    // a second incarnation's boot closes the prior generation and the
+    // never-reuse high-water burns its id, so the retry cannot reuse
+    // them, and no public fixture builds a servable offer with custom
+    // ids.
+    let (offer, manifest_bytes) = if phase == PHASE_SERVED {
+        let object = put_artifact(&cas);
+        offer_serving_object(&authority, &object)
+    } else {
+        offer_with_manifest_bytes(&authority)
     };
-    let (offer, manifest_bytes) = offer_serving_object(&authority, &object);
     {
         let mut store = cas.store().lock().expect("store lock");
         install_admission_world(&mut *store, &authority);
@@ -225,11 +242,15 @@ fn now_micros() -> i64 {
 #[test]
 #[ignore = "spawned by the T004 matrix parent; aborts by design"]
 fn t004_crash_child() {
-    let Ok(phase) = std::env::var(PHASE_ENV) else {
-        panic!("{PHASE_ENV} must be set: this test is only ever spawned by the matrix");
+    // Returning quietly when unsteered keeps `cargo test -- --ignored`
+    // green. It cannot weaken the matrix: the parent only accepts a
+    // phase whose fsynced sentinel is present, so a child that returned
+    // without doing the work fails the parent rather than passing it.
+    let (Ok(phase), Ok(state_dir)) = (std::env::var(PHASE_ENV), std::env::var(STATE_ENV)) else {
+        eprintln!("t004_crash_child: not steered by the matrix ({PHASE_ENV} unset); nothing to do");
+        return;
     };
-    let state_dir = PathBuf::from(std::env::var(STATE_ENV).expect("state dir"));
-    drive_to(&phase, &state_dir);
+    drive_to(&phase, &PathBuf::from(state_dir));
 }
 
 /// Run the child to `phase` over `state_dir` and require that it died by
@@ -255,7 +276,7 @@ fn crash_at(phase: &str, state_dir: &Path) {
     );
     assert_eq!(
         output.status.signal(),
-        Some(libc_sigabrt()),
+        Some(SIGABRT),
         "phase {phase}: expected SIGABRT from abort()"
     );
     // And it died where we meant it to. Without this a child that
@@ -270,10 +291,8 @@ fn crash_at(phase: &str, state_dir: &Path) {
     );
 }
 
-/// SIGABRT, without pulling in a libc dependency for one constant.
-const fn libc_sigabrt() -> i32 {
-    6
-}
+/// SIGABRT, spelled out rather than pulling in libc for one constant.
+const SIGABRT: i32 = 6;
 
 /// Boot the shipped daemon over the store and return its output: the
 /// product's own reconcile is the recovery oracle.
@@ -303,6 +322,33 @@ fn publications_for_sample(store: &mut SqlMetadataStore<RusqliteEngine>) -> Vec<
 }
 
 #[test]
+fn t004_the_harness_rejects_a_child_that_did_not_crash_where_it_was_told() {
+    // Teeth for the matrix itself. Everything below depends on
+    // `crash_at` refusing to accept a child that did not reach its
+    // phase — without that, a child that died early would still look
+    // like a successful injection and every oracle would be asserted
+    // against a store the phase never touched.
+    //
+    // Steered at a phase that does not exist, the child does the setup
+    // and the commit and then panics instead of reaching `die_at`, so
+    // it exits with a code rather than a signal and writes no sentinel.
+    // `crash_at` must reject that.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let outcome = std::panic::catch_unwind(|| {
+        crash_at("no-such-phase", dir.path());
+    });
+    assert!(
+        outcome.is_err(),
+        "crash_at accepted a child that never reached a phase: the matrix's \
+         protection against vacuous passes does not work"
+    );
+    assert!(
+        !dir.path().join("reached-no-such-phase").exists(),
+        "no sentinel may exist for a phase that was never reached"
+    );
+}
+
+#[test]
 fn t004_every_publication_phase_survives_a_real_process_death() {
     for phase in PHASES {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -323,12 +369,15 @@ fn t004_every_publication_phase_survives_a_real_process_death() {
         );
         assert!(
             stdout.contains("\"serving_refused\":false"),
-            "phase {phase}: reconcile refused serving after the crash: {stdout}"
+            "phase {phase}: reconcile refused serving after the crash\
+             \nSTDOUT:{stdout}\nSTDERR:{stderr}"
         );
-        assert!(
-            stderr.contains("\"kind\":\"rabsd-recovery\""),
-            "phase {phase}: the boot marker must report the unclean prior incarnation: {stderr}"
-        );
+        // Deliberately NOT asserted: the "rabsd-recovery" boot-marker
+        // line. The child crashes the coordinator in-process, so no
+        // daemon incarnation ever wrote a marker — asserting recovery
+        // here would be asserting an incarnation that never existed.
+        // `committed_state_survives_a_kill_dash_nine_and_reboot` covers
+        // the daemon-incarnation marker; this matrix covers the store.
 
         // 2. Publication state is exactly what the phase reached — never
         //    partial, never doubled.
@@ -356,9 +405,13 @@ fn t004_every_publication_phase_survives_a_real_process_death() {
 
         // 3. Serving reflects the phase, and quarantine survives the
         //    crash rather than being forgotten into a hit.
-        let decision =
-            serving_gate(&mut store, &digest_key(&sample_action_key()), now_micros(), 0)
-                .expect("gate");
+        let decision = serving_gate(
+            &mut store,
+            &digest_key(&sample_action_key()),
+            now_micros(),
+            0,
+        )
+        .expect("gate");
         match phase {
             PHASE_UPLOADED => assert!(
                 !matches!(decision, ServeDecision::Servable),
@@ -414,35 +467,25 @@ fn t004_a_retry_after_a_crash_converges_and_never_double_commits() {
         crash_at(phase, &state_dir);
         assert!(reboot(&state_dir).status.success(), "phase {phase}: reboot");
 
-        // A brand-new incarnation redoes the offer.
+        // A brand-new incarnation redoes the offer. Its boot closes the
+        // dead incarnation's generation and the never-reuse high-water
+        // burns that id, so the reissue MUST carry fresh attempt ids —
+        // reusing them is refused by exactly the fence T039 pins.
         let cas = Arc::new(mount_and_reconcile(&state_dir.join("cas")).expect("remount"));
         let coord = CoordLive::with_cas(Arc::clone(&cas));
         let authority = coord
             .acquire_boot_authority(&cluster_id())
             .expect("re-acquire authority");
-        let object = {
-            let bytes = artifact();
-            let mut store = cas.store().lock().expect("store lock");
-            let declared = digest_set(&bytes, DigestRequest::default(), None)
-                .expect("digest")
-                .atp_content_id;
-            let mut reader: &[u8] = &bytes;
-            put_if_absent(
-                cas.layout(),
-                &mut *store,
-                &declared,
-                &mut reader,
-                PutLimits::default(),
-                DurabilityPolicy::FULL,
-            )
-            .expect("put artifact");
-            ObjectId(declared)
+        let reissue = FixtureAttemptIds {
+            generation: 12,
+            attempt: 21,
+            lease: 31,
         };
-        let (offer, manifest_bytes) = offer_serving_object(&authority, &object);
         {
             let mut store = cas.store().lock().expect("store lock");
-            install_admission_world(&mut *store, &authority);
+            install_admission_world_with_ids(&mut *store, &authority, reissue);
         }
+        let (offer, manifest_bytes) = offer_with_manifest_bytes_with_ids(&authority, reissue);
         store_manifest_object(&cas, &offer, &manifest_bytes);
 
         let outcome = coord
@@ -451,9 +494,10 @@ fn t004_a_retry_after_a_crash_converges_and_never_double_commits() {
         assert!(
             matches!(
                 outcome,
-                PublicationOutcome::Committed(_) | PublicationOutcome::AlreadyPublished { .. }
+                PublicationOutcome::Committed(_) | PublicationOutcome::IdempotentEvidenceAppended
             ),
-            "phase {phase}: a retry of the identical result must publish or be a no-op, \
+            "phase {phase}: a retry of the identical result must publish (crash before the \
+             commit) or be idempotent (crash after it) — never a second publication, \
              got {outcome:?}"
         );
 
