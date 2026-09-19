@@ -277,8 +277,9 @@ mod tests {
         list.iter().map(|s| s.as_bytes().to_vec()).collect()
     }
     /// The byte form of a path literal, for comparing against the
-    /// `Vec<u8>` a refusal carries.
-    fn b(path: &str) -> Vec<u8> {
+    /// `Vec<u8>` a refusal carries. Named `pb` rather than `b` because
+    /// several tests bind a `BundleId` called `b`.
+    fn pb(path: &str) -> Vec<u8> {
         path.as_bytes().to_vec()
     }
 
@@ -297,10 +298,10 @@ mod tests {
                 let error = arbiter
                     .reserve(&bundle("other"), &paths(&[alias]))
                     .unwrap_err();
-                assert_eq!(error.path, b(alias));
+                assert_eq!(error.path, pb(alias));
                 assert_eq!(
                     error.reserved,
-                    b(owned),
+                    pb(owned),
                     "retain caller spelling for diagnostics"
                 );
                 assert_eq!(error.holder, owner);
@@ -333,9 +334,7 @@ mod tests {
         ] {
             assert_eq!(
                 arbiter.authorize_install(&owner, path),
-                Err(UndeclaredWrite {
-                    path: path.to_owned()
-                }),
+                Err(UndeclaredWrite { path: pb(path) }),
                 "{path:?}"
             );
         }
@@ -369,10 +368,61 @@ mod tests {
     }
 
     #[test]
+    fn destinations_differing_only_in_invalid_utf8_are_distinct_reservations() {
+        // bd-1rofg. These two paths are different files. Under a lossy
+        // decode they were the SAME reservation key, because
+        // `to_string_lossy` maps every invalid byte to U+FFFD — so
+        // "target/out/\xff" and "target/out/\xfe" both became
+        // "target/out/\u{FFFD}" and the second serve was refused,
+        // naming a path neither caller had asked for.
+        let first = b"target/out/\xff".to_vec();
+        let second = b"target/out/\xfe".to_vec();
+        assert_ne!(first, second, "the fixture must be two different files");
+        assert_eq!(
+            String::from_utf8_lossy(&first),
+            String::from_utf8_lossy(&second),
+            "and they must be indistinguishable under the decode this replaced, \
+             or the test is not exercising the bug"
+        );
+
+        let mut arbiter = DestinationArbiter::new();
+        let (a, b) = (bundle("a"), bundle("b"));
+        arbiter.reserve(&a, std::slice::from_ref(&first)).unwrap();
+        arbiter
+            .reserve(&b, std::slice::from_ref(&second))
+            .expect("two genuinely different files must not conflict");
+
+        // And each bundle owns exactly its own, so the byte identity
+        // reaches authorization too and not just the conflict check.
+        assert_eq!(
+            arbiter.authorize_install(&a, &first),
+            Ok(InstallScope::OwnedSubtree)
+        );
+        assert_eq!(
+            arbiter.authorize_install(&b, &second),
+            Ok(InstallScope::OwnedSubtree)
+        );
+        assert_eq!(
+            arbiter.authorize_install(&a, &second),
+            Err(UndeclaredWrite {
+                path: second.clone()
+            }),
+            "a bundle must not gain a neighbour's path by sharing a lossy spelling"
+        );
+
+        // The genuine overlap still refuses: identical bytes conflict.
+        let conflict = arbiter
+            .reserve(&bundle("c"), std::slice::from_ref(&first))
+            .unwrap_err();
+        assert_eq!(conflict.path, first);
+        assert_eq!(conflict.holder, a);
+    }
+
+    #[test]
     fn root_claims_cover_descendants_in_both_reservation_orders() {
         for (root, child) in [("/", "/target/out"), (".", "target/out")] {
-            assert!(overlaps(root, child));
-            assert!(overlaps(child, root));
+            assert!(overlaps(root.as_bytes(), child.as_bytes()));
+            assert!(overlaps(child.as_bytes(), root.as_bytes()));
             let mut arbiter = DestinationArbiter::new();
             let owner = bundle("owner");
             arbiter.reserve(&owner, &paths(&[root])).unwrap();
@@ -451,7 +501,7 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(conflict.holder, a);
-        assert_eq!(conflict.reserved, b("target/debug/build/x/out"));
+        assert_eq!(conflict.reserved, pb("target/debug/build/x/out"));
         // All-or-nothing: B's NON-overlapping path was not reserved.
         assert!(matches!(
             arbiter.authorize_install(&b, "target/debug/deps/liby.rmeta"),
@@ -479,7 +529,7 @@ mod tests {
         let err = arbiter
             .reserve(&bundle("b"), &paths(&["target/debug/build/x/out"]))
             .unwrap_err();
-        assert_eq!(err.reserved, b("target/debug/build/x/out/gen.rs"));
+        assert_eq!(err.reserved, pb("target/debug/build/x/out/gen.rs"));
         // Sibling with a shared name PREFIX (not ancestry) is fine.
         arbiter
             .reserve(&bundle("b"), &paths(&["target/debug/build/x/output"]))
@@ -534,7 +584,7 @@ mod tests {
                 let barrier = Arc::clone(&barrier);
                 std::thread::spawn(move || {
                     let me = bundle(&format!("op-{i}"));
-                    let mine = format!("target/debug/build/crate-{i}/out");
+                    let mine = format!("target/debug/build/crate-{i}/out").into_bytes();
                     arbiter
                         .lock()
                         .unwrap()
@@ -544,7 +594,10 @@ mod tests {
                     barrier.wait();
                     let scope = arbiter.lock().unwrap().authorize_install(&me, &mine);
                     assert_eq!(scope, Ok(InstallScope::OwnedSubtree));
-                    let dir = root.path().join(&mine);
+                    // The reservation key is bytes; the real filesystem
+                    // takes those same bytes, with no decode in between.
+                    use std::os::unix::ffi::OsStrExt;
+                    let dir = root.path().join(std::ffi::OsStr::from_bytes(&mine));
                     std::fs::create_dir_all(&dir).unwrap();
                     std::fs::write(dir.join("gen.rs"), b"x").unwrap();
                     arbiter.lock().unwrap().release(&me);
