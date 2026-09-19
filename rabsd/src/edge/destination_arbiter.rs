@@ -356,11 +356,7 @@ mod tests {
             let mut arbiter = DestinationArbiter::new();
             let owner = bundle("owner");
             arbiter.reserve(&owner, &paths(&[root])).unwrap();
-            assert!(
-                arbiter
-                    .reserve(&bundle("other"), &paths(&[child]))
-                    .is_err()
-            );
+            assert!(arbiter.reserve(&bundle("other"), &paths(&[child])).is_err());
             assert_eq!(
                 arbiter.authorize_install(&owner, child),
                 Ok(InstallScope::OwnedFile)

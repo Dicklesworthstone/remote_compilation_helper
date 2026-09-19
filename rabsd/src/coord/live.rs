@@ -38,9 +38,7 @@ use rabs_cas::digest_set::ATP_OBJECT_CONTENT_DOMAIN;
 use rabs_cas::digest_set::{DigestRequest, digest_set};
 use rabs_cas::manifest_codec::{decode_manifest_v1, encode_manifest_v1};
 use rabs_cas::materialization::ActionMaterializeFailure;
-use rabs_cas::metadata_store::{
-    AuthorityRow, RabsMetadataStore, SqlValue, StoreError, digest_key,
-};
+use rabs_cas::metadata_store::{AuthorityRow, RabsMetadataStore, SqlValue, StoreError, digest_key};
 use rabs_cas::publication::{
     AUTHORITY_DIGEST_DOMAIN, CommitDurabilityProfile, OBSERVABLE_PROJECTION_DOMAIN,
     OfferPreparedActionResult, OfferRefusal, PublicationOutcome, SEMANTIC_PROJECTION_DOMAIN,
@@ -61,9 +59,7 @@ use rabs_protocol::generation::{
     WorkerIncarnationId,
 };
 use rabs_protocol::input_evidence::{ActionInputManifest, InputFileType};
-use rabs_protocol::result_identity::{
-    CanonicalActionResultManifest, DigestAlgorithm, TypedDigest,
-};
+use rabs_protocol::result_identity::{CanonicalActionResultManifest, DigestAlgorithm, TypedDigest};
 use rabs_protocol::wire_time::PeerId;
 use rabs_protocol::worker_fence::{WorkerAdmission, WorkerSessionOffer};
 use rabs_sandbox::snapshot_capture::{MemberKind, SealedSourceSnapshot};
@@ -337,8 +333,10 @@ impl std::fmt::Display for ServeError {
             }
             Self::Preparation { path, reason } => write!(f, "preparing {path}: {reason}"),
             Self::Materialize(failure) => write!(
-                f, "materialization interrupted after {} installed outputs: {}",
-                failure.installed.len(), failure.error,
+                f,
+                "materialization interrupted after {} installed outputs: {}",
+                failure.installed.len(),
+                failure.error,
             ),
         }
     }
@@ -419,9 +417,13 @@ fn recorded_action_risk(
                 Ok(ActionClassRisk::LowRiskRegistry)
             }
             [SqlValue::Text(_)] => Ok(ActionClassRisk::Elevated),
-            _ => Err(StoreError::Backend("invalid live action-class receipt".to_owned())),
+            _ => Err(StoreError::Backend(
+                "invalid live action-class receipt".to_owned(),
+            )),
         },
-        _ => Err(StoreError::Backend("ambiguous live action-class receipt".to_owned())),
+        _ => Err(StoreError::Backend(
+            "ambiguous live action-class receipt".to_owned(),
+        )),
     }
 }
 
@@ -445,16 +447,13 @@ fn record_live_verification(
         // A repeated pointer is not itself a verified comparison. Bind the
         // offered value to its content id AND the independently loaded baseline.
         // Missing/corrupt baseline bytes must never manufacture passing evidence.
-        let baseline = committed.ok_or_else(|| {
-            StoreError::Backend("verification baseline unavailable".to_owned())
-        })?;
+        let baseline = committed
+            .ok_or_else(|| StoreError::Backend("verification baseline unavailable".to_owned()))?;
         let bytes = encode_manifest_v1(&offer.manifest);
         let offered_id = digest_set(&bytes, DigestRequest::default(), None)
             .map_err(|_| StoreError::Backend("verification manifest digest failed".to_owned()))?
             .atp_content_id;
-        if offered_id != offer.manifest_id.0
-            || encode_manifest_v1(baseline) != bytes
-        {
+        if offered_id != offer.manifest_id.0 || encode_manifest_v1(baseline) != bytes {
             return Err(StoreError::Backend(
                 "verification manifest does not match its committed bytes".to_owned(),
             ));
@@ -464,10 +463,14 @@ fn record_live_verification(
             &[SqlValue::Text(digest_key(action))],
         )?;
         let [row] = rows.as_slice() else {
-            return Err(StoreError::Backend("missing verification baseline".to_owned()));
+            return Err(StoreError::Backend(
+                "missing verification baseline".to_owned(),
+            ));
         };
         let [SqlValue::Text(winner)] = row.as_slice() else {
-            return Err(StoreError::Backend("invalid verification baseline".to_owned()));
+            return Err(StoreError::Backend(
+                "invalid verification baseline".to_owned(),
+            ));
         };
         let winner = u128::from_str_radix(winner, 16)
             .map_err(|_| StoreError::Backend("invalid winner attempt identity".to_owned()))?;
@@ -1773,10 +1776,11 @@ impl CoordLive {
         // One complete logical-output map: do not silently discard .rmeta or
         // dep-info. Canonical .d files are verified and derived privately before
         // any target write. Unsupported roles and incomplete mappings refuse.
-        let plan = match output_install::prepare(&mut *store, &manifest, destination_root, expected)? {
-            Ok(plan) => plan,
-            Err(outcome) => return Ok(outcome),
-        };
+        let plan =
+            match output_install::prepare(&mut *store, &manifest, destination_root, expected)? {
+                Ok(plan) => plan,
+                Err(outcome) => return Ok(outcome),
+            };
         if plan.outputs.is_empty() {
             return Ok(ServeOutcome::Served { files: Vec::new() });
         }
@@ -1785,8 +1789,11 @@ impl CoordLive {
         // install, so a concurrent serve into an overlapping path is
         // refused rather than interleaved.
         let bundle = BundleId(format!("serve:{key}:{}", self.next_seq()));
-        let paths: Vec<String> = plan.outputs.iter()
-            .map(|out| out.destination.to_string_lossy().into_owned()).collect();
+        let paths: Vec<String> = plan
+            .outputs
+            .iter()
+            .map(|out| out.destination.to_string_lossy().into_owned())
+            .collect();
         // The guard releases on drop, so the reservation cannot outlive
         // this call however it ends — including an unwind, which
         // previously stranded the paths for the process's lifetime
@@ -2098,7 +2105,7 @@ mod tests {
         ActionInputManifest,
         ActionDescriptor,
     ) {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_util::private_tempdir();
         std::fs::write(dir.path().join("input.txt"), b"projected bytes\n").unwrap();
         std::fs::write(dir.path().join("unrelated.txt"), b"not an input\n").unwrap();
         let source = Arc::new(
@@ -2173,7 +2180,7 @@ mod tests {
     }
 
     fn submission_coordinator() -> (tempfile::TempDir, CoordLive) {
-        let state = tempfile::tempdir().unwrap();
+        let state = crate::test_util::private_tempdir();
         let coord = CoordLive::with_cas(Arc::new(mount_and_reconcile(state.path()).unwrap()));
         coord.acquire_boot_authority("submission-tests").unwrap();
         coord.mark_up();
@@ -2226,7 +2233,7 @@ mod tests {
         let (live, source, manifest, descriptor) = source_fixture();
         let input = submission(&source, &manifest, &descriptor);
         std::fs::write(live.path().join("input.txt"), b"edited after capture").unwrap();
-        let fresh = tempfile::tempdir().unwrap();
+        let fresh = crate::test_util::private_tempdir();
         let target = fresh.path().join("projection");
         let paths = input.materialize_into(&target).unwrap();
         assert_eq!(
@@ -2379,7 +2386,7 @@ mod tests {
             assert_eq!(second.input().key(), optional.action_key);
             assert!(coord.next_action_dispatch().unwrap().is_none());
             // An actual failed preparation does not permanently claim work.
-            let existing = tempfile::tempdir().unwrap();
+            let existing = crate::test_util::private_tempdir();
             assert!(first.input().materialize_into(existing.path()).is_err());
         }
         assert_eq!(
@@ -2592,7 +2599,7 @@ mod tests {
 
     #[test]
     fn worker_fence_is_atomic_exact_owner_and_durable() {
-        let dir = tempfile::tempdir().expect("temp store");
+        let dir = crate::test_util::private_tempdir();
         let cas = Arc::new(mount_and_reconcile(dir.path()).expect("mount"));
         let coord = CoordLive::with_cas(Arc::clone(&cas));
         coord
@@ -2699,7 +2706,7 @@ mod tests {
 
     #[test]
     fn t038_clone_ambiguity_durably_revokes_old_leases_until_reenrollment() {
-        let dir = tempfile::tempdir().expect("temp store");
+        let dir = crate::test_util::private_tempdir();
         let cas = Arc::new(mount_and_reconcile(dir.path()).expect("mount"));
         let coord = CoordLive::with_cas(Arc::clone(&cas));
         let coordinator = coord

@@ -34,13 +34,19 @@ fn require(condition: bool, message: &str) -> io::Result<()> {
 
 fn text<'a>(value: &'a Value, field: &str) -> io::Result<&'a str> {
     value.get(field).and_then(Value::as_str).ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidData, format!("missing string {field}"))
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("missing string {field}"),
+        )
     })
 }
 
 fn number(value: &Value, field: &str) -> io::Result<u64> {
     value.get(field).and_then(Value::as_u64).ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidData, format!("missing integer {field}"))
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("missing integer {field}"),
+        )
     })
 }
 
@@ -64,11 +70,15 @@ fn digest(value: &Value, field: &str) -> io::Result<String> {
 fn read_receipt(path: &Path) -> io::Result<Value> {
     let metadata = fs::symlink_metadata(path)?;
     require(metadata.is_file(), "delivery receipt is not a regular file")?;
-    require(metadata.len() <= MAX_FRAME_BYTES as u64, "oversized delivery receipt")?;
+    require(
+        metadata.len() <= MAX_FRAME_BYTES as u64,
+        "oversized delivery receipt",
+    )?;
     let file = File::open(path)?;
     require(file.metadata()?.is_file(), "delivery receipt changed type")?;
     let mut bytes = Vec::new();
-    file.take(MAX_FRAME_BYTES as u64 + 1).read_to_end(&mut bytes)?;
+    file.take(MAX_FRAME_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)?;
     require(bytes.len() <= MAX_FRAME_BYTES, "oversized delivery receipt")?;
     Ok(serde_json::from_slice(&bytes)?)
 }
@@ -115,9 +125,8 @@ fn expected_files(
                 .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "artifact declaration"))?
                 .iter()
                 .map(|name| {
-                    name.as_str().ok_or_else(|| {
-                        io::Error::new(io::ErrorKind::InvalidData, "artifact name")
-                    })
+                    name.as_str()
+                        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "artifact name"))
                 })
                 .collect::<io::Result<_>>()?;
             let manifest = &receipt["artifact_manifest"];
@@ -146,7 +155,14 @@ fn expected_files(
                 manifest_hash.update([u8::from(executable)]);
                 manifest_hash.update(len.to_be_bytes());
                 field(&mut manifest_hash, sha256.as_bytes());
-                files.insert(Path::new("artifacts").join(name), ExpectedFile { len, sha256, executable });
+                files.insert(
+                    Path::new("artifacts").join(name),
+                    ExpectedFile {
+                        len,
+                        sha256,
+                        executable,
+                    },
+                );
             }
             require(
                 artifact_total == number(manifest, "total_bytes")?
@@ -185,7 +201,10 @@ fn verify_tree(root: &Path, files: &BTreeMap<PathBuf, ExpectedFile>) -> io::Resu
     // attacker-controlled subtrees. Empty artifact sets still need both roots.
     for relative in &directories {
         let directory = root.join(relative);
-        require(fs::symlink_metadata(&directory)?.is_dir(), "delivery directory is missing or a link")?;
+        require(
+            fs::symlink_metadata(&directory)?.is_dir(),
+            "delivery directory is missing or a link",
+        )?;
         for entry in fs::read_dir(directory)? {
             let entry = entry?;
             let path = relative.join(entry.file_name());
@@ -207,15 +226,24 @@ fn verify_tree(root: &Path, files: &BTreeMap<PathBuf, ExpectedFile>) -> io::Resu
 
 fn verify_file(path: &Path, expected: &ExpectedFile) -> io::Result<()> {
     let metadata = fs::symlink_metadata(path)?;
-    require(metadata.is_file() && metadata.len() == expected.len, "delivery file type/length mismatch")?;
+    require(
+        metadata.is_file() && metadata.len() == expected.len,
+        "delivery file type/length mismatch",
+    )?;
     let file = File::open(path)?;
     let metadata = file.metadata()?;
-    require(metadata.is_file() && metadata.len() == expected.len, "delivery file changed type/length")?;
+    require(
+        metadata.is_file() && metadata.len() == expected.len,
+        "delivery file changed type/length",
+    )?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let mode = if expected.executable { 0o700 } else { 0o600 };
-        require(metadata.permissions().mode() & 0o7777 == mode, "delivery file mode mismatch")?;
+        require(
+            metadata.permissions().mode() & 0o7777 == mode,
+            "delivery file mode mismatch",
+        )?;
     }
     #[cfg(not(unix))]
     let _ = expected.executable;
@@ -255,7 +283,9 @@ pub fn recover_existing_delivery(
         require(!expected_worker.is_empty(), "empty expected worker")?;
         require(
             destination.is_absolute()
-                && destination.components().all(|part| matches!(part, Component::RootDir | Component::Normal(_))),
+                && destination
+                    .components()
+                    .all(|part| matches!(part, Component::RootDir | Component::Normal(_))),
             "delivery destination must be absolute without traversal",
         )?;
         let metadata = match fs::symlink_metadata(destination) {
@@ -263,11 +293,17 @@ pub fn recover_existing_delivery(
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error),
         };
-        require(metadata.is_dir(), "retained delivery is not an ordinary directory")?;
+        require(
+            metadata.is_dir(),
+            "retained delivery is not an ordinary directory",
+        )?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            require(metadata.permissions().mode() & 0o077 == 0, "retained delivery is not private")?;
+            require(
+                metadata.permissions().mode() & 0o077 == 0,
+                "retained delivery is not private",
+            )?;
         }
         let receipt = read_receipt(&destination.join("delivery.json"))?;
         require(
@@ -275,8 +311,12 @@ pub fn recover_existing_delivery(
                 && text(&receipt, "kind")? == "verified-worker-delivery"
                 && number(&receipt, "request_id")? == number(request, "request_id")?
                 && text(&receipt, "worker_id")? == expected_worker
-                && digest(&receipt, "request_sha256")? == hex(&Sha256::digest(serde_json::to_vec(request)?))
-                && receipt.get("publication_authorized").and_then(Value::as_bool) == Some(false)
+                && digest(&receipt, "request_sha256")?
+                    == hex(&Sha256::digest(serde_json::to_vec(request)?))
+                && receipt
+                    .get("publication_authorized")
+                    .and_then(Value::as_bool)
+                    == Some(false)
                 && receipt.get("reexecute").and_then(Value::as_bool) == Some(false),
             "delivery receipt does not match this request or authority policy",
         )?;
@@ -289,15 +329,25 @@ pub fn recover_existing_delivery(
         )?;
         match trust {
             DeliveryTrust::Loopback => require(
-                receipt.get("transport_authenticated").and_then(Value::as_bool) == Some(false)
-                    && ["worker_spki_sha256", "authenticated_session_id", "identity_generation"]
-                        .iter()
-                        .all(|field| receipt.get(*field) == Some(&Value::Null)),
+                receipt
+                    .get("transport_authenticated")
+                    .and_then(Value::as_bool)
+                    == Some(false)
+                    && [
+                        "worker_spki_sha256",
+                        "authenticated_session_id",
+                        "identity_generation",
+                    ]
+                    .iter()
+                    .all(|field| receipt.get(*field) == Some(&Value::Null)),
                 "retained delivery transport does not match loopback mode",
             )?,
             DeliveryTrust::PinnedWorker(pin) => require(
                 pin != [0; 32]
-                    && receipt.get("transport_authenticated").and_then(Value::as_bool) == Some(true)
+                    && receipt
+                        .get("transport_authenticated")
+                        .and_then(Value::as_bool)
+                        == Some(true)
                     && digest(&receipt, "worker_spki_sha256")? == hex(&pin)
                     && number(&receipt, "authenticated_session_id")? > 0
                     && number(&receipt, "identity_generation")? > 0,
@@ -305,14 +355,19 @@ pub fn recover_existing_delivery(
             )?,
         }
         let exit = receipt.get("exit_code").and_then(Value::as_i64);
-        require(exit.is_some_and(|code| (0..=255).contains(&code)), "invalid retained exit code")?;
+        require(
+            exit.is_some_and(|code| (0..=255).contains(&code)),
+            "invalid retained exit code",
+        )?;
         let stop = receipt.get("stop_reason").ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidData, "missing retained stop reason")
         })?;
         require(
             stop.is_null()
-                || (matches!(stop.as_str(), Some("cancelled" | "deadline-exceeded" | "session-lost"))
-                    && exit != Some(0)),
+                || (matches!(
+                    stop.as_str(),
+                    Some("cancelled" | "deadline-exceeded" | "session-lost")
+                ) && exit != Some(0)),
             "invalid retained interruption or interrupted success",
         )?;
         let files = expected_files(request, &receipt, exit == Some(0) && stop.is_null())?;
@@ -328,7 +383,9 @@ pub fn recover_existing_delivery(
             directory: destination.to_path_buf(),
             receipt,
             acknowledgments_confirmed: false,
-            acknowledgment_error: Some("restored durable delivery; remote acknowledgments were not rechecked".to_owned()),
+            acknowledgment_error: Some(
+                "restored durable delivery; remote acknowledgments were not rechecked".to_owned(),
+            ),
         }))
     })();
     outcome.map_err(|error| DeliveryFailure {

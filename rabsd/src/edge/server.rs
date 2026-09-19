@@ -442,12 +442,20 @@ fn serve_reply(coord: &crate::coord::live::EdgeSubscriber, value: &serde_json::V
     let expected = match (expected, value.get("dep_info_mappings")) {
         (ExpectedOutputs::Exactly(paths), Some(value)) => {
             let Some(mappings) = parse_dep_info_mappings(value) else {
-                return refusal("bad-dep-info-mappings", "expected bounded [canonical-directory, subscriber-directory] pairs");
+                return refusal(
+                    "bad-dep-info-mappings",
+                    "expected bounded [canonical-directory, subscriber-directory] pairs",
+                );
             };
             ExpectedOutputs::WithDepInfo { paths, mappings }
         }
         (expected, None) => expected,
-        _ => return refusal("bad-dep-info-mappings", "dep-info mappings require expected_outputs"),
+        _ => {
+            return refusal(
+                "bad-dep-info-mappings",
+                "dep-info mappings require expected_outputs",
+            );
+        }
     };
     // The committed serving record carries clock epoch 0 (its column
     // default) until the coordinator populates a real clock epoch, so
@@ -509,20 +517,32 @@ fn serve_reply(coord: &crate::coord::live::EdgeSubscriber, value: &serde_json::V
 
 fn parse_dep_info_mappings(value: &serde_json::Value) -> Option<Vec<(Vec<u8>, Vec<u8>)>> {
     let entries = value.as_array()?;
-    if entries.len() > 64 { return None; }
+    if entries.len() > 64 {
+        return None;
+    }
     let path_bytes = |value: &serde_json::Value| -> Option<Vec<u8>> {
         if let Some(text) = value.as_str() {
             return (text.len() <= 4096).then(|| text.as_bytes().to_vec());
         }
         let bytes = value.as_array()?;
-        if bytes.len() > 4096 { return None; }
-        bytes.iter().map(|byte| u8::try_from(byte.as_u64()?).ok()).collect()
+        if bytes.len() > 4096 {
+            return None;
+        }
+        bytes
+            .iter()
+            .map(|byte| u8::try_from(byte.as_u64()?).ok())
+            .collect()
     };
-    entries.iter().map(|entry| {
-        let pair = entry.as_array()?;
-        if pair.len() != 2 { return None; }
-        Some((path_bytes(&pair[0])?, path_bytes(&pair[1])?))
-    }).collect()
+    entries
+        .iter()
+        .map(|entry| {
+            let pair = entry.as_array()?;
+            if pair.len() != 2 {
+                return None;
+            }
+            Some((path_bytes(&pair[0])?, path_bytes(&pair[1])?))
+        })
+        .collect()
 }
 
 /// Error transport preserves the materializer's installed prefix. No response
@@ -532,8 +552,14 @@ fn serve_error_reply(error: &crate::coord::live::ServeError) -> String {
     use crate::coord::live::ServeError;
     use std::os::unix::ffi::OsStrExt;
     let (started, files) = match error {
-        ServeError::Materialize(failure) => (true, failure.installed.iter()
-            .map(|output| output.destination.as_path()).collect::<Vec<_>>()),
+        ServeError::Materialize(failure) => (
+            true,
+            failure
+                .installed
+                .iter()
+                .map(|output| output.destination.as_path())
+                .collect::<Vec<_>>(),
+        ),
         _ => (false, Vec::new()),
     };
     serde_json::json!({
@@ -549,7 +575,9 @@ fn serve_error_reply(error: &crate::coord::live::ServeError) -> String {
 mod complete_output_wire_tests {
     use super::{parse_dep_info_mappings, serve_error_reply};
     use crate::coord::live::ServeError;
-    use rabs_cas::materialization::{ActionMaterializeFailure, MaterializeError, OutputMaterialized};
+    use rabs_cas::materialization::{
+        ActionMaterializeFailure, MaterializeError, OutputMaterialized,
+    };
     use rabs_protocol::raw_bytes::RawBytes;
     use rabs_protocol::result_identity::OutputRole;
     use std::os::unix::ffi::OsStringExt;
@@ -558,7 +586,10 @@ mod complete_output_wire_tests {
     #[test]
     fn mapping_wire_preserves_unix_bytes_and_refuses_malformed_pairs() {
         let value = serde_json::json!([["/__rabs/workspace", [47, 116, 109, 112, 47, 255]]]);
-        assert_eq!(parse_dep_info_mappings(&value).unwrap(), vec![(b"/__rabs/workspace".to_vec(), b"/tmp/\xff".to_vec())]);
+        assert_eq!(
+            parse_dep_info_mappings(&value).unwrap(),
+            vec![(b"/__rabs/workspace".to_vec(), b"/tmp/\xff".to_vec())]
+        );
         for value in [
             serde_json::json!([["/__rabs/workspace"]]),
             serde_json::json!([["/__rabs/workspace", [256]]]),
@@ -574,8 +605,17 @@ mod complete_output_wire_tests {
     fn mapping_wire_bounds_both_cardinality_and_path_size() {
         let pair = serde_json::json!(["/__rabs/workspace", "/subscriber"]);
         assert!(parse_dep_info_mappings(&serde_json::json!(vec![pair; 65])).is_none());
-        assert!(parse_dep_info_mappings(&serde_json::json!([["/__rabs/workspace", "x".repeat(4097)]])).is_none());
-        assert!(parse_dep_info_mappings(&serde_json::json!([["/__rabs/workspace", vec![1; 4097]]])).is_none());
+        assert!(
+            parse_dep_info_mappings(&serde_json::json!([[
+                "/__rabs/workspace",
+                "x".repeat(4097)
+            ]]))
+            .is_none()
+        );
+        assert!(
+            parse_dep_info_mappings(&serde_json::json!([["/__rabs/workspace", vec![1; 4097]]]))
+                .is_none()
+        );
     }
 
     #[test]
@@ -583,11 +623,16 @@ mod complete_output_wire_tests {
         let raw = b"/target/quote\"-\xff.rmeta".to_vec();
         let failure = ServeError::Materialize(ActionMaterializeFailure {
             installed: vec![OutputMaterialized {
-                role: OutputRole::ProvisionalMetadata, virtual_path: RawBytes::from("out.rmeta"),
+                role: OutputRole::ProvisionalMetadata,
+                virtual_path: RawBytes::from("out.rmeta"),
                 destination: PathBuf::from(std::ffi::OsString::from_vec(raw.clone())),
-                bytes: 42, nanos: 1,
+                bytes: 42,
+                nanos: 1,
             }],
-            error: MaterializeError::Io { step: "prepare", error: "fault".to_owned() },
+            error: MaterializeError::Io {
+                step: "prepare",
+                error: "fault".to_owned(),
+            },
         });
         let reply: serde_json::Value = serde_json::from_str(&serve_error_reply(&failure)).unwrap();
         assert_eq!(reply["outcome"], "error");
@@ -595,7 +640,10 @@ mod complete_output_wire_tests {
         assert_eq!(reply["installed_path_bytes"], serde_json::json!([raw]));
         assert_eq!(reply["compiler_skip_authorized"], false);
         assert_eq!(reply["reexecution_authorized"], false);
-        let before = ServeError::Preparation { path: "/target".into(), reason: "mapping".into() };
+        let before = ServeError::Preparation {
+            path: "/target".into(),
+            reason: "mapping".into(),
+        };
         let reply: serde_json::Value = serde_json::from_str(&serve_error_reply(&before)).unwrap();
         assert_eq!(reply["materialization_started"], false);
         assert_eq!(reply["installed_path_bytes"], serde_json::json!([]));
@@ -685,17 +733,16 @@ fn parse_hello(frame: &[u8]) -> Result<VersionHello, String> {
 mod live_serve_tests {
     use super::*;
     use rabs_cas::test_support::{
-        install_admission_world, install_offer_closure, offer_under,
-        sample_action_key, sample_expected_descriptor,
+        install_admission_world, install_offer_closure, offer_under, sample_action_key,
+        sample_expected_descriptor,
     };
     use std::sync::Arc;
 
     #[test]
     fn serve_frame_cannot_choose_its_own_risk_or_evidence_floor() {
         let dir = tempfile::tempdir().unwrap();
-        let cas = Arc::new(
-            crate::janitor::store::mount_and_reconcile(&dir.path().join("cas")).unwrap(),
-        );
+        let cas =
+            Arc::new(crate::janitor::store::mount_and_reconcile(&dir.path().join("cas")).unwrap());
         let coord = Arc::new(crate::coord::live::CoordLive::with_cas(Arc::clone(&cas)));
         let authority = coord.acquire_boot_authority("serve-frame-fixture").unwrap();
         coord.mark_up();
@@ -705,7 +752,9 @@ mod live_serve_tests {
             install_admission_world(&mut *store, &authority);
             install_offer_closure(&mut *store, &offer);
         }
-        coord.commit_offer(&offer, &sample_expected_descriptor()).unwrap();
+        coord
+            .commit_offer(&offer, &sample_expected_descriptor())
+            .unwrap();
         let destination = dir.path().join("not-written");
         let key = sample_action_key()
             .bytes
@@ -726,17 +775,23 @@ mod live_serve_tests {
             serde_json::from_str(&serve_reply(&coord.edge_subscriber(), &frame)).unwrap();
         assert_eq!(reply["kind"], "serve-result");
         assert_eq!(reply["outcome"], "execute-privately");
-        assert!(reply["reason"].as_str().unwrap().contains("ElevatedClassRisk"));
+        assert!(
+            reply["reason"]
+                .as_str()
+                .unwrap()
+                .contains("ElevatedClassRisk")
+        );
         assert!(!destination.exists());
 
         // The absence of an output expectation is not an authorization bypass.
         let mut inspection_claim = frame;
-        inspection_claim.as_object_mut().unwrap().remove("expected_outputs");
-        let reply: serde_json::Value = serde_json::from_str(&serve_reply(
-            &coord.edge_subscriber(),
-            &inspection_claim,
-        ))
-        .unwrap();
+        inspection_claim
+            .as_object_mut()
+            .unwrap()
+            .remove("expected_outputs");
+        let reply: serde_json::Value =
+            serde_json::from_str(&serve_reply(&coord.edge_subscriber(), &inspection_claim))
+                .unwrap();
         assert_eq!(reply["outcome"], "execute-privately");
         assert!(!destination.exists());
     }
