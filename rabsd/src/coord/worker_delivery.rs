@@ -22,6 +22,26 @@ pub const MAX_DELIVERY_BYTES: u64 = 1024 * 1024 * 1024;
 /// Maximum UTF-8 JSON frame before parsing or allocating its decoded payload.
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
 
+/// Local operator intent, never inferred from a peer response or a failed run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliveryMode {
+    /// Admit one new execution; use durable result retention when advertised.
+    Execute,
+    /// Retrieve a previously sealed result. No execution dispatch is permitted.
+    Resume,
+}
+
+impl DeliveryMode {
+    pub(crate) fn frame(self, request: &Value) -> Value {
+        match self {
+            Self::Execute => request.clone(),
+            Self::Resume => json!({"kind":"result-resume", "request_id":request["request_id"], "request":request}),
+        }
+    }
+}
+
+const RESULT_RETENTION: &str = "durable-result-v1";
+
 /// Evidence supplied by a trusted transport adapter AFTER session admission.
 /// Never deserialize this from a worker's JSON: labels and claimed peer IDs are
 /// not transport proof. Authentication does not authorize cache publication.
@@ -318,9 +338,23 @@ fn acknowledge(peer: &mut impl WorkerPeer, worker: &str, frame: Value, expected_
 pub fn receive_execution(
     peer: &mut impl WorkerPeer, request: &Value, expected_worker: &str, destination: &Path,
 ) -> Result<Delivery, DeliveryFailure> {
-    let mut execution_may_have_run = false;
+    receive_operation(peer, request, expected_worker, destination, DeliveryMode::Execute)
+}
+
+/// Receive one explicitly selected operation through the same byte verifier.
+/// Resume sends only result-resume, never canonical-exec or a fallback request.
+/// Its destination must be NEW: prior partial files are never trusted or mixed
+/// with a new result. The original command may already have run even if resume
+/// fails before contacting a worker, so uncertainty remains true in that mode.
+pub fn receive_operation(
+    peer: &mut impl WorkerPeer, request: &Value, expected_worker: &str, destination: &Path,
+    mode: DeliveryMode,
+) -> Result<Delivery, DeliveryFailure> {
+    let mut execution_may_have_run = mode == DeliveryMode::Resume;
     let outcome = (|| -> io::Result<Delivery> {
         validate_request(request)?;
+        let dispatch = mode.frame(request);
+        require(serde_json::to_vec(&dispatch)?.len() <= MAX_FRAME_BYTES, "operation frame too large")?;
         require(!expected_worker.is_empty(), "empty expected worker")?;
         require(destination.is_absolute() && destination.components().all(|c| {
             matches!(c, Component::RootDir | Component::Normal(_))
@@ -338,11 +372,18 @@ pub fn receive_execution(
             && supports("output_transfers", "ranges-v1"), "worker lacks required delivery/recovery capabilities")?;
         let incarnation = text(&hello, "incarnation")?;
         require(is_hex(incarnation, 32) && incarnation.bytes().any(|b| b != b'0'), "invalid worker incarnation")?;
-        match hello.get("request_high_water") {
-            Some(Value::Null) => {}
-            Some(value) => require(value.as_u64().is_some_and(|last| id > last), "request is already admitted or retired; reconcile instead of reexecuting")?,
-            None => return Err(invalid("missing durable request high-water")),
+        if mode == DeliveryMode::Resume {
+            require(hello.get("request_high_water").and_then(Value::as_u64) == Some(id),
+                "resume does not name the worker's retained admission")?;
+        } else {
+            match hello.get("request_high_water") {
+                Some(Value::Null) => {}
+                Some(value) => require(value.as_u64().is_some_and(|last| id > last), "request is already admitted or retired; reconcile instead of reexecuting")?,
+                None => return Err(invalid("missing durable request high-water")),
+            }
         }
+        let retention = supports("result_retentions", RESULT_RETENTION);
+        require(mode != DeliveryMode::Resume || retention, "worker lacks durable result recovery")?;
         if expected.is_some() { require(supports("artifact_transfers", "files-v1"), "worker lacks files-v1")?; }
         // Atomic create, never exists-then-truncate. Everything written below is
         // in this caller-owned private tree; no peer controls a host root.
@@ -351,13 +392,25 @@ pub fn receive_execution(
         create_directory(&destination.join("artifacts"))?;
         let mut ack = json!({"kind":"session-ok","output_transfer":"ranges-v1","recovery_protocol":"request-journal-v1"});
         if expected.is_some() { ack["artifact_transfer"] = json!("files-v1"); }
+        if retention { ack["result_retention"] = json!(RESULT_RETENTION); }
         peer.negotiate(&hello, &ack)?;
         let authentication = peer.authentication();
         execution_may_have_run = true; // before even a partially successful write
-        peer.send(request)?;
+        peer.send(&dispatch)?;
         let result = receive(peer, expected_worker)?;
         require(text(&result, "kind")? == "exec-result" && number(&result, "request_id")? == id,
             "execution refused or returned an unexpected identity; do not resubmit")?;
+        if mode == DeliveryMode::Resume {
+            require(result.get("resumed").and_then(Value::as_bool) == Some(true),
+                "worker did not return an explicitly resumed result")?;
+        } else {
+            require(result.get("resumed").is_none_or(|value| value.as_bool() == Some(false)),
+                "new execution unexpectedly returned a resumed result")?;
+        }
+        let retained_digest = if retention {
+            require(text(&result, "result_retention")? == RESULT_RETENTION, "worker did not seal negotiated result")?;
+            Some(digest(&result, "retained_result_sha256")?)
+        } else { None };
         require(result.get("executed").and_then(Value::as_bool) == Some(true)
             && number(&result, "residual_group_members")? == 0, "execution incomplete or descendants unresolved")?;
         let exit_code = result.get("exit_code").and_then(Value::as_i64)
@@ -394,7 +447,7 @@ pub fn receive_execution(
         // Sync parent ancestry too: a power loss must not erase a newly linked
         // delivery directory after the worker has discarded its only copies.
         for parent in destination.ancestors().skip(1) { File::open(parent)?.sync_all()?; }
-        let receipt = json!({"version":1,"kind":"verified-worker-delivery","request_id":id,
+        let mut receipt = json!({"version":1,"kind":"verified-worker-delivery","request_id":id,
             "worker_id":expected_worker,"boot_generation":hello["boot_generation"],"incarnation":incarnation,
             "request_sha256":hash(&serde_json::to_vec(request)?),"exit_code":exit_code,"stop_reason":stop,
             "stdout_bytes":stdout.len,"stdout_sha256":stdout.sha256,
@@ -406,6 +459,17 @@ pub fn receive_execution(
             "authenticated_session_id":authentication.map(|proof| proof.session_id),
             "identity_generation":authentication.map(|proof| proof.identity_generation),
             "publication_authorized":false,"reexecute":false});
+        if let Some(digest) = retained_digest {
+            receipt["result_retention"] = json!(RESULT_RETENTION);
+            receipt["retained_result_sha256"] = json!(digest);
+        }
+        if mode == DeliveryMode::Resume {
+            // The authenticated hello identifies this DELIVERY session, not the
+            // process incarnation that executed before the worker restarted.
+            receipt["resumed"] = json!(true);
+            receipt["worker_identity_scope"] = json!("delivery-session");
+            receipt["execution_boot_generation"] = Value::Null;
+        }
         let mut marker = create_file(&destination.join("delivery.pending"))?;
         marker.write_all(&serde_json::to_vec_pretty(&receipt)?)?;
         marker.sync_all()?;
@@ -676,5 +740,82 @@ mod tests {
                 assert!(result.unwrap().acknowledgments_confirmed);
             }
         }
+    }
+
+    fn resumable(destination: &Path) -> Script {
+        let mut peer = fixture(destination);
+        peer.replies[0]["request_high_water"] = json!(7);
+        peer.replies[0]["boot_generation"] = json!(2);
+        peer.replies[0]["result_retentions"] = json!([RESULT_RETENTION]);
+        peer.replies[1]["resumed"] = json!(true);
+        peer.replies[1]["result_retention"] = json!(RESULT_RETENTION);
+        peer.replies[1]["retained_result_sha256"] = json!(hash(b"sealed result"));
+        peer
+    }
+
+    #[test]
+    fn resumed_delivery_reuses_full_verification_without_any_execution_dispatch() {
+        let parent = tempfile::tempdir().unwrap(); let dest = parent.path().join("resumed");
+        let mut peer = resumable(&dest);
+        let delivery = receive_operation(&mut peer, &request(), "worker", &dest, DeliveryMode::Resume).unwrap();
+        assert!(delivery.acknowledgments_confirmed);
+        assert_eq!(peer.sent[0]["result_retention"], RESULT_RETENTION);
+        assert_eq!(peer.sent[1], DeliveryMode::Resume.frame(&request()));
+        assert!(!peer.sent.iter().any(|frame| frame["kind"] == "canonical-exec"));
+        assert_eq!(delivery.receipt["resumed"], true);
+        assert_eq!(delivery.receipt["worker_identity_scope"], "delivery-session");
+        assert!(delivery.receipt["execution_boot_generation"].is_null());
+        assert_eq!(std::fs::read(dest.join("artifacts/a")).unwrap(), b"A\0\xffB");
+        super::super::delivery_recovery::recover_existing_delivery(&request(), "worker", &dest,
+            super::super::delivery_recovery::DeliveryTrust::Loopback).unwrap().unwrap();
+    }
+
+    #[test]
+    fn resume_refuses_wrong_high_water_or_missing_retention_before_sending() {
+        for case in 0..5 {
+            let parent = tempfile::tempdir().unwrap(); let dest = parent.path().join("resumed");
+            let mut peer = resumable(&dest);
+            match case {
+                0 => peer.replies[0]["request_high_water"] = Value::Null,
+                1 => peer.replies[0]["request_high_water"] = json!(6),
+                2 => peer.replies[0]["request_high_water"] = json!(8),
+                3 => peer.replies[0]["result_retentions"] = json!([]),
+                _ => peer.replies[0]["result_retentions"] = json!(["durable-result-v2"]),
+            }
+            assert!(receive_operation(&mut peer, &request(), "worker", &dest, DeliveryMode::Resume).is_err());
+            assert!(peer.sent.is_empty()); assert!(!dest.exists());
+        }
+    }
+
+    #[test]
+    fn resumed_corruption_refusal_and_lost_write_never_fall_back_to_execution() {
+        for case in 0..5 {
+            let parent = tempfile::tempdir().unwrap(); let dest = parent.path().join("resumed");
+            let mut peer = resumable(&dest);
+            match case {
+                0 => peer.replies[1]["resumed"] = json!(false),
+                1 => peer.replies[1]["retained_result_sha256"] = json!("bad"),
+                2 => peer.replies[1] = json!({"kind":"error","request_id":7,"reason":"result unavailable"}),
+                3 => peer.replies[4]["data_hex"] = json!("4100ff43"),
+                _ => peer.fail_send = Some("result-resume"),
+            }
+            let error = receive_operation(&mut peer, &request(), "worker", &dest, DeliveryMode::Resume).unwrap_err();
+            assert!(error.execution_may_have_run, "prior execution remains possible");
+            assert!(!peer.sent.iter().any(|frame| frame["kind"] == "canonical-exec"));
+            assert!(no_ack(&peer)); assert!(!dest.join("delivery.json").exists());
+        }
+    }
+
+    #[test]
+    fn new_execution_selects_advertised_retention_and_persists_the_seal() {
+        let parent = tempfile::tempdir().unwrap(); let dest = parent.path().join("retained");
+        let mut peer = resumable(&dest);
+        peer.replies[0]["request_high_water"] = Value::Null;
+        peer.replies[1].as_object_mut().unwrap().remove("resumed");
+        let delivery = receive_execution(&mut peer, &request(), "worker", &dest).unwrap();
+        assert_eq!(peer.sent[0]["result_retention"], RESULT_RETENTION);
+        assert_eq!(peer.sent[1], request());
+        assert_eq!(delivery.receipt["retained_result_sha256"], hash(b"sealed result"));
+        assert_eq!(delivery.receipt["publication_authorized"], false);
     }
 }
