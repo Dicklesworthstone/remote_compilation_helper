@@ -3,15 +3,17 @@
 //! This composes the real session-admission policy with the SAME files-v1 and
 //! ranges-v1 receiver used by the loopback operator. An operator-provided SPKI
 //! expectation is checked against TLS evidence, never learned from a hello.
-//! One exact request may be sent, once, after admission. This is not a fleet
-//! scheduler, durable enrollment service, cache publication, or reconnect loop.
+//! One exact operation may be sent, once, after admission. Explicit result
+//! recovery retrieves sealed bytes; it cannot dispatch or retry execution.
+//! This is not a fleet scheduler, durable enrollment service, cache publication,
+//! or automatic reconnect loop.
 //!
 //! The synchronous entry point runs on a dedicated operator thread. It drives
 //! native async I/O with a current-thread Runtime and performs filesystem work
 //! outside that reactor. Do not call it from a running async task.
 
 use super::worker_delivery::{
-    Delivery, DeliveryFailure, WorkerAuthentication, WorkerPeer, receive_execution,
+    Delivery, DeliveryFailure, DeliveryMode, WorkerAuthentication, WorkerPeer, receive_operation,
     validate_request,
 };
 use asupersync::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -104,8 +106,7 @@ fn challenge_ids() -> io::Result<[u64; 3]> {
     File::open("/dev/urandom")?.read_exact(&mut bytes)?;
     let mut ids = [0; 3];
     for (id, chunk) in ids.iter_mut().zip(bytes.as_chunks::<8>().0) {
-        // `as_chunks::<8>` yields `[u8; 8]` directly, so the width is proven by
-        // the type and the previous fallible conversion cannot fail.
+        // `as_chunks::<8>` proves the width without a fallible conversion.
         *id = u64::from_be_bytes(*chunk);
     }
     require(ids.iter().all(|id| *id != 0), "zero challenge identity")?;
@@ -118,12 +119,13 @@ struct AdmittedPeer<P> {
     inner: P,
     identity: TransportIdentity,
     identities: IdentityStore,
-    expected_request: Value,
+    expected_operation: Value,
+    mode: DeliveryMode,
     ids: [u64; 3],
     hello_read: bool,
     negotiation_started: bool,
     proof: Option<WorkerAuthentication>,
-    execution_sent: bool,
+    operation_sent: bool,
 }
 
 impl<P: WorkerPeer> AdmittedPeer<P> {
@@ -133,11 +135,13 @@ impl<P: WorkerPeer> AdmittedPeer<P> {
         expected: [u8; 32],
         request: &Value,
         ids: [u64; 3],
+        mode: DeliveryMode,
     ) -> io::Result<Self> {
         validate_request(request)?;
+        let expected_operation = mode.frame(request);
         require(
-            serde_json::to_vec(request)?.len() <= MAX_JSON_RECORD,
-            "request exceeds ATP limit",
+            serde_json::to_vec(&expected_operation)?.len() <= MAX_JSON_RECORD,
+            "operation exceeds ATP limit",
         )?;
         require(
             expected != [0; 32] && identity.peer_id == expected && identity.fingerprint == expected,
@@ -157,12 +161,13 @@ impl<P: WorkerPeer> AdmittedPeer<P> {
             inner,
             identity,
             identities,
-            expected_request: request.clone(),
+            expected_operation,
+            mode,
             ids,
             hello_read: false,
             negotiation_started: false,
             proof: None,
-            execution_sent: false,
+            operation_sent: false,
         })
     }
 }
@@ -191,10 +196,20 @@ impl<P: WorkerPeer> WorkerPeer for AdmittedPeer<P> {
                 && grant["recovery_protocol"] == "request-journal-v1",
             "invalid delivery session selection",
         )?;
+        if self.mode == DeliveryMode::Resume {
+            require(
+                grant["result_retention"] == "durable-result-v1"
+                    && hello["result_retentions"].as_array().is_some_and(|items| {
+                        items.iter().any(|item| item == "durable-result-v1")
+                    }),
+                "resume requires negotiated durable result retention",
+            )?;
+        }
         let [session_id, operation_id, token_id] = self.ids;
         // Retain the worker's existing S5 admission vocabulary. This is a
         // handshake token, not a steady-state execution lease. The adapter below
-        // narrows all execution sends to the complete operator-selected request.
+        // narrows ALL sends to the complete operator-selected operation. A
+        // recovery session cannot use its handshake token to execute anything.
         let scope = format!("canonical-probes:{peer}");
         let token = mint(
             token_id,
@@ -262,6 +277,8 @@ impl<P: WorkerPeer> WorkerPeer for AdmittedPeer<P> {
         grant["transport"] = json!(admitted.grant().transport_version);
         grant["application"] = json!(admitted.grant().application_version);
         grant["publication"] = json!("disabled");
+        // No arbitrary session continuation: sealed-result retrieval is the
+        // separately negotiated result_retention protocol on a NEW session.
         grant["resume"] = json!("unsupported");
         self.inner.send(&grant)?;
         self.proof = Some(WorkerAuthentication {
@@ -282,18 +299,18 @@ impl<P: WorkerPeer> WorkerPeer for AdmittedPeer<P> {
             "execution/delivery before authenticated admission",
         )?;
         match frame["kind"].as_str() {
-            Some("canonical-exec") => {
+            Some("canonical-exec" | "result-resume") => {
                 require(
-                    !self.execution_sent && frame == &self.expected_request,
-                    "only the exact one-shot request may execute, once",
+                    !self.operation_sent && frame == &self.expected_operation,
+                    "only the exact selected operation may be sent, once",
                 )?;
-                self.execution_sent = true; // burn before any possibly partial write
+                self.operation_sent = true; // burn before any possibly partial write
             }
             Some("output-read" | "artifact-read" | "output-ack" | "artifact-ack") => {
                 require(
-                    self.execution_sent
-                        && frame["request_id"] == self.expected_request["request_id"],
-                    "delivery request does not own this execution",
+                    self.operation_sent
+                        && frame["request_id"] == self.expected_operation["request_id"],
+                    "delivery request does not own this operation",
                 )?;
             }
             _ => {
@@ -316,7 +333,7 @@ impl<P: WorkerPeer> WorkerPeer for AdmittedPeer<P> {
             )?;
             return Ok(hello);
         }
-        require(self.execution_sent, "unsolicited worker result")?;
+        require(self.operation_sent, "unsolicited worker result")?;
         let frame = self.inner.receive()?;
         require(
             matches!(
@@ -403,6 +420,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin> WorkerPeer for RecordPeer<'_, S> {
                 self.phase = Phase::Execution;
                 self.until = Instant::now() + self.execution_budget;
             }
+            Some("result-resume") => {
+                require(self.phase == Phase::Admission, "duplicate recovery dispatch")?;
+                // Restoring the spool and downloading it share one finite
+                // budget. Receiving exec-result must NOT restart that budget.
+                self.phase = Phase::Transfer;
+                self.until = Instant::now() + TRANSFER_BUDGET;
+            }
             Some("output-ack" | "artifact-ack") if self.phase == Phase::Transfer => {
                 self.phase = Phase::Acknowledgment;
                 self.until = Instant::now() + ACK_BUDGET;
@@ -464,9 +488,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> WorkerPeer for RecordPeer<'_, S> {
     }
 }
 
-/// Receive one exact command over a stream returned by native mutual-TLS
-/// admission. Pin mismatch refuses before application I/O. Only the existing
-/// verifier may finalize delivery and release remote diagnostic/artifact owners.
+/// Receive one exact new command over a stream returned by native mutual-TLS
+/// admission. Recovery is never selected implicitly after an execution error.
 pub fn receive_authenticated(
     runtime: &Runtime,
     peer: AuthenticatedPeer,
@@ -475,9 +498,35 @@ pub fn receive_authenticated(
     request: &Value,
     destination: &Path,
 ) -> Result<Delivery, DeliveryFailure> {
+    receive_authenticated_operation(
+        runtime,
+        peer,
+        expected_spki,
+        expected_worker,
+        request,
+        destination,
+        DeliveryMode::Execute,
+    )
+}
+
+/// Perform one locally selected operation under a fresh mutually authenticated
+/// session. Resume binds the COMPLETE original canonical-exec request, but only
+/// sends result-resume. Pin/admission/retention failures never authorize execution
+/// or plaintext fallback. In recovery mode even pre-admission errors preserve
+/// uncertainty about the original run. Only the shared byte verifier can finalize
+/// the new delivery directory and acknowledge remote captures.
+pub fn receive_authenticated_operation(
+    runtime: &Runtime,
+    peer: AuthenticatedPeer,
+    expected_spki: [u8; 32],
+    expected_worker: &str,
+    request: &Value,
+    destination: &Path,
+    mode: DeliveryMode,
+) -> Result<Delivery, DeliveryFailure> {
     let failure = |error: io::Error| DeliveryFailure {
         directory: destination.to_path_buf(),
-        execution_may_have_run: false,
+        execution_may_have_run: mode == DeliveryMode::Resume,
         detail: error.to_string(),
     };
     if asupersync::cx::Cx::current().is_some() {
@@ -492,9 +541,10 @@ pub fn receive_authenticated(
         expected_spki,
         request,
         challenge_ids().map_err(&failure)?,
+        mode,
     )
     .map_err(failure)?;
-    receive_execution(&mut admitted, request, expected_worker, destination)
+    receive_operation(&mut admitted, request, expected_worker, destination, mode)
 }
 
 #[cfg(test)]
@@ -511,10 +561,12 @@ mod tests {
     impl WorkerPeer for Script {
         fn send(&mut self, frame: &Value) -> io::Result<()> {
             self.sent.push(frame.clone());
-            if self.fail_execution && frame["kind"] == "canonical-exec" {
+            if self.fail_execution
+                && matches!(frame["kind"].as_str(), Some("canonical-exec" | "result-resume"))
+            {
                 return Err(io::Error::new(
                     io::ErrorKind::BrokenPipe,
-                    "partial execution write",
+                    "partial operation write",
                 ));
             }
             Ok(())
@@ -541,7 +593,7 @@ mod tests {
         json!({"kind":"session-ok", "output_transfer":"ranges-v1",
             "artifact_transfer":"files-v1", "recovery_protocol":"request-journal-v1"})
     }
-    fn peer(hello: Value, response: Value) -> AdmittedPeer<Script> {
+    fn peer_with_mode(hello: Value, response: Value, mode: DeliveryMode) -> AdmittedPeer<Script> {
         let inner = Script {
             replies: VecDeque::from([hello, response]),
             ..Script::default()
@@ -555,8 +607,12 @@ mod tests {
             [1; 32],
             &request(),
             [10, 20, 30],
+            mode,
         )
         .unwrap()
+    }
+    fn peer(hello: Value, response: Value) -> AdmittedPeer<Script> {
+        peer_with_mode(hello, response, DeliveryMode::Execute)
     }
 
     #[test]
@@ -586,7 +642,8 @@ mod tests {
                     identity,
                     [1; 32],
                     &request(),
-                    [10, 20, 30]
+                    [10, 20, 30],
+                    DeliveryMode::Execute,
                 )
                 .is_err()
             );
@@ -655,6 +712,7 @@ mod tests {
         let mut wrong = request();
         wrong["artifacts"]["files"] = json!(["other"]);
         assert!(peer.send(&wrong).is_err());
+        assert!(peer.send(&DeliveryMode::Resume.frame(&request())).is_err());
         peer.send(&request()).unwrap();
         assert!(peer.send(&request()).is_err());
         assert!(peer.send(&json!({"kind":"commit","request_id":7})).is_err());
@@ -693,5 +751,138 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    fn recovery_hello() -> Value {
+        let mut hello = hello();
+        hello["worker_id"] = json!("worker");
+        hello["boot_generation"] = json!(2);
+        hello["incarnation"] = json!("00000000000000000000000000000002");
+        hello["request_high_water"] = json!(7);
+        hello["recovery_protocols"] = json!(["request-journal-v1"]);
+        hello["result_retentions"] = json!(["durable-result-v1"]);
+        hello["output_transfers"] = json!(["ranges-v1"]);
+        hello["artifact_transfers"] = json!(["files-v1"]);
+        hello
+    }
+
+    #[test]
+    fn resume_requires_retention_before_challenge_and_never_downgrades() {
+        for missing_hello in [false, true] {
+            let mut hello = recovery_hello();
+            let mut grant = grant();
+            if missing_hello {
+                hello["result_retentions"] = json!([]);
+                grant["result_retention"] = json!("durable-result-v1");
+            }
+            let mut peer = peer_with_mode(hello, response(), DeliveryMode::Resume);
+            let hello = peer.receive().unwrap();
+            assert!(peer.negotiate(&hello, &grant).is_err());
+            assert!(peer.inner.sent.is_empty());
+            assert!(peer.send(&request()).is_err());
+            assert!(peer.send(&DeliveryMode::Resume.frame(&request())).is_err());
+        }
+    }
+
+    #[test]
+    fn resume_binds_complete_request_and_burns_dispatch_before_partial_write() {
+        let mut peer = peer_with_mode(recovery_hello(), response(), DeliveryMode::Resume);
+        let hello = peer.receive().unwrap();
+        let mut grant = grant();
+        grant["result_retention"] = json!("durable-result-v1");
+        peer.negotiate(&hello, &grant).unwrap();
+        assert!(peer.send(&request()).is_err());
+        let dispatch = DeliveryMode::Resume.frame(&request());
+        for field in ["program", "args", "artifacts", "workspace_backing", "toolchain_backing"] {
+            let mut changed = dispatch.clone();
+            changed["request"][field] = json!("different");
+            assert!(peer.send(&changed).is_err(), "{field}");
+        }
+        let mut changed = dispatch.clone();
+        changed["request_id"] = json!(8);
+        assert!(peer.send(&changed).is_err());
+        peer.inner.fail_execution = true;
+        assert!(peer.send(&dispatch).is_err());
+        peer.inner.fail_execution = false;
+        assert!(peer.send(&dispatch).is_err());
+        assert!(peer.send(&request()).is_err());
+        assert_eq!(peer.inner.sent.iter().filter(|v| v["kind"] == "result-resume").count(), 1);
+        assert!(!peer.inner.sent.iter().any(|v| v["kind"] == "canonical-exec"));
+    }
+
+    fn resumed_peer() -> (AdmittedPeer<Script>, Value) {
+        use sha2::{Digest, Sha256};
+        let hash = |bytes: &[u8]| hex(&Sha256::digest(bytes));
+        let bytes = b"A\0\xffB";
+        let mut request = request();
+        request.as_object_mut().unwrap().remove("artifacts");
+        let result = json!({"kind":"exec-result", "request_id":7, "executed":true,
+            "resumed":true, "exit_code":0, "residual_group_members":0, "stop_reason":null,
+            "result_retention":"durable-result-v1", "retained_result_sha256":"07".repeat(32),
+            "output_transfer":"ranges-v1", "output_ack_required":true,
+            "stdout_bytes":bytes.len(), "stdout_sha256":hash(bytes),
+            "stderr_bytes":0, "stderr_sha256":hash(b""),
+            "artifact_ack_required":false, "artifact_manifest":null});
+        let chunk = |stream: &str, bytes: &[u8]| json!({"kind":"output-chunk", "request_id":7,
+            "stream":stream, "offset":0, "next_offset":bytes.len(), "total_bytes":bytes.len(),
+            "sha256":hash(bytes), "chunk_sha256":hash(bytes), "eof":true, "data_hex":hex(bytes)});
+        let inner = Script {
+            replies: VecDeque::from([
+                recovery_hello(), response(), result,
+                chunk("stdout", bytes), chunk("stderr", b""),
+                json!({"kind":"output-acknowledged", "request_id":7, "already_released":false}),
+            ]),
+            ..Script::default()
+        };
+        let peer = AdmittedPeer::new(
+            inner,
+            TransportIdentity { peer_id: [1; 32], fingerprint: [1; 32] },
+            [1; 32], &request, [10, 20, 30], DeliveryMode::Resume,
+        ).unwrap();
+        (peer, request)
+    }
+
+    #[test]
+    fn authenticated_resume_uses_shared_byte_verifier_and_survives_ack_loss() {
+        for lose_ack in [false, true] {
+            let parent = tempfile::tempdir().unwrap();
+            let destination = parent.path().join("recovered");
+            let (mut peer, request) = resumed_peer();
+            if lose_ack { peer.inner.replies.pop_back(); }
+            let delivery = receive_operation(
+                &mut peer, &request, "worker", &destination, DeliveryMode::Resume,
+            ).unwrap();
+            assert_eq!(delivery.acknowledgments_confirmed, !lose_ack);
+            assert_eq!(delivery.receipt["resumed"], true);
+            assert_eq!(delivery.receipt["transport_authenticated"], true);
+            assert_eq!(delivery.receipt["worker_spki_sha256"], hex(&[1; 32]));
+            assert_eq!(delivery.receipt["publication_authorized"], false);
+            assert!(delivery.receipt["execution_boot_generation"].is_null());
+            assert_eq!(std::fs::read(destination.join("diagnostics/stdout")).unwrap(), b"A\0\xffB");
+            assert!(destination.join("delivery.json").is_file());
+            assert!(!peer.inner.sent.iter().any(|v| v["kind"] == "canonical-exec"));
+            assert_eq!(peer.inner.sent.iter().filter(|v| v["kind"] == "result-resume").count(), 1);
+        }
+    }
+
+    #[test]
+    fn unavailable_or_unresumed_result_never_authorizes_reexecution_or_ack() {
+        for unavailable in [false, true] {
+            let parent = tempfile::tempdir().unwrap();
+            let destination = parent.path().join("refused");
+            let (mut peer, request) = resumed_peer();
+            if unavailable {
+                peer.inner.replies[2] = json!({"kind":"error", "request_id":7, "error":"result unavailable"});
+            } else {
+                peer.inner.replies[2]["resumed"] = json!(false);
+            }
+            let failure = receive_operation(
+                &mut peer, &request, "worker", &destination, DeliveryMode::Resume,
+            ).unwrap_err();
+            assert!(failure.execution_may_have_run);
+            assert!(!destination.join("delivery.json").exists());
+            assert_eq!(peer.inner.sent.len(), 3); // challenge, grant, retrieval only
+            assert_eq!(peer.inner.sent[2]["kind"], "result-resume");
+        }
     }
 }
