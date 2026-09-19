@@ -2,8 +2,9 @@
 //!
 //! A request is recorded before its process may start. An interrupted admission
 //! is uncertain, NOT permission to run it again. Even newer work is refused until
-//! that uncertainty is resolved outside this prototype. Terminal receipts are
-//! metadata only: they neither restore output bytes nor authorize publication.
+//! that uncertainty is resolved outside this prototype. A terminal receipt may
+//! bind a separately sealed durable result; metadata alone never restores bytes
+//! or authorizes publication. Retained results block new admission until accepted.
 //!
 //! One private, local, fsync-capable state directory belongs to one worker and
 //! coordinator endpoint. The held lock excludes overlapping local processes;
@@ -12,6 +13,8 @@
 //! required for those guarantees. Never delete this directory to retry a build.
 
 use crate::session::sha256_hex;
+use crate::execution::ExecutionCompletion;
+use crate::result_spool::{self, RecoveredResult, ResultRecipient};
 use rabs_protocol::generation::{WorkerBootGeneration, WorkerIncarnationId};
 use serde_json::{Value, json};
 use std::fs::{File, OpenOptions};
@@ -31,6 +34,8 @@ pub struct WorkerJournal {
     _lock: File,
     state: Value,
     poisoned: bool,
+    recovered_result: Option<RecoveredResult>,
+    result_recipient: Option<ResultRecipient>,
     #[cfg(test)]
     fail_after_rename: bool,
 }
@@ -78,6 +83,13 @@ fn validate_state(state: &Value, worker: &str, coordinator: &str) -> io::Result<
         || (!last["receipt"].is_null() && last["receipt"]["request_id"] != last["request_id"])
     {
         return Err(invalid("invalid durable admission or terminal receipt"));
+    }
+    if let Some(digest) = last["receipt"].get("retained_result_sha256") {
+        if !hex_string(digest, 64) || last["resolved"] != true
+            || last["receipt"]["retained_result_released"].as_bool().is_none()
+        {
+            return Err(invalid("invalid durable result retention record"));
+        }
     }
     Ok(())
 }
@@ -207,10 +219,24 @@ impl WorkerJournal {
         state["incarnation"] = json!(incarnation);
         let mut journal = Self {
             root, _lock: lock, state: Value::Null, poisoned: false,
+            recovered_result: None, result_recipient: None,
             #[cfg(test)]
             fail_after_rename: false,
         };
         journal.store(state)?;
+        // Startup is outside the async runtime. Rehash/recreate private snapshots
+        // while the same exclusive lock protects both the journal and its spool.
+        if let Some(digest) = journal.retained_digest() {
+            if journal.state["last"]["receipt"]["retained_result_released"] == true {
+                result_spool::purge_accepted(&journal.root, &digest)?;
+            } else {
+                let id = journal.high_water().ok_or_else(|| invalid("retained result lacks admission"))?;
+                let fingerprint = journal.state["last"]["fingerprint"].as_str()
+                    .ok_or_else(|| invalid("retained result lacks fingerprint"))?;
+                result_spool::validate_receipt(&journal.root, id, fingerprint, &digest, &journal.state["last"]["receipt"])?;
+                journal.recovered_result = Some(result_spool::load(&journal.root, id, fingerprint, &digest)?);
+            }
+        }
         Ok(journal)
     }
 
@@ -232,6 +258,72 @@ impl WorkerJournal {
     #[must_use]
     pub fn high_water(&self) -> Option<u64> {
         self.state["last"]["request_id"].as_u64()
+    }
+
+    /// Canonical local root, used only to construct a sink for an admitted task.
+    #[must_use]
+    pub fn storage_root(&self) -> &Path { &self.root }
+
+    fn retained_digest(&self) -> Option<String> {
+        self.state["last"]["receipt"]["retained_result_sha256"].as_str().map(str::to_owned)
+    }
+
+    #[must_use]
+    pub fn has_retained_result(&self) -> bool {
+        !self.poisoned && self.retained_digest().is_some()
+            && self.state["last"]["receipt"]["retained_result_released"] != true
+    }
+
+    /// Set only after the real connection authenticates and selects retention.
+    /// No wire-provided worker label, claimed pin, or resume frame sets this value.
+    pub fn authorize_result_recipient(&mut self, recipient: ResultRecipient) {
+        self.result_recipient = Some(recipient);
+    }
+
+    /// Connection authorization cannot leak into a later, unnegotiated session.
+    pub fn clear_result_recipient(&mut self) {
+        self.result_recipient = None;
+    }
+
+    /// Move a startup-verified result into the existing range-transfer owners.
+    /// Exact request and effective budget must match; this never admits a process.
+    pub fn resume_result(
+        &mut self, request: &Value, timeout: Duration, artifacts_enabled: bool,
+    ) -> io::Result<ExecutionCompletion> {
+        self.ensure_healthy()?;
+        if !self.has_retained_result() || request["kind"] != "canonical-exec"
+            || request["request_id"].as_u64() != self.high_water()
+            || self.state["last"]["fingerprint"] != request_fingerprint(request, timeout)
+        {
+            return Err(invalid("retained result does not match this request"));
+        }
+        let recovered = self.recovered_result.as_ref()
+            .ok_or_else(|| invalid("result is already transferring or requires reconnect"))?;
+        if self.result_recipient.as_ref() != Some(&recovered.recipient) {
+            return Err(invalid("retained result belongs to another authenticated recipient"));
+        }
+        if recovered.completion.artifacts.is_some() && !artifacts_enabled {
+            return Err(invalid("artifact transfer not negotiated for retained result"));
+        }
+        Ok(self.recovered_result.take().ok_or_else(|| invalid("missing retained result"))?.completion)
+    }
+
+    /// The caller invokes this only after BOTH identity-bound output owners have
+    /// accepted their ACKs. Journal the acceptance before deleting any spool byte.
+    /// Lost ACK confirmation can never resurrect execution or release newer work.
+    pub fn release_retained_result(&mut self, request_id: u64) -> io::Result<()> {
+        self.ensure_healthy()?;
+        if self.high_water() != Some(request_id) {
+            return Err(invalid("result acceptance does not own the current admission"));
+        }
+        let Some(digest) = self.retained_digest() else { return Ok(()); };
+        if self.state["last"]["receipt"]["retained_result_released"] != true {
+            let mut next = self.state.clone();
+            next["last"]["receipt"]["retained_result_released"] = json!(true);
+            self.store(next)?;
+        }
+        self.recovered_result = None;
+        result_spool::purge_accepted(&self.root, &digest)
     }
 
     /// Durably reserve an execution before invoking any process-launch seam.
@@ -261,6 +353,12 @@ impl WorkerJournal {
             if self.state["last"]["resolved"] != true {
                 return Ok(Some("prior-execution-uncertain"));
             }
+            if self.has_retained_result() {
+                return Ok(Some("retained-result-unacknowledged"));
+            }
+        }
+        if result_spool::exists(&self.root)? {
+            return Ok(Some("retained-result-needs-reconciliation"));
         }
         let mut next = self.state.clone();
         next["last"] = json!({
@@ -287,9 +385,19 @@ impl WorkerJournal {
         {
             return Err(invalid("terminal receipt does not own this admission"));
         }
-        // Scratch paths and transfer advertisements never become durable output
-        // references. The receipt only supports outcome reconciliation.
+        // Scratch paths are not durable references. A separately synced seal is
+        // explicitly bound here; metadata without that seal remains observational.
         let mut receipt = receipt.clone();
+        if let Some(digest) = receipt.get("retained_result_sha256").cloned() {
+            if !resolved || !hex_string(&digest, 64) {
+                return Err(invalid("only a complete sealed result can be retained"));
+            }
+            result_spool::validate_receipt(
+                &self.root, request_id, last["fingerprint"].as_str().ok_or_else(|| invalid("missing fingerprint"))?,
+                digest.as_str().ok_or_else(|| invalid("missing retained digest"))?, &receipt,
+            )?;
+            receipt["retained_result_released"] = json!(false);
+        }
         if let Some(object) = receipt.as_object_mut() {
             for field in ["stdout_spill_path", "stderr_spill_path", "output_transfer", "output_ack_required"] {
                 object.remove(field);
@@ -308,8 +416,8 @@ impl WorkerJournal {
         self.store(next)
     }
 
-    /// Reconciliation-only response. Never replay this as compiler output or a
-    /// prepared result; anonymous diagnostic snapshots do not survive restart.
+    /// Reconciliation metadata, not a result frame or publication authority.
+    /// Explicit result-resume is required to transfer a separately verified spool.
     #[must_use]
     pub fn status(&self, request_id: u64) -> Value {
         let current = self.high_water() == Some(request_id);
@@ -327,7 +435,8 @@ impl WorkerJournal {
         json!({
             "kind": "request-status", "request_id": request_id, "status": status,
             "high_water": self.high_water(), "replay_authorized": false,
-            "output_recovery": "unavailable", "publication_authorized": false,
+            "output_recovery": if current && self.has_retained_result() { "durable-result-v1" } else { "unavailable" },
+            "publication_authorized": false,
             "receipt": if current && !self.poisoned { self.state["last"]["receipt"].clone() } else { Value::Null },
         })
     }
@@ -498,5 +607,104 @@ mod tests {
         journal.finish(1, &json!({"kind":"error","request_id":1,"execution_may_have_run":true}), false).unwrap();
         assert_eq!(journal.status(1)["status"], "execution-uncertain");
         assert_eq!(journal.admit(&request(2), Duration::from_secs(1)).unwrap(), Some("prior-execution-uncertain"));
+    }
+
+    fn seal(journal: &mut WorkerJournal, id: u64) -> Value {
+        use crate::output::{CapturedOutputs, CapturedStream};
+        use crate::result_spool::RetentionTarget;
+        use crate::session::ExecResult;
+        journal.admit(&request(id), Duration::from_secs(1)).unwrap();
+        let target = RetentionTarget::from_admitted(journal.storage_root(), id, ResultRecipient::TlsSpki([7; 32])).unwrap();
+        let mut completion = ExecutionCompletion {
+            result: ExecResult { request_id: id, exit_code: 0,
+                stdout_sha256: sha256_hex(b"resumed\0\xff"), stderr_sha256: sha256_hex(b""),
+                executed: true, residual_group_members: 0, stdout_spill_bytes: 0, stderr_spill_bytes: 0,
+                stdout_spill_path: None, stderr_spill_path: None }, stop_reason: None,
+            outputs: Some(CapturedOutputs {
+                stdout: CapturedStream::from_reader(&b"resumed\0\xff"[..], 9).unwrap(),
+                stderr: CapturedStream::from_reader(&b""[..], 0).unwrap(),
+            }), artifacts: None,
+        };
+        let digest = target.seal(&mut completion).unwrap();
+        json!({"kind":"exec-result","request_id":id,"exit_code":0,"executed":true,
+            "residual_group_members":0,"stop_reason":null,
+            "stdout_sha256":completion.result.stdout_sha256,"stderr_sha256":completion.result.stderr_sha256,
+            "retained_result_sha256":digest})
+    }
+
+    #[test]
+    fn durable_result_resumes_only_for_original_request_and_recipient() {
+        let root = tempfile::tempdir().unwrap();
+        let mut journal = open(root.path());
+        let receipt = seal(&mut journal, 1);
+        journal.finish(1, &receipt, true).unwrap();
+        assert_eq!(journal.admit(&request(2), Duration::from_secs(1)).unwrap(), Some("retained-result-unacknowledged"));
+        drop(journal);
+        let mut journal = open(root.path());
+        assert!(journal.has_retained_result());
+        journal.authorize_result_recipient(ResultRecipient::TlsSpki([8; 32]));
+        assert!(journal.resume_result(&request(1), Duration::from_secs(1), false).is_err());
+        journal.authorize_result_recipient(ResultRecipient::TlsSpki([7; 32]));
+        let mut changed = request(1);
+        changed["args"] = json!(["different.rs"]);
+        assert!(journal.resume_result(&changed, Duration::from_secs(1), false).is_err());
+        assert!(journal.resume_result(&request(1), Duration::from_secs(2), false).is_err());
+        let mut result = journal.resume_result(&request(1), Duration::from_secs(1), false).unwrap();
+        assert_eq!(result.outputs.as_mut().unwrap().stdout.read_chunk(0, 64).unwrap(), b"resumed\0\xff");
+        assert!(journal.resume_result(&request(1), Duration::from_secs(1), false).is_err());
+        assert_eq!(journal.admit(&request(1), Duration::from_secs(1)).unwrap(), Some("durable-request-already-admitted"));
+        journal.release_retained_result(1).unwrap();
+        assert!(!root.path().join("retained-result").exists());
+        journal.release_retained_result(1).unwrap();
+        assert_eq!(journal.admit(&request(2), Duration::from_secs(1)).unwrap(), None);
+        assert!(journal.release_retained_result(1).is_err(), "old acceptance cannot release a newer request");
+    }
+
+    #[test]
+    fn uncommitted_seal_cannot_certify_a_previous_boots_execution() {
+        let root = tempfile::tempdir().unwrap();
+        let mut journal = open(root.path());
+        let _uncommitted_receipt = seal(&mut journal, 1);
+        drop(journal);
+        let mut journal = open(root.path());
+        journal.authorize_result_recipient(ResultRecipient::TlsSpki([7; 32]));
+        assert!(!journal.has_retained_result());
+        assert!(journal.resume_result(&request(1), Duration::from_secs(1), false).is_err());
+        assert_eq!(journal.admit(&request(2), Duration::from_secs(1)).unwrap(), Some("prior-execution-uncertain"));
+        assert!(root.path().join("retained-result/manifest.json").exists());
+    }
+
+    #[test]
+    fn failed_acceptance_barrier_never_deletes_the_only_retained_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        let mut journal = open(root.path());
+        let receipt = seal(&mut journal, 1);
+        journal.finish(1, &receipt, true).unwrap();
+        journal.fail_after_rename = true;
+        assert!(journal.release_retained_result(1).is_err());
+        assert!(root.path().join("retained-result/manifest.json").exists());
+        assert!(journal.admit(&request(2), Duration::from_secs(1)).is_err());
+        drop(journal);
+        // The visible rename contained acceptance. On reopen it is safe to
+        // finish that cleanup; a recovered pre-rename state would retain bytes.
+        let mut journal = open(root.path());
+        assert!(!journal.has_retained_result());
+        assert!(!root.path().join("retained-result").exists());
+        assert_eq!(journal.high_water(), Some(1));
+        assert_eq!(journal.admit(&request(2), Duration::from_secs(1)).unwrap(), None);
+    }
+
+    #[test]
+    fn corrupted_retained_bytes_refuse_startup_without_resetting_admission() {
+        let root = tempfile::tempdir().unwrap();
+        let mut journal = open(root.path());
+        let receipt = seal(&mut journal, 1);
+        journal.finish(1, &receipt, true).unwrap();
+        drop(journal);
+        std::fs::write(root.path().join("retained-result/file-000"), b"corrupted").unwrap();
+        assert!(WorkerJournal::open(root.path(), "worker", "coord:7000").is_err());
+        let state: Value = serde_json::from_slice(&std::fs::read(root.path().join(STATE_FILE)).unwrap()).unwrap();
+        assert_eq!(state["last"]["request_id"], 1);
+        assert_eq!(state["last"]["receipt"]["retained_result_released"], false);
     }
 }

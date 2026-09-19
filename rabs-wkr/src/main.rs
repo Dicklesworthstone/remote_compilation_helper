@@ -169,7 +169,10 @@ async fn write_frame<W: AsyncWrite + Unpin>(stream: &mut W, line: &str) -> io::R
 
 enum SessionEvent {
     Frame(io::Result<Option<String>>),
-    Completed { request_id: u64, result: Result<ExecutionCompletion, String> },
+    // Boxed: an ExecutionCompletion result is ~360 bytes against a 24-byte
+    // Frame, and every frame read would otherwise carry the completion's
+    // footprint through the session loop.
+    Completed { request_id: u64, result: Box<Result<ExecutionCompletion, String>> },
 }
 
 async fn next_event<R: AsyncRead + Unpin>(
@@ -179,7 +182,7 @@ async fn next_event<R: AsyncRead + Unpin>(
     poll_fn(|cx| {
         // A flood of immediately-readable pings cannot starve completion.
         if let Some(task) = active.as_mut() && let Poll::Ready(result) = task.poll_completion(cx) {
-            return Poll::Ready(SessionEvent::Completed { request_id: task.request_id(), result });
+            return Poll::Ready(SessionEvent::Completed { request_id: task.request_id(), result: Box::new(result) });
         }
         read.as_mut().poll(cx).map(SessionEvent::Frame)
     }).await
@@ -324,7 +327,7 @@ where
                 SessionEvent::Completed { request_id, result } => {
                     drop(active.take());
                     journal_completion(journal.as_deref_mut(), request_id, &result)?;
-                    let reply = match result {
+                    let reply = match *result {
                         Ok(mut completion) => {
                             let reply = completion_frame(&completion);
                             pending_output = completion.outputs.take().map(|outputs| PendingOutput::new(request_id, outputs));
@@ -461,7 +464,7 @@ where
         task.cancel(StopReason::SessionLost);
         let request_id = task.request_id();
         let cleanup = task.wait().await;
-        journal_completion(journal.as_deref_mut(), request_id, &cleanup)?;
+        journal_completion(journal, request_id, &cleanup)?;
         if outcome.is_ok() { cleanup.map_err(|e| format!("session cleanup: {e}"))?; }
     }
     drop(pending_output);
@@ -817,7 +820,7 @@ mod tests {
         let waker = Waker::from(Arc::new(ThreadWake(std::thread::current())));
         assert!(event.as_mut().poll(&mut Context::from_waker(&waker)).is_pending());
         release.store(true, Ordering::Release);
-        assert!(matches!(wait(event), SessionEvent::Completed { request_id: 1, result: Ok(_) }));
+        assert!(matches!(wait(event), SessionEvent::Completed { request_id: 1, result } if result.is_ok()));
         drop(active.take()); peer.bytes(b"\"ping\"}\n");
         assert_eq!(wait(reader.read(&mut wire)).unwrap(), Some("{\"kind\":\"ping\"}".to_owned()));
     }

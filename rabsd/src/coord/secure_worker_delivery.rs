@@ -80,6 +80,8 @@ fn challenge_ids() -> io::Result<[u64; 3]> {
     File::open("/dev/urandom")?.read_exact(&mut bytes)?;
     let mut ids = [0; 3];
     for (id, chunk) in ids.iter_mut().zip(bytes.as_chunks::<8>().0) {
+        // `as_chunks::<8>` yields `[u8; 8]` directly, so the width is proven by
+        // the type and the previous fallible conversion cannot fail.
         *id = u64::from_be_bytes(*chunk);
     }
     require(ids.iter().all(|id| *id != 0), "zero challenge identity")?;
