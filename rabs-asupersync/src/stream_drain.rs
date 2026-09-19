@@ -150,7 +150,7 @@ impl DrainControl {
         if let Some(error) = self.error() {
             return Err(error);
         }
-        if self.0.remaining.fetch_update(Ordering::AcqRel, Ordering::Acquire,
+        if self.0.remaining.try_update(Ordering::AcqRel, Ordering::Acquire,
             |remaining| remaining.checked_sub(count)).is_err()
         {
             self.record(DrainFailure::OutputLimitExceeded { maximum: self.0.maximum });
