@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 
 use crate::artifacts::{ArtifactPlan, CapturedArtifacts};
 use crate::output::CapturedOutputs;
+use crate::result_spool::RetentionTarget;
 use crate::session::ExecResult;
 
 /// Default worker-local upper bound; a request may shorten, never extend it.
@@ -255,6 +256,7 @@ fn complete_result(
 #[derive(Default)]
 struct CompletionState {
     result: Option<Result<ExecutionCompletion, String>>,
+    retained_result_digest: Option<String>,
     waker: Option<Waker>,
 }
 
@@ -276,7 +278,7 @@ impl ExecutionTask {
         timeout: Duration,
         execute: impl FnOnce(ExecutionControl) -> ExecResult + Send + 'static,
     ) -> io::Result<Self> {
-        Self::spawn_controlled(request_id, ExecutionControl::new(timeout)?, execute)
+        Self::spawn_controlled(request_id, ExecutionControl::new(timeout)?, None, execute)
     }
 
     /// Fix the artifact contract BEFORE spawning, so even a very fast executor
@@ -289,12 +291,29 @@ impl ExecutionTask {
     ) -> io::Result<Self> {
         let control = ExecutionControl::new(timeout)?;
         control.request_artifacts(artifacts)?;
-        Self::spawn_controlled(request_id, control, execute)
+        Self::spawn_controlled(request_id, control, None, execute)
+    }
+
+    /// Production delivery with an optional durable result sink. Sealing runs on
+    /// the SAME blocking owner after process cleanup, never on the control loop.
+    /// A seal failure cannot become a successful or resumable completion.
+    pub fn spawn_for_delivery(
+        request_id: u64,
+        timeout: Duration,
+        artifacts: Option<ArtifactPlan>,
+        retention: Option<RetentionTarget>,
+        execute: impl FnOnce(ExecutionControl) -> ExecResult + Send + 'static,
+    ) -> io::Result<Self> {
+        let control = ExecutionControl::new(timeout)?;
+        if let Some(plan) = artifacts { control.request_artifacts(plan)?; }
+        if retention.is_some() { control.request_output_capture(); }
+        Self::spawn_controlled(request_id, control, retention, execute)
     }
 
     fn spawn_controlled(
         request_id: u64,
         control: ExecutionControl,
+        retention: Option<RetentionTarget>,
         execute: impl FnOnce(ExecutionControl) -> ExecResult + Send + 'static,
     ) -> io::Result<Self> {
         let state = Arc::new(Mutex::new(CompletionState::default()));
@@ -304,19 +323,30 @@ impl ExecutionTask {
             .name(format!("rabs-exec-{request_id}"))
             .spawn(move || {
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    execute(worker_control.clone())
-                }));
-                let stop_reason = worker_control.finish();
-                let result = match outcome {
-                    Ok(result) if result.request_id == request_id => {
-                        complete_result(&worker_control, result, stop_reason)
+                    let result = execute(worker_control.clone());
+                    let stop_reason = worker_control.finish();
+                    if result.request_id != request_id {
+                        return Err("executor returned a different request identity".to_owned());
                     }
-                    Ok(_) => Err("executor returned a different request identity".to_owned()),
-                    Err(_) => Err("execution thread panicked".to_owned()),
+                    let mut completion = complete_result(&worker_control, result, stop_reason)?;
+                    let retained = match retention {
+                        Some(target) if completion.result.executed => Some(
+                            target.seal(&mut completion).map_err(|error| format!("result retention failed: {error}"))?
+                        ),
+                        _ => None,
+                    };
+                    Ok((completion, retained))
+                }));
+                let _ = worker_control.finish();
+                let (result, retained_result_digest) = match outcome {
+                    Ok(Ok((completion, retained))) => (Ok(completion), retained),
+                    Ok(Err(error)) => (Err(error), None),
+                    Err(_) => (Err("execution thread panicked".to_owned()), None),
                 };
                 let waker = {
                     let mut state = worker_state.lock().unwrap_or_else(|e| e.into_inner());
                     state.result = Some(result);
+                    state.retained_result_digest = retained_result_digest;
                     state.waker.take()
                 };
                 if let Some(waker) = waker {
@@ -335,6 +365,13 @@ impl ExecutionTask {
     /// Session-scoped identity; cancellations must match this exactly.
     #[must_use]
     pub fn request_id(&self) -> u64 { self.request_id }
+
+    /// Present only after complete bytes and their seal are durably stored.
+    /// The session must commit this digest to its journal before sending output.
+    #[must_use]
+    pub fn retained_result_digest(&self) -> Option<String> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).retained_result_digest.clone()
+    }
 
     /// Request cancellation without blocking the reactor on process cleanup.
     pub fn cancel(&self, reason: StopReason) -> bool { self.control.cancel(reason) }

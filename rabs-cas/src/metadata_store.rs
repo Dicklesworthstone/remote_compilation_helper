@@ -1472,6 +1472,19 @@ pub trait RabsMetadataStore {
     /// sweep input).
     fn list_publications(&mut self) -> Result<Vec<(String, String)>, StoreError>;
 
+    /// Action keys whose publication names a `winner_generation` that has
+    /// no surviving `action_generations` row (R113 lineage loss).
+    ///
+    /// A store with publications must be able to account for the
+    /// generations that produced them. This is the PRECISE form of that
+    /// check: a count-based rule ("are there any generations at all")
+    /// misses partial row loss, where some generations survive and the
+    /// winner's does not.
+    ///
+    /// # Errors
+    /// Store errors.
+    fn publications_missing_their_generation(&mut self) -> Result<Vec<String>, StoreError>;
+
     /// Released flag of a pin addressed by hex id, if it exists.
     fn pin_released_by_hex(&mut self, pin_hex: &str) -> Result<Option<bool>, StoreError>;
 
@@ -2522,22 +2535,54 @@ impl<E: SqlEngine> SqlMetadataStore<E> {
         })
     }
 
+    /// The never-reuse generation high-water (I51/R108).
+    ///
+    /// The stored row is the fast path, but it is only a row, and a
+    /// rollback can lose it while the `action_generations` rows it was
+    /// summarising survive. Reading 0 in that case silently downgraded
+    /// the fence from a monotone watermark to primary-key uniqueness, so
+    /// an id BELOW the lost watermark that was never minted became
+    /// mintable again — the R108 ABA window, opened by a loss R113 was
+    /// written to catch (bd-9nnqm).
+    ///
+    /// So the watermark is the MAXIMUM of the two sources. The stored
+    /// row still covers ids whose rows were evicted or compacted away,
+    /// and the surviving rows still cover a lost row. Neither alone is
+    /// sufficient; the maximum is monotone under losing either.
+    ///
+    /// `action_generations.id` is a big-endian 16-byte blob, so SQL
+    /// `MAX` over it orders numerically.
     fn generation_high_water(engine: &mut E) -> Result<u128, StoreError> {
-        let rows = engine.query(
+        fn decode(value: &SqlValue) -> Result<u128, StoreError> {
+            match value {
+                SqlValue::Blob(b) => {
+                    let bytes: [u8; 16] = b
+                        .as_slice()
+                        .try_into()
+                        .map_err(|_| StoreError::Corruption("high-water not 16 bytes".into()))?;
+                    Ok(u128::from_be_bytes(bytes))
+                }
+                SqlValue::Null => Ok(0),
+                _ => Err(StoreError::Corruption("high-water shape".into())),
+            }
+        }
+
+        let stored = engine.query(
             "SELECT value FROM generation_high_water WHERE kind = 'action-generation'",
             &[],
         )?;
-        match rows.first().and_then(|r| r.first()) {
-            None => Ok(0),
-            Some(SqlValue::Blob(b)) => {
-                let bytes: [u8; 16] = b
-                    .as_slice()
-                    .try_into()
-                    .map_err(|_| StoreError::Corruption("high-water not 16 bytes".into()))?;
-                Ok(u128::from_be_bytes(bytes))
-            }
-            Some(_) => Err(StoreError::Corruption("high-water shape".into())),
-        }
+        let stored = match stored.first().and_then(|r| r.first()) {
+            None => 0,
+            Some(value) => decode(value)?,
+        };
+
+        let observed = engine.query("SELECT MAX(id) FROM action_generations", &[])?;
+        let observed = match observed.first().and_then(|r| r.first()) {
+            None => 0,
+            Some(value) => decode(value)?,
+        };
+
+        Ok(stored.max(observed))
     }
 
     /// Shared row mapper for `provisional_pins` SELECTs (single source of
@@ -4220,6 +4265,23 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
             .map(|row| match row.as_slice() {
                 [SqlValue::Text(action), SqlValue::Text(pin)] => Ok((action.clone(), pin.clone())),
                 _ => Err(StoreError::Corruption("publication list shape".into())),
+            })
+            .collect()
+    }
+
+    fn publications_missing_their_generation(&mut self) -> Result<Vec<String>, StoreError> {
+        let rows = self.engine.query(
+            "SELECT p.action_key FROM action_publications p \
+             LEFT JOIN action_generations g ON g.id_hex = p.winner_generation_hex \
+             WHERE g.id_hex IS NULL ORDER BY p.action_key",
+            &[],
+        )?;
+        rows.into_iter()
+            .map(|row| match row.as_slice() {
+                [SqlValue::Text(action)] => Ok(action.clone()),
+                _ => Err(StoreError::Corruption(
+                    "orphaned-publication list shape".into(),
+                )),
             })
             .collect()
     }
