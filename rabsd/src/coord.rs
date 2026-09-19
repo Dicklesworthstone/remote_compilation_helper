@@ -24,3 +24,4 @@ pub mod target_lease;
 pub mod live;
 pub mod worker_delivery;
 pub mod secure_worker_delivery;
+pub mod delivery_recovery;
