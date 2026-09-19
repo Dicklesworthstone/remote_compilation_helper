@@ -64,7 +64,7 @@ use rabs_protocol::worker_fence::{
 /// (every execution lease links through its attempt); v22 = peer
 /// authority incarnation fencing (legacy rows require a newer term);
 /// v23 = credential-generation fencing (legacy unknown generations fail closed).
-pub const SCHEMA_VERSION: u32 = 23;
+pub const SCHEMA_VERSION: u32 = 24;
 
 /// One transactional, versioned migration step.
 pub struct Migration {
@@ -483,6 +483,23 @@ pub const MIGRATIONS: &[Migration] = &[
         statements: &[
             "ALTER TABLE peer_authority_high_water ADD COLUMN credential_generation INTEGER",
         ],
+    },
+    Migration {
+        // T010/bd-iuorn: `pins` is append-only. A released pin is marked
+        // and kept, and nothing anywhere deletes from it, so the table
+        // grows by one row per pin lifecycle forever. Live PROTECTION
+        // stays flat — `gc_snapshot` selects `released = 0` — but it
+        // finds those few live rows by scanning a table sized by every
+        // lifecycle the deployment has EVER run, so GC cost grows with
+        // history rather than with live work.
+        //
+        // Index the selected column so the collector reads live pins
+        // instead of history. Same shape as
+        // `idx_provisional_install_state` over `(state)`; deliberately
+        // NOT a partial index, so no engine needs to support the
+        // `WHERE` form for the A002 differential lanes to agree.
+        version: 24,
+        statements: &["CREATE INDEX idx_pins_released ON pins (released)"],
     },
 ];
 
