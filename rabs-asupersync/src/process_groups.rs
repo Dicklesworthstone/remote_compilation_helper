@@ -303,16 +303,38 @@ impl ManagedProcessGroup {
     ///
     /// # Errors
     /// Wait, pipe-drain, or spill errors, after attempting group cleanup and
-    /// joining both output lanes. The stop predicate must not panic.
+    /// joining both output lanes. The default aggregate stdout/stderr budget is
+    /// [`crate::stream_drain::DEFAULT_MAX_CAPTURE_BYTES`]. Drain I/O failure,
+    /// budget exhaustion or a lane startup failure stops the process immediately
+    /// through the same TERM/KILL policy. No partial capture becomes success.
+    /// The stop predicate must not panic.
     pub fn wait_with_bounded_drain_controlled(
+        self,
+        limits: &crate::stream_drain::DrainLimits,
+        stop_requested: impl FnMut() -> bool,
+    ) -> io::Result<crate::stream_drain::DrainedOutput> {
+        self.wait_with_bounded_drain_budget(
+            limits,
+            crate::stream_drain::DEFAULT_MAX_CAPTURE_BYTES,
+            stop_requested,
+        )
+    }
+
+    /// Managed capture with an explicit aggregate byte budget. Zero permits
+    /// empty streams only; resident bytes consume the same budget as spill bytes.
+    /// The limit is execution-resource policy, not a compiler-success condition.
+    /// On failure the process is stopped, residuals are closed, both lanes are
+    /// joined, and an error is returned even if a TERM handler exits with zero.
+    pub fn wait_with_bounded_drain_budget(
         mut self,
         limits: &crate::stream_drain::DrainLimits,
+        maximum: u64,
         mut stop_requested: impl FnMut() -> bool,
     ) -> io::Result<crate::stream_drain::DrainedOutput> {
-        use crate::stream_drain::{LaneDrain, join_lane, spawn_lanes};
+        use crate::stream_drain::MonitoredLanes;
         use std::time::{Duration, Instant};
 
-        let (out_lane, err_lane) = spawn_lanes(&mut self.leader, limits);
+        let lanes = MonitoredLanes::spawn(&mut self.leader, limits, maximum);
         let mut stopping_at = None;
         let mut killed = false;
         let status = loop {
@@ -327,7 +349,7 @@ impl ManagedProcessGroup {
                     break Err(error);
                 }
             }
-            if stopping_at.is_none() && stop_requested() {
+            if stopping_at.is_none() && (lanes.failed() || stop_requested()) {
                 stopping_at = Some(Instant::now());
                 let _ = self.signal_group(GroupSignal::Term);
             }
@@ -344,13 +366,14 @@ impl ManagedProcessGroup {
             std::thread::sleep(Duration::from_millis(10));
         };
         let residual_group_members = reap_residuals(self.pgid);
-        // Evaluate both joins before propagating either error.
-        let stdout = out_lane.map_or_else(|| Ok(LaneDrain::empty()), join_lane);
-        let stderr = err_lane.map_or_else(|| Ok(LaneDrain::empty()), join_lane);
+        // Join both lanes even when waiting for the process itself failed.
+        let streams = lanes.join();
+        let status = status?;
+        let (stdout, stderr) = streams?;
         Ok(crate::stream_drain::DrainedOutput {
-            status: status?,
-            stdout: stdout?,
-            stderr: stderr?,
+            status,
+            stdout,
+            stderr,
             residual_group_members,
         })
     }
@@ -468,6 +491,90 @@ fn split_stat_fields(stat: &str) -> Option<(String, &str)> {
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn capture_budget_exact_boundary_keeps_both_binary_streams() {
+        let dir = tempfile::tempdir().unwrap();
+        let group = ManagedProcessGroup::spawn_with(
+            &spec("sh", "printf 'A\\000B'; printf 'C\\377DE' >&2"),
+            |cmd| { cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()); },
+        ).unwrap();
+        let output = group.wait_with_bounded_drain_budget(
+            &crate::stream_drain::DrainLimits { resident_bound: 0, spill_dir: dir.path().join("spill") },
+            7, || false,
+        ).unwrap();
+        assert!(output.status.success());
+        assert_eq!(std::fs::read(&output.stdout.spill().unwrap().path).unwrap(), b"A\0B");
+        assert_eq!(std::fs::read(&output.stderr.spill().unwrap().path).unwrap(), b"C\xffDE");
+        assert_eq!(output.stdout.total_bytes() + output.stderr.total_bytes(), 7);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn capture_budget_terminates_long_lived_writers_without_waiting_for_caller_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let group = ManagedProcessGroup::spawn_with(
+            &spec("sh", "trap '' TERM; printf abcd; printf efgh >&2; sleep 30 & wait"),
+            |cmd| { cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()); },
+        ).unwrap();
+        let pgid = group.pgid();
+        let start = Instant::now();
+        let mut external_stop = false;
+        let error = group.wait_with_bounded_drain_budget(
+            &crate::stream_drain::DrainLimits { resident_bound: 0, spill_dir: dir.path().join("spill") },
+            7,
+            || { external_stop = start.elapsed() >= Duration::from_secs(3); external_stop },
+        ).unwrap_err();
+        assert!(!external_stop, "only the caller's timeout stopped the failed capture");
+        assert!(matches!(error.get_ref().and_then(|e| e.downcast_ref::<crate::stream_drain::DrainFailure>()),
+            Some(crate::stream_drain::DrainFailure::OutputLimitExceeded { maximum: 7 })));
+        assert!(members_from_proc(pgid).is_empty());
+        let retained: u64 = ["stdout.spill", "stderr.spill"].iter().map(|name| {
+            std::fs::metadata(dir.path().join("spill").join(name)).map_or(0, |m| m.len())
+        }).sum();
+        assert!(retained <= 7, "quota was enforced only after writing");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn spill_io_failure_stops_execution_and_joins_the_other_pipe() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocked = dir.path().join("not-a-directory");
+        std::fs::write(&blocked, b"preserve").unwrap();
+        let group = ManagedProcessGroup::spawn_with(
+            &spec("sh", "printf failed-spill; sleep 30 & wait"),
+            |cmd| { cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()); },
+        ).unwrap();
+        let pgid = group.pgid();
+        let start = Instant::now();
+        let mut external_stop = false;
+        let error = group.wait_with_bounded_drain_controlled(
+            &crate::stream_drain::DrainLimits { resident_bound: 0, spill_dir: blocked.clone() },
+            || { external_stop = start.elapsed() >= Duration::from_secs(3); external_stop },
+        ).unwrap_err();
+        assert!(!external_stop, "drain failure did not reach the process owner");
+        assert!(error.to_string().contains("stdout.spill"));
+        assert!(members_from_proc(pgid).is_empty());
+        assert_eq!(std::fs::read(blocked).unwrap(), b"preserve");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_zero_exit_term_handler_cannot_turn_truncated_output_into_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let group = ManagedProcessGroup::spawn_with(
+            &spec("sh", "trap 'exit 0' TERM; printf too-long; while :; do sleep 1; done"),
+            |cmd| { cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()); },
+        ).unwrap();
+        let pgid = group.pgid();
+        let start = Instant::now();
+        let outcome = group.wait_with_bounded_drain_budget(
+            &crate::stream_drain::DrainLimits { resident_bound: 64, spill_dir: dir.path().join("spill") },
+            1, || start.elapsed() >= Duration::from_secs(3),
+        );
+        assert!(outcome.is_err());
+        assert!(members_from_proc(pgid).is_empty());
+    }
 
     fn spec(program: &str, script: &str) -> ProcessGroupSpec {
         let mut s = ProcessGroupSpec::new(program, ["-c".to_owned(), script.to_owned()]);
