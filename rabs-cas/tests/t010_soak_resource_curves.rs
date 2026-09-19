@@ -36,8 +36,7 @@
 //! a real limit of this test rather than something it papers over.
 
 use rabs_cas::metadata_store::{
-    AuthorityRow, RabsMetadataStore, RusqliteEngine, SqlEngine, SqlMetadataStore, SqlValue,
-    digest_key,
+    AuthorityRow, RabsMetadataStore, RusqliteEngine, SqlMetadataStore, SqlValue,
 };
 use rabs_cas::pin_leases::{PUBLICATION_PIN_CLASS, Releaser, release_pin_scoped};
 use rabs_cas::publication::authority_digest;
