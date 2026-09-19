@@ -3,7 +3,8 @@
 //! Blocking sandbox execution has one session-owned ExecutionTask; control
 //! traffic remains responsive. Negotiated diagnostic and artifact ranges retain
 //! immutable snapshots until identity-bound ACKs. These are post-execution
-//! offers, not publications, authenticated ATP or durable reconnect resume.
+//! offers, not publications or durable reconnect resume. Configured fleet
+//! connections use mutual TLS and native ATP; plaintext is loopback-fixture only.
 //!
 //! CLI: rabs-wkr --coordinator <host:port> [--worker-id ID] [--once]
 //! `--once` waits for every negotiated output/artifact acceptance before exiting.
@@ -12,7 +13,6 @@
 
 use asupersync::cx::Cx;
 use asupersync::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use asupersync::net::TcpStream;
 use asupersync::runtime::RuntimeBuilder;
 use rabs_wkr::artifacts::{self, ARTIFACT_TRANSFER, ArtifactPlan, ArtifactTransferState, CapturedArtifacts};
 use rabs_wkr::execution::{DEFAULT_EXECUTION_TIMEOUT, ExecutionCompletion, ExecutionTask, StopReason};
@@ -76,6 +76,8 @@ fn main() {
                  Serves canonical-exec requests through the sandbox launcher; offers results, never commits.\n\
                  Select output_transfer=ranges-v1 and artifact_transfer=files-v1 in session-ok\n\
                  to retrieve diagnostics and declared compiled artifacts.\n\
+                 Fleet transport requires RABS_WORKER_TLS_CA, RABS_WORKER_TLS_CERT,\n\
+                 RABS_WORKER_TLS_KEY and RABS_WORKER_TLS_SERVER_NAME.\n\
                  Request IDs must increase across restarts; request-status reconciles outcomes.\n\
                  RABS_WORKER_STATE_DIR selects a private durable directory (never reset it to retry work)."
             );
@@ -161,7 +163,8 @@ impl FrameReader {
 
 async fn write_frame<W: AsyncWrite + Unpin>(stream: &mut W, line: &str) -> io::Result<()> {
     let mut bytes = line.as_bytes().to_vec(); bytes.push(b'\n');
-    stream.write_all(&bytes).await
+    stream.write_all(&bytes).await?;
+    stream.flush().await
 }
 
 enum SessionEvent {
@@ -483,17 +486,78 @@ async fn session_loop(
     cx: &Cx, coordinator: &str, report: &rabs_wkr::session::CapabilityReport, once: bool,
     journal: &mut WorkerJournal,
 ) -> Result<(), String> {
-    let mut stream = TcpStream::connect(coordinator.to_string()).await.map_err(|e| format!("connect {coordinator}: {e}"))?;
+    let mut stream = rabs_asupersync::worker_transport::connect_worker(coordinator).await?;
     cx.trace("rabs-wkr connected to coordinator");
-    // Durable identity metadata is not authentication; ATP enrollment is separate.
-    let hello = worker_hello(report, journal);
-    write_frame(&mut stream, &hello).await.map_err(|e| format!("hello write: {e}"))?;
-    let ack = FrameReader::default().read(&mut stream).await.map_err(|e| format!("handshake read: {e}"))?
-        .ok_or_else(|| "no session-ok".to_string())?;
-    if !session_ack_accepted(&ack) { return Err(format!("handshake refused: {ack}")); }
-    let capture_output = output_transfer_requested(&ack)?;
-    let capture_artifacts = artifacts::transfer_requested(&ack)?;
-    validate_recovery_selection(&ack)?;
+    let local_identity = stream.local_identity();
+    let (capture_output, capture_artifacts) = asupersync::time::timeout(
+        asupersync::time::wall_now(),
+        Duration::from_secs(10),
+        async {
+            // Extend, rather than replace, the journal/artifact hello: transport
+            // authentication does not replace durable execution ownership.
+            let mut hello: serde_json::Value = serde_json::from_str(&worker_hello(report, journal))
+                .map_err(|e| format!("local worker hello: {e}"))?;
+            if let Some(identity) = local_identity {
+                hello["peer_id"] = serde_json::json!(identity.peer_id.iter()
+                    .map(|byte| format!("{byte:02x}")).collect::<String>());
+                hello["transport"] = serde_json::json!({"minimum_compatible":1,"current":1});
+                hello["application"] = serde_json::json!({"minimum_compatible":1,"current":1});
+                hello.as_object_mut().ok_or("local worker hello is not an object")?.remove("token_id");
+            }
+            write_frame(&mut stream, &hello.to_string()).await.map_err(|e| format!("hello write: {e}"))?;
+            let mut reader = FrameReader::default();
+            let first = reader.read(&mut stream).await
+                .map_err(|e| format!("handshake read: {e}"))?
+                .ok_or("no worker session admission")?;
+            let ack = match local_identity {
+                Some(identity) => {
+                    let challenge: serde_json::Value = serde_json::from_str(&first)
+                        .map_err(|e| format!("worker challenge JSON: {e}"))?;
+                    let positive = |key: &str| -> Result<u64, String> {
+                        challenge.get(key).and_then(serde_json::Value::as_u64)
+                            .filter(|value| *value != 0)
+                            .ok_or_else(|| format!("invalid worker challenge {key}"))
+                    };
+                    let session = positive("session_id")?;
+                    let operation = positive("operation_id")?;
+                    let token = positive("token_id")?;
+                    let peer_id: String = identity.peer_id.iter().map(|byte| format!("{byte:02x}")).collect();
+                    let scope = format!("canonical-probes:{peer_id}");
+                    if challenge["kind"] != "session-challenge"
+                        || challenge["capability"].as_u64() != Some(3)
+                        || challenge["scope"].as_str() != Some(scope.as_str())
+                        || positive("expires_seq")? <= 1
+                    {
+                        return Err("unexpected authenticated worker capability".to_owned());
+                    }
+                    write_frame(&mut stream, &serde_json::json!({
+                        "kind":"worker-auth", "session_id":session, "operation_id":operation,
+                        "token_id":token, "peer_id":peer_id,
+                    }).to_string()).await.map_err(|e| format!("worker auth write: {e}"))?;
+                    let ack = reader.read(&mut stream).await
+                        .map_err(|e| format!("worker auth response: {e}"))?
+                        .ok_or("no authenticated session-ok")?;
+                    let value: serde_json::Value = serde_json::from_str(&ack)
+                        .map_err(|e| format!("worker session JSON: {e}"))?;
+                    if value["session_id"].as_u64() != Some(session)
+                        || value["publication"] != "disabled" || value["resume"] != "unsupported"
+                    {
+                        return Err("worker session grant does not match its challenge".to_owned());
+                    }
+                    ack
+                }
+                None => first,
+            };
+            if !session_ack_accepted(&ack) { return Err(format!("handshake refused: {ack}")); }
+            let output = output_transfer_requested(&ack)?;
+            let artifacts = artifacts::transfer_requested(&ack)?;
+            validate_recovery_selection(&ack)?;
+            if local_identity.is_some() && !output {
+                return Err("authenticated worker requires complete output retrieval".to_owned());
+            }
+            Ok::<(bool, bool), String>((output, artifacts))
+        },
+    ).await.map_err(|_| "worker session admission deadline exceeded".to_owned())??;
     let cargo_home = std::env::temp_dir().join(format!("rabs-wkr-ch-{}", std::process::id()));
     let home = std::env::temp_dir().join(format!("rabs-wkr-home-{}", std::process::id()));
     let spills = std::env::temp_dir().join(format!("rabs-wkr-spill-{}", std::process::id()));
