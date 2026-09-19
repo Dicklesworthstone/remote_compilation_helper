@@ -2,7 +2,7 @@
 //!
 //! This is byte delivery, not action-cache admission or publication. A worker's
 //! identity and result are claims until the authenticated ATP path supplies its
-//! own proof. The operator transport is deliberately restricted to loopback.
+//! own proof. Plaintext operator transport is deliberately restricted to loopback.
 //! Nothing is installed into a Cargo target directory. A new private directory
 //! receives all bytes; delivery.json is finalized only after complete verification
 //! and filesystem sync. ACK loss after that frontier must never trigger execution
@@ -22,11 +22,35 @@ pub const MAX_DELIVERY_BYTES: u64 = 1024 * 1024 * 1024;
 /// Maximum UTF-8 JSON frame before parsing or allocating its decoded payload.
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
 
+/// Evidence supplied by a trusted transport adapter AFTER session admission.
+/// Never deserialize this from a worker's JSON: labels and claimed peer IDs are
+/// not transport proof. Authentication does not authorize cache publication.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkerAuthentication {
+    pub spki_sha256: [u8; 32],
+    pub session_id: u64,
+    pub identity_generation: u32,
+}
+
 /// Ordered, bounded message transport. Implementations must enforce a deadline
 /// on the entire exchange, not restart the deadline for every received byte.
 pub trait WorkerPeer {
     fn send(&mut self, frame: &Value) -> io::Result<()>;
     fn receive(&mut self) -> io::Result<Value>;
+
+    /// Complete transport-specific admission before the first execution write.
+    /// The default is the explicitly unauthenticated loopback protocol. Secure
+    /// transports must verify the hello against their authenticated peer and
+    /// complete the challenge before sending the selected session grant.
+    fn negotiate(&mut self, _hello: &Value, grant: &Value) -> io::Result<()> {
+        self.send(grant)
+    }
+
+    /// Only the trusted adapter may supply authenticated provenance. A worker
+    /// cannot upgrade the receipt by adding fields to its hello or result.
+    fn authentication(&self) -> Option<WorkerAuthentication> {
+        None
+    }
 }
 
 /// Verified local delivery, even when its final ACK response was lost.
@@ -327,7 +351,8 @@ pub fn receive_execution(
         create_directory(&destination.join("artifacts"))?;
         let mut ack = json!({"kind":"session-ok","output_transfer":"ranges-v1","recovery_protocol":"request-journal-v1"});
         if expected.is_some() { ack["artifact_transfer"] = json!("files-v1"); }
-        peer.send(&ack)?;
+        peer.negotiate(&hello, &ack)?;
+        let authentication = peer.authentication();
         execution_may_have_run = true; // before even a partially successful write
         peer.send(request)?;
         let result = receive(peer, expected_worker)?;
@@ -375,7 +400,12 @@ pub fn receive_execution(
             "stdout_bytes":stdout.len,"stdout_sha256":stdout.sha256,
             "stderr_bytes":stderr.len,"stderr_sha256":stderr.sha256,
             "artifact_manifest":result["artifact_manifest"],"total_bytes":total,
-            "transport_authenticated":false,"publication_authorized":false,"reexecute":false});
+            "transport_authenticated":authentication.is_some(),
+            "worker_spki_sha256":authentication.map(|proof| proof.spki_sha256.iter()
+                .map(|byte| format!("{byte:02x}")).collect::<String>()),
+            "authenticated_session_id":authentication.map(|proof| proof.session_id),
+            "identity_generation":authentication.map(|proof| proof.identity_generation),
+            "publication_authorized":false,"reexecute":false});
         let mut marker = create_file(&destination.join("delivery.pending"))?;
         marker.write_all(&serde_json::to_vec_pretty(&receipt)?)?;
         marker.sync_all()?;
@@ -588,6 +618,63 @@ mod tests {
             let mut peer=fixture(&dest);
             assert!(!receive_execution(&mut peer,&request,"worker",&dest).unwrap_err().execution_may_have_run);
             assert!(!dest.exists()); assert_eq!(peer.replies.len(),7);
+        }
+    }
+
+    #[test]
+    fn wire_claims_cannot_upgrade_transport_provenance() {
+        let parent = tempfile::tempdir().unwrap();
+        let destination = parent.path().join("delivery");
+        let mut peer = fixture(&destination);
+        peer.replies[0]["transport_authenticated"] = json!(true);
+        peer.replies[0]["worker_spki_sha256"] = json!("01".repeat(32));
+        peer.replies[1]["transport_authenticated"] = json!(true);
+        let delivered = receive_execution(&mut peer, &request(), "worker", &destination).unwrap();
+        assert_eq!(delivered.receipt["transport_authenticated"], false);
+        assert!(delivered.receipt["worker_spki_sha256"].is_null());
+    }
+
+    struct AdmissionPeer { inner: Script, reject: bool, admitted: bool }
+    impl WorkerPeer for AdmissionPeer {
+        fn negotiate(&mut self, _hello: &Value, grant: &Value) -> io::Result<()> {
+            if self.reject { return Err(invalid("injected authentication refusal")); }
+            self.inner.send(grant)?;
+            self.admitted = true;
+            Ok(())
+        }
+        fn authentication(&self) -> Option<WorkerAuthentication> {
+            self.admitted.then_some(WorkerAuthentication {
+                spki_sha256: [1; 32], session_id: 42, identity_generation: 1,
+            })
+        }
+        fn send(&mut self, value: &Value) -> io::Result<()> {
+            if matches!(value["kind"].as_str(), Some("output-ack" | "artifact-ack")) {
+                let receipt: Value = serde_json::from_slice(&std::fs::read(
+                    self.inner.destination.join("delivery.json"))?)?;
+                assert_eq!(receipt["transport_authenticated"], true);
+                assert_eq!(receipt["worker_spki_sha256"], "01".repeat(32));
+                assert_eq!(receipt["authenticated_session_id"], 42);
+                assert_eq!(receipt["publication_authorized"], false);
+            }
+            self.inner.send(value)
+        }
+        fn receive(&mut self) -> io::Result<Value> { self.inner.receive() }
+    }
+
+    #[test]
+    fn authentication_precedes_execution_and_is_durable_before_release() {
+        for reject in [true, false] {
+            let parent = tempfile::tempdir().unwrap();
+            let destination = parent.path().join("delivery");
+            let mut peer = AdmissionPeer { inner: fixture(&destination), reject, admitted: false };
+            let result = receive_execution(&mut peer, &request(), "worker", &destination);
+            if reject {
+                assert!(!result.unwrap_err().execution_may_have_run);
+                assert!(peer.inner.sent.is_empty());
+                assert!(!destination.join("delivery.json").exists());
+            } else {
+                assert!(result.unwrap().acknowledgments_confirmed);
+            }
         }
     }
 }
