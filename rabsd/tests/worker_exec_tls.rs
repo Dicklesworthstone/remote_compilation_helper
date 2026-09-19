@@ -81,6 +81,9 @@ struct Receiver {
 }
 impl Receiver {
     fn spawn(root: &Path, pin: &str, tls: Option<&TlsFiles>, destination: &Path) -> Self {
+        Self::spawn_mode(root, pin, tls, destination, false)
+    }
+    fn spawn_mode(root: &Path, pin: &str, tls: Option<&TlsFiles>, destination: &Path, resume: bool) -> Self {
         let request_path = root.join("request.json");
         fs::write(&request_path, request().to_string()).unwrap();
         let stdout = root.join("receiver.stdout");
@@ -91,6 +94,7 @@ impl Receiver {
             .env_remove("RABS_COORD_TLS_CA").env_remove("RABS_COORD_TLS_CERT").env_remove("RABS_COORD_TLS_KEY")
             .stdout(Stdio::from(File::create(&stdout).unwrap()))
             .stderr(Stdio::from(File::create(&stderr).unwrap()));
+        if resume { command.arg("--resume"); }
         if let Some(tls) = tls {
             command.env("RABS_COORD_TLS_CA", &tls.ca)
                 .env("RABS_COORD_TLS_CERT", &tls.certificate).env("RABS_COORD_TLS_KEY", &tls.private_key);
@@ -149,6 +153,14 @@ fn hello(pin: &str) -> Value {
         "recovery_protocols":["request-journal-v1"],
         "output_transfers":["ranges-v1"], "artifact_transfers":["files-v1"]})
 }
+fn recovery_hello(pin: &str) -> Value {
+    let mut hello = hello(pin);
+    hello["boot_generation"] = json!(2);
+    hello["incarnation"] = json!("00000000000000000000000000000002");
+    hello["request_high_water"] = json!(7);
+    hello["result_retentions"] = json!(["durable-result-v1"]);
+    hello
+}
 async fn send(stream: &mut SecureWorkerStream, value: &Value) -> io::Result<()> {
     stream.write_all(format!("{value}\n").as_bytes()).await?;
     stream.flush().await
@@ -166,7 +178,11 @@ async fn receive(stream: &mut SecureWorkerStream) -> io::Result<Value> {
     }
 }
 async fn authenticate(stream: &mut SecureWorkerStream, pin: &str) -> u64 {
-    send(stream, &hello(pin)).await.unwrap();
+    authenticate_mode(stream, pin, false).await
+}
+async fn authenticate_mode(stream: &mut SecureWorkerStream, pin: &str, resume: bool) -> u64 {
+    let hello = if resume { recovery_hello(pin) } else { hello(pin) };
+    send(stream, &hello).await.unwrap();
     let challenge = receive(stream).await.unwrap();
     assert_eq!(challenge["kind"], "session-challenge");
     assert_eq!(challenge["capability"], 3);
@@ -181,19 +197,35 @@ async fn authenticate(stream: &mut SecureWorkerStream, pin: &str) -> u64 {
     assert_eq!(grant["artifact_transfer"], "files-v1");
     assert_eq!(grant["output_transfer"], "ranges-v1");
     assert_eq!(grant["publication"], "disabled");
-    assert_eq!(receive(stream).await.unwrap(), request(), "dispatch must preserve the entire request");
+    let expected = if resume {
+        assert_eq!(grant["result_retention"], "durable-result-v1");
+        json!({"kind":"result-resume", "request_id":7, "request":request()})
+    } else { request() };
+    assert_eq!(receive(stream).await.unwrap(), expected, "dispatch must preserve the entire selected operation");
     session
 }
 
 async fn deliver(stream: &mut SecureWorkerStream, destination: &Path, pin: &str, session: u64, corrupt: bool) {
+    deliver_mode(stream, destination, pin, session, corrupt, false, false).await;
+}
+async fn deliver_mode(
+    stream: &mut SecureWorkerStream, destination: &Path, pin: &str, session: u64,
+    corrupt: bool, resumed: bool, lose_ack: bool,
+) {
     // More than a range; includes NUL, invalid UTF-8 and all byte values.
     let stdout: Vec<u8> = (0..65_549).map(|index| (index % 256) as u8).collect();
-    send(stream, &json!({"kind":"exec-result", "request_id":7, "executed":true, "exit_code":0,
+    let mut result = json!({"kind":"exec-result", "request_id":7, "executed":true, "exit_code":0,
         "residual_group_members":0, "stop_reason":null, "output_transfer":"ranges-v1", "output_ack_required":true,
         "stdout_bytes":stdout.len(), "stdout_sha256":hash(&stdout), "stderr_bytes":0, "stderr_sha256":hash(b""),
         "artifact_transfer":"files-v1", "artifact_ack_required":true, "artifact_manifest":{
             "unit":"dep", "files":[{"name":"a", "bytes":4, "sha256":hash(ARTIFACT), "executable":false}],
-            "total_bytes":4, "manifest_sha256":MANIFEST}})).await.unwrap();
+            "total_bytes":4, "manifest_sha256":MANIFEST}});
+    if resumed {
+        result["resumed"] = json!(true);
+        result["result_retention"] = json!("durable-result-v1");
+        result["retained_result_sha256"] = json!("07".repeat(32));
+    }
+    send(stream, &result).await.unwrap();
     let mut acknowledgments = 0;
     let mut stdout_ranges = 0;
     loop {
@@ -241,6 +273,11 @@ async fn deliver(stream: &mut SecureWorkerStream, destination: &Path, pin: &str,
                 assert_eq!(receipt["worker_spki_sha256"], pin);
                 assert_eq!(receipt["authenticated_session_id"], session);
                 assert_eq!(receipt["publication_authorized"], false);
+                if resumed {
+                    assert_eq!(receipt["resumed"], true);
+                    assert_eq!(receipt["worker_identity_scope"], "delivery-session");
+                    assert!(receipt["execution_boot_generation"].is_null());
+                }
                 assert_eq!(fs::read(destination.join("diagnostics/stdout")).unwrap(), stdout);
                 assert_eq!(fs::read(destination.join("artifacts/a")).unwrap(), ARTIFACT);
                 let output = query["kind"] == "output-ack";
@@ -250,6 +287,7 @@ async fn deliver(stream: &mut SecureWorkerStream, destination: &Path, pin: &str,
                 } else {
                     assert_eq!(query["manifest_sha256"], MANIFEST);
                     assert_eq!(query["total_bytes"], 4);
+                    if lose_ack { return; } // peer drops after the local durability frontier
                 }
                 send(stream, &json!({"kind":if output {"output-acknowledged"} else {"artifact-acknowledged"},
                     "request_id":7, "already_released":false})).await.unwrap();
@@ -350,10 +388,11 @@ fn existing_delivery_is_untouched_before_any_network_or_credential_operation() {
     fs::write(destination.join("sentinel"), b"keep").unwrap();
     let mut receiver = Receiver::spawn(root.path(), &"01".repeat(32), None, &destination);
     assert!(!receiver.wait().success());
-    assert!(receiver.logs().contains("delivery directory already exists"));
+    assert!(receiver.logs().contains("retained delivery cannot be replayed"));
     assert!(!receiver.logs().contains("worker-exec-listening"));
     assert_eq!(fs::read(destination.join("sentinel")).unwrap(), b"keep");
-    assert_eq!(receiver.failure()["execution_may_have_run"], false);
+    // Existing partial state is uncertain, not evidence the original never ran.
+    assert_eq!(receiver.failure()["execution_may_have_run"], true);
 }
 
 #[test]
@@ -399,4 +438,154 @@ fn authenticated_peer_with_wrong_challenge_cannot_receive_execution() {
     assert_eq!(receiver.failure()["execution_may_have_run"], false);
     assert!(receiver.logs().contains("challenge response mismatch"));
     assert!(!destination.join("delivery.json").exists());
+}
+
+#[test]
+fn actual_receiver_resumes_binary_outputs_and_replays_locally_after_ack_loss() {
+    let certificates = Certificates::new();
+    let pin = certificates.pin();
+    for lose_ack in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let destination = root.path().join("recovered");
+        let partial = root.path().join("previous-partial");
+        fs::create_dir(&partial).unwrap();
+        fs::write(partial.join("sentinel"), b"untrusted old bytes").unwrap();
+        let mut receiver = Receiver::spawn_mode(root.path(), &pin, Some(&certificates.server), &destination, true);
+        let address = receiver.listening();
+        let runtime = RuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            asupersync::time::timeout(asupersync::time::wall_now(), Duration::from_secs(15), async {
+                let mut peer = connect_peer(&address, "localhost", &certificates.worker).await.unwrap();
+                let session = authenticate_mode(&mut peer.stream, &pin, true).await;
+                deliver_mode(&mut peer.stream, &destination, &pin, session, false, true, lose_ack).await;
+            }).await.expect("authenticated resume timed out");
+        });
+        assert!(receiver.wait().success(), "{}", receiver.logs());
+        let reported: Value = serde_json::from_slice(&fs::read(&receiver.stdout).unwrap()).unwrap();
+        assert_eq!(reported["acknowledgments_confirmed"], !lose_ack);
+        assert_eq!(reported["receipt"]["resumed"], true);
+        assert_eq!(reported["receipt"]["transport_authenticated"], true);
+        assert_eq!(reported["receipt"]["boot_generation"], 2);
+        assert_eq!(reported["reexecute"], false);
+        assert_eq!(fs::read(partial.join("sentinel")).unwrap(), b"untrusted old bytes");
+        let receipt = fs::read(destination.join("delivery.json")).unwrap();
+        drop(receiver);
+        // The complete result must be recoverable without a worker, credentials
+        // or another TLS handshake, even if the remote final acknowledgment died.
+        let mut offline = Receiver::spawn_mode(root.path(), &pin, None, &destination, true);
+        assert!(offline.wait().success(), "{}", offline.logs());
+        assert!(!offline.logs().contains("worker-exec-listening"));
+        let replay: Value = serde_json::from_slice(&fs::read(&offline.stdout).unwrap()).unwrap();
+        assert_eq!(replay["receipt"], reported["receipt"]);
+        assert_eq!(replay["reexecute"], false);
+        assert_eq!(fs::read(destination.join("delivery.json")).unwrap(), receipt);
+    }
+}
+
+#[test]
+fn unavailable_retained_result_is_not_reexecuted_by_actual_tls_operator() {
+    let certificates = Certificates::new();
+    let pin = certificates.pin();
+    let root = tempfile::tempdir().unwrap();
+    let destination = root.path().join("unavailable");
+    let mut receiver = Receiver::spawn_mode(root.path(), &pin, Some(&certificates.server), &destination, true);
+    let address = receiver.listening();
+    let runtime = RuntimeBuilder::current_thread().build().unwrap();
+    runtime.block_on(async {
+        asupersync::time::timeout(asupersync::time::wall_now(), Duration::from_secs(15), async {
+            let mut peer = connect_peer(&address, "localhost", &certificates.worker).await.unwrap();
+            authenticate_mode(&mut peer.stream, &pin, true).await;
+            send(&mut peer.stream, &json!({"kind":"error", "request_id":7, "error":"retained result unavailable"})).await.unwrap();
+            assert!(receive(&mut peer.stream).await.is_err(), "resume failure caused another operation");
+        }).await.expect("unavailable-result refusal timed out");
+    });
+    assert!(!receiver.wait().success());
+    assert_eq!(receiver.failure()["execution_may_have_run"], true);
+    assert_eq!(receiver.failure()["reexecute"], false);
+    assert!(!destination.join("delivery.json").exists());
+}
+
+#[test]
+fn resume_capability_high_water_and_pin_refusals_preserve_uncertainty() {
+    let certificates = Certificates::new();
+    let pin = certificates.pin();
+    let runtime = RuntimeBuilder::current_thread().build().unwrap();
+    for case in 0..4 {
+        let root = tempfile::tempdir().unwrap();
+        let destination = root.path().join("refused");
+        let expected_pin = if case == 3 {
+            if pin == "01".repeat(32) { "02".repeat(32) } else { "01".repeat(32) }
+        } else { pin.clone() };
+        let mut receiver = Receiver::spawn_mode(root.path(), &expected_pin, Some(&certificates.server), &destination, true);
+        let address = receiver.listening();
+        runtime.block_on(async {
+            asupersync::time::timeout(asupersync::time::wall_now(), Duration::from_secs(15), async {
+                let mut peer = connect_peer(&address, "localhost", &certificates.worker).await.unwrap();
+                let mut hello = recovery_hello(&pin);
+                match case {
+                    0 => hello["result_retentions"] = json!([]),
+                    1 => hello["request_high_water"] = json!(6),
+                    2 => hello["request_high_water"] = json!(8),
+                    _ => {}
+                }
+                let _ = send(&mut peer.stream, &hello).await;
+                assert!(receive(&mut peer.stream).await.is_err(), "invalid recovery reached application admission");
+            }).await.expect("recovery admission refusal timed out");
+        });
+        assert!(!receiver.wait().success());
+        assert_eq!(receiver.failure()["execution_may_have_run"], true);
+        assert_eq!(receiver.failure()["reexecute"], false);
+        assert!(!destination.exists());
+    }
+}
+
+#[test]
+fn resume_preconnect_errors_and_partial_directories_never_become_new_execution() {
+    for case in 0..3 {
+        let root = tempfile::tempdir().unwrap();
+        let destination = root.path().join("refused");
+        if case == 2 {
+            fs::create_dir(&destination).unwrap();
+            fs::write(destination.join("sentinel"), b"keep").unwrap();
+        }
+        let pin = if case == 1 { "invalid".to_owned() } else { "01".repeat(32) };
+        let mut receiver = Receiver::spawn_mode(root.path(), &pin, None, &destination, true);
+        assert!(!receiver.wait().success());
+        assert!(!receiver.logs().contains("worker-exec-listening"));
+        assert_eq!(receiver.failure()["execution_may_have_run"], true);
+        assert_eq!(receiver.failure()["reexecute"], false);
+        if case == 2 {
+            assert_eq!(fs::read(destination.join("sentinel")).unwrap(), b"keep");
+            assert_eq!(fs::read_dir(&destination).unwrap().count(), 1);
+        } else { assert!(!destination.exists()); }
+    }
+}
+
+#[test]
+fn resumed_artifact_corruption_keeps_old_partial_files_and_never_acknowledges() {
+    let certificates = Certificates::new();
+    let pin = certificates.pin();
+    let root = tempfile::tempdir().unwrap();
+    let destination = root.path().join("corrupt-resume");
+    let mut receiver = Receiver::spawn_mode(root.path(), &pin, Some(&certificates.server), &destination, true);
+    let address = receiver.listening();
+    let runtime = RuntimeBuilder::current_thread().build().unwrap();
+    runtime.block_on(async {
+        asupersync::time::timeout(asupersync::time::wall_now(), Duration::from_secs(15), async {
+            let mut peer = connect_peer(&address, "localhost", &certificates.worker).await.unwrap();
+            let session = authenticate_mode(&mut peer.stream, &pin, true).await;
+            deliver_mode(&mut peer.stream, &destination, &pin, session, true, true, false).await;
+        }).await.expect("resumed corruption refusal timed out");
+    });
+    assert!(!receiver.wait().success());
+    assert_eq!(receiver.failure()["execution_may_have_run"], true);
+    assert!(receiver.logs().contains("complete file digest mismatch"));
+    assert!(!destination.join("delivery.json").exists());
+    let partial_bytes = fs::read(destination.join("artifacts/a")).unwrap();
+    drop(receiver);
+    let mut repeat = Receiver::spawn_mode(root.path(), &pin, None, &destination, true);
+    assert!(!repeat.wait().success());
+    assert!(!repeat.logs().contains("worker-exec-listening"));
+    assert_eq!(fs::read(destination.join("artifacts/a")).unwrap(), partial_bytes);
+    assert_eq!(repeat.failure()["reexecute"], false);
 }
