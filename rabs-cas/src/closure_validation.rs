@@ -6,20 +6,27 @@
 //! graphs can encode cycles (infinite traversal), pathological
 //! depth/fan-out (allocation bombs), dangling references (closure
 //! holes), and overlapping or out-of-bounds pack ranges (aliased
-//! bytes). Validation rejects ALL of it with BOUNDED work — limits are
-//! checked as counters during one traversal, so a hostile graph is
-//! refused before any allocation-heavy expansion.
+//! bytes). Validation rejects ALL of it with BOUNDED work.
+//!
+//! The claimed closure is bounded before indexing. An iterative DFS
+//! visits each reachable node and edge once, without consuming the
+//! process stack. Completed nodes retain their longest descendant path:
+//! sharing a subtree cannot hide an over-depth path through another
+//! parent, even when the shallow path was visited first.
+
+use std::collections::HashMap;
 
 use rabs_protocol::result_identity::ObjectId;
 
 /// Bounds for manifest graphs (fleet policy; conservative defaults).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GraphBounds {
-    /// Maximum reference depth.
+    /// Maximum reference depth, measured in edges from the root.
     pub max_depth: usize,
     /// Maximum children per node.
     pub max_fanout: usize,
-    /// Maximum total nodes visited.
+    /// Maximum entries in the supplied closure, including unreachable
+    /// entries. Checked before allocating the lookup index.
     pub max_nodes: usize,
 }
 
@@ -53,10 +60,34 @@ pub enum ClosureError {
     NodeCountExceeded,
     /// A referenced identity is absent from the closure.
     DanglingReference(ObjectId),
+    /// The claimed closure defines an identity more than once. Even
+    /// identical duplicates are refused rather than making lookup order
+    /// or a consumer's choice of duplicate part of the graph's meaning.
+    DuplicateNode(ObjectId),
+}
+
+#[derive(Clone, Copy)]
+enum VisitState {
+    Unseen,
+    Active,
+    /// Longest path from this node to a reachable leaf, in edges.
+    Complete(usize),
+}
+
+struct Frame {
+    node: usize,
+    next_child: usize,
+    height: usize,
 }
 
 /// Validate the manifest graph rooted at `root`: acyclic, bounded,
 /// closed. `nodes` is the claimed closure (id → node).
+///
+/// The input count, duplicate identities and fan-out are checked before
+/// traversal. Reachable nodes are indexed, not repeatedly searched, and
+/// completed subtree heights are checked at EVERY incoming edge. Work is
+/// linear in the supplied nodes and reachable edges (expected hash-map
+/// lookup cost); memory is linear in the supplied nodes, not path count.
 ///
 /// # Errors
 /// The first [`ClosureError`] encountered.
@@ -65,43 +96,81 @@ pub fn validate_closure(
     nodes: &[ManifestNode],
     bounds: GraphBounds,
 ) -> Result<(), ClosureError> {
-    fn visit(
-        id: &ObjectId,
-        nodes: &[ManifestNode],
-        bounds: GraphBounds,
-        depth: usize,
-        stack: &mut Vec<ObjectId>,
-        visited: &mut Vec<ObjectId>,
-    ) -> Result<(), ClosureError> {
-        if depth > bounds.max_depth {
-            return Err(ClosureError::DepthExceeded);
-        }
-        if stack.contains(id) {
-            return Err(ClosureError::Cycle(id.clone()));
-        }
-        if visited.contains(id) {
-            return Ok(()); // shared subtree (DAG): fine, already checked
-        }
-        if visited.len() >= bounds.max_nodes {
-            return Err(ClosureError::NodeCountExceeded);
-        }
-        let Some(node) = nodes.iter().find(|n| n.id == *id) else {
-            return Err(ClosureError::DanglingReference(id.clone()));
-        };
-        if node.references.len() > bounds.max_fanout {
-            return Err(ClosureError::FanoutExceeded(id.clone()));
-        }
-        visited.push(id.clone());
-        stack.push(id.clone());
-        for reference in &node.references {
-            visit(reference, nodes, bounds, depth + 1, stack, visited)?;
-        }
-        stack.pop();
-        Ok(())
+    if nodes.len() > bounds.max_nodes {
+        return Err(ClosureError::NodeCountExceeded);
     }
-    let mut stack = Vec::new();
-    let mut visited = Vec::new();
-    visit(root, nodes, bounds, 0, &mut stack, &mut visited)
+    let mut index = HashMap::with_capacity(nodes.len());
+    for (position, node) in nodes.iter().enumerate() {
+        if node.references.len() > bounds.max_fanout {
+            return Err(ClosureError::FanoutExceeded(node.id.clone()));
+        }
+        if index.insert(&node.id, position).is_some() {
+            return Err(ClosureError::DuplicateNode(node.id.clone()));
+        }
+    }
+    let Some(&root_index) = index.get(root) else {
+        return Err(ClosureError::DanglingReference(root.clone()));
+    };
+    let mut states = vec![VisitState::Unseen; nodes.len()];
+    states[root_index] = VisitState::Active;
+    let mut stack = vec![Frame {
+        node: root_index,
+        next_child: 0,
+        height: 0,
+    }];
+
+    while let Some(mut frame) = stack.pop() {
+        // After popping, the remaining frames are exactly this node's
+        // ancestors. No recursion or caller-selected stack depth is used.
+        let depth = stack.len();
+        let node = &nodes[frame.node];
+        if let Some(child) = node.references.get(frame.next_child) {
+            frame.next_child += 1;
+            let child_depth = depth.checked_add(1).ok_or(ClosureError::DepthExceeded)?;
+            if child_depth > bounds.max_depth {
+                return Err(ClosureError::DepthExceeded);
+            }
+            let Some(&child_index) = index.get(child) else {
+                return Err(ClosureError::DanglingReference(child.clone()));
+            };
+            match states[child_index] {
+                VisitState::Active => return Err(ClosureError::Cycle(child.clone())),
+                VisitState::Complete(height) => {
+                    // A shallow visit does not prove a deeper incoming
+                    // path safe. Account for the ENTIRE cached subtree.
+                    if height > bounds.max_depth - child_depth {
+                        return Err(ClosureError::DepthExceeded);
+                    }
+                    let through_child =
+                        height.checked_add(1).ok_or(ClosureError::DepthExceeded)?;
+                    frame.height = frame.height.max(through_child);
+                    stack.push(frame);
+                }
+                VisitState::Unseen => {
+                    stack.push(frame);
+                    states[child_index] = VisitState::Active;
+                    stack.push(Frame {
+                        node: child_index,
+                        next_child: 0,
+                        height: 0,
+                    });
+                }
+            }
+        } else {
+            if frame.height > bounds.max_depth - depth {
+                return Err(ClosureError::DepthExceeded);
+            }
+            states[frame.node] = VisitState::Complete(frame.height);
+            if let Some(parent) = stack.last_mut() {
+                let through_child = frame
+                    .height
+                    .checked_add(1)
+                    .ok_or(ClosureError::DepthExceeded)?;
+                parent.height = parent.height.max(through_child);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// One pack member: byte range inside the pack blob.
@@ -176,6 +245,132 @@ mod tests {
         // Diamond: 1 -> {2, 3} -> 4 (shared). A DAG, not a cycle.
         let nodes = vec![node(1, &[2, 3]), node(2, &[4]), node(3, &[4]), node(4, &[])];
         assert_eq!(validate_closure(&id(1), &nodes, DEFAULT_BOUNDS), Ok(()));
+    }
+
+    #[test]
+    fn shared_subtrees_respect_longest_path_in_either_visit_order() {
+        // The shallow path 1 -> 2 -> 4 -> 5 has depth 3. Visiting it
+        // first must not hide 1 -> 3 -> 2 -> 4 -> 5, whose depth is 4.
+        for references in [[2, 3], [3, 2]] {
+            let mut nodes = vec![
+                node(1, &references),
+                node(2, &[4]),
+                node(3, &[2]),
+                node(4, &[5]),
+                node(5, &[]),
+            ];
+            for _ in 0..2 {
+                assert_eq!(
+                    validate_closure(
+                        &id(1),
+                        &nodes,
+                        GraphBounds {
+                            max_depth: 3,
+                            ..DEFAULT_BOUNDS
+                        },
+                    ),
+                    Err(ClosureError::DepthExceeded)
+                );
+                assert_eq!(
+                    validate_closure(
+                        &id(1),
+                        &nodes,
+                        GraphBounds {
+                            max_depth: 4,
+                            ..DEFAULT_BOUNDS
+                        },
+                    ),
+                    Ok(())
+                );
+                nodes.reverse();
+            }
+        }
+    }
+
+    #[test]
+    fn duplicate_identities_cannot_hide_a_different_graph() {
+        for duplicate in [node(1, &[]), node(1, &[1]), node(1, &[99])] {
+            let mut nodes = vec![node(1, &[]), duplicate];
+            for _ in 0..2 {
+                assert_eq!(
+                    validate_closure(&id(1), &nodes, DEFAULT_BOUNDS),
+                    Err(ClosureError::DuplicateNode(id(1)))
+                );
+                nodes.reverse();
+            }
+        }
+    }
+
+    #[test]
+    fn input_budget_and_zero_depth_are_enforced() {
+        let root_only = [node(1, &[])];
+        let zero_depth = GraphBounds {
+            max_depth: 0,
+            max_fanout: 1,
+            max_nodes: 1,
+        };
+        assert_eq!(validate_closure(&id(1), &root_only, zero_depth), Ok(()));
+        assert_eq!(
+            validate_closure(
+                &id(1),
+                &root_only,
+                GraphBounds {
+                    max_nodes: 0,
+                    ..zero_depth
+                },
+            ),
+            Err(ClosureError::NodeCountExceeded)
+        );
+        assert_eq!(
+            validate_closure(&id(1), &[], zero_depth),
+            Err(ClosureError::DanglingReference(id(1)))
+        );
+        assert_eq!(
+            validate_closure(&id(1), &[node(1, &[1])], zero_depth),
+            Err(ClosureError::DepthExceeded)
+        );
+        // Unreachable padding must not bypass the pre-allocation budget.
+        assert_eq!(
+            validate_closure(&id(1), &[node(1, &[]), node(2, &[])], zero_depth),
+            Err(ClosureError::NodeCountExceeded)
+        );
+    }
+
+    #[test]
+    fn large_depth_policy_does_not_recurse_on_process_stack() {
+        fn numbered_id(number: usize) -> ObjectId {
+            let mut object = id(0);
+            object.0.bytes[..8].copy_from_slice(&u64::try_from(number).unwrap().to_be_bytes());
+            object
+        }
+        let count = 20_000;
+        let nodes: Vec<_> = (0..count)
+            .map(|number| ManifestNode {
+                id: numbered_id(number),
+                references: if number + 1 == count {
+                    Vec::new()
+                } else {
+                    vec![numbered_id(number + 1)]
+                },
+            })
+            .collect();
+        let result = std::thread::Builder::new()
+            .stack_size(64 * 1024)
+            .spawn(move || {
+                validate_closure(
+                    &numbered_id(0),
+                    &nodes,
+                    GraphBounds {
+                        max_depth: usize::MAX,
+                        max_fanout: 1,
+                        max_nodes: count,
+                    },
+                )
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        assert_eq!(result, Ok(()));
     }
 
     #[test]
