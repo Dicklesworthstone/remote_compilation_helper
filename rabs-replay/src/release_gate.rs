@@ -331,9 +331,7 @@ mod tests {
         };
 
         let mut explained_policy = policy();
-        explained_policy
-            .explained
-            .insert("cargo doc".to_owned());
+        explained_policy.explained.insert("cargo doc".to_owned());
         let run = report(
             vec![
                 row("cargo build", false, true),
@@ -344,8 +342,8 @@ mod tests {
             0,
             0,
         );
-        let authorized =
-            evaluate_release_gate(&run, &explained_policy).expect("explained divergence authorizes");
+        let authorized = evaluate_release_gate(&run, &explained_policy)
+            .expect("explained divergence authorizes");
 
         let validity = ServingValidity {
             evaluated_at_unix_micros: 1_000,

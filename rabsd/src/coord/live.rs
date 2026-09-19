@@ -32,9 +32,6 @@ use crate::coord::action_actor::{
 };
 use crate::coord::target_lease::TargetLeaseRegistry;
 use crate::edge::destination_arbiter::{BundleId, DestinationArbiter, reserve_scoped};
-use rabs_protocol::release_authorization::{
-    ReleaseAuthorization, ReleaseAuthorizationMode, authorization as release_standing,
-};
 use crate::janitor::store::LiveCas;
 use rabs_cas::blob_store::RAW_PROFILE_V1;
 use rabs_cas::digest_set::ATP_OBJECT_CONTENT_DOMAIN;
@@ -62,6 +59,9 @@ use rabs_protocol::generation::{
     WorkerIncarnationId,
 };
 use rabs_protocol::input_evidence::{ActionInputManifest, InputFileType};
+use rabs_protocol::release_authorization::{
+    ReleaseAuthorization, ReleaseAuthorizationMode, authorization as release_standing,
+};
 use rabs_protocol::result_identity::{CanonicalActionResultManifest, DigestAlgorithm, TypedDigest};
 use rabs_protocol::wire_time::PeerId;
 use rabs_protocol::worker_fence::{WorkerAdmission, WorkerSessionOffer};

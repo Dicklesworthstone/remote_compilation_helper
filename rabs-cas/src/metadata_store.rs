@@ -38,8 +38,8 @@ use rabs_protocol::generation::{
     ActionGeneration, ActionGenerationId, AttemptAuthority, LeaseRenewal, WorkerBootGeneration,
     WorkerIncarnationId,
 };
-use rabs_protocol::result_identity::{DigestAlgorithm, TypedDigest};
 use rabs_protocol::release_authorization::ReleaseVerdict;
+use rabs_protocol::result_identity::{DigestAlgorithm, TypedDigest};
 use rabs_protocol::serving::ServingValidity;
 use rabs_protocol::wire_time::PeerId;
 use rabs_protocol::worker_fence::{
@@ -519,8 +519,7 @@ pub const MIGRATIONS: &[Migration] = &[
         // so a release verdict expires under the same clock discipline
         // as a publication rather than under a second notion of time.
         version: 25,
-        statements: &[
-            "CREATE TABLE release_verdicts ( \
+        statements: &["CREATE TABLE release_verdicts ( \
          build TEXT PRIMARY KEY, \
          corpus TEXT NOT NULL, \
          replayed INTEGER NOT NULL, \
@@ -528,8 +527,7 @@ pub const MIGRATIONS: &[Migration] = &[
          evaluated_at_micros INTEGER NOT NULL, \
          max_age_micros INTEGER, \
          clock_uncertainty_micros INTEGER NOT NULL, \
-         clock_epoch INTEGER NOT NULL)",
-        ],
+         clock_epoch INTEGER NOT NULL)"],
     },
 ];
 
@@ -5929,8 +5927,15 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
         let Some(row) = rows.first() else {
             return Ok(None);
         };
-        let [corpus, replayed, explained, evaluated_at, max_age, uncertainty, epoch] =
-            row.as_slice()
+        let [
+            corpus,
+            replayed,
+            explained,
+            evaluated_at,
+            max_age,
+            uncertainty,
+            epoch,
+        ] = row.as_slice()
         else {
             return Err(StoreError::Corruption("release verdict shape".into()));
         };
@@ -9189,8 +9194,7 @@ mod tests {
         // A verdict with no expiry stores its NULL max-age as absence of
         // a bound, not as a zero-length window that expires instantly.
         verdict.validity.maximum_age_micros = None;
-        let mut store =
-            SqlMetadataStore::open(RusqliteEngine::open_in_memory().unwrap()).unwrap();
+        let mut store = SqlMetadataStore::open(RusqliteEngine::open_in_memory().unwrap()).unwrap();
         store.record_release_verdict(&verdict).unwrap();
         let stored = store.release_verdict("rabs-build-1").unwrap();
         assert_eq!(

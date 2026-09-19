@@ -1092,8 +1092,11 @@ fn the_release_gate_governs_serving_promotion_for_the_whole_build() {
         ReleaseAuthorization, ReleaseAuthorizationMode, ReleaseVerdict,
     };
     use rabs_protocol::serving::ServingValidity;
+    use rabs_replay::ReplayCommand;
     use rabs_replay::release_gate::{ReleasePolicy, evaluate_release_gate};
-    use rabs_replay::shadow_pipeline::{CachedObservation, ShadowServingBackend, run_shadow_pipeline};
+    use rabs_replay::shadow_pipeline::{
+        CachedObservation, ServingDecision, ShadowServingBackend, run_shadow_pipeline,
+    };
 
     const BUILD: &str = "rabsd-build-under-test";
 
@@ -1182,25 +1185,40 @@ fn the_release_gate_governs_serving_promotion_for_the_whole_build() {
     );
 
     // Run the REAL gate over a real corpus and mint its authorization.
-    struct NoCache;
-    impl ShadowServingBackend for NoCache {
-        fn lookup(&mut self, _command: &str) -> Option<CachedObservation> {
+    //
+    // The replay paths genuinely `sh -c` every record — that is what
+    // makes a differential run evidence rather than a simulation — so
+    // the corpus is deliberately trivial shell, not real compiles. The
+    // gate cannot tell the difference, which is the point: it is
+    // counting agreement between two execution paths.
+    struct NeverCached;
+    impl ShadowServingBackend for NeverCached {
+        fn decide(&mut self, _invocation: &ReplayCommand) -> ServingDecision {
+            // Every record executes privately, so nothing in this run is
+            // a SERVED divergence. A served divergence is unexplainable
+            // by policy and would refuse outright; keeping the corpus
+            // clean is what lets the authorized path be exercised.
+            ServingDecision::ExecutePrivately
+        }
+        fn served_observation(&mut self, _invocation: &ReplayCommand) -> Option<CachedObservation> {
             None
         }
     }
-    let corpus: Vec<String> = ["cargo build", "cargo test", "cargo check"]
+    let corpus: Vec<String> = ["true", "echo alpha", "echo beta"]
         .iter()
         .map(|command| {
             serde_json::json!({
-                "schema": "rabs.replay.invocation.v1",
-                "command": command,
-                "exit_code": 0,
+                "argv_redacted": command.split(' ').collect::<Vec<&str>>(),
+                "cwd_redacted": std::env::temp_dir().to_string_lossy(),
+                "outcome_kind": "exited",
+                "outcome_value": 0,
+                "duration_ms": 1_u64,
             })
             .to_string()
         })
         .collect();
     let lines: Vec<&str> = corpus.iter().map(String::as_str).collect();
-    let report = run_shadow_pipeline(&lines, &mut NoCache);
+    let report = run_shadow_pipeline(&lines, &mut NeverCached);
     let authorized = evaluate_release_gate(
         &report,
         &ReleasePolicy {
