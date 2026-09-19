@@ -1208,6 +1208,14 @@ pub enum MemberDisposition {
     ExcludeEphemeralLock,
     /// `.git` hidden: no canonical git-state object was declared.
     HiddenGitState,
+    /// Refused by the E027 source-capture policy (credential and key
+    /// locations, or a project-declared non-uploadable class).
+    ///
+    /// A distinct disposition rather than a silent drop: what did NOT
+    /// leave the machine is exactly the thing an operator needs to be
+    /// able to see, and a capture that quietly omitted files would be
+    /// indistinguishable from one that lost them.
+    ExcludeSecretPolicy,
 }
 
 /// Names that are always-include even when untracked/ignored: the
@@ -1236,6 +1244,39 @@ fn is_ephemeral_lock(rel_path: &str) -> bool {
 /// declared for this capture (D031); without it `.git` stays hidden.
 #[must_use]
 pub fn member_disposition(rel_path: &str, declared_git_state: bool) -> MemberDisposition {
+    // E027 source-capture policy is consulted FIRST, ahead of the
+    // always-include set. This is the boundary where bytes leave the
+    // developer's machine, and `source_capture`'s own doctrine is that
+    // structural refusals dominate configuration — a build-identity
+    // file is not a reason to upload a credential.
+    //
+    // Only `BuildInputAllowed` may be captured. Every other class means
+    // "not uploadable": `Denied` and `SecretCapability` are credential
+    // locations, `LocalOnly` and `ExplicitOperatorApproval` are paths
+    // the project declared non-portable. Erring toward exclusion is
+    // right here — a false positive costs an action its remote
+    // execution, a false negative ships a secret to a worker.
+    //
+    // SCOPE, stated rather than implied: this applies the NAME-based
+    // policy only. `PathShape::REGULAR` is passed because membership is
+    // decided from a relative path with no filesystem facts attached;
+    // the structural refusals (symlink escape, device/socket nodes,
+    // unrelated ancestors) remain the scanner's own job, which it
+    // already does — symlinks are recorded and never followed, and
+    // paths outside the root are refused. `configured` is `None`
+    // because no project policy file is plumbed here yet, so only the
+    // built-in seed set applies; a project that wants to declare extra
+    // classes has nowhere to say so, which is a real follow-up.
+    if !matches!(
+        crate::source_capture::classify_path(
+            rel_path.as_bytes(),
+            crate::source_capture::PathShape::REGULAR,
+            None,
+        ),
+        crate::source_capture::SourceCapturePolicy::BuildInputAllowed
+    ) {
+        return MemberDisposition::ExcludeSecretPolicy;
+    }
     if ALWAYS_INCLUDE.contains(&rel_path) {
         return MemberDisposition::Include;
     }
@@ -2096,6 +2137,83 @@ mod tests {
         let provenance = base.provenance();
         assert_eq!(provenance.manifest_sha256, base.manifest_sha256);
         assert_eq!(provenance.snapshot_root, "workspace");
+    }
+
+    #[test]
+    fn credential_locations_never_enter_the_snapshot() {
+        // THE reason this wiring exists. Before it, member_disposition's
+        // fallthrough was Include, so anything not explicitly excluded
+        // was captured and shipped to a remote worker — including a
+        // credential sitting in the workspace. The E027 policy existed
+        // the whole time and nothing called it.
+        //
+        // Paths are spelled the way the scanner produces them: relative,
+        // `/`-separated, no leading slash.
+        for path in [
+            ".env",
+            ".env.production",
+            ".ENV",
+            "id_rsa",
+            ".ssh/id_ed25519",
+            "deploy/signing.pem",
+            "certs/store.p12",
+            "release.keystore",
+            ".aws/credentials",
+            ".netrc",
+            ".docker/config.json",
+            ".gnupg/secring.gpg",
+        ] {
+            assert_eq!(
+                member_disposition(path, false),
+                MemberDisposition::ExcludeSecretPolicy,
+                "{path} would have been captured and uploaded"
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_sources_are_still_captured() {
+        // The other half, and the reason the half above means anything:
+        // a policy that withheld everything would satisfy it while
+        // making remote execution impossible. Includes the near-misses
+        // that a sloppier matcher would swallow.
+        for path in [
+            "src/lib.rs",
+            "build.rs",
+            "Cargo.toml",
+            "fixtures/generated.bin",
+            "src/environment.rs",
+            "app.environment",
+            "docs/PEMDAS.md",
+            "crates/keystore_client/src/lib.rs",
+        ] {
+            assert_eq!(
+                member_disposition(path, false),
+                MemberDisposition::Include,
+                "{path} must still be captured"
+            );
+        }
+    }
+
+    #[test]
+    fn no_always_include_path_is_withheld_by_secret_policy() {
+        // The collision guard for the ordering choice. Secret policy is
+        // consulted BEFORE the always-include set, which is right —
+        // a build-identity file is not a reason to upload a credential
+        // — but it means a future secret pattern that happened to match
+        // `.cargo/config.toml` would silently stop capturing it and
+        // break every remote build with a confusing error.
+        //
+        // Today none of them collide. If that changes, this names which
+        // one, here, rather than in a build failure on a worker.
+        for path in ALWAYS_INCLUDE {
+            assert_eq!(
+                member_disposition(path, false),
+                MemberDisposition::Include,
+                "{path} is an always-include build-identity file but the secret \
+                 policy now withholds it: the seed set and ALWAYS_INCLUDE have collided"
+            );
+        }
     }
 
     #[test]
