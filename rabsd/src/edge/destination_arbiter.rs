@@ -18,6 +18,7 @@
 //!   authorization only ever names a reserved path.
 
 use std::collections::BTreeMap;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 /// Identity of one materialization bundle (per-operation).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -49,6 +50,70 @@ pub enum InstallScope {
     /// The owned subtree (e.g. one build script's OUT_DIR) — may swap
     /// whole via the D025 replacement semantics.
     OwnedSubtree,
+}
+
+/// Lock the shared arbiter, recovering from poisoning.
+///
+/// A panic anywhere can poison this mutex, but what it guards is a map
+/// of path strings — there is no invariant a panic could have left
+/// half-applied. Treating poison as a hard failure turned one unrelated
+/// panic into a permanent, whole-daemon serving outage, reported to the
+/// caller as a STORE error, which is both fatal and misleading.
+fn lock(arbiter: &Mutex<DestinationArbiter>) -> MutexGuard<'_, DestinationArbiter> {
+    arbiter.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// A held reservation that releases when it drops.
+///
+/// Reservations have no owner liveness, no expiry and no reclaim: one
+/// lives until someone calls [`DestinationArbiter::release`] with the
+/// same [`BundleId`], and the ids are minted from a counter that only
+/// advances. So an exit between reserving and releasing that skipped the
+/// release — an unwind, a `?` added later on the wrong side of it —
+/// stranded those paths for the process's lifetime, held by a bundle
+/// that no longer exists, and every later serve into them (or any
+/// overlapping path, since conflicts include ancestry) was refused
+/// naming a phantom holder.
+///
+/// Making the release a `Drop` moves that from a property of one
+/// function's control flow to a property of the type: unwinding
+/// reclaims the paths for free.
+#[derive(Debug)]
+pub struct ReservationGuard<'a> {
+    arbiter: &'a Mutex<DestinationArbiter>,
+    bundle: BundleId,
+}
+
+impl ReservationGuard<'_> {
+    /// The bundle whose reservation this guard holds.
+    #[must_use]
+    pub const fn bundle(&self) -> &BundleId {
+        &self.bundle
+    }
+}
+
+impl Drop for ReservationGuard<'_> {
+    fn drop(&mut self) {
+        lock(self.arbiter).release(&self.bundle);
+    }
+}
+
+/// Reserve every declared destination for `bundle`, all-or-nothing, and
+/// hold the reservation until the returned guard drops.
+///
+/// This is the only reservation path callers should use; it cannot leak
+/// the way a manual reserve/release pair can.
+///
+/// # Errors
+/// [`ReservationConflict`] when any path overlaps another bundle's
+/// reservation. A refused reservation holds nothing.
+pub fn reserve_scoped<'a>(
+    arbiter: &'a Mutex<DestinationArbiter>,
+    bundle: BundleId,
+    paths: &[String],
+) -> Result<ReservationGuard<'a>, ReservationConflict> {
+    lock(arbiter).reserve(&bundle, paths)?;
+    Ok(ReservationGuard { arbiter, bundle })
 }
 
 /// Whether one path is equal to, an ancestor of, or a descendant of
@@ -277,5 +342,62 @@ mod tests {
                     .exists()
             );
         }
+    }
+
+    #[test]
+    fn a_panic_holding_a_reservation_releases_it_instead_of_stranding_the_path() {
+        // bd-v9ho1. Reservations have no owner liveness, no expiry and
+        // no reclaim, and bundle ids only ever advance — so before the
+        // guard, an unwind between reserving and releasing left the path
+        // held forever by a bundle that no longer existed, and every
+        // later serve into it was refused naming a phantom.
+        let arbiter = Mutex::new(DestinationArbiter::new());
+        let path = paths(&["target/debug/build/crate-0/out"]);
+
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _held = reserve_scoped(&arbiter, bundle("doomed"), &path).expect("reserved");
+            assert!(
+                !lock(&arbiter).reserved.is_empty(),
+                "precondition: the reservation is actually held here"
+            );
+            panic!("the holder dies mid-install");
+        }));
+        assert!(panicked.is_err(), "the fixture must really have unwound");
+
+        // The path is free: a later bundle takes it without conflict.
+        assert!(
+            lock(&arbiter).reserved.is_empty(),
+            "an unwind must reclaim the reservation, not strand it"
+        );
+        reserve_scoped(&arbiter, bundle("next"), &path)
+            .expect("a path freed by unwinding must be reservable again");
+    }
+
+    #[test]
+    fn a_poisoned_arbiter_still_serves_rather_than_failing_every_reservation() {
+        // The other half. A panic while the lock was held poisoned the
+        // mutex, after which every reserve failed and every release was
+        // silently skipped — one unrelated panic took serving out
+        // permanently. What the lock guards is a map of path strings,
+        // with no invariant a panic can leave half-applied, so poison is
+        // recovered rather than treated as corruption.
+        let arbiter = Mutex::new(DestinationArbiter::new());
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = arbiter.lock().unwrap();
+            panic!("poison it");
+        }));
+        assert!(
+            arbiter.is_poisoned(),
+            "the fixture must really have poisoned"
+        );
+
+        let path = paths(&["target/debug/build/crate-1/out"]);
+        let held = reserve_scoped(&arbiter, bundle("after-poison"), &path)
+            .expect("a poisoned arbiter must still reserve");
+        drop(held);
+        assert!(
+            lock(&arbiter).reserved.is_empty(),
+            "release must work through poisoning too"
+        );
     }
 }

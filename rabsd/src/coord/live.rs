@@ -29,7 +29,7 @@ use crate::coord::action_actor::{
     RegisterAttemptReceipt,
 };
 use crate::coord::target_lease::TargetLeaseRegistry;
-use crate::edge::destination_arbiter::{BundleId, DestinationArbiter};
+use crate::edge::destination_arbiter::{BundleId, DestinationArbiter, reserve_scoped};
 use crate::janitor::store::LiveCas;
 use rabs_cas::blob_store::RAW_PROFILE_V1;
 use rabs_cas::digest_set::ATP_OBJECT_CONTENT_DOMAIN;
@@ -1817,23 +1817,18 @@ impl CoordLive {
         // refused rather than interleaved.
         let bundle = BundleId(format!("serve:{key}:{}", self.next_seq()));
         let paths: Vec<String> = plan.iter().map(|(_, _, text)| text.clone()).collect();
-        {
-            let mut arbiter = self
-                .arbiter
-                .lock()
-                .map_err(|_| ServeError::StoreUnavailable)?;
-            arbiter.reserve(&bundle, &paths).map_err(|conflict| {
-                ServeError::DestinationConflict {
-                    path: conflict.path,
-                    holder: conflict.holder.0,
-                }
-            })?;
-        }
-        let result = install_all(&mut *store, &plan);
-        if let Ok(mut arbiter) = self.arbiter.lock() {
-            arbiter.release(&bundle);
-        }
-        let files = result?;
+        // The guard releases on drop, so the reservation cannot outlive
+        // this call however it ends — including an unwind, which
+        // previously stranded the paths for the process's lifetime
+        // (bd-v9ho1). Bound to a name, not `_`, so it lives until the
+        // end of the scope rather than being dropped immediately.
+        let _reservation = reserve_scoped(&self.arbiter, bundle, &paths).map_err(|conflict| {
+            ServeError::DestinationConflict {
+                path: conflict.path,
+                holder: conflict.holder.0,
+            }
+        })?;
+        let files = install_all(&mut *store, &plan)?;
         Ok(ServeOutcome::Served { files })
     }
 
