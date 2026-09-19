@@ -3435,6 +3435,41 @@ fn default_excludes() -> Vec<String> {
         "secrets.cfg".to_string(),
         "secrets.properties".to_string(),
         "secrets.xml".to_string(),
+        // The classes above were already covered. These are the ones
+        // RABS's E027 source-capture seed set denies
+        // (rabs-sandbox/src/source_capture.rs) that this list did not,
+        // so the two halves of the product now agree about what a
+        // secret is. Two components disagreeing on that is the kind of
+        // gap nobody notices until one of them is the path that ran.
+        //
+        // rsync patterns without a `/` match a basename at any depth,
+        // so these cover nested copies too — a key checked into a
+        // fixtures directory is excluded exactly like one at the root.
+        //
+        // SSH private keys. The public halves (.pub) are deliberately
+        // not excluded: they are not secret and some builds read them.
+        "id_rsa".to_string(),
+        "id_ed25519".to_string(),
+        "id_ecdsa".to_string(),
+        "id_dsa".to_string(),
+        // Key/certificate container formats (*.pem and *.key are above).
+        "*.p12".to_string(),
+        "*.pfx".to_string(),
+        "*.keystore".to_string(),
+        "*.jks".to_string(),
+        // Machine credentials and cloud/container config that carries
+        // long-lived tokens.
+        ".netrc".to_string(),
+        "_netrc".to_string(),
+        ".aws/credentials".to_string(),
+        ".docker/config.json".to_string(),
+        // Package-registry auth tokens. These sit in project roots far
+        // more often than the key formats above and are the likeliest
+        // real leak in a normal repo.
+        ".npmrc".to_string(),
+        ".pypirc".to_string(),
+        // GnuPG private keyring.
+        "secring.*".to_string(),
     ]
 }
 
