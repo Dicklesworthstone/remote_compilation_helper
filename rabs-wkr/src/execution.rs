@@ -57,7 +57,7 @@ impl StopReason {
     }
 
     fn from_state(state: u8) -> Option<Self> {
-        match state {
+        match state & !FINISHED {
             1 => Some(Self::Cancelled),
             2 => Some(Self::DeadlineExceeded),
             3 => Some(Self::SessionLost),
@@ -67,6 +67,9 @@ impl StopReason {
 }
 
 const RUNNING: u8 = 0;
+// Completion is independent of the stop reason. A cancelled execution must
+// become just as immutable as a naturally completed one, without erasing why
+// it stopped. States 5, 6 and 7 are frozen interrupted executions.
 const FINISHED: u8 = 4;
 
 #[derive(Debug, Default)]
@@ -127,8 +130,12 @@ impl ExecutionControl {
     /// Enable complete output capture before invoking the executor. Digest-only
     /// callers do not pay for the additional disk snapshots. This is local
     /// execution configuration, not authority to open an arbitrary remote path.
+    /// Requests after the frozen result frontier have no effect.
     pub fn request_output_capture(&self) {
-        self.output.lock().unwrap_or_else(|e| e.into_inner()).requested = true;
+        let mut output = self.output.lock().unwrap_or_else(|e| e.into_inner());
+        if self.state.load(Ordering::Acquire) & FINISHED == 0 {
+            output.requested = true;
+        }
     }
 
     /// Whether the owner requested readable output as well as digests.
@@ -138,11 +145,12 @@ impl ExecutionControl {
     }
 
     /// Attach a complete capture (or a precise capture failure) exactly once.
-    /// Interrupted executions may still attach their pre-kill diagnostics.
+    /// Interrupted executions may still attach their pre-kill diagnostics,
+    /// but only BEFORE the owner freezes the result frontier.
     /// The task validates the captured digests against its final ExecResult.
     pub fn retain_outputs(&self, capture: Result<CapturedOutputs, String>) -> io::Result<()> {
         let mut output = self.output.lock().unwrap_or_else(|e| e.into_inner());
-        if output.result.is_some() || self.state.load(Ordering::Acquire) == FINISHED {
+        if output.result.is_some() || self.state.load(Ordering::Acquire) & FINISHED != 0 {
             return Err(io::Error::other("output capture already completed"));
         }
         output.requested = true;
@@ -176,7 +184,7 @@ impl ExecutionControl {
     pub fn retain_artifacts(&self, capture: Result<CapturedArtifacts, String>) -> io::Result<()> {
         let mut artifacts = self.artifacts.lock().unwrap_or_else(|e| e.into_inner());
         if artifacts.plan.is_none() || artifacts.result.is_some()
-            || self.state.load(Ordering::Acquire) == FINISHED
+            || self.state.load(Ordering::Acquire) & FINISHED != 0
         {
             return Err(io::Error::other("artifact capture not requested or already completed"));
         }
@@ -187,14 +195,15 @@ impl ExecutionControl {
         Ok(())
     }
 
-    /// Freeze the result frontier. A subsequent cancel cannot relabel a
-    /// completed execution or affect the next request on this session.
+    /// Freeze the result frontier, including interrupted executions. Retain
+    /// the first stop reason while rejecting all later capture writes. Taking
+    /// the capture locks in one fixed order makes the freeze atomic relative
+    /// to their check-and-attach operations, not just to cancellation.
     pub(crate) fn finish(&self) -> Option<StopReason> {
+        let _output = self.output.lock().unwrap_or_else(|e| e.into_inner());
+        let _artifacts = self.artifacts.lock().unwrap_or_else(|e| e.into_inner());
         let _ = self.reason();
-        match self.state.compare_exchange(RUNNING, FINISHED, Ordering::AcqRel, Ordering::Acquire) {
-            Ok(_) => None,
-            Err(state) => StopReason::from_state(state),
-        }
+        StopReason::from_state(self.state.fetch_or(FINISHED, Ordering::AcqRel))
     }
 }
 
@@ -218,6 +227,19 @@ fn complete_result(
     mut result: ExecResult,
     stop_reason: Option<StopReason>,
 ) -> Result<ExecutionCompletion, String> {
+    // Process cleanup is a prerequisite for EVERY completion, including
+    // digest-only requests, compiler failures and interrupted executions.
+    // Otherwise a resumable result can outlive children that still mutate
+    // the supposedly finished workspace. This check precedes retention.
+    if result.residual_group_members != 0 {
+        return Err("execution cleanup left residual process-group members".to_owned());
+    }
+    if result.executed && !(0..=255).contains(&result.exit_code) {
+        return Err("executor returned an invalid exit status".to_owned());
+    }
+    if !result.executed && result.exit_code == 0 {
+        return Err("unexecuted request cannot report successful completion".to_owned());
+    }
     if let Some(reason) = stop_reason {
         result.exit_code = reason.exit_code();
     }
@@ -236,9 +258,6 @@ fn complete_result(
     let artifacts = if capture.plan.is_some() && result.executed && result.exit_code == 0
         && stop_reason.is_none()
     {
-        if result.residual_group_members != 0 {
-            return Err("artifact execution left residual process-group members".to_owned());
-        }
         match captured {
             Some(Ok(artifacts)) if Some(artifacts.plan()) == capture.plan.as_ref() => Some(artifacts),
             Some(Ok(_)) => return Err("artifact capture does not match declaration".to_owned()),
@@ -574,6 +593,8 @@ mod tests {
             if case == 3 {
                 let mut completion = completion.unwrap();
                 assert_eq!(completion.artifacts.as_mut().unwrap().read_chunk("a", 0, 64).unwrap(), b"compiled");
+            } else if case == 2 {
+                assert!(completion.unwrap_err().contains("residual process-group members"));
             } else {
                 assert!(completion.unwrap_err().contains("artifact"));
             }
@@ -599,5 +620,111 @@ mod tests {
             assert!(completion.outputs.is_some());
             assert_ne!(completion.result.exit_code, 0);
         }
+    }
+
+    #[test]
+    fn every_finished_state_rejects_late_capture_and_keeps_its_stop_reason() {
+        for reason in [
+            None,
+            Some(StopReason::Cancelled),
+            Some(StopReason::DeadlineExceeded),
+            Some(StopReason::SessionLost),
+        ] {
+            let control = ExecutionControl::new(Duration::from_secs(5)).unwrap();
+            control.request_artifacts(artifact_plan("a")).unwrap();
+            if let Some(reason) = reason {
+                assert!(control.cancel(reason));
+            }
+            assert_eq!(control.finish(), reason);
+            assert_eq!(control.finish(), reason, "freezing is idempotent");
+            assert_eq!(control.reason(), reason);
+            assert!(!control.cancel(StopReason::SessionLost));
+            assert!(control.retain_outputs(Err("late output".into())).is_err());
+            assert!(control.retain_artifacts(Err("late artifact".into())).is_err());
+            assert!(control.take_outputs().is_none());
+            assert!(control.artifacts.lock().unwrap().result.is_none());
+            control.request_output_capture();
+            assert!(!control.output_capture_requested());
+        }
+    }
+
+    #[test]
+    fn concurrent_cancel_and_finish_choose_one_immutable_frontier() {
+        use std::sync::Barrier;
+
+        for _ in 0..64 {
+            let control = ExecutionControl::new(Duration::from_secs(5)).unwrap();
+            let barrier = Arc::new(Barrier::new(2));
+            let other_control = control.clone();
+            let other_barrier = Arc::clone(&barrier);
+            let other = std::thread::spawn(move || {
+                other_barrier.wait();
+                other_control.cancel(StopReason::Cancelled)
+            });
+            barrier.wait();
+            let reason = control.finish();
+            let cancellation_won = other.join().unwrap();
+            assert_eq!(reason, cancellation_won.then_some(StopReason::Cancelled));
+            assert_eq!(control.reason(), reason);
+            assert_eq!(control.finish(), reason);
+            assert!(control.retain_outputs(Err("late".into())).is_err());
+        }
+    }
+
+    #[test]
+    fn residual_children_refuse_completion_without_an_artifact_contract() {
+        for exit_code in [0, 1, 137] {
+            for reason in [None, Some(StopReason::Cancelled), Some(StopReason::SessionLost)] {
+                let mut task = ExecutionTask::spawn_for_delivery(
+                    30,
+                    Duration::from_secs(5),
+                    None,
+                    None,
+                    move |control| {
+                        if let Some(reason) = reason {
+                            control.cancel(reason);
+                        }
+                        let mut result = result(30);
+                        result.exit_code = exit_code;
+                        result.residual_group_members = 1;
+                        result
+                    },
+                ).unwrap();
+                assert!(wait(&mut task).unwrap_err().contains("residual process-group members"));
+                assert!(task.retained_result_digest().is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_status_and_unexecuted_success_never_become_completion() {
+        for exit_code in [i32::MIN, -1, 256, i32::MAX] {
+            let mut task = ExecutionTask::spawn(31, Duration::from_secs(5), move |_| {
+                let mut result = result(31);
+                result.exit_code = exit_code;
+                result
+            }).unwrap();
+            assert!(wait(&mut task).unwrap_err().contains("invalid exit status"));
+        }
+        let mut task = ExecutionTask::spawn(32, Duration::from_secs(5), |_| {
+            let mut result = result(32);
+            result.executed = false;
+            result
+        }).unwrap();
+        assert!(wait(&mut task).unwrap_err().contains("unexecuted request"));
+
+        // A real pre-execution refusal is not silently relabelled as a
+        // compiler failure or forced to supply nonexistent output captures.
+        let mut refused = ExecutionTask::spawn(33, Duration::from_secs(5), |control| {
+            control.request_output_capture();
+            let mut result = result(33);
+            result.executed = false;
+            result.exit_code = -1;
+            result
+        }).unwrap();
+        let completion = wait(&mut refused).unwrap();
+        assert!(!completion.result.executed);
+        assert_eq!(completion.result.exit_code, -1);
+        assert!(completion.outputs.is_none());
     }
 }
