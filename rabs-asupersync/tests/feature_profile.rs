@@ -6,7 +6,8 @@
 //!
 //! - `default-features = false` — the experimental `nightly-outcome-try`
 //!   Try/residual impls stay off; RABS uses explicit Outcome helpers.
-//! - Runtime `features = ["proc-macros"]` exactly.
+//! - Runtime `features = ["proc-macros", "tls"]` exactly: S5 uses native
+//!   mutual TLS for the actual coordinator/worker transport.
 //! - Browser/wasm, legacy-harness, messaging-fabric, and real-service-e2e
 //!   features never appear in the runtime dependency.
 //! - `test-internals` (which exposes private APIs like `Cx::new()`) may
@@ -56,8 +57,8 @@ fn asupersync_uses_the_minimal_profile() {
          experimental); line: {dep_line}"
     );
     assert!(
-        dep_line.contains(r#"features = ["proc-macros"]"#),
-        "runtime feature set must be exactly [\"proc-macros\"]; widening it \
+        dep_line.contains(r#"features = ["proc-macros", "tls"]"#),
+        "runtime feature set must be exactly [\"proc-macros\", \"tls\"]; widening it \
          is a reviewed rabs-profile change (bead A004); line: {dep_line}"
     );
     assert!(

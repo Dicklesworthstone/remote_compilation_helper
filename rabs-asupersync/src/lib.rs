@@ -33,6 +33,7 @@
 
 pub mod crashpack;
 pub mod daemon_runtime;
+pub mod worker_transport;
 pub mod delivery_obligations;
 pub mod obligation_dashboard;
 pub mod obligations;
