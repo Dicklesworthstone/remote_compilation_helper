@@ -9,6 +9,7 @@
 //! - `--version` / `--help`
 //! - `--check-config` — parse + validate config, print resolved values
 //! - `--run-for-ms N` — auto-shutdown after N ms (acceptance harness)
+//! - `--worker-exec-loopback` — receive one explicit worker execution and its files
 //! - default: run until SIGTERM/SIGINT (asupersync signal listener)
 //!
 //! Config: `[rabs]` table in the RCH config file (`$RABS_CONFIG` file
@@ -18,6 +19,8 @@
 
 use rabs_asupersync::daemon_runtime::{DaemonRunOptions, run_daemon};
 use std::time::{Duration, Instant};
+
+mod worker_exec;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -196,6 +199,8 @@ fn main() {
                 "rabsd {VERSION} — RABS edge+coordinator daemon\n\
                  \n\
                  USAGE: rabsd [--version|--help|--check-config|--run-for-ms N]\n\
+                 OPERATOR: rabsd --worker-exec-loopback <127.0.0.1:port> <worker> <request.json> <new-absolute-directory>\n\
+                 The operator lane is plaintext loopback only, not authenticated fleet transport.\n\
                  \n\
                  Runs until SIGTERM/SIGINT; prints the obligation-accounted\n\
                  shutdown receipt (JSON) as its final stdout line.\n\
@@ -203,6 +208,9 @@ fn main() {
                  env: RABS_SOCKET_PATH, RABS_LOG_LEVEL."
             );
             return;
+        }
+        Some("--worker-exec-loopback") => {
+            std::process::exit(worker_exec::run(&args[1..]));
         }
         Some("--doctor") => {
             let code = run_doctor();
