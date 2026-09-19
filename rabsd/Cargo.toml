@@ -1,5 +1,6 @@
 [package]
 name = "rabsd"
+default-run = "rabsd"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

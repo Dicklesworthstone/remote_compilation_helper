@@ -10,7 +10,7 @@ const USAGE: &str = "rabs-delivery-cas archive CAS_ROOT REQUEST_JSON WORKER DELI
     rabs-delivery-cas restore CAS_ROOT ROOT_OBJECT REQUEST_JSON WORKER NEW_DIR TRUST\n\
     TRUST is loopback or spki:<64 lowercase hex digits>.\n\
     Uses exclusive CAS ownership; stop the daemon or choose a separate store.\n\
-    Existing destinations are never overwritten. Archive pins do not expire.\n\
+    Complete matching restores are verified and reused, never overwritten. Archive pins do not expire.\n\
     This does not publish an action, authorize reuse, or rerun compilation.";
 
 fn trust(text: &str) -> Result<DeliveryTrust, String> {

@@ -25,8 +25,10 @@ For an authenticated historical delivery, replace `loopback` with
 Recovery preserves and checks the original provenance; it performs no new TLS
 handshake and does not upgrade an unauthenticated receipt.
 
-The destination of `restore` must be absent and its parent must already exist.
-An existing empty directory is also refused. Both commands emit JSON. Exit zero
+The destination of `restore` must be absent or a complete matching prior restore;
+its parent must already exist. A complete prior restore is fully reverified,
+including native object identities, and returned without rewriting its files.
+An empty, incomplete, corrupt, or different-result directory is refused. Both commands emit JSON. Exit zero
 means the archive/restore operation succeeded, not that the original compilation
 succeeded; its original exit code and interruption remain in the receipt.
 

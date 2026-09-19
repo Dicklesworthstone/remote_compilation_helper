@@ -277,10 +277,11 @@ fn sync_dirs(root: &Path) -> io::Result<()> {
     File::open(root)?.sync_all()
 }
 
-/// Restore the exact archived delivery to a NEW directory. This is not a cache
+/// Restore the exact archived delivery to a new or already-complete directory. This is not a cache
 /// lookup: the original request and historical trust policy are mandatory. No
 /// source delivery, worker connection, or compiler is needed. Failed staging is
-/// retained, never reused; an existing destination is never overwritten.
+/// retained, never reused; an existing destination is never overwritten. A
+/// complete matching restore is verified and returned idempotently.
 pub fn restore_delivery(
     cas: &LiveCas, root_key: &str, request: &Value, worker: &str,
     destination: &Path, trust: DeliveryTrust,
@@ -319,6 +320,23 @@ pub fn restore_delivery(
         }
         require(store.manifest_meta(&root).map_err(failure)? == Some((KIND.to_owned(), plan.len() as u64)),
             "archive metadata mismatch")?;
+        for object in &objects { not_quarantined(&mut *store, object)?; }
+        if let Some(mut existing) = recover_existing_delivery(request,worker,destination,trust)
+            .map_err(|e| io::Error::other(e.to_string()))?
+        {
+            require(existing.receipt == index["receipt"], "existing delivery belongs to a different archive result")?;
+            // The request alone is not a result identity: two nondeterministic
+            // executions may share it. Also verify each native CAS identity,
+            // rather than trusting only the receipt's raw content hashes.
+            for ((path, item), object) in plan.iter().zip(&objects) {
+                let mut file = ordinary_file(&destination.join(path))?;
+                let digests = stream(&mut file,&mut io::sink(),item.len)?;
+                require(digests.atp_content_id == *object && matches_item(&digests,item),
+                    "existing delivery differs from this archive's object map")?;
+            }
+            existing.acknowledgment_error = Some("verified an existing CAS restore; remote acknowledgments were not rechecked".to_owned());
+            return Ok(existing);
+        }
         // Only private staging is populated until the ordinary recovery verifier
         // checks receipt/request/provenance, the exact tree, modes and raw hashes.
         mkdir(destination)?;

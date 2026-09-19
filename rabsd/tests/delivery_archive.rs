@@ -87,6 +87,41 @@ fn archive_deduplicates_protects_full_closure_and_restores_after_store_reopen() 
     assert_eq!(fs::read(dest.join("diagnostics/stdout")).unwrap(),b"diagnostic\0\xff");
     assert!(!dest.join(".restore-staging").exists());
     recover_existing_delivery(&f.request,"worker",&dest,DeliveryTrust::Loopback).unwrap().unwrap();
+    let original_inode = {
+        use std::os::unix::fs::MetadataExt;
+        fs::metadata(dest.join("artifacts/nested/a")).unwrap().ino()
+    };
+    let again = restore_delivery(&cas,&digest_key(&archive.root),&f.request,"worker",&dest,DeliveryTrust::Loopback).unwrap();
+    assert_eq!(again.receipt,restored.receipt);
+    {
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(fs::metadata(dest.join("artifacts/nested/a")).unwrap().ino(),original_inode);
+    }
+}
+
+#[test]
+fn a_valid_different_result_for_the_same_request_never_overwrites_existing_delivery() {
+    let f = Fixture::new(); let alternate = Fixture::new(); let cas = f.mount();
+    let first = archive_delivery(&cas,&f.request,"worker",&f.source,DeliveryTrust::Loopback).unwrap();
+    let dest = f.destination("already-restored");
+    restore_delivery(&cas,&digest_key(&first.root),&f.request,"worker",&dest,DeliveryTrust::Loopback).unwrap();
+    let changed = b"other___\0\xff";
+    write(&alternate.source.join("artifacts/nested/a"),changed,true);
+    let mut receipt: Value = serde_json::from_slice(&fs::read(alternate.source.join("delivery.json")).unwrap()).unwrap();
+    receipt["artifact_manifest"]["files"][0]["sha256"] = json!(hash(changed));
+    let mut h = Sha256::new(); field(&mut h,b"rabs.worker-artifact-manifest.v1"); field(&mut h,b"dep");
+    h.update(1_u64.to_be_bytes()); field(&mut h,b"nested/a"); h.update([1_u8]);
+    h.update((changed.len() as u64).to_be_bytes()); field(&mut h,hash(changed).as_bytes());
+    receipt["artifact_manifest"]["manifest_sha256"] = json!(hex(&h.finalize()));
+    write(&alternate.source.join("delivery.json"),&serde_json::to_vec(&receipt).unwrap(),false);
+    let second = archive_delivery(&cas,&alternate.request,"worker",&alternate.source,DeliveryTrust::Loopback).unwrap();
+    assert_ne!(first.root,second.root);
+    assert!(restore_delivery(&cas,&digest_key(&second.root),&f.request,"worker",&dest,DeliveryTrust::Loopback).is_err());
+    assert_eq!(fs::read(dest.join("artifacts/nested/a")).unwrap(),b"compiled\0\xff");
+    // Damaged output is not an idempotent success and is not silently repaired.
+    write(&dest.join("artifacts/nested/a"),b"damaged",true);
+    assert!(restore_delivery(&cas,&digest_key(&first.root),&f.request,"worker",&dest,DeliveryTrust::Loopback).is_err());
+    assert_eq!(fs::read(dest.join("artifacts/nested/a")).unwrap(),b"damaged");
 }
 
 #[test]
