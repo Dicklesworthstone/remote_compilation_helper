@@ -16,8 +16,17 @@
 //! - atomic swaps are authorized per OWNED file/subtree only — swapping
 //!   an unrelated shared target root is unrepresentable because
 //!   authorization only ever names a reserved path.
+//!
+//! Names are compared in one lexical Unix path namespace: repeated
+//! separators and `.` do not create independent destinations. Parent
+//! traversal is NEVER collapsed through a possible symlink and cannot
+//! authorize an install. Unresolved claims conservatively overlap, rather
+//! than manufacturing concurrency from an ambiguous spelling. Callers still
+//! own filesystem containment, symlink/case-alias policy, and directory
+//! mutation fencing; this arbiter is not a filesystem sandbox.
 
 use std::collections::BTreeMap;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 /// Identity of one materialization bundle (per-operation).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -51,12 +60,107 @@ pub enum InstallScope {
     OwnedSubtree,
 }
 
-/// Whether one path is equal to, an ancestor of, or a descendant of
-/// another (the overlap relation; `/`-separated normalized paths).
+/// Lock the shared arbiter, recovering from poisoning.
+///
+/// A panic anywhere can poison this mutex, but what it guards is a map
+/// of path strings — there is no invariant a panic could have left
+/// half-applied. Treating poison as a hard failure turned one unrelated
+/// panic into a permanent, whole-daemon serving outage, reported to the
+/// caller as a STORE error, which is both fatal and misleading.
+fn lock(arbiter: &Mutex<DestinationArbiter>) -> MutexGuard<'_, DestinationArbiter> {
+    arbiter.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// A held reservation that releases when it drops.
+///
+/// Reservations have no owner liveness, no expiry and no reclaim: one
+/// lives until someone calls [`DestinationArbiter::release`] with the
+/// same [`BundleId`], and the ids are minted from a counter that only
+/// advances. So an exit between reserving and releasing that skipped the
+/// release — an unwind, a `?` added later on the wrong side of it —
+/// stranded those paths for the process's lifetime, held by a bundle
+/// that no longer exists, and every later serve into them (or any
+/// overlapping path, since conflicts include ancestry) was refused
+/// naming a phantom holder.
+///
+/// Making the release a `Drop` moves that from a property of one
+/// function's control flow to a property of the type: unwinding
+/// reclaims the paths for free.
+#[derive(Debug)]
+pub struct ReservationGuard<'a> {
+    arbiter: &'a Mutex<DestinationArbiter>,
+    bundle: BundleId,
+}
+
+impl ReservationGuard<'_> {
+    /// The bundle whose reservation this guard holds.
+    #[must_use]
+    pub const fn bundle(&self) -> &BundleId {
+        &self.bundle
+    }
+}
+
+impl Drop for ReservationGuard<'_> {
+    fn drop(&mut self) {
+        lock(self.arbiter).release(&self.bundle);
+    }
+}
+
+/// Reserve every declared destination for `bundle`, all-or-nothing, and
+/// hold the reservation until the returned guard drops.
+///
+/// This is the only reservation path callers should use; it cannot leak
+/// the way a manual reserve/release pair can.
+///
+/// # Errors
+/// [`ReservationConflict`] when any path overlaps another bundle's
+/// reservation. A refused reservation holds nothing.
+pub fn reserve_scoped<'a>(
+    arbiter: &'a Mutex<DestinationArbiter>,
+    bundle: BundleId,
+    paths: &[String],
+) -> Result<ReservationGuard<'a>, ReservationConflict> {
+    lock(arbiter).reserve(&bundle, paths)?;
+    Ok(ReservationGuard { arbiter, bundle })
+}
+
+/// A lexical identity, without filesystem access or lossy path rewriting.
+/// An empty component list names `/` or the relative root `.`; those are
+/// real subtree claims, not prefixes that happen to contain no characters.
+struct Destination<'a> {
+    absolute: bool,
+    components: Vec<&'a str>,
+}
+
+fn destination(path: &str) -> Option<Destination<'_>> {
+    if path.is_empty() || path.contains('\0') {
+        return None;
+    }
+    let mut components = Vec::new();
+    for component in path.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => return None,
+            component => components.push(component),
+        }
+    }
+    Some(Destination {
+        absolute: path.starts_with('/'),
+        components,
+    })
+}
+
+/// Whether two claims can overlap. Unknown identities and mixed
+/// absolute/relative namespaces are conservative conflicts: resolving the
+/// latter requires the caller's working-directory identity, which this
+/// operation-independent arbiter must not guess from the daemon's cwd.
 fn overlaps(a: &str, b: &str) -> bool {
-    a == b
-        || a.strip_prefix(b).is_some_and(|rest| rest.starts_with('/'))
-        || b.strip_prefix(a).is_some_and(|rest| rest.starts_with('/'))
+    let (Some(a), Some(b)) = (destination(a), destination(b)) else {
+        return true;
+    };
+    a.absolute != b.absolute
+        || a.components.starts_with(&b.components)
+        || b.components.starts_with(&a.components)
 }
 
 /// The per-operation destination arbiter.
@@ -75,6 +179,11 @@ impl DestinationArbiter {
     /// Reserve every declared destination for `bundle`, all-or-nothing:
     /// one overlap refuses the WHOLE reservation (the caller serializes
     /// behind the named holder or bypasses).
+    ///
+    /// An unresolved name claims conservatively against every other bundle
+    /// until released, but can NEVER authorize an install. Reserving is not
+    /// validation or permission to write: use `authorize_install` before
+    /// installing, in addition to the caller's filesystem containment checks.
     pub fn reserve(
         &mut self,
         bundle: &BundleId,
@@ -111,23 +220,35 @@ impl DestinationArbiter {
         bundle: &BundleId,
         path: &str,
     ) -> Result<InstallScope, UndeclaredWrite> {
+        let denied = || UndeclaredWrite {
+            path: path.to_string(),
+        };
+        let requested = destination(path).ok_or_else(denied)?;
+        let mut inside_owned_subtree = false;
         for (reserved, holder) in &self.reserved {
             if holder != bundle {
                 continue;
             }
-            if path == reserved {
+            let Some(reserved) = destination(reserved) else {
+                continue;
+            };
+            if requested.absolute != reserved.absolute {
+                continue;
+            }
+            if requested.components == reserved.components {
                 return Ok(InstallScope::OwnedSubtree);
             }
-            if path
-                .strip_prefix(reserved.as_str())
-                .is_some_and(|rest| rest.starts_with('/'))
-            {
-                return Ok(InstallScope::OwnedFile);
+            if requested.components.starts_with(&reserved.components) {
+                // Keep looking: an explicitly owned child subtree must not
+                // be downgraded just because its ancestor sorts first.
+                inside_owned_subtree = true;
             }
         }
-        Err(UndeclaredWrite {
-            path: path.to_string(),
-        })
+        if inside_owned_subtree {
+            Ok(InstallScope::OwnedFile)
+        } else {
+            Err(denied())
+        }
     }
 }
 
@@ -140,6 +261,153 @@ mod tests {
     }
     fn paths(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn equivalent_spellings_share_ownership_and_conflict_identity() {
+        let spellings = [
+            "target/debug/build/x/out",
+            "./target//debug/build/x/out/",
+            "target/./debug/build/x/./out",
+        ];
+        for owned in spellings {
+            let mut arbiter = DestinationArbiter::new();
+            let owner = bundle("owner");
+            arbiter.reserve(&owner, &paths(&[owned])).unwrap();
+            for alias in spellings {
+                let error = arbiter
+                    .reserve(&bundle("other"), &paths(&[alias]))
+                    .unwrap_err();
+                assert_eq!(error.path, alias);
+                assert_eq!(
+                    error.reserved, owned,
+                    "retain caller spelling for diagnostics"
+                );
+                assert_eq!(error.holder, owner);
+                assert_eq!(
+                    arbiter.authorize_install(&owner, alias),
+                    Ok(InstallScope::OwnedSubtree)
+                );
+                assert_eq!(
+                    arbiter.authorize_install(&owner, &format!("{alias}/gen.rs")),
+                    Ok(InstallScope::OwnedFile)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn parent_traversal_and_invalid_names_never_authorize_writes() {
+        let mut arbiter = DestinationArbiter::new();
+        let owner = bundle("owner");
+        arbiter.reserve(&owner, &paths(&["target/out"])).unwrap();
+        for path in [
+            "target/out/../unowned.rs",
+            "target/out/sub/../../unowned.rs",
+            "target/out/sub/../within.rs",
+            "target/out/..",
+            "target/out/\0injected",
+            "",
+            "target/output/file.rs",
+            "/target/out/file.rs",
+        ] {
+            assert_eq!(
+                arbiter.authorize_install(&owner, path),
+                Err(UndeclaredWrite {
+                    path: path.to_owned()
+                }),
+                "{path:?}"
+            );
+        }
+        // Dot-prefixed ordinary names are not traversal.
+        assert_eq!(
+            arbiter.authorize_install(&owner, "target/out/.cache/.../file"),
+            Ok(InstallScope::OwnedFile)
+        );
+    }
+
+    #[test]
+    fn ambiguous_claims_cannot_authorize_or_manufacture_disjointness() {
+        for bad in ["", "target/out/..", "target/\0out"] {
+            let mut arbiter = DestinationArbiter::new();
+            let owner = bundle("owner");
+            let other = bundle("other");
+            arbiter.reserve(&owner, &paths(&[bad])).unwrap();
+            assert!(arbiter.authorize_install(&owner, bad).is_err());
+            assert!(arbiter.authorize_install(&owner, "target/file").is_err());
+            assert!(
+                arbiter
+                    .reserve(&other, &paths(&["elsewhere/file"]))
+                    .is_err()
+            );
+            arbiter.release(&owner);
+            arbiter
+                .reserve(&other, &paths(&["elsewhere/file"]))
+                .unwrap();
+            assert!(arbiter.reserve(&owner, &paths(&[bad])).is_err());
+        }
+    }
+
+    #[test]
+    fn root_claims_cover_descendants_in_both_reservation_orders() {
+        for (root, child) in [("/", "/target/out"), (".", "target/out")] {
+            assert!(overlaps(root, child));
+            assert!(overlaps(child, root));
+            let mut arbiter = DestinationArbiter::new();
+            let owner = bundle("owner");
+            arbiter.reserve(&owner, &paths(&[root])).unwrap();
+            assert!(
+                arbiter
+                    .reserve(&bundle("other"), &paths(&[child]))
+                    .is_err()
+            );
+            assert_eq!(
+                arbiter.authorize_install(&owner, child),
+                Ok(InstallScope::OwnedFile)
+            );
+            assert_eq!(
+                arbiter.authorize_install(&owner, root),
+                Ok(InstallScope::OwnedSubtree)
+            );
+        }
+    }
+
+    #[test]
+    fn aliases_refuse_the_whole_bundle_without_stealing_free_paths() {
+        let mut arbiter = DestinationArbiter::new();
+        let owner = bundle("owner");
+        let other = bundle("other");
+        arbiter.reserve(&owner, &paths(&["/target/out"])).unwrap();
+        let requested = paths(&["/target/free", "/target/./out//file"]);
+        assert!(arbiter.reserve(&other, &requested).is_err());
+        assert!(arbiter.authorize_install(&other, "/target/free").is_err());
+        // Do not invent a relationship between relative names and the
+        // edge daemon's cwd; ambiguity is a conflict, not a disjoint grant.
+        assert!(
+            arbiter
+                .reserve(&other, &paths(&["target/out/file"]))
+                .is_err()
+        );
+        arbiter.release(&owner);
+        arbiter.reserve(&other, &requested).unwrap();
+        assert!(arbiter.authorize_install(&other, "/target/free").is_ok());
+    }
+
+    #[test]
+    fn exact_child_reservation_keeps_subtree_scope_beneath_owned_parent() {
+        let mut arbiter = DestinationArbiter::new();
+        let owner = bundle("owner");
+        arbiter
+            .reserve(&owner, &paths(&["target/out", "target/out/nested"]))
+            .unwrap();
+        assert_eq!(
+            arbiter.authorize_install(&owner, "./target/out/nested/"),
+            Ok(InstallScope::OwnedSubtree)
+        );
+        assert_eq!(
+            arbiter.authorize_install(&owner, "target/out/nested/file"),
+            Ok(InstallScope::OwnedFile)
+        );
     }
 
     #[test]
@@ -277,5 +545,62 @@ mod tests {
                     .exists()
             );
         }
+    }
+
+    #[test]
+    fn a_panic_holding_a_reservation_releases_it_instead_of_stranding_the_path() {
+        // bd-v9ho1. Reservations have no owner liveness, no expiry and
+        // no reclaim, and bundle ids only ever advance — so before the
+        // guard, an unwind between reserving and releasing left the path
+        // held forever by a bundle that no longer existed, and every
+        // later serve into it was refused naming a phantom.
+        let arbiter = Mutex::new(DestinationArbiter::new());
+        let path = paths(&["target/debug/build/crate-0/out"]);
+
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _held = reserve_scoped(&arbiter, bundle("doomed"), &path).expect("reserved");
+            assert!(
+                !lock(&arbiter).reserved.is_empty(),
+                "precondition: the reservation is actually held here"
+            );
+            panic!("the holder dies mid-install");
+        }));
+        assert!(panicked.is_err(), "the fixture must really have unwound");
+
+        // The path is free: a later bundle takes it without conflict.
+        assert!(
+            lock(&arbiter).reserved.is_empty(),
+            "an unwind must reclaim the reservation, not strand it"
+        );
+        reserve_scoped(&arbiter, bundle("next"), &path)
+            .expect("a path freed by unwinding must be reservable again");
+    }
+
+    #[test]
+    fn a_poisoned_arbiter_still_serves_rather_than_failing_every_reservation() {
+        // The other half. A panic while the lock was held poisoned the
+        // mutex, after which every reserve failed and every release was
+        // silently skipped — one unrelated panic took serving out
+        // permanently. What the lock guards is a map of path strings,
+        // with no invariant a panic can leave half-applied, so poison is
+        // recovered rather than treated as corruption.
+        let arbiter = Mutex::new(DestinationArbiter::new());
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = arbiter.lock().unwrap();
+            panic!("poison it");
+        }));
+        assert!(
+            arbiter.is_poisoned(),
+            "the fixture must really have poisoned"
+        );
+
+        let path = paths(&["target/debug/build/crate-1/out"]);
+        let held = reserve_scoped(&arbiter, bundle("after-poison"), &path)
+            .expect("a poisoned arbiter must still reserve");
+        drop(held);
+        assert!(
+            lock(&arbiter).reserved.is_empty(),
+            "release must work through poisoning too"
+        );
     }
 }

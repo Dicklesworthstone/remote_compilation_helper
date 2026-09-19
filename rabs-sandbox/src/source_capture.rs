@@ -59,8 +59,14 @@ impl PathShape {
     };
 }
 
-/// Built-in secret-location rules (raw byte patterns; the seed set —
-/// projects extend via configuration, and scanners may only ADD).
+/// Built-in secret-location rules (the seed set — projects extend via
+/// configuration, and scanners may only ADD).
+///
+/// Patterns are lower case and matched against an ASCII-lowercased,
+/// separator-anchored probe of the candidate path, so a spelling like
+/// `.ENV` or a relative `.env` cannot walk past them (T027). Keep new
+/// patterns lower case; a pattern beginning with `/` matches a whole
+/// path component, one without it matches any substring.
 const SECRET_LOCATION_PATTERNS: &[&[u8]] = &[
     b"/.env",
     b"id_rsa",
@@ -91,9 +97,32 @@ pub fn classify_path(
     // Built-in secret locations: denied-by-default even when the
     // project configured something weaker; SecretCapability (which is
     // still never an upload) is the only override that stands.
+    //
+    // The probe normalizes two things the seed set would otherwise be
+    // silently sensitive to (T027):
+    //
+    // - CASE. The patterns are lower case and the match is byte-exact,
+    //   but the filesystems this protects on are not case-sensitive. On
+    //   macOS APFS and on Windows, `.ENV` and `.env` name the SAME
+    //   FILE, so an upper-case spelling classified a credential as an
+    //   ordinary build input and uploaded it. Erring toward denial is
+    //   right here even on Linux, where they are different files: a
+    //   false positive costs an action its remote execution, a false
+    //   negative ships a credential off the machine.
+    // - ANCHORING. Five patterns begin with `/` so they match a path
+    //   COMPONENT rather than any substring, which is what keeps
+    //   `app.environment` out of `/.env`'s reach. Nothing precedes the
+    //   first component of a RELATIVE path, so a bare `.env` matched
+    //   none of them. Prefixing the separator restores the component
+    //   boundary without widening any pattern.
+    let mut probe = Vec::with_capacity(raw_path.len() + 1);
+    if raw_path.first() != Some(&b'/') {
+        probe.push(b'/');
+    }
+    probe.extend(raw_path.iter().map(u8::to_ascii_lowercase));
     let matches_secret_location = SECRET_LOCATION_PATTERNS
         .iter()
-        .any(|p| raw_path.windows(p.len()).any(|w| w == *p));
+        .any(|p| probe.windows(p.len()).any(|w| w == *p));
     if matches_secret_location {
         return match configured {
             Some(SourceCapturePolicy::SecretCapability) => SourceCapturePolicy::SecretCapability,

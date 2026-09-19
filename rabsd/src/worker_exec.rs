@@ -2,7 +2,9 @@
 //! Neither command starts a compiler locally or installs files into a worktree.
 //! Plaintext loopback and mutually authenticated native ATP are separate modes;
 //! an error in the secure path never selects the loopback path.
+//! Repeating an exact command replays a verified durable delivery without dispatch.
 
+use rabsd::coord::delivery_recovery::{DeliveryTrust, recover_existing_delivery};
 use rabsd::coord::worker_delivery::{
     Delivery, DeliveryFailure, MAX_FRAME_BYTES, WorkerPeer, receive_execution, validate_request,
 };
@@ -129,18 +131,26 @@ impl WorkerPeer for TcpPeer {
 
 fn run_once(args: &[String]) -> Result<Delivery, DeliveryFailure> {
     let directory = PathBuf::from(&args[3]);
-    let setup = (|| -> io::Result<_> {
+    let failure = |error: io::Error| DeliveryFailure {
+        directory: directory.clone(),
+        execution_may_have_run: !matches!(std::fs::symlink_metadata(&directory),
+            Err(error) if error.kind() == io::ErrorKind::NotFound),
+        detail: error.to_string(),
+    };
+    let (address, request) = (|| -> io::Result<_> {
         let address = loopback_address(&args[0])?;
         let request = read_request(Path::new(&args[2]))?;
-        if args[1].is_empty() { return Err(invalid("expected worker must not be empty")); }
-        if !directory.is_absolute() || directory.components().any(|c| matches!(c,std::path::Component::ParentDir)) {
-            return Err(invalid("delivery directory must be absolute without traversal"));
-        }
-        match std::fs::symlink_metadata(&directory) {
-            Ok(_) => return Err(io::Error::new(io::ErrorKind::AlreadyExists,"delivery directory already exists")),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
-        }
+        Ok((address, request))
+    })().map_err(&failure)?;
+    // A durable result is independent of the worker still being connected.
+    // Verify it BEFORE binding, and never turn an incomplete delivery into a
+    // new execution. The receiver still atomically creates new destinations.
+    if let Some(delivery) = recover_existing_delivery(
+        &request, &args[1], &directory, DeliveryTrust::Loopback,
+    )? {
+        return Ok(delivery);
+    }
+    let setup = (|| -> io::Result<_> {
         let parent = directory.parent().ok_or_else(|| invalid("delivery directory needs an existing parent"))?;
         if !parent.is_dir() { return Err(invalid("delivery parent directory does not exist")); }
         let listener = TcpListener::bind(address)?;
@@ -149,18 +159,16 @@ fn run_once(args: &[String]) -> Result<Delivery, DeliveryFailure> {
         let stream = accept_one(&listener,ACCEPT_BUDGET)?;
         let budget = Duration::from_millis(request.get("timeout_ms").and_then(Value::as_u64)
             .unwrap_or(MAX_EXECUTION_MILLIS).min(MAX_EXECUTION_MILLIS)) + TRANSFER_ALLOWANCE;
-        Ok((TcpPeer::new(stream,HANDSHAKE_BUDGET,budget)?,request))
+        TcpPeer::new(stream,HANDSHAKE_BUDGET,budget)
     })();
-    let (mut peer,request) = setup.map_err(|error| DeliveryFailure {
-        directory:directory.clone(),execution_may_have_run:false,detail:error.to_string(),
-    })?;
+    let mut peer = setup.map_err(failure)?;
     receive_execution(&mut peer,&request,&args[1],&directory)
 }
 
 /// One explicit command, not a background service or an automatic retry loop.
 pub fn run(args: &[String]) -> i32 {
     if args.len() != 4 {
-        eprintln!("usage: rabsd --worker-exec-loopback <127.0.0.1:port> <expected-worker> <request.json> <new-absolute-directory>");
+        eprintln!("usage: rabsd --worker-exec-loopback <127.0.0.1:port> <expected-worker> <request.json> <absolute-delivery-directory>");
         return 2;
     }
     report_result(run_once(args))
@@ -204,9 +212,12 @@ fn run_tls_once(args: &[String]) -> Result<Delivery, DeliveryFailure> {
 
     let directory = PathBuf::from(&args[4]);
     let failure = |detail: String| DeliveryFailure {
-        directory: directory.clone(), execution_may_have_run: false, detail,
+        directory: directory.clone(),
+        execution_may_have_run: !matches!(std::fs::symlink_metadata(&directory),
+            Err(error) if error.kind() == io::ErrorKind::NotFound),
+        detail,
     };
-    let setup = (|| -> Result<_, String> {
+    let (address, pin, request) = (|| -> Result<_, String> {
         let address: SocketAddr = args[0].parse().map_err(|_| "listen must be a literal IP:port")?;
         if args[1].is_empty() { return Err("expected worker must not be empty".to_owned()); }
         let pin = parse_worker_pin(&args[2]).map_err(|error| error.to_string())?;
@@ -214,27 +225,24 @@ fn run_tls_once(args: &[String]) -> Result<Delivery, DeliveryFailure> {
         if serde_json::to_vec(&request).map_err(|error| error.to_string())?.len() > MAX_JSON_RECORD {
             return Err("request exceeds native ATP record limit".to_owned());
         }
-        if !directory.is_absolute() || directory.components().any(|component| {
-            !matches!(component, std::path::Component::RootDir | std::path::Component::Normal(_))
-        }) {
-            return Err("delivery directory must be absolute without traversal".to_owned());
-        }
-        match std::fs::symlink_metadata(&directory) {
-            Ok(_) => return Err("delivery directory already exists".to_owned()),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.to_string()),
-        }
-        if !directory.parent().is_some_and(Path::is_dir) {
-            return Err("delivery parent directory does not exist".to_owned());
-        }
-        // Validate all credentials BEFORE binding. This branch never invokes the
-        // loopback transport, including when the TLS listener itself is loopback.
-        let acceptor = coordinator_tls_files().map_err(|error| error.to_string())?.acceptor()?;
-        let runtime = RuntimeBuilder::current_thread().build()
-            .map_err(|error| format!("worker delivery runtime: {error:?}"))?;
-        Ok((runtime, acceptor, address, pin, request))
+        Ok((address, pin, request))
     })().map_err(&failure)?;
-    let (runtime, acceptor, address, pin, request) = setup;
+    // Local recovery checks the original authenticated SPKI and never falls
+    // back to a plaintext receipt. It needs no live listener or new TLS session.
+    if let Some(delivery) = recover_existing_delivery(
+        &request, &args[1], &directory, DeliveryTrust::PinnedWorker(pin),
+    )? {
+        return Ok(delivery);
+    }
+    if !directory.parent().is_some_and(Path::is_dir) {
+        return Err(failure("delivery parent directory does not exist".to_owned()));
+    }
+    // Validate all credentials BEFORE binding. This branch never invokes the
+    // loopback transport, including when the TLS listener itself is loopback.
+    let acceptor = coordinator_tls_files().map_err(|error| failure(error.to_string()))?
+        .acceptor().map_err(&failure)?;
+    let runtime = RuntimeBuilder::current_thread().build()
+        .map_err(|error| failure(format!("worker delivery runtime: {error:?}")))?;
     let peer = runtime.block_on(async {
         let listener = asupersync::net::TcpListener::bind(address).await
             .map_err(|error| format!("worker TLS listen: {error}"))?;
@@ -253,9 +261,10 @@ fn run_tls_once(args: &[String]) -> Result<Delivery, DeliveryFailure> {
 
 /// One explicitly pinned worker, authenticated transport, and one exact command.
 /// TLS/admission failures terminate without dispatch or a plaintext retry.
+/// Repeating the exact command revalidates an existing durable delivery offline.
 pub fn run_tls(args: &[String]) -> i32 {
     if args.len() != 5 {
-        eprintln!("usage: rabsd --worker-exec-tls <IP:port> <expected-worker> <worker-spki-sha256> <request.json> <new-absolute-directory>");
+        eprintln!("usage: rabsd --worker-exec-tls <IP:port> <expected-worker> <worker-spki-sha256> <request.json> <absolute-delivery-directory>");
         eprintln!("required: RABS_COORD_TLS_CA, RABS_COORD_TLS_CERT, RABS_COORD_TLS_KEY");
         return 2;
     }

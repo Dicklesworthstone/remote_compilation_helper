@@ -3,13 +3,14 @@
 //! Blocking sandbox execution has one session-owned ExecutionTask; control
 //! traffic remains responsive. Negotiated diagnostic and artifact ranges retain
 //! immutable snapshots until identity-bound ACKs. These are post-execution
-//! offers, not publications or durable reconnect resume. Configured fleet
+//! offers, not publications. Negotiated durable retention seals complete bytes
+//! before announcing results and releases them only after both ACKs. Configured fleet
 //! connections use mutual TLS and native ATP; plaintext is loopback-fixture only.
 //!
 //! CLI: rabs-wkr --coordinator <host:port> [--worker-id ID] [--once]
 //! `--once` waits for every negotiated output/artifact acceptance before exiting.
 //! Durable worker/endpoint admission survives restarts. Request-status reconciles
-//! outcome metadata, never restores scratch artifacts or authorizes a rerun.
+//! outcome metadata; result-resume restores sealed captures without authorizing a rerun.
 
 use asupersync::cx::Cx;
 use asupersync::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -18,6 +19,7 @@ use rabs_wkr::artifacts::{self, ARTIFACT_TRANSFER, ArtifactPlan, ArtifactTransfe
 use rabs_wkr::execution::{DEFAULT_EXECUTION_TIMEOUT, ExecutionCompletion, ExecutionTask, StopReason};
 use rabs_wkr::output::{CapturedOutputs, MAX_OUTPUT_CHUNK_BYTES};
 use rabs_wkr::request_journal::{RECOVERY_PROTOCOL, WorkerJournal};
+use rabs_wkr::result_spool::{RESULT_RETENTION, ResultRecipient, RetentionTarget};
 use rabs_wkr::session::{CanonicalExecRequest, execute_canonical_controlled, probe_capability, sample_pressure};
 use std::future::{Future, poll_fn};
 use std::io;
@@ -76,6 +78,7 @@ fn main() {
                  Serves canonical-exec requests through the sandbox launcher; offers results, never commits.\n\
                  Select output_transfer=ranges-v1 and artifact_transfer=files-v1 in session-ok\n\
                  to retrieve diagnostics and declared compiled artifacts.\n\
+                 Select result_retention=durable-result-v1 to retain complete results until acceptance.\n\
                  Fleet transport requires RABS_WORKER_TLS_CA, RABS_WORKER_TLS_CERT,\n\
                  RABS_WORKER_TLS_KEY and RABS_WORKER_TLS_SERVER_NAME.\n\
                  Request IDs must increase across restarts; request-status reconciles outcomes.\n\
@@ -188,9 +191,9 @@ async fn next_event<R: AsyncRead + Unpin>(
     }).await
 }
 
-fn completion_frame(completion: &ExecutionCompletion) -> String {
+fn completion_frame(completion: &ExecutionCompletion, retained: Option<&str>) -> String {
     let result = &completion.result;
-    serde_json::json!({
+    let mut frame = serde_json::json!({
         "kind": "exec-result", "request_id": result.request_id, "exit_code": result.exit_code,
         "stdout_sha256": result.stdout_sha256, "stderr_sha256": result.stderr_sha256,
         "executed": result.executed, "residual_group_members": result.residual_group_members,
@@ -204,7 +207,12 @@ fn completion_frame(completion: &ExecutionCompletion) -> String {
         "artifact_transfer": completion.artifacts.as_ref().map(|_| ARTIFACT_TRANSFER),
         "artifact_manifest": completion.artifacts.as_ref().map(CapturedArtifacts::manifest),
         "artifact_ack_required": completion.artifacts.is_some(),
-    }).to_string()
+    });
+    if let Some(digest) = retained {
+        frame["result_retention"] = serde_json::json!(RESULT_RETENTION);
+        frame["retained_result_sha256"] = serde_json::json!(digest);
+    }
+    frame.to_string()
 }
 
 /// Persist bounded outcome metadata before network delivery, not scratch paths,
@@ -213,9 +221,10 @@ fn journal_completion(
     journal: Option<&mut WorkerJournal>,
     request_id: u64,
     result: &Result<ExecutionCompletion, String>,
+    retained: Option<&str>,
 ) -> Result<(), String> {
     let Some(journal) = journal else { return Ok(()); };
-    let (receipt, resolved) = match result {
+    let (mut receipt, resolved) = match result {
         Ok(completion) => {
             let result = &completion.result;
             (serde_json::json!({
@@ -232,6 +241,10 @@ fn journal_completion(
             "error_sha256": rabs_wkr::session::sha256_hex(error.as_bytes()),
         }), false),
     };
+    if let Some(digest) = retained {
+        if !resolved { return Err("unresolved execution cannot advertise a retained result".to_owned()); }
+        receipt["retained_result_sha256"] = serde_json::json!(digest);
+    }
     journal.finish(request_id, &receipt, resolved)
         .map_err(|error| format!("persist execution outcome: {error}"))
 }
@@ -319,17 +332,20 @@ where
     let mut pending_output: Option<PendingOutput> = None;
     let mut last_output_ack: Option<OutputIdentity> = None;
     let mut artifact_transfer = ArtifactTransferState::default();
+    let mut retained_result: Option<(u64, String)> = None;
     let outcome = async {
         loop {
             if Cx::current().is_some_and(|cx| cx.checkpoint().is_err()) { return Err("session cancelled".to_owned()); }
             let mut exit_after_reply = false;
             let reply = match next_event(&mut reader, stream, &mut active).await {
                 SessionEvent::Completed { request_id, result } => {
+                    let digest = active.as_ref().and_then(ExecutionTask::retained_result_digest);
                     drop(active.take());
-                    journal_completion(journal.as_deref_mut(), request_id, &result)?;
+                    journal_completion(journal.as_deref_mut(), request_id, &result, digest.as_deref())?;
                     let reply = match *result {
                         Ok(mut completion) => {
-                            let reply = completion_frame(&completion);
+                            let reply = completion_frame(&completion, digest.as_deref());
+                            retained_result = digest.map(|digest| (request_id, digest));
                             pending_output = completion.outputs.take().map(|outputs| PendingOutput::new(request_id, outputs));
                             if let Some(bundle) = completion.artifacts.take() { artifact_transfer.retain(request_id, bundle)?; }
                             reply
@@ -376,6 +392,44 @@ where
                             (None, _) => request_error(request_id, "request-journal-unavailable"),
                             (_, None) => request_error(None, "request-status-requires-request-id"),
                         },
+                        Some("result-resume") => {
+                            // This is not admission or execution. The journal owns
+                            // the original request fingerprint, startup-verified
+                            // captures and authenticated recipient grant.
+                            let recovered = (|| -> Result<_, String> {
+                                if active.is_some() || pending_output.is_some() || artifact_transfer.is_pending() {
+                                    return Err("worker-busy-or-result-pending".to_owned());
+                                }
+                                let id = request_id.ok_or("resume requires request_id")?;
+                                let original = value.get("request").ok_or("resume requires original request")?;
+                                if original["kind"] != "canonical-exec"
+                                    || parse_exec_request(original)?.request_id != id
+                                {
+                                    return Err("resume request identity mismatch".to_owned());
+                                }
+                                let timeout = parse_timeout(original)?;
+                                let journal = journal.as_deref_mut().ok_or("request-journal-unavailable")?;
+                                let status = journal.status(id);
+                                let digest = status["receipt"]["retained_result_sha256"].as_str()
+                                    .ok_or("no retained result for request")?.to_owned();
+                                let completion = journal.resume_result(original, timeout, artifact_transfer_enabled)
+                                    .map_err(|error| error.to_string())?;
+                                Ok((id, digest, completion))
+                            })();
+                            match recovered {
+                                Ok((id, digest, mut completion)) => {
+                                    let mut reply: serde_json::Value = serde_json::from_str(
+                                        &completion_frame(&completion, Some(&digest)),
+                                    ).map_err(|error| format!("encode recovered result: {error}"))?;
+                                    reply["resumed"] = serde_json::json!(true);
+                                    pending_output = completion.outputs.take().map(|outputs| PendingOutput::new(id, outputs));
+                                    if let Some(bundle) = completion.artifacts.take() { artifact_transfer.retain(id, bundle)?; }
+                                    retained_result = Some((id, digest));
+                                    reply.to_string()
+                                }
+                                Err(reason) => request_error(request_id, &reason),
+                            }
+                        }
                         Some("artifact-read") => artifact_transfer.read_frame(&value)
                             .unwrap_or_else(|reason| request_error(request_id, &reason)),
                         Some("artifact-ack") => match artifact_transfer.acknowledge(&value) {
@@ -454,17 +508,32 @@ where
                     }
                 }
             };
+            // ACKs describe verified receipt identities. Do not reclaim either
+            // stream while the other owner is still pending, and commit their
+            // joint acceptance BEFORE sending the final acknowledgment reply.
+            if pending_output.is_none() && !artifact_transfer.is_pending()
+                && let Some((id, digest)) = retained_result.as_ref()
+            {
+                let journal = journal.as_deref_mut().ok_or("retained result has no journal owner")?;
+                if journal.status(*id)["receipt"]["retained_result_sha256"].as_str() != Some(digest.as_str()) {
+                    return Err("retained result changed before receiver acceptance".to_owned());
+                }
+                journal.release_retained_result(*id)
+                    .map_err(|error| format!("persist result acceptance: {error}"))?;
+                retained_result = None;
+            }
             write_frame(stream, &reply).await.map_err(|e| format!("control write: {e}"))?;
             if exit_after_reply { return Ok(()); }
         }
     }.await;
     // All transport failure/EOF paths cancel and await the single owned process.
-    // Completed snapshots are connection-owned and disappear on disconnect.
+    // Anonymous snapshots disappear on disconnect; sealed retained bytes and
+    // their journal pointer survive until complete receiver acceptance.
     if let Some(mut task) = active.take() {
         task.cancel(StopReason::SessionLost);
         let request_id = task.request_id();
         let cleanup = task.wait().await;
-        journal_completion(journal, request_id, &cleanup)?;
+        journal_completion(journal, request_id, &cleanup, task.retained_result_digest().as_deref())?;
         if outcome.is_ok() { cleanup.map_err(|e| format!("session cleanup: {e}"))?; }
     }
     drop(pending_output);
@@ -478,6 +547,7 @@ fn worker_hello(report: &rabs_wkr::session::CapabilityReport, journal: &WorkerJo
         "canonical": report.canonical_namespace, "slots": report.slots, "token_id": 1,
         "output_transfers": [OUTPUT_TRANSFER], "artifact_transfers": [ARTIFACT_TRANSFER],
         "recovery_protocols": [RECOVERY_PROTOCOL],
+        "result_retentions": [RESULT_RETENTION],
         "boot_generation": journal.boot_generation().0,
         "incarnation": format!("{:032x}", journal.incarnation().0),
         "request_high_water": journal.high_water(),
@@ -492,7 +562,15 @@ async fn session_loop(
     let mut stream = rabs_asupersync::worker_transport::connect_worker(coordinator).await?;
     cx.trace("rabs-wkr connected to coordinator");
     let local_identity = stream.local_identity();
-    let (capture_output, capture_artifacts) = asupersync::time::timeout(
+    // The recipient is the key TLS actually authenticated, never a hello or
+    // request field. A plaintext fixture cannot recover a TLS-bound result.
+    let recipient = match &stream {
+        rabs_asupersync::worker_transport::WorkerConnection::Authenticated { peer, .. } => {
+            ResultRecipient::TlsSpki(peer.identity.fingerprint)
+        }
+        rabs_asupersync::worker_transport::WorkerConnection::LoopbackFixture(_) => ResultRecipient::LoopbackFixture,
+    };
+    let (capture_output, capture_artifacts, retain_result) = asupersync::time::timeout(
         asupersync::time::wall_now(),
         Duration::from_secs(10),
         async {
@@ -555,10 +633,11 @@ async fn session_loop(
             let output = output_transfer_requested(&ack)?;
             let artifacts = artifacts::transfer_requested(&ack)?;
             validate_recovery_selection(&ack)?;
+            let retain = result_retention_requested(&ack)?;
             if local_identity.is_some() && !output {
                 return Err("authenticated worker requires complete output retrieval".to_owned());
             }
-            Ok::<(bool, bool), String>((output, artifacts))
+            Ok::<(bool, bool, bool), String>((output, artifacts, retain))
         },
     ).await.map_err(|_| "worker session admission deadline exceeded".to_owned())??;
     let cargo_home = std::env::temp_dir().join(format!("rabs-wkr-ch-{}", std::process::id()));
@@ -567,19 +646,24 @@ async fn session_loop(
     for path in [&cargo_home, &home, &spills] {
         std::fs::create_dir_all(path).map_err(|e| format!("prepare {}: {e}", path.display()))?;
     }
-    drive_session(&mut stream, report, once, Some(journal), capture_artifacts, |request, timeout, artifacts| {
+    let journal_root = journal.storage_root().to_path_buf();
+    journal.clear_result_recipient();
+    if retain_result { journal.authorize_result_recipient(recipient.clone()); }
+    let outcome = drive_session(&mut stream, report, once, Some(&mut *journal), capture_artifacts, |request, timeout, artifacts| {
         let cargo_home = cargo_home.clone(); let home = home.clone(); let spills = spills.clone();
         let slots = report.slots;
         let id = request.request_id;
+        let retention = retain_result.then(|| RetentionTarget::from_admitted(
+            &journal_root, id, recipient.clone(),
+        )).transpose()?;
         let execute = move |control: rabs_wkr::execution::ExecutionControl| {
             if capture_output { control.request_output_capture(); }
             execute_canonical_controlled(&request, &cargo_home, &home, slots, &spills, &control)
         };
-        match artifacts {
-            Some(plan) => ExecutionTask::spawn_with_artifacts(id, timeout, plan, execute),
-            None => ExecutionTask::spawn(id, timeout, execute),
-        }
-    }, || sample_pressure(&cargo_home)).await
+        ExecutionTask::spawn_for_delivery(id, timeout, artifacts, retention, execute)
+    }, || sample_pressure(&cargo_home)).await;
+    journal.clear_result_recipient();
+    outcome
 }
 
 fn session_ack_accepted(frame: &str) -> bool {
@@ -602,6 +686,20 @@ fn output_transfer_requested(frame: &str) -> Result<bool, String> {
     match value.get("output_transfer") {
         None => Ok(false), Some(value) if value.as_str() == Some(OUTPUT_TRANSFER) => Ok(true),
         Some(_) => Err("unsupported output_transfer selection".to_owned()),
+    }
+}
+
+fn result_retention_requested(frame: &str) -> Result<bool, String> {
+    let value: serde_json::Value = serde_json::from_str(frame).map_err(|e| format!("handshake JSON: {e}"))?;
+    match value.get("result_retention") {
+        None => Ok(false),
+        Some(value) if value.as_str() == Some(RESULT_RETENTION) => {
+            if !output_transfer_requested(frame)? {
+                return Err("durable result retention requires complete output transfer".to_owned());
+            }
+            Ok(true)
+        }
+        Some(_) => Err("unsupported result_retention selection".to_owned()),
     }
 }
 
@@ -1209,5 +1307,208 @@ mod tests {
         assert_eq!(replies[0]["output_available_in_this_session"], false);
         assert_eq!(replies[1]["reason"], "durable-request-already-admitted");
         assert_eq!(replies[2]["reason"], "durable-request-conflict");
+    }
+
+    #[cfg(unix)]
+    fn retained_launch(root: &std::path::Path, request: CanonicalExecRequest, timeout: Duration,
+        plan: Option<ArtifactPlan>) -> io::Result<ExecutionTask>
+    {
+        let target = RetentionTarget::from_admitted(root, request.request_id, ResultRecipient::TlsSpki([7; 32]))?;
+        ExecutionTask::spawn_for_delivery(request.request_id, timeout, plan, Some(target), move |control| {
+            if let Some(plan) = control.artifact_plan() {
+                let prepared = artifacts::PreparedArtifacts::new(plan).unwrap();
+                std::fs::write(prepared.backing().join("lib.rlib"), b"archive\0\xff").unwrap();
+                control.retain_artifacts(Ok(prepared.capture(|| false).unwrap())).unwrap();
+            }
+            let outputs = CapturedOutputs {
+                stdout: rabs_wkr::output::CapturedStream::from_reader(&b"A\0\xffB"[..], 4).unwrap(),
+                stderr: rabs_wkr::output::CapturedStream::from_reader(&b""[..], 0).unwrap(),
+            };
+            let mut result = result(request.request_id);
+            result.stdout_sha256 = outputs.stdout.sha256().into();
+            result.stderr_sha256 = outputs.stderr.sha256().into();
+            control.retain_outputs(Ok(outputs)).unwrap();
+            result
+        })
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retained_result_is_durable_before_failed_delivery_and_blocks_new_work() {
+        let root = tempfile::tempdir().unwrap();
+        let mut journal = WorkerJournal::open(root.path(), "session-test", "coord").unwrap();
+        let mut wire = Wire::default();
+        wire.frame(artifact_request(110));
+        wire.0.lock().unwrap().fail_write = true;
+        assert!(wait(drive_session(&mut wire, &report(), true, Some(&mut journal), true,
+            |request, timeout, plan| retained_launch(root.path(), request, timeout, plan), pressure)).is_err());
+        let digest = journal.status(110)["receipt"]["retained_result_sha256"].as_str().unwrap().to_owned();
+        let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(root.path().join("requests.json")).unwrap()).unwrap();
+        assert_eq!(saved["last"]["receipt"]["retained_result_sha256"], digest);
+        assert_eq!(saved["last"]["receipt"]["retained_result_released"], false);
+        drop(journal);
+        let mut journal = WorkerJournal::open(root.path(), "session-test", "coord").unwrap();
+        assert_eq!(journal.status(110)["receipt"]["retained_result_sha256"], digest);
+        assert!(root.path().join("retained-result/manifest.json").exists());
+        assert_eq!(journal.admit(&request(111), DEFAULT_EXECUTION_TIMEOUT).unwrap(), Some("retained-result-unacknowledged"));
+        let fingerprint = rabs_wkr::request_journal::request_fingerprint(&artifact_request(110), DEFAULT_EXECUTION_TIMEOUT);
+        let mut recovered = rabs_wkr::result_spool::load(root.path(), 110, &fingerprint, &digest).unwrap();
+        assert_eq!(recovered.completion.artifacts.as_mut().unwrap().read_chunk("lib.rlib", 0, 64).unwrap(), b"archive\0\xff");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retained_spool_is_released_only_after_both_identity_bound_acks() {
+        for artifacts_first in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let mut journal = WorkerJournal::open(root.path(), "session-test", "coord").unwrap();
+            let mut wire = Wire::default(); let peer = wire.clone(); let report = report();
+            wire.frame(artifact_request(120));
+            let mut driver = Box::pin(drive_session(&mut wire, &report, true, Some(&mut journal), true,
+                |request, timeout, plan| retained_launch(root.path(), request, timeout, plan), pressure));
+            pump(driver.as_mut(), &peer, 1);
+            let offer = peer.replies()[0].clone();
+            assert_eq!(offer["result_retention"], RESULT_RETENTION);
+            let ack = serde_json::json!({"kind":"artifact-ack","request_id":120,
+                "manifest_sha256":offer["artifact_manifest"]["manifest_sha256"],
+                "total_bytes":offer["artifact_manifest"]["total_bytes"]});
+            if artifacts_first { peer.frame(ack.clone()); } else { peer.frame(output_ack(120)); }
+            pump(driver.as_mut(), &peer, 2);
+            assert!(root.path().join("retained-result/manifest.json").exists());
+            let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(root.path().join("requests.json")).unwrap()).unwrap();
+            assert_eq!(saved["last"]["receipt"]["retained_result_released"], false);
+            if artifacts_first { peer.frame(output_ack(120)); } else { peer.frame(ack); }
+            wait(driver).unwrap();
+            assert!(!root.path().join("retained-result").exists());
+            drop(journal);
+            let mut journal = WorkerJournal::open(root.path(), "session-test", "coord").unwrap();
+            assert_eq!(journal.status(120)["receipt"]["retained_result_released"], true);
+            assert_eq!(journal.admit(&request(121), DEFAULT_EXECUTION_TIMEOUT).unwrap(), None);
+        }
+    }
+
+    #[test]
+    fn durable_retention_requires_an_explicit_version_and_complete_streams() {
+        assert!(!result_retention_requested(r#"{"kind":"session-ok"}"#).unwrap());
+        let valid = serde_json::json!({"kind":"session-ok","output_transfer":OUTPUT_TRANSFER,
+            "result_retention":RESULT_RETENTION});
+        assert!(result_retention_requested(&valid.to_string()).unwrap());
+        for bad in [serde_json::Value::Null, serde_json::json!(true), serde_json::json!("durable-result-v2")] {
+            let mut value = valid.clone(); value["result_retention"] = bad;
+            assert!(result_retention_requested(&value.to_string()).is_err());
+        }
+        assert!(result_retention_requested(&serde_json::json!({"kind":"session-ok",
+            "result_retention":RESULT_RETENTION}).to_string()).is_err());
+    }
+
+    #[cfg(unix)]
+    fn leave_retained_result(root: &std::path::Path, id: u64) {
+        let mut journal = WorkerJournal::open(root, "session-test", "coord").unwrap();
+        let mut wire = Wire::default(); wire.frame(artifact_request(id));
+        wire.0.lock().unwrap().fail_write = true;
+        assert!(wait(drive_session(&mut wire, &report(), true, Some(&mut journal), true,
+            |request, timeout, plan| retained_launch(root, request, timeout, plan), pressure)).is_err());
+        assert!(journal.has_retained_result());
+    }
+
+    #[cfg(unix)]
+    fn resume_request(id: u64) -> serde_json::Value {
+        serde_json::json!({"kind":"result-resume", "request_id":id, "request":artifact_request(id)})
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restarted_session_resumes_exact_binary_ranges_without_launching_any_process() {
+        let root = tempfile::tempdir().unwrap();
+        leave_retained_result(root.path(), 130);
+        let mut journal = WorkerJournal::open(root.path(), "session-test", "coord").unwrap();
+        journal.authorize_result_recipient(ResultRecipient::TlsSpki([7; 32]));
+        let mut wire = Wire::default(); let peer = wire.clone(); let report = report();
+        wire.frame(resume_request(130));
+        let mut driver = Box::pin(drive_session(&mut wire, &report, true, Some(&mut journal), true,
+            |_, _, _| panic!("result recovery must not invoke the executor"), pressure));
+        pump(driver.as_mut(), &peer, 1);
+        let result = peer.replies()[0].clone();
+        assert_eq!(result["kind"], "exec-result"); assert_eq!(result["resumed"], true);
+        assert_eq!(result["result_retention"], RESULT_RETENTION);
+        peer.frame(output_read(130, "stdout", 1, 3));
+        peer.frame(serde_json::json!({"kind":"artifact-read","request_id":130,"name":"lib.rlib","offset":0,"max_bytes":64}));
+        peer.frame(resume_request(130));
+        pump(driver.as_mut(), &peer, 4);
+        assert_eq!(peer.replies()[1]["data_hex"], "00ff42");
+        assert_eq!(peer.replies()[2]["data_hex"], "6172636869766500ff");
+        assert_eq!(peer.replies()[3]["reason"], "worker-busy-or-result-pending");
+        peer.frame(output_ack(130)); pump(driver.as_mut(), &peer, 5);
+        assert!(root.path().join("retained-result/manifest.json").exists());
+        peer.frame(serde_json::json!({"kind":"artifact-ack","request_id":130,
+            "manifest_sha256":result["artifact_manifest"]["manifest_sha256"],
+            "total_bytes":result["artifact_manifest"]["total_bytes"]}));
+        wait(driver).unwrap();
+        assert!(!root.path().join("retained-result").exists());
+        assert_eq!(journal.high_water(), Some(130));
+        assert_eq!(journal.status(130)["receipt"]["retained_result_released"], true);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resume_requires_negotiation_exact_original_request_and_original_tls_recipient() {
+        let root = tempfile::tempdir().unwrap();
+        leave_retained_result(root.path(), 140);
+        let mut journal = WorkerJournal::open(root.path(), "session-test", "coord").unwrap();
+        for recipient in [None, Some(ResultRecipient::LoopbackFixture), Some(ResultRecipient::TlsSpki([8; 32]))] {
+            journal.clear_result_recipient();
+            if let Some(recipient) = recipient { journal.authorize_result_recipient(recipient); }
+            let mut wire = Wire::default(); let peer = wire.clone();
+            wire.frame(resume_request(140)); wire.close();
+            wait(drive_session(&mut wire, &report(), false, Some(&mut journal), true,
+                |_, _, _| panic!("foreign resume must never launch"), pressure)).unwrap();
+            assert_eq!(peer.replies()[0]["kind"], "error");
+            assert!(journal.has_retained_result());
+        }
+        journal.authorize_result_recipient(ResultRecipient::TlsSpki([7; 32]));
+        for artifacts_enabled in [false, true] {
+            let mut wire = Wire::default(); let peer = wire.clone();
+            let mut changed = resume_request(140); changed["request"]["timeout_ms"] = serde_json::json!(1);
+            wire.frame(changed);
+            let mut changed = resume_request(140); changed["request"]["args"] = serde_json::json!(["different"]);
+            wire.frame(changed);
+            let mut changed = resume_request(140); changed["request_id"] = serde_json::json!(141);
+            wire.frame(changed);
+            if !artifacts_enabled { wire.frame(resume_request(140)); }
+            wire.close();
+            wait(drive_session(&mut wire, &report(), false, Some(&mut journal), artifacts_enabled,
+                |_, _, _| panic!("invalid resume must never launch"), pressure)).unwrap();
+            assert!(peer.replies().iter().all(|reply| reply["kind"] == "error"));
+            assert!(journal.has_retained_result());
+        }
+        // All refusals leave the validated capture available to its rightful owner.
+        assert!(journal.resume_result(&artifact_request(140), DEFAULT_EXECUTION_TIMEOUT, true).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn disconnect_after_one_ack_retains_both_streams_for_a_second_restart() {
+        let root = tempfile::tempdir().unwrap();
+        leave_retained_result(root.path(), 150);
+        let mut original_offer = None;
+        for _ in 0..2 {
+            let mut journal = WorkerJournal::open(root.path(), "session-test", "coord").unwrap();
+            journal.authorize_result_recipient(ResultRecipient::TlsSpki([7; 32]));
+            let mut wire = Wire::default(); let peer = wire.clone(); let report = report();
+            wire.frame(resume_request(150));
+            let mut driver = Box::pin(drive_session(&mut wire, &report, false, Some(&mut journal), true,
+                |_, _, _| panic!("reconnect is not a new execution"), pressure));
+            pump(driver.as_mut(), &peer, 1);
+            let offer = peer.replies()[0].clone();
+            if let Some(original) = &original_offer { assert_eq!(&offer, original); }
+            original_offer = Some(offer);
+            peer.frame(output_read(150, "stdout", 0, 64));
+            peer.frame(output_ack(150)); pump(driver.as_mut(), &peer, 3);
+            assert_eq!(peer.replies()[1]["data_hex"], "4100ff42");
+            peer.close(); wait(driver).unwrap();
+            assert!(journal.has_retained_result());
+            assert_eq!(journal.admit(&request(151), DEFAULT_EXECUTION_TIMEOUT).unwrap(), Some("retained-result-unacknowledged"));
+            assert!(root.path().join("retained-result/manifest.json").exists());
+        }
     }
 }

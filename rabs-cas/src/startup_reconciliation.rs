@@ -107,6 +107,14 @@ pub enum IncompleteState {
     AuthorityHistoryMissing,
     /// Generations exist without the never-reuse high-water mark.
     GenerationHighWaterMissing,
+    /// A publication names a winner generation the store can no longer
+    /// account for (bd-9nnqm). Losing the generation lineage under a
+    /// surviving publication is metadata loss, not a cold cache: it
+    /// frees the very ids R108 exists to burn.
+    PublicationGenerationMissing {
+        /// The action key whose winner generation has no row.
+        action_key: String,
+    },
 }
 
 /// Serving decision after reconciliation.
@@ -244,6 +252,33 @@ fn authoritative_incompleteness(
     if generations > 0 && !store.has_generation_high_water()? && !reset_consumed {
         incomplete.push(IncompleteState::GenerationHighWaterMissing);
     }
+    // The check above is guarded by `generations > 0`, so it only fires
+    // when generation ROWS survived and the watermark did not. Total
+    // loss makes the count zero and skips it entirely, which let a store
+    // that had forgotten its whole generation lineage present as an
+    // ordinary cold cache — serving allowed, no reset, and the winning
+    // generation id of a still-published action mintable again
+    // (bd-9nnqm). Ask the precise question instead: a store with
+    // publications must be able to account for the generations that
+    // produced them. This also catches PARTIAL row loss, where some
+    // generations survive and the winner's does not, which no
+    // count-based rule can see.
+    //
+    // Deliberately NOT guarded by `reset_consumed`, unlike the two
+    // history-wide gaps above. This is a PER-PUBLICATION tear, the same
+    // shape as a missing pin, so it follows that rule instead: it is
+    // always detected, and `apply_operator_reset` quarantines the
+    // affected publication rather than declaring it fine. (A
+    // reset-guarded check would also be invisible to the reset itself,
+    // which records the reset BEFORE evaluating completeness.) Once
+    // quarantined it has been adjudicated and stops refusing, exactly
+    // like the per-publication checks above.
+    for action_key in store.publications_missing_their_generation()? {
+        if store.serving_disposition_key(&action_key)?.as_deref() == Some("quarantined") {
+            continue;
+        }
+        incomplete.push(IncompleteState::PublicationGenerationMissing { action_key });
+    }
     Ok(incomplete)
 }
 
@@ -282,7 +317,8 @@ pub fn apply_operator_reset(
             IncompleteState::PublicationPinMissing { action_key }
             | IncompleteState::PublicationPinReleased { action_key }
             | IncompleteState::ServingStateMissing { action_key }
-            | IncompleteState::EvidenceMissing { action_key } => action_key,
+            | IncompleteState::EvidenceMissing { action_key }
+            | IncompleteState::PublicationGenerationMissing { action_key } => action_key,
             IncompleteState::AuthorityHistoryMissing
             | IncompleteState::GenerationHighWaterMissing => continue,
         };
@@ -677,48 +713,53 @@ mod tests {
             "an id that was actually minted must stay burned even without the watermark"
         );
 
-        // A DOCUMENTED DIVERGENCE, not a wish. With the watermark
-        // present, an id below it that was never minted is refused
+        // bd-9nnqm, fixed. The watermark row is gone, but the
+        // `action_generations` rows it was summarising survive, and
+        // `generation_high_water` now takes the MAXIMUM of the stored row
+        // and the highest surviving id. So an id BELOW the lost watermark
+        // that was never minted is still refused, exactly as it would be
+        // with the row present
         // (`t039_the_watermark_burns_ids_that_were_never_minted_at_all`).
-        // With the watermark gone, `generation_high_water` reads 0 — it
-        // is NOT recomputed from the surviving `action_generations` rows
-        // — so the same id is accepted. The fence has silently degraded
-        // from "monotone watermark" to "primary-key uniqueness", which
-        // is precisely the weaker set-membership semantics F031 replaced.
         //
-        // The reset does not cause this and cannot repair it: the
-        // watermark is simply gone. Recomputing it from MAX(id) over the
-        // surviving rows at reset (or at open) would restore the
-        // guarantee for every id the store still remembers.
+        // Before the fix this returned Ok(()): the fence had silently
+        // degraded from a monotone watermark to primary-key uniqueness,
+        // which is the weaker set-membership semantics F031 replaced.
         assert_eq!(
             store.create_generation(&auth, 7, &action),
-            Ok(()),
-            "documented: a lost watermark downgrades the fence to primary-key \
-             uniqueness, so an id below it that was never minted is admitted"
+            Err(StoreError::GenerationIdNotAboveHighWater),
+            "a lost watermark row must be recovered from the surviving generation \
+             rows, not silently read as zero (R108)"
         );
+        // And the recovered watermark is the real one, not merely
+        // non-zero: minting must resume strictly above the highest id the
+        // store still remembers.
+        assert_eq!(
+            store.create_generation(&auth, 11, &action),
+            Err(StoreError::GenerationIdNotAboveHighWater)
+        );
+        store
+            .create_generation(&auth, 12, &action)
+            .expect("minting resumes above the recovered watermark");
     }
 
-    /// T039, the sharper half, and A DOCUMENTED DEFECT rather than a
-    /// property. R113 says loss of generation-fence metadata must refuse
-    /// serving until an explicit reset and must NEVER be treated as an
-    /// ordinary cold cache. The check that enforces this is guarded by
-    /// `generations > 0`, so it fires only for PARTIAL loss — rows
-    /// survive, watermark gone. TOTAL loss makes the count zero and the
-    /// guard skips the check entirely.
+    /// T039's sharper half, now fixed (bd-9nnqm). R113 says loss of
+    /// generation-fence metadata must refuse serving until an explicit
+    /// reset and must NEVER be treated as an ordinary cold cache.
     ///
-    /// The consequence is not subtle: serving is allowed with no reset
-    /// and no operator involvement, and the generation id space is
-    /// completely free again, including the exact id the surviving
-    /// publication still names as its winner. That is the full ABA
-    /// window (R108) opened by a loss that R113 was written to catch.
+    /// The old check was guarded by `generations > 0`, so it fired only
+    /// for PARTIAL loss — rows survive, watermark gone. TOTAL loss made
+    /// the count zero and skipped the check entirely: serving was
+    /// allowed with no reset and no operator, and the exact id the
+    /// surviving publication named as its winner was mintable again.
     ///
-    /// The store is not short of signal here — the publication's
-    /// `winner_generation` names a generation it can no longer account
-    /// for. The check simply does not look. Filed with the proposed fix;
-    /// asserting the current behaviour keeps the suite honest and green
-    /// instead of leaving a red test for the next agent to inherit.
+    /// Total loss is the one case the watermark cannot be recovered
+    /// from, because nothing in the store remembers the ids any more. So
+    /// the fix is not memory, it is ADJUDICATION: refuse, and make an
+    /// operator open a new lineage. The store was never short of signal
+    /// — the publication names a `winner_generation` it cannot account
+    /// for — the check simply did not look.
     #[test]
-    fn t039_total_generation_state_loss_is_not_detected_at_all() {
+    fn t039_total_generation_state_loss_refuses_until_an_operator_resets() {
         let mut store = SqlMetadataStore::open(RusqliteEngine::open_in_memory().unwrap()).unwrap();
         healthy(&mut store);
         let auth = digest("rabs.authority.sha256.v1", 1);
@@ -735,24 +776,48 @@ mod tests {
         assert_eq!(store.generation_count().unwrap(), 0);
         assert!(!store.list_publications().unwrap().is_empty());
 
-        // PARTIAL loss refuses (the test above). TOTAL loss does not.
+        // Partial loss refuses (the test above), and so does total loss.
+        let action_key = digest_key(&action);
+        assert_eq!(
+            reconcile_startup(&mut store, &full_filesystem())
+                .unwrap()
+                .serving,
+            ServingDecision::Refused(vec![IncompleteState::PublicationGenerationMissing {
+                action_key: action_key.clone(),
+            }]),
+            "total generation-state loss must refuse serving, never present as an \
+             ordinary cold cache (R113)"
+        );
+        assert_eq!(store.highest_operator_reset().unwrap(), None);
+
+        // An operator reset is what resumes serving — and it ADJUDICATES
+        // rather than trusts: the publication whose lineage was lost is
+        // quarantined, so it can never serve as a cache hit from the old
+        // lineage.
+        let outcome = apply_operator_reset(&mut store, 1, 500).unwrap();
+        assert_eq!(outcome.quarantined_actions, vec![action_key.clone()]);
+        assert_eq!(
+            store
+                .serving_disposition_key(&action_key)
+                .unwrap()
+                .as_deref(),
+            Some("quarantined")
+        );
         assert_eq!(
             reconcile_startup(&mut store, &full_filesystem())
                 .unwrap()
                 .serving,
             ServingDecision::Allowed,
-            "documented defect: total generation-state loss presents as an ordinary \
-             cold cache — no refusal, no reset required (R113)"
+            "the reset opens a new lineage and serving resumes"
         );
-        assert_eq!(store.highest_operator_reset().unwrap(), None);
 
-        // And the window is fully open: the id the surviving publication
-        // names as its own winner can be minted again.
-        assert_eq!(
-            store.create_generation(&auth, 11, &action),
-            Ok(()),
-            "documented defect: the winning generation id of a still-published \
-             action is re-mintable after total generation-state loss (R108)"
-        );
+        // The id space really is free afterwards — but only because an
+        // operator declared a new lineage, which is the whole point.
+        // Nothing in the store remembers the old ids, so the watermark
+        // cannot be recovered here the way the partial-loss test
+        // recovers it; the refusal above is what stands in for that.
+        store
+            .create_generation(&auth, 11, &action)
+            .expect("a post-reset lineage may reuse the id space it declared new");
     }
 }
