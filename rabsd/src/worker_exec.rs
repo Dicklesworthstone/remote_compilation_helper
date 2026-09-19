@@ -3,10 +3,13 @@
 //! Plaintext loopback and mutually authenticated native ATP are separate modes;
 //! an error in the secure path never selects the loopback path.
 //! Repeating an exact command replays a verified durable delivery without dispatch.
+//! --resume explicitly retrieves a sealed remote result into a NEW directory;
+//! incomplete prior deliveries remain untouched and never trigger reexecution.
 
 use rabsd::coord::delivery_recovery::{DeliveryTrust, recover_existing_delivery};
 use rabsd::coord::worker_delivery::{
-    Delivery, DeliveryFailure, MAX_FRAME_BYTES, WorkerPeer, receive_execution, validate_request,
+    Delivery, DeliveryFailure, DeliveryMode, MAX_FRAME_BYTES, WorkerPeer, receive_operation,
+    validate_request,
 };
 use serde_json::{Value, json};
 use std::fs::File;
@@ -32,6 +35,23 @@ fn check_deadline(deadline: Instant) -> io::Result<()> {
         Err(io::Error::new(io::ErrorKind::TimedOut,"worker exchange deadline exceeded"))
     } else { Ok(()) }
 }
+
+/// Intent is a local flag, never a guess based on a failed response. Accept it
+/// before or after the positional arguments, but never twice or in their midst.
+fn operation_arguments(args: &[String], count: usize) -> Option<(&[String], DeliveryMode)> {
+    let (positionals, mode) = if args.len() == count {
+        (args, DeliveryMode::Execute)
+    } else if args.len() == count + 1 && args.first().is_some_and(|arg| arg == "--resume") {
+        (&args[1..], DeliveryMode::Resume)
+    } else if args.len() == count + 1 && args.last().is_some_and(|arg| arg == "--resume") {
+        (&args[..count], DeliveryMode::Resume)
+    } else {
+        return None;
+    };
+    if positionals.iter().any(|arg| arg == "--resume") { return None; }
+    Some((positionals, mode))
+}
+
 fn loopback_address(address: &str) -> io::Result<SocketAddr> {
     let address: SocketAddr = address.parse().map_err(|_| invalid("listen must be a literal loopback IP:port"))?;
     if !address.ip().is_loopback() {
@@ -46,6 +66,9 @@ fn read_request(path: &Path) -> io::Result<Value> {
     file.take(MAX_FRAME_BYTES as u64 + 1).read_to_end(&mut bytes)?;
     if bytes.len() > MAX_FRAME_BYTES { return Err(invalid("request file exceeds frame limit")); }
     let value = serde_json::from_slice(&bytes)?;
+    // Resume also takes the ORIGINAL request. Only the shared receiver builds
+    // the result-resume envelope; accepting an operator-supplied envelope here
+    // could lose the original request fingerprint or nest recovery operations.
     validate_request(&value)?;
     Ok(value)
 }
@@ -71,14 +94,15 @@ struct TcpPeer {
     buffered: Vec<u8>,
     until: Instant,
     execution_budget: Duration,
-    execution_started: bool,
+    mode: DeliveryMode,
+    operation_started: bool,
 }
 impl TcpPeer {
-    fn new(stream: TcpStream, handshake: Duration, execution_budget: Duration) -> io::Result<Self> {
+    fn new(stream: TcpStream, handshake: Duration, execution_budget: Duration, mode: DeliveryMode) -> io::Result<Self> {
         if !stream.peer_addr()?.ip().is_loopback() { return Err(invalid("non-loopback worker peer")); }
         stream.set_nonblocking(true)?;
         stream.set_nodelay(true)?;
-        Ok(Self {stream,buffered:Vec::new(),until:deadline(handshake)?,execution_budget,execution_started:false})
+        Ok(Self {stream,buffered:Vec::new(),until:deadline(handshake)?,execution_budget,mode,operation_started:false})
     }
 }
 impl WorkerPeer for TcpPeer {
@@ -86,10 +110,20 @@ impl WorkerPeer for TcpPeer {
         check_deadline(self.until)?;
         let mut bytes = serde_json::to_vec(value)?;
         if bytes.len() > MAX_FRAME_BYTES { return Err(invalid("outbound frame too large")); }
-        if value.get("kind").and_then(Value::as_str) == Some("canonical-exec") {
-            if self.execution_started { return Err(invalid("operator connection cannot execute twice")); }
-            self.execution_started = true;
-            self.until = deadline(self.execution_budget)?;
+        if matches!(value.get("kind").and_then(Value::as_str), Some("canonical-exec" | "result-resume")) {
+            let expected = match self.mode {
+                DeliveryMode::Execute => "canonical-exec",
+                DeliveryMode::Resume => "result-resume",
+            };
+            if value["kind"] != expected { return Err(invalid("operation differs from local operator intent")); }
+            if self.operation_started { return Err(invalid("operator connection cannot dispatch twice")); }
+            self.operation_started = true; // burn before any possibly partial write
+            self.until = deadline(match self.mode {
+                DeliveryMode::Execute => self.execution_budget,
+                // Spool restoration and all range reads share ONE deadline.
+                // A historical compiler timeout does not govern byte recovery.
+                DeliveryMode::Resume => TRANSFER_ALLOWANCE,
+            })?;
         }
         bytes.push(b'\n');
         let mut offset = 0;
@@ -129,12 +163,13 @@ impl WorkerPeer for TcpPeer {
     }
 }
 
-fn run_once(args: &[String]) -> Result<Delivery, DeliveryFailure> {
+fn run_once(args: &[String], mode: DeliveryMode) -> Result<Delivery, DeliveryFailure> {
     let directory = PathBuf::from(&args[3]);
     let failure = |error: io::Error| DeliveryFailure {
         directory: directory.clone(),
-        execution_may_have_run: !matches!(std::fs::symlink_metadata(&directory),
-            Err(error) if error.kind() == io::ErrorKind::NotFound),
+        execution_may_have_run: mode == DeliveryMode::Resume
+            || !matches!(std::fs::symlink_metadata(&directory),
+                Err(error) if error.kind() == io::ErrorKind::NotFound),
         detail: error.to_string(),
     };
     let (address, request) = (|| -> io::Result<_> {
@@ -155,23 +190,25 @@ fn run_once(args: &[String]) -> Result<Delivery, DeliveryFailure> {
         if !parent.is_dir() { return Err(invalid("delivery parent directory does not exist")); }
         let listener = TcpListener::bind(address)?;
         eprintln!("{}",json!({"kind":"worker-exec-listening","address":listener.local_addr()?.to_string(),
-            "expected_worker":args[1],"request_id":request["request_id"],"transport_authenticated":false}));
+            "expected_worker":args[1],"request_id":request["request_id"],"transport_authenticated":false,
+            "operation":if mode == DeliveryMode::Resume {"result-resume"} else {"canonical-exec"}}));
         let stream = accept_one(&listener,ACCEPT_BUDGET)?;
         let budget = Duration::from_millis(request.get("timeout_ms").and_then(Value::as_u64)
             .unwrap_or(MAX_EXECUTION_MILLIS).min(MAX_EXECUTION_MILLIS)) + TRANSFER_ALLOWANCE;
-        TcpPeer::new(stream,HANDSHAKE_BUDGET,budget)
+        TcpPeer::new(stream,HANDSHAKE_BUDGET,budget,mode)
     })();
     let mut peer = setup.map_err(failure)?;
-    receive_execution(&mut peer,&request,&args[1],&directory)
+    receive_operation(&mut peer,&request,&args[1],&directory,mode)
 }
 
 /// One explicit command, not a background service or an automatic retry loop.
 pub fn run(args: &[String]) -> i32 {
-    if args.len() != 4 {
-        eprintln!("usage: rabsd --worker-exec-loopback <127.0.0.1:port> <expected-worker> <request.json> <absolute-delivery-directory>");
+    let Some((args, mode)) = operation_arguments(args, 4) else {
+        eprintln!("usage: rabsd --worker-exec-loopback [--resume] <127.0.0.1:port> <expected-worker> <request.json> <absolute-delivery-directory>");
+        eprintln!("--resume retrieves the original request into a new directory; it never executes it");
         return 2;
-    }
-    report_result(run_once(args))
+    };
+    report_result(run_once(args, mode))
 }
 
 fn report_result(result: Result<Delivery, DeliveryFailure>) -> i32 {
@@ -205,16 +242,17 @@ fn coordinator_tls_files() -> io::Result<rabs_asupersync::worker_transport::TlsF
     })
 }
 
-fn run_tls_once(args: &[String]) -> Result<Delivery, DeliveryFailure> {
+fn run_tls_once(args: &[String], mode: DeliveryMode) -> Result<Delivery, DeliveryFailure> {
     use asupersync::runtime::RuntimeBuilder;
     use rabs_asupersync::worker_transport::{MAX_JSON_RECORD, accept_peer};
-    use rabsd::coord::secure_worker_delivery::{parse_worker_pin, receive_authenticated};
+    use rabsd::coord::secure_worker_delivery::{parse_worker_pin, receive_authenticated_operation};
 
     let directory = PathBuf::from(&args[4]);
     let failure = |detail: String| DeliveryFailure {
         directory: directory.clone(),
-        execution_may_have_run: !matches!(std::fs::symlink_metadata(&directory),
-            Err(error) if error.kind() == io::ErrorKind::NotFound),
+        execution_may_have_run: mode == DeliveryMode::Resume
+            || !matches!(std::fs::symlink_metadata(&directory),
+                Err(error) if error.kind() == io::ErrorKind::NotFound),
         detail,
     };
     let (address, pin, request) = (|| -> Result<_, String> {
@@ -250,35 +288,41 @@ fn run_tls_once(args: &[String]) -> Result<Delivery, DeliveryFailure> {
             "address":listener.local_addr().map_err(|error| error.to_string())?.to_string(),
             "expected_worker":args[1], "expected_worker_spki_sha256":args[2],
             "request_id":request["request_id"], "transport":"mutual-tls-atp",
+            "operation":if mode == DeliveryMode::Resume {"result-resume"} else {"canonical-exec"},
             "authentication_required":true}));
         let (stream, _) = asupersync::time::timeout(asupersync::time::wall_now(), ACCEPT_BUDGET,
             listener.accept()).await.map_err(|_| "worker TLS accept deadline exceeded")?
             .map_err(|error| format!("worker TLS accept: {error}"))?;
         accept_peer(&acceptor, stream).await
     }).map_err(failure)?;
-    receive_authenticated(&runtime, peer, pin, &args[1], &request, &directory)
+    receive_authenticated_operation(&runtime, peer, pin, &args[1], &request, &directory, mode)
 }
 
 /// One explicitly pinned worker, authenticated transport, and one exact command.
 /// TLS/admission failures terminate without dispatch or a plaintext retry.
 /// Repeating the exact command revalidates an existing durable delivery offline.
+/// --resume selects retrieval only; absent/uncertain retained results are errors.
 pub fn run_tls(args: &[String]) -> i32 {
-    if args.len() != 5 {
-        eprintln!("usage: rabsd --worker-exec-tls <IP:port> <expected-worker> <worker-spki-sha256> <request.json> <absolute-delivery-directory>");
+    let Some((args, mode)) = operation_arguments(args, 5) else {
+        eprintln!("usage: rabsd --worker-exec-tls [--resume] <IP:port> <expected-worker> <worker-spki-sha256> <request.json> <absolute-delivery-directory>");
         eprintln!("required: RABS_COORD_TLS_CA, RABS_COORD_TLS_CERT, RABS_COORD_TLS_KEY");
+        eprintln!("--resume retrieves the original request into a new directory; it never executes it");
         return 2;
-    }
-    report_result(run_tls_once(args))
+    };
+    report_result(run_tls_once(args, mode))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn pair(budget: Duration) -> (TcpPeer,TcpStream) {
+    fn pair_with_mode(budget: Duration, mode: DeliveryMode) -> (TcpPeer,TcpStream) {
         let listener=TcpListener::bind("127.0.0.1:0").unwrap();
         let client=TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let stream=accept_one(&listener,Duration::from_secs(2)).unwrap();
-        (TcpPeer::new(stream,budget,budget).unwrap(),client)
+        (TcpPeer::new(stream,budget,budget,mode).unwrap(),client)
+    }
+    fn pair(budget: Duration) -> (TcpPeer,TcpStream) {
+        pair_with_mode(budget, DeliveryMode::Execute)
     }
     #[test]
     fn loopback_is_literal_and_never_a_public_fallback() {
@@ -323,5 +367,56 @@ mod tests {
         let (mut peer,_client)=pair(Duration::from_secs(2));
         peer.send(&json!({"kind":"canonical-exec","request_id":1})).unwrap();
         assert!(peer.send(&json!({"kind":"canonical-exec","request_id":2})).is_err());
+        assert!(peer.send(&json!({"kind":"result-resume","request_id":1})).is_err());
+    }
+
+    #[test]
+    fn resume_intent_is_explicit_and_cannot_be_duplicated_or_misplaced() {
+        let plain: Vec<String> = ["127.0.0.1:0", "worker", "request.json", "/delivery"]
+            .into_iter().map(str::to_owned).collect();
+        assert_eq!(operation_arguments(&plain, 4), Some((plain.as_slice(), DeliveryMode::Execute)));
+        let mut leading = vec!["--resume".to_owned()];
+        leading.extend(plain.clone());
+        assert_eq!(operation_arguments(&leading, 4), Some((&leading[1..], DeliveryMode::Resume)));
+        let mut trailing = plain.clone();
+        trailing.push("--resume".to_owned());
+        assert_eq!(operation_arguments(&trailing, 4), Some((&trailing[..4], DeliveryMode::Resume)));
+        leading.push("--resume".to_owned());
+        assert!(operation_arguments(&leading, 4).is_none());
+        let mut misplaced = plain;
+        misplaced.insert(2, "--resume".to_owned());
+        assert!(operation_arguments(&misplaced, 4).is_none());
+        assert!(operation_arguments(&[], 4).is_none());
+    }
+
+    #[test]
+    fn resume_refuses_execution_and_has_one_restoration_transfer_deadline() {
+        let (mut peer, _client) = pair_with_mode(Duration::from_secs(2), DeliveryMode::Resume);
+        assert!(peer.send(&json!({"kind":"canonical-exec", "request_id":7})).is_err());
+        peer.send(&json!({"kind":"result-resume", "request_id":7})).unwrap();
+        let until = peer.until;
+        assert!(until > Instant::now() + Duration::from_secs(60));
+        peer.send(&json!({"kind":"output-read", "request_id":7})).unwrap();
+        assert_eq!(peer.until, until);
+        assert!(peer.send(&json!({"kind":"result-resume", "request_id":7})).is_err());
+        assert!(peer.send(&json!({"kind":"canonical-exec", "request_id":7})).is_err());
+        assert_eq!(peer.until, until);
+    }
+
+    #[test]
+    fn resume_failures_before_connect_preserve_original_execution_uncertainty() {
+        let root = tempfile::tempdir().unwrap();
+        let missing = root.path().join("missing-request.json").to_string_lossy().into_owned();
+        let destination = root.path().join("delivery").to_string_lossy().into_owned();
+        let plain = vec!["127.0.0.1:0".to_owned(), "worker".to_owned(), missing.clone(), destination.clone()];
+        let tls = vec!["127.0.0.1:0".to_owned(), "worker".to_owned(), "01".repeat(32), missing, destination];
+        for mode in [DeliveryMode::Execute, DeliveryMode::Resume] {
+            assert_eq!(run_once(&plain, mode).unwrap_err().execution_may_have_run, mode == DeliveryMode::Resume);
+            assert_eq!(run_tls_once(&tls, mode).unwrap_err().execution_may_have_run, mode == DeliveryMode::Resume);
+            let mut invalid_pin = tls.clone();
+            invalid_pin[2] = "invalid".to_owned();
+            assert_eq!(run_tls_once(&invalid_pin, mode).unwrap_err().execution_may_have_run, mode == DeliveryMode::Resume);
+        }
+        assert!(!root.path().join("delivery").exists());
     }
 }
