@@ -146,10 +146,30 @@ pub fn route(signals: &[CouplingSignal]) -> SuiteRouting {
     if signals.is_empty() {
         return SuiteRouting::PerTestCaching;
     }
+    // The coupled state is a SET, so its digest is taken over the
+    // signals in canonical order rather than the order the detector
+    // happened to report them. Encoding them as received forked the
+    // suite key on report order — a directory walk or a map iteration
+    // reordering two signals gave the same suite two different keys,
+    // which is a spurious miss and a duplicate entry for one logical
+    // suite. This is the same rule T035 pins for output order: order is
+    // not part of an identity (T022).
+    let mut encoded: Vec<Vec<u8>> = signals
+        .iter()
+        .map(|signal| {
+            let mut one = CanonicalEncoder::new();
+            signal.encode(&mut one);
+            one.finish()
+        })
+        .collect();
+    encoded.sort();
+
     let mut enc = CanonicalEncoder::new();
-    enc.u32(u32::try_from(signals.len()).unwrap_or(u32::MAX));
-    for signal in signals {
-        signal.encode(&mut enc);
+    enc.u32(u32::try_from(encoded.len()).unwrap_or(u32::MAX));
+    for bytes in &encoded {
+        // `bytes` is length-delimited, so concatenation stays
+        // unambiguous: two adjacent encodings can never be read as one.
+        enc.bytes(bytes);
     }
     SuiteRouting::TestBinaryBatch {
         coupled_state: compute(DOMAIN_SUITE_COUPLING, &enc.finish()),

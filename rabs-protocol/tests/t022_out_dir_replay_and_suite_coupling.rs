@@ -50,7 +50,11 @@ fn manifest(out: &[(&str, u64)], cache: &[(&str, u64)]) -> OutputTreeManifest {
 
 /// Paths the plan would leave in place: everything the live tree has
 /// that is not deleted, plus everything the plan creates.
-fn resulting_paths(live: &OutputTreeManifest, plan_delete: &[Vec<u8>], created: &[Vec<u8>]) -> Vec<Vec<u8>> {
+fn resulting_paths(
+    live: &OutputTreeManifest,
+    plan_delete: &[Vec<u8>],
+    created: &[Vec<u8>],
+) -> Vec<Vec<u8>> {
     let mut paths: Vec<Vec<u8>> = live
         .section(OutputSection::OutDir)
         .iter()
@@ -132,7 +136,10 @@ fn t022_the_planner_does_see_drift_that_changes_length() {
     let plan = plan_swap(&live, &target).expect("plans");
     assert_eq!(plan.delete, vec![b"build/generated.rs".to_vec()]);
     assert_eq!(plan.create, vec![b"build/generated.rs".to_vec()]);
-    assert_ne!(pre_state_key_material(&live), pre_state_key_material(&target));
+    assert_ne!(
+        pre_state_key_material(&live),
+        pre_state_key_material(&target)
+    );
 }
 
 #[test]
@@ -180,4 +187,3 @@ fn t022_replay_equals_a_clean_run_for_every_difference_the_planner_can_see() {
         "a target path missing from the live tree must be created"
     );
 }
-
