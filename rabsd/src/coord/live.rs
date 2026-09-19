@@ -24,6 +24,8 @@
 //! split itself, and the shutdown receipt shows the coord region
 //! abandoned so nothing hides.
 
+mod output_install;
+
 use crate::coord::action_actor::{
     ActionActor, AttemptPurpose, JoinReceipt, JoinRequest, OpenGenerationReceipt, RegisterAttempt,
     RegisterAttemptReceipt,
@@ -35,7 +37,7 @@ use rabs_cas::blob_store::RAW_PROFILE_V1;
 use rabs_cas::digest_set::ATP_OBJECT_CONTENT_DOMAIN;
 use rabs_cas::digest_set::{DigestRequest, digest_set};
 use rabs_cas::manifest_codec::{decode_manifest_v1, encode_manifest_v1};
-use rabs_cas::materialization::{MaterializationMode, materialize_object};
+use rabs_cas::materialization::ActionMaterializeFailure;
 use rabs_cas::metadata_store::{
     AuthorityRow, RabsMetadataStore, SqlValue, StoreError, digest_key,
 };
@@ -60,7 +62,7 @@ use rabs_protocol::generation::{
 };
 use rabs_protocol::input_evidence::{ActionInputManifest, InputFileType};
 use rabs_protocol::result_identity::{
-    CanonicalActionResultManifest, DigestAlgorithm, OutputRole, TypedDigest,
+    CanonicalActionResultManifest, DigestAlgorithm, TypedDigest,
 };
 use rabs_protocol::wire_time::PeerId;
 use rabs_protocol::worker_fence::{WorkerAdmission, WorkerSessionOffer};
@@ -223,7 +225,7 @@ pub enum ServeOutcome {
     /// Materialized; these files now exist (empty when the committed
     /// manifest declares no materializable output).
     Served {
-        /// The destinations written, in manifest order.
+        /// The destinations written, in installation order (.rmeta first).
         files: Vec<PathBuf>,
     },
     /// The serving gate said no. The typed decision is preserved —
@@ -261,16 +263,28 @@ pub enum ServeOutcome {
 pub enum ExpectedOutputs {
     /// The caller's derived output set (filenames relative to the
     /// destination root, e.g. from `rabs_key::output_derivation`). The
-    /// committed manifest's materializable outputs must equal it
+    /// committed manifest's complete logical-output set must equal it
     /// exactly.
     Exactly(std::collections::BTreeSet<String>),
+    /// Exact outputs plus byte-preserving canonical-directory to subscriber-
+    /// directory mappings used ONLY for private dep-info derivation. Neither
+    /// the mappings nor derived .d bytes change the action/CAS identity.
+    WithDepInfo {
+        /// Complete canonical output names, including .rmeta and .d.
+        paths: std::collections::BTreeSet<String>,
+        /// Directory mappings; component boundaries and longest-prefix order
+        /// are validated before deriving any subscriber output.
+        mappings: Vec<(Vec<u8>, Vec<u8>)>,
+    },
     /// The caller is not skipping any work and accepts whatever the
     /// commit declares: operator and diagnostic paths only. A wrapper
     /// must never use this.
     WhateverWasCommitted,
 }
 
-/// Why a serve could not even be attempted. Nothing is written.
+/// A serve refusal or interrupted materialization. `Materialize` retains the
+/// exact installed prefix; it MUST NOT be interpreted as an untouched target
+/// tree or permission to run a compiler. A lost reply is likewise uncertain.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServeError {
     /// Work-skipping replay requires this process's live, active coordinator.
@@ -295,13 +309,17 @@ pub enum ServeError {
         /// The bundle holding it.
         holder: String,
     },
-    /// Materializing one output failed.
-    Materialize {
-        /// Which destination.
+    /// Whole-plan or dep-info preparation failed before any target output was
+    /// installed. Private scratch may have been written; no CAS bytes changed.
+    Preparation {
+        /// The affected destination (presentation only).
         path: String,
-        /// The typed materialization failure.
+        /// Why the complete plan could not be prepared.
         reason: String,
     },
+    /// The existing materializer's full failure, including any already
+    /// installed, verified prefix. Never erase this delivery-frontier evidence.
+    Materialize(ActionMaterializeFailure),
 }
 
 impl std::fmt::Display for ServeError {
@@ -317,7 +335,11 @@ impl std::fmt::Display for ServeError {
             Self::DestinationConflict { path, holder } => {
                 write!(f, "destination {path} is held by {holder}")
             }
-            Self::Materialize { path, reason } => write!(f, "materializing {path}: {reason}"),
+            Self::Preparation { path, reason } => write!(f, "preparing {path}: {reason}"),
+            Self::Materialize(failure) => write!(
+                f, "materialization interrupted after {} installed outputs: {}",
+                failure.installed.len(), failure.error,
+            ),
         }
     }
 }
@@ -341,26 +363,6 @@ fn resolve_destination(root: &Path, virtual_path: &[u8]) -> Option<PathBuf> {
         components += 1;
     }
     (components > 0).then_some(out)
-}
-
-/// Materialize every planned output, stopping at the first failure.
-fn install_all(
-    store: &mut dyn RabsMetadataStore,
-    plan: &[(TypedDigest, PathBuf, String)],
-) -> Result<Vec<PathBuf>, ServeError> {
-    let mut written = Vec::with_capacity(plan.len());
-    for (object, path, text) in plan {
-        // The backend verifies filesystem CoW isolation before cloning. An
-        // unsupported filesystem or cross-device copy retains the verified
-        // private-copy path; mutable subscribers never alias a CAS inode.
-        let mode = MaterializationMode::VerifiedCowReflink;
-        materialize_object(store, object, path, mode).map_err(|e| ServeError::Materialize {
-            path: text.clone(),
-            reason: e.to_string(),
-        })?;
-        written.push(path.clone());
-    }
-    Ok(written)
 }
 
 // The class receipt is derived from the actual keyed descriptor at submission,
@@ -1665,19 +1667,19 @@ impl CoordLive {
     /// 2. the committed manifest is reloaded from its CAS bytes, so
     ///    what gets materialized is what was committed, not what some
     ///    process remembered;
-    /// 3. the commit's materializable outputs are checked against
-    ///    `expected` — a caller skipping work must get exactly the files
-    ///    that work would have produced, or no hit at all;
+    /// 3. the complete logical-output set is checked against `expected`;
+    ///    unsupported roles or dep-info derivations refuse before installation;
     /// 4. every destination is resolved under `destination_root` and
     ///    refused if it escapes (absolute, `..`, empty);
     /// 5. the D031 arbiter reserves ALL of them all-or-nothing, so two
     ///    concurrent serves cannot install into overlapping paths;
-    /// 6. only then do bytes land, each verified against its object id
-    ///    and renamed into place.
+    /// 6. only then do bytes land, each verified against its object id,
+    ///    privately derived where needed, stamped and renamed into place.
     ///
     /// A failure part-way leaves the files already written in place —
-    /// they are individually correct, verified artifacts — and reports
-    /// the failure; the caller must not treat a partial serve as a hit.
+    /// they are individually verified artifacts or subscriber derivations —
+    /// and reports the exact installed prefix. A partial serve is not a hit
+    /// and never authorizes uncoordinated compiler execution.
     ///
     /// # Errors
     /// A typed [`ServeError`]. The non-error non-serve cases (nothing
@@ -1768,47 +1770,14 @@ impl CoordLive {
             return Ok(ServeOutcome::ManifestUnavailable { key: manifest_key });
         }
 
-        // The interlock: does this commit produce what the caller's own
-        // work would have produced? Checked BEFORE any path resolution,
-        // reservation, or byte — a mismatch must cost nothing.
-        if let ExpectedOutputs::Exactly(expected) = expected {
-            let mut committed_outputs = std::collections::BTreeSet::new();
-            for output in &manifest.logical_outputs {
-                if output.role != OutputRole::Materializable {
-                    continue;
-                }
-                // No lossy comparison in a safety interlock: a path this
-                // build cannot even read is a path it cannot promise.
-                let text = std::str::from_utf8(output.virtual_path.as_bytes()).map_err(|_| {
-                    ServeError::UnsafeVirtualPath {
-                        path: output.virtual_path.escaped(),
-                    }
-                })?;
-                committed_outputs.insert(text.to_owned());
-            }
-            if committed_outputs != *expected {
-                return Ok(ServeOutcome::OutputSetMismatch {
-                    missing: expected.difference(&committed_outputs).cloned().collect(),
-                    unexpected: committed_outputs.difference(expected).cloned().collect(),
-                });
-            }
-        }
-
-        // Resolve destinations first: nothing is reserved, and no byte
-        // is written, until every path is known to stay inside the root.
-        let mut plan: Vec<(TypedDigest, PathBuf, String)> = Vec::new();
-        for output in &manifest.logical_outputs {
-            if output.role != OutputRole::Materializable {
-                continue;
-            }
-            let path = resolve_destination(destination_root, output.virtual_path.as_bytes())
-                .ok_or_else(|| ServeError::UnsafeVirtualPath {
-                    path: output.virtual_path.escaped(),
-                })?;
-            let text = path.to_string_lossy().into_owned();
-            plan.push((output.object.0.clone(), path, text));
-        }
-        if plan.is_empty() {
+        // One complete logical-output map: do not silently discard .rmeta or
+        // dep-info. Canonical .d files are verified and derived privately before
+        // any target write. Unsupported roles and incomplete mappings refuse.
+        let plan = match output_install::prepare(&mut *store, &manifest, destination_root, expected)? {
+            Ok(plan) => plan,
+            Err(outcome) => return Ok(outcome),
+        };
+        if plan.outputs.is_empty() {
             return Ok(ServeOutcome::Served { files: Vec::new() });
         }
 
@@ -1816,7 +1785,8 @@ impl CoordLive {
         // install, so a concurrent serve into an overlapping path is
         // refused rather than interleaved.
         let bundle = BundleId(format!("serve:{key}:{}", self.next_seq()));
-        let paths: Vec<String> = plan.iter().map(|(_, _, text)| text.clone()).collect();
+        let paths: Vec<String> = plan.outputs.iter()
+            .map(|out| out.destination.to_string_lossy().into_owned()).collect();
         // The guard releases on drop, so the reservation cannot outlive
         // this call however it ends — including an unwind, which
         // previously stranded the paths for the process's lifetime
@@ -1828,7 +1798,7 @@ impl CoordLive {
                 holder: conflict.holder.0,
             }
         })?;
-        let files = install_all(&mut *store, &plan)?;
+        let files = output_install::install(&mut *store, &plan)?;
         Ok(ServeOutcome::Served { files })
     }
 
