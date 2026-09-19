@@ -1,6 +1,11 @@
-//! T027, the secret-policy family: paths that LOOK ordinary to the
-//! classifier but name a secret file on a real filesystem (bead E027;
-//! invariant I38; risk R82).
+//! T027: paths that LOOK ordinary to a classifier but are not — the
+//! secret-policy family (bead E027; invariant I38; risk R82) and the
+//! runtime-path family (bead D027; risk R84).
+//!
+//! Both arms turned out to have the same shape of defect: a matching
+//! rule that was right about WHAT to compare and wrong about HOW, in a
+//! way the original fixtures could not see because they only ever used
+//! the one spelling the rule happened to handle.
 //!
 //! E027 already ships the headline acceptance — seed secret and denied
 //! paths among ordinary sources, and the uploaded set contains not one
@@ -34,6 +39,10 @@
 //! These are evasions by accident, not by construction — nobody has to
 //! be attacking for a capture to enumerate a path in either shape.
 
+use rabs_sandbox::runtime_path_scanner::{
+    PortabilityDeclarations, RuntimePathClass, RuntimePathFinding, forces_local_only,
+    scan_runtime_paths,
+};
 use rabs_sandbox::source_capture::{
     CaptureDecision, PathShape, SourceCapturePolicy, classify_path, partition_capture,
 };
@@ -181,6 +190,80 @@ fn t027_a_case_variant_secret_is_not_rescued_by_weaker_configuration() {
         decision.uploaded.is_empty(),
         "the capability route must never put a secret in the uploaded set"
     );
+}
+
+#[test]
+fn t027_a_portability_declaration_covers_its_own_subtree_and_not_a_sibling() {
+    // The R84 family. A declaration names a canonical path PREFIX, and
+    // classification matched it with a plain string `starts_with` — so
+    // declaring `/__rabs/workspace/assets` also covered
+    // `/__rabs/workspace/assets-private/...`, a DIFFERENT directory
+    // whose name merely extends it.
+    //
+    // That silently converts the fail-safe answer into the unsafe one:
+    // an embedded path that should be `RuntimePathSensitive`, forcing
+    // the action local-only because the path will not exist on the
+    // user's machine, is instead reported portable and the artifact is
+    // shared. The declaration is the project's promise about a
+    // directory, and a sibling is not inside it.
+    let declarations = PortabilityDeclarations {
+        packaged_resources: vec!["/__rabs/workspace/assets".to_owned()],
+        guaranteed_runtime_mounts: Vec::new(),
+    };
+
+    // Inside the declared directory: portable, as declared.
+    let inside = scan_runtime_paths(
+        b"open(\"/__rabs/workspace/assets/logo.png\")",
+        &declarations,
+    );
+    assert_eq!(
+        inside,
+        vec![RuntimePathFinding {
+            path: "/__rabs/workspace/assets/logo.png".to_owned(),
+            class: RuntimePathClass::PackagedResource(
+                "/__rabs/workspace/assets/logo.png".to_owned()
+            ),
+        }],
+        "a path inside the declared directory is covered by it"
+    );
+    assert!(!forces_local_only(&inside));
+
+    // A SIBLING whose name extends the declared one: not covered.
+    let sibling = scan_runtime_paths(
+        b"open(\"/__rabs/workspace/assets-private/token.txt\")",
+        &declarations,
+    );
+    assert_eq!(
+        sibling,
+        vec![RuntimePathFinding {
+            path: "/__rabs/workspace/assets-private/token.txt".to_owned(),
+            class: RuntimePathClass::RuntimePathSensitive(
+                "/__rabs/workspace/assets-private/token.txt".to_owned()
+            ),
+        }],
+        "declaring `assets` must not silently cover `assets-private`"
+    );
+    assert!(
+        forces_local_only(&sibling),
+        "an undeclared runtime-opened path must force the local-only lane"
+    );
+
+    // The declared directory named exactly, and with a trailing
+    // separator, both still cover their own subtree.
+    for declared in ["/__rabs/workspace/assets", "/__rabs/workspace/assets/"] {
+        let declarations = PortabilityDeclarations {
+            packaged_resources: vec![declared.to_owned()],
+            guaranteed_runtime_mounts: Vec::new(),
+        };
+        let findings = scan_runtime_paths(
+            b"open(\"/__rabs/workspace/assets/logo.png\")",
+            &declarations,
+        );
+        assert!(
+            !forces_local_only(&findings),
+            "declaring {declared} must cover its own subtree"
+        );
+    }
 }
 
 #[test]

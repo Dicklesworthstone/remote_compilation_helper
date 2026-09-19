@@ -80,6 +80,24 @@ fn embedded_canonical_paths(bytes: &[u8]) -> Vec<String> {
     found
 }
 
+/// Whether `declared` covers `path`: the same path, or an ancestor
+/// DIRECTORY of it.
+///
+/// A declaration is the project's promise about a path and everything
+/// under it, so the match has to end on a component boundary. Comparing
+/// with a plain `starts_with` made `/__rabs/workspace/assets` cover
+/// `/__rabs/workspace/assets-private/...`, a different directory whose
+/// name merely extends it — and that turns the fail-safe answer into
+/// the unsafe one, reporting an undeclared runtime-opened path as
+/// portable instead of routing the action local-only (T027/R84).
+fn declaration_covers(path: &str, declared: &str) -> bool {
+    let declared = declared.strip_suffix('/').unwrap_or(declared);
+    path == declared
+        || path
+            .strip_prefix(declared)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
 /// Scan loadable bytes and classify every embedded canonical path.
 #[must_use]
 pub fn scan_runtime_paths(
@@ -92,13 +110,13 @@ pub fn scan_runtime_paths(
             let class = if declarations
                 .packaged_resources
                 .iter()
-                .any(|p| path.starts_with(p.as_str()))
+                .any(|p| declaration_covers(&path, p))
             {
                 RuntimePathClass::PackagedResource(path.clone())
             } else if declarations
                 .guaranteed_runtime_mounts
                 .iter()
-                .any(|p| path.starts_with(p.as_str()))
+                .any(|p| declaration_covers(&path, p))
             {
                 RuntimePathClass::GuaranteedRuntimeMount(path.clone())
             } else {
