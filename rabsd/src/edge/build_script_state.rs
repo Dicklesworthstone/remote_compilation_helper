@@ -17,11 +17,51 @@
 
 use std::collections::BTreeMap;
 
+/// The `/`-separated byte key for a relative path inside an OUT_DIR.
+///
+/// Byte-exact: a path component is an arbitrary byte string on Unix,
+/// and this key is what decides whether two captured files are the same
+/// file. On Windows `MAIN_SEPARATOR` is `\`, so the separator is
+/// normalized to `/` for a stable cross-platform key; on Unix that
+/// substitution cannot fire, because `/` is already the separator and
+/// no other byte is.
+fn relative_key(rel: &std::path::Path) -> Vec<u8> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        rel.as_os_str().as_bytes().to_vec()
+    }
+    #[cfg(not(unix))]
+    {
+        rel.to_string_lossy()
+            .replace(std::path::MAIN_SEPARATOR, "/")
+            .into_bytes()
+    }
+}
+
 /// A complete OUT_DIR state: relative path → content bytes.
+///
+/// Relative paths are BYTES. They were `String` via `to_string_lossy`,
+/// which maps every invalid UTF-8 byte to U+FFFD — so two files whose
+/// names differed only in invalid bytes collapsed to one map key, and
+/// the `insert` in [`Self::capture`] silently kept whichever
+/// `read_dir` happened to yield last.
+///
+/// That defeats the premise this module is built on. The captured
+/// post-state is supposed to be COMPLETE, with deletions expressed by
+/// absence; a collapse makes a file the script actually wrote absent
+/// from the state, so the replay omits it and the replayed build
+/// silently differs from the clean run it claims to equal. That is the
+/// R66 ghost class arriving through capture instead of through a merge,
+/// and the swap-never-merge rule cannot prevent it.
+///
+/// Worse, `read_dir` order is unspecified, so WHICH of the two
+/// survived varied run to run — a nondeterministic capture underneath
+/// a cache whose whole value is determinism.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct OutDirState {
     /// Every file the state contains (paths `/`-separated, relative).
-    pub files: BTreeMap<String, Vec<u8>>,
+    pub files: BTreeMap<Vec<u8>, Vec<u8>>,
 }
 
 impl OutDirState {
@@ -35,12 +75,12 @@ impl OutDirState {
                 if entry.file_type()?.is_dir() {
                     pending.push(entry.path());
                 } else {
-                    let rel = entry
-                        .path()
-                        .strip_prefix(root)
-                        .expect("walk stays under root")
-                        .to_string_lossy()
-                        .replace(std::path::MAIN_SEPARATOR, "/");
+                    let rel = relative_key(
+                        entry
+                            .path()
+                            .strip_prefix(root)
+                            .expect("walk stays under root"),
+                    );
                     state.files.insert(rel, std::fs::read(entry.path())?);
                 }
             }
@@ -83,7 +123,16 @@ pub fn replay_post_state(
     }
     std::fs::create_dir(&staging)?;
     for (rel, content) in &post_state.files {
-        let path = staging.join(rel);
+        // The key is bytes and the filesystem takes bytes, with no
+        // decode in between — the same path that was captured is the
+        // path that gets written back.
+        #[cfg(unix)]
+        let path = {
+            use std::os::unix::ffi::OsStrExt;
+            staging.join(std::ffi::OsStr::from_bytes(rel))
+        };
+        #[cfg(not(unix))]
+        let path = staging.join(String::from_utf8_lossy(rel).as_ref());
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
@@ -110,9 +159,14 @@ mod tests {
         let mut s = OutDirState::default();
         for (path, content) in entries {
             s.files
-                .insert((*path).to_string(), content.as_bytes().to_vec());
+                .insert(path.as_bytes().to_vec(), content.as_bytes().to_vec());
         }
         s
+    }
+
+    /// The byte key for a path literal, matching what `capture` records.
+    fn k(path: &str) -> Vec<u8> {
+        path.as_bytes().to_vec()
     }
 
     fn write(root: &std::path::Path, rel: &str, contents: &str) {
@@ -144,13 +198,61 @@ mod tests {
         let clean = OutDirState::capture(&clean_out).unwrap();
         assert_eq!(replayed, clean, "replay must equal a clean run");
         assert!(
-            !replayed.files.contains_key("ghost.rs"),
+            !replayed.files.contains_key(&k("ghost.rs")),
             "the ghost survived: {:?}",
             replayed.files.keys().collect::<Vec<_>>()
         );
         assert_eq!(
-            replayed.files["generated.rs"],
+            replayed.files[&k("generated.rs")],
             b"pub const X: u32 = 2;".to_vec()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn two_out_dir_files_differing_only_in_invalid_utf8_both_survive_capture() {
+        // The completeness premise, against the one input that used to
+        // break it. These are two different files; under the previous
+        // `to_string_lossy` key they became one, and whichever
+        // `read_dir` yielded last silently won — so the "complete"
+        // post-state was missing a file the script had really written,
+        // and replay produced a build differing from the clean run.
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let out = root.path().join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let first = OsStr::from_bytes(b"gen-\xff.rs");
+        let second = OsStr::from_bytes(b"gen-\xfe.rs");
+        assert_eq!(
+            first.to_string_lossy(),
+            second.to_string_lossy(),
+            "the fixture must be indistinguishable under the decode this replaced, \
+             or it is not exercising the collapse"
+        );
+        std::fs::write(out.join(first), b"first").unwrap();
+        std::fs::write(out.join(second), b"second").unwrap();
+
+        let captured = OutDirState::capture(&out).unwrap();
+        assert_eq!(
+            captured.files.len(),
+            2,
+            "both files must be in the state: {:?}",
+            captured.files.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(captured.files[&b"gen-\xff.rs".to_vec()], b"first".to_vec());
+        assert_eq!(captured.files[&b"gen-\xfe.rs".to_vec()], b"second".to_vec());
+
+        // And the round trip holds: replaying the captured state into a
+        // clean directory reproduces it exactly, which is the property
+        // the whole module exists to provide.
+        let clean = root.path().join("clean");
+        replay_post_state(&clean, &captured).unwrap();
+        assert_eq!(
+            OutDirState::capture(&clean).unwrap(),
+            captured,
+            "replay of a non-UTF-8 state must equal the state"
         );
     }
 
@@ -169,7 +271,10 @@ mod tests {
 
         replay_post_state(&out, &run.post_state).unwrap();
         let observed = OutDirState::capture(&out).unwrap();
-        assert!(!observed.files.contains_key("cached.bin"), "deletion lost");
+        assert!(
+            !observed.files.contains_key(&k("cached.bin")),
+            "deletion lost"
+        );
         assert_eq!(observed, run.post_state);
     }
 
