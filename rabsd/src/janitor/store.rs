@@ -35,7 +35,9 @@ fn acquire_mount_lock(root: &Path) -> Result<File, String> {
         let metadata = std::fs::symlink_metadata(&path)
             .map_err(|e| format!("CAS mount lock metadata: {e}"))?;
         if !metadata.is_file() {
-            return Err("CAS mount lock must be an ordinary file, not a link or directory".to_owned());
+            return Err(
+                "CAS mount lock must be an ordinary file, not a link or directory".to_owned(),
+            );
         }
         #[cfg(unix)]
         {
@@ -57,14 +59,20 @@ fn acquire_mount_lock(root: &Path) -> Result<File, String> {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             validate()?;
-            OpenOptions::new().read(true).write(true).open(&path)
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
                 .map_err(|e| format!("open CAS mount lock: {e}"))?
         }
         Err(error) => return Err(format!("create CAS mount lock: {error}")),
     };
-    file.try_lock().map_err(|e| format!("CAS already mounted or exclusive lock unavailable: {e}"))?;
+    file.try_lock()
+        .map_err(|e| format!("CAS already mounted or exclusive lock unavailable: {e}"))?;
     let named = validate()?;
-    let opened = file.metadata().map_err(|e| format!("opened CAS mount lock: {e}"))?;
+    let opened = file
+        .metadata()
+        .map_err(|e| format!("opened CAS mount lock: {e}"))?;
     if !opened.is_file() {
         return Err("opened CAS mount lock is not a regular file".to_owned());
     }
@@ -180,10 +188,28 @@ impl std::fmt::Debug for LiveCas {
 /// acquired. A failed mount never touches SQLite or blob metadata without the
 /// lock. The lock is released on every startup error and at the last owner drop.
 pub fn mount_and_reconcile(cas_root: &Path) -> Result<LiveCas, String> {
+    // `create_dir_all` honours the process umask, and the Debian/Ubuntu
+    // default is 0002 (user-private groups), which creates a 0775 root
+    // — group-writable, which `acquire_mount_lock` then refuses. The
+    // daemon would create a CAS root and immediately decline to mount
+    // it, so a cold start could not succeed on a stock host at all.
+    //
+    // Tighten what WE create. A PRE-EXISTING root is deliberately left
+    // alone: its permissions are evidence about who else can write
+    // there, and silently repairing someone else's directory would
+    // convert the security check below into a no-op rather than
+    // satisfying it.
+    let preexisting = cas_root.exists();
     std::fs::create_dir_all(cas_root)
         .map_err(|e| format!("cas root {}: {e}", cas_root.display()))?;
-    let cas_root = std::fs::canonicalize(cas_root)
-        .map_err(|e| format!("canonical CAS root: {e}"))?;
+    #[cfg(unix)]
+    if !preexisting {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(cas_root, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| format!("cas root permissions {}: {e}", cas_root.display()))?;
+    }
+    let cas_root =
+        std::fs::canonicalize(cas_root).map_err(|e| format!("canonical CAS root: {e}"))?;
     let mount_lock = acquire_mount_lock(&cas_root)?;
     let layout = BlobStoreLayout::open(&cas_root.join("blobs"))
         .map_err(|e| format!("blob layout: {e:?}"))?;
@@ -348,7 +374,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cas_root = dir.path().join("cas");
         let first = mount_and_reconcile(&cas_root).expect("first mount");
-        assert!(mount_and_reconcile(&cas_root).is_err(), "live ownership must not be superseded");
+        assert!(
+            mount_and_reconcile(&cas_root).is_err(),
+            "live ownership must not be superseded"
+        );
         drop(first);
         let second = mount_and_reconcile(&cas_root).expect("re-mount");
         assert!(!second.serving_refused);
@@ -362,7 +391,10 @@ mod tests {
         drop(first);
         assert!(mount_and_reconcile(dir.path()).is_err());
         drop(other_region);
-        assert!(dir.path().join(MOUNT_LOCK).is_file(), "never unlink the fencing inode");
+        assert!(
+            dir.path().join(MOUNT_LOCK).is_file(),
+            "never unlink the fencing inode"
+        );
         assert!(mount_and_reconcile(dir.path()).is_ok());
     }
 
@@ -397,7 +429,8 @@ mod tests {
                 2 => std::fs::create_dir(&path).unwrap(),
                 _ => {
                     std::fs::write(&path, b"shared").unwrap();
-                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666))
+                        .unwrap();
                 }
             }
             assert!(mount_and_reconcile(&root).is_err());
@@ -418,8 +451,14 @@ mod tests {
 
     #[test]
     fn mount_lock_subprocess_helper() {
-        let Some(root) = std::env::var_os("RABS_TEST_CAS_MOUNT_LOCK") else { return; };
-        std::process::exit(if mount_and_reconcile(Path::new(&root)).is_err() { 41 } else { 42 });
+        let Some(root) = std::env::var_os("RABS_TEST_CAS_MOUNT_LOCK") else {
+            return;
+        };
+        std::process::exit(if mount_and_reconcile(Path::new(&root)).is_err() {
+            41
+        } else {
+            42
+        });
     }
 
     #[test]
@@ -427,10 +466,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let _mounted = mount_and_reconcile(dir.path()).unwrap();
         let status = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "janitor::store::tests::mount_lock_subprocess_helper"])
+            .args([
+                "--exact",
+                "janitor::store::tests::mount_lock_subprocess_helper",
+            ])
             .env("RABS_TEST_CAS_MOUNT_LOCK", dir.path())
-            .status().unwrap();
-        assert_eq!(status.code(), Some(41), "child must run the helper and refuse the mount");
+            .status()
+            .unwrap();
+        assert_eq!(
+            status.code(),
+            Some(41),
+            "child must run the helper and refuse the mount"
+        );
     }
 
     #[test]
@@ -444,5 +491,76 @@ mod tests {
         assert!(fs.exists(file.to_str().unwrap()));
         assert!(!fs.exists(dir.path().join("missing").to_str().unwrap()));
         assert!(fs.all_paths().iter().any(|p| p.ends_with("obj.bin")));
+    }
+
+    /// A cold start must succeed on a host whose default umask is
+    /// group-writable — which is the Debian/Ubuntu default (0002).
+    ///
+    /// `create_dir_all` honours the umask, so the mount used to create a
+    /// 0775 CAS root and then refuse it for being group-writable: the
+    /// daemon declined to mount a directory it had just made itself, and
+    /// no cold start could succeed on a stock host. The whole rabsd test
+    /// suite failed on exactly those workers too, which is how this was
+    /// found.
+    #[cfg(unix)]
+    #[test]
+    fn a_cold_start_creates_a_private_cas_root_whatever_the_umask() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // The mode is asserted EXACTLY rather than just "not
+        // group-writable", which is what makes this umask-independent:
+        // without the explicit tightening the created root inherits the
+        // ambient umask, giving 0755 on a 0022 host and 0775 on a 0002
+        // one. Neither is 0700, so this fails on any host if the fix
+        // regresses — and the 0775 case is the one where the mount then
+        // refused the directory it had just created, so no cold start
+        // could succeed on a stock Debian/Ubuntu box at all.
+        let dir = tempfile::tempdir().unwrap();
+        let cas_root = dir.path().join("cas");
+
+        let mounted = mount_and_reconcile(&cas_root);
+        assert!(
+            mounted.is_ok(),
+            "a cold start must succeed: {:?}",
+            mounted.err()
+        );
+        assert_eq!(
+            std::fs::metadata(&cas_root)
+                .expect("cas root exists")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700,
+            "a CAS root this mount created must be private to its owner"
+        );
+    }
+
+    /// The security check still has teeth: a PRE-EXISTING root with
+    /// unsafe permissions is refused rather than silently repaired.
+    /// Without this, the fix above would have turned the check into a
+    /// no-op instead of satisfying it.
+    #[cfg(unix)]
+    #[test]
+    fn a_preexisting_group_writable_root_is_still_refused() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cas_root = dir.path().join("cas");
+        std::fs::create_dir_all(&cas_root).unwrap();
+        std::fs::set_permissions(&cas_root, std::fs::Permissions::from_mode(0o775)).unwrap();
+
+        let mounted = mount_and_reconcile(&cas_root);
+        assert!(
+            mounted
+                .as_ref()
+                .err()
+                .is_some_and(|e| e.contains("writable by group or other")),
+            "a root someone else can write must be refused, got {mounted:?}"
+        );
+        assert_eq!(
+            std::fs::metadata(&cas_root).unwrap().permissions().mode() & 0o777,
+            0o775,
+            "a refused root must be left exactly as found, not repaired"
+        );
     }
 }
