@@ -722,6 +722,136 @@ mod profile_artifact_tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn build_only_cargo_returns_real_test_and_bench_executables() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Stdio;
+        use std::time::Duration;
+        use tokio::process::Command;
+
+        for (kind, subcommand, selector, forwarded) in [
+            (CompilationKind::CargoTest, "test", "--lib", false),
+            (CompilationKind::CargoTest, "test", "--lib", true),
+            (CompilationKind::CargoBench, "bench", "--bench=runproof", false),
+        ] {
+            let root = tempfile::tempdir().unwrap().keep();
+            let source = root.join("source project");
+            let local_project = root.join("local project");
+            std::fs::create_dir_all(source.join("src")).unwrap();
+            std::fs::create_dir_all(source.join("benches")).unwrap();
+            std::fs::create_dir_all(local_project.join("src")).unwrap();
+            std::fs::write(source.join("Cargo.toml"), concat!(
+                "[package]\nname = \"rch_no_run_fixture\"\nversion = \"0.0.0\"\nedition = \"2024\"\n",
+                "[workspace]\n",
+                "[[bench]]\nname = \"runproof\"\nharness = false\n",
+                "[profile.no-run-fixture]\ninherits = \"dev\"\nopt-level = 0\n",
+            )).unwrap();
+            std::fs::write(source.join("src/lib.rs"), concat!(
+                "#[test]\nfn build_only_test_must_not_execute() {\n",
+                "    panic!(\"Cargo ran a build-only test\");\n}\n",
+            )).unwrap();
+            std::fs::write(source.join("benches/runproof.rs"), concat!(
+                "fn main() {\n",
+                "    if std::env::args().any(|arg| arg == \"--list\") {\n",
+                "        println!(\"build_only_bench_must_not_execute\");\n",
+                "    } else { panic!(\"Cargo ran a build-only benchmark\"); }\n}\n",
+            )).unwrap();
+            let sentinel = local_project.join("src/lib.rs");
+            std::fs::write(&sentinel, b"local source must not be overwritten\n").unwrap();
+            let remote_target = root.join("worker target");
+            let local_target = root.join("local target");
+            let mut args = vec![subcommand.to_owned(), "--no-run".into(), selector.into(),
+                "--offline".into(), "--jobs=1".into(), "--message-format=json".into()];
+            if forwarded {
+                args.extend(["--target-dir".into(), remote_target.to_str().unwrap().to_owned(),
+                    "--profile=no-run-fixture".into()]);
+            }
+            let command_text = shell_words::join(
+                std::iter::once("cargo").chain(args.iter().map(String::as_str))
+            );
+            let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+            let mut compile = Command::new(cargo);
+            compile.current_dir(&source).args(&args)
+                .env("CARGO_HOME", root.join("cargo-home"))
+                .env_remove("RUSTC_WRAPPER").env_remove("RUSTC_WORKSPACE_WRAPPER")
+                .env_remove("RUSTFLAGS").env_remove("CARGO_ENCODED_RUSTFLAGS")
+                .env_remove("CARGO_BUILD_TARGET").env_remove("CARGO_TARGET_DIR")
+                .env_remove("CARGO_BUILD_TARGET_DIR").env_remove("CARGO_BUILD_BUILD_DIR")
+                .env_remove("CARGO_MAKEFLAGS").env_remove("MAKEFLAGS")
+                .stdin(Stdio::null()).kill_on_drop(true);
+            let built = tokio::time::timeout(Duration::from_secs(90), compile.output())
+                .await.expect("owned Cargo fixture timed out")
+                .expect("Cargo is required for the build-only artifact regression");
+            assert!(built.status.success(), "{command_text}: {}",
+                String::from_utf8_lossy(&built.stderr));
+            let executables: Vec<_> = String::from_utf8(built.stdout).unwrap().lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .filter(|message| message["reason"] == "compiler-artifact")
+                .filter_map(|message| message["executable"].as_str().map(std::path::PathBuf::from))
+                .collect();
+            assert_eq!(executables.len(), 1, "fixture must emit one runnable test/bench");
+
+            let (remote_basis, local_basis, patterns) = if forwarded {
+                assert!(get_project_artifact_patterns(Some(kind), Some(&command_text), true).is_empty());
+                (&remote_target, &local_target,
+                    get_custom_target_artifact_patterns(Some(kind), Some(&command_text)))
+            } else {
+                (&source, &local_project,
+                    get_project_artifact_patterns(Some(kind), Some(&command_text), false))
+            };
+            std::fs::create_dir_all(local_basis).unwrap();
+            for executable in &executables {
+                let relative = executable.strip_prefix(remote_basis).unwrap();
+                let local = local_basis.join(relative);
+                std::fs::create_dir_all(local.parent().unwrap()).unwrap();
+                std::fs::write(&local, b"stale local test executable").unwrap();
+            }
+            let mut copy = Command::new("rsync");
+            copy.args(["-a", "--checksum", "--no-owner", "--no-group", "--safe-links",
+                "--prune-empty-dirs"]);
+            for pattern in &patterns {
+                if let Some(exclude) = pattern.strip_prefix("- ") {
+                    copy.arg(format!("--exclude={exclude}"));
+                }
+            }
+            copy.arg("--include=*/");
+            for pattern in &patterns {
+                if !pattern.starts_with("- ") {
+                    copy.arg(format!("--include=/{pattern}"));
+                }
+            }
+            copy.arg("--exclude=*").arg(format!("{}/", remote_basis.display()))
+                .arg(format!("{}/", local_basis.display()))
+                .stdin(Stdio::null()).kill_on_drop(true);
+            let copied = tokio::time::timeout(Duration::from_secs(15), copy.output())
+                .await.expect("owned rsync fixture timed out")
+                .expect("rsync is required for the build-only artifact regression");
+            assert!(copied.status.success(), "{copied:?}");
+            for executable in &executables {
+                let local = local_basis.join(executable.strip_prefix(remote_basis).unwrap());
+                assert_eq!(std::fs::read(&local).unwrap(), std::fs::read(executable).unwrap());
+                assert_ne!(std::fs::metadata(&local).unwrap().permissions().mode() & 0o111, 0);
+                let mut list = Command::new(&local);
+                list.arg("--list").current_dir(&local_project)
+                    .stdin(Stdio::null()).kill_on_drop(true);
+                let listed = tokio::time::timeout(Duration::from_secs(10), list.output())
+                    .await.expect("returned executable timed out").unwrap();
+                assert!(listed.status.success(), "returned executable is not runnable: {listed:?}");
+                let expected = if kind == CompilationKind::CargoTest {
+                    "build_only_test_must_not_execute"
+                } else { "build_only_bench_must_not_execute" };
+                assert!(String::from_utf8_lossy(&listed.stdout).contains(expected));
+            }
+            assert_eq!(std::fs::read(&sentinel).unwrap(), b"local source must not be overwritten\n");
+            if forwarded {
+                for cache in ["incremental", ".fingerprint", "build"] {
+                    assert!(!local_target.join("no-run-fixture").join(cache).exists());
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn cargo_profile_artifacts_real_rsync_refreshes_custom_outputs_without_cache_or_source_overwrite()
      {
         use std::path::Path;
