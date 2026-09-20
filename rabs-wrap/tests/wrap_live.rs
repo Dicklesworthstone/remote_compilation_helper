@@ -80,11 +80,16 @@ fn exec_preserves_non_utf8_argv_and_compiler_path() {
         "compiler",
         "printf '%s\\n' \"$@\"\necho compiler-stderr >&2\nexit 23\n",
     );
-    let raw_compiler = dir.path().join(OsString::from_vec(b"compiler-\xff".to_vec()));
+    let raw_compiler = dir
+        .path()
+        .join(OsString::from_vec(b"compiler-\xff".to_vec()));
     std::fs::copy(&compiler, &raw_compiler).unwrap();
     let raw_arg = OsString::from_vec(b"source-\xfe.rs".to_vec());
     let cases = [
-        (&compiler, vec![raw_arg.clone(), OsString::new(), "café".into()]),
+        (
+            &compiler,
+            vec![raw_arg.clone(), OsString::new(), "café".into()],
+        ),
         (&raw_compiler, vec!["source.rs".into()]),
         (&raw_compiler, vec![raw_arg]),
     ];
@@ -145,7 +150,21 @@ fn streaming_is_unbuffered_by_construction_10mb_stderr() {
         command.env(key, value);
     }
     let output = command.output().unwrap();
-    assert!(output.status.success());
+    // Report what actually happened: a bare `assert!` here said only
+    // "false", which is useless for an intermittent failure. This one is
+    // flaky (~1 run in 12 on a busy fleet worker) and the exit status is
+    // the whole question — a signal death means the pipeline in the fake
+    // rustc died, an exit code means the wrapper propagated a failure.
+    use std::os::unix::process::ExitStatusExt;
+    assert!(
+        output.status.success(),
+        "wrapper exited non-zero streaming 10 MiB of stderr: code={:?} signal={:?} \
+         stderr_len={} stdout_len={}",
+        output.status.code(),
+        output.status.signal(),
+        output.stderr.len(),
+        output.stdout.len()
+    );
     assert_eq!(output.stderr.len(), 10 * 1048576, "every byte arrived");
 }
 
@@ -315,8 +334,14 @@ fn daemon_alive_consult_succeeds_and_breaker_stays_closed() {
         // Exercise observation, not merely the daemon-dead early return.
         // Neither unrelated values, Cargo values, nor non-UTF-8 names
         // may make enumeration panic or rewrite the compiler environment.
-        command.env("RABS_TEST_BINARY_ENV", OsString::from_vec(raw_value.to_vec()));
-        command.env("CARGO_RABS_BINARY_ENV", OsString::from_vec(raw_value.to_vec()));
+        command.env(
+            "RABS_TEST_BINARY_ENV",
+            OsString::from_vec(raw_value.to_vec()),
+        );
+        command.env(
+            "CARGO_RABS_BINARY_ENV",
+            OsString::from_vec(raw_value.to_vec()),
+        );
         command.env(OsString::from_vec(b"RABS_TEST_\xff".to_vec()), "untouched");
         let output = command.output().unwrap();
         assert!(output.status.success(), "{:?}", output.stderr);
