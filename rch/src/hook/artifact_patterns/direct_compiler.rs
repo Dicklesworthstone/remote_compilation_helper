@@ -2,7 +2,7 @@
 //!
 //! Cargo's target-directory convention does not apply to direct compilers.
 //! Resolve primary outputs only when the command names every emission. Native
-//! GCC/Clang selections include explicit depfiles and Clang -MJ fragments. Never
+//! GCC/Clang selections include depfiles and Clang -MJ fragments. Never
 //! infer crate names from source filenames or transfer an arbitrary --out-dir
 //! tree: crate attributes and target specifications can change implicit names.
 //! Unsupported commands retain the caller's existing selection policy. This is
@@ -351,10 +351,11 @@ fn c_plain_option(option: &str) -> bool {
             .iter().any(|prefix| option.starts_with(*prefix))
 }
 
-/// Native driver outputs with an explicit -o, and optional explicitly named
-/// depfiles / Clang compilation-database fragments. Inferred depfile names,
-/// preprocessing-only modes, raw subtool options, debug sidecars and response
-/// files retain the previous policy; they are not an exact named selection.
+/// Native driver outputs with an explicit -o and their dependency sidecars.
+/// Without -MF, -MD/-MMD derives the depfile from -o for one ordinary C/C++
+/// source. Multi-input or language-overridden inference, preprocessing-only
+/// modes, raw subtool options, debug sidecars and response files retain the
+/// previous policy; they are not an exact selection.
 fn c_family_patterns(command: &str, compilers: &[&str], clang: bool) -> Option<Vec<String>> {
     let args = compiler_arguments(command, compilers)?;
     if args.iter().any(|arg| arg.starts_with('@')) {
@@ -366,9 +367,14 @@ fn c_family_patterns(command: &str, compilers: &[&str], clang: bool) -> Option<V
     let mut database: Option<String> = None;
     let mut dependencies = false;
     let mut inputs = 0;
+    let mut source = None;
+    let mut language_override = false;
     while let Some(arg) = iter.next() {
         if arg == "--" {
-            inputs += iter.count();
+            for input in iter {
+                source = Some(input.as_str());
+                inputs += 1;
+            }
             break;
         }
         // These Clang options overlap the spelling of joined -o. They can
@@ -404,6 +410,7 @@ fn c_family_patterns(command: &str, compilers: &[&str], clang: bool) -> Option<V
         } else if matches!(arg.as_str(), "-MD" | "-MMD") {
             dependencies = true;
         } else if c_value_option(arg) {
+            language_override |= arg == "-x";
             iter.next()?;
         } else if c_plain_option(arg)
             || ["-I", "-L", "-l", "-D", "-U", "-B", "-MT", "-MQ"]
@@ -411,19 +418,39 @@ fn c_family_patterns(command: &str, compilers: &[&str], clang: bool) -> Option<V
             || arg.split_once('=').is_some_and(|(key, _)| c_value_option(key))
         {
             // A flag's operand is opaque even when it looks like -o or -MF.
+            language_override |= arg.starts_with("-x=");
         } else if arg.starts_with('-') || arg.starts_with('@') || arg.is_empty() {
             return None;
         } else {
+            source = Some(arg.as_str());
             inputs += 1;
         }
     }
     let output = output?;
     // '-' is mode-specific in native drivers (stdout in some modes, a real
     // linker filename in others), unlike rustc's uniform stdout convention.
-    if inputs == 0 || output == "-" || dependencies != depfile.is_some() {
+    if inputs == 0 || output == "-" || !dependencies && depfile.is_some() {
         return None;
     }
     let mut patterns = BTreeSet::from([literal_file_pattern(&output)?]);
+    if dependencies && depfile.is_none() {
+        if inputs != 1 || language_override {
+            return None;
+        }
+        let extension = Path::new(source?).extension()?.to_str()?;
+        if !matches!(extension, "c" | "C" | "cc" | "cp" | "cpp" | "CPP"
+            | "cxx" | "c++" | "m" | "M" | "mm")
+        {
+            return None;
+        }
+        // The drivers replace the last dot suffix INCLUDING a leading dot:
+        // -o products/.hidden yields products/.d, not .hidden.d. Rust's
+        // Path::with_extension treats dotfiles differently and is wrong here.
+        let (parent, name) = output.rsplit_once('/').map_or(("", output.as_str()),
+            |(parent, name)| (&output[..parent.len() + 1], name));
+        let stem = name.rsplit_once('.').map_or(name, |(stem, _)| stem);
+        depfile = Some(format!("{parent}{stem}.d"));
+    }
     if let Some(depfile) = depfile && depfile != "-" {
         patterns.insert(literal_file_pattern(&depfile)?);
     }
@@ -503,7 +530,7 @@ mod tests {
             "env -C subdir rustc main.rs -o app",
             "env -S 'rustc main.rs -o app'",
             "sh -c 'rustc main.rs -o app'",
-            "time -o timing rustc main.rs -o app",
+            "time -o timing rustc main.rs -o app'",
             "rustc main.rs -o $OUT",
             "rustc main.rs -o $(pwd)/app",
             "rustc main.rs -o app; touch elsewhere",
@@ -574,6 +601,28 @@ mod tests {
     }
 
     #[test]
+    fn native_single_source_default_depfiles_follow_driver_suffix_rules() {
+        for driver in ["gcc", "clang"] {
+            for mode in ["", "-c", "-S"] {
+                for (output, dependency) in [
+                    ("products/app", "products/app.d"),
+                    ("products/app.bin", "products/app.d"),
+                    ("products/archive.part.exe", "products/archive.part.d"),
+                    ("products/.hidden", "products/.d"),
+                    ("products.v1/app", "products.v1/app.d"),
+                ] {
+                    let command = format!("{driver} {mode} main.c -MMD -o {output}");
+                    let mut expected = vec![output.to_owned(), dependency.to_owned()];
+                    expected.sort();
+                    assert_eq!(c_family_patterns(&command, &[driver], driver == "clang").unwrap(), expected, "{command}");
+                }
+            }
+        }
+        assert_eq!(c_family_patterns("gcc main.c -MD -o 'products/app[dev]*?'", &["gcc"], false).unwrap(),
+            vec!["products/app[[]dev[]][*][?]", "products/app[[]dev[]][*][?].d"]);
+    }
+
+    #[test]
     fn native_option_values_are_opaque_and_filename_filters_are_literal() {
         for option in ["-D", "-I", "-L", "-include", "-imacros", "-MT", "-MQ"] {
             let command = format!("gcc main.c {option} '-odecoy' -o real");
@@ -589,7 +638,10 @@ mod tests {
     fn native_implicit_sidecars_forwarded_options_and_reparsing_do_not_narrow_selection() {
         for command in [
             "gcc main.c",
-            "gcc main.c -o app -MMD",
+            "gcc main.c extra.c -o app -MMD",
+            "gcc main.o -o app -MMD",
+            "gcc main.i -o app -MMD",
+            "gcc main.c -x c-header -o app -MMD",
             "gcc main.c -o app -MF unused.d",
             "gcc main.c -o app -MJ clang-only.json",
             "gcc main.c -o first -o second",
@@ -661,9 +713,15 @@ mod tests {
         }
 
         let root = tempfile::tempdir().unwrap().keep();
-        for (driver, kind) in [("gcc", CompilationKind::Gcc), ("clang", CompilationKind::Clang)] {
-            let source = root.join(driver).join("worker");
-            let local = root.join(driver).join("local");
+        for (driver, kind, named_dependency) in [
+            ("gcc", CompilationKind::Gcc, true),
+            ("gcc", CompilationKind::Gcc, false),
+            ("clang", CompilationKind::Clang, true),
+            ("clang", CompilationKind::Clang, false),
+        ] {
+            let mode = if named_dependency { "named" } else { "default" };
+            let source = root.join(driver).join(mode).join("worker");
+            let local = root.join(driver).join(mode).join("local");
             for base in [&source, &local] {
                 std::fs::create_dir_all(base.join("products")).unwrap();
             }
@@ -672,9 +730,12 @@ mod tests {
             std::fs::write(source.join("message.h"), b"#define MESSAGE \"remote-artifact-ok\"\n").unwrap();
             std::fs::write(local.join("main.c"), b"local source sentinel\n").unwrap();
             let binary = "products/app[dev]*?";
-            let depfile = "products/app.d";
+            let depfile = if named_dependency { "products/app.d" } else { "products/app[dev]*?.d" };
             let fragment = "products/app.compile.json";
-            let mut argv = vec!["main.c", "-O2", "-MMD", "-MF", depfile, "-o", binary];
+            let mut argv = vec!["main.c", "-O2", "-MMD", "-o", binary];
+            if named_dependency {
+                argv.extend(["-MF", depfile]);
+            }
             let mut files = vec![binary, depfile];
             if driver == "clang" {
                 argv.extend(["-MJ", fragment]);
@@ -742,7 +803,7 @@ mod tests {
         std::fs::write(source.join("dist/inputs.d"), b"artifact: main.rs\n").unwrap();
         std::fs::write(source.join("dist/appdOTHER1"), b"wildcard decoy").unwrap();
         std::fs::write(source.join("dist/main.rs"), b"foreign source").unwrap();
-        std::fs::write(local.join("dist/main.rs"), b"local source sentinel").unwrap();
+        std::fs::write(local.join("dist/main.rs"), b"local source sentinel\n").unwrap();
         let patterns = get_project_artifact_patterns(
             Some(rch_common::CompilationKind::Rustc),
             Some("rustc main.rs --emit=link,dep-info=dist/inputs.d -o 'dist/app[dev]*?'"),
