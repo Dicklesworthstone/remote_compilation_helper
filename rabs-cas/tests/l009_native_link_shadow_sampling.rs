@@ -242,6 +242,50 @@ fn l009_served_divergence_lands_in_quarantine_required_not_private() {
     let mut risk = HashMap::new();
     risk.insert(cmd.clone(), ActionClassRisk::LowRiskRegistry);
     let policy = SamplingPolicy::sample_all(1, 10_000);
+
+    // This test is about DIVERGENCE CLASSIFICATION — that a served,
+    // diverged result is a serving incident rather than private noise.
+    // To assert that, the action has to actually be SERVED, which means
+    // its evidence must pass the fail-closed attributability rule 40bc5954
+    // introduced: `verification_evidence` joins verification_samples ->
+    // action_attempts -> action_generations and counts only distinct
+    // attempts with a non-empty worker whose generation belongs to THIS
+    // action key.
+    //
+    // The fixture used to record a sample for attempt 7 with no attempt
+    // row behind it, so the join found nothing, evidence was zero, and the
+    // gate correctly refused to serve — and the test then failed on its
+    // SERVED precondition rather than on the property it names (bd-sudco).
+    // It had stopped testing its own subject and was silently exercising
+    // the evidence gate instead.
+    //
+    // So bind a real attempt, the way published_fixture and the pin and
+    // publication fixtures already do. This does NOT relax the gate: the
+    // assertion below is untouched, and if divergence classification
+    // regresses this test still fails, now for the right reason.
+    let coordinator = CoordinatorAuthority {
+        cluster_id: ClusterId("cluster-a".to_owned()),
+        credential_generation: 1,
+        term: 1,
+        incarnation_id: CoordinatorIncarnationId(1),
+    };
+    let authority = coordinator_authority_digest(&coordinator);
+    st.acquire_authority(&AuthorityRow {
+        digest: authority.clone(),
+        cluster_id: "cluster-a".to_owned(),
+        incarnation: 1,
+        term: 1,
+        acquired_seq: 1,
+    })
+    .unwrap();
+    st.upsert_action_entry(&ActionEntryRow {
+        action_key: key.clone(),
+        key_epoch: 0,
+        projection_epoch: 0,
+    })
+    .unwrap();
+    st.create_generation(&authority, 10, &key).unwrap();
+    st.record_attempt(7, 10, "worker-a", 5).unwrap();
     st.record_verification_sample(&key, 7, true, 0).unwrap();
 
     let mut backend = GateBackend {
