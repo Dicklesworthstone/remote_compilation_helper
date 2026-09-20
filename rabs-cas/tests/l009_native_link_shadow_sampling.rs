@@ -111,6 +111,122 @@ fn stock_link() -> StockLinkOutcome {
     }
 }
 
+/// Establish EVERYTHING `serving_sample_decision` requires before it will
+/// return `ServeFromCache` for `key`, so a shadow test that means to
+/// exercise serving actually serves.
+///
+/// The gate refuses strictest-first, and a fixture that stops short at any
+/// step silently gets `ExecutePrivately` instead: elevated class risk, then
+/// `has_publication`, then a serving record, then quarantine, then a
+/// SERVABLE disposition, and only THEN the attributability rule 40bc5954
+/// introduced (`verification_evidence` joins verification_samples ->
+/// action_attempts -> action_generations, counting only distinct attempts
+/// with a non-empty worker under a generation for this same key).
+///
+/// This existed nowhere, which is why both shadow-pipeline tests were
+/// reaching the backend and being told to execute privately (bd-sudco).
+/// One failed on its SERVED precondition; the other passed VACUOUSLY,
+/// asserting that an honest cache produces no served divergences while
+/// nothing was ever served at all. A passing test that cannot fail is the
+/// worse of the two.
+fn make_servable(st: &mut SqlMetadataStore<RusqliteEngine>, key: &TypedDigest) {
+    let coordinator = CoordinatorAuthority {
+        cluster_id: ClusterId("cluster-a".to_owned()),
+        credential_generation: 1,
+        term: 1,
+        incarnation_id: CoordinatorIncarnationId(1),
+    };
+    let authority = coordinator_authority_digest(&coordinator);
+    st.acquire_authority(&AuthorityRow {
+        digest: authority.clone(),
+        cluster_id: "cluster-a".to_owned(),
+        incarnation: 1,
+        term: 1,
+        acquired_seq: 1,
+    })
+    .unwrap();
+    // Each worker's incarnation fence must exist before any attempt
+    // references it, or the lease is refused as an unknown worker.
+    for (worker, incarnation) in [("worker-a", 5u128), ("worker-b", 6)] {
+        st.admit_worker_session(
+            &authority,
+            &WorkerSessionOffer {
+                worker_peer_id: PeerId(worker.to_owned()),
+                boot_generation: WorkerBootGeneration(1),
+                incarnation: WorkerIncarnationId(incarnation),
+                reenrollment_proof: None,
+            },
+            u64::try_from(incarnation).unwrap(),
+        )
+        .unwrap();
+    }
+    st.upsert_action_entry(&ActionEntryRow {
+        action_key: key.clone(),
+        key_epoch: 0,
+        projection_epoch: 0,
+    })
+    .unwrap();
+    let attempt_authority = |attempt: u128, worker: &str, incarnation: u128| AttemptAuthority {
+        coordinator: coordinator.clone(),
+        action_key: key.clone(),
+        action_generation: ActionGeneration {
+            generation_id: ActionGenerationId(10),
+            per_key_ordinal: 1,
+            created_under_authority_digest: authority.clone(),
+        },
+        attempt_id: AttemptId(attempt),
+        execution_lease_id: ExecutionLeaseId(attempt),
+        lease_renewal_seq: LeaseRenewalSeq(1),
+        worker_peer_id: PeerId(worker.to_owned()),
+        worker_boot_generation: WorkerBootGeneration(1),
+        worker_incarnation_id: WorkerIncarnationId(incarnation),
+    };
+    // TWO attempts on DIFFERENT workers: the strictest sampling policy in
+    // this file requires two attributable ones, and distinct workers are
+    // what the evidence rule actually counts.
+    let winner = attempt_authority(20, "worker-a", 5);
+    let second = attempt_authority(21, "worker-b", 6);
+    // Only a BOUND generation accepts live leases, and the store refuses
+    // verification samples for leaseless attempts — so the attempt the
+    // sample names has to be a real, leased one.
+    st.create_bound_generation(&authority, &winner.action_generation, key)
+        .unwrap();
+    st.admit_attempt_lease(&winner, 5, 1_000).unwrap();
+    st.admit_attempt_lease(&second, 6, 1_000).unwrap();
+    assert_eq!(
+        st.commit_publication(
+            &authority,
+            Some(&winner),
+            &PublicationRow {
+                action_key: key.clone(),
+                descriptor_digest: d("rabs.descriptor.sha256.v1", 1),
+                manifest_digest: d("rabs.result-manifest.sha256.v1", 1),
+                evidence_digest: d("rabs.evidence-bundle.sha256.v1", 1),
+                winner_generation: 10,
+                winner_attempt: 20,
+                result_kind: ResultKindTag::Success,
+                pin_id: 40,
+                pin_owner: "coordinator".to_owned(),
+                provisional_ancestors: Vec::new(),
+            },
+        )
+        .unwrap(),
+        CommitOutcome::Committed
+    );
+    let policies = vec![TrustPolicy {
+        version: 1,
+        revoked: false,
+        required_tier: TrustEvidenceTier::ShadowMatched,
+    }];
+    st.record_verification_sample(key, 20, true, 101).unwrap();
+    st.record_verification_sample(key, 21, true, 103).unwrap();
+    let eval = reevaluate_action(st, &authority, key, &policies, 104).unwrap();
+    assert_eq!(
+        eval.disposition, DISPOSITION_SERVABLE,
+        "fixture must reach a SERVABLE disposition or the shadow test cannot serve"
+    );
+}
+
 /// Backend mirroring [`rabs_cas::serving_sample_gate`] semantics per
 /// invocation: class risk strictest-first via the REAL gate function
 /// against the real store, then cache lookup for serve decisions.
@@ -171,12 +287,17 @@ fn l009_shadow_corpus_is_green_when_the_cache_is_honest() {
 
     // Evidence: enough PASSED verification samples for the link key
     // under sample-all; none for native (it would not matter).
+    //
+    // This used to record two samples naming attempts 100 and 101, which
+    // had no attempt rows behind them. Under the fail-closed
+    // attributability rule those count for nothing, so the link action
+    // was never served, the honest cache below was never consulted, and
+    // the "zero served divergences" assertion held because zero things
+    // were served (bd-sudco). `make_servable` establishes the real
+    // precondition so the claim has teeth.
     let policy = SamplingPolicy::sample_all(2, 10_000);
     let link_key = keys[&link_cmd].clone();
-    for seq in 0..2u64 {
-        st.record_verification_sample(&link_key, 100 + u128::from(seq), true, seq)
-            .unwrap();
-    }
+    make_servable(&mut st, &link_key);
 
     // Honest cache: the served observation is EXACTLY what stock
     // produces for this command (a real serving backend stores the
@@ -214,6 +335,23 @@ fn l009_shadow_corpus_is_green_when_the_cache_is_honest() {
             rabs_cas::serving_sample_gate::PrivateExecutionReason::ElevatedClassRisk
         ),
         "native/workspace class is never sampled"
+    );
+    // NON-VACUITY GUARD. The assertions below say an honest cache
+    // produces zero served divergences, which is trivially true if
+    // nothing is served at all — and that is exactly the state this test
+    // was in (bd-sudco). Pin that the link action really does reach
+    // ServeFromCache, so the claim can only pass by the cache being
+    // consulted and agreeing with stock.
+    assert_eq!(
+        serving_sample_decision(
+            &mut *backend.store,
+            &link_key,
+            ActionClassRisk::LowRiskRegistry,
+            &policy
+        )
+        .unwrap(),
+        SampleGateDecision::ServeFromCache,
+        "the link action must actually serve, or this test asserts nothing"
     );
 
     let report = run_shadow_pipeline(
@@ -263,30 +401,7 @@ fn l009_served_divergence_lands_in_quarantine_required_not_private() {
     // publication fixtures already do. This does NOT relax the gate: the
     // assertion below is untouched, and if divergence classification
     // regresses this test still fails, now for the right reason.
-    let coordinator = CoordinatorAuthority {
-        cluster_id: ClusterId("cluster-a".to_owned()),
-        credential_generation: 1,
-        term: 1,
-        incarnation_id: CoordinatorIncarnationId(1),
-    };
-    let authority = coordinator_authority_digest(&coordinator);
-    st.acquire_authority(&AuthorityRow {
-        digest: authority.clone(),
-        cluster_id: "cluster-a".to_owned(),
-        incarnation: 1,
-        term: 1,
-        acquired_seq: 1,
-    })
-    .unwrap();
-    st.upsert_action_entry(&ActionEntryRow {
-        action_key: key.clone(),
-        key_epoch: 0,
-        projection_epoch: 0,
-    })
-    .unwrap();
-    st.create_generation(&authority, 10, &key).unwrap();
-    st.record_attempt(7, 10, "worker-a", 5).unwrap();
-    st.record_verification_sample(&key, 7, true, 0).unwrap();
+    make_servable(&mut st, &key);
 
     let mut backend = GateBackend {
         store: &mut st,
