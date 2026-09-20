@@ -79,6 +79,23 @@ pub const DIVERGENCE_EVIDENCE_PIN_CLASS: &str = "divergence-evidence";
 
 /// Length-delimited canonical framing (the F034 pattern): every field is
 /// `len(u64 be) || bytes`, so no concatenation ambiguity exists.
+/// Length-delimited canonical framing (the F034 pattern): every field is
+/// `len(u64 be) || bytes`, so no concatenation ambiguity exists — two
+/// different field splits can never produce the same digest input.
+///
+/// ONE implementation for the whole crate, deliberately. This existed as
+/// two byte-identical copies (here and in `trust_evidence`), which is the
+/// shape that rots quietly: each copy feeds a DIFFERENT domain, so
+/// "improving" one changes only that domain's digests and nothing
+/// cross-checks the two. A canonical encoding has to be singular to be
+/// canonical.
+///
+/// `rabs-sandbox::env_builder` still carries a third copy for its
+/// presented-env digest. It cannot share this one — rabs-sandbox does not
+/// depend on rabs-cas and must not — and the natural shared home,
+/// `rabs-protocol`, has no dependencies at all and so cannot host a
+/// `sha2` helper. Left alone rather than moved, and noted here so the
+/// next person does not assume this is the only one.
 pub(crate) struct Framing(Sha256);
 
 impl Framing {

@@ -36,9 +36,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use rabs_protocol::result_identity::{DigestAlgorithm, TypedDigest};
+use rabs_protocol::result_identity::TypedDigest;
 use rabs_protocol::serving::TrustEvidenceTier;
-use sha2::{Digest, Sha256};
 
 use crate::metadata_store::{
     QuarantineScope, RabsMetadataStore, SqlValue, StoreError, TrustEvaluationRow, digest_key,
@@ -120,36 +119,7 @@ pub(crate) fn require_active_authority(
     }
 }
 
-/// Length-delimited canonical framing (the F034 pattern): every field is
-/// `len(u64 be) || bytes`, so no concatenation ambiguity exists.
-struct Framing(Sha256);
-
-impl Framing {
-    fn new(domain: &str) -> Self {
-        let mut hasher = Sha256::new();
-        hasher.update((domain.len() as u64).to_be_bytes());
-        hasher.update(domain.as_bytes());
-        Self(hasher)
-    }
-
-    fn field(&mut self, bytes: &[u8]) -> &mut Self {
-        self.0.update((bytes.len() as u64).to_be_bytes());
-        self.0.update(bytes);
-        self
-    }
-
-    fn u64(&mut self, v: u64) -> &mut Self {
-        self.field(&v.to_be_bytes())
-    }
-
-    fn finish(self, domain: &'static str) -> TypedDigest {
-        TypedDigest {
-            algorithm: DigestAlgorithm::Sha256V1,
-            domain,
-            bytes: self.0.finalize().into(),
-        }
-    }
-}
+use crate::publication::Framing;
 
 /// Canonical digest over an evidence-ID set: IDs are sorted and
 /// deduplicated before framing, so append-only growth changes the digest
@@ -421,6 +391,7 @@ mod tests {
         RusqliteEngine, SqlMetadataStore,
     };
     use crate::serving_state::{ServeDecision, serving_gate};
+    use rabs_protocol::result_identity::DigestAlgorithm;
     use rabs_protocol::serving::ServingValidity;
     use std::sync::atomic::{AtomicU64, Ordering};
 
