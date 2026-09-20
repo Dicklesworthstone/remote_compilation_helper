@@ -13,6 +13,37 @@
 //! process stack. Completed nodes retain their longest descendant path:
 //! sharing a subtree cannot hide an over-depth path through another
 //! parent, even when the shallow path was visited first.
+//!
+//! # STAGED: nothing calls this yet (bd-i7zop)
+//!
+//! Read this before assuming R95 is defended on any path you are
+//! working on. Neither [`validate_closure`] nor [`validate_pack_ranges`]
+//! has a production caller; `lib.rs` declares the module and the only
+//! other references are this file's own tests and T029's fuzz corpus.
+//! A module with the right name, good tests and no callers reads
+//! exactly like a working safeguard, which is the trap this note exists
+//! to disarm. [`DEFAULT_BOUNDS`] is likewise policy nobody currently
+//! enforces.
+//!
+//! Why that is not a live hole today, so nobody escalates it as one:
+//!
+//! - **Packs.** `pack.rs` has its own `PackMember` and validates in
+//!   `PackIndex::parse` under a STRICTER rule than
+//!   [`validate_pack_ranges`] — exact tiling, so gaps are rejected too,
+//!   plus `checked_add` overflow, sorted keys, and
+//!   `payload_len == expected_offset`. This module's version permits
+//!   gaps, making it strictly weaker and redundant.
+//! - **Manifest graphs.** The real hierarchical manifest is
+//!   `tree_manifest.rs`'s `TreeNode`, an owned Rust enum in which a
+//!   cycle is structurally UNREPRESENTABLE, so
+//!   [`validate_closure`]'s cycle arm has nothing to defend there.
+//!
+//! What it IS for: the shape H031 was built against — a manifest graph
+//! whose edges are digest REFERENCES resolved through a lookup, where
+//! cycles and dangling references become expressible and depth/fan-out
+//! stop being bounded by construction. `TreeNode` is not that. If you
+//! are adding such an ingest path, this is the validation to call, and
+//! this note should be replaced with the call site.
 
 use std::collections::HashMap;
 
@@ -141,8 +172,7 @@ pub fn validate_closure(
                     if height > bounds.max_depth - child_depth {
                         return Err(ClosureError::DepthExceeded);
                     }
-                    let through_child =
-                        height.checked_add(1).ok_or(ClosureError::DepthExceeded)?;
+                    let through_child = height.checked_add(1).ok_or(ClosureError::DepthExceeded)?;
                     frame.height = frame.height.max(through_child);
                     stack.push(frame);
                 }
