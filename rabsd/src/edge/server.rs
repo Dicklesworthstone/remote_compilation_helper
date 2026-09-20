@@ -1,14 +1,16 @@
 //! The edge UDS server (bead S3 / bridge plan Phase S). Runs INSIDE the
 //! S1 edge region as its [`SubsystemWork`]: every wrapper consult flows
 //! through the REAL modules — `socket_admission` per connection,
-//! `version_negotiation` per handshake — with one region-owned task per
-//! connection (aborted on shutdown, so a hung client can never wedge the
-//! daemon; verified by the kill-mid-frame test).
+//! `version_negotiation` per handshake — with bounded region-owned sessions.
 //!
-//! Wire format (S3 skeleton; S4 enriches the consult): newline-delimited
-//! JSON, one frame per line, 64 KiB bound. A malformed frame is a typed
-//! refusal reply and a closed connection — never a panic (fuzzed against
-//! the LIVE socket).
+//! Slow peers have absolute frame-read/write budgets, and each connection has
+//! a bounded request count. Shadow disk work and artifact materialization use
+//! separate bounded blocking lanes, not the native control reactor. Cancellation
+//! joins an admitted writer rather than detaching work that can still mutate a
+//! subscriber's outputs. Filesystem shutdown itself is not claimed interruptible.
+//!
+//! Wire format: newline-delimited JSON, one request per line, 64 KiB bound.
+//! Malformed input never grants execution, publication, or fallback authority.
 //!
 //! Stale-socket takeover: never a blind unlink. If the socket path
 //! exists, LIVENESS-PROBE it (connect): a live daemon means this boot
@@ -16,10 +18,13 @@
 //! from a dead incarnation) is removed and taken over, and the takeover
 //! is logged.
 
+mod liveness;
+
 use asupersync::cx::Cx;
 use asupersync::io::{AsyncReadExt, AsyncWriteExt};
 use asupersync::net::unix::{UnixListener, UnixStream};
 use asupersync::signal::ShutdownReceiver;
+use liveness::{Limit, WorkError};
 use rabs_asupersync::daemon_runtime::SubsystemWork;
 use rabs_protocol::socket_admission::{
     AdmissionPolicy, ConnectionEvidence, PeerCredentials, SocketMetadata, TokenContext, admit,
@@ -27,9 +32,35 @@ use rabs_protocol::socket_admission::{
 use rabs_protocol::version_negotiation::{Negotiation, VersionHello, VersionRange, negotiate};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::PathBuf;
+use std::time::Duration;
 
 /// Frame size bound (one JSON line).
 pub const MAX_FRAME_BYTES: usize = 64 * 1024;
+/// Bounds are per edge listener, shared by all of its connections.
+pub const MAX_CONNECTIONS: usize = 128;
+pub const MAX_REQUESTS_PER_CONNECTION: usize = 64;
+const FRAME_IO_BUDGET: Duration = Duration::from_secs(5);
+const CONTROL_WORKERS: usize = 2;
+const SHADOW_WORKERS: usize = 4;
+const MATERIALIZATION_WORKERS: usize = 2;
+
+#[derive(Clone)]
+struct EdgeLimits {
+    sessions: Limit,
+    control: Limit,
+    shadow: Limit,
+    materialization: Limit,
+}
+impl EdgeLimits {
+    fn new() -> Self {
+        Self {
+            sessions: Limit::new(MAX_CONNECTIONS),
+            control: Limit::new(CONTROL_WORKERS),
+            shadow: Limit::new(SHADOW_WORKERS),
+            materialization: Limit::new(MATERIALIZATION_WORKERS),
+        }
+    }
+}
 
 /// The daemon's own hello (transport v1..=1, application v1..=1).
 #[must_use]
@@ -130,12 +161,13 @@ async fn serve(
             .map_err(|e| format!("shadow plane open: {e}"))?,
     ));
 
-    // Acceptor as a region-owned child task; aborted at shutdown so a
-    // blocked accept (or a hung connection it spawned) cannot wedge us.
+    // Acceptor and connections remain region-owned. Each admitted blocking
+    // operation also owns a join guard; abort cannot leave a detached writer.
     let acceptor_cx = cx.clone();
     let coord = config.coord.clone();
+    let limits = EdgeLimits::new();
     let acceptor = cx
-        .spawn(move |cx| accept_loop(cx, listener, policy, socket_evidence, shadow, coord))
+        .spawn(move |cx| accept_loop(cx, listener, policy, socket_evidence, shadow, coord, limits))
         .map_err(|e| format!("acceptor spawn: {e:?}"))?;
     let _ = acceptor_cx.checkpoint();
 
@@ -154,18 +186,32 @@ async fn accept_loop(
     socket_evidence: SocketMetadata,
     shadow: std::sync::Arc<std::sync::Mutex<crate::edge::shadow::ShadowPlane>>,
     coord: crate::coord::live::EdgeSubscriber,
+    limits: EdgeLimits,
 ) {
     let mut connection_id: u64 = 0;
     loop {
         match listener.accept().await {
             Ok((stream, _addr)) => {
-                connection_id += 1;
-                let id = connection_id;
+                // Refuse before task allocation. Do not attempt a potentially
+                // blocking refusal write to a peer we have not admitted.
+                let Some(permit) = limits.sessions.acquire() else {
+                    log_line("rabsd-edge-capacity-refused", &[]);
+                    drop(stream);
+                    continue;
+                };
+                let Some(id) = connection_id.checked_add(1) else {
+                    log_line("rabsd-edge-identity-exhausted", &[]);
+                    return;
+                };
+                connection_id = id;
                 let shadow = std::sync::Arc::clone(&shadow);
                 let coord = coord.clone();
+                let limits = limits.clone();
                 let spawned = cx.spawn(move |cx| async move {
-                    let _ = cx.checkpoint();
-                    handle_connection(id, stream, policy, socket_evidence, shadow, coord).await;
+                    if cx.checkpoint().is_ok() {
+                        handle_connection(id, stream, policy, socket_evidence, shadow, coord, limits).await;
+                    }
+                    drop(permit);
                 });
                 match spawned {
                     // Dropping the handle detaches WITHOUT aborting
@@ -187,31 +233,35 @@ async fn accept_loop(
     }
 }
 
-/// Read one newline-terminated frame (bounded). None = EOF/oversize.
-async fn read_frame(stream: &mut UnixStream) -> Option<Vec<u8>> {
-    let mut frame = Vec::new();
-    let mut byte = [0u8; 1];
-    loop {
-        match stream.read(&mut byte).await {
-            Ok(0) => return None,
-            Ok(_) => {
-                if byte[0] == b'\n' {
-                    return Some(frame);
+/// One absolute budget covers the ENTIRE frame, not each trickled byte.
+async fn read_frame_with_budget(stream: &mut UnixStream, budget: Duration) -> Option<Vec<u8>> {
+    asupersync::time::timeout(asupersync::time::wall_now(), budget, async {
+        let mut frame = Vec::new();
+        let mut byte = [0u8; 1];
+        loop {
+            match stream.read(&mut byte).await {
+                Ok(0) => return None,
+                Ok(_) => {
+                    if byte[0] == b'\n' { return Some(frame); }
+                    if frame.len() == MAX_FRAME_BYTES { return None; }
+                    frame.push(byte[0]);
                 }
-                frame.push(byte[0]);
-                if frame.len() > MAX_FRAME_BYTES {
-                    return None;
-                }
+                Err(_) => return None,
             }
-            Err(_) => return None,
         }
-    }
+    }).await.ok().flatten()
+}
+
+/// None means EOF, a truncated/oversized frame, or an exhausted read budget.
+async fn read_frame(stream: &mut UnixStream) -> Option<Vec<u8>> {
+    read_frame_with_budget(stream, FRAME_IO_BUDGET).await
 }
 
 async fn write_frame(stream: &mut UnixStream, line: &str) -> bool {
     let mut bytes = line.as_bytes().to_vec();
     bytes.push(b'\n');
-    stream.write_all(&bytes).await.is_ok()
+    asupersync::time::timeout(asupersync::time::wall_now(), FRAME_IO_BUDGET,
+        stream.write_all(&bytes)).await.is_ok_and(|result| result.is_ok())
 }
 
 fn refusal(reason: &str, detail: &str) -> String {
@@ -221,6 +271,17 @@ fn refusal(reason: &str, detail: &str) -> String {
     )
 }
 
+/// Created at the same point as begin_flight, including on a blocking worker.
+/// A cancelled future, failed reply, or panic cannot lose its matching release.
+struct Flight {
+    coord: crate::coord::live::EdgeSubscriber,
+    key: String,
+    label: &'static str,
+}
+impl Drop for Flight {
+    fn drop(&mut self) { self.coord.end_flight(&self.key); }
+}
+
 async fn handle_connection(
     id: u64,
     mut stream: UnixStream,
@@ -228,6 +289,7 @@ async fn handle_connection(
     socket_evidence: SocketMetadata,
     shadow: std::sync::Arc<std::sync::Mutex<crate::edge::shadow::ShadowPlane>>,
     coord: crate::coord::live::EdgeSubscriber,
+    limits: EdgeLimits,
 ) {
     let trace = format!("edge-conn-{id}");
     // Admission: kernel peer credentials against the policy.
@@ -266,7 +328,7 @@ async fn handle_connection(
 
     // Handshake: hello frame -> negotiate -> reply.
     let Some(frame) = read_frame(&mut stream).await else {
-        return; // EOF/oversize before hello: nothing to answer
+        return;
     };
     let hello: VersionHello = match parse_hello(&frame) {
         Ok(hello) => hello,
@@ -297,66 +359,35 @@ async fn handle_connection(
         }
     }
 
-    // Consult loop: the S4 shadow decision plane routed through the S6
-    // live coordinator. Every consult computes its REAL Epic F key,
-    // joins that key's singleflight (window = this connection's life),
-    // records a receipt carrying its flight role, and passes through.
-    let mut open_flights: Vec<String> = Vec::new();
-    while let Some(frame) = read_frame(&mut stream).await {
+    // Shadow-flight lifetime stays connection-scoped, including cancellation.
+    // The request quota bounds both retained flight guards and per-peer work.
+    let mut open_flights: Vec<Flight> = Vec::new();
+    for _ in 0..MAX_REQUESTS_PER_CONNECTION {
+        let Some(frame) = read_frame(&mut stream).await else { break; };
         let reply = match serde_json::from_slice::<serde_json::Value>(&frame) {
             Ok(value) if value.get("kind").and_then(|k| k.as_str()) == Some("status") => {
-                coord.status_json()
+                status_on_lane(&limits.control, coord.clone()).await
             }
             Ok(value) if value.get("kind").and_then(|k| k.as_str()) == Some("consult") => {
                 match parse_observation(&value) {
                     Some(observation) => {
-                        let coord_for_flight = coord.clone();
-                        let mut joined: Option<(String, &'static str)> = None;
-                        let decision = shadow.lock().map_err(|_| ()).and_then(|mut plane| {
-                            plane
-                                .on_consult(&trace, &observation, |key| {
-                                    let role = coord_for_flight.begin_flight(key);
-                                    joined = Some((key.to_string(), role.label()));
-                                    role.label()
-                                })
-                                .map_err(|_| ())
-                        });
-                        let flight_label = match &joined {
-                            Some((key, label)) => {
-                                open_flights.push(key.clone());
-                                label
-                            }
-                            None => "degraded",
+                        let shadow = std::sync::Arc::clone(&shadow);
+                        let coord = coord.clone();
+                        let work_trace = trace.clone();
+                        let result = match limits.shadow.spawn(move || {
+                            shadow_reply(&work_trace, observation, shadow, coord)
+                        }) {
+                            Ok(mut work) => work.wait().await,
+                            Err(error) => Err(error),
                         };
-                        match decision {
-                            Ok(decision) => format!(
-                                "{{\"kind\":\"decision\",\"decision\":\"pass-through\",\
-                                 \"mode\":\"{}\",\"key\":\"{}\",\
-                                 \"hit_upper_bound\":{},\"class\":\"{}\",\
-                                 \"flight\":\"{flight_label}\"}}",
-                                if coord.available() {
-                                    "shadow"
-                                } else {
-                                    "shadow-coord-degraded"
-                                },
-                                decision.key_hex,
-                                decision.would_have_hit_upper_bound,
-                                decision.class,
-                            ),
-                            Err(()) => {
-                                // The daemon admitting it could not
-                                // decide. This used to be silent, which
-                                // made a degraded shadow plane invisible
-                                // in the logs AND (until the wrapper
-                                // learned to count it) invisible to the
-                                // breaker.
-                                log_line(
-                                    "rabsd-edge-shadow-error",
-                                    &[("trace", &trace), ("key_class", "unknown")],
-                                );
-                                "{\"kind\":\"decision\",\"decision\":\"pass-through\",\
-                                 \"mode\":\"shadow-error\"}"
-                                    .to_string()
+                        match result {
+                            Ok((reply, flight)) => {
+                                if let Some(flight) = flight { open_flights.push(flight); }
+                                reply
+                            }
+                            Err(error) => {
+                                log_line("rabsd-edge-shadow-error", &[("trace", &trace), ("error", &error.to_string())]);
+                                "{\"kind\":\"decision\",\"decision\":\"pass-through\",\"mode\":\"shadow-error\"}".to_owned()
                             }
                         }
                     }
@@ -366,7 +397,7 @@ async fn handle_connection(
                 }
             }
             Ok(value) if value.get("kind").and_then(|k| k.as_str()) == Some("serve") => {
-                serve_reply(&coord, &value)
+                serve_on_lane(&limits.materialization, coord.clone(), value).await
             }
             Ok(other) => refusal(
                 "unknown-frame",
@@ -384,11 +415,80 @@ async fn handle_connection(
             break;
         }
     }
-    // Connection closed: every flight this connection joined ends now
-    // (the shadow-tier singleflight window is connection-scoped).
-    for key in open_flights {
-        coord.end_flight(&key);
+    drop(open_flights);
+}
+
+fn shadow_reply(
+    trace: &str,
+    observation: crate::edge::shadow::ConsultObservation,
+    shadow: std::sync::Arc<std::sync::Mutex<crate::edge::shadow::ShadowPlane>>,
+    coord: crate::coord::live::EdgeSubscriber,
+) -> (String, Option<Flight>) {
+    let mut joined: Option<Flight> = None;
+    let decision = shadow.lock().map_err(|_| ()).and_then(|mut plane| {
+        plane.on_consult(trace, &observation, |key| {
+            let role = coord.begin_flight(key);
+            if role != crate::coord::live::FlightRole::Degraded {
+                joined = Some(Flight { coord: coord.clone(), key: key.to_owned(), label: role.label() });
+            }
+            role.label()
+        }).map_err(|_| ())
+    });
+    let flight_label = joined.as_ref().map_or("degraded", |flight| flight.label);
+    let reply = match decision {
+        Ok(decision) => format!(
+            "{{\"kind\":\"decision\",\"decision\":\"pass-through\",\
+             \"mode\":\"{}\",\"key\":\"{}\",\
+             \"hit_upper_bound\":{},\"class\":\"{}\",\
+             \"flight\":\"{flight_label}\"}}",
+            if coord.available() { "shadow" } else { "shadow-coord-degraded" },
+            decision.key_hex, decision.would_have_hit_upper_bound, decision.class,
+        ),
+        Err(()) => {
+            log_line("rabsd-edge-shadow-error", &[("trace", trace), ("key_class", "unknown")]);
+            "{\"kind\":\"decision\",\"decision\":\"pass-through\",\"mode\":\"shadow-error\"}".to_owned()
+        }
+    };
+    (reply, joined)
+}
+
+async fn status_on_lane(lane: &Limit, coord: crate::coord::live::EdgeSubscriber) -> String {
+    // Status can consult release-policy storage and coordinator locks too.
+    // Its own lane prevents both inline I/O and bulk-work admission starvation.
+    let result = match lane.spawn(move || coord.status_json()) {
+        Ok(mut work) => work.wait().await,
+        Err(error) => Err(error),
+    };
+    match result {
+        Ok(reply) => reply,
+        Err(error) => refusal("status-unavailable", &error.to_string()),
     }
+}
+
+async fn serve_on_lane(
+    lane: &Limit,
+    coord: crate::coord::live::EdgeSubscriber,
+    request: serde_json::Value,
+) -> String {
+    match lane.spawn(move || serve_reply(&coord, &request)) {
+        Ok(mut work) => match work.wait().await {
+            Ok(reply) => reply,
+            Err(error) => serve_work_error(&error, true),
+        },
+        Err(error) => serve_work_error(&error, false),
+    }
+}
+
+fn serve_work_error(error: &WorkError, started: bool) -> String {
+    // A panic may occur after an output rename but before a receipt is returned.
+    // Do not invent an empty installed prefix or authorize a local rerun.
+    serde_json::json!({
+        "kind":"serve-result", "outcome":"error", "reason":error.to_string(),
+        "materialization_started":started,
+        "installed": if started { serde_json::Value::Null } else { serde_json::json!([]) },
+        "installed_path_bytes": if started { serde_json::Value::Null } else { serde_json::json!([]) },
+        "compiler_skip_authorized":false, "reexecution_authorized":false,
+    }).to_string()
 }
 
 /// Handle a `serve` frame: materialize a committed action's outputs
@@ -803,5 +903,121 @@ mod live_serve_tests {
                 .unwrap();
         assert_eq!(reply["outcome"], "execute-privately");
         assert!(!destination.exists());
+    }
+}
+
+#[cfg(test)]
+mod edge_liveness_tests {
+    use super::*;
+    use asupersync::runtime::RuntimeBuilder;
+    use std::future::Future;
+    use std::sync::{Arc, mpsc};
+    use std::task::{Context, Poll, Waker};
+    use std::time::Instant;
+
+    #[test]
+    fn flight_guards_release_on_drop_and_unwind_without_borrowing_other_participants() {
+        let coord = Arc::new(crate::coord::live::CoordLive::new());
+        coord.mark_up();
+        let edge = coord.edge_subscriber();
+        assert_eq!(edge.begin_flight("key"), crate::coord::live::FlightRole::Leader);
+        let guard = Flight { coord: edge.clone(), key: "key".into(), label: "leader" };
+        assert_eq!(edge.begin_flight("key"), crate::coord::live::FlightRole::Follower);
+        drop(guard);
+        let status: serde_json::Value = serde_json::from_str(&edge.status_json()).unwrap();
+        assert_eq!(status["open_flights"], 1);
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = Flight { coord: edge.clone(), key: "key".into(), label: "follower" };
+            panic!("injected connection panic");
+        }));
+        assert!(panic.is_err());
+        let status: serde_json::Value = serde_json::from_str(&edge.status_json()).unwrap();
+        assert_eq!(status["open_flights"], 0);
+    }
+
+    #[test]
+    fn saturated_materialization_refuses_without_writes_or_fallback_authority() {
+        let lane = Limit::new(0);
+        let coord = Arc::new(crate::coord::live::CoordLive::new());
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("untouched");
+        let runtime = RuntimeBuilder::current_thread().build().unwrap();
+        let reply = runtime.block_on(serve_on_lane(&lane, coord.edge_subscriber(),
+            serde_json::json!({"kind":"serve", "action_key":"01".repeat(32),
+                "destination_root":destination.to_str().unwrap()})));
+        let reply: serde_json::Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(reply["outcome"], "error");
+        assert_eq!(reply["materialization_started"], false);
+        assert_eq!(reply["installed"], serde_json::json!([]));
+        assert_eq!(reply["compiler_skip_authorized"], false);
+        assert_eq!(reply["reexecution_authorized"], false);
+        assert!(!destination.exists());
+        let panic: serde_json::Value = serde_json::from_str(
+            &serve_work_error(&WorkError::Panicked, true)).unwrap();
+        assert_eq!(panic["materialization_started"], true);
+        assert!(panic["installed_path_bytes"].is_null(), "panic cannot prove no files installed");
+        assert_eq!(panic["reexecution_authorized"], false);
+    }
+
+    #[test]
+    fn actual_serve_yields_while_cas_is_busy() {
+        let dir = tempfile::tempdir().unwrap();
+        let cas = Arc::new(crate::janitor::store::mount_and_reconcile(&dir.path().join("cas")).unwrap());
+        let coord = Arc::new(crate::coord::live::CoordLive::with_cas(Arc::clone(&cas)));
+        coord.acquire_boot_authority("busy-cas-fixture").unwrap();
+        coord.mark_up();
+        let lane = Limit::new(1);
+        let (ready, ready_rx) = mpsc::channel();
+        let (release, release_rx) = mpsc::channel();
+        std::thread::scope(|scope| {
+            let holder_cas = Arc::clone(&cas);
+            let holder = scope.spawn(move || {
+                let _store = holder_cas.store().lock().unwrap();
+                ready.send(()).unwrap();
+                // Bound even the failure case: an inline-I/O regression must
+                // fail this test, not deadlock its process indefinitely.
+                let _ = release_rx.recv_timeout(Duration::from_secs(3));
+            });
+            ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let mut request = Box::pin(serve_on_lane(&lane, coord.edge_subscriber(),
+                serde_json::json!({"kind":"serve", "action_key":"01".repeat(32),
+                    "destination_root":dir.path().join("outputs").to_str().unwrap()})));
+            let start = Instant::now();
+            assert!(matches!(request.as_mut().poll(&mut Context::from_waker(Waker::noop())), Poll::Pending));
+            assert!(coord.available());
+            assert!(start.elapsed() < Duration::from_secs(1), "CAS I/O blocked the polling/control thread");
+            assert!(lane.acquire().is_none());
+            release.send(()).unwrap();
+            holder.join().unwrap();
+            let runtime = RuntimeBuilder::current_thread().build().unwrap();
+            let reply: serde_json::Value = serde_json::from_str(&runtime.block_on(request)).unwrap();
+            assert_eq!(reply["kind"], "serve-result");
+            assert_ne!(reply["outcome"], "served");
+            assert!(!dir.path().join("outputs").exists());
+        });
+    }
+
+    #[test]
+    fn live_frame_reader_expires_a_trickling_peer_without_resetting_its_budget() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("edge.sock");
+        let runtime = RuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let listener = UnixListener::bind(&path).await.unwrap();
+            let path = path.clone();
+            let writer = std::thread::spawn(move || {
+                let mut stream = std::os::unix::net::UnixStream::connect(path).unwrap();
+                for _ in 0..40 {
+                    if stream.write_all(b" ").is_err() { break; }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            });
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let frame = read_frame_with_budget(&mut stream, Duration::from_millis(30)).await;
+            assert!(frame.is_none());
+            drop(stream);
+            writer.join().unwrap();
+        });
     }
 }
