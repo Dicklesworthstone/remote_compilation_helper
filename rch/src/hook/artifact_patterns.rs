@@ -40,8 +40,23 @@
 
 mod direct_compiler;
 
-use super::command_parsing::cargo_custom_profile_output_dir;
+use super::command_parsing::{cargo_build_only_test, cargo_custom_profile_output_dir};
 use super::*;
+
+/// Output policy is distinct from the command's execution/telemetry kind.
+/// --no-run produces caller-owned test/bench binaries, not just a report from
+/// a worker-side test run. Reuse CargoBuild's retrieval and validation contract
+/// consistently, including durable collection-only recovery.
+pub(super) fn artifact_delivery_kind(
+    kind: Option<CompilationKind>,
+    command: Option<&str>,
+) -> Option<CompilationKind> {
+    if command.is_some_and(|command| cargo_build_only_test(kind, command)) {
+        Some(CompilationKind::CargoBuild)
+    } else {
+        kind
+    }
+}
 
 /// Get artifact patterns based on compilation kind.
 ///
@@ -62,6 +77,7 @@ pub(super) fn get_artifact_patterns(
     kind: Option<CompilationKind>,
     command: Option<&str>,
 ) -> Vec<String> {
+    let kind = artifact_delivery_kind(kind, command);
     if let Some(patterns) = direct_compiler::patterns(kind, command) {
         return patterns;
     }
@@ -259,6 +275,7 @@ pub(super) fn get_custom_target_artifact_patterns(
     kind: Option<CompilationKind>,
     command: Option<&str>,
 ) -> Vec<String> {
+    let kind = artifact_delivery_kind(kind, command);
     if direct_compiler::patterns(kind, command).is_some() {
         return Vec::new();
     }
@@ -563,6 +580,50 @@ pub(super) fn sync_back_verified_zero_build_outputs(
 #[cfg(test)]
 mod profile_artifact_tests {
     use super::*;
+
+    #[test]
+    fn build_only_tests_use_the_build_contract_for_both_retrieval_bases_and_gates() {
+        for (kind, command) in [
+            (CompilationKind::CargoTest, "cargo test --no-run --lib"),
+            (CompilationKind::CargoTest, "env -- cargo test --no-run --profile release-perf"),
+            (CompilationKind::CargoBench, "cargo bench --no-run --bench timing"),
+        ] {
+            let kind = Some(kind);
+            let command = Some(command);
+            let delivery_kind = artifact_delivery_kind(kind, command);
+            assert_eq!(delivery_kind, Some(CompilationKind::CargoBuild));
+            assert_eq!(get_artifact_patterns(kind, command), get_artifact_patterns(delivery_kind, command));
+            assert_eq!(get_custom_target_artifact_patterns(kind, command),
+                get_custom_target_artifact_patterns(delivery_kind, command));
+            assert!(!get_project_artifact_patterns(kind, command, false).is_empty());
+            assert!(get_project_artifact_patterns(kind, command, true).is_empty());
+            assert!(kind_produces_transferable_artifacts(delivery_kind));
+            assert!(kind_has_enumerable_output_contract(delivery_kind));
+            assert!(sync_back_verified_zero_build_outputs(
+                &["target/CACHEDIR.TAG".into()], Some(1), delivery_kind, false,
+            ));
+            assert!(!sync_back_verified_zero_build_outputs(
+                &["debug/deps/unit_test-123".into()], Some(1), delivery_kind, true,
+            ));
+        }
+    }
+
+    #[test]
+    fn runtime_tests_and_opaque_no_run_values_keep_the_stream_only_contract() {
+        for (kind, command) in [
+            (CompilationKind::CargoTest, "cargo test -- --no-run"),
+            (CompilationKind::CargoTest, "cargo test --config --no-run"),
+            (CompilationKind::CargoBench, "cargo bench --bench --no-run"),
+            (CompilationKind::CargoNextest, "cargo nextest run --no-run"),
+        ] {
+            let kind = Some(kind);
+            assert_eq!(artifact_delivery_kind(kind, Some(command)), kind);
+            assert_eq!(get_artifact_patterns(kind, Some(command)), get_artifact_patterns(kind, None));
+            assert_eq!(get_custom_target_artifact_patterns(kind, Some(command)),
+                get_custom_target_artifact_patterns(kind, None));
+            assert!(!kind_produces_transferable_artifacts(kind));
+        }
+    }
 
     #[test]
     fn cargo_profile_artifacts_use_wrapped_profile_for_includes_and_cache_excludes() {

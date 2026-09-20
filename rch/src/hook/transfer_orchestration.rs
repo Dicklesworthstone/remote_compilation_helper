@@ -22,6 +22,7 @@
 //! are private to this module.
 
 use super::artifact_patterns::{
+    artifact_delivery_kind,
     expected_output_glob_list, get_custom_target_artifact_patterns, get_project_artifact_patterns,
     kind_has_enumerable_output_contract, kind_produces_transferable_artifacts,
     sync_back_verified_zero_build_outputs, sync_back_verified_zero_package_archives,
@@ -2207,6 +2208,10 @@ pub(super) async fn execute_remote_compilation(
     let expected_triple = pinned_triple
         .clone()
         .unwrap_or_else(default_host_target_triple);
+    // Build-only test/bench outputs belong to the caller. They require the
+    // same transfer-failure, metadata-only and foreign-target checks as builds;
+    // the execution kind remains unchanged for telemetry and remote execution.
+    let artifact_kind = artifact_delivery_kind(kind, Some(command));
     // Only the kinds whose contract is "materialize the caller's runnable
     // outputs under the cargo target tree" are typed. Test/bench/coverage kinds
     // retrieve reports and instrumented trees whose binaries are the WORKER's
@@ -2217,7 +2222,7 @@ pub(super) async fn execute_remote_compilation(
         Some(base)
             if result.success()
                 && !artifacts_failed
-                && kind_has_enumerable_output_contract(kind)
+                && kind_has_enumerable_output_contract(artifact_kind)
                 && !foreign_artifact_gate_disabled() =>
         {
             foreign_target_artifacts(
@@ -2266,7 +2271,9 @@ pub(super) async fn execute_remote_compilation(
             worker_config.id, result.exit_code, EXIT_ARTIFACT_TRANSFER_FAILED
         );
         EXIT_ARTIFACT_TRANSFER_FAILED
-    } else if result.success() && artifacts_failed && kind_produces_transferable_artifacts(kind) {
+    } else if result.success() && artifacts_failed
+        && kind_produces_transferable_artifacts(artifact_kind)
+    {
         let code = ErrorCode::BuildArtifactMissing;
         // stderr, not just `warn!`: this MUST reach the operator/agent even when
         // tracing is silenced. stderr is the diagnostics stream (AGENTS.md).
@@ -2291,7 +2298,7 @@ pub(super) async fn execute_remote_compilation(
         && (sync_back_verified_zero_build_outputs(
             &retrieval_manifest,
             retrieval_matched_regular,
-            kind,
+            artifact_kind,
             retrieval_custom_target_basis,
         ) || sync_back_verified_zero_package_archives(retrieval_matched_regular, command))
     {

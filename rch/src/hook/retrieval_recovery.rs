@@ -184,6 +184,9 @@ impl RecoverySession {
         result_dirs: &[PathBuf],
         identity: String,
     ) -> anyhow::Result<Self> {
+        // Persist the output contract, not runtime-test policy: recovery is
+        // collection-only and has no command to reparse after the wrapper dies.
+        let kind = artifact_delivery_kind(kind, Some(command));
         let lease = writer.snapshot();
         let build_id = lease
             .identity
