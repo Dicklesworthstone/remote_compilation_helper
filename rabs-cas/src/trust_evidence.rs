@@ -22,6 +22,8 @@
 //! Failed samples remain adverse evidence. Neither positive evidence nor
 //! a weaker policy releases existing quarantine or named blockers: that
 //! requires the explicit repair flow, not ordinary reevaluation.
+//! Observable-only divergence retains its narrower presentation quarantine;
+//! stronger blockers or adverse evidence still require full quarantine.
 //!
 //! With no active policy an ordinary evaluation leaves state untouched.
 //! A compromise report is different: durable quarantine is written
@@ -119,7 +121,7 @@ pub(crate) fn require_active_authority(
     }
 }
 
-use crate::publication::Framing;
+use crate::publication::{DISPOSITION_PRESENTATION_QUARANTINED, Framing};
 
 /// Canonical digest over an evidence-ID set: IDs are sorted and
 /// deduplicated before framing, so append-only growth changes the digest
@@ -262,7 +264,7 @@ pub fn reevaluate_action(
     action: &TypedDigest,
     policies: &[TrustPolicy],
     seq: u64,
-) -> Result<TrustReevaluation, TrustEvidenceError> {
+) -> Result<TrustRevaluation, TrustEvidenceError> {
     if !store.has_publication(action)? {
         return Err(TrustEvidenceError::NotPublished);
     }
@@ -274,6 +276,12 @@ pub fn reevaluate_action(
     let serving_blocked = serving.as_ref().is_some_and(|record| {
         record.disposition == DISPOSITION_QUARANTINED || !record.blocking.is_empty()
     });
+    // H026 observable-only divergence is narrower than action quarantine,
+    // but still forbids replay. Verification and policy changes are not a
+    // repair, including when the new policy would only leave evidence pending.
+    let presentation_quarantined = serving
+        .as_ref()
+        .is_some_and(|record| record.disposition == DISPOSITION_PRESENTATION_QUARANTINED);
     let keys = store.list_evidence_keys(action)?;
     let compromised = keys
         .iter()
@@ -287,6 +295,11 @@ pub fn reevaluate_action(
         (DISPOSITION_QUARANTINED, "adverse-evidence")
     } else if action_quarantined || serving_blocked {
         (DISPOSITION_QUARANTINED, "unresolved-quarantine")
+    } else if presentation_quarantined {
+        (
+            DISPOSITION_PRESENTATION_QUARANTINED,
+            "unresolved-presentation-quarantine",
+        )
     } else if tier >= policy.required_tier {
         (DISPOSITION_SERVABLE, tier_tag(tier))
     } else {
@@ -323,7 +336,7 @@ pub fn reevaluate_action(
                 digest_key(&evidence_set),
                 adverse_samples,
                 compromised,
-                action_quarantined || serving_blocked
+                action_quarantined || serving_blocked || presentation_quarantined
             ),
             evaluated_seq: seq,
         },
@@ -956,5 +969,149 @@ mod tests {
             compromise_without_policy_is_still_blocked(&mut reference),
             compromise_without_policy_is_still_blocked(&mut candidate)
         );
+    }
+
+    /// bd-rhdef / I34: evidence adequacy and incident repair are independent.
+    /// The narrow disposition must survive BOTH promotion and pending evidence.
+    fn presentation_quarantine_policy_matrix(store: &mut dyn RabsMetadataStore) -> Vec<String> {
+        let (active, action) = published_fixture(store);
+        let action_key = digest_key(&action);
+        let frozen = publication_lines(store);
+        store
+            .record_verification_sample(&action, 20, true, 100)
+            .unwrap();
+        store
+            .set_serving_disposition_key(&action_key, DISPOSITION_PRESENTATION_QUARANTINED)
+            .unwrap();
+        let before = store.serving_record(&action_key).unwrap().unwrap();
+        let policies = [
+            vec![policy(1, false, TrustEvidenceTier::ShadowMatched)],
+            vec![policy(2, false, TrustEvidenceTier::ReproducibleCrossWorker)],
+            vec![policy(3, false, TrustEvidenceTier::UnverifiedCandidate)],
+            vec![
+                policy(3, false, TrustEvidenceTier::UnverifiedCandidate),
+                policy(4, true, TrustEvidenceTier::ProjectReleaseEligible),
+            ],
+        ];
+        for (index, policies) in policies.iter().enumerate() {
+            let evaluation = reevaluate_action(store, &active, &action, policies, 101 + index as u64)
+                .unwrap();
+            assert_eq!(evaluation.observed_tier, TrustEvidenceTier::ShadowMatched);
+            assert_eq!(evaluation.disposition, DISPOSITION_PRESENTATION_QUARANTINED);
+            let ledger = store.latest_trust_evaluation(&action).unwrap().unwrap();
+            assert_eq!(ledger.state, "unresolved-presentation-quarantine");
+            assert!(ledger.reason.contains("prior-blocker true"));
+            let after = store.serving_record(&action_key).unwrap().unwrap();
+            assert_eq!(after.state_revision, before.state_revision);
+            assert_eq!(after.validity, before.validity);
+            assert_eq!(after.blocking, before.blocking);
+            assert!(!action_quarantine_present(store, &action_key).unwrap());
+            assert_eq!(
+                serving_gate(store, &action_key, 200, 0).unwrap(),
+                ServeDecision::NotServable {
+                    disposition: DISPOSITION_PRESENTATION_QUARANTINED.to_owned(),
+                }
+            );
+            assert_eq!(publication_lines(store), frozen);
+        }
+        let snapshot = store.differential_snapshot().unwrap();
+        assert_eq!(
+            reevaluate_action(store, &active, &action, &[], 110),
+            Err(TrustEvidenceError::NoActivePolicy)
+        );
+        let stale = digest("rabs.authority.sha256.v1", 2);
+        assert_eq!(
+            reevaluate_action(store, &stale, &action, &policies[0], 111),
+            Err(TrustEvidenceError::Store(StoreError::NotActiveAuthority))
+        );
+        assert_eq!(store.differential_snapshot().unwrap(), snapshot);
+        snapshot
+    }
+
+    #[test]
+    fn presentation_quarantine_survives_policy_changes_reference() {
+        let engine = RusqliteEngine::open_in_memory().unwrap();
+        let mut store = SqlMetadataStore::open(engine).unwrap();
+        presentation_quarantine_policy_matrix(&mut store);
+    }
+
+    #[test]
+    fn presentation_quarantine_survives_policy_changes_differential() {
+        let reference_engine = RusqliteEngine::open(&fresh_path("presentation-ref")).unwrap();
+        let candidate_engine = FsqliteEngine::open(&fresh_path("presentation-fsq")).unwrap();
+        let mut reference = SqlMetadataStore::open(reference_engine).unwrap();
+        let mut candidate = SqlMetadataStore::open(candidate_engine).unwrap();
+        assert_eq!(
+            presentation_quarantine_policy_matrix(&mut reference),
+            presentation_quarantine_policy_matrix(&mut candidate)
+        );
+    }
+
+    #[test]
+    fn presentation_quarantine_never_masks_stronger_blockers() {
+        for cause in ["action", "named", "adverse", "compromise"] {
+            let engine = RusqliteEngine::open_in_memory().unwrap();
+            let mut store = SqlMetadataStore::open(engine).unwrap();
+            let (active, action) = published_fixture(&mut store);
+            let action_key = digest_key(&action);
+            let frozen = publication_lines(&mut store);
+            let policies = [policy(1, false, TrustEvidenceTier::UnverifiedCandidate)];
+            store
+                .set_serving_disposition_key(&action_key, DISPOSITION_PRESENTATION_QUARANTINED)
+                .unwrap();
+            let expected_state = match cause {
+                "action" => {
+                    store
+                        .add_quarantine(QuarantineScope::ActionEntry, &action_key, "semantic divergence")
+                        .unwrap();
+                    "unresolved-quarantine"
+                }
+                "named" => {
+                    store
+                        .add_quarantine(QuarantineScope::LogicalObject, "object:damaged", "bad bytes")
+                        .unwrap();
+                    let record = store.serving_record(&action_key).unwrap().unwrap();
+                    store
+                        .put_serving_record(
+                            &active,
+                            &action_key,
+                            DISPOSITION_PRESENTATION_QUARANTINED,
+                            record.state_revision + 1,
+                            &record.validity,
+                            &[(QuarantineScope::LogicalObject, "object:damaged".to_owned())],
+                        )
+                        .unwrap();
+                    "unresolved-quarantine"
+                }
+                "adverse" => {
+                    store.record_verification_sample(&action, 20, false, 100).unwrap();
+                    "adverse-evidence"
+                }
+                _ => {
+                    let report = digest(COMPROMISE_REPORT_DOMAIN, 66);
+                    report_compromise(
+                        &mut store, &active, &action, &report, 10, 20, &policies, 100,
+                    )
+                    .unwrap();
+                    "compromised"
+                }
+            };
+            let evaluation = reevaluate_action(&mut store, &active, &action, &policies, 101).unwrap();
+            assert_eq!(evaluation.disposition, DISPOSITION_QUARANTINED, "{cause}");
+            assert_eq!(
+                store.latest_trust_evaluation(&action).unwrap().unwrap().state,
+                expected_state,
+                "{cause}"
+            );
+            if cause == "named" {
+                assert_eq!(
+                    store.serving_record(&action_key).unwrap().unwrap().blocking,
+                    vec![("logical-object".to_owned(), "object:damaged".to_owned())]
+                );
+            } else {
+                assert!(action_quarantine_present(&mut store, &action_key).unwrap());
+            }
+            assert_eq!(publication_lines(&mut store), frozen);
+        }
     }
 }
