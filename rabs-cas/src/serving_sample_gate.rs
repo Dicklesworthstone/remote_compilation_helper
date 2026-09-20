@@ -11,6 +11,8 @@
 //!   no durable quarantine or named blocking references;
 //! - evidence counts independent, attributable attempts of THIS action,
 //!   not repeated observations or invented worker identities;
+//! - failed observations remain a safety veto, even when unattributed or
+//!   outnumbered by enough passing attempts to meet the rate threshold;
 //! - rates are validated basis points and zero evidence always refuses,
 //!   including when the configured minimum is zero;
 //! - eligible keys are sampled deterministically from their action-key
@@ -65,7 +67,8 @@ pub struct SamplingPolicy {
     pub min_samples: u32,
     /// Required fraction of PASSED independent attempts, in basis
     /// points (9_900 = 99%). A failed observation dominates other
-    /// observations of the same attempt.
+    /// observations of the same attempt. Meeting this threshold does not
+    /// override the adverse-evidence safety veto.
     pub min_pass_rate_basis_points: u32,
     /// Share of eligible keys served from cache, in basis points
     /// (1_000 = 10% sampled serving).
@@ -115,6 +118,12 @@ pub enum PrivateExecutionReason {
         observed_basis_points: u32,
         /// [`SamplingPolicy::min_pass_rate_basis_points`].
         required_basis_points: u32,
+    },
+    /// The rate threshold passed, but failed observations still forbid
+    /// reuse. This does not imply a quarantine row has already been written.
+    AdverseVerificationSamples {
+        /// Failed observations, including unknown and foreign attempts.
+        observed: u64,
     },
     /// Eligible, but this key's deterministic share says run privately.
     NotSampledThisEpoch {
@@ -211,6 +220,16 @@ pub fn serving_sample_decision(
             PrivateExecutionReason::VerificationRateBelowPolicy {
                 observed_basis_points: pass_rate_basis_points,
                 required_basis_points: policy.min_pass_rate_basis_points,
+            },
+        ));
+    }
+    // Evidence can be appended before trust reevaluation persists quarantine.
+    // Neither a permissive rate nor absent attempt attribution may turn a
+    // known failed observation into permission to serve in that interval.
+    if evidence.adverse_samples > 0 {
+        return Ok(SampleGateDecision::ExecutePrivately(
+            PrivateExecutionReason::AdverseVerificationSamples {
+                observed: evidence.adverse_samples,
             },
         ));
     }
@@ -767,6 +786,86 @@ mod tests {
         assert_eq!(
             k008_scenarios(&mut reference),
             k008_scenarios(&mut candidate)
+        );
+    }
+
+    /// Check the interval between a failed sample arriving and durable trust
+    /// demotion. No caller should need a second, bespoke adverse-evidence guard.
+    fn adverse_verification_scenarios(store: &mut dyn RabsMetadataStore) -> Vec<String> {
+        let permissive = SamplingPolicy::sample_all(3, 7_500);
+        for (tag, generation) in [(1_u8, 10_u128), (2, 11), (3, 12)] {
+            let key = published(store, tag, generation);
+            samples(store, tag, generation, 3, 0);
+            assert_eq!(
+                serving_sample_decision(store, &action(tag), ActionClassRisk::LowRiskRegistry, &permissive)
+                    .unwrap(),
+                SampleGateDecision::ServeFromCache
+            );
+            let failed_attempt = match tag {
+                1 => {
+                    let attempt = generation * 1_000 + 4;
+                    store.record_attempt(attempt, generation, "worker-sampler", 100).unwrap();
+                    attempt
+                }
+                2 => 99_999, // unknown: excluded from the pass-rate denominator
+                _ => {
+                    published(store, 9, 13);
+                    131 // real attempt belonging to a DIFFERENT action
+                }
+            };
+            store
+                .record_verification_sample(&action(tag), failed_attempt, false, 100)
+                .unwrap();
+            for policy in [permissive, SamplingPolicy::sample_all(0, 0)] {
+                let before = store.differential_snapshot().unwrap();
+                assert_eq!(
+                    serving_sample_decision(store, &action(tag), ActionClassRisk::LowRiskRegistry, &policy)
+                        .unwrap(),
+                    SampleGateDecision::ExecutePrivately(
+                        PrivateExecutionReason::AdverseVerificationSamples { observed: 1 }
+                    )
+                );
+                assert_eq!(store.differential_snapshot().unwrap(), before);
+            }
+            // A later passing observation of the SAME attempt, plus another
+            // independent pass, cannot erase or outvote the earlier failure.
+            store
+                .record_verification_sample(&action(tag), failed_attempt, true, 101)
+                .unwrap();
+            samples(store, tag, generation, 1, 0);
+            assert_eq!(
+                serving_sample_decision(store, &action(tag), ActionClassRisk::LowRiskRegistry, &permissive)
+                    .unwrap(),
+                SampleGateDecision::ExecutePrivately(
+                    PrivateExecutionReason::AdverseVerificationSamples { observed: 1 }
+                )
+            );
+            // The refusal comes from evidence itself, not an earlier demotion.
+            assert_eq!(
+                store.serving_disposition_key(&key).unwrap().as_deref(),
+                Some(SERVABLE_DISPOSITION)
+            );
+            assert!(!action_quarantine_present(store, &key).unwrap());
+        }
+        store.differential_snapshot().unwrap()
+    }
+
+    #[test]
+    fn adverse_verification_is_a_safety_veto_reference() {
+        let engine = RusqliteEngine::open_in_memory().unwrap();
+        let mut store = SqlMetadataStore::open(engine).unwrap();
+        adverse_verification_scenarios(&mut store);
+    }
+
+    #[test]
+    fn adverse_verification_is_a_safety_veto_differential() {
+        let reference_engine = RusqliteEngine::open(&fresh_path("adverse-ref")).unwrap();
+        let candidate_engine = FsqliteEngine::open(&fresh_path("adverse-fsq")).unwrap();
+        let mut reference = SqlMetadataStore::open(reference_engine).unwrap();
+        let mut candidate = SqlMetadataStore::open(candidate_engine).unwrap();
+        assert_eq!(
+            adverse_verification_scenarios(&mut reference),
+            adverse_verification_scenarios(&mut candidate)
         );
     }
 }
