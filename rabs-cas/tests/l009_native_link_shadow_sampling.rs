@@ -111,6 +111,16 @@ fn stock_link() -> StockLinkOutcome {
     }
 }
 
+/// The sampling bucket `key_bucket_basis_points` assigns to
+/// `d("rabs.action-key.sha256.v1", 3)`.
+///
+/// Recorded from the current implementation, and its whole job is to
+/// break if that implementation ever changes: the bucket decides which
+/// actions get sampled for verification, so moving it silently re-rolls
+/// the verification population. If this constant needs updating, that is
+/// the signal to check the change was intended — not a value to refresh.
+const BUCKET_FOR_ACTION_KEY_3: u32 = 0;
+
 /// Establish EVERYTHING `serving_sample_decision` requires before it will
 /// return `ServeFromCache` for `key`, so a shadow test that means to
 /// exercise serving actually serves.
@@ -383,24 +393,13 @@ fn l009_served_divergence_lands_in_quarantine_required_not_private() {
 
     // This test is about DIVERGENCE CLASSIFICATION — that a served,
     // diverged result is a serving incident rather than private noise.
-    // To assert that, the action has to actually be SERVED, which means
-    // its evidence must pass the fail-closed attributability rule 40bc5954
-    // introduced: `verification_evidence` joins verification_samples ->
-    // action_attempts -> action_generations and counts only distinct
-    // attempts with a non-empty worker whose generation belongs to THIS
-    // action key.
-    //
-    // The fixture used to record a sample for attempt 7 with no attempt
-    // row behind it, so the join found nothing, evidence was zero, and the
-    // gate correctly refused to serve — and the test then failed on its
+    // To assert that, the action has to actually be SERVED. The fixture
+    // used to record a verification sample for an attempt that had no
+    // attempt row behind it and nothing else, so the gate refused long
+    // before evidence was even consulted, and the test failed on its own
     // SERVED precondition rather than on the property it names (bd-sudco).
-    // It had stopped testing its own subject and was silently exercising
-    // the evidence gate instead.
-    //
-    // So bind a real attempt, the way published_fixture and the pin and
-    // publication fixtures already do. This does NOT relax the gate: the
-    // assertion below is untouched, and if divergence classification
-    // regresses this test still fails, now for the right reason.
+    // `make_servable` establishes every precondition the gate checks; see
+    // its doc comment for the order.
     make_servable(&mut st, &key);
 
     let mut backend = GateBackend {
@@ -420,8 +419,20 @@ fn l009_served_divergence_lands_in_quarantine_required_not_private() {
     );
     assert_eq!(report.private_divergences, 0);
     // Bucket stability: same key, same bucket, every process, forever.
-    let bucket = key_bucket_basis_points(&key);
-    assert_eq!(key_bucket_basis_points(&key), bucket);
+    //
+    // This used to read `let bucket = key_bucket_basis_points(&key);
+    // assert_eq!(key_bucket_basis_points(&key), bucket);` — comparing the
+    // function to itself inside one process, which holds for ANY
+    // implementation including a random one, and so could not detect the
+    // cross-process instability it names. Pin the VALUE instead: a change
+    // to the bucketing function moves every key's sampling bucket, which
+    // silently re-rolls which actions get verified, so it must break a
+    // test rather than pass unnoticed.
+    assert_eq!(
+        key_bucket_basis_points(&key),
+        BUCKET_FOR_ACTION_KEY_3,
+        "bucket assignment changed: every key's sampling bucket moves with it"
+    );
 }
 
 // ---------------------------------------------------------------------
