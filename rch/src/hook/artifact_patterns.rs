@@ -24,6 +24,10 @@
 //!   silent stale-local-binary hazard (see also the RCH-E326 failure arm in
 //!   `transfer_orchestration`).
 //!
+//! Explicit direct-compiler output paths are resolved before Cargo patterns.
+//! They stay in the project-root phase, even with CARGO_TARGET_DIR forwarding;
+//! Cargo cache exclusions must not suppress a requested compiler dep-info file.
+//!
 //! It reaches its support layer from the parent via `use super::*`: the
 //! `CompilationKind` enum and the `default_*_artifact_patterns` builders (which
 //! live in `crate::transfer` and are imported into `hook`), plus the cargo
@@ -33,6 +37,8 @@
 //! which imports them directly, and by the hook test suite which imports them
 //! into `hook::tests`. `CARGO_TARGET_CACHE_EXCLUDES` is used only within this
 //! module and stays private.
+
+mod direct_compiler;
 
 use super::command_parsing::cargo_custom_profile_output_dir;
 use super::*;
@@ -56,6 +62,9 @@ pub(super) fn get_artifact_patterns(
     kind: Option<CompilationKind>,
     command: Option<&str>,
 ) -> Vec<String> {
+    if let Some(patterns) = direct_compiler::patterns(kind, command) {
+        return patterns;
+    }
     if kind == Some(CompilationKind::CargoBuild)
         && command.is_some_and(rch_common::patterns::is_cargo_package_verification)
     {
@@ -169,6 +178,11 @@ pub(super) fn get_project_artifact_patterns(
     command: Option<&str>,
     custom_target_sync: bool,
 ) -> Vec<String> {
+    // A direct compiler does not consult Cargo's target-directory setting.
+    // Its explicit target/foo output still belongs to the project-root pull.
+    if let Some(patterns) = direct_compiler::patterns(kind, command) {
+        return patterns;
+    }
     let patterns = get_artifact_patterns(kind, command);
     if custom_target_sync {
         patterns
@@ -245,6 +259,9 @@ pub(super) fn get_custom_target_artifact_patterns(
     kind: Option<CompilationKind>,
     command: Option<&str>,
 ) -> Vec<String> {
+    if direct_compiler::patterns(kind, command).is_some() {
+        return Vec::new();
+    }
     match kind {
         Some(CompilationKind::CargoTest)
         | Some(CompilationKind::CargoCheck)
