@@ -342,7 +342,28 @@ fn probe_channel(channel: &Channel, project: &Path) -> Value {
             .env_remove("CARGO_BUILD_RUSTC")
             .env_remove("RUSTC_WRAPPER")
             .env_remove("RUSTC_WORKSPACE_WRAPPER")
-            .env_remove("RUSTFLAGS")
+            // EMPTY, not removed. Cargo's flag precedence is
+            // CARGO_ENCODED_RUSTFLAGS > RUSTFLAGS > `[build] rustflags`,
+            // and an absent RUSTFLAGS simply lets a config file win. The
+            // workspace sets `rustflags = ["-Z", "threads=4"]` in
+            // .cargo/config.toml — a NIGHTLY-only option — so whenever
+            // this fixture ends up anywhere beneath the repository root,
+            // the stable channel's rustc refused it outright ("1 nightly
+            // option were parsed") and the stable lane could never pass.
+            //
+            // That is not hypothetical: the fixture goes in
+            // `tempfile::tempdir()`, and when this suite runs under `rch
+            // exec` the worker's TMPDIR is deliberately forced to a
+            // worker-scoped path UNDER the synchronized project root
+            // (rch/src/transfer.rs, FORCED_MANAGED_ENV_KEYS), so the
+            // "standalone" fixture lands inside the repo and inherits its
+            // config after all.
+            //
+            // Setting both — encoded removed so it cannot win, RUSTFLAGS
+            // empty so it beats any `[build] rustflags` — makes the stock
+            // build genuinely stock wherever it is run from.
+            .env("RUSTFLAGS", "")
+            .env_remove("CARGO_ENCODED_RUSTFLAGS")
             .env_remove("CARGO_TARGET_DIR")
             .env_remove("CARGO_BUILD_TARGET_DIR")
             .env_remove("RUSTUP_TOOLCHAIN");

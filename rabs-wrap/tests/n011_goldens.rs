@@ -277,7 +277,15 @@ fn build_consumer(channel: &str, project: &Path) -> RunOutcome {
         .env_remove("CARGO_BUILD_RUSTC")
         .env_remove("RUSTC_WRAPPER")
         .env_remove("RUSTC_WORKSPACE_WRAPPER")
-        .env_remove("RUSTFLAGS")
+        // EMPTY, not removed — same reasoning as n001_contract.rs. Cargo
+        // prefers CARGO_ENCODED_RUSTFLAGS over RUSTFLAGS over `[build]
+        // rustflags`, so an absent RUSTFLAGS just lets the workspace's
+        // `rustflags = ["-Z", "threads=4"]` win. That is a nightly-only
+        // option, and this fixture reaches the repository's config
+        // whenever TMPDIR points inside it — which `rch exec` does on
+        // purpose. Stable rustc then refuses the build outright.
+        .env("RUSTFLAGS", "")
+        .env_remove("CARGO_ENCODED_RUSTFLAGS")
         .env_remove("CARGO_TARGET_DIR")
         .env_remove("CARGO_BUILD_TARGET_DIR")
         .env_remove("RUSTUP_TOOLCHAIN");
