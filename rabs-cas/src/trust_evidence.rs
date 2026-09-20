@@ -264,7 +264,7 @@ pub fn reevaluate_action(
     action: &TypedDigest,
     policies: &[TrustPolicy],
     seq: u64,
-) -> Result<TrustRevaluation, TrustEvidenceError> {
+) -> Result<TrustReevaluation, TrustEvidenceError> {
     if !store.has_publication(action)? {
         return Err(TrustEvidenceError::NotPublished);
     }
@@ -994,8 +994,8 @@ mod tests {
             ],
         ];
         for (index, policies) in policies.iter().enumerate() {
-            let evaluation = reevaluate_action(store, &active, &action, policies, 101 + index as u64)
-                .unwrap();
+            let evaluation =
+                reevaluate_action(store, &active, &action, policies, 101 + index as u64).unwrap();
             assert_eq!(evaluation.observed_tier, TrustEvidenceTier::ShadowMatched);
             assert_eq!(evaluation.disposition, DISPOSITION_PRESENTATION_QUARANTINED);
             let ledger = store.latest_trust_evaluation(&action).unwrap().unwrap();
@@ -1062,7 +1062,11 @@ mod tests {
             let expected_state = match cause {
                 "action" => {
                     store
-                        .add_quarantine(QuarantineScope::ActionEntry, &action_key, "semantic divergence")
+                        .add_quarantine(
+                            QuarantineScope::ActionEntry,
+                            &action_key,
+                            "semantic divergence",
+                        )
                         .unwrap();
                     "unresolved-quarantine"
                 }
@@ -1084,7 +1088,9 @@ mod tests {
                     "unresolved-quarantine"
                 }
                 "adverse" => {
-                    store.record_verification_sample(&action, 20, false, 100).unwrap();
+                    store
+                        .record_verification_sample(&action, 20, false, 100)
+                        .unwrap();
                     "adverse-evidence"
                 }
                 _ => {
@@ -1113,5 +1119,48 @@ mod tests {
             }
             assert_eq!(publication_lines(&mut store), frozen);
         }
+    }
+
+    #[test]
+    fn presentation_quarantine_survives_metadata_reopen_differential() {
+        let reference_path = fresh_path("presentation-reopen-ref");
+        let candidate_path = fresh_path("presentation-reopen-fsq");
+        let snapshot = {
+            let reference_engine = RusqliteEngine::open(&reference_path).unwrap();
+            let candidate_engine = FsqliteEngine::open(&candidate_path).unwrap();
+            let mut reference = SqlMetadataStore::open(reference_engine).unwrap();
+            let mut candidate = SqlMetadataStore::open(candidate_engine).unwrap();
+            let snapshot = presentation_quarantine_policy_matrix(&mut reference);
+            assert_eq!(presentation_quarantine_policy_matrix(&mut candidate), snapshot);
+            snapshot
+        };
+        let reference_engine = RusqliteEngine::open(&reference_path).unwrap();
+        let candidate_engine = FsqliteEngine::open(&candidate_path).unwrap();
+        let mut reference = SqlMetadataStore::open(reference_engine).unwrap();
+        let mut candidate = SqlMetadataStore::open(candidate_engine).unwrap();
+        let active = digest("rabs.authority.sha256.v1", 1);
+        let action = digest("rabs.action-key.sha256.v1", 7);
+        let action_key = digest_key(&action);
+        let policies = [policy(5, false, TrustEvidenceTier::UnverifiedCandidate)];
+        for store in [
+            &mut reference as &mut dyn RabsMetadataStore,
+            &mut candidate as &mut dyn RabsMetadataStore,
+        ] {
+            assert_eq!(store.differential_snapshot().unwrap(), snapshot);
+            let evaluation = reevaluate_action(store, &active, &action, &policies, 120).unwrap();
+            assert_eq!(evaluation.ledger_version, 5);
+            assert_eq!(evaluation.disposition, DISPOSITION_PRESENTATION_QUARANTINED);
+            assert_eq!(
+                serving_gate(store, &action_key, 200, 0).unwrap(),
+                ServeDecision::NotServable {
+                    disposition: DISPOSITION_PRESENTATION_QUARANTINED.to_owned(),
+                }
+            );
+            assert!(!action_quarantine_present(store, &action_key).unwrap());
+        }
+        assert_eq!(
+            reference.differential_snapshot().unwrap(),
+            candidate.differential_snapshot().unwrap()
+        );
     }
 }
