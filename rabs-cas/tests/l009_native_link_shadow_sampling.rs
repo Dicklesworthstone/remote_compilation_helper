@@ -119,7 +119,7 @@ fn stock_link() -> StockLinkOutcome {
 /// actions get sampled for verification, so moving it silently re-rolls
 /// the verification population. If this constant needs updating, that is
 /// the signal to check the change was intended — not a value to refresh.
-const BUCKET_FOR_ACTION_KEY_3: u32 = 0;
+const BUCKET_FOR_ACTION_KEY_3: u32 = 2891;
 
 /// Establish EVERYTHING `serving_sample_decision` requires before it will
 /// return `ServeFromCache` for `key`, so a shadow test that means to
