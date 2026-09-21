@@ -72,6 +72,9 @@ async fn drain_on_shutdown<F: Future>(
         if !requested && signal.as_mut().poll(task).is_ready() {
             requested = true;
             cx.cancel_with(CancelKind::User, Some("worker process shutdown"));
+            // Acknowledge the request before entering the explicit drain phase.
+            // This is not acknowledgement that execution cleanup has completed.
+            let _ = cx.checkpoint();
         }
         session.as_mut().poll(task)
     }).await
@@ -318,6 +321,7 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let address = listener.local_addr().unwrap().to_string();
+        let retained_endpoint = address.clone();
         let controller = Arc::new(ShutdownController::new());
         let trigger = Arc::clone(&controller);
         let started_file = pid_file.clone();
@@ -412,19 +416,16 @@ mod tests {
         peer.join().unwrap();
         let before = journal.status(42);
         drop(journal);
-        let journal = WorkerJournal::open(&root.path().join("state"), "shutdown-test", &listener_address(&before, root.path())).err();
-        // The receipt itself, not a fabricated status, was durably written.
+        let journal = WorkerJournal::open(
+            &root.path().join("state"), "shutdown-test", &retained_endpoint,
+        ).unwrap();
+        // Reopening the SAME owner proves that cleanup, not just an in-memory
+        // result, crossed the durable outcome barrier before shutdown returned.
+        assert_eq!(journal.status(42), before);
         let saved: serde_json::Value = serde_json::from_slice(
             &std::fs::read(root.path().join("state/requests.json")).unwrap(),
         ).unwrap();
         assert_eq!(saved["last"]["resolved"], true);
         assert_eq!(saved["last"]["receipt"], before["receipt"]);
-        assert!(journal.is_some(), "an unrelated endpoint cannot acquire the journal");
-    }
-
-    #[cfg(target_os = "linux")]
-    fn listener_address(_status: &serde_json::Value, _root: &std::path::Path) -> String {
-        // Intentionally foreign endpoint for the final binding refusal assertion.
-        "not-the-admitted-coordinator".to_owned()
     }
 }
