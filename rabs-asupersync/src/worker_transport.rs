@@ -7,9 +7,10 @@
 //! Its peer identity is derived from the public key TLS actually authenticated,
 //! never from the worker label or a self-asserted hello field.
 //!
-//! Partial read/write state belongs to the connection, not a disposable future.
-//! A cancelled read therefore cannot discard a prefix and reinterpret its tail
-//! as another command. No retry reconnects or retransmits an execution request.
+//! Partial read/write state AND deadlines belong to the connection, not a
+//! disposable future. Trickled progress cannot renew an incomplete record's
+//! budget. Cancellation and timeout return errors through the session driver's
+//! ordinary process-drain/journal path; they never retransmit execution.
 
 use asupersync::bytes::BytesMut;
 use asupersync::codec::{Decoder, Encoder};
@@ -22,12 +23,13 @@ use asupersync::tls::{
     TlsConnector, TlsConnectorBuilder, TlsStream,
 };
 use rabs_protocol::identity_store::TransportIdentity;
+use std::future::{Future, poll_fn};
 use std::io::{self, Read};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
+use std::pin::{Pin, pin};
 use std::task::{Context, Poll, ready};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Both endpoints must negotiate this exact protocol. There is no downgrade.
 pub const WORKER_ALPN: &[u8] = b"rabs-worker-atp/1";
@@ -38,9 +40,48 @@ pub const MAX_JSON_RECORD: usize = MAX_WIRE_FRAME - 64;
 const TLS_FILE_LIMIT: u64 = 1024 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+const FRAME_IO_TIMEOUT: Duration = Duration::from_secs(10);
+// A quiet compiler is not a partial protocol frame. Allow the worker's maximum
+// 30-minute execution plus transfer grace before recycling an idle connection.
+// This does not renew an execution lease or replace the executor's own budget.
+const IDLE_READ_TIMEOUT: Duration = Duration::from_secs(35 * 60);
 
 fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
+}
+
+fn check_task_cancellation() -> io::Result<()> {
+    if asupersync::cx::Cx::current().is_some_and(|cx| cx.is_cancel_requested()) {
+        // Interrupted can be retried by write_all. Cancellation is terminal for
+        // this session and must instead unwind into its explicit cleanup path.
+        Err(io::Error::new(io::ErrorKind::ConnectionAborted, "worker session cancelled"))
+    } else {
+        Ok(())
+    }
+}
+
+/// A native timer supplies wakeups; the monotonic instant also rejects a late
+/// poll even when bytes are immediately available. Construct the timeout NOW,
+/// not inside the boxed async body, so its first poll cannot restart the clock.
+struct FrameDeadline {
+    until: Instant,
+    wake: Pin<Box<dyn Future<Output = ()> + Send>>,
+}
+
+impl FrameDeadline {
+    fn new(budget: Duration) -> Self {
+        let timer = asupersync::time::timeout(
+            asupersync::time::wall_now(), budget, std::future::pending::<()>(),
+        );
+        Self {
+            until: Instant::now() + budget,
+            wake: Box::pin(async move { let _ = timer.await; }),
+        }
+    }
+
+    fn expired(&mut self, cx: &mut Context<'_>) -> bool {
+        Instant::now() >= self.until || self.wake.as_mut().poll(cx).is_ready()
+    }
 }
 
 /// Translate the existing record-oriented driver to the native ATP codec.
@@ -60,6 +101,9 @@ pub struct JsonAtpStream<S> {
     output: Vec<u8>,
     output_offset: usize,
     failed: bool,
+    read_deadline: Option<FrameDeadline>,
+    idle_deadline: Option<FrameDeadline>,
+    write_deadline: Option<FrameDeadline>,
 }
 
 impl<S> JsonAtpStream<S> {
@@ -76,18 +120,57 @@ impl<S> JsonAtpStream<S> {
             output: Vec::new(),
             output_offset: 0,
             failed: false,
+            read_deadline: None,
+            idle_deadline: None,
+            write_deadline: None,
         }
     }
 
     fn poison(&mut self, error: io::Error) -> io::Error {
         self.failed = true;
+        self.read_deadline = None;
+        self.idle_deadline = None;
+        self.write_deadline = None;
         error
+    }
+
+    fn check_live(&mut self, cx: &mut Context<'_>) -> io::Result<()> {
+        if self.failed {
+            return Err(invalid("worker ATP connection is unusable"));
+        }
+        if let Err(error) = check_task_cancellation() {
+            return Err(self.poison(error));
+        }
+        let expired = if self.read_deadline.as_mut().is_some_and(|timer| timer.expired(cx)) {
+            Some("worker ATP partial-frame deadline exceeded")
+        } else if self.write_deadline.as_mut().is_some_and(|timer| timer.expired(cx)) {
+            Some("worker ATP write/flush deadline exceeded")
+        } else if self.idle_deadline.as_mut().is_some_and(|timer| timer.expired(cx)) {
+            Some("worker ATP idle-read deadline exceeded")
+        } else {
+            None
+        };
+        match expired {
+            Some(message) => Err(self.poison(io::Error::new(io::ErrorKind::TimedOut, message))),
+            None => Ok(()),
+        }
+    }
+
+    fn begin_write(&mut self) {
+        self.write_deadline.get_or_insert_with(|| FrameDeadline::new(FRAME_IO_TIMEOUT));
     }
 }
 
 impl<S: AsyncWrite + Unpin> JsonAtpStream<S> {
     fn drain_output(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        while self.output_offset < self.output.len() {
+        // Even an always-ready writer yields so shutdown/control can be polled.
+        for _ in 0..32 {
+            self.check_live(cx)?;
+            if self.output_offset == self.output.len() {
+                self.output.clear();
+                self.output_offset = 0;
+                return Poll::Ready(Ok(()));
+            }
             let n = match ready!(Pin::new(&mut self.io).poll_write(
                 cx,
                 &self.output[self.output_offset..],
@@ -103,9 +186,23 @@ impl<S: AsyncWrite + Unpin> JsonAtpStream<S> {
             };
             self.output_offset += n;
         }
-        self.output.clear();
-        self.output_offset = 0;
-        Poll::Ready(Ok(()))
+        cx.waker().wake_by_ref();
+        Poll::Pending
+    }
+
+    fn flush_output(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.begin_write();
+        self.check_live(cx)?;
+        ready!(self.drain_output(cx))?;
+        match ready!(Pin::new(&mut self.io).poll_flush(cx)) {
+            Ok(()) => {
+                // Flushing an unfinished JSON prefix is not completion of its
+                // record and must not grant that prefix a fresh write budget.
+                if self.line.is_empty() { self.write_deadline = None; }
+                Poll::Ready(Ok(()))
+            }
+            Err(error) => Poll::Ready(Err(self.poison(error))),
+        }
     }
 }
 
@@ -116,15 +213,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for JsonAtpStream<S> {
         destination: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
-        if this.failed {
-            return Poll::Ready(Err(invalid("worker ATP connection is unusable")));
-        }
+        this.check_live(cx)?;
         if destination.remaining() == 0 {
             return Poll::Ready(Ok(()));
         }
-        ready!(this.drain_output(cx))?;
-        ready!(Pin::new(&mut this.io).poll_flush(cx))?;
+        ready!(this.flush_output(cx))?;
         for _ in 0..32 {
+            this.check_live(cx)?;
             if this.ready_offset < this.ready.len() {
                 let count = destination.remaining().min(this.ready.len() - this.ready_offset);
                 destination.put_slice(&this.ready[this.ready_offset..this.ready_offset + count]);
@@ -148,6 +243,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for JsonAtpStream<S> {
                         ))));
                     }
                     this.boundary_bytes = this.input.len();
+                    this.read_deadline = None;
+                    this.idle_deadline = None;
                     this.ready = frame.payload;
                     this.ready.push(b'\n');
                     continue;
@@ -159,6 +256,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for JsonAtpStream<S> {
                     )))));
                 }
             }
+            this.idle_deadline.get_or_insert_with(|| FrameDeadline::new(IDLE_READ_TIMEOUT));
+            if this.boundary_bytes != 0 {
+                this.read_deadline.get_or_insert_with(|| FrameDeadline::new(FRAME_IO_TIMEOUT));
+            }
+            this.check_live(cx)?;
             // The codec may consume a header while waiting for its payload.
             // boundary_bytes, unlike input.is_empty(), still records that an
             // EOF here would truncate a frame.
@@ -176,11 +278,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for JsonAtpStream<S> {
                             "truncated worker ATP frame",
                         ))));
                     }
+                    this.idle_deadline = None;
                     return Poll::Ready(Ok(()));
                 }
                 Ok(()) => {
                     this.boundary_bytes += read.filled().len();
                     this.input.extend_from_slice(read.filled());
+                    this.read_deadline.get_or_insert_with(|| FrameDeadline::new(FRAME_IO_TIMEOUT));
                 }
                 Err(error) => return Poll::Ready(Err(this.poison(error))),
             }
@@ -198,9 +302,9 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for JsonAtpStream<S> {
         bytes: &[u8],
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
-        if this.failed {
-            return Poll::Ready(Err(invalid("worker ATP connection is unusable")));
-        }
+        this.check_live(cx)?;
+        if bytes.is_empty() { return Poll::Ready(Ok(0)); }
+        this.begin_write();
         ready!(this.drain_output(cx))?;
         let newline = bytes.iter().position(|byte| *byte == b'\n');
         let count = newline.map_or(bytes.len(), |index| index + 1);
@@ -231,20 +335,22 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for JsonAtpStream<S> {
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
-        if this.failed {
-            return Poll::Ready(Err(invalid("worker ATP connection is unusable")));
-        }
-        ready!(this.drain_output(cx))?;
-        Pin::new(&mut this.io).poll_flush(cx)
+        this.check_live(cx)?;
+        this.flush_output(cx)
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
-        if this.failed || !this.line.is_empty() {
+        this.check_live(cx)?;
+        if !this.line.is_empty() {
             return Poll::Ready(Err(this.poison(invalid("unfinished worker ATP record"))));
         }
+        this.begin_write();
         ready!(this.drain_output(cx))?;
-        Pin::new(&mut this.io).poll_shutdown(cx)
+        match ready!(Pin::new(&mut this.io).poll_shutdown(cx)) {
+            Ok(()) => { this.write_deadline = None; Poll::Ready(Ok(())) }
+            Err(error) => Poll::Ready(Err(this.poison(error))),
+        }
     }
 }
 
@@ -383,6 +489,7 @@ impl WorkerConnection {
 
 impl AsyncRead for WorkerConnection {
     fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+        check_task_cancellation()?;
         match self.get_mut() {
             Self::Authenticated { peer, .. } => Pin::new(&mut peer.stream).poll_read(cx, buf),
             Self::LoopbackFixture(stream) => Pin::new(stream).poll_read(cx, buf),
@@ -392,18 +499,21 @@ impl AsyncRead for WorkerConnection {
 
 impl AsyncWrite for WorkerConnection {
     fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, bytes: &[u8]) -> Poll<io::Result<usize>> {
+        check_task_cancellation()?;
         match self.get_mut() {
             Self::Authenticated { peer, .. } => Pin::new(&mut peer.stream).poll_write(cx, bytes),
             Self::LoopbackFixture(stream) => Pin::new(stream).poll_write(cx, bytes),
         }
     }
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        check_task_cancellation()?;
         match self.get_mut() {
             Self::Authenticated { peer, .. } => Pin::new(&mut peer.stream).poll_flush(cx),
             Self::LoopbackFixture(stream) => Pin::new(stream).poll_flush(cx),
         }
     }
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        check_task_cancellation()?;
         match self.get_mut() {
             Self::Authenticated { peer, .. } => Pin::new(&mut peer.stream).poll_shutdown(cx),
             Self::LoopbackFixture(stream) => Pin::new(stream).poll_shutdown(cx),
@@ -412,7 +522,19 @@ impl AsyncWrite for WorkerConnection {
 }
 
 /// Load only explicit worker TLS settings. Partial configuration fails closed.
+/// A supervisor cancelling the owning Cx can interrupt connection establishment
+/// before execution is admitted, as well as reads/writes on an established peer.
 pub async fn connect_worker(address: &str) -> Result<WorkerConnection, String> {
+    let mut connection = pin!(connect_worker_inner(address));
+    poll_fn(|cx| {
+        if let Err(error) = check_task_cancellation() {
+            return Poll::Ready(Err(error.to_string()));
+        }
+        connection.as_mut().poll(cx)
+    }).await
+}
+
+async fn connect_worker_inner(address: &str) -> Result<WorkerConnection, String> {
     let ca = std::env::var_os("RABS_WORKER_TLS_CA");
     let certificate = std::env::var_os("RABS_WORKER_TLS_CERT");
     let private_key = std::env::var_os("RABS_WORKER_TLS_KEY");
@@ -593,5 +715,69 @@ mod tests {
         for address in ["localhost:1234", "worker:1234", "10.0.0.2:1234", "0.0.0.0:1234", "[::]:1234"] {
             assert!(!is_loopback_fixture(address), "{address}");
         }
+    }
+
+    #[test]
+    fn trickled_frame_and_replaced_read_future_cannot_renew_deadline() {
+        let bytes = encoded(br#"{"kind":"ping"}"#, FrameType::Control);
+        let mut stream = JsonAtpStream::new(Wire::default());
+        stream.io.input.extend(&bytes[..1]);
+        assert!(read_once(&mut stream).is_pending());
+        let until = stream.read_deadline.as_ref().unwrap().until;
+        for byte in &bytes[1..6] {
+            stream.io.input.push_back(*byte);
+            assert!(read_once(&mut stream).is_pending());
+            assert_eq!(stream.read_deadline.as_ref().unwrap().until, until);
+        }
+        stream.read_deadline.as_mut().unwrap().until = Instant::now();
+        stream.io.input.extend(&bytes[6..]);
+        assert!(matches!(read_once(&mut stream), Poll::Ready(Err(error))
+            if error.kind() == io::ErrorKind::TimedOut));
+        assert!(stream.failed);
+        assert!(matches!(read_once(&mut stream), Poll::Ready(Err(_))));
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(matches!(Pin::new(&mut stream).poll_write(&mut cx, b"{}\n"), Poll::Ready(Err(_))));
+        assert!(stream.io.output.is_empty());
+    }
+
+    #[test]
+    fn write_prefix_and_stalled_flush_share_one_terminal_deadline() {
+        let mut stream = JsonAtpStream::new(Wire::default());
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(matches!(Pin::new(&mut stream).poll_write(&mut cx, b"{"), Poll::Ready(Ok(1))));
+        let until = stream.write_deadline.as_ref().unwrap().until;
+        assert!(matches!(Pin::new(&mut stream).poll_flush(&mut cx), Poll::Ready(Ok(()))));
+        assert_eq!(stream.write_deadline.as_ref().unwrap().until, until);
+        assert!(matches!(Pin::new(&mut stream).poll_write(&mut cx, b"}\n"), Poll::Ready(Ok(2))));
+        assert_eq!(stream.write_deadline.as_ref().unwrap().until, until);
+        stream.io.blocked = true;
+        assert!(Pin::new(&mut stream).poll_flush(&mut cx).is_pending());
+        stream.write_deadline.as_mut().unwrap().until = Instant::now();
+        stream.io.blocked = false;
+        assert!(matches!(Pin::new(&mut stream).poll_flush(&mut cx), Poll::Ready(Err(error))
+            if error.kind() == io::ErrorKind::TimedOut));
+        assert!(stream.io.output.is_empty(), "late flush must not write expired bytes");
+        assert!(matches!(Pin::new(&mut stream).poll_shutdown(&mut cx), Poll::Ready(Err(_))));
+    }
+
+    #[test]
+    fn healthy_idle_and_partial_record_budgets_are_distinct() {
+        let mut stream = JsonAtpStream::new(Wire::default());
+        assert!(read_once(&mut stream).is_pending());
+        assert!(stream.read_deadline.is_none());
+        let idle = stream.idle_deadline.as_ref().unwrap().until;
+        assert!(idle.duration_since(Instant::now()) > Duration::from_secs(30 * 60));
+        let bytes = encoded(br#"{"kind":"ping"}"#, FrameType::Control);
+        stream.io.input.extend(&bytes[..6]);
+        assert!(read_once(&mut stream).is_pending());
+        assert!(stream.read_deadline.as_ref().unwrap().until < idle);
+        stream.io.input.extend(&bytes[6..]);
+        assert!(matches!(read_once(&mut stream), Poll::Ready(Ok(_))));
+        assert!(stream.read_deadline.is_none());
+        assert!(stream.idle_deadline.is_none());
+        assert!(read_once(&mut stream).is_pending());
+        stream.idle_deadline.as_mut().unwrap().until = Instant::now();
+        assert!(matches!(read_once(&mut stream), Poll::Ready(Err(error))
+            if error.kind() == io::ErrorKind::TimedOut));
     }
 }
