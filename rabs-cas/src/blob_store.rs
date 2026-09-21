@@ -118,8 +118,20 @@ pub struct PutLimits {
     /// reader decodes an encoded transport stream). Exceeding it
     /// ABORTS the stream.
     pub max_logical_bytes: Option<u64>,
-    /// Declared logical size, verified exactly at finish.
+    /// Declared logical size. Overruns abort while streaming; underruns
+    /// are rejected at EOF. This declaration never enlarges the hard cap.
     pub expected_size: Option<u64>,
+}
+
+impl PutLimits {
+    fn validate(self) -> Result<(), PutError> {
+        if let (Some(expected), Some(limit)) = (self.expected_size, self.max_logical_bytes)
+            && expected > limit
+        {
+            return Err(PutError::LogicalLimitExceeded { limit });
+        }
+        Ok(())
+    }
 }
 
 /// Independent, mandatory resource ceilings for encoded ingestion (H030).
@@ -164,6 +176,17 @@ impl EncodedPutLimits {
 /// publish anything.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PutError {
+    /// A storage profile is not a safe, unambiguous filename component,
+    /// or an encoded put tried to impersonate the reserved raw profile.
+    InvalidStorageProfile {
+        /// Refused profile name.
+        profile: String,
+    },
+    /// Staged publication was given a symlink, directory, or special file.
+    NonRegularStagingFile {
+        /// The refused path, left untouched for inspection.
+        path: String,
+    },
     /// Encoded input exceeded its configured staging budget.
     EncodedLimitExceeded {
         /// Maximum encoded bytes permitted.
@@ -315,7 +338,9 @@ impl BlobStoreLayout {
 
     /// Published path for `(logical id, profile, encoded digest)`.
     /// Digest keys contain `:`/arbitrary domain text, so path segments
-    /// use hex only, with a two-hex-char fan-out directory.
+    /// use hex only, with a two-hex-char fan-out directory. This is a pure
+    /// path builder: I/O callers must validate the profile first. The encoded
+    /// put entry point rejects separators, dots, and reserved raw aliases.
     #[must_use]
     pub fn published_path(
         &self,
@@ -438,6 +463,7 @@ pub fn put_if_absent_with_fault(
     durability: DurabilityPolicy,
     fault: Option<FaultPoint>,
 ) -> Result<PutOutcome, PutError> {
+    limits.validate()?;
     let staging = layout.fresh_staging_path();
 
     // 1. Stream to the private staging file, hashing while writing and
@@ -477,15 +503,18 @@ pub fn put_if_absent_with_fault(
     )
 }
 
-/// Publish an ALREADY-VERIFIED staged file (steps 3–5 of the
-/// pipeline): fsync per durability policy, atomic create-exclusive
-/// link, directory fsync, metadata record, staging cleanup. Used by
-/// the put path and by H007 journal recovery when it RESUMES a staged
-/// write whose bytes verify against the declared identity — the
-/// caller vouches for that verification.
+/// Verify and publish a private staged raw object. Journal recovery and
+/// sparse writers may have checked it earlier, but a stale caller assertion
+/// never substitutes for verification at this publication boundary.
+///
+/// The caller must exclusively own the staged file through this call: no
+/// concurrent replacement or mutation is permitted. Symlinks, directories,
+/// and special files are refused before opening, and logical bytes are hashed
+/// in bounded chunks before entering the atomic publication pipeline.
 ///
 /// # Errors
-/// As [`put_if_absent`].
+/// As [`put_if_absent`], plus [`PutError::NonRegularStagingFile`]. Verification
+/// refusals leave the staged source intact and publish no object or metadata.
 pub fn publish_staged(
     layout: &BlobStoreLayout,
     store: &mut dyn RabsMetadataStore,
@@ -493,13 +522,41 @@ pub fn publish_staged(
     staging: &Path,
     durability: DurabilityPolicy,
 ) -> Result<PutOutcome, PutError> {
-    let logical_size = fs::metadata(staging).map_err(io_err("stat-staging"))?.len();
+    let metadata = fs::symlink_metadata(staging).map_err(io_err("stat-staging"))?;
+    if !metadata.is_file() {
+        return Err(PutError::NonRegularStagingFile {
+            path: staging.to_string_lossy().into_owned(),
+        });
+    }
+    let logical_size = metadata.len();
+    let mut input = fs::File::open(staging)
+        .map_err(io_err("open-staging"))?
+        .take(logical_size.saturating_add(1));
+    let mut writer = StreamingObjectWriter::new(DigestRequest::default(), Some(logical_size));
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let n = match input.read(&mut buffer) {
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            result => result.map_err(io_err("verify-staging"))?,
+        };
+        if n == 0 {
+            break;
+        }
+        writer.write(&buffer[..n]).map_err(PutError::Digest)?;
+    }
+    let digests = writer.finish().map_err(PutError::Digest)?;
+    if digests.atp_content_id != *declared {
+        return Err(PutError::DeclaredDigestMismatch {
+            declared: digest_key(declared),
+            computed: digest_key(&digests.atp_content_id),
+        });
+    }
     publish_staged_inner(
         layout,
         store,
         declared,
         staging,
-        logical_size,
+        digests.logical_size,
         durability,
         None,
         RAW_PROFILE_V1,
@@ -602,6 +659,25 @@ fn publish_staged_inner(
     })
 }
 
+// The two digests and separators use 130 bytes. A 96-byte profile keeps
+// the complete component below the usual 255-byte filesystem limit. Dots
+// are reserved separators; raw aliases must only use the raw put pipeline.
+fn validate_encoded_profile(profile: &str) -> Result<(), PutError> {
+    if profile.is_empty()
+        || profile.len() > 96
+        || profile == RAW_PROFILE_V1
+        || profile == "raw"
+        || !profile
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return Err(PutError::InvalidStorageProfile {
+            profile: profile.to_owned(),
+        });
+    }
+    Ok(())
+}
+
 /// H030: publish an encoded representation only after streaming verification
 /// against its logical identity. Encoded and logical byte budgets are enforced
 /// independently, before accepting each chunk. No whole-object allocation is
@@ -622,6 +698,9 @@ pub fn put_encoded_representation(
     limits: EncodedPutLimits,
     durability: DurabilityPolicy,
 ) -> Result<(StoredRepresentationId, PutOutcome), PutError> {
+    // Profile names cannot escape the namespace or label encoded bytes raw.
+    // Refuse before reading the source or creating a staging file.
+    validate_encoded_profile(profile)?;
     // Header claims cannot enlarge a budget or trigger an allocation.
     limits.validate()?;
     let staging = layout.fresh_staging_path();
@@ -844,19 +923,44 @@ pub(crate) fn stream_to_staging(
     limits: PutLimits,
 ) -> Result<crate::digest_set::DigestSet, PutError> {
     let mut file = fs::File::create(staging).map_err(io_err("create-staging"))?;
+    // The ordinary put validates before creating its path; journal callers
+    // also need this check before any bytes are consumed from their source.
+    limits.validate()?;
     let mut writer = StreamingObjectWriter::new(DigestRequest::default(), limits.expected_size);
-    let mut buffer = vec![0_u8; 64 * 1024];
-    let mut total: u64 = 0;
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut total = 0_u64;
+    let ceiling = match (limits.max_logical_bytes, limits.expected_size) {
+        (Some(cap), Some(expected)) => Some(cap.min(expected)),
+        (cap, expected) => cap.or(expected),
+    };
     loop {
-        let n = reader.read(&mut buffer).map_err(io_err("read-source"))?;
+        let read_len = ceiling.map_or(buffer.len(), |cap| {
+            cap.saturating_sub(total)
+                .saturating_add(1)
+                .min(buffer.len() as u64) as usize
+        });
+        let n = match reader.read(&mut buffer[..read_len]) {
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            result => result.map_err(io_err("read-source"))?,
+        };
         if n == 0 {
             break;
         }
-        total = total.saturating_add(n as u64);
+        total = total
+            .checked_add(n as u64)
+            .ok_or(PutError::Digest(DigestError::SizeOverflow))?;
         if let Some(limit) = limits.max_logical_bytes
             && total > limit
         {
             return Err(PutError::LogicalLimitExceeded { limit });
+        }
+        if let Some(expected) = limits.expected_size
+            && total > expected
+        {
+            return Err(PutError::Digest(DigestError::LogicalSizeMismatch {
+                expected,
+                actual: total,
+            }));
         }
         writer.write(&buffer[..n]).map_err(PutError::Digest)?;
         file.write_all(&buffer[..n])
@@ -1287,7 +1391,10 @@ mod tests {
             DurabilityPolicy::FULL,
         )
         .unwrap();
-        let PutOutcome::Stored { path: encoded_path } = outcome else {
+        let PutOutcome::Stored {
+            path: encoded_path,
+        } = outcome
+        else {
             panic!("encoded put must store");
         };
 
@@ -1327,7 +1434,10 @@ mod tests {
             DurabilityPolicy::FULL,
         )
         .unwrap();
-        assert_eq!(again, PutOutcome::IdempotentDuplicate { path: encoded_path });
+        assert_eq!(
+            again,
+            PutOutcome::IdempotentDuplicate { path: encoded_path }
+        );
         assert_eq!(fs::read_dir(layout.staging_dir()).unwrap().count(), 0);
     }
 
@@ -1752,17 +1862,19 @@ mod tests {
             remaining: &encoded,
             interrupted: false,
         };
-        assert!(put_encoded_representation(
-            &layout,
-            &mut store,
-            &id_of(b"retried"),
-            "xor-v1",
-            &mut source,
-            &xor_decoder,
-            ENCODED_LIMITS,
-            DurabilityPolicy::FULL,
-        )
-        .is_ok());
+        assert!(
+            put_encoded_representation(
+                &layout,
+                &mut store,
+                &id_of(b"retried"),
+                "xor-v1",
+                &mut source,
+                &xor_decoder,
+                ENCODED_LIMITS,
+                DurabilityPolicy::FULL,
+            )
+            .is_ok()
+        );
         assert_eq!(fs::read_dir(layout.staging_dir()).unwrap().count(), 0);
     }
 
@@ -1787,6 +1899,296 @@ mod tests {
         }));
         assert!(result.is_err());
         assert_encoded_refusal_clean(&layout, &mut store);
+    }
+
+    #[test]
+    fn h030_unsafe_or_reserved_profiles_refuse_before_source_io() {
+        let too_long = "x".repeat(97);
+        for profile in [
+            "",
+            "raw",
+            "raw-v1",
+            ".",
+            "..",
+            "zstd.v1",
+            "../escape",
+            "x/../../escape",
+            "x\\escape",
+            "x y",
+            "x\0y",
+            "zst\u{00e9}",
+            &too_long,
+        ] {
+            let layout = BlobStoreLayout::open(&fresh_root("unsafe-profile")).unwrap();
+            let mut store = store();
+            let before = store.differential_snapshot().unwrap();
+            let mut source = std::io::Cursor::new(b"must not be read");
+            assert_eq!(
+                put_encoded_representation(
+                    &layout,
+                    &mut store,
+                    &id_of(b"unused"),
+                    profile,
+                    &mut source,
+                    &xor_decoder,
+                    ENCODED_LIMITS,
+                    DurabilityPolicy::FULL,
+                ),
+                Err(PutError::InvalidStorageProfile {
+                    profile: profile.to_owned(),
+                })
+            );
+            assert_eq!(source.position(), 0, "profile {profile:?}");
+            assert_eq!(store.differential_snapshot().unwrap(), before);
+            assert_encoded_refusal_clean(&layout, &mut store);
+        }
+    }
+
+    #[test]
+    fn h030_longest_safe_profile_has_an_unambiguous_bounded_filename() {
+        let layout = BlobStoreLayout::open(&fresh_root("safe-profile")).unwrap();
+        let mut store = store();
+        let profile = format!("zstd_{}-v1", "x".repeat(88));
+        assert_eq!(profile.len(), 96);
+        let encoded = xor_encode(b"object");
+        let (_, outcome) = put_encoded_representation(
+            &layout,
+            &mut store,
+            &id_of(b"object"),
+            &profile,
+            &mut encoded.as_slice(),
+            &xor_decoder,
+            ENCODED_LIMITS,
+            DurabilityPolicy::FULL,
+        )
+        .unwrap();
+        let PutOutcome::Stored { path } = outcome else {
+            panic!("valid profile must publish");
+        };
+        let path = Path::new(&path);
+        assert!(path.starts_with(layout.objects_dir()));
+        assert_eq!(path.file_name().unwrap().len(), 226);
+        assert_eq!(store.reconciliation_scan().unwrap()[0].encoding, profile);
+        assert_no_partial_published(&layout);
+    }
+
+    #[test]
+    fn h003_staged_publication_rechecks_digest_and_preserves_bad_source() {
+        let layout = BlobStoreLayout::open(&fresh_root("staged-mismatch")).unwrap();
+        let mut store = store();
+        let before = store.differential_snapshot().unwrap();
+        let staging = layout.staging_dir().join("recovery-candidate");
+        fs::write(&staging, b"changed since the journal verified it").unwrap();
+        assert!(matches!(
+            publish_staged(
+                &layout,
+                &mut store,
+                &id_of(b"previous bytes"),
+                &staging,
+                DurabilityPolicy::FULL,
+            ),
+            Err(PutError::DeclaredDigestMismatch { .. })
+        ));
+        assert_eq!(
+            fs::read(staging).unwrap(),
+            b"changed since the journal verified it"
+        );
+        assert_eq!(store.differential_snapshot().unwrap(), before);
+        assert_eq!(fs::read_dir(layout.objects_dir()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn h003_staged_publication_refuses_directories_without_mutation() {
+        let layout = BlobStoreLayout::open(&fresh_root("staged-directory")).unwrap();
+        let mut store = store();
+        let staging = layout.staging_dir().join("not-a-file");
+        fs::create_dir(&staging).unwrap();
+        assert_eq!(
+            publish_staged(
+                &layout,
+                &mut store,
+                &id_of(b""),
+                &staging,
+                DurabilityPolicy::FULL,
+            ),
+            Err(PutError::NonRegularStagingFile {
+                path: staging.to_string_lossy().into_owned(),
+            })
+        );
+        assert!(staging.is_dir());
+        assert!(store.reconciliation_scan().unwrap().is_empty());
+        assert_eq!(fs::read_dir(layout.objects_dir()).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn h003_staged_symlink_cannot_publish_even_when_its_target_matches() {
+        let layout = BlobStoreLayout::open(&fresh_root("staged-symlink")).unwrap();
+        let mut store = store();
+        let outside = layout.root().join("outside-staging");
+        let staging = layout.staging_dir().join("linked-candidate");
+        let bytes = b"correct bytes in a mutable outside file";
+        fs::write(&outside, bytes).unwrap();
+        std::os::unix::fs::symlink(&outside, &staging).unwrap();
+        assert!(matches!(
+            publish_staged(
+                &layout,
+                &mut store,
+                &id_of(bytes),
+                &staging,
+                DurabilityPolicy::FULL,
+            ),
+            Err(PutError::NonRegularStagingFile { .. })
+        ));
+        assert!(fs::symlink_metadata(staging).unwrap().is_symlink());
+        assert_eq!(fs::read(outside).unwrap(), bytes);
+        assert!(store.reconciliation_scan().unwrap().is_empty());
+        assert_eq!(fs::read_dir(layout.objects_dir()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn h003_verified_staged_objects_publish_and_deduplicate() {
+        for size in [0, 131_073] {
+            let layout = BlobStoreLayout::open(&fresh_root("staged-valid")).unwrap();
+            let mut store = store();
+            let bytes = vec![19_u8; size];
+            let declared = id_of(&bytes);
+            let staging = layout.staging_dir().join("recovered");
+            let mut published = None;
+            for duplicate in [false, true] {
+                fs::write(&staging, &bytes).unwrap();
+                let outcome = publish_staged(
+                    &layout,
+                    &mut store,
+                    &declared,
+                    &staging,
+                    DurabilityPolicy::FULL,
+                )
+                .unwrap();
+                let path = match outcome {
+                    PutOutcome::Stored { path } if !duplicate => path,
+                    PutOutcome::IdempotentDuplicate { path } if duplicate => path,
+                    other => panic!("unexpected staged publish outcome {other:?}"),
+                };
+                if let Some(previous) = published.replace(path.clone()) {
+                    assert_eq!(previous, path);
+                }
+                assert_eq!(fs::read(path).unwrap(), bytes);
+                assert!(!staging.exists());
+            }
+            assert!(store.object_located(&declared).unwrap());
+            assert_no_partial_published(&layout);
+        }
+    }
+
+    #[test]
+    fn h003_raw_budgets_stop_after_one_overrun_byte() {
+        for (limits, error, consumed) in [
+            (
+                PutLimits {
+                    max_logical_bytes: Some(3),
+                    expected_size: None,
+                },
+                PutError::LogicalLimitExceeded { limit: 3 },
+                4,
+            ),
+            (
+                PutLimits {
+                    max_logical_bytes: None,
+                    expected_size: Some(3),
+                },
+                PutError::Digest(DigestError::LogicalSizeMismatch {
+                    expected: 3,
+                    actual: 4,
+                }),
+                4,
+            ),
+            (
+                PutLimits {
+                    max_logical_bytes: Some(0),
+                    expected_size: Some(0),
+                },
+                PutError::LogicalLimitExceeded { limit: 0 },
+                1,
+            ),
+        ] {
+            let layout = BlobStoreLayout::open(&fresh_root("raw-early-limit")).unwrap();
+            let mut store = store();
+            let mut source = std::io::repeat(1).take(1_000_000);
+            assert_eq!(
+                put_if_absent(
+                    &layout,
+                    &mut store,
+                    &id_of(b"unused"),
+                    &mut source,
+                    limits,
+                    DurabilityPolicy::FULL,
+                ),
+                Err(error)
+            );
+            assert_eq!(source.limit(), 1_000_000 - consumed);
+            assert_encoded_refusal_clean(&layout, &mut store);
+        }
+    }
+
+    #[test]
+    fn h003_raw_oversized_header_refuses_before_source_io() {
+        let layout = BlobStoreLayout::open(&fresh_root("raw-header-limit")).unwrap();
+        let mut store = store();
+        let mut source = std::io::Cursor::new(b"not consumed");
+        assert_eq!(
+            put_if_absent(
+                &layout,
+                &mut store,
+                &id_of(b"unused"),
+                &mut source,
+                PutLimits {
+                    max_logical_bytes: Some(3),
+                    expected_size: Some(4),
+                },
+                DurabilityPolicy::FULL,
+            ),
+            Err(PutError::LogicalLimitExceeded { limit: 3 })
+        );
+        assert_eq!(source.position(), 0);
+        assert_encoded_refusal_clean(&layout, &mut store);
+    }
+
+    #[test]
+    fn h003_raw_exact_caps_and_interrupted_reads_remain_valid() {
+        struct InterruptedOnce<'a>(bool, &'a [u8]);
+        impl Read for InterruptedOnce<'_> {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                if !self.0 {
+                    self.0 = true;
+                    return Err(std::io::ErrorKind::Interrupted.into());
+                }
+                self.1.read(buffer)
+            }
+        }
+        for size in [0, 131_073] {
+            let bytes = vec![19_u8; size];
+            let layout = BlobStoreLayout::open(&fresh_root("raw-exact-limits")).unwrap();
+            let mut store = store();
+            let mut source = InterruptedOnce(false, &bytes);
+            assert!(
+                put_if_absent(
+                    &layout,
+                    &mut store,
+                    &id_of(&bytes),
+                    &mut source,
+                    PutLimits {
+                        max_logical_bytes: Some(size as u64),
+                        expected_size: Some(size as u64),
+                    },
+                    DurabilityPolicy::FULL,
+                )
+                .is_ok()
+            );
+            assert!(source.1.is_empty());
+            assert_eq!(fs::read_dir(layout.staging_dir()).unwrap().count(), 0);
+            assert_no_partial_published(&layout);
+        }
     }
 
     #[test]
