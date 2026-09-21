@@ -71,6 +71,9 @@ pub enum SizingAdvice {
     },
     /// Hold current size.
     Hold,
+    /// The pool is hot but already has `u32::MAX` workers. No larger
+    /// size is representable; this is not a healthy hold recommendation.
+    CapacityLimitReached,
 }
 
 /// One report row.
@@ -78,7 +81,8 @@ pub enum SizingAdvice {
 pub struct PoolReport {
     /// The family.
     pub family: PoolFamily,
-    /// Utilization, permille.
+    /// Utilization in whole permille, rounded down and capped at
+    /// `u64::MAX`. Advice uses the exact ratio before this narrowing.
     pub utilization_permille: u64,
     /// The advice.
     pub advice: SizingAdvice,
@@ -96,19 +100,27 @@ pub const TARGET_UTILIZATION: u64 = 600;
 /// Produce the advisory report for one pool.
 #[must_use]
 pub fn advise(observation: &PoolObservation) -> PoolReport {
-    let capacity =
-        u64::from(observation.current_size.max(1)) * observation.service_rate_permille.max(1);
-    let utilization_permille = observation.arrival_rate_permille * 1000 / capacity;
-    // Size that lands utilization at the target.
-    let target_size = (observation.arrival_rate_permille * 1000
-        / (TARGET_UTILIZATION * observation.service_rate_permille.max(1)))
-    .max(1);
+    // Rates are u64 and sizes u32; their products and the threshold
+    // comparisons fit in u128. Keep the existing one-unit service floor.
+    let service = u128::from(observation.service_rate_permille.max(1));
+    let capacity = u128::from(observation.current_size.max(1)) * service;
+    let scaled_arrival = u128::from(observation.arrival_rate_permille) * 1_000;
+    let utilization_permille = u64::try_from(scaled_arrival / capacity).unwrap_or(u64::MAX);
+    // The minimum whole-worker size meeting the target must round UP.
+    // Rounding down can turn a cold pool into an overloaded pool on shrink.
+    let target_size = scaled_arrival
+        .div_ceil(u128::from(TARGET_UTILIZATION) * service)
+        .max(1);
     let target_size = u32::try_from(target_size).unwrap_or(u32::MAX);
-    let advice = if utilization_permille > HOT_THRESHOLD {
-        SizingAdvice::Grow {
-            to: target_size.max(observation.current_size + 1),
+    let needs_first_worker = observation.current_size == 0 && observation.arrival_rate_permille > 0;
+    let advice = if scaled_arrival > u128::from(HOT_THRESHOLD) * capacity || needs_first_worker {
+        match observation.current_size.checked_add(1) {
+            Some(next_size) => SizingAdvice::Grow {
+                to: target_size.max(next_size),
+            },
+            None => SizingAdvice::CapacityLimitReached,
         }
-    } else if utilization_permille < COLD_THRESHOLD && observation.current_size > 1 {
+    } else if scaled_arrival < u128::from(COLD_THRESHOLD) * capacity && observation.current_size > 1 {
         SizingAdvice::Shrink {
             to: target_size.min(observation.current_size - 1).max(1),
         }
@@ -117,7 +129,7 @@ pub fn advise(observation: &PoolObservation) -> PoolReport {
     };
     // Confidence earned by observations: 0 obs = 0; caps at 950 —
     // advisory output never claims certainty.
-    let confidence = (observation.observations * 10).min(950);
+    let confidence = observation.observations.saturating_mul(10).min(950);
     PoolReport {
         family: observation.family,
         utilization_permille,
@@ -210,5 +222,126 @@ mod tests {
             advice: _,
             confidence_permille: _,
         } = advise(&fresh);
+    }
+
+    #[test]
+    fn rounding_up_prevents_shrinking_a_cold_pool_into_overload() {
+        for family in PoolFamily::ALL {
+            let mut load = observation(family, 4, 1_100, 1_000, 100);
+            let report = advise(&load);
+            assert_eq!(report.utilization_permille, 275);
+            assert_eq!(report.advice, SizingAdvice::Shrink { to: 2 });
+            // The old floor recommended one worker: utilization 1100.
+            // Applying the advisory size in this model should instead hold
+            // within the target band, not immediately call for more workers.
+            load.current_size = 2;
+            assert_eq!(advise(&load).utilization_permille, 550);
+            assert_eq!(advise(&load).advice, SizingAdvice::Hold);
+        }
+    }
+
+    #[test]
+    fn utilization_thresholds_are_compared_before_display_rounding() {
+        for (arrival, advice) in [
+            (1_199, SizingAdvice::Shrink { to: 2 }),
+            (1_200, SizingAdvice::Hold),
+            (3_200, SizingAdvice::Hold),
+            (3_201, SizingAdvice::Grow { to: 6 }),
+        ] {
+            let load = observation(PoolFamily::CompilerActions, 4, arrival, 1_000, 100);
+            assert_eq!(advise(&load).advice, advice, "arrival={arrival}");
+        }
+        let barely_hot = observation(PoolFamily::CompilerActions, 4, 3_201, 1_000, 100);
+        assert_eq!(advise(&barely_hot).utilization_permille, 800);
+    }
+
+    #[test]
+    fn full_width_rates_and_capacity_keep_their_exact_quotients() {
+        for (size, utilization, advice) in [
+            (1, 1_000, SizingAdvice::Grow { to: 2 }),
+            (4, 250, SizingAdvice::Shrink { to: 2 }),
+            (u32::MAX, 0, SizingAdvice::Shrink { to: 2 }),
+        ] {
+            let load = observation(PoolFamily::HashingWorkers, size, u64::MAX, u64::MAX, 100);
+            let report = advise(&load);
+            assert_eq!(report.utilization_permille, utilization);
+            assert_eq!(report.advice, advice);
+        }
+    }
+
+    #[test]
+    fn a_hot_maximum_size_pool_reports_the_limit_instead_of_wrapping() {
+        let load = observation(PoolFamily::CasWriters, u32::MAX, u64::MAX, 1, 100);
+        let report = advise(&load);
+        assert_eq!(report.advice, SizingAdvice::CapacityLimitReached);
+        // (2^64 - 1) / (2^32 - 1) = 2^32 + 1.
+        assert_eq!(report.utilization_permille, 4_294_967_297_000);
+    }
+
+    #[test]
+    fn oversized_reports_and_targets_saturate_only_after_exact_calculation() {
+        let load = observation(PoolFamily::Linkers, 1, u64::MAX, 1, u64::MAX);
+        let report = advise(&load);
+        assert_eq!(report.utilization_permille, u64::MAX);
+        assert_eq!(report.advice, SizingAdvice::Grow { to: u32::MAX });
+        assert_eq!(report.confidence_permille, 950);
+    }
+
+    #[test]
+    fn confidence_never_wraps_or_exceeds_its_evidence_cap() {
+        for (samples, confidence) in [
+            (0, 0),
+            (1, 10),
+            (94, 940),
+            (95, 950),
+            (u64::MAX / 10 + 1, 950),
+            (u64::MAX, 950),
+        ] {
+            let load = observation(PoolFamily::TestProcesses, 1, 1, 1, samples);
+            assert_eq!(advise(&load).confidence_permille, confidence);
+        }
+    }
+
+    #[test]
+    fn a_nonempty_arrival_stream_needs_a_worker_even_below_the_hot_threshold() {
+        let idle = observation(PoolFamily::NativeBuilds, 0, 0, 0, 0);
+        assert_eq!(advise(&idle).advice, SizingAdvice::Hold);
+        assert_eq!(advise(&idle).utilization_permille, 0);
+        for service in [0, 1_000, u64::MAX] {
+            let load = observation(PoolFamily::NativeBuilds, 0, 1, service, 10);
+            let expected = if service == 0 { 2 } else { 1 };
+            assert_eq!(advise(&load).advice, SizingAdvice::Grow { to: expected });
+        }
+    }
+
+    #[test]
+    fn small_recommendations_match_a_minimum_worker_search() {
+        for size in 1..=10_u32 {
+            for service in 1..=10_u64 {
+                for arrival in 0..=50_u64 {
+                    let load =
+                        observation(PoolFamily::CompilerActions, size, arrival, service, 100);
+                    let report = advise(&load);
+                    // Enumerate candidates instead of duplicating div_ceil.
+                    let target = (1..=100_u32)
+                        .find(|n| u64::from(*n) * service * 600 >= arrival * 1_000)
+                        .unwrap();
+                    let capacity = u64::from(size) * service;
+                    let expected = if arrival * 1_000 > capacity * 800 {
+                        assert!(target > size);
+                        SizingAdvice::Grow { to: target }
+                    } else if arrival * 1_000 < capacity * 300 && size > 1 {
+                        assert!(target < size);
+                        SizingAdvice::Shrink { to: target }
+                    } else {
+                        SizingAdvice::Hold
+                    };
+                    assert_eq!(
+                        report.advice, expected,
+                        "size={size}, service={service}, arrival={arrival}"
+                    );
+                }
+            }
+        }
     }
 }
