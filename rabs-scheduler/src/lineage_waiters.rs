@@ -119,6 +119,16 @@ pub enum WaiterAdmission {
         /// The budget they may fill.
         waiter_budget: u32,
     },
+    /// Producers and waiters already occupy the whole root, even
+    /// though the waiter-class budget may still have room.
+    AllSlotsOccupied {
+        /// Active producers at refusal time.
+        active_producers: u32,
+        /// Active waiters at refusal time.
+        active_waiters: u32,
+        /// Total slots of the root.
+        total: u32,
+    },
     /// The waiter's transitive depth exceeds the bound.
     DepthBeyondBound {
         /// The offered depth.
@@ -141,13 +151,24 @@ impl LineageWaiterBoard {
         }
     }
 
-    /// Admit an UNRESOLVED PRODUCER attempt. Producers outrank
-    /// waiters by construction: admission consults only total slots —
-    /// never the waiter count — so waiter pressure can never queue-
-    /// refuse a producer while any slot exists.
+    /// Slots not occupied by either class. Subtract separately so
+    /// accounting never depends on an overflowing occupancy sum.
+    fn remaining_slots(&self) -> u32 {
+        self.budget
+            .total_slots()
+            .saturating_sub(self.active_producers)
+            .saturating_sub(self.active_waiters)
+    }
+
+    /// Admit an UNRESOLVED PRODUCER attempt. Producers may use any
+    /// unoccupied slot, including capacity beyond their reserve;
+    /// unlike waiters, they have no additional class-specific cap.
+    ///
+    /// # Errors
+    /// [`ProducerAdmissionRefusal::AllSlotsOccupied`] when the root is full.
     pub fn admit_producer(&mut self) -> Result<(), ProducerAdmissionRefusal> {
         let total = self.budget.total_slots();
-        if self.active_producers + self.active_waiters >= total {
+        if self.remaining_slots() == 0 {
             return Err(ProducerAdmissionRefusal::AllSlotsOccupied { total });
         }
         self.active_producers += 1;
@@ -160,8 +181,8 @@ impl LineageWaiterBoard {
     }
 
     /// Admit a lineage-waiting wrapper with its transitive depth.
-    /// Refused when the depth bound is exceeded or when parking would
-    /// consume the producer reserve.
+    /// Refused when the depth bound is exceeded, parking would consume
+    /// the producer reserve, or producers and waiters fill the root.
     pub fn admit_waiter(&mut self, transitive_depth: u32) -> WaiterAdmission {
         if transitive_depth > self.max_transitive_depth {
             return WaiterAdmission::DepthBeyondBound {
@@ -169,10 +190,17 @@ impl LineageWaiterBoard {
                 bound: self.max_transitive_depth,
             };
         }
-        if self.active_waiters + 1 > self.budget.waiter_budget() {
+        if self.active_waiters >= self.budget.waiter_budget() {
             return WaiterAdmission::WaiterBudgetExhausted {
                 active_waiters: self.active_waiters,
                 waiter_budget: self.budget.waiter_budget(),
+            };
+        }
+        if self.remaining_slots() == 0 {
+            return WaiterAdmission::AllSlotsOccupied {
+                active_producers: self.active_producers,
+                active_waiters: self.active_waiters,
+                total: self.budget.total_slots(),
             };
         }
         self.active_waiters += 1;
@@ -186,13 +214,15 @@ impl LineageWaiterBoard {
 
     /// How many additional provisional-metadata REPLAYS may start right
     /// now: replay traffic occupies the same bounded lanes as waiters
-    /// and STOPS at the waiter-budget edge — it can never consume the
-    /// producer reserve (R112).
+    /// and STOPS at either the waiter-budget edge or total occupancy.
+    /// Producers may borrow non-reserved slots; that occupied capacity
+    /// is unavailable for replay, even below the waiter quota (R112).
     #[must_use]
     pub fn remaining_replay_capacity(&self) -> u32 {
         self.budget
             .waiter_budget()
             .saturating_sub(self.active_waiters)
+            .min(self.remaining_slots())
     }
 
     /// Active producers (the prioritized class).
@@ -298,8 +328,8 @@ mod tests {
         b.admit_waiter(3);
         assert_eq!(b.remaining_replay_capacity(), 0);
         // At zero, further replays MUST NOT proceed — the reserve is
-        // untouchable by construction (capacity is derived from the
-        // waiter budget alone).
+        // untouchable by construction (capacity is capped by the
+        // waiter budget as well as total occupancy).
         assert_eq!(b.remaining_replay_capacity(), 0);
         // Producers still admit.
         assert!(b.admit_producer().is_ok());
@@ -334,5 +364,164 @@ mod tests {
             b.admit_producer(),
             Err(ProducerAdmissionRefusal::AllSlotsOccupied { total: 6 })
         );
+    }
+
+    #[test]
+    fn producer_saturation_refuses_waiters_and_stops_replay() {
+        let mut b = board();
+        for _ in 0..6 {
+            b.admit_producer().expect("free root slot");
+        }
+        assert_eq!(b.remaining_replay_capacity(), 0);
+        let before = b.clone();
+        assert_eq!(
+            b.admit_waiter(1),
+            WaiterAdmission::AllSlotsOccupied {
+                active_producers: 6,
+                active_waiters: 0,
+                total: 6,
+            }
+        );
+        assert_eq!(b, before, "a refused waiter consumes nothing");
+
+        b.release_producer();
+        assert_eq!(b.remaining_replay_capacity(), 1);
+        assert_eq!(b.admit_waiter(1), WaiterAdmission::Parked);
+        assert_eq!((b.active_producers(), b.active_waiters()), (5, 1));
+        assert_eq!(b.remaining_replay_capacity(), 0);
+    }
+
+    #[test]
+    fn producer_borrowing_and_releases_share_one_total_budget() {
+        let mut b = board();
+        for _ in 0..4 {
+            b.admit_producer().expect("producers may borrow waiter lanes");
+        }
+        // Four nominal waiter lanes, but only two are unoccupied.
+        assert_eq!(b.remaining_replay_capacity(), 2);
+        assert_eq!(b.admit_waiter(1), WaiterAdmission::Parked);
+        assert_eq!(b.remaining_replay_capacity(), 1);
+        assert_eq!(b.admit_waiter(2), WaiterAdmission::Parked);
+        assert_eq!(b.remaining_replay_capacity(), 0);
+        assert_eq!(
+            b.admit_waiter(3),
+            WaiterAdmission::AllSlotsOccupied {
+                active_producers: 4,
+                active_waiters: 2,
+                total: 6,
+            }
+        );
+
+        b.release_waiter();
+        assert_eq!(b.remaining_replay_capacity(), 1);
+        b.admit_producer().expect("released slot can serve a producer");
+        assert_eq!(b.remaining_replay_capacity(), 0);
+        b.release_producer();
+        b.release_producer();
+        assert_eq!(b.remaining_replay_capacity(), 2);
+        assert_eq!(b.admit_waiter(3), WaiterAdmission::Parked);
+        assert_eq!((b.active_producers(), b.active_waiters()), (3, 2));
+    }
+
+    #[test]
+    fn every_small_occupancy_obeys_both_limits_after_each_operation() {
+        // Cover every legal occupancy and reserve split, not just the
+        // waiter-first admission order. Each transition starts from the
+        // same reachable state and is checked against independent counts.
+        for total in 2..=12 {
+            for reserve in 1..total {
+                let budget = RootProgressBudget::new(total, reserve).unwrap();
+                for producers in 0..=total {
+                    for waiters in 0..=(total - reserve).min(total - producers) {
+                        let mut b = LineageWaiterBoard::new(budget, 3);
+                        for _ in 0..producers {
+                            b.admit_producer().unwrap();
+                        }
+                        for _ in 0..waiters {
+                            assert_eq!(b.admit_waiter(1), WaiterAdmission::Parked);
+                        }
+                        let free = total - producers - waiters;
+                        let quota = total - reserve - waiters;
+                        assert_eq!(b.remaining_replay_capacity(), free.min(quota));
+
+                        let mut next = b.clone();
+                        let expected = if quota == 0 {
+                            WaiterAdmission::WaiterBudgetExhausted {
+                                active_waiters: waiters,
+                                waiter_budget: total - reserve,
+                            }
+                        } else if free == 0 {
+                            WaiterAdmission::AllSlotsOccupied {
+                                active_producers: producers,
+                                active_waiters: waiters,
+                                total,
+                            }
+                        } else {
+                            WaiterAdmission::Parked
+                        };
+                        assert_eq!(next.admit_waiter(1), expected);
+                        if expected == WaiterAdmission::Parked {
+                            assert_eq!(next.active_waiters(), waiters + 1);
+                            assert_eq!(next.remaining_replay_capacity(), free.min(quota) - 1);
+                        } else {
+                            assert_eq!(next, b, "refusals must not change accounting");
+                        }
+
+                        let mut next = b.clone();
+                        assert_eq!(next.admit_producer().is_ok(), free > 0);
+                        if free == 0 {
+                            assert_eq!(next, b);
+                        } else {
+                            assert_eq!(next.active_producers(), producers + 1);
+                            assert_eq!(
+                                next.remaining_replay_capacity(),
+                                (free - 1).min(quota)
+                            );
+                        }
+
+                        let mut next = b.clone();
+                        next.release_producer();
+                        let released = u32::from(producers > 0);
+                        assert_eq!(next.active_producers(), producers - released);
+                        assert_eq!(
+                            next.remaining_replay_capacity(),
+                            (free + released).min(quota)
+                        );
+
+                        let mut next = b.clone();
+                        next.release_waiter();
+                        let released = u32::from(waiters > 0);
+                        assert_eq!(next.active_waiters(), waiters - released);
+                        assert_eq!(next.remaining_replay_capacity(), free.min(quota) + released);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn full_u32_capacity_cannot_wrap_into_an_available_slot() {
+        // Seed a reachable boundary state without billions of admissions.
+        let mut b = LineageWaiterBoard::new(RootProgressBudget::new(u32::MAX, 1).unwrap(), 3);
+        b.active_producers = u32::MAX - 1;
+        b.active_waiters = 1;
+        assert_eq!(b.remaining_replay_capacity(), 0);
+        assert_eq!(
+            b.admit_waiter(1),
+            WaiterAdmission::AllSlotsOccupied {
+                active_producers: u32::MAX - 1,
+                active_waiters: 1,
+                total: u32::MAX,
+            }
+        );
+        assert_eq!(
+            b.admit_producer(),
+            Err(ProducerAdmissionRefusal::AllSlotsOccupied { total: u32::MAX })
+        );
+        b.release_waiter();
+        assert_eq!(b.remaining_replay_capacity(), 1);
+        b.admit_producer().unwrap();
+        assert_eq!(b.active_producers(), u32::MAX);
+        assert_eq!(b.remaining_replay_capacity(), 0);
     }
 }
