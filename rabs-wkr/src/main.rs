@@ -9,12 +9,12 @@
 //!
 //! CLI: rabs-wkr --coordinator <host:port> [--worker-id ID] [--once]
 //! `--once` waits for every negotiated output/artifact acceptance before exiting.
+//! Otherwise the worker reconnects after session loss without replaying execution.
 //! Durable worker/endpoint admission survives restarts. Request-status reconciles
 //! outcome metadata; result-resume restores sealed captures without authorizing a rerun.
 
 use asupersync::cx::Cx;
 use asupersync::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use asupersync::runtime::RuntimeBuilder;
 use rabs_wkr::artifacts::{self, ARTIFACT_TRANSFER, ArtifactPlan, ArtifactTransferState, CapturedArtifacts};
 use rabs_wkr::execution::{DEFAULT_EXECUTION_TIMEOUT, ExecutionCompletion, ExecutionTask, StopReason};
 use rabs_wkr::output::{CapturedOutputs, MAX_OUTPUT_CHUNK_BYTES};
@@ -27,6 +27,8 @@ use std::path::PathBuf;
 use std::pin::pin;
 use std::task::Poll;
 use std::time::Duration;
+
+mod reconnect;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const MAX_FRAME_BYTES: usize = 1 << 20;
@@ -76,6 +78,8 @@ fn main() {
                 "rabs-wkr {VERSION} — RABS trusted worker daemon\n\
                  USAGE: rabs-wkr --coordinator <host:port> [--worker-id ID] [--once]\n\
                  Serves canonical-exec requests through the sandbox launcher; offers results, never commits.\n\
+                 Reconnects with bounded backoff after session loss; execution is never replayed.\n\
+                 --once performs one session only, without reconnecting.\n\
                  Select output_transfer=ranges-v1 and artifact_transfer=files-v1 in session-ok\n\
                  to retrieve diagnostics and declared compiled artifacts.\n\
                  Select result_retention=durable-result-v1 to retain complete results until acceptance.\n\
@@ -109,7 +113,7 @@ fn main() {
     };
     // Persist ownership before any runtime task or network advertisement. An IO
     // error never falls back to a fresh temporary journal that forgets history.
-    let mut journal = match worker_state_path(&worker_id, &coordinator)
+    let journal = match worker_state_path(&worker_id, &coordinator)
         .and_then(|root| WorkerJournal::open(&root, &worker_id, &coordinator))
     {
         Ok(journal) => journal,
@@ -123,21 +127,7 @@ fn main() {
         "{{\"v\":1,\"kind\":\"rabs-wkr-boot\",\"worker_id\":{},\"canonical\":{},\"slots\":{}}}",
         json_string(&report.worker_id), report.canonical_namespace, report.slots
     );
-    let runtime = match RuntimeBuilder::current_thread().build() {
-        Ok(runtime) => runtime,
-        Err(error) => { eprintln!("rabs-wkr: runtime build failed: {error:?}"); std::process::exit(1); }
-    };
-    let handle = runtime.handle();
-    let exit_code: i32 = runtime.block_on(async move {
-        handle.spawn(async move {
-            let cx = Cx::current().expect("runtime task Cx");
-            match session_loop(&cx, &coordinator, &report, once, &mut journal).await {
-                Ok(()) => 0,
-                Err(error) => { eprintln!("rabs-wkr: session ended: {error}"); 1 }
-            }
-        }).await
-    });
-    std::process::exit(exit_code);
+    std::process::exit(reconnect::run(coordinator, report, once, journal));
 }
 
 /// Partial input belongs to the session, not to a disposable read future.
@@ -551,13 +541,14 @@ fn worker_hello(report: &rabs_wkr::session::CapabilityReport, journal: &WorkerJo
         "boot_generation": journal.boot_generation().0,
         "incarnation": format!("{:032x}", journal.incarnation().0),
         "request_high_water": journal.high_water(),
+        "retained_result_available": journal.has_retained_result(),
         "request_id_policy": "worker-endpoint-monotonic",
     }).to_string()
 }
 
 async fn session_loop(
     cx: &Cx, coordinator: &str, report: &rabs_wkr::session::CapabilityReport, once: bool,
-    journal: &mut WorkerJournal,
+    journal: &mut WorkerJournal, admitted_at: &mut Option<std::time::Instant>,
 ) -> Result<(), String> {
     let mut stream = rabs_asupersync::worker_transport::connect_worker(coordinator).await?;
     cx.trace("rabs-wkr connected to coordinator");
@@ -649,6 +640,7 @@ async fn session_loop(
     let journal_root = journal.storage_root().to_path_buf();
     journal.clear_result_recipient();
     if retain_result { journal.authorize_result_recipient(recipient.clone()); }
+    *admitted_at = Some(std::time::Instant::now());
     let outcome = drive_session(&mut stream, report, once, Some(&mut *journal), capture_artifacts, |request, timeout, artifacts| {
         let cargo_home = cargo_home.clone(); let home = home.clone(); let spills = spills.clone();
         let slots = report.slots;

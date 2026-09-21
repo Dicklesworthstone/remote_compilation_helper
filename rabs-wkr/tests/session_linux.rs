@@ -122,17 +122,17 @@ fn orchestrated_canonical_exec_reports_d005_sysroot() {
 }
 
 #[test]
-fn handshake_carries_real_capability_and_worker_exits_on_close() {
+fn handshake_carries_real_capability_and_once_worker_exits_on_close() {
     if !canonical_supported() {
         eprintln!("SKIP: canonical namespace unavailable on this host");
         return;
     }
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap().to_string();
-    // No --once: verify the worker ends cleanly when the coordinator
-    // drops the connection (session survives, exits, no orphan).
+    // One-shot sessions still exit cleanly on peer close. Persistent default
+    // reconnection is separately exercised by reconnect_live.rs.
     let mut worker = Command::new(worker_bin())
-        .args(["--coordinator", &addr, "--worker-id", "close-test"])
+        .args(["--coordinator", &addr, "--worker-id", "close-test", "--once"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -166,7 +166,7 @@ fn malformed_exec_request_does_not_tear_down_the_session() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap().to_string();
     let mut worker = Command::new(worker_bin())
-        .args(["--coordinator", &addr, "--worker-id", "robust-test"])
+        .args(["--coordinator", &addr, "--worker-id", "robust-test", "--once"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
