@@ -191,17 +191,25 @@ impl<S: AsyncWrite + Unpin> JsonAtpStream<S> {
     }
 
     fn flush_output(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.begin_write();
         self.check_live(cx)?;
         ready!(self.drain_output(cx))?;
-        match ready!(Pin::new(&mut self.io).poll_flush(cx)) {
-            Ok(()) => {
+        match Pin::new(&mut self.io).poll_flush(cx) {
+            Poll::Pending => {
+                // The driver requests one decoded byte at a time. An empty,
+                // ready flush must not allocate a fresh timer for EVERY byte.
+                // Actual writes already own a deadline; an idle flush starts
+                // one only when it would otherwise wait indefinitely.
+                self.begin_write();
+                self.check_live(cx)?;
+                Poll::Pending
+            }
+            Poll::Ready(Ok(())) => {
                 // Flushing an unfinished JSON prefix is not completion of its
                 // record and must not grant that prefix a fresh write budget.
                 if self.line.is_empty() { self.write_deadline = None; }
                 Poll::Ready(Ok(()))
             }
-            Err(error) => Poll::Ready(Err(self.poison(error))),
+            Poll::Ready(Err(error)) => Poll::Ready(Err(self.poison(error))),
         }
     }
 }
@@ -779,5 +787,45 @@ mod tests {
         stream.idle_deadline.as_mut().unwrap().until = Instant::now();
         assert!(matches!(read_once(&mut stream), Poll::Ready(Err(error))
             if error.kind() == io::ErrorKind::TimedOut));
+    }
+
+    #[test]
+    fn native_deadlines_wake_stalled_io_without_another_peer_event() {
+        use asupersync::io::{AsyncReadExt, AsyncWriteExt};
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+        let handle = runtime.handle();
+        runtime.block_on(async move {
+            handle.spawn(async move {
+                for writing in [false, true] {
+                    let mut stream = JsonAtpStream::new(Wire::default());
+                    if writing {
+                        let mut cx = Context::from_waker(Waker::noop());
+                        assert!(matches!(Pin::new(&mut stream).poll_write(&mut cx, b"{}\n"), Poll::Ready(Ok(3))));
+                        stream.io.blocked = true;
+                        stream.write_deadline = Some(FrameDeadline::new(Duration::from_millis(30)));
+                    } else {
+                        let bytes = encoded(br#"{"kind":"ping"}"#, FrameType::Control);
+                        stream.io.input.push_back(bytes[0]);
+                        assert!(read_once(&mut stream).is_pending());
+                        stream.read_deadline = Some(FrameDeadline::new(Duration::from_millis(30)));
+                    }
+                    // This wire sends no more bytes and supplies no wakeups.
+                    // The adapter's native timer must wake its own blocked IO;
+                    // a separately expiring watchdog is a FAILURE, not a pass.
+                    let operation = async {
+                        if writing { stream.flush().await }
+                        else {
+                            let mut byte = [0];
+                            stream.read(&mut byte).await.map(|_| ())
+                        }
+                    };
+                    let error = asupersync::time::timeout(
+                        asupersync::time::wall_now(), Duration::from_secs(1), operation,
+                    ).await.expect("connection timer did not wake stalled IO").unwrap_err();
+                    assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+                    assert!(stream.failed);
+                }
+            }).await
+        });
     }
 }
