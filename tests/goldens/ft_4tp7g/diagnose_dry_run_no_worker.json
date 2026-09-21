@@ -81,9 +81,7 @@
             "active_project_excluded": false,
             "final_decision": "deny",
             "final_reason": "critical pressure: disk_ratio_below_critical",
-            "reason_codes": [
-              "pressure.critical"
-            ]
+            "reason_codes": ["pressure.critical"]
           }
         ]
       }

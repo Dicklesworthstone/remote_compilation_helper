@@ -2,9 +2,7 @@
   "schema_version": "rch.golden.speedscore_list_status_shapes.v1",
   "volatility": {
     "platform_dependent": false,
-    "dynamic_fields_scrubbed": [
-      "measured_at"
-    ]
+    "dynamic_fields_scrubbed": ["measured_at"]
   },
   "raw_response": {
     "workers": [

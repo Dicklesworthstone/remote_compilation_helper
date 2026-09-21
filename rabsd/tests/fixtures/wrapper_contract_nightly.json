@@ -15,12 +15,7 @@
         "-C metadata"
       ],
       "error_format": "json",
-      "json": [
-        "artifacts",
-        "diagnostic-rendered-ansi",
-        "future-incompat",
-        "unused-externs-silent"
-      ]
+      "json": ["artifacts", "diagnostic-rendered-ansi", "future-incompat", "unused-externs-silent"]
     },
     "crate": {
       "flags": [
@@ -39,12 +34,7 @@
         "-C split-debuginfo"
       ],
       "error_format": "json",
-      "json": [
-        "artifacts",
-        "diagnostic-rendered-ansi",
-        "future-incompat",
-        "unused-externs-silent"
-      ]
+      "json": ["artifacts", "diagnostic-rendered-ansi", "future-incompat", "unused-externs-silent"]
     }
   },
   "env_keys": [

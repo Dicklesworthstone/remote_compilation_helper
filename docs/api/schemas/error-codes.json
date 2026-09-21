@@ -1175,11 +1175,7 @@
       "number": 504,
       "category": "internal",
       "message": "Unexpected internal state",
-      "remediation": [
-        "Restart the daemon",
-        "Clear any lock files",
-        "Report bug if persists"
-      ],
+      "remediation": ["Restart the daemon", "Clear any lock files", "Report bug if persists"],
       "doc_url": "https://rch.dev/docs/troubleshooting"
     },
     {

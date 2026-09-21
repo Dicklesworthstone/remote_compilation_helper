@@ -16,11 +16,7 @@
         "-L"
       ],
       "error_format": "json",
-      "json": [
-        "artifacts",
-        "diagnostic-rendered-ansi",
-        "future-incompat"
-      ]
+      "json": ["artifacts", "diagnostic-rendered-ansi", "future-incompat"]
     },
     "crate": {
       "flags": [
@@ -40,11 +36,7 @@
         "-L"
       ],
       "error_format": "json",
-      "json": [
-        "artifacts",
-        "diagnostic-rendered-ansi",
-        "future-incompat"
-      ]
+      "json": ["artifacts", "diagnostic-rendered-ansi", "future-incompat"]
     }
   },
   "env_keys": [

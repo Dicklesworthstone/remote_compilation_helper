@@ -48,10 +48,7 @@
           "color": { "mode": "thresholds" },
           "thresholds": {
             "mode": "absolute",
-            "steps": [
-              { "color": "red", "value": null },
-              { "color": "green", "value": 1 }
-            ]
+            "steps": [{ "color": "red", "value": null }, { "color": "green", "value": 1 }]
           },
           "mappings": [
             { "options": { "0": { "text": "DOWN" } }, "type": "value" },
@@ -409,10 +406,7 @@
           "color": { "mode": "thresholds" },
           "thresholds": {
             "mode": "absolute",
-            "steps": [
-              { "color": "red", "value": null },
-              { "color": "green", "value": 1 }
-            ]
+            "steps": [{ "color": "red", "value": null }, { "color": "green", "value": 1 }]
           },
           "mappings": [
             { "options": { "0": { "color": "red", "text": "DOWN" } }, "type": "value" },
@@ -465,10 +459,7 @@
           },
           "thresholds": {
             "mode": "absolute",
-            "steps": [
-              { "color": "green", "value": null },
-              { "color": "red", "value": 0.001 }
-            ]
+            "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 0.001 }]
           },
           "unit": "s"
         }
@@ -511,10 +502,7 @@
           },
           "thresholds": {
             "mode": "absolute",
-            "steps": [
-              { "color": "green", "value": null },
-              { "color": "red", "value": 0.005 }
-            ]
+            "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 0.005 }]
           },
           "unit": "s"
         }

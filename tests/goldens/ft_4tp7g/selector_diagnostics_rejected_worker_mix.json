@@ -22,9 +22,7 @@
         "full_version": "rustc 1.97.0-nightly (fixture 2026-05-16)"
       }
     },
-    "excluded_worker_ids": [
-      "active-rust"
-    ],
+    "excluded_worker_ids": ["active-rust"],
     "workers": [
       "active-rust",
       "busy-rust",
@@ -58,9 +56,7 @@
         "active_project_excluded": true,
         "final_decision": "deny",
         "final_reason": "worker already has an active build for this project",
-        "reason_codes": [
-          "active_project_exclusion"
-        ]
+        "reason_codes": ["active_project_exclusion"]
       },
       {
         "worker_id": "busy-rust",
@@ -79,9 +75,7 @@
         "active_project_excluded": false,
         "final_decision": "deny",
         "final_reason": "requested cores 2 exceed total slots 1",
-        "reason_codes": [
-          "slots.request_exceeds_capacity"
-        ]
+        "reason_codes": ["slots.request_exceeds_capacity"]
       },
       {
         "worker_id": "circuit-open",
@@ -100,9 +94,7 @@
         "active_project_excluded": false,
         "final_decision": "deny",
         "final_reason": "circuit is open",
-        "reason_codes": [
-          "worker.circuit_open"
-        ]
+        "reason_codes": ["worker.circuit_open"]
       },
       {
         "worker_id": "no-rust",
@@ -121,9 +113,7 @@
         "active_project_excluded": false,
         "final_decision": "deny",
         "final_reason": "required runtime Rust is unavailable",
-        "reason_codes": [
-          "runtime.unavailable"
-        ]
+        "reason_codes": ["runtime.unavailable"]
       },
       {
         "worker_id": "pressure-critical",
@@ -142,9 +132,7 @@
         "active_project_excluded": false,
         "final_decision": "deny",
         "final_reason": "critical pressure: pressure.disk_critical",
-        "reason_codes": [
-          "pressure.critical"
-        ]
+        "reason_codes": ["pressure.critical"]
       },
       {
         "worker_id": "toolchain-mismatch",
@@ -163,9 +151,7 @@
         "active_project_excluded": false,
         "final_decision": "deny",
         "final_reason": "rustc_channel_mismatch:local=nightly:worker=1.95.0",
-        "reason_codes": [
-          "toolchain.version_mismatch"
-        ]
+        "reason_codes": ["toolchain.version_mismatch"]
       }
     ]
   }
