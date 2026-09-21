@@ -224,20 +224,45 @@ impl WorkerJournal {
             fail_after_rename: false,
         };
         journal.store(state)?;
-        // Startup is outside the async runtime. Rehash/recreate private snapshots
-        // while the same exclusive lock protects both the journal and its spool.
-        if let Some(digest) = journal.retained_digest() {
-            if journal.state["last"]["receipt"]["retained_result_released"] == true {
-                result_spool::purge_accepted(&journal.root, &digest)?;
-            } else {
-                let id = journal.high_water().ok_or_else(|| invalid("retained result lacks admission"))?;
-                let fingerprint = journal.state["last"]["fingerprint"].as_str()
-                    .ok_or_else(|| invalid("retained result lacks fingerprint"))?;
-                result_spool::validate_receipt(&journal.root, id, fingerprint, &digest, &journal.state["last"]["receipt"])?;
-                journal.recovered_result = Some(result_spool::load(&journal.root, id, fingerprint, &digest)?);
-            }
-        }
+        // Startup and between-session restoration run outside the async reactor.
+        journal.prepare_reconnect()?;
         Ok(journal)
+    }
+
+    /// Prepare a fresh connection while retaining this process's exclusive
+    /// journal lock, boot generation, incarnation and execution high-water.
+    ///
+    /// Call only AFTER the previous session has joined its execution owner and
+    /// dropped its transfer owners. This is blocking filesystem work and belongs
+    /// outside the control reactor. It never certifies unfinished execution,
+    /// retries a request, or changes the durable receipt. An already-restored
+    /// private snapshot can survive a failed handshake without another rehash.
+    /// Every new session must independently authorize its authenticated recipient.
+    ///
+    /// # Errors
+    /// Refuses poisoned persistence or a missing/corrupt receipt-bound seal.
+    /// The caller must stop rather than discard history or create a fresh journal.
+    pub fn prepare_reconnect(&mut self) -> io::Result<()> {
+        self.clear_result_recipient();
+        self.ensure_healthy()?;
+        let Some(digest) = self.retained_digest() else {
+            self.recovered_result = None;
+            return Ok(());
+        };
+        if self.state["last"]["receipt"]["retained_result_released"] == true {
+            self.recovered_result = None;
+            return result_spool::purge_accepted(&self.root, &digest);
+        }
+        if self.recovered_result.is_none() {
+            let id = self.high_water().ok_or_else(|| invalid("retained result lacks admission"))?;
+            let fingerprint = self.state["last"]["fingerprint"].as_str()
+                .ok_or_else(|| invalid("retained result lacks fingerprint"))?;
+            result_spool::validate_receipt(
+                &self.root, id, fingerprint, &digest, &self.state["last"]["receipt"],
+            )?;
+            self.recovered_result = Some(result_spool::load(&self.root, id, fingerprint, &digest)?);
+        }
+        Ok(())
     }
 
     /// Durable generation advertised in worker-hello.
@@ -706,5 +731,70 @@ mod tests {
         let state: Value = serde_json::from_slice(&std::fs::read(root.path().join(STATE_FILE)).unwrap()).unwrap();
         assert_eq!(state["last"]["request_id"], 1);
         assert_eq!(state["last"]["receipt"]["retained_result_released"], false);
+    }
+
+    #[test]
+    fn reconnect_restores_each_interrupted_transfer_without_reboot_or_reexecution() {
+        let root = tempfile::tempdir().unwrap();
+        let mut journal = open(root.path());
+        let receipt = seal(&mut journal, 1);
+        journal.finish(1, &receipt, true).unwrap();
+        let generation = journal.boot_generation();
+        let incarnation = journal.incarnation();
+        let durable = std::fs::read(root.path().join(STATE_FILE)).unwrap();
+        for _ in 0..3 {
+            journal.prepare_reconnect().unwrap();
+            assert_eq!(journal.boot_generation(), generation);
+            assert_eq!(journal.incarnation(), incarnation);
+            assert_eq!(journal.high_water(), Some(1));
+            assert!(WorkerJournal::open(root.path(), "worker", "coord:7000").is_err());
+            // Authorization from a previous connection must never survive.
+            assert!(journal.resume_result(&request(1), Duration::from_secs(1), false).is_err());
+            journal.authorize_result_recipient(ResultRecipient::TlsSpki([8; 32]));
+            assert!(journal.resume_result(&request(1), Duration::from_secs(1), false).is_err());
+            journal.authorize_result_recipient(ResultRecipient::TlsSpki([7; 32]));
+            let mut completion = journal.resume_result(&request(1), Duration::from_secs(1), false).unwrap();
+            assert_eq!(completion.outputs.as_mut().unwrap().stdout.read_chunk(0, 64).unwrap(), b"resumed\0\xff");
+            assert!(journal.resume_result(&request(1), Duration::from_secs(1), false).is_err());
+            drop(completion); // the disconnected session has dropped its transfer owner
+            assert_eq!(journal.admit(&request(1), Duration::from_secs(1)).unwrap(), Some("durable-request-already-admitted"));
+            assert_eq!(journal.admit(&request(2), Duration::from_secs(1)).unwrap(), Some("retained-result-unacknowledged"));
+            assert_eq!(std::fs::read(root.path().join(STATE_FILE)).unwrap(), durable);
+        }
+        journal.release_retained_result(1).unwrap();
+        journal.prepare_reconnect().unwrap();
+        assert!(!journal.has_retained_result());
+        assert!(journal.resume_result(&request(1), Duration::from_secs(1), false).is_err());
+        assert_eq!(journal.admit(&request(2), Duration::from_secs(1)).unwrap(), None);
+    }
+
+    #[test]
+    fn reconnect_does_not_resolve_uncertain_execution_or_poisoned_persistence() {
+        let root = tempfile::tempdir().unwrap();
+        let mut journal = open(root.path());
+        journal.admit(&request(10), Duration::from_secs(1)).unwrap();
+        let before = std::fs::read(root.path().join(STATE_FILE)).unwrap();
+        journal.prepare_reconnect().unwrap();
+        assert_eq!(journal.status(10)["status"], "execution-uncertain");
+        assert_eq!(journal.admit(&request(11), Duration::from_secs(1)).unwrap(), Some("prior-execution-uncertain"));
+        assert_eq!(std::fs::read(root.path().join(STATE_FILE)).unwrap(), before);
+        journal.fail_after_rename = true;
+        assert!(journal.finish(10, &receipt(10), true).is_err());
+        assert!(journal.prepare_reconnect().is_err());
+        assert_eq!(journal.status(10)["status"], "journal-unavailable");
+    }
+
+    #[test]
+    fn reconnect_refuses_a_corrupt_seal_without_resetting_the_live_journal() {
+        let root = tempfile::tempdir().unwrap();
+        let mut journal = open(root.path());
+        let receipt = seal(&mut journal, 1);
+        journal.finish(1, &receipt, true).unwrap();
+        let before = std::fs::read(root.path().join(STATE_FILE)).unwrap();
+        std::fs::write(root.path().join("retained-result/file-000"), b"corrupt").unwrap();
+        assert!(journal.prepare_reconnect().is_err());
+        assert_eq!(journal.high_water(), Some(1));
+        assert_eq!(std::fs::read(root.path().join(STATE_FILE)).unwrap(), before);
+        assert_eq!(journal.admit(&request(2), Duration::from_secs(1)).unwrap(), Some("retained-result-unacknowledged"));
     }
 }
