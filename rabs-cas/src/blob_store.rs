@@ -60,9 +60,14 @@ pub const RAW_PROFILE_V1: &str = "raw-v1";
 /// domain so an encoded digest can never pose as object identity.
 pub const ENCODED_REPRESENTATION_DOMAIN: &str = "rabs.encoded-representation.sha256.v1";
 
-/// A profile's decoder: encoded bytes → logical bytes (H030
-/// verification input; errors are the profile's own diagnostics).
-pub type RepresentationDecoder<'a> = &'a dyn Fn(&[u8]) -> Result<Vec<u8>, String>;
+/// A streaming profile decoder (H030). Read encoded bytes and write logical
+/// bytes to the supplied, size-limited sink. Propagate read/write failures and
+/// reject truncated frames. A successful decoder must consume the entire input.
+///
+/// The store never buffers a whole representation or logical object. Codecs
+/// must also bound their own working memory (including windows advertised in
+/// untrusted headers); a sink cannot police allocations internal to a codec.
+pub type RepresentationDecoder<'a> = &'a dyn Fn(&mut dyn Read, &mut dyn Write) -> Result<(), String>;
 
 /// One verified stored representation of a logical object (H030;
 /// risk R81): raw/zstd/packed representations coexist, each under its
@@ -117,10 +122,60 @@ pub struct PutLimits {
     pub expected_size: Option<u64>,
 }
 
+/// Independent, mandatory resource ceilings for encoded ingestion (H030).
+/// No unbounded default: callers must choose both budgets before reading an
+/// untrusted representation. Expected sizes are checked before I/O when they
+/// exceed these ceilings, during streaming on overruns, and at EOF on underruns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EncodedPutLimits {
+    /// Maximum encoded bytes accepted into staging.
+    pub max_encoded_bytes: u64,
+    /// Maximum decoded bytes accepted into the logical hasher.
+    pub max_logical_bytes: u64,
+    /// Declared encoded byte count, when supplied by the transfer header.
+    pub expected_encoded_size: Option<u64>,
+    /// Declared logical byte count, when supplied by the object manifest.
+    pub expected_logical_size: Option<u64>,
+}
+
+impl EncodedPutLimits {
+    fn validate(self) -> Result<(), PutError> {
+        if self
+            .expected_encoded_size
+            .is_some_and(|n| n > self.max_encoded_bytes)
+        {
+            return Err(PutError::EncodedLimitExceeded {
+                limit: self.max_encoded_bytes,
+            });
+        }
+        if self
+            .expected_logical_size
+            .is_some_and(|n| n > self.max_logical_bytes)
+        {
+            return Err(PutError::LogicalLimitExceeded {
+                limit: self.max_logical_bytes,
+            });
+        }
+        Ok(())
+    }
+}
+
 /// Typed put failures. Refusals remove the staging file; none of them
 /// publish anything.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PutError {
+    /// Encoded input exceeded its configured staging budget.
+    EncodedLimitExceeded {
+        /// Maximum encoded bytes permitted.
+        limit: u64,
+    },
+    /// Encoded input differs from the size declared by its transfer header.
+    EncodedSizeMismatch {
+        /// Declared encoded byte count.
+        expected: u64,
+        /// Observed byte count (at most one extra byte on overrun).
+        actual: u64,
+    },
     /// The stream exceeded [`PutLimits::max_logical_bytes`].
     LogicalLimitExceeded {
         /// The configured cap.
@@ -547,18 +602,15 @@ fn publish_staged_inner(
     })
 }
 
-/// H030: publish one ENCODED representation of an already-known
-/// logical object. The encoded bytes stream to staging while their
-/// digest (under [`ENCODED_REPRESENTATION_DOMAIN`]) is computed; the
-/// representation is then VERIFIED — `decoder` must reproduce bytes
-/// that digest to `declared_logical` (raw callers use
-/// [`put_if_absent`] instead) — before the standard atomic publish at
-/// the representation's own `(logical, profile, encoded)` pathname.
-/// `limits.max_logical_bytes` caps the DECODED size (bomb guard);
-/// `limits.expected_size` verifies the ENCODED byte count.
+/// H030: publish an encoded representation only after streaming verification
+/// against its logical identity. Encoded and logical byte budgets are enforced
+/// independently, before accepting each chunk. No whole-object allocation is
+/// performed, and a failed decoder write cannot be ignored to publish a prefix.
+/// Raw callers use [`put_if_absent`].
 ///
 /// # Errors
-/// Typed [`PutError`]; refusals publish nothing and clean staging.
+/// Typed [`PutError`]; refusals before publication leave neither an object nor
+/// metadata. The owned staging file is cleaned on every return path or unwind.
 #[allow(clippy::too_many_arguments)]
 pub fn put_encoded_representation(
     layout: &BlobStoreLayout,
@@ -567,93 +619,31 @@ pub fn put_encoded_representation(
     profile: &str,
     encoded: &mut dyn Read,
     decoder: RepresentationDecoder<'_>,
-    limits: PutLimits,
+    limits: EncodedPutLimits,
     durability: DurabilityPolicy,
 ) -> Result<(StoredRepresentationId, PutOutcome), PutError> {
+    // Header claims cannot enlarge a budget or trigger an allocation.
+    limits.validate()?;
     let staging = layout.fresh_staging_path();
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&staging)
+        .map_err(io_err("create-staging"))?;
+    // Install cleanup only AFTER exclusive creation: never unlink somebody
+    // else's file when a stale name or a symlink occupied the candidate path.
+    let _cleanup = EncodedStagingCleanup(&staging);
+    let (encoded_digest, encoded_size) = stream_encoded(&mut file, encoded, limits)?;
+    drop(file);
 
-    // Stream encoded bytes to staging, hashing under the ENCODED
-    // domain and counting encoded size.
-    let stream = (|| -> Result<(TypedDigest, u64), PutError> {
-        use sha2::{Digest as _, Sha256};
-        let mut file = fs::File::create(&staging).map_err(io_err("create-staging"))?;
-        let mut hasher = Sha256::new();
-        hasher.update((ENCODED_REPRESENTATION_DOMAIN.len() as u64).to_be_bytes());
-        hasher.update(ENCODED_REPRESENTATION_DOMAIN.as_bytes());
-        let mut buffer = vec![0_u8; 64 * 1024];
-        let mut total: u64 = 0;
-        loop {
-            let n = encoded.read(&mut buffer).map_err(io_err("read-encoded"))?;
-            if n == 0 {
-                break;
-            }
-            total = total.saturating_add(n as u64);
-            hasher.update(&buffer[..n]);
-            file.write_all(&buffer[..n])
-                .map_err(io_err("write-staging"))?;
-        }
-        if let Some(expected) = limits.expected_size
-            && expected != total
-        {
-            return Err(PutError::Digest(DigestError::LogicalSizeMismatch {
-                expected,
-                actual: total,
-            }));
-        }
-        Ok((
-            TypedDigest {
-                algorithm: rabs_protocol::result_identity::DigestAlgorithm::Sha256V1,
-                domain: ENCODED_REPRESENTATION_DOMAIN,
-                bytes: hasher.finalize().into(),
-            },
-            total,
-        ))
-    })();
-    let (encoded_digest, encoded_size) = match stream {
-        Ok(v) => v,
-        Err(e) => {
-            let _ = fs::remove_file(&staging);
-            return Err(e);
-        }
-    };
-
-    // VERIFY: the representation must decode to the declared logical
-    // object; the decoded size honors the bomb guard.
-    let verify = (|| -> Result<u64, PutError> {
-        let encoded_bytes = fs::read(&staging).map_err(io_err("read-staged"))?;
-        let logical_bytes =
-            decoder(&encoded_bytes).map_err(|error| PutError::EncodingDecodeFailed {
-                profile: profile.to_owned(),
-                error,
-            })?;
-        if let Some(limit) = limits.max_logical_bytes
-            && logical_bytes.len() as u64 > limit
-        {
-            return Err(PutError::LogicalLimitExceeded { limit });
-        }
-        let computed = crate::digest_set::digest_set(
-            &logical_bytes,
-            crate::digest_set::DigestRequest::default(),
-            None,
-        )
-        .map_err(PutError::Digest)?
-        .atp_content_id;
-        if computed != *declared_logical {
-            return Err(PutError::DeclaredDigestMismatch {
-                declared: digest_key(declared_logical),
-                computed: digest_key(&computed),
-            });
-        }
-        Ok(logical_bytes.len() as u64)
-    })();
-    let logical_size = match verify {
-        Ok(v) => v,
-        Err(e) => {
-            let _ = fs::remove_file(&staging);
-            return Err(e);
-        }
-    };
-
+    let logical_size = verify_decoded_representation(
+        &staging,
+        declared_logical,
+        profile,
+        decoder,
+        limits,
+        encoded_size,
+    )?;
     let outcome = publish_staged_inner(
         layout,
         store,
@@ -674,6 +664,178 @@ pub fn put_encoded_representation(
         },
         outcome,
     ))
+}
+
+struct EncodedStagingCleanup<'a>(&'a Path);
+
+impl Drop for EncodedStagingCleanup<'_> {
+    fn drop(&mut self) {
+        // Publication may already have unlinked staging or preserved an
+        // incident under quarantine. Neither case removes the published file.
+        let _ = fs::remove_file(self.0);
+    }
+}
+
+fn stream_encoded(
+    file: &mut fs::File,
+    encoded: &mut dyn Read,
+    limits: EncodedPutLimits,
+) -> Result<(TypedDigest, u64), PutError> {
+    use sha2::{Digest as _, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update((ENCODED_REPRESENTATION_DOMAIN.len() as u64).to_be_bytes());
+    hasher.update(ENCODED_REPRESENTATION_DOMAIN.as_bytes());
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut total = 0_u64;
+    let ceiling = limits
+        .expected_encoded_size
+        .unwrap_or(limits.max_encoded_bytes)
+        .min(limits.max_encoded_bytes);
+    loop {
+        // Probe one byte beyond the ceiling, rather than treating a capped
+        // reader's synthetic EOF as a valid, silently truncated representation.
+        let read_len = ceiling
+            .saturating_sub(total)
+            .saturating_add(1)
+            .min(buffer.len() as u64) as usize;
+        let n = match encoded.read(&mut buffer[..read_len]) {
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            result => result.map_err(io_err("read-encoded"))?,
+        };
+        if n == 0 {
+            break;
+        }
+        total = total
+            .checked_add(n as u64)
+            .ok_or(PutError::Digest(DigestError::SizeOverflow))?;
+        if total > limits.max_encoded_bytes {
+            return Err(PutError::EncodedLimitExceeded {
+                limit: limits.max_encoded_bytes,
+            });
+        }
+        if let Some(expected) = limits.expected_encoded_size
+            && total > expected
+        {
+            return Err(PutError::EncodedSizeMismatch {
+                expected,
+                actual: total,
+            });
+        }
+        hasher.update(&buffer[..n]);
+        file.write_all(&buffer[..n])
+            .map_err(io_err("write-staging"))?;
+    }
+    if let Some(expected) = limits.expected_encoded_size
+        && total != expected
+    {
+        return Err(PutError::EncodedSizeMismatch {
+            expected,
+            actual: total,
+        });
+    }
+    Ok((
+        TypedDigest {
+            algorithm: rabs_protocol::result_identity::DigestAlgorithm::Sha256V1,
+            domain: ENCODED_REPRESENTATION_DOMAIN,
+            bytes: hasher.finalize().into(),
+        },
+        total,
+    ))
+}
+
+/// Hash-only sink: no decoded bytes are retained. The first refusal is sticky
+/// even when a decoder mistakenly catches a write error and returns success.
+struct BoundedLogicalWriter {
+    digest: StreamingObjectWriter,
+    limits: EncodedPutLimits,
+    written: u64,
+    failure: Option<PutError>,
+}
+
+impl Write for BoundedLogicalWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if self.failure.is_some() {
+            return Err(std::io::Error::other("logical sink already refused output"));
+        }
+        let result = (|| {
+            let next = self
+                .written
+                .checked_add(bytes.len() as u64)
+                .ok_or(PutError::Digest(DigestError::SizeOverflow))?;
+            if next > self.limits.max_logical_bytes {
+                return Err(PutError::LogicalLimitExceeded {
+                    limit: self.limits.max_logical_bytes,
+                });
+            }
+            if let Some(expected) = self.limits.expected_logical_size
+                && next > expected
+            {
+                return Err(PutError::Digest(DigestError::LogicalSizeMismatch {
+                    expected,
+                    actual: next,
+                }));
+            }
+            self.digest.write(bytes).map_err(PutError::Digest)?;
+            self.written = next;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => Ok(bytes.len()),
+            Err(error) => {
+                self.failure = Some(error);
+                Err(std::io::Error::other("logical output exceeded its budget"))
+            }
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        if self.failure.is_some() {
+            Err(std::io::Error::other("logical sink already refused output"))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+fn verify_decoded_representation(
+    staging: &Path,
+    declared: &TypedDigest,
+    profile: &str,
+    decoder: RepresentationDecoder<'_>,
+    limits: EncodedPutLimits,
+    encoded_size: u64,
+) -> Result<u64, PutError> {
+    let mut input = fs::File::open(staging)
+        .map_err(io_err("read-staged"))?
+        .take(encoded_size);
+    let mut output = BoundedLogicalWriter {
+        digest: StreamingObjectWriter::new(DigestRequest::default(), limits.expected_logical_size),
+        limits,
+        written: 0,
+        failure: None,
+    };
+    let decoded = decoder(&mut input, &mut output);
+    if let Some(error) = output.failure {
+        return Err(error);
+    }
+    decoded.map_err(|error| PutError::EncodingDecodeFailed {
+        profile: profile.to_owned(),
+        error,
+    })?;
+    if input.limit() != 0 {
+        return Err(PutError::EncodingDecodeFailed {
+            profile: profile.to_owned(),
+            error: "decoder did not consume the complete representation".to_owned(),
+        });
+    }
+    let digests = output.digest.finish().map_err(PutError::Digest)?;
+    if digests.atp_content_id != *declared {
+        return Err(PutError::DeclaredDigestMismatch {
+            declared: digest_key(declared),
+            computed: digest_key(&digests.atp_content_id),
+        });
+    }
+    Ok(digests.logical_size)
 }
 
 pub(crate) fn stream_to_staging(
@@ -1065,13 +1227,30 @@ mod tests {
         }
     }
 
-    /// Test profile: bytes stored reversed.
-    fn rev_encode(bytes: &[u8]) -> Vec<u8> {
-        bytes.iter().rev().copied().collect()
+    const ENCODED_LIMITS: EncodedPutLimits = EncodedPutLimits {
+        max_encoded_bytes: 4096,
+        max_logical_bytes: 4096,
+        expected_encoded_size: None,
+        expected_logical_size: None,
+    };
+
+    /// A reversible test profile that can be decoded with constant memory.
+    fn xor_encode(bytes: &[u8]) -> Vec<u8> {
+        bytes.iter().map(|b| b ^ 0xa5).collect()
     }
 
-    fn rev_decoder(encoded: &[u8]) -> Result<Vec<u8>, String> {
-        Ok(encoded.iter().rev().copied().collect())
+    fn xor_decoder(input: &mut dyn Read, output: &mut dyn Write) -> Result<(), String> {
+        let mut buffer = [0_u8; 128];
+        loop {
+            let n = input.read(&mut buffer).map_err(|e| e.to_string())?;
+            if n == 0 {
+                return Ok(());
+            }
+            for b in &mut buffer[..n] {
+                *b ^= 0xa5;
+            }
+            output.write_all(&buffer[..n]).map_err(|e| e.to_string())?;
+        }
     }
 
     #[test]
@@ -1092,30 +1271,31 @@ mod tests {
         .unwrap() else {
             panic!("raw put must store");
         };
-        let encoded = rev_encode(&bytes);
+        let encoded = xor_encode(&bytes);
         let (representation, outcome) = put_encoded_representation(
             &layout,
             &mut store,
             &declared,
-            "rev-v1",
+            "xor-v1",
             &mut encoded.as_slice(),
-            &rev_decoder,
-            PutLimits {
-                max_logical_bytes: Some(1024),
-                expected_size: Some(encoded.len() as u64),
+            &xor_decoder,
+            EncodedPutLimits {
+                expected_encoded_size: Some(encoded.len() as u64),
+                expected_logical_size: Some(bytes.len() as u64),
+                ..ENCODED_LIMITS
             },
             DurabilityPolicy::FULL,
         )
         .unwrap();
-        let PutOutcome::Stored { path: rev_path } = outcome else {
+        let PutOutcome::Stored { path: encoded_path } = outcome else {
             panic!("encoded put must store");
         };
 
         // Distinct unambiguous pathnames; encoded bytes live at the
         // encoded path; the representation names everything.
-        assert_ne!(raw_path, rev_path);
-        assert_eq!(fs::read(&rev_path).unwrap(), encoded);
-        assert_eq!(representation.storage_profile, "rev-v1");
+        assert_ne!(raw_path, encoded_path);
+        assert_eq!(fs::read(&encoded_path).unwrap(), encoded);
+        assert_eq!(representation.storage_profile, "xor-v1");
         assert_eq!(representation.encoded_size, encoded.len() as u64);
         assert_eq!(
             representation.encoded_digest.domain,
@@ -1132,7 +1312,7 @@ mod tests {
             .map(|row| row.encoding)
             .collect();
         assert!(encodings.contains(&"raw-v1".to_owned()));
-        assert!(encodings.contains(&"rev-v1".to_owned()));
+        assert!(encodings.contains(&"xor-v1".to_owned()));
 
         // Re-put of the same encoded representation: verified
         // idempotent against the ENCODED digest.
@@ -1140,14 +1320,14 @@ mod tests {
             &layout,
             &mut store,
             &declared,
-            "rev-v1",
+            "xor-v1",
             &mut encoded.as_slice(),
-            &rev_decoder,
-            PutLimits::default(),
+            &xor_decoder,
+            ENCODED_LIMITS,
             DurabilityPolicy::FULL,
         )
         .unwrap();
-        assert_eq!(again, PutOutcome::IdempotentDuplicate { path: rev_path });
+        assert_eq!(again, PutOutcome::IdempotentDuplicate { path: encoded_path });
         assert_eq!(fs::read_dir(layout.staging_dir()).unwrap().count(), 0);
     }
 
@@ -1157,43 +1337,53 @@ mod tests {
         let mut store = store();
         let bytes = b"verified object".to_vec();
         let declared = id_of(&bytes);
-        let encoded = rev_encode(&bytes);
+        let encoded = xor_encode(&bytes);
 
         // Decoder that produces the WRONG logical bytes: refused, and
         // nothing published anywhere.
-        let bad_decoder = |_: &[u8]| -> Result<Vec<u8>, String> { Ok(b"other bytes".to_vec()) };
+        let bad_decoder = |input: &mut dyn Read, output: &mut dyn Write| {
+            std::io::copy(input, &mut std::io::sink()).map_err(|e| e.to_string())?;
+            output.write_all(b"other bytes").map_err(|e| e.to_string())
+        };
         assert!(matches!(
             put_encoded_representation(
                 &layout,
                 &mut store,
                 &declared,
-                "rev-v1",
+                "xor-v1",
                 &mut encoded.as_slice(),
                 &bad_decoder,
-                PutLimits::default(),
+                ENCODED_LIMITS,
                 DurabilityPolicy::FULL,
             ),
             Err(PutError::DeclaredDigestMismatch { .. })
         ));
 
         // Decoder failure is typed.
-        let failing = |_: &[u8]| -> Result<Vec<u8>, String> { Err("truncated frame".to_owned()) };
+        let failing = |_: &mut dyn Read, _: &mut dyn Write| Err("truncated frame".to_owned());
         assert!(matches!(
             put_encoded_representation(
                 &layout,
                 &mut store,
                 &declared,
-                "rev-v1",
+                "xor-v1",
                 &mut encoded.as_slice(),
                 &failing,
-                PutLimits::default(),
+                ENCODED_LIMITS,
                 DurabilityPolicy::FULL,
             ),
             Err(PutError::EncodingDecodeFailed { .. })
         ));
 
         // Decompression bomb: decoded bytes exceed the logical cap.
-        let bomb = |_: &[u8]| -> Result<Vec<u8>, String> { Ok(vec![0_u8; 4096]) };
+        let attempted = std::cell::Cell::new(0);
+        let bomb = |_: &mut dyn Read, output: &mut dyn Write| {
+            for _ in 0..1_000_000 {
+                attempted.set(attempted.get() + 1);
+                output.write_all(&[0_u8; 32]).map_err(|e| e.to_string())?;
+            }
+            Ok(())
+        };
         assert_eq!(
             put_encoded_representation(
                 &layout,
@@ -1202,14 +1392,15 @@ mod tests {
                 "bomb-v1",
                 &mut encoded.as_slice(),
                 &bomb,
-                PutLimits {
-                    max_logical_bytes: Some(64),
-                    expected_size: None,
+                EncodedPutLimits {
+                    max_logical_bytes: 64,
+                    ..ENCODED_LIMITS
                 },
                 DurabilityPolicy::FULL,
             ),
             Err(PutError::LogicalLimitExceeded { limit: 64 })
         );
+        assert_eq!(attempted.get(), 3, "stop the bomb before expanding it");
 
         assert!(!store.object_located(&declared).unwrap());
         assert_eq!(fs::read_dir(layout.staging_dir()).unwrap().count(), 0);
@@ -1240,18 +1431,18 @@ mod tests {
                         )
                         .map(|outcome| ("raw-v1", outcome))
                     } else {
-                        let encoded = rev_encode(&bytes);
+                        let encoded = xor_encode(&bytes);
                         put_encoded_representation(
                             &layout,
                             &mut store,
                             &declared,
-                            "rev-v1",
+                            "xor-v1",
                             &mut encoded.as_slice(),
-                            &rev_decoder,
-                            PutLimits::default(),
+                            &xor_decoder,
+                            ENCODED_LIMITS,
                             DurabilityPolicy::FULL,
                         )
-                        .map(|(_, outcome)| ("rev-v1", outcome))
+                        .map(|(_, outcome)| ("xor-v1", outcome))
                     }
                 })
             })
@@ -1263,7 +1454,7 @@ mod tests {
 
         // Exactly one Stored PER PROFILE: different profiles never
         // contend on one ambiguous pathname.
-        for profile in ["raw-v1", "rev-v1"] {
+        for profile in ["raw-v1", "xor-v1"] {
             let stored = outcomes
                 .iter()
                 .filter(|(p, o)| *p == profile && matches!(o, PutOutcome::Stored { .. }))
@@ -1295,15 +1486,15 @@ mod tests {
             DurabilityPolicy::FULL,
         )
         .unwrap();
-        let encoded = rev_encode(&bytes);
+        let encoded = xor_encode(&bytes);
         put_encoded_representation(
             &layout,
             &mut store,
             &declared,
-            "rev-v1",
+            "xor-v1",
             &mut encoded.as_slice(),
-            &rev_decoder,
-            PutLimits::default(),
+            &xor_decoder,
+            ENCODED_LIMITS,
             DurabilityPolicy::FULL,
         )
         .unwrap();
@@ -1315,6 +1506,287 @@ mod tests {
             .collect();
         // Representation selection never changes action keys (H030).
         assert_eq!(before, after);
+    }
+
+    fn assert_encoded_refusal_clean(
+        layout: &BlobStoreLayout,
+        store: &mut SqlMetadataStore<RusqliteEngine>,
+    ) {
+        assert!(store.reconciliation_scan().unwrap().is_empty());
+        assert_eq!(fs::read_dir(layout.staging_dir()).unwrap().count(), 0);
+        assert_eq!(fs::read_dir(layout.objects_dir()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn h030_encoded_budget_stops_source_before_decoding() {
+        let layout = BlobStoreLayout::open(&fresh_root("encoded-cap")).unwrap();
+        let mut store = store();
+        let mut source = std::io::repeat(7).take(1_000_000);
+        let decoder = |_: &mut dyn Read, _: &mut dyn Write| -> Result<(), String> {
+            panic!("encoded overrun must refuse before invoking the decoder");
+        };
+        assert_eq!(
+            put_encoded_representation(
+                &layout,
+                &mut store,
+                &id_of(b"unused"),
+                "xor-v1",
+                &mut source,
+                &decoder,
+                EncodedPutLimits {
+                    max_encoded_bytes: 8,
+                    ..ENCODED_LIMITS
+                },
+                DurabilityPolicy::FULL,
+            ),
+            Err(PutError::EncodedLimitExceeded { limit: 8 })
+        );
+        assert_eq!(source.limit(), 1_000_000 - 9, "one-byte overrun probe");
+        assert_encoded_refusal_clean(&layout, &mut store);
+    }
+
+    #[test]
+    fn h030_oversized_header_claims_are_refused_without_reading() {
+        for limits in [
+            EncodedPutLimits {
+                expected_encoded_size: Some(4097),
+                ..ENCODED_LIMITS
+            },
+            EncodedPutLimits {
+                expected_logical_size: Some(4097),
+                ..ENCODED_LIMITS
+            },
+        ] {
+            let layout = BlobStoreLayout::open(&fresh_root("header-cap")).unwrap();
+            let mut store = store();
+            let mut source = std::io::Cursor::new(b"unread");
+            let result = put_encoded_representation(
+                &layout,
+                &mut store,
+                &id_of(b"unused"),
+                "xor-v1",
+                &mut source,
+                &xor_decoder,
+                limits,
+                DurabilityPolicy::FULL,
+            );
+            assert!(matches!(
+                result,
+                Err(PutError::EncodedLimitExceeded { limit: 4096 })
+                    | Err(PutError::LogicalLimitExceeded { limit: 4096 })
+            ));
+            assert_eq!(source.position(), 0);
+            assert_encoded_refusal_clean(&layout, &mut store);
+        }
+    }
+
+    #[test]
+    fn h030_encoded_expected_size_rejects_short_and_long_streams_before_decode() {
+        for bytes in [b"ab".as_slice(), b"abcd".as_slice()] {
+            let mut source = bytes;
+            let layout = BlobStoreLayout::open(&fresh_root("encoded-size")).unwrap();
+            let mut store = store();
+            let decoder = |_: &mut dyn Read, _: &mut dyn Write| -> Result<(), String> {
+                panic!("encoded length mismatch must refuse before decoding");
+            };
+            assert_eq!(
+                put_encoded_representation(
+                    &layout,
+                    &mut store,
+                    &id_of(b"unused"),
+                    "xor-v1",
+                    &mut source,
+                    &decoder,
+                    EncodedPutLimits {
+                        expected_encoded_size: Some(3),
+                        ..ENCODED_LIMITS
+                    },
+                    DurabilityPolicy::FULL,
+                ),
+                Err(PutError::EncodedSizeMismatch {
+                    expected: 3,
+                    actual: bytes.len() as u64,
+                })
+            );
+            assert_encoded_refusal_clean(&layout, &mut store);
+        }
+    }
+
+    #[test]
+    fn h030_logical_expected_size_is_independent_of_encoded_size() {
+        let bytes = b"abc";
+        let encoded = xor_encode(bytes);
+        for expected in [2, 4] {
+            let layout = BlobStoreLayout::open(&fresh_root("logical-size")).unwrap();
+            let mut store = store();
+            assert_eq!(
+                put_encoded_representation(
+                    &layout,
+                    &mut store,
+                    &id_of(bytes),
+                    "xor-v1",
+                    &mut encoded.as_slice(),
+                    &xor_decoder,
+                    EncodedPutLimits {
+                        expected_encoded_size: Some(3),
+                        expected_logical_size: Some(expected),
+                        ..ENCODED_LIMITS
+                    },
+                    DurabilityPolicy::FULL,
+                ),
+                Err(PutError::Digest(DigestError::LogicalSizeMismatch {
+                    expected,
+                    actual: 3,
+                }))
+            );
+            assert_encoded_refusal_clean(&layout, &mut store);
+        }
+    }
+
+    #[test]
+    fn h030_swallowed_sink_failure_cannot_publish_a_valid_prefix() {
+        let layout = BlobStoreLayout::open(&fresh_root("sticky-refusal")).unwrap();
+        let mut store = store();
+        let decoder = |input: &mut dyn Read, output: &mut dyn Write| {
+            std::io::copy(input, &mut std::io::sink()).map_err(|e| e.to_string())?;
+            output.write_all(b"ok").map_err(|e| e.to_string())?;
+            assert!(output.write_all(b"excess").is_err());
+            assert!(output.flush().is_err());
+            assert!(output.write(b"").is_err());
+            // The accepted prefix has the expected identity, but a decoder
+            // that ignores a refusal must NEVER turn that prefix into a hit.
+            Ok(())
+        };
+        assert_eq!(
+            put_encoded_representation(
+                &layout,
+                &mut store,
+                &id_of(b"ok"),
+                "broken-v1",
+                &mut b"frame".as_slice(),
+                &decoder,
+                EncodedPutLimits {
+                    max_logical_bytes: 2,
+                    ..ENCODED_LIMITS
+                },
+                DurabilityPolicy::FULL,
+            ),
+            Err(PutError::LogicalLimitExceeded { limit: 2 })
+        );
+        assert_encoded_refusal_clean(&layout, &mut store);
+    }
+
+    #[test]
+    fn h030_decoder_must_consume_complete_encoded_input() {
+        let layout = BlobStoreLayout::open(&fresh_root("trailing-input")).unwrap();
+        let mut store = store();
+        let decoder = |_: &mut dyn Read, _: &mut dyn Write| Ok(());
+        assert!(matches!(
+            put_encoded_representation(
+                &layout,
+                &mut store,
+                &id_of(b""),
+                "empty-v1",
+                &mut b"unconsumed suffix".as_slice(),
+                &decoder,
+                ENCODED_LIMITS,
+                DurabilityPolicy::FULL,
+            ),
+            Err(PutError::EncodingDecodeFailed { .. })
+        ));
+        assert_encoded_refusal_clean(&layout, &mut store);
+    }
+
+    #[test]
+    fn h030_exact_caps_accept_empty_and_multibuffer_objects() {
+        for size in [0, 131_073] {
+            let bytes = vec![42_u8; size];
+            let encoded = xor_encode(&bytes);
+            let layout = BlobStoreLayout::open(&fresh_root("exact-caps")).unwrap();
+            let mut store = store();
+            let (representation, outcome) = put_encoded_representation(
+                &layout,
+                &mut store,
+                &id_of(&bytes),
+                "xor-v1",
+                &mut encoded.as_slice(),
+                &xor_decoder,
+                EncodedPutLimits {
+                    max_encoded_bytes: size as u64,
+                    max_logical_bytes: size as u64,
+                    expected_encoded_size: Some(size as u64),
+                    expected_logical_size: Some(size as u64),
+                },
+                DurabilityPolicy::FULL,
+            )
+            .unwrap();
+            assert_eq!(representation.logical, id_of(&bytes));
+            let PutOutcome::Stored { path } = outcome else {
+                panic!("first representation must be stored");
+            };
+            assert_eq!(fs::read(path).unwrap(), encoded);
+            assert_eq!(fs::read_dir(layout.staging_dir()).unwrap().count(), 0);
+            assert_no_partial_published(&layout);
+        }
+    }
+
+    #[test]
+    fn h030_interrupted_encoded_read_is_retried() {
+        struct InterruptedOnce<'a> {
+            remaining: &'a [u8],
+            interrupted: bool,
+        }
+        impl Read for InterruptedOnce<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if !self.interrupted {
+                    self.interrupted = true;
+                    return Err(std::io::ErrorKind::Interrupted.into());
+                }
+                self.remaining.read(buf)
+            }
+        }
+        let layout = BlobStoreLayout::open(&fresh_root("interrupted")).unwrap();
+        let mut store = store();
+        let encoded = xor_encode(b"retried");
+        let mut source = InterruptedOnce {
+            remaining: &encoded,
+            interrupted: false,
+        };
+        assert!(put_encoded_representation(
+            &layout,
+            &mut store,
+            &id_of(b"retried"),
+            "xor-v1",
+            &mut source,
+            &xor_decoder,
+            ENCODED_LIMITS,
+            DurabilityPolicy::FULL,
+        )
+        .is_ok());
+        assert_eq!(fs::read_dir(layout.staging_dir()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn h030_decoder_unwind_cleans_owned_staging() {
+        let layout = BlobStoreLayout::open(&fresh_root("decoder-unwind")).unwrap();
+        let mut store = store();
+        let decoder = |_: &mut dyn Read, _: &mut dyn Write| -> Result<(), String> {
+            panic!("codec failed unexpectedly");
+        };
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            put_encoded_representation(
+                &layout,
+                &mut store,
+                &id_of(b"unused"),
+                "panic-v1",
+                &mut b"frame".as_slice(),
+                &decoder,
+                ENCODED_LIMITS,
+                DurabilityPolicy::FULL,
+            )
+        }));
+        assert!(result.is_err());
+        assert_encoded_refusal_clean(&layout, &mut store);
     }
 
     #[test]
