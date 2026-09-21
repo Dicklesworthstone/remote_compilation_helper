@@ -225,11 +225,21 @@ pub fn validate_request(request: &Value) -> io::Result<()> {
         "expected canonical-exec",
     )?;
     number(request, "request_id")?;
-    for field in ["program", "workspace_backing", "toolchain_backing"] {
+    for field in ["program", "toolchain_backing"] {
         let value = text(request, field)?;
         require(
             !value.is_empty() && !value.contains('\0'),
             "invalid execution string",
+        )?;
+    }
+    // The worker owns the backing directory for a transferred projection.
+    // Validate its canonical manifest here, including the mutually exclusive
+    // workspace_backing rule. Recovery validates identity without source bytes.
+    if super::source_delivery::request_manifest(request)?.is_none() {
+        let backing = text(request, "workspace_backing")?;
+        require(
+            !backing.is_empty() && !backing.contains('\0'),
+            "invalid workspace backing",
         )?;
     }
     if let Some(args) = request.get("args") {
@@ -1292,5 +1302,147 @@ mod tests {
             hash(b"sealed result")
         );
         assert_eq!(delivery.receipt["publication_authorized"], false);
+    }
+
+
+    fn source_request(root: &Path) -> (super::super::source_delivery::SourceUpload, Value) {
+        use rabs_sandbox::snapshot_capture::capture_sealed_source;
+        use super::super::source_delivery::SourceUpload;
+        use std::sync::Arc;
+
+        std::fs::write(root.join("lib.rs"), b"pub fn answer() -> u32 { 42 }\n").unwrap();
+        std::fs::write(root.join("private.key"), b"not selected for upload").unwrap();
+        let image = capture_sealed_source(
+            &[("workspace".into(), root.to_path_buf())], false, 2, 200_000,
+        ).unwrap();
+        let upload = SourceUpload::from_snapshot(
+            Arc::new(image), "workspace", &["lib.rs".into()],
+        ).unwrap();
+        let mut request = request();
+        request.as_object_mut().unwrap().remove("workspace_backing");
+        request["source_manifest"] = upload.wire_manifest();
+        (upload, request)
+    }
+
+    fn source_replies(peer: &mut Script, request: &Value) {
+        let manifest = &request["source_manifest"];
+        peer.replies[0]["source_transfers"] = json!(["source-files-v1"]);
+        peer.replies.insert(1, json!({"kind":"source-ready", "request_id":7,
+            "manifest_sha256":manifest["manifest_sha256"], "sealed":false}));
+        peer.replies.insert(2, json!({"kind":"source-chunk-accepted", "request_id":7,
+            "manifest_sha256":manifest["manifest_sha256"], "path":"lib.rs",
+            "next_offset":manifest["files"][0]["bytes"]}));
+        peer.replies.insert(3, json!({"kind":"source-ready", "request_id":7,
+            "manifest_sha256":manifest["manifest_sha256"], "sealed":true}));
+    }
+
+    #[test]
+    fn source_projection_runs_through_the_complete_delivery_receiver() {
+        use super::super::source_delivery::SourcePeer;
+
+        let parent = tempfile::tempdir().unwrap();
+        let source = tempfile::tempdir().unwrap();
+        let (upload, request) = source_request(source.path());
+        // The sender must use the sealed image, not this mutable checkout.
+        std::fs::write(source.path().join("lib.rs"), b"changed after capture").unwrap();
+        let destination = parent.path().join("delivery");
+        let mut peer = fixture(&destination);
+        source_replies(&mut peer, &request);
+        let delivery = receive_execution(
+            &mut SourcePeer::new(&mut peer, &upload, &request).unwrap(),
+            &request, "worker", &destination,
+        ).unwrap();
+        assert!(delivery.acknowledgments_confirmed);
+        assert!(peer.replies.is_empty());
+        assert_eq!(peer.sent[0]["source_transfer"], "source-files-v1");
+        assert_eq!(peer.sent[1]["kind"], "source-begin");
+        assert_eq!(peer.sent[2]["kind"], "source-chunk");
+        assert_eq!(peer.sent[2]["path"], "lib.rs");
+        assert_eq!(peer.sent[2]["chunk_sha256"], request["source_manifest"]["files"][0]["sha256"]);
+        assert_eq!(peer.sent[3]["kind"], "source-seal");
+        assert_eq!(peer.sent[4], request);
+        assert!(peer.sent[4].get("workspace_backing").is_none());
+        assert_eq!(std::fs::read(destination.join("artifacts/a")).unwrap(), b"A\0\xffB");
+        assert_eq!(delivery.receipt["request_sha256"], hash(&serde_json::to_vec(&request).unwrap()));
+        assert_eq!(delivery.receipt["publication_authorized"], false);
+    }
+
+    #[test]
+    fn source_failures_stop_before_the_execution_frontier() {
+        use super::super::source_delivery::SourcePeer;
+
+        let source = tempfile::tempdir().unwrap();
+        let (upload, request) = source_request(source.path());
+        for case in 0..7 {
+            let parent = tempfile::tempdir().unwrap();
+            let destination = parent.path().join("delivery");
+            let mut peer = fixture(&destination);
+            source_replies(&mut peer, &request);
+            match case {
+                0 => peer.replies[0]["source_transfers"] = json!([]),
+                1 => peer.replies[1]["request_id"] = json!(8),
+                2 => peer.replies[2]["next_offset"] = json!(0),
+                3 => peer.replies[3]["manifest_sha256"] = json!("00".repeat(32)),
+                4 => peer.replies[3]["sealed"] = json!(false),
+                5 => peer.fail_send = Some("source-chunk"),
+                _ => { peer.replies.remove(3); }
+            }
+            let failure = receive_execution(
+                &mut SourcePeer::new(&mut peer, &upload, &request).unwrap(),
+                &request, "worker", &destination,
+            ).unwrap_err();
+            assert!(!failure.execution_may_have_run, "case {case}: {failure}");
+            assert!(!peer.sent.iter().any(|frame| frame["kind"] == "canonical-exec"));
+            assert!(no_ack(&peer));
+            assert!(!destination.join("delivery.json").exists());
+        }
+    }
+
+    #[test]
+    fn invalid_source_identity_is_rejected_without_contacting_the_worker() {
+        let source = tempfile::tempdir().unwrap();
+        let (_, original) = source_request(source.path());
+        for case in 0..6 {
+            let mut request = original.clone();
+            match case {
+                0 => request["workspace_backing"] = json!("/ws"),
+                1 => request["source_manifest"] = Value::Null,
+                2 => request["source_manifest"]["manifest_sha256"] = json!("00".repeat(32)),
+                3 => request["source_manifest"]["files"][0]["path"] = json!("../private.key"),
+                4 => request["source_manifest"]["files"][0]["bytes"] = json!(u64::MAX),
+                _ => { request.as_object_mut().unwrap().remove("source_manifest"); }
+            }
+            let parent = tempfile::tempdir().unwrap();
+            let destination = parent.path().join("delivery");
+            let mut peer = fixture(&destination);
+            let failure = receive_execution(&mut peer, &request, "worker", &destination).unwrap_err();
+            assert!(!failure.execution_may_have_run, "case {case}");
+            assert!(peer.sent.is_empty());
+            assert_eq!(peer.replies.len(), 7);
+            assert!(!destination.exists());
+        }
+    }
+
+    #[test]
+    fn source_backed_result_recovery_needs_no_checkout_or_source_upload() {
+        let parent = tempfile::tempdir().unwrap();
+        let request = {
+            let source = tempfile::tempdir().unwrap();
+            source_request(source.path()).1
+        };
+        let destination = parent.path().join("resumed");
+        let mut peer = resumable(&destination);
+        let delivery = receive_operation(
+            &mut peer, &request, "worker", &destination, DeliveryMode::Resume,
+        ).unwrap();
+        assert!(delivery.acknowledgments_confirmed);
+        assert_eq!(peer.sent[1], DeliveryMode::Resume.frame(&request));
+        assert!(!peer.sent.iter().any(|frame| {
+            matches!(frame["kind"].as_str(), Some("canonical-exec" | "source-begin" | "source-chunk" | "source-seal"))
+        }));
+        super::super::delivery_recovery::recover_existing_delivery(
+            &request, "worker", &destination,
+            super::super::delivery_recovery::DeliveryTrust::Loopback,
+        ).unwrap().unwrap();
     }
 }
