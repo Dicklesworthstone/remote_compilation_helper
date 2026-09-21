@@ -178,7 +178,11 @@ export interface Alert {
 }
 
 /** Wire form of an rchd issue: `[severity, summary, remediation]`. */
-export type IssueTuple = [severity: string | null, summary: string | null, remediation: string | null];
+export type IssueTuple = [
+  severity: string | null,
+  summary: string | null,
+  remediation: string | null,
+];
 
 export interface Issue {
   severity: string | null;
@@ -353,7 +357,12 @@ export interface Dispatcher {
     passed: number;
     warnings: number;
     failed: number;
-    failing: [name: string | null, status: string | null, message: string | null, fixable: boolean][];
+    failing: [
+      name: string | null,
+      status: string | null,
+      message: string | null,
+      fixable: boolean,
+    ][];
   } | null;
   /**
    * `rch shim status`: is the cargo shim installed, current and first on PATH,
@@ -379,7 +388,10 @@ export interface Dispatcher {
     runs: number;
     passed: number;
     failed: number;
-    scope?: { source: "stored_history" } | { source: "recent_memory"; max_records: number } | { source: "unknown" };
+    scope?:
+      | { source: "stored_history" }
+      | { source: "recent_memory"; max_records: number }
+      | { source: "unknown" };
   } | null;
   /**
    * This machine's own derated slot reading for every worker in the fleet, as

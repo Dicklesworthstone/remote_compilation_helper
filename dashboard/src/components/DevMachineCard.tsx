@@ -1,6 +1,6 @@
-import type { DispatcherView } from "../types";
 import { fmtDuration, fmtUptime } from "../derive";
 import { isHookDead, isStalledBuild } from "../problems";
+import type { DispatcherView } from "../types";
 
 interface Props {
   d: DispatcherView;
@@ -23,17 +23,20 @@ export function DevMachineCard({ d, onOpen }: Props) {
   const recentRemote = recent.filter((b) => (b.location ?? "").toLowerCase() === "remote").length;
   const shownRemote = recent.length > 0 ? recentRemote : (s?.remote ?? 0);
   const shownLocal = recent.length > 0 ? recent.length - recentRemote : (s?.local ?? 0);
-  const shownCounted = recent.length > 0 ? recent.length : (s ? s.remote + s.local : 0);
+  const shownCounted = recent.length > 0 ? recent.length : s ? s.remote + s.local : 0;
   const windowTag = d.remoteBasis === "recent" ? " recent" : "";
   // Bar colour encodes the remote share itself, not the posture: a box pushing
   // 100% of its builds to the pool is doing the right thing even when some
   // workers are pressure-blocked (posture "degraded") — the pill above carries
   // that alarm. Red here means builds are mostly landing locally.
-  const cls =
-    remotePct == null ? "off" : remotePct < 50 ? "crit" : remotePct < 80 ? "warn" : "ok";
+  const cls = remotePct == null ? "off" : remotePct < 50 ? "crit" : remotePct < 80 ? "warn" : "ok";
 
   return (
-    <button className="wcard" onClick={() => onOpen(d.id)} title={`View details for dev machine ${d.id}`}>
+    <button
+      className="wcard"
+      onClick={() => onOpen(d.id)}
+      title={`View details for dev machine ${d.id}`}
+    >
       <div className="wcard-top">
         <span className="wname">{d.id}</span>
         <span className={`pill dev-${d.level}`}>{d.level}</span>
@@ -61,9 +64,7 @@ export function DevMachineCard({ d, onOpen }: Props) {
             <i className={cls} style={{ width: `${remotePct ?? 0}%` }} />
           </span>
           <span className="metric-value">
-            {shownCounted > 0
-              ? `${shownRemote}R / ${shownLocal}L${windowTag}`
-              : "no builds"}
+            {shownCounted > 0 ? `${shownRemote}R / ${shownLocal}L${windowTag}` : "no builds"}
           </span>
         </div>
         <div className="metric">
@@ -74,7 +75,10 @@ export function DevMachineCard({ d, onOpen }: Props) {
               style={{
                 width: `${
                   d.daemon?.slots_total
-                    ? ((d.daemon.slots_total - (d.daemon.slots_available ?? 0)) / d.daemon.slots_total) * 100
+                    ? (
+                        (d.daemon.slots_total - (d.daemon.slots_available ?? 0)) /
+                          d.daemon.slots_total
+                      ) * 100
                     : 0
                 }%`,
               }}
@@ -113,15 +117,24 @@ export function DevMachineCard({ d, onOpen }: Props) {
         <div className="card-flags">
           {d.hook?.claude_code === false && <span className="pill critical">hook missing</span>}
           {d.shim?.installed === false && <span className="pill warn">shim missing</span>}
-          {d.shim?.installed === true && (d.shim.up_to_date === false || d.shim.on_path === false) && (
-            <span className="pill warn">shim stale</span>
-          )}
+          {d.shim?.installed === true &&
+            (d.shim.up_to_date === false || d.shim.on_path === false) && (
+              <span className="pill warn">shim stale</span>
+            )}
           {(d.shim?.local_builds_running ?? 0) > 0 && (
-            <span className="pill critical">{d.shim!.local_builds_running} compiling outside rch</span>
+            <span className="pill critical">
+              {d.shim!.local_builds_running} compiling outside rch
+            </span>
           )}
-          {(d.doctor?.failed ?? 0) > 0 && <span className="pill critical">doctor: {d.doctor!.failed} failed</span>}
-          {d.active_records.some(isHookDead) && <span className="pill critical">build hook dead</span>}
-          {d.active_records.some(isStalledBuild) && <span className="pill warn">build stalled</span>}
+          {(d.doctor?.failed ?? 0) > 0 && (
+            <span className="pill critical">doctor: {d.doctor!.failed} failed</span>
+          )}
+          {d.active_records.some(isHookDead) && (
+            <span className="pill critical">build hook dead</span>
+          )}
+          {d.active_records.some(isStalledBuild) && (
+            <span className="pill warn">build stalled</span>
+          )}
         </div>
       )}
 

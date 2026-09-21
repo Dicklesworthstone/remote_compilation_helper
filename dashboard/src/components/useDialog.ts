@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, type MouseEvent } from "react";
+import { type MouseEvent, useCallback, useEffect, useRef } from "react";
 
 /**
  * Backs both drawers with a native <dialog>. showModal() provides the focus

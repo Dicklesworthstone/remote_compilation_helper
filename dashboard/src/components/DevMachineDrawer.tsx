@@ -1,7 +1,7 @@
 import { useMemo, useState } from "react";
-import type { DispatcherView } from "../types";
 import { fmtAge, fmtDuration, fmtUptime } from "../derive";
 import { isHookDead, isStalledBuild } from "../problems";
+import type { DispatcherView } from "../types";
 import { useDialog } from "./useDialog";
 
 interface Props {
@@ -90,12 +90,14 @@ export function DevMachineDrawer({ d, snapshotMs, onClose, onOpenWorker, fleetWo
       onClick={onClick}
       onKeyDown={onKeyDown}
     >
-          <div className="drawer-head">
-            <h3>{d.id}</h3>
-            <span className={`pill dev-${d.level}`}>{d.level}</span>
-            <span style={{ flex: 1 }} />
-            <button className="icon-btn" onClick={onClose}>Close</button>
-          </div>
+      <div className="drawer-head">
+        <h3>{d.id}</h3>
+        <span className={`pill dev-${d.level}`}>{d.level}</span>
+        <span style={{ flex: 1 }} />
+        <button className="icon-btn" onClick={onClose}>
+          Close
+        </button>
+      </div>
       <div className="drawer-host">
         <span>dev machine · dispatches builds to the pool</span>
         <button
@@ -132,9 +134,10 @@ export function DevMachineDrawer({ d, snapshotMs, onClose, onOpenWorker, fleetWo
           {(() => {
             // Counts must match the window the share was measured over.
             const recent = d.remoteBasis === "recent" ? (d.recent_builds ?? []) : [];
-            const r = recent.length > 0
-              ? recent.filter((b) => (b.location ?? "").toLowerCase() === "remote").length
-              : (s?.remote ?? null);
+            const r =
+              recent.length > 0
+                ? recent.filter((b) => (b.location ?? "").toLowerCase() === "remote").length
+                : (s?.remote ?? null);
             const l = recent.length > 0 ? recent.length - (r ?? 0) : (s?.local ?? null);
             return (
               <>
@@ -155,8 +158,14 @@ export function DevMachineDrawer({ d, snapshotMs, onClose, onOpenWorker, fleetWo
           <Row k="Version" v={d.daemon?.version ?? "—"} />
           <Row k="Uptime" v={fmtUptime(d.daemon?.uptime_secs ?? null)} />
           <Row k="PID" v={d.daemon?.pid ?? "—"} />
-          <Row k="Workers healthy" v={`${d.daemon?.workers_healthy ?? "—"} / ${d.daemon?.workers_total ?? "—"}`} />
-          <Row k="Slots free" v={`${d.daemon?.slots_available ?? "—"} / ${d.daemon?.slots_total ?? "—"}`} />
+          <Row
+            k="Workers healthy"
+            v={`${d.daemon?.workers_healthy ?? "—"} / ${d.daemon?.workers_total ?? "—"}`}
+          />
+          <Row
+            k="Slots free"
+            v={`${d.daemon?.slots_available ?? "—"} / ${d.daemon?.slots_total ?? "—"}`}
+          />
           <Row k="Active / queued" v={`${d.active_builds} / ${d.queued_builds}`} />
         </dl>
       </div>
@@ -164,21 +173,25 @@ export function DevMachineDrawer({ d, snapshotMs, onClose, onOpenWorker, fleetWo
       <div className="kv-group">
         <h4>Interception on this box</h4>
         <p className="note">
-          Three ways a dev machine quietly stops offloading while every worker looks fine: no
-          hook, no shim, or compiles started outside both. <code>unknown</code> means the probe
-          did not answer — not that it is fine.
+          Three ways a dev machine quietly stops offloading while every worker looks fine: no hook,
+          no shim, or compiles started outside both. <code>unknown</code> means the probe did not
+          answer — not that it is fine.
         </p>
         <dl style={{ margin: 0 }}>
           <Row
             k="Claude Code hook"
             v={
-              d.hook
-                ? d.hook.claude_code === true
-                  ? "installed"
-                  : d.hook.claude_code === false
-                    ? <span className="fail-mark">NOT INSTALLED — run rch hook install</span>
-                    : "unknown"
-                : "unknown (probe did not answer)"
+              d.hook ? (
+                d.hook.claude_code === true ? (
+                  "installed"
+                ) : d.hook.claude_code === false ? (
+                  <span className="fail-mark">NOT INSTALLED — run rch hook install</span>
+                ) : (
+                  "unknown"
+                )
+              ) : (
+                "unknown (probe did not answer)"
+              )
             }
           />
           {d.hook && d.hook.agents.length > 0 && (
@@ -193,37 +206,50 @@ export function DevMachineDrawer({ d, snapshotMs, onClose, onOpenWorker, fleetWo
           <Row
             k="cargo shim"
             v={
-              d.shim
-                ? d.shim.installed === false
-                  ? <span className="fail-mark">not installed — run rch shim install</span>
-                  : d.shim.installed === true
-                    ? `installed${d.shim.up_to_date === false ? " · OUT OF DATE" : ""}${d.shim.on_path === false ? " · SHADOWED on PATH" : ""}` +
-                      `${d.shim.interception ? ` · ${d.shim.interception}` : ""}` +
-                      `${d.shim.toolchains_wrapped != null && d.shim.toolchains_total != null ? ` · ${d.shim.toolchains_wrapped}/${d.shim.toolchains_total} toolchains wrapped` : ""}`
-                    : "unknown"
-                : "unknown (probe did not answer)"
+              d.shim ? (
+                d.shim.installed === false ? (
+                  <span className="fail-mark">not installed — run rch shim install</span>
+                ) : d.shim.installed === true ? (
+                  `installed${d.shim.up_to_date === false ? " · OUT OF DATE" : ""}${d.shim.on_path === false ? " · SHADOWED on PATH" : ""}` +
+                  `${d.shim.interception ? ` · ${d.shim.interception}` : ""}` +
+                  `${d.shim.toolchains_wrapped != null && d.shim.toolchains_total != null ? ` · ${d.shim.toolchains_wrapped}/${d.shim.toolchains_total} toolchains wrapped` : ""}`
+                ) : (
+                  "unknown"
+                )
+              ) : (
+                "unknown (probe did not answer)"
+              )
             }
           />
           <Row
             k="Compiles outside rch"
             v={
-              d.shim?.local_builds_running == null
-                ? "unknown"
-                : d.shim.local_builds_running > 0
-                  ? <span className="fail-mark">{d.shim.local_builds_running} running right now</span>
-                  : "none"
+              d.shim?.local_builds_running == null ? (
+                "unknown"
+              ) : d.shim.local_builds_running > 0 ? (
+                <span className="fail-mark">{d.shim.local_builds_running} running right now</span>
+              ) : (
+                "none"
+              )
             }
           />
           <Row
             k="rch doctor"
             v={
-              d.doctor
-                ? d.doctor.failed > 0
-                  ? <span className="fail-mark">{d.doctor.failed} failed · {d.doctor.warnings} warnings · {d.doctor.passed}/{d.doctor.total} passed</span>
-                  : d.doctor.warnings > 0
-                    ? `${d.doctor.warnings} warning${d.doctor.warnings === 1 ? "" : "s"} · ${d.doctor.passed}/${d.doctor.total} passed`
-                    : `${d.doctor.passed}/${d.doctor.total} passed`
-                : "unknown (probe did not answer)"
+              d.doctor ? (
+                d.doctor.failed > 0 ? (
+                  <span className="fail-mark">
+                    {d.doctor.failed} failed · {d.doctor.warnings} warnings · {d.doctor.passed}/
+                    {d.doctor.total} passed
+                  </span>
+                ) : d.doctor.warnings > 0 ? (
+                  `${d.doctor.warnings} warning${d.doctor.warnings === 1 ? "" : "s"} · ${d.doctor.passed}/${d.doctor.total} passed`
+                ) : (
+                  `${d.doctor.passed}/${d.doctor.total} passed`
+                )
+              ) : (
+                "unknown (probe did not answer)"
+              )
             }
           />
           {d.doctor && d.doctor.failing.length > 0 && (
@@ -256,12 +282,15 @@ export function DevMachineDrawer({ d, snapshotMs, onClose, onOpenWorker, fleetWo
           )}
           {d.tests && d.tests.runs > 0 && (
             <Row
-              k={`Test commands (${d.tests.scope?.source === "stored_history"
-                ? "all stored records"
-                : d.tests.scope?.source === "recent_memory" &&
-                  Number.isSafeInteger(d.tests.scope.max_records) && d.tests.scope.max_records >= 0
-                  ? `recent memory up to ${d.tests.scope.max_records}`
-                  : "scope unknown"})`}
+              k={`Test commands (${
+                d.tests.scope?.source === "stored_history"
+                  ? "all stored records"
+                  : d.tests.scope?.source === "recent_memory" &&
+                      Number.isSafeInteger(d.tests.scope.max_records) &&
+                      d.tests.scope.max_records >= 0
+                    ? `recent memory up to ${d.tests.scope.max_records}`
+                    : "scope unknown"
+              })`}
               v={`${d.tests.runs} · ${d.tests.passed} succeeded · ${d.tests.failed} failed`}
             />
           )}
@@ -270,37 +299,60 @@ export function DevMachineDrawer({ d, snapshotMs, onClose, onOpenWorker, fleetWo
 
       {(d.active_records.length > 0 || d.queued_records.length > 0) && (
         <div className="kv-group">
-          <h4>Builds in flight ({d.active_records.length} active · {d.queued_records.length} queued)</h4>
+          <h4>
+            Builds in flight ({d.active_records.length} active · {d.queued_records.length} queued)
+          </h4>
           <div className="builds inflight">
             {d.active_records.map((b, i) => {
               // Same rules as the problem list and the card — see src/problems.js.
               const dead = isHookDead(b);
               const stalled = isStalledBuild(b);
               return (
-                <div key={`${b.id ?? ""}|${i}`} className="build-row" title={b.command ?? undefined}>
+                <div
+                  key={`${b.id ?? ""}|${i}`}
+                  className="build-row"
+                  title={b.command ?? undefined}
+                >
                   <span className={`pill ${dead ? "critical" : stalled ? "warn" : "busy"}`}>
-                    {dead ? "hook dead" : stalled ? "stalled" : b.phase ?? "active"}
+                    {dead ? "hook dead" : stalled ? "stalled" : (b.phase ?? "active")}
                   </span>
                   <span className="build-proj">{b.project ?? "—"}</span>
                   {b.worker_id && fleetWorkerIds.has(b.worker_id) ? (
-                    <button className="link" onClick={() => onOpenWorker(b.worker_id as string)} title={`Open worker ${b.worker_id}`}>
+                    <button
+                      className="link"
+                      onClick={() => onOpenWorker(b.worker_id as string)}
+                      title={`Open worker ${b.worker_id}`}
+                    >
                       {b.worker_id}
                     </button>
                   ) : (
                     <span className="metric-value">{b.worker_id ?? "—"}</span>
                   )}
-                  <span className="metric-value" title="build age / since last progress (snapshot time)">
+                  <span
+                    className="metric-value"
+                    title="build age / since last progress (snapshot time)"
+                  >
                     {b.build_age_secs != null ? fmtAge(b.build_age_secs).replace(" ago", "") : "—"}
                     {b.progress_age_secs != null && b.progress_age_secs > 120 && (
-                      <span className="stall-mark"> · no progress {fmtAge(b.progress_age_secs).replace(" ago", "")}</span>
+                      <span className="stall-mark">
+                        {" "}
+                        · no progress {fmtAge(b.progress_age_secs).replace(" ago", "")}
+                      </span>
                     )}
                   </span>
-                  <span className="metric-value">{b.slots != null ? `${b.slots} slots` : ""}{b.id ? ` · #${b.id}` : ""}</span>
+                  <span className="metric-value">
+                    {b.slots != null ? `${b.slots} slots` : ""}
+                    {b.id ? ` · #${b.id}` : ""}
+                  </span>
                 </div>
               );
             })}
             {d.queued_records.map((q, i) => (
-              <div key={`q|${q.id ?? ""}|${i}`} className="build-row" title={q.command ?? undefined}>
+              <div
+                key={`q|${q.id ?? ""}|${i}`}
+                className="build-row"
+                title={q.command ?? undefined}
+              >
                 <span className="pill warn">queued #{q.position ?? "?"}</span>
                 <span className="build-proj">{q.project ?? "—"}</span>
                 <span className="metric-value">needs {q.slots_needed ?? "?"} slots</span>
@@ -320,16 +372,23 @@ export function DevMachineDrawer({ d, snapshotMs, onClose, onOpenWorker, fleetWo
             return (
               <div key={`a|${a.kind ?? ""}|${a.worker_id ?? ""}|${i}`} className="hint">
                 <div className="hint-top">
-                  <span className={`pill ${a.severity === "critical" || a.severity === "error" ? "critical" : "warn"}`}>
+                  <span
+                    className={`pill ${a.severity === "critical" || a.severity === "error" ? "critical" : "warn"}`}
+                  >
                     {a.kind ?? a.severity ?? "alert"}
                   </span>
                   {a.worker_id && fleetWorkerIds.has(a.worker_id) ? (
-                    <button className="link" onClick={() => onOpenWorker(a.worker_id as string)}>{a.worker_id}</button>
+                    <button className="link" onClick={() => onOpenWorker(a.worker_id as string)}>
+                      {a.worker_id}
+                    </button>
                   ) : (
                     a.worker_id && <span className="metric-value">{a.worker_id}</span>
                   )}
                   <span className="metric-value">
-                    {a.state ?? ""}{Number.isFinite(sinceMs) ? ` · since ${fmtAge((snapshotMs - sinceMs) / 1000)}` : ""}
+                    {a.state ?? ""}
+                    {Number.isFinite(sinceMs)
+                      ? ` · since ${fmtAge((snapshotMs - sinceMs) / 1000)}`
+                      : ""}
                   </span>
                 </div>
                 <div className="hint-msg">{a.message}</div>
@@ -339,7 +398,9 @@ export function DevMachineDrawer({ d, snapshotMs, onClose, onOpenWorker, fleetWo
           {d.issue_records.map((it, i) => (
             <div key={`i|${it.summary ?? ""}|${i}`} className="hint">
               <div className="hint-top">
-                <span className={`pill ${it.severity === "critical" || it.severity === "error" ? "critical" : "warn"}`}>
+                <span
+                  className={`pill ${it.severity === "critical" || it.severity === "error" ? "critical" : "warn"}`}
+                >
                   {it.severity ?? "issue"}
                 </span>
               </div>
@@ -353,9 +414,9 @@ export function DevMachineDrawer({ d, snapshotMs, onClose, onOpenWorker, fleetWo
       <div className="kv-group">
         <h4>This machine's view of the pool</h4>
         <p className="note">
-          rchd derates every worker from live RAM/disk telemetry, independently on each
-          dispatcher. A worker derated to <code>0</code> slots is invisible to any build — the
-          root cause of a machine quietly going local.
+          rchd derates every worker from live RAM/disk telemetry, independently on each dispatcher.
+          A worker derated to <code>0</code> slots is invisible to any build — the root cause of a
+          machine quietly going local.
         </p>
         <dl style={{ margin: 0 }}>
           <Row k="Workers seen" v={pool.count} />
@@ -391,12 +452,16 @@ export function DevMachineDrawer({ d, snapshotMs, onClose, onOpenWorker, fleetWo
       <div className="kv-group">
         <h4>Recent builds ({buildRows.length})</h4>
         {buildRows.length === 0 ? (
-          <div className="empty" style={{ padding: 16 }}>no builds recorded</div>
+          <div className="empty" style={{ padding: 16 }}>
+            no builds recorded
+          </div>
         ) : (
           <div className="builds recent">
             {buildRows.map((b) => (
               <div key={b.key} className="build-row">
-                <span className={`pill ${b.remote ? "healthy" : "warn"}`}>{b.remote ? "remote" : "local"}</span>
+                <span className={`pill ${b.remote ? "healthy" : "warn"}`}>
+                  {b.remote ? "remote" : "local"}
+                </span>
                 <span className="build-proj" title={b.command ?? undefined}>
                   {b.project ?? "—"}
                 </span>
@@ -411,16 +476,18 @@ export function DevMachineDrawer({ d, snapshotMs, onClose, onOpenWorker, fleetWo
                 ) : (
                   <span className="metric-value">{b.worker_id ?? (b.remote ? "?" : "—")}</span>
                 )}
-                <span className="metric-value" title="when the build finished (snapshot time)">{b.ago ?? "—"}</span>
+                <span className="metric-value" title="when the build finished (snapshot time)">
+                  {b.ago ?? "—"}
+                </span>
                 <span className="metric-value">
                   {fmtDuration(b.duration_ms)}
                   {b.failed && <span className="fail-mark"> · exit {b.exit}</span>}
                 </span>
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
     </dialog>
   );
 }

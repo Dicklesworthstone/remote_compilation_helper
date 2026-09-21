@@ -1,21 +1,24 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { Envelope } from "./crypto";
-import { clearKey, decryptEnvelope, deriveKey, loadPersistedKey, persistKey } from "./crypto";
-import type { DispatcherView, HealthLevel, Snapshot, WorkerView } from "./types";
-import {
-  STALE_CRIT_SECONDS, classifyAll, classifyDispatcher,
-  devRank, fmtAge, healthRank,
-} from "./derive";
-import { Gate } from "./components/Gate";
-import { WorkerDrawer } from "./components/WorkerDrawer";
 import { DevMachineCard } from "./components/DevMachineCard";
 import { DevMachineDrawer } from "./components/DevMachineDrawer";
-import { Overview } from "./components/Overview";
-import { Topbar, WorkersSection, type Sort } from "./components/Topbar";
 import { FleetMap } from "./components/FleetMap";
+import { Gate } from "./components/Gate";
+import { Overview } from "./components/Overview";
 import { Problems } from "./components/Problems";
+import { type Sort, Topbar, WorkersSection } from "./components/Topbar";
+import { WorkerDrawer } from "./components/WorkerDrawer";
+import type { Envelope } from "./crypto";
+import { clearKey, decryptEnvelope, deriveKey, loadPersistedKey, persistKey } from "./crypto";
+import {
+  classifyAll,
+  classifyDispatcher,
+  devRank,
+  fmtAge,
+  healthRank,
+  STALE_CRIT_SECONDS,
+} from "./derive";
 import { buildProblems } from "./problems";
-
+import type { DispatcherView, HealthLevel, Snapshot, WorkerView } from "./types";
 
 /** The snapshot baked into this deployment — the fallback, and the only source when no live URL is configured. */
 const STATIC_DATA_URL = `${import.meta.env.BASE_URL}data/fleet.enc.json`;
@@ -100,7 +103,9 @@ export default function App() {
     }
   });
   const [query, setQuery] = useState(() => readViewPref().query);
-  const [statusFilter, setStatusFilter] = useState<HealthLevel | "all">(() => readViewPref().statusFilter);
+  const [statusFilter, setStatusFilter] = useState<HealthLevel | "all">(
+    () => readViewPref().statusFilter,
+  );
   const [sort, setSort] = useState<Sort>(() => readViewPref().sort);
   // When the current snapshot was decrypted — anchors the auto-refresh countdown.
   const [snapAt, setSnapAt] = useState<number | null>(null);
@@ -308,7 +313,8 @@ export default function App() {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.metaKey || e.ctrlKey || e.altKey) return;
       const activeTag = (document.activeElement?.tagName ?? "").toLowerCase();
-      const isInputActive = activeTag === "input" || activeTag === "textarea" || activeTag === "select";
+      const isInputActive =
+        activeTag === "input" || activeTag === "textarea" || activeTag === "select";
       if (isInputActive) return;
       if (openWorker || openDev) return;
 
@@ -359,7 +365,12 @@ export default function App() {
   // would recompute every tick for an identical result.
   const workers: WorkerView[] = useMemo(() => (snap ? classifyAll(snap) : []), [snap]);
   const devs: DispatcherView[] = useMemo(
-    () => (snap ? snap.dispatchers.map(classifyDispatcher).sort((a, b) => devRank(a.level) - devRank(b.level) || a.id.localeCompare(b.id)) : []),
+    () =>
+      snap
+        ? snap.dispatchers
+            .map(classifyDispatcher)
+            .sort((a, b) => devRank(a.level) - devRank(b.level) || a.id.localeCompare(b.id))
+        : [],
     [snap],
   );
 
@@ -407,9 +418,12 @@ export default function App() {
     const sorted = [...list];
     sorted.sort((a, b) => {
       switch (sort) {
-        case "name": return a.id.localeCompare(b.id);
-        case "speed": return (b.speed ?? -1) - (a.speed ?? -1) || a.id.localeCompare(b.id);
-        case "disk": return (b.diskUsedPct ?? -1) - (a.diskUsedPct ?? -1) || a.id.localeCompare(b.id);
+        case "name":
+          return a.id.localeCompare(b.id);
+        case "speed":
+          return (b.speed ?? -1) - (a.speed ?? -1) || a.id.localeCompare(b.id);
+        case "disk":
+          return (b.diskUsedPct ?? -1) - (a.diskUsedPct ?? -1) || a.id.localeCompare(b.id);
         case "load": {
           const aLoad = a.slotPct ?? (a.loadPerCore != null ? a.loadPerCore * 50 : -1);
           const bLoad = b.slotPct ?? (b.loadPerCore != null ? b.loadPerCore * 50 : -1);
@@ -420,7 +434,8 @@ export default function App() {
           if (diff !== 0) return diff;
           return (b.used_slots ?? -1) - (a.used_slots ?? -1) || a.id.localeCompare(b.id);
         }
-        default: return healthRank(a.health) - healthRank(b.health) || a.id.localeCompare(b.id);
+        default:
+          return healthRank(a.health) - healthRank(b.health) || a.id.localeCompare(b.id);
       }
     });
     return sorted;
@@ -444,9 +459,7 @@ export default function App() {
   // Minutes until the next auto-refresh, for the header countdown. Anchored to
   // when the current snapshot was decrypted, so it survives re-unlocks.
   const autoInMin =
-    auto && snapAt != null
-      ? Math.max(0, Math.ceil((snapAt + 5 * 60_000 - now) / 60_000))
-      : null;
+    auto && snapAt != null ? Math.max(0, Math.ceil((snapAt + 5 * 60_000 - now) / 60_000)) : null;
   const snapshotMs = new Date(snap.generated_at).getTime();
 
   return (
@@ -468,8 +481,8 @@ export default function App() {
 
       {ageSec > STALE_CRIT_SECONDS && (
         <div className="banner">
-          This snapshot is {fmtAge(ageSec)} old — it may no longer reflect the fleet.
-          Re-run <code>npm run snapshot</code>.
+          This snapshot is {fmtAge(ageSec)} old — it may no longer reflect the fleet. Re-run{" "}
+          <code>npm run snapshot</code>.
         </div>
       )}
 
@@ -496,14 +509,21 @@ export default function App() {
       <section className="section">
         <div className="section-head">
           <h2>Fleet map</h2>
-          <span className="count-pill">{devs.length} ▸ {workers.length}</span>
+          <span className="count-pill">
+            {devs.length} ▸ {workers.length}
+          </span>
           <span className="spacer" />
           <span className="hint-inline">
-            left: dev machines · right: workers · edges = who builds on what —
-            hover to focus, click for details
+            left: dev machines · right: workers · edges = who builds on what — hover to focus, click
+            for details
           </span>
         </div>
-        <FleetMap devs={devs} workers={workers} onOpenDev={openDevFrom} onOpenWorker={openWorkerFrom} />
+        <FleetMap
+          devs={devs}
+          workers={workers}
+          onOpenDev={openDevFrom}
+          onOpenWorker={openWorkerFrom}
+        />
       </section>
 
       <div className="duo">

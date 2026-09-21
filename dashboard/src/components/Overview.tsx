@@ -1,5 +1,5 @@
-import type { Snapshot, HealthLevel } from "../types";
 import { fmtGb } from "../derive";
+import type { HealthLevel, Snapshot } from "../types";
 import { Sparkline } from "./Sparkline";
 
 interface Props {
@@ -30,19 +30,30 @@ export function Overview({ snap, counts, hardProblems }: Props) {
         <div className="kpi" style={{ ["--kpi-accent" as string]: "var(--accent)" }}>
           <div className="kpi-label">Workers</div>
           <div className="kpi-value">{t.workers}</div>
-          <div className="kpi-sub">{counts.healthy ?? 0} healthy · {counts.busy ?? 0} busy</div>
+          <div className="kpi-sub">
+            {counts.healthy ?? 0} healthy · {counts.busy ?? 0} busy
+          </div>
         </div>
-        <div className="kpi" style={{ ["--kpi-accent" as string]: attention > 0 ? "var(--warn)" : "var(--ok)" }}>
+        <div
+          className="kpi"
+          style={{ ["--kpi-accent" as string]: attention > 0 ? "var(--warn)" : "var(--ok)" }}
+        >
           <div className="kpi-label">Needs attention</div>
           <div className="kpi-value">{attention}</div>
           <div className="kpi-sub">
-            {counts.critical ?? 0} critical · {counts.warn ?? 0} warn · {counts.offline ?? 0} offline
+            {counts.critical ?? 0} critical · {counts.warn ?? 0} warn · {counts.offline ?? 0}{" "}
+            offline
           </div>
         </div>
         <div className="kpi" style={{ ["--kpi-accent" as string]: "var(--busy)" }}>
           <div className="kpi-label">Build slots</div>
-          <div className="kpi-value">{t.slots_used}<span className="unit">/ {t.slots}</span></div>
-          <div className="kpi-sub">{t.active_builds} active build{t.active_builds === 1 ? "" : "s"}</div>
+          <div className="kpi-value">
+            {t.slots_used}
+            <span className="unit">/ {t.slots}</span>
+          </div>
+          <div className="kpi-sub">
+            {t.active_builds} active build{t.active_builds === 1 ? "" : "s"}
+          </div>
         </div>
         <div
           className="kpi"
@@ -50,27 +61,35 @@ export function Overview({ snap, counts, hardProblems }: Props) {
         >
           <div className="kpi-label">Dev machines</div>
           <div className="kpi-value">
-            {t.dispatchers_remote_ready}<span className="unit">/ {t.dispatchers_reachable}</span>
+            {t.dispatchers_remote_ready}
+            <span className="unit">/ {t.dispatchers_reachable}</span>
           </div>
           <div className="kpi-sub">
             remote-ready of {t.dispatchers_total} configured
             {(t.dispatchers_hook_missing ?? 0) > 0 && (
-              <span style={{ color: "var(--crit)" }}> · {t.dispatchers_hook_missing} hook missing</span>
+              <span style={{ color: "var(--crit)" }}>
+                {" "}
+                · {t.dispatchers_hook_missing} hook missing
+              </span>
             )}
           </div>
         </div>
         <div
           className="kpi"
-          style={{ ["--kpi-accent" as string]: remotePct != null && remotePct < 80 ? "var(--warn)" : "var(--ok)" }}
+          style={{
+            ["--kpi-accent" as string]:
+              remotePct != null && remotePct < 80 ? "var(--warn)" : "var(--ok)",
+          }}
         >
           <div className="kpi-label">Builds offloaded</div>
-          <div className="kpi-value">
-            {remotePct != null ? `${remotePct.toFixed(0)}%` : "—"}
-          </div>
+          <div className="kpi-value">{remotePct != null ? `${remotePct.toFixed(0)}%` : "—"}</div>
           <div className="kpi-sub">
             {t.builds_remote} remote · {t.builds_local} local
             {(t.local_builds_running ?? 0) > 0 && (
-              <span style={{ color: "var(--crit)" }}> · {t.local_builds_running} compiling outside rch now</span>
+              <span style={{ color: "var(--crit)" }}>
+                {" "}
+                · {t.local_builds_running} compiling outside rch now
+              </span>
             )}
           </div>
         </div>

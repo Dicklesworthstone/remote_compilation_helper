@@ -1,6 +1,6 @@
 import { useState } from "react";
-import type { NextAction, Problem } from "../problems";
 import { fmtAge } from "../derive";
+import type { NextAction, Problem } from "../problems";
 
 interface Props {
   problems: Problem[];
@@ -42,7 +42,15 @@ function CopyButton({ text }: { text: string }) {
  * machines degraded"), which repeated one worker-side root cause once per
  * machine and never said what to run.
  */
-export function Problems({ problems, nextActions, snapshotMs, devIds, workerIds, onOpenDev, onOpenWorker }: Props) {
+export function Problems({
+  problems,
+  nextActions,
+  snapshotMs,
+  devIds,
+  workerIds,
+  onOpenDev,
+  onOpenWorker,
+}: Props) {
   const critical = problems.filter((p) => p.severity === "critical").length;
 
   const targetLink = (target: string) => {
@@ -69,7 +77,9 @@ export function Problems({ problems, nextActions, snapshotMs, devIds, workerIds,
     <section className="section" aria-label="Problems">
       <div className="section-head">
         <h2>Problems</h2>
-        <span className={`count-pill ${critical > 0 ? "crit" : problems.length > 0 ? "warn" : "ok"}`}>
+        <span
+          className={`count-pill ${critical > 0 ? "crit" : problems.length > 0 ? "warn" : "ok"}`}
+        >
           {critical > 0
             ? `${critical} critical · ${problems.length - critical} warn`
             : problems.length > 0
@@ -83,7 +93,9 @@ export function Problems({ problems, nextActions, snapshotMs, devIds, workerIds,
       </div>
 
       {problems.length === 0 ? (
-        <div className="empty ok">No problems. Every reachable dev machine is offloading and every worker is admissible.</div>
+        <div className="empty ok">
+          No problems. Every reachable dev machine is offloading and every worker is admissible.
+        </div>
       ) : (
         <div className="problems-scroll">
           <table className="problems">
@@ -104,7 +116,9 @@ export function Problems({ problems, nextActions, snapshotMs, devIds, workerIds,
                 return (
                   <tr key={`${p.kind}|${p.target}|${i}`} className={`prob-${p.severity}`}>
                     <td>
-                      <span className={`pill ${p.severity === "critical" ? "critical" : "warn"}`}>{p.severity}</span>
+                      <span className={`pill ${p.severity === "critical" ? "critical" : "warn"}`}>
+                        {p.severity}
+                      </span>
                     </td>
                     <td className="mono">{p.kind}</td>
                     <td className="mono">{targetLink(p.target)}</td>
@@ -121,7 +135,9 @@ export function Problems({ problems, nextActions, snapshotMs, devIds, workerIds,
                         "—"
                       )}
                     </td>
-                    <td className="mono">{p.on ? (devIds.has(p.on) ? targetLink(p.on) : p.on) : "—"}</td>
+                    <td className="mono">
+                      {p.on ? (devIds.has(p.on) ? targetLink(p.on) : p.on) : "—"}
+                    </td>
                   </tr>
                 );
               })}
@@ -133,12 +149,15 @@ export function Problems({ problems, nextActions, snapshotMs, devIds, workerIds,
       {nextActions.length > 0 && (
         <details className="next-actions">
           <summary>
-            Next actions — {nextActions.length} distinct command{nextActions.length === 1 ? "" : "s"}, grouped by machine
+            Next actions — {nextActions.length} distinct command
+            {nextActions.length === 1 ? "" : "s"}, grouped by machine
           </summary>
           <ul>
             {nextActions.map((a, i) => (
               <li key={`${a.on}|${a.run}|${i}`}>
-                <span className={`pill ${a.severity === "critical" ? "critical" : "warn"}`}>{a.severity}</span>
+                <span className={`pill ${a.severity === "critical" ? "critical" : "warn"}`}>
+                  {a.severity}
+                </span>
                 <span className="mono">{a.on || "—"}</span>
                 <code>{a.run}</code>
                 <CopyButton text={a.run} />

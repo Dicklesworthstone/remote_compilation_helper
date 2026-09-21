@@ -1,5 +1,5 @@
-import type { HealthLevel, WorkerView } from "../types";
 import { fmtAge, STALE_CRIT_SECONDS, STALE_WARN_SECONDS } from "../derive";
+import type { HealthLevel, WorkerView } from "../types";
 import { WorkerCard } from "./WorkerCard";
 
 interface TopbarProps {
@@ -31,7 +31,9 @@ export function Topbar(p: TopbarProps) {
         <span className={`dot ${dotClass}`} />
         snapshot {fmtAge(p.ageSec)}
         {p.autoInMin != null && (
-          <span className="auto-in" title="Auto-refresh countdown">· auto ~{p.autoInMin}m</span>
+          <span className="auto-in" title="Auto-refresh countdown">
+            · auto ~{p.autoInMin}m
+          </span>
         )}
       </div>
       <button
@@ -87,7 +89,9 @@ export function WorkersSection(p: WorkersProps) {
     <section className="section">
       <div className="section-head">
         <h2>Workers</h2>
-        <span className="count-pill">{p.visible.length} of {p.total}</span>
+        <span className="count-pill">
+          {p.visible.length} of {p.total}
+        </span>
         <span className="spacer" />
         <div className="filters">
           <input
@@ -111,7 +115,8 @@ export function WorkersSection(p: WorkersProps) {
               aria-pressed={p.statusFilter === s}
               onClick={() => p.onStatusFilter(s as HealthLevel | "all")}
             >
-              {s}{s !== "all" && p.counts[s] ? ` ${p.counts[s]}` : ""}
+              {s}
+              {s !== "all" && p.counts[s] ? ` ${p.counts[s]}` : ""}
             </button>
           ))}
           {p.onToggleWeightedSizing && (

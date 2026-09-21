@@ -33,18 +33,25 @@ function hFor(slots: number | null | undefined): number {
 }
 
 function workerDot(w: WorkerView): string {
-  return w.health === "healthy" ? "ok"
-    : w.health === "busy" ? "busy"
-    : w.health === "warn" ? "warn"
-    : w.health === "critical" ? "crit"
-    : "off";
+  return w.health === "healthy"
+    ? "ok"
+    : w.health === "busy"
+      ? "busy"
+      : w.health === "warn"
+        ? "warn"
+        : w.health === "critical"
+          ? "crit"
+          : "off";
 }
 
 function devDot(d: DispatcherView): string {
-  return d.level === "offloading" ? "ok"
-    : d.level === "idle" ? "off"
-    : d.level === "degraded" ? "warn"
-    : "crit";
+  return d.level === "offloading"
+    ? "ok"
+    : d.level === "idle"
+      ? "off"
+      : d.level === "degraded"
+        ? "warn"
+        : "crit";
 }
 
 /** True when the viewport is wide enough for the bipartite map. */
@@ -85,15 +92,21 @@ export function FleetMap({ devs: rawDevs, workers: rawWorkers, onOpenDev, onOpen
   // by the size of the pool they can reach. Health breaks ties (problems float
   // within a size band), then id for determinism.
   const workers = useMemo(
-    () => [...rawWorkers].sort((a, b) =>
-      (b.total_slots ?? 0) - (a.total_slots ?? 0) ||
-      a.health.localeCompare(b.health) ||
-      a.id.localeCompare(b.id)),
+    () =>
+      [...rawWorkers].sort(
+        (a, b) =>
+          (b.total_slots ?? 0) - (a.total_slots ?? 0) ||
+          a.health.localeCompare(b.health) ||
+          a.id.localeCompare(b.id),
+      ),
     [rawWorkers],
   );
   const devs = useMemo(
-    () => [...rawDevs].sort((a, b) =>
-      devCap(b) - devCap(a) || a.level.localeCompare(b.level) || a.id.localeCompare(b.id)),
+    () =>
+      [...rawDevs].sort(
+        (a, b) =>
+          devCap(b) - devCap(a) || a.level.localeCompare(b.level) || a.id.localeCompare(b.id),
+      ),
     [rawDevs],
   );
 
@@ -110,10 +123,7 @@ export function FleetMap({ devs: rawDevs, workers: rawWorkers, onOpenDev, onOpen
 
   // Workers no machine reports: real orphans get their own lane at the bottom
   // (zero capacity → smallest nodes) rather than silently looking connected.
-  const orphans = useMemo(
-    () => workers.filter((w) => (w.seen_by?.length ?? 0) === 0),
-    [workers],
-  );
+  const orphans = useMemo(() => workers.filter((w) => (w.seen_by?.length ?? 0) === 0), [workers]);
 
   if (workers.length === 0 && devs.length === 0) return null;
   return wide ? (
@@ -186,7 +196,16 @@ interface WideProps extends Props {
   setFocus: (id: string | null) => void;
 }
 
-function BipartiteMap({ devs, workers, orphans, edges, focus, setFocus, onOpenDev, onOpenWorker }: WideProps) {
+function BipartiteMap({
+  devs,
+  workers,
+  orphans,
+  edges,
+  focus,
+  setFocus,
+  onOpenDev,
+  onOpenWorker,
+}: WideProps) {
   const wrapRef = useRef<HTMLDivElement | null>(null);
   const [width, setWidth] = useState(900);
 
@@ -260,7 +279,9 @@ function BipartiteMap({ devs, workers, orphans, edges, focus, setFocus, onOpenDe
               <span className="fm-fill dev" style={{ width: `${pct}%` }} aria-hidden="true" />
               <span className={`fm-dot ${devDot(d)}`} />
               <span className="fm-name">{d.id}</span>
-              <span className="fm-sub">{used}/{cap}</span>
+              <span className="fm-sub">
+                {used}/{cap}
+              </span>
             </button>
           );
         })}
@@ -272,17 +293,30 @@ function BipartiteMap({ devs, workers, orphans, edges, focus, setFocus, onOpenDe
             <button
               key={w.id}
               className={`fm-node worker ${isWorkhorse ? "workhorse" : ""} ${(w.used_slots ?? 0) > 0 ? "active" : ""}`}
-              style={{ left: width - COL_W + 18, top: workerOffs[i], height: workerHeights[i], width: COL_W - 18 }}
+              style={{
+                left: width - COL_W + 18,
+                top: workerOffs[i],
+                height: workerHeights[i],
+                width: COL_W - 18,
+              }}
               onMouseEnter={() => setFocus(w.id)}
               onFocus={() => setFocus(w.id)}
               onClick={() => onOpenWorker(w.id)}
               title={`${w.id} — ${w.health} · ${w.used_slots ?? 0}/${w.total_slots ?? "—"} slots${isWorkhorse ? " (Workhorse)" : ""} — open details`}
             >
-              <span className={`fm-fill ${pct >= 88 ? "hot" : "use"}`} style={{ width: `${Math.min(100, pct)}%` }} aria-hidden="true" />
+              <span
+                className={`fm-fill ${pct >= 88 ? "hot" : "use"}`}
+                style={{ width: `${Math.min(100, pct)}%` }}
+                aria-hidden="true"
+              />
               <span className={`fm-dot ${workerDot(w)}`} />
               <span className="fm-name">
                 {w.id}
-                {isWorkhorse && <span className="fm-workhorse-tag" title="Workhorse capacity (16+ slots)">⚡</span>}
+                {isWorkhorse && (
+                  <span className="fm-workhorse-tag" title="Workhorse capacity (16+ slots)">
+                    ⚡
+                  </span>
+                )}
               </span>
               <span className="fm-sub">
                 {w.used_slots ?? 0}/{w.total_slots ?? "—"}
@@ -324,12 +358,18 @@ function GroupedMap({ devs, workers, orphans, onOpenDev, onOpenWorker }: NarrowP
         key={`${dev ?? "fleet"}|${w.id}`}
         className={`fm-chip${invisible ? " inv" : ""}${big ? " big" : ""}`}
         onClick={() => onOpenWorker(w.id)}
-        title={invisible ? `${w.id} is derated to 0 slots on ${dev} — invisible to it` : `${w.id} — ${w.health}`}
+        title={
+          invisible
+            ? `${w.id} is derated to 0 slots on ${dev} — invisible to it`
+            : `${w.id} — ${w.health}`
+        }
       >
         <span className={`fm-dot ${workerDot(w)}`} />
         {w.id}
         <span className="fm-sub">
-          {pair ? `${pair.used ?? 0}/${pair.total ?? "—"}` : `${w.used_slots ?? 0}/${w.total_slots ?? "—"}`}
+          {pair
+            ? `${pair.used ?? 0}/${pair.total ?? "—"}`
+            : `${w.used_slots ?? 0}/${w.total_slots ?? "—"}`}
         </span>
       </button>
     );
@@ -344,11 +384,16 @@ function GroupedMap({ devs, workers, orphans, onOpenDev, onOpenWorker }: NarrowP
             <button className={`fm-node dev static ${devDot(d)}`} onClick={() => onOpenDev(d.id)}>
               <span className="fm-name">{d.id}</span>
               <span className="fm-sub">
-                {d.level} · {list.length} worker{list.length === 1 ? "" : "s"} · pool {devUsed(d)}/{devCap(d)}
+                {d.level} · {list.length} worker{list.length === 1 ? "" : "s"} · pool {devUsed(d)}/
+                {devCap(d)}
               </span>
             </button>
             <div className="fm-chips">
-              {list.length > 0 ? list.map((w) => workerChip(w, d.id)) : <span className="fm-sub">sees no workers</span>}
+              {list.length > 0 ? (
+                list.map((w) => workerChip(w, d.id))
+              ) : (
+                <span className="fm-sub">sees no workers</span>
+              )}
             </div>
           </div>
         );

@@ -17,14 +17,25 @@ interface Props {
  * polyline, and this way the colours are the same CSS tokens as everything else.
  * Hovering shows the value (and age, when `times` is given) at the nearest point.
  */
-export function Sparkline({ values, times, format, filled = true, stroke = "var(--accent)", label }: Props) {
+export function Sparkline({
+  values,
+  times,
+  format,
+  filled = true,
+  stroke = "var(--accent)",
+  label,
+}: Props) {
   // useId, not a hash of the data: two sparklines whose first value and length
   // happen to match would otherwise share one gradient element. Hooks must run
   // unconditionally, so these sit above the early return.
   const id = useId();
   const [hover, setHover] = useState<number | null>(null);
   if (values.length < 2) {
-    return <div className="empty" style={{ padding: 16 }}>not enough history yet</div>;
+    return (
+      <div className="empty" style={{ padding: 16 }}>
+        not enough history yet
+      </div>
+    );
   }
   const w = 100;
   const h = 30;
@@ -36,7 +47,9 @@ export function Sparkline({ values, times, format, filled = true, stroke = "var(
     const y = h - ((v - min) / span) * (h - 4) - 2;
     return [x, y] as const;
   });
-  const line = pts.map(([x, y], i) => `${i === 0 ? "M" : "L"}${x.toFixed(2)},${y.toFixed(2)}`).join(" ");
+  const line = pts
+    .map(([x, y], i) => `${i === 0 ? "M" : "L"}${x.toFixed(2)},${y.toFixed(2)}`)
+    .join(" ");
   const area = `${line} L${w},${h} L0,${h} Z`;
 
   const hoverTip = (() => {
@@ -58,8 +71,13 @@ export function Sparkline({ values, times, format, filled = true, stroke = "var(
       }}
       onPointerLeave={() => setHover(null)}
     >
-      <svg className="spark" viewBox={`0 0 ${w} ${h}`} preserveAspectRatio="none" role="img"
-           aria-label={label ?? "trend"}>
+      <svg
+        className="spark"
+        viewBox={`0 0 ${w} ${h}`}
+        preserveAspectRatio="none"
+        role="img"
+        aria-label={label ?? "trend"}
+      >
         <defs>
           <linearGradient id={id} x1="0" y1="0" x2="0" y2="1">
             <stop offset="0%" stopColor={stroke} stopOpacity="0.30" />
@@ -67,10 +85,23 @@ export function Sparkline({ values, times, format, filled = true, stroke = "var(
           </linearGradient>
         </defs>
         {filled && <path d={area} fill={`url(#${id})`} />}
-        <path d={line} fill="none" stroke={stroke} strokeWidth="1.5"
-              vectorEffect="non-scaling-stroke" strokeLinejoin="round" strokeLinecap="round" />
+        <path
+          d={line}
+          fill="none"
+          stroke={stroke}
+          strokeWidth="1.5"
+          vectorEffect="non-scaling-stroke"
+          strokeLinejoin="round"
+          strokeLinecap="round"
+        />
         {hover != null && pts[hover] && (
-          <circle cx={pts[hover][0]} cy={pts[hover][1]} r="2" fill={stroke} vectorEffect="non-scaling-stroke" />
+          <circle
+            cx={pts[hover][0]}
+            cy={pts[hover][1]}
+            r="2"
+            fill={stroke}
+            vectorEffect="non-scaling-stroke"
+          />
         )}
       </svg>
       {hoverTip && <div className="spark-tip">{hoverTip}</div>}

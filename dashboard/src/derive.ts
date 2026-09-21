@@ -1,8 +1,25 @@
 import type {
-  ActiveBuild, ActiveBuildTuple, Alert, AlertTuple,
-  BuildTuple, Dispatcher, DispatcherView, DispatcherWorkerSlots, DevLevel, HealthLevel,
-  HintTuple, InternedString, Issue, IssueTuple, QueuedBuild, QueuedBuildTuple,
-  RecentBuild, RemediationHint, Snapshot, Worker, WorkerSlotPair,
+  ActiveBuild,
+  ActiveBuildTuple,
+  Alert,
+  AlertTuple,
+  BuildTuple,
+  DevLevel,
+  Dispatcher,
+  DispatcherView,
+  DispatcherWorkerSlots,
+  HealthLevel,
+  HintTuple,
+  InternedString,
+  Issue,
+  IssueTuple,
+  QueuedBuild,
+  QueuedBuildTuple,
+  RecentBuild,
+  RemediationHint,
+  Snapshot,
+  Worker,
+  WorkerSlotPair,
   WorkerView,
 } from "./types";
 
@@ -88,7 +105,8 @@ export function classify(w: Worker, snapshotMs: number): WorkerView {
     healthReason = "manually disabled";
   } else if (st === "down" || st === "unreachable" || w.circuit_state === "open") {
     health = "offline";
-    healthReason = w.circuit_state === "open" ? "circuit breaker open" : `worker ${st || "unreachable"}`;
+    healthReason =
+      w.circuit_state === "open" ? "circuit breaker open" : `worker ${st || "unreachable"}`;
   } else if (staleSeconds != null && staleSeconds > STALE_CRIT_SECONDS) {
     health = "offline";
     healthReason = `not seen for ${Math.round(staleSeconds / 60)}m`;
@@ -218,7 +236,10 @@ function attachSlotColumns(snap: Snapshot, views: WorkerView[]): void {
           built[d.id] = { used: pair[0] ?? null, total: pair[1] ?? null };
         }
         Object.defineProperty(view, "slots_by_dispatcher", {
-          value: built, writable: true, configurable: true, enumerable: true,
+          value: built,
+          writable: true,
+          configurable: true,
+          enumerable: true,
         });
         return built;
       },
@@ -355,7 +376,10 @@ export function rehydrateStrings(snap: Snapshot): Snapshot {
  * a snapshot written by an older collector, and a dev machine with no build
  * history must render "no builds recorded", never crash the drawer.
  */
-export function expandBuilds(rows: BuildTuple[] | undefined, strings?: readonly string[]): RecentBuild[] {
+export function expandBuilds(
+  rows: BuildTuple[] | undefined,
+  strings?: readonly string[],
+): RecentBuild[] {
   if (!Array.isArray(rows)) return [];
   return rows.map((b) => ({
     // `?? null` throughout, never `|| null`: `duration_ms: 0` and the
@@ -376,7 +400,10 @@ export function expandBuilds(rows: BuildTuple[] | undefined, strings?: readonly 
  * `[worker_id, severity, message, suggested_action, reason_code]`.
  * Same reasoning and the same legacy tolerance as `expandBuilds()`.
  */
-export function expandHints(rows: HintTuple[] | undefined, strings?: readonly string[]): RemediationHint[] {
+export function expandHints(
+  rows: HintTuple[] | undefined,
+  strings?: readonly string[],
+): RemediationHint[] {
   if (!Array.isArray(rows)) return [];
   return rows.map((h) => ({
     // Everything but `severity` is interned — see INTERNED_HINT_SLOTS.
@@ -496,7 +523,8 @@ export function classifyDispatcher(d: Dispatcher, strings?: unknown): Dispatcher
         ? (s!.remote / lifetimeCounted) * 100
         : null;
 
-  const window = basis === "recent" ? `last ${recentCounted} builds` : "all builds since daemon start";
+  const window =
+    basis === "recent" ? `last ${recentCounted} builds` : "all builds since daemon start";
 
   let level: DevLevel;
   let levelReason: string;
@@ -533,7 +561,10 @@ export function classifyDispatcher(d: Dispatcher, strings?: unknown): Dispatcher
     issue_records: expandIssues(d.issues),
     active_records: expandActive(d.active),
     queued_records: expandQueued(d.queued),
-    level, levelReason, remotePct, remoteBasis: basis,
+    level,
+    levelReason,
+    remotePct,
+    remoteBasis: basis,
     remoteCounted: recentCounted || lifetimeCounted,
   };
 }
@@ -543,14 +574,27 @@ export function classifyDispatcher(d: Dispatcher, strings?: unknown): Dispatcher
  * reach at all is a bigger problem than one with a single transient probe
  * failure. `disabled` sorts last — it is an intended state, not a fault.
  */
-export const HEALTH_ORDER: HealthLevel[] = ["critical", "offline", "warn", "busy", "healthy", "disabled"];
+export const HEALTH_ORDER: HealthLevel[] = [
+  "critical",
+  "offline",
+  "warn",
+  "busy",
+  "healthy",
+  "disabled",
+];
 
 export function healthRank(h: HealthLevel): number {
   const i = HEALTH_ORDER.indexOf(h);
   return i === -1 ? HEALTH_ORDER.length : i;
 }
 
-export const DEV_ORDER: DevLevel[] = ["unreachable", "local-only", "degraded", "offloading", "idle"];
+export const DEV_ORDER: DevLevel[] = [
+  "unreachable",
+  "local-only",
+  "degraded",
+  "offloading",
+  "idle",
+];
 export function devRank(l: DevLevel): number {
   const i = DEV_ORDER.indexOf(l);
   return i === -1 ? DEV_ORDER.length : i;

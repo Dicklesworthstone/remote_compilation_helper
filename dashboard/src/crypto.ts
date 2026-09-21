@@ -94,9 +94,12 @@ function isSupportedCompression(c: string | null | undefined): boolean {
  * indefinite freeze of the main thread with no error and no way out.
  */
 export function assertUsableEnvelope(env: Envelope): void {
-  if (!env?.ciphertext || typeof env.ciphertext !== "string") throw new Error("envelope has no ciphertext");
-  if (!env?.cipher?.iv || typeof env.cipher.iv !== "string") throw new Error("envelope has no cipher IV");
-  if (!env?.kdf?.salt || typeof env.kdf.salt !== "string") throw new Error("envelope has no KDF salt");
+  if (!env?.ciphertext || typeof env.ciphertext !== "string")
+    throw new Error("envelope has no ciphertext");
+  if (!env?.cipher?.iv || typeof env.cipher.iv !== "string")
+    throw new Error("envelope has no cipher IV");
+  if (!env?.kdf?.salt || typeof env.kdf.salt !== "string")
+    throw new Error("envelope has no KDF salt");
   const iters = env.kdf.iterations;
   if (!Number.isInteger(iters) || iters < 1 || iters > MAX_KDF_ITERATIONS) {
     throw new Error(`envelope KDF iterations out of range: ${String(iters)}`);
@@ -197,7 +200,9 @@ async function inflate(bytes: ArrayBuffer, compression: string): Promise<string>
       `this browser cannot decompress the snapshot (no DecompressionStream) — needs Safari 16.4+, Firefox 113+, or Chrome 80+`,
     );
   }
-  const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream(compression as "gzip"));
+  const stream = new Blob([bytes])
+    .stream()
+    .pipeThrough(new DecompressionStream(compression as "gzip"));
   // Response.text() decodes UTF-8 as it drains the stream, so the decompressed
   // bytes are never materialised as a second copy.
   return new Response(stream).text();
@@ -242,8 +247,7 @@ function cookieAttrs(maxAge: number): string {
 export async function persistKey(key: CryptoKey): Promise<void> {
   const raw = await crypto.subtle.exportKey("raw", key);
   document.cookie =
-    `${COOKIE_NAME}=${encodeURIComponent(bufToB64(raw))}` +
-    cookieAttrs(COOKIE_MAX_AGE_SECONDS);
+    `${COOKIE_NAME}=${encodeURIComponent(bufToB64(raw))}` + cookieAttrs(COOKIE_MAX_AGE_SECONDS);
 }
 
 export function clearKey(): void {

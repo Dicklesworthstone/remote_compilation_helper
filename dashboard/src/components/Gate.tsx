@@ -1,4 +1,4 @@
-import { useState, type FormEvent } from "react";
+import { type FormEvent, useState } from "react";
 
 interface Props {
   onUnlock: (passphrase: string, remember: boolean) => Promise<void>;
@@ -61,11 +61,20 @@ export function Gate({ onUnlock, error, busy }: Props) {
 
         <label
           style={{
-            display: "flex", alignItems: "center", gap: 8,
-            fontSize: 13, color: "var(--text-dim)", marginBottom: 16, cursor: "pointer",
+            display: "flex",
+            alignItems: "center",
+            gap: 8,
+            fontSize: 13,
+            color: "var(--text-dim)",
+            marginBottom: 16,
+            cursor: "pointer",
           }}
         >
-          <input type="checkbox" checked={remember} onChange={(e) => setRemember(e.target.checked)} />
+          <input
+            type="checkbox"
+            checked={remember}
+            onChange={(e) => setRemember(e.target.checked)}
+          />
           Stay unlocked on this device for 60 days
         </label>
 
@@ -73,7 +82,11 @@ export function Gate({ onUnlock, error, busy }: Props) {
           {busy ? "Deriving key…" : "Unlock"}
         </button>
 
-        {error && <div className="gate-err" role="alert">{error}</div>}
+        {error && (
+          <div className="gate-err" role="alert">
+            {error}
+          </div>
+        )}
 
         <p className="gate-note">
           The payload is AES-256-GCM ciphertext with a PBKDF2-SHA-256 (600k iteration) key.
