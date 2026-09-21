@@ -12,6 +12,7 @@
 //! native async I/O with a current-thread Runtime and performs filesystem work
 //! outside that reactor. Do not call it from a running async task.
 
+use super::source_delivery::SourceUpload;
 use super::worker_delivery::{
     Delivery, DeliveryFailure, DeliveryMode, WorkerAuthentication, WorkerPeer, receive_operation,
     validate_request,
@@ -126,6 +127,7 @@ struct AdmittedPeer<P> {
     negotiation_started: bool,
     proof: Option<WorkerAuthentication>,
     operation_sent: bool,
+    source: Option<SourceUpload>,
 }
 
 impl<P: WorkerPeer> AdmittedPeer<P> {
@@ -168,7 +170,23 @@ impl<P: WorkerPeer> AdmittedPeer<P> {
             negotiation_started: false,
             proof: None,
             operation_sent: false,
+            source: None,
         })
+    }
+
+    /// Upload permission is local intent bound to the complete saved request,
+    /// not a capability that the worker can request by adding hello fields.
+    fn with_source(mut self, upload: &SourceUpload) -> io::Result<Self> {
+        require(
+            self.mode == DeliveryMode::Execute
+                && !self.hello_read
+                && !self.negotiation_started
+                && self.source.is_none(),
+            "source upload requires a fresh execution session",
+        )?;
+        upload.validate_request(&self.expected_operation)?;
+        self.source = Some(upload.clone());
+        Ok(self)
     }
 }
 
@@ -205,6 +223,23 @@ impl<P: WorkerPeer> WorkerPeer for AdmittedPeer<P> {
                 "resume requires negotiated durable result retention",
             )?;
         }
+        // Decide source authority before sending the challenge. A source-backed
+        // execution without captured bytes must not become a remote admission.
+        // Resume retains the original manifest but never uploads it again.
+        let mut grant = if let Some(upload) = &self.source {
+            upload.grant(hello, grant)?
+        } else {
+            require(
+                self.mode == DeliveryMode::Resume
+                    || self.expected_operation.get("source_manifest").is_none(),
+                "source-backed execution requires a captured source upload",
+            )?;
+            require(
+                grant.get("source_transfer").is_none(),
+                "source transfer was not authorized by this operator session",
+            )?;
+            grant.clone()
+        };
         let [session_id, operation_id, token_id] = self.ids;
         // Retain the worker's existing S5 admission vocabulary. This is a
         // handshake token, not a steady-state execution lease. The adapter below
@@ -272,7 +307,6 @@ impl<P: WorkerPeer> WorkerPeer for AdmittedPeer<P> {
                 && response["token_id"].as_u64() == Some(token_id),
             "worker challenge response mismatch",
         )?;
-        let mut grant = grant.clone();
         grant["session_id"] = json!(session_id);
         grant["transport"] = json!(admitted.grant().transport_version);
         grant["application"] = json!(admitted.grant().application_version);
@@ -281,6 +315,12 @@ impl<P: WorkerPeer> WorkerPeer for AdmittedPeer<P> {
         // separately negotiated result_retention protocol on a NEW session.
         grant["resume"] = json!("unsupported");
         self.inner.send(&grant)?;
+        // Only now is the TLS-pinned identity's challenge complete. Keep source
+        // frames inside this negotiation frontier: the public adapter never
+        // allows arbitrary source writes, and a failed seal cannot dispatch.
+        if let Some(upload) = &self.source {
+            upload.transmit(&mut self.inner, &self.expected_operation)?;
+        }
         self.proof = Some(WorkerAuthentication {
             spki_sha256: self.identity.fingerprint,
             session_id,
@@ -357,6 +397,7 @@ impl<P: WorkerPeer> WorkerPeer for AdmittedPeer<P> {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Phase {
     Admission,
+    SourceUpload,
     Execution,
     Transfer,
     Acknowledgment,
@@ -373,7 +414,7 @@ struct RecordPeer<'a, S> {
     failed: bool,
 }
 
-impl<'a, S: AsyncRead + AsyncWrite + Unpin> RecordPeer<'a, S> {
+impl<'a, S> RecordPeer<'a, S> {
     fn new(runtime: &'a Runtime, stream: S, request: &Value) -> Self {
         let millis = request
             .get("timeout_ms")
@@ -401,20 +442,23 @@ impl<'a, S: AsyncRead + AsyncWrite + Unpin> RecordPeer<'a, S> {
                 io::Error::new(io::ErrorKind::TimedOut, "worker phase deadline exceeded")
             })
     }
-}
 
-impl<S: AsyncRead + AsyncWrite + Unpin> WorkerPeer for RecordPeer<'_, S> {
-    fn send(&mut self, frame: &Value) -> io::Result<()> {
+    fn begin_frame(&mut self, kind: Option<&str>) -> io::Result<()> {
+        // Expiration is checked before a phase transition can grant new time.
         self.remaining()?;
-        let mut bytes = serde_json::to_vec(frame)?;
-        require(
-            bytes.len() <= MAX_JSON_RECORD,
-            "worker record exceeds ATP limit",
-        )?;
-        match frame["kind"].as_str() {
+        match kind {
+            Some("source-begin") => {
+                require(self.phase == Phase::Admission, "duplicate source upload")?;
+                self.phase = Phase::SourceUpload;
+                self.until = Instant::now() + TRANSFER_BUDGET;
+            }
+            Some("source-chunk" | "source-seal") => {
+                require(self.phase == Phase::SourceUpload, "source frame outside upload")?;
+                // Every chunk and the seal share the original upload budget.
+            }
             Some("canonical-exec") => {
                 require(
-                    self.phase == Phase::Admission,
+                    matches!(self.phase, Phase::Admission | Phase::SourceUpload),
                     "duplicate execution dispatch",
                 )?;
                 self.phase = Phase::Execution;
@@ -433,6 +477,19 @@ impl<S: AsyncRead + AsyncWrite + Unpin> WorkerPeer for RecordPeer<'_, S> {
             }
             _ => {}
         }
+        Ok(())
+    }
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin> WorkerPeer for RecordPeer<'_, S> {
+    fn send(&mut self, frame: &Value) -> io::Result<()> {
+        self.remaining()?;
+        let mut bytes = serde_json::to_vec(frame)?;
+        require(
+            bytes.len() <= MAX_JSON_RECORD,
+            "worker record exceeds ATP limit",
+        )?;
+        self.begin_frame(frame["kind"].as_str())?;
         bytes.push(b'\n');
         let budget = self.remaining()?;
         let stream = &mut self.stream;
@@ -545,6 +602,46 @@ pub fn receive_authenticated_operation(
     )
     .map_err(failure)?;
     receive_operation(&mut admitted, request, expected_worker, destination, mode)
+}
+
+/// Upload an explicitly approved immutable source projection after native TLS
+/// admission, execute the exact request once, then verify the ordinary delivery.
+/// A changed checkout cannot alter the retained snapshot or request identity.
+/// This entry point never resumes, retries, publishes, or selects plaintext.
+pub fn receive_authenticated_source(
+    runtime: &Runtime,
+    peer: AuthenticatedPeer,
+    expected_spki: [u8; 32],
+    expected_worker: &str,
+    request: &Value,
+    destination: &Path,
+    upload: &SourceUpload,
+) -> Result<Delivery, DeliveryFailure> {
+    let failure = |error: io::Error| DeliveryFailure {
+        directory: destination.to_path_buf(),
+        execution_may_have_run: false,
+        detail: error.to_string(),
+    };
+    if asupersync::cx::Cx::current().is_some() {
+        return Err(failure(invalid(
+            "authenticated delivery requires an operator thread, not nested block_on",
+        )));
+    }
+    upload.validate_request(request).map_err(&failure)?;
+    let raw = RecordPeer::new(runtime, peer.stream, request);
+    let mut admitted = AdmittedPeer::new(
+        raw,
+        peer.identity,
+        expected_spki,
+        request,
+        challenge_ids().map_err(&failure)?,
+        DeliveryMode::Execute,
+    )
+    .and_then(|admitted| admitted.with_source(upload))
+    .map_err(failure)?;
+    receive_operation(
+        &mut admitted, request, expected_worker, destination, DeliveryMode::Execute,
+    )
 }
 
 #[cfg(test)]
@@ -883,6 +980,200 @@ mod tests {
             assert!(!destination.join("delivery.json").exists());
             assert_eq!(peer.inner.sent.len(), 3); // challenge, grant, retrieval only
             assert_eq!(peer.inner.sent[2]["kind"], "result-resume");
+        }
+    }
+
+    #[cfg(unix)]
+    fn source_fixture(
+        root: &Path,
+    ) -> (SourceUpload, Value, Script, Vec<u8>) {
+        use rabs_sandbox::snapshot_capture::capture_sealed_source;
+        use rabs_sandbox::source_transfer::MAX_SOURCE_CHUNK;
+        use std::sync::Arc;
+
+        let bytes: Vec<u8> = (0..MAX_SOURCE_CHUNK + 17).map(|i| (i % 251) as u8).collect();
+        std::fs::write(root.join("lib.rs"), &bytes).unwrap();
+        std::fs::write(root.join("private.key"), b"not approved for upload").unwrap();
+        let image = capture_sealed_source(
+            &[("workspace".into(), root.to_path_buf())], false, 2, 200_000,
+        ).unwrap();
+        let upload = SourceUpload::from_snapshot(
+            Arc::new(image), "workspace", &["lib.rs".into()],
+        ).unwrap();
+        let (peer, mut request) = resumed_peer();
+        request.as_object_mut().unwrap().remove("workspace_backing");
+        request["source_manifest"] = upload.wire_manifest();
+        let manifest = &request["source_manifest"]["manifest_sha256"];
+        let mut script = peer.inner;
+        script.replies[0]["request_high_water"] = Value::Null;
+        script.replies[0]["source_transfers"] = json!(["source-files-v1"]);
+        script.replies[2].as_object_mut().unwrap().remove("resumed");
+        script.replies.insert(2, json!({"kind":"source-ready", "request_id":7,
+            "manifest_sha256":manifest, "sealed":false}));
+        for (index, next) in [MAX_SOURCE_CHUNK, bytes.len()].into_iter().enumerate() {
+            script.replies.insert(3 + index, json!({"kind":"source-chunk-accepted",
+                "request_id":7, "manifest_sha256":manifest, "path":"lib.rs", "next_offset":next}));
+        }
+        script.replies.insert(5, json!({"kind":"source-ready", "request_id":7,
+            "manifest_sha256":manifest, "sealed":true}));
+        (upload, request, script, bytes)
+    }
+
+    #[cfg(unix)]
+    fn source_admission(script: Script, request: &Value) -> AdmittedPeer<Script> {
+        AdmittedPeer::new(
+            script,
+            TransportIdentity { peer_id: [1; 32], fingerprint: [1; 32] },
+            [1; 32], request, [10, 20, 30], DeliveryMode::Execute,
+        ).unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn authenticated_source_upload_precedes_execution_and_verified_delivery() {
+        use rabs_sandbox::source_transfer::MAX_SOURCE_CHUNK;
+        use sha2::{Digest, Sha256};
+
+        let source = tempfile::tempdir().unwrap();
+        let (upload, request, script, bytes) = source_fixture(source.path());
+        std::fs::write(source.path().join("lib.rs"), b"changed after capture").unwrap();
+        let parent = tempfile::tempdir().unwrap();
+        let destination = parent.path().join("delivery");
+        let mut peer = source_admission(script, &request).with_source(&upload).unwrap();
+        let delivery = receive_operation(
+            &mut peer, &request, "worker", &destination, DeliveryMode::Execute,
+        ).unwrap();
+        assert!(delivery.acknowledgments_confirmed);
+        assert!(peer.inner.replies.is_empty());
+        let sent = &peer.inner.sent;
+        assert_eq!(sent[0]["kind"], "session-challenge");
+        assert_eq!(sent[1]["kind"], "session-ok");
+        assert_eq!(sent[1]["source_transfer"], "source-files-v1");
+        assert_eq!(sent[1]["publication"], "disabled");
+        assert_eq!(sent[2]["kind"], "source-begin");
+        for (index, chunk) in bytes.chunks(MAX_SOURCE_CHUNK).enumerate() {
+            assert_eq!(sent[3 + index]["kind"], "source-chunk");
+            assert_eq!(sent[3 + index]["path"], "lib.rs");
+            assert_eq!(sent[3 + index]["data_hex"], hex(chunk));
+            assert_eq!(sent[3 + index]["chunk_sha256"], hex(&Sha256::digest(chunk)));
+        }
+        assert_eq!(sent[5]["kind"], "source-seal");
+        assert_eq!(sent[6], request);
+        assert_eq!(delivery.receipt["transport_authenticated"], true);
+        assert_eq!(delivery.receipt["worker_spki_sha256"], hex(&[1; 32]));
+        assert_eq!(delivery.receipt["publication_authorized"], false);
+        assert_eq!(std::fs::read(destination.join("diagnostics/stdout")).unwrap(), b"A\0\xffB");
+        assert!(peer.send(&request).is_err());
+        assert!(peer.send(&json!({"kind":"source-begin", "request_id":7})).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_bytes_never_cross_failed_identity_capability_or_challenge_admission() {
+        let source = tempfile::tempdir().unwrap();
+        for case in 0..4 {
+            let (upload, request, mut script, _) = source_fixture(source.path());
+            match case {
+                0 => script.replies[0]["peer_id"] = json!(hex(&[2; 32])),
+                1 => script.replies[0]["source_transfers"] = json!([]),
+                2 => script.replies[1]["token_id"] = json!(999),
+                _ => script.replies[0]["application"] = json!({"minimum_compatible":2,"current":2}),
+            }
+            let mut peer = source_admission(script, &request).with_source(&upload).unwrap();
+            let hello = peer.receive().unwrap();
+            assert!(peer.negotiate(&hello, &grant()).is_err(), "case {case}");
+            assert!(peer.authentication().is_none());
+            assert!(peer.send(&request).is_err());
+            assert!(peer.inner.sent.iter().all(|frame| frame["kind"] == "session-challenge"));
+            assert!(peer.negotiate(&hello, &grant()).is_err());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn corrupted_or_lost_source_acceptance_cannot_dispatch_or_retry() {
+        let source = tempfile::tempdir().unwrap();
+        for case in 0..7 {
+            let (upload, request, mut script, _) = source_fixture(source.path());
+            match case {
+                0 => script.replies[2]["sealed"] = json!(true),
+                1 => script.replies[2]["request_id"] = json!(8),
+                2 => script.replies[3]["next_offset"] = json!(0),
+                3 => script.replies[4]["path"] = json!("private.key"),
+                4 => script.replies[5]["manifest_sha256"] = json!("00".repeat(32)),
+                5 => script.replies[5]["sealed"] = json!(false),
+                _ => script.replies.truncate(5),
+            }
+            let parent = tempfile::tempdir().unwrap();
+            let destination = parent.path().join("delivery");
+            let mut peer = source_admission(script, &request).with_source(&upload).unwrap();
+            let failure = receive_operation(
+                &mut peer, &request, "worker", &destination, DeliveryMode::Execute,
+            ).unwrap_err();
+            assert!(!failure.execution_may_have_run, "case {case}: {failure}");
+            assert!(peer.authentication().is_none());
+            assert!(!peer.inner.sent.iter().any(|frame| {
+                matches!(frame["kind"].as_str(), Some("canonical-exec" | "output-ack" | "artifact-ack"))
+            }));
+            assert!(!destination.join("delivery.json").exists());
+            assert!(peer.send(&request).is_err());
+            assert!(peer.negotiate(&recovery_hello(), &grant()).is_err());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_upload_is_explicit_and_never_attached_to_recovery() {
+        let source = tempfile::tempdir().unwrap();
+        let (upload, request, script, _) = source_fixture(source.path());
+        let mut peer = source_admission(script, &request);
+        let hello = peer.receive().unwrap();
+        assert!(peer.negotiate(&hello, &grant()).is_err());
+        assert!(peer.inner.sent.is_empty());
+        assert!(peer.send(&request).is_err());
+        assert!(peer.with_source(&upload).is_err(), "no late upload authorization");
+        let (resumed, _) = resumed_peer();
+        assert!(resumed.with_source(&upload).is_err());
+        assert!(source_admission(Script::default(), &self::request())
+            .with_source(&upload).is_err(), "upload cannot replace the selected workspace");
+    }
+
+    #[test]
+    fn upload_chunks_and_seal_share_one_absolute_deadline() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+        let mut peer = RecordPeer::new(&runtime, (), &request());
+        assert!(peer.begin_frame(Some("source-chunk")).is_err());
+        peer.begin_frame(Some("source-begin")).unwrap();
+        let until = peer.until;
+        for kind in ["source-chunk", "source-chunk", "source-seal"] {
+            peer.begin_frame(Some(kind)).unwrap();
+            assert_eq!(peer.until, until, "{kind} must not renew the upload budget");
+        }
+        assert!(peer.begin_frame(Some("source-begin")).is_err());
+        assert!(peer.begin_frame(Some("result-resume")).is_err());
+        peer.begin_frame(Some("canonical-exec")).unwrap();
+        assert!(peer.phase == Phase::Execution);
+        assert!(peer.begin_frame(Some("source-chunk")).is_err());
+        assert!(peer.begin_frame(Some("canonical-exec")).is_err());
+    }
+
+    #[test]
+    fn expired_or_failed_upload_cannot_refresh_itself_into_execution() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+        for failed in [false, true] {
+            let mut peer = RecordPeer::new(&runtime, (), &request());
+            peer.begin_frame(Some("source-begin")).unwrap();
+            if failed {
+                peer.failed = true;
+            } else {
+                peer.until = Instant::now() - Duration::from_secs(1);
+            }
+            let until = peer.until;
+            for kind in ["source-begin", "source-chunk", "source-seal", "canonical-exec", "result-resume"] {
+                assert!(peer.begin_frame(Some(kind)).is_err(), "{kind}");
+                assert!(peer.phase == Phase::SourceUpload);
+                assert_eq!(peer.until, until);
+            }
         }
     }
 }
