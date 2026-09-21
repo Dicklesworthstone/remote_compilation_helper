@@ -32,6 +32,7 @@
 use crate::metadata_store::{RabsMetadataStore, StoreError};
 use crate::provisional_pins::ProvisionalPinError;
 use rabs_protocol::generation::AttemptId;
+use std::sync::Arc;
 
 /// The terminal-delivery decision for one descendant attempt (I44).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -131,7 +132,7 @@ pub fn lineage_wait_depth(
 /// readiness rather than occupying slots indefinitely (R112).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WaiterBounds {
-    /// Total provisional-lineage waiter slots per Cargo root.
+    /// Total slots per Cargo root, including the producer reserve.
     pub max_concurrent: usize,
     /// Slots reserved for producer progress; waiters can never occupy
     /// them (`max_concurrent - reserved_progress_slots` effective).
@@ -179,7 +180,7 @@ pub enum WaiterRefusal {
         /// Cargo root key.
         root: String,
     },
-    /// The configured bounds reserve more than the total capacity.
+    /// The producer reserve is zero or exceeds the total capacity.
     InvalidBounds,
 }
 
@@ -203,11 +204,34 @@ impl std::fmt::Display for WaiterRefusal {
             Self::AlreadyAdmitted { root } => {
                 write!(f, "attempt already admitted as waiter on root {root}")
             }
-            Self::InvalidBounds => write!(f, "reserved progress slots exceed waiter capacity"),
+            Self::InvalidBounds => write!(
+                f,
+                "producer reserve must be nonzero and no greater than root capacity"
+            ),
         }
     }
 }
 impl std::error::Error for WaiterRefusal {}
+
+/// Why a waiter permit could not be released. Refusals change neither
+/// the permit nor the registry; the caller retains the original handle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaiterReleaseRefusal {
+    /// Only the registry that issued the permit may release its slot.
+    ForeignRegistry,
+    /// An unreleased local permit has no matching active admission.
+    UnknownAdmission,
+}
+
+impl std::fmt::Display for WaiterReleaseRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ForeignRegistry => write!(f, "waiter permit belongs to another registry"),
+            Self::UnknownAdmission => write!(f, "waiter permit has no matching active admission"),
+        }
+    }
+}
+impl std::error::Error for WaiterReleaseRefusal {}
 
 /// Permit for ONE admitted lineage-waiting wrapper on one Cargo root.
 /// Release is EXPLICIT ([`WaiterRegistry::release`]) because the
@@ -216,6 +240,9 @@ impl std::error::Error for WaiterRefusal {}
 /// is the fail-toward-retention direction for slot accounting.
 #[derive(Debug)]
 pub struct WaiterPermit {
+    // Retaining the allocation prevents a stale permit from aliasing a
+    // replacement registry, even when root and attempt IDs are reused.
+    owner: Arc<()>,
     root: String,
     attempt: u128,
     released: bool,
@@ -233,15 +260,6 @@ impl WaiterPermit {
     pub fn is_released(&self) -> bool {
         self.released
     }
-
-    fn take_release(&mut self) -> Option<(String, u128)> {
-        if self.released {
-            None
-        } else {
-            self.released = true;
-            Some((std::mem::take(&mut self.root), self.attempt))
-        }
-    }
 }
 
 #[derive(Debug, Default)]
@@ -252,10 +270,17 @@ struct RootState {
 /// Per-Cargo-root registry of bounded provisional-lineage waiters
 /// (I025). Deterministic and store-free: admission is pure capacity
 /// arithmetic over caller-supplied depths.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct WaiterRegistry {
+    owner: Arc<()>,
     roots: std::collections::HashMap<String, RootState>,
     bounds: WaiterBounds,
+}
+
+impl Default for WaiterRegistry {
+    fn default() -> Self {
+        Self::with_defaults()
+    }
 }
 
 impl WaiterRegistry {
@@ -263,6 +288,7 @@ impl WaiterRegistry {
     #[must_use]
     pub fn new(bounds: WaiterBounds) -> Self {
         Self {
+            owner: Arc::new(()),
             roots: std::collections::HashMap::new(),
             bounds,
         }
@@ -275,6 +301,9 @@ impl WaiterRegistry {
     }
 
     fn effective_capacity(&self) -> Result<usize, WaiterRefusal> {
+        if self.bounds.reserved_progress_slots == 0 {
+            return Err(WaiterRefusal::InvalidBounds);
+        }
         self.bounds
             .max_concurrent
             .checked_sub(self.bounds.reserved_progress_slots)
@@ -292,8 +321,11 @@ impl WaiterRegistry {
         lineage_depth: u64,
     ) -> Result<WaiterPermit, WaiterRefusal> {
         let capacity = self.effective_capacity()?;
-        let state = self.roots.entry(root.to_owned()).or_default();
-        if state.waiters.contains(&attempt.0) {
+        if self
+            .roots
+            .get(root)
+            .is_some_and(|state| state.waiters.contains(&attempt.0))
+        {
             return Err(WaiterRefusal::AlreadyAdmitted {
                 root: root.to_owned(),
             });
@@ -305,28 +337,54 @@ impl WaiterRegistry {
                 max: self.bounds.max_lineage_depth,
             });
         }
-        if state.waiters.len() >= capacity {
+        let active = self.active_waiters(root);
+        if active >= capacity {
             return Err(WaiterRefusal::Saturated {
                 root: root.to_owned(),
-                active: state.waiters.len(),
+                active,
                 capacity,
             });
         }
-        state.waiters.insert(attempt.0);
+        // Refused requests must not allocate empty per-root state.
+        self.roots
+            .entry(root.to_owned())
+            .or_default()
+            .waiters
+            .insert(attempt.0);
         Ok(WaiterPermit {
+            owner: Arc::clone(&self.owner),
             root: root.to_owned(),
             attempt: attempt.0,
             released: false,
         })
     }
 
-    /// Release a permit's slot (idempotent).
-    pub fn release(&mut self, permit: &mut WaiterPermit) {
-        if let Some((root, attempt)) = permit.take_release()
-            && let Some(state) = self.roots.get_mut(&root)
-        {
-            state.waiters.remove(&attempt);
+    /// Release a permit's slot in its issuing registry (idempotent).
+    /// Retain the root identity for diagnostics after release.
+    ///
+    /// # Errors
+    /// [`WaiterReleaseRefusal`] for a foreign permit or missing local
+    /// admission. A refusal does not consume the handle or free capacity.
+    pub fn release(&mut self, permit: &mut WaiterPermit) -> Result<(), WaiterReleaseRefusal> {
+        if !Arc::ptr_eq(&self.owner, &permit.owner) {
+            return Err(WaiterReleaseRefusal::ForeignRegistry);
         }
+        if permit.released {
+            return Ok(());
+        }
+        let state = self
+            .roots
+            .get_mut(&permit.root)
+            .ok_or(WaiterReleaseRefusal::UnknownAdmission)?;
+        if !state.waiters.remove(&permit.attempt) {
+            return Err(WaiterReleaseRefusal::UnknownAdmission);
+        }
+        let root_is_empty = state.waiters.is_empty();
+        permit.released = true;
+        if root_is_empty {
+            self.roots.remove(&permit.root);
+        }
+        Ok(())
     }
 
     /// Active waiter count for one root.
@@ -602,9 +660,9 @@ mod tests {
         registry.admit("root-2", AttemptId(3), 1).unwrap();
 
         // Release frees exactly one slot; double release is a no-op.
-        registry.release(&mut p1);
+        registry.release(&mut p1).unwrap();
         assert!(p1.is_released());
-        registry.release(&mut p1);
+        registry.release(&mut p1).unwrap();
         registry.admit("root-1", AttemptId(3), 1).unwrap();
         assert_eq!(registry.active_waiters("root-1"), 2);
     }
@@ -640,6 +698,170 @@ mod tests {
             registry.admit("r", AttemptId(1), 1).unwrap_err(),
             WaiterRefusal::InvalidBounds
         );
+    }
+
+    #[test]
+    fn waiter_permits_cannot_release_another_registrys_matching_slot() {
+        let bounds = WaiterBounds {
+            max_concurrent: 2,
+            reserved_progress_slots: 1,
+            max_lineage_depth: 4,
+        };
+        let mut a = WaiterRegistry::new(bounds);
+        let mut b = WaiterRegistry::new(bounds);
+        let mut pa = a.admit("root", AttemptId(1), 1).unwrap();
+        let mut pb = b.admit("root", AttemptId(1), 1).unwrap();
+
+        assert_eq!(a.release(&mut pb), Err(WaiterReleaseRefusal::ForeignRegistry));
+        assert!(
+            !pb.is_released(),
+            "the true owner must still be able to release"
+        );
+        assert_eq!(pb.root(), "root");
+        assert_eq!(a.active_waiters("root"), 1);
+        assert_eq!(b.active_waiters("root"), 1);
+        assert_eq!(
+            a.admit("root", AttemptId(2), 1).unwrap_err(),
+            WaiterRefusal::Saturated {
+                root: "root".to_owned(),
+                active: 1,
+                capacity: 1,
+            }
+        );
+
+        // Misrouting to an empty registry must not lose the handle either.
+        let mut empty = WaiterRegistry::default();
+        assert_eq!(
+            empty.release(&mut pa),
+            Err(WaiterReleaseRefusal::ForeignRegistry)
+        );
+        assert!(!pa.is_released());
+        assert!(empty.roots.is_empty());
+        b.release(&mut pb).unwrap();
+        assert_eq!(a.active_waiters("root"), 1);
+        a.release(&mut pa).unwrap();
+        assert!(a.roots.is_empty());
+        assert!(b.roots.is_empty());
+    }
+
+    #[test]
+    fn stale_waiter_permit_cannot_release_a_replacement_registry() {
+        let mut stale = {
+            let mut old = WaiterRegistry::default();
+            old.admit("root", AttemptId(1), 1).unwrap()
+        };
+        let mut replacement = WaiterRegistry::with_defaults();
+        let mut current = replacement.admit("root", AttemptId(1), 1).unwrap();
+        assert_eq!(
+            replacement.release(&mut stale),
+            Err(WaiterReleaseRefusal::ForeignRegistry)
+        );
+        assert!(!stale.is_released());
+        assert_eq!(replacement.active_waiters("root"), 1);
+        replacement.release(&mut current).unwrap();
+        assert!(replacement.roots.is_empty());
+    }
+
+    #[test]
+    fn waiter_release_survives_moves_and_is_idempotent_after_readmission() {
+        let mut registry = WaiterRegistry::default();
+        let mut old = registry.admit("root", AttemptId(1), 1).unwrap();
+        let mut moved = registry;
+        moved.release(&mut old).unwrap();
+        assert!(old.is_released());
+        assert_eq!(old.root(), "root", "release retains diagnostic identity");
+        assert!(moved.roots.is_empty());
+
+        let mut current = moved.admit("root", AttemptId(1), 1).unwrap();
+        moved.release(&mut old).unwrap();
+        assert_eq!(moved.active_waiters("root"), 1);
+        moved.release(&mut current).unwrap();
+        moved.release(&mut current).unwrap();
+        assert!(moved.roots.is_empty());
+    }
+
+    #[test]
+    fn missing_admission_does_not_consume_a_local_waiter_permit() {
+        let mut registry = WaiterRegistry::default();
+        let mut permit = registry.admit("root", AttemptId(1), 1).unwrap();
+        // Inject a ledger inconsistency: fail toward retaining the permit,
+        // rather than reporting a successful release with no matching row.
+        registry.roots.get_mut("root").unwrap().waiters.remove(&1);
+        assert_eq!(
+            registry.release(&mut permit),
+            Err(WaiterReleaseRefusal::UnknownAdmission)
+        );
+        assert!(!permit.is_released());
+        assert_eq!(permit.root(), "root");
+        registry.roots.get_mut("root").unwrap().waiters.insert(1);
+        registry.release(&mut permit).unwrap();
+        assert!(registry.roots.is_empty());
+    }
+
+    #[test]
+    fn refused_waiters_do_not_accumulate_empty_root_entries() {
+        let mut registry = WaiterRegistry::default();
+        let mut serial = WaiterRegistry::new(WaiterBounds {
+            max_concurrent: 1,
+            reserved_progress_slots: 1,
+            max_lineage_depth: 16,
+        });
+        for n in 0..64 {
+            let root = format!("root-{n}");
+            assert_eq!(
+                registry.admit(&root, AttemptId(n), 17).unwrap_err(),
+                WaiterRefusal::DepthExceeded {
+                    root: root.clone(),
+                    depth: 17,
+                    max: 16,
+                }
+            );
+            // A single-slot root has no waiter capacity, but retains its
+            // producer reserve without accumulating refused-root state.
+            assert_eq!(
+                serial.admit(&root, AttemptId(n), 1).unwrap_err(),
+                WaiterRefusal::Saturated {
+                    root,
+                    active: 0,
+                    capacity: 0,
+                }
+            );
+            assert!(registry.roots.is_empty());
+            assert!(serial.roots.is_empty());
+        }
+    }
+
+    #[test]
+    fn finished_roots_are_retired_without_affecting_live_roots() {
+        let mut registry = WaiterRegistry::default();
+        let mut live = registry.admit("live", AttemptId(1), 1).unwrap();
+        for n in 0..64 {
+            let root = format!("finished-{n}");
+            let mut permit = registry.admit(&root, AttemptId(n), 1).unwrap();
+            assert_eq!(registry.roots.len(), 2);
+            registry.release(&mut permit).unwrap();
+            assert_eq!(registry.roots.len(), 1);
+            assert_eq!(registry.active_waiters("live"), 1);
+            assert_eq!(registry.active_waiters(&root), 0);
+        }
+        registry.release(&mut live).unwrap();
+        assert!(registry.roots.is_empty());
+    }
+
+    #[test]
+    fn waiter_bounds_cannot_disable_the_producer_reserve() {
+        for (total, reserve) in [(0, 0), (0, 1), (3, 0)] {
+            let mut registry = WaiterRegistry::new(WaiterBounds {
+                max_concurrent: total,
+                reserved_progress_slots: reserve,
+                max_lineage_depth: 4,
+            });
+            assert_eq!(
+                registry.admit("root", AttemptId(1), 1).unwrap_err(),
+                WaiterRefusal::InvalidBounds
+            );
+            assert!(registry.roots.is_empty());
+        }
     }
 
     #[test]
