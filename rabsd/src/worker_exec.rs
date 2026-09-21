@@ -5,8 +5,11 @@
 //! Repeating an exact command replays a verified durable delivery without dispatch.
 //! --resume explicitly retrieves a sealed remote result into a NEW directory;
 //! incomplete prior deliveries remain untouched and never trigger reexecution.
+//! --source-root selects local capture for a request's explicit source_manifest;
+//! it never infers upload permission from a checkout or rewrites the request.
 
 use rabsd::coord::delivery_recovery::{DeliveryTrust, recover_existing_delivery};
+use rabsd::coord::source_delivery::{SourcePeer, SourceUpload, request_manifest};
 use rabsd::coord::worker_delivery::{
     Delivery, DeliveryFailure, DeliveryMode, MAX_FRAME_BYTES, WorkerPeer, receive_operation,
     validate_request,
@@ -50,6 +53,54 @@ fn operation_arguments(args: &[String], count: usize) -> Option<(&[String], Deli
     };
     if positionals.iter().any(|arg| arg == "--resume") { return None; }
     Some((positionals, mode))
+}
+
+/// Source capture is explicit and execution-only. Keep the existing resume
+/// spelling/placement contract; do not interpret an absent upload as a retry.
+fn execution_arguments(
+    args: &[String], count: usize,
+) -> Option<(&[String], DeliveryMode, Option<&Path>)> {
+    let (args, source_root) = if args.first().is_some_and(|arg| arg == "--source-root") {
+        (args.get(2..)?, Some(Path::new(args.get(1)?)))
+    } else if args.len() >= 2 && args[args.len() - 2] == "--source-root" {
+        (&args[..args.len() - 2], Some(Path::new(args.last()?)))
+    } else {
+        (args, None)
+    };
+    let (args, mode) = operation_arguments(args, count)?;
+    if args.iter().any(|arg| arg == "--source-root")
+        || source_root.is_some_and(|root| !root.is_absolute())
+        || (source_root.is_some() && mode == DeliveryMode::Resume)
+    {
+        return None;
+    }
+    Some((args, mode, source_root))
+}
+
+/// Reuse the coherent sealed-capture boundary, then select ONLY the files whose
+/// paths, bytes and executable bits the original request already authorizes.
+/// Capturing a root does not authorize uploading its siblings. The snapshot's
+/// paired scans each have the existing source-protocol byte bound.
+fn capture_source(
+    request: &Value, mode: DeliveryMode, root: Option<&Path>,
+) -> io::Result<Option<SourceUpload>> {
+    let manifest = request_manifest(request)?;
+    if mode == DeliveryMode::Resume {
+        if root.is_some() { return Err(invalid("--resume cannot upload source")); }
+        return Ok(None);
+    }
+    let root = match (manifest, root) {
+        (None, None) => return Ok(None),
+        (None, Some(_)) => return Err(invalid("--source-root requires source_manifest, not workspace_backing")),
+        (Some(_), None) => return Err(invalid("source_manifest execution requires --source-root")),
+        (Some(_), Some(root)) => root,
+    };
+    if !root.is_absolute() { return Err(invalid("source root must be absolute")); }
+    let image = rabs_sandbox::snapshot_capture::capture_sealed_source(
+        &[("workspace".to_owned(), root.to_path_buf())],
+        false, 2, rabs_sandbox::source_transfer::MAX_SOURCE_BYTES,
+    ).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, format!("source capture refused: {error:?}")))?;
+    SourceUpload::for_request(std::sync::Arc::new(image), "workspace", request).map(Some)
 }
 
 fn loopback_address(address: &str) -> io::Result<SocketAddr> {
@@ -96,13 +147,14 @@ struct TcpPeer {
     execution_budget: Duration,
     mode: DeliveryMode,
     operation_started: bool,
+    source_started: bool,
 }
 impl TcpPeer {
     fn new(stream: TcpStream, handshake: Duration, execution_budget: Duration, mode: DeliveryMode) -> io::Result<Self> {
         if !stream.peer_addr()?.ip().is_loopback() { return Err(invalid("non-loopback worker peer")); }
         stream.set_nonblocking(true)?;
         stream.set_nodelay(true)?;
-        Ok(Self {stream,buffered:Vec::new(),until:deadline(handshake)?,execution_budget,mode,operation_started:false})
+        Ok(Self {stream,buffered:Vec::new(),until:deadline(handshake)?,execution_budget,mode,operation_started:false,source_started:false})
     }
 }
 impl WorkerPeer for TcpPeer {
@@ -110,6 +162,22 @@ impl WorkerPeer for TcpPeer {
         check_deadline(self.until)?;
         let mut bytes = serde_json::to_vec(value)?;
         if bytes.len() > MAX_FRAME_BYTES { return Err(invalid("outbound frame too large")); }
+        match value.get("kind").and_then(Value::as_str) {
+            Some("source-begin") => {
+                if self.mode != DeliveryMode::Execute || self.operation_started || self.source_started {
+                    return Err(invalid("source upload requires a fresh execution connection"));
+                }
+                self.source_started = true;
+                self.until = deadline(TRANSFER_ALLOWANCE)?;
+            }
+            Some("source-chunk" | "source-seal") => {
+                if self.mode != DeliveryMode::Execute || !self.source_started || self.operation_started {
+                    return Err(invalid("source frame outside upload"));
+                }
+                // Chunk progress and the final seal never renew the budget.
+            }
+            _ => {}
+        }
         if matches!(value.get("kind").and_then(Value::as_str), Some("canonical-exec" | "result-resume")) {
             let expected = match self.mode {
                 DeliveryMode::Execute => "canonical-exec",
@@ -163,7 +231,7 @@ impl WorkerPeer for TcpPeer {
     }
 }
 
-fn run_once(args: &[String], mode: DeliveryMode) -> Result<Delivery, DeliveryFailure> {
+fn run_once(args: &[String], mode: DeliveryMode, source_root: Option<&Path>) -> Result<Delivery, DeliveryFailure> {
     let directory = PathBuf::from(&args[3]);
     let failure = |error: io::Error| DeliveryFailure {
         directory: directory.clone(),
@@ -185,6 +253,9 @@ fn run_once(args: &[String], mode: DeliveryMode) -> Result<Delivery, DeliveryFai
     )? {
         return Ok(delivery);
     }
+    // Offline receipt recovery above must not depend on a still-existing
+    // checkout. A new run captures and verifies source BEFORE listening.
+    let upload = capture_source(&request, mode, source_root).map_err(&failure)?;
     let setup = (|| -> io::Result<_> {
         let parent = directory.parent().ok_or_else(|| invalid("delivery directory needs an existing parent"))?;
         if !parent.is_dir() { return Err(invalid("delivery parent directory does not exist")); }
@@ -197,18 +268,25 @@ fn run_once(args: &[String], mode: DeliveryMode) -> Result<Delivery, DeliveryFai
             .unwrap_or(MAX_EXECUTION_MILLIS).min(MAX_EXECUTION_MILLIS)) + TRANSFER_ALLOWANCE;
         TcpPeer::new(stream,HANDSHAKE_BUDGET,budget,mode)
     })();
-    let mut peer = setup.map_err(failure)?;
-    receive_operation(&mut peer,&request,&args[1],&directory,mode)
+    let mut peer = setup.map_err(&failure)?;
+    match upload.as_ref() {
+        Some(upload) => {
+            let mut peer = SourcePeer::new(&mut peer, upload, &request).map_err(failure)?;
+            receive_operation(&mut peer, &request, &args[1], &directory, mode)
+        }
+        None => receive_operation(&mut peer, &request, &args[1], &directory, mode),
+    }
 }
 
 /// One explicit command, not a background service or an automatic retry loop.
 pub fn run(args: &[String]) -> i32 {
-    let Some((args, mode)) = operation_arguments(args, 4) else {
-        eprintln!("usage: rabsd --worker-exec-loopback [--resume] <127.0.0.1:port> <expected-worker> <request.json> <absolute-delivery-directory>");
+    let Some((args, mode, source_root)) = execution_arguments(args, 4) else {
+        eprintln!("usage: rabsd --worker-exec-loopback [--resume | --source-root <absolute-root>] <127.0.0.1:port> <expected-worker> <request.json> <absolute-delivery-directory>");
         eprintln!("--resume retrieves the original request into a new directory; it never executes it");
+        eprintln!("--source-root captures only for new source_manifest requests; only declared regular files are uploaded");
         return 2;
     };
-    report_result(run_once(args, mode))
+    report_result(run_once(args, mode, source_root))
 }
 
 fn report_result(result: Result<Delivery, DeliveryFailure>) -> i32 {
@@ -242,10 +320,10 @@ fn coordinator_tls_files() -> io::Result<rabs_asupersync::worker_transport::TlsF
     })
 }
 
-fn run_tls_once(args: &[String], mode: DeliveryMode) -> Result<Delivery, DeliveryFailure> {
+fn run_tls_once(args: &[String], mode: DeliveryMode, source_root: Option<&Path>) -> Result<Delivery, DeliveryFailure> {
     use asupersync::runtime::RuntimeBuilder;
     use rabs_asupersync::worker_transport::{MAX_JSON_RECORD, accept_peer};
-    use rabsd::coord::secure_worker_delivery::{parse_worker_pin, receive_authenticated_operation};
+    use rabsd::coord::secure_worker_delivery::{parse_worker_pin, receive_authenticated_operation, receive_authenticated_source};
 
     let directory = PathBuf::from(&args[4]);
     let failure = |detail: String| DeliveryFailure {
@@ -272,6 +350,8 @@ fn run_tls_once(args: &[String], mode: DeliveryMode) -> Result<Delivery, Deliver
     )? {
         return Ok(delivery);
     }
+    let upload = capture_source(&request, mode, source_root)
+        .map_err(|error| failure(error.to_string()))?;
     if !directory.parent().is_some_and(Path::is_dir) {
         return Err(failure("delivery parent directory does not exist".to_owned()));
     }
@@ -295,7 +375,14 @@ fn run_tls_once(args: &[String], mode: DeliveryMode) -> Result<Delivery, Deliver
             .map_err(|error| format!("worker TLS accept: {error}"))?;
         accept_peer(&acceptor, stream).await
     }).map_err(failure)?;
-    receive_authenticated_operation(&runtime, peer, pin, &args[1], &request, &directory, mode)
+    match upload.as_ref() {
+        Some(upload) => receive_authenticated_source(
+            &runtime, peer, pin, &args[1], &request, &directory, upload,
+        ),
+        None => receive_authenticated_operation(
+            &runtime, peer, pin, &args[1], &request, &directory, mode,
+        ),
+    }
 }
 
 /// One explicitly pinned worker, authenticated transport, and one exact command.
@@ -303,13 +390,14 @@ fn run_tls_once(args: &[String], mode: DeliveryMode) -> Result<Delivery, Deliver
 /// Repeating the exact command revalidates an existing durable delivery offline.
 /// --resume selects retrieval only; absent/uncertain retained results are errors.
 pub fn run_tls(args: &[String]) -> i32 {
-    let Some((args, mode)) = operation_arguments(args, 5) else {
-        eprintln!("usage: rabsd --worker-exec-tls [--resume] <IP:port> <expected-worker> <worker-spki-sha256> <request.json> <absolute-delivery-directory>");
+    let Some((args, mode, source_root)) = execution_arguments(args, 5) else {
+        eprintln!("usage: rabsd --worker-exec-tls [--resume | --source-root <absolute-root>] <IP:port> <expected-worker> <worker-spki-sha256> <request.json> <absolute-delivery-directory>");
         eprintln!("required: RABS_COORD_TLS_CA, RABS_COORD_TLS_CERT, RABS_COORD_TLS_KEY");
         eprintln!("--resume retrieves the original request into a new directory; it never executes it");
+        eprintln!("--source-root captures only for new source_manifest requests; only declared regular files are uploaded");
         return 2;
     };
-    report_result(run_tls_once(args, mode))
+    report_result(run_tls_once(args, mode, source_root))
 }
 
 #[cfg(test)]
@@ -411,12 +499,205 @@ mod tests {
         let plain = vec!["127.0.0.1:0".to_owned(), "worker".to_owned(), missing.clone(), destination.clone()];
         let tls = vec!["127.0.0.1:0".to_owned(), "worker".to_owned(), "01".repeat(32), missing, destination];
         for mode in [DeliveryMode::Execute, DeliveryMode::Resume] {
-            assert_eq!(run_once(&plain, mode).unwrap_err().execution_may_have_run, mode == DeliveryMode::Resume);
-            assert_eq!(run_tls_once(&tls, mode).unwrap_err().execution_may_have_run, mode == DeliveryMode::Resume);
+            assert_eq!(run_once(&plain, mode, None).unwrap_err().execution_may_have_run, mode == DeliveryMode::Resume);
+            assert_eq!(run_tls_once(&tls, mode, None).unwrap_err().execution_may_have_run, mode == DeliveryMode::Resume);
             let mut invalid_pin = tls.clone();
             invalid_pin[2] = "invalid".to_owned();
-            assert_eq!(run_tls_once(&invalid_pin, mode).unwrap_err().execution_may_have_run, mode == DeliveryMode::Resume);
+            assert_eq!(run_tls_once(&invalid_pin, mode, None).unwrap_err().execution_may_have_run, mode == DeliveryMode::Resume);
         }
         assert!(!root.path().join("delivery").exists());
+    }
+
+    #[cfg(unix)]
+    fn source_request(root: &Path) -> Value {
+        use rabs_sandbox::snapshot_capture::capture_sealed_source;
+        std::fs::write(root.join("lib.rs"), b"pub fn value() -> u32 { 42 }\n").unwrap();
+        std::fs::write(root.join("private.key"), b"never selected").unwrap();
+        let image = capture_sealed_source(
+            &[("workspace".into(), root.to_path_buf())], false, 2, 200_000,
+        ).unwrap();
+        let upload = SourceUpload::from_snapshot(
+            std::sync::Arc::new(image), "workspace", &["lib.rs".into()],
+        ).unwrap();
+        json!({"kind":"canonical-exec", "request_id":7, "program":"rustc",
+            "args":["lib.rs"], "toolchain_backing":"/tc", "source_manifest":upload.wire_manifest()})
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_root_is_explicit_execution_only_and_preserves_resume_parsing() {
+        for count in [4, 5] {
+            let plain: Vec<_> = (0..count).map(|index| format!("arg-{index}")).collect();
+            assert_eq!(execution_arguments(&plain, count), Some((plain.as_slice(), DeliveryMode::Execute, None)));
+            let mut leading = vec!["--source-root".to_owned(), "/source".to_owned()];
+            leading.extend(plain.clone());
+            assert_eq!(execution_arguments(&leading, count), Some((&leading[2..], DeliveryMode::Execute, Some(Path::new("/source")))));
+            let mut trailing = plain.clone();
+            trailing.extend(["--source-root".to_owned(), "/source".to_owned()]);
+            assert_eq!(execution_arguments(&trailing, count), Some((&trailing[..count], DeliveryMode::Execute, Some(Path::new("/source")))));
+            let mut resume = plain.clone();
+            resume.push("--resume".to_owned());
+            assert_eq!(execution_arguments(&resume, count), Some((&resume[..count], DeliveryMode::Resume, None)));
+            for invalid in [
+                [leading.clone(), vec!["--resume".to_owned()]].concat(),
+                [vec!["--resume".to_owned()], trailing.clone()].concat(),
+                [leading.clone(), vec!["--source-root".to_owned(), "/other".to_owned()]].concat(),
+                [plain.clone(), vec!["--source-root".to_owned()]].concat(),
+                [vec!["--source-root".to_owned(), "relative".to_owned()], plain.clone()].concat(),
+            ] {
+                assert!(execution_arguments(&invalid, count).is_none(), "{invalid:?}");
+            }
+            let mut misplaced = plain;
+            misplaced.splice(1..1, ["--source-root".to_owned(), "/source".to_owned()]);
+            assert!(execution_arguments(&misplaced, count).is_none());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn captured_source_must_match_saved_bytes_and_mode_without_rewriting_request() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let request = source_request(root.path());
+        let original = serde_json::to_vec(&request).unwrap();
+        let captured = capture_source(&request, DeliveryMode::Execute, Some(root.path())).unwrap().unwrap();
+        assert_eq!(captured.wire_manifest(), request["source_manifest"]);
+        assert_eq!(captured.wire_manifest()["files"].as_array().unwrap().len(), 1);
+        assert!(capture_source(&request, DeliveryMode::Execute, None).is_err());
+        assert!(capture_source(&request, DeliveryMode::Resume, Some(root.path())).is_err());
+        std::fs::set_permissions(root.path().join("lib.rs"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(capture_source(&request, DeliveryMode::Execute, Some(root.path())).is_err());
+        std::fs::set_permissions(root.path().join("lib.rs"), std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::write(root.path().join("lib.rs"), b"different content").unwrap();
+        assert!(capture_source(&request, DeliveryMode::Execute, Some(root.path())).is_err());
+        assert_eq!(captured.wire_manifest(), request["source_manifest"], "captured bytes remain immutable");
+        assert_eq!(serde_json::to_vec(&request).unwrap(), original);
+        drop(root);
+        assert!(capture_source(&request, DeliveryMode::Resume, None).unwrap().is_none());
+        let mut backing = request;
+        backing.as_object_mut().unwrap().remove("source_manifest");
+        backing["workspace_backing"] = json!("/worker/workspace");
+        assert!(capture_source(&backing, DeliveryMode::Execute, None).unwrap().is_none());
+        assert!(capture_source(&backing, DeliveryMode::Execute, Some(Path::new("/unused"))).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_preflight_refuses_before_listening_or_reading_tls_credentials() {
+        let source = tempfile::tempdir().unwrap();
+        let request = source_request(source.path());
+        let parent = tempfile::tempdir().unwrap();
+        let request_path = parent.path().join("request.json");
+        std::fs::write(&request_path, serde_json::to_vec(&request).unwrap()).unwrap();
+        std::fs::write(source.path().join("lib.rs"), b"does not match saved request").unwrap();
+        // An accidental listen would fail for a different reason. Neither lane
+        // may reach it before source intent and the captured image are checked.
+        let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
+        let destination = parent.path().join("delivery");
+        let plain = vec![occupied.local_addr().unwrap().to_string(), "worker".into(),
+            request_path.to_string_lossy().into_owned(), destination.to_string_lossy().into_owned()];
+        let mut tls = plain.clone();
+        tls.insert(2, "01".repeat(32));
+        for root in [None, Some(Path::new("relative")), Some(source.path())] {
+            let expected = capture_source(&request, DeliveryMode::Execute, root).unwrap_err().to_string();
+            let loopback = run_once(&plain, DeliveryMode::Execute, root).unwrap_err();
+            let secure = run_tls_once(&tls, DeliveryMode::Execute, root).unwrap_err();
+            assert_eq!(loopback.detail, expected);
+            assert_eq!(secure.detail, expected);
+            assert!(!loopback.execution_may_have_run);
+            assert!(!secure.execution_may_have_run);
+            assert!(!destination.exists());
+        }
+    }
+
+    #[test]
+    fn loopback_source_upload_has_one_budget_and_cannot_reenter_after_dispatch() {
+        let (mut peer, _client) = pair(Duration::from_secs(2));
+        assert!(peer.send(&json!({"kind":"source-chunk"})).is_err());
+        peer.send(&json!({"kind":"source-begin"})).unwrap();
+        let until = peer.until;
+        for kind in ["source-chunk", "source-chunk", "source-seal"] {
+            peer.send(&json!({"kind":kind})).unwrap();
+            assert_eq!(peer.until, until);
+        }
+        assert!(peer.send(&json!({"kind":"source-begin"})).is_err());
+        peer.send(&json!({"kind":"canonical-exec", "request_id":7})).unwrap();
+        for kind in ["source-begin", "source-chunk", "source-seal"] {
+            assert!(peer.send(&json!({"kind":kind})).is_err());
+        }
+        let (mut expired, _client) = pair(Duration::from_secs(2));
+        expired.send(&json!({"kind":"source-begin"})).unwrap();
+        expired.until = Instant::now() - Duration::from_secs(1);
+        for kind in ["source-chunk", "source-seal", "canonical-exec"] {
+            assert_eq!(expired.send(&json!({"kind":kind})).unwrap_err().kind(), io::ErrorKind::TimedOut);
+        }
+        assert!(!expired.operation_started);
+        let (mut resume, _client) = pair_with_mode(Duration::from_secs(2), DeliveryMode::Resume);
+        for kind in ["source-begin", "source-chunk", "source-seal"] {
+            assert!(resume.send(&json!({"kind":kind})).is_err());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn completed_source_delivery_recovers_offline_without_recapture_or_reexecution() {
+        use std::collections::VecDeque;
+        use sha2::{Digest, Sha256};
+        struct Responses(VecDeque<Value>);
+        impl WorkerPeer for Responses {
+            fn send(&mut self, _frame: &Value) -> io::Result<()> { Ok(()) }
+            fn receive(&mut self) -> io::Result<Value> {
+                self.0.pop_front().ok_or_else(|| invalid("missing scripted response"))
+            }
+        }
+        let source = tempfile::tempdir().unwrap();
+        let request = source_request(source.path());
+        let upload = capture_source(&request, DeliveryMode::Execute, Some(source.path())).unwrap().unwrap();
+        let digest = &request["source_manifest"]["manifest_sha256"];
+        let empty: String = Sha256::digest([]).iter().map(|byte| format!("{byte:02x}")).collect();
+        let chunk = |stream: &str| json!({"kind":"output-chunk", "request_id":7,
+            "stream":stream, "offset":0, "next_offset":0, "total_bytes":0,
+            "sha256":empty, "chunk_sha256":empty, "eof":true, "data_hex":""});
+        let mut peer = Responses(VecDeque::from([
+            json!({"kind":"worker-hello", "worker_id":"worker", "canonical":true, "slots":1,
+                "boot_generation":1, "incarnation":"00000000000000000000000000000001", "request_high_water":null,
+                "source_transfers":["source-files-v1"], "output_transfers":["ranges-v1"], "recovery_protocols":["request-journal-v1"]}),
+            json!({"kind":"source-ready", "request_id":7, "manifest_sha256":digest, "sealed":false}),
+            json!({"kind":"source-chunk-accepted", "request_id":7, "manifest_sha256":digest,
+                "path":"lib.rs", "next_offset":request["source_manifest"]["files"][0]["bytes"]}),
+            json!({"kind":"source-ready", "request_id":7, "manifest_sha256":digest, "sealed":true}),
+            json!({"kind":"exec-result", "request_id":7, "executed":true, "exit_code":0,
+                "residual_group_members":0, "stop_reason":null, "output_transfer":"ranges-v1", "output_ack_required":true,
+                "stdout_bytes":0, "stdout_sha256":empty, "stderr_bytes":0, "stderr_sha256":empty,
+                "artifact_ack_required":false, "artifact_manifest":null}),
+            chunk("stdout"), chunk("stderr"),
+            json!({"kind":"output-acknowledged", "request_id":7, "already_released":false}),
+        ]));
+        let parent = tempfile::tempdir().unwrap();
+        let destination = parent.path().join("delivery");
+        receive_operation(
+            &mut SourcePeer::new(&mut peer, &upload, &request).unwrap(),
+            &request, "worker", &destination, DeliveryMode::Execute,
+        ).unwrap();
+        assert!(peer.0.is_empty());
+        let source_path = source.path().to_path_buf();
+        drop(upload);
+        drop(source);
+        let request_path = parent.path().join("request.json");
+        std::fs::write(&request_path, serde_json::to_vec(&request).unwrap()).unwrap();
+        let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
+        let args = vec![occupied.local_addr().unwrap().to_string(), "worker".into(),
+            request_path.to_string_lossy().into_owned(), destination.to_string_lossy().into_owned()];
+        for mode in [DeliveryMode::Execute, DeliveryMode::Resume] {
+            let delivery = run_once(&args, mode, None).unwrap();
+            assert_eq!(delivery.receipt["request_id"], 7);
+            assert_eq!(delivery.receipt["publication_authorized"], false);
+        }
+        assert!(run_once(&args, DeliveryMode::Execute, Some(&source_path)).is_ok());
+        let mut tls = args.clone();
+        tls.insert(2, "01".repeat(32));
+        assert!(run_tls_once(&tls, DeliveryMode::Resume, None).is_err(), "plaintext receipt cannot upgrade to TLS");
+        std::fs::write(destination.join("diagnostics/stdout"), b"corrupted").unwrap();
+        assert!(run_once(&args, DeliveryMode::Execute, Some(&source_path)).unwrap_err().execution_may_have_run);
     }
 }
