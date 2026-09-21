@@ -12,6 +12,7 @@
 
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -113,6 +114,9 @@ struct PendingFile {
 /// Retrying an already-written exact range is idempotent and does not rehash it.
 pub struct SourceReceiver {
     root: PathBuf,
+    // Keep the created directory alive and bind all Linux member opens to it.
+    // A replacement at the public path must never become the execution root.
+    root_directory: File,
     manifest: SourceManifest,
     files: BTreeMap<String, PendingFile>,
     poisoned: bool,
@@ -132,6 +136,199 @@ fn private_directory(path: &Path) -> io::Result<()> {
 #[cfg(not(unix))]
 fn private_directory(_path: &Path) -> io::Result<()> {
     Err(io::Error::new(io::ErrorKind::Unsupported, "source staging requires Unix"))
+}
+
+fn same_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        left.dev() == right.dev() && left.ino() == right.ino()
+    }
+    #[cfg(not(unix))]
+    {
+        // SourceReceiver::create refuses these platforms before opening a root.
+        let _ = (left, right);
+        false
+    }
+}
+
+fn same_state(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        same_identity(left, right)
+            && left.len() == right.len()
+            && left.mode() == right.mode()
+            && left.nlink() == right.nlink()
+            && left.mtime() == right.mtime()
+            && left.mtime_nsec() == right.mtime_nsec()
+            && left.ctime() == right.ctime()
+            && left.ctime_nsec() == right.ctime_nsec()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (left, right);
+        false
+    }
+}
+
+fn ordinary_file(meta: &fs::Metadata, len: u64) -> io::Result<()> {
+    if !meta.is_file() || meta.len() != len {
+        return Err(invalid("source staging file type or length changed"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if meta.nlink() != 1 {
+            return Err(invalid("source staging file has another link"));
+        }
+    }
+    Ok(())
+}
+
+fn open_root(path: &Path) -> io::Result<File> {
+    #[cfg(target_os = "linux")]
+    {
+        use rustix::fs::{Mode, OFlags, open};
+        Ok(File::from(open(
+            path,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        if !fs::symlink_metadata(path)?.is_dir() {
+            return Err(invalid("source root is not an ordinary directory"));
+        }
+        File::open(path)
+    }
+}
+
+/// Every component is opened separately: NOFOLLOW on the final pathname alone
+/// does not protect a file whose parent was replaced with a symlink. NONBLOCK
+/// prevents a substituted FIFO from wedging the execution control reactor.
+fn open_member(
+    directory: &File,
+    parent: &Path,
+    name: &OsStr,
+    is_directory: bool,
+    append: bool,
+) -> io::Result<File> {
+    #[cfg(target_os = "linux")]
+    {
+        use rustix::fs::{Mode, OFlags, openat};
+        let _ = parent;
+        let mut flags = OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK;
+        flags |= if append { OFlags::WRONLY | OFlags::APPEND } else { OFlags::RDONLY };
+        if is_directory {
+            flags |= OFlags::DIRECTORY;
+        }
+        Ok(File::from(openat(directory, name, flags, Mode::empty())?))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // The portable lane retains the private-owner exclusion contract. It
+        // checks each component but does not claim Linux's openat race boundary.
+        let _ = directory;
+        let path = parent.join(name);
+        let before = fs::symlink_metadata(&path)?;
+        if (is_directory && !before.is_dir()) || (!is_directory && !before.is_file()) {
+            return Err(invalid("source member is not an ordinary file or directory"));
+        }
+        let file = OpenOptions::new().read(!append).append(append).open(&path)?;
+        if !same_identity(&before, &file.metadata()?) {
+            return Err(invalid("source member changed while opening"));
+        }
+        Ok(file)
+    }
+}
+
+fn check_root(root: &Path, directory: &File) -> io::Result<()> {
+    let current = fs::symlink_metadata(root)?;
+    if !current.is_dir() || !same_identity(&current, &directory.metadata()?) {
+        return Err(invalid("source staging root was replaced"));
+    }
+    Ok(())
+}
+
+/// The relative name has already passed SourceManifest validation. At most one
+/// parent descriptor is retained while walking to the requested regular file.
+fn open_source(root: &Path, directory: &File, relative: &str, append: bool) -> io::Result<File> {
+    check_root(root, directory)?;
+    let mut directory = directory.try_clone()?;
+    let mut parent = root.to_path_buf();
+    let mut parts = relative.split('/').peekable();
+    while let Some(part) = parts.next() {
+        let is_directory = parts.peek().is_some();
+        let member = open_member(&directory, &parent, OsStr::new(part), is_directory, append && !is_directory)?;
+        if !is_directory {
+            return Ok(member);
+        }
+        directory = member;
+        parent.push(part);
+    }
+    Err(invalid("empty source member"))
+}
+
+/// Enumerate incrementally, refusing undeclared entries before descending or
+/// opening them. Directory depth and total accepted membership come only from
+/// the bounded manifest, never from untrusted read_dir output.
+fn each_child(
+    directory: &File,
+    path: &Path,
+    mut visit: impl FnMut(&OsStr) -> io::Result<()>,
+) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let _ = path;
+        let mut entries = rustix::fs::Dir::read_from(directory)?;
+        while let Some(entry) = entries.read() {
+            let entry = entry?;
+            let name = entry.file_name().to_bytes();
+            if name != b"." && name != b".." {
+                visit(OsStr::from_bytes(name))?;
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = directory;
+        for entry in fs::read_dir(path)? {
+            visit(&entry?.file_name())?;
+        }
+    }
+    Ok(())
+}
+
+fn verify_file(file: &mut File, expected: &SourceFile) -> io::Result<()> {
+    let before = file.metadata()?;
+    ordinary_file(&before, expected.len)?;
+    let mut hash = Sha256::new();
+    let mut buffer = [0_u8; MAX_SOURCE_CHUNK];
+    let mut remaining = expected.len;
+    while remaining != 0 {
+        let count = remaining.min(buffer.len() as u64) as usize;
+        file.read_exact(&mut buffer[..count])?;
+        hash.update(&buffer[..count]);
+        remaining -= count as u64;
+    }
+    // Bounded even when a writer keeps appending. Read exactly the declaration
+    // plus one byte rather than following an unbounded moving EOF.
+    if file.read(&mut buffer[..1])? != 0
+        || !same_state(&before, &file.metadata()?)
+        || <[u8; 32]>::from(hash.finalize()) != expected.sha256
+    {
+        return Err(invalid("staged source bytes changed before seal"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // Change the verified descriptor, never re-resolve a mutable pathname.
+        file.set_permissions(fs::Permissions::from_mode(if expected.executable { 0o555 } else { 0o444 }))?;
+    }
+    Ok(())
 }
 
 impl SourceReceiver {
@@ -155,6 +352,8 @@ impl SourceReceiver {
             builder.mode(0o700);
         }
         builder.create(&root)?;
+        let root_directory = open_root(&root)?;
+        check_root(&root, &root_directory)?;
         let mut files = BTreeMap::new();
         for expected in manifest.files() {
             let path = root.join(&expected.path);
@@ -179,7 +378,7 @@ impl SourceReceiver {
                 expected: expected.clone(), received: 0, hash: Sha256::new(),
             });
         }
-        Ok(Self { root, manifest, files, poisoned: false, sealed: false })
+        Ok(Self { root, root_directory, manifest, files, poisoned: false, sealed: false })
     }
 
     #[must_use]
@@ -206,27 +405,21 @@ impl SourceReceiver {
         if offset > file.received || (offset < file.received && end > file.received) {
             return Err(invalid("source range is not contiguous or an exact retry"));
         }
-        let target = self.root.join(path);
         let result = (|| {
-            let meta = fs::symlink_metadata(&target)?;
-            if !meta.is_file() || meta.len() != file.received {
-                return Err(invalid("source staging file changed outside its owner"));
-            }
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::MetadataExt;
-                if meta.nlink() != 1 { return Err(invalid("source staging file has another link")); }
-            }
+            let mut target = open_source(&self.root, &self.root_directory, path, offset == file.received)?;
+            let before = target.metadata()?;
+            ordinary_file(&before, file.received)?;
             if offset < file.received {
                 let mut original = vec![0; bytes.len()];
-                let mut input = File::open(&target)?;
-                input.seek(SeekFrom::Start(offset))?;
-                input.read_exact(&mut original)?;
-                if original != bytes { return Err(invalid("source retry changes accepted bytes")); }
+                target.seek(SeekFrom::Start(offset))?;
+                target.read_exact(&mut original)?;
+                if original != bytes || !same_state(&before, &target.metadata()?) {
+                    return Err(invalid("source retry changes accepted bytes"));
+                }
                 return Ok(file.received);
             }
-            let mut output = OpenOptions::new().append(true).open(&target)?;
-            output.write_all(bytes)?;
+            target.write_all(bytes)?;
+            ordinary_file(&target.metadata()?, end)?;
             file.hash.update(bytes);
             file.received = end;
             if end == file.expected.len
@@ -243,6 +436,8 @@ impl SourceReceiver {
     /// Verify the exact closure before returning a usable root. This frontier
     /// seals the bytes, not durable publication. The private owner must outlive
     /// the execution and the execroot must be mounted read-only by the sandbox.
+    /// Transfer hashes prove what arrived, not what is still on disk: sealing
+    /// rereads every file and rejects all undeclared files, directories and links.
     pub fn seal(&mut self) -> io::Result<&Path> {
         if self.poisoned { return Err(invalid("source staging is poisoned")); }
         if self.sealed { return Ok(&self.root); }
@@ -254,25 +449,57 @@ impl SourceReceiver {
                 if <[u8; 32]>::from(file.hash.clone().finalize()) != file.expected.sha256 {
                     return Err(invalid("source digest changed before seal"));
                 }
-                let path = self.root.join(&file.expected.path);
-                let meta = fs::symlink_metadata(&path)?;
-                if !meta.is_file() || meta.len() != file.expected.len {
-                    return Err(invalid("source file changed before seal"));
-                }
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::{MetadataExt, PermissionsExt};
-                    if meta.nlink() != 1 { return Err(invalid("source file linked before seal")); }
-                    fs::set_permissions(&path, fs::Permissions::from_mode(
-                        if file.expected.executable { 0o555 } else { 0o444 },
-                    ))?;
+            }
+            check_root(&self.root, &self.root_directory)?;
+            let mut directories = BTreeSet::new();
+            let mut remaining: BTreeSet<String> = self.files.keys().cloned().collect();
+            for name in self.files.keys() {
+                for (offset, _) in name.match_indices('/') {
+                    directories.insert(&name[..offset]);
+                    remaining.insert(name[..offset].to_owned());
                 }
             }
+            self.verify_directory(&self.root_directory, &self.root, "", &directories, &mut remaining)?;
+            if !remaining.is_empty() {
+                return Err(invalid("source staging lost declared members"));
+            }
+            check_root(&self.root, &self.root_directory)?;
             Ok(())
         })();
         if let Err(error) = result { self.poisoned = true; return Err(error); }
         self.sealed = true;
         Ok(&self.root)
+    }
+
+    fn verify_directory(
+        &self,
+        directory: &File,
+        path: &Path,
+        prefix: &str,
+        directories: &BTreeSet<&str>,
+        remaining: &mut BTreeSet<String>,
+    ) -> io::Result<()> {
+        let before = directory.metadata()?;
+        each_child(directory, path, |name| {
+            let text = name.to_str().ok_or_else(|| invalid("non-UTF-8 source member"))?;
+            let relative = if prefix.is_empty() { text.to_owned() } else { format!("{prefix}/{text}") };
+            if !remaining.remove(&relative) {
+                return Err(invalid("undeclared or duplicate source member before seal"));
+            }
+            let is_directory = directories.contains(relative.as_str());
+            let mut member = open_member(directory, path, name, is_directory, false)?;
+            if is_directory {
+                self.verify_directory(&member, &path.join(name), &relative, directories, remaining)?;
+            } else {
+                let pending = self.files.get(&relative).ok_or_else(|| invalid("undeclared source file"))?;
+                verify_file(&mut member, &pending.expected)?;
+            }
+            Ok(())
+        })?;
+        if !same_state(&before, &directory.metadata()?) {
+            return Err(invalid("source directory changed during seal"));
+        }
+        Ok(())
     }
 
     #[must_use]
@@ -357,5 +584,188 @@ mod tests {
             assert!(receiver.sealed_root().is_none());
             assert!(receiver.write_chunk("a", 0, b"AB", Sha256::digest(b"AB").into()).is_err());
         }
+    }
+
+    fn completed_source(owner: &Path) -> (SourceReceiver, PathBuf) {
+        let root = owner.join("source");
+        let mut receiver = SourceReceiver::create(
+            &root, SourceManifest::new(vec![entry("src/lib.rs", b"AB")]).unwrap(),
+        ).unwrap();
+        receiver.write_chunk("src/lib.rs", 0, b"AB", Sha256::digest(b"AB").into()).unwrap();
+        (receiver, root)
+    }
+
+    fn assert_poisoned(receiver: &mut SourceReceiver) {
+        assert!(receiver.seal().is_err());
+        assert!(receiver.sealed_root().is_none());
+        assert!(receiver.write_chunk("src/lib.rs", 0, b"AB", Sha256::digest(b"AB").into()).is_err());
+        assert!(receiver.seal().is_err(), "a failed seal cannot be retried into authority");
+    }
+
+    #[test]
+    fn seal_rehashes_disk_bytes_not_just_the_accepted_chunk_transcript() {
+        let owner = tempfile::tempdir().unwrap();
+        let (mut receiver, root) = completed_source(owner.path());
+        fs::write(root.join("src/lib.rs"), b"XY").unwrap();
+        assert_poisoned(&mut receiver);
+        // Restoring the expected bytes cannot un-poison this operation.
+        fs::write(root.join("src/lib.rs"), b"AB").unwrap();
+        assert!(receiver.seal().is_err());
+    }
+
+    #[test]
+    fn accepted_prefix_edits_cannot_hide_behind_a_valid_final_chunk_hash() {
+        let owner = tempfile::tempdir().unwrap();
+        let root = owner.path().join("source");
+        let mut receiver = SourceReceiver::create(
+            &root, SourceManifest::new(vec![entry("src/lib.rs", b"AB")]).unwrap(),
+        ).unwrap();
+        receiver.write_chunk("src/lib.rs", 0, b"A", Sha256::digest(b"A").into()).unwrap();
+        fs::write(root.join("src/lib.rs"), b"X").unwrap();
+        // The received transcript still hashes to AB, but the disk now holds XB.
+        receiver.write_chunk("src/lib.rs", 1, b"B", Sha256::digest(b"B").into()).unwrap();
+        assert_poisoned(&mut receiver);
+    }
+
+    #[test]
+    fn seal_refuses_undeclared_files_empty_directories_and_hidden_cargo_inputs() {
+        for extra in ["extra.rs", ".cargo/config.toml", ".git/HEAD", "src/extra.rs", "empty-dir"] {
+            let owner = tempfile::tempdir().unwrap();
+            let (mut receiver, root) = completed_source(owner.path());
+            let path = root.join(extra);
+            if extra == "empty-dir" {
+                fs::create_dir(&path).unwrap();
+            } else {
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                fs::write(&path, b"undeclared semantic input").unwrap();
+            }
+            assert_poisoned(&mut receiver);
+        }
+    }
+
+    #[test]
+    fn seal_refuses_missing_replaced_and_resized_members() {
+        for change in 0..4 {
+            let owner = tempfile::tempdir().unwrap();
+            let (mut receiver, root) = completed_source(owner.path());
+            let path = root.join("src/lib.rs");
+            match change {
+                0 => fs::rename(&path, owner.path().join("moved-file")).unwrap(),
+                1 => {
+                    fs::rename(&path, owner.path().join("moved-file")).unwrap();
+                    fs::create_dir(&path).unwrap();
+                }
+                2 => fs::write(&path, b"A").unwrap(),
+                _ => fs::write(&path, b"ABC").unwrap(),
+            }
+            assert_poisoned(&mut receiver);
+        }
+    }
+
+    #[test]
+    fn root_replacement_never_redirects_upload_or_sealing() {
+        for during_upload in [false, true] {
+            let owner = tempfile::tempdir().unwrap();
+            let root = owner.path().join("source");
+            let mut receiver = SourceReceiver::create(
+                &root, SourceManifest::new(vec![entry("src/lib.rs", b"AB")]).unwrap(),
+            ).unwrap();
+            if !during_upload {
+                receiver.write_chunk("src/lib.rs", 0, b"AB", Sha256::digest(b"AB").into()).unwrap();
+            }
+            fs::rename(&root, owner.path().join("original-root")).unwrap();
+            fs::create_dir_all(root.join("src")).unwrap();
+            let replacement: &[u8] = if during_upload { b"" } else { b"AB" };
+            fs::write(root.join("src/lib.rs"), replacement).unwrap();
+            if during_upload {
+                assert!(receiver.write_chunk("src/lib.rs", 0, b"AB", Sha256::digest(b"AB").into()).is_err());
+            }
+            assert_poisoned(&mut receiver);
+            assert_eq!(fs::read(root.join("src/lib.rs")).unwrap(), replacement);
+        }
+    }
+
+    #[test]
+    fn symlinked_parent_never_receives_source_bytes_or_mode_changes() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        for during_upload in [false, true] {
+            let owner = tempfile::tempdir().unwrap();
+            let root = owner.path().join("source");
+            let mut receiver = SourceReceiver::create(
+                &root, SourceManifest::new(vec![entry("src/lib.rs", b"AB")]).unwrap(),
+            ).unwrap();
+            if !during_upload {
+                receiver.write_chunk("src/lib.rs", 0, b"AB", Sha256::digest(b"AB").into()).unwrap();
+            }
+            let outside = owner.path().join("outside");
+            fs::create_dir(&outside).unwrap();
+            let bytes: &[u8] = if during_upload { b"" } else { b"AB" };
+            let outside_file = outside.join("lib.rs");
+            fs::write(&outside_file, bytes).unwrap();
+            fs::set_permissions(&outside_file, fs::Permissions::from_mode(0o600)).unwrap();
+            fs::rename(root.join("src"), owner.path().join("original-src")).unwrap();
+            symlink(&outside, root.join("src")).unwrap();
+            if during_upload {
+                assert!(receiver.write_chunk("src/lib.rs", 0, b"AB", Sha256::digest(b"AB").into()).is_err());
+            }
+            assert_poisoned(&mut receiver);
+            assert_eq!(fs::read(&outside_file).unwrap(), bytes);
+            assert_eq!(fs::metadata(&outside_file).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+    }
+
+    #[test]
+    fn seal_rejects_final_symlinks_and_hardlinks() {
+        use std::os::unix::fs::symlink;
+        for change in 0..3 {
+            let owner = tempfile::tempdir().unwrap();
+            let (mut receiver, root) = completed_source(owner.path());
+            let path = root.join("src/lib.rs");
+            let preserved = owner.path().join("preserved");
+            match change {
+                0 => fs::hard_link(&path, &preserved).unwrap(),
+                1 => {
+                    fs::rename(&path, &preserved).unwrap();
+                    symlink(&preserved, &path).unwrap();
+                }
+                _ => symlink("missing", root.join("extra-link")).unwrap(),
+            }
+            assert_poisoned(&mut receiver);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_substituted_fifo_is_rejected_without_waiting_for_a_writer() {
+        use rustix::fs::{CWD, Mode, mkfifoat};
+        let owner = tempfile::tempdir().unwrap();
+        let (mut receiver, root) = completed_source(owner.path());
+        let path = root.join("src/lib.rs");
+        fs::rename(&path, owner.path().join("preserved")).unwrap();
+        mkfifoat(CWD, &path, Mode::RUSR | Mode::WUSR).unwrap();
+        assert_poisoned(&mut receiver);
+    }
+
+    #[test]
+    fn exact_multichunk_binary_empty_and_executable_inputs_remain_usable() {
+        use std::os::unix::fs::PermissionsExt;
+        let owner = tempfile::tempdir().unwrap();
+        let bytes: Vec<_> = (0..MAX_SOURCE_CHUNK * 2 + 17).map(|n| (n % 256) as u8).collect();
+        let mut executable = entry("tools/run", &bytes);
+        executable.executable = true;
+        let root = owner.path().join("source");
+        let mut receiver = SourceReceiver::create(&root, SourceManifest::new(vec![
+            executable, entry(".cargo/config.toml", b""),
+        ]).unwrap()).unwrap();
+        for (index, chunk) in bytes.chunks(MAX_SOURCE_CHUNK).enumerate() {
+            receiver.write_chunk("tools/run", (index * MAX_SOURCE_CHUNK) as u64, chunk,
+                Sha256::digest(chunk).into()).unwrap();
+        }
+        assert_eq!(receiver.seal().unwrap(), root);
+        assert_eq!(receiver.seal().unwrap(), root, "a successful seal is idempotent");
+        assert_eq!(receiver.sealed_root(), Some(root.as_path()));
+        assert_eq!(fs::read(root.join("tools/run")).unwrap(), bytes);
+        assert_eq!(fs::metadata(root.join("tools/run")).unwrap().permissions().mode() & 0o777, 0o555);
+        assert_eq!(fs::metadata(root.join(".cargo/config.toml")).unwrap().len(), 0);
     }
 }
