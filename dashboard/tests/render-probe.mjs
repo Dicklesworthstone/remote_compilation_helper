@@ -3,15 +3,23 @@
  * b) one 30s tick: long-task observer window
  * c) scripted full-page scroll: metric deltas (for content-visibility A/B)
  */
-import { chromium } from "playwright";
+
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { chromium } from "playwright";
 
 const env = Object.fromEntries(
   readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", ".env"), "utf8")
-    .split("\n").filter((l) => l.includes("="))
-    .map((l) => [l.slice(0, l.indexOf("=")).trim(), l.slice(l.indexOf("=") + 1).trim().replace(/^['"]|['"]$/g, "")]),
+    .split("\n")
+    .filter((l) => l.includes("="))
+    .map((l) => [
+      l.slice(0, l.indexOf("=")).trim(),
+      l
+        .slice(l.indexOf("=") + 1)
+        .trim()
+        .replace(/^['"]|['"]$/g, ""),
+    ]),
 );
 const PORT = process.env.RCH_DASH_E2E_PORT ?? "4174";
 const URL = `http://127.0.0.1:${PORT}${process.env.RCH_DASH_BASE ?? "/remote_compilation_helper/"}`;
@@ -25,13 +33,17 @@ const page = await browser.newPage({ viewport: { width: vw, height: vh } });
 const cdp = await page.context().newCDPSession(page);
 await cdp.send("Performance.enable");
 if (throttle > 0) await cdp.send("Emulation.setCPUThrottlingRate", { rate: throttle });
-const metrics = async () => (await cdp.send("Performance.getMetrics")).metrics
-  .filter((m) => ["RecalcStyleCount", "LayoutCount", "ScriptDuration", "TaskDuration"].includes(m.name))
-  .reduce((a, m) => ((a[m.name] = m.value), a), {});
+const metrics = async () =>
+  (await cdp.send("Performance.getMetrics")).metrics
+    .filter((m) =>
+      ["RecalcStyleCount", "LayoutCount", "ScriptDuration", "TaskDuration"].includes(m.name),
+    )
+    .reduce((a, m) => ((a[m.name] = m.value), a), {});
 await page.addInitScript(() => {
   window.__lt = [];
-  new PerformanceObserver((l) => window.__lt.push(...l.getEntries().map((e) => e.duration)))
-    .observe({ entryTypes: ["longtask"] });
+  new PerformanceObserver((l) =>
+    window.__lt.push(...l.getEntries().map((e) => e.duration)),
+  ).observe({ entryTypes: ["longtask"] });
 });
 
 await page.goto(URL, { waitUntil: "load" });
@@ -51,17 +63,21 @@ const out = {
 
 // a) typing
 await page.click(".search");
-for (const ch of "vmill112") { await page.type(".search", ch, { delay: 120 }); }
+for (const ch of "vmill112") {
+  await page.type(".search", ch, { delay: 120 });
+}
 await page.waitForTimeout(300);
 // Second burst in the same session: isolates first-input paint overhead from
 // per-keystroke render cost. If the long task only appears in burst one, it
 // is first-input style/paint, not React.
 const firstBurst = { longTasks: await page.evaluate(() => window.__lt.splice(0)) };
-let m1b0 = await metrics();
+const m1b0 = await metrics();
 await page.fill(".search", "");
-for (const ch of "omarchy") { await page.type(".search", ch, { delay: 120 }); }
+for (const ch of "omarchy") {
+  await page.type(".search", ch, { delay: 120 });
+}
 await page.waitForTimeout(300);
-let m1b = await metrics();
+const m1b = await metrics();
 out.typing = {
   firstBurst,
   secondBurst: {

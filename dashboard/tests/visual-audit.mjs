@@ -1,17 +1,26 @@
 /* Visual audit driver for the rch dashboard. Reads .env itself; prints nothing secret. */
-import { chromium } from "playwright";
+
+import { createReadStream, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { createServer } from "node:http";
-import { readFileSync, mkdirSync, existsSync, createReadStream } from "node:fs";
-import { dirname, join, extname } from "node:path";
+import { dirname, extname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { chromium } from "playwright";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const dist = join(root, "dist");
 let env = {};
 if (existsSync(`${root}/.env`)) {
   env = Object.fromEntries(
-    readFileSync(`${root}/.env`, "utf8").split("\n").filter((l) => l.includes("="))
-      .map((l) => [l.slice(0, l.indexOf("=")).trim(), l.slice(l.indexOf("=") + 1).trim().replace(/^['"]|['"]$/g, "")]),
+    readFileSync(`${root}/.env`, "utf8")
+      .split("\n")
+      .filter((l) => l.includes("="))
+      .map((l) => [
+        l.slice(0, l.indexOf("=")).trim(),
+        l
+          .slice(l.indexOf("=") + 1)
+          .trim()
+          .replace(/^['"]|['"]$/g, ""),
+      ]),
   );
 }
 const PASS = process.env.RCH_DASH_PASSPHRASE || env.RCH_DASH_PASSPHRASE;
@@ -52,7 +61,9 @@ const errors = [];
 async function newPage(w, h) {
   const page = await browser.newPage({ viewport: { width: w, height: h }, deviceScaleFactor: 2 });
   page.on("pageerror", (e) => errors.push(String(e)));
-  page.on("console", (m) => { if (m.type() === "error") errors.push(m.text()); });
+  page.on("console", (m) => {
+    if (m.type() === "error") errors.push(m.text());
+  });
   return page;
 }
 
@@ -95,10 +106,16 @@ await d.keyboard.press("Escape");
 await d.waitForTimeout(250);
 
 // light theme
-await d.locator("button.icon-btn", { hasText: /Light|Dark/ }).first().click();
+await d
+  .locator("button.icon-btn", { hasText: /Light|Dark/ })
+  .first()
+  .click();
 await d.waitForTimeout(300);
 await d.screenshot({ path: "/tmp/dash-audit/05-desktop-light.png" });
-await d.locator("button.icon-btn", { hasText: /Light|Dark/ }).first().click();
+await d
+  .locator("button.icon-btn", { hasText: /Light|Dark/ })
+  .first()
+  .click();
 await d.waitForTimeout(200);
 await d.close();
 
@@ -124,8 +141,9 @@ await m.waitForSelector(".kpis", { timeout: 40000 });
 await m.waitForTimeout(400);
 await m.screenshot({ path: "/tmp/dash-audit/08-mobile-top.png" });
 await m.screenshot({ path: "/tmp/dash-audit/09-mobile-full.png", fullPage: true });
-const overflow = await m.evaluate(() =>
-  document.documentElement.scrollWidth - document.documentElement.clientWidth);
+const overflow = await m.evaluate(
+  () => document.documentElement.scrollWidth - document.documentElement.clientWidth,
+);
 console.log(`mobile horizontal overflow px: ${overflow}`);
 
 // mobile worker drawer
@@ -136,7 +154,9 @@ await mobileWorkers.locator(".wcard").first().click();
 await m.waitForSelector(".drawer");
 await m.waitForTimeout(300);
 await m.screenshot({ path: "/tmp/dash-audit/10-mobile-drawer.png" });
-const drawerW = await m.evaluate(() => document.querySelector(".drawer").getBoundingClientRect().width);
+const drawerW = await m.evaluate(
+  () => document.querySelector(".drawer").getBoundingClientRect().width,
+);
 console.log(`mobile drawer width px: ${drawerW}`);
 // filter row wrapping check
 const filters = await m.evaluate(() => {
@@ -155,8 +175,9 @@ await s320.fill("#pp", PASS);
 await s320.click("button.btn");
 await s320.waitForSelector(".kpis", { timeout: 40000 });
 await s320.waitForTimeout(400);
-const overflow320 = await s320.evaluate(() =>
-  document.documentElement.scrollWidth - document.documentElement.clientWidth);
+const overflow320 = await s320.evaluate(
+  () => document.documentElement.scrollWidth - document.documentElement.clientWidth,
+);
 console.log(`320px narrow mobile horizontal overflow px: ${overflow320}`);
 if (overflow320 > 0) {
   errors.push(`horizontal overflow on 320px viewport: ${overflow320}px`);

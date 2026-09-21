@@ -1,14 +1,22 @@
 /* Find which elements overflow a 320px viewport. */
-import { chromium } from "playwright";
+
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { chromium } from "playwright";
 
 const root = dirname(fileURLToPath(import.meta.url));
 const env = Object.fromEntries(
   readFileSync(join(root, ".env"), "utf8")
-    .split("\n").filter((l) => l.includes("="))
-    .map((l) => [l.slice(0, l.indexOf("=")).trim(), l.slice(l.indexOf("=") + 1).trim().replace(/^['"]|['"]$/g, "")]),
+    .split("\n")
+    .filter((l) => l.includes("="))
+    .map((l) => [
+      l.slice(0, l.indexOf("=")).trim(),
+      l
+        .slice(l.indexOf("=") + 1)
+        .trim()
+        .replace(/^['"]|['"]$/g, ""),
+    ]),
 );
 const URL = `http://127.0.0.1:${process.env.RCH_DASH_E2E_PORT ?? "4174"}${process.env.RCH_DASH_BASE ?? "/remote_compilation_helper/"}`;
 
@@ -24,7 +32,9 @@ const wide = await page.evaluate(() => {
   for (const el of document.querySelectorAll("*")) {
     const r = el.getBoundingClientRect();
     if (r.right > vw + 1 && r.width > 8) {
-      bad.push(`${el.tagName.toLowerCase()}.${String(el.className).slice(0, 40)} right=${Math.round(r.right)} w=${Math.round(r.width)}`);
+      bad.push(
+        `${el.tagName.toLowerCase()}.${String(el.className).slice(0, 40)} right=${Math.round(r.right)} w=${Math.round(r.width)}`,
+      );
     }
   }
   return { vw, scrollW: document.documentElement.scrollWidth, bad: bad.slice(0, 12) };

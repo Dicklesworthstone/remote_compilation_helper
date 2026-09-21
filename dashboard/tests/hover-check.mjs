@@ -1,16 +1,24 @@
 /* Hover-focus verification for the fleet map: hovering a node must light
  * exactly its own edges (lit + dimmed === total), and leaving the map must
  * relight everything. Reads .env itself; prints nothing secret. */
-import { chromium } from "playwright";
+
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { chromium } from "playwright";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const env = Object.fromEntries(
   readFileSync(join(root, ".env"), "utf8")
-    .split("\n").filter((l) => l.includes("="))
-    .map((l) => [l.slice(0, l.indexOf("=")).trim(), l.slice(l.indexOf("=") + 1).trim().replace(/^['"]|['"]$/g, "")]),
+    .split("\n")
+    .filter((l) => l.includes("="))
+    .map((l) => [
+      l.slice(0, l.indexOf("=")).trim(),
+      l
+        .slice(l.indexOf("=") + 1)
+        .trim()
+        .replace(/^['"]|['"]$/g, ""),
+    ]),
 );
 const PORT = process.env.RCH_DASH_E2E_PORT ?? "4174";
 const URL = `http://127.0.0.1:${PORT}${process.env.RCH_DASH_BASE ?? "/remote_compilation_helper/"}`;
@@ -37,7 +45,11 @@ await page.waitForTimeout(250);
 const lit = await page.locator(".fm-edge:not(.dim)").count();
 const dimmed = await page.locator(".fm-edge.dim").count();
 const id = (await node.locator(".fm-name").innerText()).trim();
-check(`hover ${id}: lit + dimmed === total`, lit + dimmed === total, `${lit} + ${dimmed} vs ${total}`);
+check(
+  `hover ${id}: lit + dimmed === total`,
+  lit + dimmed === total,
+  `${lit} + ${dimmed} vs ${total}`,
+);
 check(`hover ${id}: some edges lit`, lit > 0, `${lit}`);
 
 const dev = page.locator(".fm-node.dev").first();
@@ -46,7 +58,11 @@ await page.waitForTimeout(250);
 const lit2 = await page.locator(".fm-edge:not(.dim)").count();
 const dimmed2 = await page.locator(".fm-edge.dim").count();
 const devId = (await dev.locator(".fm-name").innerText()).trim();
-check(`hover ${devId}: lit + dimmed === total`, lit2 + dimmed2 === total, `${lit2} + ${dimmed2} vs ${total}`);
+check(
+  `hover ${devId}: lit + dimmed === total`,
+  lit2 + dimmed2 === total,
+  `${lit2} + ${dimmed2} vs ${total}`,
+);
 
 await page.mouse.move(10, 10);
 await page.waitForTimeout(250);

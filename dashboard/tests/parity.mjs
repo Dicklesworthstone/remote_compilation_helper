@@ -12,16 +12,25 @@
  * Usage: npm run test:llm
  */
 
-import { build } from "esbuild";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
-import {
-  classifyWorker, classifyDev, expandBuilds, expandHints, seenByColumns,
-  expandAlerts, expandIssues, expandActive, expandQueued, buildLlmView, UnknownTarget,
-} from "../tools/llm-view.mjs";
+import { build } from "esbuild";
 import { buildProblems, PROBLEM_KINDS } from "../src/problems.js";
+import {
+  buildLlmView,
+  classifyDev,
+  classifyWorker,
+  expandActive,
+  expandAlerts,
+  expandBuilds,
+  expandHints,
+  expandIssues,
+  expandQueued,
+  seenByColumns,
+  UnknownTarget,
+} from "../tools/llm-view.mjs";
 
 const dir = await mkdtemp(join(tmpdir(), "rch-parity-"));
 const outfile = join(dir, "derive.mjs");
@@ -46,20 +55,45 @@ const SNAP_S = SNAP_MS / 1000;
 
 /** Minimal worker with overridable fields. */
 const w = (over = {}) => ({
-  id: "w", host: "h", user: "u", status: "healthy", circuit_state: "closed",
-  used_slots: 0, total_slots: 8, speed: 50, last_error: null,
-  consecutive_failures: 0, failure_history: [],
+  id: "w",
+  host: "h",
+  user: "u",
+  status: "healthy",
+  circuit_state: "closed",
+  used_slots: 0,
+  total_slots: 8,
+  speed: 50,
+  last_error: null,
+  consecutive_failures: 0,
+  failure_history: [],
   pressure: {
-    state: "healthy", reason: null, disk_free_gb: 500, disk_total_gb: 1000,
-    disk_io_util_pct: 0, memory_pressure: 0, telemetry_age_secs: 5, telemetry_fresh: true,
+    state: "healthy",
+    reason: null,
+    disk_free_gb: 500,
+    disk_total_gb: 1000,
+    disk_io_util_pct: 0,
+    memory_pressure: 0,
+    telemetry_age_secs: 5,
+    telemetry_fresh: true,
   },
-  latency_ms: 10, last_seen_unix: SNAP_S - 30, priority: 100,
+  latency_ms: 10,
+  last_seen_unix: SNAP_S - 30,
+  priority: 100,
   caps: {
-    num_cpus: 8, load_avg_1: 1, load_avg_5: 1, load_avg_15: 1,
-    cpu_microarch_level: 3, rustc_version: "1.87.0", bun_version: null,
-    node_version: null, go_version: null, zig_version: null, projects_root_ok: true,
+    num_cpus: 8,
+    load_avg_1: 1,
+    load_avg_5: 1,
+    load_avg_15: 1,
+    cpu_microarch_level: 3,
+    rustc_version: "1.87.0",
+    bun_version: null,
+    node_version: null,
+    go_version: null,
+    zig_version: null,
+    projects_root_ok: true,
   },
-  tags: [], ...over,
+  tags: [],
+  ...over,
 });
 
 // Boundary matrix — each row targets one threshold, including both sides of it.
@@ -78,12 +112,30 @@ const cases = [
   ["drained while busy", w({ status: "drained", used_slots: 2 })],
   ["stale just under 1h", w({ last_seen_unix: SNAP_S - 3599 })],
   ["stale just over 1h", w({ last_seen_unix: SNAP_S - 3601 })],
-  ["disk 94.9% (under crit)", w({ pressure: { ...w().pressure, disk_free_gb: 51, disk_total_gb: 1000 } })],
-  ["disk 95.1% (crit)", w({ pressure: { ...w().pressure, disk_free_gb: 49, disk_total_gb: 1000 } })],
-  ["disk 88.1% (warn)", w({ pressure: { ...w().pressure, disk_free_gb: 119, disk_total_gb: 1000 } })],
-  ["disk 87.9% (under warn)", w({ pressure: { ...w().pressure, disk_free_gb: 121, disk_total_gb: 1000 } })],
-  ["pressure critical flag", w({ pressure: { ...w().pressure, state: "critical", reason: "disk_free_below_critical_gb" } })],
-  ["pressure warning flag", w({ pressure: { ...w().pressure, state: "warning", reason: "disk_io_high" } })],
+  [
+    "disk 94.9% (under crit)",
+    w({ pressure: { ...w().pressure, disk_free_gb: 51, disk_total_gb: 1000 } }),
+  ],
+  [
+    "disk 95.1% (crit)",
+    w({ pressure: { ...w().pressure, disk_free_gb: 49, disk_total_gb: 1000 } }),
+  ],
+  [
+    "disk 88.1% (warn)",
+    w({ pressure: { ...w().pressure, disk_free_gb: 119, disk_total_gb: 1000 } }),
+  ],
+  [
+    "disk 87.9% (under warn)",
+    w({ pressure: { ...w().pressure, disk_free_gb: 121, disk_total_gb: 1000 } }),
+  ],
+  [
+    "pressure critical flag",
+    w({ pressure: { ...w().pressure, state: "critical", reason: "disk_free_below_critical_gb" } }),
+  ],
+  [
+    "pressure warning flag",
+    w({ pressure: { ...w().pressure, state: "warning", reason: "disk_io_high" } }),
+  ],
   ["load exactly 2x", w({ caps: { ...w().caps, load_avg_1: 16, num_cpus: 8 } })],
   ["load just under 2x", w({ caps: { ...w().caps, load_avg_1: 15.9, num_cpus: 8 } })],
   ["one consecutive failure (singular)", w({ consecutive_failures: 1 })],
@@ -92,21 +144,67 @@ const cases = [
   ["projects root bad", w({ caps: { ...w().caps, projects_root_ok: false } })],
   // A broken projects root used to be unreachable whenever the worker was busy,
   // i.e. exactly when a build was running on the broken root.
-  ["projects root bad WHILE busy", w({ used_slots: 4, caps: { ...w().caps, projects_root_ok: false } })],
+  [
+    "projects root bad WHILE busy",
+    w({ used_slots: 4, caps: { ...w().caps, projects_root_ok: false } }),
+  ],
   // rch's fourth pressure state. Ranked below healthy in the old merge and
   // matched by neither classifier, so "I have no telemetry" rendered green.
   ["pressure telemetry_gap", w({ pressure: { ...w().pressure, state: "telemetry_gap" } })],
-  ["pressure telemetry_gap with reason", w({ pressure: { ...w().pressure, state: "telemetry_gap", reason: "pressure_telemetry_gap" } })],
+  [
+    "pressure telemetry_gap with reason",
+    w({ pressure: { ...w().pressure, state: "telemetry_gap", reason: "pressure_telemetry_gap" } }),
+  ],
   // Pressure events that carry no disk numbers used to render the literal
   // string "disk undefined% full".
-  ["critical pressure, no disk numbers", w({ pressure: { ...w().pressure, state: "critical", reason: null, disk_free_gb: null, disk_total_gb: null } })],
-  ["warning pressure, no disk numbers", w({ pressure: { ...w().pressure, state: "warning", reason: null, disk_free_gb: null, disk_total_gb: null } })],
+  [
+    "critical pressure, no disk numbers",
+    w({
+      pressure: {
+        ...w().pressure,
+        state: "critical",
+        reason: null,
+        disk_free_gb: null,
+        disk_total_gb: null,
+      },
+    }),
+  ],
+  [
+    "warning pressure, no disk numbers",
+    w({
+      pressure: {
+        ...w().pressure,
+        state: "warning",
+        reason: null,
+        disk_free_gb: null,
+        disk_total_gb: null,
+      },
+    }),
+  ],
   // Healthy-looking verdict derived from stale readings.
-  ["stale telemetry, otherwise healthy", w({ pressure: { ...w().pressure, telemetry_fresh: false, telemetry_age_secs: 900 } })],
-  ["stale telemetry, no age", w({ pressure: { ...w().pressure, telemetry_fresh: false, telemetry_age_secs: null } })],
-  ["stale telemetry while busy", w({ used_slots: 3, pressure: { ...w().pressure, telemetry_fresh: false, telemetry_age_secs: 120 } })],
-  ["no telemetry at all", w({ last_seen_unix: null, caps: { ...w().caps, load_avg_1: null, num_cpus: null },
-                             pressure: { ...w().pressure, disk_free_gb: null, disk_total_gb: null } })],
+  [
+    "stale telemetry, otherwise healthy",
+    w({ pressure: { ...w().pressure, telemetry_fresh: false, telemetry_age_secs: 900 } }),
+  ],
+  [
+    "stale telemetry, no age",
+    w({ pressure: { ...w().pressure, telemetry_fresh: false, telemetry_age_secs: null } }),
+  ],
+  [
+    "stale telemetry while busy",
+    w({
+      used_slots: 3,
+      pressure: { ...w().pressure, telemetry_fresh: false, telemetry_age_secs: 120 },
+    }),
+  ],
+  [
+    "no telemetry at all",
+    w({
+      last_seen_unix: null,
+      caps: { ...w().caps, load_avg_1: null, num_cpus: null },
+      pressure: { ...w().pressure, disk_free_gb: null, disk_total_gb: null },
+    }),
+  ],
 ];
 
 for (const [name, worker] of cases) {
@@ -116,31 +214,59 @@ for (const [name, worker] of cases) {
   // Compare reasons unconditionally. Skipping the healthy case (and only
   // reporting on mismatch) meant a passing reason check was invisible and
   // healthy-path drift went unnoticed entirely.
-  chk(`worker reason: ${name}`, a.healthReason === b.reason, `derive="${a.healthReason}" llm="${b.reason}"`);
+  chk(
+    `worker reason: ${name}`,
+    a.healthReason === b.reason,
+    `derive="${a.healthReason}" llm="${b.reason}"`,
+  );
   // A reason must never interpolate a missing number into the text.
-  chk(`worker reason well-formed: ${name}`, !/undefined|NaN|null/.test(a.healthReason), `derive="${a.healthReason}"`);
+  chk(
+    `worker reason well-formed: ${name}`,
+    !/undefined|NaN|null/.test(a.healthReason),
+    `derive="${a.healthReason}"`,
+  );
 }
 
 // Dev-machine parity.
 const d = (over = {}) => ({
-  id: "d", reachable: true, posture: "remote_ready", posture_description: "ok",
-  daemon: { version: "1", uptime_secs: 60, pid: 1, workers_total: 2, workers_healthy: 2,
-            slots_total: 10, slots_available: 10 },
+  id: "d",
+  reachable: true,
+  posture: "remote_ready",
+  posture_description: "ok",
+  daemon: {
+    version: "1",
+    uptime_secs: 60,
+    pid: 1,
+    workers_total: 2,
+    workers_healthy: 2,
+    slots_total: 10,
+    slots_available: 10,
+  },
   build_stats: { total: 10, remote: 10, local: 0, success: 10, failure: 0, avg_duration_ms: 100 },
-  saved_time_ms: 0, active_builds: 0, queued_builds: 0,
+  saved_time_ms: 0,
+  active_builds: 0,
+  queued_builds: 0,
   // The wire shape the collector actually emits: positional tuples, not objects
   // — `worker_slots` as `[used, total]`, `builds` as
   // `[project, command, location, worker_id, duration_ms, exit_code, completed_at]`
   // and `hints` as `[worker_id, severity, message, suggested_action, reason_code]`.
   // `issues`/`alerts` are gone entirely: nothing ever read them.
-  builds: [], hints: [],
-  collection_errors: [], config_degraded: false, worker_slots: [], ...over,
+  builds: [],
+  hints: [],
+  collection_errors: [],
+  config_degraded: false,
+  worker_slots: [],
+  ...over,
 });
 
 /** Build a wire build tuple from named parts, so the cases below stay readable. */
 const bt = (o = {}) => [
-  o.project ?? "proj", o.command ?? "cargo build", o.location ?? "Remote",
-  o.worker_id ?? "w1", o.duration_ms ?? 1000, o.exit_code ?? 0,
+  o.project ?? "proj",
+  o.command ?? "cargo build",
+  o.location ?? "Remote",
+  o.worker_id ?? "w1",
+  o.duration_ms ?? 1000,
+  o.exit_code ?? 0,
   o.completed_at ?? "2026-08-26T11:59:00.000Z",
 ];
 
@@ -149,21 +275,54 @@ const devCases = [
   ["unreachable", d({ reachable: false })],
   ["posture degraded", d({ posture: "degraded", posture_description: "partial" })],
   ["posture local_only", d({ posture: "local_only", posture_description: "no workers" })],
-  ["idle (no builds)", d({ build_stats: { total: 0, remote: 0, local: 0, success: 0, failure: 0, avg_duration_ms: null } })],
-  ["mostly local", d({ build_stats: { total: 10, remote: 2, local: 8, success: 10, failure: 0, avg_duration_ms: 100 } })],
+  [
+    "idle (no builds)",
+    d({
+      build_stats: { total: 0, remote: 0, local: 0, success: 0, failure: 0, avg_duration_ms: null },
+    }),
+  ],
+  [
+    "mostly local",
+    d({
+      build_stats: {
+        total: 10,
+        remote: 2,
+        local: 8,
+        success: 10,
+        failure: 0,
+        avg_duration_ms: 100,
+      },
+    }),
+  ],
   ["no build_stats", d({ build_stats: null })],
   // The RECENT-window basis, which nothing exercised before the builds array
   // moved to tuples. It is the branch that decides `local-only`, and it reads
   // `location` out of a fixed tuple position — a misread index would count
   // every build as local and paint the whole fleet red.
   ["recent window: all remote", d({ builds: [bt(), bt(), bt()] })],
-  ["recent window: all local", d({ builds: [bt({ location: "Local" }), bt({ location: "Local" })] })],
+  [
+    "recent window: all local",
+    d({ builds: [bt({ location: "Local" }), bt({ location: "Local" })] }),
+  ],
   ["recent window: 50/50 (on the threshold)", d({ builds: [bt(), bt({ location: "Local" })] })],
-  ["recent window: 1 of 3 remote", d({ builds: [bt(), bt({ location: "Local" }), bt({ location: "Local" })] })],
-  ["recent window beats lifetime counters", d({
-    builds: [bt({ location: "Local" }), bt({ location: "Local" })],
-    build_stats: { total: 100, remote: 100, local: 0, success: 100, failure: 0, avg_duration_ms: 100 },
-  })],
+  [
+    "recent window: 1 of 3 remote",
+    d({ builds: [bt(), bt({ location: "Local" }), bt({ location: "Local" })] }),
+  ],
+  [
+    "recent window beats lifetime counters",
+    d({
+      builds: [bt({ location: "Local" }), bt({ location: "Local" })],
+      build_stats: {
+        total: 100,
+        remote: 100,
+        local: 0,
+        success: 100,
+        failure: 0,
+        avg_duration_ms: 100,
+      },
+    }),
+  ],
   ["recent window with a null location", d({ builds: [bt({ location: null }), bt()] })],
 ];
 
@@ -175,11 +334,21 @@ for (const [name, dev] of devCases) {
   // measured percentage AND the window size ("only 33% of the last 3 builds
   // went remote"), so this is what actually catches a classifier that counts a
   // different number of builds than the other one.
-  chk(`dev reason: ${name}`, a.levelReason === b.reason, `derive="${a.levelReason}" llm="${b.reason}"`);
-  chk(`dev remotePct: ${name}`, a.remotePct === b.remotePct, `derive=${a.remotePct} llm=${b.remotePct}`);
-  chk(`dev basis: ${name}`,
+  chk(
+    `dev reason: ${name}`,
+    a.levelReason === b.reason,
+    `derive="${a.levelReason}" llm="${b.reason}"`,
+  );
+  chk(
+    `dev remotePct: ${name}`,
+    a.remotePct === b.remotePct,
+    `derive=${a.remotePct} llm=${b.remotePct}`,
+  );
+  chk(
+    `dev basis: ${name}`,
     a.remoteBasis === b.remoteBasis && a.remoteCounted === b.remoteCounted,
-    `derive=${a.remoteBasis}/${a.remoteCounted} llm=${b.remoteBasis}/${b.remoteCounted}`);
+    `derive=${a.remoteBasis}/${a.remoteCounted} llm=${b.remoteBasis}/${b.remoteCounted}`,
+  );
 }
 
 // ------------------------------------------------- per-dispatcher slot view
@@ -193,32 +362,51 @@ for (const [name, dev] of devCases) {
 // so an expansion that dropped or reordered a pair would silently change that
 // verdict.
 {
-  const pairs = [[0, 16], [4, 8], [null, null], [2, 0]];
+  const pairs = [
+    [0, 16],
+    [4, 8],
+    [null, null],
+    [2, 0],
+  ];
   const dv = derive.classifyDispatcher(d({ worker_slots: pairs }));
-  chk("slot pairs expand one-for-one", dv.workers.length === pairs.length, `${dv.workers.length} of ${pairs.length}`);
-  chk("slot pairs keep their order and values",
+  chk(
+    "slot pairs expand one-for-one",
+    dv.workers.length === pairs.length,
+    `${dv.workers.length} of ${pairs.length}`,
+  );
+  chk(
+    "slot pairs keep their order and values",
     JSON.stringify(dv.workers) ===
       JSON.stringify(pairs.map(([used, total]) => ({ used_slots: used, total_slots: total }))),
-    JSON.stringify(dv.workers));
+    JSON.stringify(dv.workers),
+  );
   // The drawer's three numbers, computed exactly as DevMachineDrawer does.
   const ws = dv.workers;
-  chk("derated totals survive the round trip",
+  chk(
+    "derated totals survive the round trip",
     ws.reduce((n, x) => n + (x.total_slots ?? 0), 0) === 24 &&
-    ws.reduce((n, x) => n + (x.used_slots ?? 0), 0) === 6,
-    `total=${ws.reduce((n, x) => n + (x.total_slots ?? 0), 0)} used=${ws.reduce((n, x) => n + (x.used_slots ?? 0), 0)}`);
+      ws.reduce((n, x) => n + (x.used_slots ?? 0), 0) === 6,
+    `total=${ws.reduce((n, x) => n + (x.total_slots ?? 0), 0)} used=${ws.reduce((n, x) => n + (x.used_slots ?? 0), 0)}`,
+  );
   // A worker derated to 0 slots is invisible to this machine — the exact
   // condition the drawer exists to surface, and the one `|| null` instead of
   // `?? null` in the expander would erase.
-  chk("zero-slot workers stay countable",
+  chk(
+    "zero-slot workers stay countable",
     ws.filter((x) => (x.total_slots ?? 0) === 0).length === 2,
-    `${ws.filter((x) => (x.total_slots ?? 0) === 0).length} of 2`);
-  chk("a dispatcher with no slot view yields no workers",
-    derive.classifyDispatcher(d()).workers.length === 0);
+    `${ws.filter((x) => (x.total_slots ?? 0) === 0).length} of 2`,
+  );
+  chk(
+    "a dispatcher with no slot view yields no workers",
+    derive.classifyDispatcher(d()).workers.length === 0,
+  );
   // An older snapshot cached in a browser tab has no `worker_slots` at all.
   const legacy = d();
   delete legacy.worker_slots;
-  chk("a pre-projection snapshot renders instead of throwing",
-    derive.classifyDispatcher(legacy).workers.length === 0);
+  chk(
+    "a pre-projection snapshot renders instead of throwing",
+    derive.classifyDispatcher(legacy).workers.length === 0,
+  );
 }
 
 // ------------------------------------ the (dispatcher x worker) slot matrix
@@ -237,29 +425,52 @@ for (const [name, dev] of devCases) {
   // the central failure mode of the row encoding.
   const row = [[0, 16], null, [4, 8], null, [2, 0]];
   const dv = derive.classifyDispatcher(d({ pool_slots: row }));
-  chk("pool_slots drops the nulls rather than expanding them",
-    dv.workers.length === 3, `${dv.workers.length} of 3`);
-  chk("pool_slots keeps order and values across the gaps",
+  chk(
+    "pool_slots drops the nulls rather than expanding them",
+    dv.workers.length === 3,
+    `${dv.workers.length} of 3`,
+  );
+  chk(
+    "pool_slots keeps order and values across the gaps",
     JSON.stringify(dv.workers) ===
-      JSON.stringify([{ used_slots: 0, total_slots: 16 }, { used_slots: 4, total_slots: 8 },
-                      { used_slots: 2, total_slots: 0 }]),
-    JSON.stringify(dv.workers));
-  chk("a null is never counted as a zero-slot worker",
+      JSON.stringify([
+        { used_slots: 0, total_slots: 16 },
+        { used_slots: 4, total_slots: 8 },
+        { used_slots: 2, total_slots: 0 },
+      ]),
+    JSON.stringify(dv.workers),
+  );
+  chk(
+    "a null is never counted as a zero-slot worker",
     dv.workers.filter((x) => (x.total_slots ?? 0) === 0).length === 1,
-    `${dv.workers.filter((x) => (x.total_slots ?? 0) === 0).length} of 1`);
-  chk("drawer aggregates match the surviving pairs",
+    `${dv.workers.filter((x) => (x.total_slots ?? 0) === 0).length} of 1`,
+  );
+  chk(
+    "drawer aggregates match the surviving pairs",
     dv.workers.reduce((n, x) => n + (x.total_slots ?? 0), 0) === 24 &&
-    dv.workers.reduce((n, x) => n + (x.used_slots ?? 0), 0) === 6);
+      dv.workers.reduce((n, x) => n + (x.used_slots ?? 0), 0) === 6,
+  );
   // Trailing nulls are trimmed by the collector, so a dispatcher that sees only
   // the first workers of a large fleet ships a SHORT row. Reading past its end
   // must yield "not seen", never a zero reading.
-  chk("a short row is read as absence, not as zeroes",
-    derive.classifyDispatcher(d({ pool_slots: [[1, 2]] })).workers.length === 1);
+  chk(
+    "a short row is read as absence, not as zeroes",
+    derive.classifyDispatcher(d({ pool_slots: [[1, 2]] })).workers.length === 1,
+  );
   // Both encodings can be in flight at once: a tab holding an older bundle, a
   // stale published file. `pool_slots` is authoritative when present.
-  chk("pool_slots wins over a legacy worker_slots on the same record",
-    derive.classifyDispatcher(d({ pool_slots: [[9, 9]], worker_slots: [[1, 1], [2, 2]] }))
-      .workers.length === 1);
+  chk(
+    "pool_slots wins over a legacy worker_slots on the same record",
+    derive.classifyDispatcher(
+      d({
+        pool_slots: [[9, 9]],
+        worker_slots: [
+          [1, 1],
+          [2, 2],
+        ],
+      }),
+    ).workers.length === 1,
+  );
 }
 
 // `seen_by` is the same matrix read by COLUMN, and the browser and the LLM view
@@ -268,56 +479,87 @@ for (const [name, dev] of devCases) {
   const workers = [w({ id: "wa" }), w({ id: "wb" }), w({ id: "wc" })];
   const dispatchers = [
     d({ id: "dev-1", pool_slots: [[1, 8], null, [3, 8]] }),
-    d({ id: "dev-2", pool_slots: [[2, 4], [5, 5]] }),
+    d({
+      id: "dev-2",
+      pool_slots: [
+        [2, 4],
+        [5, 5],
+      ],
+    }),
   ];
   const snapM = {
-    schema: "x", label: "l", generated_at: new Date(SNAP_MS).toISOString(),
-    totals: {}, dispatchers, workers, history: [],
+    schema: "x",
+    label: "l",
+    generated_at: new Date(SNAP_MS).toISOString(),
+    totals: {},
+    dispatchers,
+    workers,
+    history: [],
   };
   const views = derive.classifyAll(snapM);
   const cols = seenByColumns(snapM);
   const expected = [["dev-1", "dev-2"], ["dev-2"], ["dev-1"]];
   for (let i = 0; i < workers.length; i++) {
-    chk(`seen_by column ${i} is read from the rows`,
+    chk(
+      `seen_by column ${i} is read from the rows`,
       JSON.stringify(views[i].seen_by) === JSON.stringify(expected[i]),
-      JSON.stringify(views[i].seen_by));
-    chk(`seen_by column ${i} agrees between derive and llm-view`,
+      JSON.stringify(views[i].seen_by),
+    );
+    chk(
+      `seen_by column ${i} agrees between derive and llm-view`,
       JSON.stringify(views[i].seen_by) === JSON.stringify(cols[i]),
-      `derive=${JSON.stringify(views[i].seen_by)} llm=${JSON.stringify(cols[i])}`);
+      `derive=${JSON.stringify(views[i].seen_by)} llm=${JSON.stringify(cols[i])}`,
+    );
   }
   // Dispatcher order is the contract: the drawer lists machines in it, and the
   // collector built the old inline copy by iterating dispatchers outermost.
-  chk("slots_by_dispatcher is keyed in dispatcher order",
-    JSON.stringify(Object.keys(views[0].slots_by_dispatcher)) === JSON.stringify(["dev-1", "dev-2"]),
-    JSON.stringify(Object.keys(views[0].slots_by_dispatcher)));
-  chk("slots_by_dispatcher carries the per-observer readings",
+  chk(
+    "slots_by_dispatcher is keyed in dispatcher order",
+    JSON.stringify(Object.keys(views[0].slots_by_dispatcher)) ===
+      JSON.stringify(["dev-1", "dev-2"]),
+    JSON.stringify(Object.keys(views[0].slots_by_dispatcher)),
+  );
+  chk(
+    "slots_by_dispatcher carries the per-observer readings",
     JSON.stringify(views[0].slots_by_dispatcher) ===
       JSON.stringify({ "dev-1": { used: 1, total: 8 }, "dev-2": { used: 2, total: 4 } }),
-    JSON.stringify(views[0].slots_by_dispatcher));
+    JSON.stringify(views[0].slots_by_dispatcher),
+  );
   // Lazily materialised, so it must survive every way a consumer might read it.
   // Serialise ONCE and read the result back, rather than round-tripping as a
   // clone: what is under test is exactly what a consumer receives after the
   // view has been through JSON, so the serialized form is the subject, not an
   // incidental copy.
   const serializedView = JSON.stringify(views[0]);
-  chk("the lazy slot record survives a spread and JSON round-trip",
+  chk(
+    "the lazy slot record survives a spread and JSON round-trip",
     JSON.stringify({ ...views[0] }.slots_by_dispatcher) ===
       JSON.stringify(views[0].slots_by_dispatcher) &&
-    JSON.parse(serializedView).slots_by_dispatcher["dev-2"].total === 4);
-  chk("a worker no dispatcher reports keeps both fields absent",
-    derive.classifyAll({ ...snapM, workers: [...workers, w({ id: "wd" })] })[3].seen_by === undefined);
+      JSON.parse(serializedView).slots_by_dispatcher["dev-2"].total === 4,
+  );
+  chk(
+    "a worker no dispatcher reports keeps both fields absent",
+    derive.classifyAll({ ...snapM, workers: [...workers, w({ id: "wd" })] })[3].seen_by ===
+      undefined,
+  );
   // A snapshot written before the matrix was de-duplicated carries the columns
   // inline; its `worker_slots` index a DIFFERENT space, so re-deriving them
   // would attribute readings to the wrong machines. It must be left alone.
   const legacySnap = {
     ...snapM,
     dispatchers: [d({ id: "dev-1", worker_slots: [[1, 8]] })],
-    workers: [w({ id: "wa", seen_by: ["dev-9"], slots_by_dispatcher: { "dev-9": { used: 7, total: 7 } } })],
+    workers: [
+      w({ id: "wa", seen_by: ["dev-9"], slots_by_dispatcher: { "dev-9": { used: 7, total: 7 } } }),
+    ],
   };
-  chk("a legacy snapshot keeps its own seen_by",
-    JSON.stringify(derive.classifyAll(legacySnap)[0].seen_by) === JSON.stringify(["dev-9"]));
-  chk("a legacy snapshot keeps its own slots_by_dispatcher",
-    derive.classifyAll(legacySnap)[0].slots_by_dispatcher["dev-9"].total === 7);
+  chk(
+    "a legacy snapshot keeps its own seen_by",
+    JSON.stringify(derive.classifyAll(legacySnap)[0].seen_by) === JSON.stringify(["dev-9"]),
+  );
+  chk(
+    "a legacy snapshot keeps its own slots_by_dispatcher",
+    derive.classifyAll(legacySnap)[0].slots_by_dispatcher["dev-9"].total === 7,
+  );
 }
 
 // ------------------------------------------------ build + hint tuple expansion
@@ -338,18 +580,38 @@ for (const [name, dev] of devCases) {
     ["x", null, null, null, null, 101, null],
   ];
   const dv = derive.classifyDispatcher(d({ builds }));
-  chk("build tuples expand one-for-one", dv.recent_builds.length === builds.length,
-    `${dv.recent_builds.length} of ${builds.length}`);
-  chk("build tuples keep order and every field",
-    JSON.stringify(dv.recent_builds) === JSON.stringify(builds.map(
-      ([project, command, location, worker_id, duration_ms, exit_code, completed_at]) =>
-        ({ project, command, location, worker_id, duration_ms, exit_code, completed_at }))),
-    JSON.stringify(dv.recent_builds));
-  chk("build expansion agrees between derive and llm-view",
-    JSON.stringify(dv.recent_builds) === JSON.stringify(expandBuilds(builds)));
-  chk("a zero exit code survives as 0, not null",
+  chk(
+    "build tuples expand one-for-one",
+    dv.recent_builds.length === builds.length,
+    `${dv.recent_builds.length} of ${builds.length}`,
+  );
+  chk(
+    "build tuples keep order and every field",
+    JSON.stringify(dv.recent_builds) ===
+      JSON.stringify(
+        builds.map(
+          ([project, command, location, worker_id, duration_ms, exit_code, completed_at]) => ({
+            project,
+            command,
+            location,
+            worker_id,
+            duration_ms,
+            exit_code,
+            completed_at,
+          }),
+        ),
+      ),
+    JSON.stringify(dv.recent_builds),
+  );
+  chk(
+    "build expansion agrees between derive and llm-view",
+    JSON.stringify(dv.recent_builds) === JSON.stringify(expandBuilds(builds)),
+  );
+  chk(
+    "a zero exit code survives as 0, not null",
     dv.recent_builds[1].exit_code === 0 && dv.recent_builds[1].duration_ms === 0,
-    `exit=${dv.recent_builds[1].exit_code} ms=${dv.recent_builds[1].duration_ms}`);
+    `exit=${dv.recent_builds[1].exit_code} ms=${dv.recent_builds[1].duration_ms}`,
+  );
   chk("a failing build keeps its exit code", dv.recent_builds[2].exit_code === 101);
 
   const hints = [
@@ -357,30 +619,51 @@ for (const [name, dev] of devCases) {
     ["vmi1", "warn", "telemetry stale", null, null],
   ];
   const hv = derive.classifyDispatcher(d({ hints }));
-  chk("hint tuples expand one-for-one", hv.remediation_hints.length === hints.length,
-    `${hv.remediation_hints.length} of ${hints.length}`);
-  chk("hint tuples keep order and every field",
-    JSON.stringify(hv.remediation_hints) === JSON.stringify(hints.map(
-      ([worker_id, severity, message, suggested_action, reason_code]) =>
-        ({ worker_id, severity, message, suggested_action, reason_code }))),
-    JSON.stringify(hv.remediation_hints));
-  chk("hint expansion agrees between derive and llm-view",
-    JSON.stringify(hv.remediation_hints) === JSON.stringify(expandHints(hints)));
+  chk(
+    "hint tuples expand one-for-one",
+    hv.remediation_hints.length === hints.length,
+    `${hv.remediation_hints.length} of ${hints.length}`,
+  );
+  chk(
+    "hint tuples keep order and every field",
+    JSON.stringify(hv.remediation_hints) ===
+      JSON.stringify(
+        hints.map(([worker_id, severity, message, suggested_action, reason_code]) => ({
+          worker_id,
+          severity,
+          message,
+          suggested_action,
+          reason_code,
+        })),
+      ),
+    JSON.stringify(hv.remediation_hints),
+  );
+  chk(
+    "hint expansion agrees between derive and llm-view",
+    JSON.stringify(hv.remediation_hints) === JSON.stringify(expandHints(hints)),
+  );
   // DevMachineCard prints this count, DevMachineDrawer keys each row off
   // `worker_id|reason_code|message` — so reason_code has to survive the wire
   // even though it is never displayed.
-  chk("hint reason_code survives for the drawer's row keys",
-    hv.remediation_hints[0].reason_code === "disk_free_below_critical_gb");
+  chk(
+    "hint reason_code survives for the drawer's row keys",
+    hv.remediation_hints[0].reason_code === "disk_free_below_critical_gb",
+  );
 
   // A snapshot written before this projection, still cached in a browser tab.
   const old = d();
   delete old.builds;
   delete old.hints;
   const ov = derive.classifyDispatcher(old);
-  chk("a pre-tuple snapshot renders instead of throwing",
-    ov.recent_builds.length === 0 && ov.remediation_hints.length === 0);
-  chk("...and falls back to the lifetime counters for its verdict",
-    ov.remoteBasis === "lifetime" && ov.level === "offloading", `${ov.remoteBasis}/${ov.level}`);
+  chk(
+    "a pre-tuple snapshot renders instead of throwing",
+    ov.recent_builds.length === 0 && ov.remediation_hints.length === 0,
+  );
+  chk(
+    "...and falls back to the lifetime counters for its verdict",
+    ov.remoteBasis === "lifetime" && ov.level === "offloading",
+    `${ov.remoteBasis}/${ov.level}`,
+  );
 }
 
 // ------------------------------------------------------ snapshot string table
@@ -422,113 +705,173 @@ for (const [name, dev] of devCases) {
     [null, "warn", "disk 96% full", null, ""],
   ];
 
-  const iv = derive.classifyDispatcher(d({ builds: internedBuilds, hints: internedHints }), strings);
+  const iv = derive.classifyDispatcher(
+    d({ builds: internedBuilds, hints: internedHints }),
+    strings,
+  );
   const lv = derive.classifyDispatcher(d({ builds: literalBuilds, hints: literalHints }));
 
-  chk("interned builds expand to the literal records",
+  chk(
+    "interned builds expand to the literal records",
     JSON.stringify(iv.recent_builds) === JSON.stringify(lv.recent_builds),
-    JSON.stringify(iv.recent_builds));
-  chk("interned hints expand to the literal records",
+    JSON.stringify(iv.recent_builds),
+  );
+  chk(
+    "interned hints expand to the literal records",
     JSON.stringify(iv.remediation_hints) === JSON.stringify(lv.remediation_hints),
-    JSON.stringify(iv.remediation_hints));
-  chk("build interning agrees between derive and llm-view",
-    JSON.stringify(iv.recent_builds) === JSON.stringify(expandBuilds(internedBuilds, strings)));
-  chk("hint interning agrees between derive and llm-view",
-    JSON.stringify(iv.remediation_hints) === JSON.stringify(expandHints(internedHints, strings)));
+    JSON.stringify(iv.remediation_hints),
+  );
+  chk(
+    "build interning agrees between derive and llm-view",
+    JSON.stringify(iv.recent_builds) === JSON.stringify(expandBuilds(internedBuilds, strings)),
+  );
+  chk(
+    "hint interning agrees between derive and llm-view",
+    JSON.stringify(iv.remediation_hints) === JSON.stringify(expandHints(internedHints, strings)),
+  );
 
   // The trap this pass was warned about: a missing value must not collapse into
   // table entry 0. Entry 0 here is "cargo build -p rch", so a `null` project
   // read as an index would render every unnamed build as that command.
-  chk("a null interned slot stays null, never entry 0",
-    iv.recent_builds[1].project === null && iv.recent_builds[1].worker_id === null &&
-    iv.remediation_hints[1].worker_id === null && iv.remediation_hints[1].suggested_action === null,
-    JSON.stringify([iv.recent_builds[1].project, iv.remediation_hints[1].suggested_action]));
-  chk("an empty interned slot stays the empty string",
+  chk(
+    "a null interned slot stays null, never entry 0",
+    iv.recent_builds[1].project === null &&
+      iv.recent_builds[1].worker_id === null &&
+      iv.remediation_hints[1].worker_id === null &&
+      iv.remediation_hints[1].suggested_action === null,
+    JSON.stringify([iv.recent_builds[1].project, iv.remediation_hints[1].suggested_action]),
+  );
+  chk(
+    "an empty interned slot stays the empty string",
     iv.recent_builds[1].command === "" && iv.remediation_hints[1].reason_code === "",
-    JSON.stringify([iv.recent_builds[1].command, iv.remediation_hints[1].reason_code]));
+    JSON.stringify([iv.recent_builds[1].command, iv.remediation_hints[1].reason_code]),
+  );
   // One index may be referenced from several slots and several dispatchers —
   // that IS the saving — so resolution must be by value, not consumed.
-  chk("one table entry serves several slots",
+  chk(
+    "one table entry serves several slots",
     iv.remediation_hints[0].message === "disk 96% full" &&
-    iv.remediation_hints[0].reason_code === "disk 96% full" &&
-    iv.remediation_hints[1].message === "disk 96% full");
+      iv.remediation_hints[0].reason_code === "disk 96% full" &&
+      iv.remediation_hints[1].message === "disk 96% full",
+  );
 
   // Version skew, both directions.
   //
   // NEW code + OLD snapshot: no table at all, literal strings in every slot.
   // `internedStr` dispatches on the wire type, so these pass straight through —
   // unlike pass 3's key rename, this needs no fallback and loses nothing.
-  const noTable = derive.classifyDispatcher(d({ builds: literalBuilds, hints: literalHints }), undefined);
-  chk("a pre-table snapshot expands unchanged with no table",
+  const noTable = derive.classifyDispatcher(
+    d({ builds: literalBuilds, hints: literalHints }),
+    undefined,
+  );
+  chk(
+    "a pre-table snapshot expands unchanged with no table",
     JSON.stringify(noTable.recent_builds) === JSON.stringify(lv.recent_builds) &&
-    JSON.stringify(noTable.remediation_hints) === JSON.stringify(lv.remediation_hints));
+      JSON.stringify(noTable.remediation_hints) === JSON.stringify(lv.remediation_hints),
+  );
   // ...and interned tuples with the table MISSING must degrade to empty values,
   // never to `undefined` rendered as the string "undefined".
   const lost = derive.classifyDispatcher(d({ builds: internedBuilds, hints: internedHints }));
-  chk("interned tuples with no table degrade to null, not \"undefined\"",
+  chk(
+    'interned tuples with no table degrade to null, not "undefined"',
     lost.recent_builds[0].project === null && lost.remediation_hints[0].message === null,
-    JSON.stringify([lost.recent_builds[0].project, lost.remediation_hints[0].message]));
+    JSON.stringify([lost.recent_builds[0].project, lost.remediation_hints[0].message]),
+  );
   // A truncated or corrupt table must not throw or leak `undefined` either.
-  const short = derive.classifyDispatcher(d({ builds: internedBuilds, hints: internedHints }), ["only-one"]);
-  chk("an out-of-range index yields null rather than undefined",
+  const short = derive.classifyDispatcher(d({ builds: internedBuilds, hints: internedHints }), [
+    "only-one",
+  ]);
+  chk(
+    "an out-of-range index yields null rather than undefined",
     short.recent_builds[0].project === null && short.recent_builds[0].command === "only-one",
-    JSON.stringify([short.recent_builds[0].project, short.recent_builds[0].command]));
-  chk("out-of-range agrees between derive and llm-view",
-    JSON.stringify(short.recent_builds) === JSON.stringify(expandBuilds(internedBuilds, ["only-one"])));
+    JSON.stringify([short.recent_builds[0].project, short.recent_builds[0].command]),
+  );
+  chk(
+    "out-of-range agrees between derive and llm-view",
+    JSON.stringify(short.recent_builds) ===
+      JSON.stringify(expandBuilds(internedBuilds, ["only-one"])),
+  );
 
   // `App.tsx` calls `snap.dispatchers.map(classifyDispatcher)`, so the second
   // argument it actually receives is the element INDEX. A number must never be
   // mistaken for a table, or every interned slot in the browser would resolve
   // to null.
-  const mapped = [d({ builds: internedBuilds, hints: internedHints })].map(derive.classifyDispatcher);
-  chk("a .map() index is not mistaken for a string table",
-    JSON.stringify(mapped[0].recent_builds) === JSON.stringify(lost.recent_builds));
+  const mapped = [d({ builds: internedBuilds, hints: internedHints })].map(
+    derive.classifyDispatcher,
+  );
+  chk(
+    "a .map() index is not mistaken for a string table",
+    JSON.stringify(mapped[0].recent_builds) === JSON.stringify(lost.recent_builds),
+  );
 
   // The browser never resolves indices in `classifyDispatcher` at all:
   // src/crypto.ts calls `rehydrateStrings()` on the decrypted snapshot, because
   // the table belongs to the snapshot and `.map(classifyDispatcher)` has no
   // argument to carry it. The two paths must produce identical records.
   const wire = {
-    schema: "x", label: "l", generated_at: new Date(SNAP_MS).toISOString(),
-    totals: {}, workers: [], history: [], strings,
-    dispatchers: [d({ builds: structuredClone(internedBuilds), hints: structuredClone(internedHints) })],
+    schema: "x",
+    label: "l",
+    generated_at: new Date(SNAP_MS).toISOString(),
+    totals: {},
+    workers: [],
+    history: [],
+    strings,
+    dispatchers: [
+      d({ builds: structuredClone(internedBuilds), hints: structuredClone(internedHints) }),
+    ],
   };
   const rehydrated = derive.rehydrateStrings(wire);
   const rv = derive.classifyDispatcher(rehydrated.dispatchers[0]);
-  chk("rehydrateStrings matches per-call table resolution",
+  chk(
+    "rehydrateStrings matches per-call table resolution",
     JSON.stringify(rv.recent_builds) === JSON.stringify(iv.recent_builds) &&
-    JSON.stringify(rv.remediation_hints) === JSON.stringify(iv.remediation_hints),
-    JSON.stringify(rv.recent_builds));
+      JSON.stringify(rv.remediation_hints) === JSON.stringify(iv.remediation_hints),
+    JSON.stringify(rv.recent_builds),
+  );
   // Idempotent: the tuples now hold strings, and a second pass must leave them
   // alone rather than re-reading a string as an index.
   const twice = derive.classifyDispatcher(derive.rehydrateStrings(rehydrated).dispatchers[0]);
-  chk("rehydrateStrings is idempotent",
+  chk(
+    "rehydrateStrings is idempotent",
     JSON.stringify(twice.recent_builds) === JSON.stringify(iv.recent_builds) &&
-    JSON.stringify(twice.remediation_hints) === JSON.stringify(iv.remediation_hints));
+      JSON.stringify(twice.remediation_hints) === JSON.stringify(iv.remediation_hints),
+  );
   // And it must leave the never-interned slots exactly as they were: `location`
   // drives the offload verdict through `.toLowerCase()`, and `severity` picks
   // the alarm colour.
-  chk("rehydrateStrings leaves location and severity untouched",
+  chk(
+    "rehydrateStrings leaves location and severity untouched",
     rehydrated.dispatchers[0].builds[0][2] === "Remote" &&
-    rehydrated.dispatchers[0].hints[0][1] === "critical");
-  chk("a snapshot with no table survives rehydration",
-    derive.rehydrateStrings({ dispatchers: [d()] }) != null &&
-    derive.rehydrateStrings({}) != null);
+      rehydrated.dispatchers[0].hints[0][1] === "critical",
+  );
+  chk(
+    "a snapshot with no table survives rehydration",
+    derive.rehydrateStrings({ dispatchers: [d()] }) != null && derive.rehydrateStrings({}) != null,
+  );
 
   // The verdict itself must be unaffected: `location` is not interned, so the
   // offload share is computed from the same values either way.
-  chk("the offload verdict is identical with and without interning",
+  chk(
+    "the offload verdict is identical with and without interning",
     iv.level === lv.level && iv.levelReason === lv.levelReason && iv.remotePct === lv.remotePct,
-    `${iv.level}/${iv.levelReason} vs ${lv.level}/${lv.levelReason}`);
-  chk("classifyDev reads location off the raw tuple regardless of interning",
+    `${iv.level}/${iv.levelReason} vs ${lv.level}/${lv.levelReason}`,
+  );
+  chk(
+    "classifyDev reads location off the raw tuple regardless of interning",
     classifyDev(d({ builds: internedBuilds })).remotePct ===
-      classifyDev(d({ builds: literalBuilds })).remotePct);
+      classifyDev(d({ builds: literalBuilds })).remotePct,
+  );
 }
 
 // The stale-clock regression: classifyAll must ignore the caller's clock.
 const snap = {
-  schema: "x", label: "l", generated_at: new Date(SNAP_MS).toISOString(),
-  totals: {}, dispatchers: [], workers: [w()], history: [],
+  schema: "x",
+  label: "l",
+  generated_at: new Date(SNAP_MS).toISOString(),
+  totals: {},
+  dispatchers: [],
+  workers: [w()],
+  history: [],
 };
 const wayLater = SNAP_MS + 6 * 60 * 60 * 1000;
 chk(
@@ -544,36 +887,86 @@ chk(
 // contract as the other tuples: both expanders agree, a snapshot without them
 // yields empty arrays, and 0/false survive.
 {
-  const alerts = [["worker_offline", "error", "w1", "Worker 'w1' is offline", "2026-08-26T10:00:00.000Z", "2026-08-26T11:00:00.000Z", "active"]];
+  const alerts = [
+    [
+      "worker_offline",
+      "error",
+      "w1",
+      "Worker 'w1' is offline",
+      "2026-08-26T10:00:00.000Z",
+      "2026-08-26T11:00:00.000Z",
+      "active",
+    ],
+  ];
   const issues = [["error", "Worker 'w1' is unreachable", "rch workers probe w1"]];
-  const active = [["1", "proj", "w1", "cargo build", "2026-08-26T11:30:00.000Z", 4, 394, "sync_up", true, false, true, 0.25, 8, 395]];
+  const active = [
+    [
+      "1",
+      "proj",
+      "w1",
+      "cargo build",
+      "2026-08-26T11:30:00.000Z",
+      4,
+      394,
+      "sync_up",
+      true,
+      false,
+      true,
+      0.25,
+      8,
+      395,
+    ],
+  ];
   const queued = [["2", "proj", "cargo test", 0, 4, "2m"]];
   const dv = derive.classifyDispatcher(d({ alerts, issues, active, queued }));
-  chk("alerts expand identically on both paths",
+  chk(
+    "alerts expand identically on both paths",
     JSON.stringify(dv.alert_records) === JSON.stringify(expandAlerts(alerts)) &&
-    dv.alert_records[0].first_seen === "2026-08-26T10:00:00.000Z" && dv.alert_records[0].state === "active");
-  chk("issues expand identically on both paths",
+      dv.alert_records[0].first_seen === "2026-08-26T10:00:00.000Z" &&
+      dv.alert_records[0].state === "active",
+  );
+  chk(
+    "issues expand identically on both paths",
     JSON.stringify(dv.issue_records) === JSON.stringify(expandIssues(issues)) &&
-    dv.issue_records[0].remediation === "rch workers probe w1");
-  chk("active builds expand identically, keeping false and 0.25",
+      dv.issue_records[0].remediation === "rch workers probe w1",
+  );
+  chk(
+    "active builds expand identically, keeping false and 0.25",
     JSON.stringify(dv.active_records) === JSON.stringify(expandActive(active)) &&
-    dv.active_records[0].hook_alive === true && dv.active_records[0].heartbeat_stale === false &&
-    dv.active_records[0].progress_stale === true && dv.active_records[0].confidence === 0.25 &&
-    dv.active_records[0].id === "1");
-  chk("queued builds expand identically, keeping position 0",
-    JSON.stringify(dv.queued_records) === JSON.stringify(expandQueued(queued)) && dv.queued_records[0].position === 0);
+      dv.active_records[0].hook_alive === true &&
+      dv.active_records[0].heartbeat_stale === false &&
+      dv.active_records[0].progress_stale === true &&
+      dv.active_records[0].confidence === 0.25 &&
+      dv.active_records[0].id === "1",
+  );
+  chk(
+    "queued builds expand identically, keeping position 0",
+    JSON.stringify(dv.queued_records) === JSON.stringify(expandQueued(queued)) &&
+      dv.queued_records[0].position === 0,
+  );
   const old = derive.classifyDispatcher(d());
-  chk("a snapshot without the new arrays yields empty records, not a crash",
-    old.alert_records.length === 0 && old.issue_records.length === 0 &&
-    old.active_records.length === 0 && old.queued_records.length === 0 &&
-    expandAlerts(undefined).length === 0 && expandActive(undefined).length === 0);
+  chk(
+    "a snapshot without the new arrays yields empty records, not a crash",
+    old.alert_records.length === 0 &&
+      old.issue_records.length === 0 &&
+      old.active_records.length === 0 &&
+      old.queued_records.length === 0 &&
+      expandAlerts(undefined).length === 0 &&
+      expandActive(undefined).length === 0,
+  );
 
   // An unreachable machine now says WHICH failure, on both paths.
-  const un = d({ reachable: false, collection_errors: ["status: ssh: connect to host x port 22: Connection refused"] });
+  const un = d({
+    reachable: false,
+    collection_errors: ["status: ssh: connect to host x port 22: Connection refused"],
+  });
   const a = derive.classifyDispatcher(un);
   const b = classifyDev(un);
-  chk("unreachable reason names the first collection error on both paths",
-    a.levelReason === b.reason && b.reason.includes("Connection refused"), `derive="${a.levelReason}" llm="${b.reason}"`);
+  chk(
+    "unreachable reason names the first collection error on both paths",
+    a.levelReason === b.reason && b.reason.includes("Connection refused"),
+    `derive="${a.levelReason}" llm="${b.reason}"`,
+  );
 }
 
 // -------------------------------------------------- problems parity
@@ -583,180 +976,467 @@ chk(
 // through it over a fixture that trips every new rule, and asserts the rows
 // are byte-identical. It is also the only place the new rules are pinned.
 {
-  const alerts = [["worker_offline", "error", "w1", "down", "2026-08-26T10:00:00.000Z", "2026-08-26T11:00:00.000Z", "active"]];
+  const alerts = [
+    [
+      "worker_offline",
+      "error",
+      "w1",
+      "down",
+      "2026-08-26T10:00:00.000Z",
+      "2026-08-26T11:00:00.000Z",
+      "active",
+    ],
+  ];
   const issues = [["error", "Worker 'w1' is unreachable", "rch workers probe w1"]];
-  const hints = [["w1", "critical", "Worker w1 unreachable", "ssh w1 'echo ok'", "worker_unreachable"]];
-  const hookDead = ["7", "proj", "w2", "cargo test", "2026-08-26T11:00:00.000Z", 900, 900, "execute", false, true, true, 0.9, 8, 3600];
-  const stalled = ["8", "proj2", "w2", "cargo test", "2026-08-26T11:00:00.000Z", 900, 900, "execute", true, true, true, 0.9, 4, 3600];
-  const fine = ["9", "proj3", "w2", "cargo test", "2026-08-26T11:50:00.000Z", 3, 20, "execute", true, false, false, 0.1, 4, 60];
-  const daemon = (version) => ({ version, uptime_secs: 60, pid: 1, workers_total: 2, workers_healthy: 1, slots_total: 10, slots_available: 8 });
+  const hints = [
+    ["w1", "critical", "Worker w1 unreachable", "ssh w1 'echo ok'", "worker_unreachable"],
+  ];
+  const hookDead = [
+    "7",
+    "proj",
+    "w2",
+    "cargo test",
+    "2026-08-26T11:00:00.000Z",
+    900,
+    900,
+    "execute",
+    false,
+    true,
+    true,
+    0.9,
+    8,
+    3600,
+  ];
+  const stalled = [
+    "8",
+    "proj2",
+    "w2",
+    "cargo test",
+    "2026-08-26T11:00:00.000Z",
+    900,
+    900,
+    "execute",
+    true,
+    true,
+    true,
+    0.9,
+    4,
+    3600,
+  ];
+  const fine = [
+    "9",
+    "proj3",
+    "w2",
+    "cargo test",
+    "2026-08-26T11:50:00.000Z",
+    3,
+    20,
+    "execute",
+    true,
+    false,
+    false,
+    0.1,
+    4,
+    60,
+  ];
+  const daemon = (version) => ({
+    version,
+    uptime_secs: 60,
+    pid: 1,
+    workers_total: 2,
+    workers_healthy: 1,
+    slots_total: 10,
+    slots_available: 8,
+  });
   const snapFx = {
-    schema: "rch.dashboard.snapshot.v2", label: "fx", generated_at: new Date(SNAP_MS).toISOString(),
-    totals: { workers: 2, slots: 16, slots_used: 0, cores: 16, disk_free_gb: 1000, disk_total_gb: 2000,
-              dispatchers_total: 3, dispatchers_reachable: 2, dispatchers_remote_ready: 0,
-              builds_remote: 20, builds_local: 0, active_builds: 3 },
+    schema: "rch.dashboard.snapshot.v2",
+    label: "fx",
+    generated_at: new Date(SNAP_MS).toISOString(),
+    totals: {
+      workers: 2,
+      slots: 16,
+      slots_used: 0,
+      cores: 16,
+      disk_free_gb: 1000,
+      disk_total_gb: 2000,
+      dispatchers_total: 3,
+      dispatchers_reachable: 2,
+      dispatchers_remote_ready: 0,
+      builds_remote: 20,
+      builds_local: 0,
+      active_builds: 3,
+    },
     dispatchers: [
       d({
-        id: "dev-a", posture: "degraded", posture_description: "partial", daemon: daemon("1.0.60"),
-        hints, alerts, issues, active: [hookDead, stalled, fine],
-        hook: { claude_code: false, agents: [["ClaudeCode", false], ["CodexCli", true]] },
-        shim: { installed: true, up_to_date: false, on_path: true, interception: "direct",
-                local_builds_running: 2, toolchains_wrapped: 1, toolchains_total: 1 },
-        doctor: { total: 3, passed: 2, warnings: 0, failed: 1,
-                  failing: [["daemon_socket", "fail", "Daemon not accepting connections", false]] },
-        convergence: { status: "drifting", ready: 1, drifting: 1, converging: 0, failed: 0, stale: 0,
-                       workers: [["w2", "drifting", 2]] },
-        pool_slots: [[0, 0], [2, 8]],
+        id: "dev-a",
+        posture: "degraded",
+        posture_description: "partial",
+        daemon: daemon("1.0.60"),
+        hints,
+        alerts,
+        issues,
+        active: [hookDead, stalled, fine],
+        hook: {
+          claude_code: false,
+          agents: [
+            ["ClaudeCode", false],
+            ["CodexCli", true],
+          ],
+        },
+        shim: {
+          installed: true,
+          up_to_date: false,
+          on_path: true,
+          interception: "direct",
+          local_builds_running: 2,
+          toolchains_wrapped: 1,
+          toolchains_total: 1,
+        },
+        doctor: {
+          total: 3,
+          passed: 2,
+          warnings: 0,
+          failed: 1,
+          failing: [["daemon_socket", "fail", "Daemon not accepting connections", false]],
+        },
+        convergence: {
+          status: "drifting",
+          ready: 1,
+          drifting: 1,
+          converging: 0,
+          failed: 0,
+          stale: 0,
+          workers: [["w2", "drifting", 2]],
+        },
+        pool_slots: [
+          [0, 0],
+          [2, 8],
+        ],
       }),
-      d({ id: "dev-b", posture: "degraded", posture_description: "partial", daemon: daemon("1.0.59"),
-          collection_errors: ["metrics: no response from 127.0.0.1:9100"], pool_slots: [[0, 8], [0, 8]] }),
-      d({ id: "dev-c", reachable: false, posture: null, daemon: null,
-          collection_errors: ["status: ssh: connect to host 10.0.0.3 port 22: No route to host"] }),
+      d({
+        id: "dev-b",
+        posture: "degraded",
+        posture_description: "partial",
+        daemon: daemon("1.0.59"),
+        collection_errors: ["metrics: no response from 127.0.0.1:9100"],
+        pool_slots: [
+          [0, 8],
+          [0, 8],
+        ],
+      }),
+      d({
+        id: "dev-c",
+        reachable: false,
+        posture: null,
+        daemon: null,
+        collection_errors: ["status: ssh: connect to host 10.0.0.3 port 22: No route to host"],
+      }),
     ],
-    workers: [w({ id: "w1", status: "unreachable", circuit_state: "open", recovery_in_secs: 240, bypass: "RCH-I004 10.0.0.1" }), w({ id: "w2" })],
+    workers: [
+      w({
+        id: "w1",
+        status: "unreachable",
+        circuit_state: "open",
+        recovery_in_secs: 240,
+        bypass: "RCH-I004 10.0.0.1",
+      }),
+      w({ id: "w2" }),
+    ],
     history: [],
   };
 
   // Browser path.
   const bw = derive.classifyAll(snapFx);
   const bd = snapFx.dispatchers.map((x) => derive.classifyDispatcher(x));
-  const browser = buildProblems({ workers: bw, devs: bd, snapshotValid: true, ageSeconds: 0, staleAfter: 3600 });
+  const browser = buildProblems({
+    workers: bw,
+    devs: bd,
+    snapshotValid: true,
+    ageSeconds: 0,
+    staleAfter: 3600,
+  });
   // Endpoint path.
   const api = buildLlmView(snapFx, { view: "problems", now: SNAP_MS });
 
-  chk("problems are byte-identical on the browser and endpoint paths",
+  chk(
+    "problems are byte-identical on the browser and endpoint paths",
     JSON.stringify(browser.problems) === JSON.stringify(api.problems),
-    `${browser.problems.length} vs ${api.problems.length}`);
-  chk("next_actions are byte-identical on both paths",
-    JSON.stringify(browser.next_actions) === JSON.stringify(api.next_actions));
+    `${browser.problems.length} vs ${api.problems.length}`,
+  );
+  chk(
+    "next_actions are byte-identical on both paths",
+    JSON.stringify(browser.next_actions) === JSON.stringify(api.next_actions),
+  );
 
   const kinds = new Map(api.problems.map((p) => [`${p.kind} ${p.target}`, p]));
   const has = (k) => kinds.has(k);
   // dev-a's shim is installed and first on PATH, so cargo is still intercepted:
   // a missing hook there is a warning about non-cargo commands, not "nothing
   // is intercepted".
-  chk("a missing Claude Code hook with a working shim is a WARNING with the install command",
-    has("dev.hook_missing dev-a") && kinds.get("dev.hook_missing dev-a").severity === "warn" &&
-    kinds.get("dev.hook_missing dev-a").action === "rch hook install" &&
-    kinds.get("dev.hook_missing dev-a").on === "dev-a" && /shim still intercepts cargo/.test(kinds.get("dev.hook_missing dev-a").detail));
+  chk(
+    "a missing Claude Code hook with a working shim is a WARNING with the install command",
+    has("dev.hook_missing dev-a") &&
+      kinds.get("dev.hook_missing dev-a").severity === "warn" &&
+      kinds.get("dev.hook_missing dev-a").action === "rch hook install" &&
+      kinds.get("dev.hook_missing dev-a").on === "dev-a" &&
+      /shim still intercepts cargo/.test(kinds.get("dev.hook_missing dev-a").detail),
+  );
   {
-    const noShim = buildLlmView({
-      ...snapFx,
-      dispatchers: [{ ...snapFx.dispatchers[0], shim: { ...snapFx.dispatchers[0].shim, installed: false } }],
-    }, { view: "problems", now: SNAP_MS });
+    const noShim = buildLlmView(
+      {
+        ...snapFx,
+        dispatchers: [
+          { ...snapFx.dispatchers[0], shim: { ...snapFx.dispatchers[0].shim, installed: false } },
+        ],
+      },
+      { view: "problems", now: SNAP_MS },
+    );
     const hm = noShim.problems.find((p) => p.kind === "dev.hook_missing");
-    chk("a missing hook with NO working shim is critical", hm && hm.severity === "critical" && /nothing is intercepted/.test(hm.detail));
-    const shadowed = buildLlmView({
-      ...snapFx,
-      dispatchers: [{ ...snapFx.dispatchers[0], shim: { ...snapFx.dispatchers[0].shim, on_path: false } }],
-    }, { view: "problems", now: SNAP_MS });
-    chk("a shadowed shim does not count as coverage",
-      shadowed.problems.find((p) => p.kind === "dev.hook_missing")?.severity === "critical");
+    chk(
+      "a missing hook with NO working shim is critical",
+      hm && hm.severity === "critical" && /nothing is intercepted/.test(hm.detail),
+    );
+    const shadowed = buildLlmView(
+      {
+        ...snapFx,
+        dispatchers: [
+          { ...snapFx.dispatchers[0], shim: { ...snapFx.dispatchers[0].shim, on_path: false } },
+        ],
+      },
+      { view: "problems", now: SNAP_MS },
+    );
+    chk(
+      "a shadowed shim does not count as coverage",
+      shadowed.problems.find((p) => p.kind === "dev.hook_missing")?.severity === "critical",
+    );
   }
-  chk("compiles outside rch are critical", has("dev.unmanaged_local_builds dev-a") &&
-    kinds.get("dev.unmanaged_local_builds dev-a").detail.startsWith("2 compiler processes"));
-  chk("a stale shim is a warning", has("dev.shim_stale dev-a") && kinds.get("dev.shim_stale dev-a").action === "rch shim install");
-  chk("a failed doctor check is critical and names the check",
-    has("dev.doctor_failed dev-a") && /daemon_socket/.test(kinds.get("dev.doctor_failed dev-a").detail) &&
-    kinds.get("dev.doctor_failed dev-a").action === "rch doctor");
-  chk("a dead build hook is critical with the cancel command",
-    has("build.hook_dead dev-a:7") && kinds.get("build.hook_dead dev-a:7").action === "rch cancel 7");
-  chk("a stalled build is a warning that says how to cancel",
-    has("build.stalled dev-a:8") && /rch cancel 8/.test(kinds.get("build.stalled dev-a:8").detail));
-  chk("a healthy active build raises nothing", !has("build.stalled dev-a:9") && !has("build.hook_dead dev-a:9"));
-  chk("version skew flags the machine on the OLDER version",
-    has("dev.daemon_version_skew dev-b") && !has("dev.daemon_version_skew dev-a") &&
-    kinds.get("dev.daemon_version_skew dev-b").action === "rch update");
-  chk("a failed probe is a warning naming the probe",
-    has("dev.collection_error dev-b") && /metrics/.test(kinds.get("dev.collection_error dev-b").detail));
-  chk("an ssh-unreachable machine's action runs from the collector",
-    has("dev.unreachable dev-c") && kinds.get("dev.unreachable dev-c").on === "collector" &&
-    kinds.get("dev.unreachable dev-c").action === "ssh dev-c true");
-  chk("convergence drift is a per-worker warning",
-    has("worker.convergence_drift w2") && /2 repos missing as seen from dev-a/.test(kinds.get("worker.convergence_drift w2").detail));
+  chk(
+    "compiles outside rch are critical",
+    has("dev.unmanaged_local_builds dev-a") &&
+      kinds.get("dev.unmanaged_local_builds dev-a").detail.startsWith("2 compiler processes"),
+  );
+  chk(
+    "a stale shim is a warning",
+    has("dev.shim_stale dev-a") && kinds.get("dev.shim_stale dev-a").action === "rch shim install",
+  );
+  chk(
+    "a failed doctor check is critical and names the check",
+    has("dev.doctor_failed dev-a") &&
+      /daemon_socket/.test(kinds.get("dev.doctor_failed dev-a").detail) &&
+      kinds.get("dev.doctor_failed dev-a").action === "rch doctor",
+  );
+  chk(
+    "a dead build hook is critical with the cancel command",
+    has("build.hook_dead dev-a:7") &&
+      kinds.get("build.hook_dead dev-a:7").action === "rch cancel 7",
+  );
+  chk(
+    "a stalled build is a warning that says how to cancel",
+    has("build.stalled dev-a:8") && /rch cancel 8/.test(kinds.get("build.stalled dev-a:8").detail),
+  );
+  chk(
+    "a healthy active build raises nothing",
+    !has("build.stalled dev-a:9") && !has("build.hook_dead dev-a:9"),
+  );
+  chk(
+    "version skew flags the machine on the OLDER version",
+    has("dev.daemon_version_skew dev-b") &&
+      !has("dev.daemon_version_skew dev-a") &&
+      kinds.get("dev.daemon_version_skew dev-b").action === "rch update",
+  );
+  chk(
+    "a failed probe is a warning naming the probe",
+    has("dev.collection_error dev-b") &&
+      /metrics/.test(kinds.get("dev.collection_error dev-b").detail),
+  );
+  chk(
+    "an ssh-unreachable machine's action runs from the collector",
+    has("dev.unreachable dev-c") &&
+      kinds.get("dev.unreachable dev-c").on === "collector" &&
+      kinds.get("dev.unreachable dev-c").action === "ssh dev-c true",
+  );
+  chk(
+    "convergence drift is a per-worker warning",
+    has("worker.convergence_drift w2") &&
+      /2 repos missing as seen from dev-a/.test(kinds.get("worker.convergence_drift w2").detail),
+  );
   const w1 = kinds.get("worker.offline w1");
-  chk("a worker problem carries since (from alerts) and action (from hints)",
-    w1 && w1.since === "2026-08-26T10:00:00.000Z" && w1.action === "ssh w1 'echo ok'" && w1.on === "dev-a",
-    JSON.stringify(w1));
-  chk("a worker problem mentions circuit recovery and bypass",
-    w1 && /retries in 4m/.test(w1.detail) && /bypass RCH-I004/.test(w1.detail), w1?.detail);
-  chk("two degraded machines with a sick pool collapse into one fleet row",
-    has("fleet.degraded fleet") && !has("dev.degraded dev-a") && !has("dev.degraded dev-b") &&
-    /fix w1/.test(kinds.get("fleet.degraded fleet").detail));
-  chk("problems are severity-sorted", api.problems.every((p, i, arr) => i === 0 ||
-    (arr[i - 1].severity === "critical") || p.severity !== "critical"));
-  chk("every field is a string on every row (TOON stays tabular)",
-    api.problems.every((p) => ["severity", "kind", "target", "detail", "since", "action", "on"].every((k) => typeof p[k] === "string")));
-  chk("every emitted kind is in the catalogue the help view serves",
-    api.problems.every((p) => p.kind in PROBLEM_KINDS), [...new Set(api.problems.map((p) => p.kind))].filter((k) => !(k in PROBLEM_KINDS)).join(","));
-  chk("next_actions group by (on, command) and list every target",
-    api.next_actions.some((a) => a.on === "dev-a" && a.run === "rch hook install" && a.fixes === "dev-a"));
-  chk("summary counts the fleet-wide zeros-that-should-be-zero",
-    api.summary.hooks_missing === 1 && api.summary.local_builds_running === 2 &&
-    api.summary.version_skew === 1 && api.summary.daemon_version === "1.0.60");
+  chk(
+    "a worker problem carries since (from alerts) and action (from hints)",
+    w1 &&
+      w1.since === "2026-08-26T10:00:00.000Z" &&
+      w1.action === "ssh w1 'echo ok'" &&
+      w1.on === "dev-a",
+    JSON.stringify(w1),
+  );
+  chk(
+    "a worker problem mentions circuit recovery and bypass",
+    w1 && /retries in 4m/.test(w1.detail) && /bypass RCH-I004/.test(w1.detail),
+    w1?.detail,
+  );
+  chk(
+    "two degraded machines with a sick pool collapse into one fleet row",
+    has("fleet.degraded fleet") &&
+      !has("dev.degraded dev-a") &&
+      !has("dev.degraded dev-b") &&
+      /fix w1/.test(kinds.get("fleet.degraded fleet").detail),
+  );
+  chk(
+    "problems are severity-sorted",
+    api.problems.every(
+      (p, i, arr) => i === 0 || arr[i - 1].severity === "critical" || p.severity !== "critical",
+    ),
+  );
+  chk(
+    "every field is a string on every row (TOON stays tabular)",
+    api.problems.every((p) =>
+      ["severity", "kind", "target", "detail", "since", "action", "on"].every(
+        (k) => typeof p[k] === "string",
+      ),
+    ),
+  );
+  chk(
+    "every emitted kind is in the catalogue the help view serves",
+    api.problems.every((p) => p.kind in PROBLEM_KINDS),
+    [...new Set(api.problems.map((p) => p.kind))].filter((k) => !(k in PROBLEM_KINDS)).join(","),
+  );
+  chk(
+    "next_actions group by (on, command) and list every target",
+    api.next_actions.some(
+      (a) => a.on === "dev-a" && a.run === "rch hook install" && a.fixes === "dev-a",
+    ),
+  );
+  chk(
+    "summary counts the fleet-wide zeros-that-should-be-zero",
+    api.summary.hooks_missing === 1 &&
+      api.summary.local_builds_running === 2 &&
+      api.summary.version_skew === 1 &&
+      api.summary.daemon_version === "1.0.60",
+  );
   // A single degraded machine is NOT collapsed: it is its own problem.
-  const one = buildLlmView({ ...snapFx, dispatchers: [snapFx.dispatchers[0]] }, { view: "problems", now: SNAP_MS });
-  chk("a lone degraded machine keeps its own dev.degraded row",
-    one.problems.some((p) => p.kind === "dev.degraded" && p.target === "dev-a") && !one.problems.some((p) => p.kind === "fleet.degraded"));
+  const one = buildLlmView(
+    { ...snapFx, dispatchers: [snapFx.dispatchers[0]] },
+    { view: "problems", now: SNAP_MS },
+  );
+  chk(
+    "a lone degraded machine keeps its own dev.degraded row",
+    one.problems.some((p) => p.kind === "dev.degraded" && p.target === "dev-a") &&
+      !one.problems.some((p) => p.kind === "fleet.degraded"),
+  );
   // Two machines degraded for DIFFERENT reasons are two problems, not one.
-  const differ = buildLlmView({
-    ...snapFx,
-    dispatchers: [snapFx.dispatchers[0], { ...snapFx.dispatchers[1], posture_description: "something else entirely" }, snapFx.dispatchers[2]],
-  }, { view: "problems", now: SNAP_MS });
-  chk("degraded machines with different reasons are not collapsed",
+  const differ = buildLlmView(
+    {
+      ...snapFx,
+      dispatchers: [
+        snapFx.dispatchers[0],
+        { ...snapFx.dispatchers[1], posture_description: "something else entirely" },
+        snapFx.dispatchers[2],
+      ],
+    },
+    { view: "problems", now: SNAP_MS },
+  );
+  chk(
+    "degraded machines with different reasons are not collapsed",
     !differ.problems.some((p) => p.kind === "fleet.degraded") &&
-    differ.problems.filter((p) => p.kind === "dev.degraded").length === 2);
+      differ.problems.filter((p) => p.kind === "dev.degraded").length === 2,
+  );
   // A pool whose only trouble is warn-level (high load) cannot explain a
   // degraded posture, so the machines keep their own rows and the fleet row
   // does not blame the loaded worker.
-  const onlyWarn = buildLlmView({
-    ...snapFx,
-    workers: [w({ id: "w1", caps: { ...w().caps, load_avg_1: 40, num_cpus: 8 } }), w({ id: "w2" })],
-    // No hints or issues about w1 anywhere, so the row has no advice to carry.
-    dispatchers: snapFx.dispatchers.map((d) => ({ ...d, hints: [], issues: [], alerts: [] })),
-  }, { view: "problems", now: SNAP_MS });
-  chk("warn-level workers are never named as a fleet root cause",
+  const onlyWarn = buildLlmView(
+    {
+      ...snapFx,
+      workers: [
+        w({ id: "w1", caps: { ...w().caps, load_avg_1: 40, num_cpus: 8 } }),
+        w({ id: "w2" }),
+      ],
+      // No hints or issues about w1 anywhere, so the row has no advice to carry.
+      dispatchers: snapFx.dispatchers.map((d) => ({ ...d, hints: [], issues: [], alerts: [] })),
+    },
+    { view: "problems", now: SNAP_MS },
+  );
+  chk(
+    "warn-level workers are never named as a fleet root cause",
     !onlyWarn.problems.some((p) => p.kind === "fleet.degraded") &&
-    onlyWarn.problems.some((p) => p.kind === "worker.warn" && p.target === "w1"));
+      onlyWarn.problems.some((p) => p.kind === "worker.warn" && p.target === "w1"),
+  );
   // A worker warning with no advice names no machine to run nothing on.
   const w1warn = onlyWarn.problems.find((p) => p.kind === "worker.warn" && p.target === "w1");
   chk("a row with no action has no `on`", w1warn && w1warn.action === "" && w1warn.on === "");
   // Target scoping matches whole ids inside the fleet row, never substrings.
-  const hz = buildLlmView({
-    ...snapFx,
-    workers: [w({ id: "hz1", status: "unreachable" }), w({ id: "hz10" })],
-    dispatchers: snapFx.dispatchers.map((d) => ({ ...d, hints: [], issues: [], alerts: [] })),
-  }, { view: "problems", target: "hz10", now: SNAP_MS });
-  chk("scoping to hz10 does not pull in the fleet row that names hz1",
-    !hz.problems.some((p) => p.kind === "fleet.degraded"), JSON.stringify(hz.problems.map((p) => p.kind)));
+  const hz = buildLlmView(
+    {
+      ...snapFx,
+      workers: [w({ id: "hz1", status: "unreachable" }), w({ id: "hz10" })],
+      dispatchers: snapFx.dispatchers.map((d) => ({ ...d, hints: [], issues: [], alerts: [] })),
+    },
+    { view: "problems", target: "hz10", now: SNAP_MS },
+  );
+  chk(
+    "scoping to hz10 does not pull in the fleet row that names hz1",
+    !hz.problems.some((p) => p.kind === "fleet.degraded"),
+    JSON.stringify(hz.problems.map((p) => p.kind)),
+  );
   // An rch-side failure (not ssh) on an unreachable machine is a daemon or
   // doctor question ON THAT BOX, never an ssh check from the collector.
-  const rchDown = buildLlmView({
-    ...snapFx,
-    dispatchers: [{ ...snapFx.dispatchers[2], collection_errors: ["status: RCH-E400 Daemon not accepting connections"] }],
-  }, { view: "problems", now: SNAP_MS });
+  const rchDown = buildLlmView(
+    {
+      ...snapFx,
+      dispatchers: [
+        {
+          ...snapFx.dispatchers[2],
+          collection_errors: ["status: RCH-E400 Daemon not accepting connections"],
+        },
+      ],
+    },
+    { view: "problems", now: SNAP_MS },
+  );
   const un = rchDown.problems.find((p) => p.kind === "dev.unreachable");
-  chk("a dead daemon on a reachable host is 'rch daemon start' on that box",
-    un && un.action === "rch daemon start" && un.on === "dev-c", JSON.stringify(un));
+  chk(
+    "a dead daemon on a reachable host is 'rch daemon start' on that box",
+    un && un.action === "rch daemon start" && un.on === "dev-c",
+    JSON.stringify(un),
+  );
 
   // Targeting.
   const diag = buildLlmView(snapFx, { view: "diagnose", target: "W1", now: SNAP_MS });
-  chk("diagnose resolves a worker case-insensitively and scopes the problems",
-    diag.target.type === "worker" && diag.target.id === "w1" && diag.problems.every((p) => p.target === "w1" || p.kind === "fleet.degraded") &&
-    diag.detail.recovery_in_s === 240 && diag.detail.slots_by_dev === "dev-a=0/0|dev-b=0/8" &&
-    diag.hints_about.length === 1 && diag.alerts_about.length === 1, JSON.stringify(diag.target));
+  chk(
+    "diagnose resolves a worker case-insensitively and scopes the problems",
+    diag.target.type === "worker" &&
+      diag.target.id === "w1" &&
+      diag.problems.every((p) => p.target === "w1" || p.kind === "fleet.degraded") &&
+      diag.detail.recovery_in_s === 240 &&
+      diag.detail.slots_by_dev === "dev-a=0/0|dev-b=0/8" &&
+      diag.hints_about.length === 1 &&
+      diag.alerts_about.length === 1,
+    JSON.stringify(diag.target),
+  );
   const diagDev = buildLlmView(snapFx, { view: "diagnose", target: "dev-a", now: SNAP_MS });
-  chk("diagnose on a dev machine carries the self-checks and its pool view",
-    diagDev.detail.hook.claude_code === false && diagDev.detail.doctor.failing[0].check === "daemon_socket" &&
-    diagDev.pool_as_seen_here.length === 2 && diagDev.pool_as_seen_here[0].total === 0 &&
-    diagDev.detail.active_builds.length === 3);
+  chk(
+    "diagnose on a dev machine carries the self-checks and its pool view",
+    diagDev.detail.hook.claude_code === false &&
+      diagDev.detail.doctor.failing[0].check === "daemon_socket" &&
+      diagDev.pool_as_seen_here.length === 2 &&
+      diagDev.pool_as_seen_here[0].total === 0 &&
+      diagDev.detail.active_builds.length === 3,
+  );
   const scoped = buildLlmView(snapFx, { view: "summary", target: "dev-b", now: SNAP_MS });
-  chk("summary with a target filters the rows and keeps the fleet summary",
-    scoped.dev_machines.length === 1 && scoped.workers.length === 0 && scoped.summary.workers === 2);
+  chk(
+    "summary with a target filters the rows and keeps the fleet summary",
+    scoped.dev_machines.length === 1 && scoped.workers.length === 0 && scoped.summary.workers === 2,
+  );
   let threw = null;
-  try { buildLlmView(snapFx, { view: "summary", target: "nope", now: SNAP_MS }); } catch (e) { threw = e; }
-  chk("an unknown target throws UnknownTarget listing the known ids",
-    threw instanceof UnknownTarget && threw.known.dev_machines.includes("dev-a") && threw.known.workers.includes("w2"));
+  try {
+    buildLlmView(snapFx, { view: "summary", target: "nope", now: SNAP_MS });
+  } catch (e) {
+    threw = e;
+  }
+  chk(
+    "an unknown target throws UnknownTarget listing the known ids",
+    threw instanceof UnknownTarget &&
+      threw.known.dev_machines.includes("dev-a") &&
+      threw.known.workers.includes("w2"),
+  );
   const help = buildLlmView(snapFx, { view: "help" });
   chk("help lists every problem kind", help.kinds.length === Object.keys(PROBLEM_KINDS).length);
 }
