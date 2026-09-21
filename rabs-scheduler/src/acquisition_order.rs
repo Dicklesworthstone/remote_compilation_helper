@@ -256,13 +256,30 @@ impl PermitWallet {
 /// opening it consumes the IMPLICIT token for the Cargo root itself,
 /// and it then exposes AT MOST `C-1` transferable jobserver tokens —
 /// exact accounting, no hidden extra slots under any asking pattern.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// The ledger is intentionally not cloneable: a copy would mint a second
+/// independent budget for the same Cargo root.
+#[derive(Debug, PartialEq, Eq)]
 pub struct RootGrant {
+    identity: GrantIdentity,
     capacity: u32,
     implicit_alive: bool,
     outstanding: std::collections::BTreeSet<u64>,
-    next_serial: u64,
+    next_serial: Option<u64>,
 }
+
+/// In-process owner identity, not a wire ID. Tokens keep this allocation alive,
+/// so a dropped grant's identity cannot be reused while stale handles exist.
+/// No global counter, randomness, or pointer serialization is needed.
+#[derive(Debug, Clone)]
+struct GrantIdentity(std::sync::Arc<()>);
+
+impl PartialEq for GrantIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for GrantIdentity {}
 
 /// Grant-accounting refusals (each names what ran out / what was
 /// returned wrongly).
@@ -275,8 +292,8 @@ pub enum GrantRefusal {
         /// The grant capacity.
         capacity: u32,
     },
-    /// The token serial was not outstanding (double release, foreign
-    /// token, or post-close release): nothing changed.
+    /// The token belongs to another grant or its serial is no longer
+    /// outstanding (double release): nothing changed.
     UnknownToken {
         /// The offending serial.
         serial: u64,
@@ -284,12 +301,17 @@ pub enum GrantRefusal {
     /// The grant is closed (the Cargo root exited) or was opened with
     /// a meaningless capacity; nothing issues.
     GrantClosed,
+    /// Every serial has been used. Existing tokens can still drain, but
+    /// no serial may wrap around and alias a previously issued handle.
+    SerialsExhausted,
 }
 
-/// A transferable jobserver token (opaque handle; the serial carries
-/// the accounting identity).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// A transferable jobserver token, identified by BOTH its issuing grant and
+/// serial. Cloning the handle does not duplicate capacity: release succeeds
+/// only once across all handles for that token.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransferableToken {
+    identity: GrantIdentity,
     serial: u64,
 }
 
@@ -305,10 +327,11 @@ impl RootGrant {
             return Err(GrantRefusal::GrantClosed);
         }
         Ok(Self {
+            identity: GrantIdentity(std::sync::Arc::new(())),
             capacity,
             implicit_alive: true,
             outstanding: std::collections::BTreeSet::new(),
-            next_serial: 1,
+            next_serial: Some(1),
         })
     }
 
@@ -335,7 +358,8 @@ impl RootGrant {
     ///
     /// # Errors
     /// [`GrantRefusal::TransferablesExhausted`] at the budget edge;
-    /// [`GrantRefusal::GrantClosed`] after close.
+    /// [`GrantRefusal::GrantClosed`] after close;
+    /// [`GrantRefusal::SerialsExhausted`] instead of reusing a serial.
     pub fn issue_transferable(&mut self) -> Result<TransferableToken, GrantRefusal> {
         if !self.implicit_alive {
             return Err(GrantRefusal::GrantClosed);
@@ -346,19 +370,22 @@ impl RootGrant {
                 capacity: self.capacity,
             });
         }
-        let serial = self.next_serial;
-        self.next_serial += 1;
+        let serial = self.next_serial.ok_or(GrantRefusal::SerialsExhausted)?;
+        self.next_serial = serial.checked_add(1);
         self.outstanding.insert(serial);
-        Ok(TransferableToken { serial })
+        Ok(TransferableToken {
+            identity: self.identity.clone(),
+            serial,
+        })
     }
 
     /// Release a transferable token back to the budget.
     ///
     /// # Errors
-    /// [`GrantRefusal::UnknownToken`] for a serial not outstanding;
+    /// [`GrantRefusal::UnknownToken`] for a foreign or non-outstanding token;
     /// nothing changes on refusal.
     pub fn release(&mut self, token: &TransferableToken) -> Result<(), GrantRefusal> {
-        if !self.outstanding.remove(&token.serial) {
+        if self.identity != token.identity || !self.outstanding.remove(&token.serial) {
             return Err(GrantRefusal::UnknownToken {
                 serial: token.serial,
             });
@@ -367,7 +394,8 @@ impl RootGrant {
     }
 
     /// Close the grant: the Cargo root exited; the implicit token dies
-    /// with it and nothing further issues.
+    /// with it and nothing further issues. Already issued tokens still belong
+    /// to this ledger and can be released while its children drain.
     pub fn close(&mut self) {
         self.implicit_alive = false;
     }
@@ -493,6 +521,117 @@ mod tests {
         );
         grant.issue_transferable().expect("slot returned");
         assert_eq!(grant.transferable_outstanding(), 4);
+    }
+
+    #[test]
+    fn foreign_tokens_with_matching_serials_cannot_release_capacity() {
+        let mut first = RootGrant::open(2).unwrap();
+        let mut second = RootGrant::open(2).unwrap();
+        let first_token = first.issue_transferable().unwrap();
+        let second_token = second.issue_transferable().unwrap();
+        assert_eq!(first_token.serial, second_token.serial);
+        assert_ne!(first_token, second_token);
+
+        assert_eq!(
+            first.release(&second_token),
+            Err(GrantRefusal::UnknownToken {
+                serial: second_token.serial
+            })
+        );
+        assert_eq!(
+            second.release(&first_token),
+            Err(GrantRefusal::UnknownToken {
+                serial: first_token.serial
+            })
+        );
+        for grant in [&mut first, &mut second] {
+            assert_eq!(grant.transferable_outstanding(), 1);
+            assert_eq!(
+                grant.issue_transferable(),
+                Err(GrantRefusal::TransferablesExhausted {
+                    outstanding: 1,
+                    capacity: 2
+                })
+            );
+        }
+        first.release(&first_token).unwrap();
+        second.release(&second_token).unwrap();
+        assert_eq!(first.transferable_outstanding(), 0);
+        assert_eq!(second.transferable_outstanding(), 0);
+    }
+
+    #[test]
+    fn stale_tokens_do_not_belong_to_a_reopened_grant() {
+        let stale = {
+            let mut grant = RootGrant::open(2).unwrap();
+            grant.issue_transferable().unwrap()
+        };
+        let mut reopened = RootGrant::open(2).unwrap();
+        let current = reopened.issue_transferable().unwrap();
+        assert_eq!(stale.serial, current.serial);
+        assert_ne!(stale, current);
+        assert_eq!(
+            reopened.release(&stale),
+            Err(GrantRefusal::UnknownToken {
+                serial: stale.serial
+            })
+        );
+        assert_eq!(reopened.transferable_outstanding(), 1);
+        reopened.release(&current).unwrap();
+    }
+
+    #[test]
+    fn cloned_handles_release_once_after_the_owner_moves() {
+        let mut grant = RootGrant::open(2).unwrap();
+        let token = grant.issue_transferable().unwrap();
+        let duplicate = token.clone();
+        assert_eq!(token, duplicate);
+        // Moving the ledger must preserve identity; its stack address is not
+        // suitable as a token's owner ID.
+        let mut moved = Box::new(grant);
+        moved.release(&duplicate).unwrap();
+        assert_eq!(
+            moved.release(&token),
+            Err(GrantRefusal::UnknownToken {
+                serial: token.serial
+            })
+        );
+        let replacement = moved.issue_transferable().unwrap();
+        assert_ne!(replacement, token);
+        assert_eq!(moved.transferable_outstanding(), 1);
+    }
+
+    #[test]
+    fn serial_exhaustion_never_wraps_or_loses_outstanding_tokens() {
+        let mut grant = RootGrant::open(3).unwrap();
+        let first = grant.issue_transferable().unwrap();
+        grant.next_serial = Some(u64::MAX);
+        let last = grant.issue_transferable().unwrap();
+        assert_eq!(last.serial, u64::MAX);
+        grant.release(&last).unwrap();
+        assert_eq!(
+            grant.issue_transferable(),
+            Err(GrantRefusal::SerialsExhausted)
+        );
+        assert_eq!(grant.transferable_outstanding(), 1);
+        grant.release(&first).unwrap();
+        assert_eq!(grant.transferable_outstanding(), 0);
+        assert_eq!(
+            grant.issue_transferable(),
+            Err(GrantRefusal::SerialsExhausted)
+        );
+    }
+
+    #[test]
+    fn closing_a_grant_stops_issuance_but_preserves_owned_drain_accounting() {
+        let mut grant = RootGrant::open(2).unwrap();
+        let token = grant.issue_transferable().unwrap();
+        grant.close();
+        assert_eq!(grant.issue_transferable(), Err(GrantRefusal::GrantClosed));
+        assert_eq!(grant.transferable_outstanding(), 1);
+        grant.release(&token).unwrap();
+        assert_eq!(grant.transferable_outstanding(), 0);
+        assert_eq!(grant.issue_transferable(), Err(GrantRefusal::GrantClosed));
     }
 
     #[test]
