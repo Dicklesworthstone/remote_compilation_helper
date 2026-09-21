@@ -107,7 +107,17 @@ pub struct SourceOwner {
 }
 
 impl SourceOwner {
-    fn ready(&self) -> Value {
+    fn within_budget(&self) -> Result<(), String> {
+        if Instant::now() >= self.deadline {
+            return Err(invalid("source upload deadline exceeded"));
+        }
+        Ok(())
+    }
+
+    /// Every readiness response uses the same post-I/O deadline frontier.
+    /// Cached-file reuse and verification cannot renew the original budget.
+    fn ready(&self) -> Result<Value, String> {
+        self.within_budget()?;
         let mut reply = json!({"kind":"source-ready", "request_id":self.request_id,
             "manifest_sha256":hex(&self.receiver.manifest().digest()),
             "sealed":self.receiver.sealed_root().is_some() && !self.source_failed});
@@ -118,7 +128,7 @@ impl SourceOwner {
             reply["source_reused_bytes"] = json!(self.reused_bytes);
             reply["cache_write_error"] = json!(self.cache_write_error);
         }
-        reply
+        Ok(reply)
     }
 }
 
@@ -149,8 +159,7 @@ impl SourceTransferState {
                     return Err(invalid("another source transfer owns this session"));
                 }
                 if owner.source_failed { return Err(invalid("execution source verification failed")); }
-                if Instant::now() >= owner.deadline { return Err(invalid("source upload deadline exceeded")); }
-                return Ok(owner.ready());
+                return owner.ready();
             }
             let deadline = Instant::now() + UPLOAD_BUDGET;
             let cache = if allow_cached_files {
@@ -187,7 +196,7 @@ impl SourceTransferState {
                 deadline, allow_cached_files, missing_files, reused_bytes, cache,
                 cache_write_error: None, source_failed: false,
             };
-            let reply = owner.ready();
+            let reply = owner.ready()?;
             self.pending = Some(owner);
             return Ok(reply);
         }
@@ -196,14 +205,17 @@ impl SourceTransferState {
         if owner.request_id != id || owner.receiver.manifest().digest() != digest(&value["manifest_sha256"])? {
             return Err(invalid("source transfer identity mismatch"));
         }
-        if Instant::now() >= owner.deadline { return Err(invalid("source upload deadline exceeded")); }
+        owner.within_budget()?;
         match value["kind"].as_str() {
             Some("source-chunk") => {
                 let path = value["path"].as_str().ok_or("source chunk lacks a relative path")?;
                 let offset = value["offset"].as_u64().ok_or("source chunk offset must be unsigned")?;
                 let bytes = decode_hex(value["data_hex"].as_str().ok_or("source chunk lacks data")?, MAX_SOURCE_CHUNK)?;
-                let next = owner.receiver.write_chunk(path, offset, &bytes, digest(&value["chunk_sha256"])?)
+                let next = owner.receiver.write_chunk(path, offset, &bytes, digest(&value["chunk_sha256"])? )
                     .map_err(|error| error.to_string())?;
+                // Accepted filesystem writes do not make an expired transfer
+                // live again. Do not acknowledge progress after the deadline.
+                owner.within_budget()?;
                 Ok(json!({"kind":"source-chunk-accepted", "request_id":id,
                     "manifest_sha256":hex(&owner.receiver.manifest().digest()),
                     "path":path, "next_offset":next}))
@@ -223,8 +235,7 @@ impl SourceTransferState {
                         }
                     }
                 }
-                if Instant::now() >= owner.deadline { return Err(invalid("source upload deadline exceeded")); }
-                Ok(owner.ready())
+                owner.ready()
             }
             _ => Err(invalid("unknown source operation")),
         }
@@ -243,7 +254,7 @@ impl SourceTransferState {
         {
             return Err(invalid("execution differs from its uploaded source identity"));
         }
-        if Instant::now() >= owner.deadline { return Err(invalid("source upload deadline exceeded")); }
+        owner.within_budget()?;
         let path = owner.receiver.sealed_root().ok_or("execution source is not completely verified")?;
         path.to_str().map(|path| Some(path.to_owned())).ok_or_else(|| invalid("worker staging path is not UTF-8"))
     }
@@ -477,5 +488,132 @@ mod tests {
         assert!(changed.prepared_path(&request, true).is_err());
         assert!(changed.handle(&seal(&manifest, 2), true, false).is_err());
         assert!(changed.take_prepared(&request).is_err());
+    }
+
+    fn uploaded() -> (SourceTransferState, Value, Value, Value) {
+        let manifest = manifest();
+        let request = json!({"kind":"canonical-exec", "request_id":7,
+            "source_manifest":manifest, "program":"rustc", "args":["src/lib.rs"]});
+        let begin = json!({"kind":"source-begin", "request_id":7, "manifest":manifest});
+        let chunk = json!({"kind":"source-chunk", "request_id":7,
+            "manifest_sha256":manifest["manifest_sha256"], "path":"src/lib.rs", "offset":0,
+            "data_hex":hex(b"source\0\xff"), "chunk_sha256":hex(&Sha256::digest(b"source\0\xff"))});
+        let seal = json!({"kind":"source-seal", "request_id":7,
+            "manifest_sha256":manifest["manifest_sha256"]});
+        let mut state = SourceTransferState::default();
+        assert_eq!(state.handle(&begin, true, false).unwrap()["sealed"], false);
+        state.handle(&chunk, true, false).unwrap();
+        (state, request, begin, seal)
+    }
+
+    fn assert_not_admissible(state: &mut SourceTransferState, request: &Value, seal: &Value) {
+        assert!(state.handle(seal, true, false).is_err());
+        assert!(state.prepared_path(request, true).is_err());
+        assert!(state.take_prepared(request).is_err());
+        assert!(state.pending.is_some(), "failed input ownership remains with this session");
+    }
+
+    #[test]
+    fn changed_staged_bytes_never_become_an_execution_source() {
+        let (mut state, request, begin, seal) = uploaded();
+        let original = request.clone();
+        let path = state.pending.as_ref().unwrap()._directory.path().join("workspace/src/lib.rs");
+        std::fs::write(&path, b"edited\0\xff").unwrap();
+        assert_not_admissible(&mut state, &request, &seal);
+        // The original identity cannot be reused to bless repaired or changed
+        // bytes after a failed seal, nor does re-begin reset the poisoned stage.
+        std::fs::write(&path, b"source\0\xff").unwrap();
+        assert_eq!(state.handle(&begin, true, false).unwrap()["sealed"], false);
+        assert_not_admissible(&mut state, &request, &seal);
+        assert_eq!(request, original, "worker paths never rewrite the journal request");
+    }
+
+    #[test]
+    fn unrequested_cargo_configuration_and_empty_directories_refuse_admission() {
+        for extra in [".cargo/config.toml", ".git/HEAD", "unrequested-directory"] {
+            let (mut state, request, _, seal) = uploaded();
+            let root = state.pending.as_ref().unwrap()._directory.path().join("workspace");
+            let path = root.join(extra);
+            if extra == "unrequested-directory" {
+                std::fs::create_dir(&path).unwrap();
+            } else {
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(&path, b"unrequested input").unwrap();
+            }
+            assert_not_admissible(&mut state, &request, &seal);
+        }
+    }
+
+    #[test]
+    fn a_redirected_source_directory_cannot_be_handed_to_the_executor() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let (mut state, request, _, seal) = uploaded();
+        let private = state.pending.as_ref().unwrap()._directory.path().to_path_buf();
+        let outside = private.join("outside");
+        std::fs::rename(private.join("workspace/src"), &outside).unwrap();
+        symlink(&outside, private.join("workspace/src")).unwrap();
+        assert_not_admissible(&mut state, &request, &seal);
+        let file = outside.join("lib.rs");
+        assert_eq!(std::fs::read(&file).unwrap(), b"source\0\xff");
+        assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+
+    #[test]
+    fn verified_but_late_seal_never_acknowledges_readiness_or_transfers_ownership() {
+        let (mut state, request, begin, seal) = uploaded();
+        let owner = state.pending.as_mut().unwrap();
+        // Drive the actual post-I/O readiness frontier with a completed seal
+        // and an expired budget, without timing-dependent sleeps or fake IO.
+        owner.receiver.seal().unwrap();
+        owner.deadline = Instant::now() - Duration::from_secs(1);
+        assert!(owner.ready().is_err());
+        assert!(state.handle(&begin, true, false).is_err());
+        assert_not_admissible(&mut state, &request, &seal);
+    }
+
+    #[test]
+    fn successful_sealing_and_repeated_begin_never_renew_the_upload_budget() {
+        let (mut state, request, begin, seal) = uploaded();
+        let deadline = state.pending.as_ref().unwrap().deadline;
+        assert_eq!(state.handle(&begin, true, false).unwrap()["sealed"], false);
+        assert_eq!(state.pending.as_ref().unwrap().deadline, deadline);
+        let ready = state.handle(&seal, true, false).unwrap();
+        assert_eq!(ready["sealed"], true);
+        assert_eq!(ready["request_id"], request["request_id"]);
+        assert_eq!(ready["manifest_sha256"], request["source_manifest"]["manifest_sha256"]);
+        assert_eq!(state.handle(&begin, true, false).unwrap(), ready);
+        assert_eq!(state.pending.as_ref().unwrap().deadline, deadline);
+        let path = state.prepared_path(&request, true).unwrap().unwrap();
+        let owner = state.take_prepared(&request).unwrap().unwrap();
+        assert!(state.pending.is_none());
+        assert_eq!(owner.deadline, deadline);
+        assert_eq!(std::fs::read(std::path::Path::new(&path).join("src/lib.rs")).unwrap(), b"source\0\xff");
+    }
+
+    #[test]
+    fn cached_bytes_do_not_authorize_extra_inputs_or_a_changed_private_copy() {
+        let cache = tempfile::tempdir().unwrap();
+        let manifest = projection(&[("lib.rs", b"good", false)]);
+        let mut cold = cached_state(cache.path());
+        cold.handle(&begin(&manifest, 1), true, false).unwrap();
+        upload(&mut cold, &manifest, 1, "lib.rs", b"good");
+        cold.handle(&seal(&manifest, 1), true, false).unwrap();
+        for extra_file in [false, true] {
+            let mut warm = cached_state(cache.path());
+            let start = warm.handle(&begin(&manifest, 2), true, false).unwrap();
+            assert_eq!(start["missing_files"], json!([]));
+            assert_eq!(start["sealed"], false);
+            let root = warm.pending.as_ref().unwrap()._directory.path().join("workspace");
+            if extra_file {
+                std::fs::create_dir(root.join(".cargo")).unwrap();
+                std::fs::write(root.join(".cargo/config.toml"), b"unexpected configuration").unwrap();
+            } else {
+                std::fs::write(root.join("lib.rs"), b"evil").unwrap();
+            }
+            let request = json!({"kind":"canonical-exec", "request_id":2, "source_manifest":manifest});
+            assert_not_admissible(&mut warm, &request, &seal(&manifest, 2));
+            let cached = cache.path().join("source-files-v1").join(format!("{}.src", hex(&Sha256::digest(b"good"))));
+            assert_eq!(std::fs::read(cached).unwrap(), b"good", "a bad stage never reseeds the cache");
+        }
     }
 }
