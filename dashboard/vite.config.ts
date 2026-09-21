@@ -1,5 +1,5 @@
-import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
+import { defineConfig } from "vite";
 
 // GitHub Pages serves project sites from /<repo>/, so the base path must match
 // or every asset 404s. Override with RCH_DASH_BASE for a user/organisation page

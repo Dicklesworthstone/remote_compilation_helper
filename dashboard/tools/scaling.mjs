@@ -62,18 +62,23 @@
  * byte-identical fleets and the payload column is exactly reproducible.
  */
 
-import { webcrypto, createHash } from "node:crypto";
+import { createHash, webcrypto } from "node:crypto";
 import { writeFile } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
-import { gzipSync, gunzipSync } from "node:zlib";
-
+import { gunzipSync, gzipSync } from "node:zlib";
 import {
-  mergeWorkers, computeTotals, projectDispatchers, internSnapshotStrings,
-} from "./snapshot.mjs";
-import {
-  compressPlaintext, decompressPlaintext, SNAPSHOT_COMPRESSION, SNAPSHOT_GZIP_LEVEL,
+  compressPlaintext,
+  decompressPlaintext,
+  SNAPSHOT_COMPRESSION,
+  SNAPSHOT_GZIP_LEVEL,
 } from "./envelope.mjs";
 import { buildLlmView, encodeView } from "./llm-view.mjs";
+import {
+  computeTotals,
+  internSnapshotStrings,
+  mergeWorkers,
+  projectDispatchers,
+} from "./snapshot.mjs";
 
 // ------------------------------------------------------------------- fleet gen
 
@@ -104,11 +109,24 @@ function rng(seed) {
 
 const pick = (r, xs) => xs[Math.floor(r() * xs.length) % xs.length];
 
-const STATUSES = ["healthy", "healthy", "healthy", "degraded", "draining", "drained", "unreachable", "disabled"];
+const STATUSES = [
+  "healthy",
+  "healthy",
+  "healthy",
+  "degraded",
+  "draining",
+  "drained",
+  "unreachable",
+  "disabled",
+];
 const CIRCUITS = ["closed", "closed", "closed", "half_open", "open"];
 const PRESSURE = ["healthy", "healthy", "warning", "critical", "telemetry_gap"];
 const POSTURES = ["remote_ready", "remote_ready", "remote_ready", "degraded", "local_only"];
-const RUSTC = ["1.94.0-nightly (a1b2c3d4e 2026-08-01)", "1.93.0 (9f0c1e2ab 2026-07-11)", "1.92.1 (33ef00212 2026-06-02)"];
+const RUSTC = [
+  "1.94.0-nightly (a1b2c3d4e 2026-08-01)",
+  "1.93.0 (9f0c1e2ab 2026-07-11)",
+  "1.92.1 (33ef00212 2026-06-02)",
+];
 const TAGS = ["fast", "big-mem", "avx2", "nvme", "arch", "ubuntu-dispatch", "outlet"];
 /**
  * Project names grow SUBLINEARLY with the fleet (a bigger fleet compiles a
@@ -117,13 +135,29 @@ const TAGS = ["fast", "big-mem", "avx2", "nvme", "arch", "ubuntu-dispatch", "out
  * dispatcher reports the same advice about the same shared worker.
  */
 const PROJECTS = [
-  "remote_compilation_helper", "franken_sqlite", "beads_rust", "smartedgar", "asupersync",
-  "franken_markdown", "franken_ocr", "coding_agent_search", "doodlestein_self_releaser",
-  "agent_mail", "frankenterm", "franken_whisper", "franken_tui", "atp", "eidetic_engine",
+  "remote_compilation_helper",
+  "franken_sqlite",
+  "beads_rust",
+  "smartedgar",
+  "asupersync",
+  "franken_markdown",
+  "franken_ocr",
+  "coding_agent_search",
+  "doodlestein_self_releaser",
+  "agent_mail",
+  "frankenterm",
+  "franken_whisper",
+  "franken_tui",
+  "atp",
+  "eidetic_engine",
 ];
 const COMMANDS = [
-  "cargo build --release", "cargo test --workspace", "cargo check --all-targets",
-  "cargo clippy --all-targets -- -D warnings", "cargo build", "cargo nextest run",
+  "cargo build --release",
+  "cargo test --workspace",
+  "cargo check --all-targets",
+  "cargo clippy --all-targets -- -D warnings",
+  "cargo build",
+  "cargo nextest run",
 ];
 const HINT_MESSAGES = [
   "Disk is above the pressure threshold and rchd has derated this worker to zero slots.",
@@ -139,7 +173,13 @@ const HINT_ACTIONS = [
   "Drain the worker, or raise CARGO_BUILD_JOBS pressure limits in /etc/environment.",
   "Fix ownership on the projects root and re-run `rch doctor`.",
 ];
-const HINT_REASONS = ["disk_pressure", "circuit_open", "telemetry_stale", "load_high", "projects_root"];
+const HINT_REASONS = [
+  "disk_pressure",
+  "circuit_open",
+  "telemetry_stale",
+  "load_high",
+  "projects_root",
+];
 const SEVERITIES = ["critical", "warn", "info"];
 
 function synthWorker(r, id, nowUnix) {
@@ -198,7 +238,8 @@ export function synthFleet(n, seed = 0x5eed) {
   const nowUnix = Math.floor(Date.UTC(2026, 7, 27, 2, 0, 0) / 1000);
   const poolSize = Math.max(1, Math.round(n * WORKERS_PER_DISPATCHER));
   const pool = Array.from({ length: poolSize }, (_, i) =>
-    synthWorker(r, `wkr-${String(i).padStart(4, "0")}`, nowUnix));
+    synthWorker(r, `wkr-${String(i).padStart(4, "0")}`, nowUnix),
+  );
 
   const visible = Math.max(1, Math.round(poolSize * VISIBILITY));
   let observations = 0;
@@ -212,7 +253,11 @@ export function synthFleet(n, seed = 0x5eed) {
       const w = pool[(start + k) % poolSize];
       // Each observer derates independently — that per-observer disagreement is
       // the reason `slots_by_dispatcher` exists at all.
-      return { ...w, used_slots: Math.floor(r() * (w.total_slots + 1)), total_slots: Math.max(0, w.total_slots - Math.floor(r() * 4)) };
+      return {
+        ...w,
+        used_slots: Math.floor(r() * (w.total_slots + 1)),
+        total_slots: Math.max(0, w.total_slots - Math.floor(r() * 4)),
+      };
     });
     observations += workers.length;
 
@@ -323,15 +368,19 @@ function timeStage(fn, { reps = 7, setup = null } = {}) {
     wall.push(w1 - w0);
   }
   return {
-    cpuMs: median(cpu), cpuMad: mad(cpu),
-    wallMs: median(wall), wallMad: mad(wall),
+    cpuMs: median(cpu),
+    cpuMad: mad(cpu),
+    wallMs: median(wall),
+    wallMad: mad(wall),
     out,
   };
 }
 
 // ------------------------------------------------------------------ the ladder
 
-const AES_KEY = await webcrypto.subtle.generateKey({ name: "AES-GCM", length: 256 }, false, ["encrypt"]);
+const AES_KEY = await webcrypto.subtle.generateKey({ name: "AES-GCM", length: 256 }, false, [
+  "encrypt",
+]);
 const IV = webcrypto.getRandomValues(new Uint8Array(12));
 
 /** Bytes of a sub-structure, measured the way the wire measures it. */
@@ -360,9 +409,12 @@ function assembleSnapshot({ totals, dispatchers, workers, strings }) {
     // one: it is the floor every other component is compared against.
     history: Array.from({ length: 96 }, (_, i) => ({
       t: new Date(Date.UTC(2026, 7, 20) + i * 3e5).toISOString(),
-      slots_total: totals.slots, slots_used: totals.slots_used, workers: totals.workers,
+      slots_total: totals.slots,
+      slots_used: totals.slots_used,
+      workers: totals.workers,
       disk_free_gb: Math.round(totals.disk_free_gb),
-      builds_remote: totals.builds_remote, builds_local: totals.builds_local,
+      builds_remote: totals.builds_remote,
+      builds_local: totals.builds_local,
       dispatchers_remote_ready: totals.dispatchers_remote_ready,
     })),
   };
@@ -377,8 +429,9 @@ export function snapshotPlaintext(n) {
   const { dispatchers } = synthFleet(n);
   const workers = mergeWorkers(dispatchers);
   const totals = computeTotals(workers, dispatchers);
-  const { dispatchers: interned, strings } =
-    internSnapshotStrings(projectDispatchers(dispatchers, workers));
+  const { dispatchers: interned, strings } = internSnapshotStrings(
+    projectDispatchers(dispatchers, workers),
+  );
   return JSON.stringify(assembleSnapshot({ totals, dispatchers: interned, workers, strings }));
 }
 
@@ -414,16 +467,23 @@ async function runOne(n, reps, browser) {
     // WebCrypto is async, so it cannot go through timeStage(); same protocol,
     // inline. PBKDF2 is deliberately NOT here: 600k iterations is a constant,
     // independent of fleet size, and pass 1 already cached it.
-    const cpu = [], wall = [];
+    const cpu = [],
+      wall = [];
     await webcrypto.subtle.encrypt({ name: "AES-GCM", iv: IV }, AES_KEY, aesIn);
     for (let i = 0; i < reps; i++) {
-      const c0 = process.cpuUsage(); const w0 = performance.now();
+      const c0 = process.cpuUsage();
+      const w0 = performance.now();
       await webcrypto.subtle.encrypt({ name: "AES-GCM", iv: IV }, AES_KEY, aesIn);
       wall.push(performance.now() - w0);
       const c1 = process.cpuUsage(c0);
       cpu.push((c1.user + c1.system) / 1000);
     }
-    stages.aes_gcm = { cpuMs: median(cpu), cpuMad: mad(cpu), wallMs: median(wall), wallMad: mad(wall) };
+    stages.aes_gcm = {
+      cpuMs: median(cpu),
+      cpuMad: mad(cpu),
+      wallMs: median(wall),
+      wallMad: mad(wall),
+    };
   }
   const envelope = {
     format: "rch.dashboard.enc.v1",
@@ -460,8 +520,13 @@ async function runOne(n, reps, browser) {
 
   // ---- LLM endpoint (api/fleet.mjs + tools/fleet-llm.mjs)
   const llmSnap = JSON.parse(plain);
-  stages.llm_summary = timeStage(() => buildLlmView(llmSnap, { view: "summary", now: Date.now() }), { reps });
-  stages.llm_full = timeStage(() => buildLlmView(llmSnap, { view: "full", now: Date.now() }), { reps });
+  stages.llm_summary = timeStage(
+    () => buildLlmView(llmSnap, { view: "summary", now: Date.now() }),
+    { reps },
+  );
+  stages.llm_full = timeStage(() => buildLlmView(llmSnap, { view: "full", now: Date.now() }), {
+    reps,
+  });
   stages.toon = timeStage(() => encodeView(stages.llm_summary.out, "toon"), { reps });
 
   const payload = {
@@ -477,21 +542,37 @@ async function runOne(n, reps, browser) {
     k_strings: bytesOf(snapshot.strings),
     k_history: bytesOf(snapshot.history),
     k_pool_slots: snapshot.dispatchers.reduce((b, d) => b + bytesOf(d.pool_slots), 0),
-    k_slots_by_dispatcher: snapshot.workers.reduce((b, w) => b + (w.slots_by_dispatcher ? bytesOf(w.slots_by_dispatcher) : 0), 0),
+    k_slots_by_dispatcher: snapshot.workers.reduce(
+      (b, w) => b + (w.slots_by_dispatcher ? bytesOf(w.slots_by_dispatcher) : 0),
+      0,
+    ),
     k_seen_by: snapshot.workers.reduce((b, w) => b + (w.seen_by ? bytesOf(w.seen_by) : 0), 0),
-    k_worker_slots: snapshot.dispatchers.reduce((b, d) => b + (d.worker_slots ? bytesOf(d.worker_slots) : 0), 0),
+    k_worker_slots: snapshot.dispatchers.reduce(
+      (b, d) => b + (d.worker_slots ? bytesOf(d.worker_slots) : 0),
+      0,
+    ),
     k_builds: snapshot.dispatchers.reduce((b, d) => b + bytesOf(d.builds), 0),
     k_hints: snapshot.dispatchers.reduce((b, d) => b + bytesOf(d.hints), 0),
   };
 
   return {
-    n, pool, observations,
+    n,
+    pool,
+    observations,
     workers: workers.length,
     strings: strings.length,
     payload,
-    stages: Object.fromEntries(Object.entries(stages).map(([k, v]) => [k, {
-      cpuMs: v.cpuMs, cpuMad: v.cpuMad, wallMs: v.wallMs, wallMad: v.wallMad,
-    }])),
+    stages: Object.fromEntries(
+      Object.entries(stages).map(([k, v]) => [
+        k,
+        {
+          cpuMs: v.cpuMs,
+          cpuMad: v.cpuMad,
+          wallMs: v.wallMs,
+          wallMad: v.wallMad,
+        },
+      ]),
+    ),
   };
 }
 
@@ -511,8 +592,12 @@ function fitExponent(points) {
   const ys = usable.map((p) => Math.log(p.y));
   const mx = xs.reduce((a, b) => a + b, 0) / xs.length;
   const my = ys.reduce((a, b) => a + b, 0) / ys.length;
-  let num = 0, den = 0;
-  for (let i = 0; i < xs.length; i++) { num += (xs[i] - mx) * (ys[i] - my); den += (xs[i] - mx) ** 2; }
+  let num = 0,
+    den = 0;
+  for (let i = 0; i < xs.length; i++) {
+    num += (xs[i] - mx) * (ys[i] - my);
+    den += (xs[i] - mx) ** 2;
+  }
   if (den === 0) return null;
   const k = num / den;
   // R^2, so a nonsense fit over noisy sub-millisecond stages announces itself.
@@ -544,7 +629,8 @@ function nameCurve(fit) {
 const pad = (s, w) => String(s).padStart(w);
 const padr = (s, w) => String(s).padEnd(w);
 const ms = (v) => (v >= 100 ? v.toFixed(0) : v >= 10 ? v.toFixed(1) : v.toFixed(3));
-const kb = (b) => (b >= 1048576 ? `${(b / 1048576).toFixed(1)}M` : b >= 1024 ? `${(b / 1024).toFixed(1)}K` : `${b}`);
+const kb = (b) =>
+  b >= 1048576 ? `${(b / 1048576).toFixed(1)}M` : b >= 1024 ? `${(b / 1024).toFixed(1)}K` : `${b}`;
 
 /**
  * `[label, unit]`, where `unit` is the size of the stage's OWN INPUT.
@@ -579,19 +665,27 @@ const STAGE_LABELS = {
 };
 
 const unitSize = (run, unit) =>
-  unit === "cell" ? run.observations
-  : unit === "byte" ? run.payload.plaintext
-  : run.n + run.workers;
+  unit === "cell"
+    ? run.observations
+    : unit === "byte"
+      ? run.payload.plaintext
+      : run.n + run.workers;
 
 const PAYLOAD_LABELS = {
-  plaintext: "plaintext JSON", gzip: "gzip'd", envelope: "envelope on disk",
-  llm_toon: "llm view (toon)", k_workers: "  workers[]", k_dispatchers: "  dispatchers[]",
-  k_strings: "  strings[]", k_history: "  history[]",
+  plaintext: "plaintext JSON",
+  gzip: "gzip'd",
+  envelope: "envelope on disk",
+  llm_toon: "llm view (toon)",
+  k_workers: "  workers[]",
+  k_dispatchers: "  dispatchers[]",
+  k_strings: "  strings[]",
+  k_history: "  history[]",
   k_pool_slots: "  (dxw) .pool_slots",
   k_slots_by_dispatcher: "  (dxw) .slots_by_dispatcher",
   k_seen_by: "  (dxw) .seen_by",
   k_worker_slots: "  (dxw) .worker_slots (legacy)",
-  k_builds: "    .builds", k_hints: "    .hints",
+  k_builds: "    .builds",
+  k_hints: "    .hints",
 };
 
 function report(runs) {
@@ -601,8 +695,12 @@ function report(runs) {
 
   console.log(`\nFLEET SHAPE (workers shared across dispatchers, ${VISIBILITY * 100}% visibility)`);
   console.log(padr("", w0) + ns.map((n) => pad(`n=${n}`, cw)).join(""));
-  for (const [label, key] of [["dispatchers", "n"], ["distinct workers", "workers"],
-    ["worker observations (dxw)", "observations"], ["string-table entries", "strings"]]) {
+  for (const [label, key] of [
+    ["dispatchers", "n"],
+    ["distinct workers", "workers"],
+    ["worker observations (dxw)", "observations"],
+    ["string-table entries", "strings"],
+  ]) {
     console.log(padr(label, w0) + runs.map((r) => pad(r[key], cw)).join(""));
   }
 
@@ -615,49 +713,71 @@ function report(runs) {
     fits[key] = fit;
     console.log(
       padr(STAGE_LABELS[key][0], w0) +
-      pts.map((p) => pad(ms(p.y), cw)).join("") +
-      pad(fit ? fit.k.toFixed(2) : "—", 11) + "  " + nameCurve(fit) +
-      (fit && fit.r2 < 0.9 ? `  (R²=${fit.r2.toFixed(2)} — noisy)` : ""),
+        pts.map((p) => pad(ms(p.y), cw)).join("") +
+        pad(fit ? fit.k.toFixed(2) : "—", 11) +
+        "  " +
+        nameCurve(fit) +
+        (fit && fit.r2 < 0.9 ? `  (R²=${fit.r2.toFixed(2)} — noisy)` : ""),
     );
   }
 
   console.log(`\nCOST PER UNIT OF INPUT (ns per cell / per byte / per row)`);
-  console.log(`  exponent ~0 = the stage is LINEAR in what it was handed; any growth is its INPUT's`);
-  console.log(padr("stage", w0) + ns.map((n) => pad(`n=${n}`, cw)).join("") + "   exponent  verdict");
+  console.log(
+    `  exponent ~0 = the stage is LINEAR in what it was handed; any growth is its INPUT's`,
+  );
+  console.log(
+    padr("stage", w0) + ns.map((n) => pad(`n=${n}`, cw)).join("") + "   exponent  verdict",
+  );
   for (const key of Object.keys(STAGE_LABELS)) {
     const [label, unit] = STAGE_LABELS[key];
-    const pts = runs.map((r) => ({ n: r.n, y: (r.stages[key].cpuMs * 1e6) / Math.max(1, unitSize(r, unit)) }));
+    const pts = runs.map((r) => ({
+      n: r.n,
+      y: (r.stages[key].cpuMs * 1e6) / Math.max(1, unitSize(r, unit)),
+    }));
     const fit = fitExponent(pts.map((p) => ({ n: p.n, y: p.y / 1000 })));
     const k = fit?.k ?? 0;
     console.log(
       padr(`${label} [/${unit}]`, w0) +
-      pts.map((p) => pad(p.y >= 100 ? p.y.toFixed(0) : p.y.toFixed(1), cw)).join("") +
-      pad(fit ? k.toFixed(2) : "—", 11) + "  " +
-      (!fit || Math.abs(k) < 0.25 ? "linear in its input"
-        : k >= 0.25 ? "SUPER-LINEAR IN ITS OWN INPUT" : "amortises (fixed cost fading)"),
+        pts.map((p) => pad(p.y >= 100 ? p.y.toFixed(0) : p.y.toFixed(1), cw)).join("") +
+        pad(fit ? k.toFixed(2) : "—", 11) +
+        "  " +
+        (!fit || Math.abs(k) < 0.25
+          ? "linear in its input"
+          : k >= 0.25
+            ? "SUPER-LINEAR IN ITS OWN INPUT"
+            : "amortises (fixed cost fading)"),
     );
   }
 
   console.log(`\nVALIDITY  wall/cpu ratio (1.0 = quiet box)  ·  MAD/median (0.0 = repeatable)`);
   console.log(padr("stage", w0) + ns.map((n) => pad(`n=${n}`, cw)).join(""));
   for (const key of Object.keys(STAGE_LABELS)) {
-    console.log(padr(STAGE_LABELS[key][0], w0) + runs.map((r) => {
-      const s = r.stages[key];
-      const ratio = s.cpuMs > 0 ? s.wallMs / s.cpuMs : 0;
-      const rel = s.cpuMs > 0 ? s.cpuMad / s.cpuMs : 0;
-      return pad(`${ratio.toFixed(1)}/${rel.toFixed(2)}`, cw);
-    }).join(""));
+    console.log(
+      padr(STAGE_LABELS[key][0], w0) +
+        runs
+          .map((r) => {
+            const s = r.stages[key];
+            const ratio = s.cpuMs > 0 ? s.wallMs / s.cpuMs : 0;
+            const rel = s.cpuMs > 0 ? s.cpuMad / s.cpuMs : 0;
+            return pad(`${ratio.toFixed(1)}/${rel.toFixed(2)}`, cw);
+          })
+          .join(""),
+    );
   }
 
   console.log(`\nPAYLOAD BYTES`);
-  console.log(padr("component", w0) + ns.map((n) => pad(`n=${n}`, cw)).join("") + "   exponent  curve");
+  console.log(
+    padr("component", w0) + ns.map((n) => pad(`n=${n}`, cw)).join("") + "   exponent  curve",
+  );
   for (const key of Object.keys(PAYLOAD_LABELS)) {
     const pts = runs.map((r) => ({ n: r.n, y: r.payload[key] }));
     const fit = fitExponent(pts);
     console.log(
       padr(PAYLOAD_LABELS[key], w0) +
-      pts.map((p) => pad(kb(p.y), cw)).join("") +
-      pad(fit ? fit.k.toFixed(2) : "—", 11) + "  " + nameCurve(fit),
+        pts.map((p) => pad(kb(p.y), cw)).join("") +
+        pad(fit ? fit.k.toFixed(2) : "—", 11) +
+        "  " +
+        nameCurve(fit),
     );
   }
 
@@ -720,9 +840,8 @@ function gzipLevelSweep(ns, reps, levels) {
         wallMs: timed.wallMs,
         iso: createHash("sha256").update(Buffer.from(back, "utf8")).digest("hex") === digest,
         // Only meaningful on the shipped level; `null` elsewhere.
-        matchesCollector: level === SNAPSHOT_GZIP_LEVEL
-          ? out.equals(compressPlaintext(text))
-          : null,
+        matchesCollector:
+          level === SNAPSHOT_GZIP_LEVEL ? out.equals(compressPlaintext(text)) : null,
       };
     });
     return { n, plaintext: buf.length, digest, rows };
@@ -736,35 +855,41 @@ function reportLevels(sweeps) {
     const ref = s.rows.find((r) => r.level === SNAPSHOT_GZIP_LEVEL);
     console.log(
       `\nn=${s.n}  plaintext ${s.plaintext.toLocaleString()}B  sha256 ${s.digest.slice(0, 12)}` +
-      (ref ? `  ·  L${SNAPSHOT_GZIP_LEVEL} == compressPlaintext(): ${ref.matchesCollector ? "yes" : "NO — SWEEP AND COLLECTOR DISAGREE"}` : ""),
+        (ref
+          ? `  ·  L${SNAPSHOT_GZIP_LEVEL} == compressPlaintext(): ${ref.matchesCollector ? "yes" : "NO — SWEEP AND COLLECTOR DISAGREE"}`
+          : ""),
     );
     console.log(
       `  lvl${pad("bytes", 11)}${pad("ratio", 8)}${pad("cpu ms", 10)}${pad("mad%", 7)}` +
-      `${pad(`vs L${SNAPSHOT_GZIP_LEVEL} B`, 11)}${pad("vs cpu", 11)}${pad("B/ms", 8)}  iso`,
+        `${pad(`vs L${SNAPSHOT_GZIP_LEVEL} B`, 11)}${pad("vs cpu", 11)}${pad("B/ms", 8)}  iso`,
     );
     for (const r of s.rows) {
       const db = ref ? r.bytes - ref.bytes : 0;
       const dc = ref ? r.cpuMs - ref.cpuMs : 0;
       // Bytes given up per millisecond of collector CPU bought. Undefined for
       // the reference row and for any level that is worse on BOTH axes.
-      const rate = r.level === SNAPSHOT_GZIP_LEVEL ? "—"
-        : db > 0 && dc < 0 ? (db / -dc).toFixed(0)
-        : db <= 0 && dc <= 0 ? "free"
-        : "worse";
+      const rate =
+        r.level === SNAPSHOT_GZIP_LEVEL
+          ? "—"
+          : db > 0 && dc < 0
+            ? (db / -dc).toFixed(0)
+            : db <= 0 && dc <= 0
+              ? "free"
+              : "worse";
       console.log(
         `  ${pad(r.level, 3)}${pad(r.bytes.toLocaleString(), 11)}` +
-        `${pad((s.plaintext / r.bytes).toFixed(2) + "x", 8)}${pad(ms(r.cpuMs), 10)}` +
-        `${pad(r.cpuMs ? ((r.cpuMad / r.cpuMs) * 100).toFixed(0) : "—", 7)}` +
-        `${pad((db > 0 ? "+" : "") + db.toLocaleString(), 11)}` +
-        `${pad((dc > 0 ? "+" : "") + ms(dc) + "ms", 11)}${pad(rate, 8)}  ${r.iso ? "ok" : "FAIL"}`,
+          `${pad((s.plaintext / r.bytes).toFixed(2) + "x", 8)}${pad(ms(r.cpuMs), 10)}` +
+          `${pad(r.cpuMs ? ((r.cpuMad / r.cpuMs) * 100).toFixed(0) : "—", 7)}` +
+          `${pad((db > 0 ? "+" : "") + db.toLocaleString(), 11)}` +
+          `${pad((dc > 0 ? "+" : "") + ms(dc) + "ms", 11)}${pad(rate, 8)}  ${r.iso ? "ok" : "FAIL"}`,
       );
     }
   }
   console.log(
     `\nB/ms falling as n grows IS the crossover: a bigger fleet gives up fewer bytes\n` +
-    `per millisecond saved. Read it against the absolute cpu column before acting on\n` +
-    `it — the collector compresses once per cron tick, every reader pays the bytes on\n` +
-    `every fetch. tools/envelope.mjs records where that lands.\n`,
+      `per millisecond saved. Read it against the absolute cpu column before acting on\n` +
+      `it — the collector compresses once per cron tick, every reader pays the bytes on\n` +
+      `every fetch. tools/envelope.mjs records where that lands.\n`,
   );
 }
 
@@ -776,17 +901,32 @@ const USAGE = [
 ].join("\n");
 
 function parseArgs(argv) {
-  const out = { ns: null, reps: 7, json: null, gzipLevels: false, levels: [1, 2, 3, 4, 5, 6, 7, 8, 9] };
+  const out = {
+    ns: null,
+    reps: 7,
+    json: null,
+    gzipLevels: false,
+    levels: [1, 2, 3, 4, 5, 6, 7, 8, 9],
+  };
   for (let i = 2; i < argv.length; i++) {
     const a = argv[i];
-    if (a === "--n") out.ns = argv[++i].split(",").map((s) => Number(s.trim())).filter((x) => x > 0);
+    if (a === "--n")
+      out.ns = argv[++i]
+        .split(",")
+        .map((s) => Number(s.trim()))
+        .filter((x) => x > 0);
     else if (a === "--reps") out.reps = Math.max(3, Number(argv[++i]) || 7);
     else if (a === "--json") out.json = argv[++i];
     else if (a === "--gzip-levels") out.gzipLevels = true;
     else if (a === "--levels") {
-      out.levels = argv[++i].split(",").map((s) => Number(s.trim()))
+      out.levels = argv[++i]
+        .split(",")
+        .map((s) => Number(s.trim()))
         .filter((x) => Number.isInteger(x) && x >= 0 && x <= 9);
-    } else if (a === "--help" || a === "-h") { console.log(USAGE); process.exit(0); }
+    } else if (a === "--help" || a === "-h") {
+      console.log(USAGE);
+      process.exit(0);
+    }
   }
   // Different questions want different ladders. The full pipeline run needs the
   // extremes to fit an exponent at all; the level sweep is a decision about the
@@ -838,11 +978,18 @@ if (RUN_DIRECTLY) {
     const sweeps = gzipLevelSweep(args.ns, args.reps, args.levels);
     reportLevels(sweeps);
     if (args.json) {
-      await writeFile(args.json, JSON.stringify({
-        generated_at: new Date().toISOString(),
-        shipped_level: SNAPSHOT_GZIP_LEVEL,
-        sweeps,
-      }, null, 2));
+      await writeFile(
+        args.json,
+        JSON.stringify(
+          {
+            generated_at: new Date().toISOString(),
+            shipped_level: SNAPSHOT_GZIP_LEVEL,
+            sweeps,
+          },
+          null,
+          2,
+        ),
+      );
       console.log(`wrote ${args.json}`);
     }
     process.exit(0);
@@ -858,7 +1005,10 @@ if (RUN_DIRECTLY) {
   }
   report(runs);
   if (args.json) {
-    await writeFile(args.json, JSON.stringify({ generated_at: new Date().toISOString(), runs }, null, 2));
+    await writeFile(
+      args.json,
+      JSON.stringify({ generated_at: new Date().toISOString(), runs }, null, 2),
+    );
     console.log(`wrote ${args.json}`);
   }
 }

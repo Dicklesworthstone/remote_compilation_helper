@@ -17,7 +17,7 @@
  */
 
 import { encode as toonEncode } from "@toon-format/toon";
-import { buildProblems, PROBLEM_KINDS, isHookDead, isStalledBuild } from "../src/problems.js";
+import { buildProblems, isHookDead, isStalledBuild, PROBLEM_KINDS } from "../src/problems.js";
 
 export const STALE_CRIT_SECONDS = 60 * 60;
 
@@ -76,34 +76,55 @@ export function classifyWorker(w, snapshotMs) {
         ? `disk ${diskUsedPct.toFixed(0)}% full`
         : fallback;
 
-  if (st === "disabled") { health = "disabled"; reason = "manually disabled"; }
-  else if (st === "down" || st === "unreachable" || w.circuit_state === "open") {
+  if (st === "disabled") {
+    health = "disabled";
+    reason = "manually disabled";
+  } else if (st === "down" || st === "unreachable" || w.circuit_state === "open") {
     health = "offline";
     reason = w.circuit_state === "open" ? "circuit breaker open" : `worker ${st || "unreachable"}`;
   } else if (staleSeconds != null && staleSeconds > STALE_CRIT_SECONDS) {
-    health = "offline"; reason = `not seen for ${Math.round(staleSeconds / 60)}m`;
+    health = "offline";
+    reason = `not seen for ${Math.round(staleSeconds / 60)}m`;
   } else if (p.state === "critical" || (diskUsedPct != null && diskUsedPct >= 95)) {
-    health = "critical"; reason = pressureReason("critical pressure");
-  } else if (st === "draining") { health = "warn"; reason = "draining (finishing current jobs)"; }
-  else if (st === "drained") { health = "warn"; reason = "drained — accepting no new jobs"; }
-  else if (p.state === "warning" || (diskUsedPct != null && diskUsedPct >= 88)) {
-    health = "warn"; reason = pressureReason("pressure warning");
+    health = "critical";
+    reason = pressureReason("critical pressure");
+  } else if (st === "draining") {
+    health = "warn";
+    reason = "draining (finishing current jobs)";
+  } else if (st === "drained") {
+    health = "warn";
+    reason = "drained — accepting no new jobs";
+  } else if (p.state === "warning" || (diskUsedPct != null && diskUsedPct >= 88)) {
+    health = "warn";
+    reason = pressureReason("pressure warning");
   } else if (p.state === "telemetry_gap") {
-    health = "warn"; reason = p.reason ? `pressure: ${p.reason}` : "no pressure telemetry";
-  } else if (st === "degraded") { health = "warn"; reason = "worker responding slowly"; }
-  else if ((w.consecutive_failures ?? 0) > 0) {
+    health = "warn";
+    reason = p.reason ? `pressure: ${p.reason}` : "no pressure telemetry";
+  } else if (st === "degraded") {
+    health = "warn";
+    reason = "worker responding slowly";
+  } else if ((w.consecutive_failures ?? 0) > 0) {
     health = "warn";
     reason = `${w.consecutive_failures} consecutive failure${w.consecutive_failures === 1 ? "" : "s"}`;
   } else if (loadPerCore != null && loadPerCore >= 2) {
-    health = "warn"; reason = `load ${loadPerCore.toFixed(1)}x cores`;
-  } else if (w.circuit_state === "half_open") { health = "warn"; reason = "circuit half-open (probing)"; }
-  else if (w.caps?.projects_root_ok === false) { health = "warn"; reason = "projects root unhealthy"; }
-  else if (p.telemetry_fresh === false) {
     health = "warn";
-    reason = p.telemetry_age_secs != null
-      ? `telemetry ${fmtAgeBare(p.telemetry_age_secs)} old`
-      : "telemetry stale";
-  } else if ((w.used_slots ?? 0) > 0) { health = "busy"; reason = `${w.used_slots}/${w.total_slots} slots in use`; }
+    reason = `load ${loadPerCore.toFixed(1)}x cores`;
+  } else if (w.circuit_state === "half_open") {
+    health = "warn";
+    reason = "circuit half-open (probing)";
+  } else if (w.caps?.projects_root_ok === false) {
+    health = "warn";
+    reason = "projects root unhealthy";
+  } else if (p.telemetry_fresh === false) {
+    health = "warn";
+    reason =
+      p.telemetry_age_secs != null
+        ? `telemetry ${fmtAgeBare(p.telemetry_age_secs)} old`
+        : "telemetry stale";
+  } else if ((w.used_slots ?? 0) > 0) {
+    health = "busy";
+    reason = `${w.used_slots}/${w.total_slots} slots in use`;
+  }
 
   return { health, reason, diskUsedPct, loadPerCore };
 }
@@ -138,7 +159,8 @@ export function classifyDev(d) {
         ? (s.remote / lifetimeCounted) * 100
         : null;
 
-  const window = basis === "recent" ? `last ${recentCounted} builds` : "all builds since daemon start";
+  const window =
+    basis === "recent" ? `last ${recentCounted} builds` : "all builds since daemon start";
 
   let level, reason;
   if (!d.reachable) {
@@ -149,10 +171,22 @@ export function classifyDev(d) {
     level = d.posture.includes("local") ? "local-only" : "degraded";
     reason = d.posture_description ?? d.posture;
   } else if (remotePct != null && remotePct < 50) {
-    level = "local-only"; reason = `only ${remotePct.toFixed(0)}% of the ${window} went remote`;
-  } else if (basis === null) { level = "idle"; reason = "no builds recorded yet"; }
-  else { level = "offloading"; reason = `${remotePct.toFixed(0)}% of the ${window} went to the pool`; }
-  return { level, reason, remotePct, remoteBasis: basis, remoteCounted: recentCounted || lifetimeCounted };
+    level = "local-only";
+    reason = `only ${remotePct.toFixed(0)}% of the ${window} went remote`;
+  } else if (basis === null) {
+    level = "idle";
+    reason = "no builds recorded yet";
+  } else {
+    level = "offloading";
+    reason = `${remotePct.toFixed(0)}% of the ${window} went to the pool`;
+  }
+  return {
+    level,
+    reason,
+    remotePct,
+    remoteBasis: basis,
+    remoteCounted: recentCounted || lifetimeCounted,
+  };
 }
 
 /**
@@ -166,9 +200,18 @@ export function classifyDev(d) {
  * in `tools/snapshot.mjs`, change it here and in `expandBuilds()`/
  * `expandHints()` in src/derive.ts together.
  */
-const B_PROJECT = 0, B_COMMAND = 1, B_LOCATION = 2, B_WORKER = 3,
-      B_DURATION = 4, B_EXIT = 5, B_COMPLETED = 6;
-const H_WORKER = 0, H_SEVERITY = 1, H_MESSAGE = 2, H_ACTION = 3, H_REASON = 4;
+const B_PROJECT = 0,
+  B_COMMAND = 1,
+  B_LOCATION = 2,
+  B_WORKER = 3,
+  B_DURATION = 4,
+  B_EXIT = 5,
+  B_COMPLETED = 6;
+const H_WORKER = 0,
+  H_SEVERITY = 1,
+  H_MESSAGE = 2,
+  H_ACTION = 3,
+  H_REASON = 4;
 
 /**
  * Mirror of `internedStr()` in src/derive.ts — keep in sync.
@@ -334,24 +377,36 @@ export function helpView() {
   return {
     schema: SCHEMA,
     what: "rch fleet state for agents: which dev machines are offloading, which workers are healthy, what is broken, and the command that fixes each thing.",
-    start_here: "GET ?view=problems — every problem with severity, target, since, action and WHERE to run it (`on`). Empty problems[] with stale:false means the fleet is fine.",
+    start_here:
+      "GET ?view=problems — every problem with severity, target, since, action and WHERE to run it (`on`). Empty problems[] with stale:false means the fleet is fine.",
     auth: "Authorization: Bearer <passphrase> (or X-Fleet-Key header, or ?key=). The passphrase is the AES key; a wrong one is a 401.",
     params: {
       view: "summary (default: overview + problems + per-machine/worker rows) | problems (just problems + next_actions, cheapest poll) | full (+ hints, recent builds, worker detail, history) | diagnose (requires target: everything about ONE machine or worker) | help",
-      target: "a dev machine id or worker id. Filters summary/full/problems to that entity; required by diagnose. A box that is both (it dispatches AND takes builds) resolves to both halves; prefix `dev:` or `worker:` to pick one. Unknown id -> 404 listing the known ids.",
+      target:
+        "a dev machine id or worker id. Filters summary/full/problems to that entity; required by diagnose. A box that is both (it dispatches AND takes builds) resolves to both halves; prefix `dev:` or `worker:` to pick one. Unknown id -> 404 listing the known ids.",
       format: "toon (default, ~65% fewer characters) | json",
     },
-    freshness: "generated_at is when the snapshot was TAKEN; age_seconds is against the server clock; stale:true past 1h. The collector republishes on a schedule (see README); do not expect sub-minute data.",
+    freshness:
+      "generated_at is when the snapshot was TAKEN; age_seconds is against the server clock; stale:true past 1h. The collector republishes on a schedule (see README); do not expect sub-minute data.",
     reading_problems: {
-      severity: "critical = builds are (or will be) landing locally, or capacity is silently gone. warn = degraded but working.",
+      severity:
+        "critical = builds are (or will be) landing locally, or capacity is silently gone. warn = degraded but working.",
       kind: "dotted, stable — dev.* dev machine, worker.* worker, build.* hung build, fleet.* one root cause behind many symptoms, snapshot.* this feed",
       on: "where to run `action`: a dev machine id (ssh there, or you are there), `collector` (the box that publishes this dashboard), or empty when informational",
       since: "ISO time the daemon first raised the underlying alert, when known",
     },
-    next_actions: "problems folded into distinct commands, grouped by machine, most severe first. `fixes` lists the targets each command addresses.",
-    kinds: Object.entries(PROBLEM_KINDS).map(([kind, k]) => ({ kind, severity: k.severity, meaning: k.meaning, fix: k.fix })),
-    exit_codes_cli: "npm run llm: 0 ok | 2 no passphrase | 3 unreadable snapshot | 4 wrong passphrase | 5 unknown target",
-    http_status: "200 ok | 400 bad param (body says which) | 401 missing/wrong key | 404 unknown target (body lists known ids) | 405 not GET | 500 no snapshot",
+    next_actions:
+      "problems folded into distinct commands, grouped by machine, most severe first. `fixes` lists the targets each command addresses.",
+    kinds: Object.entries(PROBLEM_KINDS).map(([kind, k]) => ({
+      kind,
+      severity: k.severity,
+      meaning: k.meaning,
+      fix: k.fix,
+    })),
+    exit_codes_cli:
+      "npm run llm: 0 ok | 2 no passphrase | 3 unreadable snapshot | 4 wrong passphrase | 5 unknown target",
+    http_status:
+      "200 ok | 400 bad param (body says which) | 401 missing/wrong key | 404 unknown target (body lists known ids) | 405 not GET | 500 no snapshot",
   };
 }
 
@@ -365,9 +420,14 @@ function resolveTarget(snap, target) {
   let want = String(target).trim().toLowerCase();
   let only = null;
   const m = /^(dev|dev_machine|machine|worker):(.+)$/.exec(want);
-  if (m) { only = m[1] === "worker" ? "worker" : "dev_machine"; want = m[2].trim(); }
-  const dev = only === "worker" ? null : snap.dispatchers.find((d) => String(d.id).toLowerCase() === want);
-  const w = only === "dev_machine" ? null : snap.workers.find((x) => String(x.id).toLowerCase() === want);
+  if (m) {
+    only = m[1] === "worker" ? "worker" : "dev_machine";
+    want = m[2].trim();
+  }
+  const dev =
+    only === "worker" ? null : snap.dispatchers.find((d) => String(d.id).toLowerCase() === want);
+  const w =
+    only === "dev_machine" ? null : snap.workers.find((x) => String(x.id).toLowerCase() === want);
   if (dev && w) return { type: "both", id: dev.id, worker_id: w.id };
   if (dev) return { type: "dev_machine", id: dev.id };
   if (w) return { type: "worker", id: w.id };
@@ -415,7 +475,9 @@ export function buildLlmView(snap, opts = {}) {
   // direction for a monitoring feed.
   const snapshotMs = new Date(snap.generated_at).getTime();
   const timestampValid = Number.isFinite(snapshotMs);
-  const ageSeconds = timestampValid ? Math.round((now - snapshotMs) / 1000) : Number.POSITIVE_INFINITY;
+  const ageSeconds = timestampValid
+    ? Math.round((now - snapshotMs) / 1000)
+    : Number.POSITIVE_INFINITY;
   const workers = snap.workers.map((w) => ({ ...w, ...classifyWorker(w, snapshotMs) }));
   const devs = snap.dispatchers.map((d) => ({
     ...d,
@@ -436,12 +498,18 @@ export function buildLlmView(snap, opts = {}) {
   // Problems first: this is what an agent should act on. Derived by the SAME
   // module the browser uses, so the two surfaces cannot disagree.
   const derived = buildProblems({
-    workers, devs, snapshotValid: timestampValid, ageSeconds, staleAfter: STALE_CRIT_SECONDS,
+    workers,
+    devs,
+    snapshotValid: timestampValid,
+    ageSeconds,
+    staleAfter: STALE_CRIT_SECONDS,
   });
   let problems = derived.problems;
   let nextActions = derived.next_actions;
   if (target) {
-    problems = problems.filter((p) => problemTouches(p, target.id) || p.kind.startsWith("snapshot."));
+    problems = problems.filter(
+      (p) => problemTouches(p, target.id) || p.kind.startsWith("snapshot."),
+    );
     const keep = new Set(problems.map((p) => `${p.on} ${p.action}`));
     nextActions = nextActions.filter((a) => keep.has(`${a.on} ${a.run}`));
   }
@@ -491,8 +559,10 @@ export function buildLlmView(snap, opts = {}) {
     dev_remote_ready: t.dispatchers_remote_ready ?? 0,
     // Known-missing hooks and live unmanaged compiles: the two fleet-wide
     // numbers whose correct value is zero.
-    hooks_missing: t.dispatchers_hook_missing ?? devs.filter((d) => d.hook?.claude_code === false).length,
-    local_builds_running: t.local_builds_running ?? devs.reduce((n, d) => n + (d.shim?.local_builds_running ?? 0), 0),
+    hooks_missing:
+      t.dispatchers_hook_missing ?? devs.filter((d) => d.hook?.claude_code === false).length,
+    local_builds_running:
+      t.local_builds_running ?? devs.reduce((n, d) => n + (d.shim?.local_builds_running ?? 0), 0),
     builds_remote: t.builds_remote ?? 0,
     builds_local: t.builds_local ?? 0,
     offload_pct: buildsCounted > 0 ? r1(((t.builds_remote ?? 0) / buildsCounted) * 100) : null,
@@ -520,12 +590,23 @@ export function buildLlmView(snap, opts = {}) {
     local_builds: d.build_stats?.local ?? 0,
     // Compiler processes running outside rch RIGHT NOW (null = unknown).
     local_now: d.shim?.local_builds_running ?? null,
-    hook: d.hook ? (d.hook.claude_code === true ? "ok" : d.hook.claude_code === false ? "MISSING" : "?") : "",
+    hook: d.hook
+      ? d.hook.claude_code === true
+        ? "ok"
+        : d.hook.claude_code === false
+          ? "MISSING"
+          : "?"
+      : "",
     shim: d.shim
-      ? d.shim.installed === false ? "MISSING"
-        : d.shim.up_to_date === false ? "stale"
-        : d.shim.on_path === false ? "shadowed"
-        : d.shim.installed === true ? "ok" : "?"
+      ? d.shim.installed === false
+        ? "MISSING"
+        : d.shim.up_to_date === false
+          ? "stale"
+          : d.shim.on_path === false
+            ? "shadowed"
+            : d.shim.installed === true
+              ? "ok"
+              : "?"
       : "",
     doctor: d.doctor ? `${d.doctor.passed}/${d.doctor.total}` : "",
     // How this row was collected: `api` (rchd tailnet API, live) or `ssh`.
@@ -557,7 +638,11 @@ export function buildLlmView(snap, opts = {}) {
   const wantDev = target && target.type !== "worker";
   const wantWorker = target && target.type !== "dev_machine";
   const shownDevs = !target ? devs : wantDev ? devs.filter((d) => d.id === target.id) : [];
-  const shownWorkers = !target ? workers : wantWorker ? workers.filter((w) => w.id === (target.worker_id ?? target.id)) : [];
+  const shownWorkers = !target
+    ? workers
+    : wantWorker
+      ? workers.filter((w) => w.id === (target.worker_id ?? target.id))
+      : [];
   const cols = seenByColumns(snap);
   const colIndex = new Map(workers.map((w, i) => [w.id, i]));
 
@@ -573,43 +658,84 @@ export function buildLlmView(snap, opts = {}) {
       action: h.suggested_action ?? "",
     })),
     alerts: (d.alert_records ?? []).map((a) => ({
-      kind: a.kind ?? "", severity: a.severity ?? "", worker: a.worker_id ?? "",
-      since: a.first_seen ?? "", state: a.state ?? "", message: a.message ?? "",
+      kind: a.kind ?? "",
+      severity: a.severity ?? "",
+      worker: a.worker_id ?? "",
+      since: a.first_seen ?? "",
+      state: a.state ?? "",
+      message: a.message ?? "",
     })),
     issues: (d.issue_records ?? []).map((i) => ({
-      severity: i.severity ?? "", summary: i.summary ?? "", remediation: i.remediation ?? "",
+      severity: i.severity ?? "",
+      summary: i.summary ?? "",
+      remediation: i.remediation ?? "",
     })),
     active_builds: (d.active_records ?? []).map((b) => ({
-      id: b.id ?? "", project: b.project ?? "", worker: b.worker_id ?? "", phase: b.phase ?? "",
-      age_s: b.build_age_secs ?? null, heartbeat_age_s: b.heartbeat_age_secs ?? null,
-      progress_age_s: b.progress_age_secs ?? null, hook_alive: b.hook_alive ?? null,
-      hook_dead: isHookDead(b), stalled: isStalledBuild(b), slots: b.slots ?? null,
+      id: b.id ?? "",
+      project: b.project ?? "",
+      worker: b.worker_id ?? "",
+      phase: b.phase ?? "",
+      age_s: b.build_age_secs ?? null,
+      heartbeat_age_s: b.heartbeat_age_secs ?? null,
+      progress_age_s: b.progress_age_secs ?? null,
+      hook_alive: b.hook_alive ?? null,
+      hook_dead: isHookDead(b),
+      stalled: isStalledBuild(b),
+      slots: b.slots ?? null,
       command: b.command ?? "",
     })),
     queued_builds: (d.queued_records ?? []).map((q) => ({
-      id: q.id ?? "", project: q.project ?? "", position: q.position ?? null,
-      slots_needed: q.slots_needed ?? null, waiting: q.wait_time ?? "", command: q.command ?? "",
+      id: q.id ?? "",
+      project: q.project ?? "",
+      position: q.position ?? null,
+      slots_needed: q.slots_needed ?? null,
+      waiting: q.wait_time ?? "",
+      command: q.command ?? "",
     })),
-    hook: d.hook ? { claude_code: d.hook.claude_code, agents: (d.hook.agents ?? []).map(([a, i]) => `${a}:${i ? "installed" : "missing"}`).join("|") } : null,
+    hook: d.hook
+      ? {
+          claude_code: d.hook.claude_code,
+          agents: (d.hook.agents ?? [])
+            .map(([a, i]) => `${a}:${i ? "installed" : "missing"}`)
+            .join("|"),
+        }
+      : null,
     shim: d.shim ?? null,
     doctor: d.doctor
-      ? { ...d.doctor, failing: (d.doctor.failing ?? []).map((c) => ({ check: c[0] ?? "", status: c[1] ?? "", message: c[2] ?? "", fixable: c[3] === true })) }
+      ? {
+          ...d.doctor,
+          failing: (d.doctor.failing ?? []).map((c) => ({
+            check: c[0] ?? "",
+            status: c[1] ?? "",
+            message: c[2] ?? "",
+            fixable: c[3] === true,
+          })),
+        }
       : null,
     convergence: d.convergence
-      ? { ...d.convergence, workers: (d.convergence.workers ?? []).map((w) => ({ worker: w[0] ?? "", state: w[1] ?? "", missing_repos: w[2] ?? 0 })) }
+      ? {
+          ...d.convergence,
+          workers: (d.convergence.workers ?? []).map((w) => ({
+            worker: w[0] ?? "",
+            state: w[1] ?? "",
+            missing_repos: w[2] ?? 0,
+          })),
+        }
       : null,
     tests: d.tests ?? null,
     // The browser drawer renders every build the collector sends; this view
     // is context-budgeted and shows only the newest 10. Note that `classifyDev`
     // above still counts ALL of them — the offload verdict must be measured
     // over the whole window, not the slice an agent happens to be shown.
-    recent_builds: expandBuilds(d.builds, snap.strings).slice(-10).map((b) => ({
-      project: b.project ?? "",
-      location: b.location ?? "",
-      worker: b.worker_id ?? "",
-      ms: b.duration_ms ?? null,
-      exit: b.exit_code ?? null,
-    })),
+    recent_builds: expandBuilds(d.builds, snap.strings)
+      .slice(-10)
+      .map((b) => ({
+        project: b.project ?? "",
+        location: b.location ?? "",
+        worker: b.worker_id ?? "",
+        ms: b.duration_ms ?? null,
+        exit: b.exit_code ?? null,
+      })),
   });
   const workerDetail = (w) => {
     const i = colIndex.get(w.id);
@@ -647,7 +773,9 @@ export function buildLlmView(snap, opts = {}) {
       load_15: r1(w.caps?.load_avg_15),
       priority: w.priority ?? null,
       seen_by: seenBy.join("|"),
-      slots_by_dev: Object.entries(slotsBy).map(([k, v]) => `${k}=${v}`).join("|"),
+      slots_by_dev: Object.entries(slotsBy)
+        .map(([k, v]) => `${k}=${v}`)
+        .join("|"),
     };
   };
 
@@ -666,7 +794,12 @@ export function buildLlmView(snap, opts = {}) {
       if (Array.isArray(row)) {
         for (let i = 0; i < row.length && i < workers.length; i++) {
           if (!Array.isArray(row[i])) continue;
-          pool.push({ worker: workers[i].id, health: workers[i].health, used: row[i][0] ?? null, total: row[i][1] ?? null });
+          pool.push({
+            worker: workers[i].id,
+            health: workers[i].health,
+            used: row[i][0] ?? null,
+            total: row[i][1] ?? null,
+          });
         }
       }
       out.pool_as_seen_here = pool;
@@ -677,18 +810,50 @@ export function buildLlmView(snap, opts = {}) {
       // `detail` is the worker's when the target is only a worker; beside a
       // dev-machine half it is named so neither shadows the other.
       out[wantDev ? "worker_detail" : "detail"] = workerDetail(w);
-      out.hints_about = devs.flatMap((d) => (d.remediation_hints ?? [])
-        .filter((h) => h.worker_id === w.id)
-        .map((h) => ({ from: d.id, severity: h.severity ?? "", message: h.message ?? "", action: h.suggested_action ?? "" })));
-      out.alerts_about = devs.flatMap((d) => (d.alert_records ?? [])
-        .filter((a) => a.worker_id === w.id)
-        .map((a) => ({ from: d.id, kind: a.kind ?? "", since: a.first_seen ?? "", state: a.state ?? "", message: a.message ?? "" })));
-      out.builds_running_here = devs.flatMap((d) => (d.active_records ?? [])
-        .filter((b) => b.worker_id === w.id)
-        .map((b) => ({ from: d.id, id: b.id ?? "", project: b.project ?? "", age_s: b.build_age_secs ?? null, phase: b.phase ?? "" })));
-      out.recent_builds_here = devs.flatMap((d) => expandBuilds(d.builds, snap.strings)
-        .filter((b) => b.worker_id === w.id).slice(-5)
-        .map((b) => ({ from: d.id, project: b.project ?? "", ms: b.duration_ms ?? null, exit: b.exit_code ?? null, at: b.completed_at ?? "" })));
+      out.hints_about = devs.flatMap((d) =>
+        (d.remediation_hints ?? [])
+          .filter((h) => h.worker_id === w.id)
+          .map((h) => ({
+            from: d.id,
+            severity: h.severity ?? "",
+            message: h.message ?? "",
+            action: h.suggested_action ?? "",
+          })),
+      );
+      out.alerts_about = devs.flatMap((d) =>
+        (d.alert_records ?? [])
+          .filter((a) => a.worker_id === w.id)
+          .map((a) => ({
+            from: d.id,
+            kind: a.kind ?? "",
+            since: a.first_seen ?? "",
+            state: a.state ?? "",
+            message: a.message ?? "",
+          })),
+      );
+      out.builds_running_here = devs.flatMap((d) =>
+        (d.active_records ?? [])
+          .filter((b) => b.worker_id === w.id)
+          .map((b) => ({
+            from: d.id,
+            id: b.id ?? "",
+            project: b.project ?? "",
+            age_s: b.build_age_secs ?? null,
+            phase: b.phase ?? "",
+          })),
+      );
+      out.recent_builds_here = devs.flatMap((d) =>
+        expandBuilds(d.builds, snap.strings)
+          .filter((b) => b.worker_id === w.id)
+          .slice(-5)
+          .map((b) => ({
+            from: d.id,
+            project: b.project ?? "",
+            ms: b.duration_ms ?? null,
+            exit: b.exit_code ?? null,
+            at: b.completed_at ?? "",
+          })),
+      );
     }
     return out;
   }

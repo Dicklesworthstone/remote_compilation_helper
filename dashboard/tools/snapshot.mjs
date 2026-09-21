@@ -36,14 +36,14 @@
  */
 
 import { execFile } from "node:child_process";
-import { promisify } from "node:util";
 import { webcrypto as crypto } from "node:crypto";
-import { writeFile, mkdir, readFile, rename } from "node:fs/promises";
-import { dirname } from "node:path";
+import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { hostname } from "node:os";
+import { dirname } from "node:path";
 import { pathToFileURL } from "node:url";
+import { promisify } from "node:util";
 
-import { SNAPSHOT_COMPRESSION, compressPlaintext, decompressPlaintext } from "./envelope.mjs";
+import { compressPlaintext, decompressPlaintext, SNAPSHOT_COMPRESSION } from "./envelope.mjs";
 
 const execFileAsync = promisify(execFile);
 
@@ -97,7 +97,11 @@ function parseArgs(argv) {
       }
       return v;
     };
-    if (a === "--dispatchers") args.dispatchers = next().split(",").map((s) => s.trim()).filter(Boolean);
+    if (a === "--dispatchers")
+      args.dispatchers = next()
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean);
     else if (a === "--out") args.out = next();
     else if (a === "--label") args.label = next();
     else if (a === "--history-file") args.historyFile = next();
@@ -110,16 +114,14 @@ function parseArgs(argv) {
         process.exit(2);
       }
       args.historyMax = n;
-    }
-    else if (a === "--max-parallel") {
+    } else if (a === "--max-parallel") {
       const n = Number(next());
       if (!Number.isInteger(n) || n < 1) {
         console.error("--max-parallel must be a positive integer");
         process.exit(2);
       }
       args.maxParallel = n;
-    }
-    else if (a === "--api-token") args.apiToken = next();
+    } else if (a === "--api-token") args.apiToken = next();
     else if (a === "--selfcheck-max-age") {
       const n = Number(next());
       if (!Number.isInteger(n) || n < 0) {
@@ -127,8 +129,7 @@ function parseArgs(argv) {
         process.exit(2);
       }
       args.selfcheckMaxAge = n;
-    }
-    else if (a === "--selfcheck-cache") args.selfcheckCache = next();
+    } else if (a === "--selfcheck-cache") args.selfcheckCache = next();
     else if (a === "--help" || a === "-h") {
       console.log(
         "usage: RCH_DASH_PASSPHRASE=... node tools/snapshot.mjs\n" +
@@ -183,11 +184,22 @@ async function run(host, command) {
   const isLocal = isLocalDispatcher(host);
   try {
     const { stdout } = isLocal
-      ? await execFileAsync("bash", ["-lc", command], { timeout: SSH_TIMEOUT_MS, maxBuffer: MAX_BUFFER })
+      ? await execFileAsync("bash", ["-lc", command], {
+          timeout: SSH_TIMEOUT_MS,
+          maxBuffer: MAX_BUFFER,
+        })
       : await execFileAsync(
           "ssh",
-          ["-o", "BatchMode=yes", "-o", "ConnectTimeout=12",
-           "-o", "StrictHostKeyChecking=accept-new", host, command],
+          [
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=12",
+            "-o",
+            "StrictHostKeyChecking=accept-new",
+            host,
+            command,
+          ],
           { timeout: SSH_TIMEOUT_MS, maxBuffer: MAX_BUFFER },
         );
     return { ok: true, stdout };
@@ -210,14 +222,21 @@ async function run(host, command) {
  * script stripped.
  */
 export function describeExecError(err) {
-  const stderrLines = String(err?.stderr ?? "").split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  const stderrLines = String(err?.stderr ?? "")
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean);
   const last = stderrLines[stderrLines.length - 1];
   if (last) return last.slice(0, 200);
-  if (err?.killed || err?.signal) return `killed by ${err.signal ?? "timeout"} after ${SSH_TIMEOUT_MS / 1000}s`;
+  if (err?.killed || err?.signal)
+    return `killed by ${err.signal ?? "timeout"} after ${SSH_TIMEOUT_MS / 1000}s`;
   if (typeof err?.code === "number") return `exited ${err.code}`;
   const msg = String(err?.shortMessage || err?.message || err).split(/\r?\n/)[0];
   // "Command failed: ssh -o ... host d=$(mktemp" -> "Command failed: ssh host"
-  return msg.replace(/\s+d=\$\(mktemp[\s\S]*$/, "").replace(/-o \S+=\S+\s+/g, "").slice(0, 200);
+  return msg
+    .replace(/\s+d=\$\(mktemp[\s\S]*$/, "")
+    .replace(/-o \S+=\S+\s+/g, "")
+    .slice(0, 200);
 }
 
 // --------------------------------------------------------- the combined probe
@@ -317,8 +336,9 @@ export function buildProbeScript(nonce = PROBE_NONCE, sections = PROBE_SECTIONS)
     `if [ -n "$d" ]; then`,
     `trap 'rm -f ${files}; rmdir "$d" 2>/dev/null' EXIT`,
     ...sections.map((s, i) => `{ ${s.cmd}; } > "$d/${s.key}" & q${i}=$!`),
-    ...sections.map((s, i) =>
-      `wait $q${i}; e${i}=$?\ncat "$d/${s.key}"; echo; echo "${nonce}:${s.key}:$e${i}"`),
+    ...sections.map(
+      (s, i) => `wait $q${i}; e${i}=$?\ncat "$d/${s.key}"; echo; echo "${nonce}:${s.key}:$e${i}"`,
+    ),
     `else`,
     ...sections.map((s) => `( ${s.cmd} ); e=$?; echo; echo "${nonce}:${s.key}:$e"`),
     `fi`,
@@ -354,7 +374,10 @@ export function splitProbeSections(stdout, nonce = PROBE_NONCE) {
   let buf = [];
   for (const line of String(stdout ?? "").split("\n")) {
     const m = marker.exec(line);
-    if (!m) { buf.push(line); continue; }
+    if (!m) {
+      buf.push(line);
+      continue;
+    }
     if (!out.has(m[1])) out.set(m[1], { text: buf.join("\n"), rc: Number(m[2]) });
     buf = [];
   }
@@ -413,7 +436,10 @@ async function probeDispatcher(host) {
  */
 function parseRchJson(subcommand, res) {
   if (!res.stdout.trim()) {
-    return { data: null, error: res.error ? `${subcommand}: ${res.error}` : `${subcommand}: no output` };
+    return {
+      data: null,
+      error: res.error ? `${subcommand}: ${res.error}` : `${subcommand}: no output`,
+    };
   }
   let parsed;
   try {
@@ -421,10 +447,14 @@ function parseRchJson(subcommand, res) {
     const s = res.stdout;
     const start = s.indexOf("{");
     const end = s.lastIndexOf("}");
-    if (start === -1 || end <= start) return { data: null, error: `${subcommand}: no JSON object in output` };
+    if (start === -1 || end <= start)
+      return { data: null, error: `${subcommand}: no JSON object in output` };
     parsed = JSON.parse(s.slice(start, end + 1));
   } catch (err) {
-    return { data: null, error: `${subcommand}: unparseable JSON (${String(err?.message || err).slice(0, 120)})` };
+    return {
+      data: null,
+      error: `${subcommand}: unparseable JSON (${String(err?.message || err).slice(0, 120)})`,
+    };
   }
 
   // The API envelope reports failure in `success`, and omits `data` entirely
@@ -454,13 +484,17 @@ function parseMetrics(res) {
     out.error = `metrics: ${res.error || "no response from 127.0.0.1:9100"}`;
     return out;
   }
-  const sum = {}, count = {};
+  const sum = {},
+    count = {};
   for (const line of res.stdout.split("\n")) {
     if (!line || line[0] === "#") continue;
     let m;
-    if ((m = line.match(/^rch_worker_latency_ms_sum\{worker="([^"]+)"\}\s+(\S+)/))) sum[m[1]] = Number(m[2]);
-    else if ((m = line.match(/^rch_worker_latency_ms_count\{worker="([^"]+)"\}\s+(\S+)/))) count[m[1]] = Number(m[2]);
-    else if ((m = line.match(/^rch_worker_last_seen_timestamp\{worker="([^"]+)"\}\s+(\S+)/))) out.lastSeen[m[1]] = Number(m[2]);
+    if ((m = line.match(/^rch_worker_latency_ms_sum\{worker="([^"]+)"\}\s+(\S+)/)))
+      sum[m[1]] = Number(m[2]);
+    else if ((m = line.match(/^rch_worker_latency_ms_count\{worker="([^"]+)"\}\s+(\S+)/)))
+      count[m[1]] = Number(m[2]);
+    else if ((m = line.match(/^rch_worker_last_seen_timestamp\{worker="([^"]+)"\}\s+(\S+)/)))
+      out.lastSeen[m[1]] = Number(m[2]);
   }
   for (const id of Object.keys(sum)) if (count[id] > 0) out.latency[id] = sum[id] / count[id];
   return out;
@@ -480,24 +514,36 @@ function num(v) {
 // and lost every merge against a healthy observation.
 export function statusRank(s) {
   switch ((s ?? "").toLowerCase()) {
-    case "healthy": return 0;
-    case "busy": return 1;          // not emitted by rch, kept for tolerance
-    case "degraded": return 2;      // responding slowly, but still serving
-    case "draining": return 3;      // finishing current jobs
-    case "drained": return 4;       // idle and accepting nothing
-    case "disabled": return 5;
+    case "healthy":
+      return 0;
+    case "busy":
+      return 1; // not emitted by rch, kept for tolerance
+    case "degraded":
+      return 2; // responding slowly, but still serving
+    case "draining":
+      return 3; // finishing current jobs
+    case "drained":
+      return 4; // idle and accepting nothing
+    case "disabled":
+      return 5;
     case "unreachable":
-    case "down": return 6;
-    default: return s ? 1 : -1; // unknown label beats "no reading at all"
+    case "down":
+      return 6;
+    default:
+      return s ? 1 : -1; // unknown label beats "no reading at all"
   }
 }
 
 export function circuitRank(c) {
   switch ((c ?? "").toLowerCase()) {
-    case "closed": return 0;
-    case "half_open": return 1;
-    case "open": return 2;
-    default: return -1;
+    case "closed":
+      return 0;
+    case "half_open":
+      return 1;
+    case "open":
+      return 2;
+    default:
+      return -1;
   }
 }
 
@@ -595,7 +641,10 @@ async function fetchApi(base, path, token) {
     const text = await res.text();
     return { ok: res.ok, status: res.status, text };
   } catch (e) {
-    const reason = e?.name === "AbortError" ? `timed out after ${API_TIMEOUT_MS / 1000}s` : String(e?.cause?.message || e?.message || e);
+    const reason =
+      e?.name === "AbortError"
+        ? `timed out after ${API_TIMEOUT_MS / 1000}s`
+        : String(e?.cause?.message || e?.message || e);
     return { ok: false, status: 0, text: "", error: reason };
   } finally {
     clearTimeout(timer);
@@ -611,7 +660,9 @@ async function fetchApi(base, path, token) {
 export function postureFromDaemonStatus(full) {
   const d = full?.daemon ?? {};
   const workers = Array.isArray(full?.workers) ? full.workers : [];
-  const admissible = workers.filter((w) => w?.status === "healthy" && w?.pressure_state !== "critical").length;
+  const admissible = workers.filter(
+    (w) => w?.status === "healthy" && w?.pressure_state !== "critical",
+  ).length;
   const critical = workers.filter((w) => w?.pressure_state === "critical").length;
   const total = num(d.workers_total) ?? 0;
   const healthy = num(d.workers_healthy) ?? 0;
@@ -639,7 +690,12 @@ export function hintsFromIssues(issues) {
       const sev = String(i.severity ?? "").toLowerCase();
       return {
         worker_id: m ? m[1] : null,
-        severity: sev === "error" || sev === "critical" ? "critical" : sev === "warning" || sev === "warn" ? "warning" : "info",
+        severity:
+          sev === "error" || sev === "critical"
+            ? "critical"
+            : sev === "warning" || sev === "warn"
+              ? "warning"
+              : "info",
         message: i.summary ?? null,
         suggested_action: i.remediation ?? null,
         reason_code: "daemon_issue",
@@ -667,7 +723,11 @@ export function sectionsFromApi(r, selfChecks) {
   };
   const parsed = (key, res) => {
     if (res?.ok) {
-      try { return JSON.parse(res.text); } catch { /* fall through */ }
+      try {
+        return JSON.parse(res.text);
+      } catch {
+        /* fall through */
+      }
     }
     errors[key] = why(res);
     return null;
@@ -690,18 +750,27 @@ export function sectionsFromApi(r, selfChecks) {
   if (full) {
     const [posture, posture_description] = postureFromDaemonStatus(full);
     sections.set("s", {
-      text: JSON.stringify({ success: true, data: {
-        posture, posture_description, daemon: full,
-        convergence: conv,
-        remediation_hints: hintsFromIssues(full.issues),
-      } }),
+      text: JSON.stringify({
+        success: true,
+        data: {
+          posture,
+          posture_description,
+          daemon: full,
+          convergence: conv,
+          remediation_hints: hintsFromIssues(full.issues),
+        },
+      }),
       rc: 0,
     });
   }
   const caps = parsed("c", r.caps);
   if (caps) sections.set("c", { text: JSON.stringify({ success: true, data: caps }), rc: 0 });
   const cfg = parsed("l", r.config);
-  if (cfg) sections.set("l", { text: JSON.stringify({ success: true, data: { workers: cfg.workers ?? [] } }), rc: 0 });
+  if (cfg)
+    sections.set("l", {
+      text: JSON.stringify({ success: true, data: { workers: cfg.workers ?? [] } }),
+      rc: 0,
+    });
   if (r.metrics?.ok) sections.set("m", { text: r.metrics.text, rc: 0 });
   else errors.m = why(r.metrics);
   for (const key of ["d", "h", "k"]) {
@@ -721,7 +790,11 @@ async function selfChecksFor(host, opts) {
   const cache = opts?.cache ?? {};
   const maxAgeMs = (opts?.selfcheckMaxAge ?? 900) * 1000;
   const entry = cache[host];
-  if (entry && Number.isFinite(Date.parse(entry.at)) && Date.now() - Date.parse(entry.at) < maxAgeMs) {
+  if (
+    entry &&
+    Number.isFinite(Date.parse(entry.at)) &&
+    Date.now() - Date.parse(entry.at) < maxAgeMs
+  ) {
     return entry;
   }
   const res = await run(host, SELFCHECK_SCRIPT);
@@ -759,11 +832,17 @@ async function collectDispatcher(spec, opts = {}) {
   // dark or showing a machine as unreachable that ssh can still see.
   let statusBody = null;
   if (status.ok) {
-    try { statusBody = JSON.parse(status.text); } catch { statusBody = null; }
+    try {
+      statusBody = JSON.parse(status.text);
+    } catch {
+      statusBody = null;
+    }
   }
   if (!statusBody || typeof statusBody !== "object" || !statusBody.daemon) {
     const reason = !status.ok
-      ? (status.status ? `HTTP ${status.status}` : status.error ?? "no response")
+      ? status.status
+        ? `HTTP ${status.status}`
+        : (status.error ?? "no response")
       : "200 but not a daemon status body";
     const d = dispatcherFromProbe(host, await probeDispatcher(host));
     d.transport = "ssh";
@@ -815,8 +894,13 @@ export function dispatcherFromProbe(host, probe) {
   // an `rch` too old to know `shim status` must show up as "shim state
   // unknown", never as "shim fine".
   const collectionErrors = [
-    statusRes.error, capsRes.error, listRes.error, metrics.error,
-    doctorRes.error, shimRes.error, hookRes.error,
+    statusRes.error,
+    capsRes.error,
+    listRes.error,
+    metrics.error,
+    doctorRes.error,
+    shimRes.error,
+    hookRes.error,
   ].filter(Boolean);
   const reachable = Boolean(status);
   // `workers list` failing silently blanks every tag and priority; say so
@@ -846,10 +930,12 @@ export function dispatcherFromProbe(host, probe) {
       recovery_in_secs: num(w.recovery_in_secs),
       // rch's own admission-bypass record: a stable `RCH-Innn` reason for why
       // this worker is being skipped, when the daemon has one.
-      bypass: w.bypass && typeof w.bypass === "object"
-        ? [w.bypass.reason_code ?? w.bypass.failure_class ?? null, w.bypass.host ?? null]
-            .filter(Boolean).join(" ") || null
-        : null,
+      bypass:
+        w.bypass && typeof w.bypass === "object"
+          ? [w.bypass.reason_code ?? w.bypass.failure_class ?? null, w.bypass.host ?? null]
+              .filter(Boolean)
+              .join(" ") || null
+          : null,
       // failure_history is oldest-first booleans; keep it for the sparkline.
       failure_history: Array.isArray(w.failure_history) ? w.failure_history.slice(-20) : [],
       pressure: {
@@ -892,14 +978,15 @@ export function dispatcherFromProbe(host, probe) {
   const str = (v, max = 240) => (typeof v === "string" ? v.slice(0, max) : null);
   // Only real records: an older daemon (and one test fixture) puts bare
   // numbers in these arrays, and a row of fourteen nulls is not an alert.
-  const objs = (arr, max) => (Array.isArray(arr) ? arr : []).filter((x) => x && typeof x === "object").slice(0, max);
+  const objs = (arr, max) =>
+    (Array.isArray(arr) ? arr : []).filter((x) => x && typeof x === "object").slice(0, max);
   // Positional, not named — see `builds` in the returned object below. Field
   // order is the contract: project, command, location, worker, duration,
   // exit code, completed_at. `src/derive.ts` and `tools/llm-view.mjs` expand it.
   const recent = (status?.daemon?.recent_builds ?? []).slice(-25).map((b) => [
     b.project_id ?? null,
     str(b.command, 120),
-    b.location ?? null,                    // "Remote" | "Local"
+    b.location ?? null, // "Remote" | "Local"
     b.worker_id ?? null,
     num(b.duration_ms),
     num(b.exit_code),
@@ -914,21 +1001,34 @@ export function dispatcherFromProbe(host, probe) {
   const hints = [...(status?.remediation_hints ?? [])]
     .sort((a, b) => hintRank(a) - hintRank(b))
     .slice(0, 12)
-    .map((h) => [h.worker_id ?? null, h.severity ?? null, str(h.message), str(h.suggested_action), h.reason_code ?? null]);
+    .map((h) => [
+      h.worker_id ?? null,
+      h.severity ?? null,
+      str(h.message),
+      str(h.suggested_action),
+      h.reason_code ?? null,
+    ]);
 
   // `daemon.alerts[]`: rch's own alert lifecycle — kind, when it FIRST fired,
   // whether it is still active. This is what lets a worker problem say
   // "offline since 18:39" instead of just "offline". Tuples:
   //   [kind, severity, worker_id, message, first_seen, last_seen, state]
   const alerts = objs(status?.daemon?.alerts, 20).map((a) => [
-    a.kind ?? null, a.severity ?? null, a.worker_id ?? null, str(a.message, 200),
-    a.first_seen ?? a.created_at ?? null, a.last_seen ?? null, a.state ?? null,
+    a.kind ?? null,
+    a.severity ?? null,
+    a.worker_id ?? null,
+    str(a.message, 200),
+    a.first_seen ?? a.created_at ?? null,
+    a.last_seen ?? null,
+    a.state ?? null,
   ]);
 
   // `daemon.issues[]`: the daemon's own diagnosis WITH the command it wants run
   // (`remediation`). Tuples: [severity, summary, remediation]
   const issues = objs(status?.daemon?.issues, 20).map((i) => [
-    i.severity ?? null, str(i.summary, 200), str(i.remediation, 200),
+    i.severity ?? null,
+    str(i.summary, 200),
+    str(i.remediation, 200),
   ]);
 
   // Active builds with the daemon's stall detectors. A count alone hid every
@@ -955,8 +1055,12 @@ export function dispatcherFromProbe(host, probe) {
 
   // Queued builds: [id, project, command, position, slots_needed, wait_time]
   const queued = objs(status?.daemon?.queued_builds, 40).map((q) => [
-    q.id != null ? String(q.id) : null, q.project_id ?? null, str(q.command, 120),
-    num(q.position), num(q.slots_needed), str(q.wait_time, 40),
+    q.id != null ? String(q.id) : null,
+    q.project_id ?? null,
+    str(q.command, 120),
+    num(q.position),
+    num(q.slots_needed),
+    str(q.wait_time, 40),
   ]);
 
   // Repo convergence: which workers are missing repos this box's builds need.
@@ -1019,22 +1123,37 @@ export function dispatcherFromProbe(host, probe) {
         claude_code: (() => {
           // "ClaudeCode" today; tolerate "Claude Code" / "claude-code" if the
           // label ever changes, since a miss here reads as "unknown", not "fine".
-          const a = hookAgents.find((x) => String(x.agent ?? "").toLowerCase().replace(/[^a-z]/g, "") === "claudecode");
+          const a = hookAgents.find(
+            (x) =>
+              String(x.agent ?? "")
+                .toLowerCase()
+                .replace(/[^a-z]/g, "") === "claudecode",
+          );
           return a ? /^installed$/i.test(String(a.status ?? "")) : null;
         })(),
         // Every agent rch knows about: [agent, installed]
-        agents: hookAgents.map((a) => [a.agent ?? null, /^installed$/i.test(String(a.status ?? ""))]),
+        agents: hookAgents.map((a) => [
+          a.agent ?? null,
+          /^installed$/i.test(String(a.status ?? "")),
+        ]),
       }
     : null;
 
   const ts = status?.daemon?.test_stats ?? null;
   const reportedTestScope = ts?.scope;
   let testScope = { source: "unknown" };
-  if (reportedTestScope && typeof reportedTestScope === "object" && !Array.isArray(reportedTestScope)) {
+  if (
+    reportedTestScope &&
+    typeof reportedTestScope === "object" &&
+    !Array.isArray(reportedTestScope)
+  ) {
     if (reportedTestScope.source === "stored_history") {
       testScope = { source: "stored_history" };
-    } else if (reportedTestScope.source === "recent_memory" &&
-               Number.isSafeInteger(reportedTestScope.max_records) && reportedTestScope.max_records >= 0) {
+    } else if (
+      reportedTestScope.source === "recent_memory" &&
+      Number.isSafeInteger(reportedTestScope.max_records) &&
+      reportedTestScope.max_records >= 0
+    ) {
       testScope = { source: "recent_memory", max_records: reportedTestScope.max_records };
     }
   }
@@ -1186,22 +1305,26 @@ export function mergeWorkers(dispatchers) {
       }
       // Seen by ANY dispatcher recently means it is not stale, so keep the most
       // recent sighting rather than the first one reported.
-      if ((w.last_seen_unix ?? 0) > (prev.last_seen_unix ?? 0)) prev.last_seen_unix = w.last_seen_unix;
+      if ((w.last_seen_unix ?? 0) > (prev.last_seen_unix ?? 0))
+        prev.last_seen_unix = w.last_seen_unix;
 
       for (const k of ["speed", "latency_ms", "last_error", "priority", "bypass"]) {
         if (prev[k] == null && w[k] != null) prev[k] = w[k];
       }
       // Longest wait wins: "comes back in 4 minutes" is the pessimistic answer.
-      if ((w.recovery_in_secs ?? -1) > (prev.recovery_in_secs ?? -1)) prev.recovery_in_secs = w.recovery_in_secs;
+      if ((w.recovery_in_secs ?? -1) > (prev.recovery_in_secs ?? -1))
+        prev.recovery_in_secs = w.recovery_in_secs;
       if ((prev.tags?.length ?? 0) === 0 && w.tags?.length) prev.tags = [...w.tags];
-      for (const k of Object.keys(w.caps)) if (prev.caps[k] == null && w.caps[k] != null) prev.caps[k] = w.caps[k];
+      for (const k of Object.keys(w.caps))
+        if (prev.caps[k] == null && w.caps[k] != null) prev.caps[k] = w.caps[k];
 
       // Take the pressure block WHOLE from the freshest observer. Merging it
       // field by field could pair disk_free_gb from one dispatcher with
       // disk_total_gb from another and compute a nonsense percentage.
       if (pressureIsBetter(w.pressure, prev.pressure)) prev.pressure = { ...w.pressure };
 
-      if (!prev.failure_history.length && w.failure_history.length) prev.failure_history = [...w.failure_history];
+      if (!prev.failure_history.length && w.failure_history.length)
+        prev.failure_history = [...w.failure_history];
     }
   }
   return [...merged.values()].sort((a, b) => a.id.localeCompare(b.id));
@@ -1222,7 +1345,10 @@ export function computeTotals(workers, dispatchers) {
   // denominator and nothing to the numerator, inflating fleet "disk used %"
   // with a number no single worker ever reported.
   const diskWorkers = workers.filter(
-    (w) => w.pressure.disk_free_gb != null && w.pressure.disk_total_gb != null && w.pressure.disk_total_gb > 0,
+    (w) =>
+      w.pressure.disk_free_gb != null &&
+      w.pressure.disk_total_gb != null &&
+      w.pressure.disk_total_gb > 0,
   );
 
   return {
@@ -1230,7 +1356,10 @@ export function computeTotals(workers, dispatchers) {
     slots: workers.reduce((n, w) => n + (w.total_slots ?? 0), 0),
     // Per-observer occupancy (each rchd derates and reserves independently), so
     // this is the worst single observation, never more than capacity.
-    slots_used: workers.reduce((n, w) => n + Math.min(w.used_slots ?? 0, w.total_slots ?? Infinity), 0),
+    slots_used: workers.reduce(
+      (n, w) => n + Math.min(w.used_slots ?? 0, w.total_slots ?? Infinity),
+      0,
+    ),
     cores: workers.reduce((n, w) => n + (w.caps.num_cpus ?? 0), 0),
     disk_free_gb: diskWorkers.reduce((n, w) => n + w.pressure.disk_free_gb, 0),
     disk_total_gb: diskWorkers.reduce((n, w) => n + w.pressure.disk_total_gb, 0),
@@ -1358,8 +1487,8 @@ export function projectDispatchers(dispatchers, workers) {
  * key material, so an old bundle reading a new snapshot renders a small integer
  * for at most one refresh interval and every VERDICT stays correct.
  */
-const INTERNED_BUILD_SLOTS = [0, 1, 3];        // project, command, worker_id
-const INTERNED_HINT_SLOTS = [0, 2, 3, 4];      // worker_id, message, suggested_action, reason_code
+const INTERNED_BUILD_SLOTS = [0, 1, 3]; // project, command, worker_id
+const INTERNED_HINT_SLOTS = [0, 2, 3, 4]; // worker_id, message, suggested_action, reason_code
 
 /**
  * Replace repeated tuple strings with indices into ONE snapshot-level table.
@@ -1499,7 +1628,9 @@ export async function encrypt(plaintext, passphrase, reusableSalt = null) {
   const enc = new TextEncoder();
   const salt = reusableSalt ?? crypto.getRandomValues(new Uint8Array(16));
   const iv = crypto.getRandomValues(new Uint8Array(12));
-  const baseKey = await crypto.subtle.importKey("raw", enc.encode(passphrase), "PBKDF2", false, ["deriveKey"]);
+  const baseKey = await crypto.subtle.importKey("raw", enc.encode(passphrase), "PBKDF2", false, [
+    "deriveKey",
+  ]);
   const key = await crypto.subtle.deriveKey(
     { name: "PBKDF2", salt, iterations: PBKDF2_ITERATIONS, hash: "SHA-256" },
     baseKey,
@@ -1514,7 +1645,11 @@ export async function encrypt(plaintext, passphrase, reusableSalt = null) {
     // this module.
     ["encrypt", "decrypt"],
   );
-  const ct = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, compressPlaintext(plaintext));
+  const ct = await crypto.subtle.encrypt(
+    { name: "AES-GCM", iv },
+    key,
+    compressPlaintext(plaintext),
+  );
   const b64 = (u8) => Buffer.from(u8).toString("base64");
   const envelope = {
     format: "rch.dashboard.enc.v1",
@@ -1524,7 +1659,11 @@ export async function encrypt(plaintext, passphrase, reusableSalt = null) {
     ciphertext: b64(new Uint8Array(ct)),
   };
   derivedEncryptionKeys.set(envelope, {
-    key, passphrase, salt, iterations: PBKDF2_ITERATIONS, hash: "SHA-256",
+    key,
+    passphrase,
+    salt,
+    iterations: PBKDF2_ITERATIONS,
+    hash: "SHA-256",
   });
   return envelope;
 }
@@ -1566,10 +1705,19 @@ async function roundTripKey(envelope, passphrase, b) {
     return memo.key;
   }
   const baseKey = await crypto.subtle.importKey(
-    "raw", new TextEncoder().encode(passphrase), "PBKDF2", false, ["deriveKey"],
+    "raw",
+    new TextEncoder().encode(passphrase),
+    "PBKDF2",
+    false,
+    ["deriveKey"],
   );
   return crypto.subtle.deriveKey(
-    { name: "PBKDF2", salt: b(envelope.kdf.salt), iterations: envelope.kdf.iterations, hash: envelope.kdf.hash },
+    {
+      name: "PBKDF2",
+      salt: b(envelope.kdf.salt),
+      iterations: envelope.kdf.iterations,
+      hash: envelope.kdf.hash,
+    },
     baseKey,
     { name: "AES-GCM", length: 256 },
     false,
@@ -1629,7 +1777,9 @@ async function main() {
         ? "RCH_DASH_PASSPHRASE is only whitespace. Refusing to write an unencrypted snapshot."
         : "RCH_DASH_PASSPHRASE is not set. Refusing to write an unencrypted snapshot.",
     );
-    console.error("This repository is PUBLIC — fleet hosts and IPs must never be committed in clear text.");
+    console.error(
+      "This repository is PUBLIC — fleet hosts and IPs must never be committed in clear text.",
+    );
     process.exit(2);
   }
   if (passphrase !== rawPassphrase) {
@@ -1652,7 +1802,10 @@ async function main() {
   for (const spec of args.dispatchers) {
     const id = dispatcherId(parseDispatcherSpec(spec).host);
     if (!seenHosts.has(id)) seenHosts.set(id, spec);
-    else console.error(`  note: "${spec}" is the same machine as "${seenHosts.get(id)}" — collecting once`);
+    else
+      console.error(
+        `  note: "${spec}" is the same machine as "${seenHosts.get(id)}" — collecting once`,
+      );
   }
   const targets = [...seenHosts.values()];
 
@@ -1673,7 +1826,9 @@ async function main() {
   }
   const viaApi = targets.filter((t) => parseDispatcherSpec(t).api).length;
   if (viaApi > 0 && !opts.apiToken) {
-    console.error("  note: dispatchers name an rchd API but no token is set (--api-token / RCH_DASH_API_TOKEN); expect 401s and ssh fallback unless [api] no_token is on");
+    console.error(
+      "  note: dispatchers name an rchd API but no token is set (--api-token / RCH_DASH_API_TOKEN); expect 401s and ssh fallback unless [api] no_token is on",
+    );
   }
 
   console.error(
@@ -1702,12 +1857,30 @@ async function main() {
     // dropping it, so a box that stops responding cannot quietly vanish from
     // the fleet count.
     return {
-      id: dispatcherId(host), reachable: false, collection_errors: [reason], config_degraded: true,
+      id: dispatcherId(host),
+      reachable: false,
+      collection_errors: [reason],
+      config_degraded: true,
       transport: parseDispatcherSpec(targets[i]).api ? "api" : "ssh",
-      posture: null, posture_description: null, daemon: null, build_stats: null,
-      saved_time_ms: null, active_builds: 0, queued_builds: 0,
-      builds: [], hints: [], alerts: [], issues: [], active: [], queued: [],
-      convergence: null, doctor: null, shim: null, hook: null, tests: null, workers: [],
+      posture: null,
+      posture_description: null,
+      daemon: null,
+      build_stats: null,
+      saved_time_ms: null,
+      active_builds: 0,
+      queued_builds: 0,
+      builds: [],
+      hints: [],
+      alerts: [],
+      issues: [],
+      active: [],
+      queued: [],
+      convergence: null,
+      doctor: null,
+      shim: null,
+      hook: null,
+      tests: null,
+      workers: [],
     };
   });
 
@@ -1723,7 +1896,9 @@ async function main() {
   }
 
   if (!dispatchers.some((d) => d.reachable)) {
-    console.error("no dispatcher responded — refusing to publish an all-zero snapshot over good data");
+    console.error(
+      "no dispatcher responded — refusing to publish an all-zero snapshot over good data",
+    );
     process.exit(1);
   }
 
@@ -1773,8 +1948,14 @@ async function main() {
   const { dispatchers: internedDispatchers, strings } = internSnapshotStrings(emittedDispatchers);
 
   const snapshot = {
-    schema: SCHEMA, label: args.label, generated_at, totals,
-    dispatchers: internedDispatchers, workers, strings, history,
+    schema: SCHEMA,
+    label: args.label,
+    generated_at,
+    totals,
+    dispatchers: internedDispatchers,
+    workers,
+    strings,
+    history,
   };
 
   const plain = JSON.stringify(snapshot);

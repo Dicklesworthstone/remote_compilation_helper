@@ -143,7 +143,7 @@
  * asserted here.
  */
 
-import { gzipSync, gunzipSync } from "node:zlib";
+import { gunzipSync, gzipSync } from "node:zlib";
 
 /** What the collector writes into `envelope.compression`. */
 export const SNAPSHOT_COMPRESSION = "gzip";

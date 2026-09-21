@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+
 /**
  * Print the fleet state as TOON (default) or JSON, for an LLM/agent to read.
  *
@@ -25,23 +26,32 @@
  *   2 no passphrase · 3 unreadable snapshot · 4 wrong passphrase · 5 unknown target
  */
 
-import { readFile } from "node:fs/promises";
-import { webcrypto as crypto } from "node:crypto";
 import { execFile } from "node:child_process";
-import { promisify } from "node:util";
+import { webcrypto as crypto } from "node:crypto";
+import { readFile } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
-import { buildLlmView, encodeView, helpView, UnknownTarget, VIEWS, FORMATS } from "./llm-view.mjs";
+import { promisify } from "node:util";
 import { decompressPlaintext, isSupportedCompression } from "./envelope.mjs";
+import { buildLlmView, encodeView, FORMATS, helpView, UnknownTarget, VIEWS } from "./llm-view.mjs";
 
 const execFileAsync = promisify(execFile);
 
 function parseArgs(argv) {
-  const a = { format: "toon", view: "summary", target: null, in: "public/data/fleet.enc.json", url: null };
+  const a = {
+    format: "toon",
+    view: "summary",
+    target: null,
+    in: "public/data/fleet.enc.json",
+    url: null,
+  };
   for (let i = 2; i < argv.length; i++) {
     const k = argv[i];
     const next = () => {
       const v = argv[++i];
-      if (v === undefined) { console.error(`${k} requires a value`); process.exit(2); }
+      if (v === undefined) {
+        console.error(`${k} requires a value`);
+        process.exit(2);
+      }
       return v;
     };
     if (k === "--format" || k === "-F") a.format = next();
@@ -58,12 +68,23 @@ function parseArgs(argv) {
           "  --view help prints the full contract (problem kinds, columns, exit codes) and needs no passphrase.",
       );
       process.exit(0);
-    } else { console.error(`unknown argument: ${k} (try --help)`); process.exit(2); }
+    } else {
+      console.error(`unknown argument: ${k} (try --help)`);
+      process.exit(2);
+    }
   }
-  if (!FORMATS.includes(a.format)) { console.error(`--format must be one of ${FORMATS.join("|")}`); process.exit(2); }
-  if (!VIEWS.includes(a.view)) { console.error(`--view must be one of ${VIEWS.join("|")}`); process.exit(2); }
+  if (!FORMATS.includes(a.format)) {
+    console.error(`--format must be one of ${FORMATS.join("|")}`);
+    process.exit(2);
+  }
+  if (!VIEWS.includes(a.view)) {
+    console.error(`--view must be one of ${VIEWS.join("|")}`);
+    process.exit(2);
+  }
   if (a.view === "diagnose" && !a.target) {
-    console.error("--view diagnose needs --target <dev machine id | worker id>; --view summary lists the ids");
+    console.error(
+      "--view diagnose needs --target <dev machine id | worker id>; --view summary lists the ids",
+    );
     process.exit(2);
   }
   return a;
@@ -90,7 +111,9 @@ async function resolvePassphrase() {
     // unquoted value with a trailing space arrives with it attached.
     const fromFile = m?.[1]?.trim();
     if (fromFile) return fromFile;
-  } catch { /* no .env — fall through to Vault */ }
+  } catch {
+    /* no .env — fall through to Vault */
+  }
   try {
     const { stdout } = await execFileAsync(
       "vault",
@@ -105,7 +128,9 @@ async function resolvePassphrase() {
       },
     );
     if (stdout.trim()) return stdout.trim();
-  } catch { /* no vault */ }
+  } catch {
+    /* no vault */
+  }
   return null;
 }
 
@@ -125,14 +150,28 @@ function b64ToBuf(b64) {
  */
 export async function decryptToBytes(env, passphrase) {
   const baseKey = await crypto.subtle.importKey(
-    "raw", new TextEncoder().encode(passphrase), "PBKDF2", false, ["deriveKey"],
+    "raw",
+    new TextEncoder().encode(passphrase),
+    "PBKDF2",
+    false,
+    ["deriveKey"],
   );
   const key = await crypto.subtle.deriveKey(
-    { name: "PBKDF2", salt: b64ToBuf(env.kdf.salt), iterations: env.kdf.iterations, hash: env.kdf.hash },
-    baseKey, { name: "AES-GCM", length: 256 }, false, ["decrypt"],
+    {
+      name: "PBKDF2",
+      salt: b64ToBuf(env.kdf.salt),
+      iterations: env.kdf.iterations,
+      hash: env.kdf.hash,
+    },
+    baseKey,
+    { name: "AES-GCM", length: 256 },
+    false,
+    ["decrypt"],
   );
   return crypto.subtle.decrypt(
-    { name: "AES-GCM", iv: b64ToBuf(env.cipher.iv) }, key, b64ToBuf(env.ciphertext),
+    { name: "AES-GCM", iv: b64ToBuf(env.cipher.iv) },
+    key,
+    b64ToBuf(env.ciphertext),
   );
 }
 
@@ -176,12 +215,17 @@ async function main() {
     console.error(`cannot read snapshot: ${e.message}`);
     process.exit(3);
   }
-  if (!envelope?.ciphertext) { console.error("not an encrypted snapshot envelope"); process.exit(3); }
+  if (!envelope?.ciphertext) {
+    console.error("not an encrypted snapshot envelope");
+    process.exit(3);
+  }
   // Skew guard: a codec this build cannot inflate is an unreadable snapshot
   // (exit 3), not a bad passphrase (exit 4). Checked before the 600k-iteration
   // derivation so the wrong answer is never even computed.
   if (!isSupportedCompression(envelope.compression)) {
-    console.error(`cannot read snapshot: unsupported compression ${String(envelope.compression)} — update this tool`);
+    console.error(
+      `cannot read snapshot: unsupported compression ${String(envelope.compression)} — update this tool`,
+    );
     process.exit(3);
   }
 
@@ -197,7 +241,9 @@ async function main() {
   try {
     snap = JSON.parse(decompressPlaintext(Buffer.from(plain), envelope.compression));
   } catch (e) {
-    console.error(`cannot read snapshot: decrypted but could not decode — ${e?.message ?? "unknown error"}`);
+    console.error(
+      `cannot read snapshot: decrypted but could not decode — ${e?.message ?? "unknown error"}`,
+    );
     process.exit(3);
   }
 
@@ -228,5 +274,8 @@ const invokedDirectly =
   process.argv[1] != null && import.meta.url === pathToFileURL(process.argv[1]).href;
 
 if (invokedDirectly) {
-  main().catch((e) => { console.error(e?.message ?? String(e)); process.exit(1); });
+  main().catch((e) => {
+    console.error(e?.message ?? String(e));
+    process.exit(1);
+  });
 }

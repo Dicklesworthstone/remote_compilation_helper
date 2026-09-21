@@ -40,14 +40,20 @@
  * gate (e.g. Vercel Deployment Protection) in front of it.
  */
 
-import { webcrypto as crypto, createHmac, randomBytes } from "node:crypto";
-import {
-  buildLlmView, encodeView, contentType, helpView, UnknownTarget, VIEWS, FORMATS,
-} from "../tools/llm-view.mjs";
-import { decompressPlaintext, isSupportedCompression } from "../tools/envelope.mjs";
+import { createHmac, webcrypto as crypto, randomBytes } from "node:crypto";
 // The snapshot baked into this deployment: the fallback, and the only source
 // when no live URL is configured. Bundled so the function needs no filesystem.
 import bundledEnvelope from "../public/data/fleet.enc.json" with { type: "json" };
+import { decompressPlaintext, isSupportedCompression } from "../tools/envelope.mjs";
+import {
+  buildLlmView,
+  contentType,
+  encodeView,
+  FORMATS,
+  helpView,
+  UnknownTarget,
+  VIEWS,
+} from "../tools/llm-view.mjs";
 
 /* ─── Live snapshot ────────────────────────────────────────────────────────
  *
@@ -86,7 +92,9 @@ async function currentEnvelope() {
     return {
       envelope: bundledEnvelope,
       source: "bundled-fallback",
-      reason: String(e?.name === "AbortError" ? `timed out after ${LIVE_TIMEOUT_MS / 1000}s` : e?.message ?? e),
+      reason: String(
+        e?.name === "AbortError" ? `timed out after ${LIVE_TIMEOUT_MS / 1000}s` : (e?.message ?? e),
+      ),
     };
   } finally {
     clearTimeout(timer);
@@ -187,11 +195,23 @@ function cachePut(index, key, now) {
 
 async function deriveKey(env, passphrase) {
   const baseKey = await crypto.subtle.importKey(
-    "raw", new TextEncoder().encode(passphrase), "PBKDF2", false, ["deriveKey"],
+    "raw",
+    new TextEncoder().encode(passphrase),
+    "PBKDF2",
+    false,
+    ["deriveKey"],
   );
   return crypto.subtle.deriveKey(
-    { name: "PBKDF2", salt: b64ToBuf(env.kdf.salt), iterations: env.kdf.iterations, hash: env.kdf.hash },
-    baseKey, { name: "AES-GCM", length: 256 }, false, ["decrypt"],
+    {
+      name: "PBKDF2",
+      salt: b64ToBuf(env.kdf.salt),
+      iterations: env.kdf.iterations,
+      hash: env.kdf.hash,
+    },
+    baseKey,
+    { name: "AES-GCM", length: 256 },
+    false,
+    ["decrypt"],
   );
 }
 
@@ -209,9 +229,12 @@ async function deriveKey(env, passphrase) {
 async function decryptToBytes(env, passphrase) {
   const now = Date.now();
   const index = cacheIndex(env, passphrase);
-  const open = (key) => crypto.subtle.decrypt(
-    { name: "AES-GCM", iv: b64ToBuf(env.cipher.iv) }, key, b64ToBuf(env.ciphertext),
-  );
+  const open = (key) =>
+    crypto.subtle.decrypt(
+      { name: "AES-GCM", iv: b64ToBuf(env.cipher.iv) },
+      key,
+      b64ToBuf(env.ciphertext),
+    );
 
   const cached = cacheGet(index, now);
   if (cached) {
@@ -315,14 +338,18 @@ export default async function handler(req, res) {
   }
   if (view === "diagnose" && !target) {
     res.statusCode = 400;
-    return res.end("400 view=diagnose needs target=<dev machine id | worker id>; ?view=summary lists the ids\n");
+    return res.end(
+      "400 view=diagnose needs target=<dev machine id | worker id>; ?view=summary lists the ids\n",
+    );
   }
 
   const key = extractKey(req, url);
   if (!key) {
     res.statusCode = 401;
     res.setHeader("WWW-Authenticate", 'Bearer realm="rch-fleet"');
-    return res.end("401 supply the fleet passphrase via Authorization: Bearer <passphrase>; ?view=help needs no key\n");
+    return res.end(
+      "401 supply the fleet passphrase via Authorization: Bearer <passphrase>; ?view=help needs no key\n",
+    );
   }
 
   const { envelope, source, reason } = await currentEnvelope();
@@ -338,7 +365,9 @@ export default async function handler(req, res) {
   // is both honest and cheap.
   if (!isSupportedCompression(envelope.compression)) {
     res.statusCode = 500;
-    return res.end(`500 snapshot uses an unsupported compression: ${String(envelope.compression)}\n`);
+    return res.end(
+      `500 snapshot uses an unsupported compression: ${String(envelope.compression)}\n`,
+    );
   }
 
   let plain;
@@ -355,7 +384,9 @@ export default async function handler(req, res) {
   } catch (e) {
     // Authenticated, so the bytes are genuinely ours — they just did not decode.
     res.statusCode = 500;
-    return res.end(`500 snapshot decrypted but could not be decoded: ${e?.message ?? "unknown error"}\n`);
+    return res.end(
+      `500 snapshot decrypted but could not be decoded: ${e?.message ?? "unknown error"}\n`,
+    );
   }
 
   let viewObj;
@@ -368,7 +399,7 @@ export default async function handler(req, res) {
       res.statusCode = 404;
       return res.end(
         `404 unknown target "${e.target}"; dev machines: ${e.known.dev_machines.join(",")}; ` +
-        `workers: ${e.known.workers.join(",")}\n`,
+          `workers: ${e.known.workers.join(",")}\n`,
       );
     }
     throw e;
