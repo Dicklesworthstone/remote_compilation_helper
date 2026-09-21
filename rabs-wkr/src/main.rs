@@ -12,6 +12,7 @@
 //! Otherwise the worker reconnects after session loss without replaying execution.
 //! Durable worker/endpoint admission survives restarts. Request-status reconciles
 //! outcome metadata; result-resume restores sealed captures without authorizing a rerun.
+//! Negotiated source uploads are fully verified before admission and owned by execution.
 
 use asupersync::cx::Cx;
 use asupersync::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -21,6 +22,8 @@ use rabs_wkr::output::{CapturedOutputs, MAX_OUTPUT_CHUNK_BYTES};
 use rabs_wkr::request_journal::{RECOVERY_PROTOCOL, WorkerJournal};
 use rabs_wkr::result_spool::{RESULT_RETENTION, ResultRecipient, RetentionTarget};
 use rabs_wkr::session::{CanonicalExecRequest, execute_canonical_controlled, probe_capability, sample_pressure};
+use rabs_wkr::source_transfer::{self, SourceOwner, SourceTransferState};
+use rabs_sandbox::source_transfer::SOURCE_TRANSFER;
 use std::future::{Future, poll_fn};
 use std::io;
 use std::path::PathBuf;
@@ -82,6 +85,7 @@ fn main() {
                  --once performs one session only, without reconnecting.\n\
                  Select output_transfer=ranges-v1 and artifact_transfer=files-v1 in session-ok\n\
                  to retrieve diagnostics and declared compiled artifacts.\n\
+                 Select source_transfer=source-files-v1 to upload verified source before execution.\n\
                  Select result_retention=durable-result-v1 to retain complete results until acceptance.\n\
                  Fleet transport requires RABS_WORKER_TLS_CA, RABS_WORKER_TLS_CERT,\n\
                  RABS_WORKER_TLS_KEY and RABS_WORKER_TLS_SERVER_NAME.\n\
@@ -301,19 +305,38 @@ impl PendingOutput {
     }
 }
 
-/// Production always supplies a durable journal. None is a test seam, never an
-/// IO-failure fallback. Uncertain durable work blocks admission across restarts;
-/// both output owners survive until their own ACKs. The launch seam lets tests
-/// exercise this driver without pretending to sandbox. Artifact negotiation is
-/// checked BEFORE durable admission, so a refused capability never burns an ID.
+/// Existing execution/output tests select no source capability. The production
+/// entry point below always supplies both negotiated selections explicitly.
+#[cfg(test)]
 async fn drive_session<S, L, H>(
     stream: &mut S, report: &rabs_wkr::session::CapabilityReport, once: bool,
-    mut journal: Option<&mut WorkerJournal>, artifact_transfer_enabled: bool,
-    mut launch: L, mut heartbeat: H,
+    journal: Option<&mut WorkerJournal>, artifact_transfer_enabled: bool,
+    mut launch: L, heartbeat: H,
 ) -> Result<(), String>
 where
     S: AsyncRead + AsyncWrite + Unpin,
     L: FnMut(CanonicalExecRequest, Duration, Option<ArtifactPlan>) -> io::Result<ExecutionTask>,
+    H: FnMut() -> rabs_wkr::session::PressureSample,
+{
+    drive_session_with_sources(stream, report, once, journal, artifact_transfer_enabled, false,
+        |request, timeout, artifacts, source| {
+            assert!(source.is_none(), "test did not negotiate source transfer");
+            launch(request, timeout, artifacts)
+        }, heartbeat).await
+}
+
+/// Production always supplies a durable journal. None is a test seam, never an
+/// IO-failure fallback. Source and artifact negotiation/verification precede
+/// durable admission. Launch MUST retain the source owner through process drain.
+#[allow(clippy::too_many_arguments)]
+async fn drive_session_with_sources<S, L, H>(
+    stream: &mut S, report: &rabs_wkr::session::CapabilityReport, once: bool,
+    mut journal: Option<&mut WorkerJournal>, artifact_transfer_enabled: bool,
+    source_transfer_enabled: bool, mut launch: L, mut heartbeat: H,
+) -> Result<(), String>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+    L: FnMut(CanonicalExecRequest, Duration, Option<ArtifactPlan>, Option<SourceOwner>) -> io::Result<ExecutionTask>,
     H: FnMut() -> rabs_wkr::session::PressureSample,
 {
     let mut reader = FrameReader::default();
@@ -322,6 +345,7 @@ where
     let mut pending_output: Option<PendingOutput> = None;
     let mut last_output_ack: Option<OutputIdentity> = None;
     let mut artifact_transfer = ArtifactTransferState::default();
+    let mut source_transfer = SourceTransferState::default();
     let mut retained_result: Option<(u64, String)> = None;
     let outcome = async {
         loop {
@@ -361,6 +385,12 @@ where
                     };
                     let request_id = value.get("request_id").and_then(serde_json::Value::as_u64);
                     match value.get("kind").and_then(|kind| kind.as_str()) {
+                        Some("source-begin" | "source-chunk" | "source-seal") => {
+                            source_transfer.handle(&value, source_transfer_enabled,
+                                active.is_some() || pending_output.is_some() || artifact_transfer.is_pending())
+                                .map(|reply| reply.to_string())
+                                .unwrap_or_else(|reason| request_error(request_id, &reason))
+                        }
                         Some("ping") => {
                             let pressure = heartbeat();
                             serde_json::json!({
@@ -452,11 +482,14 @@ where
                             _ => request_error(request_id, "unknown-request"),
                         },
                         Some("canonical-exec") => {
-                            let parsed = parse_exec_request(&value).and_then(|request| {
+                            let parsed = parse_exec_request(&value).and_then(|mut request| {
                                 let timeout = parse_timeout(&value)?;
                                 let artifacts = artifacts::parse_plan(&value)?;
                                 if artifacts.is_some() && !artifact_transfer_enabled {
                                     return Err("artifact transfer not negotiated".to_owned());
+                                }
+                                if let Some(path) = source_transfer.prepared_path(&value, source_transfer_enabled)? {
+                                    request.workspace_backing = path;
                                 }
                                 Ok((request, timeout, artifacts))
                             });
@@ -469,8 +502,8 @@ where
                                 Ok((request, timeout, artifacts)) => {
                                     let id = request.request_id;
                                     let refusal = match journal.as_deref_mut() {
-                                        // This fingerprint binds the complete wire request,
-                                        // including its exact artifact declaration and timeout.
+                                        // Fingerprint the ORIGINAL request, not the
+                                        // execution projection's private staging path.
                                         Some(journal) => journal.admit(&value, timeout)
                                             .map_err(|error| format!("persist execution admission: {error}"))?,
                                         None => None,
@@ -478,7 +511,9 @@ where
                                     if let Some(reason) = refusal {
                                         request_error(Some(id), reason)
                                     } else {
-                                        match launch(request, timeout, artifacts) {
+                                        let source = source_transfer.take_prepared(&value)
+                                            .map_err(|error| format!("source ownership: {error}"))?;
+                                        match launch(request, timeout, artifacts, source) {
                                             Ok(task) => { last_admitted = Some(id); active = Some(task); continue; }
                                             Err(error) => {
                                                 if let Some(journal) = journal.as_deref_mut() {
@@ -536,6 +571,7 @@ fn worker_hello(report: &rabs_wkr::session::CapabilityReport, journal: &WorkerJo
         "kind": "worker-hello", "worker_id": report.worker_id,
         "canonical": report.canonical_namespace, "slots": report.slots, "token_id": 1,
         "output_transfers": [OUTPUT_TRANSFER], "artifact_transfers": [ARTIFACT_TRANSFER],
+        "source_transfers": [SOURCE_TRANSFER],
         "recovery_protocols": [RECOVERY_PROTOCOL],
         "result_retentions": [RESULT_RETENTION],
         "boot_generation": journal.boot_generation().0,
@@ -561,7 +597,7 @@ async fn session_loop(
         }
         rabs_asupersync::worker_transport::WorkerConnection::LoopbackFixture(_) => ResultRecipient::LoopbackFixture,
     };
-    let (capture_output, capture_artifacts, retain_result) = asupersync::time::timeout(
+    let (capture_output, capture_artifacts, retain_result, receive_sources) = asupersync::time::timeout(
         asupersync::time::wall_now(),
         Duration::from_secs(10),
         async {
@@ -625,10 +661,11 @@ async fn session_loop(
             let artifacts = artifacts::transfer_requested(&ack)?;
             validate_recovery_selection(&ack)?;
             let retain = result_retention_requested(&ack)?;
+            let source = source_transfer::selected(&ack)?;
             if local_identity.is_some() && !output {
                 return Err("authenticated worker requires complete output retrieval".to_owned());
             }
-            Ok::<(bool, bool, bool), String>((output, artifacts, retain))
+            Ok::<(bool, bool, bool, bool), String>((output, artifacts, retain, source))
         },
     ).await.map_err(|_| "worker session admission deadline exceeded".to_owned())??;
     let cargo_home = std::env::temp_dir().join(format!("rabs-wkr-ch-{}", std::process::id()));
@@ -641,7 +678,8 @@ async fn session_loop(
     journal.clear_result_recipient();
     if retain_result { journal.authorize_result_recipient(recipient.clone()); }
     *admitted_at = Some(std::time::Instant::now());
-    let outcome = drive_session(&mut stream, report, once, Some(&mut *journal), capture_artifacts, |request, timeout, artifacts| {
+    let outcome = drive_session_with_sources(&mut stream, report, once, Some(&mut *journal), capture_artifacts,
+        receive_sources, |request, timeout, artifacts, source| {
         let cargo_home = cargo_home.clone(); let home = home.clone(); let spills = spills.clone();
         let slots = report.slots;
         let id = request.request_id;
@@ -649,6 +687,9 @@ async fn session_loop(
             &journal_root, id, recipient.clone(),
         )).transpose()?;
         let execute = move |control: rabs_wkr::execution::ExecutionControl| {
+            // Ownership is inside the blocking executor, not the read future.
+            // Cancellation/disconnect cannot remove source before process drain.
+            let _source_owner = source;
             if capture_output { control.request_output_capture(); }
             execute_canonical_controlled(&request, &cargo_home, &home, slots, &spills, &control)
         };
@@ -720,10 +761,17 @@ fn parse_exec_request(value: &serde_json::Value) -> Result<CanonicalExecRequest,
         None => None,
         Some(value) => Some(u32::try_from(value.as_u64().ok_or("jobserver_grant must be an unsigned integer")?).unwrap_or(u32::MAX)),
     };
+    // A source-bearing request has no worker path on the wire. Only the live
+    // admission path can fill this slot from the exact sealed source owner.
+    let workspace_backing = if source_transfer::request_manifest(value)?.is_some() {
+        String::new()
+    } else {
+        text("workspace_backing")?
+    };
     Ok(CanonicalExecRequest {
         request_id: value.get("request_id").and_then(serde_json::Value::as_u64).ok_or("exec request missing request_id")?,
         program: text("program")?, args, toolchain_backing: text("toolchain_backing")?,
-        workspace_backing: text("workspace_backing")?, jobserver_grant,
+        workspace_backing, jobserver_grant,
     })
 }
 
@@ -737,6 +785,9 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::task::{Context, Wake, Waker};
     use std::time::Instant;
+
+    #[cfg(unix)]
+    mod source_tests;
 
     #[derive(Default)]
     struct WireState {
