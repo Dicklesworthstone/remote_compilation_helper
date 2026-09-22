@@ -21,7 +21,10 @@ use rabs_wkr::execution::{DEFAULT_EXECUTION_TIMEOUT, ExecutionCompletion, Execut
 use rabs_wkr::output::{CapturedOutputs, MAX_OUTPUT_CHUNK_BYTES};
 use rabs_wkr::request_journal::{RECOVERY_PROTOCOL, WorkerJournal};
 use rabs_wkr::result_spool::{RESULT_RETENTION, ResultRecipient, RetentionTarget};
-use rabs_wkr::session::{CanonicalExecRequest, execute_canonical_controlled, probe_capability, sample_pressure};
+use rabs_wkr::session::{
+    CanonicalExecRequest, execute_canonical_controlled, execute_uploaded_canonical_controlled,
+    probe_capability, sample_pressure,
+};
 use rabs_wkr::source_transfer::{self, SourceOwner, SourceTransferState};
 use rabs_sandbox::source_transfer::SOURCE_TRANSFER;
 use std::future::{Future, poll_fn};
@@ -689,9 +692,15 @@ async fn session_loop(
         let execute = move |control: rabs_wkr::execution::ExecutionControl| {
             // Ownership is inside the blocking executor, not the read future.
             // Cancellation/disconnect cannot remove source before process drain.
-            let _source_owner = source;
             if capture_output { control.request_output_capture(); }
-            execute_canonical_controlled(&request, &cargo_home, &home, slots, &spills, &control)
+            match source.as_ref() {
+                Some(source) => execute_uploaded_canonical_controlled(
+                    &request, &cargo_home, &home, slots, &spills, &control, source,
+                ),
+                None => execute_canonical_controlled(
+                    &request, &cargo_home, &home, slots, &spills, &control,
+                ),
+            }
         };
         ExecutionTask::spawn_for_delivery(id, timeout, artifacts, retention, execute)
     }, || sample_pressure(&cargo_home)).await;

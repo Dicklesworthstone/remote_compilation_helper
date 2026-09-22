@@ -107,6 +107,53 @@ pub struct SourceOwner {
 }
 
 impl SourceOwner {
+    /// Constrain the final namespace to the exact sealed workspace owned by
+    /// this admission. File modes alone do not stop a compiler from changing
+    /// its own input files or adding undeclared inputs. Only the workspace
+    /// mount changes; runtime HOME and declared outputs remain writable.
+    /// This is transport-source isolation, not action-key provenance.
+    pub(crate) fn protect_workspace(
+        &self,
+        request_id: u64,
+        spec: &mut rabs_sandbox::canonical_namespace::CanonicalNamespaceSpec,
+    ) -> io::Result<()> {
+        use std::path::Path;
+        let refuse = |message: &str| io::Error::new(io::ErrorKind::InvalidData, message);
+        self.within_budget().map_err(io::Error::other)?;
+        if self.source_failed || request_id != self.request_id {
+            return Err(refuse("source owner does not match execution admission"));
+        }
+        let root = self.receiver.sealed_root()
+            .ok_or_else(|| refuse("execution source is not completely verified"))?;
+        let workspace = Path::new(rabs_sandbox::layout::WORKSPACE);
+        let index = spec.rw_binds.iter().position(|bind| bind.visible == workspace)
+            .ok_or_else(|| refuse("execution lacks its owned workspace mount"))?;
+        if spec.rw_binds[index].backing != root {
+            return Err(refuse("workspace mount differs from the sealed source owner"));
+        }
+        let overlaps = |path: &Path| path.starts_with(workspace) || workspace.starts_with(path);
+        if spec.ro_binds.iter().any(|bind| overlaps(&bind.visible)) {
+            return Err(refuse("another mount shadows the owned workspace"));
+        }
+        for (other, bind) in spec.rw_binds.iter().enumerate() {
+            if other == index { continue; }
+            if overlaps(&bind.visible) {
+                return Err(refuse("writable mount shadows the owned workspace"));
+            }
+            // Resolve host aliases before comparing. A read-only workspace
+            // must not remain writable through HOME or another output mount.
+            let backing = std::fs::canonicalize(&bind.backing)?;
+            if backing.starts_with(root) || root.starts_with(&backing) {
+                return Err(refuse("writable mount aliases the owned source tree"));
+            }
+        }
+        self.within_budget().map_err(io::Error::other)?;
+        // All checks precede mutation: a refused spec remains unchanged.
+        let source = spec.rw_binds.remove(index);
+        spec.ro_binds.push(source);
+        Ok(())
+    }
+
     fn within_budget(&self) -> Result<(), String> {
         if Instant::now() >= self.deadline {
             return Err(invalid("source upload deadline exceeded"));
@@ -504,6 +551,92 @@ mod tests {
         assert_eq!(state.handle(&begin, true, false).unwrap()["sealed"], false);
         state.handle(&chunk, true, false).unwrap();
         (state, request, begin, seal)
+    }
+
+    fn namespace_for_source(
+        owner: &SourceOwner, runtime: &std::path::Path,
+    ) -> rabs_sandbox::canonical_namespace::CanonicalNamespaceSpec {
+        use rabs_sandbox::canonical_namespace::{Bind, CanonicalNamespaceSpec};
+        use rabs_sandbox::layout;
+        let mut spec = CanonicalNamespaceSpec::new();
+        spec.ro_binds.push(Bind::new("/toolchain", layout::TOOLCHAIN));
+        let source = std::fs::canonicalize(owner._directory.path().join("workspace")).unwrap();
+        spec.rw_binds.push(Bind::new(source, layout::WORKSPACE));
+        for (name, visible) in [("home", layout::HOME), ("cargo-home", layout::CARGO_HOME), ("output", "/__rabs/out/dep")] {
+            let backing = runtime.join(name);
+            std::fs::create_dir_all(&backing).unwrap();
+            spec.rw_binds.push(Bind::new(backing, visible));
+        }
+        spec
+    }
+
+    #[test]
+    fn source_owner_makes_only_its_workspace_read_only() {
+        use rabs_sandbox::layout;
+        let (mut state, request, _, seal) = uploaded();
+        state.handle(&seal, true, false).unwrap();
+        let owner = state.take_prepared(&request).unwrap().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        let mut spec = namespace_for_source(&owner, runtime.path());
+        let before = spec.clone();
+        owner.protect_workspace(7, &mut spec).unwrap();
+        assert_eq!(spec.rw_binds, before.rw_binds[1..]);
+        assert_eq!(spec.ro_binds.len(), before.ro_binds.len() + 1);
+        assert_eq!(spec.ro_binds.last(), before.rw_binds.first());
+        assert!(spec.ro_binds.iter().any(|bind| bind.visible == std::path::Path::new(layout::WORKSPACE)));
+        assert_eq!(spec.env, before.env);
+        assert_eq!(spec.cwd, before.cwd);
+        assert!(!spec.allows_network());
+        assert_eq!(std::fs::read(owner.receiver.sealed_root().unwrap().join("src/lib.rs")).unwrap(), b"source\0\xff");
+    }
+
+    #[test]
+    fn invalid_source_owner_never_changes_execution_mounts() {
+        let (mut state, request, _, seal) = uploaded();
+        let runtime = tempfile::tempdir().unwrap();
+        let mut spec = namespace_for_source(state.pending.as_ref().unwrap(), runtime.path());
+        let before = spec.clone();
+        assert!(state.pending.as_ref().unwrap().protect_workspace(7, &mut spec).is_err());
+        assert_eq!(spec, before, "an unsealed upload cannot configure execution");
+        state.handle(&seal, true, false).unwrap();
+        let mut owner = state.take_prepared(&request).unwrap().unwrap();
+        assert!(owner.protect_workspace(8, &mut spec).is_err());
+        assert_eq!(spec, before);
+        owner.source_failed = true;
+        assert!(owner.protect_workspace(7, &mut spec).is_err());
+        assert_eq!(spec, before);
+        owner.source_failed = false;
+        owner.deadline = Instant::now() - Duration::from_secs(1);
+        assert!(owner.protect_workspace(7, &mut spec).is_err());
+        assert_eq!(spec, before);
+    }
+
+    #[test]
+    fn source_mount_mismatch_shadowing_and_writable_aliases_refuse() {
+        use rabs_sandbox::canonical_namespace::Bind;
+        use std::os::unix::fs::symlink;
+        let (mut state, request, _, seal) = uploaded();
+        state.handle(&seal, true, false).unwrap();
+        let owner = state.take_prepared(&request).unwrap().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        let root = owner.receiver.sealed_root().unwrap();
+        let alias = runtime.path().join("source-alias");
+        symlink(root, &alias).unwrap();
+        for variant in 0..7 {
+            let mut spec = namespace_for_source(&owner, runtime.path());
+            match variant {
+                0 => spec.rw_binds[0].backing = runtime.path().to_path_buf(),
+                1 => spec.rw_binds.push(spec.rw_binds[0].clone()),
+                2 => spec.ro_binds.push(spec.rw_binds[0].clone()),
+                3 => spec.rw_binds.push(Bind::new(runtime.path(), "/__rabs/workspace/src")),
+                4 => spec.rw_binds[1].backing = root.to_path_buf(),
+                5 => spec.rw_binds[1].backing = owner._directory.path().to_path_buf(),
+                _ => spec.rw_binds[1].backing = alias.clone(),
+            }
+            let before = spec.clone();
+            assert!(owner.protect_workspace(7, &mut spec).is_err(), "accepted variant {variant}");
+            assert_eq!(spec, before, "refusal changed variant {variant}");
+        }
     }
 
     fn assert_not_admissible(state: &mut SourceTransferState, request: &Value, seal: &Value) {

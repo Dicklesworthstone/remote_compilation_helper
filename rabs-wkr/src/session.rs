@@ -10,6 +10,7 @@ use rabs_protocol::capability_tokens::CapabilityToken;
 use crate::artifacts::PreparedArtifacts;
 use crate::execution::{DEFAULT_EXECUTION_TIMEOUT, ExecutionControl};
 use crate::output::CapturedOutputs;
+use crate::source_transfer::SourceOwner;
 
 /// What this worker can do (advertised at handshake; the scheduler
 /// gates placement on it). Derived from a real HostIsolationSupport
@@ -217,7 +218,29 @@ pub fn execute_canonical_controlled(
     spill_root: &std::path::Path,
     control: &ExecutionControl,
 ) -> ExecResult {
-    let mut result = execute_canonical_inner(request, cargo_home_backing, home_backing, slots, spill_root, control);
+    let mut result = execute_canonical_inner(request, cargo_home_backing, home_backing, slots, spill_root, control, None);
+    if let Some(reason) = control.finish() { result.exit_code = reason.exit_code(); }
+    result
+}
+
+/// Execute an uploaded projection with kernel-enforced read-only source.
+/// The caller retains the verified source owner until this blocking call has
+/// drained and reaped the process. Neither a wire flag nor a pathname alone
+/// can enable this path; the owner must match the admitted request and mount.
+/// HOME and declared artifact output mounts remain writable.
+#[must_use]
+pub fn execute_uploaded_canonical_controlled(
+    request: &CanonicalExecRequest,
+    cargo_home_backing: &std::path::Path,
+    home_backing: &std::path::Path,
+    slots: u32,
+    spill_root: &std::path::Path,
+    control: &ExecutionControl,
+    source: &SourceOwner,
+) -> ExecResult {
+    let mut result = execute_canonical_inner(
+        request, cargo_home_backing, home_backing, slots, spill_root, control, Some(source),
+    );
     if let Some(reason) = control.finish() { result.exit_code = reason.exit_code(); }
     result
 }
@@ -229,6 +252,7 @@ fn execute_canonical_inner(
     slots: u32,
     spill_root: &std::path::Path,
     control: &ExecutionControl,
+    source: Option<&SourceOwner>,
 ) -> ExecResult {
     use rabs_asupersync::process_groups::ManagedProcessGroup;
     use rabs_asupersync::region_tree::Attribution;
@@ -254,6 +278,12 @@ fn execute_canonical_inner(
     };
     if let Some(artifacts) = &artifacts { plan.out_units.push(artifacts.mount()); }
     let Ok(mut spec) = plan.to_spec() else { return exec_error(request.request_id); };
+    if let Some(source) = source
+        && let Err(error) = source.protect_workspace(request.request_id, &mut spec)
+    {
+        let _ = control.retain_outputs(Err(format!("source mount isolation: {error}")));
+        return exec_error(request.request_id);
+    }
     // Worker-local jobserver authority runs on the FINAL env: extra_env
     // may carry smuggled coordination keys, so replacement must see them.
     let grant = request.jobserver_grant.unwrap_or(slots).min(slots).max(1);

@@ -48,7 +48,7 @@ fn connect_worker() -> (OwnedChild, BufReader<TcpStream>, TcpStream) {
     let child = Command::new(env!("CARGO_BIN_EXE_rabs-wkr"))
         .args(["--coordinator", &address, "--worker-id", "artifact-test", "--once"])
         .env("RABS_WORKER_STATE_DIR", state.path())
-        .stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+        .stdout(Stdio::null()).stderr(Stdio::inherit()).spawn().unwrap();
     let mut worker = OwnedChild { child, _state: Some(state) };
     let deadline = Instant::now() + Duration::from_secs(15);
     let stream = loop {
@@ -263,5 +263,98 @@ fn unnegotiated_artifacts_are_refused_before_launch_and_session_remains_usable()
     assert_eq!(status["status"], "unknown", "unnegotiated files must not acquire durable admission");
     assert!(status["high_water"].is_null());
     drop(reader); drop(writer);
+    assert!(worker.wait_until(Duration::from_secs(10)).success());
+}
+
+#[test]
+fn uploaded_source_is_read_only_while_runtime_and_artifact_output_remain_writable() {
+    use rabs_sandbox::source_transfer::{SourceFile, SourceManifest};
+    if !rabs_sandbox::canonical_namespace::HostIsolationSupport::probe().missing_for_canonical().is_empty() {
+        eprintln!("SKIP: canonical namespace unavailable; uploaded-source isolation not exercised");
+        return;
+    }
+    let files: [(&str, &[u8]); 2] = [
+        ("input.txt", b"exact input\n"),
+        (".rabs-jobserver", b"source-owned\n"),
+    ];
+    let manifest = SourceManifest::new(files.iter().map(|(path, bytes)| SourceFile {
+        path: (*path).to_owned(), len: bytes.len() as u64,
+        sha256: Sha256::digest(bytes).into(), executable: false,
+    }).collect()).unwrap();
+    let hex = |bytes: &[u8]| bytes.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+    let source_manifest = json!({"manifest_sha256":hex(&manifest.digest()),
+        "files":manifest.files().iter().map(|file| json!({
+            "path":file.path, "bytes":file.len, "sha256":hex(&file.sha256), "executable":file.executable,
+        })).collect::<Vec<_>>()});
+    let (mut worker, mut reader, mut writer) = connect_worker();
+    send(&mut writer, &json!({"kind":"session-ok", "source_transfer":"source-files-v1",
+        "artifact_transfer":"files-v1"}));
+    send(&mut writer, &json!({"kind":"source-begin", "request_id":42, "manifest":source_manifest}));
+    let ready = receive(&mut reader);
+    assert_eq!(ready["kind"], "source-ready", "{ready}");
+    assert_eq!(ready["request_id"], 42);
+    assert_eq!(ready["manifest_sha256"], source_manifest["manifest_sha256"]);
+    assert_eq!(ready["sealed"], false);
+    for (path, bytes) in files {
+        send(&mut writer, &json!({"kind":"source-chunk", "request_id":42,
+            "manifest_sha256":source_manifest["manifest_sha256"], "path":path,
+            "offset":0, "data_hex":hex(bytes), "chunk_sha256":sha256_hex(bytes)}));
+        let ack = receive(&mut reader);
+        assert_eq!(ack["kind"], "source-chunk-accepted", "{ack}");
+        assert_eq!(ack["request_id"], 42);
+        assert_eq!(ack["manifest_sha256"], source_manifest["manifest_sha256"]);
+        assert_eq!(ack["path"], path);
+        assert_eq!(ack["next_offset"], bytes.len());
+    }
+    send(&mut writer, &json!({"kind":"source-seal", "request_id":42,
+        "manifest_sha256":source_manifest["manifest_sha256"]}));
+    let sealed = receive(&mut reader);
+    assert_eq!(sealed["kind"], "source-ready", "{sealed}");
+    assert_eq!(sealed["request_id"], 42);
+    assert_eq!(sealed["manifest_sha256"], source_manifest["manifest_sha256"]);
+    assert_eq!(sealed["sealed"], true);
+    // Run through the real worker launch closure, not just a constructed argv.
+    // Chmod distinguishes kernel read-only mounting from mode 0444; adding and
+    // renaming distinguish it from protection of only the declared file bytes.
+    let script = r#"
+set -eu
+test "$(cat input.txt)" = 'exact input'
+test "$(cat .rabs-jobserver)" = 'source-owned'
+if chmod u+w input.txt; then echo 'source chmod unexpectedly succeeded' >&2; exit 81; fi
+if (printf altered > undeclared.txt); then echo 'source creation unexpectedly succeeded' >&2; exit 82; fi
+if mv input.txt moved.txt; then echo 'source rename unexpectedly succeeded' >&2; exit 83; fi
+test "$(cat input.txt)" = 'exact input'
+test "$MAKEFLAGS" = "$CARGO_MAKEFLAGS"
+test "$NUM_JOBS" = 1
+fifo="${MAKEFLAGS##*--jobserver-auth=fifo:}"
+case "$fifo" in /__rabs/home/.rabs-jobserver-*/*.fifo) ;; *) exit 84 ;; esac
+test -p "$fifo"
+printf runtime > "$HOME/runtime.txt"
+test "$(cat "$HOME/runtime.txt")" = runtime
+printf 'exact input\n' > /__rabs/out/dep/result.txt
+"#;
+    send(&mut writer, &json!({"kind":"canonical-exec", "request_id":42, "timeout_ms":30000,
+        "program":"sh", "args":["-c",script], "toolchain_backing":toolchain(),
+        "source_manifest":source_manifest, "jobserver_grant":1,
+        "artifacts":{"unit":"dep", "files":["result.txt"]}}));
+    let result = receive(&mut reader);
+    assert_eq!(result["kind"], "exec-result", "{result}");
+    assert_eq!(result["executed"], true, "{result}");
+    assert_eq!(result["exit_code"], 0, "{result}");
+    assert_eq!(result["residual_group_members"], 0);
+    assert!(result["stop_reason"].is_null());
+    assert_eq!(result["artifact_ack_required"], true);
+    let artifacts = &result["artifact_manifest"];
+    verify_manifest(artifacts);
+    assert_eq!(artifacts["files"].as_array().unwrap().len(), 1);
+    assert_eq!(artifacts["files"][0]["name"], "result.txt");
+    assert_eq!(
+        fetch_artifact(&mut reader, &mut writer, artifacts, &artifacts["files"][0]),
+        b"exact input\n"
+    );
+    assert!(worker.child.try_wait().unwrap().is_none(), "artifact ownership ended before ACK");
+    send(&mut writer, &json!({"kind":"artifact-ack", "request_id":42,
+        "manifest_sha256":artifacts["manifest_sha256"], "total_bytes":artifacts["total_bytes"]}));
+    assert_eq!(receive(&mut reader)["kind"], "artifact-acknowledged");
     assert!(worker.wait_until(Duration::from_secs(10)).success());
 }
