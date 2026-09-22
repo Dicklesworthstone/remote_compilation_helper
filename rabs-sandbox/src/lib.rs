@@ -34,6 +34,7 @@
 pub mod artifact_tree;
 pub mod canonical_mounts;
 pub mod canonical_namespace;
+pub mod cargo_home;
 pub mod cgroup_envelope;
 pub mod edit_watcher;
 pub mod env_builder;

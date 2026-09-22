@@ -9,6 +9,9 @@
 
 mod cache;
 
+use rabs_sandbox::cargo_home::{
+    CARGO_HOME_SOURCE_VERSION, CargoHomeProjection, PreparedCargoHome,
+};
 use rabs_sandbox::source_transfer::{
     MAX_SOURCE_CHUNK, MAX_SOURCE_FILES, SOURCE_TRANSFER, SourceFile, SourceManifest, SourceReceiver,
 };
@@ -69,6 +72,20 @@ pub fn parse_manifest(value: &Value) -> Result<SourceManifest, String> {
     Ok(manifest)
 }
 
+/// The same declaration is carried by source-begin and the ORIGINAL execution
+/// request. Decode only its shape here; sandbox policy owns relative-path and
+/// registry-only selection. Never substitute a worker-local Cargo home pathname.
+fn cargo_home_projection(value: &Value, manifest: &SourceManifest) -> Result<Option<CargoHomeProjection>, String> {
+    let Some(home) = value.get("cargo_home") else { return Ok(None); };
+    if !home.as_object().is_some_and(|object| object.len() == 2)
+        || home["version"] != CARGO_HOME_SOURCE_VERSION
+    {
+        return Err(invalid("cargo_home requires a supported version and prefix"));
+    }
+    let prefix = home["prefix"].as_str().ok_or("cargo_home prefix must be a string")?;
+    CargoHomeProjection::new(prefix, manifest).map(Some).map_err(|error| error.to_string())
+}
+
 pub fn request_manifest(request: &Value) -> Result<Option<SourceManifest>, String> {
     // These fields name local preparation intent, not executable source. Check
     // their PRESENCE before the worker-local fast path as well as uploaded input.
@@ -78,12 +95,15 @@ pub fn request_manifest(request: &Value) -> Result<Option<SourceManifest>, Strin
         return Err(invalid("unprepared source_files/source_roots; use --worker-prepare before execution"));
     }
     match request.get("source_manifest") {
+        None if request.get("cargo_home").is_some() => Err(invalid("cargo_home requires an uploaded source_manifest")),
         None => Ok(None),
         Some(value) => {
             if request.get("workspace_backing").is_some() {
                 return Err(invalid("source manifest and worker workspace path are mutually exclusive"));
             }
-            parse_manifest(value).map(Some)
+            let manifest = parse_manifest(value)?;
+            cargo_home_projection(request, &manifest)?;
+            Ok(Some(manifest))
         }
     }
 }
@@ -111,13 +131,16 @@ pub struct SourceOwner {
     cache: Option<cache::SourceCache>,
     cache_write_error: Option<String>,
     source_failed: bool,
+    cargo_home: Option<CargoHomeProjection>,
+    prepared_cargo_home: Option<PreparedCargoHome>,
 }
 
 impl SourceOwner {
     /// Constrain the final namespace to the exact sealed workspace owned by
     /// this admission. File modes alone do not stop a compiler from changing
-    /// its own input files or adding undeclared inputs. Only the workspace
-    /// mount changes; runtime HOME and declared outputs remain writable.
+    /// its own input files or adding undeclared inputs. The workspace becomes
+    /// read-only; explicitly imported registry bytes use independent writable
+    /// Cargo-home scratch. HOME and declared outputs are unchanged.
     /// This is transport-source isolation, not action-key provenance.
     pub(crate) fn protect_workspace(
         &self,
@@ -154,10 +177,18 @@ impl SourceOwner {
                 return Err(refuse("writable mount aliases the owned source tree"));
             }
         }
+        // Build the whole change privately. Failure while validating the Cargo
+        // home must not leave a partially modified source/runtime namespace.
+        let mut prepared = spec.clone();
+        let source = prepared.rw_binds.remove(index);
+        prepared.ro_binds.push(source);
+        if self.cargo_home.is_some() {
+            self.prepared_cargo_home.as_ref()
+                .ok_or_else(|| refuse("Cargo home preparation is incomplete"))?
+                .apply_to(&mut prepared)?;
+        }
         self.within_budget().map_err(io::Error::other)?;
-        // All checks precede mutation: a refused spec remains unchanged.
-        let source = spec.rw_binds.remove(index);
-        spec.ro_binds.push(source);
+        *spec = prepared;
         Ok(())
     }
 
@@ -174,7 +205,13 @@ impl SourceOwner {
         self.within_budget()?;
         let mut reply = json!({"kind":"source-ready", "request_id":self.request_id,
             "manifest_sha256":hex(&self.receiver.manifest().digest()),
-            "sealed":self.receiver.sealed_root().is_some() && !self.source_failed});
+            "sealed":self.receiver.sealed_root().is_some() && !self.source_failed
+                && (self.cargo_home.is_none() || self.prepared_cargo_home.is_some())});
+        if let Some(home) = &self.cargo_home {
+            // Exact echo is the extension's support negotiation. Old workers
+            // omit it, letting senders refuse BEFORE any cache bytes are sent.
+            reply["cargo_home"] = json!({"version":CARGO_HOME_SOURCE_VERSION, "prefix":home.prefix()});
+        }
         if self.allow_cached_files {
             // This is the frozen initial missing set, not a new cache lookup on
             // every retry. Reused bytes already belong to this private receiver.
@@ -202,13 +239,14 @@ impl SourceTransferState {
         let id = value["request_id"].as_u64().ok_or("source request_id must be unsigned")?;
         if value["kind"] == "source-begin" {
             let manifest = parse_manifest(&value["manifest"])?;
+            let cargo_home = cargo_home_projection(value, &manifest)?;
             let allow_cached_files = match value.get("allow_cached_files") {
                 None => false,
                 Some(value) => value.as_bool().ok_or("allow_cached_files must be boolean")?,
             };
             if let Some(owner) = &self.pending {
                 if owner.request_id != id || owner.receiver.manifest() != &manifest
-                    || owner.allow_cached_files != allow_cached_files
+                    || owner.allow_cached_files != allow_cached_files || owner.cargo_home != cargo_home
                 {
                     return Err(invalid("another source transfer owns this session"));
                 }
@@ -249,6 +287,7 @@ impl SourceTransferState {
                 receiver, _directory: directory, request_id: id,
                 deadline, allow_cached_files, missing_files, reused_bytes, cache,
                 cache_write_error: None, source_failed: false,
+                cargo_home, prepared_cargo_home: None,
             };
             let reply = owner.ready()?;
             self.pending = Some(owner);
@@ -289,6 +328,21 @@ impl SourceTransferState {
                         }
                     }
                 }
+                if let Some(projection) = &owner.cargo_home
+                    && owner.prepared_cargo_home.is_none()
+                {
+                    let deadline = owner.deadline;
+                    match projection.prepare(&owner.receiver,
+                        &owner._directory.path().join("cargo-home-runtime"),
+                        || Instant::now() >= deadline)
+                    {
+                        Ok(prepared) => owner.prepared_cargo_home = Some(prepared),
+                        Err(error) => {
+                            owner.source_failed = true;
+                            return Err(format!("Cargo home preparation failed: {error}"));
+                        }
+                    }
+                }
                 owner.ready()
             }
             _ => Err(invalid("unknown source operation")),
@@ -305,8 +359,12 @@ impl SourceTransferState {
         if owner.source_failed { return Err(invalid("execution source verification failed")); }
         if request["request_id"].as_u64() != Some(owner.request_id)
             || owner.receiver.manifest() != &manifest
+            || cargo_home_projection(request, &manifest)? != owner.cargo_home
         {
             return Err(invalid("execution differs from its uploaded source identity"));
+        }
+        if owner.cargo_home.is_some() && owner.prepared_cargo_home.is_none() {
+            return Err(invalid("execution Cargo home is not completely prepared"));
         }
         owner.within_budget()?;
         let path = owner.receiver.sealed_root().ok_or("execution source is not completely verified")?;
@@ -325,6 +383,8 @@ impl SourceTransferState {
 
 #[cfg(all(test, unix))]
 mod tests {
+    mod cargo_home_tests;
+
     use super::*;
     use sha2::{Digest, Sha256};
 
