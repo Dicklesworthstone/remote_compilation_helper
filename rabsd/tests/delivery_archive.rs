@@ -1,7 +1,7 @@
 //! Real CAS/recovery/CLI tests. No compiler, remote fixture, or action authority.
 #![cfg(unix)]
 use rabsd::coord::delivery_archive::{archive_delivery, parse_archive_key, restore_delivery};
-use rabsd::coord::delivery_recovery::{DeliveryTrust, recover_existing_delivery};
+use rabsd::coord::delivery_recovery::{DeliveryTrust, install_delivery_outputs, recover_existing_delivery};
 use rabsd::janitor::store::{LiveCas, mount_and_reconcile};
 use rabs_cas::blob_store::RAW_PROFILE_V1;
 use rabs_cas::digest_set::{DigestRequest, digest_set};
@@ -237,4 +237,23 @@ fn real_cli_archives_then_restores_without_a_worker_or_compiler() {
     assert_eq!(fs::read(dest.join("artifacts/nested/a")).unwrap(),b"compiled\0\xff");
     let cas = f.mount();
     assert!(cas.store().lock().unwrap().query("SELECT 1 FROM action_entries",&[] as &[SqlValue]).unwrap().is_empty());
+}
+
+#[test]
+fn archived_nested_executable_outputs_install_without_aliasing_the_archive_or_delivery() {
+    let f = Fixture::new(); let cas = f.mount();
+    let archive = archive_delivery(&cas, &f.request, "worker", &f.source, DeliveryTrust::Loopback).unwrap();
+    let restored = f.destination("restored");
+    restore_delivery(&cas, &digest_key(&archive.root), &f.request, "worker", &restored, DeliveryTrust::Loopback).unwrap();
+    let restored = restored.canonicalize().unwrap();
+    let target = restored.parent().unwrap().join("target");
+    let result = install_delivery_outputs(&f.request, "worker", &restored, &target, DeliveryTrust::Loopback).unwrap();
+    assert_eq!(result.file_count, 1);
+    assert_eq!(fs::read(target.join("nested/a")).unwrap(), b"compiled\0\xff");
+    assert_eq!(fs::metadata(target.join("nested/a")).unwrap().permissions().mode() & 0o7777, 0o700);
+    write(&target.join("nested/a"), b"modified", true);
+    assert_eq!(fs::read(restored.join("artifacts/nested/a")).unwrap(), b"compiled\0\xff");
+    let second = f.destination("second-restored");
+    restore_delivery(&cas, &digest_key(&archive.root), &f.request, "worker", &second, DeliveryTrust::Loopback).unwrap();
+    assert_eq!(fs::read(second.join("artifacts/nested/a")).unwrap(), b"compiled\0\xff");
 }

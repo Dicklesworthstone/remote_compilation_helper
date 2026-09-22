@@ -1,6 +1,6 @@
 //! Explicit archival/recovery operator path. Never launches a worker/compiler.
 use rabsd::coord::delivery_archive::{archive_delivery, parse_archive_key, restore_delivery};
-use rabsd::coord::delivery_recovery::DeliveryTrust;
+use rabsd::coord::delivery_recovery::{DeliveryTrust, install_delivery_outputs};
 use rabsd::coord::worker_delivery::{MAX_FRAME_BYTES, validate_request};
 use rabsd::janitor::store::mount_and_reconcile;
 use std::io::Read;
@@ -8,9 +8,11 @@ use std::path::Path;
 
 const USAGE: &str = "rabs-delivery-cas archive CAS_ROOT REQUEST_JSON WORKER DELIVERY_DIR TRUST\n\
     rabs-delivery-cas restore CAS_ROOT ROOT_OBJECT REQUEST_JSON WORKER NEW_DIR TRUST\n\
+    rabs-delivery-cas install REQUEST_JSON WORKER DELIVERY_DIR NEW_OUTPUT_DIR TRUST\n\
     TRUST is loopback or spki:<64 lowercase hex digits>.\n\
-    Uses exclusive CAS ownership; stop the daemon or choose a separate store.\n\
-    Complete matching restores are verified and reused, never overwritten. Archive pins do not expire.\n\
+    Archive/restore use exclusive CAS ownership; stop the daemon or choose a separate store.\n\
+    Install copies verified artifacts without a worker connection or CAS mount.\n\
+    Complete matching restores/installs are verified and reused, never overwritten. Archive pins do not expire.\n\
     This does not publish an action, authorize reuse, or rerun compilation.";
 
 fn trust(text: &str) -> Result<DeliveryTrust, String> {
@@ -36,6 +38,12 @@ fn request(path: &Path) -> Result<serde_json::Value, String> {
 }
 fn run(args: &[String]) -> Result<serde_json::Value, String> {
     match args.first().map(String::as_str) {
+        Some("install") if args.len() == 6 => {
+            let request = request(Path::new(&args[1]))?;
+            let trust = trust(&args[5])?;
+            Ok(install_delivery_outputs(&request, &args[2], Path::new(&args[3]),
+                Path::new(&args[4]), trust)?.to_json())
+        }
         Some("archive") if args.len() == 6 => {
             let request = request(Path::new(&args[2]))?;
             let trust = trust(&args[5])?;

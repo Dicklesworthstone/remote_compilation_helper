@@ -48,8 +48,9 @@ rabs-key = { path = "../rabs-key" }
 # outputs newer than inputs, private materializations only).
 filetime = { workspace = true }
 
-[target.'cfg(target_os = "linux")'.dependencies]
-# H017: safe FICLONE and anonymous probe files; no unsafe code in RABS.
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+# H017: safe FICLONE and anonymous probe files; atomic no-clobber output
+# directory publication on Linux/macOS. No unsafe code in RABS.
 rustix = { version = "1.1.4", features = ["fs"] }
 
 [lints.rust]

@@ -32,6 +32,49 @@ An empty, incomplete, corrupt, or different-result directory is refused. Both co
 means the archive/restore operation succeeded, not that the original compilation
 succeeded; its original exit code and interruption remain in the receipt.
 
+## Install a verified output tree
+
+The `install` command copies a successful delivery's complete artifact tree into
+an independently writable output directory:
+
+```sh
+rabs-delivery-cas install /private/request.json worker-a \
+  /private/restored-42 /private/outputs/build-42 loopback
+```
+
+It accepts either an original delivery or a restored CAS archive. Authenticated
+deliveries require the same explicit `spki:<64-lowercase-hex-fingerprint>` trust
+argument used for recovery. Installation needs neither a worker connection nor a
+CAS mount. The original request, worker, historical trust, receipt and every
+source file are verified again. Only a successful, uninterrupted execution with
+at least one artifact can be installed.
+
+Every artifact listed in the admitted delivery is installed, including nested
+intermediates and executable files; diagnostics and `delivery.json` remain in
+the retained delivery. The destination must be absent with an existing parent,
+or already contain the exact matching tree with private permissions and
+independent regular files. Extra files, different bytes, hardlinks, symlinks,
+failed executions and overlapping source/destination trees are refused. A
+matching destination is rehashed and synchronized before returning
+`reused:true`; this acknowledges the same installation and grants no action
+cache authority.
+
+Files are copied into a private sibling staging directory, checked against their
+expected hashes, assigned their declared executable modes, and synchronized.
+After synchronizing the complete staged directory tree, an exclusive rename
+publishes the whole output directory without replacing an existing destination,
+including one created concurrently. This operation is supported on Linux and
+macOS; an unsupported filesystem fails explicitly. Failed staging directories
+are retained for inspection. If a reply or final synchronization is lost, rerun
+the same command to verify the destination; a retry never runs a compiler.
+
+Installed files have independent inodes, so later writes do not alter retained
+delivery or CAS bytes. Callers must own and control these paths while the command
+runs; content verification does not make concurrent hostile filesystem mutation
+safe. This command does not establish Cargo freshness, remap paths embedded in
+compiler outputs, publish an action result, or authorize skipping a compiler.
+Choose an output directory whose artifact layout fits the original command.
+
 ## Storage and retention
 
 Every input delivery first passes the ordinary complete recovery verifier.

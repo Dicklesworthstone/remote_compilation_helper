@@ -179,11 +179,17 @@ fn expected_files(
 }
 
 fn verify_tree(root: &Path, files: &BTreeMap<PathBuf, ExpectedFile>) -> io::Result<()> {
-    let mut directories = BTreeSet::from([
-        PathBuf::new(),
-        PathBuf::from("diagnostics"),
-        PathBuf::from("artifacts"),
-    ]);
+    verify_file_tree(root, files, &["diagnostics", "artifacts"], Some(Path::new("delivery.json")))
+}
+
+fn verify_file_tree(
+    root: &Path,
+    files: &BTreeMap<PathBuf, ExpectedFile>,
+    required_directories: &[&str],
+    receipt: Option<&Path>,
+) -> io::Result<()> {
+    let mut directories = BTreeSet::from([PathBuf::new()]);
+    directories.extend(required_directories.iter().map(PathBuf::from));
     for path in files.keys() {
         for parent in path.ancestors().skip(1) {
             directories.insert(parent.to_path_buf());
@@ -205,7 +211,7 @@ fn verify_tree(root: &Path, files: &BTreeMap<PathBuf, ExpectedFile>) -> io::Resu
             require(
                 if directories.contains(&path) {
                     kind.is_dir()
-                } else if files.contains_key(&path) || path == Path::new("delivery.json") {
+                } else if files.contains_key(&path) || receipt == Some(path.as_path()) {
                     kind.is_file()
                 } else {
                     false
@@ -215,6 +221,161 @@ fn verify_tree(root: &Path, files: &BTreeMap<PathBuf, ExpectedFile>) -> io::Resu
         }
     }
     Ok(())
+}
+
+
+/// An independently writable, complete worker output tree. This is explicit
+/// output installation, not an action-cache hit or Cargo freshness authority.
+#[derive(Debug)]
+pub struct InstalledOutputs {
+    pub directory: PathBuf,
+    pub file_count: usize,
+    pub total_bytes: u64,
+    pub reused: bool,
+}
+
+impl InstalledOutputs {
+    pub fn to_json(&self) -> Value {
+        serde_json::json!({"kind":"worker-output-install", "directory":self.directory,
+            "files":self.file_count, "total_bytes":self.total_bytes, "reused":self.reused,
+            "reexecute":false, "publication_authorized":false})
+    }
+}
+
+fn ordinary_path(path: &Path, may_be_absent: bool) -> io::Result<()> {
+    require(
+        path.is_absolute() && path.file_name().is_some()
+            && path.components().all(|part| matches!(part, Component::RootDir | Component::Normal(_))),
+        "output path must be a named absolute directory without traversal",
+    )?;
+    let mut prefix = PathBuf::new();
+    for part in path.components() {
+        prefix.push(part.as_os_str());
+        match fs::symlink_metadata(&prefix) {
+            Ok(meta) => require(meta.is_dir(), "output path contains a link or non-directory")?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound && may_be_absent && prefix == path => {},
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+/// Install ALL verified artifact files in a fresh output directory. The original
+/// request, expected worker and transport policy remain mandatory. Copy into a
+/// private sibling, rehash the staged files, sync, then publish the entire tree
+/// with an exclusive rename. No partially installed tree is exposed, no file is
+/// hardlinked to the delivery/CAS, and an existing differing directory is never
+/// overwritten. Repeating a completed install revalidates its exact bytes/modes.
+///
+/// Failed staging is retained for inspection. As with receipt recovery, the
+/// operator must own these local directories; this is not hostile-process
+/// filesystem isolation. No compiler is launched, including on uncertainty.
+pub fn install_delivery_outputs(
+    request: &Value,
+    expected_worker: &str,
+    delivery_directory: &Path,
+    destination: &Path,
+    trust: DeliveryTrust,
+) -> Result<InstalledOutputs, String> {
+    let install = || -> io::Result<InstalledOutputs> {
+        ordinary_path(delivery_directory, false)?;
+        ordinary_path(destination, true)?;
+        require(
+            !destination.starts_with(delivery_directory) && !delivery_directory.starts_with(destination),
+            "delivery and output directories must not overlap",
+        )?;
+        let delivery = recover_existing_delivery(request, expected_worker, delivery_directory, trust)
+            .map_err(io::Error::other)?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "delivery is absent"))?;
+        require(delivery.receipt["exit_code"] == 0 && delivery.receipt["stop_reason"].is_null(),
+            "unsuccessful or interrupted execution cannot install outputs")?;
+        let files: BTreeMap<_, _> = expected_files(request, &delivery.receipt, true)?
+            .into_iter().filter_map(|(path, file)| {
+                path.strip_prefix("artifacts").ok().map(|relative| (relative.to_path_buf(), file))
+            }).collect();
+        require(!files.is_empty(), "delivery has no declared output files")?;
+        let verify = |root: &Path| -> io::Result<()> {
+            verify_file_tree(root, &files, &[], None)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                require(fs::metadata(root)?.permissions().mode() & 0o077 == 0,
+                    "installed output root is not private")?;
+            }
+            #[cfg(unix)]
+            let mut identities = BTreeSet::new();
+            for (path, file) in &files {
+                verify_file(&root.join(path), file)?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt;
+                    let metadata = fs::metadata(root.join(path))?;
+                    require(metadata.nlink() == 1,
+                        "installed output has a writable hardlink alias")?;
+                    require(identities.insert((metadata.dev(), metadata.ino())),
+                        "installed output names alias the same file")?;
+                }
+            }
+            Ok(())
+        };
+        let sync_directories = |root: &Path| -> io::Result<()> {
+            let mut directories = BTreeSet::from([PathBuf::new()]);
+            for path in files.keys() {
+                directories.extend(path.ancestors().skip(1).map(Path::to_path_buf));
+            }
+            for path in directories.iter().rev() { File::open(root.join(path))?.sync_all()?; }
+            Ok(())
+        };
+        let summary = |reused| InstalledOutputs {
+            directory: destination.to_path_buf(), file_count: files.len(),
+            total_bytes: files.values().map(|file| file.len).sum(), reused,
+        };
+        match fs::symlink_metadata(destination) {
+            Ok(_) => {
+                verify(destination)?;
+                for path in files.keys() { File::open(destination.join(path))?.sync_all()?; }
+                sync_directories(destination)?;
+                File::open(destination.parent().expect("named absolute destination"))?.sync_all()?;
+                return Ok(summary(true));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {},
+            Err(error) => return Err(error),
+        }
+        let parent = destination.parent().expect("named absolute destination");
+        let staging = tempfile::Builder::new().prefix(".rabs-output-staging-")
+            .tempdir_in(parent)?.keep();
+        let names = verified_artifact_names(request, &delivery.receipt["artifact_manifest"])?;
+        super::worker_delivery::create_artifact_directories(&staging, names.iter().map(String::as_str))?;
+        for (path, expected) in &files {
+            let source = File::open(delivery_directory.join("artifacts").join(path))?;
+            require(source.metadata()?.is_file(), "output source changed type")?;
+            let mut options = fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut output = options.open(staging.join(path))?;
+            let count = io::copy(&mut source.take(expected.len + 1), &mut output)?;
+            require(count == expected.len, "output changed length during installation")?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                output.set_permissions(fs::Permissions::from_mode(if expected.executable {0o700} else {0o600}))?;
+            }
+            output.sync_all()?;
+        }
+        verify(&staging)?;
+        sync_directories(&staging)?;
+        match rabs_cas::materialization::publish_new_directory(&staging, destination) {
+            Ok(()) => Ok(summary(false)),
+            Err(error) => Err(io::Error::new(error.kind(), format!(
+                "output publication failed; verify destination before retrying; staging={}: {error}",
+                staging.display()))),
+        }
+    };
+    install().map_err(|error| error.to_string())
 }
 
 fn verify_file(path: &Path, expected: &ExpectedFile) -> io::Result<()> {

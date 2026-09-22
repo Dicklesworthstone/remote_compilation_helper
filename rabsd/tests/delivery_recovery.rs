@@ -2,7 +2,7 @@
 //! including the binary command path. No compiler or worker is executed.
 #![cfg(unix)]
 
-use rabsd::coord::delivery_recovery::{DeliveryTrust, recover_existing_delivery};
+use rabsd::coord::delivery_recovery::{DeliveryTrust, install_delivery_outputs, recover_existing_delivery};
 use rabsd::coord::worker_delivery::{
     Delivery, MAX_FRAME_BYTES, WorkerAuthentication, WorkerPeer, receive_execution,
 };
@@ -283,5 +283,152 @@ fn both_operator_commands_recover_before_binding_and_preserve_exit_status() {
         assert_eq!(result["reexecute"], false);
         assert_eq!(result["acknowledgments_confirmed"], false);
         assert!(!String::from_utf8_lossy(&output.stderr).contains("worker-exec-listening"));
+    }
+}
+
+fn output_install_parent() -> tempfile::TempDir {
+    tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap()
+}
+
+#[test]
+fn output_install_is_private_complete_and_idempotent_after_ack_loss() {
+    use std::os::unix::fs::MetadataExt;
+    let parent = output_install_parent();
+    let original = delivered(parent.path(), 0, None, false);
+    let destination = parent.path().join("target");
+    let installed = install_delivery_outputs(&request(), "worker", &original.directory,
+        &destination, DeliveryTrust::Loopback).unwrap();
+    assert_eq!((installed.file_count, installed.total_bytes, installed.reused), (1, 4, false));
+    assert_eq!(fs::read(destination.join("a")).unwrap(), b"A\0\xffB");
+    assert_eq!(fs::read_dir(&destination).unwrap().count(), 1);
+    let source_meta = fs::metadata(original.directory.join("artifacts/a")).unwrap();
+    let target_meta = fs::metadata(destination.join("a")).unwrap();
+    assert_ne!(source_meta.ino(), target_meta.ino(), "output must not alias retained delivery");
+    assert_eq!(target_meta.permissions().mode() & 0o7777, 0o600);
+    let repeated = install_delivery_outputs(&request(), "worker", &original.directory,
+        &destination, DeliveryTrust::Loopback).unwrap();
+    assert!(repeated.reused);
+    assert_eq!(fs::metadata(destination.join("a")).unwrap().ino(), target_meta.ino());
+    fs::write(destination.join("a"), b"B\0\xffA").unwrap();
+    assert!(install_delivery_outputs(&request(), "worker", &original.directory,
+        &destination, DeliveryTrust::Loopback).is_err(), "same-length drift cannot be reused");
+    assert_eq!(fs::read(original.directory.join("artifacts/a")).unwrap(), b"A\0\xffB");
+    assert_eq!(fs::read(destination.join("a")).unwrap(), b"B\0\xffA", "never repair by overwrite");
+}
+
+#[test]
+fn output_install_never_accepts_an_existing_writable_hardlink_alias() {
+    let parent = output_install_parent();
+    let original = delivered(parent.path(), 0, None, false);
+    let destination = parent.path().join("target");
+    fs::create_dir(&destination).unwrap();
+    fs::set_permissions(&destination, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::hard_link(original.directory.join("artifacts/a"), destination.join("a")).unwrap();
+    let error = install_delivery_outputs(&request(), "worker", &original.directory,
+        &destination, DeliveryTrust::Loopback).unwrap_err();
+    assert!(error.contains("hardlink"), "{error}");
+    assert_eq!(fs::read(original.directory.join("artifacts/a")).unwrap(), b"A\0\xffB");
+    assert_eq!(fs::read(destination.join("a")).unwrap(), b"A\0\xffB");
+}
+
+#[test]
+fn output_install_requires_success_exact_request_and_historical_trust() {
+    for (exit, stop) in [(101, None), (130, Some("cancelled")), (124, Some("deadline-exceeded"))] {
+        let parent = output_install_parent();
+        let original = delivered(parent.path(), exit, stop, false);
+        let destination = parent.path().join("target");
+        assert!(install_delivery_outputs(&request(), "worker", &original.directory,
+            &destination, DeliveryTrust::Loopback).is_err());
+        assert!(!destination.exists());
+    }
+    let parent = output_install_parent();
+    let original = delivered(parent.path(), 0, None, true);
+    let destination = parent.path().join("target");
+    for trust in [DeliveryTrust::Loopback, DeliveryTrust::PinnedWorker([2;32])] {
+        assert!(install_delivery_outputs(&request(), "worker", &original.directory,
+            &destination, trust).is_err());
+        assert!(!destination.exists());
+    }
+    let mut changed = request(); changed["args"] = json!(["other.rs"]);
+    assert!(install_delivery_outputs(&changed, "worker", &original.directory,
+        &destination, DeliveryTrust::PinnedWorker(PIN)).is_err());
+    assert!(install_delivery_outputs(&request(), "other-worker", &original.directory,
+        &destination, DeliveryTrust::PinnedWorker(PIN)).is_err());
+    assert!(!destination.exists());
+    install_delivery_outputs(&request(), "worker", &original.directory,
+        &destination, DeliveryTrust::PinnedWorker(PIN)).unwrap();
+}
+
+#[test]
+fn output_install_refuses_corruption_links_overlap_and_existing_different_trees() {
+    let parent = output_install_parent();
+    let original = delivered(parent.path(), 0, None, false);
+    let existing = parent.path().join("existing"); fs::create_dir(&existing).unwrap();
+    fs::write(existing.join("unrelated"), b"keep").unwrap();
+    assert!(install_delivery_outputs(&request(), "worker", &original.directory,
+        &existing, DeliveryTrust::Loopback).is_err());
+    assert_eq!(fs::read(existing.join("unrelated")).unwrap(), b"keep");
+    let link = parent.path().join("link"); symlink(&existing, &link).unwrap();
+    for destination in [link.clone(), link.join("child"), original.directory.join("outputs"),
+        parent.path().to_path_buf()] {
+        assert!(install_delivery_outputs(&request(), "worker", &original.directory,
+            &destination, DeliveryTrust::Loopback).is_err());
+    }
+    fs::write(original.directory.join("artifacts/a"), b"B\0\xffA").unwrap();
+    let destination = parent.path().join("corrupt");
+    assert!(install_delivery_outputs(&request(), "worker", &original.directory,
+        &destination, DeliveryTrust::Loopback).is_err());
+    assert!(!destination.exists());
+}
+
+#[test]
+fn output_install_cli_revalidates_without_a_worker_or_cas() {
+    let parent = output_install_parent();
+    let original = delivered(parent.path(), 0, None, false);
+    let request_path = parent.path().join("request.json");
+    fs::write(&request_path, serde_json::to_vec(&request()).unwrap()).unwrap();
+    let destination = parent.path().join("target");
+    for reused in [false, true] {
+        let output = Command::new(env!("CARGO_BIN_EXE_rabs-delivery-cas"))
+            .arg("install").arg(&request_path).arg("worker").arg(&original.directory)
+            .arg(&destination).arg("loopback").output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        let reply: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(reply["kind"], "worker-output-install");
+        assert_eq!(reply["reused"], reused);
+        assert_eq!(reply["reexecute"], false);
+        assert_eq!(reply["publication_authorized"], false);
+    }
+}
+
+#[test]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn exclusive_directory_publication_never_overwrites_an_empty_or_racing_target() {
+    use rabs_cas::materialization::publish_new_directory;
+    use std::sync::{Arc, Barrier};
+    let parent = output_install_parent();
+    let staged = parent.path().join("staged"); fs::create_dir(&staged).unwrap();
+    fs::write(staged.join("file"), b"ready").unwrap();
+    let existing = parent.path().join("existing"); fs::create_dir(&existing).unwrap();
+    assert!(publish_new_directory(&staged, &existing).is_err());
+    assert!(staged.join("file").exists());
+    assert_eq!(fs::read_dir(&existing).unwrap().count(), 0);
+    let target = parent.path().join("race");
+    let barrier = Arc::new(Barrier::new(2));
+    let threads: Vec<_> = (0..2).map(|i| {
+        let stage = parent.path().join(format!("stage-{i}")); fs::create_dir(&stage).unwrap();
+        fs::write(stage.join("winner"), i.to_string()).unwrap();
+        let target = target.clone(); let barrier = Arc::clone(&barrier);
+        std::thread::spawn(move || {
+            barrier.wait();
+            let succeeded = publish_new_directory(&stage, &target).is_ok();
+            (i, stage, succeeded)
+        })
+    }).collect();
+    let results: Vec<_> = threads.into_iter().map(|thread| thread.join().unwrap()).collect();
+    assert_eq!(results.iter().filter(|(_, _, won)| *won).count(), 1);
+    for (i, stage, won) in results {
+        assert_eq!(stage.exists(), !won);
+        if won { assert_eq!(fs::read_to_string(target.join("winner")).unwrap(), i.to_string()); }
     }
 }

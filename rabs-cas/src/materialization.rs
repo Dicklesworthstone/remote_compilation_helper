@@ -58,6 +58,44 @@ use crate::metadata_store::{RabsMetadataStore, SqlValue, StoreError, digest_key}
 /// temp path.
 static MATERIALIZE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// Atomically publish a verified private output directory beside its final
+/// destination, without replacing even an empty existing directory. Both names
+/// resolve against one open parent. There is no check-then-rename fallback.
+/// An error after rename (directory sync) is an uncertain durability outcome;
+/// callers must verify an existing destination before retrying.
+pub fn publish_new_directory(staging: &Path, destination: &Path) -> std::io::Result<()> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        let parent = staging.parent().filter(|parent| {
+            staging.is_absolute()
+                && destination.is_absolute()
+                && Some(*parent) == destination.parent()
+        }).ok_or_else(|| std::io::Error::new(
+            std::io::ErrorKind::InvalidInput, "output directories must be absolute siblings",
+        ))?;
+        let source = staging.file_name().ok_or_else(|| std::io::Error::new(
+            std::io::ErrorKind::InvalidInput, "staging directory needs a name",
+        ))?;
+        let target = destination.file_name().ok_or_else(|| std::io::Error::new(
+            std::io::ErrorKind::InvalidInput, "output directory needs a name",
+        ))?;
+        if !std::fs::symlink_metadata(staging)?.is_dir() {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput,
+                "staging must be an ordinary directory"));
+        }
+        let directory = std::fs::File::open(parent)?;
+        rustix::fs::renameat_with(&directory, source, &directory, target,
+            rustix::fs::RenameFlags::NOREPLACE)?;
+        directory.sync_all()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (staging, destination);
+        Err(std::io::Error::new(std::io::ErrorKind::Unsupported,
+            "atomic output directory installation is unsupported on this platform"))
+    }
+}
+
 /// Why a materialization did not happen. Every variant leaves the
 /// destination path exactly as it was.
 #[derive(Debug, Clone, PartialEq, Eq)]
