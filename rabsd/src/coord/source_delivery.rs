@@ -6,11 +6,15 @@
 //! transfer reply before the delivery engine reaches its execution frontier.
 //! Source availability is not action-key validity or cache-publication authority.
 
+mod preparation;
+
 use super::worker_delivery::{MAX_FRAME_BYTES, WorkerAuthentication, WorkerPeer, validate_request};
 use rabs_asupersync::worker_transport::MAX_JSON_RECORD;
-use rabs_sandbox::snapshot_capture::{MemberKind, SealedSourceSnapshot, capture_sealed_source};
+use rabs_sandbox::snapshot_capture::{MemberKind, SealedSourceSnapshot};
+#[cfg(all(test, unix))]
+use rabs_sandbox::snapshot_capture::capture_sealed_source;
 use rabs_sandbox::source_transfer::{
-    MAX_SOURCE_BYTES, MAX_SOURCE_CHUNK, MAX_SOURCE_FILES, SOURCE_TRANSFER, SourceFile,
+    MAX_SOURCE_CHUNK, MAX_SOURCE_FILES, SOURCE_TRANSFER, SourceFile,
     SourceManifest, SourceReceiver,
 };
 use serde_json::{Value, json};
@@ -45,11 +49,18 @@ fn digest(value: &Value) -> io::Result<[u8; 32]> {
     Ok(digest)
 }
 
+fn manifest_value(manifest: &SourceManifest) -> Value {
+    json!({"manifest_sha256":hex(&manifest.digest()),
+        "files":manifest.files().iter().map(|file| json!({
+            "path":file.path, "bytes":file.len, "sha256":hex(&file.sha256), "executable":file.executable,
+        })).collect::<Vec<_>>()})
+}
+
 /// Validate the optional source declaration without requiring source bytes.
 /// Resume and verified local delivery recovery use this without a checkout.
 pub fn request_manifest(request: &Value) -> io::Result<Option<SourceManifest>> {
-    require(request.get("source_files").is_none(),
-        "source_files is a preparation specification, not an execution manifest; use --worker-prepare")?;
+    require(request.get("source_files").is_none() && request.get("source_roots").is_none(),
+        "source_files/source_roots are preparation specifications, not execution manifests; use --worker-prepare")?;
     let Some(value) = request.get("source_manifest") else { return Ok(None); };
     require(request.get("workspace_backing").is_none(),
         "source_manifest and workspace_backing are mutually exclusive")?;
@@ -72,32 +83,14 @@ pub fn request_manifest(request: &Value) -> io::Result<Option<SourceManifest>> {
     Ok(Some(manifest))
 }
 
-/// Read an operator's explicit projection, never an implicit checkout walk.
-/// A preparation specification has the ordinary canonical-exec fields, with
-/// source_files in place of source_manifest. It is not itself dispatchable.
-fn preparation_paths(specification: &Value) -> io::Result<Vec<String>> {
-    require(specification.is_object(), "source preparation requires an object")?;
-    require(specification["kind"] == "canonical-exec"
-        && specification["request_id"].as_u64().is_some(),
-        "source preparation requires canonical-exec and an unsigned request_id")?;
-    require(specification.get("source_manifest").is_none()
-        && specification.get("workspace_backing").is_none(),
-        "preparation cannot replace an existing source_manifest or workspace_backing")?;
-    require(serde_json::to_vec(specification)?.len() <= MAX_FRAME_BYTES,
-        "source preparation specification exceeds the request bound")?;
-    let paths = specification["source_files"].as_array()
-        .filter(|paths| !paths.is_empty() && paths.len() <= MAX_SOURCE_FILES)
-        .ok_or_else(|| invalid("source_files must be a nonempty bounded array"))?;
-    paths.iter().map(|path| {
-        path.as_str().map(str::to_owned)
-            .ok_or_else(|| invalid("source_files must contain only relative path strings"))
-    }).collect()
-}
-
 /// Prepare an executable request AND retain its exact source bytes in a new
 /// private directory. This is a blocking operator operation, not reactor work.
-/// The existing paired-scan capture establishes coherence; only source_files
-/// are copied from that image. No compiler, network, or publication is invoked.
+/// Select either source_files for one root, or source_roots mapping stable IDs
+/// to {path, files}. Relative host paths resolve against source_root; absolute
+/// paths explicitly select another checkout. A closure's files are installed as
+/// ID/relative-path under /__rabs/workspace, preserving sibling path dependencies.
+/// All roots share ONE paired capture; only selected regular files are copied.
+/// No Cargo manifest rewriting, dependency discovery, compiler or network runs.
 ///
 /// The directory contains source/ and request.json. All selected source files
 /// are verified through SourceReceiver and synced before request.json is even
@@ -105,6 +98,9 @@ fn preparation_paths(specification: &Value) -> io::Result<Vec<String>> {
 /// retained, never overwritten, retried in place, or silently dispatched.
 /// Execute using that source directory, NOT the mutable original checkout.
 /// Recapture at execution still verifies the saved manifest before dispatch.
+/// Host root paths are stripped from the prepared request, not sent to workers.
+/// The supplied command_context/argv remains exact; use a canonical member cwd
+/// when Cargo's manifest lives under a selected ID instead of the workspace root.
 ///
 /// The caller owns the destination parent and excludes concurrent modification
 /// by processes with its own credentials, as for ordinary worker deliveries.
@@ -117,8 +113,7 @@ pub fn prepare_source_bundle(
     specification: &Value,
     destination: &Path,
 ) -> io::Result<Value> {
-    let paths = preparation_paths(specification)?;
-    require(source_root.is_absolute(), "source root must be absolute")?;
+    let inputs = preparation::SourcePreparation::parse(source_root, specification)?;
     require(destination.is_absolute() && destination.file_name().is_some()
         && destination.components().all(|part| matches!(part, Component::RootDir | Component::Normal(_))),
         "bundle destination must be absolute without traversal")?;
@@ -130,13 +125,11 @@ pub fn prepare_source_bundle(
         Err(error) => return Err(error),
         Ok(_) => return Err(io::Error::new(io::ErrorKind::AlreadyExists, "bundle destination already exists")),
     }
-    let image = capture_sealed_source(
-        &[("workspace".to_owned(), source_root.to_path_buf())], false, 2, MAX_SOURCE_BYTES,
-    ).map_err(|error| invalid(&format!("source capture refused: {error:?}")))?;
-    let upload = SourceUpload::from_snapshot(Arc::new(image), "workspace", &paths)?;
+    let upload = inputs.capture()?;
     let mut request = specification.clone();
     let fields = request.as_object_mut().ok_or_else(|| invalid("source preparation object"))?;
     fields.remove("source_files");
+    fields.remove("source_roots");
     fields.insert("source_manifest".to_owned(), upload.wire_manifest());
     // One validator for prepared and hand-authored execution requests. This
     // preserves argv, output declarations, timeouts, and unknown extensions.
@@ -192,7 +185,7 @@ pub fn prepare_source_bundle(
     Ok(json!({"kind":"prepared-source-bundle", "directory":destination,
         "source_root":source, "request_path":request_path, "request_id":request["request_id"],
         "request_sha256":hex(&Sha256::digest(&request_bytes)),
-        "manifest_sha256":hex(&upload.manifest.digest()),
+        "manifest_sha256":hex(&upload.manifest.digest()), "source_roots":inputs.root_count(),
         "source_files":upload.manifest.files().len(), "source_bytes":upload.manifest.total_bytes(),
         "executed":false, "publication_authorized":false}))
 }
@@ -262,12 +255,12 @@ impl SourceUpload {
         let mut names = BTreeSet::new();
         let mut files = Vec::new();
         for (root, paths) in roots {
-            require(valid_closure_root(root) && names.insert(root.as_str()),
-                "unsafe, hidden or duplicate source closure root")?;
+            require(valid_closure_root(root) && names.insert(root.to_ascii_lowercase()),
+                "unsafe, hidden, duplicate or case-colliding source closure root")?;
             require(paths.len() <= MAX_SOURCE_FILES.saturating_sub(files.len()),
                 "source closure exceeds aggregate file count")?;
             let selected = Self::from_snapshot(Arc::clone(&image), root, paths)?;
-            for mut file in selected.manifest.files {
+            for mut file in selected.manifest.files().iter().cloned() {
                 file.path = format!("{root}/{}", file.path);
                 // The saved bundle is recaptured as a single workspace before
                 // transfer. Refuse a prefix that would hide its selected bytes.
@@ -301,10 +294,7 @@ impl SourceUpload {
 
     #[must_use]
     pub fn wire_manifest(&self) -> Value {
-        json!({"manifest_sha256":hex(&self.manifest.digest()),
-            "files":self.manifest.files().iter().map(|file| json!({
-                "path":file.path, "bytes":file.len, "sha256":hex(&file.sha256), "executable":file.executable,
-            })).collect::<Vec<_>>()})
+        manifest_value(&self.manifest)
     }
 
     fn begin_frame(&self, request: &Value) -> Value {
