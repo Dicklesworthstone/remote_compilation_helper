@@ -23,4 +23,5 @@ pub mod output;
 pub mod request_journal;
 pub mod result_spool;
 pub mod session;
+pub mod source_task;
 pub mod source_transfer;
