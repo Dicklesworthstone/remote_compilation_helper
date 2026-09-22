@@ -22,7 +22,7 @@
 //! passthrough), but a bare `MAKEFLAGS=-jN` lets every PLAIN `make`
 //! invoked in a recipe mint its OWN full-size pool — tree-depth
 //! multiplication. [`JobserverBridge`] closes that with a real fifo
-//! jobserver carried through the workspace bind by PATH: one budget,
+//! jobserver carried through the canonical HOME bind by PATH: one budget,
 //! shared by every descendant, sized from the execution grant.
 
 /// Env var names that carry make/cargo coordination state — including
@@ -37,7 +37,7 @@ pub const COORDINATION_ENV_VARS: &[&str] = &["CARGO_MAKEFLAGS", "MAKEFLAGS", "MF
 /// nothing about THIS host's budget.
 pub const CAPACITY_ENV_VARS: &[&str] = &["NUM_JOBS"];
 
-const BRIDGE_DIRECTORY: &str = ".rabs-jobserver";
+const BRIDGE_PREFIX: &str = ".rabs-jobserver-";
 
 // The Linux bridge preloads before any client can consume tokens. Keep
 // that write within PIPE_BUF rather than allocating or blocking on an
@@ -99,20 +99,21 @@ pub fn replace_with_worker_local(env: &mut Vec<(String, String)>, slots: u32) {
 }
 
 /// One attempt's SANDBOX-VISIBLE jobserver (bead I004): a real
-/// named-pipe jobserver minted under the workspace backing so nested
+/// named-pipe jobserver minted under the worker-owned HOME backing so nested
 /// make/cargo/ninja inside the canonical namespace cooperate on ONE
 /// budget instead of each plain `make` in a recipe minting its own
 /// full-size pool (parallelism multiplying by tree depth).
 ///
-/// Mechanism: the fifo node lives host-side under the workspace backing
-/// directory, which the canonical namespace bind-mounts at
-/// `rabs_sandbox::layout::WORKSPACE` — both views address the same
+/// Mechanism: the fifo node lives in a fresh private directory under HOME,
+/// which the canonical namespace bind-mounts at
+/// `rabs_sandbox::layout::HOME` — both views address the same
 /// in-kernel pipe, so the worker-held writer feeds token bytes that
 /// sandboxed descendants consume by PATH. No fd passthrough required.
 ///
 /// Drop unlinks the fifo and closes the writer: stranded readers see
 /// EOF after the final tokens, and no per-attempt node outlives the
-/// attempt.
+/// attempt. Source is never consulted or modified to establish coordination;
+/// `.rabs-jobserver` remains an ordinary, usable source-file name.
 #[derive(Debug)]
 pub struct JobserverBridge {
     /// Host-side path (unlinked on Drop).
@@ -120,6 +121,10 @@ pub struct JobserverBridge {
     /// Held write end: keeps the fifo open for late readers; its bytes
     /// ARE the free-slot budget.
     _writer: std::fs::File,
+    /// Private runtime backing, dropped after the holding writer closes.
+    _directory: tempfile::TempDir,
+    /// Total admitted slots, including the command's implicit slot.
+    slots: u32,
     /// The full MAKEFLAGS value to install (budget + fifo auth with the
     /// IN-SANDBOX path).
     makeflags: String,
@@ -128,15 +133,14 @@ pub struct JobserverBridge {
 impl JobserverBridge {
     /// Mint a bridge with `grant_slots` TOTAL slots and exactly one
     /// implicit slot already owned by the command. Its remaining C-1
-    /// transferable tokens live under
-    /// `workspace_backing/.rabs-jobserver`. The workspace backing is
-    /// bound at `rabs_sandbox::layout::WORKSPACE`, so both fifo paths
+    /// transferable tokens live in a new private directory under
+    /// `home_backing`. HOME is bound at `rabs_sandbox::layout::HOME`, so both fifo paths
     /// are derived from the same relative location.
     ///
     /// # Errors
     /// Typed [`std::io::Error`] from directory creation or the mint.
     /// Callers must refuse execution if the shared budget is unavailable.
-    pub fn mint(grant_slots: u32, workspace_backing: &std::path::Path) -> std::io::Result<Self> {
+    pub fn mint(grant_slots: u32, home_backing: &std::path::Path) -> std::io::Result<Self> {
         let slots = grant_slots.max(1);
         if slots > MAX_BRIDGE_TOKENS {
             return Err(std::io::Error::new(
@@ -144,22 +148,27 @@ impl JobserverBridge {
                 "jobserver grant exceeds the bounded fifo preload",
             ));
         }
-        let host_dir = workspace_backing.join(BRIDGE_DIRECTORY);
-        std::fs::create_dir_all(&host_dir)?;
+        // Never use a fixed child selected by source contents or a previous
+        // action. A failed mint drops only this attempt's private directory.
+        let directory = tempfile::Builder::new().prefix(BRIDGE_PREFIX).tempdir_in(home_backing)?;
         let (host_path, writer, _edge_auth_unused) =
-            rabs_asupersync::jobserver::mint_fifo_jobserver((slots - 1) as usize, &host_dir)?;
-        let name = host_path.file_name().map_or_else(
-            || "jobserver.fifo".to_string(),
-            |n| n.to_string_lossy().into_owned(),
-        );
+            rabs_asupersync::jobserver::mint_fifo_jobserver((slots - 1) as usize, directory.path())?;
+        let component = |path: &std::path::Path| -> std::io::Result<String> {
+            path.file_name().and_then(|name| name.to_str()).map(str::to_owned)
+                .ok_or_else(|| std::io::Error::other("jobserver runtime name is not UTF-8"))
+        };
+        let dir_name = component(directory.path())?;
+        let name = component(&host_path)?;
         let makeflags = format!(
-            "-j{slots} --jobserver-auth=fifo:{}/{BRIDGE_DIRECTORY}/{}",
-            rabs_sandbox::layout::WORKSPACE,
+            "-j{slots} --jobserver-auth=fifo:{}/{dir_name}/{}",
+            rabs_sandbox::layout::HOME,
             name
         );
         Ok(Self {
             host_path,
             _writer: writer,
+            _directory: directory,
+            slots,
             makeflags,
         })
     }
@@ -170,16 +179,18 @@ impl JobserverBridge {
         &self.makeflags
     }
 
-    /// Install the bridge auth: overwrite the worker-authored MAKEFLAGS
-    /// entry in place (env stays name-sorted; only the value changes).
+    /// Install one authority for Cargo and make on the FINAL environment.
+    /// Stale descriptors, duplicate coordination keys and capacity claims are
+    /// replaced together, so CARGO_MAKEFLAGS cannot shadow the valid MAKEFLAGS.
     pub fn apply(env: &mut Vec<(String, String)>, bridge: &Self) {
+        replace_with_worker_local(env, bridge.slots);
         for (k, v) in env.iter_mut() {
             if k == "MAKEFLAGS" {
                 *v = bridge.makeflags.clone();
-                return;
             }
         }
-        env.push(("MAKEFLAGS".to_string(), bridge.makeflags.clone()));
+        env.push(("CARGO_MAKEFLAGS".to_string(), bridge.makeflags.clone()));
+        env.sort_by(|a, b| a.0.cmp(&b.0));
     }
 }
 
@@ -240,7 +251,7 @@ mod tests {
         let error = JobserverBridge::mint(u32::MAX, workspace.path())
             .expect_err("unbounded grant must be refused before allocation");
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
-        assert!(!workspace.path().join(BRIDGE_DIRECTORY).exists());
+        assert_eq!(std::fs::read_dir(workspace.path()).unwrap().count(), 0);
     }
 
     #[cfg(target_os = "linux")]
@@ -270,7 +281,56 @@ mod tests {
             drop(bridge);
             assert!(!path.exists());
             assert_eq!(reader.read(&mut [0]).unwrap(), 0);
+            assert_eq!(std::fs::read_dir(workspace.path()).unwrap().count(), 0);
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bridge_runtime_is_private_and_independent_for_each_attempt() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let first = JobserverBridge::mint(2, home.path()).unwrap();
+        let second = JobserverBridge::mint(3, home.path()).unwrap();
+        assert_ne!(first.host_path, second.host_path);
+        assert_ne!(first._directory.path(), second._directory.path());
+        assert!(first.makeflags().contains("fifo:/__rabs/home/.rabs-jobserver-"));
+        assert!(!first.makeflags().contains("/__rabs/workspace"));
+        assert_eq!(
+            std::fs::metadata(first._directory.path()).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        let first_dir = first._directory.path().to_path_buf();
+        drop(first);
+        assert!(!first_dir.exists());
+        assert!(second.host_path.exists(), "retiring one attempt must not unlink another FIFO");
+        drop(second);
+        assert_eq!(std::fs::read_dir(home.path()).unwrap().count(), 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bridge_replaces_both_auth_channels_and_capacity_without_duplicates() {
+        let home = tempfile::tempdir().unwrap();
+        let bridge = JobserverBridge::mint(2, home.path()).unwrap();
+        let mut env = env_of(&[
+            ("MAKEFLAGS", "-j999 --jobserver-auth=3,4"),
+            ("MAKEFLAGS", "duplicate"),
+            ("CARGO_MAKEFLAGS", "--jobserver-auth=fifo:/other-worker"),
+            ("MFLAGS", "-j999"),
+            ("NUM_JOBS", "999"),
+            ("PATH", "/bin"),
+        ]);
+        JobserverBridge::apply(&mut env, &bridge);
+        let once = env.clone();
+        JobserverBridge::apply(&mut env, &bridge);
+        assert_eq!(env, once);
+        assert_eq!(env.len(), 4);
+        let map: std::collections::BTreeMap<_, _> = env.into_iter().collect();
+        assert_eq!(map["MAKEFLAGS"], bridge.makeflags());
+        assert_eq!(map["CARGO_MAKEFLAGS"], bridge.makeflags());
+        assert_eq!(map["NUM_JOBS"], "2");
+        assert_eq!(map["PATH"], "/bin");
     }
 
     #[test]

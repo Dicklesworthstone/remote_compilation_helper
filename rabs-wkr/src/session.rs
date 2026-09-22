@@ -51,7 +51,8 @@ pub struct CanonicalExecRequest {
     /// Workspace backing directory (mounts at `/__rabs/workspace`).
     pub workspace_backing: String,
     /// Execution resource grant for this attempt (bead I004): the
-    /// transferable jobserver token budget the coordinator admits.
+    /// total jobserver slot budget the coordinator admits (one implicit
+    /// slot plus C-1 transferable tokens).
     /// It cannot exceed the worker's own slot count; zero floors to
     /// one. `None` uses the worker's slot count.
     pub jobserver_grant: Option<u32>,
@@ -229,7 +230,6 @@ fn execute_canonical_inner(
     spill_root: &std::path::Path,
     control: &ExecutionControl,
 ) -> ExecResult {
-    use crate::jobserver::replace_with_worker_local;
     use rabs_asupersync::process_groups::ManagedProcessGroup;
     use rabs_asupersync::region_tree::Attribution;
     use rabs_sandbox::canonical_mounts::CanonicalMountPlan;
@@ -257,10 +257,10 @@ fn execute_canonical_inner(
     // Worker-local jobserver authority runs on the FINAL env: extra_env
     // may carry smuggled coordination keys, so replacement must see them.
     let grant = request.jobserver_grant.unwrap_or(slots).min(slots).max(1);
-    replace_with_worker_local(&mut spec.env, grant);
     // One real FIFO budget is held until the process group and drains resolve.
+    // Runtime coordination belongs in writable HOME, never in verified source.
     let bridge = match crate::jobserver::JobserverBridge::mint(
-        grant, std::path::Path::new(&request.workspace_backing),
+        grant, home_backing,
     ) {
         Ok(bridge) => bridge,
         Err(_) => return exec_error(request.request_id),

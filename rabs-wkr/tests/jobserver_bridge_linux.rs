@@ -4,7 +4,7 @@
 //! recipes (not `$(MAKE)`), which without the bridge lets every
 //! sub-master mint its OWN full-size pool — parallelism multiplying by
 //! tree depth. With [`JobserverBridge`](rabs_wkr::jobserver::JobserverBridge)
-//! all descendants share ONE fifo budget carried through the workspace
+//! all descendants share ONE fifo budget carried through the HOME
 //! bind by PATH, sized by the coordinator's `jobserver_grant`: observed
 //! leaf concurrency never exceeds the grant. Skips loudly where the
 //! canonical namespace is unavailable.
@@ -12,7 +12,7 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 fn worker_bin() -> &'static str {
@@ -35,13 +35,36 @@ fn canonical_supported() -> bool {
         .is_empty()
 }
 
-fn spawn_worker(addr: &str) -> Child {
-    Command::new(worker_bin())
+struct OwnedWorker(Child);
+
+impl Drop for OwnedWorker {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+impl OwnedWorker {
+    fn wait(&mut self) -> ExitStatus {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(status) = self.0.try_wait().expect("worker status") {
+                return status;
+            }
+            assert!(Instant::now() < deadline, "worker did not drain and exit");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+fn spawn_worker(addr: &str, state: &std::path::Path) -> OwnedWorker {
+    OwnedWorker(Command::new(worker_bin())
         .args(["--coordinator", addr, "--worker-id", "i004-wkr", "--once"])
+        .env("RABS_WORKER_STATE_DIR", state)
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::inherit())
         .spawn()
-        .expect("spawn worker")
+        .expect("spawn worker"))
 }
 
 fn read_line<R: BufRead>(reader: &mut R) -> String {
@@ -78,17 +101,20 @@ fn nested_make_tree_respects_the_worker_grant() {
     }
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap().to_string();
-    let mut worker = spawn_worker(&addr);
+    let state = tempfile::tempdir().unwrap();
+    let mut worker = spawn_worker(&addr, &state.path().join("journal"));
 
-    listener.set_nonblocking(false).unwrap();
+    listener.set_nonblocking(true).unwrap();
     let (stream, _peer) = {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
+            assert!(Instant::now() < deadline, "worker connection deadline");
             match listener.accept() {
                 Ok(pair) => break pair,
-                Err(_) if Instant::now() < deadline => {
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     std::thread::sleep(Duration::from_millis(20));
                 }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(e) => panic!("accept: {e}"),
             }
         }
@@ -96,6 +122,7 @@ fn nested_make_tree_respects_the_worker_grant() {
     stream
         .set_read_timeout(Some(Duration::from_secs(120)))
         .unwrap();
+    stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
     let mut writer = stream.try_clone().unwrap();
     let mut reader = BufReader::new(stream);
 
@@ -110,6 +137,9 @@ fn nested_make_tree_respects_the_worker_grant() {
     // without interleaved-append corruption.
     let toolchain = toolchain_dir();
     let workspace = tempfile::tempdir().unwrap();
+    // This is legal source, not a worker runtime directory reservation.
+    // Previously it prevented the actual executor from starting at all.
+    std::fs::write(workspace.path().join(".rabs-jobserver"), b"source-owned").unwrap();
     std::fs::write(
         workspace.path().join("top.mk"),
         "all: s1 s2 s3\ns%:\n\t@make -s -f sub.mk job=$@\n",
@@ -147,15 +177,10 @@ fn nested_make_tree_respects_the_worker_grant() {
         "nested make failed: {result}"
     );
     // CAPACITY PROOF: parse the leaf interval lines and sweep for peak
-    // simultaneous jobs. The GNU make jobserver protocol grants every
-    // command one IMPLICIT slot before it contacts the pool (make
-    // manual §13.1, 4.4.1: "any tool ... can always run one job without
-    // having to contact the jobserver"), so the enforceable ceiling for
-    // this tree (one master + up-to-grant concurrent sub-masters) is
-    // grant + 2 — versus UNBOUNDED multiplication when every plain
-    // `make` mints its own full-size pool. Empirically the bridge holds
-    // peak at grant+1..grant+2 here; without it the same tree scales
-    // with machine slots.
+    // simultaneous jobs. One implicit slot plus C-1 FIFO tokens is C,
+    // not C+1. Each nested make's implicit slot is the parent recipe's
+    // occupied slot, not new capacity. The original declared grant is
+    // the ceiling; a relaxed grant+2 bound would hide over-allocation.
     let raw = std::fs::read_to_string(workspace.path().join("intervals.txt"))
         .expect("leaf interval stamps visible host-side through the bind");
     let intervals: Vec<(u128, u128)> = raw
@@ -179,22 +204,21 @@ fn nested_make_tree_respects_the_worker_grant() {
     const GRANT: u32 = 2;
     let peak = max_concurrency(&intervals);
     assert!(
-        peak <= GRANT + 2,
-        "worker capacity violated: {peak} concurrent leaves under a grant of {GRANT} \
-         (protocol ceiling grant+2)"
+        peak <= GRANT,
+        "worker capacity violated: {peak} concurrent leaves under a grant of {GRANT}"
     );
 
-    // No per-attempt fifo node outlives the attempt.
-    let bridge_dir = workspace.path().join(".rabs-jobserver");
-    assert!(
-        !bridge_dir.exists()
-            || std::fs::read_dir(&bridge_dir)
-                .expect("bridge dir readable")
-                .count()
-                == 0,
-        "attempt jobserver fifo was not cleaned up"
+    // The source-owned name is unchanged; all coordination is outside
+    // the workspace. The only added file is the declared test observation.
+    assert_eq!(
+        std::fs::read(workspace.path().join(".rabs-jobserver")).unwrap(),
+        b"source-owned"
     );
+    let mut names: Vec<_> = std::fs::read_dir(workspace.path()).unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap()).collect();
+    names.sort();
+    assert_eq!(names, [".rabs-jobserver", "intervals.txt", "sub.mk", "top.mk"]);
 
-    let status = worker.wait().expect("worker exit");
+    let status = worker.wait();
     assert_eq!(status.code(), Some(0), "clean worker exit after --once");
 }

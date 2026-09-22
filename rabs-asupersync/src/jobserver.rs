@@ -258,7 +258,7 @@ pub const MAX_FIFO_TOKENS: usize = 4096;
 ///
 /// THE single mint for both injection surfaces: edge-side managed Cargo
 /// launches ([`crate::cargo_launch`], fifo in temp space) and the
-/// worker's sandbox bridge (bead I004, fifo under the workspace backing
+/// worker's sandbox bridge (bead I004, fifo under private HOME backing
 /// so nested make/cargo inside the canonical namespace reach it by PATH
 /// — bwrap offers no fd passthrough, but a bind-mounted directory
 /// carries the fifo node itself, and both namespace views address the
