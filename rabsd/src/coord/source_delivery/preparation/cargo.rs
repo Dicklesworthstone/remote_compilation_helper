@@ -1,11 +1,15 @@
 //! Bounded local Cargo graph discovery from retained, coherent source bytes.
 //!
-//! This intentionally supports locked local workspaces/path dependencies. The
+//! Supports locked local workspaces and explicitly approved crates.io vendor trees.
+//! Directory-source files and lock checksums are validated before reuse. The
 //! approved anchor is the upload boundary, not a guessed set of Rust files:
 //! build scripts, include! inputs, and optional/target dependencies retain their
 //! relative layout. No descriptor, cache authority, or compiler result is minted.
 
+mod vendor;
+
 use super::super::{SourceUpload, invalid, require};
+use vendor::VendoredSources;
 use rabs_asupersync::process_groups::{GroupSignal, ManagedProcessGroup};
 use rabs_asupersync::region_tree::Attribution;
 use rabs_sandbox::snapshot_capture::{MemberKind, SealedSourceSnapshot};
@@ -26,13 +30,17 @@ const MAX_PACKAGES: usize = 1024;
 #[derive(Debug)]
 pub(super) struct CargoSource {
     manifest: String,
+    vendor: Option<String>,
 }
 
 impl CargoSource {
     pub(super) fn parse(value: &Value) -> io::Result<Self> {
         require(
-            value.as_object().is_some_and(|fields| fields.len() == 1),
-            "cargo_source requires exactly manifest",
+            value.as_object().is_some_and(|fields| {
+                fields.contains_key("manifest")
+                    && fields.keys().all(|key| matches!(key.as_str(), "manifest" | "vendor"))
+            }),
+            "cargo_source requires manifest and optional vendor",
         )?;
         let manifest = value["manifest"]
             .as_str()
@@ -49,8 +57,14 @@ impl CargoSource {
                     .is_some_and(|name| name == "Cargo.toml"),
             "cargo_source manifest must be a safe relative Cargo.toml path",
         )?;
+        let vendor = value.get("vendor").map(|value| {
+            let directory = value.as_str().ok_or_else(|| invalid("cargo_source vendor must be a string"))?;
+            vendor::validate_directory(directory)?;
+            Ok::<_, io::Error>(directory.to_owned())
+        }).transpose()?;
         Ok(Self {
             manifest: manifest.to_owned(),
+            vendor,
         })
     }
 
@@ -59,7 +73,10 @@ impl CargoSource {
     }
 
     pub(super) fn prepare(&self, image: Arc<SealedSourceSnapshot>) -> io::Result<SourceUpload> {
-        let files = validate_capture(&image, &self.manifest)?;
+        let vendor = self.vendor.as_deref().map(|directory| {
+            VendoredSources::verify(&image, &self.manifest, directory)
+        }).transpose()?;
+        let files = validate_capture(&image, &self.manifest, vendor.as_ref())?;
         // Planning starts only after a complete paired capture. Cargo never sees
         // a mutable original checkout or a mixture of pre/post-mutation files.
         let planning = tempfile::Builder::new()
@@ -120,13 +137,15 @@ impl CargoSource {
         let output = bounded_command(command, &planning_root, METADATA_TIMEOUT, OUTPUT_LIMIT)?;
         let metadata: Value = serde_json::from_slice(&output)
             .map_err(|error| invalid(&format!("invalid Cargo metadata JSON: {error}")))?;
-        validate_metadata(&image, &root, &self.manifest, &metadata)?;
+        validate_metadata(&image, &root, &self.manifest, &metadata, vendor.as_ref())?;
         verify_planning_bytes(&image, &root, &files)?;
         SourceUpload::from_snapshot(image, "workspace", &files)
     }
 }
 
-fn validate_capture(image: &SealedSourceSnapshot, manifest: &str) -> io::Result<Vec<String>> {
+fn validate_capture(
+    image: &SealedSourceSnapshot, manifest: &str, vendor: Option<&VendoredSources>,
+) -> io::Result<Vec<String>> {
     let captured = image
         .manifest("workspace")
         .ok_or_else(|| invalid("missing captured Cargo anchor"))?;
@@ -138,14 +157,18 @@ fn validate_capture(image: &SealedSourceSnapshot, manifest: &str) -> io::Result<
         )?;
         if matches!(kind, MemberKind::Regular { .. }) {
             require(
-                !is_cargo_config(Path::new(path)),
-                "automatic Cargo source preparation does not yet support .cargo/config or config.toml; use explicit source selection",
+                !is_cargo_config(Path::new(path)) || vendor.is_some_and(|vendor| vendor.allows_config(path)),
+                "Cargo config requires the explicitly validated vendor source-replacement mode",
             )?;
             files.push(path.clone());
             require(
                 files.len() <= MAX_SOURCE_FILES,
                 "Cargo source anchor exceeds the file-count bound",
             )?;
+            // Vendor packages were checked as complete checksum-covered trees.
+            // Their nested test Cargo.toml/config/lock fixtures are ordinary data,
+            // not independent workspace roots for the planning command.
+            if vendor.is_some_and(|vendor| vendor.contains(path)) { continue; }
             if Path::new(path)
                 .file_name()
                 .is_some_and(|name| name == "Cargo.toml")
@@ -176,7 +199,9 @@ fn validate_capture(image: &SealedSourceSnapshot, manifest: &str) -> io::Result<
                 let lock: toml::Value = toml::from_str(text).map_err(|error| {
                     invalid(&format!("captured Cargo lockfile {path}: {error}"))
                 })?;
-                if let Some(packages) = lock.get("package").and_then(toml::Value::as_array) {
+                if vendor.is_some() {
+                    vendor::validate_lock_sources(&lock)?;
+                } else if let Some(packages) = lock.get("package").and_then(toml::Value::as_array) {
                     require(
                         packages
                             .iter()
@@ -557,6 +582,7 @@ fn validate_metadata(
     root: &Path,
     manifest: &str,
     value: &Value,
+    vendor: Option<&VendoredSources>,
 ) -> io::Result<()> {
     require(value["version"] == 1, "unsupported Cargo metadata format")?;
     let workspace = Path::new(
@@ -579,6 +605,7 @@ fn validate_metadata(
             .is_some_and(|path| image.file_bytes("workspace", path).is_some()),
         "automatic Cargo source preparation requires the captured workspace Cargo.lock",
     )?;
+    let locked = vendor.map(|vendor| vendor.bind_lock(image, &lock)).transpose()?;
     let packages = value["packages"]
         .as_array()
         .filter(|packages| !packages.is_empty() && packages.len() <= MAX_PACKAGES)
@@ -586,10 +613,14 @@ fn validate_metadata(
     let mut ids = BTreeSet::new();
     let mut selected = false;
     for package in packages {
-        require(
-            package.get("source").is_some_and(Value::is_null),
-            "automatic Cargo source preparation supports local path packages only; registry/git sources require explicit preparation",
-        )?;
+        if let (Some(vendor), Some(locked)) = (vendor, locked.as_ref()) {
+            vendor.check_package(root, package, locked)?;
+        } else {
+            require(
+                package.get("source").is_some_and(Value::is_null),
+                "registry packages require an explicitly validated vendor source; Git remains unsupported",
+            )?;
+        }
         let id = package["id"]
             .as_str()
             .ok_or_else(|| invalid("Cargo package identity missing"))?;
@@ -698,7 +729,7 @@ mod tests {
         assert!(CargoSource::parse(&json!({"manifest":"Cargo.toml", "unknown":true})).is_err());
         assert_eq!(
             contained_relative(Path::new("app"), "../dep").unwrap(),
-            Path::new("dep")
+            PathBuf::from("dep")
         );
         assert!(contained_relative(Path::new("app"), "../../outside").is_err());
         assert!(contained_relative(Path::new("app"), "/outside").is_err());
@@ -746,7 +777,7 @@ mod tests {
             1024,
         )
         .unwrap();
-        let files = validate_capture(&image, "Cargo.toml").unwrap();
+        let files = validate_capture(&image, "Cargo.toml", None).unwrap();
         let copy = tempfile::tempdir().unwrap();
         image.materialize_into(&copy.path().join("image")).unwrap();
         let root = copy.path().join("image/workspace");
