@@ -17,6 +17,7 @@ use std::collections::BTreeSet;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
+use std::time::{Duration, Instant};
 
 /// Shared wire bounds; these match the worker contract, not its Rust layouts.
 pub const CHUNK_BYTES: usize = 65_536;
@@ -378,16 +379,41 @@ fn manifest(value: &Value, expected: &Declaration) -> io::Result<Manifest> {
     })
 }
 
+const MAX_HEARTBEAT_BURST: usize = 64;
+const HEARTBEAT_WINDOW: Duration = Duration::from_secs(1);
+
 fn receive(peer: &mut impl WorkerPeer, worker: &str) -> io::Result<Value> {
-    // Telemetry never changes result identity or resets the transport deadline.
-    for _ in 0..64 {
+    receive_with_clock(peer, worker, Instant::now)
+}
+
+/// Bound telemetry RATE, not the lifetime of a legitimate compiler operation.
+/// The transport owns the absolute execution/transfer/ACK deadline and checks
+/// it on every receive, including buffered frames. This window never changes
+/// that deadline. The clock seam lets tests exercise long waits without sleeps.
+fn receive_with_clock(
+    peer: &mut impl WorkerPeer,
+    worker: &str,
+    mut now: impl FnMut() -> Instant,
+) -> io::Result<Value> {
+    let mut window_start = now();
+    let mut heartbeats = 0;
+    loop {
         let value = peer.receive()?;
         if value.get("kind").and_then(Value::as_str) != Some("heartbeat") {
             return Ok(value);
         }
         require(text(&value, "worker_id")? == worker, "foreign heartbeat")?;
+        let observed = now();
+        if observed.saturating_duration_since(window_start) >= HEARTBEAT_WINDOW {
+            window_start = observed;
+            heartbeats = 0;
+        }
+        require(
+            heartbeats < MAX_HEARTBEAT_BURST,
+            "too much telemetry in one heartbeat window",
+        )?;
+        heartbeats += 1;
     }
-    Err(invalid("too much telemetry without a response"))
 }
 fn create_file(path: &Path) -> io::Result<File> {
     let mut options = OpenOptions::new();
@@ -1680,5 +1706,118 @@ mod tests {
                 &changed, "worker", &destination, DeliveryTrust::Loopback,
             ).is_err());
         }
+    }
+
+    fn heartbeat() -> Value {
+        json!({"kind":"heartbeat", "worker_id":"worker", "active_request_id":7})
+    }
+
+    #[test]
+    fn paced_heartbeats_do_not_impose_a_lifetime_limit_on_long_execution() {
+        let parent = tempfile::tempdir().unwrap();
+        let mut peer = fixture(&parent.path().join("unused"));
+        peer.replies = std::iter::repeat_with(heartbeat).take(4096).collect();
+        let terminal = json!({"kind":"exec-result", "request_id":7});
+        peer.replies.push_back(terminal.clone());
+        let mut clock = Instant::now();
+        let result = receive_with_clock(&mut peer, "worker", || {
+            let observed = clock;
+            clock += HEARTBEAT_WINDOW;
+            observed
+        }).unwrap();
+        assert_eq!(result, terminal);
+        assert!(peer.replies.is_empty());
+        assert!(peer.sent.is_empty());
+    }
+
+    #[test]
+    fn heartbeat_flood_is_bounded_at_the_exact_window_boundary() {
+        let parent = tempfile::tempdir().unwrap();
+        let start = Instant::now();
+        for renew in [false, true] {
+            let mut peer = fixture(&parent.path().join("unused"));
+            peer.replies = std::iter::repeat_with(heartbeat)
+                .take(MAX_HEARTBEAT_BURST + 1).collect();
+            peer.replies.push_back(json!({"kind":"exec-result", "request_id":7}));
+            let mut observations = 0;
+            let result = receive_with_clock(&mut peer, "worker", || {
+                let elapsed = if observations > MAX_HEARTBEAT_BURST {
+                    if renew { HEARTBEAT_WINDOW } else { HEARTBEAT_WINDOW - Duration::from_nanos(1) }
+                } else {
+                    Duration::ZERO
+                };
+                observations += 1;
+                start + elapsed
+            });
+            if renew {
+                assert_eq!(result.unwrap()["kind"], "exec-result");
+                assert!(peer.replies.is_empty());
+            } else {
+                let error = result.unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+                assert!(error.to_string().contains("heartbeat window"));
+                assert_eq!(peer.replies.len(), 1);
+            }
+            assert!(peer.sent.is_empty());
+        }
+    }
+
+    #[test]
+    fn sustained_telemetry_does_not_mask_a_transport_deadline() {
+        struct ExpiringPeer { remaining: usize }
+        impl WorkerPeer for ExpiringPeer {
+            fn send(&mut self, _: &Value) -> io::Result<()> {
+                panic!("waiting for a result must not send a retry");
+            }
+            fn receive(&mut self) -> io::Result<Value> {
+                if self.remaining == 0 {
+                    return Err(io::Error::new(io::ErrorKind::TimedOut, "absolute phase deadline"));
+                }
+                self.remaining -= 1;
+                Ok(heartbeat())
+            }
+        }
+        let mut peer = ExpiringPeer { remaining: 256 };
+        let mut clock = Instant::now();
+        let error = receive_with_clock(&mut peer, "worker", || {
+            let observed = clock;
+            clock += HEARTBEAT_WINDOW;
+            observed
+        }).unwrap_err();
+        assert_eq!(peer.remaining, 0);
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(error.to_string(), "absolute phase deadline");
+    }
+
+    #[test]
+    fn full_heartbeat_burst_preserves_complete_delivery_and_release_order() {
+        let parent = tempfile::tempdir().unwrap();
+        let destination = parent.path().join("delivery");
+        let mut peer = fixture(&destination);
+        for _ in 0..MAX_HEARTBEAT_BURST {
+            peer.replies.insert(1, heartbeat());
+        }
+        let delivery = receive_execution(&mut peer, &request(), "worker", &destination).unwrap();
+        assert!(delivery.acknowledgments_confirmed);
+        assert!(peer.replies.is_empty());
+        assert_eq!(std::fs::read(destination.join("artifacts/a")).unwrap(), b"A\0\xffB");
+        assert_eq!(peer.sent.iter().filter(|frame| frame["kind"] == "canonical-exec").count(), 1);
+        assert_eq!(delivery.receipt["publication_authorized"], false);
+    }
+
+    #[test]
+    fn foreign_heartbeat_never_releases_outputs_or_reexecutes() {
+        let parent = tempfile::tempdir().unwrap();
+        let destination = parent.path().join("delivery");
+        let mut peer = fixture(&destination);
+        let mut foreign = heartbeat();
+        foreign["worker_id"] = json!("another-worker");
+        peer.replies.insert(1, foreign);
+        let failure = receive_execution(&mut peer, &request(), "worker", &destination).unwrap_err();
+        assert!(failure.execution_may_have_run);
+        assert!(failure.detail.contains("foreign heartbeat"));
+        assert!(no_ack(&peer));
+        assert!(!destination.join("delivery.json").exists());
+        assert_eq!(peer.sent.iter().filter(|frame| frame["kind"] == "canonical-exec").count(), 1);
     }
 }
