@@ -21,6 +21,9 @@ use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
+/// Bound the number of independently captured repositories in one source tree.
+pub const MAX_SOURCE_ROOTS: usize = 64;
+
 fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
@@ -151,8 +154,7 @@ pub fn prepare_source_bundle(
     let source = destination.join("source");
     let mut receiver = SourceReceiver::create(&source, upload.manifest.clone())?;
     for file in upload.manifest.files() {
-        let bytes = upload.image.file_bytes(&upload.root, &file.path)
-            .ok_or_else(|| invalid("captured source bytes missing"))?;
+        let bytes = upload.file_bytes(&file.path)?;
         for (index, chunk) in bytes.chunks(MAX_SOURCE_CHUNK).enumerate() {
             receiver.write_chunk(&file.path, index as u64 * MAX_SOURCE_CHUNK as u64,
                 chunk, Sha256::digest(chunk).into())?;
@@ -195,12 +197,29 @@ pub fn prepare_source_bundle(
         "executed":false, "publication_authorized":false}))
 }
 
+#[derive(Debug, Clone)]
+enum SourceLayout {
+    /// Preserve the single-root protocol's original relative paths.
+    Root(String),
+    /// Each first path component names one root in the SAME captured image.
+    Closure,
+}
+
+fn valid_closure_root(root: &str) -> bool {
+    use rabs_sandbox::snapshot_capture::{MemberDisposition, member_disposition};
+    !root.is_empty()
+        && root.len() <= 64
+        && !matches!(root, "." | "..")
+        && root.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+        && member_disposition(root, false) == MemberDisposition::Include
+}
+
 /// Immutable captured bytes plus an explicit regular-file projection. The full
 /// source snapshot digest is provenance, not substituted for the projected root.
 #[derive(Debug, Clone)]
 pub struct SourceUpload {
     image: Arc<SealedSourceSnapshot>,
-    root: String,
+    layout: SourceLayout,
     manifest: SourceManifest,
 }
 
@@ -222,7 +241,51 @@ impl SourceUpload {
                 "captured source disagrees with its manifest")?;
             files.push(SourceFile { path:path.clone(), len:*size, sha256:*content_sha256, executable:mode & 0o111 != 0 });
         }
-        Ok(Self { image, root:root.to_owned(), manifest:SourceManifest::new(files)? })
+        Ok(Self { image, layout:SourceLayout::Root(root.to_owned()), manifest:SourceManifest::new(files)? })
+    }
+
+    /// Project several repositories from ONE coherent closure capture. Root IDs
+    /// become directory names under /__rabs/workspace: app/Cargo.toml can retain
+    /// an ordinary ../dep path dependency without rewriting either manifest.
+    /// No separately captured snapshots can be combined by this constructor.
+    ///
+    /// Each tuple contains a logical snapshot root and its approved relative
+    /// files. Only those files enter source-files-v1; the worker receives no host
+    /// roots or new mounting instructions. A missing/unsafe member refuses the
+    /// whole projection. This does not prove Cargo dependency completeness.
+    pub fn from_snapshot_closure(
+        image: Arc<SealedSourceSnapshot>,
+        roots: &[(String, Vec<String>)],
+    ) -> io::Result<Self> {
+        use rabs_sandbox::snapshot_capture::{MemberDisposition, member_disposition};
+        require(!roots.is_empty() && roots.len() <= MAX_SOURCE_ROOTS, "source closure root count")?;
+        let mut names = BTreeSet::new();
+        let mut files = Vec::new();
+        for (root, paths) in roots {
+            require(valid_closure_root(root) && names.insert(root.as_str()),
+                "unsafe, hidden or duplicate source closure root")?;
+            require(paths.len() <= MAX_SOURCE_FILES.saturating_sub(files.len()),
+                "source closure exceeds aggregate file count")?;
+            let selected = Self::from_snapshot(Arc::clone(&image), root, paths)?;
+            for mut file in selected.manifest.files {
+                file.path = format!("{root}/{}", file.path);
+                // The saved bundle is recaptured as a single workspace before
+                // transfer. Refuse a prefix that would hide its selected bytes.
+                require(member_disposition(&file.path, false) == MemberDisposition::Include,
+                    "source closure path is excluded by capture policy")?;
+                files.push(file);
+            }
+        }
+        Ok(Self { image, layout:SourceLayout::Closure, manifest:SourceManifest::new(files)? })
+    }
+
+    fn file_bytes(&self, path: &str) -> io::Result<&[u8]> {
+        let (root, relative) = match &self.layout {
+            SourceLayout::Root(root) => (root.as_str(), path),
+            SourceLayout::Closure => path.split_once('/')
+                .ok_or_else(|| invalid("source closure member lacks its root"))?,
+        };
+        self.image.file_bytes(root, relative).ok_or_else(|| invalid("retained source missing"))
     }
 
     /// Bind a newly captured image to the ORIGINAL saved execution request.
@@ -310,7 +373,7 @@ impl SourceUpload {
         let missing = self.missing_files(&reply)?;
         for file in self.manifest.files() {
             if missing.as_ref().is_some_and(|paths| !paths.contains(&file.path)) { continue; }
-            let bytes = self.image.file_bytes(&self.root, &file.path).ok_or_else(|| invalid("retained source missing"))?;
+            let bytes = self.file_bytes(&file.path)?;
             for (index, chunk) in bytes.chunks(MAX_SOURCE_CHUNK).enumerate() {
                 let offset = (index as u64) * MAX_SOURCE_CHUNK as u64;
                 let next = offset + chunk.len() as u64;
@@ -723,5 +786,133 @@ mod tests {
             assert!(prepare_source_bundle(checkout.path(), &spec, &destination).is_err());
         }
         assert!(fs::read_dir(owner.path()).unwrap().next().is_none());
+    }
+
+    fn closure_fixture(base: &Path) -> (Arc<SealedSourceSnapshot>, Vec<(String, Vec<String>)>) {
+        for root in ["app", "dep"] {
+            fs::create_dir_all(base.join(root).join("src")).unwrap();
+            fs::write(base.join(root).join("src/lib.rs"), root.as_bytes()).unwrap();
+            fs::write(base.join(root).join("not-selected.private"), b"not approved").unwrap();
+        }
+        fs::write(base.join("app/Cargo.toml"), b"[dependencies]\ndep = { path = \"../dep\" }\n").unwrap();
+        fs::write(base.join("dep/Cargo.toml"), b"[package]\nname = \"dep\"\nversion = \"0.1.0\"\n").unwrap();
+        let image = capture_sealed_source(&[
+            ("app".into(), base.join("app")), ("dep".into(), base.join("dep")),
+        ], false, 2, 200_000).unwrap();
+        let selection = ["app", "dep"].into_iter()
+            .map(|root| (root.to_owned(), vec!["Cargo.toml".into(), "src/lib.rs".into()]))
+            .collect();
+        (Arc::new(image), selection)
+    }
+
+    #[test]
+    fn closure_transfer_preserves_sibling_layout_and_one_retained_generation() {
+        let base = tempfile::tempdir().unwrap();
+        let (image, selection) = closure_fixture(base.path());
+        let upload = SourceUpload::from_snapshot_closure(image, &selection).unwrap();
+        let request = json!({"kind":"canonical-exec", "request_id":7,
+            "source_manifest":upload.wire_manifest()});
+        fs::write(base.path().join("app/src/lib.rs"), b"new app").unwrap();
+        fs::write(base.path().join("dep/src/lib.rs"), b"new dep").unwrap();
+        let mut peer = ReceiverPeer::new();
+        upload.transmit(&mut peer, &request).unwrap();
+        let root = peer.receiver.as_ref().unwrap().sealed_root().unwrap();
+        assert_eq!(fs::read(root.join("app/src/lib.rs")).unwrap(), b"app");
+        assert_eq!(fs::read(root.join("dep/src/lib.rs")).unwrap(), b"dep");
+        assert_eq!(fs::read(root.join("app/Cargo.toml")).unwrap(),
+            b"[dependencies]\ndep = { path = \"../dep\" }\n");
+        for name in ["app", "dep"] {
+            assert!(!root.join(name).join("not-selected.private").exists());
+        }
+        assert_eq!(upload.manifest.files().len(), 4);
+        assert!(!request.to_string().contains(base.path().to_str().unwrap()));
+        assert!(peer.sent.iter().all(|frame| frame["kind"] != "canonical-exec"));
+    }
+
+    #[test]
+    fn closure_cache_hints_reuse_other_roots_without_widening_selection() {
+        let base = tempfile::tempdir().unwrap();
+        let (image, selection) = closure_fixture(base.path());
+        let upload = SourceUpload::from_snapshot_closure(image, &selection).unwrap();
+        let request = json!({"kind":"canonical-exec", "request_id":7,
+            "source_manifest":upload.wire_manifest()});
+        let mut peer = ReceiverPeer::new();
+        for file in upload.manifest.files() {
+            if file.path != "dep/src/lib.rs" {
+                peer.prefilled.insert(file.path.clone(), upload.file_bytes(&file.path).unwrap().to_vec());
+            }
+        }
+        peer.missing = Some(json!(["dep/src/lib.rs"]));
+        upload.transmit(&mut peer, &request).unwrap();
+        let chunks: Vec<_> = peer.sent.iter().filter(|frame| frame["kind"] == "source-chunk").collect();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0]["path"], "dep/src/lib.rs");
+        assert_eq!(chunks[0]["data_hex"], hex(b"dep"));
+        assert_eq!(peer.sent.last().unwrap()["kind"], "source-seal");
+        let mut foreign = ReceiverPeer::new();
+        foreign.missing = Some(json!(["dep/not-selected.private"]));
+        assert!(upload.transmit(&mut foreign, &request).is_err());
+        assert_eq!(foreign.sent.len(), 1);
+    }
+
+    #[test]
+    fn closure_namespace_refuses_unsafe_hidden_duplicate_and_excess_roots() {
+        let base = tempfile::tempdir().unwrap();
+        let (image, selection) = closure_fixture(base.path());
+        assert!(SourceUpload::from_snapshot_closure(Arc::clone(&image), &[]).is_err());
+        for name in ["", ".", "..", ".git", "target", "a/b", "a\\b", "a:b", "abs\0", "other"] {
+            assert!(SourceUpload::from_snapshot_closure(Arc::clone(&image),
+                &[(name.into(), vec!["src/lib.rs".into()])]).is_err(), "{name:?}");
+        }
+        assert!(SourceUpload::from_snapshot_closure(Arc::clone(&image),
+            &[selection[0].clone(), selection[0].clone()]).is_err());
+        assert!(SourceUpload::from_snapshot_closure(image,
+            &vec![selection[0].clone(); MAX_SOURCE_ROOTS + 1]).is_err());
+    }
+
+    #[test]
+    fn incomplete_or_nonregular_root_refuses_the_entire_closure_projection() {
+        let base = tempfile::tempdir().unwrap();
+        let (image, selection) = closure_fixture(base.path());
+        for files in [vec![], vec!["missing".into()], vec!["src".into()],
+            vec!["src/lib.rs".into(), "src/lib.rs".into()]] {
+            let mut selected = selection.clone();
+            selected[1].1 = files;
+            assert!(SourceUpload::from_snapshot_closure(Arc::clone(&image), &selected).is_err());
+        }
+        std::os::unix::fs::symlink("src/lib.rs", base.path().join("dep/alias")).unwrap();
+        let image = Arc::new(capture_sealed_source(&[
+            ("app".into(), base.path().join("app")), ("dep".into(), base.path().join("dep")),
+        ], false, 2, 200_000).unwrap());
+        let mut selected = selection;
+        selected[1].1 = vec!["alias".into()];
+        assert!(SourceUpload::from_snapshot_closure(image, &selected).is_err());
+    }
+
+    #[test]
+    fn closure_identity_ignores_selection_order_but_binds_dependency_bytes_and_modes() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = tempfile::tempdir().unwrap();
+        let (image, mut selection) = closure_fixture(base.path());
+        let original = SourceUpload::from_snapshot_closure(Arc::clone(&image), &selection).unwrap();
+        selection.reverse();
+        for (_, files) in &mut selection { files.reverse(); }
+        assert_eq!(SourceUpload::from_snapshot_closure(image, &selection).unwrap().wire_manifest(),
+            original.wire_manifest());
+        for change_mode in [false, true] {
+            if change_mode {
+                fs::write(base.path().join("dep/src/lib.rs"), b"dep").unwrap();
+                fs::set_permissions(base.path().join("dep/src/lib.rs"), fs::Permissions::from_mode(0o755)).unwrap();
+            } else {
+                fs::write(base.path().join("dep/src/lib.rs"), b"changed dependency").unwrap();
+            }
+            let image = Arc::new(capture_sealed_source(&[
+                ("app".into(), base.path().join("app")), ("dep".into(), base.path().join("dep")),
+            ], false, 2, 200_000).unwrap());
+            let changed = SourceUpload::from_snapshot_closure(image, &selection).unwrap();
+            assert_ne!(changed.manifest.digest(), original.manifest.digest());
+            assert!(original.validate_request(&json!({"kind":"canonical-exec", "request_id":7,
+                "source_manifest":changed.wire_manifest()})).is_err());
+        }
     }
 }
