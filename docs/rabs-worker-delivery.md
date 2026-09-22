@@ -24,10 +24,13 @@ cargo build -p rabsd -p rabs-wkr
 ```
 
 Prepare a request using the `files-v1` declaration in
-[rabs-worker-artifacts.md](rabs-worker-artifacts.md). Toolchain and workspace
-backing paths refer to the worker host. The compiler's output paths must target
-the declared `/__rabs/out/<unit>` mount. The receiver sends the request unchanged;
-it does not derive Cargo arguments, alter source paths, or stage source inputs.
+[rabs-worker-artifacts.md](rabs-worker-artifacts.md). For worker-local inputs,
+toolchain and workspace backing paths refer to the worker host. The compiler's
+output paths must target the declared `/__rabs/out/<unit>` mount. The receiver
+sends the request unchanged; it does not derive Cargo arguments or alter source
+paths. Explicit source manifests instead use `--source-root`; `--worker-prepare`
+can retain selected inputs before execution. Neither capture nor upload is part
+of result recovery or acknowledgment reconciliation.
 
 ### Authenticated delivery
 
@@ -78,9 +81,11 @@ then checks the hello's peer claim and versions through `CoordinatorSession`.
 The worker answers a fresh session/operation/token challenge before receiving
 the grant. The existing S5 `canonical-probes:<peer-id>` label is retained for
 handshake compatibility, but the delivery adapter additionally permits only the
-complete operator-selected execution request, exactly once. Unknown operations,
-publication attempts and a changed request cannot pass that adapter. The grant
-explicitly disables publication and resume.
+complete operator-selected execution or recovery request, exactly once. Unknown
+operations, publication attempts and a changed request cannot pass that adapter.
+The grant explicitly disables publication and arbitrary session resume. Sealed
+result retrieval uses the separately negotiated `durable-result-v1` protocol on
+a fresh authenticated connection, not continuation of the old session.
 
 An authenticated receipt records `transport_authenticated:true`, the
 `worker_spki_sha256`, `authenticated_session_id` and `identity_generation` before
@@ -117,7 +122,8 @@ rabs-wkr --coordinator 127.0.0.1:7091 --worker-id local-worker --once
 
 The receiver writes its listening address to stderr, accepts exactly one worker,
 negotiates `ranges-v1`, `request-journal-v1`, and `files-v1` when artifacts are
-requested, then sends exactly one execution request. Existing delivery paths,
+requested, then sends exactly one execution request. Existing delivery paths
+are reverified offline when complete and matching. Incomplete directories,
 including empty directories and symlinks, are refused without overwriting them.
 There is no automatic reconnect, command retransmission, or local compile fallback.
 The existing worker journal still owns admission. The requested ID must exceed
@@ -131,18 +137,21 @@ retry work whose outcome is unknown. Use outcome reconciliation first.
 A completed receiver directory contains:
 
 ```text
-artifacts/<declared relative names>
+artifacts/<accepted relative names>
 diagnostics/stdout
 diagnostics/stderr
 delivery.json
 ```
 
-The receiver independently verifies the exact requested names and unit, sorted
+The receiver independently verifies the requested names and unit, sorted
 manifest, executable bits, lengths, manifest digest, request identity, offsets,
-end-of-file indicators, per-chunk digests, and complete file digests. Arbitrary
-binary bytes, including NUL and non-UTF-8 diagnostics, are preserved in files.
-Executable artifacts receive mode 0700; other files receive 0600. The delivery
-root is private. The receiver never writes these files into a Cargo target tree.
+end-of-file indicators, per-chunk digests, and complete file digests. Exact-file
+requests require equality with the declaration. Explicit `tree-files-v1`
+requests require every named output and verify the complete bounded manifest,
+including intermediate files. Arbitrary binary bytes, including NUL and non-UTF-8
+diagnostics, are preserved in files. Executable artifacts receive mode 0700;
+other files receive 0600. The delivery root is private. The receiver never writes
+these files into a Cargo target tree or claims Cargo freshness from their presence.
 
 Each range is at most 65,536 raw bytes. Loopback wire frames and request files are
 bounded to 1 MiB. A combined 1 GiB budget covers BOTH diagnostic streams AND all
@@ -164,9 +173,10 @@ modified by another local process; this is not a race-proof shared-directory API
 
 Compiler success and successful byte delivery are different facts. A failed or
 interrupted compilation may produce a verified diagnostic delivery, but no
-compiled-artifact bundle. The operator exits with the recorded nonzero compiler
-or interruption status. Missing captures, malformed results, unresolved reported
-descendants, corrupt bytes, and disk errors never become successful deliveries.
+compiled-artifact bundle. The execution/delivery operator exits with the recorded
+nonzero compiler or interruption status. Missing captures, malformed results,
+unresolved reported descendants, corrupt bytes, and disk errors never become
+successful deliveries.
 
 Before the local delivery frontier, failures produce `worker-delivery-error` on
 stderr. Once any execution write is attempted, `execution_may_have_run` remains
@@ -179,8 +189,69 @@ After the frontier, a lost or mismatched ACK response does not invalidate the
 verified local files. The command returns `worker-delivery` with
 `acknowledgments_confirmed:false`, an acknowledgment error, and `reexecute:false`.
 The verified receipt remains available. Losing the command's own stdout after
-that point likewise is not permission to rerun the compiler. This is local byte
-retention, not worker-side durable artifact resumption or cache publication.
+that point likewise is not permission to rerun the compiler. Normal repetition
+reverifies that local delivery offline and does not contact the worker. It cannot
+confirm remote acceptance or release retained-result capacity by itself.
+
+### Retrieve a missing local result without re-executing
+
+`--resume` takes the ORIGINAL request and a new absolute delivery directory. It
+sends only `result-resume`, verifies the retained bytes using the ordinary delivery
+receiver, and acknowledges only after complete local durability. A complete
+matching destination still recovers offline; an incomplete existing destination
+is never repaired or overwritten. No source checkout or `--source-root` is needed.
+Resume requires the worker's matching durable admission and retained result; an
+unavailable result is an error, never permission to run the compiler again.
+
+### Reconcile lost acknowledgments without downloading again
+
+Use `--acknowledge` only when the complete local delivery already exists and its
+receipt contains `result_retention:durable-result-v1` plus the retained-result
+seal. This addresses the case where bytes are safely local but an acceptance ACK
+was lost, so the worker still refuses new work while retaining the old result.
+For the authenticated lane, reuse the established coordinator credentials and
+original worker endpoint, identity and state directory:
+
+```sh
+RABS_COORD_TLS_CA=/credentials/ca.pem \
+RABS_COORD_TLS_CERT=/credentials/coordinator.pem \
+RABS_COORD_TLS_KEY=/credentials/coordinator.key \
+rabsd --worker-exec-tls --acknowledge \
+  0.0.0.0:7091 fleet-worker <worker-spki-sha256> \
+  /absolute/request.json /absolute/results/delivery-42
+```
+
+The worker connects as in authenticated delivery above. The trusted-local fixture
+also supports `rabsd --worker-exec-loopback --acknowledge` with its usual four
+positionals. The flag may precede or follow the positionals, but cannot be mixed
+with `--resume` or `--source-root`. A plaintext receipt cannot be acknowledged as
+an authenticated one, and TLS failure never selects the loopback lane.
+
+Before listening, acknowledgment recovery verifies the existing receipt, exact
+request and historical transport policy, every diagnostic/artifact byte and mode,
+and the complete file tree. It then authenticates the worker, resumes only the
+original request, and requires the same retained-result seal, outcome, lengths,
+diagnostic hashes and complete artifact manifest. It rechecks local bytes after
+the network round trip, before sending either release ACK. It sends no source
+bytes, range reads or compiler command and never replaces local files or rewrites
+the historical receipt.
+
+When both ACKs were already journaled but the final reply was lost, the worker may
+refuse result resume because its copies have been released. The receiver then
+queries `request-status` for the same admission. Only a matching terminal outcome
+and exact seal marked `retained_result_released:true` confirm acceptance. A missing
+spool, larger high-water mark, generic refusal or foreign result cannot confirm
+it. If the worker has moved on and no longer retains that admission's metadata,
+the operation refuses rather than guessing. The valid local delivery remains
+usable independently of whether remote acceptance can still be confirmed.
+
+Successful `--acknowledge` exits **zero**, reports
+`acknowledgments_confirmed:true`, and keeps the original compiler exit code in the
+receipt even when compilation failed. Reconciliation failure exits nonzero with
+`execution_may_have_run:true` and `reexecute:false`; the local result is retained.
+A new explicit invocation can retry reconciliation on a fresh connection. No
+failure retries the same connection or authorizes execution. Prevent concurrent
+same-user modification of the local delivery throughout this operation.
 
 ## Qualification
 
@@ -188,6 +259,7 @@ Run the receiver unit, TCP transport, and real CLI tests:
 
 ```sh
 cargo test -p rabsd worker_delivery
+cargo test -p rabsd delivery_ack
 cargo test -p rabsd --bin rabsd worker_exec
 cargo test -p rabsd --test worker_delivery_cli
 cargo test -p rabsd --test worker_exec_tls
@@ -203,7 +275,11 @@ native mutual-TLS/ATP peer to the actual `rabsd --worker-exec-tls` process. They
 exercise complete multi-range binary delivery, configured-key refusal despite a
 valid CA, authentication before dispatch, corrupted data from an authenticated
 peer, no plaintext downgrade, and pre-network configuration/path refusals.
-OpenSSL is required; these security tests do not silently skip its absence. The
-scripted peer does not execute a compiler and is not a real fleet qualification.
-Tests added with this path still require execution on a supported Rust host;
-their presence alone is not passing test or production-qualification evidence.
+Acknowledgment cases first obtain a delivery through that real receiver, then
+exercise fresh TLS reconciliation, repeated lost replies, exact already-released
+confirmation, changed-result refusal and local-evidence preservation with no
+range reads or local inode replacement. OpenSSL is required; these security tests
+do not silently skip its absence. The scripted peer does not execute a compiler
+and is not a real fleet qualification. Tests added with this path still require
+execution on a supported Rust host; their presence alone is not passing test or
+production-qualification evidence.

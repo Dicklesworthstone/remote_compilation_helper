@@ -84,6 +84,9 @@ impl Receiver {
         Self::spawn_mode(root, pin, tls, destination, false)
     }
     fn spawn_mode(root: &Path, pin: &str, tls: Option<&TlsFiles>, destination: &Path, resume: bool) -> Self {
+        Self::spawn_operation(root, pin, tls, destination, resume.then_some("--resume"))
+    }
+    fn spawn_operation(root: &Path, pin: &str, tls: Option<&TlsFiles>, destination: &Path, flag: Option<&str>) -> Self {
         let request_path = root.join("request.json");
         fs::write(&request_path, request().to_string()).unwrap();
         let stdout = root.join("receiver.stdout");
@@ -94,7 +97,7 @@ impl Receiver {
             .env_remove("RABS_COORD_TLS_CA").env_remove("RABS_COORD_TLS_CERT").env_remove("RABS_COORD_TLS_KEY")
             .stdout(Stdio::from(File::create(&stdout).unwrap()))
             .stderr(Stdio::from(File::create(&stderr).unwrap()));
-        if resume { command.arg("--resume"); }
+        if let Some(flag) = flag { command.arg(flag); }
         if let Some(tls) = tls {
             command.env("RABS_COORD_TLS_CA", &tls.ca)
                 .env("RABS_COORD_TLS_CERT", &tls.certificate).env("RABS_COORD_TLS_KEY", &tls.private_key);
@@ -588,4 +591,207 @@ fn resumed_artifact_corruption_keeps_old_partial_files_and_never_acknowledges() 
     assert!(!repeat.logs().contains("worker-exec-listening"));
     assert_eq!(fs::read(destination.join("artifacts/a")).unwrap(), partial_bytes);
     assert_eq!(repeat.failure()["reexecute"], false);
+}
+
+/// Establish local acceptance evidence through the actual TLS receiver, not by
+/// writing a purported delivery receipt directly. Only the worker is scripted.
+fn retained_delivery(certificates: &Certificates, root: &Path, destination: &Path) -> Value {
+    let pin = certificates.pin();
+    let mut receiver = Receiver::spawn_mode(root, &pin, Some(&certificates.server), destination, true);
+    let address = receiver.listening();
+    let runtime = RuntimeBuilder::current_thread().build().unwrap();
+    runtime.block_on(async {
+        asupersync::time::timeout(asupersync::time::wall_now(), Duration::from_secs(15), async {
+            let mut peer = connect_peer(&address, "localhost", &certificates.worker).await.unwrap();
+            let session = authenticate_mode(&mut peer.stream, &pin, true).await;
+            deliver_mode(&mut peer.stream, destination, &pin, session, false, true, true).await;
+        }).await.expect("initial retained delivery timed out");
+    });
+    assert!(receiver.wait().success(), "{}", receiver.logs());
+    let report: Value = serde_json::from_slice(&fs::read(&receiver.stdout).unwrap()).unwrap();
+    assert_eq!(report["acknowledgments_confirmed"], false);
+    assert_eq!(report["receipt"]["transport_authenticated"], true);
+    report["receipt"].clone()
+}
+
+fn resumed_offer(receipt: &Value) -> Value {
+    json!({"kind":"exec-result", "request_id":7, "executed":true,
+        "exit_code":receipt["exit_code"], "stop_reason":receipt["stop_reason"],
+        "residual_group_members":0, "resumed":true, "result_retention":"durable-result-v1",
+        "retained_result_sha256":receipt["retained_result_sha256"],
+        "output_transfer":"ranges-v1", "output_ack_required":true,
+        "stdout_bytes":receipt["stdout_bytes"], "stdout_sha256":receipt["stdout_sha256"],
+        "stderr_bytes":receipt["stderr_bytes"], "stderr_sha256":receipt["stderr_sha256"],
+        "artifact_transfer":"files-v1", "artifact_ack_required":true,
+        "artifact_manifest":receipt["artifact_manifest"]})
+}
+
+fn local_bytes_and_inodes(destination: &Path) -> Vec<(Vec<u8>, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    assert_eq!(fs::read_dir(destination).unwrap().count(), 3);
+    assert_eq!(fs::read_dir(destination.join("artifacts")).unwrap().count(), 1);
+    assert_eq!(fs::read_dir(destination.join("diagnostics")).unwrap().count(), 2);
+    ["delivery.json", "diagnostics/stdout", "diagnostics/stderr", "artifacts/a"]
+        .into_iter().map(|name| {
+            let path = destination.join(name);
+            (fs::read(&path).unwrap(), fs::metadata(path).unwrap().ino())
+        }).collect()
+}
+
+#[test]
+fn actual_tls_acknowledgment_retries_lost_replies_without_ranges_or_local_replacement() {
+    let certificates = Certificates::new();
+    let pin = certificates.pin();
+    let root = tempfile::tempdir().unwrap();
+    let destination = root.path().join("delivery");
+    let receipt = retained_delivery(&certificates, root.path(), &destination);
+    let before = local_bytes_and_inodes(&destination);
+    let runtime = RuntimeBuilder::current_thread().build().unwrap();
+    for lose_again in [true, false] {
+        let mut receiver = Receiver::spawn_operation(root.path(), &pin, Some(&certificates.server),
+            &destination, Some("--acknowledge"));
+        let address = receiver.listening();
+        assert!(receiver.logs().contains("result-acknowledgment"));
+        runtime.block_on(async {
+            asupersync::time::timeout(asupersync::time::wall_now(), Duration::from_secs(15), async {
+                let mut peer = connect_peer(&address, "localhost", &certificates.worker).await.unwrap();
+                authenticate_mode(&mut peer.stream, &pin, true).await;
+                send(&mut peer.stream, &resumed_offer(&receipt)).await.unwrap();
+                // Exact next-frame assertions reject any attempted range read,
+                // source upload or second compiler dispatch, not just bad bytes.
+                assert_eq!(receive(&mut peer.stream).await.unwrap(), json!({"kind":"output-ack", "request_id":7,
+                    "stdout_bytes":receipt["stdout_bytes"], "stdout_sha256":receipt["stdout_sha256"],
+                    "stderr_bytes":receipt["stderr_bytes"], "stderr_sha256":receipt["stderr_sha256"]}));
+                send(&mut peer.stream, &json!({"kind":"output-acknowledged", "request_id":7,
+                    "already_released":false})).await.unwrap();
+                assert_eq!(receive(&mut peer.stream).await.unwrap(), json!({"kind":"artifact-ack", "request_id":7,
+                    "manifest_sha256":MANIFEST, "total_bytes":ARTIFACT.len()}));
+                if !lose_again {
+                    send(&mut peer.stream, &json!({"kind":"artifact-acknowledged", "request_id":7,
+                        "already_released":false})).await.unwrap();
+                }
+            }).await.expect("acknowledgment reconciliation timed out");
+        });
+        assert_eq!(receiver.wait().success(), !lose_again, "{}", receiver.logs());
+        if lose_again {
+            assert!(fs::read(&receiver.stdout).unwrap().is_empty());
+            assert_eq!(receiver.failure()["execution_may_have_run"], true);
+            assert_eq!(receiver.failure()["reexecute"], false);
+        } else {
+            let report: Value = serde_json::from_slice(&fs::read(&receiver.stdout).unwrap()).unwrap();
+            assert_eq!(report["acknowledgments_confirmed"], true);
+            assert!(report["acknowledgment_error"].is_null());
+            assert_eq!(report["receipt"], receipt, "recovery session cannot rewrite historical provenance");
+        }
+        assert_eq!(local_bytes_and_inodes(&destination), before);
+    }
+}
+
+#[test]
+fn actual_tls_acknowledgment_confirms_only_the_exact_durably_released_result() {
+    let certificates = Certificates::new();
+    let pin = certificates.pin();
+    let root = tempfile::tempdir().unwrap();
+    let destination = root.path().join("delivery");
+    let receipt = retained_delivery(&certificates, root.path(), &destination);
+    let before = local_bytes_and_inodes(&destination);
+    let runtime = RuntimeBuilder::current_thread().build().unwrap();
+    for case in 0..4 {
+        let mut receiver = Receiver::spawn_operation(root.path(), &pin, Some(&certificates.server),
+            &destination, Some("--acknowledge"));
+        let address = receiver.listening();
+        runtime.block_on(async {
+            asupersync::time::timeout(asupersync::time::wall_now(), Duration::from_secs(15), async {
+                let mut peer = connect_peer(&address, "localhost", &certificates.worker).await.unwrap();
+                authenticate_mode(&mut peer.stream, &pin, true).await;
+                send(&mut peer.stream, &json!({"kind":"error", "request_id":7,
+                    "reason":"retained result does not match this request"})).await.unwrap();
+                assert_eq!(receive(&mut peer.stream).await.unwrap(), json!({"kind":"request-status", "request_id":7}));
+                // The worker's bounded journal receipt intentionally lacks the
+                // full output manifest; the sealed digest binds that manifest.
+                let terminal = json!({"kind":"exec-result", "request_id":7, "executed":true,
+                    "exit_code":receipt["exit_code"], "stop_reason":receipt["stop_reason"],
+                    "residual_group_members":0, "stdout_sha256":receipt["stdout_sha256"],
+                    "stderr_sha256":receipt["stderr_sha256"],
+                    "retained_result_sha256":receipt["retained_result_sha256"], "retained_result_released":true});
+                let mut status = json!({"kind":"request-status", "request_id":7, "high_water":7,
+                    "status":"terminal-observed", "output_recovery":"unavailable", "receipt":terminal,
+                    "replay_authorized":false, "publication_authorized":false});
+                match case {
+                    0 => {}
+                    1 => status["receipt"]["retained_result_sha256"] = json!("08".repeat(32)),
+                    2 => status["receipt"]["retained_result_released"] = json!(false),
+                    _ => status["status"] = json!("retired"),
+                }
+                send(&mut peer.stream, &status).await.unwrap();
+                assert!(receive(&mut peer.stream).await.is_err(), "status confirmation sent another operation");
+            }).await.expect("released-status confirmation timed out");
+        });
+        assert_eq!(receiver.wait().success(), case == 0, "{}", receiver.logs());
+        if case == 0 {
+            let report: Value = serde_json::from_slice(&fs::read(&receiver.stdout).unwrap()).unwrap();
+            assert_eq!(report["acknowledgments_confirmed"], true);
+            assert_eq!(report["receipt"], receipt);
+        } else {
+            assert_eq!(receiver.failure()["execution_may_have_run"], true);
+            assert_eq!(receiver.failure()["reexecute"], false);
+        }
+        assert_eq!(local_bytes_and_inodes(&destination), before);
+    }
+}
+
+#[test]
+fn actual_tls_acknowledgment_refuses_changed_results_before_either_acceptance() {
+    let certificates = Certificates::new();
+    let pin = certificates.pin();
+    let root = tempfile::tempdir().unwrap();
+    let destination = root.path().join("delivery");
+    let receipt = retained_delivery(&certificates, root.path(), &destination);
+    let before = local_bytes_and_inodes(&destination);
+    let runtime = RuntimeBuilder::current_thread().build().unwrap();
+    for (field, value) in [("retained_result_sha256", json!("09".repeat(32))),
+        ("artifact_manifest", Value::Null), ("stdout_bytes", json!(1)), ("resumed", json!(false))] {
+        let mut receiver = Receiver::spawn_operation(root.path(), &pin, Some(&certificates.server),
+            &destination, Some("--acknowledge"));
+        let address = receiver.listening();
+        runtime.block_on(async {
+            asupersync::time::timeout(asupersync::time::wall_now(), Duration::from_secs(15), async {
+                let mut peer = connect_peer(&address, "localhost", &certificates.worker).await.unwrap();
+                authenticate_mode(&mut peer.stream, &pin, true).await;
+                let mut result = resumed_offer(&receipt); result[field] = value;
+                send(&mut peer.stream, &result).await.unwrap();
+                assert!(receive(&mut peer.stream).await.is_err(), "mismatched {field} caused an ACK or download");
+            }).await.expect("changed-result acknowledgment refusal timed out");
+        });
+        assert!(!receiver.wait().success());
+        assert!(fs::read(&receiver.stdout).unwrap().is_empty());
+        assert_eq!(receiver.failure()["execution_may_have_run"], true);
+        assert_eq!(receiver.failure()["reexecute"], false);
+        assert_eq!(local_bytes_and_inodes(&destination), before);
+    }
+}
+
+#[test]
+fn actual_tls_acknowledgment_preflight_preserves_local_evidence_without_downgrade() {
+    let certificates = Certificates::new();
+    let pin = certificates.pin();
+    let root = tempfile::tempdir().unwrap();
+    let destination = root.path().join("delivery");
+    retained_delivery(&certificates, root.path(), &destination);
+    for case in 0..3 {
+        let wrong = if pin == "01".repeat(32) { "02".repeat(32) } else { "01".repeat(32) };
+        let expected_pin = if case == 1 { wrong.as_str() } else { pin.as_str() };
+        if case == 2 { fs::write(destination.join("artifacts/a"), b"bad!").unwrap(); }
+        let before = local_bytes_and_inodes(&destination);
+        // Missing credentials distinguish preflight refusal from a listener
+        // failure; no branch may quietly select a plaintext recovery session.
+        let mut receiver = Receiver::spawn_operation(root.path(), expected_pin, None,
+            &destination, Some("--acknowledge"));
+        assert!(!receiver.wait().success());
+        assert_eq!(receiver.logs().contains("missing RABS_COORD_TLS_CA"), case == 0);
+        assert!(!receiver.logs().contains("worker-exec-listening"));
+        assert_eq!(receiver.failure()["execution_may_have_run"], true);
+        assert_eq!(receiver.failure()["reexecute"], false);
+        assert_eq!(local_bytes_and_inodes(&destination), before);
+    }
 }
