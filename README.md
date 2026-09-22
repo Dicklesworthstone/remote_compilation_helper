@@ -229,6 +229,7 @@ rch status [--workers] [--jobs]
 rch check
 rch queue [--watch|--follow]
 rch cancel <id> | --all
+rch rabs gc plan|run|history [--cas-root DIR] [--mode normal|emergency]
 ```
 
 ### Hook + Agent Integration

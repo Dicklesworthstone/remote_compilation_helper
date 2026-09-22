@@ -17,6 +17,7 @@ mod helpers;
 mod hook;
 mod init;
 mod queue;
+pub mod rabs_gc;
 mod shim;
 mod speedscore;
 mod status;
