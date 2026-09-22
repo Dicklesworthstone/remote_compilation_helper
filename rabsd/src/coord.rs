@@ -21,6 +21,7 @@
 pub mod action_actor;
 pub mod target_lease;
 
+pub mod delivery_ack;
 pub mod delivery_archive;
 pub mod delivery_recovery;
 pub mod live;

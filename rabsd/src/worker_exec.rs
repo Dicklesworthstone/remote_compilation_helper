@@ -5,9 +5,12 @@
 //! Repeating an exact command replays a verified durable delivery without dispatch.
 //! --resume explicitly retrieves a sealed remote result into a NEW directory;
 //! incomplete prior deliveries remain untouched and never trigger reexecution.
+//! --acknowledge explicitly reconciles an existing local delivery with the worker;
+//! it sends no byte-range reads or compiler execution and never replaces files.
 //! --source-root selects local capture for a request's explicit source_manifest;
 //! it never infers upload permission from a checkout or rewrites the request.
 
+use rabsd::coord::delivery_ack::PendingAcknowledgment;
 use rabsd::coord::delivery_recovery::{DeliveryTrust, recover_existing_delivery};
 use rabsd::coord::source_delivery::{SourcePeer, SourceUpload, request_manifest};
 use rabsd::coord::worker_delivery::{
@@ -51,8 +54,23 @@ fn operation_arguments(args: &[String], count: usize) -> Option<(&[String], Deli
     } else {
         return None;
     };
-    if positionals.iter().any(|arg| arg == "--resume") { return None; }
+    if positionals.iter().any(|arg| matches!(arg.as_str(), "--resume" | "--acknowledge")) { return None; }
     Some((positionals, mode))
+}
+
+/// Acceptance is independently selected, never an implicit network side effect
+/// of ordinary offline receipt recovery. Source upload and resume flags conflict.
+fn acknowledgment_arguments(args: &[String], count: usize) -> Option<&[String]> {
+    if args.len() != count + 1 { return None; }
+    let positionals = if args.first().is_some_and(|arg| arg == "--acknowledge") {
+        &args[1..]
+    } else if args.last().is_some_and(|arg| arg == "--acknowledge") {
+        &args[..count]
+    } else { return None; };
+    if positionals.iter().any(|arg| matches!(arg.as_str(), "--resume" | "--source-root" | "--acknowledge")) {
+        return None;
+    }
+    Some(positionals)
 }
 
 /// Source capture is explicit and execution-only. Keep the existing resume
@@ -278,15 +296,51 @@ fn run_once(args: &[String], mode: DeliveryMode, source_root: Option<&Path>) -> 
     }
 }
 
+fn run_acknowledgment_once(args: &[String]) -> Result<Delivery, DeliveryFailure> {
+    let directory = PathBuf::from(&args[3]);
+    let failure = |error: io::Error| DeliveryFailure {
+        directory:directory.clone(), execution_may_have_run:true, detail:error.to_string(),
+    };
+    let address = loopback_address(&args[0]).map_err(&failure)?;
+    let request = read_request(Path::new(&args[2])).map_err(&failure)?;
+    // No listener, source capture, or new directory can precede this proof.
+    let pending = PendingAcknowledgment::verify(&request, &args[1], &directory, DeliveryTrust::Loopback)?;
+    let listener = TcpListener::bind(address).map_err(&failure)?;
+    let address = listener.local_addr().map_err(&failure)?;
+    eprintln!("{}", json!({"kind":"worker-exec-listening", "address":address.to_string(),
+        "expected_worker":args[1], "request_id":request["request_id"],
+        "transport_authenticated":false, "operation":"result-acknowledgment"}));
+    let stream = accept_one(&listener, ACCEPT_BUDGET).map_err(&failure)?;
+    let mut peer = TcpPeer::new(stream, HANDSHAKE_BUDGET, TRANSFER_ALLOWANCE, DeliveryMode::Resume)
+        .map_err(failure)?;
+    pending.acknowledge(&mut peer)
+}
+
 /// One explicit command, not a background service or an automatic retry loop.
 pub fn run(args: &[String]) -> i32 {
+    if let Some(args) = acknowledgment_arguments(args, 4) {
+        return report_acknowledgment(run_acknowledgment_once(args));
+    }
     let Some((args, mode, source_root)) = execution_arguments(args, 4) else {
-        eprintln!("usage: rabsd --worker-exec-loopback [--resume | --source-root <absolute-root>] <127.0.0.1:port> <expected-worker> <request.json> <absolute-delivery-directory>");
+        eprintln!("usage: rabsd --worker-exec-loopback [--resume | --acknowledge | --source-root <absolute-root>] <127.0.0.1:port> <expected-worker> <request.json> <absolute-delivery-directory>");
         eprintln!("--resume retrieves the original request into a new directory; it never executes it");
+        eprintln!("--acknowledge requires an existing verified delivery and releases only its matching remote result");
         eprintln!("--source-root captures only for new source_manifest requests; only declared regular files are uploaded");
         return 2;
     };
     report_result(run_once(args, mode, source_root))
+}
+
+fn report_acknowledgment(result: Result<Delivery, DeliveryFailure>) -> i32 {
+    match result {
+        Ok(delivery) => {
+            println!("{}", delivery.to_json());
+            // This command reports receiver acceptance, not the historical
+            // compiler exit. That original outcome remains in the receipt.
+            0
+        }
+        Err(error) => report_result(Err(error)),
+    }
 }
 
 fn report_result(result: Result<Delivery, DeliveryFailure>) -> i32 {
@@ -699,5 +753,42 @@ mod tests {
         assert!(run_tls_once(&tls, DeliveryMode::Resume, None).is_err(), "plaintext receipt cannot upgrade to TLS");
         std::fs::write(destination.join("diagnostics/stdout"), b"corrupted").unwrap();
         assert!(run_once(&args, DeliveryMode::Execute, Some(&source_path)).unwrap_err().execution_may_have_run);
+    }
+
+    #[test]
+    fn acknowledgment_intent_is_explicit_exclusive_and_never_an_execution_positional() {
+        let args: Vec<_> = ["127.0.0.1:0", "worker", "request.json", "/delivery"].into_iter().map(str::to_owned).collect();
+        let mut leading = vec!["--acknowledge".to_owned()]; leading.extend(args.clone());
+        assert_eq!(acknowledgment_arguments(&leading, 4), Some(&leading[1..]));
+        let mut trailing = args.clone(); trailing.push("--acknowledge".into());
+        assert_eq!(acknowledgment_arguments(&trailing, 4), Some(&trailing[..4]));
+        assert!(execution_arguments(&leading, 4).is_none());
+        assert!(execution_arguments(&trailing, 4).is_none());
+        assert!(acknowledgment_arguments(&args, 4).is_none());
+        for flag in ["--resume", "--source-root", "--acknowledge"] {
+            let mut wrong = leading.clone(); wrong[2] = flag.into();
+            assert!(acknowledgment_arguments(&wrong, 4).is_none());
+            assert!(execution_arguments(&wrong, 4).is_none());
+        }
+        let mut misplaced = args; misplaced.insert(2, "--acknowledge".into());
+        assert!(acknowledgment_arguments(&misplaced, 4).is_none());
+        assert!(execution_arguments(&misplaced, 4).is_none());
+    }
+
+    #[test]
+    fn acknowledgment_requires_a_complete_local_delivery_before_binding() {
+        let owner = tempfile::tempdir().unwrap();
+        let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
+        let request_path = owner.path().join("request.json");
+        let request = json!({"kind":"canonical-exec", "request_id":7, "program":"rustc",
+            "toolchain_backing":"/tc", "workspace_backing":"/ws"});
+        std::fs::write(&request_path, serde_json::to_vec(&request).unwrap()).unwrap();
+        let destination = owner.path().join("absent");
+        let args = vec![occupied.local_addr().unwrap().to_string(), "worker".into(),
+            request_path.to_string_lossy().into_owned(), destination.to_string_lossy().into_owned()];
+        let failure = run_acknowledgment_once(&args).unwrap_err();
+        assert!(failure.execution_may_have_run);
+        assert!(failure.detail.contains("existing verified delivery"));
+        assert!(!destination.exists());
     }
 }
