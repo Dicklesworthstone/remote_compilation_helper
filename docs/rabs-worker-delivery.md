@@ -82,19 +82,81 @@ Source discovery uses all features conservatively, even when the eventual
 command enables fewer features. A virtual workspace is supported by selecting
 its `Cargo.toml` and setting the corresponding canonical working directory.
 
-This automatic mode currently requires a captured workspace `Cargo.lock` and
-supports local packages only. It refuses symlinks, `.cargo/config` and
-`.cargo/config.toml`, escaping manifest paths, and registry/git dependencies.
-It neither fetches dependencies nor rewrites manifests or Cargo configuration.
-Use explicit `source_files` or `source_roots` preparation for other already
-supported source projections; those selectors are mutually exclusive with
-`cargo_source`. Worker support for explicitly uploaded registry Cargo-home
-inputs is separate from automatic graph preparation.
+Automatic preparation requires a captured workspace `Cargo.lock`. Without an
+explicit `vendor` selection it supports local packages only and refuses Cargo
+configuration, registry/git dependencies, symlinks and escaping manifest paths.
+The opt-in vendor mode below adds checked crates.io directory sources, not network
+fetching or arbitrary configuration replay. Use explicit `source_files` or
+`source_roots` for other supported projections; those selectors are mutually
+exclusive with `cargo_source`. Explicit registry Cargo-home replay remains a
+separate input-delivery mode.
 
 Cargo metadata may run installed compiler probes; it does not build packages or
 run their build scripts. Discovery has a 30-second process budget and an 8 MiB
 limit per output stream, plus the existing source-transfer file and byte limits.
 Failure retains no ready bundle and never dispatches a worker execution.
+
+### Prepare a workspace with vendored crates.io dependencies
+
+When the approved source anchor already contains a vendor directory, automatic
+preparation can resolve registry dependencies without enumerating their files:
+
+```json
+"cargo_source": {
+  "manifest": "Cargo.toml",
+  "vendor": "vendor"
+}
+```
+
+Both paths are relative to the approved anchor passed to `--worker-prepare`.
+For this example, the anchor's existing `.cargo/config.toml` must contain only:
+
+```toml
+[source.crates-io]
+replace-with = "vendored-sources"
+
+[source.vendored-sources]
+directory = "vendor"
+```
+
+The replacement source name may differ. Its relative directory is resolved from
+the directory containing `.cargo`, as Cargo defines configuration-file paths.
+For an `app/.cargo/config.toml` and a sibling vendor directory, use `../vendor`
+in that configuration and `vendor` in the preparation selection. The preparer
+requires those paths to identify the same contained directory. It copies the
+original configuration unchanged; it neither generates it nor runs `cargo vendor`.
+See Cargo's [source replacement reference](https://doc.rust-lang.org/cargo/reference/source-replacement.html)
+and [configuration path rules](https://doc.rust-lang.org/cargo/reference/config.html#config-relative-paths).
+
+Each vendor package must have a complete `.cargo-checksum.json` and explicit
+package name/version. Preparation rehashes the retained file bytes and requires
+exact checksum coverage: missing, extra, changed and duplicate entries refuse.
+The registry package checksums must match the actual resolved workspace's captured
+`Cargo.lock`, not a neighboring lockfile. Cargo still owns dependency resolution;
+its resolved registry identities, source directories and target paths are checked
+against the verified vendor tree and lock. Local path packages can coexist with
+registry packages, including transitive and build dependencies. Checksummed nested
+manifest/config fixtures within vendor packages remain ordinary package data.
+
+This bounded mode accepts one crates.io-to-directory replacement and no other
+Cargo configuration layers. Git dependencies, alternate registries, replacement
+chains, arbitrary build/credential configuration, symlinks and escaping paths
+refuse. Directory sources must already be complete; no registry, broker, fetch,
+archive download or user Cargo home is consulted. The existing 4,096-file and
+512 MiB source bounds include the whole approved anchor and vendor tree.
+
+The resulting ordinary source bundle works with `--worker-build-tls` below;
+no special worker vendor protocol or `cargo_home` projection is required. The
+worker sees the same source replacement and dependency layout in its read-only
+workspace. Build-script generated files belong in the declared output tree. The
+selected execution arguments and environment remain unchanged, including any
+user-supplied offline/locked requirements; planning flags are not injected into
+the later compilation command.
+
+These checks establish consistency among supplied source bytes, checksum metadata
+and the lockfile. They do not authenticate the original registry archive, prove
+full E025 resolution provenance, or authorize an action-cache hit. The operator
+must approve the captured content and target toolchain before transmission.
 
 ### Replay registry inputs into a private Cargo home
 
@@ -522,3 +584,34 @@ uploads transport-valid bytes with a wrong Cargo package checksum and requires
 Cargo to reject them with no artifact offer. The client is a bounded loopback
 fixture, not an authenticated fleet coordinator. Missing prerequisites fail when
 this ignored test is explicitly selected; source presence is not a passing gate.
+
+
+Vendored automatic preparation adds seven filesystem/metadata regressions and
+three normal process-level tests. They run the actual preparation CLI and a
+frozen local Cargo build from retained inputs after the original checkout changes,
+including transitive dependencies, a build script and its included data:
+
+```sh
+cargo test -p rabsd coord::source_delivery::preparation::cargo::vendor
+cargo test -p rabsd --test cargo_vendor_prepare
+```
+
+The separate native-TLS end-to-end case is intentionally ignored by default. On
+a canonical-capable Linux host with OpenSSL and a complete Rust toolchain, build
+the matching worker from the same revision and explicitly select it:
+
+```sh
+cargo build -p rabs-wkr
+RABS_TEST_WORKER_BIN=/absolute/path/to/target/debug/rabs-wkr \
+  cargo test -p rabsd --test cargo_vendor_prepare \
+  automatic_vendored_bundle_builds_over_native_tls_and_replays_installed_outputs_offline \
+  -- --ignored --exact
+```
+
+That case launches both real binaries, creates temporary TLS credentials, prepares
+a dependency-backed bundle, compiles through the worker's canonical namespace,
+verifies and installs the complete output, and runs the installed executable.
+It then removes access to source and credentials and repeats the command offline,
+requiring unchanged receipt/request identities and no worker connection. Missing
+prerequisites fail when the test is selected. These tests are implementation
+coverage awaiting execution, not a reported passing fleet or performance gate.
