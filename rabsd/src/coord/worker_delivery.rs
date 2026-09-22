@@ -8,6 +8,10 @@
 //! and filesystem sync. ACK loss after that frontier must never trigger execution
 //! again. Failed directories are retained for inspection, never reused or deleted.
 
+use rabs_sandbox::artifact_tree::{
+    MAX_TREE_ENTRIES, MAX_TREE_FILES, MAX_TREE_MANIFEST_BYTES, TREE_FILES_VERSION,
+    validate_tree_names,
+};
 use rabs_sandbox::process_context::{
     COMMAND_CONTEXT_VERSION, CommandContext, MAX_COMMAND_ENV_ENTRIES,
 };
@@ -172,14 +176,20 @@ fn safe_name(name: &str) -> bool {
 struct Declaration {
     unit: String,
     names: BTreeSet<String>,
+    tree: bool,
 }
 
 fn declaration(request: &Value) -> io::Result<Option<Declaration>> {
     let Some(value) = request.get("artifacts") else {
         return Ok(None);
     };
+    let tree = match value.get("tree") {
+        None => false,
+        Some(value) if value.as_str() == Some(TREE_FILES_VERSION) => true,
+        Some(_) => return Err(invalid("unsupported artifact tree declaration")),
+    };
     require(
-        value.as_object().is_some_and(|v| v.len() == 2),
+        value.as_object().is_some_and(|v| v.len() == if tree { 3 } else { 2 }),
         "invalid artifact declaration",
     )?;
     let unit = text(value, "unit")?;
@@ -215,9 +225,13 @@ fn declaration(request: &Value) -> io::Result<Option<Declaration>> {
             parent = path.parent();
         }
     }
+    if tree {
+        validate_tree_names(names.iter().map(String::as_str))?;
+    }
     Ok(Some(Declaration {
         unit: unit.to_owned(),
         names,
+        tree,
     }))
 }
 
@@ -326,18 +340,31 @@ fn manifest(value: &Value, expected: &Declaration) -> io::Result<Manifest> {
         text(value, "unit")? == expected.unit,
         "artifact unit mismatch",
     )?;
+    require(
+        serde_json::to_vec(value)?.len() <= MAX_TREE_MANIFEST_BYTES,
+        "artifact manifest exceeds its byte bound",
+    )?;
     let rows = value
         .get("files")
         .and_then(Value::as_array)
         .ok_or_else(|| invalid("manifest files"))?;
-    require(rows.len() == expected.names.len(), "artifact set mismatch")?;
+    let names = if expected.tree {
+        require(!rows.is_empty() && rows.len() <= MAX_TREE_FILES, "artifact tree file count")?;
+        let paths = rows.iter().map(|row| text(row, "name")).collect::<io::Result<Vec<_>>>()?;
+        let names = validate_tree_names(paths)?;
+        require(expected.names.is_subset(&names), "missing required tree artifact")?;
+        names
+    } else {
+        require(rows.len() == expected.names.len(), "artifact set mismatch")?;
+        expected.names.clone()
+    };
     let mut files = Vec::new();
     let mut total = 0_u64;
     let mut hasher = Sha256::new();
     field(&mut hasher, b"rabs.worker-artifact-manifest.v1");
     field(&mut hasher, expected.unit.as_bytes());
     hasher.update((rows.len() as u64).to_be_bytes());
-    for (row, expected_name) in rows.iter().zip(&expected.names) {
+    for (row, expected_name) in rows.iter().zip(&names) {
         require(
             text(row, "name")? == expected_name,
             "artifact names missing, extra or unsorted",
@@ -377,6 +404,40 @@ fn manifest(value: &Value, expected: &Declaration) -> io::Result<Manifest> {
         sha256,
         total,
     })
+}
+
+/// The single manifest admission rule used by live delivery, local recovery
+/// and CAS archive/restore. Exact declarations require equality. Tree requests
+/// require a bounded, safe, canonical full set containing every required name.
+/// Manifest identity validates descriptors; each consumer must still verify bytes.
+pub(crate) fn verified_artifact_names(request: &Value, value: &Value) -> io::Result<BTreeSet<String>> {
+    let expected = declaration(request)?.ok_or_else(|| invalid("missing artifact declaration"))?;
+    Ok(manifest(value, &expected)?.files.into_iter().map(|file| file.name).collect())
+}
+
+/// Create each implied directory exactly once in a new, caller-owned output
+/// root. Never use create_dir_all to silently merge case/normalization aliases
+/// on the receiving filesystem. The complete path set is validated beforehand.
+pub(crate) fn create_artifact_directories<'a>(
+    root: &Path, names: impl IntoIterator<Item = &'a str>,
+) -> io::Result<()> {
+    let mut directories = BTreeSet::new();
+    let mut files = 0_usize;
+    for name in names {
+        require(safe_name(name), "unsafe output path")?;
+        files += 1;
+        for parent in Path::new(name).ancestors().skip(1) {
+            if !parent.as_os_str().is_empty() {
+                directories.insert(parent.to_path_buf());
+            }
+        }
+        require(files + directories.len() <= MAX_TREE_ENTRIES, "artifact tree entry count")?;
+    }
+    // Lexical path order puts parents before their descendants.
+    for directory in directories {
+        create_directory(&root.join(directory))?;
+    }
+    Ok(())
 }
 
 const MAX_HEARTBEAT_BURST: usize = 64;
@@ -797,11 +858,11 @@ pub fn receive_operation(
             &destination.join("diagnostics/stderr"),
         )?;
         if let Some(manifest) = &artifacts {
+            create_artifact_directories(
+                &destination.join("artifacts"), manifest.files.iter().map(|file| file.name.as_str()),
+            )?;
             for file in &manifest.files {
                 let path = destination.join("artifacts").join(&file.name);
-                if let Some(parent) = path.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
                 download(
                     peer,
                     expected_worker,
@@ -841,8 +902,10 @@ pub fn receive_operation(
             receipt["worker_identity_scope"] = json!("delivery-session");
             receipt["execution_boot_generation"] = Value::Null;
         }
+        let receipt_bytes = serde_json::to_vec_pretty(&receipt)?;
+        require(receipt_bytes.len() <= MAX_FRAME_BYTES, "delivery receipt exceeds recovery bound")?;
         let mut marker = create_file(&destination.join("delivery.pending"))?;
-        marker.write_all(&serde_json::to_vec_pretty(&receipt)?)?;
+        marker.write_all(&receipt_bytes)?;
         marker.sync_all()?;
         drop(marker);
         std::fs::rename(
@@ -888,6 +951,8 @@ pub fn receive_operation(
 
 #[cfg(all(test, unix))]
 mod tests {
+    mod tree_tests;
+
     use super::*;
     use std::collections::VecDeque;
 

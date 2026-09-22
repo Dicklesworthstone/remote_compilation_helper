@@ -8,6 +8,7 @@
 
 use super::worker_delivery::{
     Delivery, DeliveryFailure, MAX_DELIVERY_BYTES, MAX_FRAME_BYTES, validate_request,
+    verified_artifact_names,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -117,19 +118,11 @@ fn expected_files(
     }
     match (successful, request.get("artifacts")) {
         (true, Some(declaration)) => {
-            // validate_request already checked names, duplicates, traversal,
-            // depth, and file/directory collisions. Read paths from THAT set,
-            // never from an untrusted retained manifest.
-            let names: BTreeSet<_> = declaration["files"]
-                .as_array()
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "artifact declaration"))?
-                .iter()
-                .map(|name| {
-                    name.as_str()
-                        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "artifact name"))
-                })
-                .collect::<io::Result<_>>()?;
+            // Use the SAME manifest admission rule as live delivery. A tree's
+            // required names are only a minimum: every captured intermediate
+            // file must be retained and reverified, never silently omitted.
             let manifest = &receipt["artifact_manifest"];
+            let names = verified_artifact_names(request, manifest)?;
             let unit = text(declaration, "unit")?;
             require(text(manifest, "unit")? == unit, "artifact unit mismatch")?;
             let rows = manifest["files"].as_array().ok_or_else(|| {
@@ -196,9 +189,9 @@ fn verify_tree(root: &Path, files: &BTreeMap<PathBuf, ExpectedFile>) -> io::Resu
             directories.insert(parent.to_path_buf());
         }
     }
-    // Iterate only the bounded set derived from the validated request. Unknown
-    // files, links, devices and directories fail without recursively exploring
-    // attacker-controlled subtrees. Empty artifact sets still need both roots.
+    // Iterate only the bounded, admitted file set. Unknown files, links,
+    // devices and directories fail without recursively exploring attacker-
+    // controlled subtrees. Empty artifact sets still need both roots.
     for relative in &directories {
         let directory = root.join(relative);
         require(

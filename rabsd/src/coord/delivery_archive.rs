@@ -8,7 +8,10 @@
 //! recovery verifier before exposing delivery.json. Failures never execute work.
 
 use super::delivery_recovery::{DeliveryTrust, recover_existing_delivery};
-use super::worker_delivery::{Delivery, MAX_DELIVERY_BYTES, validate_request};
+use super::worker_delivery::{
+    Delivery, MAX_DELIVERY_BYTES, create_artifact_directories, validate_request,
+    verified_artifact_names,
+};
 use crate::janitor::store::LiveCas;
 use rabs_cas::blob_store::{DurabilityPolicy, PutLimits, RAW_PROFILE_V1, put_if_absent};
 use rabs_cas::digest_set::{
@@ -18,7 +21,7 @@ use rabs_cas::metadata_store::{RabsMetadataStore, SqlValue, digest_key};
 use rabs_protocol::result_identity::{DigestAlgorithm, TypedDigest};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, Write};
 use std::path::{Component, Path};
@@ -104,8 +107,9 @@ struct Item {
     executable: bool,
 }
 
-/// Paths come from the caller's validated declaration. The recovery verifier
-/// checks the complete receipt, manifest and provenance again before promotion.
+/// The live manifest validator constrains the complete archived file set to
+/// the original request. Tree requests retain ALL accepted outputs, not only
+/// their minimum required names. Recovery checks bytes and provenance again.
 fn items(request: &Value, receipt: &Value) -> io::Result<BTreeMap<String, Item>> {
     validate_request(request)?;
     let mut entries = BTreeMap::new();
@@ -121,14 +125,9 @@ fn items(request: &Value, receipt: &Value) -> io::Result<BTreeMap<String, Item>>
     }
     if receipt.get("exit_code").and_then(Value::as_i64) == Some(0)
         && receipt.get("stop_reason") == Some(&Value::Null)
-        && let Some(declaration) = request.get("artifacts")
+        && request.get("artifacts").is_some()
     {
-        let names: BTreeSet<&str> = declaration["files"]
-            .as_array()
-            .ok_or_else(|| invalid("artifact declaration"))?
-            .iter()
-            .map(|value| value.as_str().ok_or_else(|| invalid("artifact name")))
-            .collect::<io::Result<_>>()?;
+        let names = verified_artifact_names(request, &receipt["artifact_manifest"])?;
         let rows = receipt["artifact_manifest"]["files"]
             .as_array()
             .ok_or_else(|| invalid("artifact manifest"))?;
@@ -549,11 +548,12 @@ pub fn restore_delivery(
         mkdir(&staging)?;
         mkdir(&staging.join("diagnostics"))?;
         mkdir(&staging.join("artifacts"))?;
+        create_artifact_directories(
+            &staging.join("artifacts"),
+            plan.keys().filter_map(|path| path.strip_prefix("artifacts/")),
+        )?;
         for ((path, item), object) in plan.iter().zip(&objects) {
             let target = staging.join(path);
-            if let Some(parent) = target.parent() {
-                fs::create_dir_all(parent)?;
-            }
             let (mut source, location) = open_object(&mut *store, object, item.len)?;
             let mut output = create_file(&target)?;
             let digests = stream(&mut source, &mut output, item.len)?;
