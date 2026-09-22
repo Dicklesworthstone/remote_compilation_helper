@@ -248,7 +248,7 @@ fn speculative_and_foreground_submissions_share_one_real_process_in_both_orders(
             std::fs::read(backing.join("input.txt")).unwrap(),
             b"sealed input\n"
         );
-        let attempt = dispatch.begin(&worker, i64::MAX as u64).unwrap().clone();
+        let attempt = dispatch.begin(&worker, 60_000).unwrap().clone();
         for state in [
             AttemptState::LeaseAccepted,
             AttemptState::AwaitingInputs,
@@ -343,7 +343,7 @@ fn speculative_and_foreground_submissions_share_one_real_process_in_both_orders(
                     lease: attempt.execution_lease_id,
                     seq: rabs_protocol::generation::LeaseRenewalSeq(1),
                 },
-                i64::MAX as u64,
+                60_000,
             ),
             Err(rabsd::coord::live::AttemptLeaseRefusal::Store(
                 rabs_cas::metadata_store::StoreError::GenerationTombstoned
@@ -361,7 +361,7 @@ fn speculative_and_foreground_submissions_share_one_real_process_in_both_orders(
         assert_eq!(resubmitted.action_key, first.action_key);
         {
             let mut next = coord.next_action_dispatch().unwrap().unwrap();
-            let admitted = next.begin(&worker, i64::MAX as u64).unwrap();
+            let admitted = next.begin(&worker, 60_000).unwrap();
             assert!(
                 admitted.action_generation.per_key_ordinal
                     > attempt.action_generation.per_key_ordinal

@@ -352,6 +352,7 @@ fn run_phase(
                 900 + u128::from(attempt),
                 1 + attempt,
                 CommitDurabilityProfile::RequireDurableClosure,
+                || 10,
             )
             .map_err(refusal_to_error)
         }
@@ -369,6 +370,7 @@ fn run_phase(
                 950 + u128::from(attempt),
                 10 + attempt,
                 CommitDurabilityProfile::RequireDurableClosure,
+                || 10,
             )
             .map_err(refusal_to_error)
         }

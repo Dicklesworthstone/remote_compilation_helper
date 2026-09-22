@@ -206,7 +206,7 @@ fn make_servable(st: &mut SqlMetadataStore<RusqliteEngine>, key: &TypedDigest) {
     assert_eq!(
         st.commit_publication(
             &authority,
-            Some(&winner),
+            Some((&winner, &|| 10)),
             &PublicationRow {
                 action_key: key.clone(),
                 descriptor_digest: d("rabs.descriptor.sha256.v1", 1),
@@ -651,7 +651,7 @@ fn l009_cross_worker_sampling_promotes_and_failure_demotes() {
     assert_eq!(
         st.commit_publication(
             &authority,
-            Some(&winner),
+            Some((&winner, &|| 10)),
             &PublicationRow {
                 action_key: action.clone(),
                 descriptor_digest: d("rabs.descriptor.sha256.v1", 1),

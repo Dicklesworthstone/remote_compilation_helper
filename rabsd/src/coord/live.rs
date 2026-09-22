@@ -70,7 +70,8 @@ use rabs_scheduler::speculation_brownout::{BrownoutDecision, PressureBand, WorkC
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
 
 /// The role a consult played in its key's flight.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -800,18 +801,19 @@ impl ActionDispatch<'_> {
 
     /// Grant the durable generation/lease and register exactly one primary.
     /// Call only after fallible source preparation; no process may start before
-    /// this returns an admitted authority tuple.
+    /// this returns an admitted authority tuple. `lease_ttl_ms` is a duration;
+    /// the coordinator derives the deadline from its own monotonic clock.
     pub fn begin(
         &mut self,
         worker: &WorkerSessionOffer,
-        expires_at_seq: u64,
+        lease_ttl_ms: u64,
     ) -> Result<&AttemptAuthority, SubmissionRefusal> {
         if self.authority.is_some() {
             return Err(SubmissionRefusal::StaleDispatch);
         }
         let authority =
             self.coord
-                .begin_submitted_dispatch(&self.key, self.serial, worker, expires_at_seq)?;
+                .begin_submitted_dispatch(&self.key, self.serial, worker, lease_ttl_ms)?;
         self.authority = Some(authority);
         self.authority
             .as_ref()
@@ -1005,6 +1007,10 @@ pub struct CoordLive {
     /// rows are keyed by (action, seq); a reused seq with different
     /// content is a typed store refusal, never a silent patch).
     next_seq: AtomicU64,
+    /// Lease durations use this incarnation's monotonic clock, never the
+    /// publication sequence or an unsynchronized peer/wall-clock timestamp.
+    /// Acquiring fresh authority fences every deadline from a previous boot.
+    lease_clock: OnceLock<Instant>,
     /// Generations closed by this incarnation's authority acquisition
     /// (G020/R120): every still-active generation minted under a PRIOR
     /// authority, tombstoned at boot so no prior-authority attempt can
@@ -1061,6 +1067,7 @@ impl CoordLive {
         Self {
             boot_nonce: boot_micros(),
             next_seq: AtomicU64::new(boot_micros()),
+            lease_clock: OnceLock::from(Instant::now()),
             ..Self::default()
         }
     }
@@ -1360,7 +1367,7 @@ impl CoordLive {
         key: &TypedDigest,
         serial: u64,
         worker: &WorkerSessionOffer,
-        expires_at_seq: u64,
+        lease_ttl_ms: u64,
     ) -> Result<AttemptAuthority, SubmissionRefusal> {
         if !self.available() {
             return Err(SubmissionRefusal::Unavailable);
@@ -1413,7 +1420,15 @@ impl CoordLive {
             worker_boot_generation: worker.boot_generation,
             worker_incarnation_id: worker.incarnation,
         };
-        if let Err(error) = store.admit_attempt_lease(&authority, self.next_seq(), expires_at_seq) {
+        // Arm the TTL after fallible generation preparation. Recheck after
+        // durable admission so slow SQL/fsync cannot return expired proof.
+        let admitted = self
+            .lease_deadline(lease_ttl_ms)
+            .and_then(|(_, deadline)| {
+                store.admit_attempt_lease(&authority, self.next_seq(), deadline)
+            })
+            .and_then(|()| self.confirm_live_admission(&mut *store, &authority));
+        if let Err(error) = admitted {
             // No executable lease was issued. Burn the failed generation before
             // allowing the still-owned queue claim to return for a fresh attempt.
             store
@@ -1646,6 +1661,7 @@ impl CoordLive {
 
     /// Atomically grant one attempt and its execution lease under the
     /// exact active worker boot-generation/incarnation tuple.
+    /// The TTL is a duration in milliseconds on this coordinator's clock.
     ///
     /// # Errors
     /// A typed refusal when this coordinator/store is unavailable, the
@@ -1654,7 +1670,7 @@ impl CoordLive {
     pub fn admit_attempt_lease(
         &self,
         authority: &AttemptAuthority,
-        expires_at_seq: u64,
+        lease_ttl_ms: u64,
     ) -> Result<ValidatedAttemptLease, AttemptLeaseRefusal> {
         let cas = self.cas.as_ref().ok_or(AttemptLeaseRefusal::NoStore)?;
         let held = self.authority().ok_or(AttemptLeaseRefusal::NoAuthority)?;
@@ -1666,8 +1682,13 @@ impl CoordLive {
             .store()
             .lock()
             .map_err(|_| AttemptLeaseRefusal::StoreUnavailable)?;
+        let (_, expires_at_seq) = self
+            .lease_deadline(lease_ttl_ms)
+            .map_err(AttemptLeaseRefusal::Store)?;
         store
             .admit_attempt_lease(authority, recorded_seq, expires_at_seq)
+            .map_err(AttemptLeaseRefusal::Store)?;
+        self.confirm_live_admission(&mut *store, authority)
             .map_err(AttemptLeaseRefusal::Store)?;
         Ok(ValidatedAttemptLease {
             authority: authority.clone(),
@@ -1675,7 +1696,8 @@ impl CoordLive {
     }
 
     /// Renew one attempt lease by durable compare-and-swap, revalidating
-    /// the exact current worker fence in the same transaction.
+    /// the exact current worker fence in the same transaction. A duration
+    /// re-arms a still-live lease; an expired lease requires a new attempt.
     ///
     /// # Errors
     /// As [`Self::admit_attempt_lease`], plus lease ownership/sequence
@@ -1684,7 +1706,7 @@ impl CoordLive {
         &self,
         authority: &AttemptAuthority,
         renewal: LeaseRenewal,
-        expires_at_seq: u64,
+        lease_ttl_ms: u64,
     ) -> Result<ValidatedLeaseRenewal, AttemptLeaseRefusal> {
         let cas = self.cas.as_ref().ok_or(AttemptLeaseRefusal::NoStore)?;
         let held = self.authority().ok_or(AttemptLeaseRefusal::NoAuthority)?;
@@ -1695,8 +1717,11 @@ impl CoordLive {
             .store()
             .lock()
             .map_err(|_| AttemptLeaseRefusal::StoreUnavailable)?;
+        let (_, expires_at_seq) = self
+            .lease_deadline(lease_ttl_ms)
+            .map_err(AttemptLeaseRefusal::Store)?;
         store
-            .renew_attempt_lease(authority, renewal, expires_at_seq)
+            .renew_attempt_lease(authority, renewal, expires_at_seq, &|| self.lease_now_ms())
             .map_err(AttemptLeaseRefusal::Store)?;
         Ok(ValidatedLeaseRenewal {
             authority: authority.clone(),
@@ -1714,7 +1739,8 @@ impl CoordLive {
     /// an incomplete upload can never become a committed pointer.
     ///
     /// # Errors
-    /// A typed [`CommitRefusal`]. Nothing is written on any of them.
+    /// A typed [`CommitRefusal`]. Refusals do not publish this offer;
+    /// already-verified lineage reconciliation and uploaded objects may remain.
     pub fn commit_offer(
         &self,
         offer: &OfferPreparedActionResult,
@@ -1766,6 +1792,7 @@ impl CoordLive {
             pin_id,
             seq,
             CommitDurabilityProfile::RequireDurableClosure,
+            || self.lease_now_ms(),
         )
         .map_err(CommitRefusal::Offer)?;
         if let Err(error) =
@@ -1985,6 +2012,35 @@ impl CoordLive {
     /// Allocate the next causal sequence.
     fn next_seq(&self) -> u64 {
         self.next_seq.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// This process's own monotonic time domain. The origin never changes
+    /// while its authority is live, including during an idle partition.
+    fn lease_now_ms(&self) -> u64 {
+        u64::try_from(self.lease_clock.get_or_init(Instant::now).elapsed().as_millis())
+            .unwrap_or(u64::MAX)
+    }
+
+    fn confirm_live_admission(
+        &self,
+        store: &mut dyn RabsMetadataStore,
+        authority: &AttemptAuthority,
+    ) -> Result<(), StoreError> {
+        let lease = store.validate_attempt_lease(authority, self.lease_now_ms())?;
+        // Validation itself performs SQL reads; sample again after them.
+        if self.lease_now_ms() >= lease.expires_at_own_monotonic_ms {
+            return Err(StoreError::LeaseExpired);
+        }
+        Ok(())
+    }
+
+    fn lease_deadline(&self, ttl_ms: u64) -> Result<(u64, u64), StoreError> {
+        let now = self.lease_now_ms();
+        let deadline = now
+            .checked_add(ttl_ms)
+            .filter(|deadline| ttl_ms > 0 && *deadline <= i64::MAX as u64)
+            .ok_or(StoreError::LeaseExpired)?;
+        Ok((now, deadline))
     }
 
     /// The coord region is up (called from coord work at boot).
@@ -2366,6 +2422,106 @@ mod tests {
     }
 
     #[test]
+    fn execution_lease_uses_monotonic_time_independently_of_publication_sequence() {
+        use rabs_cas::test_support::{install_admission_world, install_offer_closure};
+
+        let (_state, coord) = submission_coordinator();
+        let held = coord.authority().unwrap();
+        let offer = offer_under(&held);
+        let cas = coord.cas.as_ref().unwrap();
+        {
+            let mut store = cas.store().lock().unwrap();
+            install_admission_world(&mut *store, &held);
+            install_offer_closure(&mut *store, &offer);
+        }
+        // Receipt sequences can be arbitrarily far ahead of a lease's clock
+        // without shortening its TTL. No wall-clock comparison belongs here.
+        coord.next_seq.store(i64::MAX as u64 - 100, Ordering::Relaxed);
+        assert!(matches!(
+            coord
+                .commit_offer(&offer, &sample_expected_descriptor())
+                .unwrap(),
+            PublicationOutcome::Committed(_)
+        ));
+    }
+
+    #[test]
+    fn expired_execution_cannot_publish_or_renew_after_an_idle_partition_or_restart() {
+        use rabs_cas::test_support::{install_admission_world, install_offer_closure};
+        use std::time::Duration;
+
+        let (state, mut coord) = submission_coordinator();
+        let held = coord.authority().unwrap();
+        let offer = offer_under(&held);
+        {
+            let mut store = coord.cas.as_ref().unwrap().store().lock().unwrap();
+            install_admission_world(&mut *store, &held);
+            install_offer_closure(&mut *store, &offer);
+        }
+        // Deterministically model a quiet partition: elapsed monotonic time
+        // advances beyond the fixture's 60-second lease without any receipt
+        // traffic, waiting, or dependency on the machine's wall clock.
+        let sequence = coord.next_seq.load(Ordering::Relaxed);
+        coord.lease_clock = OnceLock::from(Instant::now() - Duration::from_secs(61));
+        assert!(coord.lease_now_ms() >= 61_000);
+        assert_eq!(coord.next_seq.load(Ordering::Relaxed), sequence);
+        assert_eq!(
+            coord.commit_offer(&offer, &sample_expected_descriptor()),
+            Err(CommitRefusal::Offer(OfferRefusal::LeaseExpired))
+        );
+        assert_eq!(
+            coord.renew_attempt_lease(
+                &offer.authority,
+                LeaseRenewal {
+                    lease: offer.authority.execution_lease_id,
+                    seq: LeaseRenewalSeq(offer.authority.lease_renewal_seq.0 + 1),
+                },
+                60_000,
+            ),
+            Err(AttemptLeaseRefusal::Store(StoreError::LeaseExpired))
+        );
+        {
+            let mut store = coord.cas.as_ref().unwrap().store().lock().unwrap();
+            assert!(!store.has_publication(&offer.manifest.action_key).unwrap());
+            assert!(store.object_located(&offer.manifest_id.0).unwrap());
+            assert!(store.object_located(&offer.evidence_id.0).unwrap());
+        }
+        drop(coord);
+
+        let restarted = CoordLive::with_cas(Arc::new(mount_and_reconcile(state.path()).unwrap()));
+        restarted.acquire_boot_authority("submission-tests").unwrap();
+        assert!(matches!(
+            restarted.commit_offer(&offer, &sample_expected_descriptor()),
+            Err(CommitRefusal::StaleAuthority { .. })
+        ));
+        assert!(restarted.closed_prior_generations() > 0);
+        assert!(
+            !restarted
+                .cas
+                .as_ref()
+                .unwrap()
+                .store()
+                .lock()
+                .unwrap()
+                .has_publication(&offer.manifest.action_key)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn coordinator_arms_lease_deadlines_from_durations_and_rejects_empty_or_overflowing_ttl() {
+        use std::time::Duration;
+
+        let mut coord = CoordLive::new();
+        coord.lease_clock = OnceLock::from(Instant::now() - Duration::from_secs(61));
+        let (now, deadline) = coord.lease_deadline(5_000).unwrap();
+        assert!(now >= 61_000);
+        assert_eq!(deadline - now, 5_000);
+        assert_eq!(coord.lease_deadline(0), Err(StoreError::LeaseExpired));
+        assert_eq!(coord.lease_deadline(u64::MAX), Err(StoreError::LeaseExpired));
+    }
+
+    #[test]
     fn live_serving_class_is_key_bound_and_survives_reopen() {
         let (state, coord) = submission_coordinator();
         let (_source_dir, source, manifest, mut descriptor) = source_fixture();
@@ -2638,12 +2794,12 @@ mod tests {
             )
             .unwrap();
         let worker = worker_offer(1, 1);
-        let expiry = i64::MAX as u64;
+        let lease_ttl_ms = 60_000;
         {
             let mut claim = coord.next_action_dispatch().unwrap().unwrap();
             coord.set_speculation_pressure(PressureBand::Soft).unwrap();
             assert_eq!(
-                claim.begin(&worker, expiry).unwrap_err(),
+                claim.begin(&worker, lease_ttl_ms).unwrap_err(),
                 SubmissionRefusal::Brownout
             );
             assert_eq!(
@@ -2663,16 +2819,16 @@ mod tests {
         {
             let mut claim = coord.next_action_dispatch().unwrap().unwrap();
             assert_eq!(
-                claim.begin(&worker, expiry).unwrap_err(),
+                claim.begin(&worker, lease_ttl_ms).unwrap_err(),
                 SubmissionRefusal::Admission("lease: UnknownWorkerFence".into()),
                 "unadmitted worker cannot obtain execution lease"
             );
         }
         coord.admit_worker_session(&worker).unwrap();
         let mut claim = coord.next_action_dispatch().unwrap().unwrap();
-        let authority = claim.begin(&worker, expiry).unwrap().clone();
+        let authority = claim.begin(&worker, lease_ttl_ms).unwrap().clone();
         assert_eq!(
-            claim.begin(&worker, expiry).unwrap_err(),
+            claim.begin(&worker, lease_ttl_ms).unwrap_err(),
             SubmissionRefusal::StaleDispatch
         );
         assert_eq!(
@@ -2919,14 +3075,14 @@ mod tests {
                 .expect("bound generation");
         }
         coord
-            .admit_attempt_lease(&incumbent, 100)
+            .admit_attempt_lease(&incumbent, 60_000)
             .expect("incumbent lease");
         let first_renewal = LeaseRenewal {
             lease: incumbent.execution_lease_id,
             seq: LeaseRenewalSeq(2),
         };
         coord
-            .renew_attempt_lease(&incumbent, first_renewal, 200)
+            .renew_attempt_lease(&incumbent, first_renewal, 60_000)
             .expect("incumbent renewal");
         incumbent.lease_renewal_seq = LeaseRenewalSeq(2);
 
@@ -2994,7 +3150,7 @@ mod tests {
         let reopened = Arc::new(mount_and_reconcile(dir.path()).expect("reopen"));
         let mut store = reopened.store().lock().expect("reopened store lock");
         assert_eq!(
-            store.validate_attempt_lease(&incumbent),
+            store.validate_attempt_lease(&incumbent, 10),
             Err(StoreError::WorkerLeaseRejected(
                 WorkerLeaseBindingRejection::CloneAmbiguous,
             )),
@@ -3008,7 +3164,7 @@ mod tests {
             Ok(WorkerAdmission::AdmitViaReenrollment)
         );
         assert_eq!(
-            store.validate_attempt_lease(&incumbent),
+            store.validate_attempt_lease(&incumbent, 10),
             Err(StoreError::WorkerLeaseRejected(
                 WorkerLeaseBindingRejection::IncarnationMismatch,
             )),
@@ -3031,14 +3187,16 @@ mod tests {
                     seq: LeaseRenewalSeq(2),
                 },
                 600,
+                &|| 10,
             )
             .expect("replacement renewal");
         replacement.lease_renewal_seq = LeaseRenewalSeq(2);
         assert_eq!(
-            store.validate_attempt_lease(&replacement),
+            store.validate_attempt_lease(&replacement, 10),
             Ok(rabs_cas::metadata_store::LeaseState {
                 released: false,
                 renewal_seq: 2,
+                expires_at_own_monotonic_ms: 600,
             })
         );
     }

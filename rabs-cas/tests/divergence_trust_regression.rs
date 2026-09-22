@@ -105,6 +105,7 @@ fn divergence_scenario(store: &mut dyn RabsMetadataStore, presentation_only: boo
             900,
             1,
             CommitDurabilityProfile::RequireDurableClosure,
+            || 10,
         )
         .unwrap(),
         PublicationOutcome::Committed(_)
@@ -167,6 +168,7 @@ fn divergence_scenario(store: &mut dyn RabsMetadataStore, presentation_only: boo
         901,
         20,
         CommitDurabilityProfile::RequireDurableClosure,
+        || 10,
     )
     .unwrap();
     let PublicationOutcome::Quarantined(quarantine) = outcome else {

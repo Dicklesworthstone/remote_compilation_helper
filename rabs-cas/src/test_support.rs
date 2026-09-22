@@ -458,7 +458,7 @@ pub fn install_admission_world_with_ids(
         )
         .expect("worker session");
     store
-        .admit_attempt_lease(&attempt_authority, 1, 100)
+        .admit_attempt_lease(&attempt_authority, 1, 60_000)
         .expect("attempt lease");
 }
 
@@ -555,6 +555,7 @@ mod tests {
             900,      // pin_id
             1,        // seq
             CommitDurabilityProfile::RequireDurableClosure,
+            || 10,
         )
         .expect("offer must be accepted");
         assert!(

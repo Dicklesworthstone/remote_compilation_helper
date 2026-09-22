@@ -334,12 +334,12 @@ fn operation_script(
     outcome(
         &mut t,
         "lease-renew",
-        &store.renew_attempt_lease(&lease_authority, renewal, 200),
+        &store.renew_attempt_lease(&lease_authority, renewal, 200, &|| 10),
     );
     outcome(
         &mut t,
         "lease-stale",
-        &store.renew_attempt_lease(&lease_authority, renewal, 300),
+        &store.renew_attempt_lease(&lease_authority, renewal, 300, &|| 10),
     );
     outcome(&mut t, "lease-release", &store.release_lease(30));
     let mut renewed_authority = lease_authority;
@@ -354,6 +354,7 @@ fn operation_script(
                 seq: LeaseRenewalSeq(3),
             },
             300,
+            &|| 10,
         ),
     );
     let publication_row = publication(7, 1, 40);
@@ -415,7 +416,7 @@ fn operation_script(
     outcome(
         &mut t,
         "publish-det-failure",
-        &store.commit_publication(&active, Some(&failure_authority), &failure_row),
+        &store.commit_publication(&active, Some((&failure_authority, &|| 10)), &failure_row),
     );
     let extra_evidence = digest("rabs.evidence-bundle.sha256.v1", 90);
     let manifest_key = digest_key(&publication_row.manifest_digest);

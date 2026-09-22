@@ -390,8 +390,8 @@ impl OfferPreparedActionResult {
     }
 }
 
-/// Typed coordinator refusals — the offer is NOT admitted, nothing was
-/// written (a refusal is not a divergence).
+/// Typed coordinator refusals — the offer cannot publish. A refusal does
+/// not create a divergence incident; immutable uploaded candidates remain.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OfferRefusal {
     /// The offer's full authority does not digest to the active one.
@@ -409,6 +409,9 @@ pub enum OfferRefusal {
     UnknownLease,
     /// The execution lease was released.
     LeaseReleased,
+    /// The execution lease expired on the coordinator's own monotonic clock.
+    /// Uploaded immutable objects remain candidates; this offer cannot publish.
+    LeaseExpired,
     /// Reloaded canonical descriptor digest differs byte-for-byte.
     DescriptorMismatch,
     /// Manifest action key differs from the authority's action key.
@@ -593,9 +596,16 @@ const fn result_kind_to_tag(kind: ResultKind) -> ResultKindTag {
 /// object must have a durable location BEFORE the metadata transaction
 /// runs, so the committed pointer can never name bytes a power failure
 /// may still lose.
+/// `own_monotonic_now_ms` reads the granting coordinator's monotonic clock,
+/// independent of `seq` and every peer's timestamp. Restarted coordinators
+/// must acquire a new authority before using their new clock origin. The
+/// callback is resampled at publication, so validation cannot extend a lease.
 ///
 /// # Errors
-/// A typed [`OfferRefusal`]; refusals write nothing.
+/// A typed [`OfferRefusal`]. Refusals do not publish a pointer, winner evidence,
+/// or publication pin. Previously verified lineage obligations may have been
+/// reconciled before a late refusal; those records do not grant publication.
+#[allow(clippy::too_many_arguments)]
 pub fn process_offer(
     store: &mut dyn RabsMetadataStore,
     offer: &OfferPreparedActionResult,
@@ -604,6 +614,7 @@ pub fn process_offer(
     pin_id: u128,
     seq: u64,
     durability: CommitDurabilityProfile,
+    own_monotonic_now_ms: impl Fn() -> u64,
 ) -> Result<PublicationOutcome, OfferRefusal> {
     // 1. Authority fence: active authority + F033 digest equality.
     let offered_authority = authority_digest(&offer.authority.coordinator);
@@ -634,12 +645,9 @@ pub fn process_offer(
     if !store.attempt_exists(attempt_id, generation_id)? {
         return Err(OfferRefusal::UnknownAttempt);
     }
-    match store.validate_attempt_lease(&offer.authority) {
-        Ok(_) => {}
-        Err(StoreError::UnknownLease) => return Err(OfferRefusal::UnknownLease),
-        Err(StoreError::LeaseReleased) => return Err(OfferRefusal::LeaseReleased),
-        Err(error) => return Err(OfferRefusal::Store(error)),
-    }
+    store
+        .validate_attempt_lease(&offer.authority, own_monotonic_now_ms())
+        .map_err(lease_refusal)?;
 
     // 4. Descriptor reload + byte-compare.
     if offer.manifest.canonical_descriptor_digest != *expected_descriptor {
@@ -744,21 +752,28 @@ pub fn process_offer(
 
     // 8. Same-key candidates: divergence taxonomy, never overwrite.
     if let Some(committed_key) = store.published_manifest_key(&offer.manifest.action_key)? {
+        store
+            .validate_attempt_lease(&offer.authority, own_monotonic_now_ms())
+            .map_err(lease_refusal)?;
         let candidate_key = digest_key(&offer.manifest_id.0);
         if committed_key == candidate_key {
             // Idempotent re-offer: append evidence only, bound to the
             // committed canonical manifest it supports (H029; I37).
-            store.append_evidence(
-                &offer.manifest.action_key,
-                &committed_key,
-                &offer.evidence_id.0,
-                generation_id,
-                attempt_id,
-            )?;
+            store
+                .append_evidence_for_attempt(
+                    &offer.authority,
+                    &committed_key,
+                    &offer.evidence_id.0,
+                    &own_monotonic_now_ms,
+                )
+                .map_err(lease_refusal)?;
             return Ok(PublicationOutcome::IdempotentEvidenceAppended);
         }
         let committed =
             manifest_resolver(&committed_key).ok_or(OfferRefusal::CommittedManifestUnavailable)?;
+        store
+            .validate_attempt_lease(&offer.authority, own_monotonic_now_ms())
+            .map_err(lease_refusal)?;
         // A018 taxonomy with the manifest-id inequality already
         // established above (committed_key != candidate_key), so the
         // idempotent branch is unreachable here by construction.
@@ -779,6 +794,7 @@ pub fn process_offer(
             attempt_id,
             pin_id,
             seq,
+            &own_monotonic_now_ms,
         )?;
         return Ok(PublicationOutcome::Quarantined(quarantine));
     }
@@ -797,7 +813,14 @@ pub fn process_offer(
         pin_owner: "coordinator".to_owned(),
         provisional_ancestors: ancestor_rows,
     };
-    match store.commit_publication(&offered_authority, Some(&offer.authority), &row)? {
+    match store
+        .commit_publication(
+            &offered_authority,
+            Some((&offer.authority, &own_monotonic_now_ms)),
+            &row,
+        )
+        .map_err(lease_refusal)?
+    {
         CommitOutcome::Committed => {}
         // The pipeline checked for an existing row above; hitting either
         // branch here means the store's own CAS caught a same-key row —
@@ -815,6 +838,15 @@ pub fn process_offer(
         winner_evidence_bundle_id: offer.evidence_id.clone(),
         committed_causal_sequence: seq,
     }))
+}
+
+fn lease_refusal(error: StoreError) -> OfferRefusal {
+    match error {
+        StoreError::UnknownLease => OfferRefusal::UnknownLease,
+        StoreError::LeaseReleased => OfferRefusal::LeaseReleased,
+        StoreError::LeaseExpired => OfferRefusal::LeaseExpired,
+        error => OfferRefusal::Store(error),
+    }
 }
 
 /// One lineage reference to verify: producer/role/path/consumed-object,
@@ -1052,8 +1084,9 @@ fn set_divergence_serving_disposition(
     store: &mut dyn RabsMetadataStore,
     action_key: &str,
     class: DivergenceClass,
+    attempt_lease: Option<(&AttemptAuthority, &dyn Fn() -> u64)>,
 ) -> Result<(), StoreError> {
-    let disposition = match class {
+    let mut disposition = match class {
         DivergenceClass::SemanticDivergence | DivergenceClass::ProjectionCompletenessIncident => {
             DISPOSITION_QUARANTINED
         }
@@ -1067,9 +1100,19 @@ fn set_divergence_serving_disposition(
     if disposition == DISPOSITION_PRESENTATION_QUARANTINED
         && store.serving_disposition_key(action_key)?.as_deref() == Some(DISPOSITION_QUARANTINED)
     {
-        return Ok(());
+        disposition = DISPOSITION_QUARANTINED;
     }
-    store.set_serving_disposition_key(action_key, disposition)
+    match attempt_lease {
+        Some((authority, clock)) => {
+            if digest_key(&authority.action_key) != action_key {
+                return Err(StoreError::AttemptAuthorityMismatch);
+            }
+            // Reassert even an existing quarantine inside the guarded
+            // transaction: the candidate still needs live acceptance.
+            store.set_serving_disposition_for_attempt(authority, disposition, clock)
+        }
+        None => store.set_serving_disposition_key(action_key, disposition),
+    }
 }
 
 /// Apply the class-specific serving quarantine, preserve BOTH candidates
@@ -1082,6 +1125,10 @@ fn set_divergence_serving_disposition(
 /// Write order is stricter-state-first within each class: a crash mid-
 /// sequence can leave serving denied with partial bookkeeping, never
 /// bookkept while ordinary replay remains allowed.
+/// The first disposition transaction is the candidate's acceptance point:
+/// it validates the exact lease and its clock before and after the write.
+/// Once accepted, diagnostic recording completes without a later expiry
+/// refusal; those records cannot restore serving or select another winner.
 #[allow(clippy::too_many_arguments)]
 fn quarantine_divergence(
     store: &mut dyn RabsMetadataStore,
@@ -1093,6 +1140,7 @@ fn quarantine_divergence(
     attempt_id: u128,
     pin_id: u128,
     seq: u64,
+    own_monotonic_now_ms: &dyn Fn() -> u64,
 ) -> Result<DivergenceQuarantine, OfferRefusal> {
     let action_key = digest_key(&offer.manifest.action_key);
     let candidate_key = digest_key(&offer.manifest_id.0);
@@ -1101,7 +1149,13 @@ fn quarantine_divergence(
     // gate directly consults, so a later bookkeeping failure cannot
     // leave a known divergence servable. A pre-existing full quarantine
     // is never downgraded by a later observable-only mismatch.
-    set_divergence_serving_disposition(store, &action_key, class)?;
+    set_divergence_serving_disposition(
+        store,
+        &action_key,
+        class,
+        Some((&offer.authority, own_monotonic_now_ms)),
+    )
+    .map_err(lease_refusal)?;
 
     // 2. Semantic and projection-completeness divergence make the ACTION
     // suspect and therefore get an action-entry row. Observable-only
@@ -1265,7 +1319,7 @@ pub fn check_recomputation_against_tombstone(
         DivergenceClass::SemanticDivergence
     };
     let action_key = digest_key(action);
-    set_divergence_serving_disposition(store, &action_key, class)?;
+    set_divergence_serving_disposition(store, &action_key, class, None)?;
     if class == DivergenceClass::SemanticDivergence {
         store.add_quarantine(
             QuarantineScope::ActionEntry,
@@ -1281,8 +1335,8 @@ mod tests {
     use super::*;
     use rabs_protocol::authority::{ClusterId, CoordinatorAuthority, CoordinatorIncarnationId};
     use rabs_protocol::generation::{
-        ActionGeneration, ActionGenerationId, AttemptId, ExecutionLeaseId, LeaseRenewalSeq,
-        WorkerBootGeneration, WorkerIncarnationId,
+        ActionGeneration, ActionGenerationId, AttemptId, ExecutionLeaseId, LeaseRenewal,
+        LeaseRenewalSeq, WorkerBootGeneration, WorkerIncarnationId,
     };
     use rabs_protocol::result_identity::LogicalOutput;
     use rabs_protocol::wire_time::PeerId;
@@ -1626,6 +1680,7 @@ mod tests {
                 900,
                 1,
                 CommitDurabilityProfile::RequireDurableClosure,
+                || 10,
             )
             .unwrap(),
             PublicationOutcome::Committed(_)
@@ -1694,6 +1749,7 @@ mod tests {
                 900,
                 1,
                 CommitDurabilityProfile::RequireDurableClosure,
+                || 10,
             ),
             Err(OfferRefusal::ProvisionalProducerNotCommitted { .. })
         ));
@@ -1735,6 +1791,7 @@ mod tests {
                 901,
                 1,
                 CommitDurabilityProfile::RequireDurableClosure,
+                || 10,
             ),
             Ok(PublicationOutcome::Committed(_))
         ));
@@ -1794,6 +1851,7 @@ mod tests {
                 900,
                 1,
                 CommitDurabilityProfile::RequireDurableClosure,
+                || 10,
             )
             .unwrap_err(),
             OfferRefusal::UndeclaredProvisionalConsumption { pin_key }
@@ -1848,6 +1906,7 @@ mod tests {
                 900,
                 1,
                 CommitDurabilityProfile::RequireDurableClosure,
+                || 10,
             )
             .unwrap_err(),
             OfferRefusal::ConsumptionLineageCancelled { pin_key }
@@ -1890,6 +1949,7 @@ mod tests {
                 900,
                 1,
                 CommitDurabilityProfile::RequireDurableClosure,
+                || 10,
             ),
             Err(OfferRefusal::ProvisionalProducerNotCommitted {
                 producer: digest_key(&digest("rabs.action-key.sha256.v1", 102)),
@@ -1939,6 +1999,7 @@ mod tests {
                 900,
                 1,
                 CommitDurabilityProfile::RequireDurableClosure,
+                || 10,
             ),
             Err(OfferRefusal::DivergentProvisionalAncestor {
                 producer: b_key.clone(),
@@ -1979,6 +2040,7 @@ mod tests {
                 900,
                 1,
                 CommitDurabilityProfile::RequireDurableClosure,
+                || 10,
             )
             .unwrap(),
             PublicationOutcome::Committed(_)
@@ -2076,6 +2138,7 @@ mod tests {
                 900,
                 1,
                 CommitDurabilityProfile::RequireDurableClosure,
+                || 10,
             )
             .unwrap(),
             PublicationOutcome::Committed(_)
@@ -2141,6 +2204,7 @@ mod tests {
                 900,
                 1,
                 CommitDurabilityProfile::RequireDurableClosure,
+                || 10,
             )
             .unwrap(),
             PublicationOutcome::Committed(_)
@@ -2187,6 +2251,7 @@ mod tests {
             905,
             6,
             CommitDurabilityProfile::RequireDurableClosure,
+            || 10,
         )
         .unwrap();
         // The RIGHT incident class — and specifically NOT the
@@ -2303,6 +2368,7 @@ mod tests {
                 900,
                 1,
                 CommitDurabilityProfile::RequireDurableClosure,
+                || 10,
             ),
             Err(OfferRefusal::BundleRootMismatch { .. })
         ));
@@ -2329,6 +2395,7 @@ mod tests {
                 900,
                 1,
                 CommitDurabilityProfile::RequireDurableClosure,
+                || 10,
             ),
             Err(OfferRefusal::BundleRootMismatch { .. })
         ));
@@ -2344,6 +2411,7 @@ mod tests {
                 900,
                 1,
                 CommitDurabilityProfile::RequireDurableClosure,
+                || 10,
             )
             .unwrap(),
             PublicationOutcome::Committed(_)
@@ -2369,6 +2437,7 @@ mod tests {
                 900,
                 1,
                 CommitDurabilityProfile::RequireDurableClosure,
+                || 10,
             ),
             Err(OfferRefusal::ObjectNotDurable {
                 missing: digest_key(&object(61).0),
@@ -2403,6 +2472,7 @@ mod tests {
                 900,
                 1,
                 CommitDurabilityProfile::AcceptVolatileLocations,
+                || 10,
             )
             .unwrap(),
             PublicationOutcome::Committed(_)
@@ -2423,6 +2493,7 @@ mod tests {
                 900,
                 1,
                 CommitDurabilityProfile::RequireDurableClosure,
+                || 10,
             )
             .unwrap(),
             PublicationOutcome::Committed(_)
@@ -2517,6 +2588,7 @@ mod tests {
             900,
             42,
             CommitDurabilityProfile::RequireDurableClosure,
+            || 10,
         )
         .unwrap();
         let PublicationOutcome::Committed(receipt) = outcome else {
@@ -2557,6 +2629,7 @@ mod tests {
                 900,
                 1,
                 CommitDurabilityProfile::RequireDurableClosure,
+                || 10,
             ),
             Err(OfferRefusal::NotActiveAuthority)
         );
@@ -2578,6 +2651,7 @@ mod tests {
                 900,
                 1,
                 CommitDurabilityProfile::RequireDurableClosure,
+                || 10,
             ),
             Err(OfferRefusal::GenerationAuthorityMismatch)
         );
@@ -2594,6 +2668,7 @@ mod tests {
                 900,
                 1,
                 CommitDurabilityProfile::RequireDurableClosure,
+                || 10,
             ),
             Err(OfferRefusal::UnknownGeneration)
         );
@@ -2610,6 +2685,7 @@ mod tests {
                 900,
                 1,
                 CommitDurabilityProfile::RequireDurableClosure,
+                || 10,
             ),
             Err(OfferRefusal::UnknownAttempt)
         );
@@ -2625,6 +2701,7 @@ mod tests {
                 900,
                 1,
                 CommitDurabilityProfile::RequireDurableClosure,
+                || 10,
             ),
             Err(OfferRefusal::LeaseReleased)
         );
@@ -2634,6 +2711,525 @@ mod tests {
                 .has_publication(&digest("rabs.action-key.sha256.v1", 7))
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn h011_expired_lease_refuses_publication_and_late_renewal_without_mutation() {
+        fn scenario(store: &mut dyn RabsMetadataStore) -> Vec<String> {
+            ready_store(store);
+            let prepared = offer();
+            let before = store.differential_snapshot().unwrap();
+            for now in [100, 101, u64::MAX] {
+                for durability in [
+                    CommitDurabilityProfile::RequireDurableClosure,
+                    CommitDurabilityProfile::AcceptVolatileLocations,
+                ] {
+                    assert_eq!(
+                        process_offer(
+                            store,
+                            &prepared,
+                            &expected_descriptor(),
+                            no_committed,
+                            900,
+                            1,
+                            durability,
+                            || now,
+                        ),
+                        Err(OfferRefusal::LeaseExpired)
+                    );
+                }
+                assert_eq!(
+                    store.validate_attempt_lease(&prepared.authority, now),
+                    Err(StoreError::LeaseExpired)
+                );
+            }
+
+            // Advancing the renewal sequence at the exact deadline must
+            // never revive the expired attempt or acquire publication rights.
+            assert_eq!(
+                store.renew_attempt_lease(
+                    &prepared.authority,
+                    LeaseRenewal {
+                        lease: prepared.authority.execution_lease_id,
+                        seq: LeaseRenewalSeq(2),
+                    },
+                    200,
+                    &|| 100,
+                ),
+                Err(StoreError::LeaseExpired)
+            );
+            assert!(!store.has_publication(&prepared.authority.action_key).unwrap());
+            assert!(
+                store
+                    .list_evidence_keys(&prepared.authority.action_key)
+                    .unwrap()
+                    .is_empty()
+            );
+            for tag in [40, 41, 50, 51, 60, 61, 62, 63] {
+                assert!(store.object_located(&object(tag).0).unwrap());
+            }
+            assert!(
+                store
+                    .object_located(&prepared.manifest.artifact_bundle_root.as_ref().unwrap().0)
+                    .unwrap()
+            );
+            let after = store.differential_snapshot().unwrap();
+            assert_eq!(after, before, "expiry must preserve uploaded candidates");
+            after
+        }
+
+        let mut reference =
+            SqlMetadataStore::open(RusqliteEngine::open(&fresh_path("expiry-ref")).unwrap()).unwrap();
+        let mut candidate =
+            SqlMetadataStore::open(FsqliteEngine::open(&fresh_path("expiry-fsq")).unwrap()).unwrap();
+        assert_eq!(scenario(&mut reference), scenario(&mut candidate));
+    }
+
+    #[test]
+    fn h011_lease_expiring_during_admission_cannot_commit() {
+        fn scenario(store: &mut dyn RabsMetadataStore) -> Vec<String> {
+            ready_store(store);
+            let prepared = offer();
+            let before = store.differential_snapshot().unwrap();
+            let readings = std::cell::Cell::new(0);
+            let clock = || {
+                let reading = readings.get();
+                readings.set(reading + 1);
+                if reading == 0 { 99 } else { 100 }
+            };
+            assert_eq!(
+                process_offer(
+                    store,
+                    &prepared,
+                    &expected_descriptor(),
+                    no_committed,
+                    900,
+                    1,
+                    CommitDurabilityProfile::RequireDurableClosure,
+                    clock,
+                ),
+                Err(OfferRefusal::LeaseExpired)
+            );
+            assert!(!store.has_publication(&prepared.authority.action_key).unwrap());
+            assert!(
+                store
+                    .list_evidence_keys(&prepared.authority.action_key)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(store.pin_row(900).unwrap().is_none());
+            assert!(store.object_located(&prepared.manifest_id.0).unwrap());
+            assert!(store.object_located(&prepared.evidence_id.0).unwrap());
+            let after = store.differential_snapshot().unwrap();
+            assert_eq!(after, before);
+            after
+        }
+
+        let mut reference =
+            SqlMetadataStore::open(RusqliteEngine::open(&fresh_path("late-expiry-ref")).unwrap())
+                .unwrap();
+        let mut candidate =
+            SqlMetadataStore::open(FsqliteEngine::open(&fresh_path("late-expiry-fsq")).unwrap())
+                .unwrap();
+        assert_eq!(scenario(&mut reference), scenario(&mut candidate));
+    }
+
+    #[test]
+    fn h011_publication_resamples_clock_and_rolls_back_transaction_time_expiry() {
+        use crate::metadata_store::{SqlEngine, SqlValue};
+        use std::cell::Cell;
+
+        // Advance the clock at a real backend boundary: opening the
+        // transaction, or writing the publication row. The latter must roll
+        // back the entire pointer/evidence/pin transaction on expiry.
+        struct ExpireDuringTransaction<'a, E> {
+            inner: E,
+            clock: &'a Cell<u64>,
+            armed: bool,
+            trigger: &'static str,
+        }
+
+        impl<E: SqlEngine> SqlEngine for ExpireDuringTransaction<'_, E> {
+            fn execute(&mut self, sql: &str, params: &[SqlValue]) -> Result<usize, StoreError> {
+                let affected = self.inner.execute(sql, params)?;
+                if self.armed && sql.starts_with(self.trigger) {
+                    self.clock.set(100);
+                    self.armed = false;
+                }
+                Ok(affected)
+            }
+
+            fn query(
+                &mut self,
+                sql: &str,
+                params: &[SqlValue],
+            ) -> Result<Vec<Vec<SqlValue>>, StoreError> {
+                self.inner.query(sql, params)
+            }
+        }
+
+        fn scenario(engine: impl SqlEngine, trigger: &'static str) -> Vec<String> {
+            let clock = Cell::new(99);
+            let engine = ExpireDuringTransaction {
+                inner: engine,
+                clock: &clock,
+                armed: false,
+                trigger,
+            };
+            let mut store = SqlMetadataStore::open(engine).unwrap();
+            ready_store(&mut store);
+            let prepared = offer();
+            let row = PublicationRow {
+                action_key: prepared.authority.action_key.clone(),
+                descriptor_digest: expected_descriptor(),
+                manifest_digest: prepared.manifest_id.0.clone(),
+                evidence_digest: prepared.evidence_id.0.clone(),
+                winner_generation: prepared.authority.action_generation.generation_id.0,
+                winner_attempt: prepared.authority.attempt_id.0,
+                result_kind: ResultKindTag::Success,
+                pin_id: 900,
+                pin_owner: "coordinator".to_owned(),
+                provisional_ancestors: Vec::new(),
+            };
+            let before = store.differential_snapshot().unwrap();
+            store
+                .validate_attempt_lease(&prepared.authority, clock.get())
+                .unwrap();
+            store.engine_mut().armed = true;
+            assert_eq!(
+                store.commit_publication(
+                    &authority_digest(&prepared.authority.coordinator),
+                    Some((&prepared.authority, &|| clock.get())),
+                    &row,
+                ),
+                Err(StoreError::LeaseExpired)
+            );
+            assert_eq!(clock.get(), 100);
+            assert!(!store.has_publication(&row.action_key).unwrap());
+            assert!(store.pin_row(row.pin_id).unwrap().is_none());
+            assert!(store.list_evidence_keys(&row.action_key).unwrap().is_empty());
+            let after = store.differential_snapshot().unwrap();
+            assert_eq!(after, before);
+            after
+        }
+
+        for trigger in ["BEGIN", "INSERT INTO action_publications"] {
+            assert_eq!(
+                scenario(
+                    RusqliteEngine::open(&fresh_path("txn-expiry-ref")).unwrap(),
+                    trigger,
+                ),
+                scenario(
+                    FsqliteEngine::open(&fresh_path("txn-expiry-fsq")).unwrap(),
+                    trigger,
+                ),
+            );
+        }
+    }
+
+    #[test]
+    fn h011_same_key_updates_expiring_inside_transactions_preserve_existing_state() {
+        use crate::metadata_store::{SqlEngine, SqlValue};
+        use std::cell::Cell;
+
+        #[derive(Clone, Copy)]
+        enum SameKeyUpdate {
+            AppendEvidence,
+            SemanticQuarantine,
+            ObservableAlreadyQuarantined,
+        }
+
+        struct ExpireDuringTransaction<'a, E> {
+            inner: E,
+            clock: &'a Cell<u64>,
+            armed: bool,
+            trigger: &'static str,
+        }
+
+        impl<E: SqlEngine> SqlEngine for ExpireDuringTransaction<'_, E> {
+            fn execute(&mut self, sql: &str, params: &[SqlValue]) -> Result<usize, StoreError> {
+                let affected = self.inner.execute(sql, params)?;
+                if self.armed && sql.starts_with(self.trigger) {
+                    self.clock.set(100);
+                    self.armed = false;
+                }
+                Ok(affected)
+            }
+
+            fn query(
+                &mut self,
+                sql: &str,
+                params: &[SqlValue],
+            ) -> Result<Vec<Vec<SqlValue>>, StoreError> {
+                self.inner.query(sql, params)
+            }
+        }
+
+        fn scenario(
+            engine: impl SqlEngine,
+            update: SameKeyUpdate,
+            trigger: &'static str,
+        ) -> Vec<String> {
+            let clock = Cell::new(99);
+            let engine = ExpireDuringTransaction {
+                inner: engine,
+                clock: &clock,
+                armed: false,
+                trigger,
+            };
+            let mut store = SqlMetadataStore::open(engine).unwrap();
+            ready_store(&mut store);
+            let winner = offer();
+            assert!(matches!(
+                process_offer(
+                    &mut store,
+                    &winner,
+                    &expected_descriptor(),
+                    no_committed,
+                    900,
+                    1,
+                    CommitDurabilityProfile::RequireDurableClosure,
+                    || clock.get(),
+                )
+                .unwrap(),
+                PublicationOutcome::Committed(_)
+            ));
+            let action = winner.authority.action_key.clone();
+            let action_key = digest_key(&action);
+            if matches!(update, SameKeyUpdate::ObservableAlreadyQuarantined) {
+                store
+                    .set_serving_disposition_key(&action_key, DISPOSITION_QUARANTINED)
+                    .unwrap();
+            }
+            let candidate = match update {
+                SameKeyUpdate::AppendEvidence => divergent_offer(
+                    &mut store,
+                    None,
+                    50,
+                    55,
+                    digest("rabs.observation-stream.sha256.v1", 9),
+                ),
+                SameKeyUpdate::SemanticQuarantine => divergent_offer(
+                    &mut store,
+                    Some(42),
+                    52,
+                    55,
+                    digest("rabs.observation-stream.sha256.v1", 9),
+                ),
+                SameKeyUpdate::ObservableAlreadyQuarantined => divergent_offer(
+                    &mut store,
+                    None,
+                    52,
+                    55,
+                    digest("rabs.observation-stream.sha256.v1", 10),
+                ),
+            };
+            let evidence_before = store.list_evidence_keys(&action).unwrap();
+            assert!(!evidence_before.contains(&digest_key(&candidate.evidence_id.0)));
+            let serving_before = store.serving_disposition_key(&action_key).unwrap();
+            let expected_disposition =
+                if matches!(update, SameKeyUpdate::ObservableAlreadyQuarantined) {
+                    DISPOSITION_QUARANTINED
+                } else {
+                    "servable"
+                };
+            assert_eq!(serving_before.as_deref(), Some(expected_disposition));
+            let before = store.differential_snapshot().unwrap();
+
+            // Candidate admission remains live at 99. The real backend then
+            // crosses the deadline while entering or writing the mutation
+            // transaction. Neither new trust evidence nor quarantine may land.
+            store.engine_mut().armed = true;
+            let committed = winner.manifest.clone();
+            assert_eq!(
+                process_offer(
+                    &mut store,
+                    &candidate,
+                    &expected_descriptor(),
+                    move |_| Some(committed.clone()),
+                    901,
+                    2,
+                    CommitDurabilityProfile::RequireDurableClosure,
+                    || clock.get(),
+                ),
+                Err(OfferRefusal::LeaseExpired)
+            );
+            assert_eq!(clock.get(), 100, "expiry boundary must be exercised");
+            assert_eq!(
+                store.published_manifest_key(&action).unwrap(),
+                Some(digest_key(&winner.manifest_id.0))
+            );
+            assert_eq!(
+                store.serving_disposition_key(&action_key).unwrap(),
+                serving_before
+            );
+            assert_eq!(store.list_evidence_keys(&action).unwrap(), evidence_before);
+            assert!(store.pin_row(901).unwrap().is_none());
+            assert!(
+                store
+                    .list_divergence_incidents(&action_key)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(store.object_located(&candidate.manifest_id.0).unwrap());
+            assert!(store.object_located(&candidate.evidence_id.0).unwrap());
+            for output in &candidate.manifest.logical_outputs {
+                assert!(store.object_located(&output.object.0).unwrap());
+            }
+            assert!(
+                store
+                    .object_located(&candidate.manifest.artifact_bundle_root.as_ref().unwrap().0)
+                    .unwrap()
+            );
+            let after = store.differential_snapshot().unwrap();
+            assert_eq!(after, before, "expired same-key offers must leave no writes");
+            after
+        }
+
+        for (update, trigger) in [
+            (SameKeyUpdate::AppendEvidence, "BEGIN"),
+            (
+                SameKeyUpdate::AppendEvidence,
+                "INSERT OR IGNORE INTO action_evidence_index",
+            ),
+            (SameKeyUpdate::SemanticQuarantine, "BEGIN"),
+            (
+                SameKeyUpdate::SemanticQuarantine,
+                "UPDATE action_serving_states",
+            ),
+            (SameKeyUpdate::ObservableAlreadyQuarantined, "BEGIN"),
+            (
+                SameKeyUpdate::ObservableAlreadyQuarantined,
+                "UPDATE action_serving_states",
+            ),
+        ] {
+            assert_eq!(
+                scenario(
+                    RusqliteEngine::open(&fresh_path("same-key-expiry-ref")).unwrap(),
+                    update,
+                    trigger,
+                ),
+                scenario(
+                    FsqliteEngine::open(&fresh_path("same-key-expiry-fsq")).unwrap(),
+                    update,
+                    trigger,
+                ),
+            );
+        }
+    }
+
+    #[test]
+    fn h011_live_lease_commits_just_before_its_monotonic_deadline() {
+        fn scenario(store: &mut dyn RabsMetadataStore) -> Vec<String> {
+            ready_store(store);
+            let prepared = offer();
+            let outcome = process_offer(
+                store,
+                &prepared,
+                &expected_descriptor(),
+                no_committed,
+                900,
+                10_000,
+                CommitDurabilityProfile::RequireDurableClosure,
+                || 99,
+            )
+            .unwrap();
+            let PublicationOutcome::Committed(receipt) = outcome else {
+                panic!("expected commit before the lease deadline, got {outcome:?}");
+            };
+            // Causal sequence numbers must not be used as clock readings.
+            assert_eq!(receipt.committed_causal_sequence, 10_000);
+            assert!(store.has_publication(&prepared.authority.action_key).unwrap());
+            store.differential_snapshot().unwrap()
+        }
+
+        let mut reference =
+            SqlMetadataStore::open(RusqliteEngine::open(&fresh_path("live-lease-ref")).unwrap())
+                .unwrap();
+        let mut candidate =
+            SqlMetadataStore::open(FsqliteEngine::open(&fresh_path("live-lease-fsq")).unwrap())
+                .unwrap();
+        assert_eq!(scenario(&mut reference), scenario(&mut candidate));
+    }
+
+    #[test]
+    fn h011_renewed_lease_survives_reopen_and_allows_publication_until_new_deadline() {
+        fn prepare(store: &mut dyn RabsMetadataStore) -> Vec<String> {
+            ready_store(store);
+            let authority = attempt_authority();
+            store
+                .renew_attempt_lease(
+                    &authority,
+                    LeaseRenewal {
+                        lease: authority.execution_lease_id,
+                        seq: LeaseRenewalSeq(2),
+                    },
+                    200,
+                    &|| 99,
+                )
+                .unwrap();
+            store.differential_snapshot().unwrap()
+        }
+
+        fn publish(store: &mut dyn RabsMetadataStore) -> Vec<String> {
+            let mut renewed = offer();
+            renewed.authority.lease_renewal_seq = LeaseRenewalSeq(2);
+            let state = store
+                .validate_attempt_lease(&renewed.authority, 150)
+                .unwrap();
+            assert_eq!(state.renewal_seq, 2);
+            assert_eq!(state.expires_at_own_monotonic_ms, 200);
+            assert!(matches!(
+                process_offer(
+                    store,
+                    &renewed,
+                    &expected_descriptor(),
+                    no_committed,
+                    900,
+                    1,
+                    CommitDurabilityProfile::RequireDurableClosure,
+                    || 150,
+                )
+                .unwrap(),
+                PublicationOutcome::Committed(_)
+            ));
+            assert!(store.has_publication(&renewed.authority.action_key).unwrap());
+            let committed = store.differential_snapshot().unwrap();
+            assert_eq!(
+                process_offer(
+                    store,
+                    &renewed,
+                    &expected_descriptor(),
+                    no_committed,
+                    901,
+                    2,
+                    CommitDurabilityProfile::RequireDurableClosure,
+                    || 200,
+                ),
+                Err(OfferRefusal::LeaseExpired)
+            );
+            assert_eq!(store.differential_snapshot().unwrap(), committed);
+            committed
+        }
+
+        let reference_path = fresh_path("renewed-lease-ref");
+        let candidate_path = fresh_path("renewed-lease-fsq");
+        let prepared = {
+            let mut reference =
+                SqlMetadataStore::open(RusqliteEngine::open(&reference_path).unwrap()).unwrap();
+            let mut candidate =
+                SqlMetadataStore::open(FsqliteEngine::open(&candidate_path).unwrap()).unwrap();
+            let prepared = prepare(&mut reference);
+            assert_eq!(prepared, prepare(&mut candidate));
+            prepared
+        };
+        let mut reference =
+            SqlMetadataStore::open(RusqliteEngine::open(&reference_path).unwrap()).unwrap();
+        let mut candidate =
+            SqlMetadataStore::open(FsqliteEngine::open(&candidate_path).unwrap()).unwrap();
+        assert_eq!(reference.differential_snapshot().unwrap(), prepared);
+        assert_eq!(candidate.differential_snapshot().unwrap(), prepared);
+        assert_eq!(publish(&mut reference), publish(&mut candidate));
     }
 
     #[test]
@@ -2651,6 +3247,7 @@ mod tests {
                 900,
                 1,
                 CommitDurabilityProfile::RequireDurableClosure,
+                || 10,
             ),
             Err(OfferRefusal::GenerationTombstoned)
         );
@@ -2672,6 +3269,7 @@ mod tests {
                 900,
                 1,
                 CommitDurabilityProfile::RequireDurableClosure,
+                || 10,
             ),
             Err(OfferRefusal::DescriptorMismatch)
         );
@@ -2691,6 +3289,7 @@ mod tests {
                 900,
                 1,
                 CommitDurabilityProfile::RequireDurableClosure,
+                || 10,
             ),
             Err(OfferRefusal::EpochMismatch)
         );
@@ -2707,6 +3306,7 @@ mod tests {
                 900,
                 1,
                 CommitDurabilityProfile::RequireDurableClosure,
+                || 10,
             ),
             Err(OfferRefusal::SemanticDigestMismatch)
         );
@@ -2723,6 +3323,7 @@ mod tests {
                 900,
                 1,
                 CommitDurabilityProfile::RequireDurableClosure,
+                || 10,
             ),
             Err(OfferRefusal::ObservableDigestMismatch)
         );
@@ -2758,6 +3359,7 @@ mod tests {
                 900,
                 1,
                 CommitDurabilityProfile::RequireDurableClosure,
+                || 10,
             ),
             Err(OfferRefusal::IncompleteObjectClosure {
                 missing: digest_key(&object(200).0)
@@ -2780,6 +3382,7 @@ mod tests {
                 900,
                 1,
                 CommitDurabilityProfile::RequireDurableClosure,
+                || 10,
             )
             .unwrap(),
             PublicationOutcome::Committed(_)
@@ -2796,6 +3399,7 @@ mod tests {
                 901,
                 2,
                 CommitDurabilityProfile::RequireDurableClosure,
+                || 10,
             )
             .unwrap(),
             PublicationOutcome::IdempotentEvidenceAppended
@@ -2836,6 +3440,7 @@ mod tests {
             902,
             3,
             CommitDurabilityProfile::RequireDurableClosure,
+            || 10,
         )
         .unwrap();
         let PublicationOutcome::Quarantined(quarantine) = outcome else {
@@ -2913,6 +3518,7 @@ mod tests {
                 900,
                 1,
                 CommitDurabilityProfile::RequireDurableClosure,
+                || 10,
             )
             .unwrap(),
             PublicationOutcome::Committed(_)
@@ -2955,6 +3561,7 @@ mod tests {
             902,
             3,
             CommitDurabilityProfile::RequireDurableClosure,
+            || 10,
         )
         .unwrap();
         let PublicationOutcome::Quarantined(quarantine) = outcome else {
@@ -3059,6 +3666,7 @@ mod tests {
                 900,
                 1,
                 CommitDurabilityProfile::RequireDurableClosure,
+                || 10,
             )
             .unwrap(),
             PublicationOutcome::Committed(_)
@@ -3089,6 +3697,7 @@ mod tests {
             903,
             4,
             CommitDurabilityProfile::RequireDurableClosure,
+            || 10,
         )
         .unwrap();
         let PublicationOutcome::Quarantined(quarantine) = outcome else {
@@ -3150,6 +3759,7 @@ mod tests {
             905,
             6,
             CommitDurabilityProfile::RequireDurableClosure,
+            || 10,
         )
         .unwrap();
         assert!(matches!(
@@ -3246,6 +3856,7 @@ mod tests {
             900,
             1,
             CommitDurabilityProfile::RequireDurableClosure,
+            || 10,
         )
         .unwrap();
         let PublicationOutcome::Committed(first_record) = first_outcome else {
@@ -3360,6 +3971,7 @@ mod tests {
                 904,
                 18,
                 CommitDurabilityProfile::RequireDurableClosure,
+                || 10,
             )
             .unwrap(),
             PublicationOutcome::IdempotentEvidenceAppended
@@ -3467,6 +4079,7 @@ mod tests {
                     900,
                     1,
                     CommitDurabilityProfile::RequireDurableClosure,
+                    || 10,
                 )
                 .unwrap(),
                 PublicationOutcome::Committed(_)
@@ -3490,6 +4103,7 @@ mod tests {
                 902,
                 3,
                 CommitDurabilityProfile::RequireDurableClosure,
+                || 10,
             )
             .unwrap();
             assert!(matches!(outcome, PublicationOutcome::Quarantined(_)));
@@ -3519,6 +4133,7 @@ mod tests {
                     900,
                     1,
                     CommitDurabilityProfile::RequireDurableClosure,
+                    || 10,
                 )
                 .unwrap(),
                 PublicationOutcome::Committed(_)
@@ -3532,6 +4147,7 @@ mod tests {
                     901,
                     2,
                     CommitDurabilityProfile::RequireDurableClosure,
+                    || 10,
                 )
                 .unwrap(),
                 PublicationOutcome::IdempotentEvidenceAppended
@@ -3545,6 +4161,7 @@ mod tests {
                     902,
                     3,
                     CommitDurabilityProfile::RequireDurableClosure,
+                    || 10,
                 ),
                 Err(OfferRefusal::DescriptorMismatch)
             );
@@ -3571,6 +4188,7 @@ mod tests {
                 900,
                 1,
                 CommitDurabilityProfile::RequireDurableClosure,
+                || 10,
             )
             .unwrap(),
             PublicationOutcome::Committed(_)
@@ -3689,6 +4307,7 @@ mod tests {
                     900,
                     1,
                     CommitDurabilityProfile::RequireDurableClosure,
+                    || 10,
                 )
                 .unwrap(),
                 PublicationOutcome::Committed(_)

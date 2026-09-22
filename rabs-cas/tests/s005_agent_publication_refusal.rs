@@ -294,7 +294,7 @@ fn s005_attempt_bound_to_a_foreign_coordinator_is_refused_wholesale() {
     let mut row = publication_row(&world.action);
     row.winner_attempt = 21;
     let err = st
-        .commit_publication(&foreign_active, Some(&world.winner), &row)
+        .commit_publication(&foreign_active, Some((&world.winner, &|| 10)), &row)
         .unwrap_err();
     assert_eq!(err, StoreError::AttemptAuthorityMismatch);
     assert_zero_residue(&mut st, &baseline, &world.action);
@@ -310,7 +310,7 @@ fn s005_released_lease_cannot_publish() {
     let err = st
         .commit_publication(
             &world.authority,
-            Some(&world.winner),
+            Some((&world.winner, &|| 10)),
             &publication_row(&world.action),
         )
         .unwrap_err();
@@ -343,7 +343,7 @@ fn s005_worker_incarnation_advance_invalidates_prior_attempts() {
     let err = st
         .commit_publication(
             &world.authority,
-            Some(&world.winner),
+            Some((&world.winner, &|| 10)),
             &publication_row(&world.action),
         )
         .unwrap_err();
@@ -403,7 +403,7 @@ fn s005_legacy_unbound_generation_rows_fail_closed() {
     row.winner_generation = 11;
     row.winner_attempt = 22;
     let err = st
-        .commit_publication(&authority, Some(&legacy_attempt), &row)
+        .commit_publication(&authority, Some((&legacy_attempt, &|| 10)), &row)
         .unwrap_err();
     assert_eq!(err, StoreError::LegacyUnboundAuthority);
     assert_zero_residue(&mut st, &baseline, &action);

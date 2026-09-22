@@ -590,6 +590,9 @@ pub enum StoreError {
     LeaseRenewalMismatch,
     /// Lease already released.
     LeaseReleased,
+    /// The coordinator's own monotonic deadline has elapsed. Expiry never
+    /// grants publication or permits a late renewal to revive the attempt.
+    LeaseExpired,
     /// Renewal sequence not strictly greater than the stored one.
     NonMonotonicRenewal,
     /// Referenced pin does not exist.
@@ -989,6 +992,10 @@ pub struct LeaseState {
     pub released: bool,
     /// Last accepted renewal sequence.
     pub renewal_seq: u64,
+    /// Deadline on the granting coordinator's own monotonic millisecond clock.
+    /// The schema's historical `expires_at_seq` column stores this value; it
+    /// is independent of receipt sequences and peer/wall-clock timestamps.
+    pub expires_at_own_monotonic_ms: u64,
 }
 
 /// One pin row as the lease layer sees it (H041).
@@ -1251,23 +1258,28 @@ pub trait RabsMetadataStore {
 
     /// Atomically record an attempt and acquire its execution lease after
     /// validating the full authority, generation, and exact active,
-    /// non-ambiguous worker tuple.
+    /// non-ambiguous worker tuple. The deadline is measured only on the
+    /// granting coordinator's own monotonic clock; `recorded_seq` is unrelated
+    /// causal history. The live coordinator derives the deadline from a TTL.
     fn admit_attempt_lease(
         &mut self,
         authority: &AttemptAuthority,
         recorded_seq: u64,
-        expires_at_seq: u64,
+        expires_at_own_monotonic_ms: u64,
     ) -> Result<(), StoreError>;
 
     /// Renew an execution lease after revalidating its normalized
     /// lease-to-attempt link and the attempt's exact current worker fence.
     /// The authority carries the last accepted sequence; `renewal` must
-    /// name the same lease and advance it strictly (a durable CAS).
+    /// name the same lease and advance it strictly (a durable CAS). The current
+    /// lease and its replacement deadline must both be live on the coordinator's
+    /// own monotonic clock; late renewal never resurrects expired authority.
     fn renew_attempt_lease(
         &mut self,
         authority: &AttemptAuthority,
         renewal: LeaseRenewal,
-        expires_at_seq: u64,
+        expires_at_own_monotonic_ms: u64,
+        own_monotonic_now_ms: &dyn Fn() -> u64,
     ) -> Result<(), StoreError>;
 
     /// Release a lease.
@@ -1276,13 +1288,15 @@ pub trait RabsMetadataStore {
     /// Coordinator-only atomic publication commit (row + serving state +
     /// winner evidence row + reachability pin in ONE transaction;
     /// conflicts quarantine). Live offer admission supplies
-    /// `attempt_authority` so the exact lease and worker fence are
-    /// revalidated inside this same transaction. `None` is the narrow
+    /// `attempt_authority` and a coordinator-owned monotonic clock callback
+    /// so the exact lease deadline and worker fence are revalidated inside
+    /// this same transaction. The clock is sampled again before commit;
+    /// elapsed validation time cannot extend a lease. `None` is the narrow
     /// metadata repair/fixture seam and grants no worker-originated right.
     fn commit_publication(
         &mut self,
         authority: &TypedDigest,
-        attempt_authority: Option<&AttemptAuthority>,
+        attempt_authority: Option<(&AttemptAuthority, &dyn Fn() -> u64)>,
         row: &PublicationRow,
     ) -> Result<CommitOutcome, StoreError>;
 
@@ -1298,6 +1312,17 @@ pub trait RabsMetadataStore {
         evidence: &TypedDigest,
         generation: u128,
         attempt: u128,
+    ) -> Result<(), StoreError>;
+
+    /// Append candidate evidence only while its exact lease is live. Action,
+    /// generation, and attempt attribution come from the validated authority;
+    /// checks before and after the write share its transaction.
+    fn append_evidence_for_attempt(
+        &mut self,
+        authority: &AttemptAuthority,
+        manifest_key: &str,
+        evidence: &TypedDigest,
+        own_monotonic_now_ms: &dyn Fn() -> u64,
     ) -> Result<(), StoreError>;
 
     /// Whether a publication row exists for an action key.
@@ -1323,15 +1348,17 @@ pub trait RabsMetadataStore {
     /// Whether an attempt exists under the given generation.
     fn attempt_exists(&mut self, id: u128, generation: u128) -> Result<bool, StoreError>;
 
-    /// Lease state (released flag + last renewal), if the lease exists.
+    /// Lease state (released flag, renewal sequence, own-clock deadline).
     fn lease_state(&mut self, id: u128) -> Result<Option<LeaseState>, StoreError>;
 
     /// Revalidate one authority-bearing attempt/lease against the durable
     /// normalized binding and the worker's current non-ambiguous fence.
-    /// The returned state belongs to this exact attempt and lease.
+    /// The returned state belongs to this exact attempt and lease and must be
+    /// strictly before its deadline on the granting coordinator's clock.
     fn validate_attempt_lease(
         &mut self,
         authority: &AttemptAuthority,
+        own_monotonic_now_ms: u64,
     ) -> Result<LeaseState, StoreError>;
 
     /// Whether an object has at least one recorded location.
@@ -1603,6 +1630,17 @@ pub trait RabsMetadataStore {
         &mut self,
         action_key: &str,
         disposition: &str,
+    ) -> Result<(), StoreError>;
+
+    /// Accept a candidate's serving-state change under its exact live lease.
+    /// The action comes from the authority, and expiry during the transaction
+    /// rolls back the disposition write. Successful commit is the divergence
+    /// acceptance point; diagnostic recording may follow that accepted decision.
+    fn set_serving_disposition_for_attempt(
+        &mut self,
+        authority: &AttemptAuthority,
+        disposition: &str,
+        own_monotonic_now_ms: &dyn Fn() -> u64,
     ) -> Result<(), StoreError>;
 
     // --- H038: fences, peer high-water, handoffs (authoritative
@@ -2542,13 +2580,86 @@ impl<E: SqlEngine> SqlMetadataStore<E> {
         Ok(())
     }
 
+    fn require_live_attempt(
+        engine: &mut E,
+        authority: &AttemptAuthority,
+        own_monotonic_now_ms: &dyn Fn() -> u64,
+    ) -> Result<(), StoreError> {
+        let state = Self::bound_lease_state(engine, authority)?;
+        if state.released {
+            return Err(StoreError::LeaseReleased);
+        }
+        if own_monotonic_now_ms() >= state.expires_at_own_monotonic_ms {
+            return Err(StoreError::LeaseExpired);
+        }
+        if state.renewal_seq != authority.lease_renewal_seq.0 {
+            return Err(StoreError::LeaseRenewalMismatch);
+        }
+        Ok(())
+    }
+
+    fn append_evidence_row(
+        engine: &mut E,
+        action: &TypedDigest,
+        manifest_key: &str,
+        evidence: &TypedDigest,
+        generation: u128,
+        attempt: u128,
+    ) -> Result<(), StoreError> {
+        let [algo, domain, bytes] = Self::digest_params(evidence);
+        // Append-only, first-writer-wins: re-append never rewrites the
+        // original manifest, generation, or attempt attribution (H029; I37).
+        engine.execute(
+            "INSERT OR IGNORE INTO action_evidence_index \
+             (action_key, evidence_algo, evidence_domain, evidence_bytes, \
+              generation_hex, attempt_hex, manifest_key) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            &[
+                SqlValue::Text(digest_key(action)),
+                algo,
+                domain,
+                bytes,
+                SqlValue::Text(u128_hex(generation)),
+                SqlValue::Text(u128_hex(attempt)),
+                SqlValue::Text(manifest_key.to_owned()),
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn set_serving_disposition_row(
+        engine: &mut E,
+        action_key: &str,
+        disposition: &str,
+    ) -> Result<(), StoreError> {
+        // UPDATE first preserves the H040 revision and validity columns.
+        let changed = engine.execute(
+            "UPDATE action_serving_states SET disposition = ?2 WHERE action_key = ?1",
+            &[
+                SqlValue::Text(action_key.to_owned()),
+                SqlValue::Text(disposition.to_owned()),
+            ],
+        )?;
+        if changed == 0 {
+            engine.execute(
+                "INSERT INTO action_serving_states (action_key, disposition, version) \
+                 VALUES (?1, ?2, 1)",
+                &[
+                    SqlValue::Text(action_key.to_owned()),
+                    SqlValue::Text(disposition.to_owned()),
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
     fn bound_lease_state(
         engine: &mut E,
         authority: &AttemptAuthority,
     ) -> Result<LeaseState, StoreError> {
         Self::require_attempt_context(engine, authority)?;
         let rows = engine.query(
-            "SELECT l.attempt_hex, l.released, l.renewal_seq, \
+            "SELECT l.attempt_hex, l.released, l.renewal_seq, l.expires_at_seq, \
                     a.generation_hex, a.worker, a.worker_boot_generation, \
                     a.worker_incarnation, a.execution_lease_hex \
              FROM execution_leases l \
@@ -2568,6 +2679,7 @@ impl<E: SqlEngine> SqlMetadataStore<E> {
             attempt_hex,
             released,
             renewal_seq,
+            expires_at_seq,
             generation_hex,
             worker,
             boot,
@@ -2609,6 +2721,7 @@ impl<E: SqlEngine> SqlMetadataStore<E> {
         Ok(LeaseState {
             released: expect_u64(released, "released")? != 0,
             renewal_seq: expect_u64(renewal_seq, "renewal_seq")?,
+            expires_at_own_monotonic_ms: expect_u64(expires_at_seq, "expires_at_seq")?,
         })
     }
 
@@ -3290,14 +3403,14 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
         &mut self,
         authority: &AttemptAuthority,
         recorded_seq: u64,
-        expires_at_seq: u64,
+        expires_at_own_monotonic_ms: u64,
     ) -> Result<(), StoreError> {
         let authority = authority.clone();
         let recorded = i64::try_from(recorded_seq)
             .map_err(|_| StoreError::Corruption("recorded_seq out of range".into()))?;
         let renewal = i64::try_from(authority.lease_renewal_seq.0)
             .map_err(|_| StoreError::Corruption("renewal_seq out of range".into()))?;
-        let expires = i64::try_from(expires_at_seq)
+        let expires = i64::try_from(expires_at_own_monotonic_ms)
             .map_err(|_| StoreError::Corruption("expires_at_seq out of range".into()))?;
         self.in_txn(move |engine| {
             SqlMetadataStore::<E>::require_attempt_context(engine, &authority)?;
@@ -3363,15 +3476,20 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
         &mut self,
         authority: &AttemptAuthority,
         renewal: LeaseRenewal,
-        expires_at_seq: u64,
+        expires_at_own_monotonic_ms: u64,
+        own_monotonic_now_ms: &dyn Fn() -> u64,
     ) -> Result<(), StoreError> {
         let authority = authority.clone();
-        let expires = i64::try_from(expires_at_seq)
+        let expires = i64::try_from(expires_at_own_monotonic_ms)
             .map_err(|_| StoreError::Corruption("expires_at_seq out of range".into()))?;
         self.in_txn(move |engine| {
             let state = SqlMetadataStore::<E>::bound_lease_state(engine, &authority)?;
             if state.released {
                 return Err(StoreError::LeaseReleased);
+            }
+            let now = own_monotonic_now_ms();
+            if now >= state.expires_at_own_monotonic_ms || expires_at_own_monotonic_ms <= now {
+                return Err(StoreError::LeaseExpired);
             }
             if renewal.lease != authority.execution_lease_id {
                 return Err(StoreError::LeaseAttemptMismatch);
@@ -3393,6 +3511,12 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
                     SqlValue::Text(u128_hex(authority.execution_lease_id.0)),
                 ],
             )?;
+            // A delayed transaction cannot use an earlier clock sample to
+            // re-arm authority after either the old or new deadline elapsed.
+            let now = own_monotonic_now_ms();
+            if now >= state.expires_at_own_monotonic_ms || now >= expires_at_own_monotonic_ms {
+                return Err(StoreError::LeaseExpired);
+            }
             Ok(())
         })
     }
@@ -3413,7 +3537,7 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
     fn commit_publication(
         &mut self,
         authority: &TypedDigest,
-        attempt_authority: Option<&AttemptAuthority>,
+        attempt_authority: Option<(&AttemptAuthority, &dyn Fn() -> u64)>,
         row: &PublicationRow,
     ) -> Result<CommitOutcome, StoreError> {
         self.intern(row.action_key.domain);
@@ -3421,11 +3545,11 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
         self.intern(row.manifest_digest.domain);
         self.intern(row.evidence_digest.domain);
         let authority = authority.clone();
-        let attempt_authority = attempt_authority.cloned();
+        let attempt_authority = attempt_authority.map(|(attempt, now)| (attempt.clone(), now));
         let row = row.clone();
         self.in_txn(move |engine| {
-            match &attempt_authority {
-                Some(attempt) => {
+            let lease_clock_and_deadline = match &attempt_authority {
+                Some((attempt, own_monotonic_now_ms)) => {
                     if SqlMetadataStore::<E>::attempt_authority_digest(attempt) != authority
                         || row.action_key != attempt.action_key
                         || row.winner_generation != attempt.action_generation.generation_id.0
@@ -3437,18 +3561,34 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
                     if state.released {
                         return Err(StoreError::LeaseReleased);
                     }
+                    if own_monotonic_now_ms() >= state.expires_at_own_monotonic_ms {
+                        return Err(StoreError::LeaseExpired);
+                    }
                     if state.renewal_seq != attempt.lease_renewal_seq.0 {
                         return Err(StoreError::LeaseRenewalMismatch);
                     }
+                    Some((own_monotonic_now_ms, state.expires_at_own_monotonic_ms))
                 }
-                None => SqlMetadataStore::<E>::require_active(engine, &authority)?,
-            }
+                None => {
+                    SqlMetadataStore::<E>::require_active(engine, &authority)?;
+                    None
+                }
+            };
+            let require_live_lease = || {
+                if let Some((clock, deadline)) = lease_clock_and_deadline
+                    && clock() >= deadline
+                {
+                    return Err(StoreError::LeaseExpired);
+                }
+                Ok(())
+            };
             let action = digest_key(&row.action_key);
             let existing = engine.query(
                 "SELECT descriptor_domain, descriptor_bytes FROM action_publications \
                  WHERE action_key = ?1",
                 &[SqlValue::Text(action.clone())],
             )?;
+            require_live_lease()?;
             if let Some(existing_row) = existing.first() {
                 let [domain, bytes] = existing_row.as_slice() else {
                     return Err(StoreError::Corruption("publication row shape".into()));
@@ -3468,6 +3608,7 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
                      VALUES ('action-entry', ?1, 'publication descriptor conflict')",
                     &[SqlValue::Text(action)],
                 )?;
+                require_live_lease()?;
                 return Ok(CommitOutcome::ConflictQuarantined);
             }
             let [d_algo, d_domain, d_bytes] =
@@ -3560,6 +3701,9 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
                     ],
                 )?;
             }
+            // Roll back the complete pointer/evidence/pin transaction if its
+            // writes outlived the lease. A stale admission sample is no grant.
+            require_live_lease()?;
             Ok(CommitOutcome::Committed)
         })
     }
@@ -3573,31 +3717,30 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
         attempt: u128,
     ) -> Result<(), StoreError> {
         self.intern(evidence.domain);
-        let action = digest_key(action);
-        let manifest_key = manifest_key.to_owned();
-        let [algo, domain, bytes] = SqlMetadataStore::<E>::digest_params(evidence);
-        self.in_txn(move |engine| {
-            // OR IGNORE, not OR REPLACE: append-only, first-writer-wins.
-            // A re-append of the same evidence digest under a different
-            // (manifest, generation, attempt) is an idempotent no-op —
-            // the original attribution is history and never rewritten
-            // (H029; I37).
-            engine.execute(
-                "INSERT OR IGNORE INTO action_evidence_index \
-                 (action_key, evidence_algo, evidence_domain, evidence_bytes, \
-                  generation_hex, attempt_hex, manifest_key) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                &[
-                    SqlValue::Text(action),
-                    algo,
-                    domain,
-                    bytes,
-                    SqlValue::Text(u128_hex(generation)),
-                    SqlValue::Text(u128_hex(attempt)),
-                    SqlValue::Text(manifest_key),
-                ],
+        self.in_txn(|engine| {
+            Self::append_evidence_row(engine, action, manifest_key, evidence, generation, attempt)
+        })
+    }
+
+    fn append_evidence_for_attempt(
+        &mut self,
+        authority: &AttemptAuthority,
+        manifest_key: &str,
+        evidence: &TypedDigest,
+        own_monotonic_now_ms: &dyn Fn() -> u64,
+    ) -> Result<(), StoreError> {
+        self.intern(evidence.domain);
+        self.in_txn(|engine| {
+            Self::require_live_attempt(engine, authority, own_monotonic_now_ms)?;
+            Self::append_evidence_row(
+                engine,
+                &authority.action_key,
+                manifest_key,
+                evidence,
+                authority.action_generation.generation_id.0,
+                authority.attempt_id.0,
             )?;
-            Ok(())
+            Self::require_live_attempt(engine, authority, own_monotonic_now_ms)
         })
     }
 
@@ -3659,28 +3802,33 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
 
     fn lease_state(&mut self, id: u128) -> Result<Option<LeaseState>, StoreError> {
         let rows = self.engine.query(
-            "SELECT released, renewal_seq FROM execution_leases WHERE id_hex = ?1",
+            "SELECT released, renewal_seq, expires_at_seq FROM execution_leases WHERE id_hex = ?1",
             &[SqlValue::Text(u128_hex(id))],
         )?;
         let Some(row) = rows.first() else {
             return Ok(None);
         };
-        let [released, renewal_seq] = row.as_slice() else {
+        let [released, renewal_seq, expires_at_seq] = row.as_slice() else {
             return Err(StoreError::Corruption("lease state shape".into()));
         };
         Ok(Some(LeaseState {
             released: expect_u64(released, "released")? != 0,
             renewal_seq: expect_u64(renewal_seq, "renewal_seq")?,
+            expires_at_own_monotonic_ms: expect_u64(expires_at_seq, "expires_at_seq")?,
         }))
     }
 
     fn validate_attempt_lease(
         &mut self,
         authority: &AttemptAuthority,
+        own_monotonic_now_ms: u64,
     ) -> Result<LeaseState, StoreError> {
         let state = SqlMetadataStore::<E>::bound_lease_state(&mut self.engine, authority)?;
         if state.released {
             return Err(StoreError::LeaseReleased);
+        }
+        if own_monotonic_now_ms >= state.expires_at_own_monotonic_ms {
+            return Err(StoreError::LeaseExpired);
         }
         if state.renewal_seq != authority.lease_renewal_seq.0 {
             return Err(StoreError::LeaseRenewalMismatch);
@@ -4567,26 +4715,23 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
         action_key: &str,
         disposition: &str,
     ) -> Result<(), StoreError> {
-        let action_key = action_key.to_owned();
-        let disposition = disposition.to_owned();
-        self.in_txn(move |engine| {
-            // UPDATE first: a disposition-only write must never reset
-            // the H040 revision/validity columns to their defaults.
-            let changed = engine.execute(
-                "UPDATE action_serving_states SET disposition = ?2 WHERE action_key = ?1",
-                &[
-                    SqlValue::Text(action_key.clone()),
-                    SqlValue::Text(disposition.clone()),
-                ],
+        self.in_txn(|engine| Self::set_serving_disposition_row(engine, action_key, disposition))
+    }
+
+    fn set_serving_disposition_for_attempt(
+        &mut self,
+        authority: &AttemptAuthority,
+        disposition: &str,
+        own_monotonic_now_ms: &dyn Fn() -> u64,
+    ) -> Result<(), StoreError> {
+        self.in_txn(|engine| {
+            Self::require_live_attempt(engine, authority, own_monotonic_now_ms)?;
+            Self::set_serving_disposition_row(
+                engine,
+                &digest_key(&authority.action_key),
+                disposition,
             )?;
-            if changed == 0 {
-                engine.execute(
-                    "INSERT INTO action_serving_states (action_key, disposition, version) \
-                     VALUES (?1, ?2, 1)",
-                    &[SqlValue::Text(action_key), SqlValue::Text(disposition)],
-                )?;
-            }
-            Ok(())
+            Self::require_live_attempt(engine, authority, own_monotonic_now_ms)
         })
     }
     fn apply_operator_reset_to_peer(
@@ -7749,10 +7894,10 @@ mod tests {
             seq: LeaseRenewalSeq(2),
         };
         store
-            .renew_attempt_lease(&attempt_authority, renewal, 200)
+            .renew_attempt_lease(&attempt_authority, renewal, 200, &|| 10)
             .unwrap();
         assert_eq!(
-            store.renew_attempt_lease(&attempt_authority, renewal, 300),
+            store.renew_attempt_lease(&attempt_authority, renewal, 300, &|| 10),
             Err(StoreError::LeaseRenewalMismatch)
         );
         let mut current_authority = attempt_authority.clone();
@@ -7765,6 +7910,7 @@ mod tests {
                     seq: LeaseRenewalSeq(2),
                 },
                 300,
+                &|| 10,
             ),
             Err(StoreError::NonMonotonicRenewal)
         );
@@ -7778,6 +7924,7 @@ mod tests {
                     seq: LeaseRenewalSeq(3),
                 },
                 300,
+                &|| 10,
             ),
             Err(StoreError::UnknownLease)
         );
@@ -7790,6 +7937,7 @@ mod tests {
                     seq: LeaseRenewalSeq(3),
                 },
                 300,
+                &|| 10,
             ),
             Err(StoreError::LeaseReleased)
         );
@@ -8841,7 +8989,7 @@ mod tests {
         );
         let legacy = bound_attempt_authority();
         assert_eq!(
-            store.validate_attempt_lease(&legacy),
+            store.validate_attempt_lease(&legacy, 10),
             Err(StoreError::LegacyUnboundAuthority)
         );
         assert_eq!(
@@ -8852,6 +9000,7 @@ mod tests {
                     seq: LeaseRenewalSeq(2),
                 },
                 200,
+                &|| 10,
             ),
             Err(StoreError::LegacyUnboundAuthority)
         );
@@ -8859,7 +9008,11 @@ mod tests {
         legacy_row.winner_generation = 11;
         legacy_row.winner_attempt = 22;
         assert_eq!(
-            store.commit_publication(&bound_authority_row().digest, Some(&legacy), &legacy_row),
+            store.commit_publication(
+                &bound_authority_row().digest,
+                Some((&legacy, &|| 10)),
+                &legacy_row,
+            ),
             Err(StoreError::LegacyUnboundAuthority)
         );
         assert!(!store.has_publication(&legacy.action_key).unwrap());
@@ -8892,10 +9045,11 @@ mod tests {
             .unwrap();
         store.admit_attempt_lease(&replacement, 201, 300).unwrap();
         assert_eq!(
-            store.validate_attempt_lease(&replacement),
+            store.validate_attempt_lease(&replacement, 10),
             Ok(LeaseState {
                 released: false,
                 renewal_seq: 1,
+                expires_at_own_monotonic_ms: 300,
             })
         );
     }
