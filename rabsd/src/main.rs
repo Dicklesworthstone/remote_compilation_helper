@@ -9,6 +9,7 @@
 //! - `--version` / `--help`
 //! - `--check-config` — parse + validate config, print resolved values
 //! - `--run-for-ms N` — auto-shutdown after N ms (acceptance harness)
+//! - `--worker-prepare` — capture an explicit source projection into a saved bundle
 //! - `--worker-exec-loopback` — receive one explicit worker execution and its files
 //! - `--worker-exec-tls` — receive one pinned worker execution over mutual TLS/ATP
 //! - default: run until SIGTERM/SIGINT (asupersync signal listener)
@@ -187,6 +188,71 @@ fn probe_daemon(socket_path: &str) -> bool {
     ok && reader.read_line(&mut line).is_ok() && line.contains("coord-status")
 }
 
+const WORKER_PREPARE_USAGE: &str = "usage: rabsd --worker-prepare <absolute-source-root> <spec.json> <new-absolute-bundle-directory>";
+
+/// A specification is local operator input, never a network frame or an
+/// executable request. Bound it before capture and let the shared preparation
+/// path validate its fields and construct the sole source-manifest identity.
+fn prepare_from_arguments(args: &[String]) -> std::io::Result<serde_json::Value> {
+    use rabsd::coord::source_delivery::prepare_source_bundle;
+    use rabsd::coord::worker_delivery::MAX_FRAME_BYTES;
+    use std::io::{self, Read};
+    use std::path::Path;
+
+    let [source, specification, destination] = args else {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, WORKER_PREPARE_USAGE));
+    };
+    if !Path::new(source).is_absolute()
+        || !Path::new(destination).is_absolute()
+        || specification.is_empty()
+        || specification.starts_with("--")
+    {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, WORKER_PREPARE_USAGE));
+    }
+    let metadata = std::fs::symlink_metadata(specification)?;
+    if !metadata.is_file() || metadata.len() > MAX_FRAME_BYTES as u64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "preparation specification must be a bounded ordinary file, not a link or special file",
+        ));
+    }
+    let file = std::fs::File::open(specification)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "specification changed type"));
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_FRAME_BYTES as u64 + 1).read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_FRAME_BYTES {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "specification exceeds request bound"));
+    }
+    let specification = serde_json::from_slice(&bytes)?;
+    prepare_source_bundle(Path::new(source), &specification, Path::new(destination))
+}
+
+/// Preparation has no execution side effects, even on error. Return a single
+/// machine-readable summary on stdout and keep failures on stderr. A failed
+/// output write must not report CLI success after the bundle was saved.
+fn run_prepare(args: &[String]) -> i32 {
+    use std::io::Write;
+
+    let result = prepare_from_arguments(args).and_then(|report| {
+        let mut output = std::io::stdout().lock();
+        writeln!(output, "{report}")?;
+        output.flush()
+    });
+    match result {
+        Ok(()) => 0,
+        Err(error) => {
+            eprintln!("{}", serde_json::json!({
+                "kind":"worker-prepare-failed", "directory":args.get(2),
+                "detail":error.to_string(), "executed":false,
+                "remediation":"Inspect any existing bundle; preparation never overwrites it. Use a new destination after correcting the specification."
+            }));
+            if error.kind() == std::io::ErrorKind::InvalidInput { 2 } else { 1 }
+        }
+    }
+}
+
 fn main() {
     let boot_started_at = Instant::now();
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -200,6 +266,11 @@ fn main() {
                 "rabsd {VERSION} — RABS edge+coordinator daemon\n\
                  \n\
                  USAGE: rabsd [--version|--help|--check-config|--run-for-ms N]\n\
+                 PREPARE: rabsd --worker-prepare <absolute-source-root> <spec.json> <new-absolute-bundle-directory>\n\
+                 spec.json uses canonical-exec fields plus an explicit source_files array,\n\
+                 instead of source_manifest or workspace_backing. No compiler or network runs.\n\
+                 Preparation saves request.json and source/; only selected regular files are copied.\n\
+                 Execute with --source-root <bundle>/source and <bundle>/request.json, not the old checkout.\n\
                  OPERATOR: rabsd --worker-exec-loopback <127.0.0.1:port> <worker> <request.json> <new-absolute-directory>\n\
                  SECURE: rabsd --worker-exec-tls <IP:port> <worker> <worker-spki-sha256> <request.json> <new-absolute-directory>\n\
                  TLS requires RABS_COORD_TLS_CA, RABS_COORD_TLS_CERT and RABS_COORD_TLS_KEY.\n\
@@ -211,6 +282,9 @@ fn main() {
                  env: RABS_SOCKET_PATH, RABS_LOG_LEVEL."
             );
             return;
+        }
+        Some("--worker-prepare") => {
+            std::process::exit(run_prepare(&args[1..]));
         }
         Some("--worker-exec-loopback") => {
             std::process::exit(worker_exec::run(&args[1..]));
