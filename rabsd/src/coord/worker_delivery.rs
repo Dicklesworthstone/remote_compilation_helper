@@ -8,6 +8,9 @@
 //! and filesystem sync. ACK loss after that frontier must never trigger execution
 //! again. Failed directories are retained for inspection, never reused or deleted.
 
+use rabs_sandbox::process_context::{
+    COMMAND_CONTEXT_VERSION, CommandContext, MAX_COMMAND_ENV_ENTRIES,
+};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
@@ -217,6 +220,42 @@ fn declaration(request: &Value) -> io::Result<Option<Declaration>> {
     }))
 }
 
+/// Decode only the JSON transport shape here. The same sandbox type used by
+/// the worker owns cwd, environment, reserved-name and byte-limit policy.
+/// Keep the original request untouched: sorting or dropping empty values here
+/// would change the durable execution/recovery fingerprint.
+fn command_context(request: &Value) -> io::Result<Option<CommandContext>> {
+    let Some(value) = request.get("command_context") else {
+        return Ok(None);
+    };
+    let object = value
+        .as_object()
+        .filter(|object| object.len() == 3)
+        .ok_or_else(|| invalid("command_context requires exactly version, cwd and env"))?;
+    require(
+        object.get("version").and_then(Value::as_str) == Some(COMMAND_CONTEXT_VERSION),
+        "unsupported command_context version",
+    )?;
+    let cwd = text(value, "cwd")?;
+    let env = object
+        .get("env")
+        .and_then(Value::as_object)
+        .filter(|env| env.len() <= MAX_COMMAND_ENV_ENTRIES)
+        .ok_or_else(|| invalid("command_context env must be a bounded string map"))?;
+    let entries = env
+        .iter()
+        .map(|(name, value)| {
+            value
+                .as_str()
+                .map(|value| (name.clone(), value.to_owned()))
+                .ok_or_else(|| invalid("command_context env values must be strings"))
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    CommandContext::new(cwd, entries)
+        .map(Some)
+        .map_err(|error| invalid(&error.to_string()))
+}
+
 /// Validate before listening, reserving disk, or sending execution. Unknown
 /// top-level extensions remain in the exact request sent and fingerprinted.
 pub fn validate_request(request: &Value) -> io::Result<()> {
@@ -257,6 +296,7 @@ pub fn validate_request(request: &Value) -> io::Result<()> {
     if request.get("timeout_ms").is_some() {
         require(number(request, "timeout_ms")? > 0, "zero execution budget")?;
     }
+    command_context(request)?;
     declaration(request)?;
     require(
         serde_json::to_vec(request)?.len() <= MAX_FRAME_BYTES,
@@ -554,6 +594,17 @@ pub fn receive_operation(
                 && supports("output_transfers", "ranges-v1"),
             "worker lacks required delivery/recovery capabilities",
         )?;
+        // A context changes execution semantics. Older workers accept unknown
+        // request fields, so silently forwarding it could run a different build.
+        // Refuse before disk creation, authentication grants or source upload.
+        // Resume only retrieves a sealed exact-request result; it must not require
+        // the restarted worker to retain the capability to execute that request.
+        if mode == DeliveryMode::Execute && request.get("command_context").is_some() {
+            require(
+                supports("command_contexts", COMMAND_CONTEXT_VERSION),
+                "worker lacks required env-cwd-v1 command context capability",
+            )?;
+        }
         let incarnation = text(&hello, "incarnation")?;
         require(
             is_hex(incarnation, 32) && incarnation.bytes().any(|b| b != b'0'),
@@ -1444,5 +1495,190 @@ mod tests {
             &request, "worker", &destination,
             super::super::delivery_recovery::DeliveryTrust::Loopback,
         ).unwrap().unwrap();
+    }
+
+    fn explicit_context() -> Value {
+        json!({"version":COMMAND_CONTEXT_VERSION,"cwd":"/__rabs/workspace/packages/雪",
+            "env":{"BUILD_LABEL":"spaces, \"quotes\", $HOME and\n雪","EMPTY":""}})
+    }
+
+    #[test]
+    fn command_context_delivery_preserves_exact_request_and_transport_admission() {
+        let parent = tempfile::tempdir().unwrap();
+        let destination = parent.path().join("context");
+        let mut request = request();
+        request["command_context"] = explicit_context();
+        let original = serde_json::to_vec(&request).unwrap();
+        let mut peer = AdmissionPeer {
+            inner: fixture(&destination),
+            reject: false,
+            admitted: false,
+        };
+        peer.inner.replies[0]["command_contexts"] = json!([COMMAND_CONTEXT_VERSION]);
+        let delivery = receive_execution(&mut peer, &request, "worker", &destination).unwrap();
+        assert!(delivery.acknowledgments_confirmed);
+        assert!(peer.admitted);
+        assert_eq!(serde_json::to_vec(&peer.inner.sent[1]).unwrap(), original);
+        assert_eq!(serde_json::to_vec(&request).unwrap(), original);
+        assert_eq!(delivery.receipt["request_sha256"], hash(&original));
+        assert_eq!(delivery.receipt["transport_authenticated"], true);
+        assert_eq!(delivery.receipt["publication_authorized"], false);
+        assert!(!serde_json::to_string(&delivery.receipt).unwrap().contains("BUILD_LABEL"));
+    }
+
+    #[test]
+    fn malformed_command_context_never_contacts_a_peer_or_creates_storage() {
+        for case in 0..14 {
+            let parent = tempfile::tempdir().unwrap();
+            let destination = parent.path().join("refused");
+            let mut request = request();
+            request["command_context"] = explicit_context();
+            match case {
+                0 => request["command_context"] = Value::Null,
+                1 => request["command_context"] = json!([]),
+                2 => request["command_context"]["version"] = json!("env-cwd-v2"),
+                3 => request["command_context"]["cwd"] = json!("/etc"),
+                4 => request["command_context"]["cwd"] = json!("/__rabs/workspace/../home"),
+                5 => request["command_context"]["cwd"] = json!("/__rabs/workspace//member"),
+                6 => request["command_context"]["cwd"] = json!(false),
+                7 => request["command_context"]["env"] = Value::Null,
+                8 => request["command_context"]["env"]["SECRET"] = json!({"secret-marker":1}),
+                9 => request["command_context"]["env"]["HOME"] = json!("secret-marker"),
+                10 => request["command_context"]["env"]["BAD=NAME"] = json!("secret-marker"),
+                11 => request["command_context"]["env"]["SECRET"] = json!("secret-marker\0"),
+                12 => request["command_context"]["extra"] = json!(true),
+                _ => {
+                    request["command_context"].as_object_mut().unwrap().remove("env");
+                }
+            }
+            let mut peer = fixture(&destination);
+            let failure = receive_execution(&mut peer, &request, "worker", &destination).unwrap_err();
+            assert!(!failure.execution_may_have_run, "case {case}");
+            assert!(!failure.detail.contains("secret-marker"), "case {case}");
+            assert!(peer.sent.is_empty());
+            assert_eq!(peer.replies.len(), 7);
+            assert!(!destination.exists());
+        }
+    }
+
+    #[test]
+    fn coordinator_enforces_shared_command_environment_limits() {
+        use rabs_sandbox::process_context::{
+            MAX_COMMAND_ENV_BYTES, MAX_COMMAND_ENV_VALUE_BYTES,
+        };
+
+        let mut request = request();
+        request["command_context"] = explicit_context();
+        let env: serde_json::Map<String, Value> = (0..MAX_COMMAND_ENV_ENTRIES)
+            .map(|index| (format!("V{index}"), json!("")))
+            .collect();
+        request["command_context"]["env"] = Value::Object(env);
+        validate_request(&request).unwrap();
+        request["command_context"]["env"]["ONE_TOO_MANY"] = json!("");
+        assert!(validate_request(&request).is_err());
+        request["command_context"]["env"] = json!({"A":"x".repeat(MAX_COMMAND_ENV_VALUE_BYTES)});
+        validate_request(&request).unwrap();
+        request["command_context"]["env"]["A"] = json!("x".repeat(MAX_COMMAND_ENV_VALUE_BYTES + 1));
+        assert!(validate_request(&request).is_err());
+        // Each value is individually legal; their encoded aggregate is not.
+        request["command_context"]["env"] = json!({
+            "A":"x".repeat(MAX_COMMAND_ENV_BYTES / 2),
+            "B":"x".repeat(MAX_COMMAND_ENV_BYTES / 2)
+        });
+        assert!(validate_request(&request).is_err());
+    }
+
+    #[test]
+    fn command_context_requires_an_explicit_supported_worker_capability() {
+        for advertised in [
+            None,
+            Some(Value::Null),
+            Some(json!(true)),
+            Some(json!(COMMAND_CONTEXT_VERSION)),
+            Some(json!([])),
+            Some(json!(["env-cwd-v2"])),
+            Some(json!([{ "version":COMMAND_CONTEXT_VERSION }])),
+        ] {
+            let parent = tempfile::tempdir().unwrap();
+            let destination = parent.path().join("refused");
+            let mut request = request();
+            request["command_context"] = explicit_context();
+            let mut peer = fixture(&destination);
+            if let Some(value) = advertised {
+                peer.replies[0]["command_contexts"] = value;
+            }
+            let failure = receive_execution(&mut peer, &request, "worker", &destination).unwrap_err();
+            assert!(!failure.execution_may_have_run);
+            assert!(failure.detail.contains("env-cwd-v1"));
+            assert!(peer.sent.is_empty());
+            assert_eq!(peer.replies.len(), 6);
+            assert!(!destination.exists());
+        }
+    }
+
+    #[test]
+    fn source_upload_cannot_precede_command_context_capability_admission() {
+        use super::super::source_delivery::SourcePeer;
+
+        let source = tempfile::tempdir().unwrap();
+        let (upload, mut request) = source_request(source.path());
+        request["command_context"] = explicit_context();
+        for supported in [false, true] {
+            let parent = tempfile::tempdir().unwrap();
+            let destination = parent.path().join("delivery");
+            let mut peer = fixture(&destination);
+            source_replies(&mut peer, &request);
+            if supported {
+                peer.replies[0]["command_contexts"] = json!([COMMAND_CONTEXT_VERSION]);
+            }
+            let result = receive_execution(
+                &mut SourcePeer::new(&mut peer, &upload, &request).unwrap(),
+                &request,
+                "worker",
+                &destination,
+            );
+            if supported {
+                let delivery = result.unwrap();
+                assert!(delivery.acknowledgments_confirmed);
+                assert_eq!(peer.sent[4], request);
+                assert_eq!(peer.sent[4]["command_context"], explicit_context());
+                assert_eq!(delivery.receipt["request_sha256"], hash(&serde_json::to_vec(&request).unwrap()));
+            } else {
+                assert!(!result.unwrap_err().execution_may_have_run);
+                assert!(peer.sent.is_empty());
+                assert!(!destination.exists());
+            }
+        }
+    }
+
+    #[test]
+    fn context_resume_requires_exact_identity_not_current_execution_capability() {
+        use super::super::delivery_recovery::{DeliveryTrust, recover_existing_delivery};
+
+        let parent = tempfile::tempdir().unwrap();
+        let destination = parent.path().join("resumed");
+        let mut request = request();
+        request["command_context"] = explicit_context();
+        let mut peer = resumable(&destination);
+        assert!(peer.replies[0].get("command_contexts").is_none());
+        let delivery = receive_operation(
+            &mut peer, &request, "worker", &destination, DeliveryMode::Resume,
+        ).unwrap();
+        assert!(delivery.acknowledgments_confirmed);
+        assert_eq!(peer.sent[1], DeliveryMode::Resume.frame(&request));
+        assert!(!peer.sent.iter().any(|frame| frame["kind"] == "canonical-exec"));
+        recover_existing_delivery(&request, "worker", &destination, DeliveryTrust::Loopback)
+            .unwrap().unwrap();
+        for field in ["cwd", "env"] {
+            let mut changed = request.clone();
+            if field == "cwd" {
+                changed["command_context"]["cwd"] = json!("/__rabs/workspace/other");
+            } else {
+                changed["command_context"]["env"]["EMPTY"] = json!("now-present");
+            }
+            assert!(recover_existing_delivery(
+                &changed, "worker", &destination, DeliveryTrust::Loopback,
+            ).is_err());
+        }
     }
 }
