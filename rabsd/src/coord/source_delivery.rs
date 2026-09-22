@@ -6,16 +6,19 @@
 //! transfer reply before the delivery engine reaches its execution frontier.
 //! Source availability is not action-key validity or cache-publication authority.
 
-use super::worker_delivery::{WorkerAuthentication, WorkerPeer};
+use super::worker_delivery::{MAX_FRAME_BYTES, WorkerAuthentication, WorkerPeer, validate_request};
 use rabs_asupersync::worker_transport::MAX_JSON_RECORD;
-use rabs_sandbox::snapshot_capture::{MemberKind, SealedSourceSnapshot};
+use rabs_sandbox::snapshot_capture::{MemberKind, SealedSourceSnapshot, capture_sealed_source};
 use rabs_sandbox::source_transfer::{
-    MAX_SOURCE_CHUNK, MAX_SOURCE_FILES, SOURCE_TRANSFER, SourceFile, SourceManifest,
+    MAX_SOURCE_BYTES, MAX_SOURCE_CHUNK, MAX_SOURCE_FILES, SOURCE_TRANSFER, SourceFile,
+    SourceManifest, SourceReceiver,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
-use std::io;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Write};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 fn invalid(message: &str) -> io::Error {
@@ -42,6 +45,8 @@ fn digest(value: &Value) -> io::Result<[u8; 32]> {
 /// Validate the optional source declaration without requiring source bytes.
 /// Resume and verified local delivery recovery use this without a checkout.
 pub fn request_manifest(request: &Value) -> io::Result<Option<SourceManifest>> {
+    require(request.get("source_files").is_none(),
+        "source_files is a preparation specification, not an execution manifest; use --worker-prepare")?;
     let Some(value) = request.get("source_manifest") else { return Ok(None); };
     require(request.get("workspace_backing").is_none(),
         "source_manifest and workspace_backing are mutually exclusive")?;
@@ -62,6 +67,132 @@ pub fn request_manifest(request: &Value) -> io::Result<Option<SourceManifest>> {
     let manifest = SourceManifest::new(files)?;
     require(manifest.digest() == digest(&value["manifest_sha256"])?, "source manifest digest mismatch")?;
     Ok(Some(manifest))
+}
+
+/// Read an operator's explicit projection, never an implicit checkout walk.
+/// A preparation specification has the ordinary canonical-exec fields, with
+/// source_files in place of source_manifest. It is not itself dispatchable.
+fn preparation_paths(specification: &Value) -> io::Result<Vec<String>> {
+    require(specification.is_object(), "source preparation requires an object")?;
+    require(specification["kind"] == "canonical-exec"
+        && specification["request_id"].as_u64().is_some(),
+        "source preparation requires canonical-exec and an unsigned request_id")?;
+    require(specification.get("source_manifest").is_none()
+        && specification.get("workspace_backing").is_none(),
+        "preparation cannot replace an existing source_manifest or workspace_backing")?;
+    require(serde_json::to_vec(specification)?.len() <= MAX_FRAME_BYTES,
+        "source preparation specification exceeds the request bound")?;
+    let paths = specification["source_files"].as_array()
+        .filter(|paths| !paths.is_empty() && paths.len() <= MAX_SOURCE_FILES)
+        .ok_or_else(|| invalid("source_files must be a nonempty bounded array"))?;
+    paths.iter().map(|path| {
+        path.as_str().map(str::to_owned)
+            .ok_or_else(|| invalid("source_files must contain only relative path strings"))
+    }).collect()
+}
+
+/// Prepare an executable request AND retain its exact source bytes in a new
+/// private directory. This is a blocking operator operation, not reactor work.
+/// The existing paired-scan capture establishes coherence; only source_files
+/// are copied from that image. No compiler, network, or publication is invoked.
+///
+/// The directory contains source/ and request.json. All selected source files
+/// are verified through SourceReceiver and synced before request.json is even
+/// created. The latter is the readiness marker: a failed/partial bundle is
+/// retained, never overwritten, retried in place, or silently dispatched.
+/// Execute using that source directory, NOT the mutable original checkout.
+/// Recapture at execution still verifies the saved manifest before dispatch.
+///
+/// The caller owns the destination parent and excludes concurrent modification
+/// by processes with its own credentials, as for ordinary worker deliveries.
+///
+/// # Errors
+/// Invalid/conflicting specifications, unsafe or missing selected members,
+/// incoherent capture, resource limits, existing destinations, and I/O failures.
+pub fn prepare_source_bundle(
+    source_root: &Path,
+    specification: &Value,
+    destination: &Path,
+) -> io::Result<Value> {
+    let paths = preparation_paths(specification)?;
+    require(source_root.is_absolute(), "source root must be absolute")?;
+    require(destination.is_absolute() && destination.file_name().is_some()
+        && destination.components().all(|part| matches!(part, Component::RootDir | Component::Normal(_))),
+        "bundle destination must be absolute without traversal")?;
+    let parent = fs::canonicalize(destination.parent().ok_or_else(|| invalid("bundle parent"))?)?;
+    let destination = parent.join(destination.file_name().ok_or_else(|| invalid("bundle name"))?);
+    require(destination.to_str().is_some(), "bundle path must be UTF-8")?;
+    match fs::symlink_metadata(&destination) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+        Ok(_) => return Err(io::Error::new(io::ErrorKind::AlreadyExists, "bundle destination already exists")),
+    }
+    let image = capture_sealed_source(
+        &[("workspace".to_owned(), source_root.to_path_buf())], false, 2, MAX_SOURCE_BYTES,
+    ).map_err(|error| invalid(&format!("source capture refused: {error:?}")))?;
+    let upload = SourceUpload::from_snapshot(Arc::new(image), "workspace", &paths)?;
+    let mut request = specification.clone();
+    let fields = request.as_object_mut().ok_or_else(|| invalid("source preparation object"))?;
+    fields.remove("source_files");
+    fields.insert("source_manifest".to_owned(), upload.wire_manifest());
+    // One validator for prepared and hand-authored execution requests. This
+    // preserves argv, output declarations, timeouts, and unknown extensions.
+    validate_request(&request)?;
+    upload.validate_request(&request)?;
+    let request_bytes = serde_json::to_vec(&request)?;
+
+    let mut builder = fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(&destination)?; // Exclusive; never merge into an old bundle.
+    let source = destination.join("source");
+    let mut receiver = SourceReceiver::create(&source, upload.manifest.clone())?;
+    for file in upload.manifest.files() {
+        let bytes = upload.image.file_bytes(&upload.root, &file.path)
+            .ok_or_else(|| invalid("captured source bytes missing"))?;
+        for (index, chunk) in bytes.chunks(MAX_SOURCE_CHUNK).enumerate() {
+            receiver.write_chunk(&file.path, index as u64 * MAX_SOURCE_CHUNK as u64,
+                chunk, Sha256::digest(chunk).into())?;
+        }
+    }
+    receiver.seal()?;
+    // Sync only the validated closure, children before parents. Reverse lexical
+    // path order puts every directory after its descendants, including root.
+    let mut directories = BTreeSet::from([PathBuf::new()]);
+    for file in upload.manifest.files() {
+        File::open(source.join(&file.path))?.sync_all()?;
+        for directory in Path::new(&file.path).ancestors().skip(1) {
+            directories.insert(directory.to_path_buf());
+        }
+    }
+    for directory in directories.iter().rev() {
+        File::open(source.join(directory))?.sync_all()?;
+    }
+    File::open(&destination)?.sync_all()?;
+    // Full source durability precedes any parseable request. If this write or
+    // sync fails, report failure and retain the new directory for inspection.
+    let request_path = destination.join("request.json");
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut output = options.open(&request_path)?;
+    output.write_all(&request_bytes)?;
+    output.sync_all()?;
+    File::open(&destination)?.sync_all()?;
+    File::open(&parent)?.sync_all()?;
+    Ok(json!({"kind":"prepared-source-bundle", "directory":destination,
+        "source_root":source, "request_path":request_path, "request_id":request["request_id"],
+        "request_sha256":hex(&Sha256::digest(&request_bytes)),
+        "manifest_sha256":hex(&upload.manifest.digest()),
+        "source_files":upload.manifest.files().len(), "source_bytes":upload.manifest.total_bytes(),
+        "executed":false, "publication_authorized":false}))
 }
 
 /// Immutable captured bytes plus an explicit regular-file projection. The full
@@ -235,8 +366,6 @@ impl<P: WorkerPeer + ?Sized> WorkerPeer for SourcePeer<'_, P> {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use rabs_sandbox::snapshot_capture::capture_sealed_source;
-    use rabs_sandbox::source_transfer::SourceReceiver;
     use std::collections::{BTreeMap, VecDeque};
 
     fn fixture(root: &std::path::Path) -> (SourceUpload, Value, Vec<u8>) {
@@ -438,5 +567,161 @@ mod tests {
             assert_eq!(peer.sent.len(), 3); // grant, begin, seal; never execution or retry.
             assert!(peer.sent.iter().all(|frame| frame["kind"] != "canonical-exec"));
         }
+    }
+
+    fn preparation_specification() -> Value {
+        json!({"kind":"canonical-exec", "request_id":27, "program":"rustc",
+            "toolchain_backing":"/opt/rust-toolchain", "args":["src/lib.rs", "--crate-type", "lib"],
+            "source_files":["src/lib.rs", "empty"], "timeout_ms":120000,
+            "extension":{"keep":"exactly"}})
+    }
+
+    #[test]
+    fn prepared_bundle_retains_exact_bytes_and_is_consumed_by_the_real_source_sender() {
+        use std::os::unix::fs::PermissionsExt;
+        let checkout = tempfile::tempdir().unwrap();
+        let (_, _, bytes) = fixture(checkout.path());
+        let spec = preparation_specification();
+        let original_spec = spec.clone();
+        let owner = tempfile::tempdir().unwrap();
+        let directory = owner.path().join("bundle");
+        let prepared = prepare_source_bundle(checkout.path(), &spec, &directory).unwrap();
+        let source = PathBuf::from(prepared["source_root"].as_str().unwrap());
+        let request_bytes = fs::read(prepared["request_path"].as_str().unwrap()).unwrap();
+        let request: Value = serde_json::from_slice(&request_bytes).unwrap();
+        validate_request(&request).unwrap();
+        let manifest = request_manifest(&request).unwrap().unwrap();
+        assert_eq!(manifest.files().len(), 2);
+        assert_eq!(manifest.total_bytes(), bytes.len() as u64);
+        assert_eq!(prepared["request_sha256"], hex(&Sha256::digest(&request_bytes)));
+        assert_eq!(prepared["manifest_sha256"], hex(&manifest.digest()));
+        assert_eq!(prepared["source_bytes"], bytes.len());
+        assert_eq!(prepared["source_files"], 2);
+        assert_eq!(prepared["executed"], false);
+        assert_eq!(prepared["publication_authorized"], false);
+        assert_eq!(spec, original_spec);
+        let mut without_manifest = request.clone();
+        without_manifest.as_object_mut().unwrap().remove("source_manifest");
+        let mut without_selection = spec;
+        without_selection.as_object_mut().unwrap().remove("source_files");
+        assert_eq!(without_manifest, without_selection, "command and extensions are immutable");
+        assert_eq!(fs::metadata(&directory).unwrap().permissions().mode() & 0o777, 0o700);
+        assert_eq!(fs::metadata(directory.join("request.json")).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(fs::metadata(source.join("src/lib.rs")).unwrap().permissions().mode() & 0o777, 0o444);
+        assert!(!source.join("not-selected.private").exists());
+        assert!(!prepared.to_string().contains("must not be sent"));
+
+        // The source checkout can disappear. The existing execution upload
+        // consumes only the saved request and recaptured retained projection.
+        fs::rename(checkout.path().join("src"), checkout.path().join("old-src")).unwrap();
+        let image = capture_sealed_source(&[("workspace".into(), source)], false, 2, 200_000).unwrap();
+        let upload = SourceUpload::for_request(Arc::new(image), "workspace", &request).unwrap();
+        let mut peer = ReceiverPeer::new();
+        upload.transmit(&mut peer, &request).unwrap();
+        let received = peer.receiver.as_ref().unwrap().sealed_root().unwrap();
+        assert_eq!(fs::read(received.join("src/lib.rs")).unwrap(), bytes);
+        assert_eq!(fs::read(received.join("empty")).unwrap(), b"");
+        assert!(peer.sent.iter().all(|frame| frame["kind"] != "canonical-exec"));
+    }
+
+    #[test]
+    fn preparation_preserves_executable_modes_and_rejects_tampered_retained_source() {
+        use std::os::unix::fs::PermissionsExt;
+        let checkout = tempfile::tempdir().unwrap();
+        fs::write(checkout.path().join("run"), b"#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(checkout.path().join("run"), fs::Permissions::from_mode(0o700)).unwrap();
+        let owner = tempfile::tempdir().unwrap();
+        let directory = owner.path().join("bundle");
+        let mut spec = preparation_specification();
+        spec["source_files"] = json!(["run"]);
+        prepare_source_bundle(checkout.path(), &spec, &directory).unwrap();
+        let source = directory.join("source");
+        let request: Value = serde_json::from_slice(&fs::read(directory.join("request.json")).unwrap()).unwrap();
+        assert_eq!(request["source_manifest"]["files"][0]["executable"], true);
+        assert_eq!(fs::metadata(source.join("run")).unwrap().permissions().mode() & 0o777, 0o555);
+        fs::set_permissions(source.join("run"), fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(source.join("run"), b"#!/bin/sh\nexit 1\n").unwrap();
+        let image = capture_sealed_source(&[("workspace".into(), source)], false, 2, 200_000).unwrap();
+        assert!(SourceUpload::for_request(Arc::new(image), "workspace", &request).is_err());
+    }
+
+    #[test]
+    fn ambiguous_or_invalid_preparation_never_creates_a_bundle() {
+        let checkout = tempfile::tempdir().unwrap();
+        fixture(checkout.path());
+        let owner = tempfile::tempdir().unwrap();
+        let directory = owner.path().join("bundle");
+        let good = preparation_specification();
+        let mut bad = vec![Value::Null, json!([])];
+        for (field, value) in [
+            ("kind", json!("result-resume")), ("request_id", json!(-1)),
+            ("source_manifest", Value::Null), ("workspace_backing", json!("/host")),
+            ("source_files", Value::Null), ("source_files", json!([])),
+            ("source_files", json!([false])), ("source_files", json!(["empty", "empty"])),
+            ("source_files", json!(["missing"])), ("source_files", json!(["../escape"])),
+            ("source_files", json!(["src"])), ("timeout_ms", json!(0)),
+            ("args", json!([1])), ("program", json!("")),
+            ("artifacts", json!({"unit":"bad", "files":["../escape"]})),
+        ] {
+            let mut spec = good.clone();
+            spec[field] = value;
+            bad.push(spec);
+        }
+        for spec in bad {
+            assert!(prepare_source_bundle(checkout.path(), &spec, &directory).is_err(), "{spec}");
+            assert!(!directory.exists(), "invalid input must not publish partial output");
+        }
+        let mut oversized = good;
+        oversized["extension"] = json!("x".repeat(MAX_FRAME_BYTES));
+        assert!(prepare_source_bundle(checkout.path(), &oversized, &directory).is_err());
+        assert!(!directory.exists());
+    }
+
+    #[test]
+    fn preparation_does_not_follow_selected_symlinks_or_replace_existing_bundles() {
+        use std::os::unix::fs::symlink;
+        let checkout = tempfile::tempdir().unwrap();
+        fixture(checkout.path());
+        symlink("empty", checkout.path().join("alias")).unwrap();
+        let owner = tempfile::tempdir().unwrap();
+        let directory = owner.path().join("bundle");
+        let mut spec = preparation_specification();
+        spec["source_files"] = json!(["alias"]);
+        assert!(prepare_source_bundle(checkout.path(), &spec, &directory).is_err());
+        assert!(!directory.exists());
+        spec["source_files"] = json!(["empty"]);
+        prepare_source_bundle(checkout.path(), &spec, &directory).unwrap();
+        let request_before = fs::read(directory.join("request.json")).unwrap();
+        spec["request_id"] = json!(99);
+        assert_eq!(prepare_source_bundle(checkout.path(), &spec, &directory).unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(directory.join("request.json")).unwrap(), request_before);
+        let alias = owner.path().join("alias");
+        symlink(&directory, &alias).unwrap();
+        assert!(prepare_source_bundle(checkout.path(), &spec, &alias).is_err());
+        assert_eq!(fs::read(directory.join("request.json")).unwrap(), request_before);
+    }
+
+    #[test]
+    fn unresolved_preparation_fields_cannot_be_dispatched_even_with_a_valid_manifest() {
+        let checkout = tempfile::tempdir().unwrap();
+        let (_, mut request, _) = fixture(checkout.path());
+        request["source_files"] = json!(["empty"]);
+        assert!(validate_request(&request).is_err());
+        request.as_object_mut().unwrap().remove("source_manifest");
+        request["workspace_backing"] = json!("/somewhere");
+        assert!(validate_request(&request).is_err());
+    }
+
+    #[test]
+    fn preparation_requires_an_absolute_new_destination_and_absolute_source() {
+        let checkout = tempfile::tempdir().unwrap();
+        fixture(checkout.path());
+        let owner = tempfile::tempdir().unwrap();
+        let spec = preparation_specification();
+        assert!(prepare_source_bundle(Path::new("relative"), &spec, &owner.path().join("bundle")).is_err());
+        for destination in [PathBuf::from("relative"), PathBuf::from("/"), owner.path().join("../bundle")] {
+            assert!(prepare_source_bundle(checkout.path(), &spec, &destination).is_err());
+        }
+        assert!(fs::read_dir(owner.path()).unwrap().next().is_none());
     }
 }
