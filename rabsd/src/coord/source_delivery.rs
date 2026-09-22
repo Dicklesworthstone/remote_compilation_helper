@@ -10,6 +10,7 @@ mod preparation;
 
 use super::worker_delivery::{MAX_FRAME_BYTES, WorkerAuthentication, WorkerPeer, validate_request};
 use rabs_asupersync::worker_transport::MAX_JSON_RECORD;
+use rabs_sandbox::cargo_home::{CARGO_HOME_SOURCE_VERSION, CargoHomeProjection};
 use rabs_sandbox::snapshot_capture::{MemberKind, SealedSourceSnapshot};
 #[cfg(all(test, unix))]
 use rabs_sandbox::snapshot_capture::capture_sealed_source;
@@ -56,12 +57,28 @@ fn manifest_value(manifest: &SourceManifest) -> Value {
         })).collect::<Vec<_>>()})
 }
 
+/// Decode only JSON shape; the worker shares the sandbox's registry-only
+/// projection policy. The original field remains unchanged in the saved request
+/// and its fingerprint. This validates intent, not Cargo resolution provenance.
+fn validate_cargo_home(request: &Value, manifest: &SourceManifest) -> io::Result<()> {
+    let Some(home) = request.get("cargo_home") else { return Ok(()); };
+    require(home.as_object().is_some_and(|object| object.len() == 2)
+        && home["version"] == CARGO_HOME_SOURCE_VERSION,
+        "cargo_home requires a supported version and prefix")?;
+    let prefix = home["prefix"].as_str().ok_or_else(|| invalid("cargo_home prefix must be a string"))?;
+    CargoHomeProjection::new(prefix, manifest)?;
+    Ok(())
+}
+
 /// Validate the optional source declaration without requiring source bytes.
 /// Resume and verified local delivery recovery use this without a checkout.
 pub fn request_manifest(request: &Value) -> io::Result<Option<SourceManifest>> {
     require(request.get("source_files").is_none() && request.get("source_roots").is_none(),
         "source_files/source_roots are preparation specifications, not execution manifests; use --worker-prepare")?;
-    let Some(value) = request.get("source_manifest") else { return Ok(None); };
+    let Some(value) = request.get("source_manifest") else {
+        require(request.get("cargo_home").is_none(), "cargo_home requires an uploaded source_manifest")?;
+        return Ok(None);
+    };
     require(request.get("workspace_backing").is_none(),
         "source_manifest and workspace_backing are mutually exclusive")?;
     require(value.as_object().is_some_and(|object| object.len() == 2),
@@ -80,6 +97,7 @@ pub fn request_manifest(request: &Value) -> io::Result<Option<SourceManifest>> {
     }
     let manifest = SourceManifest::new(files)?;
     require(manifest.digest() == digest(&value["manifest_sha256"])?, "source manifest digest mismatch")?;
+    validate_cargo_home(request, &manifest)?;
     Ok(Some(manifest))
 }
 
@@ -91,6 +109,8 @@ pub fn request_manifest(request: &Value) -> io::Result<Option<SourceManifest>> {
 /// ID/relative-path under /__rabs/workspace, preserving sibling path dependencies.
 /// All roots share ONE paired capture; only selected regular files are copied.
 /// No Cargo manifest rewriting, dependency discovery, compiler or network runs.
+/// Optional cargo_home selects a registry-only prefix in that same manifest;
+/// its version/prefix is preserved for worker-side private Cargo-home replay.
 ///
 /// The directory contains source/ and request.json. All selected source files
 /// are verified through SourceReceiver and synced before request.json is even
@@ -298,8 +318,10 @@ impl SourceUpload {
     }
 
     fn begin_frame(&self, request: &Value) -> Value {
-        json!({"kind":"source-begin", "request_id":request["request_id"],
-            "manifest":self.wire_manifest(), "allow_cached_files":true})
+        let mut frame = json!({"kind":"source-begin", "request_id":request["request_id"],
+            "manifest":self.wire_manifest(), "allow_cached_files":true});
+        if let Some(home) = request.get("cargo_home") { frame["cargo_home"] = home.clone(); }
+        frame
     }
 
     /// A missing-file hint narrows transfer, never the declared input closure.
@@ -360,6 +382,11 @@ impl SourceUpload {
         let reply = peer.receive()?;
         check(&reply, "source-ready")?;
         require(reply["sealed"] == false, "new source operation unexpectedly already sealed")?;
+        // Request semantics must not disappear on an older worker that accepts
+        // unknown fields. The exact echo is required BEFORE sending any source
+        // bytes; neither missing-file cache hints nor TLS identity waive it.
+        require(reply.get("cargo_home") == request.get("cargo_home"),
+            "worker did not accept the exact Cargo home replay selection")?;
         let missing = self.missing_files(&reply)?;
         for file in self.manifest.files() {
             if missing.as_ref().is_some_and(|paths| !paths.contains(&file.path)) { continue; }
@@ -381,6 +408,8 @@ impl SourceUpload {
         peer.send(&json!({"kind":"source-seal", "request_id":id, "manifest_sha256":identity}))?;
         let reply = peer.receive()?;
         check(&reply, "source-ready")?;
+        require(reply.get("cargo_home") == request.get("cargo_home"),
+            "worker sealed a different Cargo home replay selection")?;
         require(reply["sealed"] == true, "worker did not seal the complete source projection")
     }
 }
@@ -418,6 +447,8 @@ impl<P: WorkerPeer + ?Sized> WorkerPeer for SourcePeer<'_, P> {
 
 #[cfg(all(test, unix))]
 mod tests {
+    mod cargo_home_tests;
+
     use super::*;
     use std::collections::{BTreeMap, VecDeque};
 
