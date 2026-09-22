@@ -374,9 +374,34 @@ fn coordinator_tls_files() -> io::Result<rabs_asupersync::worker_transport::TlsF
     })
 }
 
-fn run_tls_once(args: &[String], mode: DeliveryMode, source_root: Option<&Path>) -> Result<Delivery, DeliveryFailure> {
+/// All secure operator intents use this one native mutual-TLS listener. Local
+/// proof/source preflight is the caller's responsibility and precedes this call.
+fn accept_tls_worker(
+    address: SocketAddr, worker: &str, pin: &str, request_id: &Value, operation: &str,
+) -> Result<(asupersync::runtime::Runtime, rabs_asupersync::worker_transport::AuthenticatedPeer), String> {
     use asupersync::runtime::RuntimeBuilder;
-    use rabs_asupersync::worker_transport::{MAX_JSON_RECORD, accept_peer};
+    use rabs_asupersync::worker_transport::accept_peer;
+    let acceptor = coordinator_tls_files().map_err(|error| error.to_string())?.acceptor()?;
+    let runtime = RuntimeBuilder::current_thread().build()
+        .map_err(|error| format!("worker delivery runtime: {error:?}"))?;
+    let peer = runtime.block_on(async {
+        let listener = asupersync::net::TcpListener::bind(address).await
+            .map_err(|error| format!("worker TLS listen: {error}"))?;
+        eprintln!("{}", json!({"kind":"worker-exec-listening",
+            "address":listener.local_addr().map_err(|error| error.to_string())?.to_string(),
+            "expected_worker":worker, "expected_worker_spki_sha256":pin,
+            "request_id":request_id, "transport":"mutual-tls-atp",
+            "operation":operation, "authentication_required":true}));
+        let (stream, _) = asupersync::time::timeout(asupersync::time::wall_now(), ACCEPT_BUDGET,
+            listener.accept()).await.map_err(|_| "worker TLS accept deadline exceeded")?
+            .map_err(|error| format!("worker TLS accept: {error}"))?;
+        accept_peer(&acceptor, stream).await
+    })?;
+    Ok((runtime, peer))
+}
+
+fn run_tls_once(args: &[String], mode: DeliveryMode, source_root: Option<&Path>) -> Result<Delivery, DeliveryFailure> {
+    use rabs_asupersync::worker_transport::MAX_JSON_RECORD;
     use rabsd::coord::secure_worker_delivery::{parse_worker_pin, receive_authenticated_operation, receive_authenticated_source};
 
     let directory = PathBuf::from(&args[4]);
@@ -409,26 +434,8 @@ fn run_tls_once(args: &[String], mode: DeliveryMode, source_root: Option<&Path>)
     if !directory.parent().is_some_and(Path::is_dir) {
         return Err(failure("delivery parent directory does not exist".to_owned()));
     }
-    // Validate all credentials BEFORE binding. This branch never invokes the
-    // loopback transport, including when the TLS listener itself is loopback.
-    let acceptor = coordinator_tls_files().map_err(|error| failure(error.to_string()))?
-        .acceptor().map_err(&failure)?;
-    let runtime = RuntimeBuilder::current_thread().build()
-        .map_err(|error| failure(format!("worker delivery runtime: {error:?}")))?;
-    let peer = runtime.block_on(async {
-        let listener = asupersync::net::TcpListener::bind(address).await
-            .map_err(|error| format!("worker TLS listen: {error}"))?;
-        eprintln!("{}", json!({"kind":"worker-exec-listening",
-            "address":listener.local_addr().map_err(|error| error.to_string())?.to_string(),
-            "expected_worker":args[1], "expected_worker_spki_sha256":args[2],
-            "request_id":request["request_id"], "transport":"mutual-tls-atp",
-            "operation":if mode == DeliveryMode::Resume {"result-resume"} else {"canonical-exec"},
-            "authentication_required":true}));
-        let (stream, _) = asupersync::time::timeout(asupersync::time::wall_now(), ACCEPT_BUDGET,
-            listener.accept()).await.map_err(|_| "worker TLS accept deadline exceeded")?
-            .map_err(|error| format!("worker TLS accept: {error}"))?;
-        accept_peer(&acceptor, stream).await
-    }).map_err(failure)?;
+    let (runtime, peer) = accept_tls_worker(address, &args[1], &args[2], &request["request_id"],
+        if mode == DeliveryMode::Resume {"result-resume"} else {"canonical-exec"}).map_err(failure)?;
     match upload.as_ref() {
         Some(upload) => receive_authenticated_source(
             &runtime, peer, pin, &args[1], &request, &directory, upload,
@@ -439,15 +446,43 @@ fn run_tls_once(args: &[String], mode: DeliveryMode, source_root: Option<&Path>)
     }
 }
 
+fn run_tls_acknowledgment_once(args: &[String]) -> Result<Delivery, DeliveryFailure> {
+    use rabsd::coord::secure_worker_delivery::{acknowledge_authenticated, parse_worker_pin};
+    let directory = PathBuf::from(&args[4]);
+    let failure = |detail: String| DeliveryFailure {
+        directory:directory.clone(), execution_may_have_run:true, detail,
+    };
+    let address: SocketAddr = args[0].parse()
+        .map_err(|_| failure("listen must be a literal IP:port".to_owned()))?;
+    let pin = parse_worker_pin(&args[2]).map_err(|error| failure(error.to_string()))?;
+    let request = read_request(Path::new(&args[3])).map_err(|error| failure(error.to_string()))?;
+    // Verify the historical SPKI and every byte BEFORE reading credentials or
+    // starting the listener. A loopback receipt cannot be upgraded to TLS.
+    let pending = PendingAcknowledgment::verify(&request, &args[1], &directory, DeliveryTrust::PinnedWorker(pin))?;
+    let envelope = json!({"kind":"result-resume", "request_id":request["request_id"], "request":request});
+    if serde_json::to_vec(&envelope).map_err(|error| failure(error.to_string()))?.len()
+        > rabs_asupersync::worker_transport::MAX_JSON_RECORD
+    {
+        return Err(failure("acknowledgment request exceeds native ATP record limit".to_owned()));
+    }
+    let (runtime, peer) = accept_tls_worker(address, &args[1], &args[2], &request["request_id"],
+        "result-acknowledgment").map_err(failure)?;
+    acknowledge_authenticated(&runtime, peer, pin, pending)
+}
+
 /// One explicitly pinned worker, authenticated transport, and one exact command.
 /// TLS/admission failures terminate without dispatch or a plaintext retry.
 /// Repeating the exact command revalidates an existing durable delivery offline.
-/// --resume selects retrieval only; absent/uncertain retained results are errors.
+/// --resume selects retrieval only; --acknowledge releases verified local results.
 pub fn run_tls(args: &[String]) -> i32 {
+    if let Some(args) = acknowledgment_arguments(args, 5) {
+        return report_acknowledgment(run_tls_acknowledgment_once(args));
+    }
     let Some((args, mode, source_root)) = execution_arguments(args, 5) else {
-        eprintln!("usage: rabsd --worker-exec-tls [--resume | --source-root <absolute-root>] <IP:port> <expected-worker> <worker-spki-sha256> <request.json> <absolute-delivery-directory>");
+        eprintln!("usage: rabsd --worker-exec-tls [--resume | --acknowledge | --source-root <absolute-root>] <IP:port> <expected-worker> <worker-spki-sha256> <request.json> <absolute-delivery-directory>");
         eprintln!("required: RABS_COORD_TLS_CA, RABS_COORD_TLS_CERT, RABS_COORD_TLS_KEY");
         eprintln!("--resume retrieves the original request into a new directory; it never executes it");
+        eprintln!("--acknowledge requires an existing pinned delivery; it never downloads, executes or downgrades transport");
         eprintln!("--source-root captures only for new source_manifest requests; only declared regular files are uploaded");
         return 2;
     };
@@ -757,22 +792,24 @@ mod tests {
 
     #[test]
     fn acknowledgment_intent_is_explicit_exclusive_and_never_an_execution_positional() {
-        let args: Vec<_> = ["127.0.0.1:0", "worker", "request.json", "/delivery"].into_iter().map(str::to_owned).collect();
-        let mut leading = vec!["--acknowledge".to_owned()]; leading.extend(args.clone());
-        assert_eq!(acknowledgment_arguments(&leading, 4), Some(&leading[1..]));
-        let mut trailing = args.clone(); trailing.push("--acknowledge".into());
-        assert_eq!(acknowledgment_arguments(&trailing, 4), Some(&trailing[..4]));
-        assert!(execution_arguments(&leading, 4).is_none());
-        assert!(execution_arguments(&trailing, 4).is_none());
-        assert!(acknowledgment_arguments(&args, 4).is_none());
-        for flag in ["--resume", "--source-root", "--acknowledge"] {
-            let mut wrong = leading.clone(); wrong[2] = flag.into();
-            assert!(acknowledgment_arguments(&wrong, 4).is_none());
-            assert!(execution_arguments(&wrong, 4).is_none());
+        for count in [4, 5] {
+            let args: Vec<_> = (0..count).map(|index| format!("arg-{index}")).collect();
+            let mut leading = vec!["--acknowledge".to_owned()]; leading.extend(args.clone());
+            assert_eq!(acknowledgment_arguments(&leading, count), Some(&leading[1..]));
+            let mut trailing = args.clone(); trailing.push("--acknowledge".into());
+            assert_eq!(acknowledgment_arguments(&trailing, count), Some(&trailing[..count]));
+            assert!(execution_arguments(&leading, count).is_none());
+            assert!(execution_arguments(&trailing, count).is_none());
+            assert!(acknowledgment_arguments(&args, count).is_none());
+            for flag in ["--resume", "--source-root", "--acknowledge"] {
+                let mut wrong = leading.clone(); wrong[2] = flag.into();
+                assert!(acknowledgment_arguments(&wrong, count).is_none());
+                assert!(execution_arguments(&wrong, count).is_none());
+            }
+            let mut misplaced = args; misplaced.insert(2, "--acknowledge".into());
+            assert!(acknowledgment_arguments(&misplaced, count).is_none());
+            assert!(execution_arguments(&misplaced, count).is_none());
         }
-        let mut misplaced = args; misplaced.insert(2, "--acknowledge".into());
-        assert!(acknowledgment_arguments(&misplaced, 4).is_none());
-        assert!(execution_arguments(&misplaced, 4).is_none());
     }
 
     #[test]
@@ -787,6 +824,10 @@ mod tests {
         let args = vec![occupied.local_addr().unwrap().to_string(), "worker".into(),
             request_path.to_string_lossy().into_owned(), destination.to_string_lossy().into_owned()];
         let failure = run_acknowledgment_once(&args).unwrap_err();
+        assert!(failure.execution_may_have_run);
+        assert!(failure.detail.contains("existing verified delivery"));
+        let mut tls = args; tls.insert(2, "01".repeat(32));
+        let failure = run_tls_acknowledgment_once(&tls).unwrap_err();
         assert!(failure.execution_may_have_run);
         assert!(failure.detail.contains("existing verified delivery"));
         assert!(!destination.exists());

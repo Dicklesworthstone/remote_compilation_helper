@@ -12,6 +12,7 @@
 //! native async I/O with a current-thread Runtime and performs filesystem work
 //! outside that reactor. Do not call it from a running async task.
 
+use super::delivery_ack::PendingAcknowledgment;
 use super::source_delivery::SourceUpload;
 use super::worker_delivery::{
     Delivery, DeliveryFailure, DeliveryMode, WorkerAuthentication, WorkerPeer, receive_operation,
@@ -347,6 +348,13 @@ impl<P: WorkerPeer> WorkerPeer for AdmittedPeer<P> {
                 )?;
                 self.operation_sent = true; // burn before any possibly partial write
             }
+            Some("request-status") => {
+                // Metadata-only confirmation after a lost final acceptance
+                // response. Never query another admission or widen execution.
+                require(self.mode == DeliveryMode::Resume && self.operation_sent
+                    && frame == &json!({"kind":"request-status", "request_id":self.expected_operation["request_id"]}),
+                    "status query does not own this recovery operation")?;
+            }
             Some("output-read" | "artifact-read" | "output-ack" | "artifact-ack") => {
                 require(
                     self.operation_sent
@@ -388,7 +396,8 @@ impl<P: WorkerPeer> WorkerPeer for AdmittedPeer<P> {
                         | "output-acknowledged"
                         | "artifact-acknowledged"
                 )
-            ),
+            ) || (self.mode == DeliveryMode::Resume && frame["kind"] == "request-status"
+                && frame["request_id"] == self.expected_operation["request_id"]),
             "worker frame forbidden on delivery session; publication is coordinator-only",
         )?;
         Ok(frame)
@@ -642,6 +651,31 @@ pub fn receive_authenticated_operation(
     )
     .map_err(failure)?;
     receive_operation(&mut admitted, request, expected_worker, destination, mode)
+}
+
+/// Reconcile a previously verified local delivery through the same native TLS
+/// key binding, session challenge and absolute-deadline adapter as result resume.
+/// The proof carries the exact request and original trust policy. No ranges,
+/// source bytes or compiler request are sent, and no local files are replaced.
+pub fn acknowledge_authenticated(
+    runtime: &Runtime,
+    peer: AuthenticatedPeer,
+    expected_spki: [u8; 32],
+    pending: PendingAcknowledgment,
+) -> Result<Delivery, DeliveryFailure> {
+    let directory = pending.directory().to_path_buf();
+    let failure = |error: io::Error| DeliveryFailure {
+        directory: directory.clone(), execution_may_have_run: true, detail: error.to_string(),
+    };
+    if asupersync::cx::Cx::current().is_some() {
+        return Err(failure(invalid("authenticated acknowledgment requires an operator thread")));
+    }
+    let raw = RecordPeer::new(runtime, peer.stream, pending.request());
+    let mut admitted = AdmittedPeer::new(
+        raw, peer.identity, expected_spki, pending.request(),
+        challenge_ids().map_err(&failure)?, DeliveryMode::Resume,
+    ).map_err(failure)?;
+    pending.acknowledge(&mut admitted)
 }
 
 /// Upload an explicitly approved immutable source projection after native TLS
@@ -1375,5 +1409,54 @@ mod tests {
         assert_eq!(peer.until, ack_until);
         assert!(peer.phase == Phase::Acknowledgment);
         assert_eq!(peer.stream.reads, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn authenticated_acknowledgment_uses_the_same_pinned_challenge_without_range_reads() {
+        use super::super::delivery_recovery::DeliveryTrust;
+        let parent = tempfile::tempdir().unwrap();
+        let destination = parent.path().join("delivery");
+        let (mut original_peer, request) = resumed_peer();
+        original_peer.inner.replies.pop_back(); // Lost original acceptance reply.
+        let original = receive_operation(&mut original_peer, &request, "worker", &destination, DeliveryMode::Resume).unwrap();
+        assert!(!original.acknowledgments_confirmed);
+        let marker = std::fs::read(destination.join("delivery.json")).unwrap();
+        let pending = PendingAcknowledgment::verify(&request, "worker", &destination, DeliveryTrust::PinnedWorker([1;32])).unwrap();
+        let (mut peer, _) = resumed_peer();
+        peer.inner.replies.remove(4); peer.inner.replies.remove(3); // No output chunks needed.
+        let delivered = pending.acknowledge(&mut peer).unwrap();
+        assert!(delivered.acknowledgments_confirmed);
+        assert_eq!(delivered.receipt, original.receipt);
+        assert_eq!(std::fs::read(destination.join("delivery.json")).unwrap(), marker);
+        assert_eq!(peer.inner.sent.iter().map(|frame| frame["kind"].as_str().unwrap()).collect::<Vec<_>>(),
+            ["session-challenge", "session-ok", "result-resume", "output-ack"]);
+        assert!(peer.inner.replies.is_empty());
+    }
+
+    #[test]
+    fn authenticated_status_queries_are_metadata_only_and_bound_to_selected_recovery() {
+        let status = json!({"kind":"request-status", "request_id":7});
+        for mode in [DeliveryMode::Execute, DeliveryMode::Resume] {
+            let mut peer = peer_with_mode(recovery_hello(), response(), mode);
+            assert!(peer.send(&status).is_err());
+            let hello = peer.receive().unwrap();
+            let mut grant = grant(); grant["result_retention"] = json!("durable-result-v1");
+            peer.negotiate(&hello, &grant).unwrap();
+            assert!(peer.send(&status).is_err());
+            peer.send(&mode.frame(&request())).unwrap();
+            assert_eq!(peer.send(&status).is_ok(), mode == DeliveryMode::Resume);
+            for changed in [json!({"kind":"request-status", "request_id":8}),
+                json!({"kind":"request-status", "request_id":7, "execute":true})] {
+                assert!(peer.send(&changed).is_err());
+            }
+            if mode == DeliveryMode::Resume {
+                peer.inner.replies.push_back(status.clone());
+                assert_eq!(peer.receive().unwrap(), status);
+                peer.inner.replies.push_back(json!({"kind":"request-status", "request_id":8}));
+                assert!(peer.receive().is_err());
+                assert!(peer.send(&request()).is_err());
+            }
+        }
     }
 }
