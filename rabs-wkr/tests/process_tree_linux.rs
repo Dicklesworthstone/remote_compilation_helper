@@ -23,6 +23,7 @@ use std::collections::BTreeMap;
 
 use rabs_wkr::jobserver::{replace_with_worker_local, worker_makeflags};
 use rabs_wkr::session::{CanonicalExecRequest, execute_canonical};
+use rabs_sandbox::process_context::CommandContext;
 
 /// The RABS fleet shape: unprivileged userns + bubblewrap. On any other
 /// host SKIP loudly rather than fake a pass.
@@ -101,6 +102,7 @@ fn canonical_action_observes_only_worker_authored_jobserver_env() {
             toolchain_backing: toolchain.path().display().to_string(),
             workspace_backing: workspace.path().display().to_string(),
             jobserver_grant: requested_grant,
+            command_context: CommandContext::default(),
         };
         let result = execute_canonical(
             &request,
@@ -126,28 +128,33 @@ fn canonical_action_observes_only_worker_authored_jobserver_env() {
             .lines()
             .map(|line| line.split_once('=').expect("coordination assignment"))
             .collect();
-        assert_eq!(observed.len(), 2, "no foreign coordination variables");
+        assert_eq!(observed.len(), 3, "only both auth channels and the granted capacity");
+        assert_eq!(observed["MAKEFLAGS"], observed["CARGO_MAKEFLAGS"]);
+        assert!(!observed.contains_key("MFLAGS"));
         assert_eq!(
             observed["NUM_JOBS"],
             expected_grant.to_string(),
             "effective grant replaces host slots"
         );
         let expected_auth =
-            format!("-j{expected_grant} --jobserver-auth=fifo:/__rabs/workspace/.rabs-jobserver/");
-        let fifo_name = observed["MAKEFLAGS"]
+            format!("-j{expected_grant} --jobserver-auth=fifo:/__rabs/home/");
+        let relative = observed["MAKEFLAGS"]
             .strip_prefix(expected_auth.as_str())
             .expect("worker auth points into the bound bridge directory");
+        let (directory, fifo_name) = relative.split_once('/').expect("private directory and FIFO");
+        assert!(directory.starts_with(".rabs-jobserver-"));
         assert!(fifo_name.starts_with("rabs-jobserver-"));
         assert!(fifo_name.ends_with(".fifo"));
         assert!(!fifo_name.contains('/'));
         assert!(
-            !workspace
+            !home
                 .path()
-                .join(".rabs-jobserver")
-                .join(fifo_name)
+                .join(relative)
                 .exists(),
             "resolved attempt releases its fifo"
         );
+        assert!(!home.path().join(directory).exists(), "private runtime directory is retired");
+        assert!(!workspace.path().join(".rabs-jobserver").exists(), "jobserver setup does not edit source");
     }
 }
 
@@ -160,7 +167,10 @@ fn jobserver_setup_failure_refuses_execution() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let cargo_home = tempfile::tempdir().expect("cargo-home tempdir");
     let home = tempfile::tempdir().expect("home tempdir");
-    let obstruction = workspace.path().join(".rabs-jobserver");
+    // Runtime setup now belongs to HOME, not to a reserved source name.
+    // Refuse a real setup failure at that boundary, retaining the old
+    // no-execution and no-overwrite assertions.
+    let obstruction = home.path().join("not-a-directory");
     std::fs::write(&obstruction, b"keep this input").expect("bridge directory obstruction");
     let request = CanonicalExecRequest {
         request_id: 424_243,
@@ -172,11 +182,12 @@ fn jobserver_setup_failure_refuses_execution() {
         toolchain_backing: toolchain.path().display().to_string(),
         workspace_backing: workspace.path().display().to_string(),
         jobserver_grant: Some(2),
+        command_context: CommandContext::default(),
     };
     let result = execute_canonical(
         &request,
         cargo_home.path(),
-        home.path(),
+        &obstruction,
         6,
         &workspace.path().join("spills"),
     );
@@ -191,4 +202,59 @@ fn jobserver_setup_failure_refuses_execution() {
         std::fs::read(&obstruction).expect("preserved obstruction"),
         b"keep this input"
     );
+}
+
+#[test]
+fn real_rustc_and_its_output_run_with_exact_workspace_member_context() {
+    use rabs_wkr::execution::ExecutionControl;
+    use rabs_wkr::session::{execute_canonical_controlled, sha256_hex};
+    if !namespace_supported() { return; }
+    let cargo = std::fs::canonicalize(std::env::var_os("CARGO").expect("Cargo supplies its path")).unwrap();
+    let toolchain = cargo.parent().and_then(std::path::Path::parent).expect("toolchain/bin/cargo");
+    let workspace = tempfile::tempdir().unwrap();
+    let cargo_home = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let spills = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(workspace.path().join("member/src")).unwrap();
+    // env! executes in the REAL compiler process, not a scripted result.
+    // The compiled program independently checks the runtime cwd/environment.
+    std::fs::write(workspace.path().join("member/src/main.rs"), r#"
+fn main() {
+    assert_eq!(env!("CARGO_PKG_NAME"), "context-member");
+    assert_eq!(env!("CARGO_PKG_VERSION"), "9.8.7");
+    assert_eq!(env!("EXACT_CONTEXT"), "spaces \"quotes\" $HOME\n雪");
+    assert_eq!(env!("EXPLICIT_EMPTY"), "");
+    assert_eq!(std::env::current_dir().unwrap(), std::path::Path::new("/__rabs/workspace/member"));
+    assert_eq!(std::env::var("EXACT_CONTEXT").unwrap(), env!("EXACT_CONTEXT"));
+    assert_eq!(std::env::var("EXPLICIT_EMPTY").unwrap(), "");
+    assert_eq!(std::env::var("NUM_JOBS").unwrap(), "1");
+    assert_eq!(std::env::var("MAKEFLAGS").unwrap(), std::env::var("CARGO_MAKEFLAGS").unwrap());
+    assert_eq!(std::env::var("HOME").unwrap(), "/__rabs/home");
+    println!("context-ok");
+}
+"#).unwrap();
+    let request = CanonicalExecRequest {
+        request_id: 424_244,
+        program: "sh".into(),
+        args: vec!["-eu".into(), "-c".into(),
+            "/__rabs/toolchain/bin/rustc --edition=2024 src/main.rs -o /__rabs/workspace/context-check; exec /__rabs/workspace/context-check".into()],
+        toolchain_backing: toolchain.to_str().unwrap().into(),
+        workspace_backing: workspace.path().to_str().unwrap().into(),
+        jobserver_grant: Some(1),
+        command_context: CommandContext::new("/__rabs/workspace/member", vec![
+            ("CARGO_PKG_NAME".into(), "context-member".into()),
+            ("CARGO_PKG_VERSION".into(), "9.8.7".into()),
+            ("EXACT_CONTEXT".into(), "spaces \"quotes\" $HOME\n雪".into()),
+            ("EXPLICIT_EMPTY".into(), String::new()),
+        ]).unwrap(),
+    };
+    let original = request.clone();
+    let control = ExecutionControl::new(std::time::Duration::from_secs(60)).unwrap();
+    let result = execute_canonical_controlled(&request, cargo_home.path(), home.path(), 4, spills.path(), &control);
+    assert!(result.executed, "{result:?}");
+    assert_eq!(result.exit_code, 0, "{result:?}");
+    assert_eq!(result.residual_group_members, 0);
+    assert_eq!(result.stdout_sha256, sha256_hex(b"context-ok\n"));
+    assert!(workspace.path().join("context-check").is_file());
+    assert_eq!(request, original, "execution does not rewrite the declared context");
 }

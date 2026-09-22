@@ -23,7 +23,7 @@ use rabs_wkr::request_journal::{RECOVERY_PROTOCOL, WorkerJournal};
 use rabs_wkr::result_spool::{RESULT_RETENTION, ResultRecipient, RetentionTarget};
 use rabs_wkr::session::{
     CanonicalExecRequest, execute_canonical_controlled, execute_uploaded_canonical_controlled,
-    probe_capability, sample_pressure,
+    parse_command_context, probe_capability, sample_pressure,
 };
 use rabs_wkr::source_task::{SourceReply, SourceTransferTask};
 use rabs_wkr::source_transfer::{self, SourceOwner};
@@ -651,6 +651,7 @@ fn worker_hello(report: &rabs_wkr::session::CapabilityReport, journal: &WorkerJo
         "canonical": report.canonical_namespace, "slots": report.slots, "token_id": 1,
         "output_transfers": [OUTPUT_TRANSFER], "artifact_transfers": [ARTIFACT_TRANSFER],
         "source_transfers": [SOURCE_TRANSFER],
+        "command_contexts": [rabs_sandbox::process_context::COMMAND_CONTEXT_VERSION],
         "recovery_protocols": [RECOVERY_PROTOCOL],
         "result_retentions": [RESULT_RETENTION],
         "boot_generation": journal.boot_generation().0,
@@ -857,6 +858,7 @@ fn parse_exec_request(value: &serde_json::Value) -> Result<CanonicalExecRequest,
         request_id: value.get("request_id").and_then(serde_json::Value::as_u64).ok_or("exec request missing request_id")?,
         program: text("program")?, args, toolchain_backing: text("toolchain_backing")?,
         workspace_backing, jobserver_grant,
+        command_context: parse_command_context(value)?,
     })
 }
 
@@ -1082,9 +1084,10 @@ mod tests {
             "jobserver_auth_fd": 7, "--jobserver-auth": "fifo:/tmp/x", "inherited_fds": [3,4,5],
             "descriptor_socket": "/tmp/ancillary.sock"
         });
-        let CanonicalExecRequest { request_id, program, args, toolchain_backing, workspace_backing, jobserver_grant } = parse_exec_request(&frame).expect("parses");
+        let CanonicalExecRequest { request_id, program, args, toolchain_backing, workspace_backing, jobserver_grant, command_context } = parse_exec_request(&frame).expect("parses");
         assert_eq!(request_id, 1); assert_eq!(program, "true"); assert!(args.is_empty());
         assert_eq!(toolchain_backing, "/tc"); assert_eq!(workspace_backing, "/ws"); assert_eq!(jobserver_grant, None);
+        assert_eq!(command_context, rabs_sandbox::process_context::CommandContext::default());
     }
 
     #[test]
@@ -1093,6 +1096,74 @@ mod tests {
         assert_eq!(parse_exec_request(&frame).unwrap().jobserver_grant, Some(65536));
         frame["jobserver_grant"] = serde_json::json!(4294967296_u64);
         assert_eq!(parse_exec_request(&frame).unwrap().jobserver_grant, Some(u32::MAX));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn invalid_command_context_is_refused_before_durable_admission() {
+        use serde_json::{Value, json};
+        let root = tempfile::tempdir().unwrap();
+        let mut journal = WorkerJournal::open(root.path(), "session-test", "coord").unwrap();
+        let mut wire = Wire::default(); let peer = wire.clone();
+        let invalid = [Value::Null, json!({"version":"env-cwd-v2","cwd":"/__rabs/workspace","env":{}}),
+            json!({"version":"env-cwd-v1","cwd":"/__rabs/workspace/../home","env":{}}),
+            json!({"version":"env-cwd-v1","cwd":"/__rabs/workspace","env":{"NUM_JOBS":"999"}}),
+            json!({"version":"env-cwd-v1","cwd":"/__rabs/workspace","env":{"LABEL":17}})];
+        let count = invalid.len();
+        for context in invalid {
+            let mut frame = request(160); frame["command_context"] = context;
+            peer.frame(frame);
+        }
+        peer.frame(json!({"kind":"request-status","request_id":160})); peer.close();
+        wait(drive_session(&mut wire, &report(), false, Some(&mut journal), false,
+            |_, _, _| panic!("invalid command context reached the executor"), pressure)).unwrap();
+        let replies = peer.replies();
+        assert_eq!(replies.len(), count + 1);
+        assert!(replies[..count].iter().all(|reply| reply["kind"] == "error"));
+        assert_eq!(replies[count]["status"], "unknown");
+        assert_eq!(journal.high_water(), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn admitted_context_reaches_execution_and_fences_changed_context_after_restart() {
+        use serde_json::json;
+        let root = tempfile::tempdir().unwrap();
+        let mut original = request(170);
+        original["command_context"] = json!({"version":"env-cwd-v1",
+            "cwd":"/__rabs/workspace/member","env":{"LABEL":"exact\n雪","EMPTY":""}});
+        let expected = parse_command_context(&original).unwrap();
+        let fingerprint = rabs_wkr::request_journal::request_fingerprint(&original, DEFAULT_EXECUTION_TIMEOUT);
+        let mut journal = WorkerJournal::open(root.path(), "session-test", "coord").unwrap();
+        let mut wire = Wire::default(); let peer = wire.clone(); let report = report();
+        peer.frame(original.clone());
+        let mut driver = Box::pin(drive_session(&mut wire, &report, false, Some(&mut journal), false,
+            |request, timeout, artifacts| {
+                assert_eq!(request.command_context, expected);
+                let saved: serde_json::Value = serde_json::from_slice(
+                    &std::fs::read(root.path().join("requests.json")).unwrap()).unwrap();
+                assert_eq!(saved["last"]["fingerprint"], fingerprint);
+                capture_launch(request, timeout, artifacts)
+            }, pressure));
+        pump(driver.as_mut(), &peer, 1);
+        peer.close(); wait(driver).unwrap(); drop(journal);
+
+        let mut journal = WorkerJournal::open(root.path(), "session-test", "coord").unwrap();
+        let mut wire = Wire::default(); let peer = wire.clone();
+        peer.frame(original.clone());
+        for (field, replacement) in [("env", json!({"LABEL":"changed","EMPTY":""})),
+            ("cwd", json!("/__rabs/workspace/other"))] {
+            let mut changed = original.clone(); changed["command_context"][field] = replacement;
+            assert_ne!(rabs_wkr::request_journal::request_fingerprint(&changed, DEFAULT_EXECUTION_TIMEOUT), fingerprint);
+            peer.frame(changed);
+        }
+        peer.close();
+        wait(drive_session(&mut wire, &report, false, Some(&mut journal), false,
+            |_, _, _| panic!("changed context cannot authorize replay"), pressure)).unwrap();
+        let replies = peer.replies();
+        assert_eq!(replies[0]["reason"], "durable-request-already-admitted");
+        assert!(replies[1..].iter().all(|reply| reply["reason"] == "durable-request-conflict"));
+        assert_eq!(journal.high_water(), Some(170));
     }
 
     fn request(id: u64) -> serde_json::Value {
@@ -1381,6 +1452,7 @@ mod tests {
         assert_eq!(hello["incarnation"], format!("{:032x}", journal.incarnation().0));
         assert_eq!(hello["request_high_water"], 80);
         assert_eq!(hello["recovery_protocols"][0], RECOVERY_PROTOCOL);
+        assert_eq!(hello["command_contexts"], serde_json::json!([rabs_sandbox::process_context::COMMAND_CONTEXT_VERSION]));
         assert!(validate_recovery_selection(r#"{"kind":"session-ok"}"#).is_ok());
         assert!(validate_recovery_selection(&serde_json::json!({"kind":"session-ok","recovery_protocol":RECOVERY_PROTOCOL}).to_string()).is_ok());
         for bad in [serde_json::json!("other"), serde_json::json!(true), serde_json::Value::Null] {

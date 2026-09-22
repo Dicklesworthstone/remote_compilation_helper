@@ -11,6 +11,7 @@ use crate::artifacts::PreparedArtifacts;
 use crate::execution::{DEFAULT_EXECUTION_TIMEOUT, ExecutionControl};
 use crate::output::CapturedOutputs;
 use crate::source_transfer::SourceOwner;
+use rabs_sandbox::process_context::{CommandContext, COMMAND_CONTEXT_VERSION, MAX_COMMAND_ENV_ENTRIES};
 
 /// What this worker can do (advertised at handshake; the scheduler
 /// gates placement on it). Derived from a real HostIsolationSupport
@@ -47,6 +48,9 @@ pub struct CanonicalExecRequest {
     pub program: String,
     /// Program arguments.
     pub args: Vec<String>,
+    /// Explicit, validated environment additions and canonical working directory.
+    /// Absence on the wire uses the canonical workspace and pinned base only.
+    pub command_context: CommandContext,
     /// Toolchain backing directory (mounts at `/__rabs/toolchain`).
     pub toolchain_backing: String,
     /// Workspace backing directory (mounts at `/__rabs/workspace`).
@@ -57,6 +61,32 @@ pub struct CanonicalExecRequest {
     /// It cannot exceed the worker's own slot count; zero floors to
     /// one. `None` uses the worker's slot count.
     pub jobserver_grant: Option<u32>,
+}
+
+/// Decode the optional versioned execution context without reading the host
+/// environment. Policy is shared with the coordinator through the sandbox's
+/// validated type. The original JSON remains the journal fingerprint input.
+///
+/// # Errors
+/// Malformed or unsupported contexts refuse before durable admission. Values
+/// never appear in errors, including rejected non-string environment values.
+pub fn parse_command_context(request: &serde_json::Value) -> Result<CommandContext, String> {
+    let Some(value) = request.get("command_context") else { return Ok(CommandContext::default()); };
+    let object = value.as_object().filter(|object| object.len() == 3)
+        .ok_or("command_context requires exactly version, cwd and env")?;
+    if object.get("version").and_then(serde_json::Value::as_str) != Some(COMMAND_CONTEXT_VERSION) {
+        return Err("unsupported command_context version".to_owned());
+    }
+    let cwd = object.get("cwd").and_then(serde_json::Value::as_str)
+        .ok_or("command_context cwd must be a string")?;
+    let env = object.get("env").and_then(serde_json::Value::as_object)
+        .filter(|env| env.len() <= MAX_COMMAND_ENV_ENTRIES)
+        .ok_or("command_context env must be a bounded string map")?;
+    let env = env.iter().map(|(name, value)| {
+        value.as_str().map(|value| (name.clone(), value.to_owned()))
+            .ok_or_else(|| "command_context env values must be strings".to_owned())
+    }).collect::<Result<Vec<_>, _>>()?;
+    CommandContext::new(cwd, env).map_err(|error| error.to_string())
 }
 
 /// The result of one canonical execution — an OFFER, never a commit.
@@ -174,9 +204,7 @@ fn free_disk_mib(dir: &std::path::Path) -> u64 {
     let output = std::process::Command::new("df").arg("-Pk").arg(dir).output();
     output.ok().and_then(|o| {
         String::from_utf8(o.stdout).ok().and_then(|text| {
-            text.lines().nth(1).and_then(|line| {
-                line.split_whitespace().nth(3).and_then(|kb| kb.parse::<u64>().ok())
-            })
+            text.lines().nth(1).and_then(|line| line.split_whitespace().nth(3).and_then(|kb| kb.parse::<u64>().ok()))
         })
     }).map(|kb| kb / 1024).unwrap_or(0)
 }
@@ -278,6 +306,10 @@ fn execute_canonical_inner(
     };
     if let Some(artifacts) = &artifacts { plan.out_units.push(artifacts.mount()); }
     let Ok(mut spec) = plan.to_spec() else { return exec_error(request.request_id); };
+    if let Err(error) = request.command_context.apply_to(&mut spec) {
+        let _ = control.retain_outputs(Err(format!("command context: {error}")));
+        return exec_error(request.request_id);
+    }
     if let Some(source) = source
         && let Err(error) = source.protect_workspace(request.request_id, &mut spec)
     {
@@ -439,6 +471,7 @@ mod tests {
         let request = CanonicalExecRequest {
             request_id: 1, program: "true".into(), args: vec![], toolchain_backing: "/tc".into(),
             workspace_backing: "/ws".into(), jobserver_grant: None,
+            command_context: CommandContext::default(),
         };
         let result = execute_canonical(&request, dir.path(), dir.path(), 4, dir.path());
         assert!(!result.executed, "no fabricated success off-Linux");
@@ -452,6 +485,7 @@ mod tests {
             toolchain_backing: dir.path().join("absent-toolchain").display().to_string(),
             workspace_backing: dir.path().join("absent-workspace").display().to_string(),
             jobserver_grant: Some(2),
+            command_context: CommandContext::default(),
         };
         let control = ExecutionControl::new(std::time::Duration::from_secs(10)).unwrap();
         control.cancel(crate::execution::StopReason::Cancelled);
@@ -459,5 +493,39 @@ mod tests {
         assert!(!result.executed);
         assert_eq!(result.exit_code, 130);
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn command_context_decode_preserves_exact_values_and_defaults_only_when_absent() {
+        use serde_json::json;
+        assert_eq!(parse_command_context(&json!({})).unwrap(), CommandContext::default());
+        let request = json!({"command_context": {"version":COMMAND_CONTEXT_VERSION,
+            "cwd":"/__rabs/workspace/member", "env":{"EMPTY":"", "LABEL":"spaces \"$HOME\"\n雪"}}});
+        let original = request.clone();
+        let context = parse_command_context(&request).unwrap();
+        assert_eq!(context.cwd(), std::path::Path::new("/__rabs/workspace/member"));
+        assert_eq!(context.environment(), &[("EMPTY".to_owned(), String::new()),
+            ("LABEL".to_owned(), "spaces \"$HOME\"\n雪".to_owned())]);
+        assert_eq!(request, original, "parsing never rewrites the journal request");
+    }
+
+    #[test]
+    fn malformed_command_context_never_becomes_default_context() {
+        use serde_json::{Value, json};
+        let valid = json!({"version":COMMAND_CONTEXT_VERSION,"cwd":"/__rabs/workspace","env":{}});
+        for invalid in [Value::Null, json!(true), json!([]), json!("env-cwd-v1"),
+            json!({"version":COMMAND_CONTEXT_VERSION,"env":{}})] {
+            assert!(parse_command_context(&json!({"command_context":invalid})).is_err());
+        }
+        for (field, value) in [("version", json!("env-cwd-v2")), ("cwd", Value::Null),
+            ("cwd", json!("/__rabs/workspace/../home")), ("env", json!([])),
+            ("env", json!({"LABEL":17})), ("env", json!({"HOME":"/other"})),
+            ("env", json!({"CARGO_MAKEFLAGS":"-j999"})), ("env", json!({"LABEL":"bad\u{0000}value"}))] {
+            let mut changed = valid.clone(); changed[field] = value;
+            assert!(parse_command_context(&json!({"command_context":changed})).is_err());
+        }
+        let mut extra = valid;
+        extra["inherit_host"] = json!(true);
+        assert!(parse_command_context(&json!({"command_context":extra})).is_err());
     }
 }
