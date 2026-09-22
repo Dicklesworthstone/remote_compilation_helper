@@ -1,12 +1,14 @@
 //! Declared compiler artifacts, captured from one private canonical output mount.
 //!
-//! The worker chooses the physical backing. The request names only a canonical
-//! unit and an exact set of relative files. Harvesting runs AFTER the process
-//! group and drains have resolved, never over a caller-selected host directory.
-//! Every file is snapshotted into the same immutable, bounded storage used for
-//! diagnostic ranges. This is a prepared transport offer, not a CAS publication.
+//! The worker chooses the physical backing. Exact-file declarations remain
+//! strict. Explicit tree-files-v1 declarations name a minimum required file set
+//! and export the complete bounded regular-file closure (directories implicit).
+//! Harvesting runs AFTER the process group and drains have resolved, never over
+//! a caller-selected host directory. Every file is copied into immutable bounded
+//! diagnostic-range storage. This is a transport offer, not a CAS publication.
 
 use crate::output::{CapturedStream, MAX_OUTPUT_CHUNK_BYTES, MAX_RETAINED_STREAM_BYTES};
+use rabs_sandbox::artifact_tree::{MAX_TREE_ENTRIES, MAX_TREE_FILES, MAX_TREE_MANIFEST_BYTES, TREE_FILES_VERSION};
 use rabs_sandbox::canonical_mounts::UnitMount;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -14,7 +16,7 @@ use std::fs::{self, File, Metadata};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
-/// Maximum files in one artifact offer, independently of peer frame limits.
+/// Maximum names in an exact declaration or a tree's minimum required set.
 pub const MAX_ARTIFACT_FILES: usize = 128;
 /// Total retained artifact bytes per execution; not a limit on compiler writes.
 pub const MAX_ARTIFACT_BYTES: u64 = MAX_RETAINED_STREAM_BYTES;
@@ -31,12 +33,37 @@ pub struct ArtifactPlan {
     unit: String,
     files: BTreeSet<String>,
     directories: BTreeSet<String>,
+    tree: bool,
 }
 
 impl ArtifactPlan {
     /// Reject aliases, traversal, duplicate files and file/directory conflicts
     /// before execution. Path spelling is preserved, never silently normalized.
     pub fn new(unit: String, paths: Vec<String>) -> io::Result<Self> {
+        Self::bounded(unit, paths, MAX_ARTIFACT_FILES)
+    }
+
+    /// Opt in to the complete regular-file output tree, with mandatory final
+    /// outputs. Old workers reject the unknown declaration field before launch;
+    /// neither endpoint may silently downgrade it to an exact-file request.
+    pub fn new_tree(unit: String, required: Vec<String>) -> io::Result<Self> {
+        let mut plan = Self::new(unit, required)?;
+        if !cfg!(target_os = "linux") {
+            return Err(io::Error::new(io::ErrorKind::Unsupported, "artifact tree capture requires Linux"));
+        }
+        rabs_sandbox::artifact_tree::validate_tree_names(plan.files())?;
+        plan.tree = true;
+        Ok(plan)
+    }
+
+    /// A sealed result contains its COMPLETE exact set, not the original tree's
+    /// minimum. Rehydration reconstructs only these names and never rediscovers
+    /// outputs or permits a caller's exact declaration to exceed its own bound.
+    pub(crate) fn from_retained(unit: String, paths: Vec<String>) -> io::Result<Self> {
+        Self::bounded(unit, paths, MAX_TREE_FILES)
+    }
+
+    fn bounded(unit: String, paths: Vec<String>, limit: usize) -> io::Result<Self> {
         if unit.is_empty()
             || unit.len() > 64
             || matches!(unit.as_str(), "." | "..")
@@ -44,8 +71,8 @@ impl ArtifactPlan {
         {
             return Err(invalid("invalid artifact unit"));
         }
-        if paths.is_empty() || paths.len() > MAX_ARTIFACT_FILES {
-            return Err(invalid("artifact file count outside 1..=128"));
+        if paths.is_empty() || paths.len() > limit {
+            return Err(invalid("artifact file count outside its bound"));
         }
         let mut files = BTreeSet::new();
         let mut directories = BTreeSet::new();
@@ -68,7 +95,7 @@ impl ArtifactPlan {
         if files.iter().any(|path| directories.contains(path)) {
             return Err(invalid("artifact file overlaps an output directory"));
         }
-        Ok(Self { unit, files, directories })
+        Ok(Self { unit, files, directories, tree:false })
     }
 
     /// Visible output root the compiler must be instructed to use explicitly.
@@ -77,7 +104,8 @@ impl ArtifactPlan {
         format!("/__rabs/out/{}", self.unit)
     }
 
-    /// Stable relative names in bytewise lexical order.
+    /// Declared required names in bytewise lexical order. For a completed tree,
+    /// the full output set is in CapturedArtifacts::manifest, not this minimum.
     pub fn files(&self) -> impl Iterator<Item = &str> {
         self.files.iter().map(String::as_str)
     }
@@ -117,13 +145,18 @@ impl PreparedArtifacts {
         }
     }
 
-    /// Capture the exact declared file set after all sandbox writers are gone.
-    ///
-    /// The caller must have confirmed successful process exit, zero residual
-    /// group members and no interruption. The private backing is quiescent;
-    /// symlinks, special files, hard links, unknown entries and missing files
-    /// refuse the ENTIRE offer. Cancellation is checked during copying too.
+    /// Capture after successful exit, zero residual group members and no
+    /// interruption. The backing must remain quiescent through final verification.
+    /// Exact mode rejects any undeclared entry and every hard link as before.
+    /// Tree mode captures all regular files and admits only closed internal hard
+    /// links, copying aliases independently; it never follows symlinks or mounts.
     pub fn capture(self, stopped: impl Fn() -> bool) -> io::Result<CapturedArtifacts> {
+        if self.plan.tree {
+            #[cfg(target_os = "linux")]
+            return self.capture_tree(stopped);
+            #[cfg(not(target_os = "linux"))]
+            return Err(io::Error::new(io::ErrorKind::Unsupported, "artifact tree capture requires Linux"));
+        }
         let mut pending = vec![PathBuf::new()];
         let mut found = BTreeSet::new();
         let mut entries = 0_usize;
@@ -133,7 +166,7 @@ impl PreparedArtifacts {
             }
             for entry in fs::read_dir(self.backing().join(&relative))? {
                 entries += 1;
-                if entries > 4096 {
+                if entries > MAX_TREE_ENTRIES {
                     return Err(invalid("artifact directory entry limit exceeded"));
                 }
                 let entry = entry?;
@@ -184,18 +217,36 @@ impl PreparedArtifacts {
         if stopped() {
             return Err(io::Error::new(io::ErrorKind::TimedOut, "artifact capture interrupted"));
         }
-        let mut hasher = Sha256::new();
-        hash_field(&mut hasher, b"rabs.worker-artifact-manifest.v1");
-        hash_field(&mut hasher, self.plan.unit.as_bytes());
-        hasher.update((files.len() as u64).to_be_bytes());
-        for (name, file) in &files {
-            hash_field(&mut hasher, name.as_bytes());
-            hasher.update([u8::from(file.executable)]);
-            hasher.update(file.bytes.len().to_be_bytes());
-            hash_field(&mut hasher, file.bytes.sha256().as_bytes());
+        finish_capture(self.plan.clone(), files)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn capture_tree(self, stopped: impl Fn() -> bool) -> io::Result<CapturedArtifacts> {
+        use rabs_sandbox::artifact_tree::TreeInventory;
+        use std::os::unix::fs::PermissionsExt;
+
+        let inventory = TreeInventory::scan(self.backing(), &self.plan.files, MAX_ARTIFACT_BYTES, &stopped)?;
+        let mut files = BTreeMap::new();
+        for name in inventory.names() {
+            let file = inventory.open_file(name)?;
+            let metadata = file.metadata()?;
+            // Retain the same inode for the post-read check even though the
+            // copying reader owns its descriptor. No original output is linked.
+            let witness = file.try_clone()?;
+            let bytes = CapturedStream::from_reader(
+                CaptureReader { file, stopped: &stopped }, metadata.len(),
+            )?;
+            inventory.verify_file(name, &witness)?;
+            files.insert(name.to_owned(), CapturedArtifact {
+                executable: metadata.permissions().mode() & 0o111 != 0, bytes,
+            });
         }
-        let manifest_sha256 = hasher.finalize().iter().map(|b| format!("{b:02x}")).collect();
-        Ok(CapturedArtifacts { plan: self.plan.clone(), files, total_bytes, manifest_sha256 })
+        inventory.verify(&stopped)?;
+        let bundle = finish_capture(self.plan.clone(), files)?;
+        if bundle.total_bytes != inventory.total_bytes() {
+            return Err(invalid("artifact tree changed length during capture"));
+        }
+        Ok(bundle)
     }
 }
 
@@ -249,8 +300,31 @@ pub struct CapturedArtifacts {
     manifest_sha256: String,
 }
 
+fn finish_capture(plan: ArtifactPlan, files: BTreeMap<String, CapturedArtifact>) -> io::Result<CapturedArtifacts> {
+    let mut total_bytes = 0_u64;
+    let mut hasher = Sha256::new();
+    hash_field(&mut hasher, b"rabs.worker-artifact-manifest.v1");
+    hash_field(&mut hasher, plan.unit.as_bytes());
+    hasher.update((files.len() as u64).to_be_bytes());
+    for (name, file) in &files {
+        total_bytes = total_bytes.checked_add(file.bytes.len())
+            .filter(|total| *total <= MAX_ARTIFACT_BYTES)
+            .ok_or_else(|| invalid("artifact byte limit exceeded"))?;
+        hash_field(&mut hasher, name.as_bytes());
+        hasher.update([u8::from(file.executable)]);
+        hasher.update(file.bytes.len().to_be_bytes());
+        hash_field(&mut hasher, file.bytes.sha256().as_bytes());
+    }
+    let manifest_sha256 = hasher.finalize().iter().map(|b| format!("{b:02x}")).collect();
+    let bundle = CapturedArtifacts { plan, files, total_bytes, manifest_sha256 };
+    if serde_json::to_vec(&bundle.manifest())?.len() > MAX_TREE_MANIFEST_BYTES {
+        return Err(invalid("artifact manifest exceeds transport/retention bound"));
+    }
+    Ok(bundle)
+}
+
 impl CapturedArtifacts {
-    /// The execution's exact declaration, checked again at result completion.
+    /// Original declaration, including whether its files were a tree minimum.
     #[must_use]
     pub fn plan(&self) -> &ArtifactPlan { &self.plan }
 
@@ -268,7 +342,8 @@ impl CapturedArtifacts {
             .bytes.read_chunk(offset, size)
     }
 
-    /// Stable descriptors for negotiation/ACK; no physical backing is disclosed.
+    /// Stable COMPLETE descriptors for negotiation/ACK; no physical backing is
+    /// disclosed. Both declaration modes use the same exact-set manifest hash.
     #[must_use]
     pub fn manifest(&self) -> serde_json::Value {
         let files: Vec<_> = self.files.iter().map(|(name, artifact)| serde_json::json!({
@@ -289,12 +364,19 @@ impl CapturedArtifacts {
 
 /// Decode a request's optional artifact declaration without accepting any host
 /// backing path. Unsupported declaration fields are refusals, not ignored hints.
+/// `tree: "tree-files-v1"` makes `files` the mandatory minimum rather than the
+/// entire set. Old workers reject that field instead of executing a weaker plan.
 pub fn parse_plan(request: &serde_json::Value) -> Result<Option<ArtifactPlan>, String> {
     let Some(value) = request.get("artifacts") else { return Ok(None); };
     let object = value.as_object().ok_or("artifacts must be an object")?;
-    if object.keys().any(|key| key != "unit" && key != "files") {
+    if object.keys().any(|key| key != "unit" && key != "files" && key != "tree") {
         return Err("unsupported artifact declaration field".to_owned());
     }
+    let tree = match value.get("tree") {
+        None => false,
+        Some(value) if value.as_str() == Some(TREE_FILES_VERSION) => true,
+        Some(_) => return Err("unsupported artifact tree declaration".to_owned()),
+    };
     let unit = value.get("unit").and_then(serde_json::Value::as_str)
         .ok_or("artifact unit must be a string")?;
     let files = value.get("files").and_then(serde_json::Value::as_array)
@@ -303,7 +385,9 @@ pub fn parse_plan(request: &serde_json::Value) -> Result<Option<ArtifactPlan>, S
     let paths = files.iter().map(|file| file.as_str().map(str::to_owned)
         .ok_or_else(|| "artifact names must be strings".to_owned()))
         .collect::<Result<Vec<_>, _>>()?;
-    ArtifactPlan::new(unit.to_owned(), paths).map(Some).map_err(|error| error.to_string())
+    let plan = if tree { ArtifactPlan::new_tree(unit.to_owned(), paths) }
+        else { ArtifactPlan::new(unit.to_owned(), paths) };
+    plan.map(Some).map_err(|error| error.to_string())
 }
 
 /// An absent selection keeps artifact capture disabled. No unknown version may
@@ -576,6 +660,71 @@ mod tests {
         assert!(transfer_requested(r#"{"artifact_transfer":"files-v1"}"#).unwrap());
         for selection in [serde_json::Value::Null, serde_json::json!(true), serde_json::json!("files-v2")] {
             assert!(transfer_requested(&serde_json::json!({"artifact_transfer": selection}).to_string()).is_err());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tree_mode_captures_cargo_outputs_and_closed_hardlinks_without_changing_exact_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let plan = ArtifactPlan::new_tree("build".into(), vec!["debug/app".into()]).unwrap();
+        let prepared = PreparedArtifacts::new(plan.clone()).unwrap();
+        fs::create_dir_all(prepared.backing().join("debug/deps")).unwrap();
+        fs::create_dir_all(prepared.backing().join("debug/.fingerprint/app-hash")).unwrap();
+        fs::create_dir_all(prepared.backing().join("debug/incremental/empty")).unwrap();
+        fs::write(prepared.backing().join("debug/deps/app-hash"), b"ELF\0\xff").unwrap();
+        fs::set_permissions(prepared.backing().join("debug/deps/app-hash"), fs::Permissions::from_mode(0o755)).unwrap();
+        fs::hard_link(prepared.backing().join("debug/deps/app-hash"), prepared.backing().join("debug/app")).unwrap();
+        fs::write(prepared.backing().join("debug/.fingerprint/app-hash/bin-app"), b"fingerprint").unwrap();
+        fs::write(prepared.backing().join("debug/.cargo-lock"), b"").unwrap();
+        let mut bundle = prepared.capture(|| false).unwrap();
+        assert_eq!(bundle.plan(), &plan);
+        assert_eq!(bundle.manifest()["files"].as_array().unwrap().len(), 4);
+        assert_eq!(bundle.read_chunk("debug/app", 0, 64).unwrap(), b"ELF\0\xff");
+        assert_eq!(bundle.read_chunk("debug/deps/app-hash", 0, 64).unwrap(), b"ELF\0\xff");
+        assert!(bundle.file_identity("debug/app").unwrap().2);
+        assert_eq!(bundle.total_bytes(), 21);
+        let exact = PreparedArtifacts::new(ArtifactPlan::new("build".into(), vec!["debug/app".into()]).unwrap()).unwrap();
+        fs::write(exact.backing().join("debug/app"), b"ok").unwrap();
+        fs::write(exact.backing().join("debug/unrequested"), b"extra").unwrap();
+        assert!(exact.capture(|| false).is_err(), "exact mode must not widen its contract");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tree_mode_never_omits_invalid_or_external_outputs() {
+        use std::os::unix::fs::symlink;
+        for case in 0..4 {
+            let prepared = PreparedArtifacts::new(ArtifactPlan::new_tree("build".into(), vec!["app".into()]).unwrap()).unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            fs::write(outside.path().join("secret"), b"secret").unwrap();
+            if case != 0 { fs::write(prepared.backing().join("app"), b"ok").unwrap(); }
+            match case {
+                0 => fs::write(prepared.backing().join("other"), b"not the required output").unwrap(),
+                1 => symlink(outside.path().join("secret"), prepared.backing().join("extra")).unwrap(),
+                2 => fs::hard_link(outside.path().join("secret"), prepared.backing().join("extra")).unwrap(),
+                _ => fs::write(prepared.backing().join("APP"), b"case alias").unwrap(),
+            }
+            assert!(prepared.capture(|| false).is_err(), "case {case}");
+        }
+    }
+
+    #[test]
+    fn tree_declaration_versions_never_downgrade_and_retained_bounds_are_separate() {
+        let request = serde_json::json!({"artifacts":{"unit":"build", "files":["debug/app"]}});
+        assert!(!parse_plan(&request).unwrap().unwrap().tree);
+        for version in [serde_json::Value::Null, serde_json::json!(true), serde_json::json!("tree-files-v2")] {
+            let mut bad = request.clone(); bad["artifacts"]["tree"] = version;
+            assert!(parse_plan(&bad).is_err());
+        }
+        let names: Vec<_> = (0..MAX_ARTIFACT_FILES + 1).map(|index| format!("f{index}")).collect();
+        assert!(ArtifactPlan::new("build".into(), names.clone()).is_err());
+        assert!(ArtifactPlan::from_retained("build".into(), names).is_ok());
+        #[cfg(target_os = "linux")]
+        {
+            let mut tree = request;
+            tree["artifacts"]["tree"] = serde_json::json!(TREE_FILES_VERSION);
+            assert!(parse_plan(&tree).unwrap().unwrap().tree);
         }
     }
 }

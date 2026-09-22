@@ -10,6 +10,7 @@ use crate::artifacts::{ArtifactPlan, PreparedArtifacts};
 use crate::execution::{ExecutionCompletion, StopReason};
 use crate::output::{CapturedOutputs, CapturedStream, MAX_OUTPUT_CHUNK_BYTES};
 use crate::session::{ExecResult, sha256_hex};
+use rabs_sandbox::artifact_tree::{MAX_TREE_FILES, MAX_TREE_MANIFEST_BYTES};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
@@ -19,7 +20,8 @@ use std::path::{Path, PathBuf};
 
 pub const RESULT_RETENTION: &str = "durable-result-v1";
 pub const MAX_RESULT_BYTES: u64 = 1024 * 1024 * 1024;
-const MAX_MANIFEST_BYTES: u64 = 256 * 1024;
+// A tree's bounded complete manifest plus diagnostic and recipient metadata.
+const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 const DIRECTORY: &str = "retained-result";
 const MANIFEST: &str = "manifest.json";
 
@@ -96,7 +98,9 @@ fn data_path(root: &Path, index: usize) -> PathBuf { root.join(format!("file-{in
 struct Item { name: String, len: u64, digest: String, executable: bool }
 
 /// Bounded interpretation of the sealed result. Names are validated as an exact
-/// artifact plan before they can ever be used to reconstruct a directory.
+/// artifact plan before they can ever be used to reconstruct a directory. The
+/// complete tree set may exceed the original request's required-file count;
+/// rehydration never treats that minimum as the complete output manifest.
 fn describe(result: &Value) -> io::Result<(Vec<Item>, Option<ArtifactPlan>, Option<StopReason>)> {
     require(text(result, "kind")? == "exec-result" && result["executed"] == true
         && number(result, "residual_group_members")? == 0, "result is not fully cleaned")?;
@@ -122,7 +126,9 @@ fn describe(result: &Value) -> io::Result<(Vec<Item>, Option<ArtifactPlan>, Opti
     let plan = match result.get("artifact_manifest") {
         Some(Value::Null) => None,
         Some(manifest) if exit == 0 && stop.is_none() => {
-            let rows = manifest["files"].as_array().filter(|rows| rows.len() <= 128)
+            require(serde_json::to_vec(manifest)?.len() <= MAX_TREE_MANIFEST_BYTES,
+                "retained artifact manifest exceeds its byte bound")?;
+            let rows = manifest["files"].as_array().filter(|rows| rows.len() <= MAX_TREE_FILES)
                 .ok_or_else(|| invalid("invalid retained artifact manifest"))?;
             let mut names = Vec::new();
             for row in rows {
@@ -131,7 +137,7 @@ fn describe(result: &Value) -> io::Result<(Vec<Item>, Option<ArtifactPlan>, Opti
                 items.push(Item { name, len: number(row, "bytes")?, digest: text(row, "sha256")?.to_owned(),
                     executable: row["executable"].as_bool().ok_or_else(|| invalid("artifact mode"))? });
             }
-            let plan = ArtifactPlan::new(text(manifest, "unit")?.to_owned(), names.clone())?;
+            let plan = ArtifactPlan::from_retained(text(manifest, "unit")?.to_owned(), names.clone())?;
             require(plan.files().eq(names.iter().map(String::as_str)), "retained manifest is not canonically ordered")?;
             Some(plan)
         }
@@ -560,5 +566,59 @@ mod tests {
                 assert!(load(root.path(), 1, &fingerprint, &digest).is_ok());
             }
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tree_results_rehydrate_every_file_beyond_the_exact_declaration_limit() {
+        use rabs_sandbox::artifact_tree::TREE_FILES_VERSION;
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let mut journal = WorkerJournal::open(root.path(), "worker", "coord").unwrap();
+        let request = json!({"kind":"canonical-exec", "request_id":23, "program":"cargo",
+            "artifacts":{"unit":"build", "files":["debug/app"], "tree":TREE_FILES_VERSION}});
+        let timeout = Duration::from_secs(5);
+        assert_eq!(journal.admit(&request, timeout).unwrap(), None);
+        let fingerprint = request_fingerprint(&request, timeout);
+        let target = RetentionTarget::from_admitted(root.path(), 23, ResultRecipient::TlsSpki([7; 32])).unwrap();
+        let plan = crate::artifacts::parse_plan(&request).unwrap().unwrap();
+        let prepared = PreparedArtifacts::new(plan).unwrap();
+        fs::create_dir_all(prepared.backing().join("debug/deps")).unwrap();
+        for index in 0..130 {
+            fs::write(prepared.backing().join(format!("debug/deps/file-{index:04}")), format!("payload-{index}")).unwrap();
+        }
+        fs::set_permissions(prepared.backing().join("debug/deps/file-0000"), fs::Permissions::from_mode(0o755)).unwrap();
+        fs::hard_link(prepared.backing().join("debug/deps/file-0000"), prepared.backing().join("debug/app")).unwrap();
+        let mut original = completion(23, false);
+        original.artifacts = Some(prepared.capture(|| false).unwrap());
+        let manifest = original.artifacts.as_ref().unwrap().manifest();
+        assert_eq!(manifest["files"].as_array().unwrap().len(), 131);
+        let digest = target.seal(&mut original).unwrap();
+        drop(original);
+        let mut recovered = load(root.path(), 23, &fingerprint, &digest).unwrap();
+        let artifacts = recovered.completion.artifacts.as_mut().unwrap();
+        assert_eq!(artifacts.manifest(), manifest);
+        assert_eq!(artifacts.read_chunk("debug/app", 0, 64).unwrap(), b"payload-0");
+        assert_eq!(artifacts.read_chunk("debug/deps/file-0129", 0, 64).unwrap(), b"payload-129");
+        assert!(artifacts.file_identity("debug/app").unwrap().2);
+        let mut changed = request;
+        changed["artifacts"].as_object_mut().unwrap().remove("tree");
+        assert!(load(root.path(), 23, &request_fingerprint(&changed, timeout), &digest).is_err());
+    }
+
+    #[test]
+    fn retained_tree_count_is_bounded_independently_of_request_minimum() {
+        let rows: Vec<_> = (0..MAX_TREE_FILES).map(|index| json!({
+            "name":format!("f{index:04}"), "bytes":0, "sha256":sha256_hex(b""), "executable":false,
+        })).collect();
+        let mut result = json!({"kind":"exec-result", "request_id":1, "executed":true,
+            "exit_code":0, "stop_reason":null, "residual_group_members":0,
+            "stdout_bytes":0, "stderr_bytes":0, "stdout_sha256":sha256_hex(b""),
+            "stderr_sha256":sha256_hex(b""), "artifact_manifest":{"unit":"build", "files":rows}});
+        assert_eq!(describe(&result).unwrap().0.len(), MAX_TREE_FILES + 2);
+        result["artifact_manifest"]["files"].as_array_mut().unwrap().push(json!({
+            "name":"overflow", "bytes":0, "sha256":sha256_hex(b""), "executable":false,
+        }));
+        assert!(describe(&result).is_err());
     }
 }
