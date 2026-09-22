@@ -32,6 +32,68 @@ paths. Explicit source manifests instead use `--source-root`; `--worker-prepare`
 can retain selected inputs before execution. Neither capture nor upload is part
 of result recovery or acknowledgment reconciliation.
 
+### Build a prepared bundle and install its outputs
+
+`--worker-build-tls` joins source upload, authenticated execution, durable byte
+delivery, and complete output installation in one operator command. First prepare
+a bundle containing `request.json` and `source/` with `--worker-prepare`. The
+request must contain a source manifest and an artifact declaration; an explicit
+`tree-files-v1` declaration receives the full output tree, including Cargo's
+intermediate files. The compiler command still supplies its exact arguments,
+canonical working directory, environment, and worker toolchain backing.
+
+With the TLS environment described below, run:
+
+```sh
+rabsd --worker-build-tls 0.0.0.0:7091 fleet-worker <worker-spki-sha256> \
+  /absolute/bundles/build-42 /absolute/deliveries/build-42 /absolute/outputs/build-42
+```
+
+Start `rabs-wkr --once` against that listener as shown in the authenticated
+delivery instructions below. The three local directories must have existing
+parents, be disjoint, and contain no symlink ancestors. For a new execution the
+delivery and output directories must be absent. The bundle supplies the only
+source upload; the original checkout is no longer needed. The command retains
+the complete verified delivery before privately staging and atomically installing
+every successful artifact. Installed files are independent copies, so modifying
+them cannot change the retained delivery. Failed or interrupted compilation
+retains diagnostics and its original exit status without installing partial outputs.
+
+Repeating this exact command verifies the existing delivery and installed tree
+offline. It can also finish installation after a previous installation failure.
+No worker connection, TLS credentials, or source directory is needed for a
+complete local delivery; keep the bundle's `request.json` to identify that
+delivery. An existing differing output tree is refused without replacement.
+An existing incomplete or corrupt delivery is also refused and never triggers
+another execution.
+
+If execution completed remotely but the delivery was lost, explicitly retrieve
+the original result into a **new** delivery directory:
+
+```sh
+rabsd --worker-build-tls --resume 0.0.0.0:7091 fleet-worker <worker-spki-sha256> \
+  /absolute/bundles/build-42 /absolute/deliveries/build-42-resumed /absolute/outputs/build-42
+```
+
+Resume sends only the retained-result request and byte reads; it neither uploads
+source nor dispatches a compiler. An unavailable remote result remains an error.
+The worker must still retain the requested result. A complete local delivery can
+be installed even if a release acknowledgment was lost; acknowledgment
+reconciliation remains the separate `--worker-exec-tls --acknowledge` operation
+using the same bundle request and delivery directory.
+
+Success prints one `worker-build` JSON object containing `delivery` and
+`installed_outputs`; the latter reports whether a verified existing tree was
+reused. A nonzero compiler exit produces a retained `delivery` and null
+`installed_outputs`. Installation or protocol failure prints `worker-build-error`
+with `execution_may_have_run` and `reexecute:false`. These commands do not publish
+action-cache entries or install Cargo freshness authority. They provide explicit
+build outputs for inspection and use in a new directory.
+
+The equivalent trusted local fixture is `--worker-build-loopback`, with the same
+arguments except for the omitted key pin. It accepts only literal loopback
+addresses and retains the plaintext provenance described above.
+
 ### Authenticated delivery
 
 Provision an explicit CA plus server and worker certificates with the appropriate

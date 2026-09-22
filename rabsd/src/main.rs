@@ -12,6 +12,7 @@
 //! - `--worker-prepare` — capture an explicit source projection into a saved bundle
 //! - `--worker-exec-loopback` — receive one explicit worker execution and its files
 //! - `--worker-exec-tls` — receive one pinned worker execution over mutual TLS/ATP
+//! - `--worker-build-tls` — execute a prepared bundle and install verified outputs
 //! - default: run until SIGTERM/SIGINT (asupersync signal listener)
 //!
 //! Config: `[rabs]` table in the RCH config file (`$RABS_CONFIG` file
@@ -200,14 +201,20 @@ fn prepare_from_arguments(args: &[String]) -> std::io::Result<serde_json::Value>
     use std::path::Path;
 
     let [source, specification, destination] = args else {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, WORKER_PREPARE_USAGE));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            WORKER_PREPARE_USAGE,
+        ));
     };
     if !Path::new(source).is_absolute()
         || !Path::new(destination).is_absolute()
         || specification.is_empty()
         || specification.starts_with("--")
     {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, WORKER_PREPARE_USAGE));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            WORKER_PREPARE_USAGE,
+        ));
     }
     let metadata = std::fs::symlink_metadata(specification)?;
     if !metadata.is_file() || metadata.len() > MAX_FRAME_BYTES as u64 {
@@ -218,12 +225,19 @@ fn prepare_from_arguments(args: &[String]) -> std::io::Result<serde_json::Value>
     }
     let file = std::fs::File::open(specification)?;
     if !file.metadata()?.is_file() {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "specification changed type"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "specification changed type",
+        ));
     }
     let mut bytes = Vec::new();
-    file.take(MAX_FRAME_BYTES as u64 + 1).read_to_end(&mut bytes)?;
+    file.take(MAX_FRAME_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)?;
     if bytes.len() > MAX_FRAME_BYTES {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "specification exceeds request bound"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "specification exceeds request bound",
+        ));
     }
     let specification = serde_json::from_slice(&bytes)?;
     prepare_source_bundle(Path::new(source), &specification, Path::new(destination))
@@ -243,12 +257,19 @@ fn run_prepare(args: &[String]) -> i32 {
     match result {
         Ok(()) => 0,
         Err(error) => {
-            eprintln!("{}", serde_json::json!({
-                "kind":"worker-prepare-failed", "directory":args.get(2),
-                "detail":error.to_string(), "executed":false,
-                "remediation":"Inspect any existing bundle; preparation never overwrites it. Use a new destination after correcting the specification."
-            }));
-            if error.kind() == std::io::ErrorKind::InvalidInput { 2 } else { 1 }
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "kind":"worker-prepare-failed", "directory":args.get(2),
+                    "detail":error.to_string(), "executed":false,
+                    "remediation":"Inspect any existing bundle; preparation never overwrites it. Use a new destination after correcting the specification."
+                })
+            );
+            if error.kind() == std::io::ErrorKind::InvalidInput {
+                2
+            } else {
+                1
+            }
         }
     }
 }
@@ -267,12 +288,16 @@ fn main() {
                  \n\
                  USAGE: rabsd [--version|--help|--check-config|--run-for-ms N]\n\
                  PREPARE: rabsd --worker-prepare <absolute-source-root> <spec.json> <new-absolute-bundle-directory>\n\
-                 spec.json uses canonical-exec fields plus an explicit source_files array,\n\
-                 instead of source_manifest or workspace_backing. No compiler or network runs.\n\
+                 spec.json uses canonical-exec fields plus source_files or source_roots,\n\
+                 instead of source_manifest or workspace_backing. Preparation does not build.\n\
                  Preparation saves request.json and source/; only selected regular files are copied.\n\
                  Execute with --source-root <bundle>/source and <bundle>/request.json, not the old checkout.\n\
                  OPERATOR: rabsd --worker-exec-loopback <127.0.0.1:port> <worker> <request.json> <new-absolute-directory>\n\
                  SECURE: rabsd --worker-exec-tls <IP:port> <worker> <worker-spki-sha256> <request.json> <new-absolute-directory>\n\
+                 BUILD: rabsd --worker-build-tls [--resume] <IP:port> <worker> <worker-spki-sha256> <bundle> <delivery> <outputs>\n\
+                 BUILD LOCAL: rabsd --worker-build-loopback [--resume] <127.0.0.1:port> <worker> <bundle> <delivery> <outputs>\n\
+                 Build paths are absolute. Successful builds install every verified artifact into a new output tree.\n\
+                 Repeating a complete build verifies local delivery and outputs without a worker; --resume never executes.\n\
                  TLS requires RABS_COORD_TLS_CA, RABS_COORD_TLS_CERT and RABS_COORD_TLS_KEY.\n\
                  The operator lane is plaintext loopback only, not authenticated fleet transport.\n\
                  \n\
@@ -291,6 +316,12 @@ fn main() {
         }
         Some("--worker-exec-tls") => {
             std::process::exit(worker_exec::run_tls(&args[1..]));
+        }
+        Some("--worker-build-loopback") => {
+            std::process::exit(worker_exec::run_build(&args[1..]));
+        }
+        Some("--worker-build-tls") => {
+            std::process::exit(worker_exec::run_build_tls(&args[1..]));
         }
         Some("--doctor") => {
             let code = run_doctor();

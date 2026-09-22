@@ -1,5 +1,7 @@
 //! Explicit operator lanes for receiving one real worker execution.
-//! Neither command starts a compiler locally or installs files into a worktree.
+//! Execution commands retain verified deliveries; prepared-build commands also
+//! install complete successful outputs into a new operator-selected directory.
+//! No command starts a compiler locally.
 //! Plaintext loopback and mutually authenticated native ATP are separate modes;
 //! an error in the secure path never selects the loopback path.
 //! Repeating an exact command replays a verified durable delivery without dispatch.
@@ -24,6 +26,9 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+mod prepared_build;
+pub use prepared_build::{run_build, run_build_tls};
+
 const ACCEPT_BUDGET: Duration = Duration::from_secs(60);
 const HANDSHAKE_BUDGET: Duration = Duration::from_secs(60);
 const POLL_INTERVAL: Duration = Duration::from_millis(2);
@@ -34,12 +39,19 @@ fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
 }
 fn deadline(budget: Duration) -> io::Result<Instant> {
-    Instant::now().checked_add(budget).ok_or_else(|| invalid("deadline overflow"))
+    Instant::now()
+        .checked_add(budget)
+        .ok_or_else(|| invalid("deadline overflow"))
 }
 fn check_deadline(deadline: Instant) -> io::Result<()> {
     if Instant::now() >= deadline {
-        Err(io::Error::new(io::ErrorKind::TimedOut,"worker exchange deadline exceeded"))
-    } else { Ok(()) }
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "worker exchange deadline exceeded",
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 /// Intent is a local flag, never a guess based on a failed response. Accept it
@@ -54,20 +66,32 @@ fn operation_arguments(args: &[String], count: usize) -> Option<(&[String], Deli
     } else {
         return None;
     };
-    if positionals.iter().any(|arg| matches!(arg.as_str(), "--resume" | "--acknowledge")) { return None; }
+    if positionals
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "--resume" | "--acknowledge"))
+    {
+        return None;
+    }
     Some((positionals, mode))
 }
 
 /// Acceptance is independently selected, never an implicit network side effect
 /// of ordinary offline receipt recovery. Source upload and resume flags conflict.
 fn acknowledgment_arguments(args: &[String], count: usize) -> Option<&[String]> {
-    if args.len() != count + 1 { return None; }
+    if args.len() != count + 1 {
+        return None;
+    }
     let positionals = if args.first().is_some_and(|arg| arg == "--acknowledge") {
         &args[1..]
     } else if args.last().is_some_and(|arg| arg == "--acknowledge") {
         &args[..count]
-    } else { return None; };
-    if positionals.iter().any(|arg| matches!(arg.as_str(), "--resume" | "--source-root" | "--acknowledge")) {
+    } else {
+        return None;
+    };
+    if positionals
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "--resume" | "--source-root" | "--acknowledge"))
+    {
         return None;
     }
     Some(positionals)
@@ -76,7 +100,8 @@ fn acknowledgment_arguments(args: &[String], count: usize) -> Option<&[String]> 
 /// Source capture is explicit and execution-only. Keep the existing resume
 /// spelling/placement contract; do not interpret an absent upload as a retry.
 fn execution_arguments(
-    args: &[String], count: usize,
+    args: &[String],
+    count: usize,
 ) -> Option<(&[String], DeliveryMode, Option<&Path>)> {
     let (args, source_root) = if args.first().is_some_and(|arg| arg == "--source-root") {
         (args.get(2..)?, Some(Path::new(args.get(1)?)))
@@ -100,40 +125,67 @@ fn execution_arguments(
 /// Capturing a root does not authorize uploading its siblings. The snapshot's
 /// paired scans each have the existing source-protocol byte bound.
 fn capture_source(
-    request: &Value, mode: DeliveryMode, root: Option<&Path>,
+    request: &Value,
+    mode: DeliveryMode,
+    root: Option<&Path>,
 ) -> io::Result<Option<SourceUpload>> {
     let manifest = request_manifest(request)?;
     if mode == DeliveryMode::Resume {
-        if root.is_some() { return Err(invalid("--resume cannot upload source")); }
+        if root.is_some() {
+            return Err(invalid("--resume cannot upload source"));
+        }
         return Ok(None);
     }
     let root = match (manifest, root) {
         (None, None) => return Ok(None),
-        (None, Some(_)) => return Err(invalid("--source-root requires source_manifest, not workspace_backing")),
+        (None, Some(_)) => {
+            return Err(invalid(
+                "--source-root requires source_manifest, not workspace_backing",
+            ));
+        }
         (Some(_), None) => return Err(invalid("source_manifest execution requires --source-root")),
         (Some(_), Some(root)) => root,
     };
-    if !root.is_absolute() { return Err(invalid("source root must be absolute")); }
+    if !root.is_absolute() {
+        return Err(invalid("source root must be absolute"));
+    }
     let image = rabs_sandbox::snapshot_capture::capture_sealed_source(
         &[("workspace".to_owned(), root.to_path_buf())],
-        false, 2, rabs_sandbox::source_transfer::MAX_SOURCE_BYTES,
-    ).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, format!("source capture refused: {error:?}")))?;
+        false,
+        2,
+        rabs_sandbox::source_transfer::MAX_SOURCE_BYTES,
+    )
+    .map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("source capture refused: {error:?}"),
+        )
+    })?;
     SourceUpload::for_request(std::sync::Arc::new(image), "workspace", request).map(Some)
 }
 
 fn loopback_address(address: &str) -> io::Result<SocketAddr> {
-    let address: SocketAddr = address.parse().map_err(|_| invalid("listen must be a literal loopback IP:port"))?;
+    let address: SocketAddr = address
+        .parse()
+        .map_err(|_| invalid("listen must be a literal loopback IP:port"))?;
     if !address.ip().is_loopback() {
-        return Err(invalid("plaintext worker execution is restricted to literal loopback"));
+        return Err(invalid(
+            "plaintext worker execution is restricted to literal loopback",
+        ));
     }
     Ok(address)
 }
 fn read_request(path: &Path) -> io::Result<Value> {
     let file = File::open(path)?;
-    if !file.metadata()?.is_file() { return Err(invalid("request must be an ordinary file")); }
+    if !file.metadata()?.is_file() {
+        return Err(invalid("request must be an ordinary file"));
+    }
     let mut bytes = Vec::new();
-    file.take(MAX_FRAME_BYTES as u64 + 1).read_to_end(&mut bytes)?;
-    if bytes.len() > MAX_FRAME_BYTES { return Err(invalid("request file exceeds frame limit")); }
+    file.take(MAX_FRAME_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_FRAME_BYTES {
+        return Err(invalid("request file exceeds frame limit"));
+    }
     let value = serde_json::from_slice(&bytes)?;
     // Resume also takes the ORIGINAL request. Only the shared receiver builds
     // the result-resume envelope; accepting an operator-supplied envelope here
@@ -149,7 +201,9 @@ fn accept_one(listener: &TcpListener, budget: Duration) -> io::Result<TcpStream>
         match listener.accept() {
             Ok((stream, address)) if address.ip().is_loopback() => return Ok(stream),
             Ok(_) => return Err(invalid("non-loopback worker peer")),
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => std::thread::sleep(POLL_INTERVAL),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                std::thread::sleep(POLL_INTERVAL)
+            }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
             Err(error) => return Err(error),
         }
@@ -168,41 +222,73 @@ struct TcpPeer {
     source_started: bool,
 }
 impl TcpPeer {
-    fn new(stream: TcpStream, handshake: Duration, execution_budget: Duration, mode: DeliveryMode) -> io::Result<Self> {
-        if !stream.peer_addr()?.ip().is_loopback() { return Err(invalid("non-loopback worker peer")); }
+    fn new(
+        stream: TcpStream,
+        handshake: Duration,
+        execution_budget: Duration,
+        mode: DeliveryMode,
+    ) -> io::Result<Self> {
+        if !stream.peer_addr()?.ip().is_loopback() {
+            return Err(invalid("non-loopback worker peer"));
+        }
         stream.set_nonblocking(true)?;
         stream.set_nodelay(true)?;
-        Ok(Self {stream,buffered:Vec::new(),until:deadline(handshake)?,execution_budget,mode,operation_started:false,source_started:false})
+        Ok(Self {
+            stream,
+            buffered: Vec::new(),
+            until: deadline(handshake)?,
+            execution_budget,
+            mode,
+            operation_started: false,
+            source_started: false,
+        })
     }
 }
 impl WorkerPeer for TcpPeer {
     fn send(&mut self, value: &Value) -> io::Result<()> {
         check_deadline(self.until)?;
         let mut bytes = serde_json::to_vec(value)?;
-        if bytes.len() > MAX_FRAME_BYTES { return Err(invalid("outbound frame too large")); }
+        if bytes.len() > MAX_FRAME_BYTES {
+            return Err(invalid("outbound frame too large"));
+        }
         match value.get("kind").and_then(Value::as_str) {
             Some("source-begin") => {
-                if self.mode != DeliveryMode::Execute || self.operation_started || self.source_started {
-                    return Err(invalid("source upload requires a fresh execution connection"));
+                if self.mode != DeliveryMode::Execute
+                    || self.operation_started
+                    || self.source_started
+                {
+                    return Err(invalid(
+                        "source upload requires a fresh execution connection",
+                    ));
                 }
                 self.source_started = true;
                 self.until = deadline(TRANSFER_ALLOWANCE)?;
             }
             Some("source-chunk" | "source-seal") => {
-                if self.mode != DeliveryMode::Execute || !self.source_started || self.operation_started {
+                if self.mode != DeliveryMode::Execute
+                    || !self.source_started
+                    || self.operation_started
+                {
                     return Err(invalid("source frame outside upload"));
                 }
                 // Chunk progress and the final seal never renew the budget.
             }
             _ => {}
         }
-        if matches!(value.get("kind").and_then(Value::as_str), Some("canonical-exec" | "result-resume")) {
+        if matches!(
+            value.get("kind").and_then(Value::as_str),
+            Some("canonical-exec" | "result-resume")
+        ) {
             let expected = match self.mode {
                 DeliveryMode::Execute => "canonical-exec",
                 DeliveryMode::Resume => "result-resume",
             };
-            if value["kind"] != expected { return Err(invalid("operation differs from local operator intent")); }
-            if self.operation_started { return Err(invalid("operator connection cannot dispatch twice")); }
+            if value["kind"] != expected {
+                return Err(invalid("operation differs from local operator intent"));
+            }
+            if self.operation_started {
+                return Err(invalid("operator connection cannot dispatch twice"));
+            }
             self.operation_started = true; // burn before any possibly partial write
             self.until = deadline(match self.mode {
                 DeliveryMode::Execute => self.execution_budget,
@@ -216,9 +302,16 @@ impl WorkerPeer for TcpPeer {
         while offset < bytes.len() {
             check_deadline(self.until)?;
             match self.stream.write(&bytes[offset..]) {
-                Ok(0) => return Err(io::Error::new(io::ErrorKind::WriteZero,"worker frame made no progress")),
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "worker frame made no progress",
+                    ));
+                }
                 Ok(n) => offset += n,
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => std::thread::sleep(POLL_INTERVAL),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(POLL_INTERVAL)
+                }
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                 Err(error) => return Err(error),
             }
@@ -226,22 +319,36 @@ impl WorkerPeer for TcpPeer {
         Ok(())
     }
     fn receive(&mut self) -> io::Result<Value> {
-        let mut bytes = [0_u8;4096];
+        let mut bytes = [0_u8; 4096];
         loop {
             check_deadline(self.until)?;
             if let Some(end) = self.buffered.iter().position(|byte| *byte == b'\n') {
-                if end > MAX_FRAME_BYTES { return Err(invalid("inbound frame too large")); }
+                if end > MAX_FRAME_BYTES {
+                    return Err(invalid("inbound frame too large"));
+                }
                 let line: Vec<_> = self.buffered.drain(..=end).collect();
                 return serde_json::from_slice(&line[..end])
-                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData,error));
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error));
             }
-            if self.buffered.len() > MAX_FRAME_BYTES { return Err(invalid("inbound frame too large")); }
+            if self.buffered.len() > MAX_FRAME_BYTES {
+                return Err(invalid("inbound frame too large"));
+            }
             let capacity = bytes.len().min(MAX_FRAME_BYTES + 1 - self.buffered.len());
             match self.stream.read(&mut bytes[..capacity]) {
-                Ok(0) => return Err(io::Error::new(io::ErrorKind::UnexpectedEof,
-                    if self.buffered.is_empty() {"worker disconnected before response"} else {"truncated worker frame"})),
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        if self.buffered.is_empty() {
+                            "worker disconnected before response"
+                        } else {
+                            "truncated worker frame"
+                        },
+                    ));
+                }
                 Ok(n) => self.buffered.extend_from_slice(&bytes[..n]),
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => std::thread::sleep(POLL_INTERVAL),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(POLL_INTERVAL)
+                }
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                 Err(error) => return Err(error),
             }
@@ -249,70 +356,129 @@ impl WorkerPeer for TcpPeer {
     }
 }
 
-fn run_once(args: &[String], mode: DeliveryMode, source_root: Option<&Path>) -> Result<Delivery, DeliveryFailure> {
-    let directory = PathBuf::from(&args[3]);
-    let failure = |error: io::Error| DeliveryFailure {
-        directory: directory.clone(),
+fn operation_failure(directory: &Path, mode: DeliveryMode, detail: String) -> DeliveryFailure {
+    DeliveryFailure {
+        directory: directory.to_path_buf(),
         execution_may_have_run: mode == DeliveryMode::Resume
-            || !matches!(std::fs::symlink_metadata(&directory),
+            || !matches!(std::fs::symlink_metadata(directory),
                 Err(error) if error.kind() == io::ErrorKind::NotFound),
-        detail: error.to_string(),
-    };
-    let (address, request) = (|| -> io::Result<_> {
-        let address = loopback_address(&args[0])?;
-        let request = read_request(Path::new(&args[2]))?;
-        Ok((address, request))
-    })().map_err(&failure)?;
+        detail,
+    }
+}
+
+/// Keep the parsed request fixed from preflight through dispatch and installation.
+/// Prepared builds must not reopen a mutable request file between those phases.
+struct WorkerOperation<'a> {
+    address: &'a str,
+    worker: &'a str,
+    request: &'a Value,
+    directory: &'a Path,
+    mode: DeliveryMode,
+    source_root: Option<&'a Path>,
+}
+
+fn run_once(
+    args: &[String],
+    mode: DeliveryMode,
+    source_root: Option<&Path>,
+) -> Result<Delivery, DeliveryFailure> {
+    let directory = Path::new(&args[3]);
+    let request = read_request(Path::new(&args[2]))
+        .map_err(|error| operation_failure(directory, mode, error.to_string()))?;
+    run_loopback_operation(WorkerOperation {
+        address: &args[0],
+        worker: &args[1],
+        request: &request,
+        directory,
+        mode,
+        source_root,
+    })
+}
+
+fn run_loopback_operation(operation: WorkerOperation<'_>) -> Result<Delivery, DeliveryFailure> {
+    let WorkerOperation {
+        address,
+        worker,
+        request,
+        directory,
+        mode,
+        source_root,
+    } = operation;
+    let failure = |error: io::Error| operation_failure(directory, mode, error.to_string());
+    let address = loopback_address(address).map_err(&failure)?;
     // A durable result is independent of the worker still being connected.
     // Verify it BEFORE binding, and never turn an incomplete delivery into a
     // new execution. The receiver still atomically creates new destinations.
-    if let Some(delivery) = recover_existing_delivery(
-        &request, &args[1], &directory, DeliveryTrust::Loopback,
-    )? {
+    if let Some(delivery) =
+        recover_existing_delivery(request, worker, directory, DeliveryTrust::Loopback)?
+    {
         return Ok(delivery);
     }
     // Offline receipt recovery above must not depend on a still-existing
     // checkout. A new run captures and verifies source BEFORE listening.
-    let upload = capture_source(&request, mode, source_root).map_err(&failure)?;
+    let upload = capture_source(request, mode, source_root).map_err(&failure)?;
     let setup = (|| -> io::Result<_> {
-        let parent = directory.parent().ok_or_else(|| invalid("delivery directory needs an existing parent"))?;
-        if !parent.is_dir() { return Err(invalid("delivery parent directory does not exist")); }
+        let parent = directory
+            .parent()
+            .ok_or_else(|| invalid("delivery directory needs an existing parent"))?;
+        if !parent.is_dir() {
+            return Err(invalid("delivery parent directory does not exist"));
+        }
         let listener = TcpListener::bind(address)?;
-        eprintln!("{}",json!({"kind":"worker-exec-listening","address":listener.local_addr()?.to_string(),
-            "expected_worker":args[1],"request_id":request["request_id"],"transport_authenticated":false,
-            "operation":if mode == DeliveryMode::Resume {"result-resume"} else {"canonical-exec"}}));
-        let stream = accept_one(&listener,ACCEPT_BUDGET)?;
-        let budget = Duration::from_millis(request.get("timeout_ms").and_then(Value::as_u64)
-            .unwrap_or(MAX_EXECUTION_MILLIS).min(MAX_EXECUTION_MILLIS)) + TRANSFER_ALLOWANCE;
-        TcpPeer::new(stream,HANDSHAKE_BUDGET,budget,mode)
+        eprintln!(
+            "{}",
+            json!({"kind":"worker-exec-listening","address":listener.local_addr()?.to_string(),
+            "expected_worker":worker,"request_id":request["request_id"],"transport_authenticated":false,
+            "operation":if mode == DeliveryMode::Resume {"result-resume"} else {"canonical-exec"}})
+        );
+        let stream = accept_one(&listener, ACCEPT_BUDGET)?;
+        let budget = Duration::from_millis(
+            request
+                .get("timeout_ms")
+                .and_then(Value::as_u64)
+                .unwrap_or(MAX_EXECUTION_MILLIS)
+                .min(MAX_EXECUTION_MILLIS),
+        ) + TRANSFER_ALLOWANCE;
+        TcpPeer::new(stream, HANDSHAKE_BUDGET, budget, mode)
     })();
     let mut peer = setup.map_err(&failure)?;
     match upload.as_ref() {
         Some(upload) => {
-            let mut peer = SourcePeer::new(&mut peer, upload, &request).map_err(failure)?;
-            receive_operation(&mut peer, &request, &args[1], &directory, mode)
+            let mut peer = SourcePeer::new(&mut peer, upload, request).map_err(failure)?;
+            receive_operation(&mut peer, request, worker, directory, mode)
         }
-        None => receive_operation(&mut peer, &request, &args[1], &directory, mode),
+        None => receive_operation(&mut peer, request, worker, directory, mode),
     }
 }
 
 fn run_acknowledgment_once(args: &[String]) -> Result<Delivery, DeliveryFailure> {
     let directory = PathBuf::from(&args[3]);
     let failure = |error: io::Error| DeliveryFailure {
-        directory:directory.clone(), execution_may_have_run:true, detail:error.to_string(),
+        directory: directory.clone(),
+        execution_may_have_run: true,
+        detail: error.to_string(),
     };
     let address = loopback_address(&args[0]).map_err(&failure)?;
     let request = read_request(Path::new(&args[2])).map_err(&failure)?;
     // No listener, source capture, or new directory can precede this proof.
-    let pending = PendingAcknowledgment::verify(&request, &args[1], &directory, DeliveryTrust::Loopback)?;
+    let pending =
+        PendingAcknowledgment::verify(&request, &args[1], &directory, DeliveryTrust::Loopback)?;
     let listener = TcpListener::bind(address).map_err(&failure)?;
     let address = listener.local_addr().map_err(&failure)?;
-    eprintln!("{}", json!({"kind":"worker-exec-listening", "address":address.to_string(),
+    eprintln!(
+        "{}",
+        json!({"kind":"worker-exec-listening", "address":address.to_string(),
         "expected_worker":args[1], "request_id":request["request_id"],
-        "transport_authenticated":false, "operation":"result-acknowledgment"}));
+        "transport_authenticated":false, "operation":"result-acknowledgment"})
+    );
     let stream = accept_one(&listener, ACCEPT_BUDGET).map_err(&failure)?;
-    let mut peer = TcpPeer::new(stream, HANDSHAKE_BUDGET, TRANSFER_ALLOWANCE, DeliveryMode::Resume)
-        .map_err(failure)?;
+    let mut peer = TcpPeer::new(
+        stream,
+        HANDSHAKE_BUDGET,
+        TRANSFER_ALLOWANCE,
+        DeliveryMode::Resume,
+    )
+    .map_err(failure)?;
     pending.acknowledge(&mut peer)
 }
 
@@ -322,10 +488,18 @@ pub fn run(args: &[String]) -> i32 {
         return report_acknowledgment(run_acknowledgment_once(args));
     }
     let Some((args, mode, source_root)) = execution_arguments(args, 4) else {
-        eprintln!("usage: rabsd --worker-exec-loopback [--resume | --acknowledge | --source-root <absolute-root>] <127.0.0.1:port> <expected-worker> <request.json> <absolute-delivery-directory>");
-        eprintln!("--resume retrieves the original request into a new directory; it never executes it");
-        eprintln!("--acknowledge requires an existing verified delivery and releases only its matching remote result");
-        eprintln!("--source-root captures only for new source_manifest requests; only declared regular files are uploaded");
+        eprintln!(
+            "usage: rabsd --worker-exec-loopback [--resume | --acknowledge | --source-root <absolute-root>] <127.0.0.1:port> <expected-worker> <request.json> <absolute-delivery-directory>"
+        );
+        eprintln!(
+            "--resume retrieves the original request into a new directory; it never executes it"
+        );
+        eprintln!(
+            "--acknowledge requires an existing verified delivery and releases only its matching remote result"
+        );
+        eprintln!(
+            "--source-root captures only for new source_manifest requests; only declared regular files are uploaded"
+        );
         return 2;
     };
     report_result(run_once(args, mode, source_root))
@@ -346,14 +520,20 @@ fn report_acknowledgment(result: Result<Delivery, DeliveryFailure>) -> i32 {
 fn report_result(result: Result<Delivery, DeliveryFailure>) -> i32 {
     match result {
         Ok(delivery) => {
-            println!("{}",delivery.to_json());
+            println!("{}", delivery.to_json());
             // Byte delivery success is distinct from compiler success. The
             // verified receipt retains a nonzero compiler/interruption status.
-            delivery.receipt["exit_code"].as_i64().and_then(|code| i32::try_from(code).ok()).unwrap_or(1)
+            delivery.receipt["exit_code"]
+                .as_i64()
+                .and_then(|code| i32::try_from(code).ok())
+                .unwrap_or(1)
         }
         Err(error) => {
-            eprintln!("{}",json!({"kind":"worker-delivery-error","directory":error.directory,
-                "execution_may_have_run":error.execution_may_have_run,"detail":error.detail,"reexecute":false}));
+            eprintln!(
+                "{}",
+                json!({"kind":"worker-delivery-error","directory":error.directory,
+                "execution_may_have_run":error.execution_may_have_run,"detail":error.detail,"reexecute":false})
+            );
             1
         }
     }
@@ -361,10 +541,15 @@ fn report_result(result: Result<Delivery, DeliveryFailure>) -> i32 {
 
 fn coordinator_tls_files() -> io::Result<rabs_asupersync::worker_transport::TlsFiles> {
     let path = |name: &str| -> io::Result<PathBuf> {
-        let value = std::env::var_os(name).filter(|value| !value.is_empty())
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, format!("missing {name}")))?;
+        let value = std::env::var_os(name)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, format!("missing {name}"))
+            })?;
         let path = PathBuf::from(value);
-        if !path.is_absolute() { return Err(invalid("coordinator TLS files must use absolute paths")); }
+        if !path.is_absolute() {
+            return Err(invalid("coordinator TLS files must use absolute paths"));
+        }
         Ok(path)
     };
     Ok(rabs_asupersync::worker_transport::TlsFiles {
@@ -377,85 +562,154 @@ fn coordinator_tls_files() -> io::Result<rabs_asupersync::worker_transport::TlsF
 /// All secure operator intents use this one native mutual-TLS listener. Local
 /// proof/source preflight is the caller's responsibility and precedes this call.
 fn accept_tls_worker(
-    address: SocketAddr, worker: &str, pin: &str, request_id: &Value, operation: &str,
-) -> Result<(
-    asupersync::runtime::Runtime,
-    rabs_asupersync::worker_transport::AuthenticatedPeer,
-    rabsd::coord::secure_worker_delivery::PinnedWorkerAdmission,
-), String> {
+    address: SocketAddr,
+    worker: &str,
+    pin: &str,
+    request_id: &Value,
+    operation: &str,
+) -> Result<
+    (
+        asupersync::runtime::Runtime,
+        rabs_asupersync::worker_transport::AuthenticatedPeer,
+        rabsd::coord::secure_worker_delivery::PinnedWorkerAdmission,
+    ),
+    String,
+> {
     use asupersync::runtime::RuntimeBuilder;
     use rabs_asupersync::worker_transport::accept_peer;
     use rabsd::coord::secure_worker_delivery::{PinnedWorkerAdmission, parse_worker_pin};
-    let acceptor = coordinator_tls_files().map_err(|error| error.to_string())?.acceptor()?;
+    let acceptor = coordinator_tls_files()
+        .map_err(|error| error.to_string())?
+        .acceptor()?;
     // A stable worker name owns its persistent pin and boot history. Hold its
     // exclusive admission capability before listening and through stream close.
     let state = std::env::var_os("RABS_STATE_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(crate::default_under_home(".cache/rch/rabs-state")));
     let admission = PinnedWorkerAdmission::open(
-        &state, worker, parse_worker_pin(pin).map_err(|error| error.to_string())?,
-    ).map_err(|error| error.to_string())?;
-    let runtime = RuntimeBuilder::current_thread().build()
+        &state,
+        worker,
+        parse_worker_pin(pin).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    let runtime = RuntimeBuilder::current_thread()
+        .build()
         .map_err(|error| format!("worker delivery runtime: {error:?}"))?;
     let peer = runtime.block_on(async {
-        let listener = asupersync::net::TcpListener::bind(address).await
+        let listener = asupersync::net::TcpListener::bind(address)
+            .await
             .map_err(|error| format!("worker TLS listen: {error}"))?;
-        eprintln!("{}", json!({"kind":"worker-exec-listening",
+        eprintln!(
+            "{}",
+            json!({"kind":"worker-exec-listening",
             "address":listener.local_addr().map_err(|error| error.to_string())?.to_string(),
             "expected_worker":worker, "expected_worker_spki_sha256":pin,
             "request_id":request_id, "transport":"mutual-tls-atp",
-            "operation":operation, "authentication_required":true}));
-        let (stream, _) = asupersync::time::timeout(asupersync::time::wall_now(), ACCEPT_BUDGET,
-            listener.accept()).await.map_err(|_| "worker TLS accept deadline exceeded")?
-            .map_err(|error| format!("worker TLS accept: {error}"))?;
+            "operation":operation, "authentication_required":true})
+        );
+        let (stream, _) = asupersync::time::timeout(
+            asupersync::time::wall_now(),
+            ACCEPT_BUDGET,
+            listener.accept(),
+        )
+        .await
+        .map_err(|_| "worker TLS accept deadline exceeded")?
+        .map_err(|error| format!("worker TLS accept: {error}"))?;
         accept_peer(&acceptor, stream).await
     })?;
     Ok((runtime, peer, admission))
 }
 
-fn run_tls_once(args: &[String], mode: DeliveryMode, source_root: Option<&Path>) -> Result<Delivery, DeliveryFailure> {
-    use rabs_asupersync::worker_transport::MAX_JSON_RECORD;
-    use rabsd::coord::secure_worker_delivery::{parse_worker_pin, receive_authenticated_operation, receive_authenticated_source};
+fn run_tls_once(
+    args: &[String],
+    mode: DeliveryMode,
+    source_root: Option<&Path>,
+) -> Result<Delivery, DeliveryFailure> {
+    let directory = Path::new(&args[4]);
+    let request = read_request(Path::new(&args[3]))
+        .map_err(|error| operation_failure(directory, mode, error.to_string()))?;
+    run_tls_operation(
+        WorkerOperation {
+            address: &args[0],
+            worker: &args[1],
+            request: &request,
+            directory,
+            mode,
+            source_root,
+        },
+        &args[2],
+    )
+}
 
-    let directory = PathBuf::from(&args[4]);
-    let failure = |detail: String| DeliveryFailure {
-        directory: directory.clone(),
-        execution_may_have_run: mode == DeliveryMode::Resume
-            || !matches!(std::fs::symlink_metadata(&directory),
-                Err(error) if error.kind() == io::ErrorKind::NotFound),
-        detail,
+fn run_tls_operation(
+    operation: WorkerOperation<'_>,
+    worker_pin: &str,
+) -> Result<Delivery, DeliveryFailure> {
+    use rabs_asupersync::worker_transport::MAX_JSON_RECORD;
+    use rabsd::coord::secure_worker_delivery::{
+        parse_worker_pin, receive_authenticated_operation, receive_authenticated_source,
     };
-    let (address, pin, request) = (|| -> Result<_, String> {
-        let address: SocketAddr = args[0].parse().map_err(|_| "listen must be a literal IP:port")?;
-        if args[1].is_empty() { return Err("expected worker must not be empty".to_owned()); }
-        let pin = parse_worker_pin(&args[2]).map_err(|error| error.to_string())?;
-        let request = read_request(Path::new(&args[3])).map_err(|error| error.to_string())?;
-        if serde_json::to_vec(&request).map_err(|error| error.to_string())?.len() > MAX_JSON_RECORD {
+
+    let WorkerOperation {
+        address,
+        worker,
+        request,
+        directory,
+        mode,
+        source_root,
+    } = operation;
+    let failure = |detail: String| operation_failure(directory, mode, detail);
+    let (address, pin) = (|| -> Result<_, String> {
+        let address: SocketAddr = address
+            .parse()
+            .map_err(|_| "listen must be a literal IP:port")?;
+        if worker.is_empty() {
+            return Err("expected worker must not be empty".to_owned());
+        }
+        let pin = parse_worker_pin(worker_pin).map_err(|error| error.to_string())?;
+        if serde_json::to_vec(request)
+            .map_err(|error| error.to_string())?
+            .len()
+            > MAX_JSON_RECORD
+        {
             return Err("request exceeds native ATP record limit".to_owned());
         }
-        Ok((address, pin, request))
-    })().map_err(&failure)?;
+        Ok((address, pin))
+    })()
+    .map_err(&failure)?;
     // Local recovery checks the original authenticated SPKI and never falls
     // back to a plaintext receipt. It needs no live listener or new TLS session.
-    if let Some(delivery) = recover_existing_delivery(
-        &request, &args[1], &directory, DeliveryTrust::PinnedWorker(pin),
-    )? {
+    if let Some(delivery) =
+        recover_existing_delivery(request, worker, directory, DeliveryTrust::PinnedWorker(pin))?
+    {
         return Ok(delivery);
     }
-    let upload = capture_source(&request, mode, source_root)
-        .map_err(|error| failure(error.to_string()))?;
+    let upload =
+        capture_source(request, mode, source_root).map_err(|error| failure(error.to_string()))?;
     if !directory.parent().is_some_and(Path::is_dir) {
-        return Err(failure("delivery parent directory does not exist".to_owned()));
+        return Err(failure(
+            "delivery parent directory does not exist".to_owned(),
+        ));
     }
-    let (runtime, peer, admission) = accept_tls_worker(address, &args[1], &args[2], &request["request_id"],
-        if mode == DeliveryMode::Resume {"result-resume"} else {"canonical-exec"}).map_err(failure)?;
+    let (runtime, peer, admission) = accept_tls_worker(
+        address,
+        worker,
+        worker_pin,
+        &request["request_id"],
+        if mode == DeliveryMode::Resume {
+            "result-resume"
+        } else {
+            "canonical-exec"
+        },
+    )
+    .map_err(failure)?;
     match upload.as_ref() {
-        Some(upload) => receive_authenticated_source(
-            &runtime, peer, admission, &request, &directory, upload,
-        ),
-        None => receive_authenticated_operation(
-            &runtime, peer, admission, &request, &directory, mode,
-        ),
+        Some(upload) => {
+            receive_authenticated_source(&runtime, peer, admission, request, directory, upload)
+        }
+        None => {
+            receive_authenticated_operation(&runtime, peer, admission, request, directory, mode)
+        }
     }
 }
 
@@ -463,23 +717,42 @@ fn run_tls_acknowledgment_once(args: &[String]) -> Result<Delivery, DeliveryFail
     use rabsd::coord::secure_worker_delivery::{acknowledge_authenticated, parse_worker_pin};
     let directory = PathBuf::from(&args[4]);
     let failure = |detail: String| DeliveryFailure {
-        directory:directory.clone(), execution_may_have_run:true, detail,
+        directory: directory.clone(),
+        execution_may_have_run: true,
+        detail,
     };
-    let address: SocketAddr = args[0].parse()
+    let address: SocketAddr = args[0]
+        .parse()
         .map_err(|_| failure("listen must be a literal IP:port".to_owned()))?;
     let pin = parse_worker_pin(&args[2]).map_err(|error| failure(error.to_string()))?;
     let request = read_request(Path::new(&args[3])).map_err(|error| failure(error.to_string()))?;
     // Verify the historical SPKI and every byte BEFORE reading credentials or
     // starting the listener. A loopback receipt cannot be upgraded to TLS.
-    let pending = PendingAcknowledgment::verify(&request, &args[1], &directory, DeliveryTrust::PinnedWorker(pin))?;
-    let envelope = json!({"kind":"result-resume", "request_id":request["request_id"], "request":request});
-    if serde_json::to_vec(&envelope).map_err(|error| failure(error.to_string()))?.len()
+    let pending = PendingAcknowledgment::verify(
+        &request,
+        &args[1],
+        &directory,
+        DeliveryTrust::PinnedWorker(pin),
+    )?;
+    let envelope =
+        json!({"kind":"result-resume", "request_id":request["request_id"], "request":request});
+    if serde_json::to_vec(&envelope)
+        .map_err(|error| failure(error.to_string()))?
+        .len()
         > rabs_asupersync::worker_transport::MAX_JSON_RECORD
     {
-        return Err(failure("acknowledgment request exceeds native ATP record limit".to_owned()));
+        return Err(failure(
+            "acknowledgment request exceeds native ATP record limit".to_owned(),
+        ));
     }
-    let (runtime, peer, admission) = accept_tls_worker(address, &args[1], &args[2], &request["request_id"],
-        "result-acknowledgment").map_err(failure)?;
+    let (runtime, peer, admission) = accept_tls_worker(
+        address,
+        &args[1],
+        &args[2],
+        &request["request_id"],
+        "result-acknowledgment",
+    )
+    .map_err(failure)?;
     acknowledge_authenticated(&runtime, peer, admission, pending)
 }
 
@@ -492,11 +765,19 @@ pub fn run_tls(args: &[String]) -> i32 {
         return report_acknowledgment(run_tls_acknowledgment_once(args));
     }
     let Some((args, mode, source_root)) = execution_arguments(args, 5) else {
-        eprintln!("usage: rabsd --worker-exec-tls [--resume | --acknowledge | --source-root <absolute-root>] <IP:port> <expected-worker> <worker-spki-sha256> <request.json> <absolute-delivery-directory>");
+        eprintln!(
+            "usage: rabsd --worker-exec-tls [--resume | --acknowledge | --source-root <absolute-root>] <IP:port> <expected-worker> <worker-spki-sha256> <request.json> <absolute-delivery-directory>"
+        );
         eprintln!("required: RABS_COORD_TLS_CA, RABS_COORD_TLS_CERT, RABS_COORD_TLS_KEY");
-        eprintln!("--resume retrieves the original request into a new directory; it never executes it");
-        eprintln!("--acknowledge requires an existing pinned delivery; it never downloads, executes or downgrades transport");
-        eprintln!("--source-root captures only for new source_manifest requests; only declared regular files are uploaded");
+        eprintln!(
+            "--resume retrieves the original request into a new directory; it never executes it"
+        );
+        eprintln!(
+            "--acknowledge requires an existing pinned delivery; it never downloads, executes or downgrades transport"
+        );
+        eprintln!(
+            "--source-root captures only for new source_manifest requests; only declared regular files are uploaded"
+        );
         return 2;
     };
     report_result(run_tls_once(args, mode, source_root))
@@ -505,72 +786,111 @@ pub fn run_tls(args: &[String]) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn pair_with_mode(budget: Duration, mode: DeliveryMode) -> (TcpPeer,TcpStream) {
-        let listener=TcpListener::bind("127.0.0.1:0").unwrap();
-        let client=TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-        let stream=accept_one(&listener,Duration::from_secs(2)).unwrap();
-        (TcpPeer::new(stream,budget,budget,mode).unwrap(),client)
+    fn pair_with_mode(budget: Duration, mode: DeliveryMode) -> (TcpPeer, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let stream = accept_one(&listener, Duration::from_secs(2)).unwrap();
+        (TcpPeer::new(stream, budget, budget, mode).unwrap(), client)
     }
-    fn pair(budget: Duration) -> (TcpPeer,TcpStream) {
+    fn pair(budget: Duration) -> (TcpPeer, TcpStream) {
         pair_with_mode(budget, DeliveryMode::Execute)
     }
     #[test]
     fn loopback_is_literal_and_never_a_public_fallback() {
-        for good in ["127.0.0.1:7000","[::1]:7000","127.0.0.1:0"] { assert!(loopback_address(good).is_ok()); }
-        for bad in ["0.0.0.0:7000","[::]:7000","192.0.2.1:7000","localhost:7000","example.com:7000"] {
-            assert!(loopback_address(bad).is_err(),"{bad}");
+        for good in ["127.0.0.1:7000", "[::1]:7000", "127.0.0.1:0"] {
+            assert!(loopback_address(good).is_ok());
+        }
+        for bad in [
+            "0.0.0.0:7000",
+            "[::]:7000",
+            "192.0.2.1:7000",
+            "localhost:7000",
+            "example.com:7000",
+        ] {
+            assert!(loopback_address(bad).is_err(), "{bad}");
         }
     }
     #[test]
     fn buffered_tcp_preserves_fragmented_and_coalesced_frames() {
-        let (mut peer,mut client)=pair(Duration::from_secs(2));
-        let writer=std::thread::spawn(move || {
+        let (mut peer, mut client) = pair(Duration::from_secs(2));
+        let writer = std::thread::spawn(move || {
             client.write_all(b"{\"kind\":").unwrap();
             std::thread::sleep(Duration::from_millis(5));
             client.write_all(b"\"one\"}\n{\"kind\":\"two\"}\n").unwrap();
         });
-        assert_eq!(peer.receive().unwrap()["kind"],"one");
-        assert_eq!(peer.receive().unwrap()["kind"],"two");
+        assert_eq!(peer.receive().unwrap()["kind"], "one");
+        assert_eq!(peer.receive().unwrap()["kind"], "two");
         writer.join().unwrap();
     }
     #[test]
     fn truncated_non_utf8_oversized_and_stalled_peers_refuse() {
-        for bytes in [b"{\"x\":".to_vec(),vec![0xff,b'\n'],vec![b'x';MAX_FRAME_BYTES+1]] {
-            let (mut peer,mut client)=pair(Duration::from_secs(2));
-            let writer=std::thread::spawn(move || { let _=client.write_all(&bytes); });
-            assert!(peer.receive().is_err()); writer.join().unwrap();
+        for bytes in [
+            b"{\"x\":".to_vec(),
+            vec![0xff, b'\n'],
+            vec![b'x'; MAX_FRAME_BYTES + 1],
+        ] {
+            let (mut peer, mut client) = pair(Duration::from_secs(2));
+            let writer = std::thread::spawn(move || {
+                let _ = client.write_all(&bytes);
+            });
+            assert!(peer.receive().is_err());
+            writer.join().unwrap();
         }
-        let (mut peer,_client)=pair(Duration::from_millis(20));
-        assert_eq!(peer.receive().unwrap_err().kind(),io::ErrorKind::TimedOut);
+        let (mut peer, _client) = pair(Duration::from_millis(20));
+        assert_eq!(peer.receive().unwrap_err().kind(), io::ErrorKind::TimedOut);
     }
     #[test]
     fn trickling_bytes_cannot_renew_the_absolute_deadline() {
-        let (mut peer,mut client)=pair(Duration::from_millis(30));
-        let writer=std::thread::spawn(move || {
-            for _ in 0..20 { if client.write_all(b" ").is_err() {break;} std::thread::sleep(Duration::from_millis(5)); }
+        let (mut peer, mut client) = pair(Duration::from_millis(30));
+        let writer = std::thread::spawn(move || {
+            for _ in 0..20 {
+                if client.write_all(b" ").is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
         });
-        assert_eq!(peer.receive().unwrap_err().kind(),io::ErrorKind::TimedOut);
-        drop(peer); writer.join().unwrap();
+        assert_eq!(peer.receive().unwrap_err().kind(), io::ErrorKind::TimedOut);
+        drop(peer);
+        writer.join().unwrap();
     }
     #[test]
     fn operator_never_sends_a_second_execution_on_one_connection() {
-        let (mut peer,_client)=pair(Duration::from_secs(2));
-        peer.send(&json!({"kind":"canonical-exec","request_id":1})).unwrap();
-        assert!(peer.send(&json!({"kind":"canonical-exec","request_id":2})).is_err());
-        assert!(peer.send(&json!({"kind":"result-resume","request_id":1})).is_err());
+        let (mut peer, _client) = pair(Duration::from_secs(2));
+        peer.send(&json!({"kind":"canonical-exec","request_id":1}))
+            .unwrap();
+        assert!(
+            peer.send(&json!({"kind":"canonical-exec","request_id":2}))
+                .is_err()
+        );
+        assert!(
+            peer.send(&json!({"kind":"result-resume","request_id":1}))
+                .is_err()
+        );
     }
 
     #[test]
     fn resume_intent_is_explicit_and_cannot_be_duplicated_or_misplaced() {
         let plain: Vec<String> = ["127.0.0.1:0", "worker", "request.json", "/delivery"]
-            .into_iter().map(str::to_owned).collect();
-        assert_eq!(operation_arguments(&plain, 4), Some((plain.as_slice(), DeliveryMode::Execute)));
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(
+            operation_arguments(&plain, 4),
+            Some((plain.as_slice(), DeliveryMode::Execute))
+        );
         let mut leading = vec!["--resume".to_owned()];
         leading.extend(plain.clone());
-        assert_eq!(operation_arguments(&leading, 4), Some((&leading[1..], DeliveryMode::Resume)));
+        assert_eq!(
+            operation_arguments(&leading, 4),
+            Some((&leading[1..], DeliveryMode::Resume))
+        );
         let mut trailing = plain.clone();
         trailing.push("--resume".to_owned());
-        assert_eq!(operation_arguments(&trailing, 4), Some((&trailing[..4], DeliveryMode::Resume)));
+        assert_eq!(
+            operation_arguments(&trailing, 4),
+            Some((&trailing[..4], DeliveryMode::Resume))
+        );
         leading.push("--resume".to_owned());
         assert!(operation_arguments(&leading, 4).is_none());
         let mut misplaced = plain;
@@ -582,30 +902,71 @@ mod tests {
     #[test]
     fn resume_refuses_execution_and_has_one_restoration_transfer_deadline() {
         let (mut peer, _client) = pair_with_mode(Duration::from_secs(2), DeliveryMode::Resume);
-        assert!(peer.send(&json!({"kind":"canonical-exec", "request_id":7})).is_err());
-        peer.send(&json!({"kind":"result-resume", "request_id":7})).unwrap();
+        assert!(
+            peer.send(&json!({"kind":"canonical-exec", "request_id":7}))
+                .is_err()
+        );
+        peer.send(&json!({"kind":"result-resume", "request_id":7}))
+            .unwrap();
         let until = peer.until;
         assert!(until > Instant::now() + Duration::from_secs(60));
-        peer.send(&json!({"kind":"output-read", "request_id":7})).unwrap();
+        peer.send(&json!({"kind":"output-read", "request_id":7}))
+            .unwrap();
         assert_eq!(peer.until, until);
-        assert!(peer.send(&json!({"kind":"result-resume", "request_id":7})).is_err());
-        assert!(peer.send(&json!({"kind":"canonical-exec", "request_id":7})).is_err());
+        assert!(
+            peer.send(&json!({"kind":"result-resume", "request_id":7}))
+                .is_err()
+        );
+        assert!(
+            peer.send(&json!({"kind":"canonical-exec", "request_id":7}))
+                .is_err()
+        );
         assert_eq!(peer.until, until);
     }
 
     #[test]
     fn resume_failures_before_connect_preserve_original_execution_uncertainty() {
         let root = tempfile::tempdir().unwrap();
-        let missing = root.path().join("missing-request.json").to_string_lossy().into_owned();
+        let missing = root
+            .path()
+            .join("missing-request.json")
+            .to_string_lossy()
+            .into_owned();
         let destination = root.path().join("delivery").to_string_lossy().into_owned();
-        let plain = vec!["127.0.0.1:0".to_owned(), "worker".to_owned(), missing.clone(), destination.clone()];
-        let tls = vec!["127.0.0.1:0".to_owned(), "worker".to_owned(), "01".repeat(32), missing, destination];
+        let plain = vec![
+            "127.0.0.1:0".to_owned(),
+            "worker".to_owned(),
+            missing.clone(),
+            destination.clone(),
+        ];
+        let tls = vec![
+            "127.0.0.1:0".to_owned(),
+            "worker".to_owned(),
+            "01".repeat(32),
+            missing,
+            destination,
+        ];
         for mode in [DeliveryMode::Execute, DeliveryMode::Resume] {
-            assert_eq!(run_once(&plain, mode, None).unwrap_err().execution_may_have_run, mode == DeliveryMode::Resume);
-            assert_eq!(run_tls_once(&tls, mode, None).unwrap_err().execution_may_have_run, mode == DeliveryMode::Resume);
+            assert_eq!(
+                run_once(&plain, mode, None)
+                    .unwrap_err()
+                    .execution_may_have_run,
+                mode == DeliveryMode::Resume
+            );
+            assert_eq!(
+                run_tls_once(&tls, mode, None)
+                    .unwrap_err()
+                    .execution_may_have_run,
+                mode == DeliveryMode::Resume
+            );
             let mut invalid_pin = tls.clone();
             invalid_pin[2] = "invalid".to_owned();
-            assert_eq!(run_tls_once(&invalid_pin, mode, None).unwrap_err().execution_may_have_run, mode == DeliveryMode::Resume);
+            assert_eq!(
+                run_tls_once(&invalid_pin, mode, None)
+                    .unwrap_err()
+                    .execution_may_have_run,
+                mode == DeliveryMode::Resume
+            );
         }
         assert!(!root.path().join("delivery").exists());
     }
@@ -616,11 +977,18 @@ mod tests {
         std::fs::write(root.join("lib.rs"), b"pub fn value() -> u32 { 42 }\n").unwrap();
         std::fs::write(root.join("private.key"), b"never selected").unwrap();
         let image = capture_sealed_source(
-            &[("workspace".into(), root.to_path_buf())], false, 2, 200_000,
-        ).unwrap();
+            &[("workspace".into(), root.to_path_buf())],
+            false,
+            2,
+            200_000,
+        )
+        .unwrap();
         let upload = SourceUpload::from_snapshot(
-            std::sync::Arc::new(image), "workspace", &["lib.rs".into()],
-        ).unwrap();
+            std::sync::Arc::new(image),
+            "workspace",
+            &["lib.rs".into()],
+        )
+        .unwrap();
         json!({"kind":"canonical-exec", "request_id":7, "program":"rustc",
             "args":["lib.rs"], "toolchain_backing":"/tc", "source_manifest":upload.wire_manifest()})
     }
@@ -630,24 +998,55 @@ mod tests {
     fn source_root_is_explicit_execution_only_and_preserves_resume_parsing() {
         for count in [4, 5] {
             let plain: Vec<_> = (0..count).map(|index| format!("arg-{index}")).collect();
-            assert_eq!(execution_arguments(&plain, count), Some((plain.as_slice(), DeliveryMode::Execute, None)));
+            assert_eq!(
+                execution_arguments(&plain, count),
+                Some((plain.as_slice(), DeliveryMode::Execute, None))
+            );
             let mut leading = vec!["--source-root".to_owned(), "/source".to_owned()];
             leading.extend(plain.clone());
-            assert_eq!(execution_arguments(&leading, count), Some((&leading[2..], DeliveryMode::Execute, Some(Path::new("/source")))));
+            assert_eq!(
+                execution_arguments(&leading, count),
+                Some((
+                    &leading[2..],
+                    DeliveryMode::Execute,
+                    Some(Path::new("/source"))
+                ))
+            );
             let mut trailing = plain.clone();
             trailing.extend(["--source-root".to_owned(), "/source".to_owned()]);
-            assert_eq!(execution_arguments(&trailing, count), Some((&trailing[..count], DeliveryMode::Execute, Some(Path::new("/source")))));
+            assert_eq!(
+                execution_arguments(&trailing, count),
+                Some((
+                    &trailing[..count],
+                    DeliveryMode::Execute,
+                    Some(Path::new("/source"))
+                ))
+            );
             let mut resume = plain.clone();
             resume.push("--resume".to_owned());
-            assert_eq!(execution_arguments(&resume, count), Some((&resume[..count], DeliveryMode::Resume, None)));
+            assert_eq!(
+                execution_arguments(&resume, count),
+                Some((&resume[..count], DeliveryMode::Resume, None))
+            );
             for invalid in [
                 [leading.clone(), vec!["--resume".to_owned()]].concat(),
                 [vec!["--resume".to_owned()], trailing.clone()].concat(),
-                [leading.clone(), vec!["--source-root".to_owned(), "/other".to_owned()]].concat(),
+                [
+                    leading.clone(),
+                    vec!["--source-root".to_owned(), "/other".to_owned()],
+                ]
+                .concat(),
                 [plain.clone(), vec!["--source-root".to_owned()]].concat(),
-                [vec!["--source-root".to_owned(), "relative".to_owned()], plain.clone()].concat(),
+                [
+                    vec!["--source-root".to_owned(), "relative".to_owned()],
+                    plain.clone(),
+                ]
+                .concat(),
             ] {
-                assert!(execution_arguments(&invalid, count).is_none(), "{invalid:?}");
+                assert!(
+                    execution_arguments(&invalid, count).is_none(),
+                    "{invalid:?}"
+                );
             }
             let mut misplaced = plain;
             misplaced.splice(1..1, ["--source-root".to_owned(), "/source".to_owned()]);
@@ -662,25 +1061,52 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let request = source_request(root.path());
         let original = serde_json::to_vec(&request).unwrap();
-        let captured = capture_source(&request, DeliveryMode::Execute, Some(root.path())).unwrap().unwrap();
+        let captured = capture_source(&request, DeliveryMode::Execute, Some(root.path()))
+            .unwrap()
+            .unwrap();
         assert_eq!(captured.wire_manifest(), request["source_manifest"]);
-        assert_eq!(captured.wire_manifest()["files"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            captured.wire_manifest()["files"].as_array().unwrap().len(),
+            1
+        );
         assert!(capture_source(&request, DeliveryMode::Execute, None).is_err());
         assert!(capture_source(&request, DeliveryMode::Resume, Some(root.path())).is_err());
-        std::fs::set_permissions(root.path().join("lib.rs"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(
+            root.path().join("lib.rs"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
         assert!(capture_source(&request, DeliveryMode::Execute, Some(root.path())).is_err());
-        std::fs::set_permissions(root.path().join("lib.rs"), std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::set_permissions(
+            root.path().join("lib.rs"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
         std::fs::write(root.path().join("lib.rs"), b"different content").unwrap();
         assert!(capture_source(&request, DeliveryMode::Execute, Some(root.path())).is_err());
-        assert_eq!(captured.wire_manifest(), request["source_manifest"], "captured bytes remain immutable");
+        assert_eq!(
+            captured.wire_manifest(),
+            request["source_manifest"],
+            "captured bytes remain immutable"
+        );
         assert_eq!(serde_json::to_vec(&request).unwrap(), original);
         drop(root);
-        assert!(capture_source(&request, DeliveryMode::Resume, None).unwrap().is_none());
+        assert!(
+            capture_source(&request, DeliveryMode::Resume, None)
+                .unwrap()
+                .is_none()
+        );
         let mut backing = request;
         backing.as_object_mut().unwrap().remove("source_manifest");
         backing["workspace_backing"] = json!("/worker/workspace");
-        assert!(capture_source(&backing, DeliveryMode::Execute, None).unwrap().is_none());
-        assert!(capture_source(&backing, DeliveryMode::Execute, Some(Path::new("/unused"))).is_err());
+        assert!(
+            capture_source(&backing, DeliveryMode::Execute, None)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            capture_source(&backing, DeliveryMode::Execute, Some(Path::new("/unused"))).is_err()
+        );
     }
 
     #[cfg(unix)]
@@ -691,17 +1117,27 @@ mod tests {
         let parent = tempfile::tempdir().unwrap();
         let request_path = parent.path().join("request.json");
         std::fs::write(&request_path, serde_json::to_vec(&request).unwrap()).unwrap();
-        std::fs::write(source.path().join("lib.rs"), b"does not match saved request").unwrap();
+        std::fs::write(
+            source.path().join("lib.rs"),
+            b"does not match saved request",
+        )
+        .unwrap();
         // An accidental listen would fail for a different reason. Neither lane
         // may reach it before source intent and the captured image are checked.
         let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
         let destination = parent.path().join("delivery");
-        let plain = vec![occupied.local_addr().unwrap().to_string(), "worker".into(),
-            request_path.to_string_lossy().into_owned(), destination.to_string_lossy().into_owned()];
+        let plain = vec![
+            occupied.local_addr().unwrap().to_string(),
+            "worker".into(),
+            request_path.to_string_lossy().into_owned(),
+            destination.to_string_lossy().into_owned(),
+        ];
         let mut tls = plain.clone();
         tls.insert(2, "01".repeat(32));
         for root in [None, Some(Path::new("relative")), Some(source.path())] {
-            let expected = capture_source(&request, DeliveryMode::Execute, root).unwrap_err().to_string();
+            let expected = capture_source(&request, DeliveryMode::Execute, root)
+                .unwrap_err()
+                .to_string();
             let loopback = run_once(&plain, DeliveryMode::Execute, root).unwrap_err();
             let secure = run_tls_once(&tls, DeliveryMode::Execute, root).unwrap_err();
             assert_eq!(loopback.detail, expected);
@@ -723,7 +1159,8 @@ mod tests {
             assert_eq!(peer.until, until);
         }
         assert!(peer.send(&json!({"kind":"source-begin"})).is_err());
-        peer.send(&json!({"kind":"canonical-exec", "request_id":7})).unwrap();
+        peer.send(&json!({"kind":"canonical-exec", "request_id":7}))
+            .unwrap();
         for kind in ["source-begin", "source-chunk", "source-seal"] {
             assert!(peer.send(&json!({"kind":kind})).is_err());
         }
@@ -731,7 +1168,10 @@ mod tests {
         expired.send(&json!({"kind":"source-begin"})).unwrap();
         expired.until = Instant::now() - Duration::from_secs(1);
         for kind in ["source-chunk", "source-seal", "canonical-exec"] {
-            assert_eq!(expired.send(&json!({"kind":kind})).unwrap_err().kind(), io::ErrorKind::TimedOut);
+            assert_eq!(
+                expired.send(&json!({"kind":kind})).unwrap_err().kind(),
+                io::ErrorKind::TimedOut
+            );
         }
         assert!(!expired.operation_started);
         let (mut resume, _client) = pair_with_mode(Duration::from_secs(2), DeliveryMode::Resume);
@@ -743,23 +1183,34 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn completed_source_delivery_recovers_offline_without_recapture_or_reexecution() {
-        use std::collections::VecDeque;
         use sha2::{Digest, Sha256};
+        use std::collections::VecDeque;
         struct Responses(VecDeque<Value>);
         impl WorkerPeer for Responses {
-            fn send(&mut self, _frame: &Value) -> io::Result<()> { Ok(()) }
+            fn send(&mut self, _frame: &Value) -> io::Result<()> {
+                Ok(())
+            }
             fn receive(&mut self) -> io::Result<Value> {
-                self.0.pop_front().ok_or_else(|| invalid("missing scripted response"))
+                self.0
+                    .pop_front()
+                    .ok_or_else(|| invalid("missing scripted response"))
             }
         }
         let source = tempfile::tempdir().unwrap();
         let request = source_request(source.path());
-        let upload = capture_source(&request, DeliveryMode::Execute, Some(source.path())).unwrap().unwrap();
+        let upload = capture_source(&request, DeliveryMode::Execute, Some(source.path()))
+            .unwrap()
+            .unwrap();
         let digest = &request["source_manifest"]["manifest_sha256"];
-        let empty: String = Sha256::digest([]).iter().map(|byte| format!("{byte:02x}")).collect();
-        let chunk = |stream: &str| json!({"kind":"output-chunk", "request_id":7,
+        let empty: String = Sha256::digest([])
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let chunk = |stream: &str| {
+            json!({"kind":"output-chunk", "request_id":7,
             "stream":stream, "offset":0, "next_offset":0, "total_bytes":0,
-            "sha256":empty, "chunk_sha256":empty, "eof":true, "data_hex":""});
+            "sha256":empty, "chunk_sha256":empty, "eof":true, "data_hex":""})
+        };
         let mut peer = Responses(VecDeque::from([
             json!({"kind":"worker-hello", "worker_id":"worker", "canonical":true, "slots":1,
                 "boot_generation":1, "incarnation":"00000000000000000000000000000001", "request_high_water":null,
@@ -772,15 +1223,20 @@ mod tests {
                 "residual_group_members":0, "stop_reason":null, "output_transfer":"ranges-v1", "output_ack_required":true,
                 "stdout_bytes":0, "stdout_sha256":empty, "stderr_bytes":0, "stderr_sha256":empty,
                 "artifact_ack_required":false, "artifact_manifest":null}),
-            chunk("stdout"), chunk("stderr"),
+            chunk("stdout"),
+            chunk("stderr"),
             json!({"kind":"output-acknowledged", "request_id":7, "already_released":false}),
         ]));
         let parent = tempfile::tempdir().unwrap();
         let destination = parent.path().join("delivery");
         receive_operation(
             &mut SourcePeer::new(&mut peer, &upload, &request).unwrap(),
-            &request, "worker", &destination, DeliveryMode::Execute,
-        ).unwrap();
+            &request,
+            "worker",
+            &destination,
+            DeliveryMode::Execute,
+        )
+        .unwrap();
         assert!(peer.0.is_empty());
         let source_path = source.path().to_path_buf();
         drop(upload);
@@ -788,8 +1244,12 @@ mod tests {
         let request_path = parent.path().join("request.json");
         std::fs::write(&request_path, serde_json::to_vec(&request).unwrap()).unwrap();
         let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
-        let args = vec![occupied.local_addr().unwrap().to_string(), "worker".into(),
-            request_path.to_string_lossy().into_owned(), destination.to_string_lossy().into_owned()];
+        let args = vec![
+            occupied.local_addr().unwrap().to_string(),
+            "worker".into(),
+            request_path.to_string_lossy().into_owned(),
+            destination.to_string_lossy().into_owned(),
+        ];
         for mode in [DeliveryMode::Execute, DeliveryMode::Resume] {
             let delivery = run_once(&args, mode, None).unwrap();
             assert_eq!(delivery.receipt["request_id"], 7);
@@ -798,28 +1258,45 @@ mod tests {
         assert!(run_once(&args, DeliveryMode::Execute, Some(&source_path)).is_ok());
         let mut tls = args.clone();
         tls.insert(2, "01".repeat(32));
-        assert!(run_tls_once(&tls, DeliveryMode::Resume, None).is_err(), "plaintext receipt cannot upgrade to TLS");
+        assert!(
+            run_tls_once(&tls, DeliveryMode::Resume, None).is_err(),
+            "plaintext receipt cannot upgrade to TLS"
+        );
         std::fs::write(destination.join("diagnostics/stdout"), b"corrupted").unwrap();
-        assert!(run_once(&args, DeliveryMode::Execute, Some(&source_path)).unwrap_err().execution_may_have_run);
+        assert!(
+            run_once(&args, DeliveryMode::Execute, Some(&source_path))
+                .unwrap_err()
+                .execution_may_have_run
+        );
     }
 
     #[test]
     fn acknowledgment_intent_is_explicit_exclusive_and_never_an_execution_positional() {
         for count in [4, 5] {
             let args: Vec<_> = (0..count).map(|index| format!("arg-{index}")).collect();
-            let mut leading = vec!["--acknowledge".to_owned()]; leading.extend(args.clone());
-            assert_eq!(acknowledgment_arguments(&leading, count), Some(&leading[1..]));
-            let mut trailing = args.clone(); trailing.push("--acknowledge".into());
-            assert_eq!(acknowledgment_arguments(&trailing, count), Some(&trailing[..count]));
+            let mut leading = vec!["--acknowledge".to_owned()];
+            leading.extend(args.clone());
+            assert_eq!(
+                acknowledgment_arguments(&leading, count),
+                Some(&leading[1..])
+            );
+            let mut trailing = args.clone();
+            trailing.push("--acknowledge".into());
+            assert_eq!(
+                acknowledgment_arguments(&trailing, count),
+                Some(&trailing[..count])
+            );
             assert!(execution_arguments(&leading, count).is_none());
             assert!(execution_arguments(&trailing, count).is_none());
             assert!(acknowledgment_arguments(&args, count).is_none());
             for flag in ["--resume", "--source-root", "--acknowledge"] {
-                let mut wrong = leading.clone(); wrong[2] = flag.into();
+                let mut wrong = leading.clone();
+                wrong[2] = flag.into();
                 assert!(acknowledgment_arguments(&wrong, count).is_none());
                 assert!(execution_arguments(&wrong, count).is_none());
             }
-            let mut misplaced = args; misplaced.insert(2, "--acknowledge".into());
+            let mut misplaced = args;
+            misplaced.insert(2, "--acknowledge".into());
             assert!(acknowledgment_arguments(&misplaced, count).is_none());
             assert!(execution_arguments(&misplaced, count).is_none());
         }
@@ -834,12 +1311,17 @@ mod tests {
             "toolchain_backing":"/tc", "workspace_backing":"/ws"});
         std::fs::write(&request_path, serde_json::to_vec(&request).unwrap()).unwrap();
         let destination = owner.path().join("absent");
-        let args = vec![occupied.local_addr().unwrap().to_string(), "worker".into(),
-            request_path.to_string_lossy().into_owned(), destination.to_string_lossy().into_owned()];
+        let args = vec![
+            occupied.local_addr().unwrap().to_string(),
+            "worker".into(),
+            request_path.to_string_lossy().into_owned(),
+            destination.to_string_lossy().into_owned(),
+        ];
         let failure = run_acknowledgment_once(&args).unwrap_err();
         assert!(failure.execution_may_have_run);
         assert!(failure.detail.contains("existing verified delivery"));
-        let mut tls = args; tls.insert(2, "01".repeat(32));
+        let mut tls = args;
+        tls.insert(2, "01".repeat(32));
         let failure = run_tls_acknowledgment_once(&tls).unwrap_err();
         assert!(failure.execution_may_have_run);
         assert!(failure.detail.contains("existing verified delivery"));
