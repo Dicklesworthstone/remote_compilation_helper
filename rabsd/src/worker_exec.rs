@@ -378,10 +378,23 @@ fn coordinator_tls_files() -> io::Result<rabs_asupersync::worker_transport::TlsF
 /// proof/source preflight is the caller's responsibility and precedes this call.
 fn accept_tls_worker(
     address: SocketAddr, worker: &str, pin: &str, request_id: &Value, operation: &str,
-) -> Result<(asupersync::runtime::Runtime, rabs_asupersync::worker_transport::AuthenticatedPeer), String> {
+) -> Result<(
+    asupersync::runtime::Runtime,
+    rabs_asupersync::worker_transport::AuthenticatedPeer,
+    rabsd::coord::secure_worker_delivery::PinnedWorkerAdmission,
+), String> {
     use asupersync::runtime::RuntimeBuilder;
     use rabs_asupersync::worker_transport::accept_peer;
+    use rabsd::coord::secure_worker_delivery::{PinnedWorkerAdmission, parse_worker_pin};
     let acceptor = coordinator_tls_files().map_err(|error| error.to_string())?.acceptor()?;
+    // A stable worker name owns its persistent pin and boot history. Hold its
+    // exclusive admission capability before listening and through stream close.
+    let state = std::env::var_os("RABS_STATE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(crate::default_under_home(".cache/rch/rabs-state")));
+    let admission = PinnedWorkerAdmission::open(
+        &state, worker, parse_worker_pin(pin).map_err(|error| error.to_string())?,
+    ).map_err(|error| error.to_string())?;
     let runtime = RuntimeBuilder::current_thread().build()
         .map_err(|error| format!("worker delivery runtime: {error:?}"))?;
     let peer = runtime.block_on(async {
@@ -397,7 +410,7 @@ fn accept_tls_worker(
             .map_err(|error| format!("worker TLS accept: {error}"))?;
         accept_peer(&acceptor, stream).await
     })?;
-    Ok((runtime, peer))
+    Ok((runtime, peer, admission))
 }
 
 fn run_tls_once(args: &[String], mode: DeliveryMode, source_root: Option<&Path>) -> Result<Delivery, DeliveryFailure> {
@@ -434,14 +447,14 @@ fn run_tls_once(args: &[String], mode: DeliveryMode, source_root: Option<&Path>)
     if !directory.parent().is_some_and(Path::is_dir) {
         return Err(failure("delivery parent directory does not exist".to_owned()));
     }
-    let (runtime, peer) = accept_tls_worker(address, &args[1], &args[2], &request["request_id"],
+    let (runtime, peer, admission) = accept_tls_worker(address, &args[1], &args[2], &request["request_id"],
         if mode == DeliveryMode::Resume {"result-resume"} else {"canonical-exec"}).map_err(failure)?;
     match upload.as_ref() {
         Some(upload) => receive_authenticated_source(
-            &runtime, peer, pin, &args[1], &request, &directory, upload,
+            &runtime, peer, admission, &request, &directory, upload,
         ),
         None => receive_authenticated_operation(
-            &runtime, peer, pin, &args[1], &request, &directory, mode,
+            &runtime, peer, admission, &request, &directory, mode,
         ),
     }
 }
@@ -465,9 +478,9 @@ fn run_tls_acknowledgment_once(args: &[String]) -> Result<Delivery, DeliveryFail
     {
         return Err(failure("acknowledgment request exceeds native ATP record limit".to_owned()));
     }
-    let (runtime, peer) = accept_tls_worker(address, &args[1], &args[2], &request["request_id"],
+    let (runtime, peer, admission) = accept_tls_worker(address, &args[1], &args[2], &request["request_id"],
         "result-acknowledgment").map_err(failure)?;
-    acknowledge_authenticated(&runtime, peer, pin, pending)
+    acknowledge_authenticated(&runtime, peer, admission, pending)
 }
 
 /// One explicitly pinned worker, authenticated transport, and one exact command.

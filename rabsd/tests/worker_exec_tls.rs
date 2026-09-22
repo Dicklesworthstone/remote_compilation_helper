@@ -94,6 +94,7 @@ impl Receiver {
         let mut command = Command::new(env!("CARGO_BIN_EXE_rabsd"));
         command.args(["--worker-exec-tls", "127.0.0.1:0", "worker", pin])
             .arg(&request_path).arg(destination)
+            .env("RABS_STATE_DIR", root.join("state"))
             .env_remove("RABS_COORD_TLS_CA").env_remove("RABS_COORD_TLS_CERT").env_remove("RABS_COORD_TLS_KEY")
             .stdout(Stdio::from(File::create(&stdout).unwrap()))
             .stderr(Stdio::from(File::create(&stderr).unwrap()));
@@ -185,7 +186,12 @@ async fn authenticate(stream: &mut SecureWorkerStream, pin: &str) -> u64 {
 }
 async fn authenticate_mode(stream: &mut SecureWorkerStream, pin: &str, resume: bool) -> u64 {
     let hello = if resume { recovery_hello(pin) } else { hello(pin) };
-    send(stream, &hello).await.unwrap();
+    authenticate_offer(stream, pin, &hello, resume).await
+}
+async fn authenticate_offer(
+    stream: &mut SecureWorkerStream, pin: &str, hello: &Value, resume: bool,
+) -> u64 {
+    send(stream, hello).await.unwrap();
     let challenge = receive(stream).await.unwrap();
     assert_eq!(challenge["kind"], "session-challenge");
     assert_eq!(challenge["capability"], 3);
@@ -793,5 +799,105 @@ fn actual_tls_acknowledgment_preflight_preserves_local_evidence_without_downgrad
         assert_eq!(receiver.failure()["execution_may_have_run"], true);
         assert_eq!(receiver.failure()["reexecute"], false);
         assert_eq!(local_bytes_and_inodes(&destination), before);
+    }
+}
+
+#[test]
+fn actual_tls_receiver_persists_boot_high_water_and_rejects_pin_reset() {
+    let certificates = Certificates::new();
+    let pin = certificates.pin();
+    let root = tempfile::tempdir().unwrap();
+    let runtime = RuntimeBuilder::current_thread().build().unwrap();
+
+    for (generation, admitted) in [(5_u64, true), (4, false), (6, true)] {
+        let destination = root.path().join(format!("generation-{generation}"));
+        let mut receiver = Receiver::spawn(root.path(), &pin, Some(&certificates.server), &destination);
+        let address = receiver.listening();
+        runtime.block_on(async {
+            asupersync::time::timeout(asupersync::time::wall_now(), Duration::from_secs(15), async {
+                let mut peer = connect_peer(&address, "localhost", &certificates.worker).await.unwrap();
+                let mut offered = hello(&pin);
+                offered["boot_generation"] = json!(generation);
+                offered["incarnation"] = json!(format!("{generation:032x}"));
+                if admitted {
+                    let session = authenticate_offer(&mut peer.stream, &pin, &offered, false).await;
+                    deliver(&mut peer.stream, &destination, &pin, session, false).await;
+                } else {
+                    send(&mut peer.stream, &offered).await.unwrap();
+                    let challenge = receive(&mut peer.stream).await.unwrap();
+                    assert_eq!(challenge["kind"], "session-challenge");
+                    send(&mut peer.stream, &json!({"kind":"worker-auth", "peer_id":pin,
+                        "session_id":challenge["session_id"], "operation_id":challenge["operation_id"],
+                        "token_id":challenge["token_id"]})).await.unwrap();
+                    assert!(receive(&mut peer.stream).await.is_err(), "stale worker received a session grant");
+                }
+            }).await.expect("persistent worker admission timed out");
+        });
+        assert_eq!(receiver.wait().success(), admitted, "{}", receiver.logs());
+        if admitted {
+            let receipt: Value = serde_json::from_slice(&fs::read(destination.join("delivery.json")).unwrap()).unwrap();
+            assert_eq!(receipt["boot_generation"], generation);
+        } else {
+            assert!(receiver.logs().contains("RejectStaleBootGeneration"));
+            assert_eq!(receiver.failure()["execution_may_have_run"], false);
+            assert!(!destination.join("delivery.json").exists());
+        }
+    }
+
+    let changed_pin = if pin == "01".repeat(32) { "02".repeat(32) } else { "01".repeat(32) };
+    let destination = root.path().join("changed-pin");
+    let mut receiver = Receiver::spawn(root.path(), &changed_pin, Some(&certificates.server), &destination);
+    assert!(!receiver.wait().success());
+    assert!(!receiver.logs().contains("worker-exec-listening"));
+    assert!(receiver.logs().contains("already bound to another SPKI pin"));
+    assert_eq!(receiver.failure()["execution_may_have_run"], false);
+    assert!(!destination.exists());
+}
+
+#[test]
+fn killed_tls_receiver_preserves_incarnation_and_clone_refusal_across_restart() {
+    let certificates = Certificates::new();
+    let pin = certificates.pin();
+    let root = tempfile::tempdir().unwrap();
+    let runtime = RuntimeBuilder::current_thread().build().unwrap();
+
+    let destination = root.path().join("interrupted");
+    {
+        let mut receiver = Receiver::spawn(root.path(), &pin, Some(&certificates.server), &destination);
+        let address = receiver.listening();
+        runtime.block_on(async {
+            asupersync::time::timeout(asupersync::time::wall_now(), Duration::from_secs(15), async {
+                let mut peer = connect_peer(&address, "localhost", &certificates.worker).await.unwrap();
+                authenticate(&mut peer.stream, &pin).await;
+                receiver.child.kill().unwrap();
+                assert!(!receiver.wait().success());
+            }).await.expect("interrupted worker admission timed out");
+        });
+    }
+    assert!(!destination.join("delivery.json").exists());
+
+    for (generation, incarnation) in [(1_u64, 2_u128), (2, 3)] {
+        let destination = root.path().join(format!("clone-{incarnation}"));
+        let mut receiver = Receiver::spawn(root.path(), &pin, Some(&certificates.server), &destination);
+        let address = receiver.listening();
+        runtime.block_on(async {
+            asupersync::time::timeout(asupersync::time::wall_now(), Duration::from_secs(15), async {
+                let mut peer = connect_peer(&address, "localhost", &certificates.worker).await.unwrap();
+                let mut offered = hello(&pin);
+                offered["boot_generation"] = json!(generation);
+                offered["incarnation"] = json!(format!("{incarnation:032x}"));
+                send(&mut peer.stream, &offered).await.unwrap();
+                let challenge = receive(&mut peer.stream).await.unwrap();
+                assert_eq!(challenge["kind"], "session-challenge");
+                send(&mut peer.stream, &json!({"kind":"worker-auth", "peer_id":pin,
+                    "session_id":challenge["session_id"], "operation_id":challenge["operation_id"],
+                    "token_id":challenge["token_id"]})).await.unwrap();
+                assert!(receive(&mut peer.stream).await.is_err(), "ambiguous worker received a session grant");
+            }).await.expect("persistent clone refusal timed out");
+        });
+        assert!(!receiver.wait().success(), "{}", receiver.logs());
+        assert!(receiver.logs().contains("RejectCloneAmbiguity"));
+        assert_eq!(receiver.failure()["execution_may_have_run"], false);
+        assert!(!destination.join("delivery.json").exists());
     }
 }

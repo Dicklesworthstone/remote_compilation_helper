@@ -78,8 +78,9 @@ this invocation without dispatch rather than starting an unbounded accept loop.
 
 Admission checks the configured SPKI against the public key TLS authenticated,
 then checks the hello's peer claim and versions through `CoordinatorSession`.
-The worker answers a fresh session/operation/token challenge before receiving
-the grant. The existing S5 `canonical-probes:<peer-id>` label is retained for
+The worker answers a fresh session/operation/token challenge, then passes durable
+boot-generation/incarnation admission before receiving the grant or uploading
+source. The existing S5 `canonical-probes:<peer-id>` label is retained for
 handshake compatibility, but the delivery adapter additionally permits only the
 complete operator-selected execution or recovery request, exactly once. Unknown
 operations, publication attempts and a changed request cannot pass that adapter.
@@ -92,9 +93,25 @@ An authenticated receipt records `transport_authenticated:true`, the
 release ACKs. These fields come from the adapter, not worker-supplied JSON.
 Authentication establishes the sender, not correctness or determinism of its
 execution; all byte and manifest checks still apply. Identity generation 1 here
-describes the explicit per-invocation pin enrollment. This command does not
-implement a persistent fleet enrollment history, key-rotation/revocation service,
-cross-host clone fencing, scheduling, or authoritative action-cache admission.
+describes the pinned key's worker role; key rotation is not implemented.
+
+The operator persists each stable worker name's authenticated SPKI binding and
+boot-generation/incarnation history beneath `$RABS_STATE_DIR/worker-admission`
+(default `~/.cache/rch/rabs-state/worker-admission`). It reuses the coordinator's
+exclusive store lock and durable S022 fence. Concurrent receivers for the same
+worker name refuse; separate workers remain independent. A first failed TLS or
+challenge exchange does not establish a key binding. Once authenticated, changing
+the pin under the same name refuses before listening rather than creating fresh
+boot history. Treat worker names and state roots as durable configuration; renaming
+a worker or discarding its state is not an outcome-recovery operation.
+
+Lower boot generations refuse across receiver restarts. Conflicting active
+incarnations at the same generation persist a clone-ambiguity refusal; neither
+contender can clear it by incrementing its boot number or supplying a JSON
+re-enrollment claim. Clean completion releases the exact session while retaining
+high-water history. A killed receiver leaves its session conservatively open.
+This command does not provide a key-rotation/re-enrollment service, cross-host
+clone adjudication, scheduling, or authoritative action-cache admission.
 
 TLS mode has separate absolute network budgets: 60 seconds for accepting the
 connection, the native transport's five-second TLS handshake limit, 10 seconds

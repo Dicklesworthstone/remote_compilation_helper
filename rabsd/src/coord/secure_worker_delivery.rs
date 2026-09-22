@@ -5,8 +5,9 @@
 //! expectation is checked against TLS evidence, never learned from a hello.
 //! One exact operation may be sent, once, after admission. Explicit result
 //! recovery retrieves sealed bytes; it cannot dispatch or retry execution.
-//! This is not a fleet scheduler, durable enrollment service, cache publication,
-//! or automatic reconnect loop.
+//! Pinned identities and worker boot/incarnation fences persist across operator
+//! processes. This is not a fleet scheduler, cache publication, key-rotation
+//! service, or automatic reconnect loop.
 //!
 //! The synchronous entry point runs on a dedicated operator thread. It drives
 //! native async I/O with a current-thread Runtime and performs filesystem work
@@ -30,7 +31,12 @@ use serde_json::{Value, json};
 use std::fs::File;
 use std::io::{self, Read};
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+mod admission;
+pub use admission::PinnedWorkerAdmission;
+use admission::AdmittedWorkerSession;
 
 const ADMISSION_BUDGET: Duration = Duration::from_secs(10);
 const TRANSFER_BUDGET: Duration = Duration::from_secs(5 * 60);
@@ -119,6 +125,8 @@ fn challenge_ids() -> io::Result<[u64; 3]> {
 /// The adapter's identity evidence is supplied only by accept_peer. Tests inject
 /// a trusted transport boundary; no deserializer can construct it from a frame.
 struct AdmittedPeer<P> {
+    session: Option<AdmittedWorkerSession>,
+    admission: Arc<PinnedWorkerAdmission>,
     inner: P,
     identity: TransportIdentity,
     identities: IdentityStore,
@@ -140,6 +148,7 @@ impl<P: WorkerPeer> AdmittedPeer<P> {
         request: &Value,
         ids: [u64; 3],
         mode: DeliveryMode,
+        admission: Arc<PinnedWorkerAdmission>,
     ) -> io::Result<Self> {
         validate_request(request)?;
         let expected_operation = mode.frame(request);
@@ -148,20 +157,26 @@ impl<P: WorkerPeer> AdmittedPeer<P> {
             "operation exceeds ATP limit",
         )?;
         require(
-            expected != [0; 32] && identity.peer_id == expected && identity.fingerprint == expected,
+            expected != [0; 32]
+                && identity.peer_id == expected
+                && identity.fingerprint == expected
+                && admission.pin() == expected,
             "authenticated worker key does not match configured SPKI pin",
         )?;
         require(
             ids.iter().all(|id| *id != 0),
             "invalid session challenge identities",
         )?;
-        // Explicit per-invocation enrollment. Do not populate this store from the
-        // key the peer just presented; the operator's expectation is its root.
+        // The persistent admission capability already checked the pinned key
+        // against this worker name's history. Reconstruct its immutable role
+        // binding; neither the TLS peer nor its hello can select another key.
         let mut identities = IdentityStore::default();
         identities
             .create(expected, expected, TrustScope::Worker, 1)
             .map_err(|error| invalid(format!("worker identity admission: {error:?}")))?;
         Ok(Self {
+            session: None,
+            admission,
             inner,
             identity,
             identities,
@@ -309,6 +324,7 @@ impl<P: WorkerPeer> WorkerPeer for AdmittedPeer<P> {
                 && response["token_id"].as_u64() == Some(token_id),
             "worker challenge response mismatch",
         )?;
+        self.session = Some(self.admission.admit(&self.identity, hello)?);
         grant["session_id"] = json!(session_id);
         grant["transport"] = json!(admitted.grant().transport_version);
         grant["application"] = json!(admitted.grant().application_version);
@@ -599,16 +615,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin> WorkerPeer for RecordPeer<'_, S> {
 pub fn receive_authenticated(
     runtime: &Runtime,
     peer: AuthenticatedPeer,
-    expected_spki: [u8; 32],
-    expected_worker: &str,
+    admission: PinnedWorkerAdmission,
     request: &Value,
     destination: &Path,
 ) -> Result<Delivery, DeliveryFailure> {
     receive_authenticated_operation(
         runtime,
         peer,
-        expected_spki,
-        expected_worker,
+        admission,
         request,
         destination,
         DeliveryMode::Execute,
@@ -624,8 +638,7 @@ pub fn receive_authenticated(
 pub fn receive_authenticated_operation(
     runtime: &Runtime,
     peer: AuthenticatedPeer,
-    expected_spki: [u8; 32],
-    expected_worker: &str,
+    admission: PinnedWorkerAdmission,
     request: &Value,
     destination: &Path,
     mode: DeliveryMode,
@@ -640,17 +653,22 @@ pub fn receive_authenticated_operation(
             "authenticated delivery requires an operator thread, not nested block_on",
         )));
     }
+    // Keep this private owner alive until the admitted peer and its transport
+    // have both dropped. No caller can clone the consumed admission capability.
+    let admission = Arc::new(admission);
+    let expected_worker = admission.worker().to_owned();
     let raw = RecordPeer::new(runtime, peer.stream, request);
     let mut admitted = AdmittedPeer::new(
         raw,
         peer.identity,
-        expected_spki,
+        admission.pin(),
         request,
         challenge_ids().map_err(&failure)?,
         mode,
+        Arc::clone(&admission),
     )
     .map_err(failure)?;
-    receive_operation(&mut admitted, request, expected_worker, destination, mode)
+    receive_operation(&mut admitted, request, &expected_worker, destination, mode)
 }
 
 /// Reconcile a previously verified local delivery through the same native TLS
@@ -660,7 +678,7 @@ pub fn receive_authenticated_operation(
 pub fn acknowledge_authenticated(
     runtime: &Runtime,
     peer: AuthenticatedPeer,
-    expected_spki: [u8; 32],
+    admission: PinnedWorkerAdmission,
     pending: PendingAcknowledgment,
 ) -> Result<Delivery, DeliveryFailure> {
     let directory = pending.directory().to_path_buf();
@@ -670,10 +688,12 @@ pub fn acknowledge_authenticated(
     if asupersync::cx::Cx::current().is_some() {
         return Err(failure(invalid("authenticated acknowledgment requires an operator thread")));
     }
+    let admission = Arc::new(admission);
     let raw = RecordPeer::new(runtime, peer.stream, pending.request());
     let mut admitted = AdmittedPeer::new(
-        raw, peer.identity, expected_spki, pending.request(),
+        raw, peer.identity, admission.pin(), pending.request(),
         challenge_ids().map_err(&failure)?, DeliveryMode::Resume,
+        Arc::clone(&admission),
     ).map_err(failure)?;
     pending.acknowledge(&mut admitted)
 }
@@ -685,8 +705,7 @@ pub fn acknowledge_authenticated(
 pub fn receive_authenticated_source(
     runtime: &Runtime,
     peer: AuthenticatedPeer,
-    expected_spki: [u8; 32],
-    expected_worker: &str,
+    admission: PinnedWorkerAdmission,
     request: &Value,
     destination: &Path,
     upload: &SourceUpload,
@@ -702,19 +721,22 @@ pub fn receive_authenticated_source(
         )));
     }
     upload.validate_request(request).map_err(&failure)?;
+    let admission = Arc::new(admission);
+    let expected_worker = admission.worker().to_owned();
     let raw = RecordPeer::new(runtime, peer.stream, request);
     let mut admitted = AdmittedPeer::new(
         raw,
         peer.identity,
-        expected_spki,
+        admission.pin(),
         request,
         challenge_ids().map_err(&failure)?,
         DeliveryMode::Execute,
+        Arc::clone(&admission),
     )
     .and_then(|admitted| admitted.with_source(upload))
     .map_err(failure)?;
     receive_operation(
-        &mut admitted, request, expected_worker, destination, DeliveryMode::Execute,
+        &mut admitted, request, &expected_worker, destination, DeliveryMode::Execute,
     )
 }
 
@@ -725,6 +747,7 @@ mod tests {
 
     #[derive(Default)]
     struct Script {
+        state: Option<tempfile::TempDir>,
         replies: VecDeque<Value>,
         sent: Vec<Value>,
         fail_execution: bool,
@@ -753,7 +776,8 @@ mod tests {
             "toolchain_backing":"/tc", "workspace_backing":"/ws", "artifacts":{"unit":"dep","files":["a"]}})
     }
     fn hello() -> Value {
-        json!({"kind":"worker-hello", "peer_id":hex(&[1; 32]), "canonical":true, "slots":4,
+        json!({"kind":"worker-hello", "worker_id":"worker", "peer_id":hex(&[1; 32]), "canonical":true, "slots":4,
+            "boot_generation":1, "incarnation":"00000000000000000000000000000001",
             "transport":{"minimum_compatible":1,"current":1},
             "application":{"minimum_compatible":1,"current":1}})
     }
@@ -764,11 +788,18 @@ mod tests {
         json!({"kind":"session-ok", "output_transfer":"ranges-v1",
             "artifact_transfer":"files-v1", "recovery_protocol":"request-journal-v1"})
     }
+    fn with_admission(mut script: Script) -> (Script, Arc<PinnedWorkerAdmission>) {
+        let root = script.state.take().unwrap_or_else(|| tempfile::tempdir().unwrap());
+        let admission = Arc::new(PinnedWorkerAdmission::open(root.path(), "worker", [1; 32]).unwrap());
+        script.state = Some(root);
+        (script, admission)
+    }
     fn peer_with_mode(hello: Value, response: Value, mode: DeliveryMode) -> AdmittedPeer<Script> {
         let inner = Script {
             replies: VecDeque::from([hello, response]),
             ..Script::default()
         };
+        let (inner, admission) = with_admission(inner);
         AdmittedPeer::new(
             inner,
             TransportIdentity {
@@ -779,6 +810,7 @@ mod tests {
             &request(),
             [10, 20, 30],
             mode,
+            admission,
         )
         .unwrap()
     }
@@ -807,14 +839,16 @@ mod tests {
                 fingerprint: [2; 32],
             },
         ] {
+            let (inner, admission) = with_admission(Script::default());
             assert!(
                 AdmittedPeer::new(
-                    Script::default(),
+                    inner,
                     identity,
                     [1; 32],
                     &request(),
                     [10, 20, 30],
                     DeliveryMode::Execute,
+                    admission,
                 )
                 .is_err()
             );
@@ -1005,10 +1039,11 @@ mod tests {
             ]),
             ..Script::default()
         };
+        let (inner, admission) = with_admission(inner);
         let peer = AdmittedPeer::new(
             inner,
             TransportIdentity { peer_id: [1; 32], fingerprint: [1; 32] },
-            [1; 32], &request, [10, 20, 30], DeliveryMode::Resume,
+            [1; 32], &request, [10, 20, 30], DeliveryMode::Resume, admission,
         ).unwrap();
         (peer, request)
     }
@@ -1095,10 +1130,11 @@ mod tests {
 
     #[cfg(unix)]
     fn source_admission(script: Script, request: &Value) -> AdmittedPeer<Script> {
+        let (script, admission) = with_admission(script);
         AdmittedPeer::new(
             script,
             TransportIdentity { peer_id: [1; 32], fingerprint: [1; 32] },
-            [1; 32], request, [10, 20, 30], DeliveryMode::Execute,
+            [1; 32], request, [10, 20, 30], DeliveryMode::Execute, admission,
         ).unwrap()
     }
 
@@ -1161,6 +1197,25 @@ mod tests {
             assert!(peer.inner.sent.iter().all(|frame| frame["kind"] == "session-challenge"));
             assert!(peer.negotiate(&hello, &grant()).is_err());
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn durable_refusal_prevents_grant_source_upload_and_execution() {
+        let source = tempfile::tempdir().unwrap();
+        let (upload, request, script, _) = source_fixture(source.path());
+        let mut peer = source_admission(script, &request).with_source(&upload).unwrap();
+        let mut newer = recovery_hello();
+        newer["boot_generation"] = json!(4);
+        newer["incarnation"] = json!("00000000000000000000000000000004");
+        drop(peer.admission.admit(&peer.identity, &newer).unwrap());
+        let offered = peer.receive().unwrap();
+        let error = peer.negotiate(&offered, &grant()).unwrap_err();
+        assert!(error.to_string().contains("RejectStaleBootGeneration"));
+        assert!(peer.authentication().is_none());
+        assert!(peer.send(&request).is_err());
+        assert_eq!(peer.inner.sent.len(), 1);
+        assert_eq!(peer.inner.sent[0]["kind"], "session-challenge");
     }
 
     #[cfg(unix)]
