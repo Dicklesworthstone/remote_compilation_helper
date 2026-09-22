@@ -70,6 +70,13 @@ pub fn parse_manifest(value: &Value) -> Result<SourceManifest, String> {
 }
 
 pub fn request_manifest(request: &Value) -> Result<Option<SourceManifest>, String> {
+    // These fields name local preparation intent, not executable source. Check
+    // their PRESENCE before the worker-local fast path as well as uploaded input.
+    // Ignoring them could admit a different workspace than the caller selected.
+    // Never echo their host paths or values into protocol diagnostics.
+    if request.get("source_files").is_some() || request.get("source_roots").is_some() {
+        return Err(invalid("unprepared source_files/source_roots; use --worker-prepare before execution"));
+    }
     match request.get("source_manifest") {
         None => Ok(None),
         Some(value) => {
@@ -310,7 +317,7 @@ impl SourceTransferState {
     /// same session owner. Keeping this separate prevents an admission refusal
     /// from accidentally losing the already-verified input snapshot.
     pub fn take_prepared(&mut self, request: &Value) -> io::Result<Option<SourceOwner>> {
-        if request.get("source_manifest").is_none() { return Ok(None); }
+        if request_manifest(request).map_err(io::Error::other)?.is_none() { return Ok(None); }
         self.prepared_path(request, true).map_err(io::Error::other)?;
         Ok(self.pending.take())
     }
@@ -748,5 +755,74 @@ mod tests {
             let cached = cache.path().join("source-files-v1").join(format!("{}.src", hex(&Sha256::digest(b"good"))));
             assert_eq!(std::fs::read(cached).unwrap(), b"good", "a bad stage never reseeds the cache");
         }
+    }
+
+    #[test]
+    fn unprepared_source_fields_refuse_before_worker_local_or_uploaded_admission() {
+        for field in ["source_files", "source_roots"] {
+            for value in [Value::Null, json!([]), json!({"host":"private-local-marker"})] {
+                for uploaded in [false, true] {
+                    let mut request = json!({"kind":"canonical-exec", "request_id":7});
+                    if uploaded { request["source_manifest"] = manifest(); }
+                    else { request["workspace_backing"] = json!("/worker/workspace"); }
+                    request[field] = value.clone();
+                    let before = request.clone();
+                    let error = request_manifest(&request).unwrap_err();
+                    assert!(error.contains("--worker-prepare"));
+                    assert!(!error.contains("private-local-marker"));
+                    let mut state = SourceTransferState::default();
+                    for enabled in [false, true] {
+                        assert!(state.prepared_path(&request, enabled).is_err());
+                    }
+                    assert!(state.take_prepared(&request).is_err());
+                    assert!(state.pending.is_none());
+                    assert_eq!(request, before);
+                }
+            }
+        }
+        let request = json!({"kind":"canonical-exec", "request_id":7, "workspace_backing":"/worker/workspace"});
+        assert!(request_manifest(&request).unwrap().is_none());
+        assert!(SourceTransferState::default().take_prepared(&request).unwrap().is_none());
+    }
+
+    #[test]
+    fn rejected_preparation_cannot_consume_an_existing_sealed_source_owner() {
+        let (mut state, request, _, seal) = uploaded();
+        state.handle(&seal, true, false).unwrap();
+        let path = state.prepared_path(&request, true).unwrap();
+        for field in ["source_files", "source_roots"] {
+            let mut bad = request.clone();
+            bad[field] = Value::Null;
+            assert!(state.prepared_path(&bad, true).is_err());
+            assert!(state.take_prepared(&bad).is_err());
+            assert!(state.pending.is_some());
+            assert_eq!(state.prepared_path(&request, true).unwrap(), path);
+        }
+        let owner = state.take_prepared(&request).unwrap().unwrap();
+        assert_eq!(std::fs::read(owner.receiver.sealed_root().unwrap().join("src/lib.rs")).unwrap(), b"source\0\xff");
+        assert!(state.pending.is_none());
+    }
+
+    #[test]
+    fn multi_repository_projection_uses_the_same_seal_and_read_only_owner() {
+        let files: [(&str, &[u8], bool); 2] = [
+            ("app/Cargo.toml", b"[dependencies]\ndep={path=\"../dep\"}\n", false),
+            ("dep/src/lib.rs", b"pub fn answer() -> u32 { 42 }\n", false),
+        ];
+        let manifest = projection(&files);
+        let request = json!({"kind":"canonical-exec", "request_id":17, "source_manifest":manifest});
+        let mut state = SourceTransferState::default();
+        state.handle(&json!({"kind":"source-begin", "request_id":17, "manifest":manifest}), true, false).unwrap();
+        for (path, bytes, _) in files { upload(&mut state, &manifest, 17, path, bytes); }
+        assert!(state.prepared_path(&request, true).is_err());
+        state.handle(&seal(&manifest, 17), true, false).unwrap();
+        let owner = state.take_prepared(&request).unwrap().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        let mut spec = namespace_for_source(&owner, runtime.path());
+        owner.protect_workspace(17, &mut spec).unwrap();
+        let root = owner.receiver.sealed_root().unwrap();
+        for (path, bytes, _) in files { assert_eq!(std::fs::read(root.join(path)).unwrap(), bytes); }
+        assert!(spec.rw_binds.iter().all(|bind| bind.visible != std::path::Path::new(rabs_sandbox::layout::WORKSPACE)));
+        assert_eq!(request["source_manifest"], manifest);
     }
 }
