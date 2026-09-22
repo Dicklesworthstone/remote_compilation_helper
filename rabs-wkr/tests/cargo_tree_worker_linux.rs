@@ -9,6 +9,9 @@
 //! Missing isolation fails this gate; it never becomes a passing skip.
 #![cfg(target_os = "linux")]
 
+#[path = "cargo_tree_worker_linux/registry_tests.rs"]
+mod registry_tests;
+
 use rabs_sandbox::artifact_tree::{MAX_TREE_FILES, TREE_FILES_VERSION, validate_tree_names};
 use rabs_sandbox::source_transfer::{SourceFile, SourceManifest};
 use rabs_wkr::session::sha256_hex;
@@ -176,19 +179,22 @@ fn source_files() -> BTreeMap<String, Vec<u8>> {
     ].into_iter().map(|(path, bytes)| (path.to_owned(), bytes.as_bytes().to_vec())).collect()
 }
 
-fn upload(peer: &mut Peer, files: &BTreeMap<String, Vec<u8>>) -> Value {
+fn upload(peer: &mut Peer, files: &BTreeMap<String, Vec<u8>>, cargo_home: Option<&Value>) -> Value {
     let manifest = SourceManifest::new(files.iter().map(|(path, bytes)| SourceFile {
         path:path.clone(), len:bytes.len() as u64, sha256:Sha256::digest(bytes).into(), executable:false,
     }).collect()).unwrap();
     let value = json!({"manifest_sha256":hex(&manifest.digest()),
         "files":manifest.files().iter().map(|file| json!({"path":file.path,
             "bytes":file.len, "sha256":hex(&file.sha256), "executable":file.executable})).collect::<Vec<_>>()});
-    peer.send(&json!({"kind":"source-begin", "request_id":REQUEST_ID, "manifest":value}));
+    let mut begin = json!({"kind":"source-begin", "request_id":REQUEST_ID, "manifest":value});
+    if let Some(home) = cargo_home { begin["cargo_home"] = home.clone(); }
+    peer.send(&begin);
     let ready = peer.receive();
     assert_eq!(ready["kind"], "source-ready", "{ready}");
     assert_eq!(ready["sealed"], false);
     assert_eq!(ready["request_id"], REQUEST_ID);
     assert_eq!(ready["manifest_sha256"], value["manifest_sha256"]);
+    assert_eq!(ready.get("cargo_home"), cargo_home);
     for (path, bytes) in files {
         peer.send(&json!({"kind":"source-chunk", "request_id":REQUEST_ID,
             "manifest_sha256":value["manifest_sha256"], "path":path, "offset":0,
@@ -206,6 +212,7 @@ fn upload(peer: &mut Peer, files: &BTreeMap<String, Vec<u8>>) -> Value {
     assert_eq!(ready["sealed"], true);
     assert_eq!(ready["request_id"], REQUEST_ID);
     assert_eq!(ready["manifest_sha256"], value["manifest_sha256"]);
+    assert_eq!(ready.get("cargo_home"), cargo_home);
     value
 }
 
@@ -286,7 +293,7 @@ fn real_cargo_tree_survives_worker_restart_and_downloaded_binary_uses_uploaded_d
     let mut peer = Peer::accept(&listener, &mut worker);
     let hello = peer.admit(true);
     let mut files = source_files();
-    let source = upload(&mut peer, &files);
+    let source = upload(&mut peer, &files, None);
     // A later client-side edit must not change already-sealed execution inputs.
     files.insert("dep/src/lib.rs".into(), b"pub fn answer() -> u32 { 99 }\n".to_vec());
     let request = json!({"kind":"canonical-exec", "request_id":REQUEST_ID, "timeout_ms":60000,

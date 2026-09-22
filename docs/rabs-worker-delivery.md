@@ -32,6 +32,78 @@ paths. Explicit source manifests instead use `--source-root`; `--worker-prepare`
 can retain selected inputs before execution. Neither capture nor upload is part
 of result recovery or acknowledgment reconciliation.
 
+### Replay registry inputs into a private Cargo home
+
+Source-backed requests may include an explicit registry-cache projection:
+
+```json
+"cargo_home": {
+  "version": "registry-cargo-home-v1",
+  "prefix": "cache"
+}
+```
+
+The prefix is a relative directory INSIDE the transferred source manifest, not
+an absolute host path or permission to crawl a Cargo installation. All selected
+files under that prefix must be beneath `registry/cache`, `registry/index` or
+`registry/src`. Their exact paths, lengths, executable bits and hashes are part
+of the same source manifest as the project. The selection is retained verbatim
+in the original request and its durable fingerprint.
+
+For preparation, select the required registry files using `source_files` or a
+`source_roots` entry such as `cache: {path, files}` alongside the application
+root. Root names become directory prefixes in the saved bundle. Select only the
+approved files required by the target Cargo invocation; this does not discover
+the dependency closure or import an entire `~/.cargo` directory. A local-registry
+fixture, for example, can carry these inputs:
+
+```text
+app/Cargo.toml
+app/Cargo.lock
+app/.cargo/config.toml
+app/src/main.rs
+cache/registry/index/local/registry_dep-1.0.0.crate
+cache/registry/index/local/index/re/gi/registry_dep
+```
+
+The application's explicitly selected `.cargo/config.toml` must name the local
+registry beneath the canonical Cargo home, not the original host checkout.
+Ordinary registry cache/index/source projections instead retain the layout and
+configuration required by their pinned Cargo version. Cargo-home internals are
+not a stable interchange format: qualify the selected inputs against the target
+toolchain. The preparer does not rewrite manifests, source replacement settings,
+lockfiles, arguments, environment or working directory. Use the original
+command's `--frozen` requirement when both locked resolution and offline operation
+are required; the sandbox's network isolation is unchanged in either case.
+
+Cargo-home configuration and credentials, installed binaries, global metadata,
+lock files and Git dependency state cannot be selected through this replay
+field. Configuration needed by the build must be explicitly supplied as an
+ordinary workspace input instead. This directory policy is not a secret scanner:
+the caller remains responsible for approving the content of every selected file.
+
+After transport/session admission, the worker must echo the exact version and
+prefix in its initial `source-ready` before any source or registry bytes are sent.
+The same echo is required at the final seal. A worker that ignores the extension,
+an unsolicited selection, a changed prefix or a missing final confirmation
+refuses without executing. A warm source-byte cache does not waive these checks.
+
+The worker verifies the sealed projection, then copies it into a fresh private
+Cargo home owned by that one execution. Files are independent writable copies
+so Cargo can acquire locks, unpack archives and update its own cache metadata;
+the transferred workspace remains read-only. No host Cargo-home configuration or
+credentials are inherited, and runtime writes cannot alter the original source
+or shared source-byte cache. Preparation shares the original bounded upload
+phase and must finish before execution ownership is handed off. Source protocol
+limits still apply: at most 4,096 files and 512 MiB across the complete projection.
+The independent runtime copy requires additional space for the selected registry
+bytes and for whatever Cargo subsequently unpacks.
+
+Result resume and acceptance reconciliation carry the original request identity
+but never reupload registry inputs or recreate an execution Cargo home. This is
+explicit input delivery, not proof of package provenance, complete dependency
+resolution, immutable action inputs, or permission to skip compilation.
+
 ### Build a prepared bundle and install its outputs
 
 `--worker-build-tls` joins source upload, authenticated execution, durable byte
@@ -362,3 +434,27 @@ do not silently skip its absence. The scripted peer does not execute a compiler
 and is not a real fleet qualification. Tests added with this path still require
 execution on a supported Rust host; their presence alone is not passing test or
 production-qualification evidence.
+
+Registry replay adds shared sandbox, worker and sender regression coverage:
+
+```sh
+cargo test -p rabs-sandbox cargo_home
+cargo test -p rabs-wkr cargo_home
+cargo test -p rabsd cargo_home
+```
+
+The controlled-host registry acceptance case is selected explicitly:
+
+```sh
+cargo test -p rabs-wkr --test cargo_tree_worker_linux registry_tests -- --ignored
+```
+
+It requires canonical-capable Linux, a complete Rust toolchain and linker, tar
+and gzip. It generates a local registry package, uploads it to the actual worker,
+compiles offline inside the canonical namespace, restarts after completion and
+retrieves the original result without reupload or reexecution. It downloads and
+checks every output before running the received executable. Its negative case
+uploads transport-valid bytes with a wrong Cargo package checksum and requires
+Cargo to reject them with no artifact offer. The client is a bounded loopback
+fixture, not an authenticated fleet coordinator. Missing prerequisites fail when
+this ignored test is explicitly selected; source presence is not a passing gate.
