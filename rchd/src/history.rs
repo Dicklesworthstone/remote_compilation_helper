@@ -446,9 +446,24 @@ impl BuildHistory {
         }) {
             return None;
         }
-        if let Some(pid) = heartbeat.hook_pid.filter(|pid| *pid > 0) {
-            state.hook_pid = pid;
-            state.hook_process_identity = process_identity(pid);
+        // A heartbeat describes the original wrapper; it is not a process
+        // handoff. A delayed message can outlive that process and its PID can
+        // already belong to somebody else. Never capture the new occupant's
+        // identity or replace the recorded PID from the message.
+        if heartbeat
+            .hook_pid
+            .filter(|pid| *pid > 0)
+            .is_some_and(|pid| pid != state.hook_pid)
+        {
+            return None;
+        }
+        if let Some(identity) = state.hook_process_identity.as_ref()
+            && process_identity(state.hook_pid).as_ref() != Some(identity)
+        {
+            return None;
+        }
+        if state.recovered && state.hook_process_identity.is_none() {
+            return None;
         }
         if let Some(local_wrapper_id) = heartbeat.local_wrapper_id {
             state.local_wrapper_id = Some(local_wrapper_id);
@@ -1776,6 +1791,246 @@ mod tests {
             updated.is_none(),
             "mismatched worker heartbeat must be ignored"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    mod heartbeat_identity {
+        use super::*;
+
+        struct OwnedWrapper(std::process::Child);
+
+        impl OwnedWrapper {
+            fn start() -> Self {
+                Self(
+                    std::process::Command::new("/bin/sleep")
+                        .arg("60")
+                        .spawn()
+                        .unwrap(),
+                )
+            }
+
+            fn assert_running(&mut self) {
+                assert!(self.0.try_wait().unwrap().is_none());
+            }
+        }
+
+        impl Drop for OwnedWrapper {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        fn register(history: &BuildHistory, pid: u32) -> ActiveBuildState {
+            history.start_active_build_with_wrapper(
+                "heartbeat-owner-project".to_owned(),
+                "heartbeat-owner-worker".to_owned(),
+                "controlled heartbeat fixture".to_owned(),
+                pid,
+                Some("exact-heartbeat-wrapper".to_owned()),
+                2,
+                BuildLocation::Remote,
+            )
+        }
+
+        fn heartbeat(build: &ActiveBuildState, pid: Option<u32>) -> BuildHeartbeatRequest {
+            BuildHeartbeatRequest {
+                build_id: build.id,
+                worker_id: rch_common::WorkerId::new(&build.worker_id),
+                hook_pid: pid,
+                local_wrapper_id: build.local_wrapper_id.clone(),
+                remote_pgid_file: Some("/tmp/rch/heartbeat-owner/.rch-run/owned.pgid".to_owned()),
+                phase: BuildHeartbeatPhase::Execute,
+                detail: Some("owned wrapper making progress".to_owned()),
+                progress_counter: Some(3),
+                progress_percent: Some(25.0),
+            }
+        }
+
+        fn persistent_history(root: &TempDir) -> (BuildHistory, PathBuf) {
+            let path = root.path().join("history.jsonl");
+            std::fs::write(&path, b"").unwrap();
+            (BuildHistory::new(10).with_persistence(path.clone()), path)
+        }
+
+        fn persist_process_identity(
+            history: &BuildHistory,
+            build_id: u64,
+            identity: Option<String>,
+        ) {
+            let mut active = history.active.write().unwrap();
+            active.get_mut(&build_id).unwrap().hook_process_identity = identity;
+            history.persist_ownership(&active, None).unwrap();
+        }
+
+        fn assert_unchanged(history: &BuildHistory, before: &ActiveBuildState) {
+            let after = history.active_build(before.id).unwrap();
+            assert_eq!(
+                serde_json::to_value(&after).unwrap(),
+                serde_json::to_value(before).unwrap()
+            );
+            assert_eq!(after.started_at_mono, before.started_at_mono);
+            assert_eq!(after.last_heartbeat_mono, before.last_heartbeat_mono);
+            assert_eq!(after.last_progress_mono, before.last_progress_mono);
+        }
+
+        #[test]
+        fn live_heartbeat_preserves_established_process_identity() {
+            let mut owner = OwnedWrapper::start();
+            let history = BuildHistory::new(10);
+            let build = register(&history, owner.0.id());
+            let identity = process_identity(owner.0.id()).unwrap();
+            assert_eq!(
+                build.hook_process_identity.as_deref(),
+                Some(identity.as_str())
+            );
+
+            let updated = history
+                .record_build_heartbeat(heartbeat(&build, Some(owner.0.id())))
+                .unwrap();
+            assert_eq!(updated.hook_process_identity, Some(identity));
+            assert_eq!(updated.hook_pid, build.hook_pid);
+            assert_eq!(updated.local_wrapper_id, build.local_wrapper_id);
+            assert_eq!(updated.heartbeat_counter, 3);
+            assert_eq!(updated.heartbeat_count, 1);
+            assert_eq!(updated.heartbeat_phase, BuildHeartbeatPhase::Execute);
+            owner.assert_running();
+        }
+
+        #[test]
+        fn heartbeat_cannot_replace_wrapper_pid_even_with_exact_wrapper_id() {
+            let mut owner = OwnedWrapper::start();
+            let mut unrelated = OwnedWrapper::start();
+            let root = TempDir::new().unwrap();
+            let (history, path) = persistent_history(&root);
+            let build = register(&history, owner.0.id());
+            let journal = std::fs::read(path.with_extension("ownership.json")).unwrap();
+
+            assert!(
+                history
+                    .record_build_heartbeat(heartbeat(&build, Some(unrelated.0.id())))
+                    .is_none()
+            );
+            assert_unchanged(&history, &build);
+            assert_eq!(
+                std::fs::read(path.with_extension("ownership.json")).unwrap(),
+                journal
+            );
+            owner.assert_running();
+            unrelated.assert_running();
+        }
+
+        #[test]
+        fn delayed_recovered_heartbeat_rejects_modelled_pid_reuse_without_adoption() {
+            let mut unrelated = OwnedWrapper::start();
+            let actual = process_identity(unrelated.0.id()).unwrap();
+            let (boot, ticks) = actual.rsplit_once(':').unwrap();
+            let ticks = ticks.parse::<u64>().unwrap();
+            let prior_ticks = if ticks > 0 { ticks - 1 } else { 1 };
+            let prior_identity = format!("{boot}:{prior_ticks}");
+            assert_ne!(prior_identity, actual);
+
+            let root = TempDir::new().unwrap();
+            let (history, path) = persistent_history(&root);
+            let build = register(&history, unrelated.0.id());
+            // Model PID reuse by recording the prior owner's distinct start
+            // ticks. The unrelated current occupant is a real live process;
+            // this test does not claim to force operating-system PID reuse.
+            persist_process_identity(&history, build.id, Some(prior_identity));
+            drop(history);
+            let recovered = BuildHistory::load_from_file(&path, 10).unwrap();
+            let before = recovered.active_build(build.id).unwrap();
+            assert!(before.recovered);
+            let journal = std::fs::read(path.with_extension("ownership.json")).unwrap();
+
+            for pid in [Some(unrelated.0.id()), None] {
+                assert!(
+                    recovered
+                        .record_build_heartbeat(heartbeat(&before, pid))
+                        .is_none(),
+                    "a delayed heartbeat must not authorize the current PID occupant"
+                );
+                assert_unchanged(&recovered, &before);
+                assert_eq!(
+                    std::fs::read(path.with_extension("ownership.json")).unwrap(),
+                    journal
+                );
+            }
+            assert_eq!(process_identity(unrelated.0.id()).unwrap(), actual);
+            unrelated.assert_running();
+        }
+
+        #[test]
+        fn recovered_heartbeat_accepts_matching_live_process_without_rebinding() {
+            let mut owner = OwnedWrapper::start();
+            let root = TempDir::new().unwrap();
+            let (history, path) = persistent_history(&root);
+            let build = register(&history, owner.0.id());
+            assert!(build.hook_process_identity.is_some());
+            drop(history);
+            let recovered = BuildHistory::load_from_file(&path, 10).unwrap();
+            assert!(recovered.active_build(build.id).unwrap().recovered);
+
+            let updated = recovered
+                .record_build_heartbeat(heartbeat(&build, Some(owner.0.id())))
+                .unwrap();
+            assert_eq!(updated.hook_process_identity, build.hook_process_identity);
+            assert_eq!(updated.hook_pid, build.hook_pid);
+            assert_eq!(updated.local_wrapper_id, build.local_wrapper_id);
+            assert!(updated.recovered);
+            assert_eq!(updated.heartbeat_count, 1);
+            drop(recovered);
+
+            let reopened = BuildHistory::load_from_file(&path, 10).unwrap();
+            let persisted = reopened.active_build(build.id).unwrap();
+            assert_eq!(persisted.hook_process_identity, build.hook_process_identity);
+            assert_eq!(persisted.heartbeat_count, 1);
+            assert_eq!(persisted.heartbeat_counter, 3);
+            owner.assert_running();
+        }
+
+        #[test]
+        fn heartbeat_never_captures_identity_for_preexisting_unverified_pid() {
+            let mut unrelated = OwnedWrapper::start();
+            let history = BuildHistory::new(10);
+            let build = register(&history, unrelated.0.id());
+            persist_process_identity(&history, build.id, None);
+            let before = history.active_build(build.id).unwrap();
+            assert!(!before.recovered);
+
+            let _ = history.record_build_heartbeat(heartbeat(&before, Some(unrelated.0.id())));
+            let after = history.active_build(build.id).unwrap();
+            assert!(after.hook_process_identity.is_none());
+            assert_eq!(after.hook_pid, before.hook_pid);
+            assert!(!after.recovered);
+            unrelated.assert_running();
+        }
+
+        #[test]
+        fn recovered_heartbeat_refuses_missing_process_identity() {
+            let mut unrelated = OwnedWrapper::start();
+            let root = TempDir::new().unwrap();
+            let (history, path) = persistent_history(&root);
+            let build = register(&history, unrelated.0.id());
+            persist_process_identity(&history, build.id, None);
+            drop(history);
+            let recovered = BuildHistory::load_from_file(&path, 10).unwrap();
+            let before = recovered.active_build(build.id).unwrap();
+            assert!(before.recovered);
+            let journal = std::fs::read(path.with_extension("ownership.json")).unwrap();
+
+            assert!(
+                recovered
+                    .record_build_heartbeat(heartbeat(&before, Some(unrelated.0.id())))
+                    .is_none()
+            );
+            assert_unchanged(&recovered, &before);
+            assert_eq!(
+                std::fs::read(path.with_extension("ownership.json")).unwrap(),
+                journal
+            );
+            unrelated.assert_running();
+        }
     }
 
     #[test]

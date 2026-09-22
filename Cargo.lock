@@ -5527,6 +5527,7 @@ dependencies = [
  "rch-telemetry",
  "rich_rust",
  "rusqlite",
+ "rustix",
  "serde",
  "serde_json",
  "serial_test",

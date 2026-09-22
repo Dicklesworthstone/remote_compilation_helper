@@ -3526,6 +3526,36 @@ fn test_remote_pipeline_failure_policy_non_timeout_allows_existing_fallback() {
 }
 
 #[test]
+fn test_unconfirmed_remote_execution_retains_ownership_and_never_falls_back() {
+    let _guard = test_guard!();
+    for error in [
+        anyhow::Error::new(crate::transfer::RemoteExecutionUnconfirmed),
+        anyhow::anyhow!("source authority holder exited")
+            .context(crate::transfer::RemoteExecutionUnconfirmed)
+            .context("remote pipeline failed"),
+        anyhow::anyhow!("missing durable completion receipt")
+            .context(crate::transfer::RemoteExecutionUnconfirmed),
+    ] {
+        assert!(is_remote_execution_unconfirmed(&error));
+        assert_eq!(
+            classify_remote_pipeline_failure(&error),
+            RemotePipelineFailurePolicy::FailClosedNoLocalFallback
+        );
+        let summary = remote_pipeline_failure_summary(&WorkerId::new("worker-a"), &error);
+        assert!(summary.contains("ownership retained for recovery"));
+        assert!(!summary.contains("SSH command timed out"));
+    }
+    let setup = anyhow::Error::new(crate::transfer::RemoteProcessSetupUnavailable)
+        .context("verified pre-workload refusal");
+    assert!(!is_remote_execution_unconfirmed(&setup));
+    assert_eq!(
+        classify_remote_pipeline_failure(&setup),
+        RemotePipelineFailurePolicy::AllowLocalFallback,
+        "verified setup refusal can release ownership and run locally"
+    );
+}
+
+#[test]
 fn test_source_sync_stall_is_not_misclassified_as_ssh_timeout() {
     // Issue #59: the stall must route into the worker-failover retry arm, so
     // it must never match the E104 fail-closed classifier, and the typed

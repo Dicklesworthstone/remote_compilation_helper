@@ -109,6 +109,40 @@ pub struct CancellationRecord {
     pub remote_pgid_file: Option<String>,
 }
 
+/// A recycled PID proves that the original process has exited; it never
+/// authorizes signalling the current occupant. Missing observation is distinct.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WrapperProcessState {
+    Running,
+    Exited,
+    Unverified,
+}
+
+fn wrapper_process_state(pid: u32, expected: Option<&str>) -> WrapperProcessState {
+    if pid == 0 {
+        return WrapperProcessState::Exited;
+    }
+    if pid <= 1 || i32::try_from(pid).is_err() {
+        return WrapperProcessState::Unverified;
+    }
+    if !is_process_alive(pid) {
+        return WrapperProcessState::Exited;
+    }
+    let Some(expected) = expected.filter(|identity| {
+        identity.rsplit_once(':').is_some_and(|(boot, ticks)| {
+            uuid::Uuid::parse_str(boot).is_ok() && ticks.parse::<u64>().is_ok()
+        })
+    }) else {
+        return WrapperProcessState::Unverified;
+    };
+    match crate::history::process_identity(pid) {
+        Some(current) if current == expected => WrapperProcessState::Running,
+        Some(_) => WrapperProcessState::Exited,
+        None if !is_process_alive(pid) => WrapperProcessState::Exited,
+        None => WrapperProcessState::Unverified,
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct CancellationWorkerHealthSnapshot {
     status: String,
@@ -395,12 +429,11 @@ impl CancellationOrchestrator {
                     slots_released: 0,
                 };
             };
-            // A persisted PID alone cannot identify its owner after restart.
-            // Do not signal it until exact process identity is available.
-            if current.hook_pid != 0
-                && (current.hook_process_identity.is_none()
-                    || crate::history::process_identity(current.hook_pid)
-                        != current.hook_process_identity)
+            // Proven exit of the original wrapper permits remote recovery.
+            // A reused PID is never adopted or signalled; uncertainty still
+            // retains ownership rather than treating a failed probe as exit.
+            if wrapper_process_state(current.hook_pid, current.hook_process_identity.as_deref())
+                == WrapperProcessState::Unverified
             {
                 return CancelBuildResponse {
                     status: "failed".into(),
@@ -520,35 +553,43 @@ impl CancellationOrchestrator {
         }
     }
 
-    /// Only exact boot+start evidence may authorize a local signal; PID reuse
-    /// or an uncertain identity fails closed rather than risking a victim.
-    fn verified_hook_identity(record: &CancellationRecord) -> Option<u32> {
-        if record.hook_pid == 0 {
+    /// Open the stable kernel handle before validating the recorded identity.
+    /// Exit/PID reuse after validation cannot redirect pidfd_send_signal.
+    #[cfg(target_os = "linux")]
+    fn verified_hook_handle(record: &CancellationRecord) -> Option<std::os::fd::OwnedFd> {
+        use rustix::process::{Pid, PidfdFlags, pidfd_open};
+
+        let pid = i32::try_from(record.hook_pid).ok().filter(|pid| *pid > 1)?;
+        let expected = record.hook_process_identity.as_deref()?;
+        let handle = pidfd_open(Pid::from_raw(pid)?, PidfdFlags::empty()).ok()?;
+        if crate::history::process_identity(record.hook_pid).as_deref() != Some(expected) {
             return None;
         }
-        if crate::history::process_identity(record.hook_pid).as_deref()
-            == record
-                .hook_process_identity
-                .as_deref()
-                .filter(|identity| !identity.is_empty())
-        {
-            Some(record.hook_pid)
-        } else {
-            None
-        }
+        Some(handle)
     }
 
     async fn send_verified_signal(&self, record: &CancellationRecord, force: bool) -> bool {
-        match Self::verified_hook_identity(record) {
-            Some(pid) => send_signal_to_process(pid, force),
-            None => {
-                warn!(
-                    "Skipping unverified local signal for build {}",
-                    record.build_id
-                );
-                false
-            }
+        if wrapper_process_state(record.hook_pid, record.hook_process_identity.as_deref())
+            == WrapperProcessState::Exited
+        {
+            return true;
         }
+        #[cfg(target_os = "linux")]
+        if let Some(handle) = Self::verified_hook_handle(record) {
+            let signal = if force {
+                rustix::process::Signal::KILL
+            } else {
+                rustix::process::Signal::TERM
+            };
+            return rustix::process::pidfd_send_signal(&handle, signal).is_ok();
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = force;
+        warn!(
+            "Skipping unverified local signal for build {}",
+            record.build_id
+        );
+        false
     }
 
     async fn execute_cancellation_stages(
@@ -569,8 +610,7 @@ impl CancellationOrchestrator {
                 self.send_verified_signal(record, true).await;
             }
             let remote_stopped = !remote_required || self.try_remote_kill(ctx, record).await;
-            let local_stopped =
-                wait_for_process_exit(record.hook_pid, self.config.kill_timeout).await;
+            let local_stopped = wait_for_wrapper_exit(record, self.config.kill_timeout).await;
             record.state = cancellation_terminal_state(local_stopped, remote_stopped);
             return;
         }
@@ -581,7 +621,7 @@ impl CancellationOrchestrator {
             self.send_verified_signal(record, false).await;
         }
 
-        let local_stopped = wait_for_process_exit(record.hook_pid, self.config.grace_period).await;
+        let local_stopped = wait_for_wrapper_exit(record, self.config.grace_period).await;
         if local_stopped {
             let remote_stopped =
                 !remote_required || self.attempt_remote_kill_stage(ctx, record).await;
@@ -596,9 +636,7 @@ impl CancellationOrchestrator {
 
         // Step 2: Terminate remote work, preserving its result through SIGKILL.
         let remote_stopped = !remote_required || self.attempt_remote_kill_stage(ctx, record).await;
-        if remote_stopped
-            && wait_for_process_exit(record.hook_pid, Duration::from_millis(500)).await
-        {
+        if remote_stopped && wait_for_wrapper_exit(record, Duration::from_millis(500)).await {
             record.state = CancellationState::Completed;
             return;
         }
@@ -624,7 +662,7 @@ impl CancellationOrchestrator {
         if record.hook_pid > 0 {
             self.send_verified_signal(record, true).await;
         }
-        let local_stopped = wait_for_process_exit(record.hook_pid, self.config.kill_timeout).await;
+        let local_stopped = wait_for_wrapper_exit(record, self.config.kill_timeout).await;
         record.state = cancellation_terminal_state(local_stopped, remote_stopped);
     }
 
@@ -957,9 +995,14 @@ fn build_remote_kill_script(remote_pgid_file: Option<&str>, build_id: u64) -> St
         // Retain the reservation when no process-group identity was recorded.
         return "exit 42".to_owned();
     };
+    let protocol = format!(
+        "{}\n{}",
+        rch_common::REMOTE_PROCESS_IDENTITY_SCRIPT,
+        REMOTE_CANCELLATION_SCRIPT
+    );
     format!(
         "sh -c {} sh {} {build_id}",
-        shell_escape::escape(std::borrow::Cow::Borrowed(REMOTE_CANCELLATION_SCRIPT)),
+        shell_escape::escape(std::borrow::Cow::Borrowed(protocol.as_str())),
         shell_escape::escape(std::borrow::Cow::Borrowed(remote_pgid_file)),
     )
 }
@@ -972,6 +1015,7 @@ fn remote_kill_confirmed(output: &std::process::Output, build_id: u64) -> bool {
 
 /// Use the existing safe syscall wrapper: spawning /bin/kill can block the
 /// runtime before an async deadline can be polled, especially under fork load.
+#[cfg(test)]
 fn send_signal_to_process(pid: u32, force: bool) -> bool {
     use nix::sys::signal::{Signal, kill};
     use nix::unistd::Pid;
@@ -1020,6 +1064,33 @@ fn is_process_alive(pid: u32) -> bool {
     !matches!(kill(Pid::from_raw(raw_pid), None), Err(Errno::ESRCH))
 }
 
+async fn wait_for_wrapper_exit(record: &CancellationRecord, budget: Duration) -> bool {
+    let observe =
+        || wrapper_process_state(record.hook_pid, record.hook_process_identity.as_deref());
+    match observe() {
+        WrapperProcessState::Exited => return true,
+        WrapperProcessState::Unverified => return false,
+        WrapperProcessState::Running => {}
+    }
+    if budget.is_zero() {
+        return false;
+    }
+    tokio::time::timeout(budget, async {
+        loop {
+            match observe() {
+                WrapperProcessState::Exited => return true,
+                WrapperProcessState::Unverified => return false,
+                WrapperProcessState::Running => {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            }
+        }
+    })
+    .await
+    .unwrap_or(false)
+}
+
+#[cfg(test)]
 async fn wait_for_process_exit(pid: u32, budget: Duration) -> bool {
     if !is_process_alive(pid) {
         return true;
@@ -1166,10 +1237,11 @@ mod tests {
     #[test]
     fn test_build_remote_kill_script_prefers_recorded_pgid_file() {
         let script = build_remote_kill_script(Some("/tmp/rch/project/.rch-run/42.pgid"), 42);
-        assert!(script.contains("pgid_file="));
+        assert!(script.contains("rch_remote_cancel"));
+        assert!(script.contains("RCH_REMOTE_PROCESS_V1"));
         // Group-kill must use `-PGID` (no `--`): dash's kill builtin mishandles
         // `kill -TERM -- -PGID`, silently failing to signal the group.
-        assert!(script.contains("kill -TERM -\"$pgid\""));
+        assert!(script.contains("kill -\"$1\" -\"$rch_pgid\""));
         assert!(!script.contains("kill -TERM -- -"));
         assert!(script.contains("/tmp/rch/project/.rch-run/42.pgid"));
         assert!(!script.contains("RCH_BUILD_ID=42;"));
@@ -1179,7 +1251,7 @@ mod tests {
     fn test_build_remote_kill_script_handles_shell_special_pgid_file_path() {
         let script =
             build_remote_kill_script(Some("/tmp/rch/project dir/agent's/.rch-run/42.pgid"), 42);
-        assert!(script.contains("pgid_file=$1"));
+        assert!(script.contains("rch_remote_cancel \"$1\" \"$2\" term"));
         assert!(script.contains("/tmp/rch/project"));
         assert!(!script.contains("pgid_file='/tmp"));
 
@@ -1806,6 +1878,338 @@ mod tests {
         assert!(wait_for_process_exit(pid, Duration::from_secs(1)).await);
     }
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn wrapper_identity_distinguishes_exit_from_unknown_and_pidfd_never_adopts_reuse() {
+        struct OwnedChild(std::process::Child);
+        impl Drop for OwnedChild {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut child = OwnedChild(
+            std::process::Command::new("/bin/sleep")
+                .arg("60")
+                .spawn()
+                .unwrap(),
+        );
+        let pid = child.0.id();
+        let identity = crate::history::process_identity(pid).unwrap();
+        assert_eq!(
+            wrapper_process_state(pid, Some(&identity)),
+            WrapperProcessState::Running
+        );
+        for unknown in [None, Some(""), Some("unparseable:identity")] {
+            assert_eq!(
+                wrapper_process_state(pid, unknown),
+                WrapperProcessState::Unverified
+            );
+        }
+        for invalid in [1, u32::MAX] {
+            assert_eq!(
+                wrapper_process_state(invalid, Some(&identity)),
+                WrapperProcessState::Unverified
+            );
+        }
+        let (boot, ticks) = identity.rsplit_once(':').unwrap();
+        let previous = format!("{boot}:{}", ticks.parse::<u64>().unwrap() + 1);
+        let mut record = test_record(CancellationState::Requested, 0, false);
+        record.hook_pid = pid;
+        record.hook_process_identity = Some(previous);
+        let owner = CancellationOrchestrator::new(test_config(), test_events());
+        assert_eq!(
+            wrapper_process_state(pid, record.hook_process_identity.as_deref()),
+            WrapperProcessState::Exited,
+            "modelled prior incarnation is gone, but the current occupant is alive"
+        );
+        assert!(CancellationOrchestrator::verified_hook_handle(&record).is_none());
+        assert!(owner.send_verified_signal(&record, true).await);
+        assert!(wait_for_wrapper_exit(&record, Duration::ZERO).await);
+        assert!(
+            child.0.try_wait().unwrap().is_none(),
+            "reused PID was signalled"
+        );
+
+        record.hook_process_identity = Some(identity);
+        assert!(!wait_for_wrapper_exit(&record, Duration::ZERO).await);
+        let handle = CancellationOrchestrator::verified_hook_handle(&record).unwrap();
+        assert!(owner.send_verified_signal(&record, false).await);
+        child.0.wait().unwrap();
+        assert!(wait_for_wrapper_exit(&record, Duration::from_secs(1)).await);
+        // The retained kernel handle refers to the exited process even if its
+        // numeric PID is reused later; it cannot signal a replacement owner.
+        assert_eq!(
+            rustix::process::pidfd_send_signal(&handle, rustix::process::Signal::KILL),
+            Err(rustix::io::Errno::SRCH)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn recovered_wrapper_exit_reconciles_real_remote_group_once() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::process::CommandExt;
+
+        const CHILD_ROOT: &str = "RCH_RECOVERED_CANCEL_TEST_ROOT";
+        struct OwnedChild(std::process::Child);
+        impl Drop for OwnedChild {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        struct OwnedGroup(std::process::Child);
+        impl Drop for OwnedGroup {
+            fn drop(&mut self) {
+                // Keep the leader unreaped until cleanup, preventing reuse of
+                // this test-owned group ID before the final group signal.
+                let _ = nix::sys::signal::killpg(
+                    nix::unistd::Pid::from_raw(i32::try_from(self.0.id()).unwrap()),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
+                let _ = self.0.wait();
+            }
+        }
+        if let Some(root) = std::env::var_os(CHILD_ROOT).map(std::path::PathBuf::from) {
+            for (scenario, force, model_reuse) in [("exited", false, false), ("reused", true, true)]
+            {
+                let case = root.join(scenario);
+                std::fs::create_dir(&case).unwrap();
+                let history_path = case.join("history.jsonl");
+                let identity_path = case.join("remote.pgid");
+                let counter_path = case.join("executions");
+                let child_path = case.join("remote-child.pid");
+                let mut wrapper = OwnedChild(
+                    std::process::Command::new("/bin/sleep")
+                        .arg("60")
+                        .spawn()
+                        .unwrap(),
+                );
+                let wrapper_pid = wrapper.0.id();
+                let unrelated = OwnedGroup(
+                    std::process::Command::new("/bin/sleep")
+                        .arg("60")
+                        .process_group(0)
+                        .spawn()
+                        .unwrap(),
+                );
+                let remote = OwnedGroup(
+                    std::process::Command::new("/bin/sh")
+                        .args([
+                            "-c",
+                            "printf 'run\\n' >> \"$1\"; trap '' TERM; sleep 60 & printf '%s\\n' \"$!\" > \"$2\"; wait",
+                            "recovery-workload",
+                        ])
+                        .arg(&counter_path)
+                        .arg(&child_path)
+                        .process_group(0)
+                        .spawn()
+                        .unwrap(),
+                );
+                let remote_child: u32 = tokio::time::timeout(Duration::from_secs(3), async {
+                    loop {
+                        if let Ok(text) = std::fs::read_to_string(&child_path)
+                            && let Ok(pid) = text.trim().parse()
+                        {
+                            break pid;
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .unwrap();
+                let config = rch_common::WorkerConfig::default();
+                let worker_id = config.id.clone();
+                let history = BuildHistory::new(100).with_persistence(history_path.clone());
+                let wrapper_id = format!("recovery-{scenario}");
+                let target = history.start_active_build_with_wrapper(
+                    "recover-target".into(),
+                    worker_id.to_string(),
+                    "cargo test".into(),
+                    wrapper_pid,
+                    Some(wrapper_id.clone()),
+                    1,
+                    rch_common::BuildLocation::Remote,
+                );
+                let other = history.start_active_build_with_wrapper(
+                    "unrelated-target".into(),
+                    worker_id.to_string(),
+                    "cargo check".into(),
+                    unrelated.0.id(),
+                    Some("unrelated-wrapper".into()),
+                    2,
+                    rch_common::BuildLocation::Remote,
+                );
+                history
+                    .record_build_heartbeat(rch_common::BuildHeartbeatRequest {
+                        build_id: target.id,
+                        worker_id: worker_id.clone(),
+                        hook_pid: Some(wrapper_pid),
+                        local_wrapper_id: Some(wrapper_id.clone()),
+                        remote_pgid_file: Some(identity_path.to_string_lossy().into_owned()),
+                        phase: rch_common::BuildHeartbeatPhase::Execute,
+                        detail: None,
+                        progress_counter: None,
+                        progress_percent: None,
+                    })
+                    .unwrap();
+                wrapper.0.kill().unwrap();
+                wrapper.0.wait().unwrap();
+                drop(history);
+                if model_reuse {
+                    // Model PID reuse in the durable prior-daemon record while
+                    // keeping a real unrelated process alive as the sentinel.
+                    let path = history_path.with_extension("ownership.json");
+                    let mut journal: serde_json::Value =
+                        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                    let state = journal["active"]
+                        .as_array_mut()
+                        .unwrap()
+                        .iter_mut()
+                        .find(|state| state["id"].as_u64() == Some(target.id))
+                        .unwrap();
+                    let actual = crate::history::process_identity(unrelated.0.id()).unwrap();
+                    let (boot, ticks) = actual.rsplit_once(':').unwrap();
+                    state["hook_pid"] = serde_json::json!(unrelated.0.id());
+                    state["hook_process_identity"] =
+                        serde_json::json!(format!("{boot}:{}", ticks.parse::<u64>().unwrap() + 1));
+                    std::fs::write(&path, serde_json::to_vec(&journal).unwrap()).unwrap();
+                }
+                let history = Arc::new(BuildHistory::load_from_file(&history_path, 100).unwrap());
+                assert!(history.active_build(target.id).unwrap().recovered);
+                let pool = WorkerPool::new();
+                pool.add_worker(config).await;
+                let worker = pool.get(&worker_id).await.unwrap();
+                for active in history.active_builds() {
+                    worker.restore_slots(active.slots).unwrap();
+                }
+                assert_eq!(worker.used_slots(), 3);
+                let ctx = make_test_context(pool, history.clone());
+                let owner = CancellationOrchestrator::new(
+                    CancellationConfig {
+                        remote_kill_timeout: Duration::from_secs(5),
+                        cleanup_timeout: Duration::from_secs(10),
+                        ..test_config()
+                    },
+                    test_events(),
+                );
+                let observed = crate::history::process_identity(remote.0.id()).unwrap();
+                let (boot, ticks) = observed.rsplit_once(':').unwrap();
+                let valid = format!(
+                    "RCH_REMOTE_PROCESS_V1:{}:{boot}:{}:{ticks}\n",
+                    target.id,
+                    remote.0.id()
+                );
+                std::fs::write(&identity_path, &valid).unwrap();
+                for failure in ["unavailable", "wrong-build"] {
+                    std::fs::write(root.join("transport"), failure).unwrap();
+                    if failure == "wrong-build" {
+                        std::fs::write(
+                            &identity_path,
+                            format!(
+                                "RCH_REMOTE_PROCESS_V1:{}:{boot}:{}:{ticks}\n",
+                                target.id + 1,
+                                remote.0.id()
+                            ),
+                        )
+                        .unwrap();
+                    }
+                    let response = owner
+                        .cancel_build(&ctx, target.id, CancelReason::User, force)
+                        .await;
+                    assert_eq!(response.status, "failed", "{scenario}/{failure}");
+                    assert_eq!(response.slots_released, 0);
+                    assert_eq!(worker.used_slots(), 3);
+                    assert!(history.active_build(target.id).is_some());
+                    assert!(is_process_alive(remote.0.id()));
+                    assert!(is_process_alive(unrelated.0.id()));
+                }
+                std::fs::write(root.join("transport"), "connected").unwrap();
+                std::fs::write(&identity_path, valid).unwrap();
+                let config_lock = worker.config.write().await;
+                let task_owner = owner.clone();
+                let task_context = ctx.clone();
+                let completion = tokio::spawn(async move {
+                    task_owner
+                        .cancel_build(&task_context, target.id, CancelReason::User, force)
+                        .await
+                });
+                wait_for_cancellation_attempts(&owner, 1).await;
+                let duplicate = owner
+                    .cancel_build(&ctx, target.id, CancelReason::User, force)
+                    .await;
+                assert_eq!(duplicate.status, "cancelling");
+                assert_eq!(duplicate.slots_released, 0);
+                drop(config_lock);
+                let completed = completion.await.unwrap();
+                assert_eq!(completed.status, "cancelled", "{completed:?}");
+                assert_eq!(completed.slots_released, 1);
+                assert_eq!(worker.used_slots(), 2);
+                assert!(!is_process_alive(remote.0.id()));
+                assert!(!is_process_alive(remote_child));
+                assert!(is_process_alive(unrelated.0.id()));
+                assert!(history.active_build(other.id).is_some());
+                assert!(history.active_build(target.id).is_none());
+                assert_eq!(
+                    history
+                        .terminal_build(target.id, &wrapper_id)
+                        .unwrap()
+                        .exit_code,
+                    130
+                );
+                assert_eq!(std::fs::read_to_string(&counter_path).unwrap(), "run\n");
+                let duplicate = owner
+                    .cancel_build(&ctx, target.id, CancelReason::User, force)
+                    .await;
+                assert_eq!(duplicate.slots_released, 0);
+                assert_eq!(worker.used_slots(), 2);
+                let reopened = BuildHistory::load_from_file(&history_path, 100).unwrap();
+                assert!(reopened.active_build(target.id).is_none());
+                assert!(reopened.active_build(other.id).is_some());
+                assert!(reopened.terminal_build(target.id, &wrapper_id).is_some());
+            }
+            std::fs::write(root.join("completed"), "ok").unwrap();
+            return;
+        }
+        // Only SSH transport is replaced. Its payload is the exact production
+        // identity/termination protocol operating on real controlled groups.
+        let root = tempfile::tempdir().unwrap().keep();
+        let ssh = root.join("ssh");
+        std::fs::write(
+            &ssh,
+            r#"#!/bin/sh
+mode=$(/bin/cat "$RCH_RECOVERED_CANCEL_TEST_ROOT/transport") || exit 99
+[ "$mode" != unavailable ] || exit 255
+for argument do payload=$argument; done
+exec /bin/sh -c "$payload"
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let output = tokio::time::timeout(
+            Duration::from_secs(40),
+            tokio::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "cancellation::tests::recovered_wrapper_exit_reconciles_real_remote_group_once",
+                    "--nocapture",
+                ])
+                .env(CHILD_ROOT, &root)
+                .env("PATH", format!("{}:/usr/bin:/bin", root.display()))
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            output.status.success(),
+            "isolated recovery failed: {output:?}"
+        );
+        assert!(root.join("completed").is_file());
+    }
+
     #[test]
     fn remote_cancel_receipt_requires_success_and_one_complete_matching_record() {
         use std::os::unix::process::ExitStatusExt;
@@ -1843,7 +2247,10 @@ mod tests {
             Duration::from_secs(5),
             tokio::process::Command::new("/bin/sh")
                 .arg("-c")
-                .arg(format!("{prefix}\n{REMOTE_CANCELLATION_SCRIPT}"))
+                .arg(format!(
+                    "{}\n{prefix}\n{REMOTE_CANCELLATION_SCRIPT}",
+                    rch_common::REMOTE_PROCESS_IDENTITY_SCRIPT
+                ))
                 .arg("rch-cancel-fixture")
                 .arg(path)
                 .arg("42")
@@ -1854,6 +2261,30 @@ mod tests {
         .await
         .expect("remote cancellation probe exceeded its test deadline")
         .unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    struct RemoteCancelOwnedGroup(std::process::Child);
+
+    #[cfg(target_os = "linux")]
+    impl Drop for RemoteCancelOwnedGroup {
+        fn drop(&mut self) {
+            // Keep the leader unreaped until here, so its PID cannot be
+            // reused by another group before this owned cleanup.
+            let pid = i32::try_from(self.0.id()).unwrap();
+            let _ = nix::sys::signal::killpg(
+                nix::unistd::Pid::from_raw(pid),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+            let _ = self.0.wait();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn remote_cancel_record(build_id: u64, pgid: u32) -> String {
+        let identity = crate::history::process_identity(pgid).unwrap();
+        let (boot, start) = identity.rsplit_once(':').unwrap();
+        format!("RCH_REMOTE_PROCESS_V1:{build_id}:{boot}:{pgid}:{start}\n")
     }
 
     #[tokio::test]
@@ -1918,10 +2349,10 @@ mod tests {
             ("ps() { printf 'not a process table\\n'; };", 44),
             ("ps() { printf '10 10 S\\n'; };", 44),
             ("ps() { printf '%s 123 S\\n' \"$$\"; };", 44),
-            ("ps() { printf '%s 99 S\\n100 123 R\\n' \"$$\"; };", 45),
+            ("ps() { printf '%s 99 S\\n100 123 R\\n' \"$$\"; };", 43),
             (
                 "ps() { printf '%s 99 S\\n100 123 Z\\n101 123 S\\n' \"$$\"; };",
-                45,
+                43,
             ),
             ("ps() { printf '%s 99 S\\n100 123 Z\\n' \"$$\"; };", 0),
             ("ps() { printf '%s 99 S\\n' \"$$\"; };", 0),
@@ -1931,6 +2362,140 @@ mod tests {
             assert_eq!(output.status.code(), Some(expected), "{probe}: {output:?}");
             assert_eq!(remote_kill_confirmed(&output, 42), expected == 0);
         }
+
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::process::CommandExt;
+
+            let group = RemoteCancelOwnedGroup(
+                std::process::Command::new("/bin/sleep")
+                    .arg("60")
+                    .process_group(0)
+                    .spawn()
+                    .unwrap(),
+            );
+            let pgid = group.0.id();
+            std::fs::write(&path, remote_cancel_record(42, pgid)).unwrap();
+            // The leader has real matching boot/start evidence. Only OS
+            // signals and observations are injected: the reported survivor
+            // must keep cancellation unconfirmed after bounded escalation.
+            let prefix = format!(
+                "kill() {{ return 0; }}; sleep() {{ :; }}; \
+                 ps() {{ printf '%s 1 S\\n{pgid} {pgid} S\\n' \"$$\"; }};"
+            );
+            let output = remote_cancel_probe_fixture(&path, &prefix).await;
+            assert_eq!(output.status.code(), Some(45), "{output:?}");
+            assert!(!remote_kill_confirmed(&output, 42));
+            assert!(is_process_alive(pgid));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn remote_cancel_rejects_stale_identity_without_signalling_owned_sentinel() {
+        use std::os::unix::process::CommandExt;
+
+        let sentinel = RemoteCancelOwnedGroup(
+            std::process::Command::new("/bin/sleep")
+                .arg("60")
+                .process_group(0)
+                .spawn()
+                .unwrap(),
+        );
+        let pgid = sentinel.0.id();
+        let identity = crate::history::process_identity(pgid).unwrap();
+        let (boot, start) = identity.rsplit_once(':').unwrap();
+        let other_boot = if boot == "00000000-0000-0000-0000-000000000000" {
+            "11111111-1111-1111-1111-111111111111"
+        } else {
+            "00000000-0000-0000-0000-000000000000"
+        };
+        let prior_start = start.parse::<u64>().unwrap().checked_add(1).unwrap();
+        let root = tempfile::tempdir().unwrap().keep();
+        let path = root.join("identity.pgid");
+        for (case, record) in [
+            ("wrong-build", remote_cancel_record(41, pgid)),
+            (
+                "wrong-boot",
+                format!("RCH_REMOTE_PROCESS_V1:42:{other_boot}:{pgid}:{start}\n"),
+            ),
+            (
+                // Model a reused leader PID with a different recorded start;
+                // the current PID occupant is a real controlled sentinel.
+                "reused-leader-start",
+                format!("RCH_REMOTE_PROCESS_V1:42:{boot}:{pgid}:{prior_start}\n"),
+            ),
+            ("legacy-live-group", format!("{pgid}\n")),
+        ] {
+            std::fs::write(&path, &record).unwrap();
+            let output = remote_cancel_probe_fixture(&path, "").await;
+            assert_eq!(output.status.code(), Some(43), "{case}: {output:?}");
+            assert!(
+                output.stdout.is_empty(),
+                "{case}: false cancellation receipt"
+            );
+            assert!(
+                is_process_alive(pgid),
+                "{case}: signalled unrelated occupant"
+            );
+            assert_eq!(
+                crate::history::process_identity(pgid).as_deref(),
+                Some(identity.as_str())
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), record);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn remote_cancel_retains_live_orphan_when_recorded_leader_cannot_be_verified() {
+        use std::os::unix::process::CommandExt;
+
+        let root = tempfile::tempdir().unwrap().keep();
+        let path = root.join("orphan.pgid");
+        let child_pid_path = root.join("orphan-child.pid");
+        let script = format!(
+            "{}\nrch_remote_record \"$1\" 42 || exit 99\n\
+             sleep 60 &\n\
+             printf '%s\\n' \"$!\" > \"$2\"\n\
+             exit 0\n",
+            rch_common::REMOTE_PROCESS_IDENTITY_SCRIPT
+        );
+        let group = RemoteCancelOwnedGroup(
+            std::process::Command::new("/bin/sh")
+                .args(["-c", &script, "rch-orphan-fixture"])
+                .arg(&path)
+                .arg(&child_pid_path)
+                .process_group(0)
+                .spawn()
+                .unwrap(),
+        );
+        let child_pid: u32 = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Ok(text) = std::fs::read_to_string(&child_pid_path)
+                    && let Ok(pid) = text.trim().parse::<u32>()
+                    && !is_process_alive(group.0.id())
+                {
+                    break pid;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let record = std::fs::read_to_string(&path).unwrap();
+        assert!(record.starts_with("RCH_REMOTE_PROCESS_V1:42:"));
+        assert!(is_process_alive(child_pid));
+        for _ in 0..2 {
+            let output = remote_cancel_probe_fixture(&path, "").await;
+            assert_eq!(output.status.code(), Some(43), "{output:?}");
+            assert!(output.stdout.is_empty());
+            assert!(
+                is_process_alive(child_pid),
+                "unverified orphan was signalled"
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), record);
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -1938,23 +2503,9 @@ mod tests {
     async fn remote_cancel_real_process_group_is_verified_and_retryable() {
         use std::os::unix::process::CommandExt;
 
-        struct OwnedGroup(std::process::Child);
-        impl Drop for OwnedGroup {
-            fn drop(&mut self) {
-                // Keep the leader unreaped until here, so its PID cannot be
-                // reused by another group before this owned cleanup.
-                let pid = i32::try_from(self.0.id()).unwrap();
-                let _ = nix::sys::signal::killpg(
-                    nix::unistd::Pid::from_raw(pid),
-                    nix::sys::signal::Signal::SIGKILL,
-                );
-                let _ = self.0.wait();
-            }
-        }
-
         let root = tempfile::tempdir().unwrap().keep();
         let child_pid_path = root.join("child.pid");
-        let group = OwnedGroup(
+        let group = RemoteCancelOwnedGroup(
             std::process::Command::new("/bin/sh")
                 .args([
                     "-c",
@@ -1966,7 +2517,7 @@ mod tests {
                 .spawn()
                 .unwrap(),
         );
-        let unrelated = OwnedGroup(
+        let unrelated = RemoteCancelOwnedGroup(
             std::process::Command::new("/bin/sleep")
                 .arg("60")
                 .process_group(0)
@@ -1986,7 +2537,7 @@ mod tests {
         .await
         .unwrap();
         let path = root.join("group with 'quote $dollar;`backtick`.pgid");
-        std::fs::write(&path, format!("{}\n", group.0.id())).unwrap();
+        std::fs::write(&path, remote_cancel_record(42, group.0.id())).unwrap();
         let script = build_remote_kill_script(Some(path.to_str().unwrap()), 42);
         for _ in 0..2 {
             let output = tokio::time::timeout(
@@ -2004,6 +2555,12 @@ mod tests {
             assert!(!is_process_alive(child_pid));
             assert!(is_process_alive(unrelated.0.id()));
         }
+        // Legacy records may confirm an already empty group, but the live
+        // legacy sentinel case above proves they never grant signalling rights.
+        std::fs::write(&path, format!("{}\n", group.0.id())).unwrap();
+        let output = remote_cancel_probe_fixture(&path, "").await;
+        assert!(remote_kill_confirmed(&output, 42), "{output:?}");
+        assert!(is_process_alive(unrelated.0.id()));
     }
 
     #[tokio::test]

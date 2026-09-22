@@ -29,6 +29,11 @@ notify = { workspace = true }
 chrono = { workspace = true }
 shell-escape = "0.1.5"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# Bind local cancellation signals to a stable process handle after checking
+# boot/start identity, so PID reuse cannot redirect a signal between syscalls.
+rustix = { version = "1.1.5", default-features = false, features = ["process", "std"] }
+
 [target.'cfg(unix)'.dependencies]
 # Direct kill(pid, 0) syscall (safe wrapper) for lease liveness checks —
 # forking /bin/kill per stale lease wedged the whole runtime at scale

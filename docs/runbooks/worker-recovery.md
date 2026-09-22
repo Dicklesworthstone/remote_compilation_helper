@@ -138,6 +138,31 @@ rch cancel --all -y                        # last resort: cancel everything
 For stuck OS processes that are not tracked builds, use the audited triage fix in
 §3 rather than `pkill -9 cargo`.
 
+**Active jobs recovered after a daemon restart:** inspect `rch queue`, then use
+`rch cancel <build-id>` for the specific job you want to stop. Cancellation can
+now finish when the original local wrapper has exited, including when its PID
+belongs to a different process. The daemon preserves the originally observed
+wrapper identity; delayed heartbeats cannot adopt that replacement process.
+Local signals use Linux pidfds after verifying the recorded boot and process
+start identity.
+
+For tracked Linux worker jobs launched by this version, the remote record binds
+the build ID, worker boot UUID, process-group leader and its start time. The
+daemon checks this identity before each remote signal and verifies that the
+group has no executing members. It then persists the terminal cancellation and
+releases the job's reservation once. Repeated or concurrent cancellation does
+not release extra slots. Recovery does not rerun the command or infer that its
+artifacts were successfully produced.
+
+If SSH is unavailable, identity cannot be verified, or a live group survives
+after its recorded leader exits, the job and reservation remain active for
+retry. `--force` does not bypass these checks. Older numeric-only PGID records
+can confirm an already empty group, but cannot authorize killing a live group.
+This process-group recovery path requires Linux worker identity support;
+Windows jobs and unsupported worker launch capabilities do not gain that
+guarantee. Do not remove the retained ownership record to make capacity appear
+free while execution remains uncertain.
+
 **CPU overloaded:** drain the worker so it stops taking new work; it rejoins on
 `enable`. Do not kill processes blindly.
 ```bash

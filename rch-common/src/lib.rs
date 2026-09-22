@@ -8,6 +8,9 @@
 
 use std::sync::OnceLock;
 
+/// Shared Linux launch and cancellation protocol; callers select their receipt.
+pub const REMOTE_PROCESS_IDENTITY_SCRIPT: &str = include_str!("remote_process.sh");
+
 pub mod admission_recommendation;
 pub mod admission_rejection;
 pub mod admit_preflight;

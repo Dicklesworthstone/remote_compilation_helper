@@ -287,9 +287,6 @@ pub enum RemoteTimeoutCleanup {
     /// The recorded remote process group is verified dead (killed now, or
     /// already gone), so the project's Cargo build-directory lock is free.
     Verified,
-    /// No pgid was recorded on the worker — the watchdog-tracked command never
-    /// started a process group, so there is nothing to orphan.
-    NothingRecorded,
     /// This execution records no remote pgid (no build id, or a Windows
     /// worker): cleanup cannot be attempted.
     NotAttempted,
@@ -303,7 +300,6 @@ impl std::fmt::Display for RemoteTimeoutCleanup {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let text = match self {
             Self::Verified => "remote process group verified dead",
-            Self::NothingRecorded => "no remote process group was recorded",
             Self::NotAttempted => "remote cleanup not attempted",
             Self::Unverified => "remote process group NOT verified dead",
         };
@@ -338,6 +334,16 @@ impl std::fmt::Display for SshCommandTimedOut {
 }
 
 impl std::error::Error for SshCommandTimedOut {}
+
+/// A pre-workload refusal, distinct from a compiler returning the same status.
+#[derive(Debug, thiserror::Error)]
+#[error("remote worker process identity setup is unavailable; workload was not started")]
+pub(crate) struct RemoteProcessSetupUnavailable;
+
+/// Failed completion/ownership evidence must never authorize replay elsewhere.
+#[derive(Debug, thiserror::Error)]
+#[error("remote execution completion is unconfirmed; automatic replay is unsafe")]
+pub(crate) struct RemoteExecutionUnconfirmed;
 
 /// Typed source-sync stall error (issue #59): the transfer produced NO output
 /// at all — no rsync progress refresh, stats, or itemized line — for the
@@ -396,19 +402,58 @@ pub(crate) struct SyncSilencePolicy {
 /// Group kill is `kill -KILL -PGID` with NO `--`: dash's kill builtin
 /// mishandles `kill -KILL -- -PGID` (same constraint as the in-session
 /// watchdog and the daemon kill path in `rchd::cancellation`).
-pub(crate) fn remote_timeout_kill_script(pgid_file: &str) -> String {
+pub(crate) fn remote_timeout_kill_script(pgid_file: &str, build_id: u64) -> String {
     let escaped_file = escape(Cow::from(pgid_file));
     format!(
         "f={escaped_file}\n\
-         if [ ! -r \"$f\" ]; then echo RCH_E104_KILL=no_pgid_file; exit 0; fi\n\
-         p=$(cat \"$f\" 2>/dev/null)\n\
-         case \"$p\" in ''|*[!0-9]*) echo RCH_E104_KILL=no_pgid_file; exit 0;; esac\n\
-         kill -KILL -\"$p\" 2>/dev/null\n\
-         i=0\n\
-         while [ \"$i\" -lt 10 ]; do\n\
-         if kill -0 -\"$p\" 2>/dev/null; then sleep 1; i=$((i+1)); else echo RCH_E104_KILL=verified_dead; exit 0; fi\n\
-         done\n\
-         echo RCH_E104_KILL=still_alive\n"
+         {identity}\n\
+         if rch_remote_cancel \"$f\" {build_id} kill; then\n\
+         echo RCH_E104_KILL=verified_dead\n\
+         else echo RCH_E104_KILL=still_alive; fi\n",
+        identity = rch_common::REMOTE_PROCESS_IDENTITY_SCRIPT,
+    )
+}
+
+/// The same identity publisher and verifier used by daemon crash recovery.
+/// Arguments: record path, timeout seconds, deadline marker, build ID, command.
+fn remote_build_watchdog_script() -> String {
+    format!(
+        "{}\n{}",
+        rch_common::REMOTE_PROCESS_IDENTITY_SCRIPT,
+        r#"rch_remote_record "$1" "$4" || { printf "\n%s_IDENTITY_UNAVAILABLE\n" "$3" >&2; exit 125; }
+__p=$$; __t="$2"; __m="$3"; shift 4
+__cancelled=0; __w=; __watch_start=
+trap '__cancelled=1' TERM
+"$@" 3>&- & __c=$!
+if [ "$__t" -gt 0 ] 2>/dev/null; then (
+    __timer_cancelled=0
+    trap '__timer_cancelled=1' TERM
+    sleep "$__t" 3>&- & __sleep=$!
+    rch_read_process "$__sleep" || exit 0
+    __sleep_start=$rch_observed_start
+    if [ "$__timer_cancelled" -eq 0 ]; then wait "$__sleep"; fi
+    if [ "$__timer_cancelled" -eq 1 ]; then
+        if rch_read_process "$__sleep" && [ "$rch_observed_boot" = "$rch_boot" ] &&
+            [ "$rch_observed_start" = "$__sleep_start" ]; then kill -TERM "$__sleep" 2>/dev/null; fi
+        wait "$__sleep" 2>/dev/null
+        exit 0
+    fi
+    rch_remote_leader_matches || exit 0
+    printf "\n%s\n" "$__m" >&3
+    rch_remote_leader_matches && kill -KILL -"$__p" 2>/dev/null
+) >/dev/null 2>&1 </dev/null & __w=$!; fi
+if [ -n "$__w" ] && rch_read_process "$__w"; then __watch_start=$rch_observed_start; fi
+wait "$__c"; __s=$?
+if [ "$__cancelled" -eq 1 ]; then
+    rch_remote_leader_matches && kill -KILL -"$__p" 2>/dev/null
+    exit 143
+fi
+if [ -n "$__w" ]; then
+    if rch_read_process "$__w" && [ "$rch_observed_boot" = "$rch_boot" ] &&
+        [ "$rch_observed_start" = "$__watch_start" ]; then kill -TERM "$__w" 2>/dev/null; fi
+    wait "$__w" 2>/dev/null
+fi
+exit "$__s""#,
     )
 }
 
@@ -418,7 +463,8 @@ pub(crate) fn parse_remote_timeout_kill_output(stdout: &str) -> Option<RemoteTim
     for line in stdout.lines().rev() {
         match line.trim() {
             "RCH_E104_KILL=verified_dead" => return Some(RemoteTimeoutCleanup::Verified),
-            "RCH_E104_KILL=no_pgid_file" => return Some(RemoteTimeoutCleanup::NothingRecorded),
+            // A missing record cannot exclude a delayed, still-starting job.
+            "RCH_E104_KILL=no_pgid_file" => return Some(RemoteTimeoutCleanup::Unverified),
             "RCH_E104_KILL=still_alive" => return Some(RemoteTimeoutCleanup::Unverified),
             _ => {}
         }
@@ -2832,68 +2878,56 @@ impl TransferPipeline {
         // SSH ConnectTimeout and the in-loop `command_timeout`, which kill the
         // local `ssh` on expiry; a detached `cargo.exe`/`rustc.exe` can still
         // outlive the channel close. Acceptable for v1 single-Windows-worker use.
-        let execution_command = if let Some(build_id) =
-            self.build_id.filter(|_| !self.worker_platform.is_windows())
-        {
-            let remote_pgid_file = Self::remote_pgid_file_path_for_root(&remote_path, build_id);
-            let remote_run_dir = Self::remote_run_dir_for_root(&remote_path);
-            let escaped_pgid_file = escape(Cow::from(remote_pgid_file));
-            let escaped_run_dir = escape(Cow::from(remote_run_dir));
-            // For the pgid-tracked path we do NOT use the `timeout(1)` wrapper:
-            // `timeout --foreground` only signals its direct child, so a livelocked
-            // test binary (and its fixtures) that the test harness spawned survive
-            // the cap and reparent to init as 20-45h PPID-1 orphans. Instead we run
-            // the raw command and arm an in-session watchdog that, at the wall-clock
-            // cap, SIGKILLs the whole process group (`-$pgid`) — the SAME group the
-            // daemon's stuck-detector kills (`cancellation.rs`). One group, both
-            // reapers, entire tree. Killing the group includes the leader `sh -c`,
-            // but that is a child of the ssh `sh -s`, so the outer shell still
-            // reports 137 (128+SIGKILL) for clean timeout exit semantics.
-            let escaped_command = escape(Cow::from(colored_command.as_str()));
-            // The watchdog program (single-quoted, no inner single quotes):
-            //   $1 = pgid file, $2 = timeout secs, $3 = deadline marker, $4.. = command.
-            // Record $$ (session-leader pgid) so the daemon kill path keeps working.
-            // NOTE: group kill is `kill -KILL -PGID` with NO `--`. dash's (/bin/sh)
-            // kill builtin mishandles `kill -KILL -- -PGID` (the `--` makes it a
-            // no-op), so `--` would silently fail to reap on the Ubuntu fleet. The
-            // `-PGID` form works in both dash and bash.
-            // The timer subshell MUST run with stdio detached from the SSH
-            // channel: `kill "$__w"` reaps only the subshell, and its `sleep`
-            // child reparents to init still holding any inherited pipe FDs.
-            // Without the redirects, sshd cannot see EOF on the channel until
-            // the orphaned sleep expires, so every successful build held the
-            // session for the full timeout and the client misreported it as
-            // "SSH command timed out" (#20).
-            // Only the timer holds fd 3 (original stderr). Its orphanable sleep
-            // and the workload close it, so a successful build cannot hold SSH
-            // open until the deadline. Emit before killing the timer's group.
-            let watchdog = "echo $$ > \"$1\"; __p=$$; __t=\"$2\"; __m=\"$3\"; shift 3; \"$@\" 3>&- & __c=$!; \
-if [ \"$__t\" -gt 0 ] 2>/dev/null; then ( sleep \"$__t\" 3>&-; printf \"\\n%s\\n\" \"$__m\" >&3; kill -KILL -\"$__p\" 2>/dev/null ) >/dev/null 2>&1 </dev/null & __w=$!; fi; \
-wait \"$__c\"; __s=$?; if [ -n \"$__w\" ]; then kill \"$__w\" 2>/dev/null; fi; exit \"$__s\"";
+        let execution_command =
+            if let Some(build_id) = self.build_id.filter(|_| !self.worker_platform.is_windows()) {
+                let remote_pgid_file = Self::remote_pgid_file_path_for_root(&remote_path, build_id);
+                let remote_run_dir = Self::remote_run_dir_for_root(&remote_path);
+                let escaped_pgid_file = escape(Cow::from(remote_pgid_file));
+                let escaped_run_dir = escape(Cow::from(remote_run_dir));
+                // For the pgid-tracked path we do NOT use the `timeout(1)` wrapper:
+                // `timeout --foreground` only signals its direct child, so a livelocked
+                // test binary (and its fixtures) that the test harness spawned survive
+                // the cap and reparent to init as 20-45h PPID-1 orphans. Instead we run
+                // the raw command and arm an in-session watchdog that, at the wall-clock
+                // cap, SIGKILLs the whole process group (`-$pgid`) — the SAME group the
+                // daemon's stuck-detector kills (`cancellation.rs`). One group, both
+                // reapers, entire tree. Killing the group includes the leader `sh -c`,
+                // but that is a child of the ssh `sh -s`, so the outer shell still
+                // reports 137 (128+SIGKILL) for clean timeout exit semantics.
+                let escaped_command = escape(Cow::from(colored_command.as_str()));
+                // The watchdog publishes boot UUID + leader start ticks + build ID
+                // before launching the workload, so daemon recovery rejects an
+                // observed reboot or reused leader before signalling. An abnormal
+                // external leader exit can still race the final proc read and kill.
+                // NOTE: group kill is `kill -KILL -PGID` with NO `--`. dash's (/bin/sh)
+                // kill builtin mishandles `kill -KILL -- -PGID` (the `--` makes it a
+                // no-op), so `--` would silently fail to reap on the Ubuntu fleet. The
+                // `-PGID` form works in both dash and bash.
+                // The timer detaches standard I/O and its sleep closes fd 3.
+                // Normal completion stops the timer and waits while it reaps
+                // that sleep, leaving neither an open SSH pipe nor an orphan
+                // group member that would obstruct later recovery. Only the
+                // timer retains fd 3 for its deadline marker before group kill.
+                let watchdog = escape(Cow::Owned(remote_build_watchdog_script()));
 
-            format!(
-                "mkdir -p {} && rm -f {} && \
-if command -v setsid >/dev/null 2>&1; then \
-setsid sh -c '{}' rch-build {} {} {} sh -lc {} 3>&2; \
-else \
-sh -c '{}' rch-build {} {} {} sh -lc {} 3>&2; \
-fi",
-                escaped_run_dir,
-                escaped_pgid_file,
-                watchdog,
-                escaped_pgid_file,
-                external_timeout_secs,
-                self.deadline_marker,
-                escaped_command,
-                watchdog,
-                escaped_pgid_file,
-                external_timeout_secs,
-                self.deadline_marker,
-                escaped_command,
-            )
-        } else {
-            timeout_wrapped_command
-        };
+                format!(
+                    "if ! command -v setsid >/dev/null 2>&1; then \
+printf '\\n%s\\n' {} >&2; exit 125; fi; \
+mkdir -p {} && rm -f {} && \
+setsid sh -c {} rch-build {} {} {} {} sh -lc {} 3>&2",
+                    self.remote_process_setup_marker(),
+                    escaped_run_dir,
+                    escaped_pgid_file,
+                    watchdog,
+                    escaped_pgid_file,
+                    external_timeout_secs,
+                    self.deadline_marker,
+                    build_id,
+                    escaped_command,
+                )
+            } else {
+                timeout_wrapped_command
+            };
 
         // Per-job rustc cap (issue #49). Exported in the outer session so
         // explicit worker/command/project settings all still win; see
@@ -3084,6 +3118,30 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
     /// deadline receipt at the end of its output. Exit status is checked later.
     pub(crate) fn is_deadline_marker(&self, line: &str) -> bool {
         line.trim_end_matches(['\r', '\n']) == self.deadline_marker
+    }
+
+    pub(crate) fn remote_process_setup_marker(&self) -> String {
+        format!("{}_IDENTITY_UNAVAILABLE", self.deadline_marker)
+    }
+
+    /// Invoke after source-lock and durable-completion checks. Only an exact
+    /// attempt marker plus setup status proves safe failover before workload.
+    pub(crate) fn ensure_remote_process_setup(&self, result: &CommandResult) -> Result<()> {
+        let marker = self.remote_process_setup_marker();
+        let mut matching_lines = 0;
+        let mut complete_lines = 0;
+        for line in result.stderr.split_inclusive('\n') {
+            let body = line.strip_suffix('\n').unwrap_or(line);
+            let body = body.strip_suffix('\r').unwrap_or(body);
+            if body == marker {
+                matching_lines += 1;
+                complete_lines += usize::from(line.ends_with('\n'));
+            }
+        }
+        if result.exit_code == 125 && matching_lines == 1 && complete_lines == 1 {
+            return Err(RemoteProcessSetupUnavailable.into());
+        }
+        Ok(())
     }
 
     // =========================================================================
@@ -4208,6 +4266,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
             let result = self
                 .execute_over_ssh_streaming(worker, &wrapped_command, |_| {}, |_| {})
                 .await?;
+            self.ensure_remote_process_setup(&result)?;
 
             if result.success() {
                 info!("Command succeeded in {}ms", result.duration_ms);
@@ -4256,7 +4315,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         }
 
         let pgid_file = Self::remote_pgid_file_path_for_root(&self.remote_path(), build_id);
-        let script = remote_timeout_kill_script(&pgid_file);
+        let script = remote_timeout_kill_script(&pgid_file, build_id);
 
         let destination = format!("{}@{}", worker.user, worker.host);
         let identity_file = shellexpand::tilde(&worker.identity_file);
@@ -4269,6 +4328,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         ));
         cmd.arg("-i").arg(identity_file.as_ref());
         cmd.arg(&destination).arg("sh").arg("-s");
+        cmd.kill_on_drop(true);
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -4304,14 +4364,11 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
                     RemoteTimeoutCleanup::Verified,
                     "remote process group SIGKILLed and verified dead".to_string(),
                 ),
-                Some(RemoteTimeoutCleanup::NothingRecorded) => (
-                    RemoteTimeoutCleanup::NothingRecorded,
-                    "no remote pgid file: the tracked command never started a group".to_string(),
-                ),
                 Some(RemoteTimeoutCleanup::Unverified)
                 | Some(RemoteTimeoutCleanup::NotAttempted) => (
                     RemoteTimeoutCleanup::Unverified,
-                    "remote process group still alive after SIGKILL".to_string(),
+                    "remote process group identity or termination could not be verified"
+                        .to_string(),
                 ),
                 None => (
                     RemoteTimeoutCleanup::Unverified,
@@ -7763,6 +7820,117 @@ Number of files transferred: 42
         }
     }
 
+    #[test]
+    fn remote_process_setup_refusal_requires_exact_attempt_and_status() {
+        let pipeline = TransferPipeline::new(
+            PathBuf::from("/tmp/test"),
+            "test".into(),
+            "hash".into(),
+            TransferConfig::default(),
+        );
+        let other = TransferPipeline::new(
+            PathBuf::from("/tmp/test"),
+            "test".into(),
+            "hash".into(),
+            TransferConfig::default(),
+        );
+        let marker = pipeline.remote_process_setup_marker();
+        for (exit_code, stderr, refused) in [
+            (125, format!("{marker}\n"), true),
+            (125, format!("{marker}\r\n"), true),
+            (125, "compiler returned 125\n".to_string(), false),
+            (127, "compiler returned 127\n".to_string(), false),
+            (127, format!("{marker}\n"), false),
+            (0, format!("{marker}\n"), false),
+            (125, format!("prefix {marker}\n"), false),
+            (125, format!("{marker} suffix\n"), false),
+            (125, marker.clone(), false),
+            (125, format!("{marker}\n{marker}\n"), false),
+            (125, format!("{marker}\n{marker}"), false),
+            (125, other.remote_process_setup_marker(), false),
+        ] {
+            let result = CommandResult {
+                exit_code,
+                stderr,
+                stdout: String::new(),
+                duration_ms: 0,
+            };
+            let checked = pipeline.ensure_remote_process_setup(&result);
+            assert_eq!(checked.is_err(), refused, "{result:?}");
+            if let Err(error) = checked {
+                assert!(error.is::<RemoteProcessSetupUnavailable>());
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn remote_process_setup_missing_capability_never_starts_workload() {
+        use std::process::Command;
+
+        let dir = tempfile::tempdir().unwrap().keep();
+        let bin = dir.join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        // Real setup tools are available, while setsid is genuinely absent.
+        for tool in ["touch", "mkdir", "rm"] {
+            std::os::unix::fs::symlink(format!("/bin/{tool}"), bin.join(tool)).unwrap();
+        }
+        let pipeline = TransferPipeline::new(
+            dir.clone(),
+            "test".into(),
+            "hash".into(),
+            TransferConfig::default(),
+        )
+        .with_remote_path_override(dir.to_str().unwrap())
+        .with_env_allowlist(Vec::new())
+        .with_build_id(Some(42))
+        .with_compilation_config(rch_common::CompilationConfig {
+            remote_build_jobs: RemoteBuildJobs::Off,
+            ..Default::default()
+        });
+        let workload = "printf 'started' > workload-started";
+        let unavailable = Command::new("/bin/sh") // ubs:ignore — production command with isolated capability PATH
+            .arg("-c")
+            .arg(pipeline.build_remote_command(workload, None))
+            .env("PATH", &bin)
+            .output()
+            .unwrap();
+        // Publishing to an absent parent fails after real /proc identity reads,
+        // and must give the same pre-workload refusal as a missing capability.
+        let unpublished = Command::new("setsid")
+            .arg("sh")
+            .arg("-c")
+            .arg(remote_build_watchdog_script())
+            .arg("rch-build")
+            .arg(dir.join("missing-parent/job.pgid"))
+            .arg("0")
+            .arg(&pipeline.deadline_marker)
+            .arg("42")
+            .arg("sh")
+            .arg("-c")
+            .arg(workload)
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        for output in [unavailable, unpublished] {
+            let result = CommandResult {
+                exit_code: output.status.code().unwrap(),
+                stdout: String::from_utf8(output.stdout).unwrap(),
+                stderr: String::from_utf8(output.stderr).unwrap(),
+                duration_ms: 0,
+            };
+            assert_eq!(result.exit_code, 125, "{result:?}");
+            assert!(
+                pipeline
+                    .ensure_remote_process_setup(&result)
+                    .unwrap_err()
+                    .is::<RemoteProcessSetupUnavailable>()
+            );
+        }
+        assert!(!dir.join("workload-started").exists());
+        assert!(!PathBuf::from(pipeline.remote_pgid_file_path().unwrap()).exists());
+    }
+
     #[cfg(target_os = "linux")]
     async fn run_external_timeout_fixture(directory: &Path, command: &str) -> std::process::Output {
         // These are actual stock shell/timeout processes, never Cargo/compiler
@@ -7923,14 +8091,7 @@ Number of files transferred: 42
                 deadline,
                 "{name}: {stderr}"
             );
-            assert!(
-                std::fs::read_to_string(pgid_path)
-                    .unwrap()
-                    .trim()
-                    .parse::<u32>()
-                    .unwrap()
-                    > 1
-            );
+            assert!(recorded_remote_pgid(&std::fs::read_to_string(pgid_path).unwrap(), 1) > 1);
             if name == "streams" {
                 assert_eq!(output.stdout, b"stdout");
                 assert_eq!(output.stderr, b"stderr-without-newline");
@@ -9971,15 +10132,16 @@ Number of files transferred: 42
     /// one machine-readable verdict marker.
     #[test]
     fn remote_timeout_kill_script_shape_and_parse() {
-        let script = remote_timeout_kill_script("/tmp/rch-run/proj-abc/42.pgid");
+        let script = remote_timeout_kill_script("/tmp/rch-run/proj-abc/42.pgid", 42);
         assert!(script.contains("/tmp/rch-run/proj-abc/42.pgid"));
         // Group kill with NO `--` (dash's kill builtin mishandles it).
-        assert!(script.contains("kill -KILL -\"$p\""));
+        assert!(script.contains("kill -\"$1\" -\"$rch_pgid\""));
         assert!(!script.contains("kill -KILL -- "));
-        // Verification loop + all three verdicts.
-        assert!(script.contains("kill -0 -\"$p\""));
+        // Boot/start identity and a process-table observation guard group signals.
+        assert!(script.contains("rch_remote_leader_matches || return 43"));
+        assert!(script.contains("ps -e -o pid= -o pgid= -o stat="));
+        assert!(script.contains("rch_remote_cancel \"$f\" 42 kill"));
         assert!(script.contains("RCH_E104_KILL=verified_dead"));
-        assert!(script.contains("RCH_E104_KILL=no_pgid_file"));
         assert!(script.contains("RCH_E104_KILL=still_alive"));
 
         assert_eq!(
@@ -9988,7 +10150,7 @@ Number of files transferred: 42
         );
         assert_eq!(
             parse_remote_timeout_kill_output("RCH_E104_KILL=no_pgid_file"),
-            Some(RemoteTimeoutCleanup::NothingRecorded)
+            Some(RemoteTimeoutCleanup::Unverified)
         );
         assert_eq!(
             parse_remote_timeout_kill_output("RCH_E104_KILL=still_alive"),
@@ -10018,68 +10180,121 @@ Number of files transferred: 42
         assert_eq!(found.cleanup, RemoteTimeoutCleanup::Unverified);
     }
 
-    /// Functional proof for issue #62: the kill script reaps a real,
-    /// TERM-ignoring process group recorded via its pgid file and reports
-    /// `verified_dead`; a missing pgid file reports `no_pgid_file`.
+    #[cfg(target_os = "linux")]
+    fn recorded_remote_pgid(record: &str, build_id: u64) -> u32 {
+        let fields: Vec<_> = record.trim_end().split(':').collect();
+        assert_eq!(fields.len(), 5, "versioned record: {record}");
+        assert_eq!(fields[0], "RCH_REMOTE_PROCESS_V1");
+        assert_eq!(fields[1], build_id.to_string());
+        assert_eq!(
+            fields[2],
+            std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+                .unwrap()
+                .trim()
+        );
+        assert!(fields[4].parse::<u64>().unwrap() > 0);
+        fields[3].parse::<u32>().unwrap()
+    }
+
+    /// Exercise the production publisher and timeout consumer against a real
+    /// group. Stale identity never signals it; its exact identity kills it.
     #[cfg(target_os = "linux")]
     #[test]
     fn remote_timeout_kill_script_reaps_process_group() {
         use std::process::Command;
         use std::time::{Duration, Instant};
 
-        if !Command::new("sh") // ubs:ignore — fixed test prerequisite probe, no interpolated input
-            .arg("-c")
-            .arg("command -v setsid")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-        {
-            eprintln!("setsid unavailable; skipping functional kill-script test");
-            return;
-        }
-
-        let dir = std::env::temp_dir().join(format!("rch-e104-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = tempfile::tempdir().unwrap().keep();
         let pgf = dir.join("job.pgid");
-        let _ = std::fs::remove_file(&pgf);
-
-        // A session with a TERM-ignoring member, pgid recorded like the
-        // production watchdog records it. `setsid -f` double-forks so the
-        // session leader reparents to init: on the worker the killed group is
-        // reaped by its (surviving or init) parent, and without `-f` the TEST
-        // process would be the parent, leaving unreaped zombies that keep
-        // `kill -0 -PGID` succeeding and falsely reporting `still_alive`.
-        let inner = "echo $$ > \"$1\"; trap '' TERM; while true; do sleep 1; done";
         let mut child = Command::new("setsid")
-            .arg("-f")
             .arg("sh")
             .arg("-c")
-            .arg(inner)
+            .arg(remote_build_watchdog_script())
             .arg("rch-e104-victim")
             .arg(pgf.to_str().unwrap())
+            .arg("30")
+            .arg("RCH_TEST_DEADLINE")
+            .arg("42")
+            .arg("sh")
+            .arg("-c")
+            .arg("trap '' TERM; sleep 30 & wait")
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
             .unwrap();
-        // The forked launcher exits immediately; reap it so no zombie remains.
-        let _ = child.wait();
-
         let start = Instant::now();
         while !pgf.exists() && start.elapsed() < Duration::from_secs(5) {
             std::thread::sleep(Duration::from_millis(50));
         }
         assert!(pgf.exists(), "victim should have recorded its pgid");
-        let pgid = std::fs::read_to_string(&pgf).unwrap().trim().to_string();
-        assert!(pgid.parse::<i64>().unwrap() > 1, "recorded a real pgid");
+        let record = std::fs::read_to_string(&pgf).unwrap();
+        let pgid = recorded_remote_pgid(&record, 42);
+        assert_eq!(pgid, child.id(), "recorded the actual session leader");
+        let stat = std::fs::read_to_string(format!("/proc/{pgid}/stat")).unwrap();
+        let stat_fields: Vec<_> = stat
+            .rsplit_once(") ")
+            .unwrap()
+            .1
+            .split_whitespace()
+            .collect();
+        assert_eq!(stat_fields[2], pgid.to_string());
+        let fields: Vec<_> = record.trim_end().split(':').collect();
+        assert_eq!(
+            fields[4], stat_fields[19],
+            "recorded real kernel start ticks"
+        );
 
-        let script = remote_timeout_kill_script(pgf.to_str().unwrap());
+        let wrong_boot = if fields[2] == "00000000-0000-0000-0000-000000000000" {
+            "11111111-1111-1111-1111-111111111111"
+        } else {
+            "00000000-0000-0000-0000-000000000000"
+        };
+        for stale in [
+            format!("{pgid}\n"),
+            format!(
+                "RCH_REMOTE_PROCESS_V1:41:{}:{pgid}:{}\n",
+                fields[2], fields[4]
+            ),
+            format!(
+                "RCH_REMOTE_PROCESS_V1:42:{wrong_boot}:{pgid}:{}\n",
+                fields[4]
+            ),
+            format!(
+                "RCH_REMOTE_PROCESS_V1:42:{}:{pgid}:{}\n",
+                fields[2],
+                fields[4].parse::<u64>().unwrap() + 1
+            ),
+            "malformed\n".to_string(),
+            record.trim_end().to_string(),
+            format!("{record}\n"),
+            format!("{record}\0"),
+        ] {
+            std::fs::write(&pgf, &stale).unwrap();
+            let output = Command::new("sh") // ubs:ignore — production verifier over this test's owned record
+                .arg("-c")
+                .arg(remote_timeout_kill_script(pgf.to_str().unwrap(), 42))
+                .output()
+                .unwrap();
+            assert_eq!(
+                parse_remote_timeout_kill_output(&String::from_utf8_lossy(&output.stdout)),
+                Some(RemoteTimeoutCleanup::Unverified),
+                "stale record must not grant signal authority: {stale}"
+            );
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "live leader was preserved"
+            );
+        }
+        std::fs::write(&pgf, &record).unwrap();
+
+        let script = remote_timeout_kill_script(pgf.to_str().unwrap(), 42);
         let output = Command::new("sh").arg("-c").arg(&script).output().unwrap(); // ubs:ignore — production kill script with this test's owned PGID path
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         // Safety net regardless of assertions.
         let _ = Command::new("sh") // ubs:ignore — test-owned process group; PGID parsed as positive integer above
             .arg("-c")
-            .arg(format!("kill -KILL -- -{pgid} 2>/dev/null"))
+            .arg(format!("kill -KILL -{pgid} 2>/dev/null"))
             .status();
         let _ = child.kill();
         let _ = child.wait();
@@ -10089,24 +10304,26 @@ Number of files transferred: 42
             Some(RemoteTimeoutCleanup::Verified),
             "kill script must verify the group dead: {stdout}"
         );
-        let group_alive = Command::new("sh") // ubs:ignore — read-only probe of the test's validated numeric PGID
+        let retry = Command::new("sh") // ubs:ignore — production retry over the test's recorded identity
             .arg("-c")
-            .arg(format!("kill -0 -- -{pgid} 2>/dev/null"))
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        assert!(!group_alive, "process group {pgid} must be reaped");
+            .arg(&script)
+            .output()
+            .unwrap();
+        assert_eq!(
+            parse_remote_timeout_kill_output(&String::from_utf8_lossy(&retry.stdout)),
+            Some(RemoteTimeoutCleanup::Verified),
+            "an already stopped group remains verifiably absent"
+        );
 
-        // Missing pgid file => NothingRecorded verdict.
-        let _ = std::fs::remove_file(&pgf);
-        let script = remote_timeout_kill_script(pgf.to_str().unwrap());
+        // Missing identity cannot prove the remote command never started.
+        let missing = dir.join("never-started.pgid");
+        let script = remote_timeout_kill_script(missing.to_str().unwrap(), 42);
         let output = Command::new("sh").arg("-c").arg(&script).output().unwrap(); // ubs:ignore — production missing-PGID script over this test's owned path
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(
             parse_remote_timeout_kill_output(&stdout),
-            Some(RemoteTimeoutCleanup::NothingRecorded),
-            "missing pgid file must report no_pgid_file: {stdout}"
+            Some(RemoteTimeoutCleanup::Unverified),
+            "missing identity must preserve quarantine: {stdout}"
         );
     }
 
@@ -10170,7 +10387,8 @@ Number of files transferred: 42
 
         assert!(command.contains("/tmp/rch-run/"));
         assert!(!command.contains("/.rch-run/"));
-        assert!(command.contains("echo $$ > \"$1\""));
+        assert!(command.contains("RCH_REMOTE_PROCESS_V1:"));
+        assert!(command.contains("rch_remote_record \"$1\" \"$4\""));
         assert!(command.contains("setsid sh -c"));
         assert!(command.contains(&remote_pgid_file));
     }
@@ -10203,7 +10421,7 @@ Number of files transferred: 42
         );
         // The default cargo-test cap (1800s) is passed to the watchdog as an arg.
         assert!(
-            command.contains(&format!("1800 {} sh -lc", pipeline.deadline_marker)),
+            command.contains(&format!("1800 {} 7 sh -lc", pipeline.deadline_marker)),
             "watchdog must receive the test timeout (1800s): {command}"
         );
         assert!(
@@ -10245,17 +10463,9 @@ Number of files transferred: 42
             return;
         }
 
-        let dir = std::env::temp_dir().join(format!("rch-wd-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = tempfile::tempdir().unwrap().keep();
         let pgf = dir.join("job.pgid");
         let marker = dir.join("grandchild-alive");
-        let _ = std::fs::remove_file(&pgf);
-        let _ = std::fs::remove_file(&marker);
-
-        // Exactly the production watchdog program (build_id branch).
-        let watchdog = "echo $$ > \"$1\"; __p=$$; __t=\"$2\"; shift 2; \"$@\" & __c=$!; \
-if [ \"$__t\" -gt 0 ] 2>/dev/null; then ( sleep \"$__t\"; kill -KILL -\"$__p\" 2>/dev/null ) >/dev/null 2>&1 </dev/null & __w=$!; fi; \
-wait \"$__c\"; __s=$?; if [ -n \"$__w\" ]; then kill \"$__w\" 2>/dev/null; fi; exit \"$__s\"";
 
         // Job forks a grandchild that IGNORES SIGTERM and loops forever (a livelock
         // that only a group SIGKILL can stop), then waits on it.
@@ -10267,10 +10477,12 @@ wait \"$__c\"; __s=$?; if [ -n \"$__w\" ]; then kill \"$__w\" 2>/dev/null; fi; e
         let mut child = Command::new("setsid")
             .arg("sh")
             .arg("-c")
-            .arg(watchdog)
+            .arg(remote_build_watchdog_script())
             .arg("rch-build")
             .arg(pgf.to_str().unwrap())
             .arg("2") // 2-second cap
+            .arg("RCH_TEST_DEADLINE")
+            .arg("42")
             .arg("sh")
             .arg("-lc")
             .arg(&inner)
@@ -10288,8 +10500,8 @@ wait \"$__c\"; __s=$?; if [ -n \"$__w\" ]; then kill \"$__w\" 2>/dev/null; fi; e
             std::thread::sleep(Duration::from_millis(50));
         }
         assert!(marker.exists(), "grandchild should have started");
-        let pgid = std::fs::read_to_string(&pgf).unwrap().trim().to_string();
-        assert!(pgid.parse::<i64>().unwrap() > 1, "recorded a real pgid");
+        let pgid = recorded_remote_pgid(&std::fs::read_to_string(&pgf).unwrap(), 42);
+        assert!(pgid > 1, "recorded a real pgid");
 
         // The session leader must die from the cap within a few seconds.
         let mut exited = false;
@@ -10301,11 +10513,13 @@ wait \"$__c\"; __s=$?; if [ -n \"$__w\" ]; then kill \"$__w\" 2>/dev/null; fi; e
             }
             std::thread::sleep(Duration::from_millis(100));
         }
-        // Safety net: ensure nothing leaks regardless of assertions.
-        let _ = Command::new("sh") // ubs:ignore — test-owned process group; PGID parsed as positive integer above
-            .arg("-c")
-            .arg(format!("kill -KILL -- -{pgid} 2>/dev/null"))
-            .status();
+        // If the deadline failed, cleanup still needs the exact live identity.
+        if !exited {
+            let _ = Command::new("sh") // ubs:ignore — production cleanup for the test-owned identity
+                .arg("-c")
+                .arg(remote_timeout_kill_script(pgf.to_str().unwrap(), 42))
+                .status();
+        }
         let _ = child.wait();
 
         assert!(
@@ -10315,17 +10529,87 @@ wait \"$__c\"; __s=$?; if [ -n \"$__w\" ]; then kill \"$__w\" 2>/dev/null; fi; e
 
         // The whole process group (incl. the TERM-ignoring grandchild) must be gone.
         std::thread::sleep(Duration::from_millis(300));
-        let group_alive = Command::new("sh") // ubs:ignore — read-only probe of the test's validated numeric PGID
+        let probe = Command::new("sh") // ubs:ignore — read-only process-table probe for the test-owned group
             .arg("-c")
-            .arg(format!("kill -0 -- -{pgid} 2>/dev/null"))
+            .arg(format!(
+                "{}\nrch_pgid={pgid}; rch_group_state",
+                rch_common::REMOTE_PROCESS_IDENTITY_SCRIPT
+            ))
             .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        let _ = std::fs::remove_dir_all(&dir);
+            .unwrap();
         assert!(
-            !group_alive,
+            probe.success(),
             "process group {pgid} (with the SIGTERM-ignoring grandchild) must be fully reaped"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_watchdog_cancellation_keeps_identity_until_descendants_stop() {
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().unwrap().keep();
+        let pgf = dir.join("job.pgid");
+        let descendant_file = dir.join("descendant.pid");
+        let mut child = Command::new("setsid")
+            .arg("sh")
+            .arg("-c")
+            .arg(remote_build_watchdog_script())
+            .arg("rch-build")
+            .arg(&pgf)
+            .arg("15")
+            .arg("RCH_TEST_DEADLINE")
+            .arg("42")
+            .arg("sh")
+            .arg("-c")
+            .arg("trap '' TERM; sleep 15 & printf '%s\\n' \"$!\" > \"$1\"; wait")
+            .arg("rch-descendant")
+            .arg(&descendant_file)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let started = Instant::now();
+        while !descendant_file.exists() && started.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let descendant: u32 = std::fs::read_to_string(descendant_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let output = Command::new("sh") // ubs:ignore — shared cancellation protocol and test-owned record
+            .arg("-c")
+            .arg(format!(
+                "{}\nrch_remote_cancel \"$1\" 42 term",
+                rch_common::REMOTE_PROCESS_IDENTITY_SCRIPT
+            ))
+            .arg("rch-cancel")
+            .arg(&pgf)
+            .output()
+            .unwrap();
+        let cancelled = output.status.success();
+        if !cancelled {
+            let _ = Command::new("sh") // ubs:ignore — bounded cleanup of this test's owned group
+                .arg("-c")
+                .arg(remote_timeout_kill_script(pgf.to_str().unwrap(), 42))
+                .status();
+        }
+        let status = child.wait().unwrap();
+        assert!(cancelled, "verified cancellation must complete: {output:?}");
+        assert!(!status.success(), "watchdog must terminate with its group");
+        match std::fs::read_to_string(format!("/proc/{descendant}/stat")) {
+            Ok(stat) => assert!(
+                matches!(
+                    stat.rsplit_once(") ").unwrap().1.chars().next(),
+                    Some('Z' | 'X')
+                ),
+                "TERM-ignoring descendant must no longer execute: {stat}"
+            ),
+            Err(error) => assert_eq!(error.kind(), std::io::ErrorKind::NotFound),
+        }
     }
 
     /// Functional proof of the #20 fix: after a SUCCESSFUL fast job, the
@@ -10340,25 +10624,21 @@ wait \"$__c\"; __s=$?; if [ -n \"$__w\" ]; then kill \"$__w\" 2>/dev/null; fi; e
         use std::process::Command;
         use std::time::{Duration, Instant};
 
-        let dir = std::env::temp_dir().join(format!("rch-wd-eof-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = tempfile::tempdir().unwrap().keep();
         let pgf = dir.join("job.pgid");
-        let _ = std::fs::remove_file(&pgf);
-
-        // Exactly the production watchdog program (build_id branch).
-        let watchdog = "echo $$ > \"$1\"; __p=$$; __t=\"$2\"; shift 2; \"$@\" & __c=$!; \
-if [ \"$__t\" -gt 0 ] 2>/dev/null; then ( sleep \"$__t\"; kill -KILL -\"$__p\" 2>/dev/null ) >/dev/null 2>&1 </dev/null & __w=$!; fi; \
-wait \"$__c\"; __s=$?; if [ -n \"$__w\" ]; then kill \"$__w\" 2>/dev/null; fi; exit \"$__s\"";
 
         // Generous 20s cap; the job itself completes instantly. EOF must NOT
         // wait for the cap.
         let start = Instant::now();
-        let mut child = Command::new("sh") // ubs:ignore — fixed watchdog pipe-lifetime fixture, no external command input
+        let mut child = Command::new("setsid")
+            .arg("sh")
             .arg("-c")
-            .arg(watchdog)
+            .arg(remote_build_watchdog_script())
             .arg("rch-build")
             .arg(pgf.to_str().unwrap())
             .arg("20")
+            .arg("RCH_TEST_DEADLINE")
+            .arg("42")
             .arg("sh")
             .arg("-c")
             .arg("echo job-done")
@@ -10377,7 +10657,6 @@ wait \"$__c\"; __s=$?; if [ -n \"$__w\" ]; then kill \"$__w\" 2>/dev/null; fi; e
             .unwrap();
         let eof_after = start.elapsed();
         let status = child.wait().unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
 
         assert!(status.success(), "fast job must exit 0: {status:?}");
         assert!(out.contains("job-done"), "job output must arrive: {out:?}");
@@ -10385,6 +10664,19 @@ wait \"$__c\"; __s=$?; if [ -n \"$__w\" ]; then kill \"$__w\" 2>/dev/null; fi; e
             eof_after < Duration::from_secs(5),
             "stdout EOF must arrive promptly after job success, not at the \
              timeout cap (took {eof_after:?})"
+        );
+        let pgid = recorded_remote_pgid(&std::fs::read_to_string(pgf).unwrap(), 42);
+        let timer_state = Command::new("sh") // ubs:ignore — read-only observation of this test's own group
+            .arg("-c")
+            .arg(format!(
+                "{}\nrch_pgid={pgid}; rch_group_state",
+                rch_common::REMOTE_PROCESS_IDENTITY_SCRIPT
+            ))
+            .status()
+            .unwrap();
+        assert!(
+            timer_state.success(),
+            "successful jobs must reap the timer's sleep"
         );
     }
 

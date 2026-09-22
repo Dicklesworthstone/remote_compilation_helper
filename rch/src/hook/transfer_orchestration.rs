@@ -22,10 +22,10 @@
 //! are private to this module.
 
 use super::artifact_patterns::{
-    artifact_delivery_kind,
-    expected_output_glob_list, get_custom_target_artifact_patterns, get_project_artifact_patterns,
-    kind_has_enumerable_output_contract, kind_produces_transferable_artifacts,
-    sync_back_verified_zero_build_outputs, sync_back_verified_zero_package_archives,
+    artifact_delivery_kind, expected_output_glob_list, get_custom_target_artifact_patterns,
+    get_project_artifact_patterns, kind_has_enumerable_output_contract,
+    kind_produces_transferable_artifacts, sync_back_verified_zero_build_outputs,
+    sync_back_verified_zero_package_archives,
 };
 use super::artifact_triple::{describe_findings, foreign_target_artifacts};
 use super::cargo_target_dir::{
@@ -61,6 +61,35 @@ mod cargo_manifest;
 
 #[path = "retrieval_recovery.rs"]
 pub(crate) mod recovery;
+
+/// Keep ownership failures distinct from a confirmed pre-workload setup refusal.
+fn confirm_source_pair_execution(
+    lock: Option<&mut super::ssh::RemoteSourceAuthorityLock>,
+    exit_code: i32,
+) -> anyhow::Result<()> {
+    if !(0..255).contains(&exit_code) {
+        return Err(anyhow::anyhow!(
+            "SSH execution exit {exit_code} does not prove remote completion"
+        )
+        .context(crate::transfer::RemoteExecutionUnconfirmed));
+    }
+    if let Some(lock) = lock {
+        lock.ensure_execution_finished(exit_code)
+            .context(crate::transfer::RemoteExecutionUnconfirmed)?;
+    }
+    Ok(())
+}
+
+/// A holder can disappear while durable completion is being read. Recheck the
+/// actual guard before turning a setup refusal into permission to fail over.
+pub(super) fn ensure_remote_process_setup_after_completion(
+    pipeline: &TransferPipeline,
+    result: &rch_common::CommandResult,
+    source_pair_lock: Option<&mut super::ssh::RemoteSourceAuthorityLock>,
+) -> anyhow::Result<()> {
+    confirm_source_pair_execution(source_pair_lock, result.exit_code)?;
+    pipeline.ensure_remote_process_setup(result)
+}
 
 /// A recovery request can interrupt collection, never execution. Keep the same
 /// session and authority guards outside this boundary across the one explicit
@@ -1578,6 +1607,7 @@ pub(super) async fn execute_remote_compilation(
     let stderr_capture_stderr = Rc::clone(&stderr_capture_cell);
     let deadline_triggered_stderr = Rc::clone(&deadline_triggered);
     let deadline_pipeline = pipeline.clone();
+    let process_setup_marker = pipeline.remote_process_setup_marker();
     let heartbeat_state_stdout = heartbeat_loop
         .as_ref()
         .map(BuildHeartbeatLoop::shared_state);
@@ -1624,6 +1654,9 @@ pub(super) async fn execute_remote_compilation(
                     deadline_triggered_stderr.set(true);
                     return;
                 }
+                if line.trim_end_matches(['\r', '\n']) == process_setup_marker {
+                    return;
+                }
                 if let Some(state) = heartbeat_state_stderr.as_ref() {
                     mark_heartbeat_progress(state);
                 }
@@ -1647,27 +1680,35 @@ pub(super) async fn execute_remote_compilation(
                 stderr_capture_stderr.borrow_mut().push_str(line);
             },
         )
-        .await?;
+        .await
+        .context(crate::transfer::RemoteExecutionUnconfirmed)?;
 
-    if let Some(lock) = source_pair_lock.as_mut() {
-        // The execution SSH session is separate from the holder. A healthy
-        // holder cannot prove Cargo stopped after that transport was lost.
-        lock.ensure_execution_finished(result.exit_code)?;
-    }
+    // The execution SSH session is separate from the holder. A healthy holder
+    // cannot prove Cargo stopped after that transport was lost.
+    confirm_source_pair_execution(source_pair_lock.as_mut(), result.exit_code)?;
 
     if let Some(session) = recovery_session.as_mut() {
-        let completed = pipeline
-            .read_recovery_completion(&worker_config)
-            .await?
-            .context(
-                "SSH exit has no exact durable completion evidence; use jobs recover, never replay",
-            )?;
-        anyhow::ensure!(
-            completed == result.exit_code,
-            "SSH status disagrees with durable completion"
-        );
-        session.completed(completed)?;
+        async {
+            let completed = pipeline
+                .read_recovery_completion(&worker_config)
+                .await?
+                .context(
+                    "SSH exit has no exact durable completion evidence; use jobs recover, never replay",
+                )?;
+            anyhow::ensure!(
+                completed == result.exit_code,
+                "SSH status disagrees with durable completion"
+            );
+            session.completed(completed)?;
+            Ok::<(), anyhow::Error>(())
+        }
+        .await
+        .context(crate::transfer::RemoteExecutionUnconfirmed)?;
     }
+
+    // A setup refusal authorizes failover only after the execution and source
+    // ownership checks above have established that this attempt has finished.
+    ensure_remote_process_setup_after_completion(&pipeline, &result, source_pair_lock.as_mut())?;
 
     let stderr_capture = std::mem::take(&mut *stderr_capture_cell.borrow_mut());
 
@@ -2271,7 +2312,8 @@ pub(super) async fn execute_remote_compilation(
             worker_config.id, result.exit_code, EXIT_ARTIFACT_TRANSFER_FAILED
         );
         EXIT_ARTIFACT_TRANSFER_FAILED
-    } else if result.success() && artifacts_failed
+    } else if result.success()
+        && artifacts_failed
         && kind_produces_transferable_artifacts(artifact_kind)
     {
         let code = ErrorCode::BuildArtifactMissing;

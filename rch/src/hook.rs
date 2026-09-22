@@ -258,11 +258,19 @@ enum RemotePipelineFailurePolicy {
 }
 
 fn classify_remote_pipeline_failure(error: &anyhow::Error) -> RemotePipelineFailurePolicy {
-    if is_ssh_command_timeout_error(error) {
+    if is_remote_execution_unconfirmed(error) || is_ssh_command_timeout_error(error) {
         RemotePipelineFailurePolicy::FailClosedNoLocalFallback
     } else {
         RemotePipelineFailurePolicy::AllowLocalFallback
     }
+}
+
+fn is_remote_execution_unconfirmed(error: &anyhow::Error) -> bool {
+    // Anyhow downcasting also finds a typed context, preserving the original
+    // ownership/transport error beneath the no-replay classification.
+    error
+        .downcast_ref::<crate::transfer::RemoteExecutionUnconfirmed>()
+        .is_some()
 }
 
 fn is_ssh_command_timeout_error(error: &anyhow::Error) -> bool {
@@ -273,7 +281,13 @@ fn is_ssh_command_timeout_error(error: &anyhow::Error) -> bool {
     })
 }
 
-fn remote_pipeline_failure_summary(worker_id: &WorkerId) -> String {
+fn remote_pipeline_failure_summary(worker_id: &WorkerId, error: &anyhow::Error) -> String {
+    if is_remote_execution_unconfirmed(error) {
+        return format!(
+            "[RCH] remote {} completion unconfirmed; ownership retained for recovery (no local fallback)",
+            worker_id
+        );
+    }
     format!(
         "[RCH] remote {} failed [{}] SSH command timed out (no local fallback)",
         worker_id,
@@ -3119,7 +3133,12 @@ pub async fn run_exec(
                 error
             );
         }
-        // Release worker slots
+        // An unconfirmed execution still owns its reservation. A generic
+        // failure release would fabricate completion and permit another job.
+        let retain_unconfirmed_ownership = result
+            .as_ref()
+            .err()
+            .is_some_and(is_remote_execution_unconfirmed);
         let release_exit_code = result
             .as_ref()
             .map(|ok| ok.exit_code)
@@ -3129,23 +3148,31 @@ pub async fn run_exec(
             timing.total = Some(remote_elapsed);
             timing
         });
-        let release_acknowledged = match release_worker(
-            &config.general.socket_path,
-            &worker.id,
-            estimated_cores,
-            Some(remote_build_id),
-            Some(release_exit_code),
-            None,
-            None,
-            release_timing.as_ref(),
-            Some(&wrapper_id),
-        )
-        .await
-        {
-            Ok(()) => true,
-            Err(error) => {
-                warn!("Failed to release worker slots: {}", error);
-                false
+        let release_acknowledged = if retain_unconfirmed_ownership {
+            warn!(
+                "Remote completion unconfirmed; retaining build {} ownership",
+                remote_build_id
+            );
+            false
+        } else {
+            match release_worker(
+                &config.general.socket_path,
+                &worker.id,
+                estimated_cores,
+                Some(remote_build_id),
+                Some(release_exit_code),
+                None,
+                None,
+                release_timing.as_ref(),
+                Some(&wrapper_id),
+            )
+            .await
+            {
+                Ok(()) => true,
+                Err(error) => {
+                    warn!("Failed to release worker slots: {}", error);
+                    false
+                }
             }
         };
         if let Ok(result) = result.as_ref() {
@@ -3482,7 +3509,7 @@ pub async fn run_exec(
                     == RemotePipelineFailurePolicy::FailClosedNoLocalFallback
                 {
                     warn!(
-                        "Remote execution failed on {} with SSH timeout; refusing local fallback: {}",
+                        "Remote execution failed on {}; refusing local fallback: {}",
                         worker.id, e
                     );
                     // Issue #62: an unverified post-timeout cleanup means the
@@ -3497,7 +3524,7 @@ pub async fn run_exec(
                     .await;
                     // Fail-closed refusal: the line explaining the non-zero exit must
                     // reach the agent even at stock visibility (rch#31).
-                    reporter.summary_critical(&remote_pipeline_failure_summary(&worker.id));
+                    reporter.summary_critical(&remote_pipeline_failure_summary(&worker.id, &e));
                     if release_acknowledged && let Err(error) = durable_lease.acknowledge_terminal()
                     {
                         warn!(
@@ -4211,7 +4238,11 @@ async fn handle_selection_response(
     .await;
     let remote_elapsed = remote_start.elapsed();
 
-    // Always release slots after execution
+    // Ownership/receipt loss after execution is not a terminal completion.
+    let retain_unconfirmed_ownership = result
+        .as_ref()
+        .err()
+        .is_some_and(is_remote_execution_unconfirmed);
     let release_exit_code = result
         .as_ref()
         .map(|ok| ok.exit_code)
@@ -4222,7 +4253,12 @@ async fn handle_selection_response(
         timing.total = Some(remote_elapsed);
         timing
     });
-    if let Err(e) = release_worker(
+    if retain_unconfirmed_ownership {
+        warn!(
+            "Remote completion unconfirmed; retaining worker {} ownership",
+            worker.id
+        );
+    } else if let Err(e) = release_worker(
         &config.general.socket_path,
         &worker.id,
         estimated_cores,
@@ -4483,7 +4519,7 @@ async fn handle_selection_response(
                 == RemotePipelineFailurePolicy::FailClosedNoLocalFallback
             {
                 warn!(
-                    "Remote execution pipeline failed on {} with SSH timeout; refusing local fallback: {}",
+                    "Remote execution pipeline failed on {}; refusing local fallback: {}",
                     worker.id, e
                 );
                 // Issue #62: quarantine the worker when the post-timeout
@@ -4496,7 +4532,7 @@ async fn handle_selection_response(
                     reporter,
                 )
                 .await;
-                reporter.summary_critical(&remote_pipeline_failure_summary(&worker.id));
+                reporter.summary_critical(&remote_pipeline_failure_summary(&worker.id, &e));
                 return HookOutput::allow_with_modified_command(format!(
                     "exit {}",
                     EXIT_BUILD_ERROR

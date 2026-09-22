@@ -1429,6 +1429,87 @@ cat "$RCH_OWNERSHIP_TEST_DIR/payload"
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
+    async fn source_pair_holder_loss_blocks_setup_capability_fallback() {
+        use crate::transfer::{RemoteExecutionUnconfirmed, RemoteProcessSetupUnavailable};
+
+        let dir = tempfile::tempdir().unwrap().keep();
+        let root = dir.join("source");
+        let lock = dir.join("pair.lock");
+        let mut owner = claim_test_source_pair(&lock, &root).await.unwrap();
+        std::fs::write(root.join("fixture"), "source retained for original owner").unwrap();
+        let ownership_path = dir.join("pair.lock.owner");
+        let ownership = std::fs::read(&ownership_path).unwrap();
+        let pipeline = TransferPipeline::new(
+            root.clone(),
+            "setup-capability-test".to_owned(),
+            "source-pair".to_owned(),
+            TransferConfig::default(),
+        );
+        let result = rch_common::CommandResult {
+            exit_code: 125,
+            stdout: String::new(),
+            stderr: format!("{}\n", pipeline.remote_process_setup_marker()),
+            duration_ms: 0,
+        };
+
+        // Establish that this exact setup receipt reaches the worker-fallback
+        // classification while the real holder and source pair remain owned.
+        let setup_error =
+            super::super::transfer_orchestration::ensure_remote_process_setup_after_completion(
+                &pipeline,
+                &result,
+                Some(&mut owner),
+            )
+            .unwrap_err();
+        assert!(
+            setup_error
+                .downcast_ref::<RemoteProcessSetupUnavailable>()
+                .is_some()
+        );
+        assert_eq!(
+            classify_remote_pipeline_failure(&setup_error),
+            RemotePipelineFailurePolicy::AllowLocalFallback
+        );
+
+        // Lose the actual holder after the execution receipt arrived. The
+        // production boundary must recheck it before authorizing any fallback.
+        owner.child.as_mut().unwrap().kill().await.unwrap();
+        let error =
+            super::super::transfer_orchestration::ensure_remote_process_setup_after_completion(
+                &pipeline,
+                &result,
+                Some(&mut owner),
+            )
+            .unwrap_err();
+        assert!(error.downcast_ref::<RemoteExecutionUnconfirmed>().is_some());
+        assert!(
+            error
+                .downcast_ref::<RemoteProcessSetupUnavailable>()
+                .is_none()
+        );
+        assert_eq!(
+            classify_remote_pipeline_failure(&error),
+            RemotePipelineFailurePolicy::FailClosedNoLocalFallback
+        );
+        drop(owner);
+
+        let claim_error = match claim_test_source_pair(&lock, &root).await {
+            Ok(_) => panic!("setup refusal must not release a pair whose ownership was lost"),
+            Err(error) => error,
+        };
+        assert!(
+            claim_error.to_string().contains("unfinished owner"),
+            "{claim_error:#}"
+        );
+        assert_eq!(std::fs::read(&ownership_path).unwrap(), ownership);
+        assert_eq!(
+            std::fs::read_to_string(root.join("fixture")).unwrap(),
+            "source retained for original owner"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
     async fn source_pair_execution_transport_loss_preserves_a_running_reader() {
         use tokio::io::AsyncWriteExt as _;
 
