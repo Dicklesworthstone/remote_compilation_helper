@@ -126,7 +126,9 @@ pub struct JobserverBridge {
 }
 
 impl JobserverBridge {
-    /// Mint a bridge granting `grant_slots` transferable tokens under
+    /// Mint a bridge with `grant_slots` TOTAL slots and exactly one
+    /// implicit slot already owned by the command. Its remaining C-1
+    /// transferable tokens live under
     /// `workspace_backing/.rabs-jobserver`. The workspace backing is
     /// bound at `rabs_sandbox::layout::WORKSPACE`, so both fifo paths
     /// are derived from the same relative location.
@@ -145,7 +147,7 @@ impl JobserverBridge {
         let host_dir = workspace_backing.join(BRIDGE_DIRECTORY);
         std::fs::create_dir_all(&host_dir)?;
         let (host_path, writer, _edge_auth_unused) =
-            rabs_asupersync::jobserver::mint_fifo_jobserver(slots as usize, &host_dir)?;
+            rabs_asupersync::jobserver::mint_fifo_jobserver((slots - 1) as usize, &host_dir)?;
         let name = host_path.file_name().map_or_else(
             || "jobserver.fifo".to_string(),
             |n| n.to_string_lossy().into_owned(),
@@ -239,6 +241,36 @@ mod tests {
             .expect_err("unbounded grant must be refused before allocation");
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
         assert!(!workspace.path().join(BRIDGE_DIRECTORY).exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bridge_kernel_credit_plus_implicit_slot_equals_the_grant() {
+        use std::io::Read;
+        use std::os::unix::fs::OpenOptionsExt;
+        for grant in [0, 1, 2, 8, MAX_BRIDGE_TOKENS] {
+            let workspace = tempfile::tempdir().unwrap();
+            let bridge = JobserverBridge::mint(grant, workspace.path()).unwrap();
+            let slots = grant.max(1);
+            assert!(bridge.makeflags().starts_with(&format!("-j{slots} --jobserver-auth=fifo:")));
+            let mut reader = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(0o4000) // Linux O_NONBLOCK; independent of client descriptors.
+                .open(&bridge.host_path)
+                .unwrap();
+            let mut tokens = vec![0; (slots - 1) as usize];
+            reader.read_exact(&mut tokens).unwrap();
+            assert_eq!(tokens, vec![b'|'; (slots - 1) as usize]);
+            assert_eq!(
+                reader.read(&mut [0]).unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock,
+                "the implicit slot must never become an extra readable token"
+            );
+            let path = bridge.host_path.clone();
+            drop(bridge);
+            assert!(!path.exists());
+            assert_eq!(reader.read(&mut [0]).unwrap(), 0);
+        }
     }
 
     #[test]

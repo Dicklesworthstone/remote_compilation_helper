@@ -246,9 +246,15 @@ const FIFO_O_NONBLOCK: i32 = 0o4000;
 /// Launch-path uniqueness for fifo filenames within one process.
 static FIFO_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Maximum transferable-token preload: one Linux PIPE_BUF-sized write.
+/// No consumer can drain the FIFO during initialization.
+pub const MAX_FIFO_TOKENS: usize = 4096;
+
 /// Create a named-pipe jobserver under `dir`, open the holding write
 /// end, preload `tokens` bytes, and return `(fifo_path, writer,
 /// makeflags_value)`.
+/// `tokens` excludes the launched command's implicit slot. Zero is valid
+/// for a serial command: the open, empty FIFO grants no additional work.
 ///
 /// THE single mint for both injection surfaces: edge-side managed Cargo
 /// launches ([`crate::cargo_launch`], fifo in temp space) and the
@@ -260,15 +266,20 @@ static FIFO_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::ne
 ///
 /// # Errors
 /// Typed [`std::io::Error`] from `mkfifo`, the opens, or the preload
-/// write.
+/// write; `InvalidInput` when the preload exceeds [`MAX_FIFO_TOKENS`].
 pub fn mint_fifo_jobserver(
     tokens: usize,
     dir: &std::path::Path,
 ) -> std::io::Result<(std::path::PathBuf, std::fs::File, String)> {
-    assert!(tokens > 0, "a zero-token jobserver deadlocks every client");
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
 
+    if tokens > MAX_FIFO_TOKENS {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "jobserver token preload exceeds PIPE_BUF",
+        ));
+    }
     let seq = FIFO_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let path = dir.join(format!("rabs-jobserver-{}-{seq}.fifo", std::process::id()));
     // House style: tiny external helper binaries instead of unsafe libc
@@ -294,14 +305,14 @@ pub fn mint_fifo_jobserver(
     let mut writer = std::fs::OpenOptions::new().write(true).open(&path)?;
     // Preload WHILE the prime reader still exists: a fifo write with
     // zero readers raises EPIPE/SIGPIPE. N readable bytes == N free
-    // compile slots; far below the 64 KiB buffer, so nothing blocks.
-    writer.write_all(&vec![b'|'; tokens])?;
+    // additional compile slots. The bound fits even a one-page Linux pipe.
+    writer.write_all(&[b'|'; MAX_FIFO_TOKENS][..tokens])?;
     // Prime reader may now go away; the held writer keeps the fifo up.
     drop(prime_reader);
 
     let auth = format!(
         "-j{} --jobserver-auth=fifo:{}",
-        tokens.max(1),
+        tokens + 1,
         path.display()
     );
     Ok((path, writer, auth))
@@ -311,6 +322,47 @@ pub fn mint_fifo_jobserver(
 mod tests {
     use super::*;
     use std::process::{Command, Stdio};
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fifo_preload_counts_transferables_not_the_implicit_slot() {
+        use std::os::unix::fs::OpenOptionsExt;
+        for tokens in [0, 1, 3, MAX_FIFO_TOKENS] {
+            let directory = tempfile::tempdir().unwrap();
+            let (path, mut writer, auth) = mint_fifo_jobserver(tokens, directory.path()).unwrap();
+            assert_eq!(auth, format!("-j{} --jobserver-auth=fifo:{}", tokens + 1, path.display()));
+            // A separate nonblocking descriptor measures kernel credit; no
+            // delayed reader thread can consume a token after test teardown.
+            let mut reader = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(FIFO_O_NONBLOCK)
+                .open(&path)
+                .unwrap();
+            let mut available = vec![0; tokens];
+            reader.read_exact(&mut available).unwrap();
+            assert_eq!(available, vec![b'|'; tokens]);
+            let error = reader.read(&mut [0]).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+            if let Some(byte) = available.first() {
+                writer.write_all(std::slice::from_ref(byte)).unwrap();
+                let mut returned = [0];
+                reader.read_exact(&mut returned).unwrap();
+                assert_eq!(returned[0], *byte);
+            }
+            drop(writer);
+            assert_eq!(reader.read(&mut [0]).unwrap(), 0, "closed FIFO reaches EOF");
+        }
+    }
+
+    #[test]
+    fn fifo_oversized_preload_refuses_before_filesystem_effects() {
+        let directory = tempfile::tempdir().unwrap();
+        for tokens in [MAX_FIFO_TOKENS + 1, usize::MAX] {
+            let error = mint_fifo_jobserver(tokens, directory.path()).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+            assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+        }
+    }
 
     #[test]
     fn tokens_are_bounded_by_slots() {
