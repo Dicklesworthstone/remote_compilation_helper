@@ -25,8 +25,10 @@ use rabs_wkr::session::{
     CanonicalExecRequest, execute_canonical_controlled, execute_uploaded_canonical_controlled,
     probe_capability, sample_pressure,
 };
-use rabs_wkr::source_transfer::{self, SourceOwner, SourceTransferState};
+use rabs_wkr::source_task::{SourceReply, SourceTransferTask};
+use rabs_wkr::source_transfer::{self, SourceOwner};
 use rabs_sandbox::source_transfer::SOURCE_TRANSFER;
+use std::collections::VecDeque;
 use std::future::{Future, poll_fn};
 use std::io;
 use std::path::PathBuf;
@@ -173,16 +175,56 @@ enum SessionEvent {
     // Frame, and every frame read would otherwise carry the completion's
     // footprint through the session loop.
     Completed { request_id: u64, result: Box<Result<ExecutionCompletion, String>> },
+    SourceCompleted(Box<Result<SourceReply, String>>),
+}
+
+/// Only source I/O may defer ordered data/admission frames. Keep raw bounded
+/// frames, not a second unbounded decoded queue. Ping and cancel bypass this
+/// queue while disk work is pending; all other frames retain receive order.
+#[derive(Default)]
+struct DeferredFrames {
+    frames: VecDeque<String>,
+    bytes: usize,
+}
+
+impl DeferredFrames {
+    const MAX_FRAMES: usize = 8;
+    const MAX_BYTES: usize = 2 * MAX_FRAME_BYTES;
+
+    fn push(&mut self, frame: String) -> Result<(), String> {
+        if self.frames.len() >= Self::MAX_FRAMES
+            || frame.len() > MAX_FRAME_BYTES
+            || frame.len() > Self::MAX_BYTES.saturating_sub(self.bytes)
+        {
+            return Err("source-pipeline-limit".to_owned());
+        }
+        self.bytes += frame.len();
+        self.frames.push_back(frame);
+        Ok(())
+    }
+
+    fn pop(&mut self) -> Option<String> {
+        let frame = self.frames.pop_front()?;
+        self.bytes -= frame.len();
+        Some(frame)
+    }
 }
 
 async fn next_event<R: AsyncRead + Unpin>(
     reader: &mut FrameReader, stream: &mut R, active: &mut Option<ExecutionTask>,
+    source: &mut SourceTransferTask, deferred: &mut DeferredFrames,
 ) -> SessionEvent {
     let mut read = pin!(reader.read(stream));
     poll_fn(|cx| {
         // A flood of immediately-readable pings cannot starve completion.
         if let Some(task) = active.as_mut() && let Poll::Ready(result) = task.poll_completion(cx) {
             return Poll::Ready(SessionEvent::Completed { request_id: task.request_id(), result: Box::new(result) });
+        }
+        if let Poll::Ready(result) = source.poll_completion(cx) {
+            return Poll::Ready(SessionEvent::SourceCompleted(Box::new(result)));
+        }
+        if !source.is_pending() && let Some(frame) = deferred.pop() {
+            return Poll::Ready(SessionEvent::Frame(Ok(Some(frame))));
         }
         read.as_mut().poll(cx).map(SessionEvent::Frame)
     }).await
@@ -348,13 +390,21 @@ where
     let mut pending_output: Option<PendingOutput> = None;
     let mut last_output_ack: Option<OutputIdentity> = None;
     let mut artifact_transfer = ArtifactTransferState::default();
-    let mut source_transfer = SourceTransferState::default();
+    let mut source_transfer = SourceTransferTask::default();
+    let mut deferred = DeferredFrames::default();
     let mut retained_result: Option<(u64, String)> = None;
     let outcome = async {
         loop {
             if Cx::current().is_some_and(|cx| cx.checkpoint().is_err()) { return Err("session cancelled".to_owned()); }
             let mut exit_after_reply = false;
-            let reply = match next_event(&mut reader, stream, &mut active).await {
+            let reply = match next_event(&mut reader, stream, &mut active,
+                &mut source_transfer, &mut deferred).await
+            {
+                SessionEvent::SourceCompleted(result) => {
+                    let completed = (*result).map_err(|error| format!("source operation failed: {error}"))?;
+                    completed.response.map(|reply| reply.to_string())
+                        .unwrap_or_else(|reason| request_error(Some(completed.request_id), &reason))
+                }
                 SessionEvent::Completed { request_id, result } => {
                     let digest = active.as_ref().and_then(ExecutionTask::retained_result_digest);
                     drop(active.take());
@@ -387,12 +437,24 @@ where
                         }
                     };
                     let request_id = value.get("request_id").and_then(serde_json::Value::as_u64);
+                    if source_transfer.is_pending()
+                        && !matches!(value.get("kind").and_then(serde_json::Value::as_str),
+                            Some("ping" | "cancel"))
+                    {
+                        // Do not reorder a pipelined seal/execute ahead of its
+                        // preceding write. An observed EOF abandons queued
+                        // frames rather than launching them during cleanup.
+                        deferred.push(frame)?;
+                        continue;
+                    }
                     match value.get("kind").and_then(|kind| kind.as_str()) {
                         Some("source-begin" | "source-chunk" | "source-seal") => {
-                            source_transfer.handle(&value, source_transfer_enabled,
+                            match source_transfer.submit(&value, source_transfer_enabled,
                                 active.is_some() || pending_output.is_some() || artifact_transfer.is_pending())
-                                .map(|reply| reply.to_string())
-                                .unwrap_or_else(|reason| request_error(request_id, &reason))
+                            {
+                                Ok(()) => continue,
+                                Err(reason) => request_error(request_id, &reason),
+                            }
                         }
                         Some("ping") => {
                             let pressure = heartbeat();
@@ -402,6 +464,8 @@ where
                                 "active_request_id": active.as_ref().map(ExecutionTask::request_id),
                                 "pending_output_request_id": pending_output.as_ref().map(|output| output.identity.request_id),
                                 "pending_artifact_request_id": artifact_transfer.pending_request_id(),
+                                "pending_source_request_id": source_transfer.request_id(),
+                                "source_operation_pending": source_transfer.is_pending(),
                             }).to_string()
                         }
                         Some("request-status") => match (journal.as_deref(), request_id) {
@@ -482,6 +546,14 @@ where
                                 let accepted = task.cancel(StopReason::Cancelled);
                                 serde_json::json!({"kind": "cancel-accepted", "request_id": id, "accepted": accepted, "cleanup_pending": true}).to_string()
                             }
+                            (_, Some(id)) => match source_transfer.cancel(id) {
+                                Some(accepted) => serde_json::json!({
+                                    "kind":"cancel-accepted", "request_id":id,
+                                    "accepted":accepted, "stage":"source-upload",
+                                    "cleanup_pending":true,
+                                }).to_string(),
+                                None => request_error(request_id, "unknown-request"),
+                            },
                             _ => request_error(request_id, "unknown-request"),
                         },
                         Some("canonical-exec") => {
@@ -566,6 +638,10 @@ where
     }
     drop(pending_output);
     drop(artifact_transfer);
+    // Closing the task joins its single accepted filesystem operation before
+    // staged source can be removed. This is not cancellable kernel I/O; a
+    // stuck filesystem can still delay teardown, but no worker is detached.
+    drop(source_transfer);
     outcome
 }
 
@@ -966,7 +1042,10 @@ mod tests {
             while !worker_release.load(Ordering::Acquire) && control.reason().is_none() { std::thread::sleep(Duration::from_millis(1)); }
             result(1)
         }).unwrap());
-        let mut reader = FrameReader::default(); let mut event = Box::pin(next_event(&mut reader, &mut wire, &mut active));
+        let mut source = SourceTransferTask::default();
+        let mut deferred = DeferredFrames::default();
+        let mut reader = FrameReader::default();
+        let mut event = Box::pin(next_event(&mut reader, &mut wire, &mut active, &mut source, &mut deferred));
         let waker = Waker::from(Arc::new(ThreadWake(std::thread::current())));
         assert!(event.as_mut().poll(&mut Context::from_waker(&waker)).is_pending());
         release.store(true, Ordering::Release);

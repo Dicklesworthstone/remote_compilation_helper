@@ -57,9 +57,13 @@ fn partial_or_unnegotiated_source_never_burns_execution_admission() {
         let mut corrupt = chunk(&request); corrupt["chunk_sha256"] = json!("00".repeat(32));
         peer.frame(corrupt);
         peer.frame(json!({"kind":"request-status", "request_id":1}));
-        peer.close();
-        wait(drive_session_with_sources(&mut wire, &report(), false, Some(&mut journal),
-            false, enabled, |_, _, _, _| panic!("incomplete input launched"), pressure)).unwrap();
+        let report = report();
+        let mut driver = Box::pin(drive_session_with_sources(&mut wire, &report, false, Some(&mut journal),
+            false, enabled, |_, _, _, _| panic!("incomplete input launched"), pressure));
+        // Observe all requested refusals before disconnecting. Closing while
+        // source I/O is pending now intentionally abandons queued requests.
+        pump(driver.as_mut(), &peer, 6);
+        peer.close(); wait(driver).unwrap();
         let replies = peer.replies();
         assert_eq!(replies[0]["kind"], "error");
         assert_eq!(replies[2]["kind"], "error");
@@ -107,9 +111,10 @@ fn disconnect_does_not_remove_source_before_the_execution_owner_drains() {
     let mut journal = WorkerJournal::open(root.path(), "session-test", "coord").unwrap();
     let mut wire = Wire::default(); let peer = wire.clone();
     let original = source_request(3);
-    upload(&peer, &original); peer.frame(original); peer.close();
+    upload(&peer, &original);
     let cleaned = Arc::new(AtomicBool::new(false)); let observed = Arc::clone(&cleaned);
-    wait(drive_session_with_sources(&mut wire, &report(), false, Some(&mut journal), false, true,
+    let report = report();
+    let mut driver = Box::pin(drive_session_with_sources(&mut wire, &report, false, Some(&mut journal), false, true,
         |request, timeout, _, source| {
             let cleaned = Arc::clone(&observed);
             ExecutionTask::spawn(request.request_id, timeout, move |control| {
@@ -120,7 +125,12 @@ fn disconnect_does_not_remove_source_before_the_execution_owner_drains() {
                 cleaned.store(true, Ordering::Release);
                 result(request.request_id)
             })
-        }, pressure)).unwrap();
+        }, pressure));
+    pump(driver.as_mut(), &peer, 3);
+    peer.frame(original); peer.frame(json!({"kind":"ping"}));
+    pump(driver.as_mut(), &peer, 4);
+    assert_eq!(peer.replies()[3]["active_request_id"], 3, "disconnect must exercise an admitted execution");
+    peer.close(); wait(driver).unwrap();
     assert!(cleaned.load(Ordering::Acquire));
     assert_eq!(journal.status(3)["receipt"]["stop_reason"], "session-lost");
 }
@@ -169,4 +179,111 @@ fn resumed_source_bound_results_need_no_worker_source_directory_or_new_upload() 
     wait(driver).unwrap();
     assert!(!journal.has_retained_result());
     assert_eq!(journal.high_water(), Some(4));
+}
+
+#[test]
+fn pipelined_source_frames_finish_in_order_and_controls_can_interleave() {
+    let root = tempfile::tempdir().unwrap();
+    let mut journal = WorkerJournal::open(root.path(), "session-test", "coord").unwrap();
+    let mut wire = Wire::default(); let peer = wire.clone(); let report = report();
+    let original = source_request(10);
+    peer.frame(begin(&original));
+    peer.frame(chunk(&original));
+    peer.frame(json!({"kind":"ping"}));
+    peer.frame(seal(&original));
+    peer.frame(json!({"kind":"request-status", "request_id":10}));
+    let mut driver = Box::pin(drive_session_with_sources(&mut wire, &report, false, Some(&mut journal),
+        false, true, |_, _, _, _| panic!("upload is not execution admission"), pressure));
+    pump(driver.as_mut(), &peer, 5);
+    peer.close(); wait(driver).unwrap();
+    let replies = peer.replies();
+    let control: Vec<_> = replies.iter().filter(|reply| reply["kind"] == "heartbeat").collect();
+    assert_eq!(control.len(), 1);
+    assert!(control[0]["active_request_id"].is_null());
+    assert_eq!(control[0]["pending_source_request_id"], 10);
+    let ordered: Vec<_> = replies.iter().filter(|reply| reply["kind"] != "heartbeat").collect();
+    assert_eq!(ordered.len(), 4);
+    assert_eq!(ordered[0]["kind"], "source-ready"); assert_eq!(ordered[0]["sealed"], false);
+    assert_eq!(ordered[1]["kind"], "source-chunk-accepted");
+    assert_eq!(ordered[1]["next_offset"], SOURCE.len());
+    assert_eq!(ordered[2]["kind"], "source-ready"); assert_eq!(ordered[2]["sealed"], true);
+    assert_eq!(ordered[3]["status"], "unknown");
+    assert!(journal.high_water().is_none());
+}
+
+#[test]
+fn cancelling_a_sealed_upload_is_exact_id_idempotent_and_prevents_admission() {
+    let root = tempfile::tempdir().unwrap();
+    let mut journal = WorkerJournal::open(root.path(), "session-test", "coord").unwrap();
+    let mut wire = Wire::default(); let peer = wire.clone(); let report = report();
+    let original = source_request(11);
+    upload(&peer, &original);
+    let mut driver = Box::pin(drive_session_with_sources(&mut wire, &report, false, Some(&mut journal),
+        false, true, |_, _, _, _| panic!("cancelled source reached durable execution admission"), pressure));
+    pump(driver.as_mut(), &peer, 3);
+    assert_eq!(peer.replies()[2]["sealed"], true);
+    peer.frame(json!({"kind":"cancel", "request_id":12}));
+    peer.frame(json!({"kind":"cancel", "request_id":11}));
+    peer.frame(json!({"kind":"cancel", "request_id":11}));
+    peer.frame(original.clone());
+    peer.frame(begin(&original));
+    peer.frame(json!({"kind":"request-status", "request_id":11}));
+    peer.frame(json!({"kind":"ping"}));
+    pump(driver.as_mut(), &peer, 10);
+    peer.close(); wait(driver).unwrap();
+    let replies = peer.replies();
+    assert_eq!(replies[3]["reason"], "unknown-request");
+    assert_eq!(replies[4]["kind"], "cancel-accepted");
+    assert_eq!(replies[4]["request_id"], 11);
+    assert_eq!(replies[4]["stage"], "source-upload");
+    assert_eq!(replies[4]["accepted"], true);
+    assert_eq!(replies[5]["accepted"], false);
+    assert_eq!(replies[6]["kind"], "error");
+    assert_eq!(replies[7]["reason"], "source upload cancelled");
+    assert_eq!(replies[8]["status"], "unknown");
+    assert_eq!(replies[9]["kind"], "heartbeat");
+    assert!(replies[9]["active_request_id"].is_null());
+    assert!(journal.high_water().is_none());
+}
+
+#[test]
+fn source_completion_wakes_a_partial_control_frame_without_losing_bytes() {
+    let mut wire = Wire::default(); let peer = wire.clone(); peer.bytes(b"{\"kind\":");
+    let mut source = SourceTransferTask::default();
+    source.submit(&begin(&source_request(12)), true, false).unwrap();
+    let mut reader = FrameReader::default(); let mut deferred = DeferredFrames::default();
+    let mut active = None;
+    match wait(next_event(&mut reader, &mut wire, &mut active, &mut source, &mut deferred)) {
+        SessionEvent::SourceCompleted(result) => {
+            let completed = (*result).unwrap();
+            assert_eq!(completed.request_id, 12);
+            assert_eq!(completed.response.unwrap()["sealed"], false);
+        }
+        _ => panic!("source completion was lost while the control frame was incomplete"),
+    }
+    peer.bytes(b"\"ping\"}\n");
+    assert_eq!(wait(reader.read(&mut wire)).unwrap(), Some("{\"kind\":\"ping\"}".to_owned()));
+}
+
+#[test]
+fn source_pipeline_bounds_count_and_bytes_without_mutating_on_refusal() {
+    let mut queue = DeferredFrames::default();
+    for n in 0..DeferredFrames::MAX_FRAMES {
+        queue.push(n.to_string()).unwrap();
+    }
+    let bytes = queue.bytes;
+    assert_eq!(queue.push("overflow".to_owned()).unwrap_err(), "source-pipeline-limit");
+    assert_eq!(queue.bytes, bytes);
+    for n in 0..DeferredFrames::MAX_FRAMES { assert_eq!(queue.pop().unwrap(), n.to_string()); }
+    assert!(queue.pop().is_none()); assert_eq!(queue.bytes, 0);
+
+    let frame = "x".repeat(MAX_FRAME_BYTES);
+    queue.push(frame.clone()).unwrap(); queue.push(frame.clone()).unwrap();
+    assert_eq!(queue.bytes, DeferredFrames::MAX_BYTES);
+    assert!(queue.push("x".to_owned()).is_err());
+    assert_eq!(queue.pop().unwrap(), frame);
+    assert_eq!(queue.pop().unwrap(), frame);
+    assert_eq!(queue.bytes, 0);
+    assert!(queue.push("x".repeat(MAX_FRAME_BYTES + 1)).is_err());
+    assert!(queue.frames.is_empty());
 }
