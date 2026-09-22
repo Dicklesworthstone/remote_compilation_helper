@@ -35,6 +35,7 @@ const ADMISSION_BUDGET: Duration = Duration::from_secs(10);
 const TRANSFER_BUDGET: Duration = Duration::from_secs(5 * 60);
 const ACK_BUDGET: Duration = Duration::from_secs(10);
 const MAX_EXECUTION_MS: u64 = 30 * 60 * 1000;
+const RECORD_READ_BYTES: usize = 4096;
 
 fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
@@ -403,11 +404,60 @@ enum Phase {
     Acknowledgment,
 }
 
+/// Decode one record while retaining any coalesced tail on the connection.
+/// Only the new bytes are scanned after each read; fragmented input cannot
+/// force repeated scans of the whole prefix. The caller's timeout covers this
+/// entire future, including cooperative yields and JSON decoding.
+async fn read_record<S: AsyncRead + Unpin>(
+    stream: &mut S,
+    buffered: &mut Vec<u8>,
+) -> io::Result<Value> {
+    let mut scanned = 0;
+    let mut reads = 0;
+    let mut chunk = [0_u8; RECORD_READ_BYTES];
+    loop {
+        if let Some(offset) = buffered[scanned..].iter().position(|byte| *byte == b'\n') {
+            let end = scanned + offset;
+            require(end <= MAX_JSON_RECORD, "worker record exceeds ATP limit")?;
+            let value = serde_json::from_slice(&buffered[..end])
+                .map_err(|error| invalid(error.to_string()))?;
+            buffered.drain(..=end);
+            return Ok(value);
+        }
+        require(buffered.len() <= MAX_JSON_RECORD, "worker record exceeds ATP limit")?;
+        scanned = buffered.len();
+        // One extra byte admits the terminator at the exact record limit, not
+        // an unbounded overshoot followed by a late size check.
+        let capacity = chunk.len().min(MAX_JSON_RECORD + 1 - buffered.len());
+        let count = stream.read(&mut chunk[..capacity]).await?;
+        if count == 0 {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "worker record incomplete"));
+        }
+        buffered.extend_from_slice(&chunk[..count]);
+        reads += 1;
+        if reads == 32 {
+            // An always-ready peer still yields to cancellation and timers.
+            let mut yielded = false;
+            std::future::poll_fn(|cx| {
+                if yielded {
+                    std::task::Poll::Ready(())
+                } else {
+                    yielded = true;
+                    cx.waker().wake_by_ref();
+                    std::task::Poll::Pending
+                }
+            }).await;
+            reads = 0;
+        }
+    }
+}
+
 /// One operator owns this runtime and stream; block_on is never nested. Absolute
 /// phase deadlines survive fragmented reads, telemetry and repeated range reads.
 struct RecordPeer<'a, S> {
     runtime: &'a Runtime,
     stream: S,
+    buffered: Vec<u8>,
     until: Instant,
     execution_budget: Duration,
     phase: Phase,
@@ -424,6 +474,7 @@ impl<'a, S> RecordPeer<'a, S> {
         Self {
             runtime,
             stream,
+            buffered: Vec::new(),
             until: Instant::now() + ADMISSION_BUDGET,
             execution_budget: Duration::from_millis(millis) + Duration::from_secs(60),
             phase: Phase::Admission,
@@ -508,32 +559,21 @@ impl<S: AsyncRead + AsyncWrite + Unpin> WorkerPeer for RecordPeer<'_, S> {
     fn receive(&mut self) -> io::Result<Value> {
         let budget = self.remaining()?;
         let stream = &mut self.stream;
+        let buffered = &mut self.buffered;
         let result = self.runtime.block_on(async {
-            asupersync::time::timeout(asupersync::time::wall_now(), budget, async {
-                let mut bytes = Vec::new();
-                let mut byte = [0];
-                loop {
-                    if stream.read(&mut byte).await? == 0 {
-                        return Err(io::Error::new(
-                            io::ErrorKind::UnexpectedEof,
-                            "worker record incomplete",
-                        ));
-                    }
-                    if byte[0] == b'\n' {
-                        return serde_json::from_slice::<Value>(&bytes)
-                            .map_err(|error| invalid(error.to_string()));
-                    }
-                    require(
-                        bytes.len() < MAX_JSON_RECORD,
-                        "worker record exceeds ATP limit",
-                    )?;
-                    bytes.push(byte[0]);
-                }
-            })
+            asupersync::time::timeout(
+                asupersync::time::wall_now(), budget, read_record(stream, buffered),
+            )
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "worker read deadline"))?
         });
         self.failed |= result.is_err();
+        // JSON parsing and immediately-ready buffered reads must not let a late
+        // result escape its absolute deadline and obtain a fresh transfer budget.
+        if result.is_ok() && let Err(error) = self.remaining() {
+            self.failed = true;
+            return Err(error);
+        }
         if let Ok(value) = &result
             && self.phase == Phase::Execution
             && value["kind"] == "exec-result"
@@ -1175,5 +1215,165 @@ mod tests {
                 assert_eq!(peer.until, until);
             }
         }
+    }
+
+    struct RecordWire {
+        input: VecDeque<u8>,
+        fragment: usize,
+        reads: usize,
+        written: Vec<u8>,
+    }
+
+    impl RecordWire {
+        fn new(input: Vec<u8>, fragment: usize) -> Self {
+            assert!(fragment > 0);
+            Self { input: input.into(), fragment, reads: 0, written: Vec::new() }
+        }
+    }
+
+    impl AsyncRead for RecordWire {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            buffer: &mut asupersync::io::ReadBuf<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            let this = self.get_mut();
+            this.reads += 1;
+            let count = buffer.remaining().min(this.fragment).min(this.input.len());
+            let bytes: Vec<_> = this.input.drain(..count).collect();
+            buffer.put_slice(&bytes);
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for RecordWire {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            bytes: &[u8],
+        ) -> std::task::Poll<io::Result<usize>> {
+            self.get_mut().written.extend_from_slice(bytes);
+            std::task::Poll::Ready(Ok(bytes.len()))
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[test]
+    fn large_native_records_use_bounded_chunk_reads_not_one_poll_per_byte() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+        let value = json!({"kind":"output-chunk", "data_hex":"ab".repeat(65_536)});
+        let bytes = format!("{value}\n").into_bytes();
+        let expected_reads = bytes.len().div_ceil(RECORD_READ_BYTES);
+        let mut peer = RecordPeer::new(&runtime, RecordWire::new(bytes, RECORD_READ_BYTES), &request());
+        assert_eq!(peer.receive().unwrap(), value);
+        assert_eq!(peer.stream.reads, expected_reads);
+        assert!(peer.buffered.is_empty());
+        assert!(peer.stream.written.is_empty());
+    }
+
+    #[test]
+    fn native_record_buffer_preserves_coalesced_frames_and_fragmented_utf8() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+        let values = [json!({"kind":"heartbeat", "label":"雪🦀\nquoted"}), json!([1, 2]), json!({"ok":true})];
+        let bytes = values.iter().map(|value| format!("{value}\n")).collect::<String>().into_bytes();
+        for fragment in [1, 7, RECORD_READ_BYTES] {
+            let mut peer = RecordPeer::new(&runtime, RecordWire::new(bytes.clone(), fragment), &request());
+            for value in &values {
+                assert_eq!(peer.receive().unwrap(), *value);
+            }
+            assert!(peer.buffered.is_empty());
+            assert!(peer.stream.input.is_empty());
+            if fragment == RECORD_READ_BYTES {
+                assert_eq!(peer.stream.reads, 1, "coalesced tails should not cause another stream read");
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_or_truncated_native_record_poisons_buffered_continuation() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+        for (bytes, expected) in [
+            (b"{bad}\n{\"kind\":\"exec-result\"}\n".to_vec(), io::ErrorKind::InvalidData),
+            (b"\xff\n{}\n".to_vec(), io::ErrorKind::InvalidData),
+            (b"{\"kind\":".to_vec(), io::ErrorKind::UnexpectedEof),
+            (Vec::new(), io::ErrorKind::UnexpectedEof),
+        ] {
+            let mut peer = RecordPeer::new(&runtime, RecordWire::new(bytes, RECORD_READ_BYTES), &request());
+            assert_eq!(peer.receive().unwrap_err().kind(), expected);
+            assert!(peer.failed);
+            let reads = peer.stream.reads;
+            assert!(peer.receive().unwrap_err().to_string().contains("no retry"));
+            assert_eq!(peer.stream.reads, reads);
+            assert!(peer.send(&request()).is_err());
+            assert!(peer.stream.written.is_empty());
+        }
+    }
+
+    #[test]
+    fn native_record_exact_limit_is_accepted_and_oversize_is_terminal() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+        for extra in [0, 1] {
+            let value = "x".repeat(MAX_JSON_RECORD - 2 + extra);
+            let bytes = format!("\"{value}\"\n").into_bytes();
+            let mut peer = RecordPeer::new(&runtime, RecordWire::new(bytes, RECORD_READ_BYTES), &request());
+            let result = peer.receive();
+            if extra == 0 {
+                assert_eq!(result.unwrap(), json!(value));
+                assert!(peer.buffered.is_empty());
+            } else {
+                assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
+                assert!(peer.failed);
+                assert!(peer.buffered.len() <= MAX_JSON_RECORD + 1);
+                assert!(peer.receive().is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn buffered_execution_result_cannot_refresh_an_expired_phase() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+        let bytes = b"{\"kind\":\"heartbeat\"}\n{\"kind\":\"exec-result\"}\n".to_vec();
+        let mut peer = RecordPeer::new(&runtime, RecordWire::new(bytes, RECORD_READ_BYTES), &request());
+        peer.begin_frame(Some("canonical-exec")).unwrap();
+        assert_eq!(peer.receive().unwrap()["kind"], "heartbeat");
+        assert!(!peer.buffered.is_empty());
+        let reads = peer.stream.reads;
+        peer.until = Instant::now() - Duration::from_secs(1);
+        let expired = peer.until;
+        assert_eq!(peer.receive().unwrap_err().kind(), io::ErrorKind::TimedOut);
+        assert!(peer.phase == Phase::Execution);
+        assert_eq!(peer.until, expired);
+        assert_eq!(peer.stream.reads, reads);
+        assert!(peer.begin_frame(Some("result-resume")).is_err());
+    }
+
+    #[test]
+    fn buffered_results_preserve_recovery_and_shared_ack_deadlines() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+        let bytes = b"{\"kind\":\"exec-result\",\"resumed\":true}\n{\"kind\":\"output-acknowledged\"}\n".to_vec();
+        let mut peer = RecordPeer::new(&runtime, RecordWire::new(bytes, RECORD_READ_BYTES), &request());
+        peer.begin_frame(Some("result-resume")).unwrap();
+        let transfer_until = peer.until;
+        assert_eq!(peer.receive().unwrap()["kind"], "exec-result");
+        assert_eq!(peer.until, transfer_until, "resume cannot renew its transfer budget");
+        assert!(peer.phase == Phase::Transfer);
+        peer.begin_frame(Some("output-ack")).unwrap();
+        let ack_until = peer.until;
+        assert_eq!(peer.receive().unwrap()["kind"], "output-acknowledged");
+        peer.begin_frame(Some("artifact-ack")).unwrap();
+        assert_eq!(peer.until, ack_until);
+        assert!(peer.phase == Phase::Acknowledgment);
+        assert_eq!(peer.stream.reads, 1);
     }
 }
