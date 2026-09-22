@@ -288,8 +288,9 @@ fn main() {
                  \n\
                  USAGE: rabsd [--version|--help|--check-config|--run-for-ms N]\n\
                  PREPARE: rabsd --worker-prepare <absolute-source-root> <spec.json> <new-absolute-bundle-directory>\n\
-                 spec.json uses canonical-exec fields plus source_files or source_roots,\n\
+                 spec.json uses canonical-exec fields plus source_files, source_roots or cargo_source,\n\
                  instead of source_manifest or workspace_backing. Preparation does not build.\n\
+                 cargo_source: {manifest: \"app/Cargo.toml\"} discovers a locked offline local Cargo graph.\n\
                  Preparation saves request.json and source/; only selected regular files are copied.\n\
                  Execute with --source-root <bundle>/source and <bundle>/request.json, not the old checkout.\n\
                  OPERATOR: rabsd --worker-exec-loopback <127.0.0.1:port> <worker> <request.json> <new-absolute-directory>\n\

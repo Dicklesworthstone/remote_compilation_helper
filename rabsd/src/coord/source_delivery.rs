@@ -11,12 +11,11 @@ mod preparation;
 use super::worker_delivery::{MAX_FRAME_BYTES, WorkerAuthentication, WorkerPeer, validate_request};
 use rabs_asupersync::worker_transport::MAX_JSON_RECORD;
 use rabs_sandbox::cargo_home::{CARGO_HOME_SOURCE_VERSION, CargoHomeProjection};
-use rabs_sandbox::snapshot_capture::{MemberKind, SealedSourceSnapshot};
 #[cfg(all(test, unix))]
 use rabs_sandbox::snapshot_capture::capture_sealed_source;
+use rabs_sandbox::snapshot_capture::{MemberKind, SealedSourceSnapshot};
 use rabs_sandbox::source_transfer::{
-    MAX_SOURCE_CHUNK, MAX_SOURCE_FILES, SOURCE_TRANSFER, SourceFile,
-    SourceManifest, SourceReceiver,
+    MAX_SOURCE_CHUNK, MAX_SOURCE_FILES, SOURCE_TRANSFER, SourceFile, SourceManifest, SourceReceiver,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -33,18 +32,35 @@ fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 fn require(condition: bool, message: &str) -> io::Result<()> {
-    if condition { Ok(()) } else { Err(invalid(message)) }
+    if condition {
+        Ok(())
+    } else {
+        Err(invalid(message))
+    }
 }
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 fn digest(value: &Value) -> io::Result<[u8; 32]> {
-    let value = value.as_str().ok_or_else(|| invalid("source digest is not a string"))?;
-    require(value.len() == 64 && value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
-        "source digest must be 64 lowercase hex digits")?;
+    let value = value
+        .as_str()
+        .ok_or_else(|| invalid("source digest is not a string"))?;
+    require(
+        value.len() == 64
+            && value
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+        "source digest must be 64 lowercase hex digits",
+    )?;
     let mut digest = [0_u8; 32];
     for (slot, pair) in digest.iter_mut().zip(value.as_bytes().chunks_exact(2)) {
-        let digit = |byte: u8| if byte <= b'9' { byte - b'0' } else { byte - b'a' + 10 };
+        let digit = |byte: u8| {
+            if byte <= b'9' {
+                byte - b'0'
+            } else {
+                byte - b'a' + 10
+            }
+        };
         *slot = (digit(pair[0]) << 4) | digit(pair[1]);
     }
     Ok(digest)
@@ -61,11 +77,17 @@ fn manifest_value(manifest: &SourceManifest) -> Value {
 /// projection policy. The original field remains unchanged in the saved request
 /// and its fingerprint. This validates intent, not Cargo resolution provenance.
 fn validate_cargo_home(request: &Value, manifest: &SourceManifest) -> io::Result<()> {
-    let Some(home) = request.get("cargo_home") else { return Ok(()); };
-    require(home.as_object().is_some_and(|object| object.len() == 2)
-        && home["version"] == CARGO_HOME_SOURCE_VERSION,
-        "cargo_home requires a supported version and prefix")?;
-    let prefix = home["prefix"].as_str().ok_or_else(|| invalid("cargo_home prefix must be a string"))?;
+    let Some(home) = request.get("cargo_home") else {
+        return Ok(());
+    };
+    require(
+        home.as_object().is_some_and(|object| object.len() == 2)
+            && home["version"] == CARGO_HOME_SOURCE_VERSION,
+        "cargo_home requires a supported version and prefix",
+    )?;
+    let prefix = home["prefix"]
+        .as_str()
+        .ok_or_else(|| invalid("cargo_home prefix must be a string"))?;
     CargoHomeProjection::new(prefix, manifest)?;
     Ok(())
 }
@@ -73,30 +95,56 @@ fn validate_cargo_home(request: &Value, manifest: &SourceManifest) -> io::Result
 /// Validate the optional source declaration without requiring source bytes.
 /// Resume and verified local delivery recovery use this without a checkout.
 pub fn request_manifest(request: &Value) -> io::Result<Option<SourceManifest>> {
-    require(request.get("source_files").is_none() && request.get("source_roots").is_none(),
-        "source_files/source_roots are preparation specifications, not execution manifests; use --worker-prepare")?;
+    require(
+        request.get("source_files").is_none()
+            && request.get("source_roots").is_none()
+            && request.get("cargo_source").is_none(),
+        "source_files/source_roots/cargo_source are preparation specifications, not execution manifests; use --worker-prepare",
+    )?;
     let Some(value) = request.get("source_manifest") else {
-        require(request.get("cargo_home").is_none(), "cargo_home requires an uploaded source_manifest")?;
+        require(
+            request.get("cargo_home").is_none(),
+            "cargo_home requires an uploaded source_manifest",
+        )?;
         return Ok(None);
     };
-    require(request.get("workspace_backing").is_none(),
-        "source_manifest and workspace_backing are mutually exclusive")?;
-    require(value.as_object().is_some_and(|object| object.len() == 2),
-        "source manifest requires exactly files and manifest_sha256")?;
-    let rows = value["files"].as_array().filter(|rows| rows.len() <= MAX_SOURCE_FILES)
+    require(
+        request.get("workspace_backing").is_none(),
+        "source_manifest and workspace_backing are mutually exclusive",
+    )?;
+    require(
+        value.as_object().is_some_and(|object| object.len() == 2),
+        "source manifest requires exactly files and manifest_sha256",
+    )?;
+    let rows = value["files"]
+        .as_array()
+        .filter(|rows| rows.len() <= MAX_SOURCE_FILES)
         .ok_or_else(|| invalid("source file list outside its bound"))?;
     let mut files = Vec::with_capacity(rows.len());
     for row in rows {
-        require(row.as_object().is_some_and(|object| object.len() == 4), "invalid source file fields")?;
+        require(
+            row.as_object().is_some_and(|object| object.len() == 4),
+            "invalid source file fields",
+        )?;
         files.push(SourceFile {
-            path: row["path"].as_str().ok_or_else(|| invalid("invalid source path"))?.to_owned(),
-            len: row["bytes"].as_u64().ok_or_else(|| invalid("invalid source length"))?,
+            path: row["path"]
+                .as_str()
+                .ok_or_else(|| invalid("invalid source path"))?
+                .to_owned(),
+            len: row["bytes"]
+                .as_u64()
+                .ok_or_else(|| invalid("invalid source length"))?,
             sha256: digest(&row["sha256"])?,
-            executable: row["executable"].as_bool().ok_or_else(|| invalid("invalid source executable bit"))?,
+            executable: row["executable"]
+                .as_bool()
+                .ok_or_else(|| invalid("invalid source executable bit"))?,
         });
     }
     let manifest = SourceManifest::new(files)?;
-    require(manifest.digest() == digest(&value["manifest_sha256"])?, "source manifest digest mismatch")?;
+    require(
+        manifest.digest() == digest(&value["manifest_sha256"])?,
+        "source manifest digest mismatch",
+    )?;
     validate_cargo_home(request, &manifest)?;
     Ok(Some(manifest))
 }
@@ -108,9 +156,13 @@ pub fn request_manifest(request: &Value) -> io::Result<Option<SourceManifest>> {
 /// paths explicitly select another checkout. A closure's files are installed as
 /// ID/relative-path under /__rabs/workspace, preserving sibling path dependencies.
 /// All roots share ONE paired capture; only selected regular files are copied.
-/// No Cargo manifest rewriting, dependency discovery, compiler or network runs.
-/// Optional cargo_home selects a registry-only prefix in that same manifest;
-/// its version/prefix is preserved for worker-side private Cargo-home replay.
+/// Alternatively cargo_source: {manifest: "app/Cargo.toml"} resolves a locked,
+/// offline local Cargo graph from a retained copy of the entire approved anchor.
+/// It includes every captured regular file, preserving build-script/include data.
+/// That mode may run compiler probes, never builds. It initially refuses symlinks,
+/// Cargo configuration, and registry/git dependencies; manifests are not rewritten.
+/// Optional cargo_home selects a registry-only prefix in an explicitly selected
+/// manifest; its version/prefix is preserved for worker-side private Cargo-home replay.
 ///
 /// The directory contains source/ and request.json. All selected source files
 /// are verified through SourceReceiver and synced before request.json is even
@@ -134,22 +186,43 @@ pub fn prepare_source_bundle(
     destination: &Path,
 ) -> io::Result<Value> {
     let inputs = preparation::SourcePreparation::parse(source_root, specification)?;
-    require(destination.is_absolute() && destination.file_name().is_some()
-        && destination.components().all(|part| matches!(part, Component::RootDir | Component::Normal(_))),
-        "bundle destination must be absolute without traversal")?;
-    let parent = fs::canonicalize(destination.parent().ok_or_else(|| invalid("bundle parent"))?)?;
-    let destination = parent.join(destination.file_name().ok_or_else(|| invalid("bundle name"))?);
+    require(
+        destination.is_absolute()
+            && destination.file_name().is_some()
+            && destination
+                .components()
+                .all(|part| matches!(part, Component::RootDir | Component::Normal(_))),
+        "bundle destination must be absolute without traversal",
+    )?;
+    let parent = fs::canonicalize(
+        destination
+            .parent()
+            .ok_or_else(|| invalid("bundle parent"))?,
+    )?;
+    let destination = parent.join(
+        destination
+            .file_name()
+            .ok_or_else(|| invalid("bundle name"))?,
+    );
     require(destination.to_str().is_some(), "bundle path must be UTF-8")?;
     match fs::symlink_metadata(&destination) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(error),
-        Ok(_) => return Err(io::Error::new(io::ErrorKind::AlreadyExists, "bundle destination already exists")),
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "bundle destination already exists",
+            ));
+        }
     }
     let upload = inputs.capture()?;
     let mut request = specification.clone();
-    let fields = request.as_object_mut().ok_or_else(|| invalid("source preparation object"))?;
+    let fields = request
+        .as_object_mut()
+        .ok_or_else(|| invalid("source preparation object"))?;
     fields.remove("source_files");
     fields.remove("source_roots");
+    fields.remove("cargo_source");
     fields.insert("source_manifest".to_owned(), upload.wire_manifest());
     // One validator for prepared and hand-authored execution requests. This
     // preserves argv, output declarations, timeouts, and unknown extensions.
@@ -169,8 +242,12 @@ pub fn prepare_source_bundle(
     for file in upload.manifest.files() {
         let bytes = upload.file_bytes(&file.path)?;
         for (index, chunk) in bytes.chunks(MAX_SOURCE_CHUNK).enumerate() {
-            receiver.write_chunk(&file.path, index as u64 * MAX_SOURCE_CHUNK as u64,
-                chunk, Sha256::digest(chunk).into())?;
+            receiver.write_chunk(
+                &file.path,
+                index as u64 * MAX_SOURCE_CHUNK as u64,
+                chunk,
+                Sha256::digest(chunk).into(),
+            )?;
         }
     }
     receiver.seal()?;
@@ -202,12 +279,14 @@ pub fn prepare_source_bundle(
     output.sync_all()?;
     File::open(&destination)?.sync_all()?;
     File::open(&parent)?.sync_all()?;
-    Ok(json!({"kind":"prepared-source-bundle", "directory":destination,
+    Ok(
+        json!({"kind":"prepared-source-bundle", "directory":destination,
         "source_root":source, "request_path":request_path, "request_id":request["request_id"],
         "request_sha256":hex(&Sha256::digest(&request_bytes)),
         "manifest_sha256":hex(&upload.manifest.digest()), "source_roots":inputs.root_count(),
         "source_files":upload.manifest.files().len(), "source_bytes":upload.manifest.total_bytes(),
-        "executed":false, "publication_authorized":false}))
+        "executed":false, "publication_authorized":false}),
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -223,7 +302,9 @@ fn valid_closure_root(root: &str) -> bool {
     !root.is_empty()
         && root.len() <= 64
         && !matches!(root, "." | "..")
-        && root.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+        && root
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
         && member_disposition(root, false) == MemberDisposition::Include
 }
 
@@ -240,21 +321,48 @@ impl SourceUpload {
     /// Callers apply their upload/confidentiality policy before selecting paths.
     /// This method cannot implicitly include siblings, symlink targets or secrets.
     pub fn from_snapshot(
-        image: Arc<SealedSourceSnapshot>, root: &str, paths: &[String],
+        image: Arc<SealedSourceSnapshot>,
+        root: &str,
+        paths: &[String],
     ) -> io::Result<Self> {
-        require(!paths.is_empty() && paths.len() <= MAX_SOURCE_FILES, "source projection file count")?;
-        let captured = image.manifest(root).ok_or_else(|| invalid("unknown source snapshot root"))?;
+        require(
+            !paths.is_empty() && paths.len() <= MAX_SOURCE_FILES,
+            "source projection file count",
+        )?;
+        let captured = image
+            .manifest(root)
+            .ok_or_else(|| invalid("unknown source snapshot root"))?;
         let mut files = Vec::with_capacity(paths.len());
         for path in paths {
-            let Some(MemberKind::Regular { size, content_sha256, mode, .. }) = captured.members.get(path) else {
+            let Some(MemberKind::Regular {
+                size,
+                content_sha256,
+                mode,
+                ..
+            }) = captured.members.get(path)
+            else {
                 return Err(invalid("projected source must be a captured regular file"));
             };
-            let bytes = image.file_bytes(root, path).ok_or_else(|| invalid("captured source bytes missing"))?;
-            require(bytes.len() as u64 == *size && <[u8; 32]>::from(Sha256::digest(bytes)) == *content_sha256,
-                "captured source disagrees with its manifest")?;
-            files.push(SourceFile { path:path.clone(), len:*size, sha256:*content_sha256, executable:mode & 0o111 != 0 });
+            let bytes = image
+                .file_bytes(root, path)
+                .ok_or_else(|| invalid("captured source bytes missing"))?;
+            require(
+                bytes.len() as u64 == *size
+                    && <[u8; 32]>::from(Sha256::digest(bytes)) == *content_sha256,
+                "captured source disagrees with its manifest",
+            )?;
+            files.push(SourceFile {
+                path: path.clone(),
+                len: *size,
+                sha256: *content_sha256,
+                executable: mode & 0o111 != 0,
+            });
         }
-        Ok(Self { image, layout:SourceLayout::Root(root.to_owned()), manifest:SourceManifest::new(files)? })
+        Ok(Self {
+            image,
+            layout: SourceLayout::Root(root.to_owned()),
+            manifest: SourceManifest::new(files)?,
+        })
     }
 
     /// Project several repositories from ONE coherent closure capture. Root IDs
@@ -271,42 +379,67 @@ impl SourceUpload {
         roots: &[(String, Vec<String>)],
     ) -> io::Result<Self> {
         use rabs_sandbox::snapshot_capture::{MemberDisposition, member_disposition};
-        require(!roots.is_empty() && roots.len() <= MAX_SOURCE_ROOTS, "source closure root count")?;
+        require(
+            !roots.is_empty() && roots.len() <= MAX_SOURCE_ROOTS,
+            "source closure root count",
+        )?;
         let mut names = BTreeSet::new();
         let mut files = Vec::new();
         for (root, paths) in roots {
-            require(valid_closure_root(root) && names.insert(root.to_ascii_lowercase()),
-                "unsafe, hidden, duplicate or case-colliding source closure root")?;
-            require(paths.len() <= MAX_SOURCE_FILES.saturating_sub(files.len()),
-                "source closure exceeds aggregate file count")?;
+            require(
+                valid_closure_root(root) && names.insert(root.to_ascii_lowercase()),
+                "unsafe, hidden, duplicate or case-colliding source closure root",
+            )?;
+            require(
+                paths.len() <= MAX_SOURCE_FILES.saturating_sub(files.len()),
+                "source closure exceeds aggregate file count",
+            )?;
             let selected = Self::from_snapshot(Arc::clone(&image), root, paths)?;
             for mut file in selected.manifest.files().iter().cloned() {
                 file.path = format!("{root}/{}", file.path);
                 // The saved bundle is recaptured as a single workspace before
                 // transfer. Refuse a prefix that would hide its selected bytes.
-                require(member_disposition(&file.path, false) == MemberDisposition::Include,
-                    "source closure path is excluded by capture policy")?;
+                require(
+                    member_disposition(&file.path, false) == MemberDisposition::Include,
+                    "source closure path is excluded by capture policy",
+                )?;
                 files.push(file);
             }
         }
-        Ok(Self { image, layout:SourceLayout::Closure, manifest:SourceManifest::new(files)? })
+        Ok(Self {
+            image,
+            layout: SourceLayout::Closure,
+            manifest: SourceManifest::new(files)?,
+        })
     }
 
     fn file_bytes(&self, path: &str) -> io::Result<&[u8]> {
         let (root, relative) = match &self.layout {
             SourceLayout::Root(root) => (root.as_str(), path),
-            SourceLayout::Closure => path.split_once('/')
+            SourceLayout::Closure => path
+                .split_once('/')
                 .ok_or_else(|| invalid("source closure member lacks its root"))?,
         };
-        self.image.file_bytes(root, relative).ok_or_else(|| invalid("retained source missing"))
+        self.image
+            .file_bytes(root, relative)
+            .ok_or_else(|| invalid("retained source missing"))
     }
 
     /// Bind a newly captured image to the ORIGINAL saved execution request.
     /// A checkout edit after request preparation refuses; it never silently
     /// changes the manifest under the same request ID.
-    pub fn for_request(image: Arc<SealedSourceSnapshot>, root: &str, request: &Value) -> io::Result<Self> {
-        let manifest = request_manifest(request)?.ok_or_else(|| invalid("request has no source manifest"))?;
-        let paths: Vec<_> = manifest.files().iter().map(|file| file.path.clone()).collect();
+    pub fn for_request(
+        image: Arc<SealedSourceSnapshot>,
+        root: &str,
+        request: &Value,
+    ) -> io::Result<Self> {
+        let manifest =
+            request_manifest(request)?.ok_or_else(|| invalid("request has no source manifest"))?;
+        let paths: Vec<_> = manifest
+            .files()
+            .iter()
+            .map(|file| file.path.clone())
+            .collect();
         let upload = Self::from_snapshot(image, root, &paths)?;
         upload.validate_request(request)?;
         Ok(upload)
@@ -320,7 +453,9 @@ impl SourceUpload {
     fn begin_frame(&self, request: &Value) -> Value {
         let mut frame = json!({"kind":"source-begin", "request_id":request["request_id"],
             "manifest":self.wire_manifest(), "allow_cached_files":true});
-        if let Some(home) = request.get("cargo_home") { frame["cargo_home"] = home.clone(); }
+        if let Some(home) = request.get("cargo_home") {
+            frame["cargo_home"] = home.clone();
+        }
         frame
     }
 
@@ -328,17 +463,30 @@ impl SourceUpload {
     /// An older worker without the extension receives the entire projection.
     /// Unknown paths cannot turn this into a request to upload sibling files.
     fn missing_files(&self, reply: &Value) -> io::Result<Option<BTreeSet<String>>> {
-        let Some(value) = reply.get("missing_files") else { return Ok(None); };
-        let rows = value.as_array().filter(|rows| rows.len() <= self.manifest.files().len())
+        let Some(value) = reply.get("missing_files") else {
+            return Ok(None);
+        };
+        let rows = value
+            .as_array()
+            .filter(|rows| rows.len() <= self.manifest.files().len())
             .ok_or_else(|| invalid("source missing-file list outside its bound"))?;
         let mut missing = BTreeSet::new();
         let mut previous: Option<&str> = None;
         for row in rows {
-            let path = row.as_str().ok_or_else(|| invalid("source missing path is not a string"))?;
-            require(self.manifest.files().binary_search_by(|file| file.path.as_str().cmp(path)).is_ok(),
-                "worker requested a source path outside the approved projection")?;
-            require(previous.is_none_or(|last| last < path),
-                "source missing-file list must be sorted and unique")?;
+            let path = row
+                .as_str()
+                .ok_or_else(|| invalid("source missing path is not a string"))?;
+            require(
+                self.manifest
+                    .files()
+                    .binary_search_by(|file| file.path.as_str().cmp(path))
+                    .is_ok(),
+                "worker requested a source path outside the approved projection",
+            )?;
+            require(
+                previous.is_none_or(|last| last < path),
+                "source missing-file list must be sorted and unique",
+            )?;
             previous = Some(path);
             missing.insert(path.to_owned());
         }
@@ -346,21 +494,37 @@ impl SourceUpload {
     }
 
     pub fn validate_request(&self, request: &Value) -> io::Result<()> {
-        require(request["kind"] == "canonical-exec" && request["request_id"].as_u64().is_some(),
-            "source upload requires an original execution request")?;
-        require(request_manifest(request)?.as_ref() == Some(&self.manifest),
-            "captured source differs from the saved execution manifest")?;
+        require(
+            request["kind"] == "canonical-exec" && request["request_id"].as_u64().is_some(),
+            "source upload requires an original execution request",
+        )?;
+        require(
+            request_manifest(request)?.as_ref() == Some(&self.manifest),
+            "captured source differs from the saved execution manifest",
+        )?;
         let begin = self.begin_frame(request);
-        require(serde_json::to_vec(&begin)?.len() <= MAX_JSON_RECORD, "source manifest exceeds the transport record bound")
+        require(
+            serde_json::to_vec(&begin)?.len() <= MAX_JSON_RECORD,
+            "source manifest exceeds the transport record bound",
+        )
     }
 
     /// Extend the ordinary grant without changing its output/retention policy.
     /// This is checked BEFORE transmission of either source bytes or execution.
     pub(crate) fn grant(&self, hello: &Value, grant: &Value) -> io::Result<Value> {
-        require(hello["source_transfers"].as_array().is_some_and(|values| values.iter().any(|value| value == SOURCE_TRANSFER)),
-            "worker does not support source-files-v1")?;
-        require(grant["kind"] == "session-ok" && grant.get("source_transfer").is_none_or(|value| value == SOURCE_TRANSFER),
-            "conflicting source transfer selection")?;
+        require(
+            hello["source_transfers"]
+                .as_array()
+                .is_some_and(|values| values.iter().any(|value| value == SOURCE_TRANSFER)),
+            "worker does not support source-files-v1",
+        )?;
+        require(
+            grant["kind"] == "session-ok"
+                && grant
+                    .get("source_transfer")
+                    .is_none_or(|value| value == SOURCE_TRANSFER),
+            "conflicting source transfer selection",
+        )?;
         let mut grant = grant.clone();
         grant["source_transfer"] = json!(SOURCE_TRANSFER);
         Ok(grant)
@@ -369,38 +533,62 @@ impl SourceUpload {
     /// Send one source projection over an ALREADY admitted session. A failed
     /// exchange is terminal for this operation; there is no execution retry.
     /// Transport implementations enforce one absolute upload-phase deadline.
-    pub(crate) fn transmit<P: WorkerPeer + ?Sized>(&self, peer: &mut P, request: &Value) -> io::Result<()> {
+    pub(crate) fn transmit<P: WorkerPeer + ?Sized>(
+        &self,
+        peer: &mut P,
+        request: &Value,
+    ) -> io::Result<()> {
         self.validate_request(request)?;
-        let id = request["request_id"].as_u64().ok_or_else(|| invalid("source request identity"))?;
+        let id = request["request_id"]
+            .as_u64()
+            .ok_or_else(|| invalid("source request identity"))?;
         let identity = hex(&self.manifest.digest());
         let check = |reply: &Value, kind: &str| -> io::Result<()> {
-            require(reply["kind"] == kind && reply["request_id"].as_u64() == Some(id)
-                && reply["manifest_sha256"].as_str() == Some(identity.as_str()),
-                "source response kind or identity mismatch")
+            require(
+                reply["kind"] == kind
+                    && reply["request_id"].as_u64() == Some(id)
+                    && reply["manifest_sha256"].as_str() == Some(identity.as_str()),
+                "source response kind or identity mismatch",
+            )
         };
         peer.send(&self.begin_frame(request))?;
         let reply = peer.receive()?;
         check(&reply, "source-ready")?;
-        require(reply["sealed"] == false, "new source operation unexpectedly already sealed")?;
+        require(
+            reply["sealed"] == false,
+            "new source operation unexpectedly already sealed",
+        )?;
         // Request semantics must not disappear on an older worker that accepts
         // unknown fields. The exact echo is required BEFORE sending any source
         // bytes; neither missing-file cache hints nor TLS identity waive it.
-        require(reply.get("cargo_home") == request.get("cargo_home"),
-            "worker did not accept the exact Cargo home replay selection")?;
+        require(
+            reply.get("cargo_home") == request.get("cargo_home"),
+            "worker did not accept the exact Cargo home replay selection",
+        )?;
         let missing = self.missing_files(&reply)?;
         for file in self.manifest.files() {
-            if missing.as_ref().is_some_and(|paths| !paths.contains(&file.path)) { continue; }
+            if missing
+                .as_ref()
+                .is_some_and(|paths| !paths.contains(&file.path))
+            {
+                continue;
+            }
             let bytes = self.file_bytes(&file.path)?;
             for (index, chunk) in bytes.chunks(MAX_SOURCE_CHUNK).enumerate() {
                 let offset = (index as u64) * MAX_SOURCE_CHUNK as u64;
                 let next = offset + chunk.len() as u64;
-                peer.send(&json!({"kind":"source-chunk", "request_id":id, "manifest_sha256":identity,
+                peer.send(
+                    &json!({"kind":"source-chunk", "request_id":id, "manifest_sha256":identity,
                     "path":file.path, "offset":offset, "data_hex":hex(chunk),
-                    "chunk_sha256":hex(&Sha256::digest(chunk))}))?;
+                    "chunk_sha256":hex(&Sha256::digest(chunk))}),
+                )?;
                 let reply = peer.receive()?;
                 check(&reply, "source-chunk-accepted")?;
-                require(reply["path"].as_str() == Some(file.path.as_str()) && reply["next_offset"].as_u64() == Some(next),
-                    "source acknowledgment does not cover the transmitted range")?;
+                require(
+                    reply["path"].as_str() == Some(file.path.as_str())
+                        && reply["next_offset"].as_u64() == Some(next),
+                    "source acknowledgment does not cover the transmitted range",
+                )?;
             }
         }
         // Even a completely warm projection needs this exact final seal. A
@@ -408,9 +596,14 @@ impl SourceUpload {
         peer.send(&json!({"kind":"source-seal", "request_id":id, "manifest_sha256":identity}))?;
         let reply = peer.receive()?;
         check(&reply, "source-ready")?;
-        require(reply.get("cargo_home") == request.get("cargo_home"),
-            "worker sealed a different Cargo home replay selection")?;
-        require(reply["sealed"] == true, "worker did not seal the complete source projection")
+        require(
+            reply.get("cargo_home") == request.get("cargo_home"),
+            "worker sealed a different Cargo home replay selection",
+        )?;
+        require(
+            reply["sealed"] == true,
+            "worker did not seal the complete source projection",
+        )
     }
 }
 
@@ -428,14 +621,25 @@ pub struct SourcePeer<'a, P: ?Sized> {
 impl<'a, P: WorkerPeer + ?Sized> SourcePeer<'a, P> {
     pub fn new(inner: &'a mut P, upload: &'a SourceUpload, request: &'a Value) -> io::Result<Self> {
         upload.validate_request(request)?;
-        Ok(Self { inner, upload, request, attempted:false })
+        Ok(Self {
+            inner,
+            upload,
+            request,
+            attempted: false,
+        })
     }
 }
 
 impl<P: WorkerPeer + ?Sized> WorkerPeer for SourcePeer<'_, P> {
-    fn send(&mut self, frame: &Value) -> io::Result<()> { self.inner.send(frame) }
-    fn receive(&mut self) -> io::Result<Value> { self.inner.receive() }
-    fn authentication(&self) -> Option<WorkerAuthentication> { self.inner.authentication() }
+    fn send(&mut self, frame: &Value) -> io::Result<()> {
+        self.inner.send(frame)
+    }
+    fn receive(&mut self) -> io::Result<Value> {
+        self.inner.receive()
+    }
+    fn authentication(&self) -> Option<WorkerAuthentication> {
+        self.inner.authentication()
+    }
     fn negotiate(&mut self, hello: &Value, grant: &Value) -> io::Result<()> {
         require(!self.attempted, "source negotiation cannot be retried")?;
         self.attempted = true;
@@ -454,12 +658,24 @@ mod tests {
 
     fn fixture(root: &std::path::Path) -> (SourceUpload, Value, Vec<u8>) {
         std::fs::create_dir(root.join("src")).unwrap();
-        let bytes: Vec<_> = (0..MAX_SOURCE_CHUNK + 17).map(|n| (n % 256) as u8).collect();
+        let bytes: Vec<_> = (0..MAX_SOURCE_CHUNK + 17)
+            .map(|n| (n % 256) as u8)
+            .collect();
         std::fs::write(root.join("src/lib.rs"), &bytes).unwrap();
         std::fs::write(root.join("empty"), b"").unwrap();
         std::fs::write(root.join("not-selected.private"), b"must not be sent").unwrap();
-        let image = Arc::new(capture_sealed_source(&[("workspace".into(), root.to_path_buf())], false, 2, 200_000).unwrap());
-        let upload = SourceUpload::from_snapshot(image, "workspace", &["src/lib.rs".into(), "empty".into()]).unwrap();
+        let image = Arc::new(
+            capture_sealed_source(
+                &[("workspace".into(), root.to_path_buf())],
+                false,
+                2,
+                200_000,
+            )
+            .unwrap(),
+        );
+        let upload =
+            SourceUpload::from_snapshot(image, "workspace", &["src/lib.rs".into(), "empty".into()])
+                .unwrap();
         let request = json!({"kind":"canonical-exec", "request_id":7, "program":"fixture",
             "toolchain_backing":"/tc", "source_manifest":upload.wire_manifest()});
         (upload, request, bytes)
@@ -477,8 +693,16 @@ mod tests {
     }
     impl ReceiverPeer {
         fn new() -> Self {
-            Self { owner:tempfile::tempdir().unwrap(), receiver:None, replies:VecDeque::new(), sent:Vec::new(), corrupt_ack:false,
-                prefilled:BTreeMap::new(), missing:None, lose_seal_ack:false }
+            Self {
+                owner: tempfile::tempdir().unwrap(),
+                receiver: None,
+                replies: VecDeque::new(),
+                sent: Vec::new(),
+                corrupt_ack: false,
+                prefilled: BTreeMap::new(),
+                missing: None,
+                lose_seal_ack: false,
+            }
         }
     }
     impl WorkerPeer for ReceiverPeer {
@@ -488,31 +712,48 @@ mod tests {
             let response = match frame["kind"].as_str() {
                 Some("session-ok") => return Ok(()),
                 Some("source-begin") => {
-                    let manifest = request_manifest(&json!({"source_manifest":frame["manifest"]}))?.unwrap();
+                    let manifest =
+                        request_manifest(&json!({"source_manifest":frame["manifest"]}))?.unwrap();
                     let identity = hex(&manifest.digest());
-                    let mut receiver = SourceReceiver::create(&self.owner.path().join("workspace"), manifest)?;
+                    let mut receiver =
+                        SourceReceiver::create(&self.owner.path().join("workspace"), manifest)?;
                     for (path, bytes) in &self.prefilled {
                         for (index, chunk) in bytes.chunks(MAX_SOURCE_CHUNK).enumerate() {
-                            receiver.write_chunk(path, index as u64 * MAX_SOURCE_CHUNK as u64,
-                                chunk, Sha256::digest(chunk).into())?;
+                            receiver.write_chunk(
+                                path,
+                                index as u64 * MAX_SOURCE_CHUNK as u64,
+                                chunk,
+                                Sha256::digest(chunk).into(),
+                            )?;
                         }
                     }
                     self.receiver = Some(receiver);
                     let mut reply = json!({"kind":"source-ready", "request_id":id, "manifest_sha256":identity, "sealed":false});
-                    if let Some(missing) = &self.missing { reply["missing_files"] = missing.clone(); }
+                    if let Some(missing) = &self.missing {
+                        reply["missing_files"] = missing.clone();
+                    }
                     reply
                 }
                 Some("source-chunk") => {
                     let raw = frame["data_hex"].as_str().unwrap();
-                    let bytes = (0..raw.len()).step_by(2).map(|index| u8::from_str_radix(&raw[index..index + 2], 16).unwrap()).collect::<Vec<_>>();
-                    let offset = self.receiver.as_mut().unwrap().write_chunk(frame["path"].as_str().unwrap(),
-                        frame["offset"].as_u64().unwrap(), &bytes, digest(&frame["chunk_sha256"])? )?;
+                    let bytes = (0..raw.len())
+                        .step_by(2)
+                        .map(|index| u8::from_str_radix(&raw[index..index + 2], 16).unwrap())
+                        .collect::<Vec<_>>();
+                    let offset = self.receiver.as_mut().unwrap().write_chunk(
+                        frame["path"].as_str().unwrap(),
+                        frame["offset"].as_u64().unwrap(),
+                        &bytes,
+                        digest(&frame["chunk_sha256"])?,
+                    )?;
                     json!({"kind":"source-chunk-accepted", "request_id":id, "manifest_sha256":frame["manifest_sha256"],
                         "path":frame["path"], "next_offset":if self.corrupt_ack { offset + 1 } else { offset }})
                 }
                 Some("source-seal") => {
                     self.receiver.as_mut().unwrap().seal()?;
-                    if self.lose_seal_ack { return Ok(()); }
+                    if self.lose_seal_ack {
+                        return Ok(());
+                    }
                     json!({"kind":"source-ready", "request_id":id, "manifest_sha256":frame["manifest_sha256"], "sealed":true})
                 }
                 _ => return Err(invalid("source sender must not dispatch execution")),
@@ -520,7 +761,11 @@ mod tests {
             self.replies.push_back(response);
             Ok(())
         }
-        fn receive(&mut self) -> io::Result<Value> { self.replies.pop_front().ok_or_else(|| invalid("no response")) }
+        fn receive(&mut self) -> io::Result<Value> {
+            self.replies
+                .pop_front()
+                .ok_or_else(|| invalid("no response"))
+        }
     }
 
     #[test]
@@ -530,16 +775,40 @@ mod tests {
         std::fs::write(root.path().join("src/lib.rs"), b"changed checkout").unwrap();
         let mut peer = ReceiverPeer::new();
         let hello = json!({"source_transfers":[SOURCE_TRANSFER]});
-        SourcePeer::new(&mut peer, &upload, &request).unwrap().negotiate(&hello, &json!({"kind":"session-ok"})).unwrap();
+        SourcePeer::new(&mut peer, &upload, &request)
+            .unwrap()
+            .negotiate(&hello, &json!({"kind":"session-ok"}))
+            .unwrap();
         let source = peer.receiver.as_ref().unwrap().sealed_root().unwrap();
         assert_eq!(std::fs::read(source.join("src/lib.rs")).unwrap(), bytes);
         assert_eq!(std::fs::read(source.join("empty")).unwrap(), b"");
         assert!(!source.join("not-selected.private").exists());
-        assert_eq!(peer.sent.iter().filter(|frame| frame["kind"] == "source-chunk").count(), 2);
+        assert_eq!(
+            peer.sent
+                .iter()
+                .filter(|frame| frame["kind"] == "source-chunk")
+                .count(),
+            2
+        );
         assert_eq!(peer.sent[0]["source_transfer"], SOURCE_TRANSFER);
-        assert!(peer.sent.iter().all(|frame| frame["kind"] != "canonical-exec"));
-        let image = Arc::new(capture_sealed_source(&[("workspace".into(), root.path().to_path_buf())], false, 2, 200_000).unwrap());
-        assert!(SourceUpload::for_request(image, "workspace", &request).is_err(), "recapture must not silently change a saved request");
+        assert!(
+            peer.sent
+                .iter()
+                .all(|frame| frame["kind"] != "canonical-exec")
+        );
+        let image = Arc::new(
+            capture_sealed_source(
+                &[("workspace".into(), root.path().to_path_buf())],
+                false,
+                2,
+                200_000,
+            )
+            .unwrap(),
+        );
+        assert!(
+            SourceUpload::for_request(image, "workspace", &request).is_err(),
+            "recapture must not silently change a saved request"
+        );
     }
 
     #[test]
@@ -547,27 +816,46 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let (upload, request, _) = fixture(root.path());
         let mut peer = ReceiverPeer::new();
-        assert!(SourcePeer::new(&mut peer, &upload, &request).unwrap()
-            .negotiate(&json!({}), &json!({"kind":"session-ok"})).is_err());
+        assert!(
+            SourcePeer::new(&mut peer, &upload, &request)
+                .unwrap()
+                .negotiate(&json!({}), &json!({"kind":"session-ok"}))
+                .is_err()
+        );
         assert!(peer.sent.is_empty());
         peer.corrupt_ack = true;
-        assert!(SourcePeer::new(&mut peer, &upload, &request).unwrap()
-            .negotiate(&json!({"source_transfers":[SOURCE_TRANSFER]}), &json!({"kind":"session-ok"})).is_err());
+        assert!(
+            SourcePeer::new(&mut peer, &upload, &request)
+                .unwrap()
+                .negotiate(
+                    &json!({"source_transfers":[SOURCE_TRANSFER]}),
+                    &json!({"kind":"session-ok"})
+                )
+                .is_err()
+        );
         assert!(peer.receiver.as_ref().unwrap().sealed_root().is_none());
-        assert!(peer.sent.iter().all(|frame| frame["kind"] != "source-seal" && frame["kind"] != "canonical-exec"));
+        assert!(
+            peer.sent
+                .iter()
+                .all(|frame| frame["kind"] != "source-seal" && frame["kind"] != "canonical-exec")
+        );
     }
 
     #[test]
     fn source_request_validation_rejects_aliases_and_changed_identity() {
         let root = tempfile::tempdir().unwrap();
         let (upload, request, _) = fixture(root.path());
-        let mut mixed = request.clone(); mixed["workspace_backing"] = json!("/worker/path");
+        let mut mixed = request.clone();
+        mixed["workspace_backing"] = json!("/worker/path");
         assert!(request_manifest(&mixed).is_err());
-        let mut changed = request.clone(); changed["source_manifest"]["files"][0]["path"] = json!("../escape");
+        let mut changed = request.clone();
+        changed["source_manifest"]["files"][0]["path"] = json!("../escape");
         assert!(request_manifest(&changed).is_err());
-        let mut changed = request.clone(); changed["source_manifest"]["manifest_sha256"] = json!("00".repeat(32));
+        let mut changed = request.clone();
+        changed["source_manifest"]["manifest_sha256"] = json!("00".repeat(32));
         assert!(request_manifest(&changed).is_err());
-        let mut changed = request; changed.as_object_mut().unwrap().remove("source_manifest");
+        let mut changed = request;
+        changed.as_object_mut().unwrap().remove("source_manifest");
         assert!(upload.validate_request(&changed).is_err());
     }
 
@@ -585,7 +873,10 @@ mod tests {
         assert_eq!(peer.sent[0]["allow_cached_files"], true);
         assert_eq!(peer.sent[0]["manifest"], request["source_manifest"]);
         assert_eq!(peer.sent[1]["kind"], "source-seal");
-        assert_eq!(peer.sent[1]["manifest_sha256"], request["source_manifest"]["manifest_sha256"]);
+        assert_eq!(
+            peer.sent[1]["manifest_sha256"],
+            request["source_manifest"]["manifest_sha256"]
+        );
         assert_eq!(serde_json::to_vec(&request).unwrap(), original);
         let source = peer.receiver.as_ref().unwrap().sealed_root().unwrap();
         assert_eq!(std::fs::read(source.join("src/lib.rs")).unwrap(), bytes);
@@ -598,9 +889,21 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let (_, _, bytes) = fixture(root.path());
         std::fs::write(root.path().join("changed.rs"), b"new source").unwrap();
-        let image = Arc::new(capture_sealed_source(&[("workspace".into(), root.path().to_path_buf())], false, 2, 200_000).unwrap());
-        let upload = SourceUpload::from_snapshot(image, "workspace",
-            &["src/lib.rs".into(), "changed.rs".into(), "empty".into()]).unwrap();
+        let image = Arc::new(
+            capture_sealed_source(
+                &[("workspace".into(), root.path().to_path_buf())],
+                false,
+                2,
+                200_000,
+            )
+            .unwrap(),
+        );
+        let upload = SourceUpload::from_snapshot(
+            image,
+            "workspace",
+            &["src/lib.rs".into(), "changed.rs".into(), "empty".into()],
+        )
+        .unwrap();
         let request = json!({"kind":"canonical-exec", "request_id":8, "program":"fixture",
             "toolchain_backing":"/tc", "source_manifest":upload.wire_manifest()});
         std::fs::write(root.path().join("changed.rs"), b"changed after capture").unwrap();
@@ -608,22 +911,36 @@ mod tests {
         peer.prefilled.insert("src/lib.rs".into(), bytes.clone());
         peer.missing = Some(json!(["changed.rs"]));
         upload.transmit(&mut peer, &request).unwrap();
-        let chunks: Vec<_> = peer.sent.iter().filter(|frame| frame["kind"] == "source-chunk").collect();
+        let chunks: Vec<_> = peer
+            .sent
+            .iter()
+            .filter(|frame| frame["kind"] == "source-chunk")
+            .collect();
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0]["path"], "changed.rs");
         assert_eq!(chunks[0]["data_hex"], hex(b"new source"));
         let source = peer.receiver.as_ref().unwrap().sealed_root().unwrap();
         assert_eq!(std::fs::read(source.join("src/lib.rs")).unwrap(), bytes);
-        assert_eq!(std::fs::read(source.join("changed.rs")).unwrap(), b"new source");
+        assert_eq!(
+            std::fs::read(source.join("changed.rs")).unwrap(),
+            b"new source"
+        );
     }
 
     #[test]
     fn malformed_missing_hints_never_upload_extra_files_or_reach_seal() {
         let root = tempfile::tempdir().unwrap();
         let (upload, request, _) = fixture(root.path());
-        for missing in [Value::Null, json!(true), json!([1]), json!(["not-selected.private"]),
-            json!(["../escape"]), json!(["src/lib.rs", "empty"]),
-            json!(["empty", "empty"]), json!(["empty", "src/lib.rs", "extra"])] {
+        for missing in [
+            Value::Null,
+            json!(true),
+            json!([1]),
+            json!(["not-selected.private"]),
+            json!(["../escape"]),
+            json!(["src/lib.rs", "empty"]),
+            json!(["empty", "empty"]),
+            json!(["empty", "src/lib.rs", "extra"]),
+        ] {
             let mut peer = ReceiverPeer::new();
             peer.missing = Some(missing);
             assert!(upload.transmit(&mut peer, &request).is_err());
@@ -646,10 +963,22 @@ mod tests {
             }
             let mut source = SourcePeer::new(&mut peer, &upload, &request).unwrap();
             let hello = json!({"source_transfers":[SOURCE_TRANSFER]});
-            assert!(source.negotiate(&hello, &json!({"kind":"session-ok"})).is_err());
-            assert!(source.negotiate(&hello, &json!({"kind":"session-ok"})).is_err());
+            assert!(
+                source
+                    .negotiate(&hello, &json!({"kind":"session-ok"}))
+                    .is_err()
+            );
+            assert!(
+                source
+                    .negotiate(&hello, &json!({"kind":"session-ok"}))
+                    .is_err()
+            );
             assert_eq!(peer.sent.len(), 3); // grant, begin, seal; never execution or retry.
-            assert!(peer.sent.iter().all(|frame| frame["kind"] != "canonical-exec"));
+            assert!(
+                peer.sent
+                    .iter()
+                    .all(|frame| frame["kind"] != "canonical-exec")
+            );
         }
     }
 
@@ -677,7 +1006,10 @@ mod tests {
         let manifest = request_manifest(&request).unwrap().unwrap();
         assert_eq!(manifest.files().len(), 2);
         assert_eq!(manifest.total_bytes(), bytes.len() as u64);
-        assert_eq!(prepared["request_sha256"], hex(&Sha256::digest(&request_bytes)));
+        assert_eq!(
+            prepared["request_sha256"],
+            hex(&Sha256::digest(&request_bytes))
+        );
         assert_eq!(prepared["manifest_sha256"], hex(&manifest.digest()));
         assert_eq!(prepared["source_bytes"], bytes.len());
         assert_eq!(prepared["source_files"], 2);
@@ -685,27 +1017,58 @@ mod tests {
         assert_eq!(prepared["publication_authorized"], false);
         assert_eq!(spec, original_spec);
         let mut without_manifest = request.clone();
-        without_manifest.as_object_mut().unwrap().remove("source_manifest");
+        without_manifest
+            .as_object_mut()
+            .unwrap()
+            .remove("source_manifest");
         let mut without_selection = spec;
-        without_selection.as_object_mut().unwrap().remove("source_files");
-        assert_eq!(without_manifest, without_selection, "command and extensions are immutable");
-        assert_eq!(fs::metadata(&directory).unwrap().permissions().mode() & 0o777, 0o700);
-        assert_eq!(fs::metadata(directory.join("request.json")).unwrap().permissions().mode() & 0o777, 0o600);
-        assert_eq!(fs::metadata(source.join("src/lib.rs")).unwrap().permissions().mode() & 0o777, 0o444);
+        without_selection
+            .as_object_mut()
+            .unwrap()
+            .remove("source_files");
+        assert_eq!(
+            without_manifest, without_selection,
+            "command and extensions are immutable"
+        );
+        assert_eq!(
+            fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(directory.join("request.json"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(source.join("src/lib.rs"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o444
+        );
         assert!(!source.join("not-selected.private").exists());
         assert!(!prepared.to_string().contains("must not be sent"));
 
         // The source checkout can disappear. The existing execution upload
         // consumes only the saved request and recaptured retained projection.
         fs::rename(checkout.path().join("src"), checkout.path().join("old-src")).unwrap();
-        let image = capture_sealed_source(&[("workspace".into(), source)], false, 2, 200_000).unwrap();
+        let image =
+            capture_sealed_source(&[("workspace".into(), source)], false, 2, 200_000).unwrap();
         let upload = SourceUpload::for_request(Arc::new(image), "workspace", &request).unwrap();
         let mut peer = ReceiverPeer::new();
         upload.transmit(&mut peer, &request).unwrap();
         let received = peer.receiver.as_ref().unwrap().sealed_root().unwrap();
         assert_eq!(fs::read(received.join("src/lib.rs")).unwrap(), bytes);
         assert_eq!(fs::read(received.join("empty")).unwrap(), b"");
-        assert!(peer.sent.iter().all(|frame| frame["kind"] != "canonical-exec"));
+        assert!(
+            peer.sent
+                .iter()
+                .all(|frame| frame["kind"] != "canonical-exec")
+        );
     }
 
     #[test]
@@ -713,19 +1076,32 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let checkout = tempfile::tempdir().unwrap();
         fs::write(checkout.path().join("run"), b"#!/bin/sh\nexit 0\n").unwrap();
-        fs::set_permissions(checkout.path().join("run"), fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(
+            checkout.path().join("run"),
+            fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
         let owner = tempfile::tempdir().unwrap();
         let directory = owner.path().join("bundle");
         let mut spec = preparation_specification();
         spec["source_files"] = json!(["run"]);
         prepare_source_bundle(checkout.path(), &spec, &directory).unwrap();
         let source = directory.join("source");
-        let request: Value = serde_json::from_slice(&fs::read(directory.join("request.json")).unwrap()).unwrap();
+        let request: Value =
+            serde_json::from_slice(&fs::read(directory.join("request.json")).unwrap()).unwrap();
         assert_eq!(request["source_manifest"]["files"][0]["executable"], true);
-        assert_eq!(fs::metadata(source.join("run")).unwrap().permissions().mode() & 0o777, 0o555);
+        assert_eq!(
+            fs::metadata(source.join("run"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o555
+        );
         fs::set_permissions(source.join("run"), fs::Permissions::from_mode(0o700)).unwrap();
         fs::write(source.join("run"), b"#!/bin/sh\nexit 1\n").unwrap();
-        let image = capture_sealed_source(&[("workspace".into(), source)], false, 2, 200_000).unwrap();
+        let image =
+            capture_sealed_source(&[("workspace".into(), source)], false, 2, 200_000).unwrap();
         assert!(SourceUpload::for_request(Arc::new(image), "workspace", &request).is_err());
     }
 
@@ -738,13 +1114,20 @@ mod tests {
         let good = preparation_specification();
         let mut bad = vec![Value::Null, json!([])];
         for (field, value) in [
-            ("kind", json!("result-resume")), ("request_id", json!(-1)),
-            ("source_manifest", Value::Null), ("workspace_backing", json!("/host")),
-            ("source_files", Value::Null), ("source_files", json!([])),
-            ("source_files", json!([false])), ("source_files", json!(["empty", "empty"])),
-            ("source_files", json!(["missing"])), ("source_files", json!(["../escape"])),
-            ("source_files", json!(["src"])), ("timeout_ms", json!(0)),
-            ("args", json!([1])), ("program", json!("")),
+            ("kind", json!("result-resume")),
+            ("request_id", json!(-1)),
+            ("source_manifest", Value::Null),
+            ("workspace_backing", json!("/host")),
+            ("source_files", Value::Null),
+            ("source_files", json!([])),
+            ("source_files", json!([false])),
+            ("source_files", json!(["empty", "empty"])),
+            ("source_files", json!(["missing"])),
+            ("source_files", json!(["../escape"])),
+            ("source_files", json!(["src"])),
+            ("timeout_ms", json!(0)),
+            ("args", json!([1])),
+            ("program", json!("")),
             ("artifacts", json!({"unit":"bad", "files":["../escape"]})),
         ] {
             let mut spec = good.clone();
@@ -752,8 +1135,14 @@ mod tests {
             bad.push(spec);
         }
         for spec in bad {
-            assert!(prepare_source_bundle(checkout.path(), &spec, &directory).is_err(), "{spec}");
-            assert!(!directory.exists(), "invalid input must not publish partial output");
+            assert!(
+                prepare_source_bundle(checkout.path(), &spec, &directory).is_err(),
+                "{spec}"
+            );
+            assert!(
+                !directory.exists(),
+                "invalid input must not publish partial output"
+            );
         }
         let mut oversized = good;
         oversized["extension"] = json!("x".repeat(MAX_FRAME_BYTES));
@@ -777,12 +1166,23 @@ mod tests {
         prepare_source_bundle(checkout.path(), &spec, &directory).unwrap();
         let request_before = fs::read(directory.join("request.json")).unwrap();
         spec["request_id"] = json!(99);
-        assert_eq!(prepare_source_bundle(checkout.path(), &spec, &directory).unwrap_err().kind(), io::ErrorKind::AlreadyExists);
-        assert_eq!(fs::read(directory.join("request.json")).unwrap(), request_before);
+        assert_eq!(
+            prepare_source_bundle(checkout.path(), &spec, &directory)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(
+            fs::read(directory.join("request.json")).unwrap(),
+            request_before
+        );
         let alias = owner.path().join("alias");
         symlink(&directory, &alias).unwrap();
         assert!(prepare_source_bundle(checkout.path(), &spec, &alias).is_err());
-        assert_eq!(fs::read(directory.join("request.json")).unwrap(), request_before);
+        assert_eq!(
+            fs::read(directory.join("request.json")).unwrap(),
+            request_before
+        );
     }
 
     #[test]
@@ -802,8 +1202,15 @@ mod tests {
         fixture(checkout.path());
         let owner = tempfile::tempdir().unwrap();
         let spec = preparation_specification();
-        assert!(prepare_source_bundle(Path::new("relative"), &spec, &owner.path().join("bundle")).is_err());
-        for destination in [PathBuf::from("relative"), PathBuf::from("/"), owner.path().join("../bundle")] {
+        assert!(
+            prepare_source_bundle(Path::new("relative"), &spec, &owner.path().join("bundle"))
+                .is_err()
+        );
+        for destination in [
+            PathBuf::from("relative"),
+            PathBuf::from("/"),
+            owner.path().join("../bundle"),
+        ] {
             assert!(prepare_source_bundle(checkout.path(), &spec, &destination).is_err());
         }
         assert!(fs::read_dir(owner.path()).unwrap().next().is_none());
@@ -813,15 +1220,40 @@ mod tests {
         for root in ["app", "dep"] {
             fs::create_dir_all(base.join(root).join("src")).unwrap();
             fs::write(base.join(root).join("src/lib.rs"), root.as_bytes()).unwrap();
-            fs::write(base.join(root).join("not-selected.private"), b"not approved").unwrap();
+            fs::write(
+                base.join(root).join("not-selected.private"),
+                b"not approved",
+            )
+            .unwrap();
         }
-        fs::write(base.join("app/Cargo.toml"), b"[dependencies]\ndep = { path = \"../dep\" }\n").unwrap();
-        fs::write(base.join("dep/Cargo.toml"), b"[package]\nname = \"dep\"\nversion = \"0.1.0\"\n").unwrap();
-        let image = capture_sealed_source(&[
-            ("app".into(), base.join("app")), ("dep".into(), base.join("dep")),
-        ], false, 2, 200_000).unwrap();
-        let selection = ["app", "dep"].into_iter()
-            .map(|root| (root.to_owned(), vec!["Cargo.toml".into(), "src/lib.rs".into()]))
+        fs::write(
+            base.join("app/Cargo.toml"),
+            b"[dependencies]\ndep = { path = \"../dep\" }\n",
+        )
+        .unwrap();
+        fs::write(
+            base.join("dep/Cargo.toml"),
+            b"[package]\nname = \"dep\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        let image = capture_sealed_source(
+            &[
+                ("app".into(), base.join("app")),
+                ("dep".into(), base.join("dep")),
+            ],
+            false,
+            2,
+            200_000,
+        )
+        .unwrap();
+        let selection = ["app", "dep"]
+            .into_iter()
+            .map(|root| {
+                (
+                    root.to_owned(),
+                    vec!["Cargo.toml".into(), "src/lib.rs".into()],
+                )
+            })
             .collect();
         (Arc::new(image), selection)
     }
@@ -840,14 +1272,20 @@ mod tests {
         let root = peer.receiver.as_ref().unwrap().sealed_root().unwrap();
         assert_eq!(fs::read(root.join("app/src/lib.rs")).unwrap(), b"app");
         assert_eq!(fs::read(root.join("dep/src/lib.rs")).unwrap(), b"dep");
-        assert_eq!(fs::read(root.join("app/Cargo.toml")).unwrap(),
-            b"[dependencies]\ndep = { path = \"../dep\" }\n");
+        assert_eq!(
+            fs::read(root.join("app/Cargo.toml")).unwrap(),
+            b"[dependencies]\ndep = { path = \"../dep\" }\n"
+        );
         for name in ["app", "dep"] {
             assert!(!root.join(name).join("not-selected.private").exists());
         }
         assert_eq!(upload.manifest.files().len(), 4);
         assert!(!request.to_string().contains(base.path().to_str().unwrap()));
-        assert!(peer.sent.iter().all(|frame| frame["kind"] != "canonical-exec"));
+        assert!(
+            peer.sent
+                .iter()
+                .all(|frame| frame["kind"] != "canonical-exec")
+        );
     }
 
     #[test]
@@ -860,12 +1298,19 @@ mod tests {
         let mut peer = ReceiverPeer::new();
         for file in upload.manifest.files() {
             if file.path != "dep/src/lib.rs" {
-                peer.prefilled.insert(file.path.clone(), upload.file_bytes(&file.path).unwrap().to_vec());
+                peer.prefilled.insert(
+                    file.path.clone(),
+                    upload.file_bytes(&file.path).unwrap().to_vec(),
+                );
             }
         }
         peer.missing = Some(json!(["dep/src/lib.rs"]));
         upload.transmit(&mut peer, &request).unwrap();
-        let chunks: Vec<_> = peer.sent.iter().filter(|frame| frame["kind"] == "source-chunk").collect();
+        let chunks: Vec<_> = peer
+            .sent
+            .iter()
+            .filter(|frame| frame["kind"] == "source-chunk")
+            .collect();
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0]["path"], "dep/src/lib.rs");
         assert_eq!(chunks[0]["data_hex"], hex(b"dep"));
@@ -881,30 +1326,61 @@ mod tests {
         let base = tempfile::tempdir().unwrap();
         let (image, selection) = closure_fixture(base.path());
         assert!(SourceUpload::from_snapshot_closure(Arc::clone(&image), &[]).is_err());
-        for name in ["", ".", "..", ".git", "target", "a/b", "a\\b", "a:b", "abs\0", "other"] {
-            assert!(SourceUpload::from_snapshot_closure(Arc::clone(&image),
-                &[(name.into(), vec!["src/lib.rs".into()])]).is_err(), "{name:?}");
+        for name in [
+            "", ".", "..", ".git", "target", "a/b", "a\\b", "a:b", "abs\0", "other",
+        ] {
+            assert!(
+                SourceUpload::from_snapshot_closure(
+                    Arc::clone(&image),
+                    &[(name.into(), vec!["src/lib.rs".into()])]
+                )
+                .is_err(),
+                "{name:?}"
+            );
         }
-        assert!(SourceUpload::from_snapshot_closure(Arc::clone(&image),
-            &[selection[0].clone(), selection[0].clone()]).is_err());
-        assert!(SourceUpload::from_snapshot_closure(image,
-            &vec![selection[0].clone(); MAX_SOURCE_ROOTS + 1]).is_err());
+        assert!(
+            SourceUpload::from_snapshot_closure(
+                Arc::clone(&image),
+                &[selection[0].clone(), selection[0].clone()]
+            )
+            .is_err()
+        );
+        assert!(
+            SourceUpload::from_snapshot_closure(
+                image,
+                &vec![selection[0].clone(); MAX_SOURCE_ROOTS + 1]
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn incomplete_or_nonregular_root_refuses_the_entire_closure_projection() {
         let base = tempfile::tempdir().unwrap();
         let (image, selection) = closure_fixture(base.path());
-        for files in [vec![], vec!["missing".into()], vec!["src".into()],
-            vec!["src/lib.rs".into(), "src/lib.rs".into()]] {
+        for files in [
+            vec![],
+            vec!["missing".into()],
+            vec!["src".into()],
+            vec!["src/lib.rs".into(), "src/lib.rs".into()],
+        ] {
             let mut selected = selection.clone();
             selected[1].1 = files;
             assert!(SourceUpload::from_snapshot_closure(Arc::clone(&image), &selected).is_err());
         }
         std::os::unix::fs::symlink("src/lib.rs", base.path().join("dep/alias")).unwrap();
-        let image = Arc::new(capture_sealed_source(&[
-            ("app".into(), base.path().join("app")), ("dep".into(), base.path().join("dep")),
-        ], false, 2, 200_000).unwrap());
+        let image = Arc::new(
+            capture_sealed_source(
+                &[
+                    ("app".into(), base.path().join("app")),
+                    ("dep".into(), base.path().join("dep")),
+                ],
+                false,
+                2,
+                200_000,
+            )
+            .unwrap(),
+        );
         let mut selected = selection;
         selected[1].1 = vec!["alias".into()];
         assert!(SourceUpload::from_snapshot_closure(image, &selected).is_err());
@@ -917,23 +1393,46 @@ mod tests {
         let (image, mut selection) = closure_fixture(base.path());
         let original = SourceUpload::from_snapshot_closure(Arc::clone(&image), &selection).unwrap();
         selection.reverse();
-        for (_, files) in &mut selection { files.reverse(); }
-        assert_eq!(SourceUpload::from_snapshot_closure(image, &selection).unwrap().wire_manifest(),
-            original.wire_manifest());
+        for (_, files) in &mut selection {
+            files.reverse();
+        }
+        assert_eq!(
+            SourceUpload::from_snapshot_closure(image, &selection)
+                .unwrap()
+                .wire_manifest(),
+            original.wire_manifest()
+        );
         for change_mode in [false, true] {
             if change_mode {
                 fs::write(base.path().join("dep/src/lib.rs"), b"dep").unwrap();
-                fs::set_permissions(base.path().join("dep/src/lib.rs"), fs::Permissions::from_mode(0o755)).unwrap();
+                fs::set_permissions(
+                    base.path().join("dep/src/lib.rs"),
+                    fs::Permissions::from_mode(0o755),
+                )
+                .unwrap();
             } else {
                 fs::write(base.path().join("dep/src/lib.rs"), b"changed dependency").unwrap();
             }
-            let image = Arc::new(capture_sealed_source(&[
-                ("app".into(), base.path().join("app")), ("dep".into(), base.path().join("dep")),
-            ], false, 2, 200_000).unwrap());
+            let image = Arc::new(
+                capture_sealed_source(
+                    &[
+                        ("app".into(), base.path().join("app")),
+                        ("dep".into(), base.path().join("dep")),
+                    ],
+                    false,
+                    2,
+                    200_000,
+                )
+                .unwrap(),
+            );
             let changed = SourceUpload::from_snapshot_closure(image, &selection).unwrap();
             assert_ne!(changed.manifest.digest(), original.manifest.digest());
-            assert!(original.validate_request(&json!({"kind":"canonical-exec", "request_id":7,
-                "source_manifest":changed.wire_manifest()})).is_err());
+            assert!(
+                original
+                    .validate_request(&json!({"kind":"canonical-exec", "request_id":7,
+                "source_manifest":changed.wire_manifest()}))
+                    .is_err()
+            );
         }
     }
 }

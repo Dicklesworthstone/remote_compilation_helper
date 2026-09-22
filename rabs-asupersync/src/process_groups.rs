@@ -240,6 +240,17 @@ impl ManagedProcessGroup {
         self.leader.try_wait()
     }
 
+    /// Force the directly owned child to exit without an external signal helper.
+    /// Group supervisors use this fallback before waiting when `kill(1)` is
+    /// unavailable or group signaling fails. Descendants still require the
+    /// normal group cleanup policy.
+    ///
+    /// # Errors
+    /// The operating system refused to terminate the direct child.
+    pub fn kill_leader(&mut self) -> io::Result<()> {
+        self.leader.kill()
+    }
+
     /// Block on the leader. Descendants are NOT waited: they die or
     /// reparent per the caller's group policy (G008).
     pub fn wait_leader(&mut self) -> io::Result<ExitStatus> {

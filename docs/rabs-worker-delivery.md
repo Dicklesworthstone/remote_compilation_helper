@@ -32,6 +32,70 @@ paths. Explicit source manifests instead use `--source-root`; `--worker-prepare`
 can retain selected inputs before execution. Neither capture nor upload is part
 of result recovery or acknowledgment reconciliation.
 
+### Prepare a local Cargo workspace without enumerating files
+
+Use `cargo_source` to prepare a locked Cargo workspace and its local path
+dependencies. The source root is an explicit approved directory containing all
+of those packages. The example below assumes `app/Cargo.toml` beneath that root;
+its sibling packages retain the same relative paths on the worker:
+
+```json
+{
+  "kind": "canonical-exec",
+  "request_id": 42,
+  "program": "cargo",
+  "args": ["build", "--frozen", "--jobs=1"],
+  "toolchain_backing": "/worker/rust-toolchain",
+  "command_context": {
+    "version": "env-cwd-v1",
+    "cwd": "/__rabs/workspace/app",
+    "env": {"CARGO_TARGET_DIR": "/__rabs/out/build"}
+  },
+  "cargo_source": {"manifest": "app/Cargo.toml"},
+  "artifacts": {
+    "unit": "build",
+    "tree": "tree-files-v1",
+    "files": ["debug/my_app"]
+  }
+}
+```
+
+Set the executable filename and worker toolchain path for the actual project,
+save the specification, and prepare it:
+
+```sh
+rabsd --worker-prepare /absolute/project-parent /absolute/spec.json /absolute/bundles/build-42
+```
+
+Preparation first captures a coherent source image, then runs local
+`cargo metadata --locked --offline --all-features` against a private copy of that
+image. It checks package, workspace, target and dependency paths against the
+approved tree. The resulting bundle includes every captured regular source file,
+including build scripts, build-script data and inactive local dependencies. The
+existing capture exclusions still apply to secrets, generated build output and
+repository metadata. Choose the narrowest source root that includes the required
+workspace and sibling packages.
+
+The executable request contains the verified source manifest; `cargo_source` is
+consumed locally. Cargo arguments and command context are preserved exactly.
+Source discovery uses all features conservatively, even when the eventual
+command enables fewer features. A virtual workspace is supported by selecting
+its `Cargo.toml` and setting the corresponding canonical working directory.
+
+This automatic mode currently requires a captured workspace `Cargo.lock` and
+supports local packages only. It refuses symlinks, `.cargo/config` and
+`.cargo/config.toml`, escaping manifest paths, and registry/git dependencies.
+It neither fetches dependencies nor rewrites manifests or Cargo configuration.
+Use explicit `source_files` or `source_roots` preparation for other already
+supported source projections; those selectors are mutually exclusive with
+`cargo_source`. Worker support for explicitly uploaded registry Cargo-home
+inputs is separate from automatic graph preparation.
+
+Cargo metadata may run installed compiler probes; it does not build packages or
+run their build scripts. Discovery has a 30-second process budget and an 8 MiB
+limit per output stream, plus the existing source-transfer file and byte limits.
+Failure retains no ready bundle and never dispatches a worker execution.
+
 ### Replay registry inputs into a private Cargo home
 
 Source-backed requests may include an explicit registry-cache projection:
