@@ -8,7 +8,7 @@
 //! so dropping an interrupted read future neither loses bytes nor resets timers.
 
 use super::{Phase, RecordPeer, TRANSFER_BUDGET, WorkerPeer, read_record, require};
-use asupersync::io::{AsyncRead, AsyncWrite};
+use asupersync::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use asupersync::signal::{Signal, sigint, sigterm};
 use serde_json::{Value, json};
 use std::future::{Future, poll_fn};
@@ -21,6 +21,38 @@ const CANCEL_DRAIN_BUDGET: Duration = Duration::from_secs(60);
 
 pub(super) trait Interrupts {
     fn wait(&mut self) -> impl Future<Output = io::Result<()>>;
+
+    fn finish_verified_delivery(&self) -> bool {
+        false
+    }
+}
+
+/// Cancellation belongs to one daemon operation. The sticky intent is consumed
+/// once here; duplicate HTTP/socket requests cannot abort its cleanup drain.
+pub(super) struct OperationInterrupts {
+    cancellation: super::OperationCancellation,
+    delivered: bool,
+}
+
+impl OperationInterrupts {
+    pub(super) fn new(cancellation: super::OperationCancellation) -> Self {
+        Self { cancellation, delivered: false }
+    }
+}
+
+impl Interrupts for OperationInterrupts {
+    async fn wait(&mut self) -> io::Result<()> {
+        if self.delivered {
+            std::future::pending::<()>().await;
+        }
+        self.cancellation.cancelled().await;
+        self.delivered = true;
+        Ok(())
+    }
+
+    fn finish_verified_delivery(&self) -> bool {
+        true
+    }
 }
 
 pub(super) struct ProcessSignals {
@@ -91,7 +123,7 @@ impl<'a, S> OperatorPeer<'a, S> {
 }
 
 impl<'a, S, I: Interrupts> OperatorPeer<'a, S, I> {
-    fn with_interrupts(inner: RecordPeer<'a, S>, interrupts: I) -> Self {
+    pub(super) fn with_interrupts(inner: RecordPeer<'a, S>, interrupts: I) -> Self {
         Self { inner, interrupts, execution:None, cancel_sent:false, cancel_response_seen:false }
     }
 
@@ -134,8 +166,42 @@ impl<'a, S, I: Interrupts> OperatorPeer<'a, S, I> {
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin, I: Interrupts> OperatorPeer<'_, S, I> {
+    fn send_interruptibly(&mut self, frame: &Value) -> io::Result<()> {
+        let bytes = self.inner.outbound(frame)?;
+        let budget = self.inner.remaining()?;
+        let stream = &mut self.inner.stream;
+        let interrupts = &mut self.interrupts;
+        self.inner.runtime.block_on(async {
+            asupersync::time::timeout(asupersync::time::wall_now(), budget, async {
+                let mut stopped = pin!(interrupts.wait());
+                let mut writing = pin!(async {
+                    stream.write_all(&bytes).await?;
+                    stream.flush().await
+                });
+                poll_fn(|cx| {
+                    if let Poll::Ready(result) = stopped.as_mut().poll(cx) {
+                        return Poll::Ready(result.and(Err(io::Error::new(
+                            io::ErrorKind::ConnectionAborted,
+                            "operation cancelled during worker write; reconcile any uncertain dispatch",
+                        ))));
+                    }
+                    writing.as_mut().poll(cx)
+                }).await
+            }).await.map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "worker write deadline"))?
+        })
+    }
+
     fn interrupt(&mut self) -> io::Result<()> {
         self.inner.remaining()?;
+        // A completed execution no longer owns a cancellable process. A daemon
+        // stop racing the terminal result must still verify and retain its
+        // bytes. The explicit operator's signal-based abandon behavior stays
+        // unchanged.
+        if self.execution.is_some() && self.inner.phase != Phase::Execution
+            && self.interrupts.finish_verified_delivery()
+        {
+            return Ok(());
+        }
         let Some(id) = self.execution.filter(|_| self.inner.phase == Phase::Execution) else {
             return Err(self.abandon());
         };
@@ -181,7 +247,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin, I: Interrupts> WorkerPeer for OperatorPe
             self.inner.remaining()?;
             require(frame["kind"] != "cancel", "cancellation is local operator intent only")?;
             if self.pending_interrupt()? { self.interrupt()?; }
-            self.inner.send(frame)?;
+            // Before a complete dispatch, cancellation may abandon a partially
+            // written frame. Poison this connection; never insert a cancel
+            // record inside it or retry an uncertain canonical-exec. After a
+            // completed dispatch, the read path owns cancellation and drain.
+            if self.execution.is_none() && self.interrupts.finish_verified_delivery() {
+                self.send_interruptibly(frame)?;
+            } else {
+                self.inner.send(frame)?;
+            }
             if frame["kind"] == "canonical-exec" {
                 self.execution = Some(frame["request_id"].as_u64()
                     .ok_or_else(|| super::invalid("missing execution identity"))?);
@@ -313,6 +387,112 @@ mod tests {
         assert!(original_deadline > Instant::now() + CANCEL_DRAIN_BUDGET);
         assert_eq!(peer.inner.stream.sent(), vec![request(), json!({"kind":"cancel", "request_id":7})]);
         assert!(peer.send(&request()).is_err(), "never dispatch twice");
+    }
+
+    #[test]
+    fn daemon_cancellation_is_idempotent_and_drains_the_terminal_result() {
+        let runtime = runtime();
+        let trigger = Trigger::default();
+        let token = super::super::OperationCancellation::default();
+        let wire = Wire::new(&trigger, &[accepted(), result()]);
+        let mut peer = OperatorPeer::with_interrupts(
+            RecordPeer::new(&runtime, wire, &request()), OperationInterrupts::new(token.clone()),
+        );
+        peer.send(&request()).unwrap();
+        token.cancel();
+        token.cancel();
+        assert_eq!(peer.receive().unwrap(), result());
+        token.cancel();
+        peer.send(&json!({"kind":"output-read", "request_id":7})).unwrap();
+        assert!(!peer.inner.failed);
+        assert_eq!(peer.inner.stream.sent().iter().filter(|frame| frame["kind"] == "cancel").count(), 1);
+        assert!(peer.cancel_response_seen);
+    }
+
+    #[test]
+    fn daemon_stop_before_dispatch_sends_nothing_and_after_completion_preserves_delivery() {
+        let runtime = runtime();
+        let trigger = Trigger::default();
+        for completed in [false, true] {
+            let token = super::super::OperationCancellation::default();
+            let success = json!({"kind":"exec-result", "request_id":7, "exit_code":0, "stop_reason":null});
+            let chunk = json!({"kind":"output-chunk", "request_id":7});
+            let wire = Wire::new(&trigger, &[success.clone(), chunk.clone()]);
+            let mut peer = OperatorPeer::with_interrupts(
+                RecordPeer::new(&runtime, wire, &request()), OperationInterrupts::new(token.clone()),
+            );
+            if completed {
+                peer.send(&request()).unwrap();
+                assert_eq!(peer.receive().unwrap(), success);
+            }
+            token.cancel();
+            if completed {
+                peer.send(&json!({"kind":"output-read", "request_id":7})).unwrap();
+                assert_eq!(peer.receive().unwrap(), chunk);
+                assert!(!peer.inner.failed);
+                assert_eq!(peer.inner.stream.sent().len(), 2);
+            } else {
+                assert!(peer.send(&request()).is_err());
+                assert!(peer.inner.stream.sent().is_empty());
+            }
+            assert!(!peer.cancel_sent);
+        }
+    }
+
+    #[test]
+    fn daemon_stop_interrupts_partial_dispatch_and_source_writes_without_inserting_cancel() {
+        struct StalledWrite {
+            token: super::super::OperationCancellation,
+            stage: usize,
+            sent: Vec<u8>,
+        }
+        impl AsyncRead for StalledWrite {
+            fn poll_read(self: Pin<&mut Self>, _: &mut Context<'_>, _: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+                Poll::Pending
+            }
+        }
+        impl AsyncWrite for StalledWrite {
+            fn poll_write(self: Pin<&mut Self>, _: &mut Context<'_>, bytes: &[u8]) -> Poll<io::Result<usize>> {
+                let this = self.get_mut();
+                if this.stage == 2 {
+                    this.sent.extend_from_slice(bytes);
+                    return Poll::Ready(Ok(bytes.len()));
+                }
+                if this.stage == 1 && this.sent.is_empty() {
+                    this.sent.extend_from_slice(&bytes[..3]);
+                    return Poll::Ready(Ok(3));
+                }
+                this.token.cancel();
+                Poll::Pending
+            }
+            fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+                self.token.cancel();
+                Poll::Pending
+            }
+            fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+        let runtime = runtime();
+        for frame in [request(), json!({"kind":"source-begin", "request_id":7})] {
+            for stage in 0..3 {
+                let token = super::super::OperationCancellation::default();
+                let stream = StalledWrite { token:token.clone(), stage, sent:Vec::new() };
+                let mut peer = OperatorPeer::with_interrupts(
+                    RecordPeer::new(&runtime, stream, &request()), OperationInterrupts::new(token),
+                );
+                assert_eq!(peer.send(&frame).unwrap_err().kind(), io::ErrorKind::ConnectionAborted);
+                assert!(peer.inner.failed);
+                assert!(!peer.cancel_sent, "a cancel cannot be appended to an incomplete frame");
+                assert!(peer.execution.is_none(), "a partial dispatch is never considered complete");
+                let sent = peer.inner.stream.sent.clone();
+                let expected = format!("{frame}\n").into_bytes();
+                assert!(expected.starts_with(&sent));
+                assert_eq!(sent.len(), match stage { 0 => 0, 1 => 3, _ => expected.len() });
+                assert!(peer.send(&request()).is_err());
+                assert_eq!(peer.inner.stream.sent, sent, "an interrupted write must never retry");
+            }
+        }
     }
 
     #[test]
