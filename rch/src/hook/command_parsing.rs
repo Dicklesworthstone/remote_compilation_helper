@@ -786,9 +786,11 @@ mod cargo_profile_tests {
     #[test]
     fn build_only_tests_reserve_compiler_capacity_not_filtered_test_capacity() {
         use super::{CompilationKind, estimate_cores_for_command};
-        let mut config = rch_common::CompilationConfig::default();
-        config.build_slots = 12;
-        config.test_slots = 4;
+        let mut config = rch_common::CompilationConfig {
+            build_slots: 12,
+            test_slots: 4,
+            ..Default::default()
+        };
         for (kind, command, expected) in [
             (CompilationKind::CargoTest, "cargo test filter --no-run -- --exact --test-threads=1", 12),
             (CompilationKind::CargoTest, "RUST_TEST_THREADS=1 cargo test --no-run", 12),
