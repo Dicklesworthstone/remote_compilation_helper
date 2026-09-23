@@ -55,7 +55,7 @@ fn digest(value: &Value) -> io::Result<[u8; 32]> {
         "source digest must be 64 lowercase hex digits",
     )?;
     let mut digest = [0_u8; 32];
-    for (slot, pair) in digest.iter_mut().zip(value.as_bytes().chunks_exact(2)) {
+    for (slot, pair) in digest.iter_mut().zip(value.as_bytes().as_chunks::<2>().0) {
         let digit = |byte: u8| {
             if byte <= b'9' {
                 byte - b'0'

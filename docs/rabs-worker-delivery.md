@@ -367,6 +367,97 @@ The equivalent trusted local fixture is `--worker-build-loopback`, with the same
 arguments except for the omitted key pin. It accepts only literal loopback
 addresses and retains the plaintext provenance described above.
 
+### Prepared builds in the running daemon
+
+The running `rabsd` can durably queue prepared builds, execute up to four jobs on
+independent workers, install verified outputs, and retain their status across
+client disconnects and daemon restarts. Set `RABS_COORD_TLS_CA`,
+`RABS_COORD_TLS_CERT`, and `RABS_COORD_TLS_KEY` on the daemon process before
+starting it. These are the same authenticated transport credentials described
+below. The job commands connect to that daemon through `RABS_SOCKET_PATH` (or
+the configured socket); setting credentials only on a submitting client does
+not configure the daemon.
+
+Prepare a bundle with selected source files and `toolchain_source` first. Daemon
+jobs require both the captured source manifest and a required toolchain identity;
+requests that depend on an unspecified worker toolchain are refused. Choose and
+retain a 32-character lowercase hexadecimal job ID **before** submitting:
+
+```sh
+rabsd --job-submit 0123456789abcdef0123456789abcdef \
+  0.0.0.0:7091 fleet-worker <worker-spki-sha256> \
+  /absolute/bundles/build-42 /absolute/deliveries/build-42 /absolute/outputs/build-42
+rabsd --job-status 0123456789abcdef0123456789abcdef
+```
+
+The submission saves the exact prepared request, worker identity, key pin, and
+paths before replying. Repeating an identical submission with the same ID returns
+its status; changing its request or destination is refused. After a lost response,
+inspect that ID instead of creating another job. The job ID identifies the durable
+submission; the bundle's `request_id` remains the worker journal's execution
+identity. A new execution needs a fresh request ID above that worker journal's
+high-water mark. Submitting the same bundle under a different job ID does not
+allocate a new worker attempt.
+
+Wait until `listen_address` is present, then connect the authenticated worker to
+the coordinator's reachable hostname or IP at the reported port, using the worker
+command below. A wildcard bind address such as `0.0.0.0` is not the worker's remote
+destination. For repeated jobs, use a fixed
+listener port and omit the worker's `--once` option so its existing reconnect loop
+can service later jobs. A listener submitted with port `0` reports its actual port
+and retains that first bound endpoint for recovery. Keep the worker's configured
+coordinator address, including its DNS spelling, unchanged for that journal;
+changing it also changes the journal identity. Jobs sharing a worker name, key
+pin, listener endpoint, or conflicting paths cannot execute concurrently.
+
+Status reports `queued`, `running`, `cancelling`, `completed`, `cancelled`,
+`failed_before_start`, or `uncertain`. Check `succeeded`, `exit_code`, `stop_reason`,
+and `outputs_installed` to distinguish a successful installed build from a
+completed compiler failure. `outputs_installed` records a verified installation;
+it does not continuously monitor later user edits. Cancellation is durable:
+
+```sh
+rabsd --job-cancel 0123456789abcdef0123456789abcdef
+```
+
+A queued execution can be cancelled before dispatch. An active cancellation
+interrupts admission or sends the exact in-flight request's cancel, then retains
+and verifies its terminal result when the connection permits. If the daemon dies
+while a job is active, restart marks it `uncertain`; it never automatically sends
+another compiler execution. The worker stays reserved until the original result
+is reconciled. Retrieve a retained result into a new directory with:
+
+```sh
+rabsd --job-resume 0123456789abcdef0123456789abcdef \
+  /absolute/deliveries/build-42-resumed /absolute/deliveries/build-42
+```
+
+The final prefix directory is optional. Resume uses the saved request and original
+worker, uploads no source, and never starts a compiler. It can verify and reuse an
+already installed, identical output tree. An unavailable remote result remains
+uncertain and does not release the worker for unrelated execution.
+
+If delivery completed but acknowledgment confirmation was lost, reconcile the
+original verified delivery instead of downloading it again:
+
+```sh
+rabsd --job-acknowledge 0123456789abcdef0123456789abcdef \
+  /absolute/deliveries/build-42
+```
+
+Acknowledgment accepts only a delivery directory already owned by this job. It
+verifies the saved bytes and exact authenticated result, including the worker's
+durable released-result status when remote spools are already gone. It neither
+executes nor uploads source nor modifies installed outputs. Confirmed release
+clears the worker reservation. Recovery uses the saved request even if the
+original bundle is no longer available.
+
+The store permits at most 1,024 retained jobs, a 64 MiB admission budget including
+reserved record space, and 16 recovery destinations per job. Full stores refuse
+new admissions; completed records are not silently erased. These jobs provide
+authenticated execution and explicit output installation. They do not grant
+semantic action-cache publication or Cargo freshness authority.
+
 ### Authenticated delivery
 
 Provision an explicit CA plus server and worker certificates with the appropriate

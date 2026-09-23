@@ -24,7 +24,7 @@ impl Limit {
     }
 
     pub(super) fn acquire(&self) -> Option<Permit> {
-        self.active.fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+        self.active.try_update(Ordering::AcqRel, Ordering::Acquire, |active| {
             (active < self.maximum).then(|| active + 1)
         }).ok()?;
         Some(Permit(Arc::clone(&self.active)))

@@ -651,7 +651,7 @@ fn validate_config(
     // Cargo resolves file-config paths relative to the parent of .cargo, not
     // relative to cwd or the .cargo directory itself (Cargo config reference).
     require(
-        contained_relative(base, configured)? == PathBuf::from(directory),
+        contained_relative(base, configured)? == Path::new(directory),
         "Cargo config directory differs from the explicitly approved vendor directory",
     )?;
     let mut result = SourceReplacements {

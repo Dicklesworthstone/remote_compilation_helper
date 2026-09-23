@@ -28,7 +28,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 mod prepared_build;
-pub use prepared_build::{run_build, run_build_tls};
+pub use prepared_build::{execute_prepared_operation, run_build, run_build_tls};
+
+use rabsd::coord::secure_worker_delivery::OperationCancellation;
 
 const ACCEPT_BUDGET: Duration = Duration::from_secs(60);
 const HANDSHAKE_BUDGET: Duration = Duration::from_secs(60);
@@ -104,10 +106,14 @@ fn acknowledgment_arguments(args: &[String], count: usize) -> Option<&[String]> 
 
 /// Source capture is explicit and execution-only. Keep the existing resume
 /// spelling/placement contract; do not interpret an absent upload as a retry.
-fn execution_arguments(
-    args: &[String],
-    count: usize,
-) -> Option<(&[String], DeliveryMode, Option<&Path>, Option<&Path>)> {
+type ExecutionArguments<'a> = (
+    &'a [String],
+    DeliveryMode,
+    Option<&'a Path>,
+    Option<&'a Path>,
+);
+
+fn execution_arguments(args: &[String], count: usize) -> Option<ExecutionArguments<'_>> {
     let (args, source_root) = if args.first().is_some_and(|arg| arg == "--source-root") {
         (args.get(2..)?, Some(Path::new(args.get(1)?)))
     } else if args.len() >= 2 && args[args.len() - 2] == "--source-root" {
@@ -283,14 +289,13 @@ impl WorkerPeer for TcpPeer {
                 self.source_started = true;
                 self.until = deadline(TRANSFER_ALLOWANCE)?;
             }
-            Some("source-chunk" | "source-seal") => {
+            // Chunk progress and the final seal never renew the budget.
+            Some("source-chunk" | "source-seal")
                 if self.mode != DeliveryMode::Execute
                     || !self.source_started
-                    || self.operation_started
-                {
-                    return Err(invalid("source frame outside upload"));
-                }
-                // Chunk progress and the final seal never renew the budget.
+                    || self.operation_started =>
+            {
+                return Err(invalid("source frame outside upload"));
             }
             _ => {}
         }
@@ -586,6 +591,28 @@ fn coordinator_tls_files() -> io::Result<rabs_asupersync::worker_transport::TlsF
     })
 }
 
+struct TlsOperationControl<'a> {
+    cancellation: OperationCancellation,
+    on_listening: &'a mut dyn FnMut(SocketAddr) -> io::Result<()>,
+}
+
+async fn until_cancelled<T>(
+    cancellation: &OperationCancellation,
+    future: impl std::future::Future<Output = Result<T, String>>,
+) -> Result<T, String> {
+    use std::future::{Future, poll_fn};
+    use std::pin::pin;
+    use std::task::Poll;
+    let mut stopped = pin!(cancellation.cancelled());
+    let mut pending = pin!(future);
+    poll_fn(|cx| {
+        if stopped.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(Err("prepared operation cancelled before dispatch".to_owned()));
+        }
+        pending.as_mut().poll(cx)
+    }).await
+}
+
 /// All secure operator intents use this one native mutual-TLS listener. Local
 /// proof/source preflight is the caller's responsibility and precedes this call.
 fn accept_tls_worker(
@@ -594,6 +621,7 @@ fn accept_tls_worker(
     pin: &str,
     request_id: &Value,
     operation: &str,
+    mut control: Option<&mut TlsOperationControl<'_>>,
 ) -> Result<
     (
         asupersync::runtime::Runtime,
@@ -605,6 +633,12 @@ fn accept_tls_worker(
     use asupersync::runtime::RuntimeBuilder;
     use rabs_asupersync::worker_transport::accept_peer;
     use rabsd::coord::secure_worker_delivery::{PinnedWorkerAdmission, parse_worker_pin};
+    if asupersync::cx::Cx::current().is_some() {
+        return Err("worker delivery requires a dedicated blocking thread".to_owned());
+    }
+    if control.as_ref().is_some_and(|control| control.cancellation.is_cancelled()) {
+        return Err("prepared operation cancelled before dispatch".to_owned());
+    }
     let acceptor = coordinator_tls_files()
         .map_err(|error| error.to_string())?
         .acceptor()?;
@@ -626,23 +660,29 @@ fn accept_tls_worker(
         let listener = asupersync::net::TcpListener::bind(address)
             .await
             .map_err(|error| format!("worker TLS listen: {error}"))?;
-        eprintln!(
-            "{}",
-            json!({"kind":"worker-exec-listening",
-            "address":listener.local_addr().map_err(|error| error.to_string())?.to_string(),
-            "expected_worker":worker, "expected_worker_spki_sha256":pin,
-            "request_id":request_id, "transport":"mutual-tls-atp",
-            "operation":operation, "authentication_required":true})
-        );
-        let (stream, _) = asupersync::time::timeout(
-            asupersync::time::wall_now(),
-            ACCEPT_BUDGET,
-            listener.accept(),
-        )
-        .await
-        .map_err(|_| "worker TLS accept deadline exceeded")?
-        .map_err(|error| format!("worker TLS accept: {error}"))?;
-        accept_peer(&acceptor, stream).await
+        let address = listener.local_addr().map_err(|error| error.to_string())?;
+        if let Some(control) = control.as_mut() {
+            (control.on_listening)(address).map_err(|error| error.to_string())?;
+        } else {
+            eprintln!(
+                "{}",
+                json!({"kind":"worker-exec-listening", "address":address.to_string(),
+                "expected_worker":worker, "expected_worker_spki_sha256":pin,
+                "request_id":request_id, "transport":"mutual-tls-atp",
+                "operation":operation, "authentication_required":true})
+            );
+        }
+        let exchange = async {
+            let (stream, _) = asupersync::time::timeout(
+                asupersync::time::wall_now(), ACCEPT_BUDGET, listener.accept(),
+            ).await.map_err(|_| "worker TLS accept deadline exceeded")?
+                .map_err(|error| format!("worker TLS accept: {error}"))?;
+            accept_peer(&acceptor, stream).await
+        };
+        match control.as_ref() {
+            Some(control) => until_cancelled(&control.cancellation, exchange).await,
+            None => exchange.await,
+        }
     })?;
     Ok((runtime, peer, admission))
 }
@@ -673,6 +713,14 @@ fn run_tls_once(
 fn run_tls_operation(
     operation: WorkerOperation<'_>,
     worker_pin: &str,
+) -> Result<Delivery, DeliveryFailure> {
+    run_tls_operation_inner(operation, worker_pin, None)
+}
+
+fn run_tls_operation_inner(
+    operation: WorkerOperation<'_>,
+    worker_pin: &str,
+    mut control: Option<TlsOperationControl<'_>>,
 ) -> Result<Delivery, DeliveryFailure> {
     use rabs_asupersync::worker_transport::MAX_JSON_RECORD;
     use rabsd::coord::secure_worker_delivery::{
@@ -733,8 +781,15 @@ fn run_tls_operation(
         } else {
             "canonical-exec"
         },
+        control.as_mut(),
     )
     .map_err(failure)?;
+    if let Some(control) = control {
+        return rabsd::coord::secure_worker_delivery::receive_authenticated_controlled(
+            &runtime, peer, admission, request, directory, mode, upload.as_ref(), reuse.as_ref(),
+            control.cancellation,
+        );
+    }
     match upload.as_ref() {
         Some(upload) => {
             receive_authenticated_source(&runtime, peer, admission, request, directory, upload)
@@ -746,24 +801,37 @@ fn run_tls_operation(
 }
 
 fn run_tls_acknowledgment_once(args: &[String]) -> Result<Delivery, DeliveryFailure> {
-    use rabsd::coord::secure_worker_delivery::{acknowledge_authenticated, parse_worker_pin};
     let directory = PathBuf::from(&args[4]);
+    let request = read_request(Path::new(&args[3])).map_err(|error| DeliveryFailure {
+        directory: directory.clone(), execution_may_have_run: true, detail: error.to_string(),
+    })?;
+    run_tls_acknowledgment_bound(&args[0], &args[1], &args[2], &request, &directory, None)
+}
+
+fn run_tls_acknowledgment_bound(
+    address: &str,
+    worker: &str,
+    worker_pin: &str,
+    request: &Value,
+    directory: &Path,
+    mut control: Option<TlsOperationControl<'_>>,
+) -> Result<Delivery, DeliveryFailure> {
+    use rabsd::coord::secure_worker_delivery::{acknowledge_authenticated, parse_worker_pin};
     let failure = |detail: String| DeliveryFailure {
-        directory: directory.clone(),
+        directory: directory.to_path_buf(),
         execution_may_have_run: true,
         detail,
     };
-    let address: SocketAddr = args[0]
+    let address: SocketAddr = address
         .parse()
         .map_err(|_| failure("listen must be a literal IP:port".to_owned()))?;
-    let pin = parse_worker_pin(&args[2]).map_err(|error| failure(error.to_string()))?;
-    let request = read_request(Path::new(&args[3])).map_err(|error| failure(error.to_string()))?;
+    let pin = parse_worker_pin(worker_pin).map_err(|error| failure(error.to_string()))?;
     // Verify the historical SPKI and every byte BEFORE reading credentials or
     // starting the listener. A loopback receipt cannot be upgraded to TLS.
     let pending = PendingAcknowledgment::verify(
-        &request,
-        &args[1],
-        &directory,
+        request,
+        worker,
+        directory,
         DeliveryTrust::PinnedWorker(pin),
     )?;
     let envelope =
@@ -779,13 +847,19 @@ fn run_tls_acknowledgment_once(args: &[String]) -> Result<Delivery, DeliveryFail
     }
     let (runtime, peer, admission) = accept_tls_worker(
         address,
-        &args[1],
-        &args[2],
+        worker,
+        worker_pin,
         &request["request_id"],
         "result-acknowledgment",
+        control.as_mut(),
     )
     .map_err(failure)?;
-    acknowledge_authenticated(&runtime, peer, admission, pending)
+    match control {
+        Some(control) => rabsd::coord::secure_worker_delivery::acknowledge_authenticated_controlled(
+            &runtime, peer, admission, pending, control.cancellation,
+        ),
+        None => acknowledge_authenticated(&runtime, peer, admission, pending),
+    }
 }
 
 /// One explicitly pinned worker, authenticated transport, and one exact command.
@@ -1426,5 +1500,27 @@ mod tests {
             assert!(!destination.exists());
         }
         assert!(prepare_resume_source(DeliveryMode::Execute, Some(&old), &root.join("new")).is_err());
+    }
+
+    #[test]
+    fn operation_cancellation_stops_a_pending_or_unstarted_admission_exchange() {
+        use std::future::{Future, pending};
+        use std::task::{Context, Poll, Waker};
+        let token = OperationCancellation::default();
+        let mut waiting = Box::pin(until_cancelled(&token, pending::<Result<(), String>>()));
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(waiting.as_mut().poll(&mut cx).is_pending());
+        token.cancel();
+        assert!(matches!(waiting.as_mut().poll(&mut cx), Poll::Ready(Err(detail))
+            if detail.contains("cancelled before dispatch")));
+
+        let mut started = false;
+        let mut stopped = Box::pin(until_cancelled(&token, async {
+            started = true;
+            Ok(())
+        }));
+        assert!(matches!(stopped.as_mut().poll(&mut cx), Poll::Ready(Err(_))));
+        drop(stopped);
+        assert!(!started, "accepted cancellation must precede even an immediately ready handshake");
     }
 }
