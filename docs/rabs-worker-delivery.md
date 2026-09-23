@@ -351,6 +351,10 @@ be installed even if a release acknowledgment was lost; acknowledgment
 reconciliation remains the separate `--worker-exec-tls --acknowledge` operation
 using the same bundle request and delivery directory.
 
+To reuse an interrupted download's local prefixes, replace `--resume` with
+`--resume-from /absolute/deliveries/interrupted`. The new delivery and output
+paths remain separate; see the prefix-recovery section below.
+
 Success prints one `worker-build` JSON object containing `delivery` and
 `installed_outputs`; the latter reports whether a verified existing tree was
 reused. A nonzero compiler exit produces a retained `delivery` and null
@@ -597,6 +601,56 @@ is never repaired or overwritten. No source checkout or `--source-root` is neede
 Resume requires the worker's matching durable admission and retained result; an
 unavailable result is an error, never permission to run the compiler again.
 
+### Resume an interrupted download using local prefixes
+
+`--resume-from` selects an old delivery directory as a source of candidate bytes,
+while recovering the original retained result into a **new** directory:
+
+```sh
+rabsd --worker-exec-tls --resume-from /absolute/deliveries/interrupted \
+  0.0.0.0:7091 fleet-worker <worker-spki-sha256> \
+  /absolute/request.json /absolute/deliveries/recovered
+```
+
+It implies result resume and cannot be combined with `--resume`, `--acknowledge`
+or `--source-root`. The flag and its absolute path may precede or follow all
+positionals. Both `--worker-build-tls` and the corresponding loopback commands
+accept the same flag. The ordinary loopback reachability/provenance restrictions
+remain unchanged; prefix availability never selects a different transport.
+
+The worker must still authenticate under the selected policy and return its
+matching retained result. The receiver then copies ordinary local file prefixes
+into new independent files and downloads only their remaining ranges. A complete
+nonempty local file can avoid range reads, but every copied byte still enters
+the same complete-file SHA-256 check as downloaded bytes. A prefix need not end
+on a protocol chunk boundary. Missing local members use normal full downloads;
+this is contiguous-prefix recovery, not sparse out-of-order chunk recovery.
+
+The previous directory is never repaired, truncated, linked into the new output,
+or promoted to a verified delivery. Its markers, file lengths and timestamps
+cannot supply result identity, transport authentication or release authority.
+The new receipt describes the current delivery session and retains the original
+request fingerprint. All manifest, aggregate-budget, durability and release-ACK
+checks remain in place. No source upload or compiler dispatch is permitted.
+
+Nonregular members, symlink parents/files, additional hard links, oversized files
+and detected changes refuse. A corrupt local prefix plus a valid remote tail
+fails the complete-file hash and sends no release acknowledgment; it does not
+silently retry, repair the old directory or install a partial build. A subsequent
+explicit ordinary `--resume` into another new directory can omit those candidates
+without reexecuting the compiler, provided the worker still retains the result.
+
+Old and new roots must be disjoint, with ordinary directory ancestors and an
+existing parent for the new destination. Prepared builds additionally keep the
+prefix source separate from their bundle and installation directory. Local root
+preflight precedes credentials/listening, but a complete matching local delivery
+still recovers offline even if the old prefix source no longer exists. Keep both
+trees exclusively operator-owned during online recovery: filesystem checks are
+not a hostile same-user race-proof API. The old data remains on disk, so plan for
+a full new delivery's storage as well as the retained partial copy. Filesystem
+copy/hash/sync work is not promised interruptible; transport deadlines are not
+renewed by prefix reuse.
+
 ### Reconcile lost acknowledgments without downloading again
 
 Use `--acknowledge` only when the complete local delivery already exists and its
@@ -618,7 +672,7 @@ rabsd --worker-exec-tls --acknowledge \
 The worker connects as in authenticated delivery above. The trusted-local fixture
 also supports `rabsd --worker-exec-loopback --acknowledge` with its usual four
 positionals. The flag may precede or follow the positionals, but cannot be mixed
-with `--resume` or `--source-root`. A plaintext receipt cannot be acknowledged as
+with `--resume`, `--resume-from` or `--source-root`. A plaintext receipt cannot be acknowledged as
 an authenticated one, and TLS failure never selects the loopback lane.
 
 Before listening, acknowledgment recovery verifies the existing receipt, exact
@@ -659,7 +713,18 @@ cargo test -p rabsd --test worker_delivery_cli
 cargo test -p rabsd --test worker_exec_tls
 cargo test -p rabsd coord::secure_worker_delivery::interrupt
 cargo test -p rabsd --test worker_interrupt_tls
+cargo test -p rabsd worker_delivery::reuse
+cargo test -p rabsd --test worker_resume_tls
 ```
+
+The prefix-recovery tests interrupt an actual receiver's native TLS download,
+then launch a fresh receiver/build command using its partial files. They require
+only the remaining artifact ranges, complete local hash verification before ACKs,
+independent installed outputs, and offline replay without the old prefix source
+or configured credentials. Corrupt prefixes and a different CA-valid worker key
+must refuse. The peer is scripted; these tests do not execute a compiler or
+establish real-worker spool/fleet proof. They remain coverage awaiting execution,
+not measured network-performance or passing acceptance evidence.
 
 The interruption tests send real SIGINT/SIGTERM to the actual receiver process
 while communicating through native mutual TLS. Their scripted peer exercises
