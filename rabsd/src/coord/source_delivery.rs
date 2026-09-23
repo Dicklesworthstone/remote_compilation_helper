@@ -159,8 +159,9 @@ pub fn request_manifest(request: &Value) -> io::Result<Option<SourceManifest>> {
 /// Alternatively cargo_source: {manifest: "app/Cargo.toml"} resolves a locked,
 /// offline local Cargo graph from a retained copy of the entire approved anchor.
 /// It includes every captured regular file, preserving build-script/include data.
-/// That mode may run compiler probes, never builds. It initially refuses symlinks,
-/// Cargo configuration, and registry/git dependencies; manifests are not rewritten.
+/// That mode may run compiler probes, never builds. Explicit vendor selection
+/// adds checked crates.io and locked Git directory sources. Other Cargo config
+/// and symlinks refuse; manifests and source replacements are not rewritten.
 /// Optional cargo_home selects a registry-only prefix in an explicitly selected
 /// manifest; its version/prefix is preserved for worker-side private Cargo-home replay.
 ///

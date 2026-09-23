@@ -1,6 +1,6 @@
 //! Bounded local Cargo graph discovery from retained, coherent source bytes.
 //!
-//! Supports locked local workspaces and explicitly approved crates.io vendor trees.
+//! Supports locked local workspaces and explicitly approved registry/Git vendor trees.
 //! Directory-source files and lock checksums are validated before reuse. The
 //! approved anchor is the upload boundary, not a guessed set of Rust files:
 //! build scripts, include! inputs, and optional/target dependencies retain their
@@ -9,7 +9,6 @@
 mod vendor;
 
 use super::super::{SourceUpload, invalid, require};
-use vendor::VendoredSources;
 use rabs_asupersync::process_groups::{GroupSignal, ManagedProcessGroup};
 use rabs_asupersync::region_tree::Attribution;
 use rabs_sandbox::snapshot_capture::{MemberKind, SealedSourceSnapshot};
@@ -22,6 +21,7 @@ use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use vendor::{SourceReplacements, VendoredSources};
 
 const OUTPUT_LIMIT: u64 = 8 * 1024 * 1024;
 const METADATA_TIMEOUT: Duration = Duration::from_secs(30);
@@ -38,7 +38,9 @@ impl CargoSource {
         require(
             value.as_object().is_some_and(|fields| {
                 fields.contains_key("manifest")
-                    && fields.keys().all(|key| matches!(key.as_str(), "manifest" | "vendor"))
+                    && fields
+                        .keys()
+                        .all(|key| matches!(key.as_str(), "manifest" | "vendor"))
             }),
             "cargo_source requires manifest and optional vendor",
         )?;
@@ -57,11 +59,16 @@ impl CargoSource {
                     .is_some_and(|name| name == "Cargo.toml"),
             "cargo_source manifest must be a safe relative Cargo.toml path",
         )?;
-        let vendor = value.get("vendor").map(|value| {
-            let directory = value.as_str().ok_or_else(|| invalid("cargo_source vendor must be a string"))?;
-            vendor::validate_directory(directory)?;
-            Ok::<_, io::Error>(directory.to_owned())
-        }).transpose()?;
+        let vendor = value
+            .get("vendor")
+            .map(|value| {
+                let directory = value
+                    .as_str()
+                    .ok_or_else(|| invalid("cargo_source vendor must be a string"))?;
+                vendor::validate_directory(directory)?;
+                Ok::<_, io::Error>(directory.to_owned())
+            })
+            .transpose()?;
         Ok(Self {
             manifest: manifest.to_owned(),
             vendor,
@@ -73,9 +80,11 @@ impl CargoSource {
     }
 
     pub(super) fn prepare(&self, image: Arc<SealedSourceSnapshot>) -> io::Result<SourceUpload> {
-        let vendor = self.vendor.as_deref().map(|directory| {
-            VendoredSources::verify(&image, &self.manifest, directory)
-        }).transpose()?;
+        let vendor = self
+            .vendor
+            .as_deref()
+            .map(|directory| VendoredSources::verify(&image, &self.manifest, directory))
+            .transpose()?;
         let files = validate_capture(&image, &self.manifest, vendor.as_ref())?;
         // Planning starts only after a complete paired capture. Cargo never sees
         // a mutable original checkout or a mixture of pre/post-mutation files.
@@ -144,7 +153,9 @@ impl CargoSource {
 }
 
 fn validate_capture(
-    image: &SealedSourceSnapshot, manifest: &str, vendor: Option<&VendoredSources>,
+    image: &SealedSourceSnapshot,
+    manifest: &str,
+    vendor: Option<&VendoredSources>,
 ) -> io::Result<Vec<String>> {
     let captured = image
         .manifest("workspace")
@@ -157,7 +168,8 @@ fn validate_capture(
         )?;
         if matches!(kind, MemberKind::Regular { .. }) {
             require(
-                !is_cargo_config(Path::new(path)) || vendor.is_some_and(|vendor| vendor.allows_config(path)),
+                !is_cargo_config(Path::new(path))
+                    || vendor.is_some_and(|vendor| vendor.allows_config(path)),
                 "Cargo config requires the explicitly validated vendor source-replacement mode",
             )?;
             files.push(path.clone());
@@ -168,7 +180,9 @@ fn validate_capture(
             // Vendor packages were checked as complete checksum-covered trees.
             // Their nested test Cargo.toml/config/lock fixtures are ordinary data,
             // not independent workspace roots for the planning command.
-            if vendor.is_some_and(|vendor| vendor.contains(path)) { continue; }
+            if vendor.is_some_and(|vendor| vendor.contains(path)) {
+                continue;
+            }
             if Path::new(path)
                 .file_name()
                 .is_some_and(|name| name == "Cargo.toml")
@@ -183,7 +197,12 @@ fn validate_capture(
                 let value: toml::Value = toml::from_str(text).map_err(|error| {
                     invalid(&format!("captured Cargo manifest {path}: {error}"))
                 })?;
-                validate_manifest_paths(Path::new(path).parent().unwrap_or(Path::new("")), &value)?;
+                validate_manifest_paths(
+                    Path::new(path).parent().unwrap_or(Path::new("")),
+                    &value,
+                    vendor.map(|vendor| &vendor.sources),
+                    false,
+                )?;
             }
             if Path::new(path)
                 .file_name()
@@ -199,8 +218,8 @@ fn validate_capture(
                 let lock: toml::Value = toml::from_str(text).map_err(|error| {
                     invalid(&format!("captured Cargo lockfile {path}: {error}"))
                 })?;
-                if vendor.is_some() {
-                    vendor::validate_lock_sources(&lock)?;
+                if let Some(vendor) = vendor {
+                    vendor.validate_lock_sources(&lock)?;
                 } else if let Some(packages) = lock.get("package").and_then(toml::Value::as_array) {
                     require(
                         packages
@@ -231,11 +250,24 @@ fn is_cargo_config(path: &Path) -> bool {
 // This is a containment preflight, not a second dependency resolver. Cargo owns
 // graph resolution; checking path-bearing manifest fields before it runs prevents
 // Cargo from opening absolute/escaping local dependencies outside the copy.
-fn validate_manifest_paths(base: &Path, value: &toml::Value) -> io::Result<()> {
+fn validate_manifest_paths(
+    base: &Path,
+    value: &toml::Value,
+    sources: Option<&SourceReplacements>,
+    vendored_git: bool,
+) -> io::Result<()> {
     for field in ["package", "project"] {
         if let Some(package) = value.get(field) {
             for field in ["workspace", "readme", "license-file", "build"] {
                 validate_path_field(base, package, field)?;
+            }
+            if !vendored_git
+                && let (Some(sources), Some(path)) = (
+                    sources,
+                    package.get("workspace").and_then(toml::Value::as_str),
+                )
+            {
+                sources.check_local_package_path(&contained_relative(base, path)?, false)?;
             }
             if let Some(scripts) = package.get("build").and_then(toml::Value::as_array) {
                 for script in scripts {
@@ -270,19 +302,25 @@ fn validate_manifest_paths(base: &Path, value: &toml::Value) -> io::Result<()> {
             }
         }
     }
-    validate_dependency_sections(base, value)?;
+    validate_dependency_sections(base, value, sources, vendored_git)?;
     if let Some(targets) = value.get("target").and_then(toml::Value::as_table) {
         for target in targets.values() {
-            validate_dependency_sections(base, target)?;
+            validate_dependency_sections(base, target, sources, vendored_git)?;
         }
     }
     if let Some(workspace) = value.get("workspace") {
-        validate_dependency_sections(base, workspace)?;
+        validate_dependency_sections(base, workspace, sources, vendored_git)?;
         for field in ["members", "default-members", "exclude"] {
             if let Some(paths) = workspace.get(field).and_then(toml::Value::as_array) {
                 for path in paths {
                     if let Some(path) = path.as_str() {
-                        contained_relative(base, path)?;
+                        let path = contained_relative(base, path)?;
+                        if !vendored_git
+                            && field != "exclude"
+                            && let Some(sources) = sources
+                        {
+                            sources.check_local_package_path(&path, true)?;
+                        }
                     }
                 }
             }
@@ -295,11 +333,11 @@ fn validate_manifest_paths(base: &Path, value: &toml::Value) -> io::Result<()> {
     }
     if let Some(patches) = value.get("patch").and_then(toml::Value::as_table) {
         for dependencies in patches.values() {
-            validate_dependencies(base, dependencies)?;
+            validate_dependencies(base, dependencies, sources, vendored_git)?;
         }
     }
     if let Some(replacements) = value.get("replace") {
-        validate_dependencies(base, replacements)?;
+        validate_dependencies(base, replacements, sources, vendored_git)?;
     }
     Ok(())
 }
@@ -311,7 +349,12 @@ fn validate_path_field(base: &Path, value: &toml::Value, field: &str) -> io::Res
     Ok(())
 }
 
-fn validate_dependency_sections(base: &Path, value: &toml::Value) -> io::Result<()> {
+fn validate_dependency_sections(
+    base: &Path,
+    value: &toml::Value,
+    sources: Option<&SourceReplacements>,
+    vendored_git: bool,
+) -> io::Result<()> {
     for field in [
         "dependencies",
         "dev-dependencies",
@@ -320,23 +363,47 @@ fn validate_dependency_sections(base: &Path, value: &toml::Value) -> io::Result<
         "build_dependencies",
     ] {
         if let Some(dependencies) = value.get(field) {
-            validate_dependencies(base, dependencies)?;
+            validate_dependencies(base, dependencies, sources, vendored_git)?;
         }
     }
     Ok(())
 }
 
-fn validate_dependencies(base: &Path, value: &toml::Value) -> io::Result<()> {
+fn validate_dependencies(
+    base: &Path,
+    value: &toml::Value,
+    sources: Option<&SourceReplacements>,
+    vendored_git: bool,
+) -> io::Result<()> {
     if let Some(dependencies) = value.as_table() {
         for dependency in dependencies.values() {
             if let Some(fields) = dependency.as_table() {
                 require(
-                    !fields.contains_key("git")
-                        && !fields.contains_key("registry")
-                        && !fields.contains_key("registry-index"),
-                    "automatic Cargo source preparation does not import git or registry dependency selectors",
+                    !fields.contains_key("registry") && !fields.contains_key("registry-index"),
+                    "automatic Cargo source preparation does not import alternate registry selectors",
                 )?;
-                validate_path_field(base, dependency, "path")?;
+                if fields.contains_key("git") {
+                    sources
+                        .ok_or_else(|| {
+                            invalid("Git dependencies require an explicitly verified vendor source")
+                        })?
+                        .check_dependency(fields)?;
+                }
+                // Cargo keeps original sibling paths in vendored Git manifests,
+                // but resolves those dependencies from that Git source's directory
+                // replacement. Do not reinterpret an ignored path as a local
+                // input. The resolved package source/manifest/targets are checked
+                // against the exact captured lock and vendor tree afterward.
+                if !vendored_git {
+                    validate_path_field(base, dependency, "path")?;
+                    if let (Some(sources), Some(path)) = (
+                        sources,
+                        dependency.get("path").and_then(toml::Value::as_str),
+                    ) {
+                        sources
+                            .check_local_package_path(&contained_relative(base, path)?, false)?;
+                    }
+                }
             }
         }
     }
@@ -605,7 +672,9 @@ fn validate_metadata(
             .is_some_and(|path| image.file_bytes("workspace", path).is_some()),
         "automatic Cargo source preparation requires the captured workspace Cargo.lock",
     )?;
-    let locked = vendor.map(|vendor| vendor.bind_lock(image, &lock)).transpose()?;
+    let locked = vendor
+        .map(|vendor| vendor.bind_lock(image, &lock))
+        .transpose()?;
     let packages = value["packages"]
         .as_array()
         .filter(|packages| !packages.is_empty() && packages.len() <= MAX_PACKAGES)
@@ -618,7 +687,7 @@ fn validate_metadata(
         } else {
             require(
                 package.get("source").is_some_and(Value::is_null),
-                "registry packages require an explicitly validated vendor source; Git remains unsupported",
+                "registry and Git packages require an explicitly validated vendor source",
             )?;
         }
         let id = package["id"]
@@ -737,7 +806,7 @@ mod tests {
             "[target.'cfg(windows)'.build-dependencies]\nx = { path = \"../../outside\" }\n",
         )
         .unwrap();
-        assert!(validate_manifest_paths(Path::new("app"), &manifest).is_err());
+        assert!(validate_manifest_paths(Path::new("app"), &manifest, None, false).is_err());
         for declaration in [
             "[dependencies]\nx = { git = 'file:///outside/repository' }",
             "[workspace.dependencies]\nx = { registry = 'outside' }",
@@ -750,15 +819,15 @@ mod tests {
         ] {
             let manifest: toml::Value = toml::from_str(declaration).unwrap();
             assert!(
-                validate_manifest_paths(Path::new("app"), &manifest).is_err(),
+                validate_manifest_paths(Path::new("app"), &manifest, None, false).is_err(),
                 "{declaration}"
             );
         }
         let metadata: toml::Value = toml::from_str("[package.metadata.example]\npath = '/not-a-Cargo-path'\ngit = 'file:///not-a-dependency'\n").unwrap();
-        validate_manifest_paths(Path::new("app"), &metadata).unwrap();
+        validate_manifest_paths(Path::new("app"), &metadata, None, false).unwrap();
         let target: toml::Value =
             toml::from_str("[package]\nforced-target = 'x86_64-unknown-linux-gnu'\n").unwrap();
-        validate_manifest_paths(Path::new("app"), &target).unwrap();
+        validate_manifest_paths(Path::new("app"), &target, None, false).unwrap();
     }
 
     #[test]
