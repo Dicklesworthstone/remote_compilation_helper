@@ -4,7 +4,7 @@
 
 use super::{
     Delivery, DeliveryFailure, DeliveryMode, DeliveryTrust, WorkerOperation, invalid,
-    operation_arguments, operation_failure, read_request, recover_existing_delivery,
+    operation_arguments, operation_failure, prepare_resume_source, read_request, recover_existing_delivery,
     request_manifest, run_loopback_operation, run_tls_operation,
 };
 use rabsd::coord::delivery_recovery::{InstalledOutputs, install_delivery_outputs};
@@ -50,6 +50,7 @@ struct PreparedBuild<'a> {
     directory: &'a Path,
     output: &'a Path,
     mode: DeliveryMode,
+    resume_from: Option<&'a Path>,
 }
 
 impl PreparedBuild<'_> {
@@ -115,6 +116,16 @@ impl PreparedBuild<'_> {
                     )),
                     Err(error) => return Err(self.failure(error.to_string())),
                 }
+                // Local reuse remains read-only through BOTH delivery and later
+                // output installation. Complete local recovery above does not
+                // depend on this old directory continuing to exist.
+                if let Some(reuse) = prepare_resume_source(self.mode, self.resume_from, self.directory)
+                    .map_err(|error| self.failure(error.to_string()))?
+                {
+                    for path in [self.bundle, self.output] {
+                        reuse.validate_destination(path).map_err(|error| self.failure(error.to_string()))?;
+                    }
+                }
                 let source = self.bundle.join("source");
                 let source_root = if self.mode == DeliveryMode::Execute {
                     ordinary_directory(&source, false)
@@ -130,6 +141,7 @@ impl PreparedBuild<'_> {
                     directory: self.directory,
                     mode: self.mode,
                     source_root,
+                    resume_from: self.resume_from,
                 };
                 match self.pin {
                     Some(pin) => run_tls_operation(operation, pin)?,
@@ -196,17 +208,17 @@ impl PreparedBuild<'_> {
 
 fn run(args: &[String], tls: bool) -> i32 {
     let count = if tls { 6 } else { 5 };
-    let Some((args, mode)) = operation_arguments(args, count).filter(|(args, _)| {
+    let Some((args, mode, resume_from)) = operation_arguments(args, count).filter(|(args, _, _)| {
         args.iter()
             .all(|arg| !arg.is_empty() && !arg.starts_with("--"))
     }) else {
         eprintln!(
-            "usage: rabsd --worker-build-{} [--resume] <IP:port> <worker> {}<absolute-bundle-directory> <absolute-delivery-directory> <absolute-output-directory>",
+            "usage: rabsd --worker-build-{} [--resume | --resume-from <absolute-old-delivery>] <IP:port> <worker> {}<absolute-bundle-directory> <absolute-delivery-directory> <absolute-output-directory>",
             if tls { "tls" } else { "loopback" },
             if tls { "<worker-spki-sha256> " } else { "" }
         );
         eprintln!(
-            "The bundle supplies request.json and source/. New execution installs successful verified outputs; --resume retrieves a retained result without source upload or execution."
+            "The bundle supplies request.json and source/. New execution installs successful verified outputs; resume retrieves a retained result without source upload or execution. --resume-from may reuse independently verified local prefixes in a NEW delivery directory."
         );
         return 2;
     };
@@ -219,6 +231,7 @@ fn run(args: &[String], tls: bool) -> i32 {
         directory: Path::new(&args[offset + 1]),
         output: Path::new(&args[offset + 2]),
         mode,
+        resume_from,
     }
     .report()
 }
@@ -278,6 +291,7 @@ mod tests {
             directory: &directory,
             output: &output,
             mode: DeliveryMode::Execute,
+            resume_from: None,
         };
         let error = build.execute().unwrap_err();
         assert!(
@@ -294,5 +308,36 @@ mod tests {
             ..build
         };
         assert!(overlap.request().unwrap_err().detail.contains("overlap"));
+    }
+
+    #[test]
+    fn resumed_build_keeps_prefix_roots_separate_from_bundle_and_installation() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().canonicalize().unwrap();
+        let source = root.join("checkout");
+        let bundle = root.join("bundle");
+        let directory = root.join("delivery");
+        let old = root.join("old");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&old).unwrap();
+        fs::write(source.join("lib.rs"), b"source").unwrap();
+        let spec = json!({"kind":"canonical-exec", "request_id":1, "program":"rustc",
+            "toolchain_backing":"/tc", "source_files":["lib.rs"],
+            "artifacts":{"unit":"build", "files":["lib.rlib"]}});
+        rabsd::coord::source_delivery::prepare_source_bundle(&source, &spec, &bundle).unwrap();
+        for (resume_from, output) in [(&bundle, root.join("out")), (&old, old.join("out"))] {
+            let build = PreparedBuild {
+                address:"invalid-address", worker:"worker", pin:None,
+                bundle:&bundle, directory:&directory, output:&output,
+                mode:DeliveryMode::Resume, resume_from:Some(resume_from),
+            };
+            let error = build.execute().unwrap_err();
+            assert!(error.execution_may_have_run);
+            assert!(error.detail.contains("overlap"));
+            assert!(!directory.exists());
+            assert!(!output.exists());
+        }
+        assert_eq!(fs::read(source.join("lib.rs")).unwrap(), b"source");
+        assert!(fs::read_dir(old).unwrap().next().is_none());
     }
 }

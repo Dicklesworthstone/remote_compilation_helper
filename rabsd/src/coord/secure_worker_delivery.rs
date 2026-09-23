@@ -16,8 +16,8 @@
 use super::delivery_ack::PendingAcknowledgment;
 use super::source_delivery::SourceUpload;
 use super::worker_delivery::{
-    Delivery, DeliveryFailure, DeliveryMode, WorkerAuthentication, WorkerPeer, receive_operation,
-    validate_request,
+    Delivery, DeliveryFailure, DeliveryMode, ResumePeer, ResumeSource,
+    WorkerAuthentication, WorkerPeer, receive_operation, validate_request,
 };
 use asupersync::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use asupersync::runtime::Runtime;
@@ -627,6 +627,7 @@ pub fn receive_authenticated(
         request,
         destination,
         DeliveryMode::Execute,
+        None,
     )
 }
 
@@ -636,6 +637,8 @@ pub fn receive_authenticated(
 /// or plaintext fallback. In recovery mode even pre-admission errors preserve
 /// uncertainty about the original run. Only the shared byte verifier can finalize
 /// the new delivery directory and acknowledge remote captures.
+/// Optional local prefixes are resume-only hints, not authentication or result
+/// evidence. Every copied byte is hashed against the newly resumed result.
 pub fn receive_authenticated_operation(
     runtime: &Runtime,
     peer: AuthenticatedPeer,
@@ -643,6 +646,7 @@ pub fn receive_authenticated_operation(
     request: &Value,
     destination: &Path,
     mode: DeliveryMode,
+    resume_source: Option<&ResumeSource>,
 ) -> Result<Delivery, DeliveryFailure> {
     let failure = |error: io::Error| DeliveryFailure {
         directory: destination.to_path_buf(),
@@ -653,6 +657,11 @@ pub fn receive_authenticated_operation(
         return Err(failure(invalid(
             "authenticated delivery requires an operator thread, not nested block_on",
         )));
+    }
+    if let Some(source) = resume_source {
+        require(mode == DeliveryMode::Resume, "local output prefixes require explicit resume")
+            .map_err(&failure)?;
+        source.validate_destination(destination).map_err(&failure)?;
     }
     // Keep this private owner alive until the admitted peer and its transport
     // have both dropped. No caller can clone the consumed admission capability.
@@ -670,7 +679,12 @@ pub fn receive_authenticated_operation(
         Arc::clone(&admission),
     )
     .map_err(failure)?;
-    receive_operation(&mut admitted, request, &expected_worker, destination, mode)
+    match resume_source {
+        Some(source) => receive_operation(
+            &mut ResumePeer::new(&mut admitted, source), request, &expected_worker, destination, mode,
+        ),
+        None => receive_operation(&mut admitted, request, &expected_worker, destination, mode),
+    }
 }
 
 /// Reconcile a previously verified local delivery through the same native TLS
@@ -1517,5 +1531,61 @@ mod tests {
                 assert!(peer.send(&request()).is_err());
             }
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn authenticated_prefix_reuse_preserves_pinned_provenance_and_exact_recovery() {
+        use std::os::unix::fs::MetadataExt;
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().canonicalize().unwrap();
+        let old = root.join("old");
+        std::fs::create_dir_all(old.join("diagnostics")).unwrap();
+        std::fs::write(old.join("diagnostics/stdout"), b"A\0\xffB").unwrap();
+        // A candidate marker is never parsed as provenance or completion proof.
+        std::fs::write(old.join("delivery.json"), b"untrusted marker").unwrap();
+        let original = std::fs::metadata(old.join("diagnostics/stdout")).unwrap();
+        let source = ResumeSource::open(&old).unwrap();
+        let destination = root.join("new");
+        let (mut peer, request) = resumed_peer();
+        peer.inner.replies.remove(3); // Complete local stdout must avoid its range request.
+        let delivery = receive_operation(&mut ResumePeer::new(&mut peer, &source),
+            &request, "worker", &destination, DeliveryMode::Resume).unwrap();
+        assert!(delivery.acknowledgments_confirmed);
+        assert_eq!(delivery.receipt["transport_authenticated"], true);
+        assert_eq!(delivery.receipt["worker_spki_sha256"], hex(&[1;32]));
+        assert_eq!(delivery.receipt["authenticated_session_id"], 10);
+        assert_eq!(delivery.receipt["publication_authorized"], false);
+        assert!(peer.inner.replies.is_empty());
+        assert_eq!(peer.inner.sent[2], DeliveryMode::Resume.frame(&request));
+        assert!(peer.inner.sent.iter().all(|frame| frame["kind"] != "canonical-exec"));
+        assert!(peer.inner.sent.iter().all(|frame| !(frame["kind"] == "output-read" && frame["stream"] == "stdout")));
+        assert_eq!(std::fs::read(old.join("delivery.json")).unwrap(), b"untrusted marker");
+        assert_ne!(original.ino(), std::fs::metadata(destination.join("diagnostics/stdout")).unwrap().ino());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_prefixes_cannot_bypass_authenticated_admission_or_complete_hashes() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().canonicalize().unwrap();
+        let old = root.join("old");
+        std::fs::create_dir_all(old.join("diagnostics")).unwrap();
+        std::fs::write(old.join("diagnostics/stdout"), b"evil").unwrap();
+        let source = ResumeSource::open(&old).unwrap();
+        for wrong_identity in [false, true] {
+            let destination = root.join(if wrong_identity {"foreign"} else {"corrupt"});
+            let (mut peer, request) = resumed_peer();
+            if wrong_identity { peer.inner.replies[0]["peer_id"] = json!(hex(&[2;32])); }
+            let error = receive_operation(&mut ResumePeer::new(&mut peer, &source),
+                &request, "worker", &destination, DeliveryMode::Resume).unwrap_err();
+            assert!(error.execution_may_have_run);
+            assert!(error.detail.contains(if wrong_identity {"authenticated peer"} else {"complete file digest"}));
+            assert!(peer.inner.sent.iter().all(|frame| !matches!(frame["kind"].as_str(),
+                Some("canonical-exec" | "output-ack" | "artifact-ack"))));
+            if wrong_identity { assert!(peer.inner.sent.is_empty()); }
+            assert!(!destination.join("delivery.json").exists());
+        }
+        assert_eq!(std::fs::read(old.join("diagnostics/stdout")).unwrap(), b"evil");
     }
 }

@@ -7,6 +7,7 @@
 //! Repeating an exact command replays a verified durable delivery without dispatch.
 //! --resume explicitly retrieves a sealed remote result into a NEW directory;
 //! incomplete prior deliveries remain untouched and never trigger reexecution.
+//! --resume-from selects local prefixes for that same recovery path, not execution.
 //! --acknowledge explicitly reconciles an existing local delivery with the worker;
 //! it sends no byte-range reads or compiler execution and never replaces files.
 //! --source-root selects local capture for a request's explicit source_manifest;
@@ -16,8 +17,8 @@ use rabsd::coord::delivery_ack::PendingAcknowledgment;
 use rabsd::coord::delivery_recovery::{DeliveryTrust, recover_existing_delivery};
 use rabsd::coord::source_delivery::{SourcePeer, SourceUpload, request_manifest};
 use rabsd::coord::worker_delivery::{
-    Delivery, DeliveryFailure, DeliveryMode, MAX_FRAME_BYTES, WorkerPeer, receive_operation,
-    validate_request,
+    Delivery, DeliveryFailure, DeliveryMode, MAX_FRAME_BYTES, ResumePeer, ResumeSource,
+    WorkerPeer, receive_operation, validate_request,
 };
 use serde_json::{Value, json};
 use std::fs::File;
@@ -56,23 +57,27 @@ fn check_deadline(deadline: Instant) -> io::Result<()> {
 
 /// Intent is a local flag, never a guess based on a failed response. Accept it
 /// before or after the positional arguments, but never twice or in their midst.
-fn operation_arguments(args: &[String], count: usize) -> Option<(&[String], DeliveryMode)> {
-    let (positionals, mode) = if args.len() == count {
-        (args, DeliveryMode::Execute)
+/// --resume-from implies resume; it never changes the saved execution request.
+fn operation_arguments(args: &[String], count: usize) -> Option<(&[String], DeliveryMode, Option<&Path>)> {
+    let (positionals, mode, resume_from) = if args.len() == count {
+        (args, DeliveryMode::Execute, None)
     } else if args.len() == count + 1 && args.first().is_some_and(|arg| arg == "--resume") {
-        (&args[1..], DeliveryMode::Resume)
+        (&args[1..], DeliveryMode::Resume, None)
     } else if args.len() == count + 1 && args.last().is_some_and(|arg| arg == "--resume") {
-        (&args[..count], DeliveryMode::Resume)
+        (&args[..count], DeliveryMode::Resume, None)
+    } else if args.len() == count + 2 && args.first().is_some_and(|arg| arg == "--resume-from") {
+        (&args[2..], DeliveryMode::Resume, Some(Path::new(&args[1])))
+    } else if args.len() == count + 2 && args[count] == "--resume-from" {
+        (&args[..count], DeliveryMode::Resume, Some(Path::new(&args[count + 1])))
     } else {
         return None;
     };
-    if positionals
-        .iter()
-        .any(|arg| matches!(arg.as_str(), "--resume" | "--acknowledge"))
+    if positionals.iter().any(|arg| matches!(arg.as_str(), "--resume" | "--resume-from" | "--acknowledge"))
+        || resume_from.is_some_and(|root| !root.is_absolute())
     {
         return None;
     }
-    Some((positionals, mode))
+    Some((positionals, mode, resume_from))
 }
 
 /// Acceptance is independently selected, never an implicit network side effect
@@ -90,7 +95,7 @@ fn acknowledgment_arguments(args: &[String], count: usize) -> Option<&[String]> 
     };
     if positionals
         .iter()
-        .any(|arg| matches!(arg.as_str(), "--resume" | "--source-root" | "--acknowledge"))
+        .any(|arg| matches!(arg.as_str(), "--resume" | "--resume-from" | "--source-root" | "--acknowledge"))
     {
         return None;
     }
@@ -102,7 +107,7 @@ fn acknowledgment_arguments(args: &[String], count: usize) -> Option<&[String]> 
 fn execution_arguments(
     args: &[String],
     count: usize,
-) -> Option<(&[String], DeliveryMode, Option<&Path>)> {
+) -> Option<(&[String], DeliveryMode, Option<&Path>, Option<&Path>)> {
     let (args, source_root) = if args.first().is_some_and(|arg| arg == "--source-root") {
         (args.get(2..)?, Some(Path::new(args.get(1)?)))
     } else if args.len() >= 2 && args[args.len() - 2] == "--source-root" {
@@ -110,14 +115,14 @@ fn execution_arguments(
     } else {
         (args, None)
     };
-    let (args, mode) = operation_arguments(args, count)?;
+    let (args, mode, resume_from) = operation_arguments(args, count)?;
     if args.iter().any(|arg| arg == "--source-root")
         || source_root.is_some_and(|root| !root.is_absolute())
         || (source_root.is_some() && mode == DeliveryMode::Resume)
     {
         return None;
     }
-    Some((args, mode, source_root))
+    Some((args, mode, source_root, resume_from))
 }
 
 /// Reuse the coherent sealed-capture boundary, then select ONLY the files whose
@@ -162,6 +167,20 @@ fn capture_source(
         )
     })?;
     SourceUpload::for_request(std::sync::Arc::new(image), "workspace", request).map(Some)
+}
+
+/// A prefix source is local intent, not proof. Validate it before credentials,
+/// listening, or worker contact, but only AFTER complete local receipt recovery.
+fn prepare_resume_source(
+    mode: DeliveryMode, root: Option<&Path>, destination: &Path,
+) -> io::Result<Option<ResumeSource>> {
+    let Some(root) = root else { return Ok(None); };
+    if mode != DeliveryMode::Resume {
+        return Err(invalid("--resume-from is result recovery only"));
+    }
+    let source = ResumeSource::open(root)?;
+    source.validate_destination(destination)?;
+    Ok(Some(source))
 }
 
 fn loopback_address(address: &str) -> io::Result<SocketAddr> {
@@ -375,12 +394,14 @@ struct WorkerOperation<'a> {
     directory: &'a Path,
     mode: DeliveryMode,
     source_root: Option<&'a Path>,
+    resume_from: Option<&'a Path>,
 }
 
 fn run_once(
     args: &[String],
     mode: DeliveryMode,
     source_root: Option<&Path>,
+    resume_from: Option<&Path>,
 ) -> Result<Delivery, DeliveryFailure> {
     let directory = Path::new(&args[3]);
     let request = read_request(Path::new(&args[2]))
@@ -392,6 +413,7 @@ fn run_once(
         directory,
         mode,
         source_root,
+        resume_from,
     })
 }
 
@@ -403,6 +425,7 @@ fn run_loopback_operation(operation: WorkerOperation<'_>) -> Result<Delivery, De
         directory,
         mode,
         source_root,
+        resume_from,
     } = operation;
     let failure = |error: io::Error| operation_failure(directory, mode, error.to_string());
     let address = loopback_address(address).map_err(&failure)?;
@@ -415,8 +438,9 @@ fn run_loopback_operation(operation: WorkerOperation<'_>) -> Result<Delivery, De
         return Ok(delivery);
     }
     // Offline receipt recovery above must not depend on a still-existing
-    // checkout. A new run captures and verifies source BEFORE listening.
+    // checkout or old partial directory. New work preflights before listening.
     let upload = capture_source(request, mode, source_root).map_err(&failure)?;
+    let reuse = prepare_resume_source(mode, resume_from, directory).map_err(&failure)?;
     let setup = (|| -> io::Result<_> {
         let parent = directory
             .parent()
@@ -442,6 +466,9 @@ fn run_loopback_operation(operation: WorkerOperation<'_>) -> Result<Delivery, De
         TcpPeer::new(stream, HANDSHAKE_BUDGET, budget, mode)
     })();
     let mut peer = setup.map_err(&failure)?;
+    if let Some(reuse) = &reuse {
+        return receive_operation(&mut ResumePeer::new(&mut peer, reuse), request, worker, directory, mode);
+    }
     match upload.as_ref() {
         Some(upload) => {
             let mut peer = SourcePeer::new(&mut peer, upload, request).map_err(failure)?;
@@ -487,12 +514,12 @@ pub fn run(args: &[String]) -> i32 {
     if let Some(args) = acknowledgment_arguments(args, 4) {
         return report_acknowledgment(run_acknowledgment_once(args));
     }
-    let Some((args, mode, source_root)) = execution_arguments(args, 4) else {
+    let Some((args, mode, source_root, resume_from)) = execution_arguments(args, 4) else {
         eprintln!(
-            "usage: rabsd --worker-exec-loopback [--resume | --acknowledge | --source-root <absolute-root>] <127.0.0.1:port> <expected-worker> <request.json> <absolute-delivery-directory>"
+            "usage: rabsd --worker-exec-loopback [--resume | --resume-from <absolute-old-delivery> | --acknowledge | --source-root <absolute-root>] <127.0.0.1:port> <expected-worker> <request.json> <absolute-delivery-directory>"
         );
         eprintln!(
-            "--resume retrieves the original request into a new directory; it never executes it"
+            "--resume retrieves the original request into a new directory; --resume-from may reuse local prefixes after complete-file verification"
         );
         eprintln!(
             "--acknowledge requires an existing verified delivery and releases only its matching remote result"
@@ -502,7 +529,7 @@ pub fn run(args: &[String]) -> i32 {
         );
         return 2;
     };
-    report_result(run_once(args, mode, source_root))
+    report_result(run_once(args, mode, source_root, resume_from))
 }
 
 fn report_acknowledgment(result: Result<Delivery, DeliveryFailure>) -> i32 {
@@ -624,6 +651,7 @@ fn run_tls_once(
     args: &[String],
     mode: DeliveryMode,
     source_root: Option<&Path>,
+    resume_from: Option<&Path>,
 ) -> Result<Delivery, DeliveryFailure> {
     let directory = Path::new(&args[4]);
     let request = read_request(Path::new(&args[3]))
@@ -636,6 +664,7 @@ fn run_tls_once(
             directory,
             mode,
             source_root,
+            resume_from,
         },
         &args[2],
     )
@@ -657,6 +686,7 @@ fn run_tls_operation(
         directory,
         mode,
         source_root,
+        resume_from,
     } = operation;
     let failure = |detail: String| operation_failure(directory, mode, detail);
     let (address, pin) = (|| -> Result<_, String> {
@@ -686,6 +716,8 @@ fn run_tls_operation(
     }
     let upload =
         capture_source(request, mode, source_root).map_err(|error| failure(error.to_string()))?;
+    let reuse = prepare_resume_source(mode, resume_from, directory)
+        .map_err(|error| failure(error.to_string()))?;
     if !directory.parent().is_some_and(Path::is_dir) {
         return Err(failure(
             "delivery parent directory does not exist".to_owned(),
@@ -708,7 +740,7 @@ fn run_tls_operation(
             receive_authenticated_source(&runtime, peer, admission, request, directory, upload)
         }
         None => {
-            receive_authenticated_operation(&runtime, peer, admission, request, directory, mode)
+            receive_authenticated_operation(&runtime, peer, admission, request, directory, mode, reuse.as_ref())
         }
     }
 }
@@ -764,13 +796,13 @@ pub fn run_tls(args: &[String]) -> i32 {
     if let Some(args) = acknowledgment_arguments(args, 5) {
         return report_acknowledgment(run_tls_acknowledgment_once(args));
     }
-    let Some((args, mode, source_root)) = execution_arguments(args, 5) else {
+    let Some((args, mode, source_root, resume_from)) = execution_arguments(args, 5) else {
         eprintln!(
-            "usage: rabsd --worker-exec-tls [--resume | --acknowledge | --source-root <absolute-root>] <IP:port> <expected-worker> <worker-spki-sha256> <request.json> <absolute-delivery-directory>"
+            "usage: rabsd --worker-exec-tls [--resume | --resume-from <absolute-old-delivery> | --acknowledge | --source-root <absolute-root>] <IP:port> <expected-worker> <worker-spki-sha256> <request.json> <absolute-delivery-directory>"
         );
         eprintln!("required: RABS_COORD_TLS_CA, RABS_COORD_TLS_CERT, RABS_COORD_TLS_KEY");
         eprintln!(
-            "--resume retrieves the original request into a new directory; it never executes it"
+            "--resume retrieves the original request into a new directory; --resume-from may reuse local prefixes after complete-file verification"
         );
         eprintln!(
             "--acknowledge requires an existing pinned delivery; it never downloads, executes or downgrades transport"
@@ -780,7 +812,7 @@ pub fn run_tls(args: &[String]) -> i32 {
         );
         return 2;
     };
-    report_result(run_tls_once(args, mode, source_root))
+    report_result(run_tls_once(args, mode, source_root, resume_from))
 }
 
 #[cfg(test)]
@@ -877,19 +909,19 @@ mod tests {
             .collect();
         assert_eq!(
             operation_arguments(&plain, 4),
-            Some((plain.as_slice(), DeliveryMode::Execute))
+            Some((plain.as_slice(), DeliveryMode::Execute, None))
         );
         let mut leading = vec!["--resume".to_owned()];
         leading.extend(plain.clone());
         assert_eq!(
             operation_arguments(&leading, 4),
-            Some((&leading[1..], DeliveryMode::Resume))
+            Some((&leading[1..], DeliveryMode::Resume, None))
         );
         let mut trailing = plain.clone();
         trailing.push("--resume".to_owned());
         assert_eq!(
             operation_arguments(&trailing, 4),
-            Some((&trailing[..4], DeliveryMode::Resume))
+            Some((&trailing[..4], DeliveryMode::Resume, None))
         );
         leading.push("--resume".to_owned());
         assert!(operation_arguments(&leading, 4).is_none());
@@ -948,13 +980,13 @@ mod tests {
         ];
         for mode in [DeliveryMode::Execute, DeliveryMode::Resume] {
             assert_eq!(
-                run_once(&plain, mode, None)
+                run_once(&plain, mode, None, None)
                     .unwrap_err()
                     .execution_may_have_run,
                 mode == DeliveryMode::Resume
             );
             assert_eq!(
-                run_tls_once(&tls, mode, None)
+                run_tls_once(&tls, mode, None, None)
                     .unwrap_err()
                     .execution_may_have_run,
                 mode == DeliveryMode::Resume
@@ -962,7 +994,7 @@ mod tests {
             let mut invalid_pin = tls.clone();
             invalid_pin[2] = "invalid".to_owned();
             assert_eq!(
-                run_tls_once(&invalid_pin, mode, None)
+                run_tls_once(&invalid_pin, mode, None, None)
                     .unwrap_err()
                     .execution_may_have_run,
                 mode == DeliveryMode::Resume
@@ -1000,7 +1032,7 @@ mod tests {
             let plain: Vec<_> = (0..count).map(|index| format!("arg-{index}")).collect();
             assert_eq!(
                 execution_arguments(&plain, count),
-                Some((plain.as_slice(), DeliveryMode::Execute, None))
+                Some((plain.as_slice(), DeliveryMode::Execute, None, None))
             );
             let mut leading = vec!["--source-root".to_owned(), "/source".to_owned()];
             leading.extend(plain.clone());
@@ -1009,7 +1041,8 @@ mod tests {
                 Some((
                     &leading[2..],
                     DeliveryMode::Execute,
-                    Some(Path::new("/source"))
+                    Some(Path::new("/source")),
+                    None
                 ))
             );
             let mut trailing = plain.clone();
@@ -1019,14 +1052,15 @@ mod tests {
                 Some((
                     &trailing[..count],
                     DeliveryMode::Execute,
-                    Some(Path::new("/source"))
+                    Some(Path::new("/source")),
+                    None
                 ))
             );
             let mut resume = plain.clone();
             resume.push("--resume".to_owned());
             assert_eq!(
                 execution_arguments(&resume, count),
-                Some((&resume[..count], DeliveryMode::Resume, None))
+                Some((&resume[..count], DeliveryMode::Resume, None, None))
             );
             for invalid in [
                 [leading.clone(), vec!["--resume".to_owned()]].concat(),
@@ -1138,8 +1172,8 @@ mod tests {
             let expected = capture_source(&request, DeliveryMode::Execute, root)
                 .unwrap_err()
                 .to_string();
-            let loopback = run_once(&plain, DeliveryMode::Execute, root).unwrap_err();
-            let secure = run_tls_once(&tls, DeliveryMode::Execute, root).unwrap_err();
+            let loopback = run_once(&plain, DeliveryMode::Execute, root, None).unwrap_err();
+            let secure = run_tls_once(&tls, DeliveryMode::Execute, root, None).unwrap_err();
             assert_eq!(loopback.detail, expected);
             assert_eq!(secure.detail, expected);
             assert!(!loopback.execution_may_have_run);
@@ -1251,20 +1285,22 @@ mod tests {
             destination.to_string_lossy().into_owned(),
         ];
         for mode in [DeliveryMode::Execute, DeliveryMode::Resume] {
-            let delivery = run_once(&args, mode, None).unwrap();
+            let delivery = run_once(&args, mode, None, None).unwrap();
             assert_eq!(delivery.receipt["request_id"], 7);
             assert_eq!(delivery.receipt["publication_authorized"], false);
         }
-        assert!(run_once(&args, DeliveryMode::Execute, Some(&source_path)).is_ok());
+        assert!(run_once(&args, DeliveryMode::Execute, Some(&source_path), None).is_ok());
+        assert!(run_once(&args, DeliveryMode::Resume, None, Some(&source_path)).is_ok(),
+            "a complete local delivery no longer needs the old prefix source");
         let mut tls = args.clone();
         tls.insert(2, "01".repeat(32));
         assert!(
-            run_tls_once(&tls, DeliveryMode::Resume, None).is_err(),
+            run_tls_once(&tls, DeliveryMode::Resume, None, None).is_err(),
             "plaintext receipt cannot upgrade to TLS"
         );
         std::fs::write(destination.join("diagnostics/stdout"), b"corrupted").unwrap();
         assert!(
-            run_once(&args, DeliveryMode::Execute, Some(&source_path))
+            run_once(&args, DeliveryMode::Execute, Some(&source_path), None)
                 .unwrap_err()
                 .execution_may_have_run
         );
@@ -1289,7 +1325,7 @@ mod tests {
             assert!(execution_arguments(&leading, count).is_none());
             assert!(execution_arguments(&trailing, count).is_none());
             assert!(acknowledgment_arguments(&args, count).is_none());
-            for flag in ["--resume", "--source-root", "--acknowledge"] {
+            for flag in ["--resume", "--resume-from", "--source-root", "--acknowledge"] {
                 let mut wrong = leading.clone();
                 wrong[2] = flag.into();
                 assert!(acknowledgment_arguments(&wrong, count).is_none());
@@ -1326,5 +1362,69 @@ mod tests {
         assert!(failure.execution_may_have_run);
         assert!(failure.detail.contains("existing verified delivery"));
         assert!(!destination.exists());
+    }
+
+    #[test]
+    fn resume_from_is_exclusive_absolute_and_always_selects_recovery() {
+        for count in [4, 5, 6] {
+            let plain: Vec<String> = (0..count).map(|index| format!("arg-{index}")).collect();
+            let mut leading = vec!["--resume-from".to_owned(), "/old".to_owned()];
+            leading.extend(plain.clone());
+            assert_eq!(operation_arguments(&leading, count),
+                Some((&leading[2..], DeliveryMode::Resume, Some(Path::new("/old")))));
+            assert_eq!(execution_arguments(&leading, count),
+                Some((&leading[2..], DeliveryMode::Resume, None, Some(Path::new("/old")))));
+            let mut trailing = plain.clone();
+            trailing.extend(["--resume-from".to_owned(), "/old".to_owned()]);
+            assert_eq!(operation_arguments(&trailing, count),
+                Some((&trailing[..count], DeliveryMode::Resume, Some(Path::new("/old")))));
+            for bad in [
+                [leading.clone(), vec!["--resume".into()]].concat(),
+                [leading.clone(), vec!["--acknowledge".into()]].concat(),
+                [leading.clone(), vec!["--source-root".into(), "/source".into()]].concat(),
+                [leading.clone(), vec!["--resume-from".into(), "/other".into()]].concat(),
+                [vec!["--resume-from".into(), "relative".into()], plain.clone()].concat(),
+                [vec!["--resume-from".into()], plain.clone()].concat(),
+            ] {
+                assert!(execution_arguments(&bad, count).is_none(), "{bad:?}");
+                assert!(acknowledgment_arguments(&bad, count).is_none());
+            }
+            let mut middle = plain;
+            middle.splice(1..1, ["--resume-from".into(), "/old".into()]);
+            assert!(operation_arguments(&middle, count).is_none());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_prefix_preflight_precedes_listening_and_tls_credentials() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().canonicalize().unwrap();
+        let old = root.join("old");
+        std::fs::create_dir(&old).unwrap();
+        let alias = root.join("alias");
+        std::os::unix::fs::symlink(&old, &alias).unwrap();
+        let path = root.join("request.json");
+        std::fs::write(&path, json!({"kind":"canonical-exec", "request_id":7,
+            "program":"rustc", "toolchain_backing":"/tc", "workspace_backing":"/ws"}).to_string()).unwrap();
+        let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
+        for source in [root.join("missing"), alias, old.clone()] {
+            let destination = if source == old { old.join("nested") } else { root.join("new") };
+            let expected = prepare_resume_source(DeliveryMode::Resume, Some(&source), &destination)
+                .unwrap_err().to_string();
+            let plain = vec![occupied.local_addr().unwrap().to_string(), "worker".into(),
+                path.to_string_lossy().into_owned(), destination.to_string_lossy().into_owned()];
+            let mut tls = plain.clone();
+            tls.insert(2, "01".repeat(32));
+            for failure in [
+                run_once(&plain, DeliveryMode::Resume, None, Some(&source)).unwrap_err(),
+                run_tls_once(&tls, DeliveryMode::Resume, None, Some(&source)).unwrap_err(),
+            ] {
+                assert_eq!(failure.detail, expected);
+                assert!(failure.execution_may_have_run);
+            }
+            assert!(!destination.exists());
+        }
+        assert!(prepare_resume_source(DeliveryMode::Execute, Some(&old), &root.join("new")).is_err());
     }
 }
