@@ -61,6 +61,37 @@ use tokio::io::BufReader as TokioBufReader;
 use tokio::net::UnixListener;
 use tokio::sync::Mutex;
 
+#[tokio::test]
+async fn queued_cancellation_replaces_hook_command_with_terminal_exit() {
+    let reporter = HookReporter::new(OutputVisibility::None);
+    let response = SelectionResponse {
+        worker: None,
+        reason: SelectionReason::SelectionError("job_cancelled_before_start".into()),
+        build_id: None,
+        diagnostics: None,
+    };
+    assert!(selection_cancelled_before_start(&response));
+    let output = handle_selection_response(
+        response,
+        "cargo build",
+        &rch_common::RchConfig::default(),
+        &reporter,
+        None,
+        Some(CompilationKind::CargoBuild),
+        "queued",
+        2,
+    )
+    .await;
+    assert_eq!(delegated_command(&output), "exit 130");
+    let busy = SelectionResponse {
+        worker: None,
+        reason: SelectionReason::AllWorkersBusy,
+        build_id: None,
+        diagnostics: None,
+    };
+    assert!(!selection_cancelled_before_start(&busy));
+}
+
 fn delegated_command(output: &HookOutput) -> &str {
     if let HookOutput::AllowWithModifiedCommand(modified) = output {
         &modified.hook_specific_output.updated_input.command
@@ -2014,6 +2045,137 @@ async fn test_daemon_query_missing_socket() {
     assert!(result.is_err());
     let err_msg = result.unwrap_err().to_string();
     assert!(err_msg.contains("not found") || err_msg.contains("No such file"));
+}
+
+fn queued_selection_test_lease(path: PathBuf) -> DurableLeaseWriter {
+    let writer = DurableLeaseWriter {
+        path,
+        lease: Arc::new(std::sync::Mutex::new(DurableJobLease::new(
+            JobIdentity::new_local(),
+            std::process::id(),
+            None,
+            None,
+            0,
+            false,
+            true,
+            "test-fingerprint".into(),
+        ))),
+    };
+    writer.persist().unwrap();
+    writer
+}
+
+#[tokio::test]
+async fn queued_selection_lost_or_malformed_response_never_reaches_recovery() {
+    let _guard = test_guard!();
+    for wire_response in [
+        "", // The daemon consumed the request but its result/receipt was lost.
+        "HTTP/1.0 200 OK\r\n\r\nnot-json",
+        "HTTP/1.0 200 OK\r\n\r\n{}",
+        "HTTP/1.0 503 Unavailable\r\n\r\n{}",
+        "HTTP/1.0 200 OK\r\n", // Truncated HTTP headers.
+    ] {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let socket = tmp.path().join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = stream.into_split();
+            let mut reader = TokioBufReader::new(reader);
+            let mut request = String::new();
+            reader.read_line(&mut request).await.unwrap();
+            writer.write_all(wire_response.as_bytes()).await.unwrap();
+            writer.shutdown().await.unwrap();
+            request
+        });
+        let lease = queued_selection_test_lease(tmp.path().join("lease.json"));
+        let wrapper = lease.wrapper_id();
+        let error = timeout(
+            Duration::from_secs(2),
+            query_daemon(
+                socket.to_str().unwrap(),
+                "queued",
+                2,
+                "cargo build",
+                None,
+                RequiredRuntime::None,
+                CommandPriority::Normal,
+                0,
+                Some(std::process::id()),
+                Some(&wrapper),
+                true,
+                &[],
+                false,
+                &[],
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        let request = server.await.unwrap();
+        assert!(request.contains("&wait=1"));
+        assert!(request.contains(&format!("local_wrapper_id={wrapper}")));
+        assert!(
+            error
+                .downcast_ref::<daemon_ipc::SelectionOutcomeUnconfirmed>()
+                .is_some()
+        );
+
+        // This is the gate used by both initial selection and the sole recovery
+        // query. Neither a transport error nor an outer context may bypass it.
+        let error = selection_error_for_recovery(error.context("outer caller context"), &lease)
+            .unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<daemon_ipc::SelectionOutcomeUnconfirmed>()
+                .is_some()
+        );
+        let persisted: DurableJobLease =
+            serde_json::from_slice(&std::fs::read(&lease.path).unwrap()).unwrap();
+        assert_eq!(persisted.phase, "selection_unconfirmed");
+        assert_eq!(persisted.identity.local_wrapper_id, wrapper);
+        assert!(!persisted.terminal_acknowledged);
+        assert!(persisted.exit_code.is_none());
+        assert!(persisted.identity.remote_build_id.is_none());
+    }
+}
+
+#[tokio::test]
+async fn queued_selection_preconnect_failure_preserves_recovery() {
+    let _guard = test_guard!();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let absent = tmp.path().join("missing.sock");
+    let refused = tmp.path().join("refused.sock");
+    drop(UnixListener::bind(&refused).unwrap());
+    for socket in [absent, refused] {
+        let lease = queued_selection_test_lease(tmp.path().join("lease.json"));
+        let wrapper = lease.wrapper_id();
+        let error = query_daemon(
+            socket.to_str().unwrap(),
+            "queued",
+            2,
+            "cargo build",
+            None,
+            RequiredRuntime::None,
+            CommandPriority::Normal,
+            0,
+            Some(std::process::id()),
+            Some(&wrapper),
+            true,
+            &[],
+            false,
+            &[],
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<daemon_ipc::SelectionOutcomeUnconfirmed>()
+                .is_none()
+        );
+        let _ = selection_error_for_recovery(error, &lease).unwrap();
+        assert_eq!(lease.snapshot().phase, "admission");
+    }
 }
 
 #[tokio::test]

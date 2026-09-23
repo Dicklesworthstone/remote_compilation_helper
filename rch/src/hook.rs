@@ -1437,6 +1437,29 @@ impl DurableLeaseWriter {
     }
 }
 
+/// Only failures known to precede queued ownership may reach autorecovery or
+/// local fallback. The typed marker survives anyhow context layers.
+fn selection_error_for_recovery(
+    error: anyhow::Error,
+    lease: &DurableLeaseWriter,
+) -> anyhow::Result<anyhow::Error> {
+    if error
+        .downcast_ref::<daemon_ipc::SelectionOutcomeUnconfirmed>()
+        .is_none()
+    {
+        return Ok(error);
+    }
+    if let Err(persist_error) = lease.heartbeat("selection_unconfirmed") {
+        return Err(error.context(format!(
+            "selection remains unconfirmed; could not persist lease phase: {persist_error}"
+        )));
+    }
+    Err(error.context(format!(
+        "selection remains unconfirmed for {}; lease retained for inspection or same-identity cancellation; command will not be replayed",
+        lease.wrapper_id()
+    )))
+}
+
 fn durable_lease_path(local_wrapper_id: &str) -> PathBuf {
     default_job_lease_directory().join(format!("{local_wrapper_id}.json"))
 }
@@ -2814,6 +2837,7 @@ pub async fn run_exec(
     {
         Ok(resp) => resp,
         Err(e) => {
+            let e = selection_error_for_recovery(e, &durable_lease)?;
             warn!("Failed to query daemon: {}, attempting recovery", e);
 
             // Classify the failure and detect a configured-vs-canonical socket
@@ -2845,7 +2869,7 @@ pub async fn run_exec(
                     .await
                     .is_ok()
                 {
-                    query_daemon(
+                    match query_daemon(
                         &socket_path,
                         &selection_project,
                         estimated_cores,
@@ -2862,7 +2886,13 @@ pub async fn run_exec(
                         &required_tools,
                     )
                     .await
-                    .ok()
+                    {
+                        Ok(response) => Some(response),
+                        Err(error) => {
+                            let _ = selection_error_for_recovery(error, &durable_lease)?;
+                            None
+                        }
+                    }
                 } else {
                     None
                 };
@@ -2948,6 +2978,12 @@ pub async fn run_exec(
     loop {
         // Only the first iteration can observe an unassigned worker: a retry
         // re-query replaces `response` solely when it carries a worker.
+        if selection_cancelled_before_start(&response) {
+            durable_lease.record_exit(130)?;
+            durable_lease.acknowledge_terminal()?;
+            reporter.summary("[RCH] cancelled before remote admission");
+            std::process::exit(130);
+        }
         let Some(worker) = response.worker.clone() else {
             let requested_refusal = requested_worker_refusal(&preferred_workers, &response);
             // A pin that could not be honored is the exact failure the allow-set fix
@@ -4163,6 +4199,12 @@ async fn process_hook(input: HookInput) -> HookOutput {
     HookOutput::allow_with_modified_command(modified_command)
 }
 
+fn selection_cancelled_before_start(response: &SelectionResponse) -> bool {
+    response.worker.is_none()
+        && response.build_id.is_none()
+        && matches!(&response.reason, SelectionReason::SelectionError(reason) if reason == "job_cancelled_before_start")
+}
+
 #[allow(dead_code)]
 #[allow(clippy::too_many_arguments)] // Pipeline wiring favors explicit params.
 async fn handle_selection_response(
@@ -4175,6 +4217,10 @@ async fn handle_selection_response(
     project: &str,
     estimated_cores: u32,
 ) -> HookOutput {
+    if selection_cancelled_before_start(&response) {
+        reporter.summary("[RCH] cancelled before remote admission");
+        return HookOutput::allow_with_modified_command("exit 130".to_owned());
+    }
     // Check if a worker was assigned
     let Some(worker) = response.worker else {
         // No worker available - graceful fallback to local execution

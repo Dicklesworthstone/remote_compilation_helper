@@ -116,6 +116,29 @@ fn validate_identity(lease: &DurableJobLease, record: &Value) -> Result<()> {
     Ok(())
 }
 
+fn validate_queued_cancellation(wrapper: &str, reply: &Value) -> Result<()> {
+    anyhow::ensure!(
+        reply["local_wrapper_id"].as_str() == Some(wrapper),
+        "daemon cancellation wrapper identity mismatch"
+    );
+    match reply["status"].as_str() {
+        Some("cancelled_before_start") => anyhow::ensure!(
+            reply["exit_code"].as_i64() == Some(130) && reply["build_id"].is_null(),
+            "invalid cancellation-before-start receipt"
+        ),
+        Some("cancelled") => anyhow::ensure!(
+            reply["build_id"].as_u64().is_some_and(|id| id > 0),
+            "admitted cancellation has no build identity"
+        ),
+        Some("completed") => anyhow::ensure!(
+            reply["record"]["id"].as_u64().is_some_and(|id| id > 0),
+            "completion has no build identity"
+        ),
+        _ => anyhow::bail!("cancellation was not acknowledged: {reply}"),
+    }
+    Ok(())
+}
+
 fn emit(ctx: &OutputContext, payload: &Value) {
     if ctx.is_json() {
         let _ = ctx.json(payload);
@@ -170,6 +193,34 @@ async fn run_unix(action: Option<JobsAction>, ctx: &OutputContext) -> Result<()>
                 ctx,
                 &json!({"status":"completed", "identity":lease.identity, "exit_code":lease.exit_code, "terminal_acknowledged":true}),
             );
+            return Ok(());
+        }
+        if cancel && lease.identity.remote_build_id.is_none() {
+            // Admission may win after this snapshot. The daemon serializes the
+            // decision with registration and cancels that exact active build.
+            let response =
+                super::send_daemon_command(&format!("POST /jobs/{wrapper_id}/cancel\n")).await?;
+            let body = response
+                .split_once("\r\n\r\n")
+                .or_else(|| response.split_once("\n\n"))
+                .map(|(_, body)| body)
+                .context("missing queued cancellation response")?;
+            let reply: Value = serde_json::from_str(body)?;
+            validate_queued_cancellation(&wrapper_id, &reply)?;
+            if reply["status"] == "cancelled_before_start" {
+                writer.record_exit(130)?;
+                writer.acknowledge_terminal()?;
+            } else if reply["status"] == "cancelled" {
+                let mut identity = lease.identity.clone();
+                identity.admit(
+                    reply["build_id"]
+                        .as_u64()
+                        .context("missing cancelled build id")?,
+                );
+                let path = default_job_lease_directory().join(format!("{wrapper_id}.cancel"));
+                crate::state::primitives::atomic_write(&path, &serde_json::to_vec(&identity)?)?;
+            }
+            emit(ctx, &reply);
             return Ok(());
         }
         let status = query(&lease).await?;
@@ -268,6 +319,26 @@ async fn run_unix(action: Option<JobsAction>, ctx: &OutputContext) -> Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn queued_cancellation_receipt_requires_exact_identity_and_terminal_evidence() {
+        let valid = json!({"status":"cancelled_before_start", "local_wrapper_id":"wrapper", "exit_code":130});
+        validate_queued_cancellation("wrapper", &valid).unwrap();
+        assert!(validate_queued_cancellation("other", &valid).is_err());
+        for reply in [
+            json!({"status":"not_queued", "local_wrapper_id":"wrapper"}),
+            json!({"status":"cancelled_before_start", "local_wrapper_id":"wrapper", "exit_code":0}),
+            json!({"status":"cancelled_before_start", "local_wrapper_id":"wrapper", "exit_code":130, "build_id":42}),
+            json!({"status":"cancelled", "local_wrapper_id":"wrapper"}),
+        ] {
+            assert!(validate_queued_cancellation("wrapper", &reply).is_err());
+        }
+        validate_queued_cancellation(
+            "wrapper",
+            &json!({"status":"cancelled", "local_wrapper_id":"wrapper", "build_id":42}),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn mismatched_identity_cannot_authorize_action() {
         let mut lease = DurableJobLease::new(

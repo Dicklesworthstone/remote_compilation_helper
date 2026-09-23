@@ -186,6 +186,9 @@ pub struct ActiveBuildFromApi {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueuedBuildFromApi {
     pub id: u64,
+    /// Preserve the daemon's exact identifier through `rch status --json`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id_text: Option<String>,
     pub project_id: String,
     pub command: String,
     pub queued_at: String,
@@ -1324,10 +1327,18 @@ mod tests {
         let build: QueuedBuildFromApi = serde_json::from_value(json).unwrap();
         assert_eq!(build.position, 3);
         assert_eq!(build.slots_needed, 4);
+        assert!(build.id_text.is_none());
         assert_eq!(
             build.estimated_start,
             Some("2026-01-16T12:05:00Z".to_string())
         );
+        let mut json = serde_json::to_value(build).unwrap();
+        json["id"] = serde_json::json!((1_u64 << 63) + 1);
+        json["id_text"] = serde_json::json!("9223372036854775809");
+        let build: QueuedBuildFromApi = serde_json::from_value(json).unwrap();
+        let projected = serde_json::to_value(build).unwrap();
+        assert_eq!(projected["id"].as_u64(), Some((1_u64 << 63) + 1));
+        assert_eq!(projected["id_text"], "9223372036854775809");
     }
 
     #[test]

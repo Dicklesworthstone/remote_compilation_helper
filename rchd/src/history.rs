@@ -25,7 +25,23 @@ struct DurableOwnership {
     version: u32,
     active: Vec<ActiveBuildState>,
     completed: Vec<TerminalOwnership>,
+    #[serde(default)]
+    cancelled_wrappers: HashSet<String>,
+    #[serde(default)]
+    next_queue_id: Option<u64>,
 }
+
+/// Cancellation and admission compete under the same ownership lock.
+pub enum WrapperCancellation {
+    BeforeStart,
+    Active(u64),
+    Completed(Box<BuildRecord>),
+    NotQueued,
+}
+
+const MAX_CANCELLED_WRAPPERS: usize = 100_000;
+/// Queue IDs occupy a separate numeric namespace from daemon build IDs.
+const QUEUE_ID_NAMESPACE: u64 = 1 << 63;
 
 #[derive(Clone, Serialize, Deserialize)]
 struct TerminalOwnership {
@@ -138,6 +154,7 @@ pub struct QueuedBuildState {
     pub queued_at_mono: Instant,
     /// Hook process ID (for cancellation).
     pub hook_pid: u32,
+    pub local_wrapper_id: Option<String>,
     /// Number of slots needed.
     pub slots_needed: u32,
     /// Estimated start time (ISO 8601), updated as queue advances.
@@ -166,6 +183,8 @@ pub struct BuildHistory {
     persistence_path: Option<PathBuf>,
     /// Terminal receipts share the atomic ownership commit, not the JSONL log.
     terminal: RwLock<HashMap<u64, TerminalOwnership>>,
+    /// Never evict an intent while a delayed same-identity admission can arrive.
+    cancelled_wrappers: RwLock<HashSet<String>>,
     ownership_failed: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     fail_after_ownership_rename: std::sync::atomic::AtomicBool,
@@ -192,9 +211,10 @@ impl BuildHistory {
             capacity,
             max_queue_depth: DEFAULT_MAX_QUEUE_DEPTH,
             next_id: AtomicU64::new(initial_id),
-            next_queue_id: AtomicU64::new(1),
+            next_queue_id: AtomicU64::new(QUEUE_ID_NAMESPACE | initial_id),
             persistence_path: None,
             terminal: RwLock::new(HashMap::new()),
+            cancelled_wrappers: RwLock::new(HashSet::new()),
             ownership_failed: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             fail_after_ownership_rename: std::sync::atomic::AtomicBool::new(false),
@@ -364,6 +384,11 @@ impl BuildHistory {
         location: BuildLocation,
     ) -> std::io::Result<Option<ActiveBuildState>> {
         let id = self.next_id();
+        if id >= QUEUE_ID_NAMESPACE {
+            return Err(std::io::Error::other(
+                "active build identifier namespace exhausted",
+            ));
+        }
         let started_at = Utc::now().to_rfc3339();
         let started_at_mono = Instant::now();
         let state = ActiveBuildState {
@@ -400,6 +425,13 @@ impl BuildHistory {
 
         let mut active = self.active.write().unwrap_or_else(|e| e.into_inner());
         if self.ownership_failed() {
+            return Ok(None);
+        }
+        if state
+            .local_wrapper_id
+            .as_deref()
+            .is_some_and(|id| self.wrapper_cancelled(id))
+        {
             return Ok(None);
         }
         if active.values().any(|existing| {
@@ -642,9 +674,102 @@ impl BuildHistory {
     // Queue Management
     // =========================================================================
 
-    /// Get the next queue ID.
-    pub fn next_queue_id(&self) -> u64 {
-        self.next_queue_id.fetch_add(1, Ordering::SeqCst)
+    pub fn wrapper_cancelled(&self, wrapper: &str) -> bool {
+        !self.ownership_failed()
+            && self
+                .cancelled_wrappers
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains(wrapper)
+    }
+
+    /// Persist cancellation before removing queue visibility or acknowledging it.
+    /// A bounded full journal refuses new cancellation rather than forgetting an
+    /// identity that might still be delivered by a disconnected wrapper.
+    pub fn cancel_wrapper(&self, wrapper: &str) -> std::io::Result<WrapperCancellation> {
+        let active = self.active.write().unwrap_or_else(|e| e.into_inner());
+        if self.ownership_failed() {
+            return Err(std::io::Error::other(
+                "durable ownership uncertain; restart required",
+            ));
+        }
+        if let Some(state) = active
+            .values()
+            .find(|state| state.local_wrapper_id.as_deref() == Some(wrapper))
+        {
+            return Ok(WrapperCancellation::Active(state.id));
+        }
+        if let Some(receipt) = self
+            .terminal
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .find(|receipt| receipt.local_wrapper_id.as_deref() == Some(wrapper))
+        {
+            return Ok(WrapperCancellation::Completed(Box::new(
+                receipt.record.clone(),
+            )));
+        }
+        if !self.wrapper_cancelled(wrapper)
+            && !self
+                .queued
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .any(|state| state.local_wrapper_id.as_deref() == Some(wrapper))
+        {
+            return Ok(WrapperCancellation::NotQueued);
+        }
+        {
+            let mut cancelled = self
+                .cancelled_wrappers
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            if !cancelled.contains(wrapper) && cancelled.len() >= MAX_CANCELLED_WRAPPERS {
+                return Err(std::io::Error::other(
+                    "queued cancellation journal is full; intent not accepted",
+                ));
+            }
+            cancelled.insert(wrapper.to_owned());
+        }
+        self.persist_ownership(&active, None)?;
+        self.queued
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|state| state.local_wrapper_id.as_deref() != Some(wrapper));
+        Ok(WrapperCancellation::BeforeStart)
+    }
+
+    /// Decide queue departure against cancellation while admission is locked.
+    /// Once departure wins, cancellation cannot claim a no-start receipt for a
+    /// wrapper that may already be handling timeout or local fallback.
+    pub fn finish_queued_build(
+        &self,
+        queue_id: u64,
+        wrapper: Option<&str>,
+    ) -> std::io::Result<bool> {
+        let _active = self.active.write().unwrap_or_else(|e| e.into_inner());
+        if self.ownership_failed() {
+            return Err(std::io::Error::other(
+                "durable ownership uncertain; restart required",
+            ));
+        }
+        let cancelled = wrapper.is_some_and(|id| self.wrapper_cancelled(id));
+        self.remove_queued_build(queue_id);
+        Ok(cancelled)
+    }
+
+    /// Allocate without wrapping into a previously used identity.
+    fn next_queue_id(&self) -> Option<u64> {
+        self.next_queue_id
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |id| {
+                if id < QUEUE_ID_NAMESPACE {
+                    None
+                } else {
+                    id.checked_add(1)
+                }
+            })
+            .ok()
     }
 
     /// Enqueue a build waiting for an available worker.
@@ -656,7 +781,16 @@ impl BuildHistory {
         command: String,
         hook_pid: u32,
         slots_needed: u32,
+        local_wrapper_id: Option<String>,
     ) -> Option<QueuedBuildState> {
+        let active = self.active.write().unwrap_or_else(|e| e.into_inner());
+        if self.ownership_failed()
+            || local_wrapper_id
+                .as_deref()
+                .is_some_and(|id| self.wrapper_cancelled(id))
+        {
+            return None;
+        }
         let mut queue = self.queued.write().unwrap_or_else(|e| e.into_inner());
 
         // Check queue depth limit
@@ -670,7 +804,10 @@ impl BuildHistory {
             return None;
         }
 
-        let id = self.next_queue_id();
+        let id = self.next_queue_id()?;
+        // A crash may waste an ID, but cannot expose an ID before its high-water
+        // mark is durable and later cancel a different wrapper after restart.
+        self.persist_ownership(&active, None).ok()?;
         let queued_at = Utc::now().to_rfc3339();
         let state = QueuedBuildState {
             id,
@@ -679,6 +816,7 @@ impl BuildHistory {
             queued_at,
             queued_at_mono: Instant::now(),
             hook_pid,
+            local_wrapper_id,
             slots_needed,
             estimated_start: None,
         };
@@ -1017,6 +1155,8 @@ impl BuildHistory {
         let ownership_path = path.with_extension("ownership.json");
         let mut active = HashMap::new();
         let mut terminal = HashMap::new();
+        let mut cancelled_wrappers = HashSet::new();
+        let mut next_queue_id = None;
         match File::open(&ownership_path) {
             Ok(file) => {
                 let snapshot: DurableOwnership = serde_json::from_reader(file)?;
@@ -1026,8 +1166,25 @@ impl BuildHistory {
                         "unsupported ownership version",
                     ));
                 }
+                cancelled_wrappers = snapshot.cancelled_wrappers;
+                next_queue_id = snapshot.next_queue_id;
+                if next_queue_id.is_some_and(|id| id < QUEUE_ID_NAMESPACE) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "invalid queued identifier high-water mark",
+                    ));
+                }
+                if cancelled_wrappers.len() > MAX_CANCELLED_WRAPPERS {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "queued cancellation journal exceeds limit",
+                    ));
+                }
                 for mut state in snapshot.active {
-                    if state.id == 0 || state.worker_id.is_empty() || active.contains_key(&state.id)
+                    if state.id == 0
+                        || state.id >= QUEUE_ID_NAMESPACE
+                        || state.worker_id.is_empty()
+                        || active.contains_key(&state.id)
                     {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
@@ -1080,7 +1237,9 @@ impl BuildHistory {
             .unwrap_or_default()
             .as_secs();
         let epoch_id = (epoch_secs << 24) | 1;
-        let initial_id = std::cmp::max(max_id + 1, epoch_id);
+        let initial_id = std::cmp::max(max_id.saturating_add(1), epoch_id);
+        let queue_epoch = QUEUE_ID_NAMESPACE | epoch_id;
+        let next_queue_id = next_queue_id.map_or(queue_epoch, |id| id.max(queue_epoch));
 
         let history = Self {
             records: RwLock::new(records),
@@ -1089,9 +1248,10 @@ impl BuildHistory {
             capacity,
             max_queue_depth: DEFAULT_MAX_QUEUE_DEPTH,
             next_id: AtomicU64::new(initial_id),
-            next_queue_id: AtomicU64::new(1),
+            next_queue_id: AtomicU64::new(next_queue_id),
             persistence_path: Some(path.to_path_buf()),
             terminal: RwLock::new(terminal),
+            cancelled_wrappers: RwLock::new(cancelled_wrappers),
             ownership_failed: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             fail_after_ownership_rename: std::sync::atomic::AtomicBool::new(false),
@@ -1268,6 +1428,12 @@ impl BuildHistory {
                 .cloned()
                 .collect(),
             completed: terminal.values().chain(completed).cloned().collect(),
+            cancelled_wrappers: self
+                .cancelled_wrappers
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
+            next_queue_id: Some(self.next_queue_id.load(Ordering::SeqCst)),
         };
         let parent = path
             .parent()
@@ -2216,19 +2382,349 @@ mod tests {
     // =========================================================================
 
     #[test]
+    fn queued_cancellation_survives_restart_and_blocks_only_same_wrapper() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("history.jsonl");
+        let history = BuildHistory::new(10).with_persistence(path.clone());
+        history
+            .enqueue_build(
+                "project".into(),
+                "cargo build".into(),
+                0,
+                2,
+                Some("cancelled".into()),
+            )
+            .unwrap();
+        history
+            .enqueue_build(
+                "other".into(),
+                "cargo build".into(),
+                0,
+                2,
+                Some("other".into()),
+            )
+            .unwrap();
+        assert!(matches!(
+            history.cancel_wrapper("cancelled").unwrap(),
+            WrapperCancellation::BeforeStart
+        ));
+        assert_eq!(history.queue_depth(), 1);
+        assert!(matches!(
+            history.cancel_wrapper("cancelled").unwrap(),
+            WrapperCancellation::BeforeStart
+        ));
+        let recovered = BuildHistory::load_from_file(&path, 10).unwrap();
+        assert!(recovered.wrapper_cancelled("cancelled"));
+        assert!(
+            recovered
+                .try_start_active_build_with_wrapper(
+                    "project".into(),
+                    "worker".into(),
+                    "cargo build".into(),
+                    0,
+                    Some("cancelled".into()),
+                    2,
+                    BuildLocation::Remote
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            recovered
+                .try_start_active_build_with_wrapper(
+                    "project".into(),
+                    "worker".into(),
+                    "cargo build".into(),
+                    0,
+                    Some("other".into()),
+                    2,
+                    BuildLocation::Remote
+                )
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn queued_cancellation_and_admission_have_exactly_one_winner() {
+        use std::sync::{Arc, Barrier};
+        for _ in 0..32 {
+            let history = Arc::new(BuildHistory::new(10));
+            history
+                .enqueue_build(
+                    "project".into(),
+                    "cargo build".into(),
+                    0,
+                    2,
+                    Some("racing".into()),
+                )
+                .unwrap();
+            let barrier = Arc::new(Barrier::new(2));
+            let admission_history = history.clone();
+            let admission_barrier = barrier.clone();
+            let admission = std::thread::spawn(move || {
+                admission_barrier.wait();
+                admission_history
+                    .try_start_active_build_with_wrapper(
+                        "project".into(),
+                        "worker".into(),
+                        "cargo build".into(),
+                        0,
+                        Some("racing".into()),
+                        2,
+                        BuildLocation::Remote,
+                    )
+                    .unwrap()
+            });
+            barrier.wait();
+            let cancellation = history.cancel_wrapper("racing").unwrap();
+            let admitted = admission.join().unwrap();
+            match cancellation {
+                WrapperCancellation::BeforeStart => {
+                    assert!(admitted.is_none());
+                    assert!(history.active_builds().is_empty());
+                    assert!(history.wrapper_cancelled("racing"));
+                }
+                WrapperCancellation::Active(build_id) => {
+                    assert_eq!(admitted.unwrap().id, build_id);
+                    assert!(!history.wrapper_cancelled("racing"));
+                    assert_eq!(history.active_builds().len(), 1);
+                }
+                WrapperCancellation::Completed(_) => panic!("no command completed in this race"),
+                WrapperCancellation::NotQueued => panic!("the queue entry was not removed"),
+            }
+        }
+    }
+
+    #[test]
+    fn queued_departure_and_cancellation_cannot_both_authorize_their_outcome() {
+        use std::sync::{Arc, Barrier};
+        for _ in 0..32 {
+            let history = Arc::new(BuildHistory::new(10));
+            let queued = history
+                .enqueue_build(
+                    "project".into(),
+                    "cargo build".into(),
+                    0,
+                    2,
+                    Some("racing".into()),
+                )
+                .unwrap();
+            let barrier = Arc::new(Barrier::new(2));
+            let leaving_history = history.clone();
+            let leaving_barrier = barrier.clone();
+            let departure = std::thread::spawn(move || {
+                leaving_barrier.wait();
+                leaving_history
+                    .finish_queued_build(queued.id, Some("racing"))
+                    .unwrap()
+            });
+            barrier.wait();
+            let cancelled = history.cancel_wrapper("racing").unwrap();
+            let must_stop = departure.join().unwrap();
+            match cancelled {
+                WrapperCancellation::BeforeStart => assert!(must_stop),
+                WrapperCancellation::NotQueued => assert!(!must_stop),
+                _ => panic!("no active or completed build in departure race"),
+            }
+            assert_eq!(history.queue_depth(), 0);
+        }
+    }
+
+    #[test]
+    fn queued_cancellation_persistence_failure_never_acknowledges_or_drops_queue() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("history.jsonl");
+        let history = BuildHistory::new(10).with_persistence(path.clone());
+        history
+            .enqueue_build(
+                "project".into(),
+                "cargo build".into(),
+                0,
+                2,
+                Some("cancelled".into()),
+            )
+            .unwrap();
+        history
+            .fail_after_ownership_rename
+            .store(true, Ordering::SeqCst);
+        assert!(history.cancel_wrapper("cancelled").is_err());
+        assert!(history.ownership_failed());
+        assert_eq!(history.queue_depth(), 1);
+        assert!(
+            history
+                .try_start_active_build_with_wrapper(
+                    "project".into(),
+                    "worker".into(),
+                    "cargo build".into(),
+                    0,
+                    Some("different".into()),
+                    2,
+                    BuildLocation::Remote
+                )
+                .unwrap()
+                .is_none()
+        );
+        let recovered = BuildHistory::load_from_file(&path, 10).unwrap();
+        assert!(recovered.wrapper_cancelled("cancelled"));
+    }
+
+    #[test]
+    fn queued_cancellation_full_journal_retains_old_intents() {
+        let history = BuildHistory::new(10);
+        *history.cancelled_wrappers.write().unwrap() = (0..MAX_CANCELLED_WRAPPERS)
+            .map(|i| format!("wrapper-{i}"))
+            .collect();
+        history
+            .enqueue_build(
+                "project".into(),
+                "cargo build".into(),
+                0,
+                2,
+                Some("new-wrapper".into()),
+            )
+            .unwrap();
+        assert!(history.cancel_wrapper("new-wrapper").is_err());
+        assert!(!history.wrapper_cancelled("new-wrapper"));
+        assert!(matches!(
+            history.cancel_wrapper("wrapper-0").unwrap(),
+            WrapperCancellation::BeforeStart
+        ));
+        assert_eq!(
+            history.cancelled_wrappers.read().unwrap().len(),
+            MAX_CANCELLED_WRAPPERS
+        );
+    }
+
+    #[test]
+    fn queued_ids_survive_restart_and_clock_rollback_without_reuse() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("history.jsonl");
+        let history = BuildHistory::new(10).with_persistence(path.clone());
+        // Model a previous daemon that allocated beyond the current wall-clock
+        // seed. Restart must honor the durable high-water, even after rollback.
+        let future = history.next_queue_id.load(Ordering::SeqCst) + (7200 << 24);
+        history.next_queue_id.store(future, Ordering::SeqCst);
+        let old = history
+            .enqueue_build(
+                "old".into(),
+                "cargo build".into(),
+                0,
+                2,
+                Some("old-wrapper".into()),
+            )
+            .unwrap();
+        assert_eq!(old.id, future);
+        let recovered = BuildHistory::load_from_file(&path, 10).unwrap();
+        let new = recovered
+            .enqueue_build(
+                "new".into(),
+                "cargo build".into(),
+                0,
+                2,
+                Some("new-wrapper".into()),
+            )
+            .unwrap();
+        assert_eq!(new.id, old.id + 1);
+        assert!(new.id >= QUEUE_ID_NAMESPACE);
+        assert!(recovered.queued_build(old.id).is_none());
+        assert_eq!(
+            recovered
+                .queued_build(new.id)
+                .unwrap()
+                .local_wrapper_id
+                .as_deref(),
+            Some("new-wrapper")
+        );
+        assert!(matches!(
+            recovered.cancel_wrapper("old-wrapper").unwrap(),
+            WrapperCancellation::NotQueued
+        ));
+        assert_eq!(recovered.queue_depth(), 1);
+    }
+
+    #[test]
+    fn queued_ids_migrate_legacy_snapshot_into_separate_namespace() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("history.jsonl");
+        std::fs::write(
+            path.with_extension("ownership.json"),
+            br#"{"version":1,"active":[],"completed":[]}"#,
+        )
+        .unwrap();
+        let history = BuildHistory::load_from_file(&path, 10).unwrap();
+        let queued = history
+            .enqueue_build("queued".into(), "cargo build".into(), 0, 2, None)
+            .unwrap();
+        let active = history
+            .try_start_active_build_with_wrapper(
+                "active".into(),
+                "worker".into(),
+                "cargo build".into(),
+                0,
+                None,
+                2,
+                BuildLocation::Remote,
+            )
+            .unwrap()
+            .unwrap();
+        assert!(queued.id >= QUEUE_ID_NAMESPACE);
+        assert!(active.id < QUEUE_ID_NAMESPACE);
+        let recovered = BuildHistory::load_from_file(&path, 10).unwrap();
+        assert!(
+            recovered
+                .enqueue_build("next".into(), "cargo build".into(), 0, 2, None)
+                .unwrap()
+                .id
+                > queued.id
+        );
+    }
+
+    #[test]
+    fn queued_id_allocation_failure_stays_invisible_and_exhaustion_never_wraps() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("history.jsonl");
+        let history = BuildHistory::new(10).with_persistence(path.clone());
+        let skipped = history.next_queue_id.load(Ordering::SeqCst);
+        history
+            .fail_after_ownership_rename
+            .store(true, Ordering::SeqCst);
+        assert!(
+            history
+                .enqueue_build("failed".into(), "cargo build".into(), 0, 2, None)
+                .is_none()
+        );
+        assert!(history.ownership_failed());
+        assert_eq!(history.queue_depth(), 0);
+        let recovered = BuildHistory::load_from_file(&path, 10).unwrap();
+        let queued = recovered
+            .enqueue_build("next".into(), "cargo build".into(), 0, 2, None)
+            .unwrap();
+        assert!(queued.id > skipped);
+        recovered.next_queue_id.store(u64::MAX, Ordering::SeqCst);
+        assert!(
+            recovered
+                .enqueue_build("overflow".into(), "cargo build".into(), 0, 2, None)
+                .is_none()
+        );
+        assert_eq!(recovered.next_queue_id.load(Ordering::SeqCst), u64::MAX);
+        assert_eq!(recovered.queue_depth(), 1);
+    }
+
+    #[test]
     fn test_enqueue_dequeue_fifo() {
         let _guard = test_guard!();
         let history = BuildHistory::new(10);
 
         // Enqueue three builds
         let b1 = history
-            .enqueue_build("proj-a".into(), "cargo build".into(), 1001, 4)
+            .enqueue_build("proj-a".into(), "cargo build".into(), 1001, 4, None)
             .unwrap();
         let b2 = history
-            .enqueue_build("proj-b".into(), "cargo test".into(), 1002, 8)
+            .enqueue_build("proj-b".into(), "cargo test".into(), 1002, 8, None)
             .unwrap();
         let b3 = history
-            .enqueue_build("proj-c".into(), "cargo check".into(), 1003, 2)
+            .enqueue_build("proj-c".into(), "cargo check".into(), 1003, 2, None)
             .unwrap();
 
         assert_eq!(history.queue_depth(), 3);
@@ -2256,19 +2752,19 @@ mod tests {
         // First two should succeed
         assert!(
             history
-                .enqueue_build("proj-a".into(), "build".into(), 1, 4)
+                .enqueue_build("proj-a".into(), "build".into(), 1, 4, None)
                 .is_some()
         );
         assert!(
             history
-                .enqueue_build("proj-b".into(), "build".into(), 2, 4)
+                .enqueue_build("proj-b".into(), "build".into(), 2, 4, None)
                 .is_some()
         );
 
         // Third should fail
         assert!(
             history
-                .enqueue_build("proj-c".into(), "build".into(), 3, 4)
+                .enqueue_build("proj-c".into(), "build".into(), 3, 4, None)
                 .is_none()
         );
 
@@ -2276,7 +2772,7 @@ mod tests {
         history.dequeue_build();
         assert!(
             history
-                .enqueue_build("proj-c".into(), "build".into(), 3, 4)
+                .enqueue_build("proj-c".into(), "build".into(), 3, 4, None)
                 .is_some()
         );
     }
@@ -2287,13 +2783,13 @@ mod tests {
         let history = BuildHistory::new(10);
 
         let b1 = history
-            .enqueue_build("proj-a".into(), "build".into(), 1, 4)
+            .enqueue_build("proj-a".into(), "build".into(), 1, 4, None)
             .unwrap();
         let b2 = history
-            .enqueue_build("proj-b".into(), "build".into(), 2, 4)
+            .enqueue_build("proj-b".into(), "build".into(), 2, 4, None)
             .unwrap();
         let b3 = history
-            .enqueue_build("proj-c".into(), "build".into(), 3, 4)
+            .enqueue_build("proj-c".into(), "build".into(), 3, 4, None)
             .unwrap();
 
         // Positions are 1-indexed
@@ -2309,13 +2805,13 @@ mod tests {
         let history = BuildHistory::new(10);
 
         let b1 = history
-            .enqueue_build("proj-a".into(), "build".into(), 1001, 4)
+            .enqueue_build("proj-a".into(), "build".into(), 1001, 4, None)
             .unwrap();
         let b2 = history
-            .enqueue_build("proj-b".into(), "build".into(), 1002, 4)
+            .enqueue_build("proj-b".into(), "build".into(), 1002, 4, None)
             .unwrap();
         let b3 = history
-            .enqueue_build("proj-c".into(), "build".into(), 1003, 4)
+            .enqueue_build("proj-c".into(), "build".into(), 1003, 4, None)
             .unwrap();
 
         // Remove middle build by ID
@@ -2338,8 +2834,8 @@ mod tests {
         let _guard = test_guard!();
         let history = BuildHistory::new(10);
 
-        history.enqueue_build("proj-a".into(), "build".into(), 1, 4);
-        history.enqueue_build("proj-b".into(), "test".into(), 2, 8);
+        history.enqueue_build("proj-a".into(), "build".into(), 1, 4, None);
+        history.enqueue_build("proj-b".into(), "test".into(), 2, 8, None);
 
         let queued = history.queued_builds();
         assert_eq!(queued.len(), 2);
@@ -2353,7 +2849,7 @@ mod tests {
         let history = BuildHistory::new(10);
 
         let b = history
-            .enqueue_build("proj-a".into(), "cargo build".into(), 1001, 4)
+            .enqueue_build("proj-a".into(), "cargo build".into(), 1001, 4, None)
             .unwrap();
 
         let found = history.queued_build(b.id).unwrap();
@@ -2374,7 +2870,7 @@ mod tests {
         for i in 0..1000 {
             assert!(
                 history
-                    .enqueue_build(format!("proj-{}", i), "build".into(), i, 4)
+                    .enqueue_build(format!("proj-{}", i), "build".into(), i, 4, None)
                     .is_some()
             );
         }

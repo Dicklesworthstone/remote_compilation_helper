@@ -872,6 +872,42 @@ chk("a remote keeps its own id", dispatcherId("hz3") === "hz3");
     "queued builds survive as [id, project, command, position, slots_needed, wait_time]",
     JSON.stringify(rich.queued) === JSON.stringify([["43", "q", "cargo build", 1, 4, "2m"]]),
   );
+  {
+    // These adjacent real u64 IDs collapse to one JavaScript number during
+    // JSON parsing. The string companion must survive collector projection.
+    const preciseStatus = JSON.parse(RICH);
+    preciseStatus.data.daemon.queued_builds = JSON.parse(`[
+      {"id":9223372036854775809,"id_text":"9223372036854775809"},
+      {"id":9223372036854775810,"id_text":"9223372036854775810"},
+      {"id":9223372036854775811}
+    ]`);
+    chk(
+      "queue precision fixture exercises colliding parsed numeric IDs",
+      preciseStatus.data.daemon.queued_builds[0].id ===
+        preciseStatus.data.daemon.queued_builds[1].id,
+    );
+    const precise = dispatcherFromProbe(
+      "hz3-dev",
+      probe([["s", JSON.stringify(preciseStatus)]]),
+    );
+    chk(
+      "distinct upper-u64 queue IDs remain exact through JSON and collector projection",
+      JSON.stringify(precise.queued.map((q) => q[0])) ===
+        JSON.stringify(["9223372036854775809", "9223372036854775810", null]),
+      JSON.stringify(precise.queued),
+    );
+    const preciseApi = dispatcherFromProbe(
+      "hz3-dev",
+      sectionsFromApi(
+        { status: { ok: true, text: JSON.stringify(preciseStatus.data.daemon) } },
+        null,
+      ),
+    );
+    chk(
+      "tailnet API collection preserves the same exact queued identities as SSH",
+      JSON.stringify(preciseApi.queued) === JSON.stringify(precise.queued),
+    );
+  }
   chk(
     "convergence keeps the summary and only the NOT-ready workers",
     rich.convergence.status === "drifting" &&

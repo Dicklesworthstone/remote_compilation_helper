@@ -1055,7 +1055,13 @@ export function dispatcherFromProbe(host, probe) {
 
   // Queued builds: [id, project, command, position, slots_needed, wait_time]
   const queued = objs(status?.daemon?.queued_builds, 40).map((q) => [
-    q.id != null ? String(q.id) : null,
+    // Queue IDs use the upper u64 namespace. Preserve the daemon's decimal
+    // string; an older server's rounded JSON number is not a usable cancel ID.
+    typeof q.id_text === "string" && /^[0-9]+$/.test(q.id_text)
+      ? q.id_text
+      : Number.isSafeInteger(q.id)
+        ? String(q.id)
+        : null,
     q.project_id ?? null,
     str(q.command, 120),
     num(q.position),

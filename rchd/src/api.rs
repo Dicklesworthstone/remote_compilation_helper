@@ -165,6 +165,9 @@ enum ApiRequest {
         force: bool,
         local_wrapper_id: Option<String>,
     },
+    CancelJob {
+        local_wrapper_id: String,
+    },
     CancelAllBuilds {
         force: bool,
     },
@@ -373,6 +376,8 @@ pub struct ActiveBuild {
 pub struct QueuedBuild {
     /// Queue position ID.
     pub id: u64,
+    /// Exact decimal ID for clients whose JSON numbers cannot represent u64.
+    pub id_text: String,
     /// Project identifier.
     pub project_id: String,
     /// Command to execute.
@@ -1110,13 +1115,42 @@ async fn handle_connection_with_metrics(
             };
             (response.to_string(), "application/json")
         }
+        Ok(ApiRequest::CancelJob { local_wrapper_id }) => {
+            let response = handle_cancel_job(&ctx, &local_wrapper_id, false).await?;
+            (response.to_string(), "application/json")
+        }
         Ok(ApiRequest::CancelBuild {
             build_id,
             force,
             local_wrapper_id,
         }) => {
             metrics::inc_requests("cancel-build");
-            if let Some(record) = local_wrapper_id
+            if let Some(queued) = ctx.history.queued_build(build_id).filter(|_| {
+                ctx.history.active_build(build_id).is_none()
+                    && !ctx.history.has_terminal_build(build_id)
+            }) {
+                let response = match queued.local_wrapper_id.as_deref() {
+                    Some(wrapper)
+                        if local_wrapper_id
+                            .as_deref()
+                            .is_none_or(|requested| requested == wrapper) =>
+                    {
+                        let mut response = handle_cancel_job(&ctx, wrapper, force).await?;
+                        response["queue_id"] = serde_json::json!(build_id);
+                        if response["status"] == "cancelled_before_start" {
+                            response["status"] = serde_json::json!("cancelled");
+                            response["build_id"] = serde_json::json!(build_id);
+                            response["message"] =
+                                serde_json::json!("Queued job cancelled before start");
+                        }
+                        response
+                    }
+                    _ => {
+                        serde_json::json!({"status":"error", "build_id":build_id, "slots_released":0, "message":"Queued job has no matching durable wrapper identity; cancellation refused"})
+                    }
+                };
+                (response.to_string(), "application/json")
+            } else if let Some(record) = local_wrapper_id
                 .as_deref()
                 .and_then(|wrapper| ctx.history.terminal_build(build_id, wrapper))
             {
@@ -1365,6 +1399,20 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
     }
 
     // Build cancellation endpoints
+    if method == "POST" {
+        if let Some(wrapper) = path
+            .strip_prefix("/jobs/")
+            .and_then(|rest| rest.strip_suffix("/cancel"))
+        {
+            let uuid = wrapper
+                .strip_prefix(LOCAL_WRAPPER_ID_PREFIX)
+                .ok_or_else(|| anyhow!("Invalid local wrapper id"))?;
+            Uuid::parse_str(uuid).map_err(|_| anyhow!("Invalid local wrapper id"))?;
+            return Ok(ApiRequest::CancelJob {
+                local_wrapper_id: wrapper.to_owned(),
+            });
+        }
+    }
     if method == "GET" && path.starts_with("/builds/") {
         let (route, query) = path.split_once('?').unwrap_or((path, ""));
         let build_id = route
@@ -2289,6 +2337,15 @@ async fn handle_event_stream(
     Ok(())
 }
 
+fn cancelled_selection() -> SelectionResponse {
+    SelectionResponse {
+        worker: None,
+        reason: SelectionReason::SelectionError("job_cancelled_before_start".to_owned()),
+        build_id: None,
+        diagnostics: None,
+    }
+}
+
 /// Handle a select-worker request.
 #[cfg(test)]
 async fn handle_select_worker(
@@ -2307,6 +2364,12 @@ async fn handle_select_worker_with_wrapper(
     wait_timeout_secs: Option<u64>,
     local_wrapper_id: Option<String>,
 ) -> Result<SelectionResponse> {
+    if local_wrapper_id
+        .as_deref()
+        .is_some_and(|id| ctx.history.wrapper_cancelled(id))
+    {
+        return Ok(cancelled_selection());
+    }
     if *ctx.admission_barrier.read().await || ctx.history.ownership_failed() {
         return Ok(SelectionResponse {
             worker: None,
@@ -2367,6 +2430,12 @@ async fn handle_select_worker_with_wrapper(
         request: &SelectionRequest,
         local_wrapper_id: Option<String>,
     ) -> Result<SelectionResponse> {
+        if local_wrapper_id
+            .as_deref()
+            .is_some_and(|id| ctx.history.wrapper_cancelled(id))
+        {
+            return Ok(cancelled_selection());
+        }
         let admission = ctx.admission_barrier.read().await;
         if *admission || ctx.history.ownership_failed() {
             return Ok(SelectionResponse {
@@ -2394,6 +2463,12 @@ async fn handle_select_worker_with_wrapper(
                 let selection_diagnostics = result.diagnostics;
 
                 let Some(worker) = result.worker else {
+                    if local_wrapper_id
+                        .as_deref()
+                        .is_some_and(|id| ctx.history.wrapper_cancelled(id))
+                    {
+                        return Ok(cancelled_selection());
+                    }
                     debug!("No worker selected: {}", selection_reason);
                     return Ok(SelectionResponse {
                         worker: None,
@@ -2453,6 +2528,12 @@ async fn handle_select_worker_with_wrapper(
                         Ok(Some(state)) => state,
                         Ok(None) => {
                             worker.release_slots(reserve_slots).await;
+                            if local_wrapper_id
+                                .as_deref()
+                                .is_some_and(|id| ctx.history.wrapper_cancelled(id))
+                            {
+                                return Ok(cancelled_selection());
+                            }
                             if ctx.history.ownership_failed() {
                                 anyhow::bail!(
                                     "durable ownership uncertain; admission closed until restart"
@@ -2561,9 +2642,19 @@ async fn handle_select_worker_with_wrapper(
         command.clone(),
         hook_pid,
         request.estimated_cores,
+        local_wrapper_id.clone(),
     );
     drop(admission);
     let Some(queued) = queued_result else {
+        if ctx.history.ownership_failed() {
+            anyhow::bail!("durable ownership uncertain; queue admission closed until restart");
+        }
+        if local_wrapper_id
+            .as_deref()
+            .is_some_and(|id| ctx.history.wrapper_cancelled(id))
+        {
+            return Ok(cancelled_selection());
+        }
         // Queue full - fall back to the normal busy response.
         return Ok(initial);
     };
@@ -2593,9 +2684,26 @@ async fn handle_select_worker_with_wrapper(
     let queue_timeout = Duration::from_secs(effective_queue_timeout_secs);
 
     loop {
+        if local_wrapper_id
+            .as_deref()
+            .is_some_and(|id| ctx.history.wrapper_cancelled(id))
+        {
+            ctx.history
+                .finish_queued_build(queued.id, local_wrapper_id.as_deref())?;
+            ctx.history.update_queue_estimates();
+            if !cfg!(test) {
+                metrics::set_build_queue_depth(ctx.history.queue_depth());
+            }
+            return Ok(cancelled_selection());
+        }
         // Check if the queue wait has timed out
         if queued.queued_at_mono.elapsed() > queue_timeout {
-            let _ = ctx.history.remove_queued_build(queued.id);
+            if ctx
+                .history
+                .finish_queued_build(queued.id, local_wrapper_id.as_deref())?
+            {
+                return Ok(cancelled_selection());
+            }
             ctx.history.update_queue_estimates();
             if !cfg!(test) {
                 metrics::set_build_queue_depth(ctx.history.queue_depth());
@@ -2624,7 +2732,12 @@ async fn handle_select_worker_with_wrapper(
 
         // If the hook process exited while waiting, drop the queued build to avoid leaking slots.
         if hook_pid > 0 && !is_process_alive(hook_pid) {
-            let _ = ctx.history.remove_queued_build(queued.id);
+            if ctx
+                .history
+                .finish_queued_build(queued.id, local_wrapper_id.as_deref())?
+            {
+                return Ok(cancelled_selection());
+            }
             ctx.history.update_queue_estimates();
             if !cfg!(test) {
                 metrics::set_build_queue_depth(ctx.history.queue_depth());
@@ -2657,7 +2770,12 @@ async fn handle_select_worker_with_wrapper(
 
         // If conditions changed (e.g., all circuits open), stop waiting and fail-open.
         if response.reason != SelectionReason::AllWorkersBusy {
-            let _ = ctx.history.remove_queued_build(queued.id);
+            if ctx
+                .history
+                .finish_queued_build(queued.id, local_wrapper_id.as_deref())?
+            {
+                return Ok(cancelled_selection());
+            }
             ctx.history.update_queue_estimates();
             if !cfg!(test) {
                 metrics::set_build_queue_depth(ctx.history.queue_depth());
@@ -3120,6 +3238,41 @@ fn is_process_alive(pid: u32) -> bool {
             .status()
             .map(|status| status.success())
             .unwrap_or(false)
+    }
+}
+
+async fn handle_cancel_job(
+    ctx: &DaemonContext,
+    wrapper: &str,
+    force: bool,
+) -> Result<serde_json::Value> {
+    use crate::history::WrapperCancellation;
+    match ctx.history.cancel_wrapper(wrapper)? {
+        WrapperCancellation::BeforeStart => {
+            ctx.history.update_queue_estimates();
+            if !cfg!(test) {
+                metrics::set_build_queue_depth(ctx.history.queue_depth());
+            }
+            ctx.events.emit(
+                "job_cancelled_before_start",
+                &serde_json::json!({"local_wrapper_id":wrapper}),
+            );
+            Ok(
+                serde_json::json!({"status":"cancelled_before_start", "local_wrapper_id":wrapper, "exit_code":130, "slots_released":0}),
+            )
+        }
+        WrapperCancellation::Active(build_id) => {
+            let response = handle_cancel_build(ctx, build_id, force).await;
+            let mut response = serde_json::to_value(response)?;
+            response["local_wrapper_id"] = serde_json::json!(wrapper);
+            Ok(response)
+        }
+        WrapperCancellation::Completed(record) => Ok(
+            serde_json::json!({"status":"completed", "local_wrapper_id":wrapper, "record":record}),
+        ),
+        WrapperCancellation::NotQueued => Ok(
+            serde_json::json!({"status":"not_queued", "local_wrapper_id":wrapper, "message":"Job is not currently queued; no cancellation-before-start was acknowledged"}),
+        ),
     }
 }
 
@@ -3691,6 +3844,7 @@ pub(crate) async fn handle_status(ctx: &DaemonContext) -> Result<DaemonFullStatu
                 let wait_secs = b.queued_at_mono.elapsed().as_secs();
                 QueuedBuild {
                     id: b.id,
+                    id_text: b.id.to_string(),
                     project_id: b.project_id,
                     command: b.command,
                     queued_at: b.queued_at,
@@ -4787,6 +4941,133 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn queued_job_cancellation_reaches_waiter_without_reserving_slots() {
+        let _guard = test_guard!();
+        for by_queue_id in [false, true] {
+            let pool = WorkerPool::new();
+            pool.add_worker(make_test_worker("requested", 4)).await;
+            let worker = pool.get(&WorkerId::new("requested")).await.unwrap();
+            assert!(worker.reserve_slots(4).await);
+            let tmp = tempfile::TempDir::new().unwrap();
+            let path = tmp.path().join("history.jsonl");
+            let mut ctx = make_test_context(pool);
+            ctx.history = Arc::new(BuildHistory::new(10).with_persistence(path.clone()));
+            let wrapper = format!("rchw-{}", Uuid::new_v4());
+            let request = SelectionRequest {
+                job_mode: false,
+                project: "cancel-queued".into(),
+                command: Some("cargo build".into()),
+                command_priority: CommandPriority::Normal,
+                estimated_cores: 2,
+                preferred_workers: vec![WorkerId::new("requested")],
+                toolchain: None,
+                required_runtime: RequiredRuntime::default(),
+                classification_duration_us: None,
+                hook_pid: Some(std::process::id()),
+                required_tools: Vec::new(),
+            };
+            let waiting_ctx = ctx.clone();
+            let waiting_request = request.clone();
+            let waiting_wrapper = wrapper.clone();
+            let waiter = tokio::spawn(async move {
+                handle_select_worker_with_wrapper(
+                    &waiting_ctx,
+                    waiting_request,
+                    true,
+                    Some(5),
+                    Some(waiting_wrapper),
+                )
+                .await
+            });
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while ctx.history.queue_depth() == 0 {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap();
+            let queue_id = ctx.history.queued_builds()[0].id;
+            let route = if by_queue_id {
+                format!("POST /builds/{queue_id}/cancel\n")
+            } else {
+                format!("POST /jobs/{wrapper}/cancel\n")
+            };
+            let (mut client, server) = UnixStream::pair().unwrap();
+            let (shutdown_tx, _shutdown_rx) = tokio::sync::mpsc::channel(1);
+            let cancellation = tokio::spawn(handle_connection(server, ctx.clone(), shutdown_tx));
+            client.write_all(route.as_bytes()).await.unwrap();
+            let mut response = String::new();
+            tokio::time::timeout(Duration::from_secs(2), client.read_to_string(&mut response))
+                .await
+                .unwrap()
+                .unwrap();
+            cancellation.await.unwrap().unwrap();
+            let body: serde_json::Value =
+                serde_json::from_str(response.split_once("\r\n\r\n").unwrap().1).unwrap();
+            assert_eq!(
+                body["status"],
+                if by_queue_id {
+                    "cancelled"
+                } else {
+                    "cancelled_before_start"
+                }
+            );
+            assert_eq!(body["local_wrapper_id"], wrapper);
+            assert_eq!(body["slots_released"], 0);
+            worker.release_slots(4).await;
+            let response = tokio::time::timeout(Duration::from_secs(3), waiter)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(response.reason, cancelled_selection().reason);
+            assert!(response.worker.is_none());
+            assert!(response.build_id.is_none());
+            assert!(ctx.history.active_builds().is_empty());
+            assert_eq!(ctx.history.queue_depth(), 0);
+            assert_eq!(worker.available_slots().await, 4);
+
+            ctx.history = Arc::new(BuildHistory::load_from_file(&path, 10).unwrap());
+            let retry = handle_select_worker_with_wrapper(
+                &ctx,
+                request,
+                false,
+                None,
+                Some(wrapper.clone()),
+            )
+            .await
+            .unwrap();
+            assert_eq!(retry.reason, cancelled_selection().reason);
+            assert_eq!(worker.available_slots().await, 4);
+            assert_eq!(
+                handle_cancel_job(&ctx, &wrapper, false).await.unwrap()["status"],
+                "cancelled_before_start"
+            );
+            assert_eq!(
+                handle_cancel_job(&ctx, "unknown-wrapper", false)
+                    .await
+                    .unwrap()["status"],
+                "not_queued"
+            );
+        }
+    }
+
+    #[test]
+    fn queued_job_cancel_route_requires_complete_wrapper_identity() {
+        let wrapper = format!("rchw-{}", Uuid::new_v4());
+        assert!(
+            matches!(parse_request(&format!("POST /jobs/{wrapper}/cancel")).unwrap(), ApiRequest::CancelJob { local_wrapper_id } if local_wrapper_id == wrapper)
+        );
+        for route in [
+            "POST /jobs/rchw-invalid/cancel",
+            "POST /jobs/1/cancel",
+            "POST /jobs/../cancel",
+        ] {
+            assert!(parse_request(route).is_err());
+        }
+    }
+
+    #[tokio::test]
     async fn test_handle_select_worker_requested_busy_queue_waits_for_requested_worker() {
         let pool = WorkerPool::new();
         pool.add_worker(make_test_worker("requested", 4)).await;
@@ -5635,7 +5916,8 @@ mod tests {
     fn test_queued_build_serialization() {
         let _guard = test_guard!();
         let build = QueuedBuild {
-            id: 1,
+            id: (1_u64 << 63) + 1,
+            id_text: "9223372036854775809".to_string(),
             project_id: "test".to_string(),
             command: "cargo test".to_string(),
             queued_at: "2025-01-01T00:00:00Z".to_string(),
@@ -5645,6 +5927,8 @@ mod tests {
             wait_time: "1m 30s".to_string(),
         };
         let json = serde_json::to_string(&build).unwrap();
+        assert!(json.contains("\"id\":9223372036854775809"));
+        assert!(json.contains("\"id_text\":\"9223372036854775809\""));
         assert!(json.contains("\"position\":1"));
         assert!(json.contains("\"slots_needed\":4"));
         assert!(json.contains("\"wait_time\":\"1m 30s\""));

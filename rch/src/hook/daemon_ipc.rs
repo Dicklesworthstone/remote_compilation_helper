@@ -14,6 +14,15 @@ const MAX_DAEMON_HEADER_BYTES: usize = 16 * 1024;
 const MAX_DAEMON_BODY_BYTES: usize = 64 * 1024;
 const MAX_DAEMON_STATUS_BYTES: usize = 1024;
 
+/// A queue-enabled request may own a live waiter even if its response is lost.
+/// Retrying selection or running locally could duplicate admission or bypass
+/// an already accepted cancellation.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "queued worker selection outcome is unconfirmed; do not retry selection or execute locally"
+)]
+pub(super) struct SelectionOutcomeUnconfirmed;
+
 /// Bound the entire write, not each partial write. A listening daemon can
 /// accept a connection and then stop reading; the response deadline has not
 /// started yet, so an unbounded write would strand the dispatch indefinitely.
@@ -291,10 +300,22 @@ pub(crate) async fn query_daemon(
 
     // Bound writes independently from the longer, queue-aware response wait.
     let request = format!("GET /select-worker?{}\n", query);
-    write_daemon_request(&mut writer, request.as_bytes(), daemon_io_timeout()).await?;
-    let body = read_daemon_body(reader, daemon_response_timeout(wait_for_worker), false).await?;
-    let response = parse_selection_response(&body)
-        .map_err(|e| anyhow::anyhow!("Failed to parse daemon response: {}", e))?;
+    let response: anyhow::Result<SelectionResponse> = async {
+        // Even a failed write or flush may have delivered the complete request.
+        write_daemon_request(&mut writer, request.as_bytes(), daemon_io_timeout()).await?;
+        let body =
+            read_daemon_body(reader, daemon_response_timeout(wait_for_worker), false).await?;
+        parse_selection_response(&body)
+            .map_err(|e| anyhow::anyhow!("Failed to parse daemon response: {}", e))
+    }
+    .await;
+    let response = response.map_err(|error| {
+        if wait_for_worker {
+            error.context(SelectionOutcomeUnconfirmed)
+        } else {
+            error
+        }
+    })?;
 
     if let Some(worker) = response.worker.as_ref()
         && !selected_worker_is_requested(&worker.id, preferred_workers)

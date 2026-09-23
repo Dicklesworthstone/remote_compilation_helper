@@ -138,6 +138,36 @@ rch cancel --all -y                        # last resort: cancel everything
 For stuck OS processes that are not tracked builds, use the audited triage fix in
 §3 rather than `pkill -9 cargo`.
 
+**Jobs still waiting for a worker:** inspect `rch queue` or `rch jobs`, then cancel
+the queued ID or its durable wrapper identity:
+
+```bash
+rch cancel <queue-id>
+rch jobs cancel <wrapper-id>
+```
+
+The daemon records cancellation before acknowledging it and prevents that wrapper
+from later receiving a worker reservation. The waiting wrapper exits with code
+130 and does not fall back to a local build. If admission has already won, the
+same request follows the existing cancellation path for the exact active build.
+If the job has already left the queue for timeout or local fallback, cancellation
+reports that it is no longer queued instead of claiming it prevented a start.
+
+If the connection fails after a queue-enabled selection request may have reached
+the daemon, the wrapper retains its lease as `selection_unconfirmed` and stops.
+It does not retry selection or run locally while the original waiter or an
+accepted cancellation remains unresolved. Inspect the original job identity with
+`rch jobs`; use that same identity for targeted cancellation when the daemon is
+available. Failures before a connection is established retain ordinary daemon
+recovery behavior.
+
+Queue IDs have a separate, durably allocated namespace and are not reused after
+a daemon restart. Repeating cancellation by wrapper identity is supported after
+restart. Legacy queued requests without a durable wrapper identity refuse this
+operation. Cancellation intents are bounded at 100,000 identities; exhaustion or
+a persistence failure refuses acknowledgment instead of forgetting a cancelled
+job and allowing it to run later.
+
 **Active jobs recovered after a daemon restart:** inspect `rch queue`, then use
 `rch cancel <build-id>` for the specific job you want to stop. Cancellation can
 now finish when the original local wrapper has exited, including when its PID
