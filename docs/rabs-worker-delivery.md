@@ -382,6 +382,52 @@ connection; partial writes are never retried. The native ATP payload limit is
 1 MiB minus 64 bytes; larger requests are rejected before listening. Filesystem
 operations, including sync, are not guaranteed interruptible by these budgets.
 
+### Interrupt an authenticated build without losing its outcome
+
+During an online `--worker-exec-tls` or `--worker-build-tls` operation, Ctrl+C
+(SIGINT) or SIGTERM can request cancellation of the exact dispatched execution.
+No new command flag is needed. The receiver's signal adapter is installed after
+TLS connection establishment. A stop observed before execution dispatch closes
+the connection without starting work; during source staging the worker's normal
+session-loss path retains ownership until accepted filesystem work drains.
+
+While awaiting an execution result, the first observed signal sends exactly one
+`cancel` for that request ID over the existing authenticated connection. It then
+waits for the actual terminal result, not merely `cancel-accepted`. The remaining
+execution/cleanup deadline is reduced to at most 60 seconds from that signal,
+never extended past the original deadline. Heartbeats and cancellation replies
+do not refresh it. A complete result then uses the ordinary bounded transfer
+phase: every diagnostic and successful artifact is verified and made locally
+durable before release acknowledgments, exactly as for uninterrupted delivery.
+
+When cancellation wins, the worker ordinarily reports exit 130 and
+`stop_reason:cancelled`; complete diagnostics remain recoverable and no failed
+build artifacts are installed. When completion wins the race, the receiver
+preserves the actual result and original exit status, including successful
+artifacts. Sending a cancel is not evidence that the command was cancelled.
+One matching late cancellation response may follow a completed result without
+being mistaken for a byte-range response or authorizing another execution.
+
+A second observed signal abandons the connection without repeating cancellation
+or acknowledging incomplete output. An interrupt during result resume, byte
+transfer or acknowledgment reconciliation likewise abandons that operation; it
+never obtains permission to cancel or execute another request. A failed or
+partial cancel write is terminal for the connection. None of these paths retries
+execution, clears worker history, or falls back to a local compiler.
+
+Keep the original request and delivery directory after interruption. A complete
+verified receipt still supports ordinary offline recovery. An incomplete delivery
+remains inspection state; explicit `--resume` may retrieve a retained original
+result into a new directory. A cancellation acknowledgment, EOF, or deadline
+expiry alone does not prove remote cleanup or make reexecution safe.
+
+Signal handling is not a claim of interruptible filesystem I/O: capture, hashing,
+fsync, and output installation can still block in the operating system. Signals
+are observed while reading network records and before new writes; writes already
+in progress retain the native transport's existing deadlines. Before the TLS
+adapter is installed, and in the separate plaintext loopback fixture, existing
+process-signal behavior is unchanged. SIGKILL cannot perform graceful recovery.
+
 ### Trusted local fixture
 
 Start the receiver with an existing absolute parent and a NEW delivery directory:
@@ -540,7 +586,19 @@ cargo test -p rabsd delivery_ack
 cargo test -p rabsd --bin rabsd worker_exec
 cargo test -p rabsd --test worker_delivery_cli
 cargo test -p rabsd --test worker_exec_tls
+cargo test -p rabsd coord::secure_worker_delivery::interrupt
+cargo test -p rabsd --test worker_interrupt_tls
 ```
+
+The interruption tests send real SIGINT/SIGTERM to the actual receiver process
+while communicating through native mutual TLS. Their scripted peer exercises
+cancel-once, complete binary diagnostics, completion races, pre-dispatch and
+resume interruption, second-signal abandonment, foreign cancellation replies,
+and offline recovery of a cancelled delivery. They do not execute a compiler or
+prove worker descendant cleanup. The unit tests additionally cover partial-frame
+preservation, failed writes, and absolute cancellation-drain deadlines. All new
+interruption tests still require execution on a supported Rust host; source
+coverage alone is not a passing cancellation or fleet-qualification result.
 
 The CLI test starts the actual receiver binary and a scripted TCP peer, delivering
 binary artifacts and multi-range diagnostics through the production receiver.
