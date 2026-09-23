@@ -27,6 +27,8 @@ use std::sync::Arc;
 
 /// Bound the number of independently captured repositories in one source tree.
 pub const MAX_SOURCE_ROOTS: usize = 64;
+// Outstanding chunks, not concurrent filesystem writers on the worker.
+const SOURCE_WINDOW: usize = 4;
 
 fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
@@ -599,6 +601,24 @@ impl SourceUpload {
             "worker did not accept the exact Cargo home replay selection",
         )?;
         let missing = self.missing_files(&reply)?;
+        // Four bounded chunks fit below the worker's eight-frame / 2 MiB
+        // deferred-source limit, including maximum encoded paths and hashes.
+        // Batch across files too: tiny dependency inputs must not each cost a
+        // full round trip. Retain only expected acknowledgment descriptors,
+        // never another copy of the already sealed source payload.
+        let mut outstanding = Vec::with_capacity(SOURCE_WINDOW);
+        let acknowledge_batch = |peer: &mut P, outstanding: &mut Vec<(&str, u64)>| {
+            for (path, next) in outstanding.drain(..) {
+                let reply = peer.receive()?;
+                check(&reply, "source-chunk-accepted")?;
+                require(
+                    reply["path"].as_str() == Some(path)
+                        && reply["next_offset"].as_u64() == Some(next),
+                    "source acknowledgment does not cover the transmitted range",
+                )?;
+            }
+            Ok::<(), io::Error>(())
+        };
         for file in self.manifest.files() {
             if missing
                 .as_ref()
@@ -615,15 +635,16 @@ impl SourceUpload {
                     "path":file.path, "offset":offset, "data_hex":hex(chunk),
                     "chunk_sha256":hex(&Sha256::digest(chunk))}),
                 )?;
-                let reply = peer.receive()?;
-                check(&reply, "source-chunk-accepted")?;
-                require(
-                    reply["path"].as_str() == Some(file.path.as_str())
-                        && reply["next_offset"].as_u64() == Some(next),
-                    "source acknowledgment does not cover the transmitted range",
-                )?;
+                outstanding.push((file.path.as_str(), next));
+                if outstanding.len() == SOURCE_WINDOW {
+                    acknowledge_batch(peer, &mut outstanding)?;
+                }
             }
         }
+        // No seal, ownership transfer or execution can precede acknowledgment
+        // of EVERY transmitted chunk, including the final partial batch. Any
+        // failed write, malformed reply or deadline aborts without retrying.
+        acknowledge_batch(peer, &mut outstanding)?;
         // Even a completely warm projection needs this exact final seal. A
         // missing-file hint by itself grants neither execution nor publication.
         peer.send(&json!({"kind":"source-seal", "request_id":id, "manifest_sha256":identity}))?;
