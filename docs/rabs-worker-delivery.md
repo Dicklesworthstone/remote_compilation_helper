@@ -560,6 +560,17 @@ has the effective execution budget (at most 30 minutes) plus five minutes for
 transfer. Trickled bytes and telemetry cannot renew those deadlines. These are
 network budgets, not a promise to interrupt an operating-system fsync that stalls.
 
+Source uploads batch up to four ordinary `source-chunk` messages, including
+chunks from different selected files, before draining their ordered acknowledgments.
+The final source seal still waits for every acknowledgment. Diagnostic and artifact
+downloads similarly queue at most four ordinary range requests for one file, then
+verify every response before starting another batch. This removes the mandatory
+one-response wait after each individual chunk without increasing a chunk's size,
+relaxing any hash or identity check, or renewing the phase deadline. Malformed
+responses and failed writes stop the operation without retrying a batch. Existing
+missing-file hints and unaligned local resume prefixes retain their usual meaning;
+no new CLI flag, wire version or cache-publication authority is introduced.
+
 All file hashes must match before any ACK is sent. The receiver syncs files,
 directories, and parent ancestry, writes and syncs `delivery.pending`, renames it
 to `delivery.json`, and syncs the directory again. Only then does it acknowledge
