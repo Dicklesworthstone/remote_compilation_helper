@@ -14,6 +14,9 @@ use crate::source_transfer::SourceOwner;
 use rabs_sandbox::process_context::{CommandContext, COMMAND_CONTEXT_VERSION, MAX_COMMAND_ENV_ENTRIES};
 use rabs_sandbox::toolchain_dataset::{ToolchainIdentity, TOOLCHAIN_DATASET_VERSION};
 
+mod toolchain_pool;
+pub use toolchain_pool::ToolchainReuseScope;
+
 /// What this worker can do (advertised at handshake; the scheduler
 /// gates placement on it). Derived from a real HostIsolationSupport
 /// probe on the worker.
@@ -52,8 +55,8 @@ pub struct CanonicalExecRequest {
     /// Explicit, validated environment additions and canonical working directory.
     /// Absence on the wire uses the canonical workspace and pinned base only.
     pub command_context: CommandContext,
-    /// Worker-local source of the toolchain dataset. Execution captures its
-    /// bytes into private backing before mounting `/__rabs/toolchain`.
+    /// Worker-local source of the toolchain dataset. Execution captures private
+    /// bytes or leases an exactly pinned captured dataset, never this live path.
     pub toolchain_backing: String,
     /// Expected content identity, when the coordinator has pinned a toolchain.
     /// This is execution input binding, never action-cache authorization.
@@ -341,36 +344,24 @@ fn execute_canonical_inner(
     let support = HostIsolationSupport::probe();
     if !support.missing_for_canonical().is_empty() { return exec_error(request.request_id); }
 
-    // A read-only bind of the original pathname still observes concurrent host
-    // writes. The private owner supplies independent bytes and is retained until
-    // every process and diagnostic drain resolves. Never mount the input path.
-    let mut staging_builder = tempfile::Builder::new();
-    staging_builder.prefix("rabs-toolchain-");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        staging_builder.permissions(std::fs::Permissions::from_mode(0o700));
-    }
-    let toolchain_staging = match staging_builder.tempdir() {
-        Ok(staging) => staging,
-        Err(error) => {
-            let _ = control.retain_outputs(Err(format!("toolchain staging: {error}")));
-            return exec_error(request.request_id);
-        }
-    };
-    let toolchain = match rabs_sandbox::toolchain_dataset::capture_toolchain(
+    // The lease retains independent bytes until processes and drains resolve.
+    // Only an explicit complete content identity may reuse a captured dataset;
+    // an unpinned request never resolves a mutable pathname through the pool.
+    let toolchain = match toolchain_pool::prepare(
         std::path::Path::new(&request.toolchain_backing),
-        &toolchain_staging.path().join("dataset"),
         request.toolchain_identity.as_ref(),
-        &rabs_sandbox::toolchain_dataset::ToolchainLimits::default(),
         || control.reason().is_some(),
     ) {
         Ok(toolchain) => toolchain,
         Err(error) => {
-            let _ = control.retain_outputs(Err(format!("toolchain capture: {error}")));
+            let _ = control.retain_outputs(Err(format!("toolchain acquisition: {error}")));
             return exec_error(request.request_id);
         }
     };
+    eprintln!("{}", serde_json::json!({
+        "kind":"worker-toolchain-acquired", "request_id":request.request_id,
+        "disposition":toolchain.disposition(), "pinned":request.toolchain_identity.is_some(),
+    }));
     let mut plan = CanonicalMountPlan::new(
         toolchain.root(),
         &request.workspace_backing,
@@ -397,6 +388,10 @@ fn execute_canonical_inner(
         && let Err(error) = source.protect_workspace(request.request_id, &mut spec)
     {
         let _ = control.retain_outputs(Err(format!("source mount isolation: {error}")));
+        return exec_error(request.request_id);
+    }
+    if let Err(error) = toolchain.validate_namespace(&spec) {
+        let _ = control.retain_outputs(Err(format!("toolchain mount isolation: {error}")));
         return exec_error(request.request_id);
     }
     // Worker-local jobserver authority runs on the FINAL env: extra_env

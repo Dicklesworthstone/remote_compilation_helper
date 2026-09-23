@@ -124,6 +124,16 @@ pub(super) fn run(
     once: bool,
     mut journal: WorkerJournal,
 ) -> i32 {
+    // This strong scope spans reconnects but not process exit. The registry is
+    // weak, so every ordinary return releases idle datasets AFTER session drain.
+    // No static TempDir owner or detached janitor can leak them on clean exit.
+    let _toolchains = match rabs_wkr::session::ToolchainReuseScope::from_environment() {
+        Ok(scope) => scope,
+        Err(error) => {
+            eprintln!("rabs-wkr: toolchain pool configuration: {error}");
+            return 1;
+        }
+    };
     let controller = Arc::new(ShutdownController::new());
     controller.listen_for_signals();
     let runtime = match RuntimeBuilder::current_thread().build() {
