@@ -5075,6 +5075,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         &self,
         worker: &WorkerConfig,
         identity: &str,
+        retirement_root: &str,
     ) -> Result<()> {
         if use_mock_transport(worker) {
             return Ok(());
@@ -5083,23 +5084,48 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
             Duration::from_secs(120),
             self.run_remote_sh(
                 worker,
-                &self.clean_overlay_source_refresh_command(identity)?,
+                &self.clean_overlay_source_refresh_command_at(identity, retirement_root)?,
             ),
         )
         .await
         .context("timed out proving clean-overlay source freshness")?
     }
 
+    #[cfg(test)]
     fn clean_overlay_source_refresh_command(&self, identity: &str) -> Result<String> {
+        self.clean_overlay_source_refresh_command_at(identity, &self.remote_path())
+    }
+
+    fn clean_overlay_source_refresh_command_at(
+        &self,
+        identity: &str,
+        retirement_root: &str,
+    ) -> Result<String> {
         if identity.len() != 64 || !identity.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             anyhow::bail!("invalid clean-overlay freshness identity");
         }
         let root = self.remote_path();
+        let retirement_root = retirement_root.trim_end_matches('/');
+        anyhow::ensure!(
+            !retirement_root.is_empty()
+                && (root == retirement_root || root.starts_with(&format!("{retirement_root}/"))),
+            "freshness source is outside its owned retirement container"
+        );
         let pool = self.remote_cargo_target_dir();
         let quote = |value: &str| escape(Cow::from(value)).into_owned();
-        let anchor = format!("{root}.freshness-anchor");
-        let epoch = format!("{root}.freshness-epoch-v1");
-        Ok(format!(
+        // Selected sibling roots are retired together. Controls must remain
+        // outside that entire container, with disjoint exact-root identities.
+        let control = if root == retirement_root {
+            root.clone()
+        } else {
+            format!(
+                "{retirement_root}.source-{}",
+                blake3::hash(root.as_bytes()).to_hex()
+            )
+        };
+        let anchor = format!("{control}.freshness-anchor");
+        let epoch = format!("{control}.freshness-epoch-v1");
+        let conservative = format!(
             "set -eu; root={root}; pool={pool}; anchor={anchor}; epoch={epoch}; identity={identity}; \
              [ ! -L \"$anchor\" ] && [ ! -L \"$epoch\" ] && [ ! -L \"$pool\" ]; \
              [ ! -e \"$epoch\" ] || [ -f \"$epoch\" ]; \
@@ -5124,7 +5150,217 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
             anchor = quote(&anchor),
             epoch = quote(&epoch),
             identity = quote(identity),
+        );
+        Ok(format!(
+            "if command -v python3 >/dev/null 2>&1; then python3 -c {script} {root} {pool} {epoch} {identity}; \
+             else printf '%s\\n' 'RCH: python3 unavailable; using conservative whole-source freshness' >&2; \
+             {conservative}; fi",
+            script = quote(Self::clean_overlay_freshness_ledger_script()),
+            root = quote(&root),
+            pool = quote(&pool),
+            epoch = quote(&epoch),
+            identity = quote(identity),
         ))
+    }
+
+    /// Metadata only: source bytes are always rematerialized under the existing
+    /// source-pair lease. Compare against the immediate predecessor, never a
+    /// historical content-to-time cache (which would make A -> B -> A stale).
+    fn clean_overlay_freshness_ledger_script() -> &'static str {
+        r#"import hashlib, json, os, stat, sys, tempfile, time
+
+root, pool, epoch, identity = sys.argv[1:]
+ledger = epoch + '.files-v2'
+MAX_ENTRIES = 200000
+MAX_BYTES = 8 * 1024**3
+MAX_LEDGER = 64 * 1024**2
+
+def require(condition, reason):
+    if not condition:
+        raise RuntimeError('RCH: source freshness unproved: ' + reason)
+
+def canonical(value):
+    return json.dumps(value, sort_keys=True, separators=(',', ':'), ensure_ascii=True).encode('ascii')
+
+def digest(value):
+    return hashlib.sha256(canonical(value)).hexdigest()
+
+def regular_control(path):
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    require(stat.S_ISREG(info.st_mode), 'nonregular freshness control')
+    return info
+
+require(stat.S_ISDIR(os.lstat(root).st_mode), 'source root is not a real directory')
+try:
+    pool_info = os.lstat(pool)
+except FileNotFoundError:
+    pool_info = None
+require(pool_info is None or stat.S_ISDIR(pool_info.st_mode), 'target pool is not a real directory')
+root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+root_identity = os.fstat(root_fd)
+
+def parent_fd(relative):
+    descriptor = os.dup(root_fd)
+    parts = relative.split('/') if relative else ['.']
+    try:
+        for part in parts[:-1]:
+            next_fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = next_fd
+        return descriptor, parts[-1]
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+epoch_info = regular_control(epoch)
+ledger_info = regular_control(ledger)
+previous = {}
+if epoch_info and ledger_info and ledger_info.st_size <= MAX_LEDGER:
+    try:
+        with os.fdopen(os.open(ledger, os.O_RDONLY | os.O_NOFOLLOW), 'rb') as stream:
+            encoded = stream.read(MAX_LEDGER + 1)
+        require(len(encoded) <= MAX_LEDGER, 'freshness ledger grew beyond cap')
+        stored = json.loads(encoded)
+        payload = stored['payload']
+        with os.fdopen(os.open(epoch, os.O_RDONLY | os.O_NOFOLLOW), 'rb') as stream:
+            marker = stream.read(66)
+        valid = (stored['sha256'] == digest(payload)
+                 and payload['schema'] == 2
+                 and marker == (payload['identity'] + '\n').encode('ascii')
+                 and epoch_info.st_mtime_ns == payload['epoch_ns']
+                 and isinstance(payload['entries'], dict)
+                 and len(payload['entries']) <= MAX_ENTRIES)
+        for path, entry in payload['entries'].items():
+            valid = valid and (path == '' or (not path.startswith('/')
+                and all(part not in ('', '.', '..') for part in path.split('/'))))
+            valid = valid and (set(entry) == {'fingerprint', 'mtime_ns'}
+                and isinstance(entry['fingerprint'], str) and len(entry['fingerprint']) == 64
+                and all(c in '0123456789abcdef' for c in entry['fingerprint'])
+                and type(entry['mtime_ns']) is int and 0 <= entry['mtime_ns'] <= payload['epoch_ns'])
+        if valid:
+            previous = payload['entries']
+    except (ValueError, KeyError, TypeError, AttributeError, UnicodeError):
+        pass
+
+def inventory():
+    entries = {}
+    total = 0
+    def visit(relative, depth):
+        nonlocal total
+        require(depth <= 128 and len(entries) < MAX_ENTRIES, 'source inventory cap exceeded')
+        directory_fd, name = parent_fd(relative)
+        before = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        mode = stat.S_IMODE(before.st_mode)
+        entries[relative] = None
+        if stat.S_ISREG(before.st_mode):
+            total += before.st_size
+            require(total <= MAX_BYTES, 'source byte cap exceeded')
+            hasher = hashlib.sha256()
+            # Reject a symlink substitution between lstat and open.
+            descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd)
+            with os.fdopen(descriptor, 'rb') as stream:
+                opened = os.fstat(stream.fileno())
+                require((opened.st_dev, opened.st_ino) == (before.st_dev, before.st_ino), 'source replaced while hashing')
+                read_bytes = 0
+                for block in iter(lambda: stream.read(1024 * 1024), b''):
+                    read_bytes += len(block)
+                    require(read_bytes <= before.st_size, 'source grew while hashing')
+                    hasher.update(block)
+            value = ['file', mode, before.st_size, hasher.hexdigest()]
+        elif stat.S_ISLNK(before.st_mode):
+            value = ['symlink', mode, os.readlink(name, dir_fd=directory_fd)]
+        elif stat.S_ISDIR(before.st_mode):
+            child_fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory_fd)
+            try:
+                children = []
+                with os.scandir(child_fd) as listing:
+                    for child in listing:
+                        require(len(children) + len(entries) < MAX_ENTRIES, 'source directory cap exceeded')
+                        children.append(child.name)
+                children.sort()
+            finally:
+                os.close(child_fd)
+            value = ['directory', mode, [[name, visit(os.path.join(relative, name), depth + 1)] for name in children]]
+        else:
+            raise RuntimeError('RCH: unsupported source entry type')
+        after = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        os.close(directory_fd)
+        require((before.st_dev, before.st_ino, before.st_mode, before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+                == (after.st_dev, after.st_ino, after.st_mode, after.st_size, after.st_mtime_ns, after.st_ctime_ns),
+                'source changed while hashing')
+        fingerprint = digest(value)
+        entries[relative] = {'fingerprint': fingerprint}
+        return fingerprint
+    visit('', 0)
+    named_root = os.lstat(root)
+    require((named_root.st_dev, named_root.st_ino) == (root_identity.st_dev, root_identity.st_ino), 'source root replaced')
+    return entries
+
+current = inventory()
+changed = [path for path, entry in current.items()
+           if previous.get(path, {}).get('fingerprint') != entry['fingerprint']]
+# A new metadata seal can retain source timestamps even when only the selected
+# commit changed. Changed inputs must still be newer than ALL cached artifacts.
+anchor_ns = max([0] + [entry['mtime_ns'] for entry in previous.values()])
+def traversal_error(error):
+    raise error
+
+if changed and pool_info is not None:
+    for directory, directories, files in os.walk(pool, followlinks=False, onerror=traversal_error):
+        directories[:] = [name for name in directories if not os.path.islink(os.path.join(directory, name))]
+        for name in files:
+            info = os.lstat(os.path.join(directory, name))
+            if stat.S_ISREG(info.st_mode):
+                anchor_ns = max(anchor_ns, info.st_mtime_ns)
+deadline = time.monotonic() + 5
+stamp_ns = time.time_ns()
+while stamp_ns <= anchor_ns:
+    require(time.monotonic() < deadline, 'worker clock cannot advance beyond cached artifacts')
+    time.sleep(0.01)
+    stamp_ns = time.time_ns()
+
+for relative, entry in sorted(current.items(), key=lambda item: item[0].count('/'), reverse=True):
+    prior = previous.get(relative)
+    modified = prior['mtime_ns'] if prior and prior['fingerprint'] == entry['fingerprint'] else stamp_ns
+    directory_fd, name = parent_fd(relative)
+    info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    os.utime(name, ns=(info.st_atime_ns, modified), dir_fd=directory_fd, follow_symlinks=False)
+    require(os.stat(name, dir_fd=directory_fd, follow_symlinks=False).st_mtime_ns == modified, 'source timestamp precision changed')
+    os.close(directory_fd)
+    entry['mtime_ns'] = modified
+verified = inventory()
+require({path: entry['fingerprint'] for path, entry in current.items()}
+        == {path: entry['fingerprint'] for path, entry in verified.items()}, 'source changed during freshness refresh')
+
+payload = {'schema': 2, 'identity': identity, 'epoch_ns': stamp_ns, 'entries': current}
+encoded = canonical({'payload': payload, 'sha256': digest(payload)})
+require(len(encoded) <= MAX_LEDGER, 'freshness ledger cap exceeded')
+def stage(path, data):
+    descriptor, temporary = tempfile.mkstemp(prefix=os.path.basename(path) + '.pending.', dir=os.path.dirname(path))
+    with os.fdopen(descriptor, 'wb') as stream:
+        stream.write(data)
+        stream.flush()
+        os.fsync(stream.fileno())
+    return temporary
+
+pending_ledger = stage(ledger, encoded)
+pending_epoch = stage(epoch, (identity + '\n').encode('ascii'))
+os.utime(pending_epoch, ns=(stamp_ns, stamp_ns), follow_symlinks=False)
+require(os.lstat(pending_epoch).st_mtime_ns == stamp_ns, 'epoch timestamp precision changed')
+# The epoch is the commit marker. A crash between these replacements leaves a
+# mismatched pair, causing conservative freshness on the next invocation.
+os.replace(pending_ledger, ledger)
+os.replace(pending_epoch, epoch)
+directory_fd = os.open(os.path.dirname(epoch), os.O_RDONLY | os.O_DIRECTORY)
+try:
+    os.fsync(directory_fd)
+finally:
+    os.close(directory_fd)
+print('RCH_SOURCE_FRESHNESS_V2 unchanged=%d changed=%d' % (len(current) - len(changed), len(changed)))
+"#
     }
 
     /// Best-effort removal of an isolated remote tree (bd-p1vlb).
@@ -9821,6 +10057,380 @@ Number of files transferred: 42
         assert_eq!(
             std::fs::read_to_string(retained.join("fixture")).unwrap(),
             "retained source"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn source_pair_real_cargo_preserves_unchanged_build_script_inputs_and_rollback() {
+        use std::os::unix::fs::PermissionsExt;
+        let retained = tempfile::tempdir().unwrap().keep();
+        let root = retained.join("source with ' quotes");
+        let pool = retained.join("pool");
+        let counter = retained.join("build-script-count");
+        let pipeline = TransferPipeline::new(
+            root.clone(),
+            "freshness".into(),
+            "pair".into(),
+            TransferConfig::default(),
+        )
+        .with_remote_path_override(root.to_string_lossy().into_owned())
+        .with_remote_cargo_target_dir_override(pool.to_string_lossy().into_owned());
+        let build_script = r#"use std::{env, fs, path::Path};
+fn main() {
+    println!("cargo:rerun-if-changed=watched.txt");
+    println!("cargo:rerun-if-changed=watched");
+    let counter = env::var("RCH_FRESHNESS_BUILD_COUNT").unwrap();
+    let count = fs::read_to_string(&counter).unwrap_or_default().parse::<usize>().unwrap_or(0);
+    fs::write(counter, (count + 1).to_string()).unwrap();
+    let mut children: Vec<_> = fs::read_dir("watched").unwrap().map(|entry| entry.unwrap().path()).collect();
+    children.sort();
+    let mut value = fs::read_to_string("watched.txt").unwrap();
+    for child in children {
+        value.push('|');
+        value.push_str(child.file_name().unwrap().to_str().unwrap());
+        value.push('=');
+        value.push_str(&fs::read_to_string(child).unwrap());
+    }
+    fs::write(Path::new(&env::var("OUT_DIR").unwrap()).join("value.rs"), format!("pub const VALUE: &str = {:?};", value)).unwrap();
+}
+"#;
+        let mut watched_time = None;
+        for (run, (code, watched, child, expected_count)) in [
+            ("A", "x", Some("one"), 1),
+            ("B", "x", Some("one"), 1), // unrelated Rust change
+            ("A", "x", Some("one"), 1), // A -> B -> A must recompile Rust
+            ("A", "y", Some("one"), 2),
+            ("A", "x", Some("one"), 3), // watched-input rollback must rerun
+            ("A", "x", Some("two"), 4), // delete/add with identical child bytes
+            ("A", "x", Some("two"), 4), // new selected identity, identical bytes
+            ("A", "x", None, 5),        // directory-watched deletion
+            ("A", "x", None, 6),        // executable/mode identity is an input
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            std::fs::create_dir_all(root.join("src")).unwrap();
+            std::fs::create_dir(root.join("watched")).unwrap();
+            std::fs::write(root.join("Cargo.toml"), "[package]\nname='freshness_fixture'\nversion='0.1.0'\nedition='2024'\n[workspace]\n").unwrap();
+            std::fs::write(root.join("build.rs"), build_script).unwrap();
+            std::fs::write(root.join("watched.txt"), watched).unwrap();
+            if run == 8 {
+                std::fs::set_permissions(
+                    root.join("watched.txt"),
+                    std::fs::Permissions::from_mode(0o600),
+                )
+                .unwrap();
+            }
+            if let Some(child) = child {
+                std::fs::write(root.join("watched").join(child), "d").unwrap();
+            }
+            std::fs::write(root.join("src/lib.rs"), format!(
+                "include!(concat!(env!(\"OUT_DIR\"), \"/value.rs\"));\n#[test] fn actual_generated_value() {{ assert_eq!(format!(\"{code}:{{}}\", VALUE), std::env::var(\"RCH_EXPECTED_EFFECT\").unwrap()); }}\n"
+            )).unwrap();
+            // Simulate archives with timestamps older than every build output.
+            for file in ["Cargo.toml", "build.rs", "watched.txt", "src/lib.rs"] {
+                std::fs::File::options()
+                    .write(true)
+                    .open(root.join(file))
+                    .unwrap()
+                    .set_times(
+                        std::fs::FileTimes::new()
+                            .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(1_000_000)),
+                    )
+                    .unwrap();
+            }
+            let identity = blake3::hash(format!("selected-commit-{run}").as_bytes())
+                .to_hex()
+                .to_string();
+            let refresh = std::process::Command::new("sh")
+                .args([
+                    "-c",
+                    &pipeline
+                        .clean_overlay_source_refresh_command(&identity)
+                        .unwrap(),
+                ])
+                .output()
+                .unwrap();
+            assert!(
+                refresh.status.success(),
+                "{}",
+                String::from_utf8_lossy(&refresh.stderr)
+            );
+            assert!(String::from_utf8_lossy(&refresh.stdout).contains("RCH_SOURCE_FRESHNESS_V2"));
+            let current_time = std::fs::metadata(root.join("watched.txt"))
+                .unwrap()
+                .modified()
+                .unwrap();
+            if run == 1 || run == 2 {
+                assert_eq!(
+                    Some(current_time),
+                    watched_time,
+                    "unchanged watched input was touched"
+                );
+            }
+            if run == 0 {
+                watched_time = Some(current_time);
+            }
+            let expected = format!(
+                "{code}:{watched}{}",
+                child.map_or_else(String::new, |name| format!("|{name}=d"))
+            );
+            let output = std::process::Command::new("cargo")
+                .current_dir(&root)
+                .args(["test", "--offline", "--jobs", "1", "--message-format=json"])
+                .env("CARGO_TARGET_DIR", &pool)
+                .env_remove("CARGO_BUILD_BUILD_DIR")
+                .env("RCH_CARGO_WRAPPER_BYPASS", "1")
+                .env("RCH_FRESHNESS_BUILD_COUNT", &counter)
+                .env("RCH_EXPECTED_EFFECT", expected)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("actual_generated_value"));
+            assert_eq!(
+                std::fs::read_to_string(&counter).unwrap(),
+                expected_count.to_string(),
+                "build-script run count at step {run}"
+            );
+            if run == 6 {
+                let artifacts: Vec<_> = String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                    .filter(|message| message["reason"] == "compiler-artifact")
+                    .collect();
+                assert!(!artifacts.is_empty());
+                assert!(artifacts.iter().all(|message| message["fresh"] == true));
+            }
+            std::fs::rename(&root, retained.join(format!("retired-{run}"))).unwrap();
+        }
+        eprintln!(
+            "content freshness Cargo fixture retained at {}",
+            retained.display()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn source_pair_nested_root_ledgers_survive_container_retirement() {
+        let retained = tempfile::tempdir().unwrap().keep();
+        let container = retained.join("paired-source");
+        let pool = retained.join("pool");
+        let make_pipeline = |name: &str| {
+            let root = container.join(name);
+            TransferPipeline::new(
+                root.clone(),
+                name.into(),
+                "pair".into(),
+                TransferConfig::default(),
+            )
+            .with_remote_path_override(root.to_string_lossy().into_owned())
+            .with_remote_cargo_target_dir_override(pool.to_string_lossy().into_owned())
+        };
+        let first = make_pipeline("first");
+        let second = make_pipeline("second");
+        let mut first_time = None;
+        let mut second_time = None;
+        for (run, contents) in ["before", "after", "before"].into_iter().enumerate() {
+            for (name, contents, pipeline) in [
+                ("first", "unchanged", &first),
+                ("second", contents, &second),
+            ] {
+                let root = container.join(name);
+                std::fs::create_dir_all(&root).unwrap();
+                std::fs::write(root.join("input"), contents).unwrap();
+                let identity = blake3::hash(format!("whole-closure-{run}").as_bytes())
+                    .to_hex()
+                    .to_string();
+                let output = std::process::Command::new("sh")
+                    .args([
+                        "-c",
+                        &pipeline
+                            .clean_overlay_source_refresh_command_at(
+                                &identity,
+                                container.to_str().unwrap(),
+                            )
+                            .unwrap(),
+                    ])
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let modified = std::fs::metadata(root.join("input"))
+                    .unwrap()
+                    .modified()
+                    .unwrap();
+                if name == "first" {
+                    if let Some(previous) = first_time {
+                        assert_eq!(modified, previous);
+                    }
+                    first_time = Some(modified);
+                } else {
+                    if let Some(previous) = second_time {
+                        assert!(modified > previous);
+                    }
+                    second_time = Some(modified);
+                }
+            }
+            std::fs::rename(&container, retained.join(format!("retired-{run}"))).unwrap();
+        }
+        assert!(
+            first
+                .clean_overlay_source_refresh_command_at(&"a".repeat(64), "/unrelated")
+                .is_err()
+        );
+        eprintln!(
+            "nested freshness fixture retained at {}",
+            retained.display()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn source_pair_freshness_ledger_refuses_links_and_recovers_interrupted_metadata() {
+        use std::os::unix::fs::symlink;
+        let retained = tempfile::tempdir().unwrap().keep();
+        let root = retained.join("source");
+        let pool = retained.join("pool");
+        let outside = retained.join("outside");
+        let epoch = retained.join("source.freshness-epoch-v1");
+        let ledger = retained.join("source.freshness-epoch-v1.files-v2");
+        std::fs::write(&outside, "must not be read or touched through a link").unwrap();
+        let outside_time = std::fs::metadata(&outside).unwrap().modified().unwrap();
+        let pipeline = TransferPipeline::new(
+            root.clone(),
+            "fixture".into(),
+            "pair".into(),
+            TransferConfig::default(),
+        )
+        .with_remote_path_override(root.to_string_lossy().into_owned())
+        .with_remote_cargo_target_dir_override(pool.to_string_lossy().into_owned());
+        let materialize = || {
+            std::fs::create_dir(&root).unwrap();
+            std::fs::write(root.join("input\nwith ' quotes"), "identical").unwrap();
+            symlink(&outside, root.join("outside-link")).unwrap();
+        };
+        let identity = "a".repeat(64);
+        let run = || {
+            std::process::Command::new("sh")
+                .args([
+                    "-c",
+                    &pipeline
+                        .clean_overlay_source_refresh_command(&identity)
+                        .unwrap(),
+                ])
+                .output()
+                .unwrap()
+        };
+        materialize();
+        let result = run();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let first = std::fs::metadata(root.join("input\nwith ' quotes"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert_eq!(
+            std::fs::metadata(&outside).unwrap().modified().unwrap(),
+            outside_time
+        );
+        // Deterministic I/O fault injection into the real helper, rather than a
+        // chmod test that silently passes under a root worker. An unreadable
+        // artifact subtree must not be omitted from the freshness upper bound.
+        std::fs::create_dir(&pool).unwrap();
+        let saved_epoch = std::fs::read(&epoch).unwrap();
+        let saved_ledger = std::fs::read(&ledger).unwrap();
+        std::fs::write(root.join("input\nwith ' quotes"), "changed").unwrap();
+        let before_failure = std::fs::metadata(root.join("input\nwith ' quotes"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        let fault_script = format!(
+            "import os, sys\noriginal_scandir = os.scandir\ndef unreadable_pool(path):\n    if path == sys.argv[2]:\n        raise PermissionError('injected unreadable artifact pool')\n    return original_scandir(path)\nos.scandir = unreadable_pool\n{}",
+            TransferPipeline::clean_overlay_freshness_ledger_script()
+        );
+        let failed = std::process::Command::new("python3")
+            .args(["-c", &fault_script])
+            .arg(&root)
+            .arg(&pool)
+            .arg(&epoch)
+            .arg(&identity)
+            .output()
+            .unwrap();
+        assert!(
+            !failed.status.success(),
+            "unreadable artifacts must fail closed"
+        );
+        assert!(
+            String::from_utf8_lossy(&failed.stderr).contains("injected unreadable artifact pool")
+        );
+        assert_eq!(std::fs::read(&epoch).unwrap(), saved_epoch);
+        assert_eq!(std::fs::read(&ledger).unwrap(), saved_ledger);
+        assert_eq!(
+            std::fs::metadata(root.join("input\nwith ' quotes"))
+                .unwrap()
+                .modified()
+                .unwrap(),
+            before_failure
+        );
+        std::fs::rename(&root, retained.join("retired-first")).unwrap();
+        materialize();
+        // A valid ledger with a different commit marker models interruption
+        // between metadata publications; it must never grant timestamp reuse.
+        std::fs::write(&epoch, format!("{}\n", "b".repeat(64))).unwrap();
+        let result = run();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(
+            std::fs::metadata(root.join("input\nwith ' quotes"))
+                .unwrap()
+                .modified()
+                .unwrap()
+                > first
+        );
+        std::fs::rename(&root, retained.join("retired-second")).unwrap();
+        materialize();
+        std::fs::write(&ledger, "incomplete JSON").unwrap();
+        let result = run();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let committed_epoch = std::fs::read(&epoch).unwrap();
+        std::fs::rename(&ledger, retained.join("retained-ledger")).unwrap();
+        symlink(&outside, &ledger).unwrap();
+        let result = run();
+        assert!(
+            !result.status.success(),
+            "symlink ledger must refuse before touching source"
+        );
+        assert_eq!(std::fs::read(&epoch).unwrap(), committed_epoch);
+        assert_eq!(
+            std::fs::metadata(&outside).unwrap().modified().unwrap(),
+            outside_time
+        );
+        assert_eq!(
+            std::fs::read_to_string(&outside).unwrap(),
+            "must not be read or touched through a link"
+        );
+        eprintln!(
+            "freshness metadata fixture retained at {}",
+            retained.display()
         );
     }
 

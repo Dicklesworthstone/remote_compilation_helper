@@ -1282,6 +1282,9 @@ pub(super) async fn execute_remote_compilation(
                         &clean_overlay_freshness_identity(
                             clean_overlay.expect("root overlay has a selected closure"),
                         ),
+                        overlay_remote_root.as_deref().context(
+                            "clean-overlay freshness requires its owned retirement container",
+                        )?,
                     )
                     .await?;
             }
