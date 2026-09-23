@@ -52,6 +52,7 @@ pub mod runtime_path_scanner;
 pub mod snapshot_capture;
 pub mod source_capture;
 pub mod source_transfer;
+pub mod toolchain_dataset;
 pub mod unit_convergence;
 pub mod unit_mappings;
 pub mod upload_policy;

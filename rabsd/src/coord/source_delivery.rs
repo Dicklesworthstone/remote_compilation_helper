@@ -215,6 +215,30 @@ pub fn prepare_source_bundle(
             ));
         }
     }
+    // The local compiler installation may have a different physical path than
+    // the worker's installation. Only its verified content identity is sent.
+    let expected_toolchain = super::worker_delivery::toolchain_identity(specification)?;
+    let toolchain = specification
+        .get("toolchain_source")
+        .map(|value| {
+            let path = value
+                .as_str()
+                .filter(|path| !path.is_empty() && path.len() <= 4096)
+                .ok_or_else(|| invalid("toolchain_source must be an absolute local directory"))?;
+            let identity = rabs_sandbox::toolchain_dataset::fingerprint_toolchain(
+                Path::new(path),
+                &rabs_sandbox::toolchain_dataset::ToolchainLimits::default(),
+                || false,
+            )?;
+            require(
+                expected_toolchain
+                    .as_ref()
+                    .is_none_or(|expected| expected == &identity),
+                "local toolchain does not match the specified toolchain_identity",
+            )?;
+            Ok::<_, io::Error>(identity)
+        })
+        .transpose()?;
     let upload = inputs.capture()?;
     let mut request = specification.clone();
     let fields = request
@@ -223,6 +247,13 @@ pub fn prepare_source_bundle(
     fields.remove("source_files");
     fields.remove("source_roots");
     fields.remove("cargo_source");
+    fields.remove("toolchain_source");
+    if let Some(identity) = &toolchain {
+        fields.insert(
+            "toolchain_identity".to_owned(),
+            super::worker_delivery::toolchain_identity_value(identity),
+        );
+    }
     fields.insert("source_manifest".to_owned(), upload.wire_manifest());
     // One validator for prepared and hand-authored execution requests. This
     // preserves argv, output declarations, timeouts, and unknown extensions.
@@ -285,6 +316,7 @@ pub fn prepare_source_bundle(
         "request_sha256":hex(&Sha256::digest(&request_bytes)),
         "manifest_sha256":hex(&upload.manifest.digest()), "source_roots":inputs.root_count(),
         "source_files":upload.manifest.files().len(), "source_bytes":upload.manifest.total_bytes(),
+        "toolchain_identity":request.get("toolchain_identity"),
         "executed":false, "publication_authorized":false}),
     )
 }

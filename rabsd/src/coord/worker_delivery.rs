@@ -19,6 +19,7 @@ use rabs_sandbox::artifact_tree::{
 use rabs_sandbox::process_context::{
     COMMAND_CONTEXT_VERSION, CommandContext, MAX_COMMAND_ENV_ENTRIES,
 };
+use rabs_sandbox::toolchain_dataset::{TOOLCHAIN_DATASET_VERSION, ToolchainIdentity};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
@@ -289,6 +290,11 @@ pub fn validate_request(request: &Value) -> io::Result<()> {
         "expected canonical-exec",
     )?;
     number(request, "request_id")?;
+    require(
+        request.get("toolchain_source").is_none(),
+        "toolchain_source is local preparation input, not an execution field",
+    )?;
+    toolchain_identity(request)?;
     for field in ["program", "toolchain_backing"] {
         let value = text(request, field)?;
         require(
@@ -327,6 +333,43 @@ pub fn validate_request(request: &Value) -> io::Result<()> {
         serde_json::to_vec(request)?.len() <= MAX_FRAME_BYTES,
         "request frame too large",
     )
+}
+
+/// Parse the exact expected dataset before any worker admission or source upload.
+/// An absent identity permits unpinned execution; malformed identity is an error.
+pub fn toolchain_identity(request: &Value) -> io::Result<Option<ToolchainIdentity>> {
+    let Some(value) = request.get("toolchain_identity") else {
+        return Ok(None);
+    };
+    require(
+        value.as_object().is_some_and(|fields| fields.len() == 4),
+        "toolchain_identity requires exactly version, sha256, files and bytes",
+    )?;
+    require(
+        text(value, "version")? == TOOLCHAIN_DATASET_VERSION,
+        "unsupported toolchain_identity version",
+    )?;
+    let digest = text(value, "sha256")?;
+    require(
+        is_hex(digest, 64),
+        "toolchain_identity sha256 must be lowercase SHA-256",
+    )?;
+    let mut sha256 = [0u8; 32];
+    for (index, byte) in sha256.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&digest[index * 2..index * 2 + 2], 16)
+            .map_err(|_| invalid("invalid toolchain_identity sha256"))?;
+    }
+    Ok(Some(ToolchainIdentity {
+        sha256,
+        files: number(value, "files")?,
+        bytes: number(value, "bytes")?,
+    }))
+}
+
+pub(super) fn toolchain_identity_value(identity: &ToolchainIdentity) -> Value {
+    json!({"version":TOOLCHAIN_DATASET_VERSION,
+        "sha256":identity.sha256.iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
+        "files":identity.files,"bytes":identity.bytes})
 }
 
 #[derive(Clone)]
@@ -713,6 +756,12 @@ pub fn receive_operation(
             require(
                 supports("command_contexts", COMMAND_CONTEXT_VERSION),
                 "worker lacks required env-cwd-v1 command context capability",
+            )?;
+        }
+        if mode == DeliveryMode::Execute && request.get("toolchain_identity").is_some() {
+            require(
+                supports("toolchain_datasets", TOOLCHAIN_DATASET_VERSION),
+                "worker lacks required toolchain-dataset-v1 execution binding",
             )?;
         }
         let incarnation = text(&hello, "incarnation")?;
@@ -1726,6 +1775,108 @@ mod tests {
             assert!(failure.detail.contains("env-cwd-v1"));
             assert!(peer.sent.is_empty());
             assert_eq!(peer.replies.len(), 6);
+            assert!(!destination.exists());
+        }
+    }
+
+    #[test]
+    fn toolchain_binding_requires_worker_support_before_any_upload_or_dispatch() {
+        use super::super::source_delivery::SourcePeer;
+        let source = tempfile::tempdir().unwrap();
+        let (upload, mut request) = source_request(source.path());
+        let identity = ToolchainIdentity {
+            sha256: [0xab; 32],
+            files: 12,
+            bytes: 345,
+        };
+        request["toolchain_identity"] = toolchain_identity_value(&identity);
+        assert_eq!(toolchain_identity(&request).unwrap(), Some(identity));
+        for supported in [false, true] {
+            let parent = tempfile::tempdir().unwrap();
+            let destination = parent.path().join("delivery");
+            let mut peer = fixture(&destination);
+            source_replies(&mut peer, &request);
+            if supported {
+                peer.replies[0]["toolchain_datasets"] = json!([TOOLCHAIN_DATASET_VERSION]);
+            }
+            let result = receive_execution(
+                &mut SourcePeer::new(&mut peer, &upload, &request).unwrap(),
+                &request,
+                "worker",
+                &destination,
+            );
+            if supported {
+                let delivery = result.unwrap();
+                assert_eq!(peer.sent[4], request);
+                assert_eq!(
+                    delivery.receipt["request_sha256"],
+                    hash(&serde_json::to_vec(&request).unwrap())
+                );
+            } else {
+                let failure = result.unwrap_err();
+                assert!(!failure.execution_may_have_run);
+                assert!(failure.detail.contains(TOOLCHAIN_DATASET_VERSION));
+                assert!(peer.sent.is_empty());
+                assert!(!destination.exists());
+            }
+        }
+    }
+
+    #[test]
+    fn toolchain_binding_resume_uses_exact_request_without_requiring_execution_capability() {
+        use super::super::delivery_recovery::{DeliveryTrust, recover_existing_delivery};
+        let parent = tempfile::tempdir().unwrap();
+        let destination = parent.path().join("resumed");
+        let mut request = request();
+        request["toolchain_identity"] = toolchain_identity_value(&ToolchainIdentity {
+            sha256: [0xab; 32],
+            files: 12,
+            bytes: 345,
+        });
+        let mut peer = resumable(&destination);
+        assert!(peer.replies[0].get("toolchain_datasets").is_none());
+        receive_operation(
+            &mut peer,
+            &request,
+            "worker",
+            &destination,
+            DeliveryMode::Resume,
+        )
+        .unwrap();
+        assert_eq!(peer.sent[1], DeliveryMode::Resume.frame(&request));
+        recover_existing_delivery(&request, "worker", &destination, DeliveryTrust::Loopback)
+            .unwrap()
+            .unwrap();
+        request["toolchain_identity"]["sha256"] = json!("cd".repeat(32));
+        assert!(
+            recover_existing_delivery(&request, "worker", &destination, DeliveryTrust::Loopback)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn invalid_toolchain_identity_refuses_before_receiving_a_worker_hello() {
+        for invalid in [
+            Value::Null,
+            json!({"version":"v2","sha256":"ab".repeat(32),"files":12,"bytes":345}),
+            json!({"version":TOOLCHAIN_DATASET_VERSION,"sha256":"AB".repeat(32),"files":12,"bytes":345}),
+            json!({"version":TOOLCHAIN_DATASET_VERSION,"sha256":"ab".repeat(32),"files":12.5,"bytes":345}),
+            json!({"version":TOOLCHAIN_DATASET_VERSION,"sha256":"ab".repeat(32),"files":12}),
+            json!({"version":TOOLCHAIN_DATASET_VERSION,"sha256":"ab".repeat(32),"files":12,"bytes":345,"extra":true}),
+        ] {
+            let parent = tempfile::tempdir().unwrap();
+            let destination = parent.path().join("refused");
+            let mut request = request();
+            request["toolchain_identity"] = invalid;
+            let mut peer = fixture(&destination);
+            let reply_count = peer.replies.len();
+            assert!(
+                !receive_execution(&mut peer, &request, "worker", &destination)
+                    .unwrap_err()
+                    .execution_may_have_run
+            );
+            assert_eq!(peer.replies.len(), reply_count);
+            assert!(peer.sent.is_empty());
             assert!(!destination.exists());
         }
     }

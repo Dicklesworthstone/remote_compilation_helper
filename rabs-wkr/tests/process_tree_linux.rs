@@ -100,6 +100,7 @@ fn canonical_action_observes_only_worker_authored_jobserver_env() {
                     .to_string(),
             ],
             toolchain_backing: toolchain.path().display().to_string(),
+            toolchain_identity: None,
             workspace_backing: workspace.path().display().to_string(),
             jobserver_grant: requested_grant,
             command_context: CommandContext::default(),
@@ -180,6 +181,7 @@ fn jobserver_setup_failure_refuses_execution() {
             "echo started > /__rabs/workspace/started.txt".to_string(),
         ],
         toolchain_backing: toolchain.path().display().to_string(),
+        toolchain_identity: None,
         workspace_backing: workspace.path().display().to_string(),
         jobserver_grant: Some(2),
         command_context: CommandContext::default(),
@@ -239,6 +241,7 @@ fn main() {
         args: vec!["-eu".into(), "-c".into(),
             "/__rabs/toolchain/bin/rustc --edition=2024 src/main.rs -o /__rabs/workspace/context-check; exec /__rabs/workspace/context-check".into()],
         toolchain_backing: toolchain.to_str().unwrap().into(),
+        toolchain_identity: None,
         workspace_backing: workspace.path().to_str().unwrap().into(),
         jobserver_grant: Some(1),
         command_context: CommandContext::new("/__rabs/workspace/member", vec![
@@ -257,4 +260,313 @@ fn main() {
     assert_eq!(result.stdout_sha256, sha256_hex(b"context-ok\n"));
     assert!(workspace.path().join("context-check").is_file());
     assert_eq!(request, original, "execution does not rewrite the declared context");
+}
+
+mod toolchain_binding {
+    use super::namespace_supported;
+    use rabs_sandbox::toolchain_dataset::{
+        TOOLCHAIN_DATASET_VERSION, ToolchainIdentity, ToolchainLimits, fingerprint_toolchain,
+    };
+    use serde_json::{Value, json};
+    use std::fs;
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::{Shutdown, TcpListener, TcpStream};
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
+    use std::process::{Child, Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    const ORIGINAL: &[u8] = b"#!/bin/sh\nprintf 'toolchain-v1\\n'\n";
+    const REPLACEMENT: &[u8] = b"#!/bin/sh\nprintf 'toolchain-v2\\n'\n";
+
+    struct Worker {
+        child: Child,
+        reader: Option<BufReader<TcpStream>>,
+    }
+
+    impl Worker {
+        fn connect(root: &Path) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let mut command = Command::new(env!("CARGO_BIN_EXE_rabs-wkr"));
+            command.args([
+                "--coordinator",
+                &listener.local_addr().unwrap().to_string(),
+                "--worker-id",
+                "toolchain-binding-test",
+                "--once",
+            ]);
+            for name in [
+                "RABS_WORKER_TLS_CA",
+                "RABS_WORKER_TLS_CERT",
+                "RABS_WORKER_TLS_KEY",
+                "RABS_WORKER_TLS_SERVER_NAME",
+            ] {
+                command.env_remove(name);
+            }
+            let child = command
+                .env("RABS_WORKER_STATE_DIR", root.join("worker-state"))
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .expect("start the production worker");
+            // Install cleanup ownership before any fallible handshake work.
+            let mut worker = Self {
+                child,
+                reader: None,
+            };
+            let deadline = Instant::now() + Duration::from_secs(20);
+            let stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            worker.child.try_wait().unwrap().is_none(),
+                            "worker exited before handshake"
+                        );
+                        assert!(Instant::now() < deadline, "worker connection deadline");
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("accept production worker: {error}"),
+                }
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(30)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            worker.reader = Some(BufReader::new(stream));
+            let hello = worker.receive();
+            assert_eq!(hello["kind"], "worker-hello", "{hello}");
+            assert_eq!(hello["canonical"], true, "{hello}");
+            assert_eq!(
+                hello["toolchain_datasets"],
+                json!([TOOLCHAIN_DATASET_VERSION])
+            );
+            worker.send(&json!({"kind": "session-ok"}));
+            worker
+        }
+
+        fn send(&mut self, frame: &Value) {
+            writeln!(self.reader.as_mut().unwrap().get_mut(), "{frame}").unwrap();
+        }
+
+        fn receive(&mut self) -> Value {
+            let mut line = String::new();
+            assert_ne!(
+                self.reader.as_mut().unwrap().read_line(&mut line).unwrap(),
+                0,
+                "worker closed before its result"
+            );
+            serde_json::from_str(&line).expect("worker JSON frame")
+        }
+
+        fn wait_for_marker(&mut self, marker: &Path) {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while !marker.is_file() {
+                if let Some(status) = self.child.try_wait().unwrap() {
+                    panic!(
+                        "worker exited before toolchain observation: {status}; {}",
+                        self.receive()
+                    );
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "action did not reach its toolchain observation barrier"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        fn finish(&mut self) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                if let Some(status) = self.child.try_wait().unwrap() {
+                    assert!(status.success(), "worker exit: {status}");
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "one-shot worker did not exit after result"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+
+    impl Drop for Worker {
+        fn drop(&mut self) {
+            if let Some(reader) = &mut self.reader {
+                let _ = reader.get_mut().shutdown(Shutdown::Both);
+            }
+            // EOF gives the execution owner an opportunity to cancel and reap
+            // its group even when the test panics before releasing the barrier.
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while self.child.try_wait().ok().flatten().is_none() {
+                if Instant::now() >= deadline {
+                    let _ = self.child.kill();
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let _ = self.child.wait();
+        }
+    }
+
+    fn toolchain(root: &Path) -> ToolchainIdentity {
+        fs::create_dir_all(root.join("bin")).unwrap();
+        fs::write(root.join("bin/probe"), ORIGINAL).unwrap();
+        fs::set_permissions(root.join("bin/probe"), fs::Permissions::from_mode(0o755)).unwrap();
+        fingerprint_toolchain(root, &ToolchainLimits::default(), || false).unwrap()
+    }
+
+    fn identity_value(identity: &ToolchainIdentity) -> Value {
+        let sha256: String = identity
+            .sha256
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        json!({"version": TOOLCHAIN_DATASET_VERSION, "sha256": sha256,
+            "files": identity.files, "bytes": identity.bytes})
+    }
+
+    fn request(toolchain: &Path, workspace: &Path, script: &str) -> Value {
+        json!({"kind": "canonical-exec", "request_id": 1, "timeout_ms": 30_000,
+            "program": "sh", "args": ["-eu", "-c", script], "jobserver_grant": 1,
+            "toolchain_backing": toolchain, "workspace_backing": workspace})
+    }
+
+    #[test]
+    fn production_worker_retains_toolchain_bytes_with_and_without_expected_identity() {
+        if !namespace_supported() {
+            return;
+        }
+        for pinned in [false, true] {
+            let owner = tempfile::tempdir().unwrap();
+            let source = owner.path().join("mutable-toolchain");
+            let workspace = owner.path().join("workspace");
+            fs::create_dir(&workspace).unwrap();
+            let expected = toolchain(&source);
+            let mut frame = request(
+                &source,
+                &workspace,
+                "printf ready > /__rabs/workspace/ready; \
+                 attempts=0; while [ ! -f /__rabs/workspace/continue ]; do \
+                 attempts=$((attempts + 1)); [ \"$attempts\" -lt 1000 ] || exit 72; sleep 0.01; done; \
+                 exec /__rabs/toolchain/bin/probe",
+            );
+            if pinned {
+                frame["toolchain_identity"] = identity_value(&expected);
+            }
+            let mut worker = Worker::connect(owner.path());
+            worker.send(&frame);
+            // The actual namespaced action reaches this barrier only AFTER
+            // toolchain admission/copy, but has not yet opened the compiler.
+            worker.wait_for_marker(&workspace.join("ready"));
+            let before_mode = fs::metadata(source.join("bin/probe"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(ORIGINAL.len(), REPLACEMENT.len());
+            fs::write(source.join("bin/probe"), REPLACEMENT).unwrap();
+            assert_eq!(
+                fs::metadata(source.join("bin/probe"))
+                    .unwrap()
+                    .permissions()
+                    .mode(),
+                before_mode
+            );
+            assert_ne!(
+                fingerprint_toolchain(&source, &ToolchainLimits::default(), || false).unwrap(),
+                expected
+            );
+            fs::write(workspace.join("continue"), b"run retained compiler").unwrap();
+            let result = worker.receive();
+            assert_eq!(result["kind"], "exec-result", "pinned={pinned}: {result}");
+            assert_eq!(result["request_id"], 1);
+            assert_eq!(result["executed"], true, "{result}");
+            assert_eq!(result["exit_code"], 0, "{result}");
+            assert_eq!(result["residual_group_members"], 0, "{result}");
+            assert_eq!(
+                result["stdout_sha256"],
+                rabs_wkr::session::sha256_hex(b"toolchain-v1\n"),
+                "the production worker must execute retained bytes, pinned={pinned}"
+            );
+            assert_eq!(fs::read(source.join("bin/probe")).unwrap(), REPLACEMENT);
+            worker.finish();
+        }
+    }
+
+    #[test]
+    fn production_worker_rejects_changed_toolchain_content_or_mode_before_spawn() {
+        if !namespace_supported() {
+            return;
+        }
+        for change in [
+            "equal-size-content",
+            "executable-mode",
+            "declared-files",
+            "declared-bytes",
+        ] {
+            let owner = tempfile::tempdir().unwrap();
+            let source = owner.path().join("mutable-toolchain");
+            let workspace = owner.path().join("workspace");
+            fs::create_dir(&workspace).unwrap();
+            let expected = toolchain(&source);
+            let mut frame = request(
+                &source,
+                &workspace,
+                "printf launched > /__rabs/workspace/launched; exec /__rabs/toolchain/bin/probe",
+            );
+            frame["toolchain_identity"] = identity_value(&expected);
+            match change {
+                "equal-size-content" => {
+                    assert_eq!(ORIGINAL.len(), REPLACEMENT.len());
+                    fs::write(source.join("bin/probe"), REPLACEMENT).unwrap();
+                    assert_eq!(
+                        fs::metadata(source.join("bin/probe"))
+                            .unwrap()
+                            .permissions()
+                            .mode()
+                            & 0o777,
+                        0o755
+                    );
+                }
+                "executable-mode" => {
+                    fs::set_permissions(source.join("bin/probe"), fs::Permissions::from_mode(0o644))
+                        .unwrap()
+                }
+                "declared-files" => {
+                    frame["toolchain_identity"]["files"] = json!(expected.files + 1)
+                }
+                "declared-bytes" => {
+                    frame["toolchain_identity"]["bytes"] = json!(expected.bytes + 1)
+                }
+                _ => unreachable!(),
+            }
+            let mut worker = Worker::connect(owner.path());
+            worker.send(&frame);
+            let result = worker.receive();
+            assert_eq!(result["kind"], "error", "{change}: {result}");
+            assert_eq!(result["request_id"], 1);
+            assert_eq!(
+                result["stage"], "execution-completion",
+                "{change}: {result}"
+            );
+            assert!(
+                result["reason"]
+                    .as_str()
+                    .unwrap()
+                    .contains("toolchain identity does not match expected dataset"),
+                "{change}: {result}"
+            );
+            assert!(
+                !workspace.join("launched").exists(),
+                "{change}: rejected toolchain still launched a process"
+            );
+            worker.finish();
+        }
+    }
 }

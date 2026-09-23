@@ -180,6 +180,7 @@ impl SourcePreparation {
         fields.remove("source_files");
         fields.remove("source_roots");
         fields.remove("cargo_source");
+        fields.remove("toolchain_source");
         fields.insert(
             "source_manifest".to_owned(),
             manifest_value(&probe_manifest),

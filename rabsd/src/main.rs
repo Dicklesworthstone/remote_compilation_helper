@@ -291,6 +291,7 @@ fn main() {
                  spec.json uses canonical-exec fields plus source_files, source_roots or cargo_source,\n\
                  instead of source_manifest or workspace_backing. Preparation does not build.\n\
                  cargo_source: {manifest: \"app/Cargo.toml\"} discovers a locked offline local Cargo graph.\n\
+                 Optional toolchain_source: \"/absolute/local/toolchain\" binds the worker to those toolchain bytes.\n\
                  Preparation saves request.json and source/; only selected regular files are copied.\n\
                  Execute with --source-root <bundle>/source and <bundle>/request.json, not the old checkout.\n\
                  OPERATOR: rabsd --worker-exec-loopback <127.0.0.1:port> <worker> <request.json> <new-absolute-directory>\n\

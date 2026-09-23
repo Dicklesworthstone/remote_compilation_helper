@@ -230,6 +230,55 @@ but never reupload registry inputs or recreate an execution Cargo home. This is
 explicit input delivery, not proof of package provenance, complete dependency
 resolution, immutable action inputs, or permission to skip compilation.
 
+### Bind execution to captured toolchain bytes
+
+Every native worker execution copies its selected `toolchain_backing` into a
+fresh private dataset and mounts that copy at `/__rabs/toolchain`. Replacing or
+editing the original worker installation after capture cannot change the bytes
+the running command sees. The owner remains alive through process cleanup and
+diagnostic capture; verification before launch and after cleanup rejects changes
+to the retained backing before successful artifacts can be offered.
+
+To select the expected toolchain during source preparation, add the local
+installation path to the specification:
+
+```json
+"toolchain_source": "/absolute/local/rust-toolchain"
+```
+
+`--worker-prepare` fingerprints that entire local tree, removes `toolchain_source`
+from the executable request, and saves a `toolchain_identity` object containing
+`version: "toolchain-dataset-v1"`, a lowercase SHA-256 digest, and unsigned `files`
+and `bytes` counts. The worker's `toolchain_backing` can have a different physical
+path; its captured contents must match. If a specification also supplies an
+identity, preparation checks it against the local tree instead of replacing it.
+Preparation reads the toolchain without running its binaries.
+
+The identity covers relative paths, directory layout including empty directories,
+regular-file bytes, executable bits, and exact contained relative symlink targets.
+Hard links become independent copies. Absolute, dangling, escaping or cyclic
+symlinks, special files, nested mounts, incoherent reads and limit violations
+refuse. The Linux implementation uses descriptor-relative `openat2` traversal.
+Defaults allow 8 GiB, 100,000 entries and 64 levels of depth. There are no implicit
+exclusions for documentation or other toolchain files: select a complete approved
+runtime tree when a full installation is unnecessarily large. Capture and repeated
+verification read the full selected tree and require a private copy's disk space
+for each execution; dataset reuse is not implemented yet.
+
+For pinned requests, the receiver requires the worker's explicit
+`toolchain-dataset-v1` capability before sending source bytes or execution.
+A missing capability refuses; a content mismatch on the worker refuses before
+compiler spawn. An omitted identity permits an unpinned execution using the same
+private capture. Malformed identities never fall back to that mode. Result resume
+uses the original request fingerprint and does not recapture a toolchain or
+require the restarted worker to retain execution capability.
+
+This binds the selected tree's bytes. It does not identify host `/usr`, linker,
+dynamic-loader configuration or other runtime inputs outside that tree, and does
+not authorize cache publication or compiler skipping. Private ownership and a
+read-only sandbox mount remain required: file modes and before/after verification
+do not protect against a hostile process with the worker owner's credentials.
+
 ### Build a prepared bundle and install its outputs
 
 `--worker-build-tls` joins source upload, authenticated execution, durable byte

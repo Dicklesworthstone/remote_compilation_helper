@@ -652,6 +652,7 @@ fn worker_hello(report: &rabs_wkr::session::CapabilityReport, journal: &WorkerJo
         "output_transfers": [OUTPUT_TRANSFER], "artifact_transfers": [ARTIFACT_TRANSFER],
         "source_transfers": [SOURCE_TRANSFER],
         "command_contexts": [rabs_sandbox::process_context::COMMAND_CONTEXT_VERSION],
+        "toolchain_datasets": [rabs_sandbox::toolchain_dataset::TOOLCHAIN_DATASET_VERSION],
         "recovery_protocols": [RECOVERY_PROTOCOL],
         "result_retentions": [RESULT_RETENTION],
         "boot_generation": journal.boot_generation().0,
@@ -833,6 +834,11 @@ fn parse_timeout(value: &serde_json::Value) -> Result<Duration, String> {
 }
 
 fn parse_exec_request(value: &serde_json::Value) -> Result<CanonicalExecRequest, String> {
+    if value.get("toolchain_source").is_some() {
+        return Err(
+            "toolchain_source is local preparation input, not an execution field".to_owned(),
+        );
+    }
     let text = |name: &str| -> Result<String, String> {
         value.get(name).and_then(serde_json::Value::as_str).filter(|text| !text.is_empty() && !text.contains('\0'))
             .map(str::to_owned).ok_or_else(|| format!("exec request missing or invalid {name}"))
@@ -857,6 +863,7 @@ fn parse_exec_request(value: &serde_json::Value) -> Result<CanonicalExecRequest,
     Ok(CanonicalExecRequest {
         request_id: value.get("request_id").and_then(serde_json::Value::as_u64).ok_or("exec request missing request_id")?,
         program: text("program")?, args, toolchain_backing: text("toolchain_backing")?,
+        toolchain_identity: rabs_wkr::session::parse_toolchain_identity(value)?,
         workspace_backing, jobserver_grant,
         command_context: parse_command_context(value)?,
     })
@@ -1084,7 +1091,17 @@ mod tests {
             "jobserver_auth_fd": 7, "--jobserver-auth": "fifo:/tmp/x", "inherited_fds": [3,4,5],
             "descriptor_socket": "/tmp/ancillary.sock"
         });
-        let CanonicalExecRequest { request_id, program, args, toolchain_backing, workspace_backing, jobserver_grant, command_context } = parse_exec_request(&frame).expect("parses");
+        let CanonicalExecRequest {
+            request_id,
+            program,
+            args,
+            toolchain_backing,
+            toolchain_identity,
+            workspace_backing,
+            jobserver_grant,
+            command_context,
+        } = parse_exec_request(&frame).expect("parses");
+        assert_eq!(toolchain_identity, None);
         assert_eq!(request_id, 1); assert_eq!(program, "true"); assert!(args.is_empty());
         assert_eq!(toolchain_backing, "/tc"); assert_eq!(workspace_backing, "/ws"); assert_eq!(jobserver_grant, None);
         assert_eq!(command_context, rabs_sandbox::process_context::CommandContext::default());

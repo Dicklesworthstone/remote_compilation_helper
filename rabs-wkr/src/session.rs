@@ -12,6 +12,7 @@ use crate::execution::{DEFAULT_EXECUTION_TIMEOUT, ExecutionControl};
 use crate::output::CapturedOutputs;
 use crate::source_transfer::SourceOwner;
 use rabs_sandbox::process_context::{CommandContext, COMMAND_CONTEXT_VERSION, MAX_COMMAND_ENV_ENTRIES};
+use rabs_sandbox::toolchain_dataset::{ToolchainIdentity, TOOLCHAIN_DATASET_VERSION};
 
 /// What this worker can do (advertised at handshake; the scheduler
 /// gates placement on it). Derived from a real HostIsolationSupport
@@ -51,8 +52,12 @@ pub struct CanonicalExecRequest {
     /// Explicit, validated environment additions and canonical working directory.
     /// Absence on the wire uses the canonical workspace and pinned base only.
     pub command_context: CommandContext,
-    /// Toolchain backing directory (mounts at `/__rabs/toolchain`).
+    /// Worker-local source of the toolchain dataset. Execution captures its
+    /// bytes into private backing before mounting `/__rabs/toolchain`.
     pub toolchain_backing: String,
+    /// Expected content identity, when the coordinator has pinned a toolchain.
+    /// This is execution input binding, never action-cache authorization.
+    pub toolchain_identity: Option<ToolchainIdentity>,
     /// Workspace backing directory (mounts at `/__rabs/workspace`).
     pub workspace_backing: String,
     /// Execution resource grant for this attempt (bead I004): the
@@ -61,6 +66,51 @@ pub struct CanonicalExecRequest {
     /// It cannot exceed the worker's own slot count; zero floors to
     /// one. `None` uses the worker's slot count.
     pub jobserver_grant: Option<u32>,
+}
+
+/// Decode the optional content identity before durable execution admission.
+/// Missing identity permits an explicitly unpinned execution, but a malformed
+/// or unknown identity never silently becomes an unpinned execution.
+pub fn parse_toolchain_identity(
+    request: &serde_json::Value,
+) -> Result<Option<ToolchainIdentity>, String> {
+    let Some(value) = request.get("toolchain_identity") else {
+        return Ok(None);
+    };
+    let fields = value
+        .as_object()
+        .filter(|fields| fields.len() == 4)
+        .ok_or("toolchain_identity requires exactly version, sha256, files and bytes")?;
+    if fields.get("version").and_then(serde_json::Value::as_str) != Some(TOOLCHAIN_DATASET_VERSION)
+    {
+        return Err("unsupported toolchain_identity version".to_owned());
+    }
+    let digest = fields
+        .get("sha256")
+        .and_then(serde_json::Value::as_str)
+        .filter(|digest| {
+            digest.len() == 64
+                && digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+        .ok_or("toolchain_identity sha256 must be lowercase SHA-256")?;
+    let mut sha256 = [0u8; 32];
+    for (index, byte) in sha256.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&digest[index * 2..index * 2 + 2], 16)
+            .map_err(|_| "invalid toolchain_identity sha256")?;
+    }
+    let number = |name| {
+        fields
+            .get(name)
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| format!("toolchain_identity {name} must be an unsigned integer"))
+    };
+    Ok(Some(ToolchainIdentity {
+        sha256,
+        files: number("files")?,
+        bytes: number("bytes")?,
+    }))
 }
 
 /// Decode the optional versioned execution context without reading the host
@@ -291,8 +341,41 @@ fn execute_canonical_inner(
     let support = HostIsolationSupport::probe();
     if !support.missing_for_canonical().is_empty() { return exec_error(request.request_id); }
 
+    // A read-only bind of the original pathname still observes concurrent host
+    // writes. The private owner supplies independent bytes and is retained until
+    // every process and diagnostic drain resolves. Never mount the input path.
+    let mut staging_builder = tempfile::Builder::new();
+    staging_builder.prefix("rabs-toolchain-");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        staging_builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    let toolchain_staging = match staging_builder.tempdir() {
+        Ok(staging) => staging,
+        Err(error) => {
+            let _ = control.retain_outputs(Err(format!("toolchain staging: {error}")));
+            return exec_error(request.request_id);
+        }
+    };
+    let toolchain = match rabs_sandbox::toolchain_dataset::capture_toolchain(
+        std::path::Path::new(&request.toolchain_backing),
+        &toolchain_staging.path().join("dataset"),
+        request.toolchain_identity.as_ref(),
+        &rabs_sandbox::toolchain_dataset::ToolchainLimits::default(),
+        || control.reason().is_some(),
+    ) {
+        Ok(toolchain) => toolchain,
+        Err(error) => {
+            let _ = control.retain_outputs(Err(format!("toolchain capture: {error}")));
+            return exec_error(request.request_id);
+        }
+    };
     let mut plan = CanonicalMountPlan::new(
-        &request.toolchain_backing, &request.workspace_backing, cargo_home_backing, home_backing,
+        toolchain.root(),
+        &request.workspace_backing,
+        cargo_home_backing,
+        home_backing,
     );
     // The peer supplies only a declaration; this execution owns fresh physical
     // backing. Use D005's existing mount builder and keep the owner alive until
@@ -337,6 +420,12 @@ fn execute_canonical_inner(
     command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
     let attribution = Attribution { attempt: Some(request.request_id.to_string()), ..Attribution::default() };
     if control.reason().is_some() { return exec_error(request.request_id); }
+    if let Err(error) = toolchain.verify(|| control.reason().is_some()) {
+        let _ = control.retain_outputs(Err(format!(
+            "toolchain pre-execution verification: {error}"
+        )));
+        return exec_error(request.request_id);
+    }
     let Ok(group) = ManagedProcessGroup::spawn_command(command, attribution) else {
         return exec_error(request.request_id);
     };
@@ -346,6 +435,19 @@ fn execute_canonical_inner(
     };
     let outcome = match group.wait_with_bounded_drain_controlled(&limits, || control.reason().is_some()) {
         Ok(output) => {
+            // A same-credential host mutation is outside namespace isolation.
+            // Detect retained backing changes before offering successful output;
+            // read-only file modes alone are not a cryptographic seal.
+            // Interrupted execution cannot offer successful artifacts, but its
+            // diagnostics must still drain and be delivered. Do not turn an
+            // intentional stop during this verification into lost output.
+            if control.reason().is_none()
+                && let Err(error) = toolchain.verify(|| control.reason().is_some())
+                && control.reason().is_none()
+            {
+                let _ = control.retain_outputs(Err(format!("toolchain post-execution verification: {error}")));
+                return exec_error(request.request_id);
+            }
             // Cleanup precedes both diagnostic and artifact capture. The outer
             // control frontier still overrides interrupted zero exits.
             #[cfg(unix)]
@@ -464,12 +566,42 @@ mod tests {
         assert_eq!(sha256_hex(b""), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
     }
 
+    #[test]
+    fn toolchain_identity_decode_is_exact_and_never_defaults_malformed_input() {
+        use serde_json::json;
+        assert_eq!(parse_toolchain_identity(&json!({})).unwrap(), None);
+        let valid = json!({"version":TOOLCHAIN_DATASET_VERSION,
+            "sha256":"ab".repeat(32), "files":12, "bytes":345});
+        let request = json!({"toolchain_identity":valid});
+        assert_eq!(
+            parse_toolchain_identity(&request).unwrap(),
+            Some(ToolchainIdentity {
+                sha256: [0xab; 32],
+                files: 12,
+                bytes: 345,
+            })
+        );
+        for invalid in [
+            serde_json::Value::Null,
+            json!("ab".repeat(32)),
+            json!({"version":"v2","sha256":"ab".repeat(32),"files":12,"bytes":345}),
+            json!({"version":TOOLCHAIN_DATASET_VERSION,"sha256":"AB".repeat(32),"files":12,"bytes":345}),
+            json!({"version":TOOLCHAIN_DATASET_VERSION,"sha256":"é".repeat(32),"files":12,"bytes":345}),
+            json!({"version":TOOLCHAIN_DATASET_VERSION,"sha256":"ab".repeat(32),"files":-1,"bytes":345}),
+            json!({"version":TOOLCHAIN_DATASET_VERSION,"sha256":"ab".repeat(32),"files":12}),
+            json!({"version":TOOLCHAIN_DATASET_VERSION,"sha256":"ab".repeat(32),"files":12,"bytes":345,"extra":true}),
+        ] {
+            assert!(parse_toolchain_identity(&json!({"toolchain_identity":invalid})).is_err());
+        }
+    }
+
     #[cfg(not(target_os = "linux"))]
     #[test]
     fn non_canonical_host_returns_typed_non_result_not_fake_success() {
         let dir = tempfile::tempdir().expect("tempdir");
         let request = CanonicalExecRequest {
             request_id: 1, program: "true".into(), args: vec![], toolchain_backing: "/tc".into(),
+            toolchain_identity: None,
             workspace_backing: "/ws".into(), jobserver_grant: None,
             command_context: CommandContext::default(),
         };
@@ -483,6 +615,7 @@ mod tests {
         let request = CanonicalExecRequest {
             request_id: 99, program: "true".into(), args: vec![],
             toolchain_backing: dir.path().join("absent-toolchain").display().to_string(),
+            toolchain_identity: None,
             workspace_backing: dir.path().join("absent-workspace").display().to_string(),
             jobserver_grant: Some(2),
             command_context: CommandContext::default(),
