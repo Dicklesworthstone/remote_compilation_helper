@@ -6,7 +6,11 @@
 //! Nothing is installed into a Cargo target directory. A new private directory
 //! receives all bytes; delivery.json is finalized only after complete verification
 //! and filesystem sync. ACK loss after that frontier must never trigger execution
-//! again. Failed directories are retained for inspection, never reused or deleted.
+//! again. Failed directories are retained, never repaired in place or deleted.
+//! Explicit resume may copy local prefixes, but verifies the complete new files.
+
+mod reuse;
+pub use reuse::{ResumePeer, ResumeSource};
 
 use rabs_sandbox::artifact_tree::{
     MAX_TREE_ENTRIES, MAX_TREE_FILES, MAX_TREE_MANIFEST_BYTES, TREE_FILES_VERSION,
@@ -79,6 +83,12 @@ pub trait WorkerPeer {
     /// Only the trusted adapter may supply authenticated provenance. A worker
     /// cannot upgrade the receipt by adding fields to its hello or result.
     fn authentication(&self) -> Option<WorkerAuthentication> {
+        None
+    }
+
+    /// Explicit LOCAL byte hints, never supplied by worker JSON. These are
+    /// accepted only for result resume and still require complete-file hashing.
+    fn resume_source(&self) -> Option<&ResumeSource> {
         None
     }
 }
@@ -516,8 +526,16 @@ fn download(
     let artifact = manifest_hash.is_some();
     let mut file = create_file(path)?;
     let mut hasher = Sha256::new();
-    let mut offset = 0_u64;
-    loop {
+    let mut offset = match peer.resume_source() {
+        Some(source) => source.copy_prefix(
+            if artifact { "artifacts" } else { "diagnostics" },
+            &item.name, item.len, &mut file, &mut hasher,
+        )?,
+        None => 0,
+    };
+    // Empty files retain the ordinary zero-length range check. A complete
+    // nonempty prefix skips range I/O, never the complete-file hash below.
+    while offset < item.len || item.len == 0 {
         let mut request = json!({"kind":if artifact {"artifact-read"} else {"output-read"},
             "request_id":id,"offset":offset,"max_bytes":CHUNK_BYTES});
         request[if artifact { "name" } else { "stream" }] = json!(item.name);
@@ -633,9 +651,10 @@ pub fn receive_execution(
 
 /// Receive one explicitly selected operation through the same byte verifier.
 /// Resume sends only result-resume, never canonical-exec or a fallback request.
-/// Its destination must be NEW: prior partial files are never trusted or mixed
-/// with a new result. The original command may already have run even if resume
-/// fails before contacting a worker, so uncertainty remains true in that mode.
+/// Its destination must be NEW. ResumePeer may supply untrusted local prefixes;
+/// complete hashes from the current retained result still verify every byte.
+/// The original command may already have run even if resume fails before
+/// contacting a worker, so uncertainty remains true in that mode.
 pub fn receive_operation(
     peer: &mut impl WorkerPeer,
     request: &Value,
@@ -646,6 +665,10 @@ pub fn receive_operation(
     let mut execution_may_have_run = mode == DeliveryMode::Resume;
     let outcome = (|| -> io::Result<Delivery> {
         validate_request(request)?;
+        if let Some(source) = peer.resume_source() {
+            require(mode == DeliveryMode::Resume, "local prefixes require explicit result resume")?;
+            source.validate_destination(destination)?;
+        }
         let dispatch = mode.frame(request);
         require(
             serde_json::to_vec(&dispatch)?.len() <= MAX_FRAME_BYTES,
