@@ -35,6 +35,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 mod admission;
+mod interrupt;
 pub use admission::PinnedWorkerAdmission;
 use admission::AdmittedWorkerSession;
 
@@ -657,7 +658,8 @@ pub fn receive_authenticated_operation(
     // have both dropped. No caller can clone the consumed admission capability.
     let admission = Arc::new(admission);
     let expected_worker = admission.worker().to_owned();
-    let raw = RecordPeer::new(runtime, peer.stream, request);
+    let raw = interrupt::OperatorPeer::new(RecordPeer::new(runtime, peer.stream, request))
+        .map_err(&failure)?;
     let mut admitted = AdmittedPeer::new(
         raw,
         peer.identity,
@@ -689,7 +691,8 @@ pub fn acknowledge_authenticated(
         return Err(failure(invalid("authenticated acknowledgment requires an operator thread")));
     }
     let admission = Arc::new(admission);
-    let raw = RecordPeer::new(runtime, peer.stream, pending.request());
+    let raw = interrupt::OperatorPeer::new(RecordPeer::new(runtime, peer.stream, pending.request()))
+        .map_err(&failure)?;
     let mut admitted = AdmittedPeer::new(
         raw, peer.identity, admission.pin(), pending.request(),
         challenge_ids().map_err(&failure)?, DeliveryMode::Resume,
@@ -723,7 +726,8 @@ pub fn receive_authenticated_source(
     upload.validate_request(request).map_err(&failure)?;
     let admission = Arc::new(admission);
     let expected_worker = admission.worker().to_owned();
-    let raw = RecordPeer::new(runtime, peer.stream, request);
+    let raw = interrupt::OperatorPeer::new(RecordPeer::new(runtime, peer.stream, request))
+        .map_err(&failure)?;
     let mut admitted = AdmittedPeer::new(
         raw,
         peer.identity,
