@@ -367,15 +367,32 @@ impl ManagedProcessGroup {
     /// On failure the process is stopped, residuals are closed, both lanes are
     /// joined, and an error is returned even if a TERM handler exits with zero.
     pub fn wait_with_bounded_drain_budget(
+        self,
+        limits: &crate::stream_drain::DrainLimits,
+        maximum: u64,
+        stop_requested: impl FnMut() -> bool,
+    ) -> io::Result<crate::stream_drain::DrainedOutput> {
+        self.wait_with_bounded_drain_preview(limits, maximum, None, stop_requested)
+    }
+
+    /// The same supervised capture with an optional bounded live observer.
+    /// Preview consumers cannot block either drain. Gaps are explicit, and a
+    /// preview is never a complete transcript, durable output or process result.
+    /// Cancellation, quota failures, final capture and cleanup are unchanged.
+    pub fn wait_with_bounded_drain_preview(
         mut self,
         limits: &crate::stream_drain::DrainLimits,
         maximum: u64,
+        preview: Option<std::sync::Arc<crate::stream_drain::preview::LiveOutputPreview>>,
         mut stop_requested: impl FnMut() -> bool,
     ) -> io::Result<crate::stream_drain::DrainedOutput> {
         use crate::stream_drain::MonitoredLanes;
         use std::time::{Duration, Instant};
 
-        let lanes = MonitoredLanes::spawn(&mut self.leader, limits, maximum);
+        let lanes = match preview {
+            Some(preview) => MonitoredLanes::spawn_preview(&mut self.leader, limits, maximum, preview),
+            None => MonitoredLanes::spawn(&mut self.leader, limits, maximum),
+        };
         let mut stopping_at = None;
         let mut killed = false;
         let status = loop {

@@ -42,6 +42,9 @@
 //! input volume (one fixed 64 KiB read buffer plus the bounded resident
 //! vector per lane).
 
+pub mod preview;
+
+use preview::{LiveOutputPreview, PreviewStream};
 use std::fs::File;
 use std::io::{self, BufWriter, Read, Write};
 use std::path::PathBuf;
@@ -114,6 +117,7 @@ struct DrainState {
     remaining: AtomicU64,
     failed: AtomicBool,
     failure: Mutex<Option<DrainFailure>>,
+    preview: Option<Arc<LiveOutputPreview>>,
 }
 
 /// Shared by exactly one pair of lanes. Reservations happen BEFORE retention,
@@ -123,11 +127,16 @@ struct DrainControl(Arc<DrainState>);
 
 impl DrainControl {
     fn new(maximum: u64) -> Self {
+        Self::with_preview(maximum, None)
+    }
+
+    fn with_preview(maximum: u64, preview: Option<Arc<LiveOutputPreview>>) -> Self {
         Self(Arc::new(DrainState {
             maximum,
             remaining: AtomicU64::new(maximum),
             failed: AtomicBool::new(false),
             failure: Mutex::new(None),
+            preview,
         }))
     }
 
@@ -331,6 +340,19 @@ fn drain_lane_inner<R: Read>(
             writer.write_all(overflow)?;
             spilled_bytes += u64::try_from(overflow.len()).unwrap_or(u64::MAX);
         }
+        // Observation follows successful retention and never controls capture.
+        // The tail uses try_lock: even a stalled observer cannot backpressure a
+        // pipe. Buffered spill bytes are not promised durable by a preview.
+        if let Some(preview) = control.and_then(|control| control.0.preview.as_ref()) {
+            let stream = match spill_name {
+                "stdout.spill" => Some(PreviewStream::Stdout),
+                "stderr.spill" => Some(PreviewStream::Stderr),
+                _ => None,
+            };
+            if let Some(stream) = stream {
+                preview.record(stream, total - n as u64, &chunk[..n]);
+            }
+        }
     }
 
     let spill = match spill_writer {
@@ -399,13 +421,35 @@ impl MonitoredLanes {
         })
     }
 
+    pub(crate) fn spawn_preview(
+        child: &mut Child, limits: &DrainLimits, maximum: u64,
+        preview: Arc<LiveOutputPreview>,
+    ) -> Self {
+        Self::spawn_with_preview(child, limits, maximum, Some(preview), |name, job| {
+            std::thread::Builder::new().name(format!("rabs-g007-{name}")).spawn(job)
+        })
+    }
+
     fn spawn_with(
         child: &mut Child,
         limits: &DrainLimits,
         maximum: u64,
+        spawn: impl FnMut(&'static str, LaneJob) -> io::Result<LaneHandle>,
+    ) -> Self {
+        Self::spawn_with_preview(child, limits, maximum, None, spawn)
+    }
+
+    fn spawn_with_preview(
+        child: &mut Child,
+        limits: &DrainLimits,
+        maximum: u64,
+        preview: Option<Arc<LiveOutputPreview>>,
         mut spawn: impl FnMut(&'static str, LaneJob) -> io::Result<LaneHandle>,
     ) -> Self {
-        let control = DrainControl::new(maximum);
+        let control = match preview {
+            Some(preview) => DrainControl::with_preview(maximum, Some(preview)),
+            None => DrainControl::new(maximum),
+        };
         let mut start = |reader: Box<dyn Read + Send>, name| {
             let lane_control = control.clone();
             let limits = limits.clone();
