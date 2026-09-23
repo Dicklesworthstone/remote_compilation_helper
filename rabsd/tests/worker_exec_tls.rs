@@ -1575,6 +1575,40 @@ fn actual_prepared_build_uploads_installs_and_replays_offline_after_ack_loss() {
     assert_eq!(local_bytes_and_inodes(&delivery), before);
     drop(offline);
 
+    // A successful installed build with a lost release response still owns
+    // worker retention. Explicit resume into a NEW delivery must reconcile it
+    // without executing again or replacing the already installed output.
+    let resumed_delivery = root.join("release-reconciled-delivery");
+    let mut resumed = Receiver::spawn_build(
+        &root, &pin, Some(&certificates.server), &bundle, &resumed_delivery, &outputs, true,
+    );
+    let address = resumed.listening();
+    runtime.block_on(async {
+        asupersync::time::timeout(
+            asupersync::time::wall_now(), Duration::from_secs(15), async {
+                let mut peer = connect_peer(&address, "localhost", &certificates.worker)
+                    .await.unwrap();
+                let (session, grant) =
+                    authenticate_grant(&mut peer.stream, &pin, &recovery_hello(&pin)).await;
+                assert_eq!(grant["result_retention"], "durable-result-v1");
+                assert!(grant.get("source_transfer").is_none());
+                assert_eq!(receive(&mut peer.stream).await.unwrap(),
+                    json!({"kind":"result-resume", "request_id":7, "request":request}));
+                assert_eq!(fs::read(outputs.join("a")).unwrap(), ARTIFACT);
+                deliver_mode(&mut peer.stream, &resumed_delivery, &pin, session, false, true, false).await;
+            },
+        ).await.expect("prepared build release reconciliation timed out");
+    });
+    assert!(resumed.wait().success(), "{}", resumed.logs());
+    let reconciled: Value = serde_json::from_slice(&fs::read(&resumed.stdout).unwrap()).unwrap();
+    assert_eq!(reconciled["delivery"]["acknowledgments_confirmed"], true);
+    assert_eq!(reconciled["delivery"]["receipt"]["resumed"], true);
+    assert_eq!(reconciled["installed_outputs"]["reused"], true);
+    assert_eq!(fs::metadata(outputs.join("a")).unwrap().ino(), inode);
+    assert_eq!(local_bytes_and_inodes(&delivery), before);
+    assert!(!bundle.join("source").exists());
+    drop(resumed);
+
     // A matching receipt never licenses silently repairing changed user output.
     fs::write(outputs.join("a"), b"user").unwrap();
     let mut changed = Receiver::spawn_build(&root, &pin, None, &bundle, &delivery, &outputs, false);

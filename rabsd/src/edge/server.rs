@@ -43,6 +43,7 @@ const FRAME_IO_BUDGET: Duration = Duration::from_secs(5);
 const CONTROL_WORKERS: usize = 2;
 const SHADOW_WORKERS: usize = 4;
 const MATERIALIZATION_WORKERS: usize = 2;
+const PREPARED_ADMISSION_WORKERS: usize = 2;
 
 #[derive(Clone)]
 struct EdgeLimits {
@@ -50,6 +51,7 @@ struct EdgeLimits {
     control: Limit,
     shadow: Limit,
     materialization: Limit,
+    prepared_admission: Limit,
 }
 impl EdgeLimits {
     fn new() -> Self {
@@ -58,8 +60,17 @@ impl EdgeLimits {
             control: Limit::new(CONTROL_WORKERS),
             shadow: Limit::new(SHADOW_WORKERS),
             materialization: Limit::new(MATERIALIZATION_WORKERS),
+            prepared_admission: Limit::new(PREPARED_ADMISSION_WORKERS),
         }
     }
+}
+
+#[derive(Clone)]
+struct EdgeServices {
+    shadow: std::sync::Arc<std::sync::Mutex<crate::edge::shadow::ShadowPlane>>,
+    coord: crate::coord::live::EdgeSubscriber,
+    prepared_operations:
+        Option<std::sync::Arc<crate::coord::prepared_operation::PreparedOperationStore>>,
 }
 
 /// The daemon's own hello (transport v1..=1, application v1..=1).
@@ -86,6 +97,9 @@ pub struct EdgeServerConfig {
     pub state_dir: PathBuf,
     /// Restricted subscriber capability; never a lease/publication owner.
     pub coord: crate::coord::live::EdgeSubscriber,
+    /// Execution-only prepared jobs. No action-cache publication capability.
+    pub prepared_operations:
+        Option<std::sync::Arc<crate::coord::prepared_operation::PreparedOperationStore>>,
 }
 
 fn log_line(kind: &str, fields: &[(&str, &str)]) {
@@ -164,10 +178,14 @@ async fn serve(
     // Acceptor and connections remain region-owned. Each admitted blocking
     // operation also owns a join guard; abort cannot leave a detached writer.
     let acceptor_cx = cx.clone();
-    let coord = config.coord.clone();
+    let services = EdgeServices {
+        shadow,
+        coord: config.coord.clone(),
+        prepared_operations: config.prepared_operations.clone(),
+    };
     let limits = EdgeLimits::new();
     let acceptor = cx
-        .spawn(move |cx| accept_loop(cx, listener, policy, socket_evidence, shadow, coord, limits))
+        .spawn(move |cx| accept_loop(cx, listener, policy, socket_evidence, services, limits))
         .map_err(|e| format!("acceptor spawn: {e:?}"))?;
     let _ = acceptor_cx.checkpoint();
 
@@ -184,8 +202,7 @@ async fn accept_loop(
     listener: UnixListener,
     policy: AdmissionPolicy,
     socket_evidence: SocketMetadata,
-    shadow: std::sync::Arc<std::sync::Mutex<crate::edge::shadow::ShadowPlane>>,
-    coord: crate::coord::live::EdgeSubscriber,
+    services: EdgeServices,
     limits: EdgeLimits,
 ) {
     let mut connection_id: u64 = 0;
@@ -204,12 +221,11 @@ async fn accept_loop(
                     return;
                 };
                 connection_id = id;
-                let shadow = std::sync::Arc::clone(&shadow);
-                let coord = coord.clone();
+                let services = services.clone();
                 let limits = limits.clone();
                 let spawned = cx.spawn(move |cx| async move {
                     if cx.checkpoint().is_ok() {
-                        handle_connection(id, stream, policy, socket_evidence, shadow, coord, limits).await;
+                        handle_connection(id, stream, policy, socket_evidence, services, limits).await;
                     }
                     drop(permit);
                 });
@@ -279,7 +295,9 @@ struct Flight {
     label: &'static str,
 }
 impl Drop for Flight {
-    fn drop(&mut self) { self.coord.end_flight(&self.key); }
+    fn drop(&mut self) {
+        self.coord.end_flight(&self.key);
+    }
 }
 
 async fn handle_connection(
@@ -287,10 +305,14 @@ async fn handle_connection(
     mut stream: UnixStream,
     policy: AdmissionPolicy,
     socket_evidence: SocketMetadata,
-    shadow: std::sync::Arc<std::sync::Mutex<crate::edge::shadow::ShadowPlane>>,
-    coord: crate::coord::live::EdgeSubscriber,
+    services: EdgeServices,
     limits: EdgeLimits,
 ) {
+    let EdgeServices {
+        shadow,
+        coord,
+        prepared_operations,
+    } = services;
     let trace = format!("edge-conn-{id}");
     // Admission: kernel peer credentials against the policy.
     let (peer_uid, peer_gid) = match stream.peer_cred() {
@@ -363,10 +385,23 @@ async fn handle_connection(
     // The request quota bounds both retained flight guards and per-peer work.
     let mut open_flights: Vec<Flight> = Vec::new();
     for _ in 0..MAX_REQUESTS_PER_CONNECTION {
-        let Some(frame) = read_frame(&mut stream).await else { break; };
+        let Some(frame) = read_frame(&mut stream).await else {
+            break;
+        };
         let reply = match serde_json::from_slice::<serde_json::Value>(&frame) {
             Ok(value) if value.get("kind").and_then(|k| k.as_str()) == Some("status") => {
                 status_on_lane(&limits.control, coord.clone()).await
+            }
+            Ok(value) if matches!(value.get("kind").and_then(|k| k.as_str()),
+                Some("prepared-submit" | "prepared-status" | "prepared-cancel" | "prepared-resume" | "prepared-acknowledge")) => {
+                // Reading a bundle can be slower than a cancellation/status
+                // transaction. Admission has its own bounded blocking lane.
+                let lane = if value["kind"] == "prepared-submit" {
+                    &limits.prepared_admission
+                } else {
+                    &limits.control
+                };
+                prepared_on_lane(lane, prepared_operations.clone(), value).await
             }
             Ok(value) if value.get("kind").and_then(|k| k.as_str()) == Some("consult") => {
                 match parse_observation(&value) {
@@ -462,6 +497,114 @@ async fn status_on_lane(lane: &Limit, coord: crate::coord::live::EdgeSubscriber)
     match result {
         Ok(reply) => reply,
         Err(error) => refusal("status-unavailable", &error.to_string()),
+    }
+}
+
+async fn prepared_on_lane(
+    lane: &Limit,
+    operations: Option<std::sync::Arc<crate::coord::prepared_operation::PreparedOperationStore>>,
+    request: serde_json::Value,
+) -> String {
+    let operation_id = request
+        .get("operation_id")
+        .or_else(|| {
+            request
+                .get("operation")
+                .and_then(|operation| operation.get("id"))
+        })
+        .cloned();
+    let result = match lane.spawn(move || prepared_reply(operations.as_deref(), &request)) {
+        Ok(mut work) => work.wait().await,
+        Err(error) => Err(error),
+    };
+    match result {
+        Ok(reply) => reply,
+        Err(error) => serde_json::json!({
+            "kind":"prepared-operation-error", "operation_id":operation_id,
+            "detail":error.to_string(), "outcome_unconfirmed":true,
+            "reexecute":false,
+        })
+        .to_string(),
+    }
+}
+
+fn prepared_reply(
+    operations: Option<&crate::coord::prepared_operation::PreparedOperationStore>,
+    request: &serde_json::Value,
+) -> String {
+    use crate::coord::prepared_operation::PreparedOperationSpec;
+    use std::io;
+    let operation_id = request.get("operation_id").or_else(|| {
+        request
+            .get("operation")
+            .and_then(|operation| operation.get("id"))
+    });
+    let result = (|| -> io::Result<serde_json::Value> {
+        let invalid = |detail: &str| io::Error::new(io::ErrorKind::InvalidInput, detail.to_owned());
+        let operations =
+            operations.ok_or_else(|| invalid("prepared job service is unavailable"))?;
+        let kind = request["kind"]
+            .as_str()
+            .ok_or_else(|| invalid("missing request kind"))?;
+        let fields: &[&str] = match kind {
+            "prepared-submit" => &["kind", "operation"],
+            "prepared-status" | "prepared-cancel" => &["kind", "operation_id"],
+            "prepared-resume" => &["kind", "operation_id", "delivery", "resume_from"],
+            "prepared-acknowledge" => &["kind", "operation_id", "delivery"],
+            _ => return Err(invalid("unknown prepared operation")),
+        };
+        if request
+            .as_object()
+            .is_none_or(|object| object.keys().any(|key| !fields.contains(&key.as_str())))
+        {
+            return Err(invalid("unexpected prepared operation field"));
+        }
+        let status = if kind == "prepared-submit" {
+            let spec: PreparedOperationSpec = serde_json::from_value(request["operation"].clone())
+                .map_err(|error| invalid(&format!("invalid prepared operation: {error}")))?;
+            operations.submit(spec)?
+        } else {
+            let id = request["operation_id"]
+                .as_str()
+                .ok_or_else(|| invalid("missing operation_id"))?;
+            match kind {
+                "prepared-status" => operations.status(id)?.ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::NotFound, "prepared operation not found")
+                })?,
+                "prepared-cancel" => operations.cancel(id)?,
+                "prepared-resume" => {
+                    let delivery = request["delivery"]
+                        .as_str()
+                        .ok_or_else(|| invalid("missing resume delivery directory"))?;
+                    let resume_from = match request.get("resume_from") {
+                        None | Some(serde_json::Value::Null) => None,
+                        Some(serde_json::Value::String(path)) => Some(PathBuf::from(path)),
+                        Some(_) => return Err(invalid("invalid resume prefix directory")),
+                    };
+                    operations.resume(id, PathBuf::from(delivery), resume_from)?
+                }
+                "prepared-acknowledge" => {
+                    let delivery = request["delivery"]
+                        .as_str()
+                        .ok_or_else(|| invalid("missing owned delivery directory"))?;
+                    operations.acknowledge(id, PathBuf::from(delivery))?
+                }
+                _ => return Err(invalid("unknown prepared operation")),
+            }
+        };
+        Ok(serde_json::json!({
+            "kind":"prepared-operation", "operation":status,
+            "publication_authorized":false, "reexecute":false,
+        }))
+    })();
+    match result {
+        Ok(reply) => reply.to_string(),
+        Err(error) => serde_json::json!({
+            "kind":"prepared-operation-error", "operation_id":operation_id,
+            "detail":error.to_string(), "outcome_unconfirmed":true,
+            "reexecute":false,
+        })
+        .to_string(),
     }
 }
 

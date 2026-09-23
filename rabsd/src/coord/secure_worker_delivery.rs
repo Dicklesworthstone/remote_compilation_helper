@@ -35,8 +35,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 mod admission;
+mod cancellation;
 mod interrupt;
 pub use admission::PinnedWorkerAdmission;
+pub use cancellation::OperationCancellation;
 use admission::AdmittedWorkerSession;
 
 const ADMISSION_BUDGET: Duration = Duration::from_secs(10);
@@ -556,18 +558,20 @@ impl<'a, S> RecordPeer<'a, S> {
         }
         Ok(())
     }
+
+    fn outbound(&mut self, frame: &Value) -> io::Result<Vec<u8>> {
+        self.remaining()?;
+        let mut bytes = serde_json::to_vec(frame)?;
+        require(bytes.len() <= MAX_JSON_RECORD, "worker record exceeds ATP limit")?;
+        self.begin_frame(frame["kind"].as_str())?;
+        bytes.push(b'\n');
+        Ok(bytes)
+    }
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> WorkerPeer for RecordPeer<'_, S> {
     fn send(&mut self, frame: &Value) -> io::Result<()> {
-        self.remaining()?;
-        let mut bytes = serde_json::to_vec(frame)?;
-        require(
-            bytes.len() <= MAX_JSON_RECORD,
-            "worker record exceeds ATP limit",
-        )?;
-        self.begin_frame(frame["kind"].as_str())?;
-        bytes.push(b'\n');
+        let bytes = self.outbound(frame)?;
         let budget = self.remaining()?;
         let stream = &mut self.stream;
         let result = self.runtime.block_on(async {
@@ -715,6 +719,35 @@ pub fn acknowledge_authenticated(
     pending.acknowledge(&mut admitted)
 }
 
+/// Reconcile an already verified result for one daemon operation. Cancellation
+/// is local to this acknowledgment exchange; no compiler can be started or
+/// stopped, and absence of remote bytes is not mistaken for acceptance.
+pub fn acknowledge_authenticated_controlled(
+    runtime: &Runtime,
+    peer: AuthenticatedPeer,
+    admission: PinnedWorkerAdmission,
+    pending: PendingAcknowledgment,
+    cancellation: OperationCancellation,
+) -> Result<Delivery, DeliveryFailure> {
+    let directory = pending.directory().to_path_buf();
+    let failure = |error: io::Error| DeliveryFailure {
+        directory: directory.clone(), execution_may_have_run: true, detail: error.to_string(),
+    };
+    if asupersync::cx::Cx::current().is_some() {
+        return Err(failure(invalid("authenticated acknowledgment requires a dedicated thread")));
+    }
+    let admission = Arc::new(admission);
+    let raw = interrupt::OperatorPeer::with_interrupts(
+        RecordPeer::new(runtime, peer.stream, pending.request()),
+        interrupt::OperationInterrupts::new(cancellation),
+    );
+    let mut admitted = AdmittedPeer::new(
+        raw, peer.identity, admission.pin(), pending.request(), challenge_ids().map_err(&failure)?,
+        DeliveryMode::Resume, Arc::clone(&admission),
+    ).map_err(failure)?;
+    pending.acknowledge(&mut admitted)
+}
+
 /// Upload an explicitly approved immutable source projection after native TLS
 /// admission, execute the exact request once, then verify the ordinary delivery.
 /// A changed checkout cannot alter the retained snapshot or request identity.
@@ -756,6 +789,62 @@ pub fn receive_authenticated_source(
     receive_operation(
         &mut admitted, request, &expected_worker, destination, DeliveryMode::Execute,
     )
+}
+
+/// Execute or reconcile one daemon-owned operation with its own cancellation
+/// intent. No process signal handler is installed. Call only from a dedicated
+/// blocking thread; the owned runtime cannot nest inside the daemon reactor.
+/// A cancellation after dispatch sends one exact cancel and drains the ordinary
+/// verified delivery. Repeated cancellation never abandons that cleanup.
+#[allow(clippy::too_many_arguments)]
+pub fn receive_authenticated_controlled(
+    runtime: &Runtime,
+    peer: AuthenticatedPeer,
+    admission: PinnedWorkerAdmission,
+    request: &Value,
+    destination: &Path,
+    mode: DeliveryMode,
+    upload: Option<&SourceUpload>,
+    resume_source: Option<&ResumeSource>,
+    cancellation: OperationCancellation,
+) -> Result<Delivery, DeliveryFailure> {
+    let failure = |error: io::Error| DeliveryFailure {
+        directory: destination.to_path_buf(),
+        execution_may_have_run: mode == DeliveryMode::Resume,
+        detail: error.to_string(),
+    };
+    if asupersync::cx::Cx::current().is_some() {
+        return Err(failure(invalid("authenticated delivery requires a dedicated thread")));
+    }
+    require(upload.is_none() || (mode == DeliveryMode::Execute && resume_source.is_none()),
+        "source upload cannot accompany result recovery").map_err(&failure)?;
+    if let Some(upload) = upload {
+        upload.validate_request(request).map_err(&failure)?;
+    }
+    if let Some(source) = resume_source {
+        require(mode == DeliveryMode::Resume, "local prefixes require explicit resume")
+            .map_err(&failure)?;
+        source.validate_destination(destination).map_err(&failure)?;
+    }
+    let admission = Arc::new(admission);
+    let expected_worker = admission.worker().to_owned();
+    let raw = interrupt::OperatorPeer::with_interrupts(
+        RecordPeer::new(runtime, peer.stream, request),
+        interrupt::OperationInterrupts::new(cancellation),
+    );
+    let mut admitted = AdmittedPeer::new(
+        raw, peer.identity, admission.pin(), request, challenge_ids().map_err(&failure)?,
+        mode, Arc::clone(&admission),
+    ).map_err(&failure)?;
+    if let Some(upload) = upload {
+        admitted = admitted.with_source(upload).map_err(&failure)?;
+    }
+    match resume_source {
+        Some(source) => receive_operation(
+            &mut ResumePeer::new(&mut admitted, source), request, &expected_worker, destination, mode,
+        ),
+        None => receive_operation(&mut admitted, request, &expected_worker, destination, mode),
+    }
 }
 
 #[cfg(test)]

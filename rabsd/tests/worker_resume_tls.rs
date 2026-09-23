@@ -251,7 +251,25 @@ async fn serve(stream: &mut SecureWorkerStream, fixture: &Fixture, destination: 
                 assert!(offset <= bytes.len() as u64);
                 if mode == Mode::Interrupt && key == "artifacts/bin/app" && offset == CHUNK as u64 {
                     assert_eq!(transfers.acknowledgments, 0);
-                    return transfers; // Drop the actual TLS connection with a verified prefix on disk.
+                    // With pipelined reads, the second request no longer proves
+                    // the first reply has been written. Keep the exact intended
+                    // failure frontier: one verified prefix, no second reply,
+                    // no receipt, and no release. The receiver is a separate
+                    // process; this bounded filesystem wait needs no peer I/O.
+                    let until = Instant::now() + Duration::from_secs(5);
+                    let prefix = destination.join("artifacts/bin/app");
+                    loop {
+                        match fs::metadata(&prefix) {
+                            Ok(metadata) if metadata.len() == CHUNK as u64 => break,
+                            Ok(metadata) => assert!(metadata.len() < CHUNK as u64),
+                            Err(error) => assert_eq!(error.kind(), io::ErrorKind::NotFound),
+                        }
+                        assert!(Instant::now() < until, "receiver did not retain its first range");
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    assert_eq!(fs::read(&prefix).unwrap(), bytes[..CHUNK]);
+                    assert!(!destination.join("delivery.json").exists());
+                    return transfers; // Drop only after the same prefix frontier as the serial test.
                 }
                 transfers.reads.push((key, offset));
                 let end = (offset as usize + CHUNK).min(bytes.len());

@@ -566,6 +566,7 @@ fn download(
     manifest_hash: Option<&str>,
     path: &Path,
 ) -> io::Result<()> {
+    const RANGE_WINDOW: usize = 4;
     let artifact = manifest_hash.is_some();
     let mut file = create_file(path)?;
     let mut hasher = Sha256::new();
@@ -578,11 +579,28 @@ fn download(
     };
     // Empty files retain the ordinary zero-length range check. A complete
     // nonempty prefix skips range I/O, never the complete-file hash below.
+    // Keep at most four ordinary range requests in flight. The worker serves
+    // ordered immutable ranges; no new wire operation or speculative bytes are
+    // needed. Drain each batch before writing more requests, and retain the
+    // existing transport's one absolute transfer deadline throughout.
+    let mut requested = offset;
+    let mut outstanding = 0_usize;
     while offset < item.len || item.len == 0 {
-        let mut request = json!({"kind":if artifact {"artifact-read"} else {"output-read"},
-            "request_id":id,"offset":offset,"max_bytes":CHUNK_BYTES});
-        request[if artifact { "name" } else { "stream" }] = json!(item.name);
-        peer.send(&request)?;
+        if outstanding == 0 {
+            for _ in 0..RANGE_WINDOW {
+                let mut request = json!({"kind":if artifact {"artifact-read"} else {"output-read"},
+                    "request_id":id,"offset":requested,"max_bytes":CHUNK_BYTES});
+                request[if artifact { "name" } else { "stream" }] = json!(item.name);
+                // A partial write aborts the whole operation. Never retry the
+                // batch or fall back to execution when its outcome is unknown.
+                peer.send(&request)?;
+                outstanding += 1;
+                requested += (item.len - requested).min(CHUNK_BYTES as u64);
+                if requested == item.len {
+                    break;
+                }
+            }
+        }
         let chunk = receive(peer, worker)?;
         require(
             text(&chunk, "kind")?
@@ -629,6 +647,7 @@ fn download(
         file.write_all(&bytes)?;
         hasher.update(&bytes);
         offset = next;
+        outstanding -= 1;
         if offset == item.len {
             break;
         }

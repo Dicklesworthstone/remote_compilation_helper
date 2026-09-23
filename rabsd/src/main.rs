@@ -23,6 +23,7 @@
 use rabs_asupersync::daemon_runtime::{DaemonRunOptions, run_daemon};
 use std::time::{Duration, Instant};
 
+mod prepared_jobs;
 mod worker_exec;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -290,7 +291,7 @@ fn main() {
                  PREPARE: rabsd --worker-prepare <absolute-source-root> <spec.json> <new-absolute-bundle-directory>\n\
                  spec.json uses canonical-exec fields plus source_files, source_roots or cargo_source,\n\
                  instead of source_manifest or workspace_backing. Preparation does not build.\n\
-                 cargo_source: {manifest: \"app/Cargo.toml\"} discovers a locked offline local Cargo graph.\n\
+                 cargo_source: {{manifest: \"app/Cargo.toml\"}} discovers a locked offline local Cargo graph.\n\
                  Optional toolchain_source: \"/absolute/local/toolchain\" binds the worker to those toolchain bytes.\n\
                  Preparation saves request.json and source/; only selected regular files are copied.\n\
                  Execute with --source-root <bundle>/source and <bundle>/request.json, not the old checkout.\n\
@@ -300,6 +301,12 @@ fn main() {
                  BUILD LOCAL: rabsd --worker-build-loopback [--resume] <127.0.0.1:port> <worker> <bundle> <delivery> <outputs>\n\
                  Build paths are absolute. Successful builds install every verified artifact into a new output tree.\n\
                  Repeating a complete build verifies local delivery and outputs without a worker; --resume never executes.\n\
+                 DAEMON JOB: rabsd --job-submit <id32hex> <listen-IP:port> <worker> <pin> <bundle> <delivery> <outputs>\n\
+                 Inspect/cancel: --job-status <id32hex> | --job-cancel <id32hex>\n\
+                 Recover: --job-resume <id32hex> <new-delivery> [old-prefix-directory]\n\
+                 Confirm release: --job-acknowledge <id32hex> <owned-delivery>\n\
+                 Jobs require a running daemon and a prepared source/toolchain binding. Inspect listen_address before connecting the worker.\n\
+                 Reuse the same job ID after a lost response. Resume retrieves the original result without executing again.\n\
                  TLS requires RABS_COORD_TLS_CA, RABS_COORD_TLS_CERT and RABS_COORD_TLS_KEY.\n\
                  The operator lane is plaintext loopback only, not authenticated fleet transport.\n\
                  \n\
@@ -324,6 +331,16 @@ fn main() {
         }
         Some("--worker-build-tls") => {
             std::process::exit(worker_exec::run_build_tls(&args[1..]));
+        }
+        Some("--job-submit" | "--job-status" | "--job-cancel" | "--job-resume" | "--job-acknowledge") => {
+            let config = match load_config() {
+                Ok(config) => config,
+                Err(error) => {
+                    eprintln!("rabsd: config error: {error}");
+                    std::process::exit(1);
+                }
+            };
+            std::process::exit(prepared_jobs::run(&args, &config.socket_path));
         }
         Some("--doctor") => {
             let code = run_doctor();
@@ -439,7 +456,24 @@ fn main() {
         Ok(cas) => rabsd::coord::live::CoordLive::with_cas(std::sync::Arc::clone(cas)),
         Err(_) => rabsd::coord::live::CoordLive::new(),
     });
-    let coord_work = rabsd::coord::live::coord_work(std::sync::Arc::clone(&coord));
+    let prepared_operations = if mounted.is_ok() {
+        match rabsd::coord::prepared_operation::PreparedOperationStore::open(
+            &state_dir.join("prepared-operations"),
+        ) {
+            Ok(operations) => Some(operations),
+            Err(error) => {
+                log_line(
+                    "rabsd-prepared-jobs-unavailable",
+                    &[("detail", &error.to_string())],
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let coord_work =
+        prepared_jobs::coord_work(std::sync::Arc::clone(&coord), prepared_operations.clone());
     let options = DaemonRunOptions {
         boot_started_at,
         run_for,
@@ -449,6 +483,7 @@ fn main() {
                 socket_path: std::path::PathBuf::from(&config.socket_path),
                 state_dir: state_dir.clone(),
                 coord: coord.edge_subscriber(),
+                prepared_operations,
             },
         )),
         coord_work: Some(coord_work),

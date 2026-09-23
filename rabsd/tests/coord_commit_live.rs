@@ -670,6 +670,7 @@ fn coordinator_commits_then_quarantines_divergence_under_running_daemon() {
                 socket_path: state_dir.join("rabsd.sock"),
                 state_dir: state_dir.clone(),
                 coord: coord.edge_subscriber(),
+                prepared_operations: None,
             },
         )),
         coord_work: Some(coord_work),
