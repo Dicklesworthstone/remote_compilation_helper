@@ -762,7 +762,7 @@ impl BuildHistory {
     /// Allocate without wrapping into a previously used identity.
     fn next_queue_id(&self) -> Option<u64> {
         self.next_queue_id
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |id| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |id| {
                 if id < QUEUE_ID_NAMESPACE {
                     None
                 } else {

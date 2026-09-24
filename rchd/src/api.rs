@@ -1399,19 +1399,18 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
     }
 
     // Build cancellation endpoints
-    if method == "POST" {
-        if let Some(wrapper) = path
+    if method == "POST"
+        && let Some(wrapper) = path
             .strip_prefix("/jobs/")
             .and_then(|rest| rest.strip_suffix("/cancel"))
-        {
-            let uuid = wrapper
-                .strip_prefix(LOCAL_WRAPPER_ID_PREFIX)
-                .ok_or_else(|| anyhow!("Invalid local wrapper id"))?;
-            Uuid::parse_str(uuid).map_err(|_| anyhow!("Invalid local wrapper id"))?;
-            return Ok(ApiRequest::CancelJob {
-                local_wrapper_id: wrapper.to_owned(),
-            });
-        }
+    {
+        let uuid = wrapper
+            .strip_prefix(LOCAL_WRAPPER_ID_PREFIX)
+            .ok_or_else(|| anyhow!("Invalid local wrapper id"))?;
+        Uuid::parse_str(uuid).map_err(|_| anyhow!("Invalid local wrapper id"))?;
+        return Ok(ApiRequest::CancelJob {
+            local_wrapper_id: wrapper.to_owned(),
+        });
     }
     if method == "GET" && path.starts_with("/builds/") {
         let (route, query) = path.split_once('?').unwrap_or((path, ""));
