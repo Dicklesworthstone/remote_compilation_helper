@@ -356,7 +356,7 @@ pub fn evaluate_pressure_policy(
         .map(|age| age <= config.telemetry_stale_after.as_secs())
         .unwrap_or(false);
 
-    let memory_pressure = latest.map(|entry| entry.telemetry.memory.pressure_score);
+    let memory_pressure = latest.map(|entry| entry.telemetry.memory.admission_pressure());
     let disk_io_util_pct = latest.and_then(|entry| {
         entry
             .telemetry
@@ -565,7 +565,7 @@ mod tests {
     use chrono::Duration as ChronoDuration;
     use rch_telemetry::collect::cpu::{CpuTelemetry, LoadAverage};
     use rch_telemetry::collect::disk::{DiskMetrics, DiskTelemetry};
-    use rch_telemetry::collect::memory::MemoryTelemetry;
+    use rch_telemetry::collect::memory::{MemoryPressureStall, MemoryTelemetry};
     use rch_telemetry::protocol::{TelemetrySource, WorkerTelemetry};
 
     #[test]
@@ -833,6 +833,41 @@ mod tests {
         let result = evaluate_pressure_policy(&caps, Some(&telemetry), &cfg);
         assert_eq!(result.state, PressureState::Warning);
         assert_eq!(result.reason_code, "memory_pressure_warning");
+    }
+
+    /// A worker thrashing on swap with RAM that still looks "available" must be
+    /// gated by its memory stall, not waved through on the utilization score.
+    /// Utilization 78.7 = vmi1264463 on 2026-09-24 (58.7% used + full swap);
+    /// planted negative: the same worker with its measured healthy PSI later
+    /// that day stays admitted.
+    #[test]
+    fn pressure_policy_gates_on_sustained_memory_stall_below_utilization_threshold() {
+        let caps = test_capabilities(80.0, 200.0);
+        let cfg = DiskPressurePolicyConfig::default();
+
+        let mut thrashing = test_received_telemetry(20.0, 78.7, 5);
+        thrashing.telemetry.memory.psi = Some(MemoryPressureStall {
+            some_avg60: 24.58,
+            full_avg60: 12.0,
+            ..MemoryPressureStall::default()
+        });
+        let result = evaluate_pressure_policy(&caps, Some(&thrashing), &cfg);
+        assert_eq!(result.state, PressureState::Critical);
+        assert_eq!(result.reason_code, "memory_pressure_critical");
+
+        let mut recovered = test_received_telemetry(20.0, 78.7, 5);
+        recovered.telemetry.memory.psi = Some(MemoryPressureStall {
+            some_avg60: 0.13,
+            full_avg60: 0.13,
+            ..MemoryPressureStall::default()
+        });
+        let result = evaluate_pressure_policy(&caps, Some(&recovered), &cfg);
+        assert_ne!(result.state, PressureState::Critical);
+        assert!(
+            !result.reason_code.starts_with("memory_pressure"),
+            "{}",
+            result.reason_code
+        );
     }
 
     #[test]

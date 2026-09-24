@@ -228,6 +228,23 @@ impl MemoryPressureStall {
 
         Some(result)
     }
+
+    /// Admission-pressure equivalent (0-100 scale) of a sustained memory stall:
+    /// 92 (critical) or 80 (warning), matching rchd's default memory
+    /// thresholds, or 0 when there is no sustained stall.
+    ///
+    /// `full` (every non-idle task stalled) is the machine-wide thrash signal;
+    /// `some` needs a much higher bar because one memory-limited cgroup can
+    /// raise it alone. 60s averages ride out a single build's link spike.
+    pub fn stall_pressure(&self) -> f64 {
+        if self.full_avg60 >= 10.0 || self.some_avg60 >= 25.0 {
+            92.0
+        } else if self.full_avg60 >= 5.0 || self.some_avg60 >= 15.0 {
+            80.0
+        } else {
+            0.0
+        }
+    }
 }
 
 /// Aggregated memory telemetry snapshot.
@@ -253,6 +270,21 @@ pub struct MemoryTelemetry {
 }
 
 impl MemoryTelemetry {
+    /// Memory pressure for admission decisions: the utilization score, raised
+    /// by sustained PSI stall when the worker reports it.
+    ///
+    /// The utilization score alone misses a worker thrashing on swap with RAM
+    /// that still looks "available": vmi1264463 (8 cores, 30 GB) sat at memory
+    /// PSI some 20-30% for a day with a score of ~78 (58% used + full swap),
+    /// under the 80/92 gates, so every dispatcher kept admitting to it.
+    pub fn admission_pressure(&self) -> f64 {
+        let stall = self
+            .psi
+            .as_ref()
+            .map_or(0.0, MemoryPressureStall::stall_pressure);
+        self.pressure_score.max(stall)
+    }
+
     /// Collect memory telemetry from the system.
     pub fn collect() -> Result<Self, MemoryError> {
         let info = MemoryInfo::read_from_proc()?;
@@ -1000,5 +1032,55 @@ Pages purgeable:                          25000.\n";
         assert!(mem.available_gb > 0.0);
         assert!((0.0..=100.0).contains(&mem.used_percent));
         assert!((0.0..=100.0).contains(&mem.pressure_score));
+    }
+
+    /// Thresholds: sustained `full` stall gates first; `some` needs a higher
+    /// bar; the fleet's healthy readings (all < 1.5% on 2026-09-24) never gate.
+    #[test]
+    fn test_stall_pressure_thresholds() {
+        let psi = |some: f64, full: f64| MemoryPressureStall {
+            some_avg60: some,
+            full_avg60: full,
+            ..MemoryPressureStall::default()
+        };
+        assert_eq!(psi(1.33, 1.11).stall_pressure(), 0.0);
+        assert_eq!(psi(14.9, 4.9).stall_pressure(), 0.0);
+        assert_eq!(psi(15.0, 0.0).stall_pressure(), 80.0);
+        assert_eq!(psi(0.0, 5.0).stall_pressure(), 80.0);
+        assert_eq!(psi(24.58, 0.0).stall_pressure(), 80.0);
+        assert_eq!(psi(25.0, 0.0).stall_pressure(), 92.0);
+        assert_eq!(psi(0.0, 10.0).stall_pressure(), 92.0);
+    }
+
+    #[test]
+    fn test_admission_pressure_takes_max_of_utilization_and_stall() {
+        let mut mem = MemoryTelemetry::from_info(
+            &MemoryInfo {
+                total_kb: 30_000_000,
+                free_kb: 1_000_000,
+                available_kb: 12_000_000,
+                buffers_kb: 0,
+                cached_kb: 0,
+                swap_total_kb: 11_000_000,
+                swap_free_kb: 0,
+                dirty_kb: 0,
+                writeback_kb: 0,
+            },
+            None,
+        );
+        let utilization = mem.pressure_score;
+        assert!(utilization < 92.0);
+        // No PSI (old kernel / non-Linux): unchanged.
+        assert_eq!(mem.admission_pressure(), utilization);
+        // Healthy PSI never lowers or raises the score.
+        mem.psi = MemoryPressureStall::parse(
+            "some avg10=0 avg60=0.13 avg300=0 total=0\nfull avg10=0 avg60=0.13 avg300=0 total=0",
+        );
+        assert_eq!(mem.admission_pressure(), utilization);
+        // Sustained full stall escalates to the critical gate.
+        mem.psi = MemoryPressureStall::parse(
+            "some avg10=30 avg60=24.58 avg300=20 total=0\nfull avg10=14 avg60=12 avg300=9 total=0",
+        );
+        assert_eq!(mem.admission_pressure(), 92.0);
     }
 }
