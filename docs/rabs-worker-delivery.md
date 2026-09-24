@@ -458,6 +458,61 @@ new admissions; completed records are not silently erased. These jobs provide
 authenticated execution and explicit output installation. They do not grant
 semantic action-cache publication or Cargo freshness authority.
 
+### Follow live diagnostic previews from a daemon job
+
+Use `--job-follow` to inspect a running prepared job without waiting for its
+complete diagnostic transcript:
+
+```sh
+rabsd --job-follow 0123456789abcdef0123456789abcdef 3600 > job-events.ndjson
+```
+
+Live previews use the worker's optional `tail-v1` capability. The daemon polls
+the existing authenticated execution connection every 500 milliseconds, with
+cancellation and lease renewal taking priority. A worker without preview support
+still provides ordinary verified completion; its live preview is unavailable.
+
+The optional timeout defaults to 3,600 seconds and accepts decimal seconds from
+1 through 86,400. Stdout contains newline-delimited JSON. Each `prepared-preview`
+event identifies the operation, its saved request fingerprint, and its durable
+`attempt`. Segments name `stdout` or `stderr`, carry binary-safe lowercase
+`data_hex`, and describe `offset`, `next_offset`, `skipped_bytes`, and
+`observed_bytes`. Each response contains at most 8 KiB per stream. A gap is
+explicit: `skipped_bytes` counts bytes between the client's previous cursor and
+the returned segment. Only `next_offset` advances that cursor; `observed_bytes`
+does not mean the client received those bytes.
+
+Previews are a bounded, temporary view and always have `complete:false`.
+Clients read independently without consuming another client's diagnostics.
+Late attachment, output faster than preview capture, and slow readers can leave
+gaps. Missing or closed preview state, daemon restart, and recovery attempts
+produce `available:false` with `reason:"unavailable"`; transient contention uses
+`reason:"busy"`. These responses contain no segments. Repeated identical preview
+responses are omitted from the CLI output. The command follows the original
+queued job into its first claimed attempt, then stops if that attempt or request
+identity changes. Start another explicit invocation to inspect a recovery attempt.
+
+At terminal delivery, the client requests verified completion metadata, checks
+the local receipt, and snapshots and hashes both complete diagnostic streams
+using the same verification as `--job-wait`. It rereads status to ensure recovery
+has not changed the attempt during verification. It then emits one
+`prepared-follow-completion` event containing `completion_verified:true`, the
+verified completion metadata, and the compiler's original exit code, and exits
+with that code. The event retains `preview_complete:false`: verification does
+not fill gaps or print the full diagnostics a second time. A cancellation before
+dispatch returns 130 with `completion:null` and `completion_verified:false`,
+without reading delivery files.
+
+Following is read-only. A timeout, uncertain outcome, lost daemon connection,
+changed attempt, failed verification, or partial output write stops the client
+without retrying output or submitting, cancelling, resuming, or acknowledging
+the job. Errors are structured JSON on stderr and report whether preview output
+may already have been exposed. Interrupting this client leaves the daemon-owned
+job running. Final verification uses temporary disk space bounded by the complete
+diagnostic size; filesystem and console writes are not promised interruptible.
+Use `--job-wait` when you need the complete binary stdout and stderr streams.
+Neither command grants cache publication or Cargo freshness authority.
+
 ### Wait for a daemon job and replay its compiler diagnostics
 
 After submitting a prepared job, a shell or CI caller can wait for that exact

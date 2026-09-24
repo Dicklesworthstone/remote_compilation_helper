@@ -95,6 +95,7 @@ impl PreparedOperationStore {
             store: Arc::clone(self), spec, request: record.request,
             mode: StoredMode::LocalRecovery, resume_from: None,
             attempt: record.attempt, cancellation, finished: false,
+            preview: None,
         }, acceptance_confirmed))
     }
 }

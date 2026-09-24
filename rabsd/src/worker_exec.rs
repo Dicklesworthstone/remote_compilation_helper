@@ -593,6 +593,7 @@ fn coordinator_tls_files() -> io::Result<rabs_asupersync::worker_transport::TlsF
 
 struct TlsOperationControl<'a> {
     cancellation: OperationCancellation,
+    preview: Option<rabsd::coord::prepared_operation::PreviewObserver>,
     on_listening: &'a mut dyn FnMut(SocketAddr) -> io::Result<()>,
 }
 
@@ -785,9 +786,9 @@ fn run_tls_operation_inner(
     )
     .map_err(failure)?;
     if let Some(control) = control {
-        return rabsd::coord::secure_worker_delivery::receive_authenticated_controlled(
+        return rabsd::coord::secure_worker_delivery::receive_authenticated_observed(
             &runtime, peer, admission, request, directory, mode, upload.as_ref(), reuse.as_ref(),
-            control.cancellation,
+            control.cancellation, control.preview,
         );
     }
     match upload.as_ref() {

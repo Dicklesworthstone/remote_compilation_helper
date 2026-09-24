@@ -393,7 +393,7 @@ async fn handle_connection(
                 status_on_lane(&limits.control, coord.clone()).await
             }
             Ok(value) if matches!(value.get("kind").and_then(|k| k.as_str()),
-                Some("prepared-submit" | "prepared-status" | "prepared-cancel" | "prepared-resume" | "prepared-acknowledge" | "prepared-completion" | "prepared-recover-local")) => {
+                Some("prepared-submit" | "prepared-status" | "prepared-cancel" | "prepared-resume" | "prepared-acknowledge" | "prepared-completion" | "prepared-recover-local" | "prepared-preview")) => {
                 // Bundle admission and complete result verification perform
                 // filesystem work. Neither may occupy the cancellation/status
                 // lane or the reactor while hashing a large delivered tree.
@@ -551,6 +551,14 @@ fn prepared_reply(
             "prepared-submit" => &["kind", "operation"],
             "prepared-status" | "prepared-cancel" => &["kind", "operation_id"],
             "prepared-completion" => &["kind", "operation_id", "request_sha256"],
+            "prepared-preview" => &[
+                "kind",
+                "operation_id",
+                "request_sha256",
+                "attempt",
+                "stdout_offset",
+                "stderr_offset",
+            ],
             "prepared-resume" => &["kind", "operation_id", "delivery", "resume_from"],
             "prepared-acknowledge" | "prepared-recover-local" => &["kind", "operation_id", "delivery"],
             _ => return Err(invalid("unknown prepared operation")),
@@ -560,6 +568,26 @@ fn prepared_reply(
             .is_none_or(|object| object.keys().any(|key| !fields.contains(&key.as_str())))
         {
             return Err(invalid("unexpected prepared operation field"));
+        }
+        if kind == "prepared-preview" {
+            let id = request["operation_id"]
+                .as_str()
+                .ok_or_else(|| invalid("missing preview operation_id"))?;
+            let fingerprint = request["request_sha256"]
+                .as_str()
+                .ok_or_else(|| invalid("missing preview request identity"))?;
+            let number = |field: &str| {
+                request[field]
+                    .as_u64()
+                    .ok_or_else(|| invalid("missing or invalid preview cursor or attempt"))
+            };
+            return operations.preview(
+                id,
+                fingerprint,
+                number("attempt")?,
+                number("stdout_offset")?,
+                number("stderr_offset")?,
+            );
         }
         if kind == "prepared-completion" {
             let id = request["operation_id"]
@@ -1079,6 +1107,54 @@ mod edge_liveness_tests {
     use std::sync::{Arc, mpsc};
     use std::task::{Context, Poll, Waker};
     use std::time::Instant;
+
+    #[test]
+    fn prepared_preview_requires_exact_identity_attempt_and_cursor_fields() {
+        use crate::coord::prepared_operation::PreparedOperationStore;
+        use serde_json::{Value, json};
+
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("operations");
+        let store = PreparedOperationStore::open(&root).unwrap();
+        let id = "0123456789abcdef0123456789abcdef";
+        let request = json!({"kind":"prepared-preview", "operation_id":id,
+            "request_sha256":"ab".repeat(32), "attempt":1,
+            "stdout_offset":0, "stderr_offset":0});
+        assert_eq!(request.as_object().unwrap().len(), 6);
+        let query = |request: &Value| -> Value {
+            serde_json::from_str(&prepared_reply(Some(&store), request)).unwrap()
+        };
+        assert_eq!(query(&request), json!({
+            "kind":"prepared-preview", "operation_id":id, "request_sha256":"ab".repeat(32),
+            "attempt":1, "available":false, "active":false, "reason":"unavailable",
+            "segments":[], "complete":false, "publication_authorized":false,
+        }));
+        let refused = |request: &Value| {
+            let reply = query(request);
+            assert_eq!(reply["kind"], "prepared-operation-error", "{request}");
+            assert_eq!(reply["outcome_unconfirmed"], true);
+            assert_eq!(reply["reexecute"], false);
+            assert!(reply.get("segments").is_none());
+        };
+        for field in ["attempt", "stdout_offset", "stderr_offset"] {
+            for malformed in [Value::Null, json!(-1), json!(1.5), json!("0"), json!(false)] {
+                let mut changed = request.clone();
+                changed[field] = malformed;
+                refused(&changed);
+            }
+        }
+        for field in ["kind", "operation_id", "request_sha256", "attempt", "stdout_offset", "stderr_offset"] {
+            let mut changed = request.clone();
+            changed.as_object_mut().unwrap().remove(field);
+            refused(&changed);
+        }
+        let mut changed = request.clone();
+        changed["execute"] = json!(true);
+        refused(&changed);
+        assert_eq!(query(&request)["available"], false);
+        assert!(store.status(id).unwrap().is_none());
+        assert!(!root.join(format!("{id}.json")).exists());
+    }
 
     #[test]
     fn flight_guards_release_on_drop_and_unwind_without_borrowing_other_participants() {

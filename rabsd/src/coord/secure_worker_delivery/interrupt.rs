@@ -9,6 +9,7 @@
 
 use super::{Phase, RecordPeer, TRANSFER_BUDGET, WorkerPeer, read_record, require};
 use super::lease::{ExecutionLease, Tick};
+use super::preview::PreviewSession;
 use asupersync::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use asupersync::signal::{Signal, sigint, sigterm};
 use serde_json::{Value, json};
@@ -19,6 +20,7 @@ use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
 const CANCEL_DRAIN_BUDGET: Duration = Duration::from_secs(60);
+const PREVIEW_WRITE_BUDGET: Duration = Duration::from_secs(1);
 
 pub(super) trait Interrupts {
     fn wait(&mut self) -> impl Future<Output = io::Result<()>>;
@@ -87,6 +89,7 @@ enum Event {
     Record(Value),
     Interrupt,
     Lease,
+    Preview,
 }
 
 async fn next_event<S: AsyncRead + Unpin, I: Interrupts>(
@@ -94,11 +97,20 @@ async fn next_event<S: AsyncRead + Unpin, I: Interrupts>(
     buffered: &mut Vec<u8>,
     interrupts: &mut I,
     lease_wake: Option<Instant>,
+    preview_wake: Option<Instant>,
 ) -> io::Result<Event> {
     let mut record = pin!(read_record(stream, buffered));
     let mut signal = pin!(interrupts.wait());
     let mut lease = pin!(async {
         if let Some(at) = lease_wake {
+            asupersync::time::sleep(asupersync::time::wall_now(),
+                at.saturating_duration_since(Instant::now())).await;
+        } else {
+            std::future::pending::<()>().await;
+        }
+    });
+    let mut preview = pin!(async {
+        if let Some(at) = preview_wake {
             asupersync::time::sleep(asupersync::time::wall_now(),
                 at.saturating_duration_since(Instant::now())).await;
         } else {
@@ -117,6 +129,9 @@ async fn next_event<S: AsyncRead + Unpin, I: Interrupts>(
         if lease.as_mut().poll(cx).is_ready() {
             return Poll::Ready(Ok(Event::Lease));
         }
+        if preview.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(Ok(Event::Preview));
+        }
         record.as_mut().poll(cx).map(|result| result.map(Event::Record))
     }).await
 }
@@ -131,6 +146,7 @@ pub(super) struct OperatorPeer<'a, S, I = ProcessSignals> {
     cancel_sent: bool,
     cancel_response_seen: bool,
     lease: Option<ExecutionLease>,
+    preview: Option<PreviewSession>,
 }
 
 impl<'a, S> OperatorPeer<'a, S> {
@@ -141,7 +157,13 @@ impl<'a, S> OperatorPeer<'a, S> {
 
 impl<'a, S, I: Interrupts> OperatorPeer<'a, S, I> {
     pub(super) fn with_interrupts(inner: RecordPeer<'a, S>, interrupts: I) -> Self {
-        Self { inner, interrupts, execution:None, cancel_sent:false, cancel_response_seen:false, lease:None }
+        Self { inner, interrupts, execution:None, cancel_sent:false, cancel_response_seen:false,
+            lease:None, preview:None }
+    }
+
+    pub(super) fn with_preview_observer(mut self, observer: Option<crate::coord::prepared_operation::PreviewObserver>) -> Self {
+        self.preview = observer.map(PreviewSession::new);
+        self
     }
 
     fn pending_interrupt(&mut self) -> io::Result<bool> {
@@ -229,6 +251,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin, I: Interrupts> OperatorPeer<'_, S, I> {
         };
         if self.cancel_sent { return Err(self.abandon()); }
         if let Some(lease) = &mut self.lease { lease.stop(); }
+        if let Some(preview) = &mut self.preview { preview.stop(); }
         self.cancel_sent = true; // burn before any possibly partial control write
         self.inner.until = self.inner.until.min(Instant::now() + CANCEL_DRAIN_BUDGET);
         // Phase::Execution can only follow the authenticated adapter's exact
@@ -241,6 +264,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin, I: Interrupts> OperatorPeer<'_, S, I> {
         match lease.tick(Instant::now())? {
             Tick::Idle => Ok(()),
             Tick::Expired => {
+                if let Some(preview) = &mut self.preview { preview.stop(); }
                 // The worker owns process cleanup. Continue draining its typed
                 // terminal result, but never grant more execution time.
                 self.inner.until = self.inner.until.min(Instant::now() + CANCEL_DRAIN_BUDGET);
@@ -255,13 +279,35 @@ impl<S: AsyncRead + AsyncWrite + Unpin, I: Interrupts> OperatorPeer<'_, S, I> {
         }
     }
 
+    fn preview_tick(&mut self) -> io::Result<()> {
+        if self.lease.as_ref().is_some_and(ExecutionLease::renewal_pending) {
+            return Ok(());
+        }
+        let Some(preview) = &mut self.preview else { return Ok(()); };
+        let Some(frame) = preview.query(Instant::now()) else { return Ok(()); };
+        // One writer owns all controls. Optional observation gets a short write
+        // budget and cannot run through the next renewal wake. Failure after a
+        // partial frame still poisons the stream; it can never insert a renewal
+        // into those unfinished bytes.
+        let deadline = self.lease.as_ref().and_then(ExecutionLease::wake_at)
+            .map_or(Instant::now() + PREVIEW_WRITE_BUDGET,
+                |wake| wake.min(Instant::now() + PREVIEW_WRITE_BUDGET));
+        self.send_interruptibly(&frame, Some(deadline))
+    }
+
     fn receive_inner(&mut self) -> io::Result<Value> {
         loop {
             let budget = self.inner.remaining()?;
             let lease_wake = self.lease.as_ref().and_then(ExecutionLease::wake_at);
+            let preview_wake = if self.lease.as_ref().is_some_and(ExecutionLease::renewal_pending) {
+                None
+            } else {
+                self.preview.as_ref().and_then(PreviewSession::wake_at)
+            };
             let event = self.inner.runtime.block_on(async {
                 asupersync::time::timeout(asupersync::time::wall_now(), budget,
-                    next_event(&mut self.inner.stream, &mut self.inner.buffered, &mut self.interrupts, lease_wake),
+                    next_event(&mut self.inner.stream, &mut self.inner.buffered, &mut self.interrupts,
+                        lease_wake, preview_wake),
                 ).await.map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "worker read deadline"))?
             })?;
             // Decoding an immediately available frame is not permission to
@@ -270,6 +316,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin, I: Interrupts> OperatorPeer<'_, S, I> {
             match event {
                 Event::Interrupt => self.interrupt()?,
                 Event::Lease => self.lease_tick()?,
+                Event::Preview => self.preview_tick()?,
                 Event::Record(value) => {
                     if self.consume_cancel_reply(&value)? { continue; }
                     if value["kind"] == "execution-lease-renewed" {
@@ -278,14 +325,22 @@ impl<S: AsyncRead + AsyncWrite + Unpin, I: Interrupts> OperatorPeer<'_, S, I> {
                         })?;
                         lease.consume(&value, Instant::now())?;
                         if lease.stopped() && self.inner.phase == Phase::Execution {
+                            if let Some(preview) = &mut self.preview { preview.stop(); }
                             self.inner.until = self.inner.until.min(Instant::now() + CANCEL_DRAIN_BUDGET);
                         }
+                        continue;
+                    }
+                    if value["kind"] == "output-preview" {
+                        self.preview.as_mut().ok_or_else(|| {
+                            super::invalid("output preview without an observation owner")
+                        })?.consume(&value)?;
                         continue;
                     }
                     if self.inner.phase == Phase::Execution && value["kind"] == "exec-result" {
                         require(value["request_id"].as_u64() == self.execution,
                             "execution result does not match the interrupted operation")?;
                         if let Some(lease) = &mut self.lease { lease.stop(); }
+                        if let Some(preview) = &mut self.preview { preview.stop(); }
                         self.inner.phase = Phase::Transfer;
                         self.inner.until = Instant::now() + TRANSFER_BUDGET;
                     }
@@ -300,10 +355,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin, I: Interrupts> WorkerPeer for OperatorPe
     fn send(&mut self, frame: &Value) -> io::Result<()> {
         let result = (|| {
             self.inner.remaining()?;
-            require(frame["kind"] != "cancel" && frame["kind"] != "execution-lease-renew",
+            require(frame["kind"] != "cancel" && frame["kind"] != "execution-lease-renew"
+                && frame["kind"] != "output-preview",
                 "execution controls are owned by this authenticated connection")?;
             if self.pending_interrupt()? { self.interrupt()?; }
             if frame["kind"] == "session-ok" {
+                if let Some(preview) = &mut self.preview { preview.select(frame)?; }
                 if let Some(grant) = frame.get("execution_lease") {
                     require(self.lease.is_none() && self.execution.is_none(),
                         "execution lease cannot be renegotiated")?;
@@ -324,9 +381,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin, I: Interrupts> WorkerPeer for OperatorPe
                 self.inner.send(frame)?;
             }
             if frame["kind"] == "canonical-exec" {
-                self.execution = Some(frame["request_id"].as_u64()
-                    .ok_or_else(|| super::invalid("missing execution identity"))?);
+                let request_id = frame["request_id"].as_u64()
+                    .ok_or_else(|| super::invalid("missing execution identity"))?;
+                self.execution = Some(request_id);
                 if let Some(lease) = &mut self.lease { lease.arm(sent_at); }
+                if let Some(preview) = &mut self.preview { preview.arm(request_id); }
             }
             Ok(())
         })();
@@ -352,6 +411,10 @@ mod tests {
 
     mod lease_tests {
         include!("interrupt/lease_tests.rs");
+    }
+
+    mod preview_tests {
+        include!("interrupt/preview_tests.rs");
     }
 
     #[derive(Default)]

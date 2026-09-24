@@ -307,6 +307,7 @@ pub fn execute_prepared_operation(
     let mut on_listening = |address| claim.listening(address);
     let control = TlsOperationControl {
         cancellation: claim.cancellation(),
+        preview: claim.preview_observer(),
         on_listening: &mut on_listening,
     };
     let acknowledgment_only = claim.acknowledgment_only();
@@ -435,6 +436,7 @@ mod tests {
         let mut on_listening = |_| { listened = true; Ok(()) };
         let control = TlsOperationControl {
             cancellation:super::super::OperationCancellation::default(),
+            preview:None,
             on_listening:&mut on_listening,
         };
         let error = build.execute_bound(&request, Some(control)).unwrap_err();
@@ -470,7 +472,7 @@ mod tests {
         token.cancel();
         let mut on_listening = |_| panic!("cancelled operation cannot listen");
         let error = build.execute_bound(&request, Some(TlsOperationControl {
-            cancellation:token, on_listening:&mut on_listening,
+            cancellation:token, preview:None, on_listening:&mut on_listening,
         })).unwrap_err();
         assert!(error.detail.contains("cancelled before dispatch"));
         assert!(!error.execution_may_have_run);

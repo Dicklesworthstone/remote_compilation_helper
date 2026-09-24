@@ -20,7 +20,10 @@ use rabs_protocol::lease_semantics::{
     REQUEST_EXECUTION_LEASE_VERSION, RequestExecutionLease, RequestExecutionLeaseIdentity,
 };
 use rabs_wkr::artifacts::{self, ARTIFACT_TRANSFER, ArtifactPlan, ArtifactTransferState, CapturedArtifacts};
-use rabs_wkr::execution::{DEFAULT_EXECUTION_TIMEOUT, ExecutionCompletion, ExecutionTask, StopReason};
+use rabs_wkr::execution::{
+    DEFAULT_EXECUTION_TIMEOUT, OUTPUT_PREVIEW_VERSION, ExecutionCompletion, ExecutionTask,
+    StopReason, output_preview_reply,
+};
 use rabs_wkr::output::{CapturedOutputs, MAX_OUTPUT_CHUNK_BYTES};
 use rabs_wkr::request_journal::{RECOVERY_PROTOCOL, WorkerJournal};
 use rabs_wkr::result_spool::{RESULT_RETENTION, ResultRecipient, RetentionTarget};
@@ -43,6 +46,8 @@ mod reconnect;
 
 #[cfg(test)]
 mod execution_lease_session_tests;
+#[cfg(test)]
+mod output_preview_session_tests;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const MAX_FRAME_BYTES: usize = 1 << 20;
@@ -212,6 +217,7 @@ fn main() {
                  Select source_transfer=source-files-v1 to upload verified source before execution.\n\
                  Select result_retention=durable-result-v1 to retain complete results until acceptance.\n\
                  Authenticated execution requires a request-renewal-v1 lease and timely renewals.\n\
+                 Select output_preview=tail-v1 for bounded live diagnostics with explicit gaps.\n\
                  Fleet transport requires RABS_WORKER_TLS_CA, RABS_WORKER_TLS_CERT,\n\
                  RABS_WORKER_TLS_KEY and RABS_WORKER_TLS_SERVER_NAME.\n\
                  Request IDs must increase across restarts; request-status reconciles outcomes.\n\
@@ -491,14 +497,34 @@ where
         }, heartbeat).await
 }
 
+/// Existing source and lease tests explicitly select no optional live preview.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+async fn drive_session_with_sources<S, L, H>(
+    stream: &mut S, report: &rabs_wkr::session::CapabilityReport, once: bool,
+    journal: Option<&mut WorkerJournal>, artifact_transfer_enabled: bool,
+    source_transfer_enabled: bool, execution_lease: &ExecutionLeaseSelection,
+    launch: L, heartbeat: H,
+) -> Result<(), String>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+    L: FnMut(CanonicalExecRequest, Duration, Option<ArtifactPlan>, Option<SourceOwner>,
+        Option<(RequestExecutionLeaseIdentity, u64)>) -> io::Result<ExecutionTask>,
+    H: FnMut() -> rabs_wkr::session::PressureSample,
+{
+    drive_session_with_previews(stream, report, once, journal, artifact_transfer_enabled,
+        source_transfer_enabled, false, execution_lease, launch, heartbeat).await
+}
+
 /// Production always supplies a durable journal. None is a test seam, never an
 /// IO-failure fallback. Source and artifact negotiation/verification precede
 /// durable admission. Launch MUST retain the source owner through process drain.
 #[allow(clippy::too_many_arguments)]
-async fn drive_session_with_sources<S, L, H>(
+async fn drive_session_with_previews<S, L, H>(
     stream: &mut S, report: &rabs_wkr::session::CapabilityReport, once: bool,
     mut journal: Option<&mut WorkerJournal>, artifact_transfer_enabled: bool,
-    source_transfer_enabled: bool, execution_lease: &ExecutionLeaseSelection,
+    source_transfer_enabled: bool, output_preview_enabled: bool,
+    execution_lease: &ExecutionLeaseSelection,
     mut launch: L, mut heartbeat: H,
 ) -> Result<(), String>
 where
@@ -681,6 +707,18 @@ where
                         },
                         Some("execution-lease-renew") => execution_lease.renew(&value, active.as_ref())
                             .unwrap_or_else(|reason| request_error(request_id, &reason)),
+                        Some("output-preview") => {
+                            if !output_preview_enabled {
+                                request_error(request_id, "output preview not negotiated")
+                            } else {
+                                // Reads only the bounded observer owned by this
+                                // exact invocation. A late inactive reply is not
+                                // completion and never reads a retained spool.
+                                output_preview_reply(&value, active.as_ref(), last_admitted)
+                                    .map(|reply| reply.to_string())
+                                    .unwrap_or_else(|reason| request_error(request_id, &reason))
+                            }
+                        }
                         Some("canonical-exec") => {
                             let parsed = parse_exec_request(&value).and_then(|mut request| {
                                 // The lease authenticates the ORIGINAL serialized
@@ -779,6 +817,7 @@ fn worker_hello(report: &rabs_wkr::session::CapabilityReport, journal: &WorkerJo
         "kind": "worker-hello", "worker_id": report.worker_id,
         "canonical": report.canonical_namespace, "slots": report.slots, "token_id": 1,
         "output_transfers": [OUTPUT_TRANSFER], "artifact_transfers": [ARTIFACT_TRANSFER],
+        "output_previews": [OUTPUT_PREVIEW_VERSION],
         "source_transfers": [SOURCE_TRANSFER],
         "execution_leases": [REQUEST_EXECUTION_LEASE_VERSION],
         "command_contexts": [rabs_sandbox::process_context::COMMAND_CONTEXT_VERSION],
@@ -808,7 +847,7 @@ async fn session_loop(
         }
         rabs_asupersync::worker_transport::WorkerConnection::LoopbackFixture(_) => ResultRecipient::LoopbackFixture,
     };
-    let (capture_output, capture_artifacts, retain_result, receive_sources, execution_lease) = asupersync::time::timeout(
+    let (capture_output, capture_artifacts, retain_result, receive_sources, output_preview, execution_lease) = asupersync::time::timeout(
         asupersync::time::wall_now(),
         Duration::from_secs(10),
         async {
@@ -875,11 +914,12 @@ async fn session_loop(
             validate_recovery_selection(&ack)?;
             let retain = result_retention_requested(&ack)?;
             let source = source_transfer::selected(&ack)?;
+            let preview = output_preview_requested(&ack)?;
             let lease = execution_lease_selection(&ack, local_identity.is_some(), challenge_session, journal)?;
             if local_identity.is_some() && !output {
                 return Err("authenticated worker requires complete output retrieval".to_owned());
             }
-            Ok::<_, String>((output, artifacts, retain, source, lease))
+            Ok::<_, String>((output, artifacts, retain, source, preview, lease))
         },
     ).await.map_err(|_| "worker session admission deadline exceeded".to_owned())??;
     let cargo_home = std::env::temp_dir().join(format!("rabs-wkr-ch-{}", std::process::id()));
@@ -892,8 +932,8 @@ async fn session_loop(
     journal.clear_result_recipient();
     if retain_result { journal.authorize_result_recipient(recipient.clone()); }
     *admitted_at = Some(std::time::Instant::now());
-    let outcome = drive_session_with_sources(&mut stream, report, once, Some(&mut *journal), capture_artifacts,
-        receive_sources, &execution_lease, |request, timeout, artifacts, source, lease| {
+    let outcome = drive_session_with_previews(&mut stream, report, once, Some(&mut *journal), capture_artifacts,
+        receive_sources, output_preview, &execution_lease, |request, timeout, artifacts, source, lease| {
         let cargo_home = cargo_home.clone(); let home = home.clone(); let spills = spills.clone();
         let slots = report.slots;
         let id = request.request_id;
@@ -939,6 +979,16 @@ fn output_transfer_requested(frame: &str) -> Result<bool, String> {
     match value.get("output_transfer") {
         None => Ok(false), Some(value) if value.as_str() == Some(OUTPUT_TRANSFER) => Ok(true),
         Some(_) => Err("unsupported output_transfer selection".to_owned()),
+    }
+}
+
+fn output_preview_requested(frame: &str) -> Result<bool, String> {
+    let value: serde_json::Value = serde_json::from_str(frame)
+        .map_err(|error| format!("handshake JSON: {error}"))?;
+    match value.get("output_preview") {
+        None => Ok(false),
+        Some(value) if value.as_str() == Some(OUTPUT_PREVIEW_VERSION) => Ok(true),
+        Some(_) => Err("unsupported output_preview selection".to_owned()),
     }
 }
 
@@ -1213,6 +1263,19 @@ mod tests {
         for frame in [r#"{"kind":"error","reason":"session-ok denied"}"#, r#"{"reason":"session-ok"}"#,
             r#""session-ok""#, r#"{"kind":"session-ok"} trailing"#] {
             assert!(!session_ack_accepted(frame), "accepted invalid acknowledgment: {frame}");
+        }
+    }
+
+    #[test]
+    fn live_output_preview_is_optional_and_requires_the_exact_version() {
+        assert!(!output_preview_requested(r#"{"kind":"session-ok"}"#).unwrap());
+        assert!(output_preview_requested(r#"{"kind":"session-ok","output_preview":"tail-v1"}"#).unwrap());
+        for selection in [serde_json::Value::Null, serde_json::json!(true),
+            serde_json::json!("tail-v2"), serde_json::json!(["tail-v1"])]
+        {
+            assert!(output_preview_requested(&serde_json::json!({
+                "kind":"session-ok", "output_preview":selection,
+            }).to_string()).is_err());
         }
     }
 
@@ -1602,6 +1665,7 @@ mod tests {
         assert_eq!(hello["incarnation"], format!("{:032x}", journal.incarnation().0));
         assert_eq!(hello["request_high_water"], 80);
         assert_eq!(hello["recovery_protocols"][0], RECOVERY_PROTOCOL);
+        assert_eq!(hello["output_previews"], serde_json::json!([OUTPUT_PREVIEW_VERSION]));
         assert_eq!(hello["command_contexts"], serde_json::json!([rabs_sandbox::process_context::COMMAND_CONTEXT_VERSION]));
         assert!(validate_recovery_selection(r#"{"kind":"session-ok"}"#).is_ok());
         assert!(validate_recovery_selection(&serde_json::json!({"kind":"session-ok","recovery_protocol":RECOVERY_PROTOCOL}).to_string()).is_ok());

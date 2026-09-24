@@ -9,7 +9,9 @@
 
 mod completion;
 mod local_recovery;
+mod preview;
 pub use completion::{DiagnosticSnapshot, DiagnosticStream, PreparedCompletion};
+pub use preview::PreviewObserver;
 
 use super::secure_worker_delivery::{OperationCancellation, parse_worker_pin};
 use super::source_delivery::request_manifest;
@@ -74,6 +76,8 @@ pub struct OperationStatus {
     pub state: OperationState,
     pub request_sha256: String,
     pub request_id: u64,
+    /// Durable claim number, zero until the first execution owner is admitted.
+    pub attempt: u64,
     pub address: String,
     pub listen_address: Option<String>,
     pub worker: String,
@@ -143,6 +147,7 @@ impl Record {
             request_id: self.request["request_id"]
                 .as_u64()
                 .expect("validated request"),
+            attempt: self.attempt,
             address: self.spec.address.clone(),
             listen_address: self.listen_address.clone(),
             worker: self.spec.worker.clone(),
@@ -224,6 +229,7 @@ pub struct PreparedOperationStore {
     root: PathBuf,
     _lock: StoreLock,
     state: Mutex<State>,
+    previews: preview::PreviewRegistry,
     changed: Condvar,
     #[cfg(test)]
     fail_after_rename: std::sync::atomic::AtomicBool,
@@ -603,6 +609,7 @@ impl PreparedOperationStore {
                 poisoned: false,
             }),
             changed: Condvar::new(),
+            previews: preview::PreviewRegistry::default(),
             #[cfg(test)]
             fail_after_rename: std::sync::atomic::AtomicBool::new(false),
         });
@@ -675,6 +682,7 @@ impl PreparedOperationStore {
         if let Err(error) = self.persist(&record) {
             state.poisoned = true;
             state.accepting = false;
+            self.previews.stop();
             for cancellation in state.active.values() {
                 cancellation.cancel();
             }
@@ -950,8 +958,7 @@ impl PreparedOperationStore {
             .records
             .values()
             .filter(|record| {
-                record.state == OperationState::Queued
-                    && record.mode != StoredMode::LocalRecovery
+                record.state == OperationState::Queued && record.mode != StoredMode::LocalRecovery
             })
             .filter(|record| {
                 state.records.values().all(|other| {
@@ -990,6 +997,12 @@ impl PreparedOperationStore {
         }
         self.replace(&mut state, record.clone())?;
         state.active.insert(spec.id.clone(), cancellation.clone());
+        let preview = if record.mode == StoredMode::Execute {
+            self.previews
+                .register(&spec.id, &record.request_sha256, record.attempt)
+        } else {
+            None
+        };
         let claim = OperationClaim {
             store: Arc::clone(self),
             spec,
@@ -998,6 +1011,7 @@ impl PreparedOperationStore {
             resume_from: record.resume_from.clone(),
             attempt: record.attempt,
             cancellation: cancellation.clone(),
+            preview,
             finished: false,
         };
         Ok(Some(claim))
@@ -1005,6 +1019,7 @@ impl PreparedOperationStore {
 
     /// Shutdown leaves unclaimed requests queued and requests cleanup of owners.
     pub fn stop(&self) -> io::Result<()> {
+        self.previews.stop();
         let mut state = self
             .state
             .lock()
@@ -1038,6 +1053,7 @@ pub struct OperationClaim {
     resume_from: Option<PathBuf>,
     attempt: u64,
     cancellation: OperationCancellation,
+    preview: Option<PreviewObserver>,
     finished: bool,
 }
 
@@ -1060,6 +1076,11 @@ impl OperationClaim {
     }
     pub fn cancellation(&self) -> OperationCancellation {
         self.cancellation.clone()
+    }
+
+    /// Optional diagnostics exist only for this original execution attempt.
+    pub fn preview_observer(&self) -> Option<PreviewObserver> {
+        self.preview.clone()
     }
 
     pub fn acknowledgment_only(&self) -> bool {
@@ -1105,6 +1126,9 @@ impl OperationClaim {
     }
 
     pub fn finish(mut self, outcome: OperationOutcome) -> io::Result<OperationStatus> {
+        if let Some(preview) = &self.preview {
+            preview.close();
+        }
         let mut state = self.store.lock_state()?;
         let mut record = self.current(&state)?;
         record.listen_address = None;
@@ -1219,6 +1243,9 @@ impl OperationClaim {
 
 impl Drop for OperationClaim {
     fn drop(&mut self) {
+        if let Some(preview) = &self.preview {
+            preview.close();
+        }
         if self.finished {
             return;
         }

@@ -304,6 +304,7 @@ fn main() {
                  DAEMON JOB: rabsd --job-submit <id32hex> <listen-IP:port> <worker> <pin> <bundle> <delivery> <outputs>\n\
                  Inspect/cancel: --job-status <id32hex> | --job-cancel <id32hex>\n\
                  Wait and replay diagnostics: --job-wait <id32hex> [timeout-seconds]\n\
+                 Follow live NDJSON previews: --job-follow <id32hex> [timeout-seconds]\n\
                  Recover: --job-resume <id32hex> <new-delivery> [old-prefix-directory]\n\
                  Confirm release: --job-acknowledge <id32hex> <owned-delivery>\n\
                  Finish local installation: --job-recover-local <id32hex> <owned-delivery>\n\
@@ -334,7 +335,7 @@ fn main() {
         Some("--worker-build-tls") => {
             std::process::exit(worker_exec::run_build_tls(&args[1..]));
         }
-        Some("--job-submit" | "--job-status" | "--job-wait" | "--job-cancel" | "--job-resume" | "--job-acknowledge" | "--job-recover-local") => {
+        Some("--job-submit" | "--job-status" | "--job-wait" | "--job-follow" | "--job-cancel" | "--job-resume" | "--job-acknowledge" | "--job-recover-local") => {
             let config = match load_config() {
                 Ok(config) => config,
                 Err(error) => {

@@ -162,6 +162,10 @@ impl ExecutionLease {
         self.active.as_ref().map(|active| active.expires)
     }
 
+    pub(super) fn renewal_pending(&self) -> bool {
+        self.pending.is_some()
+    }
+
     pub(super) fn tick(&mut self, now: Instant) -> io::Result<Tick> {
         let Some(active) = &self.active else {
             return Ok(Tick::Idle);

@@ -38,6 +38,7 @@ mod admission;
 mod cancellation;
 mod interrupt;
 mod lease;
+mod preview;
 pub use admission::PinnedWorkerAdmission;
 pub use cancellation::OperationCancellation;
 use admission::AdmittedWorkerSession;
@@ -345,6 +346,13 @@ impl<P: WorkerPeer> WorkerPeer for AdmittedPeer<P> {
         grant["resume"] = json!("unsupported");
         if let Some(lease) = execution_lease {
             grant["execution_lease"] = lease;
+        }
+        if self.mode == DeliveryMode::Execute
+            && hello["output_previews"].as_array().is_some_and(|versions| {
+                versions.iter().any(|version| version == preview::VERSION)
+            })
+        {
+            grant["output_preview"] = json!(preview::VERSION);
         }
         self.inner.send(&grant)?;
         // Only now is the TLS-pinned identity's challenge complete. Keep source
@@ -819,6 +827,25 @@ pub fn receive_authenticated_controlled(
     resume_source: Option<&ResumeSource>,
     cancellation: OperationCancellation,
 ) -> Result<Delivery, DeliveryFailure> {
+    receive_authenticated_observed(runtime, peer, admission, request, destination,
+        mode, upload, resume_source, cancellation, None)
+}
+
+/// The daemon's optional observer receives bounded live tails. It has no access
+/// to the transport, cancellation, result retention or verified delivery state.
+#[allow(clippy::too_many_arguments)]
+pub fn receive_authenticated_observed(
+    runtime: &Runtime,
+    peer: AuthenticatedPeer,
+    admission: PinnedWorkerAdmission,
+    request: &Value,
+    destination: &Path,
+    mode: DeliveryMode,
+    upload: Option<&SourceUpload>,
+    resume_source: Option<&ResumeSource>,
+    cancellation: OperationCancellation,
+    observer: Option<crate::coord::prepared_operation::PreviewObserver>,
+) -> Result<Delivery, DeliveryFailure> {
     let failure = |error: io::Error| DeliveryFailure {
         directory: destination.to_path_buf(),
         execution_may_have_run: mode == DeliveryMode::Resume,
@@ -842,7 +869,7 @@ pub fn receive_authenticated_controlled(
     let raw = interrupt::OperatorPeer::with_interrupts(
         RecordPeer::new(runtime, peer.stream, request),
         interrupt::OperationInterrupts::new(cancellation),
-    );
+    ).with_preview_observer(if mode == DeliveryMode::Execute { observer } else { None });
     let mut admitted = AdmittedPeer::new(
         raw, peer.identity, admission.pin(), request, challenge_ids().map_err(&failure)?,
         mode, Arc::clone(&admission),

@@ -41,7 +41,7 @@ enum Completion {
     Ready(PreparedCompletion),
 }
 
-fn fingerprint(status: &Value, id: &str) -> io::Result<String> {
+pub(super) fn fingerprint(status: &Value, id: &str) -> io::Result<String> {
     let value = status["request_sha256"].as_str().ok_or_else(|| invalid("job status lacks its request identity"))?;
     if status["id"] != id || value.len() != 64
         || !value.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
@@ -51,7 +51,7 @@ fn fingerprint(status: &Value, id: &str) -> io::Result<String> {
     Ok(value.to_owned())
 }
 
-fn matches_status(proof: &PreparedCompletion, status: &Value, id: &str, digest: &str) -> io::Result<()> {
+pub(super) fn matches_status(proof: &PreparedCompletion, status: &Value, id: &str, digest: &str) -> io::Result<()> {
     if proof.operation_id != id || proof.request_sha256 != digest
         || status["state"] != if proof.stop_reason.as_deref() == Some("cancelled") {"cancelled"} else {"completed"}
         || status["request_id"].as_u64() != Some(proof.request_id)

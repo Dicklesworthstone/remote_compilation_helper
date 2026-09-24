@@ -2,6 +2,7 @@
 //! The coordinator region owns every blocking executor through shutdown. A
 //! client disconnect never drops a queued job or authorizes another execution.
 
+mod follow;
 mod wait;
 
 use asupersync::io::{AsyncReadExt, AsyncWriteExt};
@@ -286,7 +287,7 @@ async fn exchange_frames(
     let reply = read_frame(stream, until).await?;
     if !matches!(
         reply["kind"].as_str(),
-        Some("prepared-operation" | "prepared-operation-error" | "prepared-completion")
+        Some("prepared-operation" | "prepared-operation-error" | "prepared-completion" | "prepared-preview")
     ) {
         return Err(invalid(
             "unexpected daemon job reply; inspect the same job ID",
@@ -321,6 +322,21 @@ async fn exchange_frames(
     {
         return Err(invalid("daemon returned status instead of a verified completion"));
     }
+    if reply["kind"] == "prepared-preview" {
+        if request["kind"] != "prepared-preview"
+            || reply.get("operation_id") != request.get("operation_id")
+            || reply.get("request_sha256") != request.get("request_sha256")
+            || reply.get("attempt") != request.get("attempt")
+            || reply["complete"] != false
+            || reply["publication_authorized"] != false
+        {
+            return Err(invalid("daemon preview differs from the selected read-only attempt"));
+        }
+    } else if request["kind"] == "prepared-preview"
+        && reply["kind"] != "prepared-operation-error"
+    {
+        return Err(invalid("daemon returned another operation instead of a preview"));
+    }
     remaining(until)?;
     Ok(reply)
 }
@@ -328,6 +344,9 @@ async fn exchange_frames(
 pub(crate) fn run(args: &[String], socket: &str) -> i32 {
     if args.first().is_some_and(|arg| arg == "--job-wait") {
         return wait::run(args, socket);
+    }
+    if args.first().is_some_and(|arg| arg == "--job-follow") {
+        return follow::run(args, socket);
     }
     let request = match request(args) {
         Ok(request) => request,
@@ -337,6 +356,7 @@ pub(crate) fn run(args: &[String], socket: &str) -> i32 {
                 --job-submit <id32hex> <listen-IP:port> <worker> <pin> <bundle> <delivery> <output>\n\
                 --job-status <id32hex>\n\
                 --job-wait <id32hex> [timeout-seconds]\n\
+                --job-follow <id32hex> [timeout-seconds]\n\
                 --job-cancel <id32hex>\n\
                 --job-resume <id32hex> <new-delivery> [old-prefix-directory]\n\
                 --job-acknowledge <id32hex> <owned-delivery>\n\
