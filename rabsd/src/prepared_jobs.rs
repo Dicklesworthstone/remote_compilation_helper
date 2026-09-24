@@ -2,6 +2,8 @@
 //! The coordinator region owns every blocking executor through shutdown. A
 //! client disconnect never drops a queued job or authorizes another execution.
 
+mod wait;
+
 use asupersync::io::{AsyncReadExt, AsyncWriteExt};
 use asupersync::net::unix::UnixStream;
 use rabs_asupersync::daemon_runtime::SubsystemWork;
@@ -274,7 +276,7 @@ async fn exchange_frames(
     let reply = read_frame(stream, until).await?;
     if !matches!(
         reply["kind"].as_str(),
-        Some("prepared-operation" | "prepared-operation-error")
+        Some("prepared-operation" | "prepared-operation-error" | "prepared-completion")
     ) {
         return Err(invalid(
             "unexpected daemon job reply; inspect the same job ID",
@@ -292,11 +294,31 @@ async fn exchange_frames(
             ));
         }
     }
+    if reply["kind"] == "prepared-completion" {
+        let expected_id = request.get("operation_id");
+        if request["kind"] != "prepared-completion"
+            || expected_id.is_none()
+            || reply.get("operation_id") != expected_id
+            || reply["completion"].get("operation_id") != expected_id
+            || reply["completion"].get("request_sha256") != request.get("request_sha256")
+            || reply["publication_authorized"] != false
+            || reply["reexecute"] != false
+        {
+            return Err(invalid("daemon completion differs from the selected read-only request"));
+        }
+    } else if request["kind"] == "prepared-completion"
+        && reply["kind"] != "prepared-operation-error"
+    {
+        return Err(invalid("daemon returned status instead of a verified completion"));
+    }
     remaining(until)?;
     Ok(reply)
 }
 
 pub(crate) fn run(args: &[String], socket: &str) -> i32 {
+    if args.first().is_some_and(|arg| arg == "--job-wait") {
+        return wait::run(args, socket);
+    }
     let request = match request(args) {
         Ok(request) => request,
         Err(detail) => {
@@ -304,6 +326,7 @@ pub(crate) fn run(args: &[String], socket: &str) -> i32 {
                 "rabsd: {detail}\n\
                 --job-submit <id32hex> <listen-IP:port> <worker> <pin> <bundle> <delivery> <output>\n\
                 --job-status <id32hex>\n\
+                --job-wait <id32hex> [timeout-seconds]\n\
                 --job-cancel <id32hex>\n\
                 --job-resume <id32hex> <new-delivery> [old-prefix-directory]\n\
                 --job-acknowledge <id32hex> <owned-delivery>\n\

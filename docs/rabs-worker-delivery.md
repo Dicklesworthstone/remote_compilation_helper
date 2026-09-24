@@ -458,6 +458,60 @@ new admissions; completed records are not silently erased. These jobs provide
 authenticated execution and explicit output installation. They do not grant
 semantic action-cache publication or Cargo freshness authority.
 
+### Wait for a daemon job and replay its compiler diagnostics
+
+After submitting a prepared job, a shell or CI caller can wait for that exact
+job and receive its original compiler exit status and binary diagnostics:
+
+```sh
+rabsd --job-wait 0123456789abcdef0123456789abcdef 3600
+```
+
+The timeout is optional (default 3,600 seconds), must be a positive decimal
+number of seconds, and cannot exceed 86,400. Waiting is read-only: it polls
+status and asks the local daemon to verify a terminal delivery. It never submits,
+resumes, acknowledges, cancels, or dispatches worker execution. An uncertain
+job, unavailable daemon, changed identity, or failed verification stops the
+client; none triggers compilation or an automatic reconciliation attempt.
+Interrupting the client leaves the daemon-owned job alone. Use `--job-cancel`
+explicitly to cancel work, and the existing resume/acknowledge commands when
+the job requires outcome reconciliation.
+
+For a delivered result, the daemon checks the entire retained artifact and
+diagnostic tree against its saved original request and worker key. It releases
+the operation-store mutex while hashing and runs this work on the bounded
+filesystem lane, not the cancellation/status lane. It rejects a recovery/state
+change observed during verification. The reply contains only bounded completion
+metadata, not the full saved request, command environment, or bulk file bytes.
+This works after daemon restart without the original bundle or worker credentials.
+
+The local client checks that metadata against the job it followed, verifies the
+receipt, and copies BOTH diagnostic streams into independent private temporary
+files while rehashing every byte. Neither stream is printed until both copies
+verify. It then emits raw stdout to stdout and raw stderr to stderr and exits
+with the original compiler code. Failed compilation is not converted to exit
+zero. Cancellation before dispatch returns 130 with no diagnostic-file access.
+A successful job must have recorded a verified output installation; this is a
+historical installation fact, not continuous monitoring of later user edits.
+
+This is terminal diagnostic replay, not live streaming during compilation.
+Per-stream byte order is preserved; historical cross-stream interleaving cannot
+be reconstructed. Each explicit invocation may print the diagnostics again.
+Failed/partial console writes stop without automatic replay, and typed client
+errors distinguish possible diagnostic exposure. No status JSON is mixed into
+successful compiler stdout or stderr. The client uses temporary disk space up
+to the combined diagnostic size (bounded by the existing 1 GiB delivery limit).
+Network calls share the overall wait deadline with per-exchange caps; copies
+check that deadline between chunks. Blocking filesystem operations and console
+writes are not promised interruptible. Both state and delivery paths remain
+operator-owned; this is not a hostile same-user filesystem API.
+
+Qualification: `cargo test -p rabsd prepared_operation::completion`,
+`cargo test -p rabsd --bin rabsd prepared_jobs::wait`, and
+`cargo test -p rabsd --test prepared_job_wait`. The process test runs the actual
+daemon and client over UDS after production receiver/store setup with a scripted
+transport-admitted peer. It does not run a compiler, TLS session, or fleet gate.
+
 ### Authenticated delivery
 
 Provision an explicit CA plus server and worker certificates with the appropriate
