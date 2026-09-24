@@ -393,13 +393,14 @@ async fn handle_connection(
                 status_on_lane(&limits.control, coord.clone()).await
             }
             Ok(value) if matches!(value.get("kind").and_then(|k| k.as_str()),
-                Some("prepared-submit" | "prepared-status" | "prepared-cancel" | "prepared-resume" | "prepared-acknowledge")) => {
-                // Reading a bundle can be slower than a cancellation/status
-                // transaction. Admission has its own bounded blocking lane.
-                let lane = if value["kind"] == "prepared-submit" {
-                    &limits.prepared_admission
-                } else {
-                    &limits.control
+                Some("prepared-submit" | "prepared-status" | "prepared-cancel" | "prepared-resume" | "prepared-acknowledge" | "prepared-completion")) => {
+                // Bundle admission and complete result verification perform
+                // filesystem work. Neither may occupy the cancellation/status
+                // lane or the reactor while hashing a large delivered tree.
+                let lane = match value["kind"].as_str() {
+                    Some("prepared-submit") => &limits.prepared_admission,
+                    Some("prepared-completion") => &limits.materialization,
+                    _ => &limits.control,
                 };
                 prepared_on_lane(lane, prepared_operations.clone(), value).await
             }
@@ -549,6 +550,7 @@ fn prepared_reply(
         let fields: &[&str] = match kind {
             "prepared-submit" => &["kind", "operation"],
             "prepared-status" | "prepared-cancel" => &["kind", "operation_id"],
+            "prepared-completion" => &["kind", "operation_id", "request_sha256"],
             "prepared-resume" => &["kind", "operation_id", "delivery", "resume_from"],
             "prepared-acknowledge" => &["kind", "operation_id", "delivery"],
             _ => return Err(invalid("unknown prepared operation")),
@@ -558,6 +560,20 @@ fn prepared_reply(
             .is_none_or(|object| object.keys().any(|key| !fields.contains(&key.as_str())))
         {
             return Err(invalid("unexpected prepared operation field"));
+        }
+        if kind == "prepared-completion" {
+            let id = request["operation_id"]
+                .as_str()
+                .ok_or_else(|| invalid("missing operation_id"))?;
+            let fingerprint = request["request_sha256"]
+                .as_str()
+                .ok_or_else(|| invalid("missing completion request identity"))?;
+            let completion = operations.completion(id, fingerprint)?;
+            return Ok(serde_json::json!({
+                "kind":"prepared-completion", "operation_id":id,
+                "completion":completion, "publication_authorized":false,
+                "reexecute":false,
+            }));
         }
         let status = if kind == "prepared-submit" {
             let spec: PreparedOperationSpec = serde_json::from_value(request["operation"].clone())

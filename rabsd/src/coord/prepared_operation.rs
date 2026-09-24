@@ -7,6 +7,9 @@
 //! manifest by the execution adapter; a mutable bundle cannot change the request.
 //! State and build directories are operator-owned, not hostile shared storage.
 
+mod completion;
+pub use completion::{DiagnosticSnapshot, DiagnosticStream, PreparedCompletion};
+
 use super::secure_worker_delivery::{OperationCancellation, parse_worker_pin};
 use super::source_delivery::request_manifest;
 use super::worker_delivery::{DeliveryMode, MAX_FRAME_BYTES, toolchain_identity, validate_request};
