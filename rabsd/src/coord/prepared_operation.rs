@@ -96,6 +96,10 @@ pub struct OperationStatus {
     /// The observed compiler completed successfully and its outputs were installed.
     pub succeeded: bool,
     pub detail: Option<String>,
+    /// Optional lossy tail from this exact live execution attempt. Never persisted
+    /// and never a substitute for the independently verified terminal diagnostics.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub live_diagnostics: Option<Value>,
 }
 
 /// Only the actual execution adapter can supply observed delivery outcomes.
@@ -172,6 +176,7 @@ impl Record {
                 && self.stop_reason.is_none()
                 && self.outputs_installed,
             detail: self.detail.clone(),
+            live_diagnostics: None,
         }
     }
 
@@ -792,7 +797,22 @@ impl PreparedOperationStore {
 
     pub fn status(&self, id: &str) -> io::Result<Option<OperationStatus>> {
         require(valid_id(id), "invalid operation id")?;
-        Ok(self.lock_state()?.records.get(id).map(Record::status))
+        // Release the durable state lock before looking at optional diagnostics.
+        // The existing preview registry uses try_lock and binds its response to
+        // the exact saved request and attempt captured by this status snapshot.
+        let mut status = self.lock_state()?.records.get(id).map(Record::status);
+        if let Some(status) = &mut status
+            && status.mode == "execute"
+            && matches!(status.state, OperationState::Running | OperationState::Cancelling)
+        {
+            status.live_diagnostics = self
+                .preview(id, &status.request_sha256, status.attempt, 0, 0)
+                .ok()
+                .filter(|reply| reply["available"] == true);
+            // Missing support, contention, closure, or a racing recovery omits
+            // the field. None is not an empty stream or terminal evidence.
+        }
+        Ok(status)
     }
 
     pub fn cancel(&self, id: &str) -> io::Result<OperationStatus> {
