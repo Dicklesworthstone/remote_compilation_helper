@@ -6,6 +6,9 @@
 //! and JOINS, never detaches a compiler that may still mutate its workspace.
 //! The executor must cooperate through `ExecutionControl::reason`.
 
+mod preview;
+pub use preview::{OUTPUT_PREVIEW_VERSION, output_preview_reply};
+use rabs_asupersync::stream_drain::preview::LiveOutputPreview;
 use std::future::poll_fn;
 use std::io;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -92,6 +95,7 @@ pub struct ExecutionControl {
     deadline: Instant,
     output: Arc<Mutex<OutputCapture>>,
     artifacts: Arc<Mutex<ArtifactCapture>>,
+    preview: Arc<LiveOutputPreview>,
 }
 
 impl ExecutionControl {
@@ -108,6 +112,7 @@ impl ExecutionControl {
             deadline,
             output: Arc::new(Mutex::new(OutputCapture::default())),
             artifacts: Arc::new(Mutex::new(ArtifactCapture::default())),
+            preview: Arc::new(LiveOutputPreview::default()),
         })
     }
 

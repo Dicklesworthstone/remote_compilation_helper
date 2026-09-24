@@ -428,7 +428,12 @@ fn execute_canonical_inner(
         resident_bound: EXEC_STREAM_RESIDENT_BOUND,
         spill_dir: spill_root.join(format!("attempt-{}", request.request_id)),
     };
-    let outcome = match group.wait_with_bounded_drain_controlled(&limits, || control.reason().is_some()) {
+    // Live tails are observational only. The SAME managed wait still owns the
+    // aggregate capture budget, cancellation, descendant cleanup and full spools.
+    let outcome = match group.wait_with_bounded_drain_preview(
+        &limits, rabs_asupersync::stream_drain::DEFAULT_MAX_CAPTURE_BYTES,
+        Some(control.output_observer()), || control.reason().is_some(),
+    ) {
         Ok(output) => {
             // A same-credential host mutation is outside namespace isolation.
             // Detect retained backing changes before offering successful output;
