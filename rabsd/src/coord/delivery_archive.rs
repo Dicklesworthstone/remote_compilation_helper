@@ -7,6 +7,10 @@
 //! Restore verifies into a private staging tree and runs the ordinary delivery
 //! recovery verifier before exposing delivery.json. Failures never execute work.
 
+mod resume;
+
+pub use resume::finish_staged_restore;
+
 use super::delivery_recovery::{DeliveryTrust, recover_existing_delivery};
 use super::worker_delivery::{
     Delivery, MAX_DELIVERY_BYTES, create_artifact_directories, validate_request,
@@ -30,6 +34,7 @@ const KIND: &str = "rabs.worker-delivery-archive.v1";
 const PIN_CLASS: &str = "delivery-archive";
 const PIN_OWNER: &str = "rabs-delivery-archive";
 const MAX_INDEX_BYTES: u64 = 2 * 1024 * 1024;
+const RESTORE_STAGING_PREFIX: &str = ".rabs-delivery-restore-";
 
 fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
@@ -429,6 +434,126 @@ fn sync_dirs(root: &Path) -> io::Result<()> {
     File::open(root)?.sync_all()
 }
 
+/// The authenticated transport policy is still checked by the ordinary
+/// delivery verifier. This structure binds its bytes to ONE pinned archive,
+/// not merely to an execution request that could have multiple outcomes.
+struct ArchiveContents {
+    receipt: Value,
+    plan: BTreeMap<String, Item>,
+    objects: Vec<TypedDigest>,
+}
+
+fn load_archive(
+    store: &mut dyn RabsMetadataStore,
+    root_key: &str,
+    request: &Value,
+    worker: &str,
+) -> io::Result<ArchiveContents> {
+    let root = parse_archive_key(root_key).map_err(io::Error::other)?;
+    require(
+        check_pin(store, &root)?,
+        "archive has no active retention pin",
+    )?;
+    let (mut file, _) = open_object(store, &root, MAX_INDEX_BYTES)?;
+    let mut bytes = Vec::new();
+    let digests = stream(&mut file, &mut bytes, MAX_INDEX_BYTES)?;
+    require(
+        digests.atp_content_id == root,
+        "archive index changed while reading",
+    )?;
+    let index: Value = serde_json::from_slice(&bytes)?;
+    require(
+        index.as_object().is_some_and(|map| map.len() == 4)
+            && number(&index, "version")? == 1
+            && text(&index, "kind")? == KIND,
+        "unsupported archive index",
+    )?;
+    let receipt = &index["receipt"];
+    require(
+        text(receipt, "worker_id")? == worker
+            && number(receipt, "request_id")? == number(request, "request_id")?
+            && text(receipt, "request_sha256")?
+                == hex(&Sha256::digest(serde_json::to_vec(request)?)),
+        "archive belongs to a different worker or request",
+    )?;
+    let plan = items(request, &index["receipt"])?;
+    let references = index["objects"]
+        .as_array()
+        .ok_or_else(|| invalid("archive object list"))?;
+    require(
+        references.len() == plan.len(),
+        "archive object set mismatch",
+    )?;
+    let mut objects = Vec::new();
+    for (entry, (path, _)) in references.iter().zip(&plan) {
+        let pair = entry
+            .as_array()
+            .ok_or_else(|| invalid("archive object entry"))?;
+        require(
+            pair.len() == 2 && pair[0].as_str() == Some(path.as_str()),
+            "archive path/order mismatch",
+        )?;
+        let object =
+            parse_archive_key(pair[1].as_str().ok_or_else(|| invalid("object digest"))?)
+                .map_err(io::Error::other)?;
+        objects.push(object);
+    }
+    require(
+        store.manifest_meta(&root).map_err(failure)?
+            == Some((KIND.to_owned(), plan.len() as u64)),
+        "archive metadata mismatch",
+    )?;
+    for object in &objects {
+        not_quarantined(store, object)?;
+    }
+    Ok(ArchiveContents {
+        receipt: index["receipt"].clone(),
+        plan,
+        objects,
+    })
+}
+
+/// Verify the ordinary delivery frontier AND its exact native archive identity.
+/// Completion and idempotent retries share this gate; neither may accept another
+/// nondeterministic execution merely because it has the same request identity.
+fn verify_archive_directory(
+    request: &Value,
+    worker: &str,
+    directory: &Path,
+    trust: DeliveryTrust,
+    archive: &ArchiveContents,
+) -> io::Result<Option<Delivery>> {
+    let Some(delivery) = recover_existing_delivery(request, worker, directory, trust)
+        .map_err(|e| io::Error::other(e.to_string()))?
+    else {
+        return Ok(None);
+    };
+    require(
+        delivery.receipt == archive.receipt,
+        "existing delivery belongs to a different archive result",
+    )?;
+    for ((path, item), object) in archive.plan.iter().zip(&archive.objects) {
+        let mut file = ordinary_file(&directory.join(path))?;
+        let digests = stream(&mut file, &mut io::sink(), item.len)?;
+        require(
+            digests.atp_content_id == *object && matches_item(&digests, item),
+            "existing delivery differs from this archive's object map",
+        )?;
+    }
+    Ok(Some(delivery))
+}
+
+fn publish_restore(staging: &Path, destination: &Path) -> io::Result<()> {
+    // Preserve the ancestor durability barrier, then use the SAME atomic,
+    // no-replace directory publication as output installation. An empty
+    // directory created by a racing caller must not be overwritten either.
+    // A post-rename sync error leaves a complete, idempotently verifiable tree.
+    for ancestor in destination.ancestors().skip(1) {
+        File::open(ancestor)?.sync_all()?;
+    }
+    rabs_cas::materialization::publish_new_directory(staging, destination)
+}
+
 /// Restore the exact archived delivery to a new or already-complete directory. This is not a cache
 /// lookup: the original request and historical trust policy are mandatory. No
 /// source delivery, worker connection, or compiler is needed. Failed staging is
@@ -459,86 +584,15 @@ pub fn restore_delivery(
                     .all(|part| matches!(part, Component::RootDir | Component::Normal(_))),
             "invalid restore destination",
         )?;
-        let root = parse_archive_key(root_key).map_err(io::Error::other)?;
         let mut store = cas
             .store()
             .lock()
             .map_err(|_| invalid("CAS metadata lock poisoned"))?;
         store.intern_domain(ATP_OBJECT_CONTENT_DOMAIN);
-        require(
-            check_pin(&mut *store, &root)?,
-            "archive has no active retention pin",
-        )?;
-        let (mut file, _) = open_object(&mut *store, &root, MAX_INDEX_BYTES)?;
-        let mut bytes = Vec::new();
-        let digests = stream(&mut file, &mut bytes, MAX_INDEX_BYTES)?;
-        require(
-            digests.atp_content_id == root,
-            "archive index changed while reading",
-        )?;
-        let index: Value = serde_json::from_slice(&bytes)?;
-        require(
-            index.as_object().is_some_and(|map| map.len() == 4)
-                && number(&index, "version")? == 1
-                && text(&index, "kind")? == KIND,
-            "unsupported archive index",
-        )?;
-        let receipt = &index["receipt"];
-        require(
-            text(receipt, "worker_id")? == worker
-                && number(receipt, "request_id")? == number(request, "request_id")?
-                && text(receipt, "request_sha256")?
-                    == hex(&Sha256::digest(serde_json::to_vec(request)?)),
-            "archive belongs to a different worker or request",
-        )?;
-        let plan = items(request, &index["receipt"])?;
-        let references = index["objects"]
-            .as_array()
-            .ok_or_else(|| invalid("archive object list"))?;
-        require(
-            references.len() == plan.len(),
-            "archive object set mismatch",
-        )?;
-        let mut objects = Vec::new();
-        for (entry, (path, _)) in references.iter().zip(&plan) {
-            let pair = entry
-                .as_array()
-                .ok_or_else(|| invalid("archive object entry"))?;
-            require(
-                pair.len() == 2 && pair[0].as_str() == Some(path.as_str()),
-                "archive path/order mismatch",
-            )?;
-            let object =
-                parse_archive_key(pair[1].as_str().ok_or_else(|| invalid("object digest"))?)
-                    .map_err(io::Error::other)?;
-            objects.push(object);
-        }
-        require(
-            store.manifest_meta(&root).map_err(failure)?
-                == Some((KIND.to_owned(), plan.len() as u64)),
-            "archive metadata mismatch",
-        )?;
-        for object in &objects {
-            not_quarantined(&mut *store, object)?;
-        }
-        if let Some(mut existing) = recover_existing_delivery(request, worker, destination, trust)
-            .map_err(|e| io::Error::other(e.to_string()))?
+        let archive = load_archive(&mut *store, root_key, request, worker)?;
+        if let Some(mut existing) =
+            verify_archive_directory(request, worker, destination, trust, &archive)?
         {
-            require(
-                existing.receipt == index["receipt"],
-                "existing delivery belongs to a different archive result",
-            )?;
-            // The request alone is not a result identity: two nondeterministic
-            // executions may share it. Also verify each native CAS identity,
-            // rather than trusting only the receipt's raw content hashes.
-            for ((path, item), object) in plan.iter().zip(&objects) {
-                let mut file = ordinary_file(&destination.join(path))?;
-                let digests = stream(&mut file, &mut io::sink(), item.len)?;
-                require(
-                    digests.atp_content_id == *object && matches_item(&digests, item),
-                    "existing delivery differs from this archive's object map",
-                )?;
-            }
             existing.acknowledgment_error = Some(
                 "verified an existing CAS restore; remote acknowledgments were not rechecked"
                     .to_owned(),
@@ -554,7 +608,7 @@ pub fn restore_delivery(
             .parent()
             .ok_or_else(|| invalid("restore destination has no parent"))?;
         let staging = tempfile::Builder::new()
-            .prefix(".rabs-delivery-restore-")
+            .prefix(RESTORE_STAGING_PREFIX)
             .tempdir_in(parent)?
             .keep();
         retained_staging = Some(staging.clone());
@@ -562,9 +616,9 @@ pub fn restore_delivery(
         mkdir(&staging.join("artifacts"))?;
         create_artifact_directories(
             &staging.join("artifacts"),
-            plan.keys().filter_map(|path| path.strip_prefix("artifacts/")),
+            archive.plan.keys().filter_map(|path| path.strip_prefix("artifacts/")),
         )?;
-        for ((path, item), object) in plan.iter().zip(&objects) {
+        for ((path, item), object) in archive.plan.iter().zip(&archive.objects) {
             let target = staging.join(path);
             let (mut source, location) = open_object(&mut *store, object, item.len)?;
             let mut output = create_file(&target)?;
@@ -591,22 +645,14 @@ pub fn restore_delivery(
             output.sync_all()?;
         }
         let mut marker = create_file(&staging.join("delivery.json"))?;
-        marker.write_all(&serde_json::to_vec(&index["receipt"])?)?;
+        marker.write_all(&serde_json::to_vec(&archive.receipt)?)?;
         marker.sync_all()?;
         drop(marker);
         sync_dirs(&staging)?;
         let verified = recover_existing_delivery(request, worker, &staging, trust)
             .map_err(|e| io::Error::other(e.to_string()))?
             .ok_or_else(|| invalid("restored staging disappeared"))?;
-        // Preserve the ancestor durability barrier, then use the SAME atomic,
-        // no-replace directory publication as output installation. In particular,
-        // an empty directory created by a racing caller must not be overwritten.
-        // If the post-rename sync fails, an idempotent retry verifies the complete
-        // destination rather than dispatching work or racing a second writer.
-        for ancestor in parent.ancestors() {
-            File::open(ancestor)?.sync_all()?;
-        }
-        rabs_cas::materialization::publish_new_directory(&staging, destination)?;
+        publish_restore(&staging, destination)?;
         Ok(Delivery {
             directory: destination.to_path_buf(),
             receipt: verified.receipt,

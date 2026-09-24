@@ -1,5 +1,7 @@
 //! Explicit archival/recovery operator path. Never launches a worker/compiler.
-use rabsd::coord::delivery_archive::{archive_delivery, parse_archive_key, restore_delivery};
+use rabsd::coord::delivery_archive::{
+    archive_delivery, finish_staged_restore, parse_archive_key, restore_delivery,
+};
 use rabsd::coord::delivery_recovery::{DeliveryTrust, install_delivery_outputs};
 use rabsd::coord::worker_delivery::{MAX_FRAME_BYTES, validate_request};
 use rabsd::janitor::store::mount_and_reconcile;
@@ -8,9 +10,13 @@ use std::path::Path;
 
 const USAGE: &str = "rabs-delivery-cas archive CAS_ROOT REQUEST_JSON WORKER DELIVERY_DIR TRUST\n\
     rabs-delivery-cas restore CAS_ROOT ROOT_OBJECT REQUEST_JSON WORKER NEW_DIR TRUST\n\
+    rabs-delivery-cas finish-restore CAS_ROOT ROOT_OBJECT REQUEST_JSON WORKER STAGING_DIR NEW_DIR TRUST\n\
     rabs-delivery-cas install REQUEST_JSON WORKER DELIVERY_DIR NEW_OUTPUT_DIR TRUST\n\
     TRUST is loopback or spki:<64 lowercase hex digits>.\n\
-    Archive/restore use exclusive CAS ownership; stop the daemon or choose a separate store.\n\
+    Archive/restore/finish-restore use exclusive CAS ownership; stop the daemon or choose a separate store.\n\
+    Finish-restore revalidates a complete private staging sibling and publishes it without recopying.\n\
+    Missing/partial staging, writable aliases, mismatches and quarantined objects are refused.\n\
+    No staging discovery or partial-tree adoption is performed.\n\
     Install copies verified artifacts without a worker connection or CAS mount.\n\
     Complete matching restores/installs are verified and reused, never overwritten. Archive pins do not expire.\n\
     This does not publish an action, authorize reuse, or rerun compilation.";
@@ -56,6 +62,22 @@ fn run(args: &[String]) -> Result<serde_json::Value, String> {
             let trust = trust(&args[6])?;
             let cas = mount_and_reconcile(Path::new(&args[1]))?;
             Ok(restore_delivery(&cas,&args[2],&request,&args[4],Path::new(&args[5]),trust)?.to_json())
+        }
+        Some("finish-restore") if args.len() == 8 => {
+            parse_archive_key(&args[2])?;
+            let request = request(Path::new(&args[3]))?;
+            let trust = trust(&args[7])?;
+            let cas = mount_and_reconcile(Path::new(&args[1]))?;
+            Ok(finish_staged_restore(
+                &cas,
+                &args[2],
+                &request,
+                &args[4],
+                Path::new(&args[5]),
+                Path::new(&args[6]),
+                trust,
+            )?
+            .to_json())
         }
         _ => Err(USAGE.to_owned()),
     }
