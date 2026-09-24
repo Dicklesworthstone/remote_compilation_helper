@@ -10,6 +10,13 @@ use asupersync::io::{AsyncReadExt, AsyncWriteExt};
 use asupersync::runtime::RuntimeBuilder;
 use rabs_asupersync::worker_transport::{SecureWorkerStream, TlsFiles, connect_peer};
 use rabs_sandbox::source_transfer::{MAX_SOURCE_CHUNK, SOURCE_TRANSFER, SourceReceiver};
+#[cfg(target_os = "linux")]
+use rabs_sandbox::toolchain_dataset::{PreparedToolchain, ToolchainLimits};
+#[cfg(target_os = "linux")]
+use rabs_sandbox::toolchain_transfer::{
+    MAX_TOOLCHAIN_CHUNK, TOOLCHAIN_TRANSFER_VERSION, ToolchainEntry, ToolchainEntryKind,
+    ToolchainReceiver,
+};
 use rabsd::coord::source_delivery::{prepare_source_bundle, request_manifest};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -1452,8 +1459,84 @@ fn prepared_build_bundle(root: &Path) -> (PathBuf, Value, Vec<u8>) {
     (bundle, request, source)
 }
 
+/// The original compiler installation is moved and changed before the operator
+/// starts. A successful upload must therefore come from the retained dataset,
+/// including metadata that an ordinary source-file projection cannot represent.
+#[cfg(target_os = "linux")]
+fn prepared_toolchain_bundle(root: &Path) -> (PathBuf, Value, Vec<u8>) {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    fs::set_permissions(root, fs::Permissions::from_mode(0o700)).unwrap();
+    let checkout = root.join("checkout");
+    fs::create_dir_all(checkout.join("src")).unwrap();
+    fs::write(
+        checkout.join("src/lib.rs"),
+        vec![b'x'; MAX_SOURCE_CHUNK + 17],
+    )
+    .unwrap();
+    fs::write(checkout.join("unselected.secret"), b"must remain local").unwrap();
+    let toolchain = root.join("local-toolchain");
+    fs::create_dir_all(toolchain.join("bin")).unwrap();
+    fs::create_dir_all(toolchain.join("lib/empty-directory")).unwrap();
+    let binary: Vec<u8> = (0..MAX_TOOLCHAIN_CHUNK * 2 + 37)
+        .map(|index| (index % 256) as u8)
+        .collect();
+    fs::write(toolchain.join("bin/probe"), &binary).unwrap();
+    fs::set_permissions(
+        toolchain.join("bin/probe"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    fs::write(toolchain.join("empty-file"), b"").unwrap();
+    symlink("probe", toolchain.join("bin/alias")).unwrap();
+    symlink("../bin/probe", toolchain.join("lib/probe")).unwrap();
+
+    let mut specification = request();
+    specification
+        .as_object_mut()
+        .unwrap()
+        .remove("workspace_backing");
+    specification
+        .as_object_mut()
+        .unwrap()
+        .remove("toolchain_backing");
+    specification["program"] = json!("/__rabs/toolchain/bin/probe");
+    specification["source_files"] = json!(["src/lib.rs"]);
+    specification["toolchain_source"] = json!(toolchain);
+    specification["timeout_ms"] = json!(10000);
+    specification["future_semantics"] = json!({"must_preserve":"cold worker toolchain"});
+    let summary = prepare_source_bundle(&checkout, &specification, &root.join("bundle")).unwrap();
+    assert_eq!(summary["executed"], false);
+    assert_eq!(summary["publication_authorized"], false);
+    let bundle = PathBuf::from(summary["directory"].as_str().unwrap());
+    let request: Value =
+        serde_json::from_slice(&fs::read(bundle.join("request.json")).unwrap()).unwrap();
+    assert!(request.get("toolchain_source").is_none());
+    assert!(request.get("toolchain_backing").is_none());
+    assert_eq!(request["toolchain_transfer"], "toolchain-tree-v1");
+    assert_eq!(request["toolchain_identity"]["files"], 2);
+    assert_eq!(request["toolchain_identity"]["bytes"], binary.len());
+    assert!(!request.to_string().contains(toolchain.to_str().unwrap()));
+    assert_eq!(
+        fs::read(bundle.join("toolchain/bin/probe")).unwrap(),
+        binary
+    );
+    assert!(bundle.join("toolchain/lib/empty-directory").is_dir());
+    assert!(!bundle.join("source/unselected.secret").exists());
+
+    let moved = root.join("original-toolchain-moved");
+    fs::rename(&toolchain, &moved).unwrap();
+    fs::write(
+        moved.join("bin/probe"),
+        b"different original compiler bytes",
+    )
+    .unwrap();
+    fs::write(checkout.join("src/lib.rs"), b"changed checkout").unwrap();
+    (bundle, request, binary)
+}
+
 /// Feed the actual TLS upload into the worker's real source receiver. Only
-/// after its complete closure seals does the peer accept the exact execution.
+/// after its complete closure seals may the next input stage or execution begin.
 async fn receive_prepared_source(
     stream: &mut SecureWorkerStream,
     request: &Value,
@@ -1531,11 +1614,390 @@ async fn receive_prepared_source(
     )
     .await
     .unwrap();
+}
+
+/// This peer uses the real streaming receiver and its independently recomputed
+/// dataset identity. It supplies no execution result until both input stages
+/// have sealed and the operator sends the exact original execution request.
+#[cfg(target_os = "linux")]
+async fn receive_prepared_toolchain(
+    stream: &mut SecureWorkerStream,
+    request: &Value,
+    destination: &Path,
+    corrupt_seal_reply: bool,
+) -> PreparedToolchain {
+    let identity = rabsd::coord::worker_delivery::toolchain_identity(request)
+        .unwrap()
+        .unwrap();
+    let sha256 = &request["toolchain_identity"]["sha256"];
+    let begin = receive(stream).await.unwrap();
+    assert_eq!(
+        begin,
+        json!({"kind":"toolchain-begin", "request_id":request["request_id"],
+            "identity":request["toolchain_identity"], "entries":8})
+    );
+    let mut receiver =
+        ToolchainReceiver::create(destination, identity, ToolchainLimits::default()).unwrap();
+    send(
+        stream,
+        &json!({"kind":"toolchain-ready", "request_id":request["request_id"],
+            "sha256":sha256, "sealed":false}),
+    )
+    .await
+    .unwrap();
+    let mut chunks = 0;
+    for _ in 0..begin["entries"].as_u64().unwrap() {
+        let frame = receive(stream).await.unwrap();
+        assert_eq!(frame.as_object().unwrap().len(), 5);
+        assert_eq!(frame["kind"], "toolchain-entry");
+        assert_eq!(frame["request_id"], request["request_id"]);
+        assert_eq!(frame["sha256"], *sha256);
+        let path = frame["path"].as_str().unwrap();
+        let entry = &frame["entry"];
+        let kind = match entry["kind"].as_str().unwrap() {
+            "directory" => {
+                assert_eq!(entry.as_object().unwrap().len(), 1);
+                ToolchainEntryKind::Directory
+            }
+            "symlink" => {
+                assert_eq!(entry.as_object().unwrap().len(), 2);
+                ToolchainEntryKind::Symlink {
+                    target: entry["target"].as_str().unwrap().to_owned(),
+                }
+            }
+            "file" => {
+                assert_eq!(entry.as_object().unwrap().len(), 3);
+                ToolchainEntryKind::File {
+                    bytes: entry["bytes"].as_u64().unwrap(),
+                    executable: entry["executable"].as_bool().unwrap(),
+                }
+            }
+            other => panic!("unexpected transferred toolchain entry {other}"),
+        };
+        receiver
+            .entry(ToolchainEntry {
+                path: path.to_owned(),
+                kind: kind.clone(),
+            })
+            .unwrap();
+        send(
+            stream,
+            &json!({"kind":"toolchain-entry-accepted", "request_id":request["request_id"],
+                "sha256":sha256, "path":path}),
+        )
+        .await
+        .unwrap();
+        if let ToolchainEntryKind::File { bytes: length, .. } = kind {
+            let mut offset = 0;
+            while offset < length {
+                let frame = receive(stream).await.unwrap();
+                assert_eq!(frame.as_object().unwrap().len(), 7);
+                assert_eq!(frame["kind"], "toolchain-chunk");
+                assert_eq!(frame["request_id"], request["request_id"]);
+                assert_eq!(frame["sha256"], *sha256);
+                assert_eq!(frame["path"], path);
+                assert_eq!(frame["offset"], offset);
+                let encoded = frame["data_hex"].as_str().unwrap();
+                assert!(
+                    !encoded.is_empty()
+                        && encoded.len() <= MAX_TOOLCHAIN_CHUNK * 2
+                        && encoded.len().is_multiple_of(2)
+                );
+                let bytes: Vec<u8> = encoded
+                    .as_bytes()
+                    .chunks_exact(2)
+                    .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+                    .collect();
+                assert_eq!(frame["chunk_sha256"], hash(&bytes));
+                receiver
+                    .write_chunk(path, offset, &bytes, Sha256::digest(&bytes).into())
+                    .unwrap();
+                offset += bytes.len() as u64;
+                send(
+                    stream,
+                    &json!({"kind":"toolchain-chunk-accepted", "request_id":request["request_id"],
+                        "sha256":sha256, "path":path, "next_offset":offset}),
+                )
+                .await
+                .unwrap();
+                chunks += 1;
+            }
+        }
+    }
+    assert_eq!(
+        chunks, 3,
+        "fixture must cross multiple toolchain chunk boundaries"
+    );
     assert_eq!(
         receive(stream).await.unwrap(),
-        *request,
-        "saved request must be dispatched exactly once after sealing"
+        json!({"kind":"toolchain-seal", "request_id":request["request_id"], "sha256":sha256})
     );
+    assert_eq!(receiver.entry_count(), 8);
+    assert_eq!(receiver.received_bytes(), identity.bytes);
+    let prepared = receiver.seal(|| false).unwrap();
+    assert_eq!(prepared.identity(), &identity);
+    let mut reply = json!({"kind":"toolchain-ready", "request_id":request["request_id"],
+        "sha256":sha256, "sealed":true});
+    if corrupt_seal_reply {
+        reply["sha256"] = json!("00".repeat(32));
+        assert_ne!(reply["sha256"], *sha256);
+    }
+    send(stream, &reply).await.unwrap();
+    prepared
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn actual_prepared_toolchain_refuses_unsupported_worker_before_any_upload() {
+    let certificates = Certificates::new();
+    let owner = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(owner.path()).unwrap();
+    let (bundle, _, binary) = prepared_toolchain_bundle(&root);
+    let delivery = root.join("delivery");
+    let outputs = root.join("outputs");
+    let pin = certificates.pin();
+    let mut receiver = Receiver::spawn_build(
+        &root,
+        &pin,
+        Some(&certificates.server),
+        &bundle,
+        &delivery,
+        &outputs,
+        false,
+    );
+    let address = receiver.listening();
+    let runtime = RuntimeBuilder::current_thread().build().unwrap();
+    runtime.block_on(async {
+        asupersync::time::timeout(
+            asupersync::time::wall_now(),
+            Duration::from_secs(15),
+            async {
+                let mut peer = connect_peer(&address, "localhost", &certificates.worker)
+                    .await
+                    .unwrap();
+                let mut offered = hello(&pin);
+                offered["source_transfers"] = json!([SOURCE_TRANSFER]);
+                offered["toolchain_datasets"] = json!(["toolchain-dataset-v1"]);
+                send(&mut peer.stream, &offered).await.unwrap();
+                assert!(
+                    receive(&mut peer.stream).await.is_err(),
+                    "a worker without tree transfer received a challenge, source or compiler bytes"
+                );
+            },
+        )
+        .await
+        .expect("toolchain capability refusal timed out");
+    });
+    assert!(!receiver.wait().success(), "{}", receiver.logs());
+    let failure: Value = receiver
+        .logs()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|value| value["kind"] == "worker-build-error")
+        .expect("typed build refusal");
+    assert_eq!(failure["execution_may_have_run"], false);
+    assert_eq!(failure["reexecute"], false);
+    assert!(!delivery.exists());
+    assert!(!outputs.exists());
+    assert_eq!(
+        fs::read(bundle.join("toolchain/bin/probe")).unwrap(),
+        binary
+    );
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn actual_prepared_toolchain_transfers_complete_tree_before_dispatch_and_replays_offline() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let certificates = Certificates::new();
+    let owner = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(owner.path()).unwrap();
+    let (bundle, request, binary) = prepared_toolchain_bundle(&root);
+    let delivery = root.join("delivery");
+    let outputs = root.join("outputs");
+    let received_source = root.join("worker-source");
+    let received_toolchain = root.join("worker-toolchain");
+    let pin = certificates.pin();
+    let mut receiver = Receiver::spawn_build(
+        &root,
+        &pin,
+        Some(&certificates.server),
+        &bundle,
+        &delivery,
+        &outputs,
+        false,
+    );
+    let address = receiver.listening();
+    let runtime = RuntimeBuilder::current_thread().build().unwrap();
+    runtime.block_on(async {
+        asupersync::time::timeout(
+            asupersync::time::wall_now(),
+            Duration::from_secs(15),
+            async {
+                let mut peer = connect_peer(&address, "localhost", &certificates.worker)
+                    .await
+                    .unwrap();
+                let mut offered = hello(&pin);
+                offered["source_transfers"] = json!([SOURCE_TRANSFER]);
+                offered["toolchain_datasets"] = json!(["toolchain-dataset-v1"]);
+                offered["toolchain_transfers"] = json!([TOOLCHAIN_TRANSFER_VERSION]);
+                let (session, grant) = authenticate_grant(&mut peer.stream, &pin, &offered).await;
+                assert_eq!(grant["source_transfer"], SOURCE_TRANSFER);
+                assert_eq!(grant["toolchain_transfer"], TOOLCHAIN_TRANSFER_VERSION);
+                assert_eq!(
+                    grant["execution_lease"]["request_sha256"],
+                    hash(&serde_json::to_vec(&request).unwrap())
+                );
+                receive_prepared_source(&mut peer.stream, &request, &received_source).await;
+                let toolchain = receive_prepared_toolchain(
+                    &mut peer.stream,
+                    &request,
+                    &received_toolchain,
+                    false,
+                )
+                .await;
+                assert_eq!(
+                    receive(&mut peer.stream).await.unwrap(),
+                    request,
+                    "execution must preserve the original request after BOTH input seals"
+                );
+                assert_eq!(
+                    fs::read(received_toolchain.join("bin/probe")).unwrap(),
+                    binary
+                );
+                assert_eq!(
+                    fs::read(received_toolchain.join("bin/alias")).unwrap(),
+                    binary
+                );
+                assert_eq!(
+                    fs::read(received_toolchain.join("lib/probe")).unwrap(),
+                    binary
+                );
+                assert_eq!(
+                    fs::read_link(received_toolchain.join("lib/probe")).unwrap(),
+                    PathBuf::from("../bin/probe")
+                );
+                assert!(received_toolchain.join("lib/empty-directory").is_dir());
+                assert_eq!(
+                    fs::read(received_toolchain.join("empty-file")).unwrap(),
+                    b""
+                );
+                assert_eq!(
+                    fs::metadata(received_toolchain.join("bin/probe"))
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    0o555
+                );
+                assert_ne!(
+                    fs::metadata(received_toolchain.join("bin/probe"))
+                        .unwrap()
+                        .ino(),
+                    fs::metadata(bundle.join("toolchain/bin/probe"))
+                        .unwrap()
+                        .ino()
+                );
+                assert!(!received_source.join("unselected.secret").exists());
+                assert!(!outputs.exists());
+                deliver(&mut peer.stream, &delivery, &pin, session, false).await;
+                toolchain.verify(|| false).unwrap();
+            },
+        )
+        .await
+        .expect("prepared full-toolchain exchange timed out");
+    });
+    assert!(receiver.wait().success(), "{}", receiver.logs());
+    let report: Value = serde_json::from_slice(&fs::read(&receiver.stdout).unwrap()).unwrap();
+    assert_eq!(report["delivery"]["acknowledgments_confirmed"], true);
+    assert_eq!(
+        report["delivery"]["receipt"]["request_sha256"],
+        hash(&serde_json::to_vec(&request).unwrap())
+    );
+    assert_eq!(report["publication_authorized"], false);
+    assert_eq!(report["reexecute"], false);
+    assert_eq!(fs::read(outputs.join("a")).unwrap(), ARTIFACT);
+    let receipt = fs::read(delivery.join("delivery.json")).unwrap();
+    let installed_inode = fs::metadata(outputs.join("a")).unwrap().ino();
+    drop(receiver);
+    fs::rename(bundle.join("source"), root.join("source-offline")).unwrap();
+    fs::rename(bundle.join("toolchain"), root.join("toolchain-offline")).unwrap();
+    let mut offline = Receiver::spawn_build(&root, &pin, None, &bundle, &delivery, &outputs, false);
+    assert!(offline.wait().success(), "{}", offline.logs());
+    assert!(!offline.logs().contains("worker-exec-listening"));
+    assert_eq!(fs::read(delivery.join("delivery.json")).unwrap(), receipt);
+    assert_eq!(
+        fs::metadata(outputs.join("a")).unwrap().ino(),
+        installed_inode
+    );
+    assert_eq!(fs::read(outputs.join("a")).unwrap(), ARTIFACT);
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn actual_prepared_toolchain_rejects_forged_seal_without_dispatch_or_output_install() {
+    let certificates = Certificates::new();
+    let owner = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(owner.path()).unwrap();
+    let (bundle, request, _) = prepared_toolchain_bundle(&root);
+    let delivery = root.join("delivery");
+    let outputs = root.join("outputs");
+    let pin = certificates.pin();
+    let mut receiver = Receiver::spawn_build(
+        &root,
+        &pin,
+        Some(&certificates.server),
+        &bundle,
+        &delivery,
+        &outputs,
+        false,
+    );
+    let address = receiver.listening();
+    let runtime = RuntimeBuilder::current_thread().build().unwrap();
+    runtime.block_on(async {
+        asupersync::time::timeout(
+            asupersync::time::wall_now(),
+            Duration::from_secs(15),
+            async {
+                let mut peer = connect_peer(&address, "localhost", &certificates.worker)
+                    .await
+                    .unwrap();
+                let mut offered = hello(&pin);
+                offered["source_transfers"] = json!([SOURCE_TRANSFER]);
+                offered["toolchain_datasets"] = json!(["toolchain-dataset-v1"]);
+                offered["toolchain_transfers"] = json!([TOOLCHAIN_TRANSFER_VERSION]);
+                authenticate_grant(&mut peer.stream, &pin, &offered).await;
+                receive_prepared_source(&mut peer.stream, &request, &root.join("worker-source"))
+                    .await;
+                let _toolchain = receive_prepared_toolchain(
+                    &mut peer.stream,
+                    &request,
+                    &root.join("worker-toolchain"),
+                    true,
+                )
+                .await;
+                assert!(
+                    receive(&mut peer.stream).await.is_err(),
+                    "a toolchain seal for another identity received execution or another upload"
+                );
+            },
+        )
+        .await
+        .expect("forged toolchain seal refusal timed out");
+    });
+    assert!(!receiver.wait().success(), "{}", receiver.logs());
+    let failure: Value = receiver
+        .logs()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|value| value["kind"] == "worker-build-error")
+        .expect("typed toolchain refusal");
+    assert_eq!(failure["execution_may_have_run"], false);
+    assert_eq!(failure["reexecute"], false);
+    assert!(receiver.logs().contains("toolchain acknowledgment"));
+    assert!(!delivery.join("delivery.json").exists());
+    assert!(!outputs.exists());
 }
 
 #[test]
@@ -1578,6 +2040,11 @@ fn actual_prepared_build_uploads_installs_and_replays_offline_after_ack_loss() {
                     hash(&serde_json::to_vec(&request).unwrap())
                 );
                 receive_prepared_source(&mut peer.stream, &request, &received_source).await;
+                assert_eq!(
+                    receive(&mut peer.stream).await.unwrap(),
+                    request,
+                    "saved request must be dispatched exactly once after sealing"
+                );
                 assert_eq!(
                     fs::read(received_source.join("src/lib.rs")).unwrap(),
                     source

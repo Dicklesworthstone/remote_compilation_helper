@@ -294,8 +294,19 @@ pub fn validate_request(request: &Value) -> io::Result<()> {
         request.get("toolchain_source").is_none(),
         "toolchain_source is local preparation input, not an execution field",
     )?;
-    toolchain_identity(request)?;
-    for field in ["program", "toolchain_backing"] {
+    let toolchain = toolchain_identity(request)?;
+    let transferred_toolchain = toolchain_transfer(request)?;
+    let fields: &[&str] = if transferred_toolchain {
+        require(toolchain.is_some(), "toolchain transfer requires a complete identity")?;
+        require(request.get("toolchain_backing").is_none(),
+            "toolchain transfer cannot fall back to a worker path")?;
+        require(request.get("source_manifest").is_some(),
+            "toolchain transfer requires a prepared source manifest")?;
+        &["program"]
+    } else {
+        &["program", "toolchain_backing"]
+    };
+    for field in fields {
         let value = text(request, field)?;
         require(
             !value.is_empty() && !value.contains('\0'),
@@ -333,6 +344,16 @@ pub fn validate_request(request: &Value) -> io::Result<()> {
         serde_json::to_vec(request)?.len() <= MAX_FRAME_BYTES,
         "request frame too large",
     )
+}
+
+/// A transferred compiler is selected explicitly and never by a worker hint.
+/// Recovery retains this selection in request identity without needing bytes.
+pub fn toolchain_transfer(request: &Value) -> io::Result<bool> {
+    match request.get("toolchain_transfer") {
+        None => Ok(false),
+        Some(value) if value == rabs_sandbox::toolchain_transfer::TOOLCHAIN_TRANSFER_VERSION => Ok(true),
+        Some(_) => Err(invalid("unsupported toolchain transfer selection")),
+    }
 }
 
 /// Parse the exact expected dataset before any worker admission or source upload.
@@ -783,6 +804,12 @@ pub fn receive_operation(
                 "worker lacks required toolchain-dataset-v1 execution binding",
             )?;
         }
+        if mode == DeliveryMode::Execute && toolchain_transfer(request)? {
+            require(
+                supports("toolchain_transfers", rabs_sandbox::toolchain_transfer::TOOLCHAIN_TRANSFER_VERSION),
+                "worker lacks required toolchain-tree-v1 transfer capability",
+            )?;
+        }
         let incarnation = text(&hello, "incarnation")?;
         require(
             is_hex(incarnation, 32) && incarnation.bytes().any(|b| b != b'0'),
@@ -828,6 +855,8 @@ pub fn receive_operation(
         }
         peer.negotiate(&hello, &ack)?;
         let authentication = peer.authentication();
+        require(mode != DeliveryMode::Execute || !toolchain_transfer(request)? || authentication.is_some(),
+            "transferred toolchains require authenticated execution admission")?;
         execution_may_have_run = true; // before even a partially successful write
         peer.send(&dispatch)?;
         let result = receive(peer, expected_worker)?;
@@ -1898,6 +1927,48 @@ mod tests {
             assert!(peer.sent.is_empty());
             assert!(!destination.exists());
         }
+    }
+
+    #[test]
+    fn toolchain_transfer_requires_source_identity_and_excludes_host_path_fallback() {
+        let source = tempfile::tempdir().unwrap();
+        let (_, mut request) = source_request(source.path());
+        request["toolchain_transfer"] = json!("toolchain-tree-v1");
+        request["toolchain_identity"] = toolchain_identity_value(&ToolchainIdentity {
+            sha256:[0xab;32], files:1, bytes:12,
+        });
+        assert!(validate_request(&request).is_err(), "worker backing and transfer cannot coexist");
+        request.as_object_mut().unwrap().remove("toolchain_backing");
+        validate_request(&request).unwrap();
+        for field in ["toolchain_identity", "source_manifest"] {
+            let mut incomplete = request.clone();
+            incomplete.as_object_mut().unwrap().remove(field);
+            assert!(validate_request(&incomplete).is_err(), "{field}");
+        }
+        for selection in [Value::Null, json!(true), json!("toolchain-tree-v2")] {
+            request["toolchain_transfer"] = selection;
+            assert!(validate_request(&request).is_err());
+        }
+    }
+
+    #[test]
+    fn unsupported_toolchain_transport_refuses_before_admission_or_dispatch() {
+        let source = tempfile::tempdir().unwrap();
+        let (_, mut request) = source_request(source.path());
+        request.as_object_mut().unwrap().remove("toolchain_backing");
+        request["toolchain_transfer"] = json!("toolchain-tree-v1");
+        request["toolchain_identity"] = toolchain_identity_value(&ToolchainIdentity {
+            sha256:[0xab;32], files:1, bytes:12,
+        });
+        let owner = tempfile::tempdir().unwrap();
+        let destination = owner.path().join("delivery");
+        let mut peer = fixture(&destination);
+        peer.replies[0]["toolchain_datasets"] = json!([TOOLCHAIN_DATASET_VERSION]);
+        let failure = receive_execution(&mut peer, &request, "worker", &destination).unwrap_err();
+        assert!(!failure.execution_may_have_run);
+        assert!(failure.detail.contains("toolchain-tree-v1"));
+        assert!(peer.sent.is_empty());
+        assert!(!destination.exists());
     }
 
     #[test]

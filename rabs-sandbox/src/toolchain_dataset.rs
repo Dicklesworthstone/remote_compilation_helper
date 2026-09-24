@@ -20,6 +20,10 @@ use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use crate::toolchain_transfer::ToolchainEntry;
+#[cfg(target_os = "linux")]
+use crate::toolchain_transfer::ToolchainEntryKind;
+
 pub const TOOLCHAIN_DATASET_VERSION: &str = "toolchain-dataset-v1";
 
 /// Portable content identity, independent of host backing paths and inode IDs.
@@ -67,6 +71,56 @@ impl PreparedToolchain {
     #[must_use]
     pub const fn identity(&self) -> &ToolchainIdentity {
         &self.identity
+    }
+
+    /// Export the retained namespace in the same order used by its identity.
+    /// File contents remain on disk and are read through [`Self::read_chunk`].
+    pub fn entries(&self) -> io::Result<Vec<ToolchainEntry>> {
+        #[cfg(target_os = "linux")]
+        {
+            self.inventory.transfer_entries()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Err(unsupported())
+        }
+    }
+
+    /// Read a bounded range through the retained, descriptor-anchored inventory.
+    /// A mutation or replacement of a selected file invalidates that read. The
+    /// receiver must verify its complete reconstructed tree against the retained
+    /// identity before accepting the seal; no second sender-wide hash is needed.
+    pub fn read_chunk(
+        &self,
+        path: &str,
+        offset: u64,
+        maximum: usize,
+        stopped: impl Fn() -> bool,
+    ) -> io::Result<Vec<u8>> {
+        #[cfg(target_os = "linux")]
+        {
+            self.inventory.read_chunk(path, offset, maximum, &stopped)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (path, offset, maximum, stopped);
+            Err(unsupported())
+        }
+    }
+
+    /// Make the retained files and namespace durable before publishing a local
+    /// bundle's readiness marker. Descriptors stay anchored to this inventory;
+    /// directory syncs run after file syncs and from children to parents.
+    pub fn sync(&self, stopped: impl Fn() -> bool) -> io::Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            self.inventory.sync(&stopped)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = stopped;
+            Err(unsupported())
+        }
     }
 
     /// Rehash the retained bytes through anchored descriptors and reject any
@@ -161,14 +215,47 @@ pub fn capture_toolchain(
     }
 }
 
+/// Open an already retained tree without copying it, requiring the exact
+/// selected identity. This performs the same complete scan, byte hashing and
+/// mutation barrier as capture. The caller owns the root and its private parent
+/// for the returned object's lifetime; this does not make arbitrary host paths
+/// immutable or grant action-cache authority.
+pub fn open_toolchain(
+    root: &Path,
+    expected: &ToolchainIdentity,
+    limits: &ToolchainLimits,
+    stopped: impl Fn() -> bool,
+) -> io::Result<PreparedToolchain> {
+    #[cfg(target_os = "linux")]
+    {
+        let inventory = linux::Inventory::scan(root, limits, &stopped)?;
+        let identity = inventory.stream(None, &stopped)?;
+        inventory.verify(&stopped)?;
+        require(
+            identity == *expected,
+            "retained toolchain identity mismatch",
+        )?;
+        Ok(PreparedToolchain {
+            root: root.to_owned(),
+            identity,
+            inventory,
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (root, expected, limits, stopped);
+        Err(unsupported())
+    }
+}
+
 #[cfg(target_os = "linux")]
 mod linux {
     use super::*;
     use rustix::fs::{CWD, Dir, Mode, OFlags, ResolveFlags, openat2, readlinkat};
     use sha2::{Digest, Sha256};
-    use std::collections::{BTreeMap, VecDeque};
+    use std::collections::BTreeMap;
     use std::fs::{self, Metadata, OpenOptions};
-    use std::io::{Read, Write};
+    use std::io::{Read, Seek, SeekFrom, Write};
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt, symlink};
     use std::path::Component;
 
@@ -238,6 +325,106 @@ mod linux {
     }
 
     impl Inventory {
+        pub(super) fn sync(&self, stopped: &impl Fn() -> bool) -> io::Result<()> {
+            self.verify(stopped)?;
+            for (path, entry) in &self.entries {
+                checkpoint(stopped)?;
+                if matches!(entry.kind, Kind::File) {
+                    self.open(path, OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOCTTY)?
+                        .sync_all()?;
+                }
+            }
+            for (path, entry) in self.entries.iter().rev() {
+                checkpoint(stopped)?;
+                if matches!(entry.kind, Kind::Directory) {
+                    if path.is_empty() {
+                        self.root.sync_all()?;
+                    } else {
+                        self.open(path, OFlags::RDONLY | OFlags::DIRECTORY)?
+                            .sync_all()?;
+                    }
+                }
+            }
+            self.verify(stopped)
+        }
+
+        pub(super) fn transfer_entries(&self) -> io::Result<Vec<ToolchainEntry>> {
+            let mut metadata_bytes = 0_usize;
+            let mut entries = Vec::with_capacity(self.entries.len());
+            for (path, entry) in &self.entries {
+                let kind = match &entry.kind {
+                    Kind::Directory => ToolchainEntryKind::Directory,
+                    Kind::Link(target) => ToolchainEntryKind::Symlink {
+                        target: target.clone(),
+                    },
+                    Kind::File => ToolchainEntryKind::File {
+                        bytes: entry.stamp.size,
+                        executable: entry.stamp.mode & 0o111 != 0,
+                    },
+                };
+                let transfer = ToolchainEntry {
+                    path: path.clone(),
+                    kind,
+                };
+                metadata_bytes = metadata_bytes
+                    .checked_add(transfer.metadata_bytes())
+                    .filter(|bytes| {
+                        *bytes <= crate::toolchain_transfer::MAX_TOOLCHAIN_METADATA_BYTES
+                    })
+                    .ok_or_else(|| invalid("toolchain transfer metadata limit exceeded"))?;
+                entries.push(transfer);
+            }
+            Ok(entries)
+        }
+
+        pub(super) fn read_chunk(
+            &self,
+            path: &str,
+            offset: u64,
+            maximum: usize,
+            stopped: &impl Fn() -> bool,
+        ) -> io::Result<Vec<u8>> {
+            checkpoint(stopped)?;
+            require(
+                maximum > 0 && maximum <= crate::toolchain_transfer::MAX_TOOLCHAIN_CHUNK,
+                "toolchain chunk size outside its bound",
+            )?;
+            let entry = self
+                .entries
+                .get(path)
+                .filter(|entry| matches!(entry.kind, Kind::File))
+                .ok_or_else(|| invalid("toolchain chunk must name an inventoried regular file"))?;
+            require(
+                offset <= entry.stamp.size,
+                "toolchain chunk offset exceeds file",
+            )?;
+            let root = self
+                .entries
+                .get("")
+                .ok_or_else(|| invalid("missing toolchain root"))?;
+            require(
+                Stamp::of(&fs::symlink_metadata(&self.root_path)?) == root.stamp,
+                "toolchain root changed during export",
+            )?;
+            let mut source = self.open(path, OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOCTTY)?;
+            require(
+                Stamp::of(&source.metadata()?) == entry.stamp,
+                "toolchain file changed before export",
+            )?;
+            source.seek(SeekFrom::Start(offset))?;
+            let length = usize::try_from((entry.stamp.size - offset).min(maximum as u64))
+                .map_err(|_| invalid("toolchain chunk length overflow"))?;
+            let mut bytes = vec![0; length];
+            source.read_exact(&mut bytes)?;
+            checkpoint(stopped)?;
+            require(
+                Stamp::of(&source.metadata()?) == entry.stamp
+                    && Stamp::of(&self.open(path, OFlags::PATH)?.metadata()?) == entry.stamp,
+                "toolchain file changed during export",
+            )?;
+            Ok(bytes)
+        }
+
         pub(super) fn scan(
             root: &Path,
             limits: &ToolchainLimits,
@@ -393,50 +580,14 @@ mod linux {
         }
 
         fn validate_link(&self, path: &str, target: &str) -> io::Result<()> {
-            let mut resolved: Vec<String> = path.split('/').map(str::to_owned).collect();
-            resolved.pop();
-            let mut pending: VecDeque<String> = target.split('/').map(str::to_owned).collect();
-            let mut traversals = 0;
-            while let Some(component) = pending.pop_front() {
-                match component.as_str() {
-                    "" | "." => continue,
-                    ".." => {
-                        require(
-                            resolved.pop().is_some(),
-                            "toolchain symlink escapes its root",
-                        )?;
-                    }
-                    _ => {
-                        resolved.push(component);
-                        let entry = self
-                            .entries
-                            .get(&resolved.join("/"))
-                            .ok_or_else(|| invalid("toolchain symlink target is absent"))?;
-                        match &entry.kind {
-                            Kind::Link(target) => {
-                                traversals += 1;
-                                require(
-                                    traversals <= 40,
-                                    "toolchain symlink cycle or excessive chain",
-                                )?;
-                                resolved.pop();
-                                for component in target.split('/').rev() {
-                                    pending.push_front(component.to_owned());
-                                }
-                            }
-                            Kind::File => require(
-                                pending.is_empty(),
-                                "toolchain symlink traverses a regular file",
-                            )?,
-                            Kind::Directory => {}
-                        }
-                    }
-                }
-            }
-            require(
-                self.entries.contains_key(&resolved.join("/")),
-                "toolchain symlink target is absent",
-            )
+            use crate::toolchain_transfer::{LinkNode, validate_link};
+            validate_link(path, target, |name| {
+                self.entries.get(name).map(|entry| match &entry.kind {
+                    Kind::Directory => LinkNode::Directory,
+                    Kind::File => LinkNode::File,
+                    Kind::Link(target) => LinkNode::Symlink(target),
+                })
+            })
         }
 
         pub(super) fn verify(&self, stopped: &impl Fn() -> bool) -> io::Result<()> {

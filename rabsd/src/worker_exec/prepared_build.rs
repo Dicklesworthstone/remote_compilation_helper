@@ -165,6 +165,7 @@ impl PreparedBuild<'_> {
                     }
                 }
                 let source = self.bundle.join("source");
+                let toolchain = self.bundle.join("toolchain");
                 let source_root = if self.mode == DeliveryMode::Execute {
                     ordinary_directory(&source, false)
                         .map_err(|error| self.failure(error.to_string()))?;
@@ -179,6 +180,8 @@ impl PreparedBuild<'_> {
                     directory: self.directory,
                     mode: self.mode,
                     source_root,
+                    toolchain_root: (self.mode == DeliveryMode::Execute
+                        && request.get("toolchain_transfer").is_some()).then_some(toolchain.as_path()),
                     resume_from: self.resume_from,
                 };
                 match self.pin {

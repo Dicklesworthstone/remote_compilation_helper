@@ -33,7 +33,9 @@ use rabs_wkr::session::{
 };
 use rabs_wkr::source_task::{SourceReply, SourceTransferTask};
 use rabs_wkr::source_transfer::{self, SourceOwner};
+use rabs_wkr::toolchain_transfer::{self, ToolchainOwner, ToolchainReply, ToolchainTransferTask};
 use rabs_sandbox::source_transfer::SOURCE_TRANSFER;
+use rabs_sandbox::toolchain_transfer::TOOLCHAIN_TRANSFER_VERSION;
 use std::collections::VecDeque;
 use std::future::{Future, poll_fn};
 use std::io;
@@ -48,6 +50,8 @@ mod reconnect;
 mod execution_lease_session_tests;
 #[cfg(test)]
 mod output_preview_session_tests;
+#[cfg(test)]
+mod toolchain_upload_session_tests;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const MAX_FRAME_BYTES: usize = 1 << 20;
@@ -302,9 +306,10 @@ enum SessionEvent {
     // footprint through the session loop.
     Completed { request_id: u64, result: Box<Result<ExecutionCompletion, String>> },
     SourceCompleted(Box<Result<SourceReply, String>>),
+    ToolchainCompleted(Box<Result<ToolchainReply, String>>),
 }
 
-/// Only source I/O may defer ordered data/admission frames. Keep raw bounded
+/// Input I/O may defer ordered data/admission frames. Keep raw bounded
 /// frames, not a second unbounded decoded queue. Ping and cancel bypass this
 /// queue while disk work is pending; all other frames retain receive order.
 #[derive(Default)]
@@ -338,7 +343,8 @@ impl DeferredFrames {
 
 async fn next_event<R: AsyncRead + Unpin>(
     reader: &mut FrameReader, stream: &mut R, active: &mut Option<ExecutionTask>,
-    source: &mut SourceTransferTask, deferred: &mut DeferredFrames,
+    source: &mut SourceTransferTask, toolchain: &mut ToolchainTransferTask,
+    deferred: &mut DeferredFrames,
 ) -> SessionEvent {
     let mut read = pin!(reader.read(stream));
     poll_fn(|cx| {
@@ -349,7 +355,10 @@ async fn next_event<R: AsyncRead + Unpin>(
         if let Poll::Ready(result) = source.poll_completion(cx) {
             return Poll::Ready(SessionEvent::SourceCompleted(Box::new(result)));
         }
-        if !source.is_pending() && let Some(frame) = deferred.pop() {
+        if let Poll::Ready(result) = toolchain.poll_completion(cx) {
+            return Poll::Ready(SessionEvent::ToolchainCompleted(Box::new(result)));
+        }
+        if !source.is_pending() && !toolchain.is_pending() && let Some(frame) = deferred.pop() {
             return Poll::Ready(SessionEvent::Frame(Ok(Some(frame))));
         }
         read.as_mut().poll(cx).map(SessionEvent::Frame)
@@ -516,21 +525,45 @@ where
         source_transfer_enabled, false, execution_lease, launch, heartbeat).await
 }
 
-/// Production always supplies a durable journal. None is a test seam, never an
-/// IO-failure fallback. Source and artifact negotiation/verification precede
-/// durable admission. Launch MUST retain the source owner through process drain.
+/// Existing source/lease/preview fixtures select no optional toolchain transfer.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 async fn drive_session_with_previews<S, L, H>(
     stream: &mut S, report: &rabs_wkr::session::CapabilityReport, once: bool,
-    mut journal: Option<&mut WorkerJournal>, artifact_transfer_enabled: bool,
+    journal: Option<&mut WorkerJournal>, artifact_transfer_enabled: bool,
     source_transfer_enabled: bool, output_preview_enabled: bool,
+    execution_lease: &ExecutionLeaseSelection,
+    mut launch: L, heartbeat: H,
+) -> Result<(), String>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+    L: FnMut(CanonicalExecRequest, Duration, Option<ArtifactPlan>, Option<SourceOwner>,
+        Option<(RequestExecutionLeaseIdentity, u64)>) -> io::Result<ExecutionTask>,
+    H: FnMut() -> rabs_wkr::session::PressureSample,
+{
+    drive_session_with_inputs(stream, report, once, journal, artifact_transfer_enabled,
+        source_transfer_enabled, false, output_preview_enabled, execution_lease,
+        |request, timeout, artifacts, source, toolchain, lease| {
+            assert!(toolchain.is_none(), "test did not negotiate toolchain transfer");
+            launch(request, timeout, artifacts, source, lease)
+        }, heartbeat).await
+}
+
+/// Production always supplies a durable journal. None is a test seam, never an
+/// IO-failure fallback. Input verification precedes durable admission and lease
+/// arming. Launch MUST retain both input owners through process and drain cleanup.
+#[allow(clippy::too_many_arguments)]
+async fn drive_session_with_inputs<S, L, H>(
+    stream: &mut S, report: &rabs_wkr::session::CapabilityReport, once: bool,
+    mut journal: Option<&mut WorkerJournal>, artifact_transfer_enabled: bool,
+    source_transfer_enabled: bool, toolchain_transfer_enabled: bool, output_preview_enabled: bool,
     execution_lease: &ExecutionLeaseSelection,
     mut launch: L, mut heartbeat: H,
 ) -> Result<(), String>
 where
     S: AsyncRead + AsyncWrite + Unpin,
     L: FnMut(CanonicalExecRequest, Duration, Option<ArtifactPlan>, Option<SourceOwner>,
-        Option<(RequestExecutionLeaseIdentity, u64)>) -> io::Result<ExecutionTask>,
+        Option<ToolchainOwner>, Option<(RequestExecutionLeaseIdentity, u64)>) -> io::Result<ExecutionTask>,
     H: FnMut() -> rabs_wkr::session::PressureSample,
 {
     let mut reader = FrameReader::default();
@@ -539,7 +572,10 @@ where
     let mut pending_output: Option<PendingOutput> = None;
     let mut last_output_ack: Option<OutputIdentity> = None;
     let mut artifact_transfer = ArtifactTransferState::default();
-    let mut source_transfer = SourceTransferTask::default();
+    let mut source_transfer = if toolchain_transfer_enabled {
+        SourceTransferTask::with_input_budget(rabs_sandbox::toolchain_transfer::TOOLCHAIN_INPUT_BUDGET)
+    } else { SourceTransferTask::default() };
+    let mut toolchain_transfer = ToolchainTransferTask::default();
     let mut deferred = DeferredFrames::default();
     let mut retained_result: Option<(u64, String)> = None;
     let outcome = async {
@@ -547,10 +583,15 @@ where
             if Cx::current().is_some_and(|cx| cx.checkpoint().is_err()) { return Err("session cancelled".to_owned()); }
             let mut exit_after_reply = false;
             let reply = match next_event(&mut reader, stream, &mut active,
-                &mut source_transfer, &mut deferred).await
+                &mut source_transfer, &mut toolchain_transfer, &mut deferred).await
             {
                 SessionEvent::SourceCompleted(result) => {
                     let completed = (*result).map_err(|error| format!("source operation failed: {error}"))?;
+                    completed.response.map(|reply| reply.to_string())
+                        .unwrap_or_else(|reason| request_error(Some(completed.request_id), &reason))
+                }
+                SessionEvent::ToolchainCompleted(result) => {
+                    let completed = (*result).map_err(|error| format!("toolchain operation failed: {error}"))?;
                     completed.response.map(|reply| reply.to_string())
                         .unwrap_or_else(|reason| request_error(Some(completed.request_id), &reason))
                 }
@@ -586,7 +627,7 @@ where
                         }
                     };
                     let request_id = value.get("request_id").and_then(serde_json::Value::as_u64);
-                    if source_transfer.is_pending()
+                    if (source_transfer.is_pending() || toolchain_transfer.is_pending())
                         && !matches!(value.get("kind").and_then(serde_json::Value::as_str),
                             Some("ping" | "cancel"))
                     {
@@ -605,6 +646,14 @@ where
                                 Err(reason) => request_error(request_id, &reason),
                             }
                         }
+                        Some("toolchain-begin" | "toolchain-entry" | "toolchain-chunk" | "toolchain-seal") => {
+                            match toolchain_transfer.submit(&value, toolchain_transfer_enabled,
+                                active.is_some() || pending_output.is_some() || artifact_transfer.is_pending())
+                            {
+                                Ok(()) => continue,
+                                Err(reason) => request_error(request_id, &reason),
+                            }
+                        }
                         Some("ping") => {
                             let pressure = heartbeat();
                             serde_json::json!({
@@ -615,6 +664,8 @@ where
                                 "pending_artifact_request_id": artifact_transfer.pending_request_id(),
                                 "pending_source_request_id": source_transfer.request_id(),
                                 "source_operation_pending": source_transfer.is_pending(),
+                                "pending_toolchain_request_id": toolchain_transfer.request_id(),
+                                "toolchain_operation_pending": toolchain_transfer.is_pending(),
                             }).to_string()
                         }
                         Some("request-status") => match (journal.as_deref(), request_id) {
@@ -695,13 +746,20 @@ where
                                 let accepted = task.cancel(StopReason::Cancelled);
                                 serde_json::json!({"kind": "cancel-accepted", "request_id": id, "accepted": accepted, "cleanup_pending": true}).to_string()
                             }
-                            (_, Some(id)) => match source_transfer.cancel(id) {
-                                Some(accepted) => serde_json::json!({
-                                    "kind":"cancel-accepted", "request_id":id,
-                                    "accepted":accepted, "stage":"source-upload",
-                                    "cleanup_pending":true,
-                                }).to_string(),
-                                None => request_error(request_id, "unknown-request"),
+                            (_, Some(id)) => {
+                                // One execution can own both inputs. Revoke both
+                                // even when one has already sealed; a cancelled
+                                // upload cannot later become execution authority.
+                                let source = source_transfer.cancel(id);
+                                let toolchain = toolchain_transfer.cancel(id);
+                                if source.is_some() || toolchain.is_some() {
+                                    serde_json::json!({
+                                        "kind":"cancel-accepted", "request_id":id,
+                                        "accepted":source.unwrap_or(false) || toolchain.unwrap_or(false),
+                                        "stage":if toolchain.is_some() { "toolchain-upload" } else { "source-upload" },
+                                        "cleanup_pending":true,
+                                    }).to_string()
+                                } else { request_error(request_id, "unknown-request") }
                             },
                             _ => request_error(request_id, "unknown-request"),
                         },
@@ -733,6 +791,9 @@ where
                                 if let Some(path) = source_transfer.prepared_path(&value, source_transfer_enabled)? {
                                     request.workspace_backing = path;
                                 }
+                                if let Some(path) = toolchain_transfer.prepared_path(&value, toolchain_transfer_enabled)? {
+                                    request.toolchain_backing = path;
+                                }
                                 Ok((request, timeout, artifacts, lease))
                             });
                             match parsed {
@@ -755,7 +816,9 @@ where
                                     } else {
                                         let source = source_transfer.take_prepared(&value)
                                             .map_err(|error| format!("source ownership: {error}"))?;
-                                        match launch(request, timeout, artifacts, source, lease) {
+                                        let toolchain = toolchain_transfer.take_prepared(&value)
+                                            .map_err(|error| format!("toolchain ownership: {error}"))?;
+                                        match launch(request, timeout, artifacts, source, toolchain, lease) {
                                             Ok(task) => { last_admitted = Some(id); active = Some(task); continue; }
                                             Err(error) => {
                                                 if let Some(journal) = journal.as_deref_mut() {
@@ -809,6 +872,7 @@ where
     // staged source can be removed. This is not cancellable kernel I/O; a
     // stuck filesystem can still delay teardown, but no worker is detached.
     drop(source_transfer);
+    drop(toolchain_transfer);
     outcome
 }
 
@@ -819,6 +883,7 @@ fn worker_hello(report: &rabs_wkr::session::CapabilityReport, journal: &WorkerJo
         "output_transfers": [OUTPUT_TRANSFER], "artifact_transfers": [ARTIFACT_TRANSFER],
         "output_previews": [OUTPUT_PREVIEW_VERSION],
         "source_transfers": [SOURCE_TRANSFER],
+        "toolchain_transfers": [TOOLCHAIN_TRANSFER_VERSION],
         "execution_leases": [REQUEST_EXECUTION_LEASE_VERSION],
         "command_contexts": [rabs_sandbox::process_context::COMMAND_CONTEXT_VERSION],
         "toolchain_datasets": [rabs_sandbox::toolchain_dataset::TOOLCHAIN_DATASET_VERSION],
@@ -847,7 +912,7 @@ async fn session_loop(
         }
         rabs_asupersync::worker_transport::WorkerConnection::LoopbackFixture(_) => ResultRecipient::LoopbackFixture,
     };
-    let (capture_output, capture_artifacts, retain_result, receive_sources, output_preview, execution_lease) = asupersync::time::timeout(
+    let (capture_output, capture_artifacts, retain_result, receive_sources, receive_toolchain, output_preview, execution_lease) = asupersync::time::timeout(
         asupersync::time::wall_now(),
         Duration::from_secs(10),
         async {
@@ -914,12 +979,13 @@ async fn session_loop(
             validate_recovery_selection(&ack)?;
             let retain = result_retention_requested(&ack)?;
             let source = source_transfer::selected(&ack)?;
+            let toolchain = toolchain_transfer::selected(&ack, local_identity.is_some(), source)?;
             let preview = output_preview_requested(&ack)?;
             let lease = execution_lease_selection(&ack, local_identity.is_some(), challenge_session, journal)?;
             if local_identity.is_some() && !output {
                 return Err("authenticated worker requires complete output retrieval".to_owned());
             }
-            Ok::<_, String>((output, artifacts, retain, source, preview, lease))
+            Ok::<_, String>((output, artifacts, retain, source, toolchain, preview, lease))
         },
     ).await.map_err(|_| "worker session admission deadline exceeded".to_owned())??;
     let cargo_home = std::env::temp_dir().join(format!("rabs-wkr-ch-{}", std::process::id()));
@@ -932,8 +998,9 @@ async fn session_loop(
     journal.clear_result_recipient();
     if retain_result { journal.authorize_result_recipient(recipient.clone()); }
     *admitted_at = Some(std::time::Instant::now());
-    let outcome = drive_session_with_previews(&mut stream, report, once, Some(&mut *journal), capture_artifacts,
-        receive_sources, output_preview, &execution_lease, |request, timeout, artifacts, source, lease| {
+    let outcome = drive_session_with_inputs(&mut stream, report, once, Some(&mut *journal), capture_artifacts,
+        receive_sources, receive_toolchain, output_preview, &execution_lease,
+        |request, timeout, artifacts, source, toolchain, lease| {
         let cargo_home = cargo_home.clone(); let home = home.clone(); let spills = spills.clone();
         let slots = report.slots;
         let id = request.request_id;
@@ -944,6 +1011,7 @@ async fn session_loop(
             // Ownership is inside the blocking executor, not the read future.
             // Cancellation/disconnect cannot remove source before process drain.
             if capture_output { control.request_output_capture(); }
+            let _toolchain_owner = toolchain;
             match source.as_ref() {
                 Some(source) => execute_uploaded_canonical_controlled(
                     &request, &cargo_home, &home, slots, &spills, &control, source,
@@ -1043,9 +1111,12 @@ fn parse_exec_request(value: &serde_json::Value) -> Result<CanonicalExecRequest,
     } else {
         text("workspace_backing")?
     };
+    let toolchain_backing = if toolchain_transfer::request_identity(value)?.is_some() {
+        String::new()
+    } else { text("toolchain_backing")? };
     Ok(CanonicalExecRequest {
         request_id: value.get("request_id").and_then(serde_json::Value::as_u64).ok_or("exec request missing request_id")?,
-        program: text("program")?, args, toolchain_backing: text("toolchain_backing")?,
+        program: text("program")?, args, toolchain_backing,
         toolchain_identity: rabs_wkr::session::parse_toolchain_identity(value)?,
         workspace_backing, jobserver_grant,
         command_context: parse_command_context(value)?,
@@ -1235,9 +1306,10 @@ mod tests {
             result(1)
         }).unwrap());
         let mut source = SourceTransferTask::default();
+        let mut toolchain = ToolchainTransferTask::default();
         let mut deferred = DeferredFrames::default();
         let mut reader = FrameReader::default();
-        let mut event = Box::pin(next_event(&mut reader, &mut wire, &mut active, &mut source, &mut deferred));
+        let mut event = Box::pin(next_event(&mut reader, &mut wire, &mut active, &mut source, &mut toolchain, &mut deferred));
         let waker = Waker::from(Arc::new(ThreadWake(std::thread::current())));
         assert!(event.as_mut().poll(&mut Context::from_waker(&waker)).is_pending());
         release.store(true, Ordering::Release);

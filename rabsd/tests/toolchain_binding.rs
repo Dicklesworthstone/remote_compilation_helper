@@ -74,7 +74,7 @@ fn read_request(destination: &Path) -> Value {
 }
 
 #[test]
-fn preparation_fingerprints_real_toolchain_and_strips_local_path() {
+fn preparation_retains_real_toolchain_and_strips_both_host_paths() {
     let fixture = Fixture::new();
     let original_specification = fixture.specification.clone();
     let expected = fixture.fingerprint();
@@ -95,7 +95,10 @@ fn preparation_fingerprints_real_toolchain_and_strips_local_path() {
             .to_string()
             .contains(fixture.toolchain.to_str().unwrap())
     );
-    assert_eq!(request["toolchain_backing"], "/worker/toolchains/probe");
+    assert!(request.get("toolchain_backing").is_none());
+    assert_eq!(request["toolchain_transfer"], "toolchain-tree-v1");
+    assert_eq!(summary["toolchain_transfer"], request["toolchain_transfer"]);
+    assert_eq!(fs::read(destination.join("toolchain/bin/probe")).unwrap(), ORIGINAL);
     assert_eq!(
         fs::read(destination.join("source/main.rs")).unwrap(),
         SOURCE
@@ -118,6 +121,8 @@ fn preparation_fingerprints_real_toolchain_and_strips_local_path() {
     // this compiler change. Previously prepared requests keep their old binding.
     assert_eq!(ORIGINAL.len(), REPLACEMENT.len());
     fs::write(fixture.toolchain.join("bin/probe"), REPLACEMENT).unwrap();
+    assert_eq!(fs::read(destination.join("toolchain/bin/probe")).unwrap(), ORIGINAL,
+        "prepared bytes must survive later equal-size changes to the original compiler");
     assert_eq!(
         fs::metadata(fixture.toolchain.join("bin/probe"))
             .unwrap()

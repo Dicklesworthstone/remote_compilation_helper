@@ -27,6 +27,7 @@ use rabs_protocol::envelope::DEFAULT_LIMITS;
 use rabs_protocol::identity_store::{IdentityStore, TransportIdentity, TrustScope};
 use rabs_protocol::version_negotiation::{VersionHello, VersionRange};
 use rabs_protocol::worker_session::{CoordinatorSession, SessionPolicy, WorkerHelloClaims};
+use rabs_sandbox::toolchain_transfer::TOOLCHAIN_UPLOAD_BUDGET;
 use serde_json::{Value, json};
 use std::fs::File;
 use std::io::{self, Read};
@@ -264,8 +265,8 @@ impl<P: WorkerPeer> WorkerPeer for AdmittedPeer<P> {
                 "source-backed execution requires a captured source upload",
             )?;
             require(
-                grant.get("source_transfer").is_none(),
-                "source transfer was not authorized by this operator session",
+                grant.get("source_transfer").is_none() && grant.get("toolchain_transfer").is_none(),
+                "input transfer was not authorized by this operator session",
             )?;
             grant.clone()
         };
@@ -446,6 +447,7 @@ impl<P: WorkerPeer> WorkerPeer for AdmittedPeer<P> {
 enum Phase {
     Admission,
     SourceUpload,
+    ToolchainUpload,
     Execution,
     Transfer,
     Acknowledgment,
@@ -554,9 +556,19 @@ impl<'a, S> RecordPeer<'a, S> {
                 require(self.phase == Phase::SourceUpload, "source frame outside upload")?;
                 // Every chunk and the seal share the original upload budget.
             }
+            Some("toolchain-begin") => {
+                require(self.phase == Phase::SourceUpload, "toolchain transfer requires prior source upload")?;
+                self.phase = Phase::ToolchainUpload;
+                self.until = Instant::now() + TOOLCHAIN_UPLOAD_BUDGET;
+            }
+            Some("toolchain-entry" | "toolchain-chunk" | "toolchain-seal") => {
+                require(self.phase == Phase::ToolchainUpload, "toolchain frame outside upload")?;
+                // Directory declarations, all file chunks and final sealing
+                // share one absolute budget, independent of execution time.
+            }
             Some("canonical-exec") => {
                 require(
-                    matches!(self.phase, Phase::Admission | Phase::SourceUpload),
+                    matches!(self.phase, Phase::Admission | Phase::SourceUpload | Phase::ToolchainUpload),
                     "duplicate execution dispatch",
                 )?;
                 self.phase = Phase::Execution;
@@ -1533,11 +1545,38 @@ mod tests {
                 peer.until = Instant::now() - Duration::from_secs(1);
             }
             let until = peer.until;
-            for kind in ["source-begin", "source-chunk", "source-seal", "canonical-exec", "result-resume"] {
+            for kind in ["source-begin", "source-chunk", "source-seal", "toolchain-begin", "canonical-exec", "result-resume"] {
                 assert!(peer.begin_frame(Some(kind)).is_err(), "{kind}");
                 assert!(peer.phase == Phase::SourceUpload);
                 assert_eq!(peer.until, until);
             }
+        }
+    }
+
+    #[test]
+    fn toolchain_records_share_one_absolute_input_budget_without_widening_execution() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+        let mut peer = RecordPeer::new(&runtime, (), &request());
+        let execution_budget = peer.execution_budget;
+        assert!(peer.begin_frame(Some("toolchain-begin")).is_err());
+        peer.begin_frame(Some("source-begin")).unwrap();
+        peer.begin_frame(Some("source-seal")).unwrap();
+        let before = Instant::now();
+        peer.begin_frame(Some("toolchain-begin")).unwrap();
+        let until = peer.until;
+        assert!(until >= before + TOOLCHAIN_UPLOAD_BUDGET);
+        for kind in ["toolchain-entry", "toolchain-chunk", "toolchain-seal"] {
+            peer.begin_frame(Some(kind)).unwrap();
+            assert_eq!(peer.until, until);
+        }
+        for kind in ["toolchain-begin", "source-begin", "source-chunk", "source-seal", "result-resume"] {
+            assert!(peer.begin_frame(Some(kind)).is_err());
+        }
+        assert_eq!(peer.execution_budget, execution_budget);
+        peer.until = Instant::now() - Duration::from_millis(1);
+        for kind in ["toolchain-entry", "toolchain-chunk", "toolchain-seal", "canonical-exec"] {
+            assert!(peer.begin_frame(Some(kind)).is_err());
+            assert!(peer.phase == Phase::ToolchainUpload);
         }
     }
 

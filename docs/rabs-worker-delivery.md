@@ -252,29 +252,41 @@ but never reupload registry inputs or recreate an execution Cargo home. This is
 explicit input delivery, not proof of package provenance, complete dependency
 resolution, immutable action inputs, or permission to skip compilation.
 
-### Bind execution to captured toolchain bytes
+### Send the selected toolchain with a prepared build
 
-Every native worker execution copies its selected `toolchain_backing` into a
-fresh private dataset and mounts that copy at `/__rabs/toolchain`. Replacing or
-editing the original worker installation after capture cannot change the bytes
-the running command sees. The owner remains alive through process cleanup and
+Prepared TLS builds can deliver their compiler installation along with their
+source. The worker does not need that installation at a matching local path.
+The uploaded tree is verified, independently captured for execution, and mounted
+at `/__rabs/toolchain`. Its owner remains alive through process cleanup and
 diagnostic capture; verification before launch and after cleanup rejects changes
 to the retained backing before successful artifacts can be offered.
 
-To select the expected toolchain during source preparation, add the local
+To include a toolchain during source preparation, add the complete local
 installation path to the specification:
 
 ```json
 "toolchain_source": "/absolute/local/rust-toolchain"
 ```
 
-`--worker-prepare` fingerprints that entire local tree, removes `toolchain_source`
-from the executable request, and saves a `toolchain_identity` object containing
-`version: "toolchain-dataset-v1"`, a lowercase SHA-256 digest, and unsigned `files`
-and `bytes` counts. The worker's `toolchain_backing` can have a different physical
-path; its captured contents must match. If a specification also supplies an
-identity, preparation checks it against the local tree instead of replacing it.
-Preparation reads the toolchain without running its binaries.
+`--worker-prepare` retains an independent copy in `bundle/toolchain/`, alongside
+`source/`. It removes `toolchain_source` and `toolchain_backing` from the
+executable request, selects `toolchain_transfer: "toolchain-tree-v1"`, and saves a
+`toolchain_identity` object containing `version: "toolchain-dataset-v1"`, a
+lowercase SHA-256 digest, and unsigned `files` and `bytes` counts. If a
+specification also supplies an identity, preparation checks it against the
+captured tree instead of replacing it. The complete retained input precedes the
+bundle's `request.json` readiness marker. Preparation reads the toolchain without
+running its binaries.
+
+Use the resulting bundle with `--worker-build-tls` or `--job-submit`. New
+execution validates the retained toolchain before contacting the worker. It
+uploads source first, then streams the toolchain over the same authenticated
+connection, and dispatches the saved command only after both inputs are sealed.
+The original local installation is no longer needed. A missing or changed
+retained tree fails before dispatch; it cannot select a worker-local compiler.
+Direct `--worker-exec-tls --source-root` does not infer toolchain upload permission
+from neighboring directories. Plaintext loopback execution does not accept the
+toolchain transfer selection.
 
 The identity covers relative paths, directory layout including empty directories,
 regular-file bytes, executable bits, and exact contained relative symlink targets.
@@ -283,17 +295,29 @@ symlinks, special files, nested mounts, incoherent reads and limit violations
 refuse. The Linux implementation uses descriptor-relative `openat2` traversal.
 Defaults allow 8 GiB, 100,000 entries and 64 levels of depth. There are no implicit
 exclusions for documentation or other toolchain files: select a complete approved
-runtime tree when a full installation is unnecessarily large. Capture and repeated
-verification read the full selected tree and require a private copy's disk space
-for each execution; dataset reuse is not implemented yet.
+runtime tree when a full installation is unnecessarily large. The transfer sends
+bounded entry records and chunks rather than loading the complete tree into
+memory. Symlinks are created after file delivery and validated against the
+complete tree. Partial, out-of-order, altered or incomplete input cannot become
+an execution root. Capture and repeated verification read the full selected tree;
+allow disk space for the retained bundle and the worker's staging and private
+execution copies. The existing optional worker toolchain pool can reuse a
+verified execution copy, but this transfer protocol still sends the selected tree
+for each new execution.
 
-For pinned requests, the receiver requires the worker's explicit
-`toolchain-dataset-v1` capability before sending source bytes or execution.
+The receiver requires the worker's explicit `toolchain-tree-v1` transfer and
+`toolchain-dataset-v1` verification capabilities before sending input bytes.
 A missing capability refuses; a content mismatch on the worker refuses before
-compiler spawn. An omitted identity permits an unpinned execution using the same
-private capture. Malformed identities never fall back to that mode. Result resume
-uses the original request fingerprint and does not recapture a toolchain or
-require the restarted worker to retain execution capability.
+compiler spawn. The original request remains the journal, lease and delivery
+identity: private worker paths are never written into it. Result resume and
+complete local delivery recovery use that original identity and do not upload or
+recapture a toolchain, or require the restarted worker to retain execution
+capability.
+
+Requests that explicitly select an existing worker `toolchain_backing` can still
+use the local capture path. A supplied `toolchain_identity` requires an exact
+match; an omitted identity permits an unpinned private capture. Malformed
+identities and simultaneous transfer/backing selections refuse.
 
 This binds the selected tree's bytes. It does not identify host `/usr`, linker,
 dynamic-loader configuration or other runtime inputs outside that tree, and does
@@ -305,11 +329,12 @@ do not protect against a hostile process with the worker owner's credentials.
 
 `--worker-build-tls` joins source upload, authenticated execution, durable byte
 delivery, and complete output installation in one operator command. First prepare
-a bundle containing `request.json` and `source/` with `--worker-prepare`. The
+a bundle containing `request.json`, `source/`, and, when selected, `toolchain/`
+with `--worker-prepare`. The
 request must contain a source manifest and an artifact declaration; an explicit
 `tree-files-v1` declaration receives the full output tree, including Cargo's
 intermediate files. The compiler command still supplies its exact arguments,
-canonical working directory, environment, and worker toolchain backing.
+canonical working directory, environment, and explicit toolchain selection.
 
 With the TLS environment described below, run:
 
@@ -363,9 +388,10 @@ with `execution_may_have_run` and `reexecute:false`. These commands do not publi
 action-cache entries or install Cargo freshness authority. They provide explicit
 build outputs for inspection and use in a new directory.
 
-The equivalent trusted local fixture is `--worker-build-loopback`, with the same
-arguments except for the omitted key pin. It accepts only literal loopback
-addresses and retains the plaintext provenance described above.
+The trusted local fixture is `--worker-build-loopback`, with the same arguments
+except for the omitted key pin. It requires a worker-local toolchain selection,
+accepts only literal loopback addresses, and retains the plaintext provenance
+described above.
 
 ### Prepared builds in the running daemon
 
@@ -650,8 +676,13 @@ clone adjudication, scheduling, or authoritative action-cache admission.
 
 TLS mode has separate absolute network budgets: 60 seconds for accepting the
 connection, the native transport's five-second TLS handshake limit, 10 seconds
-for application admission, at most 30 minutes plus 60 seconds for execution and
-cleanup, five minutes for verified transfer, and 10 seconds for both ACK replies.
+for application admission, five minutes for source upload, and an additional
+30 minutes when uploading a selected toolchain. Toolchain chunks are pipelined
+in bounded batches of four. On the worker, the source owner retains a fixed
+35-minute input deadline for these combined uploads; receiving chunks does not
+extend it. Execution still has at most 30 minutes plus 60 seconds for cleanup,
+followed by five minutes for verified result transfer and 10 seconds for both
+ACK replies.
 Bytes, telemetry and repeated ranges do not reset a phase. Timeout poisons the
 connection; partial writes are never retried. The native ATP payload limit is
 1 MiB minus 64 bytes; larger requests are rejected before listening. Filesystem
@@ -1059,3 +1090,32 @@ It then removes access to source and credentials and repeats the command offline
 requiring unchanged receipt/request identities and no worker connection. Missing
 prerequisites fail when the test is selected. These tests are implementation
 coverage awaiting execution, not a reported passing fleet or performance gate.
+
+Toolchain delivery adds filesystem receiver/export tests, worker session-driver
+tests, and preparation plus native TLS sender tests:
+
+```sh
+cargo test -p rabs-sandbox toolchain_transfer
+cargo test -p rabs-sandbox --test toolchain_dataset_realfs
+cargo test -p rabs-wkr toolchain_upload_session_tests
+cargo test -p rabsd --test toolchain_binding
+cargo test -p rabsd --test worker_exec_tls toolchain
+```
+
+The TLS sender tests use a scripted peer and the actual filesystem receiver;
+they do not prove that a compiler ran. A separate explicitly selected case runs
+both binaries, uploads the full selected compiler tree, builds the vendored
+workspace, runs the installed executable, and repeats delivery recovery with
+both retained input directories unavailable:
+
+```sh
+RABS_TEST_WORKER_BIN=/absolute/path/to/target/debug/rabs-wkr \
+  cargo test -p rabsd --test cargo_vendor_prepare \
+  uploaded_toolchain_builds_vendored_workspace_over_native_tls_and_recovers_offline \
+  -- --ignored --exact
+```
+
+That case requires the same canonical Linux and TLS prerequisites, plus disk
+space and transfer time for the selected complete toolchain. Its request carries
+no worker-local toolchain path. It retains the ordinary compiler timeout; its
+larger setup and transfer allowance covers the newly uploaded compiler data.

@@ -259,7 +259,8 @@ fn source_completion_wakes_a_partial_control_frame_without_losing_bytes() {
     source.submit(&begin(&source_request(12)), true, false).unwrap();
     let mut reader = FrameReader::default(); let mut deferred = DeferredFrames::default();
     let mut active = None;
-    match wait(next_event(&mut reader, &mut wire, &mut active, &mut source, &mut deferred)) {
+    let mut toolchain = ToolchainTransferTask::default();
+    match wait(next_event(&mut reader, &mut wire, &mut active, &mut source, &mut toolchain, &mut deferred)) {
         SessionEvent::SourceCompleted(result) => {
             let completed = (*result).unwrap();
             assert_eq!(completed.request_id, 12);

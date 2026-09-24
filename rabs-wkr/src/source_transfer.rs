@@ -226,11 +226,20 @@ impl SourceOwner {
 #[derive(Default)]
 pub struct SourceTransferState {
     pending: Option<SourceOwner>,
+    input_budget: Option<Duration>,
     #[cfg(test)]
     cache_override: Option<cache::SourceCache>,
 }
 
 impl SourceTransferState {
+    /// A selected full-toolchain upload follows the source upload before
+    /// execution admission. Both inputs retain one fixed combined budget from
+    /// source-begin; progress never renews it. Ordinary source-only sessions
+    /// retain the existing five-minute bound.
+    pub(crate) fn with_input_budget(input_budget: Duration) -> Self {
+        Self { input_budget:Some(input_budget), ..Self::default() }
+    }
+
     /// Handle only source-begin/chunk/seal after explicit session negotiation.
     /// Busy is computed by the execution driver, not asserted by the sender.
     pub fn handle(&mut self, value: &Value, enabled: bool, busy: bool) -> Result<Value, String> {
@@ -253,7 +262,7 @@ impl SourceTransferState {
                 if owner.source_failed { return Err(invalid("execution source verification failed")); }
                 return owner.ready();
             }
-            let deadline = Instant::now() + UPLOAD_BUDGET;
+            let deadline = Instant::now() + self.input_budget.unwrap_or(UPLOAD_BUDGET);
             let cache = if allow_cached_files {
                 #[cfg(test)]
                 let configured = self.cache_override.clone().map_or_else(cache::SourceCache::configured, |cache| Ok(Some(cache)));
@@ -460,6 +469,30 @@ mod tests {
                 "manifest_sha256":manifest["manifest_sha256"], "path":path,
                 "offset":index * MAX_SOURCE_CHUNK, "data_hex":hex(chunk),
                 "chunk_sha256":hex(&Sha256::digest(chunk))}), true, false).unwrap();
+        }
+    }
+
+    #[test]
+    fn full_input_budget_keeps_sealed_source_usable_during_toolchain_transfer() {
+        let manifest = projection(&[("empty.rs", b"", false)]);
+        let request = json!({"kind":"canonical-exec", "request_id":0, "source_manifest":manifest});
+        let start = json!({"kind":"source-begin", "request_id":0, "manifest":manifest});
+        for extended in [false, true] {
+            let mut state = if extended {
+                SourceTransferState::with_input_budget(rabs_sandbox::toolchain_transfer::TOOLCHAIN_INPUT_BUDGET)
+            } else { SourceTransferState::default() };
+            state.handle(&start, true, false).unwrap();
+            state.handle(&seal(&manifest, 0), true, false).unwrap();
+            // Simulate time spent transferring the full toolchain after the
+            // source sealed, without sleeping or changing the wall clock.
+            state.pending.as_mut().unwrap().deadline -= Duration::from_secs(6 * 60);
+            let deadline = state.pending.as_ref().unwrap().deadline;
+            assert_eq!(state.prepared_path(&request, true).is_ok(), extended);
+            assert_eq!(state.handle(&start, true, false).is_ok(), extended);
+            assert_eq!(state.pending.as_ref().unwrap().deadline, deadline);
+            state.pending.as_mut().unwrap().deadline = Instant::now() - Duration::from_secs(1);
+            assert!(state.prepared_path(&request, true).is_err());
+            assert!(state.take_prepared(&request).is_err());
         }
     }
 

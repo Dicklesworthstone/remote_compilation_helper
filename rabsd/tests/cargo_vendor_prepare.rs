@@ -457,6 +457,13 @@ impl Fixture {
         )
     }
     fn prepare(&self, name: &str) -> (PathBuf, ExitStatus, Vec<u8>, Vec<u8>) {
+        self.prepare_with_budget(name, Duration::from_secs(45))
+    }
+    fn prepare_with_budget(
+        &self,
+        name: &str,
+        budget: Duration,
+    ) -> (PathBuf, ExitStatus, Vec<u8>, Vec<u8>) {
         let spec = self.owner.path().join(format!("{name}.json"));
         fs::write(&spec, self.specification.to_string()).unwrap();
         let bundle = self.owner.path().join(name);
@@ -468,8 +475,7 @@ impl Fixture {
             .env("CARGO", &self.cargo)
             .env("RUSTC", &self.rustc)
             .env("RUSTC_WRAPPER", "/must-not-execute-a-wrapper");
-        let result =
-            Process::spawn(self.owner.path(), name, &mut cmd).wait(Duration::from_secs(45));
+        let result = Process::spawn(self.owner.path(), name, &mut cmd).wait(budget);
         (bundle, result.0, result.1, result.2)
     }
     fn prepared(&self) -> (PathBuf, Value) {
@@ -801,6 +807,16 @@ impl Certificates {
 #[test]
 #[ignore = "requires canonical-capable Linux, OpenSSL and matching RABS_TEST_WORKER_BIN; run explicitly"]
 fn automatic_vendored_bundle_builds_over_native_tls_and_replays_installed_outputs_offline() {
+    run_vendored_native_tls_build(false);
+}
+
+#[test]
+#[ignore = "requires canonical-capable Linux, a complete transferable toolchain, OpenSSL and matching RABS_TEST_WORKER_BIN; run explicitly"]
+fn uploaded_toolchain_builds_vendored_workspace_over_native_tls_and_recovers_offline() {
+    run_vendored_native_tls_build(true);
+}
+
+fn run_vendored_native_tls_build(upload_toolchain: bool) {
     let missing =
         rabs_sandbox::canonical_namespace::HostIsolationSupport::probe().missing_for_canonical();
     assert!(
@@ -812,8 +828,31 @@ fn automatic_vendored_bundle_builds_over_native_tls_and_replays_installed_output
             .expect("set RABS_TEST_WORKER_BIN to the absolute rabs-wkr built from this revision"),
     );
     assert!(worker_binary.is_absolute() && worker_binary.is_file());
-    let fixture = Fixture::new();
-    let (bundle, request) = fixture.prepared();
+    let mut fixture = Fixture::new();
+    let (bundle, request) = if upload_toolchain {
+        fixture.specification["toolchain_source"] =
+            json!(fixture.cargo.parent().and_then(Path::parent).unwrap());
+        // This path deliberately does not exist. Preparation must remove it,
+        // and execution must use the streamed tree rather than a host fallback.
+        fixture.specification["toolchain_backing"] =
+            json!(fixture.owner.path().join("missing-worker-installation"));
+        let (bundle, status, stdout, stderr) =
+            fixture.prepare_with_budget("bundle", Duration::from_secs(15 * 60));
+        assert!(status.success(), "{}", String::from_utf8_lossy(&stderr));
+        let prepared: Value = serde_json::from_slice(&stdout).unwrap();
+        assert_eq!(prepared["executed"], false);
+        let request: Value =
+            serde_json::from_slice(&fs::read(bundle.join("request.json")).unwrap()).unwrap();
+        assert_eq!(request["toolchain_transfer"], "toolchain-tree-v1");
+        assert_eq!(request["toolchain_identity"]["version"], "toolchain-dataset-v1");
+        assert!(request.get("toolchain_backing").is_none());
+        assert!(request.get("toolchain_source").is_none());
+        assert!(bundle.join("toolchain/bin/cargo").is_file());
+        assert!(bundle.join("toolchain/bin/rustc").is_file());
+        (bundle, request)
+    } else {
+        fixture.prepared()
+    };
     fs::rename(
         &fixture.anchor,
         fixture.owner.path().join("retired-checkout"),
@@ -856,7 +895,11 @@ fn automatic_vendored_bundle_builds_over_native_tls_and_replays_installed_output
         .env("RABS_WORKER_TLS_KEY", &certificates.worker.private_key)
         .env("RABS_WORKER_TLS_SERVER_NAME", "localhost");
     let mut worker = Process::spawn(fixture.owner.path(), "real-worker", &mut worker_command);
-    let (status, stdout, stderr) = receiver.wait(Duration::from_secs(180));
+    let (status, stdout, stderr) = receiver.wait(if upload_toolchain {
+        Duration::from_secs(40 * 60)
+    } else {
+        Duration::from_secs(180)
+    });
     assert!(status.success(), "{}", String::from_utf8_lossy(&stderr));
     let (status, _, errors) = worker.wait(Duration::from_secs(20));
     assert!(status.success(), "{}", String::from_utf8_lossy(&errors));
@@ -886,6 +929,13 @@ fn automatic_vendored_bundle_builds_over_native_tls_and_replays_installed_output
         fixture.owner.path().join("retired-source"),
     )
     .unwrap();
+    if upload_toolchain {
+        fs::rename(
+            bundle.join("toolchain"),
+            fixture.owner.path().join("retired-toolchain"),
+        )
+        .unwrap();
+    }
     let mut offline = command(env!("CARGO_BIN_EXE_rabsd"));
     offline
         .args(args)

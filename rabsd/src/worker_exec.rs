@@ -175,6 +175,39 @@ fn capture_source(
     SourceUpload::for_request(std::sync::Arc::new(image), "workspace", request).map(Some)
 }
 
+/// Toolchain bytes are a separate explicit local capability. Only the prepared
+/// build path supplies its retained toolchain root; --source-root never guesses
+/// a neighbouring directory or reopens the original compiler installation.
+fn attach_toolchain(
+    upload: Option<SourceUpload>,
+    request: &Value,
+    mode: DeliveryMode,
+    root: Option<&Path>,
+    stopped: impl Fn() -> bool,
+) -> io::Result<Option<SourceUpload>> {
+    use rabs_sandbox::toolchain_dataset::{ToolchainLimits, open_toolchain};
+    use rabsd::coord::worker_delivery::{toolchain_identity, toolchain_transfer};
+    let selected = toolchain_transfer(request)?;
+    if mode == DeliveryMode::Resume {
+        if root.is_some() {
+            return Err(invalid("result recovery cannot upload a toolchain"));
+        }
+        return Ok(upload);
+    }
+    match (selected, root) {
+        (false, None) => Ok(upload),
+        (false, Some(_)) => Err(invalid("toolchain bytes were not selected by this request")),
+        (true, None) => Err(invalid("toolchain transfer requires a retained prepared build bundle")),
+        (true, Some(root)) => {
+            let expected = toolchain_identity(request)?
+                .ok_or_else(|| invalid("toolchain transfer requires an expected identity"))?;
+            let prepared = open_toolchain(root, &expected, &ToolchainLimits::default(), stopped)?;
+            let source = upload.ok_or_else(|| invalid("toolchain transfer requires prepared source"))?;
+            source.with_toolchain(prepared, request).map(Some)
+        }
+    }
+}
+
 /// A prefix source is local intent, not proof. Validate it before credentials,
 /// listening, or worker contact, but only AFTER complete local receipt recovery.
 fn prepare_resume_source(
@@ -399,6 +432,7 @@ struct WorkerOperation<'a> {
     directory: &'a Path,
     mode: DeliveryMode,
     source_root: Option<&'a Path>,
+    toolchain_root: Option<&'a Path>,
     resume_from: Option<&'a Path>,
 }
 
@@ -418,6 +452,7 @@ fn run_once(
         directory,
         mode,
         source_root,
+        toolchain_root: None,
         resume_from,
     })
 }
@@ -430,6 +465,7 @@ fn run_loopback_operation(operation: WorkerOperation<'_>) -> Result<Delivery, De
         directory,
         mode,
         source_root,
+        toolchain_root,
         resume_from,
     } = operation;
     let failure = |error: io::Error| operation_failure(directory, mode, error.to_string());
@@ -441,6 +477,11 @@ fn run_loopback_operation(operation: WorkerOperation<'_>) -> Result<Delivery, De
         recover_existing_delivery(request, worker, directory, DeliveryTrust::Loopback)?
     {
         return Ok(delivery);
+    }
+    if toolchain_root.is_some() || rabsd::coord::worker_delivery::toolchain_transfer(request)
+        .map_err(&failure)?
+    {
+        return Err(failure(invalid("toolchain transfer requires authenticated TLS delivery")));
     }
     // Offline receipt recovery above must not depend on a still-existing
     // checkout or old partial directory. New work preflights before listening.
@@ -705,6 +746,7 @@ fn run_tls_once(
             directory,
             mode,
             source_root,
+            toolchain_root: None,
             resume_from,
         },
         &args[2],
@@ -735,6 +777,7 @@ fn run_tls_operation_inner(
         directory,
         mode,
         source_root,
+        toolchain_root,
         resume_from,
     } = operation;
     let failure = |detail: String| operation_failure(directory, mode, detail);
@@ -765,6 +808,9 @@ fn run_tls_operation_inner(
     }
     let upload =
         capture_source(request, mode, source_root).map_err(|error| failure(error.to_string()))?;
+    let upload = attach_toolchain(upload, request, mode, toolchain_root, || {
+        control.as_ref().is_some_and(|control| control.cancellation.is_cancelled())
+    }).map_err(|error| failure(error.to_string()))?;
     let reuse = prepare_resume_source(mode, resume_from, directory)
         .map_err(|error| failure(error.to_string()))?;
     if !directory.parent().is_some_and(Path::is_dir) {
@@ -1216,6 +1262,42 @@ mod tests {
         assert!(
             capture_source(&backing, DeliveryMode::Execute, Some(Path::new("/unused"))).is_err()
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn prepared_toolchain_is_explicit_verified_and_unneeded_for_result_recovery() {
+        use std::os::unix::fs::PermissionsExt;
+        let source = tempfile::tempdir().unwrap();
+        std::fs::write(source.path().join("lib.rs"), b"pub fn answer() -> u8 { 42 }").unwrap();
+        let owner = tempfile::tempdir().unwrap();
+        let original = owner.path().join("original-toolchain");
+        std::fs::create_dir_all(original.join("bin")).unwrap();
+        std::fs::write(original.join("bin/compiler"), b"compiler bytes").unwrap();
+        std::fs::set_permissions(original.join("bin/compiler"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let bundle = owner.path().join("bundle");
+        rabsd::coord::source_delivery::prepare_source_bundle(source.path(),
+            &json!({"kind":"canonical-exec", "request_id":0, "program":"/__rabs/toolchain/bin/compiler",
+                "source_files":["lib.rs"], "toolchain_source":original}), &bundle).unwrap();
+        let request = read_request(&bundle.join("request.json")).unwrap();
+        let saved = serde_json::to_vec(&request).unwrap();
+        std::fs::rename(&original, owner.path().join("moved-original")).unwrap();
+        let upload = capture_source(&request, DeliveryMode::Execute, Some(&bundle.join("source"))).unwrap();
+        assert!(attach_toolchain(upload.clone(), &request, DeliveryMode::Execute, None, || false).is_err());
+        let ready = attach_toolchain(upload.clone(), &request, DeliveryMode::Execute,
+            Some(&bundle.join("toolchain")), || false).unwrap().unwrap();
+        ready.validate_request(&request).unwrap();
+        assert_eq!(serde_json::to_vec(&request).unwrap(), saved);
+        assert!(attach_toolchain(upload.clone(), &request, DeliveryMode::Execute,
+            Some(&bundle.join("toolchain")), || true).is_err());
+        let compiler = bundle.join("toolchain/bin/compiler");
+        std::fs::set_permissions(&compiler, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(&compiler, b"different data").unwrap();
+        assert!(attach_toolchain(upload, &request, DeliveryMode::Execute,
+            Some(&bundle.join("toolchain")), || false).is_err());
+        assert!(attach_toolchain(None, &request, DeliveryMode::Resume, None, || false).unwrap().is_none());
+        assert!(attach_toolchain(None, &request, DeliveryMode::Resume,
+            Some(&bundle.join("toolchain")), || false).is_err());
     }
 
     #[cfg(unix)]

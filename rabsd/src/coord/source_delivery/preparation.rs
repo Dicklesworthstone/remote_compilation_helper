@@ -82,8 +82,9 @@ impl SourcePreparation {
         )?;
         require(
             specification.get("source_manifest").is_none()
-                && specification.get("workspace_backing").is_none(),
-            "preparation cannot replace an existing source_manifest or workspace_backing",
+                && specification.get("workspace_backing").is_none()
+                && specification.get("toolchain_transfer").is_none(),
+            "preparation cannot replace an existing manifest, workspace backing or toolchain transfer",
         )?;
         require(
             serde_json::to_vec(specification)?.len() <= super::MAX_FRAME_BYTES,
@@ -181,6 +182,12 @@ impl SourcePreparation {
         fields.remove("source_roots");
         fields.remove("cargo_source");
         fields.remove("toolchain_source");
+        if specification.get("toolchain_source").is_some() {
+            // Capture will replace this local preflight-only path with the
+            // retained dataset identity and explicit transfer selection. No
+            // fabricated toolchain digest enters a saved or transmitted request.
+            fields.insert("toolchain_backing".to_owned(), Value::String("local-preparation".into()));
+        }
         fields.insert(
             "source_manifest".to_owned(),
             manifest_value(&probe_manifest),

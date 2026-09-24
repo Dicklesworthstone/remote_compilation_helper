@@ -71,6 +71,10 @@ impl Default for SourceTransferTask {
 }
 
 impl SourceTransferTask {
+    pub fn with_input_budget(input_budget: std::time::Duration) -> Self {
+        Self { source:Some(SourceTransferState::with_input_budget(input_budget)), ..Self::default() }
+    }
+
     fn start_worker(
         &mut self,
         mut handle: impl FnMut(&mut SourceTransferState, &Value) -> Result<Value, String>

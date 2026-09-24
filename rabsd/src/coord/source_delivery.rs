@@ -7,6 +7,7 @@
 //! Source availability is not action-key validity or cache-publication authority.
 
 mod preparation;
+mod toolchain;
 
 use super::worker_delivery::{MAX_FRAME_BYTES, WorkerAuthentication, WorkerPeer, validate_request};
 use rabs_asupersync::worker_transport::MAX_JSON_RECORD;
@@ -17,6 +18,8 @@ use rabs_sandbox::snapshot_capture::{MemberKind, SealedSourceSnapshot};
 use rabs_sandbox::source_transfer::{
     MAX_SOURCE_CHUNK, MAX_SOURCE_FILES, SOURCE_TRANSFER, SourceFile, SourceManifest, SourceReceiver,
 };
+use rabs_sandbox::toolchain_dataset::{PreparedToolchain, ToolchainLimits, capture_toolchain};
+use rabs_sandbox::toolchain_transfer::TOOLCHAIN_TRANSFER_VERSION;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
@@ -218,31 +221,52 @@ pub fn prepare_source_bundle(
             ));
         }
     }
-    // The local compiler installation may have a different physical path than
-    // the worker's installation. Only its verified content identity is sent.
+    // The selected compiler tree is retained with source. It no longer relies
+    // on a corresponding path or preinstalled compiler on the eventual worker.
     let expected_toolchain = super::worker_delivery::toolchain_identity(specification)?;
-    let toolchain = specification
+    let toolchain_source = specification
         .get("toolchain_source")
         .map(|value| {
             let path = value
                 .as_str()
                 .filter(|path| !path.is_empty() && path.len() <= 4096)
                 .ok_or_else(|| invalid("toolchain_source must be an absolute local directory"))?;
-            let identity = rabs_sandbox::toolchain_dataset::fingerprint_toolchain(
-                Path::new(path),
-                &rabs_sandbox::toolchain_dataset::ToolchainLimits::default(),
-                || false,
-            )?;
+            let path = PathBuf::from(path);
+            require(path.is_absolute(), "toolchain_source must be absolute")?;
+            let canonical = fs::canonicalize(&path)?;
             require(
-                expected_toolchain
-                    .as_ref()
-                    .is_none_or(|expected| expected == &identity),
-                "local toolchain does not match the specified toolchain_identity",
+                !destination.starts_with(&canonical),
+                "bundle destination must be outside the selected toolchain",
             )?;
-            Ok::<_, io::Error>(identity)
+            if let Some(expected) = &expected_toolchain {
+                // Reject a caller's stale explicit pin before creating output.
+                // Capture still checks the pin again across its own mutation
+                // barrier; this preflight never authorizes later bytes.
+                let current = rabs_sandbox::toolchain_dataset::fingerprint_toolchain(
+                    &path, &ToolchainLimits::default(), || false)?;
+                require(&current == expected,
+                    "local toolchain does not match the specified toolchain_identity")?;
+            }
+            Ok::<_, io::Error>(path)
         })
         .transpose()?;
-    let upload = inputs.capture()?;
+    let mut upload = inputs.capture()?;
+    let mut builder = fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(&destination)?; // Exclusive; never merge into an old bundle.
+    let toolchain = toolchain_source
+        .as_ref()
+        .map(|source| {
+            let prepared = capture_toolchain(source, &destination.join("toolchain"),
+                expected_toolchain.as_ref(), &ToolchainLimits::default(), || false)?;
+            prepared.sync(|| false)?;
+            Ok::<_, io::Error>(prepared)
+        })
+        .transpose()?;
     let mut request = specification.clone();
     let fields = request
         .as_object_mut()
@@ -251,26 +275,23 @@ pub fn prepare_source_bundle(
     fields.remove("source_roots");
     fields.remove("cargo_source");
     fields.remove("toolchain_source");
-    if let Some(identity) = &toolchain {
+    if let Some(prepared) = &toolchain {
+        fields.remove("toolchain_backing");
+        fields.insert("toolchain_transfer".to_owned(), json!(TOOLCHAIN_TRANSFER_VERSION));
         fields.insert(
             "toolchain_identity".to_owned(),
-            super::worker_delivery::toolchain_identity_value(identity),
+            super::worker_delivery::toolchain_identity_value(prepared.identity()),
         );
     }
     fields.insert("source_manifest".to_owned(), upload.wire_manifest());
     // One validator for prepared and hand-authored execution requests. This
     // preserves argv, output declarations, timeouts, and unknown extensions.
     validate_request(&request)?;
+    if let Some(toolchain) = toolchain {
+        upload = upload.with_toolchain(toolchain, &request)?;
+    }
     upload.validate_request(&request)?;
     let request_bytes = serde_json::to_vec(&request)?;
-
-    let mut builder = fs::DirBuilder::new();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        builder.mode(0o700);
-    }
-    builder.create(&destination)?; // Exclusive; never merge into an old bundle.
     let source = destination.join("source");
     let mut receiver = SourceReceiver::create(&source, upload.manifest.clone())?;
     for file in upload.manifest.files() {
@@ -320,6 +341,8 @@ pub fn prepare_source_bundle(
         "manifest_sha256":hex(&upload.manifest.digest()), "source_roots":inputs.root_count(),
         "source_files":upload.manifest.files().len(), "source_bytes":upload.manifest.total_bytes(),
         "toolchain_identity":request.get("toolchain_identity"),
+        "toolchain_root":toolchain_source.as_ref().map(|_| destination.join("toolchain")),
+        "toolchain_transfer":request.get("toolchain_transfer"),
         "executed":false, "publication_authorized":false}),
     )
 }
@@ -350,6 +373,7 @@ pub struct SourceUpload {
     image: Arc<SealedSourceSnapshot>,
     layout: SourceLayout,
     manifest: SourceManifest,
+    toolchain: Option<toolchain::ToolchainUpload>,
 }
 
 impl SourceUpload {
@@ -397,6 +421,7 @@ impl SourceUpload {
             image,
             layout: SourceLayout::Root(root.to_owned()),
             manifest: SourceManifest::new(files)?,
+            toolchain: None,
         })
     }
 
@@ -445,6 +470,7 @@ impl SourceUpload {
             image,
             layout: SourceLayout::Closure,
             manifest: SourceManifest::new(files)?,
+            toolchain: None,
         })
     }
 
@@ -476,8 +502,18 @@ impl SourceUpload {
             .map(|file| file.path.clone())
             .collect();
         let upload = Self::from_snapshot(image, root, &paths)?;
-        upload.validate_request(request)?;
+        upload.validate_source_request(request)?;
         Ok(upload)
+    }
+
+    /// Attach a separately approved, retained compiler tree. Source selection
+    /// alone never grants access to a neighbouring toolchain or a host pathname.
+    pub fn with_toolchain(mut self, prepared: PreparedToolchain, request: &Value) -> io::Result<Self> {
+        require(self.toolchain.is_none(), "toolchain upload already attached")?;
+        self.validate_source_request(request)?;
+        self.toolchain = Some(toolchain::ToolchainUpload::new(prepared, request)?);
+        self.validate_request(request)?;
+        Ok(self)
     }
 
     #[must_use]
@@ -529,6 +565,18 @@ impl SourceUpload {
     }
 
     pub fn validate_request(&self, request: &Value) -> io::Result<()> {
+        self.validate_source_request(request)?;
+        require(
+            super::worker_delivery::toolchain_transfer(request)? == self.toolchain.is_some(),
+            "toolchain transfer requires explicitly retained toolchain bytes",
+        )?;
+        if let Some(toolchain) = &self.toolchain {
+            toolchain.validate_request(request)?;
+        }
+        Ok(())
+    }
+
+    fn validate_source_request(&self, request: &Value) -> io::Result<()> {
         require(
             request["kind"] == "canonical-exec" && request["request_id"].as_u64().is_some(),
             "source upload requires an original execution request",
@@ -562,6 +610,12 @@ impl SourceUpload {
         )?;
         let mut grant = grant.clone();
         grant["source_transfer"] = json!(SOURCE_TRANSFER);
+        if let Some(toolchain) = &self.toolchain {
+            toolchain.select(hello, &mut grant)?;
+        } else {
+            require(grant.get("toolchain_transfer").is_none(),
+                "toolchain transfer was not authorized by this upload")?;
+        }
         Ok(grant)
     }
 
@@ -657,7 +711,11 @@ impl SourceUpload {
         require(
             reply["sealed"] == true,
             "worker did not seal the complete source projection",
-        )
+        )?;
+        if let Some(toolchain) = &self.toolchain {
+            toolchain.transmit(peer, request)?;
+        }
+        Ok(())
     }
 }
 
@@ -675,6 +733,7 @@ pub struct SourcePeer<'a, P: ?Sized> {
 impl<'a, P: WorkerPeer + ?Sized> SourcePeer<'a, P> {
     pub fn new(inner: &'a mut P, upload: &'a SourceUpload, request: &'a Value) -> io::Result<Self> {
         upload.validate_request(request)?;
+        require(upload.toolchain.is_none(), "toolchain transfer requires authenticated delivery")?;
         Ok(Self {
             inner,
             upload,
