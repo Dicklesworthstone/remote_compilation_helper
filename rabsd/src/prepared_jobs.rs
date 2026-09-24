@@ -191,6 +191,9 @@ fn request(args: &[String]) -> Result<Value, &'static str> {
         Some("--job-acknowledge") if args.len() == 3 => Ok(json!({
             "kind":"prepared-acknowledge", "operation_id":id, "delivery":args[2],
         })),
+        Some("--job-recover-local") if args.len() == 3 => Ok(json!({
+            "kind":"prepared-recover-local", "operation_id":id, "delivery":args[2],
+        })),
         _ => Err("invalid prepared job arguments"),
     }
 }
@@ -232,7 +235,14 @@ async fn read_frame(stream: &mut UnixStream, until: Instant) -> io::Result<Value
 }
 
 fn exchange(socket: &str, request: &Value) -> io::Result<Value> {
-    let until = Instant::now() + CLIENT_BUDGET;
+    // Local verification/installation can read a complete delivery twice. A
+    // client timeout does not cancel the joined filesystem owner or retry it.
+    let budget = if request["kind"] == "prepared-recover-local" {
+        Duration::from_secs(300)
+    } else {
+        CLIENT_BUDGET
+    };
+    let until = Instant::now() + budget;
     let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
         .build()
         .map_err(|error| io::Error::other(format!("job client runtime: {error:?}")))?;
@@ -330,6 +340,7 @@ pub(crate) fn run(args: &[String], socket: &str) -> i32 {
                 --job-cancel <id32hex>\n\
                 --job-resume <id32hex> <new-delivery> [old-prefix-directory]\n\
                 --job-acknowledge <id32hex> <owned-delivery>\n\
+                --job-recover-local <id32hex> <owned-delivery>\n\
                 Paths must be absolute; reuse the same job ID to inspect an uncertain response."
             );
             return 2;
@@ -451,12 +462,16 @@ mod tests {
         let acknowledge = request(&args(&["--job-acknowledge", id, "/old"])).unwrap();
         assert_eq!(acknowledge["kind"], "prepared-acknowledge");
         assert_eq!(acknowledge["delivery"], "/old");
+        let local = request(&args(&["--job-recover-local", id, "/old"])).unwrap();
+        assert_eq!(local, json!({"kind":"prepared-recover-local", "operation_id":id, "delivery":"/old"}));
+        assert!(request(&args(&["--job-recover-local", id, "/old", "/extra"])).is_err());
         for malformed in [
             args(&["--job-status", "1"]),
             args(&["--job-submit", id]),
             args(&["--job-resume", id]),
             args(&["--job-cancel", id, "/extra"]),
             args(&["--job-acknowledge", id]),
+            args(&["--job-recover-local", id]),
         ] {
             assert!(request(&malformed).is_err());
         }

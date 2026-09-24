@@ -393,13 +393,13 @@ async fn handle_connection(
                 status_on_lane(&limits.control, coord.clone()).await
             }
             Ok(value) if matches!(value.get("kind").and_then(|k| k.as_str()),
-                Some("prepared-submit" | "prepared-status" | "prepared-cancel" | "prepared-resume" | "prepared-acknowledge" | "prepared-completion")) => {
+                Some("prepared-submit" | "prepared-status" | "prepared-cancel" | "prepared-resume" | "prepared-acknowledge" | "prepared-completion" | "prepared-recover-local")) => {
                 // Bundle admission and complete result verification perform
                 // filesystem work. Neither may occupy the cancellation/status
                 // lane or the reactor while hashing a large delivered tree.
                 let lane = match value["kind"].as_str() {
                     Some("prepared-submit") => &limits.prepared_admission,
-                    Some("prepared-completion") => &limits.materialization,
+                    Some("prepared-completion" | "prepared-recover-local") => &limits.materialization,
                     _ => &limits.control,
                 };
                 prepared_on_lane(lane, prepared_operations.clone(), value).await
@@ -514,7 +514,7 @@ async fn prepared_on_lane(
                 .and_then(|operation| operation.get("id"))
         })
         .cloned();
-    let result = match lane.spawn(move || prepared_reply(operations.as_deref(), &request)) {
+    let result = match lane.spawn(move || prepared_reply(operations.as_ref(), &request)) {
         Ok(mut work) => work.wait().await,
         Err(error) => Err(error),
     };
@@ -530,7 +530,7 @@ async fn prepared_on_lane(
 }
 
 fn prepared_reply(
-    operations: Option<&crate::coord::prepared_operation::PreparedOperationStore>,
+    operations: Option<&std::sync::Arc<crate::coord::prepared_operation::PreparedOperationStore>>,
     request: &serde_json::Value,
 ) -> String {
     use crate::coord::prepared_operation::PreparedOperationSpec;
@@ -552,7 +552,7 @@ fn prepared_reply(
             "prepared-status" | "prepared-cancel" => &["kind", "operation_id"],
             "prepared-completion" => &["kind", "operation_id", "request_sha256"],
             "prepared-resume" => &["kind", "operation_id", "delivery", "resume_from"],
-            "prepared-acknowledge" => &["kind", "operation_id", "delivery"],
+            "prepared-acknowledge" | "prepared-recover-local" => &["kind", "operation_id", "delivery"],
             _ => return Err(invalid("unknown prepared operation")),
         };
         if request
@@ -604,6 +604,12 @@ fn prepared_reply(
                         .as_str()
                         .ok_or_else(|| invalid("missing owned delivery directory"))?;
                     operations.acknowledge(id, PathBuf::from(delivery))?
+                }
+                "prepared-recover-local" => {
+                    let delivery = request["delivery"]
+                        .as_str()
+                        .ok_or_else(|| invalid("missing owned local delivery directory"))?;
+                    operations.recover_local(id, PathBuf::from(delivery))?
                 }
                 _ => return Err(invalid("unknown prepared operation")),
             }

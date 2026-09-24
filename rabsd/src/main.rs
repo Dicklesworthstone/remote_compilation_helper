@@ -306,6 +306,7 @@ fn main() {
                  Wait and replay diagnostics: --job-wait <id32hex> [timeout-seconds]\n\
                  Recover: --job-resume <id32hex> <new-delivery> [old-prefix-directory]\n\
                  Confirm release: --job-acknowledge <id32hex> <owned-delivery>\n\
+                 Finish local installation: --job-recover-local <id32hex> <owned-delivery>\n\
                  Jobs require a running daemon and a prepared source/toolchain binding. Inspect listen_address before connecting the worker.\n\
                  Reuse the same job ID after a lost response. Resume retrieves the original result without executing again.\n\
                  TLS requires RABS_COORD_TLS_CA, RABS_COORD_TLS_CERT and RABS_COORD_TLS_KEY.\n\
@@ -333,7 +334,7 @@ fn main() {
         Some("--worker-build-tls") => {
             std::process::exit(worker_exec::run_build_tls(&args[1..]));
         }
-        Some("--job-submit" | "--job-status" | "--job-wait" | "--job-cancel" | "--job-resume" | "--job-acknowledge") => {
+        Some("--job-submit" | "--job-status" | "--job-wait" | "--job-cancel" | "--job-resume" | "--job-acknowledge" | "--job-recover-local") => {
             let config = match load_config() {
                 Ok(config) => config,
                 Err(error) => {

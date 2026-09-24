@@ -8,6 +8,7 @@
 //! State and build directories are operator-owned, not hostile shared storage.
 
 mod completion;
+mod local_recovery;
 pub use completion::{DiagnosticSnapshot, DiagnosticStream, PreparedCompletion};
 
 use super::secure_worker_delivery::{OperationCancellation, parse_worker_pin};
@@ -63,6 +64,7 @@ enum StoredMode {
     Execute,
     Resume,
     Acknowledge,
+    LocalRecovery,
 }
 
 /// Bounded status; full compiler artifacts and receipts stay in the delivery.
@@ -152,6 +154,7 @@ impl Record {
                 StoredMode::Execute => "execute",
                 StoredMode::Resume => "resume",
                 StoredMode::Acknowledge => "acknowledge",
+                StoredMode::LocalRecovery => "recover-local",
             },
             cancel_requested: self.cancel_requested,
             execution_may_have_run: self.execution_may_have_run,
@@ -506,6 +509,12 @@ impl PreparedOperationStore {
                         record.attempt > 0
                             && record.execution_may_have_run
                             && record.resume_from.is_none()
+                    }
+                    StoredMode::LocalRecovery => {
+                        record.attempt > 0
+                            && record.execution_may_have_run
+                            && record.resume_from.is_none()
+                            && record.state != OperationState::Queued
                     }
                 },
                 "invalid recovered operation execution frontier",
@@ -940,7 +949,10 @@ impl PreparedOperationStore {
         let next = state
             .records
             .values()
-            .filter(|record| record.state == OperationState::Queued)
+            .filter(|record| {
+                record.state == OperationState::Queued
+                    && record.mode != StoredMode::LocalRecovery
+            })
             .filter(|record| {
                 state.records.values().all(|other| {
                     if other.spec.id == record.spec.id {
