@@ -113,6 +113,7 @@ fn describe(result: &Value) -> io::Result<(Vec<Item>, Option<ArtifactPlan>, Opti
             Some("cancelled") => StopReason::Cancelled,
             Some("deadline-exceeded") => StopReason::DeadlineExceeded,
             Some("session-lost") => StopReason::SessionLost,
+            Some("lease-expired") => StopReason::LeaseExpired,
             _ => return Err(invalid("invalid retained stop reason")),
         }),
         None => return Err(invalid("missing retained stop reason")),
@@ -457,7 +458,12 @@ mod tests {
 
     #[test]
     fn failed_and_cancelled_results_recover_diagnostics_without_fake_artifacts() {
-        for stop in [None, Some(StopReason::Cancelled), Some(StopReason::SessionLost)] {
+        for stop in [
+            None,
+            Some(StopReason::Cancelled),
+            Some(StopReason::SessionLost),
+            Some(StopReason::LeaseExpired),
+        ] {
             let root = tempfile::tempdir().unwrap();
             let (_journal, target, fingerprint) = target(root.path(), 1);
             let mut original = completion(1, false);
@@ -468,6 +474,21 @@ mod tests {
             assert_eq!(recovered.completion.stop_reason, stop);
             assert_eq!(recovered.completion.result.exit_code, original.result.exit_code);
             assert!(recovered.completion.artifacts.is_none());
+            let mut outputs = recovered.completion.outputs.unwrap();
+            assert_eq!(outputs.stdout.read_chunk(0, 64).unwrap(), b"A\0\xffB");
+        }
+    }
+
+    #[test]
+    fn lease_expiry_cannot_seal_success_or_partial_artifacts() {
+        for with_artifacts in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let (_journal, target, _) = target(root.path(), 1);
+            let mut original = completion(1, with_artifacts);
+            original.stop_reason = Some(StopReason::LeaseExpired);
+            original.result.exit_code = if with_artifacts { 125 } else { 0 };
+            assert!(target.seal(&mut original).is_err());
+            assert!(!root.path().join(DIRECTORY).exists(), "refusal must precede spool creation");
         }
     }
 

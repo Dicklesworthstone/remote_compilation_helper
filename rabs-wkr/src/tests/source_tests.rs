@@ -58,8 +58,9 @@ fn partial_or_unnegotiated_source_never_burns_execution_admission() {
         peer.frame(corrupt);
         peer.frame(json!({"kind":"request-status", "request_id":1}));
         let report = report();
+        let lease = ExecutionLeaseSelection::default();
         let mut driver = Box::pin(drive_session_with_sources(&mut wire, &report, false, Some(&mut journal),
-            false, enabled, |_, _, _, _| panic!("incomplete input launched"), pressure));
+            false, enabled, &lease, |_, _, _, _, _| panic!("incomplete input launched"), pressure));
         // Observe all requested refusals before disconnecting. Closing while
         // source I/O is pending now intentionally abandons queued requests.
         pump(driver.as_mut(), &peer, 6);
@@ -84,7 +85,8 @@ fn verified_source_is_execution_owned_but_the_original_request_is_journaled() {
     let path = Arc::new(Mutex::new(None::<PathBuf>)); let observed = Arc::clone(&path);
     let fingerprint = rabs_wkr::request_journal::request_fingerprint(&original, DEFAULT_EXECUTION_TIMEOUT);
     wait(drive_session_with_sources(&mut wire, &report(), true, Some(&mut journal), false, true,
-        |request, timeout, artifacts, source| {
+        &ExecutionLeaseSelection::default(), |request, timeout, artifacts, source, lease| {
+            assert!(lease.is_none());
             assert!(artifacts.is_none()); assert!(source.is_some());
             let saved: Value = serde_json::from_slice(&std::fs::read(root.path().join("requests.json")).unwrap()).unwrap();
             assert_eq!(saved["last"]["fingerprint"], fingerprint);
@@ -114,8 +116,9 @@ fn disconnect_does_not_remove_source_before_the_execution_owner_drains() {
     upload(&peer, &original);
     let cleaned = Arc::new(AtomicBool::new(false)); let observed = Arc::clone(&cleaned);
     let report = report();
+    let lease = ExecutionLeaseSelection::default();
     let mut driver = Box::pin(drive_session_with_sources(&mut wire, &report, false, Some(&mut journal), false, true,
-        |request, timeout, _, source| {
+        &lease, |request, timeout, _, source, _| {
             let cleaned = Arc::clone(&observed);
             ExecutionTask::spawn(request.request_id, timeout, move |control| {
                 let _owner = source;
@@ -143,8 +146,9 @@ fn resumed_source_bound_results_need_no_worker_source_directory_or_new_upload() 
     let original = source_request(4);
     upload(&peer, &original); peer.frame(original.clone());
     let path = Arc::new(Mutex::new(None::<PathBuf>)); let observed = Arc::clone(&path);
+    let lease = ExecutionLeaseSelection::default();
     let mut driver = Box::pin(drive_session_with_sources(&mut wire, &report, false, Some(&mut journal), false, true,
-        |request, timeout, _, source| {
+        &lease, |request, timeout, _, source, _| {
             *observed.lock().unwrap() = Some(PathBuf::from(&request.workspace_backing));
             let target = RetentionTarget::from_admitted(root.path(), request.request_id, ResultRecipient::TlsSpki([7; 32]))?;
             ExecutionTask::spawn_for_delivery(request.request_id, timeout, None, Some(target), move |control| {
@@ -168,7 +172,7 @@ fn resumed_source_bound_results_need_no_worker_source_directory_or_new_upload() 
     let mut next = Wire::default(); let peer = next.clone();
     peer.frame(json!({"kind":"result-resume", "request_id":4, "request":original}));
     let mut driver = Box::pin(drive_session_with_sources(&mut next, &report, true, Some(&mut journal), false, false,
-        |_, _, _, _| panic!("resumption must not launch or require source reupload"), pressure));
+        &lease, |_, _, _, _, _| panic!("resumption must not launch or require source reupload"), pressure));
     pump(driver.as_mut(), &peer, 1);
     assert_eq!(peer.replies()[0]["resumed"], true);
     peer.frame(output_read(4, "stdout", 0, 64)); pump(driver.as_mut(), &peer, 2);
@@ -192,8 +196,9 @@ fn pipelined_source_frames_finish_in_order_and_controls_can_interleave() {
     peer.frame(json!({"kind":"ping"}));
     peer.frame(seal(&original));
     peer.frame(json!({"kind":"request-status", "request_id":10}));
+    let lease = ExecutionLeaseSelection::default();
     let mut driver = Box::pin(drive_session_with_sources(&mut wire, &report, false, Some(&mut journal),
-        false, true, |_, _, _, _| panic!("upload is not execution admission"), pressure));
+        false, true, &lease, |_, _, _, _, _| panic!("upload is not execution admission"), pressure));
     pump(driver.as_mut(), &peer, 5);
     peer.close(); wait(driver).unwrap();
     let replies = peer.replies();
@@ -218,8 +223,9 @@ fn cancelling_a_sealed_upload_is_exact_id_idempotent_and_prevents_admission() {
     let mut wire = Wire::default(); let peer = wire.clone(); let report = report();
     let original = source_request(11);
     upload(&peer, &original);
+    let lease = ExecutionLeaseSelection::default();
     let mut driver = Box::pin(drive_session_with_sources(&mut wire, &report, false, Some(&mut journal),
-        false, true, |_, _, _, _| panic!("cancelled source reached durable execution admission"), pressure));
+        false, true, &lease, |_, _, _, _, _| panic!("cancelled source reached durable execution admission"), pressure));
     pump(driver.as_mut(), &peer, 3);
     assert_eq!(peer.replies()[2]["sealed"], true);
     peer.frame(json!({"kind":"cancel", "request_id":12}));

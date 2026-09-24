@@ -128,12 +128,16 @@ fn request() -> Value {
         "artifacts":{"unit":"dep", "files":["a"]}})
 }
 fn hello(pin: &str, resume: bool) -> Value {
-    json!({"kind":"worker-hello", "worker_id":"worker", "peer_id":pin,
+    let mut hello = json!({"kind":"worker-hello", "worker_id":"worker", "peer_id":pin,
         "canonical":true, "slots":1, "boot_generation":1,
         "incarnation":"00000000000000000000000000000001", "request_high_water":if resume {json!(7)} else {Value::Null},
         "transport":{"minimum_compatible":1,"current":1}, "application":{"minimum_compatible":1,"current":1},
         "recovery_protocols":["request-journal-v1"], "result_retentions":["durable-result-v1"],
-        "output_transfers":["ranges-v1"], "artifact_transfers":["files-v1"]})
+        "output_transfers":["ranges-v1"], "artifact_transfers":["files-v1"]});
+    if !resume {
+        hello["execution_leases"] = json!(["request-renewal-v1"]);
+    }
+    hello
 }
 async fn send(stream: &mut SecureWorkerStream, value: &Value) {
     stream.write_all(format!("{value}\n").as_bytes()).await.unwrap();
@@ -167,6 +171,20 @@ async fn authenticate(stream: &mut SecureWorkerStream, pin: &str, resume: bool) 
     assert_eq!(grant["session_id"], session);
     assert_eq!(grant["publication"], "disabled");
     assert_eq!(grant["result_retention"], "durable-result-v1");
+    if resume {
+        assert!(grant.get("execution_lease").is_none());
+    } else {
+        assert_eq!(
+            grant["execution_lease"],
+            json!({
+                "version":"request-renewal-v1", "session_id":session,
+                "lease_id":challenge["token_id"], "request_id":7,
+                "request_sha256":hash(&serde_json::to_vec(&request()).unwrap()),
+                "boot_generation":1, "incarnation":"00000000000000000000000000000001",
+                "ttl_ms":30000,
+            })
+        );
+    }
     let dispatch = receive(stream).await.unwrap();
     assert_eq!(dispatch, if resume { json!({"kind":"result-resume", "request_id":7, "request":request()}) } else { request() });
     session

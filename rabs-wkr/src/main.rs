@@ -16,6 +16,9 @@
 
 use asupersync::cx::Cx;
 use asupersync::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use rabs_protocol::lease_semantics::{
+    REQUEST_EXECUTION_LEASE_VERSION, RequestExecutionLease, RequestExecutionLeaseIdentity,
+};
 use rabs_wkr::artifacts::{self, ARTIFACT_TRANSFER, ArtifactPlan, ArtifactTransferState, CapturedArtifacts};
 use rabs_wkr::execution::{DEFAULT_EXECUTION_TIMEOUT, ExecutionCompletion, ExecutionTask, StopReason};
 use rabs_wkr::output::{CapturedOutputs, MAX_OUTPUT_CHUNK_BYTES};
@@ -38,9 +41,125 @@ use std::time::Duration;
 
 mod reconnect;
 
+#[cfg(test)]
+mod execution_lease_session_tests;
+
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const MAX_FRAME_BYTES: usize = 1 << 20;
 const OUTPUT_TRANSFER: &str = "ranges-v1";
+
+/// A session grant is distinct from the saved executable request. The full
+/// original request remains the journal fingerprint and can be recovered after
+/// this ephemeral, authenticated connection and its lease have disappeared.
+#[derive(Clone, Debug)]
+struct ExecutionLeaseGrant {
+    identity: RequestExecutionLeaseIdentity,
+    ttl_ms: u64,
+}
+
+#[derive(Default)]
+struct ExecutionLeaseSelection {
+    authenticated: bool,
+    grant: Option<ExecutionLeaseGrant>,
+}
+
+impl ExecutionLeaseSelection {
+    fn execution_grant(&self, request: &serde_json::Value)
+        -> Result<Option<(RequestExecutionLeaseIdentity, u64)>, String>
+    {
+        let Some(grant) = &self.grant else {
+            return if self.authenticated {
+                Err("authenticated execution requires request-renewal-v1".to_owned())
+            } else { Ok(None) };
+        };
+        let digest = rabs_wkr::session::sha256_hex(
+            &serde_json::to_vec(request).map_err(|error| format!("request encoding: {error}"))?,
+        );
+        let expected: String = grant.identity.request_sha256.iter()
+            .map(|byte| format!("{byte:02x}")).collect();
+        if request["request_id"].as_u64() != Some(grant.identity.request_id)
+            || digest != expected
+        {
+            return Err("execution lease does not bind this exact request".to_owned());
+        }
+        Ok(Some((grant.identity, grant.ttl_ms)))
+    }
+
+    fn renew(&self, frame: &serde_json::Value, active: Option<&ExecutionTask>)
+        -> Result<String, String>
+    {
+        if frame.as_object().is_none_or(|fields| fields.len() != 5) {
+            return Err("execution lease renewal requires exactly its identity and sequence".to_owned());
+        }
+        let number = |name: &str| frame[name].as_u64().filter(|value| *value != 0)
+            .ok_or_else(|| format!("invalid execution lease renewal {name}"));
+        let session_id = number("session_id")?;
+        let lease_id = number("lease_id")?;
+        let request_id = frame["request_id"].as_u64()
+            .ok_or("invalid execution lease renewal request_id")?;
+        let renewal_seq = number("renewal_seq")?;
+        let accepted = self.grant.as_ref().is_some_and(|grant| {
+            grant.identity.session_id == session_id && grant.identity.lease_id == lease_id
+                && grant.identity.request_id == request_id
+                && active.is_some_and(|task| task.request_id() == request_id
+                    && task.renew_execution_lease(renewal_seq))
+        });
+        Ok(serde_json::json!({"kind":"execution-lease-renewed", "session_id":session_id,
+            "lease_id":lease_id, "request_id":request_id, "renewal_seq":renewal_seq,
+            "accepted":accepted}).to_string())
+    }
+}
+
+fn execution_lease_selection(
+    frame: &str, authenticated: bool, challenge_session: Option<u64>, journal: &WorkerJournal,
+) -> Result<ExecutionLeaseSelection, String> {
+    let value: serde_json::Value = serde_json::from_str(frame)
+        .map_err(|error| format!("handshake JSON: {error}"))?;
+    let Some(lease) = value.get("execution_lease") else {
+        return Ok(ExecutionLeaseSelection { authenticated, grant: None });
+    };
+    if lease.as_object().is_none_or(|fields| fields.len() != 8)
+        || lease["version"] != REQUEST_EXECUTION_LEASE_VERSION
+    {
+        return Err("unsupported execution lease selection".to_owned());
+    }
+    let number = |name: &str| lease[name].as_u64().filter(|number| *number != 0)
+        .ok_or_else(|| format!("invalid execution lease {name}"));
+    let lower_hex = |name: &str, len: usize| lease[name].as_str()
+        .filter(|text| text.len() == len
+            && text.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+        .ok_or_else(|| format!("invalid execution lease {name}"));
+    let session_id = number("session_id")?;
+    if value["session_id"].as_u64() != Some(session_id)
+        || challenge_session.is_some_and(|expected| expected != session_id)
+    {
+        return Err("execution lease session does not match admission".to_owned());
+    }
+    let mut request_sha256 = [0_u8; 32];
+    for (byte, digits) in request_sha256.iter_mut().zip(lower_hex("request_sha256", 64)?.as_bytes().chunks_exact(2)) {
+        let digits = std::str::from_utf8(digits).map_err(|_| "invalid request digest")?;
+        *byte = u8::from_str_radix(digits, 16).map_err(|_| "invalid request digest")?;
+    }
+    let identity = RequestExecutionLeaseIdentity {
+        session_id, lease_id: number("lease_id")?,
+        request_id: lease["request_id"].as_u64().ok_or("invalid execution lease request_id")?,
+        request_sha256, boot_generation: number("boot_generation")?,
+        incarnation: u128::from_str_radix(lower_hex("incarnation", 32)?, 16)
+            .map_err(|_| "invalid execution lease incarnation")?,
+    };
+    if identity.boot_generation != journal.boot_generation().0
+        || identity.incarnation != journal.incarnation().0
+    {
+        return Err("execution lease does not bind this worker boot".to_owned());
+    }
+    let ttl_ms = number("ttl_ms")?;
+    // Validate all bounds now without arming a live lease during source upload.
+    // The actual owner uses its own fresh monotonic origin only at dispatch.
+    RequestExecutionLease::new(identity, ttl_ms, 0)
+        .map_err(|error| format!("invalid execution lease: {error:?}"))?;
+    Ok(ExecutionLeaseSelection { authenticated,
+        grant: Some(ExecutionLeaseGrant { identity, ttl_ms }) })
+}
 
 fn json_string(text: &str) -> String {
     let mut out = String::with_capacity(text.len() + 2);
@@ -92,6 +211,7 @@ fn main() {
                  to retrieve diagnostics and declared compiled artifacts.\n\
                  Select source_transfer=source-files-v1 to upload verified source before execution.\n\
                  Select result_retention=durable-result-v1 to retain complete results until acceptance.\n\
+                 Authenticated execution requires a request-renewal-v1 lease and timely renewals.\n\
                  Fleet transport requires RABS_WORKER_TLS_CA, RABS_WORKER_TLS_CERT,\n\
                  RABS_WORKER_TLS_KEY and RABS_WORKER_TLS_SERVER_NAME.\n\
                  Request IDs must increase across restarts; request-status reconciles outcomes.\n\
@@ -364,8 +484,9 @@ where
     H: FnMut() -> rabs_wkr::session::PressureSample,
 {
     drive_session_with_sources(stream, report, once, journal, artifact_transfer_enabled, false,
-        |request, timeout, artifacts, source| {
+        &ExecutionLeaseSelection::default(), |request, timeout, artifacts, source, lease| {
             assert!(source.is_none(), "test did not negotiate source transfer");
+            assert!(lease.is_none(), "test did not negotiate execution leases");
             launch(request, timeout, artifacts)
         }, heartbeat).await
 }
@@ -377,11 +498,13 @@ where
 async fn drive_session_with_sources<S, L, H>(
     stream: &mut S, report: &rabs_wkr::session::CapabilityReport, once: bool,
     mut journal: Option<&mut WorkerJournal>, artifact_transfer_enabled: bool,
-    source_transfer_enabled: bool, mut launch: L, mut heartbeat: H,
+    source_transfer_enabled: bool, execution_lease: &ExecutionLeaseSelection,
+    mut launch: L, mut heartbeat: H,
 ) -> Result<(), String>
 where
     S: AsyncRead + AsyncWrite + Unpin,
-    L: FnMut(CanonicalExecRequest, Duration, Option<ArtifactPlan>, Option<SourceOwner>) -> io::Result<ExecutionTask>,
+    L: FnMut(CanonicalExecRequest, Duration, Option<ArtifactPlan>, Option<SourceOwner>,
+        Option<(RequestExecutionLeaseIdentity, u64)>) -> io::Result<ExecutionTask>,
     H: FnMut() -> rabs_wkr::session::PressureSample,
 {
     let mut reader = FrameReader::default();
@@ -556,8 +679,14 @@ where
                             },
                             _ => request_error(request_id, "unknown-request"),
                         },
+                        Some("execution-lease-renew") => execution_lease.renew(&value, active.as_ref())
+                            .unwrap_or_else(|reason| request_error(request_id, &reason)),
                         Some("canonical-exec") => {
                             let parsed = parse_exec_request(&value).and_then(|mut request| {
+                                // The lease authenticates the ORIGINAL serialized
+                                // request, before any private source-path projection
+                                // and before durable execution ownership is acquired.
+                                let lease = execution_lease.execution_grant(&value)?;
                                 let timeout = parse_timeout(&value)?;
                                 let artifacts = artifacts::parse_plan(&value)?;
                                 if artifacts.is_some() && !artifact_transfer_enabled {
@@ -566,15 +695,15 @@ where
                                 if let Some(path) = source_transfer.prepared_path(&value, source_transfer_enabled)? {
                                     request.workspace_backing = path;
                                 }
-                                Ok((request, timeout, artifacts))
+                                Ok((request, timeout, artifacts, lease))
                             });
                             match parsed {
                                 Err(reason) => request_error(request_id, &reason),
-                                Ok((request, _, _)) if last_admitted.is_some_and(|last| request.request_id <= last) => request_error(Some(request.request_id), "stale-request-id"),
-                                Ok((request, _, _)) if active.is_some() => request_error(Some(request.request_id), "worker-busy"),
-                                Ok((request, _, _)) if pending_output.is_some() => request_error(Some(request.request_id), "output-unacknowledged"),
-                                Ok((request, _, _)) if artifact_transfer.is_pending() => request_error(Some(request.request_id), "artifacts-unacknowledged"),
-                                Ok((request, timeout, artifacts)) => {
+                                Ok((request, _, _, _)) if last_admitted.is_some_and(|last| request.request_id <= last) => request_error(Some(request.request_id), "stale-request-id"),
+                                Ok((request, _, _, _)) if active.is_some() => request_error(Some(request.request_id), "worker-busy"),
+                                Ok((request, _, _, _)) if pending_output.is_some() => request_error(Some(request.request_id), "output-unacknowledged"),
+                                Ok((request, _, _, _)) if artifact_transfer.is_pending() => request_error(Some(request.request_id), "artifacts-unacknowledged"),
+                                Ok((request, timeout, artifacts, lease)) => {
                                     let id = request.request_id;
                                     let refusal = match journal.as_deref_mut() {
                                         // Fingerprint the ORIGINAL request, not the
@@ -588,7 +717,7 @@ where
                                     } else {
                                         let source = source_transfer.take_prepared(&value)
                                             .map_err(|error| format!("source ownership: {error}"))?;
-                                        match launch(request, timeout, artifacts, source) {
+                                        match launch(request, timeout, artifacts, source, lease) {
                                             Ok(task) => { last_admitted = Some(id); active = Some(task); continue; }
                                             Err(error) => {
                                                 if let Some(journal) = journal.as_deref_mut() {
@@ -651,6 +780,7 @@ fn worker_hello(report: &rabs_wkr::session::CapabilityReport, journal: &WorkerJo
         "canonical": report.canonical_namespace, "slots": report.slots, "token_id": 1,
         "output_transfers": [OUTPUT_TRANSFER], "artifact_transfers": [ARTIFACT_TRANSFER],
         "source_transfers": [SOURCE_TRANSFER],
+        "execution_leases": [REQUEST_EXECUTION_LEASE_VERSION],
         "command_contexts": [rabs_sandbox::process_context::COMMAND_CONTEXT_VERSION],
         "toolchain_datasets": [rabs_sandbox::toolchain_dataset::TOOLCHAIN_DATASET_VERSION],
         "recovery_protocols": [RECOVERY_PROTOCOL],
@@ -678,7 +808,7 @@ async fn session_loop(
         }
         rabs_asupersync::worker_transport::WorkerConnection::LoopbackFixture(_) => ResultRecipient::LoopbackFixture,
     };
-    let (capture_output, capture_artifacts, retain_result, receive_sources) = asupersync::time::timeout(
+    let (capture_output, capture_artifacts, retain_result, receive_sources, execution_lease) = asupersync::time::timeout(
         asupersync::time::wall_now(),
         Duration::from_secs(10),
         async {
@@ -698,6 +828,7 @@ async fn session_loop(
             let first = reader.read(&mut stream).await
                 .map_err(|e| format!("handshake read: {e}"))?
                 .ok_or("no worker session admission")?;
+            let mut challenge_session = None;
             let ack = match local_identity {
                 Some(identity) => {
                     let challenge: serde_json::Value = serde_json::from_str(&first)
@@ -708,6 +839,7 @@ async fn session_loop(
                             .ok_or_else(|| format!("invalid worker challenge {key}"))
                     };
                     let session = positive("session_id")?;
+                    challenge_session = Some(session);
                     let operation = positive("operation_id")?;
                     let token = positive("token_id")?;
                     let peer_id: String = identity.peer_id.iter().map(|byte| format!("{byte:02x}")).collect();
@@ -743,10 +875,11 @@ async fn session_loop(
             validate_recovery_selection(&ack)?;
             let retain = result_retention_requested(&ack)?;
             let source = source_transfer::selected(&ack)?;
+            let lease = execution_lease_selection(&ack, local_identity.is_some(), challenge_session, journal)?;
             if local_identity.is_some() && !output {
                 return Err("authenticated worker requires complete output retrieval".to_owned());
             }
-            Ok::<(bool, bool, bool, bool), String>((output, artifacts, retain, source))
+            Ok::<_, String>((output, artifacts, retain, source, lease))
         },
     ).await.map_err(|_| "worker session admission deadline exceeded".to_owned())??;
     let cargo_home = std::env::temp_dir().join(format!("rabs-wkr-ch-{}", std::process::id()));
@@ -760,7 +893,7 @@ async fn session_loop(
     if retain_result { journal.authorize_result_recipient(recipient.clone()); }
     *admitted_at = Some(std::time::Instant::now());
     let outcome = drive_session_with_sources(&mut stream, report, once, Some(&mut *journal), capture_artifacts,
-        receive_sources, |request, timeout, artifacts, source| {
+        receive_sources, &execution_lease, |request, timeout, artifacts, source, lease| {
         let cargo_home = cargo_home.clone(); let home = home.clone(); let spills = spills.clone();
         let slots = report.slots;
         let id = request.request_id;
@@ -780,7 +913,7 @@ async fn session_loop(
                 ),
             }
         };
-        ExecutionTask::spawn_for_delivery(id, timeout, artifacts, retention, execute)
+        ExecutionTask::spawn_for_delivery_with_lease(id, timeout, artifacts, retention, lease, execute)
     }, || sample_pressure(&cargo_home)).await;
     journal.clear_result_recipient();
     outcome

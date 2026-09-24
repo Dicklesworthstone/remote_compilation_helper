@@ -37,6 +37,7 @@ use std::time::{Duration, Instant};
 mod admission;
 mod cancellation;
 mod interrupt;
+mod lease;
 pub use admission::PinnedWorkerAdmission;
 pub use cancellation::OperationCancellation;
 use admission::AdmittedWorkerSession;
@@ -243,6 +244,13 @@ impl<P: WorkerPeer> WorkerPeer for AdmittedPeer<P> {
                 "resume requires negotiated durable result retention",
             )?;
         }
+        // Refuse an old worker before challenge, source upload or dispatch.
+        // The ephemeral grant binds the unchanged journal request and this boot.
+        let execution_lease = if self.mode == DeliveryMode::Execute {
+            Some(lease::grant(hello, &self.expected_operation, self.ids[0], self.ids[2])?)
+        } else {
+            None
+        };
         // Decide source authority before sending the challenge. A source-backed
         // execution without captured bytes must not become a remote admission.
         // Resume retains the original manifest but never uploads it again.
@@ -335,6 +343,9 @@ impl<P: WorkerPeer> WorkerPeer for AdmittedPeer<P> {
         // No arbitrary session continuation: sealed-result retrieval is the
         // separately negotiated result_retention protocol on a NEW session.
         grant["resume"] = json!("unsupported");
+        if let Some(lease) = execution_lease {
+            grant["execution_lease"] = lease;
+        }
         self.inner.send(&grant)?;
         // Only now is the TLS-pinned identity's challenge complete. Keep source
         // frames inside this negotiation frontier: the public adapter never
@@ -885,6 +896,7 @@ mod tests {
     fn hello() -> Value {
         json!({"kind":"worker-hello", "worker_id":"worker", "peer_id":hex(&[1; 32]), "canonical":true, "slots":4,
             "boot_generation":1, "incarnation":"00000000000000000000000000000001",
+            "execution_leases":["request-renewal-v1"],
             "transport":{"minimum_compatible":1,"current":1},
             "application":{"minimum_compatible":1,"current":1}})
     }
@@ -990,6 +1002,85 @@ mod tests {
     }
 
     #[test]
+    fn execution_requires_lease_capability_before_challenge() {
+        for capability in [
+            None,
+            Some(Value::Null),
+            Some(json!("request-renewal-v1")),
+            Some(json!([])),
+            Some(json!(["request-renewal-v2"])),
+        ] {
+            let mut offered = hello();
+            match capability {
+                Some(value) => offered["execution_leases"] = value,
+                None => {
+                    offered.as_object_mut().unwrap().remove("execution_leases");
+                }
+            }
+            let mut peer = peer(offered, response());
+            let offered = peer.receive().unwrap();
+            let error = peer.negotiate(&offered, &grant()).unwrap_err();
+            assert!(error.to_string().contains("execution leases"));
+            assert!(peer.inner.sent.is_empty(), "refusal must precede challenge");
+            assert!(peer.authentication().is_none());
+            assert!(peer.send(&request()).is_err());
+            assert!(peer.negotiate(&offered, &grant()).is_err());
+        }
+    }
+
+    #[test]
+    fn execution_lease_binds_exact_request_without_mutating_dispatch() {
+        use sha2::{Digest, Sha256};
+
+        for request_id in [0, 7] {
+            let mut selected = request();
+            selected["request_id"] = json!(request_id);
+            selected["extension"] = json!({"preserve":["opaque", 17]});
+            let original_bytes = serde_json::to_vec(&selected).unwrap();
+            let (inner, admission) = with_admission(Script {
+                replies: VecDeque::from([hello(), response()]),
+                ..Script::default()
+            });
+            let mut peer = AdmittedPeer::new(
+                inner,
+                TransportIdentity {
+                    peer_id: [1; 32],
+                    fingerprint: [1; 32],
+                },
+                [1; 32],
+                &selected,
+                [10, 20, 30],
+                DeliveryMode::Execute,
+                admission,
+            )
+            .unwrap();
+            let offered = peer.receive().unwrap();
+            peer.negotiate(&offered, &grant()).unwrap();
+            assert_eq!(
+                peer.inner.sent[1]["execution_lease"],
+                json!({
+                    "version":"request-renewal-v1", "session_id":10, "lease_id":30,
+                    "request_id":request_id, "request_sha256":hex(&Sha256::digest(&original_bytes)),
+                    "boot_generation":1, "incarnation":"00000000000000000000000000000001",
+                    "ttl_ms":30000,
+                })
+            );
+            let mut changed = selected.clone();
+            changed["extension"]["preserve"] = json!(["changed", 17]);
+            assert!(peer.send(&changed).is_err());
+            peer.send(&selected).unwrap();
+            assert_eq!(peer.inner.sent[2], selected);
+            assert_eq!(
+                serde_json::to_vec(&peer.inner.sent[2]).unwrap(),
+                original_bytes
+            );
+            assert_eq!(serde_json::to_vec(&selected).unwrap(), original_bytes);
+            assert!(peer.inner.sent[2].get("execution_lease").is_none());
+            assert!(peer.send(&selected).is_err());
+        }
+    }
+
+    #[test]
     fn challenge_binds_session_operation_token_and_peer_before_any_execution() {
         for field in ["session_id", "operation_id", "token_id", "peer_id", "kind"] {
             let mut response = response();
@@ -1067,6 +1158,7 @@ mod tests {
 
     fn recovery_hello() -> Value {
         let mut hello = hello();
+        hello.as_object_mut().unwrap().remove("execution_leases");
         hello["worker_id"] = json!("worker");
         hello["boot_generation"] = json!(2);
         hello["incarnation"] = json!("00000000000000000000000000000002");
@@ -1103,6 +1195,7 @@ mod tests {
         let mut grant = grant();
         grant["result_retention"] = json!("durable-result-v1");
         peer.negotiate(&hello, &grant).unwrap();
+        assert!(peer.inner.sent[1].get("execution_lease").is_none());
         assert!(peer.send(&request()).is_err());
         let dispatch = DeliveryMode::Resume.frame(&request());
         for field in ["program", "args", "artifacts", "workspace_backing", "toolchain_backing"] {
@@ -1267,6 +1360,10 @@ mod tests {
         assert_eq!(sent[1]["kind"], "session-ok");
         assert_eq!(sent[1]["source_transfer"], "source-files-v1");
         assert_eq!(sent[1]["publication"], "disabled");
+        assert_eq!(
+            sent[1]["execution_lease"]["request_sha256"],
+            hex(&Sha256::digest(serde_json::to_vec(&request).unwrap()))
+        );
         assert_eq!(sent[2]["kind"], "source-begin");
         for (index, chunk) in bytes.chunks(MAX_SOURCE_CHUNK).enumerate() {
             assert_eq!(sent[3 + index]["kind"], "source-chunk");
@@ -1288,13 +1385,14 @@ mod tests {
     #[test]
     fn source_bytes_never_cross_failed_identity_capability_or_challenge_admission() {
         let source = tempfile::tempdir().unwrap();
-        for case in 0..4 {
+        for case in 0..5 {
             let (upload, request, mut script, _) = source_fixture(source.path());
             match case {
                 0 => script.replies[0]["peer_id"] = json!(hex(&[2; 32])),
                 1 => script.replies[0]["source_transfers"] = json!([]),
                 2 => script.replies[1]["token_id"] = json!(999),
-                _ => script.replies[0]["application"] = json!({"minimum_compatible":2,"current":2}),
+                3 => script.replies[0]["application"] = json!({"minimum_compatible":2,"current":2}),
+                _ => script.replies[0]["execution_leases"] = json!([]),
             }
             let mut peer = source_admission(script, &request).with_source(&upload).unwrap();
             let hello = peer.receive().unwrap();
@@ -1302,6 +1400,9 @@ mod tests {
             assert!(peer.authentication().is_none());
             assert!(peer.send(&request).is_err());
             assert!(peer.inner.sent.iter().all(|frame| frame["kind"] == "session-challenge"));
+            if case == 4 {
+                assert!(peer.inner.sent.is_empty());
+            }
             assert!(peer.negotiate(&hello, &grant()).is_err());
         }
     }
@@ -1600,7 +1701,11 @@ mod tests {
     fn authenticated_status_queries_are_metadata_only_and_bound_to_selected_recovery() {
         let status = json!({"kind":"request-status", "request_id":7});
         for mode in [DeliveryMode::Execute, DeliveryMode::Resume] {
-            let mut peer = peer_with_mode(recovery_hello(), response(), mode);
+            let mut offered = recovery_hello();
+            if mode == DeliveryMode::Execute {
+                offered["execution_leases"] = json!(["request-renewal-v1"]);
+            }
+            let mut peer = peer_with_mode(offered, response(), mode);
             assert!(peer.send(&status).is_err());
             let hello = peer.receive().unwrap();
             let mut grant = grant(); grant["result_retention"] = json!("durable-result-v1");

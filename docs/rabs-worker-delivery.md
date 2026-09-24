@@ -602,6 +602,45 @@ connection; partial writes are never retried. The native ATP payload limit is
 1 MiB minus 64 bytes; larger requests are rejected before listening. Filesystem
 operations, including sync, are not guaranteed interruptible by these budgets.
 
+### Execution leases stop abandoned compilations
+
+Authenticated execution requires the worker to advertise `request-renewal-v1`.
+The coordinator selects a 30-second execution lease during session admission and
+renews it every 10 seconds while waiting for the execution result. An older
+worker that does not advertise this protocol is refused before source upload or
+dispatch. Upgrade the coordinator and worker together. Result resume and release
+acknowledgment reconciliation remain available without an execution lease.
+
+The grant binds the authenticated session, a fresh lease ID, worker boot and
+incarnation, request ID, and SHA-256 of the complete original JSON request. It
+travels in `session-ok`; the saved request and durable journal fingerprint remain
+unchanged. Source upload does not consume execution time: the worker arms its
+local monotonic timer only after the exact request is admitted and before its
+execution owner starts. The request's independent hard timeout still applies.
+
+The worker checks expiry in its execution owner, including the managed process
+drain loop. An open but silent connection, or a blocked renewal-acknowledgment
+write, cannot keep a compiler alive. On observed expiry, the worker stops and
+drains its process group, records exit 125 with `stop_reason:lease-expired`, and
+retains complete captured diagnostics through the ordinary verified delivery and
+recovery path. An expired execution cannot supply successful build artifacts.
+Filesystem operations blocked inside the operating system remain subject to the
+existing cleanup limitations; the lease is not a guarantee of interruptible I/O.
+
+Renewals must name the exact session, lease and active request, with a strictly
+newer sequence. The coordinator permits only one unacknowledged renewal and
+measures its own deadline from sending it, so delayed acknowledgments cannot
+grant extra time. Expiry, cancellation and completion permanently stop renewals.
+One exact outstanding acknowledgment may be drained after the terminal result;
+it cannot revive execution. A partial renewal write poisons the connection and
+is never retried. Local expiry reduces the remaining result-drain budget to at
+most 60 seconds without claiming that remote cleanup has already completed.
+
+This lease controls execution liveness on the existing prepared-request path.
+It does not establish the full action-generation authority or semantic input
+identity required for action-cache publication. The explicit plaintext loopback
+fixture remains an unleased test path.
+
 ### Interrupt an authenticated build without losing its outcome
 
 During an online `--worker-exec-tls` or `--worker-build-tls` operation, Ctrl+C

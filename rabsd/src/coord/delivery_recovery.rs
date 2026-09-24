@@ -520,7 +520,7 @@ pub fn recover_existing_delivery(
             stop.is_null()
                 || (matches!(
                     stop.as_str(),
-                    Some("cancelled" | "deadline-exceeded" | "session-lost")
+                    Some("cancelled" | "deadline-exceeded" | "session-lost" | "lease-expired")
                 ) && exit != Some(0)),
             "invalid retained interruption or interrupted success",
         )?;

@@ -1,6 +1,6 @@
 //! Operator interruption on an already authenticated, request-scoped connection.
 //!
-//! The only generated control message is cancel for the exact canonical-exec
+//! Generated control messages renew or cancel the exact canonical-exec
 //! that this connection actually sent. Recovery never acquires cancellation or
 //! execution authority. A cancel acknowledgment is NOT completion: diagnostics,
 //! artifacts, journal retention and release ACKs still use the ordinary receiver.
@@ -8,6 +8,7 @@
 //! so dropping an interrupted read future neither loses bytes nor resets timers.
 
 use super::{Phase, RecordPeer, TRANSFER_BUDGET, WorkerPeer, read_record, require};
+use super::lease::{ExecutionLease, Tick};
 use asupersync::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use asupersync::signal::{Signal, sigint, sigterm};
 use serde_json::{Value, json};
@@ -85,21 +86,36 @@ impl Interrupts for ProcessSignals {
 enum Event {
     Record(Value),
     Interrupt,
+    Lease,
 }
 
 async fn next_event<S: AsyncRead + Unpin, I: Interrupts>(
     stream: &mut S,
     buffered: &mut Vec<u8>,
     interrupts: &mut I,
+    lease_wake: Option<Instant>,
 ) -> io::Result<Event> {
     let mut record = pin!(read_record(stream, buffered));
     let mut signal = pin!(interrupts.wait());
+    let mut lease = pin!(async {
+        if let Some(at) = lease_wake {
+            asupersync::time::sleep(asupersync::time::wall_now(),
+                at.saturating_duration_since(Instant::now())).await;
+        } else {
+            std::future::pending::<()>().await;
+        }
+    });
     poll_fn(|cx| {
         // A continuously readable peer cannot starve an operator's stop. Both
         // futures keep their owners outside the select; the signal stream's
         // receive is cancel-safe and decoded partial records remain buffered.
         if let Poll::Ready(result) = signal.as_mut().poll(cx) {
             return Poll::Ready(result.map(|()| Event::Interrupt));
+        }
+        // Ready heartbeats cannot starve renewal or local lease expiry. The
+        // read future retains all partial bytes in the connection's buffer.
+        if lease.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(Ok(Event::Lease));
         }
         record.as_mut().poll(cx).map(|result| result.map(Event::Record))
     }).await
@@ -114,6 +130,7 @@ pub(super) struct OperatorPeer<'a, S, I = ProcessSignals> {
     execution: Option<u64>,
     cancel_sent: bool,
     cancel_response_seen: bool,
+    lease: Option<ExecutionLease>,
 }
 
 impl<'a, S> OperatorPeer<'a, S> {
@@ -124,7 +141,7 @@ impl<'a, S> OperatorPeer<'a, S> {
 
 impl<'a, S, I: Interrupts> OperatorPeer<'a, S, I> {
     pub(super) fn with_interrupts(inner: RecordPeer<'a, S>, interrupts: I) -> Self {
-        Self { inner, interrupts, execution:None, cancel_sent:false, cancel_response_seen:false }
+        Self { inner, interrupts, execution:None, cancel_sent:false, cancel_response_seen:false, lease:None }
     }
 
     fn pending_interrupt(&mut self) -> io::Result<bool> {
@@ -166,9 +183,14 @@ impl<'a, S, I: Interrupts> OperatorPeer<'a, S, I> {
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin, I: Interrupts> OperatorPeer<'_, S, I> {
-    fn send_interruptibly(&mut self, frame: &Value) -> io::Result<()> {
+    fn send_interruptibly(&mut self, frame: &Value, lease_deadline: Option<Instant>) -> io::Result<()> {
         let bytes = self.inner.outbound(frame)?;
-        let budget = self.inner.remaining()?;
+        let mut budget = self.inner.remaining()?;
+        if let Some(deadline) = lease_deadline {
+            let remaining = deadline.checked_duration_since(Instant::now())
+                .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "execution lease write deadline"))?;
+            budget = budget.min(remaining);
+        }
         let stream = &mut self.inner.stream;
         let interrupts = &mut self.interrupts;
         self.inner.runtime.block_on(async {
@@ -206,6 +228,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin, I: Interrupts> OperatorPeer<'_, S, I> {
             return Err(self.abandon());
         };
         if self.cancel_sent { return Err(self.abandon()); }
+        if let Some(lease) = &mut self.lease { lease.stop(); }
         self.cancel_sent = true; // burn before any possibly partial control write
         self.inner.until = self.inner.until.min(Instant::now() + CANCEL_DRAIN_BUDGET);
         // Phase::Execution can only follow the authenticated adapter's exact
@@ -213,12 +236,32 @@ impl<S: AsyncRead + AsyncWrite + Unpin, I: Interrupts> OperatorPeer<'_, S, I> {
         self.inner.send(&json!({"kind":"cancel", "request_id":id}))
     }
 
+    fn lease_tick(&mut self) -> io::Result<()> {
+        let Some(lease) = &mut self.lease else { return Ok(()); };
+        match lease.tick(Instant::now())? {
+            Tick::Idle => Ok(()),
+            Tick::Expired => {
+                // The worker owns process cleanup. Continue draining its typed
+                // terminal result, but never grant more execution time.
+                self.inner.until = self.inner.until.min(Instant::now() + CANCEL_DRAIN_BUDGET);
+                Ok(())
+            }
+            Tick::Renew(frame) => {
+                let deadline = lease.expires_at();
+                // Any failed/partial renewal write poisons the connection. A
+                // stop cannot append a cancel inside an incomplete JSON frame.
+                self.send_interruptibly(&frame, deadline)
+            }
+        }
+    }
+
     fn receive_inner(&mut self) -> io::Result<Value> {
         loop {
             let budget = self.inner.remaining()?;
+            let lease_wake = self.lease.as_ref().and_then(ExecutionLease::wake_at);
             let event = self.inner.runtime.block_on(async {
                 asupersync::time::timeout(asupersync::time::wall_now(), budget,
-                    next_event(&mut self.inner.stream, &mut self.inner.buffered, &mut self.interrupts),
+                    next_event(&mut self.inner.stream, &mut self.inner.buffered, &mut self.interrupts, lease_wake),
                 ).await.map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "worker read deadline"))?
             })?;
             // Decoding an immediately available frame is not permission to
@@ -226,11 +269,23 @@ impl<S: AsyncRead + AsyncWrite + Unpin, I: Interrupts> OperatorPeer<'_, S, I> {
             self.inner.remaining()?;
             match event {
                 Event::Interrupt => self.interrupt()?,
+                Event::Lease => self.lease_tick()?,
                 Event::Record(value) => {
                     if self.consume_cancel_reply(&value)? { continue; }
+                    if value["kind"] == "execution-lease-renewed" {
+                        let lease = self.lease.as_mut().ok_or_else(|| {
+                            super::invalid("execution lease acknowledgment without a negotiated lease")
+                        })?;
+                        lease.consume(&value, Instant::now())?;
+                        if lease.stopped() && self.inner.phase == Phase::Execution {
+                            self.inner.until = self.inner.until.min(Instant::now() + CANCEL_DRAIN_BUDGET);
+                        }
+                        continue;
+                    }
                     if self.inner.phase == Phase::Execution && value["kind"] == "exec-result" {
                         require(value["request_id"].as_u64() == self.execution,
                             "execution result does not match the interrupted operation")?;
+                        if let Some(lease) = &mut self.lease { lease.stop(); }
                         self.inner.phase = Phase::Transfer;
                         self.inner.until = Instant::now() + TRANSFER_BUDGET;
                     }
@@ -245,20 +300,33 @@ impl<S: AsyncRead + AsyncWrite + Unpin, I: Interrupts> WorkerPeer for OperatorPe
     fn send(&mut self, frame: &Value) -> io::Result<()> {
         let result = (|| {
             self.inner.remaining()?;
-            require(frame["kind"] != "cancel", "cancellation is local operator intent only")?;
+            require(frame["kind"] != "cancel" && frame["kind"] != "execution-lease-renew",
+                "execution controls are owned by this authenticated connection")?;
             if self.pending_interrupt()? { self.interrupt()?; }
+            if frame["kind"] == "session-ok" {
+                if let Some(grant) = frame.get("execution_lease") {
+                    require(self.lease.is_none() && self.execution.is_none(),
+                        "execution lease cannot be renegotiated")?;
+                    self.lease = Some(ExecutionLease::parse(grant)?);
+                }
+            }
+            if frame["kind"] == "canonical-exec" {
+                if let Some(lease) = &self.lease { lease.validate_request(frame)?; }
+            }
+            let sent_at = Instant::now();
             // Before a complete dispatch, cancellation may abandon a partially
             // written frame. Poison this connection; never insert a cancel
             // record inside it or retry an uncertain canonical-exec. After a
             // completed dispatch, the read path owns cancellation and drain.
             if self.execution.is_none() && self.interrupts.finish_verified_delivery() {
-                self.send_interruptibly(frame)?;
+                self.send_interruptibly(frame, None)?;
             } else {
                 self.inner.send(frame)?;
             }
             if frame["kind"] == "canonical-exec" {
                 self.execution = Some(frame["request_id"].as_u64()
                     .ok_or_else(|| super::invalid("missing execution identity"))?);
+                if let Some(lease) = &mut self.lease { lease.arm(sent_at); }
             }
             Ok(())
         })();
@@ -281,6 +349,10 @@ mod tests {
     use std::collections::VecDeque;
     use std::pin::Pin;
     use std::sync::{Arc, Mutex};
+
+    mod lease_tests {
+        include!("interrupt/lease_tests.rs");
+    }
 
     #[derive(Default)]
     struct Notification { pending:usize, waker:Option<Waker> }

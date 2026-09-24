@@ -421,6 +421,9 @@ fn execute_canonical_inner(
         )));
         return exec_error(request.request_id);
     }
+    // Verification may have spent the remaining lease or execution budget.
+    // Do not start a compiler after that final input-preparation boundary.
+    if control.reason().is_some() { return exec_error(request.request_id); }
     let Ok(group) = ManagedProcessGroup::spawn_command(command, attribution) else {
         return exec_error(request.request_id);
     };

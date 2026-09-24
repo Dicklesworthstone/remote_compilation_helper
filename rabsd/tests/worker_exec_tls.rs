@@ -303,10 +303,12 @@ fn hello(pin: &str) -> Value {
         "transport":{"minimum_compatible":1,"current":1},
         "application":{"minimum_compatible":1,"current":1},
         "recovery_protocols":["request-journal-v1"],
+        "execution_leases":["request-renewal-v1"],
         "output_transfers":["ranges-v1"], "artifact_transfers":["files-v1"]})
 }
 fn recovery_hello(pin: &str) -> Value {
     let mut hello = hello(pin);
+    hello.as_object_mut().unwrap().remove("execution_leases");
     hello["boot_generation"] = json!(2);
     hello["incarnation"] = json!("00000000000000000000000000000002");
     hello["request_high_water"] = json!(7);
@@ -356,8 +358,14 @@ async fn authenticate_offer(
     let (session, grant) = authenticate_grant(stream, pin, hello).await;
     let expected = if resume {
         assert_eq!(grant["result_retention"], "durable-result-v1");
+        assert!(grant.get("execution_lease").is_none());
         json!({"kind":"result-resume", "request_id":7, "request":request()})
     } else {
+        assert_eq!(grant["execution_lease"]["request_id"], request()["request_id"]);
+        assert_eq!(
+            grant["execution_lease"]["request_sha256"],
+            hash(&serde_json::to_vec(&request()).unwrap())
+        );
         request()
     };
     assert_eq!(
@@ -393,6 +401,19 @@ async fn authenticate_grant(
     assert_eq!(grant["artifact_transfer"], "files-v1");
     assert_eq!(grant["output_transfer"], "ranges-v1");
     assert_eq!(grant["publication"], "disabled");
+    if hello.get("execution_leases").is_some() {
+        let lease = &grant["execution_lease"];
+        assert_eq!(lease.as_object().unwrap().len(), 8);
+        assert_eq!(lease["version"], "request-renewal-v1");
+        assert_eq!(lease["session_id"], session);
+        assert_eq!(lease["lease_id"], challenge["token_id"]);
+        assert!(lease["lease_id"].as_u64().unwrap() > 0);
+        assert_eq!(lease["boot_generation"], hello["boot_generation"]);
+        assert_eq!(lease["incarnation"], hello["incarnation"]);
+        assert_eq!(lease["ttl_ms"], 30000);
+    } else {
+        assert!(grant.get("execution_lease").is_none());
+    }
     (session, grant)
 }
 
@@ -688,6 +709,41 @@ fn tls_listener_never_accepts_a_plaintext_worker_hello() {
             .logs()
             .contains("\"transport_authenticated\":false")
     );
+}
+
+#[test]
+fn authenticated_worker_without_execution_lease_is_refused_before_challenge() {
+    let certificates = Certificates::new();
+    let root = tempfile::tempdir().unwrap();
+    let destination = root.path().join("delivery");
+    let pin = certificates.pin();
+    let mut receiver = Receiver::spawn(root.path(), &pin, Some(&certificates.server), &destination);
+    let address = receiver.listening();
+    let runtime = RuntimeBuilder::current_thread().build().unwrap();
+    runtime.block_on(async {
+        asupersync::time::timeout(
+            asupersync::time::wall_now(),
+            Duration::from_secs(15),
+            async {
+                let mut peer = connect_peer(&address, "localhost", &certificates.worker)
+                    .await
+                    .unwrap();
+                let mut offered = hello(&pin);
+                offered.as_object_mut().unwrap().remove("execution_leases");
+                send(&mut peer.stream, &offered).await.unwrap();
+                assert!(
+                    receive(&mut peer.stream).await.is_err(),
+                    "unsupported worker received a challenge, grant, or dispatch"
+                );
+            },
+        )
+        .await
+        .expect("execution lease capability refusal timed out");
+    });
+    assert!(!receiver.wait().success());
+    assert_eq!(receiver.failure()["execution_may_have_run"], false);
+    assert!(receiver.logs().contains("execution leases"));
+    assert!(!destination.join("delivery.json").exists());
 }
 
 #[test]
@@ -1516,6 +1572,11 @@ fn actual_prepared_build_uploads_installs_and_replays_offline_after_ack_loss() {
                 offered["source_transfers"] = json!([SOURCE_TRANSFER]);
                 let (session, grant) = authenticate_grant(&mut peer.stream, &pin, &offered).await;
                 assert_eq!(grant["source_transfer"], SOURCE_TRANSFER);
+                assert_eq!(grant["execution_lease"]["request_id"], request["request_id"]);
+                assert_eq!(
+                    grant["execution_lease"]["request_sha256"],
+                    hash(&serde_json::to_vec(&request).unwrap())
+                );
                 receive_prepared_source(&mut peer.stream, &request, &received_source).await;
                 assert_eq!(
                     fs::read(received_source.join("src/lib.rs")).unwrap(),

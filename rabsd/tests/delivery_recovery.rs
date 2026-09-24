@@ -132,7 +132,7 @@ fn restart_replays_exact_committed_bytes_without_an_ack_or_execution() {
 
 #[test]
 fn failed_and_interrupted_exit_semantics_survive_recovery() {
-    for (exit, stop) in [(101, None), (130, Some("cancelled")), (143, Some("session-lost")), (124, Some("deadline-exceeded"))] {
+    for (exit, stop) in [(101, None), (130, Some("cancelled")), (143, Some("session-lost")), (124, Some("deadline-exceeded")), (125, Some("lease-expired"))] {
         let parent = tempfile::tempdir().unwrap();
         let original = delivered(parent.path(), exit, stop, false);
         let restored = recover(&original, DeliveryTrust::Loopback).unwrap().unwrap();

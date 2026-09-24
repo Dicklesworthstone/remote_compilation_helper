@@ -217,6 +217,7 @@ async fn authenticate(stream: &mut SecureWorkerStream, pin: &str, boot: u64, req
     assert_eq!(grant["publication"], "disabled");
     assert_eq!(grant["result_retention"], "durable-result-v1");
     assert!(grant.get("source_transfer").is_none());
+    assert!(grant.get("execution_lease").is_none());
     assert_eq!(receive(stream).await.unwrap(), json!({"kind":"result-resume", "request_id":7, "request":request}));
     grant["session_id"].as_u64().unwrap()
 }

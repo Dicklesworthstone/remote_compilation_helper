@@ -138,7 +138,7 @@ impl PreparedCompletion {
         require(self.stdout.bytes.checked_add(self.stderr.bytes)
             .is_some_and(|bytes| bytes <= MAX_DELIVERY_BYTES), "diagnostics exceed delivery budget")?;
         require(self.stop_reason.as_deref().is_none_or(|reason|
-            matches!(reason, "cancelled" | "deadline-exceeded" | "session-lost")), "unknown completion stop reason")?;
+            matches!(reason, "cancelled" | "deadline-exceeded" | "session-lost" | "lease-expired")), "unknown completion stop reason")?;
         require(self.stop_reason.is_none() || self.exit_code != 0, "interrupted success contradiction")?;
         require(self.exit_code != 0 || self.outputs_installed,
             "successful compiler outcome has no verified output installation")?;
@@ -407,7 +407,7 @@ mod tests {
 
     #[test]
     fn complete_success_failure_and_cancellation_replay_exact_binary_streams() {
-        for (exit, stop) in [(0,None),(1,None),(130,Some("cancelled"))] {
+        for (exit, stop) in [(0,None),(1,None),(130,Some("cancelled")),(125,Some("lease-expired"))] {
             let fixture = Fixture::new(); fixture.complete(exit, stop);
             let proof = fixture.proof();
             assert_eq!(proof.exit_code, exit);
@@ -549,7 +549,7 @@ mod tests {
 
     #[test]
     fn local_recovery_preserves_failed_or_cancelled_compiler_diagnostics_without_installation() {
-        for (exit, stop) in [(17, None), (130, Some("cancelled"))] {
+        for (exit, stop) in [(17, None), (130, Some("cancelled")), (125, Some("lease-expired"))] {
             let fixture = Fixture::new(); fixture.strand(exit, stop);
             let status = fixture.store.recover_local(ID, fixture.spec.delivery.clone()).unwrap();
             assert_eq!(status.exit_code, Some(i32::from(exit)));

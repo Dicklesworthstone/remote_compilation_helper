@@ -874,7 +874,7 @@ pub fn receive_operation(
             stop.is_null()
                 || matches!(
                     stop.as_str(),
-                    Some("cancelled" | "deadline-exceeded" | "session-lost")
+                    Some("cancelled" | "deadline-exceeded" | "session-lost" | "lease-expired")
                 ),
             "unknown interruption",
         )?;
