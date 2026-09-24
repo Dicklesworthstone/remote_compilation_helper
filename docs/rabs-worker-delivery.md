@@ -678,15 +678,46 @@ TLS mode has separate absolute network budgets: 60 seconds for accepting the
 connection, the native transport's five-second TLS handshake limit, 10 seconds
 for application admission, five minutes for source upload, and an additional
 30 minutes when uploading a selected toolchain. Toolchain chunks are pipelined
-in bounded batches of four. On the worker, the source owner retains a fixed
-35-minute input deadline for these combined uploads; receiving chunks does not
-extend it. Execution still has at most 30 minutes plus 60 seconds for cleanup,
+in bounded batches of four. The worker independently enforces the input budgets
+described below. Execution still has at most 30 minutes plus 60 seconds for cleanup,
 followed by five minutes for verified result transfer and 10 seconds for both
 ACK replies.
 Bytes, telemetry and repeated ranges do not reset a phase. Timeout poisons the
 connection; partial writes are never retried. The native ATP payload limit is
 1 MiB minus 64 bytes; larger requests are rejected before listening. Filesystem
 operations, including sync, are not guaranteed interruptible by these budgets.
+
+### Worker input deadlines release abandoned uploads
+
+The worker starts its own monotonic input clock when it accepts the first source
+upload for a request. Source upload has five minutes. A matching toolchain upload
+may begin only after source sealing; it then has at most 30 minutes, with a fixed
+35-minute limit measured from the original source start. Repeated begin frames,
+chunks, heartbeats and refused requests do not renew either limit. Fully sealed
+inputs remain subject to the deadline until their matching execution takes
+ownership.
+
+The session driver races input reads, filesystem-task completions and reply
+writes against the same deadline. A connected client that sends nothing, sends
+only heartbeats, or stops reading an upload acknowledgment therefore cannot keep
+the staging reservation indefinitely. Expiry closes the session with
+`input-upload-deadline-exceeded`, revokes both source and toolchain readiness,
+and drains accepted filesystem work before dropping the staged trees. If a write
+has already emitted part of a frame, the worker abandons the connection without
+appending another frame or retrying the partial write.
+
+While staged inputs belong to a request, an unrelated execution or result-resume
+request is refused before durable admission. Successful handoff of the matching
+inputs ends the upload clock; the execution's own hard timeout and renewable
+lease then govern its lifetime. Ordinary result recovery starts without staged
+inputs and does not acquire an upload deadline. As with execution cleanup, an
+operating-system filesystem call that stalls can delay the final joined cleanup.
+
+If expiry or an input-ownership failure is discovered after durable admission
+but before invoking the launcher, the worker records a resolved error receipt
+with `executed:false` and `execution_may_have_run:false`. The failed request ID
+remains reserved across restart, while later request IDs can proceed. A failure
+to persist that receipt keeps the journal closed to further admission.
 
 ### Execution leases stop abandoned compilations
 
@@ -1100,6 +1131,16 @@ cargo test -p rabs-sandbox --test toolchain_dataset_realfs
 cargo test -p rabs-wkr toolchain_upload_session_tests
 cargo test -p rabsd --test toolchain_binding
 cargo test -p rabsd --test worker_exec_tls toolchain
+```
+
+Input deadline regressions drive the production worker session on the native
+current-thread runtime with short injected budgets. They cover idle uploads,
+blocked acknowledgments, traffic that cannot renew a deadline, and execution
+handoff. The transport peer is a fixture; these tests do not establish native TLS
+or canonical compiler coverage:
+
+```sh
+cargo test -p rabs-wkr --bin rabs-wkr input_deadline
 ```
 
 The TLS sender tests use a scripted peer and the actual filesystem receiver;

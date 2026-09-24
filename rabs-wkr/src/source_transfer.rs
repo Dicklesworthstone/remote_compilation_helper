@@ -125,6 +125,7 @@ pub struct SourceOwner {
     _directory: tempfile::TempDir,
     request_id: u64,
     deadline: Instant,
+    execution_owned: bool,
     allow_cached_files: bool,
     missing_files: Vec<String>,
     reused_bytes: u64,
@@ -149,7 +150,10 @@ impl SourceOwner {
     ) -> io::Result<()> {
         use std::path::Path;
         let refuse = |message: &str| io::Error::new(io::ErrorKind::InvalidData, message);
-        self.within_budget().map_err(io::Error::other)?;
+        // A validated handoff ends the upload phase. Toolchain acquisition
+        // before this mount check belongs to the execution timeout and lease;
+        // it must not consume a second, already-retired upload budget.
+        if !self.execution_owned { self.within_budget().map_err(io::Error::other)?; }
         if self.source_failed || request_id != self.request_id {
             return Err(refuse("source owner does not match execution admission"));
         }
@@ -187,7 +191,7 @@ impl SourceOwner {
                 .ok_or_else(|| refuse("Cargo home preparation is incomplete"))?
                 .apply_to(&mut prepared)?;
         }
-        self.within_budget().map_err(io::Error::other)?;
+        if !self.execution_owned { self.within_budget().map_err(io::Error::other)?; }
         *spec = prepared;
         Ok(())
     }
@@ -294,7 +298,7 @@ impl SourceTransferState {
             if Instant::now() >= deadline { return Err(invalid("source upload deadline exceeded")); }
             let owner = SourceOwner {
                 receiver, _directory: directory, request_id: id,
-                deadline, allow_cached_files, missing_files, reused_bytes, cache,
+                deadline, execution_owned: false, allow_cached_files, missing_files, reused_bytes, cache,
                 cache_write_error: None, source_failed: false,
                 cargo_home, prepared_cargo_home: None,
             };
@@ -386,7 +390,12 @@ impl SourceTransferState {
     pub fn take_prepared(&mut self, request: &Value) -> io::Result<Option<SourceOwner>> {
         if request_manifest(request).map_err(io::Error::other)?.is_none() { return Ok(None); }
         self.prepared_path(request, true).map_err(io::Error::other)?;
-        Ok(self.pending.take())
+        Ok(self.pending.take().map(|mut owner| {
+            // Only the same fully verified, unexpired owner can make this
+            // transition. There is no public setter or alternate host path.
+            owner.execution_owned = true;
+            owner
+        }))
     }
 }
 
@@ -705,10 +714,54 @@ mod tests {
         owner.source_failed = true;
         assert!(owner.protect_workspace(7, &mut spec).is_err());
         assert_eq!(spec, before);
-        owner.source_failed = false;
-        owner.deadline = Instant::now() - Duration::from_secs(1);
+
+        // Expiration still blocks a sealed owner which has not transferred
+        // into execution, and refusal cannot silently change its ownership.
+        let (mut expired, request, _, seal) = uploaded();
+        expired.handle(&seal, true, false).unwrap();
+        expired.pending.as_mut().unwrap().deadline = Instant::now() - Duration::from_secs(1);
+        let mut spec = namespace_for_source(expired.pending.as_ref().unwrap(), runtime.path());
+        let before = spec.clone();
+        assert!(expired.prepared_path(&request, true).is_err());
+        assert!(expired.take_prepared(&request).is_err());
+        let owner = expired.pending.as_ref().unwrap();
+        assert!(!owner.execution_owned);
         assert!(owner.protect_workspace(7, &mut spec).is_err());
         assert_eq!(spec, before);
+    }
+
+    #[test]
+    fn handed_off_source_mount_outlives_upload_deadline_and_keeps_isolation() {
+        use rabs_sandbox::layout;
+        let (mut state, request, _, seal) = uploaded();
+        state.handle(&seal, true, false).unwrap();
+        assert!(!state.pending.as_ref().unwrap().execution_owned);
+        let mut foreign = request.clone();
+        foreign["request_id"] = json!(8);
+        assert!(state.take_prepared(&foreign).is_err());
+        assert!(!state.pending.as_ref().unwrap().execution_owned);
+
+        let mut owner = state.take_prepared(&request).unwrap().unwrap();
+        assert!(owner.execution_owned);
+        assert!(state.pending.is_none());
+        // Model time spent acquiring the compiler after successful admission
+        // by expiring only this owner's already-retired upload timestamp.
+        owner.deadline = Instant::now() - Duration::from_secs(1);
+        let runtime = tempfile::tempdir().unwrap();
+        let mut spec = namespace_for_source(&owner, runtime.path());
+        let before = spec.clone();
+        owner.protect_workspace(7, &mut spec).unwrap();
+        assert_eq!(spec.rw_binds, before.rw_binds[1..]);
+        assert_eq!(spec.ro_binds.last(), before.rw_binds.first());
+        assert!(spec.rw_binds.iter().all(|bind|
+            bind.visible != std::path::Path::new(layout::WORKSPACE)));
+        assert_eq!(spec.env, before.env);
+        assert_eq!(spec.cwd, before.cwd);
+        assert_eq!(std::fs::read(owner.receiver.sealed_root().unwrap().join("src/lib.rs")).unwrap(),
+            b"source\0\xff");
+        let mut foreign_spec = before.clone();
+        assert!(owner.protect_workspace(8, &mut foreign_spec).is_err());
+        assert_eq!(foreign_spec, before);
     }
 
     #[test]
