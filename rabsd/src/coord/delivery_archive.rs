@@ -432,7 +432,9 @@ fn sync_dirs(root: &Path) -> io::Result<()> {
 /// Restore the exact archived delivery to a new or already-complete directory. This is not a cache
 /// lookup: the original request and historical trust policy are mandatory. No
 /// source delivery, worker connection, or compiler is needed. Failed staging is
-/// retained, never reused; an existing destination is never overwritten. A
+/// retained in a private sibling, never reused; an existing destination is never
+/// overwritten. The final directory appears only in one exclusive publication,
+/// so a pre-publication failure cannot strand it or block a later retry. A
 /// complete matching restore is verified and returned idempotently.
 pub fn restore_delivery(
     cas: &LiveCas,
@@ -442,6 +444,7 @@ pub fn restore_delivery(
     destination: &Path,
     trust: DeliveryTrust,
 ) -> Result<Delivery, String> {
+    let mut retained_staging = None;
     let result = (|| -> io::Result<Delivery> {
         validate_request(request)?;
         require(
@@ -450,6 +453,7 @@ pub fn restore_delivery(
         )?;
         require(
             destination.is_absolute()
+                && destination.file_name().is_some()
                 && destination
                     .components()
                     .all(|part| matches!(part, Component::RootDir | Component::Normal(_))),
@@ -541,11 +545,19 @@ pub fn restore_delivery(
             );
             return Ok(existing);
         }
-        // Only private staging is populated until the ordinary recovery verifier
-        // checks receipt/request/provenance, the exact tree, modes and raw hashes.
-        mkdir(destination)?;
-        let staging = destination.join(".restore-staging");
-        mkdir(&staging)?;
+        // Never create the final destination before the complete delivery is
+        // verified and durable. A failed copy or process death leaves only a
+        // private sibling; the same destination remains available for retry.
+        // A unique sibling also prevents one restore from adopting or removing
+        // another restore's partial files. keep() retains failure evidence.
+        let parent = destination
+            .parent()
+            .ok_or_else(|| invalid("restore destination has no parent"))?;
+        let staging = tempfile::Builder::new()
+            .prefix(".rabs-delivery-restore-")
+            .tempdir_in(parent)?
+            .keep();
+        retained_staging = Some(staging.clone());
         mkdir(&staging.join("diagnostics"))?;
         mkdir(&staging.join("artifacts"))?;
         create_artifact_directories(
@@ -586,24 +598,15 @@ pub fn restore_delivery(
         let verified = recover_existing_delivery(request, worker, &staging, trust)
             .map_err(|e| io::Error::other(e.to_string()))?
             .ok_or_else(|| invalid("restored staging disappeared"))?;
-        fs::rename(staging.join("diagnostics"), destination.join("diagnostics"))?;
-        fs::rename(staging.join("artifacts"), destination.join("artifacts"))?;
-        fs::rename(
-            staging.join("delivery.json"),
-            destination.join("delivery.pending"),
-        )?;
-        // Remove only our now-empty staging directory, never source deliveries,
-        // existing destinations, or a failed partial restore.
-        fs::remove_dir(&staging)?;
-        sync_dirs(destination)?;
-        for parent in destination.ancestors().skip(1) {
-            File::open(parent)?.sync_all()?;
+        // Preserve the ancestor durability barrier, then use the SAME atomic,
+        // no-replace directory publication as output installation. In particular,
+        // an empty directory created by a racing caller must not be overwritten.
+        // If the post-rename sync fails, an idempotent retry verifies the complete
+        // destination rather than dispatching work or racing a second writer.
+        for ancestor in parent.ancestors() {
+            File::open(ancestor)?.sync_all()?;
         }
-        fs::rename(
-            destination.join("delivery.pending"),
-            destination.join("delivery.json"),
-        )?;
-        File::open(destination)?.sync_all()?;
+        rabs_cas::materialization::publish_new_directory(&staging, destination)?;
         Ok(Delivery {
             directory: destination.to_path_buf(),
             receipt: verified.receipt,
@@ -614,6 +617,9 @@ pub fn restore_delivery(
         })
     })();
     result.map_err(|error| {
-        format!("archive restore refused; no execution or retry was attempted: {error}")
+        let staging = retained_staging
+            .map(|path| format!("; retained staging={}", path.display()))
+            .unwrap_or_default();
+        format!("archive restore refused; no execution or retry was attempted: {error}{staging}")
     })
 }
