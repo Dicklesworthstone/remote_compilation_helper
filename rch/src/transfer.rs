@@ -453,9 +453,13 @@ async fn run_windows_artifact_process<W: tokio::io::AsyncWrite + Unpin>(
     let mut reported_bytes = 0_u64;
     let result = {
         let operation = async {
-            let send = async {
-                stdin.write_all(script.as_bytes()).await?;
-                stdin.shutdown().await
+            let send = async move {
+                let written = stdin.write_all(script.as_bytes()).await;
+                // ChildStdin::shutdown does not close a Unix pipe. The shell needs
+                // EOF to finish reading `sh -s`; retain no writer while the
+                // receive future awaits its stdout/stderr and exit status.
+                drop(stdin);
+                written
             };
             let receive = async {
                 let mut out_buffer = [0_u8; 32 * 1024];
@@ -12424,12 +12428,61 @@ fn main() {
         // for each persisted phase (notably an external CARGO_TARGET_DIR).
         let target = tempfile::tempdir().unwrap();
         std::fs::write(target.path().join("private.txt"), b"caller-owned").unwrap();
+        std::fs::write(target.path().join(".rchignore"), b"private-build/\n").unwrap();
+        std::fs::create_dir(target.path().join("x86_64-pc-windows-msvc")).unwrap();
         let recovered = pipeline.with_retrieval_reference_root(target.path().to_path_buf());
+        assert!(
+            recovered
+                .validate_staged_artifact_paths(
+                    &[PathBuf::from("private.txt")],
+                    &["*".to_string()],
+                )
+                .is_err(),
+            "the recovered target reference must protect its own existing files"
+        );
         let patterns = vec!["*/release/**".to_string()];
-        let excludes =
-            recovered.local_source_roots_to_exclude(&allowed_artifact_roots(&patterns), &patterns);
-        assert!(excludes.contains(&"/private.txt".to_string()));
-        assert!(!excludes.contains(&"/Cargo.toml".to_string()));
+        let (includes, excludes) = recovered.artifact_retrieval_filters(&patterns).unwrap();
+        // A wildcard first component keeps target directories traversable;
+        // root-level files are refused by the complete include pattern, not
+        // necessarily by an explicit source-root exclusion string.
+        let selected = windows_artifact_selection(
+            b"4 ./private.txt\0\
+            4 ./Cargo.toml\0\
+            4 ./x86_64-pc-windows-msvc/release/app.exe\0\
+            4 ./private-build/release/secret.exe\0\
+            4 ./ignored/release/kept.exe\0",
+            &includes,
+            &excludes,
+        )
+        .unwrap();
+        assert_eq!(
+            selected.into_keys().collect::<Vec<_>>(),
+            [
+                "ignored/release/kept.exe",
+                "x86_64-pc-windows-msvc/release/app.exe"
+            ]
+        );
+        for path in [
+            "private.txt",
+            "Cargo.toml",
+            "private-build/release/secret.exe",
+        ] {
+            assert!(
+                recovered
+                    .validate_staged_artifact_paths(&[PathBuf::from(path)], &patterns)
+                    .is_err(),
+                "recovered publication must reject {path}"
+            );
+        }
+        recovered
+            .validate_staged_artifact_paths(
+                &[
+                    PathBuf::from("ignored/release/kept.exe"),
+                    PathBuf::from("x86_64-pc-windows-msvc/release/app.exe"),
+                ],
+                &patterns,
+            )
+            .unwrap();
         assert_eq!(recovered.project_root, stage.path());
     }
 

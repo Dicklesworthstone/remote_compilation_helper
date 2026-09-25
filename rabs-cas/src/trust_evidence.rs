@@ -1154,6 +1154,9 @@ mod tests {
             &mut candidate as &mut dyn RabsMetadataStore,
         ] {
             assert_eq!(store.differential_snapshot().unwrap(), snapshot);
+            // Fresh readers declare their known domains before restoring
+            // prior authority, just as coordinator startup does (R121).
+            store.intern_domain(active.domain);
             let evaluation = reevaluate_action(store, &active, &action, &policies, 120).unwrap();
             assert_eq!(evaluation.ledger_version, 5);
             assert_eq!(evaluation.disposition, DISPOSITION_PRESENTATION_QUARANTINED);
