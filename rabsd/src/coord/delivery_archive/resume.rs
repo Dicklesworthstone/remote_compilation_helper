@@ -7,6 +7,7 @@ use super::{
     Value, invalid, load_archive, publish_restore, require, sync_dirs, validate_request,
     verify_archive_directory,
 };
+use rabs_cas::metadata_store::RabsMetadataStore;
 use std::io;
 use std::path::{Component, Path};
 

@@ -1393,10 +1393,9 @@ impl OperationClaim {
             && !record.cancel_requested
             && !self.cancellation.is_cancelled()
             && record.unresolved()
+            && let Err(error) = self.schedule_recovery(&mut state, &mut record, recovery)
         {
-            if let Err(error) = self.schedule_recovery(&mut state, &mut record, recovery) {
-                scheduling_error = Some(error.to_string());
-            }
+            scheduling_error = Some(error.to_string());
         }
         if let Some(error) = scheduling_error {
             record.detail = Some(bounded_detail(&format!(

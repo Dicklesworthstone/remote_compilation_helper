@@ -367,8 +367,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin, I: Interrupts> WorkerPeer for OperatorPe
                     self.lease = Some(ExecutionLease::parse(grant)?);
                 }
             }
-            if frame["kind"] == "canonical-exec" {
-                if let Some(lease) = &self.lease { lease.validate_request(frame)?; }
+            if frame["kind"] == "canonical-exec"
+                && let Some(lease) = &self.lease
+            {
+                lease.validate_request(frame)?;
             }
             let sent_at = Instant::now();
             // Before a complete dispatch, cancellation may abandon a partially

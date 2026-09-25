@@ -57,8 +57,18 @@ pub struct SourceTransferTask {
 
 impl Default for SourceTransferTask {
     fn default() -> Self {
+        Self::with_source(SourceTransferState::default())
+    }
+}
+
+impl SourceTransferTask {
+    pub fn with_input_budget(input_budget: std::time::Duration) -> Self {
+        Self::with_source(SourceTransferState::with_input_budget(input_budget))
+    }
+
+    fn with_source(source: SourceTransferState) -> Self {
         Self {
-            source: Some(SourceTransferState::default()),
+            source: Some(source),
             shared: Arc::new(Mutex::new(CompletionState::default())),
             sender: None,
             thread: None,
@@ -67,12 +77,6 @@ impl Default for SourceTransferTask {
             cancelled: false,
             failed: false,
         }
-    }
-}
-
-impl SourceTransferTask {
-    pub fn with_input_budget(input_budget: std::time::Duration) -> Self {
-        Self { source:Some(SourceTransferState::with_input_budget(input_budget)), ..Self::default() }
     }
 
     fn start_worker(
