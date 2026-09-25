@@ -89,6 +89,174 @@ fn metadata(root: &Path) -> Value {
         "resolve":{"nodes":[{"id":"app","dependencies":["dep"]},{"id":"dep","dependencies":[]}]}})
 }
 
+fn alternate_registry_fixture(root: &Path, index: &str, source: &str) {
+    fixture(root);
+    write(
+        root,
+        "app/.cargo/config.toml",
+        format!(
+            "[registries.private]\nindex='{index}'\n[source.captured-index]\nregistry='{index}'\nreplace-with='vendored'\n[source.vendored]\ndirectory='../vendor'\n"
+        ),
+    );
+    write(
+        root,
+        "app/Cargo.toml",
+        "[package]\nname='app'\nversion='0.1.0'\nedition='2021'\n[workspace]\n[dependencies]\nfixture_dep={version='=1.0.0',registry='private'}\n",
+    );
+    let path = root.join("app/Cargo.lock");
+    let lock = fs::read_to_string(&path).unwrap();
+    fs::write(path, lock.replace(CRATES_IO, source)).unwrap();
+}
+
+#[test]
+fn alternate_registry_indexes_bind_names_lock_and_resolved_source_exactly() {
+    for (index, source) in [
+        (
+            "https://registry.invalid/index",
+            "registry+https://registry.invalid/index",
+        ),
+        (
+            "sparse+https://registry.invalid/index/",
+            "sparse+https://registry.invalid/index/",
+        ),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        alternate_registry_fixture(root.path(), index, source);
+        let retained = image(root.path());
+        let vendor = VendoredSources::verify(&retained, "app/Cargo.toml", "vendor").unwrap();
+        validate_capture(&retained, "app/Cargo.toml", Some(&vendor)).unwrap();
+        let locked = vendor
+            .bind_lock(&retained, Path::new("app/Cargo.lock"))
+            .unwrap();
+        assert_eq!(
+            locked,
+            BTreeSet::from([("fixture_dep".into(), "1.0.0".into(), source.into())])
+        );
+        let planning = Path::new("/private/planning");
+        let mut resolved = metadata(planning);
+        resolved["packages"][1]["source"] = json!(source);
+        validate_metadata(
+            &retained,
+            planning,
+            "app/Cargo.toml",
+            &resolved,
+            Some(&vendor),
+        )
+        .unwrap();
+        // A valid checksum/name/version under another registry is a different
+        // package identity, even when the replacement contains identical bytes.
+        resolved["packages"][1]["source"] = json!(CRATES_IO);
+        assert!(
+            validate_metadata(
+                &retained,
+                planning,
+                "app/Cargo.toml",
+                &resolved,
+                Some(&vendor)
+            )
+            .is_err()
+        );
+        for selector in [
+            format!("registry-index='{index}'"),
+            "registry='private'".to_owned(),
+        ] {
+            let manifest: toml::Value = toml::from_str(&format!(
+                "[dependencies]\nfixture_dep={{version='=1.0.0',{selector}}}\n"
+            ))
+            .unwrap();
+            super::super::validate_manifest_paths(
+                Path::new("app"),
+                &manifest,
+                Some(&vendor.sources),
+                false,
+            )
+            .unwrap();
+        }
+    }
+}
+
+#[test]
+fn alternate_registry_selectors_cannot_borrow_another_source_authorization() {
+    let root = tempfile::tempdir().unwrap();
+    alternate_registry_fixture(
+        root.path(),
+        "https://registry.invalid/index",
+        "registry+https://registry.invalid/index",
+    );
+    let vendor = verify(root.path()).unwrap();
+    for fields in [
+        "registry='unknown'",
+        "registry='crates-io'",
+        "registry=7",
+        "registry-index='https://other.invalid/index'",
+        "registry-index='sparse+https://registry.invalid/index/'",
+        "registry-index=7",
+        "registry='private',registry-index='https://registry.invalid/index'",
+        "registry='private',git='https://registry.invalid/index'",
+    ] {
+        let manifest: toml::Value =
+            toml::from_str(&format!("[dependencies]\nx={{version='1',{fields}}}\n")).unwrap();
+        assert!(
+            super::super::validate_manifest_paths(
+                Path::new("app"),
+                &manifest,
+                Some(&vendor.sources),
+                false
+            )
+            .is_err(),
+            "{fields}"
+        );
+    }
+    let path = root.path().join("app/Cargo.lock");
+    let lock = fs::read_to_string(&path).unwrap();
+    fs::write(path, lock.replace("registry.invalid", "other.invalid")).unwrap();
+    let retained = image(root.path());
+    assert!(
+        vendor
+            .bind_lock(&retained, Path::new("app/Cargo.lock"))
+            .is_err()
+    );
+}
+
+#[test]
+fn alternate_registry_config_refuses_credentials_helpers_alias_drift_and_ambiguous_urls() {
+    let index = "https://registry.invalid/index";
+    let base = format!(
+        "[source.captured]\nregistry='{index}'\nreplace-with='vendored'\n[source.vendored]\ndirectory='vendor'\n"
+    );
+    for addition in [
+        format!("[registries.private]\nindex='{index}'\ntoken='private-marker'\n"),
+        format!("[registries.private]\nindex='{index}'\ncredential-provider='private-marker'\n"),
+        "[registries.private]\nindex='https://other.invalid/index'\n".into(),
+        format!("[registries.crates-io]\nindex='{index}'\n"),
+        "[registries.private]\nindex=7\n".into(),
+        "[registry]\ndefault='private'\n".into(),
+        format!("[source.duplicate]\nregistry='{index}'\nreplace-with='vendored'\n"),
+    ] {
+        let value: toml::Value = toml::from_str(&format!("{base}{addition}")).unwrap();
+        let error = validate_config(&value, Path::new(""), "vendor").unwrap_err();
+        assert!(!error.to_string().contains("private-marker"));
+    }
+    for index in [
+        "file:///outside/index",
+        "ssh://git@registry.invalid/index",
+        "https://registry.invalid",
+        "https://user:private-marker@registry.invalid/index",
+        "https://registry.invalid/index?token=private-marker",
+        "https://registry.invalid/index#fragment",
+        "https://registry.invalid/../index",
+        "https://registry.invalid/a//index",
+        "https://registry.invalid/%2e%2e/index",
+        "https://registry.invalid/index\n",
+        "sparse+https://registry.invalid/index",
+        "registry+https://registry.invalid/index",
+    ] {
+        let error = registry_source(index).unwrap_err();
+        assert!(!error.to_string().contains("private-marker"));
+    }
+    assert!(validate_registry_source("registry+sparse+https://registry.invalid/index/").is_err());
+}
+
 #[test]
 fn vendor_selection_is_explicit_bounded_and_does_not_change_legacy_mode() {
     assert!(

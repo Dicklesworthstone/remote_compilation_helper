@@ -378,10 +378,11 @@ fn validate_dependencies(
     if let Some(dependencies) = value.as_table() {
         for dependency in dependencies.values() {
             if let Some(fields) = dependency.as_table() {
-                require(
-                    !fields.contains_key("registry") && !fields.contains_key("registry-index"),
-                    "automatic Cargo source preparation does not import alternate registry selectors",
-                )?;
+                if fields.contains_key("registry") || fields.contains_key("registry-index") {
+                    sources
+                        .ok_or_else(|| invalid("alternate registry dependencies require an explicitly verified vendor source"))?
+                        .check_registry_dependency(fields)?;
+                }
                 if fields.contains_key("git") {
                     sources
                         .ok_or_else(|| {

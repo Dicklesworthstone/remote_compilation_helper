@@ -50,6 +50,55 @@ fn git_revision(value: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
+/// Preserve Cargo's registry source identity exactly, including the sparse
+/// protocol prefix. Accept only unambiguous, credential-free HTTP(S) indexes;
+/// this declaration selects already-captured bytes and never grants a fetch.
+fn registry_source(index: &str) -> io::Result<String> {
+    let (sparse, url) = match index.strip_prefix("sparse+") {
+        Some(url) => (true, url),
+        None => (false, index),
+    };
+    let authority_and_path = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .ok_or_else(|| invalid("registry index requires an HTTP(S) or sparse HTTP(S) URL"))?;
+    let (authority, path) = authority_and_path
+        .split_once('/')
+        .ok_or_else(|| invalid("registry index requires an explicit URL path"))?;
+    require(
+        index.len() <= 2048
+            && !authority.is_empty()
+            && authority
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b".-:[]".contains(&byte))
+            && !index.contains(['?', '#', '@', '\\', '%'])
+            && !index
+                .chars()
+                .any(|ch| ch.is_whitespace() || ch.is_control())
+            && path.split('/').all(|part| !matches!(part, "." | ".."))
+            && !path.contains("//")
+            && (!sparse || url.ends_with('/')),
+        "registry index must be bounded, credential-free and unambiguous",
+    )?;
+    Ok(if sparse {
+        index.to_owned()
+    } else {
+        format!("registry+{index}")
+    })
+}
+
+fn is_registry_source(source: &str) -> bool {
+    source.starts_with("registry+") || source.starts_with("sparse+")
+}
+
+fn validate_registry_source(source: &str) -> io::Result<()> {
+    let index = source.strip_prefix("registry+").unwrap_or(source);
+    require(
+        registry_source(index)? == source,
+        "registry source has a noncanonical protocol prefix",
+    )
+}
+
 fn hash(bytes: &[u8]) -> String {
     Sha256::digest(bytes)
         .iter()
@@ -212,7 +261,8 @@ impl GitSource {
 
 #[derive(Debug)]
 pub(super) struct SourceReplacements {
-    registry: bool,
+    registries: BTreeSet<String>,
+    registry_names: BTreeMap<String, String>,
     git: BTreeSet<GitSource>,
     directory: PathBuf,
 }
@@ -258,10 +308,41 @@ impl SourceReplacements {
         )
     }
 
+    pub(super) fn check_registry_dependency(
+        &self,
+        fields: &toml::map::Map<String, toml::Value>,
+    ) -> io::Result<()> {
+        require(
+            !fields.contains_key("git")
+                && !(fields.contains_key("registry") && fields.contains_key("registry-index")),
+            "dependency contains conflicting registry/Git selectors",
+        )?;
+        let source = if let Some(name) = fields.get("registry") {
+            let name = name
+                .as_str()
+                .ok_or_else(|| invalid("dependency registry name must be a string"))?;
+            self.registry_names
+                .get(name)
+                .cloned()
+                .ok_or_else(|| invalid("dependency registry has no captured index declaration"))?
+        } else {
+            let index = fields
+                .get("registry-index")
+                .and_then(toml::Value::as_str)
+                .ok_or_else(|| invalid("dependency registry index must be a string"))?;
+            registry_source(index)?
+        };
+        require(
+            self.registries.contains(&source),
+            "dependency registry has no exact captured directory-source replacement",
+        )
+    }
+
     fn check_source(&self, source: &str) -> io::Result<()> {
-        if source == CRATES_IO {
+        if is_registry_source(source) {
+            validate_registry_source(source)?;
             require(
-                self.registry,
+                self.registries.contains(source),
                 "registry package has no captured source replacement",
             )
         } else {
@@ -616,8 +697,13 @@ fn validate_config(
 ) -> io::Result<SourceReplacements> {
     let top = value
         .as_table()
-        .filter(|top| top.len() == 1)
-        .ok_or_else(|| invalid("vendor config may contain only source replacement"))?;
+        .filter(|top| {
+            top.keys()
+                .all(|key| matches!(key.as_str(), "source" | "registries"))
+        })
+        .ok_or_else(|| {
+            invalid("vendor config may contain only source replacement and registry indexes")
+        })?;
     let sources = top
         .get("source")
         .and_then(toml::Value::as_table)
@@ -655,7 +741,8 @@ fn validate_config(
         "Cargo config directory differs from the explicitly approved vendor directory",
     )?;
     let mut result = SourceReplacements {
-        registry: false,
+        registries: BTreeSet::new(),
+        registry_names: BTreeMap::new(),
         git: BTreeSet::new(),
         directory: PathBuf::from(directory),
     };
@@ -672,7 +759,27 @@ fn validate_config(
         )?;
         if original_name == "crates-io" {
             require(fields.len() == 1, "invalid crates.io source replacement")?;
-            result.registry = true;
+            require(
+                result.registries.insert(CRATES_IO.to_owned()),
+                "duplicate registry source replacement identity",
+            )?;
+            result
+                .registry_names
+                .insert("crates-io".to_owned(), CRATES_IO.to_owned());
+        } else if let Some(index) = fields.get("registry") {
+            require(
+                fields.len() == 2,
+                "registry source replacement requires only registry and replace-with",
+            )?;
+            let source = registry_source(
+                index
+                    .as_str()
+                    .ok_or_else(|| invalid("registry source index must be a string"))?,
+            )?;
+            require(
+                result.registries.insert(source),
+                "duplicate registry source replacement identity",
+            )?;
         } else {
             require(
                 fields.keys().all(|key| {
@@ -692,6 +799,39 @@ fn validate_config(
             )?;
         }
     }
+    if let Some(registries) = top.get("registries") {
+        let registries = registries
+            .as_table()
+            .filter(|registries| registries.len() <= MAX_PACKAGES)
+            .ok_or_else(|| invalid("captured registry declarations must be a bounded table"))?;
+        for (name, registry) in registries {
+            require(
+                !name.is_empty()
+                    && name.len() <= 128
+                    && name != "crates-io"
+                    && name
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')),
+                "invalid or reserved alternate registry name",
+            )?;
+            let fields = registry
+                .as_table()
+                .filter(|fields| fields.len() == 1)
+                .ok_or_else(|| {
+                    invalid("captured registry accepts only its index, not credentials or helpers")
+                })?;
+            let index = fields
+                .get("index")
+                .and_then(toml::Value::as_str)
+                .ok_or_else(|| invalid("captured registry index missing"))?;
+            let source = registry_source(index)?;
+            require(
+                result.registries.contains(&source),
+                "alternate registry has no exact captured directory-source replacement",
+            )?;
+            result.registry_names.insert(name.clone(), source);
+        }
+    }
     Ok(result)
 }
 
@@ -706,7 +846,8 @@ pub(super) fn validate_lock_sources(lock: &toml::Value) -> io::Result<()> {
             let source = source
                 .as_str()
                 .ok_or_else(|| invalid("locked package source must be a string"))?;
-            if source == CRATES_IO {
+            if is_registry_source(source) {
+                validate_registry_source(source)?;
                 require(
                     package
                         .get("checksum")

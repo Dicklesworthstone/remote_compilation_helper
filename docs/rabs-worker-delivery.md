@@ -85,7 +85,7 @@ its `Cargo.toml` and setting the corresponding canonical working directory.
 Automatic preparation requires a captured workspace `Cargo.lock`. Without an
 explicit `vendor` selection it supports local packages only and refuses Cargo
 configuration, registry/git dependencies, symlinks and escaping manifest paths.
-The opt-in vendor mode below adds checked crates.io and locked Git directory
+The opt-in vendor mode below adds checked crates.io, alternate-registry and locked Git directory
 sources without network fetching or arbitrary configuration replay. Use explicit `source_files` or
 `source_roots` for other supported projections; those selectors are mutually
 exclusive with `cargo_source`. Explicit registry Cargo-home replay remains a
@@ -159,9 +159,52 @@ through Cargo's directory-source semantics. Local dependency or workspace
 selections that enter the vendor directory refuse before Cargo runs, preventing
 those packages from being reinterpreted as unrestricted local path packages.
 
-This bounded mode accepts one directory replacement, optional crates.io, and
-explicit Git source replacements. It accepts no other Cargo configuration layers.
-Alternate registries, replacement chains, arbitrary build/credential configuration,
+Alternate registries can use the same checked directory. Declare the registry's
+name and exact index URL alongside its direct source replacement in the single
+captured `.cargo/config.toml`:
+
+```toml
+[registries.private]
+index = "sparse+https://registry.example.org/index/"
+
+[source.private-index]
+registry = "sparse+https://registry.example.org/index/"
+replace-with = "vendored-sources"
+
+[source.vendored-sources]
+directory = "vendor"
+```
+
+The workspace may then declare
+`dependency = { version = "1.2.3", registry = "private" }`. The registry name
+must resolve through that captured index declaration; the source table name
+may differ. Published dependency manifests with `registry-index` are also
+supported, so transitive and build dependencies retain their exact source
+selection. Every registry index must have a direct replacement to the approved
+directory, and every resolved package must match the captured lock's complete
+name/version/source identity and archive checksum. The same name/version from
+different sources is refused as ambiguous in this bounded vendor layout.
+
+Both Git-index HTTP(S) URLs and `sparse+http(s)` URLs are supported. Use the
+canonical index spelling recorded by Cargo: a Git index appears as
+`registry+https://…` in `Cargo.lock`, while a sparse index retains `sparse+https://…`
+and its required trailing slash. Source identities are compared exactly; an
+index with a different path or protocol cannot borrow another index's verified
+packages. Credential-bearing URLs, registry tokens and credential-provider
+configuration are not accepted. See Cargo's
+[alternate registry reference](https://doc.rust-lang.org/cargo/reference/registries.html#using-an-alternate-registry).
+
+Use the same `cargo_source` selection above and prepare the existing captured
+layout with the normal command:
+
+```bash
+rabsd --worker-prepare /absolute/approved-anchor /absolute/specification.json /absolute/new-bundle
+```
+
+This bounded mode accepts one directory replacement, optional crates.io,
+explicit alternate-registry indexes, and explicit Git source replacements.
+It accepts no other Cargo configuration layers.
+Replacement chains, arbitrary build/credential configuration,
 symlinks and escaping local paths refuse. Directory sources must already be complete; no registry, broker, fetch,
 archive download or user Cargo home is consulted. The existing 4,096-file and
 512 MiB source bounds include the whole approved anchor and vendor tree.

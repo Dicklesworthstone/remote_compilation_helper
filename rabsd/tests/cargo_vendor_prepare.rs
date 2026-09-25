@@ -286,6 +286,40 @@ impl Fixture {
         );
         package
     }
+    fn alternate_registry(index: &str, source: &str) -> Self {
+        let fixture = Self::new();
+        write(
+            &fixture.anchor,
+            ".cargo/config.toml",
+            format!(
+                "[registries.private]\nindex='{index}'\n[source.captured-private-index]\nregistry='{index}'\nreplace-with='vendored-sources'\n[source.vendored-sources]\ndirectory='vendor'\n"
+            ),
+        );
+        write(
+            &fixture.anchor,
+            "app/Cargo.toml",
+            "[package]\nname='vendor_app'\nversion='0.1.0'\nedition='2021'\n[dependencies]\nlocal_dep={path='../local_dep'}\nregistry_dep={version='=1.0.0',registry='private'}\n",
+        );
+        // Published manifests express transitive alternate-registry inputs by
+        // index URL; they cannot rely on the publisher's private registry alias.
+        let manifest_path = fixture.anchor.join("vendor/registry_dep/Cargo.toml");
+        let manifest = fs::read_to_string(&manifest_path).unwrap().replace(
+            "registry_leaf='=1.0.0'",
+            &format!("registry_leaf={{version='=1.0.0',registry-index='{index}'}}"),
+        );
+        fs::write(manifest_path, &manifest).unwrap();
+        let checksums_path = fixture
+            .anchor
+            .join("vendor/registry_dep/.cargo-checksum.json");
+        let mut checksums: Value =
+            serde_json::from_slice(&fs::read(&checksums_path).unwrap()).unwrap();
+        checksums["files"]["Cargo.toml"] = json!(hash(manifest.as_bytes()));
+        fs::write(checksums_path, serde_json::to_vec(&checksums).unwrap()).unwrap();
+        let lock_path = fixture.anchor.join("Cargo.lock");
+        let lock = fs::read_to_string(&lock_path).unwrap();
+        fs::write(lock_path, lock.replace(REGISTRY, source)).unwrap();
+        fixture
+    }
     fn git() -> (Self, String) {
         let owner = tempfile::tempdir().unwrap();
         let anchor = owner.path().join("approved source");
@@ -507,7 +541,26 @@ impl Fixture {
 
 #[test]
 fn real_preparation_and_frozen_cargo_build_use_captured_transitive_and_build_script_inputs() {
-    let fixture = Fixture::new();
+    run_captured_vendor_build(Fixture::new());
+}
+
+#[test]
+fn alternate_registry_preparation_and_build_use_exact_captured_git_and_sparse_indexes() {
+    for (index, source) in [
+        (
+            "https://registry.invalid/index",
+            "registry+https://registry.invalid/index",
+        ),
+        (
+            "sparse+https://registry.invalid/index/",
+            "sparse+https://registry.invalid/index/",
+        ),
+    ] {
+        run_captured_vendor_build(Fixture::alternate_registry(index, source));
+    }
+}
+
+fn run_captured_vendor_build(fixture: Fixture) {
     let (bundle, request) = fixture.prepared();
     write(
         &fixture.anchor,
@@ -844,7 +897,10 @@ fn run_vendored_native_tls_build(upload_toolchain: bool) {
         let request: Value =
             serde_json::from_slice(&fs::read(bundle.join("request.json")).unwrap()).unwrap();
         assert_eq!(request["toolchain_transfer"], "toolchain-tree-v1");
-        assert_eq!(request["toolchain_identity"]["version"], "toolchain-dataset-v1");
+        assert_eq!(
+            request["toolchain_identity"]["version"],
+            "toolchain-dataset-v1"
+        );
         assert!(request.get("toolchain_backing").is_none());
         assert!(request.get("toolchain_source").is_none());
         assert!(bundle.join("toolchain/bin/cargo").is_file());
