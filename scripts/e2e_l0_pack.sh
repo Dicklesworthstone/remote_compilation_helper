@@ -49,17 +49,26 @@ RENDER=$(cargo metadata --no-deps --format-version 1 \
   | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')/debug/layer0_render
 [ -x "$RENDER" ] || { log "layer0_render not built at $RENDER"; exit 2; }
 
-# Two renders. The BARE one proves the pack's default posture: no knob is on
-# without an explicit request, so an unconfigured host's Cargo defaults are
-# untouched. The OPTED-IN one is the subject of the flag assertions below —
-# every knob in it was asked for AND proven available on this host.
+# Two renders. The BARE one proves the pack's default posture: no opt-in knob
+# is on without an explicit request. The one documented exception is the
+# linker (L0-c, `layer0_render --help`): wild/lld is selected by AVAILABILITY
+# alone when the clang driver and a known host triple are present, so on such
+# a host the bare render carries exactly that linker block and nothing else.
+# The OPTED-IN one is the subject of the flag assertions below — every knob
+# in it was asked for AND proven available on this host.
 "$RENDER" >"$OUT/layer0-bare.toml" 2>"$OUT/render-bare.stderr"
-if grep -v '^#' "$OUT/layer0-bare.toml" | grep -q '[^[:space:]]'; then
-  log "FAIL: an unrequested pack rendered live config:"
+HOST_TRIPLE=$(rustc -vV | sed -n 's/^host: //p')
+LINKER_LIVE_RE="^(\[target\.${HOST_TRIPLE//./\\.}\]|linker = \"clang\"|rustflags = \[\"-C\", \"link-arg=(-fuse-ld=lld|--ld-path=wild)\"\])$"
+if grep -v '^#' "$OUT/layer0-bare.toml" | grep '[^[:space:]]' | grep -Evq "$LINKER_LIVE_RE"; then
+  log "FAIL: an unrequested pack rendered live config beyond the auto-selected linker:"
   cat "$OUT/layer0-bare.toml" >&2
   exit 3
 fi
-log "bare render is inert (defaults untouched) -> $OUT/layer0-bare.toml"
+if grep -q '^linker = "clang"' "$OUT/layer0-bare.toml" && ! command -v clang >/dev/null 2>&1; then
+  log "FAIL: bare render selected a clang-driven linker but clang is absent"
+  exit 3
+fi
+log "bare render touches nothing but the availability-selected linker -> $OUT/layer0-bare.toml"
 
 TARGET_CPU=${TARGET_CPU:-x86-64-v2}
 case "$(rustc -vV | sed -n 's/^host: //p')" in
