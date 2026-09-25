@@ -3148,26 +3148,54 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
     // Transfer Size Estimation (bd-3hho)
     // =========================================================================
 
-    /// Estimate transfer size using rsync dry-run.
+    /// Wall-clock budget for the pre-upload `rsync --dry-run --stats`
+    /// estimate (issue #74).
     ///
-    /// Returns `None` if estimation fails (e.g., rsync unavailable). Fail-open:
-    /// if estimation fails, proceed with transfer rather than blocking.
-    #[allow(dead_code)]
-    pub async fn estimate_transfer_size(&self, worker: &WorkerConfig) -> Option<TransferEstimate> {
-        let effective_excludes = self.get_effective_excludes();
-        let start = std::time::Instant::now();
+    /// The dry-run prints nothing until it finishes, so silence and wall-clock
+    /// are the same thing here: the estimate is bounded by the source-sync
+    /// silence window, and never outlives an explicit `sync_timeout_ms`. With
+    /// both disabled/unset it uses the default silence window. A stalled
+    /// estimate then fails open into the bounded upload instead of holding the
+    /// worker reservation indefinitely.
+    fn transfer_estimate_timeout(&self) -> std::time::Duration {
+        const FALLBACK: std::time::Duration = std::time::Duration::from_secs(120);
+        let silence = match self.transfer_config.source_sync_silence_timeout_secs {
+            0 => None,
+            secs => Some(std::time::Duration::from_secs(secs)),
+        };
+        let explicit = self
+            .transfer_config
+            .sync_timeout_ms
+            .filter(|ms| TransferConfig::valid_sync_timeout_ms(*ms))
+            .map(std::time::Duration::from_millis);
+        match (silence, explicit) {
+            (Some(silence), Some(explicit)) => silence.min(explicit),
+            (Some(bound), None) | (None, Some(bound)) => bound,
+            (None, None) => FALLBACK,
+        }
+    }
 
+    /// Build the `rsync --dry-run --stats` command behind
+    /// [`Self::estimate_transfer_size`]. It shares the upload's ssh transport
+    /// (`build_rsync_ssh_command`), so `ServerAliveInterval` and connection
+    /// multiplexing reach the estimate as well (issue #74).
+    fn build_estimate_command(&self, worker: &WorkerConfig) -> Command {
+        let effective_excludes = self.get_effective_excludes();
         let (mut cmd, _capabilities) = self.rsync_command();
 
         let identity_file = shellexpand::tilde(&worker.identity_file);
         let escaped_identity = escape(Cow::from(identity_file.as_ref()));
+        let ssh_command = format!(
+            "{} -o ConnectTimeout=5",
+            self.build_rsync_ssh_command(escaped_identity.as_ref())
+        );
 
         cmd.arg("-az");
         add_portable_rsync_archive_args(&mut cmd);
-        cmd.arg("--dry-run").arg("--stats").arg("-e").arg(format!(
-            "ssh -i {} -o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=5",
-            escaped_identity
-        ));
+        cmd.arg("--dry-run")
+            .arg("--stats")
+            .arg("-e")
+            .arg(ssh_command);
 
         for pattern in &effective_excludes {
             cmd.arg("--exclude").arg(pattern);
@@ -3180,12 +3208,39 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         cmd.arg(format!("{}/", self.project_root.display()))
             .arg(&destination);
 
-        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        cmd
+    }
 
-        let output = match cmd.output().await {
-            Ok(output) => output,
-            Err(e) => {
+    /// Estimate transfer size using rsync dry-run.
+    ///
+    /// Returns `None` if estimation fails (e.g., rsync unavailable) or does not
+    /// finish within [`Self::transfer_estimate_timeout`]. Fail-open: if
+    /// estimation fails, proceed with transfer rather than blocking.
+    #[allow(dead_code)]
+    pub async fn estimate_transfer_size(&self, worker: &WorkerConfig) -> Option<TransferEstimate> {
+        let start = std::time::Instant::now();
+        let mut cmd = self.build_estimate_command(worker);
+        let budget = self.transfer_estimate_timeout();
+
+        // `kill_on_drop` kills the stalled rsync when the timeout drops the
+        // pending `output()` future; its ssh then loses its peer and exits.
+        let output = match tokio::time::timeout(budget, cmd.output()).await {
+            Ok(Ok(output)) => output,
+            Ok(Err(e)) => {
                 debug!("Transfer estimation failed (rsync error): {}", e);
+                return None;
+            }
+            Err(_) => {
+                warn!(
+                    worker = %worker.id,
+                    timeout_secs = budget.as_secs_f64(),
+                    "Transfer size estimate produced no result in time; proceeding with the \
+                     bounded upload (fail-open)"
+                );
                 return None;
             }
         };
@@ -8401,6 +8456,159 @@ Number of files transferred: 42
         assert!(ssh_arg.contains("ControlPath="));
         assert!(ssh_arg.contains("rch-rsync-%C"));
         assert!(ssh_arg.contains("ControlPersist=60s"));
+    }
+
+    fn estimate_test_worker() -> WorkerConfig {
+        WorkerConfig {
+            id: WorkerId::new("estimate-worker"),
+            host: "worker.example".to_string(),
+            user: "ubuntu".to_string(),
+            identity_file: "~/.ssh/id_ed25519".to_string(),
+            total_slots: 4,
+            priority: 100,
+            tags: vec![],
+            tools: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn test_estimate_command_uses_configured_ssh_keepalive() {
+        // Issue #74: the estimate's ssh must carry ServerAliveInterval like the
+        // upload's, and keep its connect bound.
+        let _guard = test_guard!();
+        let pipeline = TransferPipeline::new(
+            PathBuf::from("/home/user/project"),
+            "estimate-project".to_string(),
+            "abc123".to_string(),
+            TransferConfig {
+                adaptive_compression: true,
+                ..TransferConfig::default()
+            },
+        )
+        .with_rsync(pinned_rsync(RsyncFlavor::Rsync {
+            major: 3,
+            minor: 2,
+            patch: 7,
+        }))
+        .with_ssh_options(SshOptions {
+            server_alive_interval: Some(Duration::from_secs(5)),
+            control_master: false,
+            ..SshOptions::default()
+        });
+
+        let cmd = pipeline.build_estimate_command(&estimate_test_worker());
+        let args: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect();
+        assert!(args.iter().any(|arg| arg == "--dry-run"));
+        assert!(args.iter().any(|arg| arg == "--stats"));
+        let e_index = args.iter().position(|arg| arg == "-e").expect("-e arg");
+        let ssh_arg = &args[e_index + 1];
+        assert!(ssh_arg.contains("ServerAliveInterval=5"), "{ssh_arg}");
+        assert!(ssh_arg.contains("ConnectTimeout=5"), "{ssh_arg}");
+        assert!(ssh_arg.contains("BatchMode=yes"), "{ssh_arg}");
+    }
+
+    #[test]
+    fn test_transfer_estimate_timeout_follows_sync_bounds() {
+        // Issue #74: the estimate is bounded by the silence window, never
+        // outlives an explicit sync_timeout_ms, and stays bounded when silence
+        // detection is disabled.
+        let pipeline_with = |config: TransferConfig| {
+            TransferPipeline::new(
+                PathBuf::from("/home/user/project"),
+                "estimate-project".to_string(),
+                "abc123".to_string(),
+                config,
+            )
+        };
+        let default_budget = pipeline_with(TransferConfig::default()).transfer_estimate_timeout();
+        assert_eq!(
+            default_budget,
+            Duration::from_secs(TransferConfig::default().source_sync_silence_timeout_secs)
+        );
+        let silence = pipeline_with(TransferConfig {
+            source_sync_silence_timeout_secs: 10,
+            sync_timeout_ms: Some(60_000),
+            ..TransferConfig::default()
+        });
+        assert_eq!(silence.transfer_estimate_timeout(), Duration::from_secs(10));
+        let tight_cap = pipeline_with(TransferConfig {
+            source_sync_silence_timeout_secs: 120,
+            sync_timeout_ms: Some(5_000),
+            ..TransferConfig::default()
+        });
+        assert_eq!(
+            tight_cap.transfer_estimate_timeout(),
+            Duration::from_secs(5)
+        );
+        let explicit_only = pipeline_with(TransferConfig {
+            source_sync_silence_timeout_secs: 0,
+            sync_timeout_ms: Some(45_000),
+            ..TransferConfig::default()
+        });
+        assert_eq!(
+            explicit_only.transfer_estimate_timeout(),
+            Duration::from_secs(45)
+        );
+        let unbounded_config = pipeline_with(TransferConfig {
+            source_sync_silence_timeout_secs: 0,
+            ..TransferConfig::default()
+        });
+        assert_eq!(
+            unbounded_config.transfer_estimate_timeout(),
+            Duration::from_secs(120),
+            "the estimate stays bounded even with silence detection disabled"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_estimate_transfer_size_fails_open_when_rsync_stalls() {
+        // Issue #74: an rsync that connects and then goes silent must not hang
+        // the estimate; it fails open (None) within the silence window and
+        // should_skip_transfer proceeds to the bounded upload.
+        use std::os::unix::fs::PermissionsExt;
+        let _guard = test_guard!();
+        let dir = tempfile::tempdir().unwrap();
+        let fake = dir.path().join("stalled-rsync");
+        std::fs::write(&fake, "#!/bin/sh\nexec sleep 60\n").unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut pipeline = TransferPipeline::new(
+            dir.path().to_path_buf(),
+            "estimate-project".to_string(),
+            "abc123".to_string(),
+            TransferConfig {
+                adaptive_compression: true,
+                source_sync_silence_timeout_secs: 1,
+                ..TransferConfig::default()
+            },
+        )
+        .with_rsync(ResolvedRsync {
+            path: fake,
+            flavor: RsyncFlavor::Rsync {
+                major: 3,
+                minor: 2,
+                patch: 7,
+            },
+            version_line: String::new(),
+            source: RsyncSource::Config,
+            shadowed: None,
+        });
+        let worker = estimate_test_worker();
+
+        let started = std::time::Instant::now();
+        assert!(pipeline.estimate_transfer_size(&worker).await.is_none());
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(20),
+            "stalled estimate must be abandoned near the 1 s window, took {elapsed:?}"
+        );
+        assert_eq!(pipeline.should_skip_transfer(&worker).await, None);
+        assert_eq!(pipeline.estimated_transfer_bytes, None);
     }
 
     #[test]
