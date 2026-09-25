@@ -1002,9 +1002,37 @@ fn resolve_cargo_path_dependency_graph_with_policy_and_provider<F>(
 where
     F: Fn(&Path) -> Result<String, CargoPathDependencyError>,
 {
+    resolve_cargo_path_dependency_graph_with_cargo_home(
+        entrypoint,
+        policy,
+        metadata_provider,
+        default_cargo_home().as_deref(),
+    )
+}
+
+/// The Cargo home `cargo metadata` resolves against: `$CARGO_HOME`, else
+/// `~/.cargo` (cargo's own default), canonicalized when it exists so it
+/// compares against canonical package roots.
+fn default_cargo_home() -> Option<PathBuf> {
+    let cargo_home = std::env::var_os("CARGO_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|home| home.join(".cargo")))?;
+    Some(cargo_home.canonicalize().unwrap_or(cargo_home))
+}
+
+fn resolve_cargo_path_dependency_graph_with_cargo_home<F>(
+    entrypoint: &Path,
+    policy: &PathTopologyPolicy,
+    metadata_provider: F,
+    cargo_home: Option<&Path>,
+) -> Result<CargoPathDependencyGraph, CargoPathDependencyError>
+where
+    F: Fn(&Path) -> Result<String, CargoPathDependencyError>,
+{
     let entry_manifest = resolve_entry_manifest(entrypoint, policy)?;
 
-    match resolve_from_metadata(&entry_manifest, policy, &metadata_provider) {
+    match resolve_from_metadata(&entry_manifest, policy, &metadata_provider, cargo_home) {
         Ok(graph) => Ok(graph),
         Err(metadata_error) => match resolve_from_manifest_fallback(&entry_manifest, policy) {
             Ok(graph) => Ok(graph),
@@ -1597,6 +1625,10 @@ struct MetadataPackage {
     id: String,
     name: String,
     manifest_path: String,
+    /// `null` for local path packages; `registry+…` / `git+…` otherwise.
+    /// Vendored (`[source] directory`) crates keep their original source id.
+    #[serde(default)]
+    source: Option<String>,
     #[serde(default)]
     dependencies: Vec<MetadataDependency>,
 }
@@ -1621,6 +1653,7 @@ fn resolve_from_metadata<F>(
     entry_manifest_path: &Path,
     policy: &PathTopologyPolicy,
     metadata_provider: &F,
+    cargo_home: Option<&Path>,
 ) -> Result<CargoPathDependencyGraph, CargoPathDependencyError>
 where
     F: Fn(&Path) -> Result<String, CargoPathDependencyError>,
@@ -1672,6 +1705,18 @@ where
             }
             Err(error) => return Err(error),
         };
+        // Registry and git packages unpacked into Cargo's own caches are not
+        // local inputs: the worker resolves them through its own isolated
+        // CARGO_HOME. They only look local when CARGO_HOME happens to sit under
+        // the topology root (e.g. `canonical_root = $HOME`), so exclude them
+        // explicitly (issue #77). Sourced packages elsewhere — vendored
+        // `[source] directory` trees — stay in the closure.
+        if !workspace_member
+            && package.source.is_some()
+            && cargo_home.is_some_and(|cargo_home| package_root.starts_with(cargo_home))
+        {
+            continue;
+        }
         let canonical_manifest_path = package_root.join("Cargo.toml");
 
         partial.add_package(
@@ -4835,6 +4880,95 @@ unused_patch_dep = { path = "../unused_patch_dep" }
                 .iter()
                 .all(|pkg| pkg.package_root != dev_dep_canonical),
             "dev-only dependency package should not be pulled into runtime closure"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn metadata_resolve_excludes_cargo_home_packages_inside_topology_root() {
+        // Issue #77: with CARGO_HOME under canonical_root, registry and git
+        // packages from Cargo's caches must not become closure packages. A
+        // vendored (`[source] directory`) crate keeps its registry source id
+        // but is a real local input, so it stays.
+        let fixture = TopologyFixture::new("synthetic-meta-cargo-home");
+        let scenario_root = fixture.canonical_root.join("synth_meta_cargo_home");
+        let app_root = scenario_root.join("app");
+        let cargo_home = scenario_root.join(".cargo");
+        let registry_root = cargo_home.join("registry/src/index.crates.io-abc/itoa-1.0.15");
+        let git_root = cargo_home.join("git/checkouts/gitdep-0123/abcdef0");
+        let vendor_root = scenario_root.join("vendor/ryu");
+
+        write_bin_crate(&app_root, "cargo_home_app", &[]);
+        write_lib_crate(&registry_root, "itoa", &[]);
+        write_lib_crate(&git_root, "gitdep", &[]);
+        write_lib_crate(&vendor_root, "ryu", &[]);
+
+        let app = app_root.canonicalize().expect("canonical app");
+        let registry = registry_root.canonicalize().expect("canonical registry");
+        let git = git_root.canonicalize().expect("canonical git");
+        let vendor = vendor_root.canonicalize().expect("canonical vendor");
+        let cargo_home = cargo_home.canonicalize().expect("canonical cargo home");
+        let crates_io = "registry+https://github.com/rust-lang/crates.io-index";
+
+        let metadata_json = format!(
+            r#"{{
+                "packages": [
+                    {{"id": "app", "name": "cargo_home_app", "source": null,
+                      "manifest_path": "{app}/Cargo.toml", "dependencies": []}},
+                    {{"id": "itoa", "name": "itoa", "source": "{crates_io}",
+                      "manifest_path": "{registry}/Cargo.toml", "dependencies": []}},
+                    {{"id": "gitdep", "name": "gitdep", "source": "git+https://example.com/gitdep#abcdef0",
+                      "manifest_path": "{git}/Cargo.toml", "dependencies": []}},
+                    {{"id": "ryu", "name": "ryu", "source": "{crates_io}",
+                      "manifest_path": "{vendor}/Cargo.toml", "dependencies": []}}
+                ],
+                "workspace_members": ["app"],
+                "workspace_root": "{app}",
+                "resolve": {{
+                    "root": "app",
+                    "nodes": [
+                        {{"id": "app", "deps": [
+                            {{"name": "itoa", "pkg": "itoa", "dep_kinds": [{{"kind": null, "target": null}}]}},
+                            {{"name": "gitdep", "pkg": "gitdep", "dep_kinds": [{{"kind": null, "target": null}}]}},
+                            {{"name": "ryu", "pkg": "ryu", "dep_kinds": [{{"kind": null, "target": null}}]}}
+                        ]}},
+                        {{"id": "itoa", "deps": []}},
+                        {{"id": "gitdep", "deps": []}},
+                        {{"id": "ryu", "deps": []}}
+                    ]
+                }}
+            }}"#,
+            app = app.display(),
+            registry = registry.display(),
+            git = git.display(),
+            vendor = vendor.display(),
+        );
+
+        let package_roots = |cargo_home: Option<&Path>| {
+            let json = metadata_json.clone();
+            let graph = resolve_cargo_path_dependency_graph_with_cargo_home(
+                &app_root,
+                &fixture.policy(),
+                move |_| Ok(json.clone()),
+                cargo_home,
+            )
+            .expect("synthetic metadata should resolve");
+            graph
+                .packages
+                .iter()
+                .map(|package| package.package_root.clone())
+                .collect::<BTreeSet<_>>()
+        };
+
+        assert_eq!(
+            package_roots(Some(&cargo_home)),
+            BTreeSet::from([app.clone(), vendor.clone()]),
+            "Cargo-home registry/git packages must not enter the closure"
+        );
+        // Control: a Cargo home elsewhere leaves in-root sourced packages alone.
+        assert_eq!(
+            package_roots(Some(&fixture.root.join("elsewhere-cargo-home"))),
+            BTreeSet::from([app, registry, git, vendor]),
         );
     }
 
