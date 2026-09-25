@@ -933,14 +933,6 @@ pub(super) async fn execute_remote_compilation(
         &transfer_config.remote_base,
         &ownership_scan_roots,
     )?;
-    ensure_worker_projects_topology(
-        &worker_config,
-        reporter,
-        &remote_topology_policy,
-        &ownership_scan_roots,
-    )
-    .await?;
-
     // Build transfer pipelines with color mode, command timeout, and compilation kind.
     // When the in-session watchdog is active it enforces the real build cap
     // remotely (same timeout_for_kind value). Give the local SSH stream a grace
@@ -1038,6 +1030,7 @@ pub(super) async fn execute_remote_compilation(
         let guard = acquire_remote_source_authority_lock(
             &worker_config,
             &mutable_source_authority_roots,
+            source_pair_lock.as_mut(),
             command_timeout,
         )
         .await?;
@@ -1047,6 +1040,15 @@ pub(super) async fn execute_remote_compilation(
         ));
         Some(guard)
     };
+    // Ownership repair changes source-tree metadata too. It must wait for the
+    // complete grant, including ancestor/descendant exclusion, just like sync.
+    ensure_worker_projects_topology(
+        &worker_config,
+        reporter,
+        &remote_topology_policy,
+        &ownership_scan_roots,
+    )
+    .await?;
     if !mutable_source_authority_roots.is_empty()
         && !super::ssh::should_skip_remote_preflight(&worker_config)
     {

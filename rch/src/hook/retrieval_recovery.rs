@@ -496,6 +496,7 @@ impl RecoverySession {
             let mut sources = super::super::ssh::acquire_remote_source_authority_lock(
                 &worker,
                 &self.recipe.source_roots,
+                pair.as_mut(),
                 Duration::from_secs(15),
             )
             .await?;
@@ -610,6 +611,7 @@ pub(crate) async fn recover_job(writer: &DurableLeaseWriter) -> anyhow::Result<i
     let mut sources = super::super::ssh::acquire_remote_source_authority_lock(
         &worker,
         &session.recipe.source_roots,
+        pair.as_mut(),
         Duration::from_secs(15),
     )
     .await?;

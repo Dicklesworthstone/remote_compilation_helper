@@ -175,35 +175,84 @@ async fn join_lock_drain(
     }
 }
 
+fn source_authority_lock_path(root: &str) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"rch.remote_source_authority_lock.v1\0");
+    hasher.update(root.as_bytes());
+    format!(
+        "{REMOTE_SOURCE_AUTHORITY_LOCK_DIR}/{}.lock",
+        hasher.finalize().to_hex()
+    )
+}
+
 fn source_authority_lock_paths(authority_roots: &[String]) -> Vec<String> {
     let mut roots = authority_roots.to_vec();
     roots.sort();
     roots.dedup();
     roots
         .into_iter()
-        .map(|root| {
-            let mut hasher = blake3::Hasher::new();
-            hasher.update(b"rch.remote_source_authority_lock.v1\0");
-            hasher.update(root.as_bytes());
-            format!(
-                "{REMOTE_SOURCE_AUTHORITY_LOCK_DIR}/{}.lock",
-                hasher.finalize().to_hex()
-            )
-        })
+        .map(|root| source_authority_lock_path(&root))
         .collect()
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SourceAuthorityLockSpec {
+    path: String,
+    shared: bool,
+}
+
+/// A full-tree writer must exclude writers of any subtree. Shared ancestor
+/// locks make that conflict visible without serializing disjoint siblings.
+/// Resolve the strongest mode before taking any lock: upgrades can deadlock.
+fn source_authority_lock_plan(
+    authority_roots: &[String],
+    include_ancestors: bool,
+) -> anyhow::Result<Vec<SourceAuthorityLockSpec>> {
+    let mut roots = std::collections::BTreeMap::new();
+    for root in authority_roots {
+        let path = Path::new(root);
+        let canonical = path.components().collect::<PathBuf>();
+        anyhow::ensure!(
+            path.is_absolute()
+                && path.as_os_str() == canonical.as_os_str()
+                && !path.components().any(|component| matches!(
+                    component,
+                    std::path::Component::ParentDir | std::path::Component::Prefix(_)
+                )),
+            "source authority must be a canonical absolute path: {root:?}"
+        );
+        roots.insert(root.clone(), false);
+        if include_ancestors {
+            for ancestor in path.ancestors().skip(1) {
+                roots
+                    .entry(ancestor.to_string_lossy().into_owned())
+                    .or_insert(true);
+            }
+        }
+    }
+    // Sort by canonical source paths, never by their lock-file hashes. Every
+    // invocation then acquires overlapping sets in the same global order.
+    Ok(roots
+        .into_iter()
+        .map(|(root, shared)| SourceAuthorityLockSpec {
+            path: source_authority_lock_path(&root),
+            shared,
+        })
+        .collect())
 }
 
 fn build_remote_source_authority_lock_cmd(
     lock_dir: &str,
-    lock_paths: &[String],
+    locks: &[SourceAuthorityLockSpec],
     ready_marker: &str,
 ) -> anyhow::Result<String> {
-    if lock_paths.is_empty() {
+    if locks.is_empty() {
         anyhow::bail!("remote source-authority lock set must not be empty");
     }
     let mut seen = std::collections::HashSet::new();
-    for path in lock_paths {
-        // The quoted here-document carries literal, one-path-per-line data.
+    for lock in locks {
+        let path = &lock.path;
+        // The quoted here-document carries literal, one-lock-per-line data.
         // Absolute paths cannot equal its non-path delimiter. Keep the caller's
         // established canonical-root order; re-sorting hashes could deadlock
         // against older holders that acquire the same roots in that order.
@@ -228,11 +277,16 @@ fn build_remote_source_authority_lock_cmd(
     // One descriptor per root is still necessary; exhaustion fails before
     // readiness and process exit releases every partially acquired lock.
     let holder = shell_escape::escape(SOURCE_AUTHORITY_LOCK_HOLDER.into());
+    let records = locks
+        .iter()
+        .map(|lock| format!("{} {}", if lock.shared { "s" } else { "x" }, lock.path))
+        .collect::<Vec<_>>()
+        .join("\n");
     Ok(format!(
         "set -e\nmkdir -p -- {directory}\nexec 3<<'RCH_SOURCE_LOCK_PATHS'\n{paths}\nRCH_SOURCE_LOCK_PATHS\nexec sh -c {holder} {holder} {count} {ready}",
         directory = shell_escape::escape(lock_dir.into()),
-        paths = lock_paths.join("\n"),
-        count = lock_paths.len(),
+        paths = records,
+        count = locks.len(),
         ready = shell_escape::escape(ready_marker.into()),
     ))
 }
@@ -261,13 +315,29 @@ fn source_authority_lock_transport(
 pub(super) async fn acquire_remote_source_authority_lock(
     worker: &WorkerConfig,
     authority_roots: &[String],
+    source_pair: Option<&mut RemoteSourceAuthorityLock>,
     wait_timeout: Duration,
 ) -> anyhow::Result<RemoteSourceAuthorityLock> {
-    let lock_paths = source_authority_lock_paths(authority_roots);
+    // A validated clean-overlay pair already holds its container exclusively.
+    // Its private descendants retain their exact locks; re-locking their parent
+    // through another SSH session would deadlock against our own pair holder.
+    // Derive this exception from the actual live pair, never a caller flag or
+    // an unvalidated recovery-recipe path.
+    let include_ancestors = if let Some(pair) = source_pair {
+        pair.ensure_held()?;
+        anyhow::ensure!(
+            pair.pair_token().is_some(),
+            "source pair has no owner token"
+        );
+        false
+    } else {
+        true
+    };
+    let locks = source_authority_lock_plan(authority_roots, include_ancestors)?;
     let ready_marker = format!("RCH_SOURCE_AUTHORITY_READY:{}", uuid::Uuid::new_v4());
     let remote_cmd = build_remote_source_authority_lock_cmd(
         REMOTE_SOURCE_AUTHORITY_LOCK_DIR,
-        &lock_paths,
+        &locks,
         &ready_marker,
     )?;
     spawn_source_authority_lock(worker, &remote_cmd, &ready_marker, wait_timeout).await
@@ -1313,6 +1383,271 @@ cat "$RCH_OWNERSHIP_TEST_DIR/payload"
         );
     }
 
+    fn exclusive_source_locks(paths: &[String]) -> Vec<SourceAuthorityLockSpec> {
+        paths
+            .iter()
+            .map(|path| SourceAuthorityLockSpec {
+                path: path.clone(),
+                shared: false,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn source_authority_hierarchy_uses_one_order_and_strongest_mode() {
+        let forward =
+            source_authority_lock_plan(&["/a/child".into(), "/b/child".into(), "/a".into()], true)
+                .unwrap();
+        let reverse = source_authority_lock_plan(
+            &[
+                "/a".into(),
+                "/b/child".into(),
+                "/a/child".into(),
+                "/a".into(),
+            ],
+            true,
+        )
+        .unwrap();
+        assert_eq!(forward, reverse);
+        let expected = [
+            ("/", true),
+            ("/a", false),
+            ("/a/child", false),
+            ("/b", true),
+            ("/b/child", false),
+        ]
+        .into_iter()
+        .map(|(root, shared)| SourceAuthorityLockSpec {
+            path: source_authority_lock_path(root),
+            shared,
+        })
+        .collect::<Vec<_>>();
+        assert_eq!(forward, expected);
+        for root in ["relative", "/a/../b", "/a/./b", "/a//b", "/a/"] {
+            assert!(source_authority_lock_plan(&[root.into()], true).is_err());
+        }
+        let paired = source_authority_lock_plan(&["/private/child".into()], false).unwrap();
+        assert_eq!(
+            paired,
+            exclusive_source_locks(&[source_authority_lock_path("/private/child")])
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn claim_test_source_closure(roots: &[String]) -> RemoteSourceAuthorityLock {
+        let locks = source_authority_lock_plan(roots, true).unwrap();
+        let script = build_remote_source_authority_lock_cmd(
+            REMOTE_SOURCE_AUTHORITY_LOCK_DIR,
+            &locks,
+            "CLOSURE_READY",
+        )
+        .unwrap();
+        let (child, bootstrap) = local_source_lock_transport(WorkerPlatform::Posix, &script);
+        finish_source_authority_lock_acquisition(
+            child,
+            WorkerId::new("local-closure-regression"),
+            "CLOSURE_READY",
+            bootstrap.as_deref(),
+            Duration::from_secs(10),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn source_authority_hierarchy_prevents_nested_snapshot_mutation() {
+        use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+
+        let dir = tempfile::tempdir().unwrap().keep();
+        let parent = dir.join("repository");
+        let nested = parent.join("standalone");
+        std::fs::create_dir_all(nested.join("src")).unwrap();
+        std::fs::write(
+            parent.join("Cargo.toml"),
+            "[package]\nname='parent'\nversion='0.1.0'\n[dependencies]\nchild={path='standalone'}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            nested.join("Cargo.toml"),
+            "[package]\nname='child'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        let source = nested.join("src/lib.rs");
+        let policy = PathTopologyPolicy::new(dir.clone(), dir.join("alias"));
+        // Exercise the production collapse that caused this race: the parent
+        // transfer covers the child, while a child-cwd invocation syncs only
+        // the child. Neither manifest declares a Cargo workspace.
+        let parent_plan = build_sync_closure_plan(
+            &[parent.clone(), nested.clone()],
+            &parent,
+            "parent-revision",
+            &policy,
+        );
+        let nested_plan = build_sync_closure_plan(
+            std::slice::from_ref(&nested),
+            &nested,
+            "child-revision",
+            &policy,
+        );
+        assert_eq!(parent_plan.len(), 1);
+        assert_eq!(nested_plan.len(), 1);
+        assert_ne!(parent_plan[0].remote_root, nested_plan[0].remote_root);
+        let parent_roots = vec![parent_plan[0].remote_root.clone()];
+        let nested_roots = vec![nested_plan[0].remote_root.clone()];
+
+        // Prove exclusion in both directions: ancestor writes versus a child
+        // reader, and child writes versus an ancestor reader.
+        for (reader_roots, writer_roots) in [
+            (&parent_roots, &nested_roots),
+            (&nested_roots, &parent_roots),
+        ] {
+            std::fs::write(&source, "revision A\n").unwrap();
+            let first = claim_test_source_closure(reader_roots).await;
+            let mut reader = Command::new("sh")
+                .args([
+                    "-c",
+                    "cat -- \"$1\"; IFS= read -r resume; cat -- \"$1\"",
+                    "snapshot-reader",
+                ])
+                .arg(&source)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let mut lines = BufReader::new(reader.stdout.take().unwrap()).lines();
+            assert_eq!(
+                timeout(Duration::from_secs(5), lines.next_line())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .as_deref(),
+                Some("revision A")
+            );
+            let mut competing_sync = Box::pin(async {
+                let second = claim_test_source_closure(writer_roots).await;
+                let status = Command::new("sh")
+                    .args(["-c", "printf 'revision B\\n' > \"$1\"", "snapshot-writer"])
+                    .arg(&source)
+                    .kill_on_drop(true)
+                    .status()
+                    .await
+                    .unwrap();
+                assert!(status.success());
+                second.release().await.unwrap();
+            });
+            let early_write = timeout(Duration::from_millis(150), &mut competing_sync).await;
+            assert_eq!(
+                std::fs::read_to_string(&source).unwrap(),
+                "revision A\n",
+                "a concurrent closure sync changed bytes while the reader was active"
+            );
+            assert!(
+                early_write.is_err(),
+                "overlapping sync acquired before reader exit"
+            );
+            reader
+                .stdin
+                .as_mut()
+                .unwrap()
+                .write_all(b"resume\n")
+                .await
+                .unwrap();
+            assert_eq!(
+                timeout(Duration::from_secs(5), lines.next_line())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .as_deref(),
+                Some("revision A")
+            );
+            assert!(
+                timeout(Duration::from_secs(5), reader.wait())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .success()
+            );
+            first.release().await.unwrap();
+            timeout(Duration::from_secs(10), competing_sync)
+                .await
+                .unwrap();
+            assert_eq!(std::fs::read_to_string(&source).unwrap(), "revision B\n");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn source_authority_hierarchy_disjoint_siblings_proceed_concurrently() {
+        let dir = tempfile::tempdir().unwrap().keep();
+        let first_root = dir.join("left");
+        let second_root = dir.join("right");
+        std::fs::create_dir_all(&first_root).unwrap();
+        std::fs::create_dir_all(&second_root).unwrap();
+        let mut first = claim_test_source_closure(&[first_root.display().to_string()]).await;
+        let second = timeout(
+            Duration::from_secs(5),
+            claim_test_source_closure(&[second_root.display().to_string()]),
+        )
+        .await
+        .expect("shared ancestors must not serialize disjoint sibling closures");
+        let source = second_root.join("source");
+        let status = Command::new("sh")
+            .args(["-c", "printf 'second writer' > \"$1\"", "sibling-writer"])
+            .arg(&source)
+            .kill_on_drop(true)
+            .status()
+            .await
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(std::fs::read_to_string(source).unwrap(), "second writer");
+        first.ensure_held().unwrap();
+        second.release().await.unwrap();
+        first.release().await.unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn source_authority_hierarchy_reversed_multi_root_claims_finish() {
+        async fn read_under_closure(roots: &[String], source: &Path) -> Vec<u8> {
+            let guard = claim_test_source_closure(roots).await;
+            let output = Command::new("cat")
+                .arg(source)
+                .kill_on_drop(true)
+                .output()
+                .await
+                .unwrap();
+            assert!(output.status.success());
+            guard.release().await.unwrap();
+            output.stdout
+        }
+        let dir = tempfile::tempdir().unwrap().keep();
+        let parent = dir.join("a");
+        let nested = parent.join("child");
+        let sibling = dir.join("z");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
+        let source = nested.join("source");
+        std::fs::write(&source, "one coherent revision").unwrap();
+        let forward = vec![
+            nested.display().to_string(),
+            parent.display().to_string(),
+            sibling.display().to_string(),
+        ];
+        let reverse = forward.iter().rev().cloned().collect::<Vec<_>>();
+        let (first, second) = timeout(Duration::from_secs(10), async {
+            tokio::join!(
+                read_under_closure(&forward, &source),
+                read_under_closure(&reverse, &source)
+            )
+        })
+        .await
+        .expect("reversed overlapping root sets deadlocked");
+        assert_eq!(first, b"one coherent revision");
+        assert_eq!(second, b"one coherent revision");
+    }
+
     /// How long a test may wait to ACQUIRE a source-authority lock.
     ///
     /// Generous on purpose. What these tests assert is serialization —
@@ -1573,9 +1908,12 @@ cat "$RCH_OWNERSHIP_TEST_DIR/payload"
     ) {
         use std::io::BufRead as _;
 
-        let command =
-            build_remote_source_authority_lock_cmd("/tmp", &[lock_path.to_string()], marker)
-                .expect("build source lock command");
+        let command = build_remote_source_authority_lock_cmd(
+            "/tmp",
+            &exclusive_source_locks(&[lock_path.to_string()]),
+            marker,
+        )
+        .expect("build source lock command");
         let mut child = std::process::Command::new("sh")
             .arg("-lc")
             .arg(command)
@@ -1680,7 +2018,9 @@ cat "$RCH_OWNERSHIP_TEST_DIR/payload"
                 .into_owned(),
         ];
         let marker = "READY ' \" % ! & $()";
-        let script = build_remote_source_authority_lock_cmd(root, &locks, marker).unwrap();
+        let script =
+            build_remote_source_authority_lock_cmd(root, &exclusive_source_locks(&locks), marker)
+                .unwrap();
         let (child, bootstrap) = local_source_lock_transport(WorkerPlatform::Windows, &script);
         let mut first = finish_source_authority_lock_acquisition(
             child,
@@ -2836,14 +3176,32 @@ exec /bin/ln \"$@\"\n",
         assert!(build_remote_source_authority_lock_cmd("/tmp", &[], "READY").is_err());
         for path in ["relative", "/tmp/a\n/tmp/b", "/tmp/a\r", "/tmp/a\0b"] {
             let paths = vec!["/tmp/valid".to_owned(), path.to_owned()];
-            assert!(build_remote_source_authority_lock_cmd("/tmp", &paths, "READY").is_err());
+            assert!(
+                build_remote_source_authority_lock_cmd(
+                    "/tmp",
+                    &exclusive_source_locks(&paths),
+                    "READY"
+                )
+                .is_err()
+            );
         }
         let duplicate = vec!["/tmp/same".to_owned(); 2];
-        assert!(build_remote_source_authority_lock_cmd("/tmp", &duplicate, "READY").is_err());
+        assert!(
+            build_remote_source_authority_lock_cmd(
+                "/tmp",
+                &exclusive_source_locks(&duplicate),
+                "READY"
+            )
+            .is_err()
+        );
         for marker in ["", "READY\nFORGED", "READY\r", "READY\0"] {
             assert!(
-                build_remote_source_authority_lock_cmd("/tmp", &["/tmp/one".into()], marker)
-                    .is_err()
+                build_remote_source_authority_lock_cmd(
+                    "/tmp",
+                    &exclusive_source_locks(&["/tmp/one".into()]),
+                    marker
+                )
+                .is_err()
             );
         }
     }
@@ -2884,9 +3242,12 @@ exec /bin/ln \"$@\"\n",
             .display()
             .to_string();
         let marker = "READY ' \" $() ; `literal`";
-        let script =
-            build_remote_source_authority_lock_cmd(lock_dir.to_str().unwrap(), &locks, marker)
-                .unwrap();
+        let script = build_remote_source_authority_lock_cmd(
+            lock_dir.to_str().unwrap(),
+            &exclusive_source_locks(&locks),
+            marker,
+        )
+        .unwrap();
         assert!(script.len() > 128 * 1024);
         for platform in [WorkerPlatform::Posix, WorkerPlatform::Windows] {
             let (child, bootstrap) = local_source_lock_transport(platform, &script);
@@ -2925,7 +3286,7 @@ exec /bin/ln \"$@\"\n",
             );
             let overlap = build_remote_source_authority_lock_cmd(
                 lock_dir.to_str().unwrap(),
-                std::slice::from_ref(&locks[547]),
+                &exclusive_source_locks(std::slice::from_ref(&locks[547])),
                 "SECOND",
             )
             .unwrap();
@@ -2960,7 +3321,12 @@ exec /bin/ln \"$@\"\n",
             .collect::<Vec<_>>();
         let script = format!(
             "ulimit -n 16\n{}",
-            build_remote_source_authority_lock_cmd(dir.to_str().unwrap(), &locks, "READY").unwrap()
+            build_remote_source_authority_lock_cmd(
+                dir.to_str().unwrap(),
+                &exclusive_source_locks(&locks),
+                "READY"
+            )
+            .unwrap()
         );
         let (child, bootstrap) = local_source_lock_transport(WorkerPlatform::Posix, &script);
         let result = finish_source_authority_lock_acquisition(
@@ -2988,7 +3354,7 @@ exec /bin/ln \"$@\"\n",
         let b = dir.join("b.lock").display().to_string();
         let first_script = build_remote_source_authority_lock_cmd(
             dir.to_str().unwrap(),
-            std::slice::from_ref(&b),
+            &exclusive_source_locks(std::slice::from_ref(&b)),
             "FIRST",
         )
         .unwrap();
@@ -3004,7 +3370,7 @@ exec /bin/ln \"$@\"\n",
         .unwrap();
         let script = build_remote_source_authority_lock_cmd(
             dir.to_str().unwrap(),
-            &[a.clone(), b.clone()],
+            &exclusive_source_locks(&[a.clone(), b.clone()]),
             "SECOND",
         )
         .unwrap();
