@@ -173,6 +173,42 @@ fn cache_is_disabled() -> bool {
     std::env::var_os("RCH_DISABLE_CONFIG_CACHE").is_some_and(|v| v != "0" && !v.is_empty())
 }
 
+/// The project `.rch/config.toml` for the current directory.
+///
+/// The nearest `.rch/config.toml` from the current directory up to AND
+/// including the enclosing git work-tree root, like Cargo's own config
+/// discovery. It used to be `<cwd>/.rch/config.toml` only, so running cargo
+/// from any subdirectory crate silently ignored the repo's project config.
+/// phage_explorer's `force_local = true` offloaded every
+/// `packages/wasm-compute` build, and the repo had to document an
+/// `RCH_CARGO_WRAPPER_BYPASS=1` workaround instead.
+///
+/// The walk never crosses the git root, so a `.rch/` above the repo (e.g.
+/// `~/.rch/`, which holds the shims) is never mistaken for project config.
+/// Outside a git work tree only the current directory is consulted, which
+/// is the previous behavior.
+fn project_config_path() -> PathBuf {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    find_project_config_from(&cwd).unwrap_or_else(|| cwd.join(".rch/config.toml"))
+}
+
+fn find_project_config_from(start: &Path) -> Option<PathBuf> {
+    let git_root = start.ancestors().find(|dir| dir.join(".git").exists());
+    find_project_config_within(start, git_root)
+}
+
+fn find_project_config_within(start: &Path, git_root: Option<&Path>) -> Option<PathBuf> {
+    let Some(git_root) = git_root else {
+        let candidate = start.join(".rch/config.toml");
+        return candidate.is_file().then_some(candidate);
+    };
+    start
+        .ancestors()
+        .take_while(|dir| dir.starts_with(git_root))
+        .map(|dir| dir.join(".rch/config.toml"))
+        .find(|candidate| candidate.is_file())
+}
+
 /// Resolve the user + project config paths in canonical order. Used both
 /// by the cache and by `load_config_uncached` so the source fingerprints
 /// match the actual files read.
@@ -181,10 +217,7 @@ fn resolved_source_paths() -> Vec<PathBuf> {
     if let Some(dir) = config_dir() {
         out.push(dir.join("config.toml"));
     }
-    let project_config = std::env::current_dir()
-        .map(|dir| dir.join(".rch/config.toml"))
-        .unwrap_or_else(|_| PathBuf::from(".rch/config.toml"));
-    out.push(project_config);
+    out.push(project_config_path());
     out
 }
 
@@ -316,9 +349,7 @@ fn load_config_uncached() -> Result<RchConfig> {
     let user_path = config_dir().map(|dir| dir.join("config.toml"));
     let user_path = user_path.as_deref().filter(|path| path.exists());
 
-    let project_path = std::env::current_dir()
-        .map(|dir| dir.join(".rch/config.toml"))
-        .unwrap_or_else(|_| PathBuf::from(".rch/config.toml"));
+    let project_path = project_config_path();
     let project_path = if project_path.exists() {
         Some(project_path.as_path())
     } else {
@@ -742,7 +773,7 @@ struct PartialSelfTestConfig {
 /// Load configuration with source tracking.
 pub fn load_config_with_sources() -> Result<LoadedConfig> {
     let user_path = config_dir().map(|d| d.join("config.toml"));
-    let project_path = PathBuf::from(".rch/config.toml");
+    let project_path = project_config_path();
 
     let user_path = user_path.as_deref().filter(|p| p.exists());
     let project_path = project_path.as_path();
@@ -5976,5 +6007,78 @@ confidence_threshold = 0.80
             runtime_config.general.log_level, "error",
             "runtime env override should still apply after cache lookup"
         );
+    }
+
+    fn write_project_config(dir: &Path) -> PathBuf {
+        let path = dir.join(".rch/config.toml");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "[general]\nforce_local = true\n").unwrap();
+        path
+    }
+
+    /// phage_explorer shape: repo-root `.rch/config.toml`, cargo run from a
+    /// nested crate. The root config must apply (it used to be ignored).
+    #[test]
+    fn project_config_is_found_from_a_nested_crate_up_to_the_git_root() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir(repo.path().join(".git")).unwrap();
+        let root_config = write_project_config(repo.path());
+        let crate_dir = repo.path().join("packages/wasm-compute");
+        std::fs::create_dir_all(&crate_dir).unwrap();
+
+        assert_eq!(
+            find_project_config_from(&crate_dir),
+            Some(root_config.clone())
+        );
+        assert_eq!(find_project_config_from(repo.path()), Some(root_config));
+    }
+
+    #[test]
+    fn nearest_project_config_wins_over_the_repo_root() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir(repo.path().join(".git")).unwrap();
+        write_project_config(repo.path());
+        let member = repo.path().join("crates/member");
+        let member_config = write_project_config(&member);
+
+        assert_eq!(
+            find_project_config_from(&member.join("src")),
+            Some(member_config)
+        );
+    }
+
+    /// Planted negative: a `.rch/config.toml` ABOVE the git root (e.g. the
+    /// `~/.rch/` shim directory) must never be read as project config, and
+    /// outside any git work tree only the current directory counts.
+    #[test]
+    fn project_config_search_never_crosses_the_git_root() {
+        let outer = tempfile::tempdir().unwrap();
+        write_project_config(outer.path());
+        let repo = outer.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let nested = repo.join("a/b");
+        std::fs::create_dir_all(&nested).unwrap();
+        assert_eq!(find_project_config_from(&nested), None);
+
+        // Outside any git work tree only the current directory counts: a
+        // subdirectory does not inherit its parent's config. (Explicit
+        // `None` root: a tempdir can itself sit inside some outer repo.)
+        let plain = tempfile::tempdir().unwrap();
+        write_project_config(plain.path());
+        let sub = plain.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        assert_eq!(find_project_config_within(&sub, None), None);
+        assert!(find_project_config_within(plain.path(), None).is_some());
+    }
+
+    /// Git worktrees have a `.git` FILE, not a directory; that is still the root.
+    #[test]
+    fn git_worktree_file_marks_the_root() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(repo.path().join(".git"), "gitdir: /elsewhere\n").unwrap();
+        let root_config = write_project_config(repo.path());
+        let nested = repo.path().join("x");
+        std::fs::create_dir(&nested).unwrap();
+        assert_eq!(find_project_config_from(&nested), Some(root_config));
     }
 }
