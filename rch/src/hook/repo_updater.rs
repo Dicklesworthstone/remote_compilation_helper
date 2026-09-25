@@ -27,7 +27,9 @@
 //! consumed from outside the moved set (`execute_remote_compilation` and the
 //! hook test suite) are `pub(super)`; everything else stays private.
 
-use super::ssh::{run_offload_ssh_command, should_skip_remote_preflight};
+use super::ssh::{
+    run_offload_ssh_command, should_skip_remote_preflight, wrap_remote_source_activity,
+};
 use super::*;
 
 fn repo_updater_timeout_for(
@@ -108,7 +110,8 @@ async fn execute_repo_updater_command(
     sync_roots: &[PathBuf],
     command: RepoUpdaterAdapterCommand,
     reporter: &HookReporter,
-) -> bool {
+    source_identity: Option<&str>,
+) -> anyhow::Result<bool> {
     let mut request = base_request.clone();
     let timeout_secs = repo_updater_timeout_for(contract, command);
     request.command = command;
@@ -134,11 +137,25 @@ async fn execute_repo_updater_command(
             err,
             err.remediation()
         ));
-        return false;
+        return Ok(false);
     }
 
     let invocation = build_invocation(&request, contract);
     let remote_cmd = build_repo_updater_remote_command(&invocation);
+    const UNAVAILABLE: &[u8] = b"RCH_REPO_UPDATER_UNAVAILABLE\n";
+    let remote_cmd = match source_identity {
+        Some(identity) => {
+            // The optional adapter may be absent. Prove that before invoking
+            // it; after an invoked mutator fails, cancel instead of continuing
+            // toward execution while one of its children might survive.
+            let checked = format!(
+                "if ! command -v {} >/dev/null 2>&1; then printf 'RCH_REPO_UPDATER_UNAVAILABLE\\n'; exit 0; fi; {remote_cmd}",
+                shell_escape::escape(invocation.binary.as_str().into())
+            );
+            wrap_remote_source_activity(&checked, identity)?
+        }
+        None => remote_cmd,
+    };
     let retry_policy = &contract.retry_policy;
     let max_attempts = retry_policy.max_attempts.max(1);
     let mut backoff_ms = retry_policy.initial_backoff_ms;
@@ -163,6 +180,12 @@ async fn execute_repo_updater_command(
         match run_offload_ssh_command(worker, &remote_cmd, Duration::from_secs(timeout_secs)).await
         {
             Ok(output) if output.status.success() => {
+                if source_identity.is_some() && output.stdout == UNAVAILABLE {
+                    reporter.verbose(
+                        "[RCH] repo_updater unavailable; using direct source synchronization",
+                    );
+                    return Ok(false);
+                }
                 if attempt > 0 {
                     reporter.verbose(&format!(
                         "[RCH] repo_updater {} succeeded on attempt {}/{} for {} repositories on {}",
@@ -180,7 +203,13 @@ async fn execute_repo_updater_command(
                         worker.id
                     ));
                 }
-                return true;
+                return Ok(true);
+            }
+            Ok(output) if source_identity.is_some() => {
+                anyhow::bail!(
+                    "repo_updater failed; source preparation must be cancelled before continuing: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
             }
             Ok(output) => {
                 let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -201,8 +230,13 @@ async fn execute_repo_updater_command(
                         max_attempts,
                         worker.id
                     ));
-                    return false;
+                    return Ok(false);
                 }
+            }
+            Err(err) if source_identity.is_some() => {
+                return Err(err.context(
+                    "repo_updater source preparation remains unconfirmed; cancellation required",
+                ));
             }
             Err(err) => {
                 warn!(
@@ -221,13 +255,13 @@ async fn execute_repo_updater_command(
                         max_attempts,
                         worker.id
                     ));
-                    return false;
+                    return Ok(false);
                 }
             }
         }
     }
 
-    false
+    Ok(false)
 }
 
 fn parse_csv_env_var(var_name: &str) -> Option<Vec<String>> {
@@ -566,19 +600,20 @@ pub(super) async fn maybe_sync_repo_set_with_repo_updater(
     worker: &WorkerConfig,
     sync_roots: &[PathBuf],
     reporter: &HookReporter,
-) {
+    source_identity: Option<&str>,
+) -> anyhow::Result<()> {
     if sync_roots.len() <= 1 {
-        return;
+        return Ok(());
     }
     if should_skip_remote_preflight(worker) {
         reporter.verbose("[RCH] repo_updater pre-sync skipped in mock mode");
-        return;
+        return Ok(());
     }
 
     let repo_updater_roots = collect_repo_updater_roots_and_specs(sync_roots).await;
     if repo_updater_roots.specs.is_empty() {
         reporter.verbose("[RCH] repo_updater pre-sync skipped (no git origin remotes found)");
-        return;
+        return Ok(());
     }
 
     let dirty_roots = detect_dirty_sync_roots(&repo_updater_roots.roots).await;
@@ -591,11 +626,12 @@ pub(super) async fn maybe_sync_repo_set_with_repo_updater(
         reporter.verbose(&format!(
             "[RCH] repo_updater pre-sync skipped (dirty local sync roots: {joined})"
         ));
-        return;
+        return Ok(());
     }
 
     let remote_unsuitable_roots =
-        detect_remote_unsuitable_sync_roots(worker, &repo_updater_roots.roots).await;
+        detect_remote_unsuitable_sync_roots(worker, &repo_updater_roots.roots, source_identity)
+            .await?;
     if !remote_unsuitable_roots.is_empty() {
         let joined = remote_unsuitable_roots
             .iter()
@@ -606,7 +642,7 @@ pub(super) async fn maybe_sync_repo_set_with_repo_updater(
             "[RCH] repo_updater pre-sync skipped (dirty/broken remote sync roots on {}: {joined})",
             worker.id
         ));
-        return;
+        return Ok(());
     }
 
     let mut contract = RepoUpdaterAdapterContract::default();
@@ -681,7 +717,7 @@ pub(super) async fn maybe_sync_repo_set_with_repo_updater(
             err,
             err.remediation()
         ));
-        return;
+        return Ok(());
     }
 
     // Read-only convergence preflight to surface policy/auth/drift issues before mutation.
@@ -692,8 +728,9 @@ pub(super) async fn maybe_sync_repo_set_with_repo_updater(
         &repo_updater_roots.roots,
         RepoUpdaterAdapterCommand::SyncDryRun,
         reporter,
+        source_identity,
     )
-    .await;
+    .await?;
     if !dry_run_ok {
         reporter.verbose(
             "[RCH] repo_updater dry-run did not complete cleanly; attempting sync apply anyway",
@@ -707,8 +744,9 @@ pub(super) async fn maybe_sync_repo_set_with_repo_updater(
         &repo_updater_roots.roots,
         RepoUpdaterAdapterCommand::SyncApply,
         reporter,
+        source_identity,
     )
-    .await;
+    .await?;
     if sync_apply_ok {
         // Post-apply non-mutating snapshot for diagnostics and observability.
         let _ = execute_repo_updater_command(
@@ -718,9 +756,11 @@ pub(super) async fn maybe_sync_repo_set_with_repo_updater(
             &repo_updater_roots.roots,
             RepoUpdaterAdapterCommand::StatusNoFetch,
             reporter,
+            source_identity,
         )
-        .await;
+        .await?;
     }
+    Ok(())
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -795,12 +835,17 @@ async fn detect_dirty_sync_roots(sync_roots: &[PathBuf]) -> Vec<PathBuf> {
 async fn detect_remote_unsuitable_sync_roots(
     worker: &WorkerConfig,
     sync_roots: &[PathBuf],
-) -> Vec<(PathBuf, String)> {
+    source_identity: Option<&str>,
+) -> anyhow::Result<Vec<(PathBuf, String)>> {
     let mut unsuitable = Vec::new();
 
     for root in sync_roots {
         let escaped_root = shell_escape::escape(root.to_string_lossy()).to_string();
-        let command = format!("git -C {escaped_root} status --porcelain");
+        let command = format!("GIT_OPTIONAL_LOCKS=0 git -C {escaped_root} status --porcelain");
+        let command = match source_identity {
+            Some(identity) => wrap_remote_source_activity(&command, identity)?,
+            None => command,
+        };
 
         match run_offload_ssh_command(worker, &command, Duration::from_secs(10)).await {
             Ok(output) if output.status.success() => {
@@ -808,6 +853,11 @@ async fn detect_remote_unsuitable_sync_roots(
                 if !stdout.trim().is_empty() {
                     unsuitable.push((root.clone(), "dirty".to_string()));
                 }
+            }
+            Ok(output)
+                if source_identity.is_some() && !matches!(output.status.code(), Some(0..=254)) =>
+            {
+                anyhow::bail!("remote repository status transport ended without completion");
             }
             Ok(output) => {
                 let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -818,9 +868,10 @@ async fn detect_remote_unsuitable_sync_roots(
                 };
                 unsuitable.push((root.clone(), reason));
             }
+            Err(err) if source_identity.is_some() => return Err(err),
             Err(err) => unsuitable.push((root.clone(), format!("status probe error: {err}"))),
         }
     }
 
-    unsuitable
+    Ok(unsuitable)
 }

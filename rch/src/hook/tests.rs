@@ -3697,6 +3697,10 @@ fn test_unconfirmed_remote_execution_retains_ownership_and_never_falls_back() {
             .context("remote pipeline failed"),
         anyhow::anyhow!("missing durable completion receipt")
             .context(crate::transfer::RemoteExecutionUnconfirmed),
+        anyhow::Error::new(TransferError::TransferSkipped {
+            reason: "transfer budget".to_owned(),
+        })
+        .context(crate::transfer::RemoteExecutionUnconfirmed),
     ] {
         assert!(is_remote_execution_unconfirmed(&error));
         assert_eq!(
@@ -6045,7 +6049,7 @@ async fn test_verify_remote_dependency_manifests_blocks_stale_outcomes_determini
     )];
     let reporter = HookReporter::new(OutputVisibility::Verbose);
 
-    let err = verify_remote_dependency_manifests(&worker, &outcomes, &reporter)
+    let err = verify_remote_dependency_manifests(&worker, &outcomes, &reporter, None)
         .await
         .expect_err("stale dependency evidence should block remote execution");
     let preflight = err

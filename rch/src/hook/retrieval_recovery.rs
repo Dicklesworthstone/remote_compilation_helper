@@ -1,4 +1,4 @@
-//! Identity-bound collection only. This module never stores or replays a command.
+//! Durable source ownership and identity-bound collection. Never replays a command.
 use super::*;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -27,6 +27,14 @@ pub(crate) struct RecoveryRecipe {
     exit_code: Option<i32>,
     returned: Option<i32>,
     #[serde(default)]
+    prepared: bool,
+    #[serde(default)]
+    execution_started: bool,
+    #[serde(default)]
+    preparation_cancelled: bool,
+    #[serde(default)]
+    sources_released: bool,
+    #[serde(default)]
     tree_retired: bool,
     #[serde(default)]
     pair_released: bool,
@@ -54,10 +62,6 @@ pub(crate) struct RecoverySession {
     recipe: RecoveryRecipe,
     writer: DurableLeaseWriter,
     _output_locks: Vec<File>,
-}
-
-fn quote(value: &str) -> String {
-    shell_escape::escape(value.into()).into_owned()
 }
 
 fn fingerprint(path: &Path) -> anyhow::Result<Option<String>> {
@@ -127,47 +131,67 @@ fn local_locks(roots: impl Iterator<Item = PathBuf>) -> anyhow::Result<Vec<File>
     }).collect()
 }
 
-pub(crate) fn owner_marker(root: &str) -> String {
-    let mut hash = blake3::Hasher::new();
-    hash.update(b"rch.remote_source_authority_lock.v1\0");
-    hash.update(root.as_bytes());
-    format!(
-        "/tmp/rch-source-authority-locks/{}.recovery-owner",
-        hash.finalize().to_hex()
-    )
-}
-
-pub(crate) async fn claim_sources(
-    worker: &WorkerConfig,
-    roots: &[String],
-    identity: &str,
-) -> anyhow::Result<()> {
-    let mut script =
-        String::from("set -eu; umask 077; mkdir -p /tmp/rch-source-authority-locks;\n");
-    for root in roots {
-        let marker = owner_marker(root);
-        script.push_str(&format!(
-            "[ ! -L {m} ]; printf '%s\\n' {i} > {m}.pending; mv -f -- {m}.pending {m};\n",
-            m = quote(&marker),
-            i = quote(identity)
-        ));
-    }
-    let output = super::super::ssh::run_offload_ssh_command_with_stdin(
-        worker,
-        "sh -s",
-        script.as_bytes(),
-        Duration::from_secs(30),
-    )
-    .await?;
-    anyhow::ensure!(
-        output.status.success(),
-        "cannot claim exact remote source ownership: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    Ok(())
-}
-
 impl RecoverySession {
+    /// Save the recovery identity before even a queued remote grant can exist.
+    /// Until `starting_execution` is durable, recovery can drain transfers and
+    /// cancel this exact preparation without replaying a compiler command.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn begin(
+        writer: &DurableLeaseWriter,
+        worker: &WorkerConfig,
+        source_roots: Vec<String>,
+        pair: Option<(String, String)>,
+        retire_root: Option<String>,
+        transfer: TransferConfig,
+        project_root: PathBuf,
+        identity: String,
+    ) -> anyhow::Result<()> {
+        let lease = writer.snapshot();
+        let build_id = lease
+            .identity
+            .remote_build_id
+            .context("source ownership requires admitted build identity")?;
+        anyhow::ensure!(
+            lease.worker_id.as_deref() == Some(worker.id.as_str()) && lease.recovery.is_none(),
+            "source ownership requires a fresh admitted lease; recover the previous attempt first"
+        );
+        let completion = format!(
+            "{}/recovery-{}-{}.done",
+            transfer.remote_base.trim_end_matches('/'),
+            build_id,
+            identity
+        );
+        let recipe = RecoveryRecipe {
+            version: 2,
+            wrapper_id: lease.identity.local_wrapper_id,
+            build_id,
+            worker: worker.clone(),
+            identity,
+            completion,
+            source_roots,
+            pair,
+            retire_root,
+            transfer,
+            project_root,
+            kind: None,
+            expected_triple: String::new(),
+            pinned_triple: None,
+            allow_foreign: false,
+            package_archive: false,
+            phases: Vec::new(),
+            exit_code: None,
+            returned: None,
+            prepared: false,
+            execution_started: false,
+            preparation_cancelled: false,
+            sources_released: false,
+            tree_retired: false,
+            pair_released: false,
+            retired: false,
+        };
+        writer.set_recovery(serde_json::to_value(recipe)?)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn prepare(
         writer: &DurableLeaseWriter,
@@ -188,6 +212,26 @@ impl RecoverySession {
         // collection-only and has no command to reparse after the wrapper dies.
         let kind = artifact_delivery_kind(kind, Some(command));
         let lease = writer.snapshot();
+        let intent: RecoveryRecipe = serde_json::from_value(
+            lease
+                .recovery
+                .clone()
+                .context("output preparation requires the persisted source intent")?,
+        )?;
+        anyhow::ensure!(
+            intent.version == 2
+                && intent.identity == identity
+                && intent.wrapper_id == lease.identity.local_wrapper_id
+                && Some(intent.build_id) == lease.identity.remote_build_id
+                && intent.worker.id == worker.id
+                && intent.source_roots == source_roots
+                && intent.pair == pair
+                && intent.retire_root == retire_root
+                && !intent.execution_started
+                && !intent.preparation_cancelled
+                && !intent.retired,
+            "output preparation cannot replace another source ownership intent"
+        );
         let build_id = lease
             .identity
             .remote_build_id
@@ -286,7 +330,7 @@ impl RecoverySession {
         }
         let pinned_triple = explicit_target_triple_for_command(command);
         let recipe = RecoveryRecipe {
-            version: 1,
+            version: 2,
             wrapper_id: lease.identity.local_wrapper_id,
             build_id,
             worker: worker.clone(),
@@ -307,6 +351,10 @@ impl RecoverySession {
             phases,
             exit_code: None,
             returned: None,
+            prepared: true,
+            execution_started: false,
+            preparation_cancelled: false,
+            sources_released: false,
             tree_retired: false,
             pair_released: false,
             retired: false,
@@ -329,7 +377,22 @@ impl RecoverySession {
             .with_recovery_completion(self.recipe.completion.clone(), self.recipe.identity.clone())
     }
     pub(crate) fn completed(&mut self, exit: i32) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.recipe.execution_started,
+            "completion requires an admitted execution attempt"
+        );
         self.recipe.exit_code = Some(exit);
+        self.persist()
+    }
+    pub(crate) fn starting_execution(&mut self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.recipe.prepared
+                && !self.recipe.execution_started
+                && !self.recipe.preparation_cancelled
+                && !self.recipe.sources_released,
+            "execution requires an unconsumed prepared source grant"
+        );
+        self.recipe.execution_started = true;
         self.persist()
     }
     fn stage(&self, index: usize) -> PathBuf {
@@ -447,6 +510,10 @@ impl RecoverySession {
         self.recipe.pair_released = true;
         self.persist()
     }
+    pub(crate) fn sources_released(&mut self) -> anyhow::Result<()> {
+        self.recipe.sources_released = true;
+        self.persist()
+    }
     pub(crate) fn retired(&mut self) -> anyhow::Result<()> {
         anyhow::ensure!(
             self.recipe.returned.is_some(),
@@ -460,13 +527,21 @@ impl RecoverySession {
             self.recipe.pair.is_none() || self.recipe.pair_released,
             "source-pair release is outstanding"
         );
+        anyhow::ensure!(
+            self.recipe.source_roots.is_empty() || self.recipe.sources_released,
+            "remote source release is outstanding"
+        );
         self.recipe.retired = true;
         self.persist()
     }
-    async fn retire_returned(&mut self) -> anyhow::Result<()> {
+    pub(crate) async fn retire_returned(&mut self) -> anyhow::Result<()> {
         if self.recipe.retired {
             return Ok(());
         }
+        anyhow::ensure!(
+            self.recipe.returned.is_some(),
+            "cannot retire outputs before durable return"
+        );
         let worker = self.recipe.worker.clone();
         let mut pair = if !self.recipe.pair_released {
             if let Some((root, token)) = self.recipe.pair.clone() {
@@ -492,33 +567,39 @@ impl RecoverySession {
         } else {
             None
         };
-        if !self.recipe.tree_retired {
-            let mut sources = super::super::ssh::acquire_remote_source_authority_lock(
-                &worker,
-                &self.recipe.source_roots,
-                pair.as_mut(),
-                Duration::from_secs(15),
-            )
-            .await?;
-            let mut script = String::from("set -eu;\n");
-            for root in &self.recipe.source_roots {
-                script.push_str(&format!(
-                    "[ ! -L {m} ] && [ \"$(cat -- {m})\" = {i} ];\n",
-                    m = quote(&owner_marker(root)),
-                    i = quote(&self.recipe.identity),
-                ));
-            }
-            let output = super::super::ssh::run_offload_ssh_command_with_stdin(
-                &worker,
-                "sh -s",
-                script.as_bytes(),
-                Duration::from_secs(30),
-            )
-            .await?;
+        let mut sources = if self.recipe.sources_released || self.recipe.source_roots.is_empty() {
+            None
+        } else if super::super::ssh::remote_source_authority_was_released(
+            &worker,
+            &self.recipe.source_roots,
+            &self.recipe.identity,
+        )
+        .await?
+        {
+            // A release receipt is only a terminal reconciliation fact. It can
+            // never reopen paths which a later invocation may now be writing.
             anyhow::ensure!(
-                output.status.success(),
-                "source ownership changed; refusing stale retirement"
+                self.recipe.tree_retired,
+                "source release preceded durable tree retirement; refusing path access"
             );
+            self.sources_released()?;
+            None
+        } else {
+            Some(
+                super::super::ssh::recover_remote_source_authority_lock(
+                    &worker,
+                    &self.recipe.source_roots,
+                    pair.as_mut(),
+                    &self.recipe.identity,
+                    Duration::from_secs(15),
+                )
+                .await?,
+            )
+        };
+        if !self.recipe.tree_retired {
+            let sources = sources
+                .as_mut()
+                .context("tree retirement requires the active source grant")?;
             sources.ensure_held()?;
             if let Some(pair) = pair.as_mut() {
                 pair.ensure_held()?;
@@ -530,11 +611,15 @@ impl RecoverySession {
                     self.recipe.identity.clone(),
                     self.recipe.transfer.clone(),
                 )
+                .with_source_authority(self.recipe.identity.clone())?
                 .reap_remote_tree(&worker, root)
                 .await?;
             }
             self.tree_retired()?;
+        }
+        if let Some(sources) = sources.take() {
             sources.release().await?;
+            self.sources_released()?;
         }
         if let Some(pair) = pair.take() {
             pair.release().await?;
@@ -544,21 +629,111 @@ impl RecoverySession {
     }
 }
 
-/// Recollect the admitted command's outputs; no execution path is reachable.
-pub(crate) async fn recover_job(writer: &DurableLeaseWriter) -> anyhow::Result<i32> {
+fn load_recipe(writer: &DurableLeaseWriter) -> anyhow::Result<RecoveryRecipe> {
     let lease = writer.snapshot();
     let recipe: RecoveryRecipe = serde_json::from_value(
         lease
             .recovery
-            .context("job has no durable retrieval recipe")?,
+            .context("job has no durable source/retrieval recipe")?,
     )?;
     anyhow::ensure!(
-        recipe.version == 1
+        recipe.version == 2
             && recipe.wrapper_id == lease.identity.local_wrapper_id
             && Some(recipe.build_id) == lease.identity.remote_build_id
             && lease.worker_id.as_deref() == Some(recipe.worker.id.as_str()),
-        "recovery recipe identity mismatch"
+        "recovery recipe identity mismatch or unsupported source ownership version"
     );
+    Ok(recipe)
+}
+
+/// Cancel only preparation. The remote activity fence drains surviving sync
+/// processes and denies late arrivals before any root becomes writable again.
+/// Once execution might have started, only its exact completion can retire it.
+pub(crate) async fn cancel_preparation(writer: &DurableLeaseWriter) -> anyhow::Result<bool> {
+    let recipe = load_recipe(writer)?;
+    if recipe.retired {
+        return Ok(true);
+    }
+    if recipe.execution_started {
+        return Ok(false);
+    }
+    let mut session = RecoverySession {
+        recipe,
+        writer: writer.clone(),
+        _output_locks: Vec::new(),
+    };
+    session.recipe.preparation_cancelled = true;
+    session.persist()?;
+    let worker = session.recipe.worker.clone();
+    let owned = super::super::ssh::cancel_remote_source_authority_intent(
+        &worker,
+        &session.recipe.source_roots,
+        &session.recipe.identity,
+    )
+    .await?;
+    let mut pair = if let Some((root, token)) = session.recipe.pair.clone() {
+        super::super::ssh::cancel_clean_overlay_source_pair_intent(
+            &worker,
+            &root,
+            &token,
+            Duration::from_secs(15),
+        )
+        .await?
+    } else {
+        None
+    };
+    anyhow::ensure!(
+        owned || pair.is_none(),
+        "cancelled intent without a source grant cannot acquire a source pair"
+    );
+    if owned {
+        if let Some(pair) = pair.as_mut() {
+            pair.ensure_held()?;
+        }
+        if let Some(root) = session.recipe.retire_root.as_ref() {
+            // The full durable grant still excludes every overlapping owner.
+            // Cleanup activity survives its SSH client and is drained again
+            // before final cancellation can make these paths writable.
+            TransferPipeline::new(
+                session.recipe.project_root.clone(),
+                "recovery".into(),
+                session.recipe.identity.clone(),
+                session.recipe.transfer.clone(),
+            )
+            .with_source_authority_cleanup(session.recipe.identity.clone())?
+            .reap_remote_tree(&worker, root)
+            .await?;
+        }
+        session.tree_retired()?;
+        if let Some(pair) = pair.take() {
+            pair.release().await?;
+        }
+        super::super::ssh::finish_cancel_remote_source_authority_intent(
+            &worker,
+            &session.recipe.source_roots,
+            &session.recipe.identity,
+        )
+        .await?;
+    }
+    // Without a full grant, cancellation only fences delayed acquisition and
+    // abandons pair metadata. The paths may belong to another parent-root job.
+    session.tree_retired()?;
+    session.pair_released()?;
+    session.sources_released()?;
+    session.returned(EXIT_BUILD_ERROR)?;
+    session.retired()?;
+    Ok(true)
+}
+
+/// Recollect the admitted command's outputs; no execution path is reachable.
+pub(crate) async fn recover_job(writer: &DurableLeaseWriter) -> anyhow::Result<i32> {
+    let recipe = load_recipe(writer)?;
+    if !recipe.execution_started {
+        cancel_preparation(writer).await?;
+        writer.record_exit(EXIT_BUILD_ERROR)?;
+        writer.acknowledge_terminal()?;
+        return Ok(EXIT_BUILD_ERROR);
+    }
     if let Some(exit) = recipe.returned {
         let mut session = RecoverySession {
             recipe,
@@ -608,32 +783,15 @@ pub(crate) async fn recover_job(writer: &DurableLeaseWriter) -> anyhow::Result<i
     } else {
         None
     };
-    let mut sources = super::super::ssh::acquire_remote_source_authority_lock(
+    let mut sources = super::super::ssh::recover_remote_source_authority_lock(
         &worker,
         &session.recipe.source_roots,
         pair.as_mut(),
+        &session.recipe.identity,
         Duration::from_secs(15),
     )
     .await?;
-    let mut script = String::from("set -eu;\n");
-    for root in &session.recipe.source_roots {
-        script.push_str(&format!(
-            "[ ! -L {m} ] && [ \"$(cat -- {m})\" = {i} ];\n",
-            m = quote(&owner_marker(root)),
-            i = quote(&session.recipe.identity)
-        ));
-    }
-    let output = super::super::ssh::run_offload_ssh_command_with_stdin(
-        &worker,
-        "sh -s",
-        script.as_bytes(),
-        Duration::from_secs(30),
-    )
-    .await?;
-    anyhow::ensure!(
-        output.status.success(),
-        "source/output ownership changed; refusing stale recovery"
-    );
+    let base = base.with_source_authority(session.recipe.identity.clone())?;
     session.completed(exit)?;
     for index in 0..session.recipe.phases.len() {
         let phase = session.recipe.phases[index].clone();
@@ -698,8 +856,213 @@ pub(crate) async fn recover_job(writer: &DurableLeaseWriter) -> anyhow::Result<i
     }
     session.pair_released()?;
     sources.release().await?;
+    session.sources_released()?;
     session.retired()?;
     writer.record_exit(exit)?;
     writer.acknowledge_terminal()?;
     Ok(exit)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn preparation_fixture() -> (tempfile::TempDir, DurableLeaseWriter, WorkerConfig) {
+        let directory = tempfile::tempdir().unwrap();
+        let worker = WorkerConfig {
+            id: WorkerId::new("source-recovery"),
+            host: "unreachable.invalid".into(),
+            user: "worker".into(),
+            identity_file: "/unused/test-key".into(),
+            total_slots: 1,
+            priority: 100,
+            tags: Vec::new(),
+            tools: Vec::new(),
+        };
+        let writer = DurableLeaseWriter {
+            path: directory.path().join("lease.json"),
+            lease: Arc::new(Mutex::new(DurableJobLease::new(
+                JobIdentity::new_local(),
+                std::process::id(),
+                None,
+                None,
+                0,
+                false,
+                false,
+                "test-command-fingerprint".into(),
+            ))),
+        };
+        writer.admit(41, &worker.id).unwrap();
+        RecoverySession::begin(
+            &writer,
+            &worker,
+            vec!["/data/projects/source-recovery".into()],
+            None,
+            None,
+            TransferConfig::default(),
+            directory.path().to_owned(),
+            "abc123".into(),
+        )
+        .unwrap();
+        (directory, writer, worker)
+    }
+
+    #[test]
+    fn source_intent_is_durable_before_remote_acquisition_and_blocks_re_admission() {
+        let (_directory, writer, worker) = preparation_fixture();
+        let disk: DurableJobLease =
+            serde_json::from_slice(&std::fs::read(&writer.path).unwrap()).unwrap();
+        let recipe: RecoveryRecipe = serde_json::from_value(disk.recovery.unwrap()).unwrap();
+        assert_eq!(recipe.identity, "abc123");
+        assert_eq!(recipe.source_roots, ["/data/projects/source-recovery"]);
+        assert!(!recipe.prepared);
+        assert!(!recipe.execution_started);
+        assert!(recipe.phases.is_empty());
+        assert!(writer.ensure_released_for_retry().is_err());
+        assert!(writer.admit(42, &worker.id).is_err());
+        assert_eq!(writer.snapshot().identity.remote_build_id, Some(41));
+        assert!(writer.acknowledge_terminal().is_err());
+    }
+
+    #[test]
+    fn source_execution_requires_preparation_and_persists_before_launch() {
+        let (_directory, writer, _worker) = preparation_fixture();
+        let mut session = RecoverySession {
+            recipe: load_recipe(&writer).unwrap(),
+            writer: writer.clone(),
+            _output_locks: Vec::new(),
+        };
+        assert!(session.starting_execution().is_err());
+        session.recipe.prepared = true;
+        session.starting_execution().unwrap();
+        let disk: DurableJobLease =
+            serde_json::from_slice(&std::fs::read(&writer.path).unwrap()).unwrap();
+        let recipe: RecoveryRecipe = serde_json::from_value(disk.recovery.unwrap()).unwrap();
+        assert!(recipe.execution_started);
+        assert!(
+            session.starting_execution().is_err(),
+            "a prepared execution is consumed once"
+        );
+    }
+
+    #[test]
+    fn delayed_heartbeat_publication_cannot_roll_back_execution_admission() {
+        let (_directory, writer, _worker) = preparation_fixture();
+        let mut recipe = load_recipe(&writer).unwrap();
+        recipe.prepared = true;
+        let mut session = RecoverySession {
+            recipe,
+            writer: writer.clone(),
+            _output_locks: Vec::new(),
+        };
+        let (captured_tx, captured_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let heartbeat_writer = writer.clone();
+        let older = std::thread::spawn(move || {
+            heartbeat_writer.persist_snapshot(|path, bytes| {
+                captured_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                atomic_write(path, bytes)
+            })
+        });
+        captured_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (starting_tx, starting_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let newer = std::thread::spawn(move || {
+            starting_tx.send(()).unwrap();
+            let result = session.starting_execution();
+            finished_tx.send(()).unwrap();
+            result
+        });
+        starting_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let overtook = finished_rx.recv_timeout(Duration::from_millis(200)).is_ok();
+        // Release both threads before asserting so a failed ordering assertion
+        // never strands a blocked publisher in the test process.
+        release_tx.send(()).unwrap();
+        older.join().unwrap().unwrap();
+        newer.join().unwrap().unwrap();
+        assert!(
+            !overtook,
+            "new execution admission overtook an older pending disk publication"
+        );
+        let disk: DurableJobLease =
+            serde_json::from_slice(&std::fs::read(&writer.path).unwrap()).unwrap();
+        let persisted: RecoveryRecipe = serde_json::from_value(disk.recovery.unwrap()).unwrap();
+        assert!(
+            persisted.execution_started,
+            "a delayed heartbeat replaced the durable execution boundary with Preparing"
+        );
+    }
+
+    #[tokio::test]
+    async fn started_source_intent_cannot_be_cancelled_as_preparation() {
+        let (_directory, writer, _worker) = preparation_fixture();
+        let mut recipe = load_recipe(&writer).unwrap();
+        recipe.prepared = true;
+        recipe.execution_started = true;
+        writer
+            .set_recovery(serde_json::to_value(&recipe).unwrap())
+            .unwrap();
+        let before = std::fs::read(&writer.path).unwrap();
+        assert!(!cancel_preparation(&writer).await.unwrap());
+        assert_eq!(
+            std::fs::read(&writer.path).unwrap(),
+            before,
+            "a started attempt cannot contact the worker's cancellation path or rewrite its journal"
+        );
+    }
+
+    #[test]
+    fn returned_outputs_do_not_authorize_terminal_ack_until_sources_release() {
+        let (_directory, writer, worker) = preparation_fixture();
+        let mut session = RecoverySession {
+            recipe: load_recipe(&writer).unwrap(),
+            writer: writer.clone(),
+            _output_locks: Vec::new(),
+        };
+        session.returned(0).unwrap();
+        session.tree_retired().unwrap();
+        session.pair_released().unwrap();
+        assert!(session.retired().is_err());
+        assert!(writer.acknowledge_terminal().is_err());
+        session.sources_released().unwrap();
+        session.retired().unwrap();
+        writer.record_exit(0).unwrap();
+        writer.acknowledge_terminal().unwrap();
+        writer.ensure_released_for_retry().unwrap();
+        writer.admit(42, &worker.id).unwrap();
+        let next = writer.snapshot();
+        assert!(next.recovery.is_none());
+        assert!(!next.terminal_acknowledged);
+        assert_eq!(next.exit_code, None);
+        assert_eq!(next.identity.remote_build_id, Some(42));
+    }
+
+    #[test]
+    fn unsupported_or_mismatched_source_intent_never_enters_recovery() {
+        let (_directory, writer, _worker) = preparation_fixture();
+        let original = load_recipe(&writer).unwrap();
+        for changed in [
+            {
+                let mut recipe = original.clone();
+                recipe.version = 1;
+                recipe
+            },
+            {
+                let mut recipe = original.clone();
+                recipe.build_id += 1;
+                recipe
+            },
+            {
+                let mut recipe = original.clone();
+                recipe.worker.id = WorkerId::new("other");
+                recipe
+            },
+        ] {
+            writer
+                .set_recovery(serde_json::to_value(changed).unwrap())
+                .unwrap();
+            assert!(load_recipe(&writer).is_err());
+        }
+    }
 }

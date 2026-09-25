@@ -8,11 +8,9 @@
 //! stay in active use far beyond a single command — a long-running build keeps
 //! writing into it (one was observed accumulating ~11.5h of artifacts). So a
 //! per-job dir must **never** be removed merely because some build finished; that
-//! could clip a build still in flight. Instead we remove only dirs that have seen
-//! **no file activity for `idle_hours`** — i.e. finished/abandoned ones. A dir idle
-//! that long cannot be a live job (an active build touches its dir continuously),
-//! so reaping never races a concurrent build on the same project, even when
-//! multiple agents build it on the same worker at once.
+//! could clip a build still in flight. The idle window excludes recently used
+//! directories; durable ownership must also permit deletion because completed
+//! builds can retain quiet outputs until their requesting wrapper recovers.
 //!
 //! This logic is shared by two callers so the predicate cannot drift:
 //!
@@ -32,14 +30,18 @@
 //! — never a bare `target`, never a source dir, never `.git`/`.beads`.
 //!
 //! Pooled dirs (`-pool-`) are SHARED by concurrent jobs with identical build
-//! dimensions. The idle-based predicate already keeps them safe — an actively
-//! building pool dir has a fresh mtime (cargo writes into it continuously), so
-//! it is never evicted while in use — and on top of that they, and the durable
-//! `rch-cargo-cache-*` caches, must clear two LIVENESS GATES before anything
+//! dimensions. Beyond the idle window, pooled targets and the durable
+//! `rch-cargo-cache-*` caches must clear two LIVENESS GATES before anything
 //! removes them: no open file descriptor (or cwd) anywhere under the dir, and
 //! no live process whose command line names it. See [`gate_snapshot_fragment`]
 //! and [`evaluate_gc_candidate`]. A gate that cannot be evaluated counts as
 //! "in use": an error must never make a directory eligible for deletion.
+//!
+//! Worker-wide deletion also shares the durable source registry transaction
+//! with admission. A completed build may retain its outputs for recovery long
+//! after its processes and mtimes go quiet; its active claim still forbids GC.
+
+const SOURCE_CLAIM_REGISTRY: &str = "/tmp/rch-source-authority-locks/claims-v1";
 
 /// The glob patterns matched for reaping. Restricted to per-job / per-pid /
 /// pooled dirs so a bare `target` (or any non-rch dir) is never touched.
@@ -179,9 +181,38 @@ pub fn reap_loop_body_with_event(
     freed_kb: &str,
     trigger: Option<&str>,
 ) -> String {
+    reap_loop_body_with_source_gate(
+        idle_minutes,
+        exclude_token,
+        removed_counter,
+        freed_kb,
+        trigger,
+        false,
+    )
+}
+
+fn reap_loop_body_with_source_gate(
+    idle_minutes: u64,
+    exclude_token: Option<&str>,
+    removed_counter: &str,
+    freed_kb: &str,
+    trigger: Option<&str>,
+    source_gate: bool,
+) -> String {
     let exclude = match exclude_token {
         Some(tok) => format!("[ \"$d\" = \"{tok}\" ] && continue; "),
         None => String::new(),
+    };
+    let (claim, unlock) = if source_gate {
+        (
+            format!(
+                "if ! __gc_source_begin \"$d\"; then printf 'RCH_GC_SKIP {} source-ownership %s\\n' \"$d\"; continue; fi; ",
+                trigger.unwrap_or("ttl")
+            ),
+            "__gc_source_end; ",
+        )
+    } else {
+        (String::new(), "")
     };
     // Account for size only when both counter var names are provided.
     let (size_capture, removal) = if removed_counter.is_empty() || freed_kb.is_empty() {
@@ -213,8 +244,107 @@ pub fn reap_loop_body_with_event(
     format!(
         "[ -d \"$d\" ] || continue; \
          {exclude}\
-         if find \"$d\" -mmin -{idle_minutes} -print -quit 2>/dev/null | grep -q .; then continue; fi; \
-         {size_capture}{removal}"
+         {claim}\
+         if find \"$d\" -mmin -{idle_minutes} -print -quit 2>/dev/null | grep -q .; then {unlock}continue; fi; \
+         {size_capture}{removal}{unlock}"
+    )
+}
+
+/// Keep the metadata lock in the supervising shell from the ownership check
+/// through the final filesystem mutation. No source hierarchy/activity lock is
+/// acquired here, so admission's hierarchy -> metadata order cannot invert.
+/// The HUP-resistant parent retains fd 8 even if a removal tool closes its own
+/// inherited descriptors after the SSH connection disappears. Its durable GC
+/// claim remains after SIGKILL/OOM too; only completed child activity permits
+/// retirement, and an interrupted removal stays unavailable for inspection.
+fn source_claim_gate_fragment(registry: &str) -> String {
+    const GATE: &str = r#"
+trap '' HUP;
+__gc_source_realpath() {
+    __gc_resolved=$(realpath -m -- "$1" && printf '.') || return 1;
+    __gc_resolved=${__gc_resolved%.}; __gc_resolved=${__gc_resolved%?};
+    __gc_lines=$(printf '%s\n' "$__gc_resolved" | wc -l);
+    __gc_cr=$(printf '\r');
+    [ "$__gc_lines" -eq 1 ] || return 1;
+    case "$__gc_resolved" in /*) ;; *) return 1;; esac;
+    case "$__gc_resolved" in *"$__gc_cr"*) return 1;; esac;
+};
+__gc_source_records_free() {
+    __gc_source_realpath "$1" || return 1; __gc_candidate=$__gc_resolved;
+    for __gc_record in "$__gc_source_registry"/*.claim "$__gc_source_registry"/*.pending; do
+        [ -e "$__gc_record" ] || [ -L "$__gc_record" ] || continue;
+        [ ! -L "$__gc_record" ] && [ -f "$__gc_record" ] || return 1;
+        __gc_name=${__gc_record##*/}; __gc_token=${__gc_name%%.*};
+        __gc_digest=${__gc_name#*.}; __gc_digest=${__gc_digest%%.*};
+        case "$__gc_token" in ''|*[!a-f0-9-]*) return 1;; esac;
+        case "$__gc_digest" in *[!a-f0-9]*) return 1;; esac;
+        [ "${#__gc_digest}" -eq 64 ] || return 1;
+        __gc_size=$(wc -c < "$__gc_record") || return 1;
+        [ "$__gc_size" -gt 0 ] && [ "$__gc_size" -le 33554432 ] || return 1;
+        __gc_actual=$(sha256sum -- "$__gc_record") || return 1;
+        [ "${__gc_actual%% *}" = "$__gc_digest" ] || return 1;
+        while IFS= read -r __gc_root || [ -n "$__gc_root" ]; do
+            case "$__gc_root" in /*) ;; *) return 1;; esac;
+            case "$__gc_root" in *//*|*/./*|*/../*|*/.|*/..) return 1;; esac;
+            [ "$__gc_root" = / ] || [ "${__gc_root%/}" = "$__gc_root" ] || return 1;
+            __gc_source_realpath "$__gc_root" || return 1; __gc_root=$__gc_resolved;
+            [ "$__gc_root" != / ] && [ "$__gc_candidate" != / ] || return 1;
+            case "$__gc_candidate" in "$__gc_root"|"$__gc_root"/*) return 1;; esac;
+            case "$__gc_root" in "$__gc_candidate"/*) return 1;; esac;
+        done < "$__gc_record";
+    done;
+};
+__gc_source_end() {
+    if [ -n "${__gc_reservation-}" ]; then
+        if [ -L "$__gc_reservation" ] || [ ! -f "$__gc_reservation" ]; then
+            exec 8>&-; return 1;
+        fi;
+        __gc_actual=$(sha256sum -- "$__gc_reservation") || { exec 8>&-; return 1; };
+        [ "${__gc_actual%% *}" = "$__gc_reservation_digest" ] || { exec 8>&-; return 1; };
+        [ ! -L "$__gc_source_registry/released" ] || { exec 8>&-; return 1; };
+        mkdir -p -- "$__gc_source_registry/released" || { exec 8>&-; return 1; };
+        __gc_receipt="$__gc_source_registry/released/${__gc_reservation##*/}";
+        [ ! -e "$__gc_receipt" ] && [ ! -L "$__gc_receipt" ] || { exec 8>&-; return 1; };
+        if ! mv -- "$__gc_reservation" "$__gc_receipt" || ! sync -f "$__gc_receipt" \
+            || ! sync -f "$__gc_source_registry/released" || ! sync -f "$__gc_source_registry"; then
+            exec 8>&-; return 1;
+        fi;
+        __gc_reservation="";
+    fi;
+    exec 8>&-;
+};
+__gc_source_begin() {
+    __gc_reservation="";
+    [ ! -L "$__gc_source_registry" ] || return 1;
+    (umask 077; mkdir -p -- "$__gc_source_registry") || return 1;
+    [ ! -L "$__gc_source_registry/metadata.lock" ] || return 1;
+    exec 8>"$__gc_source_registry/metadata.lock" || return 1;
+    if ! flock -x 8; then __gc_source_end; return 1; fi;
+    if [ ! -d "$1" ] || [ -L "$1" ] || ! __gc_source_records_free "$1"; then
+        __gc_source_end; return 1;
+    fi;
+    __gc_token=fc-$(cat /proc/sys/kernel/random/uuid) || { __gc_source_end; return 1; };
+    case "$__gc_token" in *[!a-f0-9-]*) __gc_source_end; return 1;; esac;
+    [ "${#__gc_token}" -eq 39 ] || { __gc_source_end; return 1; };
+    for __gc_previous in "$__gc_source_registry/$__gc_token."* \
+        "$__gc_source_registry/released/$__gc_token."* "$__gc_source_registry/cancelled/$__gc_token."*; do
+        if [ -e "$__gc_previous" ] || [ -L "$__gc_previous" ]; then __gc_source_end; return 1; fi;
+    done;
+    __gc_actual=$(printf '%s\n' "$__gc_candidate" | sha256sum) || { __gc_source_end; return 1; };
+    __gc_reservation_digest=${__gc_actual%% *};
+    __gc_pending="$__gc_source_registry/$__gc_token.$__gc_reservation_digest.pending";
+    if ! (umask 077; set -C; printf '%s\n' "$__gc_candidate" > "$__gc_pending") \
+        || ! sync -f "$__gc_pending"; then __gc_source_end; return 1; fi;
+    __gc_active="$__gc_source_registry/$__gc_token.$__gc_reservation_digest.claim";
+    if ! mv -- "$__gc_pending" "$__gc_active" || ! sync -f "$__gc_source_registry"; then
+        __gc_source_end; return 1;
+    fi;
+    __gc_reservation=$__gc_active;
+};
+"#;
+    format!(
+        "__gc_source_registry={}; {GATE}",
+        shell_escape::escape(registry.into())
     )
 }
 
@@ -448,15 +578,43 @@ pub fn worker_sweep_command(
     pooled_idle_minutes: Option<u64>,
     max_cache_kb: Option<u64>,
 ) -> String {
-    let loop_body =
-        reap_loop_body_with_event(idle_minutes, None, "removed", "freed_kb", Some("ttl"));
+    worker_sweep_command_with_registry(
+        escaped_base,
+        idle_minutes,
+        pooled_idle_minutes,
+        max_cache_kb,
+        SOURCE_CLAIM_REGISTRY,
+    )
+}
+
+fn worker_sweep_command_with_registry(
+    escaped_base: &str,
+    idle_minutes: u64,
+    pooled_idle_minutes: Option<u64>,
+    max_cache_kb: Option<u64>,
+    registry: &str,
+) -> String {
+    let loop_body = reap_loop_body_with_source_gate(
+        idle_minutes,
+        None,
+        "removed",
+        "freed_kb",
+        Some("ttl"),
+        true,
+    );
     let guard = "printf 'RCH_WORKER_REAP_METRICS removed=0 freed_kb=0\\n'; ";
     let preamble = candidate_discovery_preamble(escaped_base, guard);
     let pooled_pass = match pooled_idle_minutes {
         Some(window) => {
             let window = window.max(MIN_POOLED_IDLE_MINUTES);
-            let pooled_body =
-                reap_loop_body_with_event(window, None, "removed", "freed_kb", Some("pooled-ttl"));
+            let pooled_body = reap_loop_body_with_source_gate(
+                window,
+                None,
+                "removed",
+                "freed_kb",
+                Some("pooled-ttl"),
+                true,
+            );
             let dedup2 = dedup_candidate_file("__tmpf2");
             format!(
                 "if __tmpf2=$(mktemp 2>/dev/null || mktemp -p \"$__tmpbase\" 2>/dev/null); then \
@@ -513,12 +671,17 @@ pub fn worker_sweep_command(
                      printf 'RCH_GC_SKIP cap active %s\\n' \"$d\"; continue; \
                    fi; \
                    if ! __gc_gates_ok \"$d\"; then printf 'RCH_GC_SKIP cap gate %s\\n' \"$d\"; continue; fi; \
+                   if ! __gc_source_begin \"$d\"; then printf 'RCH_GC_SKIP cap source-ownership %s\\n' \"$d\"; continue; fi; \
+                   if find \"$d\" -mmin -{idle_minutes} -print -quit 2>/dev/null | grep -q .; then \
+                     __gc_source_end; printf 'RCH_GC_SKIP cap active %s\\n' \"$d\"; continue; \
+                   fi; \
                    if __rmerr=$(rm -rf -- \"$d\" 2>&1); then \
                      removed=$((removed + 1)); freed_kb=$((freed_kb + __k)); total_kb=$((total_kb - __k)); \
                      printf 'RCH_REAP_RM %s cap %s\\n' \"$__k\" \"$d\"; \
                    else \
                      printf 'RCH_REAP_ERR cap %s :: %s\\n' \"$d\" \"$(printf '%s' \"$__rmerr\" | head -1)\"; \
                    fi; \
+                   __gc_source_end; \
                  done < \"$__tmpf3\"; \
                  printf 'RCH_REAP_CAP final_kb=%s\\n' \"$total_kb\"; \
                fi; \
@@ -529,6 +692,7 @@ pub fn worker_sweep_command(
     };
     format!(
         "{preamble}\
+         {source_gate}\
          removed=0; freed_kb=0; \
          while IFS= read -r d; do {loop_body} done < \"$__tmpf\"; \
          rm -f \"$__tmpf\"; \
@@ -536,7 +700,8 @@ pub fn worker_sweep_command(
          {cap_pass}\
          {gate_cleanup}\
          printf 'RCH_WORKER_REAP_METRICS removed=%s freed_kb=%s\\n' \"$removed\" \"$freed_kb\"",
-        gate_cleanup = gate_snapshot_cleanup()
+        gate_cleanup = gate_snapshot_cleanup(),
+        source_gate = source_claim_gate_fragment(registry),
     )
 }
 
@@ -1119,6 +1284,13 @@ pub struct GcCollectTarget {
 /// lines as [`worker_sweep_command`], plus `RCH_GC_SKIP <trigger> <reason>
 /// <path>` for a dir the worker's re-check declined.
 pub fn collect_paths_command(targets: &[GcCollectTarget]) -> Result<String, String> {
+    collect_paths_command_with_registry(targets, SOURCE_CLAIM_REGISTRY)
+}
+
+fn collect_paths_command_with_registry(
+    targets: &[GcCollectTarget],
+    registry: &str,
+) -> Result<String, String> {
     if targets.is_empty() {
         return Err("no targets to collect".to_string());
     }
@@ -1164,6 +1336,7 @@ pub fn collect_paths_command(targets: &[GcCollectTarget]) -> Result<String, Stri
          {tmp_base_prelude}; \
          __tmpbase=\"${{{tmp_base_var}}}\"; \
          {gates}\
+         {source_gate}\
          removed=0; freed_kb=0; \
          for __e in{list}; do \
            __mins=${{__e%%:*}}; __r=${{__e#*:}}; __tag=${{__r%%:*}}; d=${{__r#*:}}; \
@@ -1171,6 +1344,9 @@ pub fn collect_paths_command(targets: &[GcCollectTarget]) -> Result<String, Stri
            if find \"$d\" -mmin -\"$__mins\" -print -quit 2>/dev/null | grep -q .; then \
              printf 'RCH_GC_SKIP %s active %s\\n' \"$__tag\" \"$d\"; continue; fi; \
            if ! __gc_gates_ok \"$d\"; then printf 'RCH_GC_SKIP %s gate %s\\n' \"$__tag\" \"$d\"; continue; fi; \
+           if ! __gc_source_begin \"$d\"; then printf 'RCH_GC_SKIP %s source-ownership %s\\n' \"$__tag\" \"$d\"; continue; fi; \
+           if find \"$d\" -mmin -\"$__mins\" -print -quit 2>/dev/null | grep -q .; then \
+             __gc_source_end; printf 'RCH_GC_SKIP %s active %s\\n' \"$__tag\" \"$d\"; continue; fi; \
            sz=$(du -sk \"$d\" 2>/dev/null | awk '{{print $1}}'); [ -z \"$sz\" ] && sz=0; \
            if __rmerr=$(rm -rf -- \"$d\" 2>&1); then \
              removed=$((removed + 1)); freed_kb=$((freed_kb + sz)); \
@@ -1178,11 +1354,13 @@ pub fn collect_paths_command(targets: &[GcCollectTarget]) -> Result<String, Stri
            else \
              printf 'RCH_REAP_ERR %s %s :: %s\\n' \"$__tag\" \"$d\" \"$(printf '%s' \"$__rmerr\" | head -1)\"; \
            fi; \
+           __gc_source_end; \
          done; \
          {gate_cleanup}\
          printf 'RCH_WORKER_REAP_METRICS removed=%s freed_kb=%s\\n' \"$removed\" \"$freed_kb\"",
         gates = gate_snapshot_fragment(),
         gate_cleanup = gate_snapshot_cleanup(),
+        source_gate = source_claim_gate_fragment(registry),
     ))
 }
 
@@ -1191,7 +1369,7 @@ pub fn collect_paths_command(targets: &[GcCollectTarget]) -> Result<String, Stri
 pub struct GcSkip {
     /// Trigger tag of the pass that declined it.
     pub trigger: String,
-    /// Why: `missing`, `active`, or `gate`.
+    /// Why: `missing`, `active`, `gate`, or `source-ownership`.
     pub reason: String,
     /// Absolute path.
     pub path: String,
@@ -2335,6 +2513,353 @@ mod tests {
         let (removed, _freed) =
             parse_worker_reap_metrics(&stdout).expect("sweep must print its metrics line");
         assert_eq!(removed, 2, "exactly the two idle dirs; stdout: {stdout}");
+    }
+
+    #[cfg(target_os = "linux")]
+    fn source_gc_fixture_dir(path: &std::path::Path) {
+        std::fs::create_dir_all(path).unwrap();
+        std::fs::write(path.join("artifact.o"), vec![b'x'; 16 * 1024]).unwrap();
+        assert!(
+            std::process::Command::new("find")
+                .arg(path)
+                .args(["-exec", "touch", "-t", "202001010000", "{}", "+"])
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn source_gc_fixture_claim(
+        registry: &std::path::Path,
+        root: &std::path::Path,
+        token: &str,
+        extension: &str,
+    ) -> std::path::PathBuf {
+        std::fs::create_dir_all(registry).unwrap();
+        let pending = registry.join(format!("input-{token}"));
+        std::fs::write(&pending, format!("{}\n", root.display())).unwrap();
+        let output = std::process::Command::new("sha256sum")
+            .arg(&pending)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let digest = std::str::from_utf8(&output.stdout)
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .unwrap();
+        let record = registry.join(format!("{token}.{digest}.{extension}"));
+        std::fs::rename(pending, &record).unwrap();
+        record
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn worker_gc_preserves_active_pending_and_aliased_source_claims() {
+        use std::os::unix::fs::symlink;
+        use std::process::Command;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("projects");
+        let registry = tmp.path().join("claims");
+        let scratch = tmp.path().join("scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let exact = base.join("exact/.rch-target-w-job-exact");
+        let ancestor = base.join("ancestor/.rch-target-w-job-ancestor");
+        let descendant = base.join("descendant/.rch-target-w-job-descendant");
+        let aliased = base.join("aliased/.rch-target-w-job-aliased");
+        let disjoint = base.join("free/.rch-target-w-job-free");
+        std::fs::create_dir_all(descendant.join("nested")).unwrap();
+        for path in [&exact, &ancestor, &descendant, &aliased, &disjoint] {
+            source_gc_fixture_dir(path);
+        }
+        let alias = tmp.path().join("source-alias");
+        symlink(aliased.parent().unwrap(), &alias).unwrap();
+        let claims = [
+            source_gc_fixture_claim(&registry, &exact, "aa", "claim"),
+            source_gc_fixture_claim(&registry, ancestor.parent().unwrap(), "ab", "claim"),
+            source_gc_fixture_claim(&registry, &descendant.join("nested"), "ac", "pending"),
+            source_gc_fixture_claim(&registry, &alias, "ad", "claim"),
+        ];
+        let command = worker_sweep_command_with_registry(
+            base.to_str().unwrap(),
+            60,
+            None,
+            None,
+            registry.to_str().unwrap(),
+        );
+        let run = || {
+            Command::new("sh")
+                .arg("-c")
+                .arg(&command)
+                .env("TMPDIR", &scratch)
+                .output()
+                .unwrap()
+        };
+        let output = run();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        for path in [&exact, &ancestor, &descendant, &aliased] {
+            assert!(
+                path.join("artifact.o").exists(),
+                "claimed output removed: {path:?}"
+            );
+        }
+        assert!(
+            !disjoint.exists(),
+            "a disjoint unowned candidate should be collected"
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(parse_worker_reap_metrics(&stdout).unwrap().0, 1, "{stdout}");
+        assert_eq!(
+            parse_gc_skips(&stdout)
+                .iter()
+                .filter(|skip| skip.reason == "source-ownership")
+                .count(),
+            4,
+            "{stdout}"
+        );
+
+        // Terminal receipts retain history without pinning the paths forever.
+        std::fs::create_dir_all(registry.join("released")).unwrap();
+        std::fs::create_dir_all(registry.join("cancelled")).unwrap();
+        for claim in claims {
+            let destination =
+                if claim.extension().and_then(|extension| extension.to_str()) == Some("pending") {
+                    registry
+                        .join("cancelled")
+                        .join(claim.with_extension("claim").file_name().unwrap())
+                } else {
+                    registry.join("released").join(claim.file_name().unwrap())
+                };
+            std::fs::rename(&claim, destination).unwrap();
+        }
+        let output = run();
+        assert!(output.status.success());
+        for path in [&exact, &ancestor, &descendant, &aliased] {
+            assert!(!path.exists(), "released path remained pinned: {path:?}");
+        }
+        assert_eq!(
+            parse_worker_reap_metrics(&String::from_utf8_lossy(&output.stdout))
+                .unwrap()
+                .0,
+            4
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn worker_gc_corrupt_source_record_fails_closed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("projects");
+        let scratch = tmp.path().join("scratch");
+        let registry = tmp.path().join("claims");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let candidate = base.join("repo/.rch-target-w-job-unclaimed");
+        source_gc_fixture_dir(&candidate);
+        let record = source_gc_fixture_claim(&registry, &tmp.path().join("other"), "aa", "pending");
+        std::fs::write(record, b"/truncated").unwrap();
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(worker_sweep_command_with_registry(
+                base.to_str().unwrap(),
+                60,
+                None,
+                None,
+                registry.to_str().unwrap(),
+            ))
+            .env("TMPDIR", scratch)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert!(candidate.join("artifact.o").exists());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(parse_worker_reap_metrics(&stdout).unwrap().0, 0);
+        assert!(
+            parse_gc_skips(&stdout)
+                .iter()
+                .any(|skip| skip.reason == "source-ownership")
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn byte_cap_and_explicit_gc_cannot_override_source_ownership() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("projects");
+        let scratch = tmp.path().join("scratch");
+        let registry = tmp.path().join("claims");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let owned = base.join("owned/.rch-target-w-pool-owned");
+        let free = base.join("free/.rch-target-w-pool-free");
+        source_gc_fixture_dir(&owned);
+        source_gc_fixture_dir(&free);
+        source_gc_fixture_claim(&registry, &owned, "aa", "claim");
+        let run = |command: String| {
+            std::process::Command::new("sh")
+                .arg("-c")
+                .arg(command)
+                .env("TMPDIR", &scratch)
+                .output()
+                .unwrap()
+        };
+        let output = run(worker_sweep_command_with_registry(
+            base.to_str().unwrap(),
+            60,
+            None,
+            Some(1),
+            registry.to_str().unwrap(),
+        ));
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(owned.join("artifact.o").exists());
+        assert!(!free.exists());
+        assert_eq!(
+            parse_worker_reap_metrics(&String::from_utf8_lossy(&output.stdout))
+                .unwrap()
+                .0,
+            1
+        );
+        source_gc_fixture_dir(&free);
+        let targets = [&owned, &free].map(|path| GcCollectTarget {
+            path: path.to_string_lossy().into_owned(),
+            idle_minutes: 60,
+            trigger: "manual",
+        });
+        let output =
+            run(collect_paths_command_with_registry(&targets, registry.to_str().unwrap()).unwrap());
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(owned.join("artifact.o").exists());
+        assert!(!free.exists());
+        assert_eq!(
+            parse_worker_reap_metrics(&String::from_utf8_lossy(&output.stdout))
+                .unwrap()
+                .0,
+            1
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn source_gc_preserves_ownership_through_hup_and_killed_supervisor() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+
+        for signal in ["-HUP", "-KILL"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let candidate = tmp.path().join(".rch-target-w-job-interrupted");
+            let registry = tmp.path().join("claims");
+            let ready = tmp.path().join("ready");
+            let resume = tmp.path().join("resume");
+            let bin = tmp.path().join("bin");
+            std::fs::create_dir(&bin).unwrap();
+            source_gc_fixture_dir(&candidate);
+            let remover = bin.join("rm");
+            std::fs::write(&remover, b"#!/bin/sh\nexec 8>&-\n: > \"$RCH_GC_TEST_READY\"\ni=0\nwhile [ ! -e \"$RCH_GC_TEST_RESUME\" ]; do i=$((i+1)); [ \"$i\" -lt 1000 ] || exit 9; sleep 0.01; done\nexec /bin/rm \"$@\"\n").unwrap();
+            std::fs::set_permissions(&remover, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let script = format!(
+                "{} __gc_source_begin \"$1\" || exit 1; rm -rf -- \"$1\"; __gc_source_end;",
+                source_claim_gate_fragment(registry.to_str().unwrap())
+            );
+            let mut child = Command::new("sh")
+                .args(["-c", &script, "gc-lifetime"])
+                .arg(&candidate)
+                .env(
+                    "PATH",
+                    format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+                )
+                .env("RCH_GC_TEST_READY", &ready)
+                .env("RCH_GC_TEST_RESUME", &resume)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !ready.exists() && Instant::now() < deadline {
+                assert!(
+                    child.try_wait().unwrap().is_none(),
+                    "source guard exited before deletion"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(ready.exists(), "removal child failed to reach barrier");
+            assert!(
+                Command::new("kill")
+                    .args([signal, &child.id().to_string()])
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            let contender = || {
+                Command::new("flock")
+                    .arg("-n")
+                    .arg(registry.join("metadata.lock"))
+                    .arg("true")
+                    .status()
+                    .unwrap()
+            };
+            if signal == "-KILL" {
+                assert!(!child.wait().unwrap().success());
+                assert!(
+                    contender().success(),
+                    "the killed supervisor should release its kernel lock"
+                );
+                let retry = format!(
+                    "{} __gc_source_begin \"$1\"",
+                    source_claim_gate_fragment(registry.to_str().unwrap())
+                );
+                assert!(
+                    !Command::new("sh")
+                        .args(["-c", &retry, "gc-retry"])
+                        .arg(&candidate)
+                        .status()
+                        .unwrap()
+                        .success(),
+                    "surviving deletion lost its durable overlap blocker"
+                );
+            } else {
+                assert!(
+                    !contender().success(),
+                    "admission crossed a still-running deletion"
+                );
+            }
+            assert!(candidate.exists());
+            std::fs::write(resume, b"continue").unwrap();
+            if signal == "-HUP" {
+                assert!(child.wait().unwrap().success());
+            } else {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while candidate.exists() && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                assert!(
+                    std::fs::read_dir(&registry).unwrap().any(|entry| entry
+                        .unwrap()
+                        .path()
+                        .extension()
+                        .is_some_and(|extension| extension == "claim")),
+                    "an interrupted GC claim must remain after its unobserved child completes"
+                );
+            }
+            assert!(!candidate.exists());
+            assert!(
+                contender().success(),
+                "metadata lock was not released after deletion"
+            );
+        }
     }
 
     /// `rch gc --dry-run` enumerates; the real run sweeps. If enumerate cannot

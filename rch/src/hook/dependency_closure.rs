@@ -971,6 +971,7 @@ pub(super) async fn verify_remote_dependency_manifests(
     worker: &WorkerConfig,
     root_outcomes: &[(SyncClosurePlanEntry, SyncRootOutcome)],
     reporter: &HookReporter,
+    source_identity: Option<&str>,
 ) -> anyhow::Result<()> {
     if should_skip_remote_preflight(worker) {
         reporter.verbose("[RCH] remote dependency preflight skipped in mock mode");
@@ -987,12 +988,16 @@ pub(super) async fn verify_remote_dependency_manifests(
     let mut probe_failure: Option<String> = None;
 
     if let Some(verify_cmd) = build_remote_dependency_preflight_command(&synced_checks) {
+        let remote_command = source_identity
+            .map(|identity| super::ssh::wrap_remote_source_activity("sh -s", identity))
+            .transpose()?
+            .unwrap_or_else(|| "sh -s".to_owned());
         // Stdin transport has no argv-size limit. Probe the entire closure in
         // one SSH session instead of paying a handshake and login-shell startup
         // for every 128 paths. Retain the former batches' total timeout budget.
         match run_offload_ssh_command_with_stdin(
             worker,
-            "sh -s",
+            &remote_command,
             verify_cmd.as_bytes(),
             dependency_preflight_timeout(synced_checks.len()),
         )
@@ -1143,7 +1148,7 @@ mod stdin_tests {
             assert!(command.len() > 256 * 1024);
 
             let reporter = HookReporter::new(OutputVisibility::Summary);
-            let error = verify_remote_dependency_manifests(&worker, &outcomes, &reporter)
+            let error = verify_remote_dependency_manifests(&worker, &outcomes, &reporter, None)
                 .await
                 .expect_err("absent fixture paths must remain missing, not pass preflight");
             let report = error
@@ -1175,9 +1180,14 @@ mod stdin_tests {
                 "probe\n",
                 "oversized multi-root checks must use exactly one SSH connection"
             );
-            verify_remote_dependency_manifests(&worker, &outcomes[ROOT_COUNT - 1..], &reporter)
-                .await
-                .expect("healthy paths must still pass preflight");
+            verify_remote_dependency_manifests(
+                &worker,
+                &outcomes[ROOT_COUNT - 1..],
+                &reporter,
+                None,
+            )
+            .await
+            .expect("healthy paths must still pass preflight");
             // SSH can forward every present line and still exit unsuccessfully.
             // None of those lines may certify a failed batch as verified.
             for code in [1, 42, 43, 255] {
@@ -1186,6 +1196,7 @@ mod stdin_tests {
                     &worker,
                     &outcomes[ROOT_COUNT - 1..],
                     &reporter,
+                    None,
                 )
                 .await
                 .expect_err("failed transport must not verify complete positive output")

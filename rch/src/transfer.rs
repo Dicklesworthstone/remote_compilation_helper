@@ -1408,6 +1408,9 @@ pub struct TransferPipeline {
     rsync_override: Option<ResolvedRsync>,
     /// Non-replayable, identity-bound remote completion evidence.
     recovery_completion: Option<(String, String)>,
+    /// Worker-side activity lease bound to the persisted source grant. Every
+    /// source operation checks the grant after joining its drain barrier.
+    source_authority_prefix: Option<String>,
     /// Cooperative collection-only cancellation; the sender never drops a live child future.
     retrieval_control: Option<(tokio::sync::watch::Receiver<bool>, TokioInstant)>,
 }
@@ -1521,6 +1524,7 @@ impl TransferPipeline {
                 rch_common::remediation_config::DEFAULT_POOLED_REAPER_POOLED_IDLE_HOURS,
             rsync_override: None,
             recovery_completion: None,
+            source_authority_prefix: None,
             retrieval_control: None,
         }
     }
@@ -1641,6 +1645,52 @@ impl TransferPipeline {
         self
     }
 
+    #[cfg(unix)]
+    pub(crate) fn with_source_authority(mut self, identity: String) -> Result<Self> {
+        self.source_authority_prefix =
+            Some(crate::hook::source_authority_activity_prefix(&identity)?);
+        Ok(self)
+    }
+
+    /// Cleanup is admitted only while the exact active grant is cancelling.
+    /// Final cancellation drains these operations before releasing its roots.
+    #[cfg(unix)]
+    pub(crate) fn with_source_authority_cleanup(mut self, identity: String) -> Result<Self> {
+        self.source_authority_prefix =
+            Some(crate::hook::source_authority_cleanup_prefix(&identity)?);
+        Ok(self)
+    }
+
+    fn source_activity_command(&self, command: &str) -> String {
+        match &self.source_authority_prefix {
+            Some(prefix) => format!("{prefix} sh -c {}", escape(Cow::from(command))),
+            None => command.to_owned(),
+        }
+    }
+
+    /// rsync appends its server argv to this shell fragment. Forward those
+    /// arguments inside the lease, after any destination setup has completed.
+    fn source_rsync_path(&self, command: String) -> String {
+        match &self.source_authority_prefix {
+            Some(prefix) => {
+                let script = format!("{command} \"$@\"");
+                format!(
+                    "{prefix} sh -c {} rch-source-rsync",
+                    escape(Cow::from(script))
+                )
+            }
+            None => command,
+        }
+    }
+
+    fn append_source_rsync_path(&self, command: &mut Command) {
+        if self.source_authority_prefix.is_some() {
+            command
+                .arg("--rsync-path")
+                .arg(self.source_rsync_path("rsync".to_owned()));
+        }
+    }
+
     pub(crate) fn with_local_root(mut self, root: PathBuf) -> Self {
         self.project_root = root;
         self
@@ -1691,7 +1741,12 @@ impl TransferPipeline {
         );
         let output = tokio::time::timeout(
             Duration::from_secs(10),
-            self.worker_ssh_command(worker, &["sh", "-c", &escape(Cow::from(script.as_str()))])
+            // This immutable identity-bound receipt is outside source-tree
+            // authority. Its probe must not wait behind the running command's
+            // exclusive activity lease and stall diagnostic streaming.
+            self.worker_ssh_command_with_activity(
+                worker, &["sh", "-c", &escape(Cow::from(script.as_str()))], false,
+            )
                 .output(),
         )
         .await??;
@@ -1899,6 +1954,16 @@ impl TransferPipeline {
             && max_transfer_time_ms > 0
         {
             retry.total_timeout_ms = max_transfer_time_ms;
+        }
+        retry
+    }
+
+    fn source_retry_config(&self, mut retry: RetryConfig) -> RetryConfig {
+        if self.source_authority_prefix.is_some() {
+            // A timed-out remote mutator may still arrive or run. Retire this
+            // token through preparation cancellation before retrying a job;
+            // otherwise an older upload could start after source verification.
+            retry.max_attempts = 1;
         }
         retry
     }
@@ -2114,8 +2179,12 @@ impl TransferPipeline {
 
     /// Parent directory of the pooled target-dir override, shell-escaped, for
     /// the transfer-start janitor's pooled sweep. `None` when no override is
-    /// set (the sweep then covers `<remote_path>` as before).
+    /// set or a durable source grant is active. That grant owns this pool,
+    /// not its siblings: age cannot release another job's retained outputs.
     fn escaped_pooled_target_override_parent(&self) -> Option<String> {
+        if self.source_authority_prefix.is_some() {
+            return None;
+        }
         let override_path = self.remote_cargo_target_dir_override.as_deref()?;
         let (parent, _basename) = override_path.rsplit_once('/')?;
         if parent.is_empty() {
@@ -2587,7 +2656,7 @@ impl TransferPipeline {
             .arg("-e")
             .arg(ssh_command)
             .arg("--rsync-path")
-            .arg(format!("mkdir -p {} && rsync", escaped_remote_path));
+            .arg(self.source_rsync_path(format!("mkdir -p {} && rsync", escaped_remote_path)));
         add_portable_rsync_archive_args(&mut cmd);
         if self.sync_delete {
             cmd.arg("--delete");
@@ -3196,6 +3265,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
             .arg("--stats")
             .arg("-e")
             .arg(ssh_command);
+        self.append_source_rsync_path(&mut cmd);
 
         for pattern in &effective_excludes {
             cmd.arg("--exclude").arg(pattern);
@@ -3366,7 +3436,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         // This saves a separate SSH handshake for 'mkdir -p'. The same remote
         // shell invocation also reaps stale worker-side runtime state
         // (bd-wfumv) — see worker_cache_prune_rsync_path_prefix.
-        cmd.arg("--rsync-path").arg(format!(
+        cmd.arg("--rsync-path").arg(self.source_rsync_path(format!(
             "{}mkdir -p {} && rsync",
             worker_cache_prune_rsync_path_prefix(
                 escaped_remote_path,
@@ -3374,7 +3444,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
                 self.escaped_pooled_target_override_parent().as_deref()
             ),
             escaped_remote_path
-        ));
+        )));
 
         self.append_sync_filter_args(&mut cmd, effective_excludes);
 
@@ -3432,7 +3502,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         // Create remote directory implicitly using rsync-path wrapper; the
         // same remote shell invocation reaps stale worker-side runtime state
         // (bd-wfumv) — see worker_cache_prune_rsync_path_prefix.
-        cmd.arg("--rsync-path").arg(format!(
+        cmd.arg("--rsync-path").arg(self.source_rsync_path(format!(
             "{}mkdir -p {} && rsync",
             worker_cache_prune_rsync_path_prefix(
                 escaped_remote_path,
@@ -3440,7 +3510,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
                 self.escaped_pooled_target_override_parent().as_deref()
             ),
             escaped_remote_path
-        ));
+        )));
 
         self.append_sync_filter_args(&mut cmd, effective_excludes);
 
@@ -3547,7 +3617,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         if self.worker_platform.is_windows() {
             let start = std::time::Instant::now();
             let ((), attempts) = run_source_transfer_attempts(
-                &self.transfer_config.retry,
+                &self.source_retry_config(self.transfer_config.retry.clone()),
                 attempt_timeout,
                 "clean_overlay_base_sync",
                 |_attempt| async {
@@ -3588,7 +3658,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         let start = std::time::Instant::now();
         let (((), attempts), duration_ms) = {
             let result = run_source_transfer_attempts(
-                &self.transfer_config.retry,
+                &self.source_retry_config(self.transfer_config.retry.clone()),
                 attempt_timeout,
                 "clean_overlay_base_sync",
                 |_attempt| {
@@ -3612,7 +3682,9 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
                             .arg("-e")
                             .arg(ssh_command)
                             .arg("--rsync-path")
-                            .arg(format!("mkdir -p {escaped_remote_path} && rsync"))
+                            .arg(self.source_rsync_path(format!(
+                                "mkdir -p {escaped_remote_path} && rsync"
+                            )))
                             .arg(archive_path)
                             .arg(destination)
                             .stdout(Stdio::piped())
@@ -3667,6 +3739,15 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
     /// ready to run `remote_args` on the worker. The Windows tar transport uses
     /// this instead of rsync.
     fn worker_ssh_command(&self, worker: &WorkerConfig, remote_args: &[&str]) -> Command {
+        self.worker_ssh_command_with_activity(worker, remote_args, true)
+    }
+
+    fn worker_ssh_command_with_activity(
+        &self,
+        worker: &WorkerConfig,
+        remote_args: &[&str],
+        bind_activity: bool,
+    ) -> Command {
         let identity_file = shellexpand::tilde(&worker.identity_file);
         let mut cmd = Command::new("ssh");
         cmd.arg("-o").arg("BatchMode=yes");
@@ -3683,6 +3764,9 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
             }
         }
         cmd.arg(format!("{}@{}", worker.user, worker.host));
+        if bind_activity && let Some(prefix) = &self.source_authority_prefix {
+            cmd.arg(prefix);
+        }
         for a in remote_args {
             cmd.arg(a);
         }
@@ -4040,7 +4124,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         // Create MockRsync ONCE and share via Arc so failure counters persist across retries
         let rsync = std::sync::Arc::new(MockRsync::new(MockRsyncConfig::from_env()));
         let project_root_str = self.project_root.display().to_string();
-        let retry_config = self.transfer_config.retry.clone();
+        let retry_config = self.source_retry_config(self.transfer_config.retry.clone());
         let attempt_timeout = self.source_sync_attempt_timeout(effective_excludes);
         let (result, _attempts) = run_source_transfer_attempts(
             &retry_config,
@@ -4113,7 +4197,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         // Source uploads receive a full payload-aware timeout on every attempt.
         // This is intentionally independent of the remote Cargo command timeout
         // and artifact-return retry budget.
-        let retry_config = self.transfer_config.retry.clone();
+        let retry_config = self.source_retry_config(self.transfer_config.retry.clone());
         let attempt_timeout = self.source_sync_attempt_timeout(&effective_excludes);
         let (output, _attempts) = run_source_transfer_attempts(
             &retry_config,
@@ -4218,8 +4302,8 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         debug!("Effective exclude patterns: {:?}", effective_excludes);
 
         // Rebuilt per retry attempt: rsync consumes its `Command`, and a
-        // transient SSH/rsync drop on this streaming path must reconnect from a
-        // fresh command rather than fail the whole transfer with zero retries.
+        // transient SSH/rsync drop requires a fresh command. Durable source
+        // grants instead leave retries to the job's cancellation boundary.
         let build_cmd = || {
             self.build_sync_streaming_command(
                 worker,
@@ -4234,7 +4318,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
             build_cmd().as_std().get_args().collect::<Vec<_>>()
         );
 
-        let retry_config = self.effective_rsync_retry_config();
+        let retry_config = self.source_retry_config(self.effective_rsync_retry_config());
         let attempt_timeout = self.source_sync_attempt_timeout(&effective_excludes);
         // Issue #59: silence-based stall detection rides alongside the
         // wall-clock attempt timeout. Every rsync output segment (including
@@ -4475,7 +4559,11 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         // IMPORTANT: pass the script via stdin (`sh -s`) to avoid quoting issues with
         // newlines/comments in `remote_script`. This preserves the prior mux behavior
         // where the script is an argv payload, not re-parsed by the user's login shell.
-        cmd.arg(&destination).arg("sh").arg("-s");
+        cmd.arg(&destination);
+        if let Some(prefix) = &self.source_authority_prefix {
+            cmd.arg(prefix);
+        }
+        cmd.arg("sh").arg("-s");
 
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -4716,6 +4804,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
             .arg("--safe-links")
             .arg("-e")
             .arg(ssh_command);
+        self.append_source_rsync_path(&mut cmd);
 
         // Add zstd compression (zlib on a legacy binary; issue #66)
         self.append_compression_args(&mut cmd, &capabilities);
@@ -4812,6 +4901,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
             .arg("--safe-links")
             .arg("-e")
             .arg(ssh_command);
+        self.append_source_rsync_path(&mut cmd);
 
         // Add zstd compression (zlib on a legacy binary; issue #66)
         self.append_compression_args(&mut cmd, &capabilities);
@@ -5098,6 +5188,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
             .arg("--safe-links")
             .arg("-e")
             .arg(ssh_command);
+        self.append_source_rsync_path(&mut cmd);
 
         self.append_compression_args(&mut cmd, &capabilities);
         if let Some(bwlimit) = self.transfer_config.bwlimit_kbps
@@ -5718,7 +5809,7 @@ print('RCH_SOURCE_FRESHNESS_V2 unchanged=%d changed=%d' % (len(current) - len(ch
             client.connect().await?;
 
             let result = client
-                .execute(&format!("rm -rf {}", escaped_remote_path))
+                .execute(&self.source_activity_command(&format!("rm -rf {}", escaped_remote_path)))
                 .await;
 
             if let Err(e) = client.disconnect().await {
@@ -5772,6 +5863,11 @@ print('RCH_SOURCE_FRESHNESS_V2 unchanged=%d changed=%d' % (len(current) - len(ch
         worker: &WorkerConfig,
         idle_hours: u32,
     ) {
+        if self.source_authority_prefix.is_some() {
+            // Detached preparation work can start after final verification.
+            // The independent daemon GC understands durable retained grants.
+            return;
+        }
         let project_dir = self.remote_path();
         let current = self.remote_cargo_target_dir_name.clone();
 
@@ -5822,9 +5918,14 @@ print('RCH_SOURCE_FRESHNESS_V2 unchanged=%d changed=%d' % (len(current) - len(ch
                  for d in {globs}; do {loop_body} done"
             );
             // Detach on the worker so a large reclaim runs concurrently with the
-            // build rather than blocking it. The script contains no single quotes
-            // (inputs are charset-restricted above), so single-quoting is safe.
-            let remote_command = format!("nohup sh -c '{script}' >/dev/null 2>&1 &");
+            // build rather than blocking it. The detached operation joins the
+            // source activity barrier itself, so release either drains it or
+            // fences it before the first filesystem effect.
+            let protected_script = self.source_activity_command(&script);
+            let remote_command = format!(
+                "nohup sh -c {} >/dev/null 2>&1 &",
+                escape(Cow::from(protected_script))
+            );
 
             let mut client = SshClient::new(worker.clone(), self.ssh_options.clone());
             if let Err(e) = client.connect().await {
@@ -8659,6 +8760,168 @@ Number of files transferred: 42
 
         assert!(args.iter().any(|arg| arg == "--compress-choice=zstd"));
         assert!(args.iter().any(|arg| arg == "--compress-level=7"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_activity_rsync_wrapper_preserves_server_argv_and_fences_setup() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("source with spaces");
+        let mut pipeline = TransferPipeline::new(
+            directory.path().to_owned(),
+            "activity".into(),
+            "abcdef".into(),
+            TransferConfig::default(),
+        );
+        // The production registry tests exercise the real grant. Here the
+        // controlled prefix isolates shell argument forwarding and ordering.
+        pipeline.source_authority_prefix = Some("env RCH_ACTIVITY_TEST=owned".into());
+        let setup = format!(
+            "test \"$RCH_ACTIVITY_TEST\" = owned && mkdir -p {} && printf '%s\\0'",
+            escape(destination.to_string_lossy())
+        );
+        let server_args = [
+            "--server", "--sender", "-logDtpre.iLsfxCIvu", ".", "a '$literal; b",
+        ];
+        let remote = format!(
+            "{} {}",
+            pipeline.source_rsync_path(setup),
+            server_args
+                .iter()
+                .map(|arg| escape(Cow::from(*arg)).into_owned())
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        let output = std::process::Command::new("sh")
+            .arg("-c").arg(remote).output().unwrap();
+        assert!(output.status.success(), "{:?}", output);
+        assert!(destination.is_dir());
+        let expected: Vec<u8> = server_args
+            .iter()
+            .flat_map(|arg| arg.bytes().chain(std::iter::once(0)))
+            .collect();
+        assert_eq!(output.stdout, expected);
+
+        pipeline.source_authority_prefix = Some("false".into());
+        let denied = directory.path().join("must-not-exist");
+        let remote = pipeline.source_rsync_path(format!(
+            "mkdir -p {} && printf '%s'",
+            escape(denied.to_string_lossy())
+        ));
+        let output = std::process::Command::new("sh")
+            .arg("-c").arg(remote).output().unwrap();
+        assert!(!output.status.success());
+        assert!(
+            !denied.exists(),
+            "a rejected lease must precede destination setup"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn owned_source_failure_does_not_retry_inside_the_same_grant() {
+        use std::os::unix::fs::PermissionsExt;
+        let _guard = test_guard!();
+        let directory = tempfile::tempdir().unwrap();
+        let counter = directory.path().join("attempts");
+        let fake = directory.path().join("failed-rsync");
+        std::fs::write(&fake, format!(
+            "#!/bin/sh\nprintf 'attempt\\n' >> {}\nprintf 'ssh: connection reset by peer\\n' >&2\nexit 255\n",
+            escape(counter.to_string_lossy())
+        )).unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut pipeline = TransferPipeline::new(
+            directory.path().to_owned(), "activity".into(), "abcdef".into(),
+            TransferConfig {
+                retry: RetryConfig {
+                    max_attempts: 3, base_delay_ms: 1, max_delay_ms: 1,
+                    jitter_factor: 0.0, total_timeout_ms: 30_000,
+                },
+                ..TransferConfig::default()
+            },
+        ).with_rsync(ResolvedRsync {
+            path: fake,
+            flavor: RsyncFlavor::Rsync { major: 3, minor: 2, patch: 7 },
+            version_line: String::new(), source: RsyncSource::Config, shadowed: None,
+        });
+        let worker = estimate_test_worker();
+        pipeline.source_authority_prefix = Some("env RCH_ACTIVITY_TEST=owned".into());
+        assert!(pipeline.sync_to_remote(&worker).await.is_err());
+        assert_eq!(std::fs::read_to_string(&counter).unwrap().lines().count(), 1);
+        assert!(pipeline.sync_to_remote_streaming(&worker, |_| {}).await.is_err());
+        assert_eq!(std::fs::read_to_string(&counter).unwrap().lines().count(), 2);
+        // Control: the ordinary transport still exercises the configured
+        // three attempts. The owned failure must return for token cancellation.
+        pipeline.source_authority_prefix = None;
+        assert!(pipeline.sync_to_remote(&worker).await.is_err());
+        assert_eq!(std::fs::read_to_string(&counter).unwrap().lines().count(), 5);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_activity_is_carried_by_all_rsync_transports() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut pipeline = TransferPipeline::new(
+            directory.path().to_owned(),
+            "activity".into(),
+            "abcdef".into(),
+            TransferConfig::default(),
+        );
+        pipeline.source_authority_prefix = Some("env RCH_ACTIVITY_TEST=owned".into());
+        let worker = estimate_test_worker();
+        let commands = [
+            pipeline.build_sync_command(&worker, "user@worker:/src", "/src", &[]),
+            pipeline.build_sync_streaming_command(&worker, "user@worker:/src", "/src", &[]),
+            pipeline.build_estimate_command(&worker),
+            pipeline.build_retrieve_command(&worker, "/src", &[]),
+            pipeline.build_retrieve_streaming_command(&worker, "/src", &[]),
+            pipeline.build_result_dir_retrieve_command(&worker, "/src", Path::new("results")),
+        ];
+        for command in commands {
+            let args: Vec<_> = command.as_std().get_args().collect();
+            let paths: Vec<_> = args
+                .windows(2)
+                .filter(|pair| pair[0] == "--rsync-path")
+                .collect();
+            assert_eq!(paths.len(), 1, "exactly one activity wrapper: {args:?}");
+            let path = paths[0][1].to_string_lossy();
+            assert!(
+                path.starts_with("env RCH_ACTIVITY_TEST=owned sh -c "),
+                "{path}"
+            );
+            assert!(path.ends_with(" rch-source-rsync"), "{path}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_grant_does_not_authorize_pruning_sibling_target_pools() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut pipeline = TransferPipeline::new(
+            directory.path().to_owned(),
+            "activity".into(),
+            "abcdef".into(),
+            TransferConfig::default(),
+        )
+        .with_remote_path_override("/worker/sources/current")
+        .with_remote_cargo_target_dir_override("/worker/pools/.rch-target-current-pool-abcdef");
+        pipeline.source_authority_prefix = Some("env RCH_ACTIVITY_TEST=owned".into());
+        assert_eq!(pipeline.escaped_pooled_target_override_parent(), None);
+        let worker = estimate_test_worker();
+        for command in [
+            pipeline.build_sync_command(
+                &worker, "user@worker:/worker/sources/current", "/worker/sources/current", &[],
+            ),
+            pipeline.build_sync_streaming_command(
+                &worker, "user@worker:/worker/sources/current", "/worker/sources/current", &[],
+            ),
+        ] {
+            let args: Vec<_> = command.as_std().get_args().collect();
+            let wrapper = args.windows(2)
+                .find(|pair| pair[0] == "--rsync-path").unwrap()[1].to_string_lossy();
+            assert!(!wrapper.contains("find /worker/pools"), "{wrapper}");
+            assert!(wrapper.contains("find /worker/sources/current"), "{wrapper}");
+        }
     }
 
     #[test]

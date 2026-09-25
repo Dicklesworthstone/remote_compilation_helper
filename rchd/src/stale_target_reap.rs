@@ -25,10 +25,12 @@
 //!   (`<base>/<repo>/<glob>`). A bare `target`, a source dir, `.git`, `.beads`,
 //!   etc. are structurally unreachable by the glob + depth.
 //! - A dir is removed only if **neither it nor any descendant** was modified
-//!   within the idle window (default 12h). An active build touches its dir
-//!   continuously, so a live (or merely paused-for-minutes) build is always kept —
-//!   this is what makes the sweep safe to run concurrently with active builds, on
-//!   the same worker or even the same repo.
+//!   within the idle window (default 12h), and the durable source registry has
+//!   no overlapping active or pending claim. Quiet outputs awaiting recovery
+//!   remain owned even when their original process has exited.
+//! - The shared builder reserves each deletion durably under the admission
+//!   metadata lock. A killed sweep leaves its reservation intact, preventing a
+//!   surviving removal child from racing a newly admitted source writer.
 //! - The `remote_base` is validated against
 //!   [`rch_common::stale_target_reap::is_safe_reap_base`] before being embedded in
 //!   the generated shell (the security boundary).

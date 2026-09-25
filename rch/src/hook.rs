@@ -1380,6 +1380,15 @@ impl DurableLeaseWriter {
                 .lease
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(recovery) = lease.recovery.as_ref() {
+                anyhow::ensure!(
+                    recovery.get("retired").and_then(serde_json::Value::as_bool) == Some(true),
+                    "previous remote source ownership is unresolved; recover this wrapper before another admission"
+                );
+            }
+            lease.recovery = None;
+            lease.exit_code = None;
+            lease.terminal_acknowledged = false;
             lease.admit(
                 remote_build_id,
                 worker_id.as_str().to_string(),
@@ -1387,6 +1396,18 @@ impl DurableLeaseWriter {
             );
         }
         self.persist()
+    }
+
+    fn ensure_released_for_retry(&self) -> anyhow::Result<()> {
+        let lease = self.snapshot();
+        if let Some(recovery) = lease.recovery.as_ref() {
+            anyhow::ensure!(
+                recovery.get("retired").and_then(serde_json::Value::as_bool) == Some(true),
+                "remote source ownership is unresolved; run rch jobs recover {} before retrying",
+                lease.identity.local_wrapper_id
+            );
+        }
+        Ok(())
     }
 
     pub(crate) fn heartbeat(&self, phase: &str) -> anyhow::Result<()> {
@@ -1411,13 +1432,11 @@ impl DurableLeaseWriter {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             if let Some(recovery) = lease.recovery.as_ref()
-                && recovery
-                    .get("returned")
-                    .and_then(serde_json::Value::as_i64)
-                    .is_none()
+                && (recovery.get("returned").and_then(serde_json::Value::as_i64).is_none()
+                    || recovery.get("retired").and_then(serde_json::Value::as_bool) != Some(true))
             {
                 anyhow::bail!(
-                    "durable retrieval evidence is incomplete; terminal acknowledgement refused (state stays recoverable)"
+                    "durable retrieval or source release evidence is incomplete; terminal acknowledgement refused (state stays recoverable)"
                 );
             }
             lease.acknowledge_terminal(now_unix_ms());
@@ -1426,14 +1445,22 @@ impl DurableLeaseWriter {
     }
 
     fn persist(&self) -> anyhow::Result<()> {
-        let bytes = {
-            let lease = self
-                .lease
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            serde_json::to_vec_pretty(&*lease)?
-        };
-        atomic_write(&self.path, &bytes)
+        self.persist_snapshot(atomic_write)
+    }
+
+    fn persist_snapshot(
+        &self,
+        publish: impl FnOnce(&Path, &[u8]) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        // Keep publication inside the same mutex as snapshot serialization.
+        // Otherwise a heartbeat can write its older Preparing snapshot after
+        // execution admission was durably recorded, enabling unsafe recovery.
+        let lease = self
+            .lease
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let bytes = serde_json::to_vec_pretty(&*lease)?;
+        publish(&self.path, &bytes)
     }
 }
 
@@ -3494,7 +3521,10 @@ pub async fn run_exec(
                 }
             }
             Err(e) => {
-                if let Some(preflight_err) = e.downcast_ref::<DependencyPreflightFailure>() {
+                if classify_remote_pipeline_failure(&e)
+                    == RemotePipelineFailurePolicy::AllowLocalFallback
+                    && let Some(preflight_err) = e.downcast_ref::<DependencyPreflightFailure>()
+                {
                     // Project-specific: retrying a different worker cannot help.
                     let evidence_summary = preflight_err.evidence_summary();
                     warn!(
@@ -3522,7 +3552,9 @@ pub async fn run_exec(
                 }
 
                 // Transfer skip (a "run locally instead" decision, not a failure).
-                if let Some(skip_err) = e.downcast_ref::<TransferError>()
+                if classify_remote_pipeline_failure(&e)
+                    == RemotePipelineFailurePolicy::AllowLocalFallback
+                    && let Some(skip_err) = e.downcast_ref::<TransferError>()
                     && let TransferError::TransferSkipped { reason } = skip_err
                 {
                     reporter.summary(&format!("[RCH] local ({})", reason));
@@ -3636,6 +3668,10 @@ pub async fn run_exec(
             }
         };
 
+        // A retry must not overwrite the only recovery identity for an older
+        // source grant. This check precedes requesting another reservation.
+        durable_lease.ensure_released_for_retry()
+            .context(crate::transfer::RemoteExecutionUnconfirmed)?;
         // Worker-fault failure: try a bigger/different worker before going terminal.
         if attempt < max_attempts
             && let Some((next_response, next_worker)) = try_retry_on_bigger_worker(
@@ -3838,6 +3874,7 @@ mod repo_updater;
 // consumes the same items via `crate::hook::ssh`, so the module stays
 // crate-internal (`pub(crate)`) rather than fully private.
 pub(crate) mod ssh;
+pub(crate) use ssh::{source_authority_activity_prefix, source_authority_cleanup_prefix};
 
 // The dependency-closure sync planning + remote dependency-preflight cluster
 // (sync-closure plan/manifest, sync-topology predicates, cargo manifest/workspace

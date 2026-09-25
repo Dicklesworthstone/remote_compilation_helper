@@ -375,6 +375,22 @@ transfer before retrying that retrieval phase. An absent wrapper can recover
 outstanding outputs from its retained journal without starting another build.
 Use a rebuilt daemon with the identity-aware job routes; older daemons are refused.
 
+On POSIX workers, source ownership is saved before synchronization starts and
+remains active through output retrieval, including after the SSH lock holder
+disappears. Another job cannot overwrite an overlapping source root while that
+ownership is unresolved; disjoint source trees can still run concurrently.
+Uploads, verification, execution, and collection check the same ownership token.
+Operations within one token are serialized. An uncertain preparation failure
+ends that preparation; its token is drained and cancelled before a new attempt,
+so an older upload cannot arrive after verification and change compiler inputs.
+Recovery of an interrupted preparation drains surviving transfers and cancels
+that token, so a delayed upload cannot mutate a tree after ownership is released.
+Once execution may have started, recovery requires its exact completion record.
+If a worker loses its ownership registry or the local recovery recipe predates
+this protocol, recovery refuses to infer ownership from the current source bytes.
+Worker cache cleanup also respects retained source grants, including jobs whose
+outputs are quiet but still await recovery.
+
 ### Config + Diagnostics
 
 ```bash

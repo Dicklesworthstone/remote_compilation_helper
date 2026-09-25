@@ -53,6 +53,7 @@ use super::source_fidelity::{
 use super::ssh::{
     acquire_clean_overlay_source_pair, acquire_remote_source_authority_lock,
     ensure_worker_projects_topology, remote_preflight_topology_policy,
+    worker_projects_topology_requires_initialization,
 };
 use super::*;
 
@@ -494,6 +495,82 @@ pub(super) async fn execute_remote_compilation(
     // `None` keeps pooled stores inside the project mirror.
     pooled_target_store_base: Option<&str>,
 ) -> anyhow::Result<RemoteExecutionResult> {
+    let outcome = execute_remote_compilation_inner(
+        worker,
+        command,
+        transfer_config,
+        env_allowlist,
+        forwarded_cargo_target_dir,
+        compilation_config,
+        toolchain,
+        kind,
+        reporter,
+        socket_path,
+        color_mode,
+        build_id,
+        local_wrapper_id,
+        durable_lease,
+        topology_policy,
+        clean_overlay,
+        source_content_receipt,
+        result_dirs,
+        layer0_env,
+        pooled_target_prune_idle_hours,
+        pooled_target_store_base,
+    )
+    .await;
+    // The inner future has dropped every local holder before cleanup tries to
+    // reattach it. Cancellation drains remote mutation descriptors first; once
+    // execution may have started, its exact completion must resolve ownership.
+    if outcome.is_err()
+        && let Some(writer) = durable_lease.filter(|writer| writer.snapshot().recovery.is_some())
+    {
+        match recovery::cancel_preparation(writer).await {
+            Ok(true) => {}
+            Ok(false) => {
+                return outcome
+                    .map_err(|error| error.context(crate::transfer::RemoteExecutionUnconfirmed));
+            }
+            Err(cleanup) => {
+                let detail = format!(
+                    "source ownership remains recoverable with rch jobs recover {}: {cleanup:#}",
+                    writer.snapshot().identity.local_wrapper_id
+                );
+                return outcome.map_err(|error| {
+                    error
+                        .context(detail)
+                        .context(crate::transfer::RemoteExecutionUnconfirmed)
+                });
+            }
+        }
+    }
+    outcome
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_remote_compilation_inner(
+    worker: &SelectedWorker,
+    command: &str,
+    transfer_config: TransferConfig,
+    env_allowlist: Vec<String>,
+    forwarded_cargo_target_dir: Option<PathBuf>,
+    compilation_config: &rch_common::CompilationConfig,
+    toolchain: Option<&ToolchainInfo>,
+    kind: Option<CompilationKind>,
+    reporter: &HookReporter,
+    socket_path: &str,
+    color_mode: ColorMode,
+    build_id: Option<u64>,
+    local_wrapper_id: Option<&str>,
+    durable_lease: Option<&DurableLeaseWriter>,
+    topology_policy: &PathTopologyPolicy,
+    clean_overlay: Option<&CleanOverlaySpec>,
+    source_content_receipt: bool,
+    result_dirs: &[PathBuf],
+    layer0_env: &[(String, String)],
+    pooled_target_prune_idle_hours: u32,
+    pooled_target_store_base: Option<&str>,
+) -> anyhow::Result<RemoteExecutionResult> {
     let worker_config = selected_worker_to_config(worker);
     // The build is already registered. Source validation and fingerprinting can
     // outlast the stuck detector's deadline before any remote transfer begins.
@@ -900,25 +977,6 @@ pub(super) async fn execute_remote_compilation(
     } else {
         remote_cap
     };
-    // Acquire before topology's ownership repair can inspect/change the pair.
-    let mut source_pair_lock = if source_pair_pool.is_some()
-        && !super::ssh::should_skip_remote_preflight(&worker_config)
-    {
-        reporter.verbose("[RCH] waiting for the clean-overlay source/target pair; same-pool jobs serialize through retrieval");
-        Some(
-            acquire_clean_overlay_source_pair(
-                &worker_config,
-                overlay_remote_root
-                    .as_deref()
-                    .ok_or_else(|| anyhow::anyhow!("missing clean-overlay container"))?,
-                command_timeout,
-            )
-            .await?,
-        )
-    } else {
-        None
-    };
-
     // Ensure deterministic remote topology before any repo synchronization.
     // bd-8iwkm/bd-gc0ze: the ownership sweep inside is scoped to this
     // dispatch's closure remote roots so its cost tracks the trees about to
@@ -994,11 +1052,41 @@ pub(super) async fn execute_remote_compilation(
                 stable
             })
     };
+    let durable_sources =
+        !worker_is_windows && !super::ssh::should_skip_remote_preflight(&worker_config);
+    // Initializing a shared alias changes the physical meaning of every path
+    // beneath it. Discover that need without mutation, then include both
+    // topology roots in the same saved grant before creating either path.
+    // Healthy topology needs no parent grant, so sibling builds stay parallel.
+    let initialize_topology = if durable_sources {
+        worker_projects_topology_requires_initialization(&worker_config, &remote_topology_policy)
+            .await?
+    } else {
+        false
+    };
     let mut mutable_source_authority_roots: Vec<String> = sync_plan
         .iter()
         .map(|entry| entry.remote_root.clone())
-        .filter(|root| source_pair_pool.is_none() || Some(root) != overlay_remote_root.as_ref())
         .collect();
+    if initialize_topology {
+        for root in [
+            remote_topology_policy.canonical_root(),
+            remote_topology_policy.alias_root(),
+        ] {
+            mutable_source_authority_roots.push(
+                root.to_str()
+                    .context("worker topology root is not a UTF-8 path")?
+                    .to_owned(),
+            );
+        }
+    }
+    if source_pair_pool.is_some()
+        && let Some(root) = overlay_remote_root.as_ref()
+    {
+        // Include the complete pair in the durable claim. Its already-owned
+        // kernel lock is omitted by the source grant using the live pair guard.
+        mutable_source_authority_roots.push(root.clone());
+    }
     if let Some(primary) = sync_plan.iter().find(|entry| entry.is_primary) {
         mutable_source_authority_roots.push(pooled_target_dir_override.clone().unwrap_or_else(
             || {
@@ -1017,6 +1105,42 @@ pub(super) async fn execute_remote_compilation(
     if worker_is_windows {
         mutable_source_authority_roots.clear();
     }
+    let source_identity = durable_sources.then_some(recovery_identity.as_str());
+    let planned_pair = source_pair_pool.as_ref().map(|_| {
+        (
+            overlay_remote_root
+                .clone()
+                .expect("paired source container"),
+            recovery_identity.clone(),
+        )
+    });
+    if durable_sources {
+        recovery::RecoverySession::begin(
+            durable_lease.context(
+                "remote source ownership requires an admitted durable job lease; use rch exec",
+            )?,
+            &worker_config,
+            mutable_source_authority_roots.clone(),
+            planned_pair.clone(),
+            overlay_remote_root.clone(),
+            transfer_config.clone(),
+            normalized_project_root.clone(),
+            recovery_identity.clone(),
+        )?;
+    }
+    let mut source_pair_lock = if durable_sources {
+        if let Some((root, token)) = planned_pair.as_ref() {
+            reporter.verbose("[RCH] waiting for the clean-overlay source/target pair; same-pool jobs serialize through retrieval");
+            Some(
+                acquire_clean_overlay_source_pair(&worker_config, root, token, command_timeout)
+                    .await?,
+            )
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     let mut source_authority_lock = if mutable_source_authority_roots.is_empty()
         || super::ssh::should_skip_remote_preflight(&worker_config)
     {
@@ -1031,6 +1155,7 @@ pub(super) async fn execute_remote_compilation(
             &worker_config,
             &mutable_source_authority_roots,
             source_pair_lock.as_mut(),
+            &recovery_identity,
             command_timeout,
         )
         .await?;
@@ -1047,24 +1172,22 @@ pub(super) async fn execute_remote_compilation(
         reporter,
         &remote_topology_policy,
         &ownership_scan_roots,
+        source_identity,
+        initialize_topology,
     )
     .await?;
-    if !mutable_source_authority_roots.is_empty()
-        && !super::ssh::should_skip_remote_preflight(&worker_config)
-    {
-        recovery::claim_sources(
-            &worker_config,
-            &mutable_source_authority_roots,
-            &recovery_identity,
-        )
-        .await?;
-    }
     // Hold source and output authorities through retrieval, not only execution.
     // Best-effort repo convergence for ordinary multi-repo dependency graphs.
     // A clean-overlay run already names an immutable base; mutating repositories
     // behind that receipt would break the source identity guarantee.
     if clean_overlay.is_none() {
-        maybe_sync_repo_set_with_repo_updater(&worker_config, &sync_roots, reporter).await;
+        maybe_sync_repo_set_with_repo_updater(
+            &worker_config,
+            &sync_roots,
+            reporter,
+            source_identity,
+        )
+        .await?;
     }
 
     let mut primary_pipeline: Option<TransferPipeline> = None;
@@ -1125,6 +1248,9 @@ pub(super) async fn execute_remote_compilation(
         .with_worker_platform(WorkerPlatform::from_worker(&worker_config))
         .with_build_id(build_id)
         .with_pooled_target_prune_idle_hours(pooled_target_prune_idle_hours);
+        if let Some(identity) = source_identity {
+            root_pipeline = root_pipeline.with_source_authority(identity.to_owned())?;
+        }
         if let Some(spec) = root_overlay {
             root_pipeline = root_pipeline
                 .with_sync_include_patterns(clean_overlay_include_patterns(
@@ -1320,12 +1446,14 @@ pub(super) async fn execute_remote_compilation(
             }
             Err(e) => {
                 if entry.is_primary
+                    || durable_sources
                     || clean_overlay.is_some()
                     || exact_dependency_closure_sync
                     || source_content_receipt
                 {
-                    // Cargo dependency-closure builds must not continue against
-                    // stale sibling repositories on the worker.
+                    // Any failed owned transfer may still arrive remotely.
+                    // Cancel and drain this token before another preparation;
+                    // never continue into execution behind a late old writer.
                     if let Some(history) =
                         e.downcast_ref::<crate::transfer::TransferAttemptsExhausted>()
                     {
@@ -1507,7 +1635,13 @@ pub(super) async fn execute_remote_compilation(
         } else {
             &root_outcomes
         };
-        verify_remote_dependency_manifests(&worker_config, preflight_outcomes, reporter).await?;
+        verify_remote_dependency_manifests(
+            &worker_config,
+            preflight_outcomes,
+            reporter,
+            source_identity,
+        )
+        .await?;
     }
 
     if source_content_build_id.is_some() {
@@ -1521,7 +1655,8 @@ pub(super) async fn execute_remote_compilation(
         // Admission check immediately before Cargo opens the isolated source
         // tree. The same roots are verified again after Cargo exits, and only
         // then is the single receipt emitted.
-        verify_source_content_roots(&worker_config, &prepared_source_roots).await?;
+        verify_source_content_roots(&worker_config, &prepared_source_roots, source_identity)
+            .await?;
     }
     if let Some(lock) = source_authority_lock.as_mut() {
         lock.ensure_held()?;
@@ -1621,6 +1756,9 @@ pub(super) async fn execute_remote_compilation(
         .map(BuildHeartbeatLoop::shared_state);
     let mut suppress_telemetry = false;
 
+    if let Some(session) = recovery_session.as_mut() {
+        session.starting_execution()?;
+    }
     let result = pipeline
         .execute_remote_streaming(
             &worker_config,
@@ -1713,7 +1851,22 @@ pub(super) async fn execute_remote_compilation(
 
     // A setup refusal authorizes failover only after the execution and source
     // ownership checks above have established that this attempt has finished.
-    ensure_remote_process_setup_after_completion(&pipeline, &result, source_pair_lock.as_mut())?;
+    if let Err(error) =
+        ensure_remote_process_setup_after_completion(&pipeline, &result, source_pair_lock.as_mut())
+    {
+        if error.is::<crate::transfer::RemoteProcessSetupUnavailable>()
+            && let Some(session) = recovery_session.as_mut()
+        {
+            // This typed refusal follows an exact completion and proves the
+            // workload never started. Finish source ownership before allowing
+            // the caller's existing worker-failover path to select another job.
+            session.returned(result.exit_code)?;
+            drop(source_authority_lock.take());
+            drop(source_pair_lock.take());
+            session.retire_returned().await?;
+        }
+        return Err(error);
+    }
 
     let stderr_capture = std::mem::take(&mut *stderr_capture_cell.borrow_mut());
 
@@ -1755,6 +1908,7 @@ pub(super) async fn execute_remote_compilation(
             command,
             result.exit_code,
             &prepared_source_roots,
+            source_identity,
         )
         .await?;
         reporter.summary_critical(&format!(
@@ -2434,12 +2588,9 @@ pub(super) async fn execute_remote_compilation(
         session.returned(exit_code)?;
     }
 
-    // bd-p1vlb: an unpooled clean-overlay root is invocation-unique (a job nonce is
-    // hashed into it) and holds a full materialized snapshot; once artifacts
-    // and declared result dirs are retrieved above, the tree is dead weight
-    // on the worker's staging base. Best-effort reap: failures only log —
-    // residue is caught by periodic `rch cache clean --base` sweeps — and
-    // never affect the surfaced exit code.
+    // Retire the materialized clean-overlay source after delivery. The durable
+    // grant remains outstanding on failure so recovery can finish retirement
+    // before a subsequent owner is allowed to write the same source pair.
     if retrieval_complete && let Some(overlay_remote_root) = overlay_remote_root.as_deref() {
         if let Some(lock) = source_pair_lock.as_mut() {
             lock.ensure_held()?;
@@ -2448,23 +2599,44 @@ pub(super) async fn execute_remote_compilation(
             .reap_remote_tree(&worker_config, overlay_remote_root)
             .await
         {
-            Ok(()) => reporter.verbose(&format!(
-                "[RCH] clean-overlay remote root {overlay_remote_root} reaped"
-            )),
-            Err(e) => warn!(
-                "clean-overlay reap of {} on {} failed (residue ages out): {e}",
-                overlay_remote_root, worker_config.id
-            ),
+            Ok(()) => {
+                reporter.verbose(&format!(
+                    "[RCH] clean-overlay remote root {overlay_remote_root} reaped"
+                ));
+                if let Some(session) = recovery_session.as_mut() {
+                    session.tree_retired()?;
+                }
+            }
+            Err(error) => {
+                return Err(
+                    error.context("remote tree retirement remains pending; use jobs recover")
+                );
+            }
         }
+    }
+    if retrieval_complete
+        && overlay_remote_root.is_none()
+        && let Some(session) = recovery_session.as_mut()
+    {
+        session.tree_retired()?;
     }
     if retrieval_complete && let Some(lock) = source_pair_lock.take() {
         // The explicit acknowledgment also verifies that the root is gone.
         // Never release this lease from an error/Drop path: a remote process
         // or transfer may still be alive after its client disconnects.
         lock.release().await?;
+        if let Some(session) = recovery_session.as_mut() {
+            session.pair_released()?;
+        }
     }
-    if let Some(lock) = source_authority_lock.take() {
+    if retrieval_complete && let Some(lock) = source_authority_lock.take() {
         lock.release().await?;
+        if let Some(session) = recovery_session.as_mut() {
+            session.sources_released()?;
+        }
+    }
+    if retrieval_complete && let Some(session) = recovery_session.as_mut() {
+        session.retire_returned().await?;
     }
 
     if clean_overlay_cargo

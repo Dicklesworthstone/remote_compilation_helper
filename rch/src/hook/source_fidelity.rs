@@ -346,18 +346,20 @@ fn remote_verify_command(manifest: &SourceContentRootManifest) -> String {
 async fn verify_remote_root(
     worker: &WorkerConfig,
     root: &PreparedSourceContentRoot,
+    source_identity: Option<&str>,
 ) -> anyhow::Result<()> {
     root.pipeline
         .verify_source_content_rsync_barrier(worker)
         .await?;
     let payload = remote_manifest_payload(&root.manifest)?;
-    let output = run_offload_ssh_command_with_stdin(
-        worker,
-        &remote_verify_command(&root.manifest),
-        &payload,
-        REMOTE_VERIFY_TIMEOUT,
-    )
-    .await?;
+    let command = remote_verify_command(&root.manifest);
+    let command = match source_identity {
+        Some(identity) => super::ssh::wrap_remote_source_activity(&command, identity)?,
+        None => command,
+    };
+    let output =
+        run_offload_ssh_command_with_stdin(worker, &command, &payload, REMOTE_VERIFY_TIMEOUT)
+            .await?;
     if !output.status.success() {
         anyhow::bail!(
             "remote source-content verification failed on {} for {} (exit {:?}): {}",
@@ -393,12 +395,13 @@ async fn verify_remote_root(
 pub(super) async fn verify_source_content_roots(
     worker: &WorkerConfig,
     prepared: &[PreparedSourceContentRoot],
+    source_identity: Option<&str>,
 ) -> anyhow::Result<()> {
     if prepared.is_empty() {
         anyhow::bail!("source-content proof has no synchronized roots");
     }
     for root in prepared {
-        verify_remote_root(worker, root).await?;
+        verify_remote_root(worker, root, source_identity).await?;
     }
 
     // Re-enumerate and re-hash after every remote verification. A lasting local
@@ -434,8 +437,9 @@ pub(super) async fn finalize_source_content_receipt(
     command: &str,
     command_exit_code: i32,
     prepared: &[PreparedSourceContentRoot],
+    source_identity: Option<&str>,
 ) -> anyhow::Result<SourceContentReceipt> {
-    verify_source_content_roots(worker, prepared).await?;
+    verify_source_content_roots(worker, prepared, source_identity).await?;
 
     let roots = prepared
         .iter()
