@@ -37,7 +37,10 @@ use rabs_protocol::result_identity::TypedDigest;
 use crate::metadata_store::{
     DivergenceIncidentRow, QuarantineScope, RabsMetadataStore, StoreError, digest_key,
 };
-use crate::serving_state::{RevalidationError, SERVABLE_DISPOSITION, action_quarantine_present};
+use crate::serving_state::{
+    RevalidationError, SERVABLE_DISPOSITION, action_quarantine_present,
+    divergence_quarantine_disposition,
+};
 use crate::trust_evidence::{
     DISPOSITION_QUARANTINED, require_active_authority, verification_evidence,
 };
@@ -98,7 +101,7 @@ pub enum PrivateExecutionReason {
     InvalidPolicy,
     /// No committed publication or corresponding serving record exists.
     NoPublishedResult,
-    /// A durable action quarantine or named blocker forbids reuse.
+    /// A durable quarantine, unresolved incident, or named blocker forbids reuse.
     Quarantined,
     /// The mutable serving disposition does not permit reuse.
     ServingNotEligible {
@@ -188,7 +191,10 @@ pub fn serving_sample_decision(
             PrivateExecutionReason::NoPublishedResult,
         ));
     };
-    if !record.blocking.is_empty() || action_quarantine_present(store, &action_key)? {
+    if !record.blocking.is_empty()
+        || action_quarantine_present(store, &action_key)?
+        || divergence_quarantine_disposition(store, &action_key)?.is_some()
+    {
         return Ok(SampleGateDecision::ExecutePrivately(
             PrivateExecutionReason::Quarantined,
         ));

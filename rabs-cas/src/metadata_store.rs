@@ -643,6 +643,9 @@ pub enum StoreError {
     /// Serving-state revision not strictly greater than the stored one
     /// (replayed or stale evaluation; H040).
     StaleServingRevision,
+    /// An ordinary serving writer attempted to weaken quarantine without
+    /// the verified incident-repair flow. A newer revision is not a receipt.
+    QuarantineRequiresRepair,
     /// A named blocking quarantine row does not exist — references are
     /// the authority, so dangling ones are refused at write.
     UnknownQuarantineReference,
@@ -1624,8 +1627,11 @@ pub trait RabsMetadataStore {
     /// Serving disposition for an action key, if a row exists.
     fn serving_disposition_key(&mut self, action_key: &str) -> Result<Option<String>, StoreError>;
 
-    /// Set (insert or overwrite) the serving disposition for an action
-    /// key.
+    /// Set the serving disposition for an action key. A changed disposition
+    /// atomically advances its H040 revision while preserving validity,
+    /// authority, and blocking references. Restating the same disposition is
+    /// idempotent; a stale prepared renewal cannot erase a newer quarantine.
+    /// Ordinary writes cannot weaken either full or presentation quarantine.
     fn set_serving_disposition_key(
         &mut self,
         action_key: &str,
@@ -2627,23 +2633,58 @@ impl<E: SqlEngine> SqlMetadataStore<E> {
         Ok(())
     }
 
+    fn require_quarantine_preserved(current: &str, proposed: &str) -> Result<(), StoreError> {
+        if (current == "quarantined" && proposed != "quarantined")
+            || (current == "presentation-quarantined"
+                && !matches!(proposed, "presentation-quarantined" | "quarantined"))
+        {
+            return Err(StoreError::QuarantineRequiresRepair);
+        }
+        Ok(())
+    }
+
     fn set_serving_disposition_row(
         engine: &mut E,
         action_key: &str,
         disposition: &str,
     ) -> Result<(), StoreError> {
-        // UPDATE first preserves the H040 revision and validity columns.
-        let changed = engine.execute(
-            "UPDATE action_serving_states SET disposition = ?2 WHERE action_key = ?1",
-            &[
-                SqlValue::Text(action_key.to_owned()),
-                SqlValue::Text(disposition.to_owned()),
-            ],
+        let rows = engine.query(
+            "SELECT disposition, state_revision FROM action_serving_states WHERE action_key = ?1",
+            &[SqlValue::Text(action_key.to_owned())],
         )?;
-        if changed == 0 {
+        if let Some(row) = rows.first() {
+            let [stored_disposition, stored_revision] = row.as_slice() else {
+                return Err(StoreError::Corruption(
+                    "serving disposition row shape".into(),
+                ));
+            };
+            let stored_disposition = expect_text(stored_disposition, "disposition")?;
+            Self::require_quarantine_preserved(&stored_disposition, disposition)?;
+            let revision = expect_u64(stored_revision, "state_revision")?;
+            let revision = if stored_disposition == disposition {
+                revision
+            } else {
+                revision
+                    .checked_add(1)
+                    .ok_or_else(|| StoreError::Corruption("serving revision exhausted".into()))?
+            };
+            let revision = to_seq(revision, "state_revision")?;
+            // The disposition and its revision land in ONE transaction.
+            // In particular, quarantine must fence renewals prepared before
+            // this write even if later incident bookkeeping never lands.
             engine.execute(
-                "INSERT INTO action_serving_states (action_key, disposition, version) \
-                 VALUES (?1, ?2, 1)",
+                "UPDATE action_serving_states SET disposition = ?2, state_revision = ?3 \
+                 WHERE action_key = ?1",
+                &[
+                    SqlValue::Text(action_key.to_owned()),
+                    SqlValue::Text(disposition.to_owned()),
+                    SqlValue::Int(revision),
+                ],
+            )?;
+        } else {
+            engine.execute(
+                "INSERT INTO action_serving_states (action_key, disposition, version, state_revision) \
+                 VALUES (?1, ?2, 1, 0)",
                 &[
                     SqlValue::Text(action_key.to_owned()),
                     SqlValue::Text(disposition.to_owned()),
@@ -3635,19 +3676,20 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
                     SqlValue::Text(u128_hex(row.pin_id)),
                 ],
             )?;
-            // Disposition-only write: UPDATE first so the H040 revision
-            // and validity columns are never silently reset by a legacy
-            // path.
-            let serving_changed = engine.execute(
-                "UPDATE action_serving_states SET disposition = 'servable' WHERE action_key = ?1",
+            // A pre-existing serving row may carry an operator quarantine or
+            // an H040 revision. Publication is not permission to erase either.
+            let serving_exists = engine.query(
+                "SELECT 1 FROM action_serving_states WHERE action_key = ?1",
                 &[SqlValue::Text(action.clone())],
             )?;
-            if serving_changed == 0 {
+            if serving_exists.is_empty() {
                 engine.execute(
                     "INSERT INTO action_serving_states (action_key, disposition, version) \
                      VALUES (?1, 'servable', 1)",
                     &[SqlValue::Text(action.clone())],
                 )?;
+            } else {
+                Self::set_serving_disposition_row(engine, &action, "servable")?;
             }
             // The winner's evidence association, SAME transaction (H011),
             // bound to the committed canonical manifest (H029; I37) and
@@ -5895,7 +5937,7 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
         self.in_txn(move |engine| {
             SqlMetadataStore::<E>::require_active(engine, &authority)?;
             let stored = engine.query(
-                "SELECT state_revision FROM action_serving_states WHERE action_key = ?1",
+                "SELECT state_revision, disposition FROM action_serving_states WHERE action_key = ?1",
                 &[SqlValue::Text(action_key.clone())],
             )?;
             let stored_revision = match stored.first().and_then(|r| r.first()) {
@@ -5905,6 +5947,12 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
             // Legacy rows are revision 0; H040 records start at 1.
             if state_revision == 0 || stored_revision.is_some_and(|s| state_revision <= s) {
                 return Err(StoreError::StaleServingRevision);
+            }
+            if let Some(row) = stored.first() {
+                let [_, current] = row.as_slice() else {
+                    return Err(StoreError::Corruption("serving revision row shape".into()));
+                };
+                Self::require_quarantine_preserved(&expect_text(current, "disposition")?, &disposition)?;
             }
             // Every NAMED blocking quarantine must exist (references are
             // the authority; dangling ones are refused at write).

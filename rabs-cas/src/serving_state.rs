@@ -11,7 +11,8 @@
 //!   (`StaleServingRevision`), never an overwrite — idempotency lives at
 //!   the message layer, not by clobbering state.
 //! - **Quarantine is independent of serving metadata**: named blocking
-//!   references AND durable action-entry quarantine rows deny serving.
+//!   references, durable action-entry quarantine rows, and unresolved
+//!   divergence incidents deny serving.
 //!   Dropping a reference or rewriting a disposition is not a repair.
 //!   A dangling reference is refused at write time
 //!   (`UnknownQuarantineReference`).
@@ -32,7 +33,8 @@ use rabs_protocol::serving::ServingValidity;
 use crate::metadata_store::{
     DivergenceIncidentRow, QuarantineScope, RabsMetadataStore, SqlValue, StoreError, digest_key,
 };
-use crate::trust_evidence::require_active_authority;
+use crate::publication::DISPOSITION_PRESENTATION_QUARANTINED;
+use crate::trust_evidence::{DISPOSITION_QUARANTINED, require_active_authority};
 
 /// Disposition string under which serving is possible at all.
 pub const SERVABLE_DISPOSITION: &str = "servable";
@@ -54,14 +56,47 @@ pub(crate) fn action_quarantine_present(
         .is_empty())
 }
 
+/// A durable divergence incident is not released by replacing its serving
+/// record. In particular, observable-only divergence has no action-entry
+/// quarantine row: an old H040 renewal must not erase its only replay veto.
+///
+/// Incidents are currently append-only and have no verified resolution API.
+/// Treat them as unresolved until that repair flow exists; passing evidence,
+/// a newer serving revision, and a coordinator restart are not repair receipts.
+/// Keep the narrower presentation disposition only when EVERY incident has
+/// that class. Unknown classes conservatively block the whole action.
+pub(crate) fn divergence_quarantine_disposition(
+    store: &mut dyn RabsMetadataStore,
+    action_key: &str,
+) -> Result<Option<&'static str>, StoreError> {
+    let key = [SqlValue::Text(action_key.to_owned())];
+    if !store
+        .query(
+            "SELECT 1 FROM divergence_incidents \
+             WHERE action_key = ?1 AND class != 'observable-only' LIMIT 1",
+            &key,
+        )?
+        .is_empty()
+    {
+        return Ok(Some(DISPOSITION_QUARANTINED));
+    }
+    Ok((!store
+        .query(
+            "SELECT 1 FROM divergence_incidents WHERE action_key = ?1 LIMIT 1",
+            &key,
+        )?
+        .is_empty())
+    .then_some(DISPOSITION_PRESENTATION_QUARANTINED))
+}
+
 /// The gate's typed decision for one action key at one instant.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServeDecision {
     /// No serving record exists.
     NoRecord,
-    /// The disposition forbids serving.
+    /// The disposition or an unresolved divergence incident forbids serving.
     NotServable {
-        /// The stored disposition.
+        /// The effective disposition, including a durable incident veto.
         disposition: String,
     },
     /// Blocked by named references or a durable action quarantine.
@@ -107,6 +142,11 @@ pub fn serving_gate(
     if action_quarantine_present(store, action_key)? {
         return Ok(ServeDecision::Blocked {
             references: vec![("action-entry".to_owned(), action_key.to_owned())],
+        });
+    }
+    if let Some(disposition) = divergence_quarantine_disposition(store, action_key)? {
+        return Ok(ServeDecision::NotServable {
+            disposition: disposition.to_owned(),
         });
     }
     if !record.validity.still_valid(now_unix_micros, now_epoch) {
@@ -403,6 +443,9 @@ pub fn apply_revalidation(
             || !record.blocking.is_empty()
             || action_quarantine_present(store, action_key_str)
                 .map_err(|e| RevalidationError::Store(format!("{e:?}")))?
+            || divergence_quarantine_disposition(store, action_key_str)
+                .map_err(|e| RevalidationError::Store(format!("{e:?}")))?
+                .is_some()
         {
             return Err(RevalidationError::ServingBlocked);
         }
@@ -792,16 +835,20 @@ mod tests {
             }
         );
 
-        // Legacy disposition-only writers must NOT reset the revision:
-        // the H040 columns survive a set_serving_disposition_key.
+        // Disposition-only writers advance the revision, preserving the
+        // other H040 columns and fencing any renewal prepared before them.
+        let before = store.serving_record(&action_key).unwrap().unwrap();
         store
             .set_serving_disposition_key(&action_key, "servable")
             .unwrap();
         let after = store.serving_record(&action_key).unwrap().unwrap();
         assert_eq!(
-            after.state_revision, 4,
-            "disposition-only write reset the revision — replay protection lost"
+            after.state_revision, 5,
+            "disposition-only write failed to fence an older serving evaluation"
         );
+        assert_eq!(after.validity, before.validity);
+        assert_eq!(after.authority_key, before.authority_key);
+        assert_eq!(after.blocking, before.blocking);
         assert_eq!(after.disposition, "servable");
         assert!(matches!(
             serving_gate(store, &action_key, 3_100, 1).unwrap(),
@@ -816,6 +863,50 @@ mod tests {
         let engine = RusqliteEngine::open_in_memory().unwrap();
         let mut store = SqlMetadataStore::open(engine).unwrap();
         t048_scenarios(&mut store);
+    }
+
+    #[test]
+    fn disposition_revision_exhaustion_never_partially_updates_quarantine() {
+        fn scenario(store: &mut dyn RabsMetadataStore) -> Vec<String> {
+            let (active, action_key) = published_fixture(store);
+            store
+                .put_serving_record(
+                    &active,
+                    &action_key,
+                    DISPOSITION_PRESENTATION_QUARANTINED,
+                    u64::try_from(i64::MAX).unwrap(),
+                    &validity(1_000, Some(5_000), 10, 2),
+                    &[],
+                )
+                .unwrap();
+            let before = store.differential_snapshot().unwrap();
+            assert_eq!(
+                store.set_serving_disposition_key(&action_key, DISPOSITION_QUARANTINED),
+                Err(StoreError::Corruption(
+                    "state_revision out of range".to_owned()
+                ))
+            );
+            assert_eq!(store.differential_snapshot().unwrap(), before);
+            // Restating the same quarantine needs no new revision and must
+            // remain idempotent even at the database's representable maximum.
+            store
+                .set_serving_disposition_key(&action_key, DISPOSITION_PRESENTATION_QUARANTINED)
+                .unwrap();
+            assert_eq!(store.differential_snapshot().unwrap(), before);
+            assert_eq!(
+                serving_gate(store, &action_key, 1_100, 2).unwrap(),
+                ServeDecision::NotServable {
+                    disposition: DISPOSITION_PRESENTATION_QUARANTINED.to_owned(),
+                }
+            );
+            before
+        }
+        let mut reference =
+            SqlMetadataStore::open(RusqliteEngine::open_in_memory().unwrap()).unwrap();
+        let mut candidate =
+            SqlMetadataStore::open(FsqliteEngine::open(&fresh_path("revision-exhausted")).unwrap())
+                .unwrap();
+        assert_eq!(scenario(&mut reference), scenario(&mut candidate));
     }
 
     #[test]

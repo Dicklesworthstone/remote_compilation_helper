@@ -44,7 +44,7 @@ use rabs_protocol::serving::TrustEvidenceTier;
 use crate::metadata_store::{
     QuarantineScope, RabsMetadataStore, SqlValue, StoreError, TrustEvaluationRow, digest_key,
 };
-use crate::serving_state::action_quarantine_present;
+use crate::serving_state::{action_quarantine_present, divergence_quarantine_disposition};
 
 /// Domain separator for the canonical evidence-set digest.
 pub const EVIDENCE_SET_DOMAIN: &str = "rabs.evidence-set.sha256.v1";
@@ -272,16 +272,20 @@ pub fn reevaluate_action(
     require_active_authority(store, authority)?;
     let action_key = digest_key(action);
     let action_quarantined = action_quarantine_present(store, &action_key)?;
+    let incident_disposition = divergence_quarantine_disposition(store, &action_key)?;
     let serving = store.serving_record(&action_key)?;
-    let serving_blocked = serving.as_ref().is_some_and(|record| {
-        record.disposition == DISPOSITION_QUARANTINED || !record.blocking.is_empty()
-    });
+    let serving_blocked = incident_disposition == Some(DISPOSITION_QUARANTINED)
+        || serving.as_ref().is_some_and(|record| {
+            record.disposition == DISPOSITION_QUARANTINED || !record.blocking.is_empty()
+        });
     // H026 observable-only divergence is narrower than action quarantine,
     // but still forbids replay. Verification and policy changes are not a
     // repair, including when the new policy would only leave evidence pending.
-    let presentation_quarantined = serving
-        .as_ref()
-        .is_some_and(|record| record.disposition == DISPOSITION_PRESENTATION_QUARANTINED);
+    let presentation_quarantined = incident_disposition
+        == Some(DISPOSITION_PRESENTATION_QUARANTINED)
+        || serving
+            .as_ref()
+            .is_some_and(|record| record.disposition == DISPOSITION_PRESENTATION_QUARANTINED);
     let keys = store.list_evidence_keys(action)?;
     let compromised = keys
         .iter()
@@ -893,7 +897,10 @@ mod tests {
             assert_eq!(eval.disposition, DISPOSITION_QUARANTINED);
             let after = store.serving_record(&action_key).unwrap().unwrap();
             assert_eq!(after.blocking, before.blocking);
-            assert_eq!(after.state_revision, before.state_revision);
+            assert_eq!(
+                after.state_revision,
+                before.state_revision + u64::from(named_blocker)
+            );
             assert!(matches!(
                 serving_gate(&mut store, &action_key, 200, 0).unwrap(),
                 ServeDecision::NotServable { .. }
