@@ -316,7 +316,12 @@ fn source_claim_roots(authority_roots: &[String]) -> anyhow::Result<(String, Str
     roots.dedup();
     let roots = format!("{}\n", roots.join("\n"));
     anyhow::ensure!(roots.len() <= 32 * 1024 * 1024, "source grant is too large");
-    let digest = format!("{:x}", Sha256::digest(roots.as_bytes()));
+    // sha2 0.11 digests are hybrid-array `Array`s, which implement no
+    // `LowerHex`; spell out the lowercase hex that `sha256sum` prints.
+    let digest = Sha256::digest(roots.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
     Ok((roots, digest))
 }
 
