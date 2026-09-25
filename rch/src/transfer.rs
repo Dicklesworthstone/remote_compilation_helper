@@ -153,21 +153,374 @@ async fn run_source_content_rsync_capture(
     }
 }
 
-/// Top-level members `retrieve_artifacts_windows` archives from the remote root.
-///
-/// A project ROOT (it has a `Cargo.toml`) yields only `./target`, so a
-/// project-root retrieval (`rustc`/`clang --target *-windows-msvc`, whose build
-/// dir is not forwarded) can never tar the synced remote source back over the
-/// local source tree — this mirrors the unix retrieval's source-integrity guard
-/// (rch bug d7xc3). A bare CARGO_TARGET_DIR (no `Cargo.toml`) yields `.`: it holds
-/// only build outputs, including the cross-target `<triple>/` subdir that a
-/// pattern-based root filter would miss, so archiving everything is both correct
-/// and safe.
-fn windows_retrieve_members(project_root: &Path) -> Vec<&'static str> {
-    if project_root.join("Cargo.toml").exists() {
-        vec!["./target"]
-    } else {
-        vec!["."]
+/// Windows uses the same rooted include and directory-exclusion policy as
+/// rsync. Compile it locally; shell expansion must never choose archive members.
+struct WindowsArtifactFilter {
+    pattern: Pattern,
+    rooted: bool,
+    directory_only: bool,
+}
+
+impl WindowsArtifactFilter {
+    fn new(raw: &str, include: bool) -> Result<Self> {
+        let rooted = include || raw.starts_with('/');
+        let directory_only = raw.ends_with('/');
+        let raw = raw.trim_start_matches('/').trim_end_matches('/');
+        anyhow::ensure!(!raw.is_empty(), "empty Windows artifact filter");
+        // The source-integrity guard escapes literal glob characters with
+        // backslashes. glob::Pattern uses bracket quoting instead.
+        let mut converted = String::new();
+        let mut chars = raw.chars();
+        while let Some(ch) = chars.next() {
+            if ch == '\\' {
+                let literal = chars.next().context("incomplete artifact filter escape")?;
+                converted.push_str(&Pattern::escape(&literal.to_string()));
+            } else {
+                converted.push(ch);
+            }
+        }
+        Ok(Self {
+            pattern: Pattern::new(&converted)
+                .with_context(|| format!("invalid Windows artifact filter {raw:?}"))?,
+            rooted,
+            directory_only,
+        })
+    }
+
+    fn matches(&self, path: &str, directory: bool) -> bool {
+        if self.directory_only && !directory {
+            return false;
+        }
+        let options = glob::MatchOptions {
+            case_sensitive: true,
+            require_literal_separator: true,
+            require_literal_leading_dot: false,
+        };
+        if self.pattern.matches_with(path, options) {
+            return true;
+        }
+        !self.rooted
+            && path
+                .match_indices('/')
+                .any(|(index, _)| self.pattern.matches_with(&path[index + 1..], options))
+    }
+
+    fn excludes(&self, path: &str) -> bool {
+        self.matches(path, false)
+            || path
+                .match_indices('/')
+                .any(|(index, _)| self.matches(&path[..index], true))
+    }
+}
+
+fn windows_artifact_relative_path(path: &str) -> Result<&str> {
+    let path = path.strip_prefix("./").unwrap_or(path);
+    anyhow::ensure!(
+        !path.is_empty()
+            && !path.contains(['\\', ':'])
+            && !path.chars().any(char::is_control)
+            && path.split('/').all(|part| !matches!(part, "" | "." | "..")),
+        "invalid Windows artifact member {path:?}"
+    );
+    Ok(path)
+}
+
+fn windows_artifact_selection(
+    inventory: &[u8],
+    includes: &[WindowsArtifactFilter],
+    excludes: &[WindowsArtifactFilter],
+) -> Result<std::collections::BTreeMap<String, u64>> {
+    anyhow::ensure!(
+        inventory.is_empty() || inventory.ends_with(&[0]),
+        "incomplete Windows artifact inventory"
+    );
+    let mut selected = std::collections::BTreeMap::new();
+    for entry in inventory
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+    {
+        let split = entry
+            .iter()
+            .position(|byte| *byte == b' ')
+            .context("artifact inventory lacks size")?;
+        let size = std::str::from_utf8(&entry[..split])?.parse::<u64>()?;
+        let path = windows_artifact_relative_path(std::str::from_utf8(&entry[split + 1..])?)?;
+        if includes.iter().any(|filter| filter.matches(path, false))
+            && !excludes.iter().any(|filter| filter.excludes(path))
+        {
+            anyhow::ensure!(
+                selected.insert(path.to_string(), size).is_none(),
+                "duplicate Windows artifact inventory member {path:?}"
+            );
+        }
+    }
+    Ok(selected)
+}
+
+fn windows_artifact_archive_script(
+    remote_path: &str,
+    selected: &std::collections::BTreeMap<String, u64>,
+) -> String {
+    let mut script = format!("set -eu\ncd {}\n{{\n", escape(Cow::from(remote_path)));
+    for path in selected.keys() {
+        script.push_str(&format!(
+            "printf '%s\\0' {}\n",
+            escape(Cow::Owned(format!("./{path}")))
+        ));
+    }
+    // --null makes each pathname literal, including names beginning with '-'.
+    // GNU-only --hard-dereference is unavailable in Windows' native bsdtar;
+    // validated links to earlier selected files are preserved on extraction.
+    script.push_str("} | tar -czf - --no-recursion --null -T -\n");
+    script
+}
+
+fn windows_artifact_inventory_script(remote_path: &str) -> String {
+    format!(
+        "set -eu\ncd {}\n/usr/bin/find . -type f -printf '%s %p\\0'\n",
+        escape(Cow::from(remote_path))
+    )
+}
+
+struct WindowsArtifactReader<R> {
+    reader: R,
+    remaining: u64,
+    deadline: TokioInstant,
+    cancel: Option<tokio::sync::watch::Receiver<bool>>,
+}
+
+impl<R: std::io::Read> std::io::Read for WindowsArtifactReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if self.cancel.as_ref().is_some_and(|cancel| *cancel.borrow()) {
+            return Err(std::io::Error::other(
+                "Windows artifact extraction cancelled",
+            ));
+        }
+        if TokioInstant::now() >= self.deadline {
+            return Err(std::io::Error::other(
+                "Windows artifact extraction deadline exceeded",
+            ));
+        }
+        if self.remaining == 0 {
+            return Err(std::io::Error::other(
+                "Windows artifact archive exceeded its expanded size bound",
+            ));
+        }
+        let limit = buffer
+            .len()
+            .min(32 * 1024)
+            .min(usize::try_from(self.remaining).unwrap_or(usize::MAX));
+        let count = self.reader.read(&mut buffer[..limit])?;
+        self.remaining -= count as u64;
+        Ok(count)
+    }
+}
+
+/// Validate the complete downloaded archive before writing any caller output.
+/// Both the inventory and tar are untrusted pathname inputs; only selected
+/// regular files of the advertised size may cross this boundary.
+fn unpack_windows_artifact_archive(
+    archive_path: &Path,
+    destination: &Path,
+    selected: &std::collections::BTreeMap<String, u64>,
+    deadline: TokioInstant,
+    cancel: Option<tokio::sync::watch::Receiver<bool>>,
+) -> Result<()> {
+    let limit = selected.values().fold(1024 * 1024_u64, |total, size| {
+        total.saturating_add(*size).saturating_add(8192)
+    });
+    let open = || -> Result<_> {
+        Ok(tar::Archive::new(WindowsArtifactReader {
+            reader: flate2::read::GzDecoder::new(std::fs::File::open(archive_path)?),
+            remaining: limit,
+            deadline,
+            cancel: cancel.clone(),
+        }))
+    };
+    let mut archive = open()?;
+    let mut seen = BTreeSet::new();
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let path = entry.path()?.into_owned();
+        let path =
+            windows_artifact_relative_path(path.to_str().context("non-UTF-8 artifact path")?)?;
+        let expected_size = selected
+            .get(path)
+            .context("unselected Windows artifact archive member")?;
+        if entry.header().entry_type().is_file() {
+            anyhow::ensure!(
+                *expected_size == entry.size(),
+                "Windows artifact size changed for {path:?}"
+            );
+        } else if entry.header().entry_type().is_hard_link() {
+            let target = entry
+                .link_name()?
+                .context("artifact hardlink without target")?;
+            let target = windows_artifact_relative_path(
+                target.to_str().context("non-UTF-8 artifact link")?,
+            )?;
+            anyhow::ensure!(
+                entry.size() == 0
+                    && seen.contains(target)
+                    && selected.get(target) == Some(expected_size),
+                "Windows artifact hardlink does not reference a prior selected output"
+            );
+        } else {
+            anyhow::bail!("non-regular Windows artifact archive member");
+        }
+        anyhow::ensure!(
+            seen.insert(path.to_string()),
+            "duplicate Windows artifact archive member {path:?}"
+        );
+        std::io::copy(&mut entry, &mut std::io::sink())?;
+    }
+    // tar stops at its terminator; drain gzip as well to verify its checksum.
+    std::io::copy(&mut archive.into_inner(), &mut std::io::sink())?;
+    anyhow::ensure!(
+        seen.len() == selected.len(),
+        "Windows artifact archive omitted selected outputs"
+    );
+    for path in selected.keys() {
+        let mut target = destination.to_path_buf();
+        for component in path.split('/') {
+            target.push(component);
+            match std::fs::symlink_metadata(&target) {
+                Ok(metadata) => anyhow::ensure!(
+                    !metadata.file_type().is_symlink(),
+                    "symlink in artifact destination {}",
+                    target.display()
+                ),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+    std::fs::create_dir_all(destination)?;
+    for entry in open()?.entries()? {
+        anyhow::ensure!(
+            entry?.unpack_in(destination)?,
+            "artifact escaped destination"
+        );
+    }
+    Ok(())
+}
+
+async fn windows_artifact_cancelled(cancel: &mut Option<tokio::sync::watch::Receiver<bool>>) {
+    if let Some(cancel) = cancel {
+        loop {
+            if *cancel.borrow() {
+                return;
+            }
+            if cancel.changed().await.is_err() {
+                break;
+            }
+        }
+    }
+    std::future::pending::<()>().await;
+}
+
+/// The script, stdout receiver, stderr drain and child share one deadline.
+/// No detached pump can keep an SSH pipe alive after cancellation returns.
+async fn run_windows_artifact_process<W: tokio::io::AsyncWrite + Unpin>(
+    mut command: Command,
+    script: &str,
+    sink: &mut W,
+    output_limit: u64,
+    deadline: TokioInstant,
+    mut cancel: Option<tokio::sync::watch::Receiver<bool>>,
+    on_line: &mut impl FnMut(&str),
+) -> Result<u64> {
+    if cancel.as_ref().is_some_and(|cancel| *cancel.borrow()) {
+        return Err(RetrievalCancelled.into());
+    }
+    anyhow::ensure!(
+        TokioInstant::now() < deadline,
+        "Windows artifact retrieval deadline exceeded"
+    );
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = command
+        .spawn()
+        .context("spawn Windows artifact transport")?;
+    let mut stdin = child.stdin.take().context("artifact script stdin")?;
+    let mut stdout = child.stdout.take().context("artifact transport stdout")?;
+    let mut stderr = child.stderr.take().context("artifact transport stderr")?;
+    let mut diagnostics = Vec::new();
+    let mut bytes = 0_u64;
+    let mut reported_bytes = 0_u64;
+    let result = {
+        let operation = async {
+            let send = async {
+                stdin.write_all(script.as_bytes()).await?;
+                stdin.shutdown().await
+            };
+            let receive = async {
+                let mut out_buffer = [0_u8; 32 * 1024];
+                let mut err_buffer = [0_u8; 8192];
+                let mut out_open = true;
+                let mut err_open = true;
+                while out_open || err_open {
+                    tokio::select! {
+                        read = stdout.read(&mut out_buffer), if out_open => {
+                            let count = read?;
+                            out_open = count != 0;
+                            bytes = bytes.checked_add(count as u64).context("artifact stream size overflow")?;
+                            anyhow::ensure!(bytes <= output_limit, "Windows artifact stream exceeded its size bound");
+                            sink.write_all(&out_buffer[..count]).await?;
+                            if bytes.saturating_sub(reported_bytes) >= 1024 * 1024 {
+                                on_line(&format!("Windows artifact transfer: {bytes} bytes received"));
+                                reported_bytes = bytes;
+                            }
+                        },
+                        read = stderr.read(&mut err_buffer), if err_open => {
+                            let count = read?;
+                            err_open = count != 0;
+                            on_line(&String::from_utf8_lossy(&err_buffer[..count]));
+                            let retained = count.min((1024 * 1024_usize).saturating_sub(diagnostics.len()));
+                            diagnostics.extend_from_slice(&err_buffer[..retained]);
+                        },
+                    }
+                }
+                sink.flush().await?;
+                Ok::<_, anyhow::Error>(child.wait().await?)
+            };
+            let (sent, received) = tokio::join!(send, receive);
+            let status = received?;
+            anyhow::ensure!(
+                status.success(),
+                "Windows artifact transport failed (exit {:?}): {}",
+                status.code(),
+                String::from_utf8_lossy(&diagnostics).trim()
+            );
+            sent.context("send Windows artifact script")?;
+            Ok::<_, anyhow::Error>(())
+        };
+        tokio::select! {
+            result = operation => Some(result),
+            () = windows_artifact_cancelled(&mut cancel) => None,
+            () = tokio::time::sleep_until(deadline) => None,
+        }
+    };
+    match result {
+        Some(Ok(())) => Ok(bytes),
+        other => {
+            if child.try_wait()?.is_none() {
+                child
+                    .kill()
+                    .await
+                    .context("stop and reap Windows artifact transport")?;
+            }
+            if let Some(Err(error)) = other {
+                return Err(error);
+            }
+            if cancel.as_ref().is_some_and(|cancel| *cancel.borrow()) {
+                return Err(RetrievalCancelled.into());
+            }
+            anyhow::bail!("Windows artifact retrieval deadline exceeded");
+        }
     }
 }
 
@@ -1330,6 +1683,9 @@ pub struct TransferPipeline {
     deadline_marker: String,
     /// Local project root.
     project_root: PathBuf,
+    /// Caller-owned tree used to distinguish source from artifact roots. A
+    /// private retrieval staging directory must not replace this evidence.
+    retrieval_reference_root: PathBuf,
     /// Project identifier (usually directory name).
     project_id: String,
     /// Project hash for cache invalidation.
@@ -1499,6 +1855,7 @@ impl TransferPipeline {
 
         Self {
             deadline_marker: format!("RCH_EXTERNAL_DEADLINE:{}", uuid::Uuid::new_v4()),
+            retrieval_reference_root: project_root.clone(),
             project_root,
             project_id: safe_project_id,
             project_hash: safe_project_hash,
@@ -1694,6 +2051,57 @@ impl TransferPipeline {
     pub(crate) fn with_local_root(mut self, root: PathBuf) -> Self {
         self.project_root = root;
         self
+    }
+
+    pub(crate) fn with_retrieval_reference_root(mut self, root: PathBuf) -> Self {
+        self.retrieval_reference_root = root;
+        self
+    }
+
+    fn artifact_retrieval_filters(
+        &self,
+        artifact_patterns: &[String],
+    ) -> Result<(Vec<WindowsArtifactFilter>, Vec<WindowsArtifactFilter>)> {
+        let (caller_excludes, includes) = partition_artifact_filters(artifact_patterns);
+        let mut excludes = self.get_retrieval_excludes(&includes);
+        excludes.extend(caller_excludes);
+        excludes.extend(
+            self.local_source_roots_to_exclude(&allowed_artifact_roots(&includes), &includes),
+        );
+        Ok((
+            includes
+                .iter()
+                .map(|pattern| WindowsArtifactFilter::new(pattern, true))
+                .collect::<Result<Vec<_>>>()?,
+            excludes
+                .iter()
+                .map(|pattern| WindowsArtifactFilter::new(pattern, false))
+                .collect::<Result<Vec<_>>>()?,
+        ))
+    }
+
+    /// Retained staging bytes may predate the current transfer filters. Check
+    /// them again before publication, including any interrupted pending write.
+    pub(crate) fn validate_staged_artifact_paths(
+        &self,
+        paths: &[PathBuf],
+        artifact_patterns: &[String],
+    ) -> Result<()> {
+        let (includes, excludes) = self.artifact_retrieval_filters(artifact_patterns)?;
+        for path in paths {
+            let name = path.to_str().context("non-UTF-8 staged artifact path")?;
+            anyhow::ensure!(
+                !name.is_empty()
+                    && path
+                        .components()
+                        .all(|component| matches!(component, Component::Normal(_)))
+                    && includes.iter().any(|filter| filter.matches(name, false))
+                    && !excludes.iter().any(|filter| filter.excludes(name)),
+                "staged file is outside the caller's artifact policy: {}",
+                path.display()
+            );
+        }
+        Ok(())
     }
 
     /// The supervisor owns all output descriptors, so loss of the streaming
@@ -2733,7 +3141,7 @@ impl TransferPipeline {
         allowed_roots: &BTreeSet<String>,
         artifact_patterns: &[String],
     ) -> Vec<String> {
-        let Ok(entries) = std::fs::read_dir(&self.project_root) else {
+        let Ok(entries) = std::fs::read_dir(&self.retrieval_reference_root) else {
             // Project root unreadable → nothing to exclude here. Other
             // retrieval excludes (REMOTE_RUNTIME_EXCLUDE_PATTERNS, the
             // final `--exclude "*"`) still apply, so retrieval remains
@@ -2794,7 +3202,7 @@ impl TransferPipeline {
             }
         }
 
-        let rchignore_path = self.project_root.join(".rchignore");
+        let rchignore_path = self.retrieval_reference_root.join(".rchignore");
         if let Ok(patterns) = parse_rchignore(&rchignore_path) {
             let original_count = excludes.len();
             for pattern in patterns {
@@ -4010,105 +4418,118 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         })
     }
 
-    /// Windows artifact retrieval: `tar c` the remote build dir (skipping the
-    /// incremental/fingerprint/build junk) and pipe it into `tar x` locally.
+    /// Select exact regular files with the same filters as rsync, then archive
+    /// only those names. A complete, validated download precedes local writes.
     async fn retrieve_artifacts_windows(
         &self,
         worker: &WorkerConfig,
         remote_path: &str,
-    ) -> Result<SyncResult> {
-        let start = std::time::Instant::now();
+        artifact_patterns: &[String],
+        on_line: &mut impl FnMut(&str),
+    ) -> Result<ArtifactRetrieval> {
+        let start = TokioInstant::now();
+        let (cancel, started) = self
+            .retrieval_control
+            .as_ref()
+            .map_or((None, start), |(cancel, started)| {
+                (Some(cancel.clone()), *started)
+            });
+        let (includes, excludes) = self.artifact_retrieval_filters(artifact_patterns)?;
+        if includes.is_empty() {
+            return Ok(ArtifactRetrieval {
+                stats: SyncResult {
+                    bytes_transferred: 0,
+                    files_transferred: 0,
+                    duration_ms: 0,
+                },
+                manifest_regular_files: Vec::new(),
+                matched_regular_files: Some(0),
+            });
+        }
         info!(
             "Retrieving (windows/tar) artifacts from {} on {}",
             remote_path, worker.id
         );
-        std::fs::create_dir_all(&self.project_root).ok();
-
-        // Skip the same non-artifact subtrees rsync's retrieval filters drop.
-        // `deps/` and the final binaries are kept.
-        let junk = [
-            "*/incremental",
-            "*/incremental/*",
-            "*/.fingerprint",
-            "*/.fingerprint/*",
-            "*/build",
-            "*/build/*",
-        ];
-        let mut remote_args: Vec<String> = vec![
-            "tar".into(),
-            "czf".into(),
-            "-".into(),
-            "-C".into(),
-            remote_path.into(),
-        ];
-        for e in junk {
-            remote_args.push(format!("--exclude={e}"));
-        }
-        for member in windows_retrieve_members(&self.project_root) {
-            remote_args.push(member.to_string());
-        }
-        let remote_args_ref: Vec<&str> = remote_args.iter().map(String::as_str).collect();
-
-        let mut ssh = self.worker_ssh_command(worker, &remote_args_ref);
-        ssh.stdout(Stdio::piped()).stderr(Stdio::piped());
-        let mut local_tar = Command::new("tar");
-        local_tar
-            .arg("xzf")
-            .arg("-")
-            .arg("-C")
-            .arg(&self.project_root);
-        local_tar
-            .stdin(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-
-        let mut ssh_child = ssh.spawn().context("spawn ssh tar c (windows retrieve)")?;
-        let mut tar_child = local_tar
-            .spawn()
-            .context("spawn local tar x (windows retrieve)")?;
-        let mut ssh_out = ssh_child.stdout.take().context("ssh stdout")?;
-        let mut ssh_err = ssh_child.stderr.take();
-        let mut tar_in = tar_child.stdin.take().context("local tar stdin")?;
-        let pump = tokio::spawn(async move {
-            let _ = tokio::io::copy(&mut ssh_out, &mut tar_in).await;
-            drop(tar_in);
-        });
-        // Drain the remote tar's stderr (forwarded over ssh) concurrently. Without
-        // this a chatty remote tar (e.g. "file changed as we read it" on a live
-        // target dir) fills the undrained ssh stderr pipe, blocks ssh, starves the
-        // pump, and hangs the local extract. Exit status is all we need here.
-        let ssh_err_drain = tokio::spawn(async move {
-            if let Some(err) = ssh_err.as_mut() {
-                let _ = tokio::io::copy(err, &mut tokio::io::sink()).await;
+        // Git for Windows supplies GNU find alongside the POSIX shell already
+        // required for execution. -P (the default) does not traverse symlinks.
+        // A NUL-delimited inventory preserves spaces and shell metacharacters.
+        let inventory_script = windows_artifact_inventory_script(remote_path);
+        let mut inventory = Vec::new();
+        run_windows_artifact_process(
+            self.worker_ssh_command(worker, &["sh", "-s"]),
+            &inventory_script,
+            &mut inventory,
+            MAX_SOURCE_CONTENT_RSYNC_OUTPUT_BYTES as u64,
+            started + Duration::from_millis(self.effective_rsync_retry_config().total_timeout_ms),
+            cancel.clone(),
+            on_line,
+        )
+        .await?;
+        let selected = windows_artifact_selection(&inventory, &includes, &excludes)?;
+        let count = u32::try_from(selected.len()).context("too many Windows artifacts")?;
+        let mut bytes = 0;
+        if !selected.is_empty() {
+            let selected_size = selected
+                .values()
+                .fold(0_u64, |total, size| total.saturating_add(*size));
+            let retry = self.artifact_retry_config_for_size(selected_size);
+            let deadline = started + Duration::from_millis(retry.total_timeout_ms);
+            let archive = tempfile::Builder::new()
+                .prefix("rch-windows-artifacts-")
+                .suffix(".tar.gz")
+                .tempfile()?;
+            let mut output = tokio::fs::File::from_std(archive.reopen()?);
+            bytes = run_windows_artifact_process(
+                self.worker_ssh_command(worker, &["sh", "-s"]),
+                &windows_artifact_archive_script(remote_path, &selected),
+                &mut output,
+                selected_size
+                    .saturating_add(u64::from(count).saturating_mul(8192))
+                    .saturating_add(1024 * 1024),
+                deadline,
+                cancel.clone(),
+                on_line,
+            )
+            .await?;
+            drop(output);
+            if cancel.as_ref().is_some_and(|cancel| *cancel.borrow()) {
+                return Err(RetrievalCancelled.into());
             }
-        });
-        let tar_res = tar_child
-            .wait_with_output()
-            .await
-            .context("local tar x wait")?;
-        let ssh_status = ssh_child.wait().await.context("ssh tar c wait")?;
-        let _ = pump.await;
-        let _ = ssh_err_drain.await;
-
-        if !tar_res.status.success() {
-            return Err(anyhow::anyhow!(
-                "local tar extract failed (exit {:?}): {}",
-                tar_res.status.code(),
-                String::from_utf8_lossy(&tar_res.stderr)
-            ));
-        }
-        // The remote tar can exit non-zero when the tree is empty or a file
-        // changed mid-read; the authority is whether local extraction succeeded.
-        if !ssh_status.success() {
-            warn!(
-                "remote tar reported exit {:?} during windows retrieve (local extract ok)",
-                ssh_status.code()
+            anyhow::ensure!(
+                TokioInstant::now() < deadline,
+                "Windows artifact retrieval deadline exceeded"
             );
+            // Await validation/publication to completion: a detached blocking
+            // task must never continue overwriting outputs after recovery starts.
+            let destination = self.project_root.clone();
+            let expected = selected.clone();
+            let extraction_cancel = cancel.clone();
+            let extracted = tokio::task::spawn_blocking(move || {
+                unpack_windows_artifact_archive(
+                    archive.path(),
+                    &destination,
+                    &expected,
+                    deadline,
+                    extraction_cancel,
+                )
+            })
+            .await?;
+            if cancel.as_ref().is_some_and(|cancel| *cancel.borrow()) {
+                return Err(RetrievalCancelled.into());
+            }
+            extracted?;
         }
-        Ok(SyncResult {
-            bytes_transferred: 0,
-            files_transferred: 0,
-            duration_ms: u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
+        on_line(&format!(
+            "Retrieved {count} Windows artifact files ({bytes} archive bytes)"
+        ));
+        Ok(ArtifactRetrieval {
+            stats: SyncResult {
+                bytes_transferred: bytes,
+                files_transferred: count,
+                duration_ms: u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
+            },
+            manifest_regular_files: selected.into_keys().collect(),
+            matched_regular_files: Some(count),
         })
     }
 
@@ -5061,27 +5482,12 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
             }));
         }
 
-        // Windows worker: pull artifacts via tar-over-ssh (no rsync). Gated on
-        // platform, so linux/darwin never reach this. Bounded by `command_timeout`
-        // (the tar transport has no timeout of its own); on expiry the future
-        // drops and the `kill_on_drop` children are reaped. The tar transport
-        // has no per-file manifest, so the retrieval carries no manifest and
-        // the zero-output detector declines to fire (fail-open).
+        // The Windows transport enforces its deadline and cancellation while
+        // owning/reaping SSH children, then verifies and publishes the archive.
         if self.worker_platform.is_windows() {
-            let timeout = self.ssh_options.command_timeout;
-            return match tokio::time::timeout(
-                timeout,
-                self.retrieve_artifacts_windows(worker, &remote_path),
-            )
-            .await
-            {
-                Ok(result) => result.map(ArtifactRetrieval::from_stats),
-                Err(_) => Err(anyhow::anyhow!(
-                    "windows tar artifact retrieve from {} timed out after {:?}",
-                    worker.id,
-                    timeout
-                )),
-            };
+            return self
+                .retrieve_artifacts_windows(worker, &remote_path, artifact_patterns, &mut |_| {})
+                .await;
         }
 
         info!("Retrieving artifacts from {} on {}", remote_path, worker.id);
@@ -5699,6 +6105,12 @@ print('RCH_SOURCE_FRESHNESS_V2 unchanged=%d changed=%d' % (len(current) - len(ch
             }));
         }
 
+        if self.worker_platform.is_windows() {
+            return self
+                .retrieve_artifacts_windows(worker, &remote_path, artifact_patterns, &mut on_line)
+                .await;
+        }
+
         info!(
             "Retrieving artifacts from {} on {} (streaming)",
             remote_path, worker.id
@@ -5991,8 +6403,8 @@ pub struct SyncResult {
 ///   rsync matched, the manifest is incomplete and the detector must decline
 ///   to fire (fail-open).
 ///
-/// Transports that cannot produce a manifest (mock rsync, the Windows
-/// tar-over-ssh path) return an empty manifest with `matched_regular_files:
+/// Transports that cannot produce a manifest (mock rsync) return an empty
+/// manifest with `matched_regular_files:
 /// None`, which the detector treats as "no proof" and never fires on.
 #[derive(Debug, Clone)]
 pub struct ArtifactRetrieval {
@@ -6005,7 +6417,7 @@ pub struct ArtifactRetrieval {
 }
 
 impl ArtifactRetrieval {
-    /// A manifest-less retrieval (mock transport, Windows tar path).
+    /// A manifest-less retrieval (mock transport).
     fn from_stats(stats: SyncResult) -> Self {
         Self {
             stats,
@@ -11840,16 +12252,409 @@ fn main() {
     }
 
     #[test]
-    fn windows_retrieve_members_protects_project_root_source() {
+    fn windows_artifact_filters_preserve_exact_outputs_and_exclude_cache_ancestors() {
+        let includes = ["*/release/**", "bin/app[[]dev[]].exe", "*.obj"]
+            .map(|pattern| WindowsArtifactFilter::new(pattern, true).unwrap());
+        let excludes = ["*/release/incremental/", "*.d", "/src/"]
+            .map(|pattern| WindowsArtifactFilter::new(pattern, false).unwrap());
+        let inventory = b"4 ./x86_64-pc-windows-msvc/release/app.exe\0\
+            8 ./x86_64-pc-windows-msvc/release/incremental/state\0\
+            1 ./x86_64-pc-windows-msvc/release/app.d\0\
+            2 ./bin/app[dev].exe\0\
+            3 ./bin/appd.exe\0\
+            5 ./root.obj\0\
+            6 ./src/source.obj\0";
+        let selected = windows_artifact_selection(inventory, &includes, &excludes).unwrap();
+        assert_eq!(
+            selected.into_keys().collect::<Vec<_>>(),
+            [
+                "bin/app[dev].exe",
+                "root.obj",
+                "x86_64-pc-windows-msvc/release/app.exe"
+            ]
+        );
+        assert!(windows_artifact_selection(b"4 ./bin/app.exe", &includes, &excludes).is_err());
+        for path in ["../outside", "/outside", "C:/outside", "a/../../b", "a\\b"] {
+            let inventory = format!("1 {path}\0");
+            assert!(
+                windows_artifact_selection(inventory.as_bytes(), &includes, &excludes).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn windows_artifact_staging_preserves_source_guard_and_recovery_phase_reference() {
         let _guard = test_guard!();
-        let temp = tempfile::tempdir().expect("temp dir");
-        // A bare target dir (no Cargo.toml) → archive everything, so the
-        // cross-target `<triple>/` outputs come back.
-        assert_eq!(windows_retrieve_members(temp.path()), vec!["."]);
-        // A project root (has Cargo.toml) → archive only `target/`, so remote
-        // source can't be tarred back over the local source tree.
-        std::fs::write(temp.path().join("Cargo.toml"), b"[package]").expect("write");
-        assert_eq!(windows_retrieve_members(temp.path()), vec!["./target"]);
+        let caller = tempfile::tempdir().unwrap();
+        let stage = tempfile::tempdir().unwrap();
+        std::fs::create_dir(caller.path().join("src")).unwrap();
+        std::fs::create_dir(caller.path().join("bin")).unwrap();
+        std::fs::write(caller.path().join("Cargo.toml"), b"local manifest").unwrap();
+        std::fs::write(caller.path().join("main.c"), b"local source").unwrap();
+        std::fs::write(caller.path().join(".rchignore"), b"ignored/\n").unwrap();
+        let pipeline = TransferPipeline::new(
+            caller.path().to_path_buf(),
+            "project".into(),
+            "abc".into(),
+            TransferConfig::default(),
+        )
+        .with_local_root(stage.path().to_path_buf());
+        let patterns = default_c_cpp_artifact_patterns();
+        let excludes =
+            pipeline.local_source_roots_to_exclude(&allowed_artifact_roots(&patterns), &patterns);
+        assert!(excludes.contains(&"/Cargo.toml".to_string()));
+        assert!(excludes.contains(&"/main.c".to_string()));
+        assert!(excludes.contains(&"/src/".to_string()));
+        assert!(!excludes.contains(&"/bin/".to_string()));
+        assert!(
+            pipeline
+                .get_retrieval_excludes(&patterns)
+                .contains(&"ignored/".to_string())
+        );
+        let includes = patterns
+            .iter()
+            .map(|pattern| WindowsArtifactFilter::new(pattern, true).unwrap())
+            .collect::<Vec<_>>();
+        let filters = excludes
+            .iter()
+            .map(|pattern| WindowsArtifactFilter::new(pattern, false).unwrap())
+            .collect::<Vec<_>>();
+        let selected = windows_artifact_selection(
+            b"4 ./Cargo.toml\0\
+            4 ./main.c\0\
+            4 ./src/main.c\0\
+            4 ./bin/app.exe\0\
+            4 ./fresh.exe\0",
+            &includes,
+            &filters,
+        )
+        .unwrap();
+        assert_eq!(
+            selected.into_keys().collect::<Vec<_>>(),
+            ["bin/app.exe", "fresh.exe"]
+        );
+        assert!(
+            pipeline
+                .validate_staged_artifact_paths(&[PathBuf::from("main.c")], &patterns)
+                .is_err()
+        );
+        pipeline
+            .validate_staged_artifact_paths(
+                &[PathBuf::from("bin/app.exe"), PathBuf::from("fresh.exe")],
+                &patterns,
+            )
+            .unwrap();
+        let worker = worker_with_os(Some("linux"));
+        for command in [
+            pipeline.build_retrieve_command(&worker, "/remote", &patterns),
+            pipeline.build_retrieve_streaming_command(&worker, "/remote", &patterns),
+        ] {
+            let args = command
+                .as_std()
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            assert!(arg_pair_position(&args, "--exclude", "/main.c").is_some());
+            assert!(arg_pair_position(&args, "--exclude", "/src/").is_some());
+            assert_eq!(
+                args.last().unwrap(),
+                &format!("{}/", stage.path().display())
+            );
+        }
+
+        // Recovery reconstructs one base pipeline, then replaces this reference
+        // for each persisted phase (notably an external CARGO_TARGET_DIR).
+        let target = tempfile::tempdir().unwrap();
+        std::fs::write(target.path().join("private.txt"), b"caller-owned").unwrap();
+        let recovered = pipeline.with_retrieval_reference_root(target.path().to_path_buf());
+        let patterns = vec!["*/release/**".to_string()];
+        let excludes =
+            recovered.local_source_roots_to_exclude(&allowed_artifact_roots(&patterns), &patterns);
+        assert!(excludes.contains(&"/private.txt".to_string()));
+        assert!(!excludes.contains(&"/Cargo.toml".to_string()));
+        assert_eq!(recovered.project_root, stage.path());
+    }
+
+    #[tokio::test]
+    async fn windows_artifact_empty_policy_uses_tar_routing_in_both_entrypoints() {
+        let _guard = test_guard!();
+        let destination = tempfile::tempdir().unwrap();
+        let pipeline = TransferPipeline::new(
+            destination.path().to_path_buf(),
+            "project".into(),
+            "abc".into(),
+            TransferConfig::default(),
+        )
+        .with_worker_platform(WorkerPlatform::Windows);
+        let worker = worker_with_os(Some("windows"));
+        for result in [
+            pipeline.retrieve_artifacts(&worker, &[]).await,
+            pipeline
+                .retrieve_artifacts_streaming(&worker, &[], |_| {})
+                .await,
+        ] {
+            let result = result.unwrap();
+            assert_eq!(result.matched_regular_files, Some(0));
+            assert_eq!(result.stats.files_transferred, 0);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn windows_artifact_real_tar_returns_selected_files_and_hardlinks_only() {
+        let _guard = test_guard!();
+        let source = tempfile::tempdir().unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        for path in ["bin", "src", "target/debug", "peer/target/debug"] {
+            std::fs::create_dir_all(source.path().join(path)).unwrap();
+        }
+        for (path, bytes) in [
+            ("bin/app[dev] $cash.exe", b"actual executable".as_slice()),
+            ("bin/app.pdb", b"debug symbols".as_slice()),
+            ("target/debug/unrequested.exe", b"other target".as_slice()),
+            ("peer/target/debug/foreign.exe", b"nested target".as_slice()),
+            ("Cargo.toml", b"remote manifest".as_slice()),
+            ("src/lib.rs", b"remote source".as_slice()),
+        ] {
+            std::fs::write(source.path().join(path), bytes).unwrap();
+        }
+        std::fs::hard_link(
+            source.path().join("bin/app.pdb"),
+            source.path().join("bin/app-link.pdb"),
+        )
+        .unwrap();
+        std::fs::write(destination.path().join("Cargo.toml"), b"local manifest").unwrap();
+        let mut inventory = Vec::new();
+        let mut shell = Command::new("sh");
+        shell.arg("-s");
+        run_windows_artifact_process(
+            shell,
+            &windows_artifact_inventory_script(source.path().to_str().unwrap()),
+            &mut inventory,
+            1024 * 1024,
+            TokioInstant::now() + Duration::from_secs(10),
+            None,
+            &mut |_| {},
+        )
+        .await
+        .unwrap();
+        let includes = ["bin/app[[]dev[]] $cash.exe", "bin/*.pdb"]
+            .map(|pattern| WindowsArtifactFilter::new(pattern, true).unwrap());
+        let selected = windows_artifact_selection(&inventory, &includes, &[]).unwrap();
+        assert_eq!(selected.len(), 3);
+        let archive = tempfile::NamedTempFile::new().unwrap();
+        let mut output = tokio::fs::File::from_std(archive.reopen().unwrap());
+        let mut shell = Command::new("sh");
+        shell.arg("-s");
+        let bytes = run_windows_artifact_process(
+            shell,
+            &windows_artifact_archive_script(source.path().to_str().unwrap(), &selected),
+            &mut output,
+            1024 * 1024,
+            TokioInstant::now() + Duration::from_secs(10),
+            None,
+            &mut |_| {},
+        )
+        .await
+        .unwrap();
+        assert!(bytes > 0);
+        drop(output);
+        unpack_windows_artifact_archive(
+            archive.path(),
+            destination.path(),
+            &selected,
+            TokioInstant::now() + Duration::from_secs(10),
+            None,
+        )
+        .unwrap();
+        for path in selected.keys() {
+            assert_eq!(
+                std::fs::read(destination.path().join(path)).unwrap(),
+                std::fs::read(source.path().join(path)).unwrap()
+            );
+        }
+        assert_eq!(
+            std::fs::read(destination.path().join("Cargo.toml")).unwrap(),
+            b"local manifest"
+        );
+        assert!(!destination.path().join("src").exists());
+        assert!(!destination.path().join("target").exists());
+        assert!(!destination.path().join("peer").exists());
+        let mut incomplete = selected;
+        incomplete.insert("bin/missing.exe".to_string(), 4);
+        assert!(
+            unpack_windows_artifact_archive(
+                archive.path(),
+                destination.path(),
+                &incomplete,
+                TokioInstant::now() + Duration::from_secs(10),
+                None
+            )
+            .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn windows_artifact_transport_propagates_remote_failure_and_reaps_cancelled_child() {
+        let _guard = test_guard!();
+        let mut command = Command::new("sh");
+        command.arg("-s");
+        let mut output = Vec::new();
+        let error = run_windows_artifact_process(
+            command,
+            "printf partial; printf 'missing requested file' >&2; exit 7\n",
+            &mut output,
+            1024,
+            TokioInstant::now() + Duration::from_secs(5),
+            None,
+            &mut |_| {},
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("Some(7)"), "{error}");
+        assert!(
+            error.to_string().contains("missing requested file"),
+            "{error}"
+        );
+
+        let retained = tempfile::tempdir().unwrap();
+        let pid_path = retained.path().join("child.pid");
+        let script = format!(
+            "printf '%s' \"$$\" > {}\nwhile :; do :; done\n",
+            escape(Cow::from(pid_path.to_str().unwrap()))
+        );
+        let (cancel, receiver) = tokio::sync::watch::channel(false);
+        let mut command = Command::new("sh");
+        command.arg("-s");
+        let mut output = Vec::new();
+        let mut on_line = |_line: &str| {};
+        let operation = run_windows_artifact_process(
+            command,
+            &script,
+            &mut output,
+            1024,
+            TokioInstant::now() + Duration::from_secs(5),
+            Some(receiver),
+            &mut on_line,
+        );
+        let cancel_when_started = async {
+            let deadline = TokioInstant::now() + Duration::from_secs(3);
+            while !pid_path.exists() {
+                assert!(TokioInstant::now() < deadline, "fixture did not start");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            cancel.send(true).unwrap();
+        };
+        let (result, ()) = tokio::join!(operation, cancel_when_started);
+        assert!(result.unwrap_err().is::<RetrievalCancelled>());
+        let pid = std::fs::read_to_string(pid_path).unwrap();
+        let status = std::process::Command::new("kill")
+            .args(["-0", &pid])
+            .status()
+            .unwrap();
+        assert!(!status.success(), "cancelled transport child remains alive");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn windows_artifact_archive_refuses_unsafe_members_and_expansion_before_publication() {
+        use std::io::Write;
+
+        for case in [
+            "unselected",
+            "symlink",
+            "outside-hardlink",
+            "future-hardlink",
+            "gzip-padding",
+            "local-symlink",
+        ] {
+            let retained = tempfile::tempdir().unwrap();
+            let destination = retained.path().join("destination");
+            std::fs::create_dir_all(destination.join("bin")).unwrap();
+            std::fs::write(destination.join("bin/app.exe"), b"old!").unwrap();
+            let archive = tempfile::NamedTempFile::new().unwrap();
+            let encoder = flate2::write::GzEncoder::new(
+                archive.reopen().unwrap(),
+                flate2::Compression::fast(),
+            );
+            let mut builder = tar::Builder::new(encoder);
+            let mut header = tar::Header::new_gnu();
+            header.set_mode(0o644);
+            header.set_size(4);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, "bin/app.exe", b"new!".as_slice())
+                .unwrap();
+            let mut selected = std::collections::BTreeMap::from([("bin/app.exe".to_string(), 4)]);
+            if matches!(case, "symlink" | "outside-hardlink" | "future-hardlink") {
+                selected.insert("bin/linked.exe".to_string(), 4);
+                let mut header = tar::Header::new_gnu();
+                header.set_entry_type(if case == "symlink" {
+                    tar::EntryType::Symlink
+                } else {
+                    tar::EntryType::Link
+                });
+                header.set_size(0);
+                header.set_mode(0o644);
+                header
+                    .set_link_name(if case == "future-hardlink" {
+                        "bin/future.exe"
+                    } else {
+                        "../outside"
+                    })
+                    .unwrap();
+                header.set_cksum();
+                builder
+                    .append_data(&mut header, "bin/linked.exe", std::io::empty())
+                    .unwrap();
+                if case == "future-hardlink" {
+                    selected.insert("bin/future.exe".to_string(), 4);
+                }
+            } else if case == "unselected" {
+                builder
+                    .append_data(&mut header, "Cargo.toml", b"evil".as_slice())
+                    .unwrap();
+            }
+            let mut encoder = builder.into_inner().unwrap();
+            if case == "gzip-padding" {
+                std::io::copy(
+                    &mut std::io::Read::take(std::io::repeat(0), 2 * 1024 * 1024),
+                    &mut encoder,
+                )
+                .unwrap();
+            }
+            encoder.flush().unwrap();
+            encoder.finish().unwrap();
+            let publication_root = if case == "local-symlink" {
+                let alias = retained.path().join("alias");
+                std::fs::create_dir(&alias).unwrap();
+                std::os::unix::fs::symlink(destination.join("bin"), alias.join("bin")).unwrap();
+                alias
+            } else {
+                destination.clone()
+            };
+            let error = unpack_windows_artifact_archive(
+                archive.path(),
+                &publication_root,
+                &selected,
+                TokioInstant::now() + Duration::from_secs(5),
+                None,
+            )
+            .unwrap_err();
+            if case == "gzip-padding" {
+                assert!(
+                    error.to_string().contains("expanded size bound"),
+                    "{error:#}"
+                );
+            }
+            assert_eq!(
+                std::fs::read(destination.join("bin/app.exe")).unwrap(),
+                b"old!",
+                "{case}: validation must precede every local write"
+            );
+            assert!(!destination.join("Cargo.toml").exists(), "{case}");
+        }
     }
 
     #[test]

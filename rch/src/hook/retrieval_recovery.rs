@@ -414,7 +414,10 @@ impl RecoverySession {
             .context("missing retrieval phase")?;
         let stage = self.stage(index);
         std::fs::create_dir_all(&stage)?;
-        Ok(pipeline.clone().with_local_root(stage))
+        Ok(pipeline
+            .clone()
+            .with_retrieval_reference_root(self.recipe.phases[index].local.clone())
+            .with_local_root(stage))
     }
     pub(crate) fn publish(&mut self, name: &str) -> anyhow::Result<()> {
         let index = self
@@ -427,6 +430,38 @@ impl RecoverySession {
             return Ok(());
         }
         let stage = self.stage(index);
+        let files = regular_files(&stage)?;
+        let phase = &self.recipe.phases[index];
+        if phase.result_dir.is_none() {
+            // A resumed transfer can retain files selected by an older
+            // collector. Ownership fingerprints alone do not authorize a
+            // source file as an artifact: validate the complete pending write
+            // set before either journal recovery or ordinary publication.
+            let mut writes: Vec<_> = files
+                .iter()
+                .filter(|path| !phase.published.contains_key(*path))
+                .cloned()
+                .collect();
+            if let Some((relative, hash)) = &phase.pending {
+                if !phase.baseline.contains_key(relative)
+                    && fingerprint(&phase.local.join(relative))?.as_ref() == Some(hash)
+                {
+                    // The prior rename already created this new output. Only
+                    // its journal remains to be completed; the live reference
+                    // tree must not reclassify our own generic output as source.
+                    writes.retain(|path| path != relative);
+                } else if !writes.contains(relative) {
+                    writes.push(relative.clone());
+                }
+            }
+            TransferPipeline::new(
+                phase.local.clone(),
+                "recovery-publication".into(),
+                self.recipe.identity.clone(),
+                self.recipe.transfer.clone(),
+            )
+            .validate_staged_artifact_paths(&writes, &phase.patterns)?;
+        }
         if let Some((relative, hash)) = self.recipe.phases[index].pending.clone() {
             let destination = self.recipe.phases[index].local.join(&relative);
             let parent = destination
@@ -449,7 +484,6 @@ impl RecoverySession {
             self.recipe.phases[index].pending = None;
             self.persist()?;
         }
-        let files = regular_files(&stage)?;
         for relative in files {
             let phase = &self.recipe.phases[index];
             if phase.published.contains_key(&relative) {
@@ -805,6 +839,7 @@ pub(crate) async fn recover_job(writer: &DurableLeaseWriter) -> anyhow::Result<i
         let pipeline = base
             .clone()
             .with_remote_path_override(phase.remote.clone())
+            .with_retrieval_reference_root(phase.local.clone())
             .with_local_root(session.stage(index));
         std::fs::create_dir_all(session.stage(index))?;
         if let Some(dir) = &phase.result_dir {
@@ -905,6 +940,152 @@ mod tests {
         )
         .unwrap();
         (directory, writer, worker)
+    }
+
+    fn publication_fixture() -> (tempfile::TempDir, tempfile::TempDir, RecoverySession) {
+        let (directory, writer, _worker) = preparation_fixture();
+        let stages = default_job_lease_directory().join("retrieval");
+        std::fs::create_dir_all(&stages).unwrap();
+        let stage_owner = tempfile::Builder::new()
+            .prefix("publication-regression-")
+            .tempdir_in(stages)
+            .unwrap();
+        let mut recipe = load_recipe(&writer).unwrap();
+        recipe.identity = stage_owner
+            .path()
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        recipe.project_root = directory.path().join("checkout");
+        std::fs::create_dir(&recipe.project_root).unwrap();
+        recipe.phases.push(RecoveryPhase {
+            name: "project".into(),
+            local: recipe.project_root.clone(),
+            remote: "/unused/remote".into(),
+            patterns: default_c_cpp_artifact_patterns(),
+            result_dir: None,
+            custom_target: false,
+            output_gate: false,
+            baseline: BTreeMap::new(),
+            published: BTreeMap::new(),
+            pending: None,
+            complete: false,
+        });
+        let session = RecoverySession {
+            recipe,
+            writer,
+            _output_locks: Vec::new(),
+        };
+        std::fs::create_dir(session.stage(0)).unwrap();
+        (directory, stage_owner, session)
+    }
+
+    #[test]
+    fn recovery_publication_refuses_retained_or_pending_source_before_any_write() {
+        for pending in [false, true] {
+            let (_directory, _stage_owner, mut session) = publication_fixture();
+            let local = session.recipe.project_root.clone();
+            let stage = session.stage(0);
+            let original = b"int main(void) { return 0; }\n";
+            let remote = b"changed source from an earlier collector\n";
+            std::fs::write(local.join("main.c"), original).unwrap();
+            session.recipe.phases[0].baseline.insert(
+                PathBuf::from("main.c"),
+                fingerprint(&local.join("main.c")).unwrap().unwrap(),
+            );
+            std::fs::create_dir(stage.join("build")).unwrap();
+            std::fs::write(stage.join("build/app"), b"valid artifact").unwrap();
+            let retained = if pending {
+                let temporary = local.join(format!(".rch-return-{}", session.recipe.identity));
+                std::fs::write(&temporary, remote).unwrap();
+                session.recipe.phases[0].pending = Some((
+                    PathBuf::from("main.c"),
+                    fingerprint(&temporary).unwrap().unwrap(),
+                ));
+                temporary
+            } else {
+                let retained = stage.join("main.c");
+                std::fs::write(&retained, remote).unwrap();
+                retained
+            };
+            session.persist().unwrap();
+            let journal = std::fs::read(&session.writer.path).unwrap();
+
+            assert!(session.publish("project").is_err(), "pending={pending}");
+            assert_eq!(std::fs::read(local.join("main.c")).unwrap(), original);
+            assert!(!local.join("build/app").exists());
+            assert_eq!(std::fs::read(&retained).unwrap(), remote);
+            assert_eq!(
+                std::fs::read(stage.join("build/app")).unwrap(),
+                b"valid artifact"
+            );
+            assert_eq!(std::fs::read(&session.writer.path).unwrap(), journal);
+            assert!(session.recipe.phases[0].published.is_empty());
+        }
+    }
+
+    #[test]
+    fn recovery_publication_finishes_journaled_new_outputs_without_rewriting_them() {
+        let (_directory, _stage_owner, mut session) = publication_fixture();
+        let local = session.recipe.project_root.clone();
+        let stage = session.stage(0);
+        for (path, bytes) in [("a.out", b"first output"), ("b.out", b"other output")] {
+            std::fs::write(local.join(path), bytes).unwrap();
+            std::fs::write(stage.join(path), b"stale retained staging bytes").unwrap();
+        }
+        let first = fingerprint(&local.join("a.out")).unwrap().unwrap();
+        session.recipe.phases[0].pending = Some((PathBuf::from("a.out"), first.clone()));
+        session.recipe.phases[0].published.insert(
+            PathBuf::from("b.out"),
+            fingerprint(&local.join("b.out")).unwrap().unwrap(),
+        );
+        std::fs::create_dir(stage.join("build")).unwrap();
+        std::fs::write(stage.join("build/next.o"), b"next output").unwrap();
+        session.persist().unwrap();
+
+        session.publish("project").unwrap();
+        assert_eq!(std::fs::read(local.join("a.out")).unwrap(), b"first output");
+        assert_eq!(std::fs::read(local.join("b.out")).unwrap(), b"other output");
+        assert_eq!(
+            std::fs::read(local.join("build/next.o")).unwrap(),
+            b"next output"
+        );
+        assert_eq!(session.recipe.phases[0].published.len(), 3);
+        assert_eq!(
+            session.recipe.phases[0].published[Path::new("a.out")],
+            first
+        );
+        assert!(session.recipe.phases[0].pending.is_none());
+        assert!(session.recipe.phases[0].complete);
+    }
+
+    #[test]
+    fn recovery_publication_retains_declared_result_directory_contract() {
+        let (_directory, _stage_owner, mut session) = publication_fixture();
+        let local = session.recipe.project_root.clone();
+        let stage = session.stage(0);
+        std::fs::create_dir(local.join("reports")).unwrap();
+        std::fs::create_dir(stage.join("reports")).unwrap();
+        std::fs::write(local.join("reports/result.json"), b"old report").unwrap();
+        std::fs::write(stage.join("reports/result.json"), b"new report").unwrap();
+        session.recipe.phases[0].patterns.clear();
+        session.recipe.phases[0].result_dir = Some(PathBuf::from("reports"));
+        session.recipe.phases[0].baseline.insert(
+            PathBuf::from("reports/result.json"),
+            fingerprint(&local.join("reports/result.json"))
+                .unwrap()
+                .unwrap(),
+        );
+        session.persist().unwrap();
+
+        session.publish("project").unwrap();
+        assert_eq!(
+            std::fs::read(local.join("reports/result.json")).unwrap(),
+            b"new report"
+        );
+        assert!(session.recipe.phases[0].complete);
     }
 
     #[test]

@@ -581,6 +581,21 @@ If estimation fails, RCH logs the failure and retains the configured retry
 budget. These filters can include other cached build outputs in the same profile;
 they do not yet select only the executable named by `cargo build --bin`.
 
+Windows workers return artifacts through tar in both quiet and interactive
+execution. The transfer honors the requested output patterns and cache exclusions,
+including custom Cargo target directories and explicit compiler outputs outside
+`target/`. RCH inventories regular files, downloads only selected paths, and
+validates the complete archive before writing outputs locally. Remote tar errors,
+missing selected files, and unexpected archive members fail artifact retrieval;
+successful downloads include file counts and a manifest for output validation.
+Inventory and transfer use bounded deadlines, and cancellation reaps the transport
+before recovery can begin. This transport requires GNU `find` from the worker's
+Git for Windows installation and native `tar`.
+
+Artifact staging retains the original caller directory as the source-protection
+reference. Recovery restores that reference for each output phase, so an empty
+staging directory cannot make source files eligible for a broad output pattern.
+
 Built-in worker selection defaults to `balanced`, which blends speed, load,
 health, and cache affinity. Use `priority` only when you want explicit
 worker-priority control, and `fair_fastest` when you want extra load spreading.
