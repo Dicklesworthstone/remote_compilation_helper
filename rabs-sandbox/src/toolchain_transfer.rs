@@ -17,6 +17,8 @@ use std::path::Path;
 use std::time::Duration;
 
 pub const TOOLCHAIN_TRANSFER_VERSION: &str = "toolchain-tree-v1";
+/// Optional admission capability: a verified retained dataset may seal begin.
+pub const TOOLCHAIN_REUSE_VERSION: &str = "toolchain-reuse-v1";
 pub const MAX_TOOLCHAIN_CHUNK: usize = 64 * 1024;
 pub const MAX_TOOLCHAIN_METADATA_BYTES: usize = 64 * 1024 * 1024;
 pub const TOOLCHAIN_UPLOAD_TIMEOUT_MS: u64 = 30 * 60 * 1000;

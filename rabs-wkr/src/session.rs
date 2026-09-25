@@ -14,7 +14,7 @@ use crate::source_transfer::SourceOwner;
 use rabs_sandbox::process_context::{CommandContext, COMMAND_CONTEXT_VERSION, MAX_COMMAND_ENV_ENTRIES};
 use rabs_sandbox::toolchain_dataset::{ToolchainIdentity, TOOLCHAIN_DATASET_VERSION};
 
-mod toolchain_pool;
+pub(crate) mod toolchain_pool;
 pub use toolchain_pool::ToolchainReuseScope;
 
 /// What this worker can do (advertised at handshake; the scheduler

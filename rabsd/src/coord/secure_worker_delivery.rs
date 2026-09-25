@@ -265,7 +265,8 @@ impl<P: WorkerPeer> WorkerPeer for AdmittedPeer<P> {
                 "source-backed execution requires a captured source upload",
             )?;
             require(
-                grant.get("source_transfer").is_none() && grant.get("toolchain_transfer").is_none(),
+                grant.get("source_transfer").is_none() && grant.get("toolchain_transfer").is_none()
+                    && grant.get("toolchain_reuse").is_none(),
                 "input transfer was not authorized by this operator session",
             )?;
             grant.clone()
@@ -360,7 +361,13 @@ impl<P: WorkerPeer> WorkerPeer for AdmittedPeer<P> {
         // frames inside this negotiation frontier: the public adapter never
         // allows arbitrary source writes, and a failed seal cannot dispatch.
         if let Some(upload) = &self.source {
-            upload.transmit(&mut self.inner, &self.expected_operation)?;
+            upload.transmit(
+                &mut self.inner,
+                &self.expected_operation,
+                grant.get("toolchain_reuse").is_some_and(|value| {
+                    value == rabs_sandbox::toolchain_transfer::TOOLCHAIN_REUSE_VERSION
+                }),
+            )?;
         }
         self.proof = Some(WorkerAuthentication {
             spki_sha256: self.identity.fingerprint,
@@ -908,12 +915,16 @@ mod tests {
         replies: VecDeque<Value>,
         sent: Vec<Value>,
         fail_execution: bool,
+        interrupt_toolchain_ready: bool,
     }
     impl WorkerPeer for Script {
         fn send(&mut self, frame: &Value) -> io::Result<()> {
             self.sent.push(frame.clone());
             if self.fail_execution
-                && matches!(frame["kind"].as_str(), Some("canonical-exec" | "result-resume"))
+                && matches!(
+                    frame["kind"].as_str(),
+                    Some("canonical-exec" | "result-resume")
+                )
             {
                 return Err(io::Error::new(
                     io::ErrorKind::BrokenPipe,
@@ -923,9 +934,17 @@ mod tests {
             Ok(())
         }
         fn receive(&mut self) -> io::Result<Value> {
-            self.replies
+            let reply = self
+                .replies
                 .pop_front()
-                .ok_or_else(|| invalid("missing scripted response"))
+                .ok_or_else(|| invalid("missing scripted response"))?;
+            if self.interrupt_toolchain_ready && reply["kind"] == "toolchain-ready" {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "cancelled toolchain lookup",
+                ));
+            }
+            Ok(reply)
         }
     }
     fn request() -> Value {
@@ -1375,6 +1394,185 @@ mod tests {
             TransportIdentity { peer_id: [1; 32], fingerprint: [1; 32] },
             [1; 32], request, [10, 20, 30], DeliveryMode::Execute, admission,
         ).unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn toolchain_fixture(root: &Path, warm: bool) -> (SourceUpload, Value, Script) {
+        use super::super::worker_delivery::toolchain_identity_value;
+        use rabs_sandbox::toolchain_dataset::{
+            TOOLCHAIN_DATASET_VERSION, ToolchainLimits, capture_toolchain,
+        };
+        use rabs_sandbox::toolchain_transfer::{
+            MAX_TOOLCHAIN_CHUNK, TOOLCHAIN_TRANSFER_VERSION, ToolchainEntryKind,
+        };
+        use std::os::unix::fs::PermissionsExt;
+
+        let (upload, mut request, mut script, _) = source_fixture(root);
+        let original = root.join("compiler-input");
+        std::fs::create_dir(&original).unwrap();
+        std::fs::write(original.join("rustc"), b"transport fixture bytes").unwrap();
+        std::fs::set_permissions(
+            original.join("rustc"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        let prepared = capture_toolchain(
+            &original,
+            &root.join("compiler-retained"),
+            None,
+            &ToolchainLimits::default(),
+            || false,
+        )
+        .unwrap();
+        request.as_object_mut().unwrap().remove("toolchain_backing");
+        request["toolchain_transfer"] = json!(TOOLCHAIN_TRANSFER_VERSION);
+        request["toolchain_identity"] = toolchain_identity_value(prepared.identity());
+        script.replies[0]["toolchain_transfers"] = json!([TOOLCHAIN_TRANSFER_VERSION]);
+        script.replies[0]["toolchain_datasets"] = json!([TOOLCHAIN_DATASET_VERSION]);
+        let sha256 = hex(&prepared.identity().sha256);
+        let ready = |sealed| {
+            json!({"kind":"toolchain-ready", "request_id":7,
+            "sha256":sha256, "sealed":sealed})
+        };
+        // Scripted acknowledgments exercise authenticated coordinator dispatch;
+        // the source_delivery tests separately use a real ToolchainReceiver.
+        let mut replies = vec![ready(warm)];
+        if !warm {
+            for entry in prepared.entries().unwrap() {
+                replies.push(json!({"kind":"toolchain-entry-accepted", "request_id":7,
+                    "sha256":sha256, "path":entry.path}));
+                if let ToolchainEntryKind::File { bytes, .. } = entry.kind {
+                    let mut offset = 0;
+                    while offset < bytes {
+                        offset = (offset + MAX_TOOLCHAIN_CHUNK as u64).min(bytes);
+                        replies.push(json!({"kind":"toolchain-chunk-accepted", "request_id":7,
+                            "sha256":sha256, "path":entry.path, "next_offset":offset}));
+                    }
+                }
+            }
+            replies.push(ready(true));
+        }
+        for (index, reply) in replies.into_iter().enumerate() {
+            script.replies.insert(6 + index, reply);
+        }
+        (
+            upload.with_toolchain(prepared, &request).unwrap(),
+            request,
+            script,
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn authenticated_toolchain_reuse_uses_the_actual_grant_and_preserves_exact_execution() {
+        use rabs_sandbox::toolchain_transfer::TOOLCHAIN_REUSE_VERSION;
+        use sha2::{Digest, Sha256};
+
+        for (advertised, warm) in [(false, false), (true, false), (true, true)] {
+            let root = tempfile::tempdir().unwrap();
+            let (upload, request, mut script) = toolchain_fixture(root.path(), warm);
+            if advertised {
+                script.replies[0]["toolchain_reuses"] = json!([TOOLCHAIN_REUSE_VERSION]);
+            }
+            let original = serde_json::to_vec(&request).unwrap();
+            let mut peer = source_admission(script, &request)
+                .with_source(&upload)
+                .unwrap();
+            let destination = root.path().join("delivery");
+            let delivery = receive_operation(
+                &mut peer,
+                &request,
+                "worker",
+                &destination,
+                DeliveryMode::Execute,
+            )
+            .unwrap();
+            assert!(delivery.acknowledgments_confirmed);
+            assert!(peer.inner.replies.is_empty());
+            let sent = &peer.inner.sent;
+            assert_eq!(sent[1].get("toolchain_reuse").is_some(), advertised);
+            if advertised {
+                assert_eq!(sent[1]["toolchain_reuse"], TOOLCHAIN_REUSE_VERSION);
+            }
+            assert_eq!(
+                sent[1]["execution_lease"]["request_sha256"],
+                hex(&Sha256::digest(&original))
+            );
+            assert_eq!(sent[5]["kind"], "source-seal");
+            assert_eq!(sent[6]["kind"], "toolchain-begin");
+            assert_eq!(sent[6].as_object().unwrap().len(), 4);
+            assert_eq!(sent[6]["identity"], request["toolchain_identity"]);
+            let executions: Vec<_> = sent
+                .iter()
+                .filter(|frame| frame["kind"] == "canonical-exec")
+                .collect();
+            assert_eq!(executions, vec![&request]);
+            assert_eq!(serde_json::to_vec(&request).unwrap(), original);
+            if warm {
+                assert_eq!(sent[7], request);
+                assert!(sent.iter().all(|frame| !matches!(
+                    frame["kind"].as_str(),
+                    Some("toolchain-entry" | "toolchain-chunk" | "toolchain-seal")
+                )));
+            } else {
+                assert!(sent.iter().any(|frame| frame["kind"] == "toolchain-chunk"));
+                let execution = sent
+                    .iter()
+                    .position(|frame| frame["kind"] == "canonical-exec")
+                    .unwrap();
+                assert_eq!(sent[execution - 1]["kind"], "toolchain-seal");
+            }
+            assert!(peer.send(&request).is_err(), "execution cannot be repeated");
+            let mut changed = request.clone();
+            changed["toolchain_identity"]["sha256"] = json!("ab".repeat(32));
+            assert!(peer.send(&changed).is_err());
+            assert_eq!(delivery.receipt["publication_authorized"], false);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unselected_invalid_or_cancelled_warm_toolchain_reply_never_dispatches_or_retries() {
+        use rabs_sandbox::toolchain_transfer::TOOLCHAIN_REUSE_VERSION;
+
+        for case in 0..7 {
+            let root = tempfile::tempdir().unwrap();
+            let (upload, request, mut script) = toolchain_fixture(root.path(), true);
+            if case != 0 {
+                script.replies[0]["toolchain_reuses"] = json!([TOOLCHAIN_REUSE_VERSION]);
+            }
+            match case {
+                0 => {}
+                1 => script.replies[6]["request_id"] = json!(8),
+                2 => script.replies[6]["sha256"] = json!("ab".repeat(32)),
+                3 => script.replies[6]["extra"] = json!(true),
+                4 => script.replies[6]["sealed"] = json!("true"),
+                5 => script.replies.truncate(6),
+                _ => script.interrupt_toolchain_ready = true,
+            }
+            let mut peer = source_admission(script, &request)
+                .with_source(&upload)
+                .unwrap();
+            let destination = root.path().join("delivery");
+            let failure = receive_operation(
+                &mut peer,
+                &request,
+                "worker",
+                &destination,
+                DeliveryMode::Execute,
+            )
+            .unwrap_err();
+            assert!(!failure.execution_may_have_run, "case {case}: {failure}");
+            assert!(peer.authentication().is_none());
+            assert_eq!(peer.inner.sent.last().unwrap()["kind"], "toolchain-begin");
+            assert!(peer.inner.sent.iter().all(|frame| !matches!(
+                frame["kind"].as_str(),
+                Some("toolchain-entry" | "toolchain-chunk" | "toolchain-seal" | "canonical-exec")
+            )));
+            assert!(peer.send(&request).is_err());
+            assert!(peer.negotiate(&recovery_hello(), &grant()).is_err());
+            assert!(!destination.join("delivery.json").exists());
+        }
     }
 
     #[cfg(unix)]

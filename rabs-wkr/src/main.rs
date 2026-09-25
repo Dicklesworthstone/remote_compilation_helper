@@ -35,7 +35,7 @@ use rabs_wkr::source_task::{SourceReply, SourceTransferTask};
 use rabs_wkr::source_transfer::{self, SourceOwner};
 use rabs_wkr::toolchain_transfer::{self, ToolchainOwner, ToolchainReply, ToolchainTransferTask};
 use rabs_sandbox::source_transfer::SOURCE_TRANSFER;
-use rabs_sandbox::toolchain_transfer::TOOLCHAIN_TRANSFER_VERSION;
+use rabs_sandbox::toolchain_transfer::{TOOLCHAIN_REUSE_VERSION, TOOLCHAIN_TRANSFER_VERSION};
 use std::collections::VecDeque;
 use std::future::{Future, poll_fn};
 use std::io;
@@ -748,7 +748,7 @@ where
     H: FnMut() -> rabs_wkr::session::PressureSample,
 {
     drive_session_with_inputs(stream, report, once, journal, artifact_transfer_enabled,
-        source_transfer_enabled, false, output_preview_enabled, execution_lease,
+        source_transfer_enabled, false, output_preview_enabled, execution_lease, false,
         |request, timeout, artifacts, source, toolchain, lease| {
             assert!(toolchain.is_none(), "test did not negotiate toolchain transfer");
             launch(request, timeout, artifacts, source, lease)
@@ -763,7 +763,7 @@ async fn drive_session_with_inputs<S, L, H>(
     stream: &mut S, report: &rabs_wkr::session::CapabilityReport, once: bool,
     journal: Option<&mut WorkerJournal>, artifact_transfer_enabled: bool,
     source_transfer_enabled: bool, toolchain_transfer_enabled: bool, output_preview_enabled: bool,
-    execution_lease: &ExecutionLeaseSelection,
+    execution_lease: &ExecutionLeaseSelection, toolchain_reuse_enabled: bool,
     launch: L, heartbeat: H,
 ) -> Result<(), String>
 where
@@ -774,7 +774,7 @@ where
 {
     drive_session_with_input_budgets(stream, report, once, journal, artifact_transfer_enabled,
         source_transfer_enabled, toolchain_transfer_enabled, output_preview_enabled,
-        execution_lease, InputBudgets::default(), launch, heartbeat).await
+        execution_lease, toolchain_reuse_enabled, InputBudgets::default(), launch, heartbeat).await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -782,7 +782,8 @@ async fn drive_session_with_input_budgets<S, L, H>(
     stream: &mut S, report: &rabs_wkr::session::CapabilityReport, once: bool,
     mut journal: Option<&mut WorkerJournal>, artifact_transfer_enabled: bool,
     source_transfer_enabled: bool, toolchain_transfer_enabled: bool, output_preview_enabled: bool,
-    execution_lease: &ExecutionLeaseSelection, input_budgets: InputBudgets,
+    execution_lease: &ExecutionLeaseSelection, toolchain_reuse_enabled: bool,
+    input_budgets: InputBudgets,
     mut launch: L, mut heartbeat: H,
 ) -> Result<(), String>
 where
@@ -791,6 +792,9 @@ where
         Option<ToolchainOwner>, Option<(RequestExecutionLeaseIdentity, u64)>) -> io::Result<ExecutionTask>,
     H: FnMut() -> rabs_wkr::session::PressureSample,
 {
+    if toolchain_reuse_enabled && !toolchain_transfer_enabled {
+        return Err("toolchain reuse requires toolchain transfer".to_owned());
+    }
     let mut reader = FrameReader::default();
     let mut active: Option<ExecutionTask> = None;
     let mut last_admitted: Option<u64> = None;
@@ -800,7 +804,7 @@ where
     let mut source_transfer = if toolchain_transfer_enabled {
         SourceTransferTask::with_input_budget(rabs_sandbox::toolchain_transfer::TOOLCHAIN_INPUT_BUDGET)
     } else { SourceTransferTask::default() };
-    let mut toolchain_transfer = ToolchainTransferTask::default();
+    let mut toolchain_transfer = ToolchainTransferTask::with_reuse(toolchain_reuse_enabled);
     let mut input_deadline = InputDeadline::new(input_budgets);
     let mut deferred = DeferredFrames::default();
     let mut retained_result: Option<(u64, String)> = None;
@@ -1146,6 +1150,7 @@ fn worker_hello(report: &rabs_wkr::session::CapabilityReport, journal: &WorkerJo
         "output_previews": [OUTPUT_PREVIEW_VERSION],
         "source_transfers": [SOURCE_TRANSFER],
         "toolchain_transfers": [TOOLCHAIN_TRANSFER_VERSION],
+        "toolchain_reuses": [TOOLCHAIN_REUSE_VERSION],
         "execution_leases": [REQUEST_EXECUTION_LEASE_VERSION],
         "command_contexts": [rabs_sandbox::process_context::COMMAND_CONTEXT_VERSION],
         "toolchain_datasets": [rabs_sandbox::toolchain_dataset::TOOLCHAIN_DATASET_VERSION],
@@ -1174,7 +1179,8 @@ async fn session_loop(
         }
         rabs_asupersync::worker_transport::WorkerConnection::LoopbackFixture(_) => ResultRecipient::LoopbackFixture,
     };
-    let (capture_output, capture_artifacts, retain_result, receive_sources, receive_toolchain, output_preview, execution_lease) = asupersync::time::timeout(
+    let (capture_output, capture_artifacts, retain_result, receive_sources, receive_toolchain,
+        reuse_toolchain, output_preview, execution_lease) = asupersync::time::timeout(
         asupersync::time::wall_now(),
         Duration::from_secs(10),
         async {
@@ -1242,12 +1248,13 @@ async fn session_loop(
             let retain = result_retention_requested(&ack)?;
             let source = source_transfer::selected(&ack)?;
             let toolchain = toolchain_transfer::selected(&ack, local_identity.is_some(), source)?;
+            let reuse = toolchain_transfer::selected_reuse(&ack, local_identity.is_some(), toolchain)?;
             let preview = output_preview_requested(&ack)?;
             let lease = execution_lease_selection(&ack, local_identity.is_some(), challenge_session, journal)?;
             if local_identity.is_some() && !output {
                 return Err("authenticated worker requires complete output retrieval".to_owned());
             }
-            Ok::<_, String>((output, artifacts, retain, source, toolchain, preview, lease))
+            Ok::<_, String>((output, artifacts, retain, source, toolchain, reuse, preview, lease))
         },
     ).await.map_err(|_| "worker session admission deadline exceeded".to_owned())??;
     let cargo_home = std::env::temp_dir().join(format!("rabs-wkr-ch-{}", std::process::id()));
@@ -1261,7 +1268,7 @@ async fn session_loop(
     if retain_result { journal.authorize_result_recipient(recipient.clone()); }
     *admitted_at = Some(std::time::Instant::now());
     let outcome = drive_session_with_inputs(&mut stream, report, once, Some(&mut *journal), capture_artifacts,
-        receive_sources, receive_toolchain, output_preview, &execution_lease,
+        receive_sources, receive_toolchain, output_preview, &execution_lease, reuse_toolchain,
         |request, timeout, artifacts, source, toolchain, lease| {
         let cargo_home = cargo_home.clone(); let home = home.clone(); let spills = spills.clone();
         let slots = report.slots;
