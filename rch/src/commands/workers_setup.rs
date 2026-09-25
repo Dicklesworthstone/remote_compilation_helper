@@ -927,8 +927,9 @@ fn push_topology_audit(
 }
 
 /// Run a one-shot SSH command on a worker for **setup / probing** flows
-/// (reachability checks, canonical/alias topology probes and fixes). Uses a
+/// (reachability checks and canonical/alias topology probes). Uses a
 /// fixed 10s connect timeout and a plain `cmd.output()`.
+/// Topology mutations use the durable source-ownership path instead.
 ///
 /// Distinct from the offload-pipeline control-plane executor
 /// `run_offload_ssh_command` in `hook::ssh`, which takes a caller-supplied
@@ -1002,7 +1003,16 @@ async fn execute_topology_fix(
     action_message: &str,
     ctx: &mut TopologyFixContext<'_>,
 ) -> bool {
-    match run_setup_ssh_command(worker, command).await {
+    // Setup can create the canonical root or retarget its alias. Those writes
+    // must exclude builds retaining either path, including their descendants.
+    match crate::hook::run_owned_worker_topology_command(
+        worker,
+        ctx.canonical_root,
+        ctx.alias_root,
+        command,
+    )
+    .await
+    {
         Ok(output) if output.status.success() => {
             ctx.outcome.changed = true;
             push_topology_audit(

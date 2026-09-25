@@ -2393,6 +2393,103 @@ cat "$RCH_OWNERSHIP_TEST_DIR/payload"
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
+    async fn explicit_topology_setup_waits_for_sources_and_cancellation_fences_late_retarget() {
+        let directory = tempfile::tempdir().unwrap().keep();
+        let registry = directory.join("registry");
+        for (index, job_uses_alias) in [false, true].into_iter().enumerate() {
+            let fixture = directory.join(format!("topology-{index}"));
+            let previous = fixture.join("previous sources");
+            let canonical = fixture.join("new sources");
+            let alias = fixture.join("alias ' quoted");
+            std::fs::create_dir_all(previous.join("repo")).unwrap();
+            std::fs::create_dir_all(canonical.join("repo")).unwrap();
+            std::fs::write(previous.join("repo/input"), b"existing build\n").unwrap();
+            std::fs::write(canonical.join("repo/input"), b"next build\n").unwrap();
+            std::os::unix::fs::symlink(&previous, &alias).unwrap();
+            let job_root = if job_uses_alias { &alias } else { &previous };
+            let job_roots = vec![job_root.join("repo").display().to_string()];
+            let setup_roots = vec![canonical.display().to_string(), alias.display().to_string()];
+            let job_token = format!("da{index}1");
+            let cancelled_token = format!("da{index}2");
+            let setup_token = format!("da{index}3");
+            let next_token = format!("da{index}4");
+            let job =
+                claim_test_durable_source_closure(&registry, &job_roots, &job_token, "acquire")
+                    .await
+                    .unwrap();
+
+            // Exercise the actual metadata admission transaction directly so
+            // lexical hierarchy locks cannot hide a missing physical check.
+            let blocked =
+                test_source_intent(&registry, &setup_roots, &cancelled_token, "acquire").await;
+            assert_eq!(blocked.status.code(), Some(73));
+            assert!(String::from_utf8_lossy(&blocked.stderr).contains("overlapping"));
+            assert_eq!(std::fs::read_link(&alias).unwrap(), previous);
+
+            let cancellation =
+                test_source_intent(&registry, &setup_roots, &cancelled_token, "cancel").await;
+            assert!(cancellation.status.success());
+            assert_eq!(cancellation.stdout, b"unowned");
+            let retarget = |prefix: &str| {
+                format!(
+                    "exec {prefix} ln -sfn -- {} {}",
+                    shell_escape::escape(canonical.to_string_lossy()),
+                    shell_escape::escape(alias.to_string_lossy()),
+                )
+            };
+            let cancelled_prefix =
+                source_authority_activity_prefix_at(registry.to_str().unwrap(), &cancelled_token)
+                    .unwrap();
+            let late = Command::new("sh")
+                .args(["-c", &retarget(&cancelled_prefix)])
+                .output()
+                .await
+                .unwrap();
+            assert!(!late.status.success());
+            assert_eq!(std::fs::read_link(&alias).unwrap(), previous);
+            assert_eq!(
+                std::fs::read(alias.join("repo/input")).unwrap(),
+                b"existing build\n"
+            );
+
+            job.release().await.unwrap();
+            let setup =
+                claim_test_durable_source_closure(&registry, &setup_roots, &setup_token, "acquire")
+                    .await
+                    .unwrap();
+            let setup_prefix =
+                source_authority_activity_prefix_at(registry.to_str().unwrap(), &setup_token)
+                    .unwrap();
+            let output = Command::new("sh")
+                .args(["-c", &retarget(&setup_prefix)])
+                .output()
+                .await
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(std::fs::read_link(&alias).unwrap(), canonical);
+            assert_eq!(
+                std::fs::read(alias.join("repo/input")).unwrap(),
+                b"next build\n"
+            );
+            setup.release().await.unwrap();
+            let next = claim_test_durable_source_closure(
+                &registry,
+                &[alias.join("repo").display().to_string()],
+                &next_token,
+                "acquire",
+            )
+            .await
+            .unwrap();
+            next.release().await.unwrap();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
     async fn source_authority_hierarchy_prevents_nested_snapshot_mutation() {
         use super::super::dependency_closure::build_sync_closure_plan;
         use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};

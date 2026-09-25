@@ -3876,6 +3876,73 @@ mod repo_updater;
 pub(crate) mod ssh;
 pub(crate) use ssh::{source_authority_activity_prefix, source_authority_cleanup_prefix};
 
+/// Worker setup can change a shared ancestor of many source trees. Give each
+/// explicit mutation the same durable exclusion and activity draining as a
+/// build, including when SSH stops reporting before the command finishes.
+pub(crate) async fn run_owned_worker_topology_command(
+    worker: &WorkerConfig,
+    canonical_root: &Path,
+    alias_root: &Path,
+    command: &str,
+) -> anyhow::Result<Output> {
+    let mut roots = [canonical_root, alias_root]
+        .into_iter()
+        .map(|root| {
+            root.to_str()
+                .map(str::to_owned)
+                .context("worker topology root is not a UTF-8 path")
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    roots.sort();
+    roots.dedup();
+    let identity = uuid::Uuid::new_v4().simple().to_string();
+    let activity_command = ssh::wrap_remote_source_activity(command, &identity)?;
+    let guard = match ssh::acquire_remote_source_authority_lock(
+        worker,
+        &roots,
+        None,
+        &identity,
+        Duration::from_secs(30),
+    )
+    .await
+    {
+        Ok(guard) => guard,
+        Err(acquisition_error) => {
+            // No command was dispatched, but a delayed holder may still gain
+            // its kernel locks. Fence that exact intent before reporting that
+            // setup failed; a missing acknowledgment is not absent ownership.
+            let cancellation = async {
+                if ssh::cancel_remote_source_authority_intent(worker, &roots, &identity).await? {
+                    ssh::finish_cancel_remote_source_authority_intent(worker, &roots, &identity)
+                        .await?;
+                }
+                Ok::<(), anyhow::Error>(())
+            }
+            .await;
+            return match cancellation {
+                Ok(()) => Err(acquisition_error.context("worker topology setup was not started")),
+                Err(cancellation_error) => Err(acquisition_error.context(format!(
+                    "worker topology intent {identity} on {} remains unresolved; source ownership is retained: {cancellation_error:#}",
+                    worker.id,
+                ))),
+            };
+        }
+    };
+    let result =
+        ssh::run_offload_ssh_command(worker, &activity_command, Duration::from_secs(30)).await;
+    // Release waits for the activity supervisor even after a transport error.
+    // A command arriving later must recheck the now-released token and refuse.
+    // If draining cannot be proved, keep the durable claim and name it instead
+    // of allowing a later build to share a changing topology.
+    guard.release().await.with_context(|| {
+        format!(
+            "worker topology intent {identity} on {} could not acknowledge release; inspect the retained source claim before retrying setup",
+            worker.id,
+        )
+    })?;
+    result
+}
+
 // The dependency-closure sync planning + remote dependency-preflight cluster
 // (sync-closure plan/manifest, sync-topology predicates, cargo manifest/workspace
 // parsers, and the remote dependency-manifest verifier) lives in the
