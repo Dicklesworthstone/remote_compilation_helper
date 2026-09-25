@@ -593,18 +593,25 @@ fn test_release_worker() {
         .wait_for_socket(&socket_path, Duration::from_secs(10))
         .unwrap();
 
-    // Send release-worker request (include empty body line for timing data)
-    let response = send_socket_request(
+    // Since 0e64c878 a release must name the durable build that owns the
+    // slots; an unowned release is refused so one client cannot free slots
+    // another build still holds. The owned path is covered by
+    // api::tests::test_handle_release_worker_build_id_is_idempotent; this
+    // end-to-end check pins the refusal on the real socket.
+    let unowned = send_socket_request(
         &socket_path,
         "POST /release-worker?worker=worker1&slots=2\n",
-    )
-    .unwrap();
-
-    // Verify response
+    );
     assert!(
-        response.contains("200 OK"),
-        "Expected 200 OK, got: {}",
-        response
+        !unowned.as_deref().is_ok_and(|r| r.contains("200 OK")),
+        "unowned release must be refused, got: {unowned:?}"
+    );
+
+    // The refusal is per-request: the daemon keeps serving afterwards.
+    let status = send_socket_request(&socket_path, "GET /status").unwrap();
+    assert!(
+        status.contains("200 OK"),
+        "daemon unhealthy after refusal: {status}"
     );
 
     harness.mark_passed();
