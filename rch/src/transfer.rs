@@ -792,7 +792,15 @@ if [ "$__t" -gt 0 ] 2>/dev/null; then (
         exit 0
     fi
     rch_remote_leader_matches || exit 0
-    printf "\n%s\n" "$__m" >&3
+    # fd 3 is the session's stderr pipe. If the dispatcher stopped draining it,
+    # a blocking printf here would wedge forever and the deadline would never
+    # fire (a 24h-stuck cargo test on vmi1153651, 2026-09-25). Emit the marker
+    # from a child and give it a bounded grace; the group kill reaps it.
+    printf "\n%s\n" "$__m" >&3 & __mp=$!
+    __i=0
+    while kill -0 "$__mp" 2>/dev/null && [ "$__i" -lt 50 ]; do
+        sleep 0.1 3>&-; __i=$((__i + 1))
+    done
     rch_remote_leader_matches && kill -KILL -"$__p" 2>/dev/null
 ) >/dev/null 2>&1 </dev/null & __w=$!; fi
 if [ -n "$__w" ] && rch_read_process "$__w"; then __watch_start=$rch_observed_start; fi
@@ -11690,6 +11698,56 @@ fn main() {
         );
         assert!(fields[4].parse::<u64>().unwrap() > 0);
         fields[3].parse::<u32>().unwrap()
+    }
+
+    /// The deadline must fire even when nobody drains the session's stderr.
+    /// The workload fills the pipe (like cargo writing to a dispatcher that
+    /// stopped reading), so a blocking marker write would wedge the timer.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn remote_build_watchdog_kills_when_stderr_pipe_is_full() {
+        use std::process::Command;
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().unwrap().keep();
+        let pgf = dir.join("job.pgid");
+        let mut child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(r#"exec setsid sh -c "$1" rch-build "$2" 1 RCH_TEST_DEADLINE 42 sh -c "$3" 3>&2"#)
+            .arg("rch-full-pipe")
+            .arg(remote_build_watchdog_script())
+            .arg(pgf.to_str().unwrap())
+            .arg("head -c 1048576 /dev/zero >&2; sleep 60")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        // Hold the read end open without reading so the pipe stays full.
+        let _undrained = child.stderr.take();
+        let start = Instant::now();
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break Some(status);
+            }
+            if start.elapsed() > Duration::from_secs(20) {
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        if status.is_none() {
+            let _ = Command::new("kill")
+                .arg("-KILL")
+                .arg(format!("-{}", child.id()))
+                .status();
+            let _ = child.wait();
+        }
+        let status = status.expect("deadline kill must not block on a full stderr pipe");
+        assert_eq!(
+            std::os::unix::process::ExitStatusExt::signal(&status),
+            Some(9),
+            "{status:?}"
+        );
     }
 
     /// Exercise the production publisher and timeout consumer against a real
