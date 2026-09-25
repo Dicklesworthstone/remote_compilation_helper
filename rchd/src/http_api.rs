@@ -20,7 +20,6 @@ use serde_json::json;
 
 use crate::metrics::{self, budget};
 use crate::workers::WorkerPool;
-use rch_common::WorkerStatus;
 
 /// Shared state for HTTP handlers.
 #[derive(Clone)]
@@ -79,18 +78,25 @@ async fn health_handler(State(state): State<Arc<HttpState>>) -> impl IntoRespons
 /// Handler for `/ready` - Readiness probe.
 ///
 /// Returns 200 OK if workers are available, 503 otherwise.
+///
+/// "Available" means select-worker could hand the worker a build: the same
+/// predicate as the socket `/ready` and `/status` `slots_available` (healthy
+/// or degraded, circuit not open, pressure not critical — issue #75).
 async fn ready_handler(State(state): State<Arc<HttpState>>) -> impl IntoResponse {
     let workers = state.pool.all_workers().await;
     let mut healthy_workers = Vec::new();
     let mut total_slots = 0;
 
     for w in workers {
-        // Consider a worker available if it is healthy/degraded AND has available slots
-        let status = w.status().await;
-        let is_status_healthy = matches!(status, WorkerStatus::Healthy | WorkerStatus::Degraded);
+        let Some(circuit_state) = w.circuit_state().await else {
+            continue;
+        };
+        let pressure_state = w.pressure_assessment().await.state;
+        let assignable =
+            crate::api::worker_accepts_new_builds(w.status().await, circuit_state, pressure_state);
         let available = w.available_slots().await;
 
-        if is_status_healthy && available > 0 {
+        if assignable && available > 0 {
             healthy_workers.push(w);
             total_slots += available;
         }

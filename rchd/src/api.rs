@@ -3161,9 +3161,20 @@ fn handle_health(ctx: &DaemonContext) -> HealthResponse {
     }
 }
 
-fn worker_accepts_new_builds(status: WorkerStatus, circuit_state: CircuitState) -> bool {
+/// Whether select-worker could hand this worker a new build.
+///
+/// Capacity surfaces (`/status` `slots_available`, socket and HTTP `/ready`)
+/// must agree with selection: critical pressure is a hard selection exclusion
+/// whichever pressure rule fired (disk, ratio, IO, memory), so a critical
+/// worker contributes no assignable capacity (issue #75).
+pub(crate) fn worker_accepts_new_builds(
+    status: WorkerStatus,
+    circuit_state: CircuitState,
+    pressure_state: crate::disk_pressure::PressureState,
+) -> bool {
     matches!(status, WorkerStatus::Healthy | WorkerStatus::Degraded)
         && circuit_state != CircuitState::Open
+        && pressure_state != crate::disk_pressure::PressureState::Critical
 }
 
 /// Handle a readiness check request.
@@ -3171,13 +3182,15 @@ async fn handle_ready(ctx: &DaemonContext) -> ReadyResponse {
     let workers = ctx.pool.all_workers().await;
 
     // Check if any assignable workers are available. Raw free slots on drained,
-    // disabled, unreachable, or open-circuit workers cannot accept new builds.
+    // disabled, unreachable, open-circuit, or critical-pressure workers cannot
+    // accept new builds.
     let mut workers_available = false;
     for w in workers {
         let Some(circuit_state) = w.circuit_state().await else {
             continue;
         };
-        if !worker_accepts_new_builds(w.status().await, circuit_state) {
+        let pressure_state = w.pressure_assessment().await.state;
+        if !worker_accepts_new_builds(w.status().await, circuit_state, pressure_state) {
             continue;
         }
         if w.available_slots().await > 0 {
@@ -3672,7 +3685,8 @@ pub(crate) async fn handle_status(ctx: &DaemonContext) -> Result<DaemonFullStatu
         let available_slots = total_slots.saturating_sub(used_slots);
         let circuit_stats = worker.circuit_stats().await;
         let circuit_state = circuit_stats.state();
-        let assignable_slots = if worker_accepts_new_builds(status, circuit_state) {
+        let pressure = worker.pressure_assessment().await;
+        let assignable_slots = if worker_accepts_new_builds(status, circuit_state, pressure.state) {
             available_slots
         } else {
             0
@@ -3701,7 +3715,6 @@ pub(crate) async fn handle_status(ctx: &DaemonContext) -> Result<DaemonFullStatu
             CircuitState::Open => "open",
             CircuitState::HalfOpen => "half_open",
         };
-        let pressure = worker.pressure_assessment().await;
 
         // Use default circuit config for recovery time calculation
         let circuit_config = CircuitBreakerConfig::default();
@@ -7468,6 +7481,95 @@ mod tests {
             status.daemon.slots_available, 9,
             "only healthy/degraded, non-open-circuit capacity should be assignable"
         );
+    }
+
+    /// Issue #75: `/status` slots_available, socket `/ready` and HTTP `/ready`
+    /// must agree with select-worker, which hard-excludes critical pressure
+    /// whichever rule fired (disk floor via the capabilities probe, memory).
+    #[tokio::test]
+    async fn test_capacity_surfaces_exclude_critical_pressure_workers() {
+        use tower::ServiceExt;
+        let _guard = test_guard!();
+
+        async fn http_ready_status(pool: &WorkerPool) -> axum::http::StatusCode {
+            crate::http_api::create_router(crate::http_api::HttpState {
+                pool: pool.clone(),
+                version: "test",
+                started_at: Instant::now(),
+                pid: 1,
+            })
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/ready")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+        }
+
+        for case in ["disk_critical", "memory_critical"] {
+            let pool = WorkerPool::new();
+            pool.add_worker(make_test_worker("w1", 8)).await;
+            let worker = pool.get(&WorkerId::new("w1")).await.unwrap();
+            if case == "disk_critical" {
+                // 45 GB of 926 GB (4.9%): below the 5% critical ratio, via the
+                // same policy path the capabilities probe takes.
+                worker
+                    .set_capabilities(WorkerCapabilities {
+                        disk_free_gb: Some(45.0),
+                        disk_total_gb: Some(926.0),
+                        ..Default::default()
+                    })
+                    .await;
+            } else {
+                worker
+                    .set_pressure_assessment(PressureAssessment {
+                        state: PressureState::Critical,
+                        confidence: PressureConfidence::High,
+                        reason_code: "memory_pressure_critical".to_string(),
+                        policy_rule: "memory_pressure>=critical_memory_pressure".to_string(),
+                        disk_free_gb: Some(500.0),
+                        disk_total_gb: Some(926.0),
+                        memory_pressure: Some(95.0),
+                        telemetry_fresh: true,
+                        ..Default::default()
+                    })
+                    .await;
+            }
+            assert_eq!(
+                worker.pressure_assessment().await.state,
+                PressureState::Critical,
+                "{case}"
+            );
+
+            let ctx = make_test_context(pool.clone());
+            let status = handle_status(&ctx).await.unwrap();
+            assert_eq!(status.daemon.slots_available, 0, "{case}");
+            assert!(status.daemon.slots_total > 0, "{case}");
+            let ready = handle_ready(&ctx).await;
+            assert_eq!(ready.status, "not_ready", "{case}");
+            assert!(!ready.workers_available, "{case}");
+            assert_eq!(
+                http_ready_status(&pool).await,
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "{case}"
+            );
+
+            // A second, unpressured worker restores readiness and contributes
+            // exactly its own slots.
+            pool.add_worker(make_test_worker("w2", 4)).await;
+            let ctx = make_test_context(pool.clone());
+            let status = handle_status(&ctx).await.unwrap();
+            assert_eq!(status.daemon.slots_available, 4, "{case}");
+            assert!(handle_ready(&ctx).await.workers_available, "{case}");
+            assert_eq!(
+                http_ready_status(&pool).await,
+                axum::http::StatusCode::OK,
+                "{case}"
+            );
+        }
     }
 
     #[tokio::test]
