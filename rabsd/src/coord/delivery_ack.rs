@@ -7,7 +7,7 @@
 //! A local receipt is not permission to discard a DIFFERENT remote result.
 
 use super::delivery_recovery::{DeliveryTrust, recover_existing_delivery};
-use super::worker_delivery::{Delivery, DeliveryFailure, DeliveryMode, MAX_FRAME_BYTES, WorkerPeer};
+use super::worker_delivery::{Delivery, DeliveryFailure, DeliveryMode, MAX_FRAME_BYTES, WorkerPeer, transport_interrupted};
 use serde_json::{Value, json};
 use std::io;
 use std::path::Path;
@@ -65,6 +65,7 @@ impl PendingAcknowledgment {
     ) -> Result<Self, DeliveryFailure> {
         let failure = |detail: &str| DeliveryFailure {
             directory: directory.to_path_buf(), execution_may_have_run: true,
+            transport_interrupted: false,
             detail: detail.to_owned(),
         };
         let delivery = recover_existing_delivery(request, worker, directory, trust)?
@@ -89,9 +90,10 @@ impl PendingAcknowledgment {
     #[must_use]
     pub fn directory(&self) -> &Path { &self.delivery.directory }
 
-    fn failure(&self, error: impl std::fmt::Display) -> DeliveryFailure {
+    fn failure(&self, error: io::Error) -> DeliveryFailure {
         DeliveryFailure {
             directory: self.delivery.directory.clone(), execution_may_have_run: true,
+            transport_interrupted: transport_interrupted(&error),
             detail: format!("worker acknowledgment unconfirmed; local delivery retained; do not reexecute: {error}"),
         }
     }
@@ -218,6 +220,7 @@ impl PendingAcknowledgment {
         self.confirm(peer).map_err(|error| self.failure(error))?;
         self.delivery.acknowledgments_confirmed = true;
         self.delivery.acknowledgment_error = None;
+        self.delivery.acknowledgment_interrupted = false;
         Ok(self.delivery)
     }
 }
@@ -317,7 +320,7 @@ mod tests {
                 json!({"kind":"output-acknowledged", "request_id":7, "already_released":false}),
             ]);
             if artifacts { replies.push_back(json!({"kind":"artifact-acknowledged", "request_id":7, "already_released":false})); }
-            Script { replies, sent:Vec::new(), corrupt_on_result:None,
+            Script { replies, sent:Vec::new(), corrupt_on_result:None, lost_reply_is_transport:false,
                 proof:if self.receipt["transport_authenticated"] == true {
                     Some(WorkerAuthentication { spki_sha256:[1;32], session_id:22, identity_generation:1 })
                 } else { None } }
@@ -328,6 +331,7 @@ mod tests {
         sent: Vec<Value>,
         proof: Option<WorkerAuthentication>,
         corrupt_on_result: Option<PathBuf>,
+        lost_reply_is_transport: bool,
     }
     impl WorkerPeer for Script {
         fn send(&mut self, value: &Value) -> io::Result<()> {
@@ -335,7 +339,12 @@ mod tests {
             self.sent.push(value.clone()); Ok(())
         }
         fn receive(&mut self) -> io::Result<Value> {
-            let value = self.replies.pop_front().ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "lost reply"))?;
+            let value = self.replies.pop_front().ok_or_else(|| {
+                let error = io::Error::new(io::ErrorKind::UnexpectedEof, "lost reply");
+                if self.lost_reply_is_transport {
+                    super::super::worker_delivery::worker_transport_error(error)
+                } else { error }
+            })?;
             if value["kind"] == "exec-result" && let Some(path) = self.corrupt_on_result.take() { fs::write(path, b"bad")?; }
             Ok(value)
         }
@@ -438,6 +447,26 @@ mod tests {
             assert_eq!(peer.sent.iter().filter(|value| value["kind"] == "result-resume").count(), 1);
         }
         assert!(f.pending().acknowledge(&mut f.peer()).unwrap().acknowledgments_confirmed);
+    }
+
+    #[test]
+    fn acknowledgment_failure_preserves_only_marked_network_recovery_evidence() {
+        let f = Fixture::new(true, true);
+        let original = fs::read(f.directory().join("delivery.json")).unwrap();
+        for marked in [false, true] {
+            let mut peer = f.peer();
+            peer.replies.truncate(3); // Output ACK succeeds; artifact ACK reply is lost.
+            peer.lost_reply_is_transport = marked;
+            let failure = f.pending().acknowledge(&mut peer).unwrap_err();
+            assert!(failure.execution_may_have_run);
+            assert_eq!(failure.transport_interrupted, marked);
+            assert_eq!(peer.sent.iter().filter(|frame| frame["kind"] == "result-resume").count(), 1);
+            assert_eq!(peer.sent.iter().filter(|frame| frame["kind"] == "artifact-ack").count(), 1);
+            assert_eq!(fs::read(f.directory().join("delivery.json")).unwrap(), original);
+        }
+        let recovered = f.pending().acknowledge(&mut f.peer()).unwrap();
+        assert!(recovered.acknowledgments_confirmed);
+        assert!(!recovered.acknowledgment_interrupted);
     }
 
     #[test]

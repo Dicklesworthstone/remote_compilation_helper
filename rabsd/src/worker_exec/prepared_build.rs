@@ -201,6 +201,7 @@ impl PreparedBuild<'_> {
                 .map_err(|detail| DeliveryFailure {
                     directory: self.directory.to_path_buf(),
                     execution_may_have_run: true,
+                    transport_interrupted: false,
                     detail,
                 })?;
         Ok((delivery, Some(installed)))
@@ -215,6 +216,7 @@ impl PreparedBuild<'_> {
                 .map_err(|error| DeliveryFailure {
                     directory: self.directory.to_path_buf(),
                     execution_may_have_run: true,
+                    transport_interrupted: false,
                     detail: format!("build completed but its status could not be written: {error}"),
                 })?;
             let code = delivery.receipt["exit_code"]
@@ -337,6 +339,10 @@ pub fn execute_prepared_operation(
                 OperationOutcome::Completed { result }
             }
         }
+        Err(error) if error.transport_interrupted => OperationOutcome::TransportInterrupted {
+            detail: error.detail,
+            execution_may_have_run: error.execution_may_have_run,
+        },
         Err(error) => OperationOutcome::Failed {
             detail: error.detail,
             execution_may_have_run: error.execution_may_have_run,

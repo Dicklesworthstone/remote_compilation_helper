@@ -18,6 +18,7 @@ use super::source_delivery::SourceUpload;
 use super::worker_delivery::{
     Delivery, DeliveryFailure, DeliveryMode, ResumePeer, ResumeSource,
     WorkerAuthentication, WorkerPeer, receive_operation, validate_request,
+    transport_interrupted, worker_transport_error,
 };
 use asupersync::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use asupersync::runtime::Runtime;
@@ -485,9 +486,9 @@ async fn read_record<S: AsyncRead + Unpin>(
         // One extra byte admits the terminator at the exact record limit, not
         // an unbounded overshoot followed by a late size check.
         let capacity = chunk.len().min(MAX_JSON_RECORD + 1 - buffered.len());
-        let count = stream.read(&mut chunk[..capacity]).await?;
+        let count = stream.read(&mut chunk[..capacity]).await.map_err(worker_transport_error)?;
         if count == 0 {
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "worker record incomplete"));
+            return Err(worker_transport_error(io::Error::new(io::ErrorKind::UnexpectedEof, "worker record incomplete")));
         }
         buffered.extend_from_slice(&chunk[..count]);
         reads += 1;
@@ -614,11 +615,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> WorkerPeer for RecordPeer<'_, S> {
         let stream = &mut self.stream;
         let result = self.runtime.block_on(async {
             asupersync::time::timeout(asupersync::time::wall_now(), budget, async {
-                stream.write_all(&bytes).await?;
-                stream.flush().await
+                stream.write_all(&bytes).await.map_err(worker_transport_error)?;
+                stream.flush().await.map_err(worker_transport_error)
             })
             .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "worker write deadline"))?
+            .map_err(|_| worker_transport_error(io::Error::new(io::ErrorKind::TimedOut, "worker write deadline")))?
         });
         self.failed |= result.is_err();
         result
@@ -633,7 +634,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> WorkerPeer for RecordPeer<'_, S> {
                 asupersync::time::wall_now(), budget, read_record(stream, buffered),
             )
             .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "worker read deadline"))?
+            .map_err(|_| worker_transport_error(io::Error::new(io::ErrorKind::TimedOut, "worker read deadline")))?
         });
         self.failed |= result.is_err();
         // JSON parsing and immediately-ready buffered reads must not let a late
@@ -693,6 +694,7 @@ pub fn receive_authenticated_operation(
     let failure = |error: io::Error| DeliveryFailure {
         directory: destination.to_path_buf(),
         execution_may_have_run: mode == DeliveryMode::Resume,
+        transport_interrupted: transport_interrupted(&error),
         detail: error.to_string(),
     };
     if asupersync::cx::Cx::current().is_some() {
@@ -741,7 +743,8 @@ pub fn acknowledge_authenticated(
 ) -> Result<Delivery, DeliveryFailure> {
     let directory = pending.directory().to_path_buf();
     let failure = |error: io::Error| DeliveryFailure {
-        directory: directory.clone(), execution_may_have_run: true, detail: error.to_string(),
+        directory: directory.clone(), execution_may_have_run: true,
+        transport_interrupted: transport_interrupted(&error), detail: error.to_string(),
     };
     if asupersync::cx::Cx::current().is_some() {
         return Err(failure(invalid("authenticated acknowledgment requires an operator thread")));
@@ -769,7 +772,8 @@ pub fn acknowledge_authenticated_controlled(
 ) -> Result<Delivery, DeliveryFailure> {
     let directory = pending.directory().to_path_buf();
     let failure = |error: io::Error| DeliveryFailure {
-        directory: directory.clone(), execution_may_have_run: true, detail: error.to_string(),
+        directory: directory.clone(), execution_may_have_run: true,
+        transport_interrupted: transport_interrupted(&error), detail: error.to_string(),
     };
     if asupersync::cx::Cx::current().is_some() {
         return Err(failure(invalid("authenticated acknowledgment requires a dedicated thread")));
@@ -801,6 +805,7 @@ pub fn receive_authenticated_source(
     let failure = |error: io::Error| DeliveryFailure {
         directory: destination.to_path_buf(),
         execution_may_have_run: false,
+        transport_interrupted: transport_interrupted(&error),
         detail: error.to_string(),
     };
     if asupersync::cx::Cx::current().is_some() {
@@ -868,6 +873,7 @@ pub fn receive_authenticated_observed(
     let failure = |error: io::Error| DeliveryFailure {
         directory: destination.to_path_buf(),
         execution_may_have_run: mode == DeliveryMode::Resume,
+        transport_interrupted: transport_interrupted(&error),
         detail: error.to_string(),
     };
     if asupersync::cx::Cx::current().is_some() {
@@ -1373,6 +1379,7 @@ mod tests {
         let manifest = &request["source_manifest"]["manifest_sha256"];
         let mut script = peer.inner;
         script.replies[0]["request_high_water"] = Value::Null;
+        script.replies[0]["execution_leases"] = json!(["request-renewal-v1"]);
         script.replies[0]["source_transfers"] = json!(["source-files-v1"]);
         script.replies[2].as_object_mut().unwrap().remove("resumed");
         script.replies.insert(2, json!({"kind":"source-ready", "request_id":7,
@@ -1830,6 +1837,115 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn native_disconnect_evidence_preserves_the_source_and_execution_frontiers() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+        for case in 0..5 {
+            let root = tempfile::tempdir().unwrap();
+            let (upload, request, mut script, _) = source_fixture(root.path());
+            match case {
+                0 => script.replies.truncate(2), // Source begin has no reply.
+                1 => script.replies.truncate(5), // Source seal has no reply.
+                2 | 3 => script.replies.truncate(6), // Execute has no result.
+                _ => script.replies[7]["data_hex"] = json!("4200ff42"),
+            }
+            let mut bytes = script.replies.iter().map(|frame| format!("{frame}\n"))
+                .collect::<String>().into_bytes();
+            if case == 3 { bytes.extend_from_slice(b"{invalid-json}\n"); }
+            let (_script, admission) = with_admission(script);
+            let raw = RecordPeer::new(&runtime, RecordWire::new(bytes, 97), &request);
+            let mut peer = AdmittedPeer::new(raw,
+                TransportIdentity { peer_id: [1; 32], fingerprint: [1; 32] },
+                [1; 32], &request, [10, 20, 30], DeliveryMode::Execute, admission,
+            ).unwrap().with_source(&upload).unwrap();
+            let destination = root.path().join("delivery");
+            let failure = receive_operation(&mut peer, &request, "worker", &destination,
+                DeliveryMode::Execute).unwrap_err();
+            assert_eq!(failure.transport_interrupted, case < 3, "case {case}: {failure}");
+            assert_eq!(failure.execution_may_have_run, case >= 2, "case {case}: {failure}");
+            assert!(!destination.join("delivery.json").exists());
+            let sent = peer.inner.stream.written.split(|byte| *byte == b'\n')
+                .filter(|line| !line.is_empty())
+                .map(|line| serde_json::from_slice::<Value>(line).unwrap()).collect::<Vec<_>>();
+            let executions = sent.iter().filter(|frame| frame["kind"] == "canonical-exec")
+                .collect::<Vec<_>>();
+            assert_eq!(executions.len(), usize::from(case >= 2));
+            if let Some(execution) = executions.first() { assert_eq!(**execution, request); }
+            assert!(!sent.iter().any(|frame| matches!(frame["kind"].as_str(),
+                Some("result-resume" | "output-ack" | "artifact-ack"))));
+            assert!(peer.send(&request).is_err(), "an existing connection never retries");
+        }
+    }
+
+    #[test]
+    fn native_ack_disconnect_is_distinct_from_a_malformed_acknowledgment() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+        for malformed in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let (fixture, request) = resumed_peer();
+            let mut script = fixture.inner;
+            drop(fixture.admission);
+            if malformed {
+                script.replies.back_mut().unwrap()["request_id"] = json!(8);
+            } else {
+                script.replies.pop_back();
+            }
+            let bytes = script.replies.iter().map(|frame| format!("{frame}\n"))
+                .collect::<String>().into_bytes();
+            let (_script, admission) = with_admission(script);
+            let mut peer = AdmittedPeer::new(
+                RecordPeer::new(&runtime, RecordWire::new(bytes, 23), &request),
+                TransportIdentity { peer_id: [1; 32], fingerprint: [1; 32] },
+                [1; 32], &request, [10, 20, 30], DeliveryMode::Resume, admission,
+            ).unwrap();
+            let destination = root.path().join("delivery");
+            let delivery = receive_operation(&mut peer, &request, "worker", &destination,
+                DeliveryMode::Resume).unwrap();
+            assert!(!delivery.acknowledgments_confirmed);
+            assert_eq!(delivery.acknowledgment_interrupted, !malformed);
+            assert_eq!(delivery.to_json()["acknowledgment_interrupted"], !malformed);
+            assert_eq!(std::fs::read(destination.join("diagnostics/stdout")).unwrap(), b"A\0\xffB");
+            assert!(destination.join("delivery.json").is_file());
+            let sent = peer.inner.stream.written.split(|byte| *byte == b'\n')
+                .filter(|line| !line.is_empty())
+                .map(|line| serde_json::from_slice::<Value>(line).unwrap()).collect::<Vec<_>>();
+            assert_eq!(sent.iter().filter(|frame| frame["kind"] == "result-resume").count(), 1);
+            assert_eq!(sent.iter().filter(|frame| frame["kind"] == "output-ack").count(), 1);
+            assert!(!sent.iter().any(|frame| frame["kind"] == "canonical-exec"));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn native_toolchain_disconnect_never_marks_compiler_dispatch_possible() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let (upload, request, mut script) = toolchain_fixture(root.path(), true);
+        script.replies[0]["toolchain_reuses"] = json!([
+            rabs_sandbox::toolchain_transfer::TOOLCHAIN_REUSE_VERSION,
+        ]);
+        script.replies.truncate(6); // Source sealed; toolchain begin gets EOF.
+        let bytes = script.replies.iter().map(|frame| format!("{frame}\n"))
+            .collect::<String>().into_bytes();
+        let (_script, admission) = with_admission(script);
+        let mut peer = AdmittedPeer::new(
+            RecordPeer::new(&runtime, RecordWire::new(bytes, 97), &request),
+            TransportIdentity { peer_id: [1; 32], fingerprint: [1; 32] },
+            [1; 32], &request, [10, 20, 30], DeliveryMode::Execute, admission,
+        ).unwrap().with_source(&upload).unwrap();
+        let failure = receive_operation(&mut peer, &request, "worker", &root.path().join("delivery"),
+            DeliveryMode::Execute).unwrap_err();
+        assert!(failure.transport_interrupted);
+        assert!(!failure.execution_may_have_run);
+        assert!(peer.authentication().is_none());
+        let sent = peer.inner.stream.written.split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice::<Value>(line).unwrap()).collect::<Vec<_>>();
+        assert_eq!(sent.last().unwrap()["kind"], "toolchain-begin");
+        assert!(!sent.iter().any(|frame| frame["kind"] == "canonical-exec"));
+    }
+
     #[test]
     fn large_native_records_use_bounded_chunk_reads_not_one_poll_per_byte() {
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
@@ -1871,7 +1987,9 @@ mod tests {
             (Vec::new(), io::ErrorKind::UnexpectedEof),
         ] {
             let mut peer = RecordPeer::new(&runtime, RecordWire::new(bytes, RECORD_READ_BYTES), &request());
-            assert_eq!(peer.receive().unwrap_err().kind(), expected);
+            let failure = peer.receive().unwrap_err();
+            assert_eq!(failure.kind(), expected);
+            assert_eq!(transport_interrupted(&failure), expected == io::ErrorKind::UnexpectedEof);
             assert!(peer.failed);
             let reads = peer.stream.reads;
             assert!(peer.receive().unwrap_err().to_string().contains("no retry"));

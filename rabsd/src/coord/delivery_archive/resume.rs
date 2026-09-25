@@ -110,6 +110,7 @@ pub fn finish_staged_restore(
             directory: destination.to_path_buf(),
             receipt: verified.receipt,
             acknowledgments_confirmed: false,
+            acknowledgment_interrupted: false,
             acknowledgment_error: Some(
                 "completed staged CAS restore; remote acknowledgments were not rechecked".to_owned(),
             ),

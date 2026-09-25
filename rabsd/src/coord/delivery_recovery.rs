@@ -537,6 +537,7 @@ pub fn recover_existing_delivery(
             directory: destination.to_path_buf(),
             receipt,
             acknowledgments_confirmed: false,
+            acknowledgment_interrupted: false,
             acknowledgment_error: Some(
                 "restored durable delivery; remote acknowledgments were not rechecked".to_owned(),
             ),
@@ -545,6 +546,7 @@ pub fn recover_existing_delivery(
     outcome.map_err(|error| DeliveryFailure {
         directory: destination.to_path_buf(),
         execution_may_have_run: true,
+        transport_interrupted: false,
         detail: format!("retained delivery cannot be replayed; do not reexecute: {error}"),
     })
 }

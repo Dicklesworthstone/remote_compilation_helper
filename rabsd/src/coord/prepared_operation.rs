@@ -2,8 +2,9 @@
 //!
 //! The saved request is an operation identity, never an ActionDescriptor or a
 //! cache key. An exclusive local owner records Running before invoking the real
-//! worker adapter. Lost owners become Uncertain, and only an explicit result
-//! resume can proceed thereafter. Source bytes are revalidated against the saved
+//! worker adapter. Proven transport loss can queue bounded result-only recovery;
+//! lost owners without that durable intent become Uncertain and require explicit
+//! recovery. Source bytes are revalidated against the saved
 //! manifest by the execution adapter; a mutable bundle cannot change the request.
 //! State and build directories are operator-owned, not hostile shared storage.
 
@@ -26,7 +27,7 @@ use std::io::{self, Read, Write};
 use std::net::SocketAddr;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const MAX_OPERATIONS: usize = 1024;
 const MAX_RETAINED_BYTES: usize = 64 * 1024 * 1024;
@@ -34,6 +35,11 @@ const RECORD_OVERHEAD: usize = 96 * 1024;
 const MAX_RECORD_BYTES: usize = MAX_FRAME_BYTES + RECORD_OVERHEAD;
 const MAX_DETAIL_BYTES: usize = 2048;
 const MAX_RUNNING: usize = 4;
+const MAX_AUTOMATIC_RECOVERIES: u8 = 3;
+
+fn recovery_delay(attempt: u8) -> Duration {
+    Duration::from_secs(1_u64 << u32::from(attempt.saturating_sub(1).min(2)))
+}
 
 /// All execution placement and destination choices remain bound to this ID.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -79,6 +85,14 @@ pub struct OperationStatus {
     pub request_id: u64,
     /// Durable claim number, zero until the first execution owner is admitted.
     pub attempt: u64,
+    /// Number of automatically scheduled result/ACK recovery attempts. These
+    /// never authorize another compiler execution.
+    pub automatic_recoveries: u8,
+    /// A durably queued recovery is waiting for its bounded reconnect backoff.
+    pub recovery_pending: bool,
+    /// The original claim followed by the current automatic recovery sequence.
+    /// Explicit manual recovery starts a new follow owner instead.
+    pub recovery_origin_attempt: Option<u64>,
     pub address: String,
     pub listen_address: Option<String>,
     pub worker: String,
@@ -116,6 +130,12 @@ pub enum OperationOutcome {
         detail: String,
         execution_may_have_run: bool,
     },
+    /// The native transport observed a socket interruption. Protocol, trust,
+    /// filesystem and cancellation errors cannot construct this via the adapter.
+    TransportInterrupted {
+        detail: String,
+        execution_may_have_run: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -127,6 +147,12 @@ struct Record {
     request_sha256: String,
     order: u64,
     attempt: u64,
+    #[serde(default)]
+    automatic_recoveries: u8,
+    #[serde(default)]
+    recovery_pending: bool,
+    #[serde(default)]
+    recovery_origin_attempt: Option<u64>,
     state: OperationState,
     mode: StoredMode,
     delivery: PathBuf,
@@ -153,6 +179,9 @@ impl Record {
                 .as_u64()
                 .expect("validated request"),
             attempt: self.attempt,
+            automatic_recoveries: self.automatic_recoveries,
+            recovery_pending: self.recovery_pending,
+            recovery_origin_attempt: self.recovery_origin_attempt,
             address: self.spec.address.clone(),
             listen_address: self.listen_address.clone(),
             worker: self.spec.worker.clone(),
@@ -215,11 +244,20 @@ impl Record {
 struct State {
     records: BTreeMap<String, Record>,
     active: BTreeMap<String, OperationCancellation>,
+    /// Runtime-only monotonic deadlines. Reopening a pending durable recovery
+    /// starts its full backoff again without relying on wall-clock continuity.
+    recovery_ready: BTreeMap<String, Instant>,
     retained_bytes: usize,
     next_order: u64,
     archive_revision: u64,
     accepting: bool,
     poisoned: bool,
+}
+
+#[derive(Debug)]
+enum AutomaticRecovery {
+    Resume(PathBuf),
+    Acknowledge,
 }
 
 #[derive(Debug)]
@@ -263,14 +301,19 @@ fn valid_id(id: &str) -> bool {
 fn overlap(left: &Path, right: &Path) -> bool {
     left.starts_with(right) || right.starts_with(left)
 }
-fn same_worker(left: &PreparedOperationSpec, right: &PreparedOperationSpec) -> bool {
-    left.worker == right.worker
-        || left.worker_spki_sha256 == right.worker_spki_sha256
-        || (left.address == right.address
-            && left
-                .address
-                .parse::<SocketAddr>()
-                .is_ok_and(|address| address.port() != 0))
+fn shares_worker_or_endpoint(left: &Record, right: &Record) -> bool {
+    let endpoint = |record: &Record| {
+        record
+            .bound_address
+            .as_deref()
+            .unwrap_or(&record.spec.address)
+            .parse::<SocketAddr>()
+            .ok()
+            .filter(|address| address.port() != 0)
+    };
+    left.spec.worker == right.spec.worker
+        || left.spec.worker_spki_sha256 == right.spec.worker_spki_sha256
+        || endpoint(left).is_some_and(|left| endpoint(right) == Some(left))
 }
 fn bounded_detail(value: &str) -> String {
     let mut end = value.len().min(MAX_DETAIL_BYTES);
@@ -465,6 +508,7 @@ impl PreparedOperationStore {
         let mut records = BTreeMap::new();
         let mut retained_bytes = 0usize;
         let mut next_order = 1u64;
+        let mut recovery_ready = BTreeMap::new();
         for entry in fs::read_dir(&root)? {
             let path = entry?.path();
             if path.extension().and_then(|s| s.to_str()) != Some("json") {
@@ -488,6 +532,12 @@ impl PreparedOperationStore {
                     .checked_add(1)
                     .ok_or_else(|| invalid("operation queue order exhausted"))?,
             );
+            if record.recovery_pending {
+                recovery_ready.insert(
+                    record.spec.id.clone(),
+                    Instant::now() + recovery_delay(record.automatic_recoveries),
+                );
+            }
             require(
                 records.insert(record.spec.id.clone(), record).is_none(),
                 "duplicate prepared operation id",
@@ -499,6 +549,7 @@ impl PreparedOperationStore {
             state: Mutex::new(State {
                 records,
                 active: BTreeMap::new(),
+                recovery_ready,
                 retained_bytes,
                 next_order,
                 archive_revision: 0,
@@ -544,6 +595,7 @@ impl PreparedOperationStore {
                 record.state = OperationState::Uncertain;
                 record.execution_may_have_run = true;
                 record.listen_address = None;
+                record.recovery_pending = false;
                 record.detail = Some(
                     "daemon owner stopped before a terminal result; explicit resume required"
                         .into(),
@@ -684,6 +736,9 @@ impl PreparedOperationStore {
             request_sha256: fingerprint,
             order: state.next_order,
             attempt: 0,
+            automatic_recoveries: 0,
+            recovery_pending: false,
+            recovery_origin_attempt: None,
             state: OperationState::Queued,
             mode: StoredMode::Execute,
             prior_deliveries: Vec::new(),
@@ -744,6 +799,7 @@ impl PreparedOperationStore {
         match record.state {
             OperationState::Queued => {
                 record.cancel_requested = true;
+                record.recovery_pending = false;
                 // Cancelling a recovery request says nothing about the old run.
                 record.state = if record.mode != StoredMode::Execute {
                     OperationState::Uncertain
@@ -764,6 +820,7 @@ impl PreparedOperationStore {
         }
         let status = record.status();
         self.replace(&mut state, record)?;
+        state.recovery_ready.remove(id);
         if let Some(cancellation) = state.active.get(id) {
             cancellation.cancel();
         }
@@ -836,6 +893,8 @@ impl PreparedOperationStore {
         record.mode = StoredMode::Resume;
         record.state = OperationState::Queued;
         record.cancel_requested = false;
+        record.recovery_pending = false;
+        record.recovery_origin_attempt = None;
         record.listen_address = None;
         record.detail = None;
         record.order = state.next_order;
@@ -845,6 +904,7 @@ impl PreparedOperationStore {
             .ok_or_else(|| invalid("operation queue exhausted"))?;
         let status = record.status();
         self.replace(&mut state, record)?;
+        state.recovery_ready.remove(id);
         Ok(status)
     }
 
@@ -881,6 +941,8 @@ impl PreparedOperationStore {
         record.state = OperationState::Queued;
         record.resume_from = None;
         record.cancel_requested = false;
+        record.recovery_pending = false;
+        record.recovery_origin_attempt = None;
         record.listen_address = None;
         record.detail = None;
         record.order = state.next_order;
@@ -890,10 +952,15 @@ impl PreparedOperationStore {
             .ok_or_else(|| invalid("operation queue exhausted"))?;
         let status = record.status();
         self.replace(&mut state, record)?;
+        state.recovery_ready.remove(id);
         Ok(status)
     }
 
     pub fn claim_next(self: &Arc<Self>) -> io::Result<Option<OperationClaim>> {
+        self.claim_next_at(Instant::now())
+    }
+
+    fn claim_next_at(self: &Arc<Self>, now: Instant) -> io::Result<Option<OperationClaim>> {
         let mut state = self.lock_state()?;
         if !state.accepting || state.active.len() >= MAX_RUNNING {
             return Ok(None);
@@ -905,13 +972,20 @@ impl PreparedOperationStore {
                 record.state == OperationState::Queued && record.mode != StoredMode::LocalRecovery
             })
             .filter(|record| {
+                !record.recovery_pending
+                    || state
+                        .recovery_ready
+                        .get(&record.spec.id)
+                        .is_some_and(|ready| *ready <= now)
+            })
+            .filter(|record| {
                 state.records.values().all(|other| {
                     if other.spec.id == record.spec.id {
                         return true;
                     }
                     let owns_worker =
                         state.active.contains_key(&other.spec.id) || other.unresolved();
-                    (!owns_worker || !same_worker(&record.spec, &other.spec))
+                    (!owns_worker || !shares_worker_or_endpoint(record, other))
                         && (!state.active.contains_key(&other.spec.id)
                             || !record
                                 .paths()
@@ -925,6 +999,7 @@ impl PreparedOperationStore {
             return Ok(None);
         };
         record.state = OperationState::Running;
+        record.recovery_pending = false;
         record.attempt = record
             .attempt
             .checked_add(1)
@@ -940,6 +1015,7 @@ impl PreparedOperationStore {
             spec.address = address.clone();
         }
         self.replace(&mut state, record.clone())?;
+        state.recovery_ready.remove(&spec.id);
         state.active.insert(spec.id.clone(), cancellation.clone());
         let preview = if record.mode == StoredMode::Execute {
             self.previews
@@ -1069,11 +1145,129 @@ impl OperationClaim {
         Ok(record)
     }
 
+    fn automatic_recovery(
+        &self,
+        outcome: &OperationOutcome,
+    ) -> io::Result<Option<AutomaticRecovery>> {
+        let acknowledge = match outcome {
+            OperationOutcome::TransportInterrupted {
+                execution_may_have_run: true,
+                ..
+            } => self.mode == StoredMode::Acknowledge,
+            OperationOutcome::Completed { result } | OperationOutcome::Cancelled { result }
+                if result["delivery"]["acknowledgments_confirmed"] == false
+                    && result["delivery"]["acknowledgment_interrupted"] == true =>
+            {
+                true
+            }
+            _ => return Ok(None),
+        };
+        let state = self.store.lock_state()?;
+        let record = self.current(&state)?;
+        if !state.accepting
+            || record.cancel_requested
+            || self.cancellation.is_cancelled()
+            || self.mode == StoredMode::LocalRecovery
+            || record.automatic_recoveries >= MAX_AUTOMATIC_RECOVERIES
+            || record.bound_address.is_none()
+        {
+            return Ok(None);
+        }
+        if acknowledge {
+            return Ok(Some(AutomaticRecovery::Acknowledge));
+        }
+        if record.prior_deliveries.len() >= 16 {
+            return Ok(None);
+        }
+        let parent = record
+            .spec
+            .delivery
+            .parent()
+            .ok_or_else(|| invalid("operation delivery parent disappeared"))?;
+        Ok(Some(AutomaticRecovery::Resume(parent.join(format!(
+            "rabs-recovery-{}-{}",
+            record.spec.id,
+            record.automatic_recoveries + 1,
+        )))))
+    }
+
+    fn schedule_recovery(
+        &self,
+        state: &mut State,
+        record: &mut Record,
+        recovery: AutomaticRecovery,
+    ) -> io::Result<()> {
+        let next_order = state
+            .next_order
+            .checked_add(1)
+            .ok_or_else(|| invalid("operation recovery queue exhausted"))?;
+        match recovery {
+            AutomaticRecovery::Resume(destination) => {
+                // The archive was checked outside the state mutex. This final
+                // live-set check and persistence share its stable revision lock,
+                // exactly as ordinary resume admission does.
+                require(
+                    !overlap(&destination, &self.store.root)
+                        && state.records.values().all(|other| {
+                            other
+                                .paths()
+                                .iter()
+                                .all(|path| !overlap(&destination, path))
+                        }),
+                    "automatic recovery destination overlaps retained operation",
+                )?;
+                require(
+                    record.prior_deliveries.len() < 16,
+                    "operation resume directory limit exhausted",
+                )?;
+                record.prior_deliveries.push(record.delivery.clone());
+                record.delivery = destination;
+                record.mode = StoredMode::Resume;
+            }
+            AutomaticRecovery::Acknowledge => record.mode = StoredMode::Acknowledge,
+        }
+        record.resume_from = None;
+        record.state = OperationState::Queued;
+        record.recovery_pending = true;
+        record.recovery_origin_attempt.get_or_insert(record.attempt);
+        record.automatic_recoveries += 1;
+        record.order = state.next_order;
+        state.next_order = next_order;
+        Ok(())
+    }
+
     pub fn finish(mut self, outcome: OperationOutcome) -> io::Result<OperationStatus> {
         if let Some(preview) = &self.preview {
             preview.close();
         }
-        let mut state = self.store.lock_state()?;
+        let (mut state, recovery, mut scheduling_error) = match self.automatic_recovery(&outcome)? {
+            Some(AutomaticRecovery::Resume(destination)) => {
+                // An optional retry must not turn a path collision into a fatal
+                // daemon error, nor scan growing history under cancellation's
+                // state mutex. A failed preflight leaves the result Uncertain.
+                let prepare = || {
+                    ordinary_directory(&destination, true)?;
+                    require(
+                        !destination.exists(),
+                        "automatic recovery destination already exists",
+                    )?;
+                    self.store.lock_after_archived_check(|other| {
+                        require(
+                            other
+                                .paths()
+                                .iter()
+                                .all(|path| !overlap(&destination, path)),
+                            "automatic recovery destination overlaps archived operation",
+                        )
+                    })
+                };
+                match prepare() {
+                    Ok(state) => (state, Some(AutomaticRecovery::Resume(destination)), None),
+                    Err(error) => (self.store.lock_state()?, None, Some(error.to_string())),
+                }
+            }
+            recovery => (self.store.lock_state()?, recovery, None),
+        };
         let mut record = self.current(&state)?;
         record.listen_address = None;
         match outcome {
@@ -1160,11 +1354,29 @@ impl OperationClaim {
             OperationOutcome::Failed {
                 detail,
                 execution_may_have_run,
+            }
+            | OperationOutcome::TransportInterrupted {
+                detail,
+                execution_may_have_run,
             } => {
                 // A failed resume never disproves an earlier uncertain run.
                 record.execution_may_have_run =
                     execution_may_have_run || self.mode != StoredMode::Execute;
-                record.state = if record.execution_may_have_run {
+                record.state = if self.mode == StoredMode::Acknowledge
+                    && record.exit_code.is_some()
+                    && record.acknowledgments_confirmed.is_some()
+                {
+                    // A failed release exchange cannot erase the already
+                    // verified compiler outcome or installed local bytes. Keep
+                    // the worker reserved through unresolved() while callers
+                    // can still consume that proven completion.
+                    record.acknowledgments_confirmed = Some(false);
+                    if record.stop_reason.as_deref() == Some("cancelled") {
+                        OperationState::Cancelled
+                    } else {
+                        OperationState::Completed
+                    }
+                } else if record.execution_may_have_run {
                     OperationState::Uncertain
                 } else if record.cancel_requested {
                     record.exit_code = Some(130);
@@ -1176,8 +1388,33 @@ impl OperationClaim {
                 record.detail = Some(bounded_detail(&detail));
             }
         }
+        if let Some(recovery) = recovery
+            && state.accepting
+            && !record.cancel_requested
+            && !self.cancellation.is_cancelled()
+            && record.unresolved()
+        {
+            if let Err(error) = self.schedule_recovery(&mut state, &mut record, recovery) {
+                scheduling_error = Some(error.to_string());
+            }
+        }
+        if let Some(error) = scheduling_error {
+            record.detail = Some(bounded_detail(&format!(
+                "{}; automatic result recovery unavailable: {error}",
+                record
+                    .detail
+                    .as_deref()
+                    .unwrap_or("worker delivery interrupted"),
+            )));
+        }
         let status = record.status();
+        let recovery_ready = record
+            .recovery_pending
+            .then(|| Instant::now() + recovery_delay(record.automatic_recoveries));
         self.store.replace(&mut state, record)?;
+        if let Some(ready) = recovery_ready {
+            state.recovery_ready.insert(self.spec.id.clone(), ready);
+        }
         state.active.remove(&self.spec.id);
         self.finished = true;
         self.store.changed.notify_all();

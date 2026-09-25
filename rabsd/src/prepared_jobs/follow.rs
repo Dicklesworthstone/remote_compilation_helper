@@ -167,6 +167,39 @@ fn selected_status(reply: &Value, id: &str) -> io::Result<(String, u64)> {
     Ok((digest, attempt))
 }
 
+fn followed_owner(status: &Value, attempt: u64) -> io::Result<u64> {
+    let recoveries = match status.get("automatic_recoveries") {
+        None => 0,
+        Some(value) => value
+            .as_u64()
+            .ok_or_else(|| invalid("invalid recovery count"))?,
+    };
+    let pending = match status.get("recovery_pending") {
+        None => false,
+        Some(value) => value
+            .as_bool()
+            .ok_or_else(|| invalid("invalid recovery readiness"))?,
+    };
+    if pending && (status["state"] != "queued" || recoveries == 0) {
+        return Err(invalid("invalid queued recovery identity"));
+    }
+    match status.get("recovery_origin_attempt") {
+        None | Some(Value::Null) if !pending => Ok(attempt),
+        Some(value) => value
+            .as_u64()
+            .filter(|origin| {
+                *origin > 0
+                    && *origin <= attempt
+                    && recoveries > 0
+                    && matches!(status["mode"].as_str(), Some("resume" | "acknowledge"))
+            })
+            .ok_or_else(|| invalid("invalid automatic recovery origin")),
+        None => Err(invalid(
+            "queued recovery lacks its original execution identity",
+        )),
+    }
+}
+
 fn follow(
     id: &str,
     until: Instant,
@@ -175,7 +208,7 @@ fn follow(
     mut emit: impl FnMut(&Value) -> io::Result<()>,
 ) -> io::Result<Completion> {
     let mut identity: Option<String> = None;
-    let mut attempt = None;
+    let mut owner = None;
     let mut cursor = Cursor::default();
     let mut previous_preview = None;
     loop {
@@ -186,28 +219,31 @@ fn follow(
         )?;
         remaining(until)?;
         let (digest, current_attempt) = selected_status(&reply, id)?;
+        let status = &reply["operation"];
+        let current_owner = followed_owner(status, current_attempt)?;
         if identity
             .as_ref()
             .is_some_and(|expected| expected != &digest)
         {
             return Err(invalid("job request identity changed while following"));
         }
-        if attempt.is_some_and(|previous| {
-            previous != current_attempt && !(previous == 0 && current_attempt == 1)
+        if owner.is_some_and(|previous| {
+            previous != current_owner && !(previous == 0 && current_owner == 1)
         }) {
             return Err(invalid(
                 "job attempt changed; start a separate explicit follow",
             ));
         }
         identity = Some(digest.clone());
-        attempt = Some(current_attempt);
-        let status = &reply["operation"];
+        owner = Some(current_owner);
         match status["state"].as_str() {
             Some("queued" | "running" | "cancelling") => {
                 if current_attempt == 0 && status["state"] != "queued" {
                     return Err(invalid("active job lacks a claimed attempt"));
                 }
-                if current_attempt != 0 {
+                if current_attempt != 0
+                    && !matches!(status["mode"].as_str(), Some("resume" | "acknowledge"))
+                {
                     let preview = exchange(
                         &cursor.request(id, &digest, current_attempt),
                         until.min(Instant::now() + CLIENT_BUDGET),
@@ -550,6 +586,134 @@ mod tests {
             query["kind"].as_str(),
             Some("prepared-status" | "prepared-preview")
         )));
+    }
+
+    #[test]
+    fn automatic_result_recovery_preserves_the_followed_execution_without_replaying_preview() {
+        let recovery = |state, attempt, count, pending| {
+            let mut value = status(state, attempt);
+            value["operation"]["mode"] = json!("resume");
+            value["operation"]["automatic_recoveries"] = json!(count);
+            value["operation"]["recovery_pending"] = json!(pending);
+            value["operation"]["recovery_origin_attempt"] = json!(1);
+            value
+        };
+        let mut replies = std::collections::VecDeque::from([
+            status("running", 1),
+            preview(json!([segment("stdout", 0, "00ff", 0, 2)])),
+            recovery("queued", 1, 1, true),
+            recovery("running", 2, 1, false),
+            recovery("queued", 2, 2, true),
+            recovery("running", 3, 2, false),
+            recovery("uncertain", 3, 2, false),
+        ]);
+        let mut queries = Vec::new();
+        let mut events = Vec::new();
+        let error = follow(
+            ID,
+            Instant::now() + Duration::from_secs(2),
+            |query, _| {
+                queries.push(query.clone());
+                Ok(replies.pop_front().unwrap())
+            },
+            |_| {},
+            |event| {
+                events.push(event.clone());
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("outcome is uncertain"),
+            "{error}"
+        );
+        assert!(
+            replies.is_empty(),
+            "following stopped before recovery resolved"
+        );
+        assert_eq!(
+            events.len(),
+            1,
+            "recovery must not replay already exposed diagnostics"
+        );
+        assert_eq!(
+            queries
+                .iter()
+                .filter(|query| query["kind"] == "prepared-preview")
+                .count(),
+            1
+        );
+        assert!(queries.iter().all(|query| matches!(
+            query["kind"].as_str(),
+            Some("prepared-status" | "prepared-preview")
+        )));
+    }
+
+    #[test]
+    fn follow_recovery_identity_checks_distinguish_pending_claims_and_manual_recovery() {
+        let mut reply = status("queued", 1);
+        let status = &mut reply["operation"];
+        status["mode"] = json!("acknowledge");
+        status["automatic_recoveries"] = json!(1);
+        status["recovery_pending"] = json!(true);
+        status["recovery_origin_attempt"] = json!(1);
+        assert_eq!(followed_owner(status, 1).unwrap(), 1);
+        status["state"] = json!("running");
+        status["recovery_pending"] = json!(false);
+        assert_eq!(followed_owner(status, 2).unwrap(), 1);
+        status["recovery_origin_attempt"] = Value::Null;
+        assert_eq!(
+            followed_owner(status, 3).unwrap(),
+            3,
+            "manual claim is a different follow owner"
+        );
+        status["recovery_origin_attempt"] = json!(3);
+        assert!(followed_owner(status, 2).is_err());
+        status["recovery_origin_attempt"] = json!(1);
+        status["automatic_recoveries"] = json!(0);
+        assert!(followed_owner(status, 2).is_err());
+        status["automatic_recoveries"] = json!(1);
+        status["recovery_pending"] = json!(true);
+        assert!(
+            followed_owner(status, 2).is_err(),
+            "running cannot remain pending"
+        );
+        status["state"] = json!("queued");
+        status["mode"] = json!("execute");
+        assert!(
+            followed_owner(status, 2).is_err(),
+            "recovery never becomes execution"
+        );
+    }
+
+    #[test]
+    fn cancelling_an_unclaimed_automatic_retry_does_not_invent_another_execution() {
+        let mut pending = status("queued", 1);
+        pending["operation"]["mode"] = json!("resume");
+        pending["operation"]["automatic_recoveries"] = json!(1);
+        pending["operation"]["recovery_pending"] = json!(true);
+        pending["operation"]["recovery_origin_attempt"] = json!(1);
+        let mut cancelled = pending.clone();
+        cancelled["operation"]["state"] = json!("uncertain");
+        cancelled["operation"]["cancel_requested"] = json!(true);
+        cancelled["operation"]["recovery_pending"] = json!(false);
+        let mut replies = std::collections::VecDeque::from([pending, cancelled]);
+        let error = follow(
+            ID,
+            Instant::now() + Duration::from_secs(2),
+            |query, _| {
+                assert_eq!(query["kind"], "prepared-status");
+                Ok(replies.pop_front().unwrap())
+            },
+            |_| {},
+            |_| panic!("result recovery has no live compiler preview"),
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("outcome is uncertain"),
+            "{error}"
+        );
+        assert!(replies.is_empty());
     }
 
     #[test]

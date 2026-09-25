@@ -84,6 +84,7 @@ impl PreparedOperationStore {
             .ok_or_else(|| invalid("operation attempts exhausted"))?;
         record.state = OperationState::Running;
         record.mode = StoredMode::LocalRecovery;
+        record.recovery_origin_attempt = None;
         record.resume_from = None;
         record.listen_address = None;
         record.cancel_requested = false;

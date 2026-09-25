@@ -101,6 +101,9 @@ pub struct Delivery {
     pub receipt: Value,
     pub acknowledgments_confirmed: bool,
     pub acknowledgment_error: Option<String>,
+    /// The failed ACK exchange ended at a known transport I/O boundary. Local
+    /// verification, protocol refusals and cancellation never set this hint.
+    pub acknowledgment_interrupted: bool,
 }
 
 impl Delivery {
@@ -108,7 +111,8 @@ impl Delivery {
     pub fn to_json(&self) -> Value {
         json!({"kind":"worker-delivery", "directory":self.directory,
             "receipt":self.receipt, "acknowledgments_confirmed":self.acknowledgments_confirmed,
-            "acknowledgment_error":self.acknowledgment_error, "reexecute":false})
+            "acknowledgment_error":self.acknowledgment_error,
+            "acknowledgment_interrupted":self.acknowledgment_interrupted, "reexecute":false})
     }
 }
 
@@ -117,7 +121,49 @@ impl Delivery {
 pub struct DeliveryFailure {
     pub directory: PathBuf,
     pub execution_may_have_run: bool,
+    /// A transient socket I/O failure, not an inference from diagnostic text or
+    /// from the error kind of a mixed filesystem/protocol operation.
+    pub transport_interrupted: bool,
     pub detail: String,
+}
+
+#[derive(Debug)]
+struct InterruptedTransport(io::Error);
+
+impl std::fmt::Display for InterruptedTransport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl std::error::Error for InterruptedTransport {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
+/// Preserve provenance immediately around a worker socket read/write or its
+/// deadline. Do not call this on combined protocol, filesystem or cancellation
+/// results: equal `ErrorKind`s from those operations are not network evidence.
+pub fn worker_transport_error(error: io::Error) -> io::Error {
+    if transport_interrupted(&error) {
+        return error;
+    }
+    if matches!(error.kind(),
+        io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::BrokenPipe | io::ErrorKind::UnexpectedEof
+            | io::ErrorKind::TimedOut | io::ErrorKind::WriteZero)
+    {
+        io::Error::new(error.kind(), InterruptedTransport(error))
+    } else {
+        error
+    }
+}
+
+/// Inspect the typed evidence attached by the actual transport adapter.
+#[must_use]
+pub fn transport_interrupted(error: &io::Error) -> bool {
+    error.get_ref().is_some_and(|source| source.is::<InterruptedTransport>())
 }
 
 impl std::fmt::Display for DeliveryFailure {
@@ -1059,12 +1105,14 @@ pub fn receive_operation(
             directory: destination.to_path_buf(),
             receipt,
             acknowledgments_confirmed: acknowledgments.is_ok(),
+            acknowledgment_interrupted: acknowledgments.as_ref().is_err_and(transport_interrupted),
             acknowledgment_error: acknowledgments.err().map(|e| e.to_string()),
         })
     })();
     outcome.map_err(|error| DeliveryFailure {
         directory: destination.to_path_buf(),
         execution_may_have_run,
+        transport_interrupted: transport_interrupted(&error),
         detail: error.to_string(),
     })
 }
@@ -1155,6 +1203,37 @@ mod tests {
             .sent
             .iter()
             .any(|v| matches!(v["kind"].as_str(), Some("output-ack" | "artifact-ack")))
+    }
+
+    #[test]
+    fn recovery_hint_requires_transport_provenance_not_error_kind_or_text() {
+        use std::io::Read;
+
+        let parent = tempfile::tempdir().unwrap();
+        let truncated = parent.path().join("truncated-local-output");
+        std::fs::write(&truncated, b"a").unwrap();
+        let disk_error = File::open(truncated).unwrap().read_exact(&mut [0; 2]).unwrap_err();
+        assert_eq!(disk_error.kind(), io::ErrorKind::UnexpectedEof);
+        assert!(!transport_interrupted(&disk_error));
+
+        for kind in [io::ErrorKind::BrokenPipe, io::ErrorKind::ConnectionReset,
+            io::ErrorKind::ConnectionAborted, io::ErrorKind::UnexpectedEof,
+            io::ErrorKind::TimedOut, io::ErrorKind::WriteZero]
+        {
+            let diagnostic = "worker connection interrupted";
+            assert!(!transport_interrupted(&io::Error::new(kind, diagnostic)));
+            let marked = worker_transport_error(io::Error::new(kind, diagnostic));
+            assert!(transport_interrupted(&marked));
+            assert_eq!(marked.kind(), kind);
+            assert_eq!(marked.to_string(), diagnostic);
+            assert!(transport_interrupted(&worker_transport_error(marked)));
+        }
+        for kind in [io::ErrorKind::InvalidData, io::ErrorKind::PermissionDenied,
+            io::ErrorKind::Interrupted, io::ErrorKind::Other]
+        {
+            assert!(!transport_interrupted(&worker_transport_error(io::Error::new(kind,
+                "BrokenPipe: worker read deadline; ConnectionReset"))));
+        }
     }
 
     #[test]

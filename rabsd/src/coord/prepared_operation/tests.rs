@@ -144,6 +144,520 @@ fn adapter_result(claim: &OperationClaim, exit_code: i32, stop: Value, ack: bool
     result
 }
 
+fn network_interruption(claim: OperationClaim) -> OperationStatus {
+    claim
+        .finish(OperationOutcome::TransportInterrupted {
+            detail: "native worker connection reset while receiving the retained result".into(),
+            execution_may_have_run: true,
+        })
+        .unwrap()
+}
+
+#[test]
+fn automatic_result_recovery_reserves_the_worker_and_never_redispatches_execution() {
+    let fixture = Fixture::new();
+    let mut spec = fixture.spec(301, 21);
+    spec.address = "127.0.0.1:0".into();
+    let store = fixture.open();
+    store.submit(spec.clone()).unwrap();
+    let first = store.claim_next().unwrap().unwrap();
+    let original = first.request().clone();
+    let bound: SocketAddr = "127.0.0.1:40321".parse().unwrap();
+    first.listening(bound).unwrap();
+    let before_recovery = Instant::now();
+    let queued = network_interruption(first);
+    assert_eq!(queued.state, OperationState::Queued);
+    assert_eq!(queued.automatic_recoveries, 1);
+    assert!(queued.recovery_pending);
+    assert_eq!(queued.recovery_origin_attempt, Some(1));
+    assert_eq!(queued.mode, "resume");
+    assert!(queued.execution_may_have_run);
+    assert_ne!(queued.delivery, spec.delivery);
+    assert_eq!(queued.delivery.parent(), spec.delivery.parent());
+    assert!(!queued.delivery.exists());
+    assert!(
+        store.claim_next_at(before_recovery).unwrap().is_none(),
+        "backoff must delay recovery"
+    );
+
+    let waiting = fixture.spec(302, 21);
+    let independent = fixture.spec(303, 22);
+    store.submit(waiting.clone()).unwrap();
+    store.submit(independent.clone()).unwrap();
+    let unrelated = store.claim_next_at(before_recovery).unwrap().unwrap();
+    assert_eq!(unrelated.spec().id, independent.id);
+    fail_before_dispatch(unrelated);
+    assert!(
+        store.claim_next_at(before_recovery).unwrap().is_none(),
+        "new work must not overtake the lost run"
+    );
+
+    let resumed = store
+        .claim_next_at(Instant::now() + Duration::from_secs(10))
+        .unwrap()
+        .unwrap();
+    assert_eq!(resumed.spec().id, spec.id);
+    assert_eq!(resumed.spec().address, bound.to_string());
+    assert_eq!(resumed.spec().worker_spki_sha256, spec.worker_spki_sha256);
+    assert_eq!(resumed.request(), &original);
+    assert_eq!(resumed.mode(), DeliveryMode::Resume);
+    assert!(!resumed.acknowledgment_only());
+    let frame = resumed.mode().frame(resumed.request());
+    assert_eq!(
+        frame,
+        json!({"kind":"result-resume", "request_id":original["request_id"], "request":original})
+    );
+    assert!(
+        resumed.resume_from().is_none(),
+        "unverified partial directories are not silently trusted"
+    );
+    assert!(resumed.preview_observer().is_none());
+    assert!(!store.status(&spec.id).unwrap().unwrap().recovery_pending);
+    let result = adapter_result(&resumed, 0, Value::Null, true);
+    let completed = resumed
+        .finish(OperationOutcome::Completed { result })
+        .unwrap();
+    assert!(completed.succeeded);
+    assert_eq!(completed.automatic_recoveries, 1);
+    let next = store.claim_next().unwrap().unwrap();
+    assert_eq!(
+        next.spec().id,
+        waiting.id,
+        "confirmed recovery must release the worker reservation"
+    );
+    fail_before_dispatch(next);
+}
+
+#[test]
+fn automatic_recovery_budget_is_durable_and_exhaustion_requires_explicit_recovery() {
+    let fixture = Fixture::new();
+    let spec = fixture.spec(304, 23);
+    let mut store = fixture.open();
+    store.submit(spec.clone()).unwrap();
+    let mut claim = store.claim_next().unwrap().unwrap();
+    claim.listening(spec.address.parse().unwrap()).unwrap();
+    for expected in 1..=MAX_AUTOMATIC_RECOVERIES {
+        let queued = network_interruption(claim);
+        assert_eq!(queued.automatic_recoveries, expected);
+        assert!(queued.recovery_pending);
+        drop(store);
+        let before_reopen = Instant::now();
+        store = fixture.open();
+        let saved = store.status(&spec.id).unwrap().unwrap();
+        assert_eq!(saved.automatic_recoveries, expected);
+        assert!(saved.recovery_pending);
+        assert_eq!(saved.recovery_origin_attempt, Some(1));
+        assert!(
+            store.claim_next_at(before_reopen).unwrap().is_none(),
+            "reopen must retain backoff"
+        );
+        claim = store
+            .claim_next_at(Instant::now() + Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+        assert_eq!(claim.mode(), DeliveryMode::Resume);
+        claim.listening(spec.address.parse().unwrap()).unwrap();
+    }
+    let stopped = network_interruption(claim);
+    assert_eq!(stopped.state, OperationState::Uncertain);
+    assert_eq!(stopped.automatic_recoveries, MAX_AUTOMATIC_RECOVERIES);
+    assert!(!stopped.recovery_pending);
+    assert!(
+        store
+            .claim_next_at(Instant::now() + Duration::from_secs(100))
+            .unwrap()
+            .is_none()
+    );
+    drop(store);
+    let store = fixture.open();
+    assert!(store.claim_next().unwrap().is_none());
+    let manual = store
+        .resume(
+            &spec.id,
+            fixture.root.join("manual-recovery-after-budget"),
+            None,
+        )
+        .unwrap();
+    assert!(!manual.recovery_pending);
+    assert_eq!(manual.recovery_origin_attempt, None);
+    assert_eq!(manual.automatic_recoveries, MAX_AUTOMATIC_RECOVERIES);
+    let claim = store.claim_next().unwrap().unwrap();
+    assert_eq!(claim.mode(), DeliveryMode::Resume);
+    let stopped = network_interruption(claim);
+    assert_eq!(
+        stopped.state,
+        OperationState::Uncertain,
+        "manual retries must not reset automatic budget"
+    );
+}
+
+#[test]
+fn automatic_recovery_keeps_its_bound_ephemeral_endpoint_reserved() {
+    let fixture = Fixture::new();
+    let mut first = fixture.spec(321, 34);
+    first.address = "127.0.0.1:0".into();
+    let store = fixture.open();
+    store.submit(first.clone()).unwrap();
+    let claim = store.claim_next().unwrap().unwrap();
+    let listener = std::net::TcpListener::bind(&claim.spec().address).unwrap();
+    let bound = listener.local_addr().unwrap();
+    claim.listening(bound).unwrap();
+    drop(listener);
+    let before_recovery = Instant::now();
+    network_interruption(claim);
+    let mut competing = fixture.spec(322, 35);
+    competing.address = bound.to_string();
+    store.submit(competing.clone()).unwrap();
+    assert!(
+        store.claim_next_at(before_recovery).unwrap().is_none(),
+        "another worker must not take the pending recovery's original endpoint"
+    );
+    let claim = store
+        .claim_next_at(Instant::now() + Duration::from_secs(10))
+        .unwrap()
+        .unwrap();
+    assert_eq!(claim.spec().id, first.id);
+    let rebound = std::net::TcpListener::bind(&claim.spec().address).unwrap();
+    assert_eq!(rebound.local_addr().unwrap(), bound);
+    drop(rebound);
+    let result = adapter_result(&claim, 0, Value::Null, true);
+    claim
+        .finish(OperationOutcome::Completed { result })
+        .unwrap();
+    let next = store.claim_next().unwrap().unwrap();
+    assert_eq!(next.spec().id, competing.id);
+    fail_before_dispatch(next);
+}
+
+#[test]
+fn lost_acknowledgments_retry_only_acceptance_of_the_existing_installed_delivery() {
+    let fixture = Fixture::new();
+    let spec = fixture.spec(305, 24);
+    let store = fixture.open();
+    store.submit(spec.clone()).unwrap();
+    let claim = store.claim_next().unwrap().unwrap();
+    claim.listening(spec.address.parse().unwrap()).unwrap();
+    let mut result = adapter_result(&claim, 0, Value::Null, false);
+    result["delivery"]["acknowledgment_interrupted"] = json!(true);
+    let queued = claim
+        .finish(OperationOutcome::Completed { result })
+        .unwrap();
+    assert_eq!(queued.state, OperationState::Queued);
+    assert_eq!(queued.mode, "acknowledge");
+    assert_eq!(queued.delivery, spec.delivery);
+    assert!(queued.outputs_installed);
+    assert_eq!(queued.exit_code, Some(0));
+    assert_eq!(queued.automatic_recoveries, 1);
+    let claim = store
+        .claim_next_at(Instant::now() + Duration::from_secs(10))
+        .unwrap()
+        .unwrap();
+    assert!(claim.acknowledgment_only());
+    assert_eq!(claim.spec().delivery, spec.delivery);
+    let queued = network_interruption(claim);
+    assert_eq!(
+        queued.mode, "acknowledge",
+        "an ACK interruption must never switch to download"
+    );
+    assert_eq!(queued.delivery, spec.delivery);
+    assert_eq!(queued.automatic_recoveries, 2);
+    let claim = store
+        .claim_next_at(Instant::now() + Duration::from_secs(10))
+        .unwrap()
+        .unwrap();
+    assert!(claim.acknowledgment_only());
+    let result = adapter_result(&claim, 0, Value::Null, true);
+    let completed = claim
+        .finish(OperationOutcome::Completed { result })
+        .unwrap();
+    assert!(completed.succeeded);
+    assert_eq!(completed.acknowledgments_confirmed, Some(true));
+    assert_eq!(completed.automatic_recoveries, 2);
+    assert!(
+        store.lock_state().unwrap().records[&spec.id]
+            .prior_deliveries
+            .is_empty()
+    );
+}
+
+#[test]
+fn exhausted_or_cancelled_automatic_ack_recovery_preserves_the_verified_build_outcome() {
+    for cancel in [false, true] {
+        let fixture = Fixture::new();
+        let spec = fixture.spec(319, 33);
+        let store = fixture.open();
+        store.submit(spec.clone()).unwrap();
+        let claim = store.claim_next().unwrap().unwrap();
+        claim.listening(spec.address.parse().unwrap()).unwrap();
+        let mut result = adapter_result(&claim, 0, Value::Null, false);
+        result["delivery"]["acknowledgment_interrupted"] = json!(true);
+        let mut status = claim
+            .finish(OperationOutcome::Completed { result })
+            .unwrap();
+        while status.recovery_pending {
+            let claim = store
+                .claim_next_at(Instant::now() + Duration::from_secs(10))
+                .unwrap()
+                .unwrap();
+            assert!(claim.acknowledgment_only());
+            if cancel {
+                store.cancel(&spec.id).unwrap();
+            }
+            status = network_interruption(claim);
+        }
+        assert_eq!(status.state, OperationState::Completed);
+        assert!(
+            status.succeeded,
+            "release failure must not erase verified compiler success"
+        );
+        assert!(status.outputs_installed);
+        assert_eq!(status.acknowledgments_confirmed, Some(false));
+        assert_eq!(
+            status.automatic_recoveries,
+            if cancel { 1 } else { MAX_AUTOMATIC_RECOVERIES }
+        );
+        assert_eq!(status.cancel_requested, cancel);
+        assert!(store.lock_state().unwrap().records[&spec.id].unresolved());
+        let waiting = fixture.spec(320, 33);
+        store.submit(waiting).unwrap();
+        assert!(
+            store
+                .claim_next_at(Instant::now() + Duration::from_secs(100))
+                .unwrap()
+                .is_none(),
+            "the retained remote result still reserves the worker"
+        );
+        drop(store);
+        let store = fixture.open();
+        assert!(store.status(&spec.id).unwrap().unwrap().succeeded);
+    }
+}
+
+#[test]
+fn unclassified_errors_pre_dispatch_loss_and_missing_endpoint_never_retry() {
+    for case in 0..4 {
+        let fixture = Fixture::new();
+        let spec = fixture.spec(306 + case, 25);
+        let store = fixture.open();
+        store.submit(spec.clone()).unwrap();
+        let claim = store.claim_next().unwrap().unwrap();
+        if case != 2 {
+            claim.listening(spec.address.parse().unwrap()).unwrap();
+        }
+        let outcome = match case {
+            0 => OperationOutcome::Failed {
+                detail: "protocol/authentication/corruption/disk failure".into(),
+                execution_may_have_run: true,
+            },
+            1 => OperationOutcome::TransportInterrupted {
+                detail: "source upload connection lost before execution".into(),
+                execution_may_have_run: false,
+            },
+            2 => OperationOutcome::TransportInterrupted {
+                detail: "no durably bound listener".into(),
+                execution_may_have_run: true,
+            },
+            _ => OperationOutcome::Completed {
+                result: adapter_result(&claim, 0, Value::Null, false),
+            },
+        };
+        let status = claim.finish(outcome).unwrap();
+        assert_eq!(status.automatic_recoveries, 0, "case {case}");
+        assert!(!status.recovery_pending, "case {case}");
+        assert!(
+            store
+                .claim_next_at(Instant::now() + Duration::from_secs(100))
+                .unwrap()
+                .is_none()
+        );
+        if case == 1 {
+            assert_eq!(status.state, OperationState::FailedBeforeStart);
+        }
+    }
+}
+
+#[test]
+fn cancellation_and_shutdown_suppress_automatic_recovery_without_forgetting_uncertainty() {
+    for stop in [false, true] {
+        let fixture = Fixture::new();
+        let spec = fixture.spec(310, 26);
+        let store = fixture.open();
+        store.submit(spec.clone()).unwrap();
+        let claim = store.claim_next().unwrap().unwrap();
+        claim.listening(spec.address.parse().unwrap()).unwrap();
+        if stop {
+            store.stop().unwrap();
+        } else {
+            store.cancel(&spec.id).unwrap();
+        }
+        let status = network_interruption(claim);
+        assert_eq!(status.state, OperationState::Uncertain);
+        assert_eq!(status.automatic_recoveries, 0);
+        assert!(!status.recovery_pending);
+        assert!(store.claim_next().unwrap().is_none());
+    }
+    let fixture = Fixture::new();
+    let spec = fixture.spec(311, 27);
+    let store = fixture.open();
+    store.submit(spec.clone()).unwrap();
+    let claim = store.claim_next().unwrap().unwrap();
+    claim.listening(spec.address.parse().unwrap()).unwrap();
+    network_interruption(claim);
+    let cancelled = store.cancel(&spec.id).unwrap();
+    assert!(cancelled.cancel_requested);
+    assert_eq!(cancelled.state, OperationState::Uncertain);
+    assert!(!cancelled.recovery_pending);
+    assert_eq!(cancelled.recovery_origin_attempt, Some(1));
+    assert!(store.lock_state().unwrap().recovery_ready.is_empty());
+    drop(store);
+    let store = fixture.open();
+    assert!(
+        store
+            .claim_next_at(Instant::now() + Duration::from_secs(100))
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn recovery_directory_conflicts_and_links_leave_the_existing_paths_untouched() {
+    for case in 0..3 {
+        let fixture = Fixture::new();
+        let spec = fixture.spec(312 + case, 28);
+        let store = fixture.open();
+        store.submit(spec.clone()).unwrap();
+        let claim = store.claim_next().unwrap().unwrap();
+        claim.listening(spec.address.parse().unwrap()).unwrap();
+        let destination = fixture.root.join(format!("rabs-recovery-{}-1", spec.id));
+        if case == 0 {
+            fs::create_dir(&destination).unwrap();
+            fs::write(destination.join("sentinel"), b"existing unrelated bytes").unwrap();
+        } else if case == 1 {
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&spec.bundle, &destination).unwrap();
+            #[cfg(not(unix))]
+            fs::write(&destination, b"not a directory").unwrap();
+        } else {
+            let mut other = fixture.spec(315, 29);
+            other.output = destination.clone();
+            store.submit(other).unwrap();
+        }
+        let status = network_interruption(claim);
+        assert_eq!(status.state, OperationState::Uncertain);
+        assert_eq!(status.automatic_recoveries, 0);
+        assert_eq!(status.delivery, spec.delivery);
+        assert!(
+            status
+                .detail
+                .unwrap()
+                .contains("automatic result recovery unavailable")
+        );
+        if case == 0 {
+            assert_eq!(
+                fs::read(destination.join("sentinel")).unwrap(),
+                b"existing unrelated bytes"
+            );
+        }
+        assert!(
+            store.lock_state().unwrap().accepting,
+            "optional recovery refusal must not stop the daemon"
+        );
+    }
+}
+
+#[test]
+fn abandoned_recovery_does_not_schedule_another_attempt() {
+    let fixture = Fixture::new();
+    let spec = fixture.spec(316, 30);
+    let store = fixture.open();
+    store.submit(spec.clone()).unwrap();
+    let claim = store.claim_next().unwrap().unwrap();
+    claim.listening(spec.address.parse().unwrap()).unwrap();
+    network_interruption(claim);
+    let resumed = store
+        .claim_next_at(Instant::now() + Duration::from_secs(10))
+        .unwrap()
+        .unwrap();
+    drop(resumed);
+    let status = store.status(&spec.id).unwrap().unwrap();
+    assert_eq!(status.state, OperationState::Uncertain);
+    assert_eq!(status.automatic_recoveries, 1);
+    assert!(!status.recovery_pending);
+    drop(store);
+    let store = fixture.open();
+    assert!(
+        store
+            .claim_next_at(Instant::now() + Duration::from_secs(100))
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn scheduled_recovery_survives_a_failure_after_the_durable_rename() {
+    let fixture = Fixture::new();
+    let spec = fixture.spec(317, 31);
+    let store = fixture.open();
+    store.submit(spec.clone()).unwrap();
+    let claim = store.claim_next().unwrap().unwrap();
+    claim.listening(spec.address.parse().unwrap()).unwrap();
+    store
+        .fail_after_rename
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        claim
+            .finish(OperationOutcome::TransportInterrupted {
+                detail: "lost native transport".into(),
+                execution_may_have_run: true,
+            })
+            .is_err()
+    );
+    assert!(store.lock_state().is_err());
+    drop(store);
+    let store = fixture.open();
+    let status = store.status(&spec.id).unwrap().unwrap();
+    assert!(status.recovery_pending);
+    assert_eq!(status.automatic_recoveries, 1);
+    let claim = store
+        .claim_next_at(Instant::now() + Duration::from_secs(10))
+        .unwrap()
+        .unwrap();
+    assert_eq!(claim.mode(), DeliveryMode::Resume);
+    uncertain(claim);
+}
+
+#[test]
+fn malformed_persisted_recovery_intent_cannot_authorize_execution() {
+    for (field, value) in [
+        ("automatic_recoveries", json!(MAX_AUTOMATIC_RECOVERIES + 1)),
+        ("automatic_recoveries", json!(0)),
+        ("recovery_origin_attempt", Value::Null),
+        ("recovery_origin_attempt", json!(0)),
+        ("recovery_origin_attempt", json!(2)),
+        ("mode", json!("execute")),
+        ("bound_address", Value::Null),
+        ("cancel_requested", json!(true)),
+        ("state", json!("running")),
+    ] {
+        let fixture = Fixture::new();
+        let spec = fixture.spec(318, 32);
+        let store = fixture.open();
+        store.submit(spec.clone()).unwrap();
+        let claim = store.claim_next().unwrap().unwrap();
+        claim.listening(spec.address.parse().unwrap()).unwrap();
+        network_interruption(claim);
+        drop(store);
+        let path = fixture.store_root.join(format!("{}.json", spec.id));
+        let mut record: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        record[field] = value;
+        fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+        assert!(
+            PreparedOperationStore::open(&fixture.store_root).is_err(),
+            "invalid recovery field {field}"
+        );
+    }
+}
+
 #[test]
 fn submission_is_idempotent_and_retains_the_exact_request_across_reopen() {
     let fixture = Fixture::new();

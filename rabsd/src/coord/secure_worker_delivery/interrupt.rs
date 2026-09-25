@@ -7,7 +7,7 @@
 //! The native ATP stream and read_record retain partial input on the connection,
 //! so dropping an interrupted read future neither loses bytes nor resets timers.
 
-use super::{Phase, RecordPeer, TRANSFER_BUDGET, WorkerPeer, read_record, require};
+use super::{Phase, RecordPeer, TRANSFER_BUDGET, WorkerPeer, read_record, require, worker_transport_error};
 use super::lease::{ExecutionLease, Tick};
 use super::preview::PreviewSession;
 use asupersync::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
@@ -219,8 +219,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin, I: Interrupts> OperatorPeer<'_, S, I> {
             asupersync::time::timeout(asupersync::time::wall_now(), budget, async {
                 let mut stopped = pin!(interrupts.wait());
                 let mut writing = pin!(async {
-                    stream.write_all(&bytes).await?;
-                    stream.flush().await
+                    stream.write_all(&bytes).await.map_err(worker_transport_error)?;
+                    stream.flush().await.map_err(worker_transport_error)
                 });
                 poll_fn(|cx| {
                     if let Poll::Ready(result) = stopped.as_mut().poll(cx) {
@@ -231,7 +231,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin, I: Interrupts> OperatorPeer<'_, S, I> {
                     }
                     writing.as_mut().poll(cx)
                 }).await
-            }).await.map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "worker write deadline"))?
+            }).await.map_err(|_| worker_transport_error(io::Error::new(io::ErrorKind::TimedOut, "worker write deadline")))?
         })
     }
 
@@ -308,7 +308,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin, I: Interrupts> OperatorPeer<'_, S, I> {
                 asupersync::time::timeout(asupersync::time::wall_now(), budget,
                     next_event(&mut self.inner.stream, &mut self.inner.buffered, &mut self.interrupts,
                         lease_wake, preview_wake),
-                ).await.map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "worker read deadline"))?
+                ).await.map_err(|_| worker_transport_error(io::Error::new(io::ErrorKind::TimedOut, "worker read deadline")))?
             })?;
             // Decoding an immediately available frame is not permission to
             // cross a deadline or obtain a new transfer budget afterward.
@@ -616,7 +616,10 @@ mod tests {
                 let mut peer = OperatorPeer::with_interrupts(
                     RecordPeer::new(&runtime, stream, &request()), OperationInterrupts::new(token),
                 );
-                assert_eq!(peer.send(&frame).unwrap_err().kind(), io::ErrorKind::ConnectionAborted);
+                let error = peer.send(&frame).unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted);
+                assert!(!super::super::transport_interrupted(&error),
+                    "cancellation is not transport evidence even when the error kind matches");
                 assert!(peer.inner.failed);
                 assert!(!peer.cancel_sent, "a cancel cannot be appended to an incomplete frame");
                 assert!(peer.execution.is_none(), "a partial dispatch is never considered complete");

@@ -465,7 +465,30 @@ Status reports `queued`, `running`, `cancelling`, `completed`, `cancelled`,
 `failed_before_start`, or `uncertain`. Check `succeeded`, `exit_code`, `stop_reason`,
 and `outputs_installed` to distinguish a successful installed build from a
 completed compiler failure. `outputs_installed` records a verified installation;
-it does not continuously monitor later user edits. Cancellation is durable:
+it does not continuously monitor later user edits.
+
+After a native socket interruption during execution or result delivery, the
+daemon automatically tries to recover the original retained result up to three
+times, with 1, 2, and 4 second backoffs.
+These attempts use only result resume or acknowledgment messages: they do not
+upload source or execute the compiler again. Status exposes
+`automatic_recoveries`, `recovery_pending`, and the current `mode`. Each resumed
+download gets a fresh `rabs-recovery-<job-id>-<number>` directory beside the
+original delivery, checked against live and archived ownership. A lost release
+acknowledgment uses the already verified delivery and preserves the known build
+outcome even if its cleanup retries run out.
+
+The worker stays reserved throughout recovery. A durably queued retry survives
+a daemon restart and starts a fresh conservative backoff; an owner that crashes
+during an active attempt still leaves an uncertain job for explicit recovery.
+Cancellation and daemon shutdown suppress further automatic recovery. Invalid
+protocol messages, authentication failures, corrupt data, and local filesystem
+errors do not trigger these retries. After the budget is exhausted or recovery
+cannot be safely scheduled, the explicit commands below remain available.
+Source or toolchain upload failures before compiler dispatch remain
+`failed_before_start`; automatic recovery never retries execution.
+
+Cancellation is durable:
 
 ```sh
 rabsd --job-cancel 0123456789abcdef0123456789abcdef
@@ -561,7 +584,11 @@ produce `available:false` with `reason:"unavailable"`; transient contention uses
 `reason:"busy"`. These responses contain no segments. Repeated identical preview
 responses are omitted from the CLI output. The command follows the original
 queued job into its first claimed attempt, then stops if that attempt or request
-identity changes. Start another explicit invocation to inspect a recovery attempt.
+identity changes outside its bounded automatic recovery sequence. Automatic
+result and acknowledgment recovery retain the same request and can be followed
+through to verified completion; live preview reads stop during those recovery
+attempts. A manually changed attempt still requires another explicit follow
+invocation.
 
 At terminal delivery, the client requests verified completion metadata, checks
 the local receipt, and snapshots and hashes both complete diagnostic streams

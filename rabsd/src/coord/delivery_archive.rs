@@ -657,6 +657,7 @@ pub fn restore_delivery(
             directory: destination.to_path_buf(),
             receipt: verified.receipt,
             acknowledgments_confirmed: false,
+            acknowledgment_interrupted: false,
             acknowledgment_error: Some(
                 "restored from CAS; remote acknowledgments were not rechecked".to_owned(),
             ),

@@ -19,6 +19,7 @@ use rabsd::coord::source_delivery::{SourcePeer, SourceUpload, request_manifest};
 use rabsd::coord::worker_delivery::{
     Delivery, DeliveryFailure, DeliveryMode, MAX_FRAME_BYTES, ResumePeer, ResumeSource,
     WorkerPeer, receive_operation, validate_request,
+    transport_interrupted, worker_transport_error,
 };
 use serde_json::{Value, json};
 use std::fs::File;
@@ -419,6 +420,7 @@ fn operation_failure(directory: &Path, mode: DeliveryMode, detail: String) -> De
         execution_may_have_run: mode == DeliveryMode::Resume
             || !matches!(std::fs::symlink_metadata(directory),
                 Err(error) if error.kind() == io::ErrorKind::NotFound),
+        transport_interrupted: false,
         detail,
     }
 }
@@ -529,6 +531,7 @@ fn run_acknowledgment_once(args: &[String]) -> Result<Delivery, DeliveryFailure>
     let failure = |error: io::Error| DeliveryFailure {
         directory: directory.clone(),
         execution_may_have_run: true,
+        transport_interrupted: transport_interrupted(&error),
         detail: error.to_string(),
     };
     let address = loopback_address(&args[0]).map_err(&failure)?;
@@ -640,8 +643,8 @@ struct TlsOperationControl<'a> {
 
 async fn until_cancelled<T>(
     cancellation: &OperationCancellation,
-    future: impl std::future::Future<Output = Result<T, String>>,
-) -> Result<T, String> {
+    future: impl std::future::Future<Output = io::Result<T>>,
+) -> io::Result<T> {
     use std::future::{Future, poll_fn};
     use std::pin::pin;
     use std::task::Poll;
@@ -649,7 +652,8 @@ async fn until_cancelled<T>(
     let mut pending = pin!(future);
     poll_fn(|cx| {
         if stopped.as_mut().poll(cx).is_ready() {
-            return Poll::Ready(Err("prepared operation cancelled before dispatch".to_owned()));
+            return Poll::Ready(Err(io::Error::new(io::ErrorKind::Interrupted,
+                "prepared operation cancelled before dispatch")));
         }
         pending.as_mut().poll(cx)
     }).await
@@ -664,26 +668,24 @@ fn accept_tls_worker(
     request_id: &Value,
     operation: &str,
     mut control: Option<&mut TlsOperationControl<'_>>,
-) -> Result<
+) -> io::Result<
     (
         asupersync::runtime::Runtime,
         rabs_asupersync::worker_transport::AuthenticatedPeer,
         rabsd::coord::secure_worker_delivery::PinnedWorkerAdmission,
     ),
-    String,
 > {
     use asupersync::runtime::RuntimeBuilder;
     use rabs_asupersync::worker_transport::accept_peer;
     use rabsd::coord::secure_worker_delivery::{PinnedWorkerAdmission, parse_worker_pin};
     if asupersync::cx::Cx::current().is_some() {
-        return Err("worker delivery requires a dedicated blocking thread".to_owned());
+        return Err(invalid("worker delivery requires a dedicated blocking thread"));
     }
     if control.as_ref().is_some_and(|control| control.cancellation.is_cancelled()) {
-        return Err("prepared operation cancelled before dispatch".to_owned());
+        return Err(io::Error::new(io::ErrorKind::Interrupted,
+            "prepared operation cancelled before dispatch"));
     }
-    let acceptor = coordinator_tls_files()
-        .map_err(|error| error.to_string())?
-        .acceptor()?;
+    let acceptor = coordinator_tls_files()?.acceptor().map_err(io::Error::other)?;
     // A stable worker name owns its persistent pin and boot history. Hold its
     // exclusive admission capability before listening and through stream close.
     let state = std::env::var_os("RABS_STATE_DIR")
@@ -692,19 +694,18 @@ fn accept_tls_worker(
     let admission = PinnedWorkerAdmission::open(
         &state,
         worker,
-        parse_worker_pin(pin).map_err(|error| error.to_string())?,
-    )
-    .map_err(|error| error.to_string())?;
+        parse_worker_pin(pin)?,
+    )?;
     let runtime = RuntimeBuilder::current_thread()
         .build()
-        .map_err(|error| format!("worker delivery runtime: {error:?}"))?;
+        .map_err(|error| io::Error::other(format!("worker delivery runtime: {error:?}")))?;
     let peer = runtime.block_on(async {
         let listener = asupersync::net::TcpListener::bind(address)
             .await
-            .map_err(|error| format!("worker TLS listen: {error}"))?;
-        let address = listener.local_addr().map_err(|error| error.to_string())?;
+            .map_err(|error| io::Error::new(error.kind(), format!("worker TLS listen: {error}")))?;
+        let address = listener.local_addr()?;
         if let Some(control) = control.as_mut() {
-            (control.on_listening)(address).map_err(|error| error.to_string())?;
+            (control.on_listening)(address)?;
         } else {
             eprintln!(
                 "{}",
@@ -717,9 +718,13 @@ fn accept_tls_worker(
         let exchange = async {
             let (stream, _) = asupersync::time::timeout(
                 asupersync::time::wall_now(), ACCEPT_BUDGET, listener.accept(),
-            ).await.map_err(|_| "worker TLS accept deadline exceeded")?
-                .map_err(|error| format!("worker TLS accept: {error}"))?;
-            accept_peer(&acceptor, stream).await
+            ).await.map_err(|_| worker_transport_error(io::Error::new(
+                io::ErrorKind::TimedOut, "worker TLS accept deadline exceeded")))?
+                .map_err(worker_transport_error)?;
+            // This lower TLS boundary intentionally exposes only a diagnostic
+            // string. Authentication/handshake failures remain nonretryable;
+            // they are never guessed from that text.
+            accept_peer(&acceptor, stream).await.map_err(io::Error::other)
         };
         match control.as_ref() {
             Some(control) => until_cancelled(&control.cancellation, exchange).await,
@@ -830,7 +835,11 @@ fn run_tls_operation_inner(
         },
         control.as_mut(),
     )
-    .map_err(failure)?;
+    .map_err(|error| {
+        let mut failure = failure(error.to_string());
+        failure.transport_interrupted = transport_interrupted(&error);
+        failure
+    })?;
     if let Some(control) = control {
         return rabsd::coord::secure_worker_delivery::receive_authenticated_observed(
             &runtime, peer, admission, request, directory, mode, upload.as_ref(), reuse.as_ref(),
@@ -850,7 +859,8 @@ fn run_tls_operation_inner(
 fn run_tls_acknowledgment_once(args: &[String]) -> Result<Delivery, DeliveryFailure> {
     let directory = PathBuf::from(&args[4]);
     let request = read_request(Path::new(&args[3])).map_err(|error| DeliveryFailure {
-        directory: directory.clone(), execution_may_have_run: true, detail: error.to_string(),
+        directory: directory.clone(), execution_may_have_run: true,
+        transport_interrupted: false, detail: error.to_string(),
     })?;
     run_tls_acknowledgment_bound(&args[0], &args[1], &args[2], &request, &directory, None)
 }
@@ -867,6 +877,7 @@ fn run_tls_acknowledgment_bound(
     let failure = |detail: String| DeliveryFailure {
         directory: directory.to_path_buf(),
         execution_may_have_run: true,
+        transport_interrupted: false,
         detail,
     };
     let address: SocketAddr = address
@@ -900,7 +911,11 @@ fn run_tls_acknowledgment_bound(
         "result-acknowledgment",
         control.as_mut(),
     )
-    .map_err(failure)?;
+    .map_err(|error| {
+        let mut failure = failure(error.to_string());
+        failure.transport_interrupted = transport_interrupted(&error);
+        failure
+    })?;
     match control {
         Some(control) => rabsd::coord::secure_worker_delivery::acknowledge_authenticated_controlled(
             &runtime, peer, admission, pending, control.cancellation,
@@ -1590,12 +1605,13 @@ mod tests {
         use std::future::{Future, pending};
         use std::task::{Context, Poll, Waker};
         let token = OperationCancellation::default();
-        let mut waiting = Box::pin(until_cancelled(&token, pending::<Result<(), String>>()));
+        let mut waiting = Box::pin(until_cancelled(&token, pending::<io::Result<()>>()));
         let mut cx = Context::from_waker(Waker::noop());
         assert!(waiting.as_mut().poll(&mut cx).is_pending());
         token.cancel();
         assert!(matches!(waiting.as_mut().poll(&mut cx), Poll::Ready(Err(detail))
-            if detail.contains("cancelled before dispatch")));
+            if detail.to_string().contains("cancelled before dispatch")
+                && !transport_interrupted(&detail)));
 
         let mut started = false;
         let mut stopped = Box::pin(until_cancelled(&token, async {

@@ -6,10 +6,10 @@
 //! one bounded record at a time on the existing filesystem lane.
 
 use super::{
-    MAX_DETAIL_BYTES, MAX_OPERATIONS, MAX_RECORD_BYTES, MAX_RETAINED_BYTES, OperationState,
-    PreparedOperationStore, Record, State, StoredMode, invalid, ordinary_directory, overlap,
-    path_shape, read_bounded, request_digest, require, valid_id, validate_bound_request,
-    validate_spec_shape,
+    MAX_AUTOMATIC_RECOVERIES, MAX_DETAIL_BYTES, MAX_OPERATIONS, MAX_RECORD_BYTES,
+    MAX_RETAINED_BYTES, OperationState, PreparedOperationStore, Record, State, StoredMode, invalid,
+    ordinary_directory, overlap, path_shape, read_bounded, request_digest, require, valid_id,
+    validate_bound_request, validate_spec_shape,
 };
 use std::fs::{self, File};
 use std::io;
@@ -58,6 +58,22 @@ pub(super) fn load_record(root: &Path, path: &Path) -> io::Result<Record> {
             && record.request_sha256 == request_digest(&record.request)?
             && path.file_stem().and_then(|s| s.to_str()) == Some(record.spec.id.as_str())
             && record.prior_deliveries.len() <= 16
+            && record.automatic_recoveries <= MAX_AUTOMATIC_RECOVERIES
+            && (record.automatic_recoveries == 0 || record.mode != StoredMode::Execute)
+            && record.recovery_origin_attempt.is_none_or(|origin| {
+                origin > 0
+                    && origin <= record.attempt
+                    && record.automatic_recoveries > 0
+                    && matches!(record.mode, StoredMode::Resume | StoredMode::Acknowledge)
+            })
+            && (!record.recovery_pending
+                || (record.automatic_recoveries > 0
+                    && record.recovery_origin_attempt.is_some()
+                    && record.state == OperationState::Queued
+                    && matches!(record.mode, StoredMode::Resume | StoredMode::Acknowledge)
+                    && record.bound_address.is_some()
+                    && !record.cancel_requested
+                    && record.execution_may_have_run))
             && record
                 .detail
                 .as_ref()
