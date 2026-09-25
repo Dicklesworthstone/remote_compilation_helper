@@ -8163,7 +8163,10 @@ Number of files transferred: 42
         let bin = dir.join("bin");
         std::fs::create_dir(&bin).unwrap();
         // Real setup tools are available, while setsid is genuinely absent.
-        for tool in ["touch", "mkdir", "rm"] {
+        // chmod belongs here: the generated command chmods restricted dirs
+        // before the setsid capability check, so without it the fixture died
+        // at exit 127 and never reached the refusal this test asserts.
+        for tool in ["touch", "mkdir", "rm", "chmod"] {
             std::os::unix::fs::symlink(format!("/bin/{tool}"), bin.join(tool)).unwrap();
         }
         let pipeline = TransferPipeline::new(
