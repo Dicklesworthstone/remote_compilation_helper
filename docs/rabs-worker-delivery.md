@@ -280,8 +280,10 @@ running its binaries.
 
 Use the resulting bundle with `--worker-build-tls` or `--job-submit`. New
 execution validates the retained toolchain before contacting the worker. It
-uploads source first, then streams the toolchain over the same authenticated
-connection, and dispatches the saved command only after both inputs are sealed.
+uploads source first, then offers the toolchain over the same authenticated
+connection. A negotiated verified worker cache hit avoids retransmitting the
+tree; a miss streams it normally. The saved command is dispatched only after
+both inputs are sealed.
 The original local installation is no longer needed. A missing or changed
 retained tree fails before dispatch; it cannot select a worker-local compiler.
 Direct `--worker-exec-tls --source-root` does not infer toolchain upload permission
@@ -301,9 +303,32 @@ memory. Symlinks are created after file delivery and validated against the
 complete tree. Partial, out-of-order, altered or incomplete input cannot become
 an execution root. Capture and repeated verification read the full selected tree;
 allow disk space for the retained bundle and the worker's staging and private
-execution copies. The existing optional worker toolchain pool can reuse a
-verified execution copy, but this transfer protocol still sends the selected tree
-for each new execution.
+execution copies.
+
+To retain toolchains across jobs and worker reconnects, set
+`RABS_WORKER_TOOLCHAIN_CACHE_BYTES` to the worker-local byte budget before
+starting the worker. Absence or zero disables retention; the pool is bounded by
+64 GiB and eight datasets. The first actual execution captures the verified
+toolchain into that pool. A later connection may select `toolchain-reuse-v1`
+when the worker advertises it alongside toolchain transfer. On an exact hit,
+the worker revalidates the retained dataset on its filesystem thread and replies
+to the initial toolchain offer with `sealed:true`; the coordinator sends no
+toolchain entries, chunks or seal frame. The original request is unchanged.
+
+Lookup uses the full dataset identity and verifies the declared entry count.
+It never opens a sender-supplied worker path, captures a missing installation,
+or waits for another capture. A disabled pool, missing dataset, oversized dataset
+or capture still in progress uses ordinary upload. Corrupt retained bytes refuse
+the current operation; they do not become a successful hit. A lease keeps the
+verified tree alive through admission, execution and process drain, even if its
+cache entry is retired. Cancellation and the fixed input deadline still apply
+to lookup and acknowledgment. Without explicit reuse negotiation, an unsolicited
+`sealed:true` begin reply is rejected.
+
+This pool is process-local. Worker process restart discards it, while reconnects
+within the same worker process can retain it. Prepared bundles still contain
+their own complete compiler tree and are verified locally before networking;
+cache reuse does not make a missing or corrupted local bundle executable.
 
 The receiver requires the worker's explicit `toolchain-tree-v1` transfer and
 `toolchain-dataset-v1` verification capabilities before sending input bytes.

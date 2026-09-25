@@ -531,6 +531,7 @@ fn unnegotiated_and_partial_toolchains_never_reach_durable_admission() {
             enabled,
             false,
             &selected,
+            false,
             |_, _, _, _, _, _| panic!("incomplete toolchain launched"),
             pressure,
         ));
@@ -590,6 +591,7 @@ fn pipelined_toolchain_chunks_preserve_order_while_ping_bypasses_filesystem_work
         true,
         false,
         &selected,
+        false,
         |_, _, _, _, _, _| panic!("toolchain upload is not execution admission"),
         pressure,
     ));
@@ -672,6 +674,7 @@ fn uploaded_executable_runs_private_bytes_and_journals_the_exact_original_reques
             true,
             false,
             &selected,
+            request_id == 0,
             |request, timeout, artifacts, source, toolchain, lease| {
                 assert!(lease.is_some());
                 launch(
@@ -788,6 +791,7 @@ fn sealed_toolchain_refuses_foreign_original_identity_without_consuming_the_owne
         true,
         false,
         &selected,
+        false,
         |request, timeout, artifacts, source, toolchain, lease| {
             launch(
                 root.path(),
@@ -858,6 +862,7 @@ fn disconnect_retains_the_uploaded_toolchain_until_the_real_child_is_drained() {
         true,
         false,
         &selected,
+        false,
         |request, timeout, artifacts, source, toolchain, lease| {
             launch(
                 root.path(),
@@ -916,6 +921,7 @@ fn cancel_before_seal_and_after_seal_blocks_later_execution_and_reupload() {
             true,
             false,
             &selected,
+            false,
             |_, _, _, _, _, _| panic!("cancelled upload reached execution"),
             pressure,
         ));
@@ -1013,6 +1019,7 @@ fn a_blocked_seal_reply_does_not_admit_pipelined_execution_after_cancel() {
         true,
         false,
         &selected,
+        false,
         |_, _, _, _, _, _| panic!("cancelled pipelined request launched"),
         pressure,
     ));

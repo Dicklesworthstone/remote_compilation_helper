@@ -613,8 +613,10 @@ impl SourceUpload {
         if let Some(toolchain) = &self.toolchain {
             toolchain.select(hello, &mut grant)?;
         } else {
-            require(grant.get("toolchain_transfer").is_none(),
-                "toolchain transfer was not authorized by this upload")?;
+            require(
+                grant.get("toolchain_transfer").is_none() && grant.get("toolchain_reuse").is_none(),
+                "toolchain transfer was not authorized by this upload",
+            )?;
         }
         Ok(grant)
     }
@@ -622,12 +624,19 @@ impl SourceUpload {
     /// Send one source projection over an ALREADY admitted session. A failed
     /// exchange is terminal for this operation; there is no execution retry.
     /// Transport implementations enforce one absolute upload-phase deadline.
+    /// Toolchain reuse is selected by the actual authenticated session grant,
+    /// never inferred from a ready response or the saved execution request.
     pub(crate) fn transmit<P: WorkerPeer + ?Sized>(
         &self,
         peer: &mut P,
         request: &Value,
+        toolchain_reuse_selected: bool,
     ) -> io::Result<()> {
         self.validate_request(request)?;
+        require(
+            !toolchain_reuse_selected || self.toolchain.is_some(),
+            "toolchain reuse requires an authorized toolchain upload",
+        )?;
         let id = request["request_id"]
             .as_u64()
             .ok_or_else(|| invalid("source request identity"))?;
@@ -713,7 +722,7 @@ impl SourceUpload {
             "worker did not seal the complete source projection",
         )?;
         if let Some(toolchain) = &self.toolchain {
-            toolchain.transmit(peer, request)?;
+            toolchain.transmit(peer, request, toolchain_reuse_selected)?;
         }
         Ok(())
     }
@@ -758,7 +767,7 @@ impl<P: WorkerPeer + ?Sized> WorkerPeer for SourcePeer<'_, P> {
         self.attempted = true;
         let grant = self.upload.grant(hello, grant)?;
         self.inner.negotiate(hello, &grant)?;
-        self.upload.transmit(self.inner, self.request)
+        self.upload.transmit(self.inner, self.request, false)
     }
 }
 
@@ -980,7 +989,7 @@ mod tests {
         let mut peer = ReceiverPeer::new();
         peer.prefilled.insert("src/lib.rs".into(), bytes.clone());
         peer.missing = Some(json!([]));
-        upload.transmit(&mut peer, &request).unwrap();
+        upload.transmit(&mut peer, &request, false).unwrap();
         assert_eq!(peer.sent.len(), 2);
         assert_eq!(peer.sent[0], upload.begin_frame(&request));
         assert_eq!(peer.sent[0]["allow_cached_files"], true);
@@ -995,6 +1004,26 @@ mod tests {
         assert_eq!(std::fs::read(source.join("src/lib.rs")).unwrap(), bytes);
         assert_eq!(std::fs::read(source.join("empty")).unwrap(), b"");
         assert!(!source.join("not-selected.private").exists());
+    }
+
+    #[test]
+    fn source_authority_cannot_select_or_start_unretained_toolchain_reuse() {
+        use rabs_sandbox::toolchain_transfer::TOOLCHAIN_REUSE_VERSION;
+
+        let root = tempfile::tempdir().unwrap();
+        let (upload, request, _) = fixture(root.path());
+        let hello = json!({"source_transfers":[SOURCE_TRANSFER],
+            "toolchain_transfers":[TOOLCHAIN_TRANSFER_VERSION],
+            "toolchain_reuses":[TOOLCHAIN_REUSE_VERSION]});
+        let mut grant = json!({"kind":"session-ok"});
+        let selected = upload.grant(&hello, &grant).unwrap();
+        assert!(selected.get("toolchain_transfer").is_none());
+        assert!(selected.get("toolchain_reuse").is_none());
+        grant["toolchain_reuse"] = json!(TOOLCHAIN_REUSE_VERSION);
+        assert!(upload.grant(&hello, &grant).is_err());
+        let mut peer = ReceiverPeer::new();
+        assert!(upload.transmit(&mut peer, &request, true).is_err());
+        assert!(peer.sent.is_empty());
     }
 
     #[test]
@@ -1023,7 +1052,7 @@ mod tests {
         let mut peer = ReceiverPeer::new();
         peer.prefilled.insert("src/lib.rs".into(), bytes.clone());
         peer.missing = Some(json!(["changed.rs"]));
-        upload.transmit(&mut peer, &request).unwrap();
+        upload.transmit(&mut peer, &request, false).unwrap();
         let chunks: Vec<_> = peer
             .sent
             .iter()
@@ -1056,7 +1085,7 @@ mod tests {
         ] {
             let mut peer = ReceiverPeer::new();
             peer.missing = Some(missing);
-            assert!(upload.transmit(&mut peer, &request).is_err());
+            assert!(upload.transmit(&mut peer, &request, false).is_err());
             assert_eq!(peer.sent.len(), 1);
             assert_eq!(peer.sent[0]["kind"], "source-begin");
             assert!(peer.receiver.as_ref().unwrap().sealed_root().is_none());
@@ -1173,7 +1202,7 @@ mod tests {
             capture_sealed_source(&[("workspace".into(), source)], false, 2, 200_000).unwrap();
         let upload = SourceUpload::for_request(Arc::new(image), "workspace", &request).unwrap();
         let mut peer = ReceiverPeer::new();
-        upload.transmit(&mut peer, &request).unwrap();
+        upload.transmit(&mut peer, &request, false).unwrap();
         let received = peer.receiver.as_ref().unwrap().sealed_root().unwrap();
         assert_eq!(fs::read(received.join("src/lib.rs")).unwrap(), bytes);
         assert_eq!(fs::read(received.join("empty")).unwrap(), b"");
@@ -1381,7 +1410,7 @@ mod tests {
         fs::write(base.path().join("app/src/lib.rs"), b"new app").unwrap();
         fs::write(base.path().join("dep/src/lib.rs"), b"new dep").unwrap();
         let mut peer = ReceiverPeer::new();
-        upload.transmit(&mut peer, &request).unwrap();
+        upload.transmit(&mut peer, &request, false).unwrap();
         let root = peer.receiver.as_ref().unwrap().sealed_root().unwrap();
         assert_eq!(fs::read(root.join("app/src/lib.rs")).unwrap(), b"app");
         assert_eq!(fs::read(root.join("dep/src/lib.rs")).unwrap(), b"dep");
@@ -1418,7 +1447,7 @@ mod tests {
             }
         }
         peer.missing = Some(json!(["dep/src/lib.rs"]));
-        upload.transmit(&mut peer, &request).unwrap();
+        upload.transmit(&mut peer, &request, false).unwrap();
         let chunks: Vec<_> = peer
             .sent
             .iter()
@@ -1430,7 +1459,7 @@ mod tests {
         assert_eq!(peer.sent.last().unwrap()["kind"], "source-seal");
         let mut foreign = ReceiverPeer::new();
         foreign.missing = Some(json!(["dep/not-selected.private"]));
-        assert!(upload.transmit(&mut foreign, &request).is_err());
+        assert!(upload.transmit(&mut foreign, &request, false).is_err());
         assert_eq!(foreign.sent.len(), 1);
     }
 

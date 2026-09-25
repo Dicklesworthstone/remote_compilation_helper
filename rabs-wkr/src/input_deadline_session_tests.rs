@@ -357,6 +357,7 @@ fn silent_partial_source_and_sealed_inputs_expire_without_another_peer_frame() {
                 stage == 2,
                 false,
                 &selected,
+                false,
                 short_budgets(),
                 |_, _, _, _, _, _| panic!("idle input acquired execution admission"),
                 pressure,
@@ -419,6 +420,7 @@ fn stalled_input_reply_write_and_flush_expire_without_appending_another_frame() 
                 false,
                 false,
                 &selected,
+                false,
                 short_budgets(),
                 |_, _, _, _, _, _| panic!("blocked input reply launched execution"),
                 pressure,
@@ -472,6 +474,7 @@ fn accepted_chunks_pings_and_refused_frames_do_not_renew_the_source_budget() {
             true,
             false,
             &selected,
+            false,
             budgets,
             |_, _, _, _, _, _| panic!("source activity acquired execution admission"),
             pressure,
@@ -558,6 +561,7 @@ fn source_to_toolchain_transition_keeps_the_original_total_input_cap() {
             true,
             false,
             &selected,
+            false,
             InputBudgets {
                 source: Duration::from_secs(4),
                 toolchain: Duration::from_secs(4),
@@ -617,6 +621,7 @@ fn staged_input_identity_cannot_be_bypassed_by_execution_or_result_recovery() {
             true,
             false,
             &selected,
+            false,
             short_budgets(),
             |_, _, _, _, _, _| panic!("mixed input ownership passed durable admission"),
             pressure,
@@ -844,6 +849,7 @@ fn handed_off_source_and_toolchain_outlive_the_upload_clock_with_the_managed_chi
             true,
             false,
             &selected,
+            false,
             short_budgets(),
             |request, timeout, artifacts, source, toolchain, lease| {
                 assert!(artifacts.is_none());

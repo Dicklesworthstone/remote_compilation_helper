@@ -93,14 +93,17 @@ impl Dataset {
 }
 
 /// Scope-owned execution input; nothing can evict its backing while it is used.
-pub(super) struct ToolchainLease {
+pub(crate) struct ToolchainLease {
     dataset: Arc<Dataset>,
     disposition: &'static str,
 }
 impl ToolchainLease {
-    pub(super) fn root(&self) -> &Path { self.dataset.toolchain.root() }
+    pub(crate) fn root(&self) -> &Path { self.dataset.toolchain.root() }
+    pub(crate) fn entry_count(&self) -> io::Result<usize> {
+        self.dataset.toolchain.entries().map(|entries| entries.len())
+    }
     pub(super) fn disposition(&self) -> &'static str { self.disposition }
-    pub(super) fn verify(&self, stopped: impl Fn() -> bool) -> io::Result<()> {
+    pub(crate) fn verify(&self, stopped: impl Fn() -> bool) -> io::Result<()> {
         self.dataset.toolchain.verify(stopped)
     }
 
@@ -161,7 +164,7 @@ struct State {
     reserved_bytes: u64,
     clock: u64,
 }
-struct ToolchainPool {
+pub(crate) struct ToolchainPool {
     directory: Arc<PoolDirectory>,
     max_bytes: u64,
     max_entries: usize,
@@ -190,7 +193,7 @@ impl Drop for Reservation<'_> {
 }
 
 impl ToolchainPool {
-    fn new(max_bytes: u64, max_entries: usize) -> io::Result<Self> {
+    pub(crate) fn new(max_bytes: u64, max_entries: usize) -> io::Result<Self> {
         if max_bytes > MAX_POOL_BYTES || max_entries == 0 || max_entries > MAX_POOL_ENTRIES {
             return Err(invalid("toolchain pool limits outside their bounds"));
         }
@@ -221,7 +224,38 @@ impl ToolchainPool {
         self.changed.notify_all();
         Ok(())
     }
-    fn acquire(
+    /// A miss has no filesystem source, reservation or capture side effects.
+    /// Captures already in progress are misses too: a sender can upload its
+    /// retained bytes instead of waiting for another execution's preparation.
+    pub(crate) fn lookup(
+        &self, expected: &ToolchainIdentity, stopped: impl Fn() -> bool,
+    ) -> io::Result<Option<ToolchainLease>> {
+        checkpoint(&stopped)?;
+        if self.max_bytes == 0 || expected.bytes > self.max_bytes { return Ok(None); }
+        let identity = key(expected);
+        let dataset = {
+            let mut state = self.lock()?;
+            state.clock = state.clock.saturating_add(1);
+            let touched = state.clock;
+            match state.entries.get_mut(&identity) {
+                Some(Slot::Ready { dataset, touched:last }) => {
+                    *last = touched;
+                    Arc::clone(dataset)
+                }
+                Some(Slot::Capturing) | None => return Ok(None),
+            }
+        };
+        // Keep the dataset pinned during verification, outside the admission
+        // mutex. A filename or matching identity record is never a cache hit.
+        if let Err(error) = dataset.toolchain.verify(&stopped) {
+            if !stopped() { self.discard_failed(identity, &dataset)?; }
+            return Err(error);
+        }
+        checkpoint(&stopped)?;
+        Ok(Some(ToolchainLease { dataset, disposition:"reused" }))
+    }
+
+    pub(crate) fn acquire(
         &self, source: &Path, expected: Option<&ToolchainIdentity>, stopped: impl Fn() -> bool,
     ) -> io::Result<ToolchainLease> {
         checkpoint(&stopped)?;
@@ -359,6 +393,20 @@ pub(super) fn prepare(
     }
 }
 
+/// Reuse only an already retained, verified dataset from the active supervisor.
+/// An absent scope or disabled pool never creates a private directory on lookup.
+pub(crate) fn lookup(
+    expected: &ToolchainIdentity, stopped: impl Fn() -> bool,
+) -> io::Result<Option<ToolchainLease>> {
+    checkpoint(&stopped)?;
+    let pool = ACTIVE_POOL.lock()
+        .map_err(|_| invalid("toolchain pool registry is poisoned"))?.upgrade();
+    match pool {
+        Some(pool) => pool.lookup(expected, stopped),
+        None => Ok(None),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -402,6 +450,61 @@ mod tests {
             spec.ro_binds.push(Bind::new(lease.root(), rabs_sandbox::layout::TOOLCHAIN));
             spec.rw_binds.push(Bind::new(writable, rabs_sandbox::layout::WORKSPACE));
             spec
+        }
+
+        #[test]
+        fn lookup_misses_do_not_create_captures_reservations_or_waiters() {
+            let (_source, identity) = source(b"compiler");
+            for budget in [0, identity.bytes - 1, 1024] {
+                let pool = pool(budget, 2);
+                assert!(pool.lookup(&identity, || false).unwrap().is_none());
+                assert!(pool.lock().unwrap().entries.is_empty());
+                assert_eq!(pool.lock().unwrap().reserved_bytes, 0);
+                assert_eq!(fs::read_dir(pool.directory.0.path()).unwrap().count(), 0);
+            }
+        }
+
+        #[test]
+        fn lookup_uses_full_identity_and_retains_verified_bytes_without_a_source_path() {
+            let (source, identity) = source(b"compiler\0\xff");
+            let pool = pool(1024, 2);
+            let first = pool.acquire(source.path(), Some(&identity), || false).unwrap();
+            let root = first.root().to_path_buf();
+            fs::rename(source.path().join("bin"), source.path().join("unavailable")).unwrap();
+            for foreign in [
+                ToolchainIdentity { sha256:[0; 32], ..identity },
+                ToolchainIdentity { files:identity.files + 1, ..identity },
+                ToolchainIdentity { bytes:identity.bytes + 1, ..identity },
+            ] {
+                assert!(pool.lookup(&foreign, || false).unwrap().is_none());
+            }
+            let lease = pool.lookup(&identity, || false).unwrap().unwrap();
+            assert_eq!(lease.disposition(), "reused");
+            assert_eq!(lease.root(), root);
+            assert_eq!(lease.entry_count().unwrap(), 6);
+            drop(first);
+            drop(pool);
+            assert_eq!(fs::read(root.join("bin/compiler")).unwrap(), b"compiler\0\xff");
+            lease.verify(|| false).unwrap();
+            drop(lease);
+            assert!(!root.exists());
+        }
+
+        #[test]
+        fn lookup_cancellation_returns_no_lease_without_retiring_valid_storage() {
+            use std::sync::atomic::AtomicUsize;
+            let (source, identity) = source(b"compiler");
+            let pool = pool(1024, 2);
+            let first = pool.acquire(source.path(), Some(&identity), || false).unwrap();
+            let checkpoints = AtomicUsize::new(0);
+            let error = pool.lookup(&identity, || {
+                checkpoints.fetch_add(1, Ordering::SeqCst) != 0
+            }).err().unwrap();
+            assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+            assert_eq!(pool.lock().unwrap().reserved_bytes, identity.bytes);
+            assert_eq!(pool.lock().unwrap().entries.len(), 1);
+            let next = pool.lookup(&identity, || false).unwrap().unwrap();
+            assert_eq!(next.root(), first.root());
         }
 
         #[test]
@@ -471,7 +574,7 @@ mod tests {
             drop(a);
             drop(b);
             // Refresh B; A is the unique least recently used idle entry.
-            drop(pool.acquire(Path::new("/absent"), Some(&b_id), || false).unwrap());
+            drop(pool.lookup(&b_id, || false).unwrap().unwrap());
             let c = pool.acquire(c.path(), Some(&c_id), || false).unwrap();
             assert_eq!(c.disposition(), "captured");
             assert!(!a_root.exists());
@@ -527,6 +630,10 @@ mod tests {
                 })
             });
             entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            // Negotiated reuse does not wait for the real concurrent capture.
+            assert!(pool.lookup(&identity, || false).unwrap().is_none());
+            assert!(matches!(pool.lock().unwrap().entries.get(&key(&identity)), Some(Slot::Capturing)));
+            assert_eq!(pool.lock().unwrap().reserved_bytes, identity.bytes);
             let until = Instant::now() + Duration::from_millis(60);
             let error = pool.acquire(Path::new("/absent"), Some(&identity), || Instant::now() >= until)
                 .err().unwrap();
@@ -553,7 +660,7 @@ mod tests {
             let path = lease.root().join("bin/compiler");
             fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
             fs::write(&path, b"tampered").unwrap();
-            assert!(pool.acquire(source.path(), Some(&identity), || false).is_err());
+            assert!(pool.lookup(&identity, || false).is_err());
             assert!(lease.verify(|| false).is_err());
             assert!(pool.lock().unwrap().entries.is_empty());
             let replacement = pool.acquire(source.path(), Some(&identity), || false).unwrap();

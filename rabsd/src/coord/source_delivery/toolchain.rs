@@ -1,6 +1,8 @@
 //! Stream an explicitly retained compiler tree inside authenticated admission.
 //! Every reply names the original request and complete dataset identity. The
 //! receiver must seal all entries and bytes before execution can be dispatched.
+//! Negotiated reuse permits that seal to come from a fully verified retained
+//! dataset; a cache claim without the selected protocol never skips an upload.
 
 use super::{digest, hex, invalid, require};
 use crate::coord::worker_delivery::{
@@ -8,7 +10,8 @@ use crate::coord::worker_delivery::{
 };
 use rabs_sandbox::toolchain_dataset::PreparedToolchain;
 use rabs_sandbox::toolchain_transfer::{
-    MAX_TOOLCHAIN_CHUNK, TOOLCHAIN_TRANSFER_VERSION, ToolchainEntry, ToolchainEntryKind,
+    MAX_TOOLCHAIN_CHUNK, TOOLCHAIN_REUSE_VERSION, TOOLCHAIN_TRANSFER_VERSION, ToolchainEntry,
+    ToolchainEntryKind,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -70,6 +73,22 @@ impl ToolchainUpload {
             "conflicting toolchain transfer selection",
         )?;
         grant["toolchain_transfer"] = json!(TOOLCHAIN_TRANSFER_VERSION);
+        let reuse = hello["toolchain_reuses"]
+            .as_array()
+            .is_some_and(|versions| {
+                versions
+                    .iter()
+                    .any(|version| version == TOOLCHAIN_REUSE_VERSION)
+            });
+        require(
+            grant
+                .get("toolchain_reuse")
+                .is_none_or(|value| reuse && value == TOOLCHAIN_REUSE_VERSION),
+            "conflicting or unsupported toolchain reuse selection",
+        )?;
+        if reuse {
+            grant["toolchain_reuse"] = json!(TOOLCHAIN_REUSE_VERSION);
+        }
         Ok(())
     }
 
@@ -77,6 +96,7 @@ impl ToolchainUpload {
         &self,
         peer: &mut P,
         request: &Value,
+        reuse_selected: bool,
     ) -> io::Result<()> {
         self.validate_request(request)?;
         let id = request["request_id"]
@@ -99,10 +119,14 @@ impl ToolchainUpload {
             "identity":toolchain_identity_value(identity), "entries":self.entries.len()}))?;
         let reply = peer.receive()?;
         check(&reply, "toolchain-ready", 4)?;
-        require(
-            reply["sealed"] == false,
-            "new toolchain transfer unexpectedly sealed",
-        )?;
+        match reply["sealed"].as_bool() {
+            Some(true) => {
+                require(reuse_selected, "toolchain reuse was not negotiated")?;
+                return Ok(());
+            }
+            Some(false) => {}
+            None => return Err(invalid("toolchain ready seal must be a boolean")),
+        }
         for entry in self.entries.iter() {
             let value = match &entry.kind {
                 ToolchainEntryKind::Directory => json!({"kind":"directory"}),
@@ -226,6 +250,8 @@ mod tests {
         sent: Vec<Value>,
         maximum_pending: usize,
         fault: Option<&'static str>,
+        reuse_enabled: bool,
+        stopped: bool,
     }
 
     impl ReceiverPeer {
@@ -240,6 +266,8 @@ mod tests {
                 sent: Vec::new(),
                 maximum_pending: 0,
                 fault: None,
+                reuse_enabled: false,
+                stopped: false,
             }
         }
     }
@@ -251,11 +279,31 @@ mod tests {
             let identity = &frame["sha256"];
             let reply = match frame["kind"].as_str().unwrap() {
                 "toolchain-begin" => {
+                    require(
+                        frame.as_object().unwrap().len() == 4,
+                        "toolchain begin shape changed",
+                    )?;
                     let expected =
                         toolchain_identity(&json!({"toolchain_identity":frame["identity"]}))?
                             .unwrap();
+                    // This transport fixture is warmed by the real receiver
+                    // below. A hit still rehashes the retained tree before
+                    // replying; it is not a claim about worker pool execution.
+                    if self.reuse_enabled
+                        && let Some(cached) = &self.sealed
+                        && cached.identity() == &expected
+                    {
+                        cached.verify(|| self.stopped)?;
+                        self.replies.push_back(json!({"kind":"toolchain-ready",
+                            "request_id":id, "sha256":hex(&expected.sha256), "sealed":true}));
+                        return Ok(());
+                    }
+                    self.sealed = None;
                     self.receiver = Some(ToolchainReceiver::create(
-                        &self.owner.path().join("received"),
+                        &self
+                            .owner
+                            .path()
+                            .join(format!("received-{}", self.sent.len())),
                         expected,
                         ToolchainLimits::default(),
                     )?);
@@ -314,7 +362,20 @@ mod tests {
                 .ok_or_else(|| invalid("missing reply"))?;
             match self.fault {
                 Some("identity") => reply["sha256"] = json!("ab".repeat(32)),
+                Some("request") => reply["request_id"] = json!(999),
                 Some("extra") => reply["extra"] = json!(true),
+                Some("seal-type") => reply["sealed"] = json!("true"),
+                Some("upper-digest") => reply["sha256"] = json!("AB".repeat(32)),
+                Some("missing-digest") => {
+                    reply.as_object_mut().unwrap().remove("sha256");
+                }
+                Some("kind") => reply["kind"] = json!("source-ready"),
+                Some("lost-ready") if reply["kind"] == "toolchain-ready" => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "lost ready ACK",
+                    ));
+                }
                 Some("entry") if reply["kind"] == "toolchain-entry-accepted" => {
                     reply["path"] = json!("foreign")
                 }
@@ -344,7 +405,7 @@ mod tests {
         )
         .unwrap();
         let mut peer = ReceiverPeer::new();
-        upload.transmit(&mut peer, &request).unwrap();
+        upload.transmit(&mut peer, &request, false).unwrap();
         let received = peer.sealed.as_ref().unwrap();
         received.verify(|| false).unwrap();
         assert_eq!(received.identity(), upload.prepared.identity());
@@ -361,13 +422,154 @@ mod tests {
     }
 
     #[test]
+    fn reuse_selection_requires_supported_transfer_and_an_advertised_version() {
+        let root = tempfile::tempdir().unwrap();
+        let (upload, _, _) = fixture(root.path());
+        let hello = json!({"toolchain_transfers":[TOOLCHAIN_TRANSFER_VERSION]});
+        for advertised in [
+            None,
+            Some(Value::Null),
+            Some(json!([])),
+            Some(json!(["toolchain-reuse-v2"])),
+            Some(json!([TOOLCHAIN_REUSE_VERSION])),
+        ] {
+            let selected = advertised.as_ref() == Some(&json!([TOOLCHAIN_REUSE_VERSION]));
+            let mut offered = hello.clone();
+            if let Some(value) = advertised {
+                offered["toolchain_reuses"] = value;
+            }
+            let mut grant = json!({"kind":"session-ok"});
+            upload.select(&offered, &mut grant).unwrap();
+            assert_eq!(grant["toolchain_transfer"], TOOLCHAIN_TRANSFER_VERSION);
+            assert_eq!(grant.get("toolchain_reuse").is_some(), selected);
+            if selected {
+                assert_eq!(grant["toolchain_reuse"], TOOLCHAIN_REUSE_VERSION);
+            }
+            for value in [Value::Null, json!(true), json!("toolchain-reuse-v2")] {
+                let mut invalid = json!({"kind":"session-ok", "toolchain_reuse":value});
+                assert!(upload.select(&offered, &mut invalid).is_err());
+            }
+            if !selected {
+                let mut unsolicited =
+                    json!({"kind":"session-ok", "toolchain_reuse":TOOLCHAIN_REUSE_VERSION});
+                assert!(upload.select(&offered, &mut unsolicited).is_err());
+            }
+        }
+        let mut grant = json!({"kind":"session-ok"});
+        assert!(
+            upload
+                .select(
+                    &json!({"toolchain_reuses":[TOOLCHAIN_REUSE_VERSION]}),
+                    &mut grant
+                )
+                .is_err()
+        );
+        assert!(grant.get("toolchain_reuse").is_none());
+    }
+
+    #[test]
+    fn negotiated_receiver_warmth_skips_every_entry_chunk_and_seal() {
+        let root = tempfile::tempdir().unwrap();
+        let (upload, mut request, bytes) = fixture(root.path());
+        let mut peer = ReceiverPeer::new();
+        peer.reuse_enabled = true;
+        // A selected miss follows the complete bounded transfer protocol.
+        upload.transmit(&mut peer, &request, true).unwrap();
+        assert_eq!(peer.maximum_pending, CHUNK_WINDOW);
+        assert!(
+            peer.sent
+                .iter()
+                .any(|frame| frame["kind"] == "toolchain-chunk")
+        );
+        assert_eq!(peer.sent.last().unwrap()["kind"], "toolchain-seal");
+        let cold_end = peer.sent.len();
+        request["request_id"] = json!(1);
+        let original = serde_json::to_vec(&request).unwrap();
+        upload.transmit(&mut peer, &request, true).unwrap();
+        assert_eq!(peer.sent.len(), cold_end + 1);
+        assert_eq!(
+            peer.sent[cold_end],
+            json!({"kind":"toolchain-begin", "request_id":1,
+            "identity":request["toolchain_identity"], "entries":upload.entries.len()})
+        );
+        assert_eq!(serde_json::to_vec(&request).unwrap(), original);
+        assert_eq!(
+            fs::read(peer.sealed.as_ref().unwrap().root().join("rustc")).unwrap(),
+            bytes
+        );
+        assert!(peer.replies.is_empty());
+    }
+
+    #[test]
+    fn warm_reply_requires_negotiation_and_exact_identity_shape_and_boolean_seal() {
+        let root = tempfile::tempdir().unwrap();
+        let (upload, request, _) = fixture(root.path());
+        let mut peer = ReceiverPeer::new();
+        upload.transmit(&mut peer, &request, false).unwrap();
+        peer.reuse_enabled = true;
+        for fault in [
+            None,
+            Some("identity"),
+            Some("request"),
+            Some("extra"),
+            Some("seal-type"),
+            Some("upper-digest"),
+            Some("missing-digest"),
+            Some("kind"),
+            Some("lost-ready"),
+        ] {
+            peer.fault = fault;
+            let before = peer.sent.len();
+            // The unfaulted warm reply is still refused without selection.
+            assert!(
+                upload
+                    .transmit(&mut peer, &request, fault.is_some())
+                    .is_err(),
+                "{fault:?}"
+            );
+            assert_eq!(peer.sent.len(), before + 1);
+            assert_eq!(peer.sent[before]["kind"], "toolchain-begin");
+        }
+    }
+
+    #[test]
+    fn cancelled_or_corrupted_warm_verification_never_authorizes_more_frames() {
+        let root = tempfile::tempdir().unwrap();
+        let (upload, request, _) = fixture(root.path());
+        let mut peer = ReceiverPeer::new();
+        upload.transmit(&mut peer, &request, false).unwrap();
+        peer.reuse_enabled = true;
+        peer.stopped = true;
+        let before = peer.sent.len();
+        assert_eq!(
+            upload
+                .transmit(&mut peer, &request, true)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Interrupted
+        );
+        assert_eq!(peer.sent.len(), before + 1);
+        assert!(peer.replies.is_empty());
+        peer.stopped = false;
+        let compiler = peer.sealed.as_ref().unwrap().root().join("bin/compiler");
+        fs::set_permissions(&compiler, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(&compiler, b"changed cached bytes").unwrap();
+        assert!(upload.transmit(&mut peer, &request, true).is_err());
+        assert_eq!(peer.sent.len(), before + 2);
+        assert!(peer.replies.is_empty());
+    }
+
+    #[test]
     fn incorrect_or_lost_acknowledgments_never_complete_transfer() {
         let root = tempfile::tempdir().unwrap();
         let (upload, request, _) = fixture(root.path());
         for fault in ["identity", "extra", "entry", "offset", "lost-chunk", "seal"] {
             let mut peer = ReceiverPeer::new();
             peer.fault = Some(fault);
-            assert!(upload.transmit(&mut peer, &request).is_err(), "{fault}");
+            assert!(
+                upload.transmit(&mut peer, &request, false).is_err(),
+                "{fault}"
+            );
             if fault != "seal" {
                 assert!(peer.sealed.is_none(), "{fault}");
                 assert!(
@@ -393,7 +595,7 @@ mod tests {
         bytes[0] ^= 0xff;
         fs::write(&compiler, bytes).unwrap();
         let mut peer = ReceiverPeer::new();
-        assert!(upload.transmit(&mut peer, &request).is_err());
+        assert!(upload.transmit(&mut peer, &request, false).is_err());
         assert!(peer.sealed.is_none());
         assert!(
             peer.sent
