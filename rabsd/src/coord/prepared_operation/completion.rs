@@ -74,13 +74,13 @@ impl PreparedOperationStore {
         require(valid_id(id) && canonical_hash(request_sha256), "invalid completion identity")?;
         let record = {
             let state = self.lock_state()?;
-            let record = state.records.get(id)
+            let record = self.read_record(&state, id)?
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "prepared operation not found"))?;
             require(record.request_sha256 == request_sha256, "completion request identity changed")?;
             require(matches!(record.state, OperationState::Completed | OperationState::Cancelled)
                 && record.execution_may_have_run && !state.active.contains_key(id),
                 "prepared operation has no terminal delivered execution")?;
-            record.clone()
+            record
         };
         let pin = parse_worker_pin(&record.spec.worker_spki_sha256)?;
         ordinary_directory(&record.delivery, false)?;
@@ -115,7 +115,7 @@ impl PreparedOperationStore {
         // Explicit recovery can start while files are being checked. Do not
         // label that newer attempt with a previous terminal completion snapshot.
         let state = self.lock_state()?;
-        let current = state.records.get(id).ok_or_else(|| invalid("completion owner disappeared"))?;
+        let current = self.read_record(&state, id)?.ok_or_else(|| invalid("completion owner disappeared"))?;
         require(current.attempt == record.attempt && current.state == record.state
             && current.delivery == record.delivery && current.mode == record.mode
             && current.outputs_installed == record.outputs_installed
@@ -454,45 +454,76 @@ mod tests {
         let claim = active.store.claim_next().unwrap().unwrap();
         assert!(active.store.completion(ID, &active.digest).is_err());
         drop(claim);
-        assert_eq!(active.store.status(ID).unwrap().unwrap().state, OperationState::Uncertain);
+        assert_eq!(
+            active.store.status(ID).unwrap().unwrap().state,
+            OperationState::Uncertain
+        );
         assert!(active.store.completion(ID, &active.digest).is_err());
-        let completed = Fixture::new(); completed.complete(1,None);
+        let completed = Fixture::new();
+        completed.complete(1, None);
         assert!(completed.store.completion(ID, &"00".repeat(32)).is_err());
-        assert!(completed.store.completion(&"00".repeat(16), &completed.digest).is_err());
+        assert!(
+            completed
+                .store
+                .completion(&"00".repeat(16), &completed.digest)
+                .is_err()
+        );
     }
 
     #[test]
     fn receipt_substitution_links_and_expired_snapshot_refuse_before_replay() {
         for case in 0..4 {
-            let fixture = Fixture::new(); fixture.complete(1,None);
+            let fixture = Fixture::new();
+            fixture.complete(1, None);
             let proof = fixture.proof();
             let stdout = fixture.spec.delivery.join("diagnostics/stdout");
             match case {
-                0 => { fs::write(fixture.spec.delivery.join("delivery.json"), b"{}").unwrap(); },
-                1 => { fs::hard_link(&stdout, fixture.root.join("alias")).unwrap(); },
+                0 => {
+                    fs::write(fixture.spec.delivery.join("delivery.json"), b"{}").unwrap();
+                }
+                1 => {
+                    fs::hard_link(&stdout, fixture.root.join("alias")).unwrap();
+                }
                 2 => {
                     let retained = fixture.root.join("retained-stdout");
                     fs::rename(&stdout, &retained).unwrap();
                     std::os::unix::fs::symlink(&retained, &stdout).unwrap();
-                },
-                _ => {},
+                }
+                _ => {}
             }
-            assert!(proof.snapshot(if case == 3 {Instant::now()} else {deadline()}).is_err());
+            assert!(
+                proof
+                    .snapshot(if case == 3 {
+                        Instant::now()
+                    } else {
+                        deadline()
+                    })
+                    .is_err()
+            );
         }
     }
 
     #[test]
     fn completion_survives_store_restart_without_the_original_bundle() {
-        let fixture = Fixture::new(); fixture.complete(1,None);
+        let fixture = Fixture::new();
+        fixture.complete(1, None);
         let proof = fixture.proof();
         fs::rename(&fixture.spec.bundle, fixture.root.join("retired-bundle")).unwrap();
         drop(fixture.store);
         let reopened = PreparedOperationStore::open(&fixture.root.join("state")).unwrap();
         assert_eq!(reopened.completion(ID, &fixture.digest).unwrap(), proof);
         let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
-        proof.snapshot(deadline()).unwrap().emit(&mut stdout, &mut stderr, deadline()).unwrap();
-        assert_eq!(stdout, STDOUT); assert_eq!(stderr, STDERR);
-        assert!(reopened.claim_next().unwrap().is_none(), "replay must never enqueue a compiler");
+        proof
+            .snapshot(deadline())
+            .unwrap()
+            .emit(&mut stdout, &mut stderr, deadline())
+            .unwrap();
+        assert_eq!(stdout, STDOUT);
+        assert_eq!(stderr, STDERR);
+        assert!(
+            reopened.claim_next().unwrap().is_none(),
+            "replay must never enqueue a compiler"
+        );
     }
 
     #[test]
@@ -500,39 +531,76 @@ mod tests {
         struct Broken(usize);
         impl Write for Broken {
             fn write(&mut self, _: &[u8]) -> io::Result<usize> {
-                self.0 += 1; Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed console"))
+                self.0 += 1;
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed console"))
             }
-            fn flush(&mut self) -> io::Result<()> { Ok(()) }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
         }
-        let fixture = Fixture::new(); fixture.complete(1,None);
+        let fixture = Fixture::new();
+        fixture.complete(1, None);
         let snapshot = fixture.proof().snapshot(deadline()).unwrap();
         let (mut stdout, mut stderr) = (Broken(0), Vec::new());
-        assert_eq!(snapshot.emit(&mut stdout, &mut stderr, deadline()).unwrap_err().kind(), io::ErrorKind::BrokenPipe);
-        assert_eq!(stdout.0,1); assert!(stderr.is_empty());
-        assert_eq!(fixture.store.status(ID).unwrap().unwrap().state, OperationState::Completed);
+        assert_eq!(
+            snapshot
+                .emit(&mut stdout, &mut stderr, deadline())
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::BrokenPipe
+        );
+        assert_eq!(stdout.0, 1);
+        assert!(stderr.is_empty());
+        assert_eq!(
+            fixture.store.status(ID).unwrap().unwrap().state,
+            OperationState::Completed
+        );
     }
 
     #[test]
-    fn local_recovery_installs_stranded_outputs_without_the_bundle_and_retains_uncertainty_about_acks() {
+    fn local_recovery_installs_stranded_outputs_without_the_bundle_and_retains_uncertainty_about_acks()
+     {
         use std::os::unix::fs::MetadataExt;
-        let fixture = Fixture::new(); fixture.strand(0, None);
+        let fixture = Fixture::new();
+        fixture.strand(0, None);
         let receipt = fs::read(fixture.spec.delivery.join("delivery.json")).unwrap();
-        let source_inode = fs::metadata(fixture.spec.delivery.join("artifacts/app")).unwrap().ino();
+        let source_inode = fs::metadata(fixture.spec.delivery.join("artifacts/app"))
+            .unwrap()
+            .ino();
         fs::rename(&fixture.spec.bundle, fixture.root.join("retired-bundle")).unwrap();
-        let status = fixture.store.recover_local(ID, fixture.spec.delivery.clone()).unwrap();
+        let status = fixture
+            .store
+            .recover_local(ID, fixture.spec.delivery.clone())
+            .unwrap();
         assert!(status.succeeded && status.outputs_installed);
         assert_eq!(status.mode, "recover-local");
         assert_eq!(status.request_sha256, fixture.digest);
         assert!(status.listen_address.is_none());
         assert_eq!(status.acknowledgments_confirmed, Some(false));
-        assert!(status.detail.unwrap().contains("did not contact the worker"));
+        assert!(
+            status
+                .detail
+                .unwrap()
+                .contains("did not contact the worker")
+        );
         assert_eq!(fs::read(fixture.spec.output.join("app")).unwrap(), ARTIFACT);
-        assert_ne!(source_inode, fs::metadata(fixture.spec.output.join("app")).unwrap().ino());
-        assert_eq!(fs::read(fixture.spec.delivery.join("delivery.json")).unwrap(), receipt);
+        assert_ne!(
+            source_inode,
+            fs::metadata(fixture.spec.output.join("app")).unwrap().ino()
+        );
+        assert_eq!(
+            fs::read(fixture.spec.delivery.join("delivery.json")).unwrap(),
+            receipt
+        );
         let proof = fixture.proof();
         let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
-        proof.snapshot(deadline()).unwrap().emit(&mut stdout, &mut stderr, deadline()).unwrap();
-        assert_eq!(stdout, STDOUT); assert_eq!(stderr, STDERR);
+        proof
+            .snapshot(deadline())
+            .unwrap()
+            .emit(&mut stdout, &mut stderr, deadline())
+            .unwrap();
+        assert_eq!(stdout, STDOUT);
+        assert_eq!(stderr, STDERR);
 
         // Local completion does not free an uncertain remote reservation.
         let mut next = fixture.spec.clone();
@@ -541,21 +609,41 @@ mod tests {
         next.delivery = fixture.root.join("next-delivery");
         next.output = fixture.root.join("next-output");
         fs::create_dir(&next.bundle).unwrap();
-        let mut request = fixture.request.clone(); request["request_id"] = json!(8);
-        fs::write(next.bundle.join("request.json"), serde_json::to_vec(&request).unwrap()).unwrap();
+        let mut request = fixture.request.clone();
+        request["request_id"] = json!(8);
+        fs::write(
+            next.bundle.join("request.json"),
+            serde_json::to_vec(&request).unwrap(),
+        )
+        .unwrap();
         fixture.store.submit(next).unwrap();
         assert!(fixture.store.claim_next().unwrap().is_none());
     }
 
     #[test]
     fn local_recovery_preserves_failed_or_cancelled_compiler_diagnostics_without_installation() {
-        for (exit, stop) in [(17, None), (130, Some("cancelled")), (125, Some("lease-expired"))] {
-            let fixture = Fixture::new(); fixture.strand(exit, stop);
-            let status = fixture.store.recover_local(ID, fixture.spec.delivery.clone()).unwrap();
+        for (exit, stop) in [
+            (17, None),
+            (130, Some("cancelled")),
+            (125, Some("lease-expired")),
+        ] {
+            let fixture = Fixture::new();
+            fixture.strand(exit, stop);
+            let status = fixture
+                .store
+                .recover_local(ID, fixture.spec.delivery.clone())
+                .unwrap();
             assert_eq!(status.exit_code, Some(i32::from(exit)));
             assert_eq!(status.stop_reason.as_deref(), stop);
             assert!(!status.succeeded && !status.outputs_installed);
-            assert_eq!(status.state, if stop.is_some() {OperationState::Cancelled} else {OperationState::Completed});
+            assert_eq!(
+                status.state,
+                if stop.is_some() {
+                    OperationState::Cancelled
+                } else {
+                    OperationState::Completed
+                }
+            );
             assert!(!fixture.spec.output.exists());
             assert_eq!(fixture.proof().exit_code, exit);
             assert!(fixture.store.claim_next().unwrap().is_none());
@@ -565,28 +653,60 @@ mod tests {
     #[test]
     fn local_recovery_never_repairs_corrupt_deliveries_or_overwrites_conflicting_outputs() {
         for case in 0..5 {
-            let fixture = Fixture::new(); fixture.strand(0, None);
+            let fixture = Fixture::new();
+            fixture.strand(0, None);
             match case {
-                0 => fs::write(fixture.spec.delivery.join("artifacts/app"), b"corrupt artifact").unwrap(),
-                1 => fs::write(fixture.spec.delivery.join("diagnostics/stderr"), b"corrupt diagnostics").unwrap(),
-                2 => fs::rename(fixture.spec.delivery.join("delivery.json"), fixture.root.join("saved-receipt")).unwrap(),
+                0 => fs::write(
+                    fixture.spec.delivery.join("artifacts/app"),
+                    b"corrupt artifact",
+                )
+                .unwrap(),
+                1 => fs::write(
+                    fixture.spec.delivery.join("diagnostics/stderr"),
+                    b"corrupt diagnostics",
+                )
+                .unwrap(),
+                2 => fs::rename(
+                    fixture.spec.delivery.join("delivery.json"),
+                    fixture.root.join("saved-receipt"),
+                )
+                .unwrap(),
                 3 => {
                     let path = fixture.spec.delivery.join("delivery.json");
-                    let mut receipt: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+                    let mut receipt: Value =
+                        serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
                     receipt["worker_spki_sha256"] = json!("02".repeat(32));
                     fs::write(path, serde_json::to_vec(&receipt).unwrap()).unwrap();
                 }
                 _ => {
                     fs::create_dir(&fixture.spec.output).unwrap();
-                    fs::write(fixture.spec.output.join("app"), b"operator-owned different output").unwrap();
+                    fs::write(
+                        fixture.spec.output.join("app"),
+                        b"operator-owned different output",
+                    )
+                    .unwrap();
                 }
             }
             let artifact_before = fs::read(fixture.spec.delivery.join("artifacts/app")).unwrap();
-            assert!(fixture.store.recover_local(ID, fixture.spec.delivery.clone()).is_err(), "case {case}");
-            assert_eq!(fs::read(fixture.spec.delivery.join("artifacts/app")).unwrap(), artifact_before);
+            assert!(
+                fixture
+                    .store
+                    .recover_local(ID, fixture.spec.delivery.clone())
+                    .is_err(),
+                "case {case}"
+            );
+            assert_eq!(
+                fs::read(fixture.spec.delivery.join("artifacts/app")).unwrap(),
+                artifact_before
+            );
             if case == 4 {
-                assert_eq!(fs::read(fixture.spec.output.join("app")).unwrap(), b"operator-owned different output");
-            } else { assert!(!fixture.spec.output.exists()); }
+                assert_eq!(
+                    fs::read(fixture.spec.output.join("app")).unwrap(),
+                    b"operator-owned different output"
+                );
+            } else {
+                assert!(!fixture.spec.output.exists());
+            }
             let status = fixture.store.status(ID).unwrap().unwrap();
             assert_eq!(status.state, OperationState::Uncertain);
             assert!(status.execution_may_have_run);
@@ -599,12 +719,24 @@ mod tests {
     fn local_recovery_refuses_unowned_active_or_never_dispatched_jobs_without_mutation() {
         for case in 0..4 {
             let fixture = Fixture::new();
-            let claim = if case == 0 { fixture.store.claim_next().unwrap() } else { None };
-            if case == 2 { fixture.store.cancel(ID).unwrap(); }
-            if case == 3 { fixture.strand(0, None); }
+            let claim = if case == 0 {
+                fixture.store.claim_next().unwrap()
+            } else {
+                None
+            };
+            if case == 2 {
+                fixture.store.cancel(ID).unwrap();
+            }
+            if case == 3 {
+                fixture.strand(0, None);
+            }
             let record = fixture.root.join(format!("state/{ID}.json"));
             let before = fs::read(&record).unwrap();
-            let path = if case == 3 {fixture.root.join("unowned")} else {fixture.spec.delivery.clone()};
+            let path = if case == 3 {
+                fixture.root.join("unowned")
+            } else {
+                fixture.spec.delivery.clone()
+            };
             assert!(fixture.store.recover_local(ID, path).is_err());
             assert_eq!(fs::read(record).unwrap(), before);
             assert!(!fixture.spec.output.exists());
@@ -614,15 +746,27 @@ mod tests {
 
     #[test]
     fn local_recovery_can_select_an_earlier_owned_delivery_after_failed_remote_resume() {
-        let fixture = Fixture::new(); fixture.strand(0, None);
+        let fixture = Fixture::new();
+        fixture.strand(0, None);
         let later = fixture.root.join("later-delivery");
         fixture.store.resume(ID, later.clone(), None).unwrap();
         drop(fixture.store.claim_next().unwrap().unwrap());
-        let status = fixture.store.recover_local(ID, fixture.spec.delivery.clone()).unwrap();
+        let status = fixture
+            .store
+            .recover_local(ID, fixture.spec.delivery.clone())
+            .unwrap();
         assert!(status.succeeded);
         assert_eq!(status.delivery, fixture.spec.delivery);
-        let record: Value = serde_json::from_slice(&fs::read(fixture.root.join(format!("state/{ID}.json"))).unwrap()).unwrap();
-        assert!(record["prior_deliveries"].as_array().unwrap().contains(&json!(later)));
+        let record: Value = serde_json::from_slice(
+            &fs::read(fixture.root.join(format!("state/{ID}.json"))).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            record["prior_deliveries"]
+                .as_array()
+                .unwrap()
+                .contains(&json!(later))
+        );
         assert!(!later.exists());
     }
 
@@ -693,5 +837,145 @@ mod tests {
         assert!(status.execution_may_have_run);
         assert!(reopened.claim_next().unwrap().is_none());
         assert!(reopened.recover_local(ID, fixture.spec.delivery).unwrap().succeeded);
+    }
+
+    #[test]
+    fn archived_completion_replays_and_local_recovery_restores_without_source_or_execution() {
+        use crate::coord::prepared_operation::MAX_RETAINED_BYTES;
+        use std::os::unix::fs::MetadataExt;
+        let fixture = Fixture::new();
+        fixture.complete(0, None);
+        let proof = fixture.proof();
+        let inode = fs::metadata(fixture.spec.output.join("app")).unwrap().ino();
+        let receipt = fs::read(fixture.spec.delivery.join("delivery.json")).unwrap();
+        let archive = fixture.root.join(format!("state/archive/{ID}.json"));
+        {
+            let mut state = fixture.store.lock_state().unwrap();
+            fixture
+                .store
+                .make_room(&mut state, MAX_RETAINED_BYTES)
+                .unwrap();
+            assert!(state.records.is_empty());
+        }
+        fs::rename(&fixture.spec.bundle, fixture.root.join("retired-bundle")).unwrap();
+        assert_eq!(
+            fixture.proof(),
+            proof,
+            "archival preserves the complete delivery proof"
+        );
+        let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+        fixture
+            .proof()
+            .snapshot(deadline())
+            .unwrap()
+            .emit(&mut stdout, &mut stderr, deadline())
+            .unwrap();
+        assert_eq!(stdout, STDOUT);
+        assert_eq!(stderr, STDERR);
+        assert!(archive.is_file());
+        assert!(fixture.store.claim_next().unwrap().is_none());
+        drop(fixture.store);
+
+        let reopened = PreparedOperationStore::open(&fixture.root.join("state")).unwrap();
+        assert_eq!(reopened.completion(ID, &fixture.digest).unwrap(), proof);
+        let status = reopened
+            .recover_local(ID, fixture.spec.delivery.clone())
+            .unwrap();
+        assert!(status.succeeded && status.outputs_installed);
+        assert_eq!(status.acknowledgments_confirmed, Some(true));
+        assert_eq!(status.mode, "recover-local");
+        assert_eq!(status.attempt, 2);
+        assert!(reopened.lock_state().unwrap().records.contains_key(ID));
+        assert!(
+            !archive.exists(),
+            "one durable record moves back to live ownership"
+        );
+        assert_eq!(
+            fs::metadata(fixture.spec.output.join("app")).unwrap().ino(),
+            inode
+        );
+        assert_eq!(
+            fs::read(fixture.spec.delivery.join("delivery.json")).unwrap(),
+            receipt
+        );
+        assert!(reopened.claim_next().unwrap().is_none());
+        {
+            let mut state = reopened.lock_state().unwrap();
+            reopened.make_room(&mut state, MAX_RETAINED_BYTES).unwrap();
+        }
+        let archived: Value = serde_json::from_slice(&fs::read(&archive).unwrap()).unwrap();
+        assert_eq!(archived["attempt"], 2);
+        assert_eq!(archived["mode"], "local_recovery");
+        assert_eq!(reopened.completion(ID, &fixture.digest).unwrap(), proof);
+        assert!(reopened.claim_next().unwrap().is_none());
+    }
+
+    #[test]
+    fn archival_restore_crashes_never_queue_an_execution_or_replace_installed_outputs() {
+        use crate::coord::prepared_operation::MAX_RETAINED_BYTES;
+        use std::os::unix::fs::MetadataExt;
+        use std::sync::atomic::Ordering;
+        for after_running in [false, true] {
+            let fixture = Fixture::new();
+            fixture.complete(0, None);
+            let inode = fs::metadata(fixture.spec.output.join("app")).unwrap().ino();
+            {
+                let mut state = fixture.store.lock_state().unwrap();
+                fixture
+                    .store
+                    .make_room(&mut state, MAX_RETAINED_BYTES)
+                    .unwrap();
+            }
+            // These are distinct durable boundaries: the terminal record moves
+            // back first; only then can the local owner persist Running.
+            if after_running {
+                fixture
+                    .store
+                    .fail_after_rename
+                    .store(true, Ordering::SeqCst);
+            } else {
+                fixture
+                    .store
+                    .fail_after_archive_rename
+                    .store(true, Ordering::SeqCst);
+            }
+            assert!(
+                fixture
+                    .store
+                    .recover_local(ID, fixture.spec.delivery.clone())
+                    .is_err()
+            );
+            assert!(fixture.store.claim_next().is_err());
+            assert_eq!(
+                fs::metadata(fixture.spec.output.join("app")).unwrap().ino(),
+                inode
+            );
+            assert_eq!(fs::read(fixture.spec.output.join("app")).unwrap(), ARTIFACT);
+            drop(fixture.store);
+
+            let reopened = PreparedOperationStore::open(&fixture.root.join("state")).unwrap();
+            let status = reopened.status(ID).unwrap().unwrap();
+            assert_eq!(
+                status.state,
+                if after_running {
+                    OperationState::Uncertain
+                } else {
+                    OperationState::Completed
+                }
+            );
+            assert_eq!(status.attempt, if after_running { 2 } else { 1 });
+            assert!(reopened.claim_next().unwrap().is_none());
+            assert!(
+                reopened
+                    .recover_local(ID, fixture.spec.delivery.clone())
+                    .unwrap()
+                    .succeeded
+            );
+            assert_eq!(
+                fs::metadata(fixture.spec.output.join("app")).unwrap().ino(),
+                inode
+            );
+            assert!(reopened.claim_next().unwrap().is_none());
+        }
     }
 }

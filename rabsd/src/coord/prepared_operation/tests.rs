@@ -1227,3 +1227,868 @@ fn store_paths_are_private_and_symlink_aliases_are_rejected() {
     symlink(&retained, &request).unwrap();
     assert!(store.submit(third).is_err());
 }
+
+#[test]
+fn capacity_rollover_preserves_cancelled_jobs_while_admitting_new_work() {
+    let fixture = Fixture::new();
+    let original = fixture.spec(200, 1);
+    let store = fixture.open();
+    let mut first_status = None;
+    let mut submitted = Vec::new();
+    let mut admissions_after_archive = 0;
+    for sequence in 200..200 + MAX_OPERATIONS as u64 + 4 {
+        // The same immutable source bundle may be submitted with independent
+        // operation IDs and destinations. Every job is cancelled before claim;
+        // this tests admission accounting, without inventing worker executions.
+        let mut spec = original.clone();
+        spec.id = format!("{sequence:032x}");
+        spec.delivery = fixture.root.join(format!("delivery-{sequence}"));
+        spec.output = fixture.root.join(format!("output-{sequence}"));
+        store.submit(spec.clone()).unwrap();
+        let cancelled = store.cancel(&spec.id).unwrap();
+        assert_eq!(cancelled.state, OperationState::Cancelled);
+        assert!(!cancelled.execution_may_have_run);
+        first_status.get_or_insert_with(|| serde_json::to_value(&cancelled).unwrap());
+        submitted.push(spec.id);
+        if fixture
+            .store_root
+            .join("archive")
+            .join(format!("{}.json", original.id))
+            .is_file()
+        {
+            admissions_after_archive += 1;
+            if admissions_after_archive == 4 {
+                break;
+            }
+        }
+    }
+    assert_eq!(
+        admissions_after_archive, 4,
+        "real submissions must continue after capacity is reclaimed"
+    );
+    {
+        let state = store.lock_state().unwrap();
+        assert!(state.records.len() < submitted.len());
+        assert!(state.records.len() <= MAX_OPERATIONS);
+        assert!(state.retained_bytes <= MAX_RETAINED_BYTES);
+        assert_eq!(
+            state.retained_bytes,
+            state
+                .records
+                .values()
+                .map(|record| record.weight().unwrap())
+                .sum::<usize>()
+        );
+    }
+    assert_eq!(
+        serde_json::to_value(store.submit(original.clone()).unwrap()).unwrap(),
+        first_status.clone().unwrap()
+    );
+    assert!(store.claim_next().unwrap().is_none());
+    drop(store);
+
+    let reopened = fixture.open();
+    for id in &submitted {
+        let status = reopened.status(id).unwrap().unwrap();
+        assert_eq!(status.state, OperationState::Cancelled);
+        assert!(!status.execution_may_have_run);
+    }
+    assert_eq!(
+        serde_json::to_value(reopened.submit(original).unwrap()).unwrap(),
+        first_status.unwrap()
+    );
+    assert!(reopened.claim_next().unwrap().is_none());
+}
+
+#[test]
+fn archival_pressure_selects_oldest_resolved_jobs_and_keeps_queued_work() {
+    let fixture = Fixture::new();
+    let first = fixture.spec(210, 1);
+    let queued = fixture.spec(211, 2);
+    let cancelled = fixture.spec(212, 3);
+    let last = fixture.spec(213, 4);
+    let store = fixture.open();
+    store.submit(first.clone()).unwrap();
+    let claim = store.claim_next().unwrap().unwrap();
+    let result = adapter_result(&claim, 101, Value::Null, true);
+    claim
+        .finish(OperationOutcome::Completed { result })
+        .unwrap();
+    store.submit(queued.clone()).unwrap();
+    store.submit(cancelled.clone()).unwrap();
+    store.cancel(&cancelled.id).unwrap();
+    store.submit(last.clone()).unwrap();
+    store.cancel(&last.id).unwrap();
+
+    {
+        let mut state = store.lock_state().unwrap();
+        let remaining = state.retained_bytes - state.records[&first.id].weight().unwrap();
+        // Apply a prospective admission budget to a small real store. This
+        // isolates which record is retired, without manufacturing record state.
+        store
+            .make_room(&mut state, MAX_RETAINED_BYTES - remaining)
+            .unwrap();
+        assert!(!state.records.contains_key(&first.id));
+        for spec in [&queued, &cancelled, &last] {
+            assert!(state.records.contains_key(&spec.id));
+        }
+        assert_eq!(state.retained_bytes, remaining);
+        let remaining =
+            state.records[&queued.id].weight().unwrap() + state.records[&last.id].weight().unwrap();
+        store
+            .make_room(&mut state, MAX_RETAINED_BYTES - remaining)
+            .unwrap();
+        assert!(!state.records.contains_key(&cancelled.id));
+        assert!(state.records.contains_key(&queued.id));
+        assert!(state.records.contains_key(&last.id));
+        assert_eq!(state.retained_bytes, remaining);
+    }
+    assert_eq!(
+        store.status(&first.id).unwrap().unwrap().exit_code,
+        Some(101)
+    );
+    assert_eq!(
+        store.status(&cancelled.id).unwrap().unwrap().state,
+        OperationState::Cancelled
+    );
+    let claim = store.claim_next().unwrap().unwrap();
+    assert_eq!(claim.spec().id, queued.id);
+    fail_before_dispatch(claim);
+    assert!(store.claim_next().unwrap().is_none());
+}
+
+#[test]
+fn archived_identity_and_terminal_status_survive_resubmission_and_restart() {
+    let fixture = Fixture::new();
+    let spec = fixture.spec(220, 1);
+    let original = prepared_request(&spec);
+    let store = fixture.open();
+    store.submit(spec.clone()).unwrap();
+    let claim = store.claim_next().unwrap().unwrap();
+    let result = adapter_result(&claim, 0, Value::Null, true);
+    let completed = claim
+        .finish(OperationOutcome::Completed { result })
+        .unwrap();
+    let expected = serde_json::to_value(&completed).unwrap();
+    let original_record = fs::read(fixture.store_root.join(format!("{}.json", spec.id))).unwrap();
+    {
+        let mut state = store.lock_state().unwrap();
+        store.make_room(&mut state, MAX_RETAINED_BYTES).unwrap();
+        assert!(state.records.is_empty());
+        assert_eq!(state.retained_bytes, 0);
+    }
+    let archived = fixture
+        .store_root
+        .join("archive")
+        .join(format!("{}.json", spec.id));
+    assert_eq!(fs::read(&archived).unwrap(), original_record);
+    assert!(
+        !fixture
+            .store_root
+            .join(format!("{}.json", spec.id))
+            .exists()
+    );
+    assert_eq!(
+        serde_json::to_value(store.status(&spec.id).unwrap().unwrap()).unwrap(),
+        expected
+    );
+    assert_eq!(
+        serde_json::to_value(store.submit(spec.clone()).unwrap()).unwrap(),
+        expected
+    );
+    assert_eq!(
+        serde_json::to_value(store.cancel(&spec.id).unwrap()).unwrap(),
+        expected
+    );
+    let mut changed_destination = spec.clone();
+    changed_destination.output = fixture.root.join("different-archived-output");
+    assert!(store.submit(changed_destination).is_err());
+    let mut changed_request = original.clone();
+    changed_request["args"][0] = json!("different.rs");
+    fs::write(
+        spec.bundle.join("request.json"),
+        serde_json::to_vec(&changed_request).unwrap(),
+    )
+    .unwrap();
+    assert!(store.submit(spec.clone()).is_err());
+    fs::write(
+        spec.bundle.join("request.json"),
+        serde_json::to_vec(&original).unwrap(),
+    )
+    .unwrap();
+    assert!(store.claim_next().unwrap().is_none());
+    drop(store);
+
+    let reopened = fixture.open();
+    assert_eq!(
+        serde_json::to_value(reopened.status(&spec.id).unwrap().unwrap()).unwrap(),
+        expected
+    );
+    assert_eq!(
+        serde_json::to_value(reopened.submit(spec.clone()).unwrap()).unwrap(),
+        expected
+    );
+    assert!(reopened.lock_state().unwrap().records.is_empty());
+    assert!(reopened.claim_next().unwrap().is_none());
+    assert_eq!(fs::read(archived).unwrap(), original_record);
+}
+
+#[test]
+fn archived_current_and_prior_destinations_still_exclude_submit_and_resume() {
+    let fixture = Fixture::new();
+    let archived = fixture.spec(230, 1);
+    let next = fixture.spec(231, 2);
+    let store = fixture.open();
+    store.submit(archived.clone()).unwrap();
+    uncertain(store.claim_next().unwrap().unwrap());
+    let resumed_delivery = fixture.root.join("archived-resumed-delivery");
+    store
+        .resume(&archived.id, resumed_delivery.clone(), None)
+        .unwrap();
+    let claim = store.claim_next().unwrap().unwrap();
+    let result = adapter_result(&claim, 101, Value::Null, true);
+    claim
+        .finish(OperationOutcome::Completed { result })
+        .unwrap();
+    {
+        let mut state = store.lock_state().unwrap();
+        store.make_room(&mut state, MAX_RETAINED_BYTES).unwrap();
+    }
+    let reserved = [&archived.delivery, &resumed_delivery, &archived.output];
+    for destination in reserved {
+        for use_output in [false, true] {
+            let mut collision = next.clone();
+            if use_output {
+                collision.output = destination.clone();
+            } else {
+                collision.delivery = destination.clone();
+            }
+            let error = store.submit(collision).unwrap_err();
+            assert!(
+                error.to_string().contains("overlap"),
+                "wrong refusal: {error}"
+            );
+        }
+    }
+    let mut source_collision = next.clone();
+    source_collision.output = archived.bundle.join("source/new-output");
+    let error = store.submit(source_collision).unwrap_err();
+    assert!(
+        error.to_string().contains("overlap"),
+        "wrong refusal: {error}"
+    );
+    store.submit(next.clone()).unwrap();
+    uncertain(store.claim_next().unwrap().unwrap());
+    for destination in reserved {
+        let error = store
+            .resume(&next.id, destination.clone(), None)
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("overlap"),
+            "wrong refusal: {error}"
+        );
+    }
+    assert_eq!(
+        store.status(&next.id).unwrap().unwrap().state,
+        OperationState::Uncertain
+    );
+    assert!(store.claim_next().unwrap().is_none());
+    drop(store);
+
+    let reopened = fixture.open();
+    let error = reopened
+        .resume(&next.id, archived.delivery, None)
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("overlap"),
+        "wrong refusal after restart: {error}"
+    );
+    assert!(reopened.claim_next().unwrap().is_none());
+}
+
+#[test]
+fn archival_pressure_preserves_every_unresolved_operation() {
+    for case in [
+        "queued",
+        "running",
+        "cancelling",
+        "uncertain",
+        "ack-pending",
+        "cancelled-ack-pending",
+        "queued-recovery",
+    ] {
+        let fixture = Fixture::new();
+        let spec = fixture.spec(240, 1);
+        let store = fixture.open();
+        store.submit(spec.clone()).unwrap();
+        let active = match case {
+            "queued" => None,
+            "running" => Some(store.claim_next().unwrap().unwrap()),
+            "cancelling" => {
+                let claim = store.claim_next().unwrap().unwrap();
+                store.cancel(&spec.id).unwrap();
+                Some(claim)
+            }
+            "uncertain" => {
+                uncertain(store.claim_next().unwrap().unwrap());
+                None
+            }
+            "ack-pending" | "cancelled-ack-pending" => {
+                let claim = store.claim_next().unwrap().unwrap();
+                let stop = if case == "ack-pending" {
+                    Value::Null
+                } else {
+                    json!("cancelled")
+                };
+                let result = adapter_result(&claim, 130, stop, false);
+                claim
+                    .finish(OperationOutcome::Completed { result })
+                    .unwrap();
+                None
+            }
+            "queued-recovery" => {
+                uncertain(store.claim_next().unwrap().unwrap());
+                store
+                    .resume(&spec.id, fixture.root.join("pending-resume"), None)
+                    .unwrap();
+                None
+            }
+            _ => unreachable!(),
+        };
+        let before = serde_json::to_value(store.status(&spec.id).unwrap().unwrap()).unwrap();
+        {
+            let mut state = store.lock_state().unwrap();
+            let weight = state.retained_bytes;
+            assert!(!state.records[&spec.id].archivable(), "case: {case}");
+            assert!(
+                store.make_room(&mut state, MAX_RETAINED_BYTES).is_err(),
+                "case: {case}"
+            );
+            assert!(state.records.contains_key(&spec.id), "case: {case}");
+            assert_eq!(state.retained_bytes, weight, "case: {case}");
+        }
+        assert!(
+            !fixture
+                .store_root
+                .join("archive")
+                .join(format!("{}.json", spec.id))
+                .exists(),
+            "case: {case}"
+        );
+        assert_eq!(
+            serde_json::to_value(store.status(&spec.id).unwrap().unwrap()).unwrap(),
+            before,
+            "case: {case}"
+        );
+        if let Some(claim) = active {
+            if case == "running" {
+                assert!(!claim.cancellation().is_cancelled());
+            }
+            drop(claim);
+        }
+    }
+}
+
+#[test]
+fn failure_after_archive_rename_fences_admission_and_reopens_without_reexecution() {
+    let fixture = Fixture::new();
+    let completed = fixture.spec(250, 1);
+    let running = fixture.spec(251, 2);
+    let store = fixture.open();
+    store.submit(completed.clone()).unwrap();
+    let claim = store.claim_next().unwrap().unwrap();
+    let result = adapter_result(&claim, 0, Value::Null, true);
+    let completed_status = claim
+        .finish(OperationOutcome::Completed { result })
+        .unwrap();
+    store.submit(running.clone()).unwrap();
+    let active = store.claim_next().unwrap().unwrap();
+    let cancellation = active.cancellation();
+    store
+        .fail_after_archive_rename
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    {
+        let mut state = store.lock_state().unwrap();
+        let remaining = state.records[&running.id].weight().unwrap();
+        assert!(
+            store
+                .make_room(&mut state, MAX_RETAINED_BYTES - remaining)
+                .is_err()
+        );
+    }
+    assert!(cancellation.is_cancelled());
+    assert!(store.status(&completed.id).is_err());
+    assert!(store.submit(completed.clone()).is_err());
+    assert!(store.claim_next().is_err());
+    assert!(
+        fixture
+            .store_root
+            .join("archive")
+            .join(format!("{}.json", completed.id))
+            .is_file()
+    );
+    assert!(
+        !fixture
+            .store_root
+            .join(format!("{}.json", completed.id))
+            .exists()
+    );
+    drop(active);
+    drop(store);
+
+    let reopened = fixture.open();
+    assert_eq!(
+        serde_json::to_value(reopened.status(&completed.id).unwrap().unwrap()).unwrap(),
+        serde_json::to_value(completed_status).unwrap()
+    );
+    assert_eq!(
+        reopened.status(&running.id).unwrap().unwrap().state,
+        OperationState::Uncertain
+    );
+    assert_eq!(
+        reopened.submit(completed).unwrap().state,
+        OperationState::Completed
+    );
+    assert!(reopened.claim_next().unwrap().is_none());
+}
+
+#[test]
+fn observed_cancellation_becomes_archivable_after_release_acknowledgment() {
+    let fixture = Fixture::new();
+    let spec = fixture.spec(260, 1);
+    let store = fixture.open();
+    store.submit(spec.clone()).unwrap();
+    let claim = store.claim_next().unwrap().unwrap();
+    store.cancel(&spec.id).unwrap();
+    let result = adapter_result(&claim, 130, json!("cancelled"), false);
+    claim
+        .finish(OperationOutcome::Cancelled { result })
+        .unwrap();
+    {
+        let mut state = store.lock_state().unwrap();
+        assert!(store.make_room(&mut state, MAX_RETAINED_BYTES).is_err());
+        assert!(state.records.contains_key(&spec.id));
+    }
+    fs::create_dir(&spec.delivery).unwrap();
+    store.acknowledge(&spec.id, spec.delivery.clone()).unwrap();
+    let acknowledgment = store.claim_next().unwrap().unwrap();
+    assert!(acknowledgment.acknowledgment_only());
+    let result = adapter_result(&acknowledgment, 130, json!("cancelled"), true);
+    acknowledgment
+        .finish(OperationOutcome::Cancelled { result })
+        .unwrap();
+    {
+        let mut state = store.lock_state().unwrap();
+        store.make_room(&mut state, MAX_RETAINED_BYTES).unwrap();
+        assert!(state.records.is_empty());
+        assert_eq!(state.retained_bytes, 0);
+    }
+    drop(store);
+
+    let reopened = fixture.open();
+    let status = reopened.status(&spec.id).unwrap().unwrap();
+    assert_eq!(status.state, OperationState::Cancelled);
+    assert_eq!(status.acknowledgments_confirmed, Some(true));
+    assert!(status.execution_may_have_run);
+    assert_eq!(status.exit_code, Some(130));
+    assert!(!status.outputs_installed);
+    assert!(reopened.claim_next().unwrap().is_none());
+}
+
+#[test]
+fn corrupt_archived_identity_or_unresolved_state_blocks_lookup_admission_and_restart() {
+    for corruption in ["request", "fingerprint", "unresolved"] {
+        let fixture = Fixture::new();
+        let spec = fixture.spec(270, 1);
+        let next = fixture.spec(271, 2);
+        let store = fixture.open();
+        store.submit(spec.clone()).unwrap();
+        let claim = store.claim_next().unwrap().unwrap();
+        let result = adapter_result(&claim, 0, Value::Null, true);
+        claim
+            .finish(OperationOutcome::Completed { result })
+            .unwrap();
+        {
+            let mut state = store.lock_state().unwrap();
+            store.make_room(&mut state, MAX_RETAINED_BYTES).unwrap();
+        }
+        let path = fixture
+            .store_root
+            .join("archive")
+            .join(format!("{}.json", spec.id));
+        let mut record: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        match corruption {
+            "request" => record["request"]["args"][0] = json!("different-source.rs"),
+            "fingerprint" => record["request_sha256"] = json!("cd".repeat(32)),
+            "unresolved" => record["state"] = json!("uncertain"),
+            _ => unreachable!(),
+        }
+        let corrupted = serde_json::to_vec(&record).unwrap();
+        fs::write(&path, &corrupted).unwrap();
+        assert!(store.status(&spec.id).is_err(), "corruption: {corruption}");
+        assert!(
+            store.submit(spec.clone()).is_err(),
+            "corruption: {corruption}"
+        );
+        assert!(
+            store.submit(next.clone()).is_err(),
+            "corruption: {corruption}"
+        );
+        assert!(store.status(&next.id).unwrap().is_none());
+        assert!(store.claim_next().unwrap().is_none());
+        assert_eq!(fs::read(&path).unwrap(), corrupted);
+        drop(store);
+
+        assert!(
+            PreparedOperationStore::open(&fixture.store_root).is_err(),
+            "corruption: {corruption}"
+        );
+        assert_eq!(fs::read(&path).unwrap(), corrupted);
+        assert!(
+            !fixture
+                .store_root
+                .join(format!("{}.json", spec.id))
+                .exists()
+        );
+        assert!(
+            !fixture
+                .store_root
+                .join(format!("{}.json", next.id))
+                .exists()
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinked_archive_records_and_directories_refuse_without_touching_targets() {
+    use std::os::unix::fs::symlink;
+
+    for directory_alias in [false, true] {
+        let fixture = Fixture::new();
+        let spec = fixture.spec(280, 1);
+        let next = fixture.spec(281, 2);
+        let store = fixture.open();
+        store.submit(spec.clone()).unwrap();
+        store.cancel(&spec.id).unwrap();
+        {
+            let mut state = store.lock_state().unwrap();
+            store.make_room(&mut state, MAX_RETAINED_BYTES).unwrap();
+        }
+        let archive = fixture.store_root.join("archive");
+        let original = archive.join(format!("{}.json", spec.id));
+        let original_bytes = fs::read(&original).unwrap();
+        let marker_bytes = b"archive alias must never write this target\0\xff";
+        let (link, retained_record, marker) = if directory_alias {
+            let retained_archive = fixture.store_root.join("saved-archive");
+            fs::rename(&archive, &retained_archive).unwrap();
+            let marker = retained_archive.join("marker");
+            fs::write(&marker, marker_bytes).unwrap();
+            symlink(&retained_archive, &archive).unwrap();
+            (
+                archive,
+                retained_archive.join(format!("{}.json", spec.id)),
+                marker,
+            )
+        } else {
+            let retained_record = fixture.root.join("saved-archive-record.json");
+            fs::rename(&original, &retained_record).unwrap();
+            let marker = fixture.root.join("archive-link-marker");
+            fs::write(&marker, marker_bytes).unwrap();
+            symlink(&marker, &original).unwrap();
+            (original, retained_record, marker)
+        };
+        assert!(store.status(&spec.id).is_err());
+        assert!(store.submit(spec.clone()).is_err());
+        assert!(store.submit(next.clone()).is_err());
+        assert!(store.claim_next().unwrap().is_none());
+        assert_eq!(fs::read(&marker).unwrap(), marker_bytes);
+        assert_eq!(fs::read(&retained_record).unwrap(), original_bytes);
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        drop(store);
+
+        assert!(PreparedOperationStore::open(&fixture.store_root).is_err());
+        assert_eq!(fs::read(&marker).unwrap(), marker_bytes);
+        assert_eq!(fs::read(&retained_record).unwrap(), original_bytes);
+        assert!(fs::symlink_metadata(link).unwrap().file_type().is_symlink());
+        assert!(
+            !fixture
+                .store_root
+                .join(format!("{}.json", next.id))
+                .exists()
+        );
+    }
+}
+
+#[test]
+fn conflicting_archive_destination_preserves_both_records_and_fences_the_store() {
+    let fixture = Fixture::new();
+    let completed = fixture.spec(290, 1);
+    let running = fixture.spec(291, 2);
+    let store = fixture.open();
+    store.submit(completed.clone()).unwrap();
+    store.cancel(&completed.id).unwrap();
+    store.submit(running.clone()).unwrap();
+    let active = store.claim_next().unwrap().unwrap();
+    let cancellation = active.cancellation();
+    let source = fixture.store_root.join(format!("{}.json", completed.id));
+    let destination = fixture
+        .store_root
+        .join("archive")
+        .join(format!("{}.json", completed.id));
+    let source_bytes = fs::read(&source).unwrap();
+    let mut conflicting: Value = serde_json::from_slice(&source_bytes).unwrap();
+    conflicting["spec"]["output"] = json!(fixture.root.join("conflicting-archive-output"));
+    let conflicting_bytes = serde_json::to_vec(&conflicting).unwrap();
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut existing = options.open(&destination).unwrap();
+    existing.write_all(&conflicting_bytes).unwrap();
+    existing.sync_all().unwrap();
+    drop(existing);
+    {
+        let mut state = store.lock_state().unwrap();
+        let remaining = state.records[&running.id].weight().unwrap();
+        assert!(
+            store
+                .make_room(&mut state, MAX_RETAINED_BYTES - remaining)
+                .is_err()
+        );
+    }
+    assert!(cancellation.is_cancelled());
+    assert!(store.status(&completed.id).is_err());
+    assert!(store.submit(completed.clone()).is_err());
+    assert!(store.claim_next().is_err());
+    assert_eq!(fs::read(&source).unwrap(), source_bytes);
+    assert_eq!(fs::read(&destination).unwrap(), conflicting_bytes);
+    drop(active);
+    drop(store);
+
+    assert!(PreparedOperationStore::open(&fixture.store_root).is_err());
+    assert_eq!(fs::read(source).unwrap(), source_bytes);
+    assert_eq!(fs::read(destination).unwrap(), conflicting_bytes);
+}
+
+#[test]
+fn failure_before_dispatch_archives_without_allowing_reexecution_or_local_recovery() {
+    let fixture = Fixture::new();
+    let spec = fixture.spec(300, 1);
+    let store = fixture.open();
+    store.submit(spec.clone()).unwrap();
+    fail_before_dispatch(store.claim_next().unwrap().unwrap());
+    let failed = store.status(&spec.id).unwrap().unwrap();
+    assert_eq!(failed.state, OperationState::FailedBeforeStart);
+    assert!(!failed.execution_may_have_run);
+    assert!(failed.exit_code.is_none());
+    let expected = serde_json::to_value(failed).unwrap();
+    let archived = fixture
+        .store_root
+        .join("archive")
+        .join(format!("{}.json", spec.id));
+    {
+        let mut state = store.lock_state().unwrap();
+        assert!(state.records[&spec.id].archivable());
+        store.make_room(&mut state, MAX_RETAINED_BYTES).unwrap();
+        assert!(state.records.is_empty());
+        assert_eq!(state.retained_bytes, 0);
+    }
+    let archived_bytes = fs::read(&archived).unwrap();
+    assert_eq!(
+        serde_json::to_value(store.submit(spec.clone()).unwrap()).unwrap(),
+        expected
+    );
+    assert!(
+        store
+            .recover_local(&spec.id, spec.delivery.clone())
+            .is_err()
+    );
+    assert!(store.claim_next().unwrap().is_none());
+    assert!(!spec.output.exists());
+    drop(store);
+
+    let reopened = fixture.open();
+    assert_eq!(
+        serde_json::to_value(reopened.status(&spec.id).unwrap().unwrap()).unwrap(),
+        expected
+    );
+    assert_eq!(
+        serde_json::to_value(reopened.submit(spec.clone()).unwrap()).unwrap(),
+        expected
+    );
+    assert!(reopened.recover_local(&spec.id, spec.delivery).is_err());
+    assert!(reopened.claim_next().unwrap().is_none());
+    assert!(reopened.lock_state().unwrap().records.is_empty());
+    assert_eq!(fs::read(archived).unwrap(), archived_bytes);
+    assert!(!spec.output.exists());
+}
+
+#[test]
+fn paused_archive_scan_leaves_queued_cancellation_responsive() {
+    let fixture = Fixture::new();
+    let archived = fixture.spec(310, 1);
+    let queued = fixture.spec(311, 2);
+    let store = fixture.open();
+    store.submit(archived.clone()).unwrap();
+    store.cancel(&archived.id).unwrap();
+    {
+        let mut state = store.lock_state().unwrap();
+        store.make_room(&mut state, MAX_RETAINED_BYTES).unwrap();
+    }
+    store.submit(queued.clone()).unwrap();
+    let (entered_send, entered_receive) = mpsc::channel();
+    let (release_send, release_receive) = mpsc::channel();
+    let scanner_store = Arc::clone(&store);
+    let scanner = std::thread::spawn(move || -> io::Result<()> {
+        let mut paused = false;
+        let state = scanner_store.lock_after_archived_check(|record| {
+            require(record.spec.id == archived.id, "unexpected archived fixture")?;
+            if !paused {
+                paused = true;
+                entered_send.send(()).map_err(io::Error::other)?;
+                release_receive
+                    .recv_timeout(Duration::from_secs(10))
+                    .map_err(io::Error::other)?;
+            }
+            Ok(())
+        })?;
+        drop(state);
+        Ok(())
+    });
+    let entered = entered_receive.recv_timeout(Duration::from_secs(5));
+    let (cancelled_send, cancelled_receive) = mpsc::channel();
+    let cancellation_store = Arc::clone(&store);
+    let queued_id = queued.id.clone();
+    let cancellation = std::thread::spawn(move || {
+        let result = cancellation_store.cancel(&queued_id);
+        cancelled_send.send(result).unwrap();
+    });
+    let cancelled_while_paused = cancelled_receive.recv_timeout(Duration::from_secs(3));
+    // Release and join both owners even on a failed deadline. A regression
+    // holding State during the visitor must fail this test rather than hang it.
+    let _ = release_send.send(());
+    let scan_result = scanner.join().unwrap();
+    cancellation.join().unwrap();
+    assert!(
+        entered.is_ok(),
+        "archive visitor did not reach the controlled pause"
+    );
+    assert!(
+        cancelled_while_paused.is_ok(),
+        "queued cancellation waited for an archive scan"
+    );
+    let status = cancelled_while_paused.unwrap().unwrap();
+    assert_eq!(status.state, OperationState::Cancelled);
+    assert!(!status.execution_may_have_run);
+    scan_result.unwrap();
+    assert_eq!(
+        store.status(&queued.id).unwrap().unwrap().state,
+        OperationState::Cancelled
+    );
+    assert!(store.claim_next().unwrap().is_none());
+}
+
+#[test]
+fn archive_move_during_scan_retries_before_accepting_a_destination_check() {
+    let fixture = Fixture::new();
+    let earlier = fixture.spec(320, 1);
+    let newly_archived = fixture.spec(321, 2);
+    let store = fixture.open();
+    store.submit(earlier.clone()).unwrap();
+    store.cancel(&earlier.id).unwrap();
+    {
+        let mut state = store.lock_state().unwrap();
+        store.make_room(&mut state, MAX_RETAINED_BYTES).unwrap();
+    }
+    let next_status = store.submit(newly_archived.clone()).unwrap();
+    store.cancel(&newly_archived.id).unwrap();
+    let (entered_send, entered_receive) = mpsc::channel();
+    let (release_send, release_receive) = mpsc::channel();
+    let scanner_store = Arc::clone(&store);
+    let scanner_id = newly_archived.id.clone();
+    let destination = newly_archived.output.clone();
+    let scanner = std::thread::spawn(move || {
+        let mut visits = 0;
+        let checked = scanner_store.lock_after_archived_check(|record| {
+            visits += 1;
+            if visits == 1 {
+                require(record.spec.id == earlier.id, "initial archive view changed")?;
+                entered_send.send(()).map_err(io::Error::other)?;
+                release_receive
+                    .recv_timeout(Duration::from_secs(10))
+                    .map_err(io::Error::other)?;
+                // End this pass deterministically: directory iterators need not
+                // expose an entry added while they were open. Revision checking
+                // must discard this stale refusal and scan the changed history.
+                return Err(invalid("initial archive view interrupted"));
+            }
+            if record
+                .paths()
+                .iter()
+                .any(|path| overlap(&destination, path))
+            {
+                require(
+                    record.spec.id == scanner_id
+                        && record.request_sha256 == next_status.request_sha256,
+                    "new archived path has the wrong operation identity",
+                )?;
+                return Err(invalid("newly archived destination remains reserved"));
+            }
+            Ok(())
+        });
+        let result = match checked {
+            Ok(state) => {
+                drop(state);
+                Ok(())
+            }
+            Err(error) => Err(error),
+        };
+        (result, visits)
+    });
+    let entered = entered_receive.recv_timeout(Duration::from_secs(5));
+    let (moved_send, moved_receive) = mpsc::channel();
+    let mover_store = Arc::clone(&store);
+    let mover = std::thread::spawn(move || {
+        let result = (|| -> io::Result<()> {
+            let mut state = mover_store.lock_state()?;
+            mover_store.make_room(&mut state, MAX_RETAINED_BYTES)
+        })();
+        moved_send.send(result).unwrap();
+    });
+    let moved_while_paused = moved_receive.recv_timeout(Duration::from_secs(3));
+    let _ = release_send.send(());
+    mover.join().unwrap();
+    let (scan_result, visits) = scanner.join().unwrap();
+    assert!(
+        entered.is_ok(),
+        "archive visitor did not reach the controlled pause"
+    );
+    assert!(
+        moved_while_paused.is_ok(),
+        "archival move waited for the archive visitor"
+    );
+    moved_while_paused.unwrap().unwrap();
+    assert!(visits >= 2, "changed archive must be visited again");
+    assert_eq!(
+        scan_result.unwrap_err().to_string(),
+        "newly archived destination remains reserved"
+    );
+    assert!(
+        fixture
+            .store_root
+            .join("archive")
+            .join(format!("{}.json", newly_archived.id))
+            .is_file()
+    );
+    assert!(store.lock_state().unwrap().records.is_empty());
+    assert!(store.claim_next().unwrap().is_none());
+}
