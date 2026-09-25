@@ -339,7 +339,7 @@ pub fn record_pack_member_locations(
 mod tests {
     use super::*;
     use crate::digest_set::{DigestRequest, digest_set};
-    use crate::metadata_store::{RusqliteEngine, SqlMetadataStore};
+    use crate::metadata_store::{FsqliteEngine, RusqliteEngine, SqlMetadataStore};
 
     fn id_of(bytes: &[u8]) -> TypedDigest {
         digest_set(bytes, DigestRequest::default(), None)
@@ -507,5 +507,101 @@ mod tests {
             .filter(|l| l.starts_with("action_"))
             .collect();
         assert_eq!(before_actions, after_actions);
+    }
+
+    #[test]
+    fn pack_reindex_preserves_quarantined_member_differential() {
+        fn scenario(
+            store: &mut dyn RabsMetadataStore,
+            pack_path: &str,
+            alternate_path: &str,
+        ) -> Vec<String> {
+            let base = members();
+            let pack = build_pack(&borrow(&base)).unwrap();
+            let index = PackIndex::parse(&pack).unwrap();
+            let digests: Vec<_> = base.iter().map(|(digest, _)| digest.clone()).collect();
+            std::fs::write(pack_path, &pack).unwrap();
+            record_pack_member_locations(store, pack_path, &index, &digests, true).unwrap();
+
+            let damaged = &digests[0];
+            let member = index
+                .members
+                .iter()
+                .find(|member| member.key == digest_key(damaged))
+                .unwrap();
+            let location = format!("{pack_path}#{}", member.offset);
+            let mut corrupted = pack.clone();
+            corrupted[usize::try_from(index.payload_start + member.offset).unwrap()] ^= 0xff;
+            std::fs::write(pack_path, &corrupted).unwrap();
+            assert_ne!(
+                id_of(index.member_bytes(&corrupted, damaged).unwrap()),
+                *damaged
+            );
+            store
+                .set_location_quarantined(damaged, &location, true)
+                .unwrap();
+
+            // Refreshing a previously parsed pack index does not read its
+            // payload. The actual file still holds corrupt bytes; reindexing
+            // must neither restore availability nor claim a repair.
+            record_pack_member_locations(store, pack_path, &index, &digests, true).unwrap();
+            assert_eq!(std::fs::read(pack_path).unwrap(), corrupted);
+            assert!(!store.object_located(damaged).unwrap());
+            assert!(!store.object_durably_located(damaged).unwrap());
+            assert!(store.object_locations(damaged).unwrap().is_empty());
+            for healthy in &digests[1..] {
+                assert!(store.object_durably_located(healthy).unwrap());
+            }
+
+            // A distinct pack with verified original bytes is a new copy,
+            // not a release of the original member's quarantine.
+            std::fs::write(alternate_path, &pack).unwrap();
+            let alternate_index = PackIndex::parse(&pack).unwrap();
+            assert_eq!(
+                id_of(alternate_index.member_bytes(&pack, damaged).unwrap()),
+                *damaged
+            );
+            record_pack_member_locations(store, alternate_path, &alternate_index, &digests, true)
+                .unwrap();
+            assert!(store.object_durably_located(damaged).unwrap());
+            assert_eq!(
+                store.object_locations(damaged).unwrap(),
+                vec![(
+                    format!("{alternate_path}#{}", member.offset),
+                    PACK_PROFILE_V1.to_owned(),
+                    true
+                )]
+            );
+            assert!(
+                store
+                    .reconciliation_scan()
+                    .unwrap()
+                    .iter()
+                    .any(|row| row.store_path == location && row.quarantined)
+            );
+            store.differential_snapshot().unwrap()
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let pack_path = directory.path().join("suspect.pack");
+        let alternate_path = directory.path().join("verified.pack");
+        let mut reference =
+            SqlMetadataStore::open(RusqliteEngine::open_in_memory().unwrap()).unwrap();
+        let mut candidate = SqlMetadataStore::open(
+            FsqliteEngine::open(&directory.path().join("metadata.db")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            scenario(
+                &mut reference,
+                pack_path.to_str().unwrap(),
+                alternate_path.to_str().unwrap()
+            ),
+            scenario(
+                &mut candidate,
+                pack_path.to_str().unwrap(),
+                alternate_path.to_str().unwrap()
+            )
+        );
     }
 }

@@ -23,9 +23,10 @@
 //!   — this module only names the cause; the protocol impl stays the
 //!   single authority on the verdict.
 //!
-//! Recovery requires the H012 repair flow to release the quarantine,
-//! followed by a NEW record at a higher revision without the reference.
-//! Ordinary trust reevaluation and failure revalidation are not repairs.
+//! Recovery requires the H012 repair flow to release the quarantine and
+//! its named references before a NEW record can authorize serving.
+//! Ordinary serving writes, trust reevaluation, and failure revalidation
+//! are not repairs.
 
 use rabs_protocol::result_identity::TypedDigest;
 use rabs_protocol::serving::ServingValidity;
@@ -653,7 +654,11 @@ mod tests {
 
         // Quarantining an unrelated action must not disable this one.
         store
-            .add_quarantine(QuarantineScope::ActionEntry, "other:key", "unrelated incident")
+            .add_quarantine(
+                QuarantineScope::ActionEntry,
+                "other:key",
+                "unrelated incident",
+            )
             .unwrap();
         assert_eq!(
             serving_gate(store, &action_key, 1_000, 0).unwrap(),
@@ -792,6 +797,27 @@ mod tests {
         // Dropping the junction reference at a newer revision is NOT
         // recovery: the durable incident is still unresolved. Only the
         // explicit repair flow may release that quarantine row.
+        let before = store.differential_snapshot().unwrap();
+        assert_eq!(
+            store.put_serving_record(
+                &active,
+                &action_key,
+                "servable",
+                3,
+                &validity(3_000, None, 0, 1),
+                &[],
+            ),
+            Err(StoreError::QuarantineRequiresRepair)
+        );
+        assert_eq!(store.differential_snapshot().unwrap(), before);
+        assert_eq!(
+            serving_gate(store, &action_key, 3_100, 1).unwrap(),
+            ServeDecision::Blocked {
+                references: vec![("action-entry".to_owned(), action_key.clone())],
+            }
+        );
+        // A normal renewal may retain the blocker while advancing its
+        // clock window. Its existence still forbids serving.
         store
             .put_serving_record(
                 &active,
@@ -799,22 +825,12 @@ mod tests {
                 "servable",
                 3,
                 &validity(3_000, None, 0, 1),
-                &[],
+                std::slice::from_ref(&reference),
             )
             .unwrap();
         assert_eq!(
-            serving_gate(store, &action_key, 3_100, 1).unwrap(),
-            ServeDecision::Blocked {
-                references: vec![("action-entry".to_owned(), action_key.clone())],
-            }
-        );
-        assert!(
-            store
-                .serving_record(&action_key)
-                .unwrap()
-                .unwrap()
-                .blocking
-                .is_empty()
+            store.serving_record(&action_key).unwrap().unwrap().blocking,
+            vec![("action-entry".to_owned(), action_key.clone())]
         );
 
         // A non-servable disposition gates before validity.
@@ -825,7 +841,7 @@ mod tests {
                 "evidence-pending",
                 4,
                 &validity(3_000, None, 0, 1),
-                &[],
+                std::slice::from_ref(&reference),
             )
             .unwrap();
         assert_eq!(
@@ -993,7 +1009,11 @@ mod tests {
             let (_, key) = published_fixture(&mut store);
             action_key = key;
             store
-                .add_quarantine(QuarantineScope::ActionEntry, &action_key, "interrupted demotion")
+                .add_quarantine(
+                    QuarantineScope::ActionEntry,
+                    &action_key,
+                    "interrupted demotion",
+                )
                 .unwrap();
         }
         let engine = RusqliteEngine::open(&path).unwrap();
@@ -1390,18 +1410,45 @@ mod tests {
         for signature in ["published", "diverged"] {
             assert_eq!(
                 apply_revalidation(
-                    store, &wrong_authority, &action_key, &action_typed,
-                    1, 20, 10, "published", signature,
-                    "manifest-a", "manifest-b", "ev-b", 1_100, 1, None,
+                    store,
+                    &wrong_authority,
+                    &action_key,
+                    &action_typed,
+                    1,
+                    20,
+                    10,
+                    "published",
+                    signature,
+                    "manifest-a",
+                    "manifest-b",
+                    "ev-b",
+                    1_100,
+                    1,
+                    None,
                 ),
-                Err(RevalidationError::Store(format!("{:?}", StoreError::NotActiveAuthority)))
+                Err(RevalidationError::Store(format!(
+                    "{:?}",
+                    StoreError::NotActiveAuthority
+                )))
             );
             assert_eq!(store.differential_snapshot().unwrap(), before);
             assert_eq!(
                 apply_revalidation(
-                    store, &active, &action_key, &wrong_action,
-                    1, 20, 10, "published", signature,
-                    "manifest-a", "manifest-b", "ev-b", 1_100, 1, None,
+                    store,
+                    &active,
+                    &action_key,
+                    &wrong_action,
+                    1,
+                    20,
+                    10,
+                    "published",
+                    signature,
+                    "manifest-a",
+                    "manifest-b",
+                    "ev-b",
+                    1_100,
+                    1,
+                    None,
                 ),
                 Err(RevalidationError::ActionKeyMismatch)
             );
@@ -1409,7 +1456,11 @@ mod tests {
         }
 
         store
-            .add_quarantine(QuarantineScope::LogicalObject, "object:damaged", "bad bytes")
+            .add_quarantine(
+                QuarantineScope::LogicalObject,
+                "object:damaged",
+                "bad bytes",
+            )
             .unwrap();
         store
             .add_quarantine(QuarantineScope::ActionEntry, &action_key, "operator hold")
@@ -1449,9 +1500,21 @@ mod tests {
             .collect();
         assert_eq!(
             apply_revalidation(
-                store, &active, &action_key, &action_typed,
-                2, 20, 10, "published", "diverged",
-                "manifest-a", "manifest-b", "ev-b", 1_200, 1, None,
+                store,
+                &active,
+                &action_key,
+                &action_typed,
+                2,
+                20,
+                10,
+                "published",
+                "diverged",
+                "manifest-a",
+                "manifest-b",
+                "ev-b",
+                1_200,
+                1,
+                None,
             ),
             Ok(RevalidationVerdict::SoundnessIncidentQuarantined {
                 incident_seq: 41,

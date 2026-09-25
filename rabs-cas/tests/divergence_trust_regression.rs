@@ -10,15 +10,16 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use rabs_cas::metadata_store::{
-    FsqliteEngine, RabsMetadataStore, RusqliteEngine, SqlEngine, SqlMetadataStore, SqlValue,
-    StoreError, digest_key,
+    FsqliteEngine, QuarantineScope, RabsMetadataStore, RusqliteEngine, SqlEngine, SqlMetadataStore,
+    SqlValue, StoreError, digest_key,
 };
 use rabs_cas::publication::{
     CommitDurabilityProfile, DISPOSITION_PRESENTATION_QUARANTINED, DIVERGENCE_EVIDENCE_PIN_CLASS,
     OfferPreparedActionResult, OfferRefusal, PublicationOutcome, authority_digest, process_offer,
 };
 use rabs_cas::serving_sample_gate::{
-    ActionClassRisk, SampleGateDecision, SamplingPolicy, serving_sample_decision,
+    ActionClassRisk, PrivateExecutionReason, SampleGateDecision, SamplingPolicy,
+    serving_sample_decision,
 };
 use rabs_cas::serving_state::{RevalidationError, ServeDecision, apply_revalidation, serving_gate};
 use rabs_cas::test_support::{
@@ -790,4 +791,208 @@ fn durable_incident_blocks_legacy_servable_projection_differential() {
         scenario(RusqliteEngine::open_in_memory().unwrap()),
         scenario(FsqliteEngine::open(&fresh_path("legacy-projection-fsq")).unwrap())
     );
+}
+
+/// Location and logical-object quarantines do not identify their dependent
+/// actions. The named reference is therefore essential even while a serving
+/// record has an otherwise eligible disposition and sufficient evidence.
+fn named_blocker_scenario(
+    store: &mut dyn RabsMetadataStore,
+    scope: QuarantineScope,
+    scope_name: &str,
+) -> Vec<String> {
+    install_ready_store(store);
+    let authority = authority_digest(&sample_coordinator_authority());
+    let action = sample_action_key();
+    let key = digest_key(&action);
+    let winner = sample_offer();
+    assert!(matches!(
+        process_offer(
+            store,
+            &winner,
+            &sample_expected_descriptor(),
+            |_| None,
+            900,
+            1,
+            CommitDurabilityProfile::RequireDurableClosure,
+            || 10,
+        )
+        .unwrap(),
+        PublicationOutcome::Committed(_)
+    ));
+    store
+        .record_verification_sample(&action, 20, true, 10)
+        .unwrap();
+    let validity = ServingValidity {
+        evaluated_at_unix_micros: 20,
+        maximum_age_micros: Some(100),
+        clock_uncertainty_micros: 0,
+        coordinator_clock_epoch: 0,
+    };
+    store
+        .put_serving_record(&authority, &key, DISPOSITION_SERVABLE, 1, &validity, &[])
+        .unwrap();
+    let policy = SamplingPolicy::sample_all(1, 10_000);
+
+    // A quarantine elsewhere must not become a global veto on valid hits.
+    let unrelated = (scope, "unrelated-copy".to_owned());
+    store
+        .add_quarantine(scope, &unrelated.1, "unrelated corruption")
+        .unwrap();
+    assert_eq!(
+        serving_gate(store, &key, 50, 0).unwrap(),
+        ServeDecision::Servable
+    );
+    assert_eq!(
+        serving_sample_decision(store, &action, ActionClassRisk::LowRiskRegistry, &policy).unwrap(),
+        SampleGateDecision::ServeFromCache
+    );
+
+    let output_key = digest_key(&winner.manifest.logical_outputs[0].object.0);
+    let subject = match scope {
+        QuarantineScope::Location => format!("/cas/{output_key}"),
+        QuarantineScope::LogicalObject => output_key,
+        QuarantineScope::ActionEntry => key.clone(),
+    };
+    let reference = (scope, subject.clone());
+    store
+        .add_quarantine(scope, &subject, "required output is quarantined")
+        .unwrap();
+    store
+        .put_serving_record(
+            &authority,
+            &key,
+            DISPOSITION_SERVABLE,
+            2,
+            &validity,
+            std::slice::from_ref(&reference),
+        )
+        .unwrap();
+    let blocked = ServeDecision::Blocked {
+        references: vec![(scope_name.to_owned(), subject.clone())],
+    };
+    assert_eq!(serving_gate(store, &key, 50, 0).unwrap(), blocked);
+    let protected = protected_snapshot(store);
+    let before = store.differential_snapshot().unwrap();
+
+    // Both dropping all blockers and replacing one with another live row
+    // previously succeeded. Either would erase the only link to this
+    // incident; a newer revision and a temporary demotion are not repairs.
+    for disposition in [
+        DISPOSITION_SERVABLE,
+        "evidence-pending",
+        DISPOSITION_QUARANTINED,
+    ] {
+        for proposed in [Vec::new(), vec![unrelated.clone()]] {
+            assert_eq!(
+                store.put_serving_record(&authority, &key, disposition, 3, &validity, &proposed),
+                Err(StoreError::QuarantineRequiresRepair)
+            );
+            assert_eq!(store.differential_snapshot().unwrap(), before);
+            assert_eq!(serving_gate(store, &key, 50, 0).unwrap(), blocked);
+            assert_eq!(
+                serving_sample_decision(store, &action, ActionClassRisk::LowRiskRegistry, &policy)
+                    .unwrap(),
+                SampleGateDecision::ExecutePrivately(PrivateExecutionReason::Quarantined)
+            );
+        }
+    }
+
+    // Retaining every blocker is an ordinary legal renewal; adding one is
+    // legal too, and later removing only part of that set still refuses.
+    let renewed_validity = ServingValidity {
+        evaluated_at_unix_micros: 40,
+        ..validity
+    };
+    store
+        .put_serving_record(
+            &authority,
+            &key,
+            DISPOSITION_SERVABLE,
+            3,
+            &renewed_validity,
+            std::slice::from_ref(&reference),
+        )
+        .unwrap();
+    assert_eq!(serving_gate(store, &key, 50, 0).unwrap(), blocked);
+    store
+        .put_serving_record(
+            &authority,
+            &key,
+            DISPOSITION_SERVABLE,
+            4,
+            &renewed_validity,
+            &[reference.clone(), unrelated],
+        )
+        .unwrap();
+    let before_subset = store.differential_snapshot().unwrap();
+    assert_eq!(
+        store.put_serving_record(
+            &authority,
+            &key,
+            DISPOSITION_SERVABLE,
+            5,
+            &renewed_validity,
+            std::slice::from_ref(&reference),
+        ),
+        Err(StoreError::QuarantineRequiresRepair)
+    );
+    assert_eq!(store.differential_snapshot().unwrap(), before_subset);
+    assert_eq!(protected_snapshot(store), protected);
+    store.differential_snapshot().unwrap()
+}
+
+#[test]
+fn serving_renewal_preserves_named_blockers_after_reopen_differential() {
+    for (scope, scope_name) in [
+        (QuarantineScope::Location, "location"),
+        (QuarantineScope::LogicalObject, "logical-object"),
+        (QuarantineScope::ActionEntry, "action-entry"),
+    ] {
+        let reference_path = fresh_path("named-blocker-ref");
+        let candidate_path = fresh_path("named-blocker-fsq");
+        let snapshot = {
+            let mut reference =
+                SqlMetadataStore::open(RusqliteEngine::open(&reference_path).unwrap()).unwrap();
+            let mut candidate =
+                SqlMetadataStore::open(FsqliteEngine::open(&candidate_path).unwrap()).unwrap();
+            let snapshot = named_blocker_scenario(&mut reference, scope, scope_name);
+            assert_eq!(
+                named_blocker_scenario(&mut candidate, scope, scope_name),
+                snapshot
+            );
+            snapshot
+        };
+        let mut reference =
+            SqlMetadataStore::open(RusqliteEngine::open(&reference_path).unwrap()).unwrap();
+        let mut candidate =
+            SqlMetadataStore::open(FsqliteEngine::open(&candidate_path).unwrap()).unwrap();
+        let key = digest_key(&sample_action_key());
+        for store in [
+            &mut reference as &mut dyn RabsMetadataStore,
+            &mut candidate as &mut dyn RabsMetadataStore,
+        ] {
+            assert_eq!(store.differential_snapshot().unwrap(), snapshot);
+            let record = store.serving_record(&key).unwrap().unwrap();
+            assert_eq!(record.blocking.len(), 2);
+            assert_eq!(
+                serving_gate(store, &key, 50, 0).unwrap(),
+                ServeDecision::Blocked {
+                    references: record.blocking.clone()
+                }
+            );
+            assert_eq!(
+                store.put_serving_record(
+                    &authority_digest(&sample_coordinator_authority()),
+                    &key,
+                    DISPOSITION_SERVABLE,
+                    record.state_revision + 1,
+                    &record.validity,
+                    &[],
+                ),
+                Err(StoreError::QuarantineRequiresRepair)
+            );
+            assert_eq!(store.differential_snapshot().unwrap(), snapshot);
+        }
+    }
 }

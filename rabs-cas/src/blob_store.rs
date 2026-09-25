@@ -940,6 +940,78 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_ingestion_preserves_location_quarantine_and_accepts_clean_replica() {
+        let layout = BlobStoreLayout::open(&fresh_root("quarantined-duplicate")).unwrap();
+        let alternate = BlobStoreLayout::open(&fresh_root("clean-replica")).unwrap();
+        let mut store = store();
+        let bytes = b"verified bytes on a disk under investigation";
+        let declared = id_of(bytes);
+        let PutOutcome::Stored { path } = put_if_absent(
+            &layout,
+            &mut store,
+            &declared,
+            &mut bytes.as_slice(),
+            PutLimits::default(),
+            DurabilityPolicy::FULL,
+        )
+        .unwrap() else {
+            panic!("first ingestion must store a new copy");
+        };
+        store
+            .set_location_quarantined(&declared, &path, true)
+            .unwrap();
+
+        // The duplicate path rehashes the existing representation and may
+        // still report idempotent ingestion. That check does not adjudicate
+        // a device/incident quarantine or make this copy selectable again.
+        assert_eq!(
+            put_if_absent(
+                &layout,
+                &mut store,
+                &declared,
+                &mut bytes.as_slice(),
+                PutLimits::default(),
+                DurabilityPolicy::FULL,
+            )
+            .unwrap(),
+            PutOutcome::IdempotentDuplicate { path: path.clone() }
+        );
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert!(!store.object_located(&declared).unwrap());
+        assert!(!store.object_durably_located(&declared).unwrap());
+        assert!(store.object_locations(&declared).unwrap().is_empty());
+
+        // Quarantine belongs to one copy. A separately verified, durable
+        // replica restores availability without clearing the suspect one.
+        let PutOutcome::Stored {
+            path: alternate_path,
+        } = put_if_absent(
+            &alternate,
+            &mut store,
+            &declared,
+            &mut bytes.as_slice(),
+            PutLimits::default(),
+            DurabilityPolicy::FULL,
+        )
+        .unwrap()
+        else {
+            panic!("alternate storage must receive a new copy");
+        };
+        assert!(store.object_durably_located(&declared).unwrap());
+        assert_eq!(
+            store.object_locations(&declared).unwrap(),
+            vec![(alternate_path, RAW_PROFILE_V1.to_owned(), true)]
+        );
+        assert!(
+            store
+                .reconciliation_scan()
+                .unwrap()
+                .iter()
+                .any(|row| row.store_path == path && row.quarantined)
+        );
+    }
+
+    #[test]
     fn h003_existing_digest_different_bytes_is_quarantined_incident() {
         let layout = BlobStoreLayout::open(&fresh_root("collision")).unwrap();
         let mut store = store();

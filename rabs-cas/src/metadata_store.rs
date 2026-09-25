@@ -1386,7 +1386,8 @@ pub trait RabsMetadataStore {
     /// changes the object's logical identity). `durable` states whether
     /// this copy satisfied the FULL durability policy (file + directory
     /// fsync) when recorded (H032) — a claim about THIS copy, never
-    /// inferred.
+    /// inferred. Refreshing an existing location preserves its quarantine;
+    /// ordinary ingestion or index reconstruction is not incident repair.
     fn add_location(
         &mut self,
         object: &TypedDigest,
@@ -1920,8 +1921,9 @@ pub trait RabsMetadataStore {
     /// must be strictly greater than the stored one (legacy rows are
     /// revision 0, so H040 records start at 1); every named blocking
     /// quarantine must exist; the record is stamped with the ACTIVE
-    /// authority's digest key. The junction reference set is replaced
-    /// atomically with the row.
+    /// authority's digest key. Existing blocking references must be retained:
+    /// an ordinary renewal cannot release quarantine by omitting a reference.
+    /// The reference set and row are updated atomically.
     fn put_serving_record(
         &mut self,
         authority: &TypedDigest,
@@ -3953,15 +3955,33 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
             ),
         };
         self.in_txn(move |engine| {
+            // Location refreshes carry storage/verification observations,
+            // not permission to release a prior containment decision. In
+            // particular, pack reindexing never re-reads the member bytes.
+            // Preserve the flag in the same transaction as the refresh so
+            // neither stale inventories nor duplicate puts can clear it.
+            let existing = engine.query(
+                "SELECT quarantined FROM object_locations WHERE object_key = ?1 AND store_path = ?2",
+                &[SqlValue::Text(key.clone()), SqlValue::Text(path.clone())],
+            )?;
+            let quarantined = if let Some(row) = existing.first() {
+                let [value] = row.as_slice() else {
+                    return Err(StoreError::Corruption("location quarantine shape".into()));
+                };
+                expect_u64(value, "quarantined")? != 0
+            } else {
+                false
+            };
             engine.execute(
                 "INSERT OR REPLACE INTO object_locations \
                  (object_key, store_path, verified_seq, encoding, quarantined, durable) \
-                 VALUES (?1, ?2, ?3, ?4, 0, ?5)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 &[
                     SqlValue::Text(key),
                     SqlValue::Text(path),
                     verified,
                     SqlValue::Text(encoding),
+                    SqlValue::Int(i64::from(quarantined)),
                     SqlValue::Int(i64::from(durable)),
                 ],
             )?;
@@ -5953,6 +5973,28 @@ impl<E: SqlEngine> RabsMetadataStore for SqlMetadataStore<E> {
                     return Err(StoreError::Corruption("serving revision row shape".into()));
                 };
                 Self::require_quarantine_preserved(&expect_text(current, "disposition")?, &disposition)?;
+            }
+            // The named reference is the action's durable association with
+            // a quarantined location or logical object. Once omitted, the
+            // serving gate cannot rediscover that dependency from an action
+            // quarantine row. Check inside this write transaction so a
+            // newer renewal, including one based on stale state, cannot
+            // discard any existing blocker without explicit incident repair.
+            let existing_blocking = engine.query(
+                "SELECT scope, subject FROM serving_blocking_quarantines WHERE action_key = ?1",
+                &[SqlValue::Text(action_key.clone())],
+            )?;
+            for row in &existing_blocking {
+                let [scope, subject] = row.as_slice() else {
+                    return Err(StoreError::Corruption("blocking reference shape".into()));
+                };
+                let reference = (
+                    expect_text(scope, "scope")?,
+                    expect_text(subject, "subject")?,
+                );
+                if !blocking.contains(&reference) {
+                    return Err(StoreError::QuarantineRequiresRepair);
+                }
             }
             // Every NAMED blocking quarantine must exist (references are
             // the authority; dangling ones are refused at write).
@@ -8128,12 +8170,22 @@ mod tests {
         store
             .set_location_quarantined(&object, "/cas/aa/bb", true)
             .unwrap();
+        store
+            .add_location(&object, "/cas/aa/bb", Some(8), "raw", true)
+            .unwrap();
         assert!(
             store.object_located(&object).unwrap(),
             "second clean copy remains"
         );
+        assert!(
+            !store.object_durably_located(&object).unwrap(),
+            "refreshing the durable copy must not release its quarantine"
+        );
         store
             .set_location_quarantined(&object, "/cas/cc/dd", true)
+            .unwrap();
+        store
+            .add_location(&object, "/cas/cc/dd", None, "zstd", false)
             .unwrap();
         assert!(
             !store.object_located(&object).unwrap(),
@@ -8185,7 +8237,7 @@ mod tests {
         assert!(!snapshot.reachable_from_pins.contains(&digest_key(&orphan)));
         let scan = store.reconciliation_scan().unwrap();
         assert_eq!(scan.len(), 2);
-        assert_eq!(scan[0].verified_seq, Some(7));
+        assert_eq!(scan[0].verified_seq, Some(8));
         assert_eq!(scan[0].encoding, "raw");
         assert!(!scan[0].quarantined);
         assert_eq!(scan[1].verified_seq, None);
