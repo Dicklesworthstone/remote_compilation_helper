@@ -18,8 +18,11 @@ use sha2::{Digest, Sha256};
 use std::io;
 use std::sync::Arc;
 
+mod pipeline;
+
 // Stay below the worker's eight deferred frames and 2 MiB aggregate bound.
-// Only acknowledgment offsets are retained; at most one 64 KiB chunk is held.
+// The shared window spans entries and chunks, including small and empty files.
+// Only acknowledgment descriptors are retained, never queued payload buffers.
 const CHUNK_WINDOW: usize = 4;
 
 #[derive(Debug, Clone)]
@@ -127,6 +130,7 @@ impl ToolchainUpload {
             Some(false) => {}
             None => return Err(invalid("toolchain ready seal must be a boolean")),
         }
+        let mut window = pipeline::UploadWindow::new(peer, id, identity.sha256);
         for entry in self.entries.iter() {
             let value = match &entry.kind {
                 ToolchainEntryKind::Directory => json!({"kind":"directory"}),
@@ -137,19 +141,13 @@ impl ToolchainUpload {
                     json!({"kind":"file", "bytes":bytes, "executable":executable})
                 }
             };
-            peer.send(
+            window.queue(
                 &json!({"kind":"toolchain-entry", "request_id":id, "sha256":sha256,
                 "path":entry.path, "entry":value}),
-            )?;
-            let reply = peer.receive()?;
-            check(&reply, "toolchain-entry-accepted", 4)?;
-            require(
-                reply["path"].as_str() == Some(entry.path.as_str()),
-                "toolchain acknowledgment names another entry",
+                pipeline::ExpectedAck::Entry { path: &entry.path },
             )?;
             if let ToolchainEntryKind::File { bytes, .. } = &entry.kind {
                 let mut offset = 0_u64;
-                let mut pending = Vec::with_capacity(CHUNK_WINDOW);
                 while offset < *bytes {
                     // The retained inventory checks the opened file's identity
                     // and stamps around every bounded read. A changed sender
@@ -167,27 +165,17 @@ impl ToolchainUpload {
                         .ok_or_else(|| {
                             invalid("retained toolchain exceeded declared file length")
                         })?;
-                    peer.send(
+                    window.queue(
                         &json!({"kind":"toolchain-chunk", "request_id":id, "sha256":sha256,
                         "path":entry.path, "offset":offset, "data_hex":hex(&chunk),
                         "chunk_sha256":hex(&Sha256::digest(&chunk))}),
+                        pipeline::ExpectedAck::Chunk { path: &entry.path, next_offset: next },
                     )?;
                     offset = next;
-                    pending.push(next);
-                    if pending.len() == CHUNK_WINDOW || offset == *bytes {
-                        for expected in pending.drain(..) {
-                            let reply = peer.receive()?;
-                            check(&reply, "toolchain-chunk-accepted", 5)?;
-                            require(
-                                reply["path"].as_str() == Some(entry.path.as_str())
-                                    && reply["next_offset"].as_u64() == Some(expected),
-                                "toolchain acknowledgment does not cover the transmitted range",
-                            )?;
-                        }
-                    }
                 }
             }
         }
+        window.finish()?;
         peer.send(&json!({"kind":"toolchain-seal", "request_id":id, "sha256":sha256}))?;
         let reply = peer.receive()?;
         check(&reply, "toolchain-ready", 4)?;
@@ -201,6 +189,7 @@ impl ToolchainUpload {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+    mod pipeline_tests;
     use rabs_sandbox::toolchain_dataset::{ToolchainLimits, capture_toolchain};
     use rabs_sandbox::toolchain_transfer::ToolchainReceiver;
     use std::collections::VecDeque;
