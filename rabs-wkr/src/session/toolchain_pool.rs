@@ -1,16 +1,21 @@
-//! Bounded process-local reuse of pinned, independently captured toolchains.
+//! Bounded reuse of pinned, independently captured toolchains.
 //!
 //! Only a complete ToolchainIdentity selects reuse. A pathname, compiler version,
 //! timestamp or cache hit never substitutes for content verification. Unpinned
 //! requests keep their private capture. Pooled bytes are rehashed on acquisition
 //! and by the executor before/after execution, and every lease retains the real
-//! private directory owner through process cleanup. No persistent cache format,
-//! action publication, network operation or compiler-result reuse is introduced.
+//! private directory owner through process cleanup. Optional durable storage
+//! retains verified compiler inputs across worker restarts; it does not grant
+//! action publication or compiler-result reuse.
 //!
 //! The pool serializes admission, not filesystem work. Same-identity misses join
 //! one capture; different identities can capture concurrently. Reservations count
-//! against both bounds. Eviction touches only idle datasets; a busy/full pool
-//! uses a private capture rather than waiting for an unrelated compiler to exit.
+//! against both bounds. Eviction touches only idle in-memory entries; a busy/full
+//! pool uses a private capture rather than waiting for an unrelated compiler.
+//! The optional durable catalogue has its own matching byte/entry bounds and
+//! never deletes trees or adopts incomplete captures. See [`durable`].
+
+mod durable;
 
 use rabs_sandbox::canonical_namespace::CanonicalNamespaceSpec;
 use rabs_sandbox::toolchain_dataset::{
@@ -60,21 +65,37 @@ fn private_directory(parent: Option<&Path>) -> io::Result<tempfile::TempDir> {
     }
 }
 
-/// The parent must outlive every dataset, even after a test/embedded pool drops.
-struct PoolDirectory(tempfile::TempDir);
+/// The parent and optional durable-cache lock outlive every execution lease.
+struct PoolDirectory(tempfile::TempDir, Option<Arc<durable::DurableCache>>);
 struct Dataset {
     // Field order closes inventory descriptors before removing the private tree,
     // and removes the child before dropping its last parent-directory reference.
     toolchain: PreparedToolchain,
-    _directory: tempfile::TempDir,
+    _directory: Option<tempfile::TempDir>,
     pool: Arc<PoolDirectory>,
 }
 impl Dataset {
+    fn retained(
+        pool: &Arc<PoolDirectory>, expected: &ToolchainIdentity, stopped: &impl Fn() -> bool,
+    ) -> io::Result<Option<Arc<Self>>> {
+        let Some(cache) = &pool.1 else { return Ok(None); };
+        Ok(cache.load(expected, stopped)?.map(|toolchain| Arc::new(Self {
+            toolchain, _directory:None, pool:Arc::clone(pool),
+        })))
+    }
+
     fn capture(
         pool: &Arc<PoolDirectory>, source: &Path, expected: Option<&ToolchainIdentity>,
         stopped: &impl Fn() -> bool,
     ) -> io::Result<Arc<Self>> {
         checkpoint(stopped)?;
+        if let (Some(cache), Some(expected)) = (&pool.1, expected)
+            && let Some(toolchain) = cache.capture(source, expected, stopped)?
+        {
+            return Ok(Arc::new(Self {
+                toolchain, _directory:None, pool:Arc::clone(pool),
+            }));
+        }
         let directory = private_directory(Some(pool.0.path()))?;
         let mut limits = ToolchainLimits::default();
         if let Some(expected) = expected {
@@ -88,7 +109,7 @@ impl Dataset {
             &limits, stopped,
         )?;
         checkpoint(stopped)?;
-        Ok(Arc::new(Self { toolchain, _directory:directory, pool:Arc::clone(pool) }))
+        Ok(Arc::new(Self { toolchain, _directory:Some(directory), pool:Arc::clone(pool) }))
     }
 }
 
@@ -109,14 +130,17 @@ impl ToolchainLease {
 
     /// Read-only at its canonical name is insufficient when another writable
     /// bind exposes the same tree. Check the FINAL spec, after source/Cargo-home
-    /// selection, without changing it. Protect the whole pool, not just this
-    /// lease: a build must not write another retained toolchain through HOME or
-    /// a broad workspace bind. Host processes with our credentials remain outside
-    /// this boundary; the existing inode/mutation verification still applies.
+    /// selection, without changing it. Protect all temporary AND persistent
+    /// cache storage, even when this particular lease is a private overflow copy.
+    /// Host processes with our credentials remain outside this boundary; the
+    /// existing inode/mutation verification still applies.
     pub(super) fn validate_namespace(&self, spec: &CanonicalNamespaceSpec) -> io::Result<()> {
         let visible = Path::new(rabs_sandbox::layout::TOOLCHAIN);
         let root = std::fs::canonicalize(self.root())?;
         let pool = std::fs::canonicalize(self.dataset.pool.0.path())?;
+        let durable = self.dataset.pool.1.as_ref()
+            .map(|cache| std::fs::canonicalize(cache.root())).transpose()?;
+        let protected: Vec<_> = [&pool, &root].into_iter().chain(durable.as_ref()).collect();
         let overlap = |a: &Path, b: &Path| a.starts_with(b) || b.starts_with(a);
         let mut owned = 0;
         for bind in &spec.ro_binds {
@@ -135,15 +159,15 @@ impl ToolchainLease {
                 return Err(invalid("writable mount shadows the retained toolchain"));
             }
             let backing = std::fs::canonicalize(&bind.backing)?;
-            if overlap(&backing, &pool) || overlap(&backing, &root) {
+            if protected.iter().any(|root| overlap(&backing, root)) {
                 return Err(invalid("writable mount exposes retained toolchain storage"));
             }
             #[cfg(unix)]
             {
                 use std::os::unix::fs::MetadataExt;
                 let candidate = std::fs::metadata(&backing)?;
-                for protected in [&pool, &root] {
-                    let metadata = std::fs::metadata(protected)?;
+                for root in &protected {
+                    let metadata = std::fs::metadata(root)?;
                     if candidate.dev() == metadata.dev() && candidate.ino() == metadata.ino() {
                         return Err(invalid("writable mount aliases retained toolchain storage"));
                     }
@@ -194,11 +218,17 @@ impl Drop for Reservation<'_> {
 
 impl ToolchainPool {
     pub(crate) fn new(max_bytes: u64, max_entries: usize) -> io::Result<Self> {
+        Self::with_directory(max_bytes, max_entries, None)
+    }
+
+    fn with_directory(max_bytes: u64, max_entries: usize, directory: Option<&Path>) -> io::Result<Self> {
         if max_bytes > MAX_POOL_BYTES || max_entries == 0 || max_entries > MAX_POOL_ENTRIES {
             return Err(invalid("toolchain pool limits outside their bounds"));
         }
+        let durable = directory.map(|root| durable::DurableCache::open(root, max_bytes, max_entries))
+            .transpose()?.map(Arc::new);
         Ok(Self {
-            directory:Arc::new(PoolDirectory(private_directory(None)?)),
+            directory:Arc::new(PoolDirectory(private_directory(None)?, durable)),
             max_bytes, max_entries, state:Mutex::new(State::default()), changed:Condvar::new(),
         })
     }
@@ -224,9 +254,9 @@ impl ToolchainPool {
         self.changed.notify_all();
         Ok(())
     }
-    /// A miss has no filesystem source, reservation or capture side effects.
-    /// Captures already in progress are misses too: a sender can upload its
-    /// retained bytes instead of waiting for another execution's preparation.
+    /// Lookup may reopen a published durable tree, but never creates a capture,
+    /// reservation or waiter. Hashing stays off the control reactor and outside
+    /// the admission lock. In-progress captures and partial disk trees miss.
     pub(crate) fn lookup(
         &self, expected: &ToolchainIdentity, stopped: impl Fn() -> bool,
     ) -> io::Result<Option<ToolchainLease>> {
@@ -240,10 +270,18 @@ impl ToolchainPool {
             match state.entries.get_mut(&identity) {
                 Some(Slot::Ready { dataset, touched:last }) => {
                     *last = touched;
-                    Arc::clone(dataset)
+                    Some(Arc::clone(dataset))
                 }
-                Some(Slot::Capturing) | None => return Ok(None),
+                Some(Slot::Capturing) => return Ok(None),
+                None => None,
             }
+        };
+        let dataset = match dataset {
+            Some(dataset) => dataset,
+            None => match Dataset::retained(&self.directory, expected, &stopped)? {
+                Some(dataset) => return Ok(Some(ToolchainLease { dataset, disposition:"reused" })),
+                None => return Ok(None),
+            },
         };
         // Keep the dataset pinned during verification, outside the admission
         // mutex. A filename or matching identity record is never a cache hit.
@@ -341,8 +379,9 @@ fn configured_bytes(value: Option<&str>) -> io::Result<u64> {
 }
 
 /// The worker supervisor retains this scope across reconnects and drops it only
-/// after session-owned execution has drained. Idle datasets then disappear;
-/// outstanding library leases still retain their own backing until cleanup.
+/// after session-owned execution has drained. Private datasets then disappear;
+/// explicitly configured durable datasets remain for verified restart reuse.
+/// Outstanding library leases retain their backing and the durable cache lock.
 /// No global strong reference or detached janitor extends this lifetime.
 #[must_use = "retain the toolchain scope through worker shutdown"]
 pub struct ToolchainReuseScope {
@@ -352,18 +391,21 @@ pub struct ToolchainReuseScope {
 impl ToolchainReuseScope {
     /// Read worker-local configuration once, before starting its session loop.
     /// Zero/absence disables retained reuse. No request JSON can change limits.
+    /// CACHE_DIR is an optional private persistent store, requiring a nonzero
+    /// CACHE_BYTES budget; invalid or already-owned stores refuse worker startup.
     pub fn from_environment() -> io::Result<Self> {
         let value = std::env::var_os(CONFIG_NAME);
         let text = value.as_ref().map(|value| value.to_str()
             .ok_or_else(|| invalid("RABS_WORKER_TOOLCHAIN_CACHE_BYTES is not UTF-8"))).transpose()?;
         let max_bytes = configured_bytes(text)?;
+        let directory = std::env::var_os(durable::CONFIG_DIRECTORY).map(std::path::PathBuf::from);
         let mut registry = ACTIVE_POOL.lock()
             .map_err(|_| invalid("toolchain pool registry is poisoned"))?;
         if registry.upgrade().is_some() {
             return Err(io::Error::new(io::ErrorKind::AlreadyExists,
                 "one worker supervisor already owns the toolchain pool"));
         }
-        let pool = Arc::new(ToolchainPool::new(max_bytes, MAX_POOL_ENTRIES)?);
+        let pool = Arc::new(ToolchainPool::with_directory(max_bytes, MAX_POOL_ENTRIES, directory.as_deref())?);
         *registry = Arc::downgrade(&pool);
         Ok(Self { pool })
     }
