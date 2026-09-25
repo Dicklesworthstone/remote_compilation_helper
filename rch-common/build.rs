@@ -27,10 +27,16 @@ fn main() {
             .map(str::to_owned),
         None => git_head_commit(),
     });
-    if source.is_some() {
-        for key in BUILD_COMMIT_ENV_VARS {
-            println!("cargo:rustc-env={key}=");
+    // Blank every alias rustc would otherwise inherit from the ambient
+    // environment, so `build_commit()` only ever sees the value validated
+    // here. Without this, an alias this script rejected (e.g.
+    // `GIT_COMMIT=not-a-commit` in a tree with no `.git`) leaked through to
+    // `--version` unchanged (issue #76).
+    for key in BUILD_COMMIT_ENV_VARS {
+        if *key == "RCH_GIT_COMMIT" && commit.is_some() {
+            continue;
         }
+        println!("cargo:rustc-env={key}=");
     }
     if let Some(commit) = commit {
         println!("cargo:rustc-env=RCH_GIT_COMMIT={commit}");

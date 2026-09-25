@@ -101,17 +101,45 @@ pub const BUILD_COMMIT_ENV_VARS: &[&str] = &[
     "GITHUB_SHA",
 ];
 
+/// The validated build revision stamped into this binary, if any.
+///
+/// `build.rs` validates the commit and blanks the ambient aliases; this
+/// re-applies the same grammar so a value the build script rejected can never
+/// be displayed as a build revision (issue #76).
 pub fn build_commit() -> Option<&'static str> {
-    [
+    first_build_commit([
         option_env!("RCH_GIT_COMMIT"),
         option_env!("VERGEN_GIT_SHA"),
         option_env!("GIT_COMMIT"),
         option_env!("GITHUB_SHA"),
-    ]
-    .into_iter()
-    .flatten()
-    .map(str::trim)
-    .find(|value| !value.is_empty())
+    ])
+}
+
+fn first_build_commit<'a>(
+    candidates: impl IntoIterator<Item = Option<&'a str>>,
+) -> Option<&'a str> {
+    candidates
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|value| is_build_commit_stamp(value))
+}
+
+/// Same grammar as `rch-common/build.rs`: a 7..=64 hex commit, optionally
+/// suffixed `-dirty` or `-overlay-<64 hex fingerprint>` (build-source stamps).
+fn is_build_commit_stamp(value: &str) -> bool {
+    fn is_commit_hash(value: &str) -> bool {
+        (7..=64).contains(&value.len()) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+    }
+    is_commit_hash(value)
+        || value.strip_suffix("-dirty").is_some_and(is_commit_hash)
+        || value
+            .split_once("-overlay-")
+            .is_some_and(|(commit, fingerprint)| {
+                is_commit_hash(commit)
+                    && fingerprint.len() == 64
+                    && fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
 }
 
 pub fn build_version_value() -> String {
@@ -340,7 +368,35 @@ pub use hooks::{HookResult, is_claude_code_installed, verify_and_install_claude_
 
 #[cfg(test)]
 mod build_version_tests {
-    use super::{BUILD_COMMIT_ENV_VARS, build_version_value_with_commit};
+    use super::{BUILD_COMMIT_ENV_VARS, build_version_value_with_commit, first_build_commit};
+
+    #[test]
+    fn build_commit_skips_values_the_build_script_rejects() {
+        // Issue #76: an alias build.rs refused must not surface in --version.
+        assert_eq!(
+            first_build_commit([None, None, Some("not-a-commit"), None]),
+            None
+        );
+        let hash = "0123456789abcdef0123456789abcdef01234567";
+        assert_eq!(
+            first_build_commit([Some(""), None, Some("v2.0.0-3-gdeadbee"), Some(hash)]),
+            Some(hash)
+        );
+        assert_eq!(first_build_commit([Some(" abc1234 ")]), Some("abc1234"));
+        assert_eq!(first_build_commit([Some("abc123")]), None, "too short");
+        let dirty = format!("{hash}-dirty");
+        assert_eq!(
+            first_build_commit([Some(dirty.as_str())]),
+            Some(dirty.as_str())
+        );
+        let overlay = format!("{hash}-overlay-{}", "b".repeat(64));
+        assert_eq!(
+            first_build_commit([Some(overlay.as_str())]),
+            Some(overlay.as_str())
+        );
+        let short_overlay = format!("{hash}-overlay-{}", "b".repeat(63));
+        assert_eq!(first_build_commit([Some(short_overlay.as_str())]), None);
+    }
 
     #[test]
     fn build_version_value_omits_missing_commit() {
