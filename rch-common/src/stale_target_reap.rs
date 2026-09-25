@@ -2752,6 +2752,9 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    // Both signal cases reap the supervisor (`-KILL` right after the kill,
+    // `-HUP` after resume); clippy cannot follow the branch on `signal`.
+    #[allow(clippy::zombie_processes)]
     fn source_gc_preserves_ownership_through_hup_and_killed_supervisor() {
         use std::os::unix::fs::PermissionsExt;
         use std::process::{Command, Stdio};
