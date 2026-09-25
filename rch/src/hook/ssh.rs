@@ -1457,6 +1457,7 @@ cat "$RCH_OWNERSHIP_TEST_DIR/payload"
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn source_authority_hierarchy_prevents_nested_snapshot_mutation() {
+        use super::super::dependency_closure::build_sync_closure_plan;
         use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 
         let dir = tempfile::tempdir().unwrap().keep();
