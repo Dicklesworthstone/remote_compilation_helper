@@ -51,7 +51,7 @@ impl PreparedOperationStore {
         require(state.accepting, "prepared operation service is stopping")?;
         require(state.active.len() < MAX_RUNNING, "prepared operation capacity exhausted")?;
         require(!state.active.contains_key(id), "operation already has an active owner")?;
-        let mut record = state.records.get(id).cloned()
+        let mut record = self.read_record(&state, id)?
             .ok_or_else(|| invalid("unknown prepared operation"))?;
         require(record.execution_may_have_run && matches!(record.state,
             OperationState::Uncertain | OperationState::Completed | OperationState::Cancelled),
@@ -67,6 +67,10 @@ impl PreparedOperationStore {
                     "local recovery paths overlap an active operation")?;
             }
         }
+        // An archived record owns the same paths but no live memory slot.
+        // Restore only after all eligibility checks, under this same lock, and
+        // before either Running persistence or an installation can occur.
+        self.restore_record(&mut state, &record)?;
         // Keep proven acceptance only for this exact recorded delivery. A local
         // receipt by itself cannot prove the worker received its release ACKs.
         let acceptance_confirmed = record.delivery == delivery

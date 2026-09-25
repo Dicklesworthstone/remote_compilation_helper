@@ -398,7 +398,7 @@ async fn handle_connection(
                 // filesystem work. Neither may occupy the cancellation/status
                 // lane or the reactor while hashing a large delivered tree.
                 let lane = match value["kind"].as_str() {
-                    Some("prepared-submit") => &limits.prepared_admission,
+                    Some("prepared-submit" | "prepared-resume") => &limits.prepared_admission,
                     Some("prepared-completion" | "prepared-recover-local") => &limits.materialization,
                     _ => &limits.control,
                 };

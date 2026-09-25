@@ -7,6 +7,7 @@
 //! manifest by the execution adapter; a mutable bundle cannot change the request.
 //! State and build directories are operator-owned, not hostile shared storage.
 
+mod archival;
 mod completion;
 mod local_recovery;
 mod preview;
@@ -117,7 +118,7 @@ pub enum OperationOutcome {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Record {
     version: u32,
@@ -216,6 +217,7 @@ struct State {
     active: BTreeMap<String, OperationCancellation>,
     retained_bytes: usize,
     next_order: u64,
+    archive_revision: u64,
     accepting: bool,
     poisoned: bool,
 }
@@ -238,6 +240,8 @@ pub struct PreparedOperationStore {
     changed: Condvar,
     #[cfg(test)]
     fail_after_rename: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    fail_after_archive_rename: std::sync::atomic::AtomicBool,
 }
 
 fn invalid(message: &str) -> io::Error {
@@ -457,6 +461,7 @@ impl PreparedOperationStore {
         }
         lock.0.sync_all()?;
         File::open(&root)?.sync_all()?;
+        archival::prepare_archive(&root)?;
         let mut records = BTreeMap::new();
         let mut retained_bytes = 0usize;
         let mut next_order = 1u64;
@@ -469,121 +474,7 @@ impl PreparedOperationStore {
                 records.len() < MAX_OPERATIONS,
                 "too many retained prepared operations",
             )?;
-            let bytes = read_bounded(&path, MAX_RECORD_BYTES, true)?;
-            let record: Record = serde_json::from_slice(&bytes)?;
-            validate_spec_shape(&record.spec)?;
-            validate_bound_request(&record.request)?;
-            require(
-                record.version == 1
-                    && record.request_sha256 == request_digest(&record.request)?
-                    && path.file_stem().and_then(|s| s.to_str()) == Some(record.spec.id.as_str())
-                    && record.prior_deliveries.len() <= 16
-                    && record
-                        .detail
-                        .as_ref()
-                        .is_none_or(|s| s.len() <= MAX_DETAIL_BYTES)
-                    && record.stop_reason.as_ref().is_none_or(|s| s.len() <= 128),
-                "invalid prepared operation record",
-            )?;
-            require(
-                record
-                    .paths()
-                    .iter()
-                    .all(|path| path_shape(path) && !overlap(path, &root))
-                    && !overlap(&record.delivery, &record.spec.bundle)
-                    && !overlap(&record.delivery, &record.spec.output)
-                    && record
-                        .listen_address
-                        .as_ref()
-                        .is_none_or(|address| address.parse::<SocketAddr>().is_ok())
-                    && record.bound_address.as_ref().is_none_or(|address| {
-                        address
-                            .parse::<SocketAddr>()
-                            .is_ok_and(|address| address.port() != 0)
-                    }),
-                "invalid recovered operation paths",
-            )?;
-            require(
-                match record.mode {
-                    StoredMode::Execute => {
-                        record.prior_deliveries.is_empty()
-                            && record.resume_from.is_none()
-                            && (record.state != OperationState::Queued
-                                || (record.attempt == 0 && !record.execution_may_have_run))
-                    }
-                    StoredMode::Resume => {
-                        !record.prior_deliveries.is_empty()
-                            && record.attempt > 0
-                            && record.execution_may_have_run
-                    }
-                    StoredMode::Acknowledge => {
-                        record.attempt > 0
-                            && record.execution_may_have_run
-                            && record.resume_from.is_none()
-                    }
-                    StoredMode::LocalRecovery => {
-                        record.attempt > 0
-                            && record.execution_may_have_run
-                            && record.resume_from.is_none()
-                            && record.state != OperationState::Queued
-                    }
-                },
-                "invalid recovered operation execution frontier",
-            )?;
-            require(
-                record
-                    .exit_code
-                    .is_none_or(|code| (0..=255).contains(&code))
-                    && (!record.outputs_installed
-                        || (record.exit_code == Some(0)
-                            && record.stop_reason.is_none()
-                            && record.execution_may_have_run))
-                    && match record.state {
-                        OperationState::Queued => true,
-                        OperationState::Running | OperationState::Uncertain => {
-                            record.attempt > 0 && record.execution_may_have_run
-                        }
-                        OperationState::Cancelling => {
-                            record.attempt > 0
-                                && record.execution_may_have_run
-                                && record.cancel_requested
-                        }
-                        OperationState::Completed => {
-                            record.attempt > 0
-                                && record.execution_may_have_run
-                                && record.exit_code.is_some()
-                                && record.acknowledgments_confirmed.is_some()
-                                && record.stop_reason.as_deref() != Some("cancelled")
-                                && (record.exit_code != Some(0)
-                                    || record.stop_reason.is_some()
-                                    || record.outputs_installed
-                                    || record.mode == StoredMode::Acknowledge)
-                        }
-                        OperationState::Cancelled => {
-                            if record.execution_may_have_run {
-                                record.attempt > 0
-                                    && record.exit_code.is_some()
-                                    && record.stop_reason.as_deref() == Some("cancelled")
-                                    && record.acknowledgments_confirmed.is_some()
-                            } else {
-                                record.mode == StoredMode::Execute
-                                    && record.exit_code == Some(130)
-                                    && record.cancel_requested
-                                    && !record.outputs_installed
-                                    && record.acknowledgments_confirmed.is_none()
-                            }
-                        }
-                        OperationState::FailedBeforeStart => {
-                            record.mode == StoredMode::Execute
-                                && record.attempt > 0
-                                && !record.execution_may_have_run
-                                && record.exit_code.is_none()
-                                && record.acknowledgments_confirmed.is_none()
-                                && !record.outputs_installed
-                        }
-                    },
-                "invalid recovered operation outcome",
-            )?;
+            let record = archival::load_record(&root, &path)?;
             retained_bytes = retained_bytes
                 .checked_add(record.weight()?)
                 .ok_or_else(|| invalid("operation storage budget overflow"))?;
@@ -610,6 +501,7 @@ impl PreparedOperationStore {
                 active: BTreeMap::new(),
                 retained_bytes,
                 next_order,
+                archive_revision: 0,
                 accepting: true,
                 poisoned: false,
             }),
@@ -617,9 +509,26 @@ impl PreparedOperationStore {
             previews: preview::PreviewRegistry::default(),
             #[cfg(test)]
             fail_after_rename: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            fail_after_archive_rename: std::sync::atomic::AtomicBool::new(false),
         });
         {
             let mut state = store.lock_state()?;
+            // History stays on disk, but startup still verifies every archived
+            // identity and detects duplicate live/archive records before work.
+            store.for_each_archived(|record| {
+                require(
+                    !state.records.contains_key(&record.spec.id),
+                    "operation exists in both live and archived storage",
+                )?;
+                state.next_order = state.next_order.max(
+                    record
+                        .order
+                        .checked_add(1)
+                        .ok_or_else(|| invalid("operation queue order exhausted"))?,
+                );
+                Ok(())
+            })?;
             let recover: Vec<_> = state
                 .records
                 .values()
@@ -685,13 +594,7 @@ impl PreparedOperationStore {
 
     fn replace(&self, state: &mut State, record: Record) -> io::Result<()> {
         if let Err(error) = self.persist(&record) {
-            state.poisoned = true;
-            state.accepting = false;
-            self.previews.stop();
-            for cancellation in state.active.values() {
-                cancellation.cancel();
-            }
-            self.changed.notify_all();
+            self.poison(state);
             return Err(error);
         }
         state.records.insert(record.spec.id.clone(), record);
@@ -722,23 +625,29 @@ impl PreparedOperationStore {
         )?)?;
         validate_bound_request(&request)?;
         let fingerprint = request_digest(&request)?;
-        let mut state = self.lock_state()?;
-        require(state.accepting, "prepared operation service is stopping")?;
-        if let Some(record) = state.records.get(&spec.id) {
+        let existing_status = |record: Record| -> io::Result<OperationStatus> {
             require(
                 record.spec == spec
                     && record.request == request
                     && record.request_sha256 == fingerprint,
                 "operation id already belongs to another request or destination",
             )?;
-            return Ok(record.status());
+            Ok(record.status())
+        };
+        {
+            let state = self.lock_state()?;
+            require(state.accepting, "prepared operation service is stopping")?;
+            if let Some(record) = self.read_record(&state, &spec.id)? {
+                return existing_status(record);
+            }
         }
-        require(
-            state.records.len() < MAX_OPERATIONS,
-            "prepared operation capacity exhausted",
-        )?;
-        // Existing outputs and abandoned deliveries remain owned across restarts.
-        for existing in state.records.values() {
+        // Scan cold history without holding cancellation/status behind disk
+        // reads. Once the archive revision is stable, the same lock protects
+        // checking the current live set through admission and persistence.
+        let check_paths = |existing: &Record| -> io::Result<()> {
+            if existing.spec.id == spec.id {
+                return Ok(());
+            }
             for destination in [&spec.delivery, &spec.output] {
                 require(
                     existing
@@ -757,6 +666,15 @@ impl PreparedOperationStore {
                     "bundle overlaps retained operation destination",
                 )?;
             }
+            Ok(())
+        };
+        let mut state = self.lock_after_archived_check(&check_paths)?;
+        require(state.accepting, "prepared operation service is stopping")?;
+        if let Some(record) = self.read_record(&state, &spec.id)? {
+            return existing_status(record);
+        }
+        for existing in state.records.values() {
+            check_paths(existing)?;
         }
         let record = Record {
             version: 1,
@@ -781,10 +699,7 @@ impl PreparedOperationStore {
             detail: None,
         };
         let weight = record.weight()?;
-        require(
-            weight <= MAX_RETAINED_BYTES.saturating_sub(state.retained_bytes),
-            "prepared operation byte capacity exhausted",
-        )?;
+        self.make_room(&mut state, weight)?;
         state.next_order = state
             .next_order
             .checked_add(1)
@@ -800,10 +715,16 @@ impl PreparedOperationStore {
         // Release the durable state lock before looking at optional diagnostics.
         // The existing preview registry uses try_lock and binds its response to
         // the exact saved request and attempt captured by this status snapshot.
-        let mut status = self.lock_state()?.records.get(id).map(Record::status);
+        let mut status = {
+            let state = self.lock_state()?;
+            self.read_record(&state, id)?.map(|record| record.status())
+        };
         if let Some(status) = &mut status
             && status.mode == "execute"
-            && matches!(status.state, OperationState::Running | OperationState::Cancelling)
+            && matches!(
+                status.state,
+                OperationState::Running | OperationState::Cancelling
+            )
         {
             status.live_diagnostics = self
                 .preview(id, &status.request_sha256, status.attempt, 0, 0)
@@ -817,10 +738,8 @@ impl PreparedOperationStore {
 
     pub fn cancel(&self, id: &str) -> io::Result<OperationStatus> {
         let mut state = self.lock_state()?;
-        let mut record = state
-            .records
-            .get(id)
-            .cloned()
+        let mut record = self
+            .read_record(&state, id)?
             .ok_or_else(|| invalid("unknown prepared operation"))?;
         match record.state {
             OperationState::Queued => {
@@ -857,6 +776,7 @@ impl PreparedOperationStore {
         new_delivery: PathBuf,
         resume_from: Option<PathBuf>,
     ) -> io::Result<OperationStatus> {
+        require(valid_id(id), "invalid operation id")?;
         ordinary_directory(&new_delivery, true)?;
         require(
             !new_delivery.exists(),
@@ -865,12 +785,18 @@ impl PreparedOperationStore {
         if let Some(path) = &resume_from {
             ordinary_directory(path, false)?;
         }
-        let mut state = self.lock_state()?;
+        let mut state = self.lock_after_archived_check(|other| {
+            require(
+                other
+                    .paths()
+                    .iter()
+                    .all(|path| !overlap(&new_delivery, path)),
+                "resume destination overlaps retained operation",
+            )
+        })?;
         require(state.accepting, "prepared operation service is stopping")?;
-        let mut record = state
-            .records
-            .get(id)
-            .cloned()
+        let mut record = self
+            .read_record(&state, id)?
             .ok_or_else(|| invalid("unknown prepared operation"))?;
         require(
             record.unresolved() && !state.active.contains_key(id),
@@ -929,10 +855,8 @@ impl PreparedOperationStore {
         ordinary_directory(&delivery, false)?;
         let mut state = self.lock_state()?;
         require(state.accepting, "prepared operation service is stopping")?;
-        let mut record = state
-            .records
-            .get(id)
-            .cloned()
+        let mut record = self
+            .read_record(&state, id)?
             .ok_or_else(|| invalid("unknown prepared operation"))?;
         require(
             record.unresolved() && !state.active.contains_key(id),

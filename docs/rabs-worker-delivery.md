@@ -503,6 +503,26 @@ executes nor uploads source nor modifies installed outputs. Confirmed release
 clears the worker reservation. Recovery uses the saved request even if the
 original bundle is no longer available.
 
+The daemon bounds live operation accounting to 1,024 records and 64 MiB. When a
+new submission needs room, it automatically archives the oldest fully resolved
+records. Eligible records are jobs that failed before dispatch, executions
+cancelled before dispatch, and completed or cancelled executions whose worker
+release acknowledgments are confirmed. Queued, active, uncertain, and
+acknowledgment-pending work continues to consume live capacity; unresolved work
+can still cause admission to refuse.
+
+Archival preserves the complete saved record on disk. Historical job IDs,
+requests, and reserved paths remain checked, so archival cannot make an old ID
+or output destination available to another execution. Status, verified completion
+replay, and explicit local recovery continue to work for archived jobs. Local
+recovery first restores the record to live accounting and never queues another
+compiler execution. Archive moves are durable and verified again at startup;
+conflicting or corrupt history refuses admission. Full-history checks run on the
+filesystem admission lane without holding the operation-state mutex, so they do
+not block cancellation behind the entire scan. Archived records are retained
+indefinitely: resident accounting stays bounded while disk history and admission
+scan time grow with the number of jobs.
+
 The store permits at most 1,024 retained jobs, a 64 MiB admission budget including
 reserved record space, and 16 recovery destinations per job. Full stores refuse
 new admissions; completed records are not silently erased. These jobs provide
