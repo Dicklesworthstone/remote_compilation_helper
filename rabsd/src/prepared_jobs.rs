@@ -50,6 +50,19 @@ impl Drivers {
                             store.wait_for_work(IDLE_WAIT);
                             continue;
                         }
+                        // A lost daemon owner may already have received every
+                        // result byte. Recover those bytes on this filesystem
+                        // thread before considering another network operation.
+                        // No local recovery claim reaches the worker adapter.
+                        match store.recover_next_local() {
+                            Ok(Some(_)) => continue,
+                            Ok(None) => {}
+                            Err(error) => {
+                                stopped.store(true, Ordering::Release);
+                                let _ = store.stop();
+                                return Err(format!("prepared local recovery: {error}"));
+                            }
+                        }
                         let claim = match store.claim_next() {
                             Ok(claim) => claim,
                             Err(error) => {
