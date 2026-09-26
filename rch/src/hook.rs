@@ -907,6 +907,17 @@ fn exit_with_local_fallback(
     // real exit code) and lie on the refusal path (a `completed`
     // envelope immediately followed by `refused`). Observed live via
     // job-mode local fallback during bd-uoh4x verification.
+    //
+    // bd-qawj7: every terminal local run or refusal leaves a durable record
+    // of WHY. Before this only the daemon-unavailable lane was recorded, so a
+    // dispatcher melting under local builds (trj, 2026-09-25) left nothing to
+    // say whether rch chose local or an agent bypassed it.
+    record_hook_incident(&build_local_fallback_incident(
+        command,
+        reason,
+        require_remote,
+        now_unix_ms(),
+    ));
     let mut child = match local_fallback_command_for_policy(command, require_remote) {
         Ok(child) => child,
         Err(LocalFallbackRefusal::RemoteRequired) => {
@@ -1576,20 +1587,51 @@ fn build_recovery_terminal_incident(
     })
 }
 
+/// The incident recorded by every terminal local fallback: `LocalFallback`
+/// (RCH-I011) when the command runs locally, `ProofRefusal` (RCH-I012) when a
+/// remote-required policy refuses it. The fallback reason goes in `details`;
+/// the command is recorded only as a secret-redacted fingerprint.
+fn build_local_fallback_incident(
+    command: &str,
+    reason: &str,
+    refused: bool,
+    now_ms: u64,
+) -> IncidentEvent {
+    build_recovery_terminal_incident(
+        refused,
+        &extract_project_name(),
+        &redact_secrets(command),
+        reason,
+        now_ms,
+    )
+}
+
 /// Append `event` to the durable incident ledger, best-effort. Incident logging
 /// must never break a build, so a write failure is logged and swallowed. A
 /// tracing breadcrumb is always emitted so the incident is visible even when the
 /// ledger write fails. The ledger lives off the hot path, so the append cost
 /// (one buffered line) does not affect the classification budgets.
 fn record_hook_incident(event: &IncidentEvent) {
-    warn!(
-        target: "rch::hook::incident",
-        reason_code = %event.reason_code,
-        failure_class = event.reason_code.failure_class(),
-        selected_mode = ?event.selected_mode,
-        local_fallback_allowed = event.local_fallback_allowed,
-        "hook incident recorded",
-    );
+    // A routine local fallback (RCH-I011) is already announced by the
+    // `[RCH] local (<reason>)` summary; now that every fallback is recorded,
+    // a WARN here would add multi-line stderr noise to every local build.
+    if event.reason_code == IncidentReasonCode::LocalFallback {
+        debug!(
+            target: "rch::hook::incident",
+            reason_code = %event.reason_code,
+            selected_mode = ?event.selected_mode,
+            "hook incident recorded",
+        );
+    } else {
+        warn!(
+            target: "rch::hook::incident",
+            reason_code = %event.reason_code,
+            failure_class = event.reason_code.failure_class(),
+            selected_mode = ?event.selected_mode,
+            local_fallback_allowed = event.local_fallback_allowed,
+            "hook incident recorded",
+        );
+    }
     let ledger = IncidentLedger::new(IncidentLedgerConfig::default());
     if let Err(e) = ledger.append(event) {
         warn!(
@@ -2937,15 +2979,9 @@ pub async fn run_exec(
                         require_remote,
                     );
                 }),
-                // Fail-open convenience lane: record the fallback and run local.
+                // Fail-open convenience lane: run local. exit_with_local_fallback
+                // records the RCH-I011 incident (bd-qawj7).
                 DaemonRecoveryAction::LocalFallback => {
-                    record_hook_incident(&build_recovery_terminal_incident(
-                        false,
-                        &project,
-                        &command_fingerprint,
-                        "daemon unavailable",
-                        now_unix_ms(),
-                    ));
                     reporter.summary("[RCH] local (daemon unavailable)");
                     exit_with_local_fallback(
                         &command,
@@ -2954,17 +2990,10 @@ pub async fn run_exec(
                         require_remote,
                     );
                 }
-                // Proof lane: record the refusal and fail closed.
-                // exit_with_local_fallback also refuses under proof mode and
-                // prints the explicit "remote required" refusal summary.
+                // Proof lane: fail closed. exit_with_local_fallback refuses under
+                // proof mode, prints the explicit "remote required" refusal
+                // summary, and records the RCH-I012 incident (bd-qawj7).
                 DaemonRecoveryAction::Refuse => {
-                    record_hook_incident(&build_recovery_terminal_incident(
-                        true,
-                        &project,
-                        &command_fingerprint,
-                        "daemon unavailable",
-                        now_unix_ms(),
-                    ));
                     exit_with_local_fallback(
                         &command,
                         &reporter,
@@ -4050,8 +4079,8 @@ pub(crate) use daemon_ipc::{query_daemon, release_worker, restart_admission_is_c
 // the test suite, and the numeric `parse_*` helpers stay module-private.
 mod command_parsing;
 pub(crate) use command_parsing::{
-    cargo_job_count_for_command, estimate_cores_for_command, extract_project_name_with_policy,
-    preferred_workers,
+    cargo_job_count_for_command, estimate_cores_for_command, extract_project_name,
+    extract_project_name_with_policy, preferred_workers,
 };
 
 // Human-facing job-output rendering (compile-summary panel, job banner, and the

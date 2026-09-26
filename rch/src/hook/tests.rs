@@ -9032,6 +9032,55 @@ fn test_build_recovery_terminal_incident_proof_vs_fallback() {
 }
 
 #[test]
+fn test_local_fallback_incident_records_reason_and_redacts_command() {
+    // bd-qawj7: every terminal local fallback records WHY, durably.
+    let command = "GITHUB_TOKEN=ghp_supersecretvalue123456 cargo build --release";
+    let local = super::build_local_fallback_incident(
+        command,
+        "no admissible workers (critical_pressure=5)",
+        false,
+        1_700_000_000_010,
+    );
+    assert_eq!(
+        local.reason_code,
+        rch_common::IncidentReasonCode::LocalFallback
+    );
+    assert_eq!(local.reason_code.code(), "RCH-I011");
+    assert!(local.local_fallback_allowed);
+    assert_eq!(
+        local.details.get("reason").map(String::as_str),
+        Some("no admissible workers (critical_pressure=5)")
+    );
+    assert!(!local.command_fingerprint.contains("supersecretvalue"));
+    assert!(local.command_fingerprint.contains("cargo build --release"));
+    assert!(!local.project_id.is_empty());
+
+    let refused = super::build_local_fallback_incident(
+        "cargo test",
+        "remote execution failed; remote retries exhausted",
+        true,
+        1_700_000_000_011,
+    );
+    assert_eq!(
+        refused.reason_code,
+        rch_common::IncidentReasonCode::ProofRefusal
+    );
+    assert!(!refused.local_fallback_allowed);
+    assert!(refused.control.strict_remote_policy);
+
+    let dir = create_test_state_dir();
+    let ledger = rch_common::IncidentLedger::with_path(dir.path().join("incidents.jsonl"));
+    ledger.append(&local).expect("append must succeed");
+    ledger.append(&refused).expect("append must succeed");
+    let read = rch_common::IncidentLedger::with_path(ledger.path()).read_all();
+    assert_eq!(read.len(), 2);
+    assert_eq!(
+        read[0].details.get("reason").map(String::as_str),
+        Some("no admissible workers (critical_pressure=5)")
+    );
+}
+
+#[test]
 fn test_socket_failure_incident_durably_appends_to_ledger() {
     // End-to-end durable record: build the incident the hook emits, append
     // it to a temp ledger, and read it back — proving the structured
