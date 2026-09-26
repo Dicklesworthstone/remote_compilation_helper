@@ -14,8 +14,8 @@
 //!   hosts — validation rejects the manifest for ALL of them, because
 //!   a manifest that materializes differently per host is not one
 //!   object);
-//! - symlink targets must stay inside the manifest root (no absolute
-//!   targets, no `..` escapes);
+//! - symlink targets must stay inside the manifest root after resolving
+//!   declared symlink chains, not merely after lexical `..` counting;
 //! - implicit directories participate in collision checks, and no member
 //!   may be installed beneath a file, hardlink, or symlink;
 //! - hardlinks only to DECLARED earlier regular files or hardlink chains
@@ -23,7 +23,7 @@
 //! - device/socket/FIFO/special nodes reject unless the action class
 //!   explicitly defined safe handling (none do today).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Member kinds a manifest may declare.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,6 +70,8 @@ pub enum ManifestViolation {
     UnicodeEquivalentCollision(String, String),
     SymlinkEscape { link: String, target: String },
     InvalidSymlinkTarget { link: String, target: String },
+    SymlinkCycle { link: String, through: String },
+    SymlinkResolutionLimit(String),
     UndeclaredHardlinkTarget { link: String, to: String },
     InvalidHardlinkTarget { link: String, to: String },
     NonDirectoryAncestor { ancestor: String, member: String },
@@ -110,27 +112,104 @@ fn equivalence_key(path: &str) -> String {
         .collect()
 }
 
-/// Whether a symlink target escapes the manifest root.
-fn symlink_escapes(member_path: &str, target: &str) -> bool {
-    if target.starts_with('/') {
-        return true;
-    }
-    // Resolve the target relative to the member's parent directory,
-    // counting depth; going below the root is an escape.
-    let mut depth: i64 = member_path.split('/').count() as i64 - 1;
-    for component in target.split('/') {
-        match component {
-            "" | "." => {}
-            ".." => {
-                depth -= 1;
-                if depth < 0 {
-                    return true;
-                }
+// Explicit validation budgets, independent of host kernel symlink limits.
+const MAX_SYMLINK_EXPANSIONS: usize = 40;
+const MAX_SYMLINK_COMPONENT_STEPS: usize = 16_384;
+
+enum ResolveStep<'a> {
+    Component(&'a str),
+    // Remove a link from the active chain only after its own target has
+    // resolved, before continuing with the enclosing path's suffix.
+    EndLink(&'a str),
+}
+
+/// Resolve against the complete declared namespace without filesystem I/O.
+/// Unknown targets may remain dangling, but known links are expanded before
+/// `..` is interpreted. Materializers still need private roots or no-follow
+/// filesystem operations: this cannot validate ambient filesystem contents.
+fn validate_symlink<'a>(
+    member_path: &'a str,
+    target: &'a str,
+    members: &BTreeMap<&'a str, &'a ManifestMemberKind>,
+    names: &BTreeMap<String, &'a str>,
+) -> Result<(), ManifestViolation> {
+    let invalid_target = || ManifestViolation::InvalidSymlinkTarget {
+        link: member_path.into(),
+        target: target.into(),
+    };
+    let escape = || ManifestViolation::SymlinkEscape {
+        link: member_path.into(),
+        target: target.into(),
+    };
+    let mut resolved: Vec<&str> = member_path
+        .rsplit_once('/')
+        .map_or_else(Vec::new, |(parent, _)| parent.split('/').collect());
+    let mut pending: Vec<ResolveStep<'_>> = target
+        .split('/')
+        .rev()
+        .map(ResolveStep::Component)
+        .collect();
+    let mut active = BTreeSet::from([member_path]);
+    let mut expansions = 1;
+    let mut steps = 0;
+
+    while let Some(step) = pending.pop() {
+        let component = match step {
+            ResolveStep::EndLink(path) => {
+                active.remove(path);
+                continue;
             }
-            _ => depth += 1,
+            ResolveStep::Component(component) => component,
+        };
+        steps += 1;
+        if steps > MAX_SYMLINK_COMPONENT_STEPS {
+            return Err(ManifestViolation::SymlinkResolutionLimit(member_path.into()));
+        }
+        // Even `file/.`, `file/..`, and `file/` require a directory.
+        // Lexically cancelling `file/..` would invent an accessible path.
+        if matches!(
+            members.get(resolved.join("/").as_str()).copied(),
+            Some(ManifestMemberKind::File | ManifestMemberKind::Hardlink { .. })
+        ) {
+            return Err(invalid_target());
+        }
+        match component {
+            "" | "." => continue,
+            ".." => {
+                if resolved.pop().is_none() {
+                    return Err(escape());
+                }
+                continue;
+            }
+            _ => resolved.push(component),
+        }
+        let candidate = resolved.join("/");
+        // An alternate spelling of a known node must not select a link on
+        // one host and a missing path on another. Do not silently normalize.
+        if let Some(declared) = names.get(&equivalence_key(&candidate))
+            && *declared != candidate
+        {
+            return Err(invalid_target());
+        }
+        if let Some((&link_path, kind)) = members.get_key_value(candidate.as_str())
+            && let ManifestMemberKind::Symlink { target: nested } = *kind
+        {
+            if !active.insert(link_path) {
+                return Err(ManifestViolation::SymlinkCycle {
+                    link: member_path.into(),
+                    through: link_path.into(),
+                });
+            }
+            expansions += 1;
+            if expansions > MAX_SYMLINK_EXPANSIONS {
+                return Err(ManifestViolation::SymlinkResolutionLimit(member_path.into()));
+            }
+            resolved.pop();
+            pending.push(ResolveStep::EndLink(link_path));
+            pending.extend(nested.split('/').rev().map(ResolveStep::Component));
         }
     }
-    false
+    Ok(())
 }
 
 /// Reject aliases rather than normalizing attacker-controlled paths. In
@@ -207,7 +286,7 @@ pub fn validate_manifest(members: &[ManifestMember]) -> Result<(), ManifestViola
                         target: target.clone(),
                     });
                 }
-                if target.starts_with('/') || symlink_escapes(path, target) {
+                if target.starts_with('/') {
                     return Err(ManifestViolation::SymlinkEscape {
                         link: path.into(),
                         target: target.clone(),
@@ -253,6 +332,13 @@ pub fn validate_manifest(members: &[ManifestMember]) -> Result<(), ManifestViola
                     member: member.path.clone(),
                 });
             }
+        }
+    }
+    // A link may target a later declaration. Checking only the prefix seen
+    // while reading the manifest would make escape detection order-dependent.
+    for member in members {
+        if let ManifestMemberKind::Symlink { target } = &member.kind {
+            validate_symlink(&member.path, target, &seen_exact, &seen_equivalent)?;
         }
     }
     Ok(())
@@ -408,6 +494,131 @@ mod tests {
             .map(|index| file(&format!("out/artifact_{index}")))
             .collect();
         assert_eq!(validate_manifest(&members), Ok(()));
+    }
+
+    #[test]
+    fn symlink_chains_cannot_hide_root_escapes_in_either_declaration_order() {
+        // Both targets pass lexical depth counting. Resolving `a/up`
+        // first lands at the root, so the following `..` escapes it.
+        let mut members = vec![
+            symlink("a/up", ".."),
+            symlink("escape", "a/up/../outside"),
+        ];
+        for _ in 0..2 {
+            assert_eq!(
+                validate_manifest(&members),
+                Err(ManifestViolation::SymlinkEscape {
+                    link: "escape".into(), target: "a/up/../outside".into(),
+                }),
+            );
+            members.reverse();
+        }
+    }
+
+    #[test]
+    fn nested_symlinks_resolve_relative_to_each_links_own_parent() {
+        assert_eq!(
+            validate_manifest(&[
+                symlink("out/result", "../aliases/current"),
+                symlink("aliases/current", "../real/sub/../artifact"),
+                directory("real/sub"),
+                file("real/artifact"),
+            ]),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn direct_indirect_and_suffix_growing_symlink_cycles_are_rejected() {
+        for members in [
+            vec![symlink("link", "link")],
+            vec![symlink("a", "b"), symlink("b", "a")],
+            vec![symlink("a", "b/child"), symlink("b", "a/child")],
+            vec![symlink("a", "b"), symlink("b", "c"), symlink("c", "a")],
+        ] {
+            assert!(matches!(
+                validate_manifest(&members),
+                Err(ManifestViolation::SymlinkCycle { .. })
+            ), "accepted cyclic namespace {members:?}");
+        }
+    }
+
+    #[test]
+    fn revisiting_a_link_after_its_target_resolved_is_not_a_cycle() {
+        assert_eq!(
+            validate_manifest(&[
+                symlink("a/up", ".."),
+                symlink("result", "a/up/a/up/artifact"),
+                file("artifact"),
+            ]),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn symlink_target_aliases_cannot_change_resolution_between_hosts() {
+        for target in ["A/up/../outside", "a/UP/../outside"] {
+            assert!(matches!(
+                validate_manifest(&[symlink("a/up", ".."), symlink("result", target)]),
+                Err(ManifestViolation::InvalidSymlinkTarget { .. })
+            ));
+        }
+        assert!(matches!(
+            validate_manifest(&[file("caf\u{e9}/artifact"), symlink("result", "cafe\u{301}/artifact")]),
+            Err(ManifestViolation::InvalidSymlinkTarget { .. })
+        ));
+    }
+
+    #[test]
+    fn symlink_targets_must_not_walk_through_regular_files_or_hardlinks() {
+        for target in ["artifact/child", "artifact/..", "artifact/.", "artifact/", "alias/../outside"] {
+            assert!(matches!(
+                validate_manifest(&[
+                    file("artifact"),
+                    hardlink("alias", "artifact"),
+                    symlink("result", target),
+                ]),
+                Err(ManifestViolation::InvalidSymlinkTarget { .. })
+            ), "accepted non-directory traversal {target:?}");
+        }
+        assert_eq!(
+            validate_manifest(&[file("artifact"), symlink("result", "artifact")]),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn bounded_resolution_accepts_short_chains_and_refuses_excessive_work() {
+        let mut members: Vec<_> = (0..MAX_SYMLINK_EXPANSIONS)
+            .map(|index| symlink(&format!("link{index}"), &format!("link{}", index + 1)))
+            .collect();
+        assert_eq!(validate_manifest(&members), Ok(()));
+        members.push(symlink(&format!("link{MAX_SYMLINK_EXPANSIONS}"), "missing"));
+        assert!(matches!(
+            validate_manifest(&members),
+            Err(ManifestViolation::SymlinkResolutionLimit(_))
+        ));
+
+        let target = std::iter::repeat_n(".", MAX_SYMLINK_COMPONENT_STEPS)
+            .collect::<Vec<_>>()
+            .join("/");
+        assert_eq!(validate_manifest(&[symlink("link", &target)]), Ok(()));
+        assert!(matches!(
+            validate_manifest(&[symlink("link", &format!("{target}/."))]),
+            Err(ManifestViolation::SymlinkResolutionLimit(_))
+        ));
+    }
+
+    #[test]
+    fn dangling_relative_links_and_links_to_parent_directories_remain_supported() {
+        assert_eq!(
+            validate_manifest(&[
+                symlink("dangling", "not-yet-created/artifact"),
+                symlink("a/up", ".."),
+                symlink("a/here", "."),
+            ]),
+            Ok(())
+        );
     }
 
     #[test]
