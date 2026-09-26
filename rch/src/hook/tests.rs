@@ -11105,3 +11105,26 @@ fn ssh_timeout_unverified_cleanup_detection() {
     let unrelated = anyhow::anyhow!("some other failure");
     assert!(ssh_timeout_with_unverified_cleanup(&unrelated).is_none());
 }
+
+#[test]
+fn project_topology_local_reason_admits_projects_under_the_canonical_root_only() {
+    let root = tempfile::tempdir().unwrap();
+    let canonical = root.path().canonicalize().unwrap();
+    let inside = canonical.join("repo");
+    std::fs::create_dir_all(&inside).unwrap();
+    let outside_parent = tempfile::tempdir().unwrap();
+    let outside = outside_parent.path().canonicalize().unwrap().join("repo");
+    std::fs::create_dir_all(&outside).unwrap();
+    let policy = PathTopologyPolicy::new(canonical.clone(), canonical.clone());
+
+    assert_eq!(project_topology_local_reason(&policy, &inside), None);
+
+    let reason = project_topology_local_reason(&policy, &outside)
+        .expect("a project outside the canonical root must run locally");
+    assert!(reason.contains("outside canonical root"), "{reason}");
+    assert!(reason.contains(&outside.display().to_string()), "{reason}");
+    assert!(
+        reason.contains("canonical_root"),
+        "the reason names the fix: {reason}"
+    );
+}

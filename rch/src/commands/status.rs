@@ -385,7 +385,18 @@ pub async fn diagnose(command: &str, dry_run: bool, ctx: &OutputContext) -> Resu
         .map(|s| s.source.clone())
         .unwrap_or_else(|| "default".to_string());
 
-    let decision = build_diagnose_decision_with_config(&details.classification, &config);
+    let mut decision = build_diagnose_decision_with_config(&details.classification, &config);
+    // bd-raobv: the execution path runs an off-root project locally before any
+    // worker is selected; report the same verdict here.
+    if decision.would_intercept
+        && let Ok(cwd) = std::env::current_dir()
+        && let Some(reason) = crate::hook::project_topology_local_reason(&topology_policy, &cwd)
+    {
+        decision = DiagnoseDecision {
+            would_intercept: false,
+            reason: format!("Would run locally: {reason}"),
+        };
+    }
     let would_intercept = decision.would_intercept;
 
     debug!(

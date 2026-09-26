@@ -9,7 +9,6 @@ readme.workspace = true
 keywords.workspace = true
 categories.workspace = true
 description = "Durable RABS content-addressed storage, action-cache indexing, object lifecycle, and publication transactions"
-publish = false
 
 [lib]
 doctest = false
@@ -26,7 +25,7 @@ test-support = []
 # backend in Epic H. Dependency-direction CI (bead A002) forbids Tokio and
 # rabs-asupersync from the core.
 [dependencies]
-rabs-protocol = { path = "../rabs-protocol" }
+rabs-protocol = { path = "../rabs-protocol", version = "2.1.0" }
 # H009 metadata-store backends: rusqlite (bundled C SQLite) is the
 # reference/differential TRUTH engine; fsqlite (FrankenSQLite, pure Rust)
 # is the dogfood candidate gated by the identical suite (H024).
@@ -43,7 +42,7 @@ blake3 = { workspace = true }
 # implementation instead of duplicating the canonical framing here (two
 # implementations of the root computation could silently drift). Pure
 # sibling crate; depends only on rabs-protocol.
-rabs-key = { path = "../rabs-key" }
+rabs-key = { path = "../rabs-key", version = "2.1.0" }
 # K004: coherent freshness stamping of materialized outputs (plan §30 —
 # outputs newer than inputs, private materializations only).
 filetime = { workspace = true }

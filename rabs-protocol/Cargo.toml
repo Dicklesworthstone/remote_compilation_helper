@@ -9,7 +9,6 @@ readme.workspace = true
 keywords.workspace = true
 categories.workspace = true
 description = "Stable RABS domain and wire schemas shared by wrappers, edge, coordinator, workers, gateways, and test harnesses"
-publish = false
 
 [lib]
 doctest = false

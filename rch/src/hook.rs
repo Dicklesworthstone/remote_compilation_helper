@@ -1443,7 +1443,10 @@ impl DurableLeaseWriter {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             if let Some(recovery) = lease.recovery.as_ref()
-                && (recovery.get("returned").and_then(serde_json::Value::as_i64).is_none()
+                && (recovery
+                    .get("returned")
+                    .and_then(serde_json::Value::as_i64)
+                    .is_none()
                     || recovery.get("retired").and_then(serde_json::Value::as_bool) != Some(true))
             {
                 anyhow::bail!(
@@ -2754,6 +2757,20 @@ pub async fn run_exec(
     // warnings reference the configured roots rather than compiled-in defaults.
     let topology_policy = config.path_topology.to_policy();
 
+    // bd-raobv: transfer cannot mirror a project outside the canonical root.
+    // Decide that before a worker slot is reserved, with a reason an operator
+    // can act on, and record it like every other fallback. A mode that forbids
+    // local execution refuses instead.
+    if let Ok(cwd) = std::env::current_dir()
+        && let Some(reason) = project_topology_local_reason(&topology_policy, &cwd)
+    {
+        let refuse_local = require_remote || clean_overlay || source_content_receipt;
+        if !refuse_local {
+            reporter.summary(&format!("[RCH] local ({reason})"));
+        }
+        exit_with_local_fallback(&command, &reporter, &reason, refuse_local);
+    }
+
     // Extract project name honoring configured path topology.
     let project = extract_project_name_with_policy(&topology_policy);
 
@@ -3699,7 +3716,8 @@ pub async fn run_exec(
 
         // A retry must not overwrite the only recovery identity for an older
         // source grant. This check precedes requesting another reservation.
-        durable_lease.ensure_released_for_retry()
+        durable_lease
+            .ensure_released_for_retry()
             .context(crate::transfer::RemoteExecutionUnconfirmed)?;
         // Worker-fault failure: try a bigger/different worker before going terminal.
         if attempt < max_attempts
@@ -4929,6 +4947,26 @@ fn command_uses_cargo_dependency_graph(kind: Option<CompilationKind>) -> bool {
                 | CompilationKind::CargoZigbuild
         )
     )
+}
+
+/// bd-raobv: why a build started in `cwd` must run locally because the project
+/// lies outside the configured canonical root (the worker mirror cannot place
+/// it), or `None` when topology admits it. The execution path and
+/// `rch diagnose` both call this so their verdicts cannot disagree.
+pub(crate) fn project_topology_local_reason(
+    policy: &PathTopologyPolicy,
+    cwd: &Path,
+) -> Option<String> {
+    normalize_project_path_with_policy(cwd, policy)
+        .err()
+        .map(|error| {
+            format!(
+                "project {} is outside canonical root {} ({error}); set [path_topology] \
+                 canonical_root or RCH_CANONICAL_PROJECT_ROOT to offload it",
+                cwd.display(),
+                policy.canonical_root().display()
+            )
+        })
 }
 
 fn normalize_dependency_root_for_runtime(

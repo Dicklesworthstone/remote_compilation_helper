@@ -34,7 +34,7 @@ fn fields(value: &Value, names: &[&str]) -> Result<(), String> {
 
 fn decode_hex(value: &Value, maximum: usize) -> Result<Vec<u8>, String> {
     let text = value.as_str().ok_or("toolchain hex must be a string")?;
-    if text.len() % 2 != 0
+    if !text.len().is_multiple_of(2)
         || text.len() / 2 > maximum
         || !text
             .bytes()
@@ -43,7 +43,9 @@ fn decode_hex(value: &Value, maximum: usize) -> Result<Vec<u8>, String> {
         return Err("invalid bounded toolchain hex".to_owned());
     }
     text.as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| {
             let digit = |byte: u8| {
                 if byte <= b'9' {
@@ -100,7 +102,9 @@ pub fn selected(frame: &str, authenticated: bool, source_enabled: bool) -> Resul
 }
 
 pub fn selected_reuse(
-    frame: &str, authenticated: bool, transfer_enabled: bool,
+    frame: &str,
+    authenticated: bool,
+    transfer_enabled: bool,
 ) -> Result<bool, String> {
     let value: Value = serde_json::from_str(frame).map_err(|error| error.to_string())?;
     match value.get("toolchain_reuse") {
@@ -181,7 +185,9 @@ impl ToolchainOwner {
         let ToolchainBacking::Uploaded(upload) = &mut self.backing else {
             return Err("toolchain upload is already sealed".to_owned());
         };
-        let UploadedToolchain { prepared, receiver, .. } = &mut **upload;
+        let UploadedToolchain {
+            prepared, receiver, ..
+        } = &mut **upload;
         let identity = hex(&self.identity.sha256);
         let result = (|| match frame["kind"].as_str() {
             Some("toolchain-entry") => {
@@ -272,8 +278,10 @@ impl ToolchainOwner {
                     .seal(|| cancelled.load(Ordering::Acquire) || Instant::now() >= deadline)
                     .map_err(|error| error.to_string())?;
                 *prepared = Some(verified);
-                Ok(json!({"kind":"toolchain-ready", "request_id":self.request_id,
-                    "sha256":identity, "sealed":true}))
+                Ok(
+                    json!({"kind":"toolchain-ready", "request_id":self.request_id,
+                    "sha256":identity, "sealed":true}),
+                )
             }
             _ => Err("unknown toolchain operation".to_owned()),
         })()
@@ -300,10 +308,14 @@ struct TransferState {
 
 impl TransferState {
     fn lookup(
-        &self, identity: &ToolchainIdentity, stopped: impl Fn() -> bool,
+        &self,
+        identity: &ToolchainIdentity,
+        stopped: impl Fn() -> bool,
     ) -> io::Result<Option<ToolchainLease>> {
         #[cfg(test)]
-        if let Some(pool) = &self.pool { return pool.lookup(identity, stopped); }
+        if let Some(pool) = &self.pool {
+            return pool.lookup(identity, stopped);
+        }
         toolchain_pool::lookup(identity, stopped)
     }
 
@@ -337,16 +349,24 @@ impl TransferState {
             }
             let deadline = Instant::now() + TOOLCHAIN_UPLOAD_BUDGET;
             if self.reuse
-                && let Some(lease) = self.lookup(&identity, || {
-                    cancelled.load(Ordering::Acquire) || Instant::now() >= deadline
-                }).map_err(|error| error.to_string())?
+                && let Some(lease) = self
+                    .lookup(&identity, || {
+                        cancelled.load(Ordering::Acquire) || Instant::now() >= deadline
+                    })
+                    .map_err(|error| error.to_string())?
             {
                 if lease.entry_count().map_err(|error| error.to_string())? != entries {
-                    return Err("retained toolchain entry count differs from declaration".to_owned());
+                    return Err(
+                        "retained toolchain entry count differs from declaration".to_owned()
+                    );
                 }
                 let owner = ToolchainOwner {
                     backing: ToolchainBacking::Reused(lease),
-                    request_id: id, identity, entries, deadline, failed: false,
+                    request_id: id,
+                    identity,
+                    entries,
+                    deadline,
+                    failed: false,
                 };
                 let reply = owner.ready(cancelled)?;
                 self.owner = Some(owner);
@@ -365,7 +385,9 @@ impl TransferState {
                     .map_err(|error| error.to_string())?;
             let owner = ToolchainOwner {
                 backing: ToolchainBacking::Uploaded(Box::new(UploadedToolchain {
-                    prepared: None, receiver, _directory: directory,
+                    prepared: None,
+                    receiver,
+                    _directory: directory,
                 })),
                 request_id: id,
                 identity,
@@ -407,8 +429,7 @@ impl TransferState {
             .backing
             .prepared_root()
             .ok_or("execution toolchain is not completely verified")?;
-        root
-            .to_str()
+        root.to_str()
             .map(|path| Some(path.to_owned()))
             .ok_or_else(|| "worker toolchain staging path is not UTF-8".to_owned())
     }
@@ -459,7 +480,10 @@ impl ToolchainTransferTask {
     #[must_use]
     pub fn with_reuse(reuse: bool) -> Self {
         Self {
-            state: Some(TransferState { reuse, ..TransferState::default() }),
+            state: Some(TransferState {
+                reuse,
+                ..TransferState::default()
+            }),
             shared: Arc::new(Mutex::new(CompletionState::default())),
             cancelled: Arc::new(AtomicBool::new(false)),
             sender: None,
@@ -711,17 +735,26 @@ mod tests {
 
     #[test]
     fn reuse_selection_requires_authenticated_toolchain_transfer() {
-        let ack = json!({"kind":"session-ok", "toolchain_reuse":TOOLCHAIN_REUSE_VERSION})
-            .to_string();
+        let ack =
+            json!({"kind":"session-ok", "toolchain_reuse":TOOLCHAIN_REUSE_VERSION}).to_string();
         assert!(selected_reuse(&ack, true, true).unwrap());
         assert!(selected_reuse(&ack, false, true).is_err());
         assert!(selected_reuse(&ack, true, false).is_err());
         assert!(!selected_reuse(r#"{"kind":"session-ok"}"#, false, false).unwrap());
-        for invalid in [Value::Null, json!(false), json!(17), json!("toolchain-reuse-v2")] {
-            assert!(selected_reuse(
-                &json!({"kind":"session-ok", "toolchain_reuse":invalid}).to_string(),
-                true, true,
-            ).is_err());
+        for invalid in [
+            Value::Null,
+            json!(false),
+            json!(17),
+            json!("toolchain-reuse-v2"),
+        ] {
+            assert!(
+                selected_reuse(
+                    &json!({"kind":"session-ok", "toolchain_reuse":invalid}).to_string(),
+                    true,
+                    true,
+                )
+                .is_err()
+            );
         }
     }
 
@@ -789,19 +822,29 @@ mod tests {
         const ENTRIES: usize = 5;
 
         fn fixture(
-            budget: u64, seed: bool,
+            budget: u64,
+            seed: bool,
         ) -> (tempfile::TempDir, Arc<toolchain_pool::ToolchainPool>, Value) {
             let source = tempfile::tempdir().unwrap();
             fs::create_dir(source.path().join("bin")).unwrap();
             fs::create_dir(source.path().join("empty")).unwrap();
             fs::write(source.path().join("bin/compiler"), CONTENTS).unwrap();
-            fs::set_permissions(source.path().join("bin/compiler"), fs::Permissions::from_mode(0o755)).unwrap();
+            fs::set_permissions(
+                source.path().join("bin/compiler"),
+                fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
             symlink("bin/compiler", source.path().join("rustc")).unwrap();
-            let identity = fingerprint_toolchain(source.path(), &ToolchainLimits::default(), || false).unwrap();
+            let identity =
+                fingerprint_toolchain(source.path(), &ToolchainLimits::default(), || false)
+                    .unwrap();
             let pool = Arc::new(toolchain_pool::ToolchainPool::new(budget, 2).unwrap());
             if seed {
                 // The same real capture as execution seeds this isolated pool.
-                drop(pool.acquire(source.path(), Some(&identity), || false).unwrap());
+                drop(
+                    pool.acquire(source.path(), Some(&identity), || false)
+                        .unwrap(),
+                );
             }
             let mut request = super::request();
             request["toolchain_identity"] = json!({
@@ -824,8 +867,12 @@ mod tests {
 
         struct ThreadWake(std::thread::Thread);
         impl Wake for ThreadWake {
-            fn wake(self: Arc<Self>) { self.0.unpark(); }
-            fn wake_by_ref(self: &Arc<Self>) { self.0.unpark(); }
+            fn wake(self: Arc<Self>) {
+                self.0.unpark();
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.unpark();
+            }
         }
 
         fn wait<T>(mut poll: impl FnMut(&mut Context<'_>) -> Poll<T>) -> T {
@@ -833,8 +880,13 @@ mod tests {
             let mut cx = Context::from_waker(&waker);
             let until = Instant::now() + Duration::from_secs(5);
             loop {
-                if let Poll::Ready(value) = poll(&mut cx) { return value; }
-                assert!(Instant::now() < until, "owned filesystem/execution task did not finish");
+                if let Poll::Ready(value) = poll(&mut cx) {
+                    return value;
+                }
+                assert!(
+                    Instant::now() < until,
+                    "owned filesystem/execution task did not finish"
+                );
                 std::thread::park_timeout(Duration::from_millis(5));
             }
         }
@@ -847,12 +899,17 @@ mod tests {
         fn transfer_frames(request: &Value) -> Vec<Value> {
             let id = &request["request_id"];
             let digest = &request["toolchain_identity"]["sha256"];
-            let entry = |path: &str, entry: Value| json!({"kind":"toolchain-entry",
-                "request_id":id, "sha256":digest, "path":path, "entry":entry});
+            let entry = |path: &str, entry: Value| {
+                json!({"kind":"toolchain-entry",
+                "request_id":id, "sha256":digest, "path":path, "entry":entry})
+            };
             vec![
                 entry("", json!({"kind":"directory"})),
                 entry("bin", json!({"kind":"directory"})),
-                entry("bin/compiler", json!({"kind":"file", "bytes":CONTENTS.len(), "executable":true})),
+                entry(
+                    "bin/compiler",
+                    json!({"kind":"file", "bytes":CONTENTS.len(), "executable":true}),
+                ),
                 json!({"kind":"toolchain-chunk", "request_id":id, "sha256":digest,
                     "path":"bin/compiler", "offset":0, "data_hex":hex(CONTENTS),
                     "chunk_sha256":crate::session::sha256_hex(CONTENTS)}),
@@ -872,17 +929,25 @@ mod tests {
             assert!(exchange(&mut task, &wrong).is_err());
             assert!(task.prepared_path(&request, true).is_err());
             let ready = exchange(&mut task, &begin(&request)).unwrap();
-            assert_eq!(ready, json!({"kind":"toolchain-ready", "request_id":0,
-                "sha256":request["toolchain_identity"]["sha256"], "sealed":true}));
+            assert_eq!(
+                ready,
+                json!({"kind":"toolchain-ready", "request_id":0,
+                "sha256":request["toolchain_identity"]["sha256"], "sealed":true})
+            );
             assert_eq!(exchange(&mut task, &begin(&request)).unwrap(), ready);
             let path = task.prepared_path(&request, true).unwrap().unwrap();
             assert_eq!(fs::read(Path::new(&path).join("rustc")).unwrap(), CONTENTS);
-            assert!(matches!(task.state.as_ref().unwrap().owner.as_ref().unwrap().backing,
-                ToolchainBacking::Reused(_)));
+            assert!(matches!(
+                task.state.as_ref().unwrap().owner.as_ref().unwrap().backing,
+                ToolchainBacking::Reused(_)
+            ));
             for field in ["request_id", "toolchain_identity"] {
                 let mut foreign = request.clone();
-                if field == "request_id" { foreign[field] = json!(1); }
-                else { foreign[field]["files"] = json!(2); }
+                if field == "request_id" {
+                    foreign[field] = json!(1);
+                } else {
+                    foreign[field]["files"] = json!(2);
+                }
                 assert!(task.prepared_path(&foreign, true).is_err());
                 assert!(task.take_prepared(&foreign).is_err());
             }
@@ -891,7 +956,10 @@ mod tests {
             let owner = task.take_prepared(&request).unwrap().unwrap();
             drop(task);
             drop(pool);
-            assert_eq!(fs::read(Path::new(&path).join("bin/compiler")).unwrap(), CONTENTS);
+            assert_eq!(
+                fs::read(Path::new(&path).join("bin/compiler")).unwrap(),
+                CONTENTS
+            );
             drop(owner);
             assert!(!Path::new(&path).exists());
         }
@@ -907,7 +975,10 @@ mod tests {
 
             let (source, pool, request) = fixture(1024, true);
             let mut task = task(&pool, true);
-            assert_eq!(exchange(&mut task, &begin(&request)).unwrap()["sealed"], true);
+            assert_eq!(
+                exchange(&mut task, &begin(&request)).unwrap()["sealed"],
+                true
+            );
             let owner = task.take_prepared(&request).unwrap().unwrap();
             let root = owner.backing.prepared_root().unwrap().to_path_buf();
             let execution_root = root.clone();
@@ -920,47 +991,83 @@ mod tests {
                 // This tests owned input lifetime with a real managed child; it
                 // does not substitute for a canonical sandbox or TLS fixture.
                 let mut command = Command::new("/bin/sh");
-                command.args(["-c", "while [ ! -f \"$GATE\" ]; do sleep 0.01; done; cat \"$INPUT\""])
-                    .env_clear().env("PATH", "/usr/bin:/bin")
-                    .env("GATE", execution_gate).env("INPUT", execution_root.join("rustc"))
-                    .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
-                let group = ManagedProcessGroup::spawn_command(command, Attribution::default()).unwrap();
+                command
+                    .args([
+                        "-c",
+                        "while [ ! -f \"$GATE\" ]; do sleep 0.01; done; cat \"$INPUT\"",
+                    ])
+                    .env_clear()
+                    .env("PATH", "/usr/bin:/bin")
+                    .env("GATE", execution_gate)
+                    .env("INPUT", execution_root.join("rustc"))
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
+                let group =
+                    ManagedProcessGroup::spawn_command(command, Attribution::default()).unwrap();
                 started.send(()).unwrap();
-                let drained = group.wait_with_bounded_drain_budget(
-                    &DrainLimits { resident_bound:1024, spill_dir:spill }, 4096,
-                    || control.reason().is_some(),
-                ).unwrap();
+                let drained = group
+                    .wait_with_bounded_drain_budget(
+                        &DrainLimits {
+                            resident_bound: 1024,
+                            spill_dir: spill,
+                        },
+                        4096,
+                        || control.reason().is_some(),
+                    )
+                    .unwrap();
                 assert_eq!(drained.residual_group_members, 0);
-                assert_eq!(fs::read(execution_root.join("bin/compiler")).unwrap(), CONTENTS);
-                let outputs = CapturedOutputs::from_lanes(&drained.stdout, &drained.stderr).unwrap();
+                assert_eq!(
+                    fs::read(execution_root.join("bin/compiler")).unwrap(),
+                    CONTENTS
+                );
+                let outputs =
+                    CapturedOutputs::from_lanes(&drained.stdout, &drained.stderr).unwrap();
                 crate::session::ExecResult {
-                    request_id:0, exit_code:drained.status.code().unwrap_or(125), executed:true,
-                    stdout_sha256:outputs.stdout.sha256().to_owned(),
-                    stderr_sha256:outputs.stderr.sha256().to_owned(),
-                    residual_group_members:drained.residual_group_members,
-                    stdout_spill_bytes:drained.stdout.spilled_bytes(),
-                    stderr_spill_bytes:drained.stderr.spilled_bytes(),
-                    stdout_spill_path:None, stderr_spill_path:None,
+                    request_id: 0,
+                    exit_code: drained.status.code().unwrap_or(125),
+                    executed: true,
+                    stdout_sha256: outputs.stdout.sha256().to_owned(),
+                    stderr_sha256: outputs.stderr.sha256().to_owned(),
+                    residual_group_members: drained.residual_group_members,
+                    stdout_spill_bytes: drained.stdout.spilled_bytes(),
+                    stderr_spill_bytes: drained.stderr.spilled_bytes(),
+                    stdout_spill_path: None,
+                    stderr_spill_path: None,
                 }
-            }).unwrap();
+            })
+            .unwrap();
             running.recv_timeout(Duration::from_secs(5)).unwrap();
             drop(task);
             drop(pool);
-            assert!(root.is_dir(), "the executing owner's lease retains the pool parent");
+            assert!(
+                root.is_dir(),
+                "the executing owner's lease retains the pool parent"
+            );
             fs::write(gate, b"continue").unwrap();
             let completed = wait(|cx| execution.poll_completion(cx)).unwrap();
             assert_eq!(completed.result.exit_code, 0);
-            assert_eq!(completed.result.stdout_sha256, crate::session::sha256_hex(CONTENTS));
+            assert_eq!(
+                completed.result.stdout_sha256,
+                crate::session::sha256_hex(CONTENTS)
+            );
             assert_eq!(completed.result.residual_group_members, 0);
-            assert!(!root.exists(), "the final lease is released after process cleanup");
+            assert!(
+                !root.exists(),
+                "the final lease is released after process cleanup"
+            );
         }
 
         #[test]
         fn unselected_disabled_and_missing_reuse_finish_the_full_real_upload() {
-            for (reuse, budget, seed) in [(false, 1024, true), (true, 0, true), (true, 1024, false)] {
+            for (reuse, budget, seed) in [(false, 1024, true), (true, 0, true), (true, 1024, false)]
+            {
                 let (_source, pool, request) = fixture(budget, seed);
                 let mut task = task(&pool, reuse);
-                assert_eq!(exchange(&mut task, &begin(&request)).unwrap()["sealed"], false);
+                assert_eq!(
+                    exchange(&mut task, &begin(&request)).unwrap()["sealed"],
+                    false
+                );
                 assert!(task.prepared_path(&request, true).is_err());
                 for frame in transfer_frames(&request) {
                     assert_ne!(exchange(&mut task, &frame).unwrap()["kind"], "error");
@@ -990,7 +1097,10 @@ mod tests {
             assert!(pool.lookup(&identity, || false).unwrap().is_none());
             assert!(lease.verify(|| false).is_err());
             // A subsequent begin can only recover by receiving all bytes again.
-            assert_eq!(exchange(&mut task, &begin(&request)).unwrap()["sealed"], false);
+            assert_eq!(
+                exchange(&mut task, &begin(&request)).unwrap()["sealed"],
+                false
+            );
         }
 
         #[test]
@@ -1008,8 +1118,18 @@ mod tests {
             assert!(cancelled.prepared_path(&request, true).is_err());
             assert!(cancelled.take_prepared(&request).is_err());
             let mut expired = task(&pool, true);
-            assert_eq!(exchange(&mut expired, &begin(&request)).unwrap()["sealed"], true);
-            expired.state.as_mut().unwrap().owner.as_mut().unwrap().deadline = Instant::now();
+            assert_eq!(
+                exchange(&mut expired, &begin(&request)).unwrap()["sealed"],
+                true
+            );
+            expired
+                .state
+                .as_mut()
+                .unwrap()
+                .owner
+                .as_mut()
+                .unwrap()
+                .deadline = Instant::now();
             assert!(expired.prepared_path(&request, true).is_err());
             assert!(expired.take_prepared(&request).is_err());
         }

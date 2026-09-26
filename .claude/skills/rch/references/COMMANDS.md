@@ -121,7 +121,7 @@ There is no `rch config check`; it is `validate` (syntax) / `lint` / `doctor`
 ## Doctor, Self-Test, Error Catalog
 
 ```bash
-rch doctor [--fix] [--dry-run] [--install-deps]
+rch doctor [--fix] [--dry-run]
 rch doctor --reliability [--check-schemas] [--strict|--lenient] [--scope all|topology,convergence,pressure,triage,helpers,rollout,schema]   # main adds `ownership` (mirror-ownership probe); 1.0.58 rejects it and has no such probe
 rch doctor --reliability --watch [--watch-interval <S>=5] [--transitions-only] [--watch-snapshot <PATH>]
 rch doctor --runbook <RCH-Rnnn>          # render an authored runbook as Markdown, no probes

@@ -256,7 +256,8 @@ rch gc [--root DIR]... [--workers <id>...]      # PREVIEW stale rch runtime dirs
 rch gc --apply [--root DIR]...                  # ...and actually collect them
 rch cache warm|clean|status [--workers <id>...] # remote source/target caches
 rch rabs gc plan|run|history [--cas-root DIR] [--mode normal|emergency]
-rch rabs worker|doctor|inventory|reconcile
+rch rabs worker|doctor|inventory
+rch rabs worker reconcile <WORKER>
 ```
 
 On macOS, daemon autostarts defer to a registered `com.rch.daemon` launchd
@@ -395,7 +396,7 @@ outputs are quiet but still await recovery.
 
 ```bash
 rch config show|get|set|reset|init|validate|lint|doctor|edit|diff|export
-rch doctor [--fix] [--dry-run] [--install-deps]
+rch doctor [--fix] [--dry-run]
 rch doctor --reliability [--check-schemas] [--scope <scope>] [--strict|--lenient] [--json]
 rch doctor --reliability --watch [--watch-interval N] [--transitions-only]
 rch doctor --runbook RCH-Rnnn | --runbook-list
@@ -578,8 +579,11 @@ before transferring them. Their default total retry budget grows with that size
 one hour). An explicit `max_transfer_time_ms` keeps its existing hard ceiling
 and skips estimation. Rsync also stops after 30 seconds without network I/O.
 If estimation fails, RCH logs the failure and retains the configured retry
-budget. These filters can include other cached build outputs in the same profile;
-they do not yet select only the executable named by `cargo build --bin`.
+budget. A literal `cargo build --bin NAME` or `--example NAME` retrieves only
+the named payloads, not the pooled target's other cached outputs. Anything the
+narrowing cannot parse exactly (unknown flags, shell expansion, other target
+kinds, response files, custom target specs) keeps the broad per-profile filters,
+which can include other cached build outputs in the same profile.
 
 Windows workers return artifacts through tar in both quiet and interactive
 execution. The transfer honors the requested output patterns and cache exclusions,
@@ -944,7 +948,10 @@ commands may still run locally. For several focused checks, run separate direct
 - Transport uses SSH.
 - Worker commands are constrained to classified execution paths.
 - Sensitive field masking and structured error taxonomy are built in.
-- Sigstore/checksum verification is part of update/release flows.
+- `rch update` enforces the release's SHA-256 checksums. A Sigstore bundle is
+  verified only when the release ships one and `cosign` is installed; otherwise
+  update warns and relies on the checksum, which detects corruption but not a
+  tampered release.
 - Hook path remains fail-open to avoid deadlocks/stalls.
 
 Operational recommendations:

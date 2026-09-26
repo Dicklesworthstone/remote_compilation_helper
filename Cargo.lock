@@ -5116,14 +5116,14 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "rabs-action"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "rabs-protocol",
 ]
 
 [[package]]
 name = "rabs-asupersync"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "asupersync 0.5.0 (git+https://github.com/Dicklesworthstone/asupersync.git?rev=78b64636e99fea4ea2d868096576021dd3b8e519)",
  "parking_lot",
@@ -5134,7 +5134,7 @@ dependencies = [
 
 [[package]]
 name = "rabs-cas"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "blake3",
  "filetime",
@@ -5150,7 +5150,7 @@ dependencies = [
 
 [[package]]
 name = "rabs-key"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "rabs-protocol",
  "serde_json",
@@ -5160,11 +5160,11 @@ dependencies = [
 
 [[package]]
 name = "rabs-protocol"
-version = "2.0.0"
+version = "2.1.0"
 
 [[package]]
 name = "rabs-replay"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "rabs-protocol",
  "serde_json",
@@ -5172,7 +5172,7 @@ dependencies = [
 
 [[package]]
 name = "rabs-sandbox"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "rabs-protocol",
  "rustix",
@@ -5182,7 +5182,7 @@ dependencies = [
 
 [[package]]
 name = "rabs-scheduler"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "rabs-protocol",
  "tempfile",
@@ -5190,7 +5190,7 @@ dependencies = [
 
 [[package]]
 name = "rabs-wkr"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "asupersync 0.5.0 (git+https://github.com/Dicklesworthstone/asupersync.git?rev=78b64636e99fea4ea2d868096576021dd3b8e519)",
  "rabs-action",
@@ -5205,7 +5205,7 @@ dependencies = [
 
 [[package]]
 name = "rabs-wrap"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "rabs-protocol",
  "serde_json",
@@ -5214,7 +5214,7 @@ dependencies = [
 
 [[package]]
 name = "rabsd"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "asupersync 0.5.0 (git+https://github.com/Dicklesworthstone/asupersync.git?rev=78b64636e99fea4ea2d868096576021dd3b8e519)",
  "rabs-action",
@@ -5357,7 +5357,7 @@ dependencies = [
 
 [[package]]
 name = "rch"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -5422,7 +5422,7 @@ dependencies = [
 
 [[package]]
 name = "rch-common"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -5456,7 +5456,7 @@ dependencies = [
 
 [[package]]
 name = "rch-telemetry"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -5481,7 +5481,7 @@ dependencies = [
 
 [[package]]
 name = "rch-wkr"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -5502,7 +5502,7 @@ dependencies = [
 
 [[package]]
 name = "rchd"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "anyhow",
  "axum",
