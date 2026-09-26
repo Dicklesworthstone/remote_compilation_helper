@@ -373,46 +373,24 @@ fn spawn_rchd(path: &Path) -> Result<(), AutoStartError> {
     Ok(())
 }
 
+/// A health exchange has one deadline, not a fresh deadline for each line.
+/// In particular, a peer streaming headers must not keep dispatch blocked or
+/// allocate an unbounded response while holding the autostart lock.
 async fn probe_daemon_health(socket_path: &Path) -> bool {
-    let connect = timeout(Duration::from_millis(300), UnixStream::connect(socket_path)).await;
-    let stream = match connect {
-        Ok(Ok(stream)) => stream,
-        _ => return false,
+    let budget = Duration::from_millis(300);
+    let probe = async {
+        let stream = UnixStream::connect(socket_path).await?;
+        let (reader, mut writer) = stream.into_split();
+        writer.write_all(b"GET /health\n").await?;
+        writer.flush().await?;
+
+        // Use the same bounded HTTP/status parser as selection. An HTTP error
+        // carrying a misleading {"status":"healthy"} body is not readiness.
+        let body = daemon_ipc::read_daemon_body(reader, budget, false).await?;
+        let response: HealthResponse = serde_json::from_str(&body)?;
+        Ok::<bool, anyhow::Error>(response.status == "healthy")
     };
-
-    let (reader, mut writer) = stream.into_split();
-    if writer.write_all(b"GET /health\n").await.is_err() {
-        return false;
-    }
-    let _ = writer.flush().await;
-
-    let mut reader = BufReader::new(reader);
-    let mut line = String::new();
-    let mut body = String::new();
-    let mut in_body = false;
-
-    loop {
-        line.clear();
-        let read = match timeout(Duration::from_millis(300), reader.read_line(&mut line)).await {
-            Ok(Ok(n)) => n,
-            _ => return false,
-        };
-        if read == 0 {
-            break;
-        }
-        if in_body {
-            body.push_str(&line);
-        } else if line.trim().is_empty() {
-            in_body = true;
-        }
-    }
-
-    let response: HealthResponse = match serde_json::from_str(body.trim()) {
-        Ok(resp) => resp,
-        Err(_) => return false,
-    };
-
-    response.status == "healthy"
+    matches!(timeout(budget, probe).await, Ok(Ok(true)))
 }
 
 async fn socket_is_confirmed_stale(socket_path: &Path) -> bool {
@@ -426,17 +404,22 @@ async fn socket_is_confirmed_stale(socket_path: &Path) -> bool {
     }
 }
 
-async fn wait_for_socket(socket_path: &Path, timeout_secs: u64) -> bool {
-    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
-    loop {
-        if socket_path.exists() && probe_daemon_health(socket_path).await {
-            return true;
-        }
-        if Instant::now() >= deadline {
-            return false;
-        }
-        sleep(Duration::from_millis(100)).await;
+/// Bound all readiness probes and sleeps together. Checking elapsed time only
+/// between probes allows a slow peer to exceed the caller's startup budget.
+async fn wait_for_socket(socket_path: &Path, budget: Duration) -> bool {
+    if budget.is_zero() {
+        return false;
     }
+    timeout(budget, async {
+        loop {
+            if probe_daemon_health(socket_path).await {
+                return true;
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .unwrap_or(false)
 }
 
 pub(super) async fn try_auto_start_daemon(
@@ -524,7 +507,7 @@ pub(super) async fn try_auto_start_daemon(
     spawn_rchd(&rchd_path)?;
 
     let timeout_secs = config.auto_start_timeout_secs;
-    if !wait_for_socket(socket_path, timeout_secs).await {
+    if !wait_for_socket(socket_path, Duration::from_secs(timeout_secs)).await {
         return Err(AutoStartError::Timeout(timeout_secs));
     }
 
@@ -1197,5 +1180,116 @@ mod tests {
             "Second write should be >= first write (ts2={ts2} >= ts1={ts1})"
         );
         // TEST PASS: Cooldown file update
+    }
+
+    /// Single-response server with no environment mutation or real daemon.
+    async fn probe_test_response(response: &[u8]) -> bool {
+        let dir = create_test_state_dir();
+        let socket = dir.path().join("health.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let response = response.to_vec();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 12];
+            stream.read_exact(&mut request).await.unwrap();
+            assert_eq!(&request, b"GET /health\n");
+            // Oversize rejection may close the connection before all bytes fit.
+            let _ = stream.write_all(&response).await;
+        });
+        let healthy = probe_daemon_health(&socket).await;
+        server.await.unwrap();
+        healthy
+    }
+
+    #[tokio::test]
+    async fn health_probe_accepts_valid_http_responses() {
+        for response in [
+            &b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"status\":\"healthy\"}"[..],
+            &b"HTTP/1.0 200 OK\n\n{\"status\":\"healthy\"}\n"[..],
+        ] {
+            assert!(probe_test_response(response).await);
+        }
+    }
+
+    #[tokio::test]
+    async fn health_probe_rejects_invalid_status_or_body() {
+        for response in [
+            &b"HTTP/1.1 503 Unavailable\n\n{\"status\":\"healthy\"}"[..],
+            &b"not-http 200 OK\n\n{\"status\":\"healthy\"}"[..],
+            &b"{\"status\":\"healthy\"}"[..],
+            &b"HTTP/1.1 200 OK\n\n{\"status\":\"degraded\"}"[..],
+            &b"HTTP/1.1 200 OK\n\n{\"status\":"[..],
+            &b"HTTP/1.1 200 OK\n\n\xff"[..],
+        ] {
+            assert!(!probe_test_response(response).await, "response: {response:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn health_probe_rejects_oversize_responses() {
+        let mut response = b"HTTP/1.1 200 OK\n\n{\"status\":\"healthy\",\"padding\":\"".to_vec();
+        response.extend(std::iter::repeat_n(b'x', 100 * 1024));
+        response.extend_from_slice(b"\"}");
+        assert!(!probe_test_response(&response).await);
+    }
+
+    #[tokio::test]
+    async fn health_probe_trickle_cannot_extend_the_deadline() {
+        let dir = create_test_state_dir();
+        let socket = dir.path().join("trickle.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            loop {
+                if stream.write_all(b"X-Progress: still starting\n").await.is_err() {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        });
+        let result = timeout(Duration::from_secs(2), probe_daemon_health(&socket)).await;
+        server.abort();
+        let _ = server.await;
+        assert!(!result.expect("per-line traffic must not renew the deadline"));
+    }
+
+    #[tokio::test]
+    async fn readiness_wait_bounds_a_stalled_probe() {
+        let dir = create_test_state_dir();
+        let socket = dir.path().join("stalled.sock");
+        // A listener that never handles requests still accepts connections.
+        let _listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let result = timeout(
+            Duration::from_millis(200),
+            wait_for_socket(&socket, Duration::from_millis(30)),
+        )
+        .await;
+        assert!(!result.expect("the 300ms probe must obey the shorter wait budget"));
+    }
+
+    #[tokio::test]
+    async fn readiness_wait_observes_a_delayed_daemon() {
+        let dir = create_test_state_dir();
+        let socket = dir.path().join("delayed.sock");
+        let server_socket = socket.clone();
+        let server = tokio::spawn(async move {
+            sleep(Duration::from_millis(20)).await;
+            let listener = tokio::net::UnixListener::bind(&server_socket).unwrap();
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 12];
+            stream.read_exact(&mut request).await.unwrap();
+            stream.write_all(b"HTTP/1.1 200 OK\n\n{\"status\":\"healthy\"}").await.unwrap();
+        });
+        assert!(wait_for_socket(&socket, Duration::from_secs(2)).await);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn readiness_zero_budget_does_not_connect() {
+        let dir = create_test_state_dir();
+        let socket = dir.path().join("zero.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        assert!(!wait_for_socket(&socket, Duration::ZERO).await);
+        assert!(timeout(Duration::from_millis(20), listener.accept()).await.is_err());
     }
 }
