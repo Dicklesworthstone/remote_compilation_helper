@@ -952,7 +952,10 @@ fn test_worker_handles_binary_output() {
 // Worker Release Tests
 // ============================================================================
 
-/// Test releasing a worker slot.
+/// An UNOWNED slot release (no durable build_id) is refused and never
+/// acknowledged: since 0e64c878 a release must name the build that owns the
+/// slots, and clients treat only a 2xx status line as an acknowledgement.
+/// The refusal must not take the daemon down.
 #[test]
 fn test_release_worker() {
     let _guard = test_guard!();
@@ -970,15 +973,30 @@ fn test_release_worker() {
         .wait_for_socket(&socket_path, Duration::from_secs(10))
         .unwrap();
 
-    // Release worker slot
-    let response =
-        send_socket_request(&socket_path, "POST /release-worker?worker=worker1&slots=1").unwrap();
+    // Unowned release: refused, so no acknowledgement may come back.
+    let unowned = send_socket_request(&socket_path, "POST /release-worker?worker=worker1&slots=1");
+    match &unowned {
+        Ok(response) => assert!(
+            !response.contains("200 OK"),
+            "an unowned release must not be acknowledged: {response}"
+        ),
+        Err(error) => assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::UnexpectedEof,
+            "refusal closes the connection without an acknowledgement: {error}"
+        ),
+    }
 
-    assert!(response.contains("200 OK"), "Got: {}", response);
+    // The daemon keeps serving after the refusal.
+    let health = send_socket_request(&socket_path, "GET /health").unwrap();
+    assert!(
+        health.contains("200 OK"),
+        "daemon unhealthy after refusal: {health}"
+    );
 
     harness
         .logger
-        .info("[e2e::worker] VERIFY: worker slot released successfully");
+        .info("[e2e::worker] VERIFY: unowned release refused; daemon still healthy");
     harness
         .logger
         .info("[e2e::worker] TEST PASS: test_release_worker");

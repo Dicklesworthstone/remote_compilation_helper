@@ -5,7 +5,7 @@ Compilation Helper): the PreToolUse hook + CLI (`rch`), the local daemon (`rchd`
 worker agent (`rch-wkr`), the RABS build sidecar (`rabs-*`, `rabsd`), and the fleet
 dashboard (`dashboard/`).
 
-Scope window: project inception (`v0.1.0`, 2026-01-25) through `v2.0.0` (2026-09-13).
+Scope window: project inception (`v0.1.0`, 2026-01-25) through `v2.1.0` (2026-09-26).
 
 This document was rebuilt from git history (`git log --no-merges` per tag range, `git show`
 on representative commits), version tags (`git for-each-ref`), GitHub release metadata
@@ -31,16 +31,52 @@ Repository: <https://github.com/Dicklesworthstone/remote_compilation_helper>
 
 ## Unreleased
 
-The asupersync 0.5.0 and FrankenSQLite 0.4.0 candidate on `main` is separate
-from the qualified 2.0.0 release below. Its independent native Linux
-admission and test follow-ups are recorded in
-`docs/adr/007-asupersync-revision-pin.md` and `UPGRADE_LOG.md`.
+## 2.1.0 — 2026-09-26
 
-- Add durable job ownership and same-identity `jobs attach`, `jobs cancel`, and
-  `jobs recover` commands. Recover stalled artifact retrieval without replaying
-  compilation; retain publication and retirement evidence for recovery retries.
-- Fix path normalization when canonical and alias roots are identical: resolve
-  parent components while retaining the final canonical-root containment check.
+Cut from `main`: every change since 2.0.0, including the three fixes also shipped in
+2.0.1. The detailed capability sections are under [`[v2.1.0]`](#v210----2026-09-26-release)
+below.
+
+- **Durable job identity.** `rch jobs attach | cancel | recover` act only on the
+  identity-matched job and never replay a build. Queued jobs can be cancelled
+  durably, and orphaned jobs release their slots once.
+- **Truthful outcomes.** Only exit 0 counts as success in history and statistics.
+  Deadline kills are distinguished from resource kills, and savings are not
+  estimated without a local baseline.
+- **Artifacts.** `cargo build --bin/--example`, `--no-run` and `-o` outputs retrieve
+  only the named payloads, with a retry budget sized to the payload. Wrong-CPU outputs
+  are rejected. Binaries carry the caller's source revision.
+- **Source integrity.** Source-root ownership persists through recovery and GC.
+  `--dependency-base` binds sibling repositories in clean overlays, and Cargo
+  selections that would escape the overlay fail closed (`RCH-E413`).
+- **Admission and visibility.** Memory-stall-aware admission and capacity that counts
+  only admissible workers. `--require-tool` gates jobs on verified probes. Every
+  local fallback is ledgered and summarized in `rch status`. The daemon exports OTLP
+  metrics.
+- **Operator commands do what they say.** `fleet drain` and
+  `fleet deploy --drain-first` really drain, `fleet status --watch` refreshes, the
+  dead `doctor --install-deps` flag is gone, off-root projects are decided local
+  before a worker is reserved (and `diagnose` agrees), and `FORCE_COLOR` is honored.
+- **Release-gate fix.** A fresh `rchd` no longer fsyncs its ownership journal
+  between binding and serving the socket. On busy workers that stall exceeded 10
+  seconds, and it was the root cause of about 30 daemon test failures.
+- **Dependencies.** The asupersync 0.5.0 and FrankenSQLite 0.4.x upgrade from `main`
+  ships here (`docs/adr/007-asupersync-revision-pin.md`, `UPGRADE_LOG.md`).
+- **RABS remains experimental and operator-only.** It serves no automatic Cargo cache
+  hits, and its binaries are not in the release archives.
+
+## 2.0.1 — 2026-09-26
+
+A patch release cut by another operator from a branch on top of 2.0.0 ([`3f66c37b`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/3f66c37ba029f62825e64cf89acf39ef04532c25)), not
+from `main`:
+[GitHub release](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v2.0.1).
+It carries three fixes, all of which are also in 2.1.0:
+
+- Worker benchmarks are bounded by `timeout` on the worker itself, not only on the
+  dispatcher.
+- Every local fallback or refusal is recorded as `RCH-I011`/`RCH-I012` in
+  `~/.local/state/rch/incidents.jsonl`.
+- `rch status` shows the last 24 hours' local fallbacks and their top reasons.
 
 ## 2.0.0 — 2026-09-13
 
@@ -88,6 +124,8 @@ follow-ups, artifact hashes, and retained limitations.
 
 | Version | Kind | Date | Summary |
 |---------|------|------|---------|
+| [`v2.1.0`](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v2.1.0) | Release | 2026-09-26 | Durable job identity (`rch jobs`); exit-0-only success; named-artifact retrieval; fail-closed clean overlays; PSI admission and `--require-tool`; fallback ledger; OTLP; truthful fleet drain/deploy; fresh-daemon fsync stall fixed; asupersync 0.5 |
+| [`v2.0.1`](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v2.0.1) | Release | 2026-09-26 | Patch branch on 2.0.0: worker-side benchmark deadline, local-fallback incident ledger, `rch status` fallback summary |
 | [`v2.0.0`](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v2.0.0) | Release | 2026-09-12 | Stable Rust dependency refresh; schemars 1.x Rust API break with Draft 7 output; worker admission and maintenance fixes; signed Linux x86-64 and macOS ARM64 binaries, published September 13 |
 | [`v1.0.64`](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v1.0.64) | Release | 2026-09-07 | rsync flavour probe: stock macOS openrsync no longer breaks every transfer (#66); `[transfer] rsync_bin` / `RCH_RSYNC_BIN`; retrieved artifacts typed against the requesting host (#65, RCH-E327); pooled target `store_base` for external worker volumes (#64) |
 | [`v1.0.63`](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v1.0.63) | Release | 2026-09-03 | rchd daemon can no longer be wedged by the durable-lease scan: syscall liveness, lease reaping, scan off the runtime threads |
@@ -161,6 +199,202 @@ follow-ups, artifact hashes, and retained limitations.
 ---
 
 ## [Unreleased]
+
+## [v2.1.0] -- 2026-09-26 (release)
+
+Range `v2.0.0..v2.1.0`: 532 non-merge commits in thirteen days before the release-prep
+commits. 174 touched the core product (`rch`, `rchd`, `rch-wkr`, `rch-common`,
+`rch-telemetry`, installer, dashboard, README) and 215 touched RABS. Many of those commits
+say in their own messages that their new tests were not run on the authoring host. This
+release's gate is what re-ran them, recorded in the summary at the top of this file. Two
+defects surfaced by that gate were fixed here: a pre-serve fsync in daemon startup, and
+four clippy lints in `rabs-wkr`.
+
+### Durable job identity: `rch jobs attach | cancel | recover`
+
+Every offloaded build now has a durable local lease. The lease records the wrapper's pid,
+boot id and process start ticks, so a recycled PID cannot impersonate another job. The
+daemon's job routes match on that identity. `rch jobs` lists the leases. `attach` follows
+the original job, `cancel` stops only the matching daemon build, and `recover` reconciles
+completion and fetches any outstanding outputs. None of them ever starts a second build.
+Queued jobs can be cancelled durably before a worker admits them. Orphaned jobs release
+their reservation once, and an uncertain execution is reported as a typed error, never
+replayed. These commands are Unix-only and refuse daemons that lack the identity-aware
+routes.
+
+- [`4310d4b4`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/4310d4b481fd32dbb7bc705ae08eef3e9d7d2e31): lease identity (pid, boot_id, start ticks)
+- [`0e64c878`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/0e64c878af20399d20b3db34258422f1c67d8136): identity-aware daemon job routes
+- [`81255eb3`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/81255eb336e6b0fe2e80e64d120f28d2e357cb98): the `jobs attach/cancel/recover` CLI
+- [`7eaebf10`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/7eaebf1041afc20e07054f0fdffa4735c62cc2ed): durable queued cancellation and a separate queue-ID namespace
+- [`b3e0c3bf`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/b3e0c3bf2950b76158e2060138944c69f3ca14be): orphan recovery without replay
+
+### Daemon cancellation, reload and startup safety
+
+- A reservation is released only after the worker confirms that the build's process group
+  has exited ([`3a231167`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/3a231167ed048b80661855e77ab51058b169d378)).
+- Bulk cancellation completes even if the caller disconnects
+  ([`4e8fb584`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/4e8fb5847b41078ba8d80dd278cd019c4aad12f2)).
+- A failed reload of `workers.toml` keeps the previous pool
+  ([`c5065cbc`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/c5065cbcca665153218cf54485f592a6b124cedd)).
+- CLI autostart hands off to a registered launchd service instead of racing it for the
+  socket ([`e82d2ad5`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/e82d2ad58dd8abc0305cda748f98dee9192469e8),
+  `bd-mhv3x`), and concurrent startups share one gate
+  ([`950bccef`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/950bccef742485fdfe769bed869643e528e7a678)).
+- **Fixed in this release:** a fresh daemon no longer fsyncs its ownership journal between
+  binding the socket and serving it. On a worker with heavy disk writeback, that fsync held
+  startup for more than 10 seconds while the bound socket accepted connections that nothing
+  answered. This was the root cause of 30 daemon test failures at the release candidate
+  (`bd-5rbv4`). A restart that recovers existing state still persists before admitting work.
+
+### Truthful outcomes and statistics
+
+Build and test history now counts a run as successful only when it exits 0. Before this,
+Cargo's exit 101 and signal kills could be recorded as successful compilations. The
+`build_error_runs` bucket is gone. Savings estimates read `n/a (no local baseline)` instead
+of assuming a 2x speedup. Launcher deadlines are reported separately from other SIGKILLs,
+and exit 137 is no longer reported as out-of-memory without evidence.
+
+- [`81ac3ead`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/81ac3ead1c2b9eba774092886fcbad150ea8653d): success means exit code 0 (`bd-88fpl`)
+- [`e69e2717`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/e69e2717cb8a955cab34550b2530f11179bedba2): `build_error_runs` removed
+- [`71ce8fb9`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/71ce8fb99350d2784a66f4fac3b27aa456f88740): no savings without an observed local baseline (`bd-jtlp7`)
+- [`e2b5b5e4`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/e2b5b5e4d8e9eeec8761e12efe309e6f76c8e4fb): deadline kills distinguished from resource kills (`bd-9zcwn`)
+- [`793d0667`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/793d0667ee0c19175b2f47ac0a5fd2e3d0bdd53c): deadline watchdog no longer wedges on a full stderr pipe (`bd-1we6i`; one real case hung for 24.5 hours)
+
+### Artifact retrieval returns what was asked for
+
+- A literal `cargo build --bin/--example` retrieves only the named payloads
+  ([`a241bef9`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/a241bef987455a50beb70b5c0ae03374f3737682),
+  [`84d3ace8`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/84d3ace8ca2cc4e7f3fba733b176a045cd37ee6f)).
+  So do `--no-run` test and bench executables, and `-o` outputs from rustc, GCC and Clang
+  ([`eb7caef7`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/eb7caef7e341b0373157b3e1387ae4a69a84118c),
+  [`57e365b9`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/57e365b9243a0e19811b1eedf1ef6e0d84ac142d)).
+- When no limit is configured, the retrieval retry budget scales with the selected payload
+  size
+  ([`5f1abbd3`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/5f1abbd3c559e8dff5585116c286c8d147821ff5)).
+  Windows workers return artifacts through one bounded tar transport that honors the same
+  selection
+  ([`5bbd5794`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/5bbd5794547ea92e430395f2640b56fefd9bc1c5)).
+- ELF, Mach-O and PE outputs built for the wrong CPU are rejected after retrieval
+  ([`c7dcb88d`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/c7dcb88d00891cc1e6bf21f8416969d7eb708a1b)).
+- Offloaded binaries carry the caller's source revision (`RCH_BUILD_SOURCE`, including
+  `-dirty`/`-overlay-<fp>`) instead of whatever Git metadata the worker has
+  ([`50193e21`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/50193e21dd0a34331d9958b572e1b30aa2abb941),
+  GH #76, `bd-xho6o`).
+
+### Source snapshot integrity and clean overlays
+
+Source-root ownership now persists through upload, compile, retrieval and cleanup, and GC
+honors it. Nested or aliased roots are serialized. Clean overlays can bind committed
+sibling repositories with `--dependency-base PATH=REV`, and the execution receipt records
+each one. Clean-overlay Cargo jobs fail closed with `RCH-E413` if a source, `-C`, a
+`--config` file, or ambient worker Cargo config would escape the selection. The
+worker-side guard exits 113.
+
+- [`7ddd43e5`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/7ddd43e5a85322b42f3e6e40789586f0ab8eac3a): durable source-root grants
+- [`4a5024ef`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/4a5024ef237769c9a2c741ef50a1df30b3b9de11): `--dependency-base`
+- [`919aaf8c`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/919aaf8cd60be121d1d038293f6a6373c9c0d95c), [`3ebd8d55`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/3ebd8d55caa9dc31049f7bbac476a5cb45057390): fail-closed Cargo selection and the worker config guard
+- Closed workstreams: `bd-cfv95`, `bd-e6n0j`, `bd-gqeor`
+
+### Admission, capacity and required tools
+
+- Admission also scores memory stall pressure (PSI)
+  ([`626a3a1a`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/626a3a1ac44f187fc663c853a5c7edeb2d84ec4e)).
+- `/status` and `/ready` count only admissible workers
+  ([`9e407c00`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/9e407c0048f38fbe46c5cb008eee579379363a61), GH #75).
+- Operators can declare verified tool probes in `workers.toml`, and jobs can require them
+  with `rch exec --job --require-tool` or `[jobs] required_tools`
+  ([`10e2b4cb`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/10e2b4cbebb7a6d9bebc44fec1b570ad35e0a952)).
+- Scheduled worker benchmarks are bounded on the worker itself
+  ([`fb0344cf`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/fb0344cf6c1a119ce0e04f2e7c9eda5d3576a63c), `bd-tctxy`).
+
+### Local-fallback visibility and dispatcher shims
+
+Every local fallback or proof refusal is recorded as an incident (`RCH-I011`/`RCH-I012`)
+with its reason, and `rch status` shows the last 24 hours' count and top reasons. The
+dispatcher Cargo shims are restored from `general.role`, and `doctor` warns when they are
+broken. Project `.rch/config.toml` is discovered from any directory up to the Git root.
+
+- [`64fa4105`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/64fa4105b63e3436d3b41a2f54a3a67cd1311e12), [`55d6a76a`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/55d6a76a811d17c1758848e057d7cefe470d4293): incident ledger and status summary (`bd-qawj7`)
+- [`a9434612`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/a94346125df6be6162cd3e12b0d9e2d5de45d568), [`5e8447c2`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/5e8447c2224d88071a457ead2f2b4ad634ff4364): shim role restore and doctor warning
+- [`13f22289`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/13f22289e3976057c5a62dba68da55f706e2897e): project config walk-up
+
+### OpenTelemetry
+
+The daemon exports real request-duration metrics over OTLP. `rch doctor --reliability`
+exports verdicts, probe durations and remediation outcomes, and flushes before exiting.
+
+- [`30e35c6e`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/30e35c6e61ae0241cd2577fd6f806658cd357371), [`c8085ba5`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/c8085ba5a49af078b26bb639705c4f424e06bf3f), [`80249e40`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/80249e4041775117550c2703859d43bae580c34b)
+
+### RABS (experimental, operator-only, not in the prebuilt archives)
+
+RABS still serves **no** automatic Cargo cache hits. `rabs-wrap` always runs the real
+rustc, and nothing in production publishes to or serves from the action cache. The RABS
+binaries are not in the release archives or the installer. What landed is operator
+infrastructure:
+
+- **Authenticated worker transport.** The worker link moved from plaintext JSON with a
+  fixed token to native Asupersync mutual TLS with ATP control framing. Workers are
+  admitted by SPKI pin and incarnation, and plaintext is allowed only on loopback
+  ([`970da905`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/970da905f342c2b05871d5208be6605ecba7b189),
+  [`5c36703c`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/5c36703c5237627608181c534ed5ed649305e9d4), `bd-085cm`).
+- **Operator prepared builds and a durable job daemon.** Three commands move a prepared
+  build through the pipeline: `rabsd --worker-prepare`, `--worker-build-tls`, and
+  `--job-submit/status/wait/follow/cancel/resume/acknowledge/recover-local`. Together they
+  ship an offline, locked source and toolchain bundle to a pinned worker, and they
+  install the hash-verified outputs atomically. Recovery never re-runs the compiler
+  ([`e9c33ec1`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/e9c33ec172795dde57ad7c04dbaa7a033d44a957),
+  [`6c98907b`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/6c98907be78da71dda5bdf9a7d59de7ab9bc3b68),
+  [`70f49148`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/70f49148662614e46c1bd01b80ebd7238966d7b0),
+  [`2d3ad530`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/2d3ad5303fe73810d68a8e67e32bbe4685dd5af2)).
+- **CAS and manifest hardening.** Manifest namespace, hardlink and symlink validation,
+  destination reservations keyed on raw bytes, sticky quarantine, and generation fences
+  ([`0ba40a0c`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/0ba40a0ce8dbb8902032016c5fe8f2cf6ce84040),
+  `bd-1rofg`, `bd-v9ho1`, `bd-9nnqm`).
+- Known gaps at this release: the workspace-wide test run hangs in a `rabs-cas`
+  crash-matrix test, and the new transport trips the nested-`block_on` architecture test
+  (`bd-h3fu2`).
+
+### Operator commands now do what they report (fixed at release prep)
+
+- `rch fleet drain` used to print "drained" without contacting the daemon. It now drains
+  each worker through the daemon, waits up to `--timeout` for in-flight builds, and
+  reports `still_busy` / `idle_confirmed`. If any drain fails it exits 1 with
+  `WorkerStateError` (`bd-bddpd`).
+- `rch fleet deploy --drain-first` said "Active builds will be drained first" but never
+  drained. It now drains, refuses the deploy if the targets are not confirmed idle
+  within `--drain-timeout`, and re-enables the drained workers afterwards.
+- `rch fleet status --watch` re-queries every 10 seconds instead of sleeping forever.
+- The dead `rch doctor --install-deps` flag, which was parsed and never used, is removed.
+- A project outside the configured canonical root is now decided local before a worker
+  slot is reserved. The reason names the fix (`[path_topology] canonical_root`), and
+  remote-required modes refuse instead. `rch diagnose` reports the same verdict. It used
+  to say "WOULD INTERCEPT" while the build silently fell back locally (`bd-raobv`).
+- `FORCE_COLOR` is honored as documented: `1` colors stderr without a TTY and overrides
+  `TERM=dumb`, and `0` disables color. Only `NO_COLOR` outranks it.
+
+### Behavior changes operators should know
+
+- The SSH keepalive default is now 15 s (`ssh_server_alive_interval_secs`; 0 disables it).
+- Success rates in history and the dashboard will drop, because only exit 0 now counts as
+  success.
+- A project's `.rch/config.toml` now also applies to nested crates. A repository-root
+  `force_local` therefore keeps builds in subdirectories local too.
+- New fail-closed clean-overlay refusals (`RCH-E413`; the worker-side guard exits 113).
+- A missing, empty or comment-only `workers.toml` reload now fails and keeps the old fleet.
+  An explicit `workers = []` still drains it.
+- `rch jobs` refuses daemons that predate the identity-aware routes, so upgrade `rchd`
+  together with `rch`.
+- The RABS CAS metadata schema is now 23 (`credential_generation`).
+- `rch doctor --install-deps` no longer exists.
+- A build started outside the canonical root now runs locally without first reserving
+  a worker, or is refused under `RCH_REQUIRE_REMOTE`, clean-overlay or receipt mode.
+- `POST /release-worker` without a durable `build_id` is refused and not acknowledged.
+  This has been true since [`0e64c878`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/0e64c878af20399d20b3db34258422f1c67d8136); the e2e test now asserts it.
+- The workspace is now publishable to crates.io. Internal path dependencies carry
+  versions, and `rabs-protocol`, `rabs-key` and `rabs-cas` (which `rch` depends on) are no
+  longer `publish = false`. Before this, only `rch-common` 1.0.26 had ever been
+  published. The GitHub release notes record what was actually published.
+
 
 ## [v1.0.64] -- 2026-09-07 (release)
 
