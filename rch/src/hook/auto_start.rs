@@ -3,7 +3,7 @@
 //! When the hook discovers that `rchd` is unreachable, it performs a single
 //! bounded attempt to bring the daemon back up before falling back to local
 //! compilation. This module owns every moving part of that recovery: the
-//! per-host state directory, atomic lockfile acquisition with staleness /
+//! per-host state directory, kernel-backed startup ownership with staleness /
 //! PID-reuse / cross-host defenses, the cooldown timestamp that prevents
 //! spawn storms, locating and spawning the `rchd` binary, the health probe
 //! over the Unix socket, and the bounded wait for the socket to come back.
@@ -23,7 +23,7 @@ pub(super) enum AutoStartError {
     SpawnFailed(#[source] std::io::Error),
     #[error("rchd launch wrapper exited unsuccessfully: {0}")]
     WrapperFailed(std::process::ExitStatus),
-    #[error("Daemon started but socket not found after {0}s")]
+    #[error("Daemon did not become healthy within the {0}s startup budget")]
     Timeout(u64),
     #[error("rchd binary not found in PATH")]
     BinaryNotFound,
@@ -41,6 +41,9 @@ pub(super) enum AutoStartError {
 struct AutoStartLock {
     path: PathBuf,
     body: String,
+    // Held until after Drop removes our legacy sentinel. Never unlink the
+    // gate itself: every contender must lock the same persistent inode.
+    _gate: std::fs::File,
 }
 
 impl Drop for AutoStartLock {
@@ -74,7 +77,7 @@ fn autostart_cooldown_path() -> PathBuf {
 fn read_cooldown_timestamp(path: &Path) -> Option<SystemTime> {
     let contents = std::fs::read_to_string(path).ok()?;
     let secs: u64 = contents.trim().parse().ok()?;
-    Some(UNIX_EPOCH + Duration::from_secs(secs))
+    UNIX_EPOCH.checked_add(Duration::from_secs(secs))
 }
 
 fn write_cooldown_timestamp(path: &Path) -> Result<(), AutoStartError> {
@@ -233,20 +236,48 @@ fn autostart_lock_is_stale(parsed: &ParsedLock) -> bool {
     age > AUTOSTART_LOCK_STALE_TTL_SECS
 }
 
+/// Serialize the entire sentinel create/read/reap/drop lifecycle. A
+/// create_new sentinel alone has a publication race: another client can see
+/// the still-empty file and reclaim it as corrupt. Read/compare/unlink also
+/// races with another stale reaper. A persistent kernel lock closes both
+/// windows for clients using this protocol, and releases on process exit.
+/// Keep the legacy sentinel for compatibility with older clients; those
+/// clients do not participate in the gate and retain their old guarantees.
+fn acquire_autostart_gate(path: &Path) -> Result<std::fs::File, AutoStartError> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut gate_path = path.as_os_str().to_os_string();
+    gate_path.push(".gate");
+    let gate = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(PathBuf::from(gate_path))
+        .map_err(AutoStartError::Io)?;
+    match gate.try_lock() {
+        Ok(()) => Ok(gate),
+        Err(std::fs::TryLockError::WouldBlock) => Err(AutoStartError::LockHeld),
+        Err(std::fs::TryLockError::Error(error)) => Err(AutoStartError::Io(error)),
+    }
+}
+
 fn acquire_autostart_lock(path: &Path) -> Result<AutoStartLock, AutoStartError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(AutoStartError::Io)?;
     }
-    // Atomic create_new — winner of the race; loser falls into the
-    // stale-detection branch below.
+    let gate = acquire_autostart_gate(path)?;
+    // Retain the sentinel's stale/PID/host checks for older clients, while
+    // the gate prevents upgraded clients from racing its publication/reap.
     let body = render_autostart_lock_body();
     match OpenOptions::new().write(true).create_new(true).open(path) {
         Ok(mut f) => {
             // Write the lockfile body so subsequent contenders can decide
             // whether to wait or take over. We deliberately don't fail the
-            // acquire if the write itself fails — the lockfile-exists
-            // mutual-exclusion is the load-bearing invariant; the body is
-            // diagnostic + stale-detection metadata.
+            // acquire if the write itself fails: the kernel gate still
+            // protects ownership among upgraded clients. The body is also
+            // used for diagnostic and legacy stale-detection metadata.
             let _ = std::io::Write::write_all(&mut f, body.as_bytes());
             let _ = f.sync_all();
             tracing::info!(
@@ -258,6 +289,7 @@ fn acquire_autostart_lock(path: &Path) -> Result<AutoStartLock, AutoStartError> 
             Ok(AutoStartLock {
                 path: path.to_path_buf(),
                 body,
+                _gate: gate,
             })
         }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -304,6 +336,7 @@ fn acquire_autostart_lock(path: &Path) -> Result<AutoStartLock, AutoStartError> 
                                 Ok(AutoStartLock {
                                     path: path.to_path_buf(),
                                     body,
+                                    _gate: gate,
                                 })
                             }
                             // Lost the race to recreate — another contender won.
@@ -334,9 +367,11 @@ fn which_rchd_path() -> Option<PathBuf> {
     which("rchd").ok()
 }
 
-fn spawn_rchd(path: &Path) -> Result<(), AutoStartError> {
+fn spawn_rchd(path: &Path, socket_path: &Path) -> Result<(), AutoStartError> {
     let mut cmd = std::process::Command::new("nohup");
     cmd.arg(path)
+        .arg("--socket")
+        .arg(socket_path)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .stdin(Stdio::null());
@@ -426,96 +461,142 @@ pub(super) async fn try_auto_start_daemon(
     config: &SelfHealingConfig,
     socket_path: &Path,
 ) -> Result<(), AutoStartError> {
+    recover_daemon_with_paths(
+        config,
+        socket_path,
+        &autostart_lock_path(),
+        &autostart_cooldown_path(),
+        |socket| {
+            let rchd_path = which_rchd_path().ok_or(AutoStartError::BinaryNotFound)?;
+            info!(
+                target: "rch::hook::auto_start",
+                binary = %rchd_path.display(),
+                socket = %socket.display(),
+                "Spawning rchd"
+            );
+            spawn_rchd(&rchd_path, socket)
+        },
+    )
+    .await
+}
+
+/// The production recovery flow, with paths and the single launch operation
+/// supplied explicitly so concurrent-client tests never mutate process-global
+/// environment variables or accidentally start a real daemon.
+async fn recover_daemon_with_paths(
+    config: &SelfHealingConfig,
+    socket_path: &Path,
+    lock_path: &Path,
+    cooldown_path: &Path,
+    launch: impl FnOnce(&Path) -> Result<(), AutoStartError>,
+) -> Result<(), AutoStartError> {
+    use std::os::unix::fs::FileTypeExt;
+
     if !config.hook_starts_daemon {
         return Err(AutoStartError::Disabled);
     }
+    let budget = Duration::from_secs(config.auto_start_timeout_secs);
+    if budget.is_zero() {
+        return Err(AutoStartError::Timeout(config.auto_start_timeout_secs));
+    }
+    let started = Instant::now();
+    let remaining = || budget.saturating_sub(started.elapsed());
 
     info!(
         target: "rch::hook::auto_start",
-        "Daemon unavailable, attempting auto-start"
+        "Daemon unavailable, attempting recovery"
     );
+    let recovery = async {
+        // Readiness is useful even when another process still owns the lock
+        // or a previous launch is on cooldown. Neither is proof of no workers.
+        if probe_daemon_health(socket_path).await {
+            return Ok(());
+        }
+        let _lock = match acquire_autostart_lock(lock_path) {
+            Ok(lock) => lock,
+            Err(AutoStartError::LockHeld) => {
+                debug!(
+                    target: "rch::hook::auto_start",
+                    "Waiting for another client's daemon startup"
+                );
+                return if wait_for_socket(socket_path, remaining()).await {
+                    Ok(())
+                } else {
+                    Err(AutoStartError::Timeout(config.auto_start_timeout_secs))
+                };
+            }
+            Err(error) => return Err(error),
+        };
 
-    // Acquire the autostart lock BEFORE doing anything destructive
-    // (stale-socket removal). Two concurrent hooks racing on the same
-    // socket could otherwise both observe a transiently-unresponsive
-    // daemon and the second hook deletes the socket the first hook
-    // just verified — corrupting an in-flight connection.
-    //
-    // Order is now:
-    //   1. Acquire autostart lock (only one hook auto-starts at a time).
-    //   2. Re-probe socket: while waiting for the lock, the prior
-    //      lock-holder may have already started the daemon.
-    //   3. Only delete the socket if it's confirmed stale UNDER the lock.
-    let _lock = acquire_autostart_lock(&autostart_lock_path())?;
+        // Another starter may have finished between the probe and acquisition.
+        // Keep all socket mutation and launching under the ownership guard.
+        if probe_daemon_health(socket_path).await {
+            return Ok(());
+        }
 
-    // Re-probe under the lock — another hook may have spawned rchd
-    // while we were waiting.
-    if socket_path.exists() && probe_daemon_health(socket_path).await {
-        debug!(
+        // Check cooldown BEFORE touching the socket. A daemon from an earlier
+        // timed-out call may still be starting; observe it without spawning.
+        // A clock rollback/future timestamp cannot disable recovery forever.
+        if let Some(last_attempt) = read_cooldown_timestamp(cooldown_path)
+            && let Ok(elapsed) = last_attempt.elapsed()
+            && elapsed.as_secs() < config.auto_start_cooldown_secs
+        {
+            return if wait_for_socket(socket_path, remaining()).await {
+                Ok(())
+            } else {
+                Err(AutoStartError::CooldownActive(
+                    elapsed.as_secs(),
+                    config.auto_start_cooldown_secs,
+                ))
+            };
+        }
+
+        match std::fs::symlink_metadata(socket_path) {
+            Ok(metadata) => {
+                // A typo or a symlink in the configured endpoint is not a
+                // stale socket. In particular, never delete a regular file.
+                if !metadata.file_type().is_socket() {
+                    return Err(AutoStartError::StaleSocket);
+                }
+                if !socket_is_confirmed_stale(socket_path).await {
+                    // A live listener may be overloaded or still initializing.
+                    // Never unlink it or launch a competing daemon.
+                    return if wait_for_socket(socket_path, remaining()).await {
+                        Ok(())
+                    } else {
+                        Err(AutoStartError::UnhealthySocket)
+                    };
+                }
+                match std::fs::remove_file(socket_path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(_) => return Err(AutoStartError::StaleSocket),
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(AutoStartError::Io(error)),
+        }
+
+        if remaining().is_zero() {
+            return Err(AutoStartError::Timeout(config.auto_start_timeout_secs));
+        }
+        write_cooldown_timestamp(cooldown_path)?;
+        launch(socket_path)?;
+        if !wait_for_socket(socket_path, remaining()).await {
+            return Err(AutoStartError::Timeout(config.auto_start_timeout_secs));
+        }
+        info!(
             target: "rch::hook::auto_start",
-            "Socket became responsive while waiting for autostart lock"
+            "Daemon recovery succeeded"
         );
-        return Ok(());
-    }
+        Ok(())
+    };
 
-    if socket_path.exists() {
-        warn!(
-            target: "rch::hook::auto_start",
-            "Socket exists but daemon not responding (after lock-protected re-probe)"
-        );
-        if !socket_is_confirmed_stale(socket_path).await {
-            warn!(
-                target: "rch::hook::auto_start",
-                "Socket still accepts connections or could not be proven stale; refusing to replace a possible live daemon"
-            );
-            return Err(AutoStartError::UnhealthySocket);
-        }
-        if let Err(err) = std::fs::remove_file(socket_path) {
-            warn!(
-                target: "rch::hook::auto_start",
-                "Failed to remove stale socket: {}",
-                err
-            );
-            return Err(AutoStartError::StaleSocket);
-        }
-    }
-
-    let cooldown_path = autostart_cooldown_path();
-    if let Some(last_attempt) = read_cooldown_timestamp(&cooldown_path) {
-        let elapsed = last_attempt
-            .elapsed()
-            .unwrap_or(Duration::from_secs(0))
-            .as_secs();
-        if elapsed < config.auto_start_cooldown_secs {
-            return Err(AutoStartError::CooldownActive(
-                elapsed,
-                config.auto_start_cooldown_secs,
-            ));
-        }
-    }
-
-    // Note: the autostart lock acquired earlier is still held here.
-    // It's released when this function returns (Drop).
-    write_cooldown_timestamp(&cooldown_path)?;
-
-    let rchd_path = which_rchd_path().ok_or(AutoStartError::BinaryNotFound)?;
-    info!(
-        target: "rch::hook::auto_start",
-        "Spawning rchd at {}",
-        rchd_path.display()
-    );
-    spawn_rchd(&rchd_path)?;
-
-    let timeout_secs = config.auto_start_timeout_secs;
-    if !wait_for_socket(socket_path, Duration::from_secs(timeout_secs)).await {
-        return Err(AutoStartError::Timeout(timeout_secs));
-    }
-
-    info!(
-        target: "rch::hook::auto_start",
-        "Auto-start successful, socket is responsive"
-    );
-    Ok(())
+    // Connect, health checks, contention, cooldown observation and readiness
+    // share one asynchronous budget, rather than each restarting the clock.
+    timeout(budget, recovery)
+        .await
+        .unwrap_or(Err(AutoStartError::Timeout(config.auto_start_timeout_secs)))
 }
 
 #[cfg(test)]
@@ -907,7 +988,7 @@ mod tests {
         std::fs::set_permissions(&fake_rchd, perms).expect("chmod fake rchd");
 
         let started = std::time::Instant::now();
-        super::spawn_rchd(&fake_rchd).expect("spawn fake rchd");
+        super::spawn_rchd(&fake_rchd, &temp_dir.path().join("test.sock")).expect("spawn fake rchd");
         let elapsed = started.elapsed();
         assert!(
             elapsed < std::time::Duration::from_millis(1500),
@@ -937,7 +1018,7 @@ mod tests {
         // and the test still fails; if it works, an attempt catches the exit.
         let mut caught = None;
         for _ in 0..5 {
-            if let Err(err) = super::spawn_rchd(&fake_rchd) {
+            if let Err(err) = super::spawn_rchd(&fake_rchd, &temp_dir.path().join("test.sock")) {
                 caught = Some(err);
                 break;
             }
@@ -1291,5 +1372,359 @@ mod tests {
         let listener = tokio::net::UnixListener::bind(&socket).unwrap();
         assert!(!wait_for_socket(&socket, Duration::ZERO).await);
         assert!(timeout(Duration::from_millis(20), listener.accept()).await.is_err());
+    }
+
+    fn recovery_config() -> SelfHealingConfig {
+        SelfHealingConfig {
+            hook_starts_daemon: true,
+            auto_start_timeout_secs: 1,
+            auto_start_cooldown_secs: 30,
+            ..Default::default()
+        }
+    }
+
+    fn healthy_daemon_after(socket: PathBuf, delay: Duration) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            sleep(delay).await;
+            let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0; 12];
+                if stream.read_exact(&mut request).await.is_ok() {
+                    let _ = stream
+                        .write_all(b"HTTP/1.1 200 OK\n\n{\"status\":\"healthy\"}")
+                        .await;
+                }
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn recovery_observes_another_starter_without_stealing_its_lock() {
+        let dir = create_test_state_dir();
+        let socket = dir.path().join("daemon.sock");
+        let lock_path = dir.path().join("start.lock");
+        let cooldown = dir.path().join("cooldown");
+        let lock = acquire_autostart_lock(&lock_path).unwrap();
+        let body = std::fs::read(&lock_path).unwrap();
+        let server = healthy_daemon_after(socket.clone(), Duration::from_millis(20));
+        let result = recover_daemon_with_paths(
+            &recovery_config(),
+            &socket,
+            &lock_path,
+            &cooldown,
+            |_| panic!("a lock follower must never spawn"),
+        )
+        .await;
+        server.abort();
+        let _ = server.await;
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(std::fs::read(&lock_path).unwrap(), body);
+        assert!(!cooldown.exists());
+        drop(lock);
+    }
+
+    #[tokio::test]
+    async fn recovery_coalesces_simultaneous_clients_into_one_launch() {
+        let dir = create_test_state_dir();
+        let socket = dir.path().join("daemon.sock");
+        let lock_path = dir.path().join("start.lock");
+        let cooldown = dir.path().join("cooldown");
+        let starts = std::sync::atomic::AtomicUsize::new(0);
+        let mut first_server = None;
+        let mut second_server = None;
+        let config = recovery_config();
+        let (first, second) = tokio::join!(
+            recover_daemon_with_paths(&config, &socket, &lock_path, &cooldown, |path| {
+                starts.fetch_add(1, Ordering::SeqCst);
+                first_server = Some(healthy_daemon_after(path.into(), Duration::from_millis(20)));
+                Ok(())
+            }),
+            recover_daemon_with_paths(&config, &socket, &lock_path, &cooldown, |path| {
+                starts.fetch_add(1, Ordering::SeqCst);
+                second_server = Some(healthy_daemon_after(path.into(), Duration::from_millis(20)));
+                Ok(())
+            }),
+        );
+        for server in first_server.into_iter().chain(second_server) {
+            server.abort();
+            let _ = server.await;
+        }
+        assert!(first.is_ok(), "{first:?}");
+        assert!(second.is_ok(), "{second:?}");
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+        assert!(!lock_path.exists());
+        assert!(cooldown.exists());
+    }
+
+    #[tokio::test]
+    async fn recovery_observes_a_previous_launch_during_cooldown() {
+        let dir = create_test_state_dir();
+        let socket = dir.path().join("daemon.sock");
+        let lock_path = dir.path().join("start.lock");
+        let cooldown = dir.path().join("cooldown");
+        write_cooldown_timestamp(&cooldown).unwrap();
+        let original = std::fs::read(&cooldown).unwrap();
+        let server = healthy_daemon_after(socket.clone(), Duration::from_millis(20));
+        let result = recover_daemon_with_paths(
+            &recovery_config(),
+            &socket,
+            &lock_path,
+            &cooldown,
+            |_| panic!("cooldown must prevent a second launch"),
+        )
+        .await;
+        server.abort();
+        let _ = server.await;
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(std::fs::read(&cooldown).unwrap(), original);
+        assert!(!lock_path.exists());
+    }
+
+    #[tokio::test]
+    async fn recovery_preserves_live_unhealthy_listeners_within_one_budget() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = create_test_state_dir();
+        let socket = dir.path().join("daemon.sock");
+        let lock_path = dir.path().join("start.lock");
+        let cooldown = dir.path().join("cooldown");
+        let _listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let inode = std::fs::metadata(&socket).unwrap().ino();
+        let result = timeout(
+            Duration::from_millis(1500),
+            recover_daemon_with_paths(
+                &recovery_config(),
+                &socket,
+                &lock_path,
+                &cooldown,
+                |_| panic!("never replace a possible live daemon"),
+            ),
+        )
+        .await
+        .expect("all probes must share the one-second recovery budget");
+        assert!(result.is_err());
+        assert_eq!(std::fs::metadata(&socket).unwrap().ino(), inode);
+        assert!(!cooldown.exists());
+        assert!(!lock_path.exists());
+    }
+
+    #[tokio::test]
+    async fn recovery_does_not_unlink_a_stale_socket_during_cooldown() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = create_test_state_dir();
+        let socket = dir.path().join("daemon.sock");
+        let lock_path = dir.path().join("start.lock");
+        let cooldown = dir.path().join("cooldown");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        drop(listener);
+        let inode = std::fs::metadata(&socket).unwrap().ino();
+        write_cooldown_timestamp(&cooldown).unwrap();
+        let result = recover_daemon_with_paths(
+            &recovery_config(),
+            &socket,
+            &lock_path,
+            &cooldown,
+            |_| panic!("cooldown must prevent launch"),
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(std::fs::metadata(&socket).unwrap().ino(), inode);
+        assert!(!lock_path.exists());
+    }
+
+    #[tokio::test]
+    async fn recovery_never_deletes_regular_files_or_symlinks() {
+        let dir = create_test_state_dir();
+        let regular = dir.path().join("not-a-socket");
+        let link = dir.path().join("socket-link");
+        std::fs::write(&regular, b"keep me").unwrap();
+        std::os::unix::fs::symlink(&regular, &link).unwrap();
+        for socket in [&regular, &link] {
+            let result = recover_daemon_with_paths(
+                &recovery_config(),
+                socket,
+                &dir.path().join("start.lock"),
+                &dir.path().join("cooldown"),
+                |_| panic!("invalid endpoint must not launch"),
+            )
+            .await;
+            assert!(matches!(result, Err(AutoStartError::StaleSocket)));
+        }
+        assert_eq!(std::fs::read(&regular).unwrap(), b"keep me");
+        assert_eq!(std::fs::read_link(&link).unwrap(), regular);
+    }
+
+    #[tokio::test]
+    async fn recovery_zero_budget_has_no_side_effects() {
+        let dir = create_test_state_dir();
+        let lock_path = dir.path().join("state/start.lock");
+        let cooldown = dir.path().join("state/cooldown");
+        let mut config = recovery_config();
+        config.auto_start_timeout_secs = 0;
+        let result = recover_daemon_with_paths(
+            &config,
+            &dir.path().join("daemon.sock"),
+            &lock_path,
+            &cooldown,
+            |_| panic!("zero budget must not launch"),
+        )
+        .await;
+        assert!(matches!(result, Err(AutoStartError::Timeout(0))));
+        assert!(!dir.path().join("state").exists());
+    }
+
+    #[tokio::test]
+    async fn recovery_future_cooldown_does_not_permanently_disable_startup() {
+        let dir = create_test_state_dir();
+        let socket = dir.path().join("daemon.sock");
+        let lock_path = dir.path().join("start.lock");
+        let cooldown = dir.path().join("cooldown");
+        let future = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600;
+        std::fs::write(&cooldown, future.to_string()).unwrap();
+        let mut server = None;
+        let result = recover_daemon_with_paths(
+            &recovery_config(),
+            &socket,
+            &lock_path,
+            &cooldown,
+            |path| {
+                server = Some(healthy_daemon_after(path.into(), Duration::ZERO));
+                Ok(())
+            },
+        )
+        .await;
+        let server = server.expect("future cooldown must permit repair");
+        server.abort();
+        let _ = server.await;
+        assert!(result.is_ok(), "{result:?}");
+        assert!(
+            read_cooldown_timestamp(&cooldown)
+                .unwrap()
+                .elapsed()
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn recovery_corrupt_extreme_timestamp_cannot_panic() {
+        let dir = create_test_state_dir();
+        let cooldown = dir.path().join("cooldown");
+        std::fs::write(&cooldown, u64::MAX.to_string()).unwrap();
+        assert!(read_cooldown_timestamp(&cooldown).is_none());
+    }
+
+    #[tokio::test]
+    async fn recovery_preserves_launch_failure_and_releases_ownership() {
+        let dir = create_test_state_dir();
+        let lock_path = dir.path().join("start.lock");
+        let cooldown = dir.path().join("cooldown");
+        let result = recover_daemon_with_paths(
+            &recovery_config(),
+            &dir.path().join("daemon.sock"),
+            &lock_path,
+            &cooldown,
+            |_| Err(AutoStartError::BinaryNotFound),
+        )
+        .await;
+        assert!(matches!(result, Err(AutoStartError::BinaryNotFound)));
+        assert!(!lock_path.exists());
+        assert!(
+            cooldown.exists(),
+            "failed launches must still be rate limited"
+        );
+    }
+
+    #[test]
+    fn spawn_rchd_pins_the_requested_socket_without_shell_splitting() {
+        let dir = create_test_state_dir();
+        let binary = dir.path().join("rchd with spaces");
+        let socket = dir.path().join("daemon with spaces.sock");
+        std::fs::write(
+            &binary,
+            concat!(
+                "#!/bin/sh\n",
+                "[ \"$#\" -eq 2 ] || exit 41\n",
+                "[ \"$1\" = --socket ] || exit 42\n",
+                "printf '%s' \"$2\" > \"$2.received\"\n",
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        spawn_rchd(&binary, &socket).unwrap();
+        let receipt = dir.path().join("daemon with spaces.sock.received");
+        // The bounded launcher may return before a heavily loaded child runs.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !receipt.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            std::fs::read(receipt).unwrap(),
+            socket.as_os_str().as_encoded_bytes()
+        );
+    }
+
+    #[test]
+    fn startup_gate_protects_unpublished_sentinel() {
+        let dir = create_test_state_dir();
+        let path = dir.path().join("start.lock");
+        let gate = acquire_autostart_gate(&path).unwrap();
+        // Simulate a pause between create_new and the first body write.
+        std::fs::write(&path, "").unwrap();
+        assert!(matches!(
+            acquire_autostart_lock(&path),
+            Err(AutoStartError::LockHeld)
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), b"");
+        drop(gate);
+        assert!(acquire_autostart_lock(&path).is_ok());
+    }
+
+    #[test]
+    fn startup_gate_prevents_ttl_takeover_of_a_live_owner() {
+        let dir = create_test_state_dir();
+        let path = dir.path().join("start.lock");
+        let owner = acquire_autostart_lock(&path).unwrap();
+        write_lockfile(&path, std::process::id(), 120, &our_hostname());
+        assert!(matches!(
+            acquire_autostart_lock(&path),
+            Err(AutoStartError::LockHeld)
+        ));
+        drop(owner);
+        assert!(acquire_autostart_lock(&path).is_ok());
+    }
+
+    #[test]
+    fn startup_gate_inode_survives_owner_release() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = create_test_state_dir();
+        let path = dir.path().join("start.lock");
+        let gate_path = dir.path().join("start.lock.gate");
+        let owner = acquire_autostart_lock(&path).unwrap();
+        let inode = std::fs::metadata(&gate_path).unwrap().ino();
+        drop(owner);
+        assert!(!path.exists());
+        let next_owner = acquire_autostart_lock(&path).unwrap();
+        assert_eq!(std::fs::metadata(&gate_path).unwrap().ino(), inode);
+        drop(next_owner);
+        assert_eq!(std::fs::metadata(&gate_path).unwrap().ino(), inode);
+    }
+
+    #[test]
+    fn startup_gate_is_released_after_sentinel_refusal() {
+        let dir = create_test_state_dir();
+        let path = dir.path().join("start.lock");
+        write_lockfile(&path, std::process::id(), 0, &our_hostname());
+        assert!(matches!(
+            acquire_autostart_lock(&path),
+            Err(AutoStartError::LockHeld)
+        ));
+        // Refusing a legacy owner must not leave our kernel gate locked.
+        std::fs::write(&path, "invalid legacy body").unwrap();
+        assert!(acquire_autostart_lock(&path).is_ok());
     }
 }
