@@ -2617,6 +2617,60 @@ fn local_build_status_hints(
     }]
 }
 
+fn now_unix_ms_for_status() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
+/// bd-qawj7: surface this host's recent local fallbacks (RCH-I011, recorded by
+/// every terminal local run) so "why is this box compiling locally?" has an
+/// answer in `rch status` instead of a guess about agents bypassing rch.
+fn local_fallback_issue(now_ms: u64) -> Option<IssueFromApi> {
+    let ledger = rch_common::IncidentLedger::new(rch_common::IncidentLedgerConfig::default());
+    local_fallback_issue_from(&ledger.read_all(), now_ms)
+}
+
+fn local_fallback_issue_from(
+    events: &[rch_common::IncidentEvent],
+    now_ms: u64,
+) -> Option<IssueFromApi> {
+    const WINDOW_MS: u64 = 24 * 60 * 60 * 1000;
+    let cutoff = now_ms.saturating_sub(WINDOW_MS);
+    let mut by_reason: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    for event in events {
+        if event.reason_code == rch_common::IncidentReasonCode::LocalFallback
+            && event.occurred_at_unix_ms >= cutoff
+        {
+            let reason = event
+                .details
+                .get("reason")
+                .map_or("unknown", String::as_str);
+            *by_reason.entry(reason).or_default() += 1;
+        }
+    }
+    let total: usize = by_reason.values().sum();
+    if total == 0 {
+        return None;
+    }
+    let mut ranked: Vec<(&str, usize)> = by_reason.into_iter().collect();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+    let top = ranked
+        .iter()
+        .take(3)
+        .map(|(reason, count)| format!("{count}× {reason}"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    Some(IssueFromApi {
+        severity: "warning".to_string(),
+        summary: format!("{total} local fallback build(s) on this host in the last 24h ({top})"),
+        remediation: Some(
+            "Reasons are recorded as RCH-I011 in the incident ledger (~/.local/state/rch/incidents.jsonl); `rch diagnose -- <cmd>` explains a single decision".to_string(),
+        ),
+    })
+}
+
 fn status_error_with_local_builds(
     error: anyhow::Error,
     hints: &[crate::status_types::RemediationHint],
@@ -2682,8 +2736,11 @@ pub async fn status_overview(
         serde_json::from_str(json).context("Failed to parse daemon status response")
     }
     .await;
-    let status =
+    let mut status =
         status_result.map_err(|error| status_error_with_local_builds(error, &local_hints))?;
+    if let Some(issue) = local_fallback_issue(now_unix_ms_for_status()) {
+        status.issues.push(issue);
+    }
 
     // `--fleet`: a focused desired/live grouping + dominant-problem summary +
     // absence alerts (bd-session-history-remediation-ocv9i.2.2). Short-circuits
@@ -3500,6 +3557,73 @@ mod tests {
     use super::*;
     use crate::ui::context::OutputConfig;
     use crate::ui::writer::SharedOutputBuffer;
+
+    #[test]
+    fn local_fallback_issue_counts_recent_reasons_only() {
+        use rch_common::{
+            IncidentEvent, IncidentEventType, IncidentReasonCode, IncidentSource, SelectedMode,
+        };
+        let now = 1_800_000_000_000_u64;
+        let event = |code: IncidentReasonCode, reason: &str, at: u64| {
+            IncidentEvent::new(
+                IncidentEventType::Fallback,
+                code,
+                IncidentSource::Hook,
+                "proj",
+                "cargo build",
+                SelectedMode::Local,
+                true,
+                at,
+            )
+            .with_detail("reason", reason)
+        };
+        let hour = 60 * 60 * 1000;
+        let events = vec![
+            event(
+                IncidentReasonCode::LocalFallback,
+                "no admissible workers",
+                now - hour,
+            ),
+            event(
+                IncidentReasonCode::LocalFallback,
+                "no admissible workers",
+                now - 2 * hour,
+            ),
+            event(
+                IncidentReasonCode::LocalFallback,
+                "rch disabled (general.enabled=false)",
+                now - 3 * hour,
+            ),
+            // Outside the 24h window.
+            event(
+                IncidentReasonCode::LocalFallback,
+                "daemon unavailable",
+                now - 30 * hour,
+            ),
+            // Refusals are not local builds.
+            event(
+                IncidentReasonCode::ProofRefusal,
+                "remote required",
+                now - hour,
+            ),
+        ];
+        let issue = local_fallback_issue_from(&events, now).expect("recent fallbacks => issue");
+        assert_eq!(issue.severity, "warning");
+        assert!(
+            issue.summary.starts_with("3 local fallback build(s)"),
+            "{}",
+            issue.summary
+        );
+        assert!(
+            issue
+                .summary
+                .contains("2× no admissible workers; 1× rch disabled"),
+            "{}",
+            issue.summary
+        );
+        assert!(!issue.summary.contains("daemon unavailable"));
+        assert!(local_fallback_issue_from(&events[3..], now).is_none());
+    }
 
     fn make_context(config: OutputConfig) -> OutputContext {
         let stdout = SharedOutputBuffer::new().as_writer(true);
