@@ -38,6 +38,7 @@
 //! into `hook::tests`. `CARGO_TARGET_CACHE_EXCLUDES` is used only within this
 //! module and stays private.
 
+mod cargo_bins;
 mod direct_compiler;
 
 use super::command_parsing::{cargo_build_only_test, cargo_custom_profile_output_dir};
@@ -92,6 +93,9 @@ pub(super) fn get_artifact_patterns(
             "target/package/*.crate".to_string(),
             "target/package/tmp-registry/*.crate".to_string(),
         ];
+    }
+    if let Some(patterns) = cargo_bins::patterns(kind, command) {
+        return patterns;
     }
     let mut patterns = match kind {
         Some(CompilationKind::BunTest) | Some(CompilationKind::BunTypecheck) => {
