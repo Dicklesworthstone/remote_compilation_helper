@@ -10,6 +10,7 @@ use crate::edge::dep_info::{
     DEP_INFO_DERIVATION_CONTRACT, DepInfoLine, DerivedDepInfo, derive_subscriber_dep_info,
     parse_dep_info, render_dep_info,
 };
+use rabs_cas::manifest_validation::{ManifestMember, ManifestMemberKind, validate_manifest};
 use rabs_cas::materialization::{
     MaterializationMode, PlannedActionOutput, materialize_action_outputs_prepared,
     materialize_object,
@@ -181,6 +182,31 @@ fn preflight_destination(path: &Path) -> Result<(), ServeError> {
     Ok(())
 }
 
+/// Apply H027 to the COMPLETE output namespace before dep-info scratch reads
+/// or destination writes. Exact-path checks alone miss case/normalization
+/// aliases, including aliases in implicit parent directories.
+///
+/// The text projection is only a conservative REFUSAL key, never a pathname
+/// or an action identity. Invalid UTF-8 sequences may collapse and cause a
+/// safe refusal; accepted paths still use their original RawBytes throughout
+/// resolution and installation. A lone non-UTF-8 filename remains lossless.
+fn validate_output_namespace(
+    manifest: &CanonicalActionResultManifest,
+    root: &Path,
+) -> Result<(), ServeError> {
+    let members: Vec<_> = manifest
+        .logical_outputs
+        .iter()
+        .map(|output| ManifestMember {
+            path: String::from_utf8_lossy(output.virtual_path.as_bytes()).into_owned(),
+            // This endpoint installs files, never directory/link declarations.
+            kind: ManifestMemberKind::File,
+        })
+        .collect();
+    validate_manifest(&members)
+        .map_err(|error| preparation(root, format!("invalid output namespace: {error:?}")))
+}
+
 pub(super) fn prepare(
     store: &mut dyn RabsMetadataStore,
     manifest: &CanonicalActionResultManifest,
@@ -204,6 +230,7 @@ pub(super) fn prepare(
             "deterministic failure requires terminal-result delivery",
         ));
     }
+    validate_output_namespace(manifest, root)?;
     if let Some(expected) = expected_paths(expected) {
         let committed = manifest
             .logical_outputs
@@ -537,5 +564,144 @@ mod tests {
             Err(ServeError::Preparation { .. })
         ));
         assert!(!destination.exists());
+    }
+
+    fn outputs_named(paths: &[&[u8]]) -> CanonicalActionResultManifest {
+        let mut manifest = rabs_cas::test_support::sample_manifest();
+        let template = manifest.logical_outputs[0].clone();
+        manifest.logical_outputs = paths
+            .iter()
+            .map(|path| {
+                let mut output = template.clone();
+                output.virtual_path = rabs_protocol::raw_bytes::RawBytes::new(path.to_vec());
+                output
+            })
+            .collect();
+        manifest
+    }
+
+    #[test]
+    fn complete_namespace_refuses_platform_aliases_before_any_materialization() {
+        let directory = tempfile::tempdir().unwrap();
+        let cas =
+            crate::janitor::store::mount_and_reconcile(&directory.path().join("cas")).unwrap();
+        let root = directory.path().join("outputs");
+        let cases: &[&[&[u8]]] = &[
+            &[b"out/Lib.rlib", b"out/lib.rlib"],
+            &[b"Out/head.rmeta", b"out/tail.rlib"],
+            &[
+                "out/caf\u{e9}/head".as_bytes(),
+                "out/cafe\u{301}/tail".as_bytes(),
+            ],
+            &[b"out/file", b"out/file/child"],
+            &[b"out/dir/head", b"out/Dir"],
+        ];
+        for paths in cases {
+            for reverse in [false, true] {
+                let mut manifest = outputs_named(paths);
+                if reverse {
+                    manifest.logical_outputs.reverse();
+                }
+                let result = prepare(
+                    &mut *cas.store().lock().unwrap(),
+                    &manifest,
+                    &root,
+                    &ExpectedOutputs::WhateverWasCommitted,
+                );
+                assert!(
+                    matches!(
+                        result,
+                        Err(ServeError::Preparation { reason, .. })
+                            if reason.starts_with("invalid output namespace:")
+                    ),
+                    "accepted aliases {paths:?}, reverse={reverse}",
+                );
+                assert!(!root.exists());
+            }
+        }
+    }
+
+    #[test]
+    fn namespace_validation_precedes_even_the_first_dep_info_cas_read() {
+        let directory = tempfile::tempdir().unwrap();
+        let cas =
+            crate::janitor::store::mount_and_reconcile(&directory.path().join("cas")).unwrap();
+        let root = directory.path().join("outputs");
+        let mut manifest = outputs_named(&[b"Out/crate.d", b"out/crate.rlib"]);
+        // This object deliberately has no CAS location. A per-file validator
+        // would attempt its materialization before seeing the later alias.
+        manifest.logical_outputs[0].role = OutputRole::DepInfo;
+        let result = prepare(
+            &mut *cas.store().lock().unwrap(),
+            &manifest,
+            &root,
+            &ExpectedOutputs::WhateverWasCommitted,
+        );
+        assert!(matches!(
+            result,
+            Err(ServeError::Preparation { reason, .. })
+                if reason.starts_with("invalid output namespace:")
+        ));
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn unsafe_member_spellings_never_reach_the_live_destination() {
+        let root = Path::new("/unused/output-root");
+        for path in [
+            &b"out//file"[..],
+            b"out/./file",
+            b"out/../file",
+            b"out/file/",
+            b"/absolute",
+            b"out/nul\0file",
+            b"out/a\\b",
+            b"out/a:b",
+        ] {
+            assert!(validate_output_namespace(&outputs_named(&[path]), root).is_err());
+        }
+    }
+
+    #[test]
+    fn byte_paths_remain_lossless_in_a_valid_live_plan() {
+        let directory = tempfile::tempdir().unwrap();
+        let cas =
+            crate::janitor::store::mount_and_reconcile(&directory.path().join("cas")).unwrap();
+        let root = directory.path().canonicalize().unwrap().join(
+            std::ffi::OsString::from_vec(b"root-\xfe".to_vec()),
+        );
+        let paths: &[&[u8]] = &[b"out/crate-\xff.rlib", b"out/crate.rmeta"];
+        let manifest = outputs_named(paths);
+        let plan = match prepare(
+            &mut *cas.store().lock().unwrap(),
+            &manifest,
+            &root,
+            &ExpectedOutputs::WhateverWasCommitted,
+        ) {
+            Ok(Ok(plan)) => plan,
+            _ => panic!("safe byte-preserving output plan refused"),
+        };
+        for (output, path) in plan.outputs.iter().zip(paths) {
+            assert_eq!(output.virtual_path.as_bytes(), *path);
+            assert_eq!(
+                output.destination,
+                root.join(std::ffi::OsStr::from_bytes(path)),
+            );
+        }
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn ambiguous_invalid_utf8_projection_refuses_instead_of_renaming_paths() {
+        let manifest = outputs_named(&[b"out/crate-\xff.rlib", b"out/crate-\xfe.rlib"]);
+        assert!(validate_output_namespace(&manifest, Path::new("/unused/root")).is_err());
+        assert_eq!(
+            manifest.logical_outputs[0].virtual_path.as_bytes(),
+            b"out/crate-\xff.rlib",
+        );
+        assert_eq!(
+            manifest.logical_outputs[1].virtual_path.as_bytes(),
+            b"out/crate-\xfe.rlib",
+        );
     }
 }
