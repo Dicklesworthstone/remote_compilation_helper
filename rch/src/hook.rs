@@ -1478,14 +1478,26 @@ fn build_local_fallback_incident(
 /// ledger write fails. The ledger lives off the hot path, so the append cost
 /// (one buffered line) does not affect the classification budgets.
 fn record_hook_incident(event: &IncidentEvent) {
-    warn!(
-        target: "rch::hook::incident",
-        reason_code = %event.reason_code,
-        failure_class = event.reason_code.failure_class(),
-        selected_mode = ?event.selected_mode,
-        local_fallback_allowed = event.local_fallback_allowed,
-        "hook incident recorded",
-    );
+    // A routine local fallback (RCH-I011) is already announced by the
+    // `[RCH] local (<reason>)` summary; now that every fallback is recorded,
+    // a WARN here would add multi-line stderr noise to every local build.
+    if event.reason_code == IncidentReasonCode::LocalFallback {
+        debug!(
+            target: "rch::hook::incident",
+            reason_code = %event.reason_code,
+            selected_mode = ?event.selected_mode,
+            "hook incident recorded",
+        );
+    } else {
+        warn!(
+            target: "rch::hook::incident",
+            reason_code = %event.reason_code,
+            failure_class = event.reason_code.failure_class(),
+            selected_mode = ?event.selected_mode,
+            local_fallback_allowed = event.local_fallback_allowed,
+            "hook incident recorded",
+        );
+    }
     let ledger = IncidentLedger::new(IncidentLedgerConfig::default());
     if let Err(e) = ledger.append(event) {
         warn!(

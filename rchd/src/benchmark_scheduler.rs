@@ -1081,10 +1081,15 @@ fn benchmark_ssh_command(
         .arg(format!("ConnectTimeout={}", timeout.as_secs().min(30)));
     cmd.arg("-i").arg(&identity_file);
     cmd.arg(format!("{}@{}", worker.user, worker.host));
-    let remote = rch_common::ssh::remote_shell_command(
-        worker,
-        &remote_benchmark_script(timeout.as_secs().max(1)),
-    );
+    // Windows workers keep the plain call, matching the build path, which also
+    // skips `timeout` there: depending on which `sh` the session resolves,
+    // `timeout` can be System32's pause utility, which rejects `-k 10 N`.
+    let script = if rch_common::types::declared_os(&worker.tags).as_deref() == Some("windows") {
+        "~/.local/bin/rch-wkr benchmark --json".to_string()
+    } else {
+        remote_benchmark_script(timeout.as_secs().max(1))
+    };
+    let remote = rch_common::ssh::remote_shell_command(worker, &script);
     cmd.arg(remote.command);
     (cmd, remote.stdin_script)
 }
@@ -1384,6 +1389,8 @@ mod tests {
                         .unwrap()
                         .contains("rch-wkr benchmark --json")
                 );
+                // Windows keeps the plain call: `timeout` may be System32's.
+                assert!(!input.as_deref().unwrap().contains("timeout"));
                 assert!(
                     argv.iter()
                         .all(|arg| !arg.to_string_lossy().contains("rch-wkr"))
