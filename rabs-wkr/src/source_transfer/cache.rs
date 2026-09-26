@@ -34,7 +34,10 @@ fn private_directory(path: &Path) -> io::Result<()> {
 
 #[cfg(not(unix))]
 fn private_directory(_path: &Path) -> io::Result<()> {
-    Err(io::Error::new(io::ErrorKind::Unsupported, "source reuse requires Unix"))
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "source reuse requires Unix",
+    ))
 }
 
 fn ordinary(meta: &Metadata) -> bool {
@@ -70,9 +73,9 @@ fn object_name(digest: &[u8; 32]) -> String {
 fn owned_name(name: &str) -> bool {
     name.len() == 68
         && name.ends_with(".src")
-        && name.as_bytes()[..64].iter().all(|b| {
-            b.is_ascii_digit() || (b'a'..=b'f').contains(b)
-        })
+        && name.as_bytes()[..64]
+            .iter()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b))
 }
 
 /// The bound is checked before allocating, and the descriptor is checked against
@@ -91,7 +94,9 @@ fn read_verified(path: &Path, expected: &SourceFile) -> io::Result<(File, Vec<u8
         return Err(invalid("source object changed while opening"));
     }
     let mut bytes = Vec::new();
-    (&mut input).take(expected.len + 1).read_to_end(&mut bytes)?;
+    (&mut input)
+        .take(expected.len + 1)
+        .read_to_end(&mut bytes)?;
     let after = input.metadata()?;
     if !ordinary(&after)
         || after.len() != expected.len
@@ -156,14 +161,19 @@ impl SourceCache {
             Err(error) => return Err(error),
         }
         private_directory(&root)?;
-        Ok(Self { root, max_bytes: MAX_BYTES, max_files: MAX_FILES })
+        Ok(Self {
+            root,
+            max_bytes: MAX_BYTES,
+            max_files: MAX_FILES,
+        })
     }
 
     /// An unavailable or corrupt object is a MISS before any staging write.
     /// Recency is eviction policy only; it never establishes content identity.
     pub(super) fn load(&self, expected: &SourceFile) -> Option<Vec<u8>> {
         private_directory(&self.root).ok()?;
-        let (file, bytes) = read_verified(&self.root.join(object_name(&expected.sha256)), expected).ok()?;
+        let (file, bytes) =
+            read_verified(&self.root.join(object_name(&expected.sha256)), expected).ok()?;
         let _ = file.set_modified(SystemTime::now());
         Some(bytes)
     }
@@ -201,7 +211,9 @@ impl SourceCache {
     fn inventory(&self) -> io::Result<VecDeque<Entry>> {
         let scratch = self.root.join(INCOMING);
         match fs::symlink_metadata(&scratch) {
-            Ok(meta) if ordinary(&meta) && meta.len() <= MAX_FILE_BYTES => fs::remove_file(&scratch)?,
+            Ok(meta) if ordinary(&meta) && meta.len() <= MAX_FILE_BYTES => {
+                fs::remove_file(&scratch)?
+            }
             Ok(_) => return Err(invalid("invalid source cache scratch file")),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
@@ -210,16 +222,21 @@ impl SourceCache {
         for item in fs::read_dir(&self.root)? {
             let item = item?;
             let name = item.file_name();
-            if name == "lock" { continue; }
+            if name == "lock" {
+                continue;
+            }
             if entries.len() >= self.max_files
                 || !name.to_str().is_some_and(owned_name)
                 || !ordinary(&fs::symlink_metadata(item.path())?)
             {
-                return Err(invalid("source cache inventory is not an owned bounded file set"));
+                return Err(invalid(
+                    "source cache inventory is not an owned bounded file set",
+                ));
             }
             let meta = fs::symlink_metadata(item.path())?;
             entries.push(Entry {
-                path: item.path(), bytes: meta.len(),
+                path: item.path(),
+                bytes: meta.len(),
                 used: meta.modified().unwrap_or(SystemTime::UNIX_EPOCH),
             });
         }
@@ -234,34 +251,45 @@ impl SourceCache {
     /// File and directory fsync are deliberately not publication frontiers:
     /// after a crash a missing/torn object simply fails load's full verification.
     pub(super) fn remember(&self, receiver: &SourceReceiver) -> Result<u64, RememberError> {
-        let root = receiver.sealed_root().ok_or_else(|| {
-            RememberError::Source(invalid("cannot cache unsealed source"))
-        })?;
-        let Some(_lock) = self.writer()? else { return Ok(0); };
+        let root = receiver
+            .sealed_root()
+            .ok_or_else(|| RememberError::Source(invalid("cannot cache unsealed source")))?;
+        let Some(_lock) = self.writer()? else {
+            return Ok(0);
+        };
         let mut entries = self.inventory()?;
         let mut total = entries.iter().try_fold(0_u64, |sum, entry| {
-            sum.checked_add(entry.bytes).ok_or_else(|| invalid("source cache size overflow"))
+            sum.checked_add(entry.bytes)
+                .ok_or_else(|| invalid("source cache size overflow"))
         })?;
         let mut stored = 0;
         for expected in receiver.manifest().files() {
             if expected.len == 0 || expected.len > MAX_FILE_BYTES || expected.len > self.max_bytes {
                 continue;
             }
-            if self.load(expected).is_some() { continue; }
+            if self.load(expected).is_some() {
+                continue;
+            }
             let (_, bytes) = read_verified(&root.join(&expected.path), expected)
                 .map_err(RememberError::Source)?;
             let destination = self.root.join(object_name(&expected.sha256));
             // A corrupted object with this name must not make future uploads
             // permanently miss. Only our ordinary, inventoried cache file moves.
             if let Some(index) = entries.iter().position(|entry| entry.path == destination) {
-                let entry = entries.remove(index).ok_or_else(|| invalid("source cache inventory changed"))?;
+                let entry = entries
+                    .remove(index)
+                    .ok_or_else(|| invalid("source cache inventory changed"))?;
                 fs::remove_file(&entry.path)?;
                 total -= entry.bytes;
             }
             while entries.len() >= self.max_files
-                || total.checked_add(expected.len).is_none_or(|sum| sum > self.max_bytes)
+                || total
+                    .checked_add(expected.len)
+                    .is_none_or(|sum| sum > self.max_bytes)
             {
-                let Some(entry) = entries.pop_front() else { break; };
+                let Some(entry) = entries.pop_front() else {
+                    break;
+                };
                 fs::remove_file(&entry.path)?;
                 total -= entry.bytes;
             }
@@ -286,7 +314,11 @@ impl SourceCache {
             drop(file);
             fs::rename(&scratch, &destination)?;
             total += expected.len;
-            entries.push_back(Entry { path: destination, bytes: expected.len, used: SystemTime::now() });
+            entries.push_back(Entry {
+                path: destination,
+                bytes: expected.len,
+                used: SystemTime::now(),
+            });
             stored += 1;
         }
         Ok(stored)
@@ -300,16 +332,28 @@ mod tests {
     use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 
     fn entry(path: &str, bytes: &[u8]) -> SourceFile {
-        SourceFile { path: path.into(), len: bytes.len() as u64,
-            sha256: Sha256::digest(bytes).into(), executable: false }
+        SourceFile {
+            path: path.into(),
+            len: bytes.len() as u64,
+            sha256: Sha256::digest(bytes).into(),
+            executable: false,
+        }
     }
 
     fn staged(parent: &Path, files: &[(&str, &[u8])]) -> SourceReceiver {
-        let manifest = SourceManifest::new(files.iter().map(|(path, bytes)| entry(path, bytes)).collect()).unwrap();
+        let manifest = SourceManifest::new(
+            files
+                .iter()
+                .map(|(path, bytes)| entry(path, bytes))
+                .collect(),
+        )
+        .unwrap();
         let mut receiver = SourceReceiver::create(&parent.join("workspace"), manifest).unwrap();
         for (path, bytes) in files {
             if !bytes.is_empty() {
-                receiver.write_chunk(path, 0, bytes, Sha256::digest(bytes).into()).unwrap();
+                receiver
+                    .write_chunk(path, 0, bytes, Sha256::digest(bytes).into())
+                    .unwrap();
             }
         }
         receiver.seal().unwrap();
@@ -331,12 +375,21 @@ mod tests {
         let bytes = cache.load(&projected).unwrap();
         assert_eq!(bytes, b"A\0\xffB");
         let next = tempfile::tempdir().unwrap();
-        let mut receiver = SourceReceiver::create(&next.path().join("workspace"),
-            SourceManifest::new(vec![projected.clone()]).unwrap()).unwrap();
-        receiver.write_chunk(&projected.path, 0, &bytes, Sha256::digest(&bytes).into()).unwrap();
+        let mut receiver = SourceReceiver::create(
+            &next.path().join("workspace"),
+            SourceManifest::new(vec![projected.clone()]).unwrap(),
+        )
+        .unwrap();
+        receiver
+            .write_chunk(&projected.path, 0, &bytes, Sha256::digest(&bytes).into())
+            .unwrap();
         let installed = receiver.seal().unwrap().join(&projected.path);
-        assert_ne!(fs::metadata(&installed).unwrap().ino(),
-            fs::metadata(cache.root.join(object_name(&expected.sha256))).unwrap().ino());
+        assert_ne!(
+            fs::metadata(&installed).unwrap().ino(),
+            fs::metadata(cache.root.join(object_name(&expected.sha256)))
+                .unwrap()
+                .ino()
+        );
         fs::set_permissions(&installed, fs::Permissions::from_mode(0o600)).unwrap();
         fs::write(&installed, b"changed").unwrap();
         assert_eq!(cache.load(&expected).unwrap(), b"A\0\xffB");
@@ -373,8 +426,11 @@ mod tests {
             let cache = SourceCache::open(parent.path()).unwrap();
             let path = cache.root.join(object_name(&expected.sha256));
             let original = source.sealed_root().unwrap().join("lib.rs");
-            if hardlink { fs::hard_link(original, path).unwrap(); }
-            else { symlink(original, path).unwrap(); }
+            if hardlink {
+                fs::hard_link(original, path).unwrap();
+            } else {
+                symlink(original, path).unwrap();
+            }
             assert!(cache.load(expected).is_none());
             assert!(cache.remember(&source).is_err());
         }
@@ -384,7 +440,10 @@ mod tests {
     fn byte_and_entry_limits_evict_cache_objects_not_source_files() {
         let parent = tempfile::tempdir().unwrap();
         let input = tempfile::tempdir().unwrap();
-        let source = staged(input.path(), &[("a", b"aaaa"), ("b", b"bbbb"), ("c", b"cccc")]);
+        let source = staged(
+            input.path(),
+            &[("a", b"aaaa"), ("b", b"bbbb"), ("c", b"cccc")],
+        );
         let mut cache = SourceCache::open(parent.path()).unwrap();
         cache.max_bytes = 8;
         cache.max_files = 2;
@@ -393,7 +452,10 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_eq!(entries.iter().map(|entry| entry.bytes).sum::<u64>(), 8);
         assert_eq!(cache.load(&source.manifest().files()[2]).unwrap(), b"cccc");
-        assert_eq!(fs::read(source.sealed_root().unwrap().join("a")).unwrap(), b"aaaa");
+        assert_eq!(
+            fs::read(source.sealed_root().unwrap().join("a")).unwrap(),
+            b"aaaa"
+        );
     }
 
     #[test]
@@ -418,8 +480,11 @@ mod tests {
         let parent = tempfile::tempdir().unwrap();
         let input = tempfile::tempdir().unwrap();
         let cache = SourceCache::open(parent.path()).unwrap();
-        let source = SourceReceiver::create(&input.path().join("workspace"),
-            SourceManifest::new(vec![entry("lib.rs", b"good")]).unwrap()).unwrap();
+        let source = SourceReceiver::create(
+            &input.path().join("workspace"),
+            SourceManifest::new(vec![entry("lib.rs", b"good")]).unwrap(),
+        )
+        .unwrap();
         assert!(cache.remember(&source).is_err());
         assert!(SourceCache::open(Path::new("relative")).is_err());
         fs::set_permissions(parent.path(), fs::Permissions::from_mode(0o755)).unwrap();

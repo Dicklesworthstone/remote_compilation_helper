@@ -186,7 +186,10 @@ impl SourcePreparation {
             // Capture will replace this local preflight-only path with the
             // retained dataset identity and explicit transfer selection. No
             // fabricated toolchain digest enters a saved or transmitted request.
-            fields.insert("toolchain_backing".to_owned(), Value::String("local-preparation".into()));
+            fields.insert(
+                "toolchain_backing".to_owned(),
+                Value::String("local-preparation".into()),
+            );
         }
         fields.insert(
             "source_manifest".to_owned(),

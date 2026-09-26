@@ -150,11 +150,18 @@ impl JobserverBridge {
         }
         // Never use a fixed child selected by source contents or a previous
         // action. A failed mint drops only this attempt's private directory.
-        let directory = tempfile::Builder::new().prefix(BRIDGE_PREFIX).tempdir_in(home_backing)?;
+        let directory = tempfile::Builder::new()
+            .prefix(BRIDGE_PREFIX)
+            .tempdir_in(home_backing)?;
         let (host_path, writer, _edge_auth_unused) =
-            rabs_asupersync::jobserver::mint_fifo_jobserver((slots - 1) as usize, directory.path())?;
+            rabs_asupersync::jobserver::mint_fifo_jobserver(
+                (slots - 1) as usize,
+                directory.path(),
+            )?;
         let component = |path: &std::path::Path| -> std::io::Result<String> {
-            path.file_name().and_then(|name| name.to_str()).map(str::to_owned)
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_owned)
                 .ok_or_else(|| std::io::Error::other("jobserver runtime name is not UTF-8"))
         };
         let dir_name = component(directory.path())?;
@@ -263,7 +270,11 @@ mod tests {
             let workspace = tempfile::tempdir().unwrap();
             let bridge = JobserverBridge::mint(grant, workspace.path()).unwrap();
             let slots = grant.max(1);
-            assert!(bridge.makeflags().starts_with(&format!("-j{slots} --jobserver-auth=fifo:")));
+            assert!(
+                bridge
+                    .makeflags()
+                    .starts_with(&format!("-j{slots} --jobserver-auth=fifo:"))
+            );
             let mut reader = std::fs::OpenOptions::new()
                 .read(true)
                 .custom_flags(0o4000) // Linux O_NONBLOCK; independent of client descriptors.
@@ -294,16 +305,27 @@ mod tests {
         let second = JobserverBridge::mint(3, home.path()).unwrap();
         assert_ne!(first.host_path, second.host_path);
         assert_ne!(first._directory.path(), second._directory.path());
-        assert!(first.makeflags().contains("fifo:/__rabs/home/.rabs-jobserver-"));
+        assert!(
+            first
+                .makeflags()
+                .contains("fifo:/__rabs/home/.rabs-jobserver-")
+        );
         assert!(!first.makeflags().contains("/__rabs/workspace"));
         assert_eq!(
-            std::fs::metadata(first._directory.path()).unwrap().permissions().mode() & 0o777,
+            std::fs::metadata(first._directory.path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
             0o700
         );
         let first_dir = first._directory.path().to_path_buf();
         drop(first);
         assert!(!first_dir.exists());
-        assert!(second.host_path.exists(), "retiring one attempt must not unlink another FIFO");
+        assert!(
+            second.host_path.exists(),
+            "retiring one attempt must not unlink another FIFO"
+        );
         drop(second);
         assert_eq!(std::fs::read_dir(home.path()).unwrap().count(), 0);
     }

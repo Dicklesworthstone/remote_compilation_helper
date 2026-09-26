@@ -17,9 +17,8 @@ use rabsd::coord::delivery_ack::PendingAcknowledgment;
 use rabsd::coord::delivery_recovery::{DeliveryTrust, recover_existing_delivery};
 use rabsd::coord::source_delivery::{SourcePeer, SourceUpload, request_manifest};
 use rabsd::coord::worker_delivery::{
-    Delivery, DeliveryFailure, DeliveryMode, MAX_FRAME_BYTES, ResumePeer, ResumeSource,
-    WorkerPeer, receive_operation, validate_request,
-    transport_interrupted, worker_transport_error,
+    Delivery, DeliveryFailure, DeliveryMode, MAX_FRAME_BYTES, ResumePeer, ResumeSource, WorkerPeer,
+    receive_operation, transport_interrupted, validate_request, worker_transport_error,
 };
 use serde_json::{Value, json};
 use std::fs::File;
@@ -61,7 +60,10 @@ fn check_deadline(deadline: Instant) -> io::Result<()> {
 /// Intent is a local flag, never a guess based on a failed response. Accept it
 /// before or after the positional arguments, but never twice or in their midst.
 /// --resume-from implies resume; it never changes the saved execution request.
-fn operation_arguments(args: &[String], count: usize) -> Option<(&[String], DeliveryMode, Option<&Path>)> {
+fn operation_arguments(
+    args: &[String],
+    count: usize,
+) -> Option<(&[String], DeliveryMode, Option<&Path>)> {
     let (positionals, mode, resume_from) = if args.len() == count {
         (args, DeliveryMode::Execute, None)
     } else if args.len() == count + 1 && args.first().is_some_and(|arg| arg == "--resume") {
@@ -71,11 +73,17 @@ fn operation_arguments(args: &[String], count: usize) -> Option<(&[String], Deli
     } else if args.len() == count + 2 && args.first().is_some_and(|arg| arg == "--resume-from") {
         (&args[2..], DeliveryMode::Resume, Some(Path::new(&args[1])))
     } else if args.len() == count + 2 && args[count] == "--resume-from" {
-        (&args[..count], DeliveryMode::Resume, Some(Path::new(&args[count + 1])))
+        (
+            &args[..count],
+            DeliveryMode::Resume,
+            Some(Path::new(&args[count + 1])),
+        )
     } else {
         return None;
     };
-    if positionals.iter().any(|arg| matches!(arg.as_str(), "--resume" | "--resume-from" | "--acknowledge"))
+    if positionals
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "--resume" | "--resume-from" | "--acknowledge"))
         || resume_from.is_some_and(|root| !root.is_absolute())
     {
         return None;
@@ -96,10 +104,12 @@ fn acknowledgment_arguments(args: &[String], count: usize) -> Option<&[String]> 
     } else {
         return None;
     };
-    if positionals
-        .iter()
-        .any(|arg| matches!(arg.as_str(), "--resume" | "--resume-from" | "--source-root" | "--acknowledge"))
-    {
+    if positionals.iter().any(|arg| {
+        matches!(
+            arg.as_str(),
+            "--resume" | "--resume-from" | "--source-root" | "--acknowledge"
+        )
+    }) {
         return None;
     }
     Some(positionals)
@@ -198,12 +208,15 @@ fn attach_toolchain(
     match (selected, root) {
         (false, None) => Ok(upload),
         (false, Some(_)) => Err(invalid("toolchain bytes were not selected by this request")),
-        (true, None) => Err(invalid("toolchain transfer requires a retained prepared build bundle")),
+        (true, None) => Err(invalid(
+            "toolchain transfer requires a retained prepared build bundle",
+        )),
         (true, Some(root)) => {
             let expected = toolchain_identity(request)?
                 .ok_or_else(|| invalid("toolchain transfer requires an expected identity"))?;
             let prepared = open_toolchain(root, &expected, &ToolchainLimits::default(), stopped)?;
-            let source = upload.ok_or_else(|| invalid("toolchain transfer requires prepared source"))?;
+            let source =
+                upload.ok_or_else(|| invalid("toolchain transfer requires prepared source"))?;
             source.with_toolchain(prepared, request).map(Some)
         }
     }
@@ -212,9 +225,13 @@ fn attach_toolchain(
 /// A prefix source is local intent, not proof. Validate it before credentials,
 /// listening, or worker contact, but only AFTER complete local receipt recovery.
 fn prepare_resume_source(
-    mode: DeliveryMode, root: Option<&Path>, destination: &Path,
+    mode: DeliveryMode,
+    root: Option<&Path>,
+    destination: &Path,
 ) -> io::Result<Option<ResumeSource>> {
-    let Some(root) = root else { return Ok(None); };
+    let Some(root) = root else {
+        return Ok(None);
+    };
     if mode != DeliveryMode::Resume {
         return Err(invalid("--resume-from is result recovery only"));
     }
@@ -480,10 +497,12 @@ fn run_loopback_operation(operation: WorkerOperation<'_>) -> Result<Delivery, De
     {
         return Ok(delivery);
     }
-    if toolchain_root.is_some() || rabsd::coord::worker_delivery::toolchain_transfer(request)
-        .map_err(&failure)?
+    if toolchain_root.is_some()
+        || rabsd::coord::worker_delivery::toolchain_transfer(request).map_err(&failure)?
     {
-        return Err(failure(invalid("toolchain transfer requires authenticated TLS delivery")));
+        return Err(failure(invalid(
+            "toolchain transfer requires authenticated TLS delivery",
+        )));
     }
     // Offline receipt recovery above must not depend on a still-existing
     // checkout or old partial directory. New work preflights before listening.
@@ -515,7 +534,13 @@ fn run_loopback_operation(operation: WorkerOperation<'_>) -> Result<Delivery, De
     })();
     let mut peer = setup.map_err(&failure)?;
     if let Some(reuse) = &reuse {
-        return receive_operation(&mut ResumePeer::new(&mut peer, reuse), request, worker, directory, mode);
+        return receive_operation(
+            &mut ResumePeer::new(&mut peer, reuse),
+            request,
+            worker,
+            directory,
+            mode,
+        );
     }
     match upload.as_ref() {
         Some(upload) => {
@@ -652,11 +677,14 @@ async fn until_cancelled<T>(
     let mut pending = pin!(future);
     poll_fn(|cx| {
         if stopped.as_mut().poll(cx).is_ready() {
-            return Poll::Ready(Err(io::Error::new(io::ErrorKind::Interrupted,
-                "prepared operation cancelled before dispatch")));
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "prepared operation cancelled before dispatch",
+            )));
         }
         pending.as_mut().poll(cx)
-    }).await
+    })
+    .await
 }
 
 /// All secure operator intents use this one native mutual-TLS listener. Local
@@ -668,34 +696,37 @@ fn accept_tls_worker(
     request_id: &Value,
     operation: &str,
     mut control: Option<&mut TlsOperationControl<'_>>,
-) -> io::Result<
-    (
-        asupersync::runtime::Runtime,
-        rabs_asupersync::worker_transport::AuthenticatedPeer,
-        rabsd::coord::secure_worker_delivery::PinnedWorkerAdmission,
-    ),
-> {
+) -> io::Result<(
+    asupersync::runtime::Runtime,
+    rabs_asupersync::worker_transport::AuthenticatedPeer,
+    rabsd::coord::secure_worker_delivery::PinnedWorkerAdmission,
+)> {
     use asupersync::runtime::RuntimeBuilder;
     use rabs_asupersync::worker_transport::accept_peer;
     use rabsd::coord::secure_worker_delivery::{PinnedWorkerAdmission, parse_worker_pin};
     if asupersync::cx::Cx::current().is_some() {
-        return Err(invalid("worker delivery requires a dedicated blocking thread"));
+        return Err(invalid(
+            "worker delivery requires a dedicated blocking thread",
+        ));
     }
-    if control.as_ref().is_some_and(|control| control.cancellation.is_cancelled()) {
-        return Err(io::Error::new(io::ErrorKind::Interrupted,
-            "prepared operation cancelled before dispatch"));
+    if control
+        .as_ref()
+        .is_some_and(|control| control.cancellation.is_cancelled())
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "prepared operation cancelled before dispatch",
+        ));
     }
-    let acceptor = coordinator_tls_files()?.acceptor().map_err(io::Error::other)?;
+    let acceptor = coordinator_tls_files()?
+        .acceptor()
+        .map_err(io::Error::other)?;
     // A stable worker name owns its persistent pin and boot history. Hold its
     // exclusive admission capability before listening and through stream close.
     let state = std::env::var_os("RABS_STATE_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(crate::default_under_home(".cache/rch/rabs-state")));
-    let admission = PinnedWorkerAdmission::open(
-        &state,
-        worker,
-        parse_worker_pin(pin)?,
-    )?;
+    let admission = PinnedWorkerAdmission::open(&state, worker, parse_worker_pin(pin)?)?;
     let runtime = RuntimeBuilder::current_thread()
         .build()
         .map_err(|error| io::Error::other(format!("worker delivery runtime: {error:?}")))?;
@@ -717,14 +748,24 @@ fn accept_tls_worker(
         }
         let exchange = async {
             let (stream, _) = asupersync::time::timeout(
-                asupersync::time::wall_now(), ACCEPT_BUDGET, listener.accept(),
-            ).await.map_err(|_| worker_transport_error(io::Error::new(
-                io::ErrorKind::TimedOut, "worker TLS accept deadline exceeded")))?
-                .map_err(worker_transport_error)?;
+                asupersync::time::wall_now(),
+                ACCEPT_BUDGET,
+                listener.accept(),
+            )
+            .await
+            .map_err(|_| {
+                worker_transport_error(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "worker TLS accept deadline exceeded",
+                ))
+            })?
+            .map_err(worker_transport_error)?;
             // This lower TLS boundary intentionally exposes only a diagnostic
             // string. Authentication/handshake failures remain nonretryable;
             // they are never guessed from that text.
-            accept_peer(&acceptor, stream).await.map_err(io::Error::other)
+            accept_peer(&acceptor, stream)
+                .await
+                .map_err(io::Error::other)
         };
         match control.as_ref() {
             Some(control) => until_cancelled(&control.cancellation, exchange).await,
@@ -814,8 +855,11 @@ fn run_tls_operation_inner(
     let upload =
         capture_source(request, mode, source_root).map_err(|error| failure(error.to_string()))?;
     let upload = attach_toolchain(upload, request, mode, toolchain_root, || {
-        control.as_ref().is_some_and(|control| control.cancellation.is_cancelled())
-    }).map_err(|error| failure(error.to_string()))?;
+        control
+            .as_ref()
+            .is_some_and(|control| control.cancellation.is_cancelled())
+    })
+    .map_err(|error| failure(error.to_string()))?;
     let reuse = prepare_resume_source(mode, resume_from, directory)
         .map_err(|error| failure(error.to_string()))?;
     if !directory.parent().is_some_and(Path::is_dir) {
@@ -842,25 +886,41 @@ fn run_tls_operation_inner(
     })?;
     if let Some(control) = control {
         return rabsd::coord::secure_worker_delivery::receive_authenticated_observed(
-            &runtime, peer, admission, request, directory, mode, upload.as_ref(), reuse.as_ref(),
-            control.cancellation, control.preview,
+            &runtime,
+            peer,
+            admission,
+            request,
+            directory,
+            mode,
+            upload.as_ref(),
+            reuse.as_ref(),
+            control.cancellation,
+            control.preview,
         );
     }
     match upload.as_ref() {
         Some(upload) => {
             receive_authenticated_source(&runtime, peer, admission, request, directory, upload)
         }
-        None => {
-            receive_authenticated_operation(&runtime, peer, admission, request, directory, mode, reuse.as_ref())
-        }
+        None => receive_authenticated_operation(
+            &runtime,
+            peer,
+            admission,
+            request,
+            directory,
+            mode,
+            reuse.as_ref(),
+        ),
     }
 }
 
 fn run_tls_acknowledgment_once(args: &[String]) -> Result<Delivery, DeliveryFailure> {
     let directory = PathBuf::from(&args[4]);
     let request = read_request(Path::new(&args[3])).map_err(|error| DeliveryFailure {
-        directory: directory.clone(), execution_may_have_run: true,
-        transport_interrupted: false, detail: error.to_string(),
+        directory: directory.clone(),
+        execution_may_have_run: true,
+        transport_interrupted: false,
+        detail: error.to_string(),
     })?;
     run_tls_acknowledgment_bound(&args[0], &args[1], &args[2], &request, &directory, None)
 }
@@ -917,9 +977,15 @@ fn run_tls_acknowledgment_bound(
         failure
     })?;
     match control {
-        Some(control) => rabsd::coord::secure_worker_delivery::acknowledge_authenticated_controlled(
-            &runtime, peer, admission, pending, control.cancellation,
-        ),
+        Some(control) => {
+            rabsd::coord::secure_worker_delivery::acknowledge_authenticated_controlled(
+                &runtime,
+                peer,
+                admission,
+                pending,
+                control.cancellation,
+            )
+        }
         None => acknowledge_authenticated(&runtime, peer, admission, pending),
     }
 }
@@ -1284,12 +1350,20 @@ mod tests {
     fn prepared_toolchain_is_explicit_verified_and_unneeded_for_result_recovery() {
         use std::os::unix::fs::PermissionsExt;
         let source = tempfile::tempdir().unwrap();
-        std::fs::write(source.path().join("lib.rs"), b"pub fn answer() -> u8 { 42 }").unwrap();
+        std::fs::write(
+            source.path().join("lib.rs"),
+            b"pub fn answer() -> u8 { 42 }",
+        )
+        .unwrap();
         let owner = tempfile::tempdir().unwrap();
         let original = owner.path().join("original-toolchain");
         std::fs::create_dir_all(original.join("bin")).unwrap();
         std::fs::write(original.join("bin/compiler"), b"compiler bytes").unwrap();
-        std::fs::set_permissions(original.join("bin/compiler"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(
+            original.join("bin/compiler"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
         let bundle = owner.path().join("bundle");
         rabsd::coord::source_delivery::prepare_source_bundle(source.path(),
             &json!({"kind":"canonical-exec", "request_id":0, "program":"/__rabs/toolchain/bin/compiler",
@@ -1297,22 +1371,71 @@ mod tests {
         let request = read_request(&bundle.join("request.json")).unwrap();
         let saved = serde_json::to_vec(&request).unwrap();
         std::fs::rename(&original, owner.path().join("moved-original")).unwrap();
-        let upload = capture_source(&request, DeliveryMode::Execute, Some(&bundle.join("source"))).unwrap();
-        assert!(attach_toolchain(upload.clone(), &request, DeliveryMode::Execute, None, || false).is_err());
-        let ready = attach_toolchain(upload.clone(), &request, DeliveryMode::Execute,
-            Some(&bundle.join("toolchain")), || false).unwrap().unwrap();
+        let upload = capture_source(
+            &request,
+            DeliveryMode::Execute,
+            Some(&bundle.join("source")),
+        )
+        .unwrap();
+        assert!(
+            attach_toolchain(
+                upload.clone(),
+                &request,
+                DeliveryMode::Execute,
+                None,
+                || false
+            )
+            .is_err()
+        );
+        let ready = attach_toolchain(
+            upload.clone(),
+            &request,
+            DeliveryMode::Execute,
+            Some(&bundle.join("toolchain")),
+            || false,
+        )
+        .unwrap()
+        .unwrap();
         ready.validate_request(&request).unwrap();
         assert_eq!(serde_json::to_vec(&request).unwrap(), saved);
-        assert!(attach_toolchain(upload.clone(), &request, DeliveryMode::Execute,
-            Some(&bundle.join("toolchain")), || true).is_err());
+        assert!(
+            attach_toolchain(
+                upload.clone(),
+                &request,
+                DeliveryMode::Execute,
+                Some(&bundle.join("toolchain")),
+                || true
+            )
+            .is_err()
+        );
         let compiler = bundle.join("toolchain/bin/compiler");
         std::fs::set_permissions(&compiler, std::fs::Permissions::from_mode(0o755)).unwrap();
         std::fs::write(&compiler, b"different data").unwrap();
-        assert!(attach_toolchain(upload, &request, DeliveryMode::Execute,
-            Some(&bundle.join("toolchain")), || false).is_err());
-        assert!(attach_toolchain(None, &request, DeliveryMode::Resume, None, || false).unwrap().is_none());
-        assert!(attach_toolchain(None, &request, DeliveryMode::Resume,
-            Some(&bundle.join("toolchain")), || false).is_err());
+        assert!(
+            attach_toolchain(
+                upload,
+                &request,
+                DeliveryMode::Execute,
+                Some(&bundle.join("toolchain")),
+                || false
+            )
+            .is_err()
+        );
+        assert!(
+            attach_toolchain(None, &request, DeliveryMode::Resume, None, || false)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            attach_toolchain(
+                None,
+                &request,
+                DeliveryMode::Resume,
+                Some(&bundle.join("toolchain")),
+                || false
+            )
+            .is_err()
+        );
     }
 
     #[cfg(unix)]
@@ -1462,8 +1585,10 @@ mod tests {
             assert_eq!(delivery.receipt["publication_authorized"], false);
         }
         assert!(run_once(&args, DeliveryMode::Execute, Some(&source_path), None).is_ok());
-        assert!(run_once(&args, DeliveryMode::Resume, None, Some(&source_path)).is_ok(),
-            "a complete local delivery no longer needs the old prefix source");
+        assert!(
+            run_once(&args, DeliveryMode::Resume, None, Some(&source_path)).is_ok(),
+            "a complete local delivery no longer needs the old prefix source"
+        );
         let mut tls = args.clone();
         tls.insert(2, "01".repeat(32));
         assert!(
@@ -1497,7 +1622,12 @@ mod tests {
             assert!(execution_arguments(&leading, count).is_none());
             assert!(execution_arguments(&trailing, count).is_none());
             assert!(acknowledgment_arguments(&args, count).is_none());
-            for flag in ["--resume", "--resume-from", "--source-root", "--acknowledge"] {
+            for flag in [
+                "--resume",
+                "--resume-from",
+                "--source-root",
+                "--acknowledge",
+            ] {
                 let mut wrong = leading.clone();
                 wrong[2] = flag.into();
                 assert!(acknowledgment_arguments(&wrong, count).is_none());
@@ -1542,20 +1672,47 @@ mod tests {
             let plain: Vec<String> = (0..count).map(|index| format!("arg-{index}")).collect();
             let mut leading = vec!["--resume-from".to_owned(), "/old".to_owned()];
             leading.extend(plain.clone());
-            assert_eq!(operation_arguments(&leading, count),
-                Some((&leading[2..], DeliveryMode::Resume, Some(Path::new("/old")))));
-            assert_eq!(execution_arguments(&leading, count),
-                Some((&leading[2..], DeliveryMode::Resume, None, Some(Path::new("/old")))));
+            assert_eq!(
+                operation_arguments(&leading, count),
+                Some((&leading[2..], DeliveryMode::Resume, Some(Path::new("/old"))))
+            );
+            assert_eq!(
+                execution_arguments(&leading, count),
+                Some((
+                    &leading[2..],
+                    DeliveryMode::Resume,
+                    None,
+                    Some(Path::new("/old"))
+                ))
+            );
             let mut trailing = plain.clone();
             trailing.extend(["--resume-from".to_owned(), "/old".to_owned()]);
-            assert_eq!(operation_arguments(&trailing, count),
-                Some((&trailing[..count], DeliveryMode::Resume, Some(Path::new("/old")))));
+            assert_eq!(
+                operation_arguments(&trailing, count),
+                Some((
+                    &trailing[..count],
+                    DeliveryMode::Resume,
+                    Some(Path::new("/old"))
+                ))
+            );
             for bad in [
                 [leading.clone(), vec!["--resume".into()]].concat(),
                 [leading.clone(), vec!["--acknowledge".into()]].concat(),
-                [leading.clone(), vec!["--source-root".into(), "/source".into()]].concat(),
-                [leading.clone(), vec!["--resume-from".into(), "/other".into()]].concat(),
-                [vec!["--resume-from".into(), "relative".into()], plain.clone()].concat(),
+                [
+                    leading.clone(),
+                    vec!["--source-root".into(), "/source".into()],
+                ]
+                .concat(),
+                [
+                    leading.clone(),
+                    vec!["--resume-from".into(), "/other".into()],
+                ]
+                .concat(),
+                [
+                    vec!["--resume-from".into(), "relative".into()],
+                    plain.clone(),
+                ]
+                .concat(),
                 [vec!["--resume-from".into()], plain.clone()].concat(),
             ] {
                 assert!(execution_arguments(&bad, count).is_none(), "{bad:?}");
@@ -1577,15 +1734,29 @@ mod tests {
         let alias = root.join("alias");
         std::os::unix::fs::symlink(&old, &alias).unwrap();
         let path = root.join("request.json");
-        std::fs::write(&path, json!({"kind":"canonical-exec", "request_id":7,
-            "program":"rustc", "toolchain_backing":"/tc", "workspace_backing":"/ws"}).to_string()).unwrap();
+        std::fs::write(
+            &path,
+            json!({"kind":"canonical-exec", "request_id":7,
+            "program":"rustc", "toolchain_backing":"/tc", "workspace_backing":"/ws"})
+            .to_string(),
+        )
+        .unwrap();
         let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
         for source in [root.join("missing"), alias, old.clone()] {
-            let destination = if source == old { old.join("nested") } else { root.join("new") };
+            let destination = if source == old {
+                old.join("nested")
+            } else {
+                root.join("new")
+            };
             let expected = prepare_resume_source(DeliveryMode::Resume, Some(&source), &destination)
-                .unwrap_err().to_string();
-            let plain = vec![occupied.local_addr().unwrap().to_string(), "worker".into(),
-                path.to_string_lossy().into_owned(), destination.to_string_lossy().into_owned()];
+                .unwrap_err()
+                .to_string();
+            let plain = vec![
+                occupied.local_addr().unwrap().to_string(),
+                "worker".into(),
+                path.to_string_lossy().into_owned(),
+                destination.to_string_lossy().into_owned(),
+            ];
             let mut tls = plain.clone();
             tls.insert(2, "01".repeat(32));
             for failure in [
@@ -1597,7 +1768,9 @@ mod tests {
             }
             assert!(!destination.exists());
         }
-        assert!(prepare_resume_source(DeliveryMode::Execute, Some(&old), &root.join("new")).is_err());
+        assert!(
+            prepare_resume_source(DeliveryMode::Execute, Some(&old), &root.join("new")).is_err()
+        );
     }
 
     #[test]
@@ -1609,17 +1782,25 @@ mod tests {
         let mut cx = Context::from_waker(Waker::noop());
         assert!(waiting.as_mut().poll(&mut cx).is_pending());
         token.cancel();
-        assert!(matches!(waiting.as_mut().poll(&mut cx), Poll::Ready(Err(detail))
+        assert!(
+            matches!(waiting.as_mut().poll(&mut cx), Poll::Ready(Err(detail))
             if detail.to_string().contains("cancelled before dispatch")
-                && !transport_interrupted(&detail)));
+                && !transport_interrupted(&detail))
+        );
 
         let mut started = false;
         let mut stopped = Box::pin(until_cancelled(&token, async {
             started = true;
             Ok(())
         }));
-        assert!(matches!(stopped.as_mut().poll(&mut cx), Poll::Ready(Err(_))));
+        assert!(matches!(
+            stopped.as_mut().poll(&mut cx),
+            Poll::Ready(Err(_))
+        ));
         drop(stopped);
-        assert!(!started, "accepted cancellation must precede even an immediately ready handshake");
+        assert!(
+            !started,
+            "accepted cancellation must precede even an immediately ready handshake"
+        );
     }
 }

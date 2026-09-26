@@ -423,20 +423,36 @@ fn cargo_build_only_test_options(command: &str) -> Option<(CompilationKind, Opti
         return None;
     }
     let mut args = tokens[cargo_index + 1..].iter().peekable();
-    if args.peek().is_some_and(|arg| arg.starts_with('+'))
-        && args.next()?.len() == 1
-    {
+    if args.peek().is_some_and(|arg| arg.starts_with('+')) && args.next()?.len() == 1 {
         return None;
     }
     let takes_value = |arg: &str| {
         matches!(
             arg,
-            "--config" | "--target" | "--target-dir" | "--build-dir"
-                | "--manifest-path" | "--lockfile-path" | "--package" | "-p"
-                | "--exclude" | "--features" | "-F" | "--bin" | "--example"
-                | "--test" | "--bench" | "--profile" | "--color"
-                | "--message-format" | "--jobs" | "-j" | "-Z" | "-C"
-                | "--artifact-dir" | "--out-dir"
+            "--config"
+                | "--target"
+                | "--target-dir"
+                | "--build-dir"
+                | "--manifest-path"
+                | "--lockfile-path"
+                | "--package"
+                | "-p"
+                | "--exclude"
+                | "--features"
+                | "-F"
+                | "--bin"
+                | "--example"
+                | "--test"
+                | "--bench"
+                | "--profile"
+                | "--color"
+                | "--message-format"
+                | "--jobs"
+                | "-j"
+                | "-Z"
+                | "-C"
+                | "--artifact-dir"
+                | "--out-dir"
         )
     };
     let mut kind = None;
@@ -459,10 +475,14 @@ fn cargo_build_only_test_options(command: &str) -> Option<(CompilationKind, Opti
             no_run = true;
             continue;
         }
-        if matches!(arg.as_str(), "--help" | "-h" | "--version" | "-V" | "--list" | "--doc") {
+        if matches!(
+            arg.as_str(),
+            "--help" | "-h" | "--version" | "-V" | "--list" | "--doc"
+        ) {
             return None;
         }
-        if let Some(value) = arg.strip_prefix("--jobs=")
+        if let Some(value) = arg
+            .strip_prefix("--jobs=")
             .or_else(|| arg.strip_prefix("-j="))
             .or_else(|| arg.strip_prefix("-j"))
         {
@@ -470,18 +490,35 @@ fn cargo_build_only_test_options(command: &str) -> Option<(CompilationKind, Opti
             continue;
         }
         if arg.split_once('=').is_some_and(|(key, _)| takes_value(key))
-            || ["-p", "-F", "-Z", "-C"].iter()
+            || ["-p", "-F", "-Z", "-C"]
+                .iter()
                 .any(|prefix| arg.starts_with(*prefix) && arg.len() > prefix.len())
         {
             continue;
         }
         if matches!(
             arg.as_str(),
-            "--workspace" | "--all" | "--lib" | "--bins" | "--tests" | "--benches"
-                | "--examples" | "--all-targets" | "--all-features"
-                | "--no-default-features" | "--no-fail-fast" | "--release"
-                | "--quiet" | "--verbose" | "--frozen" | "--locked" | "--offline"
-                | "--future-incompat-report" | "--timings" | "--keep-going" | "--ignore-rust-version"
+            "--workspace"
+                | "--all"
+                | "--lib"
+                | "--bins"
+                | "--tests"
+                | "--benches"
+                | "--examples"
+                | "--all-targets"
+                | "--all-features"
+                | "--no-default-features"
+                | "--no-fail-fast"
+                | "--release"
+                | "--quiet"
+                | "--verbose"
+                | "--frozen"
+                | "--locked"
+                | "--offline"
+                | "--future-incompat-report"
+                | "--timings"
+                | "--keep-going"
+                | "--ignore-rust-version"
         ) || arg.starts_with("--timings=")
             || arg.strip_prefix('-').is_some_and(|flags| {
                 !flags.is_empty() && flags.chars().all(|flag| matches!(flag, 'v' | 'q' | 'r'))
@@ -508,9 +545,10 @@ fn cargo_build_only_test_options(command: &str) -> Option<(CompilationKind, Opti
 /// Whether the classified test/bench invocation explicitly compiles without
 /// running. Nextest and other test runners have separate command contracts.
 pub(super) fn cargo_build_only_test(kind: Option<CompilationKind>, command: &str) -> bool {
-    matches!(kind, Some(CompilationKind::CargoTest | CompilationKind::CargoBench))
-        && cargo_build_only_test_options(command)
-            .is_some_and(|(selected, _)| Some(selected) == kind)
+    matches!(
+        kind,
+        Some(CompilationKind::CargoTest | CompilationKind::CargoBench)
+    ) && cargo_build_only_test_options(command).is_some_and(|(selected, _)| Some(selected) == kind)
 }
 
 pub(crate) fn estimate_cores_for_command(
@@ -522,8 +560,10 @@ pub(crate) fn estimate_cores_for_command(
     let test_default = config.test_slots.max(1);
     let check_default = config.check_slots.max(1);
 
-    if matches!(kind, Some(CompilationKind::CargoTest | CompilationKind::CargoBench))
-        && let Some((selected, jobs)) = cargo_build_only_test_options(command)
+    if matches!(
+        kind,
+        Some(CompilationKind::CargoTest | CompilationKind::CargoBench)
+    ) && let Some((selected, jobs)) = cargo_build_only_test_options(command)
         && Some(selected) == kind
     {
         // --no-run starts no test harness. Name filters, --test-threads and
@@ -757,30 +797,66 @@ mod cargo_profile_tests {
             "rustup run nightly cargo test name_filter --no-run -- --exact",
             "cargo test --config --no-run --no-run",
         ] {
-            assert!(cargo_build_only_test(Some(CompilationKind::CargoTest), command), "{command}");
+            assert!(
+                cargo_build_only_test(Some(CompilationKind::CargoTest), command),
+                "{command}"
+            );
         }
         assert!(cargo_build_only_test(
-            Some(CompilationKind::CargoBench), "cargo bench --no-run --bench timing"
+            Some(CompilationKind::CargoBench),
+            "cargo bench --no-run --bench timing"
         ));
         for command in [
-            "cargo test -- --no-run", "cargo test --no-runner", "cargo test --no-run=true",
-            "cargo test --no-run --help", "cargo test --no-run --doc",
-            "cargo --no-run test", "cargo run -- --no-run", "cargo build --no-run",
-            "cargo nextest run --no-run", "cargo-zigbuild test --no-run",
-            "env -u --no-run cargo test", "time -f --no-run cargo test",
-            "printf '%s' 'cargo test --no-run'", "cargo test --no-run && echo done",
-            "cargo test --no-run --unknown-option", "cargo test --no-run 'unterminated",
+            "cargo test -- --no-run",
+            "cargo test --no-runner",
+            "cargo test --no-run=true",
+            "cargo test --no-run --help",
+            "cargo test --no-run --doc",
+            "cargo --no-run test",
+            "cargo run -- --no-run",
+            "cargo build --no-run",
+            "cargo nextest run --no-run",
+            "cargo-zigbuild test --no-run",
+            "env -u --no-run cargo test",
+            "time -f --no-run cargo test",
+            "printf '%s' 'cargo test --no-run'",
+            "cargo test --no-run && echo done",
+            "cargo test --no-run --unknown-option",
+            "cargo test --no-run 'unterminated",
         ] {
-            assert!(!cargo_build_only_test(Some(CompilationKind::CargoTest), command), "{command}");
+            assert!(
+                !cargo_build_only_test(Some(CompilationKind::CargoTest), command),
+                "{command}"
+            );
         }
-        for option in ["--config", "--package", "--test", "--bench", "--profile", "--features",
-            "--target", "--target-dir", "--manifest-path", "--message-format", "-Z", "-C"]
-        {
+        for option in [
+            "--config",
+            "--package",
+            "--test",
+            "--bench",
+            "--profile",
+            "--features",
+            "--target",
+            "--target-dir",
+            "--manifest-path",
+            "--message-format",
+            "-Z",
+            "-C",
+        ] {
             let command = format!("cargo test {option} --no-run");
-            assert!(!cargo_build_only_test(Some(CompilationKind::CargoTest), &command), "{command}");
+            assert!(
+                !cargo_build_only_test(Some(CompilationKind::CargoTest), &command),
+                "{command}"
+            );
         }
-        assert!(!cargo_build_only_test(Some(CompilationKind::CargoBench), "cargo test --no-run"));
-        assert!(!cargo_build_only_test(Some(CompilationKind::CargoTest), "cargo bench --no-run"));
+        assert!(!cargo_build_only_test(
+            Some(CompilationKind::CargoBench),
+            "cargo test --no-run"
+        ));
+        assert!(!cargo_build_only_test(
+            Some(CompilationKind::CargoTest),
+            "cargo bench --no-run"
+        ));
     }
 
     #[test]
@@ -792,22 +868,63 @@ mod cargo_profile_tests {
             ..Default::default()
         };
         for (kind, command, expected) in [
-            (CompilationKind::CargoTest, "cargo test filter --no-run -- --exact --test-threads=1", 12),
-            (CompilationKind::CargoTest, "RUST_TEST_THREADS=1 cargo test --no-run", 12),
-            (CompilationKind::CargoTest, "cargo test --no-run -- --jobs=99", 12),
-            (CompilationKind::CargoTest, "cargo test --no-run -j3 -- --jobs=99", 3),
+            (
+                CompilationKind::CargoTest,
+                "cargo test filter --no-run -- --exact --test-threads=1",
+                12,
+            ),
+            (
+                CompilationKind::CargoTest,
+                "RUST_TEST_THREADS=1 cargo test --no-run",
+                12,
+            ),
+            (
+                CompilationKind::CargoTest,
+                "cargo test --no-run -- --jobs=99",
+                12,
+            ),
+            (
+                CompilationKind::CargoTest,
+                "cargo test --no-run -j3 -- --jobs=99",
+                3,
+            ),
             (CompilationKind::CargoTest, "cargo test --no-run -j=3", 3),
-            (CompilationKind::CargoTest, "cargo --jobs 5 test --no-run", 5),
-            (CompilationKind::CargoTest, "CARGO_BUILD_JOBS=6 cargo test --no-run", 6),
-            (CompilationKind::CargoBench, "cargo bench --no-run --jobs=2", 2),
-            (CompilationKind::CargoTest, "cargo test filter -- --exact --test-threads=1", 1),
+            (
+                CompilationKind::CargoTest,
+                "cargo --jobs 5 test --no-run",
+                5,
+            ),
+            (
+                CompilationKind::CargoTest,
+                "CARGO_BUILD_JOBS=6 cargo test --no-run",
+                6,
+            ),
+            (
+                CompilationKind::CargoBench,
+                "cargo bench --no-run --jobs=2",
+                2,
+            ),
+            (
+                CompilationKind::CargoTest,
+                "cargo test filter -- --exact --test-threads=1",
+                1,
+            ),
         ] {
-            assert_eq!(estimate_cores_for_command(Some(kind), command, &config), expected, "{command}");
+            assert_eq!(
+                estimate_cores_for_command(Some(kind), command, &config),
+                expected,
+                "{command}"
+            );
         }
         config.build_slots = 0;
-        assert_eq!(estimate_cores_for_command(
-            Some(CompilationKind::CargoTest), "cargo test --no-run", &config
-        ), 1);
+        assert_eq!(
+            estimate_cores_for_command(
+                Some(CompilationKind::CargoTest),
+                "cargo test --no-run",
+                &config
+            ),
+            1
+        );
     }
 
     #[test]

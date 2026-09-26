@@ -6,8 +6,8 @@
 //! a process outcome, or evidence that output is durable. The ordinary drains
 //! still retain every accepted byte and decide whether capture succeeded.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Maximum resident preview bytes per stream, independent of output volume.
 pub const MAX_PREVIEW_BYTES: usize = 8192;
@@ -68,20 +68,29 @@ struct Lane {
 
 impl Lane {
     fn record(&self, offset: u64, bytes: &[u8]) {
-        let Some(end) = offset.checked_add(bytes.len() as u64) else { return; };
-        if bytes.is_empty() { return; }
+        let Some(end) = offset.checked_add(bytes.len() as u64) else {
+            return;
+        };
+        if bytes.is_empty() {
+            return;
+        }
         // The real lane supplies monotonic offsets after successful retention.
         // Observational misuse cannot rewind the consumer or overflow a length.
         let previous = self.observed.fetch_max(end, Ordering::AcqRel);
-        if offset < previous { return; }
-        let Ok(mut tail) = self.tail.try_lock() else { return; };
+        if offset < previous {
+            return;
+        }
+        let Ok(mut tail) = self.tail.try_lock() else {
+            return;
+        };
         if tail.end != offset {
             tail.bytes.clear();
             tail.start = offset;
         }
         if bytes.len() >= MAX_PREVIEW_BYTES {
             tail.bytes.clear();
-            tail.bytes.extend_from_slice(&bytes[bytes.len() - MAX_PREVIEW_BYTES..]);
+            tail.bytes
+                .extend_from_slice(&bytes[bytes.len() - MAX_PREVIEW_BYTES..]);
             tail.start = end - MAX_PREVIEW_BYTES as u64;
         } else {
             let discard = (tail.bytes.len() + bytes.len()).saturating_sub(MAX_PREVIEW_BYTES);
@@ -95,7 +104,9 @@ impl Lane {
     }
 
     fn take(&self, stream: PreviewStream) -> Option<OutputPreview> {
-        let Ok(mut tail) = self.tail.try_lock() else { return None; };
+        let Ok(mut tail) = self.tail.try_lock() else {
+            return None;
+        };
         let observed = self.observed.load(Ordering::Acquire);
         if tail.end > tail.emitted {
             let offset = tail.start.max(tail.emitted);
@@ -103,14 +114,23 @@ impl Lane {
             let bytes = tail.bytes.get(skip..)?.to_vec();
             let skipped_bytes = offset - tail.emitted;
             tail.emitted = tail.end;
-            Some(OutputPreview { stream, offset, bytes, skipped_bytes, observed_bytes: observed })
+            Some(OutputPreview {
+                stream,
+                offset,
+                bytes,
+                skipped_bytes,
+                observed_bytes: observed,
+            })
         } else if observed > tail.emitted {
             // No retained preview survived contention. Expose the gap instead
             // of claiming continuity or making an empty stream look complete.
             let skipped_bytes = observed - tail.emitted;
             tail.emitted = observed;
             Some(OutputPreview {
-                stream, offset: observed, bytes: Vec::new(), skipped_bytes,
+                stream,
+                offset: observed,
+                bytes: Vec::new(),
+                skipped_bytes,
                 observed_bytes: observed,
             })
         } else {
@@ -159,19 +179,27 @@ mod tests {
         preview.record(PreviewStream::Stderr, 0, "雪".as_bytes());
         let first = preview.take(PreviewStream::Stdout).unwrap();
         assert_eq!(first.bytes, b"out\0\xff");
-        assert_eq!((first.offset, first.skipped_bytes, first.observed_bytes), (0, 0, 5));
+        assert_eq!(
+            (first.offset, first.skipped_bytes, first.observed_bytes),
+            (0, 0, 5)
+        );
         assert!(preview.take(PreviewStream::Stdout).is_none());
         preview.record(PreviewStream::Stdout, 5, b"next");
         let next = preview.take(PreviewStream::Stdout).unwrap();
         assert_eq!(next.bytes, b"next");
         assert_eq!((next.offset, next.skipped_bytes), (5, 0));
-        assert_eq!(preview.take(PreviewStream::Stderr).unwrap().bytes, "雪".as_bytes());
+        assert_eq!(
+            preview.take(PreviewStream::Stderr).unwrap().bytes,
+            "雪".as_bytes()
+        );
     }
 
     #[test]
     fn slow_consumer_receives_the_bounded_tail_and_an_exact_gap() {
         let preview = LiveOutputPreview::default();
-        let bytes: Vec<_> = (0..MAX_PREVIEW_BYTES * 5 + 13).map(|i| (i % 251) as u8).collect();
+        let bytes: Vec<_> = (0..MAX_PREVIEW_BYTES * 5 + 13)
+            .map(|i| (i % 251) as u8)
+            .collect();
         for (i, chunk) in bytes.chunks(997).enumerate() {
             preview.record(PreviewStream::Stdout, (i * 997) as u64, chunk);
         }
@@ -199,10 +227,19 @@ mod tests {
         let without_consumer = completed.recv_timeout(std::time::Duration::from_secs(2));
         drop(held); // Release even on regression, before joining the producer.
         producer.join().unwrap();
-        assert!(without_consumer.is_ok(), "preview backpressured its pipe drain");
-        assert_eq!(preview.take(PreviewStream::Stdout).unwrap().bytes, b"before");
+        assert!(
+            without_consumer.is_ok(),
+            "preview backpressured its pipe drain"
+        );
+        assert_eq!(
+            preview.take(PreviewStream::Stdout).unwrap().bytes,
+            b"before"
+        );
         let gap = preview.take(PreviewStream::Stdout).unwrap();
-        assert_eq!((gap.offset, gap.skipped_bytes, gap.observed_bytes), (12, 6, 12));
+        assert_eq!(
+            (gap.offset, gap.skipped_bytes, gap.observed_bytes),
+            (12, 6, 12)
+        );
         assert!(gap.bytes.is_empty());
         preview.record(PreviewStream::Stdout, 12, b"after");
         let after = preview.take(PreviewStream::Stdout).unwrap();
@@ -233,10 +270,17 @@ mod tests {
         preview.record(PreviewStream::Stdout, 0, b"duplicate");
         preview.record(PreviewStream::Stdout, u64::MAX, b"overflow");
         assert!(preview.take(PreviewStream::Stdout).is_none());
-        preview.record(PreviewStream::Stdout, (MAX_PREVIEW_BYTES * 8) as u64, b"tail");
+        preview.record(
+            PreviewStream::Stdout,
+            (MAX_PREVIEW_BYTES * 8) as u64,
+            b"tail",
+        );
         let result = preview.take(PreviewStream::Stdout).unwrap();
         assert_eq!(result.bytes, b"tail");
         assert_eq!(result.skipped_bytes, 0);
-        assert_eq!(preview.stdout.tail.lock().unwrap().bytes.capacity(), MAX_PREVIEW_BYTES);
+        assert_eq!(
+            preview.stdout.tail.lock().unwrap().bytes.capacity(),
+            MAX_PREVIEW_BYTES
+        );
     }
 }

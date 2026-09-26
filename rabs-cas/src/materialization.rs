@@ -66,33 +66,54 @@ static MATERIALIZE_COUNTER: AtomicU64 = AtomicU64::new(0);
 pub fn publish_new_directory(staging: &Path, destination: &Path) -> std::io::Result<()> {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
-        let parent = staging.parent().filter(|parent| {
-            staging.is_absolute()
-                && destination.is_absolute()
-                && Some(*parent) == destination.parent()
-        }).ok_or_else(|| std::io::Error::new(
-            std::io::ErrorKind::InvalidInput, "output directories must be absolute siblings",
-        ))?;
-        let source = staging.file_name().ok_or_else(|| std::io::Error::new(
-            std::io::ErrorKind::InvalidInput, "staging directory needs a name",
-        ))?;
-        let target = destination.file_name().ok_or_else(|| std::io::Error::new(
-            std::io::ErrorKind::InvalidInput, "output directory needs a name",
-        ))?;
+        let parent = staging
+            .parent()
+            .filter(|parent| {
+                staging.is_absolute()
+                    && destination.is_absolute()
+                    && Some(*parent) == destination.parent()
+            })
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "output directories must be absolute siblings",
+                )
+            })?;
+        let source = staging.file_name().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "staging directory needs a name",
+            )
+        })?;
+        let target = destination.file_name().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "output directory needs a name",
+            )
+        })?;
         if !std::fs::symlink_metadata(staging)?.is_dir() {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput,
-                "staging must be an ordinary directory"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "staging must be an ordinary directory",
+            ));
         }
         let directory = std::fs::File::open(parent)?;
-        rustix::fs::renameat_with(&directory, source, &directory, target,
-            rustix::fs::RenameFlags::NOREPLACE)?;
+        rustix::fs::renameat_with(
+            &directory,
+            source,
+            &directory,
+            target,
+            rustix::fs::RenameFlags::NOREPLACE,
+        )?;
         directory.sync_all()
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = (staging, destination);
-        Err(std::io::Error::new(std::io::ErrorKind::Unsupported,
-            "atomic output directory installation is unsupported on this platform"))
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "atomic output directory installation is unsupported on this platform",
+        ))
     }
 }
 
@@ -704,20 +725,15 @@ fn install_one(
     prepare: &impl Fn(&PlannedActionOutput, &std::fs::File) -> std::io::Result<()>,
 ) -> Result<OutputMaterialized, MaterializeError> {
     let began = Instant::now();
-    let bytes = materialize_object_prepared(
-        store,
-        &out.object,
-        &out.destination,
-        mode,
-        |staged| {
+    let bytes =
+        materialize_object_prepared(store, &out.object, &out.destination, mode, |staged| {
             prepare(out, staged)?;
             if mode.mtime_permitted() {
                 staged.set_modified(freshness)
             } else {
                 Ok(())
             }
-        },
-    )?;
+        })?;
     Ok(OutputMaterialized {
         role: out.role,
         virtual_path: out.virtual_path.clone(),
@@ -742,8 +758,7 @@ fn validate_action_destinations(outputs: &[PlannedActionOutput]) -> Result<(), M
     let mut seen = std::collections::BTreeSet::<PathBuf>::new();
     for out in outputs {
         let path = &out.destination;
-        if path.file_name().is_none()
-            || path.components().any(|part| part == Component::ParentDir)
+        if path.file_name().is_none() || path.components().any(|part| part == Component::ParentDir)
         {
             return Err(MaterializeError::UnsafeDestination {
                 path: path.to_string_lossy().into_owned(),
@@ -1556,22 +1571,21 @@ mod tests {
             let original_stamp = fs::metadata(&destination).unwrap().modified().unwrap();
             let calls = std::cell::Cell::new(0);
 
-            let failure = materialize_object_prepared(
-                &mut store,
-                &object,
-                &destination,
-                mode,
-                |staged| {
+            let failure =
+                materialize_object_prepared(&mut store, &object, &destination, mode, |staged| {
                     calls.set(calls.get() + 1);
                     assert_eq!(staged.metadata()?.len(), 9);
                     assert_eq!(fs::read(&destination)?, b"previous output");
                     staged.set_modified(SystemTime::UNIX_EPOCH)?;
                     Err(std::io::Error::other("injected metadata failure"))
-                },
-            )
-            .unwrap_err();
+                })
+                .unwrap_err();
 
-            assert_eq!(calls.get(), 1, "metadata is prepared before one publication");
+            assert_eq!(
+                calls.get(),
+                1,
+                "metadata is prepared before one publication"
+            );
             assert!(matches!(
                 failure,
                 MaterializeError::Io {
@@ -1635,13 +1649,17 @@ mod tests {
             };
             let freshness = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_234_567_890);
 
-            let receipt = install_one(&mut store, &output, freshness, mode, &|_, _| Ok(())).unwrap();
+            let receipt =
+                install_one(&mut store, &output, freshness, mode, &|_, _| Ok(())).unwrap();
 
             assert_eq!(receipt.bytes, 14);
             assert_eq!(receipt.destination, output.destination);
             assert_eq!(fs::read(&output.destination).unwrap(), b"metadata bytes");
             assert_eq!(
-                fs::metadata(&output.destination).unwrap().modified().unwrap(),
+                fs::metadata(&output.destination)
+                    .unwrap()
+                    .modified()
+                    .unwrap(),
                 freshness
             );
             assert_eq!(
@@ -2078,12 +2096,9 @@ mod tests {
             [parent.clone(), child.clone()],
             [child.clone(), parent.clone()],
         ] {
-            let failure = materialize_action_outputs(
-                &mut store,
-                &outputs,
-                MaterializationMode::PrivateCopy,
-            )
-            .unwrap_err();
+            let failure =
+                materialize_action_outputs(&mut store, &outputs, MaterializationMode::PrivateCopy)
+                    .unwrap_err();
             assert!(matches!(
                 failure.error,
                 MaterializeError::OverlappingDestinations { .. }
@@ -2103,12 +2118,9 @@ mod tests {
             object,
             destination: dir.path().join("untrusted/../out.rmeta"),
         };
-        let failure = materialize_action_outputs(
-            &mut store,
-            &[output],
-            MaterializationMode::PrivateCopy,
-        )
-        .unwrap_err();
+        let failure =
+            materialize_action_outputs(&mut store, &[output], MaterializationMode::PrivateCopy)
+                .unwrap_err();
         assert!(matches!(
             failure.error,
             MaterializeError::UnsafeDestination { .. }

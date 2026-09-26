@@ -738,7 +738,9 @@ mod tests {
     /// Unattributed, foreign-action and repeated samples never invent
     /// independent executions. Real independent attempts still promote.
     /// Once quarantined, even a weaker policy cannot restore serving.
-    fn independent_evidence_and_sticky_quarantine(store: &mut dyn RabsMetadataStore) -> Vec<String> {
+    fn independent_evidence_and_sticky_quarantine(
+        store: &mut dyn RabsMetadataStore,
+    ) -> Vec<String> {
         let (active, action) = published_fixture(store);
         let action_key = digest_key(&action);
         let frozen = publication_lines(store);
@@ -787,17 +789,27 @@ mod tests {
             .record_verification_sample(&action, 22, true, 106)
             .unwrap();
         let eval = reevaluate_action(store, &active, &action, &policies, 107).unwrap();
-        assert_eq!(eval.observed_tier, TrustEvidenceTier::ReproducibleSameWorker);
+        assert_eq!(
+            eval.observed_tier,
+            TrustEvidenceTier::ReproducibleSameWorker
+        );
         assert_eq!(eval.disposition, DISPOSITION_EVIDENCE_PENDING);
         store
             .record_verification_sample(&action, 21, true, 108)
             .unwrap();
         let eval = reevaluate_action(store, &active, &action, &policies, 109).unwrap();
-        assert_eq!(eval.observed_tier, TrustEvidenceTier::ReproducibleCrossWorker);
+        assert_eq!(
+            eval.observed_tier,
+            TrustEvidenceTier::ReproducibleCrossWorker
+        );
         assert_eq!(eval.disposition, DISPOSITION_SERVABLE);
 
         store
-            .add_quarantine(QuarantineScope::ActionEntry, &action_key, "closure corruption")
+            .add_quarantine(
+                QuarantineScope::ActionEntry,
+                &action_key,
+                "closure corruption",
+            )
             .unwrap();
         let record = store.serving_record(&action_key).unwrap().unwrap();
         assert_eq!(record.disposition, DISPOSITION_SERVABLE);
@@ -806,7 +818,11 @@ mod tests {
         let eval = reevaluate_action(store, &active, &action, &weaker, 110).unwrap();
         assert_eq!(eval.disposition, DISPOSITION_QUARANTINED);
         assert_eq!(
-            store.latest_trust_evaluation(&action).unwrap().unwrap().state,
+            store
+                .latest_trust_evaluation(&action)
+                .unwrap()
+                .unwrap()
+                .state,
             "unresolved-quarantine"
         );
         assert_eq!(
@@ -825,8 +841,12 @@ mod tests {
 
         // A later passing observation cannot erase an attempt's failed
         // observation or count it as an additional successful execution.
-        store.record_verification_sample(&action, 20, false, 111).unwrap();
-        store.record_verification_sample(&action, 20, true, 112).unwrap();
+        store
+            .record_verification_sample(&action, 20, false, 111)
+            .unwrap();
+        store
+            .record_verification_sample(&action, 20, true, 112)
+            .unwrap();
         let evidence = verification_evidence(store, &action).unwrap();
         assert_eq!(evidence.attempts, 3);
         assert_eq!(evidence.passed_attempts, 2);
@@ -867,7 +887,11 @@ mod tests {
                 .unwrap();
             let blocking = if named_blocker {
                 store
-                    .add_quarantine(QuarantineScope::LogicalObject, "object:damaged", "bad bytes")
+                    .add_quarantine(
+                        QuarantineScope::LogicalObject,
+                        "object:damaged",
+                        "bad bytes",
+                    )
                     .unwrap();
                 vec![(QuarantineScope::LogicalObject, "object:damaged".to_owned())]
             } else {
@@ -908,7 +932,9 @@ mod tests {
         }
     }
 
-    fn compromise_without_policy_is_still_blocked(store: &mut dyn RabsMetadataStore) -> Vec<String> {
+    fn compromise_without_policy_is_still_blocked(
+        store: &mut dyn RabsMetadataStore,
+    ) -> Vec<String> {
         let (active, action) = published_fixture(store);
         let action_key = digest_key(&action);
         let frozen = publication_lines(store);
@@ -1079,7 +1105,11 @@ mod tests {
                 }
                 "named" => {
                     store
-                        .add_quarantine(QuarantineScope::LogicalObject, "object:damaged", "bad bytes")
+                        .add_quarantine(
+                            QuarantineScope::LogicalObject,
+                            "object:damaged",
+                            "bad bytes",
+                        )
                         .unwrap();
                     let record = store.serving_record(&action_key).unwrap().unwrap();
                     store
@@ -1109,10 +1139,15 @@ mod tests {
                     "compromised"
                 }
             };
-            let evaluation = reevaluate_action(&mut store, &active, &action, &policies, 101).unwrap();
+            let evaluation =
+                reevaluate_action(&mut store, &active, &action, &policies, 101).unwrap();
             assert_eq!(evaluation.disposition, DISPOSITION_QUARANTINED, "{cause}");
             assert_eq!(
-                store.latest_trust_evaluation(&action).unwrap().unwrap().state,
+                store
+                    .latest_trust_evaluation(&action)
+                    .unwrap()
+                    .unwrap()
+                    .state,
                 expected_state,
                 "{cause}"
             );
@@ -1138,7 +1173,10 @@ mod tests {
             let mut reference = SqlMetadataStore::open(reference_engine).unwrap();
             let mut candidate = SqlMetadataStore::open(candidate_engine).unwrap();
             let snapshot = presentation_quarantine_policy_matrix(&mut reference);
-            assert_eq!(presentation_quarantine_policy_matrix(&mut candidate), snapshot);
+            assert_eq!(
+                presentation_quarantine_policy_matrix(&mut candidate),
+                snapshot
+            );
             snapshot
         };
         let reference_engine = RusqliteEngine::open(&reference_path).unwrap();

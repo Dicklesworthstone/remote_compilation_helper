@@ -225,7 +225,8 @@ async fn accept_loop(
                 let limits = limits.clone();
                 let spawned = cx.spawn(move |cx| async move {
                     if cx.checkpoint().is_ok() {
-                        handle_connection(id, stream, policy, socket_evidence, services, limits).await;
+                        handle_connection(id, stream, policy, socket_evidence, services, limits)
+                            .await;
                     }
                     drop(permit);
                 });
@@ -258,14 +259,21 @@ async fn read_frame_with_budget(stream: &mut UnixStream, budget: Duration) -> Op
             match stream.read(&mut byte).await {
                 Ok(0) => return None,
                 Ok(_) => {
-                    if byte[0] == b'\n' { return Some(frame); }
-                    if frame.len() == MAX_FRAME_BYTES { return None; }
+                    if byte[0] == b'\n' {
+                        return Some(frame);
+                    }
+                    if frame.len() == MAX_FRAME_BYTES {
+                        return None;
+                    }
                     frame.push(byte[0]);
                 }
                 Err(_) => return None,
             }
         }
-    }).await.ok().flatten()
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 /// None means EOF, a truncated/oversized frame, or an exhausted read budget.
@@ -276,8 +284,13 @@ async fn read_frame(stream: &mut UnixStream) -> Option<Vec<u8>> {
 async fn write_frame(stream: &mut UnixStream, line: &str) -> bool {
     let mut bytes = line.as_bytes().to_vec();
     bytes.push(b'\n');
-    asupersync::time::timeout(asupersync::time::wall_now(), FRAME_IO_BUDGET,
-        stream.write_all(&bytes)).await.is_ok_and(|result| result.is_ok())
+    asupersync::time::timeout(
+        asupersync::time::wall_now(),
+        FRAME_IO_BUDGET,
+        stream.write_all(&bytes),
+    )
+    .await
+    .is_ok_and(|result| result.is_ok())
 }
 
 fn refusal(reason: &str, detail: &str) -> String {
@@ -392,14 +405,29 @@ async fn handle_connection(
             Ok(value) if value.get("kind").and_then(|k| k.as_str()) == Some("status") => {
                 status_on_lane(&limits.control, coord.clone()).await
             }
-            Ok(value) if matches!(value.get("kind").and_then(|k| k.as_str()),
-                Some("prepared-submit" | "prepared-status" | "prepared-cancel" | "prepared-resume" | "prepared-acknowledge" | "prepared-completion" | "prepared-recover-local" | "prepared-preview")) => {
+            Ok(value)
+                if matches!(
+                    value.get("kind").and_then(|k| k.as_str()),
+                    Some(
+                        "prepared-submit"
+                            | "prepared-status"
+                            | "prepared-cancel"
+                            | "prepared-resume"
+                            | "prepared-acknowledge"
+                            | "prepared-completion"
+                            | "prepared-recover-local"
+                            | "prepared-preview"
+                    )
+                ) =>
+            {
                 // Bundle admission and complete result verification perform
                 // filesystem work. Neither may occupy the cancellation/status
                 // lane or the reactor while hashing a large delivered tree.
                 let lane = match value["kind"].as_str() {
                     Some("prepared-submit" | "prepared-resume") => &limits.prepared_admission,
-                    Some("prepared-completion" | "prepared-recover-local") => &limits.materialization,
+                    Some("prepared-completion" | "prepared-recover-local") => {
+                        &limits.materialization
+                    }
                     _ => &limits.control,
                 };
                 prepared_on_lane(lane, prepared_operations.clone(), value).await
@@ -410,19 +438,25 @@ async fn handle_connection(
                         let shadow = std::sync::Arc::clone(&shadow);
                         let coord = coord.clone();
                         let work_trace = trace.clone();
-                        let result = match limits.shadow.spawn(move || {
-                            shadow_reply(&work_trace, observation, shadow, coord)
-                        }) {
+                        let result = match limits
+                            .shadow
+                            .spawn(move || shadow_reply(&work_trace, observation, shadow, coord))
+                        {
                             Ok(mut work) => work.wait().await,
                             Err(error) => Err(error),
                         };
                         match result {
                             Ok((reply, flight)) => {
-                                if let Some(flight) = flight { open_flights.push(flight); }
+                                if let Some(flight) = flight {
+                                    open_flights.push(flight);
+                                }
                                 reply
                             }
                             Err(error) => {
-                                log_line("rabsd-edge-shadow-error", &[("trace", &trace), ("error", &error.to_string())]);
+                                log_line(
+                                    "rabsd-edge-shadow-error",
+                                    &[("trace", &trace), ("error", &error.to_string())],
+                                );
                                 "{\"kind\":\"decision\",\"decision\":\"pass-through\",\"mode\":\"shadow-error\"}".to_owned()
                             }
                         }
@@ -462,13 +496,19 @@ fn shadow_reply(
 ) -> (String, Option<Flight>) {
     let mut joined: Option<Flight> = None;
     let decision = shadow.lock().map_err(|_| ()).and_then(|mut plane| {
-        plane.on_consult(trace, &observation, |key| {
-            let role = coord.begin_flight(key);
-            if role != crate::coord::live::FlightRole::Degraded {
-                joined = Some(Flight { coord: coord.clone(), key: key.to_owned(), label: role.label() });
-            }
-            role.label()
-        }).map_err(|_| ())
+        plane
+            .on_consult(trace, &observation, |key| {
+                let role = coord.begin_flight(key);
+                if role != crate::coord::live::FlightRole::Degraded {
+                    joined = Some(Flight {
+                        coord: coord.clone(),
+                        key: key.to_owned(),
+                        label: role.label(),
+                    });
+                }
+                role.label()
+            })
+            .map_err(|_| ())
     });
     let flight_label = joined.as_ref().map_or("degraded", |flight| flight.label);
     let reply = match decision {
@@ -477,12 +517,22 @@ fn shadow_reply(
              \"mode\":\"{}\",\"key\":\"{}\",\
              \"hit_upper_bound\":{},\"class\":\"{}\",\
              \"flight\":\"{flight_label}\"}}",
-            if coord.available() { "shadow" } else { "shadow-coord-degraded" },
-            decision.key_hex, decision.would_have_hit_upper_bound, decision.class,
+            if coord.available() {
+                "shadow"
+            } else {
+                "shadow-coord-degraded"
+            },
+            decision.key_hex,
+            decision.would_have_hit_upper_bound,
+            decision.class,
         ),
         Err(()) => {
-            log_line("rabsd-edge-shadow-error", &[("trace", trace), ("key_class", "unknown")]);
-            "{\"kind\":\"decision\",\"decision\":\"pass-through\",\"mode\":\"shadow-error\"}".to_owned()
+            log_line(
+                "rabsd-edge-shadow-error",
+                &[("trace", trace), ("key_class", "unknown")],
+            );
+            "{\"kind\":\"decision\",\"decision\":\"pass-through\",\"mode\":\"shadow-error\"}"
+                .to_owned()
         }
     };
     (reply, joined)
@@ -560,7 +610,9 @@ fn prepared_reply(
                 "stderr_offset",
             ],
             "prepared-resume" => &["kind", "operation_id", "delivery", "resume_from"],
-            "prepared-acknowledge" | "prepared-recover-local" => &["kind", "operation_id", "delivery"],
+            "prepared-acknowledge" | "prepared-recover-local" => {
+                &["kind", "operation_id", "delivery"]
+            }
             _ => return Err(invalid("unknown prepared operation")),
         };
         if request
@@ -1124,11 +1176,14 @@ mod edge_liveness_tests {
         let query = |request: &Value| -> Value {
             serde_json::from_str(&prepared_reply(Some(&store), request)).unwrap()
         };
-        assert_eq!(query(&request), json!({
-            "kind":"prepared-preview", "operation_id":id, "request_sha256":"ab".repeat(32),
-            "attempt":1, "available":false, "active":false, "reason":"unavailable",
-            "segments":[], "complete":false, "publication_authorized":false,
-        }));
+        assert_eq!(
+            query(&request),
+            json!({
+                "kind":"prepared-preview", "operation_id":id, "request_sha256":"ab".repeat(32),
+                "attempt":1, "available":false, "active":false, "reason":"unavailable",
+                "segments":[], "complete":false, "publication_authorized":false,
+            })
+        );
         let refused = |request: &Value| {
             let reply = query(request);
             assert_eq!(reply["kind"], "prepared-operation-error", "{request}");
@@ -1143,7 +1198,14 @@ mod edge_liveness_tests {
                 refused(&changed);
             }
         }
-        for field in ["kind", "operation_id", "request_sha256", "attempt", "stdout_offset", "stderr_offset"] {
+        for field in [
+            "kind",
+            "operation_id",
+            "request_sha256",
+            "attempt",
+            "stdout_offset",
+            "stderr_offset",
+        ] {
             let mut changed = request.clone();
             changed.as_object_mut().unwrap().remove(field);
             refused(&changed);
@@ -1161,14 +1223,28 @@ mod edge_liveness_tests {
         let coord = Arc::new(crate::coord::live::CoordLive::new());
         coord.mark_up();
         let edge = coord.edge_subscriber();
-        assert_eq!(edge.begin_flight("key"), crate::coord::live::FlightRole::Leader);
-        let guard = Flight { coord: edge.clone(), key: "key".into(), label: "leader" };
-        assert_eq!(edge.begin_flight("key"), crate::coord::live::FlightRole::Follower);
+        assert_eq!(
+            edge.begin_flight("key"),
+            crate::coord::live::FlightRole::Leader
+        );
+        let guard = Flight {
+            coord: edge.clone(),
+            key: "key".into(),
+            label: "leader",
+        };
+        assert_eq!(
+            edge.begin_flight("key"),
+            crate::coord::live::FlightRole::Follower
+        );
         drop(guard);
         let status: serde_json::Value = serde_json::from_str(&edge.status_json()).unwrap();
         assert_eq!(status["open_flights"], 1);
         let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _guard = Flight { coord: edge.clone(), key: "key".into(), label: "follower" };
+            let _guard = Flight {
+                coord: edge.clone(),
+                key: "key".into(),
+                label: "follower",
+            };
             panic!("injected connection panic");
         }));
         assert!(panic.is_err());
@@ -1183,9 +1259,12 @@ mod edge_liveness_tests {
         let dir = tempfile::tempdir().unwrap();
         let destination = dir.path().join("untouched");
         let runtime = RuntimeBuilder::current_thread().build().unwrap();
-        let reply = runtime.block_on(serve_on_lane(&lane, coord.edge_subscriber(),
+        let reply = runtime.block_on(serve_on_lane(
+            &lane,
+            coord.edge_subscriber(),
             serde_json::json!({"kind":"serve", "action_key":"01".repeat(32),
-                "destination_root":destination.to_str().unwrap()})));
+                "destination_root":destination.to_str().unwrap()}),
+        ));
         let reply: serde_json::Value = serde_json::from_str(&reply).unwrap();
         assert_eq!(reply["outcome"], "error");
         assert_eq!(reply["materialization_started"], false);
@@ -1193,17 +1272,21 @@ mod edge_liveness_tests {
         assert_eq!(reply["compiler_skip_authorized"], false);
         assert_eq!(reply["reexecution_authorized"], false);
         assert!(!destination.exists());
-        let panic: serde_json::Value = serde_json::from_str(
-            &serve_work_error(&WorkError::Panicked, true)).unwrap();
+        let panic: serde_json::Value =
+            serde_json::from_str(&serve_work_error(&WorkError::Panicked, true)).unwrap();
         assert_eq!(panic["materialization_started"], true);
-        assert!(panic["installed_path_bytes"].is_null(), "panic cannot prove no files installed");
+        assert!(
+            panic["installed_path_bytes"].is_null(),
+            "panic cannot prove no files installed"
+        );
         assert_eq!(panic["reexecution_authorized"], false);
     }
 
     #[test]
     fn actual_serve_yields_while_cas_is_busy() {
         let dir = tempfile::tempdir().unwrap();
-        let cas = Arc::new(crate::janitor::store::mount_and_reconcile(&dir.path().join("cas")).unwrap());
+        let cas =
+            Arc::new(crate::janitor::store::mount_and_reconcile(&dir.path().join("cas")).unwrap());
         let coord = Arc::new(crate::coord::live::CoordLive::with_cas(Arc::clone(&cas)));
         coord.acquire_boot_authority("busy-cas-fixture").unwrap();
         coord.mark_up();
@@ -1220,18 +1303,30 @@ mod edge_liveness_tests {
                 let _ = release_rx.recv_timeout(Duration::from_secs(3));
             });
             ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-            let mut request = Box::pin(serve_on_lane(&lane, coord.edge_subscriber(),
+            let mut request = Box::pin(serve_on_lane(
+                &lane,
+                coord.edge_subscriber(),
                 serde_json::json!({"kind":"serve", "action_key":"01".repeat(32),
-                    "destination_root":dir.path().join("outputs").to_str().unwrap()})));
+                    "destination_root":dir.path().join("outputs").to_str().unwrap()}),
+            ));
             let start = Instant::now();
-            assert!(matches!(request.as_mut().poll(&mut Context::from_waker(Waker::noop())), Poll::Pending));
+            assert!(matches!(
+                request
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop())),
+                Poll::Pending
+            ));
             assert!(coord.available());
-            assert!(start.elapsed() < Duration::from_secs(1), "CAS I/O blocked the polling/control thread");
+            assert!(
+                start.elapsed() < Duration::from_secs(1),
+                "CAS I/O blocked the polling/control thread"
+            );
             assert!(lane.acquire().is_none());
             release.send(()).unwrap();
             holder.join().unwrap();
             let runtime = RuntimeBuilder::current_thread().build().unwrap();
-            let reply: serde_json::Value = serde_json::from_str(&runtime.block_on(request)).unwrap();
+            let reply: serde_json::Value =
+                serde_json::from_str(&runtime.block_on(request)).unwrap();
             assert_eq!(reply["kind"], "serve-result");
             assert_ne!(reply["outcome"], "served");
             assert!(!dir.path().join("outputs").exists());
@@ -1250,7 +1345,9 @@ mod edge_liveness_tests {
             let writer = std::thread::spawn(move || {
                 let mut stream = std::os::unix::net::UnixStream::connect(path).unwrap();
                 for _ in 0..40 {
-                    if stream.write_all(b" ").is_err() { break; }
+                    if stream.write_all(b" ").is_err() {
+                        break;
+                    }
                     std::thread::sleep(Duration::from_millis(5));
                 }
             });

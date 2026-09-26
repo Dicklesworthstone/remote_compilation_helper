@@ -803,14 +803,21 @@ mod tests {
             let key = published(store, tag, generation);
             samples(store, tag, generation, 3, 0);
             assert_eq!(
-                serving_sample_decision(store, &action(tag), ActionClassRisk::LowRiskRegistry, &permissive)
-                    .unwrap(),
+                serving_sample_decision(
+                    store,
+                    &action(tag),
+                    ActionClassRisk::LowRiskRegistry,
+                    &permissive
+                )
+                .unwrap(),
                 SampleGateDecision::ServeFromCache
             );
             let failed_attempt = match tag {
                 1 => {
                     let attempt = generation * 1_000 + 4;
-                    store.record_attempt(attempt, generation, "worker-sampler", 100).unwrap();
+                    store
+                        .record_attempt(attempt, generation, "worker-sampler", 100)
+                        .unwrap();
                     attempt
                 }
                 2 => 99_999, // unknown: excluded from the pass-rate denominator
@@ -825,8 +832,13 @@ mod tests {
             for policy in [permissive, SamplingPolicy::sample_all(0, 0)] {
                 let before = store.differential_snapshot().unwrap();
                 assert_eq!(
-                    serving_sample_decision(store, &action(tag), ActionClassRisk::LowRiskRegistry, &policy)
-                        .unwrap(),
+                    serving_sample_decision(
+                        store,
+                        &action(tag),
+                        ActionClassRisk::LowRiskRegistry,
+                        &policy
+                    )
+                    .unwrap(),
                     SampleGateDecision::ExecutePrivately(
                         PrivateExecutionReason::AdverseVerificationSamples { observed: 1 }
                     )
@@ -840,8 +852,13 @@ mod tests {
                 .unwrap();
             samples(store, tag, generation, 1, 0);
             assert_eq!(
-                serving_sample_decision(store, &action(tag), ActionClassRisk::LowRiskRegistry, &permissive)
-                    .unwrap(),
+                serving_sample_decision(
+                    store,
+                    &action(tag),
+                    ActionClassRisk::LowRiskRegistry,
+                    &permissive
+                )
+                .unwrap(),
                 SampleGateDecision::ExecutePrivately(
                     PrivateExecutionReason::AdverseVerificationSamples { observed: 1 }
                 )

@@ -2017,8 +2017,13 @@ impl CoordLive {
     /// This process's own monotonic time domain. The origin never changes
     /// while its authority is live, including during an idle partition.
     fn lease_now_ms(&self) -> u64 {
-        u64::try_from(self.lease_clock.get_or_init(Instant::now).elapsed().as_millis())
-            .unwrap_or(u64::MAX)
+        u64::try_from(
+            self.lease_clock
+                .get_or_init(Instant::now)
+                .elapsed()
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX)
     }
 
     fn confirm_live_admission(
@@ -2436,7 +2441,9 @@ mod tests {
         }
         // Receipt sequences can be arbitrarily far ahead of a lease's clock
         // without shortening its TTL. No wall-clock comparison belongs here.
-        coord.next_seq.store(i64::MAX as u64 - 100, Ordering::Relaxed);
+        coord
+            .next_seq
+            .store(i64::MAX as u64 - 100, Ordering::Relaxed);
         assert!(matches!(
             coord
                 .commit_offer(&offer, &sample_expected_descriptor())
@@ -2489,7 +2496,9 @@ mod tests {
         drop(coord);
 
         let restarted = CoordLive::with_cas(Arc::new(mount_and_reconcile(state.path()).unwrap()));
-        restarted.acquire_boot_authority("submission-tests").unwrap();
+        restarted
+            .acquire_boot_authority("submission-tests")
+            .unwrap();
         assert!(matches!(
             restarted.commit_offer(&offer, &sample_expected_descriptor()),
             Err(CommitRefusal::StaleAuthority { .. })
@@ -2518,7 +2527,10 @@ mod tests {
         assert!(now >= 61_000);
         assert_eq!(deadline - now, 5_000);
         assert_eq!(coord.lease_deadline(0), Err(StoreError::LeaseExpired));
-        assert_eq!(coord.lease_deadline(u64::MAX), Err(StoreError::LeaseExpired));
+        assert_eq!(
+            coord.lease_deadline(u64::MAX),
+            Err(StoreError::LeaseExpired)
+        );
     }
 
     #[test]

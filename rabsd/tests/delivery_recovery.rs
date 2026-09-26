@@ -2,7 +2,9 @@
 //! including the binary command path. No compiler or worker is executed.
 #![cfg(unix)]
 
-use rabsd::coord::delivery_recovery::{DeliveryTrust, install_delivery_outputs, recover_existing_delivery};
+use rabsd::coord::delivery_recovery::{
+    DeliveryTrust, install_delivery_outputs, recover_existing_delivery,
+};
 use rabsd::coord::worker_delivery::{
     Delivery, MAX_FRAME_BYTES, WorkerAuthentication, WorkerPeer, receive_execution,
 };
@@ -20,7 +22,10 @@ const PIN: [u8; 32] = [0x11; 32];
 const MANIFEST: &str = "548324c3a5c96511944c6ec6af94ee9bbb6683170bb0143f9d99cd192f80bfd6";
 
 fn hash(bytes: &[u8]) -> String {
-    Sha256::digest(bytes).iter().map(|byte| format!("{byte:02x}")).collect()
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn request() -> Value {
@@ -34,7 +39,7 @@ fn chunk(name: &str, bytes: &[u8], artifact: bool) -> Value {
         "request_id":7,"offset":0,"next_offset":bytes.len(),"total_bytes":bytes.len(),
         "sha256":hash(bytes),"chunk_sha256":hash(bytes),"eof":true,
         "data_hex":bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()});
-    value[if artifact {"name"} else {"stream"}] = json!(name);
+    value[if artifact { "name" } else { "stream" }] = json!(name);
     if artifact {
         value["executable"] = json!(false);
         value["manifest_sha256"] = json!(MANIFEST);
@@ -61,7 +66,9 @@ impl WorkerPeer for Peer {
     }
 
     fn receive(&mut self) -> io::Result<Value> {
-        self.replies.pop_front().ok_or_else(|| io::Error::from(io::ErrorKind::UnexpectedEof))
+        self.replies
+            .pop_front()
+            .ok_or_else(|| io::Error::from(io::ErrorKind::UnexpectedEof))
     }
 
     fn authentication(&self) -> Option<WorkerAuthentication> {
@@ -97,14 +104,22 @@ fn delivered(root: &Path, exit: i32, stop: Option<&str>, authenticated: bool) ->
     if successful {
         replies.push_back(chunk("a", b"A\0\xffB", true));
     }
-    let mut peer = Peer { replies, authenticated, executions: 0 };
-    let delivery = receive_execution(&mut peer, &request(), "worker", &root.join("delivery")).unwrap();
+    let mut peer = Peer {
+        replies,
+        authenticated,
+        executions: 0,
+    };
+    let delivery =
+        receive_execution(&mut peer, &request(), "worker", &root.join("delivery")).unwrap();
     assert_eq!(peer.executions, 1);
     assert!(!delivery.acknowledgments_confirmed);
     delivery
 }
 
-fn recover(delivery: &Delivery, trust: DeliveryTrust) -> Result<Option<Delivery>, impl std::fmt::Debug> {
+fn recover(
+    delivery: &Delivery,
+    trust: DeliveryTrust,
+) -> Result<Option<Delivery>, impl std::fmt::Debug> {
     recover_existing_delivery(&request(), "worker", &delivery.directory, trust)
 }
 
@@ -121,24 +136,50 @@ fn restart_replays_exact_committed_bytes_without_an_ack_or_execution() {
     let original = delivered(parent.path(), 0, None, false);
     let marker = fs::read(original.directory.join("delivery.json")).unwrap();
     for _ in 0..3 {
-        let restored = recover(&original, DeliveryTrust::Loopback).unwrap().unwrap();
+        let restored = recover(&original, DeliveryTrust::Loopback)
+            .unwrap()
+            .unwrap();
         assert_eq!(restored.receipt, original.receipt);
         assert!(!restored.acknowledgments_confirmed);
-        assert!(restored.acknowledgment_error.unwrap().contains("not rechecked"));
-        assert_eq!(fs::read(restored.directory.join("delivery.json")).unwrap(), marker);
-        assert_eq!(fs::read(restored.directory.join("artifacts/a")).unwrap(), b"A\0\xffB");
+        assert!(
+            restored
+                .acknowledgment_error
+                .unwrap()
+                .contains("not rechecked")
+        );
+        assert_eq!(
+            fs::read(restored.directory.join("delivery.json")).unwrap(),
+            marker
+        );
+        assert_eq!(
+            fs::read(restored.directory.join("artifacts/a")).unwrap(),
+            b"A\0\xffB"
+        );
     }
 }
 
 #[test]
 fn failed_and_interrupted_exit_semantics_survive_recovery() {
-    for (exit, stop) in [(101, None), (130, Some("cancelled")), (143, Some("session-lost")), (124, Some("deadline-exceeded")), (125, Some("lease-expired"))] {
+    for (exit, stop) in [
+        (101, None),
+        (130, Some("cancelled")),
+        (143, Some("session-lost")),
+        (124, Some("deadline-exceeded")),
+        (125, Some("lease-expired")),
+    ] {
         let parent = tempfile::tempdir().unwrap();
         let original = delivered(parent.path(), exit, stop, false);
-        let restored = recover(&original, DeliveryTrust::Loopback).unwrap().unwrap();
+        let restored = recover(&original, DeliveryTrust::Loopback)
+            .unwrap()
+            .unwrap();
         assert_eq!(restored.receipt, original.receipt);
         assert_eq!(restored.receipt["exit_code"], exit);
-        assert_eq!(fs::read_dir(restored.directory.join("artifacts")).unwrap().count(), 0);
+        assert_eq!(
+            fs::read_dir(restored.directory.join("artifacts"))
+                .unwrap()
+                .count(),
+            0
+        );
     }
 }
 
@@ -146,12 +187,18 @@ fn failed_and_interrupted_exit_semantics_survive_recovery() {
 fn only_absence_is_a_new_delivery_not_a_partial_receipt() {
     let parent = tempfile::tempdir().unwrap();
     let destination = parent.path().join("delivery");
-    assert!(recover_existing_delivery(&request(), "worker", &destination, DeliveryTrust::Loopback).unwrap().is_none());
+    assert!(
+        recover_existing_delivery(&request(), "worker", &destination, DeliveryTrust::Loopback)
+            .unwrap()
+            .is_none()
+    );
     assert!(!destination.exists());
     fs::create_dir(&destination).unwrap();
     fs::set_permissions(&destination, fs::Permissions::from_mode(0o700)).unwrap();
     fs::write(destination.join("delivery.pending"), b"{}").unwrap();
-    let error = recover_existing_delivery(&request(), "worker", &destination, DeliveryTrust::Loopback).unwrap_err();
+    let error =
+        recover_existing_delivery(&request(), "worker", &destination, DeliveryTrust::Loopback)
+            .unwrap_err();
     assert!(error.execution_may_have_run);
     assert!(destination.join("delivery.pending").exists());
     assert!(!destination.join("delivery.json").exists());
@@ -161,12 +208,32 @@ fn only_absence_is_a_new_delivery_not_a_partial_receipt() {
 fn binds_full_request_extensions_id_and_worker() {
     let parent = tempfile::tempdir().unwrap();
     let original = delivered(parent.path(), 0, None, false);
-    for (field, value) in [("request_id", json!(8)), ("args", json!(["different.rs"])), ("future_semantics", json!("different"))] {
+    for (field, value) in [
+        ("request_id", json!(8)),
+        ("args", json!(["different.rs"])),
+        ("future_semantics", json!("different")),
+    ] {
         let mut other = request();
         other[field] = value;
-        assert!(recover_existing_delivery(&other, "worker", &original.directory, DeliveryTrust::Loopback).is_err());
+        assert!(
+            recover_existing_delivery(
+                &other,
+                "worker",
+                &original.directory,
+                DeliveryTrust::Loopback
+            )
+            .is_err()
+        );
     }
-    assert!(recover_existing_delivery(&request(), "other-worker", &original.directory, DeliveryTrust::Loopback).is_err());
+    assert!(
+        recover_existing_delivery(
+            &request(),
+            "other-worker",
+            &original.directory,
+            DeliveryTrust::Loopback
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -174,8 +241,14 @@ fn pin_and_transport_cannot_be_downgraded_or_substituted() {
     for authenticated in [false, true] {
         let parent = tempfile::tempdir().unwrap();
         let original = delivered(parent.path(), 0, None, authenticated);
-        assert_eq!(recover(&original, DeliveryTrust::Loopback).is_ok(), !authenticated);
-        assert_eq!(recover(&original, DeliveryTrust::PinnedWorker(PIN)).is_ok(), authenticated);
+        assert_eq!(
+            recover(&original, DeliveryTrust::Loopback).is_ok(),
+            !authenticated
+        );
+        assert_eq!(
+            recover(&original, DeliveryTrust::PinnedWorker(PIN)).is_ok(),
+            authenticated
+        );
         assert!(recover(&original, DeliveryTrust::PinnedWorker([0x22; 32])).is_err());
         assert!(recover(&original, DeliveryTrust::PinnedWorker([0; 32])).is_err());
     }
@@ -184,16 +257,28 @@ fn pin_and_transport_cannot_be_downgraded_or_substituted() {
 #[test]
 fn receipt_corruption_never_becomes_an_execution_retry() {
     for (field, value) in [
-        ("version", json!(2)), ("kind", json!("pending")), ("exit_code", json!(256)),
-        ("stop_reason", json!("cancelled")), ("publication_authorized", json!(true)),
-        ("reexecute", json!(true)), ("total_bytes", json!(0)),
-        ("stdout_bytes", json!(u64::MAX)), ("request_sha256", json!("00".repeat(32))),
-        ("boot_generation", json!(0)), ("incarnation", json!("0".repeat(32))),
+        ("version", json!(2)),
+        ("kind", json!("pending")),
+        ("exit_code", json!(256)),
+        ("stop_reason", json!("cancelled")),
+        ("publication_authorized", json!(true)),
+        ("reexecute", json!(true)),
+        ("total_bytes", json!(0)),
+        ("stdout_bytes", json!(u64::MAX)),
+        ("request_sha256", json!("00".repeat(32))),
+        ("boot_generation", json!(0)),
+        ("incarnation", json!("0".repeat(32))),
     ] {
         let parent = tempfile::tempdir().unwrap();
         let original = delivered(parent.path(), 0, None, false);
         edit_receipt(&original, |receipt| receipt[field] = value);
-        let error = recover_existing_delivery(&request(), "worker", &original.directory, DeliveryTrust::Loopback).unwrap_err();
+        let error = recover_existing_delivery(
+            &request(),
+            "worker",
+            &original.directory,
+            DeliveryTrust::Loopback,
+        )
+        .unwrap_err();
         assert!(error.execution_may_have_run, "{field}");
         assert!(original.directory.join("artifacts/a").exists());
     }
@@ -201,15 +286,27 @@ fn receipt_corruption_never_becomes_an_execution_retry() {
 
 #[test]
 fn manifest_identity_order_mode_and_set_are_rechecked() {
-    for (field, value) in [("name", json!("../escape")), ("bytes", json!(0)), ("executable", json!(true)), ("sha256", json!("00".repeat(32)))] {
+    for (field, value) in [
+        ("name", json!("../escape")),
+        ("bytes", json!(0)),
+        ("executable", json!(true)),
+        ("sha256", json!("00".repeat(32))),
+    ] {
         let parent = tempfile::tempdir().unwrap();
         let original = delivered(parent.path(), 0, None, false);
-        edit_receipt(&original, |receipt| receipt["artifact_manifest"]["files"][0][field] = value);
-        assert!(recover(&original, DeliveryTrust::Loopback).is_err(), "{field}");
+        edit_receipt(&original, |receipt| {
+            receipt["artifact_manifest"]["files"][0][field] = value
+        });
+        assert!(
+            recover(&original, DeliveryTrust::Loopback).is_err(),
+            "{field}"
+        );
     }
     let parent = tempfile::tempdir().unwrap();
     let original = delivered(parent.path(), 0, None, false);
-    edit_receipt(&original, |receipt| receipt["artifact_manifest"]["manifest_sha256"] = json!("00".repeat(32)));
+    edit_receipt(&original, |receipt| {
+        receipt["artifact_manifest"]["manifest_sha256"] = json!("00".repeat(32))
+    });
     assert!(recover(&original, DeliveryTrust::Loopback).is_err());
 }
 
@@ -226,7 +323,10 @@ fn changed_bytes_lengths_modes_and_extra_files_refuse() {
             "extra" => fs::write(original.directory.join("artifacts/undeclared"), b"x").unwrap(),
             _ => fs::create_dir(original.directory.join("artifacts/extra")).unwrap(),
         }
-        assert!(recover(&original, DeliveryTrust::Loopback).is_err(), "{corruption}");
+        assert!(
+            recover(&original, DeliveryTrust::Loopback).is_err(),
+            "{corruption}"
+        );
     }
 }
 
@@ -239,13 +339,18 @@ fn symlink_receipts_payloads_and_roots_are_not_followed() {
         let retained = parent.path().join("original");
         fs::rename(&path, &retained).unwrap();
         symlink(&retained, &path).unwrap();
-        assert!(recover(&original, DeliveryTrust::Loopback).is_err(), "{relative}");
+        assert!(
+            recover(&original, DeliveryTrust::Loopback).is_err(),
+            "{relative}"
+        );
     }
     let parent = tempfile::tempdir().unwrap();
     let original = delivered(parent.path(), 0, None, false);
     let alias = parent.path().join("alias");
     symlink(&original.directory, &alias).unwrap();
-    assert!(recover_existing_delivery(&request(), "worker", &alias, DeliveryTrust::Loopback).is_err());
+    assert!(
+        recover_existing_delivery(&request(), "worker", &alias, DeliveryTrust::Loopback).is_err()
+    );
 }
 
 #[test]
@@ -264,20 +369,40 @@ fn both_operator_commands_recover_before_binding_and_preserve_exit_status() {
         let parent = tempfile::tempdir().unwrap();
         let original = delivered(parent.path(), exit, None, authenticated);
         let request_path = parent.path().join("request.json");
-        fs::write(&request_path, serde_json::to_vec_pretty(&request()).unwrap()).unwrap();
+        fs::write(
+            &request_path,
+            serde_json::to_vec_pretty(&request()).unwrap(),
+        )
+        .unwrap();
         // Binding this address would fail immediately. Successful recovery must
         // neither listen nor need a worker, TLS credentials, or another compile.
         let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
         let mut command = Command::new(env!("CARGO_BIN_EXE_rabsd"));
-        command.arg(if authenticated { "--worker-exec-tls" } else { "--worker-exec-loopback" });
-        command.arg(occupied.local_addr().unwrap().to_string()).arg("worker");
+        command.arg(if authenticated {
+            "--worker-exec-tls"
+        } else {
+            "--worker-exec-loopback"
+        });
+        command
+            .arg(occupied.local_addr().unwrap().to_string())
+            .arg("worker");
         if authenticated {
             command.arg("11".repeat(32));
         }
-        let output = command.arg(&request_path).arg(&original.directory)
-            .env_remove("RABS_COORD_TLS_CA").env_remove("RABS_COORD_TLS_CERT")
-            .env_remove("RABS_COORD_TLS_KEY").output().unwrap();
-        assert_eq!(output.status.code(), Some(exit), "{}", String::from_utf8_lossy(&output.stderr));
+        let output = command
+            .arg(&request_path)
+            .arg(&original.directory)
+            .env_remove("RABS_COORD_TLS_CA")
+            .env_remove("RABS_COORD_TLS_CERT")
+            .env_remove("RABS_COORD_TLS_KEY")
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(exit),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         let result: Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(result["receipt"], original.receipt);
         assert_eq!(result["reexecute"], false);
@@ -296,24 +421,66 @@ fn output_install_is_private_complete_and_idempotent_after_ack_loss() {
     let parent = output_install_parent();
     let original = delivered(parent.path(), 0, None, false);
     let destination = parent.path().join("target");
-    let installed = install_delivery_outputs(&request(), "worker", &original.directory,
-        &destination, DeliveryTrust::Loopback).unwrap();
-    assert_eq!((installed.file_count, installed.total_bytes, installed.reused), (1, 4, false));
+    let installed = install_delivery_outputs(
+        &request(),
+        "worker",
+        &original.directory,
+        &destination,
+        DeliveryTrust::Loopback,
+    )
+    .unwrap();
+    assert_eq!(
+        (
+            installed.file_count,
+            installed.total_bytes,
+            installed.reused
+        ),
+        (1, 4, false)
+    );
     assert_eq!(fs::read(destination.join("a")).unwrap(), b"A\0\xffB");
     assert_eq!(fs::read_dir(&destination).unwrap().count(), 1);
     let source_meta = fs::metadata(original.directory.join("artifacts/a")).unwrap();
     let target_meta = fs::metadata(destination.join("a")).unwrap();
-    assert_ne!(source_meta.ino(), target_meta.ino(), "output must not alias retained delivery");
+    assert_ne!(
+        source_meta.ino(),
+        target_meta.ino(),
+        "output must not alias retained delivery"
+    );
     assert_eq!(target_meta.permissions().mode() & 0o7777, 0o600);
-    let repeated = install_delivery_outputs(&request(), "worker", &original.directory,
-        &destination, DeliveryTrust::Loopback).unwrap();
+    let repeated = install_delivery_outputs(
+        &request(),
+        "worker",
+        &original.directory,
+        &destination,
+        DeliveryTrust::Loopback,
+    )
+    .unwrap();
     assert!(repeated.reused);
-    assert_eq!(fs::metadata(destination.join("a")).unwrap().ino(), target_meta.ino());
+    assert_eq!(
+        fs::metadata(destination.join("a")).unwrap().ino(),
+        target_meta.ino()
+    );
     fs::write(destination.join("a"), b"B\0\xffA").unwrap();
-    assert!(install_delivery_outputs(&request(), "worker", &original.directory,
-        &destination, DeliveryTrust::Loopback).is_err(), "same-length drift cannot be reused");
-    assert_eq!(fs::read(original.directory.join("artifacts/a")).unwrap(), b"A\0\xffB");
-    assert_eq!(fs::read(destination.join("a")).unwrap(), b"B\0\xffA", "never repair by overwrite");
+    assert!(
+        install_delivery_outputs(
+            &request(),
+            "worker",
+            &original.directory,
+            &destination,
+            DeliveryTrust::Loopback
+        )
+        .is_err(),
+        "same-length drift cannot be reused"
+    );
+    assert_eq!(
+        fs::read(original.directory.join("artifacts/a")).unwrap(),
+        b"A\0\xffB"
+    );
+    assert_eq!(
+        fs::read(destination.join("a")).unwrap(),
+        b"B\0\xffA",
+        "never repair by overwrite"
+    );
 }
 
 #[test]
@@ -323,61 +490,150 @@ fn output_install_never_accepts_an_existing_writable_hardlink_alias() {
     let destination = parent.path().join("target");
     fs::create_dir(&destination).unwrap();
     fs::set_permissions(&destination, fs::Permissions::from_mode(0o700)).unwrap();
-    fs::hard_link(original.directory.join("artifacts/a"), destination.join("a")).unwrap();
-    let error = install_delivery_outputs(&request(), "worker", &original.directory,
-        &destination, DeliveryTrust::Loopback).unwrap_err();
+    fs::hard_link(
+        original.directory.join("artifacts/a"),
+        destination.join("a"),
+    )
+    .unwrap();
+    let error = install_delivery_outputs(
+        &request(),
+        "worker",
+        &original.directory,
+        &destination,
+        DeliveryTrust::Loopback,
+    )
+    .unwrap_err();
     assert!(error.contains("hardlink"), "{error}");
-    assert_eq!(fs::read(original.directory.join("artifacts/a")).unwrap(), b"A\0\xffB");
+    assert_eq!(
+        fs::read(original.directory.join("artifacts/a")).unwrap(),
+        b"A\0\xffB"
+    );
     assert_eq!(fs::read(destination.join("a")).unwrap(), b"A\0\xffB");
 }
 
 #[test]
 fn output_install_requires_success_exact_request_and_historical_trust() {
-    for (exit, stop) in [(101, None), (130, Some("cancelled")), (124, Some("deadline-exceeded"))] {
+    for (exit, stop) in [
+        (101, None),
+        (130, Some("cancelled")),
+        (124, Some("deadline-exceeded")),
+    ] {
         let parent = output_install_parent();
         let original = delivered(parent.path(), exit, stop, false);
         let destination = parent.path().join("target");
-        assert!(install_delivery_outputs(&request(), "worker", &original.directory,
-            &destination, DeliveryTrust::Loopback).is_err());
+        assert!(
+            install_delivery_outputs(
+                &request(),
+                "worker",
+                &original.directory,
+                &destination,
+                DeliveryTrust::Loopback
+            )
+            .is_err()
+        );
         assert!(!destination.exists());
     }
     let parent = output_install_parent();
     let original = delivered(parent.path(), 0, None, true);
     let destination = parent.path().join("target");
-    for trust in [DeliveryTrust::Loopback, DeliveryTrust::PinnedWorker([2;32])] {
-        assert!(install_delivery_outputs(&request(), "worker", &original.directory,
-            &destination, trust).is_err());
+    for trust in [
+        DeliveryTrust::Loopback,
+        DeliveryTrust::PinnedWorker([2; 32]),
+    ] {
+        assert!(
+            install_delivery_outputs(
+                &request(),
+                "worker",
+                &original.directory,
+                &destination,
+                trust
+            )
+            .is_err()
+        );
         assert!(!destination.exists());
     }
-    let mut changed = request(); changed["args"] = json!(["other.rs"]);
-    assert!(install_delivery_outputs(&changed, "worker", &original.directory,
-        &destination, DeliveryTrust::PinnedWorker(PIN)).is_err());
-    assert!(install_delivery_outputs(&request(), "other-worker", &original.directory,
-        &destination, DeliveryTrust::PinnedWorker(PIN)).is_err());
+    let mut changed = request();
+    changed["args"] = json!(["other.rs"]);
+    assert!(
+        install_delivery_outputs(
+            &changed,
+            "worker",
+            &original.directory,
+            &destination,
+            DeliveryTrust::PinnedWorker(PIN)
+        )
+        .is_err()
+    );
+    assert!(
+        install_delivery_outputs(
+            &request(),
+            "other-worker",
+            &original.directory,
+            &destination,
+            DeliveryTrust::PinnedWorker(PIN)
+        )
+        .is_err()
+    );
     assert!(!destination.exists());
-    install_delivery_outputs(&request(), "worker", &original.directory,
-        &destination, DeliveryTrust::PinnedWorker(PIN)).unwrap();
+    install_delivery_outputs(
+        &request(),
+        "worker",
+        &original.directory,
+        &destination,
+        DeliveryTrust::PinnedWorker(PIN),
+    )
+    .unwrap();
 }
 
 #[test]
 fn output_install_refuses_corruption_links_overlap_and_existing_different_trees() {
     let parent = output_install_parent();
     let original = delivered(parent.path(), 0, None, false);
-    let existing = parent.path().join("existing"); fs::create_dir(&existing).unwrap();
+    let existing = parent.path().join("existing");
+    fs::create_dir(&existing).unwrap();
     fs::write(existing.join("unrelated"), b"keep").unwrap();
-    assert!(install_delivery_outputs(&request(), "worker", &original.directory,
-        &existing, DeliveryTrust::Loopback).is_err());
+    assert!(
+        install_delivery_outputs(
+            &request(),
+            "worker",
+            &original.directory,
+            &existing,
+            DeliveryTrust::Loopback
+        )
+        .is_err()
+    );
     assert_eq!(fs::read(existing.join("unrelated")).unwrap(), b"keep");
-    let link = parent.path().join("link"); symlink(&existing, &link).unwrap();
-    for destination in [link.clone(), link.join("child"), original.directory.join("outputs"),
-        parent.path().to_path_buf()] {
-        assert!(install_delivery_outputs(&request(), "worker", &original.directory,
-            &destination, DeliveryTrust::Loopback).is_err());
+    let link = parent.path().join("link");
+    symlink(&existing, &link).unwrap();
+    for destination in [
+        link.clone(),
+        link.join("child"),
+        original.directory.join("outputs"),
+        parent.path().to_path_buf(),
+    ] {
+        assert!(
+            install_delivery_outputs(
+                &request(),
+                "worker",
+                &original.directory,
+                &destination,
+                DeliveryTrust::Loopback
+            )
+            .is_err()
+        );
     }
     fs::write(original.directory.join("artifacts/a"), b"B\0\xffA").unwrap();
     let destination = parent.path().join("corrupt");
-    assert!(install_delivery_outputs(&request(), "worker", &original.directory,
-        &destination, DeliveryTrust::Loopback).is_err());
+    assert!(
+        install_delivery_outputs(
+            &request(),
+            "worker",
+            &original.directory,
+            &destination,
+            DeliveryTrust::Loopback
+        )
+        .is_err()
+    );
     assert!(!destination.exists());
 }
 
@@ -390,9 +646,19 @@ fn output_install_cli_revalidates_without_a_worker_or_cas() {
     let destination = parent.path().join("target");
     for reused in [false, true] {
         let output = Command::new(env!("CARGO_BIN_EXE_rabs-delivery-cas"))
-            .arg("install").arg(&request_path).arg("worker").arg(&original.directory)
-            .arg(&destination).arg("loopback").output().unwrap();
-        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            .arg("install")
+            .arg(&request_path)
+            .arg("worker")
+            .arg(&original.directory)
+            .arg(&destination)
+            .arg("loopback")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         let reply: Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(reply["kind"], "worker-output-install");
         assert_eq!(reply["reused"], reused);
@@ -407,28 +673,42 @@ fn exclusive_directory_publication_never_overwrites_an_empty_or_racing_target() 
     use rabs_cas::materialization::publish_new_directory;
     use std::sync::{Arc, Barrier};
     let parent = output_install_parent();
-    let staged = parent.path().join("staged"); fs::create_dir(&staged).unwrap();
+    let staged = parent.path().join("staged");
+    fs::create_dir(&staged).unwrap();
     fs::write(staged.join("file"), b"ready").unwrap();
-    let existing = parent.path().join("existing"); fs::create_dir(&existing).unwrap();
+    let existing = parent.path().join("existing");
+    fs::create_dir(&existing).unwrap();
     assert!(publish_new_directory(&staged, &existing).is_err());
     assert!(staged.join("file").exists());
     assert_eq!(fs::read_dir(&existing).unwrap().count(), 0);
     let target = parent.path().join("race");
     let barrier = Arc::new(Barrier::new(2));
-    let threads: Vec<_> = (0..2).map(|i| {
-        let stage = parent.path().join(format!("stage-{i}")); fs::create_dir(&stage).unwrap();
-        fs::write(stage.join("winner"), i.to_string()).unwrap();
-        let target = target.clone(); let barrier = Arc::clone(&barrier);
-        std::thread::spawn(move || {
-            barrier.wait();
-            let succeeded = publish_new_directory(&stage, &target).is_ok();
-            (i, stage, succeeded)
+    let threads: Vec<_> = (0..2)
+        .map(|i| {
+            let stage = parent.path().join(format!("stage-{i}"));
+            fs::create_dir(&stage).unwrap();
+            fs::write(stage.join("winner"), i.to_string()).unwrap();
+            let target = target.clone();
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                let succeeded = publish_new_directory(&stage, &target).is_ok();
+                (i, stage, succeeded)
+            })
         })
-    }).collect();
-    let results: Vec<_> = threads.into_iter().map(|thread| thread.join().unwrap()).collect();
+        .collect();
+    let results: Vec<_> = threads
+        .into_iter()
+        .map(|thread| thread.join().unwrap())
+        .collect();
     assert_eq!(results.iter().filter(|(_, _, won)| *won).count(), 1);
     for (i, stage, won) in results {
         assert_eq!(stage.exists(), !won);
-        if won { assert_eq!(fs::read_to_string(target.join("winner")).unwrap(), i.to_string()); }
+        if won {
+            assert_eq!(
+                fs::read_to_string(target.join("winner")).unwrap(),
+                i.to_string()
+            );
+        }
     }
 }

@@ -77,7 +77,12 @@ impl Fixture {
             .env("RCH_LOG_LEVEL", "error")
             .env("NO_COLOR", "1")
             .current_dir(self.root.path())
-            .args(["--json", "jobs", action, &self.lease.identity.local_wrapper_id])
+            .args([
+                "--json",
+                "jobs",
+                action,
+                &self.lease.identity.local_wrapper_id,
+            ])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -164,8 +169,12 @@ fn peer(
                     Err(error) => panic!("accept failed: {error}"),
                 }
             };
-            stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-            stream.set_write_timeout(Some(Duration::from_secs(2))).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
             let mut request = String::new();
             // The production helper half-closes its request before reading.
             Read::by_ref(&mut stream)
@@ -236,7 +245,10 @@ fn attach_follows_admission_and_the_original_terminal_acknowledgement() {
     let requests = daemon.join().unwrap();
     assert_eq!(requests.len(), 1);
     assert!(requests[0].starts_with("GET /builds/42?local_wrapper_id="));
-    assert_eq!(result["identity"]["local_wrapper_id"], fixture.lease.identity.local_wrapper_id);
+    assert_eq!(
+        result["identity"]["local_wrapper_id"],
+        fixture.lease.identity.local_wrapper_id
+    );
     assert_eq!(result["exit_code"], 101);
     assert_eq!(result["terminal_acknowledged"], true);
     assert!(!fixture.cancel_receipt().exists());
@@ -331,7 +343,11 @@ fn observing_completion_cannot_overwrite_a_live_owners_newer_recovery_journal() 
     let result = output_json(&fixture.spawn("attach", Some(5)).finish());
     let requests = daemon.join().unwrap();
     assert_eq!(requests.len(), 2);
-    assert!(requests.iter().all(|request| request.starts_with("GET /builds/42?")));
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.starts_with("GET /builds/42?"))
+    );
     assert_eq!(result["terminal_acknowledged"], true);
     assert!(!fixture.cancel_receipt().exists());
 }

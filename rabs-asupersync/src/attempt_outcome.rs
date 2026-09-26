@@ -403,10 +403,34 @@ mod tests {
             );
         }
         for (ctx, expected) in [
-            (OutcomeContext { policy_refused: true, ..ctx }, OutcomeClass::PolicyRefused),
-            (OutcomeContext { worker_lost: true, ..ctx }, OutcomeClass::WorkerLost),
-            (OutcomeContext { lease_expired: true, ..ctx }, OutcomeClass::LeaseExpired),
-            (OutcomeContext { deadline_exceeded: true, ..ctx }, OutcomeClass::VolatileFailure),
+            (
+                OutcomeContext {
+                    policy_refused: true,
+                    ..ctx
+                },
+                OutcomeClass::PolicyRefused,
+            ),
+            (
+                OutcomeContext {
+                    worker_lost: true,
+                    ..ctx
+                },
+                OutcomeClass::WorkerLost,
+            ),
+            (
+                OutcomeContext {
+                    lease_expired: true,
+                    ..ctx
+                },
+                OutcomeClass::LeaseExpired,
+            ),
+            (
+                OutcomeContext {
+                    deadline_exceeded: true,
+                    ..ctx
+                },
+                OutcomeClass::VolatileFailure,
+            ),
         ] {
             assert_eq!(classify_status(status_from(0), &ctx), expected);
         }
@@ -416,7 +440,10 @@ mod tests {
     fn malformed_statuses_cannot_become_deterministic_failures() {
         let ctx = OutcomeContext::default();
         for code in [i32::MIN, -1, 256, i32::MAX] {
-            assert_eq!(decode_exit_code(code), TerminationCause::InvalidStatus(code));
+            assert_eq!(
+                decode_exit_code(code),
+                TerminationCause::InvalidStatus(code)
+            );
             assert_eq!(
                 cause_from_exit(Some(code), None, false),
                 TerminationCause::InvalidStatus(code)
@@ -453,7 +480,10 @@ mod tests {
         for code in 129..=255 {
             assert!(!classify(decode_exit_code(code), &ctx).publication_eligible());
         }
-        assert_eq!(classify(decode_exit_code(137), &ctx), OutcomeClass::OomKilled);
+        assert_eq!(
+            classify(decode_exit_code(137), &ctx),
+            OutcomeClass::OomKilled
+        );
     }
 
     #[test]

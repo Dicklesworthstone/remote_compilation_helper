@@ -37,7 +37,11 @@ impl Backoff {
         let seed = incarnation as u64 ^ (incarnation >> 64) as u64;
         Self {
             ceiling_ms: INITIAL_DELAY_MS,
-            entropy: if seed == 0 { 0x9e37_79b9_7f4a_7c15 } else { seed },
+            entropy: if seed == 0 {
+                0x9e37_79b9_7f4a_7c15
+            } else {
+                seed
+            },
         }
     }
 
@@ -77,14 +81,17 @@ async fn drain_on_shutdown<F: Future>(
             let _ = cx.checkpoint();
         }
         session.as_mut().poll(task)
-    }).await
+    })
+    .await
 }
 
 /// Only the disposable timer is raced against shutdown, never execution.
 async fn backoff_or_shutdown(mut shutdown: ShutdownReceiver, delay: Duration) -> bool {
     let mut signal = pin!(shutdown.wait());
     let mut timer = pin!(asupersync::time::timeout(
-        asupersync::time::wall_now(), delay, std::future::pending::<()>(),
+        asupersync::time::wall_now(),
+        delay,
+        std::future::pending::<()>(),
     ));
     poll_fn(|cx| {
         if signal.as_mut().poll(cx).is_ready() {
@@ -94,7 +101,8 @@ async fn backoff_or_shutdown(mut shutdown: ShutdownReceiver, delay: Duration) ->
             return Poll::Ready(false);
         }
         Poll::Pending
-    }).await
+    })
+    .await
 }
 
 /// Lifecycle success is not compiler success. A cancelled compiler can have a
@@ -102,16 +110,22 @@ async fn backoff_or_shutdown(mut shutdown: ShutdownReceiver, delay: Duration) ->
 /// prior uncertain admission or a failed fsync must remain visibly unclean.
 fn shutdown_exit(report: &CapabilityReport, journal: &WorkerJournal) -> i32 {
     let status = journal.status(journal.high_water().unwrap_or(0));
-    let clean = matches!(status["status"].as_str(), Some("unknown" | "terminal-observed"));
-    eprintln!("{}", serde_json::json!({
-        "kind":"worker-shutdown-receipt", "worker_id":report.worker_id,
-        "clean":clean, "request_high_water":journal.high_water(),
-        "request_status":status["status"],
-        "retained_result_available":journal.has_retained_result(),
-        "boot_generation":journal.boot_generation().0,
-        "incarnation":format!("{:032x}", journal.incarnation().0),
-        "reexecute":false,
-    }));
+    let clean = matches!(
+        status["status"].as_str(),
+        Some("unknown" | "terminal-observed")
+    );
+    eprintln!(
+        "{}",
+        serde_json::json!({
+            "kind":"worker-shutdown-receipt", "worker_id":report.worker_id,
+            "clean":clean, "request_high_water":journal.high_water(),
+            "request_status":status["status"],
+            "retained_result_available":journal.has_retained_result(),
+            "boot_generation":journal.boot_generation().0,
+            "incarnation":format!("{:032x}", journal.incarnation().0),
+            "reexecute":false,
+        })
+    );
     i32::from(!clean)
 }
 
@@ -154,16 +168,28 @@ pub(super) fn run(
         let capability = Arc::clone(&report);
         let shutdown = controller.subscribe();
         let (outcome, returned_journal, admitted_for) = runtime.block_on(async move {
-            handle.spawn(async move {
-                let cx = Cx::current().expect("runtime task Cx");
-                let mut admitted_at: Option<Instant> = None;
-                let outcome = drain_on_shutdown(&cx, shutdown, super::session_loop(
-                    &cx, &endpoint, &capability, once, &mut journal, &mut admitted_at,
-                )).await;
-                // session_loop has joined process cleanup and dropped both
-                // range-transfer owners before we regain durable ownership.
-                (outcome, journal, admitted_at.map(|start| start.elapsed()))
-            }).await
+            handle
+                .spawn(async move {
+                    let cx = Cx::current().expect("runtime task Cx");
+                    let mut admitted_at: Option<Instant> = None;
+                    let outcome = drain_on_shutdown(
+                        &cx,
+                        shutdown,
+                        super::session_loop(
+                            &cx,
+                            &endpoint,
+                            &capability,
+                            once,
+                            &mut journal,
+                            &mut admitted_at,
+                        ),
+                    )
+                    .await;
+                    // session_loop has joined process cleanup and dropped both
+                    // range-transfer owners before we regain durable ownership.
+                    (outcome, journal, admitted_at.map(|start| start.elapsed()))
+                })
+                .await
         });
         journal = returned_journal;
         if controller.is_shutting_down() {
@@ -184,34 +210,38 @@ pub(super) fn run(
         // In particular no new boot/incarnation or cleared high-water is minted
         // merely because the coordinator disconnected.
         if let Err(error) = journal.prepare_reconnect() {
-            eprintln!("{}", serde_json::json!({
-                "kind":"worker-reconnect-refused", "worker_id":report.worker_id,
-                "reason":"durable-recovery-failed", "detail":error.to_string(),
-                "request_high_water":journal.high_water(), "reexecute":false,
-            }));
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "kind":"worker-reconnect-refused", "worker_id":report.worker_id,
+                    "reason":"durable-recovery-failed", "detail":error.to_string(),
+                    "request_high_water":journal.high_water(), "reexecute":false,
+                })
+            );
             return 1;
         }
         if controller.is_shutting_down() {
             return shutdown_exit(&report, &journal);
         }
         let delay = backoff.next(admitted_for);
-        eprintln!("{}", serde_json::json!({
-            "kind":"worker-reconnect-scheduled", "worker_id":report.worker_id,
-            "reason":if outcome.is_ok() {"peer-closed"} else {"session-error"},
-            // Peer-supplied handshake bodies may contain tokens or source data.
-            "error_sha256":outcome.as_ref().err().map(|error| rabs_wkr::session::sha256_hex(error.as_bytes())),
-            "delay_ms":delay.as_millis(), "boot_generation":journal.boot_generation().0,
-            "incarnation":format!("{:032x}", journal.incarnation().0),
-            "request_high_water":journal.high_water(),
-            "retained_result_available":journal.has_retained_result(), "reexecute":false,
-        }));
+        eprintln!(
+            "{}",
+            serde_json::json!({
+                "kind":"worker-reconnect-scheduled", "worker_id":report.worker_id,
+                "reason":if outcome.is_ok() {"peer-closed"} else {"session-error"},
+                // Peer-supplied handshake bodies may contain tokens or source data.
+                "error_sha256":outcome.as_ref().err().map(|error| rabs_wkr::session::sha256_hex(error.as_bytes())),
+                "delay_ms":delay.as_millis(), "boot_generation":journal.boot_generation().0,
+                "incarnation":format!("{:032x}", journal.incarnation().0),
+                "request_high_water":journal.high_water(),
+                "retained_result_available":journal.has_retained_result(), "reexecute":false,
+            })
+        );
         // The timer/signal task holds no execution lease or network session.
         // The exclusive journal lock remains held, including during backoff.
         let handle = runtime.handle();
         let shutdown = controller.subscribe();
-        runtime.block_on(async move {
-            handle.spawn(backoff_or_shutdown(shutdown, delay)).await
-        });
+        runtime.block_on(async move { handle.spawn(backoff_or_shutdown(shutdown, delay)).await });
     }
 }
 
@@ -237,9 +267,16 @@ mod tests {
     #[test]
     fn only_a_stable_admitted_session_resets_backoff() {
         let mut backoff = Backoff::new(7);
-        for _ in 0..20 { backoff.next(None); }
-        assert!(backoff.next(Some(Duration::from_millis(1))) >= Duration::from_millis(MAX_DELAY_MS / 2));
-        assert!(backoff.next(Some(STABLE_SESSION - Duration::from_nanos(1))) >= Duration::from_millis(MAX_DELAY_MS / 2));
+        for _ in 0..20 {
+            backoff.next(None);
+        }
+        assert!(
+            backoff.next(Some(Duration::from_millis(1))) >= Duration::from_millis(MAX_DELAY_MS / 2)
+        );
+        assert!(
+            backoff.next(Some(STABLE_SESSION - Duration::from_nanos(1)))
+                >= Duration::from_millis(MAX_DELAY_MS / 2)
+        );
         assert!(backoff.next(Some(STABLE_SESSION)) <= Duration::from_millis(INITIAL_DELAY_MS));
         assert_eq!(backoff.ceiling_ms, INITIAL_DELAY_MS * 2);
     }
@@ -247,7 +284,8 @@ mod tests {
     #[test]
     fn incarnation_jitter_spreads_concurrent_workers() {
         let delays: std::collections::BTreeSet<_> = (1..=64_u128)
-            .map(|seed| Backoff::new(seed).next(None)).collect();
+            .map(|seed| Backoff::new(seed).next(None))
+            .collect();
         assert!(delays.len() > 16);
     }
 
@@ -256,25 +294,33 @@ mod tests {
         let runtime = RuntimeBuilder::current_thread().build().unwrap();
         let handle = runtime.handle();
         runtime.block_on(async move {
-            handle.spawn(async move {
-                let cx = Cx::current().unwrap();
-                let controller = ShutdownController::new();
-                let mut entered = false;
-                let mut cleaned = false;
-                let session = poll_fn(|task| {
-                    if !entered {
-                        entered = true;
-                        controller.shutdown();
-                        task.waker().wake_by_ref();
-                        return Poll::Pending;
-                    }
-                    assert!(cx.is_cancel_requested());
-                    cleaned = true;
-                    Poll::Ready(37)
-                });
-                assert_eq!(drain_on_shutdown(&cx, controller.subscribe(), session).await, 37);
-                assert!(entered && cleaned, "cleanup must finish before the session returns");
-            }).await
+            handle
+                .spawn(async move {
+                    let cx = Cx::current().unwrap();
+                    let controller = ShutdownController::new();
+                    let mut entered = false;
+                    let mut cleaned = false;
+                    let session = poll_fn(|task| {
+                        if !entered {
+                            entered = true;
+                            controller.shutdown();
+                            task.waker().wake_by_ref();
+                            return Poll::Pending;
+                        }
+                        assert!(cx.is_cancel_requested());
+                        cleaned = true;
+                        Poll::Ready(37)
+                    });
+                    assert_eq!(
+                        drain_on_shutdown(&cx, controller.subscribe(), session).await,
+                        37
+                    );
+                    assert!(
+                        entered && cleaned,
+                        "cleanup must finish before the session returns"
+                    );
+                })
+                .await
         });
     }
 
@@ -285,11 +331,15 @@ mod tests {
         let runtime = RuntimeBuilder::current_thread().build().unwrap();
         let handle = runtime.handle();
         runtime.block_on(async move {
-            handle.spawn(async move {
-                assert!(backoff_or_shutdown(controller.subscribe(), Duration::from_secs(30)).await);
-                let running = ShutdownController::new();
-                assert!(!backoff_or_shutdown(running.subscribe(), Duration::ZERO).await);
-            }).await
+            handle
+                .spawn(async move {
+                    assert!(
+                        backoff_or_shutdown(controller.subscribe(), Duration::from_secs(30)).await
+                    );
+                    let running = ShutdownController::new();
+                    assert!(!backoff_or_shutdown(running.subscribe(), Duration::ZERO).await);
+                })
+                .await
         });
     }
 
@@ -299,15 +349,20 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let mut journal = WorkerJournal::open(root.path(), "shutdown-test", "coord").unwrap();
         let report = CapabilityReport {
-            worker_id: "shutdown-test".to_owned(), canonical_namespace: false,
-            missing: Vec::new(), slots: 1,
+            worker_id: "shutdown-test".to_owned(),
+            canonical_namespace: false,
+            missing: Vec::new(),
+            slots: 1,
         };
         assert_eq!(shutdown_exit(&report, &journal), 0);
         let request = serde_json::json!({"kind":"canonical-exec", "request_id":7});
         journal.admit(&request, Duration::from_secs(1)).unwrap();
         let before = std::fs::read(root.path().join("requests.json")).unwrap();
         assert_eq!(shutdown_exit(&report, &journal), 1);
-        assert_eq!(std::fs::read(root.path().join("requests.json")).unwrap(), before);
+        assert_eq!(
+            std::fs::read(root.path().join("requests.json")).unwrap(),
+            before
+        );
     }
 
     /// The actual session driver, real TCP and a real managed shell process
@@ -335,44 +390,62 @@ mod tests {
         let controller = Arc::new(ShutdownController::new());
         let trigger = Arc::clone(&controller);
         let started_file = pid_file.clone();
-        let peer = std::thread::spawn(move || {
-            let until = Instant::now() + Duration::from_secs(5);
-            let mut socket = loop {
-                match listener.accept() {
-                    Ok((socket, _)) => break socket,
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        if Instant::now() >= until {
-                            trigger.shutdown();
-                            panic!("test worker did not connect");
+        let peer =
+            std::thread::spawn(move || {
+                let until = Instant::now() + Duration::from_secs(5);
+                let mut socket = loop {
+                    match listener.accept() {
+                        Ok((socket, _)) => break socket,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            if Instant::now() >= until {
+                                trigger.shutdown();
+                                panic!("test worker did not connect");
+                            }
+                            std::thread::sleep(Duration::from_millis(5));
                         }
-                        std::thread::sleep(Duration::from_millis(5));
+                        Err(error) => {
+                            trigger.shutdown();
+                            panic!("accept: {error}");
+                        }
                     }
-                    Err(error) => { trigger.shutdown(); panic!("accept: {error}"); }
-                }
-            };
-            socket.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-            socket.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
-            writeln!(socket, "{}", serde_json::json!({
+                };
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .unwrap();
+                socket
+                    .set_write_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                writeln!(socket, "{}", serde_json::json!({
                 "kind":"canonical-exec", "request_id":42, "program":"explicit-test-executor",
                 "toolchain_backing":"/unused", "workspace_backing":"/unused",
             })).unwrap();
-            let mut started = false;
-            while Instant::now() < until {
-                if std::fs::read_to_string(&started_file).is_ok_and(|text| text.lines().count() == 2) {
-                    started = true;
-                    break;
+                let mut started = false;
+                while Instant::now() < until {
+                    if std::fs::read_to_string(&started_file)
+                        .is_ok_and(|text| text.lines().count() == 2)
+                    {
+                        started = true;
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
                 }
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            // Always release a waiting driver, even when setup did not succeed.
-            trigger.shutdown();
-            assert!(started, "real shell and descendant must exist before cancellation");
-            let mut byte = [0];
-            assert_eq!(socket.read(&mut byte).unwrap(), 0, "session closes after drain");
-        });
+                // Always release a waiting driver, even when setup did not succeed.
+                trigger.shutdown();
+                assert!(
+                    started,
+                    "real shell and descendant must exist before cancellation"
+                );
+                let mut byte = [0];
+                assert_eq!(
+                    socket.read(&mut byte).unwrap(),
+                    0,
+                    "session closes after drain"
+                );
+            });
         let runtime = RuntimeBuilder::current_thread().build().unwrap();
         let handle = runtime.handle();
-        let mut journal = WorkerJournal::open(&root.path().join("state"), "shutdown-test", &address).unwrap();
+        let mut journal =
+            WorkerJournal::open(&root.path().join("state"), "shutdown-test", &address).unwrap();
         let spill_root = root.path().join("spills");
         let process_pid_file = pid_file.clone();
         journal = runtime.block_on(async move {
@@ -427,14 +500,18 @@ mod tests {
         let before = journal.status(42);
         drop(journal);
         let journal = WorkerJournal::open(
-            &root.path().join("state"), "shutdown-test", &retained_endpoint,
-        ).unwrap();
+            &root.path().join("state"),
+            "shutdown-test",
+            &retained_endpoint,
+        )
+        .unwrap();
         // Reopening the SAME owner proves that cleanup, not just an in-memory
         // result, crossed the durable outcome barrier before shutdown returned.
         assert_eq!(journal.status(42), before);
         let saved: serde_json::Value = serde_json::from_slice(
             &std::fs::read(root.path().join("state/requests.json")).unwrap(),
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(saved["last"]["resolved"], true);
         assert_eq!(saved["last"]["receipt"], before["receipt"]);
     }

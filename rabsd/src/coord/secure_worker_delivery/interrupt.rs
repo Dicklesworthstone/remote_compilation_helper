@@ -7,9 +7,11 @@
 //! The native ATP stream and read_record retain partial input on the connection,
 //! so dropping an interrupted read future neither loses bytes nor resets timers.
 
-use super::{Phase, RecordPeer, TRANSFER_BUDGET, WorkerPeer, read_record, require, worker_transport_error};
 use super::lease::{ExecutionLease, Tick};
 use super::preview::PreviewSession;
+use super::{
+    Phase, RecordPeer, TRANSFER_BUDGET, WorkerPeer, read_record, require, worker_transport_error,
+};
 use asupersync::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use asupersync::signal::{Signal, sigint, sigterm};
 use serde_json::{Value, json};
@@ -39,7 +41,10 @@ pub(super) struct OperationInterrupts {
 
 impl OperationInterrupts {
     pub(super) fn new(cancellation: super::OperationCancellation) -> Self {
-        Self { cancellation, delivered: false }
+        Self {
+            cancellation,
+            delivered: false,
+        }
     }
 }
 
@@ -65,7 +70,10 @@ pub(super) struct ProcessSignals {
 
 impl ProcessSignals {
     fn new() -> io::Result<Self> {
-        Ok(Self { interrupt: sigint()?, terminate: sigterm()? })
+        Ok(Self {
+            interrupt: sigint()?,
+            terminate: sigterm()?,
+        })
     }
 }
 
@@ -78,10 +86,13 @@ impl Interrupts for ProcessSignals {
                 Poll::Ready(value) => Poll::Ready(value),
                 Poll::Pending => terminate.as_mut().poll(cx),
             };
-            received.map(|value| value.ok_or_else(|| {
-                io::Error::new(io::ErrorKind::BrokenPipe, "operator signal listener closed")
-            }))
-        }).await
+            received.map(|value| {
+                value.ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::BrokenPipe, "operator signal listener closed")
+                })
+            })
+        })
+        .await
     }
 }
 
@@ -103,16 +114,22 @@ async fn next_event<S: AsyncRead + Unpin, I: Interrupts>(
     let mut signal = pin!(interrupts.wait());
     let mut lease = pin!(async {
         if let Some(at) = lease_wake {
-            asupersync::time::sleep(asupersync::time::wall_now(),
-                at.saturating_duration_since(Instant::now())).await;
+            asupersync::time::sleep(
+                asupersync::time::wall_now(),
+                at.saturating_duration_since(Instant::now()),
+            )
+            .await;
         } else {
             std::future::pending::<()>().await;
         }
     });
     let mut preview = pin!(async {
         if let Some(at) = preview_wake {
-            asupersync::time::sleep(asupersync::time::wall_now(),
-                at.saturating_duration_since(Instant::now())).await;
+            asupersync::time::sleep(
+                asupersync::time::wall_now(),
+                at.saturating_duration_since(Instant::now()),
+            )
+            .await;
         } else {
             std::future::pending::<()>().await;
         }
@@ -132,8 +149,12 @@ async fn next_event<S: AsyncRead + Unpin, I: Interrupts>(
         if preview.as_mut().poll(cx).is_ready() {
             return Poll::Ready(Ok(Event::Preview));
         }
-        record.as_mut().poll(cx).map(|result| result.map(Event::Record))
-    }).await
+        record
+            .as_mut()
+            .poll(cx)
+            .map(|result| result.map(Event::Record))
+    })
+    .await
 }
 
 /// Private below AdmittedPeer: wire callers cannot manufacture an interruption
@@ -157,11 +178,21 @@ impl<'a, S> OperatorPeer<'a, S> {
 
 impl<'a, S, I: Interrupts> OperatorPeer<'a, S, I> {
     pub(super) fn with_interrupts(inner: RecordPeer<'a, S>, interrupts: I) -> Self {
-        Self { inner, interrupts, execution:None, cancel_sent:false, cancel_response_seen:false,
-            lease:None, preview:None }
+        Self {
+            inner,
+            interrupts,
+            execution: None,
+            cancel_sent: false,
+            cancel_response_seen: false,
+            lease: None,
+            preview: None,
+        }
     }
 
-    pub(super) fn with_preview_observer(mut self, observer: Option<crate::coord::prepared_operation::PreviewObserver>) -> Self {
+    pub(super) fn with_preview_observer(
+        mut self,
+        observer: Option<crate::coord::prepared_operation::PreviewObserver>,
+    ) -> Self {
         self.preview = observer.map(PreviewSession::new);
         self
     }
@@ -170,7 +201,10 @@ impl<'a, S, I: Interrupts> OperatorPeer<'a, S, I> {
         // Nonblocking pre-write check. A pending notification is consumed only
         // when it is observed; a Pending future can safely be dropped here.
         let mut signal = pin!(self.interrupts.wait());
-        match signal.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
+        match signal
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+        {
             Poll::Ready(result) => result.map(|()| true),
             Poll::Pending => Ok(false),
         }
@@ -178,23 +212,32 @@ impl<'a, S, I: Interrupts> OperatorPeer<'a, S, I> {
 
     fn abandon(&mut self) -> io::Error {
         self.inner.failed = true;
-        io::Error::new(io::ErrorKind::ConnectionAborted,
-            "operator interrupted delivery; retain the original request and reconcile, never reexecute")
+        io::Error::new(
+            io::ErrorKind::ConnectionAborted,
+            "operator interrupted delivery; retain the original request and reconcile, never reexecute",
+        )
     }
 
     fn consume_cancel_reply(&mut self, value: &Value) -> io::Result<bool> {
         let accepted = value["kind"] == "cancel-accepted";
-        let already_finished = self.cancel_sent && value["kind"] == "error"
-            && value["reason"] == "unknown-request";
-        if !accepted && !already_finished { return Ok(false); }
-        require(self.cancel_sent && !self.cancel_response_seen
-            && value["request_id"].as_u64() == self.execution,
-            "unsolicited, duplicate or foreign cancellation response")?;
+        let already_finished =
+            self.cancel_sent && value["kind"] == "error" && value["reason"] == "unknown-request";
+        if !accepted && !already_finished {
+            return Ok(false);
+        }
+        require(
+            self.cancel_sent
+                && !self.cancel_response_seen
+                && value["request_id"].as_u64() == self.execution,
+            "unsolicited, duplicate or foreign cancellation response",
+        )?;
         if accepted {
-            require(value["accepted"].as_bool().is_some()
-                && value["cleanup_pending"].as_bool() == Some(true)
-                && value.get("stage").is_none(),
-                "invalid execution cancellation acknowledgment")?;
+            require(
+                value["accepted"].as_bool().is_some()
+                    && value["cleanup_pending"].as_bool() == Some(true)
+                    && value.get("stage").is_none(),
+                "invalid execution cancellation acknowledgment",
+            )?;
         }
         // Completion may win the race, with its result preceding unknown-request
         // or cancel-accepted. Consume at most one such control response even when
@@ -205,12 +248,19 @@ impl<'a, S, I: Interrupts> OperatorPeer<'a, S, I> {
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin, I: Interrupts> OperatorPeer<'_, S, I> {
-    fn send_interruptibly(&mut self, frame: &Value, lease_deadline: Option<Instant>) -> io::Result<()> {
+    fn send_interruptibly(
+        &mut self,
+        frame: &Value,
+        lease_deadline: Option<Instant>,
+    ) -> io::Result<()> {
         let bytes = self.inner.outbound(frame)?;
         let mut budget = self.inner.remaining()?;
         if let Some(deadline) = lease_deadline {
-            let remaining = deadline.checked_duration_since(Instant::now())
-                .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "execution lease write deadline"))?;
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::TimedOut, "execution lease write deadline")
+                })?;
             budget = budget.min(remaining);
         }
         let stream = &mut self.inner.stream;
@@ -241,17 +291,27 @@ impl<S: AsyncRead + AsyncWrite + Unpin, I: Interrupts> OperatorPeer<'_, S, I> {
         // stop racing the terminal result must still verify and retain its
         // bytes. The explicit operator's signal-based abandon behavior stays
         // unchanged.
-        if self.execution.is_some() && self.inner.phase != Phase::Execution
+        if self.execution.is_some()
+            && self.inner.phase != Phase::Execution
             && self.interrupts.finish_verified_delivery()
         {
             return Ok(());
         }
-        let Some(id) = self.execution.filter(|_| self.inner.phase == Phase::Execution) else {
+        let Some(id) = self
+            .execution
+            .filter(|_| self.inner.phase == Phase::Execution)
+        else {
             return Err(self.abandon());
         };
-        if self.cancel_sent { return Err(self.abandon()); }
-        if let Some(lease) = &mut self.lease { lease.stop(); }
-        if let Some(preview) = &mut self.preview { preview.stop(); }
+        if self.cancel_sent {
+            return Err(self.abandon());
+        }
+        if let Some(lease) = &mut self.lease {
+            lease.stop();
+        }
+        if let Some(preview) = &mut self.preview {
+            preview.stop();
+        }
         self.cancel_sent = true; // burn before any possibly partial control write
         self.inner.until = self.inner.until.min(Instant::now() + CANCEL_DRAIN_BUDGET);
         // Phase::Execution can only follow the authenticated adapter's exact
@@ -260,11 +320,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin, I: Interrupts> OperatorPeer<'_, S, I> {
     }
 
     fn lease_tick(&mut self) -> io::Result<()> {
-        let Some(lease) = &mut self.lease else { return Ok(()); };
+        let Some(lease) = &mut self.lease else {
+            return Ok(());
+        };
         match lease.tick(Instant::now())? {
             Tick::Idle => Ok(()),
             Tick::Expired => {
-                if let Some(preview) = &mut self.preview { preview.stop(); }
+                if let Some(preview) = &mut self.preview {
+                    preview.stop();
+                }
                 // The worker owns process cleanup. Continue draining its typed
                 // terminal result, but never grant more execution time.
                 self.inner.until = self.inner.until.min(Instant::now() + CANCEL_DRAIN_BUDGET);
@@ -280,18 +344,30 @@ impl<S: AsyncRead + AsyncWrite + Unpin, I: Interrupts> OperatorPeer<'_, S, I> {
     }
 
     fn preview_tick(&mut self) -> io::Result<()> {
-        if self.lease.as_ref().is_some_and(ExecutionLease::renewal_pending) {
+        if self
+            .lease
+            .as_ref()
+            .is_some_and(ExecutionLease::renewal_pending)
+        {
             return Ok(());
         }
-        let Some(preview) = &mut self.preview else { return Ok(()); };
-        let Some(frame) = preview.query(Instant::now()) else { return Ok(()); };
+        let Some(preview) = &mut self.preview else {
+            return Ok(());
+        };
+        let Some(frame) = preview.query(Instant::now()) else {
+            return Ok(());
+        };
         // One writer owns all controls. Optional observation gets a short write
         // budget and cannot run through the next renewal wake. Failure after a
         // partial frame still poisons the stream; it can never insert a renewal
         // into those unfinished bytes.
-        let deadline = self.lease.as_ref().and_then(ExecutionLease::wake_at)
-            .map_or(Instant::now() + PREVIEW_WRITE_BUDGET,
-                |wake| wake.min(Instant::now() + PREVIEW_WRITE_BUDGET));
+        let deadline = self
+            .lease
+            .as_ref()
+            .and_then(ExecutionLease::wake_at)
+            .map_or(Instant::now() + PREVIEW_WRITE_BUDGET, |wake| {
+                wake.min(Instant::now() + PREVIEW_WRITE_BUDGET)
+            });
         self.send_interruptibly(&frame, Some(deadline))
     }
 
@@ -299,16 +375,34 @@ impl<S: AsyncRead + AsyncWrite + Unpin, I: Interrupts> OperatorPeer<'_, S, I> {
         loop {
             let budget = self.inner.remaining()?;
             let lease_wake = self.lease.as_ref().and_then(ExecutionLease::wake_at);
-            let preview_wake = if self.lease.as_ref().is_some_and(ExecutionLease::renewal_pending) {
+            let preview_wake = if self
+                .lease
+                .as_ref()
+                .is_some_and(ExecutionLease::renewal_pending)
+            {
                 None
             } else {
                 self.preview.as_ref().and_then(PreviewSession::wake_at)
             };
             let event = self.inner.runtime.block_on(async {
-                asupersync::time::timeout(asupersync::time::wall_now(), budget,
-                    next_event(&mut self.inner.stream, &mut self.inner.buffered, &mut self.interrupts,
-                        lease_wake, preview_wake),
-                ).await.map_err(|_| worker_transport_error(io::Error::new(io::ErrorKind::TimedOut, "worker read deadline")))?
+                asupersync::time::timeout(
+                    asupersync::time::wall_now(),
+                    budget,
+                    next_event(
+                        &mut self.inner.stream,
+                        &mut self.inner.buffered,
+                        &mut self.interrupts,
+                        lease_wake,
+                        preview_wake,
+                    ),
+                )
+                .await
+                .map_err(|_| {
+                    worker_transport_error(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "worker read deadline",
+                    ))
+                })?
             })?;
             // Decoding an immediately available frame is not permission to
             // cross a deadline or obtain a new transfer budget afterward.
@@ -318,29 +412,45 @@ impl<S: AsyncRead + AsyncWrite + Unpin, I: Interrupts> OperatorPeer<'_, S, I> {
                 Event::Lease => self.lease_tick()?,
                 Event::Preview => self.preview_tick()?,
                 Event::Record(value) => {
-                    if self.consume_cancel_reply(&value)? { continue; }
+                    if self.consume_cancel_reply(&value)? {
+                        continue;
+                    }
                     if value["kind"] == "execution-lease-renewed" {
                         let lease = self.lease.as_mut().ok_or_else(|| {
-                            super::invalid("execution lease acknowledgment without a negotiated lease")
+                            super::invalid(
+                                "execution lease acknowledgment without a negotiated lease",
+                            )
                         })?;
                         lease.consume(&value, Instant::now())?;
                         if lease.stopped() && self.inner.phase == Phase::Execution {
-                            if let Some(preview) = &mut self.preview { preview.stop(); }
-                            self.inner.until = self.inner.until.min(Instant::now() + CANCEL_DRAIN_BUDGET);
+                            if let Some(preview) = &mut self.preview {
+                                preview.stop();
+                            }
+                            self.inner.until =
+                                self.inner.until.min(Instant::now() + CANCEL_DRAIN_BUDGET);
                         }
                         continue;
                     }
                     if value["kind"] == "output-preview" {
-                        self.preview.as_mut().ok_or_else(|| {
-                            super::invalid("output preview without an observation owner")
-                        })?.consume(&value)?;
+                        self.preview
+                            .as_mut()
+                            .ok_or_else(|| {
+                                super::invalid("output preview without an observation owner")
+                            })?
+                            .consume(&value)?;
                         continue;
                     }
                     if self.inner.phase == Phase::Execution && value["kind"] == "exec-result" {
-                        require(value["request_id"].as_u64() == self.execution,
-                            "execution result does not match the interrupted operation")?;
-                        if let Some(lease) = &mut self.lease { lease.stop(); }
-                        if let Some(preview) = &mut self.preview { preview.stop(); }
+                        require(
+                            value["request_id"].as_u64() == self.execution,
+                            "execution result does not match the interrupted operation",
+                        )?;
+                        if let Some(lease) = &mut self.lease {
+                            lease.stop();
+                        }
+                        if let Some(preview) = &mut self.preview {
+                            preview.stop();
+                        }
                         self.inner.phase = Phase::Transfer;
                         self.inner.until = Instant::now() + TRANSFER_BUDGET;
                     }
@@ -355,15 +465,24 @@ impl<S: AsyncRead + AsyncWrite + Unpin, I: Interrupts> WorkerPeer for OperatorPe
     fn send(&mut self, frame: &Value) -> io::Result<()> {
         let result = (|| {
             self.inner.remaining()?;
-            require(frame["kind"] != "cancel" && frame["kind"] != "execution-lease-renew"
-                && frame["kind"] != "output-preview",
-                "execution controls are owned by this authenticated connection")?;
-            if self.pending_interrupt()? { self.interrupt()?; }
+            require(
+                frame["kind"] != "cancel"
+                    && frame["kind"] != "execution-lease-renew"
+                    && frame["kind"] != "output-preview",
+                "execution controls are owned by this authenticated connection",
+            )?;
+            if self.pending_interrupt()? {
+                self.interrupt()?;
+            }
             if frame["kind"] == "session-ok" {
-                if let Some(preview) = &mut self.preview { preview.select(frame)?; }
+                if let Some(preview) = &mut self.preview {
+                    preview.select(frame)?;
+                }
                 if let Some(grant) = frame.get("execution_lease") {
-                    require(self.lease.is_none() && self.execution.is_none(),
-                        "execution lease cannot be renegotiated")?;
+                    require(
+                        self.lease.is_none() && self.execution.is_none(),
+                        "execution lease cannot be renegotiated",
+                    )?;
                     self.lease = Some(ExecutionLease::parse(grant)?);
                 }
             }
@@ -383,11 +502,16 @@ impl<S: AsyncRead + AsyncWrite + Unpin, I: Interrupts> WorkerPeer for OperatorPe
                 self.inner.send(frame)?;
             }
             if frame["kind"] == "canonical-exec" {
-                let request_id = frame["request_id"].as_u64()
+                let request_id = frame["request_id"]
+                    .as_u64()
                     .ok_or_else(|| super::invalid("missing execution identity"))?;
                 self.execution = Some(request_id);
-                if let Some(lease) = &mut self.lease { lease.arm(sent_at); }
-                if let Some(preview) = &mut self.preview { preview.arm(request_id); }
+                if let Some(lease) = &mut self.lease {
+                    lease.arm(sent_at);
+                }
+                if let Some(preview) = &mut self.preview {
+                    preview.arm(request_id);
+                }
             }
             Ok(())
         })();
@@ -420,14 +544,19 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct Notification { pending:usize, waker:Option<Waker> }
+    struct Notification {
+        pending: usize,
+        waker: Option<Waker>,
+    }
     #[derive(Clone, Default)]
     struct Trigger(Arc<Mutex<Notification>>);
     impl Trigger {
         fn fire(&self) {
             let mut state = self.0.lock().unwrap();
             state.pending += 1;
-            if let Some(waker) = state.waker.take() { waker.wake(); }
+            if let Some(waker) = state.waker.take() {
+                waker.wake();
+            }
         }
     }
     impl Interrupts for Trigger {
@@ -441,11 +570,16 @@ mod tests {
                     state.waker = Some(cx.waker().clone());
                     Poll::Pending
                 }
-            }).await
+            })
+            .await
         }
     }
 
-    enum Step { Bytes(VecDeque<u8>), Interrupt, Pending }
+    enum Step {
+        Bytes(VecDeque<u8>),
+        Interrupt,
+        Pending,
+    }
     struct Wire {
         steps: VecDeque<Step>,
         sent: Vec<u8>,
@@ -455,17 +589,32 @@ mod tests {
     }
     impl Wire {
         fn new(trigger: &Trigger, frames: &[Value]) -> Self {
-            let bytes = frames.iter().map(|frame| format!("{frame}\n")).collect::<String>();
-            Self { steps:VecDeque::from([Step::Bytes(bytes.into_bytes().into())]), sent:Vec::new(),
-                trigger:trigger.clone(), stop_on_dispatch:false, fail_cancel:false }
+            let bytes = frames
+                .iter()
+                .map(|frame| format!("{frame}\n"))
+                .collect::<String>();
+            Self {
+                steps: VecDeque::from([Step::Bytes(bytes.into_bytes().into())]),
+                sent: Vec::new(),
+                trigger: trigger.clone(),
+                stop_on_dispatch: false,
+                fail_cancel: false,
+            }
         }
         fn sent(&self) -> Vec<Value> {
-            self.sent.split(|byte| *byte == b'\n').filter(|line| !line.is_empty())
-                .map(|line| serde_json::from_slice(line).unwrap()).collect()
+            self.sent
+                .split(|byte| *byte == b'\n')
+                .filter(|line| !line.is_empty())
+                .map(|line| serde_json::from_slice(line).unwrap())
+                .collect()
         }
     }
     impl AsyncRead for Wire {
-        fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, output: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            output: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
             let this = self.get_mut();
             loop {
                 match this.steps.front_mut() {
@@ -474,7 +623,9 @@ mod tests {
                         output.put_slice(&bytes.drain(..count).collect::<Vec<_>>());
                         return Poll::Ready(Ok(()));
                     }
-                    Some(Step::Bytes(_)) => { this.steps.pop_front(); }
+                    Some(Step::Bytes(_)) => {
+                        this.steps.pop_front();
+                    }
                     Some(Step::Interrupt) => {
                         this.steps.pop_front();
                         this.trigger.fire();
@@ -488,26 +639,54 @@ mod tests {
         }
     }
     impl AsyncWrite for Wire {
-        fn poll_write(self: Pin<&mut Self>, _: &mut Context<'_>, bytes: &[u8]) -> Poll<io::Result<usize>> {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<io::Result<usize>> {
             let this = self.get_mut();
             this.sent.extend_from_slice(bytes);
             let frame: Value = serde_json::from_slice(bytes).unwrap();
             if this.fail_cancel && frame["kind"] == "cancel" {
-                return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "uncertain cancel write")));
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "uncertain cancel write",
+                )));
             }
-            if this.stop_on_dispatch && frame["kind"] == "canonical-exec" { this.trigger.fire(); }
+            if this.stop_on_dispatch && frame["kind"] == "canonical-exec" {
+                this.trigger.fire();
+            }
             Poll::Ready(Ok(bytes.len()))
         }
-        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> { Poll::Ready(Ok(())) }
-        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> { Poll::Ready(Ok(())) }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
     }
-    fn runtime() -> Runtime { RuntimeBuilder::current_thread().build().unwrap() }
-    fn request() -> Value { json!({"kind":"canonical-exec", "request_id":7, "program":"rustc",
-        "args":[], "toolchain_backing":"/tc", "workspace_backing":"/ws"}) }
-    fn accepted() -> Value { json!({"kind":"cancel-accepted", "request_id":7, "accepted":true, "cleanup_pending":true}) }
-    fn result() -> Value { json!({"kind":"exec-result", "request_id":7, "exit_code":130, "stop_reason":"cancelled"}) }
-    fn peer<'a>(runtime: &'a Runtime, trigger: &Trigger, frames: &[Value]) -> OperatorPeer<'a, Wire, Trigger> {
-        OperatorPeer::with_interrupts(RecordPeer::new(runtime, Wire::new(trigger, frames), &request()), trigger.clone())
+    fn runtime() -> Runtime {
+        RuntimeBuilder::current_thread().build().unwrap()
+    }
+    fn request() -> Value {
+        json!({"kind":"canonical-exec", "request_id":7, "program":"rustc",
+        "args":[], "toolchain_backing":"/tc", "workspace_backing":"/ws"})
+    }
+    fn accepted() -> Value {
+        json!({"kind":"cancel-accepted", "request_id":7, "accepted":true, "cleanup_pending":true})
+    }
+    fn result() -> Value {
+        json!({"kind":"exec-result", "request_id":7, "exit_code":130, "stop_reason":"cancelled"})
+    }
+    fn peer<'a>(
+        runtime: &'a Runtime,
+        trigger: &Trigger,
+        frames: &[Value],
+    ) -> OperatorPeer<'a, Wire, Trigger> {
+        OperatorPeer::with_interrupts(
+            RecordPeer::new(runtime, Wire::new(trigger, frames), &request()),
+            trigger.clone(),
+        )
     }
 
     #[test]
@@ -522,7 +701,10 @@ mod tests {
         assert!(peer.cancel_response_seen);
         assert!(peer.inner.phase == Phase::Transfer);
         assert!(original_deadline > Instant::now() + CANCEL_DRAIN_BUDGET);
-        assert_eq!(peer.inner.stream.sent(), vec![request(), json!({"kind":"cancel", "request_id":7})]);
+        assert_eq!(
+            peer.inner.stream.sent(),
+            vec![request(), json!({"kind":"cancel", "request_id":7})]
+        );
         assert!(peer.send(&request()).is_err(), "never dispatch twice");
     }
 
@@ -533,16 +715,26 @@ mod tests {
         let token = super::super::OperationCancellation::default();
         let wire = Wire::new(&trigger, &[accepted(), result()]);
         let mut peer = OperatorPeer::with_interrupts(
-            RecordPeer::new(&runtime, wire, &request()), OperationInterrupts::new(token.clone()),
+            RecordPeer::new(&runtime, wire, &request()),
+            OperationInterrupts::new(token.clone()),
         );
         peer.send(&request()).unwrap();
         token.cancel();
         token.cancel();
         assert_eq!(peer.receive().unwrap(), result());
         token.cancel();
-        peer.send(&json!({"kind":"output-read", "request_id":7})).unwrap();
+        peer.send(&json!({"kind":"output-read", "request_id":7}))
+            .unwrap();
         assert!(!peer.inner.failed);
-        assert_eq!(peer.inner.stream.sent().iter().filter(|frame| frame["kind"] == "cancel").count(), 1);
+        assert_eq!(
+            peer.inner
+                .stream
+                .sent()
+                .iter()
+                .filter(|frame| frame["kind"] == "cancel")
+                .count(),
+            1
+        );
         assert!(peer.cancel_response_seen);
     }
 
@@ -552,11 +744,13 @@ mod tests {
         let trigger = Trigger::default();
         for completed in [false, true] {
             let token = super::super::OperationCancellation::default();
-            let success = json!({"kind":"exec-result", "request_id":7, "exit_code":0, "stop_reason":null});
+            let success =
+                json!({"kind":"exec-result", "request_id":7, "exit_code":0, "stop_reason":null});
             let chunk = json!({"kind":"output-chunk", "request_id":7});
             let wire = Wire::new(&trigger, &[success.clone(), chunk.clone()]);
             let mut peer = OperatorPeer::with_interrupts(
-                RecordPeer::new(&runtime, wire, &request()), OperationInterrupts::new(token.clone()),
+                RecordPeer::new(&runtime, wire, &request()),
+                OperationInterrupts::new(token.clone()),
             );
             if completed {
                 peer.send(&request()).unwrap();
@@ -564,7 +758,8 @@ mod tests {
             }
             token.cancel();
             if completed {
-                peer.send(&json!({"kind":"output-read", "request_id":7})).unwrap();
+                peer.send(&json!({"kind":"output-read", "request_id":7}))
+                    .unwrap();
                 assert_eq!(peer.receive().unwrap(), chunk);
                 assert!(!peer.inner.failed);
                 assert_eq!(peer.inner.stream.sent().len(), 2);
@@ -584,12 +779,20 @@ mod tests {
             sent: Vec<u8>,
         }
         impl AsyncRead for StalledWrite {
-            fn poll_read(self: Pin<&mut Self>, _: &mut Context<'_>, _: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+                _: &mut ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
                 Poll::Pending
             }
         }
         impl AsyncWrite for StalledWrite {
-            fn poll_write(self: Pin<&mut Self>, _: &mut Context<'_>, bytes: &[u8]) -> Poll<io::Result<usize>> {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+                bytes: &[u8],
+            ) -> Poll<io::Result<usize>> {
                 let this = self.get_mut();
                 if this.stage == 2 {
                     this.sent.extend_from_slice(bytes);
@@ -614,23 +817,46 @@ mod tests {
         for frame in [request(), json!({"kind":"source-begin", "request_id":7})] {
             for stage in 0..3 {
                 let token = super::super::OperationCancellation::default();
-                let stream = StalledWrite { token:token.clone(), stage, sent:Vec::new() };
+                let stream = StalledWrite {
+                    token: token.clone(),
+                    stage,
+                    sent: Vec::new(),
+                };
                 let mut peer = OperatorPeer::with_interrupts(
-                    RecordPeer::new(&runtime, stream, &request()), OperationInterrupts::new(token),
+                    RecordPeer::new(&runtime, stream, &request()),
+                    OperationInterrupts::new(token),
                 );
                 let error = peer.send(&frame).unwrap_err();
                 assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted);
-                assert!(!super::super::transport_interrupted(&error),
-                    "cancellation is not transport evidence even when the error kind matches");
+                assert!(
+                    !super::super::transport_interrupted(&error),
+                    "cancellation is not transport evidence even when the error kind matches"
+                );
                 assert!(peer.inner.failed);
-                assert!(!peer.cancel_sent, "a cancel cannot be appended to an incomplete frame");
-                assert!(peer.execution.is_none(), "a partial dispatch is never considered complete");
+                assert!(
+                    !peer.cancel_sent,
+                    "a cancel cannot be appended to an incomplete frame"
+                );
+                assert!(
+                    peer.execution.is_none(),
+                    "a partial dispatch is never considered complete"
+                );
                 let sent = peer.inner.stream.sent.clone();
                 let expected = format!("{frame}\n").into_bytes();
                 assert!(expected.starts_with(&sent));
-                assert_eq!(sent.len(), match stage { 0 => 0, 1 => 3, _ => expected.len() });
+                assert_eq!(
+                    sent.len(),
+                    match stage {
+                        0 => 0,
+                        1 => 3,
+                        _ => expected.len(),
+                    }
+                );
                 assert!(peer.send(&request()).is_err());
-                assert_eq!(peer.inner.stream.sent, sent, "an interrupted write must never retry");
+                assert_eq!(
+                    peer.inner.stream.sent, sent,
+                    "an interrupted write must never retry"
+                );
             }
         }
     }
@@ -642,7 +868,10 @@ mod tests {
         let mut peer = peer(&runtime, &trigger, &[accepted()]);
         peer.send(&request()).unwrap();
         trigger.fire();
-        assert_eq!(peer.receive().unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
+        assert_eq!(
+            peer.receive().unwrap_err().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
         assert!(peer.inner.failed);
         assert!(peer.inner.phase == Phase::Execution);
         assert_eq!(peer.inner.stream.sent().len(), 2);
@@ -654,9 +883,20 @@ mod tests {
         let trigger = Trigger::default();
         let mut peer = peer(&runtime, &trigger, &[]);
         peer.inner.stream.steps = VecDeque::from([
-            Step::Bytes(b"{\"kind\":\"cancel-accepted\",\"request_id\":".to_vec().into()),
+            Step::Bytes(
+                b"{\"kind\":\"cancel-accepted\",\"request_id\":"
+                    .to_vec()
+                    .into(),
+            ),
             Step::Interrupt,
-            Step::Bytes(format!("7,\"accepted\":true,\"cleanup_pending\":true}}\n{}\n", result()).into_bytes().into()),
+            Step::Bytes(
+                format!(
+                    "7,\"accepted\":true,\"cleanup_pending\":true}}\n{}\n",
+                    result()
+                )
+                .into_bytes()
+                .into(),
+            ),
         ]);
         peer.send(&request()).unwrap();
         assert_eq!(peer.receive().unwrap(), result());
@@ -667,19 +907,31 @@ mod tests {
     #[test]
     fn completion_race_preserves_success_and_consumes_only_one_late_control_reply() {
         let runtime = runtime();
-        for control in [accepted(), json!({"kind":"error", "request_id":7, "reason":"unknown-request"})] {
+        for control in [
+            accepted(),
+            json!({"kind":"error", "request_id":7, "reason":"unknown-request"}),
+        ] {
             let trigger = Trigger::default();
-            let success = json!({"kind":"exec-result", "request_id":7, "exit_code":0, "stop_reason":null});
+            let success =
+                json!({"kind":"exec-result", "request_id":7, "exit_code":0, "stop_reason":null});
             let chunk = json!({"kind":"output-chunk", "request_id":7});
-            let mut peer = peer(&runtime, &trigger, &[success.clone(), control.clone(), chunk.clone(), control]);
+            let mut peer = peer(
+                &runtime,
+                &trigger,
+                &[success.clone(), control.clone(), chunk.clone(), control],
+            );
             peer.send(&request()).unwrap();
             trigger.fire();
             assert_eq!(peer.receive().unwrap(), success);
             let deadline = peer.inner.until;
-            peer.send(&json!({"kind":"output-read", "request_id":7})).unwrap();
+            peer.send(&json!({"kind":"output-read", "request_id":7}))
+                .unwrap();
             assert_eq!(peer.receive().unwrap(), chunk);
             assert_eq!(peer.inner.until, deadline);
-            assert!(peer.receive().is_err(), "a second cancellation response cannot be hidden");
+            assert!(
+                peer.receive().is_err(),
+                "a second cancellation response cannot be hidden"
+            );
         }
     }
 
@@ -699,7 +951,9 @@ mod tests {
             }
             let mut peer = peer(&runtime, &trigger, &[reply, result()]);
             peer.send(&request()).unwrap();
-            if case != 5 { trigger.fire(); }
+            if case != 5 {
+                trigger.fire();
+            }
             assert!(peer.receive().is_err());
             assert!(peer.inner.failed);
             assert!(peer.inner.phase == Phase::Execution);
@@ -713,9 +967,15 @@ mod tests {
             let trigger = Trigger::default();
             let mut peer = peer(&runtime, &trigger, &[]);
             match stage {
-                "source" => peer.send(&json!({"kind":"source-begin", "request_id":7})).unwrap(),
-                "resume" => peer.send(&json!({"kind":"result-resume", "request_id":7})).unwrap(),
-                "transfer" => { peer.inner.phase = Phase::Transfer; }
+                "source" => peer
+                    .send(&json!({"kind":"source-begin", "request_id":7}))
+                    .unwrap(),
+                "resume" => peer
+                    .send(&json!({"kind":"result-resume", "request_id":7}))
+                    .unwrap(),
+                "transfer" => {
+                    peer.inner.phase = Phase::Transfer;
+                }
                 _ => {}
             }
             let before = peer.inner.stream.sent();
@@ -736,14 +996,25 @@ mod tests {
             peer.send(&request()).unwrap();
             let until = Instant::now() + Duration::from_secs(2);
             peer.inner.until = until;
-            if case == 0 { peer.inner.stream.fail_cancel = true; }
-            if case == 1 { trigger.fire(); }
-            if case == 2 { peer.inner.until = Instant::now() - Duration::from_secs(1); }
+            if case == 0 {
+                peer.inner.stream.fail_cancel = true;
+            }
+            if case == 1 {
+                trigger.fire();
+            }
+            if case == 2 {
+                peer.inner.until = Instant::now() - Duration::from_secs(1);
+            }
             trigger.fire();
             assert!(peer.receive().is_err());
             assert!(peer.inner.until <= until);
             let sent = peer.inner.stream.sent();
-            assert!(sent.iter().filter(|frame| frame["kind"] == "cancel").count() <= 1);
+            assert!(
+                sent.iter()
+                    .filter(|frame| frame["kind"] == "cancel")
+                    .count()
+                    <= 1
+            );
             assert!(peer.receive().is_err());
             assert!(peer.send(&request()).is_err());
             assert_eq!(peer.inner.stream.sent(), sent);
@@ -766,8 +1037,8 @@ mod tests {
 
     #[test]
     fn cancelled_compilation_uses_complete_delivery_verification_before_release() {
-        use sha2::{Digest, Sha256};
         use crate::coord::worker_delivery::receive_execution;
+        use sha2::{Digest, Sha256};
         let hash = |bytes: &[u8]| super::super::hex(&Sha256::digest(bytes));
         let runtime = runtime();
         let trigger = Trigger::default();
@@ -784,14 +1055,21 @@ mod tests {
         terminal["stderr_sha256"] = json!(hash(b""));
         terminal["artifact_ack_required"] = json!(false);
         terminal["artifact_manifest"] = Value::Null;
-        let chunk = |stream: &str| json!({"kind":"output-chunk", "request_id":7,
+        let chunk = |stream: &str| {
+            json!({"kind":"output-chunk", "request_id":7,
             "stream":stream, "offset":0, "next_offset":0, "total_bytes":0, "eof":true,
-            "sha256":hash(b""), "chunk_sha256":hash(b""), "data_hex":""});
-        let frames = [json!({"kind":"worker-hello", "worker_id":"worker", "canonical":true,
+            "sha256":hash(b""), "chunk_sha256":hash(b""), "data_hex":""})
+        };
+        let frames = [
+            json!({"kind":"worker-hello", "worker_id":"worker", "canonical":true,
             "slots":1, "boot_generation":1, "incarnation":"00000000000000000000000000000001",
             "request_high_water":null, "recovery_protocols":["request-journal-v1"], "output_transfers":["ranges-v1"]}),
-            accepted(), terminal, chunk("stdout"), chunk("stderr"),
-            json!({"kind":"output-acknowledged", "request_id":7, "already_released":false})];
+            accepted(),
+            terminal,
+            chunk("stdout"),
+            chunk("stderr"),
+            json!({"kind":"output-acknowledged", "request_id":7, "already_released":false}),
+        ];
         let mut peer = peer(&runtime, &trigger, &frames);
         peer.inner.stream.stop_on_dispatch = true;
         let delivery = receive_execution(&mut peer, &request(), "worker", &destination).unwrap();
@@ -801,8 +1079,18 @@ mod tests {
         assert_eq!(delivery.receipt["publication_authorized"], false);
         assert!(destination.join("delivery.json").is_file());
         let sent = peer.inner.stream.sent();
-        assert_eq!(sent.iter().filter(|frame| frame["kind"] == "canonical-exec").count(), 1);
-        assert_eq!(sent.iter().filter(|frame| frame["kind"] == "cancel").count(), 1);
+        assert_eq!(
+            sent.iter()
+                .filter(|frame| frame["kind"] == "canonical-exec")
+                .count(),
+            1
+        );
+        assert_eq!(
+            sent.iter()
+                .filter(|frame| frame["kind"] == "cancel")
+                .count(),
+            1
+        );
         assert_eq!(sent.last().unwrap()["kind"], "output-ack");
     }
 }

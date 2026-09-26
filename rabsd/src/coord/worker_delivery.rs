@@ -149,11 +149,15 @@ pub fn worker_transport_error(error: io::Error) -> io::Error {
     if transport_interrupted(&error) {
         return error;
     }
-    if matches!(error.kind(),
-        io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted
-            | io::ErrorKind::BrokenPipe | io::ErrorKind::UnexpectedEof
-            | io::ErrorKind::TimedOut | io::ErrorKind::WriteZero)
-    {
+    if matches!(
+        error.kind(),
+        io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::BrokenPipe
+            | io::ErrorKind::UnexpectedEof
+            | io::ErrorKind::TimedOut
+            | io::ErrorKind::WriteZero
+    ) {
         io::Error::new(error.kind(), InterruptedTransport(error))
     } else {
         error
@@ -163,7 +167,9 @@ pub fn worker_transport_error(error: io::Error) -> io::Error {
 /// Inspect the typed evidence attached by the actual transport adapter.
 #[must_use]
 pub fn transport_interrupted(error: &io::Error) -> bool {
-    error.get_ref().is_some_and(|source| source.is::<InterruptedTransport>())
+    error
+        .get_ref()
+        .is_some_and(|source| source.is::<InterruptedTransport>())
 }
 
 impl std::fmt::Display for DeliveryFailure {
@@ -246,7 +252,9 @@ fn declaration(request: &Value) -> io::Result<Option<Declaration>> {
         Some(_) => return Err(invalid("unsupported artifact tree declaration")),
     };
     require(
-        value.as_object().is_some_and(|v| v.len() == if tree { 3 } else { 2 }),
+        value
+            .as_object()
+            .is_some_and(|v| v.len() == if tree { 3 } else { 2 }),
         "invalid artifact declaration",
     )?;
     let unit = text(value, "unit")?;
@@ -343,11 +351,18 @@ pub fn validate_request(request: &Value) -> io::Result<()> {
     let toolchain = toolchain_identity(request)?;
     let transferred_toolchain = toolchain_transfer(request)?;
     let fields: &[&str] = if transferred_toolchain {
-        require(toolchain.is_some(), "toolchain transfer requires a complete identity")?;
-        require(request.get("toolchain_backing").is_none(),
-            "toolchain transfer cannot fall back to a worker path")?;
-        require(request.get("source_manifest").is_some(),
-            "toolchain transfer requires a prepared source manifest")?;
+        require(
+            toolchain.is_some(),
+            "toolchain transfer requires a complete identity",
+        )?;
+        require(
+            request.get("toolchain_backing").is_none(),
+            "toolchain transfer cannot fall back to a worker path",
+        )?;
+        require(
+            request.get("source_manifest").is_some(),
+            "toolchain transfer requires a prepared source manifest",
+        )?;
         &["program"]
     } else {
         &["program", "toolchain_backing"]
@@ -397,7 +412,9 @@ pub fn validate_request(request: &Value) -> io::Result<()> {
 pub fn toolchain_transfer(request: &Value) -> io::Result<bool> {
     match request.get("toolchain_transfer") {
         None => Ok(false),
-        Some(value) if value == rabs_sandbox::toolchain_transfer::TOOLCHAIN_TRANSFER_VERSION => Ok(true),
+        Some(value) if value == rabs_sandbox::toolchain_transfer::TOOLCHAIN_TRANSFER_VERSION => {
+            Ok(true)
+        }
         Some(_) => Err(invalid("unsupported toolchain transfer selection")),
     }
 }
@@ -469,10 +486,19 @@ fn manifest(value: &Value, expected: &Declaration) -> io::Result<Manifest> {
         .and_then(Value::as_array)
         .ok_or_else(|| invalid("manifest files"))?;
     let names = if expected.tree {
-        require(!rows.is_empty() && rows.len() <= MAX_TREE_FILES, "artifact tree file count")?;
-        let paths = rows.iter().map(|row| text(row, "name")).collect::<io::Result<Vec<_>>>()?;
+        require(
+            !rows.is_empty() && rows.len() <= MAX_TREE_FILES,
+            "artifact tree file count",
+        )?;
+        let paths = rows
+            .iter()
+            .map(|row| text(row, "name"))
+            .collect::<io::Result<Vec<_>>>()?;
         let names = validate_tree_names(paths)?;
-        require(expected.names.is_subset(&names), "missing required tree artifact")?;
+        require(
+            expected.names.is_subset(&names),
+            "missing required tree artifact",
+        )?;
         names
     } else {
         require(rows.len() == expected.names.len(), "artifact set mismatch")?;
@@ -530,16 +556,24 @@ fn manifest(value: &Value, expected: &Declaration) -> io::Result<Manifest> {
 /// and CAS archive/restore. Exact declarations require equality. Tree requests
 /// require a bounded, safe, canonical full set containing every required name.
 /// Manifest identity validates descriptors; each consumer must still verify bytes.
-pub(crate) fn verified_artifact_names(request: &Value, value: &Value) -> io::Result<BTreeSet<String>> {
+pub(crate) fn verified_artifact_names(
+    request: &Value,
+    value: &Value,
+) -> io::Result<BTreeSet<String>> {
     let expected = declaration(request)?.ok_or_else(|| invalid("missing artifact declaration"))?;
-    Ok(manifest(value, &expected)?.files.into_iter().map(|file| file.name).collect())
+    Ok(manifest(value, &expected)?
+        .files
+        .into_iter()
+        .map(|file| file.name)
+        .collect())
 }
 
 /// Create each implied directory exactly once in a new, caller-owned output
 /// root. Never use create_dir_all to silently merge case/normalization aliases
 /// on the receiving filesystem. The complete path set is validated beforehand.
 pub(crate) fn create_artifact_directories<'a>(
-    root: &Path, names: impl IntoIterator<Item = &'a str>,
+    root: &Path,
+    names: impl IntoIterator<Item = &'a str>,
 ) -> io::Result<()> {
     let mut directories = BTreeSet::new();
     let mut files = 0_usize;
@@ -551,7 +585,10 @@ pub(crate) fn create_artifact_directories<'a>(
                 directories.insert(parent.to_path_buf());
             }
         }
-        require(files + directories.len() <= MAX_TREE_ENTRIES, "artifact tree entry count")?;
+        require(
+            files + directories.len() <= MAX_TREE_ENTRIES,
+            "artifact tree entry count",
+        )?;
     }
     // Lexical path order puts parents before their descendants.
     for directory in directories {
@@ -640,7 +677,10 @@ fn download(
     let mut offset = match peer.resume_source() {
         Some(source) => source.copy_prefix(
             if artifact { "artifacts" } else { "diagnostics" },
-            &item.name, item.len, &mut file, &mut hasher,
+            &item.name,
+            item.len,
+            &mut file,
+            &mut hasher,
         )?,
         None => 0,
     };
@@ -795,7 +835,10 @@ pub fn receive_operation(
     let outcome = (|| -> io::Result<Delivery> {
         validate_request(request)?;
         if let Some(source) = peer.resume_source() {
-            require(mode == DeliveryMode::Resume, "local prefixes require explicit result resume")?;
+            require(
+                mode == DeliveryMode::Resume,
+                "local prefixes require explicit result resume",
+            )?;
             source.validate_destination(destination)?;
         }
         let dispatch = mode.frame(request);
@@ -852,7 +895,10 @@ pub fn receive_operation(
         }
         if mode == DeliveryMode::Execute && toolchain_transfer(request)? {
             require(
-                supports("toolchain_transfers", rabs_sandbox::toolchain_transfer::TOOLCHAIN_TRANSFER_VERSION),
+                supports(
+                    "toolchain_transfers",
+                    rabs_sandbox::toolchain_transfer::TOOLCHAIN_TRANSFER_VERSION,
+                ),
                 "worker lacks required toolchain-tree-v1 transfer capability",
             )?;
         }
@@ -901,8 +947,12 @@ pub fn receive_operation(
         }
         peer.negotiate(&hello, &ack)?;
         let authentication = peer.authentication();
-        require(mode != DeliveryMode::Execute || !toolchain_transfer(request)? || authentication.is_some(),
-            "transferred toolchains require authenticated execution admission")?;
+        require(
+            mode != DeliveryMode::Execute
+                || !toolchain_transfer(request)?
+                || authentication.is_some(),
+            "transferred toolchains require authenticated execution admission",
+        )?;
         execution_may_have_run = true; // before even a partially successful write
         peer.send(&dispatch)?;
         let result = receive(peer, expected_worker)?;
@@ -1025,7 +1075,8 @@ pub fn receive_operation(
         )?;
         if let Some(manifest) = &artifacts {
             create_artifact_directories(
-                &destination.join("artifacts"), manifest.files.iter().map(|file| file.name.as_str()),
+                &destination.join("artifacts"),
+                manifest.files.iter().map(|file| file.name.as_str()),
             )?;
             for file in &manifest.files {
                 let path = destination.join("artifacts").join(&file.name);
@@ -1069,7 +1120,10 @@ pub fn receive_operation(
             receipt["execution_boot_generation"] = Value::Null;
         }
         let receipt_bytes = serde_json::to_vec_pretty(&receipt)?;
-        require(receipt_bytes.len() <= MAX_FRAME_BYTES, "delivery receipt exceeds recovery bound")?;
+        require(
+            receipt_bytes.len() <= MAX_FRAME_BYTES,
+            "delivery receipt exceeds recovery bound",
+        )?;
         let mut marker = create_file(&destination.join("delivery.pending"))?;
         marker.write_all(&receipt_bytes)?;
         marker.sync_all()?;
@@ -1212,14 +1266,21 @@ mod tests {
         let parent = tempfile::tempdir().unwrap();
         let truncated = parent.path().join("truncated-local-output");
         std::fs::write(&truncated, b"a").unwrap();
-        let disk_error = File::open(truncated).unwrap().read_exact(&mut [0; 2]).unwrap_err();
+        let disk_error = File::open(truncated)
+            .unwrap()
+            .read_exact(&mut [0; 2])
+            .unwrap_err();
         assert_eq!(disk_error.kind(), io::ErrorKind::UnexpectedEof);
         assert!(!transport_interrupted(&disk_error));
 
-        for kind in [io::ErrorKind::BrokenPipe, io::ErrorKind::ConnectionReset,
-            io::ErrorKind::ConnectionAborted, io::ErrorKind::UnexpectedEof,
-            io::ErrorKind::TimedOut, io::ErrorKind::WriteZero]
-        {
+        for kind in [
+            io::ErrorKind::BrokenPipe,
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::ConnectionAborted,
+            io::ErrorKind::UnexpectedEof,
+            io::ErrorKind::TimedOut,
+            io::ErrorKind::WriteZero,
+        ] {
             let diagnostic = "worker connection interrupted";
             assert!(!transport_interrupted(&io::Error::new(kind, diagnostic)));
             let marked = worker_transport_error(io::Error::new(kind, diagnostic));
@@ -1228,11 +1289,15 @@ mod tests {
             assert_eq!(marked.to_string(), diagnostic);
             assert!(transport_interrupted(&worker_transport_error(marked)));
         }
-        for kind in [io::ErrorKind::InvalidData, io::ErrorKind::PermissionDenied,
-            io::ErrorKind::Interrupted, io::ErrorKind::Other]
-        {
-            assert!(!transport_interrupted(&worker_transport_error(io::Error::new(kind,
-                "BrokenPipe: worker read deadline; ConnectionReset"))));
+        for kind in [
+            io::ErrorKind::InvalidData,
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::Interrupted,
+            io::ErrorKind::Other,
+        ] {
+            assert!(!transport_interrupted(&worker_transport_error(
+                io::Error::new(kind, "BrokenPipe: worker read deadline; ConnectionReset")
+            )));
         }
     }
 
@@ -1645,20 +1710,22 @@ mod tests {
         assert_eq!(delivery.receipt["publication_authorized"], false);
     }
 
-
     fn source_request(root: &Path) -> (super::super::source_delivery::SourceUpload, Value) {
-        use rabs_sandbox::snapshot_capture::capture_sealed_source;
         use super::super::source_delivery::SourceUpload;
+        use rabs_sandbox::snapshot_capture::capture_sealed_source;
         use std::sync::Arc;
 
         std::fs::write(root.join("lib.rs"), b"pub fn answer() -> u32 { 42 }\n").unwrap();
         std::fs::write(root.join("private.key"), b"not selected for upload").unwrap();
         let image = capture_sealed_source(
-            &[("workspace".into(), root.to_path_buf())], false, 2, 200_000,
-        ).unwrap();
-        let upload = SourceUpload::from_snapshot(
-            Arc::new(image), "workspace", &["lib.rs".into()],
-        ).unwrap();
+            &[("workspace".into(), root.to_path_buf())],
+            false,
+            2,
+            200_000,
+        )
+        .unwrap();
+        let upload =
+            SourceUpload::from_snapshot(Arc::new(image), "workspace", &["lib.rs".into()]).unwrap();
         let mut request = request();
         request.as_object_mut().unwrap().remove("workspace_backing");
         request["source_manifest"] = upload.wire_manifest();
@@ -1668,13 +1735,22 @@ mod tests {
     fn source_replies(peer: &mut Script, request: &Value) {
         let manifest = &request["source_manifest"];
         peer.replies[0]["source_transfers"] = json!(["source-files-v1"]);
-        peer.replies.insert(1, json!({"kind":"source-ready", "request_id":7,
-            "manifest_sha256":manifest["manifest_sha256"], "sealed":false}));
-        peer.replies.insert(2, json!({"kind":"source-chunk-accepted", "request_id":7,
+        peer.replies.insert(
+            1,
+            json!({"kind":"source-ready", "request_id":7,
+            "manifest_sha256":manifest["manifest_sha256"], "sealed":false}),
+        );
+        peer.replies.insert(
+            2,
+            json!({"kind":"source-chunk-accepted", "request_id":7,
             "manifest_sha256":manifest["manifest_sha256"], "path":"lib.rs",
-            "next_offset":manifest["files"][0]["bytes"]}));
-        peer.replies.insert(3, json!({"kind":"source-ready", "request_id":7,
-            "manifest_sha256":manifest["manifest_sha256"], "sealed":true}));
+            "next_offset":manifest["files"][0]["bytes"]}),
+        );
+        peer.replies.insert(
+            3,
+            json!({"kind":"source-ready", "request_id":7,
+            "manifest_sha256":manifest["manifest_sha256"], "sealed":true}),
+        );
     }
 
     #[test]
@@ -1691,20 +1767,32 @@ mod tests {
         source_replies(&mut peer, &request);
         let delivery = receive_execution(
             &mut SourcePeer::new(&mut peer, &upload, &request).unwrap(),
-            &request, "worker", &destination,
-        ).unwrap();
+            &request,
+            "worker",
+            &destination,
+        )
+        .unwrap();
         assert!(delivery.acknowledgments_confirmed);
         assert!(peer.replies.is_empty());
         assert_eq!(peer.sent[0]["source_transfer"], "source-files-v1");
         assert_eq!(peer.sent[1]["kind"], "source-begin");
         assert_eq!(peer.sent[2]["kind"], "source-chunk");
         assert_eq!(peer.sent[2]["path"], "lib.rs");
-        assert_eq!(peer.sent[2]["chunk_sha256"], request["source_manifest"]["files"][0]["sha256"]);
+        assert_eq!(
+            peer.sent[2]["chunk_sha256"],
+            request["source_manifest"]["files"][0]["sha256"]
+        );
         assert_eq!(peer.sent[3]["kind"], "source-seal");
         assert_eq!(peer.sent[4], request);
         assert!(peer.sent[4].get("workspace_backing").is_none());
-        assert_eq!(std::fs::read(destination.join("artifacts/a")).unwrap(), b"A\0\xffB");
-        assert_eq!(delivery.receipt["request_sha256"], hash(&serde_json::to_vec(&request).unwrap()));
+        assert_eq!(
+            std::fs::read(destination.join("artifacts/a")).unwrap(),
+            b"A\0\xffB"
+        );
+        assert_eq!(
+            delivery.receipt["request_sha256"],
+            hash(&serde_json::to_vec(&request).unwrap())
+        );
         assert_eq!(delivery.receipt["publication_authorized"], false);
     }
 
@@ -1726,14 +1814,24 @@ mod tests {
                 3 => peer.replies[3]["manifest_sha256"] = json!("00".repeat(32)),
                 4 => peer.replies[3]["sealed"] = json!(false),
                 5 => peer.fail_send = Some("source-chunk"),
-                _ => { peer.replies.remove(3); }
+                _ => {
+                    peer.replies.remove(3);
+                }
             }
             let failure = receive_execution(
                 &mut SourcePeer::new(&mut peer, &upload, &request).unwrap(),
-                &request, "worker", &destination,
-            ).unwrap_err();
+                &request,
+                "worker",
+                &destination,
+            )
+            .unwrap_err();
             assert!(!failure.execution_may_have_run, "case {case}: {failure}");
-            assert!(!peer.sent.iter().any(|frame| frame["kind"] == "canonical-exec"));
+            assert!(
+                !peer
+                    .sent
+                    .iter()
+                    .any(|frame| frame["kind"] == "canonical-exec")
+            );
             assert!(no_ack(&peer));
             assert!(!destination.join("delivery.json").exists());
         }
@@ -1751,12 +1849,15 @@ mod tests {
                 2 => request["source_manifest"]["manifest_sha256"] = json!("00".repeat(32)),
                 3 => request["source_manifest"]["files"][0]["path"] = json!("../private.key"),
                 4 => request["source_manifest"]["files"][0]["bytes"] = json!(u64::MAX),
-                _ => { request.as_object_mut().unwrap().remove("source_manifest"); }
+                _ => {
+                    request.as_object_mut().unwrap().remove("source_manifest");
+                }
             }
             let parent = tempfile::tempdir().unwrap();
             let destination = parent.path().join("delivery");
             let mut peer = fixture(&destination);
-            let failure = receive_execution(&mut peer, &request, "worker", &destination).unwrap_err();
+            let failure =
+                receive_execution(&mut peer, &request, "worker", &destination).unwrap_err();
             assert!(!failure.execution_may_have_run, "case {case}");
             assert!(peer.sent.is_empty());
             assert_eq!(peer.replies.len(), 7);
@@ -1774,17 +1875,29 @@ mod tests {
         let destination = parent.path().join("resumed");
         let mut peer = resumable(&destination);
         let delivery = receive_operation(
-            &mut peer, &request, "worker", &destination, DeliveryMode::Resume,
-        ).unwrap();
+            &mut peer,
+            &request,
+            "worker",
+            &destination,
+            DeliveryMode::Resume,
+        )
+        .unwrap();
         assert!(delivery.acknowledgments_confirmed);
         assert_eq!(peer.sent[1], DeliveryMode::Resume.frame(&request));
         assert!(!peer.sent.iter().any(|frame| {
-            matches!(frame["kind"].as_str(), Some("canonical-exec" | "source-begin" | "source-chunk" | "source-seal"))
+            matches!(
+                frame["kind"].as_str(),
+                Some("canonical-exec" | "source-begin" | "source-chunk" | "source-seal")
+            )
         }));
         super::super::delivery_recovery::recover_existing_delivery(
-            &request, "worker", &destination,
+            &request,
+            "worker",
+            &destination,
             super::super::delivery_recovery::DeliveryTrust::Loopback,
-        ).unwrap().unwrap();
+        )
+        .unwrap()
+        .unwrap();
     }
 
     fn explicit_context() -> Value {
@@ -1813,7 +1926,11 @@ mod tests {
         assert_eq!(delivery.receipt["request_sha256"], hash(&original));
         assert_eq!(delivery.receipt["transport_authenticated"], true);
         assert_eq!(delivery.receipt["publication_authorized"], false);
-        assert!(!serde_json::to_string(&delivery.receipt).unwrap().contains("BUILD_LABEL"));
+        assert!(
+            !serde_json::to_string(&delivery.receipt)
+                .unwrap()
+                .contains("BUILD_LABEL")
+        );
     }
 
     #[test]
@@ -1838,11 +1955,15 @@ mod tests {
                 11 => request["command_context"]["env"]["SECRET"] = json!("secret-marker\0"),
                 12 => request["command_context"]["extra"] = json!(true),
                 _ => {
-                    request["command_context"].as_object_mut().unwrap().remove("env");
+                    request["command_context"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("env");
                 }
             }
             let mut peer = fixture(&destination);
-            let failure = receive_execution(&mut peer, &request, "worker", &destination).unwrap_err();
+            let failure =
+                receive_execution(&mut peer, &request, "worker", &destination).unwrap_err();
             assert!(!failure.execution_may_have_run, "case {case}");
             assert!(!failure.detail.contains("secret-marker"), "case {case}");
             assert!(peer.sent.is_empty());
@@ -1853,9 +1974,7 @@ mod tests {
 
     #[test]
     fn coordinator_enforces_shared_command_environment_limits() {
-        use rabs_sandbox::process_context::{
-            MAX_COMMAND_ENV_BYTES, MAX_COMMAND_ENV_VALUE_BYTES,
-        };
+        use rabs_sandbox::process_context::{MAX_COMMAND_ENV_BYTES, MAX_COMMAND_ENV_VALUE_BYTES};
 
         let mut request = request();
         request["command_context"] = explicit_context();
@@ -1897,7 +2016,8 @@ mod tests {
             if let Some(value) = advertised {
                 peer.replies[0]["command_contexts"] = value;
             }
-            let failure = receive_execution(&mut peer, &request, "worker", &destination).unwrap_err();
+            let failure =
+                receive_execution(&mut peer, &request, "worker", &destination).unwrap_err();
             assert!(!failure.execution_may_have_run);
             assert!(failure.detail.contains("env-cwd-v1"));
             assert!(peer.sent.is_empty());
@@ -2014,9 +2134,14 @@ mod tests {
         let (_, mut request) = source_request(source.path());
         request["toolchain_transfer"] = json!("toolchain-tree-v1");
         request["toolchain_identity"] = toolchain_identity_value(&ToolchainIdentity {
-            sha256:[0xab;32], files:1, bytes:12,
+            sha256: [0xab; 32],
+            files: 1,
+            bytes: 12,
         });
-        assert!(validate_request(&request).is_err(), "worker backing and transfer cannot coexist");
+        assert!(
+            validate_request(&request).is_err(),
+            "worker backing and transfer cannot coexist"
+        );
         request.as_object_mut().unwrap().remove("toolchain_backing");
         validate_request(&request).unwrap();
         for field in ["toolchain_identity", "source_manifest"] {
@@ -2037,7 +2162,9 @@ mod tests {
         request.as_object_mut().unwrap().remove("toolchain_backing");
         request["toolchain_transfer"] = json!("toolchain-tree-v1");
         request["toolchain_identity"] = toolchain_identity_value(&ToolchainIdentity {
-            sha256:[0xab;32], files:1, bytes:12,
+            sha256: [0xab; 32],
+            files: 1,
+            bytes: 12,
         });
         let owner = tempfile::tempdir().unwrap();
         let destination = owner.path().join("delivery");
@@ -2076,7 +2203,10 @@ mod tests {
                 assert!(delivery.acknowledgments_confirmed);
                 assert_eq!(peer.sent[4], request);
                 assert_eq!(peer.sent[4]["command_context"], explicit_context());
-                assert_eq!(delivery.receipt["request_sha256"], hash(&serde_json::to_vec(&request).unwrap()));
+                assert_eq!(
+                    delivery.receipt["request_sha256"],
+                    hash(&serde_json::to_vec(&request).unwrap())
+                );
             } else {
                 assert!(!result.unwrap_err().execution_may_have_run);
                 assert!(peer.sent.is_empty());
@@ -2096,13 +2226,24 @@ mod tests {
         let mut peer = resumable(&destination);
         assert!(peer.replies[0].get("command_contexts").is_none());
         let delivery = receive_operation(
-            &mut peer, &request, "worker", &destination, DeliveryMode::Resume,
-        ).unwrap();
+            &mut peer,
+            &request,
+            "worker",
+            &destination,
+            DeliveryMode::Resume,
+        )
+        .unwrap();
         assert!(delivery.acknowledgments_confirmed);
         assert_eq!(peer.sent[1], DeliveryMode::Resume.frame(&request));
-        assert!(!peer.sent.iter().any(|frame| frame["kind"] == "canonical-exec"));
+        assert!(
+            !peer
+                .sent
+                .iter()
+                .any(|frame| frame["kind"] == "canonical-exec")
+        );
         recover_existing_delivery(&request, "worker", &destination, DeliveryTrust::Loopback)
-            .unwrap().unwrap();
+            .unwrap()
+            .unwrap();
         for field in ["cwd", "env"] {
             let mut changed = request.clone();
             if field == "cwd" {
@@ -2110,9 +2251,15 @@ mod tests {
             } else {
                 changed["command_context"]["env"]["EMPTY"] = json!("now-present");
             }
-            assert!(recover_existing_delivery(
-                &changed, "worker", &destination, DeliveryTrust::Loopback,
-            ).is_err());
+            assert!(
+                recover_existing_delivery(
+                    &changed,
+                    "worker",
+                    &destination,
+                    DeliveryTrust::Loopback,
+                )
+                .is_err()
+            );
         }
     }
 
@@ -2132,7 +2279,8 @@ mod tests {
             let observed = clock;
             clock += HEARTBEAT_WINDOW;
             observed
-        }).unwrap();
+        })
+        .unwrap();
         assert_eq!(result, terminal);
         assert!(peer.replies.is_empty());
         assert!(peer.sent.is_empty());
@@ -2145,12 +2293,18 @@ mod tests {
         for renew in [false, true] {
             let mut peer = fixture(&parent.path().join("unused"));
             peer.replies = std::iter::repeat_with(heartbeat)
-                .take(MAX_HEARTBEAT_BURST + 1).collect();
-            peer.replies.push_back(json!({"kind":"exec-result", "request_id":7}));
+                .take(MAX_HEARTBEAT_BURST + 1)
+                .collect();
+            peer.replies
+                .push_back(json!({"kind":"exec-result", "request_id":7}));
             let mut observations = 0;
             let result = receive_with_clock(&mut peer, "worker", || {
                 let elapsed = if observations > MAX_HEARTBEAT_BURST {
-                    if renew { HEARTBEAT_WINDOW } else { HEARTBEAT_WINDOW - Duration::from_nanos(1) }
+                    if renew {
+                        HEARTBEAT_WINDOW
+                    } else {
+                        HEARTBEAT_WINDOW - Duration::from_nanos(1)
+                    }
                 } else {
                     Duration::ZERO
                 };
@@ -2172,14 +2326,19 @@ mod tests {
 
     #[test]
     fn sustained_telemetry_does_not_mask_a_transport_deadline() {
-        struct ExpiringPeer { remaining: usize }
+        struct ExpiringPeer {
+            remaining: usize,
+        }
         impl WorkerPeer for ExpiringPeer {
             fn send(&mut self, _: &Value) -> io::Result<()> {
                 panic!("waiting for a result must not send a retry");
             }
             fn receive(&mut self) -> io::Result<Value> {
                 if self.remaining == 0 {
-                    return Err(io::Error::new(io::ErrorKind::TimedOut, "absolute phase deadline"));
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "absolute phase deadline",
+                    ));
                 }
                 self.remaining -= 1;
                 Ok(heartbeat())
@@ -2191,7 +2350,8 @@ mod tests {
             let observed = clock;
             clock += HEARTBEAT_WINDOW;
             observed
-        }).unwrap_err();
+        })
+        .unwrap_err();
         assert_eq!(peer.remaining, 0);
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
         assert_eq!(error.to_string(), "absolute phase deadline");
@@ -2208,8 +2368,17 @@ mod tests {
         let delivery = receive_execution(&mut peer, &request(), "worker", &destination).unwrap();
         assert!(delivery.acknowledgments_confirmed);
         assert!(peer.replies.is_empty());
-        assert_eq!(std::fs::read(destination.join("artifacts/a")).unwrap(), b"A\0\xffB");
-        assert_eq!(peer.sent.iter().filter(|frame| frame["kind"] == "canonical-exec").count(), 1);
+        assert_eq!(
+            std::fs::read(destination.join("artifacts/a")).unwrap(),
+            b"A\0\xffB"
+        );
+        assert_eq!(
+            peer.sent
+                .iter()
+                .filter(|frame| frame["kind"] == "canonical-exec")
+                .count(),
+            1
+        );
         assert_eq!(delivery.receipt["publication_authorized"], false);
     }
 
@@ -2226,6 +2395,12 @@ mod tests {
         assert!(failure.detail.contains("foreign heartbeat"));
         assert!(no_ack(&peer));
         assert!(!destination.join("delivery.json").exists());
-        assert_eq!(peer.sent.iter().filter(|frame| frame["kind"] == "canonical-exec").count(), 1);
+        assert_eq!(
+            peer.sent
+                .iter()
+                .filter(|frame| frame["kind"] == "canonical-exec")
+                .count(),
+            1
+        );
     }
 }

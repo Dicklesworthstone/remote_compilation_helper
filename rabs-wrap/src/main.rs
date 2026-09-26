@@ -385,7 +385,8 @@ mod tests {
 
     fn reply_from_peer(bytes: Vec<u8>) -> io::Result<String> {
         let (stream, mut peer) = UnixStream::pair().unwrap();
-        peer.set_write_timeout(Some(Duration::from_secs(2))).unwrap();
+        peer.set_write_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
         let sender = std::thread::spawn(move || {
             // An oversized/malformed reply may legitimately lose its reader.
             let _ = peer.write_all(&bytes);
@@ -443,7 +444,8 @@ mod tests {
     #[test]
     fn trickling_peer_cannot_renew_the_decision_deadline() {
         let (stream, mut peer) = UnixStream::pair().unwrap();
-        peer.set_write_timeout(Some(Duration::from_secs(1))).unwrap();
+        peer.set_write_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
         peer.write_all(b"{").unwrap();
         let sender = std::thread::spawn(move || {
             for _ in 0..100 {

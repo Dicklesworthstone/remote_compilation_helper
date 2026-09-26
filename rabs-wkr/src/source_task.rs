@@ -82,7 +82,8 @@ impl SourceTransferTask {
     fn start_worker(
         &mut self,
         mut handle: impl FnMut(&mut SourceTransferState, &Value) -> Result<Value, String>
-        + Send + 'static,
+        + Send
+        + 'static,
     ) -> io::Result<()> {
         if self.thread.is_some() || self.sender.is_some() {
             return Err(io::Error::other("source filesystem worker already started"));
@@ -100,7 +101,10 @@ impl SourceTransferTask {
                     }));
                     let fatal = outcome.is_err();
                     let result = match outcome {
-                        Ok(response) => Ok(Completed { source: job.source, response }),
+                        Ok(response) => Ok(Completed {
+                            source: job.source,
+                            response,
+                        }),
                         Err(_) => Err("source filesystem worker panicked".to_owned()),
                     };
                     let wake = {
@@ -108,8 +112,12 @@ impl SourceTransferTask {
                         completion.result = Some(result);
                         completion.waker.take()
                     };
-                    if let Some(waker) = wake { waker.wake(); }
-                    if fatal { break; }
+                    if let Some(waker) = wake {
+                        waker.wake();
+                    }
+                    if fatal {
+                        break;
+                    }
                 }
             })?;
         self.sender = Some(sender);
@@ -121,22 +129,43 @@ impl SourceTransferTask {
     /// Refusals before submission do not move, poison or replace the receiver.
     /// A second source frame must wait for the first one's completion.
     pub fn submit(&mut self, frame: &Value, enabled: bool, busy: bool) -> Result<(), String> {
-        if !enabled { return Err("source transfer not negotiated".to_owned()); }
-        if busy { return Err("worker-busy-or-result-pending".to_owned()); }
-        if self.cancelled { return Err("source upload cancelled".to_owned()); }
-        if self.failed { return Err("source filesystem worker failed".to_owned()); }
-        if self.pending_id.is_some() { return Err("source-operation-pending".to_owned()); }
-        if !matches!(frame["kind"].as_str(), Some("source-begin" | "source-chunk" | "source-seal")) {
+        if !enabled {
+            return Err("source transfer not negotiated".to_owned());
+        }
+        if busy {
+            return Err("worker-busy-or-result-pending".to_owned());
+        }
+        if self.cancelled {
+            return Err("source upload cancelled".to_owned());
+        }
+        if self.failed {
+            return Err("source filesystem worker failed".to_owned());
+        }
+        if self.pending_id.is_some() {
+            return Err("source-operation-pending".to_owned());
+        }
+        if !matches!(
+            frame["kind"].as_str(),
+            Some("source-begin" | "source-chunk" | "source-seal")
+        ) {
             return Err("unknown source operation".to_owned());
         }
-        let id = frame["request_id"].as_u64().ok_or("source request_id must be unsigned")?;
+        let id = frame["request_id"]
+            .as_u64()
+            .ok_or("source request_id must be unsigned")?;
         if self.sender.is_none() {
             self.start_worker(|state, value| state.handle(value, true, false))
                 .map_err(|error| format!("start source filesystem worker: {error}"))?;
         }
-        let sender = self.sender.as_ref().ok_or("source filesystem worker unavailable")?;
+        let sender = self
+            .sender
+            .as_ref()
+            .ok_or("source filesystem worker unavailable")?;
         let source = self.source.take().ok_or("source-operation-pending")?;
-        match sender.try_send(Job { source, frame: frame.clone() }) {
+        match sender.try_send(Job {
+            source,
+            frame: frame.clone(),
+        }) {
             Ok(()) => {
                 self.pending_id = Some(id);
                 Ok(())
@@ -153,13 +182,19 @@ impl SourceTransferTask {
     /// waker and testing for a result share one lock, so completion cannot race
     /// between a readiness check and subscription and leave the reactor asleep.
     pub fn poll_completion(&mut self, cx: &mut Context<'_>) -> Poll<Result<SourceReply, String>> {
-        let Some(id) = self.pending_id else { return Poll::Pending; };
+        let Some(id) = self.pending_id else {
+            return Poll::Pending;
+        };
         let result = {
             let mut completion = self.shared.lock().unwrap_or_else(|e| e.into_inner());
             match completion.result.take() {
                 Some(result) => result,
                 None => {
-                    if completion.waker.as_ref().is_none_or(|wake| !wake.will_wake(cx.waker())) {
+                    if completion
+                        .waker
+                        .as_ref()
+                        .is_none_or(|wake| !wake.will_wake(cx.waker()))
+                    {
                         completion.waker = Some(cx.waker().clone());
                     }
                     return Poll::Pending;
@@ -168,13 +203,24 @@ impl SourceTransferTask {
         };
         self.pending_id = None;
         match result {
-            Ok(Completed { source, mut response }) => {
+            Ok(Completed {
+                source,
+                mut response,
+            }) => {
                 self.source = Some(source);
-                if response.as_ref().is_ok_and(|value| value["kind"] == "source-ready") {
+                if response
+                    .as_ref()
+                    .is_ok_and(|value| value["kind"] == "source-ready")
+                {
                     self.upload_id = Some(id);
                 }
-                if self.cancelled { response = Err("source upload cancelled".to_owned()); }
-                Poll::Ready(Ok(SourceReply { request_id: id, response }))
+                if self.cancelled {
+                    response = Err("source upload cancelled".to_owned());
+                }
+                Poll::Ready(Ok(SourceReply {
+                    request_id: id,
+                    response,
+                }))
             }
             Err(error) => {
                 self.failed = true;
@@ -186,17 +232,23 @@ impl SourceTransferTask {
     /// The source identity currently owned by this session. A foreign frame
     /// in flight cannot change which already-admitted upload is cancellable.
     #[must_use]
-    pub fn request_id(&self) -> Option<u64> { self.upload_id.or(self.pending_id) }
+    pub fn request_id(&self) -> Option<u64> {
+        self.upload_id.or(self.pending_id)
+    }
 
     #[must_use]
-    pub fn is_pending(&self) -> bool { self.pending_id.is_some() }
+    pub fn is_pending(&self) -> bool {
+        self.pending_id.is_some()
+    }
 
     /// Revoke this upload's execution readiness without waiting for disk I/O.
     /// None means a foreign/unknown ID. Some(false) is an idempotent repeat.
     /// The retained state is discarded with the session; cancellation never
     /// clears execution history or authorizes a new upload under the same ID.
     pub fn cancel(&mut self, request_id: u64) -> Option<bool> {
-        if self.request_id() != Some(request_id) { return None; }
+        if self.request_id() != Some(request_id) {
+            return None;
+        }
         let accepted = !self.cancelled;
         self.cancelled = true;
         Some(accepted)
@@ -208,16 +260,25 @@ impl SourceTransferTask {
         if request.get("source_manifest").is_some() && (self.cancelled || self.failed) {
             return Err("execution source is cancelled or failed".to_owned());
         }
-        self.source.as_ref().ok_or("source-operation-pending")?.prepared_path(request, enabled)
+        self.source
+            .as_ref()
+            .ok_or("source-operation-pending")?
+            .prepared_path(request, enabled)
     }
 
     /// Transfer the verified source owner only after durable execution
     /// admission. The caller must retain it through process and drain cleanup.
     pub fn take_prepared(&mut self, request: &Value) -> io::Result<Option<SourceOwner>> {
-        self.prepared_path(request, true).map_err(io::Error::other)?;
-        let owner = self.source.as_mut().ok_or_else(|| io::Error::other("source-operation-pending"))?
+        self.prepared_path(request, true)
+            .map_err(io::Error::other)?;
+        let owner = self
+            .source
+            .as_mut()
+            .ok_or_else(|| io::Error::other("source-operation-pending"))?
             .take_prepared(request)?;
-        if owner.is_some() { self.upload_id = None; }
+        if owner.is_some() {
+            self.upload_id = None;
+        }
         Ok(owner)
     }
 }
@@ -227,7 +288,9 @@ impl Drop for SourceTransferTask {
         // Close the command channel FIRST. The worker completes the one
         // accepted job, then exits; no join while an idle recv stays open.
         drop(self.sender.take());
-        if let Some(thread) = self.thread.take() { let _ = thread.join(); }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
     }
 }
 
@@ -246,9 +309,12 @@ mod tests {
 
     fn request() -> Value {
         let manifest = SourceManifest::new(vec![SourceFile {
-            path: "lib.rs".to_owned(), len: BYTES.len() as u64,
-            sha256: Sha256::digest(BYTES).into(), executable: false,
-        }]).unwrap();
+            path: "lib.rs".to_owned(),
+            len: BYTES.len() as u64,
+            sha256: Sha256::digest(BYTES).into(),
+            executable: false,
+        }])
+        .unwrap();
         json!({"kind":"canonical-exec", "request_id":7, "source_manifest":{
             "manifest_sha256":hex(&manifest.digest()), "files":[{
                 "path":"lib.rs", "bytes":BYTES.len(),
@@ -261,7 +327,10 @@ mod tests {
         json!({"kind":"source-begin", "request_id":7, "manifest":request["source_manifest"]})
     }
 
-    struct Notifier { thread: std::thread::Thread, wakes: AtomicUsize }
+    struct Notifier {
+        thread: std::thread::Thread,
+        wakes: AtomicUsize,
+    }
     impl Wake for Notifier {
         fn wake(self: Arc<Self>) {
             self.wakes.fetch_add(1, Ordering::SeqCst);
@@ -270,7 +339,10 @@ mod tests {
     }
 
     fn notifier() -> Arc<Notifier> {
-        Arc::new(Notifier { thread: std::thread::current(), wakes: AtomicUsize::new(0) })
+        Arc::new(Notifier {
+            thread: std::thread::current(),
+            wakes: AtomicUsize::new(0),
+        })
     }
 
     fn finish(task: &mut SourceTransferTask) -> Result<SourceReply, String> {
@@ -278,8 +350,13 @@ mod tests {
         let mut cx = Context::from_waker(&waker);
         let until = Instant::now() + Duration::from_secs(5);
         loop {
-            if let Poll::Ready(reply) = task.poll_completion(&mut cx) { return reply; }
-            assert!(Instant::now() < until, "source task failed to wake or finish");
+            if let Poll::Ready(reply) = task.poll_completion(&mut cx) {
+                return reply;
+            }
+            assert!(
+                Instant::now() < until,
+                "source task failed to wake or finish"
+            );
             std::thread::park_timeout(Duration::from_millis(5));
         }
     }
@@ -294,12 +371,21 @@ mod tests {
     fn upload(task: &mut SourceTransferTask, request: &Value) {
         assert_eq!(exchange(task, &begin(request))["sealed"], false);
         assert!(task.prepared_path(request, true).is_err());
-        exchange(task, &json!({"kind":"source-chunk", "request_id":7,
+        exchange(
+            task,
+            &json!({"kind":"source-chunk", "request_id":7,
             "manifest_sha256":request["source_manifest"]["manifest_sha256"],
             "path":"lib.rs", "offset":0, "data_hex":hex(BYTES),
-            "chunk_sha256":hex(&Sha256::digest(BYTES))}));
-        assert_eq!(exchange(task, &json!({"kind":"source-seal", "request_id":7,
-            "manifest_sha256":request["source_manifest"]["manifest_sha256"]}))["sealed"], true);
+            "chunk_sha256":hex(&Sha256::digest(BYTES))}),
+        );
+        assert_eq!(
+            exchange(
+                task,
+                &json!({"kind":"source-seal", "request_id":7,
+            "manifest_sha256":request["source_manifest"]["manifest_sha256"]})
+            )["sealed"],
+            true
+        );
     }
 
     #[test]
@@ -313,7 +399,10 @@ mod tests {
         assert_eq!(task.request_id(), None);
         assert!(task.prepared_path(&request, true).is_err());
         drop(task);
-        assert!(path.exists(), "execution, not the I/O thread, owns the sealed tree");
+        assert!(
+            path.exists(),
+            "execution, not the I/O thread, owns the sealed tree"
+        );
         drop(owner);
         assert!(!path.exists());
     }
@@ -328,24 +417,40 @@ mod tests {
             entered_tx.send(std::thread::current().id()).unwrap();
             release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
             source.handle(frame, true, false)
-        }).unwrap();
+        })
+        .unwrap();
         let request = request();
         task.submit(&begin(&request), true, false).unwrap();
-        assert_ne!(entered_rx.recv_timeout(Duration::from_secs(5)).unwrap(), reactor);
+        assert_ne!(
+            entered_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            reactor
+        );
         let notify = notifier();
         let waker = Waker::from(Arc::clone(&notify));
-        assert!(task.poll_completion(&mut Context::from_waker(&waker)).is_pending());
+        assert!(
+            task.poll_completion(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
         assert!(task.is_pending());
         assert!(task.prepared_path(&request, true).is_err());
         assert!(task.take_prepared(&request).is_err());
-        assert_eq!(task.submit(&begin(&request), true, false).unwrap_err(), "source-operation-pending");
+        assert_eq!(
+            task.submit(&begin(&request), true, false).unwrap_err(),
+            "source-operation-pending"
+        );
         release_tx.send(()).unwrap();
         let until = Instant::now() + Duration::from_secs(5);
         while notify.wakes.load(Ordering::SeqCst) == 0 {
-            assert!(Instant::now() < until, "completion did not wake the registered reactor");
+            assert!(
+                Instant::now() < until,
+                "completion did not wake the registered reactor"
+            );
             std::thread::park_timeout(Duration::from_millis(5));
         }
-        assert_eq!(finish(&mut task).unwrap().response.unwrap()["sealed"], false);
+        assert_eq!(
+            finish(&mut task).unwrap().response.unwrap()["sealed"],
+            false
+        );
         // Joining also waits for the wake that follows publishing the result.
         drop(task);
         assert!(notify.wakes.load(Ordering::SeqCst) > 0);
@@ -361,7 +466,8 @@ mod tests {
             entered_tx.send(()).unwrap();
             release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
             result
-        }).unwrap();
+        })
+        .unwrap();
         let request = request();
         task.submit(&begin(&request), true, false).unwrap();
         entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -369,7 +475,10 @@ mod tests {
         assert_eq!(task.cancel(7), Some(true));
         assert_eq!(task.cancel(7), Some(false));
         release_tx.send(()).unwrap();
-        assert_eq!(finish(&mut task).unwrap().response.unwrap_err(), "source upload cancelled");
+        assert_eq!(
+            finish(&mut task).unwrap().response.unwrap_err(),
+            "source upload cancelled"
+        );
         assert!(task.prepared_path(&request, true).is_err());
         assert!(task.take_prepared(&request).is_err());
         assert!(task.submit(&begin(&request), true, false).is_err());
@@ -393,7 +502,8 @@ mod tests {
         assert!(task.submit(&begin(&request), false, false).is_err());
         assert!(task.submit(&begin(&request), true, true).is_err());
         assert!(task.submit(&request, true, false).is_err());
-        let mut missing = begin(&request); missing["request_id"] = Value::Null;
+        let mut missing = begin(&request);
+        missing["request_id"] = Value::Null;
         assert!(task.submit(&missing, true, false).is_err());
         assert!(task.thread.is_none());
         assert!(!task.is_pending());
@@ -403,7 +513,8 @@ mod tests {
     #[test]
     fn worker_unwind_never_returns_source_authority_or_accepts_more_work() {
         let mut task = SourceTransferTask::default();
-        task.start_worker(|_, _| panic!("injected source worker unwind")).unwrap();
+        task.start_worker(|_, _| panic!("injected source worker unwind"))
+            .unwrap();
         let request = request();
         task.submit(&begin(&request), true, false).unwrap();
         assert!(finish(&mut task).is_err());
@@ -421,12 +532,19 @@ mod tests {
             entered_tx.send(()).unwrap();
             release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
             source.handle(frame, true, false)
-        }).unwrap();
+        })
+        .unwrap();
         task.submit(&begin(&request()), true, false).unwrap();
         entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         let (done_tx, done_rx) = mpsc::channel();
-        let dropper = std::thread::spawn(move || { drop(task); done_tx.send(()).unwrap(); });
-        assert!(done_rx.try_recv().is_err(), "owner returned with an outstanding filesystem operation");
+        let dropper = std::thread::spawn(move || {
+            drop(task);
+            done_tx.send(()).unwrap();
+        });
+        assert!(
+            done_rx.try_recv().is_err(),
+            "owner returned with an outstanding filesystem operation"
+        );
         release_tx.send(()).unwrap();
         done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         dropper.join().unwrap();

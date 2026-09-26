@@ -27,7 +27,10 @@ impl OwnedChild {
             if let Some(status) = self.child.try_wait().expect("child status") {
                 return status;
             }
-            assert!(Instant::now() < deadline, "child did not exit within test budget");
+            assert!(
+                Instant::now() < deadline,
+                "child did not exit within test budget"
+            );
             std::thread::sleep(Duration::from_millis(10));
         }
     }
@@ -46,35 +49,62 @@ fn connect_worker() -> (OwnedChild, BufReader<TcpStream>, TcpStream) {
     let address = listener.local_addr().unwrap().to_string();
     let state = tempfile::tempdir().unwrap();
     let child = Command::new(env!("CARGO_BIN_EXE_rabs-wkr"))
-        .args(["--coordinator", &address, "--worker-id", "artifact-test", "--once"])
+        .args([
+            "--coordinator",
+            &address,
+            "--worker-id",
+            "artifact-test",
+            "--once",
+        ])
         .env("RABS_WORKER_STATE_DIR", state.path())
-        .stdout(Stdio::null()).stderr(Stdio::inherit()).spawn().unwrap();
-    let mut worker = OwnedChild { child, _state: Some(state) };
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .unwrap();
+    let mut worker = OwnedChild {
+        child,
+        _state: Some(state),
+    };
     let deadline = Instant::now() + Duration::from_secs(15);
     let stream = loop {
         match listener.accept() {
             Ok((stream, _)) => break stream,
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                assert!(worker.child.try_wait().unwrap().is_none(), "worker exited before connecting");
+                assert!(
+                    worker.child.try_wait().unwrap().is_none(),
+                    "worker exited before connecting"
+                );
                 assert!(Instant::now() < deadline, "worker connection timeout");
                 std::thread::sleep(Duration::from_millis(10));
             }
             Err(error) => panic!("accept worker: {error}"),
         }
     };
-    stream.set_read_timeout(Some(Duration::from_secs(120))).unwrap();
-    stream.set_write_timeout(Some(Duration::from_secs(10))).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(120)))
+        .unwrap();
+    stream
+        .set_write_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
     let writer = stream.try_clone().unwrap();
     let mut reader = BufReader::new(stream);
     let hello = receive(&mut reader);
     assert_eq!(hello["kind"], "worker-hello");
-    assert!(hello["artifact_transfers"].as_array().unwrap().contains(&json!("files-v1")));
+    assert!(
+        hello["artifact_transfers"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("files-v1"))
+    );
     (worker, reader, writer)
 }
 
 fn receive(reader: &mut impl BufRead) -> Value {
     let mut line = String::new();
-    assert!(reader.read_line(&mut line).expect("read worker frame") != 0, "unexpected worker EOF");
+    assert!(
+        reader.read_line(&mut line).expect("read worker frame") != 0,
+        "unexpected worker EOF"
+    );
     assert!(line.len() <= 1 << 20, "unbounded worker frame");
     serde_json::from_str(&line).expect("worker frame is JSON")
 }
@@ -85,14 +115,21 @@ fn send(writer: &mut TcpStream, value: &Value) {
 
 fn toolchain() -> PathBuf {
     let cargo = std::fs::canonicalize(std::env::var("CARGO").expect("CARGO set by Cargo")).unwrap();
-    cargo.parent().and_then(Path::parent).expect("toolchain/bin/cargo").to_path_buf()
+    cargo
+        .parent()
+        .and_then(Path::parent)
+        .expect("toolchain/bin/cargo")
+        .to_path_buf()
 }
 
 fn decode_hex(text: &str) -> Vec<u8> {
     assert!(text.len().is_multiple_of(2), "odd byte encoding");
-    text.as_bytes().as_chunks::<2>().0.iter().map(|pair| {
-        u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).expect("byte hex")
-    }).collect()
+    text.as_bytes()
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).expect("byte hex"))
+        .collect()
 }
 
 /// Independently implement the documented framing rather than trusting an
@@ -121,11 +158,20 @@ fn verify_manifest(manifest: &Value) {
         field(&mut hasher, file["sha256"].as_str().unwrap().as_bytes());
     }
     assert_eq!(manifest["total_bytes"], total);
-    let expected: String = hasher.finalize().iter().map(|byte| format!("{byte:02x}")).collect();
+    let expected: String = hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
     assert_eq!(manifest["manifest_sha256"], expected);
 }
 
-fn fetch_artifact(reader: &mut impl BufRead, writer: &mut TcpStream, manifest: &Value, file: &Value) -> Vec<u8> {
+fn fetch_artifact(
+    reader: &mut impl BufRead,
+    writer: &mut TcpStream,
+    manifest: &Value,
+    file: &Value,
+) -> Vec<u8> {
     let size = file["bytes"].as_u64().unwrap();
     // These tiny fixtures must not hide an unexpectedly huge retained artifact.
     assert!(size < 16 * 1024 * 1024);
@@ -150,12 +196,18 @@ fn fetch_artifact(reader: &mut impl BufRead, writer: &mut TcpStream, manifest: &
         assert_eq!(chunk["next_offset"], offset + data.len() as u64);
         if offset == 0 {
             send(writer, &read);
-            assert_eq!(receive(reader), chunk, "retrying a range must return the same bytes");
+            assert_eq!(
+                receive(reader),
+                chunk,
+                "retrying a range must return the same bytes"
+            );
         }
         bytes.extend_from_slice(&data);
         let eof = bytes.len() as u64 == size;
         assert_eq!(chunk["eof"], eof);
-        if eof { break; }
+        if eof {
+            break;
+        }
         assert!(!data.is_empty(), "range stalled before EOF");
     }
     assert_eq!(bytes.len() as u64, size);
@@ -165,15 +217,25 @@ fn fetch_artifact(reader: &mut impl BufRead, writer: &mut TcpStream, manifest: &
 
 #[test]
 fn canonical_compile_returns_usable_rlib_rmeta_and_dep_info_before_acknowledged_exit() {
-    if !rabs_sandbox::canonical_namespace::HostIsolationSupport::probe().missing_for_canonical().is_empty() {
+    if !rabs_sandbox::canonical_namespace::HostIsolationSupport::probe()
+        .missing_for_canonical()
+        .is_empty()
+    {
         eprintln!("SKIP: canonical namespace unavailable; artifact TCP compilation not exercised");
         return;
     }
     let source = tempfile::tempdir().unwrap();
-    std::fs::write(source.path().join("lib.rs"), "pub fn answer() -> u32 { 42 }\n").unwrap();
+    std::fs::write(
+        source.path().join("lib.rs"),
+        "pub fn answer() -> u32 { 42 }\n",
+    )
+    .unwrap();
     let toolchain = toolchain();
     let (mut worker, mut reader, mut writer) = connect_worker();
-    send(&mut writer, &json!({"kind": "session-ok", "artifact_transfer": "files-v1"}));
+    send(
+        &mut writer,
+        &json!({"kind": "session-ok", "artifact_transfer": "files-v1"}),
+    );
     // The individual --emit=kind=path outputs are explicit. The worker must
     // not rewrite argv or guess a Cargo output set from the crate name.
     let request = json!({
@@ -195,43 +257,90 @@ fn canonical_compile_returns_usable_rlib_rmeta_and_dep_info_before_acknowledged_
     assert_eq!(result["artifact_ack_required"], true);
     let manifest = &result["artifact_manifest"];
     verify_manifest(manifest);
-    let names: BTreeSet<_> = manifest["files"].as_array().unwrap().iter()
-        .map(|file| file["name"].as_str().unwrap()).collect();
-    assert_eq!(names, BTreeSet::from(["artifact_demo.d", "libartifact_demo.rlib", "libartifact_demo.rmeta"]));
-    assert!(worker.child.try_wait().unwrap().is_none(), "--once lost files before acceptance");
+    let names: BTreeSet<_> = manifest["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|file| file["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        BTreeSet::from([
+            "artifact_demo.d",
+            "libartifact_demo.rlib",
+            "libartifact_demo.rmeta"
+        ])
+    );
+    assert!(
+        worker.child.try_wait().unwrap().is_none(),
+        "--once lost files before acceptance"
+    );
 
     let received = tempfile::tempdir().unwrap();
     for file in manifest["files"].as_array().unwrap() {
         let bytes = fetch_artifact(&mut reader, &mut writer, manifest, file);
         let name = file["name"].as_str().unwrap();
-        if name.ends_with(".rlib") { assert!(bytes.starts_with(b"!<arch>\n")); }
-        if name.ends_with(".rmeta") { assert!(!bytes.is_empty()); }
+        if name.ends_with(".rlib") {
+            assert!(bytes.starts_with(b"!<arch>\n"));
+        }
+        if name.ends_with(".rmeta") {
+            assert!(!bytes.is_empty());
+        }
         if name.ends_with(".d") {
-            assert!(std::str::from_utf8(&bytes).unwrap().contains("/__rabs/workspace/lib.rs"));
+            assert!(
+                std::str::from_utf8(&bytes)
+                    .unwrap()
+                    .contains("/__rabs/workspace/lib.rs")
+            );
         }
         std::fs::write(received.path().join(name), bytes).unwrap();
     }
     // Use the downloaded rlib, not a local recompilation of its source. This
     // catches returning syntactically plausible but unusable artifact content.
-    std::fs::write(received.path().join("consumer.rs"),
-        "fn main() { assert_eq!(artifact_demo::answer(), 42); }\n").unwrap();
+    std::fs::write(
+        received.path().join("consumer.rs"),
+        "fn main() { assert_eq!(artifact_demo::answer(), 42); }\n",
+    )
+    .unwrap();
     let binary = received.path().join("consumer");
     let child = Command::new(toolchain.join("bin/rustc"))
-        .arg("--edition=2024").arg(received.path().join("consumer.rs"))
-        .arg("--extern").arg(format!("artifact_demo={}", received.path().join("libartifact_demo.rlib").display()))
-        .arg("-o").arg(&binary).stdout(Stdio::null()).stderr(Stdio::inherit()).spawn().unwrap();
-    let mut compiler = OwnedChild { child, _state: None };
+        .arg("--edition=2024")
+        .arg(received.path().join("consumer.rs"))
+        .arg("--extern")
+        .arg(format!(
+            "artifact_demo={}",
+            received.path().join("libartifact_demo.rlib").display()
+        ))
+        .arg("-o")
+        .arg(&binary)
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .unwrap();
+    let mut compiler = OwnedChild {
+        child,
+        _state: None,
+    };
     assert!(compiler.wait_until(Duration::from_secs(60)).success());
-    let child = Command::new(binary).stdout(Stdio::null()).stderr(Stdio::inherit()).spawn().unwrap();
-    let mut consumer = OwnedChild { child, _state: None };
+    let child = Command::new(binary)
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .unwrap();
+    let mut consumer = OwnedChild {
+        child,
+        _state: None,
+    };
     assert!(consumer.wait_until(Duration::from_secs(10)).success());
 
     let ack = json!({"kind": "artifact-ack", "request_id": 42,
         "manifest_sha256": manifest["manifest_sha256"], "total_bytes": manifest["total_bytes"]});
-    let mut wrong_ack = ack.clone(); wrong_ack["manifest_sha256"] = json!("0".repeat(64));
+    let mut wrong_ack = ack.clone();
+    wrong_ack["manifest_sha256"] = json!("0".repeat(64));
     send(&mut writer, &wrong_ack);
     assert_eq!(receive(&mut reader)["reason"], "artifact-ack-mismatch");
-    let mut next = request.clone(); next["request_id"] = json!(43);
+    let mut next = request.clone();
+    next["request_id"] = json!(43);
     send(&mut writer, &next);
     assert_eq!(receive(&mut reader)["reason"], "artifacts-unacknowledged");
     assert!(worker.child.try_wait().unwrap().is_none());
@@ -246,30 +355,48 @@ fn unnegotiated_artifacts_are_refused_before_launch_and_session_remains_usable()
     // backing directory is created. Nonexistent paths cannot mask a silent run.
     let (mut worker, mut reader, mut writer) = connect_worker();
     send(&mut writer, &json!({"kind": "session-ok"}));
-    send(&mut writer, &json!({"kind": "canonical-exec", "request_id": 1,
+    send(
+        &mut writer,
+        &json!({"kind": "canonical-exec", "request_id": 1,
         "program": "true", "args": [], "toolchain_backing": "/nonexistent-artifact-tc",
         "workspace_backing": "/nonexistent-artifact-workspace",
-        "artifacts": {"unit": "dep", "files": ["lib.rlib"]}}));
+        "artifacts": {"unit": "dep", "files": ["lib.rlib"]}}),
+    );
     let refusal = receive(&mut reader);
     assert_eq!(refusal["kind"], "error");
-    assert!(refusal["reason"].as_str().unwrap().contains("artifact transfer not negotiated"));
+    assert!(
+        refusal["reason"]
+            .as_str()
+            .unwrap()
+            .contains("artifact transfer not negotiated")
+    );
     send(&mut writer, &json!({"kind": "ping"}));
     let heartbeat = receive(&mut reader);
     assert_eq!(heartbeat["kind"], "heartbeat");
     assert!(heartbeat["active_request_id"].is_null());
     assert!(heartbeat["pending_artifact_request_id"].is_null());
-    send(&mut writer, &json!({"kind": "request-status", "request_id": 1}));
+    send(
+        &mut writer,
+        &json!({"kind": "request-status", "request_id": 1}),
+    );
     let status = receive(&mut reader);
-    assert_eq!(status["status"], "unknown", "unnegotiated files must not acquire durable admission");
+    assert_eq!(
+        status["status"], "unknown",
+        "unnegotiated files must not acquire durable admission"
+    );
     assert!(status["high_water"].is_null());
-    drop(reader); drop(writer);
+    drop(reader);
+    drop(writer);
     assert!(worker.wait_until(Duration::from_secs(10)).success());
 }
 
 #[test]
 fn uploaded_source_is_read_only_while_runtime_and_artifact_output_remain_writable() {
     use rabs_sandbox::source_transfer::{SourceFile, SourceManifest};
-    if !rabs_sandbox::canonical_namespace::HostIsolationSupport::probe().missing_for_canonical().is_empty() {
+    if !rabs_sandbox::canonical_namespace::HostIsolationSupport::probe()
+        .missing_for_canonical()
+        .is_empty()
+    {
         eprintln!("SKIP: canonical namespace unavailable; uploaded-source isolation not exercised");
         return;
     }
@@ -277,28 +404,50 @@ fn uploaded_source_is_read_only_while_runtime_and_artifact_output_remain_writabl
         ("input.txt", b"exact input\n"),
         (".rabs-jobserver", b"source-owned\n"),
     ];
-    let manifest = SourceManifest::new(files.iter().map(|(path, bytes)| SourceFile {
-        path: (*path).to_owned(), len: bytes.len() as u64,
-        sha256: Sha256::digest(bytes).into(), executable: false,
-    }).collect()).unwrap();
-    let hex = |bytes: &[u8]| bytes.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+    let manifest = SourceManifest::new(
+        files
+            .iter()
+            .map(|(path, bytes)| SourceFile {
+                path: (*path).to_owned(),
+                len: bytes.len() as u64,
+                sha256: Sha256::digest(bytes).into(),
+                executable: false,
+            })
+            .collect(),
+    )
+    .unwrap();
+    let hex = |bytes: &[u8]| {
+        bytes
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    };
     let source_manifest = json!({"manifest_sha256":hex(&manifest.digest()),
         "files":manifest.files().iter().map(|file| json!({
             "path":file.path, "bytes":file.len, "sha256":hex(&file.sha256), "executable":file.executable,
         })).collect::<Vec<_>>()});
     let (mut worker, mut reader, mut writer) = connect_worker();
-    send(&mut writer, &json!({"kind":"session-ok", "source_transfer":"source-files-v1",
-        "artifact_transfer":"files-v1"}));
-    send(&mut writer, &json!({"kind":"source-begin", "request_id":42, "manifest":source_manifest}));
+    send(
+        &mut writer,
+        &json!({"kind":"session-ok", "source_transfer":"source-files-v1",
+        "artifact_transfer":"files-v1"}),
+    );
+    send(
+        &mut writer,
+        &json!({"kind":"source-begin", "request_id":42, "manifest":source_manifest}),
+    );
     let ready = receive(&mut reader);
     assert_eq!(ready["kind"], "source-ready", "{ready}");
     assert_eq!(ready["request_id"], 42);
     assert_eq!(ready["manifest_sha256"], source_manifest["manifest_sha256"]);
     assert_eq!(ready["sealed"], false);
     for (path, bytes) in files {
-        send(&mut writer, &json!({"kind":"source-chunk", "request_id":42,
+        send(
+            &mut writer,
+            &json!({"kind":"source-chunk", "request_id":42,
             "manifest_sha256":source_manifest["manifest_sha256"], "path":path,
-            "offset":0, "data_hex":hex(bytes), "chunk_sha256":sha256_hex(bytes)}));
+            "offset":0, "data_hex":hex(bytes), "chunk_sha256":sha256_hex(bytes)}),
+        );
         let ack = receive(&mut reader);
         assert_eq!(ack["kind"], "source-chunk-accepted", "{ack}");
         assert_eq!(ack["request_id"], 42);
@@ -306,12 +455,18 @@ fn uploaded_source_is_read_only_while_runtime_and_artifact_output_remain_writabl
         assert_eq!(ack["path"], path);
         assert_eq!(ack["next_offset"], bytes.len());
     }
-    send(&mut writer, &json!({"kind":"source-seal", "request_id":42,
-        "manifest_sha256":source_manifest["manifest_sha256"]}));
+    send(
+        &mut writer,
+        &json!({"kind":"source-seal", "request_id":42,
+        "manifest_sha256":source_manifest["manifest_sha256"]}),
+    );
     let sealed = receive(&mut reader);
     assert_eq!(sealed["kind"], "source-ready", "{sealed}");
     assert_eq!(sealed["request_id"], 42);
-    assert_eq!(sealed["manifest_sha256"], source_manifest["manifest_sha256"]);
+    assert_eq!(
+        sealed["manifest_sha256"],
+        source_manifest["manifest_sha256"]
+    );
     assert_eq!(sealed["sealed"], true);
     // Run through the real worker launch closure, not just a constructed argv.
     // Chmod distinguishes kernel read-only mounting from mode 0444; adding and
@@ -333,10 +488,13 @@ printf runtime > "$HOME/runtime.txt"
 test "$(cat "$HOME/runtime.txt")" = runtime
 printf 'exact input\n' > /__rabs/out/dep/result.txt
 "#;
-    send(&mut writer, &json!({"kind":"canonical-exec", "request_id":42, "timeout_ms":30000,
+    send(
+        &mut writer,
+        &json!({"kind":"canonical-exec", "request_id":42, "timeout_ms":30000,
         "program":"sh", "args":["-c",script], "toolchain_backing":toolchain(),
         "source_manifest":source_manifest, "jobserver_grant":1,
-        "artifacts":{"unit":"dep", "files":["result.txt"]}}));
+        "artifacts":{"unit":"dep", "files":["result.txt"]}}),
+    );
     let result = receive(&mut reader);
     assert_eq!(result["kind"], "exec-result", "{result}");
     assert_eq!(result["executed"], true, "{result}");
@@ -352,9 +510,15 @@ printf 'exact input\n' > /__rabs/out/dep/result.txt
         fetch_artifact(&mut reader, &mut writer, artifacts, &artifacts["files"][0]),
         b"exact input\n"
     );
-    assert!(worker.child.try_wait().unwrap().is_none(), "artifact ownership ended before ACK");
-    send(&mut writer, &json!({"kind":"artifact-ack", "request_id":42,
-        "manifest_sha256":artifacts["manifest_sha256"], "total_bytes":artifacts["total_bytes"]}));
+    assert!(
+        worker.child.try_wait().unwrap().is_none(),
+        "artifact ownership ended before ACK"
+    );
+    send(
+        &mut writer,
+        &json!({"kind":"artifact-ack", "request_id":42,
+        "manifest_sha256":artifacts["manifest_sha256"], "total_bytes":artifacts["total_bytes"]}),
+    );
     assert_eq!(receive(&mut reader)["kind"], "artifact-acknowledged");
     assert!(worker.wait_until(Duration::from_secs(10)).success());
 }

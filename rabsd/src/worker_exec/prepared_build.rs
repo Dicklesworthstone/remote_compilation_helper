@@ -3,10 +3,10 @@
 //! offline, and an uncertain execution is never converted into another dispatch.
 
 use super::{
-    Delivery, DeliveryFailure, DeliveryMode, DeliveryTrust, WorkerOperation, invalid,
-    operation_arguments, operation_failure, prepare_resume_source, read_request, recover_existing_delivery,
-    request_manifest, run_loopback_operation, run_tls_operation, run_tls_operation_inner,
-    TlsOperationControl,
+    Delivery, DeliveryFailure, DeliveryMode, DeliveryTrust, TlsOperationControl, WorkerOperation,
+    invalid, operation_arguments, operation_failure, prepare_resume_source, read_request,
+    recover_existing_delivery, request_manifest, run_loopback_operation, run_tls_operation,
+    run_tls_operation_inner,
 };
 use rabsd::coord::delivery_recovery::{InstalledOutputs, install_delivery_outputs};
 use rabsd::coord::secure_worker_delivery::parse_worker_pin;
@@ -116,12 +116,17 @@ impl PreparedBuild<'_> {
         request: &Value,
         control: Option<TlsOperationControl<'_>>,
     ) -> Result<(Delivery, Option<InstalledOutputs>), DeliveryFailure> {
-        self.validate_paths(false).map_err(|error| self.failure(error.to_string()))?;
+        self.validate_paths(false)
+            .map_err(|error| self.failure(error.to_string()))?;
         super::validate_request(request).map_err(|error| self.failure(error.to_string()))?;
-        if request_manifest(request).map_err(|error| self.failure(error.to_string()))?.is_none()
+        if request_manifest(request)
+            .map_err(|error| self.failure(error.to_string()))?
+            .is_none()
             || request.get("artifacts").is_none()
         {
-            return Err(self.failure("prepared builds require source_manifest and artifacts".to_owned()));
+            return Err(
+                self.failure("prepared builds require source_manifest and artifacts".to_owned())
+            );
         }
         let trust = match self.pin {
             Some(pin) => DeliveryTrust::PinnedWorker(
@@ -132,16 +137,17 @@ impl PreparedBuild<'_> {
         // A complete receipt is sufficient even if source, credentials, or the
         // worker are gone. Incomplete/mismatched receipts refuse here, before
         // the absence of an output directory could suggest fresh execution.
-        let delivery = match recover_existing_delivery(
-            request,
-            self.worker,
-            self.directory,
-            trust,
-        )? {
+        let delivery = match recover_existing_delivery(request, self.worker, self.directory, trust)?
+        {
             Some(delivery) => delivery,
             None => {
-                if control.as_ref().is_some_and(|control| control.cancellation.is_cancelled()) {
-                    return Err(self.failure("prepared operation cancelled before dispatch".to_owned()));
+                if control
+                    .as_ref()
+                    .is_some_and(|control| control.cancellation.is_cancelled())
+                {
+                    return Err(
+                        self.failure("prepared operation cancelled before dispatch".to_owned())
+                    );
                 }
                 match fs::symlink_metadata(self.output) {
                     Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -157,11 +163,14 @@ impl PreparedBuild<'_> {
                 // Local reuse remains read-only through BOTH delivery and later
                 // output installation. Complete local recovery above does not
                 // depend on this old directory continuing to exist.
-                if let Some(reuse) = prepare_resume_source(self.mode, self.resume_from, self.directory)
-                    .map_err(|error| self.failure(error.to_string()))?
+                if let Some(reuse) =
+                    prepare_resume_source(self.mode, self.resume_from, self.directory)
+                        .map_err(|error| self.failure(error.to_string()))?
                 {
                     for path in [self.bundle, self.output] {
-                        reuse.validate_destination(path).map_err(|error| self.failure(error.to_string()))?;
+                        reuse
+                            .validate_destination(path)
+                            .map_err(|error| self.failure(error.to_string()))?;
                     }
                 }
                 let source = self.bundle.join("source");
@@ -181,11 +190,14 @@ impl PreparedBuild<'_> {
                     mode: self.mode,
                     source_root,
                     toolchain_root: (self.mode == DeliveryMode::Execute
-                        && request.get("toolchain_transfer").is_some()).then_some(toolchain.as_path()),
+                        && request.get("toolchain_transfer").is_some())
+                    .then_some(toolchain.as_path()),
                     resume_from: self.resume_from,
                 };
                 match self.pin {
-                    Some(pin) if control.is_some() => run_tls_operation_inner(operation, pin, control)?,
+                    Some(pin) if control.is_some() => {
+                        run_tls_operation_inner(operation, pin, control)?
+                    }
                     Some(pin) => run_tls_operation(operation, pin)?,
                     None => run_loopback_operation(operation)?,
                 }
@@ -256,10 +268,12 @@ impl PreparedBuild<'_> {
 
 fn run(args: &[String], tls: bool) -> i32 {
     let count = if tls { 6 } else { 5 };
-    let Some((args, mode, resume_from)) = operation_arguments(args, count).filter(|(args, _, _)| {
-        args.iter()
-            .all(|arg| !arg.is_empty() && !arg.starts_with("--"))
-    }) else {
+    let Some((args, mode, resume_from)) =
+        operation_arguments(args, count).filter(|(args, _, _)| {
+            args.iter()
+                .all(|arg| !arg.is_empty() && !arg.starts_with("--"))
+        })
+    else {
         eprintln!(
             "usage: rabsd --worker-build-{} [--resume | --resume-from <absolute-old-delivery>] <IP:port> <worker> {}<absolute-bundle-directory> <absolute-delivery-directory> <absolute-output-directory>",
             if tls { "tls" } else { "loopback" },
@@ -321,9 +335,14 @@ pub fn execute_prepared_operation(
         // edits to the operator's installed output tree. It never replaces or
         // reinstalls those files and needs no source bundle.
         super::run_tls_acknowledgment_bound(
-            &spec.address, &spec.worker, &spec.worker_spki_sha256, claim.request(),
-            &spec.delivery, Some(control),
-        ).map(|delivery| (delivery, None))
+            &spec.address,
+            &spec.worker,
+            &spec.worker_spki_sha256,
+            claim.request(),
+            &spec.delivery,
+            Some(control),
+        )
+        .map(|delivery| (delivery, None))
     } else {
         build.execute_bound(claim.request(), Some(control))
     };
@@ -438,18 +457,31 @@ mod tests {
         fs::write(bundle.join("source/lib.rs"), b"changed source").unwrap();
         let pin = "ab".repeat(32);
         let build = PreparedBuild {
-            address:"127.0.0.1:0", worker:"worker", pin:Some(&pin), bundle:&bundle,
-            directory:&directory, output:&output, mode:DeliveryMode::Execute, resume_from:None,
+            address: "127.0.0.1:0",
+            worker: "worker",
+            pin: Some(&pin),
+            bundle: &bundle,
+            directory: &directory,
+            output: &output,
+            mode: DeliveryMode::Execute,
+            resume_from: None,
         };
         let mut listened = false;
-        let mut on_listening = |_| { listened = true; Ok(()) };
+        let mut on_listening = |_| {
+            listened = true;
+            Ok(())
+        };
         let control = TlsOperationControl {
-            cancellation:super::super::OperationCancellation::default(),
-            preview:None,
-            on_listening:&mut on_listening,
+            cancellation: super::super::OperationCancellation::default(),
+            preview: None,
+            on_listening: &mut on_listening,
         };
         let error = build.execute_bound(&request, Some(control)).unwrap_err();
-        assert!(error.detail.contains("captured source differs from"), "{}", error.detail);
+        assert!(
+            error.detail.contains("captured source differs from"),
+            "{}",
+            error.detail
+        );
         assert!(!error.execution_may_have_run);
         assert!(!listened);
         assert!(!directory.exists());
@@ -474,15 +506,28 @@ mod tests {
         let output = root.join("output");
         let pin = "ab".repeat(32);
         let build = PreparedBuild {
-            address:"127.0.0.1:0", worker:"worker", pin:Some(&pin), bundle:&bundle,
-            directory:&directory, output:&output, mode:DeliveryMode::Execute, resume_from:None,
+            address: "127.0.0.1:0",
+            worker: "worker",
+            pin: Some(&pin),
+            bundle: &bundle,
+            directory: &directory,
+            output: &output,
+            mode: DeliveryMode::Execute,
+            resume_from: None,
         };
         let token = super::super::OperationCancellation::default();
         token.cancel();
         let mut on_listening = |_| panic!("cancelled operation cannot listen");
-        let error = build.execute_bound(&request, Some(TlsOperationControl {
-            cancellation:token, preview:None, on_listening:&mut on_listening,
-        })).unwrap_err();
+        let error = build
+            .execute_bound(
+                &request,
+                Some(TlsOperationControl {
+                    cancellation: token,
+                    preview: None,
+                    on_listening: &mut on_listening,
+                }),
+            )
+            .unwrap_err();
         assert!(error.detail.contains("cancelled before dispatch"));
         assert!(!error.execution_may_have_run);
         assert!(!directory.exists());
@@ -506,9 +551,14 @@ mod tests {
         rabsd::coord::source_delivery::prepare_source_bundle(&source, &spec, &bundle).unwrap();
         for (resume_from, output) in [(&bundle, root.join("out")), (&old, old.join("out"))] {
             let build = PreparedBuild {
-                address:"invalid-address", worker:"worker", pin:None,
-                bundle:&bundle, directory:&directory, output:&output,
-                mode:DeliveryMode::Resume, resume_from:Some(resume_from),
+                address: "invalid-address",
+                worker: "worker",
+                pin: None,
+                bundle: &bundle,
+                directory: &directory,
+                output: &output,
+                mode: DeliveryMode::Resume,
+                resume_from: Some(resume_from),
             };
             let error = build.execute().unwrap_err();
             assert!(error.execution_may_have_run);

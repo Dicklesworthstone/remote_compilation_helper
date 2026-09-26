@@ -1302,7 +1302,10 @@ mod tests {
             &b"HTTP/1.1 200 OK\n\n{\"status\":"[..],
             &b"HTTP/1.1 200 OK\n\n\xff"[..],
         ] {
-            assert!(!probe_test_response(response).await, "response: {response:?}");
+            assert!(
+                !probe_test_response(response).await,
+                "response: {response:?}"
+            );
         }
     }
 
@@ -1322,7 +1325,11 @@ mod tests {
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             loop {
-                if stream.write_all(b"X-Progress: still starting\n").await.is_err() {
+                if stream
+                    .write_all(b"X-Progress: still starting\n")
+                    .await
+                    .is_err()
+                {
                     break;
                 }
                 sleep(Duration::from_millis(10)).await;
@@ -1359,7 +1366,10 @@ mod tests {
             let (mut stream, _) = listener.accept().await.unwrap();
             let mut request = [0; 12];
             stream.read_exact(&mut request).await.unwrap();
-            stream.write_all(b"HTTP/1.1 200 OK\n\n{\"status\":\"healthy\"}").await.unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\n\n{\"status\":\"healthy\"}")
+                .await
+                .unwrap();
         });
         assert!(wait_for_socket(&socket, Duration::from_secs(2)).await);
         server.await.unwrap();
@@ -1371,7 +1381,11 @@ mod tests {
         let socket = dir.path().join("zero.sock");
         let listener = tokio::net::UnixListener::bind(&socket).unwrap();
         assert!(!wait_for_socket(&socket, Duration::ZERO).await);
-        assert!(timeout(Duration::from_millis(20), listener.accept()).await.is_err());
+        assert!(
+            timeout(Duration::from_millis(20), listener.accept())
+                .await
+                .is_err()
+        );
     }
 
     fn recovery_config() -> SelfHealingConfig {
@@ -1408,14 +1422,11 @@ mod tests {
         let lock = acquire_autostart_lock(&lock_path).unwrap();
         let body = std::fs::read(&lock_path).unwrap();
         let server = healthy_daemon_after(socket.clone(), Duration::from_millis(20));
-        let result = recover_daemon_with_paths(
-            &recovery_config(),
-            &socket,
-            &lock_path,
-            &cooldown,
-            |_| panic!("a lock follower must never spawn"),
-        )
-        .await;
+        let result =
+            recover_daemon_with_paths(&recovery_config(), &socket, &lock_path, &cooldown, |_| {
+                panic!("a lock follower must never spawn")
+            })
+            .await;
         server.abort();
         let _ = server.await;
         assert!(result.is_ok(), "{result:?}");
@@ -1466,14 +1477,11 @@ mod tests {
         write_cooldown_timestamp(&cooldown).unwrap();
         let original = std::fs::read(&cooldown).unwrap();
         let server = healthy_daemon_after(socket.clone(), Duration::from_millis(20));
-        let result = recover_daemon_with_paths(
-            &recovery_config(),
-            &socket,
-            &lock_path,
-            &cooldown,
-            |_| panic!("cooldown must prevent a second launch"),
-        )
-        .await;
+        let result =
+            recover_daemon_with_paths(&recovery_config(), &socket, &lock_path, &cooldown, |_| {
+                panic!("cooldown must prevent a second launch")
+            })
+            .await;
         server.abort();
         let _ = server.await;
         assert!(result.is_ok(), "{result:?}");
@@ -1492,13 +1500,9 @@ mod tests {
         let inode = std::fs::metadata(&socket).unwrap().ino();
         let result = timeout(
             Duration::from_millis(1500),
-            recover_daemon_with_paths(
-                &recovery_config(),
-                &socket,
-                &lock_path,
-                &cooldown,
-                |_| panic!("never replace a possible live daemon"),
-            ),
+            recover_daemon_with_paths(&recovery_config(), &socket, &lock_path, &cooldown, |_| {
+                panic!("never replace a possible live daemon")
+            }),
         )
         .await
         .expect("all probes must share the one-second recovery budget");
@@ -1519,14 +1523,11 @@ mod tests {
         drop(listener);
         let inode = std::fs::metadata(&socket).unwrap().ino();
         write_cooldown_timestamp(&cooldown).unwrap();
-        let result = recover_daemon_with_paths(
-            &recovery_config(),
-            &socket,
-            &lock_path,
-            &cooldown,
-            |_| panic!("cooldown must prevent launch"),
-        )
-        .await;
+        let result =
+            recover_daemon_with_paths(&recovery_config(), &socket, &lock_path, &cooldown, |_| {
+                panic!("cooldown must prevent launch")
+            })
+            .await;
         assert!(result.is_err());
         assert_eq!(std::fs::metadata(&socket).unwrap().ino(), inode);
         assert!(!lock_path.exists());
@@ -1586,17 +1587,12 @@ mod tests {
             + 3600;
         std::fs::write(&cooldown, future.to_string()).unwrap();
         let mut server = None;
-        let result = recover_daemon_with_paths(
-            &recovery_config(),
-            &socket,
-            &lock_path,
-            &cooldown,
-            |path| {
+        let result =
+            recover_daemon_with_paths(&recovery_config(), &socket, &lock_path, &cooldown, |path| {
                 server = Some(healthy_daemon_after(path.into(), Duration::ZERO));
                 Ok(())
-            },
-        )
-        .await;
+            })
+            .await;
         let server = server.expect("future cooldown must permit repair");
         server.abort();
         let _ = server.await;

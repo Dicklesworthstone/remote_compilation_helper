@@ -33,10 +33,13 @@ pub fn output_preview_reply(
     {
         return Err("output preview requires exactly kind and request_id".into());
     }
-    let id = request["request_id"].as_u64()
+    let id = request["request_id"]
+        .as_u64()
         .ok_or("output preview requires an unsigned request_id")?;
     match active {
-        Some(task) if task.request_id() != id => return Err("unknown-output-preview-request".into()),
+        Some(task) if task.request_id() != id => {
+            return Err("unknown-output-preview-request".into());
+        }
         None if last_admitted != Some(id) => return Err("unknown-output-preview-request".into()),
         _ => {}
     }
@@ -49,9 +52,11 @@ pub fn output_preview_reply(
             }))
         })
     }).collect();
-    Ok(json!({"kind":"output-preview", "version":OUTPUT_PREVIEW_VERSION,
+    Ok(
+        json!({"kind":"output-preview", "version":OUTPUT_PREVIEW_VERSION,
         "request_id":id, "active":active.is_some(), "segments":segments,
-        "complete":false, "publication_authorized":false}))
+        "complete":false, "publication_authorized":false}),
+    )
 }
 
 #[cfg(test)]
@@ -65,40 +70,62 @@ mod tests {
     use std::time::{Duration, Instant};
 
     fn result(id: u64) -> ExecResult {
-        ExecResult { request_id:id, exit_code:0, stdout_sha256:sha256_hex(b""),
-            stderr_sha256:sha256_hex(b""), executed:true, residual_group_members:0,
-            stdout_spill_bytes:0, stderr_spill_bytes:0, stdout_spill_path:None, stderr_spill_path:None }
+        ExecResult {
+            request_id: id,
+            exit_code: 0,
+            stdout_sha256: sha256_hex(b""),
+            stderr_sha256: sha256_hex(b""),
+            executed: true,
+            residual_group_members: 0,
+            stdout_spill_bytes: 0,
+            stderr_spill_bytes: 0,
+            stdout_spill_path: None,
+            stderr_spill_path: None,
+        }
     }
     fn finish(task: &mut ExecutionTask) -> Result<ExecutionCompletion, String> {
         let until = Instant::now() + Duration::from_secs(10);
         loop {
-            if let Poll::Ready(done) = task.poll_completion(&mut Context::from_waker(Waker::noop())) {
+            if let Poll::Ready(done) = task.poll_completion(&mut Context::from_waker(Waker::noop()))
+            {
                 return done;
             }
             assert!(Instant::now() < until, "execution completion deadline");
             std::thread::sleep(Duration::from_millis(1));
         }
     }
-    fn query(id: u64) -> Value { json!({"kind":"output-preview", "request_id":id}) }
+    fn query(id: u64) -> Value {
+        json!({"kind":"output-preview", "request_id":id})
+    }
     fn task() -> (ExecutionTask, ExecutionControl) {
         let (sender, receiver) = mpsc::channel();
         let task = ExecutionTask::spawn(7, Duration::from_secs(5), move |control| {
             sender.send(control.clone()).unwrap();
-            while control.reason().is_none() { std::thread::sleep(Duration::from_millis(1)); }
+            while control.reason().is_none() {
+                std::thread::sleep(Duration::from_millis(1));
+            }
             result(7)
-        }).unwrap();
+        })
+        .unwrap();
         (task, receiver.recv_timeout(Duration::from_secs(2)).unwrap())
     }
 
     #[test]
     fn preview_queries_bind_identity_before_consuming_and_preserve_binary_streams() {
         let (mut task, control) = task();
-        control.output_observer().record(PreviewStream::Stdout, 0, b"out\0\xff");
-        control.output_observer().record(PreviewStream::Stderr, 0, "雪".as_bytes());
-        for bad in [Value::Null, json!([]), query(8),
+        control
+            .output_observer()
+            .record(PreviewStream::Stdout, 0, b"out\0\xff");
+        control
+            .output_observer()
+            .record(PreviewStream::Stderr, 0, "雪".as_bytes());
+        for bad in [
+            Value::Null,
+            json!([]),
+            query(8),
             json!({"kind":"output-preview", "request_id":7, "path":"/private"}),
-            json!({"kind":"output-preview", "request_id":"7"})]
-        {
+            json!({"kind":"output-preview", "request_id":"7"}),
+        ] {
             assert!(output_preview_reply(&bad, Some(&task), Some(7)).is_err());
         }
         let reply = output_preview_reply(&query(7), Some(&task), Some(7)).unwrap();
@@ -110,7 +137,10 @@ mod tests {
         assert_eq!(reply["complete"], false);
         assert_eq!(reply["publication_authorized"], false);
         assert!(task.retained_result_digest().is_none());
-        assert_eq!(output_preview_reply(&query(7), Some(&task), Some(7)).unwrap()["segments"], json!([]));
+        assert_eq!(
+            output_preview_reply(&query(7), Some(&task), Some(7)).unwrap()["segments"],
+            json!([])
+        );
         task.cancel(StopReason::Cancelled);
         assert_eq!(finish(&mut task).unwrap().result.exit_code, 130);
     }
@@ -118,16 +148,26 @@ mod tests {
     #[test]
     fn slow_preview_reader_gets_a_bounded_tail_with_an_explicit_gap() {
         let (mut task, control) = task();
-        control.output_observer().record(PreviewStream::Stdout, 0, &vec![0xff; MAX_PREVIEW_BYTES * 8]);
+        control.output_observer().record(
+            PreviewStream::Stdout,
+            0,
+            &vec![0xff; MAX_PREVIEW_BYTES * 8],
+        );
         let reply = output_preview_reply(&query(7), Some(&task), Some(7)).unwrap();
         let segment = &reply["segments"][0];
-        assert_eq!(segment["data_hex"].as_str().unwrap().len(), 2 * MAX_PREVIEW_BYTES);
+        assert_eq!(
+            segment["data_hex"].as_str().unwrap().len(),
+            2 * MAX_PREVIEW_BYTES
+        );
         assert_eq!(segment["offset"], 7 * MAX_PREVIEW_BYTES);
         assert_eq!(segment["skipped_bytes"], 7 * MAX_PREVIEW_BYTES);
         assert_eq!(segment["observed_bytes"], 8 * MAX_PREVIEW_BYTES);
         assert!(serde_json::to_vec(&reply).unwrap().len() < 36 * 1024);
         task.cancel(StopReason::SessionLost);
-        assert_eq!(finish(&mut task).unwrap().stop_reason, Some(StopReason::SessionLost));
+        assert_eq!(
+            finish(&mut task).unwrap().stop_reason,
+            Some(StopReason::SessionLost)
+        );
     }
 
     #[test]
@@ -147,10 +187,17 @@ mod tests {
     fn observed_bytes_never_satisfy_missing_complete_output_capture() {
         let mut task = ExecutionTask::spawn(9, Duration::from_secs(5), |control| {
             control.request_output_capture();
-            control.output_observer().record(PreviewStream::Stdout, 0, b"not a transcript");
+            control
+                .output_observer()
+                .record(PreviewStream::Stdout, 0, b"not a transcript");
             result(9)
-        }).unwrap();
-        assert!(finish(&mut task).unwrap_err().contains("omitted requested output capture"));
+        })
+        .unwrap();
+        assert!(
+            finish(&mut task)
+                .unwrap_err()
+                .contains("omitted requested output capture")
+        );
         assert!(task.retained_result_digest().is_none());
     }
 
@@ -193,13 +240,19 @@ mod tests {
             for segment in reply["segments"].as_array().unwrap() {
                 assert_eq!(segment["skipped_bytes"], 0);
                 let bytes = segment["data_hex"].as_str().unwrap();
-                if segment["stream"] == "stdout" { stdout.push_str(bytes); }
-                else { stderr.push_str(bytes); }
+                if segment["stream"] == "stdout" {
+                    stdout.push_str(bytes);
+                } else {
+                    stderr.push_str(bytes);
+                }
             }
             assert!(Instant::now() < until, "live child produced no preview");
             std::thread::sleep(Duration::from_millis(1));
         }
-        assert!(task.poll_completion(&mut Context::from_waker(Waker::noop())).is_pending());
+        assert!(
+            task.poll_completion(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
         std::fs::write(root.path().join("continue"), b"go").unwrap();
         let mut done = finish(&mut task).unwrap();
         assert_eq!(done.result.exit_code, 0);

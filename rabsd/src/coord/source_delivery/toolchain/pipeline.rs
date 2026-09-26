@@ -42,7 +42,9 @@ impl ExpectedAck<'_> {
             Self::Chunk { .. } => ("toolchain-chunk-accepted", 5),
         };
         require(
-            reply.as_object().is_some_and(|object| object.len() == fields)
+            reply
+                .as_object()
+                .is_some_and(|object| object.len() == fields)
                 && reply["kind"] == kind
                 && reply["request_id"].as_u64() == Some(request_id)
                 && digest(&reply["sha256"])? == *identity
@@ -86,7 +88,9 @@ impl<'peer, 'paths, P: WorkerPeer + ?Sized> UploadWindow<'peer, 'paths, P> {
         // cannot reuse this window after a failed send, read or acknowledgment.
         self.failed = true;
         expected.check_request(frame, self.request_id, &self.identity)?;
-        let bytes = serde_json::to_vec(frame)?.len().checked_add(1)
+        let bytes = serde_json::to_vec(frame)?
+            .len()
+            .checked_add(1)
             .filter(|bytes| *bytes <= MAX_IN_FLIGHT_BYTES)
             .ok_or_else(|| invalid("toolchain control exceeds its byte window"))?;
         if self.pending_bytes > MAX_IN_FLIGHT_BYTES - bytes {

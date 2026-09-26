@@ -23,7 +23,11 @@ impl Fixture {
         let temporary = tempfile::tempdir().unwrap();
         let root = temporary.path().canonicalize().unwrap();
         let store = PreparedOperationStore::open(&root.join("operations")).unwrap();
-        Self { temporary, root, store }
+        Self {
+            temporary,
+            root,
+            store,
+        }
     }
 
     fn submit(&self, number: u64) -> PreparedOperationSpec {
@@ -105,10 +109,13 @@ fn status_reads_share_binary_tails_without_consuming_or_persisting_them() {
     let observer = claim.preview_observer().unwrap();
     let record_path = f.root.join("operations").join(format!("{}.json", spec.id));
     let before = fs::read(&record_path).unwrap();
-    assert!(observer.observe(true, &[
-        segment(PreviewStream::Stdout, 0, b"out\0\xff"),
-        segment(PreviewStream::Stderr, 0, "雪".as_bytes()),
-    ]));
+    assert!(observer.observe(
+        true,
+        &[
+            segment(PreviewStream::Stdout, 0, b"out\0\xff"),
+            segment(PreviewStream::Stderr, 0, "雪".as_bytes()),
+        ]
+    ));
     let first = f.status(&spec.id);
     assert_eq!(first, f.status(&spec.id));
     let diagnostics = &first["live_diagnostics"];
@@ -117,9 +124,12 @@ fn status_reads_share_binary_tails_without_consuming_or_persisting_them() {
     assert_eq!(diagnostics["operation_id"], first["id"]);
     assert_eq!(diagnostics["request_sha256"], first["request_sha256"]);
     assert_eq!(diagnostics["attempt"], first["attempt"]);
-    assert_eq!(*diagnostics, f.store.preview(
-        &spec.id, first["request_sha256"].as_str().unwrap(), 1, 0, 0,
-    ).unwrap());
+    assert_eq!(
+        *diagnostics,
+        f.store
+            .preview(&spec.id, first["request_sha256"].as_str().unwrap(), 1, 0, 0,)
+            .unwrap()
+    );
     assert_eq!(before, fs::read(record_path).unwrap());
     assert!(!spec.delivery.exists());
     assert!(!spec.output.exists());
@@ -132,10 +142,21 @@ fn status_bounds_each_stream_and_reports_the_same_gaps_as_follow() {
     let claim = f.store.claim_next().unwrap().unwrap();
     let observer = claim.preview_observer().unwrap();
     for (offset, byte) in [(0, 0xff), (MAX_PREVIEW_BYTES as u64, 0xfe)] {
-        assert!(observer.observe(true, &[
-            segment(PreviewStream::Stdout, offset, &vec![byte; MAX_PREVIEW_BYTES]),
-            segment(PreviewStream::Stderr, offset, &vec![byte; MAX_PREVIEW_BYTES]),
-        ]));
+        assert!(observer.observe(
+            true,
+            &[
+                segment(
+                    PreviewStream::Stdout,
+                    offset,
+                    &vec![byte; MAX_PREVIEW_BYTES]
+                ),
+                segment(
+                    PreviewStream::Stderr,
+                    offset,
+                    &vec![byte; MAX_PREVIEW_BYTES]
+                ),
+            ]
+        ));
     }
     let status = f.status(&spec.id);
     for row in status["live_diagnostics"]["segments"].as_array().unwrap() {
@@ -160,12 +181,18 @@ fn concurrent_job_status_is_fenced_by_operation_request_and_attempt() {
     let second = f.store.claim_next().unwrap().unwrap();
     assert_eq!(first.spec().id, a.id);
     assert_eq!(second.spec().id, b.id);
-    assert!(first.preview_observer().unwrap().observe(true, &[
-        segment(PreviewStream::Stdout, 0, b"a"),
-    ]));
-    assert!(second.preview_observer().unwrap().observe(true, &[
-        segment(PreviewStream::Stdout, 0, b"b"),
-    ]));
+    assert!(
+        first
+            .preview_observer()
+            .unwrap()
+            .observe(true, &[segment(PreviewStream::Stdout, 0, b"a"),])
+    );
+    assert!(
+        second
+            .preview_observer()
+            .unwrap()
+            .observe(true, &[segment(PreviewStream::Stdout, 0, b"b"),])
+    );
     let one = f.status(&a.id);
     let two = f.status(&b.id);
     assert_ne!(one["request_sha256"], two["request_sha256"]);
@@ -173,7 +200,10 @@ fn concurrent_job_status_is_fenced_by_operation_request_and_attempt() {
     assert_eq!(two["live_diagnostics"]["segments"][0]["data_hex"], "62");
     for status in [one, two] {
         assert_eq!(status["live_diagnostics"]["operation_id"], status["id"]);
-        assert_eq!(status["live_diagnostics"]["request_sha256"], status["request_sha256"]);
+        assert_eq!(
+            status["live_diagnostics"]["request_sha256"],
+            status["request_sha256"]
+        );
         assert_eq!(status["live_diagnostics"]["attempt"], status["attempt"]);
     }
 }
@@ -194,12 +224,17 @@ fn inactive_or_cancelling_previews_do_not_manufacture_a_terminal_outcome() {
     f.store.cancel(&spec.id).unwrap();
     let status = f.status(&spec.id);
     assert_eq!(status["state"], "cancelling");
-    assert_eq!(status["live_diagnostics"]["segments"][0]["data_hex"], "7461696c");
+    assert_eq!(
+        status["live_diagnostics"]["segments"][0]["data_hex"],
+        "7461696c"
+    );
     assert_eq!(status["outputs_installed"], false);
-    claim.finish(OperationOutcome::Failed {
-        detail: "fixture owner lost; no terminal result was verified".into(),
-        execution_may_have_run: true,
-    }).unwrap();
+    claim
+        .finish(OperationOutcome::Failed {
+            detail: "fixture owner lost; no terminal result was verified".into(),
+            execution_may_have_run: true,
+        })
+        .unwrap();
     let status = f.status(&spec.id);
     assert_eq!(status["state"], "uncertain");
     assert!(status.get("live_diagnostics").is_none());
@@ -216,14 +251,20 @@ fn dropped_claim_recovery_and_restart_cannot_reanimate_old_status_output() {
     assert!(f.status(&spec.id).get("live_diagnostics").is_some());
     drop(claim);
     assert!(f.status(&spec.id).get("live_diagnostics").is_none());
-    f.store.resume(&spec.id, f.root.join("resumed-delivery"), None).unwrap();
+    f.store
+        .resume(&spec.id, f.root.join("resumed-delivery"), None)
+        .unwrap();
     let resumed = f.store.claim_next().unwrap().unwrap();
     assert!(resumed.preview_observer().is_none());
     assert_eq!(f.status(&spec.id)["attempt"], 2);
     assert!(f.status(&spec.id).get("live_diagnostics").is_none());
     assert!(!observer.observe(true, &[segment(PreviewStream::Stdout, 3, b"late")]));
     drop(resumed);
-    let Fixture { temporary, root, store } = f;
+    let Fixture {
+        temporary,
+        root,
+        store,
+    } = f;
     drop(store);
     let reopened = PreparedOperationStore::open(&root.join("operations")).unwrap();
     let status = reopened.status(&spec.id).unwrap().unwrap();
