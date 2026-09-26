@@ -695,8 +695,8 @@ pub(super) fn dedupe_worker_ids(workers: Vec<WorkerId>) -> Vec<WorkerId> {
     deduped
 }
 
-/// Default-policy convenience shim (retained for test coverage).
-#[allow(dead_code)]
+/// Default-policy convenience shim. Used where only the project identity is
+/// needed (local-fallback incident records) and no topology policy is in scope.
 pub(crate) fn extract_project_name() -> String {
     extract_project_name_with_policy(&PathTopologyPolicy::default())
 }
