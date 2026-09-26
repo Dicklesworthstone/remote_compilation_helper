@@ -1081,10 +1081,27 @@ fn benchmark_ssh_command(
         .arg(format!("ConnectTimeout={}", timeout.as_secs().min(30)));
     cmd.arg("-i").arg(&identity_file);
     cmd.arg(format!("{}@{}", worker.user, worker.host));
-    let remote =
-        rch_common::ssh::remote_shell_command(worker, "~/.local/bin/rch-wkr benchmark --json");
+    let remote = rch_common::ssh::remote_shell_command(
+        worker,
+        &remote_benchmark_script(timeout.as_secs().max(1)),
+    );
     cmd.arg(remote.command);
     (cmd, remote.stdin_script)
+}
+
+/// The worker-side benchmark command, bounded on the worker itself.
+///
+/// On timeout the dispatcher kills its local `ssh`, but a non-interactive
+/// session delivers no hangup, so the remote `rch-wkr benchmark` (a release
+/// build) kept running as an orphan on an already saturated worker (hz3,
+/// 2026-09-26). The worker enforces the same deadline where `timeout` exists
+/// and falls back to the unbounded call elsewhere (e.g. macOS without coreutils).
+fn remote_benchmark_script(timeout_secs: u64) -> String {
+    format!(
+        "if command -v timeout >/dev/null 2>&1; then \
+exec timeout -k 10 {timeout_secs} ~/.local/bin/rch-wkr benchmark --json; \
+else exec ~/.local/bin/rch-wkr benchmark --json; fi"
+    )
 }
 
 async fn execute_benchmark_process(
@@ -1353,9 +1370,11 @@ mod tests {
             if os == "linux" {
                 assert_eq!(
                     argv.last().copied(),
-                    Some(std::ffi::OsStr::new(
-                        "~/.local/bin/rch-wkr benchmark --json"
-                    ))
+                    Some(std::ffi::OsStr::new(&remote_benchmark_script(300)))
+                );
+                assert!(
+                    remote_benchmark_script(300)
+                        .contains("timeout -k 10 300 ~/.local/bin/rch-wkr benchmark --json")
                 );
                 assert!(input.is_none());
             } else {
@@ -1414,6 +1433,37 @@ mod tests {
             assert!((score.network_score - 45.0).abs() < f64::EPSILON);
             assert!((score.compilation_score - 79.0).abs() < f64::EPSILON);
         }
+    }
+
+    /// A hung worker benchmark must die on the worker at the deadline even
+    /// when nothing on the dispatcher side kills it (dropped ssh session).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_remote_benchmark_script_enforces_deadline_on_worker() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::Instant;
+
+        let home = tempfile::tempdir().unwrap();
+        let bin = home.path().join(".local/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let worker_program = bin.join("rch-wkr");
+        std::fs::write(&worker_program, "#!/bin/sh\nexec sleep 60\n").unwrap();
+        std::fs::set_permissions(&worker_program, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let start = Instant::now();
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(remote_benchmark_script(1))
+            .env("HOME", home.path())
+            .stdin(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(!status.success());
+        assert!(
+            start.elapsed() < Duration::from_secs(15),
+            "worker-side deadline did not fire: {:?}",
+            start.elapsed()
+        );
     }
 
     #[cfg(unix)]
