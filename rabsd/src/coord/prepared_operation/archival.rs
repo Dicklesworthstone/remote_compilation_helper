@@ -63,8 +63,15 @@ pub(super) fn load_record(root: &Path, path: &Path) -> io::Result<Record> {
             && record.recovery_origin_attempt.is_none_or(|origin| {
                 origin > 0
                     && origin <= record.attempt
-                    && record.automatic_recoveries > 0
-                    && matches!(record.mode, StoredMode::Resume | StoredMode::Acknowledge)
+                    && match record.mode {
+                        StoredMode::Resume | StoredMode::Acknowledge => {
+                            record.automatic_recoveries > 0
+                        }
+                        // Local recovery is claimed directly, never queued;
+                        // its origin must precede this new filesystem owner.
+                        StoredMode::LocalRecovery => origin < record.attempt,
+                        StoredMode::Execute => false,
+                    }
             })
             && (!record.recovery_pending
                 || (record.automatic_recoveries > 0

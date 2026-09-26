@@ -190,8 +190,16 @@ fn followed_owner(status: &Value, attempt: u64) -> io::Result<u64> {
             .filter(|origin| {
                 *origin > 0
                     && *origin <= attempt
-                    && recoveries > 0
-                    && matches!(status["mode"].as_str(), Some("resume" | "acknowledge"))
+                    && match status["mode"].as_str() {
+                        Some("resume" | "acknowledge") => recoveries > 0,
+                        // A local repair adds no network retry and cannot
+                        // expose another compiler preview. It is already
+                        // claimed when the origin first becomes visible.
+                        Some("recover-local") => {
+                            !pending && status["state"] != "queued" && *origin < attempt
+                        }
+                        _ => false,
+                    }
             })
             .ok_or_else(|| invalid("invalid automatic recovery origin")),
         None => Err(invalid(
@@ -242,7 +250,10 @@ fn follow(
                     return Err(invalid("active job lacks a claimed attempt"));
                 }
                 if current_attempt != 0
-                    && !matches!(status["mode"].as_str(), Some("resume" | "acknowledge"))
+                    && !matches!(
+                        status["mode"].as_str(),
+                        Some("resume" | "acknowledge" | "recover-local")
+                    )
                 {
                     let preview = exchange(
                         &cursor.request(id, &digest, current_attempt),
@@ -684,6 +695,84 @@ mod tests {
             followed_owner(status, 2).is_err(),
             "recovery never becomes execution"
         );
+    }
+
+    #[test]
+    fn local_recovery_origin_is_earlier_claimed_and_independent_of_network_retry_count() {
+        let mut reply = status("running", 2);
+        let state = &mut reply["operation"];
+        state["mode"] = json!("recover-local");
+        state["automatic_recoveries"] = json!(0);
+        state["recovery_pending"] = json!(false);
+        state["recovery_origin_attempt"] = json!(1);
+        assert_eq!(followed_owner(state, 2).unwrap(), 1);
+        for origin in [0, 2, 3] {
+            state["recovery_origin_attempt"] = json!(origin);
+            assert!(followed_owner(state, 2).is_err());
+        }
+        state["recovery_origin_attempt"] = json!(1);
+        state["mode"] = json!("resume");
+        assert!(followed_owner(state, 2).is_err(), "network retry still requires its counter");
+        state["mode"] = json!("recover-local");
+        state["state"] = json!("queued");
+        assert!(followed_owner(state, 2).is_err(), "local repair is never a queued execution");
+        state["state"] = json!("running");
+        state["recovery_pending"] = json!(true);
+        assert!(followed_owner(state, 2).is_err());
+        state["recovery_pending"] = json!(false);
+        state["recovery_origin_attempt"] = Value::Null;
+        assert_eq!(followed_owner(state, 2).unwrap(), 2, "manual recovery is a new owner");
+    }
+
+    #[test]
+    fn follow_keeps_one_preview_then_accepts_a_verified_local_recovery_completion() {
+        use rabsd::coord::prepared_operation::DiagnosticStream;
+        let local = |state| {
+            let mut value = status(state, 2);
+            value["operation"]["mode"] = json!("recover-local");
+            value["operation"]["automatic_recoveries"] = json!(0);
+            value["operation"]["recovery_pending"] = json!(false);
+            value["operation"]["recovery_origin_attempt"] = json!(1);
+            value
+        };
+        let proof = PreparedCompletion {
+            version: 1, operation_id: ID.into(), request_sha256: "ab".repeat(32),
+            delivery_request_sha256: "cd".repeat(32), receipt_sha256: "ef".repeat(32),
+            request_id: 7, worker: "worker".into(), worker_spki_sha256: "01".repeat(32),
+            delivery: "/delivery".into(), exit_code: 1, stop_reason: None,
+            outputs_installed: false,
+            stdout: DiagnosticStream { bytes: 2, sha256: "00".repeat(32) },
+            stderr: DiagnosticStream { bytes: 0, sha256: "00".repeat(32) },
+        };
+        let mut replies = std::collections::VecDeque::from([
+            status("running", 1),
+            preview(json!([segment("stdout", 0, "00ff", 0, 2)])),
+            local("running"),
+            local("completed"),
+            json!({"kind":"prepared-completion", "operation_id":ID,
+                "completion":proof, "publication_authorized":false, "reexecute":false}),
+        ]);
+        let mut queries = Vec::new();
+        let mut events = Vec::new();
+        let result = follow(
+            ID, Instant::now() + Duration::from_secs(2),
+            |query, _| {
+                queries.push(query["kind"].as_str().unwrap().to_owned());
+                Ok(replies.pop_front().unwrap())
+            },
+            |_| {},
+            |event| { events.push(event.clone()); Ok(()) },
+        ).unwrap();
+        let Completion::Ready { status: observed, proof: actual } = result else {
+            panic!("lost the original compiler outcome")
+        };
+        assert!(replies.is_empty());
+        assert_eq!(events.len(), 1, "local recovery cannot replay compiler previews");
+        assert_eq!(queries, vec!["prepared-status", "prepared-preview", "prepared-status",
+            "prepared-status", "prepared-completion"]);
+        assert_eq!(actual, proof);
+        assert_eq!(observed["attempt"], 2);
+        final_status(&observed, &local("completed"), ID, Some(&actual)).unwrap();
     }
 
     #[test]

@@ -32,7 +32,7 @@ impl PreparedOperationStore {
     /// A rejected delivery returns its persisted Uncertain status, not an error
     /// that would stop unrelated jobs. Store/ownership failures still propagate.
     pub fn recover_next_local(self: &Arc<Self>) -> io::Result<Option<OperationStatus>> {
-        let (claim, acceptance_confirmed) = {
+        let (mut claim, acceptance_confirmed) = {
             let mut state = self.lock_state()?;
             if !state.accepting || state.active.len() >= MAX_RUNNING {
                 return Ok(None);
@@ -45,14 +45,19 @@ impl PreparedOperationStore {
                         && record.mode != StoredMode::LocalRecovery
                         && !state.active.contains_key(&record.spec.id)
                         && local_paths_available(&state, record, &record.delivery)
+                        && record.prior_deliveries.iter().all(|delivery| {
+                            local_paths_available(&state, record, delivery)
+                        })
                 })
                 .min_by_key(|record| record.order)
                 .cloned();
             let Some(record) = next else { return Ok(None); };
             let delivery = record.delivery.clone();
-            self.claim_local_record(&mut state, record, delivery)?
+            self.claim_local_record(&mut state, record, delivery, true)?
         };
-        let outcome = match local_result(&claim, acceptance_confirmed) {
+        let result = select_retained_delivery(&mut claim, acceptance_confirmed)
+            .and_then(|accepted| local_result(&claim, accepted));
+        let outcome = match result {
             Ok(result) => OperationOutcome::Completed { result },
             Err(error) => OperationOutcome::Failed {
                 detail: format!("automatic local recovery: {error}; explicit recovery required"),
@@ -93,13 +98,14 @@ impl PreparedOperationStore {
         let mut state = self.lock_state()?;
         let record = self.read_record(&state, id)?
             .ok_or_else(|| invalid("unknown prepared operation"))?;
-        self.claim_local_record(&mut state, record, delivery)
+        self.claim_local_record(&mut state, record, delivery, false)
     }
 
     /// The caller holds the ownership lock from selection through persistence.
     /// Both explicit and automatic recovery use the identical claim boundary.
     fn claim_local_record(
         self: &Arc<Self>, state: &mut State, mut record: Record, delivery: PathBuf,
+        automatic: bool,
     ) -> io::Result<(OperationClaim, bool)> {
         let id = record.spec.id.clone();
         require(state.accepting, "prepared operation service is stopping")?;
@@ -127,11 +133,16 @@ impl PreparedOperationStore {
             record.prior_deliveries.push(record.delivery.clone());
             record.delivery = delivery;
         }
+        // Offline recovery is a new owner of the SAME execution's result.
+        // Preserve a preceding automatic network recovery's origin as well.
+        // Explicit manual recovery deliberately starts a separate follow owner.
+        let origin = automatic.then(|| record.recovery_origin_attempt.unwrap_or(record.attempt));
         record.attempt = record.attempt.checked_add(1)
             .ok_or_else(|| invalid("operation attempts exhausted"))?;
         record.state = OperationState::Running;
         record.mode = StoredMode::LocalRecovery;
-        record.recovery_origin_attempt = None;
+        record.recovery_origin_attempt = origin;
+        record.recovery_pending = false;
         record.resume_from = None;
         record.listen_address = None;
         record.cancel_requested = false;
@@ -150,6 +161,59 @@ impl PreparedOperationStore {
             preview: None,
         }, acceptance_confirmed))
     }
+}
+
+/// Find only a receipt in an ALREADY OWNED directory, newest first. Missing
+/// receipts are incomplete transfers; a present but invalid receipt is not a
+/// reason to silently try an older result. The real verifier still checks the
+/// complete selected delivery before installation. This scan is bounded by
+/// the journal's sixteen prior-delivery limit and never visits the bundle.
+fn select_retained_delivery(
+    claim: &mut OperationClaim, acceptance_confirmed: bool,
+) -> io::Result<bool> {
+    let candidates = {
+        let state = claim.store.lock_state()?;
+        let record = claim.current(&state)?;
+        std::iter::once(record.delivery.clone())
+            .chain(record.prior_deliveries.iter().rev().cloned())
+            .collect::<Vec<_>>()
+    };
+    for candidate in candidates {
+        checkpoint(claim)?;
+        match ordinary_directory(&candidate, true) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        }
+        match std::fs::symlink_metadata(candidate.join("delivery.json")) {
+            Ok(metadata) => require(metadata.is_file(), "owned delivery receipt is not an ordinary file")?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        }
+        if candidate == claim.spec.delivery {
+            return Ok(acceptance_confirmed);
+        }
+        {
+            let mut state = claim.store.lock_state()?;
+            let mut record = claim.current(&state)?;
+            checkpoint(claim)?;
+            require(record.mode == StoredMode::LocalRecovery
+                && record.prior_deliveries.contains(&candidate),
+                "selected delivery is not owned by this local recovery")?;
+            require(local_paths_available(&state, &record, &candidate),
+                "selected local delivery overlaps an active operation")?;
+            record.prior_deliveries.retain(|path| path != &candidate);
+            record.prior_deliveries.push(record.delivery.clone());
+            record.delivery = candidate.clone();
+            // The current directory's acceptance is never evidence about a
+            // previous directory. Persist selection before any artifact write.
+            record.acknowledgments_confirmed = None;
+            claim.store.replace(&mut state, record)?;
+        }
+        claim.spec.delivery = candidate;
+        return Ok(false);
+    }
+    Err(invalid("no complete receipt in owned local deliveries; explicit recovery required"))
 }
 
 fn local_paths_available(state: &State, record: &Record, delivery: &Path) -> bool {
@@ -542,5 +606,182 @@ mod tests {
         assert!(store.recover_next_local().unwrap().is_none());
         assert!(store.claim_next().unwrap().is_none());
         assert!(!fixture.spec.output.exists());
+    }
+
+    #[test]
+    fn older_owned_delivery_is_recovered_after_an_incomplete_manual_resume() {
+        for partial in [false, true] {
+            let fixture = Fixture::new();
+            fixture.strand(0, None);
+            let latest = fixture.root.join("interrupted-resume");
+            fixture.store.resume(ID, latest.clone(), None).unwrap();
+            drop(fixture.store.claim_next().unwrap().unwrap());
+            if partial {
+                fs::create_dir(&latest).unwrap();
+                fs::write(latest.join("partial-download"), b"keep prefix").unwrap();
+            }
+            let receipt = fs::read(fixture.spec.delivery.join("delivery.json")).unwrap();
+            fs::rename(&fixture.spec.bundle, fixture.root.join("retired-bundle")).unwrap();
+            let status = fixture.store.recover_next_local().unwrap().unwrap();
+            assert!(status.succeeded);
+            assert_eq!(status.delivery, fixture.spec.delivery);
+            assert_eq!(status.attempt, 3);
+            assert_eq!(status.recovery_origin_attempt, Some(2));
+            assert_eq!(status.automatic_recoveries, 0);
+            assert_eq!(status.acknowledgments_confirmed, Some(false));
+            assert_eq!(fs::read(fixture.spec.output.join("app")).unwrap(), ARTIFACT);
+            assert_eq!(fs::read(fixture.spec.delivery.join("delivery.json")).unwrap(), receipt);
+            if partial {
+                assert_eq!(fs::read(latest.join("partial-download")).unwrap(), b"keep prefix");
+            } else {
+                assert!(!latest.exists());
+            }
+            let state = fixture.store.lock_state().unwrap();
+            assert_eq!(state.records[ID].prior_deliveries, vec![latest]);
+            drop(state);
+            drop(fixture.store);
+            let reopened = PreparedOperationStore::open(&fixture.root.join("state")).unwrap();
+            let status = reopened.status(ID).unwrap().unwrap();
+            assert!(status.succeeded);
+            assert_eq!(status.recovery_origin_attempt, Some(2));
+            assert!(reopened.recover_next_local().unwrap().is_none());
+            assert!(reopened.claim_next().unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn local_recovery_retains_the_original_network_recovery_lineage() {
+        let fixture = Fixture::new();
+        let claim = fixture.store.claim_next().unwrap().unwrap();
+        claim.listening("127.0.0.1:7001".parse().unwrap()).unwrap();
+        receive_execution(&mut peer(0, None), &fixture.request, "worker", &fixture.spec.delivery).unwrap();
+        let queued = claim.finish(OperationOutcome::TransportInterrupted {
+            detail: "scripted socket interruption after retained bytes".into(),
+            execution_may_have_run: true,
+        }).unwrap();
+        assert!(queued.recovery_pending);
+        assert_eq!(queued.recovery_origin_attempt, Some(1));
+        let retry = fixture.store.claim_next_at(Instant::now() + Duration::from_secs(10)).unwrap().unwrap();
+        assert_eq!(retry.mode(), crate::coord::worker_delivery::DeliveryMode::Resume);
+        drop(retry);
+        let status = fixture.store.recover_next_local().unwrap().unwrap();
+        assert!(status.succeeded);
+        assert_eq!(status.attempt, 3);
+        assert_eq!(status.recovery_origin_attempt, Some(1));
+        assert_eq!(status.automatic_recoveries, 1);
+        assert!(!status.recovery_pending);
+        assert_eq!(status.delivery, fixture.spec.delivery);
+        assert_eq!(status.acknowledgments_confirmed, Some(false));
+        drop(fixture.store);
+        let reopened = PreparedOperationStore::open(&fixture.root.join("state")).unwrap();
+        assert_eq!(reopened.status(ID).unwrap().unwrap().recovery_origin_attempt, Some(1));
+        assert!(reopened.recover_next_local().unwrap().is_none());
+    }
+
+    #[test]
+    fn a_present_invalid_latest_receipt_is_not_hidden_by_an_older_valid_delivery() {
+        for case in 0..3 {
+            let fixture = Fixture::new();
+            fixture.strand(0, None);
+            let latest = fixture.root.join("bad-resume");
+            fixture.store.resume(ID, latest.clone(), None).unwrap();
+            drop(fixture.store.claim_next().unwrap().unwrap());
+            if case == 2 {
+                std::os::unix::fs::symlink(&fixture.spec.delivery, &latest).unwrap();
+            } else {
+                fs::create_dir(&latest).unwrap();
+                if case == 0 {
+                    fs::write(latest.join("delivery.json"), b"{}").unwrap();
+                } else {
+                    std::os::unix::fs::symlink(
+                        fixture.spec.delivery.join("delivery.json"), latest.join("delivery.json"),
+                    ).unwrap();
+                }
+            }
+            let status = fixture.store.recover_next_local().unwrap().unwrap();
+            assert_eq!(status.state, OperationState::Uncertain, "case {case}");
+            assert_eq!(status.delivery, latest);
+            assert!(!fixture.spec.output.exists());
+            assert_eq!(fs::read(fixture.spec.delivery.join("artifacts/app")).unwrap(), ARTIFACT);
+            assert!(fixture.store.recover_next_local().unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn prior_delivery_selection_is_durable_before_any_output_write() {
+        let fixture = Fixture::new();
+        fixture.strand(0, None);
+        let latest = fixture.root.join("missing-resume");
+        fixture.store.resume(ID, latest.clone(), None).unwrap();
+        drop(fixture.store.claim_next().unwrap().unwrap());
+        let (mut claim, accepted) = fixture.store.claim_local(ID, latest).unwrap();
+        fixture.store.fail_after_rename.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(select_retained_delivery(&mut claim, accepted).is_err());
+        assert!(!fixture.spec.output.exists());
+        drop(claim);
+        drop(fixture.store);
+        let reopened = PreparedOperationStore::open(&fixture.root.join("state")).unwrap();
+        let status = reopened.status(ID).unwrap().unwrap();
+        assert_eq!(status.state, OperationState::Uncertain);
+        assert_eq!(status.delivery, fixture.spec.delivery);
+        assert_eq!(status.acknowledgments_confirmed, None);
+        assert!(reopened.recover_next_local().unwrap().is_none());
+        assert!(reopened.claim_next().unwrap().is_none());
+        assert!(reopened.recover_local(ID, fixture.spec.delivery).unwrap().succeeded);
+    }
+
+    #[test]
+    fn cancellation_prevents_selecting_and_installing_an_earlier_delivery() {
+        let fixture = Fixture::new();
+        fixture.strand(0, None);
+        let latest = fixture.root.join("cancelled-resume");
+        fixture.store.resume(ID, latest.clone(), None).unwrap();
+        drop(fixture.store.claim_next().unwrap().unwrap());
+        let (mut claim, accepted) = fixture.store.claim_local(ID, latest.clone()).unwrap();
+        fixture.store.cancel(ID).unwrap();
+        assert_eq!(select_retained_delivery(&mut claim, accepted).unwrap_err().kind(), io::ErrorKind::Interrupted);
+        assert_eq!(fixture.store.status(ID).unwrap().unwrap().delivery, latest);
+        assert!(!fixture.spec.output.exists());
+        drop(claim);
+        assert!(fixture.store.recover_next_local().unwrap().is_none());
+    }
+
+    #[test]
+    fn manual_recovery_starts_a_new_follow_owner_without_inventing_network_retries() {
+        let fixture = Fixture::new();
+        fixture.strand(0, None);
+        let automatic = fixture.store.recover_next_local().unwrap().unwrap();
+        assert_eq!(automatic.recovery_origin_attempt, Some(1));
+        assert_eq!(automatic.automatic_recoveries, 0);
+        let manual = fixture.store.recover_local(ID, fixture.spec.delivery.clone()).unwrap();
+        assert!(manual.succeeded);
+        assert_eq!(manual.attempt, 3);
+        assert_eq!(manual.recovery_origin_attempt, None);
+        assert_eq!(manual.automatic_recoveries, 0);
+        drop(fixture.store);
+        let reopened = PreparedOperationStore::open(&fixture.root.join("state")).unwrap();
+        assert_eq!(reopened.status(ID).unwrap().unwrap().recovery_origin_attempt, None);
+    }
+
+    #[test]
+    fn persisted_local_origins_cannot_name_themselves_future_claims_or_queued_execution() {
+        for (field, value) in [
+            ("recovery_origin_attempt", json!(0)),
+            ("recovery_origin_attempt", json!(2)),
+            ("recovery_origin_attempt", json!(3)),
+            ("state", json!("queued")),
+            ("mode", json!("execute")),
+            ("recovery_pending", json!(true)),
+        ] {
+            let fixture = Fixture::new();
+            fixture.strand(0, None);
+            assert!(fixture.store.recover_next_local().unwrap().unwrap().succeeded);
+            let path = fixture.root.join(format!("state/{ID}.json"));
+            drop(fixture.store);
+            let mut record: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            record[field] = value;
+            fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+            assert!(PreparedOperationStore::open(&fixture.root.join("state")).is_err(), "{field}");
+        }
     }
 }
