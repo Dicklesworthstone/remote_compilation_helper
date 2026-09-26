@@ -81,7 +81,7 @@ pub fn materialization_step(cas_mtime_ns: u128, floor_ns: u128) -> Materializati
 
 /// The derivation contract version (bumped on any semantic change to
 /// parsing/escaping/rendering below).
-pub const DEP_INFO_DERIVATION_CONTRACT: u32 = 1;
+pub const DEP_INFO_DERIVATION_CONTRACT: u32 = 2;
 
 /// One parsed dep-info line.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -244,24 +244,133 @@ fn sha256_bytes(bytes: &[u8]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
-/// Replace canonical prefixes in one raw token (byte-level, so non-UTF8
-/// path bytes survive untouched around the replaced prefix).
-fn rewrite_token(token: &[u8], entries: &[(Vec<u8>, Vec<u8>)]) -> Vec<u8> {
-    for (canonical, worktree) in entries {
-        if token.starts_with(canonical.as_slice()) {
-            let mut out = worktree.clone();
-            out.extend_from_slice(&token[canonical.len()..]);
-            return out;
+/// Borrowed translation plan shared by the allocation bound and the renderer.
+/// `.` names the compiler's working directory, supplied by the subscriber;
+/// it is NOT inferred from the daemon's cwd, output root or first mapping.
+struct TokenTranslation<'a> {
+    prefix: &'a [u8],
+    separator: bool,
+    suffix: &'a [u8],
+}
+
+impl TokenTranslation<'_> {
+    fn bytes(&self) -> impl Iterator<Item = u8> + '_ {
+        self.prefix
+            .iter()
+            .copied()
+            .chain(self.separator.then_some(b'/'))
+            .chain(self.suffix.iter().copied())
+    }
+}
+
+fn token_translation<'a>(
+    token: &'a [u8],
+    entries: &'a [(Vec<u8>, Vec<u8>)],
+) -> Result<TokenTranslation<'a>, UnsupportedDepInfo> {
+    if !token.starts_with(b"/") {
+        let mut cwd = None;
+        for (_, destination) in entries.iter().filter(|(source, _)| source.as_slice() == b".") {
+            let directory = destination.strip_suffix(b"/").unwrap_or(destination);
+            if let Some(prior) = cwd
+                && prior != directory
+            {
+                return Err(UnsupportedDepInfo {
+                    reason: "conflicting subscriber working directories".into(),
+                });
+            }
+            cwd = Some(directory);
+        }
+        if let Some(cwd) = cwd {
+            let relative = token.strip_prefix(b"./").unwrap_or(token);
+            if !cwd.starts_with(b"/")
+                || cwd.len() < 2
+                || cwd[1..]
+                    .split(|byte| *byte == b'/')
+                    .any(|part| part.is_empty() || part == b"." || part == b"..")
+                || cwd.iter().any(|byte| matches!(byte, 0 | b'\n' | b'\r' | b'\t' | b':'))
+                || relative
+                    .split(|byte| *byte == b'/')
+                    .any(|part| part.is_empty() || part == b"." || part == b"..")
+                || relative.iter().any(|byte| matches!(byte, 0 | b'\n' | b'\r' | b'\t'))
+            {
+                return Err(UnsupportedDepInfo {
+                    reason: "relative dep-info path needs an absolute, unambiguous working directory and a traversal-free suffix".into(),
+                });
+            }
+            return Ok(TokenTranslation {
+                prefix: cwd,
+                separator: true,
+                suffix: relative,
+            });
         }
     }
-    token.to_vec()
+
+    // A directory mapping must not accidentally match its sibling. Prefer
+    // the longest component-boundary match even for direct API callers.
+    let mut selected: Option<(&[u8], &[u8])> = None;
+    for (source, destination) in entries {
+        if source.is_empty() || source.as_slice() == b"." || !token.starts_with(source) {
+            continue;
+        }
+        if source.last() != Some(&b'/')
+            && token.len() != source.len()
+            && token.get(source.len()) != Some(&b'/')
+        {
+            continue;
+        }
+        match selected {
+            Some((prior, value))
+                if prior == source.as_slice() && value != destination.as_slice() =>
+            {
+                return Err(UnsupportedDepInfo {
+                    reason: "conflicting dep-info directory mappings".into(),
+                });
+            }
+            Some((prior, _)) if prior.len() >= source.len() => {}
+            _ => selected = Some((source, destination)),
+        }
+    }
+    Ok(match selected {
+        Some((source, destination)) => TokenTranslation {
+            prefix: destination,
+            separator: false,
+            suffix: &token[source.len()..],
+        },
+        None => TokenTranslation {
+            prefix: &[],
+            separator: false,
+            suffix: token,
+        },
+    })
+}
+
+/// Exact escaped size without allocating the translated path. The live
+/// materializer uses this BEFORE accepting a potentially expanding mapping.
+pub(crate) fn rewritten_dep_info_token_len(
+    token: &[u8],
+    entries: &[(Vec<u8>, Vec<u8>)],
+) -> Result<usize, UnsupportedDepInfo> {
+    Ok(token_translation(token, entries)?
+        .bytes()
+        .map(|byte| if matches!(byte, b' ' | b'\\' | b'#') { 2 } else { 1 })
+        .fold(0_usize, usize::saturating_add))
+}
+
+fn rewrite_token(
+    token: &[u8],
+    entries: &[(Vec<u8>, Vec<u8>)],
+) -> Result<Vec<u8>, UnsupportedDepInfo> {
+    Ok(token_translation(token, entries)?.bytes().collect())
 }
 
 /// Derive the subscriber-specific dep-info from canonical bytes under
 /// the versioned contract. Structure-aware (parses, rewrites path
 /// tokens, re-renders with exact escaping) — and BYPASSES on anything
 /// unprovable: unsupported format, or a canonical marker surviving in
-/// any token after rewrite.
+/// any token after rewrite. An optional `(".", absolute_subscriber_cwd)`
+/// entry resolves relative rule targets, inputs and phony targets under that
+/// explicit working directory. No entry means no implicit cwd substitution.
+/// Parent traversal is refused rather than normalized through possible links.
 pub fn derive_subscriber_dep_info(
     canonical: &[u8],
     entries: &[(Vec<u8>, Vec<u8>)],
@@ -284,12 +393,12 @@ pub fn derive_subscriber_dep_info(
     for line in &parsed.lines {
         derived.lines.push(match line {
             DepInfoLine::Rule { target, deps } => {
-                let target = rewrite_token(target, entries);
+                let target = rewrite_token(target, entries)?;
                 check(&target)?;
                 let deps = deps
                     .iter()
                     .map(|dep| {
-                        let rewritten = rewrite_token(dep, entries);
+                        let rewritten = rewrite_token(dep, entries)?;
                         check(&rewritten)?;
                         Ok(rewritten)
                     })
@@ -496,5 +605,101 @@ mod tests {
             MaterializationStep::HardlinkSharedInode
             | MaterializationStep::WriteNewInodeAt { .. } => {}
         }
+    }
+
+    #[test]
+    fn relative_paths_use_only_the_explicit_subscriber_working_directory() {
+        let canonical = b"target/unit.rmeta: ./src/with\\ space-\xff.rs\n\n./src/with\\ space-\xff.rs:\n# env-dep:NAME=unchanged\n";
+        for directory in [&b"/first tree#"[..], &b"/second-\xfe/"[..]] {
+            let entries = vec![(b".".to_vec(), directory.to_vec())];
+            let derived = derive_subscriber_dep_info(canonical, &entries).unwrap();
+            let prefix = directory.strip_suffix(b"/").unwrap_or(directory);
+            let mut output = prefix.to_vec();
+            output.extend_from_slice(b"/target/unit.rmeta");
+            let mut source = prefix.to_vec();
+            source.extend_from_slice(b"/src/with space-\xff.rs");
+            assert_eq!(
+                parse_dep_info(&derived.bytes).unwrap().lines,
+                vec![
+                    DepInfoLine::Rule { target: output, deps: vec![source.clone()] },
+                    DepInfoLine::Blank,
+                    DepInfoLine::Rule { target: source, deps: vec![] },
+                    DepInfoLine::Comment(b"# env-dep:NAME=unchanged".to_vec()),
+                ],
+            );
+            assert_eq!(derived.derivation.canonical_sha256, sha256_bytes(canonical));
+            assert_eq!(derived.derivation.derived_sha256, sha256_bytes(&derived.bytes));
+            assert_eq!(derived.derivation.contract, 2);
+        }
+    }
+
+    #[test]
+    fn no_working_directory_is_inferred_from_an_absolute_directory_mapping() {
+        let canonical = b"target/unit.rmeta: src/lib.rs\n";
+        let derived = derive_subscriber_dep_info(
+            canonical,
+            &[(b"/__rabs/workspace".to_vec(), b"/not-an-implicit-cwd".to_vec())],
+        ).unwrap();
+        // The live materializer still refuses these unresolved relative inputs.
+        assert_eq!(derived.bytes, canonical);
+    }
+
+    #[test]
+    fn working_directory_never_normalizes_parent_traversal_or_ambiguous_suffixes() {
+        let entries = vec![(b".".to_vec(), b"/subscriber/worktree/".to_vec())];
+        for token in [
+            &b"../outside"[..], b"src/../outside", b"./../outside", b"src//lib.rs",
+            b"src/./lib.rs", b"./", b".", b"", b"src/nul\0.rs", b"src/tab\t.rs",
+        ] {
+            assert!(rewrite_token(token, &entries).is_err(), "{token:?}");
+            assert!(rewritten_dep_info_token_len(token, &entries).is_err(), "{token:?}");
+        }
+    }
+
+    #[test]
+    fn invalid_or_conflicting_working_directories_are_typed_refusals() {
+        for directory in [
+            &b"relative"[..], b"/", b"//tree", b"/tree/../other", b"/tree/./other",
+            b"/tree//other", b"/tree\0other", b"/tree\nother", b"/tree:other",
+        ] {
+            let entries = vec![(b".".to_vec(), directory.to_vec())];
+            assert!(rewrite_token(b"src/lib.rs", &entries).is_err(), "{directory:?}");
+        }
+        let conflicting = vec![
+            (b".".to_vec(), b"/first".to_vec()),
+            (b".".to_vec(), b"/second".to_vec()),
+        ];
+        assert!(rewrite_token(b"src/lib.rs", &conflicting).is_err());
+    }
+
+    #[test]
+    fn working_directory_does_not_capture_absolute_or_unmapped_canonical_paths() {
+        let entries = vec![(b".".to_vec(), b"/subscriber".to_vec())];
+        assert_eq!(rewrite_token(b"/system/lib.rs", &entries).unwrap(), b"/system/lib.rs");
+        assert!(derive_subscriber_dep_info(
+            b"target/unit: /__rabs/unmapped/lib.rs\n", &entries,
+        ).is_err());
+    }
+
+    #[test]
+    fn translated_size_counts_the_actual_byte_escaping_and_inserted_separator() {
+        let entries = vec![(b".".to_vec(), b"/subscriber with#back\\slash-\xff".to_vec())];
+        for token in [&b"src/space name.rs"[..], b"./target/unit", b"src/\xfe.rs"] {
+            let rewritten = rewrite_token(token, &entries).unwrap();
+            assert_eq!(
+                rewritten_dep_info_token_len(token, &entries).unwrap(),
+                escape_token(&rewritten).len(),
+            );
+        }
+    }
+
+    #[test]
+    fn direct_derivation_uses_longest_component_boundary_not_first_byte_prefix() {
+        let entries = vec![
+            (b"/__rabs/workspace".to_vec(), b"/subscriber".to_vec()),
+            (b"/__rabs/workspace/vendor".to_vec(), b"/vendor".to_vec()),
+        ];
+        assert_eq!(rewrite_token(b"/__rabs/workspace/vendor/lib.rs", &entries).unwrap(), b"/vendor/lib.rs");
+        assert!(derive_subscriber_dep_info(b"/__rabs/workspace-other/unit:\n", &entries).is_err());
     }
 }

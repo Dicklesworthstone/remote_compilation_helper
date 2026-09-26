@@ -293,7 +293,7 @@ fn execution_lease_selection(
         return Err("execution lease session does not match admission".to_owned());
     }
     let mut request_sha256 = [0_u8; 32];
-    for (byte, digits) in request_sha256.iter_mut().zip(lower_hex("request_sha256", 64)?.as_bytes().chunks_exact(2)) {
+    for (byte, digits) in request_sha256.iter_mut().zip(lower_hex("request_sha256", 64)?.as_bytes().as_chunks::<2>().0) {
         let digits = std::str::from_utf8(digits).map_err(|_| "invalid request digest")?;
         *byte = u8::from_str_radix(digits, 16).map_err(|_| "invalid request digest")?;
     }

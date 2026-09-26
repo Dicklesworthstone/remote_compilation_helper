@@ -34,7 +34,7 @@ fn fields(value: &Value, names: &[&str]) -> Result<(), String> {
 
 fn decode_hex(value: &Value, maximum: usize) -> Result<Vec<u8>, String> {
     let text = value.as_str().ok_or("toolchain hex must be a string")?;
-    if text.len() % 2 != 0
+    if !text.len().is_multiple_of(2)
         || text.len() / 2 > maximum
         || !text
             .bytes()
@@ -43,7 +43,9 @@ fn decode_hex(value: &Value, maximum: usize) -> Result<Vec<u8>, String> {
         return Err("invalid bounded toolchain hex".to_owned());
     }
     text.as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| {
             let digit = |byte: u8| {
                 if byte <= b'9' {

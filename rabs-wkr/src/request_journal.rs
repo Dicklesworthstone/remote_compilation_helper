@@ -84,12 +84,11 @@ fn validate_state(state: &Value, worker: &str, coordinator: &str) -> io::Result<
     {
         return Err(invalid("invalid durable admission or terminal receipt"));
     }
-    if let Some(digest) = last["receipt"].get("retained_result_sha256") {
-        if !hex_string(digest, 64) || last["resolved"] != true
-            || last["receipt"]["retained_result_released"].as_bool().is_none()
-        {
-            return Err(invalid("invalid durable result retention record"));
-        }
+    if let Some(digest) = last["receipt"].get("retained_result_sha256")
+        && (!hex_string(digest, 64) || last["resolved"] != true
+            || last["receipt"]["retained_result_released"].as_bool().is_none())
+    {
+        return Err(invalid("invalid durable result retention record"));
     }
     Ok(())
 }

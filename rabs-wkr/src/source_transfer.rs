@@ -29,12 +29,12 @@ pub fn hex(bytes: &[u8]) -> String {
 }
 
 fn decode_hex(value: &str, maximum: usize) -> Result<Vec<u8>, String> {
-    if value.len() % 2 != 0 || value.len() / 2 > maximum
+    if !value.len().is_multiple_of(2) || value.len() / 2 > maximum
         || !value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
     {
         return Err(invalid("invalid bounded source hex"));
     }
-    value.as_bytes().chunks_exact(2).map(|pair| {
+    value.as_bytes().as_chunks::<2>().0.iter().map(|pair| {
         let digit = |byte: u8| if byte <= b'9' { byte - b'0' } else { byte - b'a' + 10 };
         Ok((digit(pair[0]) << 4) | digit(pair[1]))
     }).collect()

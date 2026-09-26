@@ -273,3 +273,119 @@ fn different_roles_and_ancestor_paths_cannot_claim_overlapping_outputs() {
         assert!(!root.exists(), "the entire conflicting bundle must refuse before writes");
     }
 }
+
+const RELATIVE_DEP: &[u8] = b"target/libunit.rmeta: ./src/lib.rs\n\n./src/lib.rs:\n# env-dep:NAME=unchanged\n";
+
+fn relative_fixture(dep_info: &[u8]) -> Fixture {
+    Fixture::new(&[
+        (OutputRole::Materializable, "libunit.rlib", b"library\0\xff"),
+        (OutputRole::DepInfo, "unit.d", dep_info),
+        (OutputRole::ProvisionalMetadata, "libunit.rmeta", b"metadata\0\xfe"),
+    ])
+}
+
+#[test]
+fn relative_dep_info_serves_two_worktrees_without_mutating_the_shared_cas_object() {
+    use std::os::unix::ffi::OsStringExt;
+    use rabsd::edge::dep_info::{DepInfoLine, parse_dep_info};
+
+    let fixture = relative_fixture(RELATIVE_DEP);
+    let canonical = fixture.location("unit.d");
+    let before = std::fs::read(&canonical).unwrap();
+    let before_mtime = std::fs::metadata(&canonical).unwrap().modified().unwrap();
+    let mut deliveries = Vec::new();
+    for name in [&b"first worktree#"[..], &b"second worktree-\xff"[..]] {
+        let cwd = fixture.dir.path().join(std::ffi::OsString::from_vec(name.to_vec()));
+        std::fs::create_dir_all(cwd.join("src")).unwrap();
+        let source = cwd.join("src/lib.rs");
+        std::fs::write(&source, b"pub fn value() {}\n").unwrap();
+        let floor = UNIX_EPOCH + Duration::from_secs(2_000_000_000);
+        std::fs::File::options().write(true).open(&source).unwrap()
+            .set_modified(floor).unwrap();
+        let root = cwd.join("target");
+        let expected = ExpectedOutputs::WithDepInfo {
+            paths: fixture.names(),
+            mappings: vec![(b".".to_vec(), cwd.as_os_str().as_bytes().to_vec())],
+        };
+        let ServeOutcome::Served { files } = fixture.serve(&root, &expected).unwrap() else {
+            panic!("relative dep-info with an explicit cwd was not served");
+        };
+        assert_eq!(files.len(), 3);
+        assert_eq!(files[0], root.join("libunit.rmeta"));
+        assert_eq!(std::fs::read(root.join("libunit.rlib")).unwrap(), b"library\0\xff");
+        assert_eq!(std::fs::read(root.join("libunit.rmeta")).unwrap(), b"metadata\0\xfe");
+        for file in files {
+            assert!(std::fs::metadata(file).unwrap().modified().unwrap() >= floor);
+        }
+        let delivered = std::fs::read(root.join("unit.d")).unwrap();
+        assert_eq!(parse_dep_info(&delivered).unwrap().lines, vec![
+            DepInfoLine::Rule {
+                target: root.join("libunit.rmeta").as_os_str().as_bytes().to_vec(),
+                deps: vec![source.as_os_str().as_bytes().to_vec()],
+            },
+            DepInfoLine::Blank,
+            DepInfoLine::Rule {
+                target: source.as_os_str().as_bytes().to_vec(), deps: vec![],
+            },
+            DepInfoLine::Comment(b"# env-dep:NAME=unchanged".to_vec()),
+        ]);
+        deliveries.push(delivered);
+    }
+    assert_ne!(deliveries[0], deliveries[1]);
+    assert_eq!(std::fs::read(&canonical).unwrap(), before);
+    assert_eq!(std::fs::metadata(&canonical).unwrap().modified().unwrap(), before_mtime);
+}
+
+#[test]
+fn relative_inputs_without_cwd_or_with_missing_source_refuse_before_any_output() {
+    let fixture = relative_fixture(
+        b"/__rabs/out/unit/libunit.rmeta: src/lib.rs\n\nsrc/lib.rs:\n",
+    );
+    for absent_cwd in [false, true] {
+        let root = fixture.dir.path().join(if absent_cwd { "missing-input" } else { "no-cwd" });
+        let mut expected = fixture.expected(&root);
+        if absent_cwd
+            && let ExpectedOutputs::WithDepInfo { mappings, .. } = &mut expected
+        {
+            mappings.push((
+                b".".to_vec(),
+                fixture.dir.path().join("missing-worktree").as_os_str().as_bytes().to_vec(),
+            ));
+        }
+        assert!(matches!(fixture.serve(&root, &expected), Err(ServeError::Preparation { .. })));
+        assert!(!root.exists());
+    }
+}
+
+#[test]
+fn relative_parent_traversal_refuses_before_even_the_metadata_head() {
+    for dep_info in [
+        &b"target/libunit.rmeta: ../outside.rs\n"[..],
+        &b"target/libunit.rmeta: src/../lib.rs\n"[..],
+        &b"../target/libunit.rmeta: src/lib.rs\n"[..],
+    ] {
+        let fixture = relative_fixture(dep_info);
+        let cwd = fixture.dir.path().join("workspace");
+        let root = cwd.join("target");
+        let expected = ExpectedOutputs::WithDepInfo {
+            paths: fixture.names(),
+            mappings: vec![(b".".to_vec(), cwd.as_os_str().as_bytes().to_vec())],
+        };
+        assert!(matches!(fixture.serve(&root, &expected), Err(ServeError::Preparation { .. })));
+        assert!(!root.exists());
+    }
+}
+
+#[test]
+fn relative_targets_cannot_certify_a_different_subscriber_output_tree() {
+    let fixture = relative_fixture(RELATIVE_DEP);
+    let cwd = fixture.dir.path().join("workspace");
+    let root = fixture.dir.path().join("wrong-target");
+    let expected = ExpectedOutputs::WithDepInfo {
+        paths: fixture.names(),
+        mappings: vec![(b".".to_vec(), cwd.as_os_str().as_bytes().to_vec())],
+    };
+    assert!(matches!(fixture.serve(&root, &expected), Err(ServeError::Preparation { .. })));
+    assert!(!root.exists());
+    assert!(!cwd.join("target").exists());
+}

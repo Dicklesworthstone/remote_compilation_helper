@@ -8,7 +8,7 @@
 use super::{ExpectedOutputs, ServeError, resolve_destination};
 use crate::edge::dep_info::{
     DEP_INFO_DERIVATION_CONTRACT, DepInfoLine, DerivedDepInfo, derive_subscriber_dep_info,
-    parse_dep_info, render_dep_info,
+    parse_dep_info, render_dep_info, rewritten_dep_info_token_len,
 };
 use rabs_cas::manifest_validation::{ManifestMember, ManifestMemberKind, validate_manifest};
 use rabs_cas::materialization::{
@@ -55,6 +55,10 @@ type DirectoryMappings = Vec<(Vec<u8>, Vec<u8>)>;
 /// Mappings name directories, not arbitrary byte prefixes. A trailing separator
 /// guarantees that `workspace` cannot rewrite `workspace-other`. Longest match
 /// wins and conflicting mappings for one canonical directory are refused.
+/// The exact source `.` explicitly binds relative rustc paths to the
+/// subscriber's compiler working directory. It is never inferred from root.
+/// For example, `dep_info_mappings: [[".", "/home/agent/project"]]` resolves
+/// `src/lib.rs` and `target/debug/libcrate.rlib` in that subscriber only.
 fn directory_mappings(expected: &ExpectedOutputs) -> Result<DirectoryMappings, String> {
     let ExpectedOutputs::WithDepInfo { mappings, .. } = expected else {
         return Ok(Vec::new());
@@ -86,11 +90,17 @@ fn directory_mappings(expected: &ExpectedOutputs) -> Result<DirectoryMappings, S
     };
     let mut unique = BTreeMap::new();
     for (canonical, subscriber) in mappings {
-        let canonical = directory(canonical)?;
+        let canonical = if canonical.as_slice() == b"." {
+            canonical.clone()
+        } else {
+            directory(canonical)?
+        };
         let subscriber = directory(subscriber)?;
-        if !canonical.starts_with(b"/__rabs/") || subscriber.starts_with(b"/__rabs/") {
+        if (canonical.as_slice() != b"." && !canonical.starts_with(b"/__rabs/"))
+            || subscriber.starts_with(b"/__rabs/")
+        {
             return Err(
-                "mapping must translate a canonical RABS directory to a subscriber directory"
+                "mapping must translate a canonical RABS directory or explicit . working directory to a subscriber directory"
                     .into(),
             );
         }
@@ -112,29 +122,16 @@ fn check_expansion(canonical: &[u8], mappings: &[(Vec<u8>, Vec<u8>)]) -> Result<
     if render_dep_info(&parsed) != canonical {
         return Err("dep-info is outside the lossless canonical grammar".into());
     }
-    let escaped_len = |bytes: &[u8]| {
-        bytes.len()
-            + bytes
-                .iter()
-                .filter(|b| matches!(**b, b' ' | b'\\' | b'#'))
-                .count()
-    };
-    let token_len = |token: &[u8]| match mappings
-        .iter()
-        .find(|(prefix, _)| token.starts_with(prefix))
-    {
-        Some((prefix, replacement)) => {
-            escaped_len(replacement) + escaped_len(&token[prefix.len()..])
-        }
-        None => escaped_len(token),
+    let token_len = |token: &[u8]| {
+        rewritten_dep_info_token_len(token, mappings).map_err(|error| error.reason)
     };
     let mut total = 0_usize;
     for line in &parsed.lines {
         let length = match line {
             DepInfoLine::Rule { target, deps } => {
-                let mut length = token_len(target).saturating_add(2);
+                let mut length = token_len(target)?.saturating_add(2);
                 for dep in deps {
-                    length = length.saturating_add(1 + token_len(dep));
+                    length = length.saturating_add(token_len(dep)?.saturating_add(1));
                 }
                 length
             }
@@ -703,5 +700,50 @@ mod tests {
             manifest.logical_outputs[1].virtual_path.as_bytes(),
             b"out/crate-\xfe.rlib",
         );
+    }
+
+    #[test]
+    fn relative_path_expansion_uses_the_same_working_directory_plan_as_derivation() {
+        let mappings = directory_mappings(&expected(&[
+            (b".", b"/subscriber with#space-\xff"),
+            (b"/__rabs/toolchain", b"/local/toolchain"),
+        ])).unwrap();
+        let canonical = b"target/unit.rmeta: ./src/lib.rs /__rabs/toolchain/lib/core.rlib\n\n./src/lib.rs:\n";
+        let expanded = check_expansion(canonical, &mappings).unwrap();
+        let derived = derive_subscriber_dep_info(canonical, &mappings).unwrap();
+        assert_eq!(expanded, derived.bytes.len());
+        assert_eq!(render_dep_info(&parse_dep_info(&derived.bytes).unwrap()), derived.bytes);
+        assert!(derived.bytes.starts_with(b"/subscriber\\ with\\#space-\xff/target/unit.rmeta:"));
+    }
+
+    #[test]
+    fn working_directory_mapping_is_explicit_unique_and_absolute() {
+        let mappings = directory_mappings(&expected(&[
+            (b".", b"/worktree"), (b".", b"/worktree/"),
+        ])).unwrap();
+        assert_eq!(mappings, vec![(b".".to_vec(), b"/worktree/".to_vec())]);
+        assert!(directory_mappings(&expected(&[
+            (b".", b"/first"), (b".", b"/second"),
+        ])).is_err());
+        for directory in [&b"relative"[..], b"/", b"/tree/../other", b"/__rabs/workspace"] {
+            assert!(directory_mappings(&expected(&[(b".", directory)])).is_err());
+        }
+        for source in [&b"./"[..], b"..", b"src"] {
+            assert!(directory_mappings(&expected(&[(source, b"/worktree")])).is_err());
+        }
+    }
+
+    #[test]
+    fn working_directory_growth_is_bounded_before_allocating_relative_replacements() {
+        let mut directory = b"/subscriber/".to_vec();
+        directory.resize(MAX_MAPPING_PATH_BYTES, b'x');
+        let mappings = directory_mappings(&expected(&[(b".", &directory)])).unwrap();
+        let mut canonical = b"target/unit:".to_vec();
+        for _ in 0..1100 {
+            canonical.extend_from_slice(b" src/lib.rs");
+        }
+        canonical.push(b'\n');
+        assert!(canonical.len() < MAX_DEP_INFO_BYTES);
+        assert!(check_expansion(&canonical, &mappings).is_err());
     }
 }
