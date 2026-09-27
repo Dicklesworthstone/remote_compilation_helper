@@ -980,6 +980,15 @@ fn exit_with_local_fallback(
 
     match child.status() {
         Ok(status) => {
+            // A signal death reports 128+N like a shell, not a generic 1 that
+            // would hide an OOM kill or interrupt from the caller.
+            let code = {
+                use std::os::unix::process::ExitStatusExt as _;
+                status
+                    .code()
+                    .or_else(|| status.signal().map(|signal| 128 + signal))
+                    .unwrap_or(1)
+            };
             emit_exec_envelope(&ExecResultEnvelope {
                 api_version: "1.0",
                 command,
@@ -987,13 +996,13 @@ fn exit_with_local_fallback(
                 location: "local",
                 fallback_reason: Some(reason),
                 worker_id: None,
-                remote_exit_code: status.code(),
+                remote_exit_code: Some(code),
                 duration_ms: None,
                 timing: None,
                 result_dirs: None,
                 error_code: None,
             });
-            std::process::exit(status.code().unwrap_or(1))
+            std::process::exit(code)
         }
         Err(error) => {
             reporter.summary(&format!("[RCH] local fallback failed: {error}"));
