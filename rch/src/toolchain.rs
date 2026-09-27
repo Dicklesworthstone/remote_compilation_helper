@@ -6,8 +6,13 @@
 #![allow(dead_code)]
 
 use rch_common::ToolchainInfo;
+use std::io::{Read, Seek};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
+
+const TOOLCHAIN_PROBE_BUDGET: Duration = Duration::from_secs(2);
+const MAX_TOOLCHAIN_PROBE_BYTES: u64 = 64 * 1024;
 
 /// Errors that can occur during toolchain detection.
 #[derive(Debug, thiserror::Error)]
@@ -20,19 +25,54 @@ pub enum ToolchainError {
     ParseError(String),
     #[error("TOML parse error: {0}")]
     Toml(#[from] toml::de::Error),
+    #[error("Toolchain resolution refused: {0}")]
+    Resolution(String),
 }
 
 /// Detect the active Rust toolchain for a project.
 ///
-/// Ambient explicit overrides precede the nearest ancestor declaration.
-/// Without a declaration, ask rustup in the caller's directory before using
-/// rustc's channel. Explicit command selectors are handled by the hook first.
-/// This file fast path does not resolve rustup's stored directory overrides.
+/// Explicit command selectors are handled by the hook first; an explicit
+/// environment identity can also be resolved without a locally installed rustc.
+/// Otherwise Rustup, not a file-only approximation, resolves directory overrides
+/// and toolchain files by proximity. Its private settings format is never read.
+/// Only an absent Rustup executable permits the standalone file/rustc fallback;
+/// a failed or malformed Rustup query must not select an unrelated compiler.
 pub fn detect_toolchain(project_root: &Path) -> Result<ToolchainInfo, ToolchainError> {
-    let ambient = std::env::var("RUSTUP_TOOLCHAIN").ok();
-    detect_toolchain_with(project_root, ambient.as_deref(), detect_active_toolchain)
+    let ambient = match std::env::var("RUSTUP_TOOLCHAIN") {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => return Err(ToolchainError::InvalidFormat),
+    };
+    detect_resolved_toolchain_with(project_root, ambient.as_deref(), "rustup", "rustc")
 }
 
+/// Also used with explicit executable paths by subprocess-boundary tests.
+fn detect_resolved_toolchain_with(
+    project_root: &Path,
+    ambient: Option<&str>,
+    rustup: &str,
+    rustc: &str,
+) -> Result<ToolchainInfo, ToolchainError> {
+    if let Some(name) = ambient.filter(|name| !name.is_empty()) {
+        if name.contains(char::is_whitespace) || name.chars().any(char::is_control) {
+            return Err(ToolchainError::InvalidFormat);
+        }
+        return parse_active_toolchain(name);
+    }
+    let until = Instant::now() + TOOLCHAIN_PROBE_BUDGET;
+    if let Some(output) =
+        run_toolchain_probe(toolchain_probe(rustup, &["show"], project_root), until)?
+    {
+        return resolved_rustup_identity(project_root, &rustup_show_identity(&output)?);
+    }
+    // Without Rustup, retain support for standalone installations and project
+    // declarations. Do not make a second Rustup attempt or renew the budget.
+    detect_toolchain_with(project_root, None, |root| {
+        detect_rustc_toolchain(root, rustc, until)
+    })
+}
+
+/// A fallback for hosts without Rustup, not an authority over its override DB.
 fn detect_toolchain_with(
     project_root: &Path,
     ambient: Option<&str>,
@@ -52,9 +92,9 @@ fn detect_toolchain_with(
         };
         match parsed {
             Ok(info) => return Ok(info),
-            // A valid TOML file may declare only components/profile. Let
-            // rustup resolve its unspecified channel in the caller's cwd.
-            Err(ToolchainError::InvalidFormat) => {}
+            // Only a valid channel-less declaration may use the standalone
+            // compiler. A broken pin must not silently select a different one.
+            Err(ToolchainError::InvalidFormat) if file_has_implicit_channel(&path) => {}
             Err(error) => return Err(error),
         }
     }
@@ -243,33 +283,231 @@ fn toolchain_probe(program: &str, args: &[&str], project_root: &Path) -> Command
         .args(args)
         .current_dir(project_root)
         .env("RUSTUP_AUTO_INSTALL", "0")
-        .stdin(std::process::Stdio::null());
+        .env("RUSTUP_TERM_COLOR", "never")
+        .stdin(Stdio::null());
     command
 }
 
-fn detect_active_toolchain(project_root: &Path) -> Result<ToolchainInfo, ToolchainError> {
-    detect_active_toolchain_with(project_root, "rustup", "rustc")
+/// Own and reap the directly spawned query even when a deadline, size check or
+/// read fails. This does not claim to sandbox a hostile executable's descendants.
+struct ToolchainProbeChild(Child);
+
+impl Drop for ToolchainProbeChild {
+    fn drop(&mut self) {
+        if !matches!(self.0.try_wait(), Ok(Some(_))) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
 }
 
-fn detect_active_toolchain_with(
-    project_root: &Path,
-    rustup: &str,
-    rustc: &str,
-) -> Result<ToolchainInfo, ToolchainError> {
-    if let Ok(output) =
-        toolchain_probe(rustup, &["show", "active-toolchain"], project_root).output()
-        && output.status.success()
-        && let Ok(info) = parse_active_toolchain(&String::from_utf8_lossy(&output.stdout))
-    {
-        return Ok(info);
+fn probe_remaining(until: Instant) -> std::io::Result<Duration> {
+    until
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "toolchain resolution deadline elapsed",
+            )
+        })
+}
+
+/// Bound the wait and parsed bytes without pipe-drainer threads. An inherited
+/// stdout pipe must not keep a completed query alive. Private scratch receives
+/// stdout; stderr is discarded rather than retained or used as selection data.
+/// Filesystem and process-spawn syscalls themselves are not preemptible.
+/// `None` means only that the requested executable could not be found at spawn.
+fn run_toolchain_probe(
+    mut command: Command,
+    until: Instant,
+) -> Result<Option<String>, ToolchainError> {
+    probe_remaining(until)?;
+    let mut output = tempfile::tempfile()?;
+    command.stdout(output.try_clone()?).stderr(Stdio::null());
+    let child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let mut child = ToolchainProbeChild(child);
+    loop {
+        let remaining = probe_remaining(until)?;
+        if output.metadata()?.len() > MAX_TOOLCHAIN_PROBE_BYTES {
+            return Err(ToolchainError::Resolution(
+                "query output exceeds byte limit".into(),
+            ));
+        }
+        if let Some(status) = child.0.try_wait()? {
+            if !status.success() {
+                return Err(ToolchainError::Resolution(format!(
+                    "query exited with {status}"
+                )));
+            }
+            break;
+        }
+        std::thread::sleep(remaining.min(Duration::from_millis(5)));
     }
-    let output = toolchain_probe(rustc, &["--version"], project_root).output()?;
-    if !output.status.success() {
-        return Err(ToolchainError::ParseError(
-            "rustc --version failed".to_string(),
+    probe_remaining(until)?;
+    output.rewind()?;
+    let mut bytes = Vec::new();
+    output
+        .take(MAX_TOOLCHAIN_PROBE_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_TOOLCHAIN_PROBE_BYTES {
+        return Err(ToolchainError::Resolution(
+            "query output exceeds byte limit".into(),
         ));
     }
-    parse_rustc_version(&String::from_utf8_lossy(&output.stdout))
+    probe_remaining(until)?;
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|_| ToolchainError::InvalidFormat)
+}
+
+fn detect_rustc_toolchain(
+    project_root: &Path,
+    rustc: &str,
+    until: Instant,
+) -> Result<ToolchainInfo, ToolchainError> {
+    let output = run_toolchain_probe(toolchain_probe(rustc, &["--version"], project_root), until)?
+        .ok_or_else(|| {
+            ToolchainError::Resolution("neither Rustup nor rustc is available".into())
+        })?;
+    parse_rustc_version(&output)
+}
+
+fn active_identity_parts(output: &str) -> Result<(&str, Option<&str>), ToolchainError> {
+    let output = output.trim_end_matches(['\r', '\n']);
+    if output.is_empty() || output.chars().any(char::is_control) {
+        return Err(ToolchainError::InvalidFormat);
+    }
+    let (identity, source) = match output.split_once(" (") {
+        Some((identity, source)) => (
+            identity,
+            Some(
+                source
+                    .strip_suffix(')')
+                    .filter(|s| !s.is_empty())
+                    .ok_or(ToolchainError::InvalidFormat)?,
+            ),
+        ),
+        None => (output, None),
+    };
+    if identity.is_empty() || identity.contains(char::is_whitespace) {
+        return Err(ToolchainError::InvalidFormat);
+    }
+    Ok((identity, source))
+}
+
+/// `show active-toolchain` requires an installed toolchain even with automatic
+/// installation disabled. Plain `show` reports its selected name and source
+/// BEFORE the installation check, so an offload-only dispatcher needs no local
+/// compiler installation. Accept only its unambiguous active section, never an
+/// installed/default entry or a name extracted from error text. Unknown layouts
+/// and "no active toolchain" are resolution failures, not standalone fallbacks.
+fn rustup_show_identity(output: &str) -> Result<String, ToolchainError> {
+    if output.chars().any(|c| c.is_control() && c != '\n' && c != '\r') {
+        return Err(ToolchainError::InvalidFormat);
+    }
+    let lines: Vec<_> = output.lines().collect();
+    let mut sections = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| **line == "active toolchain");
+    let (start, _) = sections.next().ok_or(ToolchainError::InvalidFormat)?;
+    if sections.next().is_some() || lines.get(start + 1) != Some(&"----------------") {
+        return Err(ToolchainError::InvalidFormat);
+    }
+    let name = lines
+        .get(start + 2)
+        .and_then(|line| line.strip_prefix("name: "))
+        .ok_or(ToolchainError::InvalidFormat)?;
+    if name.is_empty() || name.contains(char::is_whitespace) {
+        return Err(ToolchainError::InvalidFormat);
+    }
+    let source = lines
+        .get(start + 3)
+        .and_then(|line| line.strip_prefix("active because: "))
+        .filter(|source| !source.is_empty())
+        .ok_or(ToolchainError::InvalidFormat)?;
+    let tail = &lines[start + 4..];
+    if !tail.is_empty()
+        && (tail[0] != "installed targets:"
+            || tail[1..]
+                .iter()
+                .any(|line| !line.starts_with("  ") || line.trim().is_empty()))
+    {
+        return Err(ToolchainError::InvalidFormat);
+    }
+    let identity = format!("{name} ({source})");
+    active_identity_parts(&identity)?;
+    Ok(identity)
+}
+
+/// Preserve an explicitly host-qualified FILE pin only when Rustup names that
+/// exact file as the selected source. A nearer directory override wins even
+/// over a malformed/foreign-host ancestor pin. Controller host suffixes added
+/// by Rustup to ordinary identities still do not become worker host demands.
+fn resolved_rustup_identity(
+    project_root: &Path,
+    output: &str,
+) -> Result<ToolchainInfo, ToolchainError> {
+    let (identity, source) = active_identity_parts(output)?;
+    let resolved = parse_active_toolchain(output)?;
+    let Some(source) = source.filter(|source| source.starts_with("overridden by '")) else {
+        return Ok(resolved);
+    };
+    let Some(path) = nearest_toolchain_file(project_root)? else {
+        return Err(ToolchainError::Resolution(
+            "selected toolchain file disappeared".into(),
+        ));
+    };
+    if source != format!("overridden by '{}'", path.display()) {
+        return Err(ToolchainError::Resolution(
+            "selected toolchain file changed".into(),
+        ));
+    }
+    let declared = if path.file_name().is_some_and(|name| name == "rust-toolchain") {
+        parse_legacy_toolchain_file(&path)
+    } else {
+        parse_toolchain_file(&path)
+    };
+    match declared {
+        Ok(pin)
+            if pin.rustup_toolchain() == identity
+                || pin.rustup_toolchain() == resolved.rustup_toolchain() =>
+        {
+            Ok(pin)
+        }
+        // A component-only file delegates its channel to Rustup's default.
+        Err(ToolchainError::InvalidFormat) if file_has_implicit_channel(&path) => Ok(resolved),
+        Err(error) => Err(error),
+        Ok(_) => Err(ToolchainError::Resolution(
+            "selected toolchain file changed after resolution".into(),
+        )),
+    }
+}
+
+fn file_has_implicit_channel(path: &Path) -> bool {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(value) = toml::from_str::<toml::Value>(&content) else {
+        return false;
+    };
+    let Some(table) = value.get("toolchain").and_then(toml::Value::as_table) else {
+        return false;
+    };
+    !table.contains_key("channel")
+        && !table.contains_key("path")
+        && ["components", "targets"].iter().any(|key| {
+            table.get(*key).is_some_and(|values| {
+                values
+                    .as_array()
+                    .is_some_and(|items| items.iter().all(toml::Value::is_str))
+            })
+        })
 }
 
 /// Rustup appends the controller host to official identities. A remote
@@ -277,11 +515,7 @@ fn detect_active_toolchain_with(
 /// Linux/macOS/Windows controller hosts only; unknown/custom suffixes remain
 /// opaque. Do not obtain the release date from a compiler version.
 fn parse_active_toolchain(output: &str) -> Result<ToolchainInfo, ToolchainError> {
-    let output = output.trim();
-    let identity = output.split_once(" (").map_or(output, |(name, _)| name);
-    if identity.is_empty() || identity.contains(char::is_whitespace) {
-        return Err(ToolchainError::InvalidFormat);
-    }
+    let (identity, _) = active_identity_parts(output)?;
     let official = regex::Regex::new(
         r"^((?:stable|beta|nightly)(?:-\d{4}-\d{2}-\d{2})?|\d+\.\d+(?:\.\d+)?(?:-beta(?:\.\d+)?)?)-(?:x86_64|aarch64|i686)-(?:unknown-linux-(?:gnu|musl)|apple-darwin|pc-windows-(?:msvc|gnu|gnullvm))$",
     )
@@ -678,13 +912,17 @@ mod tests {
         // Relative input paths prove the subprocess actually runs in caller.
         std::fs::write(
             &program,
-            "#!/bin/sh\n[ \"$RUSTUP_AUTO_INSTALL\" = 0 ] || exit 91\ncase \"$*\" in\n'show active-toolchain') cat active; exit 0;;\n'--version') cat compiler;;\n*) exit 92;;\nesac\n",
+            "#!/bin/sh\n[ \"$RUSTUP_AUTO_INSTALL\" = 0 ] && [ \"$RUSTUP_TERM_COLOR\" = never ] || exit 91\ncase \"$*\" in\nshow) cat active;;\n'--version') cat compiler;;\n*) exit 92;;\nesac\n",
         )
         .unwrap();
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
         std::fs::write(
             caller.join("active"),
-            "nightly-2026-08-31-x86_64-unknown-linux-gnu (default)\n",
+            show_report(
+                "nightly-2026-08-31-x86_64-unknown-linux-gnu",
+                "it's the default toolchain",
+                true,
+            ),
         )
         .unwrap();
         std::fs::write(
@@ -693,20 +931,305 @@ mod tests {
         )
         .unwrap();
         let executable = program.to_str().unwrap();
-        let info = detect_active_toolchain_with(&caller, executable, executable).unwrap();
+        let info = detect_resolved_toolchain_with(&caller, None, executable, executable).unwrap();
         assert_eq!(info.rustup_toolchain(), "nightly-2026-08-31");
 
-        // Unavailable and malformed rustup identities both use the compiler
-        // channel without inventing an archive from its commit date.
+        // Only an unavailable Rustup permits a standalone compiler fallback.
+        // Shadow any TMPDIR ancestor pin without choosing its channel.
+        std::fs::write(
+            caller.join("rust-toolchain.toml"),
+            "[toolchain]\ncomponents = []\n",
+        )
+        .unwrap();
         let absent = tmp.path().join("not-installed");
         let info =
-            detect_active_toolchain_with(&caller, absent.to_str().unwrap(), executable).unwrap();
+            detect_resolved_toolchain_with(&caller, None, absent.to_str().unwrap(), executable)
+                .unwrap();
         assert_eq!(info.rustup_toolchain(), "nightly");
         std::fs::write(caller.join("active"), "no active toolchain\n").unwrap();
-        let info = detect_active_toolchain_with(&caller, executable, executable).unwrap();
-        assert_eq!(info.rustup_toolchain(), "nightly");
+        assert!(detect_resolved_toolchain_with(&caller, None, executable, executable).is_err());
         std::fs::write(caller.join("compiler"), "not a compiler\n").unwrap();
-        assert!(detect_active_toolchain_with(&caller, executable, executable).is_err());
+        assert!(
+            detect_resolved_toolchain_with(&caller, None, absent.to_str().unwrap(), executable)
+                .is_err()
+        );
+    }
+
+    // The public Rustup CLI boundary is scripted below. These tests exercise
+    // RCH's real process launcher/parser and file handling, not an installed
+    // Rustup distribution or a compiler. No user settings are modified.
+    fn show_report(name: &str, source: &str, installed: bool) -> String {
+        format!(
+            "Default host: x86_64-unknown-linux-gnu\nrustup home: /unused\n\ninstalled toolchains\n--------------------\nstable-x86_64-unknown-linux-gnu (default)\n\nactive toolchain\n----------------\nname: {name}\nactive because: {source}\n{}",
+            if installed {
+                "installed targets:\n  x86_64-unknown-linux-gnu\n"
+            } else {
+                ""
+            },
+        )
+    }
+
+    #[cfg(unix)]
+    fn script(path: &Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(path, body).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_override_resolution_precedes_pins_without_installing_or_running_rustc() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let child = root.join("nested");
+        std::fs::create_dir(&child).unwrap();
+        let rustup = root.join("rustup-query");
+        let rustc = root.join("rustc-query");
+        script(
+            &rustup,
+            "#!/bin/sh\n[ \"$*\" = show ] && [ \"$RUSTUP_AUTO_INSTALL\" = 0 ] && [ \"$RUSTUP_TERM_COLOR\" = never ] || exit 91\ncat active\n",
+        );
+        script(&rustc, "#!/bin/sh\ntouch compiler-ran\nexit 92\n");
+        for pin in ["[toolchain]\nchannel='stable'\n", "malformed [[[\n"] {
+            std::fs::write(root.join("rust-toolchain.toml"), pin).unwrap();
+            for directory in [&root, &child] {
+                for installed in [false, true] {
+                    std::fs::write(
+                        child.join("active"),
+                        show_report(
+                            "nightly-2026-08-31-x86_64-unknown-linux-gnu",
+                            &format!("directory override for '{}'", directory.display()),
+                            installed,
+                        ),
+                    )
+                    .unwrap();
+                    let info = detect_resolved_toolchain_with(
+                        &child,
+                        None,
+                        rustup.to_str().unwrap(),
+                        rustc.to_str().unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(info.rustup_toolchain(), "nightly-2026-08-31");
+                    assert!(!child.join("compiler-ran").exists());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn selected_file_pins_preserve_host_intent_and_refuse_changed_source() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let nested = root.join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        let path = nested.join("rust-toolchain.toml");
+        std::fs::write(root.join("rust-toolchain"), "stable").unwrap();
+        let source = format!("overridden by '{}'", path.display());
+        for pin in [
+            "nightly-2026-08-31",
+            "nightly-2026-08-31-x86_64-pc-windows-msvc",
+            "custom-local",
+        ] {
+            std::fs::write(&path, format!("[toolchain]\nchannel='{pin}'\n")).unwrap();
+            let identity = if pin == "nightly-2026-08-31" {
+                "nightly-2026-08-31-x86_64-unknown-linux-gnu"
+            } else {
+                pin
+            };
+            let report = rustup_show_identity(&show_report(identity, &source, false)).unwrap();
+            assert_eq!(
+                resolved_rustup_identity(&nested, &report)
+                    .unwrap()
+                    .rustup_toolchain(),
+                pin
+            );
+            std::fs::write(&path, "[toolchain]\nchannel='beta'\n").unwrap();
+            assert!(resolved_rustup_identity(&nested, &report).is_err());
+        }
+        let wrong_source = format!(
+            "nightly (overridden by '{}')",
+            root.join("rust-toolchain").display()
+        );
+        assert!(resolved_rustup_identity(&nested, &wrong_source).is_err());
+    }
+
+    #[test]
+    fn resolved_implicit_channel_is_not_confused_with_a_broken_pin() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let path = root.join("rust-toolchain.toml");
+        let active = format!(
+            "stable-x86_64-unknown-linux-gnu (overridden by '{}')",
+            path.display()
+        );
+        for contents in [
+            "[toolchain]\ncomponents=[]\n",
+            "[toolchain]\ntargets=['wasm32-unknown-unknown']\n",
+        ] {
+            std::fs::write(&path, contents).unwrap();
+            assert_eq!(
+                resolved_rustup_identity(&root, &active)
+                    .unwrap()
+                    .rustup_toolchain(),
+                "stable"
+            );
+        }
+        for contents in [
+            "",
+            "[toolchain]\n",
+            "[toolchain]\nchannel=3\ncomponents=[]\n",
+            "[toolchain]\npath='/local'\ncomponents=[]\n",
+            "broken [[[",
+        ] {
+            std::fs::write(&path, contents).unwrap();
+            assert!(resolved_rustup_identity(&root, &active).is_err(), "{contents}");
+        }
+    }
+
+    #[test]
+    fn show_parser_requires_exactly_one_complete_active_identity() {
+        let valid = show_report(
+            "beta-x86_64-unknown-linux-gnu",
+            "it's the default toolchain",
+            true,
+        );
+        assert!(rustup_show_identity(&valid).unwrap().starts_with("beta-"));
+        assert!(rustup_show_identity(&valid.replace('\n', "\r\n")).is_ok());
+        for invalid in [
+            "stable-x86_64-unknown-linux-gnu (default)\n".to_owned(),
+            "active toolchain\n----------------\nno active toolchain\n".to_owned(),
+            valid.replace("active because:", "reason:"),
+            valid.replace("name: beta-", "name: wrong beta-"),
+            valid.replace("name: beta-", "name: \0beta-"),
+            valid.replace("active toolchain", "\x1b[1mactive toolchain"),
+            format!("{valid}{valid}"),
+            format!("{valid}name: stable\n"),
+        ] {
+            assert!(rustup_show_identity(&invalid).is_err(), "{invalid:?}");
+        }
+        for invalid in [
+            "nightly (default)\nstable (default)",
+            "nightly (default",
+            " nightly",
+            "nightly\0",
+        ] {
+            assert!(parse_active_toolchain(invalid).is_err());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rustup_errors_and_non_utf8_cannot_fall_back_to_a_valid_pin_or_compiler() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let rustup = root.join("rustup-query");
+        let rustc = root.join("compiler-query");
+        std::fs::write(root.join("rust-toolchain"), "stable").unwrap();
+        script(
+            &rustc,
+            "#!/bin/sh\ntouch compiler-ran\nprintf 'rustc 1.90.0 (abcdef 2025-09-01)\\n'\n",
+        );
+        for body in [
+            "#!/bin/sh\ncat active\nexit 1\n",
+            "#!/bin/sh\nprintf 'not a Rustup report\\n'\n",
+            "#!/bin/sh\nprintf '\\377\\n'\n",
+        ] {
+            std::fs::write(
+                root.join("active"),
+                show_report("beta", "it's the default toolchain", false),
+            )
+            .unwrap();
+            script(&rustup, body);
+            assert!(
+                detect_resolved_toolchain_with(
+                    root,
+                    None,
+                    rustup.to_str().unwrap(),
+                    rustc.to_str().unwrap(),
+                )
+                .is_err()
+            );
+            assert!(!root.join("compiler-ran").exists());
+        }
+    }
+
+    #[test]
+    fn explicit_environment_and_absent_rustup_keep_offline_declarations() {
+        let tmp = TempDir::new().unwrap();
+        let absent = tmp.path().join("not-installed");
+        let absent = absent.to_str().unwrap();
+        std::fs::write(tmp.path().join("rust-toolchain"), "beta").unwrap();
+        assert_eq!(
+            detect_resolved_toolchain_with(tmp.path(), Some("nightly-2026-08-31"), absent, absent)
+                .unwrap()
+                .rustup_toolchain(),
+            "nightly-2026-08-31"
+        );
+        assert_eq!(
+            detect_resolved_toolchain_with(tmp.path(), None, absent, absent)
+                .unwrap()
+                .rustup_toolchain(),
+            "beta"
+        );
+        for invalid in ["nightly\0", "nightly (default)", " nightly"] {
+            assert!(detect_resolved_toolchain_with(tmp.path(), Some(invalid), absent, absent).is_err());
+        }
+        std::fs::write(tmp.path().join("rust-toolchain"), "").unwrap();
+        assert!(detect_toolchain_with(tmp.path(), None, |_| {
+            panic!("a broken pin must not invoke the standalone fallback")
+        }).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn query_deadlines_cover_spawn_wait_and_do_not_renew_for_output() {
+        let tmp = TempDir::new().unwrap();
+        let marker = tmp.path().join("spawned");
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", "echo started > \"$1\"", "query"])
+            .arg(&marker);
+        assert!(matches!(
+            run_toolchain_probe(command, Instant::now()),
+            Err(ToolchainError::Io(error)) if error.kind() == std::io::ErrorKind::TimedOut
+        ));
+        assert!(!marker.exists());
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "printf 'partial'; while :; do :; done"]);
+        assert!(matches!(
+            run_toolchain_probe(command, Instant::now() + Duration::from_millis(50)),
+            Err(ToolchainError::Io(error)) if error.kind() == std::io::ErrorKind::TimedOut
+        ));
+        // A successful subprocess cannot grant a fresh budget to a later one.
+        let until = Instant::now();
+        assert!(detect_rustc_toolchain(tmp.path(), "/bin/false", until).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn query_byte_limit_is_checked_before_parsing_and_stderr_is_not_identity() {
+        for (count, accepted) in [
+            (MAX_TOOLCHAIN_PROBE_BYTES, true),
+            (MAX_TOOLCHAIN_PROBE_BYTES + 1, false),
+        ] {
+            let mut command = Command::new("/bin/sh");
+            command
+                .args(["-c", "head -c \"$1\" /dev/zero", "query"])
+                .arg(count.to_string());
+            let result = run_toolchain_probe(command, Instant::now() + TOOLCHAIN_PROBE_BUDGET);
+            if accepted {
+                assert_eq!(result.unwrap().unwrap().len() as u64, count);
+            } else {
+                assert!(result.is_err());
+            }
+        }
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "echo stable >&2"]);
+        assert_eq!(
+            run_toolchain_probe(command, Instant::now() + TOOLCHAIN_PROBE_BUDGET).unwrap(),
+            Some(String::new())
+        );
     }
 
     // === Additional edge case tests for toolchain synchronization ===
