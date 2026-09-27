@@ -15,8 +15,8 @@
 //! - fail-open: if `rch` is not on `PATH`, run the real cargo unchanged;
 //! - IDE-safe: rust-analyzer's `--message-format=json-diagnostic-{rendered-ansi,short}`
 //!   → real cargo, local. A plain `--message-format=json` (scripts, CI, lint
-//!   gates) still offloads; treating every `--message-format` as an IDE used to
-//!   keep script-driven builds on the dev box silently;
+//!   gates) still offloads; treating every `--message-format` as an IDE was the bug
+//!   that silently kept script-driven builds on the dev box;
 //! - wrapper-safe: a caller-set `RUSTC_WORKSPACE_WRAPPER` (how `cargo clippy`
 //!   drives its inner `cargo check`) → real cargo, local, so the wrapper is
 //!   never dropped by offloading the inner invocation;
@@ -68,7 +68,12 @@ use crate::ui::theme::StatusIndicator;
 /// rewriting argv, and routes the already-supported run/zigbuild/xwin commands
 /// through ordinary RCH admission (bd-g2ppt). Test/program arguments after `--`
 /// are not IDE routing instructions. Direct clippy uses the same install policy.
-const SHIM_VERSION: &str = "5";
+///
+/// `6` preserves an explicit `+toolchain` on every local/IDE/bypass path.
+/// Rustup owns that syntax: it selects the named installation before invoking
+/// real Cargo. Passing `+nightly` to an ambient `cargo-rch-real` cannot select
+/// nightly, and dropping it would silently compile with a different toolchain.
+const SHIM_VERSION: &str = "6";
 
 /// Marker line embedded in the generated shim, used to recognize an rch-managed
 /// file (vs. a hand-rolled or unrelated `cargo` on `PATH`) and read its version.
@@ -224,6 +229,30 @@ resolve_real() {{
 # here is the only reliable cap. An explicitly-set CARGO_BUILD_JOBS always wins;
 # tune the default with RCH_LOCAL_MAX_JOBS.
 exec_local() {{
+  if [ -z "${{CARGO_BUILD_JOBS:-}}" ]; then
+    CARGO_BUILD_JOBS="${{RCH_LOCAL_MAX_JOBS:-8}}"
+    export CARGO_BUILD_JOBS
+  fi
+  # +toolchain is rustup syntax, not a real Cargo subcommand. The command-line
+  # selection outranks the ambient toolchain and any inherited handoff path.
+  # Re-enter rustup with the selected installation and an explicit loop break:
+  # its cargo may itself be an RCH toolchain wrapper.
+  case "${{1:-}}" in
+    +*)
+      selected_toolchain="${{1#+}}"
+      shift
+      if [ -z "$selected_toolchain" ]; then
+        echo "rch shim: an empty +toolchain selector cannot select Cargo" >&2
+        exit 2
+      fi
+      if ! command -v rustup >/dev/null 2>&1; then
+        echo "rch shim: rustup is required for the selected +$selected_toolchain; refusing to use another Cargo" >&2
+        exit 127
+      fi
+      RCH_CARGO_WRAPPER_BYPASS=1
+      export RCH_CARGO_WRAPPER_BYPASS
+      exec rustup run "$selected_toolchain" cargo "$@" ;;
+  esac
   resolve_real
   # A renamed toolchain cargo runs with its own bin dir FIRST on PATH, or the
   # build's rustc/clippy-driver resolve through the rustup proxy's default
@@ -235,10 +264,6 @@ exec_local() {{
       export PATH
       ;;
   esac
-  if [ -z "${{CARGO_BUILD_JOBS:-}}" ]; then
-    CARGO_BUILD_JOBS="${{RCH_LOCAL_MAX_JOBS:-8}}"
-    export CARGO_BUILD_JOBS
-  fi
   exec "$REAL" "$@"
 }}
 # Loop-break: rch sets RCH_CARGO_WRAPPER_BYPASS=1 on its own local-fallback exec.
@@ -1439,6 +1464,128 @@ mod tests {
         assert!(out.starts_with("LOCAL"), "expected local, got: {out}");
     }
 
+    #[cfg(unix)]
+    fn selected_local_output(args: &[&str], extras: &[(&str, &str)]) -> std::process::Output {
+        let dir = shim_sandbox(&cargo_shim_body(true), "cargo", &[]);
+        write_exe(
+            &dir.join("rustup"),
+            "#!/bin/sh\nprintf '%s\\000' \"${RCH_CARGO_WRAPPER_BYPASS:-unset}\" \"${CARGO_BUILD_JOBS:-unset}\" \"$@\"\nexit \"${RUSTUP_STATUS:-0}\"\n",
+        );
+        let wrong = dir.join("real-cargo");
+        let mut env = vec![
+            ("RCH_REAL_CARGO", wrong.to_str().unwrap()),
+            ("RCH_SHIM_REAL_CARGO", wrong.to_str().unwrap()),
+            ("RUSTUP_TOOLCHAIN", "wrong-ambient"),
+        ];
+        env.extend_from_slice(extras);
+        exec_shim(&dir, "cargo", args, &env, Some(&dir))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn selected_toolchain_survives_every_explicit_local_escape() {
+        let args = ["+nightly", "--offline", "test", "--", "", "a\nb", "$(false)"];
+        for cause in [
+            ("RCH_CARGO_WRAPPER_BYPASS", "1"),
+            ("RCH_SHIM_LOCAL_IDE", "1"),
+            ("RUSTC_WORKSPACE_WRAPPER", "/clippy-driver"),
+        ] {
+            for (setting, cap) in [
+                (("RCH_LOCAL_MAX_JOBS", "8"), "8"),
+                (("RCH_LOCAL_MAX_JOBS", "3"), "3"),
+                (("CARGO_BUILD_JOBS", "19"), "19"),
+            ] {
+                let out = selected_local_output(&args, &[cause, setting]);
+                assert!(out.status.success(), "{cause:?}: {:?}", out.stderr);
+                let mut expected = vec!["1", cap, "run", "nightly", "cargo"];
+                expected.extend_from_slice(&args[1..]);
+                expected.push("");
+                assert_eq!(out.stdout, expected.join("\0").as_bytes());
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn selected_toolchain_handles_local_queries_and_preserves_rustup_failure() {
+        for tail in [
+            vec!["--version"],
+            vec!["check", "--message-format=json-diagnostic-short"],
+        ] {
+            let mut args = vec!["+custom"];
+            args.extend_from_slice(&tail);
+            let out = selected_local_output(&args, &[]);
+            assert!(out.status.success());
+            let mut expected = vec!["1", "8", "run", "custom", "cargo"];
+            expected.extend(tail);
+            expected.push("");
+            assert_eq!(out.stdout, expected.join("\0").as_bytes());
+        }
+        let out = selected_local_output(
+            &["+absent", "build"],
+            &[("RCH_SHIM_LOCAL_IDE", "1"), ("RUSTUP_STATUS", "67")],
+        );
+        assert_eq!(out.status.code(), Some(67));
+        assert_eq!(out.stdout, b"1\x008\x00run\x00absent\x00cargo\x00build\x00");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unavailable_rustup_or_empty_selector_cannot_use_the_default_compiler() {
+        let dir = shim_sandbox(&cargo_shim_body(true), "cargo", &[]);
+        for (selector, expected_code) in [("+nightly", 127), ("+", 2)] {
+            let out = std::process::Command::new("/bin/sh")
+                .arg(dir.join("cargo"))
+                .args([selector, "build"])
+                .env_clear()
+                .env("PATH", &dir)
+                .env("HOME", &dir)
+                .env("RCH_SHIM_LOCAL_IDE", "1")
+                .env("RCH_REAL_CARGO", dir.join("real-cargo"))
+                .output()
+                .unwrap();
+            assert_eq!(out.status.code(), Some(expected_code));
+            assert!(out.stdout.is_empty(), "an unrelated real Cargo was executed");
+            assert!(!out.stderr.is_empty());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn selected_local_toolchain_reentry_uses_the_real_wrapped_toolchain() {
+        let dir = shim_sandbox(&cargo_shim_body(true), "cargo", &[]);
+        let toolchain = dir.join(".rustup/toolchains/selected/bin");
+        let canonical = dir.join(".rch/shims");
+        std::fs::create_dir_all(&toolchain).unwrap();
+        std::fs::create_dir_all(&canonical).unwrap();
+        write_exe(&canonical.join("cargo"), &cargo_shim_body(true));
+        write_exe(&toolchain.join("cargo"), &toolchain_wrap_body());
+        write_exe(&toolchain.join("cargo-rch-real"), "#!/bin/sh\nexec rustc \"$@\"\n");
+        write_exe(
+            &toolchain.join("rustc"),
+            "#!/bin/sh\nprintf '%s\\000' SELECTED \"${RCH_CARGO_WRAPPER_BYPASS:-unset}\" \"${CARGO_BUILD_JOBS:-unset}\" \"$@\"\n",
+        );
+        write_exe(&dir.join("rustc"), "#!/bin/sh\necho WRONG-COMPILER\nexit 91\n");
+        write_exe(
+            &dir.join("rustup"),
+            r#"#!/bin/sh
+[ "$1" = run ] && [ "$2" = selected ] && [ "$3" = cargo ] || exit 92
+shift 3
+exec "$HOME/.rustup/toolchains/selected/bin/cargo" "$@"
+"#,
+        );
+        let out = exec_shim(
+            &dir,
+            "cargo",
+            &["+selected", "build", "--locked"],
+            &[("RCH_SHIM_LOCAL_IDE", "1"), ("RUSTUP_TOOLCHAIN", "wrong-ambient")],
+            Some(&dir),
+        );
+        assert!(out.status.success(), "{:?}", out.stderr);
+        assert_eq!(out.stdout, b"SELECTED\x001\x008\x00build\x00--locked\x00");
+        assert!(out.stderr.is_empty());
+    }
+
     /// Exercise the generated POSIX shell, not a second routing model. The
     /// boundary stubs record NUL-delimited arguments and policy; no compiler,
     /// installed shim, worker, or process-global environment is touched.
@@ -1463,7 +1610,13 @@ mod tests {
         );
         write_exe(
             &root.join("real-cargo"),
-            "#!/bin/sh\nprintf '%s\\0' LOCAL \"${CARGO_BUILD_JOBS:-unset}\"\nprintf '%s\\0' \"$@\"\n",
+            "#!/bin/sh\nprintf '%s\\0' LOCAL \"${CARGO_BUILD_JOBS:-unset}\"\nif [ \"$#\" -gt 0 ]; then printf '%s\\0' \"$@\"; fi\n",
+        );
+        // Model only Rustup's explicit handoff, without inspecting installed
+        // toolchains. The selected Cargo receives no +toolchain pseudo-command.
+        write_exe(
+            &root.join("rustup"),
+            "#!/bin/sh\n[ \"$1\" = run ] && [ \"$3\" = cargo ] || exit 92\nRUSTUP_TOOLCHAIN=$2\nexport RUSTUP_TOOLCHAIN\nshift 3\nexec \"$HOME/real-cargo\" \"$@\"\n",
         );
         let mut command = std::process::Command::new("/bin/sh");
         command
@@ -1553,9 +1706,14 @@ mod tests {
             assert!(output.status.success(), "{:?}: {:?}", args, output);
             let fields = recorded_fields(&output);
             assert_eq!(&fields[..2], &[b"LOCAL".as_slice(), b"8"]);
+            let expected: &[&str] = if args.first().is_some_and(|arg| arg.starts_with('+')) {
+                &args[1..]
+            } else {
+                args
+            };
             assert_eq!(
                 &fields[2..],
-                args.iter().map(|arg| arg.as_bytes()).collect::<Vec<_>>()
+                expected.iter().map(|arg| arg.as_bytes()).collect::<Vec<_>>()
             );
         }
     }
