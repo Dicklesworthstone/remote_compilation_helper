@@ -1129,16 +1129,21 @@ impl BuildHistory {
         let mut records = VecDeque::with_capacity(capacity);
         let mut max_id = 0u64;
 
+        // Split on raw bytes: `lines()` turns one invalid UTF-8 sequence (a
+        // short append cut through a multi-byte char on disk-full or crash)
+        // into an error for the whole load, and the daemon then refused to
+        // start. A damaged line is skipped like any other unparseable record;
+        // only real read errors still fail the load.
         for line in file
             .into_iter()
-            .flat_map(|file| BufReader::new(file).lines())
+            .flat_map(|file| BufReader::new(file).split(b'\n'))
         {
             let line = line?;
-            if line.trim().is_empty() {
+            if line.trim_ascii().is_empty() {
                 continue;
             }
 
-            match serde_json::from_str::<BuildRecord>(&line) {
+            match serde_json::from_slice::<BuildRecord>(&line) {
                 Ok(record) => {
                     max_id = max_id.max(record.id);
                     if records.len() >= capacity {
@@ -2318,6 +2323,29 @@ mod tests {
 
         assert_eq!(recent.len(), 3);
         assert_eq!(recent[0].id, 3);
+    }
+
+    /// A torn append (disk full / crash mid multi-byte char) must cost one
+    /// record, not the daemon's ability to start.
+    #[tokio::test]
+    async fn test_load_skips_non_utf8_line_instead_of_failing() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("history.jsonl");
+        let history = BuildHistory::new(5).with_persistence(path.clone());
+        if let Some(handle) = history.record(make_build_record(1)) {
+            handle.await.unwrap();
+        }
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes.extend_from_slice(b"{\"id\":2,\"command\":\"cargo build \xE2\x82\n");
+        std::fs::write(&path, &bytes).unwrap();
+        let history = BuildHistory::new(5).with_persistence(path.clone());
+        if let Some(handle) = history.record(make_build_record(3)) {
+            handle.await.unwrap();
+        }
+
+        let loaded = BuildHistory::load_from_file(&path, 5).unwrap();
+        let ids: Vec<u64> = loaded.recent(10).iter().map(|record| record.id).collect();
+        assert_eq!(ids, vec![3, 1]);
     }
 
     #[tokio::test]

@@ -1056,16 +1056,24 @@ async fn main() -> Result<()> {
             .with_max_queue_depth(daemon_config.queue.max_depth),
     );
     for build in history.active_builds() {
-        let worker = worker_pool
+        // A durable build can outlive its worker's workers.toml entry (host
+        // decommissioned, drained and removed, lapsed). Refusing to START over
+        // it turned one stale record into a systemd crash loop and a dispatcher
+        // that built everything locally. The build keeps its ownership record
+        // (its remote process may still exist, so it is never released without
+        // proof); there is simply no pool entry to restore slots to, and a
+        // removed worker is never selected again.
+        let Some(worker) = worker_pool
             .get(&rch_common::WorkerId::new(&build.worker_id))
             .await
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Durable build {} owns missing worker {}; refusing admission",
-                    build.id,
-                    build.worker_id
-                )
-            })?;
+        else {
+            warn!(
+                "Durable build {} owns worker {}, which is no longer configured; \
+                 keeping its ownership record without restoring slots",
+                build.id, build.worker_id
+            );
+            continue;
+        };
         worker.restore_slots(build.slots)?;
     }
 
