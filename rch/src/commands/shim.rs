@@ -63,7 +63,12 @@ use crate::ui::theme::StatusIndicator;
 /// `rustc --print sysroot`) → `$HOME/.cargo/bin/cargo`; a resolved
 /// `cargo-rch-real` gets its bin dir prepended to PATH so the build's rustc /
 /// clippy-driver come from the same toolchain (repo `-Z` flags need it).
-const SHIM_VERSION: &str = "4";
+///
+/// `5` recognizes Cargo's leading global options and toolchain selector without
+/// rewriting argv, and routes the already-supported run/zigbuild/xwin commands
+/// through ordinary RCH admission (bd-g2ppt). Test/program arguments after `--`
+/// are not IDE routing instructions. Direct clippy uses the same install policy.
+const SHIM_VERSION: &str = "5";
 
 /// Marker line embedded in the generated shim, used to recognize an rch-managed
 /// file (vs. a hand-rolled or unrelated `cargo` on `PATH`) and read its version.
@@ -100,7 +105,12 @@ fn cargo_clippy_shim_path() -> Result<PathBuf> {
 ///     re-entering `rch` here would double-offload; pass it straight through.
 ///   * `cargo-clippy ...` → invoked directly by a script. This is the leak, and
 ///     it is normalized to `cargo clippy ...` and offloaded.
-fn cargo_clippy_shim_body() -> String {
+fn cargo_clippy_shim_body(require_remote: bool) -> String {
+    let offload = if require_remote {
+        "exec env RCH_REQUIRE_REMOTE=1 RCH_QUEUE_WHEN_BUSY=1 rch exec -- cargo clippy \"$@\""
+    } else {
+        "exec rch exec -- cargo clippy \"$@\""
+    };
     format!(
         r##"#!/bin/sh
 # rch cargo-clippy shim — MANAGED FILE, edit via `rch shim install`.
@@ -133,10 +143,11 @@ if [ "${{1:-}}" = "clippy" ]; then
   exec_local "$@"
 fi
 # Direct invocation — normalize to `cargo clippy` and offload.
-exec rch exec -- cargo clippy "$@"
+{offload}
 "##,
         marker = SHIM_MARKER,
         version = SHIM_VERSION,
+        offload = offload,
     )
 }
 
@@ -252,14 +263,48 @@ fi
 # `--message-format=json` is what scripts, CI and build tooling pass, and those
 # must still offload — treating every --message-format as an IDE was the bug
 # that silently kept script-driven builds on the dev box.
+format_value=0
 for a in "$@"; do
+  if [ "$format_value" = "1" ]; then
+    case "$a" in
+      json-diagnostic-rendered-ansi*|json-diagnostic-short*) exec_local "$@" ;;
+    esac
+    format_value=0
+    continue
+  fi
   case "$a" in
+    --) break ;;
+    --message-format) format_value=1 ;;
     --message-format=json-diagnostic-rendered-ansi*|--message-format=json-diagnostic-short*)
       exec_local "$@" ;;
   esac
 done
-case "${{1:-}}" in
-  build|b|test|t|check|c|clippy|bench|doc|nextest)
+# Inspect a function-local copy of argv. Never shift the caller's arguments or
+# reconstruct a shell command: option values can contain spaces, quotes, and
+# names such as "build". RCH still owns eligibility, topology and placement.
+# Only the first argument can be rustup's +toolchain selector. Unknown options
+# stay local rather than guessing. Recognizing -C does not change cwd here:
+# RCH's source-closure preflight must still approve or refuse that request.
+find_subcommand() {{
+  rch_subcommand=
+  case "${{1:-}}" in +?*) shift ;; esac
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      -v|-vv|-vvv|--verbose|-q|--quiet|--locked|--offline|--frozen) shift ;;
+      --color|--config|-Z|-C)
+        [ "$#" -ge 2 ] || return 0
+        shift 2 ;;
+      --color=?*|--config=?*|-Z?*|-C?*) shift ;;
+      --) shift; break ;;
+      -*) return 0 ;;
+      *) break ;;
+    esac
+  done
+  rch_subcommand="${{1:-}}"
+}}
+find_subcommand "$@"
+case "$rch_subcommand" in
+  build|b|test|t|check|c|clippy|bench|doc|nextest|run|r|zigbuild|xwin)
     {offload} ;;
   *)
     exec_local "$@" ;;
@@ -714,7 +759,7 @@ pub fn shim_install(
     // `cargo-clippy` is a separate binary on PATH; a script calling it directly
     // never touches the cargo shim, so it needs its own.
     let clippy_path = cargo_clippy_shim_path()?;
-    atomic_write(&clippy_path, cargo_clippy_shim_body().as_bytes()).with_context(|| {
+    atomic_write(&clippy_path, cargo_clippy_shim_body(require_remote).as_bytes()).with_context(|| {
         format!(
             "Failed to write cargo-clippy shim to {}",
             clippy_path.display()
@@ -1314,9 +1359,9 @@ mod tests {
                 vec!["check", "--message-format=json-diagnostic-short"],
                 vec![],
             ),
-            // Non-build subcommands fall through the catch-all arm; `cargo run`
-            // compiles just as much as `cargo build`.
-            (vec!["run"], vec![]),
+            // Non-build subcommands still use the capped local path. `run`
+            // now reaches RCH's existing cargo-run classification instead of bypassing it.
+            (vec!["metadata"], vec![]),
         ] {
             let out = run_shim(&body, "cargo", &args, &env);
             assert!(out.starts_with("LOCAL"), "{args:?} should be local: {out}");
@@ -1374,7 +1419,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn clippy_shim_local_paths_cap_parallelism() {
-        let body = cargo_clippy_shim_body();
+        let body = cargo_clippy_shim_body(true);
         for (args, env) in [
             (vec!["--version"], vec![("RCH_CARGO_WRAPPER_BYPASS", "1")]),
             // Invoked BY cargo as a subcommand: outer cargo already decided.
@@ -1392,6 +1437,272 @@ mod tests {
         let body = cargo_shim_body(true);
         let out = run_shim(&body, "cargo", &["build"], &[("RCH_SHIM_LOCAL_IDE", "1")]);
         assert!(out.starts_with("LOCAL"), "expected local, got: {out}");
+    }
+
+    /// Exercise the generated POSIX shell, not a second routing model. The
+    /// boundary stubs record NUL-delimited arguments and policy; no compiler,
+    /// installed shim, worker, or process-global environment is touched.
+    #[cfg(unix)]
+    fn record_shim(
+        body: &str,
+        args: &[std::ffi::OsString],
+        env: &[(&str, &str)],
+    ) -> std::process::Output {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        write_exe(&root.join("shim"), body);
+        write_exe(
+            &root.join("rch"),
+            concat!(
+                "#!/bin/sh\n",
+                "printf '%s\\0' RCH \"${RCH_REQUIRE_REMOTE:-unset}\" ",
+                "\"${RCH_QUEUE_WHEN_BUSY:-unset}\" \"${CARGO_BUILD_JOBS:-unset}\"\n",
+                "printf '%s\\0' \"$@\"\n",
+                "exit \"${STUB_RCH_EXIT:-0}\"\n",
+            ),
+        );
+        write_exe(
+            &root.join("real-cargo"),
+            "#!/bin/sh\nprintf '%s\\0' LOCAL \"${CARGO_BUILD_JOBS:-unset}\"\nprintf '%s\\0' \"$@\"\n",
+        );
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .arg(root.join("shim"))
+            .args(args)
+            .env_clear()
+            .env("PATH", format!("{}:/usr/bin:/bin", root.display()))
+            .env("HOME", root)
+            .env("RCH_SHIM_REAL_CARGO", root.join("real-cargo"))
+            .env("RCH_SHIM_REAL_CARGO_CLIPPY", root.join("real-cargo"));
+        for (name, value) in env {
+            command.env(name, value);
+        }
+        output_retrying_text_busy(&mut command)
+    }
+
+    #[cfg(unix)]
+    fn argv_bytes(args: &[&str]) -> Vec<std::ffi::OsString> {
+        args.iter()
+            .map(|arg| std::ffi::OsString::from(*arg))
+            .collect()
+    }
+
+    #[cfg(unix)]
+    fn recorded_fields(output: &std::process::Output) -> Vec<&[u8]> {
+        let mut fields: Vec<_> = output.stdout.split(|byte| *byte == 0).collect();
+        assert_eq!(fields.pop(), Some(&b""[..]), "unterminated argument record");
+        fields
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn global_options_and_toolchain_selectors_reach_rch_with_original_arguments() {
+        let cases: &[&[&str]] = &[
+            &["+nightly", "build", "--release"],
+            &["+1.90.0", "--offline", "test", "--", "--nocapture"],
+            &["--color", "never", "--locked", "check"],
+            &["--config", "build.jobs=2", "build"],
+            &["--config=build.jobs=2", "-vvv", "clippy"],
+            &["+nightly", "-Z", "unstable-options", "build"],
+            &[
+                "+nightly",
+                "-Zunstable-options",
+                "-C",
+                "/selected/project",
+                "build",
+            ],
+            &["--", "build"],
+        ];
+        for args in cases {
+            let command = shell_words::join(std::iter::once("cargo").chain(args.iter().copied()));
+            assert!(
+                rch_common::classify_command(&command).is_compilation,
+                "{command}"
+            );
+            let output = record_shim(&cargo_shim_body(true), &argv_bytes(args), &[]);
+            assert!(output.status.success(), "{:?}: {:?}", args, output);
+            let fields = recorded_fields(&output);
+            assert_eq!(
+                &fields[..7],
+                &[b"RCH".as_slice(), b"1", b"1", b"unset", b"exec", b"--", b"cargo"]
+            );
+            assert_eq!(
+                &fields[7..],
+                args.iter().map(|arg| arg.as_bytes()).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opaque_global_values_and_local_aliases_are_not_build_commands() {
+        let cases: &[&[&str]] = &[
+            &["--config", "build", "metadata"],
+            &["--color", "test", "--version"],
+            &["--config", "alias.ltest=\"test --lib\"", "ltest"],
+            &["+nightly", "fmt", "--check"],
+            &["+nightly", "--help", "build"],
+            &["--unknown", "build"],
+            &["--config"],
+            &["--color", "build"],
+            &["-Z", "build"],
+            &["+nightly"],
+        ];
+        for args in cases {
+            let output = record_shim(&cargo_shim_body(true), &argv_bytes(args), &[]);
+            assert!(output.status.success(), "{:?}: {:?}", args, output);
+            let fields = recorded_fields(&output);
+            assert_eq!(&fields[..2], &[b"LOCAL".as_slice(), b"8"]);
+            assert_eq!(
+                &fields[2..],
+                args.iter().map(|arg| arg.as_bytes()).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn additional_supported_build_entrypoints_no_longer_bypass_rch() {
+        for args in [vec!["run"], vec!["r"], vec!["zigbuild"], vec!["xwin", "build"]] {
+            let command = shell_words::join(std::iter::once("cargo").chain(args.iter().copied()));
+            assert!(
+                rch_common::classify_command(&command).is_compilation,
+                "{command}"
+            );
+            let output = record_shim(&cargo_shim_body(true), &argv_bytes(&args), &[]);
+            assert!(output.status.success());
+            assert_eq!(recorded_fields(&output)[0], b"RCH");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn separate_ide_format_is_local_but_payload_format_is_not_a_routing_option() {
+        for format in ["json-diagnostic-rendered-ansi", "json-diagnostic-short"] {
+            let args = argv_bytes(&["check", "--message-format", format]);
+            let output = record_shim(&cargo_shim_body(true), &args, &[]);
+            assert_eq!(recorded_fields(&output)[0], b"LOCAL");
+            for args in [
+                vec![
+                    "test".to_owned(),
+                    "--".to_owned(),
+                    format!("--message-format={format}"),
+                ],
+                vec![
+                    "test".to_owned(),
+                    "--".to_owned(),
+                    "--message-format".to_owned(),
+                    format.to_owned(),
+                ],
+            ] {
+                let args: Vec<_> = args.into_iter().map(std::ffi::OsString::from).collect();
+                let output = record_shim(&cargo_shim_body(true), &args, &[]);
+                assert_eq!(recorded_fields(&output)[0], b"RCH");
+            }
+        }
+        let output = record_shim(
+            &cargo_shim_body(true),
+            &argv_bytes(&["check", "--message-format", "json"]),
+            &[],
+        );
+        assert_eq!(recorded_fields(&output)[0], b"RCH");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shim_handoff_preserves_literal_and_non_utf8_arguments() {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        let mut args = argv_bytes(&[
+            "+nightly",
+            "--config",
+            "build.rustflags=['--cfg', 'feature=\"a b\"']",
+            "test",
+            "--",
+            "",
+            "with space",
+            "literal'quote",
+            "$(not-executed)",
+            "*.rs",
+            "line\nbreak",
+            "--message-format=json-diagnostic-short",
+        ]);
+        args.push(std::ffi::OsString::from_vec(b"raw-\xff\xfe".to_vec()));
+        let output = record_shim(&cargo_shim_body(true), &args, &[]);
+        assert!(output.status.success());
+        let fields = recorded_fields(&output);
+        assert_eq!(fields[0], b"RCH");
+        assert_eq!(
+            &fields[7..],
+            args.iter().map(|arg| arg.as_bytes()).collect::<Vec<_>>()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cargo_and_direct_clippy_share_install_policy_without_a_local_job_cap() {
+        for strict in [false, true] {
+            for (body, args, clippy) in [
+                (
+                    cargo_shim_body(strict),
+                    vec!["--locked", "clippy", "--all-targets"],
+                    false,
+                ),
+                (
+                    cargo_clippy_shim_body(strict),
+                    vec!["--all-targets", "--", "-D", "warnings"],
+                    true,
+                ),
+            ] {
+                let output = record_shim(&body, &argv_bytes(&args), &[]);
+                assert!(output.status.success());
+                let fields = recorded_fields(&output);
+                let policy = if strict {
+                    b"1".as_slice()
+                } else {
+                    b"unset".as_slice()
+                };
+                assert_eq!(&fields[..4], &[b"RCH".as_slice(), policy, policy, b"unset"]);
+                let mut expected = vec![b"exec".as_slice(), b"--", b"cargo"];
+                if clippy {
+                    expected.push(b"clippy");
+                }
+                expected.extend(args.iter().map(|arg| arg.as_bytes()));
+                assert_eq!(&fields[4..], expected);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn routing_failure_preserves_exit_and_never_runs_the_local_stub() {
+        for (body, args) in [
+            (cargo_shim_body(true), vec!["+nightly", "--locked", "clippy"]),
+            (cargo_clippy_shim_body(true), vec!["--all-targets"]),
+        ] {
+            for exit in ["1", "101", "103", "137"] {
+                let output = record_shim(&body, &argv_bytes(&args), &[("STUB_RCH_EXIT", exit)]);
+                assert_eq!(output.status.code(), Some(exit.parse().unwrap()));
+                assert_eq!(recorded_fields(&output)[0], b"RCH");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_local_controls_still_bypass_prefixed_builds() {
+        for control in [
+            "RCH_CARGO_WRAPPER_BYPASS",
+            "RCH_SHIM_LOCAL_IDE",
+            "RUSTC_WORKSPACE_WRAPPER",
+        ] {
+            let output = record_shim(
+                &cargo_shim_body(true),
+                &argv_bytes(&["+nightly", "--offline", "build"]),
+                &[(control, "1")],
+            );
+            assert!(output.status.success());
+            assert_eq!(&recorded_fields(&output)[..2], &[b"LOCAL".as_slice(), b"8"]);
+        }
     }
 
     // --- tiered real-cargo resolution (shim v4) -----------------------------
@@ -1740,7 +2051,7 @@ esac
     #[cfg(unix)]
     #[test]
     fn direct_cargo_clippy_offloads() {
-        let body = cargo_clippy_shim_body();
+        let body = cargo_clippy_shim_body(true);
         let out = run_shim(&body, "cargo-clippy", &["--all-targets"], &[]);
         assert!(out.starts_with("OFFLOAD"), "expected offload, got: {out}");
         assert!(
@@ -1754,14 +2065,14 @@ esac
     #[cfg(unix)]
     #[test]
     fn cargo_clippy_as_subcommand_passes_through() {
-        let body = cargo_clippy_shim_body();
+        let body = cargo_clippy_shim_body(true);
         let out = run_shim(&body, "cargo-clippy", &["clippy", "--all-targets"], &[]);
         assert!(out.starts_with("LOCAL"), "expected passthrough, got: {out}");
     }
 
     #[test]
     fn clippy_shim_carries_the_version_marker() {
-        let body = cargo_clippy_shim_body();
+        let body = cargo_clippy_shim_body(true);
         assert_eq!(
             installed_shim_version_from_str(&body).as_deref(),
             Some(SHIM_VERSION)
