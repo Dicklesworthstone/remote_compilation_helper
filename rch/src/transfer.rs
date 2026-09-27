@@ -2146,8 +2146,10 @@ impl TransferPipeline {
         );
         // GNU `tail --pid` exits only after a final read once the supervisor
         // is gone, so the stream ends with the last byte of output. It needs
-        // the supervisor reaped first (a zombie still answers `kill -0`).
-        // Without it, the old bounded `sleep 1; kill` can cut a slow tail.
+        // the supervisor reaped first (a zombie still answers `kill -0`). A
+        // 120s backstop bounds the wait should the reaped PID be reused
+        // before tail notices. Without `--pid`, the old bounded
+        // `sleep 1; kill` can still cut a slow tail.
         format!(
             "set -e; umask 077; mkdir -p -- {directory}; mkdir {claim}; : > {out}; : > {err}; \
              nohup sh -c {supervisor} </dev/null >{out} 2>{err} & \
@@ -2156,7 +2158,10 @@ impl TransferPipeline {
              trap 'kill \"$a\" \"$b\" 2>/dev/null || :' EXIT; \
              while [ ! -f {done} ]; do sleep 1; done; \
              wait \"$p\" || :; \
-             if [ -n \"$follow\" ]; then wait \"$a\" \"$b\" || :; else sleep 1; kill \"$a\" \"$b\" 2>/dev/null || :; fi; \
+             if [ -n \"$follow\" ]; then \
+               ( sleep 120 & s=$!; trap 'kill \"$s\" 2>/dev/null; exit 0' TERM; wait \"$s\"; kill \"$a\" \"$b\" 2>/dev/null ) & k=$!; \
+               wait \"$a\" \"$b\" || :; kill \"$k\" 2>/dev/null || :; \
+             else sleep 1; kill \"$a\" \"$b\" 2>/dev/null || :; fi; \
              read -r identity status < {done}; [ \"$identity\" = {identity} ]; exit \"$status\"",
             claim = quote(&format!("{path}.started")),
             out = quote(&format!("{path}.stdout")),
@@ -2217,16 +2222,16 @@ impl TransferPipeline {
             return Ok(());
         };
         let script = recovery_completion_cleanup_script(path);
-        let output = tokio::time::timeout(
-            Duration::from_secs(10),
-            self.worker_ssh_command_with_activity(
-                worker,
-                &["sh", "-c", &escape(Cow::from(script.as_str()))],
-                false,
-            )
-            .output(),
-        )
-        .await??;
+        let mut command = self.worker_ssh_command_with_activity(
+            worker,
+            &["sh", "-c", &escape(Cow::from(script.as_str()))],
+            false,
+        );
+        // Best-effort garbage removal after the result is already delivered:
+        // bound what an unresponsive worker can add, and never leave the ssh
+        // client running past the deadline.
+        command.kill_on_drop(true);
+        let output = tokio::time::timeout(Duration::from_secs(3), command.output()).await??;
         anyhow::ensure!(
             output.status.success(),
             "completion receipt cleanup failed: {}",
@@ -5133,9 +5138,13 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         // Seeing the completion receipt means the workload finished, not that
         // its output has arrived: the remote wrapper is still streaming the
         // tail. Keep draining until the channel closes; kill only a channel
-        // that stays open past this grace (the hung case the probe exists for).
-        const COMPLETION_DRAIN_GRACE: Duration = Duration::from_secs(15);
+        // that goes quiet for the idle grace, or outlives the cap (the hung
+        // case the probe exists for). A large final burst over a slow link
+        // keeps extending the idle deadline.
+        const COMPLETION_DRAIN_IDLE: Duration = Duration::from_secs(15);
+        const COMPLETION_DRAIN_CAP: Duration = Duration::from_secs(120);
         let mut drain_deadline: Option<tokio::time::Instant> = None;
+        let mut drain_cap: Option<tokio::time::Instant> = None;
 
         let status = match tokio::time::timeout(command_timeout, async {
             loop {
@@ -5150,7 +5159,9 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
                     _ = completion_tick.tick(), if self.recovery_completion.is_some() && durable_status.is_none() => {
                         if let Ok(Some(status)) = self.read_recovery_completion(worker).await {
                             durable_status = Some(status);
-                            drain_deadline = Some(tokio::time::Instant::now() + COMPLETION_DRAIN_GRACE);
+                            let now = tokio::time::Instant::now();
+                            drain_cap = Some(now + COMPLETION_DRAIN_CAP);
+                            drain_deadline = Some(now + COMPLETION_DRAIN_IDLE);
                         }
                         continue;
                     }
@@ -5159,6 +5170,9 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
                         break;
                     }
                 };
+                if let Some(cap) = drain_cap {
+                    drain_deadline = Some((tokio::time::Instant::now() + COMPLETION_DRAIN_IDLE).min(cap));
+                }
                 match event {
                     StreamEvent::Stdout(line) => {
                         on_stdout(&line);
@@ -7464,6 +7478,39 @@ mod tests {
         assert!(stdout.ends_with("line-19999\n"), "tail was cut");
         assert_eq!(String::from_utf8_lossy(&output.stderr), "last\n");
         assert!(std::path::Path::new(&receipt).is_file());
+    }
+
+    /// A reader that lags behind the wrapper (a slow SSH link) leaves tail
+    /// blocked on a full pipe when the command finishes; the stream must
+    /// still end with the last line rather than being cut by a timer.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn durable_execution_waits_for_a_slow_reader() {
+        let directory = tempfile::tempdir().unwrap();
+        let receipt = directory
+            .path()
+            .join("recovery-9-id")
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let pipeline = TransferPipeline::new(
+            PathBuf::from("/home/user/project"),
+            "myproject".to_string(),
+            "abc123".to_string(),
+            TransferConfig::default(),
+        )
+        .with_recovery_completion(receipt, "id".to_string());
+        let command = pipeline.durable_execution_command(
+            "i=0; while [ $i -lt 20000 ]; do echo line-$i; i=$((i + 1)); done".to_string(),
+        );
+        let output = std::process::Command::new("sh") // ubs:ignore — fixed wrapper piped into a delayed reader
+            .arg("-c")
+            .arg(format!("( {command} ) | ( sleep 3; cat )"))
+            .output()
+            .expect("run durable wrapper");
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(stdout.lines().count(), 20_000);
+        assert!(stdout.ends_with("line-19999\n"), "tail was cut");
     }
 
     #[test]
