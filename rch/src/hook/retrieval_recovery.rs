@@ -711,7 +711,25 @@ impl RecoverySession {
             pair.release().await?;
         }
         self.pair_released()?;
-        self.retired()
+        self.retired()?;
+        self.discard_completion_receipts().await;
+        Ok(())
+    }
+    /// Worker receipts are garbage once retirement is durable. A failed delete
+    /// strands a few small files and must never fail the finished build.
+    async fn discard_completion_receipts(&self) {
+        let pipeline = self.completion_pipeline(TransferPipeline::new(
+            self.recipe.project_root.clone(),
+            "recovery".into(),
+            self.recipe.identity.clone(),
+            self.recipe.transfer.clone(),
+        ));
+        if let Err(error) = pipeline
+            .discard_recovery_completion(&self.recipe.worker)
+            .await
+        {
+            debug!(worker = %self.recipe.worker.id, %error, "completion receipt cleanup failed");
+        }
     }
 }
 
@@ -933,6 +951,7 @@ pub(crate) async fn recover_job(writer: &DurableLeaseWriter) -> anyhow::Result<i
     sources.release().await?;
     session.sources_released()?;
     session.retired()?;
+    session.discard_completion_receipts().await;
     writer.record_exit(exit)?;
     writer.acknowledge_terminal()?;
     Ok(exit)

@@ -771,6 +771,20 @@ pub(crate) fn remote_timeout_kill_script(pgid_file: &str, build_id: u64) -> Stri
     )
 }
 
+/// Removes every file the durable supervisor writes beside `path`; the claim
+/// is an empty `mkdir` directory. Succeeds when nothing is left.
+fn recovery_completion_cleanup_script(path: &str) -> String {
+    let quote = |value: String| escape(Cow::from(value)).into_owned();
+    format!(
+        "rm -f -- {done} {pending} {out} {err} && {{ rmdir -- {claim} 2>/dev/null || [ ! -e {claim} ]; }}",
+        done = quote(path.to_owned()),
+        pending = quote(format!("{path}.pending")),
+        out = quote(format!("{path}.stdout")),
+        err = quote(format!("{path}.stderr")),
+        claim = quote(format!("{path}.started")),
+    )
+}
+
 /// The same identity publisher and verifier used by daemon crash recovery.
 /// Arguments: record path, timeout seconds, deadline marker, build ID, command.
 fn remote_build_watchdog_script() -> String {
@@ -2187,6 +2201,32 @@ impl TransferPipeline {
             "invalid remote completion status"
         );
         Ok(Some(status))
+    }
+
+    /// Delete the supervisor's claim, logs, and completion receipt. Call only
+    /// once the local recipe is durably retired: until then the receipt is the
+    /// sole completion proof and the claim is what forbids a second launch.
+    pub(crate) async fn discard_recovery_completion(&self, worker: &WorkerConfig) -> Result<()> {
+        let Some((path, _)) = &self.recovery_completion else {
+            return Ok(());
+        };
+        let script = recovery_completion_cleanup_script(path);
+        let output = tokio::time::timeout(
+            Duration::from_secs(10),
+            self.worker_ssh_command_with_activity(
+                worker,
+                &["sh", "-c", &escape(Cow::from(script.as_str()))],
+                false,
+            )
+            .output(),
+        )
+        .await??;
+        anyhow::ensure!(
+            output.status.success(),
+            "completion receipt cleanup failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        Ok(())
     }
 
     /// Pin the rsync binary and flavour instead of probing (issue #66).
@@ -7369,6 +7409,34 @@ pub fn default_c_cpp_artifact_patterns() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recovery_completion_cleanup_removes_only_its_own_receipts() {
+        let directory = tempfile::tempdir().unwrap();
+        let base = directory.path().join("rch base");
+        std::fs::create_dir(&base).unwrap();
+        let path = base.join("recovery-7-id").to_str().unwrap().to_owned();
+        let neighbour = base.join("recovery-8-id.done");
+        std::fs::create_dir(format!("{path}.started")).unwrap();
+        for suffix in ["", ".stdout", ".stderr"] {
+            std::fs::write(format!("{path}{suffix}"), b"x").unwrap();
+        }
+        std::fs::write(&neighbour, b"x").unwrap();
+        let script = recovery_completion_cleanup_script(&path);
+        for _ in 0..2 {
+            let status = std::process::Command::new("sh") // ubs:ignore — fixed cleanup script over this test's temporary tree
+                .arg("-c")
+                .arg(&script)
+                .status()
+                .expect("run cleanup script");
+            assert!(status.success(), "cleanup must succeed, also when rerun");
+        }
+        let left: Vec<_> = std::fs::read_dir(&base)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(left, vec![std::ffi::OsString::from("recovery-8-id.done")]);
+    }
 
     #[tokio::test]
     async fn bounded_output_stream_refuses_one_byte_over_cap() {
