@@ -5,7 +5,7 @@
 
 use crate::hook::{
     cargo_job_count_for_command, estimate_cores_for_command, extract_project_name_with_policy,
-    preferred_workers, query_daemon, release_worker, required_runtime_for_kind,
+    preferred_workers, query_daemon_dry_run, required_runtime_for_kind,
 };
 use crate::status_types::{
     DaemonFullStatusResponse, IssueFromApi, SelfTestHistoryResponseFromApi,
@@ -27,7 +27,7 @@ use rch_common::storm_control::{
     all_passed, build_live_storm_run, check_all_invariants,
 };
 use rch_common::{
-    ApiResponse, CommandPriority, PlacementPlan, RequestedWorkerFacts, RequestedWorkerOutcome,
+    ApiResponse, PlacementPlan, RequestedWorkerFacts, RequestedWorkerOutcome,
     RequiredRuntime, WorkerConfig, evaluate_requested_worker, normalize_project_path_with_policy,
     resolve_placement,
 };
@@ -484,41 +484,21 @@ pub async fn diagnose(command: &str, dry_run: bool, ctx: &OutputContext) -> Resu
             .and_then(|root| detect_toolchain(root).ok());
         let preferred_workers = preferred_workers(); // env + project .rch/config.toml [routing]
 
-        match query_daemon(
+        // A dry run: a real selection opens a durable build, and releasing it
+        // without its build_id is refused, so every diagnose leaked a ghost
+        // build holding slots until the daemon restarted.
+        match query_daemon_dry_run(
             &socket_path,
             &project,
             estimated_cores,
             command,
             toolchain.as_ref(),
             required_runtime,
-            CommandPriority::Normal,
-            0,
-            None,
-            None,
-            false,
             &preferred_workers,
-            false,
-            &[], // admission preflight is compilation-scoped: no tool requirements
         )
         .await
         {
             Ok(response) => {
-                if let Some(worker) = response.worker.as_ref()
-                    && let Err(err) = release_worker(
-                        &socket_path,
-                        &worker.id,
-                        estimated_cores,
-                        None,
-                        None,
-                        None,
-                        None,
-                        None, // timing
-                        None, // local_wrapper_id
-                    )
-                    .await
-                {
-                    debug!("Failed to release worker slots: {}", err);
-                }
                 worker_selection = Some(DiagnoseWorkerSelection {
                     estimated_cores,
                     cargo_jobs,
@@ -528,7 +508,7 @@ pub async fn diagnose(command: &str, dry_run: bool, ctx: &OutputContext) -> Resu
                 });
                 if let Some(worker) = response.worker.as_ref() {
                     debug!(
-                        "Worker selected id='{}' slots_remaining_after_reservation={} speed_score={:.2} reason={:?}",
+                        "Worker selected id='{}' slots_free={} speed_score={:.2} reason={:?}",
                         worker.id, worker.slots_available, worker.speed_score, response.reason
                     );
                 } else {
@@ -894,7 +874,7 @@ pub async fn diagnose(command: &str, dry_run: bool, ctx: &OutputContext) -> Resu
                 );
                 println!(
                     "  {} {}",
-                    style.key("Slots remaining after reservation:"),
+                    style.key("Slots free:"),
                     style.value(&worker.slots_available.to_string())
                 );
                 println!("  {} {:.1}", style.key("Speed score:"), worker.speed_score);

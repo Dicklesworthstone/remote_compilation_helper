@@ -111,6 +111,9 @@ enum ApiRequest {
         /// Optional client-provided max queue wait timeout (seconds).
         /// Effective wait timeout is min(daemon queue timeout, client timeout).
         wait_timeout_secs: Option<u64>,
+        /// Report which worker would be chosen without reserving slots or
+        /// opening a durable build (`rch diagnose`).
+        dry_run: bool,
     },
     ReleaseWorker(ReleaseRequest),
     RecordBuild {
@@ -734,16 +737,21 @@ async fn handle_connection_with_metrics(
             local_wrapper_id,
             wait_for_worker,
             wait_timeout_secs,
+            dry_run,
         }) => {
             metrics::inc_requests("select-worker");
-            let response = handle_select_worker_with_wrapper(
-                &ctx,
-                request,
-                wait_for_worker,
-                wait_timeout_secs,
-                local_wrapper_id,
-            )
-            .await?;
+            let response = if dry_run {
+                handle_select_worker_dry_run(&ctx, &request).await
+            } else {
+                handle_select_worker_with_wrapper(
+                    &ctx,
+                    request,
+                    wait_for_worker,
+                    wait_timeout_secs,
+                    local_wrapper_id,
+                )
+                .await?
+            };
             (selection_response_json(&response)?, "application/json")
         }
         Ok(ApiRequest::ReleaseWorker(mut request)) => {
@@ -1858,6 +1866,7 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
     let mut local_wrapper_id = None;
     let mut preferred_workers = Vec::new();
     let mut required_tools: Vec<String> = Vec::new();
+    let mut dry_run = false;
 
     for param in query.split('&') {
         if param.is_empty() {
@@ -1915,6 +1924,9 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
             "hook_pid" => {
                 hook_pid = value.parse().ok();
             }
+            "dry_run" => {
+                dry_run = value == "1" || value == "true";
+            }
             "local_wrapper_id" => {
                 let candidate = percent_unescape_query_value(value);
                 if candidate.starts_with(LOCAL_WRAPPER_ID_PREFIX) {
@@ -1951,6 +1963,7 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
         wait_for_worker,
         wait_timeout_secs,
         local_wrapper_id,
+        dry_run,
     })
 }
 
@@ -2342,6 +2355,53 @@ fn cancelled_selection() -> SelectionResponse {
         reason: SelectionReason::SelectionError("job_cancelled_before_start".to_owned()),
         build_id: None,
         diagnostics: None,
+    }
+}
+
+/// Answer "which worker would this build get?" without admitting it.
+///
+/// `rch diagnose` used to run a real selection, which reserves slots and opens
+/// a durable build, and then release it. Since releases require the durable
+/// build_id, that release was refused: every diagnose leaked a ghost build that
+/// held its slots (and blocked same-project admission) until a daemon restart.
+/// Releasing with the build_id would instead record a phantom successful build.
+/// A dry run selects exactly as a real request does and stops before
+/// reservation.
+async fn handle_select_worker_dry_run(
+    ctx: &DaemonContext,
+    request: &SelectionRequest,
+) -> SelectionResponse {
+    // Same exclusions as a real request: a worker already building this
+    // project would not be handed a second build of it.
+    let excluded_worker_ids = ctx.history.active_workers_for_project(&request.project);
+    let result = ctx
+        .worker_selector
+        .select_with_exclusions(&ctx.pool, request, &excluded_worker_ids)
+        .await;
+    let worker = match result.worker {
+        Some(worker) => {
+            // Read slot/score state before taking the config lock: tokio's
+            // RwLock is fair, and available_slots() reads the config itself.
+            let slots_available = worker.available_slots().await;
+            let speed_score = worker.get_speed_score();
+            let config = worker.config.read().await;
+            Some(SelectedWorker {
+                id: config.id.clone(),
+                host: config.host.clone(),
+                user: config.user.clone(),
+                identity_file: config.identity_file.clone(),
+                slots_available,
+                speed_score,
+                declared_os: rch_common::declared_os(&config.tags),
+            })
+        }
+        None => None,
+    };
+    SelectionResponse {
+        worker,
+        reason: result.reason,
+        build_id: None,
+        diagnostics: result.diagnostics,
     }
 }
 
@@ -4223,6 +4283,57 @@ mod tests {
         };
         assert_eq!(req.project, "test");
         assert_eq!(req.estimated_cores, 1); // Default
+    }
+
+    #[test]
+    fn test_parse_request_dry_run_flag() {
+        let _guard = test_guard!();
+        for (line, expected) in [
+            ("GET /select-worker?project=p&cores=2&dry_run=1", true),
+            ("GET /select-worker?project=p&cores=2&dry_run=true", true),
+            ("GET /select-worker?project=p&cores=2&dry_run=0", false),
+            ("GET /select-worker?project=p&cores=2", false),
+        ] {
+            let ApiRequest::SelectWorker { dry_run, .. } = parse_request(line).unwrap() else {
+                panic!("expected select-worker request for {line}");
+            };
+            assert_eq!(dry_run, expected, "{line}");
+        }
+    }
+
+    /// `rch diagnose` must be able to ask which worker a build would get
+    /// without reserving slots or opening a durable build it cannot release.
+    #[tokio::test]
+    async fn test_dry_run_selection_reserves_nothing() {
+        let _guard = test_guard!();
+        let pool = WorkerPool::new();
+        pool.add_worker(make_test_worker("dry-worker", 8)).await;
+        let worker = pool.get(&WorkerId::new("dry-worker")).await.unwrap();
+        let ctx = make_test_context(pool);
+        let request = SelectionRequest {
+            job_mode: false,
+            project: "dry-run-project".to_string(),
+            command: Some("cargo build".to_string()),
+            command_priority: CommandPriority::Normal,
+            estimated_cores: 4,
+            preferred_workers: vec![],
+            toolchain: None,
+            required_runtime: RequiredRuntime::None,
+            classification_duration_us: None,
+            required_tools: Vec::new(),
+            hook_pid: None,
+        };
+        let response = handle_select_worker_dry_run(&ctx, &request).await;
+        let selected = response.worker.expect("dry run should report a worker");
+        assert_eq!(selected.id.as_str(), "dry-worker");
+        assert_eq!(selected.slots_available, 8);
+        assert!(response.build_id.is_none());
+        assert_eq!(worker.used_slots(), 0);
+        assert!(
+            ctx.history
+                .active_workers_for_project("dry-run-project")
+                .is_empty()
+        );
     }
 
     #[test]

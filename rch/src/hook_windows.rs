@@ -114,6 +114,21 @@ pub(crate) async fn query_daemon(
     Err(PlatformError::UnixSocketUnsupported)?
 }
 
+/// Ask which worker a build would get without reserving anything.
+///
+/// On non-Unix platforms this returns an error, like [`query_daemon`].
+pub(crate) async fn query_daemon_dry_run(
+    _socket_path: &str,
+    _project: &str,
+    _cores: u32,
+    _command: &str,
+    _toolchain: Option<&ToolchainInfo>,
+    _required_runtime: RequiredRuntime,
+    _preferred_workers: &[WorkerId],
+) -> anyhow::Result<SelectionResponse> {
+    Err(PlatformError::UnixSocketUnsupported)?
+}
+
 /// Release reserved slots on a worker.
 ///
 /// On non-Unix platforms this is a no-op.

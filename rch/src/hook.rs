@@ -4115,7 +4115,9 @@ use rabs_recorder::record_invocation;
 // path. The timeout helpers and `urlencoding_encode` stay `pub(super)` for tests.
 mod daemon_ipc;
 use daemon_ipc::{disable_worker_for_fault, queue_when_busy_enabled, record_build};
-pub(crate) use daemon_ipc::{query_daemon, release_worker, restart_admission_is_closed};
+pub(crate) use daemon_ipc::{
+    query_daemon, query_daemon_dry_run, release_worker, restart_admission_is_closed,
+};
 
 // Command-string parsing utilities (tokenization + cargo flag/env analyzers +
 // offload core estimation) live in the `command_parsing` submodule.
