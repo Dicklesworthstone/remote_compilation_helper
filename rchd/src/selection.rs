@@ -1427,10 +1427,8 @@ impl WorkerSelector {
                     .toolchain_preflight_status(&toolchain_name)
                     .await
                     .filter(|status| {
-                        status.is_reusable(
-                            TOOLCHAIN_PREFLIGHT_TTL,
-                            TOOLCHAIN_PREFLIGHT_TRANSIENT_TTL,
-                        )
+                        status
+                            .is_reusable(TOOLCHAIN_PREFLIGHT_TTL, TOOLCHAIN_PREFLIGHT_TRANSIENT_TTL)
                     })
                     .and_then(|status| {
                         (!status.usable).then(|| {

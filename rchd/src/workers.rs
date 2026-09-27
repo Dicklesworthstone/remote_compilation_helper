@@ -2129,7 +2129,10 @@ mod tests {
             checked_at_unix_ms: two_minutes_ago,
         };
 
-        let broken = verdict(false, Some("toolchain_preflight_command_failed:1:no such toolchain"));
+        let broken = verdict(
+            false,
+            Some("toolchain_preflight_command_failed:1:no such toolchain"),
+        );
         assert!(broken.is_definitive());
         assert!(broken.is_reusable(long, short));
 

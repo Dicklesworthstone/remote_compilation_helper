@@ -1188,10 +1188,7 @@ impl SshPool {
         command_timeout: Duration,
     ) -> Result<CommandResult> {
         let client = self
-            .get_or_connect_probing_within(
-                config,
-                command_timeout.min(POOL_LIVENESS_PROBE_TIMEOUT),
-            )
+            .get_or_connect_probing_within(config, command_timeout.min(POOL_LIVENESS_PROBE_TIMEOUT))
             .await?;
         // Execute under a shared read lock: execute() needs only `&self`, so
         // concurrent callers for the same worker can multiplex over the one

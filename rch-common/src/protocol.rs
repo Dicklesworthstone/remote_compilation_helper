@@ -149,9 +149,7 @@ impl HookOutput {
                 .and_then(serde_json::Value::as_object_mut)
         {
             for (key, field) in original {
-                updated
-                    .entry(key.clone())
-                    .or_insert_with(|| field.clone());
+                updated.entry(key.clone()).or_insert_with(|| field.clone());
             }
         }
         serde_json::to_string(&value)

@@ -13,8 +13,8 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use tokio::process::Command;
 
-use super::helpers::{classify_ssh_error_message, ssh_key_path_from_identity};
 use super::config_dir;
+use super::helpers::{classify_ssh_error_message, ssh_key_path_from_identity};
 
 // =============================================================================
 // Workers Init Command
@@ -709,7 +709,10 @@ enabled = false
     fn upsert_worker_entry_appends_without_touching_existing_text() {
         let _guard = test_guard!();
         let out = upsert_worker_entry(Some(FLEET), &new_worker("added")).unwrap();
-        assert!(out.starts_with(FLEET), "existing text must survive verbatim");
+        assert!(
+            out.starts_with(FLEET),
+            "existing text must survive verbatim"
+        );
         let table: toml::Table = toml::from_str(&out).unwrap();
         let workers = table["workers"].as_array().unwrap();
         let ids: Vec<&str> = workers.iter().map(|w| w["id"].as_str().unwrap()).collect();
@@ -726,7 +729,10 @@ enabled = false
         let table: toml::Table = toml::from_str(&out).unwrap();
         let workers = table["workers"].as_array().unwrap();
         assert_eq!(workers.len(), 2);
-        assert!(workers[0].get("tools").is_some(), "other workers keep all fields");
+        assert!(
+            workers[0].get("tools").is_some(),
+            "other workers keep all fields"
+        );
         assert_eq!(workers[1]["host"].as_str(), Some("10.0.0.9"));
     }
 

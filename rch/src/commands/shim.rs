@@ -784,7 +784,11 @@ pub fn shim_install(
     // `cargo-clippy` is a separate binary on PATH; a script calling it directly
     // never touches the cargo shim, so it needs its own.
     let clippy_path = cargo_clippy_shim_path()?;
-    atomic_write(&clippy_path, cargo_clippy_shim_body(require_remote).as_bytes()).with_context(|| {
+    atomic_write(
+        &clippy_path,
+        cargo_clippy_shim_body(require_remote).as_bytes(),
+    )
+    .with_context(|| {
         format!(
             "Failed to write cargo-clippy shim to {}",
             clippy_path.display()
@@ -1484,7 +1488,15 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn selected_toolchain_survives_every_explicit_local_escape() {
-        let args = ["+nightly", "--offline", "test", "--", "", "a\nb", "$(false)"];
+        let args = [
+            "+nightly",
+            "--offline",
+            "test",
+            "--",
+            "",
+            "a\nb",
+            "$(false)",
+        ];
         for cause in [
             ("RCH_CARGO_WRAPPER_BYPASS", "1"),
             ("RCH_SHIM_LOCAL_IDE", "1"),
@@ -1545,7 +1557,10 @@ mod tests {
                 .output()
                 .unwrap();
             assert_eq!(out.status.code(), Some(expected_code));
-            assert!(out.stdout.is_empty(), "an unrelated real Cargo was executed");
+            assert!(
+                out.stdout.is_empty(),
+                "an unrelated real Cargo was executed"
+            );
             assert!(!out.stderr.is_empty());
         }
     }
@@ -1560,12 +1575,18 @@ mod tests {
         std::fs::create_dir_all(&canonical).unwrap();
         write_exe(&canonical.join("cargo"), &cargo_shim_body(true));
         write_exe(&toolchain.join("cargo"), &toolchain_wrap_body());
-        write_exe(&toolchain.join("cargo-rch-real"), "#!/bin/sh\nexec rustc \"$@\"\n");
+        write_exe(
+            &toolchain.join("cargo-rch-real"),
+            "#!/bin/sh\nexec rustc \"$@\"\n",
+        );
         write_exe(
             &toolchain.join("rustc"),
             "#!/bin/sh\nprintf '%s\\000' SELECTED \"${RCH_CARGO_WRAPPER_BYPASS:-unset}\" \"${CARGO_BUILD_JOBS:-unset}\" \"$@\"\n",
         );
-        write_exe(&dir.join("rustc"), "#!/bin/sh\necho WRONG-COMPILER\nexit 91\n");
+        write_exe(
+            &dir.join("rustc"),
+            "#!/bin/sh\necho WRONG-COMPILER\nexit 91\n",
+        );
         write_exe(
             &dir.join("rustup"),
             r#"#!/bin/sh
@@ -1578,7 +1599,10 @@ exec "$HOME/.rustup/toolchains/selected/bin/cargo" "$@"
             &dir,
             "cargo",
             &["+selected", "build", "--locked"],
-            &[("RCH_SHIM_LOCAL_IDE", "1"), ("RUSTUP_TOOLCHAIN", "wrong-ambient")],
+            &[
+                ("RCH_SHIM_LOCAL_IDE", "1"),
+                ("RUSTUP_TOOLCHAIN", "wrong-ambient"),
+            ],
             Some(&dir),
         );
         assert!(out.status.success(), "{:?}", out.stderr);
@@ -1677,7 +1701,15 @@ exec "$HOME/.rustup/toolchains/selected/bin/cargo" "$@"
             let fields = recorded_fields(&output);
             assert_eq!(
                 &fields[..7],
-                &[b"RCH".as_slice(), b"1", b"1", b"unset", b"exec", b"--", b"cargo"]
+                &[
+                    b"RCH".as_slice(),
+                    b"1",
+                    b"1",
+                    b"unset",
+                    b"exec",
+                    b"--",
+                    b"cargo"
+                ]
             );
             assert_eq!(
                 &fields[7..],
@@ -1713,7 +1745,10 @@ exec "$HOME/.rustup/toolchains/selected/bin/cargo" "$@"
             };
             assert_eq!(
                 &fields[2..],
-                expected.iter().map(|arg| arg.as_bytes()).collect::<Vec<_>>()
+                expected
+                    .iter()
+                    .map(|arg| arg.as_bytes())
+                    .collect::<Vec<_>>()
             );
         }
     }
@@ -1721,7 +1756,12 @@ exec "$HOME/.rustup/toolchains/selected/bin/cargo" "$@"
     #[cfg(unix)]
     #[test]
     fn additional_supported_build_entrypoints_no_longer_bypass_rch() {
-        for args in [vec!["run"], vec!["r"], vec!["zigbuild"], vec!["xwin", "build"]] {
+        for args in [
+            vec!["run"],
+            vec!["r"],
+            vec!["zigbuild"],
+            vec!["xwin", "build"],
+        ] {
             let command = shell_words::join(std::iter::once("cargo").chain(args.iter().copied()));
             assert!(
                 rch_common::classify_command(&command).is_compilation,
@@ -1834,7 +1874,10 @@ exec "$HOME/.rustup/toolchains/selected/bin/cargo" "$@"
     #[test]
     fn routing_failure_preserves_exit_and_never_runs_the_local_stub() {
         for (body, args) in [
-            (cargo_shim_body(true), vec!["+nightly", "--locked", "clippy"]),
+            (
+                cargo_shim_body(true),
+                vec!["+nightly", "--locked", "clippy"],
+            ),
             (cargo_clippy_shim_body(true), vec!["--all-targets"]),
         ] {
             for exit in ["1", "101", "103", "137"] {
