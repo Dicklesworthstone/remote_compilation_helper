@@ -51,8 +51,8 @@ pub async fn run_update(
         return verify_installation(ctx).await;
     }
 
-    // Check for updates
-    let update_info = check_for_updates(channel, version.clone()).await?;
+    // An explicit `rch update` (including --check) always asks GitHub.
+    let update_info = check_for_updates(channel, version.clone(), false).await?;
 
     if check_only {
         display_update_check(ctx, &update_info, show_changelog);
