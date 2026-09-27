@@ -337,6 +337,9 @@ pub struct BenchmarkScheduler {
 
     /// Consecutive failure count per worker for alerting.
     consecutive_failures: Arc<RwLock<HashMap<WorkerId, u32>>>,
+
+    /// When each worker's latest consecutive failure happened (backoff).
+    last_failure: Arc<RwLock<HashMap<WorkerId, std::time::Instant>>>,
 }
 
 /// Internal tracking of a running benchmark.
@@ -391,6 +394,7 @@ impl BenchmarkScheduler {
             telemetry,
             events,
             consecutive_failures: Arc::new(RwLock::new(HashMap::new())),
+            last_failure: Arc::new(RwLock::new(HashMap::new())),
         };
 
         let handle = BenchmarkTriggerHandle { tx };
@@ -467,6 +471,20 @@ impl BenchmarkScheduler {
         }
     }
 
+    /// Time left before a worker at or past the failure threshold may be
+    /// benchmarked again on schedule, or `None` when it is free to run.
+    async fn failure_backoff_remaining(&self, worker_id: &WorkerId) -> Option<Duration> {
+        let failures = *self.consecutive_failures.read().await.get(worker_id)?;
+        let last = *self.last_failure.read().await.get(worker_id)?;
+        failure_backoff(
+            failures,
+            self.config.consecutive_failure_alert_threshold,
+            self.config.min_interval,
+        )?
+        .checked_sub(last.elapsed())
+        .filter(|remaining| !remaining.is_zero())
+    }
+
     /// Determine if a worker should be benchmarked.
     pub async fn should_benchmark(
         &self,
@@ -478,6 +496,13 @@ impl BenchmarkScheduler {
 
         // Already pending or running?
         if self.is_pending_or_running(&worker_id).await {
+            return None;
+        }
+
+        // A worker that keeps failing (a benchmark that always times out)
+        // would otherwise be rescheduled as new/stale on every check.
+        if let Some(remaining) = self.failure_backoff_remaining(&worker_id).await {
+            debug!(worker_id = %worker_id, remaining_secs = remaining.as_secs(), "Benchmark in failure backoff");
             return None;
         }
 
@@ -792,6 +817,7 @@ impl BenchmarkScheduler {
         let events = self.events.clone();
         let timeout = self.config.benchmark_timeout;
         let consecutive_failures = self.consecutive_failures.clone();
+        let last_failure = self.last_failure.clone();
         let running_map = self.running.clone();
         let pending_queue = self.pending_queue.clone();
         let alert_threshold = self.config.consecutive_failure_alert_threshold;
@@ -826,6 +852,7 @@ impl BenchmarkScheduler {
 
                     // Reset consecutive failure counter on success
                     consecutive_failures.write().await.remove(&worker_id);
+                    last_failure.write().await.remove(&worker_id);
 
                     // Emit completed event
                     events.emit(
@@ -858,6 +885,10 @@ impl BenchmarkScheduler {
                         *count += 1;
                         *count
                     };
+                    last_failure
+                        .write()
+                        .await
+                        .insert(worker_id.clone(), std::time::Instant::now());
 
                     // Emit failed event
                     events.emit(
@@ -943,6 +974,7 @@ impl BenchmarkScheduler {
 
             // Reset consecutive failure counter on success
             self.consecutive_failures.write().await.remove(worker_id);
+            self.last_failure.write().await.remove(worker_id);
 
             // Emit completed event
             self.events.emit(
@@ -980,6 +1012,10 @@ impl BenchmarkScheduler {
                 *count += 1;
                 *count
             };
+            self.last_failure
+                .write()
+                .await
+                .insert(worker_id.clone(), std::time::Instant::now());
 
             // Emit failed event
             self.events.emit(
@@ -1313,6 +1349,14 @@ fn parse_benchmark_score(output: &str) -> Option<f64> {
         }
     }
     None
+}
+
+/// Scheduled-benchmark backoff after repeated failures: 10 minutes at the
+/// threshold, doubling per further failure, capped at `cap`.
+fn failure_backoff(failures: u32, threshold: u32, cap: Duration) -> Option<Duration> {
+    const BASE: Duration = Duration::from_secs(10 * 60);
+    let beyond = failures.checked_sub(threshold.max(1))?;
+    Some(BASE.saturating_mul(1_u32 << beyond.min(16)).min(cap))
 }
 
 /// An immediate retry is for a transient blip. A worker that keeps failing
@@ -2158,6 +2202,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn repeatedly_failing_new_worker_is_not_rescheduled_during_backoff() {
+        let pool = WorkerPool::new();
+        pool.add_worker(make_worker_config("backoff-test")).await;
+        let telemetry = Arc::new(TelemetryStore::new(Duration::from_secs(300), None));
+        let mut config = make_test_config();
+        config.consecutive_failure_alert_threshold = 1;
+        let (scheduler, _handle) =
+            BenchmarkScheduler::new(config, pool.clone(), telemetry, EventBus::new(16));
+        let worker_id = WorkerId::new("backoff-test");
+        let worker = pool.get(&worker_id).await.unwrap();
+        assert!(
+            scheduler.should_benchmark(&worker).await.is_some(),
+            "a new worker is scheduled"
+        );
+
+        scheduler.running.write().await.insert(
+            worker_id.clone(),
+            RunningBenchmark {
+                request: ScheduledBenchmarkRequest::new(
+                    worker_id.clone(),
+                    BenchmarkPriority::High,
+                    BenchmarkReason::NewWorker,
+                ),
+                started_at: Utc::now(),
+            },
+        );
+        worker.reserve_slots(1).await;
+        scheduler
+            .mark_failed(&worker_id, "Benchmark timed out after 300s", true)
+            .await;
+        scheduler.pending_queue.lock().await.clear();
+
+        assert!(
+            scheduler.should_benchmark(&worker).await.is_none(),
+            "a worker past the failure threshold waits out its backoff"
+        );
+    }
+
+    #[tokio::test]
     async fn test_consecutive_failures_tracked_and_reset() {
         // Create a scheduler with low threshold for testing
         let pool = WorkerPool::new();
@@ -2879,6 +2962,17 @@ Benchmark complete
             !requeue(true, 1, 0),
             "a zero threshold still bounds retries"
         );
+    }
+
+    #[test]
+    fn scheduled_benchmark_backoff_grows_and_is_capped() {
+        use super::failure_backoff;
+        let cap = Duration::from_secs(6 * 3600);
+        let minutes = |m: u64| Some(Duration::from_secs(m * 60));
+        assert_eq!(failure_backoff(2, 3, cap), None);
+        assert_eq!(failure_backoff(3, 3, cap), minutes(10));
+        assert_eq!(failure_backoff(4, 3, cap), minutes(20));
+        assert_eq!(failure_backoff(40, 3, cap), Some(cap));
     }
 
     #[test]
