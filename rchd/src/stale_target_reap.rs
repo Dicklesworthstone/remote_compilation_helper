@@ -430,6 +430,27 @@ mod tests {
     /// a real worker has: one tmp base per daemon, not one shared with
     /// strangers. It sits beside the fixture's `projects/` so the tmp-base
     /// pass scans only this test's own tree.
+    /// The production sweep bound to an empty registry under the fixture.
+    /// Offloaded, the fixture lives inside the source root this very test
+    /// build claimed in the worker's real registry, so every candidate
+    /// would be skipped as owned.
+    fn isolated_sweep_command(
+        fixture_root: &std::path::Path,
+        base: &std::path::Path,
+        pooled_idle_minutes: Option<u64>,
+        max_cache_kb: Option<u64>,
+    ) -> String {
+        let registry = fixture_root.join("claims-v1");
+        std::fs::create_dir_all(&registry).expect("create fixture registry");
+        stale_target_reap::worker_sweep_command_with_registry(
+            base.to_str().unwrap(),
+            720,
+            pooled_idle_minutes,
+            max_cache_kb,
+            registry.to_str().unwrap(),
+        )
+    }
+
     fn run_sweep(cmd: &str, fixture_root: &std::path::Path) -> std::process::Output {
         let private_tmp = fixture_root.join("tmp");
         std::fs::create_dir_all(&private_tmp).expect("create private TMPDIR");
@@ -570,12 +591,16 @@ mod tests {
         fs::create_dir_all(&bystander).unwrap();
         make_idle(&bystander); // even idle, the glob must not match it
 
-        let cmd = build_sweep_command(base.to_str().unwrap(), 720, None, None);
+        let cmd = isolated_sweep_command(tmp.path(), &base, None, None);
         let out = run_sweep(&cmd, tmp.path());
         let stdout = String::from_utf8_lossy(&out.stdout);
 
         // Idle dirs at every depth reaped.
-        assert!(!idle_d1.exists(), "idle depth-1 dir should be reaped");
+        assert!(
+            !idle_d1.exists(),
+            "idle depth-1 dir should be reaped\nstdout: {stdout}\nstderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         assert!(!idle_d2.exists(), "idle depth-2 dir should be reaped");
         assert!(
             !idle_d3.exists(),
@@ -628,7 +653,7 @@ mod tests {
         fs::create_dir_all(&live_pool).unwrap();
         fs::write(live_pool.join("artifact.o"), b"x").unwrap();
         // An aged pooled dir with the pooled pass DISABLED must survive.
-        let cmd_no_pool = build_sweep_command(base.to_str().unwrap(), 720, None, None);
+        let cmd_no_pool = isolated_sweep_command(tmp.path(), &base, None, None);
         let out = run_sweep(&cmd_no_pool, tmp.path());
         assert!(out.status.success());
         assert!(
@@ -637,7 +662,7 @@ mod tests {
         );
 
         // With the pooled pass on, only the long-idle pool is reaped.
-        let cmd = build_sweep_command(base.to_str().unwrap(), 720, Some(7 * 24 * 60), None);
+        let cmd = isolated_sweep_command(tmp.path(), &base, Some(7 * 24 * 60), None);
         let out = run_sweep(&cmd, tmp.path());
         assert!(out.status.success());
         let stdout = String::from_utf8_lossy(&out.stdout);
@@ -688,7 +713,7 @@ mod tests {
         // the fresh dir is protected by the -mmin floor; evicting the two
         // oldest aged dirs (~408KB) brings the total to ~612KB ≤ 700 and the
         // loop stops before the newest aged dir.
-        let cmd = build_sweep_command(base.to_str().unwrap(), 720, None, Some(700));
+        let cmd = isolated_sweep_command(tmp.path(), &base, None, Some(700));
         let out = run_sweep(&cmd, tmp.path());
         assert!(out.status.success());
         let stdout = String::from_utf8_lossy(&out.stdout);
@@ -753,7 +778,7 @@ mod tests {
             );
             return;
         }
-        let cmd = build_sweep_command(base.to_str().unwrap(), 720, None, None);
+        let cmd = isolated_sweep_command(tmp.path(), &base, None, None);
         let out = run_sweep(&cmd, tmp.path());
         // Restore before asserting so tempdir cleanup works even on failure.
         fs::set_permissions(&parent, fs::Permissions::from_mode(0o755)).unwrap();
