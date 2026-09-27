@@ -39,6 +39,10 @@ const PRIORITY_SPEED_TIEBREAK_SCORE: f64 = 10.0;
 const TEST_CACHE_BOOST: f64 = 1.5;
 const TEST_BUILD_FALLBACK_FACTOR: f64 = 0.4;
 const TOOLCHAIN_PREFLIGHT_TTL: Duration = Duration::from_secs(600);
+/// Reuse window for a probe that failed to reach the worker or timed out:
+/// long enough not to re-probe a sick worker on every request, short enough
+/// that a network blip does not exclude a healthy worker for 10 minutes.
+const TOOLCHAIN_PREFLIGHT_TRANSIENT_TTL: Duration = Duration::from_secs(60);
 const TOOLCHAIN_PREFLIGHT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Balanced-score multiplier penalty for known pre-x86-64-v3 workers
 /// (bd-6qchz): strong enough that any v3-capable worker wins when one is
@@ -1422,7 +1426,12 @@ impl WorkerSelector {
                 worker
                     .toolchain_preflight_status(&toolchain_name)
                     .await
-                    .filter(|status| status.is_fresh(TOOLCHAIN_PREFLIGHT_TTL))
+                    .filter(|status| {
+                        status.is_reusable(
+                            TOOLCHAIN_PREFLIGHT_TTL,
+                            TOOLCHAIN_PREFLIGHT_TRANSIENT_TTL,
+                        )
+                    })
                     .and_then(|status| {
                         (!status.usable).then(|| {
                             status
@@ -2736,7 +2745,7 @@ impl WorkerSelector {
         let toolchain_name = toolchain.rustup_toolchain();
 
         if let Some(cached) = worker.toolchain_preflight_status(&toolchain_name).await
-            && cached.is_fresh(TOOLCHAIN_PREFLIGHT_TTL)
+            && cached.is_reusable(TOOLCHAIN_PREFLIGHT_TTL, TOOLCHAIN_PREFLIGHT_TRANSIENT_TTL)
         {
             return (!cached.usable).then(|| {
                 cached
