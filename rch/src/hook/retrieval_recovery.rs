@@ -859,7 +859,7 @@ pub(crate) async fn recover_job(writer: &DurableLeaseWriter) -> anyhow::Result<i
         session.recipe.transfer.clone(),
     );
     let base = session.completion_pipeline(base);
-    let exit = base.read_recovery_completion(&worker).await?.context(
+    let mut exit = base.read_recovery_completion(&worker).await?.context(
         "same-id remote execution has no durable completion yet; command was not replayed",
     )?;
     let mut pair = if let Some((root, token)) = &session.recipe.pair {
@@ -907,17 +907,20 @@ pub(crate) async fn recover_job(writer: &DurableLeaseWriter) -> anyhow::Result<i
                 .retrieve_artifacts(&worker, &phase.patterns)
                 .await?;
             if phase.output_gate {
-                anyhow::ensure!(
-                    !sync_back_verified_zero_build_outputs(
-                        &retrieved.manifest_regular_files,
-                        retrieved.matched_regular_files,
-                        session.recipe.kind,
-                        phase.custom_target
-                    ) && !(session.recipe.package_archive
-                        && retrieved.matched_regular_files == Some(0)),
-                    "recovered transfer matched zero expected outputs"
-                );
-                if !session.recipe.allow_foreign
+                // A rejected output set is a terminal build failure, exactly
+                // as on the live path, not a recovery error: the remote outputs
+                // never change, so an error would strand source ownership on
+                // every retry. Publish nothing further, then retire normally.
+                let rejection = if sync_back_verified_zero_build_outputs(
+                    &retrieved.manifest_regular_files,
+                    retrieved.matched_regular_files,
+                    session.recipe.kind,
+                    phase.custom_target,
+                ) || (session.recipe.package_archive
+                    && retrieved.matched_regular_files == Some(0))
+                {
+                    Some("recovered transfer matched zero expected outputs".to_owned())
+                } else if !session.recipe.allow_foreign
                     && kind_has_enumerable_output_contract(session.recipe.kind)
                 {
                     let foreign = foreign_target_artifacts(
@@ -927,11 +930,22 @@ pub(crate) async fn recover_job(writer: &DurableLeaseWriter) -> anyhow::Result<i
                         &session.recipe.expected_triple,
                         session.recipe.pinned_triple.as_deref(),
                     );
-                    anyhow::ensure!(
-                        foreign.is_empty(),
-                        "recovered outputs target a foreign platform: {}",
-                        describe_findings(&foreign)
+                    (!foreign.is_empty()).then(|| {
+                        format!(
+                            "recovered outputs target a foreign platform: {}",
+                            describe_findings(&foreign)
+                        )
+                    })
+                } else {
+                    None
+                };
+                if let Some(rejection) = rejection {
+                    eprintln!(
+                        "[RCH] {rejection}; treating the recovered build as failed \
+                         (exit {EXIT_ARTIFACT_TRANSFER_FAILED})"
                     );
+                    exit = EXIT_ARTIFACT_TRANSFER_FAILED;
+                    break;
                 }
             }
         }
