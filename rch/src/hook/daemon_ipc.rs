@@ -856,14 +856,20 @@ mod bounded_ipc_tests {
             let (stream, _) = listener.accept().await.unwrap();
             let (reader, mut writer) = stream.into_split();
             let mut request = String::new();
-            BufReader::new(reader).read_line(&mut request).await.unwrap();
+            BufReader::new(reader)
+                .read_line(&mut request)
+                .await
+                .unwrap();
             assert!(request.contains(&expected), "{request}");
             assert!(request.contains("&runtime=rust") && request.contains("&dry_run=1"));
             writer
-                .write_all(concat!(
-                    "HTTP/1.1 200 OK\r\n\r\n",
-                    "{\"worker\":null,\"reason\":\"no_workers_configured\"}"
-                ).as_bytes())
+                .write_all(
+                    concat!(
+                        "HTTP/1.1 200 OK\r\n\r\n",
+                        "{\"worker\":null,\"reason\":\"no_workers_configured\"}"
+                    )
+                    .as_bytes(),
+                )
                 .await
                 .unwrap();
         };
@@ -881,7 +887,10 @@ mod bounded_ipc_tests {
         })
         .await
         .unwrap();
-        assert_eq!(response.unwrap().reason, SelectionReason::NoWorkersConfigured);
+        assert_eq!(
+            response.unwrap().reason,
+            SelectionReason::NoWorkersConfigured
+        );
     }
 
     async fn caller_fixture(
