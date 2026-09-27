@@ -370,6 +370,7 @@ fn disk_info_from_daemon(worker: Option<&WorkerStatusFromApi>) -> WorkerDiskInfo
     WorkerDiskInfo {
         disk_free_gb,
         disk_free_ratio,
+        build_disk_free_gb: valid_disk_free(worker.pressure_build_disk_free_gb),
         disk_measurement_source: (disk_free_gb.is_some() || disk_free_ratio.is_some())
             .then_some("daemon"),
         disk_pressure_state: worker.pressure_state.clone(),
@@ -394,6 +395,8 @@ fn disk_info_from_probe(
             .filter(|total| total.is_finite() && *total > 0.0)?;
         (free <= total).then_some(free / total)
     });
+    disk.build_disk_free_gb =
+        capabilities.and_then(|caps| valid_disk_free(caps.build_disk_free_gb));
     disk.disk_measurement_source = disk.disk_free_gb.map(|_| "probe");
     disk
 }
@@ -408,6 +411,17 @@ fn format_worker_disk(disk: &WorkerDiskInfo) -> String {
         |ratio| format!("{:.1}% free", ratio * 100.0),
     );
     let measurement_source = disk.disk_measurement_source.unwrap_or("unknown source");
+    // Slots are sized from the build disk (GH #78). Show it when it is not
+    // the mount already printed, e.g. a small tmpfs /tmp is the tightest.
+    let build = disk
+        .build_disk_free_gb
+        .filter(|build| {
+            disk.disk_free_gb
+                .is_none_or(|free| (build - free).abs() >= 0.05)
+        })
+        .map_or_else(String::new, |build| {
+            format!("; build disk: {build:.1} GiB free")
+        });
     let pressure = match disk.disk_pressure_state.as_deref() {
         Some("warning") => "WARNING",
         Some("critical") => "CRITICAL",
@@ -417,7 +431,9 @@ fn format_worker_disk(disk: &WorkerDiskInfo) -> String {
     let pressure_source = disk
         .disk_pressure_source
         .map_or_else(String::new, |source| format!(" (cached {source})"));
-    format!("Disk: {free} ({ratio}, {measurement_source}); pressure: {pressure}{pressure_source}")
+    format!(
+        "Disk: {free} ({ratio}, {measurement_source}){build}; pressure: {pressure}{pressure_source}"
+    )
 }
 
 /// Apply the daemon's current capacity once, before choosing an output format.
@@ -2266,6 +2282,41 @@ mod probe_summary_tests {
         let disk = disk_info_from_daemon(Some(worker));
         assert!(format_worker_disk(&disk).starts_with("Disk: unknown"));
         assert!(format_worker_disk(&disk).contains("pressure: unknown"));
+    }
+
+    #[test]
+    fn disk_visibility_shows_the_build_disk_when_tmpfs_is_the_tightest_mount() {
+        // GH #78: the slot count comes from the build disk, so show it when
+        // the tightest mount printed first is a different filesystem.
+        let mut status = make_daemon_status();
+        let worker = &mut status.workers[0];
+        worker.pressure_disk_free_gb = Some(13.9);
+        worker.pressure_disk_free_ratio = Some(0.895);
+        worker.pressure_build_disk_free_gb = Some(1700.0);
+        worker.pressure_state = Some("healthy".to_string());
+        let disk = disk_info_from_daemon(Some(worker));
+        assert_eq!(disk.build_disk_free_gb, Some(1700.0));
+        assert_eq!(
+            format_worker_disk(&disk),
+            "Disk: 13.9 GiB free (89.5% free, daemon); build disk: 1700.0 GiB free; \
+             pressure: healthy (cached daemon)"
+        );
+
+        // Same filesystem: no duplicate figure.
+        worker.pressure_build_disk_free_gb = Some(13.9);
+        let disk = disk_info_from_daemon(Some(worker));
+        assert!(!format_worker_disk(&disk).contains("build disk"));
+
+        let capabilities = WorkerCapabilities {
+            disk_free_gb: Some(13.9),
+            disk_total_gb: Some(15.5),
+            build_disk_free_gb: Some(1700.0),
+            build_disk_total_gb: Some(1900.0),
+            ..Default::default()
+        };
+        let disk = disk_info_from_probe(Some(&capabilities), None);
+        assert_eq!(disk.build_disk_free_gb, Some(1700.0));
+        assert!(format_worker_disk(&disk).contains("; build disk: 1700.0 GiB free;"));
     }
 
     #[test]

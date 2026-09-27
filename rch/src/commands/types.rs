@@ -23,6 +23,9 @@ use crate::status_types::WorkerCapabilitiesFromApi;
 pub struct WorkerDiskInfo {
     pub disk_free_gb: Option<f64>,
     pub disk_free_ratio: Option<f64>,
+    /// Free space on the filesystem holding build trees, which sizes slots.
+    /// Null when the worker reports no sample separate from `disk_free_gb`.
+    pub build_disk_free_gb: Option<f64>,
     /// `probe` for fresh capability measurements, `daemon` for cached status.
     pub disk_measurement_source: Option<&'static str>,
     pub disk_pressure_state: Option<String>,

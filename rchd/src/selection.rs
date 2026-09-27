@@ -1667,7 +1667,7 @@ impl WorkerSelector {
                     if let Some(min_disk) = self.config.min_free_gb
                         && let Some(true) = capabilities.is_low_disk(min_disk)
                     {
-                        let free_gb = capabilities.disk_free_gb.unwrap_or(0.0);
+                        let free_gb = capabilities.build_disk_gb().0.unwrap_or(0.0);
                         push_reason_code(&mut reason_codes, "preflight.low_disk");
                         soft_reason =
                             Some(format!("low disk {:.1} GB < {:.1} GB", free_gb, min_disk));
@@ -2296,7 +2296,7 @@ impl WorkerSelector {
             if let Some(min_disk) = self.config.min_free_gb
                 && let Some(true) = capabilities.is_low_disk(min_disk)
             {
-                let free_gb = capabilities.disk_free_gb.unwrap_or(0.0);
+                let free_gb = capabilities.build_disk_gb().0.unwrap_or(0.0);
                 debug!(
                     "Worker {} excluded: low disk ({:.1} GB < {:.1} GB)",
                     worker_id, free_gb, min_disk
@@ -4220,6 +4220,8 @@ mod tests {
                 disk_free_gb: Some(100.0),
                 disk_total_gb: Some(200.0),
                 disk_free_ratio: Some(0.5),
+                build_disk_free_gb: None,
+                build_disk_total_gb: None,
                 disk_io_util_pct: None,
                 memory_pressure: None,
                 telemetry_age_secs: Some(0),
@@ -6598,6 +6600,8 @@ mod tests {
                 disk_free_gb: Some(38.0),
                 disk_total_gb: Some(774.0),
                 disk_free_ratio: Some(0.049),
+                build_disk_free_gb: None,
+                build_disk_total_gb: None,
                 disk_io_util_pct: Some(0.0),
                 memory_pressure: Some(15.0),
                 telemetry_age_secs: Some(8),
@@ -6730,6 +6734,8 @@ mod tests {
                 disk_free_gb: Some(2.0),
                 disk_total_gb: Some(240.0),
                 disk_free_ratio: Some(0.008),
+                build_disk_free_gb: None,
+                build_disk_total_gb: None,
                 disk_io_util_pct: Some(0.0),
                 memory_pressure: Some(10.0),
                 telemetry_age_secs: Some(5),
@@ -6866,6 +6872,8 @@ mod tests {
                 disk_free_gb: Some(38.0),
                 disk_total_gb: Some(774.0),
                 disk_free_ratio: Some(0.049),
+                build_disk_free_gb: None,
+                build_disk_total_gb: None,
                 disk_io_util_pct: Some(0.0),
                 memory_pressure: Some(15.0),
                 telemetry_age_secs: Some(8),
@@ -7085,6 +7093,8 @@ mod tests {
                 disk_free_gb: Some(4.0),
                 disk_total_gb: Some(120.0),
                 disk_free_ratio: Some(0.033),
+                build_disk_free_gb: None,
+                build_disk_total_gb: None,
                 disk_io_util_pct: Some(80.0),
                 memory_pressure: Some(55.0),
                 telemetry_age_secs: Some(8),
@@ -7240,6 +7250,8 @@ mod tests {
                 disk_free_gb: Some(60.0),
                 disk_total_gb: Some(120.0),
                 disk_free_ratio: Some(0.5),
+                build_disk_free_gb: None,
+                build_disk_total_gb: None,
                 disk_io_util_pct: None,
                 memory_pressure: None,
                 telemetry_age_secs: Some(600),

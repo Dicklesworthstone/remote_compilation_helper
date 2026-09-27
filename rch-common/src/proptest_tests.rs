@@ -676,6 +676,8 @@ mod tests {
                             load_avg_15,
                             disk_free_gb,
                             disk_total_gb,
+                            build_disk_free_gb: disk_free_gb,
+                            build_disk_total_gb: disk_total_gb,
                             projects_root_ok,
                             projects_root_issue,
                             projects_root_checked_at_unix_ms,

@@ -309,6 +309,14 @@ pub struct WorkerStatusInfo {
     pub pressure_disk_total_gb: Option<f64>,
     /// Measured free-disk ratio, if available.
     pub pressure_disk_free_ratio: Option<f64>,
+    /// Free space (GB) on the filesystem holding build trees, which sizes
+    /// slots and the free-space floor (GH #78). Absent when the worker reports
+    /// no separate build-disk sample.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pressure_build_disk_free_gb: Option<f64>,
+    /// Total size (GB) of the build-disk filesystem, if reported.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pressure_build_disk_total_gb: Option<f64>,
     /// Last disk I/O utilization sample, if available.
     pub pressure_disk_io_util_pct: Option<f64>,
     /// Last memory pressure sample, if available.
@@ -3834,6 +3842,8 @@ pub(crate) async fn handle_status(ctx: &DaemonContext) -> Result<DaemonFullStatu
             pressure_disk_free_gb: pressure.disk_free_gb,
             pressure_disk_total_gb: pressure.disk_total_gb,
             pressure_disk_free_ratio: pressure.disk_free_ratio,
+            pressure_build_disk_free_gb: pressure.build_disk_free_gb,
+            pressure_build_disk_total_gb: pressure.build_disk_total_gb,
             pressure_disk_io_util_pct: pressure.disk_io_util_pct,
             pressure_memory_pressure: pressure.memory_pressure,
             pressure_telemetry_age_secs: pressure.telemetry_age_secs,
@@ -6019,6 +6029,8 @@ mod tests {
             pressure_disk_free_gb: Some(42.0),
             pressure_disk_total_gb: Some(128.0),
             pressure_disk_free_ratio: Some(0.328),
+            pressure_build_disk_free_gb: None,
+            pressure_build_disk_total_gb: None,
             pressure_disk_io_util_pct: Some(18.0),
             pressure_memory_pressure: Some(44.0),
             pressure_telemetry_age_secs: Some(7),
@@ -7902,6 +7914,8 @@ mod tests {
                 disk_free_gb: Some(18.0),
                 disk_total_gb: Some(120.0),
                 disk_free_ratio: Some(0.15),
+                build_disk_free_gb: None,
+                build_disk_total_gb: None,
                 disk_io_util_pct: Some(72.0),
                 memory_pressure: Some(44.0),
                 telemetry_age_secs: Some(8),
@@ -7950,6 +7964,8 @@ mod tests {
                 disk_free_gb: Some(4.0),
                 disk_total_gb: Some(120.0),
                 disk_free_ratio: Some(0.033),
+                build_disk_free_gb: None,
+                build_disk_total_gb: None,
                 disk_io_util_pct: Some(91.0),
                 memory_pressure: Some(82.0),
                 telemetry_age_secs: Some(7),

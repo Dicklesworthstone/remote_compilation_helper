@@ -584,9 +584,14 @@ async fn probe_capabilities(tool_probe: Option<&str>) -> WorkerCapabilities {
         capabilities.load_avg_5 = Some(load5);
         capabilities.load_avg_15 = Some(load15);
     }
-    if let Some((free_gb, total_gb)) = probe_disk_space() {
+    let disk = probe_disk_space();
+    if let Some((free_gb, total_gb)) = disk.tightest {
         capabilities.disk_free_gb = Some(free_gb);
         capabilities.disk_total_gb = Some(total_gb);
+    }
+    if let Some((free_gb, total_gb)) = disk.build {
+        capabilities.build_disk_free_gb = Some(free_gb);
+        capabilities.build_disk_total_gb = Some(total_gb);
     }
 
     let (canonical_root, alias_root) = resolved_topology_roots();
@@ -1982,19 +1987,42 @@ fn probe_load_average() -> Option<(f64, f64, f64)> {
 /// hid those real disks when they actually filled. Ratio keeps the bd-lvbax
 /// guarantee (a truly full /tmp has the lowest ratio and still wins) without
 /// letting an empty small mount shadow the disk that matters.
-fn probe_disk_space() -> Option<(f64, f64)> {
+///
+/// A second sample, `build`, covers only the project roots. Pressure and
+/// capacity are different questions (GH #78): `/tmp` belongs in "is some mount
+/// a build touches about to fill?", but it holds no build trees, so it must not
+/// size "how many concurrent builds fit?". Otherwise a nearly empty 16 GB
+/// tmpfs whose free ratio sits just below a roomy data disk's derates a worker
+/// with terabytes free to zero slots.
+fn probe_disk_space() -> DiskSamples {
     use std::path::Path;
     let (canonical, alias) = resolved_topology_roots();
-    let mut worst: Option<(f64, f64)> = None;
-    for path in [canonical.as_path(), alias.as_path(), Path::new("/tmp")] {
-        if let Some(sample) = probe_disk_space_for(path) {
-            worst = Some(match worst {
-                Some(current) => fuller_disk_sample(current, sample),
-                None => sample,
-            });
-        }
+    let build_samples = [
+        probe_disk_space_for(canonical.as_path()),
+        probe_disk_space_for(alias.as_path()),
+    ];
+    summarize_disk_samples(&build_samples, probe_disk_space_for(Path::new("/tmp")))
+}
+
+/// `(free_gb, total_gb)` disk samples reported by the capabilities probe.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct DiskSamples {
+    /// Fullest mount among the project roots and `/tmp` (pressure).
+    tightest: Option<(f64, f64)>,
+    /// Fullest mount among the project roots only (capacity).
+    build: Option<(f64, f64)>,
+}
+
+fn summarize_disk_samples(build: &[Option<(f64, f64)>], tmp: Option<(f64, f64)>) -> DiskSamples {
+    DiskSamples {
+        tightest: build
+            .iter()
+            .chain(std::iter::once(&tmp))
+            .flatten()
+            .copied()
+            .reduce(fuller_disk_sample),
+        build: build.iter().flatten().copied().reduce(fuller_disk_sample),
     }
-    worst
 }
 
 /// Pick the fuller of two `(free_gb, total_gb)` disk samples by free ratio.
@@ -2387,6 +2415,37 @@ mod tests {
         let tight_root = (20.0, 225.0);
         let roomy_tmpfs = (11.0, 16.0);
         assert_eq!(fuller_disk_sample(roomy_tmpfs, tight_root), tight_root);
+    }
+
+    #[test]
+    fn test_disk_samples_keep_a_small_tmpfs_out_of_build_capacity() {
+        // GH #78 devbox: 16 GB tmpfs /tmp at 89.7% free, 1.9 TB root at 93%.
+        let tmpfs = (13.9, 15.5);
+        let root = (1767.0, 1900.0);
+        let samples = summarize_disk_samples(&[Some(root), Some(root)], Some(tmpfs));
+        assert_eq!(samples.tightest, Some(tmpfs), "pressure still sees /tmp");
+        assert_eq!(samples.build, Some(root), "capacity sees the build disk");
+
+        // The build sample is the fuller of canonical root and alias.
+        let alias = (50.0, 1000.0);
+        let samples = summarize_disk_samples(&[Some(root), Some(alias)], Some(tmpfs));
+        assert_eq!(samples.build, Some(alias));
+        assert_eq!(samples.tightest, Some(alias));
+
+        // Missing roots leave no build sample; /tmp alone is still reported
+        // for pressure.
+        let samples = summarize_disk_samples(&[None, None], Some(tmpfs));
+        assert_eq!(samples.build, None);
+        assert_eq!(samples.tightest, Some(tmpfs));
+
+        let samples = summarize_disk_samples(&[None, None], None);
+        assert_eq!(
+            samples,
+            DiskSamples {
+                tightest: None,
+                build: None
+            }
+        );
     }
 
     #[test]

@@ -200,7 +200,10 @@ impl AdmissionGate {
             return verdict;
         }
 
-        if let (Some(free_gb), Some(floor_gb)) = (pressure.disk_free_gb, self.config.min_free_gb)
+        // The floor and headroom are capacity checks, so they read the build
+        // disk; a small tmpfs /tmp only matters through `pressure.state` (GH #78).
+        let disk_free_gb = pressure.capacity_free_gb();
+        if let (Some(free_gb), Some(floor_gb)) = (disk_free_gb, self.config.min_free_gb)
             && free_gb <= floor_gb
         {
             let verdict = AdmissionVerdict::Reject {
@@ -215,7 +218,6 @@ impl AdmissionGate {
         // Missing disk telemetry is unknown, not a full disk. Keep the
         // fail-open penalty without recording a spurious hysteresis rejection
         // during startup before the first capability probe arrives.
-        let disk_free_gb = pressure.disk_free_gb;
         let wid = WorkerId::new(worker_id);
         let h_score = match disk_free_gb {
             Some(free_gb) => {
@@ -418,6 +420,8 @@ mod tests {
             disk_free_gb,
             disk_total_gb: Some(100.0),
             disk_free_ratio: disk_free_gb.map(|g| g / 100.0),
+            build_disk_free_gb: None,
+            build_disk_total_gb: None,
             disk_io_util_pct: None,
             memory_pressure: None,
             telemetry_age_secs: Some(5),
@@ -501,6 +505,40 @@ mod tests {
             unreachable!("critical pressure must reject admission");
         };
         assert_eq!(reason_code, "admission_critical_pressure");
+    }
+
+    #[tokio::test]
+    async fn disk_floor_and_headroom_read_the_build_disk_not_a_small_tmpfs() {
+        let _guard = test_guard!();
+        // GH #78: /tmp tmpfs 13.9/15.5 GB is the tightest mount; the build
+        // disk has 1.7 TB free. A 20 GB floor must not reject the worker.
+        let config = AdmissionConfig {
+            min_free_gb: Some(20.0),
+            ..AdmissionConfig::default()
+        };
+        let gate = make_gate_with_config(Arc::new(BuildHistory::new(10)), config.clone());
+        let mut assessment = make_assessment(PressureState::Healthy, Some(13.9));
+        assessment.disk_total_gb = Some(15.5);
+        assessment.disk_free_ratio = Some(13.9 / 15.5);
+        assessment.build_disk_free_gb = Some(1700.0);
+        assessment.build_disk_total_gb = Some(1900.0);
+        let worker = make_worker("w1", assessment.clone()).await;
+        let verdict = gate.evaluate(&worker, "w1", "proj-a").await;
+        let AdmissionVerdict::Admit { headroom_score, .. } = verdict else {
+            unreachable!("ample build disk must admit: {verdict:?}");
+        };
+        assert_eq!(headroom_score, 1.0);
+
+        // A full build disk hits the floor even though /tmp is roomy.
+        let gate = make_gate_with_config(Arc::new(BuildHistory::new(10)), config);
+        assessment.disk_free_gb = Some(15.0);
+        assessment.build_disk_free_gb = Some(12.0);
+        let worker = make_worker("w2", assessment).await;
+        let verdict = gate.evaluate(&worker, "w2", "proj-a").await;
+        let AdmissionVerdict::Reject { reason_code, .. } = &verdict else {
+            unreachable!("build disk below the floor must reject: {verdict:?}");
+        };
+        assert_eq!(reason_code, "admission_disk_floor");
     }
 
     #[tokio::test]

@@ -908,6 +908,8 @@ mod tests {
             pressure_disk_free_gb: None,
             pressure_disk_total_gb: None,
             pressure_disk_free_ratio: None,
+            pressure_build_disk_free_gb: None,
+            pressure_build_disk_total_gb: None,
             pressure_disk_io_util_pct: None,
             pressure_memory_pressure: None,
             pressure_telemetry_age_secs: None,

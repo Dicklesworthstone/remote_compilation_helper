@@ -929,12 +929,23 @@ pub struct WorkerCapabilities {
     /// 15-minute load average.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub load_avg_15: Option<f64>,
-    /// Free disk space in GB (on /tmp or build directory).
+    /// Free space in GB on the tightest mount a build touches: whichever of
+    /// the projects root, its alias and `/tmp` has the lowest free ratio.
+    /// Drives pressure classification (a full `/tmp` breaks scp/mktemp).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disk_free_gb: Option<f64>,
-    /// Total disk space in GB.
+    /// Total size in GB of the mount reported in `disk_free_gb`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disk_total_gb: Option<f64>,
+    /// Free space in GB on the filesystem that holds build trees (the fuller
+    /// of the projects root and its alias; `/tmp` excluded). Sizes capacity:
+    /// slot derating, disk headroom and the free-space floor (GH #78).
+    /// `None` from an `rch-wkr` that predates the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_disk_free_gb: Option<f64>,
+    /// Total size in GB of the mount reported in `build_disk_free_gb`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_disk_total_gb: Option<f64>,
     /// Canonical path-topology preflight status (`/data/projects` + `/dp` alias).
     ///
     /// `Some(false)` indicates a hard preflight failure that should exclude this
@@ -1042,10 +1053,25 @@ impl WorkerCapabilities {
         self.load_per_core().map(|lpc| lpc > max_load_per_core)
     }
 
-    /// Check if worker has low disk space (below threshold).
+    /// `(free_gb, total_gb)` of the filesystem that holds build trees.
+    ///
+    /// Capacity questions (how many builds fit, is the free-space floor met)
+    /// are about that filesystem, not about a small tmpfs `/tmp` that happens
+    /// to be the tightest mount. Falls back to the tightest-mount sample when
+    /// the worker does not report a build-disk sample (older `rch-wkr`), which
+    /// is the conservative pre-GH-#78 behaviour.
+    pub fn build_disk_gb(&self) -> (Option<f64>, Option<f64>) {
+        if self.build_disk_free_gb.is_some() {
+            (self.build_disk_free_gb, self.build_disk_total_gb)
+        } else {
+            (self.disk_free_gb, self.disk_total_gb)
+        }
+    }
+
+    /// Check if the build disk is below the free-space threshold.
     /// Returns None if metrics unavailable (fail-open).
     pub fn is_low_disk(&self, min_free_gb: f64) -> Option<bool> {
-        self.disk_free_gb.map(|free| free < min_free_gb)
+        self.build_disk_gb().0.map(|free| free < min_free_gb)
     }
 
     /// Check if canonical path-topology preflight is healthy.
@@ -6693,6 +6719,47 @@ retry_max = 2
         // No metrics -> None (fail-open)
         caps.disk_free_gb = None;
         assert!(caps.is_low_disk(10.0).is_none());
+    }
+
+    #[test]
+    fn low_disk_judges_the_build_disk_not_a_small_tmpfs() {
+        let _guard = test_guard!();
+        // GH #78: a 16 GB tmpfs /tmp is the tightest mount by ratio, but the
+        // build trees live on a roomy data disk.
+        let mut caps = WorkerCapabilities::new();
+        caps.disk_free_gb = Some(8.0);
+        caps.disk_total_gb = Some(15.5);
+        caps.build_disk_free_gb = Some(1700.0);
+        caps.build_disk_total_gb = Some(1900.0);
+        assert_eq!(caps.build_disk_gb(), (Some(1700.0), Some(1900.0)));
+        assert_eq!(caps.is_low_disk(10.0), Some(false));
+
+        // A full build disk is low even when /tmp is roomy.
+        caps.build_disk_free_gb = Some(4.0);
+        assert_eq!(caps.is_low_disk(10.0), Some(true));
+
+        // An older rch-wkr without the build sample keeps the old behaviour.
+        caps.build_disk_free_gb = None;
+        caps.build_disk_total_gb = None;
+        assert_eq!(caps.build_disk_gb(), (Some(8.0), Some(15.5)));
+        assert_eq!(caps.is_low_disk(10.0), Some(true));
+    }
+
+    #[test]
+    fn build_disk_sample_is_optional_on_the_wire() {
+        let _guard = test_guard!();
+        let old: WorkerCapabilities =
+            serde_json::from_str(r#"{"disk_free_gb":13.9,"disk_total_gb":15.5}"#).unwrap();
+        assert_eq!(old.build_disk_free_gb, None);
+        assert_eq!(old.build_disk_gb(), (Some(13.9), Some(15.5)));
+
+        let new: WorkerCapabilities = serde_json::from_str(
+            r#"{"disk_free_gb":13.9,"disk_total_gb":15.5,"build_disk_free_gb":1700.0,"build_disk_total_gb":1900.0}"#,
+        )
+        .unwrap();
+        assert_eq!(new.build_disk_gb(), (Some(1700.0), Some(1900.0)));
+        let json = serde_json::to_string(&new).unwrap();
+        assert!(json.contains("\"build_disk_free_gb\":1700.0"), "{json}");
     }
 
     #[test]

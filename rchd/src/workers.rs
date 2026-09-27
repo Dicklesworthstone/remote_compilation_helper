@@ -907,6 +907,8 @@ impl WorkerState {
             current.disk_free_gb = pressure.disk_free_gb;
             current.disk_total_gb = pressure.disk_total_gb;
             current.disk_free_ratio = pressure.disk_free_ratio;
+            current.build_disk_free_gb = pressure.build_disk_free_gb;
+            current.build_disk_total_gb = pressure.build_disk_total_gb;
             current.evaluated_at_unix_ms = now_ms;
             return;
         }
@@ -3522,6 +3524,8 @@ mod tests {
                 disk_free_gb: Some(50.0),
                 disk_total_gb: Some(100.0),
                 disk_free_ratio: Some(0.5),
+                build_disk_free_gb: None,
+                build_disk_total_gb: None,
                 disk_io_util_pct: Some(0.0),
                 memory_pressure: Some(10.0),
                 telemetry_age_secs: Some(10),
@@ -3560,6 +3564,8 @@ mod tests {
                 disk_free_gb: Some(50.0),
                 disk_total_gb: Some(100.0),
                 disk_free_ratio: Some(0.5),
+                build_disk_free_gb: None,
+                build_disk_total_gb: None,
                 disk_io_util_pct: Some(0.0),
                 memory_pressure: Some(10.0),
                 telemetry_age_secs: Some(10),

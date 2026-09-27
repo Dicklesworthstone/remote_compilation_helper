@@ -1373,6 +1373,8 @@ mod tests {
                 disk_free_gb: Some(1.0),
                 disk_total_gb: Some(500.0),
                 disk_free_ratio: Some(0.002),
+                build_disk_free_gb: None,
+                build_disk_total_gb: None,
                 disk_io_util_pct: None,
                 memory_pressure: None,
                 telemetry_age_secs: Some(5),

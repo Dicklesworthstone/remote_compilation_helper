@@ -78,6 +78,14 @@ pub struct PressureAssessment {
     /// Free disk ratio (0.0-1.0) when both free+total are known.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disk_free_ratio: Option<f64>,
+    /// Free GB on the filesystem holding build trees, when the worker reports
+    /// it separately from the tightest mount (GH #78). Sizes capacity only;
+    /// `state` is still classified from `disk_free_gb`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub build_disk_free_gb: Option<f64>,
+    /// Total GB of the filesystem reported in `build_disk_free_gb`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub build_disk_total_gb: Option<f64>,
     /// Disk I/O utilization percentage when telemetry is available.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disk_io_util_pct: Option<f64>,
@@ -103,12 +111,42 @@ impl Default for PressureAssessment {
             disk_free_gb: None,
             disk_total_gb: None,
             disk_free_ratio: None,
+            build_disk_free_gb: None,
+            build_disk_total_gb: None,
             disk_io_util_pct: None,
             memory_pressure: None,
             telemetry_age_secs: None,
             telemetry_fresh: false,
             evaluated_at_unix_ms: current_unix_ms(),
         }
+    }
+}
+
+impl PressureAssessment {
+    /// `(free_gb, total_gb, free_ratio)` of the disk that bounds how many
+    /// builds fit: the build disk when reported, else the tightest mount.
+    ///
+    /// Pressure asks "is any mount a build touches about to fill?" and must
+    /// include a small tmpfs `/tmp`. Capacity asks "how many build trees fit?"
+    /// and must not: `/tmp` holds none of them (GH #78). Without a build-disk
+    /// sample (an older `rch-wkr`) this is the tightest mount, the previous
+    /// and more conservative behaviour.
+    pub fn capacity_disk(&self) -> (Option<f64>, Option<f64>, Option<f64>) {
+        match self.build_disk_free_gb {
+            Some(free) => {
+                let total = self.build_disk_total_gb;
+                let ratio = total
+                    .filter(|total| total.is_finite() && *total > 0.0)
+                    .map(|total| (free / total).clamp(0.0, 1.0));
+                (Some(free), total, ratio)
+            }
+            None => (self.disk_free_gb, self.disk_total_gb, self.disk_free_ratio),
+        }
+    }
+
+    /// Free GB on the capacity disk; see [`Self::capacity_disk`].
+    pub fn capacity_free_gb(&self) -> Option<f64> {
+        self.capacity_disk().0
     }
 }
 
@@ -138,17 +176,15 @@ impl DiskSlotPolicy {
     /// above 25% free (or one slot's budget above the floor on small disks).
     /// Missing measurements stay neutral; admission handles telemetry gaps.
     pub fn headroom(&self, pressure: &PressureAssessment) -> f64 {
-        let ratio = pressure
-            .disk_free_ratio
-            .filter(|ratio| ratio.is_finite() && (0.0..=1.0).contains(ratio));
-        let Some(free_gb) = pressure.disk_free_gb.filter(|free| free.is_finite()) else {
+        let (free_gb, total_gb, ratio) = pressure.capacity_disk();
+        let ratio = ratio.filter(|ratio| ratio.is_finite() && (0.0..=1.0).contains(ratio));
+        let Some(free_gb) = free_gb.filter(|free| free.is_finite()) else {
             return ratio.map_or(1.0, |ratio| (ratio / 0.25).clamp(0.0, 1.0));
         };
         if free_gb <= self.floor_gb {
             return 0.0;
         }
-        let total_gb = pressure
-            .disk_total_gb
+        let total_gb = total_gb
             .filter(|total| total.is_finite() && *total > 0.0)
             .or_else(|| {
                 ratio
@@ -163,7 +199,7 @@ impl DiskSlotPolicy {
     }
 
     pub fn effective_slots(&self, configured: u32, pressure: &PressureAssessment) -> u32 {
-        let Some(free_gb) = pressure.disk_free_gb.filter(|free| free.is_finite()) else {
+        let Some(free_gb) = pressure.capacity_free_gb().filter(|free| free.is_finite()) else {
             return configured;
         };
         let disk_slots = ((free_gb - self.floor_gb).max(0.0) / self.gb_per_slot).floor();
@@ -348,6 +384,17 @@ pub fn evaluate_pressure_policy(
         }
         _ => None,
     };
+    // A zero-total or non-finite build sample is a failed probe; drop it so
+    // capacity falls back to the tightest mount instead of trusting junk.
+    let (build_disk_free_gb, build_disk_total_gb) = match (
+        capabilities.build_disk_free_gb,
+        capabilities.build_disk_total_gb,
+    ) {
+        (Some(free), Some(total)) if free.is_finite() && total.is_finite() && total > 0.0 => {
+            (Some(free.max(0.0)), Some(total))
+        }
+        _ => (None, None),
+    };
 
     let now = Utc::now();
     let telemetry_age_secs = latest.map(|entry| {
@@ -403,6 +450,8 @@ pub fn evaluate_pressure_policy(
         disk_free_gb,
         disk_total_gb,
         disk_free_ratio,
+        build_disk_free_gb,
+        build_disk_total_gb,
         disk_io_util_pct,
         memory_pressure,
         telemetry_age_secs,
@@ -622,6 +671,65 @@ mod tests {
             };
             assert!((policy.headroom(&pressure) - expected).abs() < 1e-12);
         }
+    }
+
+    fn caps_with_build_disk(tmp: (f64, f64), build: Option<(f64, f64)>) -> WorkerCapabilities {
+        let mut caps = test_capabilities(tmp.0, tmp.1);
+        caps.build_disk_free_gb = build.map(|(free, _)| free);
+        caps.build_disk_total_gb = build.map(|(_, total)| total);
+        caps
+    }
+
+    #[test]
+    fn slot_capacity_is_sized_from_the_build_disk_not_a_small_tmpfs() {
+        // GH #78 devbox: 16 GB tmpfs /tmp is the tightest mount (89.5% free)
+        // while the 1.9 TB build disk has 1.7 TB free. Defaults: 10 GB floor,
+        // 10 GB per slot.
+        let policy = DiskSlotPolicy::from(&rch_common::SelectionConfig::default());
+        let config = DiskPressurePolicyConfig::default();
+        let caps = caps_with_build_disk((13.9, 15.5), Some((1700.0, 1900.0)));
+        let pressure = evaluate_pressure_policy(&caps, None, &config);
+        assert_eq!(pressure.disk_free_gb, Some(13.9), "pressure keeps /tmp");
+        assert!(
+            !matches!(
+                pressure.state,
+                PressureState::Critical | PressureState::Warning
+            ),
+            "{:?}",
+            pressure.state
+        );
+        assert_eq!(policy.effective_slots(14, &pressure), 14);
+        assert_eq!(policy.headroom(&pressure), 1.0);
+
+        // A small build disk still derates: floor((25 - 10) / 10) = 1.
+        let caps = caps_with_build_disk((13.9, 15.5), Some((25.0, 100.0)));
+        let pressure = evaluate_pressure_policy(&caps, None, &config);
+        assert_eq!(policy.effective_slots(14, &pressure), 1);
+
+        // Without a build sample (older rch-wkr) capacity falls back to the
+        // tightest mount, the previous behaviour.
+        let caps = caps_with_build_disk((13.9, 15.5), None);
+        let pressure = evaluate_pressure_policy(&caps, None, &config);
+        assert_eq!(pressure.capacity_free_gb(), Some(13.9));
+        assert_eq!(policy.effective_slots(14, &pressure), 0);
+
+        // A junk build sample is a failed probe, not a disk: fall back.
+        for junk in [(f64::NAN, 1900.0), (1700.0, 0.0), (1700.0, f64::INFINITY)] {
+            let caps = caps_with_build_disk((13.9, 15.5), Some(junk));
+            let pressure = evaluate_pressure_policy(&caps, None, &config);
+            assert_eq!(pressure.build_disk_free_gb, None, "{junk:?}");
+            assert_eq!(policy.effective_slots(14, &pressure), 0, "{junk:?}");
+        }
+    }
+
+    #[test]
+    fn full_tmp_is_still_critical_pressure_with_an_ample_build_disk() {
+        // bd-lvbax: a full /tmp breaks scp/mktemp regardless of the data disk.
+        let config = DiskPressurePolicyConfig::default();
+        let caps = caps_with_build_disk((0.2, 15.5), Some((1700.0, 1900.0)));
+        let pressure = evaluate_pressure_policy(&caps, None, &config);
+        assert_eq!(pressure.state, PressureState::Critical);
+        assert_eq!(pressure.capacity_free_gb(), Some(1700.0));
     }
 
     fn test_capabilities(free_gb: f64, total_gb: f64) -> WorkerCapabilities {

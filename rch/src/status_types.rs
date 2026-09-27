@@ -92,6 +92,13 @@ pub struct WorkerStatusFromApi {
     /// Measured free-disk ratio, if available.
     #[serde(default)]
     pub pressure_disk_free_ratio: Option<f64>,
+    /// Free space (GB) on the filesystem holding build trees, which sizes
+    /// slots; absent when the worker reports no separate build-disk sample.
+    #[serde(default)]
+    pub pressure_build_disk_free_gb: Option<f64>,
+    /// Total size (GB) of the build-disk filesystem, if reported.
+    #[serde(default)]
+    pub pressure_build_disk_total_gb: Option<f64>,
     /// Last disk I/O utilization sample, if available.
     #[serde(default)]
     pub pressure_disk_io_util_pct: Option<f64>,
@@ -1625,6 +1632,8 @@ mod tests {
             pressure_disk_free_gb: None,
             pressure_disk_total_gb: None,
             pressure_disk_free_ratio: None,
+            pressure_build_disk_free_gb: None,
+            pressure_build_disk_total_gb: None,
             pressure_disk_io_util_pct: None,
             pressure_memory_pressure: None,
             pressure_telemetry_age_secs: None,

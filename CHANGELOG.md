@@ -31,6 +31,16 @@ Repository: <https://github.com/Dicklesworthstone/remote_compilation_helper>
 
 ## Unreleased
 
+- **A small tmpfs `/tmp` no longer zeroes a roomy worker's slots** (GH #78).
+  `rch-wkr` reported one disk sample, the fullest of the projects root, its
+  alias and `/tmp` by free ratio, and the daemon sized slots, the free-space
+  floor and disk headroom from it. A 16 GB tmpfs a few points fuller than a
+  1.9 TB data disk left the worker `ready` with 0 slots. `rch-wkr` now also
+  reports a build-disk sample (projects root and alias only), which drives
+  capacity; pressure classification still sees `/tmp`, so a full `/tmp` stays
+  critical. `rch workers list` shows the build disk when it differs. Workers
+  running an older `rch-wkr` keep the old sizing.
+
 ## 2.1.3 — 2026-09-27
 
 Everything on `main` since 2.1.0. It includes the 2.1.2 hotfix and about 40
