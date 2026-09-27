@@ -941,8 +941,9 @@ fn exit_with_local_fallback(
     // dispatcher melting under local builds (trj, 2026-09-25) left nothing to
     // say whether rch chose local or an agent bypassed it.
     // A non-compilation command running locally is not a build falling back,
-    // so it must not inflate `rch status`'s local-fallback-build count.
-    if reason != "non-compilation command" {
+    // so it must not inflate `rch status`'s local-fallback-build count. Under
+    // require-remote it is refused instead, and that refusal is recorded.
+    if reason != "non-compilation command" || require_remote {
         record_hook_incident(&build_local_fallback_incident(
             command,
             reason,

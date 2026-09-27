@@ -615,8 +615,10 @@ impl BuildHistory {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         persisted.retain(|id, _| active.contains_key(id));
+        // A failed ownership store must keep surfacing on every heartbeat.
         let due = identity_changed
             || phase_changed
+            || self.ownership_failed()
             || persisted
                 .get(&heartbeat.build_id)
                 .is_none_or(|at| now.duration_since(*at) >= HEARTBEAT_PERSIST_INTERVAL);
