@@ -167,7 +167,7 @@ pub(crate) async fn restart_admission_is_closed(socket_path: &str) -> anyhow::Re
     Ok(status.admission_closed)
 }
 
-/// Query the daemon for a worker.
+/// Query the daemon for a worker (reserves slots and opens a durable build).
 #[allow(clippy::too_many_arguments)] // Command routing query wires many independent fields.
 pub(crate) async fn query_daemon(
     socket_path: &str,
@@ -184,6 +184,77 @@ pub(crate) async fn query_daemon(
     preferred_workers: &[WorkerId],
     job_mode: bool,
     required_tools: &[String],
+) -> anyhow::Result<SelectionResponse> {
+    query_daemon_with_mode(
+        socket_path,
+        project,
+        cores,
+        command,
+        toolchain,
+        required_runtime,
+        command_priority,
+        classification_duration_us,
+        hook_pid,
+        local_wrapper_id,
+        wait_for_worker,
+        preferred_workers,
+        job_mode,
+        required_tools,
+        false,
+    )
+    .await
+}
+
+/// Ask which worker a build would get without reserving anything (`rch
+/// diagnose`). A real selection would open a durable build that a diagnostic
+/// cannot honestly release.
+#[allow(clippy::too_many_arguments)] // Mirrors query_daemon's routing fields.
+pub(crate) async fn query_daemon_dry_run(
+    socket_path: &str,
+    project: &str,
+    cores: u32,
+    command: &str,
+    toolchain: Option<&ToolchainInfo>,
+    required_runtime: RequiredRuntime,
+    preferred_workers: &[WorkerId],
+) -> anyhow::Result<SelectionResponse> {
+    query_daemon_with_mode(
+        socket_path,
+        project,
+        cores,
+        command,
+        toolchain,
+        required_runtime,
+        CommandPriority::Normal,
+        0,
+        None,
+        None,
+        false,
+        preferred_workers,
+        false,
+        &[],
+        true,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)] // Command routing query wires many independent fields.
+async fn query_daemon_with_mode(
+    socket_path: &str,
+    project: &str,
+    cores: u32,
+    command: &str,
+    toolchain: Option<&ToolchainInfo>,
+    required_runtime: RequiredRuntime,
+    command_priority: CommandPriority,
+    classification_duration_us: u64,
+    hook_pid: Option<u32>,
+    local_wrapper_id: Option<&str>,
+    wait_for_worker: bool,
+    preferred_workers: &[WorkerId],
+    job_mode: bool,
+    required_tools: &[String],
+    dry_run: bool,
 ) -> anyhow::Result<SelectionResponse> {
     // Mock support: RCH_MOCK_CIRCUIT_OPEN simulates all circuits open
     // This needs to be checked in the hook since the daemon may be started
@@ -296,6 +367,10 @@ pub(crate) async fn query_daemon(
             .saturating_sub(1)
             .max(1);
         query.push_str(&format!("&wait_timeout_secs={}", wait_timeout_secs));
+    }
+
+    if dry_run {
+        query.push_str("&dry_run=1");
     }
 
     // Bound writes independently from the longer, queue-aware response wait.
