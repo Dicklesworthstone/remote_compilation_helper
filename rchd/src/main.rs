@@ -25,6 +25,7 @@ mod health;
 mod history;
 mod http_api;
 mod metrics;
+mod orphan_quarantine;
 mod process_triage;
 mod reclaim;
 mod reliability;
@@ -1389,6 +1390,17 @@ async fn main() -> Result<()> {
     );
     let _bypass_recovery_handle = bypass_recovery.start();
     info!("Bypass recovery service started");
+
+    // bd-g8m4g: E104 orphan quarantines carrying probe evidence are cleared
+    // once the recorded process group is verified dead, instead of silently
+    // withholding the worker until an operator notices.
+    let _orphan_quarantine_handle = orphan_quarantine::OrphanQuarantineService::new(
+        worker_pool.clone(),
+        admin_disable_store.clone(),
+        orphan_quarantine::SshOrphanProber,
+        orphan_quarantine::ORPHAN_QUARANTINE_CHECK_INTERVAL,
+    )
+    .start();
 
     let metrics_pool = worker_pool.clone();
     let metrics_history = context.history.clone();
