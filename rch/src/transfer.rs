@@ -2134,8 +2134,11 @@ impl TransferPipeline {
             return command;
         };
         let quote = |value: &str| escape(Cow::from(value)).into_owned();
+        // The receipts stay private, but the workload runs under the caller's
+        // umask: a leaked 077 made every remote output 0600/0700, and rsync -a
+        // carried those modes home.
         let supervisor = format!(
-            "trap '' HUP; ( {command}\n); s=$?; printf '%s %s\\n' {identity} \"$s\" > {pending} && sync -f {pending} && mv -f -- {pending} {done} && sync -f {directory}; exit \"$s\"",
+            "trap '' HUP; ( {command}\n); s=$?; (umask 077; printf '%s %s\\n' {identity} \"$s\" > {pending}) && sync -f {pending} && mv -f -- {pending} {done} && sync -f {directory}; exit \"$s\"",
             identity = quote(identity),
             pending = quote(&format!("{path}.pending")),
             done = quote(path),
@@ -2146,19 +2149,24 @@ impl TransferPipeline {
         // the supervisor reaped first (a zombie still answers `kill -0`). A
         // 120s backstop bounds the wait should the reaped PID be reused
         // before tail notices. Without `--pid`, the old bounded
-        // `sleep 1; kill` can still cut a slow tail.
+        // `sleep 1; kill` can still cut a slow tail. Follow by polling, not
+        // inotify: bytes written between tail's first read and its watch
+        // raise no event, and once the writer is gone an inotify tail exits
+        // without a final read. With a slow reader that cut ~5-8% of streams
+        // on uutils tail; a polling tail reads to EOF before it gives up.
         format!(
-            "set -e; umask 077; mkdir -p -- {directory}; mkdir {claim}; : > {out}; : > {err}; \
+            "set -e; rch_umask=$(umask); umask 077; mkdir -p -- {directory}; mkdir {claim}; : > {out}; : > {err}; umask \"$rch_umask\"; \
              nohup sh -c {supervisor} </dev/null >{out} 2>{err} & \
-             p=$!; follow=; if tail --pid=\"$p\" -c 0 /dev/null >/dev/null 2>&1; then follow=--pid=$p; fi; \
+             p=$!; follow=; if tail --pid=\"$p\" -c 0 /dev/null >/dev/null 2>&1; then follow=--pid=$p; \
+               if tail ---disable-inotify -c 0 /dev/null >/dev/null 2>&1; then follow=\"$follow ---disable-inotify\"; fi; fi; \
              tail $follow -c +1 -f {out} & a=$!; tail $follow -c +1 -f {err} >&2 & b=$!; \
              trap 'kill \"$a\" \"$b\" 2>/dev/null || :' EXIT; \
              while [ ! -f {done} ]; do sleep 1; done; \
              wait \"$p\" || :; \
              if [ -n \"$follow\" ]; then \
-               ( sleep 120 & s=$!; trap 'kill \"$s\" 2>/dev/null; exit 0' TERM; wait \"$s\"; kill \"$a\" \"$b\" 2>/dev/null ) & k=$!; \
-               wait \"$a\" \"$b\" || :; kill \"$k\" 2>/dev/null || :; \
-             else sleep 1; kill \"$a\" \"$b\" 2>/dev/null || :; fi; \
+               ( trap 'kill \"$s\" 2>/dev/null; exit 0' TERM; sleep 120 </dev/null >/dev/null 2>&1 & s=$!; wait \"$s\"; kill \"$a\" \"$b\" 2>/dev/null ) & k=$!; \
+               wait \"$a\" || :; a=; wait \"$b\" || :; b=; kill \"$k\" 2>/dev/null || :; \
+             else sleep 1; kill \"$a\" \"$b\" 2>/dev/null || :; a=; b=; fi; \
              read -r identity status < {done}; [ \"$identity\" = {identity} ]; exit \"$status\"",
             claim = quote(&format!("{path}.started")),
             out = quote(&format!("{path}.stdout")),
@@ -7492,12 +7500,12 @@ mod tests {
         assert!(std::path::Path::new(&receipt).is_file());
     }
 
-    /// A reader that lags behind the wrapper (a slow SSH link) leaves tail
-    /// blocked on a full pipe when the command finishes; the stream must
-    /// still end with the last line rather than being cut by a timer.
-    #[cfg(target_os = "linux")]
+    /// The build must create its outputs under the caller's umask; only the
+    /// wrapper's own receipt is private.
+    #[cfg(unix)]
     #[test]
-    fn durable_execution_waits_for_a_slow_reader() {
+    fn durable_execution_runs_the_workload_under_the_callers_umask() {
+        use std::os::unix::fs::PermissionsExt;
         let directory = tempfile::tempdir().unwrap();
         let receipt = directory
             .path()
@@ -7505,24 +7513,74 @@ mod tests {
             .to_str()
             .unwrap()
             .to_owned();
+        let output_file = directory.path().join("built-output");
         let pipeline = TransferPipeline::new(
             PathBuf::from("/home/user/project"),
             "myproject".to_string(),
             "abc123".to_string(),
             TransferConfig::default(),
         )
-        .with_recovery_completion(receipt, "id".to_string());
-        let command = pipeline.durable_execution_command(
-            "i=0; while [ $i -lt 20000 ]; do echo line-$i; i=$((i + 1)); done".to_string(),
-        );
-        let output = std::process::Command::new("sh") // ubs:ignore — fixed wrapper piped into a delayed reader
+        .with_recovery_completion(receipt.clone(), "id".to_string());
+        let command = pipeline.durable_execution_command(format!(
+            "umask; : > {}",
+            escape(Cow::from(output_file.to_str().unwrap()))
+        ));
+        let output = std::process::Command::new("sh") // ubs:ignore — fixed wrapper over this test's temporary receipt
             .arg("-c")
-            .arg(format!("( {command} ) | ( sleep 3; cat )"))
+            .arg(format!("umask 0022; {command}"))
             .output()
             .expect("run durable wrapper");
-        let stdout = String::from_utf8(output.stdout).unwrap();
-        assert_eq!(stdout.lines().count(), 20_000);
-        assert!(stdout.ends_with("line-19999\n"), "tail was cut");
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "0022\n");
+        let mode =
+            |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&output_file), 0o644);
+        assert_eq!(mode(std::path::Path::new(&receipt)) & 0o077, 0);
+    }
+
+    /// A reader that lags behind the wrapper (a slow SSH link) leaves tail
+    /// blocked on a full pipe when the command finishes; the stream must
+    /// still end with the last line rather than being cut by a timer. An
+    /// inotify tail also lost bytes written before its watch existed, in
+    /// ~5-8% of runs, so eight wrappers race at once to make that visible.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn durable_execution_waits_for_a_slow_reader() {
+        let runs: Vec<_> = (0..8)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    let directory = tempfile::tempdir().unwrap();
+                    let receipt = directory
+                        .path()
+                        .join("recovery-9-id")
+                        .to_str()
+                        .unwrap()
+                        .to_owned();
+                    let pipeline = TransferPipeline::new(
+                        PathBuf::from("/home/user/project"),
+                        "myproject".to_string(),
+                        "abc123".to_string(),
+                        TransferConfig::default(),
+                    )
+                    .with_recovery_completion(receipt, "id".to_string());
+                    let command = pipeline.durable_execution_command(
+                        "i=0; while [ $i -lt 20000 ]; do echo line-$i; i=$((i + 1)); done"
+                            .to_string(),
+                    );
+                    let output = std::process::Command::new("sh") // ubs:ignore — fixed wrapper piped into a delayed reader
+                        .arg("-c")
+                        .arg(format!("( {command} ) | ( sleep 3; cat )"))
+                        .output()
+                        .expect("run durable wrapper");
+                    String::from_utf8(output.stdout).unwrap()
+                })
+            })
+            .collect();
+        for run in runs {
+            let stdout = run.join().unwrap();
+            assert_eq!(stdout.lines().count(), 20_000, "tail was cut");
+            assert!(stdout.ends_with("line-19999\n"), "tail was cut");
+        }
     }
 
     #[test]

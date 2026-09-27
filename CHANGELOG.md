@@ -31,6 +31,108 @@ Repository: <https://github.com/Dicklesworthstone/remote_compilation_helper>
 
 ## Unreleased
 
+## 2.1.3 — 2026-09-27
+
+Everything on `main` since 2.1.0. It includes the 2.1.2 hotfix and about 40
+further core fixes from two concurrent maintainers. RABS is unchanged in
+behavior: experimental, operator-only, and not in the archives.
+
+- **Builds that succeed stop being reported as failures.**
+  - Durable remote output no longer loses its tail, which had dropped the final
+    test verdict lines of green runs
+    ([`447c5c45`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/447c5c453d506430b3bd4801375ed343ac7e4a8e),
+    [`c4c405b5`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/c4c405b5706a1ee025b8400cab02bd3a89752fb0)).
+    The follower now polls instead of using inotify: bytes written before the
+    inotify watch existed raised no event, and once the command had exited the
+    follower quit without a final read. On workers with uutils `tail` this still
+    cut 5–8% of streams read by a slow client (8 of 100 under stress; 0 of 100
+    after).
+  - Output publication no longer refuses output roots that sit behind a system
+    symlink such as macOS `/tmp` or `/var`
+    ([`cb11a99c`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/cb11a99c25ea415625bdf465c15c0f36e19deaf8)).
+  - A killed wrapper (tool timeout, Ctrl-C, agent restart) no longer strands
+    its worker source claim. The daemon had reaped the only lease able to
+    release that claim, so every overlapping build on that worker was fenced
+    off: 69 such claims were found across 9 workers, and those are being cleaned
+    up on the fleet (`bd-dmg2k`,
+    [`5ee860bd`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/5ee860bd08dad4ff16324d5ce84cb74f0685ab0a)).
+  - Remote builds run under the caller's umask again. The durable-completion
+    wrapper leaked its private `umask 077` into the workload, so every output
+    was created 0600/0700 and rsync carried those modes home; mode-sensitive
+    steps (a build script watching a file's permissions) silently stopped
+    rerunning. Only the wrapper's own receipt stays private.
+  - `rch diagnose` no longer reserves a worker. It made a real selection whose
+    release was refused, leaving a ghost build that held slots and fenced the
+    project off that worker until the daemon restarted
+    ([`b1b67881`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/b1b678819a8dc80a51a6dca9dcbdd7665a63351c)).
+  - `cargo --config=K=V <subcommand>` offloads again. `rch exec` re-quotes words
+    containing `=`, and the classifier read `'--config=K=V'` as the subcommand,
+    so these builds silently ran locally.
+  - A rejected output set fails the build cleanly instead of stranding source
+    ownership
+    ([`42a92d82`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/42a92d8232f5a337612c01a4a698c2ece0dcffcc)).
+- **Failures say why.** Remote-failure warnings print the full error chain, and
+  a refusal after exhausted retries records it in the incident ledger's new
+  `error` field, secret-redacted and bounded
+  ([`32a6e2c2`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/32a6e2c2f39fb1956745e9ce6773763ea3880585)).
+- **Capacity heals itself.** An E104 orphan quarantine now records its probe
+  evidence, and `rchd` clears it once the recorded process group is verified
+  dead (`bd-g8m4g`,
+  [`19d27eb8`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/19d27eb80ba1f6653dfd8897e0f9ac62da752c28)).
+  Quarantines recorded by earlier versions carry no evidence and still need
+  `rch workers enable`.
+  - A transient toolchain probe no longer excludes a worker for 10 minutes
+    ([`bfbb0f3c`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/bfbb0f3c88d22c2c9b2dbacdf7db30d5136cd855)).
+  - Failover walks every untried worker
+    ([`430c3129`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/430c3129ae51595002f3112ba15ed67f097f1f98)).
+  - The worker orphan reaper runs again and protects cache dirs that a live
+    process is using
+    ([`40259f92`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/40259f9258284bbe6bae4cb863cd3df1dbe7a70e)).
+- **Update authenticity.** `rch update` verifies each archive's `.minisig`
+  against a pinned release key and aborts on a bad signature (`bd-oxxnk`,
+  [`a3a97e6f`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/a3a97e6f6057068a9132ccc03091b33fc0337b22)).
+  An explicit `rch update` always checks GitHub instead of a day-old cache
+  ([`777cf1ac`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/777cf1acb1825276c257a9ab1e1d9e56fad9c107)).
+- **Daemon robustness.**
+  - rchd starts even when a recorded build's worker was removed from config
+    ([`52f129d1`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/52f129d1861fa61999048c01ccf3235a5cb4f935)).
+  - Recovered builds can reattach on macOS
+    ([`85e80a02`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/85e80a02f94da025dbf04fb84b3e256cf521c0c8)).
+  - Terminal receipts are bounded, and heartbeats no longer fsync every time
+    ([`55146141`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/551461418e548574def9d05c0c50e8fe295c0497)).
+  - A persistently failing worker is no longer re-benchmarked back to back.
+- **Other fixes.**
+  - The `rch` test binary no longer overflows its stack
+    ([`f57dd552`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/f57dd552edc5e33a2227c7bdca925355cd3641b1)).
+  - Unresolved client toolchains are refused before dispatch
+    ([`eb439c96`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/eb439c960e1d9ed44e0afa1506c7094c4212428e)).
+    The client toolchain is now resolved by `rustup show` in the caller's
+    directory, so a `rustup override` directory pin wins over a project file
+    exactly as it does for rustup itself; a failed or timed-out query no longer
+    selects an ambient compiler
+    ([`115d4d84`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/115d4d842e64eb6a3b27619cb60fe09a36a38abe)).
+  - A signal-killed local fallback exits 128+N
+    ([`aec67ad3`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/aec67ad36f09656ee8369990e77e5114a1b84dad)).
+  - Redaction also covers `sk-proj`/`github_pat` keys, password-only URLs and
+    any `*_KEY=`
+    ([`ac846517`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/ac846517a53d663bd2d4165928b19baa90b8a4fd)).
+  - `--drain-first` leaves operator-held workers disabled
+    ([`8776ffe0`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/8776ffe08a2215515701ab9b80bbc58271deb40f)).
+  - `workers.toml` edits are made in place, and blank ids or hosts are rejected.
+    A `workers.toml` that is a dangling symlink is written through to its
+    target.
+  - A selection preview no longer consumes a probe slot or bookkeeping on the
+    affinity-pinned path. The durable-wrapper backstop can no longer leave a
+    `sleep` holding the SSH channel or signal a reused PID
+    ([`54a22cb2`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/54a22cb23d30e2473834e9657c4c5549667b58a8)).
+  - `FORCE_COLOR=false` disables color.
+
+Known issue, present since 2.1.0 and newly visible: with a forwarded
+`CARGO_TARGET_DIR`, `cargo test --no-run`/`cargo bench --no-run` executables
+are not returned when Cargo uses its new build-dir layout, which puts them
+under `<profile>/build/` where the cache excludes drop them. The default target
+directory is unaffected (`bd-b7lot`).
+
 ## 2.1.2 — 2026-09-27
 
 Hotfix for a concurrency regression in 2.1.0. Upgrade dispatchers now.
@@ -153,6 +255,7 @@ follow-ups, artifact hashes, and retained limitations.
 
 | Version | Kind | Date | Summary |
 |---------|------|------|---------|
+| [`v2.1.3`](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v2.1.3) | Release | 2026-09-27 | Green builds stop being reported as failures (output tail, symlinked roots); error chains in incidents; self-clearing orphan quarantines; minisign-verified updates; macOS reattach |
 | [`v2.1.2`](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v2.1.2) | Release | 2026-09-27 | Hotfix: output-ownership lock held only during publication (2.1.0 failed every overlapping build on shared `CARGO_TARGET_DIR`); dangling Cargo cache links repaired |
 | [`v2.1.1`](https://github.com/Dicklesworthstone/remote_compilation_helper/tree/v2.1.1) | Tag | 2026-09-27 | Never released: the tagged commit swept in another agent's half-finished edit and does not compile; superseded by 2.1.2 |
 | [`v2.1.0`](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v2.1.0) | Release | 2026-09-26 | Durable job identity (`rch jobs`); exit-0-only success; named-artifact retrieval; fail-closed clean overlays; PSI admission and `--require-tool`; fallback ledger; OTLP; truthful fleet drain/deploy; fresh-daemon fsync stall fixed; asupersync 0.5 |

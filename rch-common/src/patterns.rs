@@ -2406,6 +2406,18 @@ pub fn is_cargo_xwin_build(command: &str) -> bool {
     !tokens.any(|token| matches!(token, "--help" | "-h" | "--version" | "-V"))
 }
 
+/// `rch exec` rebuilds its command with `shell_words::join`, which single-quotes
+/// every word containing `=`: `cargo --config=build.jobs=2 clippy` arrives as
+/// `cargo '--config=build.jobs=2' clippy`. Read such a fully quoted word as its
+/// content; a word with any other quoting is returned unchanged.
+fn unquote_whole_word(token: &str) -> &str {
+    token
+        .strip_prefix('\'')
+        .and_then(|rest| rest.strip_suffix('\''))
+        .filter(|inner| !inner.contains('\''))
+        .unwrap_or(token)
+}
+
 /// Classify cargo subcommands.
 ///
 /// Performance: uses iterator `.nth()` to avoid Vec allocation on the hot path.
@@ -2424,7 +2436,7 @@ fn classify_cargo(cmd: &str) -> Classification {
     // written without `=` consume their following value token.
     const CARGO_VALUE_FLAGS: &[&str] = &["--color", "-Z", "-C", "--config"];
     let subcommand = loop {
-        let Some(tok) = tokens.next() else {
+        let Some(tok) = tokens.next().map(unquote_whole_word) else {
             return Classification::not_compilation("bare cargo command");
         };
         if tok.starts_with('+') {
@@ -2526,7 +2538,7 @@ fn classify_cargo_zigbuild(cmd: &str) -> Classification {
     // classify_cargo so `cargo-zigbuild +nightly zigbuild ...` still classifies.
     const CARGO_VALUE_FLAGS: &[&str] = &["--color", "-Z", "-C", "--config"];
     let subcommand = loop {
-        let Some(tok) = tokens.next() else {
+        let Some(tok) = tokens.next().map(unquote_whole_word) else {
             return Classification::not_compilation("bare cargo-zigbuild command");
         };
         if tok.starts_with('+') {
@@ -5994,6 +6006,29 @@ mod regression_classification {
                 expected_kind: Some(CompilationKind::CargoBuild),
                 reason_contains: "cargo build",
                 min_confidence: 0.90,
+            },
+            // `rch exec` re-quotes every word containing `=` (shell_words::join).
+            Case {
+                cmd: "cargo '--config=build.jobs=2' -vvv clippy",
+                expect_compilation: true,
+                expected_kind: Some(CompilationKind::CargoClippy),
+                reason_contains: "cargo clippy",
+                min_confidence: 0.85,
+            },
+            Case {
+                cmd: "cargo-zigbuild '--color=never' zigbuild",
+                expect_compilation: true,
+                expected_kind: Some(CompilationKind::CargoZigbuild),
+                reason_contains: "cargo-zigbuild build",
+                min_confidence: 0.90,
+            },
+            // A quoted word is still read by its content, never as a flag.
+            Case {
+                cmd: "cargo 'fetch'",
+                expect_compilation: false,
+                expected_kind: None,
+                reason_contains: "",
+                min_confidence: 0.0,
             },
         ];
         run_cases(&cases);

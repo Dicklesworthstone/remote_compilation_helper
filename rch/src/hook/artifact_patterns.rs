@@ -910,9 +910,10 @@ mod profile_artifact_tests {
             assert!(copied.status.success(), "{copied:?}");
             for executable in &executables {
                 let local = local_basis.join(executable.strip_prefix(remote_basis).unwrap());
-                assert_eq!(
-                    std::fs::read(&local).unwrap(),
-                    std::fs::read(executable).unwrap()
+                assert!(
+                    std::fs::read(&local).unwrap() == std::fs::read(executable).unwrap(),
+                    "{command_text}: {} was not returned by patterns {patterns:?}",
+                    executable.display()
                 );
                 assert_ne!(
                     std::fs::metadata(&local).unwrap().permissions().mode() & 0o111,
