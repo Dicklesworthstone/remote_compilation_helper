@@ -845,6 +845,16 @@ impl CancellationOrchestrator {
                         worker.release_slots(state.slots).await;
                         record.slots_released = state.slots;
                     }
+                    // An interrupted build leaves its partial pool behind (GH #81).
+                    ctx.worker_selector
+                        .record_remote_completion(
+                            &state.worker_id,
+                            &state.project_id,
+                            &state.command,
+                            130,
+                            state.remote_command_started(),
+                        )
+                        .await;
                 }
                 Ok(None) => {}
                 Err(error) => {
@@ -1318,6 +1328,62 @@ mod tests {
         assert_eq!(metadata.operation_id, format!("cancel-{}", active.id));
         assert_eq!(metadata.final_state, "completed");
         assert!(metadata.history_cancelled);
+    }
+
+    #[tokio::test]
+    async fn test_cancel_after_remote_execution_started_warms_cache_without_pin() {
+        // GH #81: an interrupted build leaves its partial pool on the worker.
+        let pool = WorkerPool::new();
+        let history = Arc::new(BuildHistory::new(100));
+        let started = history.start_active_build(
+            "proj".to_string(),
+            "worker-a".to_string(),
+            "cargo test".to_string(),
+            0,
+            0,
+            rch_common::BuildLocation::Remote,
+        );
+        history
+            .record_build_heartbeat(rch_common::BuildHeartbeatRequest {
+                build_id: started.id,
+                worker_id: WorkerId::new("worker-a"),
+                hook_pid: None,
+                local_wrapper_id: None,
+                remote_pgid_file: None,
+                phase: rch_common::BuildHeartbeatPhase::Execute,
+                detail: None,
+                progress_counter: Some(1),
+                progress_percent: None,
+            })
+            .expect("heartbeat accepted");
+        let unsynced = history.start_active_build(
+            "unsynced".to_string(),
+            "worker-a".to_string(),
+            "cargo test".to_string(),
+            0,
+            0,
+            rch_common::BuildLocation::Remote,
+        );
+        let ctx = make_test_context(pool, history.clone());
+        let orch = CancellationOrchestrator::new(test_config(), test_events());
+
+        for id in [started.id, unsynced.id] {
+            let resp = orch
+                .cancel_build(&ctx, id, CancelReason::StuckDetector, false)
+                .await;
+            assert_eq!(resp.status, "cancelled");
+        }
+        let warmth = |project: &'static str| {
+            let selector = ctx.worker_selector.clone();
+            async move {
+                selector
+                    .cache_warmth("worker-a", project, crate::selection::CacheUse::Test)
+                    .await
+            }
+        };
+        assert_eq!(warmth("proj").await, 1.0);
+        assert_eq!(warmth("unsynced").await, 0.0);
+        assert_eq!(ctx.worker_selector.get_pinned_worker("proj").await, None);
     }
 
     #[tokio::test]

@@ -608,10 +608,13 @@ pub struct SelectionResult {
 }
 
 fn cache_use_for_request(request: &SelectionRequest) -> CacheUse {
-    let Some(command) = request.command.as_deref() else {
-        return CacheUse::Build;
-    };
+    request
+        .command
+        .as_deref()
+        .map_or(CacheUse::Build, cache_use_for_command)
+}
 
+fn cache_use_for_command(command: &str) -> CacheUse {
     let classification = classify_command(command);
     if classification
         .kind
@@ -1012,6 +1015,46 @@ impl WorkerSelector {
             CacheUse::Build
         };
         cache.record_build(worker_id, project_id, cache_use);
+    }
+
+    /// Record what a finished remote build proves about cache placement.
+    ///
+    /// A zero exit pins the project to the worker ([`Self::record_success`]).
+    /// A non-zero exit or a cancellation pins nothing and is not a worker
+    /// health signal, but once the command has started remotely the worker's
+    /// pooled target dir holds the project's dependency artifacts. Record that
+    /// as cache warmth only, so the next edit-fix-build is scored toward the
+    /// warm pool instead of recompiling every dependency elsewhere (GH #81).
+    pub async fn record_remote_completion(
+        &self,
+        worker_id: &str,
+        project_id: &str,
+        command: &str,
+        exit_code: i32,
+        remote_command_started: bool,
+    ) {
+        if exit_code == 0 {
+            self.record_success(worker_id, project_id).await;
+        } else if remote_command_started {
+            let cache_use = cache_use_for_command(command);
+            self.cache_tracker
+                .write()
+                .await
+                .record_build(worker_id, project_id, cache_use);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn cache_warmth(
+        &self,
+        worker_id: &str,
+        project_id: &str,
+        cache_use: CacheUse,
+    ) -> f64 {
+        self.cache_tracker
+            .read()
+            .await
+            .estimate_warmth(worker_id, project_id, cache_use)
     }
 
     /// Record a successful build for affinity pinning.
@@ -8054,6 +8097,107 @@ mod tests {
     // ========================================================================
     // Affinity Pinning Tests (bd-5a5k)
     // ========================================================================
+
+    #[tokio::test]
+    async fn failed_remote_build_warms_its_worker_without_pinning() {
+        // GH #81: a compile error after the dependencies built leaves a warm
+        // pool on worker-a. The next build must be scored toward it, without
+        // treating the failure as a success (no pin, no fallback entry).
+        let pool = WorkerPool::new();
+        for (id, speed) in [("worker-a", 80.0), ("worker-b", 90.0)] {
+            pool.add_worker(make_worker(id, 8, speed).config.read().await.clone())
+                .await;
+            pool.get(&WorkerId::new(id))
+                .await
+                .unwrap()
+                .set_speed_score(speed);
+        }
+        let selector = WorkerSelector::with_config(
+            SelectionConfig {
+                strategy: SelectionStrategy::Balanced,
+                ..Default::default()
+            },
+            CircuitBreakerConfig::default(),
+        );
+        let request = SelectionRequest {
+            job_mode: false,
+            project: "poolrepro".to_string(),
+            command: Some("cargo build -j 2".to_string()),
+            command_priority: CommandPriority::Normal,
+            estimated_cores: 2,
+            preferred_workers: vec![],
+            toolchain: None,
+            required_runtime: RequiredRuntime::default(),
+            classification_duration_us: None,
+            hook_pid: None,
+            required_tools: Vec::new(),
+        };
+        async fn pick(
+            selector: &WorkerSelector,
+            pool: &WorkerPool,
+            request: &SelectionRequest,
+        ) -> String {
+            let result = selector.select(pool, request).await;
+            let worker = result.worker.expect("a worker is eligible");
+            let id = worker.config.read().await.id.to_string();
+            worker.release_slots(request.estimated_cores).await;
+            id
+        }
+        assert_eq!(
+            pick(&selector, &pool, &request).await,
+            "worker-b",
+            "cold: faster worker"
+        );
+
+        // Failed before the remote command started: nothing is warm.
+        selector
+            .record_remote_completion("worker-a", "poolrepro", "cargo build -j 2", 1, false)
+            .await;
+        assert_eq!(
+            selector
+                .cache_warmth("worker-a", "poolrepro", CacheUse::Build)
+                .await,
+            0.0
+        );
+
+        selector
+            .record_remote_completion("worker-a", "poolrepro", "cargo build -j 2", 101, true)
+            .await;
+        assert_eq!(
+            selector
+                .cache_warmth("worker-a", "poolrepro", CacheUse::Build)
+                .await,
+            1.0
+        );
+        assert_eq!(selector.get_pinned_worker("poolrepro").await, None);
+        assert_eq!(selector.get_fallback_worker("poolrepro").await, None);
+        assert_eq!(
+            pick(&selector, &pool, &request).await,
+            "worker-a",
+            "warm pool wins"
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_completion_records_test_warmth_and_success_pins() {
+        let selector = WorkerSelector::new();
+        selector
+            .record_remote_completion("w1", "proj", "cargo test --workspace", 130, true)
+            .await;
+        assert_eq!(
+            selector.cache_warmth("w1", "proj", CacheUse::Test).await,
+            1.0
+        );
+        assert_eq!(selector.get_pinned_worker("proj").await, None);
+
+        selector
+            .record_remote_completion("w2", "proj", "cargo build", 0, true)
+            .await;
+        assert_eq!(
+            selector.get_pinned_worker("proj").await.as_deref(),
+            Some("w2")
+        );
+    }
 
     #[test]
     fn test_cache_tracker_record_success() {

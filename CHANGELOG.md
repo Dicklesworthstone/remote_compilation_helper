@@ -40,6 +40,13 @@ Repository: <https://github.com/Dicklesworthstone/remote_compilation_helper>
   capacity; pressure classification still sees `/tmp`, so a full `/tmp` stays
   critical. `rch workers list` shows the build disk when it differs. Workers
   running an older `rch-wkr` keep the old sizing.
+- **A failed or interrupted build's warm pool now attracts the rebuild**
+  (GH #81). Only a zero exit reached the selector, so after a compile error or
+  a Ctrl-C the worker holding the fresh pooled target dir scored like any cold
+  worker and the fix-and-rebuild often recompiled every dependency elsewhere.
+  Any build whose command started remotely now records cache warmth on its
+  worker, both on release and on cancellation. A non-zero exit still creates
+  no affinity pin, no last-success fallback and no worker-health success.
 
 ## 2.1.3 — 2026-09-27
 

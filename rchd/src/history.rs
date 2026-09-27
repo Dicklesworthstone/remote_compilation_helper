@@ -176,6 +176,18 @@ pub struct ActiveBuildState {
     pub recovered: bool,
 }
 
+impl ActiveBuildState {
+    /// Whether the build's command started on its remote worker.
+    ///
+    /// The hook reports `Execute` (flushed immediately) before it launches the
+    /// remote command, then `SyncDown` and `Finalize`. A build still at
+    /// `SyncUp` never ran there, so it says nothing about the worker's cache.
+    pub fn remote_command_started(&self) -> bool {
+        self.location == BuildLocation::Remote
+            && !matches!(self.heartbeat_phase, BuildHeartbeatPhase::SyncUp)
+    }
+}
+
 /// Snapshot of stuck-detector evidence for an active build.
 #[derive(Debug, Clone, Copy)]
 pub struct StuckDetectorSnapshot {

@@ -3078,26 +3078,33 @@ fn lease_blocks_restart(
 /// Handle a release-worker request.
 async fn handle_release_worker(ctx: &DaemonContext, request: ReleaseRequest) -> Result<()> {
     let exit_code = request.exit_code.unwrap_or(0);
-    let (release_worker_id, release_slots, record) = if let Some(build_id) = request.build_id {
-        let Some((state, record)) = ctx.history.complete_durable(
-            build_id,
-            request.worker_id.as_str(),
-            request.local_wrapper_id.as_deref(),
-            crate::history::BuildCompletion {
-                exit_code,
-                duration_ms: request.duration_ms,
-                bytes_transferred: request.bytes_transferred,
-                timing: request.timing,
-                cancellation: None,
-            },
-        )?
-        else {
-            return Ok(());
+    let (release_worker_id, release_slots, record, remote_command_started) =
+        if let Some(build_id) = request.build_id {
+            let Some((state, record)) = ctx.history.complete_durable(
+                build_id,
+                request.worker_id.as_str(),
+                request.local_wrapper_id.as_deref(),
+                crate::history::BuildCompletion {
+                    exit_code,
+                    duration_ms: request.duration_ms,
+                    bytes_transferred: request.bytes_transferred,
+                    timing: request.timing,
+                    cancellation: None,
+                },
+            )?
+            else {
+                return Ok(());
+            };
+            let remote_command_started = state.remote_command_started();
+            (
+                WorkerId::new(state.worker_id),
+                state.slots,
+                Some(record),
+                remote_command_started,
+            )
+        } else {
+            anyhow::bail!("release requires durable build_id; unowned slot release refused")
         };
-        (WorkerId::new(state.worker_id), state.slots, Some(record))
-    } else {
-        anyhow::bail!("release requires durable build_id; unowned slot release refused")
-    };
 
     debug!(
         "Releasing {} slots on worker {}",
@@ -3136,11 +3143,15 @@ async fn handle_release_worker(ctx: &DaemonContext, request: ReleaseRequest) -> 
                 worker.record_success().await;
             }
 
-            if exit_code == 0 {
-                ctx.worker_selector
-                    .record_success(worker_id, &rec.project_id)
-                    .await;
-            }
+            ctx.worker_selector
+                .record_remote_completion(
+                    worker_id,
+                    &rec.project_id,
+                    &rec.command,
+                    exit_code,
+                    remote_command_started,
+                )
+                .await;
         }
     }
     Ok(())
@@ -7431,6 +7442,84 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(worker.available_slots().await, 6);
+    }
+
+    #[tokio::test]
+    async fn test_release_after_remote_failure_warms_cache_without_health_or_pin() {
+        let _guard = test_guard!();
+        let pool = WorkerPool::new();
+        pool.add_worker(make_test_worker("worker1", 8)).await;
+        let ctx = make_test_context(pool.clone());
+        let worker = pool.get(&WorkerId::new("worker1")).await.unwrap();
+
+        let start = |project: &str| {
+            let build = ctx.history.start_active_build(
+                project.to_string(),
+                "worker1".to_string(),
+                "cargo build".to_string(),
+                12345,
+                2,
+                rch_common::BuildLocation::Remote,
+            );
+            build.id
+        };
+        let release = |build_id| ReleaseRequest {
+            local_wrapper_id: None,
+            worker_id: WorkerId::new("worker1"),
+            slots: 2,
+            build_id: Some(build_id),
+            exit_code: Some(101),
+            duration_ms: Some(5000),
+            bytes_transferred: None,
+            timing: None,
+        };
+
+        // GH #81: the remote command ran (Execute heartbeat), then exited 101.
+        let ran = start("ran-project");
+        assert!(worker.reserve_slots(2).await);
+        ctx.history
+            .record_build_heartbeat(rch_common::BuildHeartbeatRequest {
+                build_id: ran,
+                worker_id: WorkerId::new("worker1"),
+                hook_pid: None,
+                local_wrapper_id: None,
+                remote_pgid_file: None,
+                phase: rch_common::BuildHeartbeatPhase::Execute,
+                detail: None,
+                progress_counter: Some(1),
+                progress_percent: None,
+            })
+            .expect("heartbeat accepted");
+        handle_release_worker(&ctx, release(ran)).await.unwrap();
+        assert_eq!(
+            ctx.worker_selector
+                .cache_warmth("worker1", "ran-project", crate::selection::CacheUse::Build)
+                .await,
+            1.0
+        );
+        assert_eq!(
+            ctx.worker_selector.get_pinned_worker("ran-project").await,
+            None
+        );
+        assert!(worker.circuit_stats().await.recent_results().is_empty());
+
+        // Never got past sync-up: the worker's cache learned nothing.
+        let unsynced = start("unsynced-project");
+        assert!(worker.reserve_slots(2).await);
+        handle_release_worker(&ctx, release(unsynced))
+            .await
+            .unwrap();
+        assert_eq!(
+            ctx.worker_selector
+                .cache_warmth(
+                    "worker1",
+                    "unsynced-project",
+                    crate::selection::CacheUse::Build
+                )
+                .await,
+            0.0
+        );
+        assert_eq!(worker.available_slots().await, 8);
     }
 
     #[tokio::test]
