@@ -100,12 +100,13 @@ async fn retrieve_with_live_recovery<T>(
     lease: Option<&DurableLeaseWriter>,
     mut retrieve: impl AsyncFnMut(&TransferPipeline) -> anyhow::Result<T>,
 ) -> anyhow::Result<T> {
+    // Retrieval futures are large; heap-pin them (bd-uz82c).
     let Some(lease) = lease else {
-        return retrieve(pipeline).await;
+        return Box::pin(retrieve(pipeline)).await;
     };
     let evidence = lease.snapshot();
     if evidence.recovery.is_none() || evidence.identity.remote_build_id.is_none() {
-        return retrieve(pipeline).await;
+        return Box::pin(retrieve(pipeline)).await;
     }
     let receipt = default_job_lease_directory()
         .join(format!("{}.recover", evidence.identity.local_wrapper_id));
@@ -114,8 +115,7 @@ async fn retrieve_with_live_recovery<T>(
         let (cancel, requested) = tokio::sync::watch::channel(false);
         let controlled = pipeline.clone().with_retrieval_control(requested, started);
         let result = {
-            let retrieval = retrieve(&controlled);
-            tokio::pin!(retrieval);
+            let mut retrieval = Box::pin(retrieve(&controlled));
             let mut poll = tokio::time::interval(Duration::from_millis(250));
             poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
@@ -495,7 +495,10 @@ pub(super) async fn execute_remote_compilation(
     // `None` keeps pooled stores inside the project mirror.
     pooled_target_store_base: Option<&str>,
 ) -> anyhow::Result<RemoteExecutionResult> {
-    let outcome = execute_remote_compilation_inner(
+    // The pipeline's state machine is large; held inline, debug builds moved
+    // it across a 2 MiB thread stack and overflowed (bd-uz82c). Keep it on
+    // the heap so every caller's future stays small.
+    let outcome = Box::pin(execute_remote_compilation_inner(
         worker,
         command,
         transfer_config,
@@ -517,7 +520,7 @@ pub(super) async fn execute_remote_compilation(
         layer0_env,
         pooled_target_prune_idle_hours,
         pooled_target_store_base,
-    )
+    ))
     .await;
     // The inner future has dropped every local holder before cleanup tries to
     // reattach it. Cancellation drains remote mutation descriptors first; once
@@ -1759,72 +1762,72 @@ async fn execute_remote_compilation_inner(
     if let Some(session) = recovery_session.as_mut() {
         session.starting_execution()?;
     }
-    let result = pipeline
-        .execute_remote_streaming(
-            &worker_config,
-            &command_with_telemetry,
-            toolchain,
-            move |line| {
-                if suppress_telemetry {
-                    return;
-                }
-                if line.trim() == PIGGYBACK_MARKER {
-                    suppress_telemetry = true;
-                    return;
-                }
-                if let Some(state) = heartbeat_state_stdout.as_ref() {
-                    mark_heartbeat_progress(state);
-                }
+    // Heap-pinned: the streaming execution future is large (bd-uz82c).
+    let result = Box::pin(pipeline.execute_remote_streaming(
+        &worker_config,
+        &command_with_telemetry,
+        toolchain,
+        move |line| {
+            if suppress_telemetry {
+                return;
+            }
+            if line.trim() == PIGGYBACK_MARKER {
+                suppress_telemetry = true;
+                return;
+            }
+            if let Some(state) = heartbeat_state_stdout.as_ref() {
+                mark_heartbeat_progress(state);
+            }
 
-                let mut state = ui_state_stdout.borrow_mut();
-                if let Some(progress) = state.progress.as_mut() {
-                    progress.update_from_line(line);
-                    if !state.output_truncated {
-                        const MAX_OUTPUT_BYTES: usize = 256 * 1024;
-                        if state.output.len() + line.len() <= MAX_OUTPUT_BYTES {
-                            state.output.push_str(line);
-                        } else {
-                            state.output_truncated = true;
-                        }
+            let mut state = ui_state_stdout.borrow_mut();
+            if let Some(progress) = state.progress.as_mut() {
+                progress.update_from_line(line);
+                if !state.output_truncated {
+                    const MAX_OUTPUT_BYTES: usize = 256 * 1024;
+                    if state.output.len() + line.len() <= MAX_OUTPUT_BYTES {
+                        state.output.push_str(line);
+                    } else {
+                        state.output_truncated = true;
                     }
-                } else {
-                    // Write stdout lines to stderr (hook stdout is for protocol)
-                    eprint!("{}", line);
                 }
-            },
-            move |line| {
-                if deadline_pipeline.is_deadline_marker(line) {
-                    deadline_triggered_stderr.set(true);
-                    return;
-                }
-                if line.trim_end_matches(['\r', '\n']) == process_setup_marker {
-                    return;
-                }
-                if let Some(state) = heartbeat_state_stderr.as_ref() {
-                    mark_heartbeat_progress(state);
-                }
-                // Write stderr lines to stderr and capture for analysis
-                let mut state = ui_state_stderr.borrow_mut();
-                if let Some(progress) = state.progress.as_mut() {
-                    progress.update_from_line(line);
-                    if !state.output_truncated {
-                        const MAX_OUTPUT_BYTES: usize = 256 * 1024;
-                        if state.output.len() + line.len() <= MAX_OUTPUT_BYTES {
-                            state.output.push_str(line);
-                        } else {
-                            state.output_truncated = true;
-                        }
+            } else {
+                // Write stdout lines to stderr (hook stdout is for protocol)
+                eprint!("{}", line);
+            }
+        },
+        move |line| {
+            if deadline_pipeline.is_deadline_marker(line) {
+                deadline_triggered_stderr.set(true);
+                return;
+            }
+            if line.trim_end_matches(['\r', '\n']) == process_setup_marker {
+                return;
+            }
+            if let Some(state) = heartbeat_state_stderr.as_ref() {
+                mark_heartbeat_progress(state);
+            }
+            // Write stderr lines to stderr and capture for analysis
+            let mut state = ui_state_stderr.borrow_mut();
+            if let Some(progress) = state.progress.as_mut() {
+                progress.update_from_line(line);
+                if !state.output_truncated {
+                    const MAX_OUTPUT_BYTES: usize = 256 * 1024;
+                    if state.output.len() + line.len() <= MAX_OUTPUT_BYTES {
+                        state.output.push_str(line);
+                    } else {
+                        state.output_truncated = true;
                     }
-                } else {
-                    eprint!("{}", line);
                 }
-                drop(state);
+            } else {
+                eprint!("{}", line);
+            }
+            drop(state);
 
-                stderr_capture_stderr.borrow_mut().push_str(line);
-            },
-        )
-        .await
-        .context(crate::transfer::RemoteExecutionUnconfirmed)?;
+            stderr_capture_stderr.borrow_mut().push_str(line);
+        },
+    ))
+    .await
+    .context(crate::transfer::RemoteExecutionUnconfirmed)?;
 
     // The execution SSH session is separate from the holder. A healthy holder
     // cannot prove Cargo stopped after that transport was lost.
