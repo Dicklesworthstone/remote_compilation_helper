@@ -1115,8 +1115,9 @@ enum RemoteFaultExhaustAction {
 }
 
 /// Fetch daemon status, rank the remaining workers by capacity, and re-query the
-/// daemon pinned to the biggest untried worker. Returns the fresh selection
-/// response plus the chosen worker id, or `None` when no bigger worker can serve.
+/// daemon pinned to each untried worker, biggest first, until one is admitted.
+/// Returns the fresh selection response plus the chosen worker id, or `None`
+/// when no untried worker can serve.
 #[allow(clippy::too_many_arguments)]
 async fn try_retry_on_bigger_worker(
     socket_path: &str,
@@ -1141,40 +1142,45 @@ async fn try_retry_on_bigger_worker(
         }
     };
     let snapshots = build_capacity_snapshots(&status);
-    let chosen = pick_bigger_worker(snapshots.as_slice(), tried_workers, worker_pin)?;
-    let preferred = vec![chosen.clone()];
-    match query_daemon(
-        socket_path,
-        project,
-        estimated_cores,
-        remote_command,
-        toolchain,
-        required_runtime,
-        command_priority,
-        0,
-        Some(std::process::id()),
-        local_wrapper_id,
-        false, // do not block waiting on one specific worker during a retry
-        &preferred,
-        false, // retry upsizing is compilation-scoped; never job mode
-        &[],   // ...and therefore carries no named-tool requirements
-    )
-    .await
-    {
-        Ok(response) if response.worker.is_some() => Some((response, chosen)),
-        Ok(_) => {
-            reporter.verbose(&format!(
-                "[RCH] retry: bigger worker {chosen} is not currently admissible; ending retries"
-            ));
-            None
-        }
-        Err(e) => {
-            reporter.verbose(&format!(
-                "[RCH] retry: re-query for {chosen} failed ({e}); ending retries"
-            ));
-            None
+    // The biggest candidate may be full right now. Walk down the capacity
+    // order rather than ending retries while smaller workers sit idle.
+    let mut passed_over = tried_workers.to_vec();
+    while let Some(chosen) = pick_bigger_worker(snapshots.as_slice(), &passed_over, worker_pin) {
+        let preferred = vec![chosen.clone()];
+        match query_daemon(
+            socket_path,
+            project,
+            estimated_cores,
+            remote_command,
+            toolchain,
+            required_runtime,
+            command_priority,
+            0,
+            Some(std::process::id()),
+            local_wrapper_id,
+            false, // do not block waiting on one specific worker during a retry
+            &preferred,
+            false, // retry upsizing is compilation-scoped; never job mode
+            &[],   // ...and therefore carries no named-tool requirements
+        )
+        .await
+        {
+            Ok(response) if response.worker.is_some() => return Some((response, chosen)),
+            Ok(_) => {
+                reporter.verbose(&format!(
+                    "[RCH] retry: worker {chosen} is not currently admissible; trying the next"
+                ));
+                passed_over.push(chosen);
+            }
+            Err(e) => {
+                reporter.verbose(&format!(
+                    "[RCH] retry: re-query for {chosen} failed ({e}); ending retries"
+                ));
+                return None;
+            }
         }
     }
+    None
 }
 
 // ---------------------------------------------------------------------------
