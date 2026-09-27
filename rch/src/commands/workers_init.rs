@@ -417,7 +417,13 @@ fn upsert_worker_entry(existing: Option<&str>, worker: &WorkerConfig) -> Result<
 /// leaves a truncated workers.toml behind. A symlinked config is written
 /// through to its target and the existing file mode is kept.
 fn write_file_atomically(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
-    let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    // A dangling symlink does not canonicalize; write to its target instead.
+    let target = std::fs::canonicalize(path).unwrap_or_else(|_| match std::fs::read_link(path) {
+        Ok(link) => path
+            .parent()
+            .map_or(link.clone(), |parent| parent.join(&link)),
+        Err(_) => path.to_path_buf(),
+    });
     let tmp = target.with_extension(format!("toml.tmp-{}", std::process::id()));
     let result = std::fs::write(&tmp, contents)
         .and_then(|()| match std::fs::metadata(&target) {
@@ -786,6 +792,29 @@ enabled = false
             .map(|w| w["id"].as_str().unwrap())
             .collect();
         assert_eq!(ids, ["a", "b"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_file_atomically_creates_the_target_of_a_dangling_symlink() {
+        let _guard = test_guard!();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("dotfiles")).unwrap();
+        let link = dir.path().join("workers.toml");
+        std::os::unix::fs::symlink("dotfiles/workers.toml", &link).unwrap();
+
+        write_file_atomically(&link, "new").unwrap();
+
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("dotfiles/workers.toml")).unwrap(),
+            "new"
+        );
     }
 
     #[cfg(unix)]

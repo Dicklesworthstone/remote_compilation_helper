@@ -849,6 +849,13 @@ impl WorkerSelector {
                 "Using affinity-pinned worker {} for project {}",
                 worker_id, request.project
             );
+            if self.preview {
+                return SelectionResult {
+                    worker: Some(worker),
+                    reason: SelectionReason::AffinityPinned,
+                    diagnostics: None,
+                };
+            }
 
             // Record the selection for fairness tracking
             let mut history = self.selection_history.write().await;
@@ -4713,6 +4720,22 @@ mod tests {
         assert!(
             !worker.can_probe(&circuit).await,
             "a real selection takes the probe"
+        );
+
+        // The affinity-pinned path must be just as side-effect free.
+        worker.close_circuit().await;
+        worker.open_circuit().await;
+        worker.half_open_circuit().await;
+        let mut config = SelectionConfig::default();
+        config.affinity.enabled = true;
+        config.affinity.pin_minutes = 60;
+        let pinned = WorkerSelector::with_config(config, circuit.clone());
+        pinned.record_success("half_open", "myproject").await;
+        let preview = pinned.preview_with_exclusions(&pool, &request, &none).await;
+        assert_eq!(preview.reason, SelectionReason::AffinityPinned);
+        assert!(
+            worker.can_probe(&circuit).await,
+            "a pinned preview consumed the probe slot"
         );
     }
 

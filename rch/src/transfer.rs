@@ -2156,9 +2156,9 @@ impl TransferPipeline {
              while [ ! -f {done} ]; do sleep 1; done; \
              wait \"$p\" || :; \
              if [ -n \"$follow\" ]; then \
-               ( sleep 120 & s=$!; trap 'kill \"$s\" 2>/dev/null; exit 0' TERM; wait \"$s\"; kill \"$a\" \"$b\" 2>/dev/null ) & k=$!; \
-               wait \"$a\" \"$b\" || :; kill \"$k\" 2>/dev/null || :; \
-             else sleep 1; kill \"$a\" \"$b\" 2>/dev/null || :; fi; \
+               ( trap 'kill \"$s\" 2>/dev/null; exit 0' TERM; sleep 120 </dev/null >/dev/null 2>&1 & s=$!; wait \"$s\"; kill \"$a\" \"$b\" 2>/dev/null ) & k=$!; \
+               wait \"$a\" || :; a=; wait \"$b\" || :; b=; kill \"$k\" 2>/dev/null || :; \
+             else sleep 1; kill \"$a\" \"$b\" 2>/dev/null || :; a=; b=; fi; \
              read -r identity status < {done}; [ \"$identity\" = {identity} ]; exit \"$status\"",
             claim = quote(&format!("{path}.started")),
             out = quote(&format!("{path}.stdout")),

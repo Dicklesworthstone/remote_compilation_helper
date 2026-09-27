@@ -3031,9 +3031,19 @@ const DEAD_WRAPPER_HEARTBEAT_STALE_MS: u64 = 15 * 60 * 1000;
 /// can release its worker-side source claim (`rch jobs recover`). Reaping it
 /// after its wrapper died stranded the claim forever and fenced every
 /// overlapping build on that worker (bd-dmg2k: 69 such claims fleet-wide).
+/// Only a recipe that names worker-side ownership (source roots, a source
+/// pair, or a tree to retire) needs keeping.
 fn lease_owns_unretired_source(lease: &DurableJobLease) -> bool {
     lease.recovery.as_ref().is_some_and(|recipe| {
-        recipe.get("retired").and_then(serde_json::Value::as_bool) != Some(true)
+        let owns = recipe
+            .get("source_roots")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|roots| !roots.is_empty())
+            || recipe.get("pair").is_some_and(|pair| !pair.is_null())
+            || recipe
+                .get("retire_root")
+                .is_some_and(|root| !root.is_null());
+        owns && recipe.get("retired").and_then(serde_json::Value::as_bool) != Some(true)
     })
 }
 
@@ -5414,15 +5424,21 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let now = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap();
         let stale = now - LEASE_REAP_RETENTION_MS - 1;
-        // A PID beyond pid_max: provably dead, so neither lease blocks restart.
+        // A PID beyond pid_max: provably dead.
         let dead_pid = 4_194_304 * 2;
-        let write = |name: &str, retired: bool| {
-            let mut lease = make_test_lease(stale, dead_pid);
-            lease.recovery = Some(serde_json::json!({ "identity": name, "retired": retired }));
+        let write = |name: &str, pid: u32, recipe: serde_json::Value| {
+            let mut lease = make_test_lease(stale, pid);
+            lease.recovery = Some(recipe);
             std::fs::write(dir.path().join(name), serde_json::to_vec(&lease).unwrap()).unwrap();
         };
-        write("owns-source.json", false);
-        write("retired.json", true);
+        let owning = |retired: bool| serde_json::json!({ "source_roots": ["/p"], "pair": null, "retire_root": null, "retired": retired });
+        write("owns-source.json", dead_pid, owning(false));
+        write("retired.json", dead_pid, owning(true));
+        write(
+            "owns-nothing.json",
+            dead_pid,
+            serde_json::json!({ "source_roots": [], "pair": null, "retire_root": null, "retired": false }),
+        );
 
         let blocked = scan_client_leases(dir.path()).unwrap();
 
@@ -5434,6 +5450,10 @@ mod tests {
         assert!(
             !dir.path().join("retired.json").exists(),
             "retired history is reaped"
+        );
+        assert!(
+            !dir.path().join("owns-nothing.json").exists(),
+            "a recipe owning nothing on the worker is plain history"
         );
     }
 
