@@ -2376,7 +2376,7 @@ async fn handle_select_worker_dry_run(
     let excluded_worker_ids = ctx.history.active_workers_for_project(&request.project);
     let result = ctx
         .worker_selector
-        .select_with_exclusions(&ctx.pool, request, &excluded_worker_ids)
+        .preview_with_exclusions(&ctx.pool, request, &excluded_worker_ids)
         .await;
     let worker = match result.worker {
         Some(worker) => {

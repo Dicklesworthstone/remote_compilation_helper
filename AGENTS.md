@@ -95,7 +95,7 @@ We only use **Cargo** in this project, NEVER any other package manager.
 | `ureq` | HTTP client for webhook dispatch |
 | `opentelemetry` + `opentelemetry-otlp` | OpenTelemetry observability |
 | `prometheus` | Metrics collection |
-| `ratatui` + `crossterm` | TUI interface |
+| `ftui` (FrankenTUI) | TUI interface (`rch dashboard` / `rch tui`) |
 | `rich_rust` | Rich terminal output |
 | `notify` | File watching for hot-reload |
 | `uuid` | UUID generation |
@@ -245,7 +245,7 @@ If you aren't 100% sure how to use a third-party library, **SEARCH ONLINE** to f
 
 ### What It Does
 
-Intercepts compilation commands (cargo build/test/clippy, gcc, clang, bun test/typecheck, make, etc.) and transparently offloads them to a fleet of 8 remote Contabo VPS workers. This prevents compilation storms from overwhelming the local machine when many agents run simultaneously.
+Intercepts compilation commands (cargo build/test/clippy, gcc, clang, bun test/typecheck, make, etc.) and transparently offloads them to a fleet of remote workers (18 in `~/.config/rch/workers.toml` as of 2026-09: Contabo, OVH, Hetzner, one Windows box; `rch workers list` is authoritative). This prevents compilation storms from overwhelming the local machine when many agents run simultaneously.
 
 ### Key Differences from DCG
 
@@ -286,6 +286,9 @@ remote_compilation_helper/
 ├── rch-wkr/                # Worker agent
 ├── rch-common/             # Shared library
 ├── rch-telemetry/          # OpenTelemetry integration
+├── rabs-*/ , rabsd/        # RABS build sidecar (experimental; 11 crates: protocol, action,
+│                           #   key, cas, sandbox, wrap, scheduler, replay, asupersync, rabsd, wkr)
+├── dashboard/              # Fleet dashboard (Vite/React, encrypted snapshots)
 ├── tests/                  # True E2E tests with fixtures
 ├── examples/               # Usage examples
 ├── docs/                   # Documentation
@@ -298,18 +301,18 @@ remote_compilation_helper/
 | Crate | Key Files | Purpose |
 |-------|-----------|---------|
 | `rch` | `src/main.rs` | Hook entry point |
-| `rch` | `src/hook.rs` | Claude Code hook protocol integration |
-| `rch` | `src/classify.rs` | Command classification (compilation detection) |
+| `rch` | `src/hook.rs`, `src/hook/` | Claude Code hook protocol, execution pipeline, retrieval/recovery |
 | `rch` | `src/transfer.rs` | Code transfer pipeline (rsync + zstd) |
 | `rchd` | `src/main.rs` | Daemon entry point |
 | `rchd` | `src/workers.rs` | Worker state management |
 | `rchd` | `src/selection.rs` | Worker selection algorithm |
-| `rchd` | `src/ssh_pool.rs` | SSH connection pooling |
+| `rchd` | `src/history.rs`, `src/api.rs` | Durable build ownership/history; socket API routes |
 | `rch-wkr` | `src/executor.rs` | Remote command executor |
 | `rch-wkr` | `src/cache.rs` | Project cache management |
 | `rch-common` | `src/types.rs` | Shared types and protocol |
 | `rch-common` | `src/protocol.rs` | Hook communication protocol |
-| `rch-common` | `src/patterns.rs` | Compilation keyword/regex patterns |
+| `rch-common` | `src/patterns.rs` | Command classification: keyword filter, regexes, `classify_command` |
+| `rch-common` | `src/ssh.rs` | Shared SSH connection pool (`SshPool`) |
 | `rch-common` | `src/ui/` | UI module (context, display, error, icons, theme, progress) |
 | `rch-telemetry` | `src/` | OpenTelemetry + Prometheus metrics |
 | `~/.config/rch/config.toml` | User configuration |
@@ -391,11 +394,13 @@ Workers are remote Linux machines with:
 #### 3. Transfer Pipeline
 
 ```
-Local Project → rsync + zstd → Remote /tmp/rch/{project}_{hash}/
+Local Project → rsync + zstd → worker mirror under its [path_topology] canonical_root
+                               (isolated/clean-overlay/Windows jobs: [transfer] remote_base,
+                                default /data/tmp/rch)
                                          ↓
-                               Execute compilation
+                               Execute compilation (pooled .rch-target-<worker>-pool-* dir)
                                          ↓
-                               tar + zstd → Local target/
+                               rsync (Unix) / bounded tar (Windows) → selected outputs → local target/
 ```
 
 **Excluded from transfer:**
@@ -409,40 +414,27 @@ Local Project → rsync + zstd → Remote /tmp/rch/{project}_{hash}/
 The hook (`rch`) communicates with daemon (`rchd`) via Unix socket:
 
 ```
-rch → /tmp/rch.sock → rchd
+rch → $XDG_RUNTIME_DIR/rch.sock, else <user cache dir>/rch/rch.sock → rchd
       ↓
       GET /select-worker?project=X&cores=4
       ←
-      { "worker": "css", "slots": 12, "speed": 87.3 }
+      SelectionResponse { worker, reason, build_id, diagnostics }
 ```
+
+`rch config get general.socket_path` shows the resolved socket.
 
 ### Adding New Compilation Patterns
 
-1. Add keyword to quick filter in `rch-common/src/patterns.rs`
-2. Add regex pattern in same file
-3. Add classifier case in `rch/src/classify.rs`
-4. Add tests for all variants
-5. Run `cargo test` to verify
+All classification lives in `rch-common/src/patterns.rs`:
 
-Example:
+1. Add the keyword to the tier-1 quick filter (`COMPILATION_KEYWORDS`).
+2. Add a `CompilationKind` variant if the command is a new kind, and the matching
+   case in `classify_command` / its per-tool helpers (e.g. `classify_nix`).
+3. Give the kind its artifact policy in `rch/src/hook/artifact_patterns.rs`
+   (stream-only kinds return no patterns).
+4. Add tests for every accepted variant and every rejected look-alike.
 
-```rust
-// In patterns.rs
-pub static COMPILATION_KEYWORDS: &[&str] = &[
-    "cargo", "rustc",
-    "gcc", "g++", "clang",
-    "make", "cmake", "ninja",
-    "meson",  // ← Add new keyword
-];
-
-// In classify.rs
-pub fn classify_command(cmd: &str) -> Classification {
-    // ...
-    if cmd.starts_with("meson compile") {
-        return Classification::BuildSystem(BuildSystemKind::Meson);
-    }
-}
-```
+`docs/extending/adding-a-classifier-tier.md` walks through a full example.
 
 ### Performance Requirements
 
@@ -590,7 +582,7 @@ Key principles:
 Dependabot is configured in `.github/dependabot.yml` to open weekly update PRs for:
 - GitHub Actions (grouped)
 - Cargo workspace dependencies (grouped; core deps like `tokio*`, `serde*`, `hyper*` are separated)
-- npm dependencies under `/web` (grouped dev vs prod)
+- npm dependencies under `/dashboard` (grouped dev vs prod)
 
 Automerge is handled by `.github/workflows/dependabot-automerge.yml`:
 - **Auto-merge GitHub Actions PRs** (after CI passes)
@@ -849,7 +841,7 @@ Parse: `file:line:col` → location | 💡 → how to fix | Exit 0/1 → pass/fa
 
 ## RCH — Remote Compilation Helper
 
-RCH offloads `cargo build`, `cargo test`, `cargo clippy`, and other compilation commands to a fleet of 8 remote Contabo VPS workers instead of building locally. This prevents compilation storms from overwhelming csd when many agents run simultaneously.
+RCH offloads `cargo build`, `cargo test`, `cargo clippy`, and other compilation commands to a fleet of remote workers (`rch workers list`) instead of building locally. This prevents compilation storms from overwhelming csd when many agents run simultaneously.
 
 **RCH is installed at `~/.local/bin/rch` and is hooked into Claude Code's PreToolUse automatically.** Most of the time you don't need to do anything if you are Claude Code — builds are intercepted and offloaded transparently.
 
@@ -863,7 +855,7 @@ rch exec -- cargo clippy
 Quick commands:
 ```bash
 rch doctor                    # Health check
-rch workers probe --all       # Test connectivity to all 8 workers
+rch workers probe --all       # Test connectivity to every configured worker
 rch status                    # Overview of current state
 rch queue                     # See active/waiting builds
 ```

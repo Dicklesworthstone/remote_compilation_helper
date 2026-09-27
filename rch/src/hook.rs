@@ -941,8 +941,9 @@ fn exit_with_local_fallback(
     // dispatcher melting under local builds (trj, 2026-09-25) left nothing to
     // say whether rch chose local or an agent bypassed it.
     // A non-compilation command running locally is not a build falling back,
-    // so it must not inflate `rch status`'s local-fallback-build count.
-    if reason != "non-compilation command" {
+    // so it must not inflate `rch status`'s local-fallback-build count. Under
+    // require-remote it is refused instead, and that refusal is recorded.
+    if reason != "non-compilation command" || require_remote {
         record_hook_incident(&build_local_fallback_incident(
             command,
             reason,
@@ -980,6 +981,15 @@ fn exit_with_local_fallback(
 
     match child.status() {
         Ok(status) => {
+            // A signal death reports 128+N like a shell, not a generic 1 that
+            // would hide an OOM kill or interrupt from the caller.
+            let code = {
+                use std::os::unix::process::ExitStatusExt as _;
+                status
+                    .code()
+                    .or_else(|| status.signal().map(|signal| 128 + signal))
+                    .unwrap_or(1)
+            };
             emit_exec_envelope(&ExecResultEnvelope {
                 api_version: "1.0",
                 command,
@@ -987,13 +997,13 @@ fn exit_with_local_fallback(
                 location: "local",
                 fallback_reason: Some(reason),
                 worker_id: None,
-                remote_exit_code: status.code(),
+                remote_exit_code: Some(code),
                 duration_ms: None,
                 timing: None,
                 result_dirs: None,
                 error_code: None,
             });
-            std::process::exit(status.code().unwrap_or(1))
+            std::process::exit(code)
         }
         Err(error) => {
             reporter.summary(&format!("[RCH] local fallback failed: {error}"));
@@ -1115,8 +1125,9 @@ enum RemoteFaultExhaustAction {
 }
 
 /// Fetch daemon status, rank the remaining workers by capacity, and re-query the
-/// daemon pinned to the biggest untried worker. Returns the fresh selection
-/// response plus the chosen worker id, or `None` when no bigger worker can serve.
+/// daemon pinned to each untried worker, biggest first, until one is admitted.
+/// Returns the fresh selection response plus the chosen worker id, or `None`
+/// when no untried worker can serve.
 #[allow(clippy::too_many_arguments)]
 async fn try_retry_on_bigger_worker(
     socket_path: &str,
@@ -1141,40 +1152,45 @@ async fn try_retry_on_bigger_worker(
         }
     };
     let snapshots = build_capacity_snapshots(&status);
-    let chosen = pick_bigger_worker(snapshots.as_slice(), tried_workers, worker_pin)?;
-    let preferred = vec![chosen.clone()];
-    match query_daemon(
-        socket_path,
-        project,
-        estimated_cores,
-        remote_command,
-        toolchain,
-        required_runtime,
-        command_priority,
-        0,
-        Some(std::process::id()),
-        local_wrapper_id,
-        false, // do not block waiting on one specific worker during a retry
-        &preferred,
-        false, // retry upsizing is compilation-scoped; never job mode
-        &[],   // ...and therefore carries no named-tool requirements
-    )
-    .await
-    {
-        Ok(response) if response.worker.is_some() => Some((response, chosen)),
-        Ok(_) => {
-            reporter.verbose(&format!(
-                "[RCH] retry: bigger worker {chosen} is not currently admissible; ending retries"
-            ));
-            None
-        }
-        Err(e) => {
-            reporter.verbose(&format!(
-                "[RCH] retry: re-query for {chosen} failed ({e}); ending retries"
-            ));
-            None
+    // The biggest candidate may be full right now. Walk down the capacity
+    // order rather than ending retries while smaller workers sit idle.
+    let mut passed_over = tried_workers.to_vec();
+    while let Some(chosen) = pick_bigger_worker(snapshots.as_slice(), &passed_over, worker_pin) {
+        let preferred = vec![chosen.clone()];
+        match query_daemon(
+            socket_path,
+            project,
+            estimated_cores,
+            remote_command,
+            toolchain,
+            required_runtime,
+            command_priority,
+            0,
+            Some(std::process::id()),
+            local_wrapper_id,
+            false, // do not block waiting on one specific worker during a retry
+            &preferred,
+            false, // retry upsizing is compilation-scoped; never job mode
+            &[],   // ...and therefore carries no named-tool requirements
+        )
+        .await
+        {
+            Ok(response) if response.worker.is_some() => return Some((response, chosen)),
+            Ok(_) => {
+                reporter.verbose(&format!(
+                    "[RCH] retry: worker {chosen} is not currently admissible; trying the next"
+                ));
+                passed_over.push(chosen);
+            }
+            Err(e) => {
+                reporter.verbose(&format!(
+                    "[RCH] retry: re-query for {chosen} failed ({e}); ending retries"
+                ));
+                return None;
+            }
         }
     }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -1641,6 +1657,15 @@ fn build_local_fallback_incident(
     )
 }
 
+/// The incident ledger as `[remediation.incident_ledger]` configures it
+/// (path and retention), or the defaults when config cannot load.
+pub(crate) fn configured_incident_ledger() -> IncidentLedger {
+    let config = crate::config::load_config()
+        .map(|config| IncidentLedgerConfig::from(&config.remediation.incident_ledger))
+        .unwrap_or_default();
+    IncidentLedger::new(config)
+}
+
 /// Append `event` to the durable incident ledger, best-effort. Incident logging
 /// must never break a build, so a write failure is logged and swallowed. A
 /// tracing breadcrumb is always emitted so the incident is visible even when the
@@ -1671,8 +1696,7 @@ fn record_hook_incident(event: &IncidentEvent) {
             "hook incident recorded",
         );
     }
-    let ledger = IncidentLedger::new(IncidentLedgerConfig::default());
-    if let Err(e) = ledger.append(event) {
+    if let Err(e) = configured_incident_ledger().append(event) {
         // Best-effort by contract. An unwritable state dir (sandbox, unset
         // HOME) would otherwise print this on every fallback and refusal.
         debug!(
@@ -3661,7 +3685,7 @@ pub async fn run_exec(
                     == RemotePipelineFailurePolicy::FailClosedNoLocalFallback
                 {
                     warn!(
-                        "Remote execution failed on {}; refusing local fallback: {}",
+                        "Remote execution failed on {}; refusing local fallback: {:#}",
                         worker.id, e
                     );
                     // Issue #62: an unverified post-timeout cleanup means the
@@ -3738,7 +3762,7 @@ pub async fn run_exec(
                 } else {
                     // Generic pipeline failure — retry on a different worker first.
                     warn!(
-                        "Remote execution failed on {}: {}; will retry on another worker if available",
+                        "Remote execution failed on {}: {:#}; will retry on another worker if available",
                         worker.id, e
                     );
                     RetryableRemoteFault {
@@ -4756,7 +4780,7 @@ async fn handle_selection_response(
                 == RemotePipelineFailurePolicy::FailClosedNoLocalFallback
             {
                 warn!(
-                    "Remote execution pipeline failed on {}; refusing local fallback: {}",
+                    "Remote execution pipeline failed on {}; refusing local fallback: {:#}",
                     worker.id, e
                 );
                 // Issue #62: quarantine the worker when the post-timeout

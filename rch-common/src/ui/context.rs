@@ -91,7 +91,7 @@ impl OutputContext {
 
         // 4. FORCE_COLOR=0 disables colors even in TTY
         let force_color = get_env("FORCE_COLOR");
-        let force_color_on = force_color.as_deref().map(|value| value.trim() != "0");
+        let force_color_on = force_color.as_deref().map(force_color_enables);
         if force_color_on == Some(false) {
             return Self::Plain;
         }
@@ -257,6 +257,15 @@ impl OutputContext {
 
         false
     }
+}
+
+/// Whether a set `FORCE_COLOR` value turns color on. `0` and `false` turn it
+/// off, as in the supports-color convention; any other value (including an
+/// empty one) turns it on.
+#[must_use]
+pub fn force_color_enables(value: &str) -> bool {
+    let value = value.trim();
+    value != "0" && !value.eq_ignore_ascii_case("false")
 }
 
 impl Default for OutputContext {
@@ -450,6 +459,13 @@ mod tests {
     #[test]
     fn test_force_color_zero_disables_colors() {
         let env = TestEnv::new(&[("FORCE_COLOR", "0")]);
+        let ctx = detect_with(&env, true, true, Some("status"));
+        assert_eq!(ctx, OutputContext::Plain);
+    }
+
+    #[test]
+    fn test_force_color_false_disables_colors() {
+        let env = TestEnv::new(&[("FORCE_COLOR", "false")]);
         let ctx = detect_with(&env, true, true, Some("status"));
         assert_eq!(ctx, OutputContext::Plain);
     }

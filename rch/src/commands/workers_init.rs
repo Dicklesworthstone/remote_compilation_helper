@@ -13,8 +13,8 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use tokio::process::Command;
 
+use super::config_dir;
 use super::helpers::{classify_ssh_error_message, ssh_key_path_from_identity};
-use super::{config_dir, load_workers_from_config};
 
 // =============================================================================
 // Workers Init Command
@@ -235,11 +235,27 @@ pub async fn workers_init(yes: bool, ctx: &OutputContext) -> Result<()> {
     // Step 5: Save to workers.toml
     println!("{}", style.highlight("Step 5/5: Saving Configuration"));
 
-    // Load existing workers
-    let mut workers = load_workers_from_config().unwrap_or_default();
+    let config_path = config_dir()
+        .ok_or_else(|| anyhow::anyhow!("Could not determine config directory"))?
+        .join("workers.toml");
+    // Work on the file itself, never on the loaded fleet: loading drops
+    // disabled workers and `tools` declarations, and a parse error used to
+    // become an empty fleet that was then written over the operator's file.
+    let existing = match std::fs::read_to_string(&config_path) {
+        Ok(text) => Some(text),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(error).with_context(|| format!("Failed to read {}", config_path.display()));
+        }
+    };
+    let already_configured = existing
+        .as_deref()
+        .map(|text| workers_toml_has_worker(text, &worker_id))
+        .transpose()?
+        .unwrap_or(false);
 
-    // Check for duplicate ID
-    if workers.iter().any(|w| w.id.as_str() == worker_id) {
+    // Check for duplicate ID (disabled workers included).
+    if already_configured {
         println!(
             "  {} Worker ID '{}' already exists in configuration.",
             StatusIndicator::Warning.display(style),
@@ -263,8 +279,6 @@ pub async fn workers_init(yes: bool, ctx: &OutputContext) -> Result<()> {
             );
             return Ok(());
         }
-
-        workers.retain(|w| w.id.as_str() != worker_id);
     }
 
     // Create new worker config
@@ -279,16 +293,8 @@ pub async fn workers_init(yes: bool, ctx: &OutputContext) -> Result<()> {
         tools: Vec::new(),
     };
 
-    workers.push(new_worker);
-
-    // Save to file
-    let config_path = config_dir()
-        .ok_or_else(|| anyhow::anyhow!("Could not determine config directory"))?
-        .join("workers.toml");
-
-    let toml_content = serialize_workers_config(&workers)?;
-
-    std::fs::write(&config_path, toml_content).context("Failed to write workers.toml")?;
+    let toml_content = upsert_worker_entry(existing.as_deref(), &new_worker)?;
+    write_file_atomically(&config_path, &toml_content).context("Failed to write workers.toml")?;
 
     println!(
         "  {} Worker '{}' added to {}",
@@ -330,6 +336,100 @@ pub async fn workers_init(yes: bool, ctx: &OutputContext) -> Result<()> {
     );
 
     Ok(())
+}
+
+/// Whether `workers.toml` text already declares `worker_id`, enabled or not.
+/// A file that does not parse is an error: never guess about it.
+fn workers_toml_has_worker(text: &str, worker_id: &str) -> Result<bool> {
+    let table: toml::Table = toml::from_str(text)
+        .context("existing workers.toml does not parse; fix it before adding a worker")?;
+    Ok(table
+        .get("workers")
+        .and_then(toml::Value::as_array)
+        .is_some_and(|workers| {
+            workers
+                .iter()
+                .any(|worker| worker.get("id").and_then(toml::Value::as_str) == Some(worker_id))
+        }))
+}
+
+/// Return `existing` with `worker` added, or replacing the entry with the same
+/// id.
+///
+/// Adding appends one `[[workers]]` table to the text unchanged, so comments,
+/// disabled workers and every other field survive byte for byte. Replacing (an
+/// explicit overwrite) edits the parsed table in place: every other worker keeps
+/// all of its fields, though comments are not preserved.
+fn upsert_worker_entry(existing: Option<&str>, worker: &WorkerConfig) -> Result<String> {
+    let entry_text = serialize_workers_config(std::slice::from_ref(worker))?;
+    let Some(text) = existing else {
+        return Ok(entry_text);
+    };
+    let exists = workers_toml_has_worker(text, worker.id.as_str())?;
+    if !exists {
+        let mut out = text.to_string();
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+        }
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&entry_text);
+        // An inline `workers = [...]` array cannot take an appended
+        // `[[workers]]` table; only a result that parses and lists the new
+        // worker is kept, otherwise the parsed table is edited instead.
+        if workers_toml_has_worker(&out, worker.id.as_str()).unwrap_or(false) {
+            return Ok(out);
+        }
+    }
+    let mut table: toml::Table = toml::from_str(text)?;
+    let entry = toml::from_str::<toml::Table>(&entry_text)?
+        .remove("workers")
+        .and_then(|workers| workers.as_array().and_then(|list| list.first().cloned()))
+        .ok_or_else(|| anyhow::anyhow!("serialized worker entry is missing"))?;
+    let workers = table
+        .entry("workers")
+        .or_insert_with(|| toml::Value::Array(Vec::new()))
+        .as_array_mut()
+        .ok_or_else(|| anyhow::anyhow!("workers.toml `workers` is not an array"))?;
+    if exists {
+        for slot in workers
+            .iter_mut()
+            .filter(|slot| slot.get("id").and_then(toml::Value::as_str) == Some(worker.id.as_str()))
+        {
+            // Re-initialising a worker must not re-enable one an operator
+            // parked, nor drop its declared tool requirements.
+            let mut replacement = entry.clone();
+            for key in ["enabled", "tools"] {
+                if let (Some(kept), Some(fields)) = (slot.get(key), replacement.as_table_mut()) {
+                    fields.insert(key.to_owned(), kept.clone());
+                }
+            }
+            *slot = replacement;
+        }
+    } else {
+        workers.push(entry);
+    }
+    toml::to_string_pretty(&table).context("Failed to serialize workers.toml")
+}
+
+/// Write via a sibling temp file and rename, so a crash or full disk never
+/// leaves a truncated workers.toml behind. A symlinked config is written
+/// through to its target and the existing file mode is kept.
+fn write_file_atomically(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
+    let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let tmp = target.with_extension(format!("toml.tmp-{}", std::process::id()));
+    let result = std::fs::write(&tmp, contents)
+        .and_then(|()| match std::fs::metadata(&target) {
+            Ok(existing) => std::fs::set_permissions(&tmp, existing.permissions()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        })
+        .and_then(|()| std::fs::rename(&tmp, &target));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
 }
 
 fn serialize_workers_config(workers: &[WorkerConfig]) -> Result<String> {
@@ -602,6 +702,133 @@ echo "ARCH:$(uname -m 2>/dev/null || echo unknown)""#;
 mod tests {
     use super::*;
     use rch_common::test_guard;
+
+    const FLEET: &str = r#"# fleet comment the operator wrote
+[[workers]]
+id = "live"
+host = "10.0.0.1"
+user = "ubuntu"
+identity_file = "~/.ssh/k"
+total_slots = 16
+tools = [{ name = "mutool", probe = "mutool -v" }]
+
+[[workers]]
+id = "parked"
+host = "10.0.0.2"
+user = "ubuntu"
+identity_file = "~/.ssh/k"
+total_slots = 4
+enabled = false
+"#;
+
+    fn new_worker(id: &str) -> WorkerConfig {
+        WorkerConfig {
+            id: WorkerId::new(id),
+            host: "10.0.0.9".to_string(),
+            user: "root".to_string(),
+            identity_file: "~/.ssh/new".to_string(),
+            total_slots: 8,
+            priority: 100,
+            tags: vec![],
+            tools: Vec::new(),
+        }
+    }
+
+    /// Adding a worker must not drop disabled workers, `tools` declarations
+    /// or the operator's comments (the old path rewrote the file from the
+    /// loaded fleet, which filters all three out).
+    #[test]
+    fn upsert_worker_entry_appends_without_touching_existing_text() {
+        let _guard = test_guard!();
+        let out = upsert_worker_entry(Some(FLEET), &new_worker("added")).unwrap();
+        assert!(
+            out.starts_with(FLEET),
+            "existing text must survive verbatim"
+        );
+        let table: toml::Table = toml::from_str(&out).unwrap();
+        let workers = table["workers"].as_array().unwrap();
+        let ids: Vec<&str> = workers.iter().map(|w| w["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, ["live", "parked", "added"]);
+        assert_eq!(workers[1]["enabled"].as_bool(), Some(false));
+        assert!(workers[0].get("tools").is_some());
+    }
+
+    #[test]
+    fn upsert_worker_entry_replaces_only_the_matching_worker() {
+        let _guard = test_guard!();
+        assert!(workers_toml_has_worker(FLEET, "parked").unwrap());
+        let out = upsert_worker_entry(Some(FLEET), &new_worker("parked")).unwrap();
+        let table: toml::Table = toml::from_str(&out).unwrap();
+        let workers = table["workers"].as_array().unwrap();
+        assert_eq!(workers.len(), 2);
+        assert!(
+            workers[0].get("tools").is_some(),
+            "other workers keep all fields"
+        );
+        assert_eq!(workers[1]["host"].as_str(), Some("10.0.0.9"));
+        assert_eq!(
+            workers[1]["enabled"].as_bool(),
+            Some(false),
+            "re-init must not re-enable a parked worker"
+        );
+    }
+
+    #[test]
+    fn upsert_worker_entry_adds_to_an_inline_workers_array() {
+        let _guard = test_guard!();
+        let inline = "workers = [{ id = \"a\", host = \"h\", user = \"u\", identity_file = \"~/.ssh/k\", total_slots = 2 }]\n";
+        let out = upsert_worker_entry(Some(inline), &new_worker("b")).unwrap();
+        let table: toml::Table = toml::from_str(&out).expect("result must parse");
+        let ids: Vec<&str> = table["workers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|w| w["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["a", "b"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_file_atomically_writes_through_a_symlink_and_keeps_the_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let _guard = test_guard!();
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.toml");
+        std::fs::write(&real, "old").unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let link = dir.path().join("workers.toml");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        write_file_atomically(&link, "new").unwrap();
+
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "new");
+        assert_eq!(
+            std::fs::metadata(&real).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            2,
+            "temp file left behind"
+        );
+    }
+
+    /// A workers.toml that does not parse must stop the write, not be
+    /// replaced by a file holding only the new worker.
+    #[test]
+    fn upsert_worker_entry_refuses_unparseable_file() {
+        let _guard = test_guard!();
+        let broken = "[[workers]]\nid = \"a\"\nhost = \n";
+        assert!(upsert_worker_entry(Some(broken), &new_worker("b")).is_err());
+        assert!(upsert_worker_entry(None, &new_worker("b")).is_ok());
+    }
 
     #[test]
     fn serialize_workers_config_escapes_toml_strings() {

@@ -670,7 +670,7 @@ fn force_color_env() -> Option<bool> {
 }
 
 fn parse_force_color(value: Option<&str>) -> Option<bool> {
-    value.map(|value| value.trim() != "0")
+    value.map(rch_common::ui::context::force_color_enables)
 }
 
 #[cfg(test)]
@@ -685,6 +685,9 @@ mod force_color_tests {
         assert_eq!(parse_force_color(Some("1")), Some(true));
         assert_eq!(parse_force_color(Some("")), Some(true));
         assert_eq!(parse_force_color(Some("3")), Some(true));
+        assert_eq!(parse_force_color(Some("false")), Some(false));
+        assert_eq!(parse_force_color(Some("FALSE")), Some(false));
+        assert_eq!(parse_force_color(Some("true")), Some(true));
     }
 }
 

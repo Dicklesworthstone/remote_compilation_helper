@@ -1068,10 +1068,16 @@ impl From<&AutoRejoinConfig> for crate::bypass_record::AutoRejoinCriteria {
 impl From<&IncidentLedgerPolicy> for IncidentLedgerConfig {
     fn from(cfg: &IncidentLedgerPolicy) -> Self {
         Self {
+            // Validation treats a blank path as unset and a leading `~` as
+            // absolute; honour both here, where the path is actually used.
             path: cfg
                 .path
-                .as_ref()
-                .map_or_else(default_ledger_path, std::path::PathBuf::from),
+                .as_deref()
+                .map(str::trim)
+                .filter(|path| !path.is_empty())
+                .map_or_else(default_ledger_path, |path| {
+                    std::path::PathBuf::from(shellexpand::tilde(path).into_owned())
+                }),
             max_entries: cfg.max_entries,
             max_bytes: cfg.max_bytes,
         }
@@ -1462,6 +1468,22 @@ mod tests {
         assert_eq!(from_cfg.max_entries, runtime.max_entries);
         assert_eq!(from_cfg.max_bytes, runtime.max_bytes);
         assert_eq!(from_cfg.path, runtime.path);
+    }
+
+    #[test]
+    fn incident_ledger_path_expands_tilde_and_treats_blank_as_unset() {
+        let with = |path: &str| {
+            IncidentLedgerConfig::from(&IncidentLedgerPolicy {
+                path: Some(path.to_owned()),
+                ..IncidentLedgerPolicy::default()
+            })
+            .path
+        };
+        let expanded = with("~/state/incidents.jsonl");
+        assert!(expanded.is_absolute(), "{expanded:?}");
+        assert!(expanded.ends_with("state/incidents.jsonl"));
+        assert_eq!(with("  "), IncidentLedgerConfig::default().path);
+        assert_eq!(with("/x/i.jsonl"), std::path::PathBuf::from("/x/i.jsonl"));
     }
 
     // Test-only helper to force an invalid disk-pressure ordering.

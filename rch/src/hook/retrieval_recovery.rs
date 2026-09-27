@@ -542,8 +542,17 @@ impl RecoverySession {
                 destination.display()
             );
             let parent = destination.parent().context("output missing parent")?;
+            // Only components BELOW the phase root can redirect a write out of
+            // the output tree. The root itself is the caller's choice and may
+            // legitimately sit behind system symlinks (macOS `/tmp` →
+            // `/private/tmp`, `$TMPDIR` under `/var` → `/private/var`, a
+            // symlinked `/data`); walking up to `/` rejected every such build
+            // after its remote compile had already succeeded.
             let mut ancestor = Some(parent);
             while let Some(path) = ancestor {
+                if path == phase.local.as_path() || !path.starts_with(&phase.local) {
+                    break;
+                }
                 if let Ok(metadata) = std::fs::symlink_metadata(path) {
                     anyhow::ensure!(
                         !metadata.file_type().is_symlink(),
@@ -702,7 +711,25 @@ impl RecoverySession {
             pair.release().await?;
         }
         self.pair_released()?;
-        self.retired()
+        self.retired()?;
+        self.discard_completion_receipts().await;
+        Ok(())
+    }
+    /// Worker receipts are garbage once retirement is durable. A failed delete
+    /// strands a few small files and must never fail the finished build.
+    async fn discard_completion_receipts(&self) {
+        let pipeline = self.completion_pipeline(TransferPipeline::new(
+            self.recipe.project_root.clone(),
+            "recovery".into(),
+            self.recipe.identity.clone(),
+            self.recipe.transfer.clone(),
+        ));
+        if let Err(error) = pipeline
+            .discard_recovery_completion(&self.recipe.worker)
+            .await
+        {
+            debug!(worker = %self.recipe.worker.id, %error, "completion receipt cleanup failed");
+        }
     }
 }
 
@@ -832,7 +859,7 @@ pub(crate) async fn recover_job(writer: &DurableLeaseWriter) -> anyhow::Result<i
         session.recipe.transfer.clone(),
     );
     let base = session.completion_pipeline(base);
-    let exit = base.read_recovery_completion(&worker).await?.context(
+    let mut exit = base.read_recovery_completion(&worker).await?.context(
         "same-id remote execution has no durable completion yet; command was not replayed",
     )?;
     let mut pair = if let Some((root, token)) = &session.recipe.pair {
@@ -880,17 +907,20 @@ pub(crate) async fn recover_job(writer: &DurableLeaseWriter) -> anyhow::Result<i
                 .retrieve_artifacts(&worker, &phase.patterns)
                 .await?;
             if phase.output_gate {
-                anyhow::ensure!(
-                    !sync_back_verified_zero_build_outputs(
-                        &retrieved.manifest_regular_files,
-                        retrieved.matched_regular_files,
-                        session.recipe.kind,
-                        phase.custom_target
-                    ) && !(session.recipe.package_archive
-                        && retrieved.matched_regular_files == Some(0)),
-                    "recovered transfer matched zero expected outputs"
-                );
-                if !session.recipe.allow_foreign
+                // A rejected output set is a terminal build failure, exactly
+                // as on the live path, not a recovery error: the remote outputs
+                // never change, so an error would strand source ownership on
+                // every retry. Publish nothing further, then retire normally.
+                let rejection = if sync_back_verified_zero_build_outputs(
+                    &retrieved.manifest_regular_files,
+                    retrieved.matched_regular_files,
+                    session.recipe.kind,
+                    phase.custom_target,
+                ) || (session.recipe.package_archive
+                    && retrieved.matched_regular_files == Some(0))
+                {
+                    Some("recovered transfer matched zero expected outputs".to_owned())
+                } else if !session.recipe.allow_foreign
                     && kind_has_enumerable_output_contract(session.recipe.kind)
                 {
                     let foreign = foreign_target_artifacts(
@@ -900,11 +930,22 @@ pub(crate) async fn recover_job(writer: &DurableLeaseWriter) -> anyhow::Result<i
                         &session.recipe.expected_triple,
                         session.recipe.pinned_triple.as_deref(),
                     );
-                    anyhow::ensure!(
-                        foreign.is_empty(),
-                        "recovered outputs target a foreign platform: {}",
-                        describe_findings(&foreign)
+                    (!foreign.is_empty()).then(|| {
+                        format!(
+                            "recovered outputs target a foreign platform: {}",
+                            describe_findings(&foreign)
+                        )
+                    })
+                } else {
+                    None
+                };
+                if let Some(rejection) = rejection {
+                    eprintln!(
+                        "[RCH] {rejection}; treating the recovered build as failed \
+                         (exit {EXIT_ARTIFACT_TRANSFER_FAILED})"
                     );
+                    exit = EXIT_ARTIFACT_TRANSFER_FAILED;
+                    break;
                 }
             }
         }
@@ -924,6 +965,7 @@ pub(crate) async fn recover_job(writer: &DurableLeaseWriter) -> anyhow::Result<i
     sources.release().await?;
     session.sources_released()?;
     session.retired()?;
+    session.discard_completion_receipts().await;
     writer.record_exit(exit)?;
     writer.acknowledge_terminal()?;
     Ok(exit)
@@ -1079,6 +1121,38 @@ mod tests {
             b"this job's output"
         );
         assert!(session.recipe.phases[0].complete);
+    }
+
+    /// The output root may sit behind system symlinks (macOS `/tmp`, `/var`,
+    /// a symlinked `/data`): publication must accept that root, while a
+    /// symlink BELOW it, which could redirect a write, is still refused.
+    #[cfg(unix)]
+    #[test]
+    fn publication_accepts_symlinked_root_but_refuses_symlinks_inside_it() {
+        let (directory, _stage_owner, mut session) = publication_fixture();
+        let real = directory.path().join("real-target");
+        std::fs::create_dir(&real).unwrap();
+        let link = directory.path().join("linked-target");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        session.recipe.phases[0].local = link;
+        let stage = session.stage(0);
+        std::fs::create_dir(stage.join("build")).unwrap();
+        std::fs::write(stage.join("build/app"), b"output").unwrap();
+        session.persist().unwrap();
+        session.publish("project").unwrap();
+        assert_eq!(std::fs::read(real.join("build/app")).unwrap(), b"output");
+
+        let (directory, _stage_owner, mut session) = publication_fixture();
+        let local = session.recipe.project_root.clone();
+        let elsewhere = directory.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, local.join("build")).unwrap();
+        let stage = session.stage(0);
+        std::fs::create_dir(stage.join("build")).unwrap();
+        std::fs::write(stage.join("build/app"), b"output").unwrap();
+        session.persist().unwrap();
+        assert!(session.publish("project").is_err());
+        assert!(!elsewhere.join("app").exists());
     }
 
     #[test]

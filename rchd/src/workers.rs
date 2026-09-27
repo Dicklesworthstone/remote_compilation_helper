@@ -1155,6 +1155,31 @@ impl ToolchainPreflightStatus {
         let age_ms = current_unix_ms().saturating_sub(self.checked_at_unix_ms);
         age_ms <= duration_millis_i64(ttl)
     }
+
+    /// Whether this verdict says anything about the toolchain itself.
+    ///
+    /// Only `toolchain_preflight_command_failed` means the probe ran and the
+    /// toolchain is missing or broken. A connect failure or timeout (the probe
+    /// runs over SSH against possibly loaded workers) says nothing about the
+    /// toolchain, and caching it as "unusable" for the full TTL excluded a
+    /// healthy worker from every build for that toolchain for 10 minutes.
+    pub fn is_definitive(&self) -> bool {
+        self.usable
+            || self
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.starts_with("toolchain_preflight_command_failed"))
+    }
+
+    /// How long to reuse this verdict: `definitive_ttl` for a real answer,
+    /// `transient_ttl` for a probe that never reached a conclusion.
+    pub fn is_reusable(&self, definitive_ttl: Duration, transient_ttl: Duration) -> bool {
+        self.is_fresh(if self.is_definitive() {
+            definitive_ttl
+        } else {
+            transient_ttl
+        })
+    }
 }
 
 /// Pool of all workers.
@@ -2089,6 +2114,35 @@ mod tests {
         };
 
         assert!(status.is_fresh(Duration::from_millis(u64::MAX)));
+    }
+
+    /// Only a probe that ran and failed says the toolchain is broken; an
+    /// unreachable or timed-out worker must not be excluded for the full TTL.
+    #[test]
+    fn test_toolchain_preflight_transport_failures_expire_quickly() {
+        let long = Duration::from_secs(600);
+        let short = Duration::from_secs(60);
+        let two_minutes_ago = current_unix_ms() - 120_000;
+        let verdict = |usable: bool, reason: Option<&str>| ToolchainPreflightStatus {
+            usable,
+            reason: reason.map(str::to_string),
+            checked_at_unix_ms: two_minutes_ago,
+        };
+
+        let broken = verdict(
+            false,
+            Some("toolchain_preflight_command_failed:1:no such toolchain"),
+        );
+        assert!(broken.is_definitive());
+        assert!(broken.is_reusable(long, short));
+
+        let unreachable = verdict(false, Some("toolchain_preflight_connect_failed:timed out"));
+        assert!(!unreachable.is_definitive());
+        assert!(!unreachable.is_reusable(long, short));
+
+        let healthy = verdict(true, None);
+        assert!(healthy.is_definitive());
+        assert!(healthy.is_reusable(long, short));
     }
 
     /// Helper to create a test worker config with given id.

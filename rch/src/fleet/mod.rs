@@ -245,9 +245,19 @@ pub async fn deploy(
     // confirm the targets are idle is refused rather than run over live builds.
     let drained_for_deploy: Vec<String> = if drain_first {
         let ids: Vec<String> = target_workers.iter().map(|w| w.id.0.clone()).collect();
+        // Only workers this deploy takes out of routing are handed back
+        // afterwards; an operator's drain or disable must survive the deploy.
+        let status = crate::status_display::query_daemon_full_status()
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "deploy refused (--drain-first): could not read worker states: {error:#}"
+                )
+            })?;
+        let held_by_operator = operator_held_workers(&status.workers, &ids);
         let mut drained = Vec::new();
         let mut refusal = None;
-        for id in &ids {
+        for id in ids.iter().filter(|id| !held_by_operator.contains(id)) {
             match crate::status_display::drain_worker(id).await {
                 Ok(()) => drained.push(id.clone()),
                 Err(error) => {
@@ -257,7 +267,8 @@ pub async fn deploy(
             }
         }
         if refusal.is_none() {
-            match wait_for_drained_idle(&drained, drain_timeout).await {
+            // A worker the operator left draining can still be finishing work.
+            match wait_for_drained_idle(&ids, drain_timeout).await {
                 Ok(busy) if busy.is_empty() => {}
                 Ok(busy) => {
                     let names: Vec<String> = busy
@@ -952,6 +963,22 @@ pub async fn drain(
     }
 }
 
+/// Targets that are already out of routing (draining, drained, disabled)
+/// before the deploy touches them.
+fn operator_held_workers(
+    workers: &[crate::status_types::WorkerStatusFromApi],
+    targets: &[String],
+) -> Vec<String> {
+    workers
+        .iter()
+        .filter(|worker| {
+            targets.contains(&worker.id)
+                && matches!(worker.status.as_str(), "draining" | "drained" | "disabled")
+        })
+        .map(|worker| worker.id.clone())
+        .collect()
+}
+
 /// Return workers drained for a deploy to routing. Best-effort: a failure is
 /// logged, because the deploy outcome is already decided and the operator can
 /// re-run `rch workers enable`.
@@ -1100,6 +1127,32 @@ mod tests {
     use super::*;
     use crate::ui::context::{ColorChoice, OutputConfig, OutputContext, OutputFormat, OutputMode};
     use crate::ui::writer::SharedOutputBuffer;
+
+    #[test]
+    fn drain_first_leaves_operator_held_workers_alone() {
+        let worker = |id: &str, status: &str| {
+            serde_json::from_value::<crate::status_types::WorkerStatusFromApi>(serde_json::json!({
+                "id": id, "host": "h", "user": "u", "status": status,
+                "circuit_state": "closed", "used_slots": 0, "total_slots": 4,
+                "speed_score": 1.0, "last_error": null
+            }))
+            .unwrap()
+        };
+        let workers = [
+            worker("a", "healthy"),
+            worker("b", "draining"),
+            worker("c", "drained"),
+            worker("d", "disabled"),
+            worker("e", "unreachable"),
+            worker("f", "disabled"),
+        ];
+        let targets: Vec<String> = ["a", "b", "c", "d", "e"].map(String::from).to_vec();
+        assert_eq!(
+            operator_held_workers(&workers, &targets),
+            ["b", "c", "d"].map(String::from).to_vec(),
+            "only out-of-routing targets are held; non-targets are ignored"
+        );
+    }
 
     fn json_ctx() -> (OutputContext, SharedOutputBuffer) {
         let stdout = SharedOutputBuffer::new();

@@ -94,18 +94,22 @@ pub fn spawn_update_check_if_needed() {
 
         // Run the check and ignore errors (this is just cache warming)
         rt.block_on(async {
-            let _ = check_for_updates(Channel::Stable, None).await;
+            let _ = check_for_updates(Channel::Stable, None, true).await;
         });
     });
 }
 
 /// Check for updates from GitHub releases.
 ///
-/// This function checks the cache first and returns cached results if valid (< 24 hours old).
-/// When fetching fresh results, they are written to cache for future calls.
+/// With `allow_cache`, a valid cached result (< 24 hours old) is returned
+/// without a network call; that is only for background cache warming. An
+/// operator's `rch update` passes `false`: a day-old answer there reported
+/// "Already up to date" while a hotfix release was already published.
+/// Fresh results are always written to the cache.
 pub async fn check_for_updates(
     channel: Channel,
     target_version: Option<String>,
+    allow_cache: bool,
 ) -> Result<UpdateCheck, UpdateError> {
     let current_version = get_current_version()?;
 
@@ -115,7 +119,8 @@ pub async fn check_for_updates(
     }
 
     // Check cache first (only for stable channel default checks)
-    if channel == Channel::Stable
+    if allow_cache
+        && channel == Channel::Stable
         && let Some(cached) = read_cached_check()
     {
         // Verify current version matches cached

@@ -39,6 +39,10 @@ const PRIORITY_SPEED_TIEBREAK_SCORE: f64 = 10.0;
 const TEST_CACHE_BOOST: f64 = 1.5;
 const TEST_BUILD_FALLBACK_FACTOR: f64 = 0.4;
 const TOOLCHAIN_PREFLIGHT_TTL: Duration = Duration::from_secs(600);
+/// Reuse window for a probe that failed to reach the worker or timed out:
+/// long enough not to re-probe a sick worker on every request, short enough
+/// that a network blip does not exclude a healthy worker for 10 minutes.
+const TOOLCHAIN_PREFLIGHT_TRANSIENT_TTL: Duration = Duration::from_secs(60);
 const TOOLCHAIN_PREFLIGHT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Balanced-score multiplier penalty for known pre-x86-64-v3 workers
 /// (bd-6qchz): strong enough that any v3-capable worker wins when one is
@@ -587,6 +591,10 @@ pub struct WorkerSelector {
     /// probe runs over a warm reused ControlMaster instead of a throwaway SSH
     /// session; when `None`, the legacy throwaway path is used.
     pub ssh_pool: Option<Arc<rch_common::SshPool>>,
+    /// Set only on a per-call round by [`Self::preview_with_exclusions`]: a
+    /// successful choice spends no half-open probe slot, fairness record,
+    /// audit entry or selection metric.
+    preview: bool,
 }
 
 /// Result of worker selection with reason.
@@ -629,6 +637,7 @@ impl WorkerSelector {
             repo_convergence: None,
             reliability: None,
             ssh_pool: None,
+            preview: false,
         }
     }
 
@@ -644,6 +653,7 @@ impl WorkerSelector {
             repo_convergence: None,
             reliability: None,
             ssh_pool: None,
+            preview: false,
         }
     }
 
@@ -702,6 +712,25 @@ impl WorkerSelector {
         // A shared cache lets concurrent requests erase one another's disk
         // decisions. Recovery hysteresis stays shared inside the forked gate.
         let mut round = self.clone();
+        round.admission_gate = self
+            .admission_gate
+            .as_ref()
+            .map(|gate| Arc::new(gate.for_selection()));
+        round
+            .select_in_round(pool, request, excluded_worker_ids)
+            .await
+    }
+
+    /// The worker [`Self::select_with_exclusions`] would choose, without
+    /// the side effects of choosing it (diagnostics such as `rch diagnose`).
+    pub async fn preview_with_exclusions(
+        &self,
+        pool: &WorkerPool,
+        request: &SelectionRequest,
+        excluded_worker_ids: &HashSet<String>,
+    ) -> SelectionResult {
+        let mut round = self.clone();
+        round.preview = true;
         round.admission_gate = self
             .admission_gate
             .as_ref()
@@ -898,6 +927,13 @@ impl WorkerSelector {
             }
 
             // Record in audit log (bd-37hc)
+            if self.preview {
+                return SelectionResult {
+                    worker: Some(worker),
+                    reason: SelectionReason::Success,
+                    diagnostics: None,
+                };
+            }
             let breakdowns = self
                 .build_score_breakdowns(&eligible, request, cache_use, Some(&worker_id))
                 .await;
@@ -1422,7 +1458,10 @@ impl WorkerSelector {
                 worker
                     .toolchain_preflight_status(&toolchain_name)
                     .await
-                    .filter(|status| status.is_fresh(TOOLCHAIN_PREFLIGHT_TTL))
+                    .filter(|status| {
+                        status
+                            .is_reusable(TOOLCHAIN_PREFLIGHT_TTL, TOOLCHAIN_PREFLIGHT_TRANSIENT_TTL)
+                    })
                     .and_then(|status| {
                         (!status.usable).then(|| {
                             status
@@ -2736,7 +2775,7 @@ impl WorkerSelector {
         let toolchain_name = toolchain.rustup_toolchain();
 
         if let Some(cached) = worker.toolchain_preflight_status(&toolchain_name).await
-            && cached.is_fresh(TOOLCHAIN_PREFLIGHT_TTL)
+            && cached.is_reusable(TOOLCHAIN_PREFLIGHT_TTL, TOOLCHAIN_PREFLIGHT_TRANSIENT_TTL)
         {
             return (!cached.usable).then(|| {
                 cached
@@ -4620,6 +4659,61 @@ mod tests {
         let result = select_worker_with_config(&pool, &request, &weights, &config).await;
         assert!(result.worker.is_none());
         assert_eq!(result.reason, SelectionReason::AllCircuitsOpen);
+    }
+
+    #[tokio::test]
+    async fn preview_selection_spends_no_half_open_probe_slot() {
+        let pool = WorkerPool::new();
+        pool.add_worker(
+            make_worker("half_open", 8, 50.0)
+                .config
+                .read()
+                .await
+                .clone(),
+        )
+        .await;
+        let worker = pool.get(&WorkerId::new("half_open")).await.unwrap();
+        worker.open_circuit().await;
+        worker.half_open_circuit().await;
+        let circuit = CircuitBreakerConfig {
+            half_open_max_probes: 1,
+            ..Default::default()
+        };
+        let selector = WorkerSelector::with_config(SelectionConfig::default(), circuit.clone());
+        let request = SelectionRequest {
+            job_mode: false,
+            project: "myproject".to_string(),
+            command: None,
+            command_priority: CommandPriority::Normal,
+            estimated_cores: 2,
+            preferred_workers: vec![],
+            toolchain: None,
+            required_runtime: RequiredRuntime::default(),
+            classification_duration_us: None,
+            hook_pid: None,
+            required_tools: Vec::new(),
+        };
+        let none = HashSet::new();
+
+        for _ in 0..2 {
+            let preview = selector
+                .preview_with_exclusions(&pool, &request, &none)
+                .await;
+            assert!(preview.worker.is_some(), "{:?}", preview.reason);
+        }
+        assert!(
+            worker.can_probe(&circuit).await,
+            "a preview consumed the probe slot"
+        );
+
+        let real = selector
+            .select_with_exclusions(&pool, &request, &none)
+            .await;
+        assert!(real.worker.is_some());
+        assert!(
+            !worker.can_probe(&circuit).await,
+            "a real selection takes the probe"
+        );
     }
 
     #[tokio::test]

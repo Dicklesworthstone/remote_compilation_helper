@@ -587,7 +587,10 @@ pub fn worker_sweep_command(
     )
 }
 
-fn worker_sweep_command_with_registry(
+/// [`worker_sweep_command`] against an explicit source-ownership registry,
+/// for sweeps (and tests) that must not consult the worker's real one.
+#[must_use]
+pub fn worker_sweep_command_with_registry(
     escaped_base: &str,
     idle_minutes: u64,
     pooled_idle_minutes: Option<u64>,
