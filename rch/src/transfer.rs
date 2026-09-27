@@ -2149,11 +2149,16 @@ impl TransferPipeline {
         // the supervisor reaped first (a zombie still answers `kill -0`). A
         // 120s backstop bounds the wait should the reaped PID be reused
         // before tail notices. Without `--pid`, the old bounded
-        // `sleep 1; kill` can still cut a slow tail.
+        // `sleep 1; kill` can still cut a slow tail. Follow by polling, not
+        // inotify: bytes written between tail's first read and its watch
+        // raise no event, and once the writer is gone an inotify tail exits
+        // without a final read. With a slow reader that cut ~5-8% of streams
+        // on uutils tail; a polling tail reads to EOF before it gives up.
         format!(
             "set -e; rch_umask=$(umask); umask 077; mkdir -p -- {directory}; mkdir {claim}; : > {out}; : > {err}; umask \"$rch_umask\"; \
              nohup sh -c {supervisor} </dev/null >{out} 2>{err} & \
-             p=$!; follow=; if tail --pid=\"$p\" -c 0 /dev/null >/dev/null 2>&1; then follow=--pid=$p; fi; \
+             p=$!; follow=; if tail --pid=\"$p\" -c 0 /dev/null >/dev/null 2>&1; then follow=--pid=$p; \
+               if tail ---disable-inotify -c 0 /dev/null >/dev/null 2>&1; then follow=\"$follow ---disable-inotify\"; fi; fi; \
              tail $follow -c +1 -f {out} & a=$!; tail $follow -c +1 -f {err} >&2 & b=$!; \
              trap 'kill \"$a\" \"$b\" 2>/dev/null || :' EXIT; \
              while [ ! -f {done} ]; do sleep 1; done; \
@@ -7535,35 +7540,47 @@ mod tests {
 
     /// A reader that lags behind the wrapper (a slow SSH link) leaves tail
     /// blocked on a full pipe when the command finishes; the stream must
-    /// still end with the last line rather than being cut by a timer.
+    /// still end with the last line rather than being cut by a timer. An
+    /// inotify tail also lost bytes written before its watch existed, in
+    /// ~5-8% of runs, so eight wrappers race at once to make that visible.
     #[cfg(target_os = "linux")]
     #[test]
     fn durable_execution_waits_for_a_slow_reader() {
-        let directory = tempfile::tempdir().unwrap();
-        let receipt = directory
-            .path()
-            .join("recovery-9-id")
-            .to_str()
-            .unwrap()
-            .to_owned();
-        let pipeline = TransferPipeline::new(
-            PathBuf::from("/home/user/project"),
-            "myproject".to_string(),
-            "abc123".to_string(),
-            TransferConfig::default(),
-        )
-        .with_recovery_completion(receipt, "id".to_string());
-        let command = pipeline.durable_execution_command(
-            "i=0; while [ $i -lt 20000 ]; do echo line-$i; i=$((i + 1)); done".to_string(),
-        );
-        let output = std::process::Command::new("sh") // ubs:ignore — fixed wrapper piped into a delayed reader
-            .arg("-c")
-            .arg(format!("( {command} ) | ( sleep 3; cat )"))
-            .output()
-            .expect("run durable wrapper");
-        let stdout = String::from_utf8(output.stdout).unwrap();
-        assert_eq!(stdout.lines().count(), 20_000);
-        assert!(stdout.ends_with("line-19999\n"), "tail was cut");
+        let runs: Vec<_> = (0..8)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    let directory = tempfile::tempdir().unwrap();
+                    let receipt = directory
+                        .path()
+                        .join("recovery-9-id")
+                        .to_str()
+                        .unwrap()
+                        .to_owned();
+                    let pipeline = TransferPipeline::new(
+                        PathBuf::from("/home/user/project"),
+                        "myproject".to_string(),
+                        "abc123".to_string(),
+                        TransferConfig::default(),
+                    )
+                    .with_recovery_completion(receipt, "id".to_string());
+                    let command = pipeline.durable_execution_command(
+                        "i=0; while [ $i -lt 20000 ]; do echo line-$i; i=$((i + 1)); done"
+                            .to_string(),
+                    );
+                    let output = std::process::Command::new("sh") // ubs:ignore — fixed wrapper piped into a delayed reader
+                        .arg("-c")
+                        .arg(format!("( {command} ) | ( sleep 3; cat )"))
+                        .output()
+                        .expect("run durable wrapper");
+                    String::from_utf8(output.stdout).unwrap()
+                })
+            })
+            .collect();
+        for run in runs {
+            let stdout = run.join().unwrap();
+            assert_eq!(stdout.lines().count(), 20_000, "tail was cut");
+            assert!(stdout.ends_with("line-19999\n"), "tail was cut");
+        }
     }
 
     #[test]
