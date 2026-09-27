@@ -3675,7 +3675,7 @@ pub async fn run_exec(
                     == RemotePipelineFailurePolicy::FailClosedNoLocalFallback
                 {
                     warn!(
-                        "Remote execution failed on {}; refusing local fallback: {}",
+                        "Remote execution failed on {}; refusing local fallback: {:#}",
                         worker.id, e
                     );
                     // Issue #62: an unverified post-timeout cleanup means the
@@ -3752,7 +3752,7 @@ pub async fn run_exec(
                 } else {
                     // Generic pipeline failure — retry on a different worker first.
                     warn!(
-                        "Remote execution failed on {}: {}; will retry on another worker if available",
+                        "Remote execution failed on {}: {:#}; will retry on another worker if available",
                         worker.id, e
                     );
                     RetryableRemoteFault {
@@ -4770,7 +4770,7 @@ async fn handle_selection_response(
                 == RemotePipelineFailurePolicy::FailClosedNoLocalFallback
             {
                 warn!(
-                    "Remote execution pipeline failed on {}; refusing local fallback: {}",
+                    "Remote execution pipeline failed on {}; refusing local fallback: {:#}",
                     worker.id, e
                 );
                 // Issue #62: quarantine the worker when the post-timeout
