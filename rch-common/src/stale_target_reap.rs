@@ -2106,7 +2106,13 @@ mod tests {
                 trigger: "pooled-ttl",
             })
             .collect();
-        let cmd = collect_paths_command(&targets).expect("targets are valid");
+        // A private registry: offloaded, this fixture sits inside a source
+        // root the test build itself owns in the worker's real one.
+        let cmd = collect_paths_command_with_registry(
+            &targets,
+            tmp.path().join("claims-v1").to_str().unwrap(),
+        )
+        .expect("targets are valid");
         let out = Command::new("sh")
             .arg("-c")
             .arg(&cmd)
@@ -2477,11 +2483,14 @@ mod tests {
             }
         }
 
-        let cmd = worker_sweep_command(
+        // A private registry: offloaded, this fixture sits inside a source
+        // root the test build itself owns in the worker's real one.
+        let cmd = worker_sweep_command_with_registry(
             base.to_str().unwrap(),
             60,
             Some(MIN_POOLED_IDLE_MINUTES),
             None,
+            tmp.path().join("claims-v1").to_str().unwrap(),
         );
         let out = Command::new("sh")
             .arg("-c")
@@ -2963,11 +2972,14 @@ mod tests {
             return;
         }
 
-        let cmd = worker_sweep_command(
+        // A private registry: offloaded, this fixture sits inside a source
+        // root the test build itself owns in the worker's real one.
+        let cmd = worker_sweep_command_with_registry(
             base.to_str().unwrap(),
             60,
             Some(MIN_POOLED_IDLE_MINUTES),
             None,
+            tmp.path().join("claims-v1").to_str().unwrap(),
         );
         let out = Command::new("sh")
             .arg("-c")

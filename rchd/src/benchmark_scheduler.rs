@@ -2968,7 +2968,7 @@ Benchmark complete
     fn scheduled_benchmark_backoff_grows_and_is_capped() {
         use super::failure_backoff;
         let cap = Duration::from_secs(6 * 3600);
-        let minutes = |m| Some(Duration::from_secs(m * 60));
+        let minutes = |m: u64| Some(Duration::from_secs(m * 60));
         assert_eq!(failure_backoff(2, 3, cap), None);
         assert_eq!(failure_backoff(3, 3, cap), minutes(10));
         assert_eq!(failure_backoff(4, 3, cap), minutes(20));
