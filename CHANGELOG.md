@@ -42,6 +42,11 @@ behavior: experimental, operator-only, and not in the archives.
     test verdict lines of green runs
     ([`447c5c45`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/447c5c453d506430b3bd4801375ed343ac7e4a8e),
     [`c4c405b5`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/c4c405b5706a1ee025b8400cab02bd3a89752fb0)).
+    The follower now polls instead of using inotify: bytes written before the
+    inotify watch existed raised no event, and once the command had exited the
+    follower quit without a final read. On workers with uutils `tail` this still
+    cut 5–8% of streams read by a slow client (8 of 100 under stress; 0 of 100
+    after).
   - Output publication no longer refuses output roots that sit behind a system
     symlink such as macOS `/tmp` or `/var`
     ([`cb11a99c`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/cb11a99c25ea415625bdf465c15c0f36e19deaf8)).
