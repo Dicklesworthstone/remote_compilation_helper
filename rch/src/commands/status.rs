@@ -2618,7 +2618,7 @@ fn now_unix_ms_for_status() -> u64 {
 /// every terminal local run) so "why is this box compiling locally?" has an
 /// answer in `rch status` instead of a guess about agents bypassing rch.
 fn local_fallback_issue(now_ms: u64) -> Option<IssueFromApi> {
-    let ledger = rch_common::IncidentLedger::new(rch_common::IncidentLedgerConfig::default());
+    let ledger = crate::hook::configured_incident_ledger();
     local_fallback_issue_from(&ledger.read_all(), now_ms)
 }
 

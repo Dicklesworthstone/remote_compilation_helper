@@ -1647,6 +1647,15 @@ fn build_local_fallback_incident(
     )
 }
 
+/// The incident ledger as `[remediation.incident_ledger]` configures it
+/// (path and retention), or the defaults when config cannot load.
+pub(crate) fn configured_incident_ledger() -> IncidentLedger {
+    let config = crate::config::load_config()
+        .map(|config| IncidentLedgerConfig::from(&config.remediation.incident_ledger))
+        .unwrap_or_default();
+    IncidentLedger::new(config)
+}
+
 /// Append `event` to the durable incident ledger, best-effort. Incident logging
 /// must never break a build, so a write failure is logged and swallowed. A
 /// tracing breadcrumb is always emitted so the incident is visible even when the
@@ -1677,8 +1686,7 @@ fn record_hook_incident(event: &IncidentEvent) {
             "hook incident recorded",
         );
     }
-    let ledger = IncidentLedger::new(IncidentLedgerConfig::default());
-    if let Err(e) = ledger.append(event) {
+    if let Err(e) = configured_incident_ledger().append(event) {
         // Best-effort by contract. An unwritable state dir (sandbox, unset
         // HOME) would otherwise print this on every fallback and refusal.
         debug!(
