@@ -58,7 +58,10 @@ pub struct BuildCompletion {
     pub cancellation: Option<BuildCancellationMetadata>,
 }
 
-/// Linux boot identity plus process start ticks distinguish PID reuse and reboot.
+/// Boot identity plus process start time distinguish PID reuse and reboot.
+/// Only the daemon computes and compares these values, so each platform just
+/// needs a stable per-incarnation string; `None` means "cannot prove".
+#[cfg(target_os = "linux")]
 pub fn process_identity(pid: u32) -> Option<String> {
     if pid <= 1 {
         return None;
@@ -68,6 +71,42 @@ pub fn process_identity(pid: u32) -> Option<String> {
     let (_, fields) = stat.rsplit_once(") ")?;
     let start_ticks = fields.split_whitespace().nth(19)?;
     Some(format!("{}:{start_ticks}", boot.trim()))
+}
+
+/// macOS has no /proc. Without an identity every heartbeat of a build
+/// recovered after a daemon restart was rejected, so reattach could never
+/// work on a Mac dispatcher (bd-w2qrp). The boot session UUID changes on
+/// every boot; `ps -o lstart=` is the process start time (empty, and so
+/// `None`, once the PID is gone).
+#[cfg(target_os = "macos")]
+pub fn process_identity(pid: u32) -> Option<String> {
+    if pid <= 1 {
+        return None;
+    }
+    static BOOT_SESSION: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    let boot = BOOT_SESSION
+        .get_or_init(|| command_stdout("/usr/sbin/sysctl", &["-n", "kern.bootsessionuuid"]))
+        .as_ref()?;
+    let started = command_stdout("/bin/ps", &["-o", "lstart=", "-p", &pid.to_string()])?;
+    Some(format!("{boot}:{started}"))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn process_identity(_pid: u32) -> Option<String> {
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn command_stdout(program: &str, args: &[&str]) -> Option<String> {
+    let output = std::process::Command::new(program)
+        .args(args)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    (!text.is_empty()).then_some(text)
 }
 /// Default maximum number of builds to retain.
 const DEFAULT_CAPACITY: usize = 100;
