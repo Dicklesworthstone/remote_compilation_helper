@@ -891,7 +891,12 @@ impl BenchmarkScheduler {
                     }
 
                     // Re-queue if retryable
-                    if retryable && let Some(running) = running {
+                    if should_requeue_failed_benchmark(
+                        retryable,
+                        consecutive_count,
+                        alert_threshold,
+                    ) && let Some(running) = running
+                    {
                         let mut req = running.request;
                         req.priority = BenchmarkPriority::Low;
                         req.requested_at = Utc::now();
@@ -1008,7 +1013,11 @@ impl BenchmarkScheduler {
             }
 
             // Re-queue if retryable (with lower priority)
-            if retryable {
+            if should_requeue_failed_benchmark(
+                retryable,
+                consecutive_count,
+                self.config.consecutive_failure_alert_threshold,
+            ) {
                 let mut request = running.request;
                 request.priority = BenchmarkPriority::Low;
                 request.requested_at = Utc::now(); // Reset timestamp
@@ -1304,6 +1313,18 @@ fn parse_benchmark_score(output: &str) -> Option<f64> {
         }
     }
     None
+}
+
+/// An immediate retry is for a transient blip. A worker that keeps failing
+/// (a benchmark that always times out on an overloaded box) must not be
+/// re-benchmarked back to back forever: past the alert threshold it waits
+/// for the regular schedule.
+fn should_requeue_failed_benchmark(
+    retryable: bool,
+    consecutive_failures: u32,
+    threshold: u32,
+) -> bool {
+    retryable && consecutive_failures < threshold.max(1)
 }
 
 /// Determine if a benchmark error is retryable.
@@ -2842,6 +2863,22 @@ Benchmark complete
         assert_eq!(super::parse_benchmark_score(r#""score":"#), None);
         // Valid short format
         assert_eq!(super::parse_benchmark_score(r#""score":5"#), Some(5.0));
+    }
+
+    #[test]
+    fn failed_benchmark_requeues_only_below_the_failure_threshold() {
+        use super::should_requeue_failed_benchmark as requeue;
+        assert!(requeue(true, 1, 3));
+        assert!(requeue(true, 2, 3));
+        assert!(
+            !requeue(true, 3, 3),
+            "a persistently failing worker must stop looping"
+        );
+        assert!(!requeue(false, 1, 3));
+        assert!(
+            !requeue(true, 1, 0),
+            "a zero threshold still bounds retries"
+        );
     }
 
     #[test]
