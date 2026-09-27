@@ -47,6 +47,18 @@ Repository: <https://github.com/Dicklesworthstone/remote_compilation_helper>
   Any build whose command started remotely now records cache warmth on its
   worker, both on release and on cancellation. A non-zero exit still creates
   no affinity pin, no last-success fallback and no worker-health success.
+- **`cargo publish --dry-run` and `cargo package` no longer end "completion
+  unconfirmed".**
+  - The remote run succeeded, but the live retrieval derived its output policy
+    from the command after rch had added its quoted build-stamp `--config`
+    flags. That made package verification look like a plain build, so
+    retrieval staged Cargo's `.rustc_info.json`.
+  - The recovery recipe had recorded the package policy from the unstamped
+    command, so publication refused the file and kept the job's ownership.
+  - Retrieval, the zero-package-archive gate and the build-only kind now all
+    use the recipe's command (`bd-3kskq`).
+  - The same mismatch disabled the zero-package-archive loud-failure gate and
+    widened `cargo build --bin` retrieval to the broad policy.
 
 ## 2.1.3 — 2026-09-27
 

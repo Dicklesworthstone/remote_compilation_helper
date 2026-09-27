@@ -1677,6 +1677,12 @@ async fn execute_remote_compilation_inner(
     } else {
         None
     };
+    // Output policy comes from the command the recovery recipe recorded. The
+    // stamp's quoted `--config env.RCH_BUILD_SOURCE…` changes no outputs, but
+    // it made `cargo publish --dry-run` look like a plain build: retrieval then
+    // staged `.rustc_info.json`, which the recipe's package policy refused, so
+    // every successful dry run ended "completion unconfirmed" (bd-3kskq).
+    let policy_command = command;
     let command = stamped_command.as_deref().unwrap_or(command);
 
     // Step 2: Execute command remotely with streaming output
@@ -1983,7 +1989,7 @@ async fn execute_remote_compilation_inner(
         // build/doc/rustc the filtered list is empty, so the phase is skipped.
         let artifact_patterns = get_project_artifact_patterns(
             kind,
-            Some(command),
+            Some(policy_command),
             forwarded_cargo_target_dir.is_some(),
         );
         if !artifact_patterns.is_empty() {
@@ -2119,7 +2125,7 @@ async fn execute_remote_compilation_inner(
 
         if let Some(local_target_dir) = forwarded_cargo_target_dir.as_ref() {
             let remote_target_path = pipeline.remote_cargo_target_dir();
-            let custom_patterns = get_custom_target_artifact_patterns(kind, Some(command));
+            let custom_patterns = get_custom_target_artifact_patterns(kind, Some(policy_command));
             if custom_patterns.is_empty() {
                 reporter.verbose(&format!(
                     "[RCH] custom target dir sync skipped for {} after command with no target artifacts",
@@ -2414,7 +2420,7 @@ async fn execute_remote_compilation_inner(
     // Build-only test/bench outputs belong to the caller. They require the
     // same transfer-failure, metadata-only and foreign-target checks as builds;
     // the execution kind remains unchanged for telemetry and remote execution.
-    let artifact_kind = artifact_delivery_kind(kind, Some(command));
+    let artifact_kind = artifact_delivery_kind(kind, Some(policy_command));
     // Only the kinds whose contract is "materialize the caller's runnable
     // outputs under the cargo target tree" are typed. Test/bench/coverage kinds
     // retrieve reports and instrumented trees whose binaries are the WORKER's
@@ -2504,7 +2510,10 @@ async fn execute_remote_compilation_inner(
             retrieval_matched_regular,
             artifact_kind,
             retrieval_custom_target_basis,
-        ) || sync_back_verified_zero_package_archives(retrieval_matched_regular, command))
+        ) || sync_back_verified_zero_package_archives(
+            retrieval_matched_regular,
+            policy_command,
+        ))
     {
         // bd-mpbav loud failure, layer B: the sync-back SUCCEEDED (unlike the
         // issue-#19 arm above) yet matched ZERO build outputs — every matched
