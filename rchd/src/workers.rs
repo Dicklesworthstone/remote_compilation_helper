@@ -1186,6 +1186,11 @@ impl ToolchainPreflightStatus {
 #[derive(Clone)]
 pub struct WorkerPool {
     workers: Arc<RwLock<HashMap<WorkerId, Arc<WorkerState>>>>,
+    /// Startup ownership for workers absent from the current configuration.
+    /// These are reservations, not schedulable workers. The durable build
+    /// history remains their source of truth across process restarts.
+    /// Lock order is always `workers` before `recovered_absent_slots`.
+    recovered_absent_slots: Arc<RwLock<HashMap<WorkerId, u32>>>,
     /// Track worker count atomically for sync access.
     worker_count: Arc<AtomicUsize>,
     disk_slot_policy: DiskSlotPolicy,
@@ -1201,6 +1206,7 @@ impl WorkerPool {
     pub fn with_selection_config(config: &rch_common::SelectionConfig) -> Self {
         Self {
             workers: Arc::new(RwLock::new(HashMap::new())),
+            recovered_absent_slots: Arc::new(RwLock::new(HashMap::new())),
             worker_count: Arc::new(AtomicUsize::new(0)),
             disk_slot_policy: DiskSlotPolicy::from(config),
         }
@@ -1231,6 +1237,21 @@ impl WorkerPool {
             let config = state.config.read().await.clone();
             existing.update_config(config).await;
         } else {
+            // Publish a reintroduced worker only after restoring its surviving
+            // builds. Holding the registry's write lock makes this transfer
+            // atomic with release_slots, including a completion that arrived
+            // while the worker was absent. There is no await after removing
+            // the pending count and before inserting the initialized state.
+            let restored = self
+                .recovered_absent_slots
+                .write()
+                .await
+                .remove(&id)
+                .unwrap_or(0);
+            // `state` is freshly constructed and has never been published.
+            // Restore ownership even when it exceeds the new capacity; free
+            // slots saturate at zero until the existing builds finish.
+            state.used_slots.store(restored, Ordering::SeqCst);
             workers.insert(id.clone(), state);
             self.worker_count.fetch_add(1, Ordering::SeqCst);
             debug!("Added worker: {}", id);
@@ -1365,8 +1386,45 @@ impl WorkerPool {
             worker.release_slots(slots).await;
             debug!("Released {} slots on worker {}", slots, id);
         } else {
-            debug!("Worker {} not found, cannot release slots", id);
+            let mut absent = self.recovered_absent_slots.write().await;
+            if let Some(used) = absent.get_mut(id) {
+                *used = used.saturating_sub(slots);
+                if *used == 0 {
+                    absent.remove(id);
+                }
+                debug!("Released {} recovered slots on absent worker {}", slots, id);
+            } else {
+                debug!("Worker {} has no reserved slots to release", id);
+            }
         }
+    }
+
+    /// Reconstruct one durable build's reservation before daemon admission.
+    ///
+    /// Returns whether the worker is currently configured. An absent worker's
+    /// reservation is retained without inventing a host or making it eligible
+    /// for selection. Config reload consumes the remaining count exactly once.
+    /// Call once per active build during startup, not periodically: this is an
+    /// additive reconstruction, just like WorkerState::restore_slots.
+    pub async fn restore_recovered_slots(
+        &self,
+        id: &WorkerId,
+        slots: u32,
+    ) -> std::io::Result<bool> {
+        let workers = self.workers.read().await;
+        if let Some(worker) = workers.get(id) {
+            worker.restore_slots(slots)?;
+            return Ok(true);
+        }
+        let mut absent = self.recovered_absent_slots.write().await;
+        let used = absent.get(id).copied().unwrap_or(0);
+        let restored = used.checked_add(slots).ok_or_else(|| {
+            std::io::Error::other(format!("recovered slot count overflow for worker {id}"))
+        })?;
+        if restored != 0 {
+            absent.insert(id.clone(), restored);
+        }
+        Ok(false)
     }
 }
 
@@ -1761,6 +1819,246 @@ fn worker_status_label(status: WorkerStatus) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn recovered_worker_config(id: &str, slots: u32) -> WorkerConfig {
+        WorkerConfig {
+            id: WorkerId::new(id),
+            host: "localhost".to_string(),
+            user: "user".to_string(),
+            identity_file: "~/.ssh/id_rsa".to_string(),
+            total_slots: slots,
+            priority: 100,
+            tags: Vec::new(),
+            tools: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn absent_reservations_are_invisible_until_reintroduced_with_usage() {
+        let pool = WorkerPool::new();
+        let id = WorkerId::new("returning");
+        assert!(!pool.restore_recovered_slots(&id, 2).await.unwrap());
+        assert!(!pool.restore_recovered_slots(&id, 3).await.unwrap());
+        assert!(pool.is_empty());
+        assert!(pool.get(&id).await.is_none());
+        assert!(pool.all_workers().await.is_empty());
+        assert!(pool.healthy_workers().await.is_empty());
+
+        pool.add_worker(recovered_worker_config(id.as_str(), 8)).await;
+        let worker = pool.get(&id).await.unwrap();
+        assert_eq!(pool.len(), 1);
+        assert_eq!(worker.used_slots(), 5);
+        assert_eq!(worker.available_slots().await, 3);
+        assert!(!worker.reserve_slots(4).await);
+        assert!(worker.reserve_slots(3).await);
+        assert_eq!(worker.used_slots(), 8);
+        assert!(pool.recovered_absent_slots.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn completion_before_reintroduction_releases_only_remaining_ownership() {
+        for released in [2, 5] {
+            let pool = WorkerPool::new();
+            let id = WorkerId::new("returning");
+            pool.restore_recovered_slots(&id, 5).await.unwrap();
+            pool.clone().release_slots(&id, released).await;
+            assert!(pool.is_empty());
+            pool.add_worker(recovered_worker_config(id.as_str(), 8)).await;
+            let worker = pool.get(&id).await.unwrap();
+            assert_eq!(worker.used_slots(), 5 - released);
+            assert_eq!(worker.available_slots().await, 3 + released);
+        }
+    }
+
+    #[tokio::test]
+    async fn restored_usage_can_exceed_new_capacity_and_is_not_applied_twice() {
+        let pool = WorkerPool::new();
+        let id = WorkerId::new("smaller");
+        pool.restore_recovered_slots(&id, 6).await.unwrap();
+        pool.add_worker(recovered_worker_config(id.as_str(), 2)).await;
+        let worker = pool.get(&id).await.unwrap();
+        assert_eq!(worker.used_slots(), 6);
+        assert_eq!(worker.available_slots().await, 0);
+        assert!(!worker.reserve_slots(1).await);
+
+        pool.add_worker(recovered_worker_config(id.as_str(), 8)).await;
+        assert!(Arc::ptr_eq(&worker, &pool.get(&id).await.unwrap()));
+        assert_eq!(worker.used_slots(), 6);
+        pool.release_slots(&id, 4).await;
+        assert_eq!(worker.used_slots(), 2);
+        assert_eq!(worker.available_slots().await, 6);
+        pool.add_worker(recovered_worker_config(id.as_str(), 8)).await;
+        assert_eq!(worker.used_slots(), 2);
+    }
+
+    #[tokio::test]
+    async fn configured_and_absent_workers_share_checked_reconstruction() {
+        for configured in [false, true] {
+            let pool = WorkerPool::new();
+            let id = WorkerId::new("overflow");
+            if configured {
+                pool.add_worker(recovered_worker_config(id.as_str(), 8)).await;
+            }
+            assert_eq!(
+                pool.restore_recovered_slots(&id, u32::MAX).await.unwrap(),
+                configured
+            );
+            assert!(pool.restore_recovered_slots(&id, 1).await.is_err());
+            if !configured {
+                pool.add_worker(recovered_worker_config(id.as_str(), 8)).await;
+            }
+            let worker = pool.get(&id).await.unwrap();
+            assert_eq!(worker.used_slots(), u32::MAX);
+            assert_eq!(worker.available_slots().await, 0);
+            pool.release_slots(&id, u32::MAX).await;
+            assert_eq!(worker.used_slots(), 0);
+            assert_eq!(worker.available_slots().await, 8);
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_release_and_zero_reconstruction_cannot_create_inventory() {
+        let pool = WorkerPool::new();
+        let id = WorkerId::new("unknown");
+        pool.release_slots(&id, 7).await;
+        assert!(!pool.restore_recovered_slots(&id, 0).await.unwrap());
+        assert!(pool.recovered_absent_slots.read().await.is_empty());
+        assert!(pool.is_empty());
+        pool.add_worker(recovered_worker_config(id.as_str(), 8)).await;
+        assert_eq!(pool.get(&id).await.unwrap().used_slots(), 0);
+    }
+
+    #[tokio::test]
+    async fn cancelled_reintroduction_cannot_drop_unpublished_reservations() {
+        use std::future::{Future, poll_fn};
+        use std::task::Poll;
+
+        let pool = WorkerPool::new();
+        let id = WorkerId::new("cancelled-reload");
+        pool.restore_recovered_slots(&id, 5).await.unwrap();
+        let held = pool.recovered_absent_slots.write().await;
+        let mut adding = Box::pin(pool.add_worker(recovered_worker_config(id.as_str(), 8)));
+        poll_fn(|cx| {
+            assert!(adding.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        // The registry write lock is retained while the transfer waits. No
+        // selector can observe the newly allocated state with zero usage.
+        assert!(pool.workers.try_read().is_err());
+        drop(adding);
+        assert_eq!(held.get(&id), Some(&5));
+        drop(held);
+        assert!(pool.get(&id).await.is_none());
+        pool.add_worker(recovered_worker_config(id.as_str(), 8)).await;
+        assert_eq!(pool.get(&id).await.unwrap().used_slots(), 5);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn concurrent_reintroductions_and_completion_never_reset_or_duplicate_usage() {
+        for iteration in 0..16 {
+            let pool = WorkerPool::new();
+            let id = WorkerId::new(format!("race-{iteration}"));
+            pool.restore_recovered_slots(&id, 6).await.unwrap();
+            let barrier = Arc::new(tokio::sync::Barrier::new(3));
+            let mut tasks = Vec::new();
+            for operation in 0..3 {
+                let pool = pool.clone();
+                let id = id.clone();
+                let barrier = Arc::clone(&barrier);
+                tasks.push(tokio::spawn(async move {
+                    barrier.wait().await;
+                    if operation == 0 {
+                        pool.release_slots(&id, 2).await;
+                    } else {
+                        pool.add_worker(recovered_worker_config(id.as_str(), 8)).await;
+                    }
+                }));
+            }
+            for task in tasks {
+                tokio::time::timeout(std::time::Duration::from_secs(5), task)
+                    .await
+                    .unwrap()
+                    .unwrap();
+            }
+            let worker = pool.get(&id).await.unwrap();
+            assert_eq!(pool.len(), 1);
+            assert_eq!(worker.used_slots(), 4);
+            assert_eq!(worker.available_slots().await, 4);
+            assert!(pool.recovered_absent_slots.read().await.is_empty());
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn durable_ownership_survives_absent_worker_and_real_configuration_reload() {
+        let directory = tempfile::tempdir().unwrap();
+        let history_path = directory.path().join("history.jsonl");
+        let workers_path = directory.path().join("workers.toml");
+        let history =
+            crate::history::BuildHistory::new(10).with_persistence(history_path.clone());
+        let build = history.start_active_build(
+            "recovered-project".into(),
+            "returning".into(),
+            "cargo check".into(),
+            std::process::id(),
+            5,
+            rch_common::BuildLocation::Remote,
+        );
+        drop(history);
+        let recovered =
+            crate::history::BuildHistory::load_from_file(&history_path, 10).unwrap();
+        let pool = WorkerPool::new();
+        for active in recovered.active_builds() {
+            assert!(
+                !pool
+                    .restore_recovered_slots(&WorkerId::new(&active.worker_id), active.slots)
+                    .await
+                    .unwrap()
+            );
+        }
+        std::fs::write(&workers_path, "workers = []\n").unwrap();
+        crate::reload::reload_workers(&pool, Some(&workers_path), true)
+            .await
+            .unwrap();
+        assert!(pool.is_empty());
+        assert!(recovered.active_build(build.id).is_some());
+
+        std::fs::write(
+            &workers_path,
+            "[[workers]]\nid = 'returning'\nhost = '127.0.0.1'\nuser = 'user'\nidentity_file = '~/.ssh/id_rsa'\ntotal_slots = 8\n",
+        )
+        .unwrap();
+        let change = crate::reload::reload_workers(&pool, Some(&workers_path), true)
+            .await
+            .unwrap();
+        assert_eq!(change.added, 1);
+        let worker = pool.get(&WorkerId::new("returning")).await.unwrap();
+        assert_eq!(worker.used_slots(), 5);
+        assert_eq!(worker.available_slots().await, 3);
+        assert!(!worker.reserve_slots(4).await);
+
+        let completed = recovered
+            .complete_durable(
+                build.id,
+                "returning",
+                None,
+                crate::history::BuildCompletion {
+                    exit_code: 0,
+                    duration_ms: None,
+                    bytes_transferred: None,
+                    timing: None,
+                    cancellation: None,
+                },
+            )
+            .unwrap()
+            .unwrap();
+        pool.release_slots(&WorkerId::new("returning"), completed.0.slots)
+            .await;
+        assert_eq!(worker.used_slots(), 0);
+        assert_eq!(worker.available_slots().await, 8);
+        assert!(recovered.active_build(build.id).is_none());
+    }
 
     // =========================================================================
     // Worker lifecycle type model (bd-session-history-remediation-ocv9i.1.1)
@@ -3031,7 +3329,6 @@ mod tests {
         assert!(!state.is_drained().await);
 
         // Release the slot (job completes) - this automatically calls check_drain_complete()
-        // and should transition to Drained since no jobs remain
         state.release_slots(1).await;
         assert_eq!(state.used_slots(), 0);
 

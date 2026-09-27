@@ -1062,20 +1062,21 @@ async fn main() -> Result<()> {
         // it turned one stale record into a systemd crash loop and a dispatcher
         // that built everything locally. The build keeps its ownership record
         // (its remote process may still exist, so it is never released without
-        // proof); there is simply no pool entry to restore slots to, and a
-        // removed worker is never selected again.
-        let Some(worker) = worker_pool
-            .get(&rch_common::WorkerId::new(&build.worker_id))
-            .await
-        else {
+        // proof). Retain its slots even without a pool entry: a later config
+        // reload may reintroduce this worker before its old build completes.
+        let configured = worker_pool
+            .restore_recovered_slots(
+                &rch_common::WorkerId::new(&build.worker_id),
+                build.slots,
+            )
+            .await?;
+        if !configured {
             warn!(
                 "Durable build {} owns worker {}, which is no longer configured; \
-                 keeping its ownership record without restoring slots",
+                 retaining its ownership and slots until completion or reconfiguration",
                 build.id, build.worker_id
             );
-            continue;
-        };
-        worker.restore_slots(build.slots)?;
+        }
     }
 
     // Admission uses the same persisted build history as the API. Attach it
