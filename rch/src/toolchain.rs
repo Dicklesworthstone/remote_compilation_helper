@@ -407,7 +407,10 @@ fn active_identity_parts(output: &str) -> Result<(&str, Option<&str>), Toolchain
 /// installed/default entry or a name extracted from error text. Unknown layouts
 /// and "no active toolchain" are resolution failures, not standalone fallbacks.
 fn rustup_show_identity(output: &str) -> Result<String, ToolchainError> {
-    if output.chars().any(|c| c.is_control() && c != '\n' && c != '\r') {
+    if output
+        .chars()
+        .any(|c| c.is_control() && c != '\n' && c != '\r')
+    {
         return Err(ToolchainError::InvalidFormat);
     }
     let lines: Vec<_> = output.lines().collect();
@@ -468,7 +471,10 @@ fn resolved_rustup_identity(
             "selected toolchain file changed".into(),
         ));
     }
-    let declared = if path.file_name().is_some_and(|name| name == "rust-toolchain") {
+    let declared = if path
+        .file_name()
+        .is_some_and(|name| name == "rust-toolchain")
+    {
         parse_legacy_toolchain_file(&path)
     } else {
         parse_toolchain_file(&path)
@@ -1083,7 +1089,10 @@ mod tests {
             "broken [[[",
         ] {
             std::fs::write(&path, contents).unwrap();
-            assert!(resolved_rustup_identity(&root, &active).is_err(), "{contents}");
+            assert!(
+                resolved_rustup_identity(&root, &active).is_err(),
+                "{contents}"
+            );
         }
     }
 
@@ -1173,12 +1182,17 @@ mod tests {
             "beta"
         );
         for invalid in ["nightly\0", "nightly (default)", " nightly"] {
-            assert!(detect_resolved_toolchain_with(tmp.path(), Some(invalid), absent, absent).is_err());
+            assert!(
+                detect_resolved_toolchain_with(tmp.path(), Some(invalid), absent, absent).is_err()
+            );
         }
         std::fs::write(tmp.path().join("rust-toolchain"), "").unwrap();
-        assert!(detect_toolchain_with(tmp.path(), None, |_| {
-            panic!("a broken pin must not invoke the standalone fallback")
-        }).is_err());
+        assert!(
+            detect_toolchain_with(tmp.path(), None, |_| {
+                panic!("a broken pin must not invoke the standalone fallback")
+            })
+            .is_err()
+        );
     }
 
     #[cfg(unix)]
