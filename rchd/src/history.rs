@@ -12,9 +12,9 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use std::sync::{Mutex, RwLock};
+use std::time::{Duration, Instant};
 use tokio::fs::OpenOptions as AsyncOpenOptions;
 use tokio::io::AsyncWriteExt;
 use tracing::{debug, warn};
@@ -42,6 +42,14 @@ pub enum WrapperCancellation {
 const MAX_CANCELLED_WRAPPERS: usize = 100_000;
 /// Queue IDs occupy a separate numeric namespace from daemon build IDs.
 const QUEUE_ID_NAMESPACE: u64 = 1 << 63;
+/// Heartbeat progress is advisory. It is made durable this often (identity
+/// and phase changes at once), so a restart sees it at most this stale.
+const HEARTBEAT_PERSIST_INTERVAL: Duration = Duration::from_secs(30);
+/// Terminal receipts answer a live or briefly restarted wrapper; recovery
+/// reads the worker's own completion receipt. Bound them so each ownership
+/// commit does not rewrite and fsync an ever-growing history.
+const TERMINAL_RECEIPT_RETENTION_DAYS: i64 = 3;
+const MAX_TERMINAL_RECEIPTS: usize = 500;
 
 #[derive(Clone, Serialize, Deserialize)]
 struct TerminalOwnership {
@@ -224,6 +232,8 @@ pub struct BuildHistory {
     terminal: RwLock<HashMap<u64, TerminalOwnership>>,
     /// Never evict an intent while a delayed same-identity admission can arrive.
     cancelled_wrappers: RwLock<HashSet<String>>,
+    /// When each active build's heartbeat was last made durable.
+    heartbeat_persisted: Mutex<HashMap<u64, Instant>>,
     ownership_failed: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     fail_after_ownership_rename: std::sync::atomic::AtomicBool,
@@ -254,6 +264,7 @@ impl BuildHistory {
             persistence_path: None,
             terminal: RwLock::new(HashMap::new()),
             cancelled_wrappers: RwLock::new(HashSet::new()),
+            heartbeat_persisted: Mutex::new(HashMap::new()),
             ownership_failed: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             fail_after_ownership_rename: std::sync::atomic::AtomicBool::new(false),
@@ -536,6 +547,15 @@ impl BuildHistory {
         if state.recovered && state.hook_process_identity.is_none() {
             return None;
         }
+        let identity_changed = heartbeat
+            .local_wrapper_id
+            .as_ref()
+            .is_some_and(|wrapper| state.local_wrapper_id.as_ref() != Some(wrapper))
+            || heartbeat
+                .remote_pgid_file
+                .as_ref()
+                .filter(|path| !path.trim().is_empty())
+                .is_some_and(|path| state.remote_pgid_file.as_ref() != Some(path));
         if let Some(local_wrapper_id) = heartbeat.local_wrapper_id {
             state.local_wrapper_id = Some(local_wrapper_id);
         }
@@ -588,9 +608,24 @@ impl BuildHistory {
         }
 
         let updated = state.clone();
-        if let Err(error) = self.persist_ownership(&active, None) {
-            warn!("Unable to persist build heartbeat: {error}");
-            return None;
+        // Rewriting and fsyncing the whole ownership file on every heartbeat,
+        // under the active lock, stalled admission and completion behind it.
+        let mut persisted = self
+            .heartbeat_persisted
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        persisted.retain(|id, _| active.contains_key(id));
+        let due = identity_changed
+            || phase_changed
+            || persisted
+                .get(&heartbeat.build_id)
+                .is_none_or(|at| now.duration_since(*at) >= HEARTBEAT_PERSIST_INTERVAL);
+        if due {
+            if let Err(error) = self.persist_ownership(&active, None) {
+                warn!("Unable to persist build heartbeat: {error}");
+                return None;
+            }
+            persisted.insert(heartbeat.build_id, now);
         }
         Some(updated)
     }
@@ -1286,6 +1321,8 @@ impl BuildHistory {
         let initial_id = std::cmp::max(max_id.saturating_add(1), epoch_id);
         let queue_epoch = QUEUE_ID_NAMESPACE | epoch_id;
         let next_queue_id = next_queue_id.map_or(queue_epoch, |id| id.max(queue_epoch));
+        // After max_id counted them: a pruned receipt's id is never reissued.
+        prune_terminal_receipts(&mut terminal, Utc::now());
 
         let history = Self {
             records: RwLock::new(records),
@@ -1298,6 +1335,7 @@ impl BuildHistory {
             persistence_path: Some(path.to_path_buf()),
             terminal: RwLock::new(terminal),
             cancelled_wrappers: RwLock::new(cancelled_wrappers),
+            heartbeat_persisted: Mutex::new(HashMap::new()),
             ownership_failed: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             fail_after_ownership_rename: std::sync::atomic::AtomicBool::new(false),
@@ -1436,6 +1474,10 @@ impl BuildHistory {
             record: record.clone(),
             local_wrapper_id: state.local_wrapper_id.clone(),
         };
+        prune_terminal_receipts(
+            &mut self.terminal.write().unwrap_or_else(|e| e.into_inner()),
+            Utc::now(),
+        );
         self.persist_ownership(&active, Some(&receipt))?;
         self.terminal
             .write()
@@ -1511,6 +1553,32 @@ impl BuildHistory {
         }
         File::open(parent)?.sync_all()?;
         Ok(())
+    }
+}
+
+/// Drop receipts past retention, then the oldest beyond the cap. An
+/// unparseable completion time sorts oldest.
+fn prune_terminal_receipts(terminal: &mut HashMap<u64, TerminalOwnership>, now: DateTime<Utc>) {
+    let cutoff = now - ChronoDuration::days(TERMINAL_RECEIPT_RETENTION_DAYS);
+    terminal.retain(|_, receipt| {
+        DateTime::parse_from_rfc3339(&receipt.record.completed_at)
+            .map_or(true, |completed| completed >= cutoff)
+    });
+    let Some(excess) = terminal.len().checked_sub(MAX_TERMINAL_RECEIPTS) else {
+        return;
+    };
+    let mut by_age: Vec<_> = terminal
+        .iter()
+        .map(|(id, receipt)| {
+            (
+                DateTime::parse_from_rfc3339(&receipt.record.completed_at).ok(),
+                *id,
+            )
+        })
+        .collect();
+    by_age.sort_unstable();
+    for (_, id) in by_age.into_iter().take(excess) {
+        terminal.remove(&id);
     }
 }
 
@@ -1981,6 +2049,86 @@ mod tests {
             Some("/tmp/rch/proj/hash/.rch-run/1.pgid")
         );
         assert_ne!(updated.last_progress_at, initial_progress_at);
+    }
+
+    #[test]
+    fn heartbeat_progress_is_durable_on_identity_phase_or_interval_only() {
+        let _guard = test_guard!();
+        let root = TempDir::new().unwrap();
+        let path = root.path().join("history.jsonl");
+        std::fs::write(&path, b"").unwrap();
+        let history = BuildHistory::new(10).with_persistence(path.clone());
+        let build = history.start_active_build(
+            "proj".to_string(),
+            "worker-a".to_string(),
+            "cargo build".to_string(),
+            1234,
+            4,
+            BuildLocation::Remote,
+        );
+        let ownership = path.with_extension("ownership.json");
+        let beat = |counter, phase| BuildHeartbeatRequest {
+            build_id: build.id,
+            worker_id: rch_common::WorkerId::new("worker-a"),
+            hook_pid: Some(1234),
+            local_wrapper_id: None,
+            remote_pgid_file: None,
+            phase,
+            detail: None,
+            progress_counter: Some(counter),
+            progress_percent: None,
+        };
+
+        history
+            .record_build_heartbeat(beat(1, BuildHeartbeatPhase::Execute))
+            .unwrap();
+        let first = std::fs::read(&ownership).unwrap();
+        history
+            .record_build_heartbeat(beat(2, BuildHeartbeatPhase::Execute))
+            .unwrap();
+        assert_eq!(
+            std::fs::read(&ownership).unwrap(),
+            first,
+            "progress-only beat was fsynced"
+        );
+        assert_eq!(history.active_build(build.id).unwrap().heartbeat_counter, 2);
+
+        history
+            .record_build_heartbeat(beat(3, BuildHeartbeatPhase::SyncDown))
+            .unwrap();
+        assert_ne!(
+            std::fs::read(&ownership).unwrap(),
+            first,
+            "phase change must be durable"
+        );
+    }
+
+    #[test]
+    fn terminal_receipts_are_bounded_by_age_then_count() {
+        let receipt = |id: u64, completed: DateTime<Utc>| {
+            let mut record = make_build_record(id);
+            record.completed_at = completed.to_rfc3339();
+            (
+                id,
+                TerminalOwnership {
+                    record,
+                    local_wrapper_id: None,
+                },
+            )
+        };
+        let now = Utc::now();
+        let mut terminal: HashMap<_, _> = (1..=MAX_TERMINAL_RECEIPTS as u64 + 10)
+            .map(|id| receipt(id, now - ChronoDuration::seconds(id as i64)))
+            .collect();
+        terminal.extend([receipt(9_999, now - ChronoDuration::days(4))]);
+        prune_terminal_receipts(&mut terminal, now);
+        assert_eq!(terminal.len(), MAX_TERMINAL_RECEIPTS);
+        assert!(!terminal.contains_key(&9_999), "expired receipt kept");
+        assert!(terminal.contains_key(&1), "newest receipt dropped");
+        assert!(
+            !terminal.contains_key(&(MAX_TERMINAL_RECEIPTS as u64 + 10)),
+            "oldest kept"
+        );
     }
 
     #[test]
