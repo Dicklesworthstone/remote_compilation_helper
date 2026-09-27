@@ -273,6 +273,17 @@ impl OutputContext {
         let supports_unicode = caps.supports_unicode;
         let supports_hyperlinks = mode == OutputMode::Human && caps.supports_hyperlinks;
 
+        // The `colored` crate decides on its own from stdout's TTY state and
+        // CLICOLOR*, so an explicit FORCE_COLOR must be handed to it or styled
+        // stderr stays plain whenever stdout is piped. Only an explicit request
+        // sets the process-global override.
+        if config.color == ColorChoice::Auto
+            && env::var("NO_COLOR").is_err()
+            && force_color_env().is_some()
+        {
+            colored::control::set_override(colors_enabled);
+        }
+
         let theme = Theme::new(colors_enabled, supports_unicode, supports_hyperlinks);
 
         Self {
