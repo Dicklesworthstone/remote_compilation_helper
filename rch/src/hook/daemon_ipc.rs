@@ -167,6 +167,41 @@ pub(crate) async fn restart_admission_is_closed(socket_path: &str) -> anyhow::Re
     Ok(status.admission_closed)
 }
 
+/// An optional field must not turn a failed client-side Rustup resolution into
+/// permission to use the worker's default compiler. Apply the same preflight to
+/// actual admission and dry-run diagnostics, before any socket or queue owner
+/// exists. Return a selection refusal, not a daemon communication error that
+/// could spuriously trigger daemon restart. The caller's placement policy still
+/// decides whether a never-dispatched command may execute locally.
+fn unresolved_toolchain_refusal(
+    toolchain: Option<&ToolchainInfo>,
+    required_runtime: RequiredRuntime,
+) -> Option<SelectionResponse> {
+    if required_runtime != RequiredRuntime::Rust {
+        return None;
+    }
+    if toolchain.is_some_and(|info| {
+        !info.channel.is_empty()
+            && !info
+                .rustup_toolchain()
+                .chars()
+                .any(|ch| ch.is_whitespace() || ch.is_control())
+    }) {
+        return None;
+    }
+    Some(SelectionResponse {
+        worker: None,
+        reason: SelectionReason::SelectionError(
+            "client_toolchain_unresolved: Rust toolchain selection is missing or invalid; \
+             no worker was requested. Inspect the caller's Rustup selection and project pin \
+             before retrying; a worker default is not a substitute."
+                .to_owned(),
+        ),
+        build_id: None,
+        diagnostics: None,
+    })
+}
+
 /// Query the daemon for a worker (reserves slots and opens a durable build).
 #[allow(clippy::too_many_arguments)] // Command routing query wires many independent fields.
 pub(crate) async fn query_daemon(
@@ -256,6 +291,9 @@ async fn query_daemon_with_mode(
     required_tools: &[String],
     dry_run: bool,
 ) -> anyhow::Result<SelectionResponse> {
+    if let Some(refusal) = unresolved_toolchain_refusal(toolchain, required_runtime) {
+        return Ok(refusal);
+    }
     // Mock support: RCH_MOCK_CIRCUIT_OPEN simulates all circuits open
     // This needs to be checked in the hook since the daemon may be started
     // before this environment variable is set for the test scenario.
@@ -725,6 +763,126 @@ mod daemon_io_timeout_tests {
 #[cfg(test)]
 mod bounded_ipc_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn unresolved_rust_queries_never_connect_or_create_a_queue_owner() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("selection.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        for toolchain in [
+            None,
+            Some(ToolchainInfo::new("", None, "")),
+            Some(ToolchainInfo::new("nightly bad", None, "")),
+            Some(ToolchainInfo::new("nightly\0", None, "")),
+        ] {
+            for wait in [false, true] {
+                let response = query_daemon(
+                    path.to_str().unwrap(),
+                    "project",
+                    1,
+                    "cargo build",
+                    toolchain.as_ref(),
+                    RequiredRuntime::Rust,
+                    CommandPriority::Normal,
+                    0,
+                    None,
+                    Some("unresolved-test-wrapper"),
+                    wait,
+                    &[],
+                    false,
+                    &[],
+                )
+                .await
+                .unwrap();
+                assert!(response.worker.is_none() && response.build_id.is_none());
+                assert!(matches!(
+                    response.reason,
+                    SelectionReason::SelectionError(reason)
+                        if reason.starts_with("client_toolchain_unresolved:")
+                ));
+                assert_eq!(
+                    listener.accept().unwrap_err().kind(),
+                    std::io::ErrorKind::WouldBlock,
+                    "a refusal must precede even the socket connection",
+                );
+            }
+            let response = query_daemon_dry_run(
+                path.to_str().unwrap(),
+                "project",
+                1,
+                "cargo build",
+                toolchain.as_ref(),
+                RequiredRuntime::Rust,
+                &[],
+            )
+            .await
+            .unwrap();
+            assert!(matches!(
+                response.reason,
+                SelectionReason::SelectionError(reason)
+                    if reason.starts_with("client_toolchain_unresolved:")
+            ));
+            assert_eq!(
+                listener.accept().unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+        }
+    }
+
+    #[test]
+    fn toolchain_preflight_is_rust_specific_and_does_not_rewrite_an_identity() {
+        assert!(unresolved_toolchain_refusal(None, RequiredRuntime::None).is_none());
+        for name in ["stable", "nightly-2026-08-31", "custom-with-checks"] {
+            let info = ToolchainInfo::new(name, None, "diagnostic compiler version");
+            assert!(unresolved_toolchain_refusal(Some(&info), RequiredRuntime::Rust).is_none());
+            assert_eq!(info.rustup_toolchain(), name);
+        }
+        let info = ToolchainInfo::new("nightly", Some("2026-08-31\n".into()), "");
+        assert!(unresolved_toolchain_refusal(Some(&info), RequiredRuntime::Rust).is_some());
+    }
+
+    #[tokio::test]
+    async fn resolved_rust_identity_reaches_the_real_diagnostic_request_unchanged() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("diagnostic.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let info = ToolchainInfo::new("nightly", Some("2026-08-31".into()), "selected override");
+        let expected = format!(
+            "&toolchain={}",
+            urlencoding_encode(&serde_json::to_string(&info).unwrap())
+        );
+        let server = async {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = stream.into_split();
+            let mut request = String::new();
+            BufReader::new(reader).read_line(&mut request).await.unwrap();
+            assert!(request.contains(&expected), "{request}");
+            assert!(request.contains("&runtime=rust") && request.contains("&dry_run=1"));
+            writer
+                .write_all(concat!(
+                    "HTTP/1.1 200 OK\r\n\r\n",
+                    "{\"worker\":null,\"reason\":\"no_workers_configured\"}"
+                ).as_bytes())
+                .await
+                .unwrap();
+        };
+        let client = query_daemon_dry_run(
+            path.to_str().unwrap(),
+            "project",
+            1,
+            "cargo build",
+            Some(&info),
+            RequiredRuntime::Rust,
+            &[],
+        );
+        let (response, ()) = timeout(Duration::from_secs(2), async {
+            tokio::join!(client, server)
+        })
+        .await
+        .unwrap();
+        assert_eq!(response.unwrap().reason, SelectionReason::NoWorkersConfigured);
+    }
 
     async fn caller_fixture(
         response: Vec<u8>,
