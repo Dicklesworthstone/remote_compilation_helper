@@ -516,8 +516,29 @@ fn hook_mode_panic_fail_open_enabled() -> bool {
 /// as a single argv entry; split that shell command once before re-quoting so
 /// `sh -c` sees `env VAR=... cargo ...` instead of one quoted command name.
 fn join_exec_command(command_parts: &[String]) -> String {
-    let normalized_parts = normalize_exec_command_parts(command_parts);
+    let mut normalized_parts = normalize_exec_command_parts(command_parts);
+    // `shell_words::join` quotes `FOO=1` as a whole word, and a quoted
+    // assignment is no longer an assignment: `'FOO=1' cargo test` runs a
+    // program named `FOO=1` (exit 127) on every local fallback and every
+    // non-cargo remote run. An explicit `env` keeps the assignment bytes as
+    // real argv, the same rule the Cargo token parser applies.
+    if normalized_parts
+        .first()
+        .is_some_and(|part| is_shell_assignment(part))
+    {
+        normalized_parts.insert(0, "env".to_string());
+    }
     shell_words::join(normalized_parts)
+}
+
+/// `NAME=value` where NAME is a valid POSIX shell variable name.
+pub(crate) fn is_shell_assignment(token: &str) -> bool {
+    token.split_once('=').is_some_and(|(key, _)| {
+        !key.is_empty()
+            && key.chars().enumerate().all(|(index, ch)| {
+                ch == '_' || ch.is_ascii_alphabetic() || index > 0 && ch.is_ascii_digit()
+            })
+    })
 }
 
 fn normalize_exec_command_parts(command_parts: &[String]) -> Vec<String> {

@@ -991,6 +991,41 @@ fn join_exec_command_plain_args_unchanged() {
     assert_eq!(round_trip, parts);
 }
 
+/// `rch exec -- FOO=1 cmd` must keep FOO=1 an assignment. Quoting it as a
+/// whole word made `sh` run a program named `FOO=1` (exit 127) on every local
+/// fallback and non-cargo remote run. Run the joined text through a real shell.
+#[cfg(unix)]
+#[test]
+fn join_exec_command_keeps_leading_assignments_as_assignments() {
+    let _guard = test_guard!();
+    let parts = vec![
+        "RCH_T_A=one".to_string(),
+        "RCH_T_B=two words".to_string(),
+        "sh".to_string(),
+        "-c".to_string(),
+        "printf '%s|%s' \"$RCH_T_A\" \"$RCH_T_B\"".to_string(),
+    ];
+    let joined = join_exec_command(&parts);
+    let output = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(&joined)
+        .output()
+        .expect("run sh");
+    assert!(output.status.success(), "{joined}: {output:?}");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "one|two words");
+    // The single-string form (`rch exec -- "FOO=1 cargo test"`) takes the same path.
+    let single = join_exec_command(&["RCH_T_A=1 cargo test".to_string()]);
+    assert_eq!(
+        shell_words::split(&single).expect("valid shell words"),
+        ["env", "RCH_T_A=1", "cargo", "test"]
+    );
+    // A non-assignment first word is untouched.
+    assert_eq!(
+        join_exec_command(&["=x".to_string(), "y".to_string()]),
+        shell_words::join(["=x", "y"])
+    );
+}
+
 #[test]
 fn clean_overlay_fmt_check_allowlist_is_exact_and_read_only() {
     let _guard = test_guard!();
