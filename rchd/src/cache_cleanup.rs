@@ -63,17 +63,30 @@ fn cleanup_threshold_kb(min_free_gb: u64) -> u64 {
     min_free_gb.saturating_mul(1024).saturating_mul(1024)
 }
 
-fn build_cleanup_command(escaped_base: &str, max_cache_age_hours: u64, min_free_gb: u64) -> String {
+/// Where the remote launcher publishes process records (`transfer.rs`).
+const REMOTE_RUN_ROOT: &str = "/tmp/rch-run";
+
+fn build_cleanup_command(
+    escaped_base: &str,
+    escaped_run_root: &str,
+    max_cache_age_hours: u64,
+    min_free_gb: u64,
+) -> String {
     let max_age_minutes = max_cache_age_hours.saturating_mul(60);
     let threshold_kb = cleanup_threshold_kb(min_free_gb);
     let active_grace_minutes = 5_u64;
-    // Worker-side orphan watchdog: a pgid-tracked job whose `.pgid` file is older
-    // than this AND whose process group still contains a member running this long
-    // is a stuck/orphaned build (escaped the in-session watchdog via ssh-drop or a
-    // daemon restart). 240 min is far above any legitimate test cap (default 30
-    // min), and the dual age check (file mtime + member elapsed time) prevents a
-    // reused pgid from ever matching. See transfer.rs build_id watchdog.
+    // Worker-side orphan watchdog: a job whose process record is older than
+    // this and whose recorded leader is still alive escaped the in-session
+    // watchdog (ssh drop or daemon restart). 240 min is far above any
+    // legitimate test cap (default 30 min). The shared identity helpers bind
+    // the group to worker boot and leader start time, so a reused pgid never
+    // matches. A record whose group is gone, whose leader no longer matches,
+    // or which is malformed can authorize nothing and is deleted; a failed
+    // process observation keeps it for the next cycle.
     let orphan_after_minutes = 240_u64;
+    // Run directories hold only records; an empty one untouched for a day is
+    // garbage. A launch racing its removal fails typed setup and fails over.
+    let empty_run_dir_minutes = 1440_u64;
     format!(
         "set -u; \
          base={base}; \
@@ -82,26 +95,39 @@ fn build_cleanup_command(escaped_base: &str, max_cache_age_hours: u64, min_free_
          active_grace_minutes={active_grace_minutes}; \
          orphan_after_minutes={orphan_after_minutes}; \
          if [ ! -d \"$base\" ]; then mkdir -p \"$base\"; fi; \
+         if physical=$(cd \"$base\" 2>/dev/null && pwd -P); then base=$physical; fi; \
          before_kb=$(df -Pk \"$base\" 2>/dev/null | awk 'NR==2 {{print $4}}'); \
          if [ -z \"$before_kb\" ]; then before_kb=0; fi; \
          removed=0; freed_kb=0; low_disk=0; remove_errors=0; orphans_killed=0; \
          if [ \"$before_kb\" -lt \"$threshold_kb\" ]; then low_disk=1; fi; \
-         if [ -d /tmp/rch-run ]; then \
-           for pgf in /tmp/rch-run/*/*.pgid; do \
-             [ -f \"$pgf\" ] || continue; \
-             pg=$(cat \"$pgf\" 2>/dev/null); \
-             case \"$pg\" in ''|*[!0-9]*) continue ;; esac; \
-             [ \"$pg\" -gt 1 ] || continue; \
-             [ -n \"$(find \"$pgf\" -mmin +\"$orphan_after_minutes\" -print 2>/dev/null)\" ] || continue; \
-             if ! kill -0 -\"$pg\" 2>/dev/null; then rm -f \"$pgf\" 2>/dev/null; continue; fi; \
-             oldest=$(pgrep -g \"$pg\" 2>/dev/null | while IFS= read -r p; do ps -o etimes= -p \"$p\" 2>/dev/null; done | tr -d ' ' | sort -n | tail -1); \
-             case \"$oldest\" in ''|*[!0-9]*) continue ;; esac; \
-             if [ \"$oldest\" -ge $((orphan_after_minutes * 60)) ]; then \
-               if kill -KILL -\"$pg\" 2>/dev/null; then orphans_killed=$((orphans_killed + 1)); fi; \
-               rm -f \"$pgf\" 2>/dev/null; \
-             fi; \
-           done; \
+         run_root={run_root}; \
+         if [ -d \"$run_root\" ]; then \
+           tally=$(mktemp /tmp/rch-cleanup.XXXXXX); \
+           (set -- \"$run_root\"/*/*.pgid\n{identity}\n killed=0; \
+             for pgf in \"$@\"; do \
+               [ -f \"$pgf\" ] && [ ! -L \"$pgf\" ] || continue; \
+               [ -n \"$(find \"$pgf\" -mmin +\"$orphan_after_minutes\" -print 2>/dev/null)\" ] || continue; \
+               build=${{pgf##*/}}; build=${{build%.pgid}}; verdict=stale; \
+               if rch_read_record \"$pgf\" \"$build\"; then \
+                 rch_group_state; \
+                 case $? in \
+                   0) ;; \
+                   1) if rch_signal_group KILL; then verdict=killed; fi ;; \
+                   *) verdict=unknown ;; \
+                 esac; \
+               fi; \
+               case $verdict in \
+                 stale) rm -f -- \"$pgf\" 2>/dev/null ;; \
+                 killed) killed=$((killed + 1)) ;; \
+               esac; \
+             done; \
+             echo \"$killed\") > \"$tally\" 2>/dev/null; \
+           orphans_killed=$(cat \"$tally\" 2>/dev/null); rm -f \"$tally\"; \
+           case \"$orphans_killed\" in ''|*[!0-9]*) orphans_killed=0 ;; esac; \
+           find \"$run_root\" -mindepth 1 -maxdepth 1 -type d -empty -mmin +{empty_run_dir_minutes} -exec rmdir -- {{}} + 2>/dev/null || :; \
          fi; \
+         cwds=$(mktemp /tmp/rch-cleanup.XXXXXX); \
+         find /proc -mindepth 2 -maxdepth 2 -name cwd -printf '%l\\n' 2>/dev/null > \"$cwds\" || :; \
          candidates=$(mktemp /tmp/rch-cleanup.XXXXXX); \
          if [ \"$low_disk\" -eq 1 ]; then \
            find \"$base\" -mindepth 2 -maxdepth 2 -type d -printf '%T@ %p\\n' 2>/dev/null \
@@ -115,6 +141,7 @@ fn build_cleanup_command(escaped_base: &str, max_cache_age_hours: u64, min_free_
            case \"$dir\" in \"$base\"/*) ;; *) continue ;; esac; \
            recent_active=$(find \"$dir\" -type f -mmin -\"$active_grace_minutes\" -print -quit 2>/dev/null || true); \
            if [ -n \"$recent_active\" ]; then continue; fi; \
+           if D=\"$dir\" awk 'BEGIN {{ d = ENVIRON[\"D\"] }} $0 == d || index($0, d \"/\") == 1 {{ f = 1; exit }} END {{ exit !f }}' \"$cwds\"; then continue; fi; \
            size_kb=$(du -sk \"$dir\" 2>/dev/null | awk '{{print $1}}'); \
            if [ -z \"$size_kb\" ]; then size_kb=0; fi; \
          if rm -rf \"$dir\" 2>/dev/null; then \
@@ -141,16 +168,19 @@ fn build_cleanup_command(escaped_base: &str, max_cache_age_hours: u64, min_free_
              if [ -n \"$current_kb\" ] && [ \"$current_kb\" -ge \"$threshold_kb\" ]; then break; fi; \
            fi; \
          done < \"$candidates\"; \
-         rm -f \"$candidates\"; \
+         rm -f \"$candidates\" \"$cwds\"; \
          after_kb=$(df -Pk \"$base\" 2>/dev/null | awk 'NR==2 {{print $4}}'); \
          if [ -z \"$after_kb\" ]; then after_kb=0; fi; \
          printf 'RCH_CLEANUP_METRICS removed=%s freed_kb=%s before_kb=%s after_kb=%s low_disk=%s remove_errors=%s orphans_killed=%s\\n' \"$removed\" \"$freed_kb\" \"$before_kb\" \"$after_kb\" \"$low_disk\" \"$remove_errors\" \"$orphans_killed\"; \
          if [ \"$remove_errors\" -gt 0 ]; then exit 1; fi",
         base = escaped_base,
+        run_root = escaped_run_root,
         max_age_minutes = max_age_minutes,
         threshold_kb = threshold_kb,
         active_grace_minutes = active_grace_minutes,
         orphan_after_minutes = orphan_after_minutes,
+        empty_run_dir_minutes = empty_run_dir_minutes,
+        identity = rch_common::REMOTE_PROCESS_IDENTITY_SCRIPT,
     )
 }
 
@@ -399,11 +429,15 @@ impl CacheCleanupScheduler {
         let remote_base = &self.config.remote_base;
         let escaped_base = rch_common::ssh_utils::shell_escape_path_with_home(remote_base)
             .ok_or_else(|| anyhow::anyhow!("Invalid remote_base: contains control characters"))?;
-        let cleanup_cmd = build_cleanup_command(
+        let cleanup_script = build_cleanup_command(
             escaped_base.as_ref(),
+            REMOTE_RUN_ROOT,
             self.config.max_cache_age_hours,
             self.config.min_free_gb,
         );
+        // The worker's login shell may be zsh, which neither word-splits nor
+        // tolerates unmatched globs the way the POSIX script expects.
+        let cleanup_cmd = format!("sh -c {}", shell_escape::escape(cleanup_script.into()));
 
         // Execute cleanup via SSH (pooled warm master when available).
         let result = self.run_remote(&config, &cleanup_cmd).await?;
@@ -1124,7 +1158,7 @@ mod tests {
     #[test]
     fn test_build_cleanup_command_contains_threshold_and_marker() {
         let _guard = test_guard!();
-        let command = build_cleanup_command("'/tmp/rch'", 72, 10);
+        let command = build_cleanup_command("'/tmp/rch'", REMOTE_RUN_ROOT, 72, 10);
         assert!(command.contains("threshold_kb=10485760"));
         assert!(command.contains("active_grace_minutes=5"));
         assert!(command.contains("-mmin -\"$active_grace_minutes\""));
@@ -1137,38 +1171,125 @@ mod tests {
         assert!(command.contains("remove_errors"));
     }
 
+    /// Backdate a file far past the 240-minute orphan threshold.
+    fn age_record(path: &std::path::Path) {
+        let backdated = std::time::SystemTime::now() - std::time::Duration::from_secs(5 * 3600);
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .expect("open record")
+            .set_modified(backdated)
+            .expect("backdate record");
+    }
+
+    /// Stale records (malformed, or naming a group with no members) are
+    /// deleted; fresh ones are kept; an empty run dir is removed only once
+    /// it is a day old.
     #[test]
-    fn test_build_cleanup_command_orphan_sweeper_guards() {
-        // The worker-side orphan sweeper must reap stuck pgid groups but be
-        // hardened against pgid reuse and against ever touching pid 0/1.
+    fn cleanup_command_deletes_stale_process_records_only() {
         let _guard = test_guard!();
-        let command = build_cleanup_command("'/tmp/rch'", 72, 10);
-        // Threshold wired (240 min).
-        assert!(command.contains("orphan_after_minutes=240"));
-        // Scans only the fixed run-dir.
-        assert!(command.contains("for pgf in /tmp/rch-run/*/*.pgid"));
-        // pgid must be all-digits and > 1 (never signal pid 0/1 / "kill -- -1").
-        assert!(command.contains("case \"$pg\" in ''|*[!0-9]*) continue ;; esac"));
-        assert!(command.contains("[ \"$pg\" -gt 1 ] || continue"));
-        // Only sweep files older than the threshold.
-        assert!(command.contains("-mmin +\"$orphan_after_minutes\""));
-        // Liveness check before kill; clean up dead-group files (no `--`: dash).
-        assert!(command.contains("kill -0 -\"$pg\""));
-        // Reuse guard: a group member must actually have been running that long.
-        assert!(command.contains("pgrep -g \"$pg\""));
-        assert!(command.contains("ps -o etimes= -p \"$p\""));
-        assert!(command.contains("[ \"$oldest\" -ge $((orphan_after_minutes * 60)) ]"));
-        // The actual group kill + accounting (no `--`: broken in dash).
-        assert!(command.contains("kill -KILL -\"$pg\""));
-        assert!(!command.contains("kill -KILL -- -"));
-        assert!(command.contains("orphans_killed=$((orphans_killed + 1))"));
-        assert!(command.contains("orphans_killed=%s"));
+        let base = tempfile::tempdir().expect("base");
+        let runs = tempfile::tempdir().expect("run root");
+        let run = runs.path().join("project-0123456789abcdef");
+        std::fs::create_dir(&run).expect("run dir");
+        let malformed = run.join("41.pgid");
+        std::fs::write(&malformed, "garbage\n").expect("malformed");
+        age_record(&malformed);
+        // Legacy bare pgid of a group that cannot exist (above pid_max).
+        let vanished = run.join("42.pgid");
+        std::fs::write(&vanished, "2147483000\n").expect("vanished");
+        age_record(&vanished);
+        let fresh = run.join("43.pgid");
+        std::fs::write(&fresh, "garbage\n").expect("fresh");
+        let empty_old = runs.path().join("empty-old");
+        std::fs::create_dir(&empty_old).expect("empty old");
+        std::fs::File::open(&empty_old)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 86400))
+            .unwrap();
+        let empty_new = runs.path().join("empty-new");
+        std::fs::create_dir(&empty_new).expect("empty new");
+
+        let (stdout, stderr, code) = run_sweep_with_runs(base.path(), runs.path(), &[]);
+        assert_eq!(code, Some(0), "{stdout}{stderr}");
+        assert!(stdout.contains("orphans_killed=0"), "{stdout}");
+        assert!(
+            !malformed.exists() && !vanished.exists(),
+            "stale records remain"
+        );
+        assert!(
+            fresh.exists(),
+            "a record younger than the threshold was touched"
+        );
+        assert!(!empty_old.exists(), "day-old empty run dir must go");
+        assert!(
+            empty_new.exists() && run.exists(),
+            "live run dirs must stay"
+        );
+    }
+
+    /// A live group whose recorded leader matches is killed; the identity
+    /// check comes from the launcher's own record format.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cleanup_command_kills_identified_orphan_group() {
+        use std::os::unix::process::ExitStatusExt;
+        let _guard = test_guard!();
+        let base = tempfile::tempdir().expect("base");
+        let runs = tempfile::tempdir().expect("run root");
+        let run = runs.path().join("project-0123456789abcdef");
+        std::fs::create_dir(&run).expect("run dir");
+        let record = run.join("77.pgid");
+        let launcher = format!(
+            "{}\nrch_remote_record \"$1\" 77 || exit 9\nexec sleep 600",
+            rch_common::REMOTE_PROCESS_IDENTITY_SCRIPT
+        );
+        let mut leader = std::process::Command::new("setsid")
+            .args(["sh", "-c", &launcher, "rch-test"])
+            .arg(&record)
+            .spawn()
+            .expect("spawn orphan");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !record.exists() {
+            assert!(Instant::now() < deadline, "launcher never published");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        age_record(&record);
+
+        let (stdout, stderr, code) = run_sweep_with_runs(base.path(), runs.path(), &[]);
+        let status = leader.wait().expect("reap leader");
+        assert_eq!(code, Some(0), "{stdout}{stderr}");
+        assert!(stdout.contains("orphans_killed=1"), "{stdout}{stderr}");
+        assert_eq!(status.signal(), Some(9));
+    }
+
+    /// The sweep (both modes share the loop) must not delete a directory a
+    /// live process works in, even when nothing in it was written recently.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cleanup_command_keeps_directory_used_as_process_cwd() {
+        let _guard = test_guard!();
+        let base = tempfile::tempdir().expect("base");
+        let pool = base.path().join("repo").join(".rch-target-pool-busy");
+        std::fs::create_dir_all(pool.join("deps")).expect("pool tree");
+        age_dir(&pool);
+        let mut worker = std::process::Command::new("sleep")
+            .arg("600")
+            .current_dir(pool.join("deps"))
+            .spawn()
+            .expect("spawn cwd holder");
+        let (stdout, _stderr, code) = run_sweep(base.path(), &[]);
+        worker.kill().expect("kill cwd holder");
+        worker.wait().expect("reap cwd holder");
+        assert_eq!(code, Some(0));
+        assert!(stdout.contains("removed=0"), "{stdout}");
+        assert!(pool.is_dir(), "in-use pool was deleted");
     }
 
     #[test]
     fn test_build_cleanup_command_reconciles_failed_rm_and_reports_diagnostics() {
         let _guard = test_guard!();
-        let command = build_cleanup_command("'/tmp/rch'", 72, 10);
+        let command = build_cleanup_command("'/tmp/rch'", REMOTE_RUN_ROOT, 72, 10);
         // bd-kwvy8: a nonzero rm does NOT mean nothing was reaped. A
         // candidate that is already gone was reaped by another writer —
         // count it.
@@ -1216,9 +1337,19 @@ mod tests {
         base: &std::path::Path,
         prepend_path: &[std::path::PathBuf],
     ) -> (String, String, Option<i32>) {
+        // Never let a test sweep the host's real process records.
+        let runs = tempfile::tempdir().expect("run root");
+        run_sweep_with_runs(base, runs.path(), prepend_path)
+    }
+
+    fn run_sweep_with_runs(
+        base: &std::path::Path,
+        runs: &std::path::Path,
+        prepend_path: &[std::path::PathBuf],
+    ) -> (String, String, Option<i32>) {
         use std::env::{join_paths, split_paths};
         let escaped = format!("'{}'", base.display());
-        let command = build_cleanup_command(&escaped, 0, 0);
+        let command = build_cleanup_command(&escaped, &format!("'{}'", runs.display()), 0, 0);
         let mut full_path: Vec<std::path::PathBuf> = prepend_path.to_vec();
         full_path.extend(split_paths(&std::env::var_os("PATH").unwrap_or_default()));
         let output = std::process::Command::new("sh")
