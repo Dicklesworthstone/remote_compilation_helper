@@ -542,8 +542,17 @@ impl RecoverySession {
                 destination.display()
             );
             let parent = destination.parent().context("output missing parent")?;
+            // Only components BELOW the phase root can redirect a write out of
+            // the output tree. The root itself is the caller's choice and may
+            // legitimately sit behind system symlinks (macOS `/tmp` →
+            // `/private/tmp`, `$TMPDIR` under `/var` → `/private/var`, a
+            // symlinked `/data`); walking up to `/` rejected every such build
+            // after its remote compile had already succeeded.
             let mut ancestor = Some(parent);
             while let Some(path) = ancestor {
+                if path == phase.local.as_path() || !path.starts_with(&phase.local) {
+                    break;
+                }
                 if let Ok(metadata) = std::fs::symlink_metadata(path) {
                     anyhow::ensure!(
                         !metadata.file_type().is_symlink(),
@@ -1079,6 +1088,38 @@ mod tests {
             b"this job's output"
         );
         assert!(session.recipe.phases[0].complete);
+    }
+
+    /// The output root may sit behind system symlinks (macOS `/tmp`, `/var`,
+    /// a symlinked `/data`): publication must accept that root, while a
+    /// symlink BELOW it, which could redirect a write, is still refused.
+    #[cfg(unix)]
+    #[test]
+    fn publication_accepts_symlinked_root_but_refuses_symlinks_inside_it() {
+        let (directory, _stage_owner, mut session) = publication_fixture();
+        let real = directory.path().join("real-target");
+        std::fs::create_dir(&real).unwrap();
+        let link = directory.path().join("linked-target");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        session.recipe.phases[0].local = link;
+        let stage = session.stage(0);
+        std::fs::create_dir(stage.join("build")).unwrap();
+        std::fs::write(stage.join("build/app"), b"output").unwrap();
+        session.persist().unwrap();
+        session.publish("project").unwrap();
+        assert_eq!(std::fs::read(real.join("build/app")).unwrap(), b"output");
+
+        let (directory, _stage_owner, mut session) = publication_fixture();
+        let local = session.recipe.project_root.clone();
+        let elsewhere = directory.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, local.join("build")).unwrap();
+        let stage = session.stage(0);
+        std::fs::create_dir(stage.join("build")).unwrap();
+        std::fs::write(stage.join("build/app"), b"output").unwrap();
+        session.persist().unwrap();
+        assert!(session.publish("project").is_err());
+        assert!(!elsewhere.join("app").exists());
     }
 
     #[test]
