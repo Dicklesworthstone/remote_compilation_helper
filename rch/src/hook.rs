@@ -332,13 +332,10 @@ async fn quarantine_worker_on_unverified_timeout_cleanup(
         ErrorCode::SshTimeout.code_string(),
         timeout_err.detail
     ));
-    if let Err(error) = disable_worker_for_fault(
-        socket_path,
-        worker_id,
-        "e104-timeout-orphan-unverified: remote build process group not verified dead after client timeout; possible orphan holding the project's Cargo target lock",
-    )
-    .await
-    {
+    // With evidence, rchd re-runs this build's kill probe and clears the
+    // quarantine once the group is verified dead (bd-g8m4g).
+    let reason = rch_common::orphan_quarantine::quarantine_reason(timeout_err.evidence.as_ref());
+    if let Err(error) = disable_worker_for_fault(socket_path, worker_id, &reason).await {
         warn!(
             "Failed to quarantine worker {} after unverified E104 cleanup: {}",
             worker_id, error

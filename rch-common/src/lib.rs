@@ -50,6 +50,7 @@ pub mod log_retention;
 pub mod logging;
 pub mod mock;
 pub mod mock_worker;
+pub mod orphan_quarantine;
 pub mod path_topology;
 pub mod patterns;
 #[cfg(test)]

@@ -678,6 +678,10 @@ pub struct SshCommandTimedOut {
     pub cleanup: RemoteTimeoutCleanup,
     /// Human-readable detail for logs/summaries.
     pub detail: String,
+    /// Where the build's process-group record lives, so the daemon can re-run
+    /// the kill probe later and clear an E104 quarantine on verified death
+    /// (bd-g8m4g). `None` when no record exists (Windows, mock, no build id).
+    pub evidence: Option<rch_common::orphan_quarantine::QuarantineEvidence>,
 }
 
 impl std::fmt::Display for SshCommandTimedOut {
@@ -760,15 +764,8 @@ pub(crate) struct SyncSilencePolicy {
 /// mishandles `kill -KILL -- -PGID` (same constraint as the in-session
 /// watchdog and the daemon kill path in `rchd::cancellation`).
 pub(crate) fn remote_timeout_kill_script(pgid_file: &str, build_id: u64) -> String {
-    let escaped_file = escape(Cow::from(pgid_file));
-    format!(
-        "f={escaped_file}\n\
-         {identity}\n\
-         if rch_remote_cancel \"$f\" {build_id} kill; then\n\
-         echo RCH_E104_KILL=verified_dead\n\
-         else echo RCH_E104_KILL=still_alive; fi\n",
-        identity = rch_common::REMOTE_PROCESS_IDENTITY_SCRIPT,
-    )
+    // Shared with rchd, which re-runs the same probe to clear a quarantine.
+    rch_common::orphan_quarantine::kill_probe_script(pgid_file, build_id)
 }
 
 /// Removes every file the durable supervisor writes beside `path`; the claim
@@ -5215,10 +5212,25 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
                     "SSH command timed out after {:?} on {}; remote cleanup: {} ({})",
                     command_timeout, worker.id, cleanup, detail
                 );
+                let evidence = (!self.worker_platform.is_windows()
+                    && !use_mock_transport(worker))
+                .then(|| {
+                    self.build_id.map(|build_id| {
+                        rch_common::orphan_quarantine::QuarantineEvidence {
+                            build_id,
+                            pgid_file: Self::remote_pgid_file_path_for_root(
+                                &self.remote_path(),
+                                build_id,
+                            ),
+                        }
+                    })
+                })
+                .flatten();
                 return Err(SshCommandTimedOut {
                     timeout: command_timeout,
                     cleanup,
                     detail,
+                    evidence,
                 }
                 .into());
             }
@@ -11896,6 +11908,7 @@ fn main() {
             timeout: std::time::Duration::from_secs(1800),
             cleanup: RemoteTimeoutCleanup::Unverified,
             detail: "kill probe timed out".to_string(),
+            evidence: None,
         };
         let text = err.to_string();
         assert!(text.starts_with("SSH command timed out after"));

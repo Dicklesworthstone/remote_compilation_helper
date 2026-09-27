@@ -11165,6 +11165,7 @@ fn ssh_timeout_unverified_cleanup_detection() {
         timeout: std::time::Duration::from_secs(1800),
         cleanup: RemoteTimeoutCleanup::Unverified,
         detail: "kill probe timed out".to_string(),
+        evidence: None,
     }
     .into();
     // Also through an added context layer, as the pipeline surfaces it.
@@ -11177,6 +11178,7 @@ fn ssh_timeout_unverified_cleanup_detection() {
         timeout: std::time::Duration::from_secs(1800),
         cleanup: RemoteTimeoutCleanup::Verified,
         detail: "remote process group SIGKILLed and verified dead".to_string(),
+        evidence: None,
     }
     .into();
     assert!(ssh_timeout_with_unverified_cleanup(&verified).is_none());
