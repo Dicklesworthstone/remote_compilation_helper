@@ -418,18 +418,6 @@ fn log_reap_audit(worker_id: &WorkerId, stdout: &str) {
 mod tests {
     use super::*;
 
-    /// Run a generated sweep script under `sh` with `TMPDIR` pointed at a
-    /// directory private to this test's fixture.
-    ///
-    /// The sweep also scans the worker's tmp base (`$TMPDIR`, resolved into
-    /// `$__tmpscan`) for reap-class dirs. Every `tempdir()` fixture lives under
-    /// the inherited `TMPDIR`, so with it inherited each test's sweep sees —
-    /// and reaps — the fixtures of every OTHER test running in parallel (on
-    /// rch workers `TMPDIR` is the in-workspace `.rch-tmp`, and the suite
-    /// failed there on exactly that cross-talk). A private base is also what
-    /// a real worker has: one tmp base per daemon, not one shared with
-    /// strangers. It sits beside the fixture's `projects/` so the tmp-base
-    /// pass scans only this test's own tree.
     /// The production sweep bound to an empty registry under the fixture.
     /// Offloaded, the fixture lives inside the source root this very test
     /// build claimed in the worker's real registry, so every candidate
@@ -451,6 +439,18 @@ mod tests {
         )
     }
 
+    /// Run a generated sweep script under `sh` with `TMPDIR` pointed at a
+    /// directory private to this test's fixture.
+    ///
+    /// The sweep also scans the worker's tmp base (`$TMPDIR`, resolved into
+    /// `$__tmpscan`) for reap-class dirs. Every `tempdir()` fixture lives under
+    /// the inherited `TMPDIR`, so with it inherited each test's sweep sees —
+    /// and reaps — the fixtures of every OTHER test running in parallel (on
+    /// rch workers `TMPDIR` is the in-workspace `.rch-tmp`, and the suite
+    /// failed there on exactly that cross-talk). A private base is also what
+    /// a real worker has: one tmp base per daemon, not one shared with
+    /// strangers. It sits beside the fixture's `projects/` so the tmp-base
+    /// pass scans only this test's own tree.
     fn run_sweep(cmd: &str, fixture_root: &std::path::Path) -> std::process::Output {
         let private_tmp = fixture_root.join("tmp");
         std::fs::create_dir_all(&private_tmp).expect("create private TMPDIR");

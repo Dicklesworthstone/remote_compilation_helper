@@ -963,9 +963,6 @@ pub async fn drain(
     }
 }
 
-/// Return workers drained for a deploy to routing. Best-effort: a failure is
-/// logged, because the deploy outcome is already decided and the operator can
-/// re-run `rch workers enable`.
 /// Targets that are already out of routing (draining, drained, disabled)
 /// before the deploy touches them.
 fn operator_held_workers(
@@ -982,6 +979,9 @@ fn operator_held_workers(
         .collect()
 }
 
+/// Return workers drained for a deploy to routing. Best-effort: a failure is
+/// logged, because the deploy outcome is already decided and the operator can
+/// re-run `rch workers enable`.
 async fn re_enable_workers(workers: &[String]) {
     for id in workers {
         if let Err(error) = crate::status_display::enable_worker(id).await {
