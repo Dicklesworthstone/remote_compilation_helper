@@ -157,16 +157,32 @@ pub struct ActiveBuildCleanup {
     context: DaemonContext,
 }
 
+/// Owns the task that can cancel builds, not the unrelated worker-pruning task.
+/// A plain JoinHandle allowed shutdown to stop the wrong background service.
+/// Keep this type distinct so that mistake cannot satisfy the shutdown API.
+#[must_use = "retain the active-build cleanup task until daemon shutdown"]
+pub struct ActiveBuildCleanupTask {
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for ActiveBuildCleanupTask {
+    fn drop(&mut self) {
+        // Early startup failure or an abandoned shutdown future must not
+        // detach the observer. Normal shutdown also joins it below.
+        self.task.abort();
+    }
+}
+
 /// Join the cancellation task before any potentially slow shutdown work.
 /// Once socket admission ends, missed heartbeats are no longer evidence that
 /// a client or its worker has stopped making progress.
 pub async fn stop_before_shutdown(
-    cleanup_handle: &mut Option<tokio::task::JoinHandle<()>>,
+    cleanup_handle: &mut Option<ActiveBuildCleanupTask>,
     shutdown: impl std::future::Future<Output = ()>,
 ) {
-    if let Some(handle) = cleanup_handle.take() {
-        handle.abort();
-        if let Err(error) = handle.await
+    if let Some(mut handle) = cleanup_handle.take() {
+        handle.task.abort();
+        if let Err(error) = (&mut handle.task).await
             && !error.is_cancelled()
         {
             warn!(%error, "Cleanup task failed while stopping daemon");
@@ -180,16 +196,18 @@ impl ActiveBuildCleanup {
         Self { context }
     }
 
-    pub fn start(self) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(async move {
-            let mut ticker = interval(Duration::from_secs(5));
-            ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-            let mut observation = ObservationWindow::default();
-            loop {
-                ticker.tick().await;
-                self.check_active_builds_observed(&mut observation).await;
-            }
-        })
+    pub fn start(self) -> ActiveBuildCleanupTask {
+        ActiveBuildCleanupTask {
+            task: tokio::spawn(async move {
+                let mut ticker = interval(Duration::from_secs(5));
+                ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+                let mut observation = ObservationWindow::default();
+                loop {
+                    ticker.tick().await;
+                    self.check_active_builds_observed(&mut observation).await;
+                }
+            }),
+        }
     }
 
     #[cfg(test)]
@@ -353,6 +371,68 @@ mod tests {
     use proptest::prelude::*;
     use rch_common::BuildHeartbeatPhase;
     use rch_common::test_guard;
+
+    #[tokio::test]
+    async fn dropping_cleanup_task_cancels_actual_background_observer() {
+        let context = crate::test_daemon_context(crate::workers::WorkerPool::new());
+        let history = std::sync::Arc::downgrade(&context.history);
+        let task = ActiveBuildCleanup::new(context).start();
+        tokio::task::yield_now().await;
+        assert!(history.upgrade().is_some(), "running observer owns its context");
+        drop(task);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while history.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropping the handle must cancel, not detach, the real observer");
+    }
+
+    #[tokio::test]
+    async fn shutdown_joins_active_cleanup_not_unrelated_maintenance() {
+        let context = crate::test_daemon_context(crate::workers::WorkerPool::new());
+        let history = std::sync::Arc::downgrade(&context.history);
+        let mut cleanup = Some(ActiveBuildCleanup::new(context).start());
+        let maintenance = tokio::spawn(std::future::pending::<()>());
+        tokio::task::yield_now().await;
+        assert!(history.upgrade().is_some());
+        stop_before_shutdown(&mut cleanup, async {
+            assert!(history.upgrade().is_none(), "join before polling shutdown work");
+            assert!(!maintenance.is_finished(), "do not substitute another task");
+        })
+        .await;
+        assert!(cleanup.is_none());
+        // A repeated stop still performs the caller's shutdown work.
+        let mut ran = false;
+        stop_before_shutdown(&mut cleanup, async { ran = true }).await;
+        assert!(ran);
+        maintenance.abort();
+        assert!(maintenance.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn abandoning_slow_shutdown_cannot_leave_cleanup_running() {
+        let context = crate::test_daemon_context(crate::workers::WorkerPool::new());
+        let history = std::sync::Arc::downgrade(&context.history);
+        let mut cleanup = Some(ActiveBuildCleanup::new(context).start());
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let mut stopping = Box::pin(stop_before_shutdown(&mut cleanup, async move {
+            entered_tx.send(()).unwrap();
+            std::future::pending::<()>().await;
+        }));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::select! {
+                _ = &mut stopping => panic!("slow shutdown must still be pending"),
+                result = entered_rx => result.expect("shutdown work entered"),
+            }
+        })
+        .await
+        .expect("cleanup must finish before entering slow shutdown work");
+        drop(stopping);
+        assert!(cleanup.is_none());
+        assert!(history.upgrade().is_none(), "observer cannot survive abandoned shutdown");
+    }
 
     #[test]
     fn observer_normal_cadence_and_cold_start_preserve_stuck_decisions() {

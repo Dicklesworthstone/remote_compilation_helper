@@ -1294,9 +1294,10 @@ async fn main() -> Result<()> {
         admission_barrier: Arc::new(RwLock::new(false)),
     };
 
-    // Start active build cleanup background task
+    // Retain the cancellation task separately from the worker-pruning task.
+    // Its typed handle must be joined before shutdown stops receiving heartbeats.
     let active_cleanup = cleanup::ActiveBuildCleanup::new(context.clone());
-    let _active_cleanup_handle = active_cleanup.start();
+    let mut active_cleanup_handle = Some(active_cleanup.start());
 
     let worker_status_panel = Arc::new(Mutex::new(
         WorkerStatusPanel::new()
@@ -1690,7 +1691,7 @@ async fn main() -> Result<()> {
     // The accept loop has stopped, so clients can no longer refresh heartbeats.
     // Stop cancellation before awaiting health probes: a slow probe must not
     // turn a still-running client's quiet build into a false stuck-job signal.
-    cleanup::stop_before_shutdown(&mut cleanup_handle, async {
+    cleanup::stop_before_shutdown(&mut active_cleanup_handle, async {
         info!("Stopping health monitor...");
         health_monitor.stop().await;
         let _ = health_handle.await;
@@ -1702,6 +1703,9 @@ async fn main() -> Result<()> {
     // Abort background tasks that have no cancellation mechanism
     info!("Stopping background tasks...");
     if let Some(handle) = metrics_handle {
+        handle.abort();
+    }
+    if let Some(handle) = cleanup_handle {
         handle.abort();
     }
 
