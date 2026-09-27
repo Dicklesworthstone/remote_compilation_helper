@@ -343,7 +343,9 @@ pub fn evaluate_pressure_policy(
     let disk_free_gb = capabilities.disk_free_gb;
     let disk_total_gb = capabilities.disk_total_gb;
     let disk_free_ratio = match (disk_free_gb, disk_total_gb) {
-        (Some(free), Some(total)) if total > 0.0 => Some((free / total).clamp(0.0, 1.0)),
+        (Some(free), Some(total)) if total > 0.0 && free.is_finite() => {
+            Some((free / total).clamp(0.0, 1.0))
+        }
         _ => None,
     };
 
@@ -365,8 +367,10 @@ pub fn evaluate_pressure_policy(
             .map(|disk| disk.max_io_utilization_pct)
     });
 
+    // A zero or non-finite reading is a failed probe, not a full disk: it
+    // must not classify as critical via a defaulted 0.0 ratio.
     let (state, confidence, reason_code, policy_rule) =
-        if disk_free_gb.is_none() || disk_total_gb.is_none() {
+        if disk_free_ratio.is_none() || disk_total_gb.is_some_and(|total| !total.is_finite()) {
             (
                 PressureState::TelemetryGap,
                 PressureConfidence::Low,
@@ -879,5 +883,18 @@ mod tests {
         assert_eq!(result.state, PressureState::TelemetryGap);
         assert_eq!(result.confidence, PressureConfidence::Low);
         assert_eq!(result.reason_code, "disk_metrics_unavailable");
+    }
+
+    #[test]
+    fn pressure_policy_treats_zero_total_or_nan_free_as_a_telemetry_gap() {
+        let cfg = DiskPressurePolicyConfig::default();
+        for (free, total) in [(10.0, 0.0), (f64::NAN, 100.0), (10.0, f64::NAN)] {
+            let mut caps = WorkerCapabilities::new();
+            caps.disk_free_gb = Some(free);
+            caps.disk_total_gb = Some(total);
+            let result = evaluate_pressure_policy(&caps, None, &cfg);
+            assert_eq!(result.state, PressureState::TelemetryGap, "{free}/{total}");
+            assert_eq!(result.reason_code, "disk_metrics_unavailable");
+        }
     }
 }
