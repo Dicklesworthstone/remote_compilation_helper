@@ -105,7 +105,8 @@ impl ExecutionLease {
     }
 
     fn live(&mut self, now: Instant) -> bool {
-        self.own_millis(now).is_some_and(|millis| self.lease.live(millis).is_ok())
+        self.own_millis(now)
+            .is_some_and(|millis| self.lease.live(millis).is_ok())
     }
 }
 
@@ -143,16 +144,26 @@ impl ExecutionControl {
         now: Instant,
     ) -> io::Result<Self> {
         if timeout.is_zero() {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "zero execution timeout"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "zero execution timeout",
+            ));
         }
         let deadline = now.checked_add(timeout).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "execution timeout overflow")
         })?;
-        let lease = lease.map(|(identity, ttl_ms)| {
-            RequestExecutionLease::new(identity, ttl_ms, 0)
-                .map(|lease| ExecutionLease { origin: now, lease })
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, format!("execution lease: {error:?}")))
-        }).transpose()?;
+        let lease = lease
+            .map(|(identity, ttl_ms)| {
+                RequestExecutionLease::new(identity, ttl_ms, 0)
+                    .map(|lease| ExecutionLease { origin: now, lease })
+                    .map_err(|error| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!("execution lease: {error:?}"),
+                        )
+                    })
+            })
+            .transpose()?;
         Ok(Self {
             state: Arc::new(AtomicU8::new(RUNNING)),
             deadline,
@@ -166,7 +177,8 @@ impl ExecutionControl {
     /// Request a stop. False means another stop or completion already won.
     pub fn cancel(&self, reason: StopReason) -> bool {
         let mut lease = self.lease.lock().unwrap_or_else(|e| e.into_inner());
-        let accepted = self.state
+        let accepted = self
+            .state
             .compare_exchange(RUNNING, reason as u8, Ordering::AcqRel, Ordering::Acquire)
             .is_ok();
         if accepted && let Some(lease) = lease.as_mut() {
@@ -182,7 +194,11 @@ impl ExecutionControl {
         self.observe_reason(&mut lease, Instant::now())
     }
 
-    fn observe_reason(&self, lease: &mut Option<ExecutionLease>, now: Instant) -> Option<StopReason> {
+    fn observe_reason(
+        &self,
+        lease: &mut Option<ExecutionLease>,
+        now: Instant,
+    ) -> Option<StopReason> {
         if self.state.load(Ordering::Acquire) == RUNNING {
             let reason = if now >= self.deadline {
                 Some(StopReason::DeadlineExceeded)
@@ -208,16 +224,27 @@ impl ExecutionControl {
         self.renew_lease_at(&mut lease, sequence, Instant::now())
     }
 
-    fn renew_lease_at(&self, lease: &mut Option<ExecutionLease>, sequence: u64, now: Instant) -> bool {
-        if self.observe_reason(lease, now).is_some() || self.state.load(Ordering::Acquire) != RUNNING {
+    fn renew_lease_at(
+        &self,
+        lease: &mut Option<ExecutionLease>,
+        sequence: u64,
+        now: Instant,
+    ) -> bool {
+        if self.observe_reason(lease, now).is_some()
+            || self.state.load(Ordering::Acquire) != RUNNING
+        {
             return false;
         }
-        let Some(lease) = lease.as_mut() else { return false; };
+        let Some(lease) = lease.as_mut() else {
+            return false;
+        };
         let identity = *lease.lease.identity();
-        let renewed = lease.own_millis(now)
+        let renewed = lease
+            .own_millis(now)
             .is_some_and(|millis| lease.lease.renew(&identity, sequence, millis).is_ok());
         if !renewed && lease.lease.is_closed() {
-            self.state.store(StopReason::LeaseExpired as u8, Ordering::Release);
+            self.state
+                .store(StopReason::LeaseExpired as u8, Ordering::Release);
         }
         renewed
     }
@@ -236,7 +263,10 @@ impl ExecutionControl {
     /// Whether the owner requested readable output as well as digests.
     #[must_use]
     pub fn output_capture_requested(&self) -> bool {
-        self.output.lock().unwrap_or_else(|e| e.into_inner()).requested
+        self.output
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .requested
     }
 
     /// Attach a complete capture (or a precise capture failure) exactly once.
@@ -254,7 +284,11 @@ impl ExecutionControl {
     }
 
     fn take_outputs(&self) -> Option<Result<CapturedOutputs, String>> {
-        self.output.lock().unwrap_or_else(|e| e.into_inner()).result.take()
+        self.output
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .result
+            .take()
     }
 
     /// Configure the exact artifact declaration before the executor starts.
@@ -271,20 +305,32 @@ impl ExecutionControl {
     /// The validated contract used to construct the canonical output mount.
     #[must_use]
     pub fn artifact_plan(&self) -> Option<ArtifactPlan> {
-        self.artifacts.lock().unwrap_or_else(|e| e.into_inner()).plan.clone()
+        self.artifacts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .plan
+            .clone()
     }
 
     /// Retain a complete offer or its capture failure, bound to this execution's
     /// declaration. The result frontier independently rejects missing artifacts.
     pub fn retain_artifacts(&self, capture: Result<CapturedArtifacts, String>) -> io::Result<()> {
         let mut artifacts = self.artifacts.lock().unwrap_or_else(|e| e.into_inner());
-        if artifacts.plan.is_none() || artifacts.result.is_some()
+        if artifacts.plan.is_none()
+            || artifacts.result.is_some()
             || self.state.load(Ordering::Acquire) & FINISHED != 0
         {
-            return Err(io::Error::other("artifact capture not requested or already completed"));
+            return Err(io::Error::other(
+                "artifact capture not requested or already completed",
+            ));
         }
-        if capture.as_ref().is_ok_and(|bundle| Some(bundle.plan()) != artifacts.plan.as_ref()) {
-            return Err(io::Error::other("artifact capture does not match declaration"));
+        if capture
+            .as_ref()
+            .is_ok_and(|bundle| Some(bundle.plan()) != artifacts.plan.as_ref())
+        {
+            return Err(io::Error::other(
+                "artifact capture does not match declaration",
+            ));
         }
         artifacts.result = Some(capture);
         Ok(())
@@ -343,8 +389,12 @@ fn complete_result(
         result.exit_code = reason.exit_code();
     }
     let outputs = match control.take_outputs() {
-        Some(Ok(outputs)) if outputs.stdout.sha256() == result.stdout_sha256
-            && outputs.stderr.sha256() == result.stderr_sha256 => Some(outputs),
+        Some(Ok(outputs))
+            if outputs.stdout.sha256() == result.stdout_sha256
+                && outputs.stderr.sha256() == result.stderr_sha256 =>
+        {
+            Some(outputs)
+        }
         Some(Ok(_)) => return Err("output capture does not match result digests".to_owned()),
         Some(Err(error)) => return Err(format!("output capture failed: {error}")),
         None if control.output_capture_requested() && result.executed => {
@@ -354,11 +404,15 @@ fn complete_result(
     };
     let mut capture = control.artifacts.lock().unwrap_or_else(|e| e.into_inner());
     let captured = capture.result.take();
-    let artifacts = if capture.plan.is_some() && result.executed && result.exit_code == 0
+    let artifacts = if capture.plan.is_some()
+        && result.executed
+        && result.exit_code == 0
         && stop_reason.is_none()
     {
         match captured {
-            Some(Ok(artifacts)) if Some(artifacts.plan()) == capture.plan.as_ref() => Some(artifacts),
+            Some(Ok(artifacts)) if Some(artifacts.plan()) == capture.plan.as_ref() => {
+                Some(artifacts)
+            }
             Some(Ok(_)) => return Err("artifact capture does not match declaration".to_owned()),
             Some(Err(error)) => return Err(format!("artifact capture failed: {error}")),
             None => return Err("executor omitted requested artifact capture".to_owned()),
@@ -368,7 +422,12 @@ fn complete_result(
         // them before cancellation won. Diagnostics remain available separately.
         None
     };
-    Ok(ExecutionCompletion { result, stop_reason, outputs, artifacts })
+    Ok(ExecutionCompletion {
+        result,
+        stop_reason,
+        outputs,
+        artifacts,
+    })
 }
 
 #[derive(Default)]
@@ -422,7 +481,9 @@ impl ExecutionTask {
         retention: Option<RetentionTarget>,
         execute: impl FnOnce(ExecutionControl) -> ExecResult + Send + 'static,
     ) -> io::Result<Self> {
-        Self::spawn_for_delivery_with_lease(request_id, timeout, artifacts, retention, None, execute)
+        Self::spawn_for_delivery_with_lease(
+            request_id, timeout, artifacts, retention, None, execute,
+        )
     }
 
     /// Production delivery with the authenticated session's exact execution
@@ -438,14 +499,21 @@ impl ExecutionTask {
         let control = match lease {
             Some((identity, ttl_ms)) => {
                 if identity.request_id != request_id {
-                    return Err(io::Error::new(io::ErrorKind::InvalidInput, "execution lease request differs from task"));
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "execution lease request differs from task",
+                    ));
                 }
                 ExecutionControl::new_with_lease(timeout, identity, ttl_ms)?
             }
             None => ExecutionControl::new(timeout)?,
         };
-        if let Some(plan) = artifacts { control.request_artifacts(plan)?; }
-        if retention.is_some() { control.request_output_capture(); }
+        if let Some(plan) = artifacts {
+            control.request_artifacts(plan)?;
+        }
+        if retention.is_some() {
+            control.request_output_capture();
+        }
         Self::spawn_controlled(request_id, control, retention, execute)
     }
 
@@ -470,7 +538,9 @@ impl ExecutionTask {
                     let mut completion = complete_result(&worker_control, result, stop_reason)?;
                     let retained = match retention {
                         Some(target) if completion.result.executed => Some(
-                            target.seal(&mut completion).map_err(|error| format!("result retention failed: {error}"))?
+                            target
+                                .seal(&mut completion)
+                                .map_err(|error| format!("result retention failed: {error}"))?,
                         ),
                         _ => None,
                     };
@@ -503,17 +573,25 @@ impl ExecutionTask {
 
     /// Session-scoped identity; cancellations must match this exactly.
     #[must_use]
-    pub fn request_id(&self) -> u64 { self.request_id }
+    pub fn request_id(&self) -> u64 {
+        self.request_id
+    }
 
     /// Present only after complete bytes and their seal are durably stored.
     /// The session must commit this digest to its journal before sending output.
     #[must_use]
     pub fn retained_result_digest(&self) -> Option<String> {
-        self.state.lock().unwrap_or_else(|e| e.into_inner()).retained_result_digest.clone()
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retained_result_digest
+            .clone()
     }
 
     /// Request cancellation without blocking the reactor on process cleanup.
-    pub fn cancel(&self, reason: StopReason) -> bool { self.control.cancel(reason) }
+    pub fn cancel(&self, reason: StopReason) -> bool {
+        self.control.cancel(reason)
+    }
 
     /// The session validates the incoming lease identity before calling this
     /// method. The control retains that identity and enforces sequence/expiry.
@@ -523,7 +601,10 @@ impl ExecutionTask {
 
     /// Poll completion alongside incoming control frames. Registers the waker
     /// under the same mutex as publication, so no completion wakeup is lost.
-    pub fn poll_completion(&mut self, cx: &mut Context<'_>) -> Poll<Result<ExecutionCompletion, String>> {
+    pub fn poll_completion(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<ExecutionCompletion, String>> {
         if self.completed {
             return Poll::Ready(Err("execution completion already consumed".to_owned()));
         }
@@ -537,7 +618,9 @@ impl ExecutionTask {
             }
         };
         self.completed = true;
-        if let Some(thread) = self.thread.take() && thread.join().is_err() {
+        if let Some(thread) = self.thread.take()
+            && thread.join().is_err()
+        {
             return Poll::Ready(Err("execution owner thread failed".to_owned()));
         }
         Poll::Ready(result)
@@ -568,7 +651,9 @@ mod tests {
 
     struct ThreadWake(std::thread::Thread);
     impl Wake for ThreadWake {
-        fn wake(self: Arc<Self>) { self.0.unpark(); }
+        fn wake(self: Arc<Self>) {
+            self.0.unpark();
+        }
     }
 
     fn wait(task: &mut ExecutionTask) -> Result<ExecutionCompletion, String> {
@@ -626,56 +711,120 @@ mod tests {
     fn execution_lease_renews_before_boundary_but_replay_and_expiry_never_rearm() {
         let origin = Instant::now();
         let control = ExecutionControl::new_at(
-            Duration::from_secs(10), Some((lease_identity(40), 1_000)), origin,
-        ).unwrap();
-        assert_eq!(observe_at(&control, origin + Duration::from_millis(999)), None);
+            Duration::from_secs(10),
+            Some((lease_identity(40), 1_000)),
+            origin,
+        )
+        .unwrap();
+        assert_eq!(
+            observe_at(&control, origin + Duration::from_millis(999)),
+            None
+        );
         assert!(!renew_at(&control, 0, origin + Duration::from_millis(999)));
         assert!(renew_at(&control, 1, origin + Duration::from_millis(999)));
-        assert_eq!(observe_at(&control, origin + Duration::from_millis(1_998)), None);
-        assert!(!renew_at(&control, 1, origin + Duration::from_millis(1_998)));
-        assert!(!renew_at(&control, 0, origin + Duration::from_millis(1_998)));
-        assert!(!renew_at(&control, 2, origin + Duration::from_millis(1_999)));
+        assert_eq!(
+            observe_at(&control, origin + Duration::from_millis(1_998)),
+            None
+        );
+        assert!(!renew_at(
+            &control,
+            1,
+            origin + Duration::from_millis(1_998)
+        ));
+        assert!(!renew_at(
+            &control,
+            0,
+            origin + Duration::from_millis(1_998)
+        ));
+        assert!(!renew_at(
+            &control,
+            2,
+            origin + Duration::from_millis(1_999)
+        ));
         assert_eq!(control.reason(), Some(StopReason::LeaseExpired));
         assert!(!renew_at(&control, 3, origin + Duration::from_secs(5)));
         assert_eq!(control.finish(), Some(StopReason::LeaseExpired));
         assert_eq!(control.finish(), Some(StopReason::LeaseExpired));
-        assert_eq!(control.state.load(Ordering::Acquire), FINISHED | StopReason::LeaseExpired as u8);
+        assert_eq!(
+            control.state.load(Ordering::Acquire),
+            FINISHED | StopReason::LeaseExpired as u8
+        );
     }
 
     #[test]
     fn lease_renewals_cannot_extend_the_hard_timeout_or_recover_a_clock_regression() {
         let origin = Instant::now();
         let bounded = ExecutionControl::new_at(
-            Duration::from_millis(1_500), Some((lease_identity(41), 1_000)), origin,
-        ).unwrap();
+            Duration::from_millis(1_500),
+            Some((lease_identity(41), 1_000)),
+            origin,
+        )
+        .unwrap();
         assert!(renew_at(&bounded, 1, origin + Duration::from_millis(900)));
-        assert!(!renew_at(&bounded, 2, origin + Duration::from_millis(1_500)));
+        assert!(!renew_at(
+            &bounded,
+            2,
+            origin + Duration::from_millis(1_500)
+        ));
         assert_eq!(bounded.reason(), Some(StopReason::DeadlineExceeded));
 
         let regressed = ExecutionControl::new_at(
-            Duration::from_secs(10), Some((lease_identity(42), 1_000)), origin,
-        ).unwrap();
-        assert_eq!(observe_at(&regressed, origin + Duration::from_millis(500)), None);
-        assert!(!renew_at(&regressed, 1, origin + Duration::from_millis(499)));
+            Duration::from_secs(10),
+            Some((lease_identity(42), 1_000)),
+            origin,
+        )
+        .unwrap();
+        assert_eq!(
+            observe_at(&regressed, origin + Duration::from_millis(500)),
+            None
+        );
+        assert!(!renew_at(
+            &regressed,
+            1,
+            origin + Duration::from_millis(499)
+        ));
         assert_eq!(regressed.reason(), Some(StopReason::LeaseExpired));
-        assert!(!renew_at(&regressed, 2, origin + Duration::from_millis(600)));
+        assert!(!renew_at(
+            &regressed,
+            2,
+            origin + Duration::from_millis(600)
+        ));
     }
 
     #[test]
     fn completion_and_cancellation_close_the_lease_without_changing_the_outcome() {
-        for reason in [None, Some(StopReason::Cancelled), Some(StopReason::SessionLost)] {
+        for reason in [
+            None,
+            Some(StopReason::Cancelled),
+            Some(StopReason::SessionLost),
+        ] {
             let control = ExecutionControl::new_with_lease(
-                Duration::from_secs(10), lease_identity(43), 1_000,
-            ).unwrap();
+                Duration::from_secs(10),
+                lease_identity(43),
+                1_000,
+            )
+            .unwrap();
             if let Some(reason) = reason {
                 assert!(control.cancel(reason));
                 assert!(!control.renew_execution_lease(1));
             }
             assert_eq!(control.finish(), reason);
             assert!(!control.renew_execution_lease(2));
-            assert_eq!(observe_at(&control, control.deadline + Duration::from_secs(1)), reason);
+            assert_eq!(
+                observe_at(&control, control.deadline + Duration::from_secs(1)),
+                reason
+            );
             assert_eq!(control.finish(), reason);
-            assert!(control.lease.lock().unwrap().as_ref().unwrap().lease.is_closed());
+            assert!(
+                control
+                    .lease
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .lease
+                    .is_closed()
+            );
         }
         let unleased = ExecutionControl::new(Duration::from_secs(10)).unwrap();
         assert!(!unleased.renew_execution_lease(1));
@@ -687,8 +836,11 @@ mod tests {
         use std::sync::Barrier;
         for _ in 0..32 {
             let control = ExecutionControl::new_with_lease(
-                Duration::from_secs(10), lease_identity(44), 1_000,
-            ).unwrap();
+                Duration::from_secs(10),
+                lease_identity(44),
+                1_000,
+            )
+            .unwrap();
             let barrier = Arc::new(Barrier::new(2));
             let renew_control = control.clone();
             let renew_barrier = Arc::clone(&barrier);
@@ -713,7 +865,11 @@ mod tests {
             let started = Arc::new(AtomicBool::new(false));
             let execute_started = Arc::clone(&started);
             let task = ExecutionTask::spawn_for_delivery_with_lease(
-                45, Duration::from_secs(10), None, None, Some((lease_identity(id), ttl)),
+                45,
+                Duration::from_secs(10),
+                None,
+                None,
+                Some((lease_identity(id), ttl)),
                 move |_| {
                     execute_started.store(true, Ordering::Release);
                     result(45)
@@ -727,7 +883,9 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn expired_lease_stops_a_real_process_tree_and_preserves_diagnostics() {
-        use rabs_asupersync::process_groups::{ManagedProcessGroup, ProcessGroupSpec, members_from_proc};
+        use rabs_asupersync::process_groups::{
+            ManagedProcessGroup, ProcessGroupSpec, members_from_proc,
+        };
         use rabs_asupersync::stream_drain::DrainLimits;
         use std::process::Stdio;
         use std::sync::atomic::AtomicU32;
@@ -737,21 +895,41 @@ mod tests {
         let pgid = Arc::new(AtomicU32::new(0));
         let worker_pgid = Arc::clone(&pgid);
         let mut task = ExecutionTask::spawn_for_delivery_with_lease(
-            47, Duration::from_secs(5), None, None, Some((lease_identity(47), 1_000)),
+            47,
+            Duration::from_secs(5),
+            None,
+            None,
+            Some((lease_identity(47), 1_000)),
             move |control| {
-                assert_eq!(control.reason(), None, "lease must be armed before executor invocation");
-                let spec = ProcessGroupSpec::new("sh", [
-                    "-c".to_owned(),
-                    "printf prefix; printf diagnostic >&2; sleep 30 & wait".to_owned(),
-                ]);
+                assert_eq!(
+                    control.reason(),
+                    None,
+                    "lease must be armed before executor invocation"
+                );
+                let spec = ProcessGroupSpec::new(
+                    "sh",
+                    [
+                        "-c".to_owned(),
+                        "printf prefix; printf diagnostic >&2; sleep 30 & wait".to_owned(),
+                    ],
+                );
                 let group = ManagedProcessGroup::spawn_with(&spec, |command| {
-                    command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
-                }).unwrap();
+                    command
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped());
+                })
+                .unwrap();
                 worker_pgid.store(group.pgid(), Ordering::Release);
-                let output = group.wait_with_bounded_drain_controlled(
-                    &DrainLimits { resident_bound: 64, spill_dir: spill },
-                    || control.reason().is_some(),
-                ).unwrap();
+                let output = group
+                    .wait_with_bounded_drain_controlled(
+                        &DrainLimits {
+                            resident_bound: 64,
+                            spill_dir: spill,
+                        },
+                        || control.reason().is_some(),
+                    )
+                    .unwrap();
                 let capture = CapturedOutputs::from_lanes(&output.stdout, &output.stderr).unwrap();
                 let mut observed = result(47);
                 observed.stdout_sha256 = capture.stdout.sha256().to_owned();
@@ -761,7 +939,8 @@ mod tests {
                 control.retain_outputs(Ok(capture)).unwrap();
                 observed
             },
-        ).unwrap();
+        )
+        .unwrap();
         let mut completed = wait(&mut task).unwrap();
         assert_eq!(completed.stop_reason, Some(StopReason::LeaseExpired));
         assert_eq!(completed.result.exit_code, 125);
@@ -793,9 +972,12 @@ mod tests {
     #[test]
     fn deadline_cannot_be_reported_as_success_even_if_executor_exits_zero() {
         let mut task = ExecutionTask::spawn(7, Duration::from_millis(30), |control| {
-            while control.reason().is_none() { std::thread::sleep(Duration::from_millis(2)); }
+            while control.reason().is_none() {
+                std::thread::sleep(Duration::from_millis(2));
+            }
             result(7)
-        }).unwrap();
+        })
+        .unwrap();
         let completed = wait(&mut task).unwrap();
         assert_eq!(completed.stop_reason, Some(StopReason::DeadlineExceeded));
         assert_eq!(completed.result.exit_code, 124);
@@ -807,10 +989,13 @@ mod tests {
         let cleaned = Arc::new(AtomicBool::new(false));
         let worker_cleaned = Arc::clone(&cleaned);
         let task = ExecutionTask::spawn(8, Duration::from_secs(5), move |control| {
-            while control.reason().is_none() { std::thread::sleep(Duration::from_millis(2)); }
+            while control.reason().is_none() {
+                std::thread::sleep(Duration::from_millis(2));
+            }
             worker_cleaned.store(true, Ordering::Release);
             result(8)
-        }).unwrap();
+        })
+        .unwrap();
         drop(task);
         assert!(cleaned.load(Ordering::Acquire));
     }
@@ -824,9 +1009,11 @@ mod tests {
         assert!(!task.cancel(StopReason::Cancelled));
         let mut panicked = ExecutionTask::spawn(10, Duration::from_secs(5), |_| {
             panic!("test executor panic")
-        }).unwrap();
+        })
+        .unwrap();
         assert!(wait(&mut panicked).unwrap_err().contains("panicked"));
-        let mut misbound = ExecutionTask::spawn(11, Duration::from_secs(5), |_| result(12)).unwrap();
+        let mut misbound =
+            ExecutionTask::spawn(11, Duration::from_secs(5), |_| result(12)).unwrap();
         assert!(wait(&mut misbound).unwrap_err().contains("identity"));
     }
 
@@ -844,11 +1031,21 @@ mod tests {
             control.retain_outputs(Ok(outputs(b"output"))).unwrap();
             assert!(control.retain_outputs(Ok(outputs(b"second"))).is_err());
             result(12)
-        }).unwrap();
+        })
+        .unwrap();
         let mut completion = wait(&mut task).unwrap();
         assert_eq!(completion.stop_reason, Some(StopReason::Cancelled));
         assert_eq!(completion.result.exit_code, 130);
-        assert_eq!(completion.outputs.as_mut().unwrap().stdout.read_chunk(0, 64).unwrap(), b"output");
+        assert_eq!(
+            completion
+                .outputs
+                .as_mut()
+                .unwrap()
+                .stdout
+                .read_chunk(0, 64)
+                .unwrap(),
+            b"output"
+        );
     }
 
     #[test]
@@ -862,7 +1059,8 @@ mod tests {
                     _ => control.retain_outputs(Ok(outputs(b"wrong bytes"))).unwrap(),
                 }
                 result(13)
-            }).unwrap();
+            })
+            .unwrap();
             assert!(wait(&mut task).unwrap_err().contains("output"));
         }
     }
@@ -880,43 +1078,82 @@ mod tests {
     #[test]
     fn artifact_success_requires_the_exact_capture_not_just_exit_zero() {
         for case in 0..4 {
-            let mut task = ExecutionTask::spawn_with_artifacts(20, Duration::from_secs(5), artifact_plan("a"), move |control| {
-                assert!(control.request_artifacts(artifact_plan("b")).is_err());
-                match case {
-                    0 => {}
-                    1 => control.retain_artifacts(Err("missing file".into())).unwrap(),
-                    _ => control.retain_artifacts(Ok(artifacts(artifact_plan("a")))).unwrap(),
-                }
-                let mut result = result(20);
-                if case == 2 { result.residual_group_members = 1; }
-                result
-            }).unwrap();
+            let mut task = ExecutionTask::spawn_with_artifacts(
+                20,
+                Duration::from_secs(5),
+                artifact_plan("a"),
+                move |control| {
+                    assert!(control.request_artifacts(artifact_plan("b")).is_err());
+                    match case {
+                        0 => {}
+                        1 => control
+                            .retain_artifacts(Err("missing file".into()))
+                            .unwrap(),
+                        _ => control
+                            .retain_artifacts(Ok(artifacts(artifact_plan("a"))))
+                            .unwrap(),
+                    }
+                    let mut result = result(20);
+                    if case == 2 {
+                        result.residual_group_members = 1;
+                    }
+                    result
+                },
+            )
+            .unwrap();
             let completion = wait(&mut task);
             if case == 3 {
                 let mut completion = completion.unwrap();
-                assert_eq!(completion.artifacts.as_mut().unwrap().read_chunk("a", 0, 64).unwrap(), b"compiled");
+                assert_eq!(
+                    completion
+                        .artifacts
+                        .as_mut()
+                        .unwrap()
+                        .read_chunk("a", 0, 64)
+                        .unwrap(),
+                    b"compiled"
+                );
             } else if case == 2 {
-                assert!(completion.unwrap_err().contains("residual process-group members"));
+                assert!(
+                    completion
+                        .unwrap_err()
+                        .contains("residual process-group members")
+                );
             } else {
                 assert!(completion.unwrap_err().contains("artifact"));
             }
         }
         let control = ExecutionControl::new(Duration::from_secs(5)).unwrap();
         control.request_artifacts(artifact_plan("b")).unwrap();
-        assert!(control.retain_artifacts(Ok(artifacts(artifact_plan("a")))).is_err());
+        assert!(
+            control
+                .retain_artifacts(Ok(artifacts(artifact_plan("a"))))
+                .is_err()
+        );
     }
 
     #[test]
     fn failed_and_interrupted_executions_retain_diagnostics_but_never_artifacts() {
         for cancelled in [false, true] {
-            let mut task = ExecutionTask::spawn_with_artifacts(21, Duration::from_secs(5), artifact_plan("a"), move |control| {
-                control.retain_outputs(Ok(outputs(b"output"))).unwrap();
-                control.retain_artifacts(Ok(artifacts(artifact_plan("a")))).unwrap();
-                let mut result = result(21);
-                if cancelled { control.cancel(StopReason::Cancelled); }
-                else { result.exit_code = 1; }
-                result
-            }).unwrap();
+            let mut task = ExecutionTask::spawn_with_artifacts(
+                21,
+                Duration::from_secs(5),
+                artifact_plan("a"),
+                move |control| {
+                    control.retain_outputs(Ok(outputs(b"output"))).unwrap();
+                    control
+                        .retain_artifacts(Ok(artifacts(artifact_plan("a"))))
+                        .unwrap();
+                    let mut result = result(21);
+                    if cancelled {
+                        control.cancel(StopReason::Cancelled);
+                    } else {
+                        result.exit_code = 1;
+                    }
+                    result
+                },
+            )
+            .unwrap();
             let completion = wait(&mut task).unwrap();
             assert!(completion.artifacts.is_none());
             assert!(completion.outputs.is_some());
@@ -943,7 +1180,11 @@ mod tests {
             assert_eq!(control.reason(), reason);
             assert!(!control.cancel(StopReason::SessionLost));
             assert!(control.retain_outputs(Err("late output".into())).is_err());
-            assert!(control.retain_artifacts(Err("late artifact".into())).is_err());
+            assert!(
+                control
+                    .retain_artifacts(Err("late artifact".into()))
+                    .is_err()
+            );
             assert!(control.take_outputs().is_none());
             assert!(control.artifacts.lock().unwrap().result.is_none());
             control.request_output_capture();
@@ -977,7 +1218,11 @@ mod tests {
     #[test]
     fn residual_children_refuse_completion_without_an_artifact_contract() {
         for exit_code in [0, 1, 137] {
-            for reason in [None, Some(StopReason::Cancelled), Some(StopReason::SessionLost)] {
+            for reason in [
+                None,
+                Some(StopReason::Cancelled),
+                Some(StopReason::SessionLost),
+            ] {
                 let mut task = ExecutionTask::spawn_for_delivery(
                     30,
                     Duration::from_secs(5),
@@ -992,8 +1237,13 @@ mod tests {
                         result.residual_group_members = 1;
                         result
                     },
-                ).unwrap();
-                assert!(wait(&mut task).unwrap_err().contains("residual process-group members"));
+                )
+                .unwrap();
+                assert!(
+                    wait(&mut task)
+                        .unwrap_err()
+                        .contains("residual process-group members")
+                );
                 assert!(task.retained_result_digest().is_none());
             }
         }
@@ -1006,14 +1256,16 @@ mod tests {
                 let mut result = result(31);
                 result.exit_code = exit_code;
                 result
-            }).unwrap();
+            })
+            .unwrap();
             assert!(wait(&mut task).unwrap_err().contains("invalid exit status"));
         }
         let mut task = ExecutionTask::spawn(32, Duration::from_secs(5), |_| {
             let mut result = result(32);
             result.executed = false;
             result
-        }).unwrap();
+        })
+        .unwrap();
         assert!(wait(&mut task).unwrap_err().contains("unexecuted request"));
 
         // A real pre-execution refusal is not silently relabelled as a
@@ -1024,7 +1276,8 @@ mod tests {
             result.executed = false;
             result.exit_code = -1;
             result
-        }).unwrap();
+        })
+        .unwrap();
         let completion = wait(&mut refused).unwrap();
         assert!(!completion.result.executed);
         assert_eq!(completion.result.exit_code, -1);

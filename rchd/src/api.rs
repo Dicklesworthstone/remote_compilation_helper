@@ -2492,10 +2492,22 @@ async fn handle_select_worker_with_wrapper(
                 // AllWorkersBusy — a phantom race against a worker that was simply
                 // too small. Observed live on ts1 2026-08-26: repeated
                 // "Failed to reserve 4 slots on hz2" against a 2-slot worker.
+                //
+                // An undersized worker is only offered while it has a free slot,
+                // so clamp such a request to what is FREE, not to its total: a
+                // 2-slot worker with one slot busy can never reserve 2, and the
+                // degraded path then failed exactly when it mattered. A worker
+                // that can hold the whole estimate still reserves all of it, so
+                // a race that shrank its free slots fails and retries instead of
+                // under-reserving and oversubscribing the host.
                 reservation_attempts += 1;
                 let reserve_slots = {
                     let total = worker.effective_total_slots().await;
-                    request.estimated_cores.min(total)
+                    if request.estimated_cores > total {
+                        total.min(worker.available_slots().await.max(1))
+                    } else {
+                        request.estimated_cores
+                    }
                 };
                 if worker.reserve_slots(reserve_slots).await {
                     let (id, host, user, identity_file, declared_os) = {
@@ -7653,6 +7665,51 @@ mod tests {
         .unwrap();
         assert_eq!(worker.used_slots(), 1);
         assert_eq!(worker.available_slots().await, 5);
+    }
+
+    /// A worker too small for the estimate is offered while it has ANY free
+    /// slot. Clamping the reservation to its total (3) when one slot is already
+    /// busy can never succeed, so the capacity-degraded path must reserve what
+    /// is free instead of reporting a phantom race and falling back to local.
+    #[tokio::test]
+    async fn test_degraded_selection_reserves_free_slots_on_partly_busy_worker() {
+        let _guard = test_guard!();
+        let pool = WorkerPool::new();
+        pool.add_worker(make_test_worker("small-worker", 8)).await;
+        let worker = pool.get(&WorkerId::new("small-worker")).await.unwrap();
+        worker
+            .set_pressure_assessment(crate::disk_pressure::PressureAssessment {
+                disk_free_gb: Some(40.0),
+                ..Default::default()
+            })
+            .await;
+        assert_eq!(worker.effective_total_slots().await, 3);
+        assert!(worker.reserve_slots(1).await);
+        let ctx = make_test_context(pool);
+        let request = SelectionRequest {
+            job_mode: false,
+            project: "degraded-busy".to_string(),
+            command: None,
+            command_priority: CommandPriority::Normal,
+            estimated_cores: 4,
+            preferred_workers: vec![],
+            toolchain: None,
+            required_runtime: RequiredRuntime::None,
+            classification_duration_us: None,
+            required_tools: Vec::new(),
+            hook_pid: Some(98766),
+        };
+        let response = handle_select_worker(&ctx, request, false, None)
+            .await
+            .unwrap();
+        assert!(
+            response.worker.is_some(),
+            "degraded worker with free slots must be admitted: {}",
+            response.reason
+        );
+        assert_eq!(worker.used_slots(), 3);
+        let build_id = response.build_id.unwrap();
+        assert_eq!(ctx.history.active_build(build_id).unwrap().slots, 2);
     }
 
     #[tokio::test]

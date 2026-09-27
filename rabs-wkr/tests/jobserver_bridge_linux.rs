@@ -58,13 +58,15 @@ impl OwnedWorker {
 }
 
 fn spawn_worker(addr: &str, state: &std::path::Path) -> OwnedWorker {
-    OwnedWorker(Command::new(worker_bin())
-        .args(["--coordinator", addr, "--worker-id", "i004-wkr", "--once"])
-        .env("RABS_WORKER_STATE_DIR", state)
-        .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .expect("spawn worker"))
+    OwnedWorker(
+        Command::new(worker_bin())
+            .args(["--coordinator", addr, "--worker-id", "i004-wkr", "--once"])
+            .env("RABS_WORKER_STATE_DIR", state)
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("spawn worker"),
+    )
 }
 
 fn read_line<R: BufRead>(reader: &mut R) -> String {
@@ -122,7 +124,9 @@ fn nested_make_tree_respects_the_worker_grant() {
     stream
         .set_read_timeout(Some(Duration::from_secs(120)))
         .unwrap();
-    stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+    stream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
     let mut writer = stream.try_clone().unwrap();
     let mut reader = BufReader::new(stream);
 
@@ -214,10 +218,15 @@ fn nested_make_tree_respects_the_worker_grant() {
         std::fs::read(workspace.path().join(".rabs-jobserver")).unwrap(),
         b"source-owned"
     );
-    let mut names: Vec<_> = std::fs::read_dir(workspace.path()).unwrap()
-        .map(|entry| entry.unwrap().file_name().into_string().unwrap()).collect();
+    let mut names: Vec<_> = std::fs::read_dir(workspace.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect();
     names.sort();
-    assert_eq!(names, [".rabs-jobserver", "intervals.txt", "sub.mk", "top.mk"]);
+    assert_eq!(
+        names,
+        [".rabs-jobserver", "intervals.txt", "sub.mk", "top.mk"]
+    );
 
     let status = worker.wait();
     assert_eq!(status.code(), Some(0), "clean worker exit after --once");

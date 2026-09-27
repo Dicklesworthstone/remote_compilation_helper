@@ -65,8 +65,8 @@ fn literal_words(command: &str) -> Option<Vec<String>> {
             _ => match ch {
                 '\'' | '"' => quote = Some(ch),
                 '\\' => escaped = true,
-                '$' | '`' | '|' | '&' | ';' | '<' | '>' | '(' | ')' | '*' | '?'
-                | '[' | '{' | '}' | '~' | '#' => return None,
+                '$' | '`' | '|' | '&' | ';' | '<' | '>' | '(' | ')' | '*' | '?' | '[' | '{'
+                | '}' | '~' | '#' => return None,
                 _ => {}
             },
         }
@@ -99,10 +99,16 @@ fn compiler_arguments(command: &str, compilers: &[&str]) -> Option<Vec<String>> 
         let executable = Path::new(words.get(index)?).file_name()?.to_str()?;
         let executable = executable.strip_suffix(".exe").unwrap_or(executable);
         if compilers.iter().any(|compiler| {
-            executable == *compiler || executable.strip_prefix(*compiler)
-                .and_then(|suffix| suffix.strip_prefix('-'))
-                .is_some_and(|version| !version.is_empty()
-                    && version.bytes().all(|byte| byte.is_ascii_digit() || byte == b'.'))
+            executable == *compiler
+                || executable
+                    .strip_prefix(*compiler)
+                    .and_then(|suffix| suffix.strip_prefix('-'))
+                    .is_some_and(|version| {
+                        !version.is_empty()
+                            && version
+                                .bytes()
+                                .all(|byte| byte.is_ascii_digit() || byte == b'.')
+                    })
         }) {
             return Some(words[index + 1..].to_vec());
         }
@@ -121,7 +127,10 @@ fn compiler_arguments(command: &str, compilers: &[&str]) -> Option<Vec<String>> 
                             index += 2;
                         }
                         _ if word.starts_with("--unset=")
-                            || word.starts_with("-u") && word.len() > 2 => index += 1,
+                            || word.starts_with("-u") && word.len() > 2 =>
+                        {
+                            index += 1
+                        }
                         _ if word.starts_with('-') => return None,
                         _ => break,
                     }
@@ -160,7 +169,10 @@ fn compiler_arguments(command: &str, compilers: &[&str]) -> Option<Vec<String>> 
                             index += 1;
                         }
                         _ if word.starts_with("--format=")
-                            || word.starts_with("-f") && word.len() > 2 => index += 1,
+                            || word.starts_with("-f") && word.len() > 2 =>
+                        {
+                            index += 1
+                        }
                         // time -o has its own file output; do not mistake that
                         // path for the compiler's output or drop its contract.
                         _ if word.starts_with('-') => return None,
@@ -211,12 +223,34 @@ fn literal_file_pattern(path: &str) -> Option<String> {
 fn rustc_value_option(option: &str) -> bool {
     matches!(
         option,
-        "--out-dir" | "--crate-name" | "--crate-type" | "--edition" | "--target"
-            | "--extern" | "--cfg" | "--check-cfg" | "--sysroot" | "--error-format"
-            | "--json" | "--color" | "--cap-lints" | "--diagnostic-width"
-            | "--remap-path-prefix" | "--remap-path-scope" | "--codegen"
-            | "--allow" | "--warn" | "--force-warn" | "--deny" | "--forbid"
-            | "-A" | "-W" | "-D" | "-F" | "-L" | "-l"
+        "--out-dir"
+            | "--crate-name"
+            | "--crate-type"
+            | "--edition"
+            | "--target"
+            | "--extern"
+            | "--cfg"
+            | "--check-cfg"
+            | "--sysroot"
+            | "--error-format"
+            | "--json"
+            | "--color"
+            | "--cap-lints"
+            | "--diagnostic-width"
+            | "--remap-path-prefix"
+            | "--remap-path-scope"
+            | "--codegen"
+            | "--allow"
+            | "--warn"
+            | "--force-warn"
+            | "--deny"
+            | "--forbid"
+            | "-A"
+            | "-W"
+            | "-D"
+            | "-F"
+            | "-L"
+            | "-l"
     )
 }
 
@@ -225,12 +259,29 @@ fn rustc_value_option(option: &str) -> bool {
 /// rather than dropping their unnamed sidecars from an explicit selection.
 fn named_output_codegen(value: &str) -> bool {
     let key = value.split_once('=').map_or(value, |(key, _)| key);
-    matches!(key, "opt-level" | "target-cpu" | "target-feature" | "panic"
-        | "overflow-checks" | "debug-assertions" | "embed-bitcode" | "lto"
-        | "prefer-dynamic" | "relocation-model" | "code-model" | "no-redzone"
-        | "force-frame-pointers" | "metadata" | "extra-filename" | "strip"
-        | "symbol-mangling-version")
-        || matches!(value, "debuginfo=0" | "split-debuginfo=off" | "codegen-units=1")
+    matches!(
+        key,
+        "opt-level"
+            | "target-cpu"
+            | "target-feature"
+            | "panic"
+            | "overflow-checks"
+            | "debug-assertions"
+            | "embed-bitcode"
+            | "lto"
+            | "prefer-dynamic"
+            | "relocation-model"
+            | "code-model"
+            | "no-redzone"
+            | "force-frame-pointers"
+            | "metadata"
+            | "extra-filename"
+            | "strip"
+            | "symbol-mangling-version"
+    ) || matches!(
+        value,
+        "debuginfo=0" | "split-debuginfo=off" | "codegen-units=1"
+    )
 }
 
 fn add_emissions(value: &str, emits: &mut BTreeMap<String, Option<String>>) -> Option<()> {
@@ -240,7 +291,10 @@ fn add_emissions(value: &str, emits: &mut BTreeMap<String, Option<String>>) -> O
             Some(_) => return None,
             None => (item, None),
         };
-        if !matches!(kind, "asm" | "dep-info" | "link" | "llvm-bc" | "llvm-ir" | "metadata" | "mir" | "obj") {
+        if !matches!(
+            kind,
+            "asm" | "dep-info" | "link" | "llvm-bc" | "llvm-ir" | "metadata" | "mir" | "obj"
+        ) {
             return None;
         }
         // rustc's OutputTypes map retains the last value for a repeated kind.
@@ -288,7 +342,8 @@ pub(super) fn rustc_patterns(command: &str) -> Option<Vec<String>> {
             if !named_output_codegen(iter.next()?) {
                 return None;
             }
-        } else if let Some(value) = arg.strip_prefix("-C")
+        } else if let Some(value) = arg
+            .strip_prefix("-C")
             .or_else(|| arg.strip_prefix("--codegen="))
         {
             if !named_output_codegen(value) {
@@ -296,9 +351,12 @@ pub(super) fn rustc_patterns(command: &str) -> Option<Vec<String>> {
             }
         } else if rustc_value_option(arg) {
             iter.next()?;
-        } else if arg.split_once('=').is_some_and(|(key, _)| rustc_value_option(key))
+        } else if arg
+            .split_once('=')
+            .is_some_and(|(key, _)| rustc_value_option(key))
             || ["-A", "-W", "-D", "-F", "-L", "-l"]
-                .iter().any(|prefix| arg.starts_with(*prefix) && arg.len() > prefix.len())
+                .iter()
+                .any(|prefix| arg.starts_with(*prefix) && arg.len() > prefix.len())
             || matches!(arg.as_str(), "-O" | "--test" | "-v" | "--verbose")
         {
             // Opaque option values are never rescanned for output flags.
@@ -329,26 +387,90 @@ pub(super) fn rustc_patterns(command: &str) -> Option<Vec<String>> {
 }
 
 fn c_value_option(option: &str) -> bool {
-    matches!(option, "-I" | "-L" | "-l" | "-D" | "-U" | "-x" | "-B"
-        | "-isystem" | "-iquote" | "-idirafter" | "-include" | "-imacros"
-        | "-isysroot" | "--sysroot" | "-target" | "--target" | "-arch"
-        | "-MT" | "-MQ" | "-std")
+    matches!(
+        option,
+        "-I" | "-L"
+            | "-l"
+            | "-D"
+            | "-U"
+            | "-x"
+            | "-B"
+            | "-isystem"
+            | "-iquote"
+            | "-idirafter"
+            | "-include"
+            | "-imacros"
+            | "-isysroot"
+            | "--sysroot"
+            | "-target"
+            | "--target"
+            | "-arch"
+            | "-MT"
+            | "-MQ"
+            | "-std"
+    )
 }
 
 fn c_plain_option(option: &str) -> bool {
-    matches!(option, "-c" | "-S" | "-shared" | "-static" | "-pie" | "-pthread"
-        | "-pipe" | "-pedantic" | "-pedantic-errors" | "-ansi" | "-nostdinc"
-        | "-nostdinc++" | "-nostdlib" | "-nodefaultlibs" | "-nostartfiles"
-        | "-fPIC" | "-fpic" | "-fPIE" | "-fpie" | "-fno-exceptions"
-        | "-fexceptions" | "-fno-rtti" | "-frtti" | "-fomit-frame-pointer"
-        | "-fno-omit-frame-pointer" | "-fno-strict-aliasing" | "-fstrict-aliasing"
-        | "-ffunction-sections" | "-fdata-sections" | "-m32" | "-m64" | "-g0"
-        | "-O" | "-O0" | "-O1" | "-O2" | "-O3" | "-Os" | "-Oz" | "-Og" | "-Ofast"
-        | "-emit-llvm" | "-MP")
-        || option.starts_with("-W") && !option.starts_with("-Wl,")
-            && !option.starts_with("-Wa,") && !option.starts_with("-Wp,")
-        || ["-std=", "--std=", "-march=", "-mtune=", "-mcpu=", "-mabi=", "-fvisibility="]
-            .iter().any(|prefix| option.starts_with(*prefix))
+    matches!(
+        option,
+        "-c" | "-S"
+            | "-shared"
+            | "-static"
+            | "-pie"
+            | "-pthread"
+            | "-pipe"
+            | "-pedantic"
+            | "-pedantic-errors"
+            | "-ansi"
+            | "-nostdinc"
+            | "-nostdinc++"
+            | "-nostdlib"
+            | "-nodefaultlibs"
+            | "-nostartfiles"
+            | "-fPIC"
+            | "-fpic"
+            | "-fPIE"
+            | "-fpie"
+            | "-fno-exceptions"
+            | "-fexceptions"
+            | "-fno-rtti"
+            | "-frtti"
+            | "-fomit-frame-pointer"
+            | "-fno-omit-frame-pointer"
+            | "-fno-strict-aliasing"
+            | "-fstrict-aliasing"
+            | "-ffunction-sections"
+            | "-fdata-sections"
+            | "-m32"
+            | "-m64"
+            | "-g0"
+            | "-O"
+            | "-O0"
+            | "-O1"
+            | "-O2"
+            | "-O3"
+            | "-Os"
+            | "-Oz"
+            | "-Og"
+            | "-Ofast"
+            | "-emit-llvm"
+            | "-MP"
+    ) || option.starts_with("-W")
+        && !option.starts_with("-Wl,")
+        && !option.starts_with("-Wa,")
+        && !option.starts_with("-Wp,")
+        || [
+            "-std=",
+            "--std=",
+            "-march=",
+            "-mtune=",
+            "-mcpu=",
+            "-mabi=",
+            "-fvisibility=",
+        ]
+        .iter()
+        .any(|prefix| option.starts_with(*prefix))
 }
 
 /// Native driver outputs with an explicit -o and their dependency sidecars.
@@ -387,7 +509,10 @@ fn c_family_patterns(command: &str, compilers: &[&str], clang: bool) -> Option<V
             if output.replace(iter.next()?.to_string()).is_some() {
                 return None;
             }
-        } else if let Some(path) = arg.strip_prefix("--output=").or_else(|| arg.strip_prefix("-o")) {
+        } else if let Some(path) = arg
+            .strip_prefix("--output=")
+            .or_else(|| arg.strip_prefix("-o"))
+        {
             if output.replace(path.to_owned()).is_some() {
                 return None;
             }
@@ -414,8 +539,11 @@ fn c_family_patterns(command: &str, compilers: &[&str], clang: bool) -> Option<V
             iter.next()?;
         } else if c_plain_option(arg)
             || ["-I", "-L", "-l", "-D", "-U", "-B", "-MT", "-MQ"]
-                .iter().any(|prefix| arg.starts_with(*prefix) && arg.len() > prefix.len())
-            || arg.split_once('=').is_some_and(|(key, _)| c_value_option(key))
+                .iter()
+                .any(|prefix| arg.starts_with(*prefix) && arg.len() > prefix.len())
+            || arg
+                .split_once('=')
+                .is_some_and(|(key, _)| c_value_option(key))
         {
             // A flag's operand is opaque even when it looks like -o or -MF.
             language_override |= arg.starts_with("-x=");
@@ -438,23 +566,31 @@ fn c_family_patterns(command: &str, compilers: &[&str], clang: bool) -> Option<V
             return None;
         }
         let extension = Path::new(source?).extension()?.to_str()?;
-        if !matches!(extension, "c" | "C" | "cc" | "cp" | "cpp" | "CPP"
-            | "cxx" | "c++" | "m" | "M" | "mm")
-        {
+        if !matches!(
+            extension,
+            "c" | "C" | "cc" | "cp" | "cpp" | "CPP" | "cxx" | "c++" | "m" | "M" | "mm"
+        ) {
             return None;
         }
         // The drivers replace the last dot suffix INCLUDING a leading dot:
         // -o products/.hidden yields products/.d, not .hidden.d. Rust's
         // Path::with_extension treats dotfiles differently and is wrong here.
-        let (parent, name) = output.rsplit_once('/').map_or(("", output.as_str()),
-            |(parent, name)| (&output[..parent.len() + 1], name));
+        let (parent, name) = output
+            .rsplit_once('/')
+            .map_or(("", output.as_str()), |(parent, name)| {
+                (&output[..parent.len() + 1], name)
+            });
         let stem = name.rsplit_once('.').map_or(name, |(stem, _)| stem);
         depfile = Some(format!("{parent}{stem}.d"));
     }
-    if let Some(depfile) = depfile && depfile != "-" {
+    if let Some(depfile) = depfile
+        && depfile != "-"
+    {
         patterns.insert(literal_file_pattern(&depfile)?);
     }
-    if let Some(database) = database && database != "-" {
+    if let Some(database) = database
+        && database != "-"
+    {
         // Clang -MJ - emits a database fragment on stdout, not a file '-'.
         patterns.insert(literal_file_pattern(&database)?);
     }
@@ -479,21 +615,35 @@ mod tests {
             "sccache rustc main.rs -o dist/app",
         ] {
             let patterns = selected(command);
-            assert_eq!(patterns, if command == "rustc main.rs -o app" { vec!["app"] } else { vec!["dist/app"] });
+            assert_eq!(
+                patterns,
+                if command == "rustc main.rs -o app" {
+                    vec!["app"]
+                } else {
+                    vec!["dist/app"]
+                }
+            );
         }
     }
 
     #[test]
     fn rustc_named_emissions_override_output_and_ignore_out_dir() {
         assert_eq!(
-            selected("rustc lib.rs --emit=link,dep-info=reports/inputs.d --out-dir ignored -o dist/libcustom.rlib"),
+            selected(
+                "rustc lib.rs --emit=link,dep-info=reports/inputs.d --out-dir ignored -o dist/libcustom.rlib"
+            ),
             vec!["dist/libcustom.rlib", "reports/inputs.d"]
         );
         assert_eq!(
-            selected("rustc lib.rs --emit=metadata=old --emit=metadata=out/new.rmeta,mir=out/code.mir -o ignored"),
+            selected(
+                "rustc lib.rs --emit=metadata=old --emit=metadata=out/new.rmeta,mir=out/code.mir -o ignored"
+            ),
             vec!["out/code.mir", "out/new.rmeta"]
         );
-        assert_eq!(selected("rustc lib.rs --emit=asm=-,metadata=out/lib.rmeta"), vec!["out/lib.rmeta"]);
+        assert_eq!(
+            selected("rustc lib.rs --emit=asm=-,metadata=out/lib.rmeta"),
+            vec!["out/lib.rmeta"]
+        );
         assert!(selected("rustc lib.rs --emit=asm -o -").is_empty());
         assert_eq!(selected("rustc lib.rs --emit=asm -o ./-"), vec!["[-]"]);
     }
@@ -549,19 +699,37 @@ mod tests {
 
     #[test]
     fn quoted_filenames_are_literal_rsync_patterns_not_filters() {
-        assert_eq!(selected("rustc main.rs -o 'dist/app[dev]*?'"), vec!["dist/app[[]dev[]][*][?]"]);
+        assert_eq!(
+            selected("rustc main.rs -o 'dist/app[dev]*?'"),
+            vec!["dist/app[[]dev[]][*][?]"]
+        );
         assert_eq!(selected("rustc main.rs -o '- output'"), vec!["[-] output"]);
-        assert_eq!(selected(r"rustc main.rs -o 'dist/back\slash'"), vec![r"dist/back[\\]slash"]);
-        assert_eq!(selected("rustc main.rs -o 'dist/$literal'"), vec!["dist/$literal"]);
+        assert_eq!(
+            selected(r"rustc main.rs -o 'dist/back\slash'"),
+            vec![r"dist/back[\\]slash"]
+        );
+        assert_eq!(
+            selected("rustc main.rs -o 'dist/$literal'"),
+            vec!["dist/$literal"]
+        );
     }
 
     #[test]
     fn explicit_project_outputs_survive_unrelated_cargo_target_forwarding() {
-        use super::super::{get_artifact_patterns, get_custom_target_artifact_patterns, get_project_artifact_patterns};
+        use super::super::{
+            get_artifact_patterns, get_custom_target_artifact_patterns,
+            get_project_artifact_patterns,
+        };
         let kind = Some(rch_common::CompilationKind::Rustc);
         let command = Some("rustc main.rs -o target/direct/app");
-        assert_eq!(get_artifact_patterns(kind, command), vec!["target/direct/app"]);
-        assert_eq!(get_project_artifact_patterns(kind, command, true), vec!["target/direct/app"]);
+        assert_eq!(
+            get_artifact_patterns(kind, command),
+            vec!["target/direct/app"]
+        );
+        assert_eq!(
+            get_project_artifact_patterns(kind, command, true),
+            vec!["target/direct/app"]
+        );
         assert!(get_custom_target_artifact_patterns(kind, command).is_empty());
     }
 
@@ -570,14 +738,30 @@ mod tests {
         use rch_common::CompilationKind;
         for (kind, command) in [
             (CompilationKind::Gcc, "gcc -O2 main.c -o products/app"),
-            (CompilationKind::Gcc, "env -- cc -std=c11 main.c -oproducts/app"),
-            (CompilationKind::Gcc, "/usr/bin/time -f '-o decoy' -- gcc-14 main.c -o products/app"),
-            (CompilationKind::Gpp, "ccache g++-14.2 main.cpp --output=products/app"),
+            (
+                CompilationKind::Gcc,
+                "env -- cc -std=c11 main.c -oproducts/app",
+            ),
+            (
+                CompilationKind::Gcc,
+                "/usr/bin/time -f '-o decoy' -- gcc-14 main.c -o products/app",
+            ),
+            (
+                CompilationKind::Gpp,
+                "ccache g++-14.2 main.cpp --output=products/app",
+            ),
             (CompilationKind::Gpp, "c++ main.cpp -o ./products/app"),
             (CompilationKind::Clang, "clang -O3 main.c -o products/app"),
-            (CompilationKind::Clangpp, "sccache /usr/bin/clang++ main.cpp -o products/app"),
+            (
+                CompilationKind::Clangpp,
+                "sccache /usr/bin/clang++ main.cpp -o products/app",
+            ),
         ] {
-            assert_eq!(patterns(Some(kind), Some(command)), Some(vec!["products/app".into()]), "{command}");
+            assert_eq!(
+                patterns(Some(kind), Some(command)),
+                Some(vec!["products/app".into()]),
+                "{command}"
+            );
         }
         assert!(patterns(Some(CompilationKind::Gcc), Some("echo gcc main.c -o app")).is_none());
         assert!(patterns(Some(CompilationKind::Make), Some("make -o Makefile")).is_none());
@@ -586,18 +770,39 @@ mod tests {
     #[test]
     fn native_named_depfiles_and_clang_database_fragments_are_part_of_selection() {
         let native = |command| c_family_patterns(command, &["gcc", "cc"], false).unwrap();
-        assert_eq!(native("gcc -c main.c -o products/main.o -MMD -MF products/main.d -MP"),
-            vec!["products/main.d", "products/main.o"]);
-        assert_eq!(native("gcc main.c -o products/app -MD -MFproducts/all.d"),
-            vec!["products/all.d", "products/app"]);
-        assert_eq!(native("gcc main.c -o products/app -MMD -MF -"), vec!["products/app"]);
-        assert_eq!(native("gcc main.c -o products/app -MMD -MF ./-"), vec!["[-]", "products/app"]);
-        assert_eq!(c_family_patterns("clang main.c -o products/app -MMD -MF products/app.d -MJ products/compile.json", &["clang"], true).unwrap(),
-            vec!["products/app", "products/app.d", "products/compile.json"]);
-        assert_eq!(c_family_patterns("clang main.c -o products/app -MJ-", &["clang"], true).unwrap(),
-            vec!["products/app"]);
-        assert_eq!(c_family_patterns("clang main.c -o products/app -MJ./-", &["clang"], true).unwrap(),
-            vec!["[-]", "products/app"]);
+        assert_eq!(
+            native("gcc -c main.c -o products/main.o -MMD -MF products/main.d -MP"),
+            vec!["products/main.d", "products/main.o"]
+        );
+        assert_eq!(
+            native("gcc main.c -o products/app -MD -MFproducts/all.d"),
+            vec!["products/all.d", "products/app"]
+        );
+        assert_eq!(
+            native("gcc main.c -o products/app -MMD -MF -"),
+            vec!["products/app"]
+        );
+        assert_eq!(
+            native("gcc main.c -o products/app -MMD -MF ./-"),
+            vec!["[-]", "products/app"]
+        );
+        assert_eq!(
+            c_family_patterns(
+                "clang main.c -o products/app -MMD -MF products/app.d -MJ products/compile.json",
+                &["clang"],
+                true
+            )
+            .unwrap(),
+            vec!["products/app", "products/app.d", "products/compile.json"]
+        );
+        assert_eq!(
+            c_family_patterns("clang main.c -o products/app -MJ-", &["clang"], true).unwrap(),
+            vec!["products/app"]
+        );
+        assert_eq!(
+            c_family_patterns("clang main.c -o products/app -MJ./-", &["clang"], true).unwrap(),
+            vec!["[-]", "products/app"]
+        );
     }
 
     #[test]
@@ -614,24 +819,45 @@ mod tests {
                     let command = format!("{driver} {mode} main.c -MMD -o {output}");
                     let mut expected = vec![output.to_owned(), dependency.to_owned()];
                     expected.sort();
-                    assert_eq!(c_family_patterns(&command, &[driver], driver == "clang").unwrap(), expected, "{command}");
+                    assert_eq!(
+                        c_family_patterns(&command, &[driver], driver == "clang").unwrap(),
+                        expected,
+                        "{command}"
+                    );
                 }
             }
         }
-        assert_eq!(c_family_patterns("gcc main.c -MD -o 'products/app[dev]*?'", &["gcc"], false).unwrap(),
-            vec!["products/app[[]dev[]][*][?]", "products/app[[]dev[]][*][?].d"]);
+        assert_eq!(
+            c_family_patterns("gcc main.c -MD -o 'products/app[dev]*?'", &["gcc"], false).unwrap(),
+            vec![
+                "products/app[[]dev[]][*][?]",
+                "products/app[[]dev[]][*][?].d"
+            ]
+        );
     }
 
     #[test]
     fn native_option_values_are_opaque_and_filename_filters_are_literal() {
         for option in ["-D", "-I", "-L", "-include", "-imacros", "-MT", "-MQ"] {
             let command = format!("gcc main.c {option} '-odecoy' -o real");
-            assert_eq!(c_family_patterns(&command, &["gcc"], false).unwrap(), vec!["real"]);
+            assert_eq!(
+                c_family_patterns(&command, &["gcc"], false).unwrap(),
+                vec!["real"]
+            );
         }
-        assert_eq!(c_family_patterns("gcc main.c -o 'products/app[dev]*?'", &["gcc"], false).unwrap(),
-            vec!["products/app[[]dev[]][*][?]"]);
-        assert_eq!(c_family_patterns("clang main.c -o '- output' -MMD -MF 'products/dep[1].d'", &["clang"], true).unwrap(),
-            vec!["[-] output", "products/dep[[]1[]].d"]);
+        assert_eq!(
+            c_family_patterns("gcc main.c -o 'products/app[dev]*?'", &["gcc"], false).unwrap(),
+            vec!["products/app[[]dev[]][*][?]"]
+        );
+        assert_eq!(
+            c_family_patterns(
+                "clang main.c -o '- output' -MMD -MF 'products/dep[1].d'",
+                &["clang"],
+                true
+            )
+            .unwrap(),
+            vec!["[-] output", "products/dep[[]1[]].d"]
+        );
     }
 
     #[test]
@@ -668,7 +894,10 @@ mod tests {
             "gcc main.c -o ../app",
             "gcc main.c -o /tmp/app",
         ] {
-            assert!(c_family_patterns(command, &["gcc"], false).is_none(), "{command}");
+            assert!(
+                c_family_patterns(command, &["gcc"], false).is_none(),
+                "{command}"
+            );
         }
         for command in [
             "clang main.c -o app -object-file-name=other",
@@ -676,7 +905,10 @@ mod tests {
             "clang main.c -o app -Xclang -emit-pch",
             "clang main.c -o app -MJ first.json -MJ second.json",
         ] {
-            assert!(c_family_patterns(command, &["clang"], true).is_none(), "{command}");
+            assert!(
+                c_family_patterns(command, &["clang"], true).is_none(),
+                "{command}"
+            );
         }
     }
 
@@ -684,12 +916,18 @@ mod tests {
     fn native_artifacts_and_depfiles_remain_project_rooted_under_custom_target_sync() {
         use super::super::{get_custom_target_artifact_patterns, get_project_artifact_patterns};
         use rch_common::CompilationKind;
-        for (kind, driver) in [(CompilationKind::Gcc, "gcc"), (CompilationKind::Gpp, "g++"),
-            (CompilationKind::Clang, "clang"), (CompilationKind::Clangpp, "clang++")]
-        {
-            let command = format!("{driver} main.c -o target/native/app -MMD -MF target/native/app.d");
-            assert_eq!(get_project_artifact_patterns(Some(kind), Some(&command), true),
-                vec!["target/native/app", "target/native/app.d"]);
+        for (kind, driver) in [
+            (CompilationKind::Gcc, "gcc"),
+            (CompilationKind::Gpp, "g++"),
+            (CompilationKind::Clang, "clang"),
+            (CompilationKind::Clangpp, "clang++"),
+        ] {
+            let command =
+                format!("{driver} main.c -o target/native/app -MMD -MF target/native/app.d");
+            assert_eq!(
+                get_project_artifact_patterns(Some(kind), Some(&command), true),
+                vec!["target/native/app", "target/native/app.d"]
+            );
             assert!(get_custom_target_artifact_patterns(Some(kind), Some(&command)).is_empty());
         }
     }
@@ -705,7 +943,8 @@ mod tests {
 
         async fn run(command: &mut Command) -> std::process::Output {
             command.stdin(Stdio::null()).kill_on_drop(true);
-            let output = tokio::time::timeout(Duration::from_secs(20), command.output()).await
+            let output = tokio::time::timeout(Duration::from_secs(20), command.output())
+                .await
                 .expect("owned native artifact fixture exceeded its deadline")
                 .expect("gcc, clang and rsync are required for the native artifact regression");
             assert!(output.status.success(), "{output:?}");
@@ -727,10 +966,18 @@ mod tests {
             }
             std::fs::write(source.join("main.c"),
                 b"#include <stdio.h>\n#include \"message.h\"\nint main(void) { puts(MESSAGE); return 0; }\n").unwrap();
-            std::fs::write(source.join("message.h"), b"#define MESSAGE \"remote-artifact-ok\"\n").unwrap();
+            std::fs::write(
+                source.join("message.h"),
+                b"#define MESSAGE \"remote-artifact-ok\"\n",
+            )
+            .unwrap();
             std::fs::write(local.join("main.c"), b"local source sentinel\n").unwrap();
             let binary = "products/app[dev]*?";
-            let depfile = if named_dependency { "products/app.d" } else { "products/app[dev]*?.d" };
+            let depfile = if named_dependency {
+                "products/app.d"
+            } else {
+                "products/app[dev]*?.d"
+            };
             let fragment = "products/app.compile.json";
             let mut argv = vec!["main.c", "-O2", "-MMD", "-o", binary];
             if named_dependency {
@@ -742,8 +989,11 @@ mod tests {
                 files.push(fragment);
             }
             let mut compiler = Command::new(driver);
-            compiler.args(&argv).current_dir(&source)
-                .env_remove("DEPENDENCIES_OUTPUT").env_remove("SUNPRO_DEPENDENCIES");
+            compiler
+                .args(&argv)
+                .current_dir(&source)
+                .env_remove("DEPENDENCIES_OUTPUT")
+                .env_remove("SUNPRO_DEPENDENCIES");
             run(&mut compiler).await;
             std::fs::write(local.join(binary), b"stale local output").unwrap();
             std::fs::write(source.join("products/appdOTHER1"), b"wildcard decoy").unwrap();
@@ -754,20 +1004,39 @@ mod tests {
             for _ in 0..2 {
                 // Repeated transfer must also preserve the no-op/current case.
                 let mut rsync = Command::new("rsync");
-                rsync.args(["-a", "--checksum", "--no-owner", "--no-group", "--safe-links",
-                    "--prune-empty-dirs", "--include=*/"]);
+                rsync.args([
+                    "-a",
+                    "--checksum",
+                    "--no-owner",
+                    "--no-group",
+                    "--safe-links",
+                    "--prune-empty-dirs",
+                    "--include=*/",
+                ]);
                 for pattern in &patterns {
                     assert!(!pattern.starts_with("- "));
                     rsync.arg(format!("--include=/{pattern}"));
                 }
-                rsync.arg("--exclude=*")
-                    .arg(format!("{}/", source.display())).arg(format!("{}/", local.display()));
+                rsync
+                    .arg("--exclude=*")
+                    .arg(format!("{}/", source.display()))
+                    .arg(format!("{}/", local.display()));
                 run(&mut rsync).await;
                 for path in &files {
-                    assert_eq!(std::fs::read(local.join(path)).unwrap(), std::fs::read(source.join(path)).unwrap());
+                    assert_eq!(
+                        std::fs::read(local.join(path)).unwrap(),
+                        std::fs::read(source.join(path)).unwrap()
+                    );
                 }
-                assert!(std::fs::read_to_string(local.join(depfile)).unwrap().contains("message.h"));
-                assert_eq!(std::fs::read(local.join("main.c")).unwrap(), b"local source sentinel\n");
+                assert!(
+                    std::fs::read_to_string(local.join(depfile))
+                        .unwrap()
+                        .contains("message.h")
+                );
+                assert_eq!(
+                    std::fs::read(local.join("main.c")).unwrap(),
+                    b"local source sentinel\n"
+                );
                 assert!(!local.join("products/appdOTHER1").exists());
                 assert!(!local.join("products/foreign.o").exists());
                 let mut executable = Command::new(local.join(binary));
@@ -810,20 +1079,42 @@ mod tests {
             true,
         );
         let mut command = Command::new("rsync");
-        command.args(["-a", "--checksum", "--no-owner", "--no-group", "--safe-links", "--prune-empty-dirs", "--include=*/"]);
+        command.args([
+            "-a",
+            "--checksum",
+            "--no-owner",
+            "--no-group",
+            "--safe-links",
+            "--prune-empty-dirs",
+            "--include=*/",
+        ]);
         for pattern in &patterns {
             assert!(!pattern.starts_with("- "));
             command.arg(format!("--include=/{pattern}"));
         }
-        command.arg("--exclude=*")
-            .arg(format!("{}/", source.display())).arg(format!("{}/", local.display()))
-            .stdin(Stdio::null()).kill_on_drop(true);
-        let output = tokio::time::timeout(Duration::from_secs(10), command.output()).await
-            .expect("rsync deadline").expect("rsync is required for artifact delivery tests");
+        command
+            .arg("--exclude=*")
+            .arg(format!("{}/", source.display()))
+            .arg(format!("{}/", local.display()))
+            .stdin(Stdio::null())
+            .kill_on_drop(true);
+        let output = tokio::time::timeout(Duration::from_secs(10), command.output())
+            .await
+            .expect("rsync deadline")
+            .expect("rsync is required for artifact delivery tests");
         assert!(output.status.success(), "{output:?}");
-        assert_eq!(std::fs::read(local.join(binary)).unwrap(), b"new compiled artifact\0\xff");
-        assert_eq!(std::fs::read(local.join("dist/inputs.d")).unwrap(), b"artifact: main.rs\n");
-        assert_eq!(std::fs::read(local.join("dist/main.rs")).unwrap(), b"local source sentinel\n");
+        assert_eq!(
+            std::fs::read(local.join(binary)).unwrap(),
+            b"new compiled artifact\0\xff"
+        );
+        assert_eq!(
+            std::fs::read(local.join("dist/inputs.d")).unwrap(),
+            b"artifact: main.rs\n"
+        );
+        assert_eq!(
+            std::fs::read(local.join("dist/main.rs")).unwrap(),
+            b"local source sentinel\n"
+        );
         assert!(!local.join("dist/appdOTHER1").exists());
         assert!(!local.join("target").exists());
     }

@@ -132,7 +132,13 @@ fn handshake_carries_real_capability_and_once_worker_exits_on_close() {
     // One-shot sessions still exit cleanly on peer close. Persistent default
     // reconnection is separately exercised by reconnect_live.rs.
     let mut worker = Command::new(worker_bin())
-        .args(["--coordinator", &addr, "--worker-id", "close-test", "--once"])
+        .args([
+            "--coordinator",
+            &addr,
+            "--worker-id",
+            "close-test",
+            "--once",
+        ])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -166,7 +172,13 @@ fn malformed_exec_request_does_not_tear_down_the_session() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap().to_string();
     let mut worker = Command::new(worker_bin())
-        .args(["--coordinator", &addr, "--worker-id", "robust-test", "--once"])
+        .args([
+            "--coordinator",
+            &addr,
+            "--worker-id",
+            "robust-test",
+            "--once",
+        ])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()

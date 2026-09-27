@@ -143,8 +143,7 @@ fn validate_identity(lease: &DurableJobLease, record: &Value) -> Result<()> {
 fn validate_completion(lease: &DurableJobLease, reply: &Value) -> Result<i32> {
     anyhow::ensure!(
         reply["status"] == "completed"
-            && reply["local_wrapper_id"].as_str()
-                == Some(lease.identity.local_wrapper_id.as_str()),
+            && reply["local_wrapper_id"].as_str() == Some(lease.identity.local_wrapper_id.as_str()),
         "daemon completion identity mismatch"
     );
     let id = lease
@@ -196,8 +195,7 @@ fn validate_admitted_cancellation(
         .filter(|worker| !worker.is_empty())
         .context("cancellation requires an admitted worker identity")?;
     anyhow::ensure!(
-        reply["build_id"].as_u64() == Some(id)
-            && reply["worker_id"].as_str() == Some(worker),
+        reply["build_id"].as_u64() == Some(id) && reply["worker_id"].as_str() == Some(worker),
         "daemon cancellation build/worker mismatch; no wrapper stop requested"
     );
     // The build endpoint fences the wrapper in its request and does not
@@ -761,18 +759,36 @@ mod tests {
     fn proc_stat(state: &str, ticks: u64) -> String {
         // Fields 3 (state) through 22 (starttime); the command deliberately
         // contains spaces and parentheses, so splitting at the first ')' fails.
-        format!("123 (rch (wrapper)) {state} {} {ticks}", vec!["0"; 18].join(" "))
+        format!(
+            "123 (rch (wrapper)) {state} {} {ticks}",
+            vec!["0"; 18].join(" ")
+        )
     }
 
     #[test]
     fn owner_observation_distinguishes_live_dead_reused_and_unknown() {
-        assert_eq!(owner_from_proc_stat(&proc_stat("S", 42), 42), OwnerPresence::Live);
+        assert_eq!(
+            owner_from_proc_stat(&proc_stat("S", 42), 42),
+            OwnerPresence::Live
+        );
         for state in ["Z", "X", "x"] {
-            assert_eq!(owner_from_proc_stat(&proc_stat(state, 42), 42), OwnerPresence::Absent);
+            assert_eq!(
+                owner_from_proc_stat(&proc_stat(state, 42), 42),
+                OwnerPresence::Absent
+            );
         }
-        assert_eq!(owner_from_proc_stat(&proc_stat("R", 43), 42), OwnerPresence::Absent);
-        assert_eq!(owner_from_proc_stat(&proc_stat("?", 42), 42), OwnerPresence::Unknown);
-        assert_eq!(owner_from_proc_stat("unreadable or truncated", 42), OwnerPresence::Unknown);
+        assert_eq!(
+            owner_from_proc_stat(&proc_stat("R", 43), 42),
+            OwnerPresence::Absent
+        );
+        assert_eq!(
+            owner_from_proc_stat(&proc_stat("?", 42), 42),
+            OwnerPresence::Unknown
+        );
+        assert_eq!(
+            owner_from_proc_stat("unreadable or truncated", 42),
+            OwnerPresence::Unknown
+        );
         assert_eq!(owner_presence(&queued_lease()), OwnerPresence::Unknown);
     }
 

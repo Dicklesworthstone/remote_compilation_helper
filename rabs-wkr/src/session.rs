@@ -6,13 +6,15 @@
 //! harvesting after successful cleanup. Results are offers, never publications;
 //! the prototype newline transport is not authenticated ATP.
 
-use rabs_protocol::capability_tokens::CapabilityToken;
 use crate::artifacts::PreparedArtifacts;
 use crate::execution::{DEFAULT_EXECUTION_TIMEOUT, ExecutionControl};
 use crate::output::CapturedOutputs;
 use crate::source_transfer::SourceOwner;
-use rabs_sandbox::process_context::{CommandContext, COMMAND_CONTEXT_VERSION, MAX_COMMAND_ENV_ENTRIES};
-use rabs_sandbox::toolchain_dataset::{ToolchainIdentity, TOOLCHAIN_DATASET_VERSION};
+use rabs_protocol::capability_tokens::CapabilityToken;
+use rabs_sandbox::process_context::{
+    COMMAND_CONTEXT_VERSION, CommandContext, MAX_COMMAND_ENV_ENTRIES,
+};
+use rabs_sandbox::toolchain_dataset::{TOOLCHAIN_DATASET_VERSION, ToolchainIdentity};
 
 pub(crate) mod toolchain_pool;
 pub use toolchain_pool::ToolchainReuseScope;
@@ -124,21 +126,34 @@ pub fn parse_toolchain_identity(
 /// Malformed or unsupported contexts refuse before durable admission. Values
 /// never appear in errors, including rejected non-string environment values.
 pub fn parse_command_context(request: &serde_json::Value) -> Result<CommandContext, String> {
-    let Some(value) = request.get("command_context") else { return Ok(CommandContext::default()); };
-    let object = value.as_object().filter(|object| object.len() == 3)
+    let Some(value) = request.get("command_context") else {
+        return Ok(CommandContext::default());
+    };
+    let object = value
+        .as_object()
+        .filter(|object| object.len() == 3)
         .ok_or("command_context requires exactly version, cwd and env")?;
     if object.get("version").and_then(serde_json::Value::as_str) != Some(COMMAND_CONTEXT_VERSION) {
         return Err("unsupported command_context version".to_owned());
     }
-    let cwd = object.get("cwd").and_then(serde_json::Value::as_str)
+    let cwd = object
+        .get("cwd")
+        .and_then(serde_json::Value::as_str)
         .ok_or("command_context cwd must be a string")?;
-    let env = object.get("env").and_then(serde_json::Value::as_object)
+    let env = object
+        .get("env")
+        .and_then(serde_json::Value::as_object)
         .filter(|env| env.len() <= MAX_COMMAND_ENV_ENTRIES)
         .ok_or("command_context env must be a bounded string map")?;
-    let env = env.iter().map(|(name, value)| {
-        value.as_str().map(|value| (name.clone(), value.to_owned()))
-            .ok_or_else(|| "command_context env values must be strings".to_owned())
-    }).collect::<Result<Vec<_>, _>>()?;
+    let env = env
+        .iter()
+        .map(|(name, value)| {
+            value
+                .as_str()
+                .map(|value| (name.clone(), value.to_owned()))
+                .ok_or_else(|| "command_context env values must be strings".to_owned())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     CommandContext::new(cwd, env).map_err(|error| error.to_string())
 }
 
@@ -219,7 +234,9 @@ fn stream_digest(lane: &rabs_asupersync::stream_drain::LaneDrain) -> std::io::Re
         let mut chunk = [0u8; 64 * 1024];
         loop {
             let n = reader.read(&mut chunk)?;
-            if n == 0 { break; }
+            if n == 0 {
+                break;
+            }
             hasher.update(&chunk[..n]);
         }
     }
@@ -230,10 +247,19 @@ fn stream_digest(lane: &rabs_asupersync::stream_drain::LaneDrain) -> std::io::Re
 #[must_use]
 pub fn probe_capability(worker_id: &str) -> CapabilityReport {
     let support = rabs_sandbox::canonical_namespace::HostIsolationSupport::probe();
-    let missing: Vec<String> = support.missing_for_canonical().into_iter().map(str::to_string).collect();
-    let slots = std::thread::available_parallelism().map(|n| n.get() as u32).unwrap_or(1);
+    let missing: Vec<String> = support
+        .missing_for_canonical()
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    let slots = std::thread::available_parallelism()
+        .map(|n| n.get() as u32)
+        .unwrap_or(1);
     CapabilityReport {
-        worker_id: worker_id.to_string(), canonical_namespace: missing.is_empty(), missing, slots,
+        worker_id: worker_id.to_string(),
+        canonical_namespace: missing.is_empty(),
+        missing,
+        slots,
     }
 }
 
@@ -248,22 +274,38 @@ pub fn sample_pressure(staging_dir: &std::path::Path) -> PressureSample {
         .unwrap_or(0);
     // 0 means unknown where the platform probe is unavailable.
     let free_disk_mib = free_disk_mib(staging_dir);
-    PressureSample { load_x100, free_disk_mib }
+    PressureSample {
+        load_x100,
+        free_disk_mib,
+    }
 }
 
 #[cfg(target_os = "linux")]
 fn free_disk_mib(dir: &std::path::Path) -> u64 {
     // POSIX df output guarantees one line per filesystem; avoid libc/unsafe.
-    let output = std::process::Command::new("df").arg("-Pk").arg(dir).output();
-    output.ok().and_then(|o| {
-        String::from_utf8(o.stdout).ok().and_then(|text| {
-            text.lines().nth(1).and_then(|line| line.split_whitespace().nth(3).and_then(|kb| kb.parse::<u64>().ok()))
+    let output = std::process::Command::new("df")
+        .arg("-Pk")
+        .arg(dir)
+        .output();
+    output
+        .ok()
+        .and_then(|o| {
+            String::from_utf8(o.stdout).ok().and_then(|text| {
+                text.lines().nth(1).and_then(|line| {
+                    line.split_whitespace()
+                        .nth(3)
+                        .and_then(|kb| kb.parse::<u64>().ok())
+                })
+            })
         })
-    }).map(|kb| kb / 1024).unwrap_or(0)
+        .map(|kb| kb / 1024)
+        .unwrap_or(0)
 }
 
 #[cfg(not(target_os = "linux"))]
-fn free_disk_mib(_dir: &std::path::Path) -> u64 { 0 }
+fn free_disk_mib(_dir: &std::path::Path) -> u64 {
+    0
+}
 
 /// Per-stream RESIDENT bound for canonical execution output (G007):
 /// heads carry diagnostics; overflow streams to disk spill archives.
@@ -283,7 +325,14 @@ pub fn execute_canonical(
     let Ok(control) = ExecutionControl::new(DEFAULT_EXECUTION_TIMEOUT) else {
         return exec_error(request.request_id);
     };
-    execute_canonical_controlled(request, cargo_home_backing, home_backing, slots, spill_root, &control)
+    execute_canonical_controlled(
+        request,
+        cargo_home_backing,
+        home_backing,
+        slots,
+        spill_root,
+        &control,
+    )
 }
 
 /// Execute using the session's cancellation/deadline authority. The sandbox,
@@ -299,8 +348,18 @@ pub fn execute_canonical_controlled(
     spill_root: &std::path::Path,
     control: &ExecutionControl,
 ) -> ExecResult {
-    let mut result = execute_canonical_inner(request, cargo_home_backing, home_backing, slots, spill_root, control, None);
-    if let Some(reason) = control.finish() { result.exit_code = reason.exit_code(); }
+    let mut result = execute_canonical_inner(
+        request,
+        cargo_home_backing,
+        home_backing,
+        slots,
+        spill_root,
+        control,
+        None,
+    );
+    if let Some(reason) = control.finish() {
+        result.exit_code = reason.exit_code();
+    }
     result
 }
 
@@ -320,9 +379,17 @@ pub fn execute_uploaded_canonical_controlled(
     source: &SourceOwner,
 ) -> ExecResult {
     let mut result = execute_canonical_inner(
-        request, cargo_home_backing, home_backing, slots, spill_root, control, Some(source),
+        request,
+        cargo_home_backing,
+        home_backing,
+        slots,
+        spill_root,
+        control,
+        Some(source),
     );
-    if let Some(reason) = control.finish() { result.exit_code = reason.exit_code(); }
+    if let Some(reason) = control.finish() {
+        result.exit_code = reason.exit_code();
+    }
     result
 }
 
@@ -338,11 +405,17 @@ fn execute_canonical_inner(
     use rabs_asupersync::process_groups::ManagedProcessGroup;
     use rabs_asupersync::region_tree::Attribution;
     use rabs_sandbox::canonical_mounts::CanonicalMountPlan;
-    use rabs_sandbox::canonical_namespace::{HostIsolationSupport, build_canonical_argv, command_for};
+    use rabs_sandbox::canonical_namespace::{
+        HostIsolationSupport, build_canonical_argv, command_for,
+    };
     use std::process::Stdio;
-    if control.reason().is_some() { return exec_error(request.request_id); }
+    if control.reason().is_some() {
+        return exec_error(request.request_id);
+    }
     let support = HostIsolationSupport::probe();
-    if !support.missing_for_canonical().is_empty() { return exec_error(request.request_id); }
+    if !support.missing_for_canonical().is_empty() {
+        return exec_error(request.request_id);
+    }
 
     // The lease retains independent bytes until processes and drains resolve.
     // Only an explicit complete content identity may reuse a captured dataset;
@@ -358,10 +431,13 @@ fn execute_canonical_inner(
             return exec_error(request.request_id);
         }
     };
-    eprintln!("{}", serde_json::json!({
-        "kind":"worker-toolchain-acquired", "request_id":request.request_id,
-        "disposition":toolchain.disposition(), "pinned":request.toolchain_identity.is_some(),
-    }));
+    eprintln!(
+        "{}",
+        serde_json::json!({
+            "kind":"worker-toolchain-acquired", "request_id":request.request_id,
+            "disposition":toolchain.disposition(), "pinned":request.toolchain_identity.is_some(),
+        })
+    );
     let mut plan = CanonicalMountPlan::new(
         toolchain.root(),
         &request.workspace_backing,
@@ -371,15 +447,23 @@ fn execute_canonical_inner(
     // The peer supplies only a declaration; this execution owns fresh physical
     // backing. Use D005's existing mount builder and keep the owner alive until
     // the process and drains have resolved and the exact output set is captured.
-    let artifacts = match control.artifact_plan().map(PreparedArtifacts::new).transpose() {
+    let artifacts = match control
+        .artifact_plan()
+        .map(PreparedArtifacts::new)
+        .transpose()
+    {
         Ok(artifacts) => artifacts,
         Err(error) => {
             let _ = control.retain_artifacts(Err(format!("artifact preparation: {error}")));
             return exec_error(request.request_id);
         }
     };
-    if let Some(artifacts) = &artifacts { plan.out_units.push(artifacts.mount()); }
-    let Ok(mut spec) = plan.to_spec() else { return exec_error(request.request_id); };
+    if let Some(artifacts) = &artifacts {
+        plan.out_units.push(artifacts.mount());
+    }
+    let Ok(mut spec) = plan.to_spec() else {
+        return exec_error(request.request_id);
+    };
     if let Err(error) = request.command_context.apply_to(&mut spec) {
         let _ = control.retain_outputs(Err(format!("command context: {error}")));
         return exec_error(request.request_id);
@@ -399,9 +483,7 @@ fn execute_canonical_inner(
     let grant = request.jobserver_grant.unwrap_or(slots).min(slots).max(1);
     // One real FIFO budget is held until the process group and drains resolve.
     // Runtime coordination belongs in writable HOME, never in verified source.
-    let bridge = match crate::jobserver::JobserverBridge::mint(
-        grant, home_backing,
-    ) {
+    let bridge = match crate::jobserver::JobserverBridge::mint(grant, home_backing) {
         Ok(bridge) => bridge,
         Err(_) => return exec_error(request.request_id),
     };
@@ -412,9 +494,17 @@ fn execute_canonical_inner(
 
     // Managed process-group execution (G006) with concurrent bounded G007 drains.
     let mut command = command_for(&launch);
-    command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
-    let attribution = Attribution { attempt: Some(request.request_id.to_string()), ..Attribution::default() };
-    if control.reason().is_some() { return exec_error(request.request_id); }
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let attribution = Attribution {
+        attempt: Some(request.request_id.to_string()),
+        ..Attribution::default()
+    };
+    if control.reason().is_some() {
+        return exec_error(request.request_id);
+    }
     if let Err(error) = toolchain.verify(|| control.reason().is_some()) {
         let _ = control.retain_outputs(Err(format!(
             "toolchain pre-execution verification: {error}"
@@ -423,7 +513,9 @@ fn execute_canonical_inner(
     }
     // Verification may have spent the remaining lease or execution budget.
     // Do not start a compiler after that final input-preparation boundary.
-    if control.reason().is_some() { return exec_error(request.request_id); }
+    if control.reason().is_some() {
+        return exec_error(request.request_id);
+    }
     let Ok(group) = ManagedProcessGroup::spawn_command(command, attribution) else {
         return exec_error(request.request_id);
     };
@@ -434,8 +526,10 @@ fn execute_canonical_inner(
     // Live tails are observational only. The SAME managed wait still owns the
     // aggregate capture budget, cancellation, descendant cleanup and full spools.
     let outcome = match group.wait_with_bounded_drain_preview(
-        &limits, rabs_asupersync::stream_drain::DEFAULT_MAX_CAPTURE_BYTES,
-        Some(control.output_observer()), || control.reason().is_some(),
+        &limits,
+        rabs_asupersync::stream_drain::DEFAULT_MAX_CAPTURE_BYTES,
+        Some(control.output_observer()),
+        || control.reason().is_some(),
     ) {
         Ok(output) => {
             // A same-credential host mutation is outside namespace isolation.
@@ -448,7 +542,9 @@ fn execute_canonical_inner(
                 && let Err(error) = toolchain.verify(|| control.reason().is_some())
                 && control.reason().is_none()
             {
-                let _ = control.retain_outputs(Err(format!("toolchain post-execution verification: {error}")));
+                let _ = control.retain_outputs(Err(format!(
+                    "toolchain post-execution verification: {error}"
+                )));
                 return exec_error(request.request_id);
             }
             // Cleanup precedes both diagnostic and artifact capture. The outer
@@ -462,13 +558,21 @@ fn execute_canonical_inner(
             let exit_code = output.status.code().unwrap_or(-1);
             let (stdout_sha256, stderr_sha256) = if control.output_capture_requested() {
                 let capture = CapturedOutputs::from_lanes(&output.stdout, &output.stderr);
-                let digests = capture.as_ref().ok().map(|outputs| (
-                    outputs.stdout.sha256().to_owned(), outputs.stderr.sha256().to_owned(),
-                ));
-                if control.retain_outputs(capture.map_err(|error| error.to_string())).is_err() {
+                let digests = capture.as_ref().ok().map(|outputs| {
+                    (
+                        outputs.stdout.sha256().to_owned(),
+                        outputs.stderr.sha256().to_owned(),
+                    )
+                });
+                if control
+                    .retain_outputs(capture.map_err(|error| error.to_string()))
+                    .is_err()
+                {
                     return exec_error(request.request_id);
                 }
-                let Some(digests) = digests else { return exec_error(request.request_id); };
+                let Some(digests) = digests else {
+                    return exec_error(request.request_id);
+                };
                 digests
             } else {
                 match (stream_digest(&output.stdout), stream_digest(&output.stderr)) {
@@ -477,18 +581,27 @@ fn execute_canonical_inner(
                 }
             };
             if let Some(artifacts) = artifacts
-                && exit_code == 0 && output.residual_group_members == 0 && control.reason().is_none()
+                && exit_code == 0
+                && output.residual_group_members == 0
+                && control.reason().is_none()
             {
                 let capture = artifacts.capture(|| control.reason().is_some());
                 // Retain failure as evidence. A zero compiler exit is NOT a
                 // successful completion if its requested artifact set is missing.
-                if control.retain_artifacts(capture.map_err(|error| error.to_string())).is_err() {
+                if control
+                    .retain_artifacts(capture.map_err(|error| error.to_string()))
+                    .is_err()
+                {
                     return exec_error(request.request_id);
                 }
             }
             ExecResult {
-                request_id: request.request_id, exit_code, stdout_sha256, stderr_sha256,
-                executed: true, residual_group_members: output.residual_group_members,
+                request_id: request.request_id,
+                exit_code,
+                stdout_sha256,
+                stderr_sha256,
+                executed: true,
+                residual_group_members: output.residual_group_members,
                 stdout_spill_bytes: output.stdout.spilled_bytes(),
                 stderr_spill_bytes: output.stderr.spilled_bytes(),
                 stdout_spill_path: output.stdout.spill().map(|s| s.path.display().to_string()),
@@ -503,9 +616,16 @@ fn execute_canonical_inner(
 
 fn exec_error(request_id: u64) -> ExecResult {
     ExecResult {
-        request_id, exit_code: -1, stdout_sha256: sha256_hex(b""), stderr_sha256: sha256_hex(b""),
-        executed: false, residual_group_members: 0, stdout_spill_bytes: 0, stderr_spill_bytes: 0,
-        stdout_spill_path: None, stderr_spill_path: None,
+        request_id,
+        exit_code: -1,
+        stdout_sha256: sha256_hex(b""),
+        stderr_sha256: sha256_hex(b""),
+        executed: false,
+        residual_group_members: 0,
+        stdout_spill_bytes: 0,
+        stderr_spill_bytes: 0,
+        stdout_spill_path: None,
+        stderr_spill_path: None,
     }
 }
 
@@ -523,9 +643,17 @@ pub fn admit_worker(
     report: &CapabilityReport,
     require_canonical: bool,
 ) -> Result<(), HandshakeRefusal> {
-    rabs_protocol::capability_tokens::validate(token, revoked, current_seq, session_id, operation_id)
-        .map_err(|refusal| HandshakeRefusal::TokenInvalid(format!("{refusal:?}")))?;
-    if require_canonical && !report.canonical_namespace { return Err(HandshakeRefusal::NotCanonicalCapable); }
+    rabs_protocol::capability_tokens::validate(
+        token,
+        revoked,
+        current_seq,
+        session_id,
+        operation_id,
+    )
+    .map_err(|refusal| HandshakeRefusal::TokenInvalid(format!("{refusal:?}")))?;
+    if require_canonical && !report.canonical_namespace {
+        return Err(HandshakeRefusal::NotCanonicalCapable);
+    }
     Ok(())
 }
 
@@ -541,32 +669,59 @@ mod tests {
     #[test]
     fn admission_validates_token_and_capability_requirement() {
         let report = CapabilityReport {
-            worker_id: "hz2".into(), canonical_namespace: true, missing: vec![], slots: 8,
+            worker_id: "hz2".into(),
+            canonical_namespace: true,
+            missing: vec![],
+            slots: 8,
         };
         assert!(admit_worker(&token(), &[], 50, 7, 3, &report, true).is_ok());
-        assert!(matches!(admit_worker(&token(), &[], 50, 999, 3, &report, true), Err(HandshakeRefusal::TokenInvalid(_))));
-        assert!(matches!(admit_worker(&token(), &[1], 50, 7, 3, &report, true), Err(HandshakeRefusal::TokenInvalid(_))));
+        assert!(matches!(
+            admit_worker(&token(), &[], 50, 999, 3, &report, true),
+            Err(HandshakeRefusal::TokenInvalid(_))
+        ));
+        assert!(matches!(
+            admit_worker(&token(), &[1], 50, 7, 3, &report, true),
+            Err(HandshakeRefusal::TokenInvalid(_))
+        ));
         let weak = CapabilityReport {
-            canonical_namespace: false, missing: vec!["bubblewrap".into()], ..report.clone()
+            canonical_namespace: false,
+            missing: vec!["bubblewrap".into()],
+            ..report.clone()
         };
-        assert!(matches!(admit_worker(&token(), &[], 50, 7, 3, &weak, true), Err(HandshakeRefusal::NotCanonicalCapable)));
+        assert!(matches!(
+            admit_worker(&token(), &[], 50, 7, 3, &weak, true),
+            Err(HandshakeRefusal::NotCanonicalCapable)
+        ));
         assert!(admit_worker(&token(), &[], 50, 7, 3, &weak, false).is_ok());
     }
 
     #[test]
     fn exec_result_is_an_offer_with_content_digests() {
         let result = ExecResult {
-            request_id: 9, exit_code: 0, stdout_sha256: sha256_hex(b"hello"), stderr_sha256: sha256_hex(b""),
-            executed: true, residual_group_members: 0, stdout_spill_bytes: 0, stderr_spill_bytes: 0,
-            stdout_spill_path: None, stderr_spill_path: None,
+            request_id: 9,
+            exit_code: 0,
+            stdout_sha256: sha256_hex(b"hello"),
+            stderr_sha256: sha256_hex(b""),
+            executed: true,
+            residual_group_members: 0,
+            stdout_spill_bytes: 0,
+            stderr_spill_bytes: 0,
+            stdout_spill_path: None,
+            stderr_spill_path: None,
         };
         assert_eq!(result.request_id, 9);
-        assert_eq!(result.stdout_sha256, "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824");
+        assert_eq!(
+            result.stdout_sha256,
+            "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+        );
     }
 
     #[test]
     fn sha256_hex_is_stable() {
-        assert_eq!(sha256_hex(b""), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+        assert_eq!(
+            sha256_hex(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
     }
 
     #[test]
@@ -603,9 +758,13 @@ mod tests {
     fn non_canonical_host_returns_typed_non_result_not_fake_success() {
         let dir = tempfile::tempdir().expect("tempdir");
         let request = CanonicalExecRequest {
-            request_id: 1, program: "true".into(), args: vec![], toolchain_backing: "/tc".into(),
+            request_id: 1,
+            program: "true".into(),
+            args: vec![],
+            toolchain_backing: "/tc".into(),
             toolchain_identity: None,
-            workspace_backing: "/ws".into(), jobserver_grant: None,
+            workspace_backing: "/ws".into(),
+            jobserver_grant: None,
             command_context: CommandContext::default(),
         };
         let result = execute_canonical(&request, dir.path(), dir.path(), 4, dir.path());
@@ -616,7 +775,9 @@ mod tests {
     fn cancelled_preflight_never_creates_a_jobserver_or_launches() {
         let dir = tempfile::tempdir().unwrap();
         let request = CanonicalExecRequest {
-            request_id: 99, program: "true".into(), args: vec![],
+            request_id: 99,
+            program: "true".into(),
+            args: vec![],
             toolchain_backing: dir.path().join("absent-toolchain").display().to_string(),
             toolchain_identity: None,
             workspace_backing: dir.path().join("absent-workspace").display().to_string(),
@@ -625,7 +786,8 @@ mod tests {
         };
         let control = ExecutionControl::new(std::time::Duration::from_secs(10)).unwrap();
         control.cancel(crate::execution::StopReason::Cancelled);
-        let result = execute_canonical_controlled(&request, dir.path(), dir.path(), 2, dir.path(), &control);
+        let result =
+            execute_canonical_controlled(&request, dir.path(), dir.path(), 2, dir.path(), &control);
         assert!(!result.executed);
         assert_eq!(result.exit_code, 130);
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
@@ -634,30 +796,56 @@ mod tests {
     #[test]
     fn command_context_decode_preserves_exact_values_and_defaults_only_when_absent() {
         use serde_json::json;
-        assert_eq!(parse_command_context(&json!({})).unwrap(), CommandContext::default());
+        assert_eq!(
+            parse_command_context(&json!({})).unwrap(),
+            CommandContext::default()
+        );
         let request = json!({"command_context": {"version":COMMAND_CONTEXT_VERSION,
             "cwd":"/__rabs/workspace/member", "env":{"EMPTY":"", "LABEL":"spaces \"$HOME\"\n雪"}}});
         let original = request.clone();
         let context = parse_command_context(&request).unwrap();
-        assert_eq!(context.cwd(), std::path::Path::new("/__rabs/workspace/member"));
-        assert_eq!(context.environment(), &[("EMPTY".to_owned(), String::new()),
-            ("LABEL".to_owned(), "spaces \"$HOME\"\n雪".to_owned())]);
-        assert_eq!(request, original, "parsing never rewrites the journal request");
+        assert_eq!(
+            context.cwd(),
+            std::path::Path::new("/__rabs/workspace/member")
+        );
+        assert_eq!(
+            context.environment(),
+            &[
+                ("EMPTY".to_owned(), String::new()),
+                ("LABEL".to_owned(), "spaces \"$HOME\"\n雪".to_owned())
+            ]
+        );
+        assert_eq!(
+            request, original,
+            "parsing never rewrites the journal request"
+        );
     }
 
     #[test]
     fn malformed_command_context_never_becomes_default_context() {
         use serde_json::{Value, json};
         let valid = json!({"version":COMMAND_CONTEXT_VERSION,"cwd":"/__rabs/workspace","env":{}});
-        for invalid in [Value::Null, json!(true), json!([]), json!("env-cwd-v1"),
-            json!({"version":COMMAND_CONTEXT_VERSION,"env":{}})] {
+        for invalid in [
+            Value::Null,
+            json!(true),
+            json!([]),
+            json!("env-cwd-v1"),
+            json!({"version":COMMAND_CONTEXT_VERSION,"env":{}}),
+        ] {
             assert!(parse_command_context(&json!({"command_context":invalid})).is_err());
         }
-        for (field, value) in [("version", json!("env-cwd-v2")), ("cwd", Value::Null),
-            ("cwd", json!("/__rabs/workspace/../home")), ("env", json!([])),
-            ("env", json!({"LABEL":17})), ("env", json!({"HOME":"/other"})),
-            ("env", json!({"CARGO_MAKEFLAGS":"-j999"})), ("env", json!({"LABEL":"bad\u{0000}value"}))] {
-            let mut changed = valid.clone(); changed[field] = value;
+        for (field, value) in [
+            ("version", json!("env-cwd-v2")),
+            ("cwd", Value::Null),
+            ("cwd", json!("/__rabs/workspace/../home")),
+            ("env", json!([])),
+            ("env", json!({"LABEL":17})),
+            ("env", json!({"HOME":"/other"})),
+            ("env", json!({"CARGO_MAKEFLAGS":"-j999"})),
+            ("env", json!({"LABEL":"bad\u{0000}value"})),
+        ] {
+            let mut changed = valid.clone();
+            changed[field] = value;
             assert!(parse_command_context(&json!({"command_context":changed})).is_err());
         }
         let mut extra = valid;

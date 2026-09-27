@@ -33,7 +33,9 @@ impl Worker {
         }
         // Child-local settings only: no shared HOME, state, or test-wide env edits.
         for name in [
-            "RABS_WORKER_TLS_CA", "RABS_WORKER_TLS_CERT", "RABS_WORKER_TLS_KEY",
+            "RABS_WORKER_TLS_CA",
+            "RABS_WORKER_TLS_CERT",
+            "RABS_WORKER_TLS_KEY",
             "RABS_WORKER_TLS_SERVER_NAME",
         ] {
             command.env_remove(name);
@@ -53,7 +55,11 @@ impl Worker {
     }
 
     fn assert_alive(&mut self) {
-        assert!(self.child.try_wait().unwrap().is_none(), "worker exited: {}", self.logs());
+        assert!(
+            self.child.try_wait().unwrap().is_none(),
+            "worker exited: {}",
+            self.logs()
+        );
     }
 
     fn expect_exit(&mut self, code: i32) {
@@ -63,7 +69,11 @@ impl Worker {
                 assert_eq!(status.code(), Some(code), "{}", self.logs());
                 return;
             }
-            assert!(Instant::now() < until, "worker did not exit: {}", self.logs());
+            assert!(
+                Instant::now() < until,
+                "worker did not exit: {}",
+                self.logs()
+            );
             std::thread::sleep(Duration::from_millis(5));
         }
     }
@@ -92,7 +102,11 @@ impl Peer {
                     return Self(BufReader::new(stream));
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    assert!(Instant::now() < until, "no worker reconnect: {}", worker.logs());
+                    assert!(
+                        Instant::now() < until,
+                        "no worker reconnect: {}",
+                        worker.logs()
+                    );
                     std::thread::sleep(Duration::from_millis(5));
                 }
                 Err(error) => panic!("accept worker: {error}"),
@@ -107,7 +121,10 @@ impl Peer {
     fn receive(&mut self) -> Value {
         let mut line = String::new();
         (&mut self.0).take(1_048_577).read_line(&mut line).unwrap();
-        assert!(line.len() <= 1_048_576 && line.ends_with('\n'), "incomplete/oversized reply");
+        assert!(
+            line.len() <= 1_048_576 && line.ends_with('\n'),
+            "incomplete/oversized reply"
+        );
         serde_json::from_str(&line).unwrap()
     }
 
@@ -176,10 +193,13 @@ fn rejected_handshake_is_retried_but_cannot_advance_execution() {
     assert_eq!(hello["incarnation"], first["incarnation"]);
     assert_eq!(hello["boot_generation"], first["boot_generation"]);
     assert!(hello["request_high_water"].is_null());
-    let journal: Value = serde_json::from_slice(
-        &std::fs::read(root.path().join("state/requests.json")).unwrap(),
-    ).unwrap();
-    assert!(journal["last"].is_null(), "failed admission created execution ownership");
+    let journal: Value =
+        serde_json::from_slice(&std::fs::read(root.path().join("state/requests.json")).unwrap())
+            .unwrap();
+    assert!(
+        journal["last"].is_null(),
+        "failed admission created execution ownership"
+    );
 }
 
 #[test]
@@ -188,8 +208,14 @@ fn uncertain_execution_stays_fenced_across_live_reconnections() {
     let listener = listener();
     let address = listener.local_addr().unwrap().to_string();
     {
-        let mut journal = WorkerJournal::open(&root.path().join("state"), WORKER_ID, &address).unwrap();
-        assert_eq!(journal.admit(&request(7), DEFAULT_EXECUTION_TIMEOUT).unwrap(), None);
+        let mut journal =
+            WorkerJournal::open(&root.path().join("state"), WORKER_ID, &address).unwrap();
+        assert_eq!(
+            journal
+                .admit(&request(7), DEFAULT_EXECUTION_TIMEOUT)
+                .unwrap(),
+            None
+        );
     }
     let mut worker = Worker::start(&address, root.path(), false);
     let mut durable = None;
@@ -212,7 +238,10 @@ fn uncertain_execution_stays_fenced_across_live_reconnections() {
         assert_eq!(peer.receive()["reason"], "durable-request-conflict");
         let bytes = std::fs::read(root.path().join("state/requests.json")).unwrap();
         if let Some(before) = &durable {
-            assert_eq!(&bytes, before, "reconnection rewrote durable execution ownership");
+            assert_eq!(
+                &bytes, before,
+                "reconnection rewrote durable execution ownership"
+            );
         }
         durable = Some(bytes);
         drop(peer);
@@ -230,7 +259,9 @@ fn once_keeps_its_clean_exit_and_no_reconnect_contract() {
     peer.admit();
     drop(peer);
     worker.expect_exit(0);
-    assert!(matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock));
+    assert!(
+        matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+    );
     assert!(!worker.logs().contains("worker-reconnect-scheduled"));
 }
 
@@ -246,7 +277,9 @@ fn artifact_request(id: u64) -> Value {
 /// Seed real immutable capture bytes and a receipt through the production
 /// storage APIs. This is an explicit completed-result fixture, NOT a compiler.
 fn seed_retained_result(
-    root: &Path, address: &str, recipient: rabs_wkr::result_spool::ResultRecipient,
+    root: &Path,
+    address: &str,
+    recipient: rabs_wkr::result_spool::ResultRecipient,
 ) {
     use rabs_wkr::artifacts::{ArtifactPlan, PreparedArtifacts};
     use rabs_wkr::execution::ExecutionCompletion;
@@ -255,33 +288,51 @@ fn seed_retained_result(
     use rabs_wkr::session::{ExecResult, sha256_hex};
 
     let mut journal = WorkerJournal::open(&root.join("state"), WORKER_ID, address).unwrap();
-    assert_eq!(journal.admit(&artifact_request(50), DEFAULT_EXECUTION_TIMEOUT).unwrap(), None);
+    assert_eq!(
+        journal
+            .admit(&artifact_request(50), DEFAULT_EXECUTION_TIMEOUT)
+            .unwrap(),
+        None
+    );
     let plan = ArtifactPlan::new("dep".to_owned(), vec!["lib.rlib".to_owned()]).unwrap();
     let prepared = PreparedArtifacts::new(plan).unwrap();
     std::fs::write(prepared.backing().join("lib.rlib"), RETAINED_ARTIFACT).unwrap();
     let mut completion = ExecutionCompletion {
         result: ExecResult {
-            request_id: 50, exit_code: 0, executed: true, residual_group_members: 0,
-            stdout_sha256: sha256_hex(RETAINED_STDOUT), stderr_sha256: sha256_hex(b""),
-            stdout_spill_bytes: 0, stderr_spill_bytes: 0,
-            stdout_spill_path: None, stderr_spill_path: None,
+            request_id: 50,
+            exit_code: 0,
+            executed: true,
+            residual_group_members: 0,
+            stdout_sha256: sha256_hex(RETAINED_STDOUT),
+            stderr_sha256: sha256_hex(b""),
+            stdout_spill_bytes: 0,
+            stderr_spill_bytes: 0,
+            stdout_spill_path: None,
+            stderr_spill_path: None,
         },
         stop_reason: None,
         outputs: Some(CapturedOutputs {
-            stdout: CapturedStream::from_reader(RETAINED_STDOUT, RETAINED_STDOUT.len() as u64).unwrap(),
+            stdout: CapturedStream::from_reader(RETAINED_STDOUT, RETAINED_STDOUT.len() as u64)
+                .unwrap(),
             stderr: CapturedStream::from_reader(&b""[..], 0).unwrap(),
         }),
         artifacts: Some(prepared.capture(|| false).unwrap()),
     };
     let target = RetentionTarget::from_admitted(journal.storage_root(), 50, recipient).unwrap();
     let digest = target.seal(&mut completion).unwrap();
-    journal.finish(50, &json!({
-        "kind":"exec-result", "request_id":50, "exit_code":0, "executed":true,
-        "residual_group_members":0, "stop_reason":null,
-        "stdout_sha256":completion.result.stdout_sha256,
-        "stderr_sha256":completion.result.stderr_sha256,
-        "retained_result_sha256":digest,
-    }), true).unwrap();
+    journal
+        .finish(
+            50,
+            &json!({
+                "kind":"exec-result", "request_id":50, "exit_code":0, "executed":true,
+                "residual_group_members":0, "stop_reason":null,
+                "stdout_sha256":completion.result.stdout_sha256,
+                "stderr_sha256":completion.result.stderr_sha256,
+                "retained_result_sha256":digest,
+            }),
+            true,
+        )
+        .unwrap();
 }
 
 fn resume_request() -> Value {
@@ -324,7 +375,10 @@ fn assert_range_bytes(peer: &mut Peer, request: Value, bytes: &[u8]) {
     let response = peer.receive();
     let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
     assert_eq!(response["data_hex"], hex);
-    assert_eq!(response["chunk_sha256"], rabs_wkr::session::sha256_hex(bytes));
+    assert_eq!(
+        response["chunk_sha256"],
+        rabs_wkr::session::sha256_hex(bytes)
+    );
     assert_eq!(response["request_id"], 50);
     assert_eq!(response["eof"], true);
 }
@@ -335,7 +389,11 @@ fn same_process_recovers_complete_result_after_partial_ack_in_either_order() {
         let root = tempfile::tempdir().unwrap();
         let listener = listener();
         let address = listener.local_addr().unwrap().to_string();
-        seed_retained_result(root.path(), &address, rabs_wkr::result_spool::ResultRecipient::LoopbackFixture);
+        seed_retained_result(
+            root.path(),
+            &address,
+            rabs_wkr::result_spool::ResultRecipient::LoopbackFixture,
+        );
         let mut worker = Worker::start(&address, root.path(), false);
 
         // An ordinary session does NOT inherit a grant to read retained bytes.
@@ -359,25 +417,50 @@ fn same_process_recovers_complete_result_after_partial_ack_in_either_order() {
             assert_eq!(result["resumed"], true);
             assert_eq!(result["exit_code"], 0);
             assert_eq!(result["executed"], true);
-            assert_eq!(result["stdout_sha256"], rabs_wkr::session::sha256_hex(RETAINED_STDOUT));
-            assert_eq!(result["artifact_manifest"]["files"][0]["sha256"],
-                rabs_wkr::session::sha256_hex(RETAINED_ARTIFACT));
+            assert_eq!(
+                result["stdout_sha256"],
+                rabs_wkr::session::sha256_hex(RETAINED_STDOUT)
+            );
+            assert_eq!(
+                result["artifact_manifest"]["files"][0]["sha256"],
+                rabs_wkr::session::sha256_hex(RETAINED_ARTIFACT)
+            );
             if let Some(original) = &original_offer {
                 assert_eq!(&result, original, "reconnect changed the retained offer");
             }
             original_offer = Some(result.clone());
-            assert_range_bytes(&mut peer, json!({
-                "kind":"output-read", "request_id":50, "stream":"stdout", "offset":0, "max_bytes":64,
-            }), RETAINED_STDOUT);
-            assert_range_bytes(&mut peer, json!({
-                "kind":"output-read", "request_id":50, "stream":"stderr", "offset":0, "max_bytes":64,
-            }), b"");
-            assert_range_bytes(&mut peer, json!({
-                "kind":"artifact-read", "request_id":50, "name":"lib.rlib", "offset":0, "max_bytes":64,
-            }), RETAINED_ARTIFACT);
+            assert_range_bytes(
+                &mut peer,
+                json!({
+                    "kind":"output-read", "request_id":50, "stream":"stdout", "offset":0, "max_bytes":64,
+                }),
+                RETAINED_STDOUT,
+            );
+            assert_range_bytes(
+                &mut peer,
+                json!({
+                    "kind":"output-read", "request_id":50, "stream":"stderr", "offset":0, "max_bytes":64,
+                }),
+                b"",
+            );
+            assert_range_bytes(
+                &mut peer,
+                json!({
+                    "kind":"artifact-read", "request_id":50, "name":"lib.rlib", "offset":0, "max_bytes":64,
+                }),
+                RETAINED_ARTIFACT,
+            );
 
-            let first = if artifacts_first { artifact_ack(&result) } else { output_ack() };
-            let second = if artifacts_first { output_ack() } else { artifact_ack(&result) };
+            let first = if artifacts_first {
+                artifact_ack(&result)
+            } else {
+                output_ack()
+            };
+            let second = if artifacts_first {
+                output_ack()
+            } else {
+                artifact_ack(&result)
+            };
             if final_session {
                 let mut wrong = output_ack();
                 wrong["stdout_bytes"] = json!(0);
@@ -388,10 +471,20 @@ fn same_process_recovers_complete_result_after_partial_ack_in_either_order() {
             assert_ne!(peer.receive()["kind"], "error");
             peer.send(&json!({"kind":"request-status", "request_id":50}));
             assert_eq!(peer.receive()["receipt"]["retained_result_released"], false);
-            assert!(root.path().join("state/retained-result/manifest.json").is_file());
+            assert!(
+                root.path()
+                    .join("state/retained-result/manifest.json")
+                    .is_file()
+            );
             peer.send(&artifact_request(51));
-            assert_eq!(peer.receive()["reason"],
-                if artifacts_first { "output-unacknowledged" } else { "artifacts-unacknowledged" });
+            assert_eq!(
+                peer.receive()["reason"],
+                if artifacts_first {
+                    "output-unacknowledged"
+                } else {
+                    "artifacts-unacknowledged"
+                }
+            );
             if final_session {
                 peer.send(&second);
                 assert_ne!(peer.receive()["kind"], "error");
@@ -420,7 +513,11 @@ fn reconnect_cannot_downgrade_a_tls_bound_result_to_a_loopback_recipient() {
     let root = tempfile::tempdir().unwrap();
     let listener = listener();
     let address = listener.local_addr().unwrap().to_string();
-    seed_retained_result(root.path(), &address, rabs_wkr::result_spool::ResultRecipient::TlsSpki([7; 32]));
+    seed_retained_result(
+        root.path(),
+        &address,
+        rabs_wkr::result_spool::ResultRecipient::TlsSpki([7; 32]),
+    );
     let mut worker = Worker::start(&address, root.path(), false);
     for _ in 0..2 {
         let mut peer = Peer::accept(&listener, &mut worker);
@@ -429,14 +526,23 @@ fn reconnect_cannot_downgrade_a_tls_bound_result_to_a_loopback_recipient() {
         peer.send(&resume_request());
         let refusal = peer.receive();
         assert_eq!(refusal["kind"], "error");
-        assert!(refusal["reason"].as_str().unwrap().contains("another authenticated recipient"));
+        assert!(
+            refusal["reason"]
+                .as_str()
+                .unwrap()
+                .contains("another authenticated recipient")
+        );
         peer.send(&json!({"kind":"output-read", "request_id":50, "stream":"stdout", "offset":0}));
         assert_eq!(peer.receive()["reason"], "unknown-output-request");
         peer.send(&artifact_request(51));
         assert_eq!(peer.receive()["reason"], "retained-result-unacknowledged");
         drop(peer);
     }
-    assert!(root.path().join("state/retained-result/manifest.json").is_file());
+    assert!(
+        root.path()
+            .join("state/retained-result/manifest.json")
+            .is_file()
+    );
     worker.assert_alive();
 }
 
@@ -445,7 +551,11 @@ fn corrupt_spool_on_disconnect_stops_service_without_resetting_ownership() {
     let root = tempfile::tempdir().unwrap();
     let listener = listener();
     let address = listener.local_addr().unwrap().to_string();
-    seed_retained_result(root.path(), &address, rabs_wkr::result_spool::ResultRecipient::LoopbackFixture);
+    seed_retained_result(
+        root.path(),
+        &address,
+        rabs_wkr::result_spool::ResultRecipient::LoopbackFixture,
+    );
     let mut worker = Worker::start(&address, root.path(), false);
     let mut peer = Peer::accept(&listener, &mut worker);
     admit_retention(&mut peer);
@@ -454,11 +564,24 @@ fn corrupt_spool_on_disconnect_stops_service_without_resetting_ownership() {
     let before = std::fs::read(root.path().join("state/requests.json")).unwrap();
     // The current session holds a private verified copy. The next connection
     // must verify the durable seal again after that transfer owner is dropped.
-    std::fs::write(root.path().join("state/retained-result/file-000"), b"corrupt").unwrap();
+    std::fs::write(
+        root.path().join("state/retained-result/file-000"),
+        b"corrupt",
+    )
+    .unwrap();
     drop(peer);
     worker.expect_exit(1);
     assert!(worker.logs().contains("worker-reconnect-refused"));
-    assert_eq!(std::fs::read(root.path().join("state/requests.json")).unwrap(), before);
-    assert!(root.path().join("state/retained-result/manifest.json").is_file());
-    assert!(matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock));
+    assert_eq!(
+        std::fs::read(root.path().join("state/requests.json")).unwrap(),
+        before
+    );
+    assert!(
+        root.path()
+            .join("state/retained-result/manifest.json")
+            .is_file()
+    );
+    assert!(
+        matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+    );
 }

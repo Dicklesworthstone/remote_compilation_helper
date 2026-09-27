@@ -243,9 +243,14 @@ pub fn prepare_source_bundle(
                 // Capture still checks the pin again across its own mutation
                 // barrier; this preflight never authorizes later bytes.
                 let current = rabs_sandbox::toolchain_dataset::fingerprint_toolchain(
-                    &path, &ToolchainLimits::default(), || false)?;
-                require(&current == expected,
-                    "local toolchain does not match the specified toolchain_identity")?;
+                    &path,
+                    &ToolchainLimits::default(),
+                    || false,
+                )?;
+                require(
+                    &current == expected,
+                    "local toolchain does not match the specified toolchain_identity",
+                )?;
             }
             Ok::<_, io::Error>(path)
         })
@@ -261,8 +266,13 @@ pub fn prepare_source_bundle(
     let toolchain = toolchain_source
         .as_ref()
         .map(|source| {
-            let prepared = capture_toolchain(source, &destination.join("toolchain"),
-                expected_toolchain.as_ref(), &ToolchainLimits::default(), || false)?;
+            let prepared = capture_toolchain(
+                source,
+                &destination.join("toolchain"),
+                expected_toolchain.as_ref(),
+                &ToolchainLimits::default(),
+                || false,
+            )?;
             prepared.sync(|| false)?;
             Ok::<_, io::Error>(prepared)
         })
@@ -277,7 +287,10 @@ pub fn prepare_source_bundle(
     fields.remove("toolchain_source");
     if let Some(prepared) = &toolchain {
         fields.remove("toolchain_backing");
-        fields.insert("toolchain_transfer".to_owned(), json!(TOOLCHAIN_TRANSFER_VERSION));
+        fields.insert(
+            "toolchain_transfer".to_owned(),
+            json!(TOOLCHAIN_TRANSFER_VERSION),
+        );
         fields.insert(
             "toolchain_identity".to_owned(),
             super::worker_delivery::toolchain_identity_value(prepared.identity()),
@@ -508,8 +521,15 @@ impl SourceUpload {
 
     /// Attach a separately approved, retained compiler tree. Source selection
     /// alone never grants access to a neighbouring toolchain or a host pathname.
-    pub fn with_toolchain(mut self, prepared: PreparedToolchain, request: &Value) -> io::Result<Self> {
-        require(self.toolchain.is_none(), "toolchain upload already attached")?;
+    pub fn with_toolchain(
+        mut self,
+        prepared: PreparedToolchain,
+        request: &Value,
+    ) -> io::Result<Self> {
+        require(
+            self.toolchain.is_none(),
+            "toolchain upload already attached",
+        )?;
         self.validate_source_request(request)?;
         self.toolchain = Some(toolchain::ToolchainUpload::new(prepared, request)?);
         self.validate_request(request)?;
@@ -742,7 +762,10 @@ pub struct SourcePeer<'a, P: ?Sized> {
 impl<'a, P: WorkerPeer + ?Sized> SourcePeer<'a, P> {
     pub fn new(inner: &'a mut P, upload: &'a SourceUpload, request: &'a Value) -> io::Result<Self> {
         upload.validate_request(request)?;
-        require(upload.toolchain.is_none(), "toolchain transfer requires authenticated delivery")?;
+        require(
+            upload.toolchain.is_none(),
+            "toolchain transfer requires authenticated delivery",
+        )?;
         Ok(Self {
             inner,
             upload,

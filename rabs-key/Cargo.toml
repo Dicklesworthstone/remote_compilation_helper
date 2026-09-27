@@ -9,7 +9,6 @@ readme.workspace = true
 keywords.workspace = true
 categories.workspace = true
 description = "Canonical RABS action-key construction, discovery recipes, presentation variants, and key explainability"
-publish = false
 
 [lib]
 doctest = false
@@ -19,7 +18,7 @@ doctest = false
 # network/filesystem/process crates. Dependency-direction CI (bead A002)
 # enforces this.
 [dependencies]
-rabs-protocol = { path = "../rabs-protocol" }
+rabs-protocol = { path = "../rabs-protocol", version = "2.1.0" }
 # The reviewed pure digest crate (bead F034): SHA-256 for typed
 # authoritative digests. no-default-features; pure computation only.
 sha2 = { workspace = true }

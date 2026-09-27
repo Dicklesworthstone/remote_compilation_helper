@@ -39,8 +39,12 @@ struct UnadmittedProcess(Option<Child>);
 fn kill_and_reap_spawned(leader: &mut Child) {
     let pgid = leader.id();
     let _ = Command::new("kill")
-        .arg("-KILL").arg("--").arg(format!("-{pgid}"))
-        .stdout(Stdio::null()).stderr(Stdio::null()).status();
+        .arg("-KILL")
+        .arg("--")
+        .arg(format!("-{pgid}"))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
     // Always retain the direct-child fallback, even when group formation itself
     // was the failed check. A negative PGID signal alone may have no recipient.
     let _ = leader.kill();
@@ -212,11 +216,22 @@ impl ManagedProcessGroup {
         verify: impl FnOnce(&mut Child) -> io::Result<Vec<GroupMember>>,
     ) -> io::Result<Self> {
         let mut pending = UnadmittedProcess(Some(leader));
-        let leader = pending.0.as_mut().expect("unadmitted process owns its child");
+        let leader = pending
+            .0
+            .as_mut()
+            .expect("unadmitted process owns its child");
         let pgid = leader.id();
         let members = verify(leader)?;
-        let leader = pending.0.take().expect("successful admission transfers the child once");
-        Ok(Self { pgid, leader, members, attribution })
+        let leader = pending
+            .0
+            .take()
+            .expect("successful admission transfers the child once");
+        Ok(Self {
+            pgid,
+            leader,
+            members,
+            attribution,
+        })
     }
     /// Group id (== leader pid by construction).
     #[must_use]
@@ -390,7 +405,9 @@ impl ManagedProcessGroup {
         use std::time::{Duration, Instant};
 
         let lanes = match preview {
-            Some(preview) => MonitoredLanes::spawn_preview(&mut self.leader, limits, maximum, preview),
+            Some(preview) => {
+                MonitoredLanes::spawn_preview(&mut self.leader, limits, maximum, preview)
+            }
             None => MonitoredLanes::spawn(&mut self.leader, limits, maximum),
         };
         let mut stopping_at = None;
@@ -572,21 +589,32 @@ mod tests {
             // This nonexistent target group would reject spawn if the mandatory
             // containment setting were applied before caller configuration.
             cmd.process_group(i32::MAX)
-                .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
-        }).unwrap();
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+        })
+        .unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let output = group.wait_with_bounded_drain(&crate::stream_drain::DrainLimits {
-            resident_bound: 64, spill_dir: dir.path().join("spill"),
-        }).unwrap();
+        let output = group
+            .wait_with_bounded_drain(&crate::stream_drain::DrainLimits {
+                resident_bound: 64,
+                spill_dir: dir.path().join("spill"),
+            })
+            .unwrap();
         assert!(output.status.success());
         assert_eq!(output.stdout.resident(), b"contained");
     }
 
     #[cfg(target_os = "linux")]
     fn spawned_tree() -> Child {
-        Command::new("sh").args(["-c", "sleep 30 & wait"])
-            .process_group(0).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
-            .spawn().unwrap()
+        Command::new("sh")
+            .args(["-c", "sleep 30 & wait"])
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap()
     }
 
     #[cfg(target_os = "linux")]
@@ -604,13 +632,22 @@ mod tests {
     fn rejected_formation_reaps_the_already_spawned_child_and_descendants() {
         let leader = spawned_tree();
         let pgid = leader.id();
-        let outcome = ManagedProcessGroup::admit_spawned(leader, Attribution::default(), |leader| {
-            observe_descendant(leader);
-            Err(io::Error::other("injected formation verification failure"))
-        });
-        assert!(outcome.unwrap_err().to_string().contains("verification failure"));
+        let outcome =
+            ManagedProcessGroup::admit_spawned(leader, Attribution::default(), |leader| {
+                observe_descendant(leader);
+                Err(io::Error::other("injected formation verification failure"))
+            });
+        assert!(
+            outcome
+                .unwrap_err()
+                .to_string()
+                .contains("verification failure")
+        );
         assert!(members_from_proc(pgid).is_empty());
-        assert!(!std::path::Path::new(&format!("/proc/{pgid}")).exists(), "leader was not reaped");
+        assert!(
+            !std::path::Path::new(&format!("/proc/{pgid}")).exists(),
+            "leader was not reaped"
+        );
     }
 
     #[cfg(all(target_os = "linux", panic = "unwind"))]
@@ -634,13 +671,24 @@ mod tests {
     fn stop_predicate_unwind_reaps_processes_and_joins_piped_drains() {
         let dir = tempfile::tempdir().unwrap();
         let group = ManagedProcessGroup::spawn_with(
-            &spec("sh", "printf prefix; printf diagnostic >&2; sleep 30 & wait"),
-            |cmd| { cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()); },
-        ).unwrap();
+            &spec(
+                "sh",
+                "printf prefix; printf diagnostic >&2; sleep 30 & wait",
+            ),
+            |cmd| {
+                cmd.stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
+            },
+        )
+        .unwrap();
         let pgid = group.pgid();
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             group.wait_with_bounded_drain_controlled(
-                &crate::stream_drain::DrainLimits { resident_bound: 2, spill_dir: dir.path().join("spill") },
+                &crate::stream_drain::DrainLimits {
+                    resident_bound: 2,
+                    spill_dir: dir.path().join("spill"),
+                },
                 || panic!("injected stop predicate unwind"),
             )
         }));
@@ -654,15 +702,32 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let group = ManagedProcessGroup::spawn_with(
             &spec("sh", "printf 'A\\000B'; printf 'C\\377DE' >&2"),
-            |cmd| { cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()); },
-        ).unwrap();
-        let output = group.wait_with_bounded_drain_budget(
-            &crate::stream_drain::DrainLimits { resident_bound: 0, spill_dir: dir.path().join("spill") },
-            7, || false,
-        ).unwrap();
+            |cmd| {
+                cmd.stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
+            },
+        )
+        .unwrap();
+        let output = group
+            .wait_with_bounded_drain_budget(
+                &crate::stream_drain::DrainLimits {
+                    resident_bound: 0,
+                    spill_dir: dir.path().join("spill"),
+                },
+                7,
+                || false,
+            )
+            .unwrap();
         assert!(output.status.success());
-        assert_eq!(std::fs::read(&output.stdout.spill().unwrap().path).unwrap(), b"A\0B");
-        assert_eq!(std::fs::read(&output.stderr.spill().unwrap().path).unwrap(), b"C\xffDE");
+        assert_eq!(
+            std::fs::read(&output.stdout.spill().unwrap().path).unwrap(),
+            b"A\0B"
+        );
+        assert_eq!(
+            std::fs::read(&output.stderr.spill().unwrap().path).unwrap(),
+            b"C\xffDE"
+        );
         assert_eq!(output.stdout.total_bytes() + output.stderr.total_bytes(), 7);
     }
 
@@ -671,24 +736,50 @@ mod tests {
     fn capture_budget_terminates_long_lived_writers_without_waiting_for_caller_timeout() {
         let dir = tempfile::tempdir().unwrap();
         let group = ManagedProcessGroup::spawn_with(
-            &spec("sh", "trap '' TERM; printf abcd; printf efgh >&2; sleep 30 & wait"),
-            |cmd| { cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()); },
-        ).unwrap();
+            &spec(
+                "sh",
+                "trap '' TERM; printf abcd; printf efgh >&2; sleep 30 & wait",
+            ),
+            |cmd| {
+                cmd.stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
+            },
+        )
+        .unwrap();
         let pgid = group.pgid();
         let start = Instant::now();
         let mut external_stop = false;
-        let error = group.wait_with_bounded_drain_budget(
-            &crate::stream_drain::DrainLimits { resident_bound: 0, spill_dir: dir.path().join("spill") },
-            7,
-            || { external_stop = start.elapsed() >= Duration::from_secs(3); external_stop },
-        ).unwrap_err();
-        assert!(!external_stop, "only the caller's timeout stopped the failed capture");
-        assert!(matches!(error.get_ref().and_then(|e| e.downcast_ref::<crate::stream_drain::DrainFailure>()),
-            Some(crate::stream_drain::DrainFailure::OutputLimitExceeded { maximum: 7 })));
+        let error = group
+            .wait_with_bounded_drain_budget(
+                &crate::stream_drain::DrainLimits {
+                    resident_bound: 0,
+                    spill_dir: dir.path().join("spill"),
+                },
+                7,
+                || {
+                    external_stop = start.elapsed() >= Duration::from_secs(3);
+                    external_stop
+                },
+            )
+            .unwrap_err();
+        assert!(
+            !external_stop,
+            "only the caller's timeout stopped the failed capture"
+        );
+        assert!(matches!(
+            error
+                .get_ref()
+                .and_then(|e| e.downcast_ref::<crate::stream_drain::DrainFailure>()),
+            Some(crate::stream_drain::DrainFailure::OutputLimitExceeded { maximum: 7 })
+        ));
         assert!(members_from_proc(pgid).is_empty());
-        let retained: u64 = ["stdout.spill", "stderr.spill"].iter().map(|name| {
-            std::fs::metadata(dir.path().join("spill").join(name)).map_or(0, |m| m.len())
-        }).sum();
+        let retained: u64 = ["stdout.spill", "stderr.spill"]
+            .iter()
+            .map(|name| {
+                std::fs::metadata(dir.path().join("spill").join(name)).map_or(0, |m| m.len())
+            })
+            .sum();
         assert!(retained <= 7, "quota was enforced only after writing");
     }
 
@@ -700,16 +791,32 @@ mod tests {
         std::fs::write(&blocked, b"preserve").unwrap();
         let group = ManagedProcessGroup::spawn_with(
             &spec("sh", "printf failed-spill; sleep 30 & wait"),
-            |cmd| { cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()); },
-        ).unwrap();
+            |cmd| {
+                cmd.stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
+            },
+        )
+        .unwrap();
         let pgid = group.pgid();
         let start = Instant::now();
         let mut external_stop = false;
-        let error = group.wait_with_bounded_drain_controlled(
-            &crate::stream_drain::DrainLimits { resident_bound: 0, spill_dir: blocked.clone() },
-            || { external_stop = start.elapsed() >= Duration::from_secs(3); external_stop },
-        ).unwrap_err();
-        assert!(!external_stop, "drain failure did not reach the process owner");
+        let error = group
+            .wait_with_bounded_drain_controlled(
+                &crate::stream_drain::DrainLimits {
+                    resident_bound: 0,
+                    spill_dir: blocked.clone(),
+                },
+                || {
+                    external_stop = start.elapsed() >= Duration::from_secs(3);
+                    external_stop
+                },
+            )
+            .unwrap_err();
+        assert!(
+            !external_stop,
+            "drain failure did not reach the process owner"
+        );
         assert!(error.to_string().contains("stdout.spill"));
         assert!(members_from_proc(pgid).is_empty());
         assert_eq!(std::fs::read(blocked).unwrap(), b"preserve");
@@ -720,14 +827,26 @@ mod tests {
     fn a_zero_exit_term_handler_cannot_turn_truncated_output_into_success() {
         let dir = tempfile::tempdir().unwrap();
         let group = ManagedProcessGroup::spawn_with(
-            &spec("sh", "trap 'exit 0' TERM; printf too-long; while :; do sleep 1; done"),
-            |cmd| { cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()); },
-        ).unwrap();
+            &spec(
+                "sh",
+                "trap 'exit 0' TERM; printf too-long; while :; do sleep 1; done",
+            ),
+            |cmd| {
+                cmd.stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
+            },
+        )
+        .unwrap();
         let pgid = group.pgid();
         let start = Instant::now();
         let outcome = group.wait_with_bounded_drain_budget(
-            &crate::stream_drain::DrainLimits { resident_bound: 64, spill_dir: dir.path().join("spill") },
-            1, || start.elapsed() >= Duration::from_secs(3),
+            &crate::stream_drain::DrainLimits {
+                resident_bound: 64,
+                spill_dir: dir.path().join("spill"),
+            },
+            1,
+            || start.elapsed() >= Duration::from_secs(3),
         );
         assert!(outcome.is_err());
         assert!(members_from_proc(pgid).is_empty());
@@ -836,9 +955,14 @@ mod tests {
     fn controlled_wait_escalates_and_drains_both_streams() {
         let dir = tempfile::tempdir().unwrap();
         let group = ManagedProcessGroup::spawn_with(
-            &spec("sh", "trap '' TERM; printf stdout-ready; printf stderr-ready >&2; sleep 30 & wait"),
+            &spec(
+                "sh",
+                "trap '' TERM; printf stdout-ready; printf stderr-ready >&2; sleep 30 & wait",
+            ),
             |cmd| {
-                cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+                cmd.stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
             },
         )
         .unwrap();
@@ -865,9 +989,14 @@ mod tests {
     fn controlled_wait_preserves_natural_failure_and_output() {
         let dir = tempfile::tempdir().unwrap();
         let group = ManagedProcessGroup::spawn_with(
-            &spec("sh", "printf ordinary-out; printf ordinary-error >&2; exit 7"),
+            &spec(
+                "sh",
+                "printf ordinary-out; printf ordinary-error >&2; exit 7",
+            ),
             |cmd| {
-                cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+                cmd.stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
             },
         )
         .unwrap();

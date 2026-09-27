@@ -485,14 +485,7 @@ fn cargo_command_tokens_with_wrappers(
     allow_classified_wrappers: bool,
 ) -> anyhow::Result<(Vec<String>, usize)> {
     let mut tokens = shell_words::split(command)?;
-    let assignment = |token: &str| {
-        token.split_once('=').is_some_and(|(key, _)| {
-            !key.is_empty()
-                && key.chars().enumerate().all(|(index, ch)| {
-                    ch == '_' || ch.is_ascii_alphabetic() || index > 0 && ch.is_ascii_digit()
-                })
-        })
-    };
+    let assignment = super::is_shell_assignment;
     // Quoting an assignment as an entire shell word makes it an executable.
     // An explicit env prefix keeps the same assignment bytes as real argv.
     if tokens.first().is_some_and(|token| assignment(token)) {

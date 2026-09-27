@@ -269,7 +269,10 @@ fn token_translation<'a>(
 ) -> Result<TokenTranslation<'a>, UnsupportedDepInfo> {
     if !token.starts_with(b"/") {
         let mut cwd = None;
-        for (_, destination) in entries.iter().filter(|(source, _)| source.as_slice() == b".") {
+        for (_, destination) in entries
+            .iter()
+            .filter(|(source, _)| source.as_slice() == b".")
+        {
             let directory = destination.strip_suffix(b"/").unwrap_or(destination);
             if let Some(prior) = cwd
                 && prior != directory
@@ -287,11 +290,15 @@ fn token_translation<'a>(
                 || cwd[1..]
                     .split(|byte| *byte == b'/')
                     .any(|part| part.is_empty() || part == b"." || part == b"..")
-                || cwd.iter().any(|byte| matches!(byte, 0 | b'\n' | b'\r' | b'\t' | b':'))
+                || cwd
+                    .iter()
+                    .any(|byte| matches!(byte, 0 | b'\n' | b'\r' | b'\t' | b':'))
                 || relative
                     .split(|byte| *byte == b'/')
                     .any(|part| part.is_empty() || part == b"." || part == b"..")
-                || relative.iter().any(|byte| matches!(byte, 0 | b'\n' | b'\r' | b'\t'))
+                || relative
+                    .iter()
+                    .any(|byte| matches!(byte, 0 | b'\n' | b'\r' | b'\t'))
             {
                 return Err(UnsupportedDepInfo {
                     reason: "relative dep-info path needs an absolute, unambiguous working directory and a traversal-free suffix".into(),
@@ -352,7 +359,13 @@ pub(crate) fn rewritten_dep_info_token_len(
 ) -> Result<usize, UnsupportedDepInfo> {
     Ok(token_translation(token, entries)?
         .bytes()
-        .map(|byte| if matches!(byte, b' ' | b'\\' | b'#') { 2 } else { 1 })
+        .map(|byte| {
+            if matches!(byte, b' ' | b'\\' | b'#') {
+                2
+            } else {
+                1
+            }
+        })
         .fold(0_usize, usize::saturating_add))
 }
 
@@ -621,14 +634,23 @@ mod tests {
             assert_eq!(
                 parse_dep_info(&derived.bytes).unwrap().lines,
                 vec![
-                    DepInfoLine::Rule { target: output, deps: vec![source.clone()] },
+                    DepInfoLine::Rule {
+                        target: output,
+                        deps: vec![source.clone()]
+                    },
                     DepInfoLine::Blank,
-                    DepInfoLine::Rule { target: source, deps: vec![] },
+                    DepInfoLine::Rule {
+                        target: source,
+                        deps: vec![]
+                    },
                     DepInfoLine::Comment(b"# env-dep:NAME=unchanged".to_vec()),
                 ],
             );
             assert_eq!(derived.derivation.canonical_sha256, sha256_bytes(canonical));
-            assert_eq!(derived.derivation.derived_sha256, sha256_bytes(&derived.bytes));
+            assert_eq!(
+                derived.derivation.derived_sha256,
+                sha256_bytes(&derived.bytes)
+            );
             assert_eq!(derived.derivation.contract, 2);
         }
     }
@@ -638,8 +660,12 @@ mod tests {
         let canonical = b"target/unit.rmeta: src/lib.rs\n";
         let derived = derive_subscriber_dep_info(
             canonical,
-            &[(b"/__rabs/workspace".to_vec(), b"/not-an-implicit-cwd".to_vec())],
-        ).unwrap();
+            &[(
+                b"/__rabs/workspace".to_vec(),
+                b"/not-an-implicit-cwd".to_vec(),
+            )],
+        )
+        .unwrap();
         // The live materializer still refuses these unresolved relative inputs.
         assert_eq!(derived.bytes, canonical);
     }
@@ -648,22 +674,43 @@ mod tests {
     fn working_directory_never_normalizes_parent_traversal_or_ambiguous_suffixes() {
         let entries = vec![(b".".to_vec(), b"/subscriber/worktree/".to_vec())];
         for token in [
-            &b"../outside"[..], b"src/../outside", b"./../outside", b"src//lib.rs",
-            b"src/./lib.rs", b"./", b".", b"", b"src/nul\0.rs", b"src/tab\t.rs",
+            &b"../outside"[..],
+            b"src/../outside",
+            b"./../outside",
+            b"src//lib.rs",
+            b"src/./lib.rs",
+            b"./",
+            b".",
+            b"",
+            b"src/nul\0.rs",
+            b"src/tab\t.rs",
         ] {
             assert!(rewrite_token(token, &entries).is_err(), "{token:?}");
-            assert!(rewritten_dep_info_token_len(token, &entries).is_err(), "{token:?}");
+            assert!(
+                rewritten_dep_info_token_len(token, &entries).is_err(),
+                "{token:?}"
+            );
         }
     }
 
     #[test]
     fn invalid_or_conflicting_working_directories_are_typed_refusals() {
         for directory in [
-            &b"relative"[..], b"/", b"//tree", b"/tree/../other", b"/tree/./other",
-            b"/tree//other", b"/tree\0other", b"/tree\nother", b"/tree:other",
+            &b"relative"[..],
+            b"/",
+            b"//tree",
+            b"/tree/../other",
+            b"/tree/./other",
+            b"/tree//other",
+            b"/tree\0other",
+            b"/tree\nother",
+            b"/tree:other",
         ] {
             let entries = vec![(b".".to_vec(), directory.to_vec())];
-            assert!(rewrite_token(b"src/lib.rs", &entries).is_err(), "{directory:?}");
+            assert!(
+                rewrite_token(b"src/lib.rs", &entries).is_err(),
+                "{directory:?}"
+            );
         }
         let conflicting = vec![
             (b".".to_vec(), b"/first".to_vec()),
@@ -675,10 +722,14 @@ mod tests {
     #[test]
     fn working_directory_does_not_capture_absolute_or_unmapped_canonical_paths() {
         let entries = vec![(b".".to_vec(), b"/subscriber".to_vec())];
-        assert_eq!(rewrite_token(b"/system/lib.rs", &entries).unwrap(), b"/system/lib.rs");
-        assert!(derive_subscriber_dep_info(
-            b"target/unit: /__rabs/unmapped/lib.rs\n", &entries,
-        ).is_err());
+        assert_eq!(
+            rewrite_token(b"/system/lib.rs", &entries).unwrap(),
+            b"/system/lib.rs"
+        );
+        assert!(
+            derive_subscriber_dep_info(b"target/unit: /__rabs/unmapped/lib.rs\n", &entries,)
+                .is_err()
+        );
     }
 
     #[test]
@@ -699,7 +750,10 @@ mod tests {
             (b"/__rabs/workspace".to_vec(), b"/subscriber".to_vec()),
             (b"/__rabs/workspace/vendor".to_vec(), b"/vendor".to_vec()),
         ];
-        assert_eq!(rewrite_token(b"/__rabs/workspace/vendor/lib.rs", &entries).unwrap(), b"/vendor/lib.rs");
+        assert_eq!(
+            rewrite_token(b"/__rabs/workspace/vendor/lib.rs", &entries).unwrap(),
+            b"/vendor/lib.rs"
+        );
         assert!(derive_subscriber_dep_info(b"/__rabs/workspace-other/unit:\n", &entries).is_err());
     }
 }

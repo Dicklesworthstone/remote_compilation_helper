@@ -129,15 +129,20 @@ impl TerminalCaps {
 
     /// Check if the terminal supports colors.
     fn detect_color_support() -> bool {
+        // NO_COLOR disables colors (https://no-color.org/)
+        if env::var("NO_COLOR").is_ok() {
+            return false;
+        }
+
+        // FORCE_COLOR is an explicit request either way.
+        if let Some(forced) = force_color_env() {
+            return forced;
+        }
+
         // Check TERM environment variable
         if let Ok(term) = env::var("TERM")
             && term == "dumb"
         {
-            return false;
-        }
-
-        // NO_COLOR disables colors (https://no-color.org/)
-        if env::var("NO_COLOR").is_ok() {
             return false;
         }
 
@@ -268,6 +273,17 @@ impl OutputContext {
         let supports_unicode = caps.supports_unicode;
         let supports_hyperlinks = mode == OutputMode::Human && caps.supports_hyperlinks;
 
+        // The `colored` crate decides on its own from stdout's TTY state and
+        // CLICOLOR*, so an explicit FORCE_COLOR must be handed to it or styled
+        // stderr stays plain whenever stdout is piped. Only an explicit request
+        // sets the process-global override.
+        if config.color == ColorChoice::Auto
+            && env::var("NO_COLOR").is_err()
+            && force_color_env().is_some()
+        {
+            colored::control::set_override(colors_enabled);
+        }
+
         let theme = Theme::new(colors_enabled, supports_unicode, supports_hyperlinks);
 
         Self {
@@ -326,6 +342,17 @@ impl OutputContext {
         // 6. NO_COLOR env var
         if env::var("NO_COLOR").is_ok() {
             return OutputMode::Plain;
+        }
+
+        // 6b. FORCE_COLOR (documented contract: `FORCE_COLOR=1` enables colors
+        // without a TTY, `FORCE_COLOR=0` disables them). It outranks TERM=dumb
+        // and TTY detection; only NO_COLOR beats it.
+        if let Some(forced) = force_color_env() {
+            return if forced {
+                OutputMode::Human
+            } else {
+                OutputMode::Plain
+            };
         }
 
         // 7. CLICOLOR_FORCE env var
@@ -634,6 +661,31 @@ impl OutputContext {
 /// Create a default output context for typical CLI usage.
 pub fn default_context() -> OutputContext {
     OutputContext::new(OutputConfig::default())
+}
+
+/// `FORCE_COLOR` as an explicit color request: `Some(false)` for `0`,
+/// `Some(true)` for any other value (including empty), `None` when unset.
+fn force_color_env() -> Option<bool> {
+    parse_force_color(env::var("FORCE_COLOR").ok().as_deref())
+}
+
+fn parse_force_color(value: Option<&str>) -> Option<bool> {
+    value.map(|value| value.trim() != "0")
+}
+
+#[cfg(test)]
+mod force_color_tests {
+    use super::parse_force_color;
+
+    #[test]
+    fn force_color_values_follow_the_documented_contract() {
+        assert_eq!(parse_force_color(None), None);
+        assert_eq!(parse_force_color(Some("0")), Some(false));
+        assert_eq!(parse_force_color(Some(" 0 ")), Some(false));
+        assert_eq!(parse_force_color(Some("1")), Some(true));
+        assert_eq!(parse_force_color(Some("")), Some(true));
+        assert_eq!(parse_force_color(Some("3")), Some(true));
+    }
 }
 
 #[cfg(test)]

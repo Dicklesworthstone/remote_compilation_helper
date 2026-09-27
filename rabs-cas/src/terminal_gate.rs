@@ -712,7 +712,10 @@ mod tests {
         let mut pa = a.admit("root", AttemptId(1), 1).unwrap();
         let mut pb = b.admit("root", AttemptId(1), 1).unwrap();
 
-        assert_eq!(a.release(&mut pb), Err(WaiterReleaseRefusal::ForeignRegistry));
+        assert_eq!(
+            a.release(&mut pb),
+            Err(WaiterReleaseRefusal::ForeignRegistry)
+        );
         assert!(
             !pb.is_released(),
             "the true owner must still be able to release"

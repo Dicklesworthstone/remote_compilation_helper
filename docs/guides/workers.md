@@ -172,9 +172,11 @@ sudo apt install -y gcc g++ clang
 curl -fsSL https://bun.sh/install | bash
 ```
 
-You can automate this with:
+`rch fleet deploy` automates the RCH side of this: it installs `rch-wkr` and
+syncs the Rust toolchain (pass `--no-toolchain` to skip that). It does not
+install system packages, so run the commands above yourself.
 ```bash
-rch fleet deploy --worker my-worker --install-deps
+rch fleet deploy --worker my-worker
 ```
 
 ## Managing Multiple Workers

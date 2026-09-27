@@ -146,9 +146,6 @@ pub struct DoctorOptions {
     pub fix: bool,
     /// Show what would be fixed without making changes.
     pub dry_run: bool,
-    /// Allow installing missing local deps (requires confirmation).
-    #[allow(dead_code)]
-    pub install_deps: bool,
     /// Run reliability-focused diagnostics instead of the general doctor suite.
     pub reliability: bool,
     /// Include schema compatibility checks in reliability mode.
@@ -8036,7 +8033,6 @@ mod tests {
         let opts_minimal = DoctorOptions {
             fix: false,
             dry_run: false,
-            install_deps: false,
             reliability: false,
             check_schemas: false,
             verbose: false,
@@ -8054,7 +8050,6 @@ mod tests {
         let opts_fix = DoctorOptions {
             fix: true,
             dry_run: false,
-            install_deps: false,
             reliability: false,
             check_schemas: false,
             verbose: false,
@@ -8071,7 +8066,6 @@ mod tests {
         let opts_dry_run = DoctorOptions {
             fix: true,
             dry_run: true,
-            install_deps: false,
             reliability: false,
             check_schemas: false,
             verbose: false,
@@ -8089,7 +8083,6 @@ mod tests {
         let opts_verbose = DoctorOptions {
             fix: false,
             dry_run: false,
-            install_deps: false,
             reliability: false,
             check_schemas: false,
             verbose: true,
@@ -8415,7 +8408,6 @@ mod tests {
         let options = DoctorOptions {
             fix: false,
             dry_run: false,
-            install_deps: false,
             reliability: false,
             check_schemas: false,
             verbose: false,
@@ -8457,7 +8449,6 @@ mod tests {
         let options = DoctorOptions {
             fix: false,
             dry_run: false,
-            install_deps: false,
             reliability: false,
             check_schemas: false,
             verbose: false,
@@ -8499,7 +8490,6 @@ mod tests {
         let options = DoctorOptions {
             fix: false,
             dry_run: false,
-            install_deps: false,
             reliability: false,
             check_schemas: false,
             verbose: false,
@@ -8537,7 +8527,6 @@ mod tests {
         let options = DoctorOptions {
             fix: false,
             dry_run: false,
-            install_deps: false,
             reliability: false,
             check_schemas: false,
             verbose: false,

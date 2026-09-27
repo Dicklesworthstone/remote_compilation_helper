@@ -18,8 +18,12 @@ use std::path::{Path, PathBuf};
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
-fn hash(bytes: &[u8]) -> String { hex(&Sha256::digest(bytes)) }
-fn binary(len: usize) -> Vec<u8> { (0..len).map(|index| (index % 251) as u8).collect() }
+fn hash(bytes: &[u8]) -> String {
+    hex(&Sha256::digest(bytes))
+}
+fn binary(len: usize) -> Vec<u8> {
+    (0..len).map(|index| (index % 251) as u8).collect()
+}
 fn field(hasher: &mut Sha256, bytes: &[u8]) {
     hasher.update((bytes.len() as u64).to_be_bytes());
     hasher.update(bytes);
@@ -61,7 +65,10 @@ impl Peer {
             ("diagnostics/stdout".into(), binary(stdout_len)),
             ("diagnostics/stderr".into(), Vec::new()),
             ("artifacts/bin/app".into(), binary(5 * CHUNK_BYTES + 7)),
-            ("artifacts/deps/lib.rlib".into(), b"dependency\0\xff".to_vec()),
+            (
+                "artifacts/deps/lib.rlib".into(),
+                b"dependency\0\xff".to_vec(),
+            ),
         ]);
         let mut manifest_hash = Sha256::new();
         field(&mut manifest_hash, b"rabs.worker-artifact-manifest.v1");
@@ -70,7 +77,9 @@ impl Peer {
         let mut rows = Vec::new();
         let mut total = 0_usize;
         for (path, bytes) in &files {
-            let Some(name) = path.strip_prefix("artifacts/") else { continue; };
+            let Some(name) = path.strip_prefix("artifacts/") else {
+                continue;
+            };
             let executable = name == "bin/app";
             let digest = hash(bytes);
             field(&mut manifest_hash, name.as_bytes());
@@ -78,7 +87,9 @@ impl Peer {
             manifest_hash.update((bytes.len() as u64).to_be_bytes());
             field(&mut manifest_hash, digest.as_bytes());
             total += bytes.len();
-            rows.push(json!({"name":name, "bytes":bytes.len(), "sha256":digest, "executable":executable}));
+            rows.push(
+                json!({"name":name, "bytes":bytes.len(), "sha256":digest, "executable":executable}),
+            );
         }
         let manifest = json!({"unit":"build", "files":rows, "total_bytes":total,
             "manifest_sha256":hex(&manifest_hash.finalize())});
@@ -94,7 +105,9 @@ impl Peer {
             "artifact_transfer":"files-v1", "artifact_ack_required":true,
             "artifact_manifest":manifest, "result_retention":"durable-result-v1",
             "retained_result_sha256":hash(b"one immutable result")});
-        if mode == DeliveryMode::Resume { result["resumed"] = json!(true); }
+        if mode == DeliveryMode::Resume {
+            result["resumed"] = json!(true);
+        }
         let hello = json!({"kind":"worker-hello", "worker_id":"worker",
             "canonical":true, "slots":1, "boot_generation":2,
             "incarnation":"00000000000000000000000000000002",
@@ -102,10 +115,21 @@ impl Peer {
             "recovery_protocols":["request-journal-v1"], "result_retentions":["durable-result-v1"],
             "output_transfers":["ranges-v1"], "artifact_transfers":["files-v1"]});
         Self {
-            destination:destination.to_path_buf(), request, result, files,
-            replies:VecDeque::from([hello]), sent:Vec::new(), scheduled:BTreeMap::new(),
-            pending:0, maximum_pending:0, draining:false, batches:Vec::new(),
-            range_writes:0, chunk_reads:0, acknowledgments:0, fault:Fault::None,
+            destination: destination.to_path_buf(),
+            request,
+            result,
+            files,
+            replies: VecDeque::from([hello]),
+            sent: Vec::new(),
+            scheduled: BTreeMap::new(),
+            pending: 0,
+            maximum_pending: 0,
+            draining: false,
+            batches: Vec::new(),
+            range_writes: 0,
+            chunk_reads: 0,
+            acknowledgments: 0,
+            fault: Fault::None,
         }
     }
 
@@ -113,19 +137,34 @@ impl Peer {
         for (name, bytes) in &self.files {
             assert_eq!(fs::read(self.destination.join(name)).unwrap(), *bytes);
         }
-        let marker: Value = serde_json::from_slice(&fs::read(self.destination.join("delivery.json")).unwrap()).unwrap();
+        let marker: Value =
+            serde_json::from_slice(&fs::read(self.destination.join("delivery.json")).unwrap())
+                .unwrap();
         assert_eq!(marker["publication_authorized"], false);
-        assert_eq!(marker["request_sha256"], hash(&serde_json::to_vec(&self.request).unwrap()));
+        assert_eq!(
+            marker["request_sha256"],
+            hash(&serde_json::to_vec(&self.request).unwrap())
+        );
     }
 
-    fn dispatch(&mut self, mode: DeliveryMode, source: Option<&ResumeSource>)
-        -> Result<rabsd::coord::worker_delivery::Delivery, rabsd::coord::worker_delivery::DeliveryFailure>
-    {
+    fn dispatch(
+        &mut self,
+        mode: DeliveryMode,
+        source: Option<&ResumeSource>,
+    ) -> Result<
+        rabsd::coord::worker_delivery::Delivery,
+        rabsd::coord::worker_delivery::DeliveryFailure,
+    > {
         let request = self.request.clone();
         let destination = self.destination.clone();
         match source {
-            Some(source) => receive_operation(&mut ResumePeer::new(self, source),
-                &request, "worker", &destination, mode),
+            Some(source) => receive_operation(
+                &mut ResumePeer::new(self, source),
+                &request,
+                "worker",
+                &destination,
+                mode,
+            ),
             None => receive_operation(self, &request, "worker", &destination, mode),
         }
     }
@@ -142,12 +181,18 @@ impl WorkerPeer for Peer {
                 self.replies.push_back(self.result.clone());
             }
             Some("result-resume") => {
-                assert_eq!(*frame, json!({"kind":"result-resume", "request_id":7, "request":self.request}));
+                assert_eq!(
+                    *frame,
+                    json!({"kind":"result-resume", "request_id":7, "request":self.request})
+                );
                 assert_eq!(self.result["resumed"], true);
                 self.replies.push_back(self.result.clone());
             }
             Some("output-read" | "artifact-read") => {
-                assert!(!self.draining, "a batch must drain before new range requests");
+                assert!(
+                    !self.draining,
+                    "a batch must drain before new range requests"
+                );
                 self.pending += 1;
                 self.range_writes += 1;
                 self.maximum_pending = self.maximum_pending.max(self.pending);
@@ -155,12 +200,19 @@ impl WorkerPeer for Peer {
                 assert_eq!(frame["request_id"], 7);
                 assert_eq!(frame["max_bytes"], CHUNK_BYTES);
                 let artifact = frame["kind"] == "artifact-read";
-                let name = frame[if artifact {"name"} else {"stream"}].as_str().unwrap();
-                let key = format!("{}/{name}", if artifact {"artifacts"} else {"diagnostics"});
+                let name = frame[if artifact { "name" } else { "stream" }]
+                    .as_str()
+                    .unwrap();
+                let key = format!(
+                    "{}/{name}",
+                    if artifact { "artifacts" } else { "diagnostics" }
+                );
                 let bytes = &self.files[&key];
                 let offset = frame["offset"].as_u64().unwrap() as usize;
                 assert!(offset <= bytes.len());
-                if let Some(previous) = self.scheduled.get(&key) { assert_eq!(*previous, offset); }
+                if let Some(previous) = self.scheduled.get(&key) {
+                    assert_eq!(*previous, offset);
+                }
                 let end = (offset + CHUNK_BYTES).min(bytes.len());
                 self.scheduled.insert(key, end);
                 let mut payload = bytes[offset..end].to_vec();
@@ -171,14 +223,18 @@ impl WorkerPeer for Peer {
                     "request_id":7, "offset":offset, "next_offset":end, "total_bytes":bytes.len(),
                     "sha256":hash(bytes), "chunk_sha256":hash(&payload),
                     "data_hex":hex(&payload), "eof":end == bytes.len()});
-                reply[if artifact {"name"} else {"stream"}] = json!(name);
+                reply[if artifact { "name" } else { "stream" }] = json!(name);
                 if artifact {
-                    reply["manifest_sha256"] = self.result["artifact_manifest"]["manifest_sha256"].clone();
+                    reply["manifest_sha256"] =
+                        self.result["artifact_manifest"]["manifest_sha256"].clone();
                     reply["executable"] = json!(name == "bin/app");
                 }
                 self.replies.push_back(reply);
                 if matches!(self.fault, Fault::FailThirdWrite) && self.range_writes == 3 {
-                    return Err(io::Error::new(io::ErrorKind::BrokenPipe, "possibly accepted range write"));
+                    return Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "possibly accepted range write",
+                    ));
                 }
             }
             Some("output-ack" | "artifact-ack") => {
@@ -190,10 +246,15 @@ impl WorkerPeer for Peer {
                     assert_eq!(frame["stdout_sha256"], self.result["stdout_sha256"]);
                     assert_eq!(frame["stderr_sha256"], self.result["stderr_sha256"]);
                 } else {
-                    assert_eq!(frame["manifest_sha256"], self.result["artifact_manifest"]["manifest_sha256"]);
+                    assert_eq!(
+                        frame["manifest_sha256"],
+                        self.result["artifact_manifest"]["manifest_sha256"]
+                    );
                 }
-                self.replies.push_back(json!({"kind":if output {"output-acknowledged"} else {"artifact-acknowledged"},
-                    "request_id":7, "already_released":false}));
+                self.replies.push_back(
+                    json!({"kind":if output {"output-acknowledged"} else {"artifact-acknowledged"},
+                    "request_id":7, "already_released":false}),
+                );
             }
             _ => panic!("unexpected receiver request: {frame}"),
         }
@@ -201,12 +262,20 @@ impl WorkerPeer for Peer {
     }
 
     fn receive(&mut self) -> io::Result<Value> {
-        if matches!(self.fault, Fault::ReverseFirstBatch) && self.chunk_reads == 0 && self.pending >= 2 {
+        if matches!(self.fault, Fault::ReverseFirstBatch)
+            && self.chunk_reads == 0
+            && self.pending >= 2
+        {
             self.replies.swap(0, 1);
         }
-        let mut frame = self.replies.pop_front()
+        let mut frame = self
+            .replies
+            .pop_front()
             .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "missing response"))?;
-        if matches!(frame["kind"].as_str(), Some("output-chunk" | "artifact-chunk")) {
+        if matches!(
+            frame["kind"].as_str(),
+            Some("output-chunk" | "artifact-chunk")
+        ) {
             if !self.draining {
                 self.batches.push(self.pending);
                 self.draining = true;
@@ -222,7 +291,10 @@ impl WorkerPeer for Peer {
                 }
             }
             if matches!(self.fault, Fault::TimeoutSecondChunk) && self.chunk_reads == 2 {
-                return Err(io::Error::new(io::ErrorKind::TimedOut, "original transfer deadline"));
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "original transfer deadline",
+                ));
             }
         }
         Ok(frame)
@@ -238,25 +310,59 @@ fn output_pipeline_drains_four_range_batches_and_the_final_tail_before_release()
     assert!(delivery.acknowledgments_confirmed);
     peer.delivered_bytes();
     assert_eq!(peer.batches, [4, 4, 2, 1, 4, 2, 1]);
-    assert_eq!(peer.maximum_pending, 4, "serial range I/O must fail this gate");
+    assert_eq!(
+        peer.maximum_pending, 4,
+        "serial range I/O must fail this gate"
+    );
     assert_eq!(peer.acknowledgments, 2);
     assert!(peer.replies.is_empty());
-    assert_eq!(peer.sent.iter().filter(|frame| frame["kind"] == "canonical-exec").count(), 1);
-    recover_existing_delivery(&peer.request, "worker", &destination, DeliveryTrust::Loopback)
-        .unwrap().unwrap();
+    assert_eq!(
+        peer.sent
+            .iter()
+            .filter(|frame| frame["kind"] == "canonical-exec")
+            .count(),
+        1
+    );
+    recover_existing_delivery(
+        &peer.request,
+        "worker",
+        &destination,
+        DeliveryTrust::Loopback,
+    )
+    .unwrap()
+    .unwrap();
 }
 
 #[test]
 fn output_pipeline_covers_empty_and_exact_boundary_files_without_phantom_ranges() {
-    for length in [0, 1, CHUNK_BYTES, CHUNK_BYTES + 1, 4 * CHUNK_BYTES, 4 * CHUNK_BYTES + 1] {
+    for length in [
+        0,
+        1,
+        CHUNK_BYTES,
+        CHUNK_BYTES + 1,
+        4 * CHUNK_BYTES,
+        4 * CHUNK_BYTES + 1,
+    ] {
         let owner = tempfile::tempdir().unwrap();
-        let mut peer = Peer::new(&owner.path().join("delivery"), length, DeliveryMode::Execute);
+        let mut peer = Peer::new(
+            &owner.path().join("delivery"),
+            length,
+            DeliveryMode::Execute,
+        );
         peer.dispatch(DeliveryMode::Execute, None).unwrap();
-        let ranges: Vec<_> = peer.sent.iter()
+        let ranges: Vec<_> = peer
+            .sent
+            .iter()
             .filter(|frame| frame["kind"] == "output-read" && frame["stream"] == "stdout")
-            .map(|frame| frame["offset"].as_u64().unwrap()).collect();
+            .map(|frame| frame["offset"].as_u64().unwrap())
+            .collect();
         let expected = length.div_ceil(CHUNK_BYTES).max(1);
-        assert_eq!(ranges, (0..expected).map(|n| (n * CHUNK_BYTES) as u64).collect::<Vec<_>>());
+        assert_eq!(
+            ranges,
+            (0..expected)
+                .map(|n| (n * CHUNK_BYTES) as u64)
+                .collect::<Vec<_>>()
+        );
         peer.delivered_bytes();
         assert_eq!(peer.acknowledgments, 2);
     }
@@ -264,9 +370,17 @@ fn output_pipeline_covers_empty_and_exact_boundary_files_without_phantom_ranges(
 
 #[test]
 fn output_pipeline_refuses_foreign_reordered_or_contradictory_ranges_before_refilling() {
-    for fault in [Fault::ForeignFirstChunk, Fault::ReverseFirstBatch, Fault::WrongFirstEof] {
+    for fault in [
+        Fault::ForeignFirstChunk,
+        Fault::ReverseFirstBatch,
+        Fault::WrongFirstEof,
+    ] {
         let owner = tempfile::tempdir().unwrap();
-        let mut peer = Peer::new(&owner.path().join("delivery"), 10 * CHUNK_BYTES, DeliveryMode::Execute);
+        let mut peer = Peer::new(
+            &owner.path().join("delivery"),
+            10 * CHUNK_BYTES,
+            DeliveryMode::Execute,
+        );
         peer.fault = fault;
         let failure = peer.dispatch(DeliveryMode::Execute, None).unwrap_err();
         assert!(failure.execution_may_have_run);
@@ -280,13 +394,21 @@ fn output_pipeline_refuses_foreign_reordered_or_contradictory_ranges_before_refi
 #[test]
 fn output_pipeline_valid_chunk_hashes_cannot_replace_complete_file_verification() {
     let owner = tempfile::tempdir().unwrap();
-    let mut peer = Peer::new(&owner.path().join("delivery"), 9 * CHUNK_BYTES + 3, DeliveryMode::Execute);
+    let mut peer = Peer::new(
+        &owner.path().join("delivery"),
+        9 * CHUNK_BYTES + 3,
+        DeliveryMode::Execute,
+    );
     peer.fault = Fault::ValidChunkWrongFileHash;
     let failure = peer.dispatch(DeliveryMode::Execute, None).unwrap_err();
     assert!(failure.detail.contains("complete file digest mismatch"));
     assert_eq!(peer.range_writes, 10);
     assert_eq!(peer.acknowledgments, 0);
-    assert!(peer.sent.iter().all(|frame| frame["kind"] != "artifact-read"));
+    assert!(
+        peer.sent
+            .iter()
+            .all(|frame| frame["kind"] != "artifact-read")
+    );
     assert!(!peer.destination.join("delivery.json").exists());
 }
 
@@ -294,14 +416,35 @@ fn output_pipeline_valid_chunk_hashes_cannot_replace_complete_file_verification(
 fn output_pipeline_lost_writes_and_deadlines_never_retry_or_release_partial_output() {
     for fault in [Fault::FailThirdWrite, Fault::TimeoutSecondChunk] {
         let owner = tempfile::tempdir().unwrap();
-        let mut peer = Peer::new(&owner.path().join("delivery"), 10 * CHUNK_BYTES, DeliveryMode::Resume);
+        let mut peer = Peer::new(
+            &owner.path().join("delivery"),
+            10 * CHUNK_BYTES,
+            DeliveryMode::Resume,
+        );
         peer.fault = fault;
         let failure = peer.dispatch(DeliveryMode::Resume, None).unwrap_err();
         assert!(failure.execution_may_have_run);
-        assert_eq!(peer.range_writes, if matches!(fault, Fault::FailThirdWrite) {3} else {4});
+        assert_eq!(
+            peer.range_writes,
+            if matches!(fault, Fault::FailThirdWrite) {
+                3
+            } else {
+                4
+            }
+        );
         assert_eq!(peer.acknowledgments, 0);
-        assert!(peer.sent.iter().all(|frame| frame["kind"] != "canonical-exec"));
-        assert_eq!(peer.sent.iter().filter(|frame| frame["kind"] == "result-resume").count(), 1);
+        assert!(
+            peer.sent
+                .iter()
+                .all(|frame| frame["kind"] != "canonical-exec")
+        );
+        assert_eq!(
+            peer.sent
+                .iter()
+                .filter(|frame| frame["kind"] == "result-resume")
+                .count(),
+            1
+        );
         assert!(!peer.destination.join("delivery.json").exists());
     }
 }
@@ -311,29 +454,66 @@ fn output_pipeline_resumes_unaligned_prefixes_and_skips_complete_local_files() {
     let owner = tempfile::tempdir().unwrap();
     let root = owner.path().canonicalize().unwrap();
     let old = root.join("old");
-    let mut peer = Peer::new(&root.join("new"), 10 * CHUNK_BYTES + 17, DeliveryMode::Resume);
+    let mut peer = Peer::new(
+        &root.join("new"),
+        10 * CHUNK_BYTES + 17,
+        DeliveryMode::Resume,
+    );
     fs::create_dir_all(old.join("diagnostics")).unwrap();
     fs::create_dir_all(old.join("artifacts/bin")).unwrap();
     let prefix = CHUNK_BYTES + 11;
-    fs::write(old.join("diagnostics/stdout"), &peer.files["diagnostics/stdout"][..prefix]).unwrap();
-    fs::write(old.join("artifacts/bin/app"), &peer.files["artifacts/bin/app"]).unwrap();
+    fs::write(
+        old.join("diagnostics/stdout"),
+        &peer.files["diagnostics/stdout"][..prefix],
+    )
+    .unwrap();
+    fs::write(
+        old.join("artifacts/bin/app"),
+        &peer.files["artifacts/bin/app"],
+    )
+    .unwrap();
     fs::write(old.join("delivery.json"), b"untrusted old marker").unwrap();
     let old_inode = fs::metadata(old.join("artifacts/bin/app")).unwrap().ino();
     let source = ResumeSource::open(&old).unwrap();
     peer.dispatch(DeliveryMode::Resume, Some(&source)).unwrap();
     peer.delivered_bytes();
-    let ranges: Vec<_> = peer.sent.iter()
+    let ranges: Vec<_> = peer
+        .sent
+        .iter()
         .filter(|frame| frame["kind"] == "output-read" && frame["stream"] == "stdout")
-        .map(|frame| frame["offset"].as_u64().unwrap()).collect();
+        .map(|frame| frame["offset"].as_u64().unwrap())
+        .collect();
     assert_eq!(ranges[0], prefix as u64);
     assert_eq!(ranges.len(), 10);
     assert_eq!(peer.batches, [4, 4, 2, 1, 1]);
-    assert!(peer.sent.iter().all(|frame| !(frame["kind"] == "artifact-read" && frame["name"] == "bin/app")));
-    assert_ne!(old_inode, fs::metadata(peer.destination.join("artifacts/bin/app")).unwrap().ino());
-    assert_eq!(fs::metadata(old.join("artifacts/bin/app")).unwrap().ino(), old_inode);
-    assert_eq!(fs::read(old.join("diagnostics/stdout")).unwrap(), peer.files["diagnostics/stdout"][..prefix]);
-    assert_eq!(fs::read(old.join("delivery.json")).unwrap(), b"untrusted old marker");
-    assert!(peer.sent.iter().all(|frame| frame["kind"] != "canonical-exec"));
+    assert!(
+        peer.sent
+            .iter()
+            .all(|frame| !(frame["kind"] == "artifact-read" && frame["name"] == "bin/app"))
+    );
+    assert_ne!(
+        old_inode,
+        fs::metadata(peer.destination.join("artifacts/bin/app"))
+            .unwrap()
+            .ino()
+    );
+    assert_eq!(
+        fs::metadata(old.join("artifacts/bin/app")).unwrap().ino(),
+        old_inode
+    );
+    assert_eq!(
+        fs::read(old.join("diagnostics/stdout")).unwrap(),
+        peer.files["diagnostics/stdout"][..prefix]
+    );
+    assert_eq!(
+        fs::read(old.join("delivery.json")).unwrap(),
+        b"untrusted old marker"
+    );
+    assert!(
+        peer.sent
+            .iter()
+            .all(|frame| frame["kind"] != "canonical-exec")
+    );
 }
 
 #[test]
@@ -347,10 +527,16 @@ fn output_pipeline_corrupt_prefix_plus_correct_remote_tail_never_acknowledges() 
     prefix[0] ^= 1;
     fs::write(old.join("diagnostics/stdout"), &prefix).unwrap();
     let source = ResumeSource::open(&old).unwrap();
-    let failure = peer.dispatch(DeliveryMode::Resume, Some(&source)).unwrap_err();
+    let failure = peer
+        .dispatch(DeliveryMode::Resume, Some(&source))
+        .unwrap_err();
     assert!(failure.detail.contains("complete file digest mismatch"));
     assert_eq!(peer.acknowledgments, 0);
     assert_eq!(fs::read(old.join("diagnostics/stdout")).unwrap(), prefix);
     assert!(!peer.destination.join("delivery.json").exists());
-    assert!(peer.sent.iter().all(|frame| frame["kind"] != "canonical-exec"));
+    assert!(
+        peer.sent
+            .iter()
+            .all(|frame| frame["kind"] != "canonical-exec")
+    );
 }

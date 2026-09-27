@@ -127,9 +127,15 @@ impl Fixture {
 
     fn archive(&self, cas: &LiveCas) -> String {
         digest_key(
-            &archive_delivery(cas, &self.request, "worker", &self.source, DeliveryTrust::Loopback)
-                .unwrap()
-                .root,
+            &archive_delivery(
+                cas,
+                &self.request,
+                "worker",
+                &self.source,
+                DeliveryTrust::Loopback,
+            )
+            .unwrap()
+            .root,
         )
     }
 }
@@ -165,11 +171,18 @@ fn rejected_trust_does_not_strand_the_destination_for_a_correct_retry() {
         DeliveryTrust::Loopback,
     )
     .unwrap();
-    assert_eq!(fs::read(destination.join("artifacts/nested/a")).unwrap(), ARTIFACT);
+    assert_eq!(
+        fs::read(destination.join("artifacts/nested/a")).unwrap(),
+        ARTIFACT
+    );
     assert!(!restored.acknowledgments_confirmed);
     assert_eq!(restored.receipt["publication_authorized"], false);
     assert_eq!(restored.receipt["reexecute"], false);
-    assert_eq!(f.staging(), failed_staging, "failed staging is never consumed");
+    assert_eq!(
+        f.staging(),
+        failed_staging,
+        "failed staging is never consumed"
+    );
 }
 
 #[test]
@@ -182,7 +195,12 @@ fn late_replica_failure_retains_evidence_and_can_retry_after_cas_reopen() {
     let object = digest_set(STDOUT, DigestRequest::default(), None)
         .unwrap()
         .atp_content_id;
-    let original = cas.store().lock().unwrap().object_locations(&object).unwrap()[0]
+    let original = cas
+        .store()
+        .lock()
+        .unwrap()
+        .object_locations(&object)
+        .unwrap()[0]
         .0
         .clone();
     fs::set_permissions(&original, fs::Permissions::from_mode(0o600)).unwrap();
@@ -201,10 +219,19 @@ fn late_replica_failure_retains_evidence_and_can_retry_after_cas_reopen() {
     let failed_staging = f.staging();
     assert_eq!(failed_staging.len(), 1);
     assert!(error.contains(&failed_staging[0].display().to_string()));
-    assert_eq!(fs::read(failed_staging[0].join("artifacts/nested/a")).unwrap(), ARTIFACT);
-    assert!(cas.store().lock().unwrap().reconciliation_scan().unwrap().iter().any(
-        |row| row.store_path == original && row.quarantined
-    ));
+    assert_eq!(
+        fs::read(failed_staging[0].join("artifacts/nested/a")).unwrap(),
+        ARTIFACT
+    );
+    assert!(
+        cas.store()
+            .lock()
+            .unwrap()
+            .reconciliation_scan()
+            .unwrap()
+            .iter()
+            .any(|row| row.store_path == original && row.quarantined)
+    );
     // Supply a NEW verified replica; do not overwrite the quarantined evidence.
     let replica = f.path("healthy-stdout-replica");
     write(&replica, STDOUT, false);
@@ -213,7 +240,13 @@ fn late_replica_failure_retains_evidence_and_can_retry_after_cas_reopen() {
     cas.store()
         .lock()
         .unwrap()
-        .add_location(&object, replica.to_str().unwrap(), None, RAW_PROFILE_V1, true)
+        .add_location(
+            &object,
+            replica.to_str().unwrap(),
+            None,
+            RAW_PROFILE_V1,
+            true,
+        )
         .unwrap();
     drop(cas);
     let cas = f.mount();
@@ -229,12 +262,28 @@ fn late_replica_failure_retains_evidence_and_can_retry_after_cas_reopen() {
     recover_existing_delivery(&f.request, "worker", &destination, DeliveryTrust::Loopback)
         .unwrap()
         .unwrap();
-    assert_eq!(fs::read(destination.join("diagnostics/stdout")).unwrap(), STDOUT);
-    assert_eq!(fs::read(destination.join("artifacts/nested/a")).unwrap(), ARTIFACT);
+    assert_eq!(
+        fs::read(destination.join("diagnostics/stdout")).unwrap(),
+        STDOUT
+    );
+    assert_eq!(
+        fs::read(destination.join("artifacts/nested/a")).unwrap(),
+        ARTIFACT
+    );
     assert_eq!(f.staging(), failed_staging);
     assert_eq!(fs::read(&original).unwrap(), vec![b'x'; STDOUT.len()]);
-    assert_eq!(fs::read(f.source.join("diagnostics/stdout")).unwrap(), STDOUT);
-    assert!(cas.store().lock().unwrap().list_publications().unwrap().is_empty());
+    assert_eq!(
+        fs::read(f.source.join("diagnostics/stdout")).unwrap(),
+        STDOUT
+    );
+    assert!(
+        cas.store()
+            .lock()
+            .unwrap()
+            .list_publications()
+            .unwrap()
+            .is_empty()
+    );
     assert_eq!(cas.store().lock().unwrap().authority_count().unwrap(), 0);
 }
 
@@ -259,13 +308,28 @@ fn completed_restore_publishes_one_private_independent_tree_and_reuses_it() {
         .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
         .collect();
     entries.sort();
-    assert_eq!(entries, vec!["artifacts".to_owned(), "delivery.json".to_owned(), "diagnostics".to_owned()]);
-    assert_eq!(fs::metadata(&destination).unwrap().permissions().mode() & 0o777, 0o700);
+    assert_eq!(
+        entries,
+        vec![
+            "artifacts".to_owned(),
+            "delivery.json".to_owned(),
+            "diagnostics".to_owned()
+        ]
+    );
+    assert_eq!(
+        fs::metadata(&destination).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
     let artifact = destination.join("artifacts/nested/a");
     let before = fs::metadata(&artifact).unwrap();
     assert_eq!(before.nlink(), 1);
     assert_eq!(before.permissions().mode() & 0o777, 0o700);
-    assert_ne!(before.ino(), fs::metadata(f.source.join("artifacts/nested/a")).unwrap().ino());
+    assert_ne!(
+        before.ino(),
+        fs::metadata(f.source.join("artifacts/nested/a"))
+            .unwrap()
+            .ino()
+    );
     restore_delivery(
         &cas,
         &key,
@@ -333,13 +397,20 @@ fn staged_completion_keeps_verified_inodes_without_reading_artifact_replicas() {
     let cas = f.mount();
     let key = f.archive(&cas);
     let staging = complete_staging(&f, &cas, &key);
-    let inode = fs::metadata(staging.join("artifacts/nested/a")).unwrap().ino();
+    let inode = fs::metadata(staging.join("artifacts/nested/a"))
+        .unwrap()
+        .ino();
     // Keep the missing replica as evidence outside its registered location.
     // Completion must use the already staged bytes, not copy from the CAS.
     let object = digest_set(ARTIFACT, DigestRequest::default(), None)
         .unwrap()
         .atp_content_id;
-    let replica = cas.store().lock().unwrap().object_locations(&object).unwrap()[0]
+    let replica = cas
+        .store()
+        .lock()
+        .unwrap()
+        .object_locations(&object)
+        .unwrap()[0]
         .0
         .clone();
     let retained_replica = f.path("unavailable-artifact-replica");
@@ -358,8 +429,16 @@ fn staged_completion_keeps_verified_inodes_without_reading_artifact_replicas() {
     assert!(!staging.exists());
     assert!(!Path::new(&replica).exists());
     assert_eq!(fs::read(&retained_replica).unwrap(), ARTIFACT);
-    assert_eq!(fs::read(destination.join("artifacts/nested/a")).unwrap(), ARTIFACT);
-    assert_eq!(fs::metadata(destination.join("artifacts/nested/a")).unwrap().ino(), inode);
+    assert_eq!(
+        fs::read(destination.join("artifacts/nested/a")).unwrap(),
+        ARTIFACT
+    );
+    assert_eq!(
+        fs::metadata(destination.join("artifacts/nested/a"))
+            .unwrap()
+            .ino(),
+        inode
+    );
     assert!(!finished.acknowledgments_confirmed);
     assert_eq!(finished.receipt["reexecute"], false);
     assert_eq!(finished.receipt["publication_authorized"], false);
@@ -379,8 +458,20 @@ fn staged_completion_keeps_verified_inodes_without_reading_artifact_replicas() {
     .unwrap();
     assert_eq!(finished.receipt, repeated.receipt);
     assert_eq!(fs::read(staging.join("later-occupant")).unwrap(), b"keep");
-    assert_eq!(fs::metadata(destination.join("artifacts/nested/a")).unwrap().ino(), inode);
-    assert!(cas.store().lock().unwrap().list_publications().unwrap().is_empty());
+    assert_eq!(
+        fs::metadata(destination.join("artifacts/nested/a"))
+            .unwrap()
+            .ino(),
+        inode
+    );
+    assert!(
+        cas.store()
+            .lock()
+            .unwrap()
+            .list_publications()
+            .unwrap()
+            .is_empty()
+    );
     assert_eq!(cas.store().lock().unwrap().authority_count().unwrap(), 0);
 }
 
@@ -489,7 +580,10 @@ fn staged_completion_binds_the_exact_result_not_only_the_request() {
         )
         .is_err()
     );
-    assert_eq!(fs::read(destination.join("diagnostics/stdout")).unwrap(), STDOUT);
+    assert_eq!(
+        fs::read(destination.join("diagnostics/stdout")).unwrap(),
+        STDOUT
+    );
 }
 
 #[test]
@@ -497,13 +591,22 @@ fn staged_completion_still_obeys_revocation_and_logical_quarantine() {
     for policy in ["released-pin", "root-quarantine", "artifact-quarantine"] {
         let f = Fixture::new();
         let cas = f.mount();
-        let archive =
-            archive_delivery(&cas, &f.request, "worker", &f.source, DeliveryTrust::Loopback)
-                .unwrap();
+        let archive = archive_delivery(
+            &cas,
+            &f.request,
+            "worker",
+            &f.source,
+            DeliveryTrust::Loopback,
+        )
+        .unwrap();
         let key = digest_key(&archive.root);
         let staging = complete_staging(&f, &cas, &key);
         if policy == "released-pin" {
-            cas.store().lock().unwrap().release_pin(archive.pin, "rabs-delivery-archive").unwrap();
+            cas.store()
+                .lock()
+                .unwrap()
+                .release_pin(archive.pin, "rabs-delivery-archive")
+                .unwrap();
         } else {
             let object = if policy == "root-quarantine" {
                 parse_archive_key(&key).unwrap()
@@ -512,11 +615,15 @@ fn staged_completion_still_obeys_revocation_and_logical_quarantine() {
                     .unwrap()
                     .atp_content_id
             };
-            cas.store().lock().unwrap().add_quarantine(
-                QuarantineScope::LogicalObject,
-                &digest_key(&object),
-                "retain but do not restore",
-            ).unwrap();
+            cas.store()
+                .lock()
+                .unwrap()
+                .add_quarantine(
+                    QuarantineScope::LogicalObject,
+                    &digest_key(&object),
+                    "retain but do not restore",
+                )
+                .unwrap();
         }
         let destination = f.path("finished");
         assert!(
@@ -550,26 +657,66 @@ fn staged_completion_requires_explicit_identity_trust_and_private_siblings() {
     fs::create_dir(&other_parent).unwrap();
     let not_sibling = other_parent.join("finished");
     for (source, target, worker, trust) in [
-        (&staging, &destination, "worker", DeliveryTrust::PinnedWorker([1; 32])),
-        (&staging, &destination, "other-worker", DeliveryTrust::Loopback),
-        (&ordinary_name, &destination, "worker", DeliveryTrust::Loopback),
-        (&absent_staging, &destination, "worker", DeliveryTrust::Loopback),
+        (
+            &staging,
+            &destination,
+            "worker",
+            DeliveryTrust::PinnedWorker([1; 32]),
+        ),
+        (
+            &staging,
+            &destination,
+            "other-worker",
+            DeliveryTrust::Loopback,
+        ),
+        (
+            &ordinary_name,
+            &destination,
+            "worker",
+            DeliveryTrust::Loopback,
+        ),
+        (
+            &absent_staging,
+            &destination,
+            "worker",
+            DeliveryTrust::Loopback,
+        ),
         (&staging, &staging, "worker", DeliveryTrust::Loopback),
         (&staging, &not_sibling, "worker", DeliveryTrust::Loopback),
     ] {
-        assert!(finish_staged_restore(&cas, &key, &f.request, worker, source, target, trust).is_err());
+        assert!(
+            finish_staged_restore(&cas, &key, &f.request, worker, source, target, trust).is_err()
+        );
         assert!(staging.is_dir());
         assert!(!destination.exists());
     }
     // Empty and partial destinations cannot be replaced or mistaken for success.
     fs::create_dir(&destination).unwrap();
-    assert!(finish_staged_restore(
-        &cas, &key, &f.request, "worker", &staging, &destination, DeliveryTrust::Loopback,
-    ).is_err());
+    assert!(
+        finish_staged_restore(
+            &cas,
+            &key,
+            &f.request,
+            "worker",
+            &staging,
+            &destination,
+            DeliveryTrust::Loopback,
+        )
+        .is_err()
+    );
     write(&destination.join("sentinel"), b"keep", false);
-    assert!(finish_staged_restore(
-        &cas, &key, &f.request, "worker", &staging, &destination, DeliveryTrust::Loopback,
-    ).is_err());
+    assert!(
+        finish_staged_restore(
+            &cas,
+            &key,
+            &f.request,
+            "worker",
+            &staging,
+            &destination,
+            DeliveryTrust::Loopback,
+        )
+        .is_err()
+    );
     assert_eq!(fs::read(destination.join("sentinel")).unwrap(), b"keep");
     assert!(staging.is_dir());
 }
@@ -580,7 +727,9 @@ fn real_cli_finishes_a_staged_restore_and_retries_after_staging_is_consumed() {
     let cas = f.mount();
     let key = f.archive(&cas);
     let staging = complete_staging(&f, &cas, &key);
-    let inode = fs::metadata(staging.join("artifacts/nested/a")).unwrap().ino();
+    let inode = fs::metadata(staging.join("artifacts/nested/a"))
+        .unwrap()
+        .ino();
     let destination = f.path("finished");
     let request = f.path("request.json");
     write(&request, &serde_json::to_vec(&f.request).unwrap(), false);
@@ -598,14 +747,26 @@ fn real_cli_finishes_a_staged_restore_and_retries_after_staging_is_consumed() {
             .arg("loopback")
             .output()
             .unwrap();
-        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         let result: Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(result["kind"], "worker-delivery");
         assert_eq!(result["reexecute"], false);
         assert_eq!(result["receipt"]["publication_authorized"], false);
         assert_eq!(result["acknowledgments_confirmed"], false);
         assert!(!staging.exists());
-        assert_eq!(fs::read(destination.join("artifacts/nested/a")).unwrap(), ARTIFACT);
-        assert_eq!(fs::metadata(destination.join("artifacts/nested/a")).unwrap().ino(), inode);
+        assert_eq!(
+            fs::read(destination.join("artifacts/nested/a")).unwrap(),
+            ARTIFACT
+        );
+        assert_eq!(
+            fs::metadata(destination.join("artifacts/nested/a"))
+                .unwrap()
+                .ino(),
+            inode
+        );
     }
 }

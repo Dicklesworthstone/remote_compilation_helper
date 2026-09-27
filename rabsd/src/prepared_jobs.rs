@@ -300,7 +300,12 @@ async fn exchange_frames(
     let reply = read_frame(stream, until).await?;
     if !matches!(
         reply["kind"].as_str(),
-        Some("prepared-operation" | "prepared-operation-error" | "prepared-completion" | "prepared-preview")
+        Some(
+            "prepared-operation"
+                | "prepared-operation-error"
+                | "prepared-completion"
+                | "prepared-preview"
+        )
     ) {
         return Err(invalid(
             "unexpected daemon job reply; inspect the same job ID",
@@ -328,12 +333,16 @@ async fn exchange_frames(
             || reply["publication_authorized"] != false
             || reply["reexecute"] != false
         {
-            return Err(invalid("daemon completion differs from the selected read-only request"));
+            return Err(invalid(
+                "daemon completion differs from the selected read-only request",
+            ));
         }
     } else if request["kind"] == "prepared-completion"
         && reply["kind"] != "prepared-operation-error"
     {
-        return Err(invalid("daemon returned status instead of a verified completion"));
+        return Err(invalid(
+            "daemon returned status instead of a verified completion",
+        ));
     }
     if reply["kind"] == "prepared-preview" {
         if request["kind"] != "prepared-preview"
@@ -343,12 +352,14 @@ async fn exchange_frames(
             || reply["complete"] != false
             || reply["publication_authorized"] != false
         {
-            return Err(invalid("daemon preview differs from the selected read-only attempt"));
+            return Err(invalid(
+                "daemon preview differs from the selected read-only attempt",
+            ));
         }
-    } else if request["kind"] == "prepared-preview"
-        && reply["kind"] != "prepared-operation-error"
-    {
-        return Err(invalid("daemon returned another operation instead of a preview"));
+    } else if request["kind"] == "prepared-preview" && reply["kind"] != "prepared-operation-error" {
+        return Err(invalid(
+            "daemon returned another operation instead of a preview",
+        ));
     }
     remaining(until)?;
     Ok(reply)
@@ -496,7 +507,10 @@ mod tests {
         assert_eq!(acknowledge["kind"], "prepared-acknowledge");
         assert_eq!(acknowledge["delivery"], "/old");
         let local = request(&args(&["--job-recover-local", id, "/old"])).unwrap();
-        assert_eq!(local, json!({"kind":"prepared-recover-local", "operation_id":id, "delivery":"/old"}));
+        assert_eq!(
+            local,
+            json!({"kind":"prepared-recover-local", "operation_id":id, "delivery":"/old"})
+        );
         assert!(request(&args(&["--job-recover-local", id, "/old", "/extra"])).is_err());
         for malformed in [
             args(&["--job-status", "1"]),

@@ -3,6 +3,11 @@ name = "rchd"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 description = "Remote Compilation Helper - Local daemon for worker orchestration"
 
 [[bin]]
@@ -12,7 +17,7 @@ required-features = ["unix-sockets"]
 
 [dependencies]
 rch-common = { workspace = true, features = ["rich-ui"] }
-rch-telemetry = { path = "../rch-telemetry" }
+rch-telemetry = { path = "../rch-telemetry", version = "2.1.0" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }

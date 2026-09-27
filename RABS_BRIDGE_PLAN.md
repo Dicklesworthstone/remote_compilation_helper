@@ -1,6 +1,166 @@
 # RABS Bridge Plan — From Proven Library to Living System
 
-## Reality check and execution order — September 15, 2026
+## Reality check and execution order — September 26, 2026
+
+This dated assessment replaces the September 15 one. It is written for the
+operator and the implementing agents who choose the next delivered
+capability. The original goals and acceptance below still stand. Revise this
+section in place when new execution evidence changes it. It waives no product
+acceptance.
+
+**Assessment revision:** `fb0344cf` (plus one other agent's uncommitted edit to
+`rchd/src/benchmark_scheduler.rs`), with bead IDs as of `64fa4105`.
+**Released revision:** still `v2.0.0` (`3289f5e4`, September 13). Main is
+about 490 commits past it, and about 540 commits landed after the
+September 15 assessment. The installed operator binaries are the
+September 15 diag build (`b4775837`). Linux dispatchers reinstall the latest
+*release* every night, so nothing merged after September 13 is running in
+production.
+
+**Conclusion:** conventional RCH is doing real work in production right now.
+A snapshot of the operator daemon's recent builds showed 20 offloaded
+clippy/test jobs across four repositories, lasting 27 seconds to 49 minutes:
+17 exit 0, two exit 101 (lint/test failures), and one exit 127 (a
+bypass-wrapped command). HEAD compiles, but it
+fails the mandatory workspace clippy gate. The dispatcher it exists to protect
+was at load average 78, with about 580% CPU of *local* rustc. RABS still
+serves zero automatic Cargo hits: the wrapper execs rustc unconditionally.
+Most RABS effort since September 15 built a second, operator-driven
+remote-build system instead of the first served class this plan sequences
+next.
+
+### Evidence gathered for this revision
+
+- `rch exec -- cargo check --workspace --all-targets` (remote,
+  `RCH_REQUIRE_REMOTE=1`): **exit 0**, 16m22s.
+- `rch exec -- cargo clippy --workspace --all-targets -- -D warnings`:
+  **exit 101**. Four lints in `rabs-wkr` (`request_journal.rs:87`,
+  `source_transfer.rs:32,37`). → `bd-kuy6y`.
+- `rch exec -- cargo test --workspace --no-fail-fast` **cannot produce a
+  verdict.** The cold attempt was still compiling test targets when its
+  90-minute deadline killed it (exit 137, reported correctly; no local
+  fallback). The warm attempt reached the RABS binaries, then hung for more
+  than 30 minutes in `rabs-cas` `h015_frankensqlite_matrix_matches_reference_at_every_kill_point`.
+  Because binaries run in package order, that hang prevents every core crate
+  from running. Before the hang it logged 6 failures, including a nested
+  `block_on` regression in the new `worker_transport.rs`. → `bd-h3fu2`.
+- Core crates only (`cargo test -j 7 -p rch -p rchd -p rch-common -p rch-wkr
+  -p rch-telemetry --no-fail-fast`, hz3, 34m55s): **5,463 passed, 39 failed,
+  20 ignored**, and the `rch` bin unit tests aborted with SIGABRT (`bd-dl3qs`).
+  Thirty failures share one signature: a harness-spawned rchd answers with an
+  empty response or EAGAIN. That cluster is not on the environment-bound list
+  recorded before v1.0.60. Cause undetermined (regression vs environment),
+  and the fix gates the release. → `bd-5rbv4`.
+- Live fleet (`rch status --workers --jobs --json`, operator Mac): 16/18
+  workers healthy, 42/66 slots free. wsurf's circuit is open after 2,613
+  consecutive failures. hz4 is disabled. hz1 and mminiold are at critical
+  disk. Five workers have zero effective slots. Posture is permanently
+  `degraded`. → `bd-81htz`.
+- Hook process cost (`hyperfine -N`, non-compilation input, load average
+  ~78): about 8.3 ms user+sys per Bash call, against about 1.9 ms for
+  `/usr/bin/true` and about 22 ms for the dcg hook. The AGENTS.md budget is
+  under 1 ms (panic threshold 5 ms). Only the in-process classifier is
+  asserted against it. → comment on `bd-1nhd`.
+- Local rustc on the dispatcher traced to the cargo shim passing through
+  (a) a project outside the canonical root, for which `rch diagnose`
+  nevertheless answers "WOULD INTERCEPT" (→ `bd-raobv`), and (b) a
+  `cargo ltest` alias with a `local_*` target directory (possibly a deliberate
+  escape hatch; ask the operator).
+- On hz3 during the test run (load average ~35 on 64 cores), the operator
+  daemon saw only its own 8-slot job. The rest of the load came from other
+  dispatchers' builds, which this daemon cannot see (each rchd accounts slots
+  independently). `asupersync` and `fsqlite_core` were being compiled
+  concurrently in separate per-project caches. This is live evidence of the
+  cross-dispatcher duplication that RABS M6/Epic I (fleet singleflight and
+  resource scheduler) and the served classes exist to remove, and none of it
+  is live.
+- Production call sites were read for every RABS claim below. Test-only and
+  library-only code is not credited as delivered.
+
+### Vision checklist against current evidence
+
+| Goal | Reality now | Remaining work / proof |
+|---|---|---|
+| Classify safe commands, preserve hook semantics | **Working.** It is in production use across repositories. The classifier covers more than the README lists (go, tsc, zigbuild/xwin, `cargo run`). | `rch diagnose` can contradict execution for off-root projects (`bd-raobv`). The hook process costs about 6 ms of CPU above spawn baseline, against a budget under 1 ms (`bd-1nhd`). |
+| Execute remotely, return correct output/artifacts | **Working** on Linux Rust paths. Named `--bin`/`--example` narrowing landed on main (unreleased; the README still says it doesn't exist). | `bd-3tkcz`, `bd-dl3qs`. Ship it: `bd-iiyvx`. |
+| Protect dispatcher CPU across harnesses | **Partial, and failing at the time of observation.** The shim is installed and wraps 14/14 toolchains. Even so, about 580% of dispatcher CPU was local rustc. | `bd-raobv` (off-root silent local builds), `bd-g2ppt`/`bd-ousos`, `bd-qawj7` (its part 1, the ledger, is on main via `64fa4105` but unreleased; `rch status` has no summary yet). |
+| Coherent source/dependency snapshots | Unchanged since September 15: implemented, with the closure tasks still open. | `bd-n41ig`, `bd-p2m5h`, `…materialization-closure-qe8dk`. |
+| Schedule within real fleet capacity | Works, but the fleet is degraded. Five of 18 workers contribute zero slots, one has been dead for thousands of probes, and the largest worker is disabled. | `bd-81htz`. |
+| Recover surviving jobs after daemon loss | **Partial.** Active builds are restored. Queued jobs are dropped. Reattach cannot work on macOS because process identity is read from `/proc`. Startup fails hard if a recorded worker was removed from config. | `bd-w2qrp` (new), `…ocv9i.10.3`. |
+| Truthful outcome and observability | **Fixed on main, unreleased.** Build success is now `exit_code == 0` (`rchd/src/history.rs:82`), and the daemon OTLP exporter is real. Hook/watch/doctor OTel is still unfinished, and the README says so. | Independently verify and close `bd-88fpl`. Continue `62u24.17`. Operator commands that fake success: `bd-bddpd` (new). |
+| Meet hook/selection/pipeline budgets | **Unproven.** Only the in-process classifier is asserted. Selection latency is measured but never asserted. The 15% pipeline overhead is not enforced. | `bd-1nhd` (see its measurement comment). |
+| Ship what main contains | **Not happening.** There has been no release in 13 days and about 490 commits, and the nightly job reverts hand deploys. | `bd-iiyvx` ← `bd-kuy6y`. |
+| Update integrity | **Overclaimed.** Updates are checksum-only. `.minisig` files are never verified, and sigstore is skipped when absent (it is absent in v2.0.0). | `bd-oxxnk` (new). |
+| Boot the Asupersync RABS spine | **Working.** A real current-thread asupersync runtime runs, with edge, coord and janitor regions, plus a prepared-job driver. | S8 soak `bd-rb754` has not started. |
+| Authenticated, resumable worker sessions | **Substantially improved.** Native mutual TLS plus ATP control framing, with SPKI peer identity (`rabs-asupersync/src/worker_transport.rs`). Only the operator lane uses it. | S5 `bd-085cm`: orchestrated D003/D005 proof, flap/restart resume, and coordinator-only publication authority. |
+| Serve automatic Cargo dependency hits | **No change: zero.** `rabs-wrap/src/main.rs:377` execs rustc unconditionally. Every edge consult reply is pass-through. `commit_offer` and the `serve` frame have only `#[cfg(test)]` callers, so production never commits an entry. | `bd-14t4j` → `bd-k52xe` (untouched since mid-August and September 15). `bd-1vf05`'s title ("a wrapper that acts on the answer") overstates what shipped; its close reason discloses the split. |
+| Trust and zero-divergence serving | Sampling and quarantine are wired into the serve code, but that code has no production traffic. The T011 release gate is Advisory and never refuses. | `bd-okthi`, `bd-rhdef`, H012. |
+| Multi-agent speedup, advanced cached classes | None measured. There is still no supported 3× or >90%-served claim. | W2 gates and the K–Q/T milestones. |
+| Ship and sustain RABS on the fleet | Unchanged. Prebuilt install and release omit the RABS binaries, and the launchd plist has no installer. | S7 `bd-n8qt3`, S8 `bd-rb754`. |
+
+### What happened since September 15 (steering signal)
+
+- There were 542 commits: 116k lines inserted and 7k deleted outside
+  `.beads/`. **389 cite no bead.** 93 say tests or compilation were not run.
+  One (`8dd4b378`) had to restore daemon/worker compilation. Only 55 beads
+  closed in the window.
+- About 225 of the commits touched RABS. The biggest theme (roughly 50–95
+  commits, mostly untracked) is an **operator prepared-build job system**:
+  `rabsd --worker-build-tls`, `--job-submit/status/wait/follow/cancel/resume/
+  acknowledge/recover-local`, vendored/alternate registry preparation,
+  durable job history, and diagnostics replay. Its operator doc,
+  `docs/rabs-worker-delivery.md`, is now 70 KB. It is real remote execution
+  over authenticated ATP, but it is **Phase 3 (M9) scope** built ahead of
+  Phase 1. Nothing in `rch` calls it and nothing packages it. It also
+  duplicates what conventional RCH already does in production.
+- Everything on this plan's critical path to a served hit is unchanged:
+  `bd-14t4j`, `bd-k52xe`, `bd-okthi`, `bd-rhdef`, S7 and S8.
+- `bv --robot-triage` ranks deep RABS graph nodes highest, such as D013, a
+  macOS VM helper idle for 50 days. Graph centrality will keep pulling
+  agents away from shipping and dispatcher protection unless priorities
+  override it.
+
+### Bridge: order of work from here
+
+0. **Ship what exists (new, first).** Make HEAD pass every mandatory gate:
+   clippy (`bd-kuy6y`), and core-crate tests green or explained
+   (`bd-5rbv4`). Then cut a release from that exact revision (`bd-iiyvx`).
+   Make the workspace test suite able to produce a verdict (`bd-h3fu2`), but
+   do not let RABS test debt hold the core release hostage. Until a release
+   ships, every fix below is invisible to users.
+1. **Dispatcher protection is the product.** Silent off-root local builds and
+   a lying `diagnose` (`bd-raobv`), shim durability (`bd-g2ppt`/`bd-ousos`),
+   and the fallback ledger (`bd-qawj7`). Measure success by local rustc CPU
+   on dispatchers during agent storms, not by bead closure.
+2. **Truthful operator surfaces.** Remove or implement the commands that
+   fake success (`bd-bddpd`). Make update authenticity real (`bd-oxxnk`).
+   Close the recovery gaps (`bd-w2qrp`, `ocv9i.10.3`). Restore fleet
+   capacity and make posture meaningful (`bd-81htz`).
+3. **Measure the budgets for real** (`bd-1nhd`): process-level hook latency,
+   asserted selection latency, and paired worker-direct vs RCH pipeline
+   overhead on a quiet host. Do not weaken the 15% requirement.
+4. **RABS: freeze the prepared-build lane at its current scope** until the
+   operator decides whether it is sanctioned. Put RABS effort into the one
+   path that turns the program into user value: a production commit path
+   (`commit_offer` with a real caller), live materialization (`bd-14t4j`),
+   sampling/quarantine integrity (`bd-okthi`, `bd-rhdef`), then a wrapper
+   that actually skips rustc on a verified hit (`bd-k52xe`). Follow with the
+   two-worktree M4 demo. The September 15 Phase 1 acceptance stands
+   unchanged.
+5. **Then** S7 packaging and the S8 soak, and only after that the later
+   phases, each through the same shadow → sampled → ratcheted serving ladder.
+
+### Verification limits
+
+This revision re-ran check, clippy and tests remotely, observed the live
+fleet and processes, benchmarked the installed hook, and read production
+call sites for every RABS claim (with two independent read-only audits,
+spot-checked by direct reads). It did not run a quiet-host performance
+benchmark, crash the shared daemon, run any RABS binary, perform macOS
+qualification, or execute a soak. The hook timing was taken on a heavily
+loaded machine with the installed (September 15) binary.
+
+## Previous assessment — September 15, 2026 (superseded where the September 26 section above differs; its detailed recovery, measurement and serving rules still bind)
 
 This update is for the operator and implementing agents choosing the next
 delivered capability. It corrects observed library-only closures, missing live

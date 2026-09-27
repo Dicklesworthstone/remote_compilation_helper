@@ -405,7 +405,14 @@ pub async fn run_hook() -> anyhow::Result<()> {
     // fall open rather than non-zero-exit and block the agent's Bash.
     match &output {
         HookOutput::Deny(_) | HookOutput::AllowWithModifiedCommand(_) => {
-            match serde_json::to_string(&output) {
+            // Only a rewrite needs the original tool input (to carry `timeout`,
+            // `run_in_background`, ... through `updatedInput`), so the second
+            // parse stays off the non-compilation hot path.
+            let original_tool_input = matches!(output, HookOutput::AllowWithModifiedCommand(_))
+                .then(|| serde_json::from_str::<serde_json::Value>(input).ok())
+                .flatten()
+                .and_then(|mut raw| raw.get_mut("tool_input").map(serde_json::Value::take));
+            match output.to_hook_json(original_tool_input.as_ref()) {
                 Ok(json) => {
                     if let Err(e) = writeln!(stdout, "{}", json) {
                         warn!(target: "rch::hook", error = %e, "stdout write failed; falling open");
@@ -509,8 +516,29 @@ fn hook_mode_panic_fail_open_enabled() -> bool {
 /// as a single argv entry; split that shell command once before re-quoting so
 /// `sh -c` sees `env VAR=... cargo ...` instead of one quoted command name.
 fn join_exec_command(command_parts: &[String]) -> String {
-    let normalized_parts = normalize_exec_command_parts(command_parts);
+    let mut normalized_parts = normalize_exec_command_parts(command_parts);
+    // `shell_words::join` quotes `FOO=1` as a whole word, and a quoted
+    // assignment is no longer an assignment: `'FOO=1' cargo test` runs a
+    // program named `FOO=1` (exit 127) on every local fallback and every
+    // non-cargo remote run. An explicit `env` keeps the assignment bytes as
+    // real argv, the same rule the Cargo token parser applies.
+    if normalized_parts
+        .first()
+        .is_some_and(|part| is_shell_assignment(part))
+    {
+        normalized_parts.insert(0, "env".to_string());
+    }
     shell_words::join(normalized_parts)
+}
+
+/// `NAME=value` where NAME is a valid POSIX shell variable name.
+pub(crate) fn is_shell_assignment(token: &str) -> bool {
+    token.split_once('=').is_some_and(|(key, _)| {
+        !key.is_empty()
+            && key.chars().enumerate().all(|(index, ch)| {
+                ch == '_' || ch.is_ascii_alphabetic() || index > 0 && ch.is_ascii_digit()
+            })
+    })
 }
 
 fn normalize_exec_command_parts(command_parts: &[String]) -> Vec<String> {
@@ -1443,7 +1471,10 @@ impl DurableLeaseWriter {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             if let Some(recovery) = lease.recovery.as_ref()
-                && (recovery.get("returned").and_then(serde_json::Value::as_i64).is_none()
+                && (recovery
+                    .get("returned")
+                    .and_then(serde_json::Value::as_i64)
+                    .is_none()
                     || recovery.get("retired").and_then(serde_json::Value::as_bool) != Some(true))
             {
                 anyhow::bail!(
@@ -2754,6 +2785,20 @@ pub async fn run_exec(
     // warnings reference the configured roots rather than compiled-in defaults.
     let topology_policy = config.path_topology.to_policy();
 
+    // bd-raobv: transfer cannot mirror a project outside the canonical root.
+    // Decide that before a worker slot is reserved, with a reason an operator
+    // can act on, and record it like every other fallback. A mode that forbids
+    // local execution refuses instead.
+    if let Ok(cwd) = std::env::current_dir()
+        && let Some(reason) = project_topology_local_reason(&topology_policy, &cwd)
+    {
+        let refuse_local = require_remote || clean_overlay || source_content_receipt;
+        if !refuse_local {
+            reporter.summary(&format!("[RCH] local ({reason})"));
+        }
+        exit_with_local_fallback(&command, &reporter, &reason, refuse_local);
+    }
+
     // Extract project name honoring configured path topology.
     let project = extract_project_name_with_policy(&topology_policy);
 
@@ -3699,7 +3744,8 @@ pub async fn run_exec(
 
         // A retry must not overwrite the only recovery identity for an older
         // source grant. This check precedes requesting another reservation.
-        durable_lease.ensure_released_for_retry()
+        durable_lease
+            .ensure_released_for_retry()
             .context(crate::transfer::RemoteExecutionUnconfirmed)?;
         // Worker-fault failure: try a bigger/different worker before going terminal.
         if attempt < max_attempts
@@ -4931,6 +4977,26 @@ fn command_uses_cargo_dependency_graph(kind: Option<CompilationKind>) -> bool {
     )
 }
 
+/// bd-raobv: why a build started in `cwd` must run locally because the project
+/// lies outside the configured canonical root (the worker mirror cannot place
+/// it), or `None` when topology admits it. The execution path and
+/// `rch diagnose` both call this so their verdicts cannot disagree.
+pub(crate) fn project_topology_local_reason(
+    policy: &PathTopologyPolicy,
+    cwd: &Path,
+) -> Option<String> {
+    normalize_project_path_with_policy(cwd, policy)
+        .err()
+        .map(|error| {
+            format!(
+                "project {} is outside canonical root {} ({error}); set [path_topology] \
+                 canonical_root or RCH_CANONICAL_PROJECT_ROOT to offload it",
+                cwd.display(),
+                policy.canonical_root().display()
+            )
+        })
+}
+
 fn normalize_dependency_root_for_runtime(
     root: &Path,
     policy: &PathTopologyPolicy,
@@ -5112,7 +5178,7 @@ pub(crate) fn add_cargo_isolation(command: &str, worker_id: &WorkerId) -> String
 
     let escaped_command = shell_escape::escape(command.into());
     let script = format!(
-        "{base_var}=\"${{1:-}}\"; if [ -z \"${{{base_var}}}\" ]; then {base_prelude}; fi; mkdir -p {cargo_home} || exit $?; touch {cargo_home} 2>/dev/null || true; export CARGO_HOME={cargo_home}; if command -v git >/dev/null 2>&1; then export CARGO_NET_GIT_FETCH_WITH_CLI=true; fi; sh -c {command}",
+        "{base_var}=\"${{1:-}}\"; if [ -z \"${{{base_var}}}\" ]; then {base_prelude}; fi; mkdir -p {cargo_home} || exit $?; touch {cargo_home} 2>/dev/null || true; for rch_cache_dir in registry git; do if [ -L {cargo_home}/$rch_cache_dir ] && [ ! -e {cargo_home}/$rch_cache_dir ]; then (cd {cargo_home} && mkdir -p -- \"$(readlink -- \"$rch_cache_dir\")\") || exit $?; fi; done; export CARGO_HOME={cargo_home}; if command -v git >/dev/null 2>&1; then export CARGO_NET_GIT_FETCH_WITH_CLI=true; fi; sh -c {command}",
         base_prelude = base_prelude,
         cargo_home = quoted_cargo_home,
         command = escaped_command

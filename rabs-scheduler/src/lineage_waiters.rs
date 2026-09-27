@@ -395,7 +395,8 @@ mod tests {
     fn producer_borrowing_and_releases_share_one_total_budget() {
         let mut b = board();
         for _ in 0..4 {
-            b.admit_producer().expect("producers may borrow waiter lanes");
+            b.admit_producer()
+                .expect("producers may borrow waiter lanes");
         }
         // Four nominal waiter lanes, but only two are unoccupied.
         assert_eq!(b.remaining_replay_capacity(), 2);
@@ -414,7 +415,8 @@ mod tests {
 
         b.release_waiter();
         assert_eq!(b.remaining_replay_capacity(), 1);
-        b.admit_producer().expect("released slot can serve a producer");
+        b.admit_producer()
+            .expect("released slot can serve a producer");
         assert_eq!(b.remaining_replay_capacity(), 0);
         b.release_producer();
         b.release_producer();
@@ -473,10 +475,7 @@ mod tests {
                             assert_eq!(next, b);
                         } else {
                             assert_eq!(next.active_producers(), producers + 1);
-                            assert_eq!(
-                                next.remaining_replay_capacity(),
-                                (free - 1).min(quota)
-                            );
+                            assert_eq!(next.remaining_replay_capacity(), (free - 1).min(quota));
                         }
 
                         let mut next = b.clone();

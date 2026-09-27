@@ -1157,8 +1157,10 @@ impl BuildHistory {
         let mut terminal = HashMap::new();
         let mut cancelled_wrappers = HashSet::new();
         let mut next_queue_id = None;
+        let mut ownership_existed = false;
         match File::open(&ownership_path) {
             Ok(file) => {
+                ownership_existed = true;
                 let snapshot: DurableOwnership = serde_json::from_reader(file)?;
                 if snapshot.version != 1 {
                     return Err(std::io::Error::new(
@@ -1256,10 +1258,18 @@ impl BuildHistory {
             #[cfg(test)]
             fail_after_ownership_rename: std::sync::atomic::AtomicBool::new(false),
         };
-        history.persist_ownership(
-            &history.active.read().unwrap_or_else(|e| e.into_inner()),
-            None,
-        )?;
+        // A fresh start has nothing to make durable: the snapshot would hold
+        // only the clock-derived queue epoch, which the next start recomputes,
+        // and no queue ID has been issued yet. Skipping it keeps an fsync off
+        // the path between binding the socket and serving it — on a worker
+        // with heavy writeback that fsync stalled startup for 10+ seconds while
+        // the bound socket accepted connections nobody answered.
+        if ownership_existed {
+            history.persist_ownership(
+                &history.active.read().unwrap_or_else(|e| e.into_inner()),
+                None,
+            )?;
+        }
         Ok(history)
     }
 
@@ -2641,6 +2651,39 @@ mod tests {
             WrapperCancellation::NotQueued
         ));
         assert_eq!(recovered.queue_depth(), 1);
+    }
+
+    #[test]
+    fn fresh_load_defers_ownership_write_but_existing_snapshot_is_rewritten() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("history.jsonl");
+        let ownership = path.with_extension("ownership.json");
+
+        // Fresh start: nothing recovered, so no durable write before serving.
+        let fresh = BuildHistory::load_from_file(&path, 10).unwrap();
+        assert!(!ownership.exists());
+        assert!(!path.with_extension("tmp").exists());
+
+        // The first ownership change still becomes durable immediately.
+        fresh
+            .try_start_active_build_with_wrapper(
+                "active".into(),
+                "worker".into(),
+                "cargo build".into(),
+                0,
+                None,
+                2,
+                BuildLocation::Remote,
+            )
+            .unwrap()
+            .unwrap();
+        assert!(ownership.exists());
+
+        // A restart that finds a snapshot re-persists it (queue epoch advance).
+        std::fs::write(&ownership, br#"{"version":1,"active":[],"completed":[]}"#).unwrap();
+        BuildHistory::load_from_file(&path, 10).unwrap();
+        let rewritten = std::fs::read_to_string(&ownership).unwrap();
+        assert!(rewritten.contains("next_queue_id"), "{rewritten}");
     }
 
     #[test]

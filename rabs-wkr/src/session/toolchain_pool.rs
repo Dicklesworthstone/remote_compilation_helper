@@ -46,7 +46,10 @@ fn invalid(message: &str) -> io::Error {
 }
 fn checkpoint(stopped: &impl Fn() -> bool) -> io::Result<()> {
     if stopped() {
-        Err(io::Error::new(io::ErrorKind::Interrupted, "toolchain acquisition interrupted"))
+        Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "toolchain acquisition interrupted",
+        ))
     } else {
         Ok(())
     }
@@ -76,16 +79,26 @@ struct Dataset {
 }
 impl Dataset {
     fn retained(
-        pool: &Arc<PoolDirectory>, expected: &ToolchainIdentity, stopped: &impl Fn() -> bool,
+        pool: &Arc<PoolDirectory>,
+        expected: &ToolchainIdentity,
+        stopped: &impl Fn() -> bool,
     ) -> io::Result<Option<Arc<Self>>> {
-        let Some(cache) = &pool.1 else { return Ok(None); };
-        Ok(cache.load(expected, stopped)?.map(|toolchain| Arc::new(Self {
-            toolchain, _directory:None, pool:Arc::clone(pool),
-        })))
+        let Some(cache) = &pool.1 else {
+            return Ok(None);
+        };
+        Ok(cache.load(expected, stopped)?.map(|toolchain| {
+            Arc::new(Self {
+                toolchain,
+                _directory: None,
+                pool: Arc::clone(pool),
+            })
+        }))
     }
 
     fn capture(
-        pool: &Arc<PoolDirectory>, source: &Path, expected: Option<&ToolchainIdentity>,
+        pool: &Arc<PoolDirectory>,
+        source: &Path,
+        expected: Option<&ToolchainIdentity>,
         stopped: &impl Fn() -> bool,
     ) -> io::Result<Arc<Self>> {
         checkpoint(stopped)?;
@@ -93,7 +106,9 @@ impl Dataset {
             && let Some(toolchain) = cache.capture(source, expected, stopped)?
         {
             return Ok(Arc::new(Self {
-                toolchain, _directory:None, pool:Arc::clone(pool),
+                toolchain,
+                _directory: None,
+                pool: Arc::clone(pool),
             }));
         }
         let directory = private_directory(Some(pool.0.path()))?;
@@ -105,11 +120,18 @@ impl Dataset {
             limits.max_bytes = limits.max_bytes.min(expected.bytes);
         }
         let toolchain = capture_toolchain(
-            source, &directory.path().join("dataset"), expected,
-            &limits, stopped,
+            source,
+            &directory.path().join("dataset"),
+            expected,
+            &limits,
+            stopped,
         )?;
         checkpoint(stopped)?;
-        Ok(Arc::new(Self { toolchain, _directory:Some(directory), pool:Arc::clone(pool) }))
+        Ok(Arc::new(Self {
+            toolchain,
+            _directory: Some(directory),
+            pool: Arc::clone(pool),
+        }))
     }
 }
 
@@ -119,11 +141,18 @@ pub(crate) struct ToolchainLease {
     disposition: &'static str,
 }
 impl ToolchainLease {
-    pub(crate) fn root(&self) -> &Path { self.dataset.toolchain.root() }
-    pub(crate) fn entry_count(&self) -> io::Result<usize> {
-        self.dataset.toolchain.entries().map(|entries| entries.len())
+    pub(crate) fn root(&self) -> &Path {
+        self.dataset.toolchain.root()
     }
-    pub(super) fn disposition(&self) -> &'static str { self.disposition }
+    pub(crate) fn entry_count(&self) -> io::Result<usize> {
+        self.dataset
+            .toolchain
+            .entries()
+            .map(|entries| entries.len())
+    }
+    pub(super) fn disposition(&self) -> &'static str {
+        self.disposition
+    }
     pub(crate) fn verify(&self, stopped: impl Fn() -> bool) -> io::Result<()> {
         self.dataset.toolchain.verify(stopped)
     }
@@ -138,8 +167,13 @@ impl ToolchainLease {
         let visible = Path::new(rabs_sandbox::layout::TOOLCHAIN);
         let root = std::fs::canonicalize(self.root())?;
         let pool = std::fs::canonicalize(self.dataset.pool.0.path())?;
-        let durable = self.dataset.pool.1.as_ref()
-            .map(|cache| std::fs::canonicalize(cache.root())).transpose()?;
+        let durable = self
+            .dataset
+            .pool
+            .1
+            .as_ref()
+            .map(|cache| std::fs::canonicalize(cache.root()))
+            .transpose()?;
         let protected: Vec<_> = [&pool, &root].into_iter().chain(durable.as_ref()).collect();
         let overlap = |a: &Path, b: &Path| a.starts_with(b) || b.starts_with(a);
         let mut owned = 0;
@@ -153,7 +187,11 @@ impl ToolchainLease {
                 return Err(invalid("read-only mount shadows the retained toolchain"));
             }
         }
-        if owned != 1 { return Err(invalid("execution requires one retained read-only toolchain mount")); }
+        if owned != 1 {
+            return Err(invalid(
+                "execution requires one retained read-only toolchain mount",
+            ));
+        }
         for bind in &spec.rw_binds {
             if overlap(&bind.visible, visible) {
                 return Err(invalid("writable mount shadows the retained toolchain"));
@@ -180,7 +218,7 @@ impl ToolchainLease {
 
 enum Slot {
     Capturing,
-    Ready { dataset:Arc<Dataset>, touched:u64 },
+    Ready { dataset: Arc<Dataset>, touched: u64 },
 }
 #[derive(Default)]
 struct State {
@@ -206,7 +244,8 @@ struct Reservation<'a> {
 }
 impl Drop for Reservation<'_> {
     fn drop(&mut self) {
-        if self.armed && let Ok(mut state) = self.pool.state.lock()
+        if self.armed
+            && let Ok(mut state) = self.pool.state.lock()
             && matches!(state.entries.get(&self.key), Some(Slot::Capturing))
         {
             state.entries.remove(&self.key);
@@ -221,25 +260,41 @@ impl ToolchainPool {
         Self::with_directory(max_bytes, max_entries, None)
     }
 
-    fn with_directory(max_bytes: u64, max_entries: usize, directory: Option<&Path>) -> io::Result<Self> {
+    fn with_directory(
+        max_bytes: u64,
+        max_entries: usize,
+        directory: Option<&Path>,
+    ) -> io::Result<Self> {
         if max_bytes > MAX_POOL_BYTES || max_entries == 0 || max_entries > MAX_POOL_ENTRIES {
             return Err(invalid("toolchain pool limits outside their bounds"));
         }
-        let durable = directory.map(|root| durable::DurableCache::open(root, max_bytes, max_entries))
-            .transpose()?.map(Arc::new);
+        let durable = directory
+            .map(|root| durable::DurableCache::open(root, max_bytes, max_entries))
+            .transpose()?
+            .map(Arc::new);
         Ok(Self {
-            directory:Arc::new(PoolDirectory(private_directory(None)?, durable)),
-            max_bytes, max_entries, state:Mutex::new(State::default()), changed:Condvar::new(),
+            directory: Arc::new(PoolDirectory(private_directory(None)?, durable)),
+            max_bytes,
+            max_entries,
+            state: Mutex::new(State::default()),
+            changed: Condvar::new(),
         })
     }
     fn lock(&self) -> io::Result<MutexGuard<'_, State>> {
-        self.state.lock().map_err(|_| invalid("toolchain pool ownership is poisoned"))
+        self.state
+            .lock()
+            .map_err(|_| invalid("toolchain pool ownership is poisoned"))
     }
     fn private(
-        &self, source: &Path, expected: Option<&ToolchainIdentity>, stopped: &impl Fn() -> bool,
+        &self,
+        source: &Path,
+        expected: Option<&ToolchainIdentity>,
+        stopped: &impl Fn() -> bool,
     ) -> io::Result<ToolchainLease> {
-        Dataset::capture(&self.directory, source, expected, stopped)
-            .map(|dataset| ToolchainLease { dataset, disposition:"private" })
+        Dataset::capture(&self.directory, source, expected, stopped).map(|dataset| ToolchainLease {
+            dataset,
+            disposition: "private",
+        })
     }
     fn discard_failed(&self, identity: Key, failed: &Arc<Dataset>) -> io::Result<()> {
         let mut state = self.lock()?;
@@ -258,17 +313,24 @@ impl ToolchainPool {
     /// reservation or waiter. Hashing stays off the control reactor and outside
     /// the admission lock. In-progress captures and partial disk trees miss.
     pub(crate) fn lookup(
-        &self, expected: &ToolchainIdentity, stopped: impl Fn() -> bool,
+        &self,
+        expected: &ToolchainIdentity,
+        stopped: impl Fn() -> bool,
     ) -> io::Result<Option<ToolchainLease>> {
         checkpoint(&stopped)?;
-        if self.max_bytes == 0 || expected.bytes > self.max_bytes { return Ok(None); }
+        if self.max_bytes == 0 || expected.bytes > self.max_bytes {
+            return Ok(None);
+        }
         let identity = key(expected);
         let dataset = {
             let mut state = self.lock()?;
             state.clock = state.clock.saturating_add(1);
             let touched = state.clock;
             match state.entries.get_mut(&identity) {
-                Some(Slot::Ready { dataset, touched:last }) => {
+                Some(Slot::Ready {
+                    dataset,
+                    touched: last,
+                }) => {
                     *last = touched;
                     Some(Arc::clone(dataset))
                 }
@@ -279,25 +341,40 @@ impl ToolchainPool {
         let dataset = match dataset {
             Some(dataset) => dataset,
             None => match Dataset::retained(&self.directory, expected, &stopped)? {
-                Some(dataset) => return Ok(Some(ToolchainLease { dataset, disposition:"reused" })),
+                Some(dataset) => {
+                    return Ok(Some(ToolchainLease {
+                        dataset,
+                        disposition: "reused",
+                    }));
+                }
                 None => return Ok(None),
             },
         };
         // Keep the dataset pinned during verification, outside the admission
         // mutex. A filename or matching identity record is never a cache hit.
         if let Err(error) = dataset.toolchain.verify(&stopped) {
-            if !stopped() { self.discard_failed(identity, &dataset)?; }
+            if !stopped() {
+                self.discard_failed(identity, &dataset)?;
+            }
             return Err(error);
         }
         checkpoint(&stopped)?;
-        Ok(Some(ToolchainLease { dataset, disposition:"reused" }))
+        Ok(Some(ToolchainLease {
+            dataset,
+            disposition: "reused",
+        }))
     }
 
     pub(crate) fn acquire(
-        &self, source: &Path, expected: Option<&ToolchainIdentity>, stopped: impl Fn() -> bool,
+        &self,
+        source: &Path,
+        expected: Option<&ToolchainIdentity>,
+        stopped: impl Fn() -> bool,
     ) -> io::Result<ToolchainLease> {
         checkpoint(&stopped)?;
-        let Some(expected) = expected.filter(|expected| self.max_bytes != 0 && expected.bytes <= self.max_bytes) else {
+        let Some(expected) =
+            expected.filter(|expected| self.max_bytes != 0 && expected.bytes <= self.max_bytes)
+        else {
             return self.private(source, expected, &stopped);
         };
         let identity = key(expected);
@@ -307,20 +384,30 @@ impl ToolchainPool {
             state.clock = state.clock.saturating_add(1);
             let touched = state.clock;
             match state.entries.get_mut(&identity) {
-                Some(Slot::Ready { dataset, touched:last }) => {
+                Some(Slot::Ready {
+                    dataset,
+                    touched: last,
+                }) => {
                     *last = touched;
                     let dataset = Arc::clone(dataset);
                     drop(state);
                     // Never consult the mutable original installation on a hit:
                     // the request selected these exact bytes, not that pathname.
                     if let Err(error) = dataset.toolchain.verify(&stopped) {
-                        if !stopped() { self.discard_failed(identity, &dataset)?; }
+                        if !stopped() {
+                            self.discard_failed(identity, &dataset)?;
+                        }
                         return Err(error);
                     }
-                    return Ok(ToolchainLease { dataset, disposition:"reused" });
+                    return Ok(ToolchainLease {
+                        dataset,
+                        disposition: "reused",
+                    });
                 }
                 Some(Slot::Capturing) => {
-                    let (state, _) = self.changed.wait_timeout(state, WAIT_SLICE)
+                    let (state, _) = self
+                        .changed
+                        .wait_timeout(state, WAIT_SLICE)
                         .map_err(|_| invalid("toolchain pool ownership is poisoned"))?;
                     drop(state);
                     continue; // The execution deadline/cancel is checked again.
@@ -331,10 +418,17 @@ impl ToolchainPool {
             while state.entries.len() >= self.max_entries
                 || state.reserved_bytes > self.max_bytes - expected.bytes
             {
-                let victim = state.entries.iter().filter_map(|(key, slot)| match slot {
-                    Slot::Ready { dataset, touched } if Arc::strong_count(dataset) == 1 => Some((*key, *touched)),
-                    _ => None,
-                }).min_by_key(|(key, touched)| (*touched, *key)).map(|(key, _)| key);
+                let victim = state
+                    .entries
+                    .iter()
+                    .filter_map(|(key, slot)| match slot {
+                        Slot::Ready { dataset, touched } if Arc::strong_count(dataset) == 1 => {
+                            Some((*key, *touched))
+                        }
+                        _ => None,
+                    })
+                    .min_by_key(|(key, touched)| (*touched, *key))
+                    .map(|(key, _)| key);
                 let Some(victim) = victim else {
                     drop(state);
                     drop(retired);
@@ -347,7 +441,11 @@ impl ToolchainPool {
             }
             state.entries.insert(identity, Slot::Capturing);
             state.reserved_bytes += expected.bytes;
-            let mut reservation = Reservation { pool:self, key:identity, armed:true };
+            let mut reservation = Reservation {
+                pool: self,
+                key: identity,
+                armed: true,
+            };
             drop(state);
             // Potentially slow filesystem cleanup and capture never hold the
             // admission mutex or block hits for another retained identity.
@@ -360,21 +458,37 @@ impl ToolchainPool {
             }
             state.clock = state.clock.saturating_add(1);
             let touched = state.clock;
-            state.entries.insert(identity, Slot::Ready { dataset:Arc::clone(&dataset), touched });
+            state.entries.insert(
+                identity,
+                Slot::Ready {
+                    dataset: Arc::clone(&dataset),
+                    touched,
+                },
+            );
             reservation.armed = false;
             drop(state);
             self.changed.notify_all();
-            return Ok(ToolchainLease { dataset, disposition:"captured" });
+            return Ok(ToolchainLease {
+                dataset,
+                disposition: "captured",
+            });
         }
     }
 }
 
 fn configured_bytes(value: Option<&str>) -> io::Result<u64> {
-    let Some(value) = value else { return Ok(0); };
+    let Some(value) = value else {
+        return Ok(0);
+    };
     if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
-        return Err(invalid("RABS_WORKER_TOOLCHAIN_CACHE_BYTES must be an unsigned decimal byte count"));
+        return Err(invalid(
+            "RABS_WORKER_TOOLCHAIN_CACHE_BYTES must be an unsigned decimal byte count",
+        ));
     }
-    value.parse::<u64>().ok().filter(|bytes| *bytes <= MAX_POOL_BYTES)
+    value
+        .parse::<u64>()
+        .ok()
+        .filter(|bytes| *bytes <= MAX_POOL_BYTES)
         .ok_or_else(|| invalid("RABS_WORKER_TOOLCHAIN_CACHE_BYTES exceeds the 64 GiB bound"))
 }
 
@@ -395,17 +509,30 @@ impl ToolchainReuseScope {
     /// CACHE_BYTES budget; invalid or already-owned stores refuse worker startup.
     pub fn from_environment() -> io::Result<Self> {
         let value = std::env::var_os(CONFIG_NAME);
-        let text = value.as_ref().map(|value| value.to_str()
-            .ok_or_else(|| invalid("RABS_WORKER_TOOLCHAIN_CACHE_BYTES is not UTF-8"))).transpose()?;
+        let text = value
+            .as_ref()
+            .map(|value| {
+                value
+                    .to_str()
+                    .ok_or_else(|| invalid("RABS_WORKER_TOOLCHAIN_CACHE_BYTES is not UTF-8"))
+            })
+            .transpose()?;
         let max_bytes = configured_bytes(text)?;
         let directory = std::env::var_os(durable::CONFIG_DIRECTORY).map(std::path::PathBuf::from);
-        let mut registry = ACTIVE_POOL.lock()
+        let mut registry = ACTIVE_POOL
+            .lock()
             .map_err(|_| invalid("toolchain pool registry is poisoned"))?;
         if registry.upgrade().is_some() {
-            return Err(io::Error::new(io::ErrorKind::AlreadyExists,
-                "one worker supervisor already owns the toolchain pool"));
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "one worker supervisor already owns the toolchain pool",
+            ));
         }
-        let pool = Arc::new(ToolchainPool::with_directory(max_bytes, MAX_POOL_ENTRIES, directory.as_deref())?);
+        let pool = Arc::new(ToolchainPool::with_directory(
+            max_bytes,
+            MAX_POOL_ENTRIES,
+            directory.as_deref(),
+        )?);
         *registry = Arc::downgrade(&pool);
         Ok(Self { pool })
     }
@@ -414,8 +541,13 @@ impl ToolchainReuseScope {
 impl Drop for ToolchainReuseScope {
     fn drop(&mut self) {
         // Poison recovery is cleanup-only, never authorization to use entries.
-        let mut registry = ACTIVE_POOL.lock().unwrap_or_else(|error| error.into_inner());
-        if registry.upgrade().is_some_and(|pool| Arc::ptr_eq(&pool, &self.pool)) {
+        let mut registry = ACTIVE_POOL
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if registry
+            .upgrade()
+            .is_some_and(|pool| Arc::ptr_eq(&pool, &self.pool))
+        {
             *registry = Weak::new();
         }
     }
@@ -424,11 +556,15 @@ impl Drop for ToolchainReuseScope {
 /// Embedded callers without a worker scope retain the original private-capture
 /// behavior. A registered pool error fails; it never selects an unpinned lane.
 pub(super) fn prepare(
-    source: &Path, expected: Option<&ToolchainIdentity>, stopped: impl Fn() -> bool,
+    source: &Path,
+    expected: Option<&ToolchainIdentity>,
+    stopped: impl Fn() -> bool,
 ) -> io::Result<ToolchainLease> {
     checkpoint(&stopped)?;
-    let pool = ACTIVE_POOL.lock()
-        .map_err(|_| invalid("toolchain pool registry is poisoned"))?.upgrade();
+    let pool = ACTIVE_POOL
+        .lock()
+        .map_err(|_| invalid("toolchain pool registry is poisoned"))?
+        .upgrade();
     match pool {
         Some(pool) => pool.acquire(source, expected, stopped),
         None => ToolchainPool::new(0, MAX_POOL_ENTRIES)?.acquire(source, expected, stopped),
@@ -438,11 +574,14 @@ pub(super) fn prepare(
 /// Reuse only an already retained, verified dataset from the active supervisor.
 /// An absent scope or disabled pool never creates a private directory on lookup.
 pub(crate) fn lookup(
-    expected: &ToolchainIdentity, stopped: impl Fn() -> bool,
+    expected: &ToolchainIdentity,
+    stopped: impl Fn() -> bool,
 ) -> io::Result<Option<ToolchainLease>> {
     checkpoint(&stopped)?;
-    let pool = ACTIVE_POOL.lock()
-        .map_err(|_| invalid("toolchain pool registry is poisoned"))?.upgrade();
+    let pool = ACTIVE_POOL
+        .lock()
+        .map_err(|_| invalid("toolchain pool registry is poisoned"))?
+        .upgrade();
     match pool {
         Some(pool) => pool.lookup(expected, stopped),
         None => Ok(None),
@@ -458,8 +597,20 @@ mod tests {
         assert_eq!(configured_bytes(None).unwrap(), 0);
         assert_eq!(configured_bytes(Some("0")).unwrap(), 0);
         assert_eq!(configured_bytes(Some("1024")).unwrap(), 1024);
-        assert_eq!(configured_bytes(Some(&MAX_POOL_BYTES.to_string())).unwrap(), MAX_POOL_BYTES);
-        for invalid in ["", "-1", "+1", " 1", "1 ", "1GiB", "18446744073709551616", "68719476737"] {
+        assert_eq!(
+            configured_bytes(Some(&MAX_POOL_BYTES.to_string())).unwrap(),
+            MAX_POOL_BYTES
+        );
+        for invalid in [
+            "",
+            "-1",
+            "+1",
+            " 1",
+            "1 ",
+            "1GiB",
+            "18446744073709551616",
+            "68719476737",
+        ] {
             assert!(configured_bytes(Some(invalid)).is_err(), "{invalid}");
         }
     }
@@ -480,17 +631,27 @@ mod tests {
             fs::create_dir_all(source.path().join("bin")).unwrap();
             fs::create_dir_all(source.path().join("lib/empty")).unwrap();
             fs::write(source.path().join("bin/compiler"), bytes).unwrap();
-            fs::set_permissions(source.path().join("bin/compiler"), fs::Permissions::from_mode(0o755)).unwrap();
+            fs::set_permissions(
+                source.path().join("bin/compiler"),
+                fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
             symlink("compiler", source.path().join("bin/rustc")).unwrap();
-            let identity = fingerprint_toolchain(source.path(), &ToolchainLimits::default(), || false).unwrap();
+            let identity =
+                fingerprint_toolchain(source.path(), &ToolchainLimits::default(), || false)
+                    .unwrap();
             (source, identity)
         }
-        fn pool(bytes: u64, entries: usize) -> ToolchainPool { ToolchainPool::new(bytes, entries).unwrap() }
+        fn pool(bytes: u64, entries: usize) -> ToolchainPool {
+            ToolchainPool::new(bytes, entries).unwrap()
+        }
         fn spec(lease: &ToolchainLease, writable: &Path) -> CanonicalNamespaceSpec {
             use rabs_sandbox::canonical_namespace::Bind;
             let mut spec = CanonicalNamespaceSpec::new();
-            spec.ro_binds.push(Bind::new(lease.root(), rabs_sandbox::layout::TOOLCHAIN));
-            spec.rw_binds.push(Bind::new(writable, rabs_sandbox::layout::WORKSPACE));
+            spec.ro_binds
+                .push(Bind::new(lease.root(), rabs_sandbox::layout::TOOLCHAIN));
+            spec.rw_binds
+                .push(Bind::new(writable, rabs_sandbox::layout::WORKSPACE));
             spec
         }
 
@@ -510,13 +671,24 @@ mod tests {
         fn lookup_uses_full_identity_and_retains_verified_bytes_without_a_source_path() {
             let (source, identity) = source(b"compiler\0\xff");
             let pool = pool(1024, 2);
-            let first = pool.acquire(source.path(), Some(&identity), || false).unwrap();
+            let first = pool
+                .acquire(source.path(), Some(&identity), || false)
+                .unwrap();
             let root = first.root().to_path_buf();
             fs::rename(source.path().join("bin"), source.path().join("unavailable")).unwrap();
             for foreign in [
-                ToolchainIdentity { sha256:[0; 32], ..identity },
-                ToolchainIdentity { files:identity.files + 1, ..identity },
-                ToolchainIdentity { bytes:identity.bytes + 1, ..identity },
+                ToolchainIdentity {
+                    sha256: [0; 32],
+                    ..identity
+                },
+                ToolchainIdentity {
+                    files: identity.files + 1,
+                    ..identity
+                },
+                ToolchainIdentity {
+                    bytes: identity.bytes + 1,
+                    ..identity
+                },
             ] {
                 assert!(pool.lookup(&foreign, || false).unwrap().is_none());
             }
@@ -526,7 +698,10 @@ mod tests {
             assert_eq!(lease.entry_count().unwrap(), 6);
             drop(first);
             drop(pool);
-            assert_eq!(fs::read(root.join("bin/compiler")).unwrap(), b"compiler\0\xff");
+            assert_eq!(
+                fs::read(root.join("bin/compiler")).unwrap(),
+                b"compiler\0\xff"
+            );
             lease.verify(|| false).unwrap();
             drop(lease);
             assert!(!root.exists());
@@ -537,11 +712,16 @@ mod tests {
             use std::sync::atomic::AtomicUsize;
             let (source, identity) = source(b"compiler");
             let pool = pool(1024, 2);
-            let first = pool.acquire(source.path(), Some(&identity), || false).unwrap();
+            let first = pool
+                .acquire(source.path(), Some(&identity), || false)
+                .unwrap();
             let checkpoints = AtomicUsize::new(0);
-            let error = pool.lookup(&identity, || {
-                checkpoints.fetch_add(1, Ordering::SeqCst) != 0
-            }).err().unwrap();
+            let error = pool
+                .lookup(&identity, || {
+                    checkpoints.fetch_add(1, Ordering::SeqCst) != 0
+                })
+                .err()
+                .unwrap();
             assert_eq!(error.kind(), io::ErrorKind::Interrupted);
             assert_eq!(pool.lock().unwrap().reserved_bytes, identity.bytes);
             assert_eq!(pool.lock().unwrap().entries.len(), 1);
@@ -553,23 +733,46 @@ mod tests {
         fn pinned_reuse_keeps_inodes_and_bytes_after_original_installation_disappears() {
             let (source, identity) = source(b"compiler\0\xff");
             let pool = pool(1024, 2);
-            let first = pool.acquire(source.path(), Some(&identity), || false).unwrap();
+            let first = pool
+                .acquire(source.path(), Some(&identity), || false)
+                .unwrap();
             assert_eq!(first.disposition(), "captured");
-            let inode = fs::metadata(first.root().join("bin/compiler")).unwrap().ino();
-            assert_ne!(inode, fs::metadata(source.path().join("bin/compiler")).unwrap().ino());
+            let inode = fs::metadata(first.root().join("bin/compiler"))
+                .unwrap()
+                .ino();
+            assert_ne!(
+                inode,
+                fs::metadata(source.path().join("bin/compiler"))
+                    .unwrap()
+                    .ino()
+            );
             let missing = source.path().join("not-an-installation");
             let second = pool.acquire(&missing, Some(&identity), || false).unwrap();
             assert_eq!(second.disposition(), "reused");
             assert_eq!(second.root(), first.root());
-            assert_eq!(fs::metadata(second.root().join("bin/compiler")).unwrap().ino(), inode);
-            assert_eq!(fs::read(second.root().join("bin/compiler")).unwrap(), b"compiler\0\xff");
-            assert_eq!(fs::read_link(second.root().join("bin/rustc")).unwrap(), Path::new("compiler"));
+            assert_eq!(
+                fs::metadata(second.root().join("bin/compiler"))
+                    .unwrap()
+                    .ino(),
+                inode
+            );
+            assert_eq!(
+                fs::read(second.root().join("bin/compiler")).unwrap(),
+                b"compiler\0\xff"
+            );
+            assert_eq!(
+                fs::read_link(second.root().join("bin/rustc")).unwrap(),
+                Path::new("compiler")
+            );
             assert!(second.root().join("lib/empty").is_dir());
             assert_eq!(pool.lock().unwrap().reserved_bytes, identity.bytes);
             let retained = second.root().to_path_buf();
             drop(first);
             drop(pool);
-            assert!(retained.is_dir(), "a live lease owns its parent even after pool shutdown");
+            assert!(
+                retained.is_dir(),
+                "a live lease owns its parent even after pool shutdown"
+            );
             second.verify(|| false).unwrap();
             drop(second);
             assert!(!retained.exists());
@@ -588,10 +791,15 @@ mod tests {
                 assert!(pool.lock().unwrap().entries.is_empty());
             }
             let pool = pool(1024, 2);
-            let first = pool.acquire(source.path(), Some(&identity), || false).unwrap();
+            let first = pool
+                .acquire(source.path(), Some(&identity), || false)
+                .unwrap();
             let mut changed = identity;
             changed.files += 1;
-            assert!(pool.acquire(source.path(), Some(&changed), || false).is_err());
+            assert!(
+                pool.acquire(source.path(), Some(&changed), || false)
+                    .is_err()
+            );
             first.verify(|| false).unwrap();
             assert_eq!(pool.lock().unwrap().entries.len(), 1);
             assert_eq!(pool.lock().unwrap().reserved_bytes, identity.bytes);
@@ -599,55 +807,72 @@ mod tests {
 
         #[test]
         fn busy_capacity_never_evicts_a_live_dataset_and_idle_lru_is_reclaimed() {
-          for (budget, entries) in [(8, 8), (1024, 2)] {
-            let (a, a_id) = source(b"aaaa");
-            let (b, b_id) = source(b"bbbb");
-            let (c, c_id) = source(b"cccc");
-            let pool = pool(budget, entries);
-            let a = pool.acquire(a.path(), Some(&a_id), || false).unwrap();
-            let b = pool.acquire(b.path(), Some(&b_id), || false).unwrap();
-            let a_root = a.root().to_path_buf();
-            let b_root = b.root().to_path_buf();
-            let overflow = pool.acquire(c.path(), Some(&c_id), || false).unwrap();
-            assert_eq!(overflow.disposition(), "private");
-            assert_eq!(pool.lock().unwrap().reserved_bytes, 8);
-            assert!(a_root.is_dir() && b_root.is_dir());
-            drop(overflow);
-            drop(a);
-            drop(b);
-            // Refresh B; A is the unique least recently used idle entry.
-            drop(pool.lookup(&b_id, || false).unwrap().unwrap());
-            let c = pool.acquire(c.path(), Some(&c_id), || false).unwrap();
-            assert_eq!(c.disposition(), "captured");
-            assert!(!a_root.exists());
-            assert!(b_root.is_dir());
-            assert_eq!(pool.lock().unwrap().reserved_bytes, 8);
-          }
+            for (budget, entries) in [(8, 8), (1024, 2)] {
+                let (a, a_id) = source(b"aaaa");
+                let (b, b_id) = source(b"bbbb");
+                let (c, c_id) = source(b"cccc");
+                let pool = pool(budget, entries);
+                let a = pool.acquire(a.path(), Some(&a_id), || false).unwrap();
+                let b = pool.acquire(b.path(), Some(&b_id), || false).unwrap();
+                let a_root = a.root().to_path_buf();
+                let b_root = b.root().to_path_buf();
+                let overflow = pool.acquire(c.path(), Some(&c_id), || false).unwrap();
+                assert_eq!(overflow.disposition(), "private");
+                assert_eq!(pool.lock().unwrap().reserved_bytes, 8);
+                assert!(a_root.is_dir() && b_root.is_dir());
+                drop(overflow);
+                drop(a);
+                drop(b);
+                // Refresh B; A is the unique least recently used idle entry.
+                drop(pool.lookup(&b_id, || false).unwrap().unwrap());
+                let c = pool.acquire(c.path(), Some(&c_id), || false).unwrap();
+                assert_eq!(c.disposition(), "captured");
+                assert!(!a_root.exists());
+                assert!(b_root.is_dir());
+                assert_eq!(pool.lock().unwrap().reserved_bytes, 8);
+            }
         }
 
         #[test]
         fn failed_and_cancelled_captures_release_their_exact_reservations() {
             let (source, identity) = source(b"compiler");
             let pool = pool(1024, 2);
-            assert!(pool.acquire(&source.path().join("missing"), Some(&identity), || false).is_err());
+            assert!(
+                pool.acquire(&source.path().join("missing"), Some(&identity), || false)
+                    .is_err()
+            );
             assert!(pool.lock().unwrap().entries.is_empty());
-            let understated = ToolchainIdentity { bytes:identity.bytes - 1, ..identity };
-            let error = pool.acquire(source.path(), Some(&understated), || false).err().unwrap();
+            let understated = ToolchainIdentity {
+                bytes: identity.bytes - 1,
+                ..identity
+            };
+            let error = pool
+                .acquire(source.path(), Some(&understated), || false)
+                .err()
+                .unwrap();
             assert!(error.to_string().contains("byte limit exceeded"));
             assert!(pool.lock().unwrap().entries.is_empty());
             assert_eq!(fs::read_dir(pool.directory.0.path()).unwrap().count(), 0);
             let cancelled = AtomicBool::new(false);
-            let error = pool.acquire(source.path(), Some(&identity), || {
-                // Stop only after the admission transaction has reserved space.
-                if pool.lock().unwrap().entries.contains_key(&key(&identity)) {
-                    cancelled.store(true, Ordering::Release);
-                }
-                cancelled.load(Ordering::Acquire)
-            }).err().unwrap();
+            let error = pool
+                .acquire(source.path(), Some(&identity), || {
+                    // Stop only after the admission transaction has reserved space.
+                    if pool.lock().unwrap().entries.contains_key(&key(&identity)) {
+                        cancelled.store(true, Ordering::Release);
+                    }
+                    cancelled.load(Ordering::Acquire)
+                })
+                .err()
+                .unwrap();
             assert_eq!(error.kind(), io::ErrorKind::Interrupted);
             assert!(pool.lock().unwrap().entries.is_empty());
             assert_eq!(pool.lock().unwrap().reserved_bytes, 0);
-            assert_eq!(pool.acquire(source.path(), Some(&identity), || false).unwrap().disposition(), "captured");
+            assert_eq!(
+                pool.acquire(source.path(), Some(&identity), || false)
+                    .unwrap()
+                    .disposition(),
+                "captured"
+            );
         }
 
         #[test]
@@ -662,7 +887,11 @@ mod tests {
                 let paused = AtomicBool::new(false);
                 leader_pool.acquire(&source_path, Some(&identity), || {
                     let reserved = {
-                        leader_pool.lock().unwrap().entries.contains_key(&key(&identity))
+                        leader_pool
+                            .lock()
+                            .unwrap()
+                            .entries
+                            .contains_key(&key(&identity))
                     };
                     if reserved && !paused.swap(true, Ordering::AcqRel) {
                         entered_tx.send(()).unwrap();
@@ -674,17 +903,29 @@ mod tests {
             entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
             // Negotiated reuse does not wait for the real concurrent capture.
             assert!(pool.lookup(&identity, || false).unwrap().is_none());
-            assert!(matches!(pool.lock().unwrap().entries.get(&key(&identity)), Some(Slot::Capturing)));
+            assert!(matches!(
+                pool.lock().unwrap().entries.get(&key(&identity)),
+                Some(Slot::Capturing)
+            ));
             assert_eq!(pool.lock().unwrap().reserved_bytes, identity.bytes);
             let until = Instant::now() + Duration::from_millis(60);
-            let error = pool.acquire(Path::new("/absent"), Some(&identity), || Instant::now() >= until)
-                .err().unwrap();
+            let error = pool
+                .acquire(Path::new("/absent"), Some(&identity), || {
+                    Instant::now() >= until
+                })
+                .err()
+                .unwrap();
             assert_eq!(error.kind(), io::ErrorKind::Interrupted);
-            assert!(matches!(pool.lock().unwrap().entries.get(&key(&identity)), Some(Slot::Capturing)));
+            assert!(matches!(
+                pool.lock().unwrap().entries.get(&key(&identity)),
+                Some(Slot::Capturing)
+            ));
             let follower_pool = Arc::clone(&pool);
             let follower = thread::spawn(move || {
                 let until = Instant::now() + Duration::from_secs(5);
-                follower_pool.acquire(Path::new("/absent"), Some(&identity), || Instant::now() >= until)
+                follower_pool.acquire(Path::new("/absent"), Some(&identity), || {
+                    Instant::now() >= until
+                })
             });
             release_tx.send(()).unwrap();
             let first = leader.join().unwrap().unwrap();
@@ -698,18 +939,29 @@ mod tests {
         fn corrupt_retained_bytes_refuse_instead_of_using_the_original_or_another_pin() {
             let (source, identity) = source(b"compiler");
             let pool = pool(1024, 2);
-            let lease = pool.acquire(source.path(), Some(&identity), || false).unwrap();
+            let lease = pool
+                .acquire(source.path(), Some(&identity), || false)
+                .unwrap();
             let path = lease.root().join("bin/compiler");
             fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
             fs::write(&path, b"tampered").unwrap();
             assert!(pool.lookup(&identity, || false).is_err());
             assert!(lease.verify(|| false).is_err());
             assert!(pool.lock().unwrap().entries.is_empty());
-            let replacement = pool.acquire(source.path(), Some(&identity), || false).unwrap();
+            let replacement = pool
+                .acquire(source.path(), Some(&identity), || false)
+                .unwrap();
             assert_ne!(lease.root(), replacement.root());
-            assert_eq!(fs::read(replacement.root().join("bin/compiler")).unwrap(), b"compiler");
+            assert_eq!(
+                fs::read(replacement.root().join("bin/compiler")).unwrap(),
+                b"compiler"
+            );
             pool.discard_failed(key(&identity), &lease.dataset).unwrap();
-            assert_eq!(pool.lock().unwrap().entries.len(), 1, "late failure cannot retire a replacement");
+            assert_eq!(
+                pool.lock().unwrap().entries.len(),
+                1,
+                "late failure cannot retire a replacement"
+            );
         }
 
         #[test]
@@ -717,7 +969,9 @@ mod tests {
             use rabs_sandbox::canonical_namespace::Bind;
             let (source, identity) = source(b"compiler");
             let pool = pool(1024, 2);
-            let lease = pool.acquire(source.path(), Some(&identity), || false).unwrap();
+            let lease = pool
+                .acquire(source.path(), Some(&identity), || false)
+                .unwrap();
             let writable = tempfile::tempdir().unwrap();
             let valid = spec(&lease, writable.path());
             lease.validate_namespace(&valid).unwrap();
@@ -728,11 +982,16 @@ mod tests {
                 match case {
                     0 => bad.ro_binds[0].backing = source.path().to_path_buf(),
                     1 => bad.ro_binds.push(bad.ro_binds[0].clone()),
-                    2 => bad.rw_binds.push(Bind::new(writable.path(), "/__rabs/toolchain/bin")),
+                    2 => bad
+                        .rw_binds
+                        .push(Bind::new(writable.path(), "/__rabs/toolchain/bin")),
                     3 => bad.rw_binds[0].backing = pool.directory.0.path().to_path_buf(),
                     4 => bad.rw_binds[0].backing = lease.root().join("lib"),
                     5 => bad.rw_binds[0].backing = alias.clone(),
-                    _ => bad.rw_binds[0].backing = pool.directory.0.path().parent().unwrap().to_path_buf(),
+                    _ => {
+                        bad.rw_binds[0].backing =
+                            pool.directory.0.path().parent().unwrap().to_path_buf()
+                    }
                 }
                 let before = bad.clone();
                 assert!(lease.validate_namespace(&bad).is_err(), "case {case}");

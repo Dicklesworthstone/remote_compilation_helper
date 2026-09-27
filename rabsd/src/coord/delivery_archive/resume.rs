@@ -3,8 +3,8 @@
 //! or treats a missing/partial staging tree as permission to execute again.
 
 use super::{
-    ATP_OBJECT_CONTENT_DOMAIN, Delivery, DeliveryTrust, LiveCas, RESTORE_STAGING_PREFIX,
-    Value, invalid, load_archive, publish_restore, require, sync_dirs, validate_request,
+    ATP_OBJECT_CONTENT_DOMAIN, Delivery, DeliveryTrust, LiveCas, RESTORE_STAGING_PREFIX, Value,
+    invalid, load_archive, publish_restore, require, sync_dirs, validate_request,
     verify_archive_directory,
 };
 use rabs_cas::metadata_store::RabsMetadataStore;
@@ -113,7 +113,8 @@ pub fn finish_staged_restore(
             acknowledgments_confirmed: false,
             acknowledgment_interrupted: false,
             acknowledgment_error: Some(
-                "completed staged CAS restore; remote acknowledgments were not rechecked".to_owned(),
+                "completed staged CAS restore; remote acknowledgments were not rechecked"
+                    .to_owned(),
             ),
         })
     })();

@@ -61,7 +61,6 @@ struct RecoveryPhase {
 pub(crate) struct RecoverySession {
     recipe: RecoveryRecipe,
     writer: DurableLeaseWriter,
-    _output_locks: Vec<File>,
 }
 
 fn fingerprint(path: &Path) -> anyhow::Result<Option<String>> {
@@ -117,18 +116,40 @@ fn regular_files(root: &Path) -> anyhow::Result<Vec<PathBuf>> {
     Ok(files)
 }
 
-fn local_locks(roots: impl Iterator<Item = PathBuf>) -> anyhow::Result<Vec<File>> {
-    let mut roots: Vec<_> = roots.collect();
-    roots.sort();
-    roots.dedup();
+/// How long a publication waits for another wrapper's publication into the
+/// same local output root. Publications only move already-staged files, so
+/// contention lasts seconds; the bound turns a wedged holder into an error.
+const OUTPUT_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Exclusive ownership of one local output root for the duration of a single
+/// phase publication. It is deliberately NOT held across the remote build:
+/// dispatchers share one CARGO_TARGET_DIR (and run concurrent jobs in one
+/// project), and a job-long lock failed every overlapping build outright.
+fn lock_output_root(root: &Path) -> anyhow::Result<File> {
     let directory = default_job_lease_directory().join("output-locks");
     std::fs::create_dir_all(&directory)?;
-    roots.into_iter().map(|root| {
-        let name = blake3::hash(root.as_os_str().as_encoded_bytes()).to_hex().to_string();
-        let file = OpenOptions::new().create(true).truncate(false).read(true).write(true).open(directory.join(name))?;
-        file.try_lock().map_err(|error| anyhow::anyhow!("output ownership is held by another live wrapper for {}: {error}; the original wrapper must finish collection", root.display()))?;
-        Ok(file)
-    }).collect()
+    let name = blake3::hash(root.as_os_str().as_encoded_bytes())
+        .to_hex()
+        .to_string();
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(directory.join(name))?;
+    let deadline = std::time::Instant::now() + OUTPUT_LOCK_WAIT;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(error) => anyhow::bail!(
+                "output publication into {} is held by another wrapper: {error}",
+                root.display()
+            ),
+        }
+    }
 }
 
 impl RecoverySession {
@@ -242,9 +263,6 @@ impl RecoverySession {
             build_id,
             identity
         );
-        let output_locks = local_locks(
-            std::iter::once(project_root.clone()).chain(target.map(Path::to_path_buf)),
-        )?;
         let mut phases = Vec::new();
         let project_patterns = get_project_artifact_patterns(kind, Some(command), target.is_some());
         if !project_patterns.is_empty() {
@@ -362,7 +380,6 @@ impl RecoverySession {
         let session = Self {
             recipe,
             writer: writer.clone(),
-            _output_locks: output_locks,
         };
         session.persist()?;
         Ok(session)
@@ -429,6 +446,8 @@ impl RecoverySession {
         if self.recipe.phases[index].complete {
             return Ok(());
         }
+        // Exclusive for this publication only; see `lock_output_root`.
+        let _publication = lock_output_root(&self.recipe.phases[index].local)?;
         let stage = self.stage(index);
         let files = regular_files(&stage)?;
         let phase = &self.recipe.phases[index];
@@ -484,6 +503,30 @@ impl RecoverySession {
             self.recipe.phases[index].pending = None;
             self.persist()?;
         }
+        // Re-baseline, under the publication lock, every output this job has
+        // not written yet. The preparation-time snapshot predates the remote
+        // build, and in a shared target dir other jobs legitimately replace
+        // these files meanwhile. Only this job's own interrupted write (the
+        // journaled `pending` entry above) has to match the older baseline;
+        // the refreshed one is persisted before any write so a crash mid-loop
+        // recovers against exactly what this publication observed.
+        {
+            let phase = &mut self.recipe.phases[index];
+            for relative in &files {
+                if phase.published.contains_key(relative) {
+                    continue;
+                }
+                match fingerprint(&phase.local.join(relative))? {
+                    Some(hash) => {
+                        phase.baseline.insert(relative.clone(), hash);
+                    }
+                    None => {
+                        phase.baseline.remove(relative);
+                    }
+                }
+            }
+        }
+        self.persist()?;
         for relative in files {
             let phase = &self.recipe.phases[index];
             if phase.published.contains_key(&relative) {
@@ -694,7 +737,6 @@ pub(crate) async fn cancel_preparation(writer: &DurableLeaseWriter) -> anyhow::R
     let mut session = RecoverySession {
         recipe,
         writer: writer.clone(),
-        _output_locks: Vec::new(),
     };
     session.recipe.preparation_cancelled = true;
     session.persist()?;
@@ -772,26 +814,15 @@ pub(crate) async fn recover_job(writer: &DurableLeaseWriter) -> anyhow::Result<i
         let mut session = RecoverySession {
             recipe,
             writer: writer.clone(),
-            _output_locks: Vec::new(),
         };
         session.retire_returned().await?;
         writer.record_exit(exit)?;
         writer.acknowledge_terminal()?;
         return Ok(exit);
     }
-    let locks = local_locks(
-        std::iter::once(recipe.project_root.clone()).chain(
-            recipe
-                .phases
-                .iter()
-                .filter(|phase| phase.custom_target)
-                .map(|phase| phase.local.clone()),
-        ),
-    )?;
     let mut session = RecoverySession {
         recipe,
         writer: writer.clone(),
-        _output_locks: locks,
     };
     let worker = session.recipe.worker.clone();
     let base = TransferPipeline::new(
@@ -973,11 +1004,7 @@ mod tests {
             pending: None,
             complete: false,
         });
-        let session = RecoverySession {
-            recipe,
-            writer,
-            _output_locks: Vec::new(),
-        };
+        let session = RecoverySession { recipe, writer };
         std::fs::create_dir(session.stage(0)).unwrap();
         (directory, stage_owner, session)
     }
@@ -1024,6 +1051,44 @@ mod tests {
             assert_eq!(std::fs::read(&session.writer.path).unwrap(), journal);
             assert!(session.recipe.phases[0].published.is_empty());
         }
+    }
+
+    #[test]
+    fn publication_overwrites_outputs_another_job_replaced_after_preparation() {
+        // Dispatchers share one CARGO_TARGET_DIR: between this job's
+        // preparation snapshot and its publication, another job may replace
+        // the same output. That is not an ownership conflict; publishing must
+        // re-baseline under the publication lock and write, not refuse.
+        let (_directory, _stage_owner, mut session) = publication_fixture();
+        let local = session.recipe.project_root.clone();
+        let stage = session.stage(0);
+        std::fs::create_dir(local.join("build")).unwrap();
+        std::fs::write(local.join("build/app"), b"snapshot at preparation").unwrap();
+        session.recipe.phases[0].baseline.insert(
+            PathBuf::from("build/app"),
+            fingerprint(&local.join("build/app")).unwrap().unwrap(),
+        );
+        std::fs::write(local.join("build/app"), b"written by a concurrent job").unwrap();
+        std::fs::create_dir(stage.join("build")).unwrap();
+        std::fs::write(stage.join("build/app"), b"this job's output").unwrap();
+        session.persist().unwrap();
+
+        session.publish("project").unwrap();
+        assert_eq!(
+            std::fs::read(local.join("build/app")).unwrap(),
+            b"this job's output"
+        );
+        assert!(session.recipe.phases[0].complete);
+    }
+
+    #[test]
+    fn publication_lock_is_released_between_publications() {
+        let (_directory, _stage_owner, session) = publication_fixture();
+        let root = session.recipe.project_root.clone();
+        let first = lock_output_root(&root).unwrap();
+        drop(first);
+        // A second wrapper can publish into the same root once the first is done.
+        let _second = lock_output_root(&root).unwrap();
     }
 
     #[test]
@@ -1111,7 +1176,6 @@ mod tests {
         let mut session = RecoverySession {
             recipe: load_recipe(&writer).unwrap(),
             writer: writer.clone(),
-            _output_locks: Vec::new(),
         };
         assert!(session.starting_execution().is_err());
         session.recipe.prepared = true;
@@ -1134,7 +1198,6 @@ mod tests {
         let mut session = RecoverySession {
             recipe,
             writer: writer.clone(),
-            _output_locks: Vec::new(),
         };
         let (captured_tx, captured_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
@@ -1199,7 +1262,6 @@ mod tests {
         let mut session = RecoverySession {
             recipe: load_recipe(&writer).unwrap(),
             writer: writer.clone(),
-            _output_locks: Vec::new(),
         };
         session.returned(0).unwrap();
         session.tree_retired().unwrap();

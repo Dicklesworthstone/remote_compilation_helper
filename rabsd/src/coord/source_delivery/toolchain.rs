@@ -169,7 +169,10 @@ impl ToolchainUpload {
                         &json!({"kind":"toolchain-chunk", "request_id":id, "sha256":sha256,
                         "path":entry.path, "offset":offset, "data_hex":hex(&chunk),
                         "chunk_sha256":hex(&Sha256::digest(&chunk))}),
-                        pipeline::ExpectedAck::Chunk { path: &entry.path, next_offset: next },
+                        pipeline::ExpectedAck::Chunk {
+                            path: &entry.path,
+                            next_offset: next,
+                        },
                     )?;
                     offset = next;
                 }

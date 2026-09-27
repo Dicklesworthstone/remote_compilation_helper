@@ -24,7 +24,9 @@ pub(super) fn patterns(
     let mut profile = None;
     let mut iter = args.into_iter();
     while let Some(arg) = iter.next() {
-        let (flag, inline) = arg.split_once('=').map_or((arg, None), |(k, v)| (k, Some(v)));
+        let (flag, inline) = arg
+            .split_once('=')
+            .map_or((arg, None), |(k, v)| (k, Some(v)));
         match flag {
             "--bin" | "--example" => {
                 let name = inline.or_else(|| iter.next())?;
@@ -66,13 +68,24 @@ pub(super) fn patterns(
                     return None;
                 }
             }
-            "--workspace" | "--all" | "--all-features" | "--no-default-features"
-            | "--locked" | "--frozen" | "--offline" | "--keep-going" | "--verbose"
-            | "--quiet" | "-v" | "-vv" | "-q" if inline.is_none() => {}
+            "--workspace"
+            | "--all"
+            | "--all-features"
+            | "--no-default-features"
+            | "--locked"
+            | "--frozen"
+            | "--offline"
+            | "--keep-going"
+            | "--verbose"
+            | "--quiet"
+            | "-v"
+            | "-vv"
+            | "-q"
+                if inline.is_none() => {}
             _ if inline.is_none()
-                && ["-p", "-j", "-F"].iter().any(|prefix| {
-                    arg.starts_with(*prefix) && arg.len() > prefix.len()
-                }) => {}
+                && ["-p", "-j", "-F"]
+                    .iter()
+                    .any(|prefix| arg.starts_with(*prefix) && arg.len() > prefix.len()) => {}
             // Includes --bins/--examples/--lib/--all-targets and test selectors,
             // --timings, --config, -Z, output-dir overrides and `--` passthrough.
             _ => return None,
@@ -102,7 +115,11 @@ pub(super) fn patterns(
             // Keep both executable spelling and normalized crate/library names
             // rather than assuming that every example has a main function.
             let crate_name = name.replace('-', "_");
-            for stem in [(*name).to_owned(), crate_name.clone(), format!("lib{crate_name}")] {
+            for stem in [
+                (*name).to_owned(),
+                crate_name.clone(),
+                format!("lib{crate_name}"),
+            ] {
                 add_named_output(&mut selected, &example_root, &stem);
             }
         }
@@ -153,7 +170,10 @@ fn build_arguments(command: &str) -> Option<Vec<&str>> {
     if command.len() > 65_536
         || !command.bytes().all(|byte| {
             byte.is_ascii_alphanumeric()
-                || matches!(byte, b' ' | b'\t' | b'_' | b'-' | b'.' | b'/' | b'=' | b'+' | b':' | b',')
+                || matches!(
+                    byte,
+                    b' ' | b'\t' | b'_' | b'-' | b'.' | b'/' | b'=' | b'+' | b':' | b','
+                )
         })
     {
         return None;
@@ -236,16 +256,33 @@ mod tests {
     fn explicit_bins_select_only_the_requested_profile_and_names() {
         let selected = select("cargo build --release --bin rch --bin=rchd --bin rch").unwrap();
         for expected in [
-            "target/release/rch", "target/release/rchd", "target/*/release/rch",
-            "target/release/rch.*", "target/release/rch.*/**",
-            "target/release/deps/*.so", "target/release/deps/*.dwo",
+            "target/release/rch",
+            "target/release/rchd",
+            "target/*/release/rch",
+            "target/release/rch.*",
+            "target/release/rch.*/**",
+            "target/release/deps/*.so",
+            "target/release/deps/*.dwo",
         ] {
-            assert!(selected.iter().any(|pattern| pattern == expected), "{expected}");
+            assert!(
+                selected.iter().any(|pattern| pattern == expected),
+                "{expected}"
+            );
         }
         assert!(!selected.iter().any(|pattern| pattern.contains("debug")));
-        assert!(!selected.iter().any(|pattern| pattern.ends_with("release/**")));
+        assert!(
+            !selected
+                .iter()
+                .any(|pattern| pattern.ends_with("release/**"))
+        );
         assert!(!selected.iter().any(|pattern| pattern.ends_with("deps/**")));
-        assert_eq!(selected.iter().filter(|p| *p == "target/release/rch").count(), 1);
+        assert_eq!(
+            selected
+                .iter()
+                .filter(|p| *p == "target/release/rch")
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -256,32 +293,66 @@ mod tests {
         ] {
             let selected = select(command).unwrap();
             assert!(selected.contains(&"target/x86_64-unknown-linux-gnu/small/app".into()));
-            assert!(selected.iter().all(|p| p.starts_with("target/x86_64-unknown-linux-gnu/small/")));
+            assert!(
+                selected
+                    .iter()
+                    .all(|p| p.starts_with("target/x86_64-unknown-linux-gnu/small/"))
+            );
         }
         assert!(select("cargo build --package --bin app").is_none());
         assert!(select("cargo build --features=--bin=decoy").is_none());
-        assert!(select("cargo build --bin app --profile dev").unwrap().contains(&"target/debug/app".into()));
-        assert!(select("cargo build --bin app --target a --target b").unwrap().contains(&"target/b/debug/app".into()));
+        assert!(
+            select("cargo build --bin app --profile dev")
+                .unwrap()
+                .contains(&"target/debug/app".into())
+        );
+        assert!(
+            select("cargo build --bin app --target a --target b")
+                .unwrap()
+                .contains(&"target/b/debug/app".into())
+        );
     }
 
     #[test]
     fn ambiguous_or_additional_outputs_retain_the_broad_policy() {
         for command in [
-            "cargo build", "cargo build --bins", "cargo build --bin app --lib",
-            "cargo build --bin app --examples", "cargo build --bin app --all-targets",
-            "cargo build --bin app --timings", "cargo build --bin app --config foo.toml",
-            "cargo build --bin app -Z unstable-options", "cargo build --bin app --out-dir out",
-            "cargo test --no-run --bin app", "cargo rustc --bin app -- --emit asm",
-            "cargo build --bin app --target custom.json", "cargo build --bin app --target host-tuple",
-            "cargo build --bin app --profile ../source", "cargo build --bin ../app",
-            "cargo build --bin app --release --profile dev", "cargo build --bin app --profile",
-            "cargo build --bin app --unknown", "cargo build --bin app --",
-            "cargo build --bin 'app*'", "cargo build --bin $APP", "cargo build --bin app; echo x",
-            "env -C other cargo build --bin app", "sh -c cargo build --bin app",
+            "cargo build",
+            "cargo build --bins",
+            "cargo build --bin app --lib",
+            "cargo build --bin app --examples",
+            "cargo build --bin app --all-targets",
+            "cargo build --bin app --timings",
+            "cargo build --bin app --config foo.toml",
+            "cargo build --bin app -Z unstable-options",
+            "cargo build --bin app --out-dir out",
+            "cargo test --no-run --bin app",
+            "cargo rustc --bin app -- --emit asm",
+            "cargo build --bin app --target custom.json",
+            "cargo build --bin app --target host-tuple",
+            "cargo build --bin app --profile ../source",
+            "cargo build --bin ../app",
+            "cargo build --bin app --release --profile dev",
+            "cargo build --bin app --profile",
+            "cargo build --bin app --unknown",
+            "cargo build --bin app --",
+            "cargo build --bin 'app*'",
+            "cargo build --bin $APP",
+            "cargo build --bin app; echo x",
+            "env -C other cargo build --bin app",
+            "sh -c cargo build --bin app",
         ] {
-            assert!(select(command).is_none(), "narrowed ambiguous command: {command}");
+            assert!(
+                select(command).is_none(),
+                "narrowed ambiguous command: {command}"
+            );
         }
-        assert!(patterns(Some(CompilationKind::CargoDoc), Some("cargo build --bin app")).is_none());
+        assert!(
+            patterns(
+                Some(CompilationKind::CargoDoc),
+                Some("cargo build --bin app")
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -313,7 +384,10 @@ mod tests {
                 "target/lean/examples/demo-lib.*/**",
                 "target/lean/deps/*.so",
             ] {
-                assert!(selected.iter().any(|pattern| pattern == expected), "{expected}");
+                assert!(
+                    selected.iter().any(|pattern| pattern == expected),
+                    "{expected}"
+                );
             }
             assert!(!selected.iter().any(|p| p.ends_with("examples/**")));
             let kind = Some(CompilationKind::CargoBuild);
@@ -348,20 +422,36 @@ mod tests {
             let destination = root.path().join("local");
             let prefix = if forwarded { "lean" } else { "target/lean" };
             let mut keep = vec![
-                "app", "app.exe", "app.pdb", "app.dSYM/Contents/Resources/DWARF/app",
-                "deps/libneeded.so", "deps/libneeded.so.1", "deps/libneeded.dylib",
-                "deps/needed.dll", "deps/split.dwo",
+                "app",
+                "app.exe",
+                "app.pdb",
+                "app.dSYM/Contents/Resources/DWARF/app",
+                "deps/libneeded.so",
+                "deps/libneeded.so.1",
+                "deps/libneeded.dylib",
+                "deps/needed.dll",
+                "deps/split.dwo",
             ];
             if example {
                 keep.extend([
-                    "examples/demo-lib", "examples/demo_lib.exe", "examples/libdemo_lib.a",
-                    "examples/demo_lib.lib", "examples/libdemo_lib.rlib",
-                    "examples/libdemo_lib.so", "examples/demo-lib.dSYM/Contents/Info.plist",
+                    "examples/demo-lib",
+                    "examples/demo_lib.exe",
+                    "examples/libdemo_lib.a",
+                    "examples/demo_lib.lib",
+                    "examples/libdemo_lib.rlib",
+                    "examples/libdemo_lib.so",
+                    "examples/demo-lib.dSYM/Contents/Info.plist",
                 ]);
             }
             let omit = [
-                "other", "app-helper", "deps/app-deadbeef", "deps/libhuge.rlib",
-                "incremental/state", ".fingerprint/state", "build/state", "examples/other",
+                "other",
+                "app-helper",
+                "deps/app-deadbeef",
+                "deps/libhuge.rlib",
+                "incremental/state",
+                ".fingerprint/state",
+                "build/state",
+                "examples/other",
             ];
             for relative in keep.iter().chain(omit.iter()) {
                 let path = source.join(prefix).join(relative);
@@ -397,19 +487,33 @@ mod tests {
                         copy.arg(format!("--include=/{rule}"));
                     }
                 }
-                copy.arg("--exclude=*").arg(format!("{}/", source.display()))
-                    .arg(format!("{}/", destination.display())).stdin(Stdio::null()).kill_on_drop(true);
+                copy.arg("--exclude=*")
+                    .arg(format!("{}/", source.display()))
+                    .arg(format!("{}/", destination.display()))
+                    .stdin(Stdio::null())
+                    .kill_on_drop(true);
                 let copied = tokio::time::timeout(Duration::from_secs(10), copy.output())
-                    .await.expect("owned rsync fixture timed out").expect("rsync is required");
+                    .await
+                    .expect("owned rsync fixture timed out")
+                    .expect("rsync is required");
                 assert!(copied.status.success(), "{copied:?}");
                 for relative in &keep {
-                    assert_eq!(std::fs::read(destination.join(prefix).join(relative)).unwrap(),
-                        std::fs::read(source.join(prefix).join(relative)).unwrap(), "{relative}");
+                    assert_eq!(
+                        std::fs::read(destination.join(prefix).join(relative)).unwrap(),
+                        std::fs::read(source.join(prefix).join(relative)).unwrap(),
+                        "{relative}"
+                    );
                 }
                 for relative in omit {
-                    assert!(!destination.join(prefix).join(relative).exists(), "copied {relative}");
+                    assert!(
+                        !destination.join(prefix).join(relative).exists(),
+                        "copied {relative}"
+                    );
                 }
-                assert_eq!(std::fs::read(destination.join("source.rs")).unwrap(), b"local source sentinel\n");
+                assert_eq!(
+                    std::fs::read(destination.join("source.rs")).unwrap(),
+                    b"local source sentinel\n"
+                );
             }
         }
     }
@@ -436,41 +540,87 @@ mod tests {
                 "[[example]]\nname = \"demo-lib\"\npath = \"examples/library.rs\"\ncrate-type = [\"staticlib\"]\n",
                 "[profile.lean]\ninherits = \"dev\"\ndebug = 0\n",
             )).unwrap();
-            std::fs::write(source.join("src/main.rs"), "fn main() { println!(\"selected app\"); }\n").unwrap();
-            std::fs::write(source.join("examples/demo.rs"), "fn main() { println!(\"selected example\"); }\n").unwrap();
-            std::fs::write(source.join("examples/library.rs"), "pub fn answer() -> u32 { 42 }\n").unwrap();
-            let remote_target = if forwarded { root.path().join("worker-target") } else { source.join("target") };
+            std::fs::write(
+                source.join("src/main.rs"),
+                "fn main() { println!(\"selected app\"); }\n",
+            )
+            .unwrap();
+            std::fs::write(
+                source.join("examples/demo.rs"),
+                "fn main() { println!(\"selected example\"); }\n",
+            )
+            .unwrap();
+            std::fs::write(
+                source.join("examples/library.rs"),
+                "pub fn answer() -> u32 { 42 }\n",
+            )
+            .unwrap();
+            let remote_target = if forwarded {
+                root.path().join("worker-target")
+            } else {
+                source.join("target")
+            };
             let command_text = "cargo build --bin app --example demo --example demo-lib --profile lean --offline --jobs=1";
             let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
             let mut compile = Command::new(cargo);
-            compile.current_dir(&source).args(command_text.split_ascii_whitespace().skip(1))
+            compile
+                .current_dir(&source)
+                .args(command_text.split_ascii_whitespace().skip(1))
                 .arg("--message-format=json")
                 .env("CARGO_HOME", root.path().join("cargo-home"))
                 .env("CARGO_TARGET_DIR", &remote_target)
-                .env_remove("RUSTC_WRAPPER").env_remove("RUSTC_WORKSPACE_WRAPPER")
-                .env_remove("RUSTFLAGS").env_remove("CARGO_ENCODED_RUSTFLAGS")
-                .env_remove("CARGO_BUILD_TARGET").env_remove("CARGO_BUILD_TARGET_DIR")
-                .env_remove("CARGO_BUILD_BUILD_DIR").env_remove("CARGO_MAKEFLAGS").env_remove("MAKEFLAGS")
-                .stdin(Stdio::null()).kill_on_drop(true);
+                .env_remove("RUSTC_WRAPPER")
+                .env_remove("RUSTC_WORKSPACE_WRAPPER")
+                .env_remove("RUSTFLAGS")
+                .env_remove("CARGO_ENCODED_RUSTFLAGS")
+                .env_remove("CARGO_BUILD_TARGET")
+                .env_remove("CARGO_BUILD_TARGET_DIR")
+                .env_remove("CARGO_BUILD_BUILD_DIR")
+                .env_remove("CARGO_MAKEFLAGS")
+                .env_remove("MAKEFLAGS")
+                .stdin(Stdio::null())
+                .kill_on_drop(true);
             let built = tokio::time::timeout(Duration::from_secs(90), compile.output())
-                .await.expect("owned Cargo fixture timed out").expect("Cargo is required");
-            assert!(built.status.success(), "{}", String::from_utf8_lossy(&built.stderr));
-            let artifacts: Vec<serde_json::Value> = String::from_utf8(built.stdout).unwrap()
-                .lines().filter_map(|line| serde_json::from_str(line).ok())
+                .await
+                .expect("owned Cargo fixture timed out")
+                .expect("Cargo is required");
+            assert!(
+                built.status.success(),
+                "{}",
+                String::from_utf8_lossy(&built.stderr)
+            );
+            let artifacts: Vec<serde_json::Value> = String::from_utf8(built.stdout)
+                .unwrap()
+                .lines()
+                .filter_map(|line| serde_json::from_str(line).ok())
                 .filter(|message: &serde_json::Value| message["reason"] == "compiler-artifact")
                 .collect();
-            assert_eq!(artifacts.len(), 3, "fixture must compile one bin and two examples");
-            let files: Vec<std::path::PathBuf> = artifacts.iter()
+            assert_eq!(
+                artifacts.len(),
+                3,
+                "fixture must compile one bin and two examples"
+            );
+            let files: Vec<std::path::PathBuf> = artifacts
+                .iter()
                 .flat_map(|message| message["filenames"].as_array().unwrap())
-                .map(|filename| filename.as_str().unwrap().into()).collect();
-            assert!(files.iter().any(|p| p.file_name().unwrap() == "libdemo_lib.a"));
+                .map(|filename| filename.as_str().unwrap().into())
+                .collect();
+            assert!(
+                files
+                    .iter()
+                    .any(|p| p.file_name().unwrap() == "libdemo_lib.a")
+            );
             let remote_basis = if forwarded { &remote_target } else { &source };
             for path in &files {
                 let destination = local.join(path.strip_prefix(remote_basis).unwrap());
                 std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
                 std::fs::write(destination, b"stale artifact\n").unwrap();
             }
-            std::fs::write(remote_target.join("lean/not_requested"), b"pooled residue\n").unwrap();
+            std::fs::write(
+                remote_target.join("lean/not_requested"),
+                b"pooled residue\n",
+            )
+            .unwrap();
             let kind = Some(CompilationKind::CargoBuild);
             let selected = if forwarded {
                 get_custom_target_artifact_patterns(kind, Some(command_text))
@@ -491,24 +641,41 @@ mod tests {
                     copy.arg(format!("--include=/{rule}"));
                 }
             }
-            copy.arg("--exclude=*").arg(format!("{}/", remote_basis.display()))
-                .arg(format!("{}/", local.display())).stdin(Stdio::null()).kill_on_drop(true);
+            copy.arg("--exclude=*")
+                .arg(format!("{}/", remote_basis.display()))
+                .arg(format!("{}/", local.display()))
+                .stdin(Stdio::null())
+                .kill_on_drop(true);
             let copied = tokio::time::timeout(Duration::from_secs(15), copy.output())
-                .await.expect("owned rsync fixture timed out").expect("rsync is required");
+                .await
+                .expect("owned rsync fixture timed out")
+                .expect("rsync is required");
             assert!(copied.status.success(), "{copied:?}");
             for path in files {
                 let destination = local.join(path.strip_prefix(remote_basis).unwrap());
-                assert_eq!(std::fs::read(&destination).unwrap(), std::fs::read(&path).unwrap(), "{}", path.display());
+                assert_eq!(
+                    std::fs::read(&destination).unwrap(),
+                    std::fs::read(&path).unwrap(),
+                    "{}",
+                    path.display()
+                );
             }
             let residue = remote_target.join("lean/not_requested");
-            assert!(!local.join(residue.strip_prefix(remote_basis).unwrap()).exists());
+            assert!(
+                !local
+                    .join(residue.strip_prefix(remote_basis).unwrap())
+                    .exists()
+            );
             for artifact in artifacts {
                 if let Some(executable) = artifact["executable"].as_str() {
-                    let executable = local.join(Path::new(executable).strip_prefix(remote_basis).unwrap());
+                    let executable =
+                        local.join(Path::new(executable).strip_prefix(remote_basis).unwrap());
                     let mut run = Command::new(executable);
                     run.stdin(Stdio::null()).kill_on_drop(true);
                     let ran = tokio::time::timeout(Duration::from_secs(10), run.output())
-                        .await.expect("returned executable timed out").unwrap();
+                        .await
+                        .expect("returned executable timed out")
+                        .unwrap();
                     assert!(ran.status.success(), "{ran:?}");
                     assert!(String::from_utf8_lossy(&ran.stdout).contains("selected"));
                 }

@@ -145,24 +145,39 @@ impl DrainControl {
     }
 
     fn record(&self, failure: DrainFailure) {
-        let mut first = self.0.failure.lock().unwrap_or_else(|error| error.into_inner());
+        let mut first = self
+            .0
+            .failure
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         first.get_or_insert(failure);
         self.0.failed.store(true, Ordering::Release);
     }
 
     fn error(&self) -> Option<io::Error> {
-        self.0.failure.lock().unwrap_or_else(|error| error.into_inner())
-            .clone().map(DrainFailure::into_io)
+        self.0
+            .failure
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+            .map(DrainFailure::into_io)
     }
 
     fn reserve(&self, count: u64) -> io::Result<()> {
         if let Some(error) = self.error() {
             return Err(error);
         }
-        if self.0.remaining.try_update(Ordering::AcqRel, Ordering::Acquire,
-            |remaining| remaining.checked_sub(count)).is_err()
+        if self
+            .0
+            .remaining
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                remaining.checked_sub(count)
+            })
+            .is_err()
         {
-            self.record(DrainFailure::OutputLimitExceeded { maximum: self.0.maximum });
+            self.record(DrainFailure::OutputLimitExceeded {
+                maximum: self.0.maximum,
+            });
         }
         // Another lane may have failed between our reservation and this check.
         // Failed captures do not refund capacity or produce reusable results.
@@ -309,7 +324,8 @@ fn drain_lane_inner<R: Read>(
         if let Some(control) = control {
             control.reserve(n as u64)?;
         }
-        total = total.checked_add(n as u64)
+        total = total
+            .checked_add(n as u64)
             .ok_or_else(|| io::Error::other("stream length overflow"))?;
 
         let remaining = limits.resident_bound.saturating_sub(resident.len());
@@ -392,9 +408,14 @@ fn monitored_lane<R: Read>(
         Err(_) => Err(DrainFailure::Panicked { stream }.into_io()),
     };
     if let Err(error) = &result {
-        let failure = error.get_ref().and_then(|inner| inner.downcast_ref::<DrainFailure>())
-            .cloned().unwrap_or_else(|| DrainFailure::Io {
-                stream, kind: error.kind(), detail: error.to_string(),
+        let failure = error
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<DrainFailure>())
+            .cloned()
+            .unwrap_or_else(|| DrainFailure::Io {
+                stream,
+                kind: error.kind(),
+                detail: error.to_string(),
             });
         // Publish BEFORE the thread completes. The process owner can terminate
         // the compiler now, without waiting for its ordinary execution deadline.
@@ -416,17 +437,22 @@ pub(crate) struct MonitoredLanes {
 impl MonitoredLanes {
     pub(crate) fn spawn(child: &mut Child, limits: &DrainLimits, maximum: u64) -> Self {
         Self::spawn_with(child, limits, maximum, |name, job| {
-            std::thread::Builder::new().name(format!("rabs-g007-{name}"))
+            std::thread::Builder::new()
+                .name(format!("rabs-g007-{name}"))
                 .spawn(job)
         })
     }
 
     pub(crate) fn spawn_preview(
-        child: &mut Child, limits: &DrainLimits, maximum: u64,
+        child: &mut Child,
+        limits: &DrainLimits,
+        maximum: u64,
         preview: Arc<LiveOutputPreview>,
     ) -> Self {
         Self::spawn_with_preview(child, limits, maximum, Some(preview), |name, job| {
-            std::thread::Builder::new().name(format!("rabs-g007-{name}")).spawn(job)
+            std::thread::Builder::new()
+                .name(format!("rabs-g007-{name}"))
+                .spawn(job)
         })
     }
 
@@ -453,22 +479,33 @@ impl MonitoredLanes {
         let mut start = |reader: Box<dyn Read + Send>, name| {
             let lane_control = control.clone();
             let limits = limits.clone();
-            let job: LaneJob = Box::new(move || {
-                monitored_lane(reader, limits, name, &lane_control)
-            });
+            let job: LaneJob =
+                Box::new(move || monitored_lane(reader, limits, name, &lane_control));
             match spawn(name, job) {
                 Ok(handle) => Some(handle),
                 Err(error) => {
                     control.record(DrainFailure::Io {
-                        stream: name, kind: error.kind(), detail: error.to_string(),
+                        stream: name,
+                        kind: error.kind(),
+                        detail: error.to_string(),
                     });
                     None
                 }
             }
         };
-        let stdout = child.stdout.take().and_then(|reader| start(Box::new(reader), "stdout.spill"));
-        let stderr = child.stderr.take().and_then(|reader| start(Box::new(reader), "stderr.spill"));
-        Self { stdout, stderr, control }
+        let stdout = child
+            .stdout
+            .take()
+            .and_then(|reader| start(Box::new(reader), "stdout.spill"));
+        let stderr = child
+            .stderr
+            .take()
+            .and_then(|reader| start(Box::new(reader), "stderr.spill"));
+        Self {
+            stdout,
+            stderr,
+            control,
+        }
     }
 
     pub(crate) fn failed(&self) -> bool {
@@ -479,8 +516,12 @@ impl MonitoredLanes {
     /// either error, and preserve the original failure rather than a sibling's
     /// resulting broken pipe. Unwind catching does not apply to panic=abort.
     pub(crate) fn join(self) -> io::Result<(LaneDrain, LaneDrain)> {
-        let stdout = self.stdout.map_or_else(|| Ok(LaneDrain::empty()), join_lane);
-        let stderr = self.stderr.map_or_else(|| Ok(LaneDrain::empty()), join_lane);
+        let stdout = self
+            .stdout
+            .map_or_else(|| Ok(LaneDrain::empty()), join_lane);
+        let stderr = self
+            .stderr
+            .map_or_else(|| Ok(LaneDrain::empty()), join_lane);
         if let Some(error) = self.control.error() {
             return Err(error);
         }
@@ -544,8 +585,12 @@ mod tests {
         assert_eq!(control.0.remaining.load(Ordering::Acquire), 0);
         assert!(!control.failed(), "exactly at the combined limit is valid");
         let failure = monitored_lane(&b"f"[..], limits, "extra.spill", &control).unwrap_err();
-        assert!(matches!(failure.get_ref().and_then(|e| e.downcast_ref::<DrainFailure>()),
-            Some(DrainFailure::OutputLimitExceeded { maximum: 5 })));
+        assert!(matches!(
+            failure
+                .get_ref()
+                .and_then(|e| e.downcast_ref::<DrainFailure>()),
+            Some(DrainFailure::OutputLimitExceeded { maximum: 5 })
+        ));
         assert!(control.failed());
     }
 
@@ -553,17 +598,24 @@ mod tests {
     fn managed_budget_is_atomic_across_concurrent_lanes_and_cannot_wrap() {
         let control = DrainControl::new(127);
         let barrier = Arc::new(std::sync::Barrier::new(8));
-        let threads: Vec<_> = (0..8).map(|_| {
-            let control = control.clone();
-            let barrier = Arc::clone(&barrier);
-            std::thread::spawn(move || {
-                barrier.wait();
-                let mut retained = 0;
-                while control.reserve(1).is_ok() { retained += 1; }
-                retained
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let control = control.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let mut retained = 0;
+                    while control.reserve(1).is_ok() {
+                        retained += 1;
+                    }
+                    retained
+                })
             })
-        }).collect();
-        let retained: u64 = threads.into_iter().map(|thread| thread.join().unwrap()).sum();
+            .collect();
+        let retained: u64 = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .sum();
         assert!(retained <= 127);
         assert_eq!(control.0.remaining.load(Ordering::Acquire), 0);
         assert!(control.failed());
@@ -577,24 +629,41 @@ mod tests {
     fn zero_budget_accepts_empty_streams_but_not_one_byte() {
         let (_dir, limits) = temp_limits("zero", 64);
         let control = DrainControl::new(0);
-        assert_eq!(monitored_lane(io::empty(), limits.clone(), "stdout.spill", &control).unwrap(), LaneDrain::empty());
+        assert_eq!(
+            monitored_lane(io::empty(), limits.clone(), "stdout.spill", &control).unwrap(),
+            LaneDrain::empty()
+        );
         assert!(monitored_lane(&b"x"[..], limits, "stderr.spill", &control).is_err());
     }
 
     #[test]
     fn interrupted_reads_retry_without_losing_or_double_charging_bytes() {
-        struct Interrupted<R> { reader: R, interrupt: bool }
+        struct Interrupted<R> {
+            reader: R,
+            interrupt: bool,
+        }
         impl<R: Read> Read for Interrupted<R> {
             fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
                 self.interrupt = !self.interrupt;
-                if self.interrupt { Err(io::ErrorKind::Interrupted.into()) }
-                else { self.reader.read(bytes) }
+                if self.interrupt {
+                    Err(io::ErrorKind::Interrupted.into())
+                } else {
+                    self.reader.read(bytes)
+                }
             }
         }
         let (_dir, limits) = temp_limits("interrupted", 2);
         let control = DrainControl::new(4);
-        let lane = monitored_lane(Interrupted { reader: &b"a\0\xffb"[..], interrupt: false },
-            limits, "stdout.spill", &control).unwrap();
+        let lane = monitored_lane(
+            Interrupted {
+                reader: &b"a\0\xffb"[..],
+                interrupt: false,
+            },
+            limits,
+            "stdout.spill",
+            &control,
+        )
+        .unwrap();
         let mut captured = lane.resident().to_vec();
         captured.extend(std::fs::read(&lane.spill().unwrap().path).unwrap());
         assert_eq!(captured, b"a\0\xffb");
@@ -614,7 +683,10 @@ mod tests {
         assert_eq!(std::fs::read(path).unwrap(), b"prior-attempt");
         let blocked = dir.path().join("not-a-directory");
         std::fs::write(&blocked, b"unchanged").unwrap();
-        let limits = DrainLimits { resident_bound: 0, spill_dir: blocked.clone() };
+        let limits = DrainLimits {
+            resident_bound: 0,
+            spill_dir: blocked.clone(),
+        };
         let control = DrainControl::new(16);
         assert!(monitored_lane(&b"x"[..], limits, "stderr.spill", &control).is_err());
         assert!(control.failed());
@@ -626,26 +698,42 @@ mod tests {
     fn a_panicked_lane_is_visible_to_the_owner_before_join() {
         struct PanickingReader;
         impl Read for PanickingReader {
-            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> { panic!("injected drain panic") }
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                panic!("injected drain panic")
+            }
         }
         let (_dir, limits) = temp_limits("panic", 64);
         let control = DrainControl::new(64);
         assert!(monitored_lane(PanickingReader, limits, "stdout.spill", &control).is_err());
         assert!(control.failed());
-        assert!(matches!(control.error().unwrap().get_ref().and_then(|e| e.downcast_ref::<DrainFailure>()),
-            Some(DrainFailure::Panicked { stream: "stdout.spill" })));
+        assert!(matches!(
+            control
+                .error()
+                .unwrap()
+                .get_ref()
+                .and_then(|e| e.downcast_ref::<DrainFailure>()),
+            Some(DrainFailure::Panicked {
+                stream: "stdout.spill"
+            })
+        ));
     }
 
     #[test]
     fn partial_lane_start_failure_keeps_and_joins_the_started_lane() {
         let (_dir, limits) = temp_limits("thread-start", 64);
-        let mut child = Command::new("sh").args(["-c", "printf out; printf err >&2"])
-            .stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+        let mut child = Command::new("sh")
+            .args(["-c", "printf out; printf err >&2"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
         let joined = Arc::new(AtomicBool::new(false));
         let mut starts = 0;
         let lanes = MonitoredLanes::spawn_with(&mut child, &limits, 64, |_, job| {
             starts += 1;
-            if starts == 2 { return Err(io::Error::other("injected thread exhaustion")); }
+            if starts == 2 {
+                return Err(io::Error::other("injected thread exhaustion"));
+            }
             let joined = Arc::clone(&joined);
             Ok(std::thread::spawn(move || {
                 let result = job();
@@ -658,7 +746,13 @@ mod tests {
         let _ = child.kill();
         child.wait().unwrap();
         assert!(lanes.failed());
-        assert!(lanes.join().unwrap_err().to_string().contains("thread exhaustion"));
+        assert!(
+            lanes
+                .join()
+                .unwrap_err()
+                .to_string()
+                .contains("thread exhaustion")
+        );
         assert!(joined.load(Ordering::Acquire), "started lane was detached");
     }
 

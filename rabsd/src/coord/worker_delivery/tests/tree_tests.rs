@@ -30,14 +30,23 @@ fn refresh_manifest(manifest: &mut Value) {
         total = total.checked_add(bytes).unwrap();
     }
     manifest["total_bytes"] = json!(total);
-    manifest["manifest_sha256"] = json!(hasher.finalize().iter().map(|byte| format!("{byte:02x}")).collect::<String>());
+    manifest["manifest_sha256"] = json!(
+        hasher
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    );
 }
 
 fn tree_fixture(destination: &Path, count: usize) -> (Script, BTreeMap<String, Vec<u8>>) {
     assert!(count > 0);
     let mut bytes = BTreeMap::from([("a".to_owned(), b"A\0\xffB".to_vec())]);
     for index in 1..count {
-        bytes.insert(format!("deps/f{index:04}"), format!("payload-{index}").into_bytes());
+        bytes.insert(
+            format!("deps/f{index:04}"),
+            format!("payload-{index}").into_bytes(),
+        );
     }
     let mut manifest = json!({"unit":"dep", "files":bytes.iter().map(|(name, bytes)| {
         json!({"name":name, "bytes":bytes.len(), "sha256":hash(bytes), "executable":name == "a"})
@@ -66,26 +75,54 @@ fn tree_delivery_verifies_every_file_before_ack_and_preserves_exact_request() {
         let request = tree_request();
         let original = serde_json::to_vec(&request).unwrap();
         let (mut peer, expected) = tree_fixture(&destination, 130);
-        if lose_ack { peer.fail_send = Some("artifact-ack"); }
+        if lose_ack {
+            peer.fail_send = Some("artifact-ack");
+        }
         let delivered = receive_execution(&mut peer, &request, "worker", &destination).unwrap();
         assert_eq!(delivered.acknowledgments_confirmed, !lose_ack);
-        assert_eq!(delivered.receipt["artifact_manifest"]["files"].as_array().unwrap().len(), 130);
+        assert_eq!(
+            delivered.receipt["artifact_manifest"]["files"]
+                .as_array()
+                .unwrap()
+                .len(),
+            130
+        );
         assert_eq!(delivered.receipt["request_sha256"], hash(&original));
         assert_eq!(serde_json::to_vec(&request).unwrap(), original);
         assert_eq!(peer.sent[1], request);
-        assert_eq!(peer.sent.iter().filter(|frame| frame["kind"] == "canonical-exec").count(), 1);
-        assert_eq!(peer.sent.iter().filter(|frame| frame["kind"] == "artifact-read").count(), 130);
+        assert_eq!(
+            peer.sent
+                .iter()
+                .filter(|frame| frame["kind"] == "canonical-exec")
+                .count(),
+            1
+        );
+        assert_eq!(
+            peer.sent
+                .iter()
+                .filter(|frame| frame["kind"] == "artifact-read")
+                .count(),
+            130
+        );
         for (name, bytes) in &expected {
-            assert_eq!(fs::read(destination.join("artifacts").join(name)).unwrap(), *bytes);
+            assert_eq!(
+                fs::read(destination.join("artifacts").join(name)).unwrap(),
+                *bytes
+            );
         }
-        let recovered = recover_existing_delivery(&request, "worker", &destination, DeliveryTrust::Loopback)
-            .unwrap().unwrap();
+        let recovered =
+            recover_existing_delivery(&request, "worker", &destination, DeliveryTrust::Loopback)
+                .unwrap()
+                .unwrap();
         assert_eq!(recovered.receipt, delivered.receipt);
         assert_eq!(recovered.receipt["publication_authorized"], false);
         assert_eq!(recovered.receipt["reexecute"], false);
         // A non-required intermediate is just as binding as the final executable.
         fs::write(destination.join("artifacts/deps/f0129"), b"bad-content").unwrap();
-        assert!(recover_existing_delivery(&request, "worker", &destination, DeliveryTrust::Loopback).is_err());
+        assert!(
+            recover_existing_delivery(&request, "worker", &destination, DeliveryTrust::Loopback)
+                .is_err()
+        );
     }
 }
 
@@ -97,7 +134,9 @@ fn tree_manifests_refuse_unsafe_incomplete_or_noncanonical_sets_before_ranges() 
         let (mut peer, _) = tree_fixture(&destination, 3);
         let manifest = &mut peer.replies[1]["artifact_manifest"];
         match case {
-            0 => { manifest["files"].as_array_mut().unwrap().remove(0); }
+            0 => {
+                manifest["files"].as_array_mut().unwrap().remove(0);
+            }
             1 => manifest["files"][1]["name"] = json!("../escape"),
             2 => manifest["files"][1]["name"] = json!("A"),
             3 => manifest["files"][1]["name"] = json!("a"),
@@ -111,7 +150,8 @@ fn tree_manifests_refuse_unsafe_incomplete_or_noncanonical_sets_before_ranges() 
         }
         // Even a freshly recomputed digest cannot bless unsafe path/set semantics.
         refresh_manifest(manifest);
-        let failure = receive_execution(&mut peer, &tree_request(), "worker", &destination).unwrap_err();
+        let failure =
+            receive_execution(&mut peer, &tree_request(), "worker", &destination).unwrap_err();
         assert!(failure.execution_may_have_run, "case {case}");
         assert_eq!(peer.sent.len(), 2, "no range reads on case {case}");
         assert!(no_ack(&peer));
@@ -127,7 +167,12 @@ fn exact_declarations_do_not_accept_tree_results_and_invalid_versions_never_disp
     assert!(receive_execution(&mut peer, &request(), "worker", &destination).is_err());
     assert_eq!(peer.sent.len(), 2);
     assert!(no_ack(&peer));
-    for version in [Value::Null, json!(true), json!("tree-files-v2"), json!({"version":TREE_FILES_VERSION})] {
+    for version in [
+        Value::Null,
+        json!(true),
+        json!("tree-files-v2"),
+        json!({"version":TREE_FILES_VERSION}),
+    ] {
         let mut request = request();
         request["artifacts"]["tree"] = version;
         let destination = owner.path().join("never-created");
@@ -151,16 +196,33 @@ fn tree_resume_retrieves_the_full_recorded_set_without_any_execution_dispatch() 
     peer.replies[1]["result_retention"] = json!(RESULT_RETENTION);
     peer.replies[1]["retained_result_sha256"] = json!(hash(b"retained full tree"));
     let request = tree_request();
-    let delivery = receive_operation(&mut peer, &request, "worker", &destination, DeliveryMode::Resume).unwrap();
+    let delivery = receive_operation(
+        &mut peer,
+        &request,
+        "worker",
+        &destination,
+        DeliveryMode::Resume,
+    )
+    .unwrap();
     assert!(delivery.acknowledgments_confirmed);
     assert_eq!(peer.sent[1], DeliveryMode::Resume.frame(&request));
-    assert!(peer.sent.iter().all(|frame| frame["kind"] != "canonical-exec"));
+    assert!(
+        peer.sent
+            .iter()
+            .all(|frame| frame["kind"] != "canonical-exec")
+    );
     for (name, bytes) in expected {
-        assert_eq!(fs::read(destination.join("artifacts").join(name)).unwrap(), bytes);
+        assert_eq!(
+            fs::read(destination.join("artifacts").join(name)).unwrap(),
+            bytes
+        );
     }
     let mut changed = request.clone();
     changed["artifacts"].as_object_mut().unwrap().remove("tree");
-    assert!(recover_existing_delivery(&changed, "worker", &destination, DeliveryTrust::Loopback).is_err());
+    assert!(
+        recover_existing_delivery(&changed, "worker", &destination, DeliveryTrust::Loopback)
+            .is_err()
+    );
 }
 
 #[test]
@@ -175,9 +237,26 @@ fn full_tree_archive_restores_after_store_reopen_without_the_original_delivery()
     let delivered = receive_execution(&mut peer, &request, "worker", &destination).unwrap();
     let cas_root = owner.path().join("cas");
     let cas = mount_and_reconcile(&cas_root).unwrap();
-    let archive = archive_delivery(&cas, &request, "worker", &destination, DeliveryTrust::Loopback).unwrap();
+    let archive = archive_delivery(
+        &cas,
+        &request,
+        "worker",
+        &destination,
+        DeliveryTrust::Loopback,
+    )
+    .unwrap();
     assert_eq!(archive.file_count, 132);
-    assert_eq!(archive_delivery(&cas, &request, "worker", &destination, DeliveryTrust::Loopback).unwrap(), archive);
+    assert_eq!(
+        archive_delivery(
+            &cas,
+            &request,
+            "worker",
+            &destination,
+            DeliveryTrust::Loopback
+        )
+        .unwrap(),
+        archive
+    );
     {
         let mut store = cas.store().lock().unwrap();
         assert!(store.list_publications().unwrap().is_empty());
@@ -191,17 +270,52 @@ fn full_tree_archive_restores_after_store_reopen_without_the_original_delivery()
     fs::rename(&destination, owner.path().join("retired-delivery")).unwrap();
     let cas = mount_and_reconcile(&cas_root).unwrap();
     let restored = owner.path().join("restored");
-    let result = restore_delivery(&cas, &digest_key(&archive.root), &request, "worker", &restored, DeliveryTrust::Loopback).unwrap();
+    let result = restore_delivery(
+        &cas,
+        &digest_key(&archive.root),
+        &request,
+        "worker",
+        &restored,
+        DeliveryTrust::Loopback,
+    )
+    .unwrap();
     assert_eq!(result.receipt, delivered.receipt);
     assert!(!result.acknowledgments_confirmed);
     for (name, bytes) in &expected {
-        assert_eq!(fs::read(restored.join("artifacts").join(name)).unwrap(), *bytes);
+        assert_eq!(
+            fs::read(restored.join("artifacts").join(name)).unwrap(),
+            *bytes
+        );
     }
-    assert_eq!(restore_delivery(&cas, &digest_key(&archive.root), &request, "worker", &restored, DeliveryTrust::Loopback)
-        .unwrap().receipt, delivered.receipt);
+    assert_eq!(
+        restore_delivery(
+            &cas,
+            &digest_key(&archive.root),
+            &request,
+            "worker",
+            &restored,
+            DeliveryTrust::Loopback
+        )
+        .unwrap()
+        .receipt,
+        delivered.receipt
+    );
     fs::write(restored.join("artifacts/deps/f0129"), b"bad-content").unwrap();
-    assert!(restore_delivery(&cas, &digest_key(&archive.root), &request, "worker", &restored, DeliveryTrust::Loopback).is_err());
-    assert_eq!(fs::read(restored.join("artifacts/deps/f0129")).unwrap(), b"bad-content");
+    assert!(
+        restore_delivery(
+            &cas,
+            &digest_key(&archive.root),
+            &request,
+            "worker",
+            &restored,
+            DeliveryTrust::Loopback
+        )
+        .is_err()
+    );
+    assert_eq!(
+        fs::read(restored.join("artifacts/deps/f0129")).unwrap(),
+        b"bad-content"
+    );
 }
 
 #[test]
@@ -210,7 +324,10 @@ fn output_parent_creation_is_exclusive_and_cannot_merge_an_existing_alias() {
     fs::create_dir(owner.path().join("nested")).unwrap();
     fs::write(owner.path().join("nested/evidence"), b"untouched").unwrap();
     assert!(create_artifact_directories(owner.path(), ["nested/a"]).is_err());
-    assert_eq!(fs::read(owner.path().join("nested/evidence")).unwrap(), b"untouched");
+    assert_eq!(
+        fs::read(owner.path().join("nested/evidence")).unwrap(),
+        b"untouched"
+    );
     let new = owner.path().join("new");
     fs::create_dir(&new).unwrap();
     create_artifact_directories(&new, ["x/a", "x/y/b", "x/y/c"]).unwrap();

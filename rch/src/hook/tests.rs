@@ -991,6 +991,41 @@ fn join_exec_command_plain_args_unchanged() {
     assert_eq!(round_trip, parts);
 }
 
+/// `rch exec -- FOO=1 cmd` must keep FOO=1 an assignment. Quoting it as a
+/// whole word made `sh` run a program named `FOO=1` (exit 127) on every local
+/// fallback and non-cargo remote run. Run the joined text through a real shell.
+#[cfg(unix)]
+#[test]
+fn join_exec_command_keeps_leading_assignments_as_assignments() {
+    let _guard = test_guard!();
+    let parts = vec![
+        "RCH_T_A=one".to_string(),
+        "RCH_T_B=two words".to_string(),
+        "sh".to_string(),
+        "-c".to_string(),
+        "printf '%s|%s' \"$RCH_T_A\" \"$RCH_T_B\"".to_string(),
+    ];
+    let joined = join_exec_command(&parts);
+    let output = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(&joined)
+        .output()
+        .expect("run sh");
+    assert!(output.status.success(), "{joined}: {output:?}");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "one|two words");
+    // The single-string form (`rch exec -- "FOO=1 cargo test"`) takes the same path.
+    let single = join_exec_command(&["RCH_T_A=1 cargo test".to_string()]);
+    assert_eq!(
+        shell_words::split(&single).expect("valid shell words"),
+        ["env", "RCH_T_A=1", "cargo", "test"]
+    );
+    // A non-assignment first word is untouched.
+    assert_eq!(
+        join_exec_command(&["=x".to_string(), "y".to_string()]),
+        shell_words::join(["=x", "y"])
+    );
+}
+
 #[test]
 fn clean_overlay_fmt_check_allowlist_is_exact_and_read_only() {
     let _guard = test_guard!();
@@ -4381,6 +4416,51 @@ fn test_add_cargo_isolation_survives_timeout_prefix_and_preserves_status() {
         status.code(),
         Some(42),
         "timeout must execute the shell wrapper and preserve the command status"
+    );
+}
+
+#[test]
+fn test_add_cargo_isolation_repairs_dangling_registry_link() {
+    // bd-hiu2v: a cache whose `registry` link points at a reclaimed
+    // ~/.cargo/registry made every crates.io fetch fail with EEXIST.
+    let _guard = test_guard!();
+    let base = tempfile::tempdir().unwrap();
+    let base_path = base.path().canonicalize().unwrap();
+    let worker_id = rch_common::WorkerId::new("dangling-worker");
+    let cache = base_path.join("rch-cargo-cache-dangling-worker");
+    std::fs::create_dir_all(&cache).unwrap();
+    let reclaimed = base_path.join("reclaimed-account-registry");
+    std::os::unix::fs::symlink(&reclaimed, cache.join("registry")).unwrap();
+    assert!(!cache.join("registry").exists(), "fixture link must dangle");
+
+    let isolated = add_cargo_isolation(
+        "printf cargo >/dev/null; test -d \"$CARGO_HOME/registry\" && touch \"$CARGO_HOME/registry/ok\"",
+        &worker_id,
+    );
+    let status = std::process::Command::new("sh") // ubs:ignore — executes the fixed isolation wrapper above.
+        .arg("-c")
+        .arg(&isolated)
+        .env("TMPDIR", &base_path)
+        // Under `rch exec` the test inherits the worker's own cache base;
+        // clear it so the wrapper resolves the fixture base from TMPDIR.
+        .env_remove(rch_common::RCH_CARGO_HOME_BASE_VAR)
+        .status()
+        .expect("isolated command should execute");
+
+    assert!(
+        status.success(),
+        "dangling registry link was not repaired: {status:?}"
+    );
+    assert!(
+        std::fs::symlink_metadata(cache.join("registry"))
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the operator's link is kept, not replaced"
+    );
+    assert!(
+        reclaimed.join("ok").exists(),
+        "writes land in the recreated link target"
     );
 }
 
@@ -11104,4 +11184,27 @@ fn ssh_timeout_unverified_cleanup_detection() {
 
     let unrelated = anyhow::anyhow!("some other failure");
     assert!(ssh_timeout_with_unverified_cleanup(&unrelated).is_none());
+}
+
+#[test]
+fn project_topology_local_reason_admits_projects_under_the_canonical_root_only() {
+    let root = tempfile::tempdir().unwrap();
+    let canonical = root.path().canonicalize().unwrap();
+    let inside = canonical.join("repo");
+    std::fs::create_dir_all(&inside).unwrap();
+    let outside_parent = tempfile::tempdir().unwrap();
+    let outside = outside_parent.path().canonicalize().unwrap().join("repo");
+    std::fs::create_dir_all(&outside).unwrap();
+    let policy = PathTopologyPolicy::new(canonical.clone(), canonical.clone());
+
+    assert_eq!(project_topology_local_reason(&policy, &inside), None);
+
+    let reason = project_topology_local_reason(&policy, &outside)
+        .expect("a project outside the canonical root must run locally");
+    assert!(reason.contains("outside canonical root"), "{reason}");
+    assert!(reason.contains(&outside.display().to_string()), "{reason}");
+    assert!(
+        reason.contains("canonical_root"),
+        "the reason names the fix: {reason}"
+    );
 }

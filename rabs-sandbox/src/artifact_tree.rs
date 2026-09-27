@@ -31,7 +31,9 @@ fn valid_path(path: &str) -> bool {
         && !path.contains(['\\', ':'])
         && !path.chars().any(char::is_control)
         && path.split('/').count() <= 32
-        && path.split('/').all(|part| !part.is_empty() && !matches!(part, "." | ".."))
+        && path
+            .split('/')
+            .all(|part| !part.is_empty() && !matches!(part, "." | ".."))
 }
 
 /// Validate names BEFORE a receiver creates paths. Preserve spelling and reject
@@ -46,18 +48,26 @@ pub fn validate_tree_names<'a>(
     let mut namespace: BTreeMap<String, (String, bool)> = BTreeMap::new();
     for path in paths {
         if names.len() >= MAX_TREE_FILES || !valid_path(path) || !names.insert(path.to_owned()) {
-            return Err(invalid("unsafe, duplicate or excessive artifact tree names"));
+            return Err(invalid(
+                "unsafe, duplicate or excessive artifact tree names",
+            ));
         }
-        let prefixes = path.match_indices('/').map(|(end, _)| (&path[..end], false))
+        let prefixes = path
+            .match_indices('/')
+            .map(|(end, _)| (&path[..end], false))
             .chain(std::iter::once((path, true)));
         for (prefix, is_file) in prefixes {
             let folded = prefix.to_lowercase();
             match namespace.get(&folded) {
                 Some((prior, prior_file)) if prior != prefix || *prior_file != is_file => {
-                    return Err(invalid("artifact tree contains aliased or overlapping paths"));
+                    return Err(invalid(
+                        "artifact tree contains aliased or overlapping paths",
+                    ));
                 }
                 Some(_) => {}
-                None => { namespace.insert(folded, (prefix.to_owned(), is_file)); }
+                None => {
+                    namespace.insert(folded, (prefix.to_owned(), is_file));
+                }
             }
         }
     }
@@ -96,8 +106,13 @@ mod linux {
     impl Stamp {
         fn of(meta: &Metadata) -> Self {
             Self {
-                device: meta.dev(), inode: meta.ino(), size: meta.len(), links: meta.nlink(),
-                mode: meta.mode(), uid: meta.uid(), gid: meta.gid(),
+                device: meta.dev(),
+                inode: meta.ino(),
+                size: meta.len(),
+                links: meta.nlink(),
+                mode: meta.mode(),
+                uid: meta.uid(),
+                gid: meta.gid(),
                 modified: (meta.mtime(), meta.mtime_nsec()),
                 changed: (meta.ctime(), meta.ctime_nsec()),
             }
@@ -119,7 +134,10 @@ mod linux {
 
     fn checkpoint(stopped: &impl Fn() -> bool) -> io::Result<()> {
         if stopped() {
-            Err(io::Error::new(io::ErrorKind::TimedOut, "artifact tree capture interrupted"))
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "artifact tree capture interrupted",
+            ))
         } else {
             Ok(())
         }
@@ -138,22 +156,29 @@ mod linux {
             checkpoint(stopped)?;
             validate_tree_names(required.iter().map(String::as_str))?;
             let directory = File::from(openat2(
-                CWD, root,
+                CWD,
+                root,
                 OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                Mode::empty(), ResolveFlags::NO_MAGICLINKS,
+                Mode::empty(),
+                ResolveFlags::NO_MAGICLINKS,
             )?);
             if directory.metadata()?.mode() & 0o077 != 0 {
                 return Err(invalid("artifact tree root must be private"));
             }
             let mut tree = Self {
-                root: directory.try_clone()?, root_path: root.to_path_buf(),
-                files: BTreeMap::new(), directories: BTreeMap::new(),
-                total_bytes: 0, entries: 0,
+                root: directory.try_clone()?,
+                root_path: root.to_path_buf(),
+                files: BTreeMap::new(),
+                directories: BTreeMap::new(),
+                total_bytes: 0,
+                entries: 0,
             };
             tree.visit(&directory, "", max_bytes, stopped)?;
             let names = validate_tree_names(tree.files.keys().map(String::as_str))?;
             if !required.is_subset(&names) {
-                return Err(invalid("compiler did not produce every required tree artifact"));
+                return Err(invalid(
+                    "compiler did not produce every required tree artifact",
+                ));
             }
             let mut aliases: BTreeMap<(u64, u64), u64> = BTreeMap::new();
             for stamp in tree.files.values() {
@@ -161,7 +186,9 @@ mod linux {
             }
             for stamp in tree.files.values() {
                 if aliases[&(stamp.device, stamp.inode)] != stamp.links {
-                    return Err(invalid("artifact hard link escapes the captured output tree"));
+                    return Err(invalid(
+                        "artifact hard link escapes the captured output tree",
+                    ));
                 }
             }
             tree.verify(stopped)?;
@@ -171,14 +198,19 @@ mod linux {
         fn open(&self, path: &str, flags: OFlags) -> io::Result<File> {
             // No fallback to pathname traversal on older kernels or filesystems.
             Ok(File::from(openat2(
-                &self.root, path, flags | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                &self.root,
+                path,
+                flags | OFlags::NOFOLLOW | OFlags::CLOEXEC,
                 Mode::empty(),
                 ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_XDEV,
             )?))
         }
 
         fn visit(
-            &mut self, directory: &File, relative: &str, max_bytes: u64,
+            &mut self,
+            directory: &File,
+            relative: &str,
+            max_bytes: u64,
             stopped: &impl Fn() -> bool,
         ) -> io::Result<()> {
             checkpoint(stopped)?;
@@ -187,15 +219,25 @@ mod linux {
             while let Some(entry) = entries.read() {
                 checkpoint(stopped)?;
                 let entry = entry?;
-                if matches!(entry.file_name().to_bytes(), b"." | b"..") { continue; }
+                if matches!(entry.file_name().to_bytes(), b"." | b"..") {
+                    continue;
+                }
                 self.entries += 1;
                 if self.entries > MAX_TREE_ENTRIES {
                     return Err(invalid("artifact tree directory entry limit exceeded"));
                 }
-                let name = entry.file_name().to_str()
+                let name = entry
+                    .file_name()
+                    .to_str()
                     .map_err(|_| invalid("non-UTF-8 artifact tree path"))?;
-                let path = if relative.is_empty() { name.to_owned() } else { format!("{relative}/{name}") };
-                if !valid_path(&path) { return Err(invalid("unsafe artifact tree path")); }
+                let path = if relative.is_empty() {
+                    name.to_owned()
+                } else {
+                    format!("{relative}/{name}")
+                };
+                if !valid_path(&path) {
+                    return Err(invalid("unsafe artifact tree path"));
+                }
                 // O_PATH classifies FIFOs/devices/symlinks without opening them
                 // for I/O. Descendant directories are opened only after this.
                 let observed = self.open(&path, OFlags::PATH)?;
@@ -211,7 +253,9 @@ mod linux {
                     if self.files.len() >= MAX_TREE_FILES {
                         return Err(invalid("artifact tree file count exceeded"));
                     }
-                    self.total_bytes = self.total_bytes.checked_add(metadata.len())
+                    self.total_bytes = self
+                        .total_bytes
+                        .checked_add(metadata.len())
                         .filter(|bytes| *bytes <= max_bytes)
                         .ok_or_else(|| invalid("artifact tree byte limit exceeded"))?;
                     if self.files.insert(path.clone(), stamp.clone()).is_some() {
@@ -238,12 +282,16 @@ mod linux {
 
         /// Counts each exported alias's bytes because each is copied independently.
         #[must_use]
-        pub const fn total_bytes(&self) -> u64 { self.total_bytes }
+        pub const fn total_bytes(&self) -> u64 {
+            self.total_bytes
+        }
 
         /// Open one INVENTORIED file through the anchored root and compare its
         /// inode and mutation stamp before a reader can consume any bytes.
         pub fn open_file(&self, name: &str) -> io::Result<File> {
-            if !self.files.contains_key(name) { return Err(invalid("unknown tree artifact")); }
+            if !self.files.contains_key(name) {
+                return Err(invalid("unknown tree artifact"));
+            }
             let file = self.open(name, OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOCTTY)?;
             self.verify_file(name, &file)?;
             Ok(file)
@@ -261,13 +309,17 @@ mod linux {
         /// change, external hard link or metadata mutation may become an offer.
         pub fn verify(&self, stopped: &impl Fn() -> bool) -> io::Result<()> {
             checkpoint(stopped)?;
-            if self.directories.get("") != Some(&Stamp::of(&fs::symlink_metadata(&self.root_path)?)) {
+            if self.directories.get("") != Some(&Stamp::of(&fs::symlink_metadata(&self.root_path)?))
+            {
                 return Err(invalid("artifact tree root changed during capture"));
             }
             for (path, stamp) in self.directories.iter().chain(&self.files) {
                 checkpoint(stopped)?;
-                let current = if path.is_empty() { self.root.metadata()? }
-                    else { self.open(path, OFlags::PATH)?.metadata()? };
+                let current = if path.is_empty() {
+                    self.root.metadata()?
+                } else {
+                    self.open(path, OFlags::PATH)?.metadata()?
+                };
                 if Stamp::of(&current) != *stamp {
                     return Err(invalid("artifact tree changed during capture"));
                 }
@@ -283,20 +335,38 @@ mod tests {
 
     #[test]
     fn names_reject_aliases_traversal_and_component_collisions() {
-        for paths in [vec!["../x"], vec!["/x"], vec!["a//b"], vec!["a\\b"], vec!["a:b"],
-            vec!["a\0b"], vec!["a", "a"], vec!["a", "a/x"], vec!["A/x", "a/y"],
-            vec!["a", "A/x"], vec!["a/FILE", "a/file"]] {
+        for paths in [
+            vec!["../x"],
+            vec!["/x"],
+            vec!["a//b"],
+            vec!["a\\b"],
+            vec!["a:b"],
+            vec!["a\0b"],
+            vec!["a", "a"],
+            vec!["a", "a/x"],
+            vec!["A/x", "a/y"],
+            vec!["a", "A/x"],
+            vec!["a/FILE", "a/file"],
+        ] {
             assert!(validate_tree_names(paths).is_err());
         }
-        let names = validate_tree_names(["debug/app", "debug/deps/lib.rlib", "debug/.cargo-lock"]).unwrap();
+        let names =
+            validate_tree_names(["debug/app", "debug/deps/lib.rlib", "debug/.cargo-lock"]).unwrap();
         assert_eq!(names.len(), 3);
         assert!(validate_tree_names(std::iter::empty::<&str>()).is_err());
     }
 
     #[test]
     fn exact_tree_name_count_and_path_limits_are_bounded() {
-        let mut names: Vec<_> = (0..MAX_TREE_FILES).map(|index| format!("d/f{index}")).collect();
-        assert_eq!(validate_tree_names(names.iter().map(String::as_str)).unwrap().len(), MAX_TREE_FILES);
+        let mut names: Vec<_> = (0..MAX_TREE_FILES)
+            .map(|index| format!("d/f{index}"))
+            .collect();
+        assert_eq!(
+            validate_tree_names(names.iter().map(String::as_str))
+                .unwrap()
+                .len(),
+            MAX_TREE_FILES
+        );
         names.push("overflow".into());
         assert!(validate_tree_names(names.iter().map(String::as_str)).is_err());
         let deep = vec!["d"; 33].join("/");
@@ -315,10 +385,17 @@ mod tests {
         std::fs::hard_link(root.path().join("deps/app-hash"), root.path().join("app")).unwrap();
         let required = BTreeSet::from(["app".to_owned()]);
         let inventory = TreeInventory::scan(root.path(), &required, 100, &|| false).unwrap();
-        assert_eq!(inventory.names().collect::<Vec<_>>(), vec!["app", "deps/app-hash"]);
+        assert_eq!(
+            inventory.names().collect::<Vec<_>>(),
+            vec!["app", "deps/app-hash"]
+        );
         assert_eq!(inventory.total_bytes(), 16);
         let mut bytes = Vec::new();
-        inventory.open_file("app").unwrap().read_to_end(&mut bytes).unwrap();
+        inventory
+            .open_file("app")
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .unwrap();
         assert_eq!(bytes, b"binary\0\xff");
         let outside = tempfile::tempdir().unwrap();
         std::fs::hard_link(root.path().join("app"), outside.path().join("alias")).unwrap();
@@ -361,8 +438,12 @@ mod tests {
                 _ => std::fs::create_dir(root.path().join("unexpected")).unwrap(),
             }
             assert!(inventory.verify(&|| false).is_err());
-            if case == 0 { assert!(inventory.verify_file("app", &file).is_err()); }
-            if case < 2 { assert!(inventory.open_file("app").is_err()); }
+            if case == 0 {
+                assert!(inventory.verify_file("app", &file).is_err());
+            }
+            if case < 2 {
+                assert!(inventory.open_file("app").is_err());
+            }
         }
     }
 }

@@ -122,9 +122,8 @@ fn check_expansion(canonical: &[u8], mappings: &[(Vec<u8>, Vec<u8>)]) -> Result<
     if render_dep_info(&parsed) != canonical {
         return Err("dep-info is outside the lossless canonical grammar".into());
     }
-    let token_len = |token: &[u8]| {
-        rewritten_dep_info_token_len(token, mappings).map_err(|error| error.reason)
-    };
+    let token_len =
+        |token: &[u8]| rewritten_dep_info_token_len(token, mappings).map_err(|error| error.reason);
     let mut total = 0_usize;
     for line in &parsed.lines {
         let length = match line {
@@ -664,9 +663,11 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let cas =
             crate::janitor::store::mount_and_reconcile(&directory.path().join("cas")).unwrap();
-        let root = directory.path().canonicalize().unwrap().join(
-            std::ffi::OsString::from_vec(b"root-\xfe".to_vec()),
-        );
+        let root = directory
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join(std::ffi::OsString::from_vec(b"root-\xfe".to_vec()));
         let paths: &[&[u8]] = &[b"out/crate-\xff.rlib", b"out/crate.rmeta"];
         let manifest = outputs_named(paths);
         let plan = match prepare(
@@ -707,25 +708,36 @@ mod tests {
         let mappings = directory_mappings(&expected(&[
             (b".", b"/subscriber with#space-\xff"),
             (b"/__rabs/toolchain", b"/local/toolchain"),
-        ])).unwrap();
-        let canonical = b"target/unit.rmeta: ./src/lib.rs /__rabs/toolchain/lib/core.rlib\n\n./src/lib.rs:\n";
+        ]))
+        .unwrap();
+        let canonical =
+            b"target/unit.rmeta: ./src/lib.rs /__rabs/toolchain/lib/core.rlib\n\n./src/lib.rs:\n";
         let expanded = check_expansion(canonical, &mappings).unwrap();
         let derived = derive_subscriber_dep_info(canonical, &mappings).unwrap();
         assert_eq!(expanded, derived.bytes.len());
-        assert_eq!(render_dep_info(&parse_dep_info(&derived.bytes).unwrap()), derived.bytes);
-        assert!(derived.bytes.starts_with(b"/subscriber\\ with\\#space-\xff/target/unit.rmeta:"));
+        assert_eq!(
+            render_dep_info(&parse_dep_info(&derived.bytes).unwrap()),
+            derived.bytes
+        );
+        assert!(
+            derived
+                .bytes
+                .starts_with(b"/subscriber\\ with\\#space-\xff/target/unit.rmeta:")
+        );
     }
 
     #[test]
     fn working_directory_mapping_is_explicit_unique_and_absolute() {
-        let mappings = directory_mappings(&expected(&[
-            (b".", b"/worktree"), (b".", b"/worktree/"),
-        ])).unwrap();
+        let mappings =
+            directory_mappings(&expected(&[(b".", b"/worktree"), (b".", b"/worktree/")])).unwrap();
         assert_eq!(mappings, vec![(b".".to_vec(), b"/worktree/".to_vec())]);
-        assert!(directory_mappings(&expected(&[
-            (b".", b"/first"), (b".", b"/second"),
-        ])).is_err());
-        for directory in [&b"relative"[..], b"/", b"/tree/../other", b"/__rabs/workspace"] {
+        assert!(directory_mappings(&expected(&[(b".", b"/first"), (b".", b"/second"),])).is_err());
+        for directory in [
+            &b"relative"[..],
+            b"/",
+            b"/tree/../other",
+            b"/__rabs/workspace",
+        ] {
             assert!(directory_mappings(&expected(&[(b".", directory)])).is_err());
         }
         for source in [&b"./"[..], b"..", b"src"] {

@@ -335,7 +335,16 @@ fn main() {
         Some("--worker-build-tls") => {
             std::process::exit(worker_exec::run_build_tls(&args[1..]));
         }
-        Some("--job-submit" | "--job-status" | "--job-wait" | "--job-follow" | "--job-cancel" | "--job-resume" | "--job-acknowledge" | "--job-recover-local") => {
+        Some(
+            "--job-submit"
+            | "--job-status"
+            | "--job-wait"
+            | "--job-follow"
+            | "--job-cancel"
+            | "--job-resume"
+            | "--job-acknowledge"
+            | "--job-recover-local",
+        ) => {
             let config = match load_config() {
                 Ok(config) => config,
                 Err(error) => {

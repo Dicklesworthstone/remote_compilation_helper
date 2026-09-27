@@ -310,11 +310,7 @@ pub fn mint_fifo_jobserver(
     // Prime reader may now go away; the held writer keeps the fifo up.
     drop(prime_reader);
 
-    let auth = format!(
-        "-j{} --jobserver-auth=fifo:{}",
-        tokens + 1,
-        path.display()
-    );
+    let auth = format!("-j{} --jobserver-auth=fifo:{}", tokens + 1, path.display());
     Ok((path, writer, auth))
 }
 
@@ -330,7 +326,10 @@ mod tests {
         for tokens in [0, 1, 3, MAX_FIFO_TOKENS] {
             let directory = tempfile::tempdir().unwrap();
             let (path, mut writer, auth) = mint_fifo_jobserver(tokens, directory.path()).unwrap();
-            assert_eq!(auth, format!("-j{} --jobserver-auth=fifo:{}", tokens + 1, path.display()));
+            assert_eq!(
+                auth,
+                format!("-j{} --jobserver-auth=fifo:{}", tokens + 1, path.display())
+            );
             // A separate nonblocking descriptor measures kernel credit; no
             // delayed reader thread can consume a token after test teardown.
             let mut reader = std::fs::OpenOptions::new()

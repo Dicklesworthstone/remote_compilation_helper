@@ -493,14 +493,12 @@ fn load_archive(
             pair.len() == 2 && pair[0].as_str() == Some(path.as_str()),
             "archive path/order mismatch",
         )?;
-        let object =
-            parse_archive_key(pair[1].as_str().ok_or_else(|| invalid("object digest"))?)
-                .map_err(io::Error::other)?;
+        let object = parse_archive_key(pair[1].as_str().ok_or_else(|| invalid("object digest"))?)
+            .map_err(io::Error::other)?;
         objects.push(object);
     }
     require(
-        store.manifest_meta(&root).map_err(failure)?
-            == Some((KIND.to_owned(), plan.len() as u64)),
+        store.manifest_meta(&root).map_err(failure)? == Some((KIND.to_owned(), plan.len() as u64)),
         "archive metadata mismatch",
     )?;
     for object in &objects {
@@ -616,7 +614,10 @@ pub fn restore_delivery(
         mkdir(&staging.join("artifacts"))?;
         create_artifact_directories(
             &staging.join("artifacts"),
-            archive.plan.keys().filter_map(|path| path.strip_prefix("artifacts/")),
+            archive
+                .plan
+                .keys()
+                .filter_map(|path| path.strip_prefix("artifacts/")),
         )?;
         for ((path, item), object) in archive.plan.iter().zip(&archive.objects) {
             let target = staging.join(path);

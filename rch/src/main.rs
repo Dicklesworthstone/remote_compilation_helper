@@ -765,10 +765,6 @@ CHECKS PERFORMED:
         #[arg(long)]
         dry_run: bool,
 
-        /// Allow installing missing prerequisites (requires confirmation)
-        #[arg(long)]
-        install_deps: bool,
-
         /// Run reliability-focused diagnostics instead of the general doctor suite
         #[arg(long)]
         reliability: bool,
@@ -2357,7 +2353,6 @@ async fn dispatch_command(cli: Cli, ctx: Arc<OutputContext>) -> Result<()> {
             Commands::Doctor {
                 fix,
                 dry_run,
-                install_deps,
                 reliability,
                 check_schemas,
                 strict,
@@ -2373,7 +2368,6 @@ async fn dispatch_command(cli: Cli, ctx: Arc<OutputContext>) -> Result<()> {
                 handle_doctor(
                     fix,
                     dry_run,
-                    install_deps,
                     reliability,
                     check_schemas,
                     strict,
@@ -5743,7 +5737,6 @@ async fn handle_agents(action: AgentsAction, ctx: &OutputContext) -> Result<()> 
 async fn handle_doctor(
     fix: bool,
     dry_run: bool,
-    install_deps: bool,
     reliability: bool,
     check_schemas: bool,
     strict: bool,
@@ -5806,7 +5799,6 @@ async fn handle_doctor(
     let options = DoctorOptions {
         fix,
         dry_run,
-        install_deps,
         reliability,
         check_schemas,
         verbose: ctx.is_verbose(),
@@ -8338,7 +8330,6 @@ mod tests {
             Some(Commands::Doctor {
                 fix,
                 dry_run,
-                install_deps,
                 reliability,
                 check_schemas,
                 strict,
@@ -8347,7 +8338,6 @@ mod tests {
             }) => {
                 assert!(!fix);
                 assert!(!dry_run);
-                assert!(!install_deps);
                 assert!(!reliability);
                 assert!(!check_schemas);
                 assert!(!strict);
@@ -8365,7 +8355,6 @@ mod tests {
             Some(Commands::Doctor {
                 fix,
                 dry_run,
-                install_deps,
                 reliability,
                 check_schemas,
                 strict,
@@ -8374,7 +8363,6 @@ mod tests {
             }) => {
                 assert!(fix);
                 assert!(!dry_run);
-                assert!(!install_deps);
                 assert!(!reliability);
                 assert!(!check_schemas);
                 assert!(!strict);
@@ -8392,7 +8380,6 @@ mod tests {
             Some(Commands::Doctor {
                 fix,
                 dry_run,
-                install_deps,
                 reliability,
                 check_schemas,
                 strict,
@@ -8401,34 +8388,6 @@ mod tests {
             }) => {
                 assert!(!fix);
                 assert!(dry_run);
-                assert!(!install_deps);
-                assert!(!reliability);
-                assert!(!check_schemas);
-                assert!(!strict);
-                assert!(!lenient);
-            }
-            _ => fail_expected("Expected doctor command"),
-        }
-    }
-
-    #[test]
-    fn cli_parses_doctor_install_deps() {
-        let _guard = test_guard!();
-        let cli = Cli::try_parse_from(["rch", "doctor", "--install-deps"]).unwrap();
-        match cli.command {
-            Some(Commands::Doctor {
-                fix,
-                dry_run,
-                install_deps,
-                reliability,
-                check_schemas,
-                strict,
-                lenient,
-                ..
-            }) => {
-                assert!(!fix);
-                assert!(!dry_run);
-                assert!(install_deps);
                 assert!(!reliability);
                 assert!(!check_schemas);
                 assert!(!strict);
@@ -8446,7 +8405,6 @@ mod tests {
             Some(Commands::Doctor {
                 fix,
                 dry_run,
-                install_deps,
                 reliability,
                 check_schemas,
                 strict,
@@ -8455,7 +8413,6 @@ mod tests {
             }) => {
                 assert!(!fix);
                 assert!(!dry_run);
-                assert!(!install_deps);
                 assert!(reliability);
                 assert!(!check_schemas);
                 assert!(!strict);
@@ -8474,7 +8431,6 @@ mod tests {
             Some(Commands::Doctor {
                 fix,
                 dry_run,
-                install_deps,
                 reliability,
                 check_schemas,
                 strict,
@@ -8483,7 +8439,6 @@ mod tests {
             }) => {
                 assert!(!fix);
                 assert!(!dry_run);
-                assert!(!install_deps);
                 assert!(reliability);
                 assert!(check_schemas);
                 assert!(!strict);

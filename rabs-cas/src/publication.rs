@@ -2758,7 +2758,11 @@ mod tests {
                 ),
                 Err(StoreError::LeaseExpired)
             );
-            assert!(!store.has_publication(&prepared.authority.action_key).unwrap());
+            assert!(
+                !store
+                    .has_publication(&prepared.authority.action_key)
+                    .unwrap()
+            );
             assert!(
                 store
                     .list_evidence_keys(&prepared.authority.action_key)
@@ -2779,9 +2783,11 @@ mod tests {
         }
 
         let mut reference =
-            SqlMetadataStore::open(RusqliteEngine::open(&fresh_path("expiry-ref")).unwrap()).unwrap();
+            SqlMetadataStore::open(RusqliteEngine::open(&fresh_path("expiry-ref")).unwrap())
+                .unwrap();
         let mut candidate =
-            SqlMetadataStore::open(FsqliteEngine::open(&fresh_path("expiry-fsq")).unwrap()).unwrap();
+            SqlMetadataStore::open(FsqliteEngine::open(&fresh_path("expiry-fsq")).unwrap())
+                .unwrap();
         assert_eq!(scenario(&mut reference), scenario(&mut candidate));
     }
 
@@ -2810,7 +2816,11 @@ mod tests {
                 ),
                 Err(OfferRefusal::LeaseExpired)
             );
-            assert!(!store.has_publication(&prepared.authority.action_key).unwrap());
+            assert!(
+                !store
+                    .has_publication(&prepared.authority.action_key)
+                    .unwrap()
+            );
             assert!(
                 store
                     .list_evidence_keys(&prepared.authority.action_key)
@@ -2907,7 +2917,12 @@ mod tests {
             assert_eq!(clock.get(), 100);
             assert!(!store.has_publication(&row.action_key).unwrap());
             assert!(store.pin_row(row.pin_id).unwrap().is_none());
-            assert!(store.list_evidence_keys(&row.action_key).unwrap().is_empty());
+            assert!(
+                store
+                    .list_evidence_keys(&row.action_key)
+                    .unwrap()
+                    .is_empty()
+            );
             let after = store.differential_snapshot().unwrap();
             assert_eq!(after, before);
             after
@@ -3082,7 +3097,10 @@ mod tests {
                     .unwrap()
             );
             let after = store.differential_snapshot().unwrap();
-            assert_eq!(after, before, "expired same-key offers must leave no writes");
+            assert_eq!(
+                after, before,
+                "expired same-key offers must leave no writes"
+            );
             after
         }
 
@@ -3139,7 +3157,11 @@ mod tests {
             };
             // Causal sequence numbers must not be used as clock readings.
             assert_eq!(receipt.committed_causal_sequence, 10_000);
-            assert!(store.has_publication(&prepared.authority.action_key).unwrap());
+            assert!(
+                store
+                    .has_publication(&prepared.authority.action_key)
+                    .unwrap()
+            );
             store.differential_snapshot().unwrap()
         }
 
@@ -3193,7 +3215,11 @@ mod tests {
                 .unwrap(),
                 PublicationOutcome::Committed(_)
             ));
-            assert!(store.has_publication(&renewed.authority.action_key).unwrap());
+            assert!(
+                store
+                    .has_publication(&renewed.authority.action_key)
+                    .unwrap()
+            );
             let committed = store.differential_snapshot().unwrap();
             assert_eq!(
                 process_offer(

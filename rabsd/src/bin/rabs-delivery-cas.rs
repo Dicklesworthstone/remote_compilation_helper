@@ -22,11 +22,17 @@ const USAGE: &str = "rabs-delivery-cas archive CAS_ROOT REQUEST_JSON WORKER DELI
     This does not publish an action, authorize reuse, or rerun compilation.";
 
 fn trust(text: &str) -> Result<DeliveryTrust, String> {
-    if text == "loopback" { return Ok(DeliveryTrust::Loopback); }
-    let pin = text.strip_prefix("spki:").ok_or("TRUST must be loopback or spki:<digest>")?;
+    if text == "loopback" {
+        return Ok(DeliveryTrust::Loopback);
+    }
+    let pin = text
+        .strip_prefix("spki:")
+        .ok_or("TRUST must be loopback or spki:<digest>")?;
     let key = format!("{}:{pin}", rabs_cas::digest_set::ATP_OBJECT_CONTENT_DOMAIN);
     let pin = parse_archive_key(&key)?.bytes;
-    if pin == [0;32] { return Err("worker SPKI pin cannot be zero".to_owned()); }
+    if pin == [0; 32] {
+        return Err("worker SPKI pin cannot be zero".to_owned());
+    }
     Ok(DeliveryTrust::PinnedWorker(pin))
 }
 fn request(path: &Path) -> Result<serde_json::Value, String> {
@@ -36,8 +42,12 @@ fn request(path: &Path) -> Result<serde_json::Value, String> {
     }
     let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
     let mut bytes = Vec::new();
-    file.take(MAX_FRAME_BYTES as u64 + 1).read_to_end(&mut bytes).map_err(|e| e.to_string())?;
-    if bytes.len() > MAX_FRAME_BYTES { return Err("request exceeds its size limit".to_owned()); }
+    file.take(MAX_FRAME_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| e.to_string())?;
+    if bytes.len() > MAX_FRAME_BYTES {
+        return Err("request exceeds its size limit".to_owned());
+    }
     let value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
     validate_request(&value).map_err(|e| e.to_string())?;
     Ok(value)
@@ -47,21 +57,35 @@ fn run(args: &[String]) -> Result<serde_json::Value, String> {
         Some("install") if args.len() == 6 => {
             let request = request(Path::new(&args[1]))?;
             let trust = trust(&args[5])?;
-            Ok(install_delivery_outputs(&request, &args[2], Path::new(&args[3]),
-                Path::new(&args[4]), trust)?.to_json())
+            Ok(install_delivery_outputs(
+                &request,
+                &args[2],
+                Path::new(&args[3]),
+                Path::new(&args[4]),
+                trust,
+            )?
+            .to_json())
         }
         Some("archive") if args.len() == 6 => {
             let request = request(Path::new(&args[2]))?;
             let trust = trust(&args[5])?;
             let cas = mount_and_reconcile(Path::new(&args[1]))?;
-            Ok(archive_delivery(&cas,&request,&args[3],Path::new(&args[4]),trust)?.to_json())
+            Ok(archive_delivery(&cas, &request, &args[3], Path::new(&args[4]), trust)?.to_json())
         }
         Some("restore") if args.len() == 7 => {
             parse_archive_key(&args[2])?;
             let request = request(Path::new(&args[3]))?;
             let trust = trust(&args[6])?;
             let cas = mount_and_reconcile(Path::new(&args[1]))?;
-            Ok(restore_delivery(&cas,&args[2],&request,&args[4],Path::new(&args[5]),trust)?.to_json())
+            Ok(restore_delivery(
+                &cas,
+                &args[2],
+                &request,
+                &args[4],
+                Path::new(&args[5]),
+                trust,
+            )?
+            .to_json())
         }
         Some("finish-restore") if args.len() == 8 => {
             parse_archive_key(&args[2])?;
@@ -84,14 +108,21 @@ fn run(args: &[String]) -> Result<serde_json::Value, String> {
 }
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.first().is_some_and(|arg| arg == "--help" || arg == "-h") {
-        println!("{USAGE}"); return;
+    if args
+        .first()
+        .is_some_and(|arg| arg == "--help" || arg == "-h")
+    {
+        println!("{USAGE}");
+        return;
     }
     match run(&args) {
         Ok(value) => println!("{value}"),
         Err(error) => {
-            eprintln!("{}",serde_json::json!({"kind":"delivery-archive-error","reason":error,
-                "reexecute":false,"publication_authorized":false}));
+            eprintln!(
+                "{}",
+                serde_json::json!({"kind":"delivery-archive-error","reason":error,
+                "reexecute":false,"publication_authorized":false})
+            );
             std::process::exit(1);
         }
     }
@@ -102,9 +133,18 @@ mod tests {
     use super::*;
     #[test]
     fn trust_is_explicit_and_cannot_silently_downgrade() {
-        assert!(matches!(trust("loopback"),Ok(DeliveryTrust::Loopback)));
-        assert!(matches!(trust(&format!("spki:{}","01".repeat(32))),Ok(DeliveryTrust::PinnedWorker(_))));
-        for bad in ["", "auto", "spki:", "spki:ABC", &format!("spki:{}","00".repeat(32))] {
+        assert!(matches!(trust("loopback"), Ok(DeliveryTrust::Loopback)));
+        assert!(matches!(
+            trust(&format!("spki:{}", "01".repeat(32))),
+            Ok(DeliveryTrust::PinnedWorker(_))
+        ));
+        for bad in [
+            "",
+            "auto",
+            "spki:",
+            "spki:ABC",
+            &format!("spki:{}", "00".repeat(32)),
+        ] {
             assert!(trust(bad).is_err());
         }
     }

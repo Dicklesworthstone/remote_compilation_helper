@@ -2165,9 +2165,11 @@ impl TransferPipeline {
             // authority. Its probe must not wait behind the running command's
             // exclusive activity lease and stall diagnostic streaming.
             self.worker_ssh_command_with_activity(
-                worker, &["sh", "-c", &escape(Cow::from(script.as_str()))], false,
+                worker,
+                &["sh", "-c", &escape(Cow::from(script.as_str()))],
+                false,
             )
-                .output(),
+            .output(),
         )
         .await??;
         anyhow::ensure!(output.status.success(), "completion probe SSH failed");
@@ -9205,7 +9207,11 @@ Number of files transferred: 42
             escape(destination.to_string_lossy())
         );
         let server_args = [
-            "--server", "--sender", "-logDtpre.iLsfxCIvu", ".", "a '$literal; b",
+            "--server",
+            "--sender",
+            "-logDtpre.iLsfxCIvu",
+            ".",
+            "a '$literal; b",
         ];
         let remote = format!(
             "{} {}",
@@ -9217,7 +9223,10 @@ Number of files transferred: 42
                 .join(" ")
         );
         let output = std::process::Command::new("sh")
-            .arg("-c").arg(remote).output().unwrap();
+            .arg("-c")
+            .arg(remote)
+            .output()
+            .unwrap();
         assert!(output.status.success(), "{:?}", output);
         assert!(destination.is_dir());
         let expected: Vec<u8> = server_args
@@ -9233,7 +9242,10 @@ Number of files transferred: 42
             escape(denied.to_string_lossy())
         ));
         let output = std::process::Command::new("sh")
-            .arg("-c").arg(remote).output().unwrap();
+            .arg("-c")
+            .arg(remote)
+            .output()
+            .unwrap();
         assert!(!output.status.success());
         assert!(
             !denied.exists(),
@@ -9255,30 +9267,56 @@ Number of files transferred: 42
         )).unwrap();
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
         let mut pipeline = TransferPipeline::new(
-            directory.path().to_owned(), "activity".into(), "abcdef".into(),
+            directory.path().to_owned(),
+            "activity".into(),
+            "abcdef".into(),
             TransferConfig {
                 retry: RetryConfig {
-                    max_attempts: 3, base_delay_ms: 1, max_delay_ms: 1,
-                    jitter_factor: 0.0, total_timeout_ms: 30_000,
+                    max_attempts: 3,
+                    base_delay_ms: 1,
+                    max_delay_ms: 1,
+                    jitter_factor: 0.0,
+                    total_timeout_ms: 30_000,
                 },
                 ..TransferConfig::default()
             },
-        ).with_rsync(ResolvedRsync {
+        )
+        .with_rsync(ResolvedRsync {
             path: fake,
-            flavor: RsyncFlavor::Rsync { major: 3, minor: 2, patch: 7 },
-            version_line: String::new(), source: RsyncSource::Config, shadowed: None,
+            flavor: RsyncFlavor::Rsync {
+                major: 3,
+                minor: 2,
+                patch: 7,
+            },
+            version_line: String::new(),
+            source: RsyncSource::Config,
+            shadowed: None,
         });
         let worker = estimate_test_worker();
         pipeline.source_authority_prefix = Some("env RCH_ACTIVITY_TEST=owned".into());
         assert!(pipeline.sync_to_remote(&worker).await.is_err());
-        assert_eq!(std::fs::read_to_string(&counter).unwrap().lines().count(), 1);
-        assert!(pipeline.sync_to_remote_streaming(&worker, |_| {}).await.is_err());
-        assert_eq!(std::fs::read_to_string(&counter).unwrap().lines().count(), 2);
+        assert_eq!(
+            std::fs::read_to_string(&counter).unwrap().lines().count(),
+            1
+        );
+        assert!(
+            pipeline
+                .sync_to_remote_streaming(&worker, |_| {})
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&counter).unwrap().lines().count(),
+            2
+        );
         // Control: the ordinary transport still exercises the configured
         // three attempts. The owned failure must return for token cancellation.
         pipeline.source_authority_prefix = None;
         assert!(pipeline.sync_to_remote(&worker).await.is_err());
-        assert_eq!(std::fs::read_to_string(&counter).unwrap().lines().count(), 5);
+        assert_eq!(
+            std::fs::read_to_string(&counter).unwrap().lines().count(),
+            5
+        );
     }
 
     #[cfg(unix)]
@@ -9334,17 +9372,29 @@ Number of files transferred: 42
         let worker = estimate_test_worker();
         for command in [
             pipeline.build_sync_command(
-                &worker, "user@worker:/worker/sources/current", "/worker/sources/current", &[],
+                &worker,
+                "user@worker:/worker/sources/current",
+                "/worker/sources/current",
+                &[],
             ),
             pipeline.build_sync_streaming_command(
-                &worker, "user@worker:/worker/sources/current", "/worker/sources/current", &[],
+                &worker,
+                "user@worker:/worker/sources/current",
+                "/worker/sources/current",
+                &[],
             ),
         ] {
             let args: Vec<_> = command.as_std().get_args().collect();
-            let wrapper = args.windows(2)
-                .find(|pair| pair[0] == "--rsync-path").unwrap()[1].to_string_lossy();
+            let wrapper = args
+                .windows(2)
+                .find(|pair| pair[0] == "--rsync-path")
+                .unwrap()[1]
+                .to_string_lossy();
             assert!(!wrapper.contains("find /worker/pools"), "{wrapper}");
-            assert!(wrapper.contains("find /worker/sources/current"), "{wrapper}");
+            assert!(
+                wrapper.contains("find /worker/sources/current"),
+                "{wrapper}"
+            );
         }
     }
 

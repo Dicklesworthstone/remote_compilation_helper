@@ -34,7 +34,7 @@ members = [
 exclude = [".rch-tmp"]
 
 [workspace.package]
-version = "2.0.0"
+version = "2.1.1"
 edition = "2024"
 license = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
 authors = ["Remote Compilation Helper Contributors"]
@@ -166,7 +166,7 @@ rich_rust = { version = "0.2.3" }
 # Internal crates
 # Use default-features = false for cross-platform compatibility (rich-ui uses Unix-only rich_rust)
 # Crates that need rich-ui should explicitly enable it via features = ["rich-ui"]
-rch-common = { path = "rch-common", default-features = false }
+rch-common = { path = "rch-common", version = "2.1.0", default-features = false }
 
 [profile.release]
 opt-level = "z"

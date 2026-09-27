@@ -109,7 +109,7 @@ impl Cursor {
                 .as_str()
                 .filter(|value| {
                     value.len() <= MAX_PREVIEW_BYTES * 2
-                        && value.len() % 2 == 0
+                        && value.len().is_multiple_of(2)
                         && value
                             .bytes()
                             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
@@ -140,7 +140,7 @@ enum Completion {
     },
     Ready {
         status: Value,
-        proof: PreparedCompletion,
+        proof: Box<PreparedCompletion>,
     },
 }
 
@@ -310,7 +310,7 @@ fn follow(
                 wait::matches_status(&proof, status, id, &digest)?;
                 return Ok(Completion::Ready {
                     status: status.clone(),
-                    proof,
+                    proof: Box::new(proof),
                 });
             }
             _ => return Err(invalid("unknown job state; refusing follow completion")),
@@ -376,7 +376,7 @@ pub(super) fn run(args: &[String], socket: &str) -> i32 {
                 let _snapshot = proof.snapshot(until)?;
                 remaining(until)?;
                 let code = i32::from(proof.exit_code);
-                (status, Some(proof), code)
+                (status, Some(*proof), code)
             }
         };
         // Recovery can change the operation during the filesystem snapshot.
@@ -712,16 +712,26 @@ mod tests {
         }
         state["recovery_origin_attempt"] = json!(1);
         state["mode"] = json!("resume");
-        assert!(followed_owner(state, 2).is_err(), "network retry still requires its counter");
+        assert!(
+            followed_owner(state, 2).is_err(),
+            "network retry still requires its counter"
+        );
         state["mode"] = json!("recover-local");
         state["state"] = json!("queued");
-        assert!(followed_owner(state, 2).is_err(), "local repair is never a queued execution");
+        assert!(
+            followed_owner(state, 2).is_err(),
+            "local repair is never a queued execution"
+        );
         state["state"] = json!("running");
         state["recovery_pending"] = json!(true);
         assert!(followed_owner(state, 2).is_err());
         state["recovery_pending"] = json!(false);
         state["recovery_origin_attempt"] = Value::Null;
-        assert_eq!(followed_owner(state, 2).unwrap(), 2, "manual recovery is a new owner");
+        assert_eq!(
+            followed_owner(state, 2).unwrap(),
+            2,
+            "manual recovery is a new owner"
+        );
     }
 
     #[test]
@@ -736,13 +746,26 @@ mod tests {
             value
         };
         let proof = PreparedCompletion {
-            version: 1, operation_id: ID.into(), request_sha256: "ab".repeat(32),
-            delivery_request_sha256: "cd".repeat(32), receipt_sha256: "ef".repeat(32),
-            request_id: 7, worker: "worker".into(), worker_spki_sha256: "01".repeat(32),
-            delivery: "/delivery".into(), exit_code: 1, stop_reason: None,
+            version: 1,
+            operation_id: ID.into(),
+            request_sha256: "ab".repeat(32),
+            delivery_request_sha256: "cd".repeat(32),
+            receipt_sha256: "ef".repeat(32),
+            request_id: 7,
+            worker: "worker".into(),
+            worker_spki_sha256: "01".repeat(32),
+            delivery: "/delivery".into(),
+            exit_code: 1,
+            stop_reason: None,
             outputs_installed: false,
-            stdout: DiagnosticStream { bytes: 2, sha256: "00".repeat(32) },
-            stderr: DiagnosticStream { bytes: 0, sha256: "00".repeat(32) },
+            stdout: DiagnosticStream {
+                bytes: 2,
+                sha256: "00".repeat(32),
+            },
+            stderr: DiagnosticStream {
+                bytes: 0,
+                sha256: "00".repeat(32),
+            },
         };
         let mut replies = std::collections::VecDeque::from([
             status("running", 1),
@@ -755,24 +778,45 @@ mod tests {
         let mut queries = Vec::new();
         let mut events = Vec::new();
         let result = follow(
-            ID, Instant::now() + Duration::from_secs(2),
+            ID,
+            Instant::now() + Duration::from_secs(2),
             |query, _| {
                 queries.push(query["kind"].as_str().unwrap().to_owned());
                 Ok(replies.pop_front().unwrap())
             },
             |_| {},
-            |event| { events.push(event.clone()); Ok(()) },
-        ).unwrap();
-        let Completion::Ready { status: observed, proof: actual } = result else {
+            |event| {
+                events.push(event.clone());
+                Ok(())
+            },
+        )
+        .unwrap();
+        let Completion::Ready {
+            status: observed,
+            proof: actual,
+        } = result
+        else {
             panic!("lost the original compiler outcome")
         };
         assert!(replies.is_empty());
-        assert_eq!(events.len(), 1, "local recovery cannot replay compiler previews");
-        assert_eq!(queries, vec!["prepared-status", "prepared-preview", "prepared-status",
-            "prepared-status", "prepared-completion"]);
-        assert_eq!(actual, proof);
+        assert_eq!(
+            events.len(),
+            1,
+            "local recovery cannot replay compiler previews"
+        );
+        assert_eq!(
+            queries,
+            vec![
+                "prepared-status",
+                "prepared-preview",
+                "prepared-status",
+                "prepared-status",
+                "prepared-completion"
+            ]
+        );
+        assert_eq!(*actual, proof);
         assert_eq!(observed["attempt"], 2);
-        final_status(&observed, &local("completed"), ID, Some(&actual)).unwrap();
+        final_status(&observed, &local("completed"), ID, Some(&*actual)).unwrap();
     }
 
     #[test]
@@ -944,8 +988,8 @@ mod tests {
             panic!("lost compiler outcome")
         };
         assert_eq!(actual.exit_code, 1);
-        assert_eq!(actual, proof);
-        final_status(&observed, &status("completed", 1), ID, Some(&actual)).unwrap();
+        assert_eq!(*actual, proof);
+        final_status(&observed, &status("completed", 1), ID, Some(&*actual)).unwrap();
         for (field, value) in [
             ("attempt", json!(2)),
             ("state", json!("queued")),

@@ -3,6 +3,11 @@ name = "rch-wkr"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 description = "Remote Compilation Helper - Worker agent for remote execution"
 
 [[bin]]
@@ -24,7 +29,7 @@ chrono = { workspace = true }
 dirs = { workspace = true }
 schemars = { workspace = true }
 tempfile = "3.25.0"
-rch-telemetry = { path = "../rch-telemetry", default-features = false }
+rch-telemetry = { path = "../rch-telemetry", version = "2.1.0", default-features = false }
 
 [lints.rust]
 unsafe_code = "forbid"

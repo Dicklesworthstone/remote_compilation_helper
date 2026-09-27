@@ -129,6 +129,33 @@ impl HookOutput {
     pub fn is_allow(&self) -> bool {
         matches!(self, Self::Allow(_) | Self::AllowWithModifiedCommand(_))
     }
+
+    /// Serialize for Claude Code, carrying the original tool input through.
+    ///
+    /// `updatedInput` replaces the entire tool input, so a rewrite that sends
+    /// only `command` silently drops the Bash tool's other fields: an offloaded
+    /// build lost the agent's extended `timeout` (and was killed at the default)
+    /// and its `run_in_background`. Every original field other than `command` is
+    /// copied into `updatedInput` unchanged.
+    pub fn to_hook_json(
+        &self,
+        original_tool_input: Option<&serde_json::Value>,
+    ) -> serde_json::Result<String> {
+        let mut value = serde_json::to_value(self)?;
+        if let (Self::AllowWithModifiedCommand(_), Some(serde_json::Value::Object(original))) =
+            (self, original_tool_input)
+            && let Some(updated) = value
+                .pointer_mut("/hookSpecificOutput/updatedInput")
+                .and_then(serde_json::Value::as_object_mut)
+        {
+            for (key, field) in original {
+                updated
+                    .entry(key.clone())
+                    .or_insert_with(|| field.clone());
+            }
+        }
+        serde_json::to_string(&value)
+    }
 }
 
 #[cfg(test)]
@@ -468,5 +495,38 @@ mod tests {
         assert!(hook_output.get("updatedInput").is_some());
         let updated_input = hook_output.get("updatedInput").unwrap();
         assert_eq!(updated_input.get("command").unwrap(), "true");
+    }
+
+    #[test]
+    fn test_to_hook_json_carries_original_tool_input_fields() {
+        let original = serde_json::json!({
+            "command": "cargo test",
+            "timeout": 600_000,
+            "run_in_background": true,
+            "description": "Run the suite",
+        });
+        let output = HookOutput::allow_with_modified_command("rch exec -- cargo test");
+        let json = output.to_hook_json(Some(&original)).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let updated = &parsed["hookSpecificOutput"]["updatedInput"];
+        assert_eq!(updated["command"], "rch exec -- cargo test");
+        assert_eq!(updated["timeout"], 600_000);
+        assert_eq!(updated["run_in_background"], true);
+        assert_eq!(updated["description"], "Run the suite");
+    }
+
+    #[test]
+    fn test_to_hook_json_leaves_deny_and_missing_input_untouched() {
+        let original = serde_json::json!({"command": "x", "timeout": 5});
+        let deny = HookOutput::deny("no");
+        assert_eq!(
+            deny.to_hook_json(Some(&original)).unwrap(),
+            serde_json::to_string(&deny).unwrap()
+        );
+        let modified = HookOutput::allow_with_modified_command("true");
+        assert_eq!(
+            modified.to_hook_json(None).unwrap(),
+            serde_json::to_string(&modified).unwrap()
+        );
     }
 }

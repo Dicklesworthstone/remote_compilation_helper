@@ -186,9 +186,7 @@ impl FairQueue {
         // Consume the charge fixed at admission, even for override winners.
         // Recomputing cost at the current weight would reprice pending work.
         // An older item served after an urgent one must not rewind the clock.
-        let new_vt = self
-            .virtual_time_of(&item.tenant)
-            .max(item.virtual_finish);
+        let new_vt = self.virtual_time_of(&item.tenant).max(item.virtual_finish);
         self.advance_virtual_time(&item.tenant, new_vt);
         Some(item)
     }

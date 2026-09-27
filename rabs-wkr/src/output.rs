@@ -31,7 +31,10 @@ impl CapturedStream {
     /// the blocking execution owner, never the async control reactor.
     pub fn from_reader(mut reader: impl Read, len: u64) -> io::Result<Self> {
         if len > MAX_RETAINED_STREAM_BYTES {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "output retention limit exceeded"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "output retention limit exceeded",
+            ));
         }
         let mut file = tempfile::tempfile()?;
         let mut hasher = Sha256::new();
@@ -51,11 +54,18 @@ impl CapturedStream {
             Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {}
             Err(error) => return Err(error),
             Ok(()) => {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "output exceeds its receipt"));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "output exceeds its receipt",
+                ));
             }
         }
         file.flush()?;
-        let sha256 = hasher.finalize().iter().map(|byte| format!("{byte:02x}")).collect();
+        let sha256 = hasher
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
         Ok(Self { file, len, sha256 })
     }
 
@@ -66,7 +76,10 @@ impl CapturedStream {
             .checked_add(lane.spilled_bytes())
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "output length overflow"))?;
         if expected != lane.total_bytes() || expected > MAX_RETAINED_STREAM_BYTES {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid output capture length"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid output capture length",
+            ));
         }
         let head = Cursor::new(lane.resident());
         match lane.spill() {
@@ -75,7 +88,10 @@ impl CapturedStream {
                 let file = File::open(&spill.path)?;
                 let metadata = file.metadata()?;
                 if !metadata.is_file() || metadata.len() != spill.bytes {
-                    return Err(io::Error::new(io::ErrorKind::InvalidData, "spill receipt mismatch"));
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "spill receipt mismatch",
+                    ));
                 }
                 Self::from_reader(head.chain(file), expected)
             }
@@ -105,7 +121,10 @@ impl CapturedStream {
     /// offset-plus-length arithmetic can wrap and no read allocates past the cap.
     pub fn read_chunk(&mut self, offset: u64, max_bytes: usize) -> io::Result<Vec<u8>> {
         if offset > self.len || max_bytes == 0 || max_bytes > MAX_OUTPUT_CHUNK_BYTES {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid output range"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid output range",
+            ));
         }
         let count = usize::try_from((self.len - offset).min(max_bytes as u64))
             .map_err(|_| io::Error::other("output range does not fit a chunk"))?;
@@ -142,7 +161,9 @@ mod tests {
 
     #[test]
     fn binary_ranges_are_replayable_bounded_and_hash_the_complete_stream() {
-        let bytes: Vec<u8> = (0..MAX_OUTPUT_CHUNK_BYTES * 2 + 13).map(|i| (i % 256) as u8).collect();
+        let bytes: Vec<u8> = (0..MAX_OUTPUT_CHUNK_BYTES * 2 + 13)
+            .map(|i| (i % 256) as u8)
+            .collect();
         let mut stream = CapturedStream::from_reader(bytes.as_slice(), bytes.len() as u64).unwrap();
         assert_eq!(stream.sha256(), crate::session::sha256_hex(&bytes));
         let first = stream.read_chunk(0, MAX_OUTPUT_CHUNK_BYTES).unwrap();
@@ -150,12 +171,19 @@ mod tests {
         assert_eq!(stream.read_chunk(0, MAX_OUTPUT_CHUNK_BYTES).unwrap(), first);
         let mut restored = first;
         while (restored.len() as u64) < stream.len() {
-            restored.extend(stream.read_chunk(restored.len() as u64, MAX_OUTPUT_CHUNK_BYTES).unwrap());
+            restored.extend(
+                stream
+                    .read_chunk(restored.len() as u64, MAX_OUTPUT_CHUNK_BYTES)
+                    .unwrap(),
+            );
         }
         assert_eq!(restored, bytes);
         assert!(stream.read_chunk(stream.len(), 1).unwrap().is_empty());
         for (offset, size) in [(0, 0), (0, MAX_OUTPUT_CHUNK_BYTES + 1), (u64::MAX, 1)] {
-            assert_eq!(stream.read_chunk(offset, size).unwrap_err().kind(), io::ErrorKind::InvalidInput);
+            assert_eq!(
+                stream.read_chunk(offset, size).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput
+            );
         }
     }
 
@@ -165,8 +193,18 @@ mod tests {
         assert!(empty.is_empty());
         assert_eq!(empty.sha256(), crate::session::sha256_hex(b""));
         assert!(empty.read_chunk(0, 1).unwrap().is_empty());
-        assert_eq!(CapturedStream::from_reader(&b"x"[..], 2).unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
-        assert_eq!(CapturedStream::from_reader(&b"xy"[..], 1).unwrap_err().kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            CapturedStream::from_reader(&b"x"[..], 2)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+        assert_eq!(
+            CapturedStream::from_reader(&b"xy"[..], 1)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
         assert!(CapturedStream::from_reader(&b"x"[..], 0).is_err());
         assert!(CapturedStream::from_reader(io::empty(), MAX_RETAINED_STREAM_BYTES + 1).is_err());
     }
@@ -179,10 +217,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut child = Command::new("sh")
             .args(["-c", "printf 'A\\000\\377B'; printf 'err\\n' >&2"])
-            .stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
-        let (stdout, stderr) = spawn_lanes(&mut child, &DrainLimits {
-            resident_bound: 2, spill_dir: dir.path().to_path_buf(),
-        });
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let (stdout, stderr) = spawn_lanes(
+            &mut child,
+            &DrainLimits {
+                resident_bound: 2,
+                spill_dir: dir.path().to_path_buf(),
+            },
+        );
         assert!(child.wait().unwrap().success());
         let stdout = join_lane(stdout.unwrap()).unwrap();
         let stderr = join_lane(stderr.unwrap()).unwrap();
@@ -191,7 +236,10 @@ mod tests {
         std::fs::write(&stderr.spill().unwrap().path, b"replaced").unwrap();
         assert_eq!(captured.stdout.read_chunk(0, 10).unwrap(), b"A\0\xffB");
         assert_eq!(captured.stderr.read_chunk(0, 10).unwrap(), b"err\n");
-        assert_eq!(captured.stdout.sha256(), crate::session::sha256_hex(b"A\0\xffB"));
+        assert_eq!(
+            captured.stdout.sha256(),
+            crate::session::sha256_hex(b"A\0\xffB")
+        );
         assert!(CapturedOutputs::from_lanes(&stdout, &stderr).is_err());
     }
 }

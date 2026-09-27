@@ -368,7 +368,10 @@ async fn authenticate_offer(
         assert!(grant.get("execution_lease").is_none());
         json!({"kind":"result-resume", "request_id":7, "request":request()})
     } else {
-        assert_eq!(grant["execution_lease"]["request_id"], request()["request_id"]);
+        assert_eq!(
+            grant["execution_lease"]["request_id"],
+            request()["request_id"]
+        );
         assert_eq!(
             grant["execution_lease"]["request_sha256"],
             hash(&serde_json::to_vec(&request()).unwrap())
@@ -1580,7 +1583,9 @@ async fn receive_prepared_source(
             );
             let bytes: Vec<u8> = encoded
                 .as_bytes()
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
                 .collect();
             assert_eq!(frame["chunk_sha256"], hash(&bytes));
@@ -1705,7 +1710,9 @@ async fn receive_prepared_toolchain(
                 );
                 let bytes: Vec<u8> = encoded
                     .as_bytes()
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
                     .collect();
                 assert_eq!(frame["chunk_sha256"], hash(&bytes));
@@ -2034,7 +2041,10 @@ fn actual_prepared_build_uploads_installs_and_replays_offline_after_ack_loss() {
                 offered["source_transfers"] = json!([SOURCE_TRANSFER]);
                 let (session, grant) = authenticate_grant(&mut peer.stream, &pin, &offered).await;
                 assert_eq!(grant["source_transfer"], SOURCE_TRANSFER);
-                assert_eq!(grant["execution_lease"]["request_id"], request["request_id"]);
+                assert_eq!(
+                    grant["execution_lease"]["request_id"],
+                    request["request_id"]
+                );
                 assert_eq!(
                     grant["execution_lease"]["request_sha256"],
                     hash(&serde_json::to_vec(&request).unwrap())
@@ -2108,24 +2118,46 @@ fn actual_prepared_build_uploads_installs_and_replays_offline_after_ack_loss() {
     // without executing again or replacing the already installed output.
     let resumed_delivery = root.join("release-reconciled-delivery");
     let mut resumed = Receiver::spawn_build(
-        &root, &pin, Some(&certificates.server), &bundle, &resumed_delivery, &outputs, true,
+        &root,
+        &pin,
+        Some(&certificates.server),
+        &bundle,
+        &resumed_delivery,
+        &outputs,
+        true,
     );
     let address = resumed.listening();
     runtime.block_on(async {
         asupersync::time::timeout(
-            asupersync::time::wall_now(), Duration::from_secs(15), async {
+            asupersync::time::wall_now(),
+            Duration::from_secs(15),
+            async {
                 let mut peer = connect_peer(&address, "localhost", &certificates.worker)
-                    .await.unwrap();
+                    .await
+                    .unwrap();
                 let (session, grant) =
                     authenticate_grant(&mut peer.stream, &pin, &recovery_hello(&pin)).await;
                 assert_eq!(grant["result_retention"], "durable-result-v1");
                 assert!(grant.get("source_transfer").is_none());
-                assert_eq!(receive(&mut peer.stream).await.unwrap(),
-                    json!({"kind":"result-resume", "request_id":7, "request":request}));
+                assert_eq!(
+                    receive(&mut peer.stream).await.unwrap(),
+                    json!({"kind":"result-resume", "request_id":7, "request":request})
+                );
                 assert_eq!(fs::read(outputs.join("a")).unwrap(), ARTIFACT);
-                deliver_mode(&mut peer.stream, &resumed_delivery, &pin, session, false, true, false).await;
+                deliver_mode(
+                    &mut peer.stream,
+                    &resumed_delivery,
+                    &pin,
+                    session,
+                    false,
+                    true,
+                    false,
+                )
+                .await;
             },
-        ).await.expect("prepared build release reconciliation timed out");
+        )
+        .await
+        .expect("prepared build release reconciliation timed out");
     });
     assert!(resumed.wait().success(), "{}", resumed.logs());
     let reconciled: Value = serde_json::from_slice(&fs::read(&resumed.stdout).unwrap()).unwrap();

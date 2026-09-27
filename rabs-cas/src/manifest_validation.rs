@@ -163,7 +163,9 @@ fn validate_symlink<'a>(
         };
         steps += 1;
         if steps > MAX_SYMLINK_COMPONENT_STEPS {
-            return Err(ManifestViolation::SymlinkResolutionLimit(member_path.into()));
+            return Err(ManifestViolation::SymlinkResolutionLimit(
+                member_path.into(),
+            ));
         }
         // Even `file/.`, `file/..`, and `file/` require a directory.
         // Lexically cancelling `file/..` would invent an accessible path.
@@ -202,7 +204,9 @@ fn validate_symlink<'a>(
             }
             expansions += 1;
             if expansions > MAX_SYMLINK_EXPANSIONS {
-                return Err(ManifestViolation::SymlinkResolutionLimit(member_path.into()));
+                return Err(ManifestViolation::SymlinkResolutionLimit(
+                    member_path.into(),
+                ));
             }
             resolved.pop();
             pending.push(ResolveStep::EndLink(link_path));
@@ -227,7 +231,10 @@ fn validate_member_path(path: &str) -> Result<(), ManifestViolation> {
     if path.split('/').any(|component| component == "..") {
         return Err(ManifestViolation::DotDotComponent(path.into()));
     }
-    if path.split('/').any(|component| component.is_empty() || component == ".") {
+    if path
+        .split('/')
+        .any(|component| component.is_empty() || component == ".")
+    {
         return Err(ManifestViolation::NonCanonicalPath(path.into()));
     }
     // The wire namespace uses slash separators, never host-specific drive,
@@ -266,7 +273,11 @@ pub fn validate_manifest(members: &[ManifestMember]) -> Result<(), ManifestViola
         // Include every implied directory. Merely comparing full paths
         // misses `Out/a` versus `out/b`, whose directory topology differs
         // between case-sensitive and case-insensitive filesystems.
-        for end in path.match_indices('/').map(|(at, _)| at).chain([path.len()]) {
+        for end in path
+            .match_indices('/')
+            .map(|(at, _)| at)
+            .chain([path.len()])
+        {
             let prefix = &path[..end];
             let key = equivalence_key(prefix);
             if let Some(prior) = seen_equivalent.get(&key) {
@@ -365,7 +376,9 @@ mod tests {
     fn symlink(path: &str, target: &str) -> ManifestMember {
         ManifestMember {
             path: path.into(),
-            kind: ManifestMemberKind::Symlink { target: target.into() },
+            kind: ManifestMemberKind::Symlink {
+                target: target.into(),
+            },
         }
     }
 
@@ -389,7 +402,13 @@ mod tests {
 
     #[test]
     fn host_specific_member_names_are_not_wire_paths() {
-        for path in ["C:/escape", "C:escape", "out/stream:data", "out\\..\\escape", "\\\\host\\share"] {
+        for path in [
+            "C:/escape",
+            "C:escape",
+            "out/stream:data",
+            "out\\..\\escape",
+            "\\\\host\\share",
+        ] {
             assert_eq!(
                 validate_manifest(&[file(path)]),
                 Err(ManifestViolation::NonPortablePath(path.into())),
@@ -415,12 +434,16 @@ mod tests {
     fn implicit_directory_aliases_are_rejected_even_with_different_leaf_names() {
         assert_eq!(
             validate_manifest(&[file("Out/a"), file("out/b")]),
-            Err(ManifestViolation::CaseEquivalentCollision("Out".into(), "out".into())),
+            Err(ManifestViolation::CaseEquivalentCollision(
+                "Out".into(),
+                "out".into()
+            )),
         );
         assert_eq!(
             validate_manifest(&[file("caf\u{e9}/a"), file("cafe\u{301}/b")]),
             Err(ManifestViolation::UnicodeEquivalentCollision(
-                "caf\u{e9}".into(), "cafe\u{301}".into(),
+                "caf\u{e9}".into(),
+                "cafe\u{301}".into(),
             )),
         );
         assert!(matches!(
@@ -478,7 +501,8 @@ mod tests {
             assert_eq!(
                 validate_manifest(&[target, hardlink("alias", "target")]),
                 Err(ManifestViolation::InvalidHardlinkTarget {
-                    link: "alias".into(), to: "target".into(),
+                    link: "alias".into(),
+                    to: "target".into(),
                 }),
             );
         }
@@ -500,15 +524,13 @@ mod tests {
     fn symlink_chains_cannot_hide_root_escapes_in_either_declaration_order() {
         // Both targets pass lexical depth counting. Resolving `a/up`
         // first lands at the root, so the following `..` escapes it.
-        let mut members = vec![
-            symlink("a/up", ".."),
-            symlink("escape", "a/up/../outside"),
-        ];
+        let mut members = vec![symlink("a/up", ".."), symlink("escape", "a/up/../outside")];
         for _ in 0..2 {
             assert_eq!(
                 validate_manifest(&members),
                 Err(ManifestViolation::SymlinkEscape {
-                    link: "escape".into(), target: "a/up/../outside".into(),
+                    link: "escape".into(),
+                    target: "a/up/../outside".into(),
                 }),
             );
             members.reverse();
@@ -536,10 +558,13 @@ mod tests {
             vec![symlink("a", "b/child"), symlink("b", "a/child")],
             vec![symlink("a", "b"), symlink("b", "c"), symlink("c", "a")],
         ] {
-            assert!(matches!(
-                validate_manifest(&members),
-                Err(ManifestViolation::SymlinkCycle { .. })
-            ), "accepted cyclic namespace {members:?}");
+            assert!(
+                matches!(
+                    validate_manifest(&members),
+                    Err(ManifestViolation::SymlinkCycle { .. })
+                ),
+                "accepted cyclic namespace {members:?}"
+            );
         }
     }
 
@@ -564,22 +589,34 @@ mod tests {
             ));
         }
         assert!(matches!(
-            validate_manifest(&[file("caf\u{e9}/artifact"), symlink("result", "cafe\u{301}/artifact")]),
+            validate_manifest(&[
+                file("caf\u{e9}/artifact"),
+                symlink("result", "cafe\u{301}/artifact")
+            ]),
             Err(ManifestViolation::InvalidSymlinkTarget { .. })
         ));
     }
 
     #[test]
     fn symlink_targets_must_not_walk_through_regular_files_or_hardlinks() {
-        for target in ["artifact/child", "artifact/..", "artifact/.", "artifact/", "alias/../outside"] {
-            assert!(matches!(
-                validate_manifest(&[
-                    file("artifact"),
-                    hardlink("alias", "artifact"),
-                    symlink("result", target),
-                ]),
-                Err(ManifestViolation::InvalidSymlinkTarget { .. })
-            ), "accepted non-directory traversal {target:?}");
+        for target in [
+            "artifact/child",
+            "artifact/..",
+            "artifact/.",
+            "artifact/",
+            "alias/../outside",
+        ] {
+            assert!(
+                matches!(
+                    validate_manifest(&[
+                        file("artifact"),
+                        hardlink("alias", "artifact"),
+                        symlink("result", target),
+                    ]),
+                    Err(ManifestViolation::InvalidSymlinkTarget { .. })
+                ),
+                "accepted non-directory traversal {target:?}"
+            );
         }
         assert_eq!(
             validate_manifest(&[file("artifact"), symlink("result", "artifact")]),

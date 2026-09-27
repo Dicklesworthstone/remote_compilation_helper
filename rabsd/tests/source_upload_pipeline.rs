@@ -20,9 +20,13 @@ fn hex(bytes: &[u8]) -> String {
 
 fn decode(value: &str) -> Vec<u8> {
     assert_eq!(value.len() % 2, 0);
-    value.as_bytes().chunks_exact(2).map(|pair| {
-        u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap()
-    }).collect()
+    value
+        .as_bytes()
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+        .collect()
 }
 
 struct Fixture {
@@ -42,16 +46,30 @@ impl Fixture {
             fs::create_dir_all(path.parent().unwrap()).unwrap();
             fs::write(path, bytes).unwrap();
         }
-        fs::write(root.join("unselected.txt"), b"not approved for transmission").unwrap();
+        fs::write(
+            root.join("unselected.txt"),
+            b"not approved for transmission",
+        )
+        .unwrap();
         let image = capture_sealed_source(
-            &[("workspace".into(), root.clone())], false, 2, 8 * 1024 * 1024,
-        ).unwrap();
+            &[("workspace".into(), root.clone())],
+            false,
+            2,
+            8 * 1024 * 1024,
+        )
+        .unwrap();
         let paths: Vec<_> = files.keys().cloned().collect();
         let upload = SourceUpload::from_snapshot(Arc::new(image), "workspace", &paths).unwrap();
         let request = json!({"kind":"canonical-exec", "request_id":17,
             "program":"rustc", "args":["lib.rs"], "toolchain_backing":"/tc",
             "source_manifest":upload.wire_manifest()});
-        Self { _owner:owner, root, files, upload, request }
+        Self {
+            _owner: owner,
+            root,
+            files,
+            upload,
+            request,
+        }
     }
 
     fn transfer(&self, peer: &mut ReceiverPeer) -> io::Result<()> {
@@ -94,11 +112,21 @@ struct ReceiverPeer {
 impl ReceiverPeer {
     fn new(fixture: &Fixture) -> Self {
         Self {
-            owner:tempfile::tempdir().unwrap(), receiver:None,
-            files:fixture.files.clone(), missing:None, replies:VecDeque::new(),
-            sent:Vec::new(), pending:0, pending_bytes:0, maximum_pending:0,
-            maximum_pending_bytes:0, draining:false, batches:Vec::new(),
-            chunks:0, acks:0, fault:Fault::None,
+            owner: tempfile::tempdir().unwrap(),
+            receiver: None,
+            files: fixture.files.clone(),
+            missing: None,
+            replies: VecDeque::new(),
+            sent: Vec::new(),
+            pending: 0,
+            pending_bytes: 0,
+            maximum_pending: 0,
+            maximum_pending_bytes: 0,
+            draining: false,
+            batches: Vec::new(),
+            chunks: 0,
+            acks: 0,
+            fault: Fault::None,
         }
     }
 
@@ -111,8 +139,18 @@ impl ReceiverPeer {
         assert!(self.replies.is_empty());
         assert_eq!(self.pending, 0);
         assert_eq!(self.pending_bytes, 0);
-        assert_eq!(self.sent.iter().filter(|frame| frame["kind"] == "source-seal").count(), 1);
-        assert!(self.sent.iter().all(|frame| frame["kind"] != "canonical-exec"));
+        assert_eq!(
+            self.sent
+                .iter()
+                .filter(|frame| frame["kind"] == "source-seal")
+                .count(),
+            1
+        );
+        assert!(
+            self.sent
+                .iter()
+                .all(|frame| frame["kind"] != "canonical-exec")
+        );
     }
 }
 
@@ -129,13 +167,20 @@ impl WorkerPeer for ReceiverPeer {
                 assert!(self.receiver.is_none());
                 let manifest = request_manifest(&json!({"source_manifest":frame["manifest"]}))?
                     .expect("source manifest");
-                let mut receiver = SourceReceiver::create(&self.owner.path().join("source"), manifest)?;
+                let mut receiver =
+                    SourceReceiver::create(&self.owner.path().join("source"), manifest)?;
                 if let Some(missing) = &self.missing {
                     for (name, bytes) in &self.files {
-                        if missing.contains(name) { continue; }
+                        if missing.contains(name) {
+                            continue;
+                        }
                         for (index, chunk) in bytes.chunks(MAX_SOURCE_CHUNK).enumerate() {
-                            receiver.write_chunk(name, (index * MAX_SOURCE_CHUNK) as u64,
-                                chunk, Sha256::digest(chunk).into())?;
+                            receiver.write_chunk(
+                                name,
+                                (index * MAX_SOURCE_CHUNK) as u64,
+                                chunk,
+                                Sha256::digest(chunk).into(),
+                            )?;
                         }
                     }
                 }
@@ -148,7 +193,10 @@ impl WorkerPeer for ReceiverPeer {
                 self.replies.push_back((reply, 0));
             }
             Some("source-chunk") => {
-                assert!(!self.draining, "do not refill before the previous batch drains");
+                assert!(
+                    !self.draining,
+                    "do not refill before the previous batch drains"
+                );
                 self.chunks += 1;
                 self.pending += 1;
                 let encoded_size = serde_json::to_vec(frame)?.len();
@@ -156,27 +204,43 @@ impl WorkerPeer for ReceiverPeer {
                 self.maximum_pending = self.maximum_pending.max(self.pending);
                 self.maximum_pending_bytes = self.maximum_pending_bytes.max(self.pending_bytes);
                 assert!(self.pending <= 4, "bounded source pipeline");
-                assert!(self.pending_bytes < 2 * 1024 * 1024, "worker deferred byte limit");
+                assert!(
+                    self.pending_bytes < 2 * 1024 * 1024,
+                    "worker deferred byte limit"
+                );
                 let path = frame["path"].as_str().unwrap();
                 let bytes = decode(frame["data_hex"].as_str().unwrap());
                 let claimed_hash: [u8; 32] = decode(frame["chunk_sha256"].as_str().unwrap())
-                    .try_into().unwrap();
+                    .try_into()
+                    .unwrap();
                 let next = self.receiver.as_mut().unwrap().write_chunk(
-                    path, frame["offset"].as_u64().unwrap(), &bytes, claimed_hash,
+                    path,
+                    frame["offset"].as_u64().unwrap(),
+                    &bytes,
+                    claimed_hash,
                 )?;
-                self.replies.push_back((json!({"kind":"source-chunk-accepted",
+                self.replies.push_back((
+                    json!({"kind":"source-chunk-accepted",
                     "request_id":id, "manifest_sha256":identity, "path":path,
-                    "next_offset":next}), encoded_size));
+                    "next_offset":next}),
+                    encoded_size,
+                ));
                 if matches!(self.fault, Fault::FailThirdWrite) && self.chunks == 3 {
-                    return Err(io::Error::new(io::ErrorKind::BrokenPipe, "possibly accepted third write"));
+                    return Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "possibly accepted third write",
+                    ));
                 }
             }
             Some("source-seal") => {
                 assert_eq!(self.pending, 0, "seal cannot overtake any acknowledgment");
                 assert!(self.replies.is_empty());
                 self.receiver.as_mut().unwrap().seal()?;
-                self.replies.push_back((json!({"kind":"source-ready", "request_id":id,
-                    "manifest_sha256":identity, "sealed":true}), 0));
+                self.replies.push_back((
+                    json!({"kind":"source-ready", "request_id":id,
+                    "manifest_sha256":identity, "sealed":true}),
+                    0,
+                ));
             }
             _ => panic!("source transfer cannot execute work: {frame}"),
         }
@@ -184,7 +248,9 @@ impl WorkerPeer for ReceiverPeer {
     }
 
     fn receive(&mut self) -> io::Result<Value> {
-        let (mut reply, bytes) = self.replies.pop_front()
+        let (mut reply, bytes) = self
+            .replies
+            .pop_front()
             .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "missing source reply"))?;
         if reply["kind"] == "source-chunk-accepted" {
             if !self.draining {
@@ -198,9 +264,16 @@ impl WorkerPeer for ReceiverPeer {
             if self.acks == 1 {
                 match self.fault {
                     Fault::ForeignFirstAck => reply["request_id"] = json!(18),
-                    Fault::WrongManifestFirstAck => reply["manifest_sha256"] = json!("00".repeat(32)),
+                    Fault::WrongManifestFirstAck => {
+                        reply["manifest_sha256"] = json!("00".repeat(32))
+                    }
                     Fault::RegressingFirstAck => reply["next_offset"] = json!(0),
-                    Fault::TimeoutFirstAck => return Err(io::Error::new(io::ErrorKind::TimedOut, "absolute upload deadline")),
+                    Fault::TimeoutFirstAck => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "absolute upload deadline",
+                        ));
+                    }
                     Fault::None | Fault::FailThirdWrite => {}
                 }
             }
@@ -211,23 +284,32 @@ impl WorkerPeer for ReceiverPeer {
 
 #[test]
 fn source_pipeline_batches_small_files_across_file_boundaries() {
-    let fixture = Fixture::new((0..11).map(|index| {
-        (format!("src/f{index:02}"), vec![index as u8, 0, 255])
-    }).collect());
+    let fixture = Fixture::new(
+        (0..11)
+            .map(|index| (format!("src/f{index:02}"), vec![index as u8, 0, 255]))
+            .collect(),
+    );
     let original = fixture.request.clone();
     let mut peer = ReceiverPeer::new(&fixture);
     fixture.transfer(&mut peer).unwrap();
     peer.assert_complete();
-    assert_eq!(peer.batches, [4, 4, 3], "serial send/ack must not pass this gate");
+    assert_eq!(
+        peer.batches,
+        [4, 4, 3],
+        "serial send/ack must not pass this gate"
+    );
     assert_eq!(peer.maximum_pending, 4);
     assert_eq!(fixture.request, original);
 }
 
 #[test]
 fn source_pipeline_uses_captured_binary_chunks_and_drains_the_partial_batch() {
-    let bytes: Vec<_> = (0..9 * MAX_SOURCE_CHUNK + 13).map(|n| (n % 251) as u8).collect();
+    let bytes: Vec<_> = (0..9 * MAX_SOURCE_CHUNK + 13)
+        .map(|n| (n % 251) as u8)
+        .collect();
     let fixture = Fixture::new(BTreeMap::from([
-        ("empty".into(), Vec::new()), ("src/lib.rs".into(), bytes.clone()),
+        ("empty".into(), Vec::new()),
+        ("src/lib.rs".into(), bytes.clone()),
     ]));
     fs::write(fixture.root.join("src/lib.rs"), b"new mutable checkout").unwrap();
     let mut peer = ReceiverPeer::new(&fixture);
@@ -235,40 +317,77 @@ fn source_pipeline_uses_captured_binary_chunks_and_drains_the_partial_batch() {
     peer.assert_complete();
     assert_eq!(peer.batches, [4, 4, 2]);
     assert_eq!(peer.maximum_pending, 4);
-    let offsets: Vec<_> = peer.sent.iter().filter(|frame| frame["kind"] == "source-chunk")
-        .map(|frame| frame["offset"].as_u64().unwrap()).collect();
-    assert_eq!(offsets, (0..10).map(|n| (n * MAX_SOURCE_CHUNK) as u64).collect::<Vec<_>>());
+    let offsets: Vec<_> = peer
+        .sent
+        .iter()
+        .filter(|frame| frame["kind"] == "source-chunk")
+        .map(|frame| frame["offset"].as_u64().unwrap())
+        .collect();
+    assert_eq!(
+        offsets,
+        (0..10)
+            .map(|n| (n * MAX_SOURCE_CHUNK) as u64)
+            .collect::<Vec<_>>()
+    );
     assert_eq!(peer.sent.last().unwrap()["kind"], "source-seal");
-    assert_eq!(hex(&Sha256::digest(&bytes)), fixture.request["source_manifest"]["files"][1]["sha256"]);
+    assert_eq!(
+        hex(&Sha256::digest(&bytes)),
+        fixture.request["source_manifest"]["files"][1]["sha256"]
+    );
 }
 
 #[test]
 fn source_pipeline_respects_exact_missing_sets_including_a_completely_warm_transfer() {
-    let fixture = Fixture::new((0..9).map(|index| {
-        (format!("src/f{index}"), vec![index as u8; 7])
-    }).collect());
-    for missing in [BTreeSet::new(), BTreeSet::from([
-        "src/f0".into(), "src/f2".into(), "src/f4".into(), "src/f6".into(), "src/f8".into(),
-    ])] {
+    let fixture = Fixture::new(
+        (0..9)
+            .map(|index| (format!("src/f{index}"), vec![index as u8; 7]))
+            .collect(),
+    );
+    for missing in [
+        BTreeSet::new(),
+        BTreeSet::from([
+            "src/f0".into(),
+            "src/f2".into(),
+            "src/f4".into(),
+            "src/f6".into(),
+            "src/f8".into(),
+        ]),
+    ] {
         let mut peer = ReceiverPeer::new(&fixture);
         peer.missing = Some(missing.clone());
         fixture.transfer(&mut peer).unwrap();
         peer.assert_complete();
-        let sent: BTreeSet<_> = peer.sent.iter().filter(|frame| frame["kind"] == "source-chunk")
-            .map(|frame| frame["path"].as_str().unwrap().to_owned()).collect();
+        let sent: BTreeSet<_> = peer
+            .sent
+            .iter()
+            .filter(|frame| frame["kind"] == "source-chunk")
+            .map(|frame| frame["path"].as_str().unwrap().to_owned())
+            .collect();
         assert_eq!(sent, missing);
-        assert_eq!(peer.batches, if missing.is_empty() { vec![] } else { vec![4, 1] });
+        assert_eq!(
+            peer.batches,
+            if missing.is_empty() {
+                vec![]
+            } else {
+                vec![4, 1]
+            }
+        );
     }
 }
 
 #[test]
 fn source_pipeline_failed_acknowledgment_stops_at_the_bounded_batch_without_sealing() {
-    let fixture = Fixture::new((0..9).map(|index| {
-        (format!("src/f{index}"), vec![index as u8; 3])
-    }).collect());
-    for fault in [Fault::ForeignFirstAck, Fault::WrongManifestFirstAck,
-        Fault::RegressingFirstAck, Fault::TimeoutFirstAck]
-    {
+    let fixture = Fixture::new(
+        (0..9)
+            .map(|index| (format!("src/f{index}"), vec![index as u8; 3]))
+            .collect(),
+    );
+    for fault in [
+        Fault::ForeignFirstAck,
+        Fault::WrongManifestFirstAck,
+        Fault::RegressingFirstAck,
+        Fault::TimeoutFirstAck,
+    ] {
         let mut peer = ReceiverPeer::new(&fixture);
         peer.fault = fault;
         let error = fixture.transfer(&mut peer).unwrap_err();
@@ -284,15 +403,20 @@ fn source_pipeline_failed_acknowledgment_stops_at_the_bounded_batch_without_seal
 
 #[test]
 fn source_pipeline_partial_batch_write_burns_negotiation_without_retry() {
-    let fixture = Fixture::new((0..9).map(|index| {
-        (format!("src/f{index}"), vec![index as u8; 3])
-    }).collect());
+    let fixture = Fixture::new(
+        (0..9)
+            .map(|index| (format!("src/f{index}"), vec![index as u8; 3]))
+            .collect(),
+    );
     let mut peer = ReceiverPeer::new(&fixture);
     peer.fault = Fault::FailThirdWrite;
     let mut source = SourcePeer::new(&mut peer, &fixture.upload, &fixture.request).unwrap();
     let hello = json!({"source_transfers":["source-files-v1"]});
     let grant = json!({"kind":"session-ok"});
-    assert_eq!(source.negotiate(&hello, &grant).unwrap_err().kind(), io::ErrorKind::BrokenPipe);
+    assert_eq!(
+        source.negotiate(&hello, &grant).unwrap_err().kind(),
+        io::ErrorKind::BrokenPipe
+    );
     assert!(source.negotiate(&hello, &grant).is_err());
     assert_eq!(peer.chunks, 3);
     assert_eq!(peer.acks, 0);

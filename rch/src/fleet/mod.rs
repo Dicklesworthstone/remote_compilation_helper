@@ -240,9 +240,56 @@ pub async fn deploy(
         println!();
     }
 
+    // --drain-first: stop routing to the targets and wait for their in-flight
+    // builds before replacing rch-wkr underneath them. A deploy that cannot
+    // confirm the targets are idle is refused rather than run over live builds.
+    let drained_for_deploy: Vec<String> = if drain_first {
+        let ids: Vec<String> = target_workers.iter().map(|w| w.id.0.clone()).collect();
+        let mut drained = Vec::new();
+        let mut refusal = None;
+        for id in &ids {
+            match crate::status_display::drain_worker(id).await {
+                Ok(()) => drained.push(id.clone()),
+                Err(error) => {
+                    refusal = Some(format!("could not drain {id}: {error:#}"));
+                    break;
+                }
+            }
+        }
+        if refusal.is_none() {
+            match wait_for_drained_idle(&drained, drain_timeout).await {
+                Ok(busy) if busy.is_empty() => {}
+                Ok(busy) => {
+                    let names: Vec<String> = busy
+                        .iter()
+                        .map(|(id, slots)| format!("{id} ({slots} slot(s))"))
+                        .collect();
+                    refusal = Some(format!(
+                        "workers still busy after {drain_timeout}s: {}",
+                        names.join(", ")
+                    ));
+                }
+                Err(error) => {
+                    refusal = Some(format!("could not confirm workers are idle: {error:#}"));
+                }
+            }
+        }
+        if let Some(reason) = refusal {
+            re_enable_workers(&drained).await;
+            anyhow::bail!(
+                "deploy refused (--drain-first): {reason}; drained workers were re-enabled"
+            );
+        }
+        drained
+    } else {
+        Vec::new()
+    };
+
     // Execute deployment
     let executor = FleetExecutor::new(parallel, audit_logger, &target_workers, local_binary)?;
-    let result = executor.execute(plan, ctx).await?;
+    let result = executor.execute(plan, ctx).await;
+    re_enable_workers(&drained_for_deploy).await;
+    let result = result?;
 
     // Output results
     if ctx.is_json() {
@@ -559,16 +606,32 @@ pub async fn status(ctx: &OutputContext, worker: Option<String>, watch: bool) ->
     }
 
     if watch {
-        println!();
-        println!("  {} Press Ctrl+C to exit", style.muted("Watching..."));
-        // Watch loop would go here - simplified for now
+        // Re-query every worker on each refresh; a stale screen that merely
+        // sleeps would claim a live view it does not have.
         loop {
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            println!();
+            println!(
+                "  {} refreshing every {}s, Ctrl+C to exit",
+                style.muted("Watching..."),
+                FLEET_STATUS_WATCH_INTERVAL.as_secs()
+            );
+            tokio::time::sleep(FLEET_STATUS_WATCH_INTERVAL).await;
+            println!();
+            println!(
+                "{}",
+                style.muted(&format!(
+                    "── {} ──",
+                    chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
+                ))
+            );
+            Box::pin(status(ctx, worker.clone(), false)).await?;
         }
     }
 
     Ok(())
 }
+
+const FLEET_STATUS_WATCH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Verify worker installations.
 pub async fn verify(ctx: &OutputContext, worker: Option<String>) -> Result<()> {
@@ -780,7 +843,10 @@ pub async fn drain(
         println!();
     }
 
-    // Drain each worker via daemon
+    // Drain each worker through the daemon. A worker counts as drained only
+    // when the daemon acknowledged it; anything else is reported as failed.
+    let mut drained: Vec<String> = Vec::new();
+    let mut failed: Vec<(String, String)> = Vec::new();
     for w in &target_workers {
         if !ctx.is_json() {
             println!(
@@ -789,28 +855,136 @@ pub async fn drain(
                 style.highlight(&w.id.0)
             );
         }
-        // Would call daemon to drain worker here
-        // For now, just mark as success
-        if !ctx.is_json() {
-            println!(
-                "  {} {} drained",
-                StatusIndicator::Success.display(style),
-                style.highlight(&w.id.0)
-            );
+        match crate::status_display::drain_worker(&w.id.0).await {
+            Ok(()) => {
+                if !ctx.is_json() {
+                    println!(
+                        "  {} {} drained (no new builds will be routed to it)",
+                        StatusIndicator::Success.display(style),
+                        style.highlight(&w.id.0)
+                    );
+                }
+                drained.push(w.id.0.clone());
+            }
+            Err(error) => {
+                if !ctx.is_json() {
+                    println!(
+                        "  {} {} not drained: {error:#}",
+                        StatusIndicator::Error.display(style),
+                        style.highlight(&w.id.0)
+                    );
+                }
+                failed.push((w.id.0.clone(), format!("{error:#}")));
+            }
+        }
+    }
+
+    // Draining stops new routing; in-flight builds keep running. Wait up to
+    // `timeout` seconds for them so a caller can safely take workers down.
+    let still_busy = wait_for_drained_idle(&drained, timeout).await;
+    if !ctx.is_json() {
+        match &still_busy {
+            Ok(busy) if busy.is_empty() => {}
+            Ok(busy) => {
+                for (id, slots) in busy {
+                    println!(
+                        "  {} {} still has {} slot(s) in use after {}s",
+                        StatusIndicator::Warning.display(style),
+                        style.highlight(id),
+                        slots,
+                        timeout
+                    );
+                }
+            }
+            Err(error) => println!(
+                "  {} Could not confirm in-flight builds finished: {error:#}",
+                StatusIndicator::Warning.display(style)
+            ),
         }
     }
 
     if ctx.is_json() {
-        let _ = ctx.json(&ApiResponse::ok(
-            "fleet drain",
-            serde_json::json!({
-                "workers_drained": target_workers.len(),
-                "timeout": timeout,
-            }),
-        ));
+        let busy_json = match &still_busy {
+            Ok(busy) => serde_json::json!(
+                busy.iter()
+                    .map(|(id, slots)| serde_json::json!({"worker_id": id, "used_slots": slots}))
+                    .collect::<Vec<_>>()
+            ),
+            Err(_) => serde_json::Value::Null,
+        };
+        if failed.is_empty() {
+            let _ = ctx.json(&ApiResponse::ok(
+                "fleet drain",
+                serde_json::json!({
+                    "workers_drained": drained,
+                    "still_busy": busy_json,
+                    "idle_confirmed": matches!(&still_busy, Ok(busy) if busy.is_empty()),
+                    "timeout": timeout,
+                }),
+            ));
+        } else {
+            let failed_ids: Vec<&str> = failed.iter().map(|(id, _)| id.as_str()).collect();
+            let details: Vec<String> = failed
+                .iter()
+                .map(|(id, error)| format!("{id}: {error}"))
+                .collect();
+            let _ = ctx.json(&ApiResponse::<()>::err(
+                "fleet drain",
+                ApiError::new(
+                    ErrorCode::WorkerStateError,
+                    format!(
+                        "{} of {} worker(s) were not drained",
+                        failed.len(),
+                        target_workers.len()
+                    ),
+                )
+                .with_details(details.join("; "))
+                .with_context("failed_workers", failed_ids.join(","))
+                .with_context("drained_workers", drained.join(",")),
+            ));
+        }
     }
 
-    Ok(())
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        Err(crate::doctor::DoctorExit(1).into())
+    }
+}
+
+/// Return workers drained for a deploy to routing. Best-effort: a failure is
+/// logged, because the deploy outcome is already decided and the operator can
+/// re-run `rch workers enable`.
+async fn re_enable_workers(workers: &[String]) {
+    for id in workers {
+        if let Err(error) = crate::status_display::enable_worker(id).await {
+            tracing::warn!(
+                "could not re-enable {id} after deploy: {error:#}; run `rch workers enable {id}`"
+            );
+        }
+    }
+}
+
+/// Poll the daemon until none of `workers` has slots in use, or `timeout_secs`
+/// elapses. Returns the workers still busy (empty when all went idle).
+async fn wait_for_drained_idle(
+    workers: &[String],
+    timeout_secs: u64,
+) -> Result<Vec<(String, u32)>> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    loop {
+        let status = crate::status_display::query_daemon_full_status().await?;
+        let busy: Vec<(String, u32)> = status
+            .workers
+            .iter()
+            .filter(|worker| workers.contains(&worker.id) && worker.used_slots > 0)
+            .map(|worker| (worker.id.clone(), worker.used_slots))
+            .collect();
+        if busy.is_empty() || std::time::Instant::now() >= deadline {
+            return Ok(busy);
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
 }
 
 /// Show deployment history.
