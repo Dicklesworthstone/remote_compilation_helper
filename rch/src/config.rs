@@ -1154,6 +1154,8 @@ pub fn validate_workers_config_file(path: &Path) -> FileValidation {
         if id.is_empty() {
             if id_value.is_none() {
                 validation.error(format!("workers[{}].id is required", index));
+            } else if id_value.is_some_and(toml::Value::is_str) {
+                validation.error(format!("workers[{}].id cannot be empty", index));
             }
         } else {
             let key = id.to_lowercase();
@@ -1174,6 +1176,8 @@ pub fn validate_workers_config_file(path: &Path) -> FileValidation {
         };
         if host.is_empty() && host_value.is_none() {
             validation.error(format!("workers[{}].host is required", index));
+        } else if host.is_empty() && host_value.is_some_and(toml::Value::is_str) {
+            validation.error(format!("workers[{}].host cannot be empty", index));
         }
 
         let user_value = table.get("user");
@@ -4628,6 +4632,31 @@ total_slots = 8
             "expected duplicate worker id error"
         );
         info!("PASS: duplicate worker ids are detected");
+    }
+
+    #[test]
+    fn test_validate_workers_rejects_empty_id_and_host() {
+        let _guard = test_guard!();
+        let identity = NamedTempFile::new().expect("create identity file");
+        let mut file = NamedTempFile::new().expect("create workers config file");
+        let workers_toml = format!(
+            "[[workers]]\nid = \"  \"\nhost = \"\"\nuser = \"u\"\nidentity_file = \"{}\"\ntotal_slots = 4\n",
+            identity.path().display()
+        );
+        std::io::Write::write_all(file.as_file_mut(), workers_toml.as_bytes())
+            .expect("write workers config");
+
+        let result = validate_workers_config_file(file.path());
+        for expected in [
+            "workers[0].id cannot be empty",
+            "workers[0].host cannot be empty",
+        ] {
+            assert!(
+                result.errors.iter().any(|e| e == expected),
+                "missing {expected:?} in {:?}",
+                result.errors
+            );
+        }
     }
 
     // ========================================================================
