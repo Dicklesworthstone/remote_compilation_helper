@@ -926,6 +926,19 @@ fn exit_with_local_fallback(
     reason: &str,
     require_remote: bool,
 ) -> ! {
+    exit_with_local_fallback_recording(command, reporter, reason, require_remote, None)
+}
+
+/// [`exit_with_local_fallback`] that also records the underlying error chain
+/// in the incident, so a refusal on a dispatcher says WHY remote execution
+/// failed instead of only "remote execution failed".
+fn exit_with_local_fallback_recording(
+    command: &str,
+    reporter: &HookReporter,
+    reason: &str,
+    require_remote: bool,
+    error: Option<&str>,
+) -> ! {
     // bd-uoh4x: exactly ONE envelope per invocation, emitted at the
     // TERMINAL path only. A pre-run emit here would double-emit on the
     // completed path (once before the child runs, again below with the
@@ -946,6 +959,7 @@ fn exit_with_local_fallback(
             reason,
             require_remote,
             now_unix_ms(),
+            error,
         ));
     }
     let mut child = match local_fallback_command_for_policy(command, require_remote) {
@@ -1072,10 +1086,11 @@ fn exit_with_gated_local_fallback(
     reason: &str,
     require_remote: bool,
     allow_local_fallback: bool,
+    error: Option<&str>,
 ) -> ! {
     if require_remote {
         // Canonical remote-required refusal (proof mode / RCH_REQUIRE_REMOTE).
-        exit_with_local_fallback(command, reporter, reason, true);
+        exit_with_local_fallback_recording(command, reporter, reason, true, error);
     }
     if !allow_local_fallback {
         warn!(
@@ -1090,7 +1105,7 @@ fn exit_with_gated_local_fallback(
         std::process::exit(EXIT_BUILD_ERROR);
     }
     reporter.summary(&format!("[RCH] local ({reason})"));
-    exit_with_local_fallback(command, reporter, reason, false)
+    exit_with_local_fallback_recording(command, reporter, reason, false, error)
 }
 
 /// A remote build failed for a *worker-fault* reason (OOM/signal-kill, missing
@@ -1118,7 +1133,12 @@ enum RemoteFaultExhaustAction {
         remediation: String,
     },
     /// Fall back to local, gated by `allow_local_fallback` / `require_remote`.
-    GatedLocalFallback { reason: String },
+    /// `reason` stays stable (it is grouped in `rch status`); `error` carries
+    /// the underlying error chain into the incident ledger.
+    GatedLocalFallback {
+        reason: String,
+        error: Option<String>,
+    },
 }
 
 /// Fetch daemon status, rank the remaining workers by capacity, and re-query the
@@ -1644,14 +1664,29 @@ fn build_local_fallback_incident(
     reason: &str,
     refused: bool,
     now_ms: u64,
+    error: Option<&str>,
 ) -> IncidentEvent {
-    build_recovery_terminal_incident(
+    let event = build_recovery_terminal_incident(
         refused,
         &extract_project_name(),
         &redact_secrets(command),
         reason,
         now_ms,
-    )
+    );
+    match error {
+        Some(error) => event.with_detail("error", bounded_incident_error(error)),
+        None => event,
+    }
+}
+
+/// Secret-redacted, length-bounded error chain for an incident record.
+fn bounded_incident_error(error: &str) -> String {
+    const MAX_CHARS: usize = 600;
+    let redacted = redact_secrets(error);
+    match redacted.char_indices().nth(MAX_CHARS) {
+        Some((cut, _)) => format!("{}…", &redacted[..cut]),
+        None => redacted,
+    }
 }
 
 /// The incident ledger as `[remediation.incident_ledger]` configures it
@@ -3146,6 +3181,7 @@ pub async fn run_exec(
                 &reason,
                 strict_remote_for_exhausted_admission(require_remote, job),
                 allow_local_fallback,
+                None,
             );
         };
 
@@ -3195,6 +3231,7 @@ pub async fn run_exec(
                 &format!("durable reservation persistence failed: {error}"),
                 require_remote || job,
                 allow_local_fallback,
+                None,
             );
         }
         if !selected_worker_is_requested(&worker.id, &current_query_preferred) {
@@ -3459,6 +3496,7 @@ pub async fn run_exec(
                         failed_worker: worker.id.clone(),
                         on_exhaust: RemoteFaultExhaustAction::GatedLocalFallback {
                             reason: format!("toolchain missing on {}", worker.id),
+                            error: None,
                         },
                     }
                 } else if !job
@@ -3754,6 +3792,7 @@ pub async fn run_exec(
                                 "source sync stalled on {} (phase {})",
                                 worker.id, stall.phase
                             ),
+                            error: None,
                         },
                     }
                 } else {
@@ -3767,6 +3806,7 @@ pub async fn run_exec(
                         failed_worker: worker.id.clone(),
                         on_exhaust: RemoteFaultExhaustAction::GatedLocalFallback {
                             reason: "remote execution failed".to_string(),
+                            error: Some(format!("{}: {e:#}", worker.id)),
                         },
                     }
                 }
@@ -3876,7 +3916,7 @@ pub async fn run_exec(
                 });
                 std::process::exit(code);
             }
-            RemoteFaultExhaustAction::GatedLocalFallback { reason } => {
+            RemoteFaultExhaustAction::GatedLocalFallback { reason, error } => {
                 // Issue #63(c): --job admission counts as strict-remote here.
                 let strict_remote = strict_remote_for_exhausted_admission(require_remote, job);
                 warn!(
@@ -3904,6 +3944,7 @@ pub async fn run_exec(
                     &reason,
                     strict_remote,
                     allow_local_fallback,
+                    error.as_deref(),
                 );
             }
         }

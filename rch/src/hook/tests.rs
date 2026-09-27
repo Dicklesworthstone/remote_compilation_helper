@@ -9120,7 +9120,9 @@ fn test_local_fallback_incident_records_reason_and_redacts_command() {
         "no admissible workers (critical_pressure=5)",
         false,
         1_700_000_000_010,
+        None,
     );
+    assert!(!local.details.contains_key("error"));
     assert_eq!(
         local.reason_code,
         rch_common::IncidentReasonCode::LocalFallback
@@ -9140,10 +9142,28 @@ fn test_local_fallback_incident_records_reason_and_redacts_command() {
         "remote execution failed; remote retries exhausted",
         true,
         1_700_000_000_011,
+        Some(&format!(
+            "hz3: remote execution completion is unconfirmed: GITHUB_TOKEN=ghp_supersecretvalue123456 {}",
+            "x".repeat(2_000)
+        )),
     );
     assert_eq!(
         refused.reason_code,
         rch_common::IncidentReasonCode::ProofRefusal
+    );
+    // The stable reason is untouched (it is grouped in `rch status`); the
+    // cause travels separately, redacted and bounded.
+    assert_eq!(
+        refused.details.get("reason").map(String::as_str),
+        Some("remote execution failed; remote retries exhausted")
+    );
+    let error = refused.details.get("error").expect("error chain recorded");
+    assert!(error.starts_with("hz3: remote execution completion is unconfirmed"));
+    assert!(!error.contains("supersecretvalue"), "{error}");
+    assert!(
+        error.chars().count() <= 601,
+        "bounded: {}",
+        error.chars().count()
     );
     assert!(!refused.local_fallback_allowed);
     assert!(refused.control.strict_remote_policy);
