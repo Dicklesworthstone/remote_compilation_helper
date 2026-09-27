@@ -202,20 +202,42 @@ impl IncidentLedger {
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         line.push('\n');
 
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.config.path)?;
-        file.write_all(line.as_bytes())?;
-        file.flush()?;
-
-        // Cheap stat-based retention trigger (no full read on the hot path).
-        if let Ok(meta) = fs::metadata(&self.config.path)
-            && meta.len() > self.config.max_bytes
-        {
-            self.compact()?;
+        let oversized = {
+            let lock = self.open_lock()?;
+            lock.lock_shared()?;
+            let mut file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.config.path)?;
+            file.write_all(line.as_bytes())?;
+            file.flush()?;
+            // Cheap stat-based retention trigger (no full read on the hot path).
+            fs::metadata(&self.config.path).is_ok_and(|meta| meta.len() > self.config.max_bytes)
+        };
+        // The shared lock is released first: compaction takes it exclusively,
+        // and every appender that saw the oversize re-checks under that lock.
+        if oversized {
+            let lock = self.open_lock()?;
+            lock.lock()?;
+            if fs::metadata(&self.config.path).is_ok_and(|meta| meta.len() > self.config.max_bytes)
+            {
+                self.rewrite_retained()?;
+            }
         }
         Ok(())
+    }
+
+    /// Stable sidecar lock. Appends share it; compaction holds it exclusively,
+    /// so no append lands on the inode a compaction is about to replace.
+    fn open_lock(&self) -> std::io::Result<fs::File> {
+        let mut path = self.config.path.clone().into_os_string();
+        path.push(".lock");
+        OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(PathBuf::from(path))
     }
 
     /// Read every parseable event, tolerating (and counting) corrupt lines.
@@ -233,17 +255,19 @@ impl IncidentLedger {
             Ok(f) => f,
             Err(_) => return (events, stats),
         };
-        for line in BufReader::new(file).lines() {
+        // Split on bytes: one line of invalid UTF-8 is a corrupt line to skip,
+        // not the end of the ledger (compaction would then drop the rest).
+        for line in BufReader::new(file).split(b'\n') {
             let Ok(line) = line else {
-                // An I/O error mid-stream (e.g. invalid UTF-8): count and stop.
+                // A real I/O error mid-stream: count and stop.
                 stats.skipped += 1;
                 break;
             };
-            let trimmed = line.trim();
+            let trimmed = line.trim_ascii();
             if trimmed.is_empty() {
                 continue;
             }
-            match serde_json::from_str::<IncidentEvent>(trimmed) {
+            match serde_json::from_slice::<IncidentEvent>(trimmed) {
                 Ok(event) => {
                     events.push(event);
                     stats.parsed += 1;
@@ -267,6 +291,13 @@ impl IncidentLedger {
     /// dropping corrupt lines. Atomic via temp-file + rename so a reader never
     /// observes a partial file.
     pub fn compact(&self) -> std::io::Result<()> {
+        let lock = self.open_lock()?;
+        lock.lock()?;
+        self.rewrite_retained()
+    }
+
+    /// Caller holds the exclusive sidecar lock.
+    fn rewrite_retained(&self) -> std::io::Result<()> {
         let (mut events, _) = self.read_all_with_stats();
         if events.len() > self.config.max_entries {
             let drop = events.len() - self.config.max_entries;
@@ -366,6 +397,56 @@ mod tests {
         // A fresh instance (simulating a process restart) sees prior events.
         let reopened = IncidentLedger::with_path(&path);
         assert_eq!(reopened.read_all().len(), 2);
+    }
+
+    #[test]
+    fn invalid_utf8_line_is_skipped_not_the_end_of_the_ledger() {
+        let (ledger, _dir) = temp_ledger();
+        ledger
+            .append(&event(IncidentReasonCode::LocalFallback, "p1", None, 1))
+            .unwrap();
+        let mut file = OpenOptions::new().append(true).open(ledger.path()).unwrap();
+        file.write_all(b"\xff\xfe torn\n").unwrap();
+        ledger
+            .append(&event(IncidentReasonCode::LocalFallback, "p2", None, 2))
+            .unwrap();
+        let (events, stats) = ledger.read_all_with_stats();
+        assert_eq!(events.len(), 2);
+        assert_eq!(stats.skipped, 1);
+        ledger.compact().unwrap();
+        assert_eq!(
+            ledger.read_all().len(),
+            2,
+            "compaction dropped later events"
+        );
+    }
+
+    #[test]
+    fn concurrent_appends_survive_repeated_compaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = IncidentLedger::new(IncidentLedgerConfig {
+            path: dir.path().join("incidents.jsonl"),
+            max_entries: 100_000,
+            // Every few appends trips compaction, which retains everything.
+            max_bytes: 2_048,
+        });
+        std::thread::scope(|scope| {
+            for thread in 0..8_u64 {
+                let ledger = &ledger;
+                scope.spawn(move || {
+                    for i in 0..50_u64 {
+                        let e = event(
+                            IncidentReasonCode::LocalFallback,
+                            "p",
+                            None,
+                            thread * 1_000 + i,
+                        );
+                        ledger.append(&e).unwrap();
+                    }
+                });
+            }
+        });
+        assert_eq!(ledger.read_all().len(), 400, "appends lost to compaction");
     }
 
     #[test]
