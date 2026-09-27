@@ -2727,9 +2727,24 @@ pub async fn status_overview(
         serde_json::from_str(json).context("Failed to parse daemon status response")
     }
     .await;
-    let mut status =
-        status_result.map_err(|error| status_error_with_local_builds(error, &local_hints))?;
-    if let Some(issue) = local_fallback_issue(now_unix_ms_for_status()) {
+    // The ledger is local, so the fallback summary does not depend on the
+    // daemon. It matters most when the daemon is DOWN: that is when "daemon
+    // unavailable" fallbacks pile up, so the error path carries it too.
+    let fallback_issue = local_fallback_issue(now_unix_ms_for_status());
+    let mut status = status_result.map_err(|error| {
+        let mut hints = local_hints.clone();
+        if let Some(issue) = fallback_issue.as_ref() {
+            hints.push(crate::status_types::RemediationHint {
+                reason_code: "local_fallbacks".to_string(),
+                severity: issue.severity.clone(),
+                message: issue.summary.clone(),
+                suggested_action: issue.remediation.clone().unwrap_or_default(),
+                worker_id: None,
+            });
+        }
+        status_error_with_local_builds(error, &hints)
+    })?;
+    if let Some(issue) = fallback_issue {
         status.issues.push(issue);
     }
 

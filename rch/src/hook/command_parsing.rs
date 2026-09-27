@@ -735,15 +735,23 @@ pub(super) fn dedupe_worker_ids(workers: Vec<WorkerId>) -> Vec<WorkerId> {
     deduped
 }
 
-/// Default-policy convenience shim. Used where only the project identity is
-/// needed (local-fallback incident records) and no topology policy is in scope.
+/// Default-policy project identity for local-fallback incident records, where
+/// no topology policy is in scope. Quiet: see [`project_name_for_cwd`].
 pub(crate) fn extract_project_name() -> String {
-    extract_project_name_with_policy(&PathTopologyPolicy::default())
+    project_name_for_cwd(&PathTopologyPolicy::default(), false)
 }
 
 /// Extract project name from current working directory, honoring the
 /// supplied [`PathTopologyPolicy`].
 pub(crate) fn extract_project_name_with_policy(policy: &PathTopologyPolicy) -> String {
+    project_name_for_cwd(policy, true)
+}
+
+/// `warn_on_failure` is false only for the default-policy identity stamped on
+/// incident records: every local fallback records one, and cwds outside the
+/// default root (scratchpads, /tmp clones, hosts with a configured root) are
+/// routine there, so a multi-line WARN on each would be pure noise.
+fn project_name_for_cwd(policy: &PathTopologyPolicy, warn_on_failure: bool) -> String {
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("unknown"));
     let normalized_cwd = match normalize_project_path_with_policy(&cwd, policy) {
         Ok(normalized) => {
@@ -753,11 +761,19 @@ pub(crate) fn extract_project_name_with_policy(policy: &PathTopologyPolicy) -> S
             normalized.canonical_path().to_path_buf()
         }
         Err(err) => {
-            warn!(
-                "Project path normalization failed for {}: {}",
-                cwd.display(),
-                err
-            );
+            if warn_on_failure {
+                warn!(
+                    "Project path normalization failed for {}: {}",
+                    cwd.display(),
+                    err
+                );
+            } else {
+                debug!(
+                    "Project path normalization failed for {}: {}",
+                    cwd.display(),
+                    err
+                );
+            }
             for decision in err.decision_trace() {
                 debug!(
                     "[RCH] project identity normalization failed at: {}",

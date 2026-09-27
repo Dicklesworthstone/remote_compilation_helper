@@ -940,12 +940,16 @@ fn exit_with_local_fallback(
     // of WHY. Before this only the daemon-unavailable lane was recorded, so a
     // dispatcher melting under local builds (trj, 2026-09-25) left nothing to
     // say whether rch chose local or an agent bypassed it.
-    record_hook_incident(&build_local_fallback_incident(
-        command,
-        reason,
-        require_remote,
-        now_unix_ms(),
-    ));
+    // A non-compilation command running locally is not a build falling back,
+    // so it must not inflate `rch status`'s local-fallback-build count.
+    if reason != "non-compilation command" {
+        record_hook_incident(&build_local_fallback_incident(
+            command,
+            reason,
+            require_remote,
+            now_unix_ms(),
+        ));
+    }
     let mut child = match local_fallback_command_for_policy(command, require_remote) {
         Ok(child) => child,
         Err(LocalFallbackRefusal::RemoteRequired) => {
@@ -1643,10 +1647,14 @@ fn build_local_fallback_incident(
 /// ledger write fails. The ledger lives off the hot path, so the append cost
 /// (one buffered line) does not affect the classification budgets.
 fn record_hook_incident(event: &IncidentEvent) {
-    // A routine local fallback (RCH-I011) is already announced by the
-    // `[RCH] local (<reason>)` summary; now that every fallback is recorded,
-    // a WARN here would add multi-line stderr noise to every local build.
-    if event.reason_code == IncidentReasonCode::LocalFallback {
+    // A local fallback (RCH-I011) is already announced by the
+    // `[RCH] local (<reason>)` summary and a refusal (RCH-I012) by its critical
+    // `remote required; refusing local fallback` line. Every one of them is now
+    // recorded, so a WARN here would add multi-line stderr noise to each.
+    if matches!(
+        event.reason_code,
+        IncidentReasonCode::LocalFallback | IncidentReasonCode::ProofRefusal
+    ) {
         debug!(
             target: "rch::hook::incident",
             reason_code = %event.reason_code,
@@ -1665,7 +1673,9 @@ fn record_hook_incident(event: &IncidentEvent) {
     }
     let ledger = IncidentLedger::new(IncidentLedgerConfig::default());
     if let Err(e) = ledger.append(event) {
-        warn!(
+        // Best-effort by contract. An unwritable state dir (sandbox, unset
+        // HOME) would otherwise print this on every fallback and refusal.
+        debug!(
             target: "rch::hook::incident",
             error = %e,
             "failed to append incident to ledger (continuing)",
