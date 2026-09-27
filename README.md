@@ -948,10 +948,12 @@ commands may still run locally. For several focused checks, run separate direct
 - Transport uses SSH.
 - Worker commands are constrained to classified execution paths.
 - Sensitive field masking and structured error taxonomy are built in.
-- `rch update` enforces the release's SHA-256 checksums. A Sigstore bundle is
-  verified only when the release ships one and `cosign` is installed; otherwise
-  update warns and relies on the checksum, which detects corruption but not a
-  tampered release.
+- `rch update` enforces the release's SHA-256 checksums and verifies the
+  archive's `.minisig` against a public key pinned in the binary (minisign key
+  `69B3955C8D2E62A8`, which signs every release since 2.0.0); a bad signature
+  aborts the update. A Sigstore bundle is also verified when the release ships
+  one and `cosign` is installed. `--skip-verify` bypasses signature checks only.
+  `install.sh` still verifies checksums only.
 - Hook path remains fail-open to avoid deadlocks/stalls.
 
 Operational recommendations:
