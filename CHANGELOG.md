@@ -102,6 +102,12 @@ behavior: experimental, operator-only, and not in the archives.
   - `--drain-first` leaves operator-held workers disabled
     ([`8776ffe0`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/8776ffe08a2215515701ab9b80bbc58271deb40f)).
   - `workers.toml` edits are made in place, and blank ids or hosts are rejected.
+    A `workers.toml` that is a dangling symlink is written through to its
+    target.
+  - A selection preview no longer consumes a probe slot or bookkeeping on the
+    affinity-pinned path. The durable-wrapper backstop can no longer leave a
+    `sleep` holding the SSH channel or signal a reused PID
+    ([`54a22cb2`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/54a22cb23d30e2473834e9657c4c5549667b58a8)).
   - `FORCE_COLOR=false` disables color.
 
 ## 2.1.2 — 2026-09-27
