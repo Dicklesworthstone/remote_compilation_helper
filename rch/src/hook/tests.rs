@@ -4385,6 +4385,51 @@ fn test_add_cargo_isolation_survives_timeout_prefix_and_preserves_status() {
 }
 
 #[test]
+fn test_add_cargo_isolation_repairs_dangling_registry_link() {
+    // bd-hiu2v: a cache whose `registry` link points at a reclaimed
+    // ~/.cargo/registry made every crates.io fetch fail with EEXIST.
+    let _guard = test_guard!();
+    let base = tempfile::tempdir().unwrap();
+    let base_path = base.path().canonicalize().unwrap();
+    let worker_id = rch_common::WorkerId::new("dangling-worker");
+    let cache = base_path.join("rch-cargo-cache-dangling-worker");
+    std::fs::create_dir_all(&cache).unwrap();
+    let reclaimed = base_path.join("reclaimed-account-registry");
+    std::os::unix::fs::symlink(&reclaimed, cache.join("registry")).unwrap();
+    assert!(!cache.join("registry").exists(), "fixture link must dangle");
+
+    let isolated = add_cargo_isolation(
+        "printf cargo >/dev/null; test -d \"$CARGO_HOME/registry\" && touch \"$CARGO_HOME/registry/ok\"",
+        &worker_id,
+    );
+    let status = std::process::Command::new("sh") // ubs:ignore — executes the fixed isolation wrapper above.
+        .arg("-c")
+        .arg(&isolated)
+        .env("TMPDIR", &base_path)
+        // Under `rch exec` the test inherits the worker's own cache base;
+        // clear it so the wrapper resolves the fixture base from TMPDIR.
+        .env_remove(rch_common::RCH_CARGO_HOME_BASE_VAR)
+        .status()
+        .expect("isolated command should execute");
+
+    assert!(
+        status.success(),
+        "dangling registry link was not repaired: {status:?}"
+    );
+    assert!(
+        std::fs::symlink_metadata(cache.join("registry"))
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the operator's link is kept, not replaced"
+    );
+    assert!(
+        reclaimed.join("ok").exists(),
+        "writes land in the recreated link target"
+    );
+}
+
+#[test]
 fn test_remote_cargo_target_dir_name_is_unique_and_path_safe() {
     let _guard = test_guard!();
     let worker_id = rch_common::WorkerId::new("worker/with spaces");

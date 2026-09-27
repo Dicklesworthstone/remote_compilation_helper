@@ -31,6 +31,28 @@ Repository: <https://github.com/Dicklesworthstone/remote_compilation_helper>
 
 ## Unreleased
 
+## 2.1.1 — 2026-09-27
+
+Hotfix for a concurrency regression in 2.1.0. Upgrade dispatchers now.
+
+- **Concurrent builds no longer fail on output ownership.** 2.1.0 took an
+  exclusive, non-blocking lock on every local output root (the project root and
+  any custom `CARGO_TARGET_DIR`) at job preparation, and held it until the job
+  finished. Dispatchers share one box-wide `CARGO_TARGET_DIR`, and agents run
+  concurrent jobs in one repository, so every overlapping build failed within
+  seconds on every worker ("output ownership is held by another live wrapper").
+  Under a remote-required policy those builds were refused; otherwise they fell
+  back to local compilation. The lock is now held only while one phase's staged
+  outputs are published, and it waits (bounded at 10 minutes) instead of
+  failing. Files another job replaced after preparation are re-fingerprinted
+  under the lock and overwritten (last writer wins, as with Cargo's own shared
+  target dir). Recovery of this job's own interrupted write still requires the
+  journaled evidence. Regression tests cover both behaviors.
+- **Dangling Cargo cache links are repaired before Cargo runs.** If a worker's
+  per-job cache has `registry` or `git` linked to a reclaimed `~/.cargo/…`
+  directory, the link target is recreated instead of every crates.io fetch
+  failing with EEXIST (`bd-hiu2v`).
+
 ## 2.1.0 — 2026-09-26
 
 Cut from `main`: every change since 2.0.0, including the three fixes also shipped in
@@ -124,6 +146,7 @@ follow-ups, artifact hashes, and retained limitations.
 
 | Version | Kind | Date | Summary |
 |---------|------|------|---------|
+| [`v2.1.1`](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v2.1.1) | Release | 2026-09-27 | Hotfix: output-ownership lock held only during publication (2.1.0 failed every overlapping build on shared `CARGO_TARGET_DIR`); dangling Cargo cache links repaired |
 | [`v2.1.0`](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v2.1.0) | Release | 2026-09-26 | Durable job identity (`rch jobs`); exit-0-only success; named-artifact retrieval; fail-closed clean overlays; PSI admission and `--require-tool`; fallback ledger; OTLP; truthful fleet drain/deploy; fresh-daemon fsync stall fixed; asupersync 0.5 |
 | [`v2.0.1`](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v2.0.1) | Release | 2026-09-26 | Patch branch on 2.0.0: worker-side benchmark deadline, local-fallback incident ledger, `rch status` fallback summary |
 | [`v2.0.0`](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v2.0.0) | Release | 2026-09-12 | Stable Rust dependency refresh; schemars 1.x Rust API break with Draft 7 output; worker admission and maintenance fixes; signed Linux x86-64 and macOS ARM64 binaries, published September 13 |
