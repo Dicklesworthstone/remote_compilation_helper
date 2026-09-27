@@ -2134,8 +2134,11 @@ impl TransferPipeline {
             return command;
         };
         let quote = |value: &str| escape(Cow::from(value)).into_owned();
+        // The receipts stay private, but the workload runs under the caller's
+        // umask: a leaked 077 made every remote output 0600/0700, and rsync -a
+        // carried those modes home.
         let supervisor = format!(
-            "trap '' HUP; ( {command}\n); s=$?; printf '%s %s\\n' {identity} \"$s\" > {pending} && sync -f {pending} && mv -f -- {pending} {done} && sync -f {directory}; exit \"$s\"",
+            "trap '' HUP; ( {command}\n); s=$?; (umask 077; printf '%s %s\\n' {identity} \"$s\" > {pending}) && sync -f {pending} && mv -f -- {pending} {done} && sync -f {directory}; exit \"$s\"",
             identity = quote(identity),
             pending = quote(&format!("{path}.pending")),
             done = quote(path),
@@ -2148,7 +2151,7 @@ impl TransferPipeline {
         // before tail notices. Without `--pid`, the old bounded
         // `sleep 1; kill` can still cut a slow tail.
         format!(
-            "set -e; umask 077; mkdir -p -- {directory}; mkdir {claim}; : > {out}; : > {err}; \
+            "set -e; rch_umask=$(umask); umask 077; mkdir -p -- {directory}; mkdir {claim}; : > {out}; : > {err}; umask \"$rch_umask\"; \
              nohup sh -c {supervisor} </dev/null >{out} 2>{err} & \
              p=$!; follow=; if tail --pid=\"$p\" -c 0 /dev/null >/dev/null 2>&1; then follow=--pid=$p; fi; \
              tail $follow -c +1 -f {out} & a=$!; tail $follow -c +1 -f {err} >&2 & b=$!; \
@@ -7490,6 +7493,44 @@ mod tests {
         assert!(stdout.ends_with("line-19999\n"), "tail was cut");
         assert_eq!(String::from_utf8_lossy(&output.stderr), "last\n");
         assert!(std::path::Path::new(&receipt).is_file());
+    }
+
+    /// The build must create its outputs under the caller's umask; only the
+    /// wrapper's own receipt is private.
+    #[cfg(unix)]
+    #[test]
+    fn durable_execution_runs_the_workload_under_the_callers_umask() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let receipt = directory
+            .path()
+            .join("recovery-9-id")
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let output_file = directory.path().join("built-output");
+        let pipeline = TransferPipeline::new(
+            PathBuf::from("/home/user/project"),
+            "myproject".to_string(),
+            "abc123".to_string(),
+            TransferConfig::default(),
+        )
+        .with_recovery_completion(receipt.clone(), "id".to_string());
+        let command = pipeline.durable_execution_command(format!(
+            "umask; : > {}",
+            escape(Cow::from(output_file.to_str().unwrap()))
+        ));
+        let output = std::process::Command::new("sh") // ubs:ignore — fixed wrapper over this test's temporary receipt
+            .arg("-c")
+            .arg(format!("umask 0022; {command}"))
+            .output()
+            .expect("run durable wrapper");
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "0022\n");
+        let mode =
+            |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&output_file), 0o644);
+        assert_eq!(mode(std::path::Path::new(&receipt)) & 0o077, 0);
     }
 
     /// A reader that lags behind the wrapper (a slow SSH link) leaves tail
