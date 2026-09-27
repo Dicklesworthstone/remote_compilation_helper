@@ -405,14 +405,7 @@ pub async fn run_hook() -> anyhow::Result<()> {
     // fall open rather than non-zero-exit and block the agent's Bash.
     match &output {
         HookOutput::Deny(_) | HookOutput::AllowWithModifiedCommand(_) => {
-            // Only a rewrite needs the original tool input (to carry `timeout`,
-            // `run_in_background`, ... through `updatedInput`), so the second
-            // parse stays off the non-compilation hot path.
-            let original_tool_input = matches!(output, HookOutput::AllowWithModifiedCommand(_))
-                .then(|| serde_json::from_str::<serde_json::Value>(input).ok())
-                .flatten()
-                .and_then(|mut raw| raw.get_mut("tool_input").map(serde_json::Value::take));
-            match output.to_hook_json(original_tool_input.as_ref()) {
+            match serde_json::to_string(&output) {
                 Ok(json) => {
                     if let Err(e) = writeln!(stdout, "{}", json) {
                         warn!(target: "rch::hook", error = %e, "stdout write failed; falling open");
