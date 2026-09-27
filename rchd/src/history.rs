@@ -29,6 +29,10 @@ struct DurableOwnership {
     cancelled_wrappers: HashSet<String>,
     #[serde(default)]
     next_queue_id: Option<u64>,
+    /// Required in version 2. Absence in version 1 means that the old daemon
+    /// never persisted its queue, not that a version-2 queue may be discarded.
+    #[serde(default)]
+    queued: Option<VecDeque<QueuedBuildState>>,
 }
 
 /// Cancellation and admission compete under the same ownership lock.
@@ -187,7 +191,8 @@ pub struct StuckDetectorSnapshot {
 ///
 /// When all workers are busy and `queue_when_busy` is enabled,
 /// builds are queued here instead of falling back to local execution.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct QueuedBuildState {
     /// Queue position ID (monotonically increasing).
     pub id: u64,
@@ -197,15 +202,23 @@ pub struct QueuedBuildState {
     pub command: String,
     /// When the build was queued (ISO 8601).
     pub queued_at: String,
-    /// Monotonic timestamp for duration calculations.
+    /// Monotonic timestamp for duration calculations, reconstructed on restart.
+    #[serde(skip, default = "Instant::now")]
     pub queued_at_mono: Instant,
     /// Hook process ID (for cancellation).
     pub hook_pid: u32,
+    /// Capture at enqueue, never by adopting a PID after daemon restart.
+    pub hook_process_identity: Option<String>,
     pub local_wrapper_id: Option<String>,
     /// Number of slots needed.
     pub slots_needed: u32,
-    /// Estimated start time (ISO 8601), updated as queue advances.
+    /// Estimated start time is advisory and must be recomputed after restart.
+    #[serde(skip)]
     pub estimated_start: Option<String>,
+    /// A recovered row is visible/cancellable, not a replacement live waiter.
+    /// Replaying selection requires a separate, identity-fenced reattachment.
+    #[serde(skip)]
+    pub recovered: bool,
 }
 
 /// Build history manager.
@@ -216,7 +229,8 @@ pub struct BuildHistory {
     records: RwLock<VecDeque<BuildRecord>>,
     /// Active builds (in-flight).
     active: RwLock<HashMap<u64, ActiveBuildState>>,
-    /// Queued builds (waiting for workers).
+    /// Queued builds (waiting for workers). Membership changes take `active`
+    /// first, so queue departure, cancellation and admission share one commit.
     queued: RwLock<VecDeque<QueuedBuildState>>,
     /// Maximum capacity for history.
     capacity: usize,
@@ -808,11 +822,8 @@ impl BuildHistory {
             }
             cancelled.insert(wrapper.to_owned());
         }
+        // Queue removal and its no-start receipt are one ownership snapshot.
         self.persist_ownership(&active, None)?;
-        self.queued
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .retain(|state| state.local_wrapper_id.as_deref() != Some(wrapper));
         Ok(WrapperCancellation::BeforeStart)
     }
 
@@ -824,14 +835,26 @@ impl BuildHistory {
         queue_id: u64,
         wrapper: Option<&str>,
     ) -> std::io::Result<bool> {
-        let _active = self.active.write().unwrap_or_else(|e| e.into_inner());
+        let active = self.active.write().unwrap_or_else(|e| e.into_inner());
         if self.ownership_failed() {
             return Err(std::io::Error::other(
                 "durable ownership uncertain; restart required",
             ));
         }
         let cancelled = wrapper.is_some_and(|id| self.wrapper_cancelled(id));
-        self.remove_queued_build(queue_id);
+        let mut queue = self.queued.write().unwrap_or_else(|e| e.into_inner());
+        if let Some(state) = queue.iter().find(|state| state.id == queue_id) {
+            if state.local_wrapper_id.as_deref() != wrapper {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "queued build ownership mismatch",
+                ));
+            }
+            let mut remaining = queue.clone();
+            remaining.retain(|state| state.id != queue_id);
+            self.persist_ownership_with_queue(&active, None, &remaining)?;
+            *queue = remaining;
+        }
         Ok(cancelled)
     }
 
@@ -850,7 +873,9 @@ impl BuildHistory {
 
     /// Enqueue a build waiting for an available worker.
     ///
-    /// Returns `None` if the queue is full (when max_queue_depth > 0).
+    /// Returns `None` if the queue is full, the wrapper already owns a row or
+    /// execution, or persistence fails. Only the last closes admission through
+    /// ownership_failed; a duplicate enqueue never grants another waiter.
     pub fn enqueue_build(
         &self,
         project_id: String,
@@ -868,6 +893,23 @@ impl BuildHistory {
             return None;
         }
         let mut queue = self.queued.write().unwrap_or_else(|e| e.into_inner());
+        if let Some(wrapper) = local_wrapper_id.as_deref()
+            && (wrapper.is_empty()
+                || queue
+                    .iter()
+                    .any(|state| state.local_wrapper_id.as_deref() == Some(wrapper))
+                || active
+                    .values()
+                    .any(|state| state.local_wrapper_id.as_deref() == Some(wrapper))
+                || self
+                    .terminal
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .values()
+                    .any(|receipt| receipt.local_wrapper_id.as_deref() == Some(wrapper)))
+        {
+            return None;
+        }
 
         // Check queue depth limit
         if self.max_queue_depth > 0 && queue.len() >= self.max_queue_depth {
@@ -881,9 +923,6 @@ impl BuildHistory {
         }
 
         let id = self.next_queue_id()?;
-        // A crash may waste an ID, but cannot expose an ID before its high-water
-        // mark is durable and later cancel a different wrapper after restart.
-        self.persist_ownership(&active, None).ok()?;
         let queued_at = Utc::now().to_rfc3339();
         let state = QueuedBuildState {
             id,
@@ -892,12 +931,21 @@ impl BuildHistory {
             queued_at,
             queued_at_mono: Instant::now(),
             hook_pid,
+            hook_process_identity: process_identity(hook_pid),
             local_wrapper_id,
             slots_needed,
             estimated_start: None,
+            recovered: false,
         };
 
-        queue.push_back(state.clone());
+        // Do not expose queue membership before both it and its ID high-water
+        // mark are durable. A post-rename failure may leave the row on disk;
+        // admission stays closed until restart resolves that uncertainty.
+        let mut pending = queue.clone();
+        pending.push_back(state.clone());
+        self.persist_ownership_with_queue(&active, None, &pending)
+            .ok()?;
+        *queue = pending;
         debug!(
             "Build queued: id={}, position={}, project={}",
             id,
@@ -912,29 +960,39 @@ impl BuildHistory {
     ///
     /// Called when a worker becomes available.
     pub fn dequeue_build(&self) -> Option<QueuedBuildState> {
-        let mut queue = self.queued.write().unwrap_or_else(|e| e.into_inner());
-        let state = queue.pop_front()?;
-        debug!(
-            "Build dequeued: id={}, waited {:?}, project={}",
-            state.id,
-            state.queued_at_mono.elapsed(),
-            state.project_id
-        );
-        Some(state)
+        self.remove_queued_matching(|_| true)
     }
 
     /// Remove a specific queued build by ID (e.g., for cancellation).
     pub fn remove_queued_build(&self, queue_id: u64) -> Option<QueuedBuildState> {
-        let mut queue = self.queued.write().unwrap_or_else(|e| e.into_inner());
-        let pos = queue.iter().position(|b| b.id == queue_id)?;
-        queue.remove(pos)
+        self.remove_queued_matching(|state| state.id == queue_id)
     }
 
-    /// Remove a queued build by hook PID.
+    /// PID-only removal cannot identify an owner recovered after restart.
+    /// Recovered rows require their queue ID or durable wrapper identity.
     pub fn remove_queued_build_by_pid(&self, hook_pid: u32) -> Option<QueuedBuildState> {
+        self.remove_queued_matching(|state| !state.recovered && state.hook_pid == hook_pid)
+    }
+
+    /// All membership mutations share the ownership serialization lock. On
+    /// failure retain visibility and close admission; never acknowledge a
+    /// departure whose durable result is unknown.
+    fn remove_queued_matching(
+        &self,
+        matches: impl Fn(&QueuedBuildState) -> bool,
+    ) -> Option<QueuedBuildState> {
+        let active = self.active.write().unwrap_or_else(|e| e.into_inner());
+        if self.ownership_failed() {
+            return None;
+        }
         let mut queue = self.queued.write().unwrap_or_else(|e| e.into_inner());
-        let pos = queue.iter().position(|b| b.hook_pid == hook_pid)?;
-        queue.remove(pos)
+        let pos = queue.iter().position(matches)?;
+        let mut remaining = queue.clone();
+        let removed = remaining.remove(pos)?;
+        self.persist_ownership_with_queue(&active, None, &remaining)
+            .ok()?;
+        *queue = remaining;
+        Some(removed)
     }
 
     /// Get all queued builds (in queue order).
@@ -1236,6 +1294,7 @@ impl BuildHistory {
         let ownership_path = path.with_extension("ownership.json");
         let mut active = HashMap::new();
         let mut terminal = HashMap::new();
+        let mut queued = VecDeque::new();
         let mut cancelled_wrappers = HashSet::new();
         let mut next_queue_id = None;
         let mut ownership_existed = false;
@@ -1243,12 +1302,16 @@ impl BuildHistory {
             Ok(file) => {
                 ownership_existed = true;
                 let snapshot: DurableOwnership = serde_json::from_reader(file)?;
-                if snapshot.version != 1 {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "unsupported ownership version",
-                    ));
-                }
+                queued = match (snapshot.version, snapshot.queued) {
+                    (1, None) => VecDeque::new(),
+                    (2, Some(queue)) if snapshot.next_queue_id.is_some() => queue,
+                    _ => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "unsupported ownership version or missing durable queue/high-water mark",
+                        ));
+                    }
+                };
                 cancelled_wrappers = snapshot.cancelled_wrappers;
                 next_queue_id = snapshot.next_queue_id;
                 if next_queue_id.is_some_and(|id| id < QUEUE_ID_NAMESPACE) {
@@ -1306,6 +1369,41 @@ impl BuildHistory {
                     }
                     terminal.insert(id, receipt);
                 }
+                let mut occupied = occupied_wrapper_ids(&active, &terminal, &cancelled_wrappers);
+                let wall_now = Utc::now();
+                let mono_now = Instant::now();
+                let mut previous_id = None;
+                for state in &mut queued {
+                    if state.id < QUEUE_ID_NAMESPACE
+                        || next_queue_id.is_none_or(|next| state.id >= next)
+                        || previous_id.is_some_and(|previous| state.id <= previous)
+                        || state.local_wrapper_id.as_ref().is_some_and(|wrapper| {
+                            wrapper.is_empty() || !occupied.insert(wrapper.clone())
+                        })
+                    {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "invalid, out-of-order or conflicting queued ownership",
+                        ));
+                    }
+                    previous_id = Some(state.id);
+                    let timestamp =
+                        DateTime::parse_from_rfc3339(&state.queued_at).map_err(|error| {
+                            std::io::Error::new(std::io::ErrorKind::InvalidData, error)
+                        })?;
+                    let age = wall_now
+                        .signed_duration_since(timestamp)
+                        .to_std()
+                        .unwrap_or_default();
+                    state.queued_at_mono = mono_now.checked_sub(age).ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "queued timestamp cannot be represented by the monotonic clock",
+                        )
+                    })?;
+                    state.estimated_start = None;
+                    state.recovered = true;
+                }
                 while records.len() > capacity {
                     records.pop_front();
                 }
@@ -1329,7 +1427,7 @@ impl BuildHistory {
         let history = Self {
             records: RwLock::new(records),
             active: RwLock::new(active),
-            queued: RwLock::new(VecDeque::new()),
+            queued: RwLock::new(queued),
             capacity,
             max_queue_depth: DEFAULT_MAX_QUEUE_DEPTH,
             next_id: AtomicU64::new(initial_id),
@@ -1491,17 +1589,53 @@ impl BuildHistory {
     }
 
     /// Atomically commit ownership before admitting or acknowledging a job.
+    /// An identity-bound queue-to-active or queue-to-cancelled transition must
+    /// not leave a second queued copy in the durable file, even if the daemon
+    /// dies before its API handler performs the old explicit queue removal.
     fn persist_ownership(
         &self,
         active: &HashMap<u64, ActiveBuildState>,
         completed: Option<&TerminalOwnership>,
+    ) -> std::io::Result<()> {
+        let mut queued = self.queued.write().unwrap_or_else(|e| e.into_inner());
+        if queued.is_empty() {
+            return self.persist_ownership_with_queue(active, completed, &queued);
+        }
+        let occupied = occupied_wrapper_ids(
+            active,
+            &self.terminal.read().unwrap_or_else(|e| e.into_inner()),
+            &self
+                .cancelled_wrappers
+                .read()
+                .unwrap_or_else(|e| e.into_inner()),
+        );
+        let mut remaining = queued.clone();
+        remaining.retain(|state| {
+            state
+                .local_wrapper_id
+                .as_deref()
+                .is_none_or(|wrapper| !occupied.contains(wrapper))
+        });
+        self.persist_ownership_with_queue(active, completed, &remaining)?;
+        *queued = remaining;
+        Ok(())
+    }
+
+    /// Commit a projected queue while its caller holds `active` then `queued`.
+    /// Separating this from persist_ownership avoids recursively locking the
+    /// queue in enqueue/departure paths. No memory rollback claims disk success.
+    fn persist_ownership_with_queue(
+        &self,
+        active: &HashMap<u64, ActiveBuildState>,
+        completed: Option<&TerminalOwnership>,
+        queued: &VecDeque<QueuedBuildState>,
     ) -> std::io::Result<()> {
         if self.ownership_failed() {
             return Err(std::io::Error::other(
                 "durable ownership uncertain; restart required",
             ));
         }
-        let result = self.write_ownership(active, completed);
+        let result = self.write_ownership(active, completed, queued);
         if result.is_err() {
             self.ownership_failed.store(true, Ordering::SeqCst);
         }
@@ -1512,6 +1646,7 @@ impl BuildHistory {
         &self,
         active: &HashMap<u64, ActiveBuildState>,
         completed: Option<&TerminalOwnership>,
+        queued: &VecDeque<QueuedBuildState>,
     ) -> std::io::Result<()> {
         let Some(path) = &self.persistence_path else {
             return Ok(());
@@ -1519,7 +1654,7 @@ impl BuildHistory {
         let path = path.with_extension("ownership.json");
         let terminal = self.terminal.read().unwrap_or_else(|e| e.into_inner());
         let snapshot = DurableOwnership {
-            version: 1,
+            version: 2,
             active: active
                 .values()
                 .filter(|state| completed.is_none_or(|receipt| receipt.record.id != state.id))
@@ -1532,6 +1667,7 @@ impl BuildHistory {
                 .unwrap_or_else(|e| e.into_inner())
                 .clone(),
             next_queue_id: Some(self.next_queue_id.load(Ordering::SeqCst)),
+            queued: Some(queued.clone()),
         };
         let parent = path
             .parent()
@@ -1556,6 +1692,26 @@ impl BuildHistory {
         File::open(parent)?.sync_all()?;
         Ok(())
     }
+}
+
+/// Queue visibility and active/terminal/no-start ownership are disjoint for
+/// durable wrapper identities. Anonymous legacy queue rows cannot be joined
+/// to an execution by a reusable PID and are never guessed away here.
+fn occupied_wrapper_ids(
+    active: &HashMap<u64, ActiveBuildState>,
+    terminal: &HashMap<u64, TerminalOwnership>,
+    cancelled: &HashSet<String>,
+) -> HashSet<String> {
+    active
+        .values()
+        .filter_map(|state| state.local_wrapper_id.clone())
+        .chain(
+            terminal
+                .values()
+                .filter_map(|receipt| receipt.local_wrapper_id.clone()),
+        )
+        .chain(cancelled.iter().cloned())
+        .collect()
 }
 
 /// Drop receipts past retention, then the oldest beyond the cap. An
@@ -2854,7 +3010,7 @@ mod tests {
             .unwrap();
         assert_eq!(new.id, old.id + 1);
         assert!(new.id >= QUEUE_ID_NAMESPACE);
-        assert!(recovered.queued_build(old.id).is_none());
+        assert!(recovered.queued_build(old.id).unwrap().recovered);
         assert_eq!(
             recovered
                 .queued_build(new.id)
@@ -2863,11 +3019,13 @@ mod tests {
                 .as_deref(),
             Some("new-wrapper")
         );
+        assert_eq!(recovered.queue_depth(), 2);
         assert!(matches!(
             recovered.cancel_wrapper("old-wrapper").unwrap(),
-            WrapperCancellation::NotQueued
+            WrapperCancellation::BeforeStart
         ));
         assert_eq!(recovered.queue_depth(), 1);
+        assert!(recovered.queued_build(new.id).is_some());
     }
 
     #[test]
@@ -2957,6 +3115,9 @@ mod tests {
         assert!(history.ownership_failed());
         assert_eq!(history.queue_depth(), 0);
         let recovered = BuildHistory::load_from_file(&path, 10).unwrap();
+        // The injected error occurred after the atomic rename: the queue
+        // intent exists on disk even though the enqueue was not acknowledged.
+        assert!(recovered.queued_build(skipped).unwrap().recovered);
         let queued = recovered
             .enqueue_build("next".into(), "cargo build".into(), 0, 2, None)
             .unwrap();
@@ -2968,7 +3129,507 @@ mod tests {
                 .is_none()
         );
         assert_eq!(recovered.next_queue_id.load(Ordering::SeqCst), u64::MAX);
+        assert_eq!(recovered.queue_depth(), 2);
+    }
+
+    #[test]
+    fn durable_queue_restart_preserves_order_identity_and_capacity() {
+        let root = TempDir::new().unwrap();
+        let path = root.path().join("history.jsonl");
+        let history = BuildHistory::new(1).with_persistence(path.clone());
+        let expected: Vec<_> = (0..5)
+            .map(|i| {
+                history
+                    .enqueue_build(
+                        format!("project-{i}"),
+                        format!("cargo test -p package-{i}"),
+                        std::process::id(),
+                        i + 1,
+                        Some(format!("wrapper-{i}")),
+                    )
+                    .unwrap()
+            })
+            .collect();
+        history.update_queue_estimates();
+        drop(history);
+        for _ in 0..3 {
+            let recovered = BuildHistory::load_from_file(&path, 1)
+                .unwrap()
+                .with_max_queue_depth(2);
+            assert_eq!(
+                recovered.queue_depth(),
+                5,
+                "history/queue limits do not evict owners"
+            );
+            assert!(
+                recovered.active_builds().is_empty(),
+                "loading is not admission"
+            );
+            for (position, (before, after)) in
+                expected.iter().zip(recovered.queued_builds()).enumerate()
+            {
+                assert_eq!(
+                    serde_json::to_value(before).unwrap(),
+                    serde_json::to_value(&after).unwrap()
+                );
+                assert_eq!(recovered.queue_position(after.id), Some(position + 1));
+                assert!(after.recovered);
+                assert!(after.estimated_start.is_none());
+            }
+            assert!(
+                recovered
+                    .enqueue_build("extra".into(), "build".into(), 0, 1, None)
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn durable_queue_departures_and_cancellation_do_not_resurrect() {
+        let root = TempDir::new().unwrap();
+        let path = root.path().join("history.jsonl");
+        let history = BuildHistory::new(10).with_persistence(path.clone());
+        let rows: Vec<_> = (0..5)
+            .map(|i| {
+                history
+                    .enqueue_build(
+                        format!("p-{i}"),
+                        "build".into(),
+                        100 + i,
+                        1,
+                        Some(format!("w-{i}")),
+                    )
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(history.dequeue_build().unwrap().id, rows[0].id);
+        assert_eq!(history.remove_queued_build(rows[2].id).unwrap().id, rows[2].id);
+        assert_eq!(history.remove_queued_build_by_pid(103).unwrap().id, rows[3].id);
+        assert!(!history.finish_queued_build(rows[1].id, Some("w-1")).unwrap());
+        drop(history);
+        let recovered = BuildHistory::load_from_file(&path, 10).unwrap();
+        assert_eq!(
+            recovered
+                .queued_builds()
+                .iter()
+                .map(|row| row.id)
+                .collect::<Vec<_>>(),
+            vec![rows[4].id]
+        );
+        assert!(matches!(
+            recovered.cancel_wrapper("w-4").unwrap(),
+            WrapperCancellation::BeforeStart
+        ));
+        drop(recovered);
+        let reopened = BuildHistory::load_from_file(&path, 10).unwrap();
+        assert!(reopened.queue_is_empty());
+        assert!(reopened.wrapper_cancelled("w-4"));
+        assert!(matches!(
+            reopened.cancel_wrapper("w-1").unwrap(),
+            WrapperCancellation::NotQueued
+        ));
+    }
+
+    #[test]
+    fn durable_queue_admission_retires_waiter_in_the_same_snapshot() {
+        let root = TempDir::new().unwrap();
+        let path = root.path().join("history.jsonl");
+        let history = BuildHistory::new(10).with_persistence(path.clone());
+        let queued = history
+            .enqueue_build(
+                "project".into(),
+                "cargo build".into(),
+                0,
+                2,
+                Some("owner".into()),
+            )
+            .unwrap();
+        let active = history
+            .try_start_active_build_with_wrapper(
+                "project".into(),
+                "worker".into(),
+                "cargo build".into(),
+                0,
+                Some("owner".into()),
+                2,
+                BuildLocation::Remote,
+            )
+            .unwrap()
+            .unwrap();
+        // No explicit API queue removal: model a crash immediately after admission.
+        assert!(history.queued_build(queued.id).is_none());
+        drop(history);
+        let recovered = BuildHistory::load_from_file(&path, 10).unwrap();
+        assert!(recovered.queue_is_empty());
+        assert_eq!(recovered.active_builds().len(), 1);
+        assert_eq!(recovered.active_build(active.id).unwrap().slots, 2);
+        assert!(matches!(
+            recovered.cancel_wrapper("owner").unwrap(),
+            WrapperCancellation::Active(id) if id == active.id
+        ));
+    }
+
+    #[test]
+    fn durable_queue_departure_failure_retains_visibility_until_restart() {
+        for after_rename in [false, true] {
+            let root = TempDir::new().unwrap();
+            let path = root.path().join("history.jsonl");
+            let mut history = BuildHistory::new(10).with_persistence(path.clone());
+            let row = history
+                .enqueue_build(
+                    "project".into(),
+                    "build".into(),
+                    0,
+                    1,
+                    Some("owner".into()),
+                )
+                .unwrap();
+            if after_rename {
+                history
+                    .fail_after_ownership_rename
+                    .store(true, Ordering::SeqCst);
+            } else {
+                let blocker = root.path().join("not-a-directory");
+                std::fs::write(&blocker, b"retained").unwrap();
+                history.persistence_path = Some(blocker.join("history.jsonl"));
+            }
+            assert!(history.finish_queued_build(row.id, Some("owner")).is_err());
+            assert!(history.ownership_failed());
+            assert!(history.queued_build(row.id).is_some());
+            assert!(history.remove_queued_build(row.id).is_none());
+            assert!(history.dequeue_build().is_none());
+            drop(history);
+            let recovered = BuildHistory::load_from_file(&path, 10).unwrap();
+            assert_eq!(recovered.queued_build(row.id).is_none(), after_rename);
+        }
+    }
+
+    #[test]
+    fn durable_queue_wrong_departure_identity_changes_nothing() {
+        let root = TempDir::new().unwrap();
+        let path = root.path().join("history.jsonl");
+        let history = BuildHistory::new(10).with_persistence(path.clone());
+        let row = history
+            .enqueue_build(
+                "project".into(),
+                "build".into(),
+                0,
+                1,
+                Some("owner".into()),
+            )
+            .unwrap();
+        let before = std::fs::read(path.with_extension("ownership.json")).unwrap();
+        for wrong in [None, Some("different")] {
+            assert_eq!(
+                history.finish_queued_build(row.id, wrong).unwrap_err().kind(),
+                std::io::ErrorKind::PermissionDenied
+            );
+            assert!(history.queued_build(row.id).is_some());
+            assert!(!history.ownership_failed());
+            assert_eq!(
+                std::fs::read(path.with_extension("ownership.json")).unwrap(),
+                before
+            );
+        }
+    }
+
+    #[test]
+    fn durable_queue_reload_reconstructs_age_without_rebinding_pid() {
+        let root = TempDir::new().unwrap();
+        let path = root.path().join("history.jsonl");
+        let history = BuildHistory::new(10).with_persistence(path.clone());
+        let row = history
+            .enqueue_build(
+                "project".into(),
+                "build".into(),
+                std::process::id(),
+                1,
+                Some("owner".into()),
+            )
+            .unwrap();
+        let ownership = path.with_extension("ownership.json");
+        let mut snapshot: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&ownership).unwrap()).unwrap();
+        let old = (Utc::now() - ChronoDuration::seconds(120)).to_rfc3339();
+        snapshot["queued"][0]["queued_at"] = serde_json::json!(old);
+        // Model an old incarnation; this does not force real OS PID reuse.
+        snapshot["queued"][0]["hook_process_identity"] =
+            serde_json::json!("prior-process-incarnation");
+        std::fs::write(&ownership, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+        drop(history);
+        let recovered = BuildHistory::load_from_file(&path, 10).unwrap();
+        let restored = recovered.queued_build(row.id).unwrap();
+        assert_eq!(restored.queued_at, old);
+        assert!(restored.queued_at_mono.elapsed() >= Duration::from_secs(120));
+        assert_eq!(
+            restored.hook_process_identity.as_deref(),
+            Some("prior-process-incarnation")
+        );
+        assert_eq!(restored.hook_pid, std::process::id());
+        assert!(restored.recovered);
+        assert!(
+            recovered
+                .remove_queued_build_by_pid(std::process::id())
+                .is_none(),
+            "a recycled PID cannot identify recovered queue ownership"
+        );
+        assert!(recovered.queued_build(row.id).is_some());
+    }
+
+    #[test]
+    fn durable_queue_invalid_snapshot_is_rejected_without_rewriting_evidence() {
+        for case in 0..10 {
+            let root = TempDir::new().unwrap();
+            let path = root.path().join("history.jsonl");
+            let history = BuildHistory::new(10).with_persistence(path.clone());
+            let row = history
+                .enqueue_build(
+                    "project".into(),
+                    "build".into(),
+                    0,
+                    1,
+                    Some("owner".into()),
+                )
+                .unwrap();
+            let ownership = path.with_extension("ownership.json");
+            let mut snapshot: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&ownership).unwrap()).unwrap();
+            match case {
+                0 => snapshot["queued"][0]["id"] = serde_json::json!(1),
+                1 => snapshot["next_queue_id"] = serde_json::json!(row.id),
+                2 => snapshot["queued"][0]["queued_at"] = serde_json::json!("not-a-time"),
+                3 => {
+                    let duplicate = snapshot["queued"][0].clone();
+                    snapshot["queued"].as_array_mut().unwrap().push(duplicate);
+                }
+                4 => snapshot["cancelled_wrappers"] = serde_json::json!(["owner"]),
+                5 => {
+                    snapshot.as_object_mut().unwrap().remove("queued");
+                }
+                6 => snapshot["version"] = serde_json::json!(1),
+                7 => {
+                    snapshot["queued"] = serde_json::json!([]);
+                    snapshot.as_object_mut().unwrap().remove("next_queue_id");
+                }
+                8 => {
+                    let mut duplicate = snapshot["queued"][0].clone();
+                    duplicate["id"] = serde_json::json!(row.id + 1);
+                    snapshot["next_queue_id"] = serde_json::json!(row.id + 2);
+                    snapshot["queued"].as_array_mut().unwrap().push(duplicate);
+                }
+                _ => snapshot["queued"][0]["local_wrapper_id"] = serde_json::json!(""),
+            }
+            let bytes = serde_json::to_vec(&snapshot).unwrap();
+            std::fs::write(&ownership, &bytes).unwrap();
+            drop(history);
+            assert!(BuildHistory::load_from_file(&path, 10).is_err(), "case {case}");
+            assert_eq!(std::fs::read(&ownership).unwrap(), bytes, "case {case}");
+        }
+    }
+
+    #[tokio::test]
+    async fn durable_queue_rejects_duplicate_and_existing_execution_owners() {
+        let root = TempDir::new().unwrap();
+        let path = root.path().join("history.jsonl");
+        let history = BuildHistory::new(10).with_persistence(path.clone());
+        let enqueue = |wrapper: &str| {
+            history.enqueue_build(
+                "project".into(),
+                "build".into(),
+                0,
+                1,
+                Some(wrapper.to_owned()),
+            )
+        };
+        let queued = enqueue("queued-owner").unwrap();
+        let before = std::fs::read(path.with_extension("ownership.json")).unwrap();
+        let next = history.next_queue_id.load(Ordering::SeqCst);
+        assert!(enqueue("queued-owner").is_none());
+        assert!(enqueue("").is_none());
+        assert_eq!(history.next_queue_id.load(Ordering::SeqCst), next);
+        assert_eq!(
+            std::fs::read(path.with_extension("ownership.json")).unwrap(),
+            before
+        );
+        let active = history
+            .try_start_active_build_with_wrapper(
+                "active-project".into(),
+                "worker".into(),
+                "build".into(),
+                0,
+                Some("execution-owner".into()),
+                2,
+                BuildLocation::Remote,
+            )
+            .unwrap()
+            .unwrap();
+        assert!(enqueue("execution-owner").is_none());
+        history
+            .complete_durable(
+                active.id,
+                "worker",
+                Some("execution-owner"),
+                BuildCompletion {
+                    exit_code: 0,
+                    duration_ms: None,
+                    bytes_transferred: None,
+                    timing: None,
+                    cancellation: None,
+                },
+            )
+            .unwrap()
+            .unwrap();
+        assert!(enqueue("execution-owner").is_none());
+        assert!(!history.ownership_failed());
+        let recovered = BuildHistory::load_from_file(&path, 10).unwrap();
         assert_eq!(recovered.queue_depth(), 1);
+        assert_eq!(recovered.queued_builds()[0].id, queued.id);
+    }
+
+    #[test]
+    fn durable_queue_admission_cancellation_race_survives_restart() {
+        use std::sync::{Arc, Barrier};
+
+        for _ in 0..8 {
+            let root = TempDir::new().unwrap();
+            let path = root.path().join("history.jsonl");
+            let history = Arc::new(BuildHistory::new(10).with_persistence(path.clone()));
+            history
+                .enqueue_build(
+                    "project".into(),
+                    "cargo build".into(),
+                    0,
+                    2,
+                    Some("racing".into()),
+                )
+                .unwrap();
+            let barrier = Arc::new(Barrier::new(2));
+            let admitting = history.clone();
+            let admission_barrier = barrier.clone();
+            let task = std::thread::spawn(move || {
+                admission_barrier.wait();
+                admitting
+                    .try_start_active_build_with_wrapper(
+                        "project".into(),
+                        "worker".into(),
+                        "cargo build".into(),
+                        0,
+                        Some("racing".into()),
+                        2,
+                        BuildLocation::Remote,
+                    )
+                    .unwrap()
+            });
+            barrier.wait();
+            let cancellation = history.cancel_wrapper("racing").unwrap();
+            let admitted = task.join().unwrap();
+            drop(history);
+            let recovered = BuildHistory::load_from_file(&path, 10).unwrap();
+            assert!(recovered.queue_is_empty());
+            match cancellation {
+                WrapperCancellation::BeforeStart => {
+                    assert!(admitted.is_none());
+                    assert!(recovered.wrapper_cancelled("racing"));
+                    assert!(recovered.active_builds().is_empty());
+                }
+                WrapperCancellation::Active(id) => {
+                    assert_eq!(admitted.unwrap().id, id);
+                    assert!(!recovered.wrapper_cancelled("racing"));
+                    assert_eq!(recovered.active_builds().len(), 1);
+                    assert_eq!(recovered.active_build(id).unwrap().slots, 2);
+                }
+                _ => panic!("race must resolve to admission or no-start cancellation"),
+            }
+        }
+    }
+
+    /// Kill the process using the real ownership writer without orderly
+    /// shutdown. This is a storage crash test, not a client reconnect test.
+    #[cfg(unix)]
+    #[test]
+    fn durable_queue_survives_process_kill_before_shutdown() {
+        const ROOT: &str = "RCH_DURABLE_QUEUE_CRASH_TEST_ROOT";
+        const TEST: &str =
+            "history::tests::durable_queue_survives_process_kill_before_shutdown";
+        if let Some(root) = std::env::var_os(ROOT) {
+            let root = PathBuf::from(root);
+            let history = BuildHistory::new(10).with_persistence(root.join("history.jsonl"));
+            let ids: Vec<_> = (0..4)
+                .map(|i| {
+                    history
+                        .enqueue_build(
+                            format!("project-{i}"),
+                            "cargo check".into(),
+                            std::process::id(),
+                            i + 1,
+                            Some(format!("crash-wrapper-{i}")),
+                        )
+                        .unwrap()
+                        .id
+                })
+                .collect();
+            std::fs::write(root.join("ready.pending"), serde_json::to_vec(&ids).unwrap())
+                .unwrap();
+            std::fs::rename(root.join("ready.pending"), root.join("ready.json")).unwrap();
+            loop {
+                std::thread::park();
+            }
+        }
+
+        struct OwnedChild(std::process::Child);
+        impl Drop for OwnedChild {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let root = TempDir::new().unwrap();
+        let mut child = OwnedChild(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture"])
+                .env(ROOT, root.path())
+                .stdout(File::create(root.path().join("child.stdout")).unwrap())
+                .stderr(File::create(root.path().join("child.stderr")).unwrap())
+                .spawn()
+                .unwrap(),
+        );
+        let started = Instant::now();
+        while !root.path().join("ready.json").is_file() {
+            assert!(child.0.try_wait().unwrap().is_none(), "writer exited before enqueue");
+            assert!(started.elapsed() < Duration::from_secs(10), "writer startup timed out");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let ids: Vec<u64> = serde_json::from_slice(
+            &std::fs::read(root.path().join("ready.json")).unwrap(),
+        )
+        .unwrap();
+        child.0.kill().unwrap();
+        let status = child.0.wait().unwrap();
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(status.signal(), Some(9));
+        let path = root.path().join("history.jsonl");
+        let recovered = BuildHistory::load_from_file(&path, 1).unwrap();
+        assert!(recovered.active_builds().is_empty());
+        assert_eq!(
+            recovered
+                .queued_builds()
+                .iter()
+                .map(|row| row.id)
+                .collect::<Vec<_>>(),
+            ids
+        );
+        for (i, row) in recovered.queued_builds().iter().enumerate() {
+            assert_eq!(row.project_id, format!("project-{i}"));
+            assert_eq!(row.slots_needed, i as u32 + 1);
+            assert_eq!(row.hook_pid, child.0.id());
+            assert!(row.recovered);
+            assert!(matches!(
+                recovered.cancel_wrapper(&format!("crash-wrapper-{i}")).unwrap(),
+                WrapperCancellation::BeforeStart
+            ));
+        }
+        drop(recovered);
+        assert!(BuildHistory::load_from_file(&path, 1).unwrap().queue_is_empty());
     }
 
     #[test]
