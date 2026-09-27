@@ -35,6 +35,11 @@ const MAX_OUTPUT_SIZE: u64 = 10 * 1024 * 1024;
 
 const HEALTH_CHECK_COMMAND: &str = "echo ok";
 
+/// Bound on the pool's reuse liveness probe (`echo ok` over an existing
+/// master). A live master answers in milliseconds; a hung one must not hold a
+/// caller for the client's multi-minute command timeout.
+const POOL_LIVENESS_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
 fn is_expected_health_check_output(stdout: &str) -> bool {
     stdout
         .trim()
@@ -653,7 +658,17 @@ impl SshClient {
 
     /// Check if the worker is reachable via SSH.
     pub async fn health_check(&self) -> Result<bool> {
-        match self.execute(HEALTH_CHECK_COMMAND).await {
+        self.health_check_with_timeout(self.options.command_timeout)
+            .await
+    }
+
+    /// [`health_check`](Self::health_check) bounded by `timeout` instead of
+    /// the client's command timeout (300s for pooled clients).
+    pub async fn health_check_with_timeout(&self, timeout: Duration) -> Result<bool> {
+        match self
+            .execute_with_timeout(HEALTH_CHECK_COMMAND, timeout)
+            .await
+        {
             Ok(result) => Ok(result.success() && is_expected_health_check_output(&result.stdout)),
             Err(e) => {
                 warn!("Health check failed for {}: {}", self.config.id, e);
@@ -984,6 +999,24 @@ impl SshPool {
     /// a connected client this probes it with a lightweight health check, and on
     /// failure reconnects once under the per-worker write lock.
     pub async fn get_or_connect(&self, config: &WorkerConfig) -> Result<Arc<RwLock<SshClient>>> {
+        self.get_or_connect_probing_within(config, POOL_LIVENESS_PROBE_TIMEOUT)
+            .await
+    }
+
+    /// [`get_or_connect`](Self::get_or_connect) with the liveness probe bounded
+    /// by `probe_timeout`.
+    ///
+    /// The probe used to run under the client's command timeout (300s for the
+    /// daemon's pools), and a failed probe is followed by a reconnect and a
+    /// second probe. A worker whose master was up but whose commands hung (fork
+    /// exhaustion, D-state) therefore held a caller with a 10-15s budget (health
+    /// probe, toolchain preflight during selection) for ~10 minutes, and the
+    /// sequential health loop stalled the whole fleet's state behind it.
+    async fn get_or_connect_probing_within(
+        &self,
+        config: &WorkerConfig,
+        probe_timeout: Duration,
+    ) -> Result<Arc<RwLock<SshClient>>> {
         let shared_client = self.get_or_create_client_entry(config).await;
 
         // Fast path: reuse only a session that is both present AND verified live.
@@ -991,7 +1024,11 @@ impl SshPool {
         // a shared read lock and never blocks other borrowers of this worker.
         let reusable = {
             let guard = shared_client.read().await;
-            guard.is_connected() && guard.health_check().await.unwrap_or(false)
+            guard.is_connected()
+                && guard
+                    .health_check_with_timeout(probe_timeout)
+                    .await
+                    .unwrap_or(false)
         };
         if reusable {
             debug!("Reusing live connection to {}", config.id);
@@ -1005,7 +1042,11 @@ impl SshPool {
         let mut client_guard = shared_client.write().await;
         if !client_guard.is_connected() {
             client_guard.connect().await?;
-        } else if !client_guard.health_check().await.unwrap_or(false) {
+        } else if !client_guard
+            .health_check_with_timeout(probe_timeout)
+            .await
+            .unwrap_or(false)
+        {
             warn!(
                 "Pooled SSH connection to {} failed liveness probe; reconnecting",
                 config.id
@@ -1146,7 +1187,12 @@ impl SshPool {
         command: &str,
         command_timeout: Duration,
     ) -> Result<CommandResult> {
-        let client = self.get_or_connect(config).await?;
+        let client = self
+            .get_or_connect_probing_within(
+                config,
+                command_timeout.min(POOL_LIVENESS_PROBE_TIMEOUT),
+            )
+            .await?;
         // Execute under a shared read lock: execute() needs only `&self`, so
         // concurrent callers for the same worker can multiplex over the one
         // master without serializing on a write lock.
