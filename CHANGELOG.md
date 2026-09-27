@@ -51,6 +51,18 @@ behavior: experimental, operator-only, and not in the archives.
     off: 69 such claims were found across 9 workers, and those are being cleaned
     up on the fleet (`bd-dmg2k`,
     [`5ee860bd`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/5ee860bd08dad4ff16324d5ce84cb74f0685ab0a)).
+  - Remote builds run under the caller's umask again. The durable-completion
+    wrapper leaked its private `umask 077` into the workload, so every output
+    was created 0600/0700 and rsync carried those modes home; mode-sensitive
+    steps (a build script watching a file's permissions) silently stopped
+    rerunning. Only the wrapper's own receipt stays private.
+  - `rch diagnose` no longer reserves a worker. It made a real selection whose
+    release was refused, leaving a ghost build that held slots and fenced the
+    project off that worker until the daemon restarted
+    ([`b1b67881`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/b1b678819a8dc80a51a6dca9dcbdd7665a63351c)).
+  - `cargo --config=K=V <subcommand>` offloads again. `rch exec` re-quotes words
+    containing `=`, and the classifier read `'--config=K=V'` as the subcommand,
+    so these builds silently ran locally.
   - A rejected output set fails the build cleanly instead of stranding source
     ownership
     ([`42a92d82`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/42a92d8232f5a337612c01a4a698c2ece0dcffcc)).
@@ -109,6 +121,12 @@ behavior: experimental, operator-only, and not in the archives.
     `sleep` holding the SSH channel or signal a reused PID
     ([`54a22cb2`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/54a22cb23d30e2473834e9657c4c5549667b58a8)).
   - `FORCE_COLOR=false` disables color.
+
+Known issue, present since 2.1.0 and newly visible: with a forwarded
+`CARGO_TARGET_DIR`, `cargo test --no-run`/`cargo bench --no-run` executables
+are not returned when Cargo uses its new build-dir layout, which puts them
+under `<profile>/build/` where the cache excludes drop them. The default target
+directory is unaffected (`bd-b7lot`).
 
 ## 2.1.2 — 2026-09-27
 
