@@ -117,6 +117,48 @@ pub async fn download_release(
         .await?;
 
         let expected_checksum = extract_checksum(&checksum_path, &archive_asset.name).await?;
+
+        // bd-oxxnk: the checksum comes from the same release, so it detects
+        // corruption, not tampering. dsr publishes a `.minisig` beside every
+        // archive; verify it against the pinned release key and refuse a bad
+        // one outright.
+        let minisign_asset = update
+            .assets
+            .iter()
+            .find(|a| a.name == format!("{}.minisig", archive_asset.name));
+        let minisign_verified = match minisign_asset {
+            Some(sig_asset) if !skip_verify => {
+                if !ctx.is_json() {
+                    println!("Verifying signature (minisign)...");
+                }
+                let sig_path = asset_temp_path(temp_dir.path(), &sig_asset.name)?;
+                download_with_retry(
+                    &sig_asset.browser_download_url,
+                    &sig_path,
+                    &sig_asset.name,
+                    MAX_DOWNLOAD_ATTEMPTS,
+                )
+                .await?;
+                let signature = tokio::fs::read_to_string(&sig_path).await.map_err(|e| {
+                    UpdateError::SignatureVerificationFailed(format!(
+                        "cannot read {}: {e}",
+                        sig_asset.name
+                    ))
+                })?;
+                super::verify::verify_minisign(&archive_path, &signature)?;
+                Some(true)
+            }
+            Some(_) => {
+                if !ctx.is_json() {
+                    println!(
+                        "Warning: skipping minisign verification (--skip-verify); checksum still enforced"
+                    );
+                }
+                None
+            }
+            None => None,
+        };
+
         let signature_bundle_asset = update
             .assets
             .iter()
@@ -156,9 +198,9 @@ pub async fn download_release(
                 None
             }
             None => {
-                if !ctx.is_json() {
+                if !ctx.is_json() && minisign_verified.is_none() {
                     println!(
-                        "Warning: No sigstore bundle available, skipping signature verification"
+                        "Warning: No signature (minisign or sigstore) available; checksum only"
                     );
                 }
                 None
@@ -171,7 +213,10 @@ pub async fn download_release(
         } else {
             verify_checksum(&archive_path, &expected_checksum).await?
         };
-        (verification.checksum_valid, verification.signature_valid)
+        (
+            verification.checksum_valid,
+            verification.signature_valid.or(minisign_verified),
+        )
     } else {
         if !ctx.is_json() {
             println!("Warning: No checksum file available for this release asset");

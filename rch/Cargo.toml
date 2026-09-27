@@ -65,6 +65,10 @@ shell-words = "1.1.0"
 
 # State detection dependencies
 which = "8.0.6"
+# Release authenticity for `rch update` (bd-oxxnk): verifies the `.minisig`
+# dsr publishes beside every archive against a pinned public key. Pure Rust,
+# no dependencies, by the minisign author.
+minisign-verify = "0.3.0"
 
 # LRU cache for classification decisions
 lru = "0.18.4"

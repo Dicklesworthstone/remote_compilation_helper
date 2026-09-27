@@ -189,6 +189,36 @@ pub(crate) async fn verify_signature(
     }
 }
 
+/// Public key dsr signs every rch release archive with (minisign key id
+/// 69B3955C8D2E62A8). A checksum from the same release only detects
+/// corruption; this signature is what makes an update authentic (bd-oxxnk).
+pub(crate) const RELEASE_MINISIGN_PUBLIC_KEY: &str =
+    "RWSoYi6NXJWzaRs1mJmOwwXrZfPWcq6MXnQlNMLBYKzlIQTLwuVQG6uO";
+
+/// Verify `archive` against a `.minisig` document with the pinned release key.
+pub(crate) fn verify_minisign(
+    archive: &std::path::Path,
+    signature_text: &str,
+) -> Result<(), UpdateError> {
+    verify_minisign_with_key(archive, signature_text, RELEASE_MINISIGN_PUBLIC_KEY)
+}
+
+fn verify_minisign_with_key(
+    archive: &std::path::Path,
+    signature_text: &str,
+    public_key: &str,
+) -> Result<(), UpdateError> {
+    let fail = |detail: String| UpdateError::SignatureVerificationFailed(detail);
+    let key = minisign_verify::PublicKey::from_base64(public_key)
+        .map_err(|e| fail(format!("invalid pinned minisign key: {e}")))?;
+    let signature = minisign_verify::Signature::decode(signature_text)
+        .map_err(|e| fail(format!("malformed .minisig: {e}")))?;
+    let bytes = std::fs::read(archive)
+        .map_err(|e| fail(format!("cannot read {}: {e}", archive.display())))?;
+    key.verify(&bytes, &signature, false)
+        .map_err(|e| fail(format!("minisign verification failed: {e}")))
+}
+
 /// Verify a byte slice against expected checksum.
 #[allow(dead_code)]
 pub fn verify_sha256_bytes(content: &[u8], expected: &str) -> Result<(), UpdateError> {
@@ -205,6 +235,61 @@ pub fn verify_sha256_bytes(content: &[u8], expected: &str) -> Result<(), UpdateE
             expected: expected.to_string(),
             actual,
         })
+    }
+}
+
+#[cfg(test)]
+mod minisign_tests {
+    use super::*;
+
+    // Fixture made once with `minisign -G -W` + `minisign -S` (throwaway key).
+    const TEST_KEY: &str = "RWTZPaZ0gaEhqMa/pPZEdaALWkxxAm/EtQzB6egPldD4Uh1cCRlw/b0w";
+    const PAYLOAD: &[u8] = b"rch minisign test payload v1\n";
+    const SIGNATURE: &str = "untrusted comment: signature from minisign secret key\n\
+RUTZPaZ0gaEhqDSXunnChY49+8G9WeMdP7wwnCG9s382LwYf7h09hfwypAG0pKwYrhcX+N1Ujyzv1r4ZpRClO4To6jTL1DR1ewo=\n\
+trusted comment: rch test fixture\n\
+xfmvGjlaWGXfdNKtFwBNm45V0V6VPZ3lLFhIzfLmQ7xUjPzacD1iHPC0MO2oczUBCt2gAZtoGnuQMxpswMpMCw==\n";
+
+    fn archive(bytes: &[u8]) -> tempfile::NamedTempFile {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), bytes).unwrap();
+        file
+    }
+
+    #[test]
+    fn genuine_signature_verifies() {
+        let file = archive(PAYLOAD);
+        verify_minisign_with_key(file.path(), SIGNATURE, TEST_KEY).unwrap();
+    }
+
+    #[test]
+    fn tampered_archive_is_refused_even_though_it_hashes_cleanly() {
+        // An attacker who replaces the archive can also replace the .sha256;
+        // the signature is what they cannot forge.
+        let file = archive(b"rch minisign test payload v2\n");
+        let error = verify_minisign_with_key(file.path(), SIGNATURE, TEST_KEY).unwrap_err();
+        assert!(
+            error.to_string().contains("minisign verification failed"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn signature_from_another_key_is_refused() {
+        let file = archive(PAYLOAD);
+        assert!(verify_minisign(file.path(), SIGNATURE).is_err());
+    }
+
+    #[test]
+    fn malformed_signature_is_refused() {
+        let file = archive(PAYLOAD);
+        let error = verify_minisign_with_key(file.path(), "not a minisig", TEST_KEY).unwrap_err();
+        assert!(error.to_string().contains("malformed .minisig"), "{error}");
+    }
+
+    #[test]
+    fn pinned_release_key_parses() {
+        minisign_verify::PublicKey::from_base64(RELEASE_MINISIGN_PUBLIC_KEY).unwrap();
     }
 }
 
