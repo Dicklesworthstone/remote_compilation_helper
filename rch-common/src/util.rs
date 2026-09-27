@@ -91,6 +91,9 @@ pub fn mask_sensitive_command(cmd: &str) -> String {
         ("STRIPE_SECRET_KEY=", "STRIPE_SECRET_KEY=***"),
         ("OPENAI_API_KEY=", "OPENAI_API_KEY=***"),
         ("ANTHROPIC_API_KEY=", "ANTHROPIC_API_KEY=***"),
+        // Any other `*_KEY=` (GROQ_KEY, SIGNING_KEY, ...): a harmless key
+        // name masked costs a log detail; an unlisted secret one leaks.
+        ("_KEY=", "_KEY=***"),
         // Command-line argument patterns (--token, --password, etc.)
         ("--token ", "--token ***"),
         ("--token=", "--token=***"),

@@ -163,9 +163,9 @@ impl Default for RedactionPolicy {
                     "RR-002",
                     ApiKey,
                     Masked,
-                    "Provider-shaped API keys (AWS AKIA…, GitHub ghp_/gho_/ghu_/ghs_/ghr_, \
-                     OpenAI/Anthropic sk-…, Google AIza…, Slack xox*, Stripe sk_live_/sk_test_) \
-                     are masked.",
+                    "Provider-shaped API keys (AWS AKIA…, GitHub ghp_/gho_/ghu_/ghs_/ghr_/\
+                     github_pat_, OpenAI/Anthropic sk-…/sk-proj-…, Google AIza…, Slack xox*, \
+                     Stripe sk_live_/sk_test_) are masked.",
                 ),
                 RedactionRule::new(
                     "RR-003",
@@ -184,8 +184,8 @@ impl Default for RedactionPolicy {
                     "RR-005",
                     DatabaseUrl,
                     Masked,
-                    "Credentials embedded in connection URLs (scheme://user:pass@host) have the \
-                     user:pass component masked.",
+                    "Credentials embedded in connection URLs (scheme://user:pass@host, \
+                     scheme://:pass@host) have the user:pass component masked.",
                 ),
                 RedactionRule::new(
                     "RR-006",
@@ -273,6 +273,8 @@ static SHAPED_PATTERNS: LazyLock<Vec<ShapedPattern>> = LazyLock::new(|| {
         p(r"AKIA[0-9A-Z]{16}", REDACTION_SENTINEL),
         // GitHub personal/OAuth/app tokens.
         p(r"gh[pousr]_[A-Za-z0-9]{20,}", REDACTION_SENTINEL),
+        // GitHub fine-grained personal access tokens.
+        p(r"github_pat_[A-Za-z0-9_]{22,}", REDACTION_SENTINEL),
         // Google API key.
         p(r"AIza[0-9A-Za-z_\-]{35}", REDACTION_SENTINEL),
         // Slack tokens.
@@ -281,6 +283,12 @@ static SHAPED_PATTERNS: LazyLock<Vec<ShapedPattern>> = LazyLock::new(|| {
         p(r"[sr]k_(live|test)_[A-Za-z0-9]{16,}", REDACTION_SENTINEL),
         // Anthropic keys (more specific than the generic sk- rule; run first).
         p(r"sk-ant-[A-Za-z0-9_\-]{16,}", REDACTION_SENTINEL),
+        // OpenAI project/service-account/admin keys carry a hyphenated prefix
+        // and `_`/`-` in the body, which the plain sk- rule cannot span.
+        p(
+            r"sk-(proj|svcacct|admin)-[A-Za-z0-9_\-]{20,}",
+            REDACTION_SENTINEL,
+        ),
         // OpenAI-style secret keys.
         p(r"sk-[A-Za-z0-9]{20,}", REDACTION_SENTINEL),
         // JWTs (header.payload.signature, base64url).
@@ -290,9 +298,10 @@ static SHAPED_PATTERNS: LazyLock<Vec<ShapedPattern>> = LazyLock::new(|| {
         ),
         // Authorization: Bearer <token>.
         p(r"(?i)bearer\s+[A-Za-z0-9._\-]{12,}", "Bearer [REDACTED]"),
-        // Credentials embedded in a connection URL: scheme://user:pass@host.
+        // Credentials embedded in a connection URL: scheme://user:pass@host,
+        // including the password-only form (redis://:pass@host).
         p(
-            r"([a-zA-Z][a-zA-Z0-9+.\-]*://)[^/@\s:]+:[^/@\s]+@",
+            r"([a-zA-Z][a-zA-Z0-9+.\-]*://)[^/@\s:]*:[^/@\s]+@",
             "${1}[REDACTED]@",
         ),
         // Home/user path segments anywhere in the text.
@@ -416,6 +425,8 @@ mod tests {
             format!("AIza{}", "SyA1234567890abcdefghijklmnopqrstuvw"), // Google
             format!("xox{}-{}-{}", "b", "123456789012", "abcdefghijklmnop"), // Slack
             format!("sk_{}_{}", "live", "abcdefghijklmnop12345678"), // Stripe
+            format!("sk-proj-{}", "Ab3_cd-EfGhIjKlMnOpQrStUvWx"), // OpenAI project
+            format!("github_pat_{}", "11ABCDEFG0123456789_abcdefghijklmnop"), // GitHub fine-grained
         ];
         for c in &cases {
             let red = redact_secrets(c);
@@ -451,6 +462,17 @@ mod tests {
         // The host/db are preserved for debugging.
         assert!(red.contains("db.internal:5432/app"), "host lost: {red}");
         assert!(red.contains("[REDACTED]@"), "creds not masked: {red}");
+
+        let red = redact_secrets("redis://:hunter2@cache.internal:6379/0");
+        assert!(!red.contains("hunter2"), "password-only URL leaked: {red}");
+        assert!(red.contains("cache.internal:6379/0"), "host lost: {red}");
+    }
+
+    #[test]
+    fn any_key_suffixed_assignment_masked() {
+        let red = redact_secrets("GROQ_KEY=gsk1234 SIGNING_KEY=abc cargo build");
+        assert!(!red.contains("gsk1234") && !red.contains("abc "), "{red}");
+        assert!(red.contains("GROQ_KEY=***") && red.contains("SIGNING_KEY=***"));
     }
 
     #[test]
