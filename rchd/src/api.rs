@@ -2986,7 +2986,9 @@ fn scan_client_leases(lease_dir: &std::path::Path) -> Result<Vec<String>> {
             .map_err(|error| anyhow!("cannot parse {}: {error}", entry.path().display()))?;
         if lease_blocks_restart(&lease, now_unix_ms, || is_process_alive(lease.wrapper_pid)) {
             blocked.push(lease.identity.local_wrapper_id);
-        } else if now_unix_ms.saturating_sub(lease.heartbeat_unix_ms) >= LEASE_REAP_RETENTION_MS {
+        } else if now_unix_ms.saturating_sub(lease.heartbeat_unix_ms) >= LEASE_REAP_RETENTION_MS
+            && !lease_owns_unretired_source(&lease)
+        {
             // Reap the file: it no longer blocks restart (terminal+acked, or
             // provably dead and stale) and its last heartbeat is over the
             // retention window, so it is pure history. Nothing else ever
@@ -3025,6 +3027,16 @@ const DEAD_WRAPPER_HEARTBEAT_STALE_MS: u64 = 15 * 60 * 1000;
 ///
 /// `wrapper_alive` is a thunk so the (subprocess-spawning) liveness probe only
 /// runs for leases that already passed the cheap heartbeat-staleness filter.
+/// A lease whose recovery recipe is not retired is the only authority that
+/// can release its worker-side source claim (`rch jobs recover`). Reaping it
+/// after its wrapper died stranded the claim forever and fenced every
+/// overlapping build on that worker (bd-dmg2k: 69 such claims fleet-wide).
+fn lease_owns_unretired_source(lease: &DurableJobLease) -> bool {
+    lease.recovery.as_ref().is_some_and(|recipe| {
+        recipe.get("retired").and_then(serde_json::Value::as_bool) != Some(true)
+    })
+}
+
 fn lease_blocks_restart(
     lease: &DurableJobLease,
     now_unix_ms: u64,
@@ -5395,6 +5407,34 @@ mod tests {
         assert!(dir.join("fresh.json").exists(), "blocker kept");
         assert!(dir.join("README.txt").exists(), "non-json untouched");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scan_never_reaps_a_dead_lease_that_still_owns_worker_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap();
+        let stale = now - LEASE_REAP_RETENTION_MS - 1;
+        // A PID beyond pid_max: provably dead, so neither lease blocks restart.
+        let dead_pid = 4_194_304 * 2;
+        let write = |name: &str, retired: bool| {
+            let mut lease = make_test_lease(stale, dead_pid);
+            lease.recovery = Some(serde_json::json!({ "identity": name, "retired": retired }));
+            std::fs::write(dir.path().join(name), serde_json::to_vec(&lease).unwrap()).unwrap();
+        };
+        write("owns-source.json", false);
+        write("retired.json", true);
+
+        let blocked = scan_client_leases(dir.path()).unwrap();
+
+        assert!(blocked.is_empty(), "{blocked:?}");
+        assert!(
+            dir.path().join("owns-source.json").exists(),
+            "the only authority able to release a worker claim was reaped"
+        );
+        assert!(
+            !dir.path().join("retired.json").exists(),
+            "retired history is reaped"
+        );
     }
 
     #[test]
