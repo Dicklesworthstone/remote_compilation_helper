@@ -107,6 +107,53 @@ pub struct CancellationRecord {
     #[serde(skip)]
     pub hook_process_identity: Option<String>,
     pub remote_pgid_file: Option<String>,
+    /// The build provably never launched remote work and was abandoned (see
+    /// [`provably_abandoned_unlaunched`]): no remote kill can be confirmed or
+    /// is needed, so the reservation may be released without one.
+    #[serde(skip)]
+    pub abandoned_unlaunched: bool,
+}
+
+/// Silence far past every remote lifetime cap: the in-session watchdog (30
+/// min default) and the worker orphan reaper (240 min).
+const ABANDONED_UNLAUNCHED_AFTER: Duration = Duration::from_secs(6 * 3600);
+
+/// A reservation that never reported a remote process record, whose wrapper
+/// is gone (or was never recorded), and that has been silent far past every
+/// remote lifetime cap cannot have a live remote process. Requiring a remote
+/// kill for it (there is no record to kill by) held its slots forever: 15
+/// such ghosts held ~40 slots on one dispatcher, surviving restarts because
+/// ownership is durable. A lease that still owns worker source keeps it: its
+/// source claim fences the worker until `rch jobs recover` retires it.
+fn provably_abandoned_unlaunched(
+    build: &crate::history::ActiveBuildState,
+    now: Instant,
+    lease_owns_source: impl FnOnce(&str) -> bool,
+) -> bool {
+    build.remote_pgid_file.is_none()
+        && now.saturating_duration_since(build.started_at_mono) >= ABANDONED_UNLAUNCHED_AFTER
+        && now.saturating_duration_since(build.last_heartbeat_mono) >= ABANDONED_UNLAUNCHED_AFTER
+        && wrapper_process_state(build.hook_pid, build.hook_process_identity.as_deref())
+            == WrapperProcessState::Exited
+        && !build
+            .local_wrapper_id
+            .as_deref()
+            .is_some_and(lease_owns_source)
+}
+
+/// Whether this dispatcher's client lease for `wrapper` still owns worker
+/// source. An unreadable lease fails closed (treated as owning).
+fn client_lease_owns_source(wrapper: &str) -> bool {
+    let path =
+        rch_common::job_identity::default_job_lease_directory().join(format!("{wrapper}.json"));
+    match std::fs::read(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => true,
+        Ok(bytes) => serde_json::from_slice::<rch_common::job_identity::DurableJobLease>(&bytes)
+            .map_or(true, |lease| {
+                crate::api::lease_owns_unretired_source(&lease)
+            }),
+    }
 }
 
 /// A recycled PID proves that the original process has exited; it never
@@ -381,6 +428,8 @@ impl CancellationOrchestrator {
                     slots_released: 0,
                 };
             };
+            let abandoned_unlaunched =
+                provably_abandoned_unlaunched(&build, Instant::now(), client_lease_owns_source);
             let record = CancellationRecord {
                 build_id,
                 worker_id: build.worker_id,
@@ -395,6 +444,7 @@ impl CancellationOrchestrator {
                 slots_released: 0,
                 hook_pid: build.hook_pid,
                 hook_process_identity: build.hook_process_identity.clone(),
+                abandoned_unlaunched,
                 remote_pgid_file: build.remote_pgid_file,
             };
             active.insert(build_id, record.clone());
@@ -600,8 +650,27 @@ impl CancellationOrchestrator {
         deadline: Instant,
     ) {
         // Losing the hook does not prove that its remote process group exited.
-        // Only builds with no reservation AND no remote identity may skip SSH.
-        let remote_required = record.slots > 0 || record.remote_pgid_file.is_some();
+        // Only builds with no reservation AND no remote identity may skip SSH,
+        // or a reservation proven abandoned before it could launch anything.
+        let remote_required =
+            !record.abandoned_unlaunched && (record.slots > 0 || record.remote_pgid_file.is_some());
+        if record.abandoned_unlaunched {
+            warn!(
+                build_id = record.build_id,
+                worker_id = %record.worker_id,
+                slots = record.slots,
+                "Releasing abandoned reservation that never launched remote work"
+            );
+            self.events.emit(
+                "cancellation_abandoned_reservation_released",
+                &serde_json::json!({
+                    "build_id": record.build_id,
+                    "worker_id": record.worker_id,
+                    "slots": record.slots,
+                    "hook_pid": record.hook_pid,
+                }),
+            );
+        }
 
         // Force skips grace, not confirmation or the overall termination budget.
         if force {
@@ -1241,6 +1310,7 @@ mod tests {
             hook_pid: 12345,
             hook_process_identity: None,
             remote_pgid_file: None,
+            abandoned_unlaunched: false,
         }
     }
 
@@ -1290,6 +1360,51 @@ mod tests {
             .await;
         assert_eq!(resp.status, "error");
         assert_eq!(resp.slots_released, 0);
+    }
+
+    #[test]
+    fn only_a_silent_unlaunched_reservation_with_a_gone_wrapper_is_abandoned() {
+        let history = BuildHistory::new(10);
+        let mut build = history.start_active_build(
+            "proj".to_string(),
+            "worker-a".to_string(),
+            "cargo build".to_string(),
+            0,
+            2,
+            rch_common::BuildLocation::Remote,
+        );
+        let now = Instant::now() + ABANDONED_UNLAUNCHED_AFTER + Duration::from_secs(60);
+        let no_lease = |_: &str| false;
+        assert!(
+            provably_abandoned_unlaunched(&build, now, no_lease),
+            "pid 0, silent, never launched"
+        );
+
+        let mut launched = build.clone();
+        launched.remote_pgid_file = Some("/tmp/rch-run/p/1.pgid".to_owned());
+        assert!(
+            !provably_abandoned_unlaunched(&launched, now, no_lease),
+            "a process record exists"
+        );
+
+        assert!(
+            !provably_abandoned_unlaunched(&build, Instant::now(), no_lease),
+            "not silent long enough"
+        );
+
+        let mut live_hook = build.clone();
+        live_hook.hook_pid = std::process::id();
+        assert!(
+            !provably_abandoned_unlaunched(&live_hook, now, no_lease),
+            "a live (unverifiable) wrapper keeps it"
+        );
+
+        build.local_wrapper_id = Some("rchw-owner".to_owned());
+        assert!(
+            !provably_abandoned_unlaunched(&build, now, |wrapper| wrapper == "rchw-owner"),
+            "a lease still owning worker source keeps it"
+        );
+        assert!(provably_abandoned_unlaunched(&build, now, no_lease));
     }
 
     #[tokio::test]
@@ -1674,6 +1789,7 @@ mod tests {
             hook_pid: 0,
             hook_process_identity: None,
             remote_pgid_file: None,
+            abandoned_unlaunched: false,
         };
 
         orch.execute_cancellation(&ctx, &mut record, false).await;
@@ -1710,6 +1826,7 @@ mod tests {
             hook_pid: 0,
             hook_process_identity: None,
             remote_pgid_file: None,
+            abandoned_unlaunched: false,
         };
 
         orch.execute_cancellation(&ctx, &mut record, false).await;

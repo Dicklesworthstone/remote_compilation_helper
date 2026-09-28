@@ -3041,7 +3041,7 @@ const DEAD_WRAPPER_HEARTBEAT_STALE_MS: u64 = 15 * 60 * 1000;
 /// overlapping build on that worker (bd-dmg2k: 69 such claims fleet-wide).
 /// Only a recipe that names worker-side ownership (source roots, a source
 /// pair, or a tree to retire) needs keeping.
-fn lease_owns_unretired_source(lease: &DurableJobLease) -> bool {
+pub(crate) fn lease_owns_unretired_source(lease: &DurableJobLease) -> bool {
     lease.recovery.as_ref().is_some_and(|recipe| {
         let owns = recipe
             .get("source_roots")
