@@ -58,8 +58,10 @@ pub struct AllowWithModifiedCommandOutput {
 pub struct AllowWithModifiedHookSpecificOutput {
     #[serde(rename = "hookEventName")]
     pub hook_event_name: String,
-    #[serde(rename = "permissionDecision")]
-    pub permission_decision: String,
+    /// `None` rewrites the input but leaves the decision to Claude Code's
+    /// normal permission flow (the user's allow/deny/ask rules).
+    #[serde(rename = "permissionDecision", skip_serializing_if = "Option::is_none")]
+    pub permission_decision: Option<String>,
     #[serde(rename = "updatedInput")]
     pub updated_input: UpdatedInput,
 }
@@ -106,7 +108,25 @@ impl HookOutput {
         Self::AllowWithModifiedCommand(AllowWithModifiedCommandOutput {
             hook_specific_output: AllowWithModifiedHookSpecificOutput {
                 hook_event_name: "PreToolUse".to_string(),
-                permission_decision: "allow".to_string(),
+                permission_decision: Some("allow".to_string()),
+                updated_input: UpdatedInput {
+                    command: replacement_command.into(),
+                },
+            },
+        })
+    }
+
+    /// Rewrite the command but let the user's permission rules decide.
+    ///
+    /// For a compound command the rewrite keeps the user's own prefix
+    /// (`cd x && <anything> && rch exec -- cargo build`); answering "allow"
+    /// would approve that prefix without the prompt the user's rules call
+    /// for. Claude Code still applies `updatedInput` without a decision.
+    pub fn rewrite_with_permission_check(replacement_command: impl Into<String>) -> Self {
+        Self::AllowWithModifiedCommand(AllowWithModifiedCommandOutput {
+            hook_specific_output: AllowWithModifiedHookSpecificOutput {
+                hook_event_name: "PreToolUse".to_string(),
+                permission_decision: None,
                 updated_input: UpdatedInput {
                     command: replacement_command.into(),
                 },
@@ -448,10 +468,37 @@ mod tests {
                 allow_mod.hook_specific_output.updated_input.command,
                 "exit 101"
             );
-            assert_eq!(allow_mod.hook_specific_output.permission_decision, "allow");
+            assert_eq!(
+                allow_mod
+                    .hook_specific_output
+                    .permission_decision
+                    .as_deref(),
+                Some("allow")
+            );
         } else {
             panic!("Expected AllowWithModifiedCommand variant");
         }
+    }
+
+    #[test]
+    fn rewrite_with_permission_check_omits_the_decision() {
+        let json = HookOutput::rewrite_with_permission_check("cd x && rch exec -- cargo build")
+            .to_hook_json(None)
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let output = &value["hookSpecificOutput"];
+        assert!(output.get("permissionDecision").is_none(), "{json}");
+        assert_eq!(
+            output["updatedInput"]["command"],
+            "cd x && rch exec -- cargo build"
+        );
+        let allow = HookOutput::allow_with_modified_command("true")
+            .to_hook_json(None)
+            .unwrap();
+        assert!(
+            allow.contains("\"permissionDecision\":\"allow\""),
+            "{allow}"
+        );
     }
 
     #[test]

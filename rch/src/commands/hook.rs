@@ -561,7 +561,8 @@ pub async fn hook_test(ctx: &OutputContext) -> Result<()> {
                     let permission_decision = hook_output
                         .get("permissionDecision")
                         .and_then(|decision| decision.as_str())
-                        .unwrap_or("unknown");
+                        // No decision: the rewrite defers to the user's rules.
+                        .unwrap_or("rewrite");
                     println!(
                         "{} Hook decision: {} (intercepted)",
                         StatusIndicator::Success.display(style),

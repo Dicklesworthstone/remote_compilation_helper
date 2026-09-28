@@ -4457,7 +4457,14 @@ async fn process_hook(input: HookInput) -> HookOutput {
         format!("rch exec -- {}", command)
     };
 
-    HookOutput::allow_with_modified_command(modified_command)
+    // A compound rewrite keeps the user's own prefix; auto-approving it would
+    // bypass the user's permission rules for that prefix (bd-08ele). A simple
+    // `rch exec -- <command>` stays approved: offloading it is rch's purpose.
+    if classification.command_prefix.is_some() {
+        HookOutput::rewrite_with_permission_check(modified_command)
+    } else {
+        HookOutput::allow_with_modified_command(modified_command)
+    }
 }
 
 fn selection_cancelled_before_start(response: &SelectionResponse) -> bool {
