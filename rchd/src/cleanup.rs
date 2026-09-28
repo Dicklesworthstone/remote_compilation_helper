@@ -1,6 +1,9 @@
 //! Background cleanup for active builds with dead hooks.
 
-use crate::{DaemonContext, history::StuckDetectorSnapshot};
+use crate::{
+    DaemonContext,
+    history::{QueuedBuildState, StuckDetectorSnapshot, WrapperCancellation},
+};
 use std::path::Path;
 use std::time::{Duration, Instant};
 use tokio::time::{MissedTickBehavior, interval};
@@ -12,6 +15,128 @@ const RECENT_PROGRESS_GRACE_SECS: u64 = 15;
 const MIN_BUILD_AGE_SECS: u64 = 30;
 const TRIAGE_BUDGET_MS: u64 = 50;
 const REMEDIATION_CONFIDENCE_THRESHOLD: f64 = 0.85;
+const RECOVERED_QUEUE_PROBES_PER_TICK: usize = 16;
+
+/// Restored queue rows have no surviving socket handler to retire them when
+/// their client exits. Leave live or unprovable owners available for explicit
+/// recovery, but do not let dead owners permanently consume the queue limit.
+#[derive(Default)]
+struct RecoveredQueueCleanup {
+    after_id: Option<u64>,
+}
+
+impl RecoveredQueueCleanup {
+    fn check(&mut self, context: &DaemonContext) {
+        if context.history.ownership_failed() {
+            return;
+        }
+        let rows = context.history.queued_builds();
+        let start = self
+            .after_id
+            .and_then(|id| rows.iter().position(|row| row.id > id))
+            .unwrap_or(0);
+        let mut changed = false;
+        // Rotate by durable ID: a live prefix cannot starve a dead tail. Bound
+        // process probes and durable writes, including on an unlimited queue.
+        for candidate in rows
+            .iter()
+            .skip(start)
+            .chain(rows.iter().take(start))
+            .filter(|row| row.recovered)
+            .take(RECOVERED_QUEUE_PROBES_PER_TICK)
+        {
+            self.after_id = Some(candidate.id);
+            let Some(row) = context.history.queued_build(candidate.id) else {
+                continue;
+            };
+            let Some(reason) = recovered_queue_owner_gone(&row) else {
+                continue;
+            };
+            match retire_recovered_queue_owner(context, &row) {
+                Ok(true) => {
+                    changed = true;
+                    context.events.emit(
+                        "recovered_queue_owner_retired",
+                        &serde_json::json!({
+                            "queue_id_text": row.id.to_string(),
+                            "project_id": row.project_id,
+                            "reason": reason,
+                        }),
+                    );
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    warn!(queue_id = row.id, %error, "Recovered queue retirement not committed");
+                    // The store itself closes admission on uncertain writes.
+                    // Never continue as if an unacknowledged departure succeeded.
+                    break;
+                }
+            }
+        }
+        if changed {
+            context.history.update_queue_estimates();
+            rch_telemetry::remediation::set_queue_depth(context.history.queue_depth());
+        }
+    }
+}
+
+/// No signal is sent. ESRCH proves absence. Linux's boot ID/start ticks also
+/// prove replacement; formatted `ps` timestamps on other platforms do not.
+/// Permission errors and missing identity are not death.
+fn recovered_queue_owner_gone(row: &QueuedBuildState) -> Option<&'static str> {
+    if !row.recovered || row.hook_pid <= 1 {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use nix::{errno::Errno, sys::signal::kill, unistd::Pid};
+
+        let pid = i32::try_from(row.hook_pid).ok()?;
+        match kill(Pid::from_raw(pid), None) {
+            Err(Errno::ESRCH) => Some("queued_owner_exited"),
+            Ok(()) | Err(Errno::EPERM) => {
+                #[cfg(target_os = "linux")]
+                {
+                    let recorded = row.hook_process_identity.as_deref()?;
+                    let observed = crate::history::process_identity(row.hook_pid)?;
+                    (observed != recorded).then_some("queued_owner_replaced")
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    None
+                }
+            }
+            Err(_) => None,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
+fn retire_recovered_queue_owner(
+    context: &DaemonContext,
+    row: &QueuedBuildState,
+) -> std::io::Result<bool> {
+    if !row.recovered {
+        return Ok(false);
+    }
+    if let Some(wrapper) = row.local_wrapper_id.as_deref() {
+        // This competes with admission under the history ownership lock. An
+        // active/completed result is NOT permission to cancel that execution.
+        // No worker connection is opened and no slots are released here.
+        Ok(matches!(
+            context.history.cancel_wrapper(wrapper)?,
+            WrapperCancellation::BeforeStart
+        ))
+    } else {
+        // Anonymous legacy rows have no delayed wrapper identity to fence.
+        // Remove by their durable queue ID, never by a reusable PID.
+        context.history.finish_queued_build(row.id, None)?;
+        Ok(context.history.queued_build(row.id).is_none())
+    }
+}
 
 /// A delayed observer cannot distinguish a stalled client from a client whose
 /// heartbeat task was paused with it. Allow one normal heartbeat window to
@@ -202,8 +327,11 @@ impl ActiveBuildCleanup {
                 let mut ticker = interval(Duration::from_secs(5));
                 ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
                 let mut observation = ObservationWindow::default();
+                let mut recovered_queue = RecoveredQueueCleanup::default();
                 loop {
                     ticker.tick().await;
+                    // This must also run when there are no active builds.
+                    recovered_queue.check(&self.context);
                     self.check_active_builds_observed(&mut observation).await;
                 }
             }),
@@ -371,6 +499,199 @@ mod tests {
     use proptest::prelude::*;
     use rch_common::BuildHeartbeatPhase;
     use rch_common::test_guard;
+
+    #[cfg(unix)]
+    mod recovered_queue {
+        use super::*;
+        use crate::history::BuildHistory;
+        use std::sync::Arc;
+
+        struct Owner(std::process::Child);
+
+        impl Owner {
+            fn start() -> Self {
+                Self(std::process::Command::new("/bin/sleep").arg("60").spawn().unwrap())
+            }
+
+            fn stop(&mut self) {
+                self.0.kill().unwrap();
+                self.0.wait().unwrap();
+            }
+        }
+
+        impl Drop for Owner {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        fn context(path: &Path) -> DaemonContext {
+            let mut context = crate::test_daemon_context(crate::workers::WorkerPool::new());
+            context.history = Arc::new(BuildHistory::new(10).with_persistence(path.to_owned()));
+            context
+        }
+
+        fn enqueue(context: &DaemonContext, pid: u32, wrapper: Option<&str>) -> QueuedBuildState {
+            context.history.enqueue_build(
+                "queue-recovery".into(), "cargo check".into(), pid, 2,
+                wrapper.map(str::to_owned),
+            ).unwrap()
+        }
+
+        fn restart(context: &mut DaemonContext, path: &Path) {
+            context.history = Arc::new(BuildHistory::load_from_file(path, 10).unwrap());
+        }
+
+        #[tokio::test]
+        async fn background_task_retires_dead_queue_owners_without_active_builds() {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("history.jsonl");
+            let mut context = context(&path);
+            let mut dead = Owner::start();
+            let mut live = Owner::start();
+            let gone = enqueue(&context, dead.0.id(), Some("dead-owner"));
+            let anonymous = enqueue(&context, dead.0.id(), None);
+            let kept = enqueue(&context, live.0.id(), Some("live-owner"));
+            let unknown = enqueue(&context, 0, Some("unknown-owner"));
+            restart(&mut context, &path);
+            let before = serde_json::to_value(context.history.queued_build(kept.id)).unwrap();
+            dead.stop();
+            let mut task = Some(ActiveBuildCleanup::new(context.clone()).start());
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while context.history.queued_build(gone.id).is_some()
+                    || context.history.queued_build(anonymous.id).is_some()
+                {
+                    tokio::task::yield_now().await;
+                }
+            }).await.expect("the actual observer must reap a queue-only daemon");
+            stop_before_shutdown(&mut task, async {}).await;
+            assert!(context.history.wrapper_cancelled("dead-owner"));
+            assert_eq!(context.history.queue_depth(), 2);
+            assert!(context.history.active_builds().is_empty());
+            assert!(context.pool.is_empty());
+            assert_eq!(serde_json::to_value(context.history.queued_build(kept.id)).unwrap(), before);
+            assert!(context.history.queued_build(unknown.id).is_some());
+            assert!(live.0.try_wait().unwrap().is_none());
+            restart(&mut context, &path);
+            assert_eq!(context.history.queue_depth(), 2);
+            assert!(context.history.wrapper_cancelled("dead-owner"));
+            assert!(context.history.queued_build(gone.id).is_none());
+        }
+
+        #[tokio::test]
+        async fn live_missing_and_replaced_identity_are_distinguished_without_signalling() {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("history.jsonl");
+            let context = context(&path);
+            let mut owner = Owner::start();
+            let mut row = enqueue(&context, owner.0.id(), Some("owner"));
+            assert!(recovered_queue_owner_gone(&row).is_none(), "live waiter owns normal cleanup");
+            row.recovered = true;
+            assert!(recovered_queue_owner_gone(&row).is_none());
+            row.hook_process_identity = None;
+            assert!(recovered_queue_owner_gone(&row).is_none(), "unknown is not dead");
+            // Model a different incarnation, not actual operating-system PID reuse.
+            #[cfg(target_os = "linux")]
+            {
+                let actual = crate::history::process_identity(owner.0.id()).unwrap();
+                row.hook_process_identity = Some(format!("{actual}-prior"));
+                assert_eq!(recovered_queue_owner_gone(&row), Some("queued_owner_replaced"));
+            }
+            assert!(owner.0.try_wait().unwrap().is_none());
+            for pid in [0, 1, u32::MAX] {
+                row.hook_pid = pid;
+                assert!(recovered_queue_owner_gone(&row).is_none());
+            }
+            row.hook_pid = owner.0.id();
+            row.hook_process_identity = None;
+            owner.stop();
+            assert_eq!(recovered_queue_owner_gone(&row), Some("queued_owner_exited"));
+            row.recovered = false;
+            assert!(recovered_queue_owner_gone(&row).is_none());
+        }
+
+        #[tokio::test]
+        async fn stale_queue_observation_cannot_cancel_an_admitted_build_or_release_slots() {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("history.jsonl");
+            let mut context = context(&path);
+            let mut owner = Owner::start();
+            let queued = enqueue(&context, owner.0.id(), Some("admitted-owner"));
+            restart(&mut context, &path);
+            let stale = context.history.queued_build(queued.id).unwrap();
+            owner.stop();
+            assert!(recovered_queue_owner_gone(&stale).is_some());
+            // Model admission winning between the process probe and retirement.
+            let id = rch_common::WorkerId::new("reserved-worker");
+            context.pool.add_worker(rch_common::WorkerConfig {
+                id: id.clone(), total_slots: 4, ..Default::default()
+            }).await;
+            let worker = context.pool.get(&id).await.unwrap();
+            assert!(worker.reserve_slots(2).await);
+            let active = context.history.try_start_active_build_with_wrapper(
+                queued.project_id, id.to_string(), queued.command, queued.hook_pid,
+                queued.local_wrapper_id, 2, rch_common::BuildLocation::Remote,
+            ).unwrap().unwrap();
+            assert!(!retire_recovered_queue_owner(&context, &stale).unwrap());
+            assert!(context.history.active_build(active.id).is_some());
+            assert!(!context.history.wrapper_cancelled("admitted-owner"));
+            assert_eq!(worker.used_slots(), 2);
+            assert!(!context.history.has_terminal_build(active.id));
+        }
+
+        #[tokio::test]
+        async fn failed_retirement_keeps_visibility_and_original_durable_evidence() {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("history.jsonl");
+            let mut context = context(&path);
+            let mut owner = Owner::start();
+            let row = enqueue(&context, owner.0.id(), Some("failed-owner"));
+            let original = std::fs::read(path.with_extension("ownership.json")).unwrap();
+            let blocker = root.path().join("not-a-directory");
+            std::fs::write(&blocker, "retained test evidence").unwrap();
+            context.history = Arc::new(BuildHistory::load_from_file(&path, 10).unwrap()
+                .with_persistence(blocker.join("history.jsonl")));
+            owner.stop();
+            let mut reaper = RecoveredQueueCleanup::default();
+            reaper.check(&context);
+            assert!(context.history.ownership_failed());
+            assert!(context.history.queued_build(row.id).is_some());
+            assert!(!context.history.wrapper_cancelled("failed-owner"));
+            reaper.check(&context);
+            assert!(context.history.queued_build(row.id).is_some());
+            // Loading may advance the counter, so compare the row after reopening
+            // rather than attributing that legitimate rewrite to failed cleanup.
+            let reopened = BuildHistory::load_from_file(&path, 10).unwrap();
+            assert!(reopened.queued_build(row.id).is_some());
+            let original: serde_json::Value = serde_json::from_slice(&original).unwrap();
+            assert_eq!(serde_json::to_value(reopened.queued_build(row.id).unwrap()).unwrap(),
+                original["queued"][0]);
+            assert!(!reopened.wrapper_cancelled("failed-owner"));
+        }
+
+        #[tokio::test]
+        async fn bounded_recovery_scan_advances_past_a_live_prefix() {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("history.jsonl");
+            let mut context = context(&path);
+            let mut owner = Owner::start();
+            for i in 0..RECOVERED_QUEUE_PROBES_PER_TICK {
+                enqueue(&context, std::process::id(), Some(&format!("keeper-{i}")));
+            }
+            let dead = enqueue(&context, owner.0.id(), Some("dead-tail"));
+            restart(&mut context, &path);
+            owner.stop();
+            let mut reaper = RecoveredQueueCleanup::default();
+            reaper.check(&context);
+            assert!(context.history.queued_build(dead.id).is_some(), "first batch is bounded");
+            reaper.check(&context);
+            assert!(context.history.queued_build(dead.id).is_none(), "live prefix must not starve tail");
+            assert_eq!(context.history.queue_depth(), RECOVERED_QUEUE_PROBES_PER_TICK);
+            assert!(context.history.wrapper_cancelled("dead-tail"));
+            assert!(context.history.active_builds().is_empty());
+        }
+    }
 
     #[tokio::test]
     async fn dropping_cleanup_task_cancels_actual_background_observer() {
