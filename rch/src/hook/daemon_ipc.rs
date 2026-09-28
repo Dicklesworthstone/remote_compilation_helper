@@ -14,14 +14,50 @@ const MAX_DAEMON_HEADER_BYTES: usize = 16 * 1024;
 const MAX_DAEMON_BODY_BYTES: usize = 64 * 1024;
 const MAX_DAEMON_STATUS_BYTES: usize = 1024;
 
-/// A queue-enabled request may own a live waiter even if its response is lost.
-/// Retrying selection or running locally could duplicate admission or bypass
-/// an already accepted cancellation.
+/// Any real selection may own a worker or waiter even if its response is lost.
+/// Queueing changes the wait policy, not whether selection creates ownership.
+/// Retrying or running locally could duplicate admission or bypass cancellation.
 #[derive(Debug, thiserror::Error)]
 #[error(
-    "queued worker selection outcome is unconfirmed; do not retry selection or execute locally"
+    "worker selection outcome is unconfirmed; do not retry selection or execute locally"
 )]
 pub(super) struct SelectionOutcomeUnconfirmed;
+
+/// Everything after dispatch is ambiguous until a complete response is parsed.
+/// Keep this boundary around both writing and reading: a failed flush can follow
+/// a fully delivered request. Connect/preflight errors occur before this helper.
+async fn exchange_selection_request<R, W>(
+    reader: R,
+    writer: &mut W,
+    request: &[u8],
+    write_budget: Duration,
+    response_budget: Duration,
+    dry_run: bool,
+) -> anyhow::Result<SelectionResponse>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let response = async {
+        write_daemon_request(writer, request, write_budget).await?;
+        let body = read_daemon_body(reader, response_budget, false).await?;
+        parse_selection_response(&body)
+            .map_err(|error| anyhow::anyhow!("Failed to parse daemon response: {error}"))
+    }
+    .await;
+    response.map_err(|error| {
+        if dry_run {
+            error
+        } else {
+            // Reuse the hook's durable uncertain-lease path for queued AND
+            // immediate admissions. This marker survives anyhow context.
+            error.context(SelectionOutcomeUnconfirmed)
+        }
+    })
+}
+
+#[cfg(test)]
+mod selection_safety_tests;
 
 /// Bound the entire write, not each partial write. A listening daemon can
 /// accept a connection and then stop reading; the response deadline has not
@@ -413,22 +449,15 @@ async fn query_daemon_with_mode(
 
     // Bound writes independently from the longer, queue-aware response wait.
     let request = format!("GET /select-worker?{}\n", query);
-    let response: anyhow::Result<SelectionResponse> = async {
-        // Even a failed write or flush may have delivered the complete request.
-        write_daemon_request(&mut writer, request.as_bytes(), daemon_io_timeout()).await?;
-        let body =
-            read_daemon_body(reader, daemon_response_timeout(wait_for_worker), false).await?;
-        parse_selection_response(&body)
-            .map_err(|e| anyhow::anyhow!("Failed to parse daemon response: {}", e))
-    }
-    .await;
-    let response = response.map_err(|error| {
-        if wait_for_worker {
-            error.context(SelectionOutcomeUnconfirmed)
-        } else {
-            error
-        }
-    })?;
+    let response = exchange_selection_request(
+        reader,
+        &mut writer,
+        request.as_bytes(),
+        daemon_io_timeout(),
+        daemon_response_timeout(wait_for_worker),
+        dry_run,
+    )
+    .await?;
 
     if let Some(worker) = response.worker.as_ref()
         && !selected_worker_is_requested(&worker.id, preferred_workers)
