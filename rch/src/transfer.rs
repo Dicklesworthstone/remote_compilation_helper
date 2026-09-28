@@ -7482,6 +7482,25 @@ pub fn default_c_cpp_artifact_patterns() -> Vec<String> {
 mod tests {
     use super::*;
 
+    /// Pins this thread to the real transport for the guard's lifetime. Mock
+    /// mode falls back to a process-global override that other tests enable
+    /// concurrently, which silently rerouted real-transport tests through the
+    /// mock and failed them only in the full parallel suite (bd-bkghy).
+    struct RealTransport;
+
+    impl RealTransport {
+        fn pin() -> Self {
+            mock::set_thread_mock_override(Some(false));
+            Self
+        }
+    }
+
+    impl Drop for RealTransport {
+        fn drop(&mut self) {
+            mock::set_thread_mock_override(None);
+        }
+    }
+
     /// The wrapper's stream must end with the command's last byte, however
     /// large the final burst, and carry its exit status.
     #[test]
@@ -9516,6 +9535,7 @@ Number of files transferred: 42
     async fn owned_source_failure_does_not_retry_inside_the_same_grant() {
         use std::os::unix::fs::PermissionsExt;
         let _guard = test_guard!();
+        let _real = RealTransport::pin();
         let directory = tempfile::tempdir().unwrap();
         let counter = directory.path().join("attempts");
         let fake = directory.path().join("failed-rsync");
@@ -12798,6 +12818,7 @@ fn main() {
     #[tokio::test]
     async fn windows_artifact_empty_policy_uses_tar_routing_in_both_entrypoints() {
         let _guard = test_guard!();
+        let _real = RealTransport::pin();
         let destination = tempfile::tempdir().unwrap();
         let pipeline = TransferPipeline::new(
             destination.path().to_path_buf(),
