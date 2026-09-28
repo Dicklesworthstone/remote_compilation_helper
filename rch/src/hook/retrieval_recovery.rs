@@ -594,7 +594,13 @@ impl RecoverySession {
             self.persist()?;
         }
         self.recipe.phases[index].complete = true;
-        self.persist()
+        self.persist()?;
+        // The stage is only needed to resume an unfinished publication. Once
+        // `complete` is durable it is a full duplicate of the outputs; nothing
+        // removed it, and 1339 of them held 43 GB on one dispatcher. Best
+        // effort: a leftover stage wastes space but is never read again.
+        let _ = std::fs::remove_dir_all(&stage);
+        Ok(())
     }
     pub(crate) fn returned(&mut self, exit: i32) -> anyhow::Result<()> {
         self.recipe.returned = Some(exit);
@@ -630,7 +636,13 @@ impl RecoverySession {
             "remote source release is outstanding"
         );
         self.recipe.retired = true;
-        self.persist()
+        self.persist()?;
+        // A retired job never publishes again; drop any stage a failed or
+        // skipped phase left behind.
+        if let Some(stages) = self.stage(0).parent() {
+            let _ = std::fs::remove_dir_all(stages);
+        }
+        Ok(())
     }
     pub(crate) async fn retire_returned(&mut self) -> anyhow::Result<()> {
         if self.recipe.retired {
@@ -1109,10 +1121,11 @@ mod tests {
             let journal = std::fs::read(&session.writer.path).unwrap();
 
             let published = session.publish("project");
-            // Source is never overwritten and the retained copy stays staged.
+            // Source is never overwritten.
             assert_eq!(std::fs::read(local.join("main.c")).unwrap(), original);
-            assert_eq!(std::fs::read(&retained).unwrap(), remote);
             if pending {
+                // The refused publication keeps its journaled copy for a retry.
+                assert_eq!(std::fs::read(&retained).unwrap(), remote);
                 // An interrupted write of an out-of-policy path cannot be
                 // finished or skipped: refuse before any write.
                 assert!(published.is_err());
@@ -1133,6 +1146,9 @@ mod tests {
                         .published
                         .contains_key(&PathBuf::from("main.c"))
                 );
+                // Completion drops the stage, retained copy included; it was
+                // never published and nothing reads it again.
+                assert!(!stage.exists());
             }
         }
     }
@@ -1163,6 +1179,10 @@ mod tests {
             b"this job's output"
         );
         assert!(session.recipe.phases[0].complete);
+        assert!(
+            !stage.exists(),
+            "a completed publication must not keep its duplicate stage"
+        );
     }
 
     /// The output root may sit behind system symlinks (macOS `/tmp`, `/var`,
