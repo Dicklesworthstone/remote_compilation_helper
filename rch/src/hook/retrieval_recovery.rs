@@ -911,9 +911,23 @@ pub(crate) async fn recover_job(writer: &DurableLeaseWriter) -> anyhow::Result<i
         if let Some(dir) = &phase.result_dir {
             pipeline.retrieve_result_dir(&worker, dir).await?;
         } else {
-            let retrieved = pipeline
-                .retrieve_artifacts(&worker, &phase.patterns)
-                .await?;
+            let retrieved = match pipeline.retrieve_artifacts(&worker, &phase.patterns).await {
+                Ok(retrieved) => retrieved,
+                // Outputs whose remote tree is gone (e.g. a GC'd target pool)
+                // can never come back: failing here stranded the job and its
+                // worker-side source claim on every retry. Like a rejected
+                // output set, it is a terminal build failure.
+                Err(error) if pipeline.remote_path_absent(&worker, &phase.remote).await? => {
+                    eprintln!(
+                        "[RCH] recovered outputs are gone from the worker ({}): {error:#}; \
+                         treating the recovered build as failed (exit {EXIT_ARTIFACT_TRANSFER_FAILED})",
+                        phase.remote
+                    );
+                    exit = EXIT_ARTIFACT_TRANSFER_FAILED;
+                    break;
+                }
+                Err(error) => return Err(error),
+            };
             if phase.output_gate {
                 // A rejected output set is a terminal build failure, exactly
                 // as on the live path, not a recovery error: the remote outputs

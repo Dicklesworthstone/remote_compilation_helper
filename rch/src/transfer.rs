@@ -768,6 +768,15 @@ pub(crate) fn remote_timeout_kill_script(pgid_file: &str, build_id: u64) -> Stri
     rch_common::orphan_quarantine::kill_probe_script(pgid_file, build_id)
 }
 
+/// Prints `RCH_PATH_ABSENT` only when `path` does not exist, not even as a
+/// dangling symlink.
+fn remote_path_probe_script(path: &str) -> String {
+    let quoted = escape(Cow::from(path));
+    format!(
+        "if [ -e {quoted} ] || [ -L {quoted} ]; then echo RCH_PATH_PRESENT; else echo RCH_PATH_ABSENT; fi"
+    )
+}
+
 /// Removes every file the durable supervisor writes beside `path`; the claim
 /// is an empty `mkdir` directory. Succeeds when nothing is left.
 fn recovery_completion_cleanup_script(path: &str) -> String {
@@ -6068,6 +6077,33 @@ print('RCH_SOURCE_FRESHNESS_V2 unchanged=%d changed=%d' % (len(current) - len(ch
         .context("timed out retiring clean-overlay source")?
     }
 
+    /// Whether `path` is provably absent on the worker. A failed or garbled
+    /// probe is an error, never "absent".
+    pub(crate) async fn remote_path_absent(
+        &self,
+        worker: &WorkerConfig,
+        path: &str,
+    ) -> Result<bool> {
+        if self.worker_platform.is_windows() {
+            // No POSIX probe there; never claim absence.
+            return Ok(false);
+        }
+        let script = remote_path_probe_script(path);
+        let mut command = self.worker_ssh_command_with_activity(
+            worker,
+            &["sh", "-c", &escape(Cow::from(script.as_str()))],
+            false,
+        );
+        command.kill_on_drop(true);
+        let output = tokio::time::timeout(Duration::from_secs(20), command.output()).await??;
+        anyhow::ensure!(output.status.success(), "remote path probe failed");
+        match String::from_utf8_lossy(&output.stdout).trim() {
+            "RCH_PATH_ABSENT" => Ok(true),
+            "RCH_PATH_PRESENT" => Ok(false),
+            other => anyhow::bail!("unexpected remote path probe output: {other:?}"),
+        }
+    }
+
     fn remote_tree_retirement_command(root: &str) -> String {
         let root = escape(Cow::from(root));
         format!("if [ -e {root} ] || [ -L {root} ]; then rm -rf -- {root}; fi")
@@ -7619,6 +7655,32 @@ mod tests {
             assert_eq!(stdout.lines().count(), 20_000, "tail was cut");
             assert!(stdout.ends_with("line-19999\n"), "tail was cut");
         }
+    }
+
+    #[test]
+    fn remote_path_probe_reports_absence_only_for_missing_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let present = dir.path().join("pool with space");
+        std::fs::create_dir(&present).unwrap();
+        let dangling = dir.path().join("dangling");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(dir.path().join("nowhere"), &dangling).unwrap();
+        let probe = |path: &std::path::Path| {
+            let output = std::process::Command::new("sh") // ubs:ignore — fixed probe over this test's temporary paths
+                .arg("-c")
+                .arg(remote_path_probe_script(path.to_str().unwrap()))
+                .output()
+                .unwrap();
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        };
+        assert_eq!(probe(&present), "RCH_PATH_PRESENT");
+        assert_eq!(probe(&dir.path().join("gone")), "RCH_PATH_ABSENT");
+        #[cfg(unix)]
+        assert_eq!(
+            probe(&dangling),
+            "RCH_PATH_PRESENT",
+            "a dangling link is not absence"
+        );
     }
 
     #[test]
