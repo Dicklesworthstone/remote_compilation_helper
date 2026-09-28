@@ -1547,6 +1547,36 @@ async fn main() -> Result<()> {
     let (shutdown_tx, mut shutdown_rx) = mpsc::channel(1);
     let mut connections = tokio::task::JoinSet::new();
 
+    // A failed durable-ownership write latches admission closed for the life
+    // of the process (bd-20zhr): after an ENOSPC blip the daemon refused every
+    // build until someone restarted it. A restart reloads the last durable
+    // ownership and keeps in-flight builds, so ask the supervisor (systemd
+    // Restart=always, launchd KeepAlive) for one once the latch has held for
+    // two consecutive checks.
+    {
+        let history = context.history.clone();
+        let shutdown = shutdown_tx.clone();
+        tokio::spawn(async move {
+            let mut ticker = interval(Duration::from_secs(30));
+            let mut latched_checks = 0u32;
+            loop {
+                ticker.tick().await;
+                latched_checks = if history.ownership_failed() {
+                    latched_checks + 1
+                } else {
+                    0
+                };
+                if latched_checks >= 2 {
+                    error!(
+                        "Durable build ownership could not be persisted; restarting rchd to reload it"
+                    );
+                    let _ = shutdown.send(()).await;
+                    return;
+                }
+            }
+        });
+    }
+
     // Main accept loop - platform-specific due to SIGHUP handling
     #[cfg(unix)]
     {
