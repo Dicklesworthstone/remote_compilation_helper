@@ -193,7 +193,8 @@ pub async fn deploy(
             } else {
                 println!("{} {}", StatusIndicator::Error.display(style), err);
             }
-            return Ok(());
+            // Another operation holds the fleet: nothing ran, so exit non-zero.
+            return Err(crate::doctor::DoctorExit(1).into());
         }
     };
 
@@ -480,7 +481,8 @@ pub async fn rollback(
             } else {
                 println!("{} {}", StatusIndicator::Error.display(style), err);
             }
-            return Ok(());
+            // Another operation holds the fleet: nothing ran, so exit non-zero.
+            return Err(crate::doctor::DoctorExit(1).into());
         }
     };
 
@@ -782,7 +784,8 @@ pub async fn drain(
                 style.highlight("--all")
             );
         }
-        return Ok(());
+        // A drain that did nothing must not exit 0: callers script on it.
+        return Err(crate::doctor::DoctorExit(1).into());
     }
 
     // Load workers configuration
@@ -826,7 +829,8 @@ pub async fn drain(
             } else {
                 println!("{} {}", StatusIndicator::Error.display(style), err);
             }
-            return Ok(());
+            // Another operation holds the fleet: nothing ran, so exit non-zero.
+            return Err(crate::doctor::DoctorExit(1).into());
         }
     };
 
@@ -1285,7 +1289,11 @@ mod tests {
     #[tokio::test]
     async fn drain_requires_worker_or_all_in_json_mode() {
         let (ctx, stdout) = json_ctx();
-        drain(&ctx, None, false, 10, true).await.unwrap();
+        let error = drain(&ctx, None, false, 10, true).await.unwrap_err();
+        assert!(
+            error.downcast_ref::<crate::doctor::DoctorExit>().is_some(),
+            "a drain with no target must exit non-zero: {error:#}"
+        );
 
         let value = parse_json_output(&stdout);
         assert_is_api_response(&value);
@@ -1298,14 +1306,10 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn drain_all_ok_even_when_no_workers_configured() {
-        let (ctx, stdout) = json_ctx();
-        drain(&ctx, None, true, 10, true).await.unwrap();
-
-        let value = parse_json_output(&stdout);
-        assert_is_api_response(&value);
-    }
+    // `drain --all` is deliberately NOT exercised in-process: these tests read
+    // the host's real workers.toml and daemon, so on a dispatcher it drained
+    // the whole live fleet (2026-09-28). It runs in the isolated subprocess
+    // suite rch/tests/fleet_drain_daemon.rs instead.
 
     #[tokio::test]
     async fn history_emits_json_response() {
@@ -1335,8 +1339,14 @@ mod tests {
         verify(&ctx, Some("definitely-missing-worker".to_string()))
             .await
             .unwrap();
-        drain(&ctx, None, false, 10, true).await.unwrap();
-        drain(&ctx, None, true, 10, true).await.unwrap();
+        // No target is a usage error: reported, and a non-zero exit.
+        assert!(
+            drain(&ctx, None, false, 10, true)
+                .await
+                .unwrap_err()
+                .downcast_ref::<crate::doctor::DoctorExit>()
+                .is_some()
+        );
         history(&ctx, 5, None).await.unwrap();
     }
 }

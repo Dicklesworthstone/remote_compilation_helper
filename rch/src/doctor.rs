@@ -1024,7 +1024,7 @@ pub async fn run_doctor(ctx: &OutputContext, options: DoctorOptions) -> Result<(
 /// The report has already been rendered; the CLI must preserve this status
 /// without printing a second error response, after flushing telemetry.
 #[derive(Debug, thiserror::Error)]
-#[error("reliability doctor finished with exit code {0}")]
+#[error("command finished with exit code {0} (result already reported)")]
 pub(crate) struct DoctorExit(pub i32);
 
 async fn run_reliability_doctor(ctx: &OutputContext, options: &DoctorOptions) -> Result<()> {

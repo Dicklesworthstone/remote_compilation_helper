@@ -84,10 +84,7 @@ fn every_publishable_crate_ships_the_license_text() {
         let Ok(manifest) = fs::read_to_string(dir.join("Cargo.toml")) else {
             continue;
         };
-        if dir == root
-            || !manifest.contains("[package]")
-            || manifest.contains("publish = false")
-        {
+        if dir == root || !manifest.contains("[package]") || manifest.contains("publish = false") {
             continue;
         }
         let shipped = fs::read_to_string(dir.join("LICENSE")).unwrap_or_default();
