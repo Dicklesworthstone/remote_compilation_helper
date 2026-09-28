@@ -86,12 +86,15 @@ pub(super) fn get_artifact_patterns(
         && command.is_some_and(rch_common::patterns::is_cargo_package_verification)
     {
         // Cargo's own verifier builds the extracted archive and checks source
-        // mutations. Workspace publication keeps the verified archives in its
-        // temporary registry. Return only archives from those two layouts,
-        // without its index, extracted sources, or duplicate tmp-crate files.
+        // mutations. `cargo package` leaves the archive in package/, workspace
+        // publication keeps verified archives in its temporary registry, and
+        // `cargo publish -p X` writes its only archive to package/tmp-crate/
+        // (bd-3kskq: without it every publish dry run returned zero archives).
+        // Return only archives, never the index or extracted sources.
         return vec![
             "target/package/*.crate".to_string(),
             "target/package/tmp-registry/*.crate".to_string(),
+            "target/package/tmp-crate/*.crate".to_string(),
         ];
     }
     if let Some(patterns) = cargo_bins::patterns(kind, command) {

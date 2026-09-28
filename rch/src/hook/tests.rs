@@ -7666,18 +7666,25 @@ fn test_cargo_package_verification_artifacts_are_exact_archives() {
             vec![
                 "target/package/*.crate".to_string(),
                 "target/package/tmp-registry/*.crate".to_string(),
+                "target/package/tmp-crate/*.crate".to_string(),
             ],
             "return archives without registry indexes or extracted sources"
         );
         let custom = get_custom_target_artifact_patterns(kind, Some(command));
         assert_eq!(
             expected_output_glob_list(&custom),
-            vec!["package/*.crate", "package/tmp-registry/*.crate"]
+            vec![
+                "package/*.crate",
+                "package/tmp-registry/*.crate",
+                "package/tmp-crate/*.crate"
+            ]
         );
         assert!(get_project_artifact_patterns(kind, Some(command), true).is_empty());
         for archive in [
             "package/asupersync-0.4.11.crate",
             "package/tmp-registry/asupersync-0.4.11.crate",
+            // `cargo publish -p X` leaves its only archive here.
+            "package/tmp-crate/asupersync-0.4.11.crate",
         ] {
             assert!(!sync_back_verified_zero_build_outputs(
                 &[archive.to_string()],
