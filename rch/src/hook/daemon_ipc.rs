@@ -18,9 +18,7 @@ const MAX_DAEMON_STATUS_BYTES: usize = 1024;
 /// Queueing changes the wait policy, not whether selection creates ownership.
 /// Retrying or running locally could duplicate admission or bypass cancellation.
 #[derive(Debug, thiserror::Error)]
-#[error(
-    "worker selection outcome is unconfirmed; do not retry selection or execute locally"
-)]
+#[error("worker selection outcome is unconfirmed; do not retry selection or execute locally")]
 pub(super) struct SelectionOutcomeUnconfirmed;
 
 /// Everything after dispatch is ambiguous until a complete response is parsed.

@@ -8,7 +8,11 @@ use tokio::io::AsyncWrite;
 
 const REQUEST: &[u8] = b"GET /select-worker?project=owner&cores=1\n";
 
-async fn query_fixture(reply: &[u8], wait: bool, dry_run: bool) -> anyhow::Result<SelectionResponse> {
+async fn query_fixture(
+    reply: &[u8],
+    wait: bool,
+    dry_run: bool,
+) -> anyhow::Result<SelectionResponse> {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("selection.sock");
     let listener = tokio::net::UnixListener::bind(&path).unwrap();
@@ -16,7 +20,10 @@ async fn query_fixture(reply: &[u8], wait: bool, dry_run: bool) -> anyhow::Resul
         let (stream, _) = listener.accept().await.unwrap();
         let (reader, mut writer) = stream.into_split();
         let mut request = String::new();
-        BufReader::new(reader).read_line(&mut request).await.unwrap();
+        BufReader::new(reader)
+            .read_line(&mut request)
+            .await
+            .unwrap();
         assert!(request.starts_with("GET /select-worker?"), "{request}");
         assert_eq!(request.contains("&wait=1"), wait);
         assert_eq!(request.contains("&dry_run=1"), dry_run);
@@ -41,11 +48,15 @@ async fn query_fixture(reply: &[u8], wait: bool, dry_run: bool) -> anyhow::Resul
         &[],
         dry_run,
     );
-    let (result, ()) = timeout(Duration::from_secs(3), async { tokio::join!(client, server) })
-        .await
-        .expect("selection fixture must terminate");
+    let (result, ()) = timeout(Duration::from_secs(3), async {
+        tokio::join!(client, server)
+    })
+    .await
+    .expect("selection fixture must terminate");
     assert!(
-        timeout(Duration::from_millis(20), listener.accept()).await.is_err(),
+        timeout(Duration::from_millis(20), listener.accept())
+            .await
+            .is_err(),
         "no automatic retry or compensating request after a lost result"
     );
     result
@@ -69,7 +80,9 @@ async fn lost_invalid_and_oversized_replies_fence_both_queued_and_immediate_sele
             for dry_run in [false, true] {
                 let error = query_fixture(&reply, wait, dry_run).await.unwrap_err();
                 assert_eq!(
-                    error.downcast_ref::<SelectionOutcomeUnconfirmed>().is_some(),
+                    error
+                        .downcast_ref::<SelectionOutcomeUnconfirmed>()
+                        .is_some(),
                     !dry_run,
                     "wait={wait}, dry_run={dry_run}, reply={reply:?}: {error:#}"
                 );
@@ -93,7 +106,8 @@ async fn confirmed_busy_and_cancellation_results_remain_ordinary_responses() {
                 reason: reason.clone(),
                 build_id: None,
                 diagnostics: None,
-            }).unwrap()
+            })
+            .unwrap()
         );
         for wait in [false, true] {
             let response = query_fixture(reply.as_bytes(), wait, false).await.unwrap();
@@ -114,11 +128,28 @@ async fn failures_before_connect_do_not_invent_unconfirmed_ownership() {
     for path in [&missing, &refused] {
         for wait in [false, true] {
             let error = query_daemon(
-                path.to_str().unwrap(), "owner", 1, "cargo build", None,
-                RequiredRuntime::None, CommandPriority::Normal, 0, None,
-                Some("selection-test-owner"), wait, &[], false, &[],
-            ).await.unwrap_err();
-            assert!(error.downcast_ref::<SelectionOutcomeUnconfirmed>().is_none());
+                path.to_str().unwrap(),
+                "owner",
+                1,
+                "cargo build",
+                None,
+                RequiredRuntime::None,
+                CommandPriority::Normal,
+                0,
+                None,
+                Some("selection-test-owner"),
+                wait,
+                &[],
+                false,
+                &[],
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                error
+                    .downcast_ref::<SelectionOutcomeUnconfirmed>()
+                    .is_none()
+            );
         }
     }
 }
@@ -131,15 +162,20 @@ struct FailedFlush {
 }
 
 impl AsyncWrite for FailedFlush {
-    fn poll_write(mut self: Pin<&mut Self>, _: &mut Context<'_>, bytes: &[u8])
-        -> Poll<std::io::Result<usize>>
-    {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+        bytes: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
         self.received.extend_from_slice(bytes);
         Poll::Ready(Ok(bytes.len()))
     }
 
     fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "flush failed")))
+        Poll::Ready(Err(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "flush failed",
+        )))
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
@@ -152,12 +188,27 @@ async fn fully_written_request_followed_by_failed_flush_remains_uncertain() {
     for dry_run in [false, true] {
         let mut writer = FailedFlush::default();
         let error = exchange_selection_request(
-            tokio::io::empty(), &mut writer, REQUEST,
-            Duration::from_secs(1), Duration::from_secs(1), dry_run,
-        ).await.unwrap_err().context("outer caller context");
+            tokio::io::empty(),
+            &mut writer,
+            REQUEST,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            dry_run,
+        )
+        .await
+        .unwrap_err()
+        .context("outer caller context");
         assert_eq!(writer.received, REQUEST);
-        assert_eq!(error.downcast_ref::<SelectionOutcomeUnconfirmed>().is_some(), !dry_run);
-        assert_eq!(error.downcast_ref::<std::io::Error>().unwrap().kind(), std::io::ErrorKind::BrokenPipe);
+        assert_eq!(
+            error
+                .downcast_ref::<SelectionOutcomeUnconfirmed>()
+                .is_some(),
+            !dry_run
+        );
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::BrokenPipe
+        );
     }
 }
 
@@ -165,10 +216,20 @@ async fn fully_written_request_followed_by_failed_flush_remains_uncertain() {
 async fn stalled_dispatch_and_silent_reply_keep_the_uncertainty_boundary() {
     let (mut writer, mut peer) = tokio::io::duplex(8);
     let error = exchange_selection_request(
-        tokio::io::empty(), &mut writer, REQUEST,
-        Duration::from_millis(20), Duration::from_secs(1), false,
-    ).await.unwrap_err();
-    assert!(error.downcast_ref::<SelectionOutcomeUnconfirmed>().is_some());
+        tokio::io::empty(),
+        &mut writer,
+        REQUEST,
+        Duration::from_millis(20),
+        Duration::from_secs(1),
+        false,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        error
+            .downcast_ref::<SelectionOutcomeUnconfirmed>()
+            .is_some()
+    );
     assert!(format!("{error:#}").contains("request write timed out"));
     drop(writer);
     let mut bytes = Vec::new();
@@ -178,10 +239,20 @@ async fn stalled_dispatch_and_silent_reply_keep_the_uncertainty_boundary() {
     let (reader, _silent_peer) = tokio::io::duplex(8);
     let mut writer = Vec::new();
     let error = exchange_selection_request(
-        reader, &mut writer, REQUEST,
-        Duration::from_secs(1), Duration::from_millis(20), false,
-    ).await.unwrap_err();
-    assert!(error.downcast_ref::<SelectionOutcomeUnconfirmed>().is_some());
+        reader,
+        &mut writer,
+        REQUEST,
+        Duration::from_secs(1),
+        Duration::from_millis(20),
+        false,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        error
+            .downcast_ref::<SelectionOutcomeUnconfirmed>()
+            .is_some()
+    );
     assert!(format!("{error:#}").contains("response timed out"));
     assert_eq!(writer, REQUEST);
 }
@@ -211,28 +282,52 @@ async fn unrequested_fixture(
             "reason": "success",
             "build_id": build_id,
         });
-        writer.write_all(format!("HTTP/1.1 200 OK\r\n\r\n{reply}").as_bytes())
-            .await.unwrap();
+        writer
+            .write_all(format!("HTTP/1.1 200 OK\r\n\r\n{reply}").as_bytes())
+            .await
+            .unwrap();
         drop(writer);
         let mut requests = vec![first];
         if let Ok(Ok((stream, _))) = timeout(Duration::from_millis(100), listener.accept()).await {
             let (reader, mut writer) = stream.into_split();
             let mut request = String::new();
-            BufReader::new(reader).read_line(&mut request).await.unwrap();
+            BufReader::new(reader)
+                .read_line(&mut request)
+                .await
+                .unwrap();
             requests.push(request);
             let _ = writer.write_all(acknowledgement).await;
         }
-        assert!(timeout(Duration::from_millis(20), listener.accept()).await.is_err());
+        assert!(
+            timeout(Duration::from_millis(20), listener.accept())
+                .await
+                .is_err()
+        );
         requests
     };
     let requested = [WorkerId::new("requested-worker")];
     let client = query_daemon_with_mode(
-        path.to_str().unwrap(), "owner", 2, "cargo build", None,
-        RequiredRuntime::None, CommandPriority::Normal, 0, Some(std::process::id()),
-        Some("selection-test-owner"), false, &requested, false, &[], dry_run,
+        path.to_str().unwrap(),
+        "owner",
+        2,
+        "cargo build",
+        None,
+        RequiredRuntime::None,
+        CommandPriority::Normal,
+        0,
+        Some(std::process::id()),
+        Some("selection-test-owner"),
+        false,
+        &requested,
+        false,
+        &[],
+        dry_run,
     );
-    timeout(Duration::from_secs(3), async { tokio::join!(client, server) })
-        .await.expect("assignment refusal must terminate")
+    timeout(Duration::from_secs(3), async {
+        tokio::join!(client, server)
+    })
+    .await
+    .expect("assignment refusal must terminate")
 }
 
 #[tokio::test]
@@ -243,7 +338,11 @@ async fn diagnostic_worker_mismatch_never_sends_a_release() {
         let response = result.unwrap();
         assert_eq!(response.reason, SelectionReason::NoMatchingWorkers);
         assert!(response.worker.is_none() && response.build_id.is_none());
-        assert_eq!(requests.len(), 1, "a preview must remain read-only: {requests:?}");
+        assert_eq!(
+            requests.len(),
+            1,
+            "a preview must remain read-only: {requests:?}"
+        );
     }
 }
 
@@ -255,7 +354,10 @@ async fn real_worker_mismatch_requires_an_identity_bound_acknowledged_release() 
     assert_eq!(response.reason, SelectionReason::NoMatchingWorkers);
     assert!(response.worker.is_none() && response.build_id.is_none());
     assert_eq!(requests.len(), 2);
-    assert!(requests[1].starts_with("POST /release-worker?worker=unrequested-worker&slots=2&build_id=42"));
+    assert!(
+        requests[1]
+            .starts_with("POST /release-worker?worker=unrequested-worker&slots=2&build_id=42")
+    );
     assert!(requests[1].contains("&local_wrapper_id=selection-test-owner"));
     assert!(requests[1].contains(&format!("&exit_code={EXIT_BUILD_ERROR}")));
 }
@@ -266,22 +368,42 @@ async fn unowned_mismatched_assignment_cannot_fall_back_or_release_by_slot_count
     for build_id in [None, Some(0), Some(1_u64 << 63), Some(u64::MAX)] {
         let (result, requests) = unrequested_fixture(false, build_id, b"HTTP/1.1 200 OK\r\n").await;
         let error = result.unwrap_err();
-        assert!(error.downcast_ref::<SelectionOutcomeUnconfirmed>().is_some());
+        assert!(
+            error
+                .downcast_ref::<SelectionOutcomeUnconfirmed>()
+                .is_some()
+        );
         assert!(format!("{error:#}").contains("no valid active build identity"));
-        assert_eq!(requests.len(), 1, "never guess which reservation to release");
+        assert_eq!(
+            requests.len(),
+            1,
+            "never guess which reservation to release"
+        );
     }
 }
 
 #[tokio::test]
 async fn unacknowledged_mismatch_release_preserves_uncertainty_and_correlation() {
     let _guard = rch_common::test_guard!();
-    for ack in [b"".as_slice(), b"HTTP/1.1 500 Failed\r\n", b"HTTP/1.1 200 OK"] {
+    for ack in [
+        b"".as_slice(),
+        b"HTTP/1.1 500 Failed\r\n",
+        b"HTTP/1.1 200 OK",
+    ] {
         let (result, requests) = unrequested_fixture(false, Some(42), ack).await;
         let error = result.unwrap_err();
-        assert!(error.downcast_ref::<SelectionOutcomeUnconfirmed>().is_some());
+        assert!(
+            error
+                .downcast_ref::<SelectionOutcomeUnconfirmed>()
+                .is_some()
+        );
         let message = format!("{error:#}");
         assert!(message.contains("unrequested-worker build 42"), "{message}");
         assert!(message.contains("not acknowledged"), "{message}");
-        assert_eq!(requests.len(), 2, "one attempted release, no selection replay");
+        assert_eq!(
+            requests.len(),
+            2,
+            "one attempted release, no selection replay"
+        );
     }
 }
