@@ -5,7 +5,7 @@ Compilation Helper): the PreToolUse hook + CLI (`rch`), the local daemon (`rchd`
 worker agent (`rch-wkr`), the RABS build sidecar (`rabs-*`, `rabsd`), and the fleet
 dashboard (`dashboard/`).
 
-Scope window: project inception (`v0.1.0`, 2026-01-25) through `v2.1.0` (2026-09-26).
+Scope window: project inception (`v0.1.0`, 2026-01-25) through `v2.1.8` (2026-09-28).
 
 This document was rebuilt from git history (`git log --no-merges` per tag range, `git show`
 on representative commits), version tags (`git for-each-ref`), GitHub release metadata
@@ -29,10 +29,29 @@ but those particular links will 404.
 
 Repository: <https://github.com/Dicklesworthstone/remote_compilation_helper>
 
-## Unreleased
+## 2.1.8 — 2026-09-28
 
-- **The new-layout `--no-run` fix now works end to end.** Two gaps found by a
-  live check on the operator Mac after 2.1.7:
+Self-healing for two daemon states that previously needed an operator, plus
+the end-to-end completion of 2.1.7's `--no-run` fix.
+
+- **Dead job leases no longer fence workers until someone runs
+  `rch jobs recover`** (`bd-nalyr`). When a wrapper died while its job still
+  owned worker source, only a manual `rch jobs recover` could release the
+  worker's source claim. Across the fleet about 15 such claims piled up per
+  half hour and blocked overlapping builds with "unfinished overlapping
+  source owner". Every 5 minutes rchd now recovers up to 4 leases whose owner
+  is provably gone, backing off per lease on failure. It emits
+  `lease_auto_recovered` / `lease_auto_recovery_failed`
+  ([`9f166b22`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/9f166b22a085c21f4833dfffad7c8bf795e3927a)).
+- **A latched admission refusal clears itself** (`bd-20zhr`). One failed
+  durable-ownership write (ENOSPC) closed admission for the life of the
+  process: every `rch exec` was refused as "restart remediation is active"
+  long after disk space returned. If the latch holds for two consecutive 30s
+  checks, rchd now shuts down cleanly. systemd or launchd restarts it, and it
+  reloads the in-flight builds
+  ([`51f01965`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/51f019655d45c1cc0e444fdaf90615e81ae4c1d8)).
+- **The new-layout `--no-run` fix now works end to end** (`bd-b7lot`
+  follow-up). Two gaps found by a live check on the operator Mac after 2.1.7:
   - The recovery recipe derived its output policy from the delivery kind
     instead of the command's own kind, so it lacked the executable carve-out
     and skipped the very test binaries the live retrieval fetched.
@@ -40,6 +59,20 @@ Repository: <https://github.com/Dicklesworthstone/remote_compilation_helper>
     binary could land on a Mac unflagged. The gate now inspects exactly the
     new-layout executable shape (never build scripts). A Mac requesting
     `--no-run` binaries from a Linux worker now gets an honest RCH-E327.
+
+  ([`874d9701`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/874d97018c13a09dbb34c8be4250f3261fce20d2))
+- **Test daemons die with their test** (`bd-b4hrx`). A test binary killed
+  without running Drop (tool timeout, OOM) left its rchd running for hours.
+  On hz3 one ignored SIGTERM and stalled a rollout's idle gate, which took it
+  for a stale dispatcher. The e2e harness now passes its pid in
+  `RCH_EXIT_WITH_PARENT_PID`. rchd shuts down once that pid is gone, and
+  exits outright 10s later if shutdown stalls. Production daemons never set it
+  ([`a958b26e`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/a958b26e8860494e2d478b28f38ba9723951388b)).
+- **Unit tests cannot touch the host's rch** (`bd-61pp8`). Running `rch`'s
+  unit tests on a dispatcher once drained all 18 live workers through the
+  real daemon socket. Under `cfg(test)`, the config directory, config cache
+  and default daemon socket now resolve to a per-process temp dir
+  ([`74396e35`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/74396e354eb3ca2cf44351d0f1ec631ea2a0aa1f)).
 
 ## 2.1.7 — 2026-09-28
 
