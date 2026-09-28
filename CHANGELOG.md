@@ -31,6 +31,29 @@ Repository: <https://github.com/Dicklesworthstone/remote_compilation_helper>
 
 ## Unreleased
 
+## 2.1.6 — 2026-09-28
+
+A faster hook, `--no-run` executables under Cargo's new build-dir layout,
+permission-respecting compound rewrites, and restart and recovery fixes.
+
+- **Compound commands keep the user's permission rules** (`bd-08ele`). A
+  rewrite like `cd x && <anything> && rch exec -- cargo build` answered
+  "allow", which approved the user's own prefix without the prompt their rules
+  call for. Compound rewrites now return the rewritten command without a
+  decision, so Claude Code applies the rewrite and still consults the user's
+  rules. Simple `rch exec --` rewrites keep "allow"
+  ([`e745f471`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/e745f4710660a6e169b9da30d87d02b96d60c181)).
+- **Recovery no longer retries forever when the worker's output tree is
+  gone.** If the remote path is provably absent (a GC'd pool, for example),
+  the build is recorded as an artifact-transfer failure and retired, releasing
+  its worker source claim. Any other retrieval error still retries
+  ([`e3b42d54`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/e3b42d5454bcb013d10b1df4b8ef7d5478b48040)).
+- **Daemon restarts** (`bd-w2qrp`).
+  - Restored builds get a 20-second reattachment window before the stuck
+    detector judges them, since their heartbeat age includes the downtime
+    ([`6f31701a`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/6f31701a9a9082cb99621397ed6072dafaaccd3b)).
+  - Recovered queue rows are retired once their client is proven gone
+    ([`ce1c4330`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/ce1c43307a8993ba3176c77783edc2930b1dabdb)).
 - **`cargo test --no-run` / `cargo bench --no-run` return their executables
   with a forwarded `CARGO_TARGET_DIR`** (`bd-b7lot`, known issue since 2.1.0).
   Cargo's new build-dir layout keeps them under
@@ -384,6 +407,7 @@ follow-ups, artifact hashes, and retained limitations.
 
 | Version | Kind | Date | Summary |
 |---------|------|------|---------|
+| [`v2.1.6`](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v2.1.6) | Release | 2026-09-28 | 2.4× cheaper non-compilation hook; `--no-run` executables under Cargo's new build-dir layout; compound rewrites respect permission rules; restart/recovery fixes; crates ship the LICENSE |
 | [`v2.1.5`](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v2.1.5) | Release | 2026-09-28 | Ghost reservations actually released (2.1.4's rule never matched a real ghost) |
 | [`v2.1.4`](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v2.1.4) | Release | 2026-09-28 | Ghost reservations released; `cargo publish --dry-run` succeeds; queued/recovered ownership survives restarts; recovery skips stray staged files |
 | [`v2.1.3`](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v2.1.3) | Release | 2026-09-27 | Green builds stop being reported as failures (output tail, symlinked roots); error chains in incidents; self-clearing orphan quarantines; minisign-verified updates; macOS reattach |
