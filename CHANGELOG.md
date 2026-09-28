@@ -31,6 +31,20 @@ Repository: <https://github.com/Dicklesworthstone/remote_compilation_helper>
 
 ## Unreleased
 
+## 2.1.5 — 2026-09-28
+
+- **Ghost reservations are actually released.** 2.1.4's release rule required
+  that no remote process record path had ever been reported. The hook reports
+  that deterministic path before launch, so every real ghost had one; 11 ghosts
+  on mac-mini-old were retried and kept every cycle after its upgrade. The path
+  no longer disqualifies a build. For an abandoned build (6 hours silent,
+  wrapper gone, no lease owning source), a remote cancel that finds no record
+  at all now counts as proof that nothing runs. That holds because the launcher
+  publishes the record before any workload starts and refuses to start without
+  it, and worker cleanup removes it only after the process group is gone. A
+  record that exists still needs a confirmed kill
+  ([`4f5cf01e`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/4f5cf01e875eb97ebd27ac7ffa7bbec5ab3f7498)).
+
 ## 2.1.4 — 2026-09-28
 
 Stuck reservations are released, `cargo publish` dry runs succeed, and daemon
@@ -334,6 +348,7 @@ follow-ups, artifact hashes, and retained limitations.
 
 | Version | Kind | Date | Summary |
 |---------|------|------|---------|
+| [`v2.1.5`](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v2.1.5) | Release | 2026-09-28 | Ghost reservations actually released (2.1.4's rule never matched a real ghost) |
 | [`v2.1.4`](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v2.1.4) | Release | 2026-09-28 | Ghost reservations released; `cargo publish --dry-run` succeeds; queued/recovered ownership survives restarts; recovery skips stray staged files |
 | [`v2.1.3`](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v2.1.3) | Release | 2026-09-27 | Green builds stop being reported as failures (output tail, symlinked roots); error chains in incidents; self-clearing orphan quarantines; minisign-verified updates; macOS reattach |
 | [`v2.1.2`](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v2.1.2) | Release | 2026-09-27 | Hotfix: output-ownership lock held only during publication (2.1.0 failed every overlapping build on shared `CARGO_TARGET_DIR`); dangling Cargo cache links repaired |
