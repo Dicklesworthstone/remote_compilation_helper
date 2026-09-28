@@ -343,6 +343,66 @@ async fn quarantine_worker_on_unverified_timeout_cleanup(
     }
 }
 
+/// Hook stdin cap, shared by the fast path and the full path.
+const HOOK_INPUT_LIMIT: u64 = 10 * 1024 * 1024;
+
+/// Input the fast path read before handing a request to the full path.
+static PRE_READ_HOOK_INPUT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Every agent Bash command runs `rch` as a PreToolUse hook, and almost all
+/// of them are not compilations. Answer that pass-through before the CLI,
+/// logging, the update check and the async runtime are built: they cost
+/// ~2ms on a quiet Linux dispatcher and ~8ms of CPU on macOS (framework
+/// loading), against a 1ms budget (bd-1nhd).
+///
+/// Returns true when the request is fully answered (allow: empty stdout,
+/// exit 0), exactly as [`process_hook`] would answer it. Anything else,
+/// including a compilation hidden behind shell structure (which reports a
+/// summary), falls back to the full path with the input already read.
+pub fn try_fast_passthrough() -> bool {
+    use std::io::{IsTerminal, Read};
+    // Only a bare `rch` fed by a pipe is a hook request; `COMPLETE` selects
+    // shell-completion mode.
+    if std::env::args_os().len() != 1
+        || std::env::var_os("COMPLETE").is_some()
+        || std::io::stdin().is_terminal()
+    {
+        return false;
+    }
+    install_hook_mode_panic_handler();
+    let mut input = String::new();
+    if std::io::stdin()
+        .take(HOOK_INPUT_LIMIT)
+        .read_to_string(&mut input)
+        .is_err()
+    {
+        // The full path also allows on an unreadable stdin.
+        return true;
+    }
+    if fast_passthrough_allows(input.trim()) {
+        return true;
+    }
+    let _ = PRE_READ_HOOK_INPUT.set(input);
+    false
+}
+
+/// Whether [`process_hook`] would answer this input with a plain allow and
+/// no other effect. Unparseable input goes to the full path, which logs it.
+fn fast_passthrough_allows(input: &str) -> bool {
+    if input.is_empty() {
+        return true;
+    }
+    let Ok(hook_input) = serde_json::from_str::<HookInput>(input) else {
+        return false;
+    };
+    if hook_input.tool_name != "Bash" {
+        return true;
+    }
+    let command = &hook_input.tool_input.command;
+    !crate::cache::classify_hook_command(command, classify_command).is_compilation
+        && declined_compilation_due_to_structure(command).is_none()
+}
+
 /// Run the hook, reading from stdin and writing to stdout.
 ///
 /// **Fail-open contract**: this function MUST return `Ok(())` for every
@@ -360,11 +420,12 @@ pub async fn run_hook() -> anyhow::Result<()> {
 
     // Read input from stdin with a 10MB limit to prevent OOM.
     // A truncated/closed pipe is treated as "no input" (fail-open).
-    let mut input = String::new();
-    {
+    // The fast path may already have consumed it.
+    let mut input = PRE_READ_HOOK_INPUT.get().cloned().unwrap_or_default();
+    if PRE_READ_HOOK_INPUT.get().is_none() {
         use tokio::io::{AsyncReadExt, stdin};
         if let Err(e) = stdin()
-            .take(10 * 1024 * 1024)
+            .take(HOOK_INPUT_LIMIT)
             .read_to_string(&mut input)
             .await
         {

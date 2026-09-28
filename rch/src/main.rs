@@ -2017,8 +2017,20 @@ fn reliability_metrics_requested(cli: &Cli) -> bool {
 /// Use current-thread runtime for CLI commands to minimize startup overhead.
 /// Multi-threaded runtime spawns one thread per CPU core (64 cores = 128MB stack allocations).
 /// Current-thread runtime uses a single thread, drastically reducing startup time.
-#[tokio::main(flavor = "current_thread")]
-async fn main() {
+fn main() {
+    // Every agent Bash command runs this binary as a hook. Answer the common
+    // pass-through before building the CLI or the runtime (bd-1nhd).
+    if hook::try_fast_passthrough() {
+        return;
+    }
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build the tokio runtime")
+        .block_on(async_main());
+}
+
+async fn async_main() {
     let args: Vec<OsString> = env::args_os().collect();
     let wants_machine_output = top_level_machine_output_requested(&args);
 

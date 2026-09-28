@@ -11292,3 +11292,50 @@ fn project_topology_local_reason_admits_projects_under_the_canonical_root_only()
         "the reason names the fix: {reason}"
     );
 }
+
+/// bd-1nhd: the fast path may only answer what `process_hook` answers with a
+/// plain allow, and must hand everything else to the full path.
+#[tokio::test]
+async fn fast_passthrough_answers_only_what_process_hook_plainly_allows() {
+    let request = |tool: &str, command: &str| {
+        serde_json::json!({
+            "session_id": "s",
+            "hook_event_name": "PreToolUse",
+            "tool_name": tool,
+            "tool_input": {"command": command},
+        })
+        .to_string()
+    };
+    for command in [
+        "ls -la",
+        "git status",
+        "cd /tmp && ls",
+        r#"br comments add x "cargo test -p rchd""#,
+        "echo cargo build",
+    ] {
+        let input = request("Bash", command);
+        assert!(super::fast_passthrough_allows(&input), "{command}");
+        let output = process_hook(serde_json::from_str(&input).unwrap()).await;
+        assert!(
+            matches!(output, HookOutput::Allow(_)),
+            "fast path allowed what process_hook would not: {command} -> {output:?}"
+        );
+    }
+    assert!(super::fast_passthrough_allows(""));
+    assert!(super::fast_passthrough_allows(&request(
+        "Read",
+        "cargo build"
+    )));
+    for command in [
+        "cargo build --release",
+        "cargo test -p rch",
+        "cargo build | tee build.log",
+        "cargo build > build.log 2>&1 &",
+    ] {
+        assert!(
+            !super::fast_passthrough_allows(&request("Bash", command)),
+            "{command} must reach the full path"
+        );
+    }
+    assert!(!super::fast_passthrough_allows("{not json"));
+}
