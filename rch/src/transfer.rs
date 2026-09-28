@@ -5769,7 +5769,9 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         .context("timed out proving clean-overlay source freshness")?
     }
 
-    #[cfg(test)]
+    // Its only callers are Linux-only tests; on macOS it is dead code and
+    // fails `clippy -D warnings`.
+    #[cfg(all(test, target_os = "linux"))]
     fn clean_overlay_source_refresh_command(&self, identity: &str) -> Result<String> {
         self.clean_overlay_source_refresh_command_at(identity, &self.remote_path())
     }
