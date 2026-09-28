@@ -224,6 +224,10 @@ pub(super) fn get_project_artifact_patterns(
 pub(super) fn expected_output_glob_list(patterns: &[String]) -> Vec<String> {
     patterns
         .iter()
+        .map(|p| {
+            p.strip_prefix("+ ")
+                .map_or_else(|| p.clone(), str::to_string)
+        })
         .filter(|p| {
             !p.starts_with("- ")
                 && !matches!(
@@ -234,7 +238,6 @@ pub(super) fn expected_output_glob_list(patterns: &[String]) -> Vec<String> {
                         | "target/CACHEDIR.TAG"
                 )
         })
-        .cloned()
         .collect()
 }
 
@@ -282,6 +285,7 @@ pub(super) fn get_custom_target_artifact_patterns(
     kind: Option<CompilationKind>,
     command: Option<&str>,
 ) -> Vec<String> {
+    let build_only_test = command.is_some_and(|command| cargo_build_only_test(kind, command));
     let kind = artifact_delivery_kind(kind, command);
     if direct_compiler::patterns(kind, command).is_some() {
         return Vec::new();
@@ -388,9 +392,32 @@ pub(super) fn get_custom_target_artifact_patterns(
                     .unwrap_or(pattern.as_str())
                     .to_string()
             }));
+            if build_only_test {
+                patterns.extend(new_layout_executable_patterns(command));
+            }
             patterns
         }
     }
+}
+
+/// `cargo test/bench --no-run` executables under Cargo's new build-dir layout
+/// live at `<profile>/build/<pkg>/<hash>/out/<crate>-<16 hex>`, inside the
+/// `build/` cache tree the excludes above drop, and are never uplifted
+/// (bd-b7lot). Priority-include exactly that shape, then drop everything else
+/// under `build/` file by file (the priority rules open its directories).
+/// The old layout's `deps/` executables are unaffected.
+fn new_layout_executable_patterns(command: Option<&str>) -> Vec<String> {
+    let mut profiles = vec!["debug".to_string(), "release".to_string()];
+    profiles.extend(command.and_then(cargo_custom_profile_output_dir));
+    let mut patterns = Vec::new();
+    for profile in &profiles {
+        for root in [profile.clone(), format!("*/{profile}")] {
+            patterns.push(format!("+ {root}/build/*/*/out/*-????????????????"));
+            patterns.push(format!("+ {root}/build/*/*/out/*-????????????????.exe"));
+            patterns.push(format!("- {root}/build/**"));
+        }
+    }
+    patterns
 }
 
 /// Whether a compilation kind produces build artifacts that must be transferred
@@ -589,6 +616,31 @@ mod profile_artifact_tests {
     use super::*;
 
     #[test]
+    fn only_build_only_tests_open_the_new_layout_build_tree() {
+        let command = "cargo test --no-run --profile=fixture";
+        let patterns =
+            get_custom_target_artifact_patterns(Some(CompilationKind::CargoTest), Some(command));
+        for root in ["debug", "release", "fixture", "*/fixture"] {
+            assert!(
+                patterns.contains(&format!("+ {root}/build/*/*/out/*-????????????????")),
+                "{root}: {patterns:?}"
+            );
+            assert!(patterns.contains(&format!("- {root}/build/**")), "{root}");
+        }
+        for (kind, command) in [
+            (CompilationKind::CargoBuild, "cargo build"),
+            (CompilationKind::CargoBuild, "cargo build --profile=fixture"),
+            (CompilationKind::CargoTest, "cargo test"),
+        ] {
+            let patterns = get_custom_target_artifact_patterns(Some(kind), Some(command));
+            assert!(
+                !patterns.iter().any(|pattern| pattern.starts_with("+ ")),
+                "{command} must keep the cache excludes closed: {patterns:?}"
+            );
+        }
+    }
+
+    #[test]
     fn build_only_tests_use_the_build_contract_for_both_retrieval_bases_and_gates() {
         for (kind, command) in [
             (CompilationKind::CargoTest, "cargo test --no-run --lib"),
@@ -609,10 +661,11 @@ mod profile_artifact_tests {
                 get_artifact_patterns(kind, command),
                 get_artifact_patterns(delivery_kind, command)
             );
-            assert_eq!(
-                get_custom_target_artifact_patterns(kind, command),
-                get_custom_target_artifact_patterns(delivery_kind, command)
-            );
+            // The build contract, plus the new build-dir layout's executables
+            // carved out of the build/ cache (bd-b7lot).
+            let mut expected = get_custom_target_artifact_patterns(delivery_kind, command);
+            expected.extend(new_layout_executable_patterns(command));
+            assert_eq!(get_custom_target_artifact_patterns(kind, command), expected);
             assert!(!get_project_artifact_patterns(kind, command, false).is_empty());
             assert!(get_project_artifact_patterns(kind, command, true).is_empty());
             assert!(kind_produces_transferable_artifacts(delivery_kind));
@@ -890,6 +943,10 @@ mod profile_artifact_tests {
                 "--safe-links",
                 "--prune-empty-dirs",
             ]);
+            // Same filter order as the production retrieval builders.
+            for rule in crate::transfer::priority_rsync_includes(&patterns) {
+                copy.arg(format!("--include={rule}"));
+            }
             for pattern in &patterns {
                 if let Some(exclude) = pattern.strip_prefix("- ") {
                     copy.arg(format!("--exclude={exclude}"));
@@ -898,6 +955,7 @@ mod profile_artifact_tests {
             copy.arg("--include=*/");
             for pattern in &patterns {
                 if !pattern.starts_with("- ") {
+                    let pattern = pattern.strip_prefix("+ ").unwrap_or(pattern);
                     copy.arg(format!("--include=/{pattern}"));
                 }
             }
@@ -947,8 +1005,34 @@ mod profile_artifact_tests {
                 b"local source must not be overwritten\n"
             );
             if forwarded {
-                for cache in ["incremental", ".fingerprint", "build"] {
+                for cache in ["incremental", ".fingerprint"] {
                     assert!(!local_target.join("no-run-fixture").join(cache).exists());
+                }
+                // Cargo's new build-dir layout keeps the executable itself
+                // under build/; nothing else from that cache may come back.
+                let returned: Vec<_> = executables
+                    .iter()
+                    .map(|executable| {
+                        local_basis.join(executable.strip_prefix(remote_basis).unwrap())
+                    })
+                    .collect();
+                let mut pending = vec![local_target.join("no-run-fixture").join("build")];
+                while let Some(directory) = pending.pop() {
+                    let Ok(entries) = std::fs::read_dir(&directory) else {
+                        continue;
+                    };
+                    for entry in entries {
+                        let path = entry.unwrap().path();
+                        if path.is_dir() {
+                            pending.push(path);
+                        } else {
+                            assert!(
+                                returned.contains(&path),
+                                "build cache file came back: {}",
+                                path.display()
+                            );
+                        }
+                    }
                 }
             }
         }

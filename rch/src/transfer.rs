@@ -213,6 +213,29 @@ impl WindowsArtifactFilter {
     }
 }
 
+/// One caller's artifact policy as path filters. This is the selection rule for
+/// the Windows tar route and for staged-output validation, and it matches the
+/// order the rsync builders emit: priority includes win, then an include
+/// selects a file unless an exclude drops it.
+struct ArtifactFilters {
+    priority: Vec<WindowsArtifactFilter>,
+    includes: Vec<WindowsArtifactFilter>,
+    excludes: Vec<WindowsArtifactFilter>,
+}
+
+impl ArtifactFilters {
+    fn selects(&self, path: &str) -> bool {
+        self.priority
+            .iter()
+            .any(|filter| filter.matches(path, false))
+            || (self
+                .includes
+                .iter()
+                .any(|filter| filter.matches(path, false))
+                && !self.excludes.iter().any(|filter| filter.excludes(path)))
+    }
+}
+
 fn windows_artifact_relative_path(path: &str) -> Result<&str> {
     let path = path.strip_prefix("./").unwrap_or(path);
     anyhow::ensure!(
@@ -227,8 +250,7 @@ fn windows_artifact_relative_path(path: &str) -> Result<&str> {
 
 fn windows_artifact_selection(
     inventory: &[u8],
-    includes: &[WindowsArtifactFilter],
-    excludes: &[WindowsArtifactFilter],
+    filters: &ArtifactFilters,
 ) -> Result<std::collections::BTreeMap<String, u64>> {
     anyhow::ensure!(
         inventory.is_empty() || inventory.ends_with(&[0]),
@@ -245,9 +267,7 @@ fn windows_artifact_selection(
             .context("artifact inventory lacks size")?;
         let size = std::str::from_utf8(&entry[..split])?.parse::<u64>()?;
         let path = windows_artifact_relative_path(std::str::from_utf8(&entry[split + 1..])?)?;
-        if includes.iter().any(|filter| filter.matches(path, false))
-            && !excludes.iter().any(|filter| filter.excludes(path))
-        {
+        if filters.selects(path) {
             anyhow::ensure!(
                 selected.insert(path.to_string(), size).is_none(),
                 "duplicate Windows artifact inventory member {path:?}"
@@ -1109,18 +1129,59 @@ fn artifact_pattern_exclude(pattern: &str) -> Option<&str> {
     pattern.strip_prefix("- ")
 }
 
+/// A `+ <pat>` entry is a PRIORITY include: it is matched before every exclude,
+/// so it can carve one exact output shape out of a tree the cache excludes
+/// otherwise drop. Cargo's new build-dir layout keeps `--no-run` test/bench
+/// executables under `<profile>/build/<pkg>/<hash>/out/`, inside the excluded
+/// `build/` cache (bd-b7lot). The payload is also an ordinary include.
+fn artifact_pattern_priority(pattern: &str) -> Option<&str> {
+    pattern.strip_prefix("+ ")
+}
+
+/// Anchored rsync `--include` rules for the priority patterns, preceded by
+/// every ancestor directory rsync must enter to reach them. They are emitted
+/// before all excludes; the caller pairs each with a file-level exclude (for
+/// example `- <profile>/build/**`) so opening those directories returns nothing
+/// else.
+pub(crate) fn priority_rsync_includes(artifact_patterns: &[String]) -> Vec<String> {
+    let mut rules: Vec<String> = Vec::new();
+    for pattern in artifact_patterns
+        .iter()
+        .filter_map(|pattern| artifact_pattern_priority(pattern))
+    {
+        let anchored = anchor_retrieval_pattern(pattern);
+        let components: Vec<&str> = anchored.trim_start_matches('/').split('/').collect();
+        let mut ancestor = String::new();
+        for directory in &components[..components.len().saturating_sub(1)] {
+            ancestor.push('/');
+            ancestor.push_str(directory);
+            let rule = format!("{ancestor}/");
+            if !rules.contains(&rule) {
+                rules.push(rule);
+            }
+        }
+        rules.push(anchored);
+    }
+    rules
+}
+
 /// Partition an artifact-pattern list into `(excludes, includes)`. Exclude
 /// entries (`- <pat>`) yield their bare payload (the `- ` marker stripped);
-/// everything else is an include pattern, preserved verbatim and in order. The
-/// include list is what the existing root/source-integrity helpers consume, so
-/// they never mistake an exclude marker for an artifact root.
+/// everything else is an include pattern, preserved in order (a priority
+/// include's `+ ` marker is stripped). The include list is what the existing
+/// root/source-integrity helpers consume, so they never mistake a marker for an
+/// artifact root.
 fn partition_artifact_filters(artifact_patterns: &[String]) -> (Vec<String>, Vec<String>) {
     let mut excludes = Vec::new();
     let mut includes = Vec::new();
     for pattern in artifact_patterns {
         match artifact_pattern_exclude(pattern) {
             Some(payload) => excludes.push(payload.to_string()),
-            None => includes.push(pattern.clone()),
+            None => includes.push(
+                artifact_pattern_priority(pattern)
+                    .unwrap_or(pattern)
+                    .to_string(),
+            ),
         }
     }
     (excludes, includes)
@@ -2090,26 +2151,28 @@ impl TransferPipeline {
         self
     }
 
-    fn artifact_retrieval_filters(
-        &self,
-        artifact_patterns: &[String],
-    ) -> Result<(Vec<WindowsArtifactFilter>, Vec<WindowsArtifactFilter>)> {
+    fn artifact_retrieval_filters(&self, artifact_patterns: &[String]) -> Result<ArtifactFilters> {
         let (caller_excludes, includes) = partition_artifact_filters(artifact_patterns);
         let mut excludes = self.get_retrieval_excludes(&includes);
         excludes.extend(caller_excludes);
         excludes.extend(
             self.local_source_roots_to_exclude(&allowed_artifact_roots(&includes), &includes),
         );
-        Ok((
-            includes
+        Ok(ArtifactFilters {
+            priority: artifact_patterns
+                .iter()
+                .filter_map(|pattern| artifact_pattern_priority(pattern))
+                .map(|pattern| WindowsArtifactFilter::new(pattern, true))
+                .collect::<Result<Vec<_>>>()?,
+            includes: includes
                 .iter()
                 .map(|pattern| WindowsArtifactFilter::new(pattern, true))
                 .collect::<Result<Vec<_>>>()?,
-            excludes
+            excludes: excludes
                 .iter()
                 .map(|pattern| WindowsArtifactFilter::new(pattern, false))
                 .collect::<Result<Vec<_>>>()?,
-        ))
+        })
     }
 
     /// Retained staging bytes may predate the current transfer filters. Check
@@ -2136,7 +2199,7 @@ impl TransferPipeline {
         paths: &[PathBuf],
         artifact_patterns: &[String],
     ) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
-        let (includes, excludes) = self.artifact_retrieval_filters(artifact_patterns)?;
+        let filters = self.artifact_retrieval_filters(artifact_patterns)?;
         let mut admitted = Vec::new();
         let mut outside = Vec::new();
         for path in paths {
@@ -2145,8 +2208,7 @@ impl TransferPipeline {
                 && path
                     .components()
                     .all(|component| matches!(component, Component::Normal(_)))
-                && includes.iter().any(|filter| filter.matches(name, false))
-                && !excludes.iter().any(|filter| filter.excludes(name));
+                && filters.selects(name);
             if allowed {
                 admitted.push(path.clone());
             } else {
@@ -4530,8 +4592,8 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
             .map_or((None, start), |(cancel, started)| {
                 (Some(cancel.clone()), *started)
             });
-        let (includes, excludes) = self.artifact_retrieval_filters(artifact_patterns)?;
-        if includes.is_empty() {
+        let filters = self.artifact_retrieval_filters(artifact_patterns)?;
+        if filters.includes.is_empty() {
             return Ok(ArtifactRetrieval {
                 stats: SyncResult {
                     bytes_transferred: 0,
@@ -4561,7 +4623,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
             on_line,
         )
         .await?;
-        let selected = windows_artifact_selection(&inventory, &includes, &excludes)?;
+        let selected = windows_artifact_selection(&inventory, &filters)?;
         let count = u32::try_from(selected.len()).context("too many Windows artifacts")?;
         let mut bytes = 0;
         if !selected.is_empty() {
@@ -5382,6 +5444,11 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         // only the include patterns feed the root/source-integrity helpers below.
         let (caller_excludes, include_patterns) = partition_artifact_filters(artifact_patterns);
 
+        // Priority includes precede every exclude (first match wins).
+        for rule in priority_rsync_includes(artifact_patterns) {
+            cmd.arg("--include").arg(rule);
+        }
+
         // Apply retrieval-safe excludes before the directory include so rsync
         // never descends into known junk trees like `.beads/recovery_*` on the
         // worker, while still allowing traversal into declared artifact roots.
@@ -5475,6 +5542,11 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         // Split caller-supplied EXCLUDE rules (`- <pat>`) from INCLUDE patterns;
         // see build_retrieve_command for the rationale (first-match-wins ordering).
         let (caller_excludes, include_patterns) = partition_artifact_filters(artifact_patterns);
+
+        // Priority includes precede every exclude (first match wins).
+        for rule in priority_rsync_includes(artifact_patterns) {
+            cmd.arg("--include").arg(rule);
+        }
 
         // Reuse the retrieval-safe excludes so streaming downloads skip stale
         // worker-local junk trees without excluding legitimate artifact roots.
@@ -12707,6 +12779,62 @@ fn main() {
     }
 
     #[test]
+    fn priority_includes_open_their_ancestors_before_every_exclude() {
+        let patterns = [
+            "- debug/build/**",
+            "+ debug/build/*/*/out/*-????????????????",
+            "+ debug/build/*/*/out/*-????????????????.exe",
+            "debug/**",
+        ]
+        .map(String::from);
+        assert_eq!(
+            priority_rsync_includes(&patterns),
+            [
+                "/debug/",
+                "/debug/build/",
+                "/debug/build/*/",
+                "/debug/build/*/*/",
+                "/debug/build/*/*/out/",
+                "/debug/build/*/*/out/*-????????????????",
+                "/debug/build/*/*/out/*-????????????????.exe",
+            ]
+        );
+        let (excludes, includes) = partition_artifact_filters(&patterns);
+        assert_eq!(excludes, ["debug/build/**"]);
+        assert!(includes.contains(&"debug/build/*/*/out/*-????????????????".to_string()));
+        assert!(includes.iter().all(|include| !include.starts_with("+ ")));
+    }
+
+    #[test]
+    fn a_priority_include_wins_over_the_cache_exclude_and_nothing_else_does() {
+        let pipeline = TransferPipeline::new(
+            PathBuf::from("/tmp/target"),
+            "p".into(),
+            "h".into(),
+            TransferConfig::default(),
+        );
+        let patterns = [
+            "- debug/build/",
+            "- debug/build/**",
+            "+ debug/build/*/*/out/*-????????????????",
+            "debug/**",
+        ]
+        .map(String::from);
+        let filters = pipeline.artifact_retrieval_filters(&patterns).unwrap();
+        assert!(
+            filters.selects("debug/build/fixture/730dbae432c4d53d/out/fixture-730dbae432c4d53d")
+        );
+        assert!(filters.selects("debug/app"));
+        for cache in [
+            "debug/build/fixture/730dbae432c4d53d/out/libfixture-730dbae432c4d53d.rlib",
+            "debug/build/fixture/730dbae432c4d53d/out/generated.rs",
+            "debug/build/fixture/730dbae432c4d53d/fingerprint",
+        ] {
+            assert!(!filters.selects(cache), "{cache} must stay remote");
+        }
+    }
+
+    #[test]
     fn windows_artifact_filters_preserve_exact_outputs_and_exclude_cache_ancestors() {
         let includes = ["*/release/**", "bin/app[[]dev[]].exe", "*.obj"]
             .map(|pattern| WindowsArtifactFilter::new(pattern, true).unwrap());
@@ -12719,7 +12847,12 @@ fn main() {
             3 ./bin/appd.exe\0\
             5 ./root.obj\0\
             6 ./src/source.obj\0";
-        let selected = windows_artifact_selection(inventory, &includes, &excludes).unwrap();
+        let filters = ArtifactFilters {
+            priority: Vec::new(),
+            includes: includes.into(),
+            excludes: excludes.into(),
+        };
+        let selected = windows_artifact_selection(inventory, &filters).unwrap();
         assert_eq!(
             selected.into_keys().collect::<Vec<_>>(),
             [
@@ -12728,12 +12861,10 @@ fn main() {
                 "x86_64-pc-windows-msvc/release/app.exe"
             ]
         );
-        assert!(windows_artifact_selection(b"4 ./bin/app.exe", &includes, &excludes).is_err());
+        assert!(windows_artifact_selection(b"4 ./bin/app.exe", &filters).is_err());
         for path in ["../outside", "/outside", "C:/outside", "a/../../b", "a\\b"] {
             let inventory = format!("1 {path}\0");
-            assert!(
-                windows_artifact_selection(inventory.as_bytes(), &includes, &excludes).is_err()
-            );
+            assert!(windows_artifact_selection(inventory.as_bytes(), &filters).is_err());
         }
     }
 
@@ -12770,17 +12901,20 @@ fn main() {
             .iter()
             .map(|pattern| WindowsArtifactFilter::new(pattern, true).unwrap())
             .collect::<Vec<_>>();
-        let filters = excludes
-            .iter()
-            .map(|pattern| WindowsArtifactFilter::new(pattern, false).unwrap())
-            .collect::<Vec<_>>();
+        let filters = ArtifactFilters {
+            priority: Vec::new(),
+            includes,
+            excludes: excludes
+                .iter()
+                .map(|pattern| WindowsArtifactFilter::new(pattern, false).unwrap())
+                .collect::<Vec<_>>(),
+        };
         let selected = windows_artifact_selection(
             b"4 ./Cargo.toml\0\
             4 ./main.c\0\
             4 ./src/main.c\0\
             4 ./bin/app.exe\0\
             4 ./fresh.exe\0",
-            &includes,
             &filters,
         )
         .unwrap();
@@ -12834,7 +12968,7 @@ fn main() {
             "the recovered target reference must protect its own existing files"
         );
         let patterns = vec!["*/release/**".to_string()];
-        let (includes, excludes) = recovered.artifact_retrieval_filters(&patterns).unwrap();
+        let filters = recovered.artifact_retrieval_filters(&patterns).unwrap();
         // A wildcard first component keeps target directories traversable;
         // root-level files are refused by the complete include pattern, not
         // necessarily by an explicit source-root exclusion string.
@@ -12844,8 +12978,7 @@ fn main() {
             4 ./x86_64-pc-windows-msvc/release/app.exe\0\
             4 ./private-build/release/secret.exe\0\
             4 ./ignored/release/kept.exe\0",
-            &includes,
-            &excludes,
+            &filters,
         )
         .unwrap();
         assert_eq!(
@@ -12945,7 +13078,12 @@ fn main() {
         .unwrap();
         let includes = ["bin/app[[]dev[]] $cash.exe", "bin/*.pdb"]
             .map(|pattern| WindowsArtifactFilter::new(pattern, true).unwrap());
-        let selected = windows_artifact_selection(&inventory, &includes, &[]).unwrap();
+        let filters = ArtifactFilters {
+            priority: Vec::new(),
+            includes: includes.into(),
+            excludes: Vec::new(),
+        };
+        let selected = windows_artifact_selection(&inventory, &filters).unwrap();
         assert_eq!(selected.len(), 3);
         let archive = tempfile::NamedTempFile::new().unwrap();
         let mut output = tokio::fs::File::from_std(archive.reopen().unwrap());
