@@ -2110,21 +2110,41 @@ impl TransferPipeline {
         paths: &[PathBuf],
         artifact_patterns: &[String],
     ) -> Result<()> {
-        let (includes, excludes) = self.artifact_retrieval_filters(artifact_patterns)?;
-        for path in paths {
-            let name = path.to_str().context("non-UTF-8 staged artifact path")?;
-            anyhow::ensure!(
-                !name.is_empty()
-                    && path
-                        .components()
-                        .all(|component| matches!(component, Component::Normal(_)))
-                    && includes.iter().any(|filter| filter.matches(name, false))
-                    && !excludes.iter().any(|filter| filter.excludes(name)),
+        let (_, outside) = self.partition_staged_artifact_paths(paths, artifact_patterns)?;
+        if let Some(path) = outside.first() {
+            anyhow::bail!(
                 "staged file is outside the caller's artifact policy: {}",
                 path.display()
             );
         }
         Ok(())
+    }
+
+    /// Split staged paths into those the artifact policy admits and those it
+    /// does not (e.g. a retained `.rustc_info.json` or `.cargo-lock`).
+    pub(crate) fn partition_staged_artifact_paths(
+        &self,
+        paths: &[PathBuf],
+        artifact_patterns: &[String],
+    ) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
+        let (includes, excludes) = self.artifact_retrieval_filters(artifact_patterns)?;
+        let mut admitted = Vec::new();
+        let mut outside = Vec::new();
+        for path in paths {
+            let name = path.to_str().context("non-UTF-8 staged artifact path")?;
+            let allowed = !name.is_empty()
+                && path
+                    .components()
+                    .all(|component| matches!(component, Component::Normal(_)))
+                && includes.iter().any(|filter| filter.matches(name, false))
+                && !excludes.iter().any(|filter| filter.excludes(name));
+            if allowed {
+                admitted.push(path.clone());
+            } else {
+                outside.push(path.clone());
+            }
+        }
+        Ok((admitted, outside))
     }
 
     /// The supervisor owns all output descriptors, so loss of the streaming

@@ -449,37 +449,43 @@ impl RecoverySession {
         // Exclusive for this publication only; see `lock_output_root`.
         let _publication = lock_output_root(&self.recipe.phases[index].local)?;
         let stage = self.stage(index);
-        let files = regular_files(&stage)?;
+        let mut files = regular_files(&stage)?;
         let phase = &self.recipe.phases[index];
         if phase.result_dir.is_none() {
             // A resumed transfer can retain files selected by an older
             // collector. Ownership fingerprints alone do not authorize a
-            // source file as an artifact: validate the complete pending write
-            // set before either journal recovery or ordinary publication.
-            let mut writes: Vec<_> = files
-                .iter()
-                .filter(|path| !phase.published.contains_key(*path))
-                .cloned()
-                .collect();
-            if let Some((relative, hash)) = &phase.pending {
-                if !phase.baseline.contains_key(relative)
-                    && fingerprint(&phase.local.join(relative))?.as_ref() == Some(hash)
-                {
-                    // The prior rename already created this new output. Only
-                    // its journal remains to be completed; the live reference
-                    // tree must not reclassify our own generic output as source.
-                    writes.retain(|path| path != relative);
-                } else if !writes.contains(relative) {
-                    writes.push(relative.clone());
-                }
-            }
-            TransferPipeline::new(
+            // source file as an artifact, so only staged files the artifact
+            // policy admits are ever published. The rest (retained Cargo
+            // metadata such as `.rustc_info.json`) stay private to the stage:
+            // refusing the whole publication instead left the job forever
+            // unrecoverable and its worker-side source claim stranded.
+            let policy = TransferPipeline::new(
                 phase.local.clone(),
                 "recovery-publication".into(),
                 self.recipe.identity.clone(),
                 self.recipe.transfer.clone(),
-            )
-            .validate_staged_artifact_paths(&writes, &phase.patterns)?;
+            );
+            let (admitted, outside) =
+                policy.partition_staged_artifact_paths(&files, &phase.patterns)?;
+            for path in &outside {
+                debug!(
+                    "recovery skips staged file outside the artifact policy: {}",
+                    path.display()
+                );
+            }
+            files = admitted;
+            if let Some((relative, hash)) = &phase.pending {
+                // A journaled write already began renaming this path into
+                // place. It must be in policy to be finished; never skip it.
+                let completed = !phase.baseline.contains_key(relative)
+                    && fingerprint(&phase.local.join(relative))?.as_ref() == Some(hash);
+                if !completed {
+                    policy.validate_staged_artifact_paths(
+                        std::slice::from_ref(relative),
+                        &phase.patterns,
+                    )?;
+                }
+            }
         }
         if let Some((relative, hash)) = self.recipe.phases[index].pending.clone() {
             let destination = self.recipe.phases[index].local.join(&relative);
@@ -1082,16 +1088,32 @@ mod tests {
             session.persist().unwrap();
             let journal = std::fs::read(&session.writer.path).unwrap();
 
-            assert!(session.publish("project").is_err(), "pending={pending}");
+            let published = session.publish("project");
+            // Source is never overwritten and the retained copy stays staged.
             assert_eq!(std::fs::read(local.join("main.c")).unwrap(), original);
-            assert!(!local.join("build/app").exists());
             assert_eq!(std::fs::read(&retained).unwrap(), remote);
-            assert_eq!(
-                std::fs::read(stage.join("build/app")).unwrap(),
-                b"valid artifact"
-            );
-            assert_eq!(std::fs::read(&session.writer.path).unwrap(), journal);
-            assert!(session.recipe.phases[0].published.is_empty());
+            if pending {
+                // An interrupted write of an out-of-policy path cannot be
+                // finished or skipped: refuse before any write.
+                assert!(published.is_err());
+                assert!(!local.join("build/app").exists());
+                assert_eq!(std::fs::read(&session.writer.path).unwrap(), journal);
+                assert!(session.recipe.phases[0].published.is_empty());
+            } else {
+                // A retained out-of-policy file is skipped, not fatal: the
+                // job's real outputs still publish, so recovery can retire
+                // and release the worker-side source claim.
+                published.unwrap();
+                assert_eq!(
+                    std::fs::read(local.join("build/app")).unwrap(),
+                    b"valid artifact"
+                );
+                assert!(
+                    !session.recipe.phases[0]
+                        .published
+                        .contains_key(&PathBuf::from("main.c"))
+                );
+            }
         }
     }
 
