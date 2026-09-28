@@ -24,6 +24,7 @@ mod headroom;
 mod health;
 mod history;
 mod http_api;
+mod lease_recovery;
 mod metrics;
 mod orphan_quarantine;
 mod process_triage;
@@ -1295,6 +1296,12 @@ async fn main() -> Result<()> {
     // Its typed handle must be joined before shutdown stops receiving heartbeats.
     let active_cleanup = cleanup::ActiveBuildCleanup::new(context.clone());
     let mut active_cleanup_handle = Some(active_cleanup.start());
+
+    // Finish dead client leases that still own worker source (bd-nalyr). An
+    // isolated test pool must not reconcile the operator's real leases.
+    if !isolated_worker_pool(&cli.socket, cli.workers_config.as_deref(), &shared_socket) {
+        let _lease_recovery = lease_recovery::start(context.events.clone(), cli.socket.clone());
+    }
 
     let worker_status_panel = Arc::new(Mutex::new(
         WorkerStatusPanel::new()

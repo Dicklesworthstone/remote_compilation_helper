@@ -3058,7 +3058,7 @@ pub(crate) fn lease_owns_unretired_source(lease: &DurableJobLease) -> bool {
     })
 }
 
-fn lease_blocks_restart(
+pub(crate) fn lease_blocks_restart(
     lease: &DurableJobLease,
     now_unix_ms: u64,
     wrapper_alive: impl FnOnce() -> bool,
@@ -3338,7 +3338,7 @@ fn handle_budget() -> BudgetStatusResponse {
     budget::get_budget_status()
 }
 
-fn is_process_alive(pid: u32) -> bool {
+pub(crate) fn is_process_alive(pid: u32) -> bool {
     if pid == 0 {
         return false;
     }
