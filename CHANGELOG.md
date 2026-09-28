@@ -5,7 +5,7 @@ Compilation Helper): the PreToolUse hook + CLI (`rch`), the local daemon (`rchd`
 worker agent (`rch-wkr`), the RABS build sidecar (`rabs-*`, `rabsd`), and the fleet
 dashboard (`dashboard/`).
 
-Scope window: project inception (`v0.1.0`, 2026-01-25) through `v2.1.9` (2026-09-28).
+Scope window: project inception (`v0.1.0`, 2026-01-25) through `v2.1.10` (2026-09-28).
 
 This document was rebuilt from git history (`git log --no-merges` per tag range, `git show`
 on representative commits), version tags (`git for-each-ref`), GitHub release metadata
@@ -28,6 +28,39 @@ history. They are kept as-is because the descriptions were verified against the 
 but those particular links will 404.
 
 Repository: <https://github.com/Dicklesworthstone/remote_compilation_helper>
+
+## 2.1.10 — 2026-09-28
+
+- **Builds wait for a busy worker instead of being refused** (`bd-141zu`).
+  The daemon queues a request (`RCH_QUEUE_WHEN_BUSY`, on by default) only when
+  selection reports every worker busy. But one worker in critical pressure, or
+  one active-project exclusion anywhere in the fleet, turned "eight capable
+  workers busy" into an immediate "no admissible workers" refusal. That was
+  the most common refusal fleet-wide (~7.9k in 24h), and agents answered it
+  with tight retry loops or local builds on the dispatcher. When a capable
+  worker is merely busy, the request now queues until it drains. Each poll
+  re-runs full selection, so a worker that turns critical while we wait is
+  filtered again
+  ([`c3e2d296`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/c3e2d296d5be26c21bd21047d32949ba6538eeb9)).
+- **Retrieved outputs are no longer kept twice on dispatchers.** Every
+  retrieved job left a full copy of its artifacts under
+  `job-leases/retrieval/`: 1,339 stages and 43 GB on ts1, and about 129 GB
+  across ten dispatchers. The stage is removed once publication is durable
+  ([`19ae7e2a`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/19ae7e2a140d0766b7b209333380e864ff6c9aaf)).
+- **Lost selection replies can no longer cause a replay or a silent local
+  build.** A failed reply to an immediate (non-queued) worker selection is now
+  treated as possibly admitted, like a queued one, and goes through the durable
+  uncertain-lease path. A refused mismatched-worker assignment only reports a
+  plain refusal after its release is acknowledged
+  ([`36520ebc`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/36520ebc8e58631f90daaac3ba95a6487ebff6bc),
+  [`9ec9b32f`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/9ec9b32f36289be34d3c01c020d4c419f020dbf1)).
+
+Fleet configuration changed alongside this release (not in the binaries):
+uniform `[selection]` (`min_free_gb = 20`, `disk_gb_per_slot = 5`,
+`max_load_per_core = 1.0`), `test_slots = 4`, larger per-dispatcher budgets for
+dedicated build hosts, and a 150 GB per-worker target-cache budget. Summed
+usable slots went from 397 to ~720–870, and concurrent builds from ~160 to
+~220–235. Details in `bd-141zu`.
 
 ## 2.1.9 — 2026-09-28
 
