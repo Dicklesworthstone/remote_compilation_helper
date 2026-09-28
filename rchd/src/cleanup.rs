@@ -10,6 +10,13 @@ use tokio::time::{MissedTickBehavior, interval};
 use tracing::{debug, warn};
 
 const HEARTBEAT_STALE_SECS: u64 = 20;
+/// Silence from a LIVE hook that corroborates a progress stall. The hook beats every 5 s, but on
+/// a loaded host the hook, this daemon, or both can be descheduled for tens of seconds, and a
+/// compile of one large crate emits no progress for many minutes. On 2026-09-28 a healthy
+/// 16-minute `cargo test` compile in Execute was cancelled at `hb_age: 23` with
+/// `progress_age: 740` while this daemon's own log lagged the event by 12 s. A dead hook still
+/// needs only [`HEARTBEAT_STALE_SECS`].
+const LIVE_HOOK_HEARTBEAT_STALE_SECS: u64 = 120;
 const PROGRESS_STALE_SECS: u64 = 90;
 const RECENT_PROGRESS_GRACE_SECS: u64 = 15;
 const MIN_BUILD_AGE_SECS: u64 = 30;
@@ -237,7 +244,8 @@ fn score_stuck_evidence(input: StuckEvidenceInput) -> StuckEvidence {
     let heartbeat_stale = input.heartbeat_age_secs >= HEARTBEAT_STALE_SECS;
     let progress_stale = input.progress_age_secs >= PROGRESS_STALE_SECS;
     let progress_recent = input.progress_age_secs <= RECENT_PROGRESS_GRACE_SECS;
-    let progress_stall_corroborated = !input.hook_alive || heartbeat_stale;
+    let progress_stall_corroborated =
+        !input.hook_alive || input.heartbeat_age_secs >= LIVE_HOOK_HEARTBEAT_STALE_SECS;
     let remediable_progress_stale = input.progress_stall_remediable_phase
         && progress_stale
         && !progress_recent
@@ -1264,7 +1272,11 @@ mod tests {
                 .used_slots(),
             3
         );
-        tokio::time::sleep(Duration::from_secs(HEARTBEAT_STALE_SECS + 1)).await;
+        // Past the recovery window, and past the live-hook silence limit for jobs[1].
+        tokio::time::sleep(Duration::from_secs(
+            (LIVE_HOOK_HEARTBEAT_STALE_SECS - PROGRESS_STALE_SECS).max(HEARTBEAT_STALE_SECS) + 1,
+        ))
+        .await;
         context
             .history
             .record_build_heartbeat(heartbeat(builds[0].id, jobs[0].0.id()))
@@ -1343,8 +1355,8 @@ mod tests {
         tokio::task::yield_now().await;
         stop_before_shutdown(&mut cleanup, async {
             // Real elapsed time matters: history uses std::time::Instant, not
-            // Tokio's virtual clock. This spans both production stale limits.
-            tokio::time::sleep(Duration::from_secs(PROGRESS_STALE_SECS + 6)).await;
+            // Tokio's virtual clock. This spans every production stale limit, a live hook's too.
+            tokio::time::sleep(Duration::from_secs(LIVE_HOOK_HEARTBEAT_STALE_SECS + 6)).await;
             assert!(job.0.try_wait().unwrap().is_none());
             assert!(context.history.active_build(build.id).is_some());
             assert_eq!(
@@ -1468,12 +1480,12 @@ mod tests {
     }
 
     #[test]
-    fn test_score_stuck_evidence_execute_progress_stall_remediates_stale_heartbeat() {
+    fn test_score_stuck_evidence_execute_progress_stall_remediates_silent_live_hook() {
         let _guard = test_guard!();
         let evidence = score_stuck_evidence(StuckEvidenceInput {
             hook_alive: true,
             progress_stall_remediable_phase: true,
-            heartbeat_age_secs: HEARTBEAT_STALE_SECS + 1,
+            heartbeat_age_secs: LIVE_HOOK_HEARTBEAT_STALE_SECS + 1,
             progress_age_secs: PROGRESS_STALE_SECS + 60,
             build_age_secs: MIN_BUILD_AGE_SECS + 90,
             slots_owned: 2,
@@ -1484,6 +1496,36 @@ mod tests {
         assert!(evidence.progress_stale);
         assert!(evidence.remediable_progress_stale);
         assert!(evidence.should_remediate());
+    }
+
+    #[test]
+    fn test_score_stuck_evidence_one_late_heartbeat_from_live_hook_retains_silent_compile() {
+        let _guard = test_guard!();
+        // The exact evidence of the 2026-09-28 20:32:23Z cancellation of a healthy build on hz4:
+        // a live hook whose heartbeat was 23 s old while rustc compiled one crate silently.
+        let observed = StuckEvidenceInput {
+            hook_alive: true,
+            progress_stall_remediable_phase: true,
+            heartbeat_age_secs: 23,
+            progress_age_secs: 740,
+            build_age_secs: 996,
+            slots_owned: 6,
+            has_worker_binding: true,
+        };
+        let evidence = score_stuck_evidence(observed);
+
+        assert!(evidence.heartbeat_stale);
+        assert!(evidence.progress_stale);
+        assert!(!evidence.remediable_progress_stale);
+        assert!(!evidence.should_remediate());
+        assert!(evidence.confidence < REMEDIATION_CONFIDENCE_THRESHOLD);
+
+        // The same silence from a DEAD hook is still remediated at once.
+        let dead = score_stuck_evidence(StuckEvidenceInput {
+            hook_alive: false,
+            ..observed
+        });
+        assert!(dead.should_remediate());
     }
 
     #[test]
@@ -1617,7 +1659,7 @@ mod tests {
                 phase_remediable
                     && progress_age_secs >= PROGRESS_STALE_SECS
                     && progress_age_secs > RECENT_PROGRESS_GRACE_SECS
-                    && (!hook_alive || evidence.heartbeat_stale)
+                    && (!hook_alive || heartbeat_age_secs >= LIVE_HOOK_HEARTBEAT_STALE_SECS)
             );
             prop_assert!(evidence.confidence.is_finite());
             prop_assert!((0.0..=1.0).contains(&evidence.confidence));
