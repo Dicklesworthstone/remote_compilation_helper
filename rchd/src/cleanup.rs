@@ -527,7 +527,12 @@ mod tests {
 
         impl Owner {
             fn start() -> Self {
-                Self(std::process::Command::new("/bin/sleep").arg("60").spawn().unwrap())
+                Self(
+                    std::process::Command::new("/bin/sleep")
+                        .arg("60")
+                        .spawn()
+                        .unwrap(),
+                )
             }
 
             fn stop(&mut self) {
@@ -550,10 +555,16 @@ mod tests {
         }
 
         fn enqueue(context: &DaemonContext, pid: u32, wrapper: Option<&str>) -> QueuedBuildState {
-            context.history.enqueue_build(
-                "queue-recovery".into(), "cargo check".into(), pid, 2,
-                wrapper.map(str::to_owned),
-            ).unwrap()
+            context
+                .history
+                .enqueue_build(
+                    "queue-recovery".into(),
+                    "cargo check".into(),
+                    pid,
+                    2,
+                    wrapper.map(str::to_owned),
+                )
+                .unwrap()
         }
 
         fn restart(context: &mut DaemonContext, path: &Path) {
@@ -581,13 +592,18 @@ mod tests {
                 {
                     tokio::task::yield_now().await;
                 }
-            }).await.expect("the actual observer must reap a queue-only daemon");
+            })
+            .await
+            .expect("the actual observer must reap a queue-only daemon");
             stop_before_shutdown(&mut task, async {}).await;
             assert!(context.history.wrapper_cancelled("dead-owner"));
             assert_eq!(context.history.queue_depth(), 2);
             assert!(context.history.active_builds().is_empty());
             assert!(context.pool.is_empty());
-            assert_eq!(serde_json::to_value(context.history.queued_build(kept.id)).unwrap(), before);
+            assert_eq!(
+                serde_json::to_value(context.history.queued_build(kept.id)).unwrap(),
+                before
+            );
             assert!(context.history.queued_build(unknown.id).is_some());
             assert!(live.0.try_wait().unwrap().is_none());
             restart(&mut context, &path);
@@ -603,17 +619,26 @@ mod tests {
             let context = context(&path);
             let mut owner = Owner::start();
             let mut row = enqueue(&context, owner.0.id(), Some("owner"));
-            assert!(recovered_queue_owner_gone(&row).is_none(), "live waiter owns normal cleanup");
+            assert!(
+                recovered_queue_owner_gone(&row).is_none(),
+                "live waiter owns normal cleanup"
+            );
             row.recovered = true;
             assert!(recovered_queue_owner_gone(&row).is_none());
             row.hook_process_identity = None;
-            assert!(recovered_queue_owner_gone(&row).is_none(), "unknown is not dead");
+            assert!(
+                recovered_queue_owner_gone(&row).is_none(),
+                "unknown is not dead"
+            );
             // Model a different incarnation, not actual operating-system PID reuse.
             #[cfg(target_os = "linux")]
             {
                 let actual = crate::history::process_identity(owner.0.id()).unwrap();
                 row.hook_process_identity = Some(format!("{actual}-prior"));
-                assert_eq!(recovered_queue_owner_gone(&row), Some("queued_owner_replaced"));
+                assert_eq!(
+                    recovered_queue_owner_gone(&row),
+                    Some("queued_owner_replaced")
+                );
             }
             assert!(owner.0.try_wait().unwrap().is_none());
             for pid in [0, 1, u32::MAX] {
@@ -623,7 +648,10 @@ mod tests {
             row.hook_pid = owner.0.id();
             row.hook_process_identity = None;
             owner.stop();
-            assert_eq!(recovered_queue_owner_gone(&row), Some("queued_owner_exited"));
+            assert_eq!(
+                recovered_queue_owner_gone(&row),
+                Some("queued_owner_exited")
+            );
             row.recovered = false;
             assert!(recovered_queue_owner_gone(&row).is_none());
         }
@@ -641,15 +669,29 @@ mod tests {
             assert!(recovered_queue_owner_gone(&stale).is_some());
             // Model admission winning between the process probe and retirement.
             let id = rch_common::WorkerId::new("reserved-worker");
-            context.pool.add_worker(rch_common::WorkerConfig {
-                id: id.clone(), total_slots: 4, ..Default::default()
-            }).await;
+            context
+                .pool
+                .add_worker(rch_common::WorkerConfig {
+                    id: id.clone(),
+                    total_slots: 4,
+                    ..Default::default()
+                })
+                .await;
             let worker = context.pool.get(&id).await.unwrap();
             assert!(worker.reserve_slots(2).await);
-            let active = context.history.try_start_active_build_with_wrapper(
-                queued.project_id, id.to_string(), queued.command, queued.hook_pid,
-                queued.local_wrapper_id, 2, rch_common::BuildLocation::Remote,
-            ).unwrap().unwrap();
+            let active = context
+                .history
+                .try_start_active_build_with_wrapper(
+                    queued.project_id,
+                    id.to_string(),
+                    queued.command,
+                    queued.hook_pid,
+                    queued.local_wrapper_id,
+                    2,
+                    rch_common::BuildLocation::Remote,
+                )
+                .unwrap()
+                .unwrap();
             assert!(!retire_recovered_queue_owner(&context, &stale).unwrap());
             assert!(context.history.active_build(active.id).is_some());
             assert!(!context.history.wrapper_cancelled("admitted-owner"));
@@ -667,8 +709,11 @@ mod tests {
             let original = std::fs::read(path.with_extension("ownership.json")).unwrap();
             let blocker = root.path().join("not-a-directory");
             std::fs::write(&blocker, "retained test evidence").unwrap();
-            context.history = Arc::new(BuildHistory::load_from_file(&path, 10).unwrap()
-                .with_persistence(blocker.join("history.jsonl")));
+            context.history = Arc::new(
+                BuildHistory::load_from_file(&path, 10)
+                    .unwrap()
+                    .with_persistence(blocker.join("history.jsonl")),
+            );
             owner.stop();
             let mut reaper = RecoveredQueueCleanup::default();
             reaper.check(&context);
@@ -682,8 +727,10 @@ mod tests {
             let reopened = BuildHistory::load_from_file(&path, 10).unwrap();
             assert!(reopened.queued_build(row.id).is_some());
             let original: serde_json::Value = serde_json::from_slice(&original).unwrap();
-            assert_eq!(serde_json::to_value(reopened.queued_build(row.id).unwrap()).unwrap(),
-                original["queued"][0]);
+            assert_eq!(
+                serde_json::to_value(reopened.queued_build(row.id).unwrap()).unwrap(),
+                original["queued"][0]
+            );
             assert!(!reopened.wrapper_cancelled("failed-owner"));
         }
 
@@ -701,10 +748,19 @@ mod tests {
             owner.stop();
             let mut reaper = RecoveredQueueCleanup::default();
             reaper.check(&context);
-            assert!(context.history.queued_build(dead.id).is_some(), "first batch is bounded");
+            assert!(
+                context.history.queued_build(dead.id).is_some(),
+                "first batch is bounded"
+            );
             reaper.check(&context);
-            assert!(context.history.queued_build(dead.id).is_none(), "live prefix must not starve tail");
-            assert_eq!(context.history.queue_depth(), RECOVERED_QUEUE_PROBES_PER_TICK);
+            assert!(
+                context.history.queued_build(dead.id).is_none(),
+                "live prefix must not starve tail"
+            );
+            assert_eq!(
+                context.history.queue_depth(),
+                RECOVERED_QUEUE_PROBES_PER_TICK
+            );
             assert!(context.history.wrapper_cancelled("dead-tail"));
             assert!(context.history.active_builds().is_empty());
         }
@@ -788,11 +844,17 @@ mod tests {
         for seconds in [0, 5, 10, 19, 20, 21, 25] {
             let now = start + Duration::from_secs(seconds);
             assert!(!observation.recovering_build(now, false));
-            assert_eq!(observation.recovering_build(now, true), seconds < HEARTBEAT_STALE_SECS);
+            assert_eq!(
+                observation.recovering_build(now, true),
+                seconds < HEARTBEAT_STALE_SECS
+            );
         }
         // A recovered build seen later does not get another startup window.
         assert!(!observation.recovering_build(start + Duration::from_secs(30), true));
-        assert_eq!(observation.startup_until, Some(start + Duration::from_secs(20)));
+        assert_eq!(
+            observation.startup_until,
+            Some(start + Duration::from_secs(20))
+        );
     }
 
     #[test]
@@ -811,7 +873,10 @@ mod tests {
                 slots_owned: 1,
                 has_worker_binding: true,
             });
-            assert!(evidence.should_remediate(), "negative control without recovery grace");
+            assert!(
+                evidence.should_remediate(),
+                "negative control without recovery grace"
+            );
             assert_eq!(evidence.should_remediate_after_observation(grace), expected);
             assert_eq!(evidence.heartbeat_age_secs, 120);
             assert_eq!(evidence.progress_age_secs, 120);
@@ -1041,7 +1106,10 @@ mod tests {
                     1,
                     rch_common::BuildLocation::Remote,
                 );
-                context.history.record_build_heartbeat(heartbeat(&build)).unwrap()
+                context
+                    .history
+                    .record_build_heartbeat(heartbeat(&build))
+                    .unwrap()
             })
             .collect();
 
@@ -1076,7 +1144,10 @@ mod tests {
 
         // A real reattachment heartbeat rescues one owner. Explicitly expire
         // only the observer's test deadline; do not fabricate client progress.
-        context.history.record_build_heartbeat(heartbeat(&builds[0])).unwrap();
+        context
+            .history
+            .record_build_heartbeat(heartbeat(&builds[0]))
+            .unwrap();
         observation.startup_until = Some(Instant::now());
         cleanup.check_active_builds_observed(&mut observation).await;
         assert!(context.history.active_build(builds[0].id).is_some());
@@ -1084,8 +1155,12 @@ mod tests {
         assert!(context.history.active_build(builds[1].id).is_none());
         assert!(jobs[1].0.try_wait().unwrap().is_some());
         assert_eq!(
-            context.pool.get(&rch_common::WorkerId::new("restart-observer-worker"))
-                .await.unwrap().used_slots(),
+            context
+                .pool
+                .get(&rch_common::WorkerId::new("restart-observer-worker"))
+                .await
+                .unwrap()
+                .used_slots(),
             1,
         );
         std::fs::write(root.join("completed"), "ok").unwrap();
