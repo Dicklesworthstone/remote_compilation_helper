@@ -141,17 +141,28 @@ fn budgets_cover_every_rabs_crate_in_the_workspace() {
     }
 }
 
+/// The rabs crates the published `rch` links against. crates.io requires them
+/// to be published too (they have been since 2.1.0); every other rabs crate
+/// is experimental and stays unpublishable.
+const PUBLISHED_RABS_LIBRARIES: &[&str] = &["rabs-protocol", "rabs-key", "rabs-cas"];
+
 #[test]
-fn rabs_crates_stay_unpublishable_until_license_metadata_is_fixed() {
-    // Risk R72: workspace package metadata advertises plain MIT while the
-    // license file carries the rider. Until bead A016 corrects metadata,
-    // no rabs crate may be publishable.
+fn only_rch_library_dependencies_among_rabs_crates_are_publishable() {
+    // Risk R72 (plain-MIT metadata contradicting the rider LICENSE) was
+    // closed by A016, and tests/license_metadata.rs now enforces it for every
+    // crate, including that each publishable crate ships the LICENSE text.
     for (krate, _, _) in BUDGETS {
-        let manifest = manifest_of(krate);
-        assert!(
-            manifest.contains("publish = false"),
-            "`{krate}` must declare publish = false until the A016 \
-             license-metadata correction lands (risk R72)"
-        );
+        let unpublishable = manifest_of(krate).contains("publish = false");
+        if PUBLISHED_RABS_LIBRARIES.contains(krate) {
+            assert!(
+                !unpublishable,
+                "`{krate}` is a dependency of the published rch and must stay publishable"
+            );
+        } else {
+            assert!(
+                unpublishable,
+                "`{krate}` is experimental RABS and must declare publish = false"
+            );
+        }
     }
 }

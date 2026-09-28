@@ -31,6 +31,14 @@ Repository: <https://github.com/Dicklesworthstone/remote_compilation_helper>
 
 ## Unreleased
 
+- **Published crates ship the license text.** The eight crates on crates.io
+  declare `LicenseRef-MIT-OpenAI-Anthropic-Rider` but packaged no LICENSE, so
+  consumers could not read the rider the identifier refers to. Each now
+  carries it (a `LICENSE` link to the root file), and a test requires it for
+  every publishable crate. The obsolete "rabs crates stay unpublishable until
+  A016" guard now states what is true: only `rch`'s three rabs library
+  dependencies are publishable.
+
 - **A worker that broke a build no longer attracts the next one** (review of
   GH #81). Since 2.1.4 a failed build whose command started remotely warms its
   worker's cache, including failures the hook itself blames on the worker: a

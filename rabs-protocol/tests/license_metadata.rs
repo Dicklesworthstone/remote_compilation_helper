@@ -72,6 +72,40 @@ fn every_member_crate_inherits_the_workspace_license() {
 }
 
 #[test]
+fn every_publishable_crate_ships_the_license_text() {
+    // A LicenseRef names a license by reference only. crates.io consumers see
+    // the rider only if the package carries the text, and Cargo packages a
+    // crate's own directory, never the workspace-root LICENSE.
+    let root = repo_root();
+    let license = fs::read_to_string(root.join("LICENSE")).unwrap();
+    let mut publishable = 0;
+    for entry in fs::read_dir(&root).unwrap() {
+        let dir = entry.unwrap().path();
+        let Ok(manifest) = fs::read_to_string(dir.join("Cargo.toml")) else {
+            continue;
+        };
+        if dir == root
+            || !manifest.contains("[package]")
+            || manifest.contains("publish = false")
+        {
+            continue;
+        }
+        let shipped = fs::read_to_string(dir.join("LICENSE")).unwrap_or_default();
+        assert_eq!(
+            shipped,
+            license,
+            "{} is publishable but does not ship the rider LICENSE text",
+            dir.display()
+        );
+        publishable += 1;
+    }
+    assert!(
+        publishable >= 8,
+        "expected the eight published crates, saw {publishable}"
+    );
+}
+
+#[test]
 fn license_file_still_carries_the_rider() {
     let license = fs::read_to_string(repo_root().join("LICENSE")).unwrap();
     assert!(
