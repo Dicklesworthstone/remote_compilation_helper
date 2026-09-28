@@ -2164,29 +2164,26 @@ impl TransferPipeline {
             done = quote(path),
             directory = quote(Path::new(path).parent().unwrap().to_str().unwrap()),
         );
-        // GNU `tail --pid` exits only after a final read once the supervisor
-        // is gone, so the stream ends with the last byte of output. It needs
-        // the supervisor reaped first (a zombie still answers `kill -0`). A
-        // 120s backstop bounds the wait should the reaped PID be reused
-        // before tail notices. Without `--pid`, the old bounded
-        // `sleep 1; kill` can still cut a slow tail. Follow by polling, not
-        // inotify: bytes written between tail's first read and its watch
-        // raise no event, and once the writer is gone an inotify tail exits
-        // without a final read. With a slow reader that cut ~5-8% of streams
-        // on uutils tail; a polling tail reads to EOF before it gives up.
+        // Each follower copies its log by byte offset and decides completion
+        // itself: it samples the receipt BEFORE the size, so once the receipt
+        // exists the size it reads is final, and it leaves only after a pass
+        // that found nothing new. `tail -f --pid` left that decision to tail:
+        // an inotify tail lost bytes written before its watch existed, and a
+        // uutils polling tail still quit early under load (a slow reader got
+        // ~9.9K of 20K lines). Only `wc -c`, `tail -c +N` and `head -c` are
+        // used; a slow reader simply blocks the copy.
         format!(
             "set -e; rch_umask=$(umask); umask 077; mkdir -p -- {directory}; mkdir {claim}; : > {out}; : > {err}; umask \"$rch_umask\"; \
              nohup sh -c {supervisor} </dev/null >{out} 2>{err} & \
-             p=$!; follow=; if tail --pid=\"$p\" -c 0 /dev/null >/dev/null 2>&1; then follow=--pid=$p; \
-               if tail ---disable-inotify -c 0 /dev/null >/dev/null 2>&1; then follow=\"$follow ---disable-inotify\"; fi; fi; \
-             tail $follow -c +1 -f {out} & a=$!; tail $follow -c +1 -f {err} >&2 & b=$!; \
+             p=$!; \
+             rch_follow() {{ o=0; while :; do if [ -f {done} ]; then d=1; else d=; fi; s=$(($(wc -c < \"$1\"))); \
+               if [ \"$s\" -gt \"$o\" ]; then tail -c +$((o + 1)) -- \"$1\" | head -c $((s - o)) || :; o=$s; continue; fi; \
+               [ -n \"$d\" ] && return 0; sleep 0.2 2>/dev/null || sleep 1; done; }}; \
+             rch_follow {out} & a=$!; rch_follow {err} >&2 & b=$!; \
              trap 'kill \"$a\" \"$b\" 2>/dev/null || :' EXIT; \
              while [ ! -f {done} ]; do sleep 1; done; \
              wait \"$p\" || :; \
-             if [ -n \"$follow\" ]; then \
-               ( trap 'kill \"$s\" 2>/dev/null; exit 0' TERM; sleep 120 </dev/null >/dev/null 2>&1 & s=$!; wait \"$s\"; kill \"$a\" \"$b\" 2>/dev/null ) & k=$!; \
-               wait \"$a\" || :; a=; wait \"$b\" || :; b=; kill \"$k\" 2>/dev/null || :; \
-             else sleep 1; kill \"$a\" \"$b\" 2>/dev/null || :; a=; b=; fi; \
+             wait \"$a\" || :; a=; wait \"$b\" || :; b=; \
              read -r identity status < {done}; [ \"$identity\" = {identity} ]; exit \"$status\"",
             claim = quote(&format!("{path}.started")),
             out = quote(&format!("{path}.stdout")),
@@ -7558,11 +7555,11 @@ mod tests {
         assert_eq!(mode(std::path::Path::new(&receipt)) & 0o077, 0);
     }
 
-    /// A reader that lags behind the wrapper (a slow SSH link) leaves tail
-    /// blocked on a full pipe when the command finishes; the stream must
-    /// still end with the last line rather than being cut by a timer. An
-    /// inotify tail also lost bytes written before its watch existed, in
-    /// ~5-8% of runs, so eight wrappers race at once to make that visible.
+    /// A reader that lags behind the wrapper (a slow SSH link) leaves the
+    /// follower blocked on a full pipe when the command finishes; the stream
+    /// must still end with the last line rather than being cut. The old
+    /// `tail -f --pid` follower lost the tail in ~5-8% of such runs, and more
+    /// under load, so eight wrappers race at once to make a regression visible.
     #[cfg(target_os = "linux")]
     #[test]
     fn durable_execution_waits_for_a_slow_reader() {
