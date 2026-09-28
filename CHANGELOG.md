@@ -31,6 +31,24 @@ Repository: <https://github.com/Dicklesworthstone/remote_compilation_helper>
 
 ## Unreleased
 
+- **`cargo test --no-run` / `cargo bench --no-run` return their executables
+  with a forwarded `CARGO_TARGET_DIR`** (`bd-b7lot`, known issue since 2.1.0).
+  Cargo's new build-dir layout keeps them under
+  `<profile>/build/<pkg>/<hash>/out/`, inside the `build/` cache the target-dir
+  sync excludes. Retrieval now supports priority includes, matched before
+  every exclude (in rsync, the Windows tar route and staged-output
+  validation). Build-only test/bench retrieval uses them to return exactly
+  `<crate>-<16 hex>` executables and nothing else from `build/`. Verified with
+  real Cargo on a Linux worker.
+- **The non-compilation hook is about 2.4× cheaper** (`bd-1nhd`). A bare `rch`
+  hook request for an ordinary command is now answered before the CLI,
+  logging, update check and async runtime start. On a quiet Linux dispatcher
+  this is ~2.8 → ~1.2 ms per agent Bash command (page faults 701 → 310). On
+  macOS the mean is 12.4 → 7.9 ms, and the remaining floor is framework
+  loading.
+- **`rch fleet drain/deploy/rollback` exit 1 when nothing ran** (held fleet
+  lock, or no target); they printed an error and exited 0 (`bd-bddpd`).
+
 - **Published crates ship the license text.** The eight crates on crates.io
   declare `LicenseRef-MIT-OpenAI-Anthropic-Rider` but packaged no LICENSE, so
   consumers could not read the rider the identifier refers to. Each now
