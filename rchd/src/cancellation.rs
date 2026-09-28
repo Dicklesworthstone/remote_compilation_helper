@@ -107,9 +107,9 @@ pub struct CancellationRecord {
     #[serde(skip)]
     pub hook_process_identity: Option<String>,
     pub remote_pgid_file: Option<String>,
-    /// The build provably never launched remote work and was abandoned (see
-    /// [`provably_abandoned_unlaunched`]): no remote kill can be confirmed or
-    /// is needed, so the reservation may be released without one.
+    /// The reservation was abandoned (see [`provably_abandoned_unlaunched`]):
+    /// without a record path it needs no remote kill; with one, a record the
+    /// worker no longer has confirms that nothing runs under it.
     #[serde(skip)]
     pub abandoned_unlaunched: bool,
 }
@@ -118,20 +118,21 @@ pub struct CancellationRecord {
 /// min default) and the worker orphan reaper (240 min).
 const ABANDONED_UNLAUNCHED_AFTER: Duration = Duration::from_secs(6 * 3600);
 
-/// A reservation that never reported a remote process record, whose wrapper
-/// is gone (or was never recorded), and that has been silent far past every
-/// remote lifetime cap cannot have a live remote process. Requiring a remote
-/// kill for it (there is no record to kill by) held its slots forever: 15
-/// such ghosts held ~40 slots on one dispatcher, surviving restarts because
-/// ownership is durable. A lease that still owns worker source keeps it: its
-/// source claim fences the worker until `rch jobs recover` retires it.
+/// A reservation whose wrapper is gone (or was never recorded) and that has
+/// been silent far past every remote lifetime cap is abandoned. With no
+/// process record path it can never have launched anything; with one (the
+/// hook reports the path before launch), a record the worker no longer has
+/// proves nothing runs under it. Demanding a confirmed remote kill for these
+/// held their slots forever: 15 such ghosts held ~40 slots on one dispatcher
+/// and survived restarts because ownership is durable. A lease that still
+/// owns worker source keeps it: its source claim fences the worker until
+/// `rch jobs recover` retires it.
 fn provably_abandoned_unlaunched(
     build: &crate::history::ActiveBuildState,
     now: Instant,
     lease_owns_source: impl FnOnce(&str) -> bool,
 ) -> bool {
-    build.remote_pgid_file.is_none()
-        && now.saturating_duration_since(build.started_at_mono) >= ABANDONED_UNLAUNCHED_AFTER
+    now.saturating_duration_since(build.started_at_mono) >= ABANDONED_UNLAUNCHED_AFTER
         && now.saturating_duration_since(build.last_heartbeat_mono) >= ABANDONED_UNLAUNCHED_AFTER
         && wrapper_process_state(build.hook_pid, build.hook_process_identity.as_deref())
             == WrapperProcessState::Exited
@@ -651,9 +652,11 @@ impl CancellationOrchestrator {
     ) {
         // Losing the hook does not prove that its remote process group exited.
         // Only builds with no reservation AND no remote identity may skip SSH,
-        // or a reservation proven abandoned before it could launch anything.
+        // or an abandoned reservation that never reported a record path. An
+        // abandoned build WITH a path still asks the worker, where a record
+        // that is gone counts as proof of death (see `try_remote_kill`).
         let remote_required =
-            !record.abandoned_unlaunched && (record.slots > 0 || record.remote_pgid_file.is_some());
+            record.remote_pgid_file.is_some() || (!record.abandoned_unlaunched && record.slots > 0);
         if record.abandoned_unlaunched {
             warn!(
                 build_id = record.build_id,
@@ -809,7 +812,9 @@ impl CancellationOrchestrator {
 
         match ssh_result {
             Ok(Ok(output)) => {
-                let success = remote_kill_confirmed(&output, record.build_id);
+                let success = remote_kill_confirmed(&output, record.build_id)
+                    || (record.abandoned_unlaunched
+                        && remote_record_absent(&output, record.build_id));
                 debug!(
                     "Remote kill for build {} on {}: success={}",
                     record.build_id, record.worker_id, success
@@ -1084,6 +1089,14 @@ fn build_remote_kill_script(remote_pgid_file: Option<&str>, build_id: u64) -> St
         shell_escape::escape(std::borrow::Cow::Borrowed(protocol.as_str())),
         shell_escape::escape(std::borrow::Cow::Borrowed(remote_pgid_file)),
     )
+}
+
+/// The worker no longer holds the build's process record (see
+/// `cancellation_remote.sh`). Proof of death only for an abandoned build.
+fn remote_record_absent(output: &std::process::Output, build_id: u64) -> bool {
+    output.status.code() == Some(42)
+        && output.stdout.as_slice()
+            == format!("RCH_REMOTE_RECORD_ABSENT_V1:{build_id}\n").as_bytes()
 }
 
 fn remote_kill_confirmed(output: &std::process::Output, build_id: u64) -> bool {
@@ -1382,9 +1395,10 @@ mod tests {
 
         let mut launched = build.clone();
         launched.remote_pgid_file = Some("/tmp/rch-run/p/1.pgid".to_owned());
+        // The hook reports the record path before launch; the worker decides.
         assert!(
-            !provably_abandoned_unlaunched(&launched, now, no_lease),
-            "a process record exists"
+            provably_abandoned_unlaunched(&launched, now, no_lease),
+            "a reported record path alone does not disqualify"
         );
 
         assert!(
@@ -2503,7 +2517,14 @@ exec /bin/sh -c "$payload"
         for invalid in [root.join("missing.pgid"), root.clone(), link] {
             let output = remote_cancel_probe_fixture(&invalid, spy).await;
             assert_eq!(output.status.code(), Some(42));
-            assert!(output.stdout.is_empty());
+            assert!(!remote_kill_confirmed(&output, 42));
+            // Only a truly missing record is reported as absent; a directory
+            // or a symlink in its place is an unreadable record, not absence.
+            let missing = invalid.ends_with("missing.pgid");
+            assert_eq!(remote_record_absent(&output, 42), missing, "{invalid:?}");
+            if !missing {
+                assert!(output.stdout.is_empty());
+            }
         }
         let script = build_remote_kill_script(None, 42);
         assert!(
