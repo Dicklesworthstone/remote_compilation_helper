@@ -1846,7 +1846,8 @@ mod tests {
         assert!(pool.all_workers().await.is_empty());
         assert!(pool.healthy_workers().await.is_empty());
 
-        pool.add_worker(recovered_worker_config(id.as_str(), 8)).await;
+        pool.add_worker(recovered_worker_config(id.as_str(), 8))
+            .await;
         let worker = pool.get(&id).await.unwrap();
         assert_eq!(pool.len(), 1);
         assert_eq!(worker.used_slots(), 5);
@@ -1865,7 +1866,8 @@ mod tests {
             pool.restore_recovered_slots(&id, 5).await.unwrap();
             pool.clone().release_slots(&id, released).await;
             assert!(pool.is_empty());
-            pool.add_worker(recovered_worker_config(id.as_str(), 8)).await;
+            pool.add_worker(recovered_worker_config(id.as_str(), 8))
+                .await;
             let worker = pool.get(&id).await.unwrap();
             assert_eq!(worker.used_slots(), 5 - released);
             assert_eq!(worker.available_slots().await, 3 + released);
@@ -1877,19 +1879,22 @@ mod tests {
         let pool = WorkerPool::new();
         let id = WorkerId::new("smaller");
         pool.restore_recovered_slots(&id, 6).await.unwrap();
-        pool.add_worker(recovered_worker_config(id.as_str(), 2)).await;
+        pool.add_worker(recovered_worker_config(id.as_str(), 2))
+            .await;
         let worker = pool.get(&id).await.unwrap();
         assert_eq!(worker.used_slots(), 6);
         assert_eq!(worker.available_slots().await, 0);
         assert!(!worker.reserve_slots(1).await);
 
-        pool.add_worker(recovered_worker_config(id.as_str(), 8)).await;
+        pool.add_worker(recovered_worker_config(id.as_str(), 8))
+            .await;
         assert!(Arc::ptr_eq(&worker, &pool.get(&id).await.unwrap()));
         assert_eq!(worker.used_slots(), 6);
         pool.release_slots(&id, 4).await;
         assert_eq!(worker.used_slots(), 2);
         assert_eq!(worker.available_slots().await, 6);
-        pool.add_worker(recovered_worker_config(id.as_str(), 8)).await;
+        pool.add_worker(recovered_worker_config(id.as_str(), 8))
+            .await;
         assert_eq!(worker.used_slots(), 2);
     }
 
@@ -1899,7 +1904,8 @@ mod tests {
             let pool = WorkerPool::new();
             let id = WorkerId::new("overflow");
             if configured {
-                pool.add_worker(recovered_worker_config(id.as_str(), 8)).await;
+                pool.add_worker(recovered_worker_config(id.as_str(), 8))
+                    .await;
             }
             assert_eq!(
                 pool.restore_recovered_slots(&id, u32::MAX).await.unwrap(),
@@ -1907,7 +1913,8 @@ mod tests {
             );
             assert!(pool.restore_recovered_slots(&id, 1).await.is_err());
             if !configured {
-                pool.add_worker(recovered_worker_config(id.as_str(), 8)).await;
+                pool.add_worker(recovered_worker_config(id.as_str(), 8))
+                    .await;
             }
             let worker = pool.get(&id).await.unwrap();
             assert_eq!(worker.used_slots(), u32::MAX);
@@ -1926,7 +1933,8 @@ mod tests {
         assert!(!pool.restore_recovered_slots(&id, 0).await.unwrap());
         assert!(pool.recovered_absent_slots.read().await.is_empty());
         assert!(pool.is_empty());
-        pool.add_worker(recovered_worker_config(id.as_str(), 8)).await;
+        pool.add_worker(recovered_worker_config(id.as_str(), 8))
+            .await;
         assert_eq!(pool.get(&id).await.unwrap().used_slots(), 0);
     }
 
@@ -1952,7 +1960,8 @@ mod tests {
         assert_eq!(held.get(&id), Some(&5));
         drop(held);
         assert!(pool.get(&id).await.is_none());
-        pool.add_worker(recovered_worker_config(id.as_str(), 8)).await;
+        pool.add_worker(recovered_worker_config(id.as_str(), 8))
+            .await;
         assert_eq!(pool.get(&id).await.unwrap().used_slots(), 5);
     }
 
@@ -1973,7 +1982,8 @@ mod tests {
                     if operation == 0 {
                         pool.release_slots(&id, 2).await;
                     } else {
-                        pool.add_worker(recovered_worker_config(id.as_str(), 8)).await;
+                        pool.add_worker(recovered_worker_config(id.as_str(), 8))
+                            .await;
                     }
                 }));
             }
@@ -1997,8 +2007,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let history_path = directory.path().join("history.jsonl");
         let workers_path = directory.path().join("workers.toml");
-        let history =
-            crate::history::BuildHistory::new(10).with_persistence(history_path.clone());
+        let history = crate::history::BuildHistory::new(10).with_persistence(history_path.clone());
         let build = history.start_active_build(
             "recovered-project".into(),
             "returning".into(),
@@ -2008,8 +2017,7 @@ mod tests {
             rch_common::BuildLocation::Remote,
         );
         drop(history);
-        let recovered =
-            crate::history::BuildHistory::load_from_file(&history_path, 10).unwrap();
+        let recovered = crate::history::BuildHistory::load_from_file(&history_path, 10).unwrap();
         let pool = WorkerPool::new();
         for active in recovered.active_builds() {
             assert!(

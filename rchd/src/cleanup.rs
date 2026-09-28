@@ -378,7 +378,10 @@ mod tests {
         let history = std::sync::Arc::downgrade(&context.history);
         let task = ActiveBuildCleanup::new(context).start();
         tokio::task::yield_now().await;
-        assert!(history.upgrade().is_some(), "running observer owns its context");
+        assert!(
+            history.upgrade().is_some(),
+            "running observer owns its context"
+        );
         drop(task);
         tokio::time::timeout(Duration::from_secs(2), async {
             while history.upgrade().is_some() {
@@ -398,7 +401,10 @@ mod tests {
         tokio::task::yield_now().await;
         assert!(history.upgrade().is_some());
         stop_before_shutdown(&mut cleanup, async {
-            assert!(history.upgrade().is_none(), "join before polling shutdown work");
+            assert!(
+                history.upgrade().is_none(),
+                "join before polling shutdown work"
+            );
             assert!(!maintenance.is_finished(), "do not substitute another task");
         })
         .await;
@@ -431,7 +437,10 @@ mod tests {
         .expect("cleanup must finish before entering slow shutdown work");
         drop(stopping);
         assert!(cleanup.is_none());
-        assert!(history.upgrade().is_none(), "observer cannot survive abandoned shutdown");
+        assert!(
+            history.upgrade().is_none(),
+            "observer cannot survive abandoned shutdown"
+        );
     }
 
     #[test]

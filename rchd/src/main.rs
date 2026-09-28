@@ -1065,10 +1065,7 @@ async fn main() -> Result<()> {
         // proof). Retain its slots even without a pool entry: a later config
         // reload may reintroduce this worker before its old build completes.
         let configured = worker_pool
-            .restore_recovered_slots(
-                &rch_common::WorkerId::new(&build.worker_id),
-                build.slots,
-            )
+            .restore_recovered_slots(&rch_common::WorkerId::new(&build.worker_id), build.slots)
             .await?;
         if !configured {
             warn!(

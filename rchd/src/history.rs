@@ -3215,9 +3215,19 @@ mod tests {
             })
             .collect();
         assert_eq!(history.dequeue_build().unwrap().id, rows[0].id);
-        assert_eq!(history.remove_queued_build(rows[2].id).unwrap().id, rows[2].id);
-        assert_eq!(history.remove_queued_build_by_pid(103).unwrap().id, rows[3].id);
-        assert!(!history.finish_queued_build(rows[1].id, Some("w-1")).unwrap());
+        assert_eq!(
+            history.remove_queued_build(rows[2].id).unwrap().id,
+            rows[2].id
+        );
+        assert_eq!(
+            history.remove_queued_build_by_pid(103).unwrap().id,
+            rows[3].id
+        );
+        assert!(
+            !history
+                .finish_queued_build(rows[1].id, Some("w-1"))
+                .unwrap()
+        );
         drop(history);
         let recovered = BuildHistory::load_from_file(&path, 10).unwrap();
         assert_eq!(
@@ -3288,13 +3298,7 @@ mod tests {
             let path = root.path().join("history.jsonl");
             let mut history = BuildHistory::new(10).with_persistence(path.clone());
             let row = history
-                .enqueue_build(
-                    "project".into(),
-                    "build".into(),
-                    0,
-                    1,
-                    Some("owner".into()),
-                )
+                .enqueue_build("project".into(), "build".into(), 0, 1, Some("owner".into()))
                 .unwrap();
             if after_rename {
                 history
@@ -3322,18 +3326,15 @@ mod tests {
         let path = root.path().join("history.jsonl");
         let history = BuildHistory::new(10).with_persistence(path.clone());
         let row = history
-            .enqueue_build(
-                "project".into(),
-                "build".into(),
-                0,
-                1,
-                Some("owner".into()),
-            )
+            .enqueue_build("project".into(), "build".into(), 0, 1, Some("owner".into()))
             .unwrap();
         let before = std::fs::read(path.with_extension("ownership.json")).unwrap();
         for wrong in [None, Some("different")] {
             assert_eq!(
-                history.finish_queued_build(row.id, wrong).unwrap_err().kind(),
+                history
+                    .finish_queued_build(row.id, wrong)
+                    .unwrap_err()
+                    .kind(),
                 std::io::ErrorKind::PermissionDenied
             );
             assert!(history.queued_build(row.id).is_some());
@@ -3395,13 +3396,7 @@ mod tests {
             let path = root.path().join("history.jsonl");
             let history = BuildHistory::new(10).with_persistence(path.clone());
             let row = history
-                .enqueue_build(
-                    "project".into(),
-                    "build".into(),
-                    0,
-                    1,
-                    Some("owner".into()),
-                )
+                .enqueue_build("project".into(), "build".into(), 0, 1, Some("owner".into()))
                 .unwrap();
             let ownership = path.with_extension("ownership.json");
             let mut snapshot: serde_json::Value =
@@ -3434,7 +3429,10 @@ mod tests {
             let bytes = serde_json::to_vec(&snapshot).unwrap();
             std::fs::write(&ownership, &bytes).unwrap();
             drop(history);
-            assert!(BuildHistory::load_from_file(&path, 10).is_err(), "case {case}");
+            assert!(
+                BuildHistory::load_from_file(&path, 10).is_err(),
+                "case {case}"
+            );
             assert_eq!(std::fs::read(&ownership).unwrap(), bytes, "case {case}");
         }
     }
@@ -3561,8 +3559,7 @@ mod tests {
     #[test]
     fn durable_queue_survives_process_kill_before_shutdown() {
         const ROOT: &str = "RCH_DURABLE_QUEUE_CRASH_TEST_ROOT";
-        const TEST: &str =
-            "history::tests::durable_queue_survives_process_kill_before_shutdown";
+        const TEST: &str = "history::tests::durable_queue_survives_process_kill_before_shutdown";
         if let Some(root) = std::env::var_os(ROOT) {
             let root = PathBuf::from(root);
             let history = BuildHistory::new(10).with_persistence(root.join("history.jsonl"));
@@ -3580,8 +3577,11 @@ mod tests {
                         .id
                 })
                 .collect();
-            std::fs::write(root.join("ready.pending"), serde_json::to_vec(&ids).unwrap())
-                .unwrap();
+            std::fs::write(
+                root.join("ready.pending"),
+                serde_json::to_vec(&ids).unwrap(),
+            )
+            .unwrap();
             std::fs::rename(root.join("ready.pending"), root.join("ready.json")).unwrap();
             loop {
                 std::thread::park();
@@ -3607,14 +3607,19 @@ mod tests {
         );
         let started = Instant::now();
         while !root.path().join("ready.json").is_file() {
-            assert!(child.0.try_wait().unwrap().is_none(), "writer exited before enqueue");
-            assert!(started.elapsed() < Duration::from_secs(10), "writer startup timed out");
+            assert!(
+                child.0.try_wait().unwrap().is_none(),
+                "writer exited before enqueue"
+            );
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "writer startup timed out"
+            );
             std::thread::sleep(Duration::from_millis(10));
         }
-        let ids: Vec<u64> = serde_json::from_slice(
-            &std::fs::read(root.path().join("ready.json")).unwrap(),
-        )
-        .unwrap();
+        let ids: Vec<u64> =
+            serde_json::from_slice(&std::fs::read(root.path().join("ready.json")).unwrap())
+                .unwrap();
         child.0.kill().unwrap();
         let status = child.0.wait().unwrap();
         use std::os::unix::process::ExitStatusExt;
@@ -3636,12 +3641,18 @@ mod tests {
             assert_eq!(row.hook_pid, child.0.id());
             assert!(row.recovered);
             assert!(matches!(
-                recovered.cancel_wrapper(&format!("crash-wrapper-{i}")).unwrap(),
+                recovered
+                    .cancel_wrapper(&format!("crash-wrapper-{i}"))
+                    .unwrap(),
                 WrapperCancellation::BeforeStart
             ));
         }
         drop(recovered);
-        assert!(BuildHistory::load_from_file(&path, 1).unwrap().queue_is_empty());
+        assert!(
+            BuildHistory::load_from_file(&path, 1)
+                .unwrap()
+                .queue_is_empty()
+        );
     }
 
     #[test]
