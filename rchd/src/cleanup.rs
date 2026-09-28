@@ -145,9 +145,26 @@ fn retire_recovered_queue_owner(
 struct ObservationWindow {
     last_observed: Option<Instant>,
     recover_until: Option<Instant>,
+    startup_until: Option<Instant>,
 }
 
 impl ObservationWindow {
+    /// A restored timestamp includes daemon downtime, when no heartbeat could
+    /// be accepted. Give surviving builds one observation window to reattach.
+    /// This deadline belongs to the observer, not each build or each sweep.
+    fn for_startup(now: Instant) -> Self {
+        Self {
+            last_observed: Some(now),
+            recover_until: None,
+            startup_until: Some(now + Duration::from_secs(HEARTBEAT_STALE_SECS)),
+        }
+    }
+
+    fn recovering_build(&mut self, now: Instant, recovered: bool) -> bool {
+        self.recovering(now)
+            || (recovered && self.startup_until.is_some_and(|deadline| now < deadline))
+    }
+
     fn recovering(&mut self, now: Instant) -> bool {
         let window = Duration::from_secs(HEARTBEAT_STALE_SECS);
         let delayed = self.last_observed.is_some_and(|previous| {
@@ -326,7 +343,7 @@ impl ActiveBuildCleanup {
             task: tokio::spawn(async move {
                 let mut ticker = interval(Duration::from_secs(5));
                 ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-                let mut observation = ObservationWindow::default();
+                let mut observation = ObservationWindow::for_startup(Instant::now());
                 let mut recovered_queue = RecoveredQueueCleanup::default();
                 loop {
                     ticker.tick().await;
@@ -360,7 +377,7 @@ impl ActiveBuildCleanup {
                 continue;
             };
             let now = Instant::now();
-            let recovering = observation.recovering(now);
+            let recovering = observation.recovering_build(now, build.recovered);
             let hook_alive = build.hook_pid == 0 || is_process_alive(build.hook_pid);
             let heartbeat_age_secs = now
                 .checked_duration_since(build.last_heartbeat_mono)
@@ -765,6 +782,58 @@ mod tests {
     }
 
     #[test]
+    fn startup_grace_applies_only_to_recovered_builds_and_expires_at_the_boundary() {
+        let start = Instant::now();
+        let mut observation = ObservationWindow::for_startup(start);
+        for seconds in [0, 5, 10, 19, 20, 21, 25] {
+            let now = start + Duration::from_secs(seconds);
+            assert!(!observation.recovering_build(now, false));
+            assert_eq!(observation.recovering_build(now, true), seconds < HEARTBEAT_STALE_SECS);
+        }
+        // A recovered build seen later does not get another startup window.
+        assert!(!observation.recovering_build(start + Duration::from_secs(30), true));
+        assert_eq!(observation.startup_until, Some(start + Duration::from_secs(20)));
+    }
+
+    #[test]
+    fn startup_grace_never_rewrites_evidence_or_extends_the_absolute_lifetime_cap() {
+        let start = Instant::now();
+        let mut observation = ObservationWindow::for_startup(start);
+        let grace = observation.recovering_build(start, true);
+        assert!(grace);
+        for (age, expected) in [(1600, false), (86400, false), (86401, true)] {
+            let evidence = score_stuck_evidence(StuckEvidenceInput {
+                hook_alive: true,
+                progress_stall_remediable_phase: true,
+                heartbeat_age_secs: 120,
+                progress_age_secs: 120,
+                build_age_secs: age,
+                slots_owned: 1,
+                has_worker_binding: true,
+            });
+            assert!(evidence.should_remediate(), "negative control without recovery grace");
+            assert_eq!(evidence.should_remediate_after_observation(grace), expected);
+            assert_eq!(evidence.heartbeat_age_secs, 120);
+            assert_eq!(evidence.progress_age_secs, 120);
+        }
+    }
+
+    #[test]
+    fn later_observer_pause_does_not_restart_the_startup_deadline() {
+        let start = Instant::now();
+        let mut observation = ObservationWindow::for_startup(start);
+        for seconds in [0, 10, 20, 25] {
+            observation.recovering_build(start + Duration::from_secs(seconds), true);
+        }
+        let deadline = observation.startup_until;
+        // A genuine later observer pause retains its existing separate grace.
+        assert!(observation.recovering_build(start + Duration::from_secs(65), false));
+        assert_eq!(observation.startup_until, deadline);
+        assert!(!observation.recovering_build(start + Duration::from_secs(105), true));
+        assert_eq!(observation.startup_until, deadline);
+    }
+
+    #[test]
     fn observer_normal_cadence_and_cold_start_preserve_stuck_decisions() {
         let start = Instant::now();
         let mut observation = ObservationWindow::default();
@@ -902,6 +971,124 @@ mod tests {
                 .await
         );
         crate::test_daemon_context(pool)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn restarted_observer_allows_reattachment_then_reaps_a_still_stale_job() {
+        use crate::history::{ActiveBuildState, BuildHistory};
+        use std::os::unix::process::CommandExt;
+        use std::sync::Arc;
+
+        let Some(root) = isolated_cleanup_transport(
+            "cleanup::tests::restarted_observer_allows_reattachment_then_reaps_a_still_stale_job",
+        )
+        .await
+        else {
+            return;
+        };
+        struct QuietJob(std::process::Child);
+        impl Drop for QuietJob {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut jobs: Vec<_> = (0..2)
+            .map(|_| {
+                QuietJob(
+                    std::process::Command::new("/bin/sleep")
+                        .arg("180")
+                        .process_group(0)
+                        .spawn()
+                        .unwrap(),
+                )
+            })
+            .collect();
+        let mut context = cleanup_worker_context("restart-observer-worker", 2).await;
+        let path = root.join("history.jsonl");
+        context.history = Arc::new(BuildHistory::new(10).with_persistence(path.clone()));
+        let heartbeat = |build: &ActiveBuildState| rch_common::BuildHeartbeatRequest {
+            build_id: build.id,
+            worker_id: rch_common::WorkerId::new(&build.worker_id),
+            hook_pid: Some(build.hook_pid),
+            local_wrapper_id: build.local_wrapper_id.clone(),
+            remote_pgid_file: Some(
+                root.join(format!("{}.pgid", build.hook_pid))
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            phase: BuildHeartbeatPhase::Execute,
+            detail: None,
+            progress_counter: None,
+            progress_percent: None,
+        };
+        let builds: Vec<_> = jobs
+            .iter()
+            .enumerate()
+            .map(|(index, job)| {
+                std::fs::write(
+                    root.join(format!("{}.pgid", job.0.id())),
+                    job.0.id().to_string(),
+                )
+                .unwrap();
+                let build = context.history.start_active_build_with_wrapper(
+                    format!("restart-observer-{index}"),
+                    "restart-observer-worker".into(),
+                    "sleep 180".into(),
+                    job.0.id(),
+                    Some(format!("restart-wrapper-{index}")),
+                    1,
+                    rch_common::BuildLocation::Remote,
+                );
+                context.history.record_build_heartbeat(heartbeat(&build)).unwrap()
+            })
+            .collect();
+
+        // Model downtime in durable timestamps, then use the production loader.
+        // This is not a native kill/restart or an elapsed-time qualification.
+        let ownership = path.with_extension("ownership.json");
+        let mut snapshot: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&ownership).unwrap()).unwrap();
+        let old = (chrono::Utc::now() - chrono::Duration::seconds(120)).to_rfc3339();
+        for row in snapshot["active"].as_array_mut().unwrap() {
+            for field in ["started_at", "last_heartbeat_at", "last_progress_at"] {
+                row[field] = serde_json::json!(&old);
+            }
+        }
+        std::fs::write(&ownership, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+        context.history = Arc::new(BuildHistory::load_from_file(&path, 10).unwrap());
+        let before: Vec<_> = builds
+            .iter()
+            .map(|build| context.history.active_build(build.id).unwrap())
+            .collect();
+        assert!(before.iter().all(|build| build.recovered));
+        let cleanup = ActiveBuildCleanup::new(context.clone());
+        let mut observation = ObservationWindow::for_startup(Instant::now());
+        cleanup.check_active_builds_observed(&mut observation).await;
+        for (build, job) in before.iter().zip(&mut jobs) {
+            let retained = context.history.active_build(build.id).unwrap();
+            assert_eq!(retained.last_heartbeat_mono, build.last_heartbeat_mono);
+            assert_eq!(retained.last_progress_mono, build.last_progress_mono);
+            assert!(retained.detector_heartbeat_stale);
+            assert!(job.0.try_wait().unwrap().is_none());
+        }
+
+        // A real reattachment heartbeat rescues one owner. Explicitly expire
+        // only the observer's test deadline; do not fabricate client progress.
+        context.history.record_build_heartbeat(heartbeat(&builds[0])).unwrap();
+        observation.startup_until = Some(Instant::now());
+        cleanup.check_active_builds_observed(&mut observation).await;
+        assert!(context.history.active_build(builds[0].id).is_some());
+        assert!(jobs[0].0.try_wait().unwrap().is_none());
+        assert!(context.history.active_build(builds[1].id).is_none());
+        assert!(jobs[1].0.try_wait().unwrap().is_some());
+        assert_eq!(
+            context.pool.get(&rch_common::WorkerId::new("restart-observer-worker"))
+                .await.unwrap().used_slots(),
+            1,
+        );
+        std::fs::write(root.join("completed"), "ok").unwrap();
     }
 
     #[cfg(target_os = "linux")]
