@@ -31,10 +31,15 @@ Repository: <https://github.com/Dicklesworthstone/remote_compilation_helper>
 
 ## Unreleased
 
-## 2.1.6 — 2026-09-28
+## 2.1.7 — 2026-09-28
 
 A faster hook, `--no-run` executables under Cargo's new build-dir layout,
 permission-respecting compound rewrites, and restart and recovery fixes.
+
+The `v2.1.6` tag (e3d87917) was never released. dsr's strict release mode
+refuses symlinks in the tracked tree, and the per-crate LICENSE files were
+symlinks. 2.1.7 is that gated tree with regular LICENSE copies and the
+version bump, and nothing else.
 
 - **Compound commands keep the user's permission rules** (`bd-08ele`). A
   rewrite like `cd x && <anything> && rch exec -- cargo build` answered
@@ -75,7 +80,7 @@ permission-respecting compound rewrites, and restart and recovery fixes.
 - **Published crates ship the license text.** The eight crates on crates.io
   declare `LicenseRef-MIT-OpenAI-Anthropic-Rider` but packaged no LICENSE, so
   consumers could not read the rider the identifier refers to. Each now
-  carries it (a `LICENSE` link to the root file), and a test requires it for
+  carries it (a copy of the root file), and a test requires it for
   every publishable crate. The obsolete "rabs crates stay unpublishable until
   A016" guard now states what is true: only `rch`'s three rabs library
   dependencies are publishable.
@@ -407,7 +412,8 @@ follow-ups, artifact hashes, and retained limitations.
 
 | Version | Kind | Date | Summary |
 |---------|------|------|---------|
-| [`v2.1.6`](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v2.1.6) | Release | 2026-09-28 | 2.4× cheaper non-compilation hook; `--no-run` executables under Cargo's new build-dir layout; compound rewrites respect permission rules; restart/recovery fixes; crates ship the LICENSE |
+| [`v2.1.7`](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v2.1.7) | Release | 2026-09-28 | 2.4× cheaper non-compilation hook; `--no-run` executables under Cargo's new build-dir layout; compound rewrites respect permission rules; restart/recovery fixes; crates ship the LICENSE |
+| [`v2.1.6`](https://github.com/Dicklesworthstone/remote_compilation_helper/tree/v2.1.6) | Tag | 2026-09-28 | Never released: symlinked per-crate LICENSE files refused by dsr strict mode; shipped as 2.1.7 |
 | [`v2.1.5`](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v2.1.5) | Release | 2026-09-28 | Ghost reservations actually released (2.1.4's rule never matched a real ghost) |
 | [`v2.1.4`](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v2.1.4) | Release | 2026-09-28 | Ghost reservations released; `cargo publish --dry-run` succeeds; queued/recovered ownership survives restarts; recovery skips stray staged files |
 | [`v2.1.3`](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v2.1.3) | Release | 2026-09-27 | Green builds stop being reported as failures (output tail, symlinked roots); error chains in incidents; self-clearing orphan quarantines; minisign-verified updates; macOS reattach |
