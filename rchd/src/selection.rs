@@ -2706,6 +2706,32 @@ impl WorkerSelector {
             return Ok(capacity_degraded);
         }
 
+        // A worker that passed every gate up to slot accounting and is merely
+        // BUSY will satisfy this request once it drains, so the pool is
+        // queueable. Report it as busy (an empty set maps to AllWorkersBusy),
+        // which lets RCH_QUEUE_WHEN_BUSY wait instead of refusing on the spot.
+        // Before this, one critical-pressure or active-project exclusion
+        // anywhere in the fleet turned "8 workers busy" into an immediate
+        // NoAdmissibleWorkers refusal; agents retried in tight loops or built
+        // locally on the dispatcher (bd-141zu: ~7.9k such refusals/24h, e.g.
+        // "critical_pressure=2,insufficient_slots=8,insufficient_total_slots=3").
+        // Each queue poll re-runs full selection, so a busy worker that turns
+        // critical or unhealthy while we wait is re-filtered, not trusted.
+        if !has_preferred
+            && filtered_by_slots > 0
+            && eligible.is_empty()
+            && preferred.is_empty()
+            && eligible_without_health.is_empty()
+            && preferred_without_health.is_empty()
+        {
+            debug!(
+                "No worker admissible now but {} capable worker(s) are busy; \
+                 reporting the pool as busy so the request can queue",
+                filtered_by_slots
+            );
+            return Ok(Vec::new());
+        }
+
         if (filtered_by_active_project > 0 || (filtered_by_capacity > 0 && filtered_by_slots == 0))
             && preferred_without_health.is_empty()
             && eligible_without_health.is_empty()
@@ -6621,8 +6647,12 @@ mod tests {
         assert_eq!(result.reason, SelectionReason::AllWorkersFailedPreflight);
     }
 
+    /// bd-141zu: one critical worker plus one capable-but-busy worker must
+    /// report the pool as BUSY so the request queues until the busy worker
+    /// drains, instead of refusing on the spot (which sent agents into retry
+    /// loops or local builds). Queue polls re-run full selection.
     #[tokio::test]
-    async fn test_pressure_and_busy_pool_reports_concrete_admission_blockers() {
+    async fn test_pressure_and_busy_pool_queues_for_the_busy_worker() {
         let pool = WorkerPool::new();
 
         let critical = make_worker("critical-pressure", 8, 80.0);
@@ -6684,12 +6714,7 @@ mod tests {
 
         let result = selector.select(&pool, &request).await;
         assert!(result.worker.is_none());
-        assert_eq!(
-            result.reason,
-            SelectionReason::NoAdmissibleWorkers(
-                "critical_pressure=1,insufficient_slots=1".to_string()
-            )
-        );
+        assert_eq!(result.reason, SelectionReason::AllWorkersBusy);
     }
 
     /// Regression (live outage 2026-08-26, ts1 + css).
@@ -9532,7 +9557,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn test_preflight_rejects_mixed_convergence_and_busy_pool() {
+        async fn test_mixed_convergence_and_busy_pool_queues_for_the_busy_worker() {
             let pool = WorkerPool::new();
             pool.add_worker(
                 make_worker("converging", 8, 80.0)
@@ -9557,12 +9582,9 @@ mod tests {
             let request = make_selection_request("test-project");
             let result = selector.select(&pool, &request).await;
             assert!(result.worker.is_none());
-            assert_eq!(
-                result.reason,
-                SelectionReason::NoAdmissibleWorkers(
-                    "insufficient_slots=1,hard_preflight=1".to_string()
-                )
-            );
+            // The converging worker stays excluded; the busy one will drain,
+            // so the request queues rather than refusing (bd-141zu).
+            assert_eq!(result.reason, SelectionReason::AllWorkersBusy);
         }
 
         #[tokio::test]
