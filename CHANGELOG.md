@@ -31,6 +31,16 @@ Repository: <https://github.com/Dicklesworthstone/remote_compilation_helper>
 
 ## Unreleased
 
+- **A worker that broke a build no longer attracts the next one** (review of
+  GH #81). Since 2.1.4 a failed build whose command started remotely warms its
+  worker's cache, including failures the hook itself blames on the worker: a
+  missing toolchain or system library, SIGILL, a full disk. The warm worker
+  then won the project's next build under `balanced`, and always under
+  `cache-affinity`, and each repeat failure warmed it again. The hook now marks
+  those releases `worker_fault=1` and the daemon records no warmth for them.
+  Compile errors, test failures and interrupts still warm the pool. Needs both
+  a new `rch` and a new `rchd`; either side alone keeps the 2.1.4 behaviour.
+
 ## 2.1.5 — 2026-09-28
 
 - **Ghost reservations are actually released.** 2.1.4's release rule required

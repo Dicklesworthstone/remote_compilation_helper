@@ -1597,6 +1597,7 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
         let mut duration_ms = None;
         let mut bytes_transferred = None;
         let mut local_wrapper_id = None;
+        let mut worker_fault = false;
 
         for param in query.split('&') {
             if param.is_empty() {
@@ -1614,6 +1615,7 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
                 "duration_ms" => duration_ms = value.parse().ok(),
                 "bytes_transferred" => bytes_transferred = value.parse().ok(),
                 "local_wrapper_id" => local_wrapper_id = Some(percent_unescape_query_value(value)),
+                "worker_fault" => worker_fault = matches!(value, "1" | "true"),
                 _ => {} // Ignore unknown parameters
             }
         }
@@ -1630,6 +1632,7 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
             bytes_transferred,
             local_wrapper_id,
             timing: None,
+            worker_fault,
         }));
     }
 
@@ -3143,13 +3146,16 @@ async fn handle_release_worker(ctx: &DaemonContext, request: ReleaseRequest) -> 
                 worker.record_success().await;
             }
 
+            // A failure the hook blamed on the worker (missing toolchain or
+            // system library, SIGILL, full disk) says the worker is broken
+            // for this project, not that its pool is worth returning to.
             ctx.worker_selector
                 .record_remote_completion(
                     worker_id,
                     &rec.project_id,
                     &rec.command,
                     exit_code,
-                    remote_command_started,
+                    remote_command_started && !request.worker_fault,
                 )
                 .await;
         }
@@ -5650,6 +5656,7 @@ mod tests {
                 duration_ms: None,
                 bytes_transferred: None,
                 timing: None,
+                worker_fault: false,
             },
         )
         .await
@@ -6471,6 +6478,24 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_request_release_worker_fault_flag() {
+        let _guard = test_guard!();
+        for (query, expected) in [
+            ("&exit_code=101&worker_fault=1", true),
+            ("&exit_code=101&worker_fault=true", true),
+            ("&exit_code=101&worker_fault=0", false),
+            ("&exit_code=101", false),
+        ] {
+            let req =
+                parse_request(&format!("POST /release-worker?worker=css&slots=4{query}")).unwrap();
+            let ApiRequest::ReleaseWorker(req) = req else {
+                unreachable!("expected release worker request for {query}");
+            };
+            assert_eq!(req.worker_fault, expected, "{query}");
+        }
+    }
+
+    #[test]
     fn test_parse_request_record_build() {
         let _guard = test_guard!();
         let req =
@@ -7231,6 +7256,7 @@ mod tests {
             duration_ms: None,
             bytes_transferred: None,
             timing: None,
+            worker_fault: false,
         };
 
         let result = handle_release_worker(&ctx, request).await;
@@ -7271,6 +7297,7 @@ mod tests {
             duration_ms: Some(5000),
             bytes_transferred: Some(1024 * 1024),
             timing: None,
+            worker_fault: false,
         };
 
         let result = handle_release_worker(&ctx, request).await;
@@ -7322,6 +7349,7 @@ mod tests {
             duration_ms: Some(5000),
             bytes_transferred: Some(1024 * 1024),
             timing: None,
+            worker_fault: false,
         };
 
         handle_release_worker(&ctx, request).await.unwrap();
@@ -7358,6 +7386,7 @@ mod tests {
             duration_ms: None,
             bytes_transferred: None,
             timing: None,
+            worker_fault: false,
         };
         handle_release_worker(&ctx, release()).await.unwrap();
         assert_eq!(worker.available_slots().await, 8);
@@ -7402,6 +7431,7 @@ mod tests {
                         duration_ms: None,
                         bytes_transferred: None,
                         timing: None,
+                        worker_fault: false,
                     },
                 )
                 .await
@@ -7437,6 +7467,7 @@ mod tests {
                 duration_ms: None,
                 bytes_transferred: None,
                 timing: None,
+                worker_fault: false,
             },
         )
         .await
@@ -7472,6 +7503,7 @@ mod tests {
             duration_ms: Some(5000),
             bytes_transferred: None,
             timing: None,
+            worker_fault: false,
         };
 
         // GH #81: the remote command ran (Execute heartbeat), then exited 101.
@@ -7520,6 +7552,39 @@ mod tests {
             0.0
         );
         assert_eq!(worker.available_slots().await, 8);
+
+        // The command ran, but the hook blamed the worker (e.g. its toolchain
+        // or a system library is missing): warming it would route the next
+        // build of the project straight back to the broken worker.
+        let broken = start("broken-worker-project");
+        assert!(worker.reserve_slots(2).await);
+        ctx.history
+            .record_build_heartbeat(rch_common::BuildHeartbeatRequest {
+                build_id: broken,
+                worker_id: WorkerId::new("worker1"),
+                hook_pid: None,
+                local_wrapper_id: None,
+                remote_pgid_file: None,
+                phase: rch_common::BuildHeartbeatPhase::Execute,
+                detail: None,
+                progress_counter: Some(1),
+                progress_percent: None,
+            })
+            .expect("heartbeat accepted");
+        let mut faulted = release(broken);
+        faulted.worker_fault = true;
+        handle_release_worker(&ctx, faulted).await.unwrap();
+        assert_eq!(
+            ctx.worker_selector
+                .cache_warmth(
+                    "worker1",
+                    "broken-worker-project",
+                    crate::selection::CacheUse::Build
+                )
+                .await,
+            0.0
+        );
+        assert_eq!(worker.available_slots().await, 8);
     }
 
     #[tokio::test]
@@ -7551,6 +7616,7 @@ mod tests {
             duration_ms: Some(5000),
             bytes_transferred: Some(1024 * 1024),
             timing: None,
+            worker_fault: false,
         };
 
         let result = handle_release_worker(&ctx, request).await;
@@ -7931,6 +7997,7 @@ mod tests {
                 duration_ms: None,
                 bytes_transferred: None,
                 timing: None,
+                worker_fault: false,
             },
         )
         .await

@@ -484,6 +484,38 @@ pub(crate) async fn release_worker(
     timing: Option<&CommandTimingBreakdown>,
     local_wrapper_id: Option<&str>,
 ) -> anyhow::Result<()> {
+    release_worker_with_fault(
+        socket_path,
+        worker_id,
+        slots,
+        build_id,
+        exit_code,
+        duration_ms,
+        bytes_transferred,
+        timing,
+        local_wrapper_id,
+        false,
+    )
+    .await
+}
+
+/// [`release_worker`] for a completed remote run, also telling the daemon
+/// whether the failure blamed the worker (`worker_fault`, see
+/// `remote_failure_is_worker_fault`). The daemon then records no cache warmth
+/// for it. Older daemons ignore the unknown query parameter.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn release_worker_with_fault(
+    socket_path: &str,
+    worker_id: &WorkerId,
+    slots: u32,
+    build_id: Option<u64>,
+    exit_code: Option<i32>,
+    duration_ms: Option<u64>,
+    bytes_transferred: Option<u64>,
+    timing: Option<&CommandTimingBreakdown>,
+    local_wrapper_id: Option<&str>,
+    worker_fault: bool,
+) -> anyhow::Result<()> {
     if !Path::new(socket_path).exists() {
         anyhow::bail!("daemon socket is missing; release was not acknowledged");
     }
@@ -518,6 +550,9 @@ pub(crate) async fn release_worker(
     }
     if let Some(bytes_transferred) = bytes_transferred {
         request.push_str(&format!("&bytes_transferred={}", bytes_transferred));
+    }
+    if worker_fault {
+        request.push_str("&worker_fault=1");
     }
     request.push('\n');
 
@@ -960,6 +995,56 @@ mod bounded_ipc_tests {
             let result =
                 caller_fixture(response.into_bytes(), "POST /release-worker?", false).await;
             assert_eq!(result.is_ok(), success, "{result:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn release_carries_the_worker_fault_flag_only_when_set() {
+        // Review of GH #81: the daemon withholds cache warmth for a failure
+        // the hook blamed on the worker, so the flag must reach the wire.
+        for worker_fault in [true, false] {
+            let root = tempfile::tempdir().unwrap().keep();
+            let path = root.join("ipc.sock");
+            let listener = tokio::net::UnixListener::bind(&path).unwrap();
+            let server = async {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (reader, mut writer) = stream.into_split();
+                let mut request = String::new();
+                BufReader::new(reader)
+                    .read_line(&mut request)
+                    .await
+                    .unwrap();
+                writer.write_all(b"HTTP/1.1 200 OK\r\n").await.unwrap();
+                request
+            };
+            let worker = WorkerId::new("ipc-test");
+            let client = release_worker_with_fault(
+                path.to_str().unwrap(),
+                &worker,
+                1,
+                Some(42),
+                Some(101),
+                None,
+                None,
+                None,
+                None,
+                worker_fault,
+            );
+            let (result, request) = timeout(Duration::from_secs(2), async {
+                tokio::join!(client, server)
+            })
+            .await
+            .expect("release fixture must terminate");
+            result.unwrap();
+            assert!(
+                request.starts_with("POST /release-worker?worker=ipc-test&slots=1&build_id=42"),
+                "{request}"
+            );
+            assert_eq!(
+                request.contains("&worker_fault=1"),
+                worker_fault,
+                "{request}"
+            );
         }
     }
 

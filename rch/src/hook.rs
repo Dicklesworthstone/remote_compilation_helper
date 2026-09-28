@@ -3353,6 +3353,11 @@ pub async fn run_exec(
             timing.total = Some(remote_elapsed);
             timing
         });
+        // A worker-caused failure must not warm that worker's cache for the
+        // project (review of GH #81), or the next build is routed back to it.
+        let release_worker_fault = result
+            .as_ref()
+            .is_ok_and(|ok| remote_failure_is_worker_fault(&ok.stderr, ok.exit_code));
         let release_acknowledged = if retain_unconfirmed_ownership {
             warn!(
                 "Remote completion unconfirmed; retaining build {} ownership",
@@ -3360,7 +3365,7 @@ pub async fn run_exec(
             );
             false
         } else {
-            match release_worker(
+            match release_worker_with_fault(
                 &config.general.socket_path,
                 &worker.id,
                 estimated_cores,
@@ -3370,6 +3375,7 @@ pub async fn run_exec(
                 None,
                 release_timing.as_ref(),
                 Some(&wrapper_id),
+                release_worker_fault,
             )
             .await
             {
@@ -4120,8 +4126,8 @@ mod remote_result;
 use remote_result::{
     ExecResultDirStat, ExecResultEnvelope, detect_cargo_workspace_inheritance_failure,
     detect_worker_system_dependency_failure, emit_exec_envelope, is_cpu_capability_signal,
-    is_signal_killed, is_toolchain_failure, set_machine_output, signal_name,
-    wrapped_cpu_capability_signal,
+    is_signal_killed, is_toolchain_failure, remote_failure_is_worker_fault, set_machine_output,
+    signal_name, wrapped_cpu_capability_signal,
 };
 
 // The remote cargo target-dir resolution / naming / command-rewrite cluster
@@ -4186,7 +4192,9 @@ use rabs_recorder::record_invocation;
 // `record_build` / `queue_when_busy_enabled` are re-exported for the hook hot
 // path. The timeout helpers and `urlencoding_encode` stay `pub(super)` for tests.
 mod daemon_ipc;
-use daemon_ipc::{disable_worker_for_fault, queue_when_busy_enabled, record_build};
+use daemon_ipc::{
+    disable_worker_for_fault, queue_when_busy_enabled, record_build, release_worker_with_fault,
+};
 pub(crate) use daemon_ipc::{
     query_daemon, query_daemon_dry_run, release_worker, restart_admission_is_closed,
 };

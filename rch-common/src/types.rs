@@ -692,6 +692,11 @@ pub struct ReleaseRequest {
     /// Optional per-phase timing breakdown for the build pipeline.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timing: Option<CommandTimingBreakdown>,
+    /// The hook classified this non-zero exit as a worker fault (missing
+    /// toolchain or system library, CPU-capability signal, full disk), so the
+    /// daemon records no cache warmth for it (review of GH #81).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub worker_fault: bool,
 }
 
 /// Build execution phase for daemon heartbeat tracking.

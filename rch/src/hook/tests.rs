@@ -3889,6 +3889,61 @@ The file `x11.pc` needs to be installed and the PKG_CONFIG_PATH environment vari
 }
 
 #[test]
+fn test_remote_failure_is_worker_fault_separates_worker_breakage_from_project_errors() {
+    let _guard = test_guard!();
+    // Review of GH #81: only these failures withhold the daemon's cache
+    // warmth; the project's own compile/test failures must still warm.
+    let worker_faults = [
+        (
+            "error: toolchain 'nightly-2026-01-01-x86_64-unknown-linux-gnu' is not installed",
+            1,
+        ),
+        (
+            "The system library `openssl` required by crate `openssl-sys` was not found.\n\
+             The file `openssl.pc` needs to be installed and the PKG_CONFIG_PATH environment variable must contain its parent directory.",
+            101,
+        ),
+        ("", 132),
+        (
+            "error: failed to run custom build command for `ring v0.17.8`\n\
+             process didn't exit successfully: `/t/build-script-build` (signal: 4, SIGILL: illegal instruction)",
+            101,
+        ),
+        (
+            "error: failed to write /data/projects/p/target/debug/deps/libx.rlib: No space left on device (os error 28)",
+            101,
+        ),
+    ];
+    for (stderr, exit_code) in worker_faults {
+        assert!(
+            remote_failure_is_worker_fault(stderr, exit_code),
+            "{exit_code}: {stderr}"
+        );
+    }
+
+    let project_failures = [
+        (
+            "error[E0308]: mismatched types\nerror: could not compile `poolrepro`",
+            101,
+        ),
+        ("test result: FAILED. 3 passed; 1 failed", 101),
+        ("", 130),
+        ("", 137),
+    ];
+    for (stderr, exit_code) in project_failures {
+        assert!(
+            !remote_failure_is_worker_fault(stderr, exit_code),
+            "{exit_code}: {stderr}"
+        );
+    }
+    // A zero exit is never a fault, whatever it printed.
+    assert!(!remote_failure_is_worker_fault(
+        "No space left on device",
+        0
+    ));
+}
+
+#[test]
 fn test_detect_worker_system_dependency_failure_ignores_normal_compile_errors() {
     let _guard = test_guard!();
     let stderr = r#"error[E0425]: cannot find value `oops` in this scope

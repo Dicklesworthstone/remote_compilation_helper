@@ -328,6 +328,32 @@ pub(super) fn wrapped_cpu_capability_signal(exit_code: i32, output: &str) -> Opt
     None
 }
 
+/// Whether a completed non-zero remote result blames the WORKER rather than
+/// the project, for the daemon's cache-warmth bookkeeping only.
+///
+/// Since GH #81 the daemon records cache warmth for a failed build whose
+/// command started remotely, so the next edit-fix-build returns to the warm
+/// pool. That is right for a compile error or test failure in the project.
+/// It is wrong when the worker itself broke the build: a missing toolchain or
+/// system library, a CPU that cannot run the codegen, or a full disk. Warming
+/// that worker makes the balanced cache term, or the `cache-affinity`
+/// strategy's hard preference, route the project's next build back to the
+/// broken worker, and each repeat failure warms it again.
+///
+/// Unlike the retry arms in `run_exec`, this is applied to `--job` runs too. A
+/// false positive only withholds warmth, which is the pre-#81 behaviour; it
+/// never reruns a command.
+pub(super) fn remote_failure_is_worker_fault(stderr: &str, exit_code: i32) -> bool {
+    if exit_code == 0 {
+        return false;
+    }
+    is_toolchain_failure(stderr, exit_code)
+        || detect_worker_system_dependency_failure(stderr, exit_code).is_some()
+        || is_signal_killed(exit_code).is_some_and(is_cpu_capability_signal)
+        || wrapped_cpu_capability_signal(exit_code, stderr).is_some()
+        || stderr.contains("No space left on device")
+}
+
 /// Topology-specific Cargo workspace inheritance failure under remote roots.
 #[derive(Debug, Clone)]
 pub(super) struct CargoWorkspaceInheritanceFailure {
