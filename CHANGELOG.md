@@ -31,6 +31,16 @@ Repository: <https://github.com/Dicklesworthstone/remote_compilation_helper>
 
 ## Unreleased
 
+- **The new-layout `--no-run` fix now works end to end.** Two gaps found by a
+  live check on the operator Mac after 2.1.7:
+  - The recovery recipe derived its output policy from the delivery kind
+    instead of the command's own kind, so it lacked the executable carve-out
+    and skipped the very test binaries the live retrieval fetched.
+  - The foreign-platform gate ignored anything under `build/`, so a Linux test
+    binary could land on a Mac unflagged. The gate now inspects exactly the
+    new-layout executable shape (never build scripts). A Mac requesting
+    `--no-run` binaries from a Linux worker now gets an honest RCH-E327.
+
 ## 2.1.7 — 2026-09-28
 
 A faster hook, `--no-run` executables under Cargo's new build-dir layout,

@@ -295,6 +295,25 @@ fn looks_like_target_triple_dir(component: &str) -> bool {
 /// library extensions cover cdylib/proc-macro outputs. Everything else
 /// (`.rlib`, `.rmeta`, `.d`, `.json`, `.o`, `.a`, …) is either an archive the
 /// host never execs or metadata, and is not worth an open.
+/// Cargo's new build-dir layout keeps a `--no-run` test/bench executable at
+/// `build/<pkg>/<hash>/out/<crate>-<16 hex>`, and retrieval returns exactly
+/// that shape (bd-b7lot). It is a deliverable, not worker-host cache: the gate
+/// must inspect it, or a Linux test binary lands on a Mac unflagged. Build
+/// scripts (worker-host by design) stay out of scope.
+fn is_new_layout_unit_executable(rest: &[&str]) -> bool {
+    let [build, _package, _hash, out, file_name] = rest else {
+        return false;
+    };
+    let stem = file_name.strip_suffix(".exe").unwrap_or(file_name);
+    *build == "build"
+        && *out == "out"
+        && !stem.starts_with("build_script")
+        && !stem.starts_with("build-script")
+        && stem.rsplit_once('-').is_some_and(|(name, hash)| {
+            !name.is_empty() && hash.len() == 16 && hash.bytes().all(|b| b.is_ascii_hexdigit())
+        })
+}
+
 fn inspectable_executable_path(file_name: &str) -> bool {
     match file_name.rsplit_once('.') {
         None => true,
@@ -361,6 +380,7 @@ fn in_scope_output_path<'a>(
     if rest
         .iter()
         .any(|c| matches!(*c, "build" | "incremental" | ".fingerprint"))
+        && !is_new_layout_unit_executable(&rest)
     {
         return None;
     }
@@ -605,6 +625,25 @@ mod tests {
         );
         // Files outside target/ never reach the gate.
         assert_eq!(in_scope_output_path("src/main.rs", false, None), None);
+        // Cargo's new build-dir layout: the --no-run executable itself is a
+        // deliverable and IS inspected (a forwarded target dir, as seen live).
+        assert_eq!(
+            in_scope_output_path(
+                "debug/build/rch-common/ccea7bb6dc7bb7c6/out/rch_common-ccea7bb6dc7bb7c6",
+                true,
+                None
+            ),
+            Some("debug/build/rch-common/ccea7bb6dc7bb7c6/out/rch_common-ccea7bb6dc7bb7c6")
+        );
+        // ...but nothing else in that cache tree, and never a build script.
+        for cache in [
+            "debug/build/rch-common/ccea7bb6dc7bb7c6/out/build_script_build-ccea7bb6dc7bb7c6",
+            "debug/build/rch-common/ccea7bb6dc7bb7c6/out/generated",
+            "debug/build/rch-common/ccea7bb6dc7bb7c6/out/sub/rch_common-ccea7bb6dc7bb7c6",
+            "debug/build/rch-common/ccea7bb6dc7bb7c6/rch_common-ccea7bb6dc7bb7c6",
+        ] {
+            assert_eq!(in_scope_output_path(cache, true, None), None, "{cache}");
+        }
     }
 
     #[test]

@@ -231,7 +231,11 @@ impl RecoverySession {
     ) -> anyhow::Result<Self> {
         // Persist the output contract, not runtime-test policy: recovery is
         // collection-only and has no command to reparse after the wrapper dies.
-        let kind = artifact_delivery_kind(kind, Some(command));
+        // The phase patterns below take the command's OWN kind, exactly as the
+        // live retrieval does: from the delivery kind they lose the build-only
+        // test/bench carve-out, and publication then skipped the very
+        // executables the live retrieval fetched (bd-b7lot, seen live).
+        let delivery_kind = artifact_delivery_kind(kind, Some(command));
         let lease = writer.snapshot();
         let intent: RecoveryRecipe = serde_json::from_value(
             lease
@@ -359,7 +363,7 @@ impl RecoverySession {
             retire_root,
             transfer,
             project_root,
-            kind,
+            kind: delivery_kind,
             expected_triple: pinned_triple
                 .clone()
                 .unwrap_or_else(default_host_target_triple),
