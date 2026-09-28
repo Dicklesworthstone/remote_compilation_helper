@@ -5,7 +5,7 @@ Compilation Helper): the PreToolUse hook + CLI (`rch`), the local daemon (`rchd`
 worker agent (`rch-wkr`), the RABS build sidecar (`rabs-*`, `rabsd`), and the fleet
 dashboard (`dashboard/`).
 
-Scope window: project inception (`v0.1.0`, 2026-01-25) through `v2.1.8` (2026-09-28).
+Scope window: project inception (`v0.1.0`, 2026-01-25) through `v2.1.9` (2026-09-28).
 
 This document was rebuilt from git history (`git log --no-merges` per tag range, `git show`
 on representative commits), version tags (`git for-each-ref`), GitHub release metadata
@@ -28,6 +28,22 @@ history. They are kept as-is because the descriptions were verified against the 
 but those particular links will 404.
 
 Repository: <https://github.com/Dicklesworthstone/remote_compilation_helper>
+
+## 2.1.9 — 2026-09-28
+
+- **A dead client can no longer wedge a worker's source locks** (`bd-m5ccr`).
+  On vmi1153651 a client died while the SSH mux master kept its channel open,
+  so nothing read the build's output stream. The durable-execution output
+  follower's `head` blocked writing its last 35 bytes for 7 hours after the
+  build finished. It had inherited the source-activity lock, so that lock
+  stayed held, the worker's source-claim registry stalled, and 2.1.8's lease
+  auto-recovery timed out. Followers now copy in steps of at most 1 MiB and
+  record their progress. Once the build has finished, a follower that copies
+  nothing for 120s is killed, and the wrapper exits with the build's status.
+  The output files stay on the worker for `rch jobs recover`. A live reader
+  slower than about 8.7 KB/s (1 MiB per 120s) would see a truncated stream,
+  though the exit status is still the build's
+  ([`ea5127d6`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/ea5127d649dd5ce41a2efc84316a915e999e5324)).
 
 ## 2.1.8 — 2026-09-28
 
