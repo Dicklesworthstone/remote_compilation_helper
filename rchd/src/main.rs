@@ -313,6 +313,19 @@ enum BindAttempt {
     SocketHeld,
 }
 
+/// The owning process a test harness asked this daemon to follow, from
+/// `RCH_EXIT_WITH_PARENT_PID`. Pids 0 and 1 are refused: init never exits, and
+/// 0 would address the process group.
+#[cfg(unix)]
+fn exit_with_parent_pid() -> Option<i32> {
+    parse_exit_with_parent_pid(std::env::var("RCH_EXIT_WITH_PARENT_PID").ok().as_deref())
+}
+
+#[cfg(unix)]
+fn parse_exit_with_parent_pid(value: Option<&str>) -> Option<i32> {
+    value?.trim().parse::<i32>().ok().filter(|pid| *pid > 1)
+}
+
 /// Send a sd_notify(3) message to systemd if NOTIFY_SOCKET is set. Silently
 /// no-op on macOS, on hosts without systemd, and for Type=simple units
 /// (which don't set NOTIFY_SOCKET — the current rchd.service config).
@@ -1577,6 +1590,31 @@ async fn main() -> Result<()> {
         });
     }
 
+    // Test harnesses pass their own pid in RCH_EXIT_WITH_PARENT_PID. A harness
+    // killed without running Drop (tool timeout, OOM, abort) left its rchd
+    // running for hours, which rollout tooling mistook for a dispatcher
+    // (bd-b4hrx). Shut down once that process is gone, and exit outright if
+    // the graceful shutdown then stalls (the leaked one ignored SIGTERM).
+    #[cfg(unix)]
+    if let Some(owner) = exit_with_parent_pid() {
+        let shutdown = shutdown_tx.clone();
+        tokio::spawn(async move {
+            let mut ticker = interval(Duration::from_secs(1));
+            loop {
+                ticker.tick().await;
+                if matches!(
+                    nix::sys::signal::kill(nix::unistd::Pid::from_raw(owner), None),
+                    Err(nix::errno::Errno::ESRCH)
+                ) {
+                    warn!("Owning process {owner} exited; shutting down");
+                    let _ = shutdown.send(()).await;
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                    std::process::exit(0);
+                }
+            }
+        });
+    }
+
     // Main accept loop - platform-specific due to SIGHUP handling
     #[cfg(unix)]
     {
@@ -1786,6 +1824,23 @@ fn socket_test_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn exit_with_parent_pid_accepts_only_a_real_owner_pid() {
+        assert_eq!(parse_exit_with_parent_pid(Some("4242")), Some(4242));
+        assert_eq!(parse_exit_with_parent_pid(Some(" 4242\n")), Some(4242));
+        for refused in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("1"),
+            Some("-5"),
+            Some("abc"),
+        ] {
+            assert_eq!(parse_exit_with_parent_pid(refused), None, "{refused:?}");
+        }
+    }
 
     #[test]
     fn socket_startup_honors_config_and_client_environment_precedence() {

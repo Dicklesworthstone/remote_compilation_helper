@@ -1304,6 +1304,10 @@ impl TestHarness {
             .stdout(stdio_for("out"))
             .stderr(stdio_for("err"));
 
+        // A daemon must not outlive a test binary that dies without running
+        // Drop (bd-b4hrx): rchd exits once this pid is gone.
+        cmd.env("RCH_EXIT_WITH_PARENT_PID", std::process::id().to_string());
+
         // Set default environment variables
         for (k, v) in &self.config.env_vars {
             cmd.env(k, v);

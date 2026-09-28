@@ -584,3 +584,74 @@ fn test_daemon_config_fixture_integration() -> HarnessResult<()> {
     harness.mark_passed();
     Ok(())
 }
+
+/// bd-b4hrx: a daemon started by a test harness must not outlive the process
+/// that owns it. A stand-in owner (`sleep 3`) is named in
+/// RCH_EXIT_WITH_PARENT_PID; once it exits, rchd must stop on its own.
+#[test]
+fn test_daemon_exits_when_its_owning_process_dies() -> HarnessResult<()> {
+    let _guard = rch_common::test_guard!();
+    let harness = TestHarnessBuilder::new("daemon_exit_with_owner")
+        .cleanup_on_success(true)
+        .cleanup_on_failure(false)
+        .rchd_binary(rchd_binary_path())
+        .build()?;
+    harness.create_workers_config(
+        "[[workers]]\nid = \"test-worker\"\nhost = \"localhost\"\nuser = \"test\"\ntotal_slots = 4\n",
+    )?;
+    let mut owner = std::process::Command::new("sleep")
+        .arg("3")
+        .spawn()
+        .expect("spawn stand-in owner");
+    let socket_path = harness.test_dir().join("rchd.sock");
+    let socket_arg = socket_path.to_string_lossy().to_string();
+    let workers = harness.test_dir().join("config").join("workers.toml");
+    let workers_arg = workers.to_string_lossy().to_string();
+    let env = std::collections::HashMap::from([(
+        "RCH_EXIT_WITH_PARENT_PID".to_string(),
+        owner.id().to_string(),
+    )]);
+    let started = harness
+        .spawn_process(
+            "daemon",
+            &rchd_binary_path(),
+            [
+                "--workers-config",
+                workers_arg.as_str(),
+                "--socket",
+                socket_arg.as_str(),
+                "--foreground",
+            ],
+            Some(&env),
+        )
+        .and_then(|pid| {
+            harness.wait_for_socket(&socket_path, Duration::from_secs(10))?;
+            Ok(pid)
+        });
+    // Reap the owner on every path, so it is truly gone (not a zombie).
+    owner.wait().expect("stand-in owner exits");
+    let pid = started?;
+
+    // The daemon is this test's child, so once it exits it lingers as a zombie
+    // until reaped: treat a missing process or state Z as exited.
+    let exited = || {
+        std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .map(|out| {
+                let stat = String::from_utf8_lossy(&out.stdout);
+                stat.trim().is_empty() || stat.trim_start().starts_with('Z')
+            })
+            .unwrap_or(false)
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while !exited() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    harness.assert(
+        exited(),
+        "rchd kept running after its owning process exited",
+    )?;
+    harness.mark_passed();
+    Ok(())
+}
