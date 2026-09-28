@@ -50,6 +50,13 @@ rest landed in parallel.
 
   Each release emits `cancellation_abandoned_reservation_released`
   ([`a2fdbfc8`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/a2fdbfc8db09dbff4f1a019e53b70e58a53312a5)).
+- **Streamed output can no longer lose its tail.** 2.1.3's polling `tail`
+  follower still cut a slow reader's stream under load (9,897 of 20,000 lines
+  on a uutils `tail` worker). The durable wrapper now copies each log by byte
+  offset. After the completion receipt exists, one final pass reads to the
+  final size, which is exact regardless of the `tail` implementation. Stress
+  runs on two workers: 100 of 100 complete, with no added latency
+  ([`dfd62bed`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/dfd62bed2431232391d2d34c11523f5650dcb976)).
 - **`rch jobs recover` no longer fails forever on a stray staged file.**
   Out-of-policy files an earlier collector staged (such as `.rustc_info.json`)
   are skipped with a warning and never published. The job's real outputs
