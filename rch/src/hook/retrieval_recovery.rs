@@ -468,7 +468,9 @@ impl RecoverySession {
             let (admitted, outside) =
                 policy.partition_staged_artifact_paths(&files, &phase.patterns)?;
             for path in &outside {
-                debug!(
+                // Warn: a skip means collector and recipe disagree about the
+                // policy (as in bd-3kskq); keep that skew visible.
+                warn!(
                     "recovery skips staged file outside the artifact policy: {}",
                     path.display()
                 );
