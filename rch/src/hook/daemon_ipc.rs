@@ -462,36 +462,47 @@ async fn query_daemon_with_mode(
     if let Some(worker) = response.worker.as_ref()
         && !selected_worker_is_requested(&worker.id, preferred_workers)
     {
-        warn!(
-            "Daemon selected unrequested worker {} for explicit request; releasing reservation and refusing remote execution",
-            worker.id
-        );
-        let release_error = release_worker(
-            socket_path,
-            &worker.id,
-            cores,
-            response.build_id,
-            Some(EXIT_BUILD_ERROR),
-            None,
-            None,
-            None,
-            local_wrapper_id,
-        )
-        .await
-        .err();
-        if let Some(error) = release_error.as_ref() {
+        // A preview never owns a reservation, even if a mismatched daemon
+        // returns an unsolicited build ID. Never turn diagnostics into a write.
+        if !dry_run {
+            let build_id = response
+                .build_id
+                .filter(|id| *id > 0 && *id < (1_u64 << 63))
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "unrequested worker {} has no valid active build identity; \
+                         cannot safely release its reservation",
+                        worker.id
+                    )
+                    .context(SelectionOutcomeUnconfirmed)
+                })?;
             warn!(
-                "Failed to release unrequested worker {} after selection refusal: {}",
-                worker.id, error
+                "Daemon selected unrequested worker {}; releasing build {} before refusing execution",
+                worker.id, build_id
             );
+            release_worker(
+                socket_path,
+                &worker.id,
+                cores,
+                Some(build_id),
+                Some(EXIT_BUILD_ERROR),
+                None,
+                None,
+                None,
+                local_wrapper_id,
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "unrequested worker {} build {} reservation release was not acknowledged",
+                    worker.id, build_id
+                )
+            })
+            .context(SelectionOutcomeUnconfirmed)?;
         }
         return Ok(SelectionResponse {
             worker: None,
-            reason: release_error.map_or(SelectionReason::NoMatchingWorkers, |error| {
-                SelectionReason::SelectionError(format!(
-                    "[RCH-I001] unrequested worker reservation release was not acknowledged: {error}; restart rchd and verify capacity before retrying"
-                ))
-            }),
+            reason: SelectionReason::NoMatchingWorkers,
             build_id: None,
             diagnostics: response.diagnostics,
         });

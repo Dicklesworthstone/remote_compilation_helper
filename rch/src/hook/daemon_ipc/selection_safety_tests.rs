@@ -185,3 +185,103 @@ async fn stalled_dispatch_and_silent_reply_keep_the_uncertainty_boundary() {
     assert!(format!("{error:#}").contains("response timed out"));
     assert_eq!(writer, REQUEST);
 }
+
+/// The first reply names a worker outside the requested allow-set. Capture
+/// every follow-up request so a preview cannot silently mutate daemon state.
+async fn unrequested_fixture(
+    dry_run: bool,
+    build_id: Option<u64>,
+    acknowledgement: &[u8],
+) -> (anyhow::Result<SelectionResponse>, Vec<String>) {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("assignment.sock");
+    let listener = tokio::net::UnixListener::bind(&path).unwrap();
+    let server = async {
+        let (stream, _) = listener.accept().await.unwrap();
+        let (reader, mut writer) = stream.into_split();
+        let mut first = String::new();
+        BufReader::new(reader).read_line(&mut first).await.unwrap();
+        assert!(first.contains("&worker=requested-worker"));
+        assert_eq!(first.contains("&dry_run=1"), dry_run);
+        let reply = serde_json::json!({
+            "worker": {
+                "id": "unrequested-worker", "host": "localhost", "user": "test",
+                "identity_file": "/no-test-key", "slots_available": 2, "speed_score": 1.0
+            },
+            "reason": "success",
+            "build_id": build_id,
+        });
+        writer.write_all(format!("HTTP/1.1 200 OK\r\n\r\n{reply}").as_bytes())
+            .await.unwrap();
+        drop(writer);
+        let mut requests = vec![first];
+        if let Ok(Ok((stream, _))) = timeout(Duration::from_millis(100), listener.accept()).await {
+            let (reader, mut writer) = stream.into_split();
+            let mut request = String::new();
+            BufReader::new(reader).read_line(&mut request).await.unwrap();
+            requests.push(request);
+            let _ = writer.write_all(acknowledgement).await;
+        }
+        assert!(timeout(Duration::from_millis(20), listener.accept()).await.is_err());
+        requests
+    };
+    let requested = [WorkerId::new("requested-worker")];
+    let client = query_daemon_with_mode(
+        path.to_str().unwrap(), "owner", 2, "cargo build", None,
+        RequiredRuntime::None, CommandPriority::Normal, 0, Some(std::process::id()),
+        Some("selection-test-owner"), false, &requested, false, &[], dry_run,
+    );
+    timeout(Duration::from_secs(3), async { tokio::join!(client, server) })
+        .await.expect("assignment refusal must terminate")
+}
+
+#[tokio::test]
+async fn diagnostic_worker_mismatch_never_sends_a_release() {
+    let _guard = rch_common::test_guard!();
+    for build_id in [None, Some(42), Some(u64::MAX)] {
+        let (result, requests) = unrequested_fixture(true, build_id, b"HTTP/1.1 200 OK\r\n").await;
+        let response = result.unwrap();
+        assert_eq!(response.reason, SelectionReason::NoMatchingWorkers);
+        assert!(response.worker.is_none() && response.build_id.is_none());
+        assert_eq!(requests.len(), 1, "a preview must remain read-only: {requests:?}");
+    }
+}
+
+#[tokio::test]
+async fn real_worker_mismatch_requires_an_identity_bound_acknowledged_release() {
+    let _guard = rch_common::test_guard!();
+    let (result, requests) = unrequested_fixture(false, Some(42), b"HTTP/1.1 200 OK\r\n").await;
+    let response = result.unwrap();
+    assert_eq!(response.reason, SelectionReason::NoMatchingWorkers);
+    assert!(response.worker.is_none() && response.build_id.is_none());
+    assert_eq!(requests.len(), 2);
+    assert!(requests[1].starts_with("POST /release-worker?worker=unrequested-worker&slots=2&build_id=42"));
+    assert!(requests[1].contains("&local_wrapper_id=selection-test-owner"));
+    assert!(requests[1].contains(&format!("&exit_code={EXIT_BUILD_ERROR}")));
+}
+
+#[tokio::test]
+async fn unowned_mismatched_assignment_cannot_fall_back_or_release_by_slot_count() {
+    let _guard = rch_common::test_guard!();
+    for build_id in [None, Some(0), Some(1_u64 << 63), Some(u64::MAX)] {
+        let (result, requests) = unrequested_fixture(false, build_id, b"HTTP/1.1 200 OK\r\n").await;
+        let error = result.unwrap_err();
+        assert!(error.downcast_ref::<SelectionOutcomeUnconfirmed>().is_some());
+        assert!(format!("{error:#}").contains("no valid active build identity"));
+        assert_eq!(requests.len(), 1, "never guess which reservation to release");
+    }
+}
+
+#[tokio::test]
+async fn unacknowledged_mismatch_release_preserves_uncertainty_and_correlation() {
+    let _guard = rch_common::test_guard!();
+    for ack in [b"".as_slice(), b"HTTP/1.1 500 Failed\r\n", b"HTTP/1.1 200 OK"] {
+        let (result, requests) = unrequested_fixture(false, Some(42), ack).await;
+        let error = result.unwrap_err();
+        assert!(error.downcast_ref::<SelectionOutcomeUnconfirmed>().is_some());
+        let message = format!("{error:#}");
+        assert!(message.contains("unrequested-worker build 42"), "{message}");
+        assert!(message.contains("not acknowledged"), "{message}");
+        assert_eq!(requests.len(), 2, "one attempted release, no selection replay");
+    }
+}
