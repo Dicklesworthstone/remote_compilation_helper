@@ -31,6 +31,49 @@ Repository: <https://github.com/Dicklesworthstone/remote_compilation_helper>
 
 ## Unreleased
 
+## 2.1.4 — 2026-09-28
+
+Stuck reservations are released, `cargo publish` dry runs succeed, and daemon
+restarts keep queued and recovered ownership. 2.1.3 exposed most of these; the
+rest landed in parallel.
+
+- **Reservations that never launched are released** (`a2fdbfc8`). A cancel
+  demanded a confirmed remote kill, but a reservation that never reached
+  execution has no process to kill, so the stuck detector retried forever and
+  durable ownership restored the ghost across restarts. On 2026-09-27, 42 such
+  ghosts held about 84 slots across 5 dispatchers. A reservation is now
+  released without a remote kill only when all of these hold:
+  - no process record was ever reported;
+  - the wrapper has exited, or no pid was recorded;
+  - it has been silent for 6 hours (ages survive a daemon restart);
+  - no local lease still owns worker source.
+
+  Each release emits `cancellation_abandoned_reservation_released`
+  ([`a2fdbfc8`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/a2fdbfc8db09dbff4f1a019e53b70e58a53312a5)).
+- **`rch jobs recover` no longer fails forever on a stray staged file.**
+  Out-of-policy files an earlier collector staged (such as `.rustc_info.json`)
+  are skipped with a warning and never published. The job's real outputs
+  publish and its worker source claim retires. An interrupted out-of-policy
+  write still refuses
+  ([`7577d7a2`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/7577d7a28d0407e32ee901f99a0439a5086530ec)).
+- **Daemon restarts keep queued and recovered ownership** (`bd-w2qrp`).
+  - The FIFO queue is part of the atomic ownership snapshot, and queue
+    departures are durable
+    ([`37450681`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/3745068104e440f0193a03ee63fcf88b3eb853db)).
+    Restored queue rows can be seen and cancelled; waiters are not yet
+    reattached automatically.
+  - Recovered reservations for a worker missing from config survive until that
+    worker returns
+    ([`b8a3b954`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/b8a3b954b73d6c2dc9e528125d46bcfb4af93e36)).
+  - Shutdown stops the active-build cancellation task first, so quiet live
+    builds are not declared stuck while the daemon winds down
+    ([`2d4f09ed`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/2d4f09ed11278a712f49a7ce5d33a95320730e85)).
+- **Stale client receipts that still own worker source are kept**, so the
+  recovery recipe that can retire the claim survives
+  ([`51f98635`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/51f986356cca55dfa4d9d2b424f6c840ee35af70)).
+- Large remote-execution and retrieval futures are heap-pinned, so debug builds
+  no longer overflow a 2 MiB thread stack
+  ([`d500c6cb`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/d500c6cb72756e4c2bbc02734fef41c4e10b039c)).
 - **A small tmpfs `/tmp` no longer zeroes a roomy worker's slots** (GH #78).
   `rch-wkr` reported one disk sample, the fullest of the projects root, its
   alias and `/tmp` by free ratio, and the daemon sized slots, the free-space
@@ -284,6 +327,7 @@ follow-ups, artifact hashes, and retained limitations.
 
 | Version | Kind | Date | Summary |
 |---------|------|------|---------|
+| [`v2.1.4`](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v2.1.4) | Release | 2026-09-28 | Ghost reservations released; `cargo publish --dry-run` succeeds; queued/recovered ownership survives restarts; recovery skips stray staged files |
 | [`v2.1.3`](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v2.1.3) | Release | 2026-09-27 | Green builds stop being reported as failures (output tail, symlinked roots); error chains in incidents; self-clearing orphan quarantines; minisign-verified updates; macOS reattach |
 | [`v2.1.2`](https://github.com/Dicklesworthstone/remote_compilation_helper/releases/tag/v2.1.2) | Release | 2026-09-27 | Hotfix: output-ownership lock held only during publication (2.1.0 failed every overlapping build on shared `CARGO_TARGET_DIR`); dangling Cargo cache links repaired |
 | [`v2.1.1`](https://github.com/Dicklesworthstone/remote_compilation_helper/tree/v2.1.1) | Tag | 2026-09-27 | Never released: the tagged commit swept in another agent's half-finished edit and does not compile; superseded by 2.1.2 |
