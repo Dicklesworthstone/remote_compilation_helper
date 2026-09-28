@@ -47,6 +47,9 @@ pub fn config_dir() -> Option<PathBuf> {
     if let Some(path) = config_dir_from_env_value(std::env::var_os(RCH_CONFIG_DIR_ENV).as_deref()) {
         return Some(path);
     }
+    if cfg!(test) {
+        return Some(unit_test_isolation_dir().join("config"));
+    }
 
     let xdg_style = std::env::var_os("XDG_CONFIG_HOME")
         .filter(|v| !v.is_empty())
@@ -170,7 +173,17 @@ fn source_fingerprint(path: PathBuf) -> SourceFingerprint {
 }
 
 fn cache_is_disabled() -> bool {
-    std::env::var_os("RCH_DISABLE_CONFIG_CACHE").is_some_and(|v| v != "0" && !v.is_empty())
+    // Unit tests never read or write the host's config cache (bd-61pp8).
+    cfg!(test)
+        || std::env::var_os("RCH_DISABLE_CONFIG_CACHE").is_some_and(|v| v != "0" && !v.is_empty())
+}
+
+/// Per-process scratch location that unit tests use in place of the host's
+/// real config directory and daemon socket (bd-61pp8). In-process tests ran
+/// `fleet drain --all` against the operator Mac's live workers.toml and daemon
+/// and drained 18 workers; a test build must not be able to find either.
+fn unit_test_isolation_dir() -> PathBuf {
+    std::env::temp_dir().join(format!("rch-unit-tests-{}", std::process::id()))
 }
 
 /// The project `.rch/config.toml` for the current directory.
@@ -424,6 +437,15 @@ pub fn load_config() -> Result<RchConfig> {
     // br-4zf3p: CLI overrides for self-healing have highest priority
     // (CLI > env > config > defaults). Recorded by main.rs at startup.
     crate::self_healing_overrides::apply_to(&mut config.self_healing);
+
+    // The built-in default socket IS the live daemon on a dispatcher. A unit
+    // test that did not configure a socket gets a private one (bd-61pp8).
+    if cfg!(test) && config.general.socket_path == rch_common::default_socket_path() {
+        config.general.socket_path = unit_test_isolation_dir()
+            .join("rchd.sock")
+            .to_string_lossy()
+            .into_owned();
+    }
 
     Ok(config)
 }
@@ -2867,6 +2889,25 @@ mod tests {
     use super::*;
     use rch_common::test_guard;
     use tempfile::NamedTempFile;
+
+    /// bd-61pp8: a unit-test build must not be able to find the host's real
+    /// config or the live daemon socket unless a test configures them.
+    #[test]
+    fn unit_tests_cannot_reach_the_hosts_config_or_daemon() {
+        if std::env::var_os(RCH_CONFIG_DIR_ENV).is_none() {
+            assert!(
+                config_dir().unwrap().starts_with(unit_test_isolation_dir()),
+                "tests resolved a real config dir"
+            );
+            assert!(cache_is_disabled(), "tests must not touch the config cache");
+        }
+        let socket = load_config().unwrap().general.socket_path;
+        assert_ne!(
+            socket,
+            rch_common::default_socket_path(),
+            "tests resolved the live daemon socket"
+        );
+    }
     use tracing::info;
 
     /// `rch workers init` and `rch config init` rewrite the WHOLE workers.toml
