@@ -387,12 +387,22 @@ mod tests {
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
-    #[tokio::test]
+    // current_thread: the config-dir override is thread-local, and this runs
+    // the REAL (non-dry-run) fleet deploy path. On another thread it would
+    // read the host's workers.toml and deploy to the live fleet over SSH.
+    #[tokio::test(flavor = "current_thread")]
     async fn test_update_fleet_json_mode() {
         // Set up a temp config directory for the test
         let temp_dir = std::env::temp_dir().join("rch_test_update_fleet_json_mode");
         let _ = std::fs::create_dir_all(&temp_dir);
         set_test_config_dir_override(Some(temp_dir.clone()));
+        // Fail closed before the real deploy path if isolation ever breaks.
+        assert!(
+            crate::commands::load_workers_from_config()
+                .expect("load isolated workers")
+                .is_empty(),
+            "test config isolation failed: refusing to run a real fleet update"
+        );
 
         let ctx = create_test_output_context(true);
         let info = create_test_update_check(true);
