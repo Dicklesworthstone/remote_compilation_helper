@@ -548,6 +548,10 @@ async fn run_windows_artifact_process<W: tokio::io::AsyncWrite + Unpin>(
     }
 }
 
+/// How long a durable-execution output follower may go without copying a byte
+/// after the workload finished before it is presumed to have no reader
+/// (bd-m5ccr).
+const FOLLOWER_STALL_SECS: u32 = 120;
 const PROJECT_HASH_CONTENT_LIMIT_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_SOURCE_CONTENT_RSYNC_OUTPUT_BYTES: usize = 32 * 1024 * 1024;
 const PROJECT_HASH_KEY_FILES: &[&str] = &[
@@ -802,11 +806,13 @@ fn remote_path_probe_script(path: &str) -> String {
 fn recovery_completion_cleanup_script(path: &str) -> String {
     let quote = |value: String| escape(Cow::from(value)).into_owned();
     format!(
-        "rm -f -- {done} {pending} {out} {err} && {{ rmdir -- {claim} 2>/dev/null || [ ! -e {claim} ]; }}",
+        "rm -f -- {done} {pending} {out} {err} {out_progress} {err_progress} && {{ rmdir -- {claim} 2>/dev/null || [ ! -e {claim} ]; }}",
         done = quote(path.to_owned()),
         pending = quote(format!("{path}.pending")),
         out = quote(format!("{path}.stdout")),
         err = quote(format!("{path}.stderr")),
+        out_progress = quote(format!("{path}.stdout.progress")),
+        err_progress = quote(format!("{path}.stderr.progress")),
         claim = quote(format!("{path}.started")),
     )
 }
@@ -2221,6 +2227,10 @@ impl TransferPipeline {
     /// The supervisor owns all output descriptors, so loss of the streaming
     /// channel cannot suppress its terminal record or execute the command twice.
     fn durable_execution_command(&self, command: String) -> String {
+        self.durable_execution_command_with_stall(command, FOLLOWER_STALL_SECS)
+    }
+
+    fn durable_execution_command_with_stall(&self, command: String, stall_secs: u32) -> String {
         let Some((path, identity)) = &self.recovery_completion else {
             return command;
         };
@@ -2243,26 +2253,49 @@ impl TransferPipeline {
         // uutils polling tail still quit early under load (a slow reader got
         // ~9.9K of 20K lines). Only `wc -c`, `tail -c +N` and `head -c` are
         // used; a slow reader simply blocks the copy.
+        //
+        // A reader that is gone for good must not block it forever, though
+        // (bd-m5ccr): a dead client whose SSH mux master kept the channel
+        // open left `head` blocked writing for 7h after the build finished,
+        // and its inherited activity-lock descriptor wedged the worker's
+        // source-claim registry. Each follower copies at most 1 MiB per step
+        // with `head` in the background, so a TERM interrupts the `wait` and
+        // kills it, and records its offset (then `done`) in a progress file.
+        // Once the workload has finished, followers that make no progress
+        // for `stall_secs` are killed. Any live reader drains 1 MiB well
+        // within that window.
         format!(
-            "set -e; rch_umask=$(umask); umask 077; mkdir -p -- {directory}; mkdir {claim}; : > {out}; : > {err}; umask \"$rch_umask\"; \
+            "set -e; rch_umask=$(umask); umask 077; mkdir -p -- {directory}; mkdir {claim}; : > {out}; : > {err}; : > {out_progress}; : > {err_progress}; umask \"$rch_umask\"; \
              nohup sh -c {supervisor} </dev/null >{out} 2>{err} & \
              p=$!; \
-             rch_follow() {{ o=0; while :; do if [ -f {done} ]; then d=1; else d=; fi; s=$(($(wc -c < \"$1\"))); \
-               if [ \"$s\" -gt \"$o\" ]; then tail -c +$((o + 1)) -- \"$1\" | head -c $((s - o)) || :; o=$s; continue; fi; \
-               [ -n \"$d\" ] && return 0; sleep 0.2 2>/dev/null || sleep 1; done; }}; \
-             rch_follow {out} & a=$!; rch_follow {err} >&2 & b=$!; \
+             rch_follow() {{ h=; trap '[ -z \"$h\" ] || kill \"$h\" 2>/dev/null; exit 1' TERM; \
+               o=0; while :; do if [ -f {done} ]; then d=1; else d=; fi; s=$(($(wc -c < \"$1\"))); \
+               if [ \"$s\" -gt \"$o\" ]; then n=$((s - o)); [ \"$n\" -le 1048576 ] || n=1048576; \
+               tail -c +$((o + 1)) -- \"$1\" | head -c \"$n\" & h=$!; wait \"$h\" || :; h=; \
+               o=$((o + n)); echo \"$o\" > \"$2\"; continue; fi; \
+               [ -n \"$d\" ] && {{ echo done > \"$2\"; return 0; }}; sleep 0.2 2>/dev/null || sleep 1; done; }}; \
+             rch_follow {out} {out_progress} & a=$!; rch_follow {err} {err_progress} >&2 & b=$!; \
              trap 'kill \"$a\" \"$b\" 2>/dev/null || :' EXIT; \
              while [ ! -f {done} ]; do sleep 1; done; \
              wait \"$p\" || :; \
+             last=; still=0; \
+             while [ \"$(cat {out_progress} {err_progress})\" != \"$(printf 'done\\ndone')\" ]; do \
+               now=$(cat {out_progress} {err_progress}); \
+               if [ \"$now\" = \"$last\" ]; then still=$((still + 1)); else still=0; last=$now; fi; \
+               if [ \"$still\" -ge {stall_ticks} ]; then kill \"$a\" \"$b\" 2>/dev/null || :; break; fi; \
+               sleep 0.2 2>/dev/null || sleep 1; done; \
              wait \"$a\" || :; a=; wait \"$b\" || :; b=; \
              read -r identity status < {done}; [ \"$identity\" = {identity} ]; exit \"$status\"",
             claim = quote(&format!("{path}.started")),
             out = quote(&format!("{path}.stdout")),
             err = quote(&format!("{path}.stderr")),
+            out_progress = quote(&format!("{path}.stdout.progress")),
+            err_progress = quote(&format!("{path}.stderr.progress")),
             supervisor = quote(&supervisor),
             done = quote(path),
             identity = quote(identity),
             directory = quote(Path::new(path).parent().unwrap().to_str().unwrap()),
+            stall_ticks = stall_secs * 5,
         )
     }
 
@@ -7729,6 +7762,67 @@ mod tests {
         }
     }
 
+    /// bd-m5ccr: a client that died while its SSH channel stayed open never
+    /// reads the stream again. The wrapper must still exit soon after the
+    /// workload, and nothing it spawned may keep the activity lock it
+    /// inherited.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn durable_execution_releases_its_lock_when_nobody_reads() {
+        let directory = tempfile::tempdir().unwrap();
+        let receipt = directory
+            .path()
+            .join("recovery-9-id")
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let lock = directory.path().join("activity.lock");
+        let pipeline = TransferPipeline::new(
+            PathBuf::from("/home/user/project"),
+            "myproject".to_string(),
+            "abc123".to_string(),
+            TransferConfig::default(),
+        )
+        .with_recovery_completion(receipt, "id".to_string());
+        // Far more than a pipe buffer, so the follower blocks writing.
+        let command = pipeline.durable_execution_command_with_stall(
+            "i=0; while [ $i -lt 50000 ]; do echo line-$i; i=$((i + 1)); done; exit 3".to_string(),
+            2,
+        );
+        let mut child = std::process::Command::new("flock") // ubs:ignore — fixed wrapper over this test's temporary lock
+            .arg("-x")
+            .arg(&lock)
+            .arg("sh")
+            .arg("-c")
+            .arg(&command)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("run durable wrapper");
+        // Hold the read end open and never read it: the dead-client channel.
+        let _unread = child.stdout.take();
+        let started = std::time::Instant::now();
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(60),
+                "wrapper never gave up on an unread stream"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        assert_eq!(status.code(), Some(3));
+        let free = std::process::Command::new("flock")
+            .args(["-n", "-x"])
+            .arg(&lock)
+            .arg("true")
+            .status()
+            .unwrap();
+        assert!(free.success(), "a leftover follower still holds the lock");
+    }
+
     #[test]
     fn remote_path_probe_reports_absence_only_for_missing_paths() {
         let dir = tempfile::tempdir().unwrap();
@@ -7763,7 +7857,13 @@ mod tests {
         let path = base.join("recovery-7-id").to_str().unwrap().to_owned();
         let neighbour = base.join("recovery-8-id.done");
         std::fs::create_dir(format!("{path}.started")).unwrap();
-        for suffix in ["", ".stdout", ".stderr"] {
+        for suffix in [
+            "",
+            ".stdout",
+            ".stderr",
+            ".stdout.progress",
+            ".stderr.progress",
+        ] {
             std::fs::write(format!("{path}{suffix}"), b"x").unwrap();
         }
         std::fs::write(&neighbour, b"x").unwrap();
