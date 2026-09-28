@@ -59,13 +59,24 @@ const BUDGETS: &[(&str, usize, &str)] = &[
     ("rabs-asupersync", 3, "asupersync + protocol (+1 headroom)"),
     (
         "rabsd",
-        12,
+        13,
         "composes the domain crates (rabs-action/rabs-key/rabs-cas/\
          rabs-sandbox/rabs-scheduler) + the asupersync runtime adapter \
          (rabs-asupersync + asupersync) + configuration surfaces (serde, \
-         serde_json, toml) + tempfile (daemon-owned staging scratch)",
+         serde_json, toml) + tempfile (daemon-owned staging scratch) + \
+         sha2 (the coordinator's wire-level SHA-256 digests over delivery \
+         archives, recovery, acks and prepared requests, which are protocol \
+         values rather than rabs-key cache keys; used in 21 modules since \
+         1c57edb3, bd-csbxg)",
     ),
-    ("rabs-wkr", 8, "composes execution-relevant domain crates"),
+    (
+        "rabs-wkr",
+        9,
+        "composes execution-relevant domain crates + tempfile (anonymous, \
+         session-owned diagnostic and transfer snapshots in source_transfer, \
+         execution, session and request_journal; added by 860c872e without \
+         the budget change)",
+    ),
 ];
 
 fn workspace_root() -> PathBuf {
