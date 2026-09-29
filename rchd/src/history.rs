@@ -1338,11 +1338,26 @@ impl BuildHistory {
                         "queued cancellation journal exceeds limit",
                     ));
                 }
+                if cancelled_wrappers.contains("") {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "empty cancelled wrapper identity",
+                    ));
+                }
+                // Older daemons could admit one wrapper on several workers.
+                // Never pick an arbitrary winner on restart, or rewrite that
+                // contradictory evidence into an apparently valid snapshot.
+                let mut active_wrappers = HashSet::new();
                 for mut state in snapshot.active {
                     if state.id == 0
                         || state.id >= QUEUE_ID_NAMESPACE
                         || state.worker_id.is_empty()
                         || active.contains_key(&state.id)
+                        || state.local_wrapper_id.as_ref().is_some_and(|wrapper| {
+                            wrapper.is_empty()
+                                || cancelled_wrappers.contains(wrapper)
+                                || !active_wrappers.insert(wrapper.clone())
+                        })
                     {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
@@ -1369,10 +1384,20 @@ impl BuildHistory {
                 }
                 for receipt in snapshot.completed {
                     let id = receipt.record.id;
-                    if active.contains_key(&id) || terminal.contains_key(&id) {
+                    // Terminal attempts keep their own build IDs. Sequential
+                    // worker failover may legitimately reuse a wrapper ID, so
+                    // do not compare these wrappers with active_wrappers.
+                    if id == 0
+                        || id >= QUEUE_ID_NAMESPACE
+                        || active.contains_key(&id)
+                        || terminal.contains_key(&id)
+                        || receipt.local_wrapper_id.as_ref().is_some_and(|wrapper| {
+                            wrapper.is_empty() || cancelled_wrappers.contains(wrapper)
+                        })
+                    {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
-                            "conflicting terminal ownership",
+                            "invalid or conflicting terminal ownership",
                         ));
                     }
                     max_id = max_id.max(id);
@@ -1764,6 +1789,191 @@ mod tests {
     use rch_common::test_guard;
     use std::time::{SystemTime, UNIX_EPOCH};
     use tempfile::TempDir;
+
+    fn recovery_validation_fixture(
+        path: &Path,
+        version: u32,
+    ) -> (serde_json::Value, ActiveBuildState) {
+        let history = BuildHistory::new(10).with_persistence(path.to_owned());
+        let active = history.start_active_build_with_wrapper(
+            "recovery-validation".into(),
+            "original-worker".into(),
+            "cargo check".into(),
+            std::process::id(),
+            Some("recovery-owner".into()),
+            2,
+            BuildLocation::Remote,
+        );
+        let mut snapshot: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(path.with_extension("ownership.json")).unwrap(),
+        )
+        .unwrap();
+        if version == 1 {
+            snapshot["version"] = serde_json::json!(1);
+            snapshot.as_object_mut().unwrap().remove("queued");
+        }
+        (snapshot, active)
+    }
+
+    fn recovery_validation_receipt(id: u64, wrapper: Option<&str>) -> serde_json::Value {
+        let mut record = make_build_record(id);
+        record.completed_at = Utc::now().to_rfc3339();
+        record.worker_id = Some("previous-worker".into());
+        record.location = BuildLocation::Remote;
+        serde_json::json!({
+            "record": record,
+            "local_wrapper_id": wrapper,
+        })
+    }
+
+    fn assert_recovery_rejects_without_rewriting(path: &Path, snapshot: &serde_json::Value) {
+        let ownership = path.with_extension("ownership.json");
+        let temporary = ownership.with_extension("tmp");
+        let bytes = serde_json::to_vec(snapshot).unwrap();
+        std::fs::write(&ownership, &bytes).unwrap();
+        // The real writer truncates this path before committing a snapshot.
+        // A rejected load must not touch it, even if it already holds evidence.
+        let prior_temporary = b"retained preexisting ownership-write evidence";
+        std::fs::write(&temporary, prior_temporary).unwrap();
+        let Err(error) = BuildHistory::load_from_file(path, 10) else {
+            panic!("contradictory ownership must not start the daemon");
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData, "{error}");
+        assert_eq!(std::fs::read(&ownership).unwrap(), bytes);
+        assert_eq!(
+            std::fs::read(&temporary).unwrap().as_slice(),
+            &prior_temporary[..]
+        );
+    }
+
+    #[test]
+    fn recovery_rejects_duplicate_active_wrappers_across_projects_and_workers() {
+        for version in [1, 2] {
+            for worker in ["original-worker", "other-worker"] {
+                let root = TempDir::new().unwrap();
+                let path = root.path().join("history.jsonl");
+                let (mut snapshot, original) = recovery_validation_fixture(&path, version);
+                let mut duplicate = snapshot["active"][0].clone();
+                duplicate["id"] = serde_json::json!(original.id + 1);
+                duplicate["project_id"] = serde_json::json!("different-project");
+                duplicate["worker_id"] = serde_json::json!(worker);
+                snapshot["active"].as_array_mut().unwrap().push(duplicate);
+                assert_recovery_rejects_without_rewriting(&path, &snapshot);
+            }
+        }
+    }
+
+    #[test]
+    fn recovery_rejects_empty_and_cancelled_active_wrapper_identities() {
+        for version in [1, 2] {
+            for case in ["empty_active", "cancelled_active", "empty_cancellation"] {
+                let root = TempDir::new().unwrap();
+                let path = root.path().join("history.jsonl");
+                let (mut snapshot, _) = recovery_validation_fixture(&path, version);
+                match case {
+                    "empty_active" => {
+                        snapshot["active"][0]["local_wrapper_id"] = serde_json::json!("");
+                    }
+                    "cancelled_active" => {
+                        snapshot["cancelled_wrappers"] = serde_json::json!(["recovery-owner"]);
+                    }
+                    _ => snapshot["cancelled_wrappers"] = serde_json::json!([""]),
+                }
+                assert_recovery_rejects_without_rewriting(&path, &snapshot);
+            }
+        }
+    }
+
+    #[test]
+    fn recovery_rejects_terminal_ids_that_would_exhaust_the_active_namespace() {
+        for version in [1, 2] {
+            for id in [0, QUEUE_ID_NAMESPACE, u64::MAX] {
+                let root = TempDir::new().unwrap();
+                let path = root.path().join("history.jsonl");
+                let (mut snapshot, _) = recovery_validation_fixture(&path, version);
+                snapshot["completed"] = serde_json::json!([
+                    recovery_validation_receipt(id, Some("completed-owner"))
+                ]);
+                assert_recovery_rejects_without_rewriting(&path, &snapshot);
+            }
+        }
+    }
+
+    #[test]
+    fn recovery_rejects_empty_and_cancelled_terminal_wrapper_identities() {
+        for version in [1, 2] {
+            for wrapper in ["", "cancelled-owner"] {
+                let root = TempDir::new().unwrap();
+                let path = root.path().join("history.jsonl");
+                let (mut snapshot, original) = recovery_validation_fixture(&path, version);
+                snapshot["cancelled_wrappers"] = serde_json::json!(["cancelled-owner"]);
+                snapshot["completed"] = serde_json::json!([
+                    recovery_validation_receipt(original.id - 1, Some(wrapper))
+                ]);
+                assert_recovery_rejects_without_rewriting(&path, &snapshot);
+            }
+        }
+    }
+
+    #[test]
+    fn recovery_preserves_sequential_failover_receipts_for_one_active_wrapper() {
+        for version in [1, 2] {
+            let root = TempDir::new().unwrap();
+            let path = root.path().join("history.jsonl");
+            let (mut snapshot, original) = recovery_validation_fixture(&path, version);
+            let earlier_ids = [original.id - 2, original.id - 1];
+            snapshot["completed"] = serde_json::json!(
+                earlier_ids.map(|id| recovery_validation_receipt(id, Some("recovery-owner")))
+            );
+            std::fs::write(
+                path.with_extension("ownership.json"),
+                serde_json::to_vec(&snapshot).unwrap(),
+            )
+            .unwrap();
+            // Repeat recovery: migration/rewrite must retain every attempt,
+            // not mistake an older receipt for a second active admission.
+            for _ in 0..2 {
+                let recovered = BuildHistory::load_from_file(&path, 10).unwrap();
+                assert_eq!(recovered.active_builds().len(), 1);
+                let active = recovered.active_build(original.id).unwrap();
+                assert!(active.recovered);
+                assert_eq!(active.local_wrapper_id, original.local_wrapper_id);
+                for id in earlier_ids {
+                    assert!(recovered.terminal_build(id, "recovery-owner").is_some());
+                }
+                assert!(!recovered.wrapper_cancelled("recovery-owner"));
+                assert!(recovered.next_id() > original.id);
+            }
+        }
+    }
+
+    #[test]
+    fn recovery_does_not_guess_wrapper_identity_for_anonymous_active_builds() {
+        for version in [1, 2] {
+            let root = TempDir::new().unwrap();
+            let path = root.path().join("history.jsonl");
+            let (mut snapshot, original) = recovery_validation_fixture(&path, version);
+            snapshot["active"][0]["local_wrapper_id"] = serde_json::Value::Null;
+            let mut second = snapshot["active"][0].clone();
+            second["id"] = serde_json::json!(original.id + 1);
+            second["worker_id"] = serde_json::json!("another-worker");
+            snapshot["active"].as_array_mut().unwrap().push(second);
+            snapshot["completed"] = serde_json::json!([
+                recovery_validation_receipt(original.id - 1, None)
+            ]);
+            std::fs::write(
+                path.with_extension("ownership.json"),
+                serde_json::to_vec(&snapshot).unwrap(),
+            )
+            .unwrap();
+            let recovered = BuildHistory::load_from_file(&path, 10).unwrap();
+            assert_eq!(recovered.active_builds().len(), 2);
+            assert!(recovered.active_builds().iter().all(|state| {
+                state.recovered && state.local_wrapper_id.is_none()
+            }));
+            assert!(recovered.has_terminal_build(original.id - 1));
+        }
+    }
 
     fn now_iso() -> String {
         let since_epoch = SystemTime::now()
