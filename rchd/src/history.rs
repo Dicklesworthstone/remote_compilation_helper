@@ -1804,10 +1804,9 @@ mod tests {
             2,
             BuildLocation::Remote,
         );
-        let mut snapshot: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(path.with_extension("ownership.json")).unwrap(),
-        )
-        .unwrap();
+        let mut snapshot: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path.with_extension("ownership.json")).unwrap())
+                .unwrap();
         if version == 1 {
             snapshot["version"] = serde_json::json!(1);
             snapshot.as_object_mut().unwrap().remove("queued");
@@ -1891,9 +1890,8 @@ mod tests {
                 let root = TempDir::new().unwrap();
                 let path = root.path().join("history.jsonl");
                 let (mut snapshot, _) = recovery_validation_fixture(&path, version);
-                snapshot["completed"] = serde_json::json!([
-                    recovery_validation_receipt(id, Some("completed-owner"))
-                ]);
+                snapshot["completed"] =
+                    serde_json::json!([recovery_validation_receipt(id, Some("completed-owner"))]);
                 assert_recovery_rejects_without_rewriting(&path, &snapshot);
             }
         }
@@ -1907,9 +1905,10 @@ mod tests {
                 let path = root.path().join("history.jsonl");
                 let (mut snapshot, original) = recovery_validation_fixture(&path, version);
                 snapshot["cancelled_wrappers"] = serde_json::json!(["cancelled-owner"]);
-                snapshot["completed"] = serde_json::json!([
-                    recovery_validation_receipt(original.id - 1, Some(wrapper))
-                ]);
+                snapshot["completed"] = serde_json::json!([recovery_validation_receipt(
+                    original.id - 1,
+                    Some(wrapper)
+                )]);
                 assert_recovery_rejects_without_rewriting(&path, &snapshot);
             }
         }
@@ -1958,9 +1957,8 @@ mod tests {
             second["id"] = serde_json::json!(original.id + 1);
             second["worker_id"] = serde_json::json!("another-worker");
             snapshot["active"].as_array_mut().unwrap().push(second);
-            snapshot["completed"] = serde_json::json!([
-                recovery_validation_receipt(original.id - 1, None)
-            ]);
+            snapshot["completed"] =
+                serde_json::json!([recovery_validation_receipt(original.id - 1, None)]);
             std::fs::write(
                 path.with_extension("ownership.json"),
                 serde_json::to_vec(&snapshot).unwrap(),
@@ -1968,9 +1966,12 @@ mod tests {
             .unwrap();
             let recovered = BuildHistory::load_from_file(&path, 10).unwrap();
             assert_eq!(recovered.active_builds().len(), 2);
-            assert!(recovered.active_builds().iter().all(|state| {
-                state.recovered && state.local_wrapper_id.is_none()
-            }));
+            assert!(
+                recovered
+                    .active_builds()
+                    .iter()
+                    .all(|state| { state.recovered && state.local_wrapper_id.is_none() })
+            );
             assert!(recovered.has_terminal_build(original.id - 1));
         }
     }
