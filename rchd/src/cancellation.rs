@@ -118,6 +118,15 @@ pub struct CancellationRecord {
 /// min default) and the worker orphan reaper (240 min).
 const ABANDONED_UNLAUNCHED_AFTER: Duration = Duration::from_secs(6 * 3600);
 
+/// The same judgement for a build that never started its remote command (its
+/// heartbeat phase is still `sync_up`). Nothing can be running remotely for
+/// it, so there is no remote lifetime cap to wait out once the wrapper is
+/// provably gone. A wrapper SIGKILLed in sync_up otherwise held its slots for
+/// the full 6h (bd-axhoi: 4 slots on vmi1152480 for 4.6h, the stuck
+/// detector's cancellation unable to confirm a remote kill for a build that
+/// had no remote process).
+const ABANDONED_BEFORE_REMOTE_AFTER: Duration = Duration::from_secs(15 * 60);
+
 /// A reservation whose wrapper is gone (or was never recorded) and that has
 /// been silent far past every remote lifetime cap is abandoned. With no
 /// process record path it can never have launched anything; with one (the
@@ -132,8 +141,13 @@ fn provably_abandoned_unlaunched(
     now: Instant,
     lease_owns_source: impl FnOnce(&str) -> bool,
 ) -> bool {
-    now.saturating_duration_since(build.started_at_mono) >= ABANDONED_UNLAUNCHED_AFTER
-        && now.saturating_duration_since(build.last_heartbeat_mono) >= ABANDONED_UNLAUNCHED_AFTER
+    let silence = if build.remote_command_started() {
+        ABANDONED_UNLAUNCHED_AFTER
+    } else {
+        ABANDONED_BEFORE_REMOTE_AFTER
+    };
+    now.saturating_duration_since(build.started_at_mono) >= silence
+        && now.saturating_duration_since(build.last_heartbeat_mono) >= silence
         && wrapper_process_state(build.hook_pid, build.hook_process_identity.as_deref())
             == WrapperProcessState::Exited
         && !build
@@ -166,6 +180,18 @@ enum WrapperProcessState {
     Unverified,
 }
 
+/// `<boot id>:<start marker>` as written by `history::process_identity`: the
+/// boot id is a UUID (no colons), so split at the FIRST colon. Linux's marker
+/// is start ticks; macOS's is `ps -o lstart=` (`Mon Sep 28 10:48:17 2026`),
+/// which itself contains colons. Splitting at the last colon rejected every
+/// macOS identity, so a Mac wrapper was never Running or Exited, only
+/// Unverified, and its abandoned reservation was retained (bd-axhoi).
+fn well_formed_process_identity(identity: &str) -> bool {
+    identity.split_once(':').is_some_and(|(boot, marker)| {
+        uuid::Uuid::parse_str(boot).is_ok() && !marker.trim().is_empty()
+    })
+}
+
 fn wrapper_process_state(pid: u32, expected: Option<&str>) -> WrapperProcessState {
     if pid == 0 {
         return WrapperProcessState::Exited;
@@ -176,11 +202,7 @@ fn wrapper_process_state(pid: u32, expected: Option<&str>) -> WrapperProcessStat
     if !is_process_alive(pid) {
         return WrapperProcessState::Exited;
     }
-    let Some(expected) = expected.filter(|identity| {
-        identity.rsplit_once(':').is_some_and(|(boot, ticks)| {
-            uuid::Uuid::parse_str(boot).is_ok() && ticks.parse::<u64>().is_ok()
-        })
-    }) else {
+    let Some(expected) = expected.filter(|identity| well_formed_process_identity(identity)) else {
         return WrapperProcessState::Unverified;
     };
     match crate::history::process_identity(pid) {
@@ -1419,6 +1441,61 @@ mod tests {
             "a lease still owning worker source keeps it"
         );
         assert!(provably_abandoned_unlaunched(&build, now, no_lease));
+    }
+
+    #[test]
+    fn process_identities_from_both_platforms_are_well_formed() {
+        let boot = "3f1c2a9e-5b7d-4e2a-9c1f-0a1b2c3d4e5f";
+        assert!(well_formed_process_identity(&format!("{boot}:123456789")));
+        assert!(
+            well_formed_process_identity(&format!("{boot}:Mon Sep 28 10:48:17 2026")),
+            "macOS lstart contains colons"
+        );
+        assert!(!well_formed_process_identity("not-a-uuid:123"));
+        assert!(!well_formed_process_identity(&format!("{boot}:")));
+        assert!(!well_formed_process_identity(&format!("{boot}:   ")));
+        assert!(!well_formed_process_identity(boot));
+    }
+
+    /// bd-axhoi: a wrapper that died in sync_up never started anything remote,
+    /// so its reservation is abandoned after the short bound, not after 6h.
+    /// Once the remote command has started, the long bound still applies.
+    #[test]
+    fn a_build_that_never_left_sync_up_is_abandoned_after_the_short_bound() {
+        let history = BuildHistory::new(10);
+        let build = history.start_active_build(
+            "proj".to_string(),
+            "worker-a".to_string(),
+            "cargo test".to_string(),
+            0,
+            4,
+            rch_common::BuildLocation::Remote,
+        );
+        assert_eq!(
+            build.heartbeat_phase,
+            rch_common::BuildHeartbeatPhase::SyncUp
+        );
+        let no_lease = |_: &str| false;
+        let past_short = Instant::now() + ABANDONED_BEFORE_REMOTE_AFTER + Duration::from_secs(60);
+        assert!(
+            provably_abandoned_unlaunched(&build, past_short, no_lease),
+            "dead in sync_up: released after the short bound"
+        );
+        assert!(
+            !provably_abandoned_unlaunched(&build, Instant::now(), no_lease),
+            "not silent long enough yet"
+        );
+
+        let mut executing = build.clone();
+        executing.heartbeat_phase = rch_common::BuildHeartbeatPhase::Execute;
+        assert!(
+            !provably_abandoned_unlaunched(&executing, past_short, no_lease),
+            "a started remote command keeps the long bound"
+        );
+        let past_long = Instant::now() + ABANDONED_UNLAUNCHED_AFTER + Duration::from_secs(60);
+        assert!(provably_abandoned_unlaunched(
+            &executing, past_long, no_lease
+        ));
     }
 
     #[tokio::test]
