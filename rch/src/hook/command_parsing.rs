@@ -40,13 +40,6 @@ fn parse_env_u32(command: &str, key: &str) -> Option<u32> {
         .find_map(|token| token.strip_prefix(&needle).and_then(parse_u32))
 }
 
-fn read_env_u32(key: &str) -> Option<u32> {
-    if cfg!(test) {
-        return None;
-    }
-    std::env::var(key).ok().and_then(|v| parse_u32(&v))
-}
-
 pub(super) fn parse_jobs_flag(command: &str) -> Option<u32> {
     let tokens: Vec<&str> = command.split_whitespace().collect();
     for (idx, token) in tokens.iter().enumerate() {
@@ -600,9 +593,10 @@ pub(crate) fn estimate_cores_for_command(
             if let Some(threads) = parse_test_threads(command) {
                 return threads.max(1);
             }
-            if let Some(threads) = parse_env_u32(command, "RUST_TEST_THREADS")
-                .or_else(|| read_env_u32("RUST_TEST_THREADS"))
-            {
+            // Inline only: the dispatcher's ambient RUST_TEST_THREADS is not
+            // forwarded to the worker (empty environment allowlist), so it
+            // must not size the reservation either (same as CARGO_BUILD_JOBS).
+            if let Some(threads) = parse_env_u32(command, "RUST_TEST_THREADS") {
                 return threads.max(1);
             }
 
@@ -623,9 +617,10 @@ pub(crate) fn estimate_cores_for_command(
             if let Some(threads) = parse_test_threads(command) {
                 return threads.max(1);
             }
-            if let Some(threads) = parse_env_u32(command, "RUST_TEST_THREADS")
-                .or_else(|| read_env_u32("RUST_TEST_THREADS"))
-            {
+            // Inline only: the dispatcher's ambient RUST_TEST_THREADS is not
+            // forwarded to the worker (empty environment allowlist), so it
+            // must not size the reservation either (same as CARGO_BUILD_JOBS).
+            if let Some(threads) = parse_env_u32(command, "RUST_TEST_THREADS") {
                 return threads.max(1);
             }
 
