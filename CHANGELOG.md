@@ -5,7 +5,7 @@ Compilation Helper): the PreToolUse hook + CLI (`rch`), the local daemon (`rchd`
 worker agent (`rch-wkr`), the RABS build sidecar (`rabs-*`, `rabsd`), and the fleet
 dashboard (`dashboard/`).
 
-Scope window: project inception (`v0.1.0`, 2026-01-25) through `v2.1.12` (2026-09-29).
+Scope window: project inception (`v0.1.0`, 2026-01-25) through `v2.1.13` (2026-09-29).
 
 This document was rebuilt from git history (`git log --no-merges` per tag range, `git show`
 on representative commits), version tags (`git for-each-ref`), GitHub release metadata
@@ -28,6 +28,26 @@ history. They are kept as-is because the descriptions were verified against the 
 but those particular links will 404.
 
 Repository: <https://github.com/Dicklesworthstone/remote_compilation_helper>
+
+## 2.1.13 — 2026-09-29
+
+- **A build whose wrapper died before remote exec releases its slots after
+  15 minutes, not 6 hours** (`bd-axhoi`). A wrapper killed during source sync
+  left a build holding 4 slots on vmi1152480 for 4.6 hours. Nothing could be
+  running remotely for it, but it waited out the 6-hour bound meant for remote
+  lifetime caps. Builds whose remote command started keep the long bound, and
+  a lease that still owns worker source still goes to lease recovery. Also
+  fixes wrapper identity on macOS dispatchers. The identity check expected the
+  Linux form and split a macOS identity inside its start time, so every Mac
+  wrapper read as unverified, and a dead one whose pid was reused kept its
+  slots forever
+  ([`e872ab6a`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/e872ab6a2341a0d595debbad7fd3d42748bac058)).
+- **`rch fleet deploy` skips workers that are already current, and
+  `rch fleet status` shows real versions.** Both read the worker's version as
+  the last token of `rch-wkr 2.1.12 (commit …)`, i.e. the commit hash. Status
+  printed `(bbe0aa61f20c))`, and deploy's "already at version" check never
+  matched, so every deploy restarted every worker
+  ([`ec44266d`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/ec44266d21bd164029b8e5b3bec6d8245c492d46)).
 
 ## 2.1.12 — 2026-09-29
 
