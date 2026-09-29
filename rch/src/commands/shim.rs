@@ -1225,6 +1225,17 @@ mod tests {
                     attempts += 1;
                     std::thread::sleep(std::time::Duration::from_millis(10));
                 }
+                // The shim itself execs freshly written stubs (`rch`,
+                // `real-cargo`), so the same race also surfaces inside the
+                // child shell as exit 126 "Text file busy" (bd-04yji).
+                Ok(output)
+                    if output.status.code() == Some(126)
+                        && String::from_utf8_lossy(&output.stderr).contains("Text file busy")
+                        && attempts < 50 =>
+                {
+                    attempts += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
                 result => return result.expect("spawn sandboxed shim"),
             }
         }

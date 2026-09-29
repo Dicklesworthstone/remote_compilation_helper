@@ -604,6 +604,25 @@ mod tests {
     use super::*;
     use rch_common::test_guard;
 
+    /// Reacquire right after this test released the lock. The release is
+    /// synchronous, but a sibling test thread that forks while our gate
+    /// descriptor is open holds a copy of it until its child execs, so the
+    /// gate can look held for a moment under parallel load (bd-04yji). Retry
+    /// only that transient `LockHeld`, bounded to about two seconds.
+    fn reacquire_after_release(
+        path: &std::path::Path,
+    ) -> Result<super::AutoStartLock, super::AutoStartError> {
+        for _ in 0..200 {
+            match super::acquire_autostart_lock(path) {
+                Err(super::AutoStartError::LockHeld) => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                other => return other,
+            }
+        }
+        super::acquire_autostart_lock(path)
+    }
+
     /// Test helper to create a unique temp directory for auto-start tests.
     /// (Local copy of the shared hook test helper, which a sibling module
     /// cannot see.)
@@ -727,7 +746,7 @@ mod tests {
         );
 
         // Should be able to acquire lock again
-        let lock2 = super::acquire_autostart_lock(&lock_path);
+        let lock2 = reacquire_after_release(&lock_path);
         assert!(lock2.is_ok(), "Should be able to reacquire lock after drop");
     }
 
@@ -1676,7 +1695,7 @@ mod tests {
         ));
         assert_eq!(std::fs::read(&path).unwrap(), b"");
         drop(gate);
-        assert!(acquire_autostart_lock(&path).is_ok());
+        assert!(reacquire_after_release(&path).is_ok());
     }
 
     #[test]
@@ -1690,7 +1709,7 @@ mod tests {
             Err(AutoStartError::LockHeld)
         ));
         drop(owner);
-        assert!(acquire_autostart_lock(&path).is_ok());
+        assert!(reacquire_after_release(&path).is_ok());
     }
 
     #[test]
@@ -1704,7 +1723,7 @@ mod tests {
         let inode = std::fs::metadata(&gate_path).unwrap().ino();
         drop(owner);
         assert!(!path.exists());
-        let next_owner = acquire_autostart_lock(&path).unwrap();
+        let next_owner = reacquire_after_release(&path).unwrap();
         assert_eq!(std::fs::metadata(&gate_path).unwrap().ino(), inode);
         drop(next_owner);
         assert_eq!(std::fs::metadata(&gate_path).unwrap().ino(), inode);
@@ -1721,6 +1740,6 @@ mod tests {
         ));
         // Refusing a legacy owner must not leave our kernel gate locked.
         std::fs::write(&path, "invalid legacy body").unwrap();
-        assert!(acquire_autostart_lock(&path).is_ok());
+        assert!(reacquire_after_release(&path).is_ok());
     }
 }

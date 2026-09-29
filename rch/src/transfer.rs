@@ -14974,7 +14974,10 @@ Total file size: 123 bytes";
         let error = run_command_streaming_with_retry(
             &retry_config,
             "ordinary_source_streaming",
-            Some(std::time::Duration::from_millis(100)),
+            // The command exits at once; this only bounds a hang. 100 ms let a
+            // loaded worker's spawn outrun it, so the attempt recorded a
+            // timeout instead of the scripted rsync error (bd-04yji).
+            Some(std::time::Duration::from_secs(5)),
             None,
             move || {
                 calls_in.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
