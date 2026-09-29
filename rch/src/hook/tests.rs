@@ -2570,7 +2570,7 @@ async fn test_daemon_query_surfaces_unacknowledged_unrequested_worker_release() 
         writer.flush().await.expect("flush release rejection");
     });
 
-    let response = query_daemon(
+    let error = query_daemon(
         &socket_path,
         "test-project",
         2,
@@ -2587,18 +2587,23 @@ async fn test_daemon_query_surfaces_unacknowledged_unrequested_worker_release() 
         &[],
     )
     .await
-    .expect("release failure should remain a structured selection refusal");
+    .expect_err("an unacknowledged release must not look like a safe ordinary refusal (9ec9b32f)");
 
     daemon_handle.await.expect("mock daemon task panicked");
     let _ = std::fs::remove_file(&socket_path_clone);
-    assert!(response.worker.is_none());
-    assert!(matches!(
-        response.reason,
-        SelectionReason::SelectionError(ref message)
-            if message.contains("release was not acknowledged")
-                && message.contains("restart rchd")
-    ));
-    assert_eq!(response.build_id, None);
+    // The daemon may still hold the reservation, so the hook must take its
+    // durable stop path: neither retry selection nor build locally.
+    assert!(
+        error
+            .downcast_ref::<daemon_ipc::SelectionOutcomeUnconfirmed>()
+            .is_some()
+    );
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("release was not acknowledged"),
+        "{message}"
+    );
+    assert!(message.contains("build 43"), "{message}");
 }
 
 #[tokio::test]
