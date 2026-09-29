@@ -48,6 +48,16 @@ Repository: <https://github.com/Dicklesworthstone/remote_compilation_helper>
   printed `(bbe0aa61f20c))`, and deploy's "already at version" check never
   matched, so every deploy restarted every worker
   ([`ec44266d`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/ec44266d21bd164029b8e5b3bec6d8245c492d46)).
+- **Contradictory recovered ownership is rejected instead of guessed**
+  (`bd-w2qrp`). Loading the durable ownership snapshot now rejects duplicate
+  active wrapper ids across workers or projects, empty wrapper ids, wrappers
+  that are both active and cancelled, and terminal ids outside the active
+  namespace. Legitimate sequential failover and anonymous owners are kept.
+  Caveat: a rejected snapshot currently stops rchd from starting, so under
+  systemd or launchd it restarts in a loop. Every live dispatcher snapshot was
+  checked against these rules before release and passes; quarantining instead
+  of refusing is tracked in `bd-tqmak`
+  ([`057bb508`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/057bb508fa9c1e9250541c5051f6c187b150974e)).
 
 ## 2.1.12 — 2026-09-29
 
