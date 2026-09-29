@@ -47,6 +47,13 @@ Repository: <https://github.com/Dicklesworthstone/remote_compilation_helper>
   `job-leases/retrieval/`: 1,339 stages and 43 GB on ts1, and about 129 GB
   across ten dispatchers. The stage is removed once publication is durable
   ([`19ae7e2a`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/19ae7e2a140d0766b7b209333380e864ff6c9aaf)).
+- **A healthy build is no longer cancelled for one late heartbeat.** The stuck
+  detector cancelled a build whose progress was stale (≥ 90 s) and whose
+  heartbeat was stale (≥ 20 s) even while the hook process was alive. A large
+  crate compiles silently for minutes, and a loaded host easily delays one
+  heartbeat by 20 s. On 2026-09-28 a healthy 16-minute `cargo test` was killed
+  this way, leaving an orphaned build and source claim
+  ([`9f8692f2`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/9f8692f28ddbfef411650bb725558d5a98f838ff)).
 - **Lost selection replies can no longer cause a replay or a silent local
   build.** A failed reply to an immediate (non-queued) worker selection is now
   treated as possibly admitted, like a queued one, and goes through the durable
