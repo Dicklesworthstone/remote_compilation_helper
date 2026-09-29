@@ -87,6 +87,15 @@ pub struct WorkerStatus {
     pub issues: Vec<String>,
 }
 
+/// The version from `rch-wkr --version` output: the token after the program
+/// name. Current binaries print `rch-wkr 2.1.12 (commit bbe0aa61f20c)`; taking
+/// the LAST token yielded `bbe0aa61f20c)`, which `fleet status` showed as
+/// `(bbe0aa61f20c))` and which never equals a deploy's target version, so
+/// `rch fleet deploy` redeployed every already-current worker.
+fn wkr_version_from_output(stdout: &str) -> Option<String> {
+    stdout.split_whitespace().nth(1).map(str::to_owned)
+}
+
 pub async fn run_preflight(
     worker: &WorkerConfig,
     _ctx: &OutputContext,
@@ -405,9 +414,7 @@ pub async fn run_preflight(
             .await
         {
             if output.success() && !output.stdout.trim().is_empty() {
-                let version_str = output.stdout.trim();
-                // Extract version number (e.g., "rch-wkr 1.0.0" -> "1.0.0")
-                let version = version_str.split_whitespace().last().map(|s| s.to_string());
+                let version = wkr_version_from_output(&output.stdout);
                 info!(
                     worker = %worker.id,
                     version = ?version,
@@ -521,12 +528,7 @@ async fn query_worker_inner(worker: &WorkerConfig, config: &FleetConfig) -> Work
             && output.success()
             && !output.stdout.trim().is_empty()
         {
-            // split_whitespace() already handles leading/trailing whitespace
-            version = output
-                .stdout
-                .split_whitespace()
-                .last()
-                .map(|s| s.to_string());
+            version = wkr_version_from_output(&output.stdout);
         }
 
         // Check disk space
@@ -734,6 +736,20 @@ pub const SSH_CONNECT_TIMEOUT_SECS: u64 = 5;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wkr_version_is_the_token_after_the_program_name() {
+        assert_eq!(
+            wkr_version_from_output("rch-wkr 2.1.12 (commit bbe0aa61f20c)\n").as_deref(),
+            Some("2.1.12")
+        );
+        assert_eq!(
+            wkr_version_from_output("rch-wkr 1.0.0").as_deref(),
+            Some("1.0.0")
+        );
+        assert_eq!(wkr_version_from_output("rch-wkr"), None);
+        assert_eq!(wkr_version_from_output("  \n"), None);
+    }
 
     // ========================
     // Severity tests
