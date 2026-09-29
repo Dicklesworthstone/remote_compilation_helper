@@ -5,7 +5,7 @@ Compilation Helper): the PreToolUse hook + CLI (`rch`), the local daemon (`rchd`
 worker agent (`rch-wkr`), the RABS build sidecar (`rabs-*`, `rabsd`), and the fleet
 dashboard (`dashboard/`).
 
-Scope window: project inception (`v0.1.0`, 2026-01-25) through `v2.1.10` (2026-09-28).
+Scope window: project inception (`v0.1.0`, 2026-01-25) through `v2.1.11` (2026-09-29).
 
 This document was rebuilt from git history (`git log --no-merges` per tag range, `git show`
 on representative commits), version tags (`git for-each-ref`), GitHub release metadata
@@ -28,6 +28,23 @@ history. They are kept as-is because the descriptions were verified against the 
 but those particular links will 404.
 
 Repository: <https://github.com/Dicklesworthstone/remote_compilation_helper>
+
+## 2.1.11 — 2026-09-29
+
+- **A dispatcher's local `CARGO_BUILD_JOBS` no longer inflates remote
+  reservations.** Every dispatcher sets `CARGO_BUILD_JOBS` in
+  `/etc/environment` to throttle local builds (16 on trj/css/csd/ts1, 32 on
+  ts2), and the hook used that value to size a remote build's slot
+  reservation. It never reaches the worker: the environment allowlist is
+  empty fleet-wide, and the worker picks its own job count. So every
+  `cargo test` without `-j` from ts1 reserved 16 slots. Only hz3 and hz4 could
+  fit that, and ts1 kept refusing 36–59 builds per 15 minutes after 2.1.10,
+  which then ran locally. Reservations now come only from `-j`/`--jobs` or an
+  inline `CARGO_BUILD_JOBS=N` in the command. If you allowlist
+  `CARGO_BUILD_JOBS` so it does reach workers, pass `-j` explicitly to size
+  the reservation. `RUST_TEST_THREADS` has the same ambient fallback. No
+  dispatcher sets it, so it is unchanged for now
+  ([`f87eb024`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/f87eb024df41860a76b77c2af4bdfd6556b08351)).
 
 ## 2.1.10 — 2026-09-28
 
