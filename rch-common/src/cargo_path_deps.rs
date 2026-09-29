@@ -494,12 +494,21 @@ impl<'a> SelectedCargoTree<'a> {
             diagnostics: Vec::new(),
         };
         for path in entries.keys() {
+            // On Unix a colon in a leaf filename is inert (for example a
+            // checked-in source excerpt named `model.rs:6150-6230`). Cargo
+            // references and symlink targets still go through `components`,
+            // which refuses colons. A colon in a directory can affect Cargo's
+            // ancestor search, and Windows cannot materialize these names.
+            let colon_in_directory = path
+                .parent()
+                .is_some_and(|parent| parent.to_string_lossy().contains(':'));
             if path.as_os_str().is_empty()
                 || path.to_str().is_none()
                 || path
                     .components()
                     .any(|part| !matches!(part, std::path::Component::Normal(_)))
-                || path.to_string_lossy().contains(['\\', ':'])
+                || path.to_string_lossy().contains('\\')
+                || (path.to_string_lossy().contains(':') && (cfg!(windows) || colon_in_directory))
             {
                 tree.diagnostics.push(format!(
                     "invalid selected inventory path: {}",
@@ -3279,6 +3288,51 @@ mod tests {
                 .unwrap_err()
                 .detail()
                 .contains("invalid selected inventory")
+        );
+    }
+
+    #[test]
+    fn selected_cargo_tree_accepts_inert_unix_colon_leaf_but_not_colon_paths() {
+        let mut entries = selected_tree(&[("Cargo.toml", "[workspace]")]);
+        entries.insert(
+            PathBuf::from("crates/fs-evidence/src/vv/model.rs:6150-6230"),
+            SelectedCargoEntry::File(None),
+        );
+        if cfg!(unix) {
+            validate_selected_cargo_tree(&entries).unwrap();
+        } else {
+            assert!(validate_selected_cargo_tree(&entries).is_err());
+        }
+        entries.insert(
+            PathBuf::from("crates/fs-evidence:outside/src/lib.rs"),
+            SelectedCargoEntry::File(None),
+        );
+        assert!(
+            validate_selected_cargo_tree(&entries)
+                .unwrap_err()
+                .detail()
+                .contains("invalid selected inventory path")
+        );
+        let referenced = selected_tree(&[(
+            "Cargo.toml",
+            "[package]\nname='root'\nversion='0.1.0'\n[dependencies]\ndep={path='dep:elsewhere'}",
+        )]);
+        assert!(
+            validate_selected_cargo_tree(&referenced)
+                .unwrap_err()
+                .detail()
+                .contains("unsupported or absolute path")
+        );
+        let mut linked = selected_tree(&[("Cargo.toml", "[workspace]")]);
+        linked.insert(
+            PathBuf::from("alias"),
+            SelectedCargoEntry::Symlink("target:elsewhere".into()),
+        );
+        assert!(
+            validate_selected_cargo_tree(&linked)
+                .unwrap_err()
+                .detail()
+                .contains("unsupported or absolute path")
         );
     }
 
