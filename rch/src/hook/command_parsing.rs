@@ -69,10 +69,17 @@ pub(super) fn parse_jobs_flag(command: &str) -> Option<u32> {
     None
 }
 
+/// The job count the REMOTE build will actually use, when the command says so:
+/// `-j`/`--jobs`, or `CARGO_BUILD_JOBS=N` written inline in the command.
+///
+/// The dispatcher's ambient `CARGO_BUILD_JOBS` is deliberately ignored. It is
+/// a local-build throttle (every dispatcher sets 16-32 in /etc/environment),
+/// it is not forwarded to the worker (the worker picks its own via
+/// `remote_build_jobs_fragment`), and reading it sized every `-j`-less
+/// `cargo test` from ts1 at 16 slots: only two workers qualified, and
+/// thousands of builds a day were refused and ran locally.
 pub(crate) fn cargo_job_count_for_command(command: &str) -> Option<u32> {
-    parse_jobs_flag(command)
-        .or_else(|| parse_env_u32(command, "CARGO_BUILD_JOBS"))
-        .or_else(|| read_env_u32("CARGO_BUILD_JOBS"))
+    parse_jobs_flag(command).or_else(|| parse_env_u32(command, "CARGO_BUILD_JOBS"))
 }
 
 pub(super) fn parse_test_threads(command: &str) -> Option<u32> {
@@ -569,9 +576,10 @@ pub(crate) fn estimate_cores_for_command(
         // --no-run starts no test harness. Name filters, --test-threads and
         // RUST_TEST_THREADS cannot shrink its compiler reservation. The jobs
         // value above came only from Cargo's argv, before its own -- separator.
+        // Ambient CARGO_BUILD_JOBS is ignored for the same reason as in
+        // `cargo_job_count_for_command`: it never reaches the worker.
         return jobs
             .or_else(|| parse_env_u32(command, "CARGO_BUILD_JOBS"))
-            .or_else(|| read_env_u32("CARGO_BUILD_JOBS"))
             .unwrap_or(build_default);
     }
 
