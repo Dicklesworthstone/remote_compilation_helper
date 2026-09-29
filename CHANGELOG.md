@@ -5,7 +5,7 @@ Compilation Helper): the PreToolUse hook + CLI (`rch`), the local daemon (`rchd`
 worker agent (`rch-wkr`), the RABS build sidecar (`rabs-*`, `rabsd`), and the fleet
 dashboard (`dashboard/`).
 
-Scope window: project inception (`v0.1.0`, 2026-01-25) through `v2.1.11` (2026-09-29).
+Scope window: project inception (`v0.1.0`, 2026-01-25) through `v2.1.12` (2026-09-29).
 
 This document was rebuilt from git history (`git log --no-merges` per tag range, `git show`
 on representative commits), version tags (`git for-each-ref`), GitHub release metadata
@@ -28,6 +28,35 @@ history. They are kept as-is because the descriptions were verified against the 
 but those particular links will 404.
 
 Repository: <https://github.com/Dicklesworthstone/remote_compilation_helper>
+
+## 2.1.12 — 2026-09-29
+
+- **`rch status` no longer tells agents to cancel healthy builds or drain
+  workers.** A build whose progress looks stale while its hook is alive and
+  heartbeating is almost always one large crate compiling silently. The status
+  issue for it advised `rch cancel` and, if repeated, `rch workers drain`.
+  Agents followed that literally: hz4 (64 cores) and vmi1152480 were drained
+  twice on 2026-09-28 with no admin record. The issue is now informational,
+  points at `rch queue --json`, allows cancelling only past the timeout
+  budget, and says not to drain the worker
+  ([`f144e978`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/f144e978622198b8f66ba13afe44b4c0d680a1ca)).
+- **Worker drains, enables and disables are attributable.** rchd logs each one
+  as "Worker admin action" with the outcome and the calling process: pid,
+  command, parent pid and parent command, read from the socket's peer
+  credentials
+  ([`1410e9d1`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/1410e9d13bd7faa97c8cacd2ddd68a50941f12af)).
+- **`rch workers enable|disable|drain` exit 1 on failure** and print the
+  daemon's message instead of the raw HTTP response. An unknown worker id
+  used to print `HTTP/1.0 200 OK … {"status":"error"…}` and exit 0
+  ([`a649dcda`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/a649dcda93f9901b5948a4e272f0dffff8a95d41)).
+- **Ambient `RUST_TEST_THREADS` no longer sizes remote reservations**, for the
+  same reason as `CARGO_BUILD_JOBS` in 2.1.11: it never reaches the worker
+  ([`9806609c`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/9806609cc1dbb46252b61134cac2b0c61c314297)).
+- **Release-gate flakes fixed** (`bd-04yji`). Three tests failed
+  intermittently under parallel load and passed alone: autostart lock
+  reacquire, shim stub exec ("Text file busy"), and a 100 ms streaming bound.
+  This release's full `rch` + `rchd` run was 5,107 passed, 0 failed
+  ([`5f1581a6`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/5f1581a6fbc1925254a3dfd1a12ac2197fd396d5)).
 
 ## 2.1.11 — 2026-09-29
 
