@@ -1766,7 +1766,7 @@ pub async fn workers_drain(worker_id: &str, skip_confirm: bool, ctx: &OutputCont
                 StatusIndicator::Info.display(style)
             );
         }
-        return Ok(());
+        return Err(crate::doctor::DoctorExit(1).into());
     }
 
     // Prompt for confirmation unless skipped or in JSON mode
@@ -1788,6 +1788,7 @@ pub async fn workers_drain(worker_id: &str, skip_confirm: bool, ctx: &OutputCont
     }
 
     // Send drain command to daemon
+    let mut failed = false;
     match send_daemon_command(&format!(
         "POST /workers/{}/drain\n",
         urlencoding_encode(worker_id)
@@ -1795,7 +1796,8 @@ pub async fn workers_drain(worker_id: &str, skip_confirm: bool, ctx: &OutputCont
     .await
     {
         Ok(response) => {
-            if response.contains("error") || response.contains("Error") {
+            if let Some(failure) = worker_action_failure(&response) {
+                failed = true;
                 if ctx.is_json() {
                     let _ = ctx.json(&ApiResponse::ok(
                         "workers drain",
@@ -1803,14 +1805,14 @@ pub async fn workers_drain(worker_id: &str, skip_confirm: bool, ctx: &OutputCont
                             worker_id: worker_id.to_string(),
                             action: "drain".to_string(),
                             success: false,
-                            message: Some(response),
+                            message: Some(failure),
                         },
                     ));
                 } else {
                     println!(
                         "{} Failed to drain worker: {}",
                         StatusIndicator::Error.display(style),
-                        style.muted(&response)
+                        style.muted(&failure)
                     );
                 }
             } else if ctx.is_json() {
@@ -1836,6 +1838,7 @@ pub async fn workers_drain(worker_id: &str, skip_confirm: bool, ctx: &OutputCont
             }
         }
         Err(e) => {
+            failed = true;
             if ctx.is_json() {
                 let _ = ctx.json(&ApiResponse::<()>::err(
                     "workers drain",
@@ -1855,7 +1858,32 @@ pub async fn workers_drain(worker_id: &str, skip_confirm: bool, ctx: &OutputCont
         }
     }
 
+    if failed {
+        return Err(crate::doctor::DoctorExit(1).into());
+    }
     Ok(())
+}
+
+/// The daemon's verdict on a worker state change, from its JSON body: `None` when
+/// it applied the change, otherwise its message. The daemon answers HTTP 200 for
+/// refusals too (`{"status":"error",...}`, e.g. an unknown worker id), so the status
+/// field, not the HTTP line, decides. A body that is not JSON falls back to the old
+/// substring check.
+fn worker_action_failure(response: &str) -> Option<String> {
+    let body = crate::status_types::extract_json_body(response)
+        .unwrap_or(response)
+        .trim();
+    match serde_json::from_str::<serde_json::Value>(body) {
+        Ok(value) if value.get("status").and_then(|s| s.as_str()) == Some("ok") => None,
+        Ok(value) => Some(
+            ["message", "reason", "error"]
+                .iter()
+                .find_map(|key| value.get(*key).and_then(|m| m.as_str()))
+                .map_or_else(|| body.to_owned(), str::to_owned),
+        ),
+        Err(_) if response.contains("error") || response.contains("Error") => Some(body.to_owned()),
+        Err(_) => None,
+    }
 }
 
 /// Enable a worker (requires daemon).
@@ -1876,8 +1904,10 @@ pub async fn workers_enable(worker_id: &str, ctx: &OutputContext) -> Result<()> 
                 style.highlight("rch daemon start")
             );
         }
-        return Ok(());
+        return Err(crate::doctor::DoctorExit(1).into());
     }
+
+    let mut failed = false;
 
     match send_daemon_command(&format!(
         "POST /workers/{}/enable\n",
@@ -1886,7 +1916,8 @@ pub async fn workers_enable(worker_id: &str, ctx: &OutputContext) -> Result<()> 
     .await
     {
         Ok(response) => {
-            if response.contains("error") || response.contains("Error") {
+            if let Some(failure) = worker_action_failure(&response) {
+                failed = true;
                 if ctx.is_json() {
                     let _ = ctx.json(&ApiResponse::ok(
                         "workers enable",
@@ -1894,14 +1925,14 @@ pub async fn workers_enable(worker_id: &str, ctx: &OutputContext) -> Result<()> 
                             worker_id: worker_id.to_string(),
                             action: "enable".to_string(),
                             success: false,
-                            message: Some(response),
+                            message: Some(failure),
                         },
                     ));
                 } else {
                     println!(
                         "{} Failed to enable worker: {}",
                         StatusIndicator::Error.display(style),
-                        style.muted(&response)
+                        style.muted(&failure)
                     );
                 }
             } else if ctx.is_json() {
@@ -1923,6 +1954,7 @@ pub async fn workers_enable(worker_id: &str, ctx: &OutputContext) -> Result<()> 
             }
         }
         Err(e) => {
+            failed = true;
             if ctx.is_json() {
                 let _ = ctx.json(&ApiResponse::<()>::err(
                     "workers enable",
@@ -1938,6 +1970,9 @@ pub async fn workers_enable(worker_id: &str, ctx: &OutputContext) -> Result<()> 
         }
     }
 
+    if failed {
+        return Err(crate::doctor::DoctorExit(1).into());
+    }
     Ok(())
 }
 
@@ -1967,7 +2002,7 @@ pub async fn workers_disable(
                 style.highlight("rch daemon start")
             );
         }
-        return Ok(());
+        return Err(crate::doctor::DoctorExit(1).into());
     }
 
     // Prompt for confirmation unless skipped or in JSON mode
@@ -2009,9 +2044,12 @@ pub async fn workers_disable(
     }
     url.push('\n');
 
+    let mut failed = false;
+
     match send_daemon_command(&url).await {
         Ok(response) => {
-            if response.contains("error") || response.contains("Error") {
+            if let Some(failure) = worker_action_failure(&response) {
+                failed = true;
                 if ctx.is_json() {
                     let _ = ctx.json(&ApiResponse::ok(
                         "workers disable",
@@ -2019,14 +2057,14 @@ pub async fn workers_disable(
                             worker_id: worker_id.to_string(),
                             action: "disable".to_string(),
                             success: false,
-                            message: Some(response),
+                            message: Some(failure),
                         },
                     ));
                 } else {
                     println!(
                         "{} Failed to disable worker: {}",
                         StatusIndicator::Error.display(style),
-                        style.muted(&response)
+                        style.muted(&failure)
                     );
                 }
             } else if ctx.is_json() {
@@ -2080,6 +2118,7 @@ pub async fn workers_disable(
             }
         }
         Err(e) => {
+            failed = true;
             if ctx.is_json() {
                 let _ = ctx.json(&ApiResponse::<()>::err(
                     "workers disable",
@@ -2095,6 +2134,9 @@ pub async fn workers_disable(
         }
     }
 
+    if failed {
+        return Err(crate::doctor::DoctorExit(1).into());
+    }
     Ok(())
 }
 
@@ -2550,5 +2592,40 @@ mod probe_summary_tests {
             ..Default::default()
         });
         assert!(!workers_list_verbose_enabled(&verbose_json_ctx));
+    }
+}
+
+#[cfg(test)]
+mod worker_action_failure_tests {
+    use super::worker_action_failure;
+
+    #[test]
+    fn daemon_status_field_decides_success_and_failure() {
+        let ok = "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n\r\n\
+                  {\"status\":\"ok\",\"worker_id\":\"hz4\",\"action\":\"enable\",\
+                  \"message\":\"no error\"}";
+        assert_eq!(worker_action_failure(ok), None);
+
+        let unknown = "HTTP/1.0 200 OK\r\n\r\n{\"status\":\"error\",\"worker_id\":\"nope\",\
+                       \"action\":\"enable\",\"message\":\"Worker 'nope' not found\"}";
+        assert_eq!(
+            worker_action_failure(unknown).as_deref(),
+            Some("Worker 'nope' not found")
+        );
+
+        let no_message = "{\"status\":\"error\",\"worker_id\":\"x\",\"action\":\"drain\"}";
+        assert_eq!(
+            worker_action_failure(no_message).as_deref(),
+            Some(no_message)
+        );
+    }
+
+    #[test]
+    fn non_json_bodies_keep_the_legacy_substring_check() {
+        assert_eq!(worker_action_failure("OK\n"), None);
+        assert_eq!(
+            worker_action_failure("Internal Error: boom").as_deref(),
+            Some("Internal Error: boom")
+        );
     }
 }
