@@ -34,7 +34,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 // ============================================================================
@@ -697,6 +697,60 @@ fn selection_response_json(response: &SelectionResponse) -> Result<String> {
     Ok(serde_json::to_string(&value)?)
 }
 
+/// Log an operator worker action with its caller, so a drain, enable or disable
+/// can be attributed later. On 2026-09-28 hz4 and vmi1152480 were drained twice
+/// with no admin record and no log line, and nobody could say which agent did
+/// it. `ps` is bounded to one second per lookup and its output is truncated.
+async fn log_worker_admin_action(
+    action: &str,
+    worker_id: &WorkerId,
+    outcome: &str,
+    peer_pid: Option<i32>,
+) {
+    let caller = match peer_pid {
+        Some(pid) => describe_caller(pid).await,
+        None => "unknown caller".to_string(),
+    };
+    info!(
+        action,
+        worker = %worker_id,
+        outcome,
+        caller = %caller,
+        "Worker admin action"
+    );
+}
+
+async fn describe_caller(pid: i32) -> String {
+    async fn ps(fields: &str, pid: &str) -> Option<String> {
+        let output = tokio::time::timeout(
+            Duration::from_secs(1),
+            tokio::process::Command::new("ps")
+                .args(["-o", fields, "-p", pid])
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .ok()?
+        .ok()?;
+        let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        (!text.is_empty()).then(|| text.chars().take(160).collect())
+    }
+    let pid_text = pid.to_string();
+    let Some(line) = ps("ppid=,command=", &pid_text).await else {
+        return format!("pid={pid}");
+    };
+    let (ppid, command) = line
+        .trim_start()
+        .split_once(char::is_whitespace)
+        .unwrap_or((line.as_str(), ""));
+    let parent = ps("command=", ppid.trim()).await.unwrap_or_default();
+    format!(
+        "pid={pid} cmd={:?} ppid={} parent={parent:?}",
+        command.trim(),
+        ppid.trim()
+    )
+}
+
 /// Handle an incoming connection on the Unix socket.
 pub async fn handle_connection(
     stream: UnixStream,
@@ -718,6 +772,9 @@ async fn handle_connection_with_metrics(
     shutdown_tx: tokio::sync::mpsc::Sender<()>,
     request_metrics: Option<rch_telemetry::metrics::Metrics>,
 ) -> Result<()> {
+    // Kept only to attribute operator actions (worker drain/enable/disable) in
+    // the log; read before the split, while the socket is whole.
+    let peer_pid = stream.peer_cred().ok().and_then(|cred| cred.pid());
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
     let mut line = String::new();
@@ -1200,11 +1257,13 @@ async fn handle_connection_with_metrics(
         Ok(ApiRequest::WorkerDrain { worker_id }) => {
             metrics::inc_requests("worker-drain");
             let response = handle_worker_drain(&ctx, &worker_id).await;
+            log_worker_admin_action("drain", &worker_id, &response.status, peer_pid).await;
             (serde_json::to_string(&response)?, "application/json")
         }
         Ok(ApiRequest::WorkerEnable { worker_id }) => {
             metrics::inc_requests("worker-enable");
             let response = handle_worker_enable(&ctx, &worker_id).await;
+            log_worker_admin_action("enable", &worker_id, &response.status, peer_pid).await;
             (serde_json::to_string(&response)?, "application/json")
         }
         Ok(ApiRequest::WorkerDisable {
@@ -1214,6 +1273,7 @@ async fn handle_connection_with_metrics(
         }) => {
             metrics::inc_requests("worker-disable");
             let response = handle_worker_disable(&ctx, &worker_id, reason, drain_first).await;
+            log_worker_admin_action("disable", &worker_id, &response.status, peer_pid).await;
             (serde_json::to_string(&response)?, "application/json")
         }
         Ok(ApiRequest::RepoConvergenceStatus { worker_id }) => {
@@ -6681,6 +6741,19 @@ mod tests {
         assert_eq!(response.status, "ok");
         assert_eq!(response.cancelled_count, 0);
         assert!(response.cancelled.is_empty());
+    }
+
+    #[tokio::test]
+    async fn describe_caller_names_the_calling_process() {
+        let pid = std::process::id();
+        let described = describe_caller(pid as i32).await;
+        assert!(described.starts_with(&format!("pid={pid} ")), "{described}");
+        assert!(
+            described.contains("cmd=") && described.contains("parent="),
+            "{described}"
+        );
+        // A pid that cannot exist still yields an attributable line, not a hang.
+        assert_eq!(describe_caller(i32::MAX).await, format!("pid={}", i32::MAX));
     }
 
     #[tokio::test]
