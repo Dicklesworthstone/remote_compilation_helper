@@ -3541,17 +3541,23 @@ fn active_build_issues_from_active_builds(
         .max_by_key(|build| build.detector_build_age_secs)
         .expect("non-empty stalled live-hook build list");
 
+    // Stale progress with a live hook and fresh heartbeats is the normal shape
+    // of one large crate compiling silently, which the stuck detector no longer
+    // cancels (9f8692f2). The old remediation told readers to cancel the build
+    // and drain the worker; agents followed it literally, cancelling healthy
+    // builds and draining a 64-core worker (hz4, 2026-09-28). Keep it
+    // informational and point at inspection, not intervention.
     vec![Issue {
-        severity: "warning".to_string(),
+        severity: "info".to_string(),
         summary: format!(
-            "{} active build(s) have stale progress while hook heartbeats remain fresh; queued validations may stall behind build {} on worker {}.",
+            "{} active build(s) have stale progress while hook heartbeats remain fresh (longest: build {} on worker {}); usually a large crate compiling silently.",
             stalled_live_hook_builds.len(),
             representative.id,
             representative.worker_id
         ),
         remediation: Some(format!(
-            "Inspect with `rch queue --json`; if progress remains stale, run `rch cancel {}`. If this repeats on {}, drain it with `rch workers drain {}` before retrying validation.",
-            representative.id, representative.worker_id, representative.worker_id
+            "No action needed while the hook stays alive. Inspect with `rch queue --json`; cancel build {} only if it is past its build/test timeout budget. Do not drain {} for this: the worker is healthy.",
+            representative.id, representative.worker_id
         )),
     }]
 }
@@ -8238,15 +8244,18 @@ mod tests {
             .find(|issue| issue.summary.contains("stale progress"))
             .expect("status issues should include live-hook progress stall");
 
-        assert_eq!(issue.severity, "warning");
+        assert_eq!(issue.severity, "info");
         assert!(issue.summary.contains(&active.id.to_string()));
         assert!(issue.summary.contains("worker1"));
         let remediation = issue
             .remediation
             .as_ref()
             .expect("stall issue should include remediation");
-        assert!(remediation.contains(&format!("rch cancel {}", active.id)));
-        assert!(remediation.contains("rch workers drain worker1"));
+        // A live, heartbeating build is healthy: the advice must never tell an
+        // agent to drain the worker or cancel unconditionally.
+        assert!(!remediation.contains("rch workers drain"));
+        assert!(!remediation.contains("rch cancel"));
+        assert!(remediation.contains("rch queue --json"));
     }
 
     #[tokio::test]
