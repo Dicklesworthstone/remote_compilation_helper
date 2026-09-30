@@ -510,6 +510,17 @@ impl BuildHistory {
         {
             return Ok(None);
         }
+        if state.local_wrapper_id.as_deref().is_some_and(|wrapper| {
+            wrapper.is_empty()
+                || active.values().any(|existing| {
+                    existing.local_wrapper_id.as_deref() == Some(wrapper)
+                })
+        }) {
+            // A durable wrapper identity is a single live execution authority.
+            // Allowing the same wrapper onto two workers makes a lost selection
+            // reply or retry indistinguishable from duplicate execution.
+            return Ok(None);
+        }
         if active.values().any(|existing| {
             existing.project_id == state.project_id && existing.worker_id == state.worker_id
         }) {
@@ -3049,6 +3060,65 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    #[test]
+    fn active_wrapper_admission_has_exactly_one_live_owner() {
+        use std::sync::{Arc, Barrier};
+
+        for _ in 0..32 {
+            let history = Arc::new(BuildHistory::new(10));
+            let barrier = Arc::new(Barrier::new(3));
+            let mut tasks = Vec::new();
+
+            for (project, worker) in [("project-a", "worker-a"), ("project-b", "worker-b")] {
+                let history = history.clone();
+                let barrier = barrier.clone();
+                tasks.push(std::thread::spawn(move || {
+                    barrier.wait();
+                    history
+                        .try_start_active_build_with_wrapper(
+                            project.into(),
+                            worker.into(),
+                            "cargo build".into(),
+                            0,
+                            Some("single-live-owner".into()),
+                            2,
+                            BuildLocation::Remote,
+                        )
+                        .unwrap()
+                }));
+            }
+
+            barrier.wait();
+            let admitted = tasks
+                .into_iter()
+                .filter_map(|task| task.join().unwrap())
+                .collect::<Vec<_>>();
+
+            assert_eq!(admitted.len(), 1);
+            assert_eq!(history.active_builds().len(), 1);
+            assert_eq!(
+                history.active_builds()[0].local_wrapper_id.as_deref(),
+                Some("single-live-owner")
+            );
+
+            assert!(
+                history
+                    .try_start_active_build_with_wrapper(
+                        "project-c".into(),
+                        "worker-c".into(),
+                        "cargo build".into(),
+                        0,
+                        Some("different-live-owner".into()),
+                        2,
+                        BuildLocation::Remote,
+                    )
+                    .unwrap()
+                    .is_some(),
+                "a distinct wrapper must remain independently admissible"
+            );
+        }
     }
 
     #[test]
