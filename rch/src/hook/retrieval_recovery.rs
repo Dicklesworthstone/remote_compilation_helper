@@ -791,6 +791,14 @@ pub(crate) async fn cancel_preparation(writer: &DurableLeaseWriter) -> anyhow::R
     };
     session.recipe.preparation_cancelled = true;
     session.persist()?;
+    cancel_source_grant(session).await
+}
+
+/// Cancel the job's source grant (and pair), reap its remote tree, and retire
+/// the recipe with a build-error exit. Callers must have proven that nothing
+/// of the job can still run remotely: execution never started, or the probe in
+/// `remote_execution_lost` found it gone.
+async fn cancel_source_grant(mut session: RecoverySession) -> anyhow::Result<bool> {
     let worker = session.recipe.worker.clone();
     let owned = super::super::ssh::cancel_remote_source_authority_intent(
         &worker,
@@ -883,9 +891,33 @@ pub(crate) async fn recover_job(writer: &DurableLeaseWriter) -> anyhow::Result<i
         session.recipe.transfer.clone(),
     );
     let base = session.completion_pipeline(base);
-    let mut exit = base.read_recovery_completion(&worker).await?.context(
-        "same-id remote execution has no durable completion yet; command was not replayed",
-    )?;
+    let Some(mut exit) = base.read_recovery_completion(&worker).await? else {
+        // A supervisor that died without its receipt (worker reboot, OOM,
+        // kill) never writes one, and waiting for it kept the lease's source
+        // claim fencing the worker forever. When the probe proves the
+        // execution is gone, retire it as a failed build: nothing is replayed.
+        if !session.recipe.source_roots.is_empty()
+            && super::super::ssh::remote_execution_lost(
+                &worker,
+                &session.recipe.identity,
+                &session.recipe.completion,
+            )
+            .await?
+        {
+            tracing::warn!(
+                identity = %session.recipe.identity,
+                worker = %worker.id,
+                "remote execution ended without a completion receipt; retiring it as failed"
+            );
+            cancel_source_grant(session).await?;
+            writer.record_exit(EXIT_BUILD_ERROR)?;
+            writer.acknowledge_terminal()?;
+            return Ok(EXIT_BUILD_ERROR);
+        }
+        anyhow::bail!(
+            "same-id remote execution has no durable completion yet; command was not replayed"
+        );
+    };
     let mut pair = if let Some((root, token)) = &session.recipe.pair {
         Some(
             super::super::ssh::recover_clean_overlay_source_pair(

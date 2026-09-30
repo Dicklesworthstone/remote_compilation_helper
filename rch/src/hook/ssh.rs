@@ -485,6 +485,53 @@ fn source_intent_command(
     ))
 }
 
+/// Probe whether a started remote execution is gone for good. Every activity
+/// under a source grant (the build supervisor and its descendants) inherits
+/// the grant's activity-lock descriptor, so while any of it lives the lock is
+/// held. Holding that lock ourselves and still finding no completion receipt
+/// proves the execution died without one and never will write it. A
+/// registry that no longer exists (worker reboot cleared /tmp) proves the
+/// same. Prints exactly one of RCH_EXEC_ACTIVE, RCH_EXEC_COMPLETED,
+/// RCH_EXEC_LOST.
+fn remote_execution_probe_script(
+    registry: &str,
+    identity: &str,
+    receipt: &str,
+) -> anyhow::Result<String> {
+    validate_source_identity(identity)?;
+    let quote = |value: &str| shell_escape::escape(value.into()).into_owned();
+    Ok(format!(
+        "[ -d {registry} ] || {{ echo RCH_EXEC_LOST; exit 0; }}; \
+         flock -n {lock} sh -c 'if [ -e \"$1\" ] || [ -L \"$1\" ]; then echo RCH_EXEC_COMPLETED; \
+         else echo RCH_EXEC_LOST; fi' rch-exec-probe {receipt} || echo RCH_EXEC_ACTIVE",
+        registry = quote(registry),
+        lock = quote(&format!("{registry}/{identity}.activity.lock")),
+        receipt = quote(receipt),
+    ))
+}
+
+/// True only when the probe proves the execution is lost (see
+/// [`remote_execution_probe_script`]); any other answer or error keeps the
+/// conservative "not complete yet" verdict.
+pub(super) async fn remote_execution_lost(
+    worker: &WorkerConfig,
+    identity: &str,
+    receipt: &str,
+) -> anyhow::Result<bool> {
+    let script = remote_execution_probe_script(REMOTE_SOURCE_CLAIM_REGISTRY, identity, receipt)?;
+    let output = run_offload_ssh_command_with_stdin(
+        worker,
+        "sh -s",
+        script.as_bytes(),
+        Duration::from_secs(15),
+    )
+    .await?;
+    Ok(output.status.success()
+        && String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .any(|line| line.trim() == "RCH_EXEC_LOST"))
+}
+
 /// Reconcile an exact release after completed retrieval. This grants no source
 /// read or mutation authority and must never substitute for strict recovery.
 pub(super) async fn remote_source_authority_was_released(
@@ -1912,6 +1959,70 @@ cat "$RCH_OWNERSHIP_TEST_DIR/payload"
             paired,
             exclusive_source_locks(&[source_authority_lock_path("/private/child")])
         );
+    }
+
+    /// A started execution is "lost" only when its activity lock is free and
+    /// no receipt exists (or the whole registry is gone); a held lock means it
+    /// is still running and a receipt means it completed.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn remote_execution_probe_distinguishes_active_completed_and_lost() {
+        use std::process::{Command, Stdio};
+        let tmp = tempfile::tempdir().unwrap();
+        let registry = tmp.path().join("claims");
+        std::fs::create_dir(&registry).unwrap();
+        let identity = "0123456789abcdef0123456789abcdef";
+        let receipt = tmp.path().join("recovery-1-id");
+        let probe = |registry: &Path| {
+            let script = remote_execution_probe_script(
+                registry.to_str().unwrap(),
+                identity,
+                receipt.to_str().unwrap(),
+            )
+            .unwrap();
+            let output = Command::new("sh").arg("-c").arg(script).output().unwrap();
+            assert!(output.status.success());
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        };
+
+        assert_eq!(probe(&registry), "RCH_EXEC_LOST", "free lock, no receipt");
+        assert_eq!(
+            probe(&tmp.path().join("absent")),
+            "RCH_EXEC_LOST",
+            "registry gone"
+        );
+
+        let lock = registry.join(format!("{identity}.activity.lock"));
+        // One process holds the lock (the shell execs into sleep, keeping fd
+        // 9), so killing it frees the lock. `flock <file> sleep` would leave
+        // the lock with the surviving sleep child: the very inheritance the
+        // probe relies on to see a live execution.
+        let mut holder = Command::new("sh")
+            .arg("-c")
+            .arg("exec 9>\"$1\" && flock -x 9 && exec sleep 30")
+            .arg("lock-holder")
+            .arg(&lock)
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while Command::new("flock")
+            .args(["-n"])
+            .arg(&lock)
+            .arg("true")
+            .status()
+            .unwrap()
+            .success()
+        {
+            assert!(std::time::Instant::now() < deadline, "holder never locked");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(probe(&registry), "RCH_EXEC_ACTIVE", "lock held");
+        holder.kill().unwrap();
+        holder.wait().unwrap();
+
+        std::fs::write(&receipt, "id 0\n").unwrap();
+        assert_eq!(probe(&registry), "RCH_EXEC_COMPLETED", "receipt present");
     }
 
     #[cfg(target_os = "linux")]
