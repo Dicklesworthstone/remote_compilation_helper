@@ -265,6 +265,13 @@ fn classify_remote_pipeline_failure(error: &anyhow::Error) -> RemotePipelineFail
     }
 }
 
+fn release_unconfirmed_error(worker_id: &WorkerId, build_id: u64) -> anyhow::Error {
+    anyhow::anyhow!(
+        "daemon release for build {build_id} on {worker_id} was not acknowledged; ownership remains uncertain and the command must not be replayed"
+    )
+    .context(crate::transfer::RemoteExecutionUnconfirmed)
+}
+
 fn is_remote_execution_unconfirmed(error: &anyhow::Error) -> bool {
     // Anyhow downcasting also finds a typed context, preserving the original
     // ownership/transport error beneath the no-replay classification.
@@ -3448,7 +3455,18 @@ pub async fn run_exec(
             }
         };
         if let Ok(result) = result.as_ref() {
+            // Persist the observed command result even when the daemon's release
+            // acknowledgement is lost. Recovery then knows the command outcome
+            // without pretending its reservation/ownership was retired.
             durable_lease.record_exit(result.exit_code)?;
+        }
+        if !retain_unconfirmed_ownership && !release_acknowledged {
+            if let Err(persist_error) = durable_lease.heartbeat("release_unconfirmed") {
+                return Err(release_unconfirmed_error(&worker.id, remote_build_id).context(
+                    format!("could not persist release uncertainty in the durable lease: {persist_error}"),
+                ));
+            }
+            return Err(release_unconfirmed_error(&worker.id, remote_build_id));
         }
 
         // Classify the outcome. Terminal cases (success, real build/test failure,

@@ -3728,6 +3728,22 @@ fn test_remote_pipeline_failure_policy_non_timeout_allows_existing_fallback() {
 }
 
 #[test]
+fn test_unacknowledged_release_is_a_typed_no_replay_error() {
+    let _guard = test_guard!();
+    let error = release_unconfirmed_error(&WorkerId::new("worker-a"), 42);
+
+    assert!(is_remote_execution_unconfirmed(&error));
+    assert_eq!(
+        classify_remote_pipeline_failure(&error),
+        RemotePipelineFailurePolicy::FailClosedNoLocalFallback
+    );
+    let message = format!("{error:#}");
+    assert!(message.contains("build 42"));
+    assert!(message.contains("worker-a"));
+    assert!(message.contains("must not be replayed"));
+}
+
+#[test]
 fn test_unconfirmed_remote_execution_retains_ownership_and_never_falls_back() {
     let _guard = test_guard!();
     for error in [
