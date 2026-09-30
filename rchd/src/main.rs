@@ -313,6 +313,99 @@ enum BindAttempt {
     SocketHeld,
 }
 
+/// Load durable build history. An ownership snapshot that cannot be trusted,
+/// because it is contradictory (057bb508's validation), malformed or truncated,
+/// is moved aside and the daemon starts without it (bd-tqmak). Refusing to
+/// start turned one bad file into a systemd/launchd restart loop that refused
+/// every build on the dispatcher. Correctness does not rest on this snapshot
+/// alone: workers keep their own source-authority claims, which fence
+/// overlapping builds, and client leases are recovered separately (bd-nalyr).
+/// The rejected file is kept for diagnosis. Any other error still fails startup.
+fn load_history_quarantining_invalid_ownership(
+    history_path: &Path,
+    capacity: usize,
+) -> Result<BuildHistory> {
+    let context = || {
+        format!(
+            "Cannot recover durable ownership from {}",
+            history_path.display()
+        )
+    };
+    let error = match BuildHistory::load_from_file(history_path, capacity) {
+        Ok(history) => return Ok(history),
+        Err(error) => error,
+    };
+    if !matches!(
+        error.kind(),
+        std::io::ErrorKind::InvalidData | std::io::ErrorKind::UnexpectedEof
+    ) {
+        return Err(error).with_context(context);
+    }
+    let snapshot = history_path.with_extension("ownership.json");
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let rejected = snapshot.with_extension(format!("json.rejected-{stamp}"));
+    std::fs::rename(&snapshot, &rejected)
+        .with_context(|| format!("{}; also could not set the snapshot aside", context()))?;
+    error!(
+        snapshot = %snapshot.display(),
+        rejected = %rejected.display(),
+        reason = %error,
+        untracked_builds = %untracked_active_builds(&rejected),
+        "Durable ownership snapshot rejected and set aside; starting without it. \
+         The builds it recorded as active are no longer tracked by this daemon \
+         (worker-side source claims still fence them); recover or cancel them \
+         from their clients. Inspect the rejected file."
+    );
+    BuildHistory::load_from_file(history_path, capacity).with_context(context)
+}
+
+/// Best-effort summary of the active builds in a rejected ownership snapshot
+/// (`id@worker[wrapper]`, at most 50), so an operator can find them. The file
+/// may be malformed, which is why it was rejected; then say so.
+fn untracked_active_builds(rejected: &Path) -> String {
+    let Some(snapshot) = std::fs::read(rejected)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+    else {
+        return "unreadable snapshot".to_owned();
+    };
+    let active = snapshot
+        .get("active")
+        .and_then(|value| value.as_array())
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    if active.is_empty() {
+        return "none".to_owned();
+    }
+    let mut listed: Vec<String> = active
+        .iter()
+        .take(50)
+        .map(|build| {
+            format!(
+                "{}@{}[{}]",
+                build
+                    .get("id")
+                    .map_or_else(|| "?".to_owned(), ToString::to_string),
+                build
+                    .get("worker_id")
+                    .and_then(|worker| worker.as_str())
+                    .unwrap_or("?"),
+                build
+                    .get("local_wrapper_id")
+                    .and_then(|wrapper| wrapper.as_str())
+                    .unwrap_or("-"),
+            )
+        })
+        .collect();
+    if active.len() > listed.len() {
+        listed.push(format!("... {} more", active.len() - listed.len()));
+    }
+    listed.join(", ")
+}
+
 /// The owning process a test harness asked this daemon to follow, from
 /// `RCH_EXIT_WITH_PARENT_PID`. Pids 0 and 1 are refused: init never exits, and
 /// 0 would address the process group.
@@ -1061,13 +1154,7 @@ async fn main() -> Result<()> {
         .clone()
         .unwrap_or_else(|| cli.socket.with_extension("history.jsonl"));
     let history = Arc::new(
-        BuildHistory::load_from_file(&history_path, cli.history_capacity)
-            .with_context(|| {
-                format!(
-                    "Cannot recover durable ownership from {}",
-                    history_path.display()
-                )
-            })?
+        load_history_quarantining_invalid_ownership(&history_path, cli.history_capacity)?
             .with_max_queue_depth(daemon_config.queue.max_depth),
     );
     for build in history.active_builds() {
@@ -1840,6 +1927,83 @@ mod tests {
         ] {
             assert_eq!(parse_exit_with_parent_pid(refused), None, "{refused:?}");
         }
+    }
+
+    /// bd-tqmak: a contradictory ownership snapshot (the duplicate-wrapper case
+    /// 057bb508 rejects) must not stop the daemon from starting. It is set aside
+    /// byte-for-byte, the daemon loads without it, and the builds it recorded
+    /// are named for the operator.
+    #[test]
+    fn contradictory_ownership_snapshot_is_set_aside_and_startup_proceeds() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("history.jsonl");
+        let history = BuildHistory::new(10).with_persistence(path.clone());
+        let original = history.start_active_build_with_wrapper(
+            "quarantine-project".into(),
+            "worker-a".into(),
+            "cargo check".into(),
+            std::process::id(),
+            Some("owner-1".into()),
+            2,
+            rch_common::BuildLocation::Remote,
+        );
+        drop(history);
+        let snapshot_path = path.with_extension("ownership.json");
+        let mut snapshot: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&snapshot_path).unwrap()).unwrap();
+        let mut duplicate = snapshot["active"][0].clone();
+        duplicate["id"] = serde_json::json!(original.id + 1);
+        duplicate["worker_id"] = serde_json::json!("worker-b");
+        snapshot["active"].as_array_mut().unwrap().push(duplicate);
+        let contradictory = serde_json::to_vec(&snapshot).unwrap();
+        std::fs::write(&snapshot_path, &contradictory).unwrap();
+        // The unwrapped loader still refuses it, as 057bb508 intends.
+        assert!(BuildHistory::load_from_file(&path, 10).is_err());
+
+        let history = load_history_quarantining_invalid_ownership(&path, 10)
+            .expect("startup proceeds past a contradictory snapshot");
+        assert!(history.active_builds().is_empty());
+        let rejected: Vec<_> = std::fs::read_dir(root.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|p| p.to_string_lossy().contains(".ownership.json.rejected-"))
+            .collect();
+        assert_eq!(rejected.len(), 1, "{rejected:?}");
+        assert_eq!(std::fs::read(&rejected[0]).unwrap(), contradictory);
+        let untracked = untracked_active_builds(&rejected[0]);
+        assert!(untracked.contains(&format!("{}@worker-a[owner-1]", original.id)));
+        assert!(untracked.contains(&format!("{}@worker-b[owner-1]", original.id + 1)));
+    }
+
+    /// Malformed or truncated snapshots are set aside too. Only a readable,
+    /// valid snapshot, or none at all, loads without quarantine.
+    #[test]
+    fn malformed_ownership_snapshot_is_set_aside() {
+        for body in [&b"{\"version\": 2, \"active\": ["[..], &b"not json"[..]] {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("history.jsonl");
+            std::fs::write(path.with_extension("ownership.json"), body).unwrap();
+            load_history_quarantining_invalid_ownership(&path, 10)
+                .expect("startup proceeds past a malformed snapshot");
+            assert!(!path.with_extension("ownership.json").exists());
+            let rejected = std::fs::read_dir(root.path())
+                .unwrap()
+                .filter(|entry| {
+                    entry
+                        .as_ref()
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .contains("rejected-")
+                })
+                .count();
+            assert_eq!(rejected, 1);
+        }
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("history.jsonl");
+        load_history_quarantining_invalid_ownership(&path, 10)
+            .expect("no snapshot is a clean start");
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
     }
 
     #[test]
