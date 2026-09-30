@@ -512,9 +512,9 @@ impl BuildHistory {
         }
         if state.local_wrapper_id.as_deref().is_some_and(|wrapper| {
             wrapper.is_empty()
-                || active.values().any(|existing| {
-                    existing.local_wrapper_id.as_deref() == Some(wrapper)
-                })
+                || active
+                    .values()
+                    .any(|existing| existing.local_wrapper_id.as_deref() == Some(wrapper))
         }) {
             // A durable wrapper identity is a single live execution authority.
             // Allowing the same wrapper onto two workers makes a lost selection
