@@ -43,8 +43,7 @@ pub(super) fn serve_reply(coord: &EdgeSubscriber, request: &Value) -> String {
 /// untrusted symlink into a different destination. The materializer retains
 /// its existing destination preflight and ownership checks.
 fn derive_frame(request: &Value) -> Result<Value, String> {
-    if request.get("expected_outputs").is_some()
-        || request.get("expected_outputs_bytes").is_some()
+    if request.get("expected_outputs").is_some() || request.get("expected_outputs_bytes").is_some()
     {
         return Err("rustc_invocation and expected_outputs are mutually exclusive".into());
     }
@@ -71,16 +70,20 @@ fn derive_frame(request: &Value) -> Result<Value, String> {
             && !path.as_os_str().as_bytes().contains(&0)
     };
     if !absolute_directory(cwd) || !absolute_directory(destination) {
-        return Err("cwd and destination_root must be absolute, NUL-free and traversal-free".into());
+        return Err(
+            "cwd and destination_root must be absolute, NUL-free and traversal-free".into(),
+        );
     }
-    let invocation = parse(&spec.argv, None)
-        .map_err(|error| format!("invalid rustc argv: {error:?}"))?;
+    let invocation =
+        parse(&spec.argv, None).map_err(|error| format!("invalid rustc argv: {error:?}"))?;
     let declarations = derive_dependency_output_declarations(&invocation, &spec.host_target)
         .map_err(|error| error.to_string())?;
     let out_dir = invocation.out_dir.as_deref().ok_or("missing --out-dir")?;
     let out_dir = cwd.join(out_dir);
     if !absolute_directory(&out_dir) || out_dir != destination {
-        return Err("destination_root must equal --out-dir resolved against rustc_invocation.cwd".into());
+        return Err(
+            "destination_root must equal --out-dir resolved against rustc_invocation.cwd".into(),
+        );
     }
 
     let mut frame = request.clone();
@@ -91,10 +94,15 @@ fn derive_frame(request: &Value) -> Result<Value, String> {
             .map(|output| output.virtual_path.as_str())
             .collect::<Vec<_>>()
     );
-    if declarations.declarations.iter().any(|output| output.class == OutputClass::DepInfo) {
+    if declarations
+        .declarations
+        .iter()
+        .any(|output| output.class == OutputClass::DepInfo)
+    {
         let mut mappings = match request.get("dep_info_mappings") {
-            Some(value) => super::parse_dep_info_mappings(value)
-                .ok_or("invalid dep_info_mappings")?,
+            Some(value) => {
+                super::parse_dep_info_mappings(value).ok_or("invalid dep_info_mappings")?
+            }
             None => Vec::new(),
         };
         // `.` has explicit semantics in the existing live dep-info adapter.
@@ -104,11 +112,16 @@ fn derive_frame(request: &Value) -> Result<Value, String> {
                 return Err("relative dep-info mapping disagrees with rustc_invocation.cwd".into());
             }
         }
-        if !mappings.iter().any(|(canonical, _)| canonical.as_slice() == b".") {
+        if !mappings
+            .iter()
+            .any(|(canonical, _)| canonical.as_slice() == b".")
+        {
             mappings.push((b".".to_vec(), spec.cwd.as_bytes().to_vec()));
         }
         if mappings.len() > 64 {
-            return Err("dep-info mappings leave no room for the compiler working directory".into());
+            return Err(
+                "dep-info mappings leave no room for the compiler working directory".into(),
+            );
         }
         // Retain Unix bytes in explicitly supplied canonical mappings. The
         // live materializer validates mapping grammar, coverage and expansion.
@@ -139,14 +152,18 @@ mod tests {
     fn build_and_check_derive_complete_sets_and_bind_relative_dep_info_in_two_worktrees() {
         for root in ["/first worktree", "/second worktree"] {
             let build = derive_frame(&request(root, "dep-info,metadata,link")).unwrap();
-            assert_eq!(build["expected_outputs"], json!([
-                "foo-123.d", "libfoo-123.rmeta", "libfoo-123.rlib"
-            ]));
-            let mappings = super::super::parse_dep_info_mappings(&build["dep_info_mappings"])
-                .unwrap();
+            assert_eq!(
+                build["expected_outputs"],
+                json!(["foo-123.d", "libfoo-123.rmeta", "libfoo-123.rlib"])
+            );
+            let mappings =
+                super::super::parse_dep_info_mappings(&build["dep_info_mappings"]).unwrap();
             assert_eq!(mappings, vec![(b".".to_vec(), root.as_bytes().to_vec())]);
             let check = derive_frame(&request(root, "dep-info,metadata")).unwrap();
-            assert_eq!(check["expected_outputs"], json!(["foo-123.d", "libfoo-123.rmeta"]));
+            assert_eq!(
+                check["expected_outputs"],
+                json!(["foo-123.d", "libfoo-123.rmeta"])
+            );
         }
     }
 
@@ -155,7 +172,12 @@ mod tests {
         let mut frame = request("/workspace", "link");
         frame["rustc_invocation"]["argv"][8] = json!("/workspace/target/debug/deps");
         assert!(derive_frame(&frame).is_ok());
-        for destination in ["/elsewhere", "relative", "/workspace/../elsewhere", "/bad\0path"] {
+        for destination in [
+            "/elsewhere",
+            "relative",
+            "/workspace/../elsewhere",
+            "/bad\0path",
+        ] {
             frame["destination_root"] = json!(destination);
             assert!(derive_frame(&frame).is_err(), "{destination:?}");
         }
@@ -171,12 +193,18 @@ mod tests {
         }
         for field in ["argv", "cwd", "host_target"] {
             let mut frame = original.clone();
-            frame["rustc_invocation"].as_object_mut().unwrap().remove(field);
+            frame["rustc_invocation"]
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
             assert!(derive_frame(&frame).is_err());
         }
         for argument in [json!(null), json!(17), json!("bad\0argument")] {
             let mut frame = original.clone();
-            frame["rustc_invocation"]["argv"].as_array_mut().unwrap().push(argument);
+            frame["rustc_invocation"]["argv"]
+                .as_array_mut()
+                .unwrap()
+                .push(argument);
             assert!(derive_frame(&frame).is_err());
         }
         let mut frame = original.clone();
@@ -200,8 +228,8 @@ mod tests {
         let raw = b"/source/\xff".to_vec();
         frame["dep_info_mappings"] = json!([["/__rabs/workspace", raw]]);
         let derived = derive_frame(&frame).unwrap();
-        let mappings = super::super::parse_dep_info_mappings(&derived["dep_info_mappings"])
-            .unwrap();
+        let mappings =
+            super::super::parse_dep_info_mappings(&derived["dep_info_mappings"]).unwrap();
         assert_eq!(mappings[0], (b"/__rabs/workspace".to_vec(), raw));
         frame["dep_info_mappings"] = json!([[".", "/different"]]);
         assert!(derive_frame(&frame).is_err());
@@ -215,11 +243,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let coord = Arc::new(crate::coord::live::CoordLive::new());
         let original = request(dir.path().to_str().unwrap(), "dep-info,metadata,link");
-        for flag in ["--test", "-Csave-temps=yes", "-Cincremental=state", "--print=file-names"] {
+        for flag in [
+            "--test",
+            "-Csave-temps=yes",
+            "-Cincremental=state",
+            "--print=file-names",
+        ] {
             let mut frame = original.clone();
-            frame["rustc_invocation"]["argv"].as_array_mut().unwrap().push(json!(flag));
-            let reply: Value = serde_json::from_str(&serve_reply(&coord.edge_subscriber(), &frame))
-                .unwrap();
+            frame["rustc_invocation"]["argv"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!(flag));
+            let reply: Value =
+                serde_json::from_str(&serve_reply(&coord.edge_subscriber(), &frame)).unwrap();
             assert_eq!(reply["reason"], "unsupported-rustc-outputs");
             assert_eq!(reply["materialization_started"], false);
             assert_eq!(reply["compiler_skip_authorized"], false);
@@ -228,8 +264,8 @@ mod tests {
         }
         // Supported derivation reaches the real coordinator, not a fabricated
         // hit. With no committed action there can be no installed artifact.
-        let reply: Value = serde_json::from_str(&serve_reply(&coord.edge_subscriber(), &original))
-            .unwrap();
+        let reply: Value =
+            serde_json::from_str(&serve_reply(&coord.edge_subscriber(), &original)).unwrap();
         assert_eq!(reply["kind"], "serve-result");
         assert_ne!(reply["outcome"], "served");
         assert!(!dir.path().join("target").exists());
@@ -242,9 +278,13 @@ mod tests {
         let mut frame = request(dir.path().to_str().unwrap(), "link");
         frame["rustc_invocation"] = Value::Null;
         let lane = super::super::Limit::new(1);
-        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
         let reply = runtime.block_on(super::super::serve_on_lane(
-            &lane, coord.edge_subscriber(), frame,
+            &lane,
+            coord.edge_subscriber(),
+            frame,
         ));
         let reply: Value = serde_json::from_str(&reply).unwrap();
         assert_eq!(reply["reason"], "unsupported-rustc-outputs");
@@ -259,11 +299,12 @@ mod tests {
             sample_expected_descriptor,
         };
         let dir = tempfile::tempdir().unwrap();
-        let cas = Arc::new(
-            crate::janitor::store::mount_and_reconcile(&dir.path().join("cas")).unwrap(),
-        );
+        let cas =
+            Arc::new(crate::janitor::store::mount_and_reconcile(&dir.path().join("cas")).unwrap());
         let coord = Arc::new(crate::coord::live::CoordLive::with_cas(Arc::clone(&cas)));
-        let authority = coord.acquire_boot_authority("derived-output-fixture").unwrap();
+        let authority = coord
+            .acquire_boot_authority("derived-output-fixture")
+            .unwrap();
         coord.mark_up();
         let offer = offer_under(&authority);
         {
@@ -271,16 +312,28 @@ mod tests {
             install_admission_world(&mut *store, &authority);
             install_offer_closure(&mut *store, &offer);
         }
-        coord.commit_offer(&offer, &sample_expected_descriptor()).unwrap();
+        coord
+            .commit_offer(&offer, &sample_expected_descriptor())
+            .unwrap();
         let mut frame = request(dir.path().to_str().unwrap(), "link");
-        frame["action_key"] = json!(sample_action_key().bytes.iter()
-            .map(|byte| format!("{byte:02x}")).collect::<String>());
+        frame["action_key"] = json!(
+            sample_action_key()
+                .bytes
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
         frame["verified"] = json!(true);
         frame["min_samples"] = json!(0);
-        let reply: Value = serde_json::from_str(&serve_reply(&coord.edge_subscriber(), &frame))
-            .unwrap();
+        let reply: Value =
+            serde_json::from_str(&serve_reply(&coord.edge_subscriber(), &frame)).unwrap();
         assert_eq!(reply["outcome"], "execute-privately");
-        assert!(reply["reason"].as_str().unwrap().contains("ElevatedClassRisk"));
+        assert!(
+            reply["reason"]
+                .as_str()
+                .unwrap()
+                .contains("ElevatedClassRisk")
+        );
         assert!(!dir.path().join("target").exists());
     }
 }

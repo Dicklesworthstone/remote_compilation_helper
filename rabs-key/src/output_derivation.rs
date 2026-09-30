@@ -339,9 +339,9 @@ pub fn derive_dependency_output_declarations(
     for output in &declarations.declarations {
         let name = &output.virtual_path;
         if name.len() > 255
-            || !name.bytes().all(|byte| {
-                byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.')
-            })
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
         {
             return Err(DerivationRefusal::UnsafeOutputName(name.clone()));
         }
@@ -669,8 +669,11 @@ mod tests {
             vec!["--json"],
         ] {
             assert!(
-                derive_dependency_output_declarations(&dependency(&args), "x86_64-unknown-linux-gnu")
-                    .is_err(),
+                derive_dependency_output_declarations(
+                    &dependency(&args),
+                    "x86_64-unknown-linux-gnu"
+                )
+                .is_err(),
                 "unmodeled output effects must refuse: {args:?}"
             );
         }
@@ -717,16 +720,25 @@ mod tests {
 
     #[test]
     fn dependency_serving_never_derives_a_path_from_extra_filename() {
-        for suffix in ["../../escape", "/absolute", "\\windows", "\0", "\n", " space"] {
+        for suffix in [
+            "../../escape",
+            "/absolute",
+            "\\windows",
+            "\0",
+            "\n",
+            " space",
+        ] {
             let mut inv = dependency(&[]);
-            inv.codegen.push(("extra-filename".into(), Some(suffix.into())));
+            inv.codegen
+                .push(("extra-filename".into(), Some(suffix.into())));
             assert!(matches!(
                 derive_dependency_output_declarations(&inv, "x86_64-unknown-linux-gnu"),
                 Err(DerivationRefusal::UnsafeOutputName(_))
             ));
         }
         let mut inv = dependency(&[]);
-        inv.codegen.push(("extra-filename".into(), Some("x".repeat(256))));
+        inv.codegen
+            .push(("extra-filename".into(), Some("x".repeat(256))));
         assert!(matches!(
             derive_dependency_output_declarations(&inv, "x86_64-unknown-linux-gnu"),
             Err(DerivationRefusal::UnsafeOutputName(_))
