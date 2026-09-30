@@ -2621,12 +2621,20 @@ impl WorkerSelector {
         if has_preferred && !preferred_without_health.is_empty() {
             return Ok(preferred_without_health);
         }
-        if has_preferred && filtered_by_slots > 0 {
+        if has_preferred && (filtered_by_slots > 0 || filtered_by_active_project > 0) {
             // Returning an empty eligible set maps to AllWorkersBusy in
             // select_with_exclusions. That keeps RCH_QUEUE_WHEN_BUSY polling
             // the same requested allow-set instead of selecting an unrelated
             // worker. If several workers were requested, one busy requested
             // worker is enough to make waiting useful.
+            //
+            // A pinned worker that is already running this project is the
+            // same kind of transient: the one-active-job-per-project-per-worker
+            // guard clears when that job ends. Refusing on the spot made
+            // pinned agents retry in tight loops (~190 refusals/24h on
+            // 2026-09-30, one agent 112 times in 19 min against hz4). The
+            // guard itself is unchanged; the request only waits for it.
+            // Unpinned requests keep their immediate verdict and diagnostics.
             //
             // bd-uw4d8: this branch MUST come before the specific-refusal
             // fall-through below — the bd-iupei allow-set enforcement once
@@ -6302,6 +6310,57 @@ mod tests {
         assert_eq!(selected.config.read().await.id.as_str(), "nix-1");
     }
 
+    /// A request pinned to a worker that already runs this project queues
+    /// (AllWorkersBusy) instead of being refused. The guard still keeps the
+    /// second job off that worker; the request waits until it clears.
+    #[tokio::test]
+    async fn pinned_worker_running_this_project_queues_instead_of_refusing() {
+        let pool = WorkerPool::new();
+        let pinned = make_worker("pinned-rust", 8, 80.0);
+        pinned
+            .set_capabilities(rch_common::WorkerCapabilities {
+                rustc_version: Some("1.97.0-nightly".to_string()),
+                ..Default::default()
+            })
+            .await;
+        pool.add_worker_state(pinned).await;
+
+        let selector = WorkerSelector::default();
+        let request = SelectionRequest {
+            job_mode: false,
+            project: "frankenterm".to_string(),
+            command: Some("cargo test".to_string()),
+            command_priority: CommandPriority::Normal,
+            estimated_cores: 2,
+            preferred_workers: vec![WorkerId::new("pinned-rust")],
+            toolchain: None,
+            required_runtime: RequiredRuntime::Rust,
+            classification_duration_us: None,
+            hook_pid: None,
+            required_tools: Vec::new(),
+        };
+        let mut excluded_worker_ids = HashSet::new();
+        excluded_worker_ids.insert("pinned-rust".to_string());
+
+        let result = selector
+            .select_with_exclusions(&pool, &request, &excluded_worker_ids)
+            .await;
+        assert!(
+            result.worker.is_none(),
+            "the guard still excludes the worker"
+        );
+        assert_eq!(result.reason, SelectionReason::AllWorkersBusy);
+
+        // Once that job ends the same pinned request is admitted.
+        let result = selector
+            .select_with_exclusions(&pool, &request, &HashSet::new())
+            .await;
+        let selected = result
+            .worker
+            .expect("pinned worker is admitted once the project's job ends");
+        assert_eq!(selected.config.read().await.id.as_str(), "pinned-rust");
+    }
+
     #[tokio::test]
     async fn test_active_project_exclusion_preserves_runtime_reason() {
         let pool = WorkerPool::new();
@@ -7782,13 +7841,15 @@ mod tests {
         let result = selector
             .select_with_exclusions(&pool, &request, &excluded)
             .await;
+        // Never escapes the allow-set to "available". The exclusion is
+        // transient, so the pinned request queues for "requested" rather than
+        // being refused, and the diagnostics still record why it is waiting.
         assert!(result.worker.is_none());
-        assert!(matches!(
-            result.reason,
-            SelectionReason::NoAdmissibleWorkers(ref summary)
-                if summary.contains("active_project_exclusion=1")
-        ));
-        assert!(result.diagnostics.is_some());
+        assert_eq!(result.reason, SelectionReason::AllWorkersBusy);
+        let diagnostics = result
+            .diagnostics
+            .expect("a queued pinned request keeps its diagnostics");
+        assert_eq!(diagnostics.active_project_exclusion_count, 1);
     }
 
     #[tokio::test]
