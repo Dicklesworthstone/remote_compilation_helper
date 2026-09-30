@@ -29,7 +29,7 @@
 //! `tests/output_derivation_conformance.rs` runs each invocation shape
 //! for real and compares the produced file set to the derived one.
 
-use crate::invocation::NormalizedRustcInvocation;
+use crate::invocation::{NormalizedRustcInvocation, SourceInput};
 use crate::output_declarations::{OutputClass, OutputDeclaration, OutputDeclarationSet};
 
 /// Why an invocation's outputs could not be derived. Each one means
@@ -51,6 +51,12 @@ pub enum DerivationRefusal {
     ExplicitEmitPath(String),
     /// A target triple whose file-naming family is not encoded here.
     UnknownTargetFamily(String),
+    /// The invocation is outside the first file-only dependency serving lane.
+    UnsupportedDependencyInvocation(&'static str),
+    /// An option may add outputs, redirect them, or suppress compilation.
+    UnsupportedOutputOption(String),
+    /// A generated name is not a bounded, portable single path component.
+    UnsafeOutputName(String),
 }
 
 impl std::fmt::Display for DerivationRefusal {
@@ -62,6 +68,11 @@ impl std::fmt::Display for DerivationRefusal {
             Self::UnknownEmitKind(e) => write!(f, "unknown --emit kind {e:?}"),
             Self::ExplicitEmitPath(e) => write!(f, "--emit with an explicit path: {e:?}"),
             Self::UnknownTargetFamily(t) => write!(f, "no naming rules for target {t:?}"),
+            Self::UnsupportedDependencyInvocation(reason) => write!(f, "{reason}"),
+            Self::UnsupportedOutputOption(option) => {
+                write!(f, "output effects are not modeled for {option:?}")
+            }
+            Self::UnsafeOutputName(name) => write!(f, "unsafe output filename {name:?}"),
         }
     }
 }
@@ -248,6 +259,149 @@ pub fn derive_output_declarations(
         }
     }
     Ok(OutputDeclarationSet { declarations })
+}
+
+/// Derive the complete file set for the first Cargo dependency serving lane
+/// (bd-14t4j), rather than treating a naming table as an output-closure proof.
+///
+/// Supported here: ordinary Linux `lib`/`rlib` invocations producing link,
+/// metadata and/or dep-info files. Unknown flags are safe to retain in a key,
+/// but NOT safe to ignore when predicting the complete set of writes. In
+/// particular `--test`, `-o`, response files, incremental state, save-temps,
+/// split-debug sidecars and unstable output modes cannot use this adapter.
+/// The general naming helper remains available for non-serving consumers.
+///
+/// This derives outputs only. It does not establish immutable inputs, validate
+/// successful execution, bind a toolchain identity, or authorize compiler skip
+/// or local fallback after delivery. Those remain separate serving gates.
+pub fn derive_dependency_output_declarations(
+    invocation: &NormalizedRustcInvocation,
+    host_target: &str,
+) -> Result<OutputDeclarationSet, DerivationRefusal> {
+    let unsupported = DerivationRefusal::UnsupportedDependencyInvocation;
+    let compiler = invocation.compiler_argv0.rsplit(['/', '\\']).next();
+    if !matches!(compiler, Some("rustc" | "rustc.exe"))
+        || !invocation.wrapper_chain.is_empty()
+        || !invocation.stripped_wrapper_flags.is_empty()
+    {
+        return Err(unsupported(
+            "dependency outputs require an unwrapped rustc invocation",
+        ));
+    }
+    if !matches!(&invocation.source, Some(SourceInput::Path(path)) if !path.starts_with('@')) {
+        return Err(unsupported(
+            "dependency outputs require an explicit source file",
+        ));
+    }
+    if invocation.out_dir.as_deref().is_none_or(str::is_empty) {
+        return Err(unsupported("dependency outputs require --out-dir"));
+    }
+    if invocation.crate_types.is_empty()
+        || invocation
+            .crate_types
+            .iter()
+            .any(|kind| !matches!(kind.as_str(), "lib" | "rlib"))
+    {
+        return Err(unsupported(
+            "dependency outputs require --crate-type lib or rlib",
+        ));
+    }
+    let target = invocation.target.as_deref().unwrap_or(host_target);
+    if !matches!(
+        target,
+        "x86_64-unknown-linux-gnu"
+            | "x86_64-unknown-linux-musl"
+            | "aarch64-unknown-linux-gnu"
+            | "aarch64-unknown-linux-musl"
+    ) {
+        return Err(DerivationRefusal::UnknownTargetFamily(target.to_owned()));
+    }
+    let name = invocation
+        .crate_name
+        .as_deref()
+        .ok_or(DerivationRefusal::NoCrateName)?;
+    if name.is_empty()
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    {
+        return Err(DerivationRefusal::UnsafeOutputName(name.to_owned()));
+    }
+    for kind in emit_kinds(invocation)? {
+        if !matches!(kind.as_str(), "link" | "metadata" | "dep-info") {
+            return Err(DerivationRefusal::UnsupportedOutputOption(format!(
+                "--emit={kind}"
+            )));
+        }
+    }
+    check_dependency_output_options(invocation)?;
+    let declarations = derive_output_declarations(invocation, host_target)?;
+    for output in &declarations.declarations {
+        let name = &output.virtual_path;
+        if name.len() > 255
+            || !name.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.')
+            })
+        {
+            return Err(DerivationRefusal::UnsafeOutputName(name.clone()));
+        }
+    }
+    Ok(declarations)
+}
+
+fn check_dependency_output_options(
+    invocation: &NormalizedRustcInvocation,
+) -> Result<(), DerivationRefusal> {
+    if let Some((name, _)) = invocation.unstable.first() {
+        return Err(DerivationRefusal::UnsupportedOutputOption(format!(
+            "-Z {name}"
+        )));
+    }
+    for (name, value) in &invocation.codegen {
+        // This is an allowlist of output-neutral controls for an rlib, not a
+        // denylist that would silently admit a future rustc output option.
+        let modeled = matches!(
+            name.as_str(),
+            "opt-level"
+                | "debuginfo"
+                | "debug-assertions"
+                | "overflow-checks"
+                | "panic"
+                | "metadata"
+                | "extra-filename"
+                | "embed-bitcode"
+                | "codegen-units"
+                | "strip"
+                | "target-cpu"
+                | "target-feature"
+                | "relocation-model"
+                | "code-model"
+                | "force-frame-pointers"
+                | "force-unwind-tables"
+                | "lto"
+        ) || (name == "split-debuginfo" && value.as_deref() == Some("off"));
+        if !modeled {
+            return Err(DerivationRefusal::UnsupportedOutputOption(format!(
+                "-C {name}"
+            )));
+        }
+    }
+    let mut passthrough = invocation.passthrough.iter();
+    while let Some(arg) = passthrough.next() {
+        let (name, inline) = arg
+            .split_once('=')
+            .map_or((arg.as_str(), None), |(name, value)| (name, Some(value)));
+        if !matches!(
+            name,
+            "--error-format" | "--json" | "--check-cfg" | "--remap-path-prefix" | "--sysroot"
+        ) || inline
+            .or_else(|| passthrough.next().map(String::as_str))
+            .is_none_or(str::is_empty)
+        {
+            return Err(DerivationRefusal::UnsupportedOutputOption(arg.clone()));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -451,5 +605,131 @@ mod tests {
             .declaration_digest()
             .expect("digest");
         assert_ne!(digest, other);
+    }
+
+    fn dependency(extra: &[&str]) -> NormalizedRustcInvocation {
+        let mut args = vec![
+            "--crate-name",
+            "foo",
+            "--crate-type",
+            "lib",
+            "--emit=dep-info,metadata,link",
+            "--out-dir",
+            "/work/target/debug/deps",
+            "-C",
+            "extra-filename=-123",
+            "src/lib.rs",
+        ];
+        args.extend_from_slice(extra);
+        invocation(&args)
+    }
+
+    #[test]
+    fn dependency_serving_derives_cargo_build_and_check_outputs() {
+        let mut inv = dependency(&[
+            "--error-format=json",
+            "--json=diagnostic-rendered-ansi,artifacts",
+            "--check-cfg",
+            "cfg(docsrs,test)",
+            "--cap-lints",
+            "allow",
+            "-C",
+            "debuginfo=2",
+            "-C",
+            "embed-bitcode=no",
+        ]);
+        let derive = |inv: &NormalizedRustcInvocation| {
+            derive_dependency_output_declarations(inv, "x86_64-unknown-linux-gnu").unwrap()
+        };
+        assert_eq!(
+            names(&derive(&inv)),
+            vec!["foo-123.d", "libfoo-123.rlib", "libfoo-123.rmeta"]
+        );
+        inv.emit = vec!["dep-info".into(), "metadata".into()];
+        assert_eq!(names(&derive(&inv)), vec!["foo-123.d", "libfoo-123.rmeta"]);
+        inv.out_dir = Some("/another/worktree/target/debug/deps".into());
+        assert_eq!(names(&derive(&inv)), vec!["foo-123.d", "libfoo-123.rmeta"]);
+    }
+
+    #[test]
+    fn dependency_serving_refuses_unmodeled_writes_and_non_compiles() {
+        for args in [
+            vec!["--test"],
+            vec!["-o", "/elsewhere/result"],
+            vec!["-oelsewhere"],
+            vec!["@args"],
+            vec!["--print=file-names"],
+            vec!["--help"],
+            vec!["-C", "incremental=/elsewhere/state"],
+            vec!["-C", "save-temps=yes"],
+            vec!["-C", "split-debuginfo=unpacked"],
+            vec!["-Z", "no-codegen"],
+            vec!["-C", "future-output-option=yes"],
+            vec!["--future-output-option"],
+            vec!["--json"],
+        ] {
+            assert!(
+                derive_dependency_output_declarations(&dependency(&args), "x86_64-unknown-linux-gnu")
+                    .is_err(),
+                "unmodeled output effects must refuse: {args:?}"
+            );
+        }
+        for emit in ["obj", "asm", "llvm-ir", "link=elsewhere", "metadata=-"] {
+            let mut inv = dependency(&[]);
+            inv.emit = vec![emit.into()];
+            assert!(
+                derive_dependency_output_declarations(&inv, "x86_64-unknown-linux-gnu").is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn dependency_serving_requires_source_driver_directory_and_library_shape() {
+        let base = dependency(&[]);
+        let mut variants = Vec::new();
+        let mut inv = base.clone();
+        inv.source = None;
+        variants.push(inv);
+        let mut inv = base.clone();
+        inv.out_dir = None;
+        variants.push(inv);
+        let mut inv = base.clone();
+        inv.compiler_argv0 = "clippy-driver".into();
+        variants.push(inv);
+        let mut inv = base.clone();
+        inv.wrapper_chain.push("sccache".into());
+        variants.push(inv);
+        let mut inv = base.clone();
+        inv.crate_types = vec!["proc-macro".into()];
+        variants.push(inv);
+        let mut inv = base.clone();
+        inv.crate_types.clear();
+        variants.push(inv);
+        let mut inv = base;
+        inv.target = Some("/tmp/x86_64-unknown-linux-gnu.json".into());
+        variants.push(inv);
+        for inv in variants {
+            assert!(
+                derive_dependency_output_declarations(&inv, "x86_64-unknown-linux-gnu").is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn dependency_serving_never_derives_a_path_from_extra_filename() {
+        for suffix in ["../../escape", "/absolute", "\\windows", "\0", "\n", " space"] {
+            let mut inv = dependency(&[]);
+            inv.codegen.push(("extra-filename".into(), Some(suffix.into())));
+            assert!(matches!(
+                derive_dependency_output_declarations(&inv, "x86_64-unknown-linux-gnu"),
+                Err(DerivationRefusal::UnsafeOutputName(_))
+            ));
+        }
+        let mut inv = dependency(&[]);
+        inv.codegen.push(("extra-filename".into(), Some("x".repeat(256))));
+        assert!(matches!(
+            derive_dependency_output_declarations(&inv, "x86_64-unknown-linux-gnu"),
+            Err(DerivationRefusal::UnsafeOutputName(_))
+        ));
     }
 }

@@ -192,3 +192,100 @@ fn a_refusal_is_returned_rather_than_a_wrong_answer() {
         "a link build with no --crate-type must refuse, got {outcome:?}"
     );
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn dependency_serving_declarations_match_real_build_and_check_in_two_roots() {
+    use rabs_key::output_derivation::derive_dependency_output_declarations;
+
+    let dir = tempfile::tempdir().unwrap();
+    let host = host_triple();
+    for emit in ["dep-info,metadata,link", "dep-info,metadata"] {
+        let mut first_digest = None;
+        for root in ["first worktree", "second worktree"] {
+            let worktree = dir.path().join(emit).join(root);
+            std::fs::create_dir_all(&worktree).unwrap();
+            let source = worktree.join("lib.rs");
+            std::fs::write(&source, "pub fn answer() -> u32 { 42 }\n").unwrap();
+            let out_dir = worktree.join("target/debug/deps");
+            let args = case(&[
+                "--crate-name",
+                "foo",
+                "--crate-type",
+                "lib",
+                "--edition=2024",
+                "--emit",
+                emit,
+                "-C",
+                "extra-filename=-123",
+                "-C",
+                "debuginfo=2",
+                "-C",
+                "embed-bitcode=no",
+                "--error-format=json",
+                "--json=diagnostic-rendered-ansi,artifacts",
+                "--check-cfg",
+                "cfg(docsrs,test)",
+            ]);
+            let mut argv = vec!["rustc".to_owned()];
+            argv.extend(args.iter().cloned());
+            argv.extend([
+                "--out-dir".to_owned(),
+                out_dir.to_str().unwrap().to_owned(),
+                source.to_str().unwrap().to_owned(),
+            ]);
+            let invocation = parse(&argv, None).unwrap();
+            let declarations = derive_dependency_output_declarations(&invocation, &host).unwrap();
+            let expected: BTreeSet<_> = declarations
+                .declarations
+                .iter()
+                .map(|output| output.virtual_path.clone())
+                .collect();
+            assert_eq!(expected, actually_produced(&args, &source, &out_dir));
+            let digest = declarations.declaration_digest().unwrap();
+            if let Some(first) = &first_digest {
+                assert_eq!(
+                    first, &digest,
+                    "subscriber root must not rename declared outputs"
+                );
+            } else {
+                first_digest = Some(digest);
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn save_temps_really_adds_files_that_dependency_serving_must_not_omit() {
+    use rabs_key::output_derivation::derive_dependency_output_declarations;
+
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("lib.rs");
+    std::fs::write(&source, "pub fn answer() -> u32 { 42 }\n").unwrap();
+    let out_dir = dir.path().join("out");
+    let args = case(&[
+        "--crate-name",
+        "foo",
+        "--crate-type",
+        "rlib",
+        "--emit=dep-info,metadata,link",
+        "-C",
+        "save-temps=yes",
+    ]);
+    let produced = actually_produced(&args, &source, &out_dir);
+    let named = derived(&args, &source, &host_triple());
+    assert!(
+        !produced.is_subset(&named),
+        "the regression must exercise real extra outputs: {produced:?}"
+    );
+    let mut argv = vec!["rustc".to_owned()];
+    argv.extend(args);
+    argv.extend([
+        "--out-dir".to_owned(),
+        out_dir.to_str().unwrap().to_owned(),
+        source.to_str().unwrap().to_owned(),
+    ]);
+    let invocation = parse(&argv, None).unwrap();
+    assert!(derive_dependency_output_declarations(&invocation, &host_triple()).is_err());
+}
