@@ -19,6 +19,7 @@
 //! is logged.
 
 mod liveness;
+mod rustc_outputs;
 
 use asupersync::cx::Cx;
 use asupersync::io::{AsyncReadExt, AsyncWriteExt};
@@ -715,7 +716,7 @@ async fn serve_on_lane(
     coord: crate::coord::live::EdgeSubscriber,
     request: serde_json::Value,
 ) -> String {
-    match lane.spawn(move || serve_reply(&coord, &request)) {
+    match lane.spawn(move || rustc_outputs::serve_reply(&coord, &request)) {
         Ok(mut work) => match work.wait().await {
             Ok(reply) => reply,
             Err(error) => serve_work_error(&error, true),
