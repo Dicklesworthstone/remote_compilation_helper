@@ -5,7 +5,7 @@ Compilation Helper): the PreToolUse hook + CLI (`rch`), the local daemon (`rchd`
 worker agent (`rch-wkr`), the RABS build sidecar (`rabs-*`, `rabsd`), and the fleet
 dashboard (`dashboard/`).
 
-Scope window: project inception (`v0.1.0`, 2026-01-25) through `v2.1.13` (2026-09-29).
+Scope window: project inception (`v0.1.0`, 2026-01-25) through `v2.1.14` (2026-09-30).
 
 This document was rebuilt from git history (`git log --no-merges` per tag range, `git show`
 on representative commits), version tags (`git for-each-ref`), GitHub release metadata
@@ -28,6 +28,20 @@ history. They are kept as-is because the descriptions were verified against the 
 but those particular links will 404.
 
 Repository: <https://github.com/Dicklesworthstone/remote_compilation_helper>
+
+## 2.1.14 — 2026-09-30
+
+- **A bad ownership snapshot no longer crash-loops the daemon** (`bd-tqmak`).
+  Since 2.1.13, rchd rejects a contradictory durable ownership snapshot, and it
+  already rejected malformed or truncated ones. Either stopped startup, and
+  under systemd or launchd that became a restart loop that refused every build
+  on the dispatcher. The snapshot is now renamed to
+  `*.ownership.json.rejected-<unix-seconds>` byte-for-byte, and an ERROR names
+  the reason and the builds it recorded as active (`id@worker[wrapper]`) so they
+  can be recovered or cancelled from their clients. rchd then starts without
+  it. Worker-side source claims still fence those builds' sources. Other I/O
+  errors still stop startup
+  ([`e78d5613`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/e78d5613953629b5093b51eaa9944bde87936cd6)).
 
 ## 2.1.13 — 2026-09-29
 
