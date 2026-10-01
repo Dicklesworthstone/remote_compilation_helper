@@ -5,7 +5,7 @@ Compilation Helper): the PreToolUse hook + CLI (`rch`), the local daemon (`rchd`
 worker agent (`rch-wkr`), the RABS build sidecar (`rabs-*`, `rabsd`), and the fleet
 dashboard (`dashboard/`).
 
-Scope window: project inception (`v0.1.0`, 2026-01-25) through `v2.1.14` (2026-09-30).
+Scope window: project inception (`v0.1.0`, 2026-01-25) through `v2.1.15` (2026-10-01).
 
 This document was rebuilt from git history (`git log --no-merges` per tag range, `git show`
 on representative commits), version tags (`git for-each-ref`), GitHub release metadata
@@ -28,6 +28,34 @@ history. They are kept as-is because the descriptions were verified against the 
 but those particular links will 404.
 
 Repository: <https://github.com/Dicklesworthstone/remote_compilation_helper>
+
+## 2.1.15 — 2026-10-01
+
+- **A request pinned to a worker already running its project waits instead
+  of being refused.** Pinning with `RCH_WORKER` already queued when the worker
+  was busy, but a worker running the same project was refused on the spot.
+  That was the largest remaining refusal class (~190 a day), and one agent
+  retried 112 times in 19 minutes. The one-job-per-project-per-worker rule is
+  unchanged, and the request never moves to a worker it didn't ask for
+  ([`51a7c4af`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/51a7c4afc758820f040fd8b85356f9e2b589056b)).
+- **Leases whose remote execution provably died are retired.** When the
+  remote supervisor died without writing its completion receipt (reboot, OOM,
+  kill), `rch jobs recover` refused forever, and the dead lease kept a worker
+  source claim that fenced every overlapping build. Recovery now probes the
+  execution's activity lock on the worker. If nothing of the execution is
+  alive (or the registry is gone after a reboot), it releases the source claim
+  and records a build error, without replaying the command
+  ([`ab94bd32`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/ab94bd32087d2b6fe2fc32ab6d0afaa6bc2f3c54)).
+- **One durable wrapper can own only one live execution.** A second admission
+  for the same wrapper id is rejected even on another worker or project,
+  atomically under the history lock, so a lost-selection retry cannot run the
+  same build twice
+  ([`b0feda9d`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/b0feda9db456fad965f45b2f6d91fead4b9de5da)).
+- **An unacknowledged worker release fails closed.** When the daemon's reply
+  to a release is lost, the observed exit code is kept, the lease is marked
+  release-unconfirmed, and a typed error stops failover or local fallback from
+  replaying the command
+  ([`559f387b`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/559f387b8fc406ce64afcca96fca79d3279443d4)).
 
 ## 2.1.14 — 2026-09-30
 
