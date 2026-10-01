@@ -1229,18 +1229,22 @@ async fn handle_connection_with_metrics(
             {
                 (serde_json::json!({"status":"completed","record":record,"local_wrapper_id":local_wrapper_id}).to_string(), "application/json")
             } else {
-                let response = if ctx
+                let owner = ctx
                     .history
                     .active_build(build_id)
-                    .is_some_and(|state| state.local_wrapper_id != local_wrapper_id)
-                    || ctx.history.has_terminal_build(build_id)
-                {
+                    .filter(|state| state.local_wrapper_id != local_wrapper_id);
+                let response = if owner.is_some() || ctx.history.has_terminal_build(build_id) {
                     CancelBuildResponse {
                         status: "error".to_string(),
                         build_id,
                         worker_id: None,
                         project_id: None,
-                        message: Some("build ownership mismatch".to_string()),
+                        message: Some(ownership_mismatch_message(
+                            build_id,
+                            owner
+                                .as_ref()
+                                .map(|state| state.local_wrapper_id.as_deref()),
+                        )),
                         slots_released: 0,
                     }
                 } else {
@@ -3238,6 +3242,27 @@ async fn handle_release_worker(ctx: &DaemonContext, request: ReleaseRequest) -> 
         );
     }
     Ok(())
+}
+
+/// A build-id cancel refused because a durable wrapper owns the build. Name
+/// the owner and the paths that do work, so the operator neither retries a
+/// refusal nor reaches for a daemon restart (which keeps durable ownership).
+/// `owner` is `None` when the build is already terminal, `Some(None)` when an
+/// active build has no wrapper identity.
+fn ownership_mismatch_message(build_id: u64, owner: Option<Option<&str>>) -> String {
+    match owner {
+        Some(Some(wrapper)) => format!(
+            "build ownership mismatch: build {build_id} is owned by wrapper {wrapper}. \
+             Cancel it with `rch jobs cancel {wrapper}`. If that wrapper and its lease are \
+             gone, the stuck detector releases the build on its own once it has been silent \
+             for 15 min (never started remote work) or 6h (started)"
+        ),
+        Some(None) => format!(
+            "build ownership mismatch: build {build_id} has no wrapper identity; cancel it \
+             by build id alone"
+        ),
+        None => format!("build ownership mismatch: build {build_id} has already completed"),
+    }
 }
 
 /// Release handling at or above this logs its per-stage breakdown.
@@ -6761,6 +6786,21 @@ mod tests {
         assert_eq!(response.status, "ok");
         assert_eq!(response.cancelled_count, 0);
         assert!(response.cancelled.is_empty());
+    }
+
+    #[test]
+    fn ownership_mismatch_names_the_owner_and_what_works() {
+        let owned = ownership_mismatch_message(7, Some(Some("rchw-abc")));
+        assert!(owned.contains("rchw-abc"), "{owned}");
+        assert!(owned.contains("rch jobs cancel rchw-abc"), "{owned}");
+        assert!(owned.contains("6h"), "{owned}");
+        let anonymous = ownership_mismatch_message(7, Some(None));
+        assert!(anonymous.contains("no wrapper identity"), "{anonymous}");
+        let done = ownership_mismatch_message(7, None);
+        assert!(done.contains("already completed"), "{done}");
+        for message in [owned, anonymous, done] {
+            assert!(message.starts_with("build ownership mismatch"), "{message}");
+        }
     }
 
     #[tokio::test]
