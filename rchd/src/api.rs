@@ -3140,6 +3140,7 @@ pub(crate) fn lease_blocks_restart(
 
 /// Handle a release-worker request.
 async fn handle_release_worker(ctx: &DaemonContext, request: ReleaseRequest) -> Result<()> {
+    let started = std::time::Instant::now();
     let exit_code = request.exit_code.unwrap_or(0);
     let (release_worker_id, release_slots, record, remote_command_started) =
         if let Some(build_id) = request.build_id {
@@ -3168,6 +3169,7 @@ async fn handle_release_worker(ctx: &DaemonContext, request: ReleaseRequest) -> 
         } else {
             anyhow::bail!("release requires durable build_id; unowned slot release refused")
         };
+    let ownership_done = started.elapsed();
 
     debug!(
         "Releasing {} slots on worker {}",
@@ -3176,6 +3178,7 @@ async fn handle_release_worker(ctx: &DaemonContext, request: ReleaseRequest) -> 
     ctx.pool
         .release_slots(&release_worker_id, release_slots)
         .await;
+    let slots_done = started.elapsed();
 
     if let Some(ref rec) = record {
         if !cfg!(test) {
@@ -3220,8 +3223,25 @@ async fn handle_release_worker(ctx: &DaemonContext, request: ReleaseRequest) -> 
                 .await;
         }
     }
+    // The hook fails a finished build closed when this ack is late, so name
+    // the slow stage instead of leaving only the client-side timeout.
+    let total = started.elapsed();
+    if total >= SLOW_RELEASE_WARN {
+        warn!(
+            build_id = ?request.build_id,
+            worker_id = %release_worker_id,
+            ownership_ms = ownership_done.as_millis() as u64,
+            slots_ms = (slots_done - ownership_done).as_millis() as u64,
+            completion_ms = (total - slots_done).as_millis() as u64,
+            "Slow release-worker handling ({} ms)",
+            total.as_millis()
+        );
+    }
     Ok(())
 }
+
+/// Release handling at or above this logs its per-stage breakdown.
+const SLOW_RELEASE_WARN: Duration = Duration::from_secs(1);
 
 /// Handle a record-build request.
 async fn handle_record_build(

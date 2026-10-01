@@ -602,13 +602,14 @@ pub(crate) async fn release_worker_with_fault(
         request.push('\n');
     }
 
-    write_daemon_request(&mut writer, request.as_bytes(), daemon_io_timeout())
+    let io_timeout = release_io_timeout_from(daemon_io_timeout());
+    write_daemon_request(&mut writer, request.as_bytes(), io_timeout)
         .await
         .context("release was not acknowledged")?;
 
     // The daemon writes its HTTP status only after processing the release.
     // A complete, bounded acknowledgement is required before publishing success.
-    read_daemon_ack(reader, daemon_io_timeout())
+    read_daemon_ack(reader, io_timeout)
         .await
         .context("release was not acknowledged")
 }
@@ -743,6 +744,18 @@ pub(super) fn daemon_io_timeout_from(raw: Option<&str>) -> Duration {
 
 fn daemon_io_timeout() -> Duration {
     daemon_io_timeout_from(std::env::var("RCH_DAEMON_TIMEOUT_MS").ok().as_deref())
+}
+
+/// Floor for the release request write and acknowledgement read. A missed
+/// release ack fails a build closed even when its command already succeeded,
+/// so the hook waits out a daemon stalled by host load (5s acks were missed at
+/// load ~110 on 2026-10-01) rather than reporting a finished build as failed.
+/// Waiting is safe: the daemon acks only after processing, and a repeated
+/// release of a terminal build is a no-op.
+const RELEASE_ACK_MIN_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn release_io_timeout_from(io_timeout: Duration) -> Duration {
+    io_timeout.max(RELEASE_ACK_MIN_TIMEOUT)
 }
 
 fn parse_timeout_secs(raw: &str) -> Option<u64> {
@@ -1034,6 +1047,54 @@ mod bounded_ipc_tests {
                 caller_fixture(response.into_bytes(), "POST /release-worker?", false).await;
             assert_eq!(result.is_ok(), success, "{result:?}");
         }
+    }
+
+    #[test]
+    fn release_ack_budget_outlasts_ordinary_daemon_io() {
+        let default = daemon_io_timeout_from(None);
+        assert!(release_io_timeout_from(default) > default);
+        assert_eq!(
+            release_io_timeout_from(Duration::from_millis(100)),
+            RELEASE_ACK_MIN_TIMEOUT
+        );
+        assert_eq!(
+            release_io_timeout_from(Duration::from_secs(120)),
+            Duration::from_secs(120)
+        );
+    }
+
+    #[tokio::test]
+    async fn release_ack_slower_than_ordinary_daemon_io_still_succeeds() {
+        // A daemon stalled by host load acks after the 5s ordinary IO budget;
+        // the finished build must not be failed closed for it.
+        let root = tempfile::tempdir().unwrap().keep();
+        let path = root.join("ipc.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let server = async {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = stream.into_split();
+            let mut request = String::new();
+            BufReader::new(reader)
+                .read_line(&mut request)
+                .await
+                .unwrap();
+            tokio::time::sleep(daemon_io_timeout_from(None) + Duration::from_secs(1)).await;
+            writer.write_all(b"HTTP/1.1 200 OK\r\n").await.unwrap();
+        };
+        let worker = WorkerId::new("ipc-test");
+        let client = release_worker(
+            path.to_str().unwrap(),
+            &worker,
+            1,
+            Some(42),
+            Some(0),
+            None,
+            None,
+            None,
+            None,
+        );
+        let (result, ()) = tokio::join!(client, server);
+        result.expect("a slow but complete ack is an acknowledgement");
     }
 
     #[tokio::test]
