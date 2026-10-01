@@ -1196,6 +1196,7 @@ case "$1" in
 toolchain) printf 'tc-a\ntc-b\ntc-c\n' ;;
 run)
     if test -f "$root/slow"; then sleep 0.1; fi
+    if test -f "$root/hang" && grep -qx "$2" "$root/hang"; then exec sleep 60; fi
     if test -f "$root/mutate"; then
         printf changed >> "$root/rustup-home/toolchains/$2/lib/rustlib/multirust-config.toml"
     fi
@@ -1344,9 +1345,14 @@ esac
 
     #[tokio::test]
     async fn inventory_incremental_deadline_prioritizes_unvisited_toolchains() {
+        // The step that must exhaust the shared deadline blocks until it is
+        // killed and every other step is instant, so which toolchains each
+        // probe visits is fixed by construction rather than by racing a
+        // short budget against scheduler latency (bd-arhz7).
         let fixture = Fixture::new();
-        std::fs::write(fixture.directory.path().join("slow"), b"1").unwrap();
-        let first = fixture.probe(Duration::from_millis(180)).await.unwrap();
+        let hang = fixture.directory.path().join("hang");
+        std::fs::write(&hang, b"tc-b\n").unwrap();
+        let first = fixture.probe(Duration::from_secs(3)).await.unwrap();
         assert!(first.1.contains(&"tc-a:clippy".to_owned()));
         assert!(!first.1.contains(&"tc-c:clippy".to_owned()));
         assert!(!first.2.is_empty());
@@ -1354,7 +1360,8 @@ esac
             serde_json::from_slice(&std::fs::read(&fixture.cache).unwrap()).unwrap();
         cache.entries.get_mut("tc-a").unwrap().checked_at = 0;
         std::fs::write(&fixture.cache, serde_json::to_vec(&cache).unwrap()).unwrap();
-        let second = fixture.probe(Duration::from_millis(180)).await.unwrap();
+        std::fs::write(&hang, b"tc-a\n").unwrap();
+        let second = fixture.probe(Duration::from_secs(3)).await.unwrap();
         assert!(
             second.1.contains(&"tc-c:clippy".to_owned()),
             "unvisited last toolchain must precede expired first entry: {second:?}"
@@ -1562,8 +1569,12 @@ esac
         )
         .await
         .unwrap_err();
-        assert!(error.to_string().contains("timed out"));
-        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(error.to_string().contains("timed out"), "{error:#}");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
         let pid = std::fs::read_to_string(pid_file).unwrap();
         #[cfg(target_os = "linux")]
         assert!(
