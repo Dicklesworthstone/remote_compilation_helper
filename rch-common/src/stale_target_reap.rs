@@ -1401,6 +1401,132 @@ pub fn parse_gc_skips(stdout: &str) -> Vec<GcSkip> {
         .collect()
 }
 
+/// A stale-target GC reservation (`fc-*.claim`) younger than this is never
+/// judged abandoned (bd-gyehj).
+pub const ABANDONED_GC_CLAIM_MIN_MINUTES: u64 = 6 * 60;
+
+/// Report, and with `apply` release, abandoned GC reservations on a worker.
+///
+/// A GC supervisor that dies between `__gc_source_begin` and
+/// `__gc_source_end` (ssh timeout, kill, OOM, reboot) leaves its `fc-*.claim`
+/// behind, and it fences every build of that tree from then on. The claim is
+/// kept on purpose after a KILL, because the `rm` child may still be deleting
+/// (see [`source_claim_gate_fragment`]), so a free metadata lock does not
+/// prove the deletion is over. A claim counts as abandoned only when, under
+/// the registry's metadata lock, all of these hold:
+/// - it is at least `min_age_minutes` old;
+/// - its record is intact (regular file, digest matches);
+/// - no process has its cwd, root or an open descriptor at or under the path;
+/// - no process's argv names the path.
+///
+/// Release is the move to `released/` that `__gc_source_end` performs.
+/// Emits `RCH_GC_CLAIMS <status>` once, then one
+/// `RCH_GC_CLAIM <verdict> <reason> <age_minutes> <name> <path>` per claim.
+#[must_use]
+pub fn abandoned_gc_claims_command(apply: bool) -> String {
+    abandoned_gc_claims_command_with_registry(
+        apply,
+        SOURCE_CLAIM_REGISTRY,
+        ABANDONED_GC_CLAIM_MIN_MINUTES,
+    )
+}
+
+/// [`abandoned_gc_claims_command`] against an explicit registry and age.
+#[must_use]
+pub fn abandoned_gc_claims_command_with_registry(
+    apply: bool,
+    registry: &str,
+    min_age_minutes: u64,
+) -> String {
+    let registry = shell_escape::escape(registry.into());
+    let apply = u8::from(apply);
+    format!(
+        r#"r={registry}; min={min_age_minutes}; apply={apply};
+if [ ! -d "$r" ] || [ -L "$r" ]; then printf 'RCH_GC_CLAIMS none\n'; exit 0; fi;
+if [ -L "$r/metadata.lock" ]; then printf 'RCH_GC_CLAIMS unsafe-lock\n'; exit 0; fi;
+if ! command -v flock >/dev/null 2>&1; then printf 'RCH_GC_CLAIMS no-flock\n'; exit 0; fi;
+exec 8>"$r/metadata.lock" || exit 1;
+if ! flock -x -w 30 8; then printf 'RCH_GC_CLAIMS busy\n'; exit 0; fi;
+if [ ! -d /proc/self/fd ]; then printf 'RCH_GC_CLAIMS no-proc\n'; exit 0; fi;
+refs=$(mktemp) && args=$(mktemp) || exit 1;
+trap 'rm -f -- "$refs" "$args"' EXIT;
+find /proc/[0-9]*/cwd /proc/[0-9]*/root /proc/[0-9]*/fd -maxdepth 1 -printf '%l\n' 2>/dev/null | grep '^/' | sort -u > "$refs";
+for p in /proc/[0-9]*; do tr '\0' ' ' 2>/dev/null < "$p/cmdline"; echo; done > "$args";
+printf 'RCH_GC_CLAIMS ok\n';
+now=$(date +%s);
+for c in "$r"/fc-*.claim; do
+  [ -e "$c" ] || [ -L "$c" ] || continue;
+  n=${{c##*/}}; p=-; age=0; v=keep;
+  if [ -L "$c" ] || [ ! -f "$c" ]; then why=unsafe-record;
+  else
+    m=$(stat -c %Y -- "$c" 2>/dev/null) || m=$now; age=$(( (now - m) / 60 ));
+    p=$(head -n 1 -- "$c"); d=${{n#*.}}; d=${{d%%.*}}; a=$(sha256sum -- "$c");
+    if [ "${{a%% *}}" != "$d" ] || [ -z "$p" ]; then why=unsafe-record;
+    elif [ "$age" -lt "$min" ]; then why=young;
+    elif awk -v p="$p/" -v q="$p" 'index($0,p)==1 || $0==q {{f=1; exit}} END{{exit !f}}' "$refs"; then why=open-handle;
+    elif grep -qF -- "$p" "$args"; then why=live-process;
+    elif [ "$apply" = 1 ]; then
+      dest="$r/released/$n";
+      if [ ! -L "$r/released" ] && mkdir -p -- "$r/released" && [ ! -e "$dest" ] && [ ! -L "$dest" ] \
+        && mv -- "$c" "$dest" && sync -f "$dest" && sync -f "$r/released"; then v=released; why=abandoned;
+      else why=release-failed; fi;
+    else v=would-release; why=abandoned; fi;
+  fi;
+  printf 'RCH_GC_CLAIM %s %s %s %s %s\n' "$v" "$why" "$age" "$n" "$p";
+done;
+sync -f "$r" 2>/dev/null || :;
+"#
+    )
+}
+
+/// One `RCH_GC_CLAIM` line from [`abandoned_gc_claims_command`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GcClaimReport {
+    /// `keep`, `would-release` or `released`.
+    pub verdict: String,
+    pub reason: String,
+    pub age_minutes: u64,
+    pub name: String,
+    /// The claimed tree, `-` when the record could not be read.
+    pub path: String,
+}
+
+/// Parse the claims scan: its `RCH_GC_CLAIMS` status (absent when the script
+/// never reached it) and every claim line.
+#[must_use]
+pub fn parse_gc_claim_reports(stdout: &str) -> (Option<String>, Vec<GcClaimReport>) {
+    let mut status = None;
+    let mut claims = Vec::new();
+    for line in stdout.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("RCH_GC_CLAIMS ") {
+            status = Some(rest.to_string());
+        } else if let Some(rest) = line.strip_prefix("RCH_GC_CLAIM ") {
+            let mut parts = rest.splitn(5, ' ');
+            let (Some(verdict), Some(reason), Some(age), Some(name), Some(path)) = (
+                parts.next(),
+                parts.next(),
+                parts.next(),
+                parts.next(),
+                parts.next(),
+            ) else {
+                continue;
+            };
+            let Ok(age_minutes) = age.parse() else {
+                continue;
+            };
+            claims.push(GcClaimReport {
+                verdict: verdict.to_string(),
+                reason: reason.to_string(),
+                age_minutes,
+                name: name.to_string(),
+                path: path.to_string(),
+            });
+        }
+    }
+    (status, claims)
+}
+
 /// The roots one enumeration/sweep run actually looked at, as reported by the
 /// script itself (`RCH_GC_ROOT <kind> <path>`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -2852,6 +2978,27 @@ mod tests {
                 );
             }
             assert!(candidate.exists());
+            let release_claims = || {
+                let script =
+                    abandoned_gc_claims_command_with_registry(true, registry.to_str().unwrap(), 0);
+                let output = Command::new("sh").args(["-c", &script]).output().unwrap();
+                assert!(output.status.success(), "{output:?}");
+                let (status, claims) =
+                    parse_gc_claim_reports(&String::from_utf8_lossy(&output.stdout));
+                assert_eq!(status.as_deref(), Some("ok"), "{output:?}");
+                claims
+            };
+            if signal == "-KILL" {
+                // bd-gyehj: the orphaned rm still names the tree, so the
+                // operator release must keep the claim while it runs.
+                let claims = release_claims();
+                assert_eq!(claims.len(), 1, "{claims:?}");
+                assert_eq!(claims[0].verdict, "keep", "{claims:?}");
+                assert!(
+                    ["open-handle", "live-process"].contains(&claims[0].reason.as_str()),
+                    "{claims:?}"
+                );
+            }
             std::fs::write(resume, b"continue").unwrap();
             if signal == "-HUP" {
                 assert!(child.wait().unwrap().success());
@@ -2868,6 +3015,20 @@ mod tests {
                         .is_some_and(|extension| extension == "claim")),
                     "an interrupted GC claim must remain after its unobserved child completes"
                 );
+                // Once nothing references the tree, the release retires it
+                // exactly as __gc_source_end would.
+                let mut claims = release_claims();
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while claims.first().is_some_and(|c| c.verdict == "keep")
+                    && Instant::now() < deadline
+                {
+                    std::thread::sleep(Duration::from_millis(50));
+                    claims = release_claims();
+                }
+                assert_eq!(claims.len(), 1, "{claims:?}");
+                assert_eq!(claims[0].verdict, "released", "{claims:?}");
+                assert!(registry.join("released").join(&claims[0].name).is_file());
+                assert!(release_claims().is_empty());
             }
             assert!(!candidate.exists());
             assert!(
@@ -2875,6 +3036,100 @@ mod tests {
                 "metadata lock was not released after deletion"
             );
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn abandoned_gc_claims_respect_age_integrity_and_live_references() {
+        use std::process::{Command, Stdio};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let registry = tmp.path().join("claims");
+        let tree = tmp.path().join(".rch-target-w-pool-stranded");
+        std::fs::create_dir_all(&tree).unwrap();
+        std::fs::create_dir_all(&registry).unwrap();
+        let record = format!("{}\n", tree.display());
+        let staged = tmp.path().join("record");
+        std::fs::write(&staged, &record).unwrap();
+        let digest = String::from_utf8(
+            Command::new("sha256sum")
+                .arg(&staged)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_string();
+        let name = format!("fc-00000000-0000-4000-8000-000000000001.{digest}.claim");
+        let claim = registry.join(&name);
+        std::fs::write(&claim, &record).unwrap();
+        let scan = |apply: bool, min_age: u64| {
+            let script = abandoned_gc_claims_command_with_registry(
+                apply,
+                registry.to_str().unwrap(),
+                min_age,
+            );
+            let output = Command::new("sh").args(["-c", &script]).output().unwrap();
+            assert!(output.status.success(), "{output:?}");
+            let (status, claims) = parse_gc_claim_reports(&String::from_utf8_lossy(&output.stdout));
+            assert_eq!(status.as_deref(), Some("ok"), "{output:?}");
+            claims
+        };
+        let only = |claims: Vec<GcClaimReport>| {
+            assert_eq!(claims.len(), 1, "{claims:?}");
+            (claims[0].verdict.clone(), claims[0].reason.clone())
+        };
+
+        assert_eq!(only(scan(true, 60)), ("keep".into(), "young".into()));
+        assert_eq!(
+            only(scan(false, 0)),
+            ("would-release".into(), "abandoned".into())
+        );
+        assert!(claim.is_file(), "a preview must not release");
+
+        let mut holder = Command::new("sleep")
+            .arg("30")
+            .current_dir(&tree)
+            .stdin(Stdio::null())
+            .spawn()
+            .unwrap();
+        let held = only(scan(true, 0));
+        holder.kill().unwrap();
+        holder.wait().unwrap();
+        assert_eq!(held, ("keep".into(), "open-handle".into()));
+
+        std::fs::write(&claim, b"/tampered\n").unwrap();
+        assert_eq!(only(scan(true, 0)), ("keep".into(), "unsafe-record".into()));
+        std::fs::write(&claim, &record).unwrap();
+
+        let released = scan(true, 0);
+        assert_eq!(released[0].path, tree.display().to_string());
+        assert_eq!(only(released), ("released".into(), "abandoned".into()));
+        assert!(!claim.exists());
+        assert!(registry.join("released").join(&name).is_file());
+    }
+
+    #[test]
+    fn gc_claim_report_lines_parse_with_spaces_in_the_path() {
+        let (status, claims) = parse_gc_claim_reports(
+            "noise\nRCH_GC_CLAIMS ok\nRCH_GC_CLAIM keep young 12 fc-a.b.claim /data/my dir\n\
+             RCH_GC_CLAIM keep x notanumber fc-c.d.claim /p\nRCH_GC_CLAIM short\n",
+        );
+        assert_eq!(status.as_deref(), Some("ok"));
+        assert_eq!(
+            claims,
+            vec![GcClaimReport {
+                verdict: "keep".into(),
+                reason: "young".into(),
+                age_minutes: 12,
+                name: "fc-a.b.claim".into(),
+                path: "/data/my dir".into(),
+            }]
+        );
+        assert_eq!(parse_gc_claim_reports("").0, None);
     }
 
     /// `rch gc --dry-run` enumerates; the real run sweeps. If enumerate cannot
