@@ -5,7 +5,7 @@ Compilation Helper): the PreToolUse hook + CLI (`rch`), the local daemon (`rchd`
 worker agent (`rch-wkr`), the RABS build sidecar (`rabs-*`, `rabsd`), and the fleet
 dashboard (`dashboard/`).
 
-Scope window: project inception (`v0.1.0`, 2026-01-25) through `v2.1.15` (2026-10-01).
+Scope window: project inception (`v0.1.0`, 2026-01-25) through `v2.1.16` (2026-10-04).
 
 This document was rebuilt from git history (`git log --no-merges` per tag range, `git show`
 on representative commits), version tags (`git for-each-ref`), GitHub release metadata
@@ -28,6 +28,43 @@ history. They are kept as-is because the descriptions were verified against the 
 but those particular links will 404.
 
 Repository: <https://github.com/Dicklesworthstone/remote_compilation_helper>
+
+## 2.1.16 — 2026-10-04
+
+- **Passing builds are no longer reported as failures when the dispatcher is
+  loaded.** The hook allowed only 5s for the daemon to acknowledge a worker
+  release. With the operator Mac at load ~110 that window was missed, and the
+  hook exited 1 with "daemon release … was not acknowledged" even though the
+  command had succeeded and its artifacts had been retrieved (3 of 7 test runs
+  on 2026-10-01). Release requests now get at least 30s. Waiting is safe: the
+  daemon acknowledges only after processing, and repeating the release of a
+  finished build is a no-op. rchd now also logs a "Slow release-worker
+  handling" WARN with per-stage milliseconds for any release taking 1s or more
+  ([`47fa7192`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/47fa719257fe0936b92dffb45973e8384eff4c2f)).
+- **`rch gc` finds and releases abandoned GC claims** (`bd-gyehj`). A GC run
+  that dies mid-removal leaves a `fc-*.claim` file behind, and it blocks every
+  build of that project tree with "remote retries exhausted". 16 such claims
+  were cleaned up by hand on 2026-09-30 and 2026-10-01. `rch gc` now lists
+  them (`gc_claims` in JSON). `rch gc --apply` releases one only when it is at
+  least 6h old, its record is intact, and no process has a working directory,
+  open file or argument inside its tree. A host where that can't be checked
+  releases nothing
+  ([`6aa3d0aa`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/6aa3d0aaafdb8b71c9a8048a44be1d07135c2fa0)).
+- **Worker cache sweeps finish on busy workers** (`bd-mz7qk`). The periodic
+  stale-target sweep used the 300s default SSH timeout and was cut short every
+  cycle on IO-saturated workers, so their cache budget was never enforced.
+  Sweeps now get half the reap interval (5–30 min), which is also the main
+  way the stranded claims above were being created. They run at idle CPU and
+  IO priority
+  ([`ade05905`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/ade05905302aa4913877d88887aa97708f4f33a2)).
+- **`rch cancel <build_id>` explains its ownership refusal.** The refusal now
+  names the wrapper that owns the build and the `rch jobs cancel <wrapper>`
+  command that works. It also says that an abandoned build is released
+  automatically after 15 min of silence if it never started remote work, or
+  6h if it did
+  ([`36f3e46f`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/36f3e46f95750e06cf3df69252befe525be91d7e)).
+- A timing-fragile rch-wkr inventory test is now deterministic (`bd-arhz7`)
+  ([`7d6f5b8b`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/7d6f5b8b8a9d9ce95fd7690ea55bae00b5c5efa2)).
 
 ## 2.1.15 — 2026-10-01
 
