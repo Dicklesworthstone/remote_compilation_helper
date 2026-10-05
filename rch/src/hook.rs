@@ -2855,7 +2855,7 @@ pub async fn run_exec(
         );
     }
 
-    let config = match load_config() {
+    let mut config = match load_config() {
         Ok(cfg) => cfg,
         Err(e) => {
             warn!("Failed to load config: {}, running locally", e);
@@ -3111,14 +3111,27 @@ pub async fn run_exec(
                 now_unix_ms(),
             ));
 
-            // Attempt a bounded daemon autostart, then retry selection ONCE.
+            // Recover one daemon, then keep that endpoint for selection,
+            // heartbeats, retries and releases throughout this operation.
             let retry =
-                if auto_start::try_auto_start_daemon(&config.self_healing, Path::new(&socket_path))
-                    .await
-                    .is_ok()
+                if let Ok(recovered_socket) =
+                    auto_start::try_auto_start_daemon(&config.self_healing, Path::new(&socket_path))
+                        .await
                 {
+                    config.general.socket_path = recovered_socket.to_string_lossy().into_owned();
+                    // The original endpoint's restart gate says nothing about
+                    // a daemon discovered in another runtime-directory context.
+                    if restart_admission_is_closed(&config.general.socket_path)
+                        .await
+                        .unwrap_or(false)
+                    {
+                        durable_lease.heartbeat("restart_admission_blocked")?;
+                        anyhow::bail!(
+                            "remote build admission is paused while daemon restart remediation is active"
+                        );
+                    }
                     match query_daemon(
-                        &socket_path,
+                        &config.general.socket_path,
                         &selection_project,
                         estimated_cores,
                         &remote_command,

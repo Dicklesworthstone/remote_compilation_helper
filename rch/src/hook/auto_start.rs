@@ -13,6 +13,8 @@
 
 use super::*;
 
+mod discovery;
+
 #[derive(Debug, thiserror::Error)]
 pub(super) enum AutoStartError {
     #[error("Another process is starting the daemon (lock held)")]
@@ -460,12 +462,10 @@ async fn wait_for_socket(socket_path: &Path, budget: Duration) -> bool {
 pub(super) async fn try_auto_start_daemon(
     config: &SelfHealingConfig,
     socket_path: &Path,
-) -> Result<(), AutoStartError> {
-    recover_daemon_with_paths(
+) -> Result<PathBuf, AutoStartError> {
+    discovery::recover_daemon(
         config,
         socket_path,
-        &autostart_lock_path(),
-        &autostart_cooldown_path(),
         |socket| {
             let rchd_path = which_rchd_path().ok_or(AutoStartError::BinaryNotFound)?;
             info!(
