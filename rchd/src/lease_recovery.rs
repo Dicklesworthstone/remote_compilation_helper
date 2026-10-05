@@ -14,18 +14,21 @@
 use crate::api::{is_process_alive, lease_blocks_restart, lease_owns_unretired_source};
 use crate::events::EventBus;
 use rch_common::job_identity::{DurableJobLease, default_job_lease_directory};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::task::{Id, JoinSet};
 use tokio::time::Instant;
 use tracing::{info, warn};
 
 /// How often the lease directory is checked for recoverable leases.
 const RECOVERY_INTERVAL: Duration = Duration::from_secs(5 * 60);
-/// Recoveries per cycle; each is serial, so a bad cycle costs at most this many
-/// timeouts.
+/// Bound both starts per scan interval and total in-flight recovery clients.
+/// A worker gets at most one client, so a stalled worker cannot consume every
+/// lane or serialize independent workers behind its timeout.
 const MAX_RECOVERIES_PER_CYCLE: usize = 4;
 /// Deadline handed to `rch jobs recover`, plus slack before the child is killed.
 const RECOVER_TIMEOUT_SECS: u64 = 300;
@@ -111,45 +114,65 @@ fn read_lease(lease_dir: &Path, wrapper_id: &str) -> Result<DurableJobLease, Str
     let bytes = std::fs::read(&path).map_err(|error| error.to_string())?;
     let lease: DurableJobLease =
         serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
-    if lease.identity.local_wrapper_id != wrapper_id {
-        return Err("recovery journal filename and identity disagree".into());
+    if lease.schema_version != 1 || lease.identity.local_wrapper_id != wrapper_id {
+        return Err("recovery journal schema or filename identity is invalid".into());
     }
     Ok(lease)
 }
 
-/// Leases in `lease_dir` that the daemon may recover on the owner's behalf:
-/// the owner is provably gone (the same evidence that stops the lease blocking
-/// a restart), the recipe owns worker source OR awaits its daemon handoff,
-/// and the wrapper never
-/// acknowledged a terminal state (`rch jobs recover` returns early on those).
-/// Unreadable entries are skipped; the restart scan already fails closed on
-/// them.
-pub(crate) fn recoverable_lease_ids(
+/// Small scheduling record; the full journal is reloaded before client launch.
+#[derive(Clone, Debug)]
+struct RecoveryCandidate {
+    wrapper_id: String,
+    build_id: u64,
+    worker_id: String,
+    heartbeat_unix_ms: u64,
+}
+
+/// Only dead, stale, unacknowledged source owners or pending daemon handoffs
+/// enter the queue. Unreadable/noncanonical journals are not execution authority;
+/// the separate restart scan retains its fail-closed treatment of bad evidence.
+fn recoverable_candidates(
     lease_dir: &Path,
     now_unix_ms: u64,
     alive: impl Fn(u32) -> bool,
-) -> Vec<String> {
+) -> Vec<RecoveryCandidate> {
     let Ok(entries) = std::fs::read_dir(lease_dir) else {
         return Vec::new();
     };
-    let mut ids: Vec<String> = entries
+    let mut candidates: Vec<RecoveryCandidate> = entries
         .filter_map(Result::ok)
+        // Never open a named pipe, socket, directory or symlink as a journal.
+        // The client rechecks the exact canonical identity before spawning.
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
         .map(|entry| entry.path())
         .filter(|path| {
             path.extension()
                 .is_some_and(|extension| extension == "json")
         })
-        .filter_map(|path| std::fs::read(path).ok())
-        .filter_map(|bytes| serde_json::from_slice::<DurableJobLease>(&bytes).ok())
+        .filter_map(|path| read_lease(lease_dir, path.file_stem()?.to_str()?).ok())
         .filter(|lease| {
             !lease.terminal_acknowledged
                 && (lease_owns_unretired_source(lease) || retired_delivery(lease).is_some())
                 && !lease_blocks_restart(lease, now_unix_ms, || alive(lease.wrapper_pid))
         })
-        .map(|lease| lease.identity.local_wrapper_id)
+        .filter_map(|lease| {
+            Some(RecoveryCandidate {
+                wrapper_id: lease.identity.local_wrapper_id,
+                build_id: lease.identity.remote_build_id.filter(|id| *id > 0)?,
+                worker_id: lease.worker_id.filter(|id| !id.is_empty())?,
+                heartbeat_unix_ms: lease.heartbeat_unix_ms,
+            })
+        })
         .collect();
-    ids.sort();
-    ids
+    // Prioritize the oldest abandoned ownership; UUID ordering is only a
+    // deterministic tie-break, not a priority that can starve old recoveries.
+    candidates.sort_by(|left, right| {
+        left.heartbeat_unix_ms
+            .cmp(&right.heartbeat_unix_ms)
+            .then_with(|| left.wrapper_id.cmp(&right.wrapper_id))
+    });
+    candidates
 }
 
 /// Delay before retrying a lease that has failed `failures` times.
@@ -178,7 +201,73 @@ impl Backoff {
 
     /// Forget leases that are no longer candidates (recovered, or reaped).
     fn retain(&mut self, candidates: &[String]) {
-        self.failures.retain(|id, _| candidates.contains(id));
+        let candidates: HashSet<&str> = candidates.iter().map(String::as_str).collect();
+        self.failures.retain(|id, _| candidates.contains(id.as_str()));
+    }
+}
+
+/// Own every recovery task across scans. A scan is admission, not a barrier:
+/// completions on healthy workers are processed while another worker waits.
+#[derive(Default)]
+struct RecoveryQueue {
+    pending: VecDeque<RecoveryCandidate>,
+    running: HashMap<Id, RecoveryCandidate>,
+    tasks: JoinSet<Result<(), String>>,
+    backoff: Backoff,
+    starts_remaining: usize,
+}
+
+impl RecoveryQueue {
+    fn refresh(&mut self, candidates: Vec<RecoveryCandidate>) {
+        let ids: Vec<String> = candidates
+            .iter()
+            .chain(self.running.values())
+            .map(|candidate| candidate.wrapper_id.clone())
+            .collect();
+        self.backoff.retain(&ids);
+        self.pending = candidates.into();
+        self.starts_remaining = MAX_RECOVERIES_PER_CYCLE;
+    }
+
+    fn start_ready<F, R>(&mut self, now: Instant, mut run: F)
+    where
+        F: FnMut(RecoveryCandidate) -> R,
+        R: Future<Output = Result<(), String>> + Send + 'static,
+    {
+        while self.starts_remaining > 0 && self.running.len() < MAX_RECOVERIES_PER_CYCLE {
+            let next = self.pending.iter().position(|candidate| {
+                self.backoff.ready(&candidate.wrapper_id, now)
+                    && !self.running.values().any(|running| {
+                        running.wrapper_id == candidate.wrapper_id
+                            || running.worker_id == candidate.worker_id
+                    })
+            });
+            let Some(next) = next else { break };
+            let candidate = self.pending.remove(next).expect("selected pending recovery");
+            let task = self.tasks.spawn(run(candidate.clone()));
+            self.running.insert(task.id(), candidate);
+            self.starts_remaining -= 1;
+        }
+    }
+
+    async fn next_completed(&mut self) -> Option<(RecoveryCandidate, Result<(), String>)> {
+        let joined = self.tasks.join_next_with_id().await?;
+        let (task_id, outcome) = match joined {
+            Ok((id, outcome)) => (id, outcome),
+            Err(error) => (error.id(), Err(format!("recovery task failed: {error}"))),
+        };
+        let candidate = self.running.remove(&task_id).expect("owned recovery task");
+        // A scan during the task may have queued its old snapshot. Do not
+        // relaunch that snapshot after success or lose backoff after a panic.
+        self.pending
+            .retain(|pending| pending.wrapper_id != candidate.wrapper_id);
+        if outcome.is_err() {
+            self.backoff
+                .record_failure(&candidate.wrapper_id, Instant::now());
+        } else {
+            self.backoff.failures.remove(&candidate.wrapper_id);
+        }
+        Some((candidate, outcome))
     }
 }
 
@@ -193,61 +282,64 @@ pub(crate) fn start(events: EventBus, socket: PathBuf) -> tokio::task::JoinHandl
                 return;
             }
         };
-        let mut backoff = Backoff::default();
+        let mut queue = RecoveryQueue::default();
         let mut ticker =
             tokio::time::interval_at(Instant::now() + RECOVERY_INTERVAL, RECOVERY_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
-            ticker.tick().await;
-            if !rch.exists() {
-                continue;
-            }
-            let now_unix_ms = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0);
-            let candidates = tokio::task::spawn_blocking(move || {
-                recoverable_lease_ids(
-                    &default_job_lease_directory(),
-                    now_unix_ms,
-                    is_process_alive,
-                )
-            })
-            .await
-            .unwrap_or_default();
-            backoff.retain(&candidates);
-            let now = Instant::now();
-            let due: Vec<&String> = candidates
-                .iter()
-                .filter(|id| backoff.ready(id, now))
-                .take(MAX_RECOVERIES_PER_CYCLE)
-                .collect();
-            for id in due {
-                match recover(&rch, &socket, id).await {
-                    Ok(()) => {
-                        info!(wrapper_id = %id, "Recovered dead client lease");
-                        events.emit(
-                            "lease_auto_recovered",
-                            &serde_json::json!({ "wrapper_id": id }),
-                        );
+            tokio::select! {
+                completed = queue.next_completed(), if !queue.running.is_empty() => {
+                    if let Some((candidate, outcome)) = completed {
+                        let id = candidate.wrapper_id;
+                        match outcome {
+                            Ok(()) => {
+                                info!(wrapper_id = %id, "Recovered dead client lease");
+                                events.emit("lease_auto_recovered", &serde_json::json!({
+                                    "wrapper_id": id,
+                                }));
+                            }
+                            Err(error) => {
+                                let failures = queue.backoff.failures[&id].0;
+                                warn!(wrapper_id = %id, failures, "Dead client lease recovery failed: {error}");
+                                events.emit("lease_auto_recovery_failed", &serde_json::json!({
+                                    "wrapper_id": id, "failures": failures, "error": error,
+                                }));
+                            }
+                        }
                     }
-                    Err(error) => {
-                        let failures = backoff.record_failure(id, Instant::now());
-                        warn!(wrapper_id = %id, failures, "Dead client lease recovery failed: {error}");
-                        events.emit(
-                            "lease_auto_recovery_failed",
-                            &serde_json::json!({
-                                "wrapper_id": id,
-                                "failures": failures,
-                                "error": error,
-                            }),
-                        );
+                }
+                _ = ticker.tick() => {
+                    if !rch.exists() {
+                        continue;
+                    }
+                    let now = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0);
+                    match tokio::task::spawn_blocking(move || {
+                        recoverable_candidates(&default_job_lease_directory(), now, is_process_alive)
+                    }).await {
+                        Ok(candidates) => queue.refresh(candidates),
+                        Err(error) => warn!(%error, "Lease recovery scan failed; retaining in-flight tasks"),
                     }
                 }
             }
+            queue.start_ready(Instant::now(), |candidate| {
+                let rch = rch.clone();
+                let socket = socket.clone();
+                async move { recover(&rch, &socket, &candidate).await }
+            });
         }
     })
 }
 
 /// Run `rch jobs recover` for one lease; the error is the tail of its stderr.
-async fn recover(rch: &Path, socket: &Path, wrapper_id: &str) -> Result<(), String> {
-    recover_in(rch, socket, &default_job_lease_directory(), wrapper_id).await
+async fn recover(rch: &Path, socket: &Path, candidate: &RecoveryCandidate) -> Result<(), String> {
+    recover_in(
+        rch,
+        socket,
+        &default_job_lease_directory(),
+        &candidate.wrapper_id,
+        Some(candidate),
+    )
+    .await
 }
 
 async fn recover_in(
@@ -255,8 +347,16 @@ async fn recover_in(
     socket: &Path,
     lease_dir: &Path,
     wrapper_id: &str,
+    candidate: Option<&RecoveryCandidate>,
 ) -> Result<(), String> {
     let before = read_lease(lease_dir, wrapper_id)?;
+    if let Some(candidate) = candidate
+        && (candidate.wrapper_id != wrapper_id
+            || before.identity.remote_build_id != Some(candidate.build_id)
+            || before.worker_id.as_deref() != Some(candidate.worker_id.as_str()))
+    {
+        return Err("recovery admission changed after scanning; client was not started".into());
+    }
     let child = tokio::process::Command::new(rch)
         .args(["jobs", "recover", wrapper_id, "--timeout-secs"])
         .arg(RECOVER_TIMEOUT_SECS.to_string())
@@ -350,6 +450,127 @@ async fn collect_recovery_child(
 mod tests {
     use super::*;
     use rch_common::job_identity::JobIdentity;
+
+    fn recoverable_lease_ids(
+        directory: &Path,
+        now: u64,
+        alive: impl Fn(u32) -> bool,
+    ) -> Vec<String> {
+        recoverable_candidates(directory, now, alive)
+            .into_iter()
+            .map(|candidate| candidate.wrapper_id)
+            .collect()
+    }
+
+    fn candidate(id: &str, worker: &str) -> RecoveryCandidate {
+        RecoveryCandidate {
+            wrapper_id: id.to_owned(),
+            build_id: 7,
+            worker_id: worker.to_owned(),
+            heartbeat_unix_ms: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_queue_limits_global_and_per_worker_concurrency_across_scans() {
+        let candidates = vec![
+            candidate("a1", "a"), candidate("a2", "a"), candidate("b1", "b"),
+            candidate("c1", "c"), candidate("d1", "d"), candidate("e1", "e"),
+        ];
+        let mut queue = RecoveryQueue::default();
+        queue.refresh(candidates.clone());
+        queue.start_ready(Instant::now(), |_| std::future::pending());
+        assert_eq!(queue.running.len(), MAX_RECOVERIES_PER_CYCLE);
+        let workers: HashSet<_> = queue.running.values().map(|job| &job.worker_id).collect();
+        assert_eq!(workers.len(), MAX_RECOVERIES_PER_CYCLE);
+        assert_eq!(queue.starts_remaining, 0);
+        // A fresh scan cannot duplicate running wrappers or allocate more lanes.
+        queue.refresh(candidates);
+        queue.start_ready(Instant::now(), |_| async { Err("exceeded in-flight cap".into()) });
+        assert_eq!(queue.running.len(), MAX_RECOVERIES_PER_CYCLE);
+        queue.tasks.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn stalled_worker_does_not_block_other_worker_completion_or_next_job() {
+        let mut queue = RecoveryQueue::default();
+        queue.refresh(vec![
+            candidate("slow", "blocked-worker"),
+            candidate("first", "healthy-worker"),
+            candidate("second", "healthy-worker"),
+        ]);
+        let run = |job: RecoveryCandidate| async move {
+            if job.worker_id == "blocked-worker" {
+                std::future::pending::<()>().await;
+            }
+            Ok(())
+        };
+        queue.start_ready(Instant::now(), run);
+        assert_eq!(queue.running.len(), 2);
+        for expected in ["first", "second"] {
+            let (job, result) = tokio::time::timeout(Duration::from_secs(2), queue.next_completed())
+                .await.unwrap().unwrap();
+            result.unwrap();
+            assert_eq!(job.wrapper_id, expected);
+            assert!(queue.running.values().any(|job| job.wrapper_id == "slow"));
+            queue.start_ready(Instant::now(), run);
+        }
+        queue.tasks.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn recovery_task_panic_releases_its_lane_and_keeps_retry_backoff() {
+        let mut queue = RecoveryQueue::default();
+        queue.refresh(vec![candidate("panic", "worker")]);
+        queue.start_ready(Instant::now(), |job| async move {
+            if job.wrapper_id == "panic" {
+                panic!("test-owned recovery task panic");
+            }
+            Ok(())
+        });
+        let (job, result) = queue.next_completed().await.unwrap();
+        assert_eq!(job.wrapper_id, "panic");
+        assert!(result.unwrap_err().contains("recovery task failed"));
+        assert!(queue.running.is_empty());
+        assert!(!queue.backoff.ready("panic", Instant::now()));
+        queue.refresh(vec![candidate("panic", "worker"), candidate("next", "worker")]);
+        queue.start_ready(Instant::now(), |job| async move {
+            assert_eq!(job.wrapper_id, "next", "failed wrapper bypassed backoff");
+            Ok(())
+        });
+        queue.next_completed().await.unwrap().1.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fast_recoveries_do_not_bypass_the_per_scan_start_budget() {
+        let candidates: Vec<_> = (0..6).map(|index| candidate(&format!("job-{index}"), "worker")).collect();
+        let mut queue = RecoveryQueue::default();
+        queue.refresh(candidates.clone());
+        for _ in 0..MAX_RECOVERIES_PER_CYCLE {
+            queue.start_ready(Instant::now(), |_| async { Ok(()) });
+            assert_eq!(queue.running.len(), 1);
+            queue.next_completed().await.unwrap().1.unwrap();
+        }
+        queue.start_ready(Instant::now(), |_| async { Err("exceeded per-scan start budget".into()) });
+        assert!(queue.running.is_empty());
+        assert_eq!(queue.pending.len(), 2);
+        queue.refresh(candidates.into_iter().skip(MAX_RECOVERIES_PER_CYCLE).collect());
+        queue.start_ready(Instant::now(), |_| async { Ok(()) });
+        assert_eq!(queue.next_completed().await.unwrap().0.wrapper_id, "job-4");
+    }
+
+    #[tokio::test]
+    async fn completion_discards_a_running_snapshot_reintroduced_by_a_scan() {
+        let mut queue = RecoveryQueue::default();
+        let job = candidate("once", "worker");
+        queue.refresh(vec![job.clone()]);
+        queue.start_ready(Instant::now(), |_| async { Ok(()) });
+        queue.refresh(vec![job]);
+        queue.next_completed().await.unwrap().1.unwrap();
+        queue.start_ready(Instant::now(), |_| async { Err("replayed a completed scan snapshot".into()) });
+        assert!(queue.pending.is_empty());
+        assert!(queue.running.is_empty());
+    }
 
     #[tokio::test]
     async fn recovery_stderr_drains_beyond_capacity_and_keeps_only_the_tail() {
@@ -486,9 +707,9 @@ mod tests {
             ("no-pid", lease(stale, 0, owning)),
             ("acked", acknowledged),
         ];
-        for (name, lease) in &leases {
+        for (_name, lease) in &leases {
             std::fs::write(
-                dir.path().join(format!("{name}.json")),
+                dir.path().join(format!("{}.json", lease.identity.local_wrapper_id)),
                 serde_json::to_vec(lease).unwrap(),
             )
             .unwrap();
@@ -551,18 +772,15 @@ mod tests {
         // A crash can occur after retirement but before record_exit. The
         // recovery entry point resumes that boundary from recipe.returned.
         assert!(pending.exit_code.is_none());
-        let mut live = pending.clone();
-        live.wrapper_pid = 22;
-        let mut fresh = pending.clone();
-        fresh.heartbeat_unix_ms = now;
-        let mut unknown = pending.clone();
-        unknown.wrapper_pid = 0;
-        let acknowledged = completed_lease(&pending, 102, 130);
-        for (name, candidate) in [
+        let live = handoff_lease(stale, 22, 102);
+        let fresh = handoff_lease(now, 11, 102);
+        let unknown = handoff_lease(stale, 0, 102);
+        let acknowledged = completed_lease(&handoff_lease(stale, 11, 102), 102, 130);
+        for (_name, candidate) in [
             ("pending", &pending), ("live", &live), ("fresh", &fresh),
             ("unknown", &unknown), ("acknowledged", &acknowledged),
         ] {
-            std::fs::write(dir.path().join(format!("{name}.json")), serde_json::to_vec(candidate).unwrap()).unwrap();
+            std::fs::write(dir.path().join(format!("{}.json", candidate.identity.local_wrapper_id)), serde_json::to_vec(candidate).unwrap()).unwrap();
         }
         assert_eq!(recoverable_lease_ids(dir.path(), now, |pid| pid == 22),
             [pending.identity.local_wrapper_id.clone()]);
@@ -636,7 +854,7 @@ mod tests {
         let child = dir.path().join("rch");
         std::fs::write(&child, "#!/bin/sh\nexit 0\n").unwrap();
         std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let error = recover_in(&child, &dir.path().join("unused.sock"), dir.path(), id).await.unwrap_err();
+        let error = recover_in(&child, &dir.path().join("unused.sock"), dir.path(), id, None).await.unwrap_err();
         assert!(error.contains("without durable daemon/delivery acknowledgement"));
         assert_eq!(read_lease(dir.path(), id).unwrap(), pending);
 
@@ -648,6 +866,53 @@ mod tests {
         std::fs::write(&child, format!("#!/bin/sh\ncp -- {} {}\n",
             shell_escape::escape(receipt.to_str().unwrap().into()),
             shell_escape::escape(path.to_str().unwrap().into()))).unwrap();
-        recover_in(&child, &dir.path().join("unused.sock"), dir.path(), id).await.unwrap();
+        recover_in(&child, &dir.path().join("unused.sock"), dir.path(), id, None).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_scan_uses_canonical_regular_journals_and_oldest_owner_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = 100 * 60 * 60 * 1000;
+        let oldest = handoff_lease(0, 11, 102);
+        let newer = handoff_lease(now - 30 * 60 * 1000, 11, 102);
+        for lease in [&oldest, &newer] {
+            std::fs::write(dir.path().join(format!("{}.json", lease.identity.local_wrapper_id)),
+                serde_json::to_vec(lease).unwrap()).unwrap();
+        }
+        let original = dir.path().join(format!("{}.json", oldest.identity.local_wrapper_id));
+        let alias = format!("{}.json", JobIdentity::new_local().local_wrapper_id);
+        std::os::unix::fs::symlink(&original, dir.path().join(alias)).unwrap();
+        std::fs::write(dir.path().join("not-a-wrapper.json"), std::fs::read(&original).unwrap()).unwrap();
+        let socket = dir.path().join(format!("{}.json", JobIdentity::new_local().local_wrapper_id));
+        let _listener = std::os::unix::net::UnixListener::bind(socket).unwrap();
+        let mut unknown_schema = handoff_lease(0, 11, 102);
+        unknown_schema.schema_version = 2;
+        std::fs::write(
+            dir.path().join(format!("{}.json", unknown_schema.identity.local_wrapper_id)),
+            serde_json::to_vec(&unknown_schema).unwrap(),
+        ).unwrap();
+        assert_eq!(recoverable_lease_ids(dir.path(), now, |_| false),
+            [oldest.identity.local_wrapper_id, newer.identity.local_wrapper_id]);
+    }
+
+    #[tokio::test]
+    async fn a_changed_worker_or_build_is_refused_before_spawning_a_recovery_client() {
+        let dir = tempfile::tempdir().unwrap();
+        let lease = handoff_lease(0, 11, 102);
+        let id = &lease.identity.local_wrapper_id;
+        let journal = serde_json::to_vec(&lease).unwrap();
+        let path = dir.path().join(format!("{id}.json"));
+        std::fs::write(&path, &journal).unwrap();
+        for (worker, build) in [("other-worker", 7), ("worker1", 8)] {
+            let mut candidate = candidate(id, worker);
+            candidate.build_id = build;
+            let error = recover_in(
+                &dir.path().join("client-that-must-not-start"),
+                &dir.path().join("unused.sock"), dir.path(), id, Some(&candidate),
+            ).await.unwrap_err();
+            assert!(error.contains("admission changed after scanning"), "{error}");
+            assert_eq!(std::fs::read(&path).unwrap(), journal);
+        }
     }
 }
