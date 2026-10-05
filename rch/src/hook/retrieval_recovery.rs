@@ -7,6 +7,8 @@ use std::io::Read;
 
 #[path = "result_recovery.rs"]
 mod result_recovery;
+#[path = "recovery_owner.rs"]
+mod recovery_owner;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct RecoveryRecipe {
@@ -892,7 +894,22 @@ async fn cancel_source_grant(mut session: RecoverySession) -> anyhow::Result<boo
 
 /// Recollect the admitted command's outputs; no execution path is reachable.
 pub(crate) async fn recover_job(writer: &DurableLeaseWriter) -> anyhow::Result<i32> {
+    // Hold one journal owner across the ENTIRE detached recovery, including
+    // worker probes and source release. claim reloads the latest disk state
+    // after acquisition and never mistakes an unverified wrapper for a dead one.
+    let _ownership = recovery_owner::claim(writer).await?;
     let recipe = load_recipe(writer)?;
+    let lease = writer.snapshot();
+    if lease.terminal_acknowledged {
+        let exit = recipe
+            .returned
+            .context("terminal recovery lacks a delivery result")?;
+        anyhow::ensure!(
+            recipe.retired && lease.exit_code == Some(exit),
+            "terminal recovery contradicts its retained delivery/retirement evidence"
+        );
+        return Ok(exit);
+    }
     if !recipe.execution_started {
         cancel_preparation(writer).await?;
         writer.record_exit(EXIT_BUILD_ERROR)?;
