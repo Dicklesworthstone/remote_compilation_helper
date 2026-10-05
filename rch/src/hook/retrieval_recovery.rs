@@ -9,6 +9,8 @@ use std::io::Read;
 mod result_recovery;
 #[path = "recovery_owner.rs"]
 mod recovery_owner;
+#[path = "recovery_completion.rs"]
+mod recovery_completion;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct RecoveryRecipe {
@@ -31,6 +33,10 @@ pub(crate) struct RecoveryRecipe {
     phases: Vec<RecoveryPhase>,
     exit_code: Option<i32>,
     returned: Option<i32>,
+    /// Daemon accounting may have completed earlier through cancellation.
+    /// Preserve its outcome independently of command and artifact delivery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    daemon_exit_code: Option<i32>,
     #[serde(default)]
     prepared: bool,
     #[serde(default)]
@@ -210,6 +216,7 @@ impl RecoverySession {
             phases: Vec::new(),
             exit_code: None,
             returned: None,
+            daemon_exit_code: None,
             prepared: false,
             execution_started: false,
             preparation_cancelled: false,
@@ -384,6 +391,7 @@ impl RecoverySession {
             phases,
             exit_code: None,
             returned: None,
+            daemon_exit_code: None,
             prepared: true,
             execution_started: false,
             preparation_cancelled: false,
@@ -894,9 +902,27 @@ async fn cancel_source_grant(mut session: RecoverySession) -> anyhow::Result<boo
 
 /// Recollect the admitted command's outputs; no execution path is reachable.
 pub(crate) async fn recover_job(writer: &DurableLeaseWriter) -> anyhow::Result<i32> {
+    // Resolve lazily so an already acknowledged journal stays a read-only
+    // operation, but pin the chosen endpoint across the entire handoff.
+    let mut socket = None;
+    Box::pin(recover_job_with_daemon(writer, async |command: &str| {
+        if socket.is_none() {
+            let config = crate::config::load_config()?;
+            socket = Some(shellexpand::tilde(&config.general.socket_path).into_owned());
+        }
+        recovery_completion::request(socket.as_deref().expect("resolved socket"), command).await
+    }))
+    .await
+}
+
+async fn recover_job_with_daemon(
+    writer: &DurableLeaseWriter,
+    mut daemon: impl AsyncFnMut(&str) -> anyhow::Result<String>,
+) -> anyhow::Result<i32> {
     // Hold one journal owner across the ENTIRE detached recovery, including
-    // worker probes and source release. claim reloads the latest disk state
-    // after acquisition and never mistakes an unverified wrapper for a dead one.
+    // worker probes, source release and final daemon reservation reconciliation.
+    // claim reloads the latest disk state after acquisition and never mistakes
+    // an unverified wrapper for a dead one.
     let _ownership = recovery_owner::claim(writer).await?;
     let recipe = load_recipe(writer)?;
     let lease = writer.snapshot();
@@ -913,7 +939,7 @@ pub(crate) async fn recover_job(writer: &DurableLeaseWriter) -> anyhow::Result<i
     if !recipe.execution_started {
         cancel_preparation(writer).await?;
         writer.record_exit(EXIT_BUILD_ERROR)?;
-        writer.acknowledge_terminal()?;
+        recovery_completion::finish(writer, &mut daemon).await?;
         return Ok(EXIT_BUILD_ERROR);
     }
     if let Some(exit) = recipe.returned {
@@ -923,7 +949,7 @@ pub(crate) async fn recover_job(writer: &DurableLeaseWriter) -> anyhow::Result<i
         };
         session.retire_returned().await?;
         writer.record_exit(exit)?;
-        writer.acknowledge_terminal()?;
+        recovery_completion::finish(writer, &mut daemon).await?;
         return Ok(exit);
     }
     let mut session = RecoverySession {
@@ -958,7 +984,7 @@ pub(crate) async fn recover_job(writer: &DurableLeaseWriter) -> anyhow::Result<i
             );
             cancel_source_grant(session).await?;
             writer.record_exit(EXIT_BUILD_ERROR)?;
-            writer.acknowledge_terminal()?;
+            recovery_completion::finish(writer, &mut daemon).await?;
             return Ok(EXIT_BUILD_ERROR);
         }
         anyhow::bail!(
@@ -1091,7 +1117,7 @@ pub(crate) async fn recover_job(writer: &DurableLeaseWriter) -> anyhow::Result<i
     session.retired()?;
     session.discard_completion_receipts().await;
     writer.record_exit(exit)?;
-    writer.acknowledge_terminal()?;
+    recovery_completion::finish(writer, &mut daemon).await?;
     Ok(exit)
 }
 
