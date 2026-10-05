@@ -630,7 +630,9 @@ async fn probe_rustup_inventory() -> (Vec<String>, Vec<String>, Vec<String>) {
             &home,
             &cache,
             &inventory_environment(),
-            std::time::Duration::from_secs(1),
+            // The lock holder may be mid-scan (up to the scan budget) and fsyncs under the lock;
+            // on a saturated disk a 1s wait made concurrent health checks report no runtime.
+            std::time::Duration::from_secs(15),
             std::time::Duration::from_secs(20),
         )
         .await
