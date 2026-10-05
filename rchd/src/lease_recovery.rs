@@ -16,8 +16,9 @@ use crate::events::EventBus;
 use rch_common::job_identity::{DurableJobLease, default_job_lease_directory};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::time::Instant;
 use tracing::{info, warn};
 
@@ -29,6 +30,10 @@ const MAX_RECOVERIES_PER_CYCLE: usize = 4;
 /// Deadline handed to `rch jobs recover`, plus slack before the child is killed.
 const RECOVER_TIMEOUT_SECS: u64 = 300;
 const RECOVER_KILL_AFTER: Duration = Duration::from_secs(RECOVER_TIMEOUT_SECS + 30);
+/// Keep diagnostics bounded even when a recovery produces gigabytes of output.
+const RECOVER_STDERR_TAIL_BYTES: usize = 16 * 1024;
+/// Reap the direct child after timeout without wedging the recovery service.
+const RECOVER_REAP_TIMEOUT: Duration = Duration::from_secs(5);
 /// Retry delay after the first failure; doubles per failure up to the cap.
 const BACKOFF_BASE: Duration = Duration::from_secs(10 * 60);
 const BACKOFF_MAX: Duration = Duration::from_secs(6 * 60 * 60);
@@ -260,18 +265,20 @@ async fn recover_in(
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
-        .output();
-    let output = match tokio::time::timeout(RECOVER_KILL_AFTER, child).await {
-        Ok(Ok(output)) => output,
-        Ok(Err(error)) => return Err(format!("cannot run {}: {error}", rch.display())),
-        Err(_) => return Err(format!("timed out after {}s", RECOVER_KILL_AFTER.as_secs())),
-    };
-    if output.status.success() {
+        .spawn()
+        .map_err(|error| format!("cannot run {}: {error}", rch.display()))?;
+    let (status, stderr) = collect_recovery_child(child, RECOVER_KILL_AFTER).await?;
+    if status.success() {
         let after = read_lease(lease_dir, wrapper_id)?;
         return verify_recovery_completion(&before, &after);
     }
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let tail: String = stderr
+    Err(format!("{status}: {}", diagnostic_tail(&stderr)))
+}
+
+fn diagnostic_tail(bytes: &[u8]) -> String {
+    // A byte-bounded tail may begin inside a UTF-8 codepoint. Lossy decoding
+    // keeps diagnostics printable without interpreting bytes as authority.
+    String::from_utf8_lossy(bytes)
         .trim()
         .chars()
         .rev()
@@ -279,14 +286,169 @@ async fn recover_in(
         .collect::<Vec<_>>()
         .into_iter()
         .rev()
-        .collect();
-    Err(format!("{}: {tail}", output.status))
+        .collect()
+}
+
+async fn drain_recovery_stderr(
+    reader: &mut (impl AsyncRead + Unpin),
+    tail: &mut Vec<u8>,
+) -> std::io::Result<()> {
+    let mut chunk = [0u8; 4096];
+    loop {
+        let count = reader.read(&mut chunk).await?;
+        if count == 0 {
+            return Ok(());
+        }
+        let retained = RECOVER_STDERR_TAIL_BYTES - count;
+        if tail.len() > retained {
+            tail.drain(..tail.len() - retained);
+        }
+        tail.extend_from_slice(&chunk[..count]);
+        // Continue draining after the cap: stopping here would block the child
+        // on a full pipe and turn noisy but healthy recovery into a timeout.
+    }
+}
+
+/// One deadline covers both exit and stderr EOF. A descendant can retain the
+/// pipe after its parent exits; neither a completed wait nor full diagnostics
+/// alone establishes recovery completion. No reader task is detached.
+async fn collect_recovery_child(
+    mut child: tokio::process::Child,
+    budget: Duration,
+) -> Result<(ExitStatus, Vec<u8>), String> {
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "recovery child has no diagnostic pipe".to_owned())?;
+    let mut tail = Vec::with_capacity(RECOVER_STDERR_TAIL_BYTES);
+    let completed = tokio::time::timeout(budget, async {
+        tokio::try_join!(child.wait(), drain_recovery_stderr(&mut stderr, &mut tail))
+    })
+    .await;
+    let failure = match completed {
+        Ok(Ok((status, ()))) => return Ok((status, tail)),
+        Ok(Err(error)) => format!("cannot collect recovery child: {error}"),
+        Err(_) => format!(
+            "recovery timed out after {}ms waiting for child exit and diagnostic EOF",
+            budget.as_millis()
+        ),
+    };
+    // kill_on_drop covers cancellation of this entire future. On our own
+    // timeout/error path, explicitly wait for the direct child to be reaped.
+    // Worker processes are governed by durable source ownership, not by this
+    // local child's PID, and no remote completion is inferred from killing it.
+    let _ = child.start_kill();
+    let cleanup = match tokio::time::timeout(RECOVER_REAP_TIMEOUT, child.wait()).await {
+        Ok(Ok(_)) => String::new(),
+        Ok(Err(error)) => format!("; child reap failed: {error}"),
+        Err(_) => "; child reap remains unconfirmed".to_owned(),
+    };
+    Err(format!("{failure}{cleanup}: {}", diagnostic_tail(&tail)))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use rch_common::job_identity::JobIdentity;
+
+    #[tokio::test]
+    async fn recovery_stderr_drains_beyond_capacity_and_keeps_only_the_tail() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let (mut sender, mut receiver) = tokio::io::duplex(128);
+        let mut tail = Vec::with_capacity(RECOVER_STDERR_TAIL_BYTES);
+        let expected = vec![0xfe; RECOVER_STDERR_TAIL_BYTES];
+        let producer = async {
+            for _ in 0..512 {
+                sender.write_all(&[b'x'; 4096]).await.unwrap();
+            }
+            sender.write_all(&expected).await.unwrap();
+            sender.shutdown().await.unwrap();
+        };
+        let consumer = drain_recovery_stderr(&mut receiver, &mut tail);
+        let ((), drained) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(producer, consumer)
+        })
+        .await
+        .unwrap();
+        drained.unwrap();
+        assert_eq!(tail, expected);
+        assert_eq!(tail.capacity(), RECOVER_STDERR_TAIL_BYTES);
+        assert_eq!(diagnostic_tail(&tail).chars().count(), 400);
+    }
+
+    #[cfg(unix)]
+    fn fixture_child(script: &str) -> tokio::process::Child {
+        tokio::process::Command::new("/bin/sh")
+            .args(["-c", script])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn recovery_child_streams_large_diagnostics_and_preserves_nonzero_exit() {
+        let child = fixture_child(
+            "awk 'BEGIN { for (i=0; i<32768; i++) print \"0123456789abcdef\" }' >&2; \
+             printf 'final recovery failure\\n' >&2; exit 7",
+        );
+        let (status, tail) = collect_recovery_child(child, Duration::from_secs(10))
+            .await
+            .unwrap();
+        assert_eq!(status.code(), Some(7));
+        assert_eq!(tail.len(), RECOVER_STDERR_TAIL_BYTES);
+        assert!(diagnostic_tail(&tail).ends_with("final recovery failure"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn recovery_timeout_reaps_the_direct_child_before_returning() {
+        let child = fixture_child("exec sleep 30");
+        let pid = child.id().unwrap();
+        let error = collect_recovery_child(child, Duration::from_millis(100))
+            .await
+            .unwrap_err();
+        assert!(error.contains("timed out"), "{error}");
+        assert!(!is_process_alive(pid), "timed-out recovery child survived");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn recovery_deadline_also_bounds_a_pipe_retained_after_child_exit() {
+        // Keep the pipe open in a separately owned child so cleanup is explicit,
+        // while presenting the same EOF condition as an inherited descriptor.
+        let mut holder = fixture_child("exec sleep 30");
+        let mut child = fixture_child("exit 0");
+        assert!(child.wait().await.unwrap().success());
+        child.stderr = holder.stderr.take();
+        let error = collect_recovery_child(child, Duration::from_millis(100))
+            .await
+            .unwrap_err();
+        holder.kill().await.unwrap();
+        assert!(error.contains("diagnostic EOF"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelling_recovery_does_not_detach_its_child_or_pipe_reader() {
+        let child = fixture_child("exec sleep 30");
+        let pid = child.id().unwrap();
+        let task = tokio::spawn(collect_recovery_child(child, Duration::from_secs(60)));
+        tokio::task::yield_now().await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while is_process_alive(pid) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("cancelled recovery child must exit");
+    }
 
     fn lease(heartbeat_unix_ms: u64, pid: u32, recipe: serde_json::Value) -> DurableJobLease {
         let mut identity = JobIdentity::new_local();
