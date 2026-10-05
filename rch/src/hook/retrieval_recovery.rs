@@ -5,6 +5,9 @@ use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::Read;
 
+#[path = "result_recovery.rs"]
+mod result_recovery;
+
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct RecoveryRecipe {
     version: u32,
@@ -56,6 +59,9 @@ struct RecoveryPhase {
     #[serde(default)]
     pending: Option<(PathBuf, String)>,
     complete: bool,
+    /// A failed delivery is terminal evidence, not a completed publication.
+    #[serde(default)]
+    missing_result: Option<result_recovery::MissingResult>,
 }
 
 pub(crate) struct RecoverySession {
@@ -282,6 +288,7 @@ impl RecoverySession {
                 published: BTreeMap::new(),
                 pending: None,
                 complete: false,
+                missing_result: None,
             });
         }
         if let Some(target) = target {
@@ -299,6 +306,7 @@ impl RecoverySession {
                     published: BTreeMap::new(),
                     pending: None,
                     complete: false,
+                    missing_result: None,
                 });
             }
         }
@@ -315,6 +323,7 @@ impl RecoverySession {
                 published: BTreeMap::new(),
                 pending: None,
                 complete: false,
+                missing_result: None,
             });
         }
         for phase in &mut phases {
@@ -402,6 +411,10 @@ impl RecoverySession {
             self.recipe.execution_started,
             "completion requires an admitted execution attempt"
         );
+        anyhow::ensure!(
+            self.recipe.exit_code.is_none_or(|observed| observed == exit),
+            "remote completion contradicts the recorded command outcome; ownership retained"
+        );
         self.recipe.exit_code = Some(exit);
         self.persist()
     }
@@ -447,6 +460,10 @@ impl RecoverySession {
             .iter()
             .position(|phase| phase.name == name)
             .context("missing retrieval phase")?;
+        anyhow::ensure!(
+            self.recipe.phases[index].missing_result.is_none(),
+            "a missing required result cannot be published as complete"
+        );
         if self.recipe.phases[index].complete {
             return Ok(());
         }
@@ -603,6 +620,11 @@ impl RecoverySession {
         Ok(())
     }
     pub(crate) fn returned(&mut self, exit: i32) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !result_recovery::has_missing_results(&self.recipe)
+                || exit == EXIT_ARTIFACT_TRANSFER_FAILED,
+            "missing required outputs must remain a delivery failure"
+        );
         self.recipe.returned = Some(exit);
         self.persist()
     }
@@ -639,7 +661,9 @@ impl RecoverySession {
         self.persist()?;
         // A retired job never publishes again; drop any stage a failed or
         // skipped phase left behind.
-        if let Some(stages) = self.stage(0).parent() {
+        if !result_recovery::has_missing_results(&self.recipe)
+            && let Some(stages) = self.stage(0).parent()
+        {
             let _ = std::fs::remove_dir_all(stages);
         }
         Ok(())
@@ -742,6 +766,11 @@ impl RecoverySession {
     /// Worker receipts are garbage once retirement is durable. A failed delete
     /// strands a few small files and must never fail the finished build.
     async fn discard_completion_receipts(&self) {
+        // Keep the original outcome and any partial staging for inspection of
+        // a terminal missing-result failure. Never fabricate retrieved output.
+        if result_recovery::has_missing_results(&self.recipe) {
+            return;
+        }
         let pipeline = self.completion_pipeline(TransferPipeline::new(
             self.recipe.project_root.clone(),
             "recovery".into(),
@@ -771,6 +800,7 @@ fn load_recipe(writer: &DurableLeaseWriter) -> anyhow::Result<RecoveryRecipe> {
             && lease.worker_id.as_deref() == Some(recipe.worker.id.as_str()),
         "recovery recipe identity mismatch or unsupported source ownership version"
     );
+    result_recovery::validate_missing_results(&recipe)?;
     Ok(recipe)
 }
 
@@ -941,9 +971,10 @@ pub(crate) async fn recover_job(writer: &DurableLeaseWriter) -> anyhow::Result<i
     .await?;
     let base = base.with_source_authority(session.recipe.identity.clone())?;
     session.completed(exit)?;
+    let command_exit = exit;
     for index in 0..session.recipe.phases.len() {
         let phase = session.recipe.phases[index].clone();
-        if phase.complete || (exit != 0 && phase.result_dir.is_none()) {
+        if phase.complete || (command_exit != 0 && phase.result_dir.is_none()) {
             continue;
         }
         sources.ensure_held()?;
@@ -956,8 +987,14 @@ pub(crate) async fn recover_job(writer: &DurableLeaseWriter) -> anyhow::Result<i
             .with_retrieval_reference_root(phase.local.clone())
             .with_local_root(session.stage(index));
         std::fs::create_dir_all(session.stage(index))?;
-        if let Some(dir) = &phase.result_dir {
-            pipeline.retrieve_result_dir(&worker, dir).await?;
+        if phase.result_dir.is_some() {
+            // The completion receipt and recovered source grant above fence
+            // the producer. Absence is now a failed output contract, not an
+            // endlessly retryable transfer. Still collect other result dirs.
+            if !result_recovery::collect_result(&mut session, index, &pipeline, &worker).await? {
+                exit = EXIT_ARTIFACT_TRANSFER_FAILED;
+                continue;
+            }
         } else {
             let retrieved = match pipeline.retrieve_artifacts(&worker, &phase.patterns).await {
                 Ok(retrieved) => retrieved,
@@ -1115,6 +1152,7 @@ mod tests {
             published: BTreeMap::new(),
             pending: None,
             complete: false,
+            missing_result: None,
         });
         let session = RecoverySession { recipe, writer };
         std::fs::create_dir(session.stage(0)).unwrap();
