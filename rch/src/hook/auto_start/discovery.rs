@@ -83,12 +83,87 @@ fn prepare_state_dir(path: &Path, uid: u32) -> io::Result<()> {
     Ok(())
 }
 
+/// Remember a verified endpoint so clients with disjoint environment-derived
+/// candidate lists can still find the daemon chosen by another starter. This
+/// is a discovery hint, never readiness evidence: every use probes the peer.
+const ENDPOINT_RECORD_LIMIT: u64 = 4096;
+
+fn candidates_with_record(
+    candidates: &[PathBuf],
+    state_dir: &Path,
+    uid: u32,
+) -> io::Result<Vec<PathBuf>> {
+    let record = state_dir.join("endpoint");
+    let metadata = match std::fs::symlink_metadata(&record) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(candidates.to_vec()),
+        Err(error) => return Err(error),
+    };
+    if !metadata.file_type().is_file()
+        || metadata.uid() != uid
+        || metadata.permissions().mode() & 0o077 != 0
+        || metadata.len() > ENDPOINT_RECORD_LIMIT
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "unsafe daemon endpoint discovery record",
+        ));
+    }
+    let mut bytes = Vec::new();
+    std::fs::File::open(record)?
+        .take(ENDPOINT_RECORD_LIMIT + 1)
+        .read_to_end(&mut bytes)?;
+    let endpoint = parse_endpoint_record(&bytes)?;
+    let mut result = vec![endpoint];
+    for candidate in candidates {
+        if !result.contains(candidate) {
+            result.push(candidate.clone());
+        }
+    }
+    Ok(result)
+}
+
+fn parse_endpoint_record(bytes: &[u8]) -> io::Result<PathBuf> {
+    let text = std::str::from_utf8(bytes)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let path = PathBuf::from(text);
+    // The effective RCH socket setting is a String. Refuse unrepresentable
+    // endpoints rather than health-checking one path then dispatching to a
+    // lossy UTF-8 replacement of it.
+    if bytes.len() as u64 > ENDPOINT_RECORD_LIMIT || bytes.contains(&0) || !path.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "daemon endpoint record must contain one absolute UTF-8 path",
+        ));
+    }
+    Ok(path)
+}
+
+fn remember_endpoint(state_dir: &Path, endpoint: &Path) -> io::Result<()> {
+    let bytes = endpoint.as_os_str().as_encoded_bytes();
+    parse_endpoint_record(bytes)?;
+    // Called with the discovery gate held. Atomic replacement means readers
+    // see the old complete hint or the new complete hint, never a partial path.
+    let mut temporary = tempfile::NamedTempFile::new_in(state_dir)?;
+    std::io::Write::write_all(&mut temporary, bytes)?;
+    temporary.as_file().sync_all()?;
+    temporary
+        .persist(state_dir.join("endpoint"))
+        .map_err(|error| error.error)?;
+    Ok(())
+}
+
 async fn probe_candidate(path: &Path, uid: u32) -> Probe {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_socket() && metadata.uid() == uid => {}
         Ok(_) => return Probe::Absent,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Probe::Absent,
         Err(_) => return Probe::Busy,
+    }
+    if path.to_str().is_none() {
+        // RCH's socket configuration cannot represent this endpoint. Keep a
+        // same-user socket conservative rather than silently changing bytes.
+        return Probe::Busy;
     }
     let budget = Duration::from_millis(300);
     let exchange = async {
@@ -163,9 +238,18 @@ async fn recover_default_with_paths(
     let cooldown_path = state_dir.join("startup.cooldown");
     let recovery = async {
         loop {
+            let effective = candidates_with_record(candidates, state_dir, uid)
+                .map_err(AutoStartError::Io)?;
             // A healthy daemon can be reused even while another starter owns
             // the gate or its cooldown is active.
-            if let Discovery::Healthy(path) = discover(candidates, uid).await {
+            if let Discovery::Healthy(path) = discover(&effective, uid).await {
+                // Publishing an already-live endpoint is best-effort here:
+                // lock contention must not make an available daemon unusable.
+                if let Ok(_gate) = acquire_autostart_gate(&gate_path)
+                    && let Err(error) = remember_endpoint(state_dir, &path)
+                {
+                    debug!(%error, "Could not record an already-live daemon endpoint");
+                }
                 return Ok(path);
             }
             let gate = match acquire_autostart_gate(&gate_path) {
@@ -176,9 +260,15 @@ async fn recover_default_with_paths(
                 }
                 Err(error) => return Err(error),
             };
-            // Close the discovery-to-spawn race among upgraded clients.
-            match discover(candidates, uid).await {
-                Discovery::Healthy(path) => return Ok(path),
+            // Re-read after acquiring ownership: another context may have
+            // published an endpoint that was absent from our original list.
+            let effective = candidates_with_record(candidates, state_dir, uid)
+                .map_err(AutoStartError::Io)?;
+            match discover(&effective, uid).await {
+                Discovery::Healthy(path) => {
+                    remember_endpoint(state_dir, &path).map_err(AutoStartError::Io)?;
+                    return Ok(path);
+                }
                 Discovery::Busy => {
                     // An overloaded or initializing listener still owns its
                     // endpoint. Neither unlink it nor start a competitor.
@@ -194,6 +284,7 @@ async fn recover_default_with_paths(
                         launch,
                     )
                     .await?;
+                    remember_endpoint(state_dir, requested).map_err(AutoStartError::Io)?;
                     return Ok(requested.to_path_buf());
                 }
             }
@@ -601,5 +692,153 @@ mod tests {
             io::ErrorKind::PermissionDenied
         );
         assert_eq!(std::fs::metadata(&shared).unwrap().mode() & 0o777, 0o777);
+    }
+
+    #[tokio::test]
+    async fn disjoint_contexts_reuse_the_published_endpoint() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("first.sock");
+        let second = temp.path().join("second.sock");
+        let state = temp.path().join("state");
+        let uid = effective_uid().unwrap();
+        let config = config();
+        let first_candidates = [first.clone()];
+        let second_candidates = [second.clone()];
+        let launches = AtomicUsize::new(0);
+        let servers = Mutex::new(Vec::new());
+        let launch = |socket: &Path| {
+            launches.fetch_add(1, Ordering::SeqCst);
+            servers.lock().unwrap().push(healthy(socket));
+            Ok(())
+        };
+        let (left, right) = tokio::join!(
+            recover_default_with_paths(
+                &config, &first, &first_candidates, &state, uid, launch,
+            ),
+            recover_default_with_paths(
+                &config, &second, &second_candidates, &state, uid, launch,
+            ),
+        );
+        let endpoint = left.unwrap();
+        assert_eq!(right.unwrap(), endpoint);
+        assert_eq!(launches.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            parse_endpoint_record(&std::fs::read(state.join("endpoint")).unwrap()).unwrap(),
+            endpoint
+        );
+        // A later process/context knows neither original candidate but can
+        // reuse the verified record without launching another daemon.
+        let third = temp.path().join("third.sock");
+        assert_eq!(
+            recover_default_with_paths(
+                &config,
+                &third,
+                std::slice::from_ref(&third),
+                &state,
+                uid,
+                no_launch,
+            )
+            .await
+            .unwrap(),
+            endpoint
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_record_is_a_hint_not_readiness_evidence() {
+        let temp = tempfile::tempdir().unwrap();
+        let stale = temp.path().join("stale.sock");
+        drop(UnixListener::bind(&stale).unwrap());
+        let requested = temp.path().join("current.sock");
+        let state = temp.path().join("state");
+        let uid = effective_uid().unwrap();
+        prepare_state_dir(&state, uid).unwrap();
+        remember_endpoint(&state, &stale).unwrap();
+        let mut server = None;
+        let result = recover_default_with_paths(
+            &config(),
+            &requested,
+            std::slice::from_ref(&requested),
+            &state,
+            uid,
+            |socket| {
+                assert_eq!(socket, requested.as_path());
+                server = Some(healthy(socket));
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(result, requested);
+        assert!(server.is_some());
+        assert!(stale.exists());
+        assert_eq!(
+            candidates_with_record(&[], &state, uid).unwrap(),
+            [requested]
+        );
+    }
+
+    #[tokio::test]
+    async fn unsafe_or_corrupt_record_refuses_recovery_without_a_launch() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join("state");
+        let uid = effective_uid().unwrap();
+        prepare_state_dir(&state, uid).unwrap();
+        let record = state.join("endpoint");
+        std::fs::write(&record, b"relative.sock").unwrap();
+        std::fs::set_permissions(&record, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let requested = temp.path().join("new.sock");
+        assert!(matches!(
+            recover_default_with_paths(
+                &config(),
+                &requested,
+                std::slice::from_ref(&requested),
+                &state,
+                uid,
+                no_launch,
+            )
+            .await,
+            Err(AutoStartError::Io(_))
+        ));
+        assert!(!requested.exists());
+        assert!(!state.join("startup.cooldown").exists());
+        assert_eq!(std::fs::read(record).unwrap(), b"relative.sock");
+    }
+
+    #[test]
+    fn endpoint_record_parser_rejects_ambiguous_or_oversized_paths() {
+        for invalid in [&b""[..], &b"relative"[..], &b"/tmp/\0bad"[..], &b"/tmp/\xff"[..]] {
+            assert!(parse_endpoint_record(invalid).is_err());
+        }
+        let oversized = format!("/{}", "x".repeat(ENDPOINT_RECORD_LIMIT as usize));
+        assert!(parse_endpoint_record(oversized.as_bytes()).is_err());
+        assert_eq!(
+            parse_endpoint_record(b"/tmp/a socket with spaces.sock").unwrap(),
+            PathBuf::from("/tmp/a socket with spaces.sock")
+        );
+    }
+
+    #[tokio::test]
+    async fn endpoint_record_must_be_a_private_owned_regular_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join("state");
+        let uid = effective_uid().unwrap();
+        prepare_state_dir(&state, uid).unwrap();
+        let target = temp.path().join("target");
+        std::fs::write(&target, b"/tmp/other.sock").unwrap();
+        std::os::unix::fs::symlink(&target, state.join("endpoint")).unwrap();
+        assert!(candidates_with_record(&[], &state, uid).is_err());
+        assert_eq!(std::fs::read(target).unwrap(), b"/tmp/other.sock");
+
+        let other_state = temp.path().join("other-state");
+        prepare_state_dir(&other_state, uid).unwrap();
+        remember_endpoint(&other_state, Path::new("/tmp/owned.sock")).unwrap();
+        assert!(candidates_with_record(&[], &other_state, uid ^ 1).is_err());
+        std::fs::set_permissions(
+            other_state.join("endpoint"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        assert!(candidates_with_record(&[], &other_state, uid).is_err());
     }
 }
