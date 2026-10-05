@@ -689,25 +689,36 @@ pub(super) fn managed_clean_overlay_cargo_build_dir(
     if subcommand == "fmt" {
         return Ok(command.to_string());
     }
+    let packaging = matches!(subcommand.as_str(), "package" | "publish");
+    if packaging {
+        // Apply the SAME authority check as classification, before inserting
+        // any worker configuration. A dry-run token inside an option value,
+        // --no-verify, or an unknown flag must never enable real publication.
+        anyhow::ensure!(
+            rch_common::patterns::is_cargo_package_verification(command),
+            "managed packaging requires verified cargo package or explicit cargo publish --dry-run"
+        );
+    }
     anyhow::ensure!(
-        matches!(
-            subcommand.as_str(),
-            "build"
-                | "b"
-                | "check"
-                | "c"
-                | "test"
-                | "t"
-                | "clippy"
-                | "doc"
-                | "d"
-                | "bench"
-                | "run"
-                | "r"
-                | "rustc"
-                | "rustdoc"
-                | "fix"
-        ),
+        packaging
+            || matches!(
+                subcommand.as_str(),
+                "build"
+                    | "b"
+                    | "check"
+                    | "c"
+                    | "test"
+                    | "t"
+                    | "clippy"
+                    | "doc"
+                    | "d"
+                    | "bench"
+                    | "run"
+                    | "r"
+                    | "rustc"
+                    | "rustdoc"
+                    | "fix"
+            ),
         "unsupported Cargo subcommand for managed build directory: {subcommand}"
     );
     let end = tokens[index + 1..]
@@ -726,6 +737,35 @@ pub(super) fn managed_clean_overlay_cargo_build_dir(
     );
     tokens.splice(end..end, ["--config".to_string(), value]);
     Ok(join_exec_command(&tokens))
+}
+
+/// Keep the caller's output contract separate from execution-only rewrites.
+/// In particular, injected TOML configuration contains shell quotes which the
+/// conservative package classifier must not interpret as publication authority.
+/// Both live retrieval and the durable recovery recipe use `policy_command`.
+pub(super) struct ManagedCargoCommand<'a> {
+    original: &'a str,
+    rewritten: Option<String>,
+}
+
+impl<'a> ManagedCargoCommand<'a> {
+    pub(super) fn new(command: &'a str, managed_target: Option<&str>) -> anyhow::Result<Self> {
+        let rewritten = managed_target
+            .map(|target| managed_clean_overlay_cargo_build_dir(command, target))
+            .transpose()?;
+        Ok(Self {
+            original: command,
+            rewritten,
+        })
+    }
+
+    pub(super) fn policy_command(&self) -> &str {
+        self.original
+    }
+
+    pub(super) fn execution_command(&self) -> &str {
+        self.rewritten.as_deref().unwrap_or(self.original)
+    }
 }
 
 pub(super) fn bind_build_source_stamp(command: &str, stamp: &str) -> anyhow::Result<String> {
@@ -1012,6 +1052,402 @@ pub(super) fn extract_cargo_target_dir_from_command_tokens(tokens: &[String]) ->
 #[cfg(test)]
 mod managed_build_dir_tests {
     use super::{managed_clean_overlay_cargo_build_dir, managed_clean_overlay_cargo_tokens};
+
+    /// Real Cargo verifies the extracted archive, not merely the working tree.
+    /// The transfer below is local rsync fed by the production artifact policy;
+    /// it does not stand in for daemon admission, SSH or source-lease qualification.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn managed_packaging_real_cargo_verifies_archive_and_returns_identical_bytes() {
+        use super::super::artifact_patterns::get_custom_target_artifact_patterns;
+        use std::fs;
+        use std::io::{Read as _, Write as _};
+        use std::path::{Path, PathBuf};
+        use std::process::{Command, Stdio};
+
+        fn files(root: &Path, directory: &Path, paths: &mut Vec<PathBuf>) {
+            for entry in fs::read_dir(directory).unwrap() {
+                let entry = entry.unwrap();
+                let kind = entry.file_type().unwrap();
+                assert!(
+                    !kind.is_symlink(),
+                    "unexpected fixture symlink: {:?}",
+                    entry.path()
+                );
+                if kind.is_dir() {
+                    files(root, &entry.path(), paths);
+                } else if kind.is_file() {
+                    paths.push(entry.path().strip_prefix(root).unwrap().to_path_buf());
+                }
+            }
+        }
+
+        let root = tempfile::Builder::new()
+            .prefix("rch-managed-package-")
+            .tempdir()
+            .unwrap()
+            .keep();
+        eprintln!(
+            "managed packaging fixture and logs retained at {}",
+            root.display()
+        );
+        for directory in ["src", ".cargo", "bin", "cargo-home", "logs", "returned"] {
+            fs::create_dir(root.join(directory)).unwrap();
+        }
+        // Explicit inclusion keeps the toolchain symlink, logs and managed
+        // caches out of the package, and makes the negative source meaningful.
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname='managed_package_fixture'\nversion='0.1.0'\nedition='2021'\n\
+             include=['Cargo.toml', 'build.rs', 'src/**', 'packaged.txt']\n[workspace]\n",
+        )
+        .unwrap();
+        fs::write(root.join("packaged.txt"), "archive-owned input\n").unwrap();
+        fs::write(root.join("worktree-only.txt"), "excluded input\n").unwrap();
+        let source = b"pub const MESSAGE: &str = include_str!(\"../packaged.txt\");\n";
+        fs::write(root.join("src/lib.rs"), source).unwrap();
+        fs::write(
+            root.join("build.rs"),
+            r#"fn main() {
+    let origin = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+    let out = std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
+    std::fs::write(out.join("rch-package-origin"), origin).unwrap();
+}
+"#,
+        )
+        .unwrap();
+        let outside_file = root.join("outside-file-config");
+        let outside_env = root.join("outside-environment");
+        fs::write(
+            root.join(".cargo/config.toml"),
+            format!(
+                "[build]\nbuild-dir={}\n",
+                toml::Value::String(outside_file.to_str().unwrap().to_owned())
+            ),
+        )
+        .unwrap();
+
+        // Follow the same test-only real-Cargo resolution as the other native
+        // managed-build-dir fixtures. Never intercept or replace a real compiler.
+        let mut cargo = PathBuf::from(env!("CARGO"));
+        if fs::metadata(&cargo).unwrap().len() <= 8 * 1024
+            && fs::read_to_string(&cargo)
+                .unwrap()
+                .lines()
+                .any(|line| line.starts_with("# rch-toolchain-wrap-version:"))
+        {
+            cargo.set_file_name("cargo-rch-real");
+        }
+        let mut magic = [0; 4];
+        fs::File::open(&cargo)
+            .unwrap()
+            .read_exact(&mut magic)
+            .unwrap();
+        assert_eq!(&magic, b"\x7fELF", "fixture requires real Cargo");
+        let cargo_bin = cargo.parent().unwrap();
+        std::os::unix::fs::symlink(&cargo, root.join("bin/cargo")).unwrap();
+        let path = std::env::join_paths([
+            root.join("bin"),
+            cargo_bin.to_path_buf(),
+            PathBuf::from("/usr/bin"),
+            PathBuf::from("/bin"),
+        ])
+        .unwrap();
+        let run = |name: &str, command: &str, pool: &Path| {
+            let plan =
+                super::ManagedCargoCommand::new(command, Some(pool.to_str().unwrap())).unwrap();
+            let stamped =
+                super::bind_build_source_stamp(plan.execution_command(), &"a".repeat(40)).unwrap();
+            let guarded = super::guard_clean_overlay_cargo_config(&stamped).unwrap();
+            // Fixed, fixture-owned commands only. timeout also bounds compiler
+            // descendants; no test relies on an indefinitely running child.
+            let output = Command::new("/usr/bin/timeout") // ubs:ignore — native Cargo regression in an owned temporary project.
+                .args(["--kill-after=5", "120", "sh", "-c", &guarded])
+                .current_dir(&root)
+                .env_clear()
+                .env("PATH", &path)
+                .env("HOME", &root)
+                .env("CARGO_HOME", root.join("cargo-home"))
+                .env("CARGO_TARGET_DIR", pool)
+                .env("CARGO_BUILD_BUILD_DIR", &outside_env)
+                .env("RUSTC", cargo_bin.join("rustc"))
+                .env("RUSTUP_AUTO_INSTALL", "0")
+                .env("RCH_CARGO_WRAPPER_BYPASS", "1")
+                .env("LC_ALL", "C")
+                .output()
+                .expect("GNU timeout and the fixture's native Cargo must be available");
+            fs::write(root.join(format!("logs/{name}.stdout")), &output.stdout).unwrap();
+            fs::write(root.join(format!("logs/{name}.stderr")), &output.stderr).unwrap();
+            output
+        };
+
+        let command = "cargo package --offline --allow-dirty --no-metadata -j1";
+        let pool = root.join("managed pool");
+        let packaged = run("package", command, &pool);
+        assert!(packaged.status.success(), "{packaged:?}");
+        let mut inventory = Vec::new();
+        files(&pool, &pool, &mut inventory);
+        let extracted = pool.join("package/managed_package_fixture-0.1.0");
+        assert!(
+            inventory.iter().any(|relative| {
+                relative
+                    .file_name()
+                    .is_some_and(|name| name == "rch-package-origin")
+                    && fs::read_to_string(pool.join(relative)).unwrap()
+                        == extracted.to_str().unwrap()
+            }),
+            "verification must execute the build script from the extracted archive"
+        );
+
+        let plan =
+            super::ManagedCargoCommand::new(command, Some(pool.to_str().unwrap())).unwrap();
+        let patterns = get_custom_target_artifact_patterns(
+            Some(rch_common::CompilationKind::CargoBuild),
+            Some(plan.policy_command()),
+        );
+        let pipeline = crate::transfer::TransferPipeline::new(
+            root.join("returned"),
+            "native-package".into(),
+            "fixture".into(),
+            rch_common::TransferConfig::default(),
+        );
+        let (selected, _) = pipeline
+            .partition_staged_artifact_paths(&inventory, &patterns)
+            .unwrap();
+        let archive = PathBuf::from("package/managed_package_fixture-0.1.0.crate");
+        assert_eq!(selected, [archive.clone()]);
+        let mut rsync = Command::new("/usr/bin/timeout") // ubs:ignore — copies only production-selected fixture archives, locally.
+            .args([
+                "--kill-after=5",
+                "60",
+                "rsync",
+                "-a",
+                "--from0",
+                "--files-from=-",
+                "--",
+            ])
+            .arg(format!("{}/", pool.display()))
+            .arg(format!("{}/", root.join("returned").display()))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("rsync must be available for the native retrieval fixture");
+        {
+            let mut input = rsync.stdin.take().unwrap();
+            for relative in &selected {
+                input
+                    .write_all(relative.as_os_str().as_encoded_bytes())
+                    .unwrap();
+                input.write_all(&[0]).unwrap();
+            }
+        }
+        let transferred = rsync.wait_with_output().unwrap();
+        assert!(transferred.status.success(), "{transferred:?}");
+        let original = fs::read(pool.join(&archive)).unwrap();
+        let returned = fs::read(root.join("returned").join(&archive)).unwrap();
+        assert_eq!(blake3::hash(&returned), blake3::hash(&original));
+        let mut members = tar::Archive::new(flate2::read::GzDecoder::new(returned.as_slice()));
+        let mut saw_source = false;
+        for entry in members.entries().unwrap() {
+            let mut entry = entry.unwrap();
+            let path = entry.path().unwrap().into_owned();
+            assert!(!path.ends_with("worktree-only.txt"));
+            if path.ends_with("src/lib.rs") {
+                let mut bytes = Vec::new();
+                entry.read_to_end(&mut bytes).unwrap();
+                assert_eq!(bytes.as_slice(), &source[..]);
+                saw_source = true;
+            }
+        }
+        assert!(saw_source);
+        assert!(!outside_file.exists() && !outside_env.exists());
+
+        // The worktree remains buildable, but the archive deliberately omits
+        // the required input. Verification must fail, not silently build the
+        // working tree or reuse artifacts from the earlier verified package.
+        fs::write(
+            root.join("src/lib.rs"),
+            b"pub const MESSAGE: &str = include_str!(\"../worktree-only.txt\");\n",
+        )
+        .unwrap();
+        let check = run(
+            "worktree",
+            "cargo check --offline -j1",
+            &root.join("check pool"),
+        );
+        assert!(check.status.success(), "{check:?}");
+        let failed_pool = root.join("failed package pool");
+        let failed = run("package-missing-input", command, &failed_pool);
+        assert_eq!(failed.status.code(), Some(101), "{failed:?}");
+        assert!(String::from_utf8_lossy(&failed.stderr).contains("worktree-only.txt"));
+        assert!(
+            failed_pool.join(&archive).is_file(),
+            "failure must occur after archive creation"
+        );
+        assert_eq!(
+            fs::read(root.join("worktree-only.txt")).unwrap(),
+            b"excluded input\n"
+        );
+        assert!(!outside_file.exists() && !outside_env.exists());
+    }
+
+    #[test]
+    fn managed_packaging_preserves_the_classified_command_and_binds_the_cache() {
+        use rch_common::patterns::{classify_command, is_cargo_package_verification};
+
+        let target = "/worker/cache with 'single' and \"double\" quotes";
+        for command in [
+            "cargo package --offline -j1",
+            "cargo publish --dry-run --locked -j1",
+            "cargo publish -n --workspace -p demo",
+            "cargo +nightly package --locked",
+            "cargo --offline publish --dry-run",
+            "env CARGO_HOME=/tmp/cargo cargo publish --dry-run",
+        ] {
+            assert!(is_cargo_package_verification(command), "{command}");
+            assert_eq!(
+                classify_command(command).kind,
+                Some(rch_common::CompilationKind::CargoBuild),
+                "{command}"
+            );
+            let plan = super::ManagedCargoCommand::new(command, Some(target)).unwrap();
+            assert_eq!(plan.policy_command(), command);
+            let original = shell_words::split(command).unwrap();
+            let rewritten = shell_words::split(plan.execution_command()).unwrap();
+            assert_eq!(&rewritten[..original.len()], original.as_slice());
+            assert_eq!(rewritten.len(), original.len() + 2);
+            assert_eq!(rewritten[original.len()], "--config");
+            let config: toml::Value = toml::from_str(&rewritten[original.len() + 1]).unwrap();
+            assert_eq!(config["build"]["build-dir"].as_str(), Some(target));
+        }
+    }
+
+    #[test]
+    fn managed_packaging_never_promotes_publication_or_a_dry_run_option_value() {
+        for command in [
+            "cargo publish",
+            "cargo publish --no-verify --dry-run",
+            "cargo package --no-verify",
+            "cargo package --list",
+            "cargo publish --help --dry-run",
+            "cargo publish --token --dry-run",
+            "cargo publish --token=--dry-run",
+            "cargo publish --registry=-n",
+            "cargo publish --config=--dry-run",
+            "cargo publish --manifest-path --dry-run",
+            "cargo publish --unknown --dry-run",
+            "cargo publish -- --dry-run",
+            "cargo publish --dry-run=false",
+            "cargo publish --dry-run --build-dir /unmanaged",
+            "cargo publish --dry-run; cargo publish",
+            "cargo publish '$MODE'",
+            "cargo package --config 'build.jobs=1'",
+        ] {
+            assert!(
+                super::ManagedCargoCommand::new(command, Some("/worker/target")).is_err(),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn managed_packaging_keeps_archive_only_delivery_through_all_execution_rewrites() {
+        use super::super::artifact_patterns::{
+            expected_output_glob_list, get_custom_target_artifact_patterns,
+            get_project_artifact_patterns, sync_back_verified_zero_package_archives,
+        };
+        use std::collections::BTreeSet;
+        use std::path::PathBuf;
+
+        let kind = Some(rch_common::CompilationKind::CargoBuild);
+        let archives: Vec<PathBuf> = [
+            "package/demo-0.1.0.crate",
+            "package/tmp-registry/dependency-0.1.0.crate",
+            "package/tmp-crate/demo-0.1.0.crate",
+        ]
+        .into_iter()
+        .map(PathBuf::from)
+        .collect();
+        let mut inventory = archives.clone();
+        inventory.extend(
+            [
+                "package/demo-0.1.0/src/lib.rs",
+                "package/tmp-registry/index/config.json",
+                ".rustc_info.json",
+                "debug/stale-executable",
+                "debug/incremental/stale.o",
+            ]
+            .into_iter()
+            .map(PathBuf::from),
+        );
+        for command in ["cargo package --offline", "cargo publish --dry-run --locked"] {
+            for target in [None, Some("/worker/managed pool")] {
+                let plan = super::ManagedCargoCommand::new(command, target).unwrap();
+                let stamped =
+                    super::bind_build_source_stamp(plan.execution_command(), &"a".repeat(40))
+                        .unwrap();
+                assert!(stamped.contains("RCH_BUILD_SOURCE"));
+                assert_eq!(plan.policy_command(), command);
+                let patterns =
+                    get_custom_target_artifact_patterns(kind, Some(plan.policy_command()));
+                assert_eq!(
+                    expected_output_glob_list(&patterns),
+                    [
+                        "package/*.crate",
+                        "package/tmp-registry/*.crate",
+                        "package/tmp-crate/*.crate",
+                    ]
+                );
+                assert!(
+                    get_project_artifact_patterns(kind, Some(plan.policy_command()), true)
+                        .is_empty()
+                );
+                assert_eq!(
+                    get_project_artifact_patterns(kind, Some(plan.policy_command()), false),
+                    [
+                        "target/package/*.crate",
+                        "target/package/tmp-registry/*.crate",
+                        "target/package/tmp-crate/*.crate",
+                    ]
+                );
+                let pipeline = crate::transfer::TransferPipeline::new(
+                    PathBuf::from("/unused/local"),
+                    "package-policy".into(),
+                    "fixture".into(),
+                    rch_common::TransferConfig::default(),
+                );
+                let (selected, excluded) = pipeline
+                    .partition_staged_artifact_paths(&inventory, &patterns)
+                    .unwrap();
+                assert_eq!(
+                    selected.into_iter().collect::<BTreeSet<_>>(),
+                    archives.iter().cloned().collect::<BTreeSet<_>>()
+                );
+                assert_eq!(excluded.len(), 5);
+                assert!(sync_back_verified_zero_package_archives(
+                    Some(0),
+                    plan.policy_command()
+                ));
+                assert!(!sync_back_verified_zero_package_archives(
+                    Some(1),
+                    plan.policy_command()
+                ));
+                assert!(!sync_back_verified_zero_package_archives(
+                    None,
+                    plan.policy_command()
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn unmanaged_command_plan_does_not_reclassify_or_rewrite_non_cargo_jobs() {
+        let command = "python3 -I collect.py --config 'literal $value'";
+        let plan = super::ManagedCargoCommand::new(command, None).unwrap();
+        assert_eq!(plan.policy_command(), command);
+        assert_eq!(plan.execution_command(), command);
+    }
 
     #[test]
     fn explicit_target_honors_inline_config_and_shell_quoting() {

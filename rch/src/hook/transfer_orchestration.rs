@@ -1541,16 +1541,19 @@ async fn execute_remote_compilation_inner(
             normalized_project_root.display()
         )
     })?;
-    let managed_overlay_command = clean_overlay
+    let managed_target = clean_overlay
         .filter(|_| clean_overlay_cargo)
-        .map(|_| {
-            super::cargo_target_dir::managed_clean_overlay_cargo_build_dir(
-                command,
-                &pipeline.remote_cargo_target_dir(),
-            )
-        })
-        .transpose()?;
-    let command = managed_overlay_command.as_deref().unwrap_or(command);
+        .map(|_| pipeline.remote_cargo_target_dir());
+    let command_plan = super::cargo_target_dir::ManagedCargoCommand::new(
+        command,
+        managed_target.as_deref(),
+    )?;
+    // Capture output semantics BEFORE build-dir binding and source stamping.
+    // Both inject quoted Cargo configuration, which is deliberately outside
+    // the classifier's publication grammar. They must not widen archive-only
+    // delivery or disable its zero-archive gate (#86, bd-3kskq).
+    let policy_command = command_plan.policy_command();
+    let command = command_plan.execution_command();
     let mut recovery_session =
         if !worker_is_windows && !super::ssh::should_skip_remote_preflight(&worker_config) {
             durable_lease
@@ -1574,7 +1577,7 @@ async fn execute_remote_compilation_inner(
                         normalized_project_root.clone(),
                         forwarded_cargo_target_dir.as_deref(),
                         kind,
-                        command,
+                        policy_command,
                         result_dirs,
                         recovery_identity.clone(),
                     )
@@ -1677,12 +1680,8 @@ async fn execute_remote_compilation_inner(
     } else {
         None
     };
-    // Output policy comes from the command the recovery recipe recorded. The
-    // stamp's quoted `--config env.RCH_BUILD_SOURCE…` changes no outputs, but
-    // it made `cargo publish --dry-run` look like a plain build: retrieval then
-    // staged `.rustc_info.json`, which the recipe's package policy refused, so
-    // every successful dry run ended "completion unconfirmed" (bd-3kskq).
-    let policy_command = command;
+    // Only execution consumes the stamp. `policy_command` still names the
+    // original contract already persisted in the recovery recipe above.
     let command = stamped_command.as_deref().unwrap_or(command);
 
     // Step 2: Execute command remotely with streaming output
