@@ -4247,6 +4247,9 @@ use cargo_target_dir::{
 // re-exported into the non-test hook namespace here.
 mod artifact_patterns;
 
+// Cargo-emitted required files bind artifact delivery to the completed job.
+pub(crate) mod cargo_output_contract;
+
 // The retrieved-artifact executable-typing gate (GitHub #65) lives in the
 // `artifact_triple` submodule: it types the files a successful sync-back placed
 // in the local target tree against the triple the caller's build was for, so an

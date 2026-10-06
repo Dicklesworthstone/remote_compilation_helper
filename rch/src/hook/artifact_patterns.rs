@@ -38,7 +38,7 @@
 //! into `hook::tests`. `CARGO_TARGET_CACHE_EXCLUDES` is used only within this
 //! module and stays private.
 
-mod cargo_bins;
+pub(super) mod cargo_bins;
 mod direct_compiler;
 
 use super::command_parsing::{cargo_build_only_test, cargo_custom_profile_output_dir};

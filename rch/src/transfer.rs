@@ -817,6 +817,192 @@ fn recovery_completion_cleanup_script(path: &str) -> String {
     )
 }
 
+/// Complete Cargo output evidence is read from the supervisor's private log,
+/// never from the bounded diagnostic preview returned by the SSH streamer.
+pub(crate) struct CargoArtifactEvidence {
+    pub(crate) stdout: Vec<u8>,
+    pub(crate) remote_root: PathBuf,
+}
+
+/// A completed reader proved that this attempt cannot supply valid output
+/// evidence. Unlike a lost SSH connection, retrying collection cannot repair
+/// a missing receipt, an oversized immutable log, or invalid framing.
+#[derive(Debug, thiserror::Error)]
+#[error("completed Cargo artifact evidence was rejected: {0}")]
+pub(crate) struct CargoArtifactEvidenceRejected(String);
+
+const MAX_CARGO_ARTIFACT_EVIDENCE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_CARGO_ARTIFACT_ROOT_BYTES: usize = 4096;
+const CARGO_ARTIFACT_EVIDENCE_REJECTION: &str = "RCH_CARGO_ARTIFACT_EVIDENCE_REJECTED";
+
+fn cargo_artifact_evidence_script(
+    path: &str,
+    identity: &str,
+    remote_output_root: &str,
+    max_bytes: usize,
+) -> String {
+    let quote = |value: &str| escape(Cow::from(value)).into_owned();
+    // The identity receipt is immutable after completion. Check it before and
+    // after copying the log, and frame the exact byte count so neither a lost
+    // connection nor a changing log can turn a prefix into output authority.
+    // Resolve the output root on the worker: /tmp can be /private/tmp there.
+    format!(
+        "set -eu; \
+         reject() {{ printf '%s: %s\\n' {rejection} \"$1\" >&2; exit 65; }}; \
+         {{ [ -f {done} ] && [ ! -L {done} ]; }} || reject 'missing regular completion receipt'; \
+         {{ [ -f {out} ] && [ ! -L {out} ]; }} || reject 'missing regular Cargo output log'; \
+         expected={expected}; [ \"$(cat -- {done})\" = \"$expected\" ] || reject 'completion identity or status mismatch'; \
+         size=$(wc -c < {out}); size=$((size + 0)); \
+         {{ [ \"$size\" -ge 0 ] && [ \"$size\" -le {max_bytes} ]; }} || reject 'Cargo output log exceeds size limit'; \
+         root=$(CDPATH= cd -- {root} && pwd -P) || reject 'Cargo output root is unavailable'; \
+         printf '%s %s\\n%s\\n' {identity} \"$size\" \"$root\"; \
+         cat -- {out}; \
+         [ \"$(wc -c < {out})\" -eq \"$size\" ] || reject 'Cargo output log changed during collection'; \
+         {{ [ -f {done} ] && [ ! -L {done} ] && [ -f {out} ] && [ ! -L {out} ]; }} || reject 'receipt or log changed during collection'; \
+         [ \"$(cat -- {done})\" = \"$expected\" ] || reject 'completion changed during collection'",
+        done = quote(path),
+        out = quote(&format!("{path}.stdout")),
+        expected = quote(&format!("{identity} 0")),
+        identity = quote(identity),
+        root = quote(remote_output_root),
+        rejection = quote(CARGO_ARTIFACT_EVIDENCE_REJECTION),
+    )
+}
+
+fn parse_cargo_artifact_evidence(
+    bytes: Vec<u8>,
+    identity: &str,
+    max_bytes: usize,
+) -> Result<CargoArtifactEvidence> {
+    let header_end = bytes
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .context("Cargo artifact evidence has no complete header")?;
+    let header = std::str::from_utf8(&bytes[..header_end])?;
+    let (observed, length) = header
+        .split_once(' ')
+        .context("malformed Cargo artifact evidence header")?;
+    anyhow::ensure!(
+        observed == identity,
+        "Cargo artifact evidence identity mismatch"
+    );
+    anyhow::ensure!(
+        !length.is_empty() && length.bytes().all(|byte| byte.is_ascii_digit()),
+        "invalid Cargo artifact evidence length"
+    );
+    let length: usize = length.parse()?;
+    anyhow::ensure!(
+        length <= max_bytes,
+        "Cargo artifact evidence exceeds its size limit"
+    );
+    let root_start = header_end + 1;
+    let root_length = bytes[root_start..]
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .context("Cargo artifact evidence has no complete output root")?;
+    anyhow::ensure!(
+        root_length <= MAX_CARGO_ARTIFACT_ROOT_BYTES,
+        "Cargo artifact evidence output root exceeds its size limit"
+    );
+    let root = std::str::from_utf8(&bytes[root_start..root_start + root_length])?;
+    let remote_root = PathBuf::from(root);
+    anyhow::ensure!(
+        remote_root.is_absolute()
+            && !root.chars().any(char::is_control)
+            && remote_root.components().all(|component| {
+                matches!(component, Component::RootDir | Component::Normal(_))
+            }),
+        "Cargo artifact evidence has an invalid canonical output root"
+    );
+    let body_start = root_start + root_length + 1;
+    anyhow::ensure!(
+        bytes.len() - body_start == length,
+        "Cargo artifact evidence log is incomplete or changed during collection"
+    );
+    Ok(CargoArtifactEvidence {
+        stdout: bytes[body_start..].to_vec(),
+        remote_root,
+    })
+}
+
+async fn collect_cargo_artifact_evidence(
+    mut command: Command,
+    identity: &str,
+    max_bytes: usize,
+    deadline: Duration,
+) -> Result<CargoArtifactEvidence> {
+    anyhow::ensure!(
+        !identity.is_empty()
+            && identity.len() <= 256
+            && identity
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')),
+        "invalid Cargo artifact evidence identity"
+    );
+    let framed_limit = max_bytes
+        .checked_add(MAX_CARGO_ARTIFACT_ROOT_BYTES + identity.len() + 32)
+        .context("Cargo artifact evidence size limit overflow")?;
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = command
+        .spawn()
+        .context("spawn Cargo artifact evidence reader")?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("Cargo evidence stdout missing")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("Cargo evidence stderr missing")?;
+    let collect = async {
+        let (stdout, stderr) = tokio::try_join!(
+            read_bounded_output_stream(stdout, framed_limit),
+            read_bounded_output_stream(stderr, 64 * 1024),
+        )?;
+        let status = child.wait().await?;
+        Ok::<_, std::io::Error>((status, stdout, stderr))
+    };
+    let collected = tokio::time::timeout(deadline, collect).await;
+    let (status, stdout, stderr) = match collected {
+        Ok(Ok(output)) => output,
+        interrupted => {
+            // A retry must not overlap a reader still consuming the receipt.
+            // kill() includes wait(); kill_on_drop also covers outer cancellation.
+            child
+                .kill()
+                .await
+                .context("stop and reap Cargo evidence reader")?;
+            match interrupted {
+                Ok(Err(error)) => return Err(error).context("read Cargo artifact evidence"),
+                Err(_) => anyhow::bail!("Cargo artifact evidence collection timed out"),
+                Ok(Ok(_)) => unreachable!(),
+            }
+        }
+    };
+    let stderr = String::from_utf8_lossy(&stderr);
+    if status.code() == Some(65)
+        && let Some(reason) = stderr
+            .lines()
+            .find_map(|line| line.strip_prefix(CARGO_ARTIFACT_EVIDENCE_REJECTION))
+    {
+        return Err(CargoArtifactEvidenceRejected(
+            reason.trim_start_matches(':').trim().to_owned(),
+        )
+        .into());
+    }
+    anyhow::ensure!(
+        status.success(),
+        "Cargo artifact evidence reader failed: {}",
+        stderr.trim()
+    );
+    parse_cargo_artifact_evidence(stdout, identity, max_bytes)
+        .map_err(|error| CargoArtifactEvidenceRejected(format!("{error:#}")).into())
+}
+
 /// The same identity publisher and verifier used by daemon crash recovery.
 /// Arguments: record path, timeout seconds, deadline marker, build ID, command.
 fn remote_build_watchdog_script() -> String {
@@ -2338,6 +2524,44 @@ impl TransferPipeline {
             "invalid remote completion status"
         );
         Ok(Some(status))
+    }
+
+    /// Read the complete successful invocation's Cargo records and canonical
+    /// output root while this job still owns the worker source grant. Recovery
+    /// uses the same receipt after a disconnected streaming client is gone.
+    pub(crate) async fn read_cargo_artifact_evidence(
+        &self,
+        worker: &WorkerConfig,
+        remote_output_root: &str,
+    ) -> Result<CargoArtifactEvidence> {
+        let (path, identity) = self
+            .recovery_completion
+            .as_ref()
+            .context("Cargo artifact evidence requires a durable execution receipt")?;
+        anyhow::ensure!(
+            !self.worker_platform.is_windows(),
+            "durable Cargo artifact evidence requires a POSIX worker"
+        );
+        anyhow::ensure!(
+            Path::new(remote_output_root).is_absolute()
+                && !remote_output_root.chars().any(char::is_control),
+            "invalid remote Cargo output root"
+        );
+        let script = cargo_artifact_evidence_script(
+            path,
+            identity,
+            remote_output_root,
+            MAX_CARGO_ARTIFACT_EVIDENCE_BYTES,
+        );
+        let command =
+            self.worker_ssh_command(worker, &["sh", "-c", &escape(Cow::from(script.as_str()))]);
+        collect_cargo_artifact_evidence(
+            command,
+            identity,
+            MAX_CARGO_ARTIFACT_EVIDENCE_BYTES,
+            Duration::from_secs(30),
+        )
+        .await
     }
 
     /// Delete the supervisor's claim, logs, and completion receipt. Call only
@@ -7642,6 +7866,171 @@ mod tests {
         fn drop(&mut self) {
             mock::set_thread_mock_override(None);
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn cargo_artifact_evidence_reads_complete_log_and_worker_canonical_root() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("actual target");
+        std::fs::create_dir(&root).unwrap();
+        let alias = directory.path().join("target alias");
+        std::os::unix::fs::symlink(&root, &alias).unwrap();
+        let receipt = directory.path().join("completed 'job'");
+        let receipt = receipt.to_str().unwrap();
+        std::fs::write(receipt, b"job_id 0\n").unwrap();
+        // Exceed the streamer's 10 MiB diagnostic preview. Exact artifact
+        // evidence must include the terminal bytes beyond that preview.
+        let mut log = vec![b' '; 10 * 1024 * 1024 + 1];
+        log.extend_from_slice(b"\n{\"reason\":\"build-finished\",\"success\":true}\n");
+        std::fs::write(format!("{receipt}.stdout"), &log).unwrap();
+        let script = cargo_artifact_evidence_script(
+            receipt,
+            "job_id",
+            alias.to_str().unwrap(),
+            MAX_CARGO_ARTIFACT_EVIDENCE_BYTES,
+        );
+        let mut command = Command::new("sh");
+        command.arg("-c").arg(script);
+        let evidence = collect_cargo_artifact_evidence(
+            command,
+            "job_id",
+            MAX_CARGO_ARTIFACT_EVIDENCE_BYTES,
+            Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
+        assert_eq!(evidence.stdout, log);
+        assert_eq!(evidence.remote_root, root.canonicalize().unwrap());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cargo_artifact_evidence_requires_exact_successful_receipt_and_bounded_log() {
+        let directory = tempfile::tempdir().unwrap();
+        let receipt = directory.path().join("completed");
+        let receipt = receipt.to_str().unwrap();
+        std::fs::write(format!("{receipt}.stdout"), b"record\n").unwrap();
+        for (completion, limit) in [
+            ("other 0\n", 64),
+            ("job 1\n", 64),
+            ("job 0 extra\n", 64),
+            ("job 0\n", 3),
+        ] {
+            std::fs::write(receipt, completion).unwrap();
+            let script = cargo_artifact_evidence_script(
+                receipt,
+                "job",
+                directory.path().to_str().unwrap(),
+                limit,
+            );
+            let mut command = Command::new("sh");
+            command.arg("-c").arg(script);
+            let error =
+                collect_cargo_artifact_evidence(command, "job", limit, Duration::from_secs(3))
+                    .await
+                    .err()
+                    .expect("invalid immutable receipt must be rejected");
+            assert!(
+                error.is::<CargoArtifactEvidenceRejected>(),
+                "accepted completion={completion:?}, limit={limit}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cargo_artifact_evidence_distinguishes_connection_loss_from_terminal_rejection() {
+        for (status, terminal) in [(255, false), (0, true)] {
+            let mut command = Command::new("sh");
+            command
+                .arg("-c")
+                .arg(format!("printf 'job 4\\n/target\\nab'; exit {status}"));
+            let error = collect_cargo_artifact_evidence(command, "job", 64, Duration::from_secs(3))
+                .await
+                .err()
+                .expect("partial evidence must not be accepted");
+            assert_eq!(
+                error.is::<CargoArtifactEvidenceRejected>(),
+                terminal,
+                "{error:#}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn cargo_artifact_evidence_refuses_symlinked_receipts_and_logs() {
+        let directory = tempfile::tempdir().unwrap();
+        for symlink_receipt in [true, false] {
+            let name = if symlink_receipt { "receipt" } else { "log" };
+            let receipt = directory.path().join(format!("{name}.done"));
+            let receipt = receipt.to_str().unwrap();
+            let source = directory.path().join(format!("{name}.source"));
+            if symlink_receipt {
+                std::fs::write(&source, b"job 0\n").unwrap();
+                std::os::unix::fs::symlink(&source, receipt).unwrap();
+                std::fs::write(format!("{receipt}.stdout"), b"record\n").unwrap();
+            } else {
+                std::fs::write(receipt, b"job 0\n").unwrap();
+                std::fs::write(&source, b"record\n").unwrap();
+                std::os::unix::fs::symlink(&source, format!("{receipt}.stdout")).unwrap();
+            }
+            let mut command = Command::new("sh");
+            command.arg("-c").arg(cargo_artifact_evidence_script(
+                receipt,
+                "job",
+                directory.path().to_str().unwrap(),
+                64,
+            ));
+            assert!(
+                collect_cargo_artifact_evidence(command, "job", 64, Duration::from_secs(3))
+                    .await
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn cargo_artifact_evidence_framing_rejects_partial_or_mismatched_payloads() {
+        for bytes in [
+            &b"job 3\n/target\nab"[..],
+            &b"job 2\n/target\nabc"[..],
+            &b"other 3\n/target\nabc"[..],
+            &b"job 3\ntarget\nabc"[..],
+            &b"job 3\n/target/../elsewhere\nabc"[..],
+            &b"job 3\n/target\r\nabc"[..],
+            &b"job 3\n/target"[..],
+        ] {
+            assert!(parse_cargo_artifact_evidence(bytes.to_vec(), "job", 64).is_err());
+        }
+        let evidence =
+            parse_cargo_artifact_evidence(b"job 3\n/target\nabc".to_vec(), "job", 64).unwrap();
+        assert_eq!(evidence.stdout, b"abc");
+        assert_eq!(evidence.remote_root, Path::new("/target"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn cargo_artifact_evidence_timeout_reaps_reader_before_returning() {
+        let directory = tempfile::tempdir().unwrap();
+        let pid_file = directory.path().join("reader.pid");
+        let mut command = Command::new("sh");
+        command.arg("-c").arg(format!(
+            // Observe the child in this procfs mount, which can expose an
+            // ancestor PID namespace rather than the shell's $$ namespace.
+            "read -r reader_pid rest < /proc/self/stat; printf '%s\\n' \"$reader_pid\" > {}; while :; do :; done",
+            escape(Cow::from(pid_file.to_str().unwrap()))
+        ));
+        let error = collect_cargo_artifact_evidence(command, "job", 64, Duration::from_millis(100))
+            .await
+            .err()
+            .expect("stalled evidence reader must time out");
+        assert!(error.to_string().contains("timed out"), "{error:#}");
+        let pid: u32 = std::fs::read_to_string(pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(!Path::new(&format!("/proc/{pid}")).exists());
     }
 
     /// The wrapper's stream must end with the command's last byte, however

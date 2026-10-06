@@ -294,6 +294,7 @@ mod tests {
             result_dir: Some(PathBuf::from("reports/export")),
             custom_target: false,
             output_gate: false,
+            cargo_outputs: None,
             baseline: BTreeMap::new(),
             published: BTreeMap::new(),
             pending: None,

@@ -9,18 +9,28 @@ use rch_common::CompilationKind;
 use std::collections::BTreeSet;
 use std::path::Path;
 
-/// Return project-root patterns; the caller rebases them for custom target dirs.
-pub(super) fn patterns(
+/// One bounded parse shared by the transfer optimization and the required
+/// output capture. The latter must never guess selectors from the globs.
+pub(in crate::hook) struct NamedCargoSelection<'a> {
+    pub(in crate::hook) bins: BTreeSet<&'a str>,
+    pub(in crate::hook) examples: BTreeSet<&'a str>,
+    pub(in crate::hook) message_formats: Vec<&'a str>,
+    targets: BTreeSet<&'a str>,
+    profile: &'a str,
+}
+
+pub(in crate::hook) fn selection(
     kind: Option<CompilationKind>,
-    command: Option<&str>,
-) -> Option<Vec<String>> {
+    command: &str,
+) -> Option<NamedCargoSelection<'_>> {
     if kind != Some(CompilationKind::CargoBuild) {
         return None;
     }
-    let args = build_arguments(command?)?;
+    let args = build_arguments(command)?;
     let mut bins = BTreeSet::new();
     let mut examples = BTreeSet::new();
     let mut targets = BTreeSet::new();
+    let mut message_formats = Vec::new();
     let mut profile = None;
     let mut iter = args.into_iter();
     while let Some(arg) = iter.next() {
@@ -60,8 +70,15 @@ pub(super) fn patterns(
             "--release" | "-r" if inline.is_none() => {
                 set_profile(&mut profile, "release")?;
             }
+            "--message-format" => {
+                let value = inline.or_else(|| iter.next())?;
+                if value.is_empty() || value.starts_with('-') {
+                    return None;
+                }
+                message_formats.push(value);
+            }
             "--package" | "-p" | "--exclude" | "--jobs" | "-j" | "--features" | "-F"
-            | "--color" | "--message-format" | "--manifest-path" | "--target-dir" => {
+            | "--color" | "--manifest-path" | "--target-dir" => {
                 // Consume opaque option values exactly once, never as selectors.
                 let value = inline.or_else(|| iter.next())?;
                 if value.is_empty() || value.starts_with('-') {
@@ -94,7 +111,27 @@ pub(super) fn patterns(
     if bins.is_empty() && examples.is_empty() {
         return None;
     }
-    let profile = profile.unwrap_or("debug");
+    Some(NamedCargoSelection {
+        bins,
+        examples,
+        message_formats,
+        targets,
+        profile: profile.unwrap_or("debug"),
+    })
+}
+
+/// Return project-root patterns; the caller rebases them for custom target dirs.
+pub(super) fn patterns(
+    kind: Option<CompilationKind>,
+    command: Option<&str>,
+) -> Option<Vec<String>> {
+    let NamedCargoSelection {
+        bins,
+        examples,
+        targets,
+        profile,
+        ..
+    } = selection(kind, command?)?;
     let roots: Vec<String> = if targets.is_empty() {
         // Configuration/environment can choose a target even without --target.
         vec![format!("target/{profile}"), format!("target/*/{profile}")]
@@ -521,6 +558,8 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn real_cargo_selected_bins_and_library_examples_round_trip() {
+        use crate::hook::cargo_output_contract::CargoOutputCapture;
+        use crate::hook::transfer_orchestration::recovery::assert_cargo_fixture_publication;
         use std::process::Stdio;
         use std::time::Duration;
         use tokio::process::Command;
@@ -536,6 +575,7 @@ mod tests {
                 "[package]\nname = \"rch_selected_fixture\"\nversion = \"0.0.0\"\nedition = \"2024\"\n",
                 "[workspace]\n",
                 "[[bin]]\nname = \"app\"\npath = \"src/main.rs\"\n",
+                "[[bin]]\nname = \"helper\"\npath = \"src/helper.rs\"\n",
                 "[[example]]\nname = \"demo\"\npath = \"examples/demo.rs\"\n",
                 "[[example]]\nname = \"demo-lib\"\npath = \"examples/library.rs\"\ncrate-type = [\"staticlib\"]\n",
                 "[profile.lean]\ninherits = \"dev\"\ndebug = 0\n",
@@ -543,6 +583,11 @@ mod tests {
             std::fs::write(
                 source.join("src/main.rs"),
                 "fn main() { println!(\"selected app\"); }\n",
+            )
+            .unwrap();
+            std::fs::write(
+                source.join("src/helper.rs"),
+                "fn main() { println!(\"selected helper\"); }\n",
             )
             .unwrap();
             std::fs::write(
@@ -560,9 +605,9 @@ mod tests {
             } else {
                 source.join("target")
             };
-            let command_text = "cargo build --bin app --example demo --example demo-lib --profile lean --offline --jobs=1";
+            let command_text = "cargo build --bin app --bin helper --example demo --example demo-lib --profile lean --offline --jobs=1";
             let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-            let mut compile = Command::new(cargo);
+            let mut compile = Command::new(&cargo);
             compile
                 .current_dir(&source)
                 .args(command_text.split_ascii_whitespace().skip(1))
@@ -589,16 +634,16 @@ mod tests {
                 "{}",
                 String::from_utf8_lossy(&built.stderr)
             );
-            let artifacts: Vec<serde_json::Value> = String::from_utf8(built.stdout)
-                .unwrap()
+            let stdout = String::from_utf8(built.stdout).unwrap();
+            let artifacts: Vec<serde_json::Value> = stdout
                 .lines()
                 .filter_map(|line| serde_json::from_str(line).ok())
                 .filter(|message: &serde_json::Value| message["reason"] == "compiler-artifact")
                 .collect();
             assert_eq!(
                 artifacts.len(),
-                3,
-                "fixture must compile one bin and two examples"
+                4,
+                "fixture must compile two bins and two examples"
             );
             let files: Vec<std::path::PathBuf> = artifacts
                 .iter()
@@ -611,6 +656,53 @@ mod tests {
                     .any(|p| p.file_name().unwrap() == "libdemo_lib.a")
             );
             let remote_basis = if forwarded { &remote_target } else { &source };
+            // The mixed binary/library-example invocation above keeps the
+            // existing selection policy. Exercise the required executable
+            // contract with a second, warm, named-binary invocation in the
+            // same real Cargo tree (no second compilation fixture).
+            assert!(
+                CargoOutputCapture::for_command(Some(CompilationKind::CargoBuild), command_text)
+                    .is_none()
+            );
+            let binary_command =
+                "cargo build --bin app --bin helper --profile lean --offline --jobs=1";
+            let capture =
+                CargoOutputCapture::for_command(Some(CompilationKind::CargoBuild), binary_command)
+                    .unwrap();
+            let instrumented = capture.execution_command(binary_command);
+            let mut binaries = Command::new(&cargo);
+            binaries
+                .current_dir(&source)
+                .args(instrumented.split_ascii_whitespace().skip(1))
+                .stdin(Stdio::null())
+                .kill_on_drop(true);
+            for (key, value) in compile.as_std().get_envs() {
+                if let Some(value) = value {
+                    binaries.env(key, value);
+                } else {
+                    binaries.env_remove(key);
+                }
+            }
+            let binary_output = tokio::time::timeout(Duration::from_secs(90), binaries.output())
+                .await
+                .expect("owned named-binary Cargo fixture timed out")
+                .expect("Cargo is required");
+            assert!(
+                binary_output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&binary_output.stderr)
+            );
+            let contract = capture
+                .parse_receipt(&binary_output.stdout, remote_basis)
+                .unwrap();
+            assert_eq!(contract.required_files.len(), 2);
+            assert_cargo_fixture_publication(
+                binary_command,
+                &binary_output.stdout,
+                remote_basis,
+                forwarded,
+            )
+            .await;
             for path in &files {
                 let destination = local.join(path.strip_prefix(remote_basis).unwrap());
                 std::fs::create_dir_all(destination.parent().unwrap()).unwrap();

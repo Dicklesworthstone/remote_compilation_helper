@@ -28,6 +28,7 @@ use super::artifact_patterns::{
     sync_back_verified_zero_package_archives,
 };
 use super::artifact_triple::{describe_findings, foreign_target_artifacts};
+use super::cargo_output_contract::CargoOutputCapture;
 use super::cargo_target_dir::{
     cargo_target_env_allowlist, cargo_target_env_overrides, default_host_target_triple,
     explicit_target_triple_for_command, remote_cargo_pooled_target_dir_name,
@@ -1588,6 +1589,16 @@ async fn execute_remote_compilation_inner(
         Some(session) => session.completion_pipeline(pipeline),
         None => pipeline,
     };
+    // Only the durable POSIX path can retain complete, identity-bound Cargo
+    // records across a wrapper disconnect. Validate the caller's original
+    // command before adding the execution-only JSON option to a managed one.
+    let cargo_output_capture = recovery_session
+        .as_ref()
+        .and_then(|_| CargoOutputCapture::for_command(kind, policy_command));
+    let captured_command = cargo_output_capture
+        .as_ref()
+        .map(|capture| capture.execution_command(command));
+    let command = captured_command.as_deref().unwrap_or(command);
     info!(
         "Sync complete: {} files, {} bytes in {}ms",
         sync_result.files_transferred, sync_result.bytes_transferred, sync_result.duration_ms
@@ -1781,6 +1792,12 @@ async fn execute_remote_compilation_inner(
             if let Some(state) = heartbeat_state_stdout.as_ref() {
                 mark_heartbeat_progress(state);
             }
+            if cargo_output_capture
+                .as_ref()
+                .is_some_and(|capture| capture.suppress_stdout_line(line))
+            {
+                return;
+            }
 
             let mut state = ui_state_stdout.borrow_mut();
             if let Some(progress) = state.progress.as_mut() {
@@ -1954,6 +1971,37 @@ async fn execute_remote_compilation_inner(
 
     let mut artifacts_result: Option<SyncResult> = None;
     let mut artifacts_failed = false;
+    let mut cargo_evidence_terminal = false;
+    if result.success()
+        && let Some(session) = recovery_session.as_mut()
+        && let Some(remote_root) = session.cargo_artifact_remote_root().map(str::to_owned)
+    {
+        let evidence = pipeline
+            .read_cargo_artifact_evidence(&worker_config, &remote_root)
+            .await;
+        let installed = evidence.and_then(|evidence| {
+            session.install_cargo_artifact_evidence(&evidence.stdout, &evidence.remote_root)
+        });
+        if let Err(error) = installed {
+            // A completed rejection cannot improve on retry. Lost transport
+            // and local journal failures retain the exact attempt for recovery.
+            // Neither case permits glob-only publication or compiler replay.
+            artifacts_failed = true;
+            cargo_evidence_terminal = error.is::<crate::transfer::CargoArtifactEvidenceRejected>()
+                || error.is::<recovery::CargoOutputContractRejected>();
+            if cargo_evidence_terminal {
+                eprintln!(
+                    "[RCH] requested Cargo executable evidence is invalid: {error:#}; \
+                     no build artifacts were published; delivery failed"
+                );
+            } else {
+                eprintln!(
+                    "[RCH] cannot establish the requested Cargo executable set: {error:#}; \
+                     no build artifacts were published; use jobs recover for this attempt"
+                );
+            }
+        }
+    }
     // Per-file evidence from the phase that carries the build's `target/`
     // outputs, for the zero-build-output loud-failure gate (bd-mpbav): the
     // matched-file manifest and the rsync-reported matched regular-file count.
@@ -1968,7 +2016,7 @@ async fn execute_remote_compilation_inner(
     // #65 executable-typing gate can open the files that were actually placed.
     let mut retrieval_local_base: Option<PathBuf> = None;
     // Step 3: Retrieve artifacts
-    if result.success() {
+    if result.success() && !artifacts_failed {
         if let Some(loop_ref) = heartbeat_loop.as_ref() {
             loop_ref.update_phase(
                 BuildHeartbeatPhase::SyncDown,
@@ -1984,12 +2032,15 @@ async fn execute_remote_compilation_inner(
         // custom target dir exists to protect, and a failed stale-residue pull
         // spuriously fails an otherwise-complete build (rch#30). For cargo
         // build/doc/rustc the filtered list is empty, so the phase is skipped.
-        let artifact_patterns = get_project_artifact_patterns(
+        let mut artifact_patterns = get_project_artifact_patterns(
             kind,
             Some(policy_command),
             forwarded_cargo_target_dir.is_some(),
         );
         if !artifact_patterns.is_empty() {
+            if let Some(session) = recovery_session.as_ref() {
+                artifact_patterns = session.cargo_artifact_patterns("project")?;
+            }
             let retrieval_pipeline = match recovery_session.as_ref() {
                 Some(session) => session.staging_pipeline("project", &pipeline)?,
                 None => pipeline.clone(),
@@ -2034,12 +2085,16 @@ async fn execute_remote_compilation_inner(
                 },
             )
             .await;
+            let retrieval = match retrieval {
+                Ok(artifact_result) => match recovery_session.as_mut() {
+                    Some(session) => session.publish("project").await.map(|()| artifact_result),
+                    None => Ok(artifact_result),
+                },
+                Err(error) => Err(error),
+            };
 
             match retrieval {
                 Ok(artifact_result) => {
-                    if let Some(session) = recovery_session.as_mut() {
-                        session.publish("project").await?;
-                    }
                     info!(
                         "Artifacts retrieved: {} files, {} bytes in {}ms",
                         artifact_result.stats.files_transferred,
@@ -2122,13 +2177,17 @@ async fn execute_remote_compilation_inner(
 
         if let Some(local_target_dir) = forwarded_cargo_target_dir.as_ref() {
             let remote_target_path = pipeline.remote_cargo_target_dir();
-            let custom_patterns = get_custom_target_artifact_patterns(kind, Some(policy_command));
+            let mut custom_patterns =
+                get_custom_target_artifact_patterns(kind, Some(policy_command));
             if custom_patterns.is_empty() {
                 reporter.verbose(&format!(
                     "[RCH] custom target dir sync skipped for {} after command with no target artifacts",
                     local_target_dir.display()
                 ));
             } else {
+                if let Some(session) = recovery_session.as_ref() {
+                    custom_patterns = session.cargo_artifact_patterns("target")?;
+                }
                 let target_pipeline = TransferPipeline::new(
                     local_target_dir.clone(),
                     project_id_from_path(local_target_dir),
@@ -2188,12 +2247,16 @@ async fn execute_remote_compilation_inner(
                     },
                 )
                 .await;
+                let target_retrieval = match target_retrieval {
+                    Ok(target_result) => match recovery_session.as_mut() {
+                        Some(session) => session.publish("target").await.map(|()| target_result),
+                        None => Ok(target_result),
+                    },
+                    Err(error) => Err(error),
+                };
 
                 match target_retrieval {
                     Ok(target_result) => {
-                        if let Some(session) = recovery_session.as_mut() {
-                            session.publish("target").await?;
-                        }
                         info!(
                             "Custom CARGO_TARGET_DIR artifacts retrieved: {} files, {} bytes in {}ms",
                             target_result.stats.files_transferred,
@@ -2592,7 +2655,8 @@ async fn execute_remote_compilation_inner(
     } else {
         result.exit_code
     };
-    let retrieval_complete = !artifacts_failed && result_dir_failures.is_empty();
+    let retrieval_complete =
+        (!artifacts_failed || cargo_evidence_terminal) && result_dir_failures.is_empty();
     if retrieval_complete && let Some(session) = recovery_session.as_mut() {
         session.returned(exit_code)?;
     }
