@@ -1436,12 +1436,14 @@ async fn recover_job_with_daemon(
 /// the selector's owned fixture, without running Cargo a second time here.
 #[cfg(test)]
 pub(crate) async fn assert_cargo_fixture_publication(
+    kind: CompilationKind,
     command: &str,
     stdout: &[u8],
     remote_root: &Path,
     custom_target: bool,
 ) {
-    tests::assert_cargo_fixture_publication(command, stdout, remote_root, custom_target).await;
+    tests::assert_cargo_fixture_publication(kind, command, stdout, remote_root, custom_target)
+        .await;
 }
 
 #[cfg(test)]
@@ -1540,13 +1542,14 @@ mod tests {
     }
 
     fn captured_publication_fixture(
+        kind: CompilationKind,
         command: &str,
         remote_root: &Path,
         custom_target: bool,
     ) -> (tempfile::TempDir, tempfile::TempDir, RecoverySession) {
         let (directory, stage_owner, mut session) = publication_fixture();
-        let kind = Some(CompilationKind::CargoBuild);
-        session.recipe.kind = kind;
+        let kind = Some(kind);
+        session.recipe.kind = artifact_delivery_kind(kind, Some(command));
         session.recipe.prepared = true;
         session.recipe.execution_started = true;
         session.recipe.exit_code = Some(0);
@@ -1567,13 +1570,14 @@ mod tests {
     }
 
     pub(super) async fn assert_cargo_fixture_publication(
+        kind: CompilationKind,
         command: &str,
         stdout: &[u8],
         remote_root: &Path,
         custom_target: bool,
     ) {
         let (_directory, _stage_owner, session) =
-            captured_publication_fixture(command, remote_root, custom_target);
+            captured_publication_fixture(kind, command, remote_root, custom_target);
         // A detached collector must remember that evidence is still owed,
         // even if the wrapper stopped immediately after remote completion.
         let mut session = reload_publication(&session);
@@ -1589,16 +1593,15 @@ mod tests {
             .unwrap()
             .required_files
             .clone();
-        assert_eq!(required.len(), 2, "fixture must select both named bins");
+        assert_eq!(
+            required.len(),
+            2,
+            "fixture must select two named executables"
+        );
         let missing = required
             .iter()
-            .find(|path| {
-                matches!(
-                    path.file_name().and_then(|p| p.to_str()),
-                    Some("helper" | "helper.exe")
-                )
-            })
-            .expect("fixture must contain the helper executable");
+            .nth(1)
+            .expect("fixture must contain a second executable");
         let local = session.recipe.phases[0].local.clone();
         let phase_name = session.recipe.phases[0].name.clone();
         let stage = session.stage(0);
@@ -1627,7 +1630,7 @@ mod tests {
             assert_eq!(
                 std::fs::read(local.join(relative)).unwrap(),
                 b"previous local executable",
-                "a missing helper must not partially replace {}",
+                "a missing executable must not partially replace {}",
                 relative.display()
             );
         }
@@ -1683,6 +1686,219 @@ mod tests {
         receipt
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cargo_no_run_delivers_every_real_named_test_and_bench_after_recovery() {
+        use std::process::Stdio;
+        use tokio::process::Command;
+
+        for (kind, subcommand, selector, target_kind, custom_target) in [
+            (CompilationKind::CargoTest, "test", "test", "test", false),
+            (CompilationKind::CargoTest, "test", "test", "test", true),
+            (
+                CompilationKind::CargoBench,
+                "bench",
+                "bench",
+                "bench",
+                false,
+            ),
+            (CompilationKind::CargoBench, "bench", "bench", "bench", true),
+        ] {
+            let fixture = tempfile::tempdir().unwrap();
+            let source = fixture.path().join("source project");
+            for directory in ["src", "tests", "benches"] {
+                std::fs::create_dir_all(source.join(directory)).unwrap();
+            }
+            std::fs::write(source.join("Cargo.toml"), concat!(
+                "[package]\nname = \"rch_named_no_run_fixture\"\nversion = \"0.0.0\"\nedition = \"2024\"\n",
+                "[workspace]\n",
+                "[[test]]\nname = \"alpha\"\npath = \"tests/alpha.rs\"\n",
+                "[[test]]\nname = \"beta\"\npath = \"tests/beta.rs\"\n",
+                "[[bench]]\nname = \"alpha\"\npath = \"benches/alpha.rs\"\nharness = false\n",
+                "[[bench]]\nname = \"beta\"\npath = \"benches/beta.rs\"\nharness = false\n",
+                "[profile.contract-fixture]\ninherits = \"dev\"\ndebug = 0\n",
+            )).unwrap();
+            std::fs::write(source.join("src/lib.rs"), "pub fn answer() -> u8 { 42 }\n").unwrap();
+            for name in ["alpha", "beta"] {
+                std::fs::write(
+                    source.join("tests").join(format!("{name}.rs")),
+                    format!("#[test] fn {name}_must_not_run() {{ panic!(\"no-run executed a test\"); }}\n"),
+                ).unwrap();
+                std::fs::write(
+                    source.join("benches").join(format!("{name}.rs")),
+                    "fn main() { panic!(\"no-run executed a benchmark\"); }\n",
+                )
+                .unwrap();
+            }
+            let remote_target = if custom_target {
+                fixture.path().join("worker target")
+            } else {
+                source.join("target")
+            };
+            let remote_root = if custom_target {
+                &remote_target
+            } else {
+                &source
+            };
+            let command = format!(
+                "cargo {subcommand} --no-run --{selector} alpha --{selector} beta --profile contract-fixture --offline --jobs=1"
+            );
+            let capture = CargoOutputCapture::for_command(Some(kind), &command).unwrap();
+            let instrumented = capture.execution_command(&command);
+            let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+            let mut compile = Command::new(cargo);
+            compile
+                .current_dir(&source)
+                .args(instrumented.split_ascii_whitespace().skip(1))
+                // The live command pins build.build-dir into the worker output
+                // tree. Exercise the real new layout, including executable
+                // files beneath normally excluded build-cache directories.
+                .arg("--config")
+                .arg(format!(
+                    "build.build-dir={}",
+                    serde_json::to_string(remote_target.to_str().unwrap()).unwrap()
+                ))
+                .env("CARGO_HOME", fixture.path().join("cargo-home"))
+                .env("CARGO_TARGET_DIR", &remote_target)
+                .env_remove("RUSTC_WRAPPER")
+                .env_remove("RUSTC_WORKSPACE_WRAPPER")
+                .env_remove("RUSTFLAGS")
+                .env_remove("CARGO_ENCODED_RUSTFLAGS")
+                .env_remove("CARGO_BUILD_TARGET")
+                .env_remove("CARGO_BUILD_TARGET_DIR")
+                .env_remove("CARGO_BUILD_BUILD_DIR")
+                .env_remove("CARGO_MAKEFLAGS")
+                .env_remove("MAKEFLAGS")
+                .stdin(Stdio::null())
+                .kill_on_drop(true);
+            let mut completed_stdout = Vec::new();
+            for warm in [false, true] {
+                let output = tokio::time::timeout(Duration::from_secs(90), compile.output())
+                    .await
+                    .expect("owned no-run Cargo fixture timed out")
+                    .expect("Cargo is required for the named no-run delivery regression");
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let records: Vec<serde_json::Value> = std::str::from_utf8(&output.stdout)
+                    .unwrap()
+                    .lines()
+                    .filter_map(|line| serde_json::from_str(line).ok())
+                    .filter(|record: &serde_json::Value| {
+                        record["reason"] == "compiler-artifact"
+                            && record["target"]["kind"] == serde_json::json!([target_kind])
+                    })
+                    .collect();
+                assert_eq!(records.len(), 2, "both requested targets must be emitted");
+                assert!(records.iter().all(|record| record["fresh"] == warm));
+                let contract = capture.parse_receipt(&output.stdout, remote_root).unwrap();
+                assert_eq!(contract.required_files.len(), 2);
+                assert!(
+                    contract
+                        .required_files
+                        .iter()
+                        .all(|path| { path.components().any(|part| part.as_os_str() == "build") }),
+                    "fixture must exercise the managed build directory: {contract:?}"
+                );
+                completed_stdout = output.stdout;
+            }
+
+            let (_local_owner, _stage_owner, mut session) =
+                captured_publication_fixture(kind, &command, remote_root, custom_target);
+            session
+                .install_cargo_artifact_evidence(&completed_stdout, remote_root)
+                .unwrap();
+            let mut session = reload_publication(&session);
+            let phase = &session.recipe.phases[0];
+            let required = phase.cargo_outputs.as_ref().unwrap().required_files.clone();
+            let patterns = phase.patterns.clone();
+            let name = phase.name.clone();
+            let local = phase.local.clone();
+            let stage = session.stage(0);
+            let missing = required.iter().next_back().unwrap();
+            for relative in &required {
+                std::fs::create_dir_all(local.join(relative).parent().unwrap()).unwrap();
+                std::fs::write(local.join(relative), b"previous local executable").unwrap();
+            }
+            let source_sentinel = local.join("source.rs");
+            std::fs::write(&source_sentinel, b"local source remains owned locally").unwrap();
+            for complete_transfer in [false, true] {
+                let mut transfer = Command::new("rsync");
+                transfer.args(["-a", "--checksum", "--safe-links", "--prune-empty-dirs"]);
+                if !complete_transfer {
+                    // Simulate a successful but incomplete artifact transfer.
+                    // The other executable makes the old nonempty gate pass.
+                    transfer.arg(format!("--exclude=/{}", missing.display()));
+                }
+                for rule in crate::transfer::priority_rsync_includes(&patterns) {
+                    transfer.arg(format!("--include={rule}"));
+                }
+                for pattern in &patterns {
+                    if let Some(excluded) = pattern.strip_prefix("- ") {
+                        transfer.arg(format!("--exclude={excluded}"));
+                    }
+                }
+                transfer.arg("--include=*/");
+                for pattern in &patterns {
+                    if !pattern.starts_with("- ") {
+                        transfer.arg(format!(
+                            "--include=/{}",
+                            pattern.strip_prefix("+ ").unwrap_or(pattern)
+                        ));
+                    }
+                }
+                transfer
+                    .arg("--exclude=*")
+                    .arg(format!("{}/", remote_root.display()))
+                    .arg(format!("{}/", stage.display()))
+                    .stdin(Stdio::null())
+                    .kill_on_drop(true);
+                let copied = tokio::time::timeout(Duration::from_secs(15), transfer.output())
+                    .await
+                    .expect("owned no-run rsync fixture timed out")
+                    .expect("rsync is required for the named no-run delivery regression");
+                assert!(copied.status.success(), "{copied:?}");
+                if !complete_transfer {
+                    assert!(
+                        required
+                            .iter()
+                            .any(|relative| stage.join(relative).is_file())
+                    );
+                    assert!(!stage.join(missing).exists());
+                    let journal = std::fs::read(&session.writer.path).unwrap();
+                    assert!(session.publish(&name).await.is_err());
+                    assert_eq!(std::fs::read(&session.writer.path).unwrap(), journal);
+                    assert!(session.returned(0).is_err());
+                    for relative in &required {
+                        assert_eq!(
+                            std::fs::read(local.join(relative)).unwrap(),
+                            b"previous local executable"
+                        );
+                    }
+                    session = reload_publication(&session);
+                } else {
+                    session.publish(&name).await.unwrap();
+                    session.returned(0).unwrap();
+                    for relative in &required {
+                        assert_eq!(
+                            std::fs::read(local.join(relative)).unwrap(),
+                            std::fs::read(remote_root.join(relative)).unwrap()
+                        );
+                    }
+                    let restored = reload_publication(&session);
+                    assert_eq!(restored.recipe.returned, Some(0));
+                    assert!(restored.recipe.phases[0].complete);
+                }
+                assert_eq!(
+                    std::fs::read(&source_sentinel).unwrap(),
+                    b"local source remains owned locally"
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn cargo_missing_named_bin_preserves_all_outputs_until_disk_reloaded_retry() {
         for custom_target in [false, true] {
@@ -1694,6 +1910,7 @@ mod tests {
             std::fs::write(outputs.join("app"), b"new app executable").unwrap();
             std::fs::write(outputs.join("helper"), b"new helper executable").unwrap();
             assert_cargo_fixture_publication(
+                CompilationKind::CargoBuild,
                 "cargo build --bin app --bin helper --profile lean",
                 &cargo_bin_receipt(remote.path(), custom_target),
                 remote.path(),
@@ -1707,6 +1924,7 @@ mod tests {
     async fn cargo_awaiting_receipt_cannot_publish_or_report_success_and_retains_failure_stage() {
         let remote = tempfile::tempdir().unwrap();
         let (_directory, _stage_owner, session) = captured_publication_fixture(
+            CompilationKind::CargoBuild,
             "cargo build --bin app --bin helper --profile lean",
             remote.path(),
             false,
@@ -1743,6 +1961,7 @@ mod tests {
     fn cargo_invalid_evidence_cannot_expand_policy_or_replace_sources() {
         let remote = tempfile::tempdir().unwrap();
         let (_directory, _stage_owner, mut session) = captured_publication_fixture(
+            CompilationKind::CargoBuild,
             "cargo build --bin app --bin helper --profile lean",
             remote.path(),
             false,
@@ -1777,6 +1996,7 @@ mod tests {
     fn cargo_evidence_journal_failure_remains_retryable_and_cannot_authorize_publication() {
         let remote = tempfile::tempdir().unwrap();
         let (directory, _stage_owner, mut session) = captured_publication_fixture(
+            CompilationKind::CargoBuild,
             "cargo build --bin app --bin helper --profile lean",
             remote.path(),
             false,

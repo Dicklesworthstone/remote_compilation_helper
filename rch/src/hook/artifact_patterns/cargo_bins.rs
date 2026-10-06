@@ -2,8 +2,11 @@
 //!
 //! This is an optimization of the existing retrieval policy, not a proof of
 //! output completeness. Only literal `cargo build --bin/--example` selections
-//! narrow retrieval. Unknown flags, shell expansion, other target kinds,
-//! response files and custom target specifications retain the broad policy.
+//! narrow retrieval. The shared parser also identifies explicit named test and
+//! benchmark executables under `--no-run` for the completed-output contract;
+//! their transfer policy still comes from the ordinary build-only path.
+//! Unknown flags, shell expansion, other target kinds, response files and
+//! custom target specifications retain the broad policy.
 
 use rch_common::CompilationKind;
 use std::collections::BTreeSet;
@@ -14,6 +17,8 @@ use std::path::Path;
 pub(in crate::hook) struct NamedCargoSelection<'a> {
     pub(in crate::hook) bins: BTreeSet<&'a str>,
     pub(in crate::hook) examples: BTreeSet<&'a str>,
+    pub(in crate::hook) tests: BTreeSet<&'a str>,
+    pub(in crate::hook) benches: BTreeSet<&'a str>,
     pub(in crate::hook) message_formats: Vec<&'a str>,
     targets: BTreeSet<&'a str>,
     profile: &'a str,
@@ -23,12 +28,13 @@ pub(in crate::hook) fn selection(
     kind: Option<CompilationKind>,
     command: &str,
 ) -> Option<NamedCargoSelection<'_>> {
-    if kind != Some(CompilationKind::CargoBuild) {
-        return None;
-    }
-    let args = build_arguments(command)?;
+    let kind = kind?;
+    let args = build_arguments(kind, command)?;
     let mut bins = BTreeSet::new();
     let mut examples = BTreeSet::new();
+    let mut tests = BTreeSet::new();
+    let mut benches = BTreeSet::new();
+    let mut no_run = false;
     let mut targets = BTreeSet::new();
     let mut message_formats = Vec::new();
     let mut profile = None;
@@ -38,7 +44,7 @@ pub(in crate::hook) fn selection(
             .split_once('=')
             .map_or((arg, None), |(k, v)| (k, Some(v)));
         match flag {
-            "--bin" | "--example" => {
+            "--bin" | "--example" if kind == CompilationKind::CargoBuild => {
                 let name = inline.or_else(|| iter.next())?;
                 if !component(name) {
                     return None;
@@ -48,6 +54,23 @@ pub(in crate::hook) fn selection(
                 } else {
                     examples.insert(name);
                 }
+            }
+            "--test" if kind == CompilationKind::CargoTest => {
+                let name = inline.or_else(|| iter.next())?;
+                if !component(name) {
+                    return None;
+                }
+                tests.insert(name);
+            }
+            "--bench" if kind == CompilationKind::CargoBench => {
+                let name = inline.or_else(|| iter.next())?;
+                if !component(name) {
+                    return None;
+                }
+                benches.insert(name);
+            }
+            "--no-run" if kind != CompilationKind::CargoBuild && inline.is_none() => {
+                no_run = true;
             }
             "--target" => {
                 let target = inline.or_else(|| iter.next())?;
@@ -108,12 +131,20 @@ pub(in crate::hook) fn selection(
             _ => return None,
         }
     }
-    if bins.is_empty() && examples.is_empty() {
+    if bins.is_empty() && examples.is_empty() && tests.is_empty() && benches.is_empty() {
+        return None;
+    }
+    // Executing tests/benches produces a result stream, not caller-owned
+    // executables. Only Cargo's own --no-run can enable output capture; a
+    // similarly named test-program argument after `--` never reaches here.
+    if kind != CompilationKind::CargoBuild && !no_run {
         return None;
     }
     Some(NamedCargoSelection {
         bins,
         examples,
+        tests,
+        benches,
         message_formats,
         targets,
         profile: profile.unwrap_or("debug"),
@@ -125,6 +156,9 @@ pub(super) fn patterns(
     kind: Option<CompilationKind>,
     command: Option<&str>,
 ) -> Option<Vec<String>> {
+    if kind != Some(CompilationKind::CargoBuild) {
+        return None;
+    }
     let NamedCargoSelection {
         bins,
         examples,
@@ -203,7 +237,7 @@ fn component(value: &str) -> bool {
 
 /// Deliberately a bounded literal subset, not a second shell parser. Quoted or
 /// expanded commands are valid elsewhere but cannot authorize this narrowing.
-fn build_arguments(command: &str) -> Option<Vec<&str>> {
+fn build_arguments(kind: CompilationKind, command: &str) -> Option<Vec<&str>> {
     if command.len() > 65_536
         || !command.bytes().all(|byte| {
             byte.is_ascii_alphanumeric()
@@ -274,7 +308,13 @@ fn build_arguments(command: &str) -> Option<Vec<&str>> {
     if words.get(index).is_some_and(|word| word.starts_with('+')) {
         index += 1;
     }
-    if !matches!(words.get(index).copied(), Some("build" | "b")) {
+    let subcommand = words.get(index).copied()?;
+    if !matches!(
+        (kind, subcommand),
+        (CompilationKind::CargoBuild, "build" | "b")
+            | (CompilationKind::CargoTest, "test" | "t")
+            | (CompilationKind::CargoBench, "bench")
+    ) {
         return None;
     }
     Some(words[index + 1..].to_vec())
@@ -697,6 +737,7 @@ mod tests {
                 .unwrap();
             assert_eq!(contract.required_files.len(), 2);
             assert_cargo_fixture_publication(
+                CompilationKind::CargoBuild,
                 binary_command,
                 &binary_output.stdout,
                 remote_basis,

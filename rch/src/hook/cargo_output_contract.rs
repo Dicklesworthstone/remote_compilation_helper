@@ -1,8 +1,9 @@
 //! Bind named Cargo executable delivery to the completed invocation's JSON.
 //!
 //! Transfer globs remain useful for runtime support files, but cannot prove
-//! that every requested binary was returned. This contract records Cargo's
-//! actual executable paths and checks them before any staged output publishes.
+//! that every requested executable was returned. This contract records Cargo's
+//! actual executable paths and checks them before any staged output publishes,
+//! including explicitly named test/benchmark targets built with `--no-run`.
 //! Commands selecting examples keep the existing artifact policy: their
 //! library metadata can belong to a separately configured Cargo build directory.
 
@@ -18,16 +19,20 @@ use std::path::{Component, Path, PathBuf};
 /// ordinary SSH output accumulator is smaller and must not supply this proof.
 pub(crate) const MAX_CARGO_OUTPUT_RECEIPT_BYTES: usize = 64 * 1024 * 1024;
 
-#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum TargetKind {
     Bin,
+    Test,
+    Bench,
 }
 
 impl TargetKind {
     fn as_str(&self) -> &'static str {
         match self {
             Self::Bin => "bin",
+            Self::Test => "test",
+            Self::Bench => "bench",
         }
     }
 }
@@ -40,7 +45,7 @@ struct SelectedTarget {
 
 /// Persist before execution so a replacement collector knows which Cargo
 /// records the original invocation must have produced. Only the existing
-/// bounded, literal named-binary grammar can create an enabled capture.
+/// bounded, literal named-target grammar can create an enabled capture.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(super) struct CargoOutputCapture {
     selected: BTreeSet<SelectedTarget>,
@@ -74,7 +79,7 @@ struct CompilerArtifact {
 impl CargoOutputCapture {
     pub(super) fn for_command(kind: Option<CompilationKind>, command: &str) -> Option<Self> {
         let selection = cargo_bins::selection(kind, command)?;
-        if !selection.examples.is_empty() || selection.bins.is_empty() {
+        if !selection.examples.is_empty() {
             return None;
         }
         let instrumented = match selection.message_formats.as_slice() {
@@ -84,14 +89,19 @@ impl CargoOutputCapture {
             // or resolve conflicting repeated options on Cargo's behalf.
             _ => return None,
         };
-        let selected = selection
-            .bins
-            .into_iter()
-            .map(|name| SelectedTarget {
-                kind: TargetKind::Bin,
+        let selected = [
+            (TargetKind::Bin, selection.bins),
+            (TargetKind::Test, selection.tests),
+            (TargetKind::Bench, selection.benches),
+        ]
+        .into_iter()
+        .flat_map(|(kind, names)| {
+            names.into_iter().map(move |name| SelectedTarget {
+                kind,
                 name: name.to_owned(),
             })
-            .collect();
+        })
+        .collect();
         Some(Self {
             selected,
             instrumented,
@@ -222,7 +232,7 @@ impl CargoOutputCapture {
                     }
                     let executable = artifact.executable.as_deref().with_context(|| {
                         format!(
-                            "Cargo selected binary {} has no executable filename",
+                            "Cargo selected target {} has no executable filename",
                             artifact.target.name
                         )
                     })?;
@@ -231,7 +241,7 @@ impl CargoOutputCapture {
                             .filenames
                             .iter()
                             .any(|filename| filename == executable),
-                        "Cargo selected binary {} executable is not among its emitted filenames",
+                        "Cargo selected target {} executable is not among its emitted filenames",
                         artifact.target.name
                     );
                     let executable = relative_output_path(executable, remote_phase_roots)?;
@@ -262,7 +272,7 @@ impl CargoOutputCapture {
             .collect();
         anyhow::ensure!(
             missing.is_empty(),
-            "Cargo output receipt is missing selected binaries: {}",
+            "Cargo output receipt is missing selected executables: {}",
             missing.join(", ")
         );
         anyhow::ensure!(!required_files.is_empty(), "Cargo output contract is empty");
@@ -476,6 +486,158 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn named_tests_and_benches_require_cargos_own_no_run_mode() {
+        for (kind, command, target_kind) in [
+            (
+                CompilationKind::CargoTest,
+                "cargo test --no-run --test alpha --test=beta --test alpha",
+                TargetKind::Test,
+            ),
+            (
+                CompilationKind::CargoTest,
+                "env CARGO_TARGET_DIR=/tmp/out rustup run nightly cargo t --test alpha --no-run --test beta --profile test",
+                TargetKind::Test,
+            ),
+            (
+                CompilationKind::CargoBench,
+                "cargo +nightly bench --bench alpha --bench=beta --no-run --profile bench",
+                TargetKind::Bench,
+            ),
+        ] {
+            let capture = CargoOutputCapture::for_command(Some(kind), command).unwrap();
+            assert_eq!(capture.selected.len(), 2, "{command}");
+            assert!(
+                capture
+                    .selected
+                    .iter()
+                    .all(|target| target.kind == target_kind)
+            );
+            assert!(
+                capture
+                    .execution_command(command)
+                    .ends_with(" --message-format=json,json-render-diagnostics")
+            );
+            let restored: CargoOutputCapture =
+                serde_json::from_slice(&serde_json::to_vec(&capture).unwrap()).unwrap();
+            assert_eq!(restored, capture);
+            let explicit = format!("{command} --message-format=json");
+            let capture = CargoOutputCapture::for_command(Some(kind), &explicit).unwrap();
+            assert_eq!(capture.execution_command(&explicit), explicit);
+            // Test/bench capture must not turn into bin-name glob narrowing.
+            assert_eq!(
+                crate::hook::artifact_patterns::get_artifact_patterns(Some(kind), Some(command)),
+                crate::transfer::default_rust_artifact_patterns()
+            );
+        }
+        for (kind, command) in [
+            (CompilationKind::CargoTest, "cargo test --test alpha"),
+            (
+                CompilationKind::CargoTest,
+                "cargo test --test alpha -- --no-run",
+            ),
+            (
+                CompilationKind::CargoTest,
+                "cargo test --test alpha --config --no-run",
+            ),
+            (
+                CompilationKind::CargoTest,
+                "cargo test --no-run --test alpha filter",
+            ),
+            (CompilationKind::CargoTest, "cargo test --no-run --lib"),
+            (
+                CompilationKind::CargoTest,
+                "cargo test --no-run --test alpha --lib",
+            ),
+            (CompilationKind::CargoTest, "cargo test --no-run --tests"),
+            (
+                CompilationKind::CargoTest,
+                "cargo test --no-run --all-targets",
+            ),
+            (
+                CompilationKind::CargoTest,
+                "cargo test --no-run --test alpha --bin tool",
+            ),
+            (
+                CompilationKind::CargoTest,
+                "cargo test --no-run --bench alpha",
+            ),
+            (
+                CompilationKind::CargoTest,
+                "cargo test --no-run --test '../alpha'",
+            ),
+            (
+                CompilationKind::CargoTest,
+                "cargo test --no-run --test alpha --message-format=human",
+            ),
+            (CompilationKind::CargoBench, "cargo bench --bench alpha"),
+            (
+                CompilationKind::CargoBench,
+                "cargo bench --no-run --benches",
+            ),
+            (
+                CompilationKind::CargoBench,
+                "cargo bench --no-run --bench alpha --example demo",
+            ),
+            (
+                CompilationKind::CargoBench,
+                "cargo test --no-run --test alpha",
+            ),
+            (
+                CompilationKind::CargoBuild,
+                "cargo test --no-run --test alpha",
+            ),
+            (
+                CompilationKind::CargoTest,
+                "cargo bench --no-run --bench alpha",
+            ),
+        ] {
+            assert!(
+                CargoOutputCapture::for_command(Some(kind), command).is_none(),
+                "{kind:?}: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_run_receipts_require_each_target_kind_and_actual_executable_path() {
+        for (kind, subcommand, selector, target_kind) in [
+            (CompilationKind::CargoTest, "test", "test", "test"),
+            (CompilationKind::CargoBench, "bench", "bench", "bench"),
+        ] {
+            let command =
+                format!("cargo {subcommand} --no-run --{selector} alpha --{selector} beta");
+            let capture = CargoOutputCapture::for_command(Some(kind), &command).unwrap();
+            let alpha = "/worker/target/debug/deps/alpha-0123456789abcdef";
+            let beta = "/worker/target/custom/build/pkg/unit/out/beta-fedcba9876543210";
+            let first = artifact(target_kind, "alpha", &[alpha], Some(alpha), true);
+            for wrong_kind in ["bin", "lib", "example"] {
+                let incomplete = receipt(&[
+                    first.clone(),
+                    artifact(wrong_kind, "beta", &[beta], Some(beta), true),
+                ]);
+                let error = capture
+                    .parse_receipt(&incomplete, Path::new("/worker/target"))
+                    .unwrap_err();
+                assert!(error.to_string().contains(&format!("{target_kind} beta")));
+            }
+            let complete = receipt(&[
+                first,
+                artifact(target_kind, "beta", &[beta], Some(beta), true),
+            ]);
+            let contract = capture
+                .parse_receipt(&complete, Path::new("/worker/target"))
+                .unwrap();
+            assert_eq!(
+                contract.required_files,
+                BTreeSet::from([
+                    PathBuf::from("debug/deps/alpha-0123456789abcdef"),
+                    PathBuf::from("custom/build/pkg/unit/out/beta-fedcba9876543210"),
+                ])
+            );
+        }
     }
 
     #[test]
