@@ -80,7 +80,12 @@ jobs:
           uuid = { version = "1", features = ["v4"] }
           TOML
           cd "$RUNNER_TEMP/rsync-path-tests"
-          cargo test -- --nocapture 2>&1 | tee "$RUNNER_TEMP/rsync-path-evidence/tests.log"
+          # Config-only resolver tests require no environment override. Do not
+          # skip them or change the resolver's environment-first precedence.
+          env -u RCH_RSYNC_BIN cargo test -- --nocapture 2>&1 | tee "$RUNNER_TEMP/rsync-path-evidence/tests.log"
+          # Independently require the real transfer against the native binary,
+          # including stock legacy rsync on macOS even if Homebrew is present.
+          cargo test tests::remote_path_arg_real_rsync_round_trip -- --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/rsync-path-evidence/native-transport.log"
           cargo clippy --all-targets -- -D warnings 2>&1 | tee "$RUNNER_TEMP/rsync-path-evidence/clippy.log"
       - uses: actions/upload-artifact@v4
         if: always()
