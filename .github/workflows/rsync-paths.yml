@@ -17,7 +17,11 @@ permissions:
 
 jobs:
   paths:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04-arm, macos-14]
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 20
     # Used only to stage reviewed source blobs for the initial direct-to-main
     # publication. This job never creates commits or moves branch references.
@@ -72,8 +76,13 @@ jobs:
           PY
       - name: Install real rsync and Rust formatter
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y rsync
+          if [ "$RUNNER_OS" = Linux ]; then
+            sudo apt-get update -qq
+            sudo apt-get install -y rsync
+          else
+            # Exercise the stock legacy implementation, not a Homebrew binary.
+            echo 'RCH_RSYNC_BIN=/usr/bin/rsync' >> "$GITHUB_ENV"
+          fi
           rsync --version
           rustup toolchain install stable --profile minimal --component rustfmt --component clippy
       - name: Parse and format the five changed Rust files
@@ -101,6 +110,7 @@ jobs:
           cargo clippy --all-targets -- -D warnings 2>&1 | tee "$RUNNER_TEMP/issue91-evidence/rsync-clippy.log"
       - name: Attempt workspace validation without changing dependency versions
         id: workspace
+        if: runner.os == 'Linux'
         continue-on-error: true
         run: |
           rustup toolchain install nightly-2026-08-31 --profile minimal --component rustfmt --component clippy
@@ -141,6 +151,7 @@ jobs:
               target.parent.mkdir(parents=True, exist_ok=True)
               shutil.copyfile(path, target)
           report = {'base_sha': os.environ['GITHUB_SHA'], 'files': entries,
+                    'runner_os': os.environ['RUNNER_OS'],
                     'workspace_outcome': os.environ['WORKSPACE_OUTCOME']}
           (evidence / 'prepared.json').write_text(json.dumps(report, indent=2) + '\n')
           (evidence / 'prepared.patch').write_bytes(subprocess.check_output(['git', 'diff', '--binary']))
@@ -149,7 +160,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: rsync-path-validation-${{ github.sha }}
+          name: rsync-path-validation-${{ matrix.runner }}-${{ github.sha }}
           path: ${{ runner.temp }}/issue91-evidence
           if-no-files-found: warn
           retention-days: 7
