@@ -1544,10 +1544,8 @@ async fn execute_remote_compilation_inner(
     let managed_target = clean_overlay
         .filter(|_| clean_overlay_cargo)
         .map(|_| pipeline.remote_cargo_target_dir());
-    let command_plan = super::cargo_target_dir::ManagedCargoCommand::new(
-        command,
-        managed_target.as_deref(),
-    )?;
+    let command_plan =
+        super::cargo_target_dir::ManagedCargoCommand::new(command, managed_target.as_deref())?;
     // Capture output semantics BEFORE build-dir binding and source stamping.
     // Both inject quoted Cargo configuration, which is deliberately outside
     // the classifier's publication grammar. They must not widen archive-only
@@ -2040,7 +2038,7 @@ async fn execute_remote_compilation_inner(
             match retrieval {
                 Ok(artifact_result) => {
                     if let Some(session) = recovery_session.as_mut() {
-                        session.publish("project")?;
+                        session.publish("project").await?;
                     }
                     info!(
                         "Artifacts retrieved: {} files, {} bytes in {}ms",
@@ -2194,7 +2192,7 @@ async fn execute_remote_compilation_inner(
                 match target_retrieval {
                     Ok(target_result) => {
                         if let Some(session) = recovery_session.as_mut() {
-                            session.publish("target")?;
+                            session.publish("target").await?;
                         }
                         info!(
                             "Custom CARGO_TARGET_DIR artifacts retrieved: {} files, {} bytes in {}ms",
@@ -2286,7 +2284,7 @@ async fn execute_remote_compilation_inner(
             {
                 Ok(retrieved) => {
                     if let Some(session) = recovery_session.as_mut() {
-                        session.publish(&phase_name)?;
+                        session.publish(&phase_name).await?;
                     }
                     reporter.verbose(&format!(
                         "[RCH] result dir '{}': {} files, {} bytes",

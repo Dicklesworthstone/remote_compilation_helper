@@ -24,7 +24,10 @@ enum Presence {
 }
 
 pub(super) fn has_missing_results(recipe: &RecoveryRecipe) -> bool {
-    recipe.phases.iter().any(|phase| phase.missing_result.is_some())
+    recipe
+        .phases
+        .iter()
+        .any(|phase| phase.missing_result.is_some())
 }
 
 pub(super) fn validate_missing_results(recipe: &RecoveryRecipe) -> anyhow::Result<()> {
@@ -38,7 +41,9 @@ pub(super) fn validate_missing_results(recipe: &RecoveryRecipe) -> anyhow::Resul
                     && !phase.complete
                     && phase.remote == failure.remote_root
                     && phase.result_dir.as_ref() == Some(&failure.directory)
-                    && recipe.returned.is_none_or(|code| code == EXIT_ARTIFACT_TRANSFER_FAILED),
+                    && recipe
+                        .returned
+                        .is_none_or(|code| code == EXIT_ARTIFACT_TRANSFER_FAILED),
                 "missing-result evidence contradicts the execution or output contract"
             );
             validate_directory(&failure.directory)?;
@@ -48,7 +53,8 @@ pub(super) fn validate_missing_results(recipe: &RecoveryRecipe) -> anyhow::Resul
 }
 
 fn validate_directory(directory: &Path) -> anyhow::Result<&str> {
-    let normalized = crate::hook::normalize_repository_relative_path("result directory", directory)?;
+    let normalized =
+        crate::hook::normalize_repository_relative_path("result directory", directory)?;
     anyhow::ensure!(
         normalized.as_os_str() == directory.as_os_str(),
         "result directory must retain its admitted normalized spelling"
@@ -100,7 +106,10 @@ fn probe_command(root: &str, directory: &Path, token: &str) -> anyhow::Result<St
 }
 
 fn parse_probe(output: &Output, token: &str) -> anyhow::Result<Presence> {
-    anyhow::ensure!(output.status.success(), "result directory probe failed; ownership retained");
+    anyhow::ensure!(
+        output.status.success(),
+        "result directory probe failed; ownership retained"
+    );
     if output.stdout == format!("{token}:absent\n").as_bytes() {
         Ok(Presence::Absent)
     } else if output.stdout == format!("{token}:present\n").as_bytes() {
@@ -124,12 +133,9 @@ async fn probe_directory(
     let token = format!("RCH_RESULT_DIRECTORY_V1:{}", uuid::Uuid::new_v4().simple());
     let command = probe_command(root, directory, &token)?;
     let command = crate::hook::ssh::wrap_remote_source_activity(&command, source_identity)?;
-    let output = crate::hook::ssh::run_offload_ssh_command(
-        worker,
-        &command,
-        Duration::from_secs(20),
-    )
-    .await?;
+    let output =
+        crate::hook::ssh::run_offload_ssh_command(worker, &command, Duration::from_secs(20))
+            .await?;
     parse_probe(&output, &token)
 }
 
@@ -142,14 +148,27 @@ pub(super) async fn collect_result(
     pipeline: &TransferPipeline,
     worker: &WorkerConfig,
 ) -> anyhow::Result<bool> {
-    let phase = session.recipe.phases.get(index).context("missing result phase")?.clone();
-    let directory = phase.result_dir.as_deref().context("not a result-directory phase")?;
+    let phase = session
+        .recipe
+        .phases
+        .get(index)
+        .context("missing result phase")?
+        .clone();
+    let directory = phase
+        .result_dir
+        .as_deref()
+        .context("not a result-directory phase")?;
     let identity = session.recipe.identity.clone();
     settle_result_phase(
         session,
         index,
         probe_directory(worker, &identity, &phase.remote, directory),
-        async { pipeline.retrieve_result_dir(worker, directory).await.map(|_| ()) },
+        async {
+            pipeline
+                .retrieve_result_dir(worker, directory)
+                .await
+                .map(|_| ())
+        },
     )
     .await
 }
@@ -173,9 +192,19 @@ async fn settle_result_phase(
             && session.recipe.returned.is_none(),
         "result recovery requires completed execution and an unretired source grant"
     );
-    let command_exit = session.recipe.exit_code.context("no observed remote completion")?;
-    let phase = session.recipe.phases.get(index).context("missing result phase")?;
-    let directory = phase.result_dir.as_ref().context("not a result-directory phase")?;
+    let command_exit = session
+        .recipe
+        .exit_code
+        .context("no observed remote completion")?;
+    let phase = session
+        .recipe
+        .phases
+        .get(index)
+        .context("missing result phase")?;
+    let directory = phase
+        .result_dir
+        .as_ref()
+        .context("not a result-directory phase")?;
     validate_directory(directory)?;
     if phase.missing_result.is_some() {
         // A later phase's transport failure may have interrupted recovery.
@@ -199,7 +228,11 @@ async fn settle_result_phase(
             eprintln!(
                 "[RCH] required result directory '{}' is absent after remote completion \
                  (command exit {command_exit}); delivery remains failed (exit {EXIT_ARTIFACT_TRANSFER_FAILED})",
-                session.recipe.phases[index].result_dir.as_ref().unwrap().display()
+                session.recipe.phases[index]
+                    .result_dir
+                    .as_ref()
+                    .unwrap()
+                    .display()
             );
             Ok(false)
         }
@@ -227,15 +260,28 @@ mod tests {
         let writer = DurableLeaseWriter {
             path: directory.path().join("lease.json"),
             lease: Arc::new(Mutex::new(DurableJobLease::new(
-                JobIdentity::new_local(), 0, None, None, 0, true, false, "test".into(),
+                JobIdentity::new_local(),
+                0,
+                None,
+                None,
+                0,
+                true,
+                false,
+                "test".into(),
             ))),
         };
         writer.admit(41, &worker.id).unwrap();
         RecoverySession::begin(
-            &writer, &worker, vec!["/test/source".into()], None, None,
-            TransferConfig::default(), directory.path().to_owned(),
+            &writer,
+            &worker,
+            vec!["/test/source".into()],
+            None,
+            None,
+            TransferConfig::default(),
+            directory.path().to_owned(),
             uuid::Uuid::new_v4().simple().to_string(),
-        ).unwrap();
+        )
+        .unwrap();
         let mut recipe = load_recipe(&writer).unwrap();
         recipe.prepared = true;
         recipe.execution_started = true;
@@ -263,7 +309,11 @@ mod tests {
         let token = "test-receipt";
         let output = std::process::Command::new("sh")
             .arg("-c")
-            .arg(probe_command(root.to_str().unwrap(), Path::new(relative), token)?)
+            .arg(probe_command(
+                root.to_str().unwrap(),
+                Path::new(relative),
+                token,
+            )?)
             .output()?;
         parse_probe(&output, token)
     }
@@ -278,22 +328,52 @@ mod tests {
         std::os::unix::fs::symlink(root.join("nowhere"), root.join("dangling")).unwrap();
         std::os::unix::fs::symlink(root.join("reports"), root.join("alias")).unwrap();
         for path in ["missing", "reports/missing", "missing/deep/result"] {
-            assert_eq!(local_probe(&root, path).unwrap(), Presence::Absent, "{path}");
+            assert_eq!(
+                local_probe(&root, path).unwrap(),
+                Presence::Absent,
+                "{path}"
+            );
         }
-        for path in ["reports", "reports/file", "reports/file/child", "dangling", "alias/missing"] {
-            assert_eq!(local_probe(&root, path).unwrap(), Presence::Present, "{path}");
+        for path in [
+            "reports",
+            "reports/file",
+            "reports/file/child",
+            "dangling",
+            "alias/missing",
+        ] {
+            assert_eq!(
+                local_probe(&root, path).unwrap(),
+                Presence::Present,
+                "{path}"
+            );
         }
         assert!(local_probe(&directory.path().join("missing-root"), "reports").is_err());
         assert!(local_probe(&root.join("dangling"), "reports").is_err());
         let root_alias = directory.path().join("source-alias");
         std::os::unix::fs::symlink(&root, &root_alias).unwrap();
-        assert_eq!(local_probe(&root_alias, "reports/missing").unwrap(), Presence::Absent);
+        assert_eq!(
+            local_probe(&root_alias, "reports/missing").unwrap(),
+            Presence::Absent
+        );
     }
 
     #[test]
     fn result_probe_refuses_unadmitted_paths_and_unbound_receipts() {
-        for directory in ["", "/reports", "../reports", "reports/../out", "reports//out", "./reports", "reports/", "reports\n", "reports\\out"] {
-            assert!(probe_command("/source", Path::new(directory), "token").is_err(), "{directory:?}");
+        for directory in [
+            "",
+            "/reports",
+            "../reports",
+            "reports/../out",
+            "reports//out",
+            "./reports",
+            "reports/",
+            "reports\n",
+            "reports\\out",
+        ] {
+            assert!(
+                probe_command("/source", Path::new(directory), "token").is_err(),
+                "{directory:?}"
+            );
         }
         for (code, bytes) in [
             (1, b"token:absent\n".to_vec()),
@@ -302,7 +382,11 @@ mod tests {
             (0, b"token:absent\ntoken:present\n".to_vec()),
             (0, vec![255]),
         ] {
-            let output = Output { status: std::process::ExitStatus::from_raw(code << 8), stdout: bytes, stderr: Vec::new() };
+            let output = Output {
+                status: std::process::ExitStatus::from_raw(code << 8),
+                stdout: bytes,
+                stderr: Vec::new(),
+            };
             assert!(parse_probe(&output, "token").is_err());
         }
     }
@@ -312,10 +396,14 @@ mod tests {
         for code in [0, 1, 101, 137] {
             let (_directory, mut session) = fixture(code);
             let transferred = Cell::new(false);
-            assert!(!settle_result_phase(&mut session, 0, async { Ok(Presence::Absent) }, async {
-                transferred.set(true);
-                Ok(())
-            }).await.unwrap());
+            assert!(
+                !settle_result_phase(&mut session, 0, async { Ok(Presence::Absent) }, async {
+                    transferred.set(true);
+                    Ok(())
+                })
+                .await
+                .unwrap()
+            );
             assert!(!transferred.get());
             let persisted = load_recipe(&session.writer).unwrap();
             assert_eq!(persisted.exit_code, Some(code));
@@ -325,7 +413,7 @@ mod tests {
             assert!(!persisted.sources_released);
             assert!(!persisted.retired);
             assert!(session.returned(0).is_err());
-            assert!(session.publish("result:reports/export").is_err());
+            assert!(session.publish("result:reports/export").await.is_err());
             assert!(session.writer.acknowledge_terminal().is_err());
             assert!(session.writer.ensure_released_for_retry().is_err());
             let before = std::fs::read(&session.writer.path).unwrap();
@@ -339,15 +427,25 @@ mod tests {
         let (_directory, mut session) = fixture(1);
         let before = std::fs::read(&session.writer.path).unwrap();
         let transferred = Cell::new(false);
-        assert!(settle_result_phase(&mut session, 0, async { anyhow::bail!("permission denied") }, async {
-            transferred.set(true);
-            Ok(())
-        }).await.is_err());
+        assert!(
+            settle_result_phase(
+                &mut session,
+                0,
+                async { anyhow::bail!("permission denied") },
+                async {
+                    transferred.set(true);
+                    Ok(())
+                }
+            )
+            .await
+            .is_err()
+        );
         assert!(!transferred.get());
         assert_eq!(std::fs::read(&session.writer.path).unwrap(), before);
         let result = settle_result_phase(&mut session, 0, async { Ok(Presence::Present) }, async {
             anyhow::bail!("transport interrupted")
-        }).await;
+        })
+        .await;
         assert_eq!(result.unwrap_err().to_string(), "transport interrupted");
         assert_eq!(std::fs::read(&session.writer.path).unwrap(), before);
         assert!(!has_missing_results(&session.recipe));
@@ -359,20 +457,47 @@ mod tests {
         let (_directory, mut session) = fixture(1);
         settle_result_phase(&mut session, 0, async { Ok(Presence::Absent) }, async {
             panic!("no transfer for absent output")
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
         session.recipe = load_recipe(&session.writer).unwrap();
-        assert!(!settle_result_phase(&mut session, 0, async {
-            panic!("settled absence must not probe again")
-        }, async {
-            panic!("settled absence must not transfer again")
-        }).await.unwrap());
+        assert!(
+            !settle_result_phase(
+                &mut session,
+                0,
+                async { panic!("settled absence must not probe again") },
+                async { panic!("settled absence must not transfer again") }
+            )
+            .await
+            .unwrap()
+        );
         let original = session.recipe.clone();
         for changed in [
-            { let mut r = original.clone(); r.phases[0].remote = "/another/root".into(); r },
-            { let mut r = original.clone(); r.phases[0].complete = true; r },
-            { let mut r = original.clone(); r.exit_code = Some(0); r },
-            { let mut r = original.clone(); r.returned = Some(0); r },
-            { let mut r = original.clone(); r.phases[0].result_dir = None; r },
+            {
+                let mut r = original.clone();
+                r.phases[0].remote = "/another/root".into();
+                r
+            },
+            {
+                let mut r = original.clone();
+                r.phases[0].complete = true;
+                r
+            },
+            {
+                let mut r = original.clone();
+                r.exit_code = Some(0);
+                r
+            },
+            {
+                let mut r = original.clone();
+                r.returned = Some(0);
+                r
+            },
+            {
+                let mut r = original.clone();
+                r.phases[0].result_dir = None;
+                r
+            },
         ] {
             assert!(validate_missing_results(&changed).is_err());
         }
@@ -382,10 +507,14 @@ mod tests {
     async fn present_results_still_require_transfer_and_publication() {
         let (_directory, mut session) = fixture(1);
         let transferred = Cell::new(false);
-        assert!(settle_result_phase(&mut session, 0, async { Ok(Presence::Present) }, async {
-            transferred.set(true);
-            Ok(())
-        }).await.unwrap());
+        assert!(
+            settle_result_phase(&mut session, 0, async { Ok(Presence::Present) }, async {
+                transferred.set(true);
+                Ok(())
+            })
+            .await
+            .unwrap()
+        );
         assert!(transferred.get());
         assert!(!session.recipe.phases[0].complete);
         assert!(!has_missing_results(&session.recipe));
@@ -403,29 +532,25 @@ mod tests {
         logs.result_dir = Some(PathBuf::from("logs"));
         session.recipe.phases.push(logs);
         session.persist().unwrap();
-        assert!(!settle_result_phase(
-            &mut session,
-            0,
-            async { Ok(Presence::Absent) },
-            async { panic!("an absent directory must never be transferred") },
-        )
-        .await
-        .unwrap());
+        assert!(
+            !settle_result_phase(&mut session, 0, async { Ok(Presence::Absent) }, async {
+                panic!("an absent directory must never be transferred")
+            },)
+            .await
+            .unwrap()
+        );
 
         let log_stage = session.stage(1);
-        assert!(settle_result_phase(
-            &mut session,
-            1,
-            async { Ok(Presence::Present) },
-            async {
+        assert!(
+            settle_result_phase(&mut session, 1, async { Ok(Presence::Present) }, async {
                 std::fs::create_dir_all(log_stage.join("logs"))?;
                 std::fs::write(log_stage.join("logs/failure.txt"), b"original failure")?;
                 Ok(())
-            },
-        )
-        .await
-        .unwrap());
-        session.publish("result:logs").unwrap();
+            },)
+            .await
+            .unwrap()
+        );
+        session.publish("result:logs").await.unwrap();
         assert!(!session.recipe.phases[0].complete);
         assert!(session.recipe.phases[1].complete);
         session.returned(EXIT_ARTIFACT_TRANSFER_FAILED).unwrap();
@@ -438,15 +563,24 @@ mod tests {
         session.pair_released().unwrap();
         session.sources_released().unwrap();
         session.retired().unwrap();
-        session.writer.record_exit(EXIT_ARTIFACT_TRANSFER_FAILED).unwrap();
+        session
+            .writer
+            .record_exit(EXIT_ARTIFACT_TRANSFER_FAILED)
+            .unwrap();
         session.writer.acknowledge_terminal().unwrap();
         assert_eq!(
             recover_job(&session.writer).await.unwrap(),
             EXIT_ARTIFACT_TRANSFER_FAILED
         );
-        assert_eq!(session.writer.snapshot().exit_code, Some(EXIT_ARTIFACT_TRANSFER_FAILED));
+        assert_eq!(
+            session.writer.snapshot().exit_code,
+            Some(EXIT_ARTIFACT_TRANSFER_FAILED)
+        );
         assert_eq!(load_recipe(&session.writer).unwrap().exit_code, Some(1));
-        assert_eq!(std::fs::read(first_stage.join("partial-evidence")).unwrap(), b"keep me");
+        assert_eq!(
+            std::fs::read(first_stage.join("partial-evidence")).unwrap(),
+            b"keep me"
+        );
         assert_eq!(
             std::fs::read(directory.path().join("logs/failure.txt")).unwrap(),
             b"original failure"

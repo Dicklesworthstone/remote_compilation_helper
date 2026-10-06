@@ -5,12 +5,12 @@ use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::Read;
 
-#[path = "result_recovery.rs"]
-mod result_recovery;
-#[path = "recovery_owner.rs"]
-mod recovery_owner;
 #[path = "recovery_completion.rs"]
 mod recovery_completion;
+#[path = "recovery_owner.rs"]
+mod recovery_owner;
+#[path = "result_recovery.rs"]
+mod result_recovery;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct RecoveryRecipe {
@@ -139,7 +139,7 @@ const OUTPUT_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(600
 /// phase publication. It is deliberately NOT held across the remote build:
 /// dispatchers share one CARGO_TARGET_DIR (and run concurrent jobs in one
 /// project), and a job-long lock failed every overlapping build outright.
-fn lock_output_root(root: &Path) -> anyhow::Result<File> {
+async fn lock_output_root(root: &Path) -> anyhow::Result<File> {
     let directory = default_job_lease_directory().join("output-locks");
     std::fs::create_dir_all(&directory)?;
     let name = blake3::hash(root.as_os_str().as_encoded_bytes())
@@ -151,12 +151,18 @@ fn lock_output_root(root: &Path) -> anyhow::Result<File> {
         .read(true)
         .write(true)
         .open(directory.join(name))?;
-    let deadline = std::time::Instant::now() + OUTPUT_LOCK_WAIT;
+    let deadline = tokio::time::Instant::now() + OUTPUT_LOCK_WAIT;
     loop {
         match file.try_lock() {
             Ok(()) => return Ok(file),
-            Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
-                std::thread::sleep(std::time::Duration::from_millis(100));
+            Err(std::fs::TryLockError::WouldBlock) if tokio::time::Instant::now() < deadline => {
+                // The CLI uses a current-thread runtime. Blocking here stalls
+                // heartbeats and prevents the caller's recovery deadline or
+                // cancellation from being polled for the whole lock budget.
+                // No output or journal has been touched while waiting, so a
+                // dropped waiter can safely retry this exact publication.
+                let next_poll = tokio::time::Instant::now() + std::time::Duration::from_millis(100);
+                tokio::time::sleep_until(next_poll.min(deadline)).await;
             }
             Err(error) => anyhow::bail!(
                 "output publication into {} is held by another wrapper: {error}",
@@ -422,7 +428,9 @@ impl RecoverySession {
             "completion requires an admitted execution attempt"
         );
         anyhow::ensure!(
-            self.recipe.exit_code.is_none_or(|observed| observed == exit),
+            self.recipe
+                .exit_code
+                .is_none_or(|observed| observed == exit),
             "remote completion contradicts the recorded command outcome; ownership retained"
         );
         self.recipe.exit_code = Some(exit);
@@ -463,7 +471,7 @@ impl RecoverySession {
             .with_retrieval_reference_root(self.recipe.phases[index].local.clone())
             .with_local_root(stage))
     }
-    pub(crate) fn publish(&mut self, name: &str) -> anyhow::Result<()> {
+    pub(crate) async fn publish(&mut self, name: &str) -> anyhow::Result<()> {
         let index = self
             .recipe
             .phases
@@ -478,7 +486,7 @@ impl RecoverySession {
             return Ok(());
         }
         // Exclusive for this publication only; see `lock_output_root`.
-        let _publication = lock_output_root(&self.recipe.phases[index].local)?;
+        let _publication = lock_output_root(&self.recipe.phases[index].local).await?;
         let stage = self.stage(index);
         let mut files = regular_files(&stage)?;
         let phase = &self.recipe.phases[index];
@@ -1099,7 +1107,7 @@ async fn recover_job_with_daemon(
                 }
             }
         }
-        session.publish(&phase.name)?;
+        session.publish(&phase.name).await?;
     }
     // Publication is the durable terminal boundary. Retirement can be retried
     // independently and must never cause a second output write.
@@ -1202,8 +1210,8 @@ mod tests {
         (directory, stage_owner, session)
     }
 
-    #[test]
-    fn recovery_publication_refuses_retained_or_pending_source_before_any_write() {
+    #[tokio::test]
+    async fn recovery_publication_refuses_retained_or_pending_source_before_any_write() {
         for pending in [false, true] {
             let (_directory, _stage_owner, mut session) = publication_fixture();
             let local = session.recipe.project_root.clone();
@@ -1233,7 +1241,7 @@ mod tests {
             session.persist().unwrap();
             let journal = std::fs::read(&session.writer.path).unwrap();
 
-            let published = session.publish("project");
+            let published = session.publish("project").await;
             // Source is never overwritten.
             assert_eq!(std::fs::read(local.join("main.c")).unwrap(), original);
             if pending {
@@ -1266,8 +1274,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn publication_overwrites_outputs_another_job_replaced_after_preparation() {
+    #[tokio::test]
+    async fn publication_overwrites_outputs_another_job_replaced_after_preparation() {
         // Dispatchers share one CARGO_TARGET_DIR: between this job's
         // preparation snapshot and its publication, another job may replace
         // the same output. That is not an ownership conflict; publishing must
@@ -1286,7 +1294,7 @@ mod tests {
         std::fs::write(stage.join("build/app"), b"this job's output").unwrap();
         session.persist().unwrap();
 
-        session.publish("project").unwrap();
+        session.publish("project").await.unwrap();
         assert_eq!(
             std::fs::read(local.join("build/app")).unwrap(),
             b"this job's output"
@@ -1302,8 +1310,8 @@ mod tests {
     /// a symlinked `/data`): publication must accept that root, while a
     /// symlink BELOW it, which could redirect a write, is still refused.
     #[cfg(unix)]
-    #[test]
-    fn publication_accepts_symlinked_root_but_refuses_symlinks_inside_it() {
+    #[tokio::test]
+    async fn publication_accepts_symlinked_root_but_refuses_symlinks_inside_it() {
         let (directory, _stage_owner, mut session) = publication_fixture();
         let real = directory.path().join("real-target");
         std::fs::create_dir(&real).unwrap();
@@ -1314,7 +1322,7 @@ mod tests {
         std::fs::create_dir(stage.join("build")).unwrap();
         std::fs::write(stage.join("build/app"), b"output").unwrap();
         session.persist().unwrap();
-        session.publish("project").unwrap();
+        session.publish("project").await.unwrap();
         assert_eq!(std::fs::read(real.join("build/app")).unwrap(), b"output");
 
         let (directory, _stage_owner, mut session) = publication_fixture();
@@ -1326,22 +1334,153 @@ mod tests {
         std::fs::create_dir(stage.join("build")).unwrap();
         std::fs::write(stage.join("build/app"), b"output").unwrap();
         session.persist().unwrap();
-        assert!(session.publish("project").is_err());
+        assert!(session.publish("project").await.is_err());
         assert!(!elsewhere.join("app").exists());
     }
 
-    #[test]
-    fn publication_lock_is_released_between_publications() {
+    #[tokio::test]
+    async fn publication_lock_is_released_between_publications() {
         let (_directory, _stage_owner, session) = publication_fixture();
         let root = session.recipe.project_root.clone();
-        let first = lock_output_root(&root).unwrap();
+        let first = lock_output_root(&root).await.unwrap();
         drop(first);
         // A second wrapper can publish into the same root once the first is done.
-        let _second = lock_output_root(&root).unwrap();
+        let _second = lock_output_root(&root).await.unwrap();
     }
 
-    #[test]
-    fn recovery_publication_finishes_journaled_new_outputs_without_rewriting_them() {
+    /// Keep a real kernel lock held independently of the Tokio reactor. The
+    /// watchdog makes a regression to a blocking wait fail in seconds instead
+    /// of hanging the test for the production ten-minute publication budget.
+    fn hold_publication_lock(
+        lock: File,
+    ) -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>) {
+        let (release, released) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let _ = released.recv_timeout(Duration::from_secs(2));
+            drop(lock);
+        });
+        (release, holder)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn publication_deadline_keeps_staged_outputs_and_journal_for_same_job_retry() {
+        let (_directory, _stage_owner, mut session) = publication_fixture();
+        let local = session.recipe.project_root.clone();
+        let stage = session.stage(0);
+        std::fs::create_dir(local.join("build")).unwrap();
+        std::fs::write(local.join("build/app"), b"previous output").unwrap();
+        std::fs::create_dir(stage.join("build")).unwrap();
+        std::fs::write(stage.join("build/app"), b"completed remote output").unwrap();
+        session.persist().unwrap();
+        let before = std::fs::read(&session.writer.path).unwrap();
+        let lock = lock_output_root(&local).await.unwrap();
+        let (release, holder) = hold_publication_lock(lock);
+
+        // This is the same cancellation boundary as jobs recover's deadline:
+        // dropping the wait must not begin publication or retire ownership.
+        let publication =
+            tokio::time::timeout(Duration::from_millis(25), session.publish("project")).await;
+        let _ = release.send(());
+        holder.join().unwrap();
+        assert!(
+            publication.is_err(),
+            "contended publication blocked its caller's deadline"
+        );
+        assert_eq!(std::fs::read(&session.writer.path).unwrap(), before);
+        assert_eq!(
+            std::fs::read(local.join("build/app")).unwrap(),
+            b"previous output"
+        );
+        assert_eq!(
+            std::fs::read(stage.join("build/app")).unwrap(),
+            b"completed remote output"
+        );
+        assert!(!session.recipe.phases[0].complete);
+        assert!(session.recipe.phases[0].pending.is_none());
+        assert!(session.recipe.phases[0].published.is_empty());
+        assert!(!session.recipe.sources_released);
+
+        // Resume from the retained disk journal, not the cancelled future's
+        // in-memory session. Only the already-staged bytes are published.
+        let writer = DurableLeaseWriter {
+            path: session.writer.path.clone(),
+            lease: Arc::new(Mutex::new(serde_json::from_slice(&before).unwrap())),
+        };
+        let mut resumed = RecoverySession {
+            recipe: load_recipe(&writer).unwrap(),
+            writer,
+        };
+        resumed.publish("project").await.unwrap();
+        assert_eq!(
+            std::fs::read(local.join("build/app")).unwrap(),
+            b"completed remote output"
+        );
+        assert!(resumed.recipe.phases[0].complete);
+        assert!(!stage.exists());
+        assert_eq!(resumed.recipe.wrapper_id, session.recipe.wrapper_id);
+        assert_eq!(resumed.recipe.build_id, session.recipe.build_id);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn same_root_publishers_wait_without_stalling_runtime_progress() {
+        let (_first_dir, _first_stage_owner, mut first) = publication_fixture();
+        let (_second_dir, _second_stage_owner, mut second) = publication_fixture();
+        let local = first.recipe.project_root.clone();
+        second.recipe.phases[0].local = local.clone();
+        std::fs::create_dir(local.join("build")).unwrap();
+        std::fs::write(local.join("build/app"), b"before both jobs").unwrap();
+        for (session, name, bytes) in [
+            (&mut first, "first.o", b"first job".as_slice()),
+            (&mut second, "second.o", b"second job".as_slice()),
+        ] {
+            let stage = session.stage(0);
+            std::fs::create_dir(stage.join("build")).unwrap();
+            std::fs::write(stage.join("build/app"), bytes).unwrap();
+            std::fs::write(stage.join("build").join(name), bytes).unwrap();
+            session.persist().unwrap();
+        }
+        let lock = lock_output_root(&local).await.unwrap();
+        let (release, holder) = hold_publication_lock(lock);
+        let publications = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(first.publish("project"), second.publish("project"), async {
+                // A heartbeat/recovery timer must still run while both jobs
+                // wait. Neither may touch the shared output before ownership.
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                assert_eq!(
+                    std::fs::read(local.join("build/app")).unwrap(),
+                    b"before both jobs"
+                );
+                release.send(()).unwrap();
+            })
+        })
+        .await;
+        drop(release);
+        holder.join().unwrap();
+        let (first_result, second_result, ()) = publications
+            .expect("contended publication prevented the timer from releasing its owner");
+        first_result.unwrap();
+        second_result.unwrap();
+        assert!(first.recipe.phases[0].complete);
+        assert!(second.recipe.phases[0].complete);
+        assert_eq!(
+            std::fs::read(local.join("build/first.o")).unwrap(),
+            b"first job"
+        );
+        assert_eq!(
+            std::fs::read(local.join("build/second.o")).unwrap(),
+            b"second job"
+        );
+        let final_output = std::fs::read(local.join("build/app")).unwrap();
+        assert!(matches!(
+            final_output.as_slice(),
+            b"first job" | b"second job"
+        ));
+        assert!(!first.stage(0).exists());
+        assert!(!second.stage(0).exists());
+    }
+
+    #[tokio::test]
+    async fn recovery_publication_finishes_journaled_new_outputs_without_rewriting_them() {
         let (_directory, _stage_owner, mut session) = publication_fixture();
         let local = session.recipe.project_root.clone();
         let stage = session.stage(0);
@@ -1359,7 +1498,7 @@ mod tests {
         std::fs::write(stage.join("build/next.o"), b"next output").unwrap();
         session.persist().unwrap();
 
-        session.publish("project").unwrap();
+        session.publish("project").await.unwrap();
         assert_eq!(std::fs::read(local.join("a.out")).unwrap(), b"first output");
         assert_eq!(std::fs::read(local.join("b.out")).unwrap(), b"other output");
         assert_eq!(
@@ -1375,8 +1514,8 @@ mod tests {
         assert!(session.recipe.phases[0].complete);
     }
 
-    #[test]
-    fn recovery_publication_retains_declared_result_directory_contract() {
+    #[tokio::test]
+    async fn recovery_publication_retains_declared_result_directory_contract() {
         let (_directory, _stage_owner, mut session) = publication_fixture();
         let local = session.recipe.project_root.clone();
         let stage = session.stage(0);
@@ -1394,7 +1533,7 @@ mod tests {
         );
         session.persist().unwrap();
 
-        session.publish("project").unwrap();
+        session.publish("project").await.unwrap();
         assert_eq!(
             std::fs::read(local.join("reports/result.json")).unwrap(),
             b"new report"
