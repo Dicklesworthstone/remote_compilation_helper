@@ -32,7 +32,8 @@ jobs:
         with:
           persist-credentials: false
       - name: Apply the reviewed issue 91 patch for initial validation
-        if: github.event_name == 'push' && github.event.head_commit.message == 'test(rsync): validate issue 91 path arguments against real rsync'
+        if: >-
+          github.event_name == 'push' && contains(github.event.head_commit.message, '[issue91-prepare]')
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -108,7 +109,8 @@ jobs:
           timeout 300 cargo test --locked -p rch --bin rch rsync_remote_paths_cover_upload_barrier_estimate_and_retrieval -- --test-threads=1 2>&1 | tee -a "$RUNNER_TEMP/issue91-evidence/workspace.log"
           timeout 300 cargo test --locked -p rch --bin rch rsync_path_fix_keeps_remote_override_safety_checks -- --test-threads=1 2>&1 | tee -a "$RUNNER_TEMP/issue91-evidence/workspace.log"
       - name: Stage validated source blobs for direct GitHub publication
-        if: github.event_name == 'push' && github.event.head_commit.message == 'test(rsync): validate issue 91 path arguments against real rsync'
+        if: >-
+          github.event_name == 'push' && contains(github.event.head_commit.message, '[issue91-prepare]')
         env:
           GH_TOKEN: ${{ github.token }}
           WORKSPACE_OUTCOME: ${{ steps.workspace.outcome }}
