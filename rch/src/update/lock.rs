@@ -190,7 +190,7 @@ fn reclaimable(body: &str, legacy_absent: impl FnOnce(u32) -> bool) -> bool {
     else {
         return false;
     };
-    if pid <= 1 {
+    if pid == 0 {
         return false;
     }
     if fields.get(1) == Some(&GATED_RECORD) {
@@ -204,7 +204,7 @@ fn reclaimable(body: &str, legacy_absent: impl FnOnce(u32) -> bool) -> bool {
             && fields[1..]
                 .iter()
                 .all(|value| value.bytes().all(|b| b.is_ascii_hexdigit())));
-    legacy && legacy_absent(pid)
+    legacy && pid > 1 && legacy_absent(pid)
 }
 
 fn legacy_owner_absent(pid: u32) -> bool {
@@ -258,6 +258,12 @@ mod tests {
         let lock = UpdateLock::acquire_at(&path).unwrap();
         assert_ne!(lock.body, stale);
         drop(lock);
+        // A container's updater may itself be PID 1. Its gated record is
+        // recoverable by kernel proof, unlike an ambiguous legacy PID 1.
+        let init_record = format!("1 {GATED_RECORD} {}\n", uuid::Uuid::new_v4());
+        fs::write(&path, &init_record).unwrap();
+        assert!(reclaimable(&init_record, |_| panic!("PID 1 needs no probe")));
+        drop(UpdateLock::acquire_at(&path).unwrap());
     }
 
     #[test]
