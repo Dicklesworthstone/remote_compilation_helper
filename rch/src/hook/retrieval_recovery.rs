@@ -135,14 +135,76 @@ fn regular_files(root: &Path) -> anyhow::Result<Vec<PathBuf>> {
 /// contention lasts seconds; the bound turns a wedged holder into an error.
 const OUTPUT_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(600);
 
+/// Different spellings of one output directory must share publication
+/// ownership. Resolve existing prefixes without creating a fresh target tree;
+/// missing suffixes keep the same identity after another job creates them.
+/// Resolve a symlink before applying a following `..`, as the filesystem does.
+fn output_lock_root_identity(root: &Path) -> anyhow::Result<PathBuf> {
+    use std::path::Component;
+
+    let absolute = if root.is_absolute() {
+        root.to_owned()
+    } else {
+        std::env::current_dir()?.join(root)
+    };
+    let mut resolved = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::Prefix(_) => anyhow::bail!(
+                "output publication requires a Unix directory path: {}",
+                root.display()
+            ),
+            Component::RootDir => resolved.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                resolved.pop();
+            }
+            Component::Normal(name) => {
+                resolved.push(name);
+                match std::fs::canonicalize(&resolved) {
+                    Ok(canonical) => {
+                        anyhow::ensure!(
+                            std::fs::metadata(&canonical)?.is_dir(),
+                            "output publication root has a non-directory component: {}",
+                            resolved.display()
+                        );
+                        resolved = canonical;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        // A missing directory is allowed, but a dangling
+                        // symlink is not an ordinary missing suffix: treating
+                        // it as one would assign a different lock from its
+                        // eventual target when that target appears.
+                        match std::fs::symlink_metadata(&resolved) {
+                            Err(missing) if missing.kind() == std::io::ErrorKind::NotFound => {}
+                            Ok(_) => {
+                                return Err(error).with_context(|| {
+                                    format!(
+                                        "cannot resolve existing output root entry {}",
+                                        resolved.display()
+                                    )
+                                });
+                            }
+                            Err(error) => return Err(error.into()),
+                        }
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        }
+    }
+    Ok(resolved)
+}
+
 /// Exclusive ownership of one local output root for the duration of a single
 /// phase publication. It is deliberately NOT held across the remote build:
 /// dispatchers share one CARGO_TARGET_DIR (and run concurrent jobs in one
 /// project), and a job-long lock failed every overlapping build outright.
 async fn lock_output_root(root: &Path) -> anyhow::Result<File> {
+    let identity = output_lock_root_identity(root)?;
     let directory = default_job_lease_directory().join("output-locks");
     std::fs::create_dir_all(&directory)?;
-    let name = blake3::hash(root.as_os_str().as_encoded_bytes())
+    let name = blake3::hash(identity.as_os_str().as_encoded_bytes())
         .to_hex()
         .to_string();
     let file = OpenOptions::new()
@@ -154,7 +216,14 @@ async fn lock_output_root(root: &Path) -> anyhow::Result<File> {
     let deadline = tokio::time::Instant::now() + OUTPUT_LOCK_WAIT;
     loop {
         match file.try_lock() {
-            Ok(()) => return Ok(file),
+            Ok(()) => {
+                anyhow::ensure!(
+                    output_lock_root_identity(root)? == identity,
+                    "output root changed while waiting for publication ownership: {}; journal retained",
+                    root.display()
+                );
+                return Ok(file);
+            }
             Err(std::fs::TryLockError::WouldBlock) if tokio::time::Instant::now() < deadline => {
                 // The CLI uses a current-thread runtime. Blocking here stalls
                 // heartbeats and prevents the caller's recovery deadline or
@@ -1360,6 +1429,127 @@ mod tests {
             drop(lock);
         });
         (release, holder)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn publication_identity_resolves_symlinks_before_parent_components_without_creating_outputs() {
+        let directory = tempfile::tempdir().unwrap();
+        let real = directory.path().join("real");
+        std::fs::create_dir_all(real.join("nested")).unwrap();
+        let alias = directory.path().join("alias");
+        std::os::unix::fs::symlink(real.join("nested"), &alias).unwrap();
+        let expected = std::fs::canonicalize(&real).unwrap().join("target");
+        for path in [
+            real.join("target"),
+            alias.join("../target"),
+            alias.join("missing/../../target"),
+        ] {
+            assert_eq!(output_lock_root_identity(&path).unwrap(), expected);
+        }
+        assert!(!real.join("target").exists());
+        assert!(!real.join("nested/missing").exists());
+
+        let dangling = directory.path().join("dangling");
+        std::os::unix::fs::symlink(directory.path().join("absent"), &dangling).unwrap();
+        assert!(output_lock_root_identity(&dangling.join("target")).is_err());
+        std::fs::write(real.join("file"), b"not a directory").unwrap();
+        assert!(output_lock_root_identity(&real.join("file/../target")).is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn symlinked_and_canonical_output_roots_share_publication_ownership() {
+        let (directory, _stage_owner, session) = publication_fixture();
+        let root = session.recipe.project_root.clone();
+        let alias = directory.path().join("output-alias");
+        std::os::unix::fs::symlink(&root, &alias).unwrap();
+        let lock = lock_output_root(&root).await.unwrap();
+        let (release, holder) = hold_publication_lock(lock);
+        let alias_lock =
+            tokio::time::timeout(Duration::from_millis(25), lock_output_root(&alias)).await;
+        let _ = release.send(());
+        holder.join().unwrap();
+        assert!(
+            alias_lock.is_err(),
+            "path alias bypassed the existing publication owner"
+        );
+        let _after_release = lock_output_root(&alias).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn missing_output_root_keeps_its_lock_when_another_job_creates_the_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        let real = directory.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let alias = directory.path().join("alias");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let root = real.join("new-target/profile");
+        let aliased_root = alias.join("new-target/profile");
+        let lock = lock_output_root(&aliased_root).await.unwrap();
+        assert!(
+            !root.exists(),
+            "lock discovery created the caller's output tree"
+        );
+        let (release, holder) = hold_publication_lock(lock);
+        std::fs::create_dir_all(&root).unwrap();
+        let created_lock =
+            tokio::time::timeout(Duration::from_millis(25), lock_output_root(&root)).await;
+        let _ = release.send(());
+        holder.join().unwrap();
+        assert!(
+            created_lock.is_err(),
+            "creating the output tree changed its ownership identity"
+        );
+        let _after_release = lock_output_root(&root).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn retargeted_output_alias_refuses_publication_and_retains_the_journal() {
+        let (directory, _stage_owner, mut session) = publication_fixture();
+        let original = session.recipe.project_root.clone();
+        let replacement = directory.path().join("other-output");
+        std::fs::create_dir(&replacement).unwrap();
+        let alias = directory.path().join("output-alias");
+        std::os::unix::fs::symlink(&original, &alias).unwrap();
+        session.recipe.phases[0].local = alias.clone();
+        let stage = session.stage(0);
+        std::fs::create_dir(stage.join("build")).unwrap();
+        std::fs::write(stage.join("build/app"), b"completed remote output").unwrap();
+        session.persist().unwrap();
+        let before = std::fs::read(&session.writer.path).unwrap();
+        let lock = lock_output_root(&original).await.unwrap();
+        let (release, holder) = hold_publication_lock(lock);
+        let mut publication = Box::pin(session.publish("project"));
+        // Borrow the future so the first deadline leaves its original lock
+        // identity pending, then retarget the alias before ownership arrives.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut publication)
+                .await
+                .is_err()
+        );
+        std::fs::rename(&alias, directory.path().join("previous-output-alias")).unwrap();
+        std::os::unix::fs::symlink(&replacement, &alias).unwrap();
+        let _ = release.send(());
+        holder.join().unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(1), publication)
+            .await
+            .expect("publication did not resume after its original owner released the lock")
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("output root changed while waiting")
+        );
+        assert_eq!(std::fs::read(&session.writer.path).unwrap(), before);
+        assert!(!original.join("build/app").exists());
+        assert!(!replacement.join("build/app").exists());
+        assert_eq!(
+            std::fs::read(stage.join("build/app")).unwrap(),
+            b"completed remote output"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
