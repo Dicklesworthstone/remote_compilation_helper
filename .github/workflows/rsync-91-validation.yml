@@ -1,0 +1,25 @@
+name: Rsync issue 91 validation
+on:
+  push:
+    branches: [automation/rsync-91-validation]
+permissions:
+  contents: read
+jobs:
+  source:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: false
+      - name: Snapshot current sources for transport validation
+        run: |
+          git rev-parse HEAD > source-head.txt
+          git archive --format=tar HEAD > source.tar
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rsync-91-source
+          path: |
+            source.tar
+            source-head.txt
+          retention-days: 1
