@@ -13,6 +13,41 @@ pub(super) fn ssh_command(transport: &str) -> String {
     format!("{transport} -o LogLevel=ERROR")
 }
 
+/// Recognize only a complete directory-attribute record in rsync's
+/// `YXcstpoguax<TAB>path` format. Checking byte 1 alone is unsound: the
+/// message `*deleting` ALSO has `d` there, for both files and directories.
+/// Creation, deletion, unknown flags and malformed records are not metadata.
+fn directory_metadata_only(line: &str) -> bool {
+    let Some((itemized, path)) = line.split_once('\t') else {
+        return false;
+    };
+    let bytes = itemized.as_bytes();
+    if bytes.len() != 11 || !bytes.starts_with(b".d") {
+        return false;
+    }
+    if path.is_empty()
+        || path.starts_with('/')
+        || path.chars().any(char::is_control)
+        || path.split('/').any(|component| component == "..")
+    {
+        return false;
+    }
+    // Spaces mean all attributes are unchanged. Otherwise each position must
+    // contain its documented attribute letter or '.', never '+' or '?'.
+    if bytes[2..].iter().all(|byte| *byte == b' ') {
+        return true;
+    }
+    bytes[2..]
+        .iter()
+        .zip(b"cstpoguax")
+        .all(|(&actual, &attribute)| {
+            actual == b'.'
+                || actual == attribute
+                || (attribute == b't' && actual == b'T')
+                || (attribute == b'u' && matches!(actual, b'n' | b'b'))
+        })
+}
+
 /// Interpret the bounded, completed rsync capture. No stderr is whitelisted,
 /// including text that resembles SSH's known-host notice: a remote process
 /// can print that same text. Only the SSH client's log level is adjusted.
@@ -34,16 +69,15 @@ pub(super) fn verify_output(output: &Output) -> Result<(), String> {
     }
     let stdout = std::str::from_utf8(&output.stdout)
         .map_err(|_| "source-content rsync barrier output was not UTF-8".to_owned())?;
-    // Preserve the existing distinction: directory metadata is not source
-    // bytes, while every file change, deletion or unexpected output is a delta.
+    if !stdout.is_empty() && !stdout.ends_with('\n') {
+        return Err("source-content rsync barrier output ended in an incomplete record".to_owned());
+    }
+    // Only recognized directory metadata can be ignored. Every file change,
+    // deletion, creation or unexpected output is a delta, never a no-op proof.
     let changed = stdout
-        .lines()
+        .split_terminator('\n')
         .filter(|line| !line.is_empty())
-        .filter(|line| {
-            !line
-                .split_once('\t')
-                .is_some_and(|(itemized, _)| itemized.as_bytes().get(1) == Some(&b'd'))
-        })
+        .filter(|line| !directory_metadata_only(line))
         .collect::<Vec<_>>();
     if !changed.is_empty() {
         let preview = changed
@@ -97,7 +131,14 @@ mod tests {
     #[test]
     fn empty_success_and_directory_metadata_are_not_file_deltas() {
         assert!(verify_output(&output(0, b"", b"")).is_ok());
-        assert!(verify_output(&output(0, b".d..t......\t./\n", b"")).is_ok());
+        for line in [
+            ".d..t......\t./\n",
+            ".d...p.....\tsrc/\n",
+            ".d..tp.....\tp q/x:y/\n",
+            ".d         \tsrc/\n",
+        ] {
+            assert!(verify_output(&output(0, line.as_bytes(), b"")).is_ok());
+        }
     }
 
     #[test]
@@ -136,10 +177,36 @@ mod tests {
             ".f...p.....\tsrc/lib.rs\n",
             "*deleting  \tsrc/old.rs\n",
             "*deleting  \told-directory/\n",
+            "*deleting\tsrc/old.rs\n",
+            "cd+++++++++\tnew-directory/\n",
         ] {
             let stdout = format!(".d..t......\t./\n{line}");
             let error = verify_output(&output(0, stdout.as_bytes(), b"")).unwrap_err();
             assert!(error.contains("1 remote delta(s)"), "{error}");
+        }
+    }
+
+    #[test]
+    fn directory_type_byte_alone_never_proves_a_metadata_only_record() {
+        for line in [
+            "ad\tsrc/\n",
+            ".d\tsrc/\n",
+            ".d........\tsrc/\n",
+            ".d..........\tsrc/\n",
+            ".d..t.....?\tsrc/\n",
+            ".d..t.....q\tsrc/\n",
+            ".d..t......\t\n",
+            ".d..t......\t../outside/\n",
+            ".d..t......\t/absolute/\n",
+            ".d..t......\tsrc/\tforged\n",
+            ".d..t......\tsrc/\0\n",
+            ".d..t......\tsrc/\r\n",
+            ".d..t......\tsrc/",
+        ] {
+            assert!(
+                verify_output(&output(0, line.as_bytes(), b"")).is_err(),
+                "malformed directory record passed: {line:?}"
+            );
         }
     }
 
