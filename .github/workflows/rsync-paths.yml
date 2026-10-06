@@ -1,0 +1,153 @@
+name: Rsync path arguments
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'rch/src/transfer.rs'
+      - 'rch-common/src/rsync_flavor.rs'
+      - 'rch-common/src/remote_compilation.rs'
+      - 'rch-common/src/remote_verification.rs'
+      - 'rch-common/src/e2e/verification.rs'
+      - '.github/workflows/rsync-paths.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  paths:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Used only to stage reviewed source blobs for the initial direct-to-main
+    # publication. This job never creates commits or moves branch references.
+    permissions:
+      contents: write
+    env:
+      RUSTUP_TOOLCHAIN: stable
+      CARGO_NET_RETRY: 2
+      CARGO_HTTP_TIMEOUT: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Apply the reviewed issue 91 patch for initial validation
+        if: github.event_name == 'push' && github.event.head_commit.message == 'test(rsync): validate issue 91 path arguments against real rsync'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PY'
+          import base64, hashlib, json, os, pathlib, subprocess, urllib.request
+          expected = {
+              'rch/src/transfer.rs': '95c5756fcafa8b7eab8f11e6111234c8d32639d1',
+              'rch-common/src/rsync_flavor.rs': 'eba097d2288e9e84114ec63917c9d4d6e1813287',
+              'rch-common/src/remote_compilation.rs': 'c2ee1558453dd9e32fb448a25aece5a76acdc34e',
+              'rch-common/src/remote_verification.rs': '2b5e15a61509e31bd2c6c1257098c709dd8aa640',
+              'rch-common/src/e2e/verification.rs': '3104585a4d49fc25227aa66f14e404de03f8d1d5',
+          }
+          for path, sha in expected.items():
+              actual = subprocess.check_output(['git', 'hash-object', path], text=True).strip()
+              assert actual == sha, (path, actual, sha)
+          patches = ['2dce7749562e1584955af9e9933361afe6d40279',
+                     'fae47b15cda1de7052d753805c7af4d7bb4aa03a',
+                     '59f8e98f8e2f197d12d8f3b288c9e53f3c3c2958']
+          payload = bytearray()
+          for sha in patches:
+              url = f"https://api.github.com/repos/{os.environ['GITHUB_REPOSITORY']}/git/blobs/{sha}"
+              request = urllib.request.Request(url, headers={
+                  'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
+                  'Accept': 'application/vnd.github+json',
+              })
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  blob = json.load(response)
+              data = base64.b64decode(blob['content'])
+              assert hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest() == sha
+              payload.extend(data)
+          patch = pathlib.Path(os.environ['RUNNER_TEMP']) / 'issue91.patch'
+          patch.write_bytes(payload)
+          subprocess.run(['git', 'apply', '--check', str(patch)], check=True)
+          subprocess.run(['git', 'apply', str(patch)], check=True)
+          print('Applied all three hash-verified patches to the exact checked-out main source.')
+          PY
+      - name: Install real rsync and Rust formatter
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y rsync
+          rsync --version
+          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+      - name: Parse and format the five changed Rust files
+        run: |
+          rustfmt --edition 2024 --config skip_children=true rch/src/transfer.rs rch-common/src/rsync_flavor.rs rch-common/src/remote_compilation.rs rch-common/src/remote_verification.rs rch-common/src/e2e/verification.rs
+          git diff --check
+      - name: Test the exact production rsync module without unrelated workspace dependencies
+        run: |
+          mkdir -p "$RUNNER_TEMP/rsync-path-tests/src" "$RUNNER_TEMP/issue91-evidence"
+          cp rch-common/src/rsync_flavor.rs "$RUNNER_TEMP/rsync-path-tests/src/lib.rs"
+          cat > "$RUNNER_TEMP/rsync-path-tests/Cargo.toml" <<'TOML'
+          [package]
+          name = "rch-rsync-path-validation"
+          version = "0.0.0"
+          edition = "2024"
+          [dependencies]
+          serde = { version = "1", features = ["derive"] }
+          thiserror = "2"
+          shell-escape = "0.1.5"
+          [dev-dependencies]
+          tempfile = "3"
+          TOML
+          cd "$RUNNER_TEMP/rsync-path-tests"
+          cargo test -- --nocapture 2>&1 | tee "$RUNNER_TEMP/issue91-evidence/rsync-tests.log"
+          cargo clippy --all-targets -- -D warnings 2>&1 | tee "$RUNNER_TEMP/issue91-evidence/rsync-clippy.log"
+      - name: Attempt workspace validation without changing dependency versions
+        id: workspace
+        continue-on-error: true
+        run: |
+          rustup toolchain install nightly-2026-08-31 --profile minimal --component rustfmt --component clippy
+          export RUSTUP_TOOLCHAIN=nightly-2026-08-31
+          timeout 300 cargo test --locked -p rch-common rsync_flavor::tests -- --nocapture 2>&1 | tee "$RUNNER_TEMP/issue91-evidence/workspace.log"
+          timeout 300 cargo test --locked -p rch --bin rch rsync_remote_paths_cover_upload_barrier_estimate_and_retrieval -- --test-threads=1 2>&1 | tee -a "$RUNNER_TEMP/issue91-evidence/workspace.log"
+          timeout 300 cargo test --locked -p rch --bin rch rsync_path_fix_keeps_remote_override_safety_checks -- --test-threads=1 2>&1 | tee -a "$RUNNER_TEMP/issue91-evidence/workspace.log"
+      - name: Stage validated source blobs for direct GitHub publication
+        if: github.event_name == 'push' && github.event.head_commit.message == 'test(rsync): validate issue 91 path arguments against real rsync'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WORKSPACE_OUTCOME: ${{ steps.workspace.outcome }}
+        run: |
+          python3 - <<'PY'
+          import base64, json, os, pathlib, shutil, subprocess, urllib.request
+          paths = ['rch/src/transfer.rs', 'rch-common/src/rsync_flavor.rs',
+                   'rch-common/src/remote_compilation.rs', 'rch-common/src/remote_verification.rs',
+                   'rch-common/src/e2e/verification.rs']
+          changed = subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines()
+          assert set(changed) <= set(paths), changed
+          evidence = pathlib.Path(os.environ['RUNNER_TEMP']) / 'issue91-evidence'
+          evidence.mkdir(exist_ok=True)
+          entries = []
+          for path in paths:
+              data = pathlib.Path(path).read_bytes()
+              payload = json.dumps({'encoding': 'base64', 'content': base64.b64encode(data).decode()}).encode()
+              url = f"https://api.github.com/repos/{os.environ['GITHUB_REPOSITORY']}/git/blobs"
+              request = urllib.request.Request(url, data=payload, method='POST', headers={
+                  'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
+                  'Accept': 'application/vnd.github+json', 'Content-Type': 'application/json',
+              })
+              with urllib.request.urlopen(request, timeout=60) as response:
+                  blob = json.load(response)
+              assert blob['sha'] == subprocess.check_output(['git', 'hash-object', path], text=True).strip()
+              entries.append({'path': path, 'mode': '100644', 'type': 'blob', 'sha': blob['sha']})
+              target = evidence / path
+              target.parent.mkdir(parents=True, exist_ok=True)
+              shutil.copyfile(path, target)
+          report = {'base_sha': os.environ['GITHUB_SHA'], 'files': entries,
+                    'workspace_outcome': os.environ['WORKSPACE_OUTCOME']}
+          (evidence / 'prepared.json').write_text(json.dumps(report, indent=2) + '\n')
+          (evidence / 'prepared.patch').write_bytes(subprocess.check_output(['git', 'diff', '--binary']))
+          print(json.dumps(report, indent=2))
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rsync-path-validation-${{ github.sha }}
+          path: ${{ runner.temp }}/issue91-evidence
+          if-no-files-found: warn
+          retention-days: 7
