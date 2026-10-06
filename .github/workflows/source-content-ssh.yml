@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - 'rch/src/transfer.rs'
+      - 'rch/src/hook/ssh.rs'
       - 'rch/src/transfer/source_content_barrier.rs'
       - 'scripts/test_source_content_ssh.py'
       - '.github/workflows/source-content-ssh.yml'
@@ -41,11 +42,15 @@ jobs:
           set -euo pipefail
           python3 - <<'PY'
           import base64, hashlib, json, os, pathlib, subprocess, urllib.request
-          path = 'rch/src/transfer.rs'
-          expected = 'c8f7e6351e78a6db695e89e7987e1aa6eddf645b'
-          actual = subprocess.check_output(['git', 'hash-object', path], text=True).strip()
-          assert actual == expected, (path, actual, expected)
-          sha = '8a376bf0914efa8985e1469fa54f35c4f8fe571e'
+          expected = {
+              'rch/src/transfer.rs': 'c8f7e6351e78a6db695e89e7987e1aa6eddf645b',
+              'rch/src/hook/ssh.rs': '838b5412b8b32b696fdefa818a3cd4539645a13c',
+              'rabs-scheduler/src/managed_pool.rs': 'c91e4b77b877c6ef32b68583aabffa61f90ae2c3',
+          }
+          for path, sha in expected.items():
+              actual = subprocess.check_output(['git', 'hash-object', path], text=True).strip()
+              assert actual == sha, (path, actual, sha)
+          sha = 'df8fd1a572e2e7db5bfc84150c0f52cb8376ba98'
           url = f"https://api.github.com/repos/{os.environ['GITHUB_REPOSITORY']}/git/blobs/{sha}"
           request = urllib.request.Request(url, headers={
               'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
@@ -69,7 +74,7 @@ jobs:
       - name: Parse and format the receipt transport integration
         run: |
           set -euo pipefail
-          rustfmt --edition 2024 --config skip_children=true rch/src/transfer.rs rch/src/transfer/source_content_barrier.rs
+          rustfmt --edition 2024 --config skip_children=true rch/src/transfer.rs rch/src/hook/ssh.rs rch/src/transfer/source_content_barrier.rs rabs-scheduler/src/managed_pool.rs
           git diff --check
       - name: Test exact Rust policy with real SSH and rsync
         run: |
@@ -85,7 +90,9 @@ jobs:
           set -euo pipefail
           python3 - <<'PY'
           import base64, json, os, pathlib, shutil, subprocess, urllib.request
-          paths = ['rch/src/transfer.rs', 'rch/src/transfer/source_content_barrier.rs']
+          paths = ['rch/src/transfer.rs', 'rch/src/hook/ssh.rs',
+                   'rch/src/transfer/source_content_barrier.rs',
+                   'rabs-scheduler/src/managed_pool.rs']
           changed = subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines()
           assert set(changed) <= set(paths), changed
           evidence = pathlib.Path(os.environ['RUNNER_TEMP']) / 'source84-evidence'

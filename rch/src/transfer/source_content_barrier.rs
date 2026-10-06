@@ -3,14 +3,23 @@
 //! SSH informational logging must not be confused with rsync evidence (#84).
 //! Suppress it at the SSH client, never by accepting arbitrary stderr here.
 
-use std::process::Output;
+use std::process::{Command, Output};
 
-/// Only the receipt barrier needs a silent successful SSH connection. Keep
-/// authentication, host-key policy, identity quoting, and multiplexing intact.
+const SSH_LOG_LEVEL: &str = "LogLevel=ERROR";
+
+/// Machine-readable receipt operations need a silent successful SSH connection.
+/// Keep authentication, host-key policy, identity quoting and multiplexing intact.
 /// OpenSSH logs new-known-host notices at INFO, but changed/revoked host keys
 /// at ERROR. Unlike `-q`, this retains authentication and transport errors.
 pub(super) fn ssh_command(transport: &str) -> String {
-    format!("{transport} -o LogLevel=ERROR")
+    format!("{transport} -o {SSH_LOG_LEVEL}")
+}
+
+/// Apply the same policy to the direct control-plane SSH transport, including
+/// the per-file hash verifier after the rsync barrier. Call before the SSH
+/// destination: these are local client options, never remote command arguments.
+pub(crate) fn configure_ssh_command(command: &mut Command) {
+    command.arg("-o").arg(SSH_LOG_LEVEL);
 }
 
 /// Recognize only a complete directory-attribute record in rsync's
@@ -126,6 +135,31 @@ mod tests {
         );
         assert!(!ssh_command(original).contains(" -q"));
         assert!(!ssh_command(original).contains("UserKnownHostsFile"));
+    }
+
+    #[test]
+    fn direct_ssh_policy_keeps_options_and_payload_as_distinct_arguments() {
+        let original = [
+            "-i",
+            "/keys/p q",
+            "-o",
+            "StrictHostKeyChecking=accept-new",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=180",
+        ];
+        let mut command = Command::new("ssh");
+        command.args(original);
+        configure_ssh_command(&mut command);
+        command.arg("builder@host").arg("sh -s");
+        let expected: Vec<_> = original
+            .into_iter()
+            .chain(["-o", "LogLevel=ERROR", "builder@host", "sh -s"])
+            .map(std::ffi::OsString::from)
+            .collect();
+        assert_eq!(command.get_args().collect::<Vec<_>>(), expected);
+        assert_eq!(command.get_program(), "ssh");
     }
 
     #[test]
