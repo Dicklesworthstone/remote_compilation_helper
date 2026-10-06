@@ -7,6 +7,7 @@
 use crate::DaemonContext;
 use crate::alerts::AlertInfo;
 use crate::events::EventBus;
+use crate::history::{QueueSelectionContract, QueuedWaiterClaim};
 use crate::metrics;
 use crate::metrics::budget::{self, BudgetStatusResponse};
 use crate::reload;
@@ -30,6 +31,7 @@ use rch_common::{
 use rch_telemetry::protocol::{TelemetrySource, TestRunRecord, TestRunStats, WorkerTelemetry};
 use rch_telemetry::speedscore::SpeedScore;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -114,6 +116,8 @@ enum ApiRequest {
         /// Report which worker would be chosen without reserving slots or
         /// opening a durable build (`rch diagnose`).
         dry_run: bool,
+        /// Resume only an identity-matched durable queue row from a prior daemon.
+        resume_queued: bool,
     },
     ReleaseWorker(ReleaseRequest),
     RecordBuild {
@@ -803,17 +807,19 @@ async fn handle_connection_with_metrics(
             wait_for_worker,
             wait_timeout_secs,
             dry_run,
+            resume_queued,
         }) => {
             metrics::inc_requests("select-worker");
             let response = if dry_run {
                 handle_select_worker_dry_run(&ctx, &request).await
             } else {
-                handle_select_worker_with_wrapper(
+                handle_select_worker_mode(
                     &ctx,
                     request,
                     wait_for_worker,
                     wait_timeout_secs,
                     local_wrapper_id,
+                    resume_queued,
                 )
                 .await?
             };
@@ -1923,7 +1929,10 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
         }
     }
 
-    let Some(query) = query_for_exact_route(path, "/select-worker") else {
+    let resume_queued = query_for_exact_route(path, "/select-worker/resume-queued").is_some();
+    let Some(query) = query_for_exact_route(path, "/select-worker")
+        .or_else(|| query_for_exact_route(path, "/select-worker/resume-queued"))
+    else {
         return Err(anyhow!("Unknown endpoint: {}", path));
     };
 
@@ -2020,6 +2029,13 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
 
     let project = project.ok_or_else(|| anyhow!("Missing 'project' parameter"))?;
     let estimated_cores = cores.unwrap_or(1);
+    if resume_queued
+        && (dry_run || !wait_for_worker || local_wrapper_id.is_none() || hook_pid.is_none())
+    {
+        return Err(anyhow!(
+            "queued resume requires the original waiting wrapper and process"
+        ));
+    }
 
     Ok(ApiRequest::SelectWorker {
         request: SelectionRequest {
@@ -2039,6 +2055,7 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
         wait_timeout_secs,
         local_wrapper_id,
         dry_run,
+        resume_queued,
     })
 }
 
@@ -2491,6 +2508,7 @@ async fn handle_select_worker(
     handle_select_worker_with_wrapper(ctx, request, wait_for_worker, wait_timeout_secs, None).await
 }
 
+#[cfg(test)]
 async fn handle_select_worker_with_wrapper(
     ctx: &DaemonContext,
     request: SelectionRequest,
@@ -2498,6 +2516,64 @@ async fn handle_select_worker_with_wrapper(
     wait_timeout_secs: Option<u64>,
     local_wrapper_id: Option<String>,
 ) -> Result<SelectionResponse> {
+    handle_select_worker_mode(
+        ctx,
+        request,
+        wait_for_worker,
+        wait_timeout_secs,
+        local_wrapper_id,
+        false,
+    )
+    .await
+}
+
+fn queue_selection_digest(
+    request: &SelectionRequest,
+    wait_timeout_secs: Option<u64>,
+) -> Result<[u8; 32]> {
+    let mut digest = Sha256::new();
+    digest.update(b"rch-queued-selection-v1\0");
+    digest.update(serde_json::to_vec(&(request, wait_timeout_secs))?);
+    Ok(digest.finalize().into())
+}
+
+async fn handle_select_worker_mode(
+    ctx: &DaemonContext,
+    request: SelectionRequest,
+    wait_for_worker: bool,
+    wait_timeout_secs: Option<u64>,
+    local_wrapper_id: Option<String>,
+    resume_queued: bool,
+) -> Result<SelectionResponse> {
+    // Resume refusal must close the exchange, never look like a confirmed busy
+    // response that permits local fallback. No selector runs before this claim.
+    let resumed = if resume_queued {
+        anyhow::ensure!(wait_for_worker, "queued resume requires waiting selection");
+        anyhow::ensure!(
+            !*ctx.admission_barrier.read().await,
+            "restart admission barrier active"
+        );
+        let wrapper = local_wrapper_id
+            .as_deref()
+            .ok_or_else(|| anyhow!("missing queued owner"))?;
+        Some(
+            ctx.history.resume_queued_build(
+                wrapper,
+                request
+                    .hook_pid
+                    .ok_or_else(|| anyhow!("missing queued process"))?,
+                &queue_selection_digest(&request, wait_timeout_secs)?,
+            )?,
+        )
+    } else {
+        anyhow::ensure!(
+            !local_wrapper_id
+                .as_deref()
+                .is_some_and(|id| ctx.history.has_queued_wrapper(id)),
+            "wrapper already owns a queued selection; explicit recovery is required"
+        );
+        None
+    };
     if local_wrapper_id
         .as_deref()
         .is_some_and(|id| ctx.history.wrapper_cancelled(id))
@@ -2505,6 +2581,10 @@ async fn handle_select_worker_with_wrapper(
         return Ok(cancelled_selection());
     }
     if *ctx.admission_barrier.read().await || ctx.history.ownership_failed() {
+        anyhow::ensure!(
+            !resume_queued,
+            "queued resume blocked by restart admission barrier"
+        );
         return Ok(SelectionResponse {
             worker: None,
             reason: SelectionReason::SelectionError("restart_admission_barrier_active".to_string()),
@@ -2550,6 +2630,7 @@ async fn handle_select_worker_with_wrapper(
 
     // Mock support: RCH_MOCK_CIRCUIT_OPEN simulates all circuits open
     if std::env::var("RCH_MOCK_CIRCUIT_OPEN").is_ok() {
+        anyhow::ensure!(!resume_queued, "queued resume blocked by circuit override");
         debug!("RCH_MOCK_CIRCUIT_OPEN set, returning AllCircuitsOpen");
         return Ok(SelectionResponse {
             worker: None,
@@ -2563,6 +2644,7 @@ async fn handle_select_worker_with_wrapper(
         ctx: &DaemonContext,
         request: &SelectionRequest,
         local_wrapper_id: Option<String>,
+        waiter: Option<&QueuedWaiterClaim>,
     ) -> Result<SelectionResponse> {
         if local_wrapper_id
             .as_deref()
@@ -2661,7 +2743,7 @@ async fn handle_select_worker_with_wrapper(
                         .clone()
                         .unwrap_or_else(|| "<unknown>".to_string());
 
-                    let admission = ctx.history.try_start_active_build_with_wrapper(
+                    let admission = ctx.history.try_start_active_build_with_waiter(
                         request.project.clone(),
                         id.as_str().to_string(),
                         command.clone(),
@@ -2669,6 +2751,7 @@ async fn handle_select_worker_with_wrapper(
                         local_wrapper_id.clone(),
                         reserve_slots,
                         rch_common::BuildLocation::Remote,
+                        waiter,
                     );
                     let state = match admission {
                         Ok(Some(state)) => state,
@@ -2685,6 +2768,17 @@ async fn handle_select_worker_with_wrapper(
                                     "durable ownership uncertain; admission closed until restart"
                                 );
                             }
+                            anyhow::ensure!(
+                                waiter.is_none_or(|claim| ctx.history.owns_queued_waiter(claim)),
+                                "queued waiter no longer owns admission"
+                            );
+                            anyhow::ensure!(
+                                waiter.is_some()
+                                    || !local_wrapper_id
+                                        .as_deref()
+                                        .is_some_and(|id| ctx.history.has_queued_wrapper(id)),
+                                "wrapper already owns a queued selection"
+                            );
                             excluded_worker_ids.insert(id.as_str().to_string());
                             continue;
                         }
@@ -2759,7 +2853,16 @@ async fn handle_select_worker_with_wrapper(
         response
     }
 
-    let initial = attempt_select_and_reserve(ctx, &request, local_wrapper_id.clone()).await?;
+    let initial = if resumed.is_some() {
+        SelectionResponse {
+            worker: None,
+            reason: SelectionReason::AllWorkersBusy,
+            build_id: None,
+            diagnostics: None,
+        }
+    } else {
+        attempt_select_and_reserve(ctx, &request, local_wrapper_id.clone(), None).await?
+    };
     if initial.worker.is_some()
         || !wait_for_worker
         || initial.reason != SelectionReason::AllWorkersBusy
@@ -2774,8 +2877,18 @@ async fn handle_select_worker_with_wrapper(
         .clone()
         .unwrap_or_else(|| "<unknown>".to_string());
 
+    let daemon_queue_timeout_secs = ctx.queue_timeout_secs.max(1);
+    let effective_queue_timeout_secs = wait_timeout_secs
+        .filter(|secs| *secs > 0)
+        .map(|client_secs| client_secs.min(daemon_queue_timeout_secs))
+        .unwrap_or(daemon_queue_timeout_secs);
+    let selection_digest = queue_selection_digest(&request, wait_timeout_secs)?;
     let admission = ctx.admission_barrier.read().await;
     if *admission || ctx.history.ownership_failed() {
+        anyhow::ensure!(
+            !resume_queued,
+            "queued resume blocked by restart admission barrier"
+        );
         return Ok(SelectionResponse {
             worker: None,
             reason: SelectionReason::SelectionError("restart_admission_barrier_active".to_string()),
@@ -2783,15 +2896,21 @@ async fn handle_select_worker_with_wrapper(
             diagnostics: None,
         });
     }
-    let queued_result = ctx.history.enqueue_build(
-        request.project.clone(),
-        command.clone(),
-        hook_pid,
-        request.estimated_cores,
-        local_wrapper_id.clone(),
-    );
+    let queued_result = resumed.or_else(|| {
+        ctx.history.enqueue_selection_build(
+            request.project.clone(),
+            command.clone(),
+            hook_pid,
+            request.estimated_cores,
+            local_wrapper_id.clone(),
+            QueueSelectionContract {
+                digest: selection_digest,
+                timeout_secs: effective_queue_timeout_secs,
+            },
+        )
+    });
     drop(admission);
-    let Some(queued) = queued_result else {
+    let Some((queued, waiter)) = queued_result else {
         if ctx.history.ownership_failed() {
             anyhow::bail!("durable ownership uncertain; queue admission closed until restart");
         }
@@ -2801,6 +2920,12 @@ async fn handle_select_worker_with_wrapper(
         {
             return Ok(cancelled_selection());
         }
+        anyhow::ensure!(
+            !local_wrapper_id
+                .as_deref()
+                .is_some_and(|id| ctx.history.has_queued_wrapper(id)),
+            "wrapper already owns a queued selection"
+        );
         // Queue full - fall back to the normal busy response.
         return Ok(initial);
     };
@@ -2810,7 +2935,11 @@ async fn handle_select_worker_with_wrapper(
         metrics::set_build_queue_depth(ctx.history.queue_depth());
     }
     ctx.events.emit(
-        "build_queued",
+        if resume_queued {
+            "build_queue_resumed"
+        } else {
+            "build_queued"
+        },
         &serde_json::json!({
             "queue_id": queued.id,
             "project_id": queued.project_id,
@@ -2822,12 +2951,14 @@ async fn handle_select_worker_with_wrapper(
     );
 
     const QUEUE_POLL_INTERVAL: Duration = Duration::from_secs(1);
-    let daemon_queue_timeout_secs = ctx.queue_timeout_secs.max(1);
-    let effective_queue_timeout_secs = wait_timeout_secs
-        .filter(|secs| *secs > 0)
-        .map(|client_secs| client_secs.min(daemon_queue_timeout_secs))
-        .unwrap_or(daemon_queue_timeout_secs);
-    let queue_timeout = Duration::from_secs(effective_queue_timeout_secs);
+    let queue_timeout = Duration::from_secs(
+        queued
+            .selection_contract
+            .as_ref()
+            .expect("selection queue has a contract")
+            .timeout_secs
+            .min(effective_queue_timeout_secs),
+    );
 
     loop {
         if local_wrapper_id
@@ -2904,7 +3035,13 @@ async fn handle_select_worker_with_wrapper(
             });
         }
 
-        let response = attempt_select_and_reserve(ctx, &request, local_wrapper_id.clone()).await?;
+        anyhow::ensure!(
+            ctx.history.owns_queued_waiter(&waiter),
+            "queued waiter ownership lost"
+        );
+        let response =
+            attempt_select_and_reserve(ctx, &request, local_wrapper_id.clone(), Some(&waiter))
+                .await?;
         if response.worker.is_some() {
             let _ = ctx.history.remove_queued_build(queued.id);
             ctx.history.update_queue_estimates();
@@ -4419,6 +4556,329 @@ mod tests {
             runtime.spawn(scheduler.run());
         }
         handle
+    }
+
+    /// Interrupt the actual waiting handler only after its queue row is durable,
+    /// then construct a fresh history manager exactly as daemon startup does.
+    async fn queue_resume_fixture(
+        queue_timeout_secs: u64,
+    ) -> (
+        tempfile::TempDir,
+        DaemonContext,
+        SelectionRequest,
+        String,
+        u64,
+    ) {
+        let hook_pid = crate::history::observable_test_process_id();
+        assert!(
+            crate::history::process_identity(hook_pid).is_some() && is_process_alive(hook_pid),
+            "queue resume integration requires one PID namespace for procfs and kill(0): \
+             getpid={}, procfs owner={hook_pid}; the live test owner must pass both unchanged production checks",
+            std::process::id(),
+        );
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("history.jsonl");
+        let pool = WorkerPool::new();
+        pool.add_worker(make_test_worker("requested", 4)).await;
+        assert!(
+            pool.get(&WorkerId::new("requested"))
+                .await
+                .unwrap()
+                .reserve_slots(4)
+                .await
+        );
+        let mut ctx = make_test_context(pool);
+        ctx.queue_timeout_secs = queue_timeout_secs;
+        ctx.history = Arc::new(BuildHistory::new(10).with_persistence(path.clone()));
+        let request = SelectionRequest {
+            project: "resume-project".into(),
+            command: Some("cargo build".into()),
+            command_priority: CommandPriority::Normal,
+            estimated_cores: 2,
+            preferred_workers: vec![WorkerId::new("requested")],
+            toolchain: None,
+            required_runtime: RequiredRuntime::None,
+            classification_duration_us: Some(9),
+            job_mode: false,
+            required_tools: vec![],
+            hook_pid: Some(hook_pid),
+        };
+        let wrapper = format!("rchw-{}", Uuid::new_v4());
+        let old_ctx = ctx.clone();
+        let old_request = request.clone();
+        let old_wrapper = wrapper.clone();
+        let waiter = tokio::spawn(async move {
+            handle_select_worker_with_wrapper(
+                &old_ctx,
+                old_request,
+                true,
+                Some(30),
+                Some(old_wrapper),
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while ctx.history.queue_depth() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let queue_id = ctx.history.queued_builds()[0].id;
+        waiter.abort();
+        assert!(waiter.await.unwrap_err().is_cancelled());
+        ctx.history = Arc::new(BuildHistory::load_from_file(&path, 10).unwrap());
+        assert!(ctx.history.queued_build(queue_id).unwrap().recovered);
+        (tmp, ctx, request, wrapper, queue_id)
+    }
+
+    #[tokio::test]
+    async fn queue_resume_socket_route_continues_the_original_waiter_once() {
+        let _guard = test_guard!();
+        let (tmp, ctx, request, wrapper, queue_id) = queue_resume_fixture(300).await;
+        let original = ctx.history.queued_build(queue_id).unwrap();
+        let worker = ctx.pool.get(&WorkerId::new("requested")).await.unwrap();
+        worker.release_slots(4).await;
+        // An ordinary selection cannot consume a restored row even now that
+        // slots are free. Only the distinct recovery route may do so.
+        assert!(
+            handle_select_worker_with_wrapper(
+                &ctx,
+                request.clone(),
+                true,
+                Some(30),
+                Some(wrapper.clone())
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(worker.available_slots().await, 4);
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let (shutdown_tx, _) = tokio::sync::mpsc::channel(1);
+        let connection = tokio::spawn(handle_connection(server, ctx.clone(), shutdown_tx));
+        let line = format!(
+            "GET /select-worker/resume-queued?project=resume-project&command=cargo%20build&cores=2&worker=requested&classification_us=9&hook_pid={}&local_wrapper_id={wrapper}&wait=1&wait_timeout_secs=30\n",
+            crate::history::observable_test_process_id(),
+        );
+        client.write_all(line.as_bytes()).await.unwrap();
+        let mut response = String::new();
+        tokio::time::timeout(Duration::from_secs(2), client.read_to_string(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        connection.await.unwrap().unwrap();
+        assert!(response.starts_with("HTTP/1.0 200"), "{response}");
+        let body: serde_json::Value =
+            serde_json::from_str(response.split_once("\r\n\r\n").unwrap().1).unwrap();
+        let build_id = body["build_id"].as_u64().unwrap();
+        assert_eq!(body["worker"]["id"], "requested");
+        assert_eq!(worker.available_slots().await, 2);
+        assert_eq!(ctx.history.queue_depth(), 0);
+        assert_eq!(ctx.history.active_builds().len(), 1);
+        assert_eq!(
+            ctx.history
+                .active_build(build_id)
+                .unwrap()
+                .local_wrapper_id
+                .as_deref(),
+            Some(wrapper.as_str())
+        );
+        let restored = BuildHistory::load_from_file(&tmp.path().join("history.jsonl"), 10).unwrap();
+        assert!(restored.queued_build(original.id).is_none());
+        assert!(restored.active_build(build_id).is_some());
+        // A lost resumed response cannot authorize another selection.
+        assert!(
+            handle_select_worker_mode(&ctx, request, true, Some(30), Some(wrapper), true)
+                .await
+                .is_err()
+        );
+        assert_eq!(worker.available_slots().await, 2);
+    }
+
+    #[tokio::test]
+    async fn queue_resume_rejects_changed_selection_constraints_without_claiming() {
+        let _guard = test_guard!();
+        let (_tmp, ctx, request, wrapper, queue_id) = queue_resume_fixture(300).await;
+        let worker = ctx.pool.get(&WorkerId::new("requested")).await.unwrap();
+        worker.release_slots(4).await;
+        let original = serde_json::to_value(&request).unwrap();
+        for (field, value) in [
+            ("project", serde_json::json!("different-project")),
+            ("command", serde_json::json!("cargo test")),
+            ("estimated_cores", serde_json::json!(1)),
+            ("command_priority", serde_json::json!("high")),
+            ("preferred_workers", serde_json::json!(["alternate"])),
+            (
+                "toolchain",
+                serde_json::json!({"channel":"nightly", "date":"2026-09-01", "full_version":"different compiler"}),
+            ),
+            ("required_runtime", serde_json::json!("rust")),
+            ("job_mode", serde_json::json!(true)),
+            ("required_tools", serde_json::json!(["git"])),
+            ("classification_duration_us", serde_json::json!(10)),
+            ("hook_pid", serde_json::json!(1)),
+        ] {
+            let mut changed = original.clone();
+            changed[field] = value;
+            let changed: SelectionRequest = serde_json::from_value(changed).unwrap();
+            assert!(
+                handle_select_worker_mode(
+                    &ctx,
+                    changed,
+                    true,
+                    Some(30),
+                    Some(wrapper.clone()),
+                    true
+                )
+                .await
+                .is_err(),
+                "accepted changed {field}"
+            );
+            assert!(ctx.history.queued_build(queue_id).unwrap().recovered);
+            assert_eq!(worker.available_slots().await, 4);
+        }
+        for timeout in [None, Some(29), Some(31)] {
+            assert!(
+                handle_select_worker_mode(
+                    &ctx,
+                    request.clone(),
+                    true,
+                    timeout,
+                    Some(wrapper.clone()),
+                    true
+                )
+                .await
+                .is_err()
+            );
+        }
+        let response =
+            handle_select_worker_mode(&ctx, request, true, Some(30), Some(wrapper), true)
+                .await
+                .unwrap();
+        assert!(response.worker.is_some());
+        assert_eq!(worker.available_slots().await, 2);
+    }
+
+    #[tokio::test]
+    async fn queue_resume_expired_original_timeout_never_reserves_free_worker() {
+        let _guard = test_guard!();
+        let (tmp, mut ctx, request, wrapper, queue_id) = queue_resume_fixture(1).await;
+        let ownership = tmp.path().join("history.ownership.json");
+        let mut snapshot: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&ownership).unwrap()).unwrap();
+        snapshot["queued"][0]["queued_at"] =
+            serde_json::json!((Utc::now() - ChronoDuration::seconds(2)).to_rfc3339());
+        std::fs::write(&ownership, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+        ctx.history =
+            Arc::new(BuildHistory::load_from_file(&tmp.path().join("history.jsonl"), 10).unwrap());
+        // Increasing daemon configuration cannot extend the persisted deadline.
+        ctx.queue_timeout_secs = 600;
+        let worker = ctx.pool.get(&WorkerId::new("requested")).await.unwrap();
+        worker.release_slots(4).await;
+        let response =
+            handle_select_worker_mode(&ctx, request, true, Some(30), Some(wrapper), true)
+                .await
+                .unwrap();
+        assert_eq!(
+            response.reason,
+            SelectionReason::SelectionError("queue_timeout".into())
+        );
+        assert!(response.worker.is_none());
+        assert!(ctx.history.queued_build(queue_id).is_none());
+        assert!(ctx.history.active_builds().is_empty());
+        assert_eq!(worker.available_slots().await, 4);
+        let restored = BuildHistory::load_from_file(&tmp.path().join("history.jsonl"), 10).unwrap();
+        assert!(restored.queued_build(queue_id).is_none());
+        assert!(restored.active_builds().is_empty());
+    }
+
+    #[tokio::test]
+    async fn queue_resume_cancelled_owner_and_duplicate_waiter_never_select() {
+        let _guard = test_guard!();
+        let (_tmp, ctx, request, wrapper, queue_id) = queue_resume_fixture(300).await;
+        let waiting_ctx = ctx.clone();
+        let waiting_request = request.clone();
+        let waiting_wrapper = wrapper.clone();
+        let waiter = tokio::spawn(async move {
+            handle_select_worker_mode(
+                &waiting_ctx,
+                waiting_request,
+                true,
+                Some(30),
+                Some(waiting_wrapper),
+                true,
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while ctx.history.queued_build(queue_id).unwrap().recovered {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            handle_select_worker_mode(
+                &ctx,
+                request.clone(),
+                true,
+                Some(30),
+                Some(wrapper.clone()),
+                true
+            )
+            .await
+            .is_err()
+        );
+        assert!(matches!(
+            ctx.history.cancel_wrapper(&wrapper).unwrap(),
+            crate::history::WrapperCancellation::BeforeStart
+        ));
+        let response = tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            response.reason,
+            SelectionReason::SelectionError("job_cancelled_before_start".into())
+        );
+        assert!(
+            handle_select_worker_mode(&ctx, request, true, Some(30), Some(wrapper), true)
+                .await
+                .is_err()
+        );
+        assert!(ctx.history.active_builds().is_empty());
+        assert_eq!(ctx.history.queue_depth(), 0);
+        assert_eq!(
+            ctx.pool
+                .get(&WorkerId::new("requested"))
+                .await
+                .unwrap()
+                .available_slots()
+                .await,
+            0
+        );
+    }
+
+    #[test]
+    fn queue_resume_route_requires_an_identified_waiter_and_never_aliases_selection() {
+        let base = "GET /select-worker/resume-queued?project=p&wait=1&local_wrapper_id=rchw-owner&hook_pid=123";
+        assert!(matches!(
+            parse_request(base).unwrap(),
+            ApiRequest::SelectWorker {
+                resume_queued: true,
+                ..
+            }
+        ));
+        for line in [
+            "GET /select-worker/resume-queued?project=p&local_wrapper_id=rchw-owner&hook_pid=123",
+            "GET /select-worker/resume-queued?project=p&wait=1&hook_pid=123",
+            "GET /select-worker/resume-queued?project=p&wait=1&local_wrapper_id=rchw-owner",
+            "GET /select-worker/resume-queued-extra?project=p&wait=1&local_wrapper_id=rchw-owner&hook_pid=123",
+        ] {
+            assert!(parse_request(line).is_err(), "{line}");
+        }
+        assert!(parse_request(&format!("{base}&dry_run=1")).is_err());
     }
 
     #[test]

@@ -21,6 +21,81 @@ const MAX_DAEMON_STATUS_BYTES: usize = 1024;
 #[error("worker selection outcome is unconfirmed; do not retry selection or execute locally")]
 pub(super) struct SelectionOutcomeUnconfirmed;
 
+fn selection_transport_disconnected(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.downcast_ref::<std::io::Error>().is_some_and(|error| {
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::UnexpectedEof
+            )
+        })
+    })
+}
+
+/// The only allowed post-dispatch recovery is an explicitly different endpoint
+/// that cannot create a fresh selection. Older daemons reject this exact route.
+/// Retry connection establishment while the daemon restarts, but dispatch only
+/// once: losing the resumed reply can mean that admission already succeeded.
+async fn resume_queued_selection(
+    socket_path: &str,
+    query: &str,
+    deadline: tokio::time::Instant,
+) -> anyhow::Result<SelectionResponse> {
+    let result = async {
+        let stream = loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            anyhow::ensure!(
+                !remaining.is_zero(),
+                "queued recovery exceeded original selection deadline"
+            );
+            match timeout(
+                daemon_io_timeout().min(remaining),
+                UnixStream::connect(socket_path),
+            )
+            .await
+            {
+                Ok(Ok(stream)) => break stream,
+                Ok(Err(error))
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                    ) =>
+                {
+                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    tokio::time::sleep(Duration::from_millis(100).min(remaining)).await;
+                }
+                Ok(Err(error)) => return Err(error.into()),
+                Err(_) => anyhow::bail!("queued recovery connection timed out"),
+            }
+        };
+        let (reader, mut writer) = stream.into_split();
+        let request = format!("GET /select-worker/resume-queued?{query}\n");
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        anyhow::ensure!(
+            !remaining.is_zero(),
+            "queued recovery exceeded original selection deadline"
+        );
+        timeout(
+            remaining,
+            exchange_selection_request(
+                reader,
+                &mut writer,
+                request.as_bytes(),
+                daemon_io_timeout().min(remaining),
+                remaining,
+                false,
+            ),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("queued recovery exceeded original selection deadline"))?
+    }
+    .await;
+    result.map_err(|error| error.context(SelectionOutcomeUnconfirmed))
+}
+
 /// Everything after dispatch is ambiguous until a complete response is parsed.
 /// Keep this boundary around both writing and reading: a failed flush can follow
 /// a fully delivered request. Connect/preflight errors occur before this helper.
@@ -95,6 +170,13 @@ pub(super) async fn read_daemon_body<R: tokio::io::AsyncRead + Unpin>(
         .map_err(|_| {
             anyhow::anyhow!("Daemon response timed out after {}ms", budget.as_millis())
         })??;
+    if response.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "daemon disconnected without a response",
+        )
+        .into());
+    }
     anyhow::ensure!(
         response.len() <= MAX_RESPONSE_BYTES,
         "Daemon response exceeded {} byte limit",
@@ -447,15 +529,46 @@ async fn query_daemon_with_mode(
 
     // Bound writes independently from the longer, queue-aware response wait.
     let request = format!("GET /select-worker?{}\n", query);
-    let response = exchange_selection_request(
-        reader,
-        &mut writer,
-        request.as_bytes(),
-        daemon_io_timeout(),
-        daemon_response_timeout(wait_for_worker),
-        dry_run,
+    let response_budget = daemon_response_timeout(wait_for_worker);
+    let deadline = tokio::time::Instant::now() + response_budget;
+    let result = timeout(
+        response_budget,
+        exchange_selection_request(
+            reader,
+            &mut writer,
+            request.as_bytes(),
+            daemon_io_timeout(),
+            response_budget,
+            dry_run,
+        ),
     )
-    .await?;
+    .await
+    .unwrap_or_else(|_| {
+        let error = anyhow::anyhow!("selection exceeded original response deadline");
+        Err(if dry_run {
+            error
+        } else {
+            error.context(SelectionOutcomeUnconfirmed)
+        })
+    });
+    let response = match result {
+        Ok(response) => response,
+        Err(error)
+            if wait_for_worker
+                && !dry_run
+                && hook_pid.is_some_and(|pid| pid > 1)
+                && local_wrapper_id.is_some_and(|id| {
+                    id.starts_with(rch_common::job_identity::LOCAL_WRAPPER_ID_PREFIX)
+                })
+                && selection_transport_disconnected(&error) =>
+        {
+            // The query is byte-identical, including the original timeout,
+            // worker pins and toolchain/tool constraints. The daemon checks
+            // these against durable queue ownership before selecting.
+            resume_queued_selection(socket_path, &query, deadline).await?
+        }
+        Err(error) => return Err(error),
+    };
 
     if let Some(worker) = response.worker.as_ref()
         && !selected_worker_is_requested(&worker.id, preferred_workers)

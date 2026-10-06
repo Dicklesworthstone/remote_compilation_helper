@@ -120,6 +120,28 @@ fn command_stdout(program: &str, args: &[&str]) -> Option<String> {
     let text = String::from_utf8_lossy(&output.stdout).trim().to_owned();
     (!text.is_empty()).then_some(text)
 }
+
+/// Keep live-owner tests in the same PID namespace as the procfs identity
+/// reader. Some test sandboxes virtualize getpid without remounting procfs;
+/// their numeric getpid names a different process in that procfs mount.
+#[cfg(test)]
+pub(crate) fn observable_test_process_id() -> u32 {
+    #[cfg(target_os = "linux")]
+    let pid = std::fs::read_to_string("/proc/self/stat")
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    #[cfg(not(target_os = "linux"))]
+    let pid = std::process::id();
+    assert!(
+        process_identity(pid).is_some(),
+        "live test process {pid} has no observable birth identity"
+    );
+    pid
+}
 /// Default maximum number of builds to retain.
 const DEFAULT_CAPACITY: usize = 100;
 
@@ -224,6 +246,13 @@ pub struct QueuedBuildState {
     pub local_wrapper_id: Option<String>,
     /// Number of slots needed.
     pub slots_needed: u32,
+    /// Exact selection constraints and the original queue timeout. Old snapshots
+    /// lack this authority and remain inspectable/cancellable, not resumable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection_contract: Option<QueueSelectionContract>,
+    /// An exclusive waiter exists only in this daemon incarnation.
+    #[serde(skip)]
+    waiter_claim: Option<u64>,
     /// Estimated start time is advisory and must be recomputed after restart.
     #[serde(skip)]
     pub estimated_start: Option<String>,
@@ -231,6 +260,21 @@ pub struct QueuedBuildState {
     /// Replaying selection requires a separate, identity-fenced reattachment.
     #[serde(skip)]
     pub recovered: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QueueSelectionContract {
+    pub digest: [u8; 32],
+    pub timeout_secs: u64,
+}
+
+/// An in-process authority to consume one queued row. It is never sent to a
+/// client or recovered from disk; restart requires identity-fenced reattachment.
+#[derive(Debug)]
+pub struct QueuedWaiterClaim {
+    queue_id: u64,
+    nonce: u64,
 }
 
 /// Build history manager.
@@ -252,6 +296,7 @@ pub struct BuildHistory {
     next_id: AtomicU64,
     /// Next queue ID.
     next_queue_id: AtomicU64,
+    next_waiter_claim: AtomicU64,
     /// Persistence path (optional).
     persistence_path: Option<PathBuf>,
     /// Terminal receipts share the atomic ownership commit, not the JSONL log.
@@ -287,6 +332,7 @@ impl BuildHistory {
             max_queue_depth: DEFAULT_MAX_QUEUE_DEPTH,
             next_id: AtomicU64::new(initial_id),
             next_queue_id: AtomicU64::new(QUEUE_ID_NAMESPACE | initial_id),
+            next_waiter_claim: AtomicU64::new(1),
             persistence_path: None,
             terminal: RwLock::new(HashMap::new()),
             cancelled_wrappers: RwLock::new(HashSet::new()),
@@ -459,6 +505,30 @@ impl BuildHistory {
         slots: u32,
         location: BuildLocation,
     ) -> std::io::Result<Option<ActiveBuildState>> {
+        self.try_start_active_build_with_waiter(
+            project_id,
+            worker_id,
+            command,
+            hook_pid,
+            local_wrapper_id,
+            slots,
+            location,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_start_active_build_with_waiter(
+        &self,
+        project_id: String,
+        worker_id: String,
+        command: String,
+        hook_pid: u32,
+        local_wrapper_id: Option<String>,
+        slots: u32,
+        location: BuildLocation,
+        waiter: Option<&QueuedWaiterClaim>,
+    ) -> std::io::Result<Option<ActiveBuildState>> {
         let id = self.next_id();
         if id >= QUEUE_ID_NAMESPACE {
             return Err(std::io::Error::other(
@@ -503,6 +573,31 @@ impl BuildHistory {
         if self.ownership_failed() {
             return Ok(None);
         }
+        {
+            let queue = self.queued.read().unwrap_or_else(|e| e.into_inner());
+            let owned_row = queue.iter().find(|row| {
+                row.local_wrapper_id.is_some() && row.local_wrapper_id == state.local_wrapper_id
+            });
+            if let Some(claim) = waiter {
+                let Some(row) = queue.iter().find(|row| row.id == claim.queue_id) else {
+                    return Ok(None);
+                };
+                if row.waiter_claim != Some(claim.nonce)
+                    || row.recovered
+                    || row.local_wrapper_id != state.local_wrapper_id
+                    || row.hook_pid != state.hook_pid
+                    || row.hook_process_identity != state.hook_process_identity
+                    || row.project_id != state.project_id
+                    || row.command != state.command
+                {
+                    return Ok(None);
+                }
+            } else if owned_row.is_some_and(|row| row.selection_contract.is_some()) {
+                // A new request cannot steal a queued request's authority, even
+                // when a worker became free between the two requests.
+                return Ok(None);
+            }
+        }
         if state
             .local_wrapper_id
             .as_deref()
@@ -527,7 +622,15 @@ impl BuildHistory {
             return Ok(None);
         }
         active.insert(id, state.clone());
-        self.persist_ownership(&active, None)?;
+        if let Some(claim) = waiter {
+            let mut queue = self.queued.write().unwrap_or_else(|e| e.into_inner());
+            let mut remaining = queue.clone();
+            remaining.retain(|row| row.id != claim.queue_id);
+            self.persist_ownership_with_queue(&active, None, &remaining)?;
+            *queue = remaining;
+        } else {
+            self.persist_ownership(&active, None)?;
+        }
         Ok(Some(state))
     }
 
@@ -907,6 +1010,46 @@ impl BuildHistory {
         slots_needed: u32,
         local_wrapper_id: Option<String>,
     ) -> Option<QueuedBuildState> {
+        self.enqueue_build_inner(
+            project_id,
+            command,
+            hook_pid,
+            slots_needed,
+            local_wrapper_id,
+            None,
+        )
+        .map(|(state, _)| state)
+    }
+
+    pub fn enqueue_selection_build(
+        &self,
+        project_id: String,
+        command: String,
+        hook_pid: u32,
+        slots_needed: u32,
+        local_wrapper_id: Option<String>,
+        contract: QueueSelectionContract,
+    ) -> Option<(QueuedBuildState, QueuedWaiterClaim)> {
+        self.enqueue_build_inner(
+            project_id,
+            command,
+            hook_pid,
+            slots_needed,
+            local_wrapper_id,
+            Some(contract),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn enqueue_build_inner(
+        &self,
+        project_id: String,
+        command: String,
+        hook_pid: u32,
+        slots_needed: u32,
+        local_wrapper_id: Option<String>,
+        selection_contract: Option<QueueSelectionContract>,
+    ) -> Option<(QueuedBuildState, QueuedWaiterClaim)> {
         let active = self.active.write().unwrap_or_else(|e| e.into_inner());
         if self.ownership_failed()
             || local_wrapper_id
@@ -946,6 +1089,7 @@ impl BuildHistory {
         }
 
         let id = self.next_queue_id()?;
+        let nonce = self.next_waiter_claim.fetch_add(1, Ordering::SeqCst);
         let queued_at = Utc::now().to_rfc3339();
         let state = QueuedBuildState {
             id,
@@ -957,6 +1101,8 @@ impl BuildHistory {
             hook_process_identity: process_identity(hook_pid),
             local_wrapper_id,
             slots_needed,
+            selection_contract,
+            waiter_claim: Some(nonce),
             estimated_start: None,
             recovered: false,
         };
@@ -976,7 +1122,78 @@ impl BuildHistory {
             state.project_id
         );
 
-        Some(state)
+        Some((
+            state,
+            QueuedWaiterClaim {
+                queue_id: id,
+                nonce,
+            },
+        ))
+    }
+
+    /// Reattach exactly one waiter to a durable queued row after restart. PID
+    /// alone is not ownership: it must still name the process born at enqueue.
+    pub fn resume_queued_build(
+        &self,
+        wrapper: &str,
+        hook_pid: u32,
+        digest: &[u8; 32],
+    ) -> std::io::Result<(QueuedBuildState, QueuedWaiterClaim)> {
+        let _active = self.active.write().unwrap_or_else(|e| e.into_inner());
+        let refused = || {
+            std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "queued selection cannot be safely resumed",
+            )
+        };
+        if self.ownership_failed() || self.wrapper_cancelled(wrapper) {
+            return Err(refused());
+        }
+        let identity = process_identity(hook_pid).ok_or_else(refused)?;
+        let mut queue = self.queued.write().unwrap_or_else(|e| e.into_inner());
+        let row = queue
+            .iter_mut()
+            .find(|row| row.local_wrapper_id.as_deref() == Some(wrapper))
+            .ok_or_else(refused)?;
+        if !row.recovered
+            || row.waiter_claim.is_some()
+            || row.hook_pid != hook_pid
+            || row.hook_process_identity.as_deref() != Some(identity.as_str())
+            || !row
+                .selection_contract
+                .as_ref()
+                .is_some_and(|contract| &contract.digest == digest && contract.timeout_secs > 0)
+        {
+            return Err(refused());
+        }
+        let nonce = self.next_waiter_claim.fetch_add(1, Ordering::SeqCst);
+        row.waiter_claim = Some(nonce);
+        row.recovered = false;
+        Ok((
+            row.clone(),
+            QueuedWaiterClaim {
+                queue_id: row.id,
+                nonce,
+            },
+        ))
+    }
+
+    pub fn has_queued_wrapper(&self, wrapper: &str) -> bool {
+        self.queued
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .any(|row| row.local_wrapper_id.as_deref() == Some(wrapper))
+    }
+
+    pub fn owns_queued_waiter(&self, claim: &QueuedWaiterClaim) -> bool {
+        self.queued
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .any(|row| {
+                row.id == claim.queue_id && row.waiter_claim == Some(claim.nonce) && !row.recovered
+            })
     }
 
     /// Dequeue the next build (FIFO).
@@ -1480,6 +1697,7 @@ impl BuildHistory {
             max_queue_depth: DEFAULT_MAX_QUEUE_DEPTH,
             next_id: AtomicU64::new(initial_id),
             next_queue_id: AtomicU64::new(next_queue_id),
+            next_waiter_claim: AtomicU64::new(1),
             persistence_path: Some(path.to_path_buf()),
             terminal: RwLock::new(terminal),
             cancelled_wrappers: RwLock::new(cancelled_wrappers),
@@ -1800,6 +2018,275 @@ mod tests {
     use rch_common::test_guard;
     use std::time::{SystemTime, UNIX_EPOCH};
     use tempfile::TempDir;
+
+    fn queue_resume_enqueue(
+        history: &BuildHistory,
+        wrapper: Option<&str>,
+    ) -> (QueuedBuildState, QueuedWaiterClaim) {
+        history
+            .enqueue_selection_build(
+                "project".into(),
+                "cargo build".into(),
+                observable_test_process_id(),
+                2,
+                wrapper.map(str::to_owned),
+                QueueSelectionContract {
+                    digest: [7; 32],
+                    timeout_secs: 45,
+                },
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn queue_resume_requires_recovery_contract_and_original_process_birth() {
+        let pid = observable_test_process_id();
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("history.jsonl");
+        let history = BuildHistory::new(10).with_persistence(path.clone());
+        let (queued, _) = queue_resume_enqueue(&history, Some("owner"));
+        assert!(history.resume_queued_build("owner", pid, &[7; 32]).is_err());
+        drop(history);
+        let history = BuildHistory::load_from_file(&path, 10).unwrap();
+        assert!(
+            history
+                .resume_queued_build("missing", pid, &[7; 32])
+                .is_err()
+        );
+        assert!(history.resume_queued_build("owner", 1, &[7; 32]).is_err());
+        assert!(history.resume_queued_build("owner", pid, &[8; 32]).is_err());
+        for missing_identity in [false, true] {
+            let mut rows = history.queued.write().unwrap();
+            rows[0].hook_process_identity = if missing_identity {
+                None
+            } else {
+                Some("another-process-birth".into())
+            };
+            drop(rows);
+            assert!(history.resume_queued_build("owner", pid, &[7; 32]).is_err());
+        }
+        let mut rows = history.queued.write().unwrap();
+        rows[0].hook_process_identity = queued.hook_process_identity;
+        rows[0].selection_contract = None;
+        drop(rows);
+        assert!(history.resume_queued_build("owner", pid, &[7; 32]).is_err());
+        assert_eq!(history.queue_depth(), 1);
+        assert!(history.active_builds().is_empty());
+    }
+
+    #[test]
+    fn queue_resume_claim_is_exclusive_and_survives_another_restart_without_resetting_age() {
+        use std::sync::{Arc, Barrier};
+        let pid = observable_test_process_id();
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("history.jsonl");
+        let history = BuildHistory::new(10).with_persistence(path.clone());
+        let (first, _) = queue_resume_enqueue(&history, Some("first"));
+        let (second, _) = queue_resume_enqueue(&history, Some("second"));
+        drop(history);
+        let history = Arc::new(BuildHistory::load_from_file(&path, 10).unwrap());
+        let barrier = Arc::new(Barrier::new(3));
+        let tasks: Vec<_> = (0..2)
+            .map(|_| {
+                let history = history.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    history.resume_queued_build("first", pid, &[7; 32])
+                })
+            })
+            .collect();
+        barrier.wait();
+        let claims: Vec<_> = tasks
+            .into_iter()
+            .filter_map(|task| task.join().unwrap().ok())
+            .collect();
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].0.id, first.id);
+        assert_eq!(
+            history
+                .queued_builds()
+                .iter()
+                .map(|row| row.id)
+                .collect::<Vec<_>>(),
+            vec![first.id, second.id]
+        );
+        let age = claims[0].0.queued_at_mono.elapsed();
+        drop(history);
+        let restarted = BuildHistory::load_from_file(&path, 10).unwrap();
+        let (again, _) = restarted
+            .resume_queued_build("first", pid, &[7; 32])
+            .unwrap();
+        assert_eq!(again.id, first.id);
+        assert_eq!(again.queued_at, first.queued_at);
+        assert!(again.queued_at_mono.elapsed() >= age);
+        assert_eq!(again.selection_contract.unwrap().timeout_secs, 45);
+    }
+
+    #[test]
+    fn queue_resume_claimed_admission_atomically_replaces_queue_and_cannot_replay() {
+        let pid = observable_test_process_id();
+        for wrapper in [Some("owner"), None] {
+            let tmp = TempDir::new().unwrap();
+            let path = tmp.path().join("history.jsonl");
+            let history = BuildHistory::new(10).with_persistence(path.clone());
+            let (queued, claim) = queue_resume_enqueue(&history, wrapper);
+            if wrapper.is_some() {
+                assert!(
+                    history
+                        .try_start_active_build_with_wrapper(
+                            "project".into(),
+                            "worker".into(),
+                            "cargo build".into(),
+                            pid,
+                            wrapper.map(str::to_owned),
+                            2,
+                            BuildLocation::Remote,
+                        )
+                        .unwrap()
+                        .is_none()
+                );
+            }
+            let active = history
+                .try_start_active_build_with_waiter(
+                    "project".into(),
+                    "worker".into(),
+                    "cargo build".into(),
+                    pid,
+                    wrapper.map(str::to_owned),
+                    2,
+                    BuildLocation::Remote,
+                    Some(&claim),
+                )
+                .unwrap()
+                .unwrap();
+            assert!(!history.owns_queued_waiter(&claim));
+            assert!(history.queued_build(queued.id).is_none());
+            assert!(
+                history
+                    .try_start_active_build_with_waiter(
+                        "project".into(),
+                        "second-worker".into(),
+                        "cargo build".into(),
+                        pid,
+                        wrapper.map(str::to_owned),
+                        2,
+                        BuildLocation::Remote,
+                        Some(&claim),
+                    )
+                    .unwrap()
+                    .is_none()
+            );
+            // Observe the durable commit before any handler cleanup can run.
+            let restored = BuildHistory::load_from_file(&path, 10).unwrap();
+            assert_eq!(restored.queue_depth(), 0);
+            assert_eq!(restored.active_builds().len(), 1);
+            assert!(restored.active_build(active.id).is_some());
+            assert!(
+                restored
+                    .resume_queued_build("owner", pid, &[7; 32])
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn queue_resume_cancellation_and_claimed_admission_have_one_durable_winner() {
+        use std::sync::{Arc, Barrier};
+        let pid = observable_test_process_id();
+        for _ in 0..8 {
+            let tmp = TempDir::new().unwrap();
+            let path = tmp.path().join("history.jsonl");
+            let history = BuildHistory::new(10).with_persistence(path.clone());
+            queue_resume_enqueue(&history, Some("owner"));
+            drop(history);
+            let history = Arc::new(BuildHistory::load_from_file(&path, 10).unwrap());
+            let (_, claim) = history.resume_queued_build("owner", pid, &[7; 32]).unwrap();
+            let barrier = Arc::new(Barrier::new(2));
+            let admission_history = history.clone();
+            let admission_barrier = barrier.clone();
+            let admission = std::thread::spawn(move || {
+                admission_barrier.wait();
+                admission_history
+                    .try_start_active_build_with_waiter(
+                        "project".into(),
+                        "worker".into(),
+                        "cargo build".into(),
+                        pid,
+                        Some("owner".into()),
+                        2,
+                        BuildLocation::Remote,
+                        Some(&claim),
+                    )
+                    .unwrap()
+            });
+            barrier.wait();
+            let cancellation = history.cancel_wrapper("owner").unwrap();
+            let admitted = admission.join().unwrap();
+            let restored = BuildHistory::load_from_file(&path, 10).unwrap();
+            assert_eq!(restored.queue_depth(), 0);
+            match cancellation {
+                WrapperCancellation::BeforeStart => {
+                    assert!(admitted.is_none());
+                    assert!(restored.active_builds().is_empty());
+                    assert!(restored.wrapper_cancelled("owner"));
+                }
+                WrapperCancellation::Active(id) => {
+                    assert_eq!(admitted.unwrap().id, id);
+                    assert!(restored.active_build(id).is_some());
+                    assert!(!restored.wrapper_cancelled("owner"));
+                }
+                WrapperCancellation::Completed(_) | WrapperCancellation::NotQueued => {
+                    panic!("queued cancellation lost both queue and execution")
+                }
+            }
+            assert!(
+                restored
+                    .resume_queued_build("owner", pid, &[7; 32])
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn queue_resume_uncertain_admission_never_restores_a_second_waiter() {
+        let pid = observable_test_process_id();
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("history.jsonl");
+        let history = BuildHistory::new(10).with_persistence(path.clone());
+        queue_resume_enqueue(&history, Some("owner"));
+        drop(history);
+        let history = BuildHistory::load_from_file(&path, 10).unwrap();
+        let (_, claim) = history.resume_queued_build("owner", pid, &[7; 32]).unwrap();
+        history
+            .fail_after_ownership_rename
+            .store(true, Ordering::SeqCst);
+        assert!(
+            history
+                .try_start_active_build_with_waiter(
+                    "project".into(),
+                    "worker".into(),
+                    "cargo build".into(),
+                    pid,
+                    Some("owner".into()),
+                    2,
+                    BuildLocation::Remote,
+                    Some(&claim),
+                )
+                .is_err()
+        );
+        assert!(history.ownership_failed());
+        assert!(history.resume_queued_build("owner", pid, &[7; 32]).is_err());
+        drop(history);
+        let restored = BuildHistory::load_from_file(&path, 10).unwrap();
+        assert_eq!(restored.queue_depth(), 0);
+        assert_eq!(restored.active_builds().len(), 1);
+        assert!(
+            restored
+                .resume_queued_build("owner", pid, &[7; 32])
+                .is_err()
+        );
+    }
 
     fn recovery_validation_fixture(
         path: &Path,
