@@ -16,7 +16,7 @@ permissions:
 
 jobs:
   ssh-integrity:
-    runs-on: ubuntu-24.04-arm
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     # Initial preparation stores reviewed source blobs only. Branch publication
     # remains an explicit, lease-checked GitHub operation, never a CI side effect.
