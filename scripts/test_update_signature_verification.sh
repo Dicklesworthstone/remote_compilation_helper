@@ -14,6 +14,7 @@ Usage:
 What it checks (each assertion -> one PASS/FAIL line):
   published_key/matches_updater           Published minisign key matches the updater's trust root.
   run/cargo_test                          All update::verify tests, including minisign, pass.
+  run/install_authorization              Unsigned updates cannot reach installation by default.
   coverage/valid                          >=1 test covers valid-signature acceptance.
   coverage/invalid                        >=1 test covers invalid-signature rejection.
   coverage/missing                        >=1 test covers missing-signature handling.
@@ -113,6 +114,17 @@ if cargo test -p rch --bin rch update::verify:: -- --nocapture >>"$TEST_LOG" 2>&
 else
     FAIL=$((FAIL + 1))
     emit run cargo_test FAIL
+fi
+
+# Missing signature metadata must not bypass a verifier by preventing it from
+# running. Exercise the installation decision as well as cryptographic checks.
+emit run begin INFO "filter=update::tests::update_verification_"
+if cargo test -p rch --bin rch update::tests::update_verification_ -- --nocapture >>"$TEST_LOG" 2>&1; then
+    PASS=$((PASS + 1))
+    emit run install_authorization PASS
+else
+    FAIL=$((FAIL + 1))
+    emit run install_authorization FAIL
 fi
 
 # 2. Verify each of the 4 sub-criteria has at least one named test

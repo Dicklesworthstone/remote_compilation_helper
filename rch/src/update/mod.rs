@@ -102,22 +102,34 @@ pub async fn run_update(
     // Download and verify
     let download = download_release(ctx, &update_info, skip_verify).await?;
 
-    if !download.checksum_verified {
-        let asset = download
-            .archive_path
-            .file_name()
-            .map(|name| name.to_string_lossy().to_string())
-            .unwrap_or_else(|| "unknown".to_string());
-
-        if skip_verify {
-            if !ctx.is_json() {
-                println!(
-                    "Warning: proceeding without checksum verification for {} (--skip-verify)",
-                    asset
-                );
-            }
-        } else {
-            return Err(UpdateError::ChecksumMissing { asset }.into());
+    let asset = download
+        .archive_path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    // A checksum obtained alongside an archive proves integrity, not who
+    // published it. Missing signature assets or a missing cosign executable
+    // must not silently downgrade an ordinary update to checksum-only.
+    // This gate precedes the install lock, daemon drain, replacement and fleet
+    // deployment, so an unauthenticated download cannot mutate installation.
+    require_update_verification(
+        &asset,
+        download.checksum_verified,
+        download.signature_verified,
+        skip_verify,
+    )?;
+    if skip_verify && (!download.checksum_verified || download.signature_verified != Some(true)) {
+        tracing::warn!(
+            asset = %asset,
+            checksum_verified = download.checksum_verified,
+            signature_verified = ?download.signature_verified,
+            "Installing an unverified update by explicit --skip-verify request"
+        );
+        if !ctx.is_json() {
+            println!(
+                "Warning: installing {} without complete checksum/signature verification (--skip-verify)",
+                asset
+            );
         }
     }
 
@@ -137,6 +149,41 @@ pub async fn run_update(
         update_fleet(ctx, &update_info, dry_run).await?;
     }
 
+    Ok(())
+}
+
+/// Authorize installation from completed cryptographic verification results,
+/// never from the presence of signature metadata alone. Both supported
+/// verifiers (pinned minisign or identity-bound Sigstore) report `Some(true)`.
+/// An explicit operator override may permit absent verification, but a known
+/// failed signature remains fatal. The download path already refuses invalid
+/// signatures and mismatched checksums before it can construct these results.
+fn require_update_verification(
+    asset: &str,
+    checksum_verified: bool,
+    signature_verified: Option<bool>,
+    skip_verify: bool,
+) -> Result<(), UpdateError> {
+    if signature_verified == Some(false) {
+        return Err(UpdateError::SignatureVerificationFailed(format!(
+            "refusing to install {asset}: its signature verification failed"
+        )));
+    }
+    if !skip_verify {
+        if !checksum_verified {
+            return Err(UpdateError::ChecksumMissing {
+                asset: asset.to_owned(),
+            });
+        }
+        if signature_verified != Some(true) {
+            return Err(UpdateError::SignatureVerificationFailed(format!(
+                "refusing to install {asset} without an authenticated signature; \
+                 a matching checksum alone does not prove release authenticity. \
+                 Use a release with a valid pinned-key .minisig or a verified \
+                 Sigstore bundle. --skip-verify is an explicit insecure override"
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -227,6 +274,49 @@ mod tests {
     use crate::commands::set_test_config_dir_override;
     use crate::ui::{OutputConfig, OutputMode};
     use types::Version;
+
+    #[test]
+    fn update_verification_rejects_checksum_only_installation() {
+        // Covers missing .minisig/.sigstore.json assets, and a Sigstore-only
+        // release on a host without cosign. All leave signature_verified=None
+        // even when an attacker supplied a matching recomputed checksum.
+        let error = require_update_verification("rch.tar.gz", true, None, false).unwrap_err();
+        assert!(matches!(
+            error,
+            UpdateError::SignatureVerificationFailed(ref reason)
+                if reason.contains("without an authenticated signature")
+                    && reason.contains("rch.tar.gz")
+        ));
+    }
+
+    #[test]
+    fn update_verification_requires_both_checksum_and_signature() {
+        assert!(require_update_verification("rch.tar.gz", true, Some(true), false).is_ok());
+        assert!(matches!(
+            require_update_verification("rch.tar.gz", false, Some(true), false),
+            Err(UpdateError::ChecksumMissing { asset }) if asset == "rch.tar.gz"
+        ));
+    }
+
+    #[test]
+    fn update_verification_requires_explicit_override_for_absent_proof() {
+        for checksum in [false, true] {
+            assert!(require_update_verification("rch.zip", checksum, None, false).is_err());
+            assert!(require_update_verification("rch.zip", checksum, None, true).is_ok());
+        }
+    }
+
+    #[test]
+    fn update_verification_never_permits_a_known_failed_signature() {
+        for checksum in [false, true] {
+            for skip_verify in [false, true] {
+                assert!(matches!(
+                    require_update_verification("rch.zip", checksum, Some(false), skip_verify),
+                    Err(UpdateError::SignatureVerificationFailed(_))
+                ));
+            }
+        }
+    }
 
     #[test]
     fn test_channel_default() {
