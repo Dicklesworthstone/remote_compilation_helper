@@ -1,0 +1,79 @@
+name: Update ownership
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'rch/src/update/lock.rs'
+      - 'rch/src/update/types.rs'
+      - 'rch-common/src/process_identity.rs'
+      - '.github/workflows/update-lock.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ownership:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, windows-latest, macos-14]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+    env:
+      RUSTUP_TOOLCHAIN: stable
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install Rust tools
+        run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+      # Copy exact production code, including the real process observer and
+      # UpdateError types. No simulated PID/lock implementation is substituted.
+      # This bounds the ownership regression independently of unrelated RABS
+      # dependencies; it is not a full-workspace or installation qualification.
+      - name: Compile and exercise real cross-process ownership
+        run: |
+          set -euo pipefail
+          work="$RUNNER_TEMP/update-lock-tests"
+          evidence="$RUNNER_TEMP/update-lock-evidence"
+          mkdir -p "$work/src/update" "$evidence"
+          cp rch/src/update/lock.rs rch/src/update/types.rs "$work/src/update/"
+          cp rch-common/src/process_identity.rs "$work/src/"
+          printf 'extern crate self as rch_common;\npub mod process_identity;\npub mod update;\n' > "$work/src/lib.rs"
+          printf 'pub mod types;\npub mod lock;\n' > "$work/src/update/mod.rs"
+          cat > "$work/Cargo.toml" <<'TOML'
+          [package]
+          name = "rch-update-lock-validation"
+          version = "0.0.0"
+          edition = "2024"
+          [dependencies]
+          dirs = "7"
+          serde = { version = "1", features = ["derive"] }
+          serde_json = "1"
+          thiserror = "2"
+          tempfile = "3.25"
+          uuid = { version = "1", features = ["v4"] }
+          [target.'cfg(target_os = "macos")'.dependencies]
+          libproc = "=0.14.11"
+          rustix = { version = "1.1.5", features = ["process"] }
+          TOML
+          cargo test --manifest-path "$work/Cargo.toml" -- --nocapture 2>&1 | tee "$evidence/tests.log"
+          cargo clippy --manifest-path "$work/Cargo.toml" --all-targets -- -D warnings 2>&1 | tee "$evidence/clippy.log"
+      - name: Check update-lock formatting
+        if: success() || failure()
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/update-lock-evidence"
+          rustfmt --edition 2024 --emit stdout rch/src/update/lock.rs > "$RUNNER_TEMP/update-lock-evidence/lock.formatted.rs"
+          rustfmt --edition 2024 --check rch/src/update/lock.rs
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: update-lock-${{ matrix.runner }}-${{ github.sha }}
+          path: ${{ runner.temp }}/update-lock-evidence
+          retention-days: 7
