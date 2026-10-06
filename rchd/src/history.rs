@@ -70,55 +70,13 @@ pub struct BuildCompletion {
     pub cancellation: Option<BuildCancellationMetadata>,
 }
 
-/// Boot identity plus process start time distinguish PID reuse and reboot.
-/// Only the daemon computes and compares these values, so each platform just
-/// needs a stable per-incarnation string; `None` means "cannot prove".
-#[cfg(target_os = "linux")]
+/// Shared kernel birth proof. Linux durable strings remain compatible; Darwin
+/// records microseconds rather than the old second-resolution ps display.
 pub fn process_identity(pid: u32) -> Option<String> {
-    if pid <= 1 {
-        return None;
+    match rch_common::process_identity::observe_process(pid) {
+        rch_common::process_identity::ProcessObservation::Present(identity) => identity.to_record(),
+        _ => None,
     }
-    let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let (_, fields) = stat.rsplit_once(") ")?;
-    let start_ticks = fields.split_whitespace().nth(19)?;
-    Some(format!("{}:{start_ticks}", boot.trim()))
-}
-
-/// macOS has no /proc. Without an identity every heartbeat of a build
-/// recovered after a daemon restart was rejected, so reattach could never
-/// work on a Mac dispatcher (bd-w2qrp). The boot session UUID changes on
-/// every boot; `ps -o lstart=` is the process start time (empty, and so
-/// `None`, once the PID is gone).
-#[cfg(target_os = "macos")]
-pub fn process_identity(pid: u32) -> Option<String> {
-    if pid <= 1 {
-        return None;
-    }
-    static BOOT_SESSION: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-    let boot = BOOT_SESSION
-        .get_or_init(|| command_stdout("/usr/sbin/sysctl", &["-n", "kern.bootsessionuuid"]))
-        .as_ref()?;
-    let started = command_stdout("/bin/ps", &["-o", "lstart=", "-p", &pid.to_string()])?;
-    Some(format!("{boot}:{started}"))
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-pub fn process_identity(_pid: u32) -> Option<String> {
-    None
-}
-
-#[cfg(target_os = "macos")]
-fn command_stdout(program: &str, args: &[&str]) -> Option<String> {
-    let output = std::process::Command::new(program)
-        .args(args)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-    (!text.is_empty()).then_some(text)
 }
 
 /// Keep live-owner tests in the same PID namespace as the procfs identity
@@ -3040,7 +2998,7 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     mod heartbeat_identity {
         use super::*;
 
@@ -3171,17 +3129,22 @@ mod tests {
         fn delayed_recovered_heartbeat_rejects_modelled_pid_reuse_without_adoption() {
             let mut unrelated = OwnedWrapper::start();
             let actual = process_identity(unrelated.0.id()).unwrap();
-            let (boot, ticks) = actual.rsplit_once(':').unwrap();
-            let ticks = ticks.parse::<u64>().unwrap();
-            let prior_ticks = if ticks > 0 { ticks - 1 } else { 1 };
-            let prior_identity = format!("{boot}:{prior_ticks}");
+            use rch_common::process_identity::{ProcessIdentity, ProcessStart};
+            let mut prior = ProcessIdentity::from_record(&actual).unwrap();
+            match &mut prior.start {
+                ProcessStart::Linux { ticks } => *ticks = if *ticks > 0 { *ticks - 1 } else { 1 },
+                ProcessStart::Darwin { microseconds, .. } => {
+                    *microseconds = (*microseconds + 1) % 1_000_000;
+                }
+            }
+            let prior_identity = prior.to_record().unwrap();
             assert_ne!(prior_identity, actual);
 
             let root = TempDir::new().unwrap();
             let (history, path) = persistent_history(&root);
             let build = register(&history, unrelated.0.id());
             // Model PID reuse by recording the prior owner's distinct start
-            // ticks. The unrelated current occupant is a real live process;
+            // marker (only microseconds on Darwin). The current occupant is live;
             // this test does not claim to force operating-system PID reuse.
             persist_process_identity(&history, build.id, Some(prior_identity));
             drop(history);

@@ -180,16 +180,11 @@ enum WrapperProcessState {
     Unverified,
 }
 
-/// `<boot id>:<start marker>` as written by `history::process_identity`: the
-/// boot id is a UUID (no colons), so split at the FIRST colon. Linux's marker
-/// is start ticks; macOS's is `ps -o lstart=` (`Mon Sep 28 10:48:17 2026`),
-/// which itself contains colons. Splitting at the last colon rejected every
-/// macOS identity, so a Mac wrapper was never Running or Exited, only
-/// Unverified, and its abandoned reservation was retained (bd-axhoi).
+/// Only precise native identities are authoritative. Old Darwin ps display
+/// strings cannot distinguish same-second PID reuse and remain unverified.
+#[cfg(test)]
 fn well_formed_process_identity(identity: &str) -> bool {
-    identity.split_once(':').is_some_and(|(boot, marker)| {
-        uuid::Uuid::parse_str(boot).is_ok() && !marker.trim().is_empty()
-    })
+    rch_common::process_identity::ProcessIdentity::from_record(identity).is_some()
 }
 
 fn wrapper_process_state(pid: u32, expected: Option<&str>) -> WrapperProcessState {
@@ -199,17 +194,12 @@ fn wrapper_process_state(pid: u32, expected: Option<&str>) -> WrapperProcessStat
     if pid <= 1 || i32::try_from(pid).is_err() {
         return WrapperProcessState::Unverified;
     }
-    if !is_process_alive(pid) {
-        return WrapperProcessState::Exited;
-    }
-    let Some(expected) = expected.filter(|identity| well_formed_process_identity(identity)) else {
-        return WrapperProcessState::Unverified;
-    };
-    match crate::history::process_identity(pid) {
-        Some(current) if current == expected => WrapperProcessState::Running,
-        Some(_) => WrapperProcessState::Exited,
-        None if !is_process_alive(pid) => WrapperProcessState::Exited,
-        None => WrapperProcessState::Unverified,
+    use rch_common::process_identity::{OwnerPresence, ProcessIdentity, owner_presence};
+    let expected = expected.and_then(ProcessIdentity::from_record);
+    match owner_presence(pid, expected.as_ref()) {
+        OwnerPresence::Live => WrapperProcessState::Running,
+        OwnerPresence::Absent => WrapperProcessState::Exited,
+        OwnerPresence::Unknown => WrapperProcessState::Unverified,
     }
 }
 
@@ -1448,13 +1438,51 @@ mod tests {
         let boot = "3f1c2a9e-5b7d-4e2a-9c1f-0a1b2c3d4e5f";
         assert!(well_formed_process_identity(&format!("{boot}:123456789")));
         assert!(
-            well_formed_process_identity(&format!("{boot}:Mon Sep 28 10:48:17 2026")),
-            "macOS lstart contains colons"
+            well_formed_process_identity(&format!("{boot}:darwin:1791280000:123456")),
+            "macOS kernel birth retains microseconds"
         );
+        assert!(!well_formed_process_identity(&format!(
+            "{boot}:Mon Sep 28 10:48:17 2026"
+        )));
+        assert!(!well_formed_process_identity(&format!(
+            "{boot}:darwin:1791280000:1000000"
+        )));
         assert!(!well_formed_process_identity("not-a-uuid:123"));
         assert!(!well_formed_process_identity(&format!("{boot}:")));
         assert!(!well_formed_process_identity(&format!("{boot}:   ")));
         assert!(!well_formed_process_identity(boot));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn native_absence_releases_legacy_owners_but_a_live_legacy_pid_is_unverified() {
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        // Reap before assertions so an unsupported test environment cannot leak
+        // the fixture. Both observations still exercise production inspection.
+        let current = crate::history::process_identity(pid);
+        let legacy = "3f1c2a9e-5b7d-4e2a-9c1f-0a1b2c3d4e5f:Mon Sep 28 10:48:17 2026";
+        let live_unknown = wrapper_process_state(pid, None);
+        let live_legacy = wrapper_process_state(pid, Some(legacy));
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(
+            current.is_some(),
+            "native birth requires a coherent process inspection namespace"
+        );
+        assert_eq!(live_unknown, WrapperProcessState::Unverified);
+        assert_eq!(live_legacy, WrapperProcessState::Unverified);
+        assert_eq!(
+            wrapper_process_state(pid, None),
+            WrapperProcessState::Exited
+        );
+        assert_eq!(
+            wrapper_process_state(pid, Some(legacy)),
+            WrapperProcessState::Exited
+        );
     }
 
     /// bd-axhoi: a wrapper that died in sync_up never started anything remote,

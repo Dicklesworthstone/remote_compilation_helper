@@ -76,6 +76,7 @@ fn verify_recovery_completion(
         || before.wrapper_pid != after.wrapper_pid
         || before.process_start_ticks != after.process_start_ticks
         || before.boot_id != after.boot_id
+        || before.process_birth != after.process_birth
         || before.command_fingerprint != after.command_fingerprint
     {
         return Err("recovery journal identity changed; completion not confirmed".into());
@@ -824,6 +825,11 @@ mod tests {
         assert!(verify_recovery_completion(&before, &false_success).is_err());
         let mut replaced = complete;
         replaced.identity.remote_build_id = Some(8);
+        assert!(verify_recovery_completion(&before, &replaced).is_err());
+        let mut replaced = completed_lease(&before, 102, 130);
+        replaced.process_birth = rch_common::process_identity::ProcessIdentity::from_record(
+            "3f1c2a9e-5b7d-4e2a-9c1f-0a1b2c3d4e5f:darwin:1791280000:123456",
+        );
         assert!(verify_recovery_completion(&before, &replaced).is_err());
     }
 

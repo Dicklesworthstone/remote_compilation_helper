@@ -1491,16 +1491,27 @@ impl DurableLeaseWriter {
         let identity = JobIdentity::new_local();
         let path = durable_lease_path(&identity.local_wrapper_id);
         let command_fingerprint = format!("blake3:{}", blake3::hash(command.as_bytes()).to_hex());
-        let lease = DurableJobLease::new(
+        let process_birth = rch_common::process_identity::current_process_identity();
+        let process_start_ticks =
+            process_birth
+                .as_ref()
+                .and_then(|identity| match identity.start {
+                    rch_common::process_identity::ProcessStart::Linux { ticks } => Some(ticks),
+                    _ => None,
+                });
+        let mut lease = DurableJobLease::new(
             identity,
             std::process::id(),
-            current_process_start_ticks(),
-            current_boot_id(),
+            process_start_ticks,
+            process_birth
+                .as_ref()
+                .map(|identity| identity.boot_id.clone()),
             now_unix_ms(),
             strict_remote,
             self_healing_enabled,
             command_fingerprint,
         );
+        lease.process_birth = process_birth;
         let writer = Self {
             path,
             lease: Arc::new(Mutex::new(lease)),
@@ -1636,19 +1647,6 @@ fn selection_error_for_recovery(
 
 fn durable_lease_path(local_wrapper_id: &str) -> PathBuf {
     default_job_lease_directory().join(format!("{local_wrapper_id}.json"))
-}
-
-fn current_process_start_ticks() -> Option<u64> {
-    let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
-    let after_comm = stat.rsplit_once(") ")?.1;
-    after_comm.split_whitespace().nth(19)?.parse().ok()
-}
-
-fn current_boot_id() -> Option<String> {
-    std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
 }
 
 /// Build the structured incident for a daemon-socket failure (RCH-I010). The

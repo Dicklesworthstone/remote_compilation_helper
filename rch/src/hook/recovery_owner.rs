@@ -60,33 +60,22 @@ fn validate_same_owner(observed: &DurableJobLease, latest: &DurableJobLease) -> 
             && observed.wrapper_pid == latest.wrapper_pid
             && observed.process_start_ticks == latest.process_start_ticks
             && observed.boot_id == latest.boot_id
+            && observed.process_birth == latest.process_birth
             && observed.command_fingerprint == latest.command_fingerprint,
         "durable job identity changed before recovery; reload the same wrapper, never replay"
     );
     Ok(())
 }
 
-/// None means /proc did not prove absence. It is NOT permission to take over.
-/// A complete process listing below can still prove a legacy/Mac owner gone
-/// even when the lease contains no Linux birth marker.
-fn linux_owner_absent(lease: &DurableJobLease) -> Option<bool> {
-    if !cfg!(target_os = "linux") {
-        return None;
+/// Native inspection can prove PID reuse, including Darwin births within one
+/// second. Unknown evidence is never permission to take over.
+fn native_owner_absent(lease: &DurableJobLease) -> Option<bool> {
+    use rch_common::process_identity::{OwnerPresence, owner_presence};
+    match owner_presence(lease.wrapper_pid, lease.owner_identity().as_ref()) {
+        OwnerPresence::Live => Some(false),
+        OwnerPresence::Absent => Some(true),
+        OwnerPresence::Unknown => None,
     }
-    let boot = lease.boot_id.as_deref()?;
-    uuid::Uuid::parse_str(boot).ok()?;
-    let current = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
-    uuid::Uuid::parse_str(current.trim()).ok()?;
-    if current.trim() != boot {
-        return Some(true);
-    }
-    let expected = lease.process_start_ticks?;
-    let stat = std::fs::read_to_string(format!("/proc/{}/stat", lease.wrapper_pid)).ok()?;
-    let (_, rest) = stat.rsplit_once(") ")?;
-    let mut fields = rest.split_whitespace();
-    let state = fields.next()?;
-    let actual = fields.nth(18)?.parse::<u64>().ok()?;
-    Some(actual != expected || matches!(state, "Z" | "X" | "x"))
 }
 
 fn absent_from_process_list(bytes: &[u8], owner: u32, observer: u32) -> anyhow::Result<bool> {
@@ -113,11 +102,18 @@ async fn owner_is_absent(lease: &DurableJobLease) -> anyhow::Result<bool> {
     if lease.wrapper_pid <= 1 || lease.wrapper_pid == std::process::id() {
         return Ok(false);
     }
-    if let Some(absent) = linux_owner_absent(lease) {
+    if let Some(absent) = native_owner_absent(lease) {
         return Ok(absent);
     }
-    // ps -A -o pid= works on both Darwin and Linux. No birth marker is needed
-    // to prove that the PID is absent; a present/reused PID stays conservative.
+    if cfg!(any(target_os = "linux", target_os = "macos")) {
+        // Native inspection already recognizes a genuinely absent PID without
+        // a birth marker. Unknown must stay unknown: ps can expose the same
+        // foreign procfs view and a coincidental numeric observer PID cannot
+        // prove that the listing is in our signal namespace.
+        return Ok(false);
+    }
+    // Other Unix platforms retain a complete listing as absence evidence.
+    // A present/reused PID stays conservative without a native birth marker.
     // An empty, failed, truncated or malformed listing never authorizes work.
     let mut child = tokio::process::Command::new("/bin/ps")
         .args(["-A", "-o", "pid="])
@@ -366,30 +362,51 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn linux_birth_marker_detects_pid_reuse_without_signalling_any_process() {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn native_birth_marker_detects_pid_reuse_without_signalling_any_process() {
+        use rch_common::process_identity::{ProcessStart, current_process_identity};
         let (_directory, writer) = fixture();
         let mut lease = writer.snapshot();
         lease.wrapper_pid = std::process::id();
-        lease.boot_id = current_boot_id();
-        lease.process_start_ticks = current_process_start_ticks();
-        assert!(lease.boot_id.is_some());
-        assert!(lease.process_start_ticks.is_some());
-        assert_eq!(linux_owner_absent(&lease), Some(false));
-        lease.process_start_ticks = Some(lease.process_start_ticks.unwrap() + 1);
-        assert_eq!(linux_owner_absent(&lease), Some(true));
-        lease.boot_id = Some("unverified-boot-marker".into());
-        assert_eq!(linux_owner_absent(&lease), None);
-        lease.boot_id = None;
-        assert_eq!(linux_owner_absent(&lease), None);
+        lease.process_birth = Some(current_process_identity().expect("native process birth"));
+        assert_eq!(native_owner_absent(&lease), Some(false));
+        match &mut lease.process_birth.as_mut().unwrap().start {
+            ProcessStart::Linux { ticks } => *ticks += 1,
+            ProcessStart::Darwin { microseconds, .. } => {
+                *microseconds = (*microseconds + 1) % 1_000_000
+            }
+        }
+        assert_eq!(native_owner_absent(&lease), Some(true));
+        lease.process_birth.as_mut().unwrap().boot_id = "unverified-boot-marker".into();
+        assert_eq!(native_owner_absent(&lease), None);
+        lease.process_birth = None;
+        assert_eq!(native_owner_absent(&lease), None);
+    }
+
+    #[test]
+    fn reloaded_owner_must_preserve_exact_darwin_microseconds() {
+        let (_directory, writer) = fixture();
+        let mut before = writer.snapshot();
+        before.process_birth = rch_common::process_identity::ProcessIdentity::from_record(
+            "3f1c2a9e-5b7d-4e2a-9c1f-0a1b2c3d4e5f:darwin:1791280000:123456",
+        );
+        let mut after: DurableJobLease =
+            serde_json::from_slice(&serde_json::to_vec(&before).unwrap()).unwrap();
+        validate_same_owner(&before, &after).unwrap();
+        if let rch_common::process_identity::ProcessStart::Darwin { microseconds, .. } =
+            &mut after.process_birth.as_mut().unwrap().start
+        {
+            *microseconds += 1;
+        }
+        assert!(validate_same_owner(&before, &after).is_err());
     }
 
     #[tokio::test]
     async fn a_live_wrapper_and_unknown_pid_cannot_be_taken_over() {
         let (_directory, writer) = fixture();
         let mut lease = writer.snapshot();
-        for pid in [0, 1, std::process::id()] {
+        for pid in [0, 1, std::process::id(), u32::MAX] {
             lease.wrapper_pid = pid;
             assert!(!owner_is_absent(&lease).await.unwrap());
         }

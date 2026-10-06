@@ -48,6 +48,10 @@ whoami = "2.1.3"
 # Rich terminal output (optional)
 rich_rust = { workspace = true, optional = true }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+libproc = "=0.14.11"
+rustix = { version = "1.1.5", features = ["process"] }
+
 [features]
 default = ["rich-ui"]
 rich-ui = ["rich_rust"]
