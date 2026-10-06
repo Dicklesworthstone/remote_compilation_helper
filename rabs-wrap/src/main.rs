@@ -51,6 +51,227 @@ fn json_string(text: &str) -> String {
     out
 }
 
+/// Minimal JSON reader for daemon replies (no serde by design). Accepts
+/// the complete grammar the daemon emits; anything else is `None`, which
+/// every caller treats as "run the compiler normally".
+mod reply_json {
+    #[derive(Debug, Clone, PartialEq)]
+    pub enum Value {
+        Null,
+        Bool(bool),
+        Number(String),
+        Str(String),
+        Array(Vec<Value>),
+        Object(Vec<(String, Value)>),
+    }
+
+    impl Value {
+        pub fn get(&self, key: &str) -> Option<&Value> {
+            match self {
+                Self::Object(fields) => fields.iter().find(|(name, _)| name == key).map(|f| &f.1),
+                _ => None,
+            }
+        }
+        pub fn as_str(&self) -> Option<&str> {
+            match self {
+                Self::Str(text) => Some(text),
+                _ => None,
+            }
+        }
+        pub fn as_array(&self) -> Option<&[Value]> {
+            match self {
+                Self::Array(items) => Some(items),
+                _ => None,
+            }
+        }
+        pub fn as_bool(&self) -> Option<bool> {
+            match self {
+                Self::Bool(value) => Some(*value),
+                _ => None,
+            }
+        }
+    }
+
+    const MAX_DEPTH: usize = 16;
+
+    struct Parser<'a> {
+        bytes: &'a [u8],
+        at: usize,
+    }
+
+    impl Parser<'_> {
+        fn skip_ws(&mut self) {
+            while self
+                .bytes
+                .get(self.at)
+                .is_some_and(|b| matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
+            {
+                self.at += 1;
+            }
+        }
+        fn eat(&mut self, byte: u8) -> Option<()> {
+            self.skip_ws();
+            (self.bytes.get(self.at) == Some(&byte)).then(|| self.at += 1)
+        }
+        fn literal(&mut self, text: &str, value: Value) -> Option<Value> {
+            let end = self.at.checked_add(text.len())?;
+            (self.bytes.get(self.at..end)? == text.as_bytes()).then(|| {
+                self.at = end;
+                value
+            })
+        }
+        fn hex4(&mut self) -> Option<u32> {
+            let end = self.at.checked_add(4)?;
+            let digits = std::str::from_utf8(self.bytes.get(self.at..end)?).ok()?;
+            self.at = end;
+            u32::from_str_radix(digits, 16).ok()
+        }
+        fn string(&mut self) -> Option<String> {
+            self.eat(b'"')?;
+            let mut out = String::new();
+            loop {
+                let start = self.at;
+                while self
+                    .bytes
+                    .get(self.at)
+                    .is_some_and(|b| *b != b'"' && *b != b'\\' && *b >= 0x20)
+                {
+                    self.at += 1;
+                }
+                out.push_str(std::str::from_utf8(&self.bytes[start..self.at]).ok()?);
+                match *self.bytes.get(self.at)? {
+                    b'"' => {
+                        self.at += 1;
+                        return Some(out);
+                    }
+                    b'\\' => {
+                        self.at += 1;
+                        let escape = *self.bytes.get(self.at)?;
+                        self.at += 1;
+                        match escape {
+                            b'"' => out.push('"'),
+                            b'\\' => out.push('\\'),
+                            b'/' => out.push('/'),
+                            b'b' => out.push('\u{8}'),
+                            b'f' => out.push('\u{c}'),
+                            b'n' => out.push('\n'),
+                            b'r' => out.push('\r'),
+                            b't' => out.push('\t'),
+                            b'u' => {
+                                let high = self.hex4()?;
+                                let code = if (0xD800..0xDC00).contains(&high) {
+                                    if self.bytes.get(self.at..self.at + 2)? != b"\\u" {
+                                        return None;
+                                    }
+                                    self.at += 2;
+                                    let low = self.hex4()?;
+                                    if !(0xDC00..0xE000).contains(&low) {
+                                        return None;
+                                    }
+                                    0x10000 + ((high - 0xD800) << 10) + (low - 0xDC00)
+                                } else {
+                                    high
+                                };
+                                out.push(char::from_u32(code)?);
+                            }
+                            _ => return None,
+                        }
+                    }
+                    _ => return None,
+                }
+            }
+        }
+        fn value(&mut self, depth: usize) -> Option<Value> {
+            if depth > MAX_DEPTH {
+                return None;
+            }
+            self.skip_ws();
+            match *self.bytes.get(self.at)? {
+                b'"' => self.string().map(Value::Str),
+                b'n' => self.literal("null", Value::Null),
+                b't' => self.literal("true", Value::Bool(true)),
+                b'f' => self.literal("false", Value::Bool(false)),
+                b'[' => {
+                    self.at += 1;
+                    let mut items = Vec::new();
+                    if self.eat(b']').is_some() {
+                        return Some(Value::Array(items));
+                    }
+                    loop {
+                        items.push(self.value(depth + 1)?);
+                        if self.eat(b']').is_some() {
+                            return Some(Value::Array(items));
+                        }
+                        self.eat(b',')?;
+                    }
+                }
+                b'{' => {
+                    self.at += 1;
+                    let mut fields = Vec::new();
+                    if self.eat(b'}').is_some() {
+                        return Some(Value::Object(fields));
+                    }
+                    loop {
+                        self.skip_ws();
+                        let name = self.string()?;
+                        self.eat(b':')?;
+                        fields.push((name, self.value(depth + 1)?));
+                        if self.eat(b'}').is_some() {
+                            return Some(Value::Object(fields));
+                        }
+                        self.eat(b',')?;
+                    }
+                }
+                b'-' | b'0'..=b'9' => {
+                    let start = self.at;
+                    while self.bytes.get(self.at).is_some_and(|b| {
+                        b.is_ascii_digit() || matches!(b, b'-' | b'+' | b'.' | b'e' | b'E')
+                    }) {
+                        self.at += 1;
+                    }
+                    Some(Value::Number(
+                        std::str::from_utf8(&self.bytes[start..self.at])
+                            .ok()?
+                            .to_owned(),
+                    ))
+                }
+                _ => None,
+            }
+        }
+    }
+
+    /// Parse one complete JSON document (surrounding whitespace allowed).
+    pub fn parse(text: &str) -> Option<Value> {
+        let mut parser = Parser {
+            bytes: text.as_bytes(),
+            at: 0,
+        };
+        let value = parser.value(0)?;
+        parser.skip_ws();
+        (parser.at == parser.bytes.len()).then_some(value)
+    }
+}
+
+fn hex_decode(text: &str) -> Option<Vec<u8>> {
+    if !text.len().is_multiple_of(2) {
+        return None;
+    }
+    text.as_bytes()
+        .chunks(2)
+        .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok())
+        .collect()
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(char::from(DIGITS[usize::from(byte >> 4)]));
+        out.push(char::from(DIGITS[usize::from(byte & 0xf)]));
+    }
+    out
+}
+
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -206,14 +427,16 @@ impl Write for ConsultStream {
 }
 
 fn read_reply(reader: &mut BufReader<ConsultStream>) -> io::Result<String> {
+    read_reply_bounded(reader, MAX_REPLY_BYTES)
+}
+
+fn read_reply_bounded(reader: &mut BufReader<ConsultStream>, max_bytes: u64) -> io::Result<String> {
     // Check even when BufReader already has bytes: a pipelined reply
     // cannot make an expired attempt healthy without another socket read.
     reader.get_ref().remaining()?;
     let mut reply = String::new();
-    (&mut *reader)
-        .take(MAX_REPLY_BYTES + 1)
-        .read_line(&mut reply)?;
-    if reply.len() as u64 > MAX_REPLY_BYTES {
+    (&mut *reader).take(max_bytes + 1).read_line(&mut reply)?;
+    if reply.len() as u64 > max_bytes {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "RABS reply exceeds frame limit",
@@ -229,14 +452,172 @@ fn read_reply(reader: &mut BufReader<ConsultStream>) -> io::Result<String> {
     Ok(reply)
 }
 
-/// One consult attempt under the breaker budgets. Ok(()) = decision
-/// received (shadow: always pass-through).
+/// Live dependency decisions may hash an unseen package or dependency
+/// artifact on the request path; they get a larger (but still bounded)
+/// decision budget than a shadow consult. `RABS_LIVE_DECISION_MS`
+/// overrides it.
+const LIVE_DECISION_TIMEOUT_MS: u32 = 2_000;
+/// A served reply carries the transcript (hex): bounded far above any
+/// capped-lint dependency transcript the daemon publishes.
+const MAX_LIVE_REPLY_BYTES: u64 = 4 * 1024 * 1024;
+/// Requests above this size fall back to a names-only shadow consult.
+const MAX_REQUEST_BYTES: usize = 60 * 1024;
+/// After accepting a hit, the wrapper has committed to NOT running the
+/// compiler while the daemon may be installing. A daemon that neither
+/// answers nor dies within this bound fails the compile (closed), because
+/// running rustc over a possibly changing output tree is never safe.
+/// `RABS_INSTALL_WAIT_MS` overrides it.
+const INSTALL_WAIT: Duration = Duration::from_secs(600);
+
+fn install_wait() -> Duration {
+    std::env::var("RABS_INSTALL_WAIT_MS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .map_or(INSTALL_WAIT, Duration::from_millis)
+}
+/// Captured compiler output above this is not publishable; it is still
+/// streamed to the caller unchanged.
+const MAX_CAPTURE_BYTES: usize = 1024 * 1024;
+
+/// What the wrapper does after consulting the daemon.
+enum Live {
+    /// Run the real compiler as if RABS were absent.
+    PassThrough,
+    /// Every declared output is installed and verified: replay stderr and
+    /// exit 0 WITHOUT running the compiler.
+    Served(Vec<u8>),
+    /// Run the compiler as the admitted attempt with exactly `env`, then
+    /// report completion on `session`.
+    Execute {
+        session: Box<BufReader<ConsultStream>>,
+        attempt: String,
+        env: Vec<(String, String)>,
+    },
+    /// An accepted hit whose install outcome is unknown: fail the compile.
+    FailClosed(String),
+}
+
+fn live_decision_timeout_ms(breaker_budget_ms: u32) -> u32 {
+    std::env::var("RABS_LIVE_DECISION_MS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(LIVE_DECISION_TIMEOUT_MS)
+        .max(breaker_budget_ms)
+}
+
+/// The full live request, or `None` when it cannot be represented
+/// exactly (non-UTF-8 environment) or exceeds the frame bound — such
+/// requests stay names-only shadow consults.
+fn live_request_frame(args: &[String], cwd: &str) -> Option<String> {
+    let mut env = Vec::new();
+    for (name, value) in std::env::vars_os() {
+        let (Ok(name), Ok(value)) = (name.into_string(), value.into_string()) else {
+            return None;
+        };
+        env.push(format!("[{},{}]", json_string(&name), json_string(&value)));
+    }
+    let argv_json: Vec<String> = args.iter().map(|a| json_string(a)).collect();
+    let frame = format!(
+        "{{\"kind\":\"rustc-request\",\"argv\":[{}],\"cwd\":{},\"env\":[{}]}}",
+        argv_json.join(","),
+        json_string(cwd),
+        env.join(","),
+    );
+    (frame.len() <= MAX_REQUEST_BYTES).then_some(frame)
+}
+
+/// Interpret a live decision. `Err(())` = the daemon failed us (breaker).
+fn live_outcome(
+    reply: &reply_json::Value,
+    mut reader: BufReader<ConsultStream>,
+) -> Result<Live, ()> {
+    match reply.get("decision").and_then(reply_json::Value::as_str) {
+        Some("pass-through") => Ok(Live::PassThrough),
+        Some("execute") => {
+            let attempt = reply.get("attempt").and_then(reply_json::Value::as_str);
+            let env = reply.get("env").and_then(reply_json::Value::as_array);
+            let (Some(attempt), Some(env)) = (attempt, env) else {
+                return Err(());
+            };
+            let env = env
+                .iter()
+                .map(|pair| match pair.as_array()? {
+                    [name, value] => Some((name.as_str()?.to_owned(), value.as_str()?.to_owned())),
+                    _ => None,
+                })
+                .collect::<Option<Vec<_>>>()
+                .ok_or(())?;
+            Ok(Live::Execute {
+                session: Box::new(reader),
+                attempt: attempt.to_owned(),
+                env,
+            })
+        }
+        Some("hit") => {
+            // Commit to waiting: from here on the daemon may write outputs,
+            // so this process must not run the compiler unless the install
+            // provably returned (an answer, or the daemon is gone).
+            reader.get_mut().deadline = Instant::now() + install_wait();
+            if reader
+                .get_mut()
+                .write_all(b"{\"kind\":\"rustc-accept\"}\n")
+                .is_err()
+            {
+                // The daemon never received the acceptance: nothing written.
+                return Ok(Live::PassThrough);
+            }
+            match read_reply_bounded(&mut reader, MAX_LIVE_REPLY_BYTES) {
+                Ok(line) => {
+                    let answer = reply_json::parse(&line).ok_or(())?;
+                    match answer.get("decision").and_then(reply_json::Value::as_str) {
+                        Some("served")
+                            if answer
+                                .get("compiler_skip_authorized")
+                                .and_then(reply_json::Value::as_bool)
+                                == Some(true) =>
+                        {
+                            answer
+                                .get("stderr_hex")
+                                .and_then(reply_json::Value::as_str)
+                                .and_then(hex_decode)
+                                .map(Live::Served)
+                                .ok_or(())
+                        }
+                        Some("serve-failed") => Ok(Live::PassThrough),
+                        _ => Ok(Live::FailClosed("unrecognized install answer".into())),
+                    }
+                }
+                // A socket read timeout surfaces as WouldBlock (EAGAIN) on
+                // Linux and TimedOut elsewhere; both mean "still alive, no
+                // answer", which is never evidence that the writer returned.
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                    ) =>
+                {
+                    Ok(Live::FailClosed(
+                        "the RABS daemon accepted a cache hit but did not finish installing it"
+                            .into(),
+                    ))
+                }
+                // EOF or reset: the daemon process is gone, and with it any
+                // writer; its synchronous install cannot continue.
+                Err(_) => Ok(Live::PassThrough),
+            }
+        }
+        _ => Err(()),
+    }
+}
+
+/// One consult attempt under the breaker budgets. `Ok(_)` = a decision
+/// was received (shadow decisions are always pass-through).
 fn consult(
     socket: &str,
     connect_timeout_ms: u32,
     decision_timeout_ms: u32,
     args: &[String],
-) -> Result<(), ()> {
+) -> Result<Live, ()> {
     // std UDS has no connect timeout: connect on a helper thread and
     // bound the wait. A short-lived process reaps stragglers at exit.
     let (sender, receiver) = std::sync::mpsc::channel();
@@ -250,7 +631,17 @@ fn consult(
         .recv_timeout(Duration::from_millis(u64::from(connect_timeout_ms)))
         .map_err(|_| ())?
         .map_err(|_| ())?;
-    let budget = Duration::from_millis(u64::from(decision_timeout_ms));
+    let cwd = std::env::current_dir()
+        .map_err(|_| ())?
+        .into_os_string()
+        .into_string()
+        .map_err(|_| ())?;
+    let live_frame = live_request_frame(args, &cwd);
+    let budget = Duration::from_millis(u64::from(if live_frame.is_some() {
+        live_decision_timeout_ms(decision_timeout_ms)
+    } else {
+        decision_timeout_ms
+    }));
     let deadline = Instant::now().checked_add(budget).ok_or(())?;
     let mut reader = BufReader::new(ConsultStream { stream, deadline });
 
@@ -264,34 +655,38 @@ fn consult(
         return Err(());
     }
 
-    // The full S4 observation: real argv, cwd, CARGO_*/RUSTC_* env
-    // NAMES (values never leave the process in shadow tier). The
-    // daemon computes the Epic F key and redacts before persisting.
-    let argv_json: Vec<String> = args.iter().map(|a| json_string(a)).collect();
-    let env_names: Vec<String> = std::env::vars_os()
-        .filter_map(|(name, _)| name.into_string().ok())
-        .filter(|name| name.starts_with("CARGO") || name.starts_with("RUSTC"))
-        .map(|name| json_string(&name))
-        .collect();
-    let cwd = std::env::current_dir()
-        .map_err(|_| ())?
-        .into_os_string()
-        .into_string()
-        .map_err(|_| ())?;
-    let consult_frame = format!(
-        "{{\"kind\":\"consult\",\"argv\":[{}],\"cwd\":{},\"env_names\":[{}]}}",
-        argv_json.join(","),
-        json_string(&cwd),
-        env_names.join(","),
-    );
+    // Live request (full argv, cwd and environment, so the daemon can key
+    // the exact action), or the names-only S4 shadow observation when the
+    // request cannot be represented exactly.
+    let frame = match live_frame {
+        Some(frame) => frame,
+        None => {
+            let argv_json: Vec<String> = args.iter().map(|a| json_string(a)).collect();
+            let env_names: Vec<String> = std::env::vars_os()
+                .filter_map(|(name, _)| name.into_string().ok())
+                .filter(|name| name.starts_with("CARGO") || name.starts_with("RUSTC"))
+                .map(|name| json_string(&name))
+                .collect();
+            format!(
+                "{{\"kind\":\"consult\",\"argv\":[{}],\"cwd\":{},\"env_names\":[{}]}}",
+                argv_json.join(","),
+                json_string(&cwd),
+                env_names.join(","),
+            )
+        }
+    };
     reader
         .get_mut()
-        .write_all(consult_frame.as_bytes())
+        .write_all(frame.as_bytes())
         .map_err(|_| ())?;
     reader.get_mut().write_all(b"\n").map_err(|_| ())?;
-    let line = read_reply(&mut reader).map_err(|_| ())?;
+    let line = read_reply_bounded(&mut reader, MAX_LIVE_REPLY_BYTES).map_err(|_| ())?;
+    if line.contains("\"kind\":\"rustc-decision\"") {
+        let reply = reply_json::parse(&line).ok_or(())?;
+        return live_outcome(&reply, reader);
+    }
     if consult_succeeded(&line) {
-        Ok(())
+        Ok(Live::PassThrough)
     } else {
         Err(())
     }
@@ -316,15 +711,15 @@ fn consult_succeeded(reply: &str) -> bool {
     !reply.contains("\"mode\":\"shadow-error\"")
 }
 
-fn observe_with_breaker(socket: &str, path: &str, args: &[String]) {
+fn observe_with_breaker(socket: &str, path: &str, args: &[String]) -> Live {
     let Some(_guard) = try_lock_breaker(path) else {
-        return;
+        return Live::PassThrough;
     };
     let policy = BreakerPolicy::default();
     let state = load_state(path);
     let now = now_ms();
     let (state, connect_timeout_ms, decision_timeout_ms) = match decide(&policy, &state, now) {
-        ConnectDecision::SkipToLocal => return,
+        ConnectDecision::SkipToLocal => return Live::PassThrough,
         ConnectDecision::Attempt {
             connect_timeout_ms,
             decision_timeout_ms,
@@ -337,20 +732,130 @@ fn observe_with_breaker(socket: &str, path: &str, args: &[String]) {
             // Ignoring a write failure permits a storm of same-window probes.
             let probing = state.probe_started(now);
             if store_state(path, &probing).is_err() {
-                return;
+                return Live::PassThrough;
             }
             (probing, connect_timeout_ms, decision_timeout_ms)
         }
     };
     let outcome = consult(socket, connect_timeout_ms, decision_timeout_ms, args);
-    let attempt = if outcome.is_ok() {
-        AttemptOutcome::Succeeded
-    } else {
-        AttemptOutcome::Failed
+    let attempt = match &outcome {
+        Ok(Live::FailClosed(_)) | Err(()) => AttemptOutcome::Failed,
+        Ok(_) => AttemptOutcome::Succeeded,
     };
     let _ = store_state(path, &on_outcome(&policy, &state, attempt, now_ms()));
-    // The guard drops BEFORE main execs the compiler. It is never a
+    // The guard drops BEFORE the compiler runs. It is never a
     // compiler-lifetime lock, and contenders never block on its owner.
+    outcome.unwrap_or(Live::PassThrough)
+}
+
+/// Copy a compiler stream to ours as bytes arrive (no buffering beyond
+/// one read), capturing up to `MAX_CAPTURE_BYTES`. Returns the capture and
+/// whether it overflowed.
+fn tee(mut source: impl Read, mut sink: impl Write) -> (Vec<u8>, bool) {
+    let mut captured = Vec::new();
+    let mut overflow = false;
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let read = match source.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => {
+                overflow = true;
+                break;
+            }
+        };
+        let _ = sink.write_all(&buffer[..read]).and_then(|()| sink.flush());
+        if captured.len() + read <= MAX_CAPTURE_BYTES {
+            captured.extend_from_slice(&buffer[..read]);
+        } else {
+            overflow = true;
+        }
+    }
+    (captured, overflow)
+}
+
+/// Terminate exactly as the compiler did: its exit code, or its signal.
+fn exit_like(status: std::process::ExitStatus) -> ! {
+    use std::os::unix::process::ExitStatusExt;
+    if let Some(code) = status.code() {
+        std::process::exit(code);
+    }
+    if let Some(signal) = status.signal() {
+        // Re-raise on ourselves (no unsafe, no extra dependency): the
+        // parent then observes the compiler's signal, not an exit code.
+        let _ = std::process::Command::new("kill")
+            .args(["-s", &signal.to_string(), &std::process::id().to_string()])
+            .status();
+        std::process::exit(128 + signal);
+    }
+    std::process::exit(1);
+}
+
+/// Run the compiler as the admitted attempt: the constructed environment
+/// exactly, streams forwarded live and captured, then one completion frame
+/// on the decision's connection. A capture that overflowed is not
+/// reported; the daemon then settles the attempt without publishing.
+fn run_attempt(
+    real_rustc: &OsStr,
+    args: &[OsString],
+    mut session: BufReader<ConsultStream>,
+    attempt: &str,
+    env: &[(String, String)],
+) -> ! {
+    let mut child = match std::process::Command::new(real_rustc)
+        .args(args)
+        .env_clear()
+        .envs(env.iter().map(|(name, value)| (name, value)))
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => {
+            eprintln!("rabs-wrap: spawn {}: {error}", real_rustc.to_string_lossy());
+            std::process::exit(127);
+        }
+    };
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let out = std::thread::spawn(move || match stdout {
+        Some(pipe) => tee(pipe, io::stdout()),
+        None => (Vec::new(), true),
+    });
+    let err = std::thread::spawn(move || match stderr {
+        Some(pipe) => tee(pipe, io::stderr()),
+        None => (Vec::new(), true),
+    });
+    let status = match child.wait() {
+        Ok(status) => status,
+        Err(error) => {
+            eprintln!("rabs-wrap: wait for compiler: {error}");
+            std::process::exit(1);
+        }
+    };
+    let (stdout, out_overflow) = out.join().unwrap_or((Vec::new(), true));
+    let (stderr, err_overflow) = err.join().unwrap_or((Vec::new(), true));
+    if !out_overflow && !err_overflow {
+        use std::os::unix::process::ExitStatusExt;
+        let number =
+            |value: Option<i32>| value.map_or_else(|| "null".to_owned(), |v| v.to_string());
+        let frame = format!(
+            "{{\"kind\":\"rustc-complete\",\"attempt\":{},\"exit_code\":{},\"signal\":{},\
+             \"stdout_hex\":\"{}\",\"stderr_hex\":\"{}\"}}\n",
+            json_string(attempt),
+            number(status.code()),
+            number(status.signal()),
+            hex_encode(&stdout),
+            hex_encode(&stderr),
+        );
+        // The daemon harvests outputs on its own time; the compile's
+        // caller does not wait for publication.
+        session.get_mut().deadline = Instant::now() + Duration::from_secs(5);
+        let _ = session.get_mut().write_all(frame.as_bytes());
+    }
+    drop(session);
+    exit_like(status);
 }
 
 fn main() {
@@ -369,7 +874,29 @@ fn main() {
         // followed by every rustc argument. Sending only the args would
         // leave the daemon statting `--crate-name` and mislabeling
         // receipts.
-        observe_with_breaker(&socket_path(), &breaker_path(), &consult_argv);
+        match observe_with_breaker(&socket_path(), &breaker_path(), &consult_argv) {
+            Live::PassThrough => {}
+            Live::Served(stderr) => {
+                // The daemon installed and verified every declared output;
+                // this is the compiler's exact transcript for this out-dir.
+                let mut sink = io::stderr();
+                if sink.write_all(&stderr).and_then(|()| sink.flush()).is_err() {
+                    std::process::exit(1);
+                }
+                std::process::exit(0);
+            }
+            Live::Execute {
+                session,
+                attempt,
+                env,
+            } => run_attempt(&real_rustc, &args, *session, &attempt, &env),
+            Live::FailClosed(reason) => {
+                eprintln!(
+                    "rabs-wrap: {reason}; refusing to run rustc over a possibly changing output tree"
+                );
+                std::process::exit(1);
+            }
+        }
     }
 
     // Become the compiler. On success this never returns; exit codes,

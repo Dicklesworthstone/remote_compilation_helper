@@ -671,6 +671,7 @@ fn coordinator_commits_then_quarantines_divergence_under_running_daemon() {
                 state_dir: state_dir.clone(),
                 coord: coord.edge_subscriber(),
                 prepared_operations: None,
+                live_dependency: None,
             },
         )),
         coord_work: Some(coord_work),

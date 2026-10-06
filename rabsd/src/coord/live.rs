@@ -257,6 +257,11 @@ pub enum ServeOutcome {
         /// Why the running build is unproven.
         standing: ReleaseAuthorization,
     },
+    /// Preview only: every gate passed and the complete output plan
+    /// (including subscriber dep-info derivation in private scratch) was
+    /// prepared. Nothing was reserved or installed; a later install request
+    /// re-evaluates every gate under one store lock.
+    Servable,
     /// The committed result does not produce the output set the caller
     /// said its work would produce. NOT a hit: materializing it would
     /// leave the caller's build missing files it was promised, or
@@ -267,6 +272,15 @@ pub enum ServeOutcome {
         /// Present in the commit, not expected by the caller.
         unexpected: Vec<String>,
     },
+}
+
+/// Whether a serve request installs or only evaluates every gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServeMode {
+    /// Reserve destinations and install verified outputs.
+    Install,
+    /// Evaluate gates and prepare the complete plan; write no target file.
+    Preview,
 }
 
 /// What the caller says the work it is about to skip would produce.
@@ -826,29 +840,12 @@ impl ActionDispatch<'_> {
         &self,
         to: rabs_action::state_machines::AttemptState,
     ) -> Result<(), SubmissionRefusal> {
-        use crate::coord::action_actor::AdvanceAttemptReceipt;
         let authority = self
             .authority
             .as_ref()
             .ok_or(SubmissionRefusal::StaleDispatch)?;
-        let mut submissions = self
-            .coord
-            .submissions
-            .lock()
-            .map_err(|_| SubmissionRefusal::Unavailable)?;
-        let entry = submissions
-            .entries
-            .get_mut(&self.key)
-            .ok_or(SubmissionRefusal::StaleDispatch)?;
-        if entry.state != DispatchState::Started(self.serial) {
-            return Err(SubmissionRefusal::StaleDispatch);
-        }
-        match entry.actor.advance_attempt(authority.attempt_id, to) {
-            AdvanceAttemptReceipt::Advanced => Ok(()),
-            refusal => Err(SubmissionRefusal::Admission(format!(
-                "attempt transition: {refusal:?}"
-            ))),
-        }
+        self.coord
+            .advance_started_dispatch(&self.key, self.serial, authority, to)
     }
 
     /// Complete ownership after the worker has confirmed process/stream cleanup
@@ -859,24 +856,8 @@ impl ActionDispatch<'_> {
             .authority
             .as_ref()
             .ok_or(SubmissionRefusal::StaleDispatch)?;
-        let mut submissions = self
-            .coord
-            .submissions
-            .lock()
-            .map_err(|_| SubmissionRefusal::Unavailable)?;
-        let entry = submissions
-            .entries
-            .get_mut(&self.key)
-            .ok_or(SubmissionRefusal::StaleDispatch)?;
-        if entry.state != DispatchState::Started(self.serial)
-            || !entry.actor.attempts().any(|attempt| {
-                attempt.attempt == authority.attempt_id
-                    && attempt.state == rabs_action::state_machines::AttemptState::Finished
-            })
-        {
-            return Err(SubmissionRefusal::StaleDispatch);
-        }
-        entry.state = DispatchState::Finished;
+        self.coord
+            .complete_started_dispatch(&self.key, self.serial, authority)?;
         self.completed = true;
         Ok(())
     }
@@ -884,21 +865,8 @@ impl ActionDispatch<'_> {
 
 impl Drop for ActionDispatch<'_> {
     fn drop(&mut self) {
-        if self.completed {
-            return;
-        }
-        if let Ok(mut submissions) = self.coord.submissions.lock()
-            && let Some(entry) = submissions.entries.get_mut(&self.key)
-        {
-            match entry.state {
-                DispatchState::Claimed(serial) if serial == self.serial => {
-                    entry.state = DispatchState::Queued
-                }
-                DispatchState::Started(serial) if serial == self.serial => {
-                    entry.state = DispatchState::Abandoned
-                }
-                _ => {}
-            }
+        if !self.completed {
+            self.coord.release_dispatch_claim(&self.key, self.serial);
         }
     }
 }
@@ -957,6 +925,7 @@ impl EdgeSubscriber {
             now_unix_micros,
             now_epoch,
             Some(LIVE_SAMPLING_POLICY),
+            ServeMode::Install,
         )
     }
 
@@ -1461,6 +1430,150 @@ impl CoordLive {
         Ok(authority)
     }
 
+    /// Claim the queued execution of ONE known key. The edge's live
+    /// dependency lane executes exactly the action its subscriber asked for;
+    /// it must not take whatever happens to rank first in the shared queue.
+    /// `None` when the key is not queued (another claim or attempt owns it).
+    pub(crate) fn claim_submitted_dispatch(
+        &self,
+        key: &TypedDigest,
+    ) -> Result<Option<u64>, SubmissionRefusal> {
+        if !self.available() {
+            return Err(SubmissionRefusal::Unavailable);
+        }
+        let mut submissions = self
+            .submissions
+            .lock()
+            .map_err(|_| SubmissionRefusal::Unavailable)?;
+        if !submissions
+            .entries
+            .get(key)
+            .is_some_and(|entry| entry.state == DispatchState::Queued)
+        {
+            return Ok(None);
+        }
+        let serial = submissions.next_serial()?;
+        let entry = submissions
+            .entries
+            .get_mut(key)
+            .ok_or(SubmissionRefusal::StaleDispatch)?;
+        entry.state = DispatchState::Claimed(serial);
+        Ok(Some(serial))
+    }
+
+    /// Admit a claimed dispatch: durable generation, attempt and lease.
+    pub(crate) fn begin_claimed_dispatch(
+        &self,
+        key: &TypedDigest,
+        serial: u64,
+        worker: &WorkerSessionOffer,
+        lease_ttl_ms: u64,
+    ) -> Result<AttemptAuthority, SubmissionRefusal> {
+        self.begin_submitted_dispatch(key, serial, worker, lease_ttl_ms)
+    }
+
+    /// One observed attempt transition through the actor machine, for the
+    /// dispatch claim `(key, serial)` that started `authority`.
+    pub(crate) fn advance_started_dispatch(
+        &self,
+        key: &TypedDigest,
+        serial: u64,
+        authority: &AttemptAuthority,
+        to: rabs_action::state_machines::AttemptState,
+    ) -> Result<(), SubmissionRefusal> {
+        use crate::coord::action_actor::AdvanceAttemptReceipt;
+        let mut submissions = self
+            .submissions
+            .lock()
+            .map_err(|_| SubmissionRefusal::Unavailable)?;
+        let entry = submissions
+            .entries
+            .get_mut(key)
+            .ok_or(SubmissionRefusal::StaleDispatch)?;
+        if entry.state != DispatchState::Started(serial) {
+            return Err(SubmissionRefusal::StaleDispatch);
+        }
+        match entry.actor.advance_attempt(authority.attempt_id, to) {
+            AdvanceAttemptReceipt::Advanced => Ok(()),
+            refusal => Err(SubmissionRefusal::Admission(format!(
+                "attempt transition: {refusal:?}"
+            ))),
+        }
+    }
+
+    /// Mark a started dispatch finished once its attempt reached `Finished`.
+    pub(crate) fn complete_started_dispatch(
+        &self,
+        key: &TypedDigest,
+        serial: u64,
+        authority: &AttemptAuthority,
+    ) -> Result<(), SubmissionRefusal> {
+        let mut submissions = self
+            .submissions
+            .lock()
+            .map_err(|_| SubmissionRefusal::Unavailable)?;
+        let entry = submissions
+            .entries
+            .get_mut(key)
+            .ok_or(SubmissionRefusal::StaleDispatch)?;
+        if entry.state != DispatchState::Started(serial)
+            || !entry.actor.attempts().any(|attempt| {
+                attempt.attempt == authority.attempt_id
+                    && attempt.state == rabs_action::state_machines::AttemptState::Finished
+            })
+        {
+            return Err(SubmissionRefusal::StaleDispatch);
+        }
+        entry.state = DispatchState::Finished;
+        Ok(())
+    }
+
+    /// Drop semantics of an unconfirmed claim: before admission the queue
+    /// regains it; after admission it is abandoned pending reconciliation,
+    /// never silently retried.
+    pub(crate) fn release_dispatch_claim(&self, key: &TypedDigest, serial: u64) {
+        if let Ok(mut submissions) = self.submissions.lock()
+            && let Some(entry) = submissions.entries.get_mut(key)
+        {
+            match entry.state {
+                DispatchState::Claimed(claimed) if claimed == serial => {
+                    entry.state = DispatchState::Queued;
+                }
+                DispatchState::Started(started) if started == serial => {
+                    entry.state = DispatchState::Abandoned;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// The mounted store, for coordinator-side lanes in this crate.
+    pub(crate) fn live_cas(&self) -> Option<&Arc<LiveCas>> {
+        self.cas.as_ref()
+    }
+
+    /// Serve under the edge's live evidence/sampling floor (the same gate
+    /// [`EdgeSubscriber::serve_action`] applies). `ServeMode::Preview`
+    /// answers [`ServeOutcome::Servable`] instead of installing.
+    pub(crate) fn serve_for_subscriber(
+        &self,
+        action_key: &TypedDigest,
+        destination_root: &Path,
+        expected: &ExpectedOutputs,
+        now_unix_micros: i64,
+        mode: ServeMode,
+    ) -> Result<ServeOutcome, ServeError> {
+        self.serve_action_inner(
+            action_key,
+            destination_root,
+            expected,
+            now_unix_micros,
+            0,
+            Some(LIVE_SAMPLING_POLICY),
+            mode,
+        )
+    }
+
     /// Read-only actor observation for subscriber delivery/diagnostics. Mutating
     /// this copy cannot mutate the coordinator or grant another dispatch.
     pub fn submitted_actor(
@@ -1862,9 +1975,11 @@ impl CoordLive {
             now_unix_micros,
             now_epoch,
             None,
+            ServeMode::Install,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn serve_action_inner(
         &self,
         action_key: &TypedDigest,
@@ -1873,6 +1988,7 @@ impl CoordLive {
         now_unix_micros: i64,
         now_epoch: u64,
         sampling: Option<SamplingPolicy>,
+        mode: ServeMode,
     ) -> Result<ServeOutcome, ServeError> {
         // Take the authority snapshot BEFORE the store lock, preserving the
         // existing authority -> store lock order during coordinator startup.
@@ -1961,6 +2077,9 @@ impl CoordLive {
                 Ok(plan) => plan,
                 Err(outcome) => return Ok(outcome),
             };
+        if mode == ServeMode::Preview {
+            return Ok(ServeOutcome::Servable);
+        }
         if plan.outputs.is_empty() {
             return Ok(ServeOutcome::Served { files: Vec::new() });
         }

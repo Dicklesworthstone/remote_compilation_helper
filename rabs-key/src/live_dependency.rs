@@ -703,15 +703,36 @@ fn artifacts_component(
     Ok(compute(DOMAIN_LIVE_ARTIFACTS, &enc.finish()))
 }
 
+/// Normalizer identity for dynamic-library search paths: Cargo prepends
+/// the invocation's out-dir to `LD_LIBRARY_PATH` for rustc, which is the
+/// same placement fact as `--out-dir` and is virtualized the same way.
+pub const DYLIB_PATH_NORMALIZER: &str = "live-dependency.dylib-path-out-dir.v1";
+
 fn environment_component(plan: &DependencyActionPlan) -> Result<TypedDigest, LiveRefusal> {
     let mut variables: Vec<(Vec<u8>, EnvDisposition)> = plan
         .keyed_env
         .iter()
         .map(|(name, value)| {
-            (
-                name.as_bytes().to_vec(),
-                EnvDisposition::SemanticHashed(value.as_bytes().to_vec()),
-            )
+            let disposition = if name == "LD_LIBRARY_PATH" {
+                EnvDisposition::SemanticNormalized {
+                    normalizer: DYLIB_PATH_NORMALIZER.to_owned(),
+                    normalized: value
+                        .split(':')
+                        .map(|entry| {
+                            if entry == plan.out_dir {
+                                CANONICAL_OUT_DIR
+                            } else {
+                                entry
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(":")
+                        .into_bytes(),
+                }
+            } else {
+                EnvDisposition::SemanticHashed(value.as_bytes().to_vec())
+            };
+            (name.as_bytes().to_vec(), disposition)
         })
         .collect();
     for (name, _) in &plan.execution_env {
@@ -915,10 +936,16 @@ fn replace_all(haystack: &[u8], needle: &[u8], replacement: &[u8]) -> Vec<u8> {
 /// rule target must be inside the out-dir, every source dependency inside
 /// the package root, and every tracked environment read (`# env-dep:`)
 /// must name a variable the key covers (keyed) or one the constructed
-/// environment removed. Returns the first violation, or `None` when the
-/// observed reads are inside the keyed closure.
+/// environment removed. `is_input` answers whether a package-relative
+/// path is a member of the keyed input manifest: a read of a package file
+/// the key does not cover is a violation too. Returns the first
+/// violation, or `None` when the observed reads are inside the closure.
 #[must_use]
-pub fn dep_info_closure_violation(plan: &DependencyActionPlan, dep_info: &[u8]) -> Option<String> {
+pub fn dep_info_closure_violation(
+    plan: &DependencyActionPlan,
+    dep_info: &[u8],
+    is_input: impl Fn(&str) -> bool,
+) -> Option<String> {
     let Ok(text) = std::str::from_utf8(dep_info) else {
         return Some("dep-info is not UTF-8".into());
     };
@@ -972,6 +999,10 @@ pub fn dep_info_closure_violation(plan: &DependencyActionPlan, dep_info: &[u8]) 
                 || !within(&absolute, &plan.package_root)
             {
                 return Some(format!("read outside the package: {dep}"));
+            }
+            let relative = &absolute[plan.package_root.len() + 1..];
+            if !is_input(relative) {
+                return Some(format!("read of an unkeyed package file: {dep}"));
             }
         }
     }
@@ -1123,6 +1154,29 @@ mod tests {
         let b = plan_for(OUT_B, &[], &[]).unwrap();
         assert_eq!(a.out_dir, OUT_A);
         assert_eq!(key(&a), key(&b));
+        // Cargo prepends the out-dir to rustc's LD_LIBRARY_PATH (observed
+        // live): that entry is placement too, every other entry keys.
+        let dylib = |out: &str, toolchain: &str| {
+            key(&plan_for(
+                out,
+                &[],
+                &[("LD_LIBRARY_PATH", &format!("{out}:{toolchain}"))],
+            )
+            .unwrap())
+        };
+        assert_eq!(dylib(OUT_A, "/tc/lib"), dylib(OUT_B, "/tc/lib"));
+        assert_ne!(dylib(OUT_A, "/tc/lib"), dylib(OUT_A, "/other/lib"));
+        // The executed environment keeps the real value.
+        let real = plan_for(
+            OUT_A,
+            &[],
+            &[("LD_LIBRARY_PATH", &format!("{OUT_A}:/tc/lib"))],
+        )
+        .unwrap();
+        assert!(
+            real.execution_env
+                .contains(&("LD_LIBRARY_PATH".to_owned(), format!("{OUT_A}:/tc/lib")))
+        );
         assert_eq!(
             a.output_names(),
             vec![
@@ -1368,14 +1422,19 @@ mod tests {
              {PACKAGE}/src/lib.rs:\n{PACKAGE}/src/udiv128.rs:\n\n\
              # env-dep:CARGO_PKG_VERSION=1.0.15\n# env-dep:SCRUBBED_VAR\n"
         );
-        assert_eq!(dep_info_closure_violation(&plan, good.as_bytes()), None);
+        let keyed = |relative: &str| matches!(relative, "src/lib.rs" | "src/udiv128.rs");
+        let check = |dep_info: &str| dep_info_closure_violation(&plan, dep_info.as_bytes(), keyed);
+        assert_eq!(check(&good), None);
         let escaped = format!("{OUT_A}/libitoa-1.rmeta: {PACKAGE}/src/lib.rs /etc/passwd\n");
-        assert!(dep_info_closure_violation(&plan, escaped.as_bytes()).is_some());
+        assert!(check(&escaped).is_some());
         let traversal = format!("{OUT_A}/libitoa-1.rmeta: {PACKAGE}/../x/lib.rs\n");
-        assert!(dep_info_closure_violation(&plan, traversal.as_bytes()).is_some());
+        assert!(check(&traversal).is_some());
         let unkeyed = format!("{OUT_A}/x.d: {PACKAGE}/src/lib.rs\n# env-dep:CARGO_MAKEFLAGS=-j\n");
-        assert!(dep_info_closure_violation(&plan, unkeyed.as_bytes()).is_some());
+        assert!(check(&unkeyed).is_some());
         let foreign_target = format!("/tmp/x.rmeta: {PACKAGE}/src/lib.rs\n");
-        assert!(dep_info_closure_violation(&plan, foreign_target.as_bytes()).is_some());
+        assert!(check(&foreign_target).is_some());
+        // A package file the input manifest does not cover.
+        let uncovered = format!("{OUT_A}/libitoa-1.rmeta: {PACKAGE}/src/generated.rs\n");
+        assert!(check(&uncovered).is_some());
     }
 }
