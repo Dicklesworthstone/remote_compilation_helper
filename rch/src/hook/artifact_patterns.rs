@@ -39,7 +39,7 @@
 //! module and stays private.
 
 pub(super) mod cargo_bins;
-mod direct_compiler;
+pub(super) mod direct_compiler;
 
 use super::command_parsing::{cargo_build_only_test, cargo_custom_profile_output_dir};
 use super::*;

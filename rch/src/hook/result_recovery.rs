@@ -295,6 +295,7 @@ mod tests {
             custom_target: false,
             output_gate: false,
             cargo_outputs: None,
+            native_outputs: None,
             baseline: BTreeMap::new(),
             published: BTreeMap::new(),
             pending: None,

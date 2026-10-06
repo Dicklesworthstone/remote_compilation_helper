@@ -5674,6 +5674,27 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         }
     }
 
+    /// Exercise the production retrieval arguments with an owned local worker
+    /// tree in filesystem integration tests. Only the source operand changes;
+    /// no SSH connection or remote execution is claimed by these tests.
+    #[cfg(test)]
+    pub(crate) fn local_artifact_retrieval_for_test(
+        &self,
+        worker: &WorkerConfig,
+        source: &Path,
+        artifact_patterns: &[String],
+    ) -> Command {
+        let planned =
+            self.build_retrieve_command(worker, source.to_str().unwrap(), artifact_patterns);
+        let planned = planned.as_std();
+        let args: Vec<_> = planned.get_args().collect();
+        let mut command = Command::new(planned.get_program());
+        command.args(&args[..args.len() - 2]);
+        command.arg(format!("{}/", source.display()));
+        command.arg(args.last().unwrap());
+        command
+    }
+
     /// Build rsync command for retrieve_artifacts.
     fn build_retrieve_command(
         &self,

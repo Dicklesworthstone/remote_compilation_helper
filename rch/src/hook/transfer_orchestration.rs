@@ -2032,11 +2032,19 @@ async fn execute_remote_compilation_inner(
         // custom target dir exists to protect, and a failed stale-residue pull
         // spuriously fails an otherwise-complete build (rch#30). For cargo
         // build/doc/rustc the filtered list is empty, so the phase is skipped.
-        let mut artifact_patterns = get_project_artifact_patterns(
-            kind,
-            Some(policy_command),
-            forwarded_cargo_target_dir.is_some(),
-        );
+        let mut artifact_patterns = match recovery_session
+            .as_ref()
+            .filter(|session| session.has_native_output_contract())
+        {
+            // The persisted contract determines whether native retrieval is
+            // required, including explicit outputs underneath target/.
+            Some(session) => session.cargo_artifact_patterns("project")?,
+            None => get_project_artifact_patterns(
+                kind,
+                Some(policy_command),
+                forwarded_cargo_target_dir.is_some(),
+            ),
+        };
         if !artifact_patterns.is_empty() {
             if let Some(session) = recovery_session.as_ref() {
                 artifact_patterns = session.cargo_artifact_patterns("project")?;
@@ -2177,8 +2185,16 @@ async fn execute_remote_compilation_inner(
 
         if let Some(local_target_dir) = forwarded_cargo_target_dir.as_ref() {
             let remote_target_path = pipeline.remote_cargo_target_dir();
-            let mut custom_patterns =
-                get_custom_target_artifact_patterns(kind, Some(policy_command));
+            let mut custom_patterns = if recovery_session
+                .as_ref()
+                .is_some_and(recovery::RecoverySession::has_native_output_contract)
+            {
+                // Native compiler outputs belong to the project phase even
+                // when the caller forwards an unrelated CARGO_TARGET_DIR.
+                Vec::new()
+            } else {
+                get_custom_target_artifact_patterns(kind, Some(policy_command))
+            };
             if custom_patterns.is_empty() {
                 reporter.verbose(&format!(
                     "[RCH] custom target dir sync skipped for {} after command with no target artifacts",

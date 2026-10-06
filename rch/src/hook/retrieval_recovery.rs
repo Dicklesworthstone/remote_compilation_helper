@@ -1,4 +1,7 @@
 //! Durable source ownership and identity-bound collection. Never replays a command.
+use super::super::artifact_patterns::direct_compiler::{
+    NativeOutputContract, native_output_contract,
+};
 use super::super::cargo_output_contract::{CargoOutputCapture, CargoOutputContract};
 use super::*;
 use serde::{Deserialize, Serialize};
@@ -69,6 +72,10 @@ struct RecoveryPhase {
     output_gate: bool,
     #[serde(default)]
     cargo_outputs: Option<CargoOutputContract>,
+    /// Exact native-driver files, known before execution and independent of
+    /// Cargo's target directory or target-root output gate.
+    #[serde(default)]
+    native_outputs: Option<NativeOutputContract>,
     baseline: BTreeMap<PathBuf, String>,
     published: BTreeMap<PathBuf, String>,
     #[serde(default)]
@@ -372,7 +379,14 @@ impl RecoverySession {
             identity
         );
         let mut phases = Vec::new();
-        let project_patterns = get_project_artifact_patterns(kind, Some(command), target.is_some());
+        let native_outputs = (!WorkerPlatform::from_worker(worker).is_windows())
+            .then(|| native_output_contract(kind, command, true))
+            .flatten();
+        let project_patterns = match &native_outputs {
+            Some(contract) => contract.patterns()?,
+            None => get_project_artifact_patterns(kind, Some(command), target.is_some()),
+        };
+        let native_project_outputs = native_outputs.is_some();
         if !project_patterns.is_empty() {
             phases.push(RecoveryPhase {
                 name: "project".into(),
@@ -383,6 +397,7 @@ impl RecoverySession {
                 custom_target: false,
                 output_gate: target.is_none(),
                 cargo_outputs: None,
+                native_outputs,
                 baseline: BTreeMap::new(),
                 published: BTreeMap::new(),
                 pending: None,
@@ -390,7 +405,7 @@ impl RecoverySession {
                 missing_result: None,
             });
         }
-        if let Some(target) = target {
+        if let Some(target) = target.filter(|_| !native_project_outputs) {
             let patterns = get_custom_target_artifact_patterns(kind, Some(command));
             if !patterns.is_empty() {
                 phases.push(RecoveryPhase {
@@ -402,6 +417,7 @@ impl RecoverySession {
                     custom_target: true,
                     output_gate: true,
                     cargo_outputs: None,
+                    native_outputs: None,
                     baseline: BTreeMap::new(),
                     published: BTreeMap::new(),
                     pending: None,
@@ -420,6 +436,7 @@ impl RecoverySession {
                 custom_target: false,
                 output_gate: false,
                 cargo_outputs: None,
+                native_outputs: None,
                 baseline: BTreeMap::new(),
                 published: BTreeMap::new(),
                 pending: None,
@@ -619,6 +636,18 @@ impl RecoverySession {
             .map(|phase| phase.patterns.clone())
             .context("missing retrieval phase")
     }
+    pub(crate) fn has_native_output_contract(&self) -> bool {
+        self.recipe
+            .phases
+            .iter()
+            .any(|phase| phase.native_outputs.is_some())
+    }
+    fn verify_native_outputs(&self, index: usize) -> anyhow::Result<()> {
+        if let Some(contract) = &self.recipe.phases[index].native_outputs {
+            contract.verify_staged(&self.stage(index))?;
+        }
+        Ok(())
+    }
     fn verify_cargo_outputs(&self, index: usize) -> anyhow::Result<()> {
         let phase = &self.recipe.phases[index];
         if self.recipe.cargo_output_capture.is_none() || !phase.output_gate {
@@ -703,6 +732,7 @@ impl RecoverySession {
         // mutation. One executable or support library cannot satisfy another
         // selected Cargo target, and existing destination files are no proof.
         self.verify_cargo_outputs(index)?;
+        self.verify_native_outputs(index)?;
         let stage = self.stage(index);
         let mut files = regular_files(&stage)?;
         let phase = &self.recipe.phases[index];
@@ -854,6 +884,15 @@ impl RecoverySession {
         Ok(())
     }
     pub(crate) fn returned(&mut self, exit: i32) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            exit != 0
+                || self
+                    .recipe
+                    .phases
+                    .iter()
+                    .all(|phase| { phase.native_outputs.is_none() || phase.complete }),
+            "native compilation cannot succeed before every required output is published"
+        );
         anyhow::ensure!(
             !result_recovery::has_missing_results(&self.recipe)
                 || exit == EXIT_ARTIFACT_TRANSFER_FAILED,
@@ -1009,6 +1048,12 @@ impl RecoverySession {
     /// strands a few small files and must never fail the finished build.
     fn retain_failed_delivery_evidence(&self) -> bool {
         result_recovery::has_missing_results(&self.recipe)
+            || (self.recipe.exit_code == Some(0)
+                && self
+                    .recipe
+                    .phases
+                    .iter()
+                    .any(|phase| phase.native_outputs.is_some() && !phase.complete))
             || (self.recipe.cargo_output_capture.is_some()
                 && self.recipe.exit_code == Some(0)
                 && self
@@ -1071,6 +1116,20 @@ fn load_recipe(writer: &DurableLeaseWriter) -> anyhow::Result<RecoveryRecipe> {
         "Cargo output evidence is attached to an unrelated recovery phase"
     );
     result_recovery::validate_missing_results(&recipe)?;
+    for phase in &recipe.phases {
+        if let Some(contract) = &phase.native_outputs {
+            anyhow::ensure!(
+                recipe.prepared
+                    && phase.name == "project"
+                    && phase.result_dir.is_none()
+                    && !phase.custom_target
+                    && phase.local == recipe.project_root
+                    && !WorkerPlatform::from_worker(&recipe.worker).is_windows()
+                    && contract.patterns()? == phase.patterns,
+                "native output contract is attached to an unrelated recovery phase"
+            );
+        }
+    }
     Ok(recipe)
 }
 
@@ -1365,6 +1424,14 @@ async fn recover_job_with_daemon(
                 }
                 Err(error) => return Err(error),
             };
+            if let Err(error) = session.verify_native_outputs(index) {
+                eprintln!(
+                    "[RCH] recovered native outputs are incomplete: {error:#}; \
+                     no build artifacts published (exit {EXIT_ARTIFACT_TRANSFER_FAILED})"
+                );
+                exit = EXIT_ARTIFACT_TRANSFER_FAILED;
+                break;
+            }
             if phase.output_gate {
                 // A rejected output set is a terminal build failure, exactly
                 // as on the live path, not a recovery error: the remote outputs
@@ -1451,6 +1518,12 @@ mod tests {
     use super::*;
 
     fn preparation_fixture() -> (tempfile::TempDir, DurableLeaseWriter, WorkerConfig) {
+        preparation_fixture_with_identity("abc123")
+    }
+
+    fn preparation_fixture_with_identity(
+        identity: &str,
+    ) -> (tempfile::TempDir, DurableLeaseWriter, WorkerConfig) {
         let directory = tempfile::tempdir().unwrap();
         let worker = WorkerConfig {
             id: WorkerId::new("source-recovery"),
@@ -1484,10 +1557,225 @@ mod tests {
             None,
             TransferConfig::default(),
             directory.path().to_owned(),
-            "abc123".into(),
+            identity.into(),
         )
         .unwrap();
         (directory, writer, worker)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn real_native_outputs_are_complete_before_publication_and_survive_recovery() {
+        use tokio::process::Command;
+        async fn run(command: &mut Command) -> std::process::Output {
+            command.stdin(Stdio::null()).kill_on_drop(true);
+            let output = tokio::time::timeout(Duration::from_secs(20), command.output())
+                .await
+                .expect("native output fixture exceeded its bound")
+                .expect("GCC and rsync are required for the native delivery regression");
+            assert!(output.status.success(), "{output:?}");
+            output
+        }
+
+        let _guard = test_guard!();
+        for (argv, expected, missing_index) in [
+            (vec!["main.c", "lib/helper.c"], vec!["a.out"], 0),
+            (
+                vec!["-c", "main.c", "lib/helper.c"],
+                vec!["helper.o", "main.o"],
+                1,
+            ),
+            (
+                vec!["-S", "main.c", "lib/helper.c"],
+                vec!["helper.s", "main.s"],
+                1,
+            ),
+            (
+                vec![
+                    "main.c",
+                    "lib/helper.c",
+                    "-o",
+                    "products/app[dev]*?",
+                    "-MMD",
+                    "-MF",
+                    "products/app.d",
+                ],
+                vec!["products/app.d", "products/app[dev]*?"],
+                1,
+            ),
+            (
+                vec![
+                    "main.c",
+                    "lib/helper.c",
+                    "-o",
+                    "target/app[dev]*?",
+                    "-MMD",
+                    "-MF",
+                    "target/app.d",
+                ],
+                vec!["target/app.d", "target/app[dev]*?"],
+                0,
+            ),
+        ] {
+            let identity = format!("native-output-{}", uuid::Uuid::new_v4());
+            let (_owner, writer, worker) = preparation_fixture_with_identity(&identity);
+            let base = writer.path.parent().unwrap();
+            let local = base.join("checkout");
+            let remote = base.join("worker");
+            let partial = base.join("partial-worker");
+            let unrelated_target = base.join("unrelated-cargo-target");
+            for path in [&local, &remote, &partial, &unrelated_target] {
+                std::fs::create_dir_all(path.join("products")).unwrap();
+                std::fs::create_dir_all(path.join("target")).unwrap();
+            }
+            std::fs::create_dir(remote.join("lib")).unwrap();
+            std::fs::write(remote.join("main.c"),
+                b"#include <stdio.h>\nint helper(void); int main(void) { printf(\"native-%d\\n\", helper()); return 0; }\n").unwrap();
+            std::fs::write(
+                remote.join("lib/helper.c"),
+                b"int helper(void) { return 37; }\n",
+            )
+            .unwrap();
+            std::fs::write(local.join("main.c"), b"local source sentinel").unwrap();
+            std::fs::write(local.join("foreign.o"), b"other job's object").unwrap();
+            std::fs::write(unrelated_target.join("sentinel"), b"unrelated Cargo target").unwrap();
+            for relative in &expected {
+                std::fs::write(local.join(relative), b"old local output").unwrap();
+            }
+            let command = shell_words::join(std::iter::once("gcc").chain(argv.iter().copied()));
+            let pipeline = TransferPipeline::new(
+                local.clone(),
+                "native-fixture".into(),
+                identity.clone(),
+                TransferConfig::default(),
+            )
+            .with_remote_path_override(remote.to_str().unwrap().to_owned());
+            let mut session = RecoverySession::prepare(
+                &writer,
+                &worker,
+                &pipeline,
+                vec!["/data/projects/source-recovery".into()],
+                None,
+                None,
+                TransferConfig::default(),
+                local.clone(),
+                Some(&unrelated_target),
+                Some(CompilationKind::Gcc),
+                &command,
+                &[],
+                identity,
+            )
+            .unwrap();
+            assert!(session.has_native_output_contract());
+            assert_eq!(
+                session.recipe.phases.len(),
+                1,
+                "ambient Cargo target must not displace native outputs"
+            );
+            assert_eq!(session.recipe.phases[0].name, "project");
+            assert!(
+                !session.recipe.phases[0].output_gate,
+                "native completeness is independent of Cargo gating"
+            );
+            assert!(
+                session.returned(0).is_err(),
+                "pre-execution contract already forbids empty success"
+            );
+            session.starting_execution().unwrap();
+            let mut compiler = Command::new("gcc");
+            compiler
+                .args(&argv)
+                .current_dir(&remote)
+                .env_remove("DEPENDENCIES_OUTPUT")
+                .env_remove("SUNPRO_DEPENDENCIES");
+            run(&mut compiler).await;
+            session.completed(0).unwrap();
+            let mut session = reload_publication(&session);
+            assert_eq!(
+                session.recipe.phases[0]
+                    .native_outputs
+                    .as_ref()
+                    .unwrap()
+                    .required_files,
+                expected
+                    .iter()
+                    .map(PathBuf::from)
+                    .collect::<std::collections::BTreeSet<_>>()
+            );
+
+            // A successful local rsync from this incomplete worker view must
+            // not turn one object/depfile into proof of the entire contract.
+            let missing = &expected[missing_index];
+            for relative in expected.iter().filter(|relative| *relative != missing) {
+                std::fs::copy(remote.join(relative), partial.join(relative)).unwrap();
+            }
+            for root in [&remote, &partial] {
+                std::fs::write(root.join("foreign.o"), b"unrelated remote object").unwrap();
+                std::fs::write(root.join("source.c"), b"unselected remote source").unwrap();
+            }
+            for complete in [false, true] {
+                let stage = session.stage(0);
+                let staged = session.staging_pipeline("project", &pipeline).unwrap();
+                let patterns = session.cargo_artifact_patterns("project").unwrap();
+                let mut rsync = staged.local_artifact_retrieval_for_test(
+                    &worker,
+                    if complete { &remote } else { &partial },
+                    &patterns,
+                );
+                run(&mut rsync).await;
+                assert!(!stage.join("foreign.o").exists());
+                assert!(!stage.join("source.c").exists());
+                let journal_before = std::fs::read(&writer.path).unwrap();
+                if !complete {
+                    assert!(session.publish("project").await.is_err());
+                    assert_eq!(
+                        std::fs::read(&writer.path).unwrap(),
+                        journal_before,
+                        "no durable publication frontier crossed"
+                    );
+                    assert!(session.returned(0).is_err());
+                    assert!(session.retain_failed_delivery_evidence());
+                    for relative in &expected {
+                        assert_eq!(
+                            std::fs::read(local.join(relative)).unwrap(),
+                            b"old local output"
+                        );
+                    }
+                    session = reload_publication(&session);
+                    assert!(session.recipe.phases[0].published.is_empty());
+                    assert!(session.recipe.phases[0].pending.is_none());
+                } else {
+                    session.publish("project").await.unwrap();
+                    session.returned(0).unwrap();
+                    session = reload_publication(&session);
+                    assert!(session.recipe.phases[0].complete);
+                    assert_eq!(session.recipe.phases[0].published.len(), expected.len());
+                    session.publish("project").await.unwrap();
+                    for relative in &expected {
+                        assert_eq!(
+                            std::fs::read(local.join(relative)).unwrap(),
+                            std::fs::read(remote.join(relative)).unwrap()
+                        );
+                    }
+                    if argv[0] != "-c" && argv[0] != "-S" {
+                        let mut executable = Command::new(local.join(expected.last().unwrap()));
+                        assert_eq!(run(&mut executable).await.stdout, b"native-37\n");
+                    }
+                }
+            }
+            assert_eq!(
+                std::fs::read(local.join("main.c")).unwrap(),
+                b"local source sentinel"
+            );
+            assert_eq!(
+                std::fs::read(local.join("foreign.o")).unwrap(),
+                b"other job's object"
+            );
+            assert_eq!(
+                std::fs::read(unrelated_target.join("sentinel")).unwrap(),
+                b"unrelated Cargo target"
+            );
+        }
     }
 
     fn publication_fixture() -> (tempfile::TempDir, tempfile::TempDir, RecoverySession) {
@@ -1517,6 +1805,7 @@ mod tests {
             custom_target: false,
             output_gate: false,
             cargo_outputs: None,
+            native_outputs: None,
             baseline: BTreeMap::new(),
             published: BTreeMap::new(),
             pending: None,
