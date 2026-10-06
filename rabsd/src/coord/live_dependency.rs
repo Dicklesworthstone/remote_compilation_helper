@@ -290,15 +290,13 @@ fn object_id(bytes: &[u8]) -> Result<TypedDigest, String> {
         .map_err(|error| format!("digest: {error:?}"))
 }
 
-fn put_bytes(
-    cas: &crate::janitor::store::LiveCas,
-    store: &mut dyn RabsMetadataStore,
-    bytes: &[u8],
-) -> Result<ObjectId, String> {
+/// Durably store one object. The store lock is held for this object only.
+fn put_bytes(cas: &crate::janitor::store::LiveCas, bytes: &[u8]) -> Result<ObjectId, String> {
     let id = object_id(bytes)?;
+    let mut store = cas.store().lock().map_err(|_| "store lock poisoned")?;
     put_if_absent(
         cas.layout(),
-        store,
+        &mut *store,
         &id,
         &mut &bytes[..],
         PutLimits {
@@ -316,7 +314,6 @@ fn put_bytes(
 /// the complete closure, including the root, to be durable).
 fn put_bundle_root(
     cas: &crate::janitor::store::LiveCas,
-    store: &mut dyn RabsMetadataStore,
     outputs: &[LogicalOutput],
 ) -> Result<(), String> {
     use std::io::Write;
@@ -324,6 +321,9 @@ fn put_bundle_root(
         .ok_or("an empty output map has no bundle root")?;
     let root = rabs_key::logical_output_map::compute_bundle_root(outputs)
         .ok_or("an empty output map has no bundle root")?;
+    // Held through the write and the location record: a concurrent
+    // completion of the same result must not race the staging name.
+    let mut store = cas.store().lock().map_err(|_| "store lock poisoned")?;
     if store
         .object_durably_located(&root.0)
         .map_err(|error| format!("{error:?}"))?
@@ -747,10 +747,12 @@ impl LocalAttempt {
         // Lock order is submissions -> store everywhere in the coordinator:
         // never advance the attempt while holding the store.
         self.advance(AttemptState::UploadingOutputs)?;
+        // Each put takes the store lock for itself only: decisions for other
+        // compiles must not queue behind a whole completion's fsyncs. The
+        // commit transaction re-verifies the complete durable closure.
         let (transcript_id, evidence_parts) = {
-            let mut store = cas.store().lock().map_err(|_| "store lock poisoned")?;
             for (declaration, path, sig, bytes) in &harvested {
-                let object = put_bytes(cas, &mut *store, bytes)?;
+                let object = put_bytes(cas, bytes)?;
                 if declaration.class != OutputClass::DepInfo {
                     known.push(KnownOutput {
                         path: path.clone(),
@@ -764,8 +766,8 @@ impl LocalAttempt {
                     object,
                 });
             }
-            put_bundle_root(cas, &mut *store, &logical_outputs)?;
-            let transcript_id = put_bytes(cas, &mut *store, &transcript)?;
+            put_bundle_root(cas, &logical_outputs)?;
+            let transcript_id = put_bytes(cas, &transcript)?;
             let hex =
                 |bytes: &[u8]| -> String { bytes.iter().map(|b| format!("{b:02x}")).collect() };
             let snapshot = serde_json::to_vec(&serde_json::json!({
@@ -802,10 +804,10 @@ impl LocalAttempt {
             }))
             .map_err(|error| error.to_string())?;
             let parts = [
-                put_bytes(cas, &mut *store, &snapshot)?,
-                put_bytes(cas, &mut *store, &observed)?,
-                put_bytes(cas, &mut *store, &process)?,
-                put_bytes(cas, &mut *store, &provenance)?,
+                put_bytes(cas, &snapshot)?,
+                put_bytes(cas, &observed)?,
+                put_bytes(cas, &process)?,
+                put_bytes(cas, &provenance)?,
             ];
             (transcript_id, parts)
         };
@@ -862,12 +864,8 @@ impl LocalAttempt {
             }))
             .map_err(|error| error.to_string())
         };
-        let (manifest_id, evidence_id) = {
-            let mut store = cas.store().lock().map_err(|_| "store lock poisoned")?;
-            let manifest_id = put_bytes(cas, &mut *store, &manifest_bytes)?;
-            let evidence_id = put_bytes(cas, &mut *store, &evidence_bytes(&manifest_id)?)?;
-            (manifest_id, evidence_id)
-        };
+        let manifest_id = put_bytes(cas, &manifest_bytes)?;
+        let evidence_id = put_bytes(cas, &evidence_bytes(&manifest_id)?)?;
         let offer = OfferPreparedActionResult::build(
             authority,
             stamped.manifest,

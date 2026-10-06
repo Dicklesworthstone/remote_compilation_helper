@@ -46,9 +46,14 @@ const CONTROL_WORKERS: usize = 2;
 const SHADOW_WORKERS: usize = 4;
 const MATERIALIZATION_WORKERS: usize = 2;
 const PREPARED_ADMISSION_WORKERS: usize = 2;
-/// Live dependency decisions and completions (observation, hashing,
-/// uploads, publication). Saturation answers pass-through, never waits.
-const LIVE_DEPENDENCY_WORKERS: usize = 4;
+/// Live dependency decisions and hit installs: a compiler is waiting on
+/// each. Saturation answers pass-through, never waits.
+const LIVE_DECISION_WORKERS: usize = 8;
+/// Live dependency completions (harvest, durable uploads, publication).
+/// Nobody waits on these — the wrapper has already exited — so they get
+/// their own, larger lane instead of crowding out decisions (observed live
+/// under `cargo -j4`: a shared lane saturated and refused decisions).
+const LIVE_COMPLETION_WORKERS: usize = 8;
 /// How long an admitted local execution may run before its completion
 /// frame must arrive (the attempt lease is longer still).
 const LOCAL_EXECUTION_BUDGET: Duration = Duration::from_secs(2 * 60 * 60);
@@ -61,6 +66,7 @@ struct EdgeLimits {
     materialization: Limit,
     prepared_admission: Limit,
     live: Limit,
+    live_completion: Limit,
 }
 impl EdgeLimits {
     fn new() -> Self {
@@ -70,7 +76,8 @@ impl EdgeLimits {
             shadow: Limit::new(SHADOW_WORKERS),
             materialization: Limit::new(MATERIALIZATION_WORKERS),
             prepared_admission: Limit::new(PREPARED_ADMISSION_WORKERS),
-            live: Limit::new(LIVE_DEPENDENCY_WORKERS),
+            live: Limit::new(LIVE_DECISION_WORKERS),
+            live_completion: Limit::new(LIVE_COMPLETION_WORKERS),
         }
     }
 }
@@ -609,9 +616,9 @@ async fn handle_connection(
                         let live = live.clone();
                         let settled = match (completion, live) {
                             (Some(frame), Some(live)) => limits
-                                .live
+                                .live_completion
                                 .spawn(move || rustc_request::complete(&live, attempt, &frame)),
-                            (_, _) => limits.live.spawn(move || {
+                            (_, _) => limits.live_completion.spawn(move || {
                                 drop(attempt);
                                 refusal("completion-lost", "")
                             }),

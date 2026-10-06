@@ -932,6 +932,22 @@ fn replace_all(haystack: &[u8], needle: &[u8], replacement: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Resolve `.` and `..` components of an absolute path without touching
+/// the filesystem. `None` when `..` would climb above `/`.
+fn lexically_normalized(absolute: &str) -> Option<String> {
+    let mut parts: Vec<&str> = Vec::new();
+    for part in absolute.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop()?;
+            }
+            other => parts.push(other),
+        }
+    }
+    Some(format!("/{}", parts.join("/")))
+}
+
 /// Post-execution closure enforcement from rustc's own dep-info: every
 /// rule target must be inside the out-dir, every source dependency inside
 /// the package root, and every tracked environment read (`# env-dep:`)
@@ -995,12 +1011,16 @@ pub fn dep_info_closure_violation(
             } else {
                 format!("{}/{dep}", plan.cwd)
             };
-            if absolute.split('/').any(|part| part == ".." || part == ".")
-                || !within(&absolute, &plan.package_root)
-            {
+            // rustc reports `include_str!("../README.md")` from `src/` as
+            // `src/../README.md`. The keyed package tree is symlink-free
+            // (capture refuses links), so lexical normalization is exact.
+            let Some(normalized) = lexically_normalized(&absolute) else {
+                return Some(format!("read outside the filesystem root: {dep}"));
+            };
+            if !within(&normalized, &plan.package_root) {
                 return Some(format!("read outside the package: {dep}"));
             }
-            let relative = &absolute[plan.package_root.len() + 1..];
+            let relative = &normalized[plan.package_root.len() + 1..];
             if !is_input(relative) {
                 return Some(format!("read of an unkeyed package file: {dep}"));
             }
@@ -1436,5 +1456,23 @@ mod tests {
         // A package file the input manifest does not cover.
         let uncovered = format!("{OUT_A}/libitoa-1.rmeta: {PACKAGE}/src/generated.rs\n");
         assert!(check(&uncovered).is_some());
+        // `include_str!("../README.md")` from src/ (seen live in clap_builder)
+        // stays inside the package and is keyed once normalized.
+        let with_readme =
+            |relative: &str| matches!(relative, "src/lib.rs" | "src/udiv128.rs" | "README.md");
+        let readme =
+            format!("{OUT_A}/libitoa-1.rmeta: {PACKAGE}/src/lib.rs {PACKAGE}/src/../README.md\n");
+        assert_eq!(
+            dep_info_closure_violation(&plan, readme.as_bytes(), with_readme),
+            None
+        );
+        assert!(check(&readme).is_some(), "README.md must be a keyed input");
+        let climbing = format!("{OUT_A}/x.rmeta: /../../etc/passwd\n");
+        assert!(check(&climbing).is_some());
+        assert_eq!(
+            lexically_normalized("/a/b/../c/./d"),
+            Some("/a/c/d".to_owned())
+        );
+        assert_eq!(lexically_normalized("/.."), None);
     }
 }

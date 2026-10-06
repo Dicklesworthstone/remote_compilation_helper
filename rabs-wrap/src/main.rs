@@ -712,29 +712,42 @@ fn consult_succeeded(reply: &str) -> bool {
 }
 
 fn observe_with_breaker(socket: &str, path: &str, args: &[String]) -> Live {
-    let Some(_guard) = try_lock_breaker(path) else {
-        return Live::PassThrough;
-    };
     let policy = BreakerPolicy::default();
-    let state = load_state(path);
-    let now = now_ms();
-    let (state, connect_timeout_ms, decision_timeout_ms) = match decide(&policy, &state, now) {
-        ConnectDecision::SkipToLocal => return Live::PassThrough,
-        ConnectDecision::Attempt {
-            connect_timeout_ms,
-            decision_timeout_ms,
-        } => (state, connect_timeout_ms, decision_timeout_ms),
-        ConnectDecision::Probe {
-            connect_timeout_ms,
-            decision_timeout_ms,
-        } => {
-            // Do not probe unless the reservation was actually published.
-            // Ignoring a write failure permits a storm of same-window probes.
-            let probing = state.probe_started(now);
-            if store_state(path, &probing).is_err() {
-                return Live::PassThrough;
+    // The breaker lock covers DECISIONS and RECORDS, not the consult. A
+    // closed breaker admits concurrent consults: holding the lock across a
+    // consult made every parallel compile of a `cargo -jN` build skip RABS
+    // (observed live: ~40% of eligible compiles under -j4). Only the open
+    // breaker's single probe keeps the lock for its whole window, which is
+    // what makes "one probe per cooldown" exact.
+    let (probe_guard, probing_state, connect_timeout_ms, decision_timeout_ms) = {
+        let Some(guard) = try_lock_breaker(path) else {
+            return Live::PassThrough;
+        };
+        let state = load_state(path);
+        let now = now_ms();
+        match decide(&policy, &state, now) {
+            ConnectDecision::SkipToLocal => return Live::PassThrough,
+            ConnectDecision::Attempt {
+                connect_timeout_ms,
+                decision_timeout_ms,
+            } => (None, None, connect_timeout_ms, decision_timeout_ms),
+            ConnectDecision::Probe {
+                connect_timeout_ms,
+                decision_timeout_ms,
+            } => {
+                // Do not probe unless the reservation was actually published.
+                // Ignoring a write failure permits a storm of same-window probes.
+                let probing = state.probe_started(now);
+                if store_state(path, &probing).is_err() {
+                    return Live::PassThrough;
+                }
+                (
+                    Some(guard),
+                    Some(probing),
+                    connect_timeout_ms,
+                    decision_timeout_ms,
+                )
             }
-            (probing, connect_timeout_ms, decision_timeout_ms)
         }
     };
     let outcome = consult(socket, connect_timeout_ms, decision_timeout_ms, args);
@@ -742,9 +755,22 @@ fn observe_with_breaker(socket: &str, path: &str, args: &[String]) -> Live {
         Ok(Live::FailClosed(_)) | Err(()) => AttemptOutcome::Failed,
         Ok(_) => AttemptOutcome::Succeeded,
     };
-    let _ = store_state(path, &on_outcome(&policy, &state, attempt, now_ms()));
-    // The guard drops BEFORE the compiler runs. It is never a
-    // compiler-lifetime lock, and contenders never block on its owner.
+    match (probe_guard, probing_state) {
+        (Some(_guard), Some(probing)) => {
+            let _ = store_state(path, &on_outcome(&policy, &probing, attempt, now_ms()));
+        }
+        _ => {
+            // Fold this outcome into the CURRENT record: concurrent attempts
+            // each contribute (success resets, failures count). A contended
+            // record is skipped — the breaker is advisory, never a queue.
+            if let Some(_guard) = try_lock_breaker(path) {
+                let current = load_state(path);
+                let _ = store_state(path, &on_outcome(&policy, &current, attempt, now_ms()));
+            }
+        }
+    }
+    // No guard outlives this function: it is never a compiler-lifetime lock,
+    // and contenders never block on its owner.
     outcome.unwrap_or(Live::PassThrough)
 }
 
@@ -1122,6 +1148,55 @@ mod tests {
         assert!(try_lock_breaker(path).is_none());
         drop(guard);
         assert!(try_lock_breaker(path).is_some());
+    }
+
+    #[test]
+    fn a_closed_breaker_consult_leaves_the_lock_to_parallel_wrappers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("breaker");
+        let path_text = path.to_str().unwrap().to_owned();
+        let socket = dir.path().join("edge.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        store_state(
+            &path_text,
+            &BreakerState::Closed {
+                consecutive_failures: 2,
+            },
+        )
+        .unwrap();
+        let (entered, mid_consult) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let daemon = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            entered.send(()).unwrap();
+            released.recv().unwrap();
+            stream.write_all(b"{\"kind\":\"hello-ok\"}\n").unwrap();
+            line.clear();
+            reader.read_line(&mut line).unwrap();
+            stream
+                .write_all(
+                    b"{\"kind\":\"decision\",\"decision\":\"pass-through\",\"mode\":\"shadow\"}\n",
+                )
+                .unwrap();
+        });
+        let socket_text = socket.to_str().unwrap().to_owned();
+        let wrapper_path = path_text.clone();
+        let wrapper = std::thread::spawn(move || {
+            observe_with_breaker(&socket_text, &wrapper_path, &["/tc/bin/rustc".to_owned()])
+        });
+        mid_consult
+            .recv_timeout(Duration::from_secs(5))
+            .expect("consult started");
+        // Another wrapper of the same `cargo -jN` build is not locked out.
+        assert!(try_lock_breaker(&path_text).is_some());
+        release.send(()).unwrap();
+        assert!(matches!(wrapper.join().unwrap(), Live::PassThrough));
+        daemon.join().unwrap();
+        // The success was folded into the current record.
+        assert_eq!(load_state(&path_text), BreakerState::fresh());
     }
 
     #[test]
