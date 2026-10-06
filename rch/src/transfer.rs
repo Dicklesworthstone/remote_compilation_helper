@@ -2313,6 +2313,14 @@ impl TransferPipeline {
     /// rsync appends its server argv to this shell fragment. Forward those
     /// arguments inside the lease, after any destination setup has completed.
     fn source_rsync_path(&self, command: String) -> String {
+        self.source_rsync_path_at(command, &self.remote_path())
+    }
+
+    fn source_rsync_path_at(&self, command: String, remote_path: &str) -> String {
+        let command = self
+            .resolved_rsync()
+            .flavor
+            .remote_path_command(command, remote_path);
         match &self.source_authority_prefix {
             Some(prefix) => {
                 let script = format!("{command} \"$@\"");
@@ -2325,11 +2333,10 @@ impl TransferPipeline {
         }
     }
 
-    fn append_source_rsync_path(&self, command: &mut Command) {
-        if self.source_authority_prefix.is_some() {
-            command
-                .arg("--rsync-path")
-                .arg(self.source_rsync_path("rsync".to_owned()));
+    fn append_source_rsync_path(&self, command: &mut Command, remote_path: &str) {
+        let rsync_path = self.source_rsync_path_at("rsync".to_owned(), remote_path);
+        if rsync_path != "rsync" {
+            command.arg("--rsync-path").arg(rsync_path);
         }
     }
 
@@ -2646,7 +2653,20 @@ impl TransferPipeline {
         let mut cmd = Command::new(&resolved.path); // ubs:ignore — trusted local rsync configuration/PATH selection, not remote input
         // Force C locale for consistent output parsing
         cmd.env("LC_ALL", "C");
+        rch_common::rsync_flavor::configure_rsync_remote_args(cmd.as_std_mut());
         (cmd, capabilities)
+    }
+
+    /// Rsync filename operands and remote shell commands have different quoting
+    /// rules. Only this helper constructs `user@host:path` argv operands; callers
+    /// continue to shell-escape paths used in `--rsync-path` and SSH commands.
+    fn rsync_remote_spec(&self, worker: &WorkerConfig, path: &str) -> String {
+        format!(
+            "{}@{}:{}",
+            worker.user,
+            worker.host,
+            self.resolved_rsync().flavor.remote_path_arg(path)
+        )
     }
 
     /// Append `--compress-choice=zstd --compress-level=N` (or the legacy
@@ -2821,7 +2841,7 @@ impl TransferPipeline {
     async fn artifact_retry_config(
         &self,
         worker: &WorkerConfig,
-        escaped_remote_path: &str,
+        remote_path: &str,
         patterns: &[String],
     ) -> RetryConfig {
         let fallback = self.effective_rsync_retry_config();
@@ -2839,8 +2859,7 @@ impl TransferPipeline {
                 &fallback,
                 "estimate_artifact_retrieval",
                 || {
-                    let mut cmd =
-                        self.build_retrieve_command(worker, escaped_remote_path, patterns);
+                    let mut cmd = self.build_retrieve_command(worker, remote_path, patterns);
                     cmd.arg("--dry-run");
                     cmd
                 },
@@ -3450,22 +3469,14 @@ impl TransferPipeline {
         Ok(paths)
     }
 
-    /// Prove that a checksum-aware rsync would transfer no selected file and
-    /// delete no selected remote entry. Directory metadata differences are not
-    /// source bytes and are intentionally ignored here; the per-file remote
-    /// verifier independently checks type, length, mode, and SHA-256.
-    pub(crate) async fn verify_source_content_rsync_barrier(
+    fn build_source_content_rsync_barrier_command(
         &self,
         worker: &WorkerConfig,
-    ) -> Result<()> {
-        if self.worker_platform.is_windows() {
-            anyhow::bail!("source-content receipts require the rsync transport");
-        }
-
+        effective_excludes: &[String],
+    ) -> Command {
         let remote_path = self.remote_path();
         let escaped_remote_path = escape(Cow::from(&remote_path));
-        let destination = format!("{}@{}:{}", worker.user, worker.host, escaped_remote_path);
-        let effective_excludes = self.get_effective_excludes();
+        let destination = self.rsync_remote_spec(worker, &remote_path);
         let identity_file = shellexpand::tilde(&worker.identity_file);
         let escaped_identity = escape(Cow::from(identity_file.as_ref()));
         let ssh_command = self.build_rsync_ssh_command(escaped_identity.as_ref());
@@ -3484,10 +3495,26 @@ impl TransferPipeline {
         if self.sync_delete {
             cmd.arg("--delete");
         }
-        self.append_sync_filter_args(&mut cmd, &effective_excludes);
+        self.append_sync_filter_args(&mut cmd, effective_excludes);
         cmd.arg(format!("{}/", self.project_root.display()))
             .arg(destination);
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        cmd
+    }
+
+    /// Prove that a checksum-aware rsync would transfer no selected file and
+    /// delete no selected remote entry. Directory metadata differences are not
+    /// source bytes and are intentionally ignored here; the per-file remote
+    /// verifier independently checks type, length, mode, and SHA-256.
+    pub(crate) async fn verify_source_content_rsync_barrier(
+        &self,
+        worker: &WorkerConfig,
+    ) -> Result<()> {
+        if self.worker_platform.is_windows() {
+            anyhow::bail!("source-content receipts require the rsync transport");
+        }
+        let effective_excludes = self.get_effective_excludes();
+        let cmd = self.build_source_content_rsync_barrier_command(worker, &effective_excludes);
 
         let output = run_source_content_rsync_capture(
             cmd,
@@ -4088,15 +4115,14 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
             .arg("--stats")
             .arg("-e")
             .arg(ssh_command);
-        self.append_source_rsync_path(&mut cmd);
 
         for pattern in &effective_excludes {
             cmd.arg("--exclude").arg(pattern);
         }
 
         let remote_path = self.remote_path();
-        let escaped_remote_path = escape(Cow::from(&remote_path));
-        let destination = format!("{}@{}:{}", worker.user, worker.host, escaped_remote_path);
+        let destination = self.rsync_remote_spec(worker, &remote_path);
+        self.append_source_rsync_path(&mut cmd, &remote_path);
 
         cmd.arg(format!("{}/", self.project_root.display()))
             .arg(&destination);
@@ -4466,7 +4492,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         // what allows rsync to validate and continue the partial payload.
         let remote_archive_path = format!("{remote_path}/.rch-clean-overlay-base.tar");
         let escaped_remote_archive = escape(Cow::from(remote_archive_path.as_str()));
-        let destination = format!("{}@{}:{}", worker.user, worker.host, escaped_remote_archive);
+        let destination = self.rsync_remote_spec(worker, &remote_archive_path);
         let identity_file = shellexpand::tilde(&worker.identity_file);
         let escaped_identity = escape(Cow::from(identity_file.as_ref()));
         let ssh_command = self.build_rsync_ssh_command(escaped_identity.as_ref());
@@ -4490,9 +4516,11 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
                     let extraction_script = extraction_script.clone();
                     let archive_path = archive_path.clone();
                     let escaped_remote_path = escaped_remote_path.clone();
+                    let remote_archive_path = remote_archive_path.clone();
                     let rsync_path = rsync_path.clone();
                     async move {
                         let mut rsync = Command::new(&rsync_path); // ubs:ignore — same trusted rsync resolver as rsync_command; payload remains argv
+                        rch_common::rsync_flavor::configure_rsync_remote_args(rsync.as_std_mut());
                         rsync
                             .env("LC_ALL", "C")
                             .arg("-a")
@@ -4505,9 +4533,10 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
                             .arg("-e")
                             .arg(ssh_command)
                             .arg("--rsync-path")
-                            .arg(self.source_rsync_path(format!(
-                                "mkdir -p {escaped_remote_path} && rsync"
-                            )))
+                            .arg(self.source_rsync_path_at(
+                                format!("mkdir -p {escaped_remote_path} && rsync"),
+                                &remote_archive_path,
+                            ))
                             .arg(archive_path)
                             .arg(destination)
                             .stdout(Stdio::piped())
@@ -4986,7 +5015,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
     pub async fn sync_to_remote(&self, worker: &WorkerConfig) -> Result<SyncResult> {
         let remote_path = self.remote_path();
         let escaped_remote_path = escape(Cow::from(&remote_path));
-        let destination = format!("{}@{}:{}", worker.user, worker.host, escaped_remote_path);
+        let destination = self.rsync_remote_spec(worker, &remote_path);
 
         // Get effective excludes (config defaults + .rchignore)
         let effective_excludes = self.get_effective_excludes();
@@ -5114,7 +5143,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
     {
         let remote_path = self.remote_path();
         let escaped_remote_path = escape(Cow::from(&remote_path));
-        let destination = format!("{}@{}:{}", worker.user, worker.host, escaped_remote_path);
+        let destination = self.rsync_remote_spec(worker, &remote_path);
 
         // Get effective excludes (config defaults + .rchignore)
         let effective_excludes = self.get_effective_excludes();
@@ -5649,7 +5678,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
     fn build_retrieve_command(
         &self,
         worker: &WorkerConfig,
-        escaped_remote_path: &str,
+        remote_path: &str,
         artifact_patterns: &[String],
     ) -> Command {
         let (mut cmd, capabilities) = self.rsync_command();
@@ -5679,7 +5708,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
             .arg("--safe-links")
             .arg("-e")
             .arg(ssh_command);
-        self.append_source_rsync_path(&mut cmd);
+        self.append_source_rsync_path(&mut cmd, &format!("{remote_path}/"));
 
         // Add zstd compression (zlib on a legacy binary; issue #66)
         self.append_compression_args(&mut cmd, &capabilities);
@@ -5745,7 +5774,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         }
         cmd.arg("--exclude").arg("*"); // Exclude everything else
 
-        let source = format!("{}@{}:{}/", worker.user, worker.host, escaped_remote_path);
+        let source = self.rsync_remote_spec(worker, &format!("{remote_path}/"));
         cmd.arg(&source)
             .arg(format!("{}/", self.project_root.display()));
 
@@ -5757,7 +5786,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
     fn build_retrieve_streaming_command(
         &self,
         worker: &WorkerConfig,
-        escaped_remote_path: &str,
+        remote_path: &str,
         artifact_patterns: &[String],
     ) -> Command {
         let (mut cmd, capabilities) = self.rsync_command();
@@ -5781,7 +5810,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
             .arg("--safe-links")
             .arg("-e")
             .arg(ssh_command);
-        self.append_source_rsync_path(&mut cmd);
+        self.append_source_rsync_path(&mut cmd, &format!("{remote_path}/"));
 
         // Add zstd compression (zlib on a legacy binary; issue #66)
         self.append_compression_args(&mut cmd, &capabilities);
@@ -5834,7 +5863,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         }
         cmd.arg("--exclude").arg("*");
 
-        let source = format!("{}@{}:{}/", worker.user, worker.host, escaped_remote_path);
+        let source = self.rsync_remote_spec(worker, &format!("{remote_path}/"));
         cmd.arg(&source)
             .arg(format!("{}/", self.project_root.display()));
 
@@ -5921,13 +5950,12 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         artifact_patterns: &[String],
     ) -> Result<ArtifactRetrieval> {
         let remote_path = self.remote_path();
-        let escaped_remote_path = escape(Cow::from(&remote_path));
 
         if use_mock_transport(worker) {
             // Mock path also uses retry logic for consistent behavior
             // Create MockRsync ONCE and share via Arc so failure counters persist across retries
             let rsync = std::sync::Arc::new(MockRsync::new(MockRsyncConfig::from_env()));
-            let source = format!("{}@{}:{}/", worker.user, worker.host, escaped_remote_path);
+            let source = self.rsync_remote_spec(worker, &format!("{remote_path}/"));
             let project_root_str = self.project_root.display().to_string();
             let patterns = artifact_patterns.to_vec();
             let retry_config = self.transfer_config.retry.clone();
@@ -5960,13 +5988,13 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
 
         // Execute rsync with retry logic for transient errors
         let retry_config = self
-            .artifact_retry_config(worker, &escaped_remote_path, artifact_patterns)
+            .artifact_retry_config(worker, &remote_path, artifact_patterns)
             .await;
         let output = self
             .execute_retrieval_rsync(
                 &retry_config,
                 "retrieve_artifacts",
-                || self.build_retrieve_command(worker, &escaped_remote_path, artifact_patterns),
+                || self.build_retrieve_command(worker, &remote_path, artifact_patterns),
                 |_| {},
             )
             .await?;
@@ -6041,7 +6069,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
     fn build_result_dir_retrieve_command(
         &self,
         worker: &WorkerConfig,
-        escaped_remote_path: &str,
+        remote_path: &str,
         rel: &Path,
     ) -> Command {
         let (mut cmd, capabilities) = self.rsync_command();
@@ -6058,7 +6086,6 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
             .arg("--safe-links")
             .arg("-e")
             .arg(ssh_command);
-        self.append_source_rsync_path(&mut cmd);
 
         self.append_compression_args(&mut cmd, &capabilities);
         if let Some(bwlimit) = self.transfer_config.bwlimit_kbps
@@ -6071,11 +6098,8 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         // into `<project_root>/<rel>/`, so declared paths materialize at their
         // identical repository-relative location locally.
         let rel_str = rel.as_os_str().to_string_lossy();
-        let escaped_rel = escape(Cow::from(rel_str.as_ref()));
-        let source = format!(
-            "{}@{}:{}/{}/",
-            worker.user, worker.host, escaped_remote_path, escaped_rel
-        );
+        let source = self.rsync_remote_spec(worker, &format!("{remote_path}/{rel_str}/"));
+        self.append_source_rsync_path(&mut cmd, &format!("{remote_path}/{rel_str}/"));
         let local_dest = format!("{}/{}/", self.project_root.display(), rel.display());
         cmd.arg(&source).arg(local_dest);
 
@@ -6498,14 +6522,13 @@ print('RCH_SOURCE_FRESHNESS_V2 unchanged=%d changed=%d' % (len(current) - len(ch
                 .map(|retrieval| retrieval.stats);
         }
 
-        let escaped_remote_path = escape(Cow::from(&remote_path));
         let start = std::time::Instant::now();
         let retry_config = self.effective_rsync_retry_config();
         let output = self
             .execute_retrieval_rsync(
                 &retry_config,
                 "retrieve_result_dir",
-                || self.build_result_dir_retrieve_command(worker, &escaped_remote_path, rel),
+                || self.build_result_dir_retrieve_command(worker, &remote_path, rel),
                 |_| {},
             )
             .await?;
@@ -6580,13 +6603,12 @@ print('RCH_SOURCE_FRESHNESS_V2 unchanged=%d changed=%d' % (len(current) - len(ch
         F: FnMut(&str),
     {
         let remote_path = self.remote_path();
-        let escaped_remote_path = escape(Cow::from(&remote_path));
 
         if use_mock_transport(worker) {
             let rsync = MockRsync::new(MockRsyncConfig::from_env());
             let result = rsync
                 .retrieve_artifacts(
-                    &format!("{}@{}:{}/", worker.user, worker.host, escaped_remote_path),
+                    &self.rsync_remote_spec(worker, &format!("{remote_path}/")),
                     &self.project_root.display().to_string(),
                     artifact_patterns,
                 )
@@ -6612,9 +6634,8 @@ print('RCH_SOURCE_FRESHNESS_V2 unchanged=%d changed=%d' % (len(current) - len(ch
         // Rebuilt per retry attempt (see `sync_to_remote_streaming`): a transient
         // transport drop while pulling artifacts must reconnect and retry instead
         // of failing the build's artifact return outright.
-        let build_cmd = || {
-            self.build_retrieve_streaming_command(worker, &escaped_remote_path, artifact_patterns)
-        };
+        let build_cmd =
+            || self.build_retrieve_streaming_command(worker, &remote_path, artifact_patterns);
 
         debug!(
             "Running artifact retrieval (streaming): rsync {:?}",
@@ -6623,7 +6644,7 @@ print('RCH_SOURCE_FRESHNESS_V2 unchanged=%d changed=%d' % (len(current) - len(ch
 
         let retrieval_start = std::time::Instant::now();
         let retry_config = self
-            .artifact_retry_config(worker, &escaped_remote_path, artifact_patterns)
+            .artifact_retry_config(worker, &remote_path, artifact_patterns)
             .await;
         let output = if self.retrieval_control.is_some() {
             let output = self
@@ -10579,6 +10600,107 @@ Number of files transferred: 42
     // =========================================================================
     // rsync flavour argv (issue #66)
     // =========================================================================
+
+    #[test]
+    fn rsync_remote_paths_cover_upload_barrier_estimate_and_retrieval() {
+        let _guard = test_guard!();
+        let worker = flavour_test_worker();
+        let patterns = vec!["target/release/**".to_string()];
+        for (major, minor, patch, modern) in [(3, 2, 3, false), (3, 2, 4, true), (3, 4, 1, true)] {
+            let flavor = RsyncFlavor::Rsync {
+                major,
+                minor,
+                patch,
+            };
+            for name in ["plain", "p q", "x:y"] {
+                let remote = format!("/data/projects/{name}");
+                let pipeline =
+                    flavour_test_pipeline(flavor, 0).with_remote_path_override(remote.clone());
+                let operand = if modern || name == "plain" {
+                    remote.clone()
+                } else {
+                    format!("'{remote}'")
+                };
+                let trailing_operand = if modern || name == "plain" {
+                    format!("{remote}/")
+                } else {
+                    format!("'{remote}/'")
+                };
+                let destination = pipeline.rsync_remote_spec(&worker, &remote);
+                assert_eq!(destination, format!("ubuntu@worker.example:{operand}"));
+                let escaped = escape(Cow::from(remote.as_str()));
+                let commands = [
+                    pipeline.build_sync_command(&worker, &destination, &escaped, &[]),
+                    pipeline.build_sync_streaming_command(&worker, &destination, &escaped, &[]),
+                    pipeline.build_estimate_command(&worker),
+                    pipeline.build_source_content_rsync_barrier_command(&worker, &[]),
+                    pipeline.build_retrieve_command(&worker, &remote, &patterns),
+                    pipeline.build_retrieve_streaming_command(&worker, &remote, &patterns),
+                ];
+                for (index, command) in commands.iter().enumerate() {
+                    let args = command_args(command);
+                    let expected = if index < 4 {
+                        destination.clone()
+                    } else {
+                        format!("ubuntu@worker.example:{trailing_operand}")
+                    };
+                    assert!(
+                        args.contains(&expected),
+                        "{flavor}, {name}, builder {index}: {args:?}"
+                    );
+                    assert!(
+                        !args
+                            .iter()
+                            .any(|arg| arg == "--old-args" || arg == "--protect-args")
+                    );
+                    for key in ["RSYNC_OLD_ARGS", "RSYNC_PROTECT_ARGS"] {
+                        assert_eq!(
+                            command.as_std().get_envs().find(|(name, _)| *name == key),
+                            Some((std::ffi::OsStr::new(key), Some(std::ffi::OsStr::new("0"))))
+                        );
+                    }
+                }
+                // The shell fragment still needs quotes, unlike the operand.
+                let barrier = command_args(&commands[3]);
+                assert!(barrier.contains(&"--checksum".to_string()));
+                assert!(barrier.windows(2).any(|args| {
+                    args[0] == "--rsync-path"
+                        && args[1].contains(&format!("mkdir -p {escaped} && rsync"))
+                }));
+                for command in &commands[4..] {
+                    assert!(command_args(command).contains(&"--safe-links".to_string()));
+                }
+                // Join first and encode once, including a spaced/colon child.
+                let result_dir = pipeline.build_result_dir_retrieve_command(
+                    &worker,
+                    &remote,
+                    Path::new("out p:q"),
+                );
+                let full = format!("{remote}/out p:q/");
+                let expected = if modern { full } else { format!("'{full}'") };
+                assert!(
+                    command_args(&result_dir)
+                        .contains(&format!("ubuntu@worker.example:{expected}"))
+                );
+                assert!(command_args(&result_dir).contains(&"--safe-links".to_string()));
+            }
+        }
+    }
+
+    #[test]
+    fn rsync_path_fix_keeps_remote_override_safety_checks() {
+        for path in ["relative/p q", "/data/p\nq", "/data/p\rq", "/data/p\0q"] {
+            let pipeline =
+                flavour_test_pipeline(RsyncFlavor::Unknown, 0).with_remote_path_override(path);
+            assert!(
+                pipeline.remote_path_override.is_none(),
+                "accepted unsafe path: {path:?}"
+            );
+        }
+        for value in ["p\nq", "p\rq", "p\0q"] {
+            assert!(shell_escape_value(value).is_none());
+        }
+    }
 
     fn pinned_rsync(flavor: RsyncFlavor) -> ResolvedRsync {
         ResolvedRsync {
