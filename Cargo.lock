@@ -5215,6 +5215,7 @@ version = "2.1.16"
 dependencies = [
  "rabs-protocol",
  "serde_json",
+ "sha2 0.11.0",
  "tempfile",
 ]
 

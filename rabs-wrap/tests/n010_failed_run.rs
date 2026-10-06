@@ -14,6 +14,7 @@ use rabs_protocol::output_manifest::{OutputEntry, OutputTreeManifest, diff_manif
 use rabs_protocol::run_publish_policy::{
     RunOutcomeKind, StagingState, ghost_files, publish_decision, resolve_retry_parity,
 };
+use sha2::{Digest, Sha256};
 
 const FIXTURE_NAME: &str = "n010_probe";
 const CARGO_PHASE_BUDGET_SECS: u64 = 180;
@@ -267,33 +268,44 @@ fn recorded_out_dir(project: &Path, phase: &str) -> PathBuf {
     out
 }
 
-fn visit_files(dir: &Path, rel: &[u8], out: &mut Vec<(Vec<u8>, u64)>) {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
+fn visit_files(dir: &Path, rel: &[u8], out: &mut Vec<OutputEntry>) {
+    assert!(
+        fs::symlink_metadata(dir)
+            .expect("inspect capture directory")
+            .file_type()
+            .is_dir(),
+        "capture directory must not be a symlink: {}",
+        dir.display()
+    );
+    for entry in fs::read_dir(dir).expect("read complete capture directory") {
+        let entry = entry.expect("read every directory entry");
         let p = entry.path();
         let name = entry.file_name();
         let mut child_rel = rel.to_vec();
         child_rel.push(b'/');
         child_rel.extend_from_slice(name.as_encoded_bytes());
-        if p.is_dir() {
+        let kind = entry.file_type().expect("inspect captured entry");
+        if kind.is_dir() {
             visit_files(&p, &child_rel, out);
-        } else if let Ok(meta) = p.metadata() {
-            out.push((child_rel, meta.len()));
+        } else {
+            assert!(
+                kind.is_file(),
+                "only regular files can be captured: {}",
+                p.display()
+            );
+            let bytes = fs::read(&p).expect("read every captured file completely");
+            out.push(OutputEntry::new(
+                child_rel,
+                u64::try_from(bytes.len()).expect("captured byte length fits u64"),
+                Sha256::digest(&bytes).into(),
+            ));
         }
     }
 }
 
 fn capture_manifest(out_dir: &Path) -> OutputTreeManifest {
-    let mut raw = Vec::new();
-    visit_files(out_dir, b"out", &mut raw);
-    raw.sort();
-    OutputTreeManifest::new(
-        raw.iter()
-            .map(|(p, l)| OutputEntry::new(p.clone(), *l))
-            .collect(),
-        Vec::new(),
-    )
-    .expect("walked tree is sorted and unique")
+    let mut entries = Vec::new();
+    visit_files(out_dir, b"out", &mut entries);
+    entries.sort_by(|left, right| left.path.cmp(&right.path));
+    OutputTreeManifest::new(entries, Vec::new()).expect("walked tree is sorted and unique")
 }
