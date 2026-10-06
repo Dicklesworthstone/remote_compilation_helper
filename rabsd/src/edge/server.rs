@@ -118,7 +118,7 @@ pub struct EdgeServerConfig {
     /// Execution-only prepared jobs. No action-cache publication capability.
     pub prepared_operations:
         Option<std::sync::Arc<crate::coord::prepared_operation::PreparedOperationStore>>,
-    /// The live registry-dependency lane (opt-in). `None` keeps every
+    /// The live registry/Git dependency lane (opt-in). `None` keeps every
     /// `rustc-request` in shadow mode.
     pub live_dependency: Option<crate::coord::live_dependency::LiveDependencyLane>,
 }

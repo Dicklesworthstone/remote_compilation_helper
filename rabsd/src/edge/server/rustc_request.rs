@@ -210,13 +210,17 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
             return Decided::Shadow(observation(&parsed));
         }
     };
-    let package = match live.facts.package(Path::new(&plan.package_root)) {
+    let package = match live
+        .facts
+        .package(Path::new(&plan.source_root), plan.source_kind)
+    {
         Ok(package) => package,
         Err(miss) => {
             log(
                 "pass-through",
                 &[
                     ("package", &plan.package_root),
+                    ("source", &plan.source_root),
                     ("reason", &miss.to_string()),
                 ],
             );

@@ -1516,6 +1516,7 @@ pub(crate) async fn assert_cargo_fixture_publication(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rch_common::test_guard;
 
     fn preparation_fixture() -> (tempfile::TempDir, DurableLeaseWriter, WorkerConfig) {
         preparation_fixture_with_identity("abc123")

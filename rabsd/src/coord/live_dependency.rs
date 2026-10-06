@@ -1,4 +1,4 @@
-//! The live registry-dependency lane (bd-14t4j / bd-k52xe): the first
+//! The live registry and Git dependency lane (bd-14t4j / bd-k52xe): the first
 //! production caller of `submit_action` → dispatch → `commit_offer`, and the
 //! first path on which a verified cache answer may replace a compiler run.
 //!
@@ -549,7 +549,7 @@ impl LiveDependencyLane {
             request.key.descriptor.clone(),
             &request.inputs,
             Arc::clone(&request.package.snapshot),
-            &[(PACKAGE_ROOT.to_owned(), request.plan.package_virtual_root())],
+            &[(PACKAGE_ROOT.to_owned(), request.plan.source_virtual_root())],
         )
         .map_err(refusal)?;
         if submission.key() != key {
@@ -707,8 +707,9 @@ impl LocalAttempt {
             return Err("transcript exceeds the class bound".into());
         }
         let plan = &self.request.plan;
-        let package_root = Path::new(&plan.package_root);
-        self.request.package.verify_unchanged(package_root)?;
+        self.request
+            .package
+            .verify_unchanged(Path::new(&plan.source_root))?;
         let members = self
             .request
             .package
@@ -773,6 +774,8 @@ impl LocalAttempt {
             let snapshot = serde_json::to_vec(&serde_json::json!({
                 "kind": "rabs-live-dependency-snapshot-v1",
                 "package_root": plan.package_root,
+                "source_root": plan.source_root,
+                "source_kind": plan.source_kind.as_str(),
                 "package_closure_sha256": hex(&self.request.package.snapshot.closure_digest()),
                 "input_manifest": digest_key(&self.request.key.descriptor.action_inputs),
             }))

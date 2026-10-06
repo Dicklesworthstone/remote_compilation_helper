@@ -21,7 +21,7 @@
 
 use rabs_cas::digest_set::{DigestRequest, StreamingObjectWriter};
 use rabs_key::canonical::CanonicalEncoder;
-use rabs_key::live_dependency::ToolchainFacts;
+use rabs_key::live_dependency::{DependencySourceKind, ToolchainFacts};
 use rabs_key::typed_digest::compute;
 use rabs_protocol::result_identity::TypedDigest;
 use rabs_sandbox::snapshot_capture::{
@@ -193,6 +193,7 @@ pub struct PackageFacts {
     /// Every regular file: relative path, CAS object id of its sealed
     /// bytes, executable bit — sorted by path.
     pub files: Vec<(String, TypedDigest, bool)>,
+    source_kind: DependencySourceKind,
     members: Vec<(String, MemberSig)>,
     bytes: u64,
 }
@@ -211,7 +212,7 @@ impl PackageFacts {
     /// # Errors
     /// A description of the first difference.
     pub fn verify_unchanged(&self, root: &Path) -> Result<(), String> {
-        let (members, _) = walk_package(root)?;
+        let (members, _) = walk_package(root, self.source_kind)?;
         if members == self.members {
             Ok(())
         } else {
@@ -222,8 +223,25 @@ impl PackageFacts {
 
 /// Walk a package tree: every directory and regular file with its
 /// identity, sorted by relative path. Symlinks and special files refuse:
-/// the class keys a plain tree.
-fn walk_package(root: &Path) -> Result<(Vec<(String, MemberSig)>, u64), String> {
+/// the class keys a plain tree. Cargo Git checkouts exclude their root
+/// `.git` entry before inspecting it: Git metadata is neither an admitted
+/// source input nor a capability to read/upload repository credentials.
+fn walk_package(
+    root: &Path,
+    source_kind: DependencySourceKind,
+) -> Result<(Vec<(String, MemberSig)>, u64), String> {
+    let root_identity = || {
+        let meta = std::fs::symlink_metadata(root)
+            .map_err(|error| format!("lstat package root {}: {error}", root.display()))?;
+        if !meta.file_type().is_dir() {
+            return Err("package root is not a real directory".to_owned());
+        }
+        Ok(FileSig::of(&meta))
+    };
+    // Warm memo lookups and post-execution verification do not repeat the
+    // sealed capture's root checks. They must independently reject a root
+    // symlink, even if it resolves to the same captured member inodes.
+    let root_before = root_identity()?;
     let mut members = Vec::new();
     let mut total = 0_u64;
     let mut pending = vec![(root.to_path_buf(), String::new())];
@@ -236,6 +254,12 @@ fn walk_package(root: &Path) -> Result<(Vec<(String, MemberSig)>, u64), String> 
                 .file_name()
                 .into_string()
                 .map_err(|_| "non-UTF-8 package path".to_owned())?;
+            if source_kind == DependencySourceKind::GitCheckout
+                && prefix.is_empty()
+                && name == ".git"
+            {
+                continue;
+            }
             let relative = if prefix.is_empty() {
                 name
             } else {
@@ -257,12 +281,15 @@ fn walk_package(root: &Path) -> Result<(Vec<(String, MemberSig)>, u64), String> 
             }
         }
     }
+    if root_identity()? != root_before {
+        return Err("package root changed while its members were observed".into());
+    }
     members.sort_by(|a, b| a.0.cmp(&b.0));
     Ok((members, total))
 }
 
-fn capture_package(root: &Path) -> Result<PackageFacts, String> {
-    let (before, bytes) = walk_package(root)?;
+fn capture_package(root: &Path, source_kind: DependencySourceKind) -> Result<PackageFacts, String> {
+    let (before, bytes) = walk_package(root, source_kind)?;
     // The key's "complete package tree" claim requires the capture policy
     // to have excluded nothing a compiler could read.
     for (relative, _) in &before {
@@ -279,7 +306,7 @@ fn capture_package(root: &Path) -> Result<PackageFacts, String> {
         MAX_PACKAGE_BYTES,
     )
     .map_err(|error| format!("capture: {error:?}"))?;
-    let (after, _) = walk_package(root)?;
+    let (after, _) = walk_package(root, source_kind)?;
     if after != before {
         return Err("package changed during capture".into());
     }
@@ -318,6 +345,7 @@ fn capture_package(root: &Path) -> Result<PackageFacts, String> {
     Ok(PackageFacts {
         snapshot: Arc::new(snapshot),
         files,
+        source_kind,
         members: before,
         bytes,
     })
@@ -429,7 +457,7 @@ fn probe_toolchain(compiler: &Path, env: &[(String, String)]) -> Result<ProbedTo
 pub struct LiveFacts {
     files: Mutex<HashMap<PathBuf, (FileSig, TypedDigest)>>,
     toolchains: Mutex<HashMap<PathBuf, Slot<ProbedToolchain>>>,
-    packages: Mutex<HashMap<PathBuf, Slot<PackageFacts>>>,
+    packages: Mutex<HashMap<(PathBuf, DependencySourceKind), Slot<PackageFacts>>>,
     warming: Mutex<usize>,
 }
 
@@ -545,19 +573,26 @@ impl LiveFacts {
         Err(FactsMiss::Pending)
     }
 
-    /// The sealed complete tree of a registry package. Small packages are
+    /// The sealed source tree of a registry package or complete Cargo Git
+    /// checkout. Git metadata is excluded only for a Git checkout; all
+    /// other source-policy exclusions refuse the capture. Small trees are
     /// captured on the request path; larger ones warm in the background.
     ///
     /// # Errors
     /// [`FactsMiss`].
-    pub fn package(self: &Arc<Self>, root: &Path) -> Result<Arc<PackageFacts>, FactsMiss> {
-        let (members, bytes) = walk_package(root).map_err(FactsMiss::Refused)?;
+    pub fn package(
+        self: &Arc<Self>,
+        root: &Path,
+        source_kind: DependencySourceKind,
+    ) -> Result<Arc<PackageFacts>, FactsMiss> {
+        let key = (root.to_path_buf(), source_kind);
+        let (members, bytes) = walk_package(root, source_kind).map_err(FactsMiss::Refused)?;
         {
             let packages = self
                 .packages
                 .lock()
                 .map_err(|_| FactsMiss::Refused("package memo poisoned".into()))?;
-            match packages.get(root) {
+            match packages.get(&key) {
                 Some(Slot::Ready(facts)) if facts.members == members => {
                     return Ok(Arc::clone(facts));
                 }
@@ -569,30 +604,35 @@ impl LiveFacts {
             }
         }
         if bytes <= SYNCHRONOUS_PACKAGE_BYTES {
-            let captured = capture_package(root).map_err(FactsMiss::Refused)?;
+            let captured = capture_package(root, source_kind).map_err(FactsMiss::Refused)?;
             let captured = Arc::new(captured);
-            self.retain_package(root, Slot::Ready(Arc::clone(&captured)));
+            self.retain_package(root, source_kind, Slot::Ready(Arc::clone(&captured)));
             return Ok(captured);
         }
-        self.retain_package(root, Slot::Warming);
+        self.retain_package(root, source_kind, Slot::Warming);
         let owned = root.to_path_buf();
         let started = self.start_warm(move |facts| {
-            let slot = match capture_package(&owned) {
+            let slot = match capture_package(&owned, source_kind) {
                 Ok(captured) => Slot::Ready(Arc::new(captured)),
                 Err(reason) => Slot::Failed {
                     reason,
                     at: Instant::now(),
                 },
             };
-            facts.retain_package(&owned, slot);
+            facts.retain_package(&owned, source_kind, slot);
         });
         if !started && let Ok(mut packages) = self.packages.lock() {
-            packages.remove(root);
+            packages.remove(&key);
         }
         Err(FactsMiss::Pending)
     }
 
-    fn retain_package(&self, root: &Path, slot: Slot<PackageFacts>) {
+    fn retain_package(
+        &self,
+        root: &Path,
+        source_kind: DependencySourceKind,
+        slot: Slot<PackageFacts>,
+    ) {
         let Ok(mut packages) = self.packages.lock() else {
             return;
         };
@@ -606,7 +646,7 @@ impl LiveFacts {
         if retained > MAX_RETAINED_PACKAGE_BYTES {
             packages.retain(|_, slot| !matches!(slot, Slot::Ready(_)));
         }
-        packages.insert(root.to_path_buf(), slot);
+        packages.insert((root.to_path_buf(), source_kind), slot);
     }
 }
 
@@ -641,7 +681,9 @@ mod tests {
         std::fs::write(root.join("Cargo.toml"), b"[package]\n").unwrap();
         std::fs::write(root.join("src/lib.rs"), b"pub fn f() {}\n").unwrap();
         let facts = LiveFacts::new();
-        let captured = facts.package(&root).unwrap();
+        let captured = facts
+            .package(&root, DependencySourceKind::RegistryPackage)
+            .unwrap();
         assert_eq!(
             captured
                 .snapshot
@@ -649,13 +691,265 @@ mod tests {
                 .unwrap(),
             b"pub fn f() {}\n"
         );
-        assert!(Arc::ptr_eq(&captured, &facts.package(&root).unwrap()));
+        assert!(Arc::ptr_eq(
+            &captured,
+            &facts
+                .package(&root, DependencySourceKind::RegistryPackage)
+                .unwrap()
+        ));
         captured.verify_unchanged(&root).unwrap();
         std::fs::write(root.join("src/extra.rs"), b"").unwrap();
         assert!(captured.verify_unchanged(&root).is_err());
-        assert!(!Arc::ptr_eq(&captured, &facts.package(&root).unwrap()));
+        assert!(!Arc::ptr_eq(
+            &captured,
+            &facts
+                .package(&root, DependencySourceKind::RegistryPackage)
+                .unwrap()
+        ));
         std::os::unix::fs::symlink("lib.rs", root.join("src/alias.rs")).unwrap();
-        assert!(matches!(facts.package(&root), Err(FactsMiss::Refused(_))));
+        assert!(matches!(
+            facts.package(&root, DependencySourceKind::RegistryPackage),
+            Err(FactsMiss::Refused(_))
+        ));
+    }
+
+    fn write_git_checkout(root: &Path) {
+        std::fs::create_dir_all(root.join("crates/dep/src")).unwrap();
+        std::fs::create_dir_all(root.join(".git/objects")).unwrap();
+        std::fs::write(root.join("Cargo.toml"), b"[workspace]\n").unwrap();
+        std::fs::write(root.join("crates/dep/Cargo.toml"), b"[package]\n").unwrap();
+        std::fs::write(
+            root.join("crates/dep/src/lib.rs"),
+            b"pub const README: &str = include_str!(\"../../../README.md\");\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("README.md"), b"first\n").unwrap();
+        std::fs::write(root.join(".git/config"), b"private repository metadata\n").unwrap();
+        // Traversing metadata would encounter an unsupported member. The
+        // source walk must prune `.git` before inspecting its children.
+        std::os::unix::fs::symlink("missing-object", root.join(".git/objects/link")).unwrap();
+    }
+
+    #[test]
+    fn git_capture_never_reads_metadata_and_metadata_edits_preserve_the_memo() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("checkout");
+        write_git_checkout(&root);
+        let facts = LiveFacts::new();
+        let captured = facts
+            .package(&root, DependencySourceKind::GitCheckout)
+            .unwrap();
+        assert_eq!(captured.source_kind, DependencySourceKind::GitCheckout);
+        assert_eq!(captured.files.len(), 4);
+        assert!(
+            captured
+                .files
+                .iter()
+                .all(|(path, _, _)| path != ".git" && !path.starts_with(".git/"))
+        );
+        assert!(
+            captured
+                .snapshot
+                .manifest(PACKAGE_ROOT)
+                .unwrap()
+                .members
+                .keys()
+                .all(|path| path != ".git" && !path.starts_with(".git/"))
+        );
+        assert!(
+            captured
+                .snapshot
+                .file_bytes(PACKAGE_ROOT, ".git/config")
+                .is_none()
+        );
+
+        std::fs::write(root.join(".git/config"), b"changed private metadata\n").unwrap();
+        std::fs::write(root.join(".git/index"), b"new metadata\n").unwrap();
+        captured.verify_unchanged(&root).unwrap();
+        assert!(Arc::ptr_eq(
+            &captured,
+            &facts
+                .package(&root, DependencySourceKind::GitCheckout)
+                .unwrap()
+        ));
+
+        // A strict registry request for this same physical root must not
+        // inherit the Git cache's permission to omit metadata.
+        assert!(matches!(
+            facts.package(&root, DependencySourceKind::RegistryPackage),
+            Err(FactsMiss::Refused(_))
+        ));
+        assert!(Arc::ptr_eq(
+            &captured,
+            &facts
+                .package(&root, DependencySourceKind::GitCheckout)
+                .unwrap()
+        ));
+    }
+
+    #[test]
+    fn git_capture_binds_dirty_sibling_bytes_and_new_checkout_members() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("checkout");
+        write_git_checkout(&root);
+        let facts = LiveFacts::new();
+        let captured = facts
+            .package(&root, DependencySourceKind::GitCheckout)
+            .unwrap();
+        let file_digest = |capture: &PackageFacts, relative: &str| {
+            capture
+                .files
+                .iter()
+                .find(|(path, _, _)| path == relative)
+                .unwrap()
+                .1
+                .clone()
+        };
+        let original = file_digest(&captured, "README.md");
+        assert_eq!(
+            captured.snapshot.file_bytes(PACKAGE_ROOT, "README.md"),
+            Some(b"first\n".as_slice())
+        );
+
+        // The package lives at crates/dep, but its whole checkout is the
+        // source closure. A same-length dirty sibling edit changes bytes
+        // without changing the Cargo revision directory's name.
+        std::fs::write(root.join("README.md"), b"other\n").unwrap();
+        assert!(captured.verify_unchanged(&root).is_err());
+        let dirty = facts
+            .package(&root, DependencySourceKind::GitCheckout)
+            .unwrap();
+        assert!(!Arc::ptr_eq(&captured, &dirty));
+        assert_ne!(file_digest(&dirty, "README.md"), original);
+        assert_eq!(
+            captured.snapshot.file_bytes(PACKAGE_ROOT, "README.md"),
+            Some(b"first\n".as_slice()),
+            "the admitted snapshot retains its original bytes"
+        );
+        std::fs::write(root.join("README.md"), b"first\n").unwrap();
+        assert!(dirty.verify_unchanged(&root).is_err());
+        let restored = facts
+            .package(&root, DependencySourceKind::GitCheckout)
+            .unwrap();
+        assert_eq!(file_digest(&restored, "README.md"), original);
+
+        std::fs::write(root.join("crates/new.rs"), b"// untracked input\n").unwrap();
+        assert!(restored.verify_unchanged(&root).is_err());
+        let added = facts
+            .package(&root, DependencySourceKind::GitCheckout)
+            .unwrap();
+        assert_eq!(added.files.len(), restored.files.len() + 1);
+        assert_eq!(
+            added.snapshot.file_bytes(PACKAGE_ROOT, "crates/new.rs"),
+            Some(b"// untracked input\n".as_slice())
+        );
+    }
+
+    #[test]
+    fn identical_source_trees_keep_distinct_capture_policy_memos() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("lib.rs"), b"pub fn f() {}\n").unwrap();
+        let facts = LiveFacts::new();
+        let git = facts
+            .package(dir.path(), DependencySourceKind::GitCheckout)
+            .unwrap();
+        let registry = facts
+            .package(dir.path(), DependencySourceKind::RegistryPackage)
+            .unwrap();
+        assert_eq!(git.files, registry.files);
+        assert!(!Arc::ptr_eq(&git, &registry));
+        assert_eq!(git.source_kind, DependencySourceKind::GitCheckout);
+        assert_eq!(registry.source_kind, DependencySourceKind::RegistryPackage);
+        assert!(Arc::ptr_eq(
+            &git,
+            &facts
+                .package(dir.path(), DependencySourceKind::GitCheckout)
+                .unwrap()
+        ));
+        assert!(Arc::ptr_eq(
+            &registry,
+            &facts
+                .package(dir.path(), DependencySourceKind::RegistryPackage)
+                .unwrap()
+        ));
+    }
+
+    #[test]
+    fn warm_package_and_verification_refuse_a_symlink_to_the_same_member_inodes() {
+        for source_kind in [
+            DependencySourceKind::RegistryPackage,
+            DependencySourceKind::GitCheckout,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("source");
+            std::fs::create_dir_all(root.join("src")).unwrap();
+            std::fs::write(root.join("src/lib.rs"), b"pub fn f() {}\n").unwrap();
+            let facts = LiveFacts::new();
+            let captured = facts.package(&root, source_kind).unwrap();
+            let (members, _) = walk_package(&root, source_kind).unwrap();
+
+            let moved = dir.path().join("another-parent/source");
+            std::fs::create_dir_all(moved.parent().unwrap()).unwrap();
+            std::fs::rename(&root, &moved).unwrap();
+            std::os::unix::fs::symlink(&moved, &root).unwrap();
+            assert_eq!(
+                walk_package(&moved, source_kind).unwrap().0,
+                members,
+                "the symlink points at precisely the original member identities"
+            );
+            assert!(matches!(
+                facts.package(&root, source_kind),
+                Err(FactsMiss::Refused(reason)) if reason.contains("root is not a real directory")
+            ));
+            assert!(
+                captured
+                    .verify_unchanged(&root)
+                    .unwrap_err()
+                    .contains("root is not a real directory")
+            );
+        }
+    }
+
+    #[test]
+    fn git_metadata_file_or_link_is_pruned_but_other_exclusions_still_refuse() {
+        for metadata_is_link in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("lib.rs"), b"pub fn f() {}\n").unwrap();
+            if metadata_is_link {
+                std::os::unix::fs::symlink("absent", dir.path().join(".git")).unwrap();
+            } else {
+                std::fs::write(dir.path().join(".git"), b"gitdir: private-location\n").unwrap();
+            }
+            let facts = LiveFacts::new();
+            let captured = facts
+                .package(dir.path(), DependencySourceKind::GitCheckout)
+                .unwrap();
+            assert_eq!(captured.files.len(), 1);
+            assert!(captured.snapshot.file_bytes(PACKAGE_ROOT, ".git").is_none());
+            assert!(matches!(
+                facts.package(dir.path(), DependencySourceKind::RegistryPackage),
+                Err(FactsMiss::Refused(_))
+            ));
+        }
+
+        for excluded in ["target/generated.rs", ".package-cache", ".env", "alias.rs"] {
+            let dir = tempfile::tempdir().unwrap();
+            write_git_checkout(dir.path());
+            let path = dir.path().join(excluded);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            if excluded == "alias.rs" {
+                std::os::unix::fs::symlink("README.md", &path).unwrap();
+            } else {
+                std::fs::write(&path, b"excluded bytes\n").unwrap();
+            }
+            assert!(
+                matches!(
+                    LiveFacts::new().package(dir.path(), DependencySourceKind::GitCheckout),
+                    Err(FactsMiss::Refused(_))
+                ),
+                "Git capture must still refuse {excluded}"
+            );
+        }
     }
 
     #[test]

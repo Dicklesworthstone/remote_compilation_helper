@@ -268,7 +268,9 @@ pub fn derive_output_declarations(
 /// metadata and/or dep-info files. Unknown flags are safe to retain in a key,
 /// but NOT safe to ignore when predicting the complete set of writes. In
 /// particular `--test`, `-o`, response files, incremental state, save-temps,
-/// split-debug sidecars and unstable output modes cannot use this adapter.
+/// split-debug sidecars and unmodeled unstable output modes cannot use this
+/// adapter. Cargo's `-Z embed-metadata=no` is modeled only with explicit
+/// separate metadata emission, so the required `.rmeta` remains declared.
 /// The general naming helper remains available for non-serving consumers.
 ///
 /// This derives outputs only. It does not establish immutable inputs, validate
@@ -352,10 +354,20 @@ pub fn derive_dependency_output_declarations(
 fn check_dependency_output_options(
     invocation: &NormalizedRustcInvocation,
 ) -> Result<(), DerivationRefusal> {
-    if let Some((name, _)) = invocation.unstable.first() {
-        return Err(DerivationRefusal::UnsupportedOutputOption(format!(
-            "-Z {name}"
-        )));
+    for (name, value) in &invocation.unstable {
+        // Current Cargo can omit metadata from the rlib while requesting
+        // a separate rmeta. This changes artifact bytes, already bound by
+        // the normalized invocation, but not the declared file set. Never
+        // admit this mode without the explicit metadata output, and do not
+        // infer output neutrality for any other unstable control.
+        if name != "embed-metadata"
+            || value.as_deref() != Some("no")
+            || !invocation.emit.iter().any(|kind| kind == "metadata")
+        {
+            return Err(DerivationRefusal::UnsupportedOutputOption(format!(
+                "-Z {name}"
+            )));
+        }
     }
     for (name, value) in &invocation.codegen {
         // This is an allowlist of output-neutral controls for an rlib, not a
@@ -649,6 +661,55 @@ mod tests {
         assert_eq!(names(&derive(&inv)), vec!["foo-123.d", "libfoo-123.rmeta"]);
         inv.out_dir = Some("/another/worktree/target/debug/deps".into());
         assert_eq!(names(&derive(&inv)), vec!["foo-123.d", "libfoo-123.rmeta"]);
+    }
+
+    #[test]
+    fn dependency_serving_models_only_separately_emitted_metadata() {
+        for args in [vec!["-Z", "embed-metadata=no"], vec!["-Zembed-metadata=no"]] {
+            let mut inv = dependency(&args);
+            assert_eq!(
+                names(
+                    &derive_dependency_output_declarations(&inv, "x86_64-unknown-linux-gnu")
+                        .unwrap()
+                ),
+                vec!["foo-123.d", "libfoo-123.rlib", "libfoo-123.rmeta"]
+            );
+            inv.emit = vec!["dep-info".into(), "metadata".into()];
+            assert_eq!(
+                names(
+                    &derive_dependency_output_declarations(&inv, "x86_64-unknown-linux-gnu")
+                        .unwrap()
+                ),
+                vec!["foo-123.d", "libfoo-123.rmeta"]
+            );
+            for emit in [vec![], vec!["link"], vec!["dep-info", "link"]] {
+                inv.emit = emit.into_iter().map(str::to_owned).collect();
+                assert!(
+                    derive_dependency_output_declarations(&inv, "x86_64-unknown-linux-gnu")
+                        .is_err(),
+                    "embed-metadata=no requires an explicit metadata output"
+                );
+            }
+        }
+        for args in [
+            vec!["-Z", "embed-metadata"],
+            vec!["-Z", "embed-metadata=yes"],
+            vec!["-Z", "embed-metadata=false"],
+            vec!["-Z", "embed-metadata=unknown"],
+            vec!["-Z", "embed-metadata=no", "-Z", "no-codegen"],
+            vec!["-Z", "no-codegen", "-Z", "embed-metadata=no"],
+            vec!["-Z", "embed-metadata=yes", "-Z", "embed-metadata=no"],
+            vec!["-Z", "embed-metadata=no", "-Z", "embed-metadata=yes"],
+        ] {
+            assert!(
+                derive_dependency_output_declarations(
+                    &dependency(&args),
+                    "x86_64-unknown-linux-gnu"
+                )
+                .is_err(),
+                "unmodeled unstable options remain refused: {args:?}"
+            );
+        }
     }
 
     #[test]

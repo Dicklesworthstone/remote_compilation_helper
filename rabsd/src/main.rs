@@ -32,7 +32,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 struct RabsConfig {
     socket_path: String,
     log_level: String,
-    /// Opt-in live registry-dependency lane (bd-k52xe): exact keys,
+    /// Opt-in live registry/Git dependency lane (bd-k52xe): exact keys,
     /// admitted local executions, evidence-gated serving. Off keeps every
     /// wrapper request in shadow mode (plan §154 rollout: observation →
     /// shadow → opt-in sampled serving).
