@@ -399,14 +399,9 @@ enum DrainCompletionAction {
 pub struct WorkerState {
     /// Worker configuration.
     pub config: RwLock<WorkerConfig>,
-    /// Invalidates network observations when a worker ID is retargeted. This is
-    /// separate from disk admission generations, which also advance on probes.
-    endpoint_generation: AtomicU64,
     /// Runtime-only identity: restored ownership must not reuse a generation
     /// from another daemon lifetime or a removed and reintroduced worker.
-    endpoint_incarnation: Arc<()>,
-    /// A retained Arc stops authorizing live evidence when pool removal wins.
-    endpoint_retired: AtomicBool,
+    endpoint_incarnation: Arc<WorkerEndpointIncarnation>,
     /// Authoritative worker lifecycle — the two-axis (admin intent + live
     /// eligibility) model from [`WorkerLifecycle`].
     ///
@@ -494,7 +489,60 @@ pub(crate) struct WorkerEndpointSnapshot {
     #[serde(skip)]
     pub generation: u64,
     #[serde(skip)]
-    incarnation: Option<Arc<()>>,
+    incarnation: Option<Arc<WorkerEndpointIncarnation>>,
+}
+
+#[derive(Debug)]
+struct WorkerEndpointIncarnation {
+    generation: AtomicU64,
+    retired: AtomicBool,
+}
+
+/// Stable coordinates used by durable filesystem obligations. CPU capacity
+/// and descriptive tags do not change the filesystem that failed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WorkerEndpointIdentity {
+    pub id: WorkerId,
+    pub host: String,
+    pub user: String,
+    pub identity_file: String,
+    pub declared_os: Option<String>,
+}
+
+impl WorkerEndpointIdentity {
+    pub(crate) fn from_config(config: &WorkerConfig) -> Self {
+        Self {
+            id: config.id.clone(),
+            host: config.host.clone(),
+            user: config.user.clone(),
+            identity_file: config.identity_file.clone(),
+            declared_os: rch_common::declared_os(&config.tags),
+        }
+    }
+
+    pub(crate) fn matches_config(&self, config: &WorkerConfig) -> bool {
+        self.id == config.id
+            && self.host == config.host
+            && self.user == config.user
+            && self.identity_file == config.identity_file
+            && self.declared_os == rch_common::declared_os(&config.tags)
+    }
+}
+
+impl WorkerEndpointSnapshot {
+    pub(crate) fn has_runtime_identity(&self) -> bool {
+        self.incarnation.is_some()
+    }
+
+    /// Retain a known retarget in durable decisions before process-local
+    /// generation evidence is lost on restart. Retirement alone is not a
+    /// retarget: the same filesystem may return after inventory removal.
+    pub(crate) fn source_was_retargeted(&self) -> bool {
+        self.incarnation.as_ref().is_some_and(|incarnation| {
+            self.generation != incarnation.generation.load(Ordering::Acquire)
+        })
+    }
 }
 
 fn same_endpoint(left: &WorkerConfig, right: &WorkerConfig) -> bool {
@@ -517,9 +565,10 @@ impl WorkerState {
     fn with_disk_slot_policy(config: WorkerConfig, disk_slot_policy: DiskSlotPolicy) -> Self {
         Self {
             config: RwLock::new(config),
-            endpoint_generation: AtomicU64::new(0),
-            endpoint_incarnation: Arc::new(()),
-            endpoint_retired: AtomicBool::new(false),
+            endpoint_incarnation: Arc::new(WorkerEndpointIncarnation {
+                generation: AtomicU64::new(0),
+                retired: AtomicBool::new(false),
+            }),
             lifecycle: RwLock::new(WorkerLifecycle::new()),
             used_slots: Arc::new(AtomicU32::new(0)),
             speed_score: AtomicU64::new(50.0_f64.to_bits()), // Default mid-range score
@@ -545,7 +594,7 @@ impl WorkerState {
         let config = self.config.read().await;
         WorkerEndpointSnapshot {
             config: config.clone(),
-            generation: self.endpoint_generation.load(Ordering::Acquire),
+            generation: self.endpoint_incarnation.generation.load(Ordering::Acquire),
             incarnation: Some(Arc::clone(&self.endpoint_incarnation)),
         }
     }
@@ -558,14 +607,42 @@ impl WorkerState {
         snapshot: &WorkerEndpointSnapshot,
     ) -> Option<RwLockReadGuard<'_, WorkerConfig>> {
         let config = self.config.read().await;
-        (!self.endpoint_retired.load(Ordering::Acquire)
+        (!self.endpoint_incarnation.retired.load(Ordering::Acquire)
             && snapshot
                 .incarnation
                 .as_ref()
                 .is_some_and(|incarnation| Arc::ptr_eq(incarnation, &self.endpoint_incarnation))
-            && snapshot.generation == self.endpoint_generation.load(Ordering::Acquire)
+            && snapshot.generation == self.endpoint_incarnation.generation.load(Ordering::Acquire)
             && same_endpoint(&config, &snapshot.config))
         .then_some(config)
+    }
+
+    /// Durable filesystem failures survive daemon restart and inventory
+    /// removal. A live retarget invalidates their publication, including ABA.
+    /// A retired incarnation that never retargeted may resume its deferred
+    /// obligation on matching coordinates; this does not authorize health or
+    /// cache feedback from the old build.
+    pub(crate) async fn lock_disk_fault_endpoint(
+        &self,
+        identity: &WorkerEndpointIdentity,
+        runtime: Option<&WorkerEndpointSnapshot>,
+    ) -> Option<RwLockReadGuard<'_, WorkerConfig>> {
+        let config = self.config.read().await;
+        let runtime_matches = runtime.is_none_or(|snapshot| {
+            snapshot.incarnation.as_ref().is_some_and(|incarnation| {
+                snapshot.generation == incarnation.generation.load(Ordering::Acquire)
+                    && (Arc::ptr_eq(incarnation, &self.endpoint_incarnation)
+                        || incarnation.retired.load(Ordering::Acquire))
+            })
+        });
+        (!self.endpoint_incarnation.retired.load(Ordering::Acquire)
+            && identity.matches_config(&config)
+            && runtime_matches)
+            .then_some(config)
+    }
+
+    pub(crate) fn is_endpoint_retired(&self) -> bool {
+        self.endpoint_incarnation.retired.load(Ordering::Acquire)
     }
 
     /// Pool removal uses workers -> config order. A publication that already
@@ -573,7 +650,9 @@ impl WorkerState {
     /// can never credit the ID after a replacement is installed.
     async fn retire_endpoint(&self) {
         let _config = self.config.write().await;
-        self.endpoint_retired.store(true, Ordering::Release);
+        self.endpoint_incarnation
+            .retired
+            .store(true, Ordering::Release);
     }
 
     /// Update configuration, returning whether the connection endpoint changed.
@@ -583,7 +662,9 @@ impl WorkerState {
             let endpoint_changed = !same_endpoint(&config, &new_config);
             self.disk_capacity_generation.fetch_add(1, Ordering::AcqRel);
             if endpoint_changed {
-                self.endpoint_generation.fetch_add(1, Ordering::AcqRel);
+                self.endpoint_incarnation
+                    .generation
+                    .fetch_add(1, Ordering::AcqRel);
                 // Observations of the previous host/key/OS cannot condemn (or
                 // qualify) its replacement. Preserve build ownership and the
                 // operator's administrative intent, including an active bypass.

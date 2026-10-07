@@ -3,7 +3,7 @@
 //! Maintains a ring buffer of recent builds for status reporting and analytics.
 
 use crate::disk_pressure::{DiskHeadroomAdmission, DiskHeadroomRejection};
-use crate::workers::WorkerEndpointSnapshot;
+use crate::workers::{WorkerEndpointIdentity, WorkerEndpointSnapshot};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use rch_common::{
     BuildCancellationMetadata, BuildHeartbeatPhase, BuildHeartbeatRequest, BuildLocation,
@@ -65,9 +65,14 @@ struct TerminalOwnership {
     /// before its worker quarantine is durable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pending_disk_fault: Option<PendingDiskFault>,
+    /// Preserve a late fault whose endpoint is stale or unknown, without
+    /// granting it authority over a replacement worker. This evidence follows
+    /// normal terminal receipt retention; it is never replayed as quarantine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    unapplied_disk_fault: Option<PendingDiskFault>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PendingDiskFault {
     pub build_id: u64,
@@ -75,7 +80,26 @@ pub(crate) struct PendingDiskFault {
     pub incident_id: String,
     pub roots: Vec<String>,
     pub reported_unix_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_endpoint: Option<WorkerEndpointIdentity>,
+    /// Additional same-daemon ABA evidence; persistence equality deliberately
+    /// excludes this runtime-only authority, which never survives restart.
+    #[serde(skip)]
+    pub runtime_endpoint: Option<WorkerEndpointSnapshot>,
 }
+
+impl PartialEq for PendingDiskFault {
+    fn eq(&self, other: &Self) -> bool {
+        self.build_id == other.build_id
+            && self.worker_id == other.worker_id
+            && self.incident_id == other.incident_id
+            && self.roots == other.roots
+            && self.reported_unix_ms == other.reported_unix_ms
+            && self.worker_endpoint == other.worker_endpoint
+    }
+}
+
+impl Eq for PendingDiskFault {}
 
 /// Terminal result supplied by completion or cancellation; ownership stays separate.
 pub struct BuildCompletion {
@@ -585,7 +609,15 @@ impl BuildHistory {
         // Recovery may meanwhile have promoted the worker from an older
         // healthy probe. Its transient lifecycle must not authorize a new
         // build while the newer fault is still awaiting durable quarantine.
-        if self.has_pending_disk_fault(&state.worker_id) {
+        let pending_disk_fault = state.worker_endpoint.as_ref().map_or_else(
+            || self.has_pending_disk_fault(&state.worker_id),
+            |endpoint| {
+                self.has_pending_disk_fault_for_endpoint(&WorkerEndpointIdentity::from_config(
+                    &endpoint.config,
+                ))
+            },
+        );
+        if pending_disk_fault {
             return Ok(None);
         }
         // This lock also serializes completion. Two selectors may have seen
@@ -1683,7 +1715,19 @@ impl BuildHistory {
                 }
                 for receipt in snapshot.completed {
                     let id = receipt.record.id;
-                    if let Some(fault) = &receipt.pending_disk_fault {
+                    if receipt.pending_disk_fault.is_some()
+                        && receipt.unapplied_disk_fault.is_some()
+                    {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "disk fault cannot be pending and archived",
+                        ));
+                    }
+                    for fault in receipt
+                        .pending_disk_fault
+                        .iter()
+                        .chain(receipt.unapplied_disk_fault.iter())
+                    {
                         let normalized =
                             crate::bypass_recovery_service::validate_disk_fault_roots(&fault.roots)
                                 .map_err(|error| {
@@ -1695,6 +1739,10 @@ impl BuildHistory {
                         if fault.build_id != id
                             || receipt.record.worker_id.as_deref() != Some(fault.worker_id.as_str())
                             || fault.worker_id.is_empty()
+                            || fault.worker_endpoint.as_ref().is_some_and(|endpoint| {
+                                endpoint.id.as_str() != fault.worker_id
+                                    || receipt.record.location != BuildLocation::Remote
+                            })
                             || receipt.record.exit_code == 0
                             || fault.incident_id
                                 != format!("build:{id}:{}", receipt.record.completed_at)
@@ -1922,12 +1970,56 @@ impl BuildHistory {
             })
     }
 
+    pub(crate) fn has_pending_disk_fault_for_endpoint(
+        &self,
+        endpoint: &WorkerEndpointIdentity,
+    ) -> bool {
+        self.terminal
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .any(|receipt| {
+                receipt
+                    .pending_disk_fault
+                    .as_ref()
+                    .is_some_and(|fault| fault.worker_endpoint.as_ref() == Some(endpoint))
+            })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn unapplied_disk_fault(&self, build_id: u64) -> Option<PendingDiskFault> {
+        self.terminal
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&build_id)
+            .and_then(|receipt| receipt.unapplied_disk_fault.clone())
+    }
+
     /// The caller holds the bypass store lock until this commit finishes, so
     /// recovery cannot erase its incident receipt before acknowledgment.
     pub(crate) fn acknowledge_disk_fault(
         &self,
         build_id: u64,
         incident_id: &str,
+    ) -> std::io::Result<()> {
+        self.resolve_disk_fault(build_id, incident_id, false)
+    }
+
+    /// A mismatched or legacy fault remains inspectable in its terminal
+    /// receipt, but cannot block admission or later quarantine any endpoint.
+    pub(crate) fn archive_disk_fault(
+        &self,
+        build_id: u64,
+        incident_id: &str,
+    ) -> std::io::Result<()> {
+        self.resolve_disk_fault(build_id, incident_id, true)
+    }
+
+    fn resolve_disk_fault(
+        &self,
+        build_id: u64,
+        incident_id: &str,
+        archive: bool,
     ) -> std::io::Result<()> {
         let active = self.active.write().unwrap_or_else(|e| e.into_inner());
         let mut receipt = self
@@ -1948,7 +2040,10 @@ impl BuildHistory {
                 "worker disk fault identity mismatch",
             ));
         }
-        receipt.pending_disk_fault = None;
+        let fault = receipt.pending_disk_fault.take();
+        if archive {
+            receipt.unapplied_disk_fault = fault;
+        }
         self.persist_ownership(&active, Some(&receipt))?;
         self.terminal
             .write()
@@ -2020,7 +2115,7 @@ impl BuildHistory {
             timing,
             cancellation,
         };
-        let pending_disk_fault = if exit_code != 0 {
+        let disk_fault = if exit_code != 0 {
             disk_roots
                 .map(|roots| {
                     crate::bypass_recovery_service::validate_disk_fault_roots(&roots).map(|roots| {
@@ -2031,6 +2126,14 @@ impl BuildHistory {
                             roots,
                             reported_unix_ms: u64::try_from(Utc::now().timestamp_millis())
                                 .unwrap_or(0),
+                            worker_endpoint: state.worker_endpoint.as_ref().map(|endpoint| {
+                                WorkerEndpointIdentity::from_config(&endpoint.config)
+                            }),
+                            runtime_endpoint: state
+                                .worker_endpoint
+                                .as_ref()
+                                .filter(|endpoint| endpoint.has_runtime_identity())
+                                .cloned(),
                         }
                     })
                 })
@@ -2041,10 +2144,25 @@ impl BuildHistory {
         } else {
             None
         };
+        // The first terminal commit must retain a retarget already known by
+        // the originating incarnation. Deferring this decision until bypass
+        // publication loses ABA evidence if the daemon crashes in between.
+        // Unknown restart epochs and same-generation retirement remain valid
+        // durable obligations for their saved coordinates.
+        let (pending_disk_fault, unapplied_disk_fault) = if state
+            .worker_endpoint
+            .as_ref()
+            .is_some_and(WorkerEndpointSnapshot::source_was_retargeted)
+        {
+            (None, disk_fault)
+        } else {
+            (disk_fault, None)
+        };
         let receipt = TerminalOwnership {
             record: record.clone(),
             local_wrapper_id: state.local_wrapper_id.clone(),
             pending_disk_fault,
+            unapplied_disk_fault,
         };
         prune_terminal_receipts(
             &mut self.terminal.write().unwrap_or_else(|e| e.into_inner()),
@@ -3137,6 +3255,266 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn disk_fault_archive_is_durable_owner_validated_and_endpoint_scoped() {
+        let root = TempDir::new().unwrap();
+        let path = root.path().join("history.jsonl");
+        let config = rch_common::WorkerConfig {
+            id: WorkerId::new("disk-worker"),
+            host: "admitted.example".into(),
+            ..Default::default()
+        };
+        let worker = crate::workers::WorkerState::new(config.clone());
+        let endpoint = worker.endpoint_snapshot().await;
+        let history = BuildHistory::new(10).with_persistence(path.clone());
+        let build = history
+            .try_start_active_build_with_waiter(
+                "failed-volume".into(),
+                config.id.to_string(),
+                "cargo test".into(),
+                0,
+                Some("disk-owner".into()),
+                2,
+                BuildLocation::Remote,
+                None,
+                DiskHeadroomAdmission::default(),
+                Some(endpoint.clone()),
+            )
+            .unwrap()
+            .unwrap();
+        history
+            .complete_durable_with_disk_fault(
+                build.id,
+                "disk-worker",
+                Some("disk-owner"),
+                disk_budget_completion(101),
+                Some(vec!["/admitted-volume/rch".into()]),
+            )
+            .unwrap()
+            .unwrap();
+        let fault = history.pending_disk_fault(build.id).unwrap();
+        assert!(fault.runtime_endpoint.is_some());
+        assert!(
+            history
+                .has_pending_disk_fault_for_endpoint(&WorkerEndpointIdentity::from_config(&config))
+        );
+        assert!(
+            history
+                .try_start_active_build_with_waiter(
+                    "same-endpoint".into(),
+                    config.id.to_string(),
+                    "cargo build".into(),
+                    0,
+                    None,
+                    1,
+                    BuildLocation::Remote,
+                    None,
+                    DiskHeadroomAdmission::default(),
+                    Some(endpoint),
+                )
+                .unwrap()
+                .is_none()
+        );
+        let replacement = crate::workers::WorkerState::new(rch_common::WorkerConfig {
+            host: "replacement.example".into(),
+            ..config
+        });
+        let replacement_endpoint = replacement.endpoint_snapshot().await;
+        assert!(!history.has_pending_disk_fault_for_endpoint(
+            &WorkerEndpointIdentity::from_config(&replacement_endpoint.config)
+        ));
+        assert!(
+            history
+                .try_start_active_build_with_waiter(
+                    "different-endpoint".into(),
+                    "disk-worker".into(),
+                    "cargo build".into(),
+                    0,
+                    None,
+                    1,
+                    BuildLocation::Remote,
+                    None,
+                    DiskHeadroomAdmission::default(),
+                    Some(replacement_endpoint),
+                )
+                .unwrap()
+                .is_some(),
+            "an absent endpoint's fault cannot fence a replacement ID"
+        );
+
+        assert_eq!(
+            history
+                .archive_disk_fault(build.id, "wrong-incident")
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(history.pending_disk_fault(build.id), Some(fault.clone()));
+        history
+            .archive_disk_fault(build.id, &fault.incident_id)
+            .unwrap();
+        assert!(history.pending_disk_fault(build.id).is_none());
+        assert_eq!(history.unapplied_disk_fault(build.id), Some(fault.clone()));
+        let restored = BuildHistory::load_from_file(&path, 10).unwrap();
+        let archived = restored.unapplied_disk_fault(build.id).unwrap();
+        assert_eq!(archived, fault);
+        assert!(archived.runtime_endpoint.is_none());
+        assert!(restored.pending_disk_faults().is_empty());
+        let snapshot: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path.with_extension("ownership.json")).unwrap())
+                .unwrap();
+        for corruption in [
+            "mismatched_worker",
+            "pending_and_archived",
+            "wrong_incident",
+        ] {
+            let mut invalid = snapshot.clone();
+            match corruption {
+                "mismatched_worker" => {
+                    invalid["completed"][0]["unapplied_disk_fault"]["worker_endpoint"]["id"] =
+                        serde_json::json!("replacement-owner")
+                }
+                "pending_and_archived" => {
+                    invalid["completed"][0]["pending_disk_fault"] =
+                        invalid["completed"][0]["unapplied_disk_fault"].clone()
+                }
+                "wrong_incident" => {
+                    invalid["completed"][0]["unapplied_disk_fault"]["incident_id"] =
+                        serde_json::json!("new-unowned-incident")
+                }
+                _ => unreachable!(),
+            }
+            assert_recovery_rejects_without_rewriting(&path, &invalid);
+        }
+    }
+
+    #[tokio::test]
+    async fn disk_fault_first_terminal_commit_preserves_known_retarget_across_restart() {
+        for change in ["aba", "retarget_removed", "removed", "active_restarted"] {
+            let root = TempDir::new().unwrap();
+            let path = root.path().join("history.jsonl");
+            let store_path = root.path().join("bypasses.json");
+            let original = rch_common::WorkerConfig {
+                id: WorkerId::new("disk-worker"),
+                host: "admitted.example".into(),
+                total_slots: 8,
+                ..Default::default()
+            };
+            let pool = crate::workers::WorkerPool::new();
+            pool.add_worker(original.clone()).await;
+            let worker = pool.get(&original.id).await.unwrap();
+            let mut history = BuildHistory::new(10).with_persistence(path.clone());
+            let build = history
+                .try_start_active_build_with_waiter(
+                    "late-disk-fault".into(),
+                    original.id.to_string(),
+                    "cargo build".into(),
+                    0,
+                    Some("disk-owner".into()),
+                    2,
+                    BuildLocation::Remote,
+                    None,
+                    DiskHeadroomAdmission::default(),
+                    Some(worker.endpoint_snapshot().await),
+                )
+                .unwrap()
+                .unwrap();
+            if matches!(change, "aba" | "retarget_removed") {
+                pool.add_worker(rch_common::WorkerConfig {
+                    host: "replacement.example".into(),
+                    ..original.clone()
+                })
+                .await;
+                if change == "aba" {
+                    pool.add_worker(original.clone()).await;
+                }
+            }
+            if matches!(change, "removed" | "retarget_removed") {
+                assert!(pool.remove_worker(&original.id).await);
+            } else if change == "active_restarted" {
+                history = BuildHistory::load_from_file(&path, 10).unwrap();
+            }
+            let (completed, record) = history
+                .complete_durable_with_disk_fault(
+                    build.id,
+                    "disk-worker",
+                    Some("disk-owner"),
+                    disk_budget_completion(101),
+                    Some(vec!["/admitted-volume/rch".into()]),
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(completed.slots, 2);
+            let known_retarget = matches!(change, "aba" | "retarget_removed");
+            let evidence = if known_retarget {
+                assert!(history.pending_disk_fault(build.id).is_none(), "{change}");
+                history.unapplied_disk_fault(build.id).unwrap()
+            } else {
+                assert!(history.unapplied_disk_fault(build.id).is_none(), "{change}");
+                history.pending_disk_fault(build.id).unwrap()
+            };
+            assert_eq!(
+                evidence.incident_id,
+                format!("build:{}:{}", build.id, record.completed_at)
+            );
+            assert_eq!(evidence.roots, ["/admitted-volume/rch"]);
+            assert!(
+                evidence
+                    .worker_endpoint
+                    .as_ref()
+                    .unwrap()
+                    .matches_config(&original)
+            );
+
+            // Stop at the actual first ownership commit: no bypass producer or
+            // archive acknowledgment runs before reopening the durable file.
+            drop(history);
+            let restored = BuildHistory::load_from_file(&path, 10).unwrap();
+            let worker = std::sync::Arc::new(crate::workers::WorkerState::new(original));
+            assert!(worker.reserve_slots(1).await); // Unrelated surviving work.
+            let store = std::sync::Arc::new(tokio::sync::Mutex::new(
+                rch_common::BypassRecordStore::with_path(&store_path),
+            ));
+            let restored_evidence = if known_retarget {
+                assert!(restored.pending_disk_faults().is_empty());
+                restored.unapplied_disk_fault(build.id).unwrap()
+            } else {
+                restored.pending_disk_fault(build.id).unwrap()
+            };
+            assert_eq!(restored_evidence, evidence);
+            assert!(restored_evidence.runtime_endpoint.is_none());
+            crate::bypass_recovery_service::apply_owned_disk_fault(
+                &store,
+                Some(&worker),
+                &restored,
+                &restored_evidence,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                worker.used_slots(),
+                1,
+                "replay cannot release another build"
+            );
+            assert_eq!(
+                worker.lifecycle().await.is_schedulable(),
+                known_retarget,
+                "{change}"
+            );
+            assert_eq!(
+                rch_common::BypassRecordStore::load(&store_path).contains("disk-worker"),
+                !known_retarget,
+                "{change}"
+            );
+            if known_retarget {
+                assert_eq!(restored.unapplied_disk_fault(build.id), Some(evidence));
+            } else {
+                assert!(restored.pending_disk_faults().is_empty());
+                assert!(restored.unapplied_disk_fault(build.id).is_none());
+            }
+        }
+    }
+
     #[test]
     fn recovery_rejects_duplicate_active_wrappers_across_projects_and_workers() {
         for version in [1, 2] {
@@ -3782,6 +4160,7 @@ mod tests {
                     record,
                     local_wrapper_id: None,
                     pending_disk_fault: None,
+                    unapplied_disk_fault: None,
                 },
             )
         };

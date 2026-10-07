@@ -53,10 +53,11 @@ use rch_common::ssh::{SshClient, SshOptions};
 use rch_common::{BypassFailureClass, WorkerConfig, WorkerId};
 use rch_telemetry::remediation::{self, BypassTransition, SelfHealingAction, SelfHealingOutcome};
 
-use crate::history::BuildHistory;
+use crate::history::{BuildHistory, PendingDiskFault};
 use crate::telemetry::TelemetryStore;
 use crate::workers::{
-    AdminIntent, EligibilityState, WorkerEndpointSnapshot, WorkerPool, WorkerState,
+    AdminIntent, EligibilityState, WorkerEndpointIdentity, WorkerEndpointSnapshot, WorkerPool,
+    WorkerState,
 };
 
 /// Current epoch milliseconds (the clock the decision core reasons in).
@@ -607,10 +608,108 @@ pub fn validate_disk_fault_roots(roots: &[String]) -> anyhow::Result<Vec<String>
 /// completion intent. Recovery shares this lock and additionally checks the
 /// history's pending intents, so a failed acknowledgment cannot lose dedupe
 /// evidence by letting the worker rejoin first.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub async fn record_worker_disk_bypass(
     store: &Arc<Mutex<BypassRecordStore>>,
     worker: Option<&Arc<WorkerState>>,
+    worker_id: &str,
+    incident_id: &str,
+    roots: &[String],
+    diagnostic: &str,
+    now_ms: u64,
+    acknowledge: impl FnOnce() -> std::io::Result<()>,
+) -> anyhow::Result<()> {
+    let mut store = store.lock().await;
+    let config = if let Some(worker) = worker {
+        Some(worker.config.read().await)
+    } else {
+        None
+    };
+    record_worker_disk_bypass_locked(
+        &mut store,
+        worker.map(Arc::as_ref),
+        config.as_deref(),
+        worker_id,
+        incident_id,
+        roots,
+        diagnostic,
+        now_ms,
+        acknowledge,
+    )
+    .await
+}
+
+/// Resolve a completion's disk fault using its admitted endpoint, never the
+/// current meaning of a worker ID. An absent known endpoint keeps its durable
+/// obligation for a later inventory change; stale or unknown origins remain
+/// archived terminal evidence and cannot seed a future bypass reconciliation.
+pub(crate) async fn apply_owned_disk_fault(
+    store: &Arc<Mutex<BypassRecordStore>>,
+    worker: Option<&Arc<WorkerState>>,
+    history: &BuildHistory,
+    fault: &PendingDiskFault,
+) -> anyhow::Result<bool> {
+    let mut store = store.lock().await;
+    // Another completion/replay may have resolved this snapshot while we
+    // waited. Never recreate quarantine from an acknowledged terminal fault.
+    let Some(current) = history.pending_disk_fault(fault.build_id) else {
+        return Ok(true);
+    };
+    anyhow::ensure!(
+        current == *fault,
+        "disk-fault intent changed before publication"
+    );
+    let Some(endpoint) = current.worker_endpoint.as_ref() else {
+        history.archive_disk_fault(current.build_id, &current.incident_id)?;
+        return Ok(true);
+    };
+    anyhow::ensure!(
+        endpoint.id.as_str() == current.worker_id,
+        "disk-fault endpoint does not match its owner"
+    );
+    let Some(worker) = worker else {
+        return Ok(false);
+    };
+    let Some(config) = worker
+        .lock_disk_fault_endpoint(endpoint, current.runtime_endpoint.as_ref())
+        .await
+    else {
+        // The pool lookup may predate removal while we waited for the store.
+        // A retired candidate is absence, not proof that the admitted endpoint
+        // was replaced; a later matching reintroduction still owes this fault.
+        if worker.is_endpoint_retired() {
+            return Ok(false);
+        }
+        history.archive_disk_fault(current.build_id, &current.incident_id)?;
+        return Ok(true);
+    };
+    record_worker_disk_bypass_locked(
+        &mut store,
+        Some(worker),
+        Some(&config),
+        &current.worker_id,
+        &current.incident_id,
+        &current.roots,
+        &format!(
+            "remote build {} reported disk space or quota exhaustion",
+            current.build_id
+        ),
+        current.reported_unix_ms,
+        || history.acknowledge_disk_fault(current.build_id, &current.incident_id),
+    )
+    .await?;
+    Ok(true)
+}
+
+/// Both guards stay with the caller through the lifecycle transition, durable
+/// bypass write, and exact incident acknowledgment. Reacquiring the config
+/// lock here could deadlock behind a queued writer.
+#[allow(clippy::too_many_arguments)]
+async fn record_worker_disk_bypass_locked(
+    store: &mut BypassRecordStore,
+    worker: Option<&WorkerState>,
+    config: Option<&WorkerConfig>,
     worker_id: &str,
     incident_id: &str,
     roots: &[String],
@@ -625,13 +724,7 @@ pub async fn record_worker_disk_bypass(
             && !incident_id.chars().any(char::is_control),
         "invalid disk-fault incident identity"
     );
-    let mut store = store.lock().await;
-    let config = if let Some(worker) = worker {
-        Some(worker.config.read().await)
-    } else {
-        None
-    };
-    let (host, user) = if let Some(config) = &config {
+    let (host, user) = if let Some(config) = config {
         anyhow::ensure!(
             config.id.as_str() == worker_id,
             "disk-fault worker identity mismatch"
@@ -667,9 +760,7 @@ pub async fn record_worker_disk_bypass(
     );
     let mut record = if let Some(previous) = previous {
         let mut record = previous.clone();
-        let retargeted = config
-            .as_ref()
-            .is_some_and(|config| rebind_recovery(&mut record, config, now_ms));
+        let retargeted = config.is_some_and(|config| rebind_recovery(&mut record, config, now_ms));
         record.failure_class = BypassFailureClass::DiskInodePressure;
         record.reason_code = record.failure_class.incident_reason_code();
         if !already_recorded {
@@ -692,7 +783,7 @@ pub async fn record_worker_disk_bypass(
         )
         .with_diagnostic(diagnostic)
     };
-    if let Some(config) = &config {
+    if let Some(config) = config {
         record
             .details
             .insert(RECOVERY_ENDPOINT.into(), recovery_endpoint(config));
@@ -772,6 +863,7 @@ impl<P: RecoveryProber + 'static> BypassRecoveryService<P> {
     pub fn start(self) -> JoinHandle<()> {
         tokio::spawn(async move {
             let mut endpoint_changes = self.pool.subscribe_endpoint_changes();
+            self.replay_pending_disk_faults().await;
             self.reconcile_on_start().await;
             let mut ticker = interval(self.config.check_interval);
             loop {
@@ -784,10 +876,34 @@ impl<P: RecoveryProber + 'static> BypassRecoveryService<P> {
                     }
                 }
                 let now = now_unix_ms();
+                self.replay_pending_disk_faults().await;
                 self.detect_new_bypasses(now).await;
                 self.evaluate_once(now).await;
             }
         })
+    }
+
+    /// Known endpoints may be absent when completion is recorded. Retry their
+    /// durable obligations after inventory changes and on each regular scan,
+    /// before admitting recovery from an older healthy observation.
+    async fn replay_pending_disk_faults(&self) {
+        let Some(history) = self.history.as_ref() else {
+            return;
+        };
+        let _release_guard = history.lock_releases().await;
+        for fault in history.pending_disk_faults() {
+            let worker = self.pool.get(&WorkerId::new(&fault.worker_id)).await;
+            if let Err(error) =
+                apply_owned_disk_fault(&self.store, worker.as_ref(), history, &fault).await
+            {
+                warn!(
+                    build_id = fault.build_id,
+                    worker_id = %fault.worker_id,
+                    %error,
+                    "failed to resolve pending worker disk fault"
+                );
+            }
+        }
     }
 
     /// Bind persisted retry state to the currently configured endpoint before
@@ -977,10 +1093,11 @@ impl<P: RecoveryProber + 'static> BypassRecoveryService<P> {
             return;
         };
         if !record.probe_due(now_ms)
-            || self
-                .history
-                .as_ref()
-                .is_some_and(|history| history.has_pending_disk_fault(&worker_id))
+            || self.history.as_ref().is_some_and(|history| {
+                history.has_pending_disk_fault_for_endpoint(&WorkerEndpointIdentity::from_config(
+                    &snapshot.config,
+                ))
+            })
         {
             return;
         }
@@ -1078,7 +1195,7 @@ impl<P: RecoveryProber + 'static> BypassRecoveryService<P> {
                 let expected = (*record).clone();
                 match decide_canary(*record, outcome, now_ms) {
                     CanaryDecision::Rejoin => {
-                        if self.rejoin(&worker, &mut store, &expected).await {
+                        if self.rejoin(&worker, &mut store, &expected, &snapshot).await {
                             info!(worker = %worker_id, "canary passed; rejoined worker");
                         }
                     }
@@ -1097,7 +1214,7 @@ impl<P: RecoveryProber + 'static> BypassRecoveryService<P> {
                     .get(&worker_id)
                     .cloned()
                     .expect("record compared above");
-                if self.rejoin(&worker, &mut store, &expected).await {
+                if self.rejoin(&worker, &mut store, &expected, &snapshot).await {
                     info!(worker = %worker_id, "recovery criteria met (no canary required); rejoined worker");
                 }
             }
@@ -1115,12 +1232,13 @@ impl<P: RecoveryProber + 'static> BypassRecoveryService<P> {
         worker: &Arc<WorkerState>,
         store: &mut BypassRecordStore,
         expected: &BypassRecord,
+        endpoint: &WorkerEndpointSnapshot,
     ) -> bool {
-        if self
-            .history
-            .as_ref()
-            .is_some_and(|history| history.has_pending_disk_fault(&expected.worker_id))
-        {
+        if self.history.as_ref().is_some_and(|history| {
+            history.has_pending_disk_fault_for_endpoint(&WorkerEndpointIdentity::from_config(
+                &endpoint.config,
+            ))
+        }) {
             return false;
         }
         // Keep admission closed if durable retirement fails. `remove` updates
@@ -1996,15 +2114,23 @@ mod tests {
         let history = Arc::new(
             BuildHistory::new(10).with_persistence(directory.path().join("history.jsonl")),
         );
-        let build = history.start_active_build_with_wrapper(
-            "project".into(),
-            "disk-worker".into(),
-            "cargo build".into(),
-            12345,
-            Some("disk-owner".into()),
-            1,
-            rch_common::BuildLocation::Remote,
-        );
+        let pool = pool_with(&["disk-worker"]).await;
+        let worker = pool.get(&WorkerId::new("disk-worker")).await.unwrap();
+        let build = history
+            .try_start_active_build_with_waiter(
+                "project".into(),
+                "disk-worker".into(),
+                "cargo build".into(),
+                12345,
+                Some("disk-owner".into()),
+                1,
+                rch_common::BuildLocation::Remote,
+                None,
+                crate::disk_pressure::DiskHeadroomAdmission::default(),
+                Some(worker.endpoint_snapshot().await),
+            )
+            .unwrap()
+            .unwrap();
         history
             .complete_durable_with_disk_fault(
                 build.id,
@@ -2024,8 +2150,6 @@ mod tests {
         let store = Arc::new(Mutex::new(BypassRecordStore::with_path(
             directory.path().join("bypasses.json"),
         )));
-        let pool = pool_with(&["disk-worker"]).await;
-        let worker = pool.get(&WorkerId::new("disk-worker")).await.unwrap();
         assert!(
             record_worker_disk_bypass(
                 &store,
@@ -2069,6 +2193,140 @@ mod tests {
         service.evaluate_once(T0 + 60_000).await;
         assert!(worker.lifecycle().await.is_schedulable());
         assert!(!store.lock().await.contains("disk-worker"));
+    }
+
+    async fn owned_disk_fault_fixture(
+        directory: &std::path::Path,
+        worker: &WorkerState,
+    ) -> (Arc<BuildHistory>, PendingDiskFault) {
+        let history =
+            Arc::new(BuildHistory::new(10).with_persistence(directory.join("history.jsonl")));
+        let endpoint = worker.endpoint_snapshot().await;
+        let id = endpoint.config.id.to_string();
+        let build = history
+            .try_start_active_build_with_waiter(
+                "owned-disk-project".into(),
+                id.clone(),
+                "cargo build".into(),
+                0,
+                Some("owned-disk-wrapper".into()),
+                1,
+                rch_common::BuildLocation::Remote,
+                None,
+                crate::disk_pressure::DiskHeadroomAdmission::default(),
+                Some(endpoint),
+            )
+            .unwrap()
+            .unwrap();
+        history
+            .complete_durable_with_disk_fault(
+                build.id,
+                &id,
+                Some("owned-disk-wrapper"),
+                crate::history::BuildCompletion {
+                    exit_code: 101,
+                    duration_ms: Some(10),
+                    bytes_transferred: None,
+                    timing: None,
+                    cancellation: None,
+                },
+                Some(vec!["/admitted-volume/rch".into()]),
+            )
+            .unwrap()
+            .unwrap();
+        let fault = history.pending_disk_fault(build.id).unwrap();
+        (history, fault)
+    }
+
+    #[tokio::test]
+    async fn pending_disk_replay_defers_absent_workers_and_binds_reintroduction() {
+        for matching in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let pool = pool_with(&["disk-worker"]).await;
+            let id = WorkerId::new("disk-worker");
+            let admitted = pool.get(&id).await.unwrap();
+            let original = admitted.endpoint_snapshot().await.config;
+            let (history, fault) = owned_disk_fault_fixture(directory.path(), &admitted).await;
+            let store = Arc::new(Mutex::new(BypassRecordStore::with_path(
+                directory.path().join("bypasses.json"),
+            )));
+            let service = BypassRecoveryService::new(
+                pool.clone(),
+                store.clone(),
+                FakeProber::new(vec![], RecoveryProbe::all_ok(), CanaryOutcome::Passed),
+                BypassRecoveryConfig::default(),
+            )
+            .with_history(history.clone());
+            assert!(pool.remove_worker(&id).await);
+            let ownership_path = directory.path().join("history.ownership.json");
+            let before = std::fs::read(&ownership_path).unwrap();
+            assert!(
+                !apply_owned_disk_fault(&store, None, &history, &fault)
+                    .await
+                    .unwrap()
+            );
+            assert!(
+                !apply_owned_disk_fault(&store, Some(&admitted), &history, &fault)
+                    .await
+                    .unwrap(),
+                "a lookup that raced removal must keep the absent obligation"
+            );
+            service.replay_pending_disk_faults().await;
+            assert_eq!(
+                history.pending_disk_fault(fault.build_id),
+                Some(fault.clone())
+            );
+            assert_eq!(std::fs::read(&ownership_path).unwrap(), before);
+            assert!(!store.lock().await.contains(id.as_str()));
+
+            let mut replacement = original;
+            if !matching {
+                replacement.host = "replacement.example".into();
+            }
+            pool.add_worker(replacement).await;
+            let worker = pool.get(&id).await.unwrap();
+            service.replay_pending_disk_faults().await;
+            assert!(history.pending_disk_fault(fault.build_id).is_none());
+            if matching {
+                let record = store.lock().await.get(id.as_str()).unwrap().clone();
+                assert_eq!(record.disk_roots, fault.roots);
+                assert!(history.unapplied_disk_fault(fault.build_id).is_none());
+                assert!(!worker.lifecycle().await.is_schedulable());
+            } else {
+                assert!(!store.lock().await.contains(id.as_str()));
+                assert!(worker.lifecycle().await.is_schedulable());
+                assert_eq!(history.unapplied_disk_fault(fault.build_id), Some(fault));
+                service.reconcile_on_start().await;
+                assert!(worker.lifecycle().await.is_schedulable());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn acknowledged_disk_fault_snapshot_cannot_resurrect_quarantine() {
+        let directory = tempfile::tempdir().unwrap();
+        let pool = pool_with(&["disk-worker"]).await;
+        let worker = pool.get(&WorkerId::new("disk-worker")).await.unwrap();
+        let (history, fault) = owned_disk_fault_fixture(directory.path(), &worker).await;
+        let store = Arc::new(Mutex::new(BypassRecordStore::with_path(
+            directory.path().join("bypasses.json"),
+        )));
+        apply_owned_disk_fault(&store, Some(&worker), &history, &fault)
+            .await
+            .unwrap();
+        assert!(history.pending_disk_fault(fault.build_id).is_none());
+        store.lock().await.remove("disk-worker").unwrap();
+        worker.recover_to_canary().await.unwrap();
+        worker.promote_from_canary().await.unwrap();
+        // A background pass can hold this old snapshot while normal release
+        // finishes publication and recovery retires the incident.
+        assert!(
+            apply_owned_disk_fault(&store, Some(&worker), &history, &fault)
+                .await
+                .unwrap()
+        );
+        assert!(!store.lock().await.contains("disk-worker"));
+        assert!(worker.lifecycle().await.is_schedulable());
     }
 
     #[test]

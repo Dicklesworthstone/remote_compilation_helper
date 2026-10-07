@@ -3364,7 +3364,10 @@ async fn handle_release_worker(ctx: &DaemonContext, request: ReleaseRequest) -> 
             // Its newly supplied flags/paths cannot rewrite a terminal build.
             let Some((state, record)) = completion else {
                 if let Some(fault) = ctx.history.pending_disk_fault(build_id) {
-                    apply_pending_disk_fault(ctx, &fault).await?;
+                    anyhow::ensure!(
+                        apply_pending_disk_fault(ctx, &fault).await?,
+                        "disk-fault endpoint is absent; durable incident is pending reintroduction"
+                    );
                 }
                 return Ok(());
             };
@@ -3391,7 +3394,15 @@ async fn handle_release_worker(ctx: &DaemonContext, request: ReleaseRequest) -> 
             .build_id
             .expect("durable build identity checked above"),
     ) {
-        apply_pending_disk_fault(ctx, &fault).await
+        apply_pending_disk_fault(ctx, &fault)
+            .await
+            .and_then(|resolved| {
+                anyhow::ensure!(
+                    resolved,
+                    "disk-fault endpoint is absent; durable incident is pending reintroduction"
+                );
+                Ok(())
+            })
     } else {
         Ok(())
     };
@@ -3474,38 +3485,46 @@ async fn handle_release_worker(ctx: &DaemonContext, request: ReleaseRequest) -> 
 async fn apply_pending_disk_fault(
     ctx: &DaemonContext,
     fault: &crate::history::PendingDiskFault,
-) -> Result<()> {
+) -> Result<bool> {
     let worker = ctx.pool.get(&WorkerId::new(&fault.worker_id)).await;
     let Some(store) = &ctx.bypass_store else {
-        if let Some(worker) = worker {
-            worker
-                .enter_bypass(rch_common::BypassFailureClass::DiskInodePressure)
-                .await;
-        }
+        let Some(endpoint) = fault.worker_endpoint.as_ref() else {
+            ctx.history
+                .archive_disk_fault(fault.build_id, &fault.incident_id)?;
+            return Ok(true);
+        };
+        let Some(worker) = worker else {
+            return Ok(false);
+        };
+        let Some(_config) = worker
+            .lock_disk_fault_endpoint(endpoint, fault.runtime_endpoint.as_ref())
+            .await
+        else {
+            if worker.is_endpoint_retired() {
+                return Ok(false);
+            }
+            ctx.history
+                .archive_disk_fault(fault.build_id, &fault.incident_id)?;
+            return Ok(true);
+        };
+        worker
+            .enter_bypass(rch_common::BypassFailureClass::DiskInodePressure)
+            .await;
         anyhow::bail!("worker disk fault cannot be acknowledged without durable bypass storage");
     };
-    crate::bypass_recovery_service::record_worker_disk_bypass(
+    crate::bypass_recovery_service::apply_owned_disk_fault(
         store,
         worker.as_ref(),
-        &fault.worker_id,
-        &fault.incident_id,
-        &fault.roots,
-        &format!(
-            "remote build {} reported disk space or quota exhaustion",
-            fault.build_id
-        ),
-        fault.reported_unix_ms,
-        || {
-            ctx.history
-                .acknowledge_disk_fault(fault.build_id, &fault.incident_id)
-        },
+        &ctx.history,
+        fault,
     )
     .await
 }
 
 /// Finish completion's durable side effects before startup enables admission
-/// or background recovery. Removed workers retain a disk record too, so a
-/// later configuration reload cannot silently forget their failed volume.
+/// or background recovery. Absent workers retain an endpoint-bound pending
+/// obligation, retried by the recovery service after inventory changes. Their
+/// old filesystem cannot quarantine a different endpoint reusing the ID.
 pub(crate) async fn replay_pending_disk_faults(ctx: &DaemonContext) -> Result<()> {
     let _release_guard = ctx.history.lock_releases().await;
     for fault in ctx.history.pending_disk_faults() {
@@ -8358,15 +8377,23 @@ mod tests {
             ctx.bypass_store = Some(Arc::new(tokio::sync::Mutex::new(
                 BypassRecordStore::with_path(&store_path),
             )));
-            let build = ctx.history.start_active_build_with_wrapper(
-                "disk-project".into(),
-                "worker1".into(),
-                "cargo build".into(),
-                12345,
-                Some("disk-owner".into()),
-                2,
-                rch_common::BuildLocation::Remote,
-            );
+            let worker = ctx.pool.get(&WorkerId::new("worker1")).await.unwrap();
+            let build = ctx
+                .history
+                .try_start_active_build_with_waiter(
+                    "disk-project".into(),
+                    "worker1".into(),
+                    "cargo build".into(),
+                    12345,
+                    Some("disk-owner".into()),
+                    2,
+                    rch_common::BuildLocation::Remote,
+                    None,
+                    crate::disk_pressure::DiskHeadroomAdmission::default(),
+                    Some(worker.endpoint_snapshot().await),
+                )
+                .unwrap()
+                .unwrap();
             // Crash frontier one: the real ownership transaction completed,
             // but no worker quarantine has yet been written.
             ctx.history
@@ -8485,15 +8512,22 @@ mod tests {
             &store_path,
         )));
         ctx.bypass_store = Some(store.clone());
-        let build = ctx.history.start_active_build_with_wrapper(
-            "disk-project".into(),
-            "worker1".into(),
-            "cargo build".into(),
-            12345,
-            Some("disk-owner".into()),
-            2,
-            rch_common::BuildLocation::Remote,
-        );
+        let build = ctx
+            .history
+            .try_start_active_build_with_waiter(
+                "disk-project".into(),
+                "worker1".into(),
+                "cargo build".into(),
+                12345,
+                Some("disk-owner".into()),
+                2,
+                rch_common::BuildLocation::Remote,
+                None,
+                crate::disk_pressure::DiskHeadroomAdmission::default(),
+                Some(worker.endpoint_snapshot().await),
+            )
+            .unwrap()
+            .unwrap();
         let mut request = disk_fault_release_request(build.id);
         request.worker_disk_roots = vec!["../bad".into()];
         assert!(handle_release_worker(&ctx, request).await.is_err());
@@ -8524,6 +8558,153 @@ mod tests {
             BypassRecordStore::load(&store_path).get("worker1"),
             Some(&recorded)
         );
+    }
+
+    #[tokio::test]
+    async fn late_disk_faults_archive_exact_incidents_without_quarantining_replacements() {
+        for change in [
+            "retarget",
+            "aba",
+            "restart",
+            "legacy",
+            "retarget_then_remove",
+        ] {
+            for durable_store in [false, true] {
+                let temporary = tempfile::tempdir().unwrap();
+                let history_path = temporary.path().join("history.jsonl");
+                let store_path = temporary.path().join("bypasses.json");
+                let original = make_test_worker("worker1", 8);
+                let pool = WorkerPool::new();
+                pool.add_worker(original.clone()).await;
+                let mut worker = pool.get(&original.id).await.unwrap();
+                let mut ctx = make_test_context(pool);
+                ctx.history =
+                    Arc::new(BuildHistory::new(100).with_persistence(history_path.clone()));
+                if durable_store {
+                    ctx.bypass_store = Some(Arc::new(tokio::sync::Mutex::new(
+                        BypassRecordStore::with_path(&store_path),
+                    )));
+                }
+                let build = ctx
+                    .history
+                    .try_start_active_build_with_waiter(
+                        "old-volume".into(),
+                        original.id.to_string(),
+                        "cargo build".into(),
+                        0,
+                        Some("disk-owner".into()),
+                        2,
+                        rch_common::BuildLocation::Remote,
+                        None,
+                        crate::disk_pressure::DiskHeadroomAdmission::default(),
+                        if change == "legacy" {
+                            None
+                        } else {
+                            Some(worker.endpoint_snapshot().await)
+                        },
+                    )
+                    .unwrap()
+                    .unwrap();
+                let other = ctx.history.start_active_build(
+                    "other-build".into(),
+                    original.id.to_string(),
+                    "cargo check".into(),
+                    0,
+                    1,
+                    rch_common::BuildLocation::Remote,
+                );
+                assert!(worker.reserve_slots(3).await);
+                let mut replacement = original.clone();
+                replacement.host = "replacement.example".into();
+                if change == "restart" {
+                    ctx.history
+                        .complete_durable_with_disk_fault(
+                            build.id,
+                            "worker1",
+                            Some("disk-owner"),
+                            crate::history::BuildCompletion {
+                                exit_code: 101,
+                                duration_ms: None,
+                                bytes_transferred: None,
+                                timing: None,
+                                cancellation: None,
+                            },
+                            Some(vec!["/build-volume/rch".into()]),
+                        )
+                        .unwrap()
+                        .unwrap();
+                    ctx.history =
+                        Arc::new(BuildHistory::load_from_file(&history_path, 100).unwrap());
+                    ctx.pool = WorkerPool::new();
+                    ctx.pool.add_worker(replacement).await;
+                    worker = ctx.pool.get(&original.id).await.unwrap();
+                    for active in ctx.history.active_builds() {
+                        ctx.pool
+                            .restore_recovered_slots(&original.id, active.slots)
+                            .await
+                            .unwrap();
+                    }
+                    replay_pending_disk_faults(&ctx).await.unwrap();
+                } else {
+                    ctx.pool.add_worker(replacement).await;
+                    if change == "aba" {
+                        ctx.pool.add_worker(original.clone()).await;
+                    } else if change == "retarget_then_remove" {
+                        // Retirement may preserve an unchanged endpoint's
+                        // obligation, but must not erase a known retarget.
+                        assert!(ctx.pool.remove_worker(&original.id).await);
+                        ctx.pool.add_worker(original.clone()).await;
+                        worker = ctx.pool.get(&original.id).await.unwrap();
+                        for active in ctx.history.active_builds() {
+                            ctx.pool
+                                .restore_recovered_slots(&original.id, active.slots)
+                                .await
+                                .unwrap();
+                        }
+                    }
+                    worker.apply_health_status(WorkerStatus::Healthy).await;
+                    handle_release_worker(&ctx, disk_fault_release_request(build.id))
+                        .await
+                        .unwrap();
+                }
+                assert!(
+                    worker.lifecycle().await.is_schedulable(),
+                    "{change}/{durable_store}"
+                );
+                assert_eq!(worker.used_slots(), 1);
+                assert!(ctx.history.active_build(other.id).is_some());
+                assert!(ctx.history.active_build(build.id).is_none());
+                assert!(ctx.history.pending_disk_fault(build.id).is_none());
+                let archived = ctx.history.unapplied_disk_fault(build.id).unwrap();
+                assert_eq!(archived.roots, ["/build-volume/rch"]);
+                assert_eq!(archived.worker_endpoint.is_none(), change == "legacy");
+                if let Some(endpoint) = archived.worker_endpoint.as_ref() {
+                    assert!(endpoint.matches_config(&original));
+                }
+                assert!(!BypassRecordStore::load(&store_path).contains("worker1"));
+
+                // An archived stale fault remains evidence when the old
+                // coordinates return in a later daemon; it never replays.
+                ctx.history = Arc::new(BuildHistory::load_from_file(&history_path, 100).unwrap());
+                ctx.pool = WorkerPool::new();
+                ctx.pool.add_worker(original.clone()).await;
+                worker = ctx.pool.get(&original.id).await.unwrap();
+                for active in ctx.history.active_builds() {
+                    ctx.pool
+                        .restore_recovered_slots(&original.id, active.slots)
+                        .await
+                        .unwrap();
+                }
+                replay_pending_disk_faults(&ctx).await.unwrap();
+                let mut duplicate = disk_fault_release_request(build.id);
+                duplicate.worker_disk_roots = vec!["../injected-retry-root".into()];
+                handle_release_worker(&ctx, duplicate).await.unwrap();
+                assert!(worker.lifecycle().await.is_schedulable());
+                assert_eq!(worker.used_slots(), 1);
+                assert_eq!(ctx.history.unapplied_disk_fault(build.id), Some(archived));
+                assert!(!BypassRecordStore::load(&store_path).contains("worker1"));
+            }
+        }
     }
 
     #[tokio::test]
