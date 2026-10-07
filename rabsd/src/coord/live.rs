@@ -212,6 +212,9 @@ pub enum ReplayRefusal {
         /// Number of adverse observations retained for this action.
         observations: u64,
     },
+    /// The latest independently verified result has exhausted its replay
+    /// allowance, or no durable live comparison has established one yet.
+    FreshVerificationRequired,
     /// The existing class/evidence/sampling policy requires private execution.
     Sampling(PrivateExecutionReason),
 }
@@ -408,8 +411,14 @@ const LIVE_PRIVATE_CLASS: &str = "private-only";
 // This is an additional floor, not a replacement for the stored serving policy.
 // In particular it never promotes a quarantined/evidence-pending record, renews
 // its TTL, or changes a trust-policy version. Every edge-delivered artifact
-// passes this floor; the Cargo wrapper itself remains in shadow mode.
+// passes this floor, including the opt-in live dependency lane.
 const LIVE_SAMPLING_POLICY: SamplingPolicy = SamplingPolicy::sample_all(2, 10_000);
+const LIVE_VERIFICATION_RECEIPT: &str = "rabs-live-verification-v1";
+const LIVE_INSTALL_RECEIPT: &str = "rabs-live-replay-install-v1";
+
+/// Maximum cache installations admitted after one new independent comparison.
+/// This fixed bound supplies ongoing verification; it is not an SPRT ratchet.
+pub const LIVE_REPLAY_INSTALL_LIMIT: u64 = 16;
 
 fn record_descriptor_class(
     store: &mut dyn RabsMetadataStore,
@@ -530,7 +539,96 @@ fn record_live_verification(
         .max()
         .map_or(Some(0), |seq| seq.checked_add(1))
         .ok_or_else(|| StoreError::Backend("verification sequence exhausted".to_owned()))?;
-    store.record_verification_sample(action, attempt, passed, seq)
+    store.record_verification_sample(action, attempt, passed, seq)?;
+    if passed {
+        // Only this admission path can renew replay authority. Raw samples,
+        // retransmissions, the original winner, and failed attempts cannot.
+        // If this second durable write fails, the old allowance remains in
+        // force; another independent comparison is needed to renew it.
+        store.record_decision_receipt(
+            LIVE_VERIFICATION_RECEIPT,
+            &digest_key(action),
+            seq,
+            &format!("{attempt:032x}"),
+            &digest_key(&offer.manifest_id.0),
+        )?;
+    }
+    Ok(())
+}
+
+struct ReplayInstallPermit {
+    subject: String,
+    seq: u64,
+}
+
+/// Inspect the durable allowance without spending it. Both preview and install
+/// read it afresh under the CAS lock; only an actual installation appends a
+/// receipt, before any output writes. The comparison and spent permits survive
+/// coordinator restarts and cannot be reset by replaying an old offer.
+fn live_replay_permit(
+    store: &mut dyn RabsMetadataStore,
+    action: &TypedDigest,
+    manifest_key: &str,
+) -> Result<Option<ReplayInstallPermit>, StoreError> {
+    let action_key = digest_key(action);
+    let rows = store.query(
+        "SELECT seq, decision, reason FROM decision_receipts \
+         WHERE kind = ?1 AND subject = ?2 ORDER BY seq DESC LIMIT 1",
+        &[
+            SqlValue::Text(LIVE_VERIFICATION_RECEIPT.to_owned()),
+            SqlValue::Text(action_key.clone()),
+        ],
+    )?;
+    let Some(row) = rows.first() else {
+        return Ok(None);
+    };
+    let [
+        SqlValue::Int(seq),
+        SqlValue::Text(attempt),
+        SqlValue::Text(manifest),
+    ] = row.as_slice()
+    else {
+        return Err(StoreError::Corruption(
+            "live verification receipt shape".into(),
+        ));
+    };
+    let seq = u64::try_from(*seq)
+        .map_err(|_| StoreError::Corruption("live verification sequence".into()))?;
+    if manifest != manifest_key
+        || attempt.len() != 32
+        || !attempt.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || !store
+            .list_verification_samples(action)?
+            .iter()
+            .any(|sample| sample.passed && sample.seq == seq && sample.attempt_hex == *attempt)
+    {
+        return Err(StoreError::Corruption(
+            "unbound live verification receipt".into(),
+        ));
+    }
+    let subject = format!("{action_key}:{seq}");
+    let installed = store.query(
+        "SELECT seq, decision, reason FROM decision_receipts \
+         WHERE kind = ?1 AND subject = ?2 ORDER BY seq",
+        &[
+            SqlValue::Text(LIVE_INSTALL_RECEIPT.to_owned()),
+            SqlValue::Text(subject.clone()),
+        ],
+    )?;
+    for (index, row) in installed.iter().enumerate() {
+        let expected_seq = i64::try_from(index)
+            .map_err(|_| StoreError::Corruption("live replay sequence exhausted".into()))?;
+        if !matches!(
+            row.as_slice(),
+            [SqlValue::Int(seq), SqlValue::Text(decision), SqlValue::Text(reason)]
+                if *seq == expected_seq && decision == "install" && reason == manifest_key
+        ) {
+            return Err(StoreError::Corruption("invalid live replay receipt".into()));
+        }
+    }
+    let used = u64::try_from(installed.len())
+        .map_err(|_| StoreError::Corruption("live replay count exhausted".into()))?;
+    Ok((used < LIVE_REPLAY_INSTALL_LIMIT).then_some(ReplayInstallPermit { subject, seq: used }))
 }
 
 /// Final live replay admission, called with the SAME store lock subsequently
@@ -2068,6 +2166,20 @@ impl CoordLive {
             // action's otherwise valid, content-addressed output manifest.
             return Ok(ServeOutcome::ManifestUnavailable { key: manifest_key });
         }
+        let replay_permit = if sampling.is_some() {
+            match live_replay_permit(&mut *store, action_key, &manifest_key)
+                .map_err(|error| ServeError::Store(format!("{error:?}")))?
+            {
+                Some(permit) => Some(permit),
+                None => {
+                    return Ok(ServeOutcome::ExecutePrivately(
+                        ReplayRefusal::FreshVerificationRequired,
+                    ));
+                }
+            }
+        } else {
+            None
+        };
 
         // One complete logical-output map: do not silently discard .rmeta or
         // dep-info. Canonical .d files are verified and derived privately before
@@ -2079,6 +2191,20 @@ impl CoordLive {
             };
         if mode == ServeMode::Preview {
             return Ok(ServeOutcome::Servable);
+        }
+        if let Some(permit) = replay_permit {
+            // Spend durably while holding the same lock as admission and
+            // installation. A failed/partial install conservatively spends its
+            // allowance; a crash must never grant it a second time.
+            store
+                .record_decision_receipt(
+                    LIVE_INSTALL_RECEIPT,
+                    &permit.subject,
+                    permit.seq,
+                    "install",
+                    &manifest_key,
+                )
+                .map_err(|error| ServeError::Store(format!("{error:?}")))?;
         }
         if plan.outputs.is_empty() {
             return Ok(ServeOutcome::Served { files: Vec::new() });

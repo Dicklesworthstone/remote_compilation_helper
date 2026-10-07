@@ -493,6 +493,31 @@ fn registry_dependencies_commit_verify_and_serve_byte_identical_results() {
     assert_eq!(world.stock("leaf", &out_stock, &[]).status.code(), Some(0));
     assert_same_library(&out_stock, &out_d, "leaf");
 
+    // The live lane must keep verifying after initial enrollment. Each hit
+    // previews and then installs; previews must not consume the 16-install
+    // budget. Once spent, the next request runs real rustc and compares its
+    // result, and only that completed comparison restores cache serving.
+    for number in 1..16 {
+        let out = world.out_dir(&format!("periodic-hit-{number}"));
+        let mark = daemon.decisions().len();
+        let output = world.wrapped("leaf", &out, &[], &[]);
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        assert_eq!(trail(&daemon, mark), ["hit", "served"]);
+        assert_same_library(&out_stock, &out, "leaf");
+    }
+    let out_verification = world.out_dir("periodic-verification");
+    let mark = daemon.decisions().len();
+    let output = world.wrapped("leaf", &out_verification, &[], &[]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(trail(&daemon, mark), ["execute", "verified"]);
+    assert_same_library(&out_stock, &out_verification, "leaf");
+    let out_renewed = world.out_dir("periodic-renewed-hit");
+    let mark = daemon.decisions().len();
+    let output = world.wrapped("leaf", &out_renewed, &[], &[]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(trail(&daemon, mark), ["hit", "served"]);
+    assert_same_library(&out_stock, &out_renewed, "leaf");
+
     // 3. A consumer keyed on its exact extern bytes climbs the same ladder.
     let leaf_rmeta = |out: &Path| ("leaf", out.join(&outputs("leaf")[1]));
     let mut demo_trails = Vec::new();

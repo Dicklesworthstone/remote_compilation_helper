@@ -68,6 +68,10 @@ jobs:
           size=$(stat -c%s target/release/rabs-wrap)
           echo "rabs-wrap release size: $size bytes"
           test "$size" -lt 2097152
+      - name: Durable replay allowance and real compiler verification
+        run: |
+          cargo test --release -p rabsd --test live_replay --locked
+          cargo test --release -p rabs-wrap --test live_dependency_e2e --locked
       - name: Doctor + wrapper overhead gate (release, enforcing)
         run: |
           cargo test --release -p rabsd --test doctor_live
