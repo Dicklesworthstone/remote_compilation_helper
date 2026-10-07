@@ -2182,8 +2182,16 @@ fn apply_env_overrides_inner(
             );
         }
     }
+    // ...except over an explicit `force_local`. The shim exports
+    // RCH_REQUIRE_REMOTE=1 into every agent, so implying force_remote there
+    // turned a project's deliberate `force_local = true` into
+    // ConflictingForceFlags and every such build was reported as
+    // "invalid config: force_local+force_remote" (bd-nfo8f). Execution was
+    // already local: an explicit force_local outranks RCH_REQUIRE_REMOTE
+    // (`ConfigLocalPolicy::overrides_require_remote`). Only the label was wrong.
     if let Some(val) = get_env("RCH_REQUIRE_REMOTE")
         && parse_bool(&val) == Some(true)
+        && !config.general.force_local
     {
         config.general.force_remote = true;
         if let Some(ref mut sources) = sources {
@@ -4327,6 +4335,41 @@ remote_speedup_threshold = 1.75
         assert_eq!(
             sources.get("general.force_remote"),
             Some(&ConfigValueSource::EnvVar("RCH_REQUIRE_REMOTE".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_apply_env_overrides_require_remote_does_not_override_explicit_force_local() {
+        // bd-nfo8f: a project's `force_local = true` plus the shim's exported
+        // RCH_REQUIRE_REMOTE=1 must resolve to plain ForceLocal, not to the
+        // "invalid config: force_local+force_remote" conflict.
+        let _guard = test_guard!();
+        let mut config = RchConfig::default();
+        config.general.force_local = true;
+        let mut sources = default_sources_map();
+        let mut env_overrides: HashMap<String, String> = HashMap::new();
+        env_overrides.insert("RCH_REQUIRE_REMOTE".to_string(), "1".to_string());
+
+        apply_env_overrides_inner(&mut config, Some(&mut sources), Some(&env_overrides));
+
+        assert!(config.general.force_local);
+        assert!(
+            !config.general.force_remote,
+            "RCH_REQUIRE_REMOTE must not imply force_remote over an explicit force_local"
+        );
+        assert_eq!(
+            crate::hook::config_local_policy(&config, None),
+            Some(crate::hook::ConfigLocalPolicy::ForceLocal)
+        );
+
+        // An explicit RCH_FORCE_REMOTE=1 with force_local is still a real conflict.
+        let mut config = RchConfig::default();
+        config.general.force_local = true;
+        env_overrides.insert("RCH_FORCE_REMOTE".to_string(), "1".to_string());
+        apply_env_overrides_inner(&mut config, None, Some(&env_overrides));
+        assert_eq!(
+            crate::hook::config_local_policy(&config, None),
+            Some(crate::hook::ConfigLocalPolicy::ConflictingForceFlags)
         );
     }
 
