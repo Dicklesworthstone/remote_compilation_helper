@@ -135,7 +135,11 @@ fn open_gate(path: &Path, create: bool) -> Result<Option<File>, UpdateError> {
         Err(error) => return Err(lock_error("inspect update gate", error)),
     }
     let mut options = OpenOptions::new();
-    options.read(true).write(true).create(create).truncate(false);
+    options
+        .read(true)
+        .write(true)
+        .create(create)
+        .truncate(false);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -235,10 +239,18 @@ mod tests {
         assert!(!path.with_extension("gate").exists(), "status is read-only");
         let first = UpdateLock::acquire_at(&path).unwrap();
         assert!(UpdateLock::is_locked_at(&path));
-        assert!(matches!(UpdateLock::acquire_at(&path), Err(UpdateError::LockHeld)));
+        assert!(matches!(
+            UpdateLock::acquire_at(&path),
+            Err(UpdateError::LockHeld)
+        ));
         let body = read_record(&path).unwrap().unwrap();
-        assert_eq!(body.split_whitespace().next(), Some(std::process::id().to_string().as_str()));
-        assert!(reclaimable(&body, |_| panic!("new record must not consult a PID")));
+        assert_eq!(
+            body.split_whitespace().next(),
+            Some(std::process::id().to_string().as_str())
+        );
+        assert!(reclaimable(&body, |_| panic!(
+            "new record must not consult a PID"
+        )));
         drop(first);
         assert!(!path.exists());
         assert!(path.with_extension("gate").is_file());
@@ -251,10 +263,18 @@ mod tests {
         let (_directory, path) = fixture();
         // Model process death after publication: the PID may now be live again
         // but the old kernel owner is gone. No process is signalled or queried.
-        let stale = format!("{} {GATED_RECORD} {}\n", std::process::id(), uuid::Uuid::new_v4());
+        let stale = format!(
+            "{} {GATED_RECORD} {}\n",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        );
         fs::write(&path, &stale).unwrap();
         assert!(!UpdateLock::is_locked_at(&path));
-        assert_eq!(fs::read_to_string(&path).unwrap(), stale, "status must not sweep");
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            stale,
+            "status must not sweep"
+        );
         let lock = UpdateLock::acquire_at(&path).unwrap();
         assert_ne!(lock.body, stale);
         drop(lock);
@@ -262,17 +282,25 @@ mod tests {
         // recoverable by kernel proof, unlike an ambiguous legacy PID 1.
         let init_record = format!("1 {GATED_RECORD} {}\n", uuid::Uuid::new_v4());
         fs::write(&path, &init_record).unwrap();
-        assert!(reclaimable(&init_record, |_| panic!("PID 1 needs no probe")));
+        assert!(reclaimable(&init_record, |_| panic!(
+            "PID 1 needs no probe"
+        )));
         drop(UpdateLock::acquire_at(&path).unwrap());
     }
 
     #[test]
     fn legacy_live_owner_and_unknown_platform_are_never_swept() {
         let (_directory, path) = fixture();
-        for body in [std::process::id().to_string(), format!("{} abc def", std::process::id())] {
+        for body in [
+            std::process::id().to_string(),
+            format!("{} abc def", std::process::id()),
+        ] {
             fs::write(&path, &body).unwrap();
             assert!(UpdateLock::is_locked_at(&path));
-            assert!(matches!(UpdateLock::acquire_at(&path), Err(UpdateError::LockHeld)));
+            assert!(matches!(
+                UpdateLock::acquire_at(&path),
+                Err(UpdateError::LockHeld)
+            ));
             assert_eq!(fs::read_to_string(&path).unwrap(), body);
         }
         for body in ["12345", "12345 abc def"] {
@@ -288,8 +316,12 @@ mod tests {
     fn ambiguous_and_incomplete_records_fail_closed() {
         let (_directory, path) = fixture();
         for body in [
-            String::new(), "garbage".into(), "0".into(), "1".into(),
-            "12345 unknown protocol".into(), "12345 abc".into(),
+            String::new(),
+            "garbage".into(),
+            "0".into(),
+            "1".into(),
+            "12345 unknown protocol".into(),
+            "12345 abc".into(),
             format!("12345 {GATED_RECORD}"),
             format!("12345 {GATED_RECORD} invalid\n"),
             format!("12345 {GATED_RECORD} {}", uuid::Uuid::new_v4()),
@@ -342,7 +374,10 @@ mod tests {
         let owner = UpdateLock::acquire_at(&path).unwrap();
         fs::remove_file(&path).unwrap(); // only this test's temporary sentinel
         assert!(UpdateLock::is_locked_at(&path));
-        assert!(matches!(UpdateLock::acquire_at(&path), Err(UpdateError::LockHeld)));
+        assert!(matches!(
+            UpdateLock::acquire_at(&path),
+            Err(UpdateError::LockHeld)
+        ));
         drop(owner);
         drop(UpdateLock::acquire_at(&path).unwrap());
     }
@@ -355,22 +390,31 @@ mod tests {
         fs::write(&path, &replacement).unwrap();
         drop(owner);
         assert_eq!(fs::read_to_string(&path).unwrap(), replacement);
-        assert!(matches!(UpdateLock::acquire_at(&path), Err(UpdateError::LockHeld)));
+        assert!(matches!(
+            UpdateLock::acquire_at(&path),
+            Err(UpdateError::LockHeld)
+        ));
     }
 
     #[test]
     fn simultaneous_stale_reclaimers_have_exactly_one_winner() {
         let (_directory, path) = fixture();
-        fs::write(&path, format!("12345 {GATED_RECORD} {}\n", uuid::Uuid::new_v4())).unwrap();
+        fs::write(
+            &path,
+            format!("12345 {GATED_RECORD} {}\n", uuid::Uuid::new_v4()),
+        )
+        .unwrap();
         let barrier = Arc::new(Barrier::new(12));
-        let handles: Vec<_> = (0..12).map(|_| {
-            let barrier = barrier.clone();
-            let path = path.clone();
-            std::thread::spawn(move || {
-                barrier.wait();
-                UpdateLock::acquire_at(&path)
+        let handles: Vec<_> = (0..12)
+            .map(|_| {
+                let barrier = barrier.clone();
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    UpdateLock::acquire_at(&path)
+                })
             })
-        }).collect();
+            .collect();
         // Keep the winning guard until every racing acquire has finished.
         let mut winners = Vec::new();
         for handle in handles {
@@ -394,19 +438,29 @@ mod tests {
     }
 
     fn child(path: &Path, mode: &str) -> OwnedChild {
-        OwnedChild(Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "update::lock::tests::subprocess_fixture", "--nocapture"])
-            .env("RCH_UPDATE_LOCK_TEST_PATH", path)
-            .env("RCH_UPDATE_LOCK_TEST_MODE", mode)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .spawn().unwrap())
+        OwnedChild(
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "update::lock::tests::subprocess_fixture",
+                    "--nocapture",
+                ])
+                .env("RCH_UPDATE_LOCK_TEST_PATH", path)
+                .env("RCH_UPDATE_LOCK_TEST_MODE", mode)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .spawn()
+                .unwrap(),
+        )
     }
 
     fn wait_for_file(child: &mut OwnedChild, path: &Path) {
         let deadline = Instant::now() + Duration::from_secs(10);
         while !path.exists() {
-            assert!(child.0.try_wait().unwrap().is_none(), "fixture child exited before ready");
+            assert!(
+                child.0.try_wait().unwrap().is_none(),
+                "fixture child exited before ready"
+            );
             assert!(Instant::now() < deadline, "fixture readiness timed out");
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -416,11 +470,16 @@ mod tests {
     // TempDir path to a dedicated child, never the operator's real data dir.
     #[test]
     fn subprocess_fixture() {
-        let Some(path) = std::env::var_os("RCH_UPDATE_LOCK_TEST_PATH") else { return };
+        let Some(path) = std::env::var_os("RCH_UPDATE_LOCK_TEST_PATH") else {
+            return;
+        };
         let path = PathBuf::from(path);
         let mode = std::env::var("RCH_UPDATE_LOCK_TEST_MODE").unwrap();
         if mode == "blocked" {
-            assert!(matches!(UpdateLock::acquire_at(&path), Err(UpdateError::LockHeld)));
+            assert!(matches!(
+                UpdateLock::acquire_at(&path),
+                Err(UpdateError::LockHeld)
+            ));
             fs::write(path.with_extension("blocked"), b"blocked").unwrap();
             return;
         }
@@ -439,7 +498,9 @@ mod tests {
             None
         };
         fs::write(path.with_extension("ready"), b"ready").unwrap();
-        loop { std::thread::sleep(Duration::from_secs(1)); }
+        loop {
+            std::thread::sleep(Duration::from_secs(1));
+        }
     }
 
     #[test]
@@ -453,10 +514,16 @@ mod tests {
                 assert!(status.success());
                 break;
             }
-            assert!(Instant::now() < deadline, "contender hung instead of refusing");
+            assert!(
+                Instant::now() < deadline,
+                "contender hung instead of refusing"
+            );
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert!(path.with_extension("blocked").exists(), "child test must actually run");
+        assert!(
+            path.with_extension("blocked").exists(),
+            "child test must actually run"
+        );
         drop(owner);
         drop(UpdateLock::acquire_at(&path).unwrap());
     }
@@ -466,13 +533,19 @@ mod tests {
         let (_directory, path) = fixture();
         let mut owner = child(&path, "legacy");
         wait_for_file(&mut owner, &path.with_extension("ready"));
-        assert!(matches!(UpdateLock::acquire_at(&path), Err(UpdateError::LockHeld)));
+        assert!(matches!(
+            UpdateLock::acquire_at(&path),
+            Err(UpdateError::LockHeld)
+        ));
         owner.0.kill().unwrap();
         owner.0.wait().unwrap();
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         drop(UpdateLock::acquire_at(&path).unwrap());
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        assert!(matches!(UpdateLock::acquire_at(&path), Err(UpdateError::LockHeld)));
+        assert!(matches!(
+            UpdateLock::acquire_at(&path),
+            Err(UpdateError::LockHeld)
+        ));
     }
 
     #[test]
@@ -482,7 +555,10 @@ mod tests {
             let mut owner = child(&path, mode);
             wait_for_file(&mut owner, &path.with_extension("ready"));
             assert!(UpdateLock::is_locked_at(&path));
-            assert!(matches!(UpdateLock::acquire_at(&path), Err(UpdateError::LockHeld)));
+            assert!(matches!(
+                UpdateLock::acquire_at(&path),
+                Err(UpdateError::LockHeld)
+            ));
             owner.0.kill().unwrap(); // exact test-owned child handle, no PID search
             owner.0.wait().unwrap();
             // No Drop ran in the child. Kernel release, not PID guessing or

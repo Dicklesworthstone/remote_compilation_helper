@@ -38,7 +38,7 @@ jobs:
           echo "RUSTUP_TOOLCHAIN=$channel" >> "$GITHUB_ENV"
       # Build the real client, including its production bounded-output reader.
       # The isolated ownership job below is not a substitute for this check.
-      - name: Exercise installation probes and authorization in the client crate
+      - name: Exercise installation probes, preflight and authorization in the client crate
         run: |
           set -euo pipefail
           evidence="$RUNNER_TEMP/update-client-evidence"
@@ -47,13 +47,18 @@ jobs:
           cargo test --locked -p rch --bin rch test_verify_installation_ -- --nocapture 2>&1 | tee "$evidence/failed-client-probes.log"
           cargo test --locked -p rch --bin rch update_verification_ -- --nocapture 2>&1 | tee "$evidence/authorization.log"
           cargo test --locked -p rch --bin rch update_shutdown_ -- --nocapture 2>&1 | tee "$evidence/shutdown.log"
+          # Include all existing archive, backup, replacement and restoration
+          # checks alongside the new staged preflight regressions.
+          cargo test --locked -p rch --bin rch update::install::tests -- --nocapture 2>&1 | tee "$evidence/preflight-and-install.log"
           cargo clippy --locked -p rch --all-targets -- -D warnings 2>&1 | tee "$evidence/clippy.log"
       - name: Check client verification formatting
         if: success() || failure()
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/update-client-evidence"
-          rustfmt --edition 2024 --config skip_children=true --emit stdout rch/src/update/mod.rs > "$RUNNER_TEMP/update-client-evidence/mod.formatted.rs"
+          # Stdin avoids rustfmt's filename banner in the retained Rust source.
+          rustfmt --edition 2024 --config skip_children=true --emit stdout < rch/src/update/mod.rs > "$RUNNER_TEMP/update-client-evidence/mod.formatted.rs"
+          rustfmt --edition 2024 --config skip_children=true --emit stdout < rch/src/update/install.rs > "$RUNNER_TEMP/update-client-evidence/install.formatted.rs"
           rustfmt --edition 2024 --config skip_children=true --check rch/src/update/mod.rs rch/src/update/install.rs rch/src/update/install/daemon_shutdown.rs
       - uses: actions/upload-artifact@v4
         if: always()
@@ -131,8 +136,8 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/update-lock-evidence"
-          rustfmt --edition 2024 --emit stdout rch/src/update/lock.rs > "$RUNNER_TEMP/update-lock-evidence/lock.formatted.rs"
-          rustfmt --edition 2024 --emit stdout rch/src/update/install/daemon_shutdown.rs > "$RUNNER_TEMP/update-lock-evidence/shutdown.formatted.rs"
+          rustfmt --edition 2024 --emit stdout < rch/src/update/lock.rs > "$RUNNER_TEMP/update-lock-evidence/lock.formatted.rs"
+          rustfmt --edition 2024 --emit stdout < rch/src/update/install/daemon_shutdown.rs > "$RUNNER_TEMP/update-lock-evidence/shutdown.formatted.rs"
           rustfmt --edition 2024 --check rch/src/update/lock.rs rch/src/update/install/daemon_shutdown.rs
       - uses: actions/upload-artifact@v4
         if: always()

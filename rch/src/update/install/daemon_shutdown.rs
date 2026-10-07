@@ -45,9 +45,15 @@ async fn socket_identity(path: &Path) -> Result<Option<SocketIdentity>, String> 
             device: metadata.dev(),
             inode: metadata.ino(),
         })),
-        Ok(_) => Err(format!("daemon endpoint is not a Unix socket: {}", path.display())),
+        Ok(_) => Err(format!(
+            "daemon endpoint is not a Unix socket: {}",
+            path.display()
+        )),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(format!("cannot inspect daemon endpoint {}: {error}", path.display())),
+        Err(error) => Err(format!(
+            "cannot inspect daemon endpoint {}: {error}",
+            path.display()
+        )),
     }
 }
 
@@ -83,9 +89,7 @@ fn decode_reply<T: serde::de::DeserializeOwned>(reply: &[u8]) -> Result<T, Strin
         .or_else(|| reply.split_once("\n\n"))
         .ok_or("incomplete daemon reply")?;
     let mut status = header.lines().next().unwrap_or_default().split_whitespace();
-    if !matches!(status.next(), Some("HTTP/1.0" | "HTTP/1.1"))
-        || status.next() != Some("200")
-    {
+    if !matches!(status.next(), Some("HTTP/1.0" | "HTTP/1.1")) || status.next() != Some("200") {
         return Err("daemon refused the update's lifecycle request".to_owned());
     }
     serde_json::from_str(body).map_err(|error| format!("invalid daemon reply: {error}"))
@@ -108,10 +112,16 @@ async fn request<T: serde::de::DeserializeOwned>(
         if socket_identity(path).await? != Some(expected) {
             return Err("daemon endpoint changed during connection; update refused".to_owned());
         }
-        stream.write_all(command.as_bytes()).await.map_err(|error| error.to_string())?;
+        stream
+            .write_all(command.as_bytes())
+            .await
+            .map_err(|error| error.to_string())?;
         stream.shutdown().await.map_err(|error| error.to_string())?;
         let mut bytes = Vec::new();
-        stream.take(MAX_REPLY_BYTES + 1).read_to_end(&mut bytes).await
+        stream
+            .take(MAX_REPLY_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .await
             .map_err(|error| error.to_string())?;
         decode_reply(&bytes)
     })
@@ -135,36 +145,57 @@ async fn stop_with_timing(
     // owner token: closing a busy barrier and later unconditionally reopening
     // it could clear another maintenance operation's gate. Instead acquire the
     // daemon's atomic, idle-only `restart_permitted` grant after this wait.
-    let mut admission: Admission = request(path, identity, ADMISSION_STATUS, timing.request).await?;
-    let deadline = Instant::now().checked_add(drain_timeout)
+    let mut admission: Admission =
+        request(path, identity, ADMISSION_STATUS, timing.request).await?;
+    let deadline = Instant::now()
+        .checked_add(drain_timeout)
         .ok_or("update drain timeout is out of range")?;
     loop {
         if admission.admission_closed {
             return Err("daemon admission is already closed; update will not take over another maintenance operation".to_owned());
         }
         if admission.client_lease_scan_error.is_some() {
-            return Err(format!("cannot prove daemon idle: {admission:?}; update refused"));
+            return Err(format!(
+                "cannot prove daemon idle: {admission:?}; update refused"
+            ));
         }
         if admission.idle() {
             break;
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            return Err(format!("update drain timed out with work still in flight: {admission:?}; daemon left running"));
+            return Err(format!(
+                "update drain timed out with work still in flight: {admission:?}; daemon left running"
+            ));
         }
         sleep(timing.poll.min(remaining)).await;
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            return Err(format!("update drain timed out with work still in flight: {admission:?}; daemon left running"));
+            return Err(format!(
+                "update drain timed out with work still in flight: {admission:?}; daemon left running"
+            ));
         }
-        admission = request(path, identity, ADMISSION_STATUS, timing.request.min(remaining)).await?;
+        admission = request(
+            path,
+            identity,
+            ADMISSION_STATUS,
+            timing.request.min(remaining),
+        )
+        .await?;
     }
-    let grant: Admission = request(path, identity, CLOSE_ADMISSION, timing.request).await
-        .map_err(|error| format!("{error}; admission ownership is unconfirmed, no shutdown or installation attempted"))?;
+    let grant: Admission = request(path, identity, CLOSE_ADMISSION, timing.request)
+        .await
+        .map_err(|error| {
+            format!(
+                "{error}; admission ownership is unconfirmed, no shutdown or installation attempted"
+            )
+        })?;
     if !grant.admission_closed || !grant.restart_permitted || !grant.idle() {
         // A concurrent maintenance request or new work won the race. No grant
         // means no authority to shut down OR to reopen the shared barrier.
-        return Err(format!("daemon did not grant an idle restart: {grant:?}; update refused, admission left unchanged by this client"));
+        return Err(format!(
+            "daemon did not grant an idle restart: {grant:?}; update refused, admission left unchanged by this client"
+        ));
     }
 
     #[derive(Deserialize)]
@@ -176,7 +207,9 @@ async fn stop_with_timing(
         Err(error) => {
             // A lost shutdown reply cannot prove whether the daemon acted.
             // Retain the barrier and endpoint; never substitute pkill/unlink.
-            return Err(format!("{error}; shutdown is unconfirmed, installation not started; admission may remain closed"));
+            return Err(format!(
+                "{error}; shutdown is unconfirmed, installation not started; admission may remain closed"
+            ));
         }
     };
     if reply.status != "shutting_down" {
@@ -184,9 +217,13 @@ async fn stop_with_timing(
         // state changed. Without an owner token, reopening it could clear a
         // different operation's barrier. Leave that state intact for explicit
         // reconciliation rather than authorizing installation or force-stop.
-        return Err(format!("daemon did not acknowledge shutdown ({}); installation not started; admission may remain closed", reply.status));
+        return Err(format!(
+            "daemon did not acknowledge shutdown ({}); installation not started; admission may remain closed",
+            reply.status
+        ));
     }
-    let deadline = Instant::now().checked_add(timing.shutdown)
+    let deadline = Instant::now()
+        .checked_add(timing.shutdown)
         .ok_or("update shutdown timeout is out of range")?;
     loop {
         match socket_identity(path).await? {
@@ -224,11 +261,17 @@ mod tests {
     }
 
     async fn answer(listener: &UnixListener, expected: &str, value: Value) {
-        let (mut stream, _) = timeout(Duration::from_secs(2), listener.accept()).await.unwrap().unwrap();
+        let (mut stream, _) = timeout(Duration::from_secs(2), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
         let mut command = String::new();
         stream.read_to_string(&mut command).await.unwrap();
         assert_eq!(command, expected);
-        stream.write_all(format!("HTTP/1.1 200 OK\r\n\r\n{value}").as_bytes()).await.unwrap();
+        stream
+            .write_all(format!("HTTP/1.1 200 OK\r\n\r\n{value}").as_bytes())
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -251,7 +294,10 @@ mod tests {
             drop(listener);
             tokio::fs::remove_file(&socket).await.unwrap();
         };
-        let (result, ()) = tokio::join!(stop_with_timing(&socket, Duration::from_secs(1), timing()), server);
+        let (result, ()) = tokio::join!(
+            stop_with_timing(&socket, Duration::from_secs(1), timing()),
+            server
+        );
         assert!(result.unwrap());
         assert!(unrelated.exists());
         drop(peer);
@@ -259,7 +305,12 @@ mod tests {
 
     #[tokio::test]
     async fn update_shutdown_zero_wait_and_each_kind_of_inflight_work_refuse_without_mutation() {
-        for field in ["active_build_ids", "queued_build_ids", "client_lease_ids", "client_lease_scan_error"] {
+        for field in [
+            "active_build_ids",
+            "queued_build_ids",
+            "client_lease_ids",
+            "client_lease_scan_error",
+        ] {
             let directory = tempfile::tempdir().unwrap();
             let socket = directory.path().join("daemon.sock");
             let listener = UnixListener::bind(&socket).unwrap();
@@ -276,7 +327,11 @@ mod tests {
             );
             assert!(result.is_err(), "{field}");
             assert_eq!(socket_identity(&socket).await.unwrap(), before);
-            assert!(timeout(Duration::from_millis(10), listener.accept()).await.is_err());
+            assert!(
+                timeout(Duration::from_millis(10), listener.accept())
+                    .await
+                    .is_err()
+            );
         }
     }
 
@@ -291,7 +346,11 @@ mod tests {
         );
         assert!(result.unwrap_err().contains("already closed"));
         assert!(socket.exists());
-        assert!(timeout(Duration::from_millis(10), listener.accept()).await.is_err());
+        assert!(
+            timeout(Duration::from_millis(10), listener.accept())
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -303,10 +362,15 @@ mod tests {
             answer(&listener, ADMISSION_STATUS, admission(false, false)).await;
             answer(&listener, CLOSE_ADMISSION, admission(true, false)).await;
         };
-        let (result, ()) = tokio::join!(stop_with_timing(&socket, Duration::ZERO, timing()), server);
+        let (result, ()) =
+            tokio::join!(stop_with_timing(&socket, Duration::ZERO, timing()), server);
         assert!(result.unwrap_err().contains("did not grant"));
         assert!(socket.exists());
-        assert!(timeout(Duration::from_millis(10), listener.accept()).await.is_err());
+        assert!(
+            timeout(Duration::from_millis(10), listener.accept())
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -319,10 +383,15 @@ mod tests {
             answer(&listener, CLOSE_ADMISSION, admission(true, true)).await;
             answer(&listener, SHUTDOWN, json!({"status":"shutdown_blocked"})).await;
         };
-        let (result, ()) = tokio::join!(stop_with_timing(&socket, Duration::ZERO, timing()), server);
+        let (result, ()) =
+            tokio::join!(stop_with_timing(&socket, Duration::ZERO, timing()), server);
         assert!(result.is_err());
         assert!(socket.exists());
-        assert!(timeout(Duration::from_millis(10), listener.accept()).await.is_err());
+        assert!(
+            timeout(Duration::from_millis(10), listener.accept())
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -336,14 +405,19 @@ mod tests {
             answer(&listener, CLOSE_ADMISSION, admission(true, true)).await;
             answer(&listener, SHUTDOWN, json!({"status":"shutting_down"})).await;
         };
-        let (result, ()) = tokio::join!(stop_with_timing(&socket, Duration::ZERO, timing()), server);
+        let (result, ()) =
+            tokio::join!(stop_with_timing(&socket, Duration::ZERO, timing()), server);
         assert!(result.unwrap_err().contains("endpoint remains"));
         assert_eq!(socket_identity(&socket).await.unwrap(), before);
     }
 
     #[tokio::test]
     async fn update_shutdown_lost_or_malformed_reply_never_authorizes_kill_or_unlink() {
-        for reply in [b"".as_slice(), b"HTTP/1.1 200 OK\r\n\r\n{}", b"HTTP/1.1 500 Error\r\n\r\n{\"status\":\"shutting_down\"}"] {
+        for reply in [
+            b"".as_slice(),
+            b"HTTP/1.1 200 OK\r\n\r\n{}",
+            b"HTTP/1.1 500 Error\r\n\r\n{\"status\":\"shutting_down\"}",
+        ] {
             let directory = tempfile::tempdir().unwrap();
             let socket = directory.path().join("daemon.sock");
             let listener = UnixListener::bind(&socket).unwrap();
@@ -356,10 +430,15 @@ mod tests {
                 assert_eq!(command, SHUTDOWN);
                 stream.write_all(reply).await.unwrap();
             };
-            let (result, ()) = tokio::join!(stop_with_timing(&socket, Duration::ZERO, timing()), server);
+            let (result, ()) =
+                tokio::join!(stop_with_timing(&socket, Duration::ZERO, timing()), server);
             assert!(result.is_err());
             assert!(socket.exists());
-            assert!(timeout(Duration::from_millis(10), listener.accept()).await.is_err());
+            assert!(
+                timeout(Duration::from_millis(10), listener.accept())
+                    .await
+                    .is_err()
+            );
         }
     }
 
@@ -368,7 +447,12 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("daemon.sock");
         let _listener = UnixListener::bind(&socket).unwrap();
-        let result = timeout(Duration::from_secs(2), stop_with_timing(&socket, Duration::ZERO, timing())).await.unwrap();
+        let result = timeout(
+            Duration::from_secs(2),
+            stop_with_timing(&socket, Duration::ZERO, timing()),
+        )
+        .await
+        .unwrap();
         assert!(result.unwrap_err().contains("timed out"));
         assert!(socket.exists());
     }
@@ -389,14 +473,16 @@ mod tests {
             std::fs::rename(&socket, &retired).unwrap();
             UnixListener::bind(&socket).unwrap()
         };
-        let (result, replacement) = tokio::join!(
-            stop_with_timing(&socket, Duration::ZERO, timing()),
-            server,
-        );
+        let (result, replacement) =
+            tokio::join!(stop_with_timing(&socket, Duration::ZERO, timing()), server,);
         assert!(result.unwrap_err().contains("replacement daemon"));
         assert!(socket.exists());
         assert!(retired.exists());
-        assert!(timeout(Duration::from_millis(10), replacement.accept()).await.is_err());
+        assert!(
+            timeout(Duration::from_millis(10), replacement.accept())
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -411,8 +497,15 @@ mod tests {
 
     #[test]
     fn update_shutdown_partial_or_invalid_evidence_cannot_prove_idle() {
-        for body in [json!({}), json!({"admission_closed":false, "restart_permitted":true}), json!({"admission_closed":false, "restart_permitted":false, "active_build_ids":[], "queued_build_ids":[]})] {
-            assert!(decode_reply::<Admission>(format!("HTTP/1.1 200 OK\r\n\r\n{body}").as_bytes()).is_err());
+        for body in [
+            json!({}),
+            json!({"admission_closed":false, "restart_permitted":true}),
+            json!({"admission_closed":false, "restart_permitted":false, "active_build_ids":[], "queued_build_ids":[]}),
+        ] {
+            assert!(
+                decode_reply::<Admission>(format!("HTTP/1.1 200 OK\r\n\r\n{body}").as_bytes())
+                    .is_err()
+            );
         }
         assert!(decode_reply::<Admission>(&vec![b' '; MAX_REPLY_BYTES as usize + 1]).is_err());
         assert!(decode_reply::<Admission>(b"HTTP/1.1 200 OK\r\n").is_err());

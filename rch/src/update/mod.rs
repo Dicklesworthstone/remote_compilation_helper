@@ -243,7 +243,10 @@ async fn verify_installation(ctx: &OutputContext) -> Result<()> {
             .into_iter()
             .flatten()
         {
-            println!("{}: not installed (optional)", name.as_str().unwrap_or_default());
+            println!(
+                "{}: not installed (optional)",
+                name.as_str().unwrap_or_default()
+            );
         }
         println!("Installed binary version checks passed (not a checksum or signature check).");
     }
@@ -591,9 +594,7 @@ mod tests {
         let path = directory.join(name);
         std::fs::write(
             &path,
-            format!(
-                "#!/bin/sh\n[ \"$#\" = 1 ] && [ \"$1\" = --version ] || exit 90\n{body}\n"
-            ),
+            format!("#!/bin/sh\n[ \"$#\" = 1 ] && [ \"$1\" = --version ] || exit 90\n{body}\n"),
         )
         .unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -631,10 +632,9 @@ mod tests {
     async fn installation_verification_discloses_client_only_installations() {
         let directory = tempfile::tempdir().unwrap();
         let client = installed_fixture(directory.path(), "rch", "printf 'rch 2.1.15\\n'");
-        let report =
-            inspect_installation(&client, "2.1.15", std::time::Duration::from_secs(2))
-                .await
-                .unwrap();
+        let report = inspect_installation(&client, "2.1.15", std::time::Duration::from_secs(2))
+            .await
+            .unwrap();
         assert_eq!(report["components"].as_array().unwrap().len(), 1);
         assert_eq!(
             report["absent_optional_components"],
@@ -668,18 +668,13 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn installation_verification_refuses_broken_or_mismatched_companions() {
-        for body in [
-            "exit 8",
-            "printf 'rchd 2.0.0\\n'",
-            "printf 'rch 2.1.15\\n'",
-        ] {
+        for body in ["exit 8", "printf 'rchd 2.0.0\\n'", "printf 'rch 2.1.15\\n'"] {
             let directory = tempfile::tempdir().unwrap();
             let client = installed_fixture(directory.path(), "rch", "printf 'rch 2.1.15\\n'");
             installed_fixture(directory.path(), "rchd", body);
-            let error =
-                inspect_installation(&client, "2.1.15", std::time::Duration::from_secs(2))
-                    .await
-                    .unwrap_err();
+            let error = inspect_installation(&client, "2.1.15", std::time::Duration::from_secs(2))
+                .await
+                .unwrap_err();
             assert!(error.to_string().contains("rchd"), "{error}");
         }
         let directory = tempfile::tempdir().unwrap();
@@ -713,10 +708,9 @@ mod tests {
         ] {
             let client = installed_fixture(directory.path(), "rch", body);
             let start = std::time::Instant::now();
-            let error =
-                inspect_installation(&client, "2.1.15", std::time::Duration::from_secs(1))
-                    .await
-                    .unwrap_err();
+            let error = inspect_installation(&client, "2.1.15", std::time::Duration::from_secs(1))
+                .await
+                .unwrap_err();
             assert!(format!("{error:#}").contains(reason), "{error:#}");
             assert!(start.elapsed() < std::time::Duration::from_secs(5));
         }

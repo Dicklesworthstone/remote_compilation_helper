@@ -90,6 +90,8 @@ jobs:
               actual = subprocess.check_output(['git', 'hash-object', path], text=True).strip()
               if actual != sha:
                   raise RuntimeError(f'{path}: expected {sha}, found {actual}; refusing stale publication')
+          for path in ['scripts/test_source_content_ssh.py', '.github/workflows/source-content-ssh.yml']:
+              expected[path] = subprocess.check_output(['git', 'hash-object', path], text=True).strip()
           sha = '373b8c9691c8128c8ef8c35da7ac93421cdc4fcf'
           request = urllib.request.Request(
               f"https://api.github.com/repos/{os.environ['GITHUB_REPOSITORY']}/git/blobs/{sha}",
@@ -106,7 +108,7 @@ jobs:
           subprocess.run(['git', 'apply', '--whitespace=error-all', str(patch)], check=True)
           subprocess.run(['git', 'diff', '--check'], check=True)
           changed = subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines()
-          if set(changed) != set(expected) - {'rch/src/transfer/source_content_barrier.rs'}:
+          if set(changed) != {'rch/src/transfer.rs', 'rch/src/hook/ssh.rs', 'rabs-scheduler/src/managed_pool.rs'}:
               raise RuntimeError(f'unexpected changed files: {changed}')
           (evidence / 'prepared.patch').write_bytes(subprocess.check_output(['git', 'diff', '--binary']))
           (evidence / 'baseline.json').write_text(json.dumps(expected, indent=2) + '\n')
@@ -131,17 +133,15 @@ jobs:
           python3 - <<'PY'
           import base64, json, os, pathlib, subprocess, urllib.request
           repo = os.environ['GITHUB_REPOSITORY']
-          parent = os.environ['GITHUB_SHA']
           paths = ['rch/src/transfer.rs', 'rch/src/hook/ssh.rs', 'rabs-scheduler/src/managed_pool.rs']
           evidence = pathlib.Path(os.environ['RUNNER_TEMP']) / 'source84-evidence'
+          expected = json.loads((evidence / 'baseline.json').read_text())
           def api(suffix, payload=None, method=None):
               data = None if payload is None else json.dumps(payload).encode()
               request = urllib.request.Request(f'https://api.github.com/repos/{repo}/{suffix}', data=data, method=method,
                   headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json', 'Content-Type': 'application/json'})
               with urllib.request.urlopen(request, timeout=60) as response:
                   return json.load(response)
-          if api('git/ref/heads/main')['object']['sha'] != parent:
-              raise RuntimeError('main moved during qualification; refusing to overwrite concurrent work')
           changed = subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines()
           if set(changed) != set(paths):
               raise RuntimeError(f'unexpected publication paths: {changed}')
@@ -152,6 +152,20 @@ jobs:
               if sha != subprocess.check_output(['git', 'hash-object', path], text=True).strip():
                   raise RuntimeError(f'published blob mismatch: {path}')
               tree.append({'path': path, 'mode': '100644', 'type': 'blob', 'sha': sha})
+          # Retain qualified blob identities even if publication conflicts.
+          (evidence / 'prepared.json').write_text(json.dumps({'qualified_base': os.environ['GITHUB_SHA'], 'files': tree}, indent=2) + '\n')
+          parent = api('git/ref/heads/main')['object']['sha']
+          current = {path: api(f'contents/{path}?ref={parent}')['sha'] for path in expected}
+          prepared = {entry['path']: entry['sha'] for entry in tree}
+          # A rerun is idempotent. Never replace a partially changed integration.
+          if all(current[path] == prepared.get(path, sha) for path, sha in expected.items()):
+              (evidence / 'published.json').write_text(json.dumps({'commit': parent, 'already_present': True, 'files': tree}, indent=2) + '\n')
+              raise SystemExit(0)
+          for path, sha in expected.items():
+              if current[path] != sha:
+                  raise RuntimeError(f'{path} changed on main; refusing to overwrite concurrent work')
+          # Unrelated commits are preserved by building on the just-inspected
+          # main tree. Related source, policy, fixture or workflow changes refuse.
           root = api(f'git/commits/{parent}')['tree']['sha']
           tree_sha = api('git/trees', {'base_tree': root, 'tree': tree})['sha']
           message = ('fix(transfer): activate qualified source-receipt checks (#84)\n\n'
@@ -164,13 +178,13 @@ jobs:
               'real SSH/rsync qualification passed in Actions run ' + os.environ['GITHUB_RUN_ID'] + '.\n'
               'This is not a full-workspace or complete RCH execution qualification.\n')
           commit = api('git/commits', {'message': message, 'tree': tree_sha, 'parents': [parent]})['sha']
-          # With one inspected parent and force=false, a concurrent main advance
-          # is rejected by GitHub as a non-fast-forward, never overwritten.
+          # One inspected parent plus force=false makes another main advance
+          # a rejected non-fast-forward, never a lost concurrent commit.
           api('git/refs/heads/main', {'sha': commit, 'force': False}, 'PATCH')
-          if api('git/ref/heads/main')['object']['sha'] != commit:
-              raise RuntimeError(f'publication readback moved after {commit}; inspect before retrying')
           report = {'parent': parent, 'commit': commit, 'tree': tree_sha, 'files': tree}
           (evidence / 'published.json').write_text(json.dumps(report, indent=2) + '\n')
+          if api('git/ref/heads/main')['object']['sha'] != commit:
+              raise RuntimeError(f'publication readback moved after {commit}; inspect before retrying')
           print(json.dumps(report, indent=2))
           PY
       - uses: actions/upload-artifact@v4

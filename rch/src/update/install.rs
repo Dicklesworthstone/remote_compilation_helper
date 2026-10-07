@@ -49,12 +49,17 @@ pub async fn install_update(
     // Get installation paths
     let install_dir = get_install_dir()?;
 
-    // Stop daemon if running and restart is requested
-    let daemon_was_running = if restart_daemon {
-        stop_daemon_gracefully(drain_timeout).await?
-    } else {
-        false
-    };
+    // Reject malformed, incomplete or unusable releases while the running
+    // installation is still untouched. Stage on the destination filesystem:
+    // copying out of an archive (and executing from a noexec temp directory)
+    // must not be deferred until after the daemon has been stopped.
+    let prepared = prepare_release(
+        &download.archive_path,
+        &install_dir,
+        &download.version,
+        std::time::Duration::from_secs(10),
+    )
+    .await?;
 
     // Get current version for backup
     let current_version = env!("CARGO_PKG_VERSION");
@@ -66,18 +71,31 @@ pub async fn install_update(
     let backup_entry = create_backup(&install_dir, current_version)?;
     let backup_dir = backup_entry.backup_path;
 
-    // Extract new binaries to temp location
-    let temp_extract = UpdateExtractDir::new();
-    extract_archive(&download.archive_path, temp_extract.path())?;
+    // Both release preparation and backup must succeed before any shutdown.
+    let daemon_was_running = if restart_daemon {
+        stop_daemon_gracefully(drain_timeout).await?
+    } else {
+        false
+    };
 
-    // Atomic replace: move new binaries to install dir
+    // Publish exactly the staged payloads that passed the version probes.
+    // Each rename is atomic on Unix; this is not a crash-atomic multi-file
+    // transaction. Retain the backup if publication or restart fails.
     if !ctx.is_json() {
         println!("Installing new binaries...");
     }
-    let _installed_binaries = replace_binaries(temp_extract.path(), &install_dir)?;
+    let _installed_binaries = replace_binaries(prepared)?;
 
-    // Verify new binaries work
-    verify_installation(&install_dir)?;
+    // Check the actual installed siblings with the same bounded version probe.
+    super::inspect_installation(
+        &install_dir.join(REQUIRED_UPDATE_BINARY),
+        &download.version,
+        std::time::Duration::from_secs(10),
+    )
+    .await
+    .map_err(|error| {
+        UpdateError::InstallFailed(format!("Installed version check failed: {error:#}"))
+    })?;
 
     // Restart daemon if it was running
     let daemon_restarted = if restart_daemon && daemon_was_running {
@@ -106,6 +124,13 @@ pub async fn rollback(
     dry_run: bool,
     target_version: Option<&str>,
 ) -> Result<(), UpdateError> {
+    // A real rollback chooses its backup under the same ownership lock as
+    // updates, so another update cannot prune the selected backup mid-read.
+    let _lock = if dry_run {
+        None
+    } else {
+        Some(UpdateLock::acquire()?)
+    };
     let backup_dir = if let Some(version) = target_version {
         find_backup_by_version(version)?
     } else {
@@ -140,17 +165,19 @@ pub async fn rollback(
         return Ok(());
     }
 
-    // Acquire lock
-    let _lock = UpdateLock::acquire()?;
+    let install_dir = get_install_dir()?;
+    // A missing required client, unreadable companion or staging failure must
+    // leave the current daemon and all installed binaries alone.
+    let prepared = StagedBinaries::new(&backup_dir, &install_dir)?;
+    if let Some(version) = &version_info {
+        prepared
+            .verify(version, std::time::Duration::from_secs(10))
+            .await?;
+    }
 
-    // Stop daemon
     let daemon_was_running = stop_daemon_gracefully(30).await?;
 
-    // Get install dir
-    let install_dir = get_install_dir()?;
-
-    // Restore from backup
-    restore_from_backup(&backup_dir, &install_dir)?;
+    replace_binaries(prepared)?;
 
     // Restart daemon if it was running
     if daemon_was_running {
@@ -636,38 +663,117 @@ fn discover_extracted_update_binaries(
     Ok(found)
 }
 
-/// Replace binaries in install directory.
-fn replace_binaries(
-    src_dir: &std::path::Path,
-    install_dir: &std::path::Path,
-) -> Result<Vec<&'static str>, UpdateError> {
-    let binaries = discover_extracted_update_binaries(src_dir)?;
-
-    std::fs::create_dir_all(install_dir)
-        .map_err(|e| UpdateError::InstallFailed(format!("Failed to create install dir: {}", e)))?;
-
-    for binary in &binaries {
-        let src = src_dir.join(binary);
-        let dst = install_dir.join(binary);
-        install_binary_from_payload(&src, &dst, binary)?;
-    }
-
-    Ok(binaries)
+/// Owned, destination-local payloads. Every copy and permission change finishes
+/// before the first installed name changes. The source archive/backup is never
+/// read again during publication, and failed preparation cleans only this stage.
+struct StagedBinaries {
+    directory: tempfile::TempDir,
+    install_dir: PathBuf,
+    binaries: Vec<&'static str>,
 }
 
-fn install_binary_from_payload(src: &Path, dst: &Path, binary: &str) -> Result<(), UpdateError> {
-    let staged = dst.with_file_name(format!(".{binary}.rch-update-{}", uuid::Uuid::new_v4()));
-
-    if let Err(error) = copy_regular_binary_payload(src, &staged, binary, "stage") {
-        let _ = std::fs::remove_file(&staged);
-        return Err(error);
+impl StagedBinaries {
+    fn new(src_dir: &Path, install_dir: &Path) -> Result<Self, UpdateError> {
+        let binaries = discover_extracted_update_binaries(src_dir)?;
+        for binary in &binaries {
+            let destination = install_dir.join(binary);
+            match fs::symlink_metadata(&destination) {
+                Ok(metadata) if metadata.is_file() => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Ok(_) => {
+                    return Err(UpdateError::InstallFailed(format!(
+                        "Refusing to replace non-regular installed entry {}",
+                        destination.display()
+                    )));
+                }
+                Err(error) => {
+                    return Err(UpdateError::InstallFailed(format!(
+                        "Cannot inspect installed entry {}: {error}",
+                        destination.display()
+                    )));
+                }
+            }
+        }
+        fs::create_dir_all(install_dir).map_err(|error| {
+            UpdateError::InstallFailed(format!("Failed to create install dir: {error}"))
+        })?;
+        let directory = tempfile::Builder::new()
+            .prefix(".rch-update-stage-")
+            .tempdir_in(install_dir)
+            .map_err(|error| {
+                UpdateError::InstallFailed(format!("Failed to create update stage: {error}"))
+            })?;
+        for binary in &binaries {
+            let staged = directory.path().join(binary);
+            copy_regular_binary_payload(&src_dir.join(binary), &staged, binary, "stage")?;
+            set_update_binary_permissions(&staged)?;
+            fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&staged)
+                .and_then(|file| file.sync_all())
+                .map_err(|error| {
+                    UpdateError::InstallFailed(format!("Failed to sync staged {binary}: {error}"))
+                })?;
+        }
+        Ok(Self {
+            directory,
+            install_dir: install_dir.to_owned(),
+            binaries,
+        })
     }
 
-    if let Err(error) = set_update_binary_permissions(&staged) {
-        let _ = std::fs::remove_file(&staged);
-        return Err(error);
+    async fn verify(
+        &self,
+        version: &str,
+        timeout: std::time::Duration,
+    ) -> Result<(), UpdateError> {
+        for binary in UPDATE_BINARIES {
+            let path = if self.binaries.contains(binary) {
+                self.directory.path().join(binary)
+            } else {
+                let path = self.install_dir.join(binary);
+                if !binary_path_exists(&path, binary, "retained companion")? {
+                    continue;
+                }
+                path
+            };
+            // Optional companions can be absent, not silently kept at another
+            // release version. No PATH lookup or unbounded blocking child.
+            let name = binary.strip_suffix(".exe").unwrap_or(binary);
+            super::probe_installed_version(&path, name, version, timeout)
+                .await
+                .map_err(|error| {
+                    UpdateError::InstallFailed(format!(
+                        "Update preflight for {binary} failed: {error:#}"
+                    ))
+                })?;
+        }
+        Ok(())
     }
-    replace_staged_binary(&staged, dst, binary)
+}
+
+async fn prepare_release(
+    archive: &Path,
+    install_dir: &Path,
+    version: &str,
+    timeout: std::time::Duration,
+) -> Result<StagedBinaries, UpdateError> {
+    let extracted = UpdateExtractDir::new();
+    extract_archive(archive, extracted.path())?;
+    let staged = StagedBinaries::new(extracted.path(), install_dir)?;
+    staged.verify(version, timeout).await?;
+    Ok(staged)
+}
+
+/// Publish the already prepared set without any further source copies.
+fn replace_binaries(prepared: StagedBinaries) -> Result<Vec<&'static str>, UpdateError> {
+    for binary in &prepared.binaries {
+        let src = prepared.directory.path().join(binary);
+        let dst = prepared.install_dir.join(binary);
+        replace_staged_binary(&src, &dst, binary)?;
+    }
+    Ok(prepared.binaries)
 }
 
 #[cfg(unix)]
@@ -706,40 +812,6 @@ fn set_update_binary_permissions(path: &Path) -> Result<(), UpdateError> {
 
 #[cfg(windows)]
 fn set_update_binary_permissions(_path: &Path) -> Result<(), UpdateError> {
-    Ok(())
-}
-
-/// Verify the installation by checking binary versions.
-fn verify_installation(install_dir: &std::path::Path) -> Result<(), UpdateError> {
-    let rch = install_dir.join(REQUIRED_UPDATE_BINARY);
-
-    let output = Command::new(&rch)
-        .arg("--version")
-        .output()
-        .map_err(|e| UpdateError::InstallFailed(format!("Failed to verify installation: {}", e)))?;
-
-    if !output.status.success() {
-        return Err(UpdateError::InstallFailed(
-            "Installed binary failed version check".to_string(),
-        ));
-    }
-
-    Ok(())
-}
-
-/// Restore from backup.
-fn restore_from_backup(
-    backup_dir: &std::path::Path,
-    install_dir: &std::path::Path,
-) -> Result<(), UpdateError> {
-    for binary in UPDATE_BINARIES {
-        let src = backup_dir.join(binary);
-        if binary_path_exists(&src, binary, "backup payload")? {
-            let dst = install_dir.join(binary);
-            install_binary_from_payload(&src, &dst, binary)?;
-        }
-    }
-
     Ok(())
 }
 
@@ -901,6 +973,220 @@ mod tests {
             .expect("update binary list should include at least one optional binary")
     }
 
+    fn stage_and_replace(src: &Path, dst: &Path) -> Result<Vec<&'static str>, UpdateError> {
+        replace_binaries(StagedBinaries::new(src, dst)?)
+    }
+
+    #[tokio::test]
+    async fn update_preflight_refuses_bad_archives_without_changing_installation() {
+        let temp = TempDir::new().unwrap();
+        let install = temp.path().join("install");
+        fs::create_dir(&install).unwrap();
+        fs::write(install.join(REQUIRED_UPDATE_BINARY), b"working installation").unwrap();
+        let archive = temp.path().join("rch.tar.gz");
+        fs::write(&archive, b"not a gzip archive").unwrap();
+        assert!(
+            prepare_release(&archive, &install, "9.1.2", std::time::Duration::from_secs(1))
+                .await
+                .is_err()
+        );
+        create_tar_gz_with_entries(&archive, &[(optional_update_binary(), b"no client")])
+            .unwrap();
+        assert!(
+            prepare_release(&archive, &install, "9.1.2", std::time::Duration::from_secs(1))
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            fs::read(install.join(REQUIRED_UPDATE_BINARY)).unwrap(),
+            b"working installation"
+        );
+        assert_eq!(fs::read_dir(&install).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn update_preflight_rejects_late_invalid_destination_before_first_replacement() {
+        let temp = TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        let install = temp.path().join("install");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir_all(install.join(optional_update_binary())).unwrap();
+        fs::write(source.join(REQUIRED_UPDATE_BINARY), b"new client").unwrap();
+        fs::write(source.join(optional_update_binary()), b"new companion").unwrap();
+        fs::write(install.join(REQUIRED_UPDATE_BINARY), b"old client").unwrap();
+        assert!(stage_and_replace(&source, &install).is_err());
+        assert_eq!(
+            fs::read(install.join(REQUIRED_UPDATE_BINARY)).unwrap(),
+            b"old client"
+        );
+        assert!(install.join(optional_update_binary()).is_dir());
+    }
+
+    #[test]
+    fn update_preflight_publishes_staged_bytes_not_reopened_source_files() {
+        let temp = TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        let install = temp.path().join("install");
+        fs::create_dir(&source).unwrap();
+        for binary in UPDATE_BINARIES {
+            fs::write(source.join(binary), format!("prepared {binary}")).unwrap();
+        }
+        let staged = StagedBinaries::new(&source, &install).unwrap();
+        let stage_path = staged.directory.path().to_owned();
+        for binary in UPDATE_BINARIES {
+            assert!(stage_path.join(binary).is_file());
+            assert!(!install.join(binary).exists());
+            fs::write(source.join(binary), b"changed after staging").unwrap();
+        }
+        assert_eq!(replace_binaries(staged).unwrap(), UPDATE_BINARIES);
+        for binary in UPDATE_BINARIES {
+            assert_eq!(
+                fs::read(install.join(binary)).unwrap(),
+                format!("prepared {binary}").as_bytes()
+            );
+        }
+        assert!(!stage_path.exists());
+    }
+
+    #[test]
+    fn update_preflight_empty_rollback_payload_does_not_report_success() {
+        let temp = TempDir::new().unwrap();
+        let source = temp.path().join("backup");
+        let install = temp.path().join("install");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&install).unwrap();
+        fs::write(install.join(REQUIRED_UPDATE_BINARY), b"working installation").unwrap();
+        assert!(stage_and_replace(&source, &install).is_err());
+        assert_eq!(
+            fs::read(install.join(REQUIRED_UPDATE_BINARY)).unwrap(),
+            b"working installation"
+        );
+    }
+
+    #[cfg(unix)]
+    fn version_payload(name: &str, version: &str) -> Vec<u8> {
+        format!("#!/bin/sh\n[ \"$1\" = --version ] || exit 91\nprintf '%s\\n' '{name} {version}'\n")
+            .into_bytes()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn update_preflight_verifies_every_staged_component_before_publication() {
+        let temp = TempDir::new().unwrap();
+        let archive = temp.path().join("rch.tar.gz");
+        let install = temp.path().join("install");
+        fs::create_dir(&install).unwrap();
+        let payloads: Vec<_> = UPDATE_BINARIES
+            .iter()
+            .map(|name| (*name, version_payload(name, "9.1.2")))
+            .collect();
+        let entries: Vec<_> = payloads
+            .iter()
+            .map(|(name, bytes)| (*name, bytes.as_slice()))
+            .collect();
+        create_tar_gz_with_entries(&archive, &entries).unwrap();
+        for binary in UPDATE_BINARIES {
+            fs::write(install.join(binary), b"old binary").unwrap();
+        }
+        let staged = prepare_release(
+            &archive,
+            &install,
+            "9.1.2",
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        for binary in UPDATE_BINARIES {
+            assert_eq!(fs::read(install.join(binary)).unwrap(), b"old binary");
+        }
+        replace_binaries(staged).unwrap();
+        super::super::inspect_installation(
+            &install.join(REQUIRED_UPDATE_BINARY),
+            "9.1.2",
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn update_preflight_refuses_wrong_failed_noisy_and_hanging_companions() {
+        let cases = [
+            version_payload("rchd", "9.1.1"),
+            version_payload("unrelated", "9.1.2"),
+            b"#!/bin/sh\nexit 0\n".to_vec(),
+            b"#!/bin/sh\nprintf 'rchd 9.1.2\\n'\nexit 7\n".to_vec(),
+            b"#!/bin/sh\nprintf 'rchd 9.1.2\\n'\nprintf 'broken\\n' >&2\n".to_vec(),
+            b"#!/bin/sh\nexec sleep 5\n".to_vec(),
+        ];
+        for (index, companion) in cases.iter().enumerate() {
+            let temp = TempDir::new().unwrap();
+            let archive = temp.path().join("rch.tar.gz");
+            let install = temp.path().join("install");
+            fs::create_dir(&install).unwrap();
+            fs::write(install.join("rch"), b"old client").unwrap();
+            fs::write(install.join("rchd"), b"old daemon").unwrap();
+            create_tar_gz_with_entries(
+                &archive,
+                &[("rch", &version_payload("rch", "9.1.2")), ("rchd", companion)],
+            )
+            .unwrap();
+            let result = prepare_release(
+                &archive,
+                &install,
+                "9.1.2",
+                std::time::Duration::from_secs(1),
+            )
+            .await;
+            let error = result.err().expect("invalid companion must be refused");
+            assert!(
+                error.to_string().contains("preflight for rchd failed"),
+                "case {index} failed before reaching the companion probe: {error}"
+            );
+            assert_eq!(fs::read(install.join("rch")).unwrap(), b"old client");
+            assert_eq!(fs::read(install.join("rchd")).unwrap(), b"old daemon");
+            assert_eq!(fs::read_dir(&install).unwrap().count(), 2);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn update_preflight_retains_only_matching_optional_companions() {
+        let temp = TempDir::new().unwrap();
+        let archive = temp.path().join("rch.tar.gz");
+        let install = temp.path().join("install");
+        fs::create_dir(&install).unwrap();
+        fs::write(install.join("rch"), b"old client").unwrap();
+        create_tar_gz_with_entries(&archive, &[("rch", &version_payload("rch", "9.1.2"))])
+            .unwrap();
+        // An actually absent companion is supported, as before.
+        drop(
+            prepare_release(&archive, &install, "9.1.2", std::time::Duration::from_secs(1))
+                .await
+                .unwrap(),
+        );
+        let companion = install.join("rchd");
+        fs::write(&companion, version_payload("rchd", "9.1.1")).unwrap();
+        set_update_binary_permissions(&companion).unwrap();
+        assert!(
+            prepare_release(&archive, &install, "9.1.2", std::time::Duration::from_secs(1))
+                .await
+                .is_err()
+        );
+        assert_eq!(fs::read(install.join("rch")).unwrap(), b"old client");
+        fs::write(&companion, version_payload("rchd", "9.1.2")).unwrap();
+        let staged = prepare_release(
+            &archive,
+            &install,
+            "9.1.2",
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(staged.binaries, vec!["rch"]);
+    }
+
     fn create_tar_gz_with_raw_path(
         archive_path: &Path,
         raw_path: &[u8],
@@ -988,7 +1274,7 @@ mod tests {
         std::fs::write(install_dir.join(REQUIRED_UPDATE_BINARY), "modified").unwrap();
 
         // Restore
-        restore_from_backup(&backup_dir, &install_dir).unwrap();
+        stage_and_replace(&backup_dir, &install_dir).unwrap();
 
         let content = std::fs::read_to_string(install_dir.join(REQUIRED_UPDATE_BINARY)).unwrap();
         assert_eq!(content, "test binary");
@@ -1096,7 +1382,7 @@ mod tests {
         // Install directory doesn't exist
         assert!(!install_dir.exists());
 
-        let installed = replace_binaries(&src_dir, &install_dir).unwrap();
+        let installed = stage_and_replace(&src_dir, &install_dir).unwrap();
 
         // Should have created it
         assert_eq!(installed, vec![REQUIRED_UPDATE_BINARY]);
@@ -1119,7 +1405,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = replace_binaries(&src_dir, &install_dir);
+        let result = stage_and_replace(&src_dir, &install_dir);
         assert!(matches!(result, Err(UpdateError::InstallFailed(_))));
         assert_eq!(
             std::fs::read_to_string(install_dir.join(REQUIRED_UPDATE_BINARY)).unwrap(),
@@ -1143,7 +1429,7 @@ mod tests {
         std::fs::write(src_dir.join(REQUIRED_UPDATE_BINARY), "new binary").unwrap();
         std::fs::write(install_dir.join(REQUIRED_UPDATE_BINARY), "old binary").unwrap();
 
-        let installed = replace_binaries(&src_dir, &install_dir).unwrap();
+        let installed = stage_and_replace(&src_dir, &install_dir).unwrap();
 
         assert_eq!(installed, vec![REQUIRED_UPDATE_BINARY]);
         assert_eq!(
@@ -1167,7 +1453,7 @@ mod tests {
 
         std::fs::create_dir_all(src_dir.join(REQUIRED_UPDATE_BINARY)).unwrap();
 
-        let result = replace_binaries(&src_dir, &install_dir);
+        let result = stage_and_replace(&src_dir, &install_dir);
         assert!(matches!(result, Err(UpdateError::InstallFailed(_))));
         assert!(
             !install_dir.exists(),
@@ -1359,7 +1645,7 @@ mod tests {
         std::fs::write(install_dir.join(REQUIRED_UPDATE_BINARY), "current v2.0").unwrap();
         std::fs::write(install_dir.join(optional_binary), "current optional").unwrap();
 
-        restore_from_backup(&backup_dir, &install_dir).unwrap();
+        stage_and_replace(&backup_dir, &install_dir).unwrap();
 
         assert_eq!(
             std::fs::read_to_string(install_dir.join(REQUIRED_UPDATE_BINARY)).unwrap(),
@@ -1387,7 +1673,7 @@ mod tests {
         symlink(&external_binary, backup_dir.join(REQUIRED_UPDATE_BINARY)).unwrap();
         std::fs::write(install_dir.join(REQUIRED_UPDATE_BINARY), "current binary").unwrap();
 
-        let result = restore_from_backup(&backup_dir, &install_dir);
+        let result = stage_and_replace(&backup_dir, &install_dir);
 
         assert!(matches!(result, Err(UpdateError::InstallFailed(_))));
         assert_eq!(
@@ -1407,7 +1693,7 @@ mod tests {
         std::fs::create_dir_all(&install_dir).unwrap();
         std::fs::write(install_dir.join(REQUIRED_UPDATE_BINARY), "current binary").unwrap();
 
-        let result = restore_from_backup(&backup_dir, &install_dir);
+        let result = stage_and_replace(&backup_dir, &install_dir);
 
         assert!(matches!(result, Err(UpdateError::InstallFailed(_))));
         assert_eq!(
