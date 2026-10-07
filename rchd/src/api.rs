@@ -5156,6 +5156,36 @@ mod tests {
             .unwrap();
         assert_eq!(ctx.history.reserved_disk_headroom_gib("large"), 0);
         assert_eq!(worker.used_slots(), 0);
+        let stale = handle_select_worker_with_wrapper(
+            &ctx,
+            second.clone(),
+            false,
+            None,
+            Some("rchw-second-disk-owner".into()),
+        )
+        .await
+        .unwrap();
+        assert!(stale.worker.is_none());
+        assert!(stale.build_id.is_none());
+        let diagnostic = stale
+            .diagnostics
+            .unwrap()
+            .workers
+            .into_iter()
+            .find(|entry| entry.worker_id.as_str() == "large")
+            .unwrap();
+        assert!(
+            diagnostic
+                .reason_codes
+                .iter()
+                .any(|reason| reason == "disk_headroom_stale")
+        );
+        assert!(ctx.history.active_builds().is_empty());
+        assert_eq!(worker.used_slots(), 0);
+        // Only a capacity probe started after completion can fund the next
+        // reservation. Keep the old positive and duplicate-release checks.
+        let refreshed = worker.capabilities().await;
+        worker.set_capabilities(refreshed).await;
         let next = handle_select_worker_with_wrapper(
             &ctx,
             second,

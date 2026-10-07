@@ -242,17 +242,30 @@ impl std::fmt::Display for DiskHeadroomRejection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Unknown => f.write_str("declared disk headroom requires a valid live capacity sample and durable budget accounting"),
-            Self::Stale => f.write_str("declared disk headroom capacity sample expired or was superseded"),
+            Self::Stale => f.write_str("declared disk headroom capacity sample expired, was superseded, or requires a probe after budget release"),
             Self::Insufficient { free_gib, required_gib } => write!(f, "declared disk headroom requires {required_gib} GiB including active reservations; worker reported {free_gib} GiB free"),
         }
     }
 }
 
 impl DiskHeadroomAdmission {
+    #[cfg(test)]
     pub(crate) fn check(
         &self,
         worker_id: &str,
         reserved_gib: u64,
+    ) -> Result<(), DiskHeadroomRejection> {
+        self.check_after_completion(worker_id, reserved_gib, None)
+    }
+
+    /// Releasing a budget does not imply its bytes became free. A new probe
+    /// must start strictly after completion before its capacity can fund
+    /// another declared build, including probes still in flight at completion.
+    pub(crate) fn check_after_completion(
+        &self,
+        worker_id: &str,
+        reserved_gib: u64,
+        capacity_after: Option<Instant>,
     ) -> Result<(), DiskHeadroomRejection> {
         if self.requested_gib == 0 {
             return Ok(());
@@ -265,6 +278,7 @@ impl DiskHeadroomAdmission {
         if capacity.observed_at.elapsed()
             > DiskPressurePolicyConfig::default().telemetry_stale_after
             || capacity.current_generation.load(Ordering::Acquire) != capacity.generation
+            || capacity_after.is_some_and(|cutoff| capacity.observed_at <= cutoff)
         {
             return Err(DiskHeadroomRejection::Stale);
         }
@@ -749,6 +763,31 @@ mod tests {
     use rch_telemetry::collect::disk::{DiskMetrics, DiskTelemetry};
     use rch_telemetry::collect::memory::{MemoryPressureStall, MemoryTelemetry};
     use rch_telemetry::protocol::{TelemetrySource, WorkerTelemetry};
+
+    #[test]
+    fn disk_budget_completion_requires_strictly_newer_probe_start() {
+        let sample = DiskCapacityObservation::fixture("worker", 100.0, Duration::ZERO);
+        let observed_at = sample.observed_at;
+        let disk = DiskHeadroomAdmission {
+            requested_gib: 80,
+            capacity: Some(sample),
+        };
+        for cutoff in [observed_at, observed_at + Duration::from_nanos(1)] {
+            assert_eq!(
+                disk.check_after_completion("worker", 0, Some(cutoff)),
+                Err(DiskHeadroomRejection::Stale)
+            );
+        }
+        assert!(
+            disk.check_after_completion("worker", 0, Some(observed_at - Duration::from_nanos(1)),)
+                .is_ok()
+        );
+        assert!(
+            DiskHeadroomAdmission::default()
+                .check_after_completion("worker", u64::MAX, Some(observed_at))
+                .is_ok()
+        );
+    }
 
     #[test]
     fn declared_disk_budget_requires_valid_recent_same_worker_capacity() {

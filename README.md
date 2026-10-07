@@ -581,7 +581,10 @@ For projects with large build outputs, set `compilation.disk_headroom_gib` in
 worker's reported build filesystem. Selection requires a successful disk probe
 within 90 seconds and subtracts budgets already held by active builds in this
 daemon. Budgets survive daemon restart and remain held until the owning build
-completes; retries, queue recovery, and `rch diagnose` use the same requirement.
+completes. Releasing a budget does not prove its output files freed any space:
+the next budgeted admission requires a disk probe started after that completion.
+A probe already in flight cannot reuse the earlier free-space reading. Retries,
+queue recovery, and `rch diagnose` use the same requirement.
 Smaller CPU-slot estimates and cache affinity cannot bypass it. Older daemons
 reject the distinct budgeted selection endpoint rather than ignoring the
 requirement.

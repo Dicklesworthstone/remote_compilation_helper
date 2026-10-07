@@ -685,12 +685,15 @@ impl WorkerSelector {
         let Some(history) = &self.build_history else {
             return Some(DiskHeadroomRejection::Unknown);
         };
-        DiskHeadroomAdmission {
-            requested_gib: request.disk_headroom_gib,
-            capacity: worker.disk_capacity_observation().await,
-        }
-        .check(worker_id, history.reserved_disk_headroom_gib(worker_id))
-        .err()
+        history
+            .check_disk_headroom(
+                worker_id,
+                &DiskHeadroomAdmission {
+                    requested_gib: request.disk_headroom_gib,
+                    capacity: worker.disk_capacity_observation().await,
+                },
+            )
+            .err()
     }
 
     /// Set the repo convergence service for pre-build freshness checks (bd-vvmd.3.3).
@@ -7072,6 +7075,24 @@ mod tests {
             "free-small"
         );
         request.disk_headroom_gib = 64;
+        selector
+            .record_success("free-small", &request.project)
+            .await;
+        let mut fallback_request = request.clone();
+        fallback_request.estimated_cores = 1;
+        fallback_request.disk_headroom_gib = 36;
+        assert_eq!(
+            selector
+                .try_fallback(&pool, &fallback_request, &excluded)
+                .await
+                .as_deref(),
+            Some("free-small"),
+            "the last-success route must be live before testing its stale-sample fence"
+        );
+        // This probe starts before completion, but its high free-space result
+        // will arrive afterward. Publication time must not make it fresh.
+        let mut in_flight_probe = Some(worker.capability_probe_context().await);
+        let old_capacity = worker.capabilities().await;
         history
             .complete_durable(
                 active.id,
@@ -7087,12 +7108,76 @@ mod tests {
             )
             .unwrap()
             .unwrap();
+        assert_eq!(history.reserved_disk_headroom_gib("free-small"), 0);
+        for delayed_publish in [false, true] {
+            if delayed_publish {
+                assert!(worker.publish_capabilities(
+                    in_flight_probe.take().unwrap(), old_capacity.clone(),
+                ).await);
+            }
+            // Both ordinary and CPU-degraded selection, including diagnostic
+            // previews, must reject the sample predating the released budget.
+            for cores in [1, 4] {
+                request.estimated_cores = cores;
+                for result in [
+                    selector
+                        .preview_with_exclusions(&pool, &request, &excluded)
+                        .await,
+                    selector
+                        .select_with_exclusions(&pool, &request, &excluded)
+                        .await,
+                ] {
+                    assert!(
+                        result.worker.is_none(),
+                        "old capacity admitted after release"
+                    );
+                    let diagnostics = result.diagnostics.unwrap();
+                    let free = diagnostics
+                        .workers
+                        .iter()
+                        .find(|entry| entry.worker_id.as_str() == "free-small")
+                        .unwrap();
+                    assert!(
+                        free.reason_codes
+                            .iter()
+                            .any(|reason| reason == "disk_headroom_stale")
+                    );
+                }
+            }
+            fallback_request.disk_headroom_gib = 64;
+            assert!(
+                selector
+                    .try_fallback(&pool, &fallback_request, &excluded)
+                    .await
+                    .is_none()
+            );
+        }
+        // Completion releases accounting, not the files. A fresh real sample
+        // still has to prove the requested free bytes actually remain.
+        let mut current_capacity = old_capacity.clone();
+        current_capacity.build_disk_free_gb = Some(20.0);
+        worker.set_capabilities(current_capacity).await;
+        assert!(
+            selector
+                .select_with_exclusions(&pool, &request, &excluded)
+                .await
+                .worker
+                .is_none()
+        );
+        worker.set_capabilities(old_capacity).await;
         assert!(
             selector
                 .select_with_exclusions(&pool, &request, &excluded)
                 .await
                 .worker
                 .is_some()
+        );
+        assert_eq!(
+            selector
+                .try_fallback(&pool, &fallback_request, &excluded)
+                .await
+                .as_deref(),
+            Some("free-small")
         );
     }
 
