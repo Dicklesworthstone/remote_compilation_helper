@@ -963,6 +963,85 @@ commands may still run locally. For several focused checks, run separate direct
 
 ---
 
+## RABS Dependency Cache (opt-in)
+
+RABS can cache the compiles of registry and Git dependencies across
+worktrees and target directories on one machine. Cargo runs every `rustc`
+through `rabs-wrap`. The wrapper asks `rabsd` for a decision under a bounded
+budget and falls back to the real compiler on any problem, so a missing or
+unhealthy daemon only costs the cache.
+
+Enable it with two settings:
+
+```toml
+# ~/.config/rch/config.toml (or $RABS_CONFIG)
+[rabs]
+live_dependency = true        # or run rabsd with RABS_LIVE_DEPENDENCY=1
+```
+
+```bash
+rabsd &                                    # socket: ~/.cache/rch/rabsd.sock
+export RUSTC_WRAPPER="$(command -v rabs-wrap)"
+cargo build
+```
+
+The wrapper and daemon share these defaults, which you can override with
+environment variables:
+
+| Path | Default | Override |
+|------|---------|----------|
+| Socket | `~/.cache/rch/rabsd.sock` | `RABS_SOCKET_PATH` (both sides) |
+| Breaker state | `~/.cache/rch/rabs-breaker` | `RABS_BREAKER_FILE` |
+| Daemon state | `~/.cache/rch/rabs-state` | `RABS_STATE_DIR` |
+
+`rabsd --check-config` prints the resolved socket and whether the dependency
+lane is on.
+
+**What is served.** A dependency compile is cached under an exact key. That
+key covers:
+
+- the compiler bytes
+- the package sources
+- the arguments
+- the keyed environment
+- the identity of every crate the compiler can actually load
+
+Crates loaded through `--extern` are identified by exact path. Crates loaded
+through `-L dependency=` are found by Cargo's file prefix and identified by
+their embedded crate metadata. As a result, unrelated or in-progress files in
+a busy `target/deps` directory do not change the key. A dependency's rlib and
+its pipelined rmeta also map to the same key.
+
+Packages with a build script are cached in one of two modes:
+
+- **Relocatable:** used when the crate's compile never reads `OUT_DIR`, for
+  example a build script that only emits `cargo:rustc-cfg` or
+  `cargo:rustc-env`. These keys are shared across worktrees.
+- **Exact:** used when the crate's compile includes generated files. These
+  keys cover the `OUT_DIR` path and its generated tree.
+
+Values the build script sets with `cargo:rustc-env` are always part of the
+key.
+
+A hit is installed only after the wrapper accepts it, and the result matches
+a stock build byte for byte. A miss compiles locally once and publishes its
+outputs only after the inputs are re-checked as unchanged.
+
+**What is refused.** These compiles run uncached:
+
+- workspace members
+- compiles that reach a dylib or proc-macro through a library search path
+  (the compile still runs; only the cache is skipped)
+- dependency directories that change during the compile
+- environment the key cannot model, such as `LD_PRELOAD`
+
+Each decision is logged on rabsd's stderr as a `rabsd-live-dependency` JSON
+line, such as `hit`, `served`, `execute`, `committed`, `pass-through` or
+`not-published`. Uncacheable compiles are logged as `shadow` with a stable
+`LIVE_DEP_*` reason code.
+
+---
+
 ## Security Model
 
 - Transport uses SSH.
