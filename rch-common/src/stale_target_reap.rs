@@ -1374,6 +1374,43 @@ pub fn collect_paths_command(targets: &[GcCollectTarget]) -> Result<String, Stri
     collect_paths_command_with_registry(targets, SOURCE_CLAIM_REGISTRY)
 }
 
+/// Why `target` may not be embedded in a removal command, or `None` if it may.
+///
+/// [`collect_paths_command`] refuses a batch containing any such target. Callers
+/// screen targets with this first and report each rejected one as a skip, so a
+/// single unembeddable path (e.g. `…/worker volume/…`, which contains a space)
+/// cannot abort a whole worker's collection (bd-kr4qb).
+#[must_use]
+pub fn collect_target_rejection(target: &GcCollectTarget) -> Option<String> {
+    if !is_safe_reap_path(&target.path) {
+        return Some(format!(
+            "refusing to collect {:?}: not an absolute, `..`-free, metacharacter-free path at \
+             least two levels deep",
+            target.path
+        ));
+    }
+    if GcClass::from_path(&target.path) == GcClass::Unrecognized {
+        return Some(format!(
+            "refusing to collect {:?}: basename is not an rch-managed runtime dir",
+            target.path
+        ));
+    }
+    if target.idle_minutes == 0 {
+        return Some(format!(
+            "refusing to collect {:?}: a zero idle window would remove a live dir",
+            target.path
+        ));
+    }
+    if !target
+        .trigger
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-')
+    {
+        return Some(format!("invalid trigger tag {:?}", target.trigger));
+    }
+    None
+}
+
 fn collect_paths_command_with_registry(
     targets: &[GcCollectTarget],
     registry: &str,
@@ -1383,31 +1420,8 @@ fn collect_paths_command_with_registry(
     }
     let mut list = String::new();
     for target in targets {
-        if !is_safe_reap_path(&target.path) {
-            return Err(format!(
-                "refusing to collect {:?}: not an absolute, `..`-free, metacharacter-free path at \
-                 least two levels deep",
-                target.path
-            ));
-        }
-        if GcClass::from_path(&target.path) == GcClass::Unrecognized {
-            return Err(format!(
-                "refusing to collect {:?}: basename is not an rch-managed runtime dir",
-                target.path
-            ));
-        }
-        if target.idle_minutes == 0 {
-            return Err(format!(
-                "refusing to collect {:?}: a zero idle window would remove a live dir",
-                target.path
-            ));
-        }
-        if !target
-            .trigger
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-')
-        {
-            return Err(format!("invalid trigger tag {:?}", target.trigger));
+        if let Some(rejection) = collect_target_rejection(target) {
+            return Err(rejection);
         }
         list.push_str(&format!(
             " \"{}:{}:{}\"",
@@ -2066,6 +2080,37 @@ mod tests {
             ..good.clone()
         };
         assert!(collect_paths_command(&[zero]).is_err());
+    }
+
+    #[test]
+    fn collect_target_rejection_screens_unembeddable_paths_individually() {
+        // bd-kr4qb: `…/worker volume/…` (a space) must be rejected on its own,
+        // so callers can skip it and still collect every other target.
+        let good = GcCollectTarget {
+            path: POOL.to_string(),
+            idle_minutes: 10_080,
+            trigger: "pooled-ttl",
+        };
+        let spaced = GcCollectTarget {
+            path: "/data/tmp/rch/repo/.rch-tmp/.tmp8xieom/worker volume/.rch-target-w-pool-a"
+                .to_string(),
+            ..good.clone()
+        };
+        assert_eq!(collect_target_rejection(&good), None);
+        let reason = collect_target_rejection(&spaced).expect("space must be rejected");
+        assert!(reason.contains("metacharacter-free"), "{reason}");
+        // The rejection is exactly what fails the batch...
+        assert_eq!(
+            collect_paths_command(&[good.clone(), spaced.clone()]),
+            Err(reason)
+        );
+        // ...so screening it out leaves a collectable batch.
+        let screened: Vec<GcCollectTarget> = [good, spaced]
+            .into_iter()
+            .filter(|t| collect_target_rejection(t).is_none())
+            .collect();
+        assert_eq!(screened.len(), 1);
+        assert!(collect_paths_command(&screened).is_ok());
     }
 
     #[test]

@@ -4901,8 +4901,22 @@ async fn handle_gc(
         let mut apply_error: Option<String> = None;
         let mut timed_out = false;
         let mut unknown_batch_paths: Vec<String> = Vec::new();
-        if apply && !targets.is_empty() {
-            for (batch_index, batch) in targets.chunks(GC_COLLECT_BATCH).enumerate() {
+        // One target that cannot be embedded in a remote command (a space in an
+        // ancestor dir, say) used to fail the whole batch, so the worker
+        // collected nothing (bd-kr4qb). Report each such target as a skip and
+        // collect the rest.
+        let mut embeddable: Vec<reap::GcCollectTarget> = Vec::with_capacity(targets.len());
+        for target in &targets {
+            match reap::collect_target_rejection(target) {
+                Some(reason) if apply => skipped.push(serde_json::json!({
+                    "path": target.path, "trigger": target.trigger, "reason": reason,
+                })),
+                Some(_) => {}
+                None => embeddable.push(target.clone()),
+            }
+        }
+        if apply && !embeddable.is_empty() {
+            for (batch_index, batch) in embeddable.chunks(GC_COLLECT_BATCH).enumerate() {
                 let command = match reap::collect_paths_command(batch) {
                     Ok(command) => command,
                     Err(e) => {
