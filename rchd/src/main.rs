@@ -479,11 +479,46 @@ fn cgroup_says_rchd_unit() -> Option<bool> {
     }
 }
 
+/// The user runtime dir `systemctl --user` needs when the caller has none.
+///
+/// cron, at and session-less ssh run without `XDG_RUNTIME_DIR`, so `systemctl
+/// --user` cannot reach the user manager there. `is-enabled rchd` then failed,
+/// the unit looked absent, and a hook-spawned duplicate kept the socket while
+/// the real unit waited (css, 2026-10-06; bd-hvos9). Returns the standard
+/// `/run/user/<uid>` only when the variable is unset and that directory exists.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn missing_user_runtime_dir(
+    xdg_runtime_dir: Option<&std::ffi::OsStr>,
+    uid: u32,
+    is_dir: impl Fn(&Path) -> bool,
+) -> Option<PathBuf> {
+    if xdg_runtime_dir.is_some_and(|dir| !dir.is_empty()) {
+        return None;
+    }
+    let dir = PathBuf::from(format!("/run/user/{uid}"));
+    is_dir(&dir).then_some(dir)
+}
+
+/// `systemctl --user`, reachable from cron/at/session-less contexts too.
+#[cfg(target_os = "linux")]
+fn systemctl_user() -> std::process::Command {
+    let mut command = std::process::Command::new("systemctl");
+    command.arg("--user");
+    if let Some(dir) = missing_user_runtime_dir(
+        std::env::var_os("XDG_RUNTIME_DIR").as_deref(),
+        nix::unistd::getuid().as_raw(),
+        Path::is_dir,
+    ) {
+        command.env("XDG_RUNTIME_DIR", dir);
+    }
+    command
+}
+
 /// Is a systemd --user `rchd.service` unit configured (enabled/static) here?
 #[cfg(target_os = "linux")]
 fn rchd_systemd_unit_present() -> bool {
-    std::process::Command::new("systemctl")
-        .args(["--user", "is-enabled", "rchd"])
+    systemctl_user()
+        .args(["is-enabled", "rchd"])
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
@@ -515,9 +550,7 @@ fn defer_to_systemd_if_managed(socket: &Path, workers_config: Option<&Path>, sha
         info!(
             "rchd is managed by the systemd --user rchd.service unit here; starting it and exiting to avoid a duplicate daemon"
         );
-        let _ = std::process::Command::new("systemctl")
-            .args(["--user", "start", "rchd"])
-            .status();
+        let _ = systemctl_user().args(["start", "rchd"]).status();
         std::process::exit(0);
     }
     #[cfg(not(target_os = "linux"))]
@@ -2775,6 +2808,28 @@ mod systemd_singleton_tests {
         assert!(!cgroup_contains_rchd_unit(
             "0::/user.slice/user-1000.slice/user@1000.service/app.slice/some-agent.scope"
         ));
+    }
+
+    #[test]
+    fn cron_context_gets_the_user_runtime_dir_for_systemctl() {
+        // bd-hvos9: cron has no XDG_RUNTIME_DIR; without it `systemctl --user`
+        // cannot see rchd.service and a duplicate daemon keeps the socket.
+        let exists = |p: &Path| p == Path::new("/run/user/1000");
+        assert_eq!(
+            missing_user_runtime_dir(None, 1000, exists),
+            Some(PathBuf::from("/run/user/1000"))
+        );
+        assert_eq!(
+            missing_user_runtime_dir(Some(std::ffi::OsStr::new("")), 1000, exists),
+            Some(PathBuf::from("/run/user/1000"))
+        );
+        // An existing session value is never overridden.
+        assert_eq!(
+            missing_user_runtime_dir(Some(std::ffi::OsStr::new("/run/user/1000")), 1000, exists),
+            None
+        );
+        // No user manager runtime dir (no lingering/session): leave it unset.
+        assert_eq!(missing_user_runtime_dir(None, 1001, exists), None);
     }
 }
 
