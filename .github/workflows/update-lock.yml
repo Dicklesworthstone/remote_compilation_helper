@@ -47,6 +47,7 @@ jobs:
           cargo test --locked -p rch --bin rch test_verify_installation_ -- --nocapture 2>&1 | tee "$evidence/failed-client-probes.log"
           cargo test --locked -p rch --bin rch update_verification_ -- --nocapture 2>&1 | tee "$evidence/authorization.log"
           cargo test --locked -p rch --bin rch update_shutdown_ -- --nocapture 2>&1 | tee "$evidence/shutdown.log"
+          cargo test --locked -p rch --bin rch update_start_ -- --nocapture 2>&1 | tee "$evidence/readiness.log"
           # Include all existing archive, backup, replacement and restoration
           # checks alongside the new staged preflight regressions.
           cargo test --locked -p rch --bin rch update::install::tests -- --nocapture 2>&1 | tee "$evidence/preflight-and-install.log"
@@ -104,6 +105,9 @@ jobs:
           mod daemon_shutdown;
           pub async fn stop_daemon(path: &std::path::Path, drain_timeout: std::time::Duration) -> Result<bool, String> {
               daemon_shutdown::stop(path, drain_timeout).await
+          }
+          pub async fn start_daemon(command: std::process::Command, path: &std::path::Path, version: Option<&str>) -> Result<(), String> {
+              daemon_shutdown::start(command, path, version).await
           }
           RS
           fi

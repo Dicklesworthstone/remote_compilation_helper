@@ -1,4 +1,4 @@
-//! Confirm an idle daemon's shutdown before an update or rollback mutates files.
+//! Confirm daemon shutdown and restart during an update or rollback.
 //!
 //! This is deliberately not the interactive `daemon stop` path: an update never
 //! authorizes killing a process, removing a socket, or interrupting a build.
@@ -15,6 +15,7 @@ const MAX_REPLY_BYTES: u64 = 1024 * 1024;
 const ADMISSION_STATUS: &str = "GET /restart-admission\n";
 const CLOSE_ADMISSION: &str = "POST /restart-admission\n";
 const SHUTDOWN: &str = "POST /shutdown\n";
+const STATUS: &str = "GET /status\n";
 
 #[derive(Clone, Copy)]
 struct Timing {
@@ -101,6 +102,18 @@ async fn request<T: serde::de::DeserializeOwned>(
     command: &str,
     budget: Duration,
 ) -> Result<T, String> {
+    request_capture(path, expected, command, budget, false)
+        .await
+        .map(|(reply, _)| reply)
+}
+
+async fn request_capture<T: serde::de::DeserializeOwned>(
+    path: &Path,
+    expected: SocketIdentity,
+    command: &str,
+    budget: Duration,
+    require_peer: bool,
+) -> Result<(T, Option<u32>), String> {
     timeout(budget, async {
         if socket_identity(path).await? != Some(expected) {
             return Err("daemon endpoint changed; update refused".to_owned());
@@ -112,6 +125,19 @@ async fn request<T: serde::de::DeserializeOwned>(
         if socket_identity(path).await? != Some(expected) {
             return Err("daemon endpoint changed during connection; update refused".to_owned());
         }
+        let peer = if require_peer {
+            Some(
+                stream
+                    .peer_cred()
+                    .map_err(|error| format!("cannot inspect daemon peer: {error}"))?
+                    .pid()
+                    .and_then(|pid| u32::try_from(pid).ok())
+                    .filter(|pid| *pid > 0)
+                    .ok_or("daemon peer PID is unavailable; readiness unconfirmed")?,
+            )
+        } else {
+            None
+        };
         stream
             .write_all(command.as_bytes())
             .await
@@ -123,10 +149,171 @@ async fn request<T: serde::de::DeserializeOwned>(
             .read_to_end(&mut bytes)
             .await
             .map_err(|error| error.to_string())?;
-        decode_reply(&bytes)
+        Ok((decode_reply(&bytes)?, peer))
     })
     .await
     .map_err(|_| "daemon lifecycle request timed out; update refused".to_owned())?
+}
+
+#[derive(Deserialize)]
+struct ReadyStatus {
+    daemon: ReadyDaemon,
+}
+
+#[derive(Deserialize)]
+struct ReadyDaemon {
+    pid: u32,
+    version: String,
+    socket_path: String,
+}
+
+/// Both replies must come from one kernel-identified peer at one socket inode.
+/// Readiness means the installed version answers and admission is open, not
+/// that the fleet is healthy or idle. New builds may already have arrived.
+async fn probe_ready(
+    path: &Path,
+    identity: SocketIdentity,
+    version: Option<&str>,
+    budget: Duration,
+) -> Result<u32, String> {
+    let (status, peer): (ReadyStatus, _) =
+        request_capture(path, identity, STATUS, budget, true).await?;
+    if peer != Some(status.daemon.pid)
+        || Path::new(&status.daemon.socket_path) != path
+        || status.daemon.version.is_empty()
+        || status.daemon.version.chars().any(char::is_control)
+        || version.is_some_and(|expected| expected != status.daemon.version)
+    {
+        return Err("daemon identity, socket or installed version mismatch".to_owned());
+    }
+    let (admission, second_peer): (Admission, _) =
+        request_capture(path, identity, ADMISSION_STATUS, budget, true).await?;
+    if second_peer != peer || socket_identity(path).await? != Some(identity) {
+        return Err("daemon endpoint changed while confirming readiness".to_owned());
+    }
+    if admission.admission_closed || admission.client_lease_scan_error.is_some() {
+        return Err("daemon is responding but admission is unavailable".to_owned());
+    }
+    Ok(status.daemon.pid)
+}
+
+fn launcher_status(
+    child: &mut Option<tokio::process::Child>,
+) -> Result<Option<std::process::ExitStatus>, String> {
+    let status = match child {
+        Some(child) => child
+            .try_wait()
+            .map_err(|error| format!("cannot inspect daemon launcher: {error}"))?,
+        None => None,
+    };
+    if let Some(status) = status
+        && !status.success()
+    {
+        return Err(format!("installed daemon launcher exited {status}; restart failed"));
+    }
+    Ok(status)
+}
+
+pub(super) async fn start(
+    command: std::process::Command,
+    path: &Path,
+    version: Option<&str>,
+) -> Result<(), String> {
+    start_with_timing(
+        command,
+        path,
+        version,
+        Duration::from_secs(30),
+        Timing::default(),
+    )
+    .await
+}
+
+/// A service manager may already have respawned the installed daemon, or the
+/// exact installed launcher may exit successfully after delegating to it. In
+/// either case success still requires real, version-bound endpoint evidence.
+/// No second spawn, process-name kill, socket unlink or admission mutation is
+/// used as a fallback. A timeout may leave a live daemon; report uncertainty
+/// rather than killing a process that could already have accepted new work.
+async fn start_with_timing(
+    mut command: std::process::Command,
+    path: &Path,
+    version: Option<&str>,
+    startup: Duration,
+    timing: Timing,
+) -> Result<(), String> {
+    if startup.is_zero() {
+        return Err("daemon readiness budget must be nonzero".to_owned());
+    }
+    let mut last_error = "daemon endpoint has not appeared".to_owned();
+    let result = timeout(startup, async {
+        let executable = Path::new(command.get_program());
+        if !executable.is_absolute() || !path.is_absolute() {
+            return Err("daemon executable and socket must be absolute paths".to_owned());
+        }
+        let metadata = tokio::fs::symlink_metadata(executable)
+            .await
+            .map_err(|error| format!("cannot inspect installed daemon: {error}"))?;
+        if !metadata.is_file() {
+            return Err("installed daemon is not a regular file".to_owned());
+        }
+        let mut identity = socket_identity(path).await?;
+        let mut child = if identity.is_none() {
+            // Do not keep the updater's JSON/output pipes or terminal open in
+            // a long-lived daemon. rchd maintains its own configured log files.
+            command
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            Some(
+                tokio::process::Command::from(command)
+                    .spawn()
+                    .map_err(|error| format!("cannot launch installed daemon: {error}"))?,
+            )
+        } else {
+            // Never spawn over even an unresponsive existing socket. It can
+            // belong to a service manager that won the startup race.
+            None
+        };
+        let launched_pid = child.as_ref().and_then(tokio::process::Child::id);
+        loop {
+            launcher_status(&mut child)?;
+            let observed = socket_identity(path).await?;
+            if identity.is_some() && observed != identity {
+                return Err(
+                    "daemon endpoint was replaced during startup; restart unconfirmed".to_owned(),
+                );
+            }
+            if let Some(current) = observed {
+                identity = Some(current);
+                match probe_ready(path, current, version, timing.request).await {
+                    Ok(peer) => {
+                        let exited = launcher_status(&mut child)?;
+                        match launched_pid {
+                            Some(pid) if pid == peer && exited.is_some() => {
+                                return Err("daemon exited after replying; restart failed".to_owned());
+                            }
+                            Some(pid) if pid != peer && exited.is_none() => {
+                                last_error =
+                                    "daemon launcher has not confirmed service-manager handoff"
+                                        .to_owned();
+                            }
+                            _ => return Ok(()),
+                        }
+                    }
+                    Err(error) => last_error = error,
+                }
+            }
+            sleep(timing.poll).await;
+        }
+    })
+    .await;
+    match result {
+        Ok(result) => result,
+        Err(_) => Err(format!(
+            "daemon readiness timed out after {startup:?}: {last_error}; installed files and any running daemon retained"
+        )),
+    }
 }
 
 pub(super) async fn stop(path: &Path, drain_timeout: Duration) -> Result<bool, String> {
@@ -272,6 +459,311 @@ mod tests {
             .write_all(format!("HTTP/1.1 200 OK\r\n\r\n{value}").as_bytes())
             .await
             .unwrap();
+    }
+
+    fn start_command(script: &str) -> std::process::Command {
+        let mut command = std::process::Command::new(std::fs::canonicalize("/bin/sh").unwrap());
+        command.args(["-c", script, "readiness-fixture"]);
+        command
+    }
+
+    fn ready_status(socket: &Path) -> Value {
+        json!({"daemon": {"pid": std::process::id(), "version": "9.1.2",
+                          "socket_path": socket}})
+    }
+
+    async fn serve_readiness(listener: &UnixListener, status: Value, admission: Value) {
+        let _ = timeout(Duration::from_millis(200), async {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut command = String::new();
+                stream.read_to_string(&mut command).await.unwrap();
+                let value = match command.as_str() {
+                    STATUS => &status,
+                    ADMISSION_STATUS => &admission,
+                    other => panic!("readiness must not mutate daemon state: {other}"),
+                };
+                // A deadline may drop the client's socket while this fixture
+                // is replying. That is expected, not a fixture panic.
+                let _ = stream
+                    .write_all(format!("HTTP/1.1 200 OK\r\n\r\n{value}").as_bytes())
+                    .await;
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn update_start_confirms_existing_ready_daemon_without_spawning_over_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("custom : daemon.sock");
+        let marker = directory.path().join("must-not-spawn");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let before = socket_identity(&socket).await.unwrap();
+        let mut command = start_command("printf spawned > \"$1\"");
+        command.arg(&marker);
+        let server = async {
+            answer(&listener, STATUS, ready_status(&socket)).await;
+            let mut available = admission(false, false);
+            // Ready does not mean idle: admitting work is the desired result.
+            available["active_build_ids"] = json!([41]);
+            answer(&listener, ADMISSION_STATUS, available).await;
+        };
+        let (result, ()) = tokio::join!(
+            start_with_timing(
+                command,
+                &socket,
+                Some("9.1.2"),
+                Duration::from_secs(1),
+                timing(),
+            ),
+            server,
+        );
+        result.unwrap();
+        assert!(!marker.exists());
+        assert_eq!(socket_identity(&socket).await.unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn update_start_rejects_wrong_identity_version_path_and_unavailable_admission() {
+        for case in 0..7 {
+            let directory = tempfile::tempdir().unwrap();
+            let socket = directory.path().join("daemon.sock");
+            let marker = directory.path().join("must-not-spawn");
+            let listener = UnixListener::bind(&socket).unwrap();
+            let before = socket_identity(&socket).await.unwrap();
+            let mut status = ready_status(&socket);
+            let mut available = admission(false, false);
+            match case {
+                0 => status["daemon"]["pid"] = json!(u32::MAX),
+                1 => status["daemon"]["version"] = json!("old-version"),
+                2 => status["daemon"]["socket_path"] = json!("/another/socket"),
+                3 => status["daemon"] = json!({"pid": std::process::id()}),
+                4 => available["admission_closed"] = json!(true),
+                5 => available["client_lease_scan_error"] = json!("permission denied"),
+                6 => available = json!({"admission_closed": false}),
+                _ => unreachable!(),
+            }
+            let mut command = start_command("printf spawned > \"$1\"");
+            command.arg(&marker);
+            let (result, ()) = tokio::join!(
+                start_with_timing(
+                    command,
+                    &socket,
+                    Some("9.1.2"),
+                    Duration::from_millis(100),
+                    timing(),
+                ),
+                serve_readiness(&listener, status, available),
+            );
+            assert!(result.is_err(), "case {case}");
+            assert!(!marker.exists());
+            assert_eq!(socket_identity(&socket).await.unwrap(), before);
+        }
+    }
+
+    #[tokio::test]
+    async fn update_start_refuses_failed_launcher_and_zero_exit_without_ready_api() {
+        for script in ["exit 17", "exit 0"] {
+            let directory = tempfile::tempdir().unwrap();
+            let socket = directory.path().join("daemon.sock");
+            let result = start_with_timing(
+                start_command(script),
+                &socket,
+                Some("9.1.2"),
+                Duration::from_millis(100),
+                timing(),
+            )
+            .await
+            .unwrap_err();
+            if script == "exit 17" {
+                assert!(result.contains("launcher exited"), "{result}");
+            } else {
+                assert!(result.contains("readiness timed out"), "{result}");
+            }
+            assert!(!socket.exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn update_start_retains_unresponsive_and_non_socket_endpoints() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let before = socket_identity(&socket).await.unwrap();
+        let began = Instant::now();
+        let error = start_with_timing(
+            start_command("exit 19"),
+            &socket,
+            Some("9.1.2"),
+            Duration::from_millis(50),
+            timing(),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("readiness timed out"), "{error}");
+        assert!(began.elapsed() < Duration::from_secs(1));
+        assert_eq!(socket_identity(&socket).await.unwrap(), before);
+        drop(listener);
+        let ordinary = directory.path().join("ordinary");
+        std::fs::write(&ordinary, b"keep").unwrap();
+        assert!(
+            start_with_timing(
+                start_command("exit 19"),
+                &ordinary,
+                Some("9.1.2"),
+                Duration::from_millis(50),
+                timing(),
+            )
+            .await
+            .unwrap_err()
+            .contains("not a Unix socket")
+        );
+        assert_eq!(std::fs::read(&ordinary).unwrap(), b"keep");
+    }
+
+    #[tokio::test]
+    async fn update_start_does_not_adopt_replacement_endpoint() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("daemon.sock");
+        let retained = directory.path().join("retained.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = async {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut command = String::new();
+            stream.read_to_string(&mut command).await.unwrap();
+            assert_eq!(command, STATUS);
+            std::fs::rename(&socket, &retained).unwrap();
+            let replacement = UnixListener::bind(&socket).unwrap();
+            stream
+                .write_all(format!("HTTP/1.1 200 OK\r\n\r\n{}", ready_status(&socket)).as_bytes())
+                .await
+                .unwrap();
+            drop(stream);
+            assert!(
+                timeout(Duration::from_millis(100), replacement.accept())
+                    .await
+                    .is_err()
+            );
+        };
+        let (result, ()) = tokio::join!(
+            start_with_timing(
+                start_command("exit 19"),
+                &socket,
+                Some("9.1.2"),
+                Duration::from_secs(1),
+                timing(),
+            ),
+            server,
+        );
+        assert!(result.unwrap_err().contains("replaced during startup"));
+        assert!(socket.exists() && retained.exists());
+    }
+
+    #[tokio::test]
+    async fn update_start_requires_absolute_executable_and_nonzero_budget_before_spawn() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("daemon.sock");
+        let mut relative = std::process::Command::new("rchd");
+        relative.arg("--socket").arg(&socket);
+        assert!(
+            start_with_timing(relative, &socket, None, Duration::from_secs(1), timing())
+                .await
+                .unwrap_err()
+                .contains("absolute")
+        );
+        assert!(
+            start_with_timing(
+                start_command("exit 19"),
+                &socket,
+                None,
+                Duration::ZERO,
+                timing(),
+            )
+            .await
+            .unwrap_err()
+            .contains("nonzero")
+        );
+        assert!(!socket.exists());
+    }
+
+    /// A real child binds its socket and identifies itself using its own PID.
+    /// It self-terminates after a bounded fixture lifetime; no real daemon,
+    /// service manager, user configuration or shared socket is touched.
+    const READY_CHILD: &str = r#"import json, os, socket, stat, sys, time
+path, done, mode = sys.argv[1:]
+null = os.stat(os.devnull)
+for descriptor in (0, 1, 2):
+    metadata = os.fstat(descriptor)
+    assert stat.S_ISCHR(metadata.st_mode) and metadata.st_rdev == null.st_rdev
+if mode == 'delegated' and os.fork() != 0:
+    sys.exit(0)
+if mode == 'delayed':
+    time.sleep(0.05)
+server = socket.socket(socket.AF_UNIX)
+server.bind(path)
+server.listen(4)
+server.settimeout(0.05)
+deadline = time.monotonic() + 1.0
+while time.monotonic() < deadline:
+    try:
+        connection, _ = server.accept()
+    except TimeoutError:
+        continue
+    with connection:
+        connection.settimeout(0.2)
+        data = b''
+        while True:
+            chunk = connection.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+        if data == b'GET /status\n':
+            value = {'daemon': {'pid': os.getpid(), 'version': '9.1.2', 'socket_path': path}}
+        elif data == b'GET /restart-admission\n':
+            value = {'admission_closed': False, 'restart_permitted': False,
+                     'active_build_ids': [], 'queued_build_ids': [], 'client_lease_ids': []}
+        else:
+            raise ValueError('unexpected mutation: ' + repr(data))
+        connection.sendall(b'HTTP/1.1 200 OK\r\n\r\n' + json.dumps(value).encode())
+server.close()
+with open(done, 'w') as output:
+    output.write('finished')
+"#;
+
+    #[tokio::test]
+    async fn update_start_waits_for_real_child_and_detaches_output_pipes() {
+        for mode in ["immediate", "delayed", "delegated"] {
+            let directory = tempfile::tempdir().unwrap();
+            let socket = directory.path().join("custom : daemon.sock");
+            let fixture = directory.path().join("child.py");
+            let done = directory.path().join("done");
+            std::fs::write(&fixture, READY_CHILD).unwrap();
+            let mut command = start_command("exec python3 -I -S \"$@\"");
+            command.arg(&fixture).arg(&socket).arg(&done).arg(mode);
+            // Even an explicitly piped caller command must not leave pipes
+            // connected to a permanent daemon (or kill it when dropped).
+            command
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+            start_with_timing(
+                command,
+                &socket,
+                Some("9.1.2"),
+                Duration::from_secs(2),
+                timing(),
+            )
+            .await
+            .unwrap();
+            timeout(Duration::from_secs(3), async {
+                while !done.exists() {
+                    sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(std::fs::read(&done).unwrap(), b"finished");
+        }
     }
 
     #[tokio::test]

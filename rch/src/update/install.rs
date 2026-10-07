@@ -102,7 +102,7 @@ pub async fn install_update(
         if !ctx.is_json() {
             println!("Restarting daemon...");
         }
-        start_daemon().await?;
+        start_daemon(&install_dir, Some(&download.version)).await?;
         true
     } else {
         false
@@ -181,7 +181,7 @@ pub async fn rollback(
 
     // Restart daemon if it was running
     if daemon_was_running {
-        start_daemon().await?;
+        start_daemon(&install_dir, version_info.as_deref()).await?;
     }
 
     if !ctx.is_json() {
@@ -879,31 +879,40 @@ async fn stop_daemon_gracefully(timeout_secs: u64) -> Result<bool, UpdateError> 
         .map_err(UpdateError::InstallFailed)
 }
 
-/// Start the daemon.
-async fn start_daemon() -> Result<(), UpdateError> {
+/// Restart only the installed sibling and require an operational API. Spawning
+/// a launcher (which may delegate to a service manager) is not readiness.
+async fn start_daemon(
+    install_dir: &Path,
+    expected_version: Option<&str>,
+) -> Result<(), UpdateError> {
     let socket_path = configured_update_socket_path()?;
-    let mut command = daemon_start_command();
+    let mut command = daemon_start_command(install_dir);
 
     // Preserve custom socket configuration across update and rollback restarts.
-    let _child = command
-        .args(daemon_start_args(&socket_path))
-        .spawn()
-        .map_err(|e| UpdateError::InstallFailed(format!("Failed to start daemon: {}", e)))?;
-
-    // Give it a moment to start
-    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-
-    Ok(())
+    command.args(daemon_start_args(&socket_path));
+    #[cfg(unix)]
+    {
+        daemon_shutdown::start(command, &socket_path, expected_version)
+            .await
+            .map_err(UpdateError::InstallFailed)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (command, expected_version);
+        Err(UpdateError::InstallFailed(
+            "Confirmed daemon restart is unsupported on this platform".into(),
+        ))
+    }
 }
 
 #[cfg(not(windows))]
-fn daemon_start_command() -> Command {
-    Command::new("rchd")
+fn daemon_start_command(install_dir: &Path) -> Command {
+    Command::new(install_dir.join("rchd"))
 }
 
 #[cfg(windows)]
-fn daemon_start_command() -> Command {
-    Command::new("rchd.exe")
+fn daemon_start_command(install_dir: &Path) -> Command {
+    Command::new(install_dir.join("rchd.exe"))
 }
 
 fn configured_update_socket_path() -> Result<PathBuf, UpdateError> {
@@ -1710,5 +1719,18 @@ mod tests {
 
         assert_eq!(args[0], std::ffi::OsStr::new("--socket"));
         assert_eq!(args[1], socket_path.as_os_str());
+    }
+
+    #[test]
+    fn update_start_selects_the_installed_sibling_not_path() {
+        let directory = TempDir::new().unwrap();
+        let install_dir = directory.path().join("installation : with spaces");
+        let command = daemon_start_command(&install_dir);
+        assert_eq!(
+            command.get_program(),
+            install_dir
+                .join(format!("rchd{}", std::env::consts::EXE_SUFFIX))
+                .as_os_str()
+        );
     }
 }
