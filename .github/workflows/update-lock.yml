@@ -1,10 +1,11 @@
-name: Update ownership
+name: Update ownership and verification
 
 on:
   push:
     branches: [main]
     paths:
       - 'rch/src/update/lock.rs'
+      - 'rch/src/update/mod.rs'
       - 'rch/src/update/types.rs'
       - 'rch-common/src/process_identity.rs'
       - '.github/workflows/update-lock.yml'
@@ -14,6 +15,49 @@ permissions:
   contents: read
 
 jobs:
+  client-verification:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_NET_RETRY: 2
+      CARGO_HTTP_TIMEOUT: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Select the repository's pinned Rust toolchain
+        run: |
+          set -euo pipefail
+          channel=$(python3 -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["channel"])')
+          rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
+          echo "RUSTUP_TOOLCHAIN=$channel" >> "$GITHUB_ENV"
+      # Build the real client, including its production bounded-output reader.
+      # The isolated ownership job below is not a substitute for this check.
+      - name: Exercise installation probes and authorization in the client crate
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/update-client-evidence"
+          mkdir -p "$evidence"
+          cargo test --locked -p rch --bin rch installation_verification_ -- --nocapture 2>&1 | tee "$evidence/installed-binaries.log"
+          cargo test --locked -p rch --bin rch test_verify_installation_ -- --nocapture 2>&1 | tee "$evidence/failed-client-probes.log"
+          cargo test --locked -p rch --bin rch update_verification_ -- --nocapture 2>&1 | tee "$evidence/authorization.log"
+          cargo clippy --locked -p rch --all-targets -- -D warnings 2>&1 | tee "$evidence/clippy.log"
+      - name: Check client verification formatting
+        if: success() || failure()
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/update-client-evidence"
+          rustfmt --edition 2024 --config skip_children=true --emit stdout rch/src/update/mod.rs > "$RUNNER_TEMP/update-client-evidence/mod.formatted.rs"
+          rustfmt --edition 2024 --config skip_children=true --check rch/src/update/mod.rs
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: update-client-${{ github.sha }}
+          path: ${{ runner.temp }}/update-client-evidence
+          retention-days: 7
   ownership:
     strategy:
       fail-fast: false
