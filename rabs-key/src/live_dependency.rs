@@ -28,11 +28,11 @@
 //!   [`derive_dependency_output_declarations`] adapter (Cargo's detached
 //!   metadata mode is modeled; other unstable output controls, incremental
 //!   state and explicit emit paths are refused; Linux targets);
-//! - every dependency artifact is a `.rmeta`/`.rlib` inside the
-//!   invocation's own out-dir; proc-macro consumption is refused because
+//! - every dependency artifact is a `.rmeta`/`.rlib` inside a completely
+//!   enumerated dependency directory; proc-macro consumption is refused because
 //!   untracked proc-macro reads cannot be proven closed (plan §33.10);
 //! - no native link inputs (`-l`) and no search path other than
-//!   `-L dependency=<out-dir>`;
+//!   explicit `-L dependency=<directory>`;
 //! - JSON diagnostics (`--error-format=json`), so the transcript is
 //!   Cargo's machine protocol and can be canonicalized exactly.
 //!
@@ -47,18 +47,19 @@
 //!   negative-dependency component binds complete enumeration. Reads
 //!   outside that tree are caught after execution by
 //!   [`dep_info_closure_violation`] and the result is not published.
-//! - **Out-dir virtualization:** the out-dir is placement, not semantics:
-//!   `--out-dir`, `-L dependency=` and `--extern` paths are rewritten to
-//!   [`CANONICAL_OUT_DIR`] before keying. rustc does not embed the out-dir
+//! - **Placement virtualization:** `--out-dir` is rewritten to
+//!   [`CANONICAL_OUT_DIR`]; ordered dependency search directories and
+//!   `--extern` paths use distinct canonical roots before keying. rustc does not embed the out-dir
 //!   in `.rlib`/`.rmeta` bytes (pinned by a real-rustc test); dep-info and
 //!   the JSON artifact notifications do mention it, and are canonicalized
 //!   by [`canonicalize_out_dir`] / rendered back by [`render_out_dir`].
+//!   Dependency-root mentions in diagnostics are refused instead of rewritten.
 //!   Every other path (source, cwd, `--remap-path-prefix`, `--sysroot`)
 //!   is keyed as given — local-host serving only (`SubscriberPathPreserving`).
 //! - **Dependencies:** the exact bytes of every `--extern` artifact
 //!   (plan §17.7's conservative default), bound to their crate names.
-//!   Transitive crates rustc loads from the search path are pinned through
-//!   the strict version hashes recorded inside those direct artifacts.
+//!   Every Rust artifact candidate in every dependency search directory is
+//!   also keyed, including transitive candidates and negative membership.
 //! - **Environment (`dependency-env-v1`):** the action's environment is
 //!   CONSTRUCTED, not inherited: `CARGO*`, `RUSTC*`, `RUST_*` and a short
 //!   fixed list are keyed with their values; the jobserver variables are
@@ -109,7 +110,7 @@ pub const DOMAIN_LIVE_CWD: &str = "rabs.live-dependency.cwd.v1";
 /// Negative-dependency component domain.
 pub const DOMAIN_LIVE_NEGATIVE: &str = "rabs.live-dependency.negative.v1";
 /// Dependency-artifact component domain (inputs + name binding).
-pub const DOMAIN_LIVE_ARTIFACTS: &str = "rabs.live-dependency.artifacts.v1";
+pub const DOMAIN_LIVE_ARTIFACTS: &str = "rabs.live-dependency.artifacts.v2";
 /// Sandbox/isolation policy component domain.
 pub const DOMAIN_LIVE_ISOLATION: &str = "rabs.live-dependency.isolation.v1";
 /// Execution-semantics component domain.
@@ -120,22 +121,24 @@ pub const DOMAIN_LIVE_TARGET_SPEC: &str = "rabs.live-dependency.target-spec.v1";
 /// The registry isolation profile. Deliberately plain: it is NOT a
 /// sandbox, and the key says so. V2 requires new evidence after closing
 /// warm-root symlink and leave-and-reenter dep-info traversal gaps.
-pub const ISOLATION_PROFILE: &str = "live-dependency-v2: unsandboxed local edge process; \
+pub const ISOLATION_PROFILE: &str = "live-dependency-v3: unsandboxed local edge process; \
      environment constructed by dependency-env-v1 (allowlisted names keyed, jobserver \
      passthrough unkeyed, all other names absent); source = complete registry package \
      tree with a real directory root revalidated on every observation; closure enforced \
      after execution by dep-info traversal bounded to the observed source root; proc-macro \
-     consumption and build-script outputs refused";
+     consumption and build-script outputs refused; exact regular Rust dependency \
+     directory candidates revalidated before serving and after execution";
 
 /// Git checkout capture includes all source members, including dirty and
 /// untracked files, but never authorizes reads of Git metadata.
-pub const GIT_ISOLATION_PROFILE: &str = "live-git-dependency-v1: unsandboxed local edge process; \
+pub const GIT_ISOLATION_PROFILE: &str = "live-git-dependency-v2: unsandboxed local edge process; \
      environment constructed by dependency-env-v1 (allowlisted names keyed, jobserver \
      passthrough unkeyed, all other names absent); source = complete Cargo Git checkout \
      tree including dirty and untracked source files, root .git excluded before capture; \
      real directory root revalidated on every observation; closure enforced after execution \
      by dep-info traversal bounded to the observed source root, Git metadata reads refused; \
-     proc-macro consumption and build-script outputs refused";
+     proc-macro consumption and build-script outputs refused; exact regular Rust dependency \
+     directory candidates revalidated before serving and after execution";
 
 /// What the executed compiler must produce for a publishable result.
 pub const EXECUTION_SEMANTICS: &str = "live-dependency-v1: rustc exit status 0 by normal \
@@ -198,7 +201,7 @@ pub enum LiveRefusal {
     SourceOutsidePackage(String),
     /// A path cannot be represented exactly in dep-info and JSON.
     UnrepresentablePath(String),
-    /// A search path other than `dependency=<out-dir>`.
+    /// A search path outside the bounded dependency-directory model.
     SearchPath(String),
     /// A dependency artifact outside the out-dir or of an unknown kind.
     Extern(String),
@@ -278,7 +281,7 @@ pub struct LiveRustcRequest<'a> {
 /// One `--extern` the action consumes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlannedExtern {
-    /// A file inside the out-dir; its bytes key the action.
+    /// A file inside an enumerated dependency directory; its bytes key the action.
     File {
         /// Crate name.
         name: String,
@@ -341,6 +344,9 @@ pub struct DependencyActionPlan {
     pub host_triple: String,
     /// Dependency artifacts in argv order.
     pub externs: Vec<PlannedExtern>,
+    /// Unique dependency directories in first-use order (-L, then externs).
+    /// Callers must capture all regular Rust artifact candidates in each.
+    pub dependency_dirs: Vec<String>,
     /// Derived outputs, relative to the out-dir.
     pub outputs: OutputDeclarationSet,
     /// Keyed environment, sorted by name.
@@ -351,6 +357,31 @@ pub struct DependencyActionPlan {
 }
 
 impl DependencyActionPlan {
+    /// Real placement roots and their canonical counterparts. Roots are
+    /// disjoint, so replacing one can never hide another.
+    #[must_use]
+    pub fn placement_mappings(&self) -> Vec<(String, String)> {
+        let mut mappings = vec![(self.out_dir.clone(), CANONICAL_OUT_DIR.to_owned())];
+        for (index, root) in self.dependency_dirs.iter().enumerate() {
+            if root != &self.out_dir {
+                mappings.push((root.clone(), format!("/__rabs/deps/{index:03}")));
+            }
+        }
+        mappings
+    }
+
+    fn virtual_dependency_path(&self, path: &str) -> String {
+        for (root, canonical) in self.placement_mappings() {
+            if path == root {
+                return canonical;
+            }
+            if let Some(relative) = path.strip_prefix(&format!("{root}/")) {
+                return format!("{canonical}/{relative}");
+            }
+        }
+        path.to_owned()
+    }
+
     /// Virtual root of the complete source tree in the input manifest.
     #[must_use]
     pub fn source_virtual_root(&self) -> String {
@@ -418,6 +449,19 @@ pub struct ExternFact {
     pub path: String,
     /// Content digest of the file bytes.
     pub content_digest: TypedDigest,
+}
+
+/// Complete candidate inventory of one dependency search directory.
+/// Only regular Rust artifacts and inert dep-info companions are admitted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DependencyDirectoryFact {
+    /// Real absolute directory, in the plan's first-use order.
+    pub path: String,
+    /// Every `.rmeta`/`.rlib` candidate, sorted by absolute path.
+    pub artifacts: Vec<ExternFact>,
+    /// Regular `.d` companions, sorted by file name. Their bytes cannot
+    /// participate in rustc artifact resolution; their membership is bound.
+    pub dep_info_names: Vec<String>,
 }
 
 /// The exact key of one live dependency action.
@@ -635,13 +679,34 @@ pub fn plan_dependency_action(
     {
         return Err(LiveRefusal::UnrepresentablePath(out_dir));
     }
-    let dependency_search = format!("dependency={out_dir}");
-    if let Some(other) = invocation
-        .lib_search
-        .iter()
-        .find(|entry| **entry != dependency_search)
-    {
-        return Err(LiveRefusal::SearchPath(other.clone()));
+    let mut dependency_dirs = Vec::new();
+    let mut add_directory = |path: &str| -> Result<(), LiveRefusal> {
+        if !plain_path(path)
+            || path == source_root
+            || within(path, &source_root)
+            || within(&source_root, path)
+            || (path != out_dir && (within(path, &out_dir) || within(&out_dir, path)))
+            || dependency_dirs
+                .iter()
+                .any(|other: &String| other != path && (within(path, other) || within(other, path)))
+        {
+            return Err(LiveRefusal::SearchPath(path.to_owned()));
+        }
+        if !dependency_dirs.iter().any(|other| other == path) {
+            if dependency_dirs.len() >= 128 {
+                return Err(LiveRefusal::SearchPath(
+                    "too many dependency directories".into(),
+                ));
+            }
+            dependency_dirs.push(path.to_owned());
+        }
+        Ok(())
+    };
+    for entry in &invocation.lib_search {
+        let path = entry
+            .strip_prefix("dependency=")
+            .ok_or_else(|| LiveRefusal::SearchPath(entry.clone()))?;
+        add_directory(path)?;
     }
 
     let mut externs = Vec::with_capacity(invocation.externs.len());
@@ -650,11 +715,21 @@ pub fn plan_dependency_action(
             externs.push(PlannedExtern::Toolchain { name: name.clone() });
             continue;
         };
-        let file = path
-            .strip_prefix(&out_dir)
-            .and_then(|rest| rest.strip_prefix('/'))
-            .filter(|file| safe_component(file))
+        let (directory, file) = path
+            .rsplit_once('/')
+            .filter(|(_, file)| safe_component(file))
             .ok_or_else(|| LiveRefusal::Extern(path.clone()))?;
+        add_directory(directory)?;
+        if directory == out_dir
+            && outputs
+                .declarations
+                .iter()
+                .any(|output| output.virtual_path == file)
+        {
+            return Err(LiveRefusal::Extern(
+                "dependency aliases a declared output".into(),
+            ));
+        }
         let kind = if file.ends_with(".rmeta") {
             DependencyArtifactKind::Rmeta
         } else if file.ends_with(".rlib") {
@@ -694,17 +769,11 @@ pub fn plan_dependency_action(
         target_triple,
         host_triple: host_triple.to_owned(),
         externs,
+        dependency_dirs,
         outputs,
         keyed_env,
         execution_env,
     })
-}
-
-fn virtual_out_path(out_dir: &str, path: &str) -> String {
-    match path.strip_prefix(out_dir) {
-        Some(rest) => format!("{CANONICAL_OUT_DIR}{rest}"),
-        None => path.to_owned(),
-    }
 }
 
 /// The normalized-invocation component: out-dir placement virtualized,
@@ -714,11 +783,14 @@ fn invocation_component(plan: &DependencyActionPlan) -> TypedDigest {
     let mut virtual_invocation = plan.invocation.clone();
     virtual_invocation.out_dir = Some(CANONICAL_OUT_DIR.to_owned());
     for entry in &mut virtual_invocation.lib_search {
-        *entry = format!("dependency={CANONICAL_OUT_DIR}");
+        let root = entry
+            .strip_prefix("dependency=")
+            .expect("planned dependency search");
+        *entry = format!("dependency={}", plan.virtual_dependency_path(root));
     }
     for (_, path) in &mut virtual_invocation.externs {
         if let Some(path) = path {
-            *path = virtual_out_path(&plan.out_dir, path);
+            *path = plan.virtual_dependency_path(path);
         }
     }
     let mut enc = CanonicalEncoder::new();
@@ -732,7 +804,76 @@ fn invocation_component(plan: &DependencyActionPlan) -> TypedDigest {
 fn artifacts_component(
     plan: &DependencyActionPlan,
     facts: &[ExternFact],
+    directories: &[DependencyDirectoryFact],
 ) -> Result<TypedDigest, LiveRefusal> {
+    if directories.len() != plan.dependency_dirs.len() {
+        return Err(LiveRefusal::Facts(
+            "dependency directory inventory is incomplete".into(),
+        ));
+    }
+    let mut candidates = CanonicalEncoder::new();
+    candidates
+        .str("exact-dependency-candidates-v1")
+        .u64(directories.len() as u64);
+    for (root, directory) in plan.dependency_dirs.iter().zip(directories) {
+        if &directory.path != root {
+            return Err(LiveRefusal::Facts(
+                "dependency directories are reordered or missing".into(),
+            ));
+        }
+        candidates.str(&plan.virtual_dependency_path(root));
+        let prefix = format!("{root}/");
+        let mut previous = None;
+        candidates.u64(directory.artifacts.len() as u64);
+        for artifact in &directory.artifacts {
+            let name = artifact
+                .path
+                .strip_prefix(&prefix)
+                .filter(|name| {
+                    safe_component(name) && (name.ends_with(".rlib") || name.ends_with(".rmeta"))
+                })
+                .ok_or_else(|| LiveRefusal::Facts("invalid Rust dependency candidate".into()))?;
+            if previous.is_some_and(|old: &str| old >= name)
+                || (root == &plan.out_dir
+                    && plan.output_names().iter().any(|output| output == name))
+            {
+                return Err(LiveRefusal::Facts(
+                    "duplicate, unsorted, or output-alias candidate".into(),
+                ));
+            }
+            previous = Some(name);
+            candidates
+                .str(name)
+                .str(artifact.content_digest.domain)
+                .bytes(&artifact.content_digest.bytes);
+        }
+        previous = None;
+        candidates.u64(directory.dep_info_names.len() as u64);
+        for name in &directory.dep_info_names {
+            if !safe_component(name)
+                || !name.ends_with(".d")
+                || previous.is_some_and(|old| old >= name.as_str())
+                || (root == &plan.out_dir && plan.output_names().contains(name))
+            {
+                return Err(LiveRefusal::Facts(
+                    "invalid dep-info companion inventory".into(),
+                ));
+            }
+            previous = Some(name);
+            candidates.str(name);
+        }
+    }
+    for fact in facts {
+        if !directories
+            .iter()
+            .flat_map(|directory| &directory.artifacts)
+            .any(|candidate| candidate == fact)
+        {
+            return Err(LiveRefusal::Facts(
+                "extern not covered by the exact candidate inventory".into(),
+            ));
+        }
+    }
     let identity_of = |path: &str| -> Option<DependencyArtifactIdentity> {
         let kind = plan.externs.iter().find_map(|planned| match planned {
             PlannedExtern::File {
@@ -780,13 +921,15 @@ fn artifacts_component(
     enc.str(digest.domain)
         .bytes(&digest.bytes)
         .str(names.domain)
-        .bytes(&names.bytes);
+        .bytes(&names.bytes)
+        .bytes(&candidates.finish());
     Ok(compute(DOMAIN_LIVE_ARTIFACTS, &enc.finish()))
 }
 
-/// Normalizer identity for dynamic-library search paths: Cargo prepends
-/// the invocation's out-dir to `LD_LIBRARY_PATH` for rustc, which is the
-/// same placement fact as `--out-dir` and is virtualized the same way.
+/// Normalizer identity for dynamic-library search paths: when Cargo puts
+/// the invocation's out-dir in `LD_LIBRARY_PATH`, that entry is virtualized
+/// as output placement. Every other entry remains exact; a tracked read of
+/// the normalized variable prevents publication.
 pub const DYLIB_PATH_NORMALIZER: &str = "live-dependency.dylib-path-out-dir.v1";
 
 fn environment_component(plan: &DependencyActionPlan) -> Result<TypedDigest, LiveRefusal> {
@@ -861,7 +1004,7 @@ fn output_platform_component(plan: &DependencyActionPlan) -> TypedDigest {
 
 /// Compute the exact key of a planned action from the caller's observed
 /// facts: the toolchain probe, the content digest of every planned extern
-/// file, and the complete source input manifest (virtual paths from
+/// file, complete candidate directory inventories, and the complete source input manifest (virtual paths from
 /// [`DependencyActionPlan::input_virtual_path`]).
 ///
 /// # Errors
@@ -870,6 +1013,7 @@ pub fn live_dependency_key(
     plan: &DependencyActionPlan,
     toolchain: &ToolchainFacts,
     externs: &[ExternFact],
+    directories: &[DependencyDirectoryFact],
     inputs: &ActionInputManifest,
 ) -> Result<LiveDependencyKey, LiveRefusal> {
     if toolchain.host_triple() != Some(plan.host_triple.as_str()) {
@@ -969,7 +1113,7 @@ pub fn live_dependency_key(
         virtual_working_directory: compute(DOMAIN_LIVE_CWD, plan.cwd.as_bytes()),
         action_inputs,
         negative_dependencies: negative,
-        dependency_inputs: artifacts_component(plan, externs)?,
+        dependency_inputs: artifacts_component(plan, externs, directories)?,
         toolchain: toolchain_contract.dataset_digest(),
         output_platform: output_platform_component(plan),
         environment: environment_component(plan)?,
@@ -1020,6 +1164,30 @@ pub fn canonicalize_out_dir(raw: &[u8], out_dir: &str) -> Result<Vec<u8>, &'stat
 #[must_use]
 pub fn render_out_dir(canonical: &[u8], out_dir: &str) -> Vec<u8> {
     replace_all(canonical, CANONICAL_OUT_DIR.as_bytes(), out_dir.as_bytes())
+}
+
+/// Canonicalize output placement in replayable dep-info or diagnostics.
+/// Dependency directory strings are refused: an arbitrary diagnostic may
+/// quote a source-authored literal, so replacing those strings is not sound.
+///
+/// # Errors
+/// Canonical markers and observable dependency placement are refused.
+pub fn canonicalize_placements(
+    raw: &[u8],
+    plan: &DependencyActionPlan,
+) -> Result<Vec<u8>, &'static str> {
+    for root in &plan.dependency_dirs {
+        if root != &plan.out_dir && contains(raw, root.as_bytes()) {
+            return Err("observable dependency directory placement cannot be replayed");
+        }
+    }
+    canonicalize_out_dir(raw, &plan.out_dir)
+}
+
+/// Render the output placement admitted by [`canonicalize_placements`].
+#[must_use]
+pub fn render_placements(canonical: &[u8], plan: &DependencyActionPlan) -> Vec<u8> {
+    render_out_dir(canonical, &plan.out_dir)
 }
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
@@ -1089,6 +1257,14 @@ pub fn dep_info_closure_violation(
                     && !plan.keyed_env.iter().any(|(keyed, _)| keyed == name);
                 if passthrough {
                     return Some(format!("tracked read of unkeyed variable {name}"));
+                }
+                if name == "LD_LIBRARY_PATH"
+                    && plan.keyed_env.iter().any(|(name, value)| {
+                        name == "LD_LIBRARY_PATH"
+                            && value.split(':').any(|entry| entry == plan.out_dir)
+                    })
+                {
+                    return Some("tracked read of placement-normalized LD_LIBRARY_PATH".into());
                 }
             }
             continue;
@@ -1175,6 +1351,47 @@ mod tests {
         "/home/agent/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/itoa-1.0.15";
     const OUT_A: &str = "/work/a/target/debug/deps";
     const OUT_B: &str = "/work/b/target/debug/deps";
+
+    fn directory_facts(
+        plan: &DependencyActionPlan,
+        externs: &[ExternFact],
+    ) -> Vec<DependencyDirectoryFact> {
+        plan.dependency_dirs
+            .iter()
+            .map(|root| {
+                let mut artifacts: Vec<_> = externs
+                    .iter()
+                    .filter(|fact| {
+                        fact.path
+                            .rsplit_once('/')
+                            .is_some_and(|(parent, _)| parent == root)
+                    })
+                    .cloned()
+                    .collect();
+                artifacts.sort_by(|a, b| a.path.cmp(&b.path));
+                DependencyDirectoryFact {
+                    path: root.clone(),
+                    artifacts,
+                    dep_info_names: Vec::new(),
+                }
+            })
+            .collect()
+    }
+
+    fn live_dependency_key(
+        plan: &DependencyActionPlan,
+        toolchain: &ToolchainFacts,
+        externs: &[ExternFact],
+        inputs: &ActionInputManifest,
+    ) -> Result<LiveDependencyKey, LiveRefusal> {
+        super::live_dependency_key(
+            plan,
+            toolchain,
+            externs,
+            &directory_facts(plan, externs),
+            inputs,
+        )
+    }
 
     fn argv(out_dir: &str, extra: &[&str]) -> Vec<String> {
         let mut argv: Vec<String> = [
@@ -1692,10 +1909,10 @@ mod tests {
         assert_eq!(
             code(plan_for(
                 OUT_A,
-                &["--extern", "x=/elsewhere/libx.rlib"],
+                &["--extern", "x=/elsewhere/../libx.rlib"],
                 &[]
             )),
-            "LIVE_DEP_EXTERN"
+            "LIVE_DEP_SEARCH_PATH"
         );
         assert_eq!(code(plan_for("/work/a b/deps", &[], &[])), "LIVE_DEP_PATH");
         // Not capped: Cargo compiles workspace members without --cap-lints.
@@ -1781,6 +1998,88 @@ mod tests {
         );
         assert!(canonicalize_out_dir(b"/__rabs/out/x", OUT_A).is_err());
         assert!(canonicalize_out_dir(b"x", "/a b").is_err());
+    }
+
+    #[test]
+    fn sibling_dependency_candidates_are_complete_ordered_and_content_bound() {
+        let sibling_plan = |base: &str| {
+            let mut args = argv(&format!("{base}/middle/out"), &[]);
+            for arg in &mut args {
+                if arg.starts_with("dependency=") {
+                    *arg = format!("dependency={base}/leaf/out");
+                }
+                if arg.starts_with("dep=") {
+                    *arg = format!("dep={base}/leaf/out/libdep-0123456789abcdef.rmeta");
+                }
+            }
+            plan_dependency_action(
+                LiveRustcRequest {
+                    argv: &args,
+                    cwd: PACKAGE,
+                    env: &env(&[]),
+                },
+                "x86_64-unknown-linux-gnu",
+            )
+            .unwrap()
+        };
+        let a = sibling_plan("/work/a");
+        let b = sibling_plan("/work/b");
+        assert_eq!(key(&a), key(&b));
+        let direct = externs(&a, 20);
+        let facts = directory_facts(&a, &direct);
+        let keyed = |facts: &[DependencyDirectoryFact]| {
+            super::live_dependency_key(&a, &toolchain(), &direct, facts, &inputs(&a, 11))
+        };
+        assert!(keyed(&[]).is_err());
+        let mut added = facts.clone();
+        added[0].artifacts.push(ExternFact {
+            path: format!("{}/libtransitive.rlib", a.dependency_dirs[0]),
+            content_digest: digest(30),
+        });
+        assert_ne!(keyed(&added).unwrap().action_key, key(&a));
+        let original = keyed(&added).unwrap().action_key;
+        added[0].artifacts[1].content_digest = digest(31);
+        assert_ne!(keyed(&added).unwrap().action_key, original);
+        added[0].artifacts.reverse();
+        assert!(keyed(&added).is_err());
+        let raw = format!("{}: {} {}", a.out_dir, direct[0].path, a.dependency_dirs[0]);
+        assert!(canonicalize_placements(raw.as_bytes(), &a).is_err());
+        // A warning can quote a string literal authored in source. Its
+        // meaning must not be changed to the next subscriber's directory.
+        let literal = format!("#[deprecated(note = \"{}\")]", a.dependency_dirs[0]);
+        let diagnostic =
+            format!("{{\"message\":\"source-authored path\",\"rendered\":{literal:?}}}");
+        assert!(canonicalize_placements(diagnostic.as_bytes(), &a).is_err());
+        let raw = format!("{}/libmiddle.rlib", a.out_dir);
+        let canonical = canonicalize_placements(raw.as_bytes(), &a).unwrap();
+        assert_eq!(render_placements(&canonical, &a), raw.as_bytes());
+        assert_eq!(
+            render_placements(&canonical, &b),
+            raw.replace("/work/a", "/work/b").as_bytes()
+        );
+    }
+
+    #[test]
+    fn reading_a_normalized_loader_value_prevents_publication() {
+        let plan = plan_for(OUT_A, &[], &[("LD_LIBRARY_PATH", OUT_A)]).unwrap();
+        assert!(
+            dep_info_closure_violation(
+                &plan,
+                format!("# env-dep:LD_LIBRARY_PATH={OUT_A}\n").as_bytes(),
+                |_| true
+            )
+            .unwrap()
+            .contains("placement-normalized")
+        );
+        let exact = plan_for(OUT_A, &[], &[("LD_LIBRARY_PATH", "/toolchain/lib")]).unwrap();
+        assert_eq!(
+            dep_info_closure_violation(
+                &exact,
+                b"# env-dep:LD_LIBRARY_PATH=/toolchain/lib\n",
+                |_| true
+            ),
+            None
+        );
     }
 
     #[test]

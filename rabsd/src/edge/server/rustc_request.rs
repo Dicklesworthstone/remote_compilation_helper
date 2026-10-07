@@ -243,6 +243,10 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
         ..ActionInputManifest::default()
     };
     let mut externs = Vec::new();
+    let dependencies = match live.facts.dependencies(&plan) {
+        Ok(dependencies) => dependencies,
+        Err(miss) => return Decided::Reply(pass_through(&miss.to_string())),
+    };
     for planned in &plan.externs {
         if let PlannedExtern::File { path, .. } = planned {
             match live.facts.file_digest(Path::new(path)) {
@@ -256,7 +260,13 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
             }
         }
     }
-    let key = match live_dependency_key(&plan, &toolchain, &externs, &inputs) {
+    let key = match live_dependency_key(
+        &plan,
+        &toolchain,
+        &externs,
+        &dependencies.directories,
+        &inputs,
+    ) {
         Ok(key) => key,
         Err(refusal) => return Decided::Reply(pass_through(refusal.code())),
     };
@@ -266,6 +276,7 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
         plan,
         inputs,
         package,
+        dependencies,
         externs: externs
             .into_iter()
             .map(|fact| (fact.path, fact.content_digest))

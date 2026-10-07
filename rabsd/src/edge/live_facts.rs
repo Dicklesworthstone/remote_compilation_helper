@@ -21,7 +21,9 @@
 
 use rabs_cas::digest_set::{DigestRequest, StreamingObjectWriter};
 use rabs_key::canonical::CanonicalEncoder;
-use rabs_key::live_dependency::{DependencySourceKind, ToolchainFacts};
+use rabs_key::live_dependency::{
+    DependencyActionPlan, DependencyDirectoryFact, DependencySourceKind, ExternFact, ToolchainFacts,
+};
 use rabs_key::typed_digest::compute;
 use rabs_protocol::result_identity::TypedDigest;
 use rabs_sandbox::snapshot_capture::{
@@ -53,6 +55,9 @@ const MAX_RETAINED_PACKAGE_BYTES: u64 = 512 * 1024 * 1024;
 const PROBE_RETRY: Duration = Duration::from_secs(30);
 /// Concurrent background warms (each hashes a lot of bytes).
 const MAX_WARMING: usize = 2;
+const MAX_DEPENDENCY_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_DEPENDENCY_FILES: usize = 4096;
+const MAX_DEPENDENCY_MEMOS: usize = 128;
 
 /// Identity of one filesystem object at one moment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -219,6 +224,187 @@ impl PackageFacts {
             Err("the package tree changed during execution".into())
         }
     }
+}
+
+/// Exact regular-file candidate closure for compiler dependency resolution.
+/// Rechecked before a hit installs and after a local compiler exits.
+#[derive(Debug)]
+pub struct DependencyFacts {
+    /// Pure facts bound to the action key, in first-use directory order.
+    pub directories: Vec<DependencyDirectoryFact>,
+    roots: Vec<(PathBuf, Vec<String>)>,
+    members: Vec<Vec<(String, FileSig)>>,
+    output: DependencyOutput,
+    // Read-only roots must retain their directory generation as well as
+    // membership: a transient candidate can otherwise be added and removed.
+    // The invocation's own out-dir legitimately changes as outputs appear.
+    root_generations: Vec<Option<FileSig>>,
+}
+
+impl DependencyFacts {
+    /// Refuse changes to any candidate, companion, member name or root type.
+    pub fn verify_unchanged(&self) -> Result<(), String> {
+        let (members, _) = walk_dependencies(&self.roots)?;
+        reject_dependency_output_aliases(&self.roots, &members, &self.output)?;
+        if dependency_root_generations(&self.roots, &self.output.0)? != self.root_generations {
+            return Err("read-only dependency directory generation changed".into());
+        }
+        if members != self.members {
+            return Err("dependency directory candidates changed".into());
+        }
+        Ok(())
+    }
+}
+
+type DependencyRoots = Vec<(PathBuf, Vec<String>)>;
+type DependencyMembers = Vec<Vec<(String, FileSig)>>;
+type DependencyOutput = (PathBuf, Vec<String>);
+
+fn dependency_root_generations(
+    roots: &DependencyRoots,
+    out_dir: &Path,
+) -> Result<Vec<Option<FileSig>>, String> {
+    roots
+        .iter()
+        .map(|(root, _)| {
+            let metadata = std::fs::symlink_metadata(root).map_err(|error| error.to_string())?;
+            if !metadata.is_dir() {
+                return Err("dependency root is not a real directory".into());
+            }
+            Ok((root != out_dir).then(|| FileSig::of(&metadata)))
+        })
+        .collect()
+}
+
+fn reject_dependency_output_aliases(
+    roots: &DependencyRoots,
+    members: &DependencyMembers,
+    (out_dir, output_names): &DependencyOutput,
+) -> Result<(), String> {
+    let optional_metadata = |path: &Path| match std::fs::symlink_metadata(path) {
+        Ok(meta) => Ok(Some(meta)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.to_string()),
+    };
+    if let Some(output) = optional_metadata(out_dir)? {
+        if !output.is_dir() {
+            return Err("output root is not a real directory".into());
+        }
+        for (root, _) in roots {
+            let dependency = std::fs::symlink_metadata(root).map_err(|error| error.to_string())?;
+            if root != out_dir
+                && dependency.dev() == output.dev()
+                && dependency.ino() == output.ino()
+            {
+                return Err("dependency root aliases the output directory".into());
+            }
+        }
+    }
+    for name in output_names {
+        if let Some(output) = optional_metadata(&out_dir.join(name))? {
+            if !output.is_file() {
+                return Err("declared output is not a regular file".into());
+            }
+            if members.iter().flatten().any(|(_, candidate)| {
+                candidate.dev == output.dev() && candidate.ino == output.ino()
+            }) {
+                return Err("dependency candidate aliases a declared output".into());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn walk_dependencies(roots: &DependencyRoots) -> Result<(DependencyMembers, u64), String> {
+    let mut inventories = Vec::new();
+    let mut bytes = 0_u64;
+    let mut count = 0_usize;
+    for (root, excluded_outputs) in roots {
+        let root_identity = || {
+            let meta = std::fs::symlink_metadata(root).map_err(|e| e.to_string())?;
+            if !meta.is_dir() {
+                return Err("dependency root is not a real directory".to_owned());
+            }
+            Ok(FileSig::of(&meta))
+        };
+        let before = root_identity()?;
+        let mut members = Vec::new();
+        for entry in std::fs::read_dir(root).map_err(|e| e.to_string())? {
+            let entry = entry.map_err(|e| e.to_string())?;
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| "non-UTF-8 dependency candidate")?;
+            // These exact files are this invocation's writes, never inputs.
+            if excluded_outputs.contains(&name) {
+                continue;
+            }
+            count += 1;
+            if count > MAX_DEPENDENCY_FILES {
+                return Err("dependency candidate count exceeds class bound".into());
+            }
+            let meta = std::fs::symlink_metadata(entry.path()).map_err(|e| e.to_string())?;
+            if !meta.is_file()
+                || !(name.ends_with(".rlib") || name.ends_with(".rmeta") || name.ends_with(".d"))
+            {
+                return Err(format!("unsupported dependency directory member {name}"));
+            }
+            if !name.ends_with(".d") {
+                bytes = bytes
+                    .checked_add(meta.len())
+                    .ok_or("dependency byte count overflow")?;
+                if bytes > MAX_DEPENDENCY_BYTES {
+                    return Err("dependency candidate bytes exceed class bound".into());
+                }
+            }
+            members.push((name, FileSig::of(&meta)));
+        }
+        members.sort_by(|a, b| a.0.cmp(&b.0));
+        if root_identity()? != before {
+            return Err("dependency directory changed while enumerating".into());
+        }
+        inventories.push(members);
+    }
+    Ok((inventories, bytes))
+}
+
+fn capture_dependencies(
+    facts: &LiveFacts,
+    roots: DependencyRoots,
+    members: DependencyMembers,
+    output: DependencyOutput,
+) -> Result<DependencyFacts, String> {
+    let root_generations = dependency_root_generations(&roots, &output.0)?;
+    let mut directories = Vec::new();
+    for ((root, _), inventory) in roots.iter().zip(&members) {
+        let mut artifacts = Vec::new();
+        let mut dep_info_names = Vec::new();
+        for (name, _) in inventory {
+            if name.ends_with(".d") {
+                dep_info_names.push(name.clone());
+            } else {
+                let path = root.join(name);
+                artifacts.push(ExternFact {
+                    path: path.to_str().ok_or("non-UTF-8 dependency path")?.to_owned(),
+                    content_digest: facts.file_digest(&path).map_err(|e| e.to_string())?,
+                });
+            }
+        }
+        directories.push(DependencyDirectoryFact {
+            path: root.to_str().ok_or("non-UTF-8 dependency root")?.to_owned(),
+            artifacts,
+            dep_info_names,
+        });
+    }
+    let captured = DependencyFacts {
+        directories,
+        roots,
+        members,
+        output,
+        root_generations,
+    };
+    captured.verify_unchanged()?;
+    Ok(captured)
 }
 
 /// Walk a package tree: every directory and regular file with its
@@ -458,6 +644,7 @@ pub struct LiveFacts {
     files: Mutex<HashMap<PathBuf, (FileSig, TypedDigest)>>,
     toolchains: Mutex<HashMap<PathBuf, Slot<ProbedToolchain>>>,
     packages: Mutex<HashMap<(PathBuf, DependencySourceKind), Slot<PackageFacts>>>,
+    dependencies: Mutex<HashMap<(DependencyRoots, DependencyOutput), Slot<DependencyFacts>>>,
     warming: Mutex<usize>,
 }
 
@@ -466,6 +653,88 @@ impl LiveFacts {
     #[must_use]
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
+    }
+
+    /// Capture exact dependency directory contents with bounded cold hashing.
+    /// Large cold inventories warm in the existing bounded background pool.
+    pub fn dependencies(
+        self: &Arc<Self>,
+        plan: &DependencyActionPlan,
+    ) -> Result<Arc<DependencyFacts>, FactsMiss> {
+        let roots: DependencyRoots = plan
+            .dependency_dirs
+            .iter()
+            .map(|root| {
+                (
+                    PathBuf::from(root),
+                    if root == &plan.out_dir {
+                        plan.output_names()
+                    } else {
+                        Vec::new()
+                    },
+                )
+            })
+            .collect();
+        let (members, bytes) = walk_dependencies(&roots).map_err(FactsMiss::Refused)?;
+        let output = (PathBuf::from(&plan.out_dir), plan.output_names());
+        reject_dependency_output_aliases(&roots, &members, &output).map_err(FactsMiss::Refused)?;
+        let root_generations =
+            dependency_root_generations(&roots, &output.0).map_err(FactsMiss::Refused)?;
+        let memo_key = (roots.clone(), output.clone());
+        {
+            let mut memos = self
+                .dependencies
+                .lock()
+                .map_err(|_| FactsMiss::Refused("dependency memo poisoned".into()))?;
+            if let Some(slot) = memos.get(&memo_key) {
+                match slot {
+                    Slot::Ready(captured)
+                        if captured.members == members
+                            && captured.root_generations == root_generations =>
+                    {
+                        return Ok(Arc::clone(captured));
+                    }
+                    Slot::Warming => return Err(FactsMiss::Pending),
+                    Slot::Failed { reason, at } if at.elapsed() < PROBE_RETRY => {
+                        return Err(FactsMiss::Refused(reason.clone()));
+                    }
+                    _ => {}
+                }
+            }
+            if memos.len() >= MAX_DEPENDENCY_MEMOS {
+                memos.retain(|_, slot| matches!(slot, Slot::Warming));
+            }
+            if bytes > SYNCHRONOUS_PACKAGE_BYTES {
+                memos.insert(memo_key.clone(), Slot::Warming);
+                drop(memos);
+                let warm_roots = roots.clone();
+                let warm_key = memo_key.clone();
+                if !self.start_warm(move |facts| {
+                    let slot = match capture_dependencies(facts, warm_roots, members, output) {
+                        Ok(captured) => Slot::Ready(Arc::new(captured)),
+                        Err(reason) => Slot::Failed {
+                            reason,
+                            at: Instant::now(),
+                        },
+                    };
+                    if let Ok(mut memos) = facts.dependencies.lock() {
+                        memos.insert(warm_key, slot);
+                    }
+                }) {
+                    if let Ok(mut memos) = self.dependencies.lock() {
+                        memos.remove(&memo_key);
+                    }
+                }
+                return Err(FactsMiss::Pending);
+            }
+        }
+        let captured = Arc::new(
+            capture_dependencies(self, roots, members, output).map_err(FactsMiss::Refused)?,
+        );
+        if let Ok(mut memos) = self.dependencies.lock() {
+            memos.insert(memo_key, Slot::Ready(Arc::clone(&captured)));
+        }
+        Ok(captured)
     }
 
     fn start_warm(self: &Arc<Self>, work: impl FnOnce(&Self) + Send + 'static) -> bool {
@@ -653,6 +922,148 @@ impl LiveFacts {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dependency_candidates_revalidate_content_membership_and_root_type() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("deps");
+        std::fs::create_dir(&root).unwrap();
+        let artifact = root.join("libdep.rmeta");
+        std::fs::write(&artifact, b"first").unwrap();
+        std::fs::write(root.join("dep.d"), b"arbitrary dep-info placement").unwrap();
+        let roots = vec![(root.clone(), vec!["libcurrent.rmeta".into()])];
+        let memo = LiveFacts::new();
+        let capture = || {
+            let (members, _) = walk_dependencies(&roots).unwrap();
+            capture_dependencies(
+                &memo,
+                roots.clone(),
+                members,
+                (root.clone(), vec!["libcurrent.rmeta".into()]),
+            )
+            .unwrap()
+        };
+        let first = capture();
+        assert_eq!(first.directories[0].artifacts.len(), 1);
+        assert_eq!(first.directories[0].dep_info_names, ["dep.d"]);
+        // This invocation's exact declared outputs may appear while executing.
+        std::fs::write(root.join("libcurrent.rmeta"), b"new output").unwrap();
+        first.verify_unchanged().unwrap();
+        std::fs::write(&artifact, b"other").unwrap();
+        assert!(first.verify_unchanged().is_err());
+        let changed = capture();
+        assert_ne!(
+            changed.directories[0].artifacts,
+            first.directories[0].artifacts
+        );
+        std::fs::write(root.join("libtransitive.rlib"), b"another candidate").unwrap();
+        assert!(changed.verify_unchanged().is_err());
+        let added = capture();
+        assert_eq!(added.directories[0].artifacts.len(), 2);
+        // Move the SAME member inodes behind a root symlink: warm facts must
+        // refuse, even though every candidate signature would still match.
+        let moved = dir.path().join("moved");
+        std::fs::rename(&root, &moved).unwrap();
+        std::os::unix::fs::symlink(&moved, &root).unwrap();
+        assert!(added.verify_unchanged().is_err());
+        assert!(walk_dependencies(&roots).is_err());
+    }
+
+    #[test]
+    fn dependency_candidates_refuse_unmodeled_files_and_symlinks() {
+        for name in [
+            "libmacro.so",
+            "libmacro.dylib",
+            "libnative.a",
+            "unknown",
+            "nested",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join(name), b"not a Rust candidate").unwrap();
+            assert!(
+                walk_dependencies(&vec![(dir.path().to_path_buf(), Vec::new())]).is_err(),
+                "{name}"
+            );
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink("missing", dir.path().join("libalias.rmeta")).unwrap();
+        assert!(walk_dependencies(&vec![(dir.path().to_path_buf(), Vec::new())]).is_err());
+    }
+
+    #[test]
+    fn dependency_candidates_refuse_physical_output_aliases() {
+        let dir = tempfile::tempdir().unwrap();
+        let real_parent = dir.path().join("real");
+        let dependencies = real_parent.join("deps");
+        let out = dir.path().join("out");
+        std::fs::create_dir_all(&dependencies).unwrap();
+        std::fs::create_dir(&out).unwrap();
+        std::fs::write(dependencies.join("libdep.rlib"), b"dependency bytes").unwrap();
+        let roots = vec![(dependencies.clone(), Vec::new())];
+        let output = (out.clone(), vec!["libcurrent.rlib".into()]);
+        let (members, _) = walk_dependencies(&roots).unwrap();
+        let captured = capture_dependencies(&LiveFacts::new(), roots, members, output).unwrap();
+        captured.verify_unchanged().unwrap();
+        // An alias created after keying must also refuse at pre-hit / completion.
+        std::fs::hard_link(
+            dependencies.join("libdep.rlib"),
+            out.join("libcurrent.rlib"),
+        )
+        .unwrap();
+        assert!(
+            captured
+                .verify_unchanged()
+                .unwrap_err()
+                .contains("aliases a declared output")
+        );
+
+        // The root itself is not a symlink; its parent is. Lexically disjoint
+        // roots still identify the same real directory and cannot be input/output.
+        let alias_parent = dir.path().join("alias");
+        std::os::unix::fs::symlink(&real_parent, &alias_parent).unwrap();
+        let alias_roots = vec![(alias_parent.join("deps"), Vec::new())];
+        let (members, _) = walk_dependencies(&alias_roots).unwrap();
+        assert!(
+            reject_dependency_output_aliases(&alias_roots, &members, &(dependencies, Vec::new()))
+                .unwrap_err()
+                .contains("aliases the output directory")
+        );
+    }
+
+    #[test]
+    fn dependency_candidates_detect_transient_members_in_read_only_roots() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("dependency");
+        let out = dir.path().join("out");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&out).unwrap();
+        std::fs::write(root.join("libstable.rlib"), b"stable").unwrap();
+        let roots = vec![(root.clone(), Vec::new())];
+        let (members, _) = walk_dependencies(&roots).unwrap();
+        let captured = capture_dependencies(
+            &LiveFacts::new(),
+            roots.clone(),
+            members.clone(),
+            (out, Vec::new()),
+        )
+        .unwrap();
+        let outside = dir.path().join("transient.rmeta");
+        std::fs::write(&outside, b"transient candidate").unwrap();
+        std::fs::rename(&outside, root.join("libtransient.rmeta")).unwrap();
+        std::fs::rename(root.join("libtransient.rmeta"), &outside).unwrap();
+        assert_eq!(
+            walk_dependencies(&roots).unwrap().0,
+            members,
+            "final membership and file identities are deliberately identical"
+        );
+        assert!(
+            captured
+                .verify_unchanged()
+                .unwrap_err()
+                .contains("directory generation changed")
+        );
+        assert_eq!(std::fs::read(outside).unwrap(), b"transient candidate");
+    }
 
     #[test]
     fn stable_reads_bind_identity_and_memo_revalidates() {

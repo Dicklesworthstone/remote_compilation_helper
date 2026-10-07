@@ -35,7 +35,7 @@ use crate::coord::live::{
     ActionSubmission, CoordLive, ExpectedOutputs, ServeMode, ServeOutcome, SubmissionRefusal,
     load_manifest,
 };
-use crate::edge::live_facts::{FileSig, PACKAGE_ROOT, PackageFacts, read_stable};
+use crate::edge::live_facts::{DependencyFacts, FileSig, PACKAGE_ROOT, PackageFacts, read_stable};
 use rabs_action::state_machines::AttemptState;
 use rabs_cas::blob_store::{DurabilityPolicy, PutLimits, put_if_absent};
 use rabs_cas::digest_set::{DigestRequest, digest_set};
@@ -45,9 +45,8 @@ use rabs_cas::publication::{
     OfferPreparedActionResult, PublicationOutcome, observable_result_digest_v1,
 };
 use rabs_key::live_dependency::{
-    CANONICAL_OUT_DIR, DependencyActionPlan, LIVE_DEPENDENCY_KEY_EPOCH,
-    LIVE_DEPENDENCY_PROJECTION_EPOCH, LiveDependencyKey, canonicalize_out_dir,
-    dep_info_closure_violation, render_out_dir,
+    DependencyActionPlan, LIVE_DEPENDENCY_KEY_EPOCH, LIVE_DEPENDENCY_PROJECTION_EPOCH,
+    LiveDependencyKey, canonicalize_placements, dep_info_closure_violation, render_placements,
 };
 use rabs_key::output_declarations::OutputClass;
 use rabs_key::typed_digest::compute;
@@ -94,6 +93,8 @@ pub struct LiveDependencyRequest {
     pub inputs: ActionInputManifest,
     /// The sealed package bytes and member identities.
     pub package: Arc<PackageFacts>,
+    /// Exact dependency candidate inventory and identities.
+    pub dependencies: Arc<DependencyFacts>,
     /// `(path, digest)` of every extern the key covers.
     pub externs: Vec<(String, TypedDigest)>,
 }
@@ -160,6 +161,14 @@ impl PendingServe {
     #[must_use]
     pub fn install(self) -> InstallResult {
         let plan = &self.request.plan;
+        if let Err(reason) = self
+            .request
+            .package
+            .verify_unchanged(Path::new(&plan.source_root))
+            .and_then(|()| self.request.dependencies.verify_unchanged())
+        {
+            return InstallResult::Declined(reason);
+        }
         let expected = expected_outputs(plan);
         match self.coord.serve_for_subscriber(
             &self.request.key.action_key,
@@ -196,7 +205,7 @@ impl PendingServe {
                     }
                 }
                 InstallResult::Served {
-                    transcript: render_out_dir(&self.canonical_transcript, &plan.out_dir),
+                    transcript: render_placements(&self.canonical_transcript, plan),
                     installed,
                 }
             }
@@ -209,10 +218,12 @@ impl PendingServe {
 fn expected_outputs(plan: &DependencyActionPlan) -> ExpectedOutputs {
     ExpectedOutputs::WithDepInfo {
         paths: plan.output_names().into_iter().collect::<BTreeSet<_>>(),
-        mappings: vec![(
-            CANONICAL_OUT_DIR.as_bytes().to_vec(),
-            plan.out_dir.as_bytes().to_vec(),
-        )],
+        mappings: plan
+            .placement_mappings()
+            .into_iter()
+            .filter(|(real, _)| real == &plan.out_dir)
+            .map(|(real, canonical)| (canonical.into_bytes(), real.into_bytes()))
+            .collect(),
     }
 }
 
@@ -710,6 +721,7 @@ impl LocalAttempt {
         self.request
             .package
             .verify_unchanged(Path::new(&plan.source_root))?;
+        self.request.dependencies.verify_unchanged()?;
         let members = self
             .request
             .package
@@ -732,13 +744,13 @@ impl LocalAttempt {
                 }) {
                     return Err(format!("closure: {violation}"));
                 }
-                canonicalize_out_dir(&raw, &plan.out_dir)?
+                canonicalize_placements(&raw, plan)?
             } else {
                 raw
             };
             harvested.push((declaration, path, sig, committed_bytes));
         }
-        let transcript = canonicalize_out_dir(&report.stderr, &plan.out_dir)?;
+        let transcript = canonicalize_placements(&report.stderr, plan)?;
         self.advance(AttemptState::HarvestingOutputs)?;
 
         let cas = self.coord.live_cas().ok_or("no CAS mounted")?;
@@ -785,6 +797,13 @@ impl LocalAttempt {
                 "externs": self.request.externs.iter()
                     .map(|(path, digest)| serde_json::json!([path, digest_key(digest)]))
                     .collect::<Vec<_>>(),
+                "dependency_directories": self.request.dependencies.directories.iter().map(|directory| {
+                    serde_json::json!({
+                        "path": directory.path,
+                        "artifacts": directory.artifacts.iter().map(|artifact| serde_json::json!([artifact.path, digest_key(&artifact.content_digest)])).collect::<Vec<_>>(),
+                        "dep_info_names": directory.dep_info_names,
+                    })
+                }).collect::<Vec<_>>(),
                 "compiler": plan.compiler,
                 "out_dir": plan.out_dir,
             }))
