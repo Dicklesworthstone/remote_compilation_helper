@@ -994,6 +994,9 @@ async fn spawn_source_authority_lock(
     cmd.arg("-o").arg("StrictHostKeyChecking=accept-new");
     cmd.arg("-o").arg("ConnectTimeout=10");
     cmd.arg("-i").arg(identity_file.as_ref());
+    if let Some(options) = rch_common::ssh::identities_only_args(identity_file.as_ref()) {
+        cmd.args(options);
+    }
     cmd.arg(&destination);
     let (remote_arg, stdin_bootstrap) =
         source_authority_lock_transport(WorkerPlatform::from_worker(worker), remote_cmd);
@@ -1199,6 +1202,9 @@ async fn run_offload_ssh_command_with_optional_stdin(
         timeout_duration.as_secs().max(1)
     ));
     cmd.arg("-i").arg(identity_file.as_ref());
+    if let Some(options) = rch_common::ssh::identities_only_args(identity_file.as_ref()) {
+        cmd.args(options);
+    }
     cmd.arg(&destination);
     cmd.arg(build_remote_shell_command(
         WorkerPlatform::from_worker(worker),

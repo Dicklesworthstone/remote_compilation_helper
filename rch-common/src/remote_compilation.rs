@@ -81,6 +81,14 @@ pub struct RemoteCompilationTest {
     pub remote_path_suffix: String,
 }
 
+/// ` -o IdentitiesOnly=yes` for an rsync `-e` command when the identity
+/// exists (bd-ebszo: offer only the configured worker key).
+fn identities_only_suffix(identity_file: &str) -> String {
+    crate::ssh::identities_only_args(identity_file)
+        .map(|options| format!(" {}", options.join(" ")))
+        .unwrap_or_default()
+}
+
 /// Resolve the `cargo` executable for the LOCAL reference build.
 ///
 /// The daemon runs with a minimal, systemd-style `PATH` (e.g.
@@ -559,8 +567,9 @@ impl RemoteCompilationTest {
             .arg(".git/")
             .arg("-e")
             .arg(format!(
-                "ssh -i {} -o StrictHostKeyChecking=accept-new -o BatchMode=yes",
-                escaped_identity
+                "ssh -i {} -o StrictHostKeyChecking=accept-new -o BatchMode=yes{}",
+                escaped_identity,
+                identities_only_suffix(identity_file.as_ref())
             ))
             .arg(format!("{}/", self.test_project.display()))
             .arg(&destination)
@@ -715,8 +724,9 @@ impl RemoteCompilationTest {
             .arg("--no-group")
             .arg("-e")
             .arg(format!(
-                "ssh -i {} -o StrictHostKeyChecking=accept-new -o BatchMode=yes",
-                escaped_identity
+                "ssh -i {} -o StrictHostKeyChecking=accept-new -o BatchMode=yes{}",
+                escaped_identity,
+                identities_only_suffix(identity_file.as_ref())
             ))
             .arg(&remote_target)
             .arg(format!("{}/", local_dest.display()))

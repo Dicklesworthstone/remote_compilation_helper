@@ -285,6 +285,9 @@ impl<'a> SshExecutor<'a> {
             .arg(format!("ConnectTimeout={}", self.connect_timeout.as_secs()));
         cmd.arg("-o").arg("StrictHostKeyChecking=accept-new");
         cmd.arg("-i").arg(&self.worker.identity_file);
+        if let Some(options) = rch_common::ssh::identities_only_args(&self.worker.identity_file) {
+            cmd.args(options);
+        }
         // All callers wrap `cmd.output()` in `tokio::time::timeout`. On
         // timeout the future is dropped; without this flag the spawned
         // ssh process keeps running and holding the network socket open
@@ -300,6 +303,9 @@ impl<'a> SshExecutor<'a> {
             .arg(format!("ConnectTimeout={}", self.scp_timeout.as_secs()));
         cmd.arg("-o").arg("StrictHostKeyChecking=accept-new");
         cmd.arg("-i").arg(&self.worker.identity_file);
+        if let Some(options) = rch_common::ssh::identities_only_args(&self.worker.identity_file) {
+            cmd.args(options);
+        }
         // Same rationale as `build_ssh_args`: avoid leaking scp processes
         // when a timeout fires.
         cmd.kill_on_drop(true);
