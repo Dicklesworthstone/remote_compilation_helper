@@ -26,6 +26,7 @@
 //! confirms that the install writer has returned.
 
 mod singleflight;
+mod supervision;
 
 use rabs_protocol::wrapper_breaker::{
     AttemptOutcome, BreakerPolicy, BreakerState, ConnectDecision, decide, decode_state,
@@ -886,18 +887,16 @@ fn run_attempt(
     mut session: BufReader<ConsultStream>,
     attempt: &str,
     env: &[(String, String)],
+    owner: supervision::Owner,
 ) -> ! {
-    let mut child = match std::process::Command::new(real_rustc)
-        .args(args)
-        .env_clear()
-        .envs(env.iter().map(|(name, value)| (name, value)))
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-    {
+    let mut child = match supervision::spawn(real_rustc, args, env, owner) {
         Ok(child) => child,
-        Err(error) => {
-            eprintln!("rabs-wrap: spawn {}: {error}", real_rustc.to_string_lossy());
+        Err(_) => {
+            // No compiler started. Abandon admission and become the original
+            // compiler, rather than leave an unsupervised observed child.
+            drop(session);
+            let error = std::process::Command::new(real_rustc).args(args).exec();
+            eprintln!("rabs-wrap: exec {}: {error}", real_rustc.to_string_lossy());
             std::process::exit(127);
         }
     };
@@ -943,6 +942,7 @@ fn run_attempt(
 }
 
 fn main() {
+    supervision::run_if_guard();
     let mut argv = std::env::args_os().skip(1);
     let Some(real_rustc) = argv.next() else {
         eprintln!("rabs-wrap: usage: rabs-wrap <real-rustc> <args…>");
@@ -952,6 +952,7 @@ fn main() {
 
     // Probes and unrepresentable argv: no state, no socket, no consult.
     if let Some(consult_argv) = shadow_argv(&real_rustc, &args) {
+        let owner = supervision::Owner::capture();
         // The consult argv is the FULL command the compiler runs:
         // argv[0] is the real tool (the daemon stats it for the
         // toolchain-identity key component and records it as argv0),
@@ -973,7 +974,13 @@ fn main() {
                 session,
                 attempt,
                 env,
-            } => run_attempt(&real_rustc, &args, *session, &attempt, &env),
+            } => {
+                if let Ok(owner) = owner {
+                    run_attempt(&real_rustc, &args, *session, &attempt, &env, owner);
+                }
+                // No usable supervision evidence: drop the admission and exec
+                // normally. Never claim to have supervised or published it.
+            }
             Live::FailClosed(reason) => {
                 eprintln!(
                     "rabs-wrap: {reason}; refusing to run rustc over a possibly changing output tree"
