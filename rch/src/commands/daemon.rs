@@ -569,6 +569,46 @@ struct ShutdownApiResponse {
     queued_build_ids: Vec<u64>,
 }
 
+/// A transport response is not a shutdown acknowledgement. Refuse HTTP errors,
+/// partial JSON, unknown states and contradictory success evidence before
+/// interpreting socket disappearance as an orderly stop.
+fn parse_shutdown_response(response: &str) -> Result<ShutdownApiResponse> {
+    let (header, body) = response
+        .split_once("\r\n\r\n")
+        .or_else(|| response.split_once("\n\n"))
+        .context("shutdown response was incomplete")?;
+    let mut status = header.lines().next().unwrap_or_default().split_whitespace();
+    anyhow::ensure!(
+        matches!(status.next(), Some("HTTP/1.0" | "HTTP/1.1")) && status.next() == Some("200"),
+        "daemon refused the shutdown request"
+    );
+    let shutdown: ShutdownApiResponse =
+        serde_json::from_str(body).context("shutdown response was malformed")?;
+    anyhow::ensure!(
+        matches!(shutdown.status.as_str(), "shutting_down" | "shutdown_blocked"),
+        "unrecognized shutdown state: {}",
+        shutdown.status
+    );
+    anyhow::ensure!(
+        shutdown.status != "shutting_down"
+            || (shutdown.active_build_ids.is_empty() && shutdown.queued_build_ids.is_empty()),
+        "shutdown acknowledgement contradicts outstanding builds"
+    );
+    Ok(shutdown)
+}
+
+/// Missing IPC evidence never authorizes a process-name kill or socket removal.
+/// Return the error to the CLI so JSON is rendered once and the exit is nonzero.
+/// In particular, restart must not proceed to its start step after this error.
+fn unconfirmed_stop(socket_path: &Path, cause: impl std::fmt::Display) -> anyhow::Error {
+    anyhow::anyhow!(
+        "daemon stop is unconfirmed at {}: {cause}; no fallback process was killed or socket removed; \
+         admission may remain closed after a lost acknowledgement; inspect the daemon and retry the \
+         supported lifecycle command after communication is restored",
+        socket_path.display()
+    )
+}
+
 fn parse_admission_response(response: &str) -> Result<RestartAdmissionResponse> {
     let body = extract_json_body(response).context("admission response was missing JSON")?;
     serde_json::from_str(body).context("admission response was malformed")
@@ -812,9 +852,12 @@ pub async fn daemon_stop(opts: StopOptions, ctx: &OutputContext) -> Result<()> {
     let workload = match close_admission().await {
         Ok(workload) => workload,
         Err(error) => {
-            // No usable API (stale socket, wedged daemon). Fall back to the
-            // legacy process-level stop rather than leaving a stale socket.
-            return stop_unresponsive_daemon(socket_path, &socket_path_str, error, ctx).await;
+            // A busy daemon may lose its IPC response while builds remain
+            // live. Neither --yes nor --force supplies a missing identity.
+            return Err(unconfirmed_stop(
+                socket_path,
+                format!("admission failed: {error:#}"),
+            ));
         }
     };
 
@@ -931,34 +974,34 @@ pub async fn daemon_stop(opts: StopOptions, ctx: &OutputContext) -> Result<()> {
     let response = match send_daemon_command("POST /shutdown\n").await {
         Ok(response) => response,
         Err(error) => {
-            return stop_unresponsive_daemon(socket_path, &socket_path_str, error, ctx).await;
-        }
-    };
-    let parsed = extract_json_body(&response)
-        .and_then(|json| serde_json::from_str::<ShutdownApiResponse>(json).ok());
-    match parsed {
-        Some(shutdown) if shutdown.status == "shutdown_blocked" => {
-            // A build was admitted between our barrier and the shutdown (or
-            // the barrier is not ours). Report exactly what blocked it.
-            release_admission().await;
-            let blocked = DaemonWorkload {
-                active_build_ids: shutdown.active_build_ids,
-                queued_build_ids: shutdown.queued_build_ids,
-                ..Default::default()
-            };
-            return Err(refuse_stop(
-                "daemon stop",
-                ErrorCode::WorkerAtCapacity,
-                "daemon refused to shut down: builds are in flight",
-                &blocked,
-                &[
-                    "rch daemon stop --drain [--drain-timeout N]",
-                    "rch daemon stop --force",
-                ],
-                ctx,
+            return Err(unconfirmed_stop(
+                socket_path,
+                format!("shutdown failed: {error:#}"),
             ));
         }
-        _ => {}
+    };
+    let shutdown = parse_shutdown_response(&response)
+        .map_err(|error| unconfirmed_stop(socket_path, format!("{error:#}")))?;
+    if shutdown.status == "shutdown_blocked" {
+        // A build was admitted between our barrier and the shutdown (or
+        // the barrier is not ours). Report exactly what blocked it.
+        release_admission().await;
+        let blocked = DaemonWorkload {
+            active_build_ids: shutdown.active_build_ids,
+            queued_build_ids: shutdown.queued_build_ids,
+            ..Default::default()
+        };
+        return Err(refuse_stop(
+            "daemon stop",
+            ErrorCode::WorkerAtCapacity,
+            "daemon refused to shut down: builds are in flight",
+            &blocked,
+            &[
+                "rch daemon stop --drain [--drain-timeout N]",
+                "rch daemon stop --force",
+            ],
+            ctx,
+        ));
     }
 
     if wait_for_socket_gone(socket_path, 50).await {
@@ -972,79 +1015,10 @@ pub async fn daemon_stop(opts: StopOptions, ctx: &OutputContext) -> Result<()> {
         return Ok(());
     }
 
-    if ctx.is_json() {
-        let _ = ctx.json(&ApiResponse::ok(
-            "daemon stop",
-            DaemonActionResponse {
-                action: "stop".to_string(),
-                success: false,
-                socket_path: socket_path_str.clone(),
-                message: Some(
-                    "Daemon acknowledged shutdown but its socket is still present".to_string(),
-                ),
-            },
-        ));
-    } else {
-        println!(
-            "{} Daemon acknowledged shutdown but may still be shutting down...",
-            StatusIndicator::Warning.display(style)
-        );
-    }
-    Ok(())
-}
-
-/// Legacy stop for a daemon that no longer answers its socket: terminate by
-/// process name and clear the stale socket. Only reached when the API is
-/// unusable, so there is no workload to protect.
-async fn stop_unresponsive_daemon(
-    socket_path: &Path,
-    socket_path_str: &str,
-    api_error: anyhow::Error,
-    ctx: &OutputContext,
-) -> Result<()> {
-    let style = ctx.theme();
-    if !ctx.is_json() {
-        println!(
-            "{} Daemon did not answer its socket ({api_error:#}).",
-            StatusIndicator::Warning.display(style)
-        );
-        println!("Attempting to find and kill daemon process...");
-    }
-
-    let output = Command::new("pkill").arg("-f").arg("rchd").output().await;
-    match output {
-        Ok(o) if o.status.success() => {
-            // Remove stale socket
-            let _ = tokio::fs::remove_file(socket_path).await;
-            report_stopped(
-                "daemon stop",
-                "stop",
-                socket_path_str,
-                "Daemon stopped via pkill",
-                ctx,
-            );
-            Ok(())
-        }
-        _ => {
-            if ctx.is_json() {
-                let _ = ctx.json(&ApiResponse::<()>::err(
-                    "daemon stop",
-                    ApiError::internal("Could not stop daemon"),
-                ));
-            } else {
-                println!(
-                    "{} Could not stop daemon. You may need to kill it manually.",
-                    StatusIndicator::Error.display(style)
-                );
-                println!(
-                    "  {} Try: {}",
-                    StatusIndicator::Info.display(style),
-                    style.highlight("pkill -9 rchd")
-                );
-            }
-            Ok(())
-        }
-    }
+    Err(unconfirmed_stop(
+        socket_path,
+        "daemon acknowledged shutdown but its socket is still present",
+    ))
 }
 
 /// Restart the daemon.
@@ -1256,7 +1230,7 @@ pub async fn daemon_reload(ctx: &OutputContext) -> Result<()> {
     // Send reload command to daemon
     match send_daemon_command("POST /reload\n").await {
         Ok(response) => {
-            let json = extract_json_body(&response)
+            let json = extract_json_body(response.as_str())
                 .unwrap_or(response.as_str())
                 .trim();
             match serde_json::from_str::<ReloadApiResponse>(json) {
@@ -1641,6 +1615,38 @@ mod tests {
             serde_json::from_str(extract_json_body(ok).unwrap().trim()).unwrap();
         assert_eq!(parsed.status, "shutting_down");
         assert!(parsed.active_build_ids.is_empty());
+    }
+
+    #[test]
+    fn shutdown_acknowledgement_requires_a_recognized_successful_reply() {
+        for response in [
+            "",
+            "{\"status\":\"shutting_down\"}",
+            "HTTP/1.1 200 OK\r\n\r\n",
+            "HTTP/1.1 200 OK\r\n\r\n{}",
+            "HTTP/1.1 200 OK\r\n\r\n{\"status\":\"queued\"}",
+            "HTTP/1.1 503 Unavailable\r\n\r\n{\"status\":\"shutting_down\"}",
+            "HTTP/1.1 200 OK\r\n\r\n{\"status\":\"shutting_down\",\"active_build_ids\":[7]}",
+            "HTTP/1.1 200 OK\r\n\r\n{\"status\":\"shutting_down\",\"queued_build_ids\":[8]}",
+            "HTTP/1.1 200 OK\r\n\r\n{\"status\":\"shutting_down\"}trailing",
+        ] {
+            assert!(parse_shutdown_response(response).is_err(), "{response:?}");
+        }
+        for response in [
+            "HTTP/1.1 200 OK\r\n\r\n{\"status\":\"shutting_down\"}",
+            "HTTP/1.0 200 OK\n\n{\"status\":\"shutting_down\",\"active_build_ids\":[],\"queued_build_ids\":[]}",
+        ] {
+            assert_eq!(
+                parse_shutdown_response(response).unwrap().status,
+                "shutting_down"
+            );
+        }
+        assert_eq!(
+            parse_shutdown_response("HTTP/1.1 200 OK\r\n\r\n{\"status\":\"shutdown_blocked\",\"active_build_ids\":[7]}")
+                .unwrap()
+                .active_build_ids,
+            vec![7]
+        );
     }
 
     #[test]

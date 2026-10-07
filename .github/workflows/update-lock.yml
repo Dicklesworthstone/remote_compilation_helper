@@ -9,6 +9,8 @@ on:
       - 'rch/src/update/types.rs'
       - 'rch/src/update/install.rs'
       - 'rch/src/update/install/daemon_shutdown.rs'
+      - 'rch/src/commands/daemon.rs'
+      - 'rch/tests/daemon_stop_safety.rs'
       - 'rch-common/src/process_identity.rs'
       - '.github/workflows/update-lock.yml'
   workflow_dispatch:
@@ -51,6 +53,8 @@ jobs:
           # Include all existing archive, backup, replacement and restoration
           # checks alongside the new staged preflight regressions.
           cargo test --locked -p rch --bin rch update::install::tests -- --nocapture 2>&1 | tee "$evidence/preflight-and-install.log"
+          cargo test --locked -p rch --bin rch commands::daemon::tests -- --nocapture 2>&1 | tee "$evidence/lifecycle-policy.log"
+          cargo test --locked -p rch --test daemon_stop_safety -- --nocapture 2>&1 | tee "$evidence/lifecycle-cli.log"
           cargo clippy --locked -p rch --all-targets -- -D warnings 2>&1 | tee "$evidence/clippy.log"
       - name: Check client verification formatting
         if: success() || failure()
@@ -61,6 +65,7 @@ jobs:
           rustfmt --edition 2024 --config skip_children=true --emit stdout < rch/src/update/mod.rs > "$RUNNER_TEMP/update-client-evidence/mod.formatted.rs"
           rustfmt --edition 2024 --config skip_children=true --emit stdout < rch/src/update/install.rs > "$RUNNER_TEMP/update-client-evidence/install.formatted.rs"
           rustfmt --edition 2024 --config skip_children=true --check rch/src/update/mod.rs rch/src/update/install.rs rch/src/update/install/daemon_shutdown.rs
+          rustfmt --edition 2024 --config skip_children=true --check rch/src/commands/daemon.rs rch/tests/daemon_stop_safety.rs
       - uses: actions/upload-artifact@v4
         if: always()
         with:
