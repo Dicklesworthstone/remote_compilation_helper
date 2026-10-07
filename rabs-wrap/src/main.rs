@@ -25,6 +25,8 @@
 //! complete, typed reply on the install connection explicitly
 //! confirms that the install writer has returned.
 
+mod singleflight;
+
 use rabs_protocol::wrapper_breaker::{
     AttemptOutcome, BreakerPolicy, BreakerState, ConnectDecision, decide, decode_state,
     encode_state, on_outcome,
@@ -558,7 +560,7 @@ fn live_request_frame(args: &[String], cwd: &str) -> Option<String> {
     }
     let argv_json: Vec<String> = args.iter().map(|a| json_string(a)).collect();
     let frame = format!(
-        "{{\"kind\":\"rustc-request\",\"argv\":[{}],\"cwd\":{},\"env\":[{}]}}",
+        "{{\"kind\":\"rustc-request\",\"argv\":[{}],\"cwd\":{},\"env\":[{}],\"wait_for_inflight\":true}}",
         argv_json.join(","),
         json_string(cwd),
         env.join(","),
@@ -701,6 +703,7 @@ fn consult(
         .into_string()
         .map_err(|_| ())?;
     let live_frame = live_request_frame(args, &cwd);
+    let may_wait = live_frame.is_some();
     let budget = Duration::from_millis(u64::from(if live_frame.is_some() {
         live_decision_timeout_ms(decision_timeout_ms)
     } else {
@@ -744,16 +747,7 @@ fn consult(
         .write_all(frame.as_bytes())
         .map_err(|_| ())?;
     reader.get_mut().write_all(b"\n").map_err(|_| ())?;
-    let line = read_reply_bounded(&mut reader, MAX_LIVE_REPLY_BYTES).map_err(|_| ())?;
-    if line.contains("\"kind\":\"rustc-decision\"") {
-        let reply = reply_json::parse(&line).ok_or(())?;
-        return live_outcome(&reply, reader);
-    }
-    if consult_succeeded(&line) {
-        Ok(Live::PassThrough)
-    } else {
-        Err(())
-    }
+    singleflight::read_decision(reader, &frame, budget, may_wait)
 }
 
 /// Did the daemon actually answer this consult, or only admit that it
