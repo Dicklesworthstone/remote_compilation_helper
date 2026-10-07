@@ -30,6 +30,30 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  # Exercise the accepted-hit delivery frontier independently of the slower
+  # release/overhead lane. Local agent sandboxes may prohibit Unix sockets;
+  # these tests must still run unchanged on a native runner.
+  delivery-protocol:
+    name: accepted-hit delivery protocol
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      RUSTUP_TOOLCHAIN: nightly-2026-08-31
+      CARGO_BUILD_JOBS: 2
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+      CARGO_INCREMENTAL: 0
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned test toolchain
+        run: rustup toolchain install nightly-2026-08-31 --profile minimal --component rustfmt --component clippy
+      - name: Check changed wrapper formatting
+        run: rustfmt --edition 2024 --check rabs-wrap/src/main.rs rabs-wrap/tests/live_protocol.rs
+      - name: Run wrapper unit and real socket delivery regressions
+        run: cargo test -p rabs-wrap --bin rabs-wrap --test live_protocol --locked
+      - name: Lint the tested wrapper targets
+        run: cargo clippy -p rabs-wrap --bin rabs-wrap --test live_protocol --locked -- -D warnings
+
   build:
     name: release build + gates
     runs-on: ubuntu-latest

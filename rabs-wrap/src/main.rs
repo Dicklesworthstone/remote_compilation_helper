@@ -52,8 +52,9 @@ fn json_string(text: &str) -> String {
 }
 
 /// Minimal JSON reader for daemon replies (no serde by design). Accepts
-/// the complete grammar the daemon emits; anything else is `None`, which
-/// every caller treats as "run the compiler normally".
+/// the complete grammar the daemon emits; anything else is `None`.
+/// Before hit acceptance that permits normal compilation; afterward it
+/// is uncertain delivery and must fail closed.
 mod reply_json {
     #[derive(Debug, Clone, PartialEq)]
     pub enum Value {
@@ -68,7 +69,14 @@ mod reply_json {
     impl Value {
         pub fn get(&self, key: &str) -> Option<&Value> {
             match self {
-                Self::Object(fields) => fields.iter().find(|(name, _)| name == key).map(|f| &f.1),
+                Self::Object(fields) => {
+                    // An ambiguous control field cannot authorize a compiler
+                    // skip or fallback. Scan only the requested name, keeping
+                    // lookup linear even for a large malformed object.
+                    let mut matching = fields.iter().filter(|(name, _)| name == key);
+                    let first = matching.next()?;
+                    matching.next().is_none().then_some(&first.1)
+                }
                 _ => None,
             }
         }
@@ -555,38 +563,21 @@ fn live_outcome(
         }
         Some("hit") => {
             // Commit to waiting: from here on the daemon may write outputs,
-            // so this process must not run the compiler unless the install
-            // provably returned (an answer, or the daemon is gone).
+            // so this process must not run the compiler unless a complete,
+            // typed answer confirms that the install writer returned. Losing
+            // a connection does not prove that its daemon or writer died.
             reader.get_mut().deadline = Instant::now() + install_wait();
             if reader
                 .get_mut()
                 .write_all(b"{\"kind\":\"rustc-accept\"}\n")
                 .is_err()
             {
-                // The daemon never received the acceptance: nothing written.
-                return Ok(Live::PassThrough);
+                return Ok(Live::FailClosed(
+                    "the RABS cache-hit acceptance could not be confirmed".into(),
+                ));
             }
             match read_reply_bounded(&mut reader, MAX_LIVE_REPLY_BYTES) {
-                Ok(line) => {
-                    let answer = reply_json::parse(&line).ok_or(())?;
-                    match answer.get("decision").and_then(reply_json::Value::as_str) {
-                        Some("served")
-                            if answer
-                                .get("compiler_skip_authorized")
-                                .and_then(reply_json::Value::as_bool)
-                                == Some(true) =>
-                        {
-                            answer
-                                .get("stderr_hex")
-                                .and_then(reply_json::Value::as_str)
-                                .and_then(hex_decode)
-                                .map(Live::Served)
-                                .ok_or(())
-                        }
-                        Some("serve-failed") => Ok(Live::PassThrough),
-                        _ => Ok(Live::FailClosed("unrecognized install answer".into())),
-                    }
-                }
+                Ok(line) => Ok(accepted_install_reply(&line)),
                 // A socket read timeout surfaces as WouldBlock (EAGAIN) on
                 // Linux and TimedOut elsewhere; both mean "still alive, no
                 // answer", which is never evidence that the writer returned.
@@ -601,12 +592,53 @@ fn live_outcome(
                             .into(),
                     ))
                 }
-                // EOF or reset: the daemon process is gone, and with it any
-                // writer; its synchronous install cannot continue.
-                Err(_) => Ok(Live::PassThrough),
+                // EOF/reset, invalid UTF-8, oversized or truncated frames
+                // are all uncertain delivery. A daemon's independently owned
+                // writer may still be running after its connection closes.
+                Err(error) => Ok(Live::FailClosed(format!(
+                    "the RABS cache-hit install outcome is unknown: {error}"
+                ))),
             }
         }
         _ => Err(()),
+    }
+}
+
+/// Decode an answer after the wrapper accepted a hit. This deliberately
+/// returns `Live`, never `Result`: malformed replies must not reach the breaker's
+/// ordinary error path, which runs the compiler over an uncertain output tree.
+fn accepted_install_reply(line: &str) -> Live {
+    let Some(answer) = reply_json::parse(line) else {
+        return Live::FailClosed("malformed install answer".into());
+    };
+    if answer.get("kind").and_then(reply_json::Value::as_str) != Some("rustc-decision") {
+        return Live::FailClosed("unrecognized install answer kind".into());
+    }
+    match answer.get("decision").and_then(reply_json::Value::as_str) {
+        Some("served")
+            if answer
+                .get("compiler_skip_authorized")
+                .and_then(reply_json::Value::as_bool)
+                == Some(true) =>
+        {
+            answer
+                .get("stderr_hex")
+                .and_then(reply_json::Value::as_str)
+                .and_then(hex_decode)
+                .map_or_else(
+                    || Live::FailClosed("malformed served transcript".into()),
+                    Live::Served,
+                )
+        }
+        Some("serve-failed")
+            if answer
+                .get("writer_returned")
+                .and_then(reply_json::Value::as_bool)
+                == Some(true) =>
+        {
+            Live::PassThrough
+        }
+        _ => Live::FailClosed("unrecognized install answer".into()),
     }
 }
 
@@ -935,6 +967,40 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn accepted_install_reply_requires_unambiguous_completion_authority() {
+        for line in [
+            "",
+            "{",
+            r#"{"decision":"serve-failed","writer_returned":true}"#,
+            r#"{"kind":"status","decision":"serve-failed","writer_returned":true}"#,
+            r#"{"kind":"rustc-decision","decision":"serve-failed"}"#,
+            r#"{"kind":"rustc-decision","decision":"serve-failed","writer_returned":false}"#,
+            r#"{"kind":"rustc-decision","decision":"serve-failed","writer_returned":"true"}"#,
+            r#"{"kind":"rustc-decision","decision":"serve-failed","writer_returned":true,"writer_returned":false}"#,
+            r#"{"kind":"rustc-decision","decision":"served","compiler_skip_authorized":true}"#,
+            r#"{"kind":"rustc-decision","decision":"served","compiler_skip_authorized":true,"stderr_hex":"zz"}"#,
+            r#"{"kind":"rustc-decision","decision":"served","compiler_skip_authorized":true,"compiler_skip_authorized":false,"stderr_hex":""}"#,
+            r#"{"kind":"rustc-decision","kind":"status","decision":"serve-failed","writer_returned":true}"#,
+            r#"{"kind":"rustc-decision","decision":"serve-failed","decision":"served","writer_returned":true}"#,
+        ] {
+            assert!(
+                matches!(accepted_install_reply(line), Live::FailClosed(_)),
+                "accepted reply cannot authorize execution: {line}"
+            );
+        }
+        assert!(matches!(
+            accepted_install_reply(
+                r#"{"kind":"rustc-decision","decision":"serve-failed","writer_returned":true}"#
+            ),
+            Live::PassThrough
+        ));
+        let served = accepted_install_reply(
+            r#"{"kind":"rustc-decision","decision":"served","compiler_skip_authorized":true,"stderr_hex":"6f6b0a"}"#,
+        );
+        assert!(matches!(served, Live::Served(bytes) if bytes == b"ok\n"));
+    }
 
     fn reply_from_peer(bytes: Vec<u8>) -> io::Result<String> {
         let (stream, mut peer) = UnixStream::pair().unwrap();

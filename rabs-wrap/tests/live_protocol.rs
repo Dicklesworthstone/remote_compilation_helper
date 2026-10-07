@@ -5,10 +5,10 @@
 //! test can state exactly whether the compiler executed:
 //!
 //! - a served hit replays the transcript and NEVER runs the compiler;
-//! - a hit is only installed after the wrapper accepts it, and a failed or
-//!   lost install (the writer has returned or is gone) runs the compiler;
-//! - an install that neither answers nor dies fails the compile closed —
-//!   the compiler must not run over a possibly changing output tree;
+//! - a hit is only installed after the wrapper accepts it, and a failed
+//!   install runs the compiler only after an explicit writer-return receipt;
+//! - an uncertain install fails the compile closed, including connection
+//!   loss while an independent daemon writer remains alive;
 //! - an admitted execution runs with exactly the daemon's constructed
 //!   environment and reports exact streams and exit status.
 #![cfg(unix)]
@@ -43,6 +43,12 @@ enum Script {
     Hit(Option<String>),
     /// Reply `hit`, require `rustc-accept`, then never answer.
     HitThenHang,
+    /// Close after acceptance, then keep a writer alive until the test
+    /// permits it to write. Connection loss cannot authorize local rustc.
+    HitThenDisconnect {
+        artifact: PathBuf,
+        continue_writing: std::sync::mpsc::Receiver<()>,
+    },
     /// Reply `execute` with this env, then return the completion frame.
     Execute(Vec<(String, String)>),
 }
@@ -119,6 +125,23 @@ impl Fixture {
                     // Hold the connection open without answering until the
                     // wrapper gives up.
                     let _ = read(&mut reader);
+                }
+                Script::HitThenDisconnect {
+                    artifact,
+                    continue_writing,
+                } => {
+                    writer.write_all(hit.as_bytes()).unwrap();
+                    let accept = read(&mut reader).unwrap();
+                    assert_eq!(accept["kind"], "rustc-accept");
+                    received.push(accept);
+                    drop(reader);
+                    drop(writer);
+                    // The daemon thread is still alive. Its filesystem work
+                    // does not depend on the connection staying open.
+                    continue_writing
+                        .recv_timeout(Duration::from_secs(30))
+                        .unwrap();
+                    std::fs::write(artifact, b"late daemon output").unwrap();
                 }
                 Script::Execute(env) => {
                     let reply = serde_json::json!({
@@ -212,25 +235,95 @@ fn a_served_reply_without_skip_authority_is_not_a_hit() {
 }
 
 #[test]
-fn a_failed_or_lost_install_runs_the_compiler() {
+fn a_confirmed_failed_install_runs_the_compiler() {
+    let fixture = Fixture::new("echo compiled >&2\nexit 3\n");
+    let daemon = fixture.daemon(Script::Hit(Some(
+        "{\"kind\":\"rustc-decision\",\"decision\":\"serve-failed\",\"reason\":\"x\",\
+         \"writer_returned\":true}"
+            .to_owned(),
+    )));
+    let output = fixture.run(&[]);
+    daemon.join().unwrap();
+    assert!(fixture.compiler_ran());
+    assert_eq!(output.status.code(), Some(3));
+    assert_eq!(output.stderr, b"compiled\n");
+}
+
+#[test]
+fn malformed_or_unconfirmed_install_answers_fail_closed() {
     for answer in [
-        Some(
-            "{\"kind\":\"rustc-decision\",\"decision\":\"serve-failed\",\"reason\":\"x\",\
-             \"writer_returned\":true}"
-                .to_owned(),
-        ),
-        // The daemon closed (crashed) after accepting: its synchronous
-        // writer is gone with it.
         None,
+        Some("{\"kind\":\"rustc-decision\",\"decision\":\"served\""),
+        Some("{\"kind\":\"rustc-decision\",\"decision\":\"serve-failed\"}"),
+        Some(
+            "{\"kind\":\"rustc-decision\",\"decision\":\"serve-failed\",\
+             \"writer_returned\":false}",
+        ),
+        Some(
+            "{\"kind\":\"rustc-decision\",\"decision\":\"serve-failed\",\
+             \"writer_returned\":\"true\"}",
+        ),
+        Some(
+            "{\"kind\":\"rustc-decision\",\"decision\":\"serve-failed\",\
+             \"writer_returned\":true,\"writer_returned\":false}",
+        ),
+        Some("{\"decision\":\"serve-failed\",\"writer_returned\":true}"),
+        Some(
+            "{\"kind\":\"status\",\"decision\":\"serve-failed\",\
+             \"writer_returned\":true}",
+        ),
+        Some(
+            "{\"kind\":\"status\",\"decision\":\"served\",\
+             \"compiler_skip_authorized\":true,\"stderr_hex\":\"\"}",
+        ),
+        Some(
+            "{\"kind\":\"rustc-decision\",\"decision\":\"served\",\
+             \"compiler_skip_authorized\":true,\"stderr_hex\":\"zz\"}",
+        ),
+        Some(
+            "{\"kind\":\"rustc-decision\",\"decision\":\"served\",\
+             \"compiler_skip_authorized\":true}",
+        ),
     ] {
         let fixture = Fixture::new("echo compiled >&2\nexit 3\n");
-        let daemon = fixture.daemon(Script::Hit(answer));
+        let daemon = fixture.daemon(Script::Hit(answer.map(str::to_owned)));
         let output = fixture.run(&[]);
         daemon.join().unwrap();
-        assert!(fixture.compiler_ran());
-        assert_eq!(output.status.code(), Some(3));
-        assert_eq!(output.stderr, b"compiled\n");
+        assert!(!fixture.compiler_ran(), "answer: {answer:?}");
+        assert_eq!(output.status.code(), Some(1), "answer: {answer:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("refusing to run rustc"),
+            "answer: {answer:?}; output: {output:?}"
+        );
     }
+}
+
+#[test]
+fn a_disconnected_daemon_with_a_live_writer_cannot_trigger_compiler_reexecution() {
+    let fixture = Fixture::new("echo compiled >&2\nexit 3\n");
+    let artifact = fixture.dir.path().join("libdemo.rlib");
+    let (release_writer, continue_writing) = std::sync::mpsc::channel();
+    let daemon = fixture.daemon(Script::HitThenDisconnect {
+        artifact: artifact.clone(),
+        continue_writing,
+    });
+    let output = fixture.run(&[]);
+    let compiler_ran_before_late_write = fixture.compiler_ran();
+    let artifact_existed_before_late_write = artifact.exists();
+    release_writer.send(()).unwrap();
+    daemon.join().unwrap();
+    assert_eq!(
+        std::fs::read(&artifact).unwrap(),
+        b"late daemon output",
+        "the writer survives the closed connection and wrapper exit"
+    );
+    assert!(!artifact_existed_before_late_write);
+    assert!(
+        !compiler_ran_before_late_write && !fixture.compiler_ran(),
+        "connection loss must not run rustc while the daemon can still write"
+    );
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("refusing to run rustc"));
 }
 
 #[test]
