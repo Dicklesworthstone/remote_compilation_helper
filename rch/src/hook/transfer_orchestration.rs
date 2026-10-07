@@ -1141,6 +1141,12 @@ async fn execute_remote_compilation_inner(
             },
         ));
     }
+    // Record and lock the canonical spelling: a trailing-slash project path
+    // used to reach the lease verbatim and was then unlockable and
+    // unrecoverable (bd-4d1hs).
+    for root in &mut mutable_source_authority_roots {
+        *root = super::ssh::canonical_source_authority_root(root);
+    }
     mutable_source_authority_roots.sort();
     mutable_source_authority_roots.dedup();
     if worker_is_windows {

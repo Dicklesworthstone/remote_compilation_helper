@@ -1085,11 +1085,17 @@ impl RecoverySession {
 
 fn load_recipe(writer: &DurableLeaseWriter) -> anyhow::Result<RecoveryRecipe> {
     let lease = writer.snapshot();
-    let recipe: RecoveryRecipe = serde_json::from_value(
+    let mut recipe: RecoveryRecipe = serde_json::from_value(
         lease
             .recovery
             .context("job has no durable source/retrieval recipe")?,
     )?;
+    // Leases written before bd-4d1hs may carry a trailing-slash root that the
+    // source-authority lock plan refuses; recover them under the canonical
+    // spelling instead of failing forever.
+    for root in &mut recipe.source_roots {
+        *root = super::super::ssh::canonical_source_authority_root(root);
+    }
     anyhow::ensure!(
         recipe.version == 2
             && recipe.wrapper_id == lease.identity.local_wrapper_id

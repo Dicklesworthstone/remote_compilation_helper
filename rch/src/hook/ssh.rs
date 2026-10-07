@@ -198,6 +198,34 @@ fn source_authority_lock_paths(authority_roots: &[String]) -> Vec<String> {
         .collect()
 }
 
+/// The canonical spelling `source_authority_lock_plan` demands: a trailing `/`,
+/// doubled `/` and `.` components removed (bd-4d1hs).
+///
+/// A project path given as `/data/tmp/landing/c9-beads/` reached the durable
+/// lease verbatim. The lock plan then refused it, the wrapper died before
+/// preparing, and `rch jobs recover` refused the same recorded root forever, so
+/// the slot reservation was never returned. Anything not merely mis-spelled
+/// (relative, `..`, control bytes, non-UTF-8) is returned unchanged so the lock
+/// plan still rejects it loudly.
+pub(crate) fn canonical_source_authority_root(root: &str) -> String {
+    let path = Path::new(root);
+    if !path.is_absolute()
+        || root.bytes().any(|byte| matches!(byte, b'\n' | b'\r' | 0))
+        || path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        return root.to_string();
+    }
+    path.components()
+        .collect::<PathBuf>()
+        .to_str()
+        .map_or_else(|| root.to_string(), str::to_string)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct SourceAuthorityLockSpec {
     path: String,
@@ -1924,6 +1952,25 @@ cat "$RCH_OWNERSHIP_TEST_DIR/payload"
                 shared: false,
             })
             .collect()
+    }
+
+    #[test]
+    fn canonical_source_authority_root_repairs_only_benign_spellings() {
+        // bd-4d1hs: the exact root a dead fleet lease recorded.
+        let recorded = "/data/tmp/landing/c9-beads/";
+        assert!(source_authority_lock_plan(&[recorded.into()], false).is_err());
+        let canonical = canonical_source_authority_root(recorded);
+        assert_eq!(canonical, "/data/tmp/landing/c9-beads");
+        assert!(source_authority_lock_plan(&[canonical], false).is_ok());
+
+        assert_eq!(canonical_source_authority_root("/a//b/./c/"), "/a/b/c");
+        assert_eq!(canonical_source_authority_root("/"), "/");
+        assert_eq!(canonical_source_authority_root("/a/b"), "/a/b");
+        // Not merely mis-spelled: left as-is so the lock plan still refuses it.
+        for unsafe_root in ["relative/dir/", "/a/../b/", "/a/b\n"] {
+            assert_eq!(canonical_source_authority_root(unsafe_root), unsafe_root);
+            assert!(source_authority_lock_plan(&[unsafe_root.into()], false).is_err());
+        }
     }
 
     #[test]
