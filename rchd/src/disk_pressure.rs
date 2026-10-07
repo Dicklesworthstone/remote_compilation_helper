@@ -435,9 +435,15 @@ impl DiskPressureMonitor {
     }
 
     async fn evaluate_worker(&self, worker: Arc<WorkerState>) {
-        let worker_id = worker.config.read().await.id.to_string();
+        let endpoint = worker.endpoint_snapshot().await;
+        // This evaluation is local. Keep its observations and publication on
+        // one endpoint, so a retarget cannot inherit an old pressure verdict.
+        let Some(_endpoint_guard) = worker.lock_current_endpoint(&endpoint).await else {
+            return;
+        };
+        let worker_id = endpoint.config.id.to_string();
         let capabilities = worker.capabilities().await;
-        let telemetry = self.telemetry.latest(worker_id.as_str());
+        let telemetry = self.telemetry.latest_for_endpoint(&endpoint);
         let next = evaluate_pressure_policy(&capabilities, telemetry.as_ref(), &self.config);
         let prev = worker.pressure_assessment().await;
 
@@ -1038,6 +1044,60 @@ mod tests {
         let mut received = ReceivedTelemetry::new(telemetry, TelemetrySource::SshPoll);
         received.received_at = Utc::now() - ChronoDuration::seconds(age_secs);
         received
+    }
+
+    #[tokio::test]
+    async fn replacement_pressure_requires_its_own_bound_telemetry() {
+        let pool = WorkerPool::new();
+        let config = rch_common::WorkerConfig {
+            id: rch_common::WorkerId::new("worker-1"),
+            host: "old.host".to_string(),
+            user: "builder".to_string(),
+            identity_file: "/test/key".to_string(),
+            total_slots: 8,
+            priority: 100,
+            tags: Vec::new(),
+            tools: Vec::new(),
+        };
+        pool.add_worker(config.clone()).await;
+        let worker = pool.get(&config.id).await.unwrap();
+        let telemetry = Arc::new(TelemetryStore::new(Duration::from_secs(300), None));
+        let monitor =
+            DiskPressureMonitor::new(pool, telemetry.clone(), DiskPressurePolicyConfig::default());
+        let sample = test_received_telemetry(30.0, 40.0, 0).telemetry;
+        let before = worker.endpoint_snapshot().await;
+        worker
+            .set_capabilities(test_capabilities(60.0, 200.0))
+            .await;
+        telemetry.ingest_for_endpoint(sample.clone(), TelemetrySource::SshPoll, &before);
+        monitor.evaluate_worker(worker.clone()).await;
+        assert_eq!(
+            worker.pressure_assessment().await.state,
+            PressureState::Healthy
+        );
+
+        let mut replacement = config;
+        replacement.host = "replacement.host".to_string();
+        assert!(worker.update_config(replacement).await);
+        // Even freshly verified replacement disk capacity cannot make the old
+        // endpoint's memory/IO telemetry valid for admission.
+        worker
+            .set_capabilities(test_capabilities(60.0, 200.0))
+            .await;
+        telemetry.ingest(sample.clone(), TelemetrySource::Piggyback);
+        monitor.evaluate_worker(worker.clone()).await;
+        assert_eq!(
+            worker.pressure_assessment().await.state,
+            PressureState::TelemetryGap
+        );
+
+        let current = worker.endpoint_snapshot().await;
+        telemetry.ingest_for_endpoint(sample, TelemetrySource::SshPoll, &current);
+        monitor.evaluate_worker(worker.clone()).await;
+        assert_eq!(
+            worker.pressure_assessment().await.state,
+            PressureState::Healthy
+        );
     }
 
     /// A nearly-empty small filesystem (a half-of-RAM tmpfs /tmp reported as

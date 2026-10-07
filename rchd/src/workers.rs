@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, RwLockReadGuard, watch};
 use tracing::debug;
 
 // Sized for a *loaded* worker, not an idle one.
@@ -399,6 +399,9 @@ enum DrainCompletionAction {
 pub struct WorkerState {
     /// Worker configuration.
     pub config: RwLock<WorkerConfig>,
+    /// Invalidates network observations when a worker ID is retargeted. This is
+    /// separate from disk admission generations, which also advance on probes.
+    endpoint_generation: AtomicU64,
     /// Authoritative worker lifecycle — the two-axis (admin intent + live
     /// eligibility) model from [`WorkerLifecycle`].
     ///
@@ -479,6 +482,21 @@ pub(crate) struct CapabilityProbeContext {
     generation: u64,
 }
 
+/// Configuration and identity of the endpoint a network operation actually used.
+#[derive(Debug, Clone)]
+pub(crate) struct WorkerEndpointSnapshot {
+    pub config: WorkerConfig,
+    pub generation: u64,
+}
+
+fn same_endpoint(left: &WorkerConfig, right: &WorkerConfig) -> bool {
+    left.id == right.id
+        && left.host == right.host
+        && left.user == right.user
+        && left.identity_file == right.identity_file
+        && rch_common::declared_os(&left.tags) == rch_common::declared_os(&right.tags)
+}
+
 impl WorkerState {
     /// Create a new worker state from configuration.
     pub fn new(config: WorkerConfig) -> Self {
@@ -491,6 +509,7 @@ impl WorkerState {
     fn with_disk_slot_policy(config: WorkerConfig, disk_slot_policy: DiskSlotPolicy) -> Self {
         Self {
             config: RwLock::new(config),
+            endpoint_generation: AtomicU64::new(0),
             lifecycle: RwLock::new(WorkerLifecycle::new()),
             used_slots: Arc::new(AtomicU32::new(0)),
             speed_score: AtomicU64::new(50.0_f64.to_bits()), // Default mid-range score
@@ -511,13 +530,55 @@ impl WorkerState {
         }
     }
 
-    /// Update worker configuration.
-    pub async fn update_config(&self, new_config: WorkerConfig) {
-        {
-            let mut config = self.config.write().await;
-            self.disk_capacity_generation.fetch_add(1, Ordering::AcqRel);
-            *config = new_config;
+    /// Snapshot the endpoint without retaining a configuration lock during I/O.
+    pub(crate) async fn endpoint_snapshot(&self) -> WorkerEndpointSnapshot {
+        let config = self.config.read().await;
+        WorkerEndpointSnapshot {
+            config: config.clone(),
+            generation: self.endpoint_generation.load(Ordering::Acquire),
         }
+    }
+
+    /// Fence publication against retargeting, including an A -> B -> A change.
+    /// Hold the returned guard only for local state updates, never network I/O
+    /// or a method that reacquires `config`.
+    pub(crate) async fn lock_current_endpoint(
+        &self,
+        snapshot: &WorkerEndpointSnapshot,
+    ) -> Option<RwLockReadGuard<'_, WorkerConfig>> {
+        let config = self.config.read().await;
+        (snapshot.generation == self.endpoint_generation.load(Ordering::Acquire)
+            && same_endpoint(&config, &snapshot.config))
+        .then_some(config)
+    }
+
+    /// Update configuration, returning whether the connection endpoint changed.
+    pub async fn update_config(&self, new_config: WorkerConfig) -> bool {
+        let endpoint_changed = {
+            let mut config = self.config.write().await;
+            let endpoint_changed = !same_endpoint(&config, &new_config);
+            self.disk_capacity_generation.fetch_add(1, Ordering::AcqRel);
+            if endpoint_changed {
+                self.endpoint_generation.fetch_add(1, Ordering::AcqRel);
+                // Observations of the previous host/key/OS cannot condemn (or
+                // qualify) its replacement. Preserve build ownership and the
+                // operator's administrative intent, including an active bypass.
+                *self.circuit.write().await = CircuitStats::new();
+                *self.last_error_msg.write().await = None;
+                self.last_latency_ms.store(0, Ordering::Relaxed);
+                self.cached_projects.write().await.clear();
+                self.toolchain_preflight.write().await.clear();
+                *self.capabilities.write().await = WorkerCapabilities::new();
+                *self.disk_capacity_observation.write().await = None;
+                *self.pressure_assessment.write().await = PressureAssessment::default();
+                self.lifecycle
+                    .write()
+                    .await
+                    .observe_health(EligibilityState::Unreachable);
+            }
+            *config = new_config;
+            endpoint_changed
+        };
 
         let cancelled_pending_removal = {
             let mut completion = self.drain_completion.write().await;
@@ -537,6 +598,7 @@ impl WorkerState {
                 lifecycle.set_admin(AdminIntent::Active);
             }
         }
+        endpoint_changed
     }
 
     /// Get the current worker status as the legacy single-axis [`WorkerStatus`].
@@ -1264,6 +1326,8 @@ pub struct WorkerPool {
     /// Track worker count atomically for sync access.
     worker_count: Arc<AtomicUsize>,
     disk_slot_policy: DiskSlotPolicy,
+    /// Broadcast retargets to health and bypass recovery even while they probe.
+    endpoint_changes: watch::Sender<u64>,
 }
 
 impl WorkerPool {
@@ -1279,7 +1343,17 @@ impl WorkerPool {
             recovered_absent_slots: Arc::new(RwLock::new(HashMap::new())),
             worker_count: Arc::new(AtomicUsize::new(0)),
             disk_slot_policy: DiskSlotPolicy::from(config),
+            endpoint_changes: watch::channel(0).0,
         }
+    }
+
+    pub(crate) fn subscribe_endpoint_changes(&self) -> watch::Receiver<u64> {
+        self.endpoint_changes.subscribe()
+    }
+
+    fn notify_endpoint_change(&self) {
+        self.endpoint_changes
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
     }
 
     /// Add a worker to the pool.
@@ -1290,7 +1364,9 @@ impl WorkerPool {
             let workers = self.workers.read().await;
             if let Some(existing) = workers.get(&id) {
                 debug!("Updating existing worker: {}", id);
-                existing.update_config(config).await;
+                if existing.update_config(config).await {
+                    self.notify_endpoint_change();
+                }
                 return;
             }
         }
@@ -1305,7 +1381,9 @@ impl WorkerPool {
             // Race condition: added between read and write lock
             // Just update config on the existing one, drop the new state
             let config = state.config.read().await.clone();
-            existing.update_config(config).await;
+            if existing.update_config(config).await {
+                self.notify_endpoint_change();
+            }
         } else {
             // Publish a reintroduced worker only after restoring its surviving
             // builds. Holding the registry's write lock makes this transfer
@@ -1325,6 +1403,7 @@ impl WorkerPool {
             workers.insert(id.clone(), state);
             self.worker_count.fetch_add(1, Ordering::SeqCst);
             debug!("Added worker: {}", id);
+            self.notify_endpoint_change();
         }
     }
 
@@ -3830,6 +3909,100 @@ mod tests {
         let config = state.config.read().await;
         assert_eq!(config.total_slots, 16);
         assert_eq!(config.priority, 200);
+    }
+
+    #[tokio::test]
+    async fn endpoint_retarget_invalidates_old_and_aba_probe_results() {
+        let state = WorkerState::new(test_config("retarget"));
+        let original = state.endpoint_snapshot().await;
+        let mut replacement = original.config.clone();
+        replacement.host = "replacement.host".to_string();
+        assert!(state.update_config(replacement).await);
+        assert!(state.lock_current_endpoint(&original).await.is_none());
+
+        let intermediate = state.endpoint_snapshot().await;
+        assert!(state.update_config(original.config.clone()).await);
+        assert!(state.lock_current_endpoint(&original).await.is_none());
+        assert!(state.lock_current_endpoint(&intermediate).await.is_none());
+        let current = state.endpoint_snapshot().await;
+        assert!(state.lock_current_endpoint(&current).await.is_some());
+
+        let mut capacity_edit = current.config.clone();
+        capacity_edit.total_slots += 1;
+        capacity_edit.priority += 1;
+        assert!(!state.update_config(capacity_edit).await);
+        assert!(state.lock_current_endpoint(&current).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn endpoint_retarget_resets_observations_but_preserves_ownership_and_admin_intent() {
+        for disabled in [false, true] {
+            let state = WorkerState::new(test_config("retarget"));
+            assert!(state.reserve_slots(2).await);
+            state
+                .record_failure(Some("old host authentication stalled".into()))
+                .await;
+            state.set_last_latency_ms(Some(25_000));
+            state
+                .cached_projects
+                .write()
+                .await
+                .push("old-project".into());
+            state
+                .record_toolchain_preflight("old-toolchain".into(), false, Some("old host".into()))
+                .await;
+            let mut capabilities = WorkerCapabilities::new();
+            capabilities.rustc_version = Some("old-rustc".into());
+            state.set_capabilities(capabilities).await;
+            state.enter_bypass(BypassFailureClass::Ssh).await;
+            if disabled {
+                state.disable(Some("operator maintenance".into())).await;
+            }
+            let previous_admin = state.lifecycle().await.admin;
+            let previous_reason = state.disabled_reason().await;
+            let mut replacement = state.endpoint_snapshot().await.config;
+            replacement.host = "new-lan-address".into();
+            replacement.total_slots = 1;
+            assert!(state.update_config(replacement).await);
+
+            assert_eq!(state.used_slots(), 2, "old builds retain slot ownership");
+            assert_eq!(state.available_slots().await, 0);
+            assert_eq!(state.lifecycle().await.admin, previous_admin);
+            assert_eq!(state.disabled_reason().await, previous_reason);
+            assert_eq!(state.eligibility().await, EligibilityState::TemporaryBypass);
+            assert_eq!(state.circuit_stats().await.consecutive_failures(), 0);
+            assert!(state.last_error().await.is_none());
+            assert!(state.last_latency_ms().is_none());
+            assert!(state.cached_projects.read().await.is_empty());
+            assert!(
+                state
+                    .toolchain_preflight_status("old-toolchain")
+                    .await
+                    .is_none()
+            );
+            assert!(state.capabilities().await.rustc_version.is_none());
+            state.release_slots(2).await;
+            assert_eq!(state.used_slots(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn endpoint_changes_notify_all_monitors_without_losing_busy_subscribers() {
+        let pool = WorkerPool::new();
+        let mut config = test_config("watched");
+        pool.add_worker(config.clone()).await;
+        let mut health = pool.subscribe_endpoint_changes();
+        let mut recovery = pool.subscribe_endpoint_changes();
+        config.priority += 1;
+        pool.add_worker(config.clone()).await;
+        assert!(!health.has_changed().unwrap());
+        config.identity_file = "/new/key".into();
+        pool.add_worker(config).await;
+        assert!(health.has_changed().unwrap());
+        assert!(recovery.has_changed().unwrap());
+        health.changed().await.unwrap();
+        recovery.changed().await.unwrap();
+        assert_eq!(*health.borrow_and_update(), *recovery.borrow_and_update());
     }
 
     #[tokio::test]

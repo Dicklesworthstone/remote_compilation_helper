@@ -2205,9 +2205,20 @@ async fn handle_telemetry_poll(ctx: &DaemonContext, worker_id: &WorkerId) -> Tel
     // 20s (matching TelemetryPollerConfig): a fresh SSH connect+auth+exec to a
     // trans-continental worker can approach/exceed 5s under load.
     match collect_telemetry_from_worker(&worker, Duration::from_secs(20)).await {
-        Ok(telemetry) => {
-            ctx.telemetry
-                .ingest(telemetry.clone(), TelemetrySource::OnDemand);
+        Ok((endpoint, telemetry)) => {
+            let Some(_endpoint_guard) = worker.lock_current_endpoint(&endpoint).await else {
+                return TelemetryPollResponse {
+                    status: "error".to_string(),
+                    telemetry: None,
+                    error: Some("worker endpoint changed during telemetry collection".to_string()),
+                    worker_id: Some(worker_id.to_string()),
+                };
+            };
+            ctx.telemetry.ingest_for_endpoint(
+                telemetry.clone(),
+                TelemetrySource::OnDemand,
+                &endpoint,
+            );
             TelemetryPollResponse {
                 status: "ok".to_string(),
                 telemetry: Some(telemetry),

@@ -2208,7 +2208,7 @@ impl WorkerSelector {
             }
 
             if let Some(reason) = self
-                .toolchain_preflight_failure(worker.as_ref(), worker_id.as_str(), request)
+                .toolchain_preflight_failure(worker.as_ref(), request)
                 .await
             {
                 debug!(
@@ -2918,43 +2918,15 @@ impl WorkerSelector {
     async fn toolchain_preflight_failure(
         &self,
         worker: &WorkerState,
-        worker_id: &str,
         request: &SelectionRequest,
     ) -> Option<String> {
         let toolchain = request.toolchain.as_ref()?;
         let toolchain_name = toolchain.rustup_toolchain();
 
-        if let Some(cached) = worker.toolchain_preflight_status(&toolchain_name).await
-            && cached.is_reusable(TOOLCHAIN_PREFLIGHT_TTL, TOOLCHAIN_PREFLIGHT_TRANSIENT_TTL)
-        {
-            return (!cached.usable).then(|| {
-                cached
-                    .reason
-                    .unwrap_or_else(|| "cached_toolchain_unusable".to_string())
-            });
-        }
-
-        let result = probe_worker_toolchain(worker, &toolchain_name, self.ssh_pool.as_ref()).await;
-        match result {
-            Ok(()) => {
-                worker
-                    .record_toolchain_preflight(toolchain_name, true, None)
-                    .await;
-                None
-            }
-            Err(reason) => {
-                warn!(
-                    worker = %worker_id,
-                    toolchain = %toolchain_name,
-                    reason = %reason,
-                    "Worker toolchain preflight failed"
-                );
-                worker
-                    .record_toolchain_preflight(toolchain_name, false, Some(reason.clone()))
-                    .await;
-                Some(reason)
-            }
-        }
+        toolchain_preflight_with(worker, &toolchain_name, |endpoint| {
+            probe_worker_toolchain(endpoint, &toolchain_name, self.ssh_pool.as_ref())
+        })
+        .await
     }
 
     /// Priority strategy: respect worker priority first, then use cache/speed
@@ -4191,12 +4163,66 @@ fn rustc_version_key(value: &str) -> Option<String> {
     (!version.is_empty()).then(|| version.to_string())
 }
 
-async fn probe_worker_toolchain(
+async fn toolchain_preflight_with<F, Fut>(
     worker: &WorkerState,
+    toolchain_name: &str,
+    probe: F,
+) -> Option<String>
+where
+    F: FnOnce(rch_common::WorkerConfig) -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    let endpoint = worker.endpoint_snapshot().await;
+    {
+        let Some(_endpoint_guard) = worker.lock_current_endpoint(&endpoint).await else {
+            return Some("toolchain_preflight_endpoint_changed".to_string());
+        };
+        if let Some(cached) = worker.toolchain_preflight_status(toolchain_name).await
+            && cached.is_reusable(TOOLCHAIN_PREFLIGHT_TTL, TOOLCHAIN_PREFLIGHT_TRANSIENT_TTL)
+        {
+            return (!cached.usable).then(|| {
+                cached
+                    .reason
+                    .unwrap_or_else(|| "cached_toolchain_unusable".to_string())
+            });
+        }
+    }
+
+    // Keep toolchain probes concurrent and reloadable: the configuration guard
+    // covers only cache access/publication, never connect or remote execution.
+    let result = probe(endpoint.config.clone()).await;
+    let Some(_endpoint_guard) = worker.lock_current_endpoint(&endpoint).await else {
+        // A late success cannot authorize the replacement, and a late failure
+        // cannot poison its cache. A later selection obtains fresh evidence.
+        return Some("toolchain_preflight_endpoint_changed".to_string());
+    };
+    match result {
+        Ok(()) => {
+            worker
+                .record_toolchain_preflight(toolchain_name.to_string(), true, None)
+                .await;
+            None
+        }
+        Err(reason) => {
+            warn!(
+                worker = %endpoint.config.id,
+                toolchain = %toolchain_name,
+                reason = %reason,
+                "Worker toolchain preflight failed"
+            );
+            worker
+                .record_toolchain_preflight(toolchain_name.to_string(), false, Some(reason.clone()))
+                .await;
+            Some(reason)
+        }
+    }
+}
+
+async fn probe_worker_toolchain(
+    worker_config: rch_common::WorkerConfig,
     toolchain_name: &str,
     ssh_pool: Option<&Arc<rch_common::SshPool>>,
 ) -> Result<(), String> {
-    let worker_config = worker.config.read().await.clone();
     let ssh_options = SshOptions {
         connect_timeout: TOOLCHAIN_PREFLIGHT_CONNECT_TIMEOUT,
         command_timeout: TOOLCHAIN_PREFLIGHT_COMMAND_TIMEOUT,
@@ -7598,6 +7624,99 @@ mod tests {
             .expect("expected worker to recover after explicit revalidation");
         assert_eq!(selected.config.read().await.id.as_str(), "flapping");
         assert_eq!(second.reason, SelectionReason::Success);
+    }
+
+    #[tokio::test]
+    async fn concurrent_preflights_discard_old_endpoint_results_and_reprobe_after_retarget() {
+        for return_to_original in [false, true] {
+            let worker = Arc::new(make_worker("retargeted-toolchains", 8, 50.0));
+            let original = worker.endpoint_snapshot().await.config;
+            let started = Arc::new(tokio::sync::Barrier::new(3));
+            let release = Arc::new(tokio::sync::Barrier::new(3));
+            let mut tasks = Vec::new();
+            for (toolchain, old_success) in [("stable", true), ("nightly", false)] {
+                let worker = worker.clone();
+                let started = started.clone();
+                let release = release.clone();
+                tasks.push(tokio::spawn(async move {
+                    toolchain_preflight_with(&worker, toolchain, |endpoint| async move {
+                        assert_eq!(endpoint.host, "localhost");
+                        started.wait().await;
+                        release.wait().await;
+                        if old_success {
+                            Ok(())
+                        } else {
+                            Err("old endpoint missing toolchain".to_string())
+                        }
+                    })
+                    .await
+                }));
+            }
+            tokio::time::timeout(Duration::from_secs(1), started.wait())
+                .await
+                .expect("different toolchains must probe concurrently");
+            let mut replacement = original.clone();
+            replacement.host = "replacement.host".to_string();
+            tokio::time::timeout(Duration::from_secs(1), async {
+                assert!(worker.update_config(replacement).await);
+                if return_to_original {
+                    assert!(worker.update_config(original).await);
+                }
+            })
+            .await
+            .expect("preflight I/O must not block endpoint reload");
+            release.wait().await;
+            for task in tasks {
+                assert_eq!(
+                    tokio::time::timeout(Duration::from_secs(1), task)
+                        .await
+                        .expect("old preflight must finish")
+                        .unwrap()
+                        .as_deref(),
+                    Some("toolchain_preflight_endpoint_changed")
+                );
+            }
+
+            // Neither success nor failure was installed in the replacement's
+            // cache. Fresh evidence can reach the opposite verdict for each.
+            for (toolchain, fresh_success) in [("stable", false), ("nightly", true)] {
+                assert!(worker.toolchain_preflight_status(toolchain).await.is_none());
+                let fresh = toolchain_preflight_with(&worker, toolchain, |endpoint| {
+                    assert_eq!(
+                        endpoint.host,
+                        if return_to_original {
+                            "localhost"
+                        } else {
+                            "replacement.host"
+                        }
+                    );
+                    std::future::ready(if fresh_success {
+                        Ok(())
+                    } else {
+                        Err("replacement missing toolchain".to_string())
+                    })
+                })
+                .await;
+                assert_eq!(fresh.is_none(), fresh_success);
+                assert_eq!(
+                    worker
+                        .toolchain_preflight_status(toolchain)
+                        .await
+                        .unwrap()
+                        .usable,
+                    fresh_success
+                );
+                let cached = toolchain_preflight_with(
+                    &worker,
+                    toolchain,
+                    |_| -> std::future::Ready<Result<(), String>> {
+                        panic!("current endpoint verdict must be reusable");
+                    },
+                )
+                .await;
+                assert_eq!(cached, fresh);
+            }
+        }
     }
 
     #[tokio::test]
