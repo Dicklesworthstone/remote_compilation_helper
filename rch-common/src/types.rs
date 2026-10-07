@@ -697,6 +697,15 @@ pub struct ReleaseRequest {
     /// daemon records no cache warmth for it (review of GH #81).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub worker_fault: bool,
+    /// The failed remote command reported exhausted disk space or quota.
+    /// After matching the durable build owner, the daemon temporarily bypasses
+    /// this worker until fresh recovery probes establish disk headroom.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub worker_disk_full: bool,
+    /// Actual remote source and output roots used by the failed attempt.
+    /// Recovery must measure these filesystems as well as configured roots.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub worker_disk_roots: Vec<String>,
 }
 
 /// Build execution phase for daemon heartbeat tracking.

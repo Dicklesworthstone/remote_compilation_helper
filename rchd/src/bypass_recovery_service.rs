@@ -53,6 +53,7 @@ use rch_common::ssh::{SshClient, SshOptions};
 use rch_common::{BypassFailureClass, WorkerConfig, WorkerId};
 use rch_telemetry::remediation::{self, BypassTransition, SelfHealingAction, SelfHealingOutcome};
 
+use crate::history::BuildHistory;
 use crate::telemetry::TelemetryStore;
 use crate::workers::{AdminIntent, EligibilityState, WorkerPool, WorkerState};
 
@@ -107,7 +108,11 @@ impl Default for BypassRecoveryConfig {
             probe_timeout: Duration::from_secs(10),
             min_disk_free_gb: 5.0,
             min_disk_inodes: 10_000,
-            disk_roots: vec!["/tmp".to_string(), "/tmp/rch".to_string()],
+            disk_roots: vec![
+                "/tmp".to_string(),
+                "/tmp/rch".to_string(),
+                rch_common::types::default_remote_base(),
+            ],
             max_load_per_core: 4.0,
             min_protocol: 0,
             required_targets: Vec::new(),
@@ -159,6 +164,7 @@ pub trait RecoveryProber: Send + Sync {
     fn probe(
         &self,
         worker: Arc<WorkerState>,
+        record: BypassRecord,
     ) -> impl std::future::Future<Output = RecoveryProbe> + Send;
 
     /// Run the canary build for a worker that passed its recovery probes.
@@ -331,6 +337,54 @@ fn assess_probe_facts(
     }
 }
 
+/// A disk-failure quarantine needs affirmative measurements of every
+/// configured root. Partial stdout, an empty probe or a failed `df` cannot
+/// establish that the filesystem which stopped the build has recovered.
+fn has_complete_disk_evidence(
+    facts: &rch_common::capability_probe::ProbedFacts,
+    config: &BypassRecoveryConfig,
+) -> bool {
+    !config.disk_roots.is_empty()
+        && config.disk_roots.iter().all(|root| {
+            if root.is_empty() {
+                return false;
+            }
+            let mut matches = facts.disk_roots.iter().filter(|fact| &fact.path == root);
+            matches.next().is_some_and(|fact| {
+                fact.total_bytes > 0 && fact.available_bytes <= fact.total_bytes
+            }) && matches.next().is_none()
+        })
+}
+
+/// The durable record, including roots reported by the failed job, owns the
+/// recovery requirements. Canary lifecycle transitions may clear their live
+/// cause, and a daemon restart must not weaken this evidence.
+fn recovery_disk_config(
+    config: &BypassRecoveryConfig,
+    record: &BypassRecord,
+) -> BypassRecoveryConfig {
+    let mut config = config.clone();
+    config.disk_roots.extend(record.disk_roots.iter().cloned());
+    config.disk_roots.sort();
+    config.disk_roots.dedup();
+    config
+}
+
+fn assess_recovery_probe_facts(
+    facts: &rch_common::capability_probe::ProbedFacts,
+    load_per_core: Option<f64>,
+    telemetry_ok: bool,
+    config: &BypassRecoveryConfig,
+    record: &BypassRecord,
+) -> RecoveryProbe {
+    let config = recovery_disk_config(config, record);
+    let mut probe = assess_probe_facts(facts, load_per_core, telemetry_ok, &config);
+    if record.failure_class == BypassFailureClass::DiskInodePressure {
+        probe.disk_ok &= has_complete_disk_evidence(facts, &config);
+    }
+    probe
+}
+
 /// Whether the telemetry dimension admits this worker during bypass recovery.
 ///
 /// Windows workers run under Git Bash and cannot produce the Linux `/proc`-based
@@ -346,9 +400,10 @@ fn recovery_telemetry_ok(config: &WorkerConfig, observed_fresh: bool) -> bool {
 }
 
 impl RecoveryProber for SshRecoveryProber {
-    async fn probe(&self, worker: Arc<WorkerState>) -> RecoveryProbe {
+    async fn probe(&self, worker: Arc<WorkerState>, record: BypassRecord) -> RecoveryProbe {
         let config = worker.config.read().await.clone();
-        let spec = self.probe_spec(&config);
+        let mut spec = self.probe_spec(&config);
+        spec.disk_roots = recovery_disk_config(&self.config, &record).disk_roots;
         // The 12.2 exact-path capability script (rch-wkr --version at the exact
         // path, rustup toolchains/targets, df -Pk/-Pi disk+inode roots), plus a
         // fresh load probe the capability script doesn't cover.
@@ -375,7 +430,7 @@ impl RecoveryProber for SshRecoveryProber {
         let load_per_core = Self::parse_load_per_core(&stdout);
         let telemetry_ok =
             recovery_telemetry_ok(&config, self.telemetry_fresh(config.id.as_str()).await);
-        assess_probe_facts(&facts, load_per_core, telemetry_ok, &self.config)
+        assess_recovery_probe_facts(&facts, load_per_core, telemetry_ok, &self.config, &record)
     }
 
     async fn canary(&self, worker: Arc<WorkerState>) -> CanaryOutcome {
@@ -405,23 +460,36 @@ pub async fn record_worker_bypass(
     diagnostic: impl Into<String>,
     now_ms: u64,
 ) {
+    let (id, host, user) = {
+        let c = worker.config.read().await;
+        (c.id.to_string(), c.host.clone(), c.user.clone())
+    };
+    // Serialize the live transition and its record with recovery's final
+    // comparison. A failure arriving while an SSH probe/canary is in flight
+    // must invalidate that old recovery result before it can reopen admission.
+    let mut store = store.lock().await;
     if worker.lifecycle().await.admin == AdminIntent::Disabled {
         return;
     }
+    let class = if store
+        .get(&id)
+        .is_some_and(|record| record.failure_class == BypassFailureClass::DiskInodePressure)
+    {
+        BypassFailureClass::DiskInodePressure
+    } else {
+        class
+    };
     worker.enter_bypass(class).await;
     // Remediation observability (bead 14.5): a worker just entered temporary
     // bypass — record the lifecycle transition and the ineligibility reason.
     remediation::record_bypass_transition(BypassTransition::Bypassed);
     remediation::record_worker_ineligible(class);
 
-    let (id, host, user) = {
-        let c = worker.config.read().await;
-        (c.id.to_string(), c.host.clone(), c.user.clone())
-    };
     let diagnostic = diagnostic.into();
-    let mut store = store.lock().await;
     let record = if let Some(existing) = store.get(&id) {
         let mut rec = existing.clone();
+        rec.failure_class = class;
+        rec.reason_code = class.incident_reason_code();
         rec.record_failure(now_ms, diagnostic);
         rec
     } else {
@@ -432,6 +500,135 @@ pub async fn record_worker_bypass(
     }
 }
 
+/// Validate remote paths without interpreting them on the dispatcher's
+/// filesystem. These are quoted probe inputs, never command fragments.
+pub fn validate_disk_fault_roots(roots: &[String]) -> anyhow::Result<Vec<String>> {
+    anyhow::ensure!(roots.len() <= 256, "too many disk-fault roots");
+    let mut normalized = Vec::with_capacity(roots.len());
+    for root in roots {
+        anyhow::ensure!(
+            !root.is_empty() && root.len() <= 4096 && !root.chars().any(char::is_control),
+            "invalid disk-fault root length or control character"
+        );
+        let bytes = root.as_bytes();
+        let relative = if root.starts_with('/') {
+            &root[1..]
+        } else if bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && &bytes[1..3] == b":/" {
+            &root[3..]
+        } else {
+            anyhow::bail!("disk-fault roots must be absolute remote paths");
+        };
+        anyhow::ensure!(
+            relative.is_empty()
+                || relative
+                    .split('/')
+                    .all(|part| !matches!(part, "" | "." | "..")),
+            "disk-fault roots must be canonical remote paths"
+        );
+        normalized.push(root.clone());
+    }
+    normalized.sort();
+    normalized.dedup();
+    Ok(normalized)
+}
+
+/// Publish an exact-owner disk incident before acknowledging its durable
+/// completion intent. Recovery shares this lock and additionally checks the
+/// history's pending intents, so a failed acknowledgment cannot lose dedupe
+/// evidence by letting the worker rejoin first.
+#[allow(clippy::too_many_arguments)]
+pub async fn record_worker_disk_bypass(
+    store: &Arc<Mutex<BypassRecordStore>>,
+    worker: Option<&Arc<WorkerState>>,
+    worker_id: &str,
+    incident_id: &str,
+    roots: &[String],
+    diagnostic: &str,
+    now_ms: u64,
+    acknowledge: impl FnOnce() -> std::io::Result<()>,
+) -> anyhow::Result<()> {
+    let roots = validate_disk_fault_roots(roots)?;
+    anyhow::ensure!(
+        !incident_id.is_empty()
+            && incident_id.len() <= 256
+            && !incident_id.chars().any(char::is_control),
+        "invalid disk-fault incident identity"
+    );
+    let (host, user) = if let Some(worker) = worker {
+        let config = worker.config.read().await;
+        anyhow::ensure!(
+            config.id.as_str() == worker_id,
+            "disk-fault worker identity mismatch"
+        );
+        (config.host.clone(), config.user.clone())
+    } else {
+        (String::new(), String::new())
+    };
+    let mut store = store.lock().await;
+    if let Some(worker) = worker
+        && worker.lifecycle().await.admin == AdminIntent::Disabled
+    {
+        // The durable operator disable already excludes this worker. A later
+        // explicit enable is the operator's choice; never change that axis.
+        acknowledge()?;
+        return Ok(());
+    }
+    if let Some(worker) = worker {
+        worker
+            .enter_bypass(BypassFailureClass::DiskInodePressure)
+            .await;
+    }
+    const INCIDENTS: &str = "disk_fault_incidents";
+    let previous = store.get(worker_id);
+    let mut incidents: Vec<String> = previous
+        .and_then(|record| record.details.get(INCIDENTS))
+        .map(|json| serde_json::from_str(json))
+        .transpose()?
+        .unwrap_or_default();
+    let already_recorded = incidents.iter().any(|id| id == incident_id);
+    anyhow::ensure!(
+        already_recorded || incidents.len() < 4096,
+        "too many unretired disk incidents"
+    );
+    let mut record = if let Some(previous) = previous {
+        let mut record = previous.clone();
+        record.failure_class = BypassFailureClass::DiskInodePressure;
+        record.reason_code = record.failure_class.incident_reason_code();
+        if !already_recorded {
+            record.record_failure(now_ms, diagnostic);
+        }
+        record
+    } else {
+        BypassRecord::new(
+            worker_id,
+            host,
+            user,
+            BypassFailureClass::DiskInodePressure,
+            now_ms,
+        )
+        .with_diagnostic(diagnostic)
+    };
+    record.disk_roots.extend(roots);
+    record.disk_roots.sort();
+    record.disk_roots.dedup();
+    record.disk_roots = validate_disk_fault_roots(&record.disk_roots)?;
+    if !already_recorded {
+        incidents.push(incident_id.to_string());
+    }
+    record
+        .details
+        .insert(INCIDENTS.to_string(), serde_json::to_string(&incidents)?);
+    // Always retry persistence, even for an incident already in the in-memory
+    // map: a previous upsert may have updated that map but failed its fsync.
+    store.upsert(record)?;
+    acknowledge()?;
+    if !already_recorded {
+        remediation::record_bypass_transition(BypassTransition::Bypassed);
+        remediation::record_worker_ineligible(BypassFailureClass::DiskInodePressure);
+    }
+    Ok(())
+}
+
 /// Background service that probes bypassed workers and rejoins the ones that
 /// recover, keeping the durable record and live lifecycle in lockstep.
 pub struct BypassRecoveryService<P: RecoveryProber> {
@@ -439,6 +636,7 @@ pub struct BypassRecoveryService<P: RecoveryProber> {
     store: Arc<Mutex<BypassRecordStore>>,
     prober: P,
     config: BypassRecoveryConfig,
+    history: Option<Arc<BuildHistory>>,
 }
 
 impl<P: RecoveryProber + 'static> BypassRecoveryService<P> {
@@ -455,7 +653,16 @@ impl<P: RecoveryProber + 'static> BypassRecoveryService<P> {
             store,
             prober,
             config,
+            history: None,
         }
+    }
+
+    /// Pending durable disk-fault intents must finish publication before
+    /// recovery may discard the matching bypass and its dedupe evidence.
+    #[must_use]
+    pub fn with_history(mut self, history: Arc<BuildHistory>) -> Self {
+        self.history = Some(history);
+        self
     }
 
     /// Spawn the periodic loop. Reconciles persisted records into live worker
@@ -556,6 +763,13 @@ impl<P: RecoveryProber + 'static> BypassRecoveryService<P> {
 
     async fn evaluate_record(&self, record: BypassRecord, now_ms: u64) {
         let worker_id = record.worker_id.clone();
+        if self
+            .history
+            .as_ref()
+            .is_some_and(|history| history.has_pending_disk_fault(&worker_id))
+        {
+            return;
+        }
         let Some(worker) = self.pool.get(&WorkerId::new(&worker_id)).await else {
             // A fresh or partial daemon pool cannot prove that an absent worker
             // recovered. Retain its durable quarantine for a later reconciliation
@@ -576,7 +790,14 @@ impl<P: RecoveryProber + 'static> BypassRecoveryService<P> {
             return;
         }
 
-        let probe = self.prober.probe(worker.clone()).await;
+        let probe = self.prober.probe(worker.clone(), record.clone()).await;
+        let mut store = self.store.lock().await;
+        if store.get(&worker_id) != Some(&record)
+            || worker.lifecycle().await.admin == AdminIntent::Disabled
+        {
+            debug!(worker = %worker_id, "discarding recovery probe superseded by a new failure or operator action");
+            return;
+        }
         match decide_probe(record, &probe, now_ms) {
             ProbeDecision::StayBypassed {
                 failed_dimension,
@@ -585,7 +806,9 @@ impl<P: RecoveryProber + 'static> BypassRecoveryService<P> {
                 debug!(worker = %worker_id, dimension = %failed_dimension, "recovery probe failed; staying bypassed");
                 remediation::record_bypass_transition(BypassTransition::StayBypassed);
                 worker.enter_bypass(record.failure_class).await;
-                self.persist(*record).await;
+                if let Err(error) = store.upsert(*record) {
+                    warn!(%error, "failed to persist bypass record");
+                }
             }
             ProbeDecision::KeepProbing {
                 consecutive_passes,
@@ -594,7 +817,9 @@ impl<P: RecoveryProber + 'static> BypassRecoveryService<P> {
             } => {
                 debug!(worker = %worker_id, consecutive_passes, required, "recovery probe passed; keep probing");
                 remediation::record_bypass_transition(BypassTransition::KeepProbing);
-                self.persist(*record).await;
+                if let Err(error) = store.upsert(*record) {
+                    warn!(%error, "failed to persist bypass record");
+                }
             }
             ProbeDecision::ReadyForCanary { record } => {
                 info!(worker = %worker_id, "recovery probes passed; running canary");
@@ -606,36 +831,47 @@ impl<P: RecoveryProber + 'static> BypassRecoveryService<P> {
                     worker.enter_bypass(record.failure_class).await;
                     let _ = worker.recover_to_canary().await;
                 }
-                self.persist((*record).clone()).await;
+                if let Err(error) = store.upsert((*record).clone()) {
+                    warn!(%error, "failed to persist canary-pending bypass record");
+                    worker.enter_bypass(record.failure_class).await;
+                    return;
+                }
+                drop(store);
                 let outcome = self.prober.canary(worker.clone()).await;
+                let mut store = self.store.lock().await;
+                if store.get(&worker_id) != Some(record.as_ref())
+                    || worker.lifecycle().await.admin == AdminIntent::Disabled
+                {
+                    debug!(worker = %worker_id, "discarding canary superseded by a new failure or operator action");
+                    return;
+                }
                 // Remediation observability (bead 14.5): record the canary result.
                 remediation::record_canary(outcome);
+                let expected = (*record).clone();
                 match decide_canary(*record, outcome, now_ms) {
                     CanaryDecision::Rejoin => {
-                        info!(worker = %worker_id, "canary passed; rejoining worker");
-                        remediation::record_bypass_transition(BypassTransition::Rejoin);
-                        remediation::record_self_healing(
-                            SelfHealingAction::WorkerRejoin,
-                            SelfHealingOutcome::Success,
-                        );
-                        self.rejoin(&worker, &worker_id).await;
+                        if self.rejoin(&worker, &mut store, &expected).await {
+                            info!(worker = %worker_id, "canary passed; rejoined worker");
+                        }
                     }
                     CanaryDecision::Relapse { record } => {
                         warn!(worker = %worker_id, "canary failed; relapsing into bypass");
                         remediation::record_bypass_transition(BypassTransition::Relapse);
                         worker.enter_bypass(record.failure_class).await;
-                        self.persist(*record).await;
+                        if let Err(error) = store.upsert(*record) {
+                            warn!(%error, "failed to persist bypass record");
+                        }
                     }
                 }
             }
             ProbeDecision::Rejoin => {
-                info!(worker = %worker_id, "recovery criteria met (no canary required); rejoining worker");
-                remediation::record_bypass_transition(BypassTransition::Rejoin);
-                remediation::record_self_healing(
-                    SelfHealingAction::WorkerRejoin,
-                    SelfHealingOutcome::Success,
-                );
-                self.rejoin(&worker, &worker_id).await;
+                let expected = store
+                    .get(&worker_id)
+                    .cloned()
+                    .expect("record compared above");
+                if self.rejoin(&worker, &mut store, &expected).await {
+                    info!(worker = %worker_id, "recovery criteria met (no canary required); rejoined worker");
+                }
             }
         }
     }
@@ -644,7 +880,26 @@ impl<P: RecoveryProber + 'static> BypassRecoveryService<P> {
     /// circuit breaker, and drop the record. For the no-canary path the worker
     /// is still `TemporaryBypass`, so step it through the legal transitions; for
     /// the canary path it is already `RecoveredPendingCanary`.
-    async fn rejoin(&self, worker: &Arc<WorkerState>, worker_id: &str) {
+    async fn rejoin(
+        &self,
+        worker: &Arc<WorkerState>,
+        store: &mut BypassRecordStore,
+        expected: &BypassRecord,
+    ) -> bool {
+        if self
+            .history
+            .as_ref()
+            .is_some_and(|history| history.has_pending_disk_fault(&expected.worker_id))
+        {
+            return false;
+        }
+        // Keep admission closed if durable retirement fails. `remove` updates
+        // the in-memory map before writing, so restore that map on an error.
+        if let Err(error) = store.remove(&expected.worker_id) {
+            let _ = store.upsert(expected.clone());
+            warn!(%error, "failed to retire bypass record; worker remains quarantined");
+            return false;
+        }
         if worker.is_canary_pending().await {
             let _ = worker.promote_from_canary().await;
         } else {
@@ -654,13 +909,12 @@ impl<P: RecoveryProber + 'static> BypassRecoveryService<P> {
         // The bypass opened the selection-side circuit (WorkerState.circuit) for
         // this worker; close it so the rejoined worker is actually schedulable.
         worker.close_circuit().await;
-        let _ = self.store.lock().await.remove(worker_id);
-    }
-
-    async fn persist(&self, record: BypassRecord) {
-        if let Err(e) = self.store.lock().await.upsert(record) {
-            warn!(error = %e, "failed to persist bypass record");
-        }
+        remediation::record_bypass_transition(BypassTransition::Rejoin);
+        remediation::record_self_healing(
+            SelfHealingAction::WorkerRejoin,
+            SelfHealingOutcome::Success,
+        );
+        true
     }
 }
 
@@ -731,7 +985,7 @@ mod tests {
     }
 
     impl RecoveryProber for FakeProber {
-        async fn probe(&self, _worker: Arc<WorkerState>) -> RecoveryProbe {
+        async fn probe(&self, _worker: Arc<WorkerState>, _record: BypassRecord) -> RecoveryProbe {
             self.probes
                 .lock()
                 .await
@@ -1083,6 +1337,94 @@ mod tests {
         );
     }
 
+    struct DiskFactsProber {
+        facts: ProbedFacts,
+        config: BypassRecoveryConfig,
+        expect_canary: bool,
+    }
+
+    impl RecoveryProber for DiskFactsProber {
+        async fn probe(&self, worker: Arc<WorkerState>, record: BypassRecord) -> RecoveryProbe {
+            assert!(worker.is_canary_pending().await);
+            assert_eq!(worker.lifecycle().await.bypass_cause, None);
+            assert_eq!(record.failure_class, BypassFailureClass::DiskInodePressure);
+            assert_eq!(record.disk_roots, ["/separate-build-volume/rch"]);
+            assess_recovery_probe_facts(&self.facts, Some(0.1), true, &self.config, &record)
+        }
+
+        async fn canary(&self, _worker: Arc<WorkerState>) -> CanaryOutcome {
+            assert!(
+                self.expect_canary,
+                "partial disk evidence must not reach a canary"
+            );
+            CanaryOutcome::Passed
+        }
+    }
+
+    #[tokio::test]
+    async fn restarted_disk_canary_requires_the_failed_jobs_actual_filesystems() {
+        for complete in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("bypasses.json");
+            let mut before_restart = BypassRecordStore::with_path(path.clone());
+            let mut record = BypassRecord::new(
+                "disk-worker",
+                "h",
+                "u",
+                BypassFailureClass::DiskInodePressure,
+                T0,
+            );
+            record.state = BypassState::RecoveredPendingCanary;
+            record.auto_rejoin.required_consecutive_passes = 1;
+            record.disk_roots = vec!["/separate-build-volume/rch".to_string()];
+            before_restart.upsert(record).unwrap();
+
+            let store = Arc::new(Mutex::new(BypassRecordStore::load(&path)));
+            let pool = pool_with(&["disk-worker"]).await;
+            let worker = pool.get(&WorkerId::new("disk-worker")).await.unwrap();
+            let config = BypassRecoveryConfig::default();
+            let mut facts = facts_all_good();
+            let measurement = facts.disk_roots[0].clone();
+            facts.disk_roots = config
+                .disk_roots
+                .iter()
+                .map(|root| {
+                    let mut fact = measurement.clone();
+                    fact.path.clone_from(root);
+                    fact
+                })
+                .collect();
+            if complete {
+                let mut fact = measurement;
+                fact.path = "/separate-build-volume/rch".to_string();
+                facts.disk_roots.push(fact);
+            }
+            let service = BypassRecoveryService::new(
+                pool,
+                store.clone(),
+                DiskFactsProber {
+                    facts,
+                    config: config.clone(),
+                    expect_canary: complete,
+                },
+                config,
+            );
+            service.reconcile_on_start().await;
+            service.evaluate_once(T0 + 60_000).await;
+
+            assert_eq!(worker.lifecycle().await.is_schedulable(), complete);
+            let persisted = BypassRecordStore::load(&path);
+            if complete {
+                assert!(!persisted.contains("disk-worker"));
+            } else {
+                let remaining = persisted.get("disk-worker").unwrap();
+                assert_eq!(remaining.state, BypassState::TemporaryBypass);
+                assert_eq!(remaining.disk_roots, ["/separate-build-volume/rch"]);
+                assert_eq!(remaining.consecutive_passes, 0);
+            }
+        }
+    }
+
     #[tokio::test]
     async fn producer_advances_backoff_on_repeated_failures() {
         let pool = pool_with(&["css"]).await;
@@ -1109,6 +1451,381 @@ mod tests {
             after_first.first_failure_unix_ms,
             after_second.first_failure_unix_ms
         );
+    }
+
+    #[tokio::test]
+    async fn disk_intent_is_not_acknowledged_until_its_record_reaches_storage() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let directory = tempfile::tempdir().unwrap();
+        let blocked_parent = directory.path().join("state");
+        std::fs::write(&blocked_parent, b"preserved obstruction").unwrap();
+        let path = blocked_parent.join("bypasses.json");
+        let store = Arc::new(Mutex::new(BypassRecordStore::with_path(&path)));
+        let pool = pool_with(&["disk-worker"]).await;
+        let worker = pool.get(&WorkerId::new("disk-worker")).await.unwrap();
+        let roots = vec!["/build volume/rch".to_string()];
+        let acknowledged = AtomicUsize::new(0);
+        let result = record_worker_disk_bypass(
+            &store,
+            Some(&worker),
+            "disk-worker",
+            "incident-a",
+            &roots,
+            "disk full",
+            T0,
+            || {
+                acknowledged.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(acknowledged.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            worker.eligibility().await,
+            EligibilityState::TemporaryBypass
+        );
+
+        // Preserve the obstructing file, then allow the same real persistence
+        // path to succeed. Its in-memory dedupe entry is not a durable receipt.
+        std::fs::rename(
+            &blocked_parent,
+            directory.path().join("obstruction-evidence"),
+        )
+        .unwrap();
+        record_worker_disk_bypass(
+            &store,
+            Some(&worker),
+            "disk-worker",
+            "incident-a",
+            &roots,
+            "disk full",
+            T0,
+            || {
+                acknowledged.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(acknowledged.load(Ordering::SeqCst), 1);
+        let persisted = BypassRecordStore::load(&path);
+        let record = persisted.get("disk-worker").unwrap();
+        assert_eq!(record.consecutive_failures, 1);
+        assert_eq!(record.disk_roots, roots);
+    }
+
+    #[tokio::test]
+    async fn disk_intent_replay_deduplicates_older_incidents_after_a_new_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("bypasses.json");
+        let store = Arc::new(Mutex::new(BypassRecordStore::with_path(&path)));
+        let pool = pool_with(&["disk-worker"]).await;
+        let worker = pool.get(&WorkerId::new("disk-worker")).await.unwrap();
+        let result = record_worker_disk_bypass(
+            &store,
+            Some(&worker),
+            "disk-worker",
+            "incident-a",
+            &["/build-volume/rch".to_string()],
+            "disk full",
+            T0,
+            || Err(std::io::Error::other("interrupted history acknowledgment")),
+        )
+        .await;
+        assert!(result.is_err());
+        let reloaded = Arc::new(Mutex::new(BypassRecordStore::load(&path)));
+        record_worker_disk_bypass(
+            &reloaded,
+            Some(&worker),
+            "disk-worker",
+            "incident-b",
+            &["/target-volume/rch".to_string()],
+            "disk full",
+            T0 + 1,
+            || Ok(()),
+        )
+        .await
+        .unwrap();
+        record_worker_disk_bypass(
+            &reloaded,
+            Some(&worker),
+            "disk-worker",
+            "incident-a",
+            &["/build-volume/rch".to_string()],
+            "disk full",
+            T0,
+            || Ok(()),
+        )
+        .await
+        .unwrap();
+        let persisted = BypassRecordStore::load(&path);
+        let record = persisted.get("disk-worker").unwrap();
+        assert_eq!(record.consecutive_failures, 2);
+        assert_eq!(record.last_failure_unix_ms, T0 + 1);
+        assert_eq!(
+            record.disk_roots,
+            ["/build-volume/rch", "/target-volume/rch"]
+        );
+    }
+
+    #[tokio::test]
+    async fn disk_recovery_waits_until_pending_completion_intent_is_acknowledged() {
+        let directory = tempfile::tempdir().unwrap();
+        let history = Arc::new(
+            BuildHistory::new(10).with_persistence(directory.path().join("history.jsonl")),
+        );
+        let build = history.start_active_build_with_wrapper(
+            "project".into(),
+            "disk-worker".into(),
+            "cargo build".into(),
+            12345,
+            Some("disk-owner".into()),
+            1,
+            rch_common::BuildLocation::Remote,
+        );
+        history
+            .complete_durable_with_disk_fault(
+                build.id,
+                "disk-worker",
+                Some("disk-owner"),
+                crate::history::BuildCompletion {
+                    exit_code: 101,
+                    duration_ms: Some(10),
+                    bytes_transferred: None,
+                    timing: None,
+                    cancellation: None,
+                },
+                Some(vec!["/build-volume/rch".to_string()]),
+            )
+            .unwrap();
+        let fault = history.pending_disk_fault(build.id).unwrap();
+        let store = Arc::new(Mutex::new(BypassRecordStore::with_path(
+            directory.path().join("bypasses.json"),
+        )));
+        let pool = pool_with(&["disk-worker"]).await;
+        let worker = pool.get(&WorkerId::new("disk-worker")).await.unwrap();
+        assert!(
+            record_worker_disk_bypass(
+                &store,
+                Some(&worker),
+                "disk-worker",
+                &fault.incident_id,
+                &fault.roots,
+                "disk full",
+                T0,
+                || Err(std::io::Error::other("acknowledgment interrupted")),
+            )
+            .await
+            .is_err()
+        );
+        let mut expected = store.lock().await.get("disk-worker").unwrap().clone();
+        expected.auto_rejoin.required_consecutive_passes = 1;
+        store.lock().await.upsert(expected.clone()).unwrap();
+        let service = BypassRecoveryService::new(
+            pool,
+            store.clone(),
+            FakeProber::new(vec![], RecoveryProbe::all_ok(), CanaryOutcome::Passed),
+            BypassRecoveryConfig::default(),
+        )
+        .with_history(history.clone());
+        service.evaluate_once(T0 + 60_000).await;
+        assert_eq!(store.lock().await.get("disk-worker"), Some(&expected));
+        assert!(!worker.lifecycle().await.is_schedulable());
+
+        record_worker_disk_bypass(
+            &store,
+            Some(&worker),
+            "disk-worker",
+            &fault.incident_id,
+            &fault.roots,
+            "disk full",
+            T0,
+            || history.acknowledge_disk_fault(build.id, &fault.incident_id),
+        )
+        .await
+        .unwrap();
+        service.evaluate_once(T0 + 60_000).await;
+        assert!(worker.lifecycle().await.is_schedulable());
+        assert!(!store.lock().await.contains("disk-worker"));
+    }
+
+    #[test]
+    fn disk_fault_roots_preserve_remote_path_semantics_and_refuse_ambiguous_paths() {
+        let roots = vec![
+            "/worker's build volume/rch".to_string(),
+            "C:/rch/builds".to_string(),
+            "/worker's build volume/rch".to_string(),
+        ];
+        assert_eq!(validate_disk_fault_roots(&roots).unwrap().len(), 2);
+        for root in [
+            "",
+            "relative/rch",
+            "/build/../other",
+            "/build/./rch",
+            "/build//rch",
+            "/build/rch/",
+            "/build\nother",
+        ] {
+            assert!(
+                validate_disk_fault_roots(&[root.to_string()]).is_err(),
+                "{root:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn disk_failure_upgrades_existing_bypass_and_cannot_be_forgotten_by_ssh_failure() {
+        let pool = pool_with(&["disk-worker"]).await;
+        let store = store();
+        let worker = pool.get(&WorkerId::new("disk-worker")).await.unwrap();
+        for (index, class) in [
+            BypassFailureClass::Ssh,
+            BypassFailureClass::DiskInodePressure,
+            BypassFailureClass::Ssh,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            record_worker_bypass(
+                &store,
+                &worker,
+                class,
+                "observed failure",
+                T0 + index as u64,
+            )
+            .await;
+            let record = store.lock().await.get("disk-worker").cloned().unwrap();
+            let expected = if index == 0 {
+                BypassFailureClass::Ssh
+            } else {
+                BypassFailureClass::DiskInodePressure
+            };
+            assert_eq!(record.failure_class, expected);
+            assert_eq!(record.reason_code, expected.incident_reason_code());
+            assert_eq!(worker.lifecycle().await.bypass_cause, Some(expected));
+            assert_eq!(worker.lifecycle().await.admin, AdminIntent::Active);
+        }
+    }
+
+    struct FailingDuringRecovery {
+        store: Arc<Mutex<BypassRecordStore>>,
+        during_canary: bool,
+    }
+
+    impl RecoveryProber for FailingDuringRecovery {
+        async fn probe(&self, worker: Arc<WorkerState>, _record: BypassRecord) -> RecoveryProbe {
+            if !self.during_canary {
+                record_worker_bypass(
+                    &self.store,
+                    &worker,
+                    BypassFailureClass::DiskInodePressure,
+                    "new disk failure during probe",
+                    T0 + 60_001,
+                )
+                .await;
+            }
+            RecoveryProbe::all_ok()
+        }
+
+        async fn canary(&self, worker: Arc<WorkerState>) -> CanaryOutcome {
+            assert!(self.during_canary);
+            record_worker_bypass(
+                &self.store,
+                &worker,
+                BypassFailureClass::DiskInodePressure,
+                "new disk failure during canary",
+                T0 + 60_001,
+            )
+            .await;
+            CanaryOutcome::Passed
+        }
+    }
+
+    #[tokio::test]
+    async fn new_disk_failure_supersedes_an_in_flight_healthy_probe_or_canary() {
+        for during_canary in [false, true] {
+            let pool = pool_with(&["disk-worker"]).await;
+            let store = store();
+            let worker = pool.get(&WorkerId::new("disk-worker")).await.unwrap();
+            record_worker_bypass(
+                &store,
+                &worker,
+                BypassFailureClass::Ssh,
+                "initial failure",
+                T0,
+            )
+            .await;
+            let mut initial = store.lock().await.get("disk-worker").cloned().unwrap();
+            initial.auto_rejoin.required_consecutive_passes = 1;
+            initial.auto_rejoin.canary_required = during_canary;
+            store.lock().await.upsert(initial).unwrap();
+            let service = BypassRecoveryService::new(
+                pool,
+                store.clone(),
+                FailingDuringRecovery {
+                    store: store.clone(),
+                    during_canary,
+                },
+                BypassRecoveryConfig::default(),
+            );
+
+            service.evaluate_once(T0 + 60_000).await;
+
+            let latest = store
+                .lock()
+                .await
+                .get("disk-worker")
+                .cloned()
+                .expect("new failure must remain durable");
+            assert_eq!(latest.last_failure_unix_ms, T0 + 60_001);
+            assert_eq!(latest.failure_class, BypassFailureClass::DiskInodePressure);
+            assert_eq!(latest.consecutive_passes, 0);
+            assert_eq!(latest.state, BypassState::TemporaryBypass);
+            assert_eq!(
+                worker.eligibility().await,
+                EligibilityState::TemporaryBypass
+            );
+            assert_eq!(
+                worker.lifecycle().await.bypass_cause,
+                Some(BypassFailureClass::DiskInodePressure)
+            );
+            let persisted = BypassRecordStore::load(store.lock().await.path());
+            assert_eq!(persisted.get("disk-worker"), Some(&latest));
+        }
+    }
+
+    #[test]
+    fn disk_recovery_requires_one_valid_measurement_for_every_configured_root() {
+        let config = BypassRecoveryConfig::default();
+        let mut facts = facts_all_good();
+        assert!(!has_complete_disk_evidence(
+            &ProbedFacts::default(),
+            &config
+        ));
+        assert!(
+            !has_complete_disk_evidence(&facts, &config),
+            "one root is still missing"
+        );
+        for root in config.disk_roots.iter().skip(1) {
+            let mut other = facts.disk_roots[0].clone();
+            other.path.clone_from(root);
+            facts.disk_roots.push(other);
+        }
+        assert!(has_complete_disk_evidence(&facts, &config));
+        assert!(assess_probe_facts(&facts, Some(0.1), true, &config).fully_healthy());
+        for (total, free) in [(0, 0), (GB, 2 * GB)] {
+            let mut invalid = facts.clone();
+            invalid.disk_roots[1].total_bytes = total;
+            invalid.disk_roots[1].available_bytes = free;
+            assert!(!has_complete_disk_evidence(&invalid, &config));
+        }
+        let mut duplicate = facts.clone();
+        duplicate.disk_roots.push(facts.disk_roots[0].clone());
+        assert!(!has_complete_disk_evidence(&duplicate, &config));
+        facts.disk_roots[1].available_bytes = GB;
+        assert!(has_complete_disk_evidence(&facts, &config));
+        assert!(!assess_probe_facts(&facts, Some(0.1), true, &config).disk_ok);
     }
 
     #[tokio::test]

@@ -59,6 +59,20 @@ const MAX_TERMINAL_RECEIPTS: usize = 500;
 struct TerminalOwnership {
     record: BuildRecord,
     local_wrapper_id: Option<String>,
+    /// Completion must not erase an owner-validated infrastructure fault
+    /// before its worker quarantine is durable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pending_disk_fault: Option<PendingDiskFault>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PendingDiskFault {
+    pub build_id: u64,
+    pub worker_id: String,
+    pub incident_id: String,
+    pub roots: Vec<String>,
+    pub reported_unix_ms: u64,
 }
 
 /// Terminal result supplied by completion or cancellation; ownership stays separate.
@@ -263,6 +277,9 @@ pub struct BuildHistory {
     cancelled_wrappers: RwLock<HashSet<String>>,
     /// When each active build's heartbeat was last made durable.
     heartbeat_persisted: Mutex<HashMap<u64, Instant>>,
+    /// A duplicate release may resume a fault, but never race the first
+    /// completion's slot release or its quarantine acknowledgment.
+    release_lock: tokio::sync::Mutex<()>,
     ownership_failed: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     fail_after_ownership_rename: std::sync::atomic::AtomicBool,
@@ -295,6 +312,7 @@ impl BuildHistory {
             terminal: RwLock::new(HashMap::new()),
             cancelled_wrappers: RwLock::new(HashSet::new()),
             heartbeat_persisted: Mutex::new(HashMap::new()),
+            release_lock: tokio::sync::Mutex::new(()),
             ownership_failed: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             fail_after_ownership_rename: std::sync::atomic::AtomicBool::new(false),
@@ -529,6 +547,14 @@ impl BuildHistory {
 
         let mut active = self.active.write().unwrap_or_else(|e| e.into_inner());
         if self.ownership_failed() {
+            return Ok(None);
+        }
+        // Completion publishes its terminal disk intent under this same
+        // active lock, before it can await the separate bypass-store lock.
+        // Recovery may meanwhile have promoted the worker from an older
+        // healthy probe. Its transient lifecycle must not authorize a new
+        // build while the newer fault is still awaiting durable quarantine.
+        if self.has_pending_disk_fault(&state.worker_id) {
             return Ok(None);
         }
         {
@@ -1570,6 +1596,29 @@ impl BuildHistory {
                 }
                 for receipt in snapshot.completed {
                     let id = receipt.record.id;
+                    if let Some(fault) = &receipt.pending_disk_fault {
+                        let normalized =
+                            crate::bypass_recovery_service::validate_disk_fault_roots(&fault.roots)
+                                .map_err(|error| {
+                                    std::io::Error::new(
+                                        std::io::ErrorKind::InvalidData,
+                                        error.to_string(),
+                                    )
+                                })?;
+                        if fault.build_id != id
+                            || receipt.record.worker_id.as_deref() != Some(fault.worker_id.as_str())
+                            || fault.worker_id.is_empty()
+                            || receipt.record.exit_code == 0
+                            || fault.incident_id
+                                != format!("build:{id}:{}", receipt.record.completed_at)
+                            || fault.roots != normalized
+                        {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "invalid terminal worker disk fault",
+                            ));
+                        }
+                    }
                     // Terminal attempts keep their own build IDs. Sequential
                     // worker failover may legitimately reuse a wrapper ID, so
                     // do not compare these wrappers with active_wrappers.
@@ -1660,6 +1709,7 @@ impl BuildHistory {
             terminal: RwLock::new(terminal),
             cancelled_wrappers: RwLock::new(cancelled_wrappers),
             heartbeat_persisted: Mutex::new(HashMap::new()),
+            release_lock: tokio::sync::Mutex::new(()),
             ownership_failed: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             fail_after_ownership_rename: std::sync::atomic::AtomicBool::new(false),
@@ -1744,6 +1794,78 @@ impl BuildHistory {
             .contains_key(&build_id)
     }
 
+    pub(crate) async fn lock_releases(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.release_lock.lock().await
+    }
+
+    pub(crate) fn pending_disk_faults(&self) -> Vec<PendingDiskFault> {
+        let mut faults: Vec<_> = self
+            .terminal
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .filter_map(|receipt| receipt.pending_disk_fault.clone())
+            .collect();
+        faults.sort_by_key(|fault| fault.build_id);
+        faults
+    }
+
+    pub(crate) fn pending_disk_fault(&self, build_id: u64) -> Option<PendingDiskFault> {
+        self.terminal
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&build_id)
+            .and_then(|receipt| receipt.pending_disk_fault.clone())
+    }
+
+    pub fn has_pending_disk_fault(&self, worker_id: &str) -> bool {
+        self.terminal
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .any(|receipt| {
+                receipt
+                    .pending_disk_fault
+                    .as_ref()
+                    .is_some_and(|fault| fault.worker_id == worker_id)
+            })
+    }
+
+    /// The caller holds the bypass store lock until this commit finishes, so
+    /// recovery cannot erase its incident receipt before acknowledgment.
+    pub(crate) fn acknowledge_disk_fault(
+        &self,
+        build_id: u64,
+        incident_id: &str,
+    ) -> std::io::Result<()> {
+        let active = self.active.write().unwrap_or_else(|e| e.into_inner());
+        let mut receipt = self
+            .terminal
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&build_id)
+            .cloned()
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::NotFound, "terminal build not found")
+            })?;
+        let Some(fault) = &receipt.pending_disk_fault else {
+            return Ok(());
+        };
+        if fault.incident_id != incident_id {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "worker disk fault identity mismatch",
+            ));
+        }
+        receipt.pending_disk_fault = None;
+        self.persist_ownership(&active, Some(&receipt))?;
+        self.terminal
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(build_id, receipt);
+        Ok(())
+    }
+
     /// One locked transition owns both the durable terminal receipt and release.
     pub fn complete_durable(
         &self,
@@ -1751,6 +1873,19 @@ impl BuildHistory {
         worker_id: &str,
         wrapper: Option<&str>,
         completion: BuildCompletion,
+    ) -> std::io::Result<Option<(ActiveBuildState, BuildRecord)>> {
+        self.complete_durable_with_disk_fault(build_id, worker_id, wrapper, completion, None)
+    }
+
+    /// Commit a fault with its exact owner's terminal receipt. Repeated
+    /// requests can only resume that stored fault, never add or replace it.
+    pub(crate) fn complete_durable_with_disk_fault(
+        &self,
+        build_id: u64,
+        worker_id: &str,
+        wrapper: Option<&str>,
+        completion: BuildCompletion,
+        disk_roots: Option<Vec<String>>,
     ) -> std::io::Result<Option<(ActiveBuildState, BuildRecord)>> {
         let BuildCompletion {
             exit_code,
@@ -1794,9 +1929,31 @@ impl BuildHistory {
             timing,
             cancellation,
         };
+        let pending_disk_fault = if exit_code != 0 {
+            disk_roots
+                .map(|roots| {
+                    crate::bypass_recovery_service::validate_disk_fault_roots(&roots).map(|roots| {
+                        PendingDiskFault {
+                            build_id,
+                            worker_id: worker_id.to_owned(),
+                            incident_id: format!("build:{build_id}:{}", record.completed_at),
+                            roots,
+                            reported_unix_ms: u64::try_from(Utc::now().timestamp_millis())
+                                .unwrap_or(0),
+                        }
+                    })
+                })
+                .transpose()
+                .map_err(|error| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string())
+                })?
+        } else {
+            None
+        };
         let receipt = TerminalOwnership {
             record: record.clone(),
             local_wrapper_id: state.local_wrapper_id.clone(),
+            pending_disk_fault,
         };
         prune_terminal_receipts(
             &mut self.terminal.write().unwrap_or_else(|e| e.into_inner()),
@@ -1884,7 +2041,12 @@ impl BuildHistory {
                 .filter(|state| completed.is_none_or(|receipt| receipt.record.id != state.id))
                 .cloned()
                 .collect(),
-            completed: terminal.values().chain(completed).cloned().collect(),
+            completed: terminal
+                .values()
+                .filter(|receipt| completed.is_none_or(|new| new.record.id != receipt.record.id))
+                .chain(completed)
+                .cloned()
+                .collect(),
             cancelled_wrappers: self
                 .cancelled_wrappers
                 .read()
@@ -1943,14 +2105,16 @@ fn occupied_wrapper_ids(
 fn prune_terminal_receipts(terminal: &mut HashMap<u64, TerminalOwnership>, now: DateTime<Utc>) {
     let cutoff = now - ChronoDuration::days(TERMINAL_RECEIPT_RETENTION_DAYS);
     terminal.retain(|_, receipt| {
-        DateTime::parse_from_rfc3339(&receipt.record.completed_at)
-            .map_or(true, |completed| completed >= cutoff)
+        receipt.pending_disk_fault.is_some()
+            || DateTime::parse_from_rfc3339(&receipt.record.completed_at)
+                .map_or(true, |completed| completed >= cutoff)
     });
     let Some(excess) = terminal.len().checked_sub(MAX_TERMINAL_RECEIPTS) else {
         return;
     };
     let mut by_age: Vec<_> = terminal
         .iter()
+        .filter(|(_, receipt)| receipt.pending_disk_fault.is_none())
         .map(|(id, receipt)| {
             (
                 DateTime::parse_from_rfc3339(&receipt.record.completed_at).ok(),
@@ -2950,6 +3114,7 @@ mod tests {
                 TerminalOwnership {
                     record,
                     local_wrapper_id: None,
+                    pending_disk_fault: None,
                 },
             )
         };
@@ -2966,6 +3131,224 @@ mod tests {
             !terminal.contains_key(&(MAX_TERMINAL_RECEIPTS as u64 + 10)),
             "oldest kept"
         );
+    }
+
+    #[tokio::test]
+    async fn disk_fault_intent_is_owned_durable_and_cannot_be_replaced_by_a_retry() {
+        let temporary = TempDir::new().unwrap();
+        let path = temporary.path().join("history.jsonl");
+        let history = BuildHistory::new(10).with_persistence(path.clone());
+        let build = history.start_active_build_with_wrapper(
+            "project".into(),
+            "worker".into(),
+            "cargo build".into(),
+            12345,
+            Some("owner".into()),
+            2,
+            BuildLocation::Remote,
+        );
+        let completion = || BuildCompletion {
+            exit_code: 101,
+            duration_ms: Some(10),
+            bytes_transferred: None,
+            timing: None,
+            cancellation: None,
+        };
+        for (worker, wrapper, roots) in [
+            ("other-worker", "owner", vec!["/build-volume/rch".into()]),
+            ("worker", "other-owner", vec!["/build-volume/rch".into()]),
+            ("worker", "owner", vec!["../relative".into()]),
+        ] {
+            assert!(
+                history
+                    .complete_durable_with_disk_fault(
+                        build.id,
+                        worker,
+                        Some(wrapper),
+                        completion(),
+                        Some(roots),
+                    )
+                    .is_err()
+            );
+            assert!(history.active_build(build.id).is_some());
+            assert!(!history.has_pending_disk_fault("worker"));
+        }
+        history
+            .complete_durable_with_disk_fault(
+                build.id,
+                "worker",
+                Some("owner"),
+                completion(),
+                Some(vec!["/build-volume/rch".into(), "/build-volume/rch".into()]),
+            )
+            .unwrap()
+            .unwrap();
+        let fault = history.pending_disk_fault(build.id).unwrap();
+        assert_eq!(fault.roots, ["/build-volume/rch"]);
+        let restored = BuildHistory::load_from_file(&path, 10).unwrap();
+        assert!(restored.active_build(build.id).is_none());
+        assert_eq!(restored.pending_disk_fault(build.id), Some(fault.clone()));
+        assert!(
+            restored
+                .complete_durable_with_disk_fault(
+                    build.id,
+                    "worker",
+                    Some("owner"),
+                    completion(),
+                    Some(vec!["../untrusted-retry".into()]),
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(restored.pending_disk_fault(build.id), Some(fault.clone()));
+        assert!(
+            restored
+                .acknowledge_disk_fault(build.id, "wrong-incident")
+                .is_err()
+        );
+        restored
+            .acknowledge_disk_fault(build.id, &fault.incident_id)
+            .unwrap();
+        restored
+            .acknowledge_disk_fault(build.id, &fault.incident_id)
+            .unwrap();
+        let acknowledged = BuildHistory::load_from_file(&path, 10).unwrap();
+        assert!(acknowledged.pending_disk_faults().is_empty());
+        assert!(acknowledged.has_terminal_build(build.id));
+    }
+
+    #[tokio::test]
+    async fn disk_fault_pending_receipt_survives_retention_and_uncertain_acknowledgment() {
+        let temporary = TempDir::new().unwrap();
+        let path = temporary.path().join("history.jsonl");
+        let history = BuildHistory::new(10).with_persistence(path.clone());
+        let build = history.start_active_build_with_wrapper(
+            "project".into(),
+            "worker".into(),
+            "gcc main.c".into(),
+            12345,
+            Some("owner".into()),
+            1,
+            BuildLocation::Remote,
+        );
+        history
+            .complete_durable_with_disk_fault(
+                build.id,
+                "worker",
+                Some("owner"),
+                BuildCompletion {
+                    exit_code: 1,
+                    duration_ms: None,
+                    bytes_transferred: None,
+                    timing: None,
+                    cancellation: None,
+                },
+                Some(vec!["/build-volume/rch".into()]),
+            )
+            .unwrap();
+        // A fault that was never delivered cannot expire as routine history.
+        {
+            let mut terminal = history.terminal.write().unwrap();
+            prune_terminal_receipts(&mut terminal, Utc::now() + ChronoDuration::days(4));
+            assert!(terminal.contains_key(&build.id));
+        }
+        let fault = history.pending_disk_fault(build.id).unwrap();
+        history
+            .fail_after_ownership_rename
+            .store(true, Ordering::SeqCst);
+        assert!(
+            history
+                .acknowledge_disk_fault(build.id, &fault.incident_id)
+                .is_err()
+        );
+        assert!(history.ownership_failed());
+        assert!(history.has_pending_disk_fault("worker"));
+        // The renamed file may have committed. Only a restart resolves that
+        // uncertainty; it must not resurrect an active owner or duplicate ID.
+        let restored = BuildHistory::load_from_file(&path, 10).unwrap();
+        assert!(!restored.has_pending_disk_fault("worker"));
+        assert!(restored.has_terminal_build(build.id));
+        assert!(restored.active_builds().is_empty());
+    }
+
+    #[tokio::test]
+    async fn disk_fault_pending_intent_fences_transient_healthy_admission_until_acknowledged() {
+        let temporary = TempDir::new().unwrap();
+        let path = temporary.path().join("history.jsonl");
+        let history = BuildHistory::new(10).with_persistence(path.clone());
+        let failed = history.start_active_build_with_wrapper(
+            "failed-project".into(),
+            "worker".into(),
+            "cargo build".into(),
+            12345,
+            Some("failed-owner".into()),
+            2,
+            BuildLocation::Remote,
+        );
+        let running = history.start_active_build_with_wrapper(
+            "running-project".into(),
+            "worker".into(),
+            "cargo build".into(),
+            12346,
+            Some("running-owner".into()),
+            7,
+            BuildLocation::Remote,
+        );
+        history
+            .complete_durable_with_disk_fault(
+                failed.id,
+                "worker",
+                Some("failed-owner"),
+                BuildCompletion {
+                    exit_code: 101,
+                    duration_ms: None,
+                    bytes_transferred: None,
+                    timing: None,
+                    cancellation: None,
+                },
+                Some(vec!["/build-volume/rch".into()]),
+            )
+            .unwrap()
+            .unwrap();
+        let fault = history.pending_disk_fault(failed.id).unwrap();
+        let durable_before = std::fs::read(path.with_extension("ownership.json")).unwrap();
+        let attempt = |history: &BuildHistory| {
+            history.try_start_active_build_with_wrapper(
+                "new-project".into(),
+                "worker".into(),
+                "cargo build".into(),
+                12347,
+                Some("new-owner".into()),
+                4,
+                BuildLocation::Remote,
+            )
+        };
+        // This is the race's exact admission boundary: a stale healthy
+        // selection reaches history while the completed fault is waiting for
+        // the bypass-store lock. No lifecycle flag is trusted by this fence.
+        assert!(attempt(&history).unwrap().is_none());
+        let held = history.active_builds();
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].id, running.id);
+        assert_eq!(held[0].slots, 7, "another build's reservation stays owned");
+        assert_eq!(
+            std::fs::read(path.with_extension("ownership.json")).unwrap(),
+            durable_before
+        );
+        assert_eq!(history.pending_disk_fault(failed.id), Some(fault.clone()));
+
+        let restored = BuildHistory::load_from_file(&path, 10).unwrap();
+        assert!(
+            attempt(&restored).unwrap().is_none(),
+            "restart preserves the admission fence"
+        );
+        restored
+            .acknowledge_disk_fault(failed.id, &fault.incident_id)
+            .unwrap();
+        let admitted = attempt(&restored).unwrap().unwrap();
+        assert_eq!(admitted.local_wrapper_id.as_deref(), Some("new-owner"));
+        assert_eq!(restored.active_build(running.id).unwrap().slots, 7);
+        assert_eq!(restored.active_builds().len(), 2);
     }
 
     #[test]

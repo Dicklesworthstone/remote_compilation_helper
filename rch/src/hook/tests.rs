@@ -3910,6 +3910,28 @@ The file `x11.pc` needs to be installed and the PKG_CONFIG_PATH environment vari
 }
 
 #[test]
+fn remote_disk_exhaustion_requires_a_failed_execution_and_covers_quota_errors() {
+    for stderr in [
+        "error: failed to write: No space left on device (os error 28)",
+        "ld: output failed: ENOSPC",
+        "rustup: Disk quota exceeded",
+        "error[E0308]: mismatched types\nerror: write failed: no space left on device",
+    ] {
+        assert!(remote_failure_is_disk_full(stderr, 101), "{stderr}");
+        assert!(remote_failure_is_worker_fault(stderr, 101), "{stderr}");
+        assert!(!remote_failure_is_disk_full(stderr, 0), "{stderr}");
+    }
+    for stderr in [
+        "error[E0308]: mismatched types",
+        "test result: FAILED. 3 passed; 1 failed",
+        "error: Permission denied (os error 13)",
+        "",
+    ] {
+        assert!(!remote_failure_is_disk_full(stderr, 101), "{stderr}");
+    }
+}
+
+#[test]
 fn test_remote_failure_is_worker_fault_separates_worker_breakage_from_project_errors() {
     let _guard = test_guard!();
     // Review of GH #81: only these failures withhold the daemon's cache

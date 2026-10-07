@@ -3111,50 +3111,49 @@ pub async fn run_exec(
 
             // Recover one daemon, then keep that endpoint for selection,
             // heartbeats, retries and releases throughout this operation.
-            let retry =
-                if let Ok(recovered_socket) =
-                    auto_start::try_auto_start_daemon(&config.self_healing, Path::new(&socket_path))
-                        .await
-                {
-                    config.general.socket_path = recovered_socket.to_string_lossy().into_owned();
-                    // The original endpoint's restart gate says nothing about
-                    // a daemon discovered in another runtime-directory context.
-                    if restart_admission_is_closed(&config.general.socket_path)
-                        .await
-                        .unwrap_or(false)
-                    {
-                        durable_lease.heartbeat("restart_admission_blocked")?;
-                        anyhow::bail!(
-                            "remote build admission is paused while daemon restart remediation is active"
-                        );
-                    }
-                    match query_daemon(
-                        &config.general.socket_path,
-                        &selection_project,
-                        estimated_cores,
-                        &remote_command,
-                        toolchain.as_ref(),
-                        required_runtime,
-                        command_priority,
-                        0,
-                        Some(std::process::id()),
-                        Some(&wrapper_id),
-                        wait_for_worker,
-                        &preferred_workers,
-                        classification.kind == Some(CompilationKind::Job),
-                        &required_tools,
-                    )
+            let retry = if let Ok(recovered_socket) =
+                auto_start::try_auto_start_daemon(&config.self_healing, Path::new(&socket_path))
                     .await
-                    {
-                        Ok(response) => Some(response),
-                        Err(error) => {
-                            let _ = selection_error_for_recovery(error, &durable_lease)?;
-                            None
-                        }
+            {
+                config.general.socket_path = recovered_socket.to_string_lossy().into_owned();
+                // The original endpoint's restart gate says nothing about
+                // a daemon discovered in another runtime-directory context.
+                if restart_admission_is_closed(&config.general.socket_path)
+                    .await
+                    .unwrap_or(false)
+                {
+                    durable_lease.heartbeat("restart_admission_blocked")?;
+                    anyhow::bail!(
+                        "remote build admission is paused while daemon restart remediation is active"
+                    );
+                }
+                match query_daemon(
+                    &config.general.socket_path,
+                    &selection_project,
+                    estimated_cores,
+                    &remote_command,
+                    toolchain.as_ref(),
+                    required_runtime,
+                    command_priority,
+                    0,
+                    Some(std::process::id()),
+                    Some(&wrapper_id),
+                    wait_for_worker,
+                    &preferred_workers,
+                    classification.kind == Some(CompilationKind::Job),
+                    &required_tools,
+                )
+                .await
+                {
+                    Ok(response) => Some(response),
+                    Err(error) => {
+                        let _ = selection_error_for_recovery(error, &durable_lease)?;
+                        None
                     }
-                } else {
-                    None
-                };
+                }
+            } else {
+                None
+            };
 
             match decide_recovery_action(retry.is_some(), strict_remote) {
                 // Daemon came back after autostart + retry — proceed remotely.
@@ -3437,6 +3436,9 @@ pub async fn run_exec(
         let release_worker_fault = result
             .as_ref()
             .is_ok_and(|ok| remote_failure_is_worker_fault(&ok.stderr, ok.exit_code));
+        let release_worker_disk_full = result
+            .as_ref()
+            .is_ok_and(|ok| remote_failure_is_disk_full(&ok.stderr, ok.exit_code));
         let release_acknowledged = if retain_unconfirmed_ownership {
             warn!(
                 "Remote completion unconfirmed; retaining build {} ownership",
@@ -3455,6 +3457,8 @@ pub async fn run_exec(
                 release_timing.as_ref(),
                 Some(&wrapper_id),
                 release_worker_fault,
+                release_worker_disk_full,
+                result.as_ref().map_or(&[], |ok| ok.disk_roots.as_slice()),
             )
             .await
             {
@@ -4216,8 +4220,8 @@ mod remote_result;
 use remote_result::{
     ExecResultDirStat, ExecResultEnvelope, detect_cargo_workspace_inheritance_failure,
     detect_worker_system_dependency_failure, emit_exec_envelope, is_cpu_capability_signal,
-    is_signal_killed, is_toolchain_failure, remote_failure_is_worker_fault, set_machine_output,
-    signal_name, wrapped_cpu_capability_signal,
+    is_signal_killed, is_toolchain_failure, remote_failure_is_disk_full,
+    remote_failure_is_worker_fault, set_machine_output, signal_name, wrapped_cpu_capability_signal,
 };
 
 // The remote cargo target-dir resolution / naming / command-rewrite cluster
@@ -4665,7 +4669,7 @@ async fn handle_selection_response(
             "Remote completion unconfirmed; retaining worker {} ownership",
             worker.id
         );
-    } else if let Err(e) = release_worker(
+    } else if let Err(e) = release_worker_with_fault(
         &config.general.socket_path,
         &worker.id,
         estimated_cores,
@@ -4675,6 +4679,13 @@ async fn handle_selection_response(
         None,
         release_timing.as_ref(),
         None,
+        result
+            .as_ref()
+            .is_ok_and(|ok| remote_failure_is_worker_fault(&ok.stderr, ok.exit_code)),
+        result
+            .as_ref()
+            .is_ok_and(|ok| remote_failure_is_disk_full(&ok.stderr, ok.exit_code)),
+        result.as_ref().map_or(&[], |ok| ok.disk_roots.as_slice()),
     )
     .await
     {

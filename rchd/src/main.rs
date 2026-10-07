@@ -1392,6 +1392,10 @@ async fn main() -> Result<()> {
         admission_barrier: Arc::new(RwLock::new(false)),
     };
 
+    // Replay disk-fault intents saved atomically with terminal ownership
+    // before any cleanup/recovery service or API can reopen admission.
+    api::replay_pending_disk_faults(&context).await?;
+
     // Retain the cancellation task separately from the worker-pruning task.
     // Its typed handle must be joined before shutdown stops receiving heartbeats.
     let active_cleanup = cleanup::ActiveBuildCleanup::new(context.clone());
@@ -1493,7 +1497,9 @@ async fn main() -> Result<()> {
         bypass_store.clone(),
         bypass_prober,
         bypass_config,
-    );
+    )
+    .with_history(context.history.clone());
+    bypass_recovery.reconcile_on_start().await;
     let _bypass_recovery_handle = bypass_recovery.start();
     info!("Bypass recovery service started");
 

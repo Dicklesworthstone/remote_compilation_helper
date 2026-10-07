@@ -646,6 +646,8 @@ pub(crate) async fn release_worker(
         timing,
         local_wrapper_id,
         false,
+        false,
+        &[],
     )
     .await
 }
@@ -653,7 +655,8 @@ pub(crate) async fn release_worker(
 /// [`release_worker`] for a completed remote run, also telling the daemon
 /// whether the failure blamed the worker (`worker_fault`, see
 /// `remote_failure_is_worker_fault`). The daemon then records no cache warmth
-/// for it. Older daemons ignore the unknown query parameter.
+/// for it. Confirmed disk exhaustion also enters temporary bypass until the
+/// recovery service measures headroom. Older daemons ignore unknown parameters.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn release_worker_with_fault(
     socket_path: &str,
@@ -666,6 +669,8 @@ pub(crate) async fn release_worker_with_fault(
     timing: Option<&CommandTimingBreakdown>,
     local_wrapper_id: Option<&str>,
     worker_fault: bool,
+    worker_disk_full: bool,
+    worker_disk_roots: &[String],
 ) -> anyhow::Result<()> {
     if !Path::new(socket_path).exists() {
         anyhow::bail!("daemon socket is missing; release was not acknowledged");
@@ -704,6 +709,13 @@ pub(crate) async fn release_worker_with_fault(
     }
     if worker_fault {
         request.push_str("&worker_fault=1");
+    }
+    if worker_disk_full {
+        request.push_str("&worker_disk_full=1");
+        request.push_str(&format!(
+            "&worker_disk_roots={}",
+            urlencoding_encode(&serde_json::to_string(worker_disk_roots)?)
+        ));
     }
     request.push('\n');
 
@@ -1214,7 +1226,9 @@ mod bounded_ipc_tests {
     async fn release_carries_the_worker_fault_flag_only_when_set() {
         // Review of GH #81: the daemon withholds cache warmth for a failure
         // the hook blamed on the worker, so the flag must reach the wire.
-        for worker_fault in [true, false] {
+        for (worker_fault, worker_disk_full) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
             let root = tempfile::tempdir().unwrap().keep();
             let path = root.join("ipc.sock");
             let listener = tokio::net::UnixListener::bind(&path).unwrap();
@@ -1241,6 +1255,8 @@ mod bounded_ipc_tests {
                 None,
                 None,
                 worker_fault,
+                worker_disk_full,
+                &[],
             );
             let (result, request) = timeout(Duration::from_secs(2), async {
                 tokio::join!(client, server)
@@ -1255,6 +1271,11 @@ mod bounded_ipc_tests {
             assert_eq!(
                 request.contains("&worker_fault=1"),
                 worker_fault,
+                "{request}"
+            );
+            assert_eq!(
+                request.contains("&worker_disk_full=1"),
+                worker_disk_full,
                 "{request}"
             );
         }

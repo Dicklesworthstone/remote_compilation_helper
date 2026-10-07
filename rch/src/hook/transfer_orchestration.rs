@@ -2777,6 +2777,13 @@ async fn execute_remote_compilation_inner(
         .into());
     }
 
+    let mut disk_roots: Vec<String> = sync_plan
+        .iter()
+        .map(|entry| entry.remote_root.clone())
+        .collect();
+    disk_roots.push(pipeline.remote_cargo_target_dir());
+    disk_roots.sort();
+    disk_roots.dedup();
     Ok(RemoteExecutionResult {
         deadline_triggered: exit_code == 137 && deadline_triggered.get(),
         exit_code,
@@ -2784,6 +2791,7 @@ async fn execute_remote_compilation_inner(
         duration_ms: result.duration_ms,
         timing,
         result_dirs: exec_dir_stats,
+        disk_roots,
     })
 }
 
