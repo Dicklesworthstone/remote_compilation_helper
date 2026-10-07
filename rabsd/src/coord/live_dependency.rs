@@ -35,7 +35,9 @@ use crate::coord::live::{
     ActionSubmission, CoordLive, ExpectedOutputs, ServeMode, ServeOutcome, SubmissionRefusal,
     load_manifest,
 };
-use crate::edge::live_facts::{DependencyFacts, FileSig, PACKAGE_ROOT, PackageFacts, read_stable};
+use crate::edge::live_facts::{
+    DependencyFacts, FileSig, GENERATED_ROOT, PACKAGE_ROOT, PackageFacts, read_stable,
+};
 use rabs_action::state_machines::AttemptState;
 use rabs_cas::blob_store::{DurabilityPolicy, PutLimits, put_if_absent};
 use rabs_cas::digest_set::{DigestRequest, digest_set};
@@ -165,6 +167,7 @@ impl PendingServe {
             .request
             .package
             .verify_unchanged(Path::new(&plan.source_root))
+            .and_then(|()| self.request.package.verify_generated_disjoint(plan))
             .and_then(|()| self.request.dependencies.verify_unchanged())
         {
             return InstallResult::Declined(reason);
@@ -225,6 +228,14 @@ fn expected_outputs(plan: &DependencyActionPlan) -> ExpectedOutputs {
             .map(|(real, canonical)| (canonical.into_bytes(), real.into_bytes()))
             .collect(),
     }
+}
+
+fn mappings_for_plan(plan: &DependencyActionPlan) -> Vec<(String, String)> {
+    let mut mappings = vec![(PACKAGE_ROOT.to_owned(), plan.source_virtual_root())];
+    if plan.generated_root.is_some() {
+        mappings.push((GENERATED_ROOT.to_owned(), plan.generated_virtual_root()));
+    }
+    mappings
 }
 
 /// What happened to a completed local attempt.
@@ -556,11 +567,12 @@ impl LiveDependencyLane {
                 })
                 .map_err(|error| format!("action entry: {error:?}"))?;
         }
+        let mappings = mappings_for_plan(&request.plan);
         let submission = ActionSubmission::from_snapshot(
             request.key.descriptor.clone(),
             &request.inputs,
             Arc::clone(&request.package.snapshot),
-            &[(PACKAGE_ROOT.to_owned(), request.plan.source_virtual_root())],
+            &mappings,
         )
         .map_err(refusal)?;
         if submission.key() != key {
@@ -721,14 +733,9 @@ impl LocalAttempt {
         self.request
             .package
             .verify_unchanged(Path::new(&plan.source_root))?;
+        self.request.package.verify_generated_disjoint(plan)?;
         self.request.dependencies.verify_unchanged()?;
-        let members = self
-            .request
-            .package
-            .snapshot
-            .manifest(PACKAGE_ROOT)
-            .ok_or("sealed package lost its root")?;
-
+        let input_roots = mappings_for_plan(plan);
         // Harvest every declared output (and nothing else).
         let mut harvested = Vec::new();
         for declaration in &plan.outputs.declarations {
@@ -736,11 +743,14 @@ impl LocalAttempt {
             let (sig, raw) = read_stable(&path, MAX_OUTPUT_BYTES)
                 .map_err(|error| format!("output {}: {error}", declaration.virtual_path))?;
             let committed_bytes = if declaration.class == OutputClass::DepInfo {
-                if let Some(violation) = dep_info_closure_violation(plan, &raw, |relative| {
-                    matches!(
-                        members.members.get(relative),
-                        Some(rabs_sandbox::snapshot_capture::MemberKind::Regular { .. })
-                    )
+                if let Some(violation) = dep_info_closure_violation(plan, &raw, |virtual_path| {
+                    input_roots.iter().any(|(logical, visible)| {
+                        virtual_path.strip_prefix(&format!("{visible}/")).is_some_and(|relative| {
+                            self.request.package.snapshot.manifest(logical).is_some_and(|manifest| {
+                                matches!(manifest.members.get(relative), Some(rabs_sandbox::snapshot_capture::MemberKind::Regular { .. }))
+                            })
+                        })
+                    })
                 }) {
                     return Err(format!("closure: {violation}"));
                 }
@@ -788,6 +798,8 @@ impl LocalAttempt {
                 "package_root": plan.package_root,
                 "source_root": plan.source_root,
                 "source_kind": plan.source_kind.as_str(),
+                "generated_root": plan.generated_root,
+                "build_script_output": self.request.package.build_script_output,
                 "package_closure_sha256": hex(&self.request.package.snapshot.closure_digest()),
                 "input_manifest": digest_key(&self.request.key.descriptor.action_inputs),
             }))

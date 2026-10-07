@@ -22,8 +22,11 @@
 //!   `<cargo-home>/git/checkouts/<repository>/<revision>[/<member>]`;
 //!   rustc's working directory is `CARGO_MANIFEST_DIR`, `--cap-lints allow`
 //!   is present and `CARGO_PRIMARY_PACKAGE` is absent;
-//! - no build script output (`OUT_DIR` absent) — build-script crates need
-//!   the N-epic run cache before they can be served;
+//! - build scripts themselves still run normally; a compiler may consume
+//!   their complete, separately captured `OUT_DIR` tree. Its exact path and
+//!   environment value remain semantic inputs, never placement aliases;
+//!   Cargo's completed run record is bound to that tree and keyed too;
+//!   rustc-env directives outside the keyed environment refuse serving;
 //! - `lib`/`rlib` outputs only, through the bounded
 //!   [`derive_dependency_output_declarations`] adapter (Cargo's detached
 //!   metadata mode is modeled; other unstable output controls, incremental
@@ -110,7 +113,7 @@ pub const DOMAIN_LIVE_CWD: &str = "rabs.live-dependency.cwd.v1";
 /// Negative-dependency component domain.
 pub const DOMAIN_LIVE_NEGATIVE: &str = "rabs.live-dependency.negative.v1";
 /// Dependency-artifact component domain (inputs + name binding).
-pub const DOMAIN_LIVE_ARTIFACTS: &str = "rabs.live-dependency.artifacts.v2";
+pub const DOMAIN_LIVE_ARTIFACTS: &str = "rabs.live-dependency.artifacts.v3";
 /// Sandbox/isolation policy component domain.
 pub const DOMAIN_LIVE_ISOLATION: &str = "rabs.live-dependency.isolation.v1";
 /// Execution-semantics component domain.
@@ -121,23 +124,27 @@ pub const DOMAIN_LIVE_TARGET_SPEC: &str = "rabs.live-dependency.target-spec.v1";
 /// The registry isolation profile. Deliberately plain: it is NOT a
 /// sandbox, and the key says so. V2 requires new evidence after closing
 /// warm-root symlink and leave-and-reenter dep-info traversal gaps.
-pub const ISOLATION_PROFILE: &str = "live-dependency-v3: unsandboxed local edge process; \
+pub const ISOLATION_PROFILE: &str = "live-dependency-v4: unsandboxed local edge process; \
      environment constructed by dependency-env-v1 (allowlisted names keyed, jobserver \
      passthrough unkeyed, all other names absent); source = complete registry package \
      tree with a real directory root revalidated on every observation; closure enforced \
      after execution by dep-info traversal bounded to the observed source root; proc-macro \
-     consumption and build-script outputs refused; exact regular Rust dependency \
+     consumption refused; generated compiler inputs captured as a complete disjoint \
+     regular-file OUT_DIR tree, with exact OUT_DIR spelling keyed and generation revalidated; \
+     build-script execution is not cached; exact regular Rust dependency \
      directory candidates revalidated before serving and after execution";
 
 /// Git checkout capture includes all source members, including dirty and
 /// untracked files, but never authorizes reads of Git metadata.
-pub const GIT_ISOLATION_PROFILE: &str = "live-git-dependency-v2: unsandboxed local edge process; \
+pub const GIT_ISOLATION_PROFILE: &str = "live-git-dependency-v3: unsandboxed local edge process; \
      environment constructed by dependency-env-v1 (allowlisted names keyed, jobserver \
      passthrough unkeyed, all other names absent); source = complete Cargo Git checkout \
      tree including dirty and untracked source files, root .git excluded before capture; \
      real directory root revalidated on every observation; closure enforced after execution \
      by dep-info traversal bounded to the observed source root, Git metadata reads refused; \
-     proc-macro consumption and build-script outputs refused; exact regular Rust dependency \
+     proc-macro consumption refused; generated compiler inputs captured as a complete disjoint \
+     regular-file OUT_DIR tree, with exact OUT_DIR spelling keyed and generation revalidated; \
+     build-script execution is not cached; exact regular Rust dependency \
      directory candidates revalidated before serving and after execution";
 
 /// What the executed compiler must produce for a publishable result.
@@ -163,12 +170,11 @@ const FIXED_KEYED_NAMES: &[&str] = &[
     "SOURCE_DATE_EPOCH",
     "DOCS_RS",
     "LD_LIBRARY_PATH",
+    "OUT_DIR",
 ];
 
 /// Names whose presence takes the request out of this class.
 const REFUSED_NAMES: &[&str] = &[
-    // Build-script output: needs the N-epic run cache.
-    "OUT_DIR",
     // A workspace member is not an immutable dependency.
     "CARGO_PRIMARY_PACKAGE",
     // Loader injection vectors change the compiler itself.
@@ -338,6 +344,9 @@ pub struct DependencyActionPlan {
     pub source_root: String,
     /// Single safe component identifying the source's virtual root.
     pub source_dir_name: String,
+    /// Cargo's build-script output tree consumed by this compile, if present.
+    /// Its exact spelling is keyed; it is not a placement mapping.
+    pub generated_root: Option<String>,
     /// Target triple the outputs are for.
     pub target_triple: String,
     /// Host triple from the toolchain probe.
@@ -393,6 +402,21 @@ impl DependencyActionPlan {
     #[must_use]
     pub fn input_virtual_path(&self, relative: &str) -> String {
         format!("{}/{relative}", self.source_virtual_root())
+    }
+
+    /// Distinct sealed-snapshot root for build-script generated inputs.
+    #[must_use]
+    pub fn generated_virtual_root(&self) -> String {
+        format!(
+            "{CANONICAL_PACKAGE_PARENT}/{}-generated",
+            self.source_dir_name
+        )
+    }
+
+    /// Virtual input path of a member of the complete generated tree.
+    #[must_use]
+    pub fn generated_input_virtual_path(&self, relative: &str) -> String {
+        format!("{}/{relative}", self.generated_virtual_root())
     }
 
     /// Output file names relative to the out-dir, sorted.
@@ -679,6 +703,18 @@ pub fn plan_dependency_action(
     {
         return Err(LiveRefusal::UnrepresentablePath(out_dir));
     }
+    let generated_root = env_value(request.env, "OUT_DIR").map(str::to_owned);
+    if let Some(root) = &generated_root
+        && (!plain_path(root)
+            // Dep-info replay substitutes the compiler output placement.
+            // It must never rewrite a retained exact generated-input path.
+            || root.contains(&out_dir)
+            || [source_root.as_str(), out_dir.as_str()]
+                .iter()
+                .any(|other| root == other || within(root, other) || within(other, root)))
+    {
+        return Err(LiveRefusal::UnrepresentablePath(root.clone()));
+    }
     let mut dependency_dirs = Vec::new();
     let mut add_directory = |path: &str| -> Result<(), LiveRefusal> {
         if !plain_path(path)
@@ -686,6 +722,9 @@ pub fn plan_dependency_action(
             || within(path, &source_root)
             || within(&source_root, path)
             || (path != out_dir && (within(path, &out_dir) || within(&out_dir, path)))
+            || generated_root
+                .as_ref()
+                .is_some_and(|root| path == root || within(path, root) || within(root, path))
             || dependency_dirs
                 .iter()
                 .any(|other: &String| other != path && (within(path, other) || within(other, path)))
@@ -766,6 +805,7 @@ pub fn plan_dependency_action(
         source_kind,
         source_root,
         source_dir_name,
+        generated_root,
         target_triple,
         host_triple: host_triple.to_owned(),
         externs,
@@ -1014,6 +1054,7 @@ pub fn live_dependency_key(
     toolchain: &ToolchainFacts,
     externs: &[ExternFact],
     directories: &[DependencyDirectoryFact],
+    build_script_output: Option<&[u8]>,
     inputs: &ActionInputManifest,
 ) -> Result<LiveDependencyKey, LiveRefusal> {
     if toolchain.host_triple() != Some(plan.host_triple.as_str()) {
@@ -1021,22 +1062,30 @@ pub fn live_dependency_key(
             "toolchain probe host differs from the planned host".into(),
         ));
     }
+    validate_build_script_output(plan, build_script_output)?;
     let root = format!("{}/", plan.source_virtual_root());
+    let generated = format!("{}/", plan.generated_virtual_root());
     if inputs.inputs.is_empty()
         || !inputs.directory_enumerations.is_empty()
         || !inputs.approved_generated_objects.is_empty()
         || inputs.inputs.iter().any(|input| {
             input.file_type != InputFileType::Regular
                 || !input.symlink_resolution.is_empty()
-                || !input.virtual_path.as_bytes().starts_with(root.as_bytes())
-                || (plan.source_kind == DependencySourceKind::GitCheckout
+                || !(input.virtual_path.as_bytes().starts_with(root.as_bytes())
+                    || (plan.generated_root.is_some()
+                        && input
+                            .virtual_path
+                            .as_bytes()
+                            .starts_with(generated.as_bytes())))
+                || (input.virtual_path.as_bytes().starts_with(root.as_bytes())
+                    && plan.source_kind == DependencySourceKind::GitCheckout
                     && input.virtual_path.as_bytes()[root.len()..]
                         .split(|byte| *byte == b'/')
                         .any(|component| component == b".git"))
         })
     {
         return Err(LiveRefusal::Facts(
-            "the input manifest must be the complete regular-file source tree without Git metadata"
+            "the input manifest must cover only the complete regular-file source and generated trees without Git metadata"
                 .into(),
         ));
     }
@@ -1076,6 +1125,11 @@ pub fn live_dependency_key(
                     .str(&plan.source_virtual_root());
             }
         }
+        if let Some(generated_root) = &plan.generated_root {
+            enc.str("complete-generated-input-tree-enumeration-v1")
+                .str(generated_root)
+                .str(&plan.generated_virtual_root());
+        }
         compute(DOMAIN_LIVE_NEGATIVE, &enc.finish())
     };
     let toolchain_contract = ToolchainContract {
@@ -1113,7 +1167,17 @@ pub fn live_dependency_key(
         virtual_working_directory: compute(DOMAIN_LIVE_CWD, plan.cwd.as_bytes()),
         action_inputs,
         negative_dependencies: negative,
-        dependency_inputs: artifacts_component(plan, externs, directories)?,
+        dependency_inputs: {
+            let artifacts = artifacts_component(plan, externs, directories)?;
+            let mut encoder = CanonicalEncoder::new();
+            encoder.str(artifacts.domain).bytes(&artifacts.bytes);
+            if let Some(output) = build_script_output {
+                encoder
+                    .str("exact-cargo-build-script-output-v1")
+                    .bytes(output);
+            }
+            compute(DOMAIN_LIVE_ARTIFACTS, &encoder.finish())
+        },
         toolchain: toolchain_contract.dataset_digest(),
         output_platform: output_platform_component(plan),
         environment: environment_component(plan)?,
@@ -1138,6 +1202,59 @@ pub fn live_dependency_key(
         action_key,
         descriptor_digest,
     })
+}
+
+/// Cargo's persisted build-script stdout is a required eligibility witness
+/// for generated-input compiles. In particular, an arbitrary rustc-env
+/// directive must not be silently scrubbed by dependency-env-v1.
+fn validate_build_script_output(
+    plan: &DependencyActionPlan,
+    output: Option<&[u8]>,
+) -> Result<(), LiveRefusal> {
+    let Some(root) = &plan.generated_root else {
+        return if output.is_none() {
+            Ok(())
+        } else {
+            Err(LiveRefusal::Facts(
+                "unexpected build-script output record".into(),
+            ))
+        };
+    };
+    let output = output.ok_or_else(|| {
+        LiveRefusal::Facts(format!("missing build-script output record for {root}"))
+    })?;
+    if output.len() > 1024 * 1024 {
+        return Err(LiveRefusal::Facts(
+            "build-script output record exceeds limit".into(),
+        ));
+    }
+    let text = std::str::from_utf8(output)
+        .map_err(|_| LiveRefusal::Facts("non-UTF-8 build-script output record".into()))?;
+    for line in text.lines() {
+        let capture = crate::build_script_directives::capture_stdout(line.trim());
+        for captured in capture.lines {
+            if let Some(crate::build_script_directives::Directive::Rustc { kind, value }) =
+                captured.directive
+                && kind == "env"
+            {
+                let Some((name, value)) = value.split_once('=') else {
+                    return Err(LiveRefusal::Facts("malformed rustc-env directive".into()));
+                };
+                if !plan
+                    .keyed_env
+                    .iter()
+                    .any(|(keyed, presented)| keyed == name && presented == value)
+                {
+                    return Err(LiveRefusal::RefusedEnv(name.to_owned()));
+                }
+            } else if line.contains("rustc-env") {
+                return Err(LiveRefusal::Facts(
+                    "unmodeled rustc-env output record".into(),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Rewrite every occurrence of the real out-dir to [`CANONICAL_OUT_DIR`]
@@ -1233,8 +1350,8 @@ fn normalized_within(absolute: &str, root: &str) -> Option<String> {
 /// rule target must be inside the out-dir, every source dependency inside
 /// the source root, and every tracked environment read (`# env-dep:`)
 /// must name a variable the key covers (keyed) or one the constructed
-/// environment removed. `is_input` answers whether a source-relative
-/// path is a member of the keyed input manifest: a read of a source file
+/// environment removed. `is_input` answers whether a virtual input path
+/// is a member of the keyed input manifest: a read of a source or generated file
 /// the key does not cover is a violation too. Returns the first
 /// violation, or `None` when the observed reads are inside the closure.
 #[must_use]
@@ -1294,15 +1411,12 @@ pub fn dep_info_closure_violation(
             }
             if normalized_within(&absolute, &plan.out_dir).is_none() {
                 // rustc also emits phony `src: ` rules for every input.
-                let Some(normalized) = normalized_within(&absolute, &plan.source_root)
-                    .filter(|_| deps.trim().is_empty())
+                let Some(virtual_path) =
+                    observed_input_virtual_path(plan, &absolute).filter(|_| deps.trim().is_empty())
                 else {
                     return Some(format!("dep-info target outside the closure: {target}"));
                 };
-                let relative = &normalized[plan.source_root.len() + 1..];
-                if (plan.source_kind == DependencySourceKind::GitCheckout && git_metadata(relative))
-                    || !is_input(relative)
-                {
+                if !is_input(&virtual_path) {
                     return Some(format!(
                         "dep-info target is an unkeyed source file: {target}"
                     ));
@@ -1324,19 +1438,30 @@ pub fn dep_info_closure_violation(
             // rustc reports `include_str!("../README.md")` from `src/` as
             // `src/../README.md`. The keyed source tree is symlink-free
             // (capture refuses links), so lexical normalization is exact.
-            let Some(normalized) = normalized_within(&absolute, &plan.source_root) else {
-                return Some(format!("read outside the source tree: {dep}"));
+            let Some(virtual_path) = observed_input_virtual_path(plan, &absolute) else {
+                return Some(format!(
+                    "read outside the source and generated trees: {dep}"
+                ));
             };
-            let relative = &normalized[plan.source_root.len() + 1..];
-            if plan.source_kind == DependencySourceKind::GitCheckout && git_metadata(relative) {
-                return Some(format!("read of excluded Git metadata: {dep}"));
-            }
-            if !is_input(relative) {
+            if !is_input(&virtual_path) {
                 return Some(format!("read of an unkeyed source file: {dep}"));
             }
         }
     }
     None
+}
+
+fn observed_input_virtual_path(plan: &DependencyActionPlan, absolute: &str) -> Option<String> {
+    if let Some(normalized) = normalized_within(absolute, &plan.source_root) {
+        let relative = &normalized[plan.source_root.len() + 1..];
+        if plan.source_kind == DependencySourceKind::GitCheckout && git_metadata(relative) {
+            return None;
+        }
+        return Some(plan.input_virtual_path(relative));
+    }
+    let root = plan.generated_root.as_ref()?;
+    let normalized = normalized_within(absolute, root)?;
+    Some(plan.generated_input_virtual_path(&normalized[root.len() + 1..]))
 }
 
 #[cfg(test)]
@@ -1389,6 +1514,7 @@ mod tests {
             toolchain,
             externs,
             &directory_facts(plan, externs),
+            plan.generated_root.as_ref().map(|_| b"".as_slice()),
             inputs,
         )
     }
@@ -1684,8 +1810,11 @@ mod tests {
     #[test]
     fn git_dep_info_allows_keyed_siblings_but_never_git_metadata() {
         let plan = plan_in_package(GIT_PACKAGE, OUT_A, &[]).unwrap();
-        let keyed =
-            |relative: &str| matches!(relative, "crates/itoa/src/lib.rs" | "shared/value.txt");
+        let keyed = |path: &str| {
+            ["crates/itoa/src/lib.rs", "shared/value.txt"]
+                .iter()
+                .any(|relative| path == plan.input_virtual_path(relative))
+        };
         let sibling = format!("{GIT_PACKAGE}/src/../../../shared/value.txt");
         let good = format!("{OUT_A}/itoa.d: {GIT_PACKAGE}/src/lib.rs {sibling}\n\n{sibling}:\n");
         assert_eq!(
@@ -1857,10 +1986,168 @@ mod tests {
     }
 
     #[test]
+    fn generated_inputs_key_exact_out_dir_and_content_and_close_observed_reads() {
+        let generated = "/work/build/generated";
+        let plan = plan_for(OUT_A, &[], &[("OUT_DIR", generated)]).unwrap();
+        assert_eq!(plan.generated_root.as_deref(), Some(generated));
+        assert!(
+            plan.execution_env
+                .contains(&("OUT_DIR".into(), generated.into()))
+        );
+        assert!(
+            plan.keyed_env
+                .contains(&("OUT_DIR".into(), generated.into()))
+        );
+        let mut manifest = inputs(&plan, 11);
+        manifest.inputs.push(PositiveInput {
+            virtual_path: RawBytes::new(plan.generated_input_virtual_path("value.rs").into_bytes()),
+            object: ObjectId(digest(42)),
+            file_type: InputFileType::Regular,
+            executable: false,
+            symlink_resolution: Vec::new(),
+        });
+        let keyed = |plan: &DependencyActionPlan, manifest: &ActionInputManifest| {
+            live_dependency_key(plan, &toolchain(), &externs(plan, 20), manifest)
+                .unwrap()
+                .action_key
+        };
+        let original = keyed(&plan, &manifest);
+        let other_output = plan_for(OUT_B, &[], &[("OUT_DIR", generated)]).unwrap();
+        assert_eq!(original, keyed(&other_output, &manifest));
+        let other_generated =
+            plan_for(OUT_A, &[], &[("OUT_DIR", "/work/other/generated")]).unwrap();
+        assert_ne!(original, keyed(&other_generated, &manifest));
+        manifest.inputs.last_mut().unwrap().object = ObjectId(digest(43));
+        assert_ne!(original, keyed(&plan, &manifest));
+        let covered = |path: &str| {
+            manifest
+                .inputs
+                .iter()
+                .any(|input| input.virtual_path.as_bytes() == path.as_bytes())
+        };
+        let good = format!(
+            "{OUT_A}/itoa.d: {PACKAGE}/src/lib.rs {generated}/value.rs\n{generated}/value.rs:\n# env-dep:OUT_DIR={generated}\n"
+        );
+        assert_eq!(
+            dep_info_closure_violation(&plan, good.as_bytes(), covered),
+            None
+        );
+        assert_eq!(
+            canonicalize_placements(good.as_bytes(), &plan).unwrap(),
+            good.replace(OUT_A, CANONICAL_OUT_DIR).into_bytes()
+        );
+        for path in [
+            format!("{generated}/missing.rs"),
+            format!("{generated}/../generated/value.rs"),
+            "/unobserved/value.rs".into(),
+        ] {
+            assert!(
+                dep_info_closure_violation(
+                    &plan,
+                    format!("{OUT_A}/itoa.d: {path}\n").as_bytes(),
+                    covered
+                )
+                .is_some()
+            );
+        }
+        let no_generated = plan_for(OUT_A, &[], &[]).unwrap();
+        assert!(
+            live_dependency_key(
+                &no_generated,
+                &toolchain(),
+                &externs(&no_generated, 20),
+                &manifest
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn generated_input_run_records_are_required_bound_and_preserve_env_policy() {
+        let plan = plan_for(
+            OUT_A,
+            &[],
+            &[
+                ("OUT_DIR", "/work/generated"),
+                ("RUST_BUILD_VALUE", "present"),
+            ],
+        )
+        .unwrap();
+        let keyed = |plan: &DependencyActionPlan, record: Option<&[u8]>| {
+            let direct = externs(plan, 20);
+            super::live_dependency_key(
+                plan,
+                &toolchain(),
+                &direct,
+                &directory_facts(plan, &direct),
+                record,
+                &inputs(plan, 11),
+            )
+        };
+        assert!(keyed(&plan, None).is_err());
+        let a = keyed(&plan, Some(b"cargo::rustc-cfg=a\n")).unwrap();
+        let b = keyed(&plan, Some(b"cargo::rustc-cfg=b\n")).unwrap();
+        assert_ne!(
+            a.action_key, b.action_key,
+            "exact run-record bytes must key"
+        );
+        assert!(keyed(&plan, Some(b"cargo::rustc-env=RUST_BUILD_VALUE=present\n")).is_ok());
+        for record in [
+            b"cargo:rustc-env=MY_VALUE=example\n".as_slice(),
+            b" cargo::rustc-env=MY_VALUE=example \n",
+            b"cargo::rustc-env=RUST_BUILD_VALUE=different\n",
+            b"cargo::rustc-env=MAKEFLAGS=unkeyed\n",
+            b"cargo::rustc-env=malformed\n",
+            b"\xff",
+        ] {
+            assert!(keyed(&plan, Some(record)).is_err());
+        }
+        let no_generated = plan_for(OUT_A, &[], &[]).unwrap();
+        assert!(keyed(&no_generated, Some(b"")).is_err());
+    }
+
+    #[test]
+    fn generated_input_roots_cannot_overlap_source_outputs_or_dependency_search() {
+        for root in [
+            PACKAGE.to_owned(),
+            format!("{PACKAGE}/generated"),
+            OUT_A.to_owned(),
+            format!("{OUT_A}/generated"),
+            format!("{OUT_A}-generated"),
+            "relative/generated".into(),
+            "/work/../generated".into(),
+        ] {
+            assert!(
+                plan_for(OUT_A, &[], &[("OUT_DIR", &root)]).is_err(),
+                "{root}"
+            );
+        }
+        assert!(
+            plan_for(
+                OUT_A,
+                &["-Ldependency=/generated"],
+                &[("OUT_DIR", "/generated")]
+            )
+            .is_err()
+        );
+        // The extension is about consuming generated Rust inputs, not
+        // executing macros or resolving native library search paths.
+        assert!(plan_for(OUT_A, &["-Lnative=/native"], &[("OUT_DIR", "/generated")]).is_err());
+        assert!(
+            plan_for(
+                OUT_A,
+                &["--extern=macro=/deps/libmacro.so"],
+                &[("OUT_DIR", "/generated")]
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn out_of_class_requests_are_typed_refusals() {
         let code = |result: Result<DependencyActionPlan, LiveRefusal>| result.unwrap_err().code();
         assert_eq!(
-            code(plan_for(OUT_A, &[], &[("OUT_DIR", "/x")])),
+            code(plan_for(OUT_A, &[], &[("LD_PRELOAD", "/x")])),
             "LIVE_DEP_REFUSED_ENV"
         );
         assert_eq!(
@@ -2028,7 +2315,7 @@ mod tests {
         let direct = externs(&a, 20);
         let facts = directory_facts(&a, &direct);
         let keyed = |facts: &[DependencyDirectoryFact]| {
-            super::live_dependency_key(&a, &toolchain(), &direct, facts, &inputs(&a, 11))
+            super::live_dependency_key(&a, &toolchain(), &direct, facts, None, &inputs(&a, 11))
         };
         assert!(keyed(&[]).is_err());
         let mut added = facts.clone();
@@ -2091,7 +2378,11 @@ mod tests {
              {PACKAGE}/src/lib.rs:\n{PACKAGE}/src/udiv128.rs:\n\n\
              # env-dep:CARGO_PKG_VERSION=1.0.15\n# env-dep:SCRUBBED_VAR\n"
         );
-        let keyed = |relative: &str| matches!(relative, "src/lib.rs" | "src/udiv128.rs");
+        let keyed = |path: &str| {
+            ["src/lib.rs", "src/udiv128.rs"]
+                .iter()
+                .any(|relative| path == plan.input_virtual_path(relative))
+        };
         let check = |dep_info: &str| dep_info_closure_violation(&plan, dep_info.as_bytes(), keyed);
         assert_eq!(check(&good), None);
         let escaped = format!("{OUT_A}/libitoa-1.rmeta: {PACKAGE}/src/lib.rs /etc/passwd\n");
@@ -2107,8 +2398,7 @@ mod tests {
         assert!(check(&uncovered).is_some());
         // `include_str!("../README.md")` from src/ (seen live in clap_builder)
         // stays inside the package and is keyed once normalized.
-        let with_readme =
-            |relative: &str| matches!(relative, "src/lib.rs" | "src/udiv128.rs" | "README.md");
+        let with_readme = |path: &str| keyed(path) || path == plan.input_virtual_path("README.md");
         let readme =
             format!("{OUT_A}/libitoa-1.rmeta: {PACKAGE}/src/lib.rs {PACKAGE}/src/../README.md\n");
         assert_eq!(

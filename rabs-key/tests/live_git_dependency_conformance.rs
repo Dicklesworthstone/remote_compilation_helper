@@ -38,7 +38,8 @@ fn main() {
     let mut compiler = Command::new(&args[0]);
     compiler.args(&args[1..]);
     let package = std::env::var("CARGO_PKG_NAME").unwrap_or_default();
-    if !matches!(package.as_str(), "git_fixture" | "chain_leaf" | "chain_middle") {
+    if !matches!(package.as_str(), "git_fixture" | "chain_leaf" | "chain_middle" | "generated_fixture")
+        || std::env::var("CARGO_CRATE_NAME").is_ok_and(|name| name == "build_script_build") {
         panic!("compiler exec: {}", compiler.exec());
     }
     let record = PathBuf::from(std::env::var_os("RABS_TEST_RECORD").unwrap());
@@ -152,10 +153,10 @@ fn real_toolchain(plan: &DependencyActionPlan) -> ToolchainFacts {
     }
 }
 
-fn actual_key(
+fn try_actual_key(
     plan: &DependencyActionPlan,
     toolchain: &ToolchainFacts,
-) -> rabs_key::live_dependency::LiveDependencyKey {
+) -> Result<rabs_key::live_dependency::LiveDependencyKey, rabs_key::live_dependency::LiveRefusal> {
     use rabs_protocol::input_evidence::{
         ActionInputManifest, INPUT_EVIDENCE_SCHEMA_VERSION, InputFileType, PositiveInput,
     };
@@ -166,30 +167,41 @@ fn actual_key(
         schema_version: INPUT_EVIDENCE_SCHEMA_VERSION,
         ..ActionInputManifest::default()
     };
-    let root = Path::new(&plan.source_root);
-    let mut pending = vec![root.to_path_buf()];
-    while let Some(directory) = pending.pop() {
-        for entry in std::fs::read_dir(&directory).unwrap() {
-            let entry = entry.unwrap();
-            if directory == root && entry.file_name() == ".git" {
-                continue;
-            }
-            let path = entry.path();
-            let meta = std::fs::symlink_metadata(&path).unwrap();
-            if meta.is_dir() {
-                pending.push(path);
-            } else {
-                assert!(meta.is_file());
-                inputs.inputs.push(PositiveInput {
-                    virtual_path: RawBytes::new(
-                        plan.input_virtual_path(path.strip_prefix(root).unwrap().to_str().unwrap())
+    let mut roots = vec![(Path::new(&plan.source_root), plan.source_virtual_root())];
+    if let Some(root) = &plan.generated_root {
+        roots.push((Path::new(root), plan.generated_virtual_root()));
+    }
+    for (root, visible) in roots {
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(directory) = pending.pop() {
+            for entry in std::fs::read_dir(&directory).unwrap() {
+                let entry = entry.unwrap();
+                if directory == root
+                    && root == Path::new(&plan.source_root)
+                    && entry.file_name() == ".git"
+                {
+                    continue;
+                }
+                let path = entry.path();
+                let meta = std::fs::symlink_metadata(&path).unwrap();
+                if meta.is_dir() {
+                    pending.push(path);
+                } else {
+                    assert!(meta.is_file());
+                    inputs.inputs.push(PositiveInput {
+                        virtual_path: RawBytes::new(
+                            format!(
+                                "{visible}/{}",
+                                path.strip_prefix(root).unwrap().to_str().unwrap()
+                            )
                             .into_bytes(),
-                    ),
-                    object: ObjectId(object_file(&path)),
-                    file_type: InputFileType::Regular,
-                    executable: meta.permissions().mode() & 0o111 != 0,
-                    symlink_resolution: Vec::new(),
-                });
+                        ),
+                        object: ObjectId(object_file(&path)),
+                        file_type: InputFileType::Regular,
+                        executable: meta.permissions().mode() & 0o111 != 0,
+                        symlink_resolution: Vec::new(),
+                    });
+                }
             }
         }
     }
@@ -236,7 +248,233 @@ fn actual_key(
             }
         })
         .collect();
-    live_dependency_key(plan, toolchain, &externs, &directories, &inputs).unwrap()
+    let script_output = plan
+        .generated_root
+        .as_ref()
+        .map(|root| std::fs::read(Path::new(root).parent().unwrap().join("run/stdout")).unwrap());
+    live_dependency_key(
+        plan,
+        toolchain,
+        &externs,
+        &directories,
+        script_output.as_deref(),
+        &inputs,
+    )
+}
+
+fn actual_key(
+    plan: &DependencyActionPlan,
+    toolchain: &ToolchainFacts,
+) -> rabs_key::live_dependency::LiveDependencyKey {
+    try_actual_key(plan, toolchain).unwrap()
+}
+
+#[test]
+fn actual_cargo_generated_inputs_bind_bytes_and_preserve_unkeyed_env_fallback() {
+    let scratch = tempfile::tempdir().unwrap();
+    let root = scratch.path();
+    let repository = root.join("upstream");
+    let app = root.join("application");
+    std::fs::create_dir_all(repository.join("src")).unwrap();
+    std::fs::create_dir_all(app.join("src")).unwrap();
+    std::fs::write(
+        repository.join("Cargo.toml"),
+        "[package]\nname=\"generated_fixture\"\nversion=\"1.0.0\"\nedition=\"2021\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repository.join("src/lib.rs"),
+        r#"
+include!(concat!(env!("OUT_DIR"), "/value.rs"));
+pub fn generated_path() -> &'static str { env!("OUT_DIR") }
+pub fn custom() -> &'static str { option_env!("MY_VALUE").unwrap_or("unset") }
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        repository.join("build.rs"),
+        r#"
+fn main() {
+    let out = std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
+    std::fs::write(out.join("value.rs"), "pub fn value() -> u32 { 17 }\n").unwrap();
+    println!("cargo::rerun-if-env-changed=RABS_TEST_UNKEYED_ENV");
+    println!("cargo::rustc-cfg=generated_input");
+    println!("cargo::rustc-check-cfg=cfg(generated_input)");
+    if std::env::var_os("RABS_TEST_UNKEYED_ENV").is_some() {
+        println!("cargo::rustc-env=MY_VALUE=example");
+    }
+}
+"#,
+    )
+    .unwrap();
+    git(&repository, &["init", "--quiet"]);
+    git(&repository, &["add", "Cargo.toml", "build.rs", "src"]);
+    git(
+        &repository,
+        &[
+            "-c",
+            "user.name=RABS fixture",
+            "-c",
+            "user.email=rabs@example.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            "generated Rust inputs",
+        ],
+    );
+    let revision = String::from_utf8(git(&repository, &["rev-parse", "HEAD"]).stdout).unwrap();
+    std::fs::write(app.join("Cargo.toml"), format!("[package]\nname=\"generated_consumer\"\nversion=\"1.0.0\"\nedition=\"2021\"\n[dependencies]\ngenerated_fixture={{git=\"file://{}\",rev=\"{}\"}}\n", repository.display(), revision.trim())).unwrap();
+    std::fs::write(app.join("src/main.rs"), "fn main(){println!(\"{}:{}:{}\", generated_fixture::value(), generated_fixture::custom(), generated_fixture::generated_path());}\n").unwrap();
+    let wrapper = root.join("recording-wrapper");
+    let wrapper_source = root.join("record.rs");
+    std::fs::write(&wrapper_source, RECORDING_WRAPPER).unwrap();
+    checked(
+        Command::new("rustc")
+            .args(["--edition=2021", "--crate-name", "recording_wrapper"])
+            .arg(&wrapper_source)
+            .arg("-o")
+            .arg(&wrapper),
+    );
+    let version = String::from_utf8(checked(Command::new("rustc").arg("-vV")).stdout).unwrap();
+    let host = version
+        .lines()
+        .find_map(|line| line.strip_prefix("host: "))
+        .unwrap();
+    let target = root.join("target");
+    let record = root.join("record");
+    let mut cargo = Command::new(env!("CARGO"));
+    cargo
+        .current_dir(&app)
+        .args(["build", "--jobs", "1", "--target-dir"])
+        .arg(&target)
+        .env("CARGO_HOME", root.join("cargo-home"))
+        .env("CARGO_INCREMENTAL", "0")
+        .env("RUSTC_WRAPPER", &wrapper)
+        .env("RABS_TEST_RECORD", &record);
+    for name in [
+        "RUSTFLAGS",
+        "CARGO_ENCODED_RUSTFLAGS",
+        "RUSTC_WORKSPACE_WRAPPER",
+        "RUSTC",
+        "CARGO_TARGET_DIR",
+        "CARGO_BUILD_TARGET",
+        "RABS_TEST_UNKEYED_ENV",
+        "MY_VALUE",
+    ] {
+        cargo.env_remove(name);
+    }
+    checked(&mut cargo);
+    let recorded = Recorded::load(&record.join("generated_fixture"));
+    let plan = recorded.plan(host);
+    let generated = Path::new(plan.generated_root.as_ref().expect("real OUT_DIR"));
+    let script_record = std::fs::read(generated.parent().unwrap().join("run/stdout")).unwrap();
+    assert_eq!(
+        std::fs::read(generated.parent().unwrap().join("run/root-output")).unwrap(),
+        generated.to_str().unwrap().as_bytes()
+    );
+    assert!(String::from_utf8_lossy(&script_record).contains("cargo::rustc-cfg=generated_input"));
+    let expected_stdout = format!("17:unset:{}\n", generated.display());
+    assert_eq!(
+        checked(&mut Command::new(target.join("debug/generated_consumer"))).stdout,
+        expected_stdout.as_bytes()
+    );
+    let toolchain = real_toolchain(&plan);
+    let baseline = actual_key(&plan, &toolchain);
+    let repeat_out = root.join("repeat-out");
+    let repeat = recorded.execute_at(&plan, &repeat_out);
+    let mut repeat_argv = recorded.argv.clone();
+    for arg in &mut repeat_argv {
+        *arg = arg.replace(&plan.out_dir, repeat_out.to_str().unwrap());
+    }
+    let repeat_plan = plan_dependency_action(
+        LiveRustcRequest {
+            argv: &repeat_argv,
+            cwd: &plan.cwd,
+            env: &plan.execution_env,
+        },
+        host,
+    )
+    .unwrap();
+    assert_eq!(baseline, actual_key(&repeat_plan, &toolchain));
+    assert_eq!(
+        canonicalize_placements(&recorded.stderr, &plan).unwrap(),
+        canonicalize_placements(&repeat.stderr, &repeat_plan).unwrap()
+    );
+    for name in plan.output_names() {
+        let original = std::fs::read(Path::new(&plan.out_dir).join(&name)).unwrap();
+        let repeated = std::fs::read(repeat_out.join(&name)).unwrap();
+        if name.ends_with(".d") {
+            assert_eq!(
+                dep_info_closure_violation(&plan, &original, |path| {
+                    path.strip_prefix(&format!("{}/", plan.source_virtual_root()))
+                        .is_some_and(|relative| {
+                            Path::new(&plan.source_root).join(relative).is_file()
+                        })
+                        || path == plan.generated_input_virtual_path("value.rs")
+                }),
+                None
+            );
+            assert!(String::from_utf8_lossy(&original).contains("# env-dep:OUT_DIR="));
+            assert_eq!(
+                canonicalize_placements(&original, &plan).unwrap(),
+                canonicalize_placements(&repeated, &repeat_plan).unwrap()
+            );
+        } else {
+            assert_eq!(
+                original, repeated,
+                "constructed compiler environment must preserve actual Cargo output {name}"
+            );
+        }
+    }
+    let generated_file = generated.join("value.rs");
+    let original = std::fs::read(&generated_file).unwrap();
+    let mutated = b"pub fn value() -> u32 { 23 }\n";
+    assert_eq!(original.len(), mutated.len());
+    std::fs::write(&generated_file, mutated).unwrap();
+    assert_ne!(
+        baseline.action_key,
+        actual_key(&plan, &toolchain).action_key
+    );
+    let changed_out = root.join("changed-out");
+    recorded.execute_at(&plan, &changed_out);
+    let rlib = plan
+        .output_names()
+        .into_iter()
+        .find(|name| name.ends_with(".rlib"))
+        .unwrap();
+    assert_ne!(
+        std::fs::read(Path::new(&plan.out_dir).join(&rlib)).unwrap(),
+        std::fs::read(changed_out.join(&rlib)).unwrap()
+    );
+    std::fs::write(&generated_file, &original).unwrap();
+    assert_eq!(baseline, actual_key(&plan, &toolchain));
+    // Cargo executes its build script again. An arbitrary rustc-env value
+    // stays on the ordinary compiler path, where the stock result proves
+    // it was preserved; the cache must refuse before private execution.
+    cargo
+        .args(["--locked", "--offline"])
+        .env("RABS_TEST_UNKEYED_ENV", "1");
+    checked(&mut cargo);
+    let fallback_request = Recorded::load(&record.join("generated_fixture"));
+    let fallback_plan = fallback_request.plan(host);
+    assert!(
+        fallback_request
+            .env
+            .contains(&("MY_VALUE".into(), "example".into()))
+    );
+    assert!(
+        !fallback_plan
+            .execution_env
+            .iter()
+            .any(|(name, _)| name == "MY_VALUE")
+    );
+    assert!(
+        matches!(try_actual_key(&fallback_plan, &toolchain), Err(rabs_key::live_dependency::LiveRefusal::RefusedEnv(name)) if name == "MY_VALUE")
+    );
+    assert_eq!(
+        checked(&mut Command::new(target.join("debug/generated_consumer"))).stdout,
+        format!("17:example:{}\n", generated.display()).as_bytes()
+    );
 }
 
 #[test]
@@ -365,9 +603,11 @@ fn actual_cargo_dependency_chain_reuses_complete_keys_across_target_directories(
             let right = std::fs::read(Path::new(&b.out_dir).join(&name)).unwrap();
             if name.ends_with(".d") {
                 assert_eq!(
-                    dep_info_closure_violation(a, &left, |relative| Path::new(&a.source_root)
-                        .join(relative)
-                        .is_file()),
+                    dep_info_closure_violation(a, &left, |virtual_path| virtual_path
+                        .strip_prefix(&format!("{}/", a.source_virtual_root()))
+                        .is_some_and(|relative| Path::new(&a.source_root)
+                            .join(relative)
+                            .is_file())),
                     None
                 );
                 let canonical = canonicalize_placements(&left, a).unwrap();
@@ -484,7 +724,22 @@ impl Recorded {
     }
 
     fn execute_at(&self, plan: &DependencyActionPlan, out: &Path) -> Output {
+        use std::io::Write;
         std::fs::create_dir_all(out).unwrap();
+        // Cargo's recorded descriptors belonged to the completed Cargo
+        // process. Reconstruct this explicitly unkeyed transport with a
+        // real FIFO jobserver instead of passing closed FDs or suppressing
+        // the compiler's resulting diagnostics. One available token plus
+        // the compiler's implicit token bounds this tiny replay to two jobs.
+        let fifo = out.with_extension("jobserver-fifo");
+        checked(Command::new("mkfifo").arg(&fifo));
+        let mut jobserver = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&fifo)
+            .unwrap();
+        jobserver.write_all(b"+").unwrap();
+        let jobserver_flags = format!("-j --jobserver-auth=fifo:{}", fifo.display());
         let out = out.to_str().unwrap();
         checked(
             Command::new(&self.argv[0])
@@ -495,11 +750,16 @@ impl Recorded {
                 )
                 .current_dir(&plan.cwd)
                 .env_clear()
-                .envs(
-                    plan.execution_env
-                        .iter()
-                        .map(|(name, value)| (name, value.replace(&plan.out_dir, out))),
-                ),
+                .envs(plan.execution_env.iter().map(|(name, value)| {
+                    (
+                        name,
+                        if matches!(name.as_str(), "CARGO_MAKEFLAGS" | "MAKEFLAGS" | "MFLAGS") {
+                            jobserver_flags.clone()
+                        } else {
+                            value.replace(&plan.out_dir, out)
+                        },
+                    )
+                })),
         )
     }
 }
@@ -648,8 +908,10 @@ fn cargo_git_member_outputs_and_observed_closure_match_the_live_plan() {
             assert_eq!(render_out_dir(&canonical, &b.out_dir), right);
             assert!(String::from_utf8_lossy(&left).contains("shared/value.txt"));
             assert_eq!(
-                dep_info_closure_violation(a, &left, |relative| {
-                    Path::new(&a.source_root).join(relative).is_file()
+                dep_info_closure_violation(a, &left, |virtual_path| {
+                    virtual_path
+                        .strip_prefix(&format!("{}/", a.source_virtual_root()))
+                        .is_some_and(|relative| Path::new(&a.source_root).join(relative).is_file())
                 }),
                 None
             );

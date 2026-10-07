@@ -40,6 +40,8 @@ use std::time::{Duration, Instant};
 pub const DOMAIN_SYSROOT_TREE: &str = "rabs.live-dependency.sysroot-tree.v1";
 /// Logical root name of a captured package in its sealed snapshot.
 pub const PACKAGE_ROOT: &str = "package";
+/// Separate sealed root for compiler inputs produced by a Cargo build script.
+pub const GENERATED_ROOT: &str = "generated";
 
 /// Largest package tree the lane captures at all.
 const MAX_PACKAGE_BYTES: u64 = 64 * 1024 * 1024;
@@ -198,8 +200,13 @@ pub struct PackageFacts {
     /// Every regular file: relative path, CAS object id of its sealed
     /// bytes, executable bit — sorted by path.
     pub files: Vec<(String, TypedDigest, bool)>,
+    /// Every regular file in the captured generated-input tree, if any.
+    pub generated_files: Vec<(String, TypedDigest, bool)>,
+    /// Exact Cargo build-script stdout record, bound into the action key.
+    pub build_script_output: Option<Vec<u8>>,
     source_kind: DependencySourceKind,
     members: Vec<(String, MemberSig)>,
+    generated: Option<GeneratedObservation>,
     bytes: u64,
 }
 
@@ -207,6 +214,17 @@ pub struct PackageFacts {
 enum MemberSig {
     Directory,
     File(FileSig),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GeneratedObservation {
+    root: PathBuf,
+    members: Vec<(String, MemberSig)>,
+    // Unlike compiler output directories this is a read-only input tree.
+    // Retain every directory generation to detect transient added inputs.
+    directories: Vec<(PathBuf, FileSig)>,
+    script_output: (PathBuf, FileSig),
+    root_output: (PathBuf, FileSig),
 }
 
 impl PackageFacts {
@@ -218,11 +236,59 @@ impl PackageFacts {
     /// A description of the first difference.
     pub fn verify_unchanged(&self, root: &Path) -> Result<(), String> {
         let (members, _) = walk_package(root, self.source_kind)?;
+        if let Some(generated) = &self.generated
+            && observe_generated(&generated.root)?.0 != *generated
+        {
+            return Err("generated inputs changed during execution".into());
+        }
         if members == self.members {
             Ok(())
         } else {
             Err("the package tree changed during execution".into())
         }
+    }
+
+    /// Generated inputs must never alias directories or files the compiler
+    /// or a cache installation can write. Rechecked at both delivery gates.
+    pub fn verify_generated_disjoint(&self, plan: &DependencyActionPlan) -> Result<(), String> {
+        let Some(generated) = &self.generated else {
+            return Ok(());
+        };
+        let output = std::fs::symlink_metadata(&plan.out_dir)
+            .map_err(|error| format!("output directory: {error}"))?;
+        let source = std::fs::symlink_metadata(&plan.source_root)
+            .map_err(|error| format!("source directory: {error}"))?;
+        if !output.is_dir() || !source.is_dir() {
+            return Err("source/output root is not a real directory".into());
+        }
+        for other in [&plan.out_dir, &plan.source_root] {
+            let canonical = std::fs::canonicalize(other)
+                .map_err(|error| format!("source/output topology: {error}"))?;
+            if generated.root.starts_with(&canonical) || canonical.starts_with(&generated.root) {
+                return Err("generated input tree overlaps source or compiler output".into());
+            }
+        }
+        for (_, sig) in &generated.directories {
+            if [(output.dev(), output.ino()), (source.dev(), source.ino())]
+                .contains(&(sig.dev, sig.ino))
+            {
+                return Err("generated input directory aliases source or compiler output".into());
+            }
+        }
+        for name in plan.output_names() {
+            let path = Path::new(&plan.out_dir).join(name);
+            let meta = match std::fs::symlink_metadata(&path) {
+                Ok(meta) => meta,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(format!("output identity: {error}")),
+            };
+            if [(generated.script_output.1.dev, generated.script_output.1.ino), (generated.root_output.1.dev, generated.root_output.1.ino)].contains(&(meta.dev(), meta.ino())) || generated.members.iter().any(|(_, member)| {
+                matches!(member, MemberSig::File(sig) if sig.dev == meta.dev() && sig.ino == meta.ino())
+            }) {
+                return Err("generated input aliases a declared compiler output".into());
+            }
+        }
+        Ok(())
     }
 }
 
@@ -474,8 +540,142 @@ fn walk_package(
     Ok((members, total))
 }
 
-fn capture_package(root: &Path, source_kind: DependencySourceKind) -> Result<PackageFacts, String> {
+fn observe_generated(root: &Path) -> Result<(GeneratedObservation, u64), String> {
+    // A lexical root reached through an ancestor symlink may overlap the
+    // compiler's writable tree despite the planner's disjoint-path check.
+    for ancestor in root.ancestors() {
+        if !std::fs::symlink_metadata(ancestor)
+            .map_err(|error| format!("generated input ancestor: {error}"))?
+            .is_dir()
+        {
+            return Err("generated input ancestor is not a real directory".into());
+        }
+    }
+    let before = FileSig::of(
+        &std::fs::symlink_metadata(root).map_err(|error| format!("generated root: {error}"))?,
+    );
+    let (members, bytes) = walk_package(root, DependencySourceKind::RegistryPackage)?;
+    let mut directories = vec![(root.to_path_buf(), before)];
+    for (relative, member) in &members {
+        if member_disposition(relative, false) != MemberDisposition::Include {
+            return Err(format!(
+                "generated member {relative} is outside the capture policy"
+            ));
+        }
+        if matches!(member, MemberSig::Directory) {
+            let path = root.join(relative);
+            let metadata = std::fs::symlink_metadata(&path)
+                .map_err(|error| format!("generated directory: {error}"))?;
+            if !metadata.is_dir() {
+                return Err("generated member ceased to be a directory".into());
+            }
+            directories.push((path, FileSig::of(&metadata)));
+        }
+    }
+    let after = FileSig::of(
+        &std::fs::symlink_metadata(root).map_err(|error| format!("generated root: {error}"))?,
+    );
+    if after != before {
+        return Err("generated root changed during observation".into());
+    }
+    // The pinned Cargo run record is a sibling of OUT_DIR. Unknown
+    // layouts remain unserved; root-output binds this record to our unit.
+    let run = root
+        .parent()
+        .ok_or("generated root has no parent")?
+        .join("run");
+    let run_meta = std::fs::symlink_metadata(&run)
+        .map_err(|error| format!("build-script run directory: {error}"))?;
+    if !run_meta.is_dir() {
+        return Err("build-script run directory is not real".into());
+    }
+    directories.push((run.clone(), FileSig::of(&run_meta)));
+    let root_output = run.join("root-output");
+    let (root_sig, root_bytes) = read_stable(&root_output, 64 * 1024)
+        .map_err(|error| format!("build-script root-output: {error}"))?;
+    if root_bytes != root.to_str().ok_or("non-UTF-8 generated root")?.as_bytes() {
+        return Err("Cargo build-script record names a different OUT_DIR".into());
+    }
+    let script_output = run.join("stdout");
+    let script_sig =
+        lstat_regular(&script_output).map_err(|error| format!("build-script stdout: {error}"))?;
+    if script_sig.size > 1024 * 1024 {
+        return Err("build-script output record exceeds limit".into());
+    }
+    Ok((
+        GeneratedObservation {
+            root: root.to_path_buf(),
+            members,
+            directories,
+            script_output: (script_output, script_sig),
+            root_output: (root_output, root_sig),
+        },
+        bytes
+            .saturating_add(script_sig.size)
+            .saturating_add(root_sig.size),
+    ))
+}
+
+fn captured_files(
+    snapshot: &SealedSourceSnapshot,
+    logical_root: &str,
+    observed: &[(String, MemberSig)],
+) -> Result<Vec<(String, TypedDigest, bool)>, String> {
+    let manifest = snapshot
+        .manifest(logical_root)
+        .ok_or("capture lost its root")?;
+    let captured_count = manifest
+        .members
+        .values()
+        .filter(|member| matches!(member, MemberKind::Regular { .. }))
+        .count();
+    let observed_count = observed
+        .iter()
+        .filter(|(_, sig)| matches!(sig, MemberSig::File(_)))
+        .count();
+    if captured_count != observed_count
+        || manifest
+            .members
+            .values()
+            .any(|member| matches!(member, MemberKind::Symlink { .. }))
+    {
+        return Err("capture does not cover the complete input tree".into());
+    }
+    let mut files = Vec::with_capacity(captured_count);
+    for (relative, member) in &manifest.members {
+        if let MemberKind::Regular { mode, .. } = member {
+            let bytes = snapshot
+                .file_bytes(logical_root, relative)
+                .ok_or("sealed bytes missing for a captured member")?;
+            let object = rabs_cas::digest_set::digest_set(bytes, DigestRequest::default(), None)
+                .map_err(|error| format!("digest: {error:?}"))?
+                .atp_content_id;
+            files.push((relative.clone(), object, mode & 0o111 != 0));
+        }
+    }
+    Ok(files)
+}
+
+fn capture_package(
+    root: &Path,
+    source_kind: DependencySourceKind,
+    generated_root: Option<&Path>,
+) -> Result<PackageFacts, String> {
     let (before, bytes) = walk_package(root, source_kind)?;
+    let (generated, generated_bytes) = match generated_root {
+        Some(root) => {
+            let (observation, size) = observe_generated(root)?;
+            (Some(observation), size)
+        }
+        None => (None, 0),
+    };
+    let bytes = bytes.saturating_add(generated_bytes);
+    if bytes > MAX_PACKAGE_BYTES
+        || before.len() + generated.as_ref().map_or(0, |tree| tree.members.len())
+            > MAX_PACKAGE_FILES
+    {
+        return Err("combined source and generated inputs exceed capture bounds".into());
+    }
     // The key's "complete package tree" claim requires the capture policy
     // to have excluded nothing a compiler could read.
     for (relative, _) in &before {
@@ -485,54 +685,42 @@ fn capture_package(root: &Path, source_kind: DependencySourceKind) -> Result<Pac
             ));
         }
     }
-    let snapshot = capture_sealed_source(
-        &[(PACKAGE_ROOT.to_owned(), root.to_path_buf())],
-        false,
-        3,
-        MAX_PACKAGE_BYTES,
-    )
-    .map_err(|error| format!("capture: {error:?}"))?;
+    let mut roots = vec![(PACKAGE_ROOT.to_owned(), root.to_path_buf())];
+    if let Some(root) = generated_root {
+        roots.push((GENERATED_ROOT.to_owned(), root.to_path_buf()));
+    }
+    let snapshot = capture_sealed_source(&roots, false, 3, MAX_PACKAGE_BYTES)
+        .map_err(|error| format!("capture: {error:?}"))?;
     let (after, _) = walk_package(root, source_kind)?;
     if after != before {
         return Err("package changed during capture".into());
     }
-    let manifest = snapshot
-        .manifest(PACKAGE_ROOT)
-        .ok_or("capture lost its root")?;
-    let captured_files = manifest
-        .members
-        .values()
-        .filter(|member| matches!(member, MemberKind::Regular { .. }))
-        .count();
-    let walked_files = before
-        .iter()
-        .filter(|(_, sig)| matches!(sig, MemberSig::File(_)))
-        .count();
-    if captured_files != walked_files
-        || manifest
-            .members
-            .values()
-            .any(|member| matches!(member, MemberKind::Symlink { .. }))
-    {
-        return Err("capture does not cover the complete package tree".into());
-    }
-    let mut files = Vec::with_capacity(captured_files);
-    for (relative, member) in &manifest.members {
-        if let MemberKind::Regular { mode, .. } = member {
-            let bytes = snapshot
-                .file_bytes(PACKAGE_ROOT, relative)
-                .ok_or("sealed bytes missing for a captured member")?;
-            let object = rabs_cas::digest_set::digest_set(bytes, DigestRequest::default(), None)
-                .map_err(|error| format!("digest: {error:?}"))?
-                .atp_content_id;
-            files.push((relative.clone(), object, mode & 0o111 != 0));
+    let (generated_files, build_script_output) = match &generated {
+        Some(tree) => {
+            let (sig, output) = read_stable(&tree.script_output.0, 1024 * 1024)
+                .map_err(|error| format!("build-script stdout capture: {error}"))?;
+            if sig != tree.script_output.1 {
+                return Err("build-script output record changed during capture".into());
+            }
+            if observe_generated(&tree.root)?.0 != *tree {
+                return Err("generated inputs changed during capture".into());
+            }
+            (
+                captured_files(&snapshot, GENERATED_ROOT, &tree.members)?,
+                Some(output),
+            )
         }
-    }
+        None => (Vec::new(), None),
+    };
+    let files = captured_files(&snapshot, PACKAGE_ROOT, &before)?;
     Ok(PackageFacts {
         snapshot: Arc::new(snapshot),
         files,
+        generated_files,
+        build_script_output,
         source_kind,
         members: before,
+        generated,
         bytes,
     })
 }
@@ -643,10 +831,12 @@ fn probe_toolchain(compiler: &Path, env: &[(String, String)]) -> Result<ProbedTo
 pub struct LiveFacts {
     files: Mutex<HashMap<PathBuf, (FileSig, TypedDigest)>>,
     toolchains: Mutex<HashMap<PathBuf, Slot<ProbedToolchain>>>,
-    packages: Mutex<HashMap<(PathBuf, DependencySourceKind), Slot<PackageFacts>>>,
+    packages: Mutex<HashMap<PackageKey, Slot<PackageFacts>>>,
     dependencies: Mutex<HashMap<(DependencyRoots, DependencyOutput), Slot<DependencyFacts>>>,
     warming: Mutex<usize>,
 }
+
+type PackageKey = (PathBuf, DependencySourceKind, Option<PathBuf>);
 
 impl LiveFacts {
     /// Empty state.
@@ -852,16 +1042,31 @@ impl LiveFacts {
         self: &Arc<Self>,
         root: &Path,
         source_kind: DependencySourceKind,
+        generated_root: Option<&Path>,
     ) -> Result<Arc<PackageFacts>, FactsMiss> {
-        let key = (root.to_path_buf(), source_kind);
+        let key = (
+            root.to_path_buf(),
+            source_kind,
+            generated_root.map(Path::to_path_buf),
+        );
         let (members, bytes) = walk_package(root, source_kind).map_err(FactsMiss::Refused)?;
+        let (generated, generated_bytes) = match generated_root {
+            Some(root) => {
+                let (observation, size) = observe_generated(root).map_err(FactsMiss::Refused)?;
+                (Some(observation), size)
+            }
+            None => (None, 0),
+        };
+        let bytes = bytes.saturating_add(generated_bytes);
         {
             let packages = self
                 .packages
                 .lock()
                 .map_err(|_| FactsMiss::Refused("package memo poisoned".into()))?;
             match packages.get(&key) {
-                Some(Slot::Ready(facts)) if facts.members == members => {
+                Some(Slot::Ready(facts))
+                    if facts.members == members && facts.generated == generated =>
+                {
                     return Ok(Arc::clone(facts));
                 }
                 Some(Slot::Warming) => return Err(FactsMiss::Pending),
@@ -872,22 +1077,23 @@ impl LiveFacts {
             }
         }
         if bytes <= SYNCHRONOUS_PACKAGE_BYTES {
-            let captured = capture_package(root, source_kind).map_err(FactsMiss::Refused)?;
+            let captured =
+                capture_package(root, source_kind, generated_root).map_err(FactsMiss::Refused)?;
             let captured = Arc::new(captured);
-            self.retain_package(root, source_kind, Slot::Ready(Arc::clone(&captured)));
+            self.retain_package(key, Slot::Ready(Arc::clone(&captured)));
             return Ok(captured);
         }
-        self.retain_package(root, source_kind, Slot::Warming);
-        let owned = root.to_path_buf();
+        self.retain_package(key.clone(), Slot::Warming);
+        let owned = key.clone();
         let started = self.start_warm(move |facts| {
-            let slot = match capture_package(&owned, source_kind) {
+            let slot = match capture_package(&owned.0, owned.1, owned.2.as_deref()) {
                 Ok(captured) => Slot::Ready(Arc::new(captured)),
                 Err(reason) => Slot::Failed {
                     reason,
                     at: Instant::now(),
                 },
             };
-            facts.retain_package(&owned, source_kind, slot);
+            facts.retain_package(owned, slot);
         });
         if !started && let Ok(mut packages) = self.packages.lock() {
             packages.remove(&key);
@@ -895,12 +1101,7 @@ impl LiveFacts {
         Err(FactsMiss::Pending)
     }
 
-    fn retain_package(
-        &self,
-        root: &Path,
-        source_kind: DependencySourceKind,
-        slot: Slot<PackageFacts>,
-    ) {
+    fn retain_package(&self, key: PackageKey, slot: Slot<PackageFacts>) {
         let Ok(mut packages) = self.packages.lock() else {
             return;
         };
@@ -914,13 +1115,218 @@ impl LiveFacts {
         if retained > MAX_RETAINED_PACKAGE_BYTES {
             packages.retain(|_, slot| !matches!(slot, Slot::Ready(_)));
         }
-        packages.insert((root.to_path_buf(), source_kind), slot);
+        packages.insert(key, slot);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn generated_fixture() -> (tempfile::TempDir, DependencyActionPlan) {
+        let dir = tempfile::tempdir().unwrap();
+        let cargo_home = dir.path().join("cargo-home");
+        let source = cargo_home.join("registry/src/index/generated-1.0");
+        let generated = dir.path().join("build-script/out");
+        let output = dir.path().join("compiler-output");
+        for root in [&source, &generated, &output] {
+            std::fs::create_dir_all(root).unwrap();
+        }
+        std::fs::write(
+            source.join("lib.rs"),
+            b"include!(concat!(env!(\"OUT_DIR\"), \"/value.rs\"));",
+        )
+        .unwrap();
+        std::fs::write(generated.join("value.rs"), b"pub const VALUE:u32=17;").unwrap();
+        std::fs::create_dir(generated.parent().unwrap().join("run")).unwrap();
+        std::fs::write(
+            generated.parent().unwrap().join("run/stdout"),
+            b"cargo::rustc-cfg=generated\n",
+        )
+        .unwrap();
+        std::fs::write(
+            generated.parent().unwrap().join("run/root-output"),
+            generated.to_str().unwrap(),
+        )
+        .unwrap();
+        let argv = vec![
+            "/toolchain/bin/rustc".into(),
+            source.join("lib.rs").to_str().unwrap().into(),
+            "--crate-name=generated".into(),
+            "--crate-type=rlib".into(),
+            "--emit=dep-info,metadata,link".into(),
+            "--error-format=json".into(),
+            "--cap-lints=allow".into(),
+            "--out-dir".into(),
+            output.to_str().unwrap().into(),
+        ];
+        let env = vec![
+            ("CARGO_HOME".into(), cargo_home.to_str().unwrap().into()),
+            ("CARGO_MANIFEST_DIR".into(), source.to_str().unwrap().into()),
+            ("CARGO_PKG_NAME".into(), "generated".into()),
+            ("OUT_DIR".into(), generated.to_str().unwrap().into()),
+        ];
+        let plan = rabs_key::live_dependency::plan_dependency_action(
+            rabs_key::live_dependency::LiveRustcRequest {
+                argv: &argv,
+                cwd: source.to_str().unwrap(),
+                env: &env,
+            },
+            "x86_64-unknown-linux-gnu",
+        )
+        .unwrap();
+        (dir, plan)
+    }
+
+    #[test]
+    fn generated_inputs_capture_revalidate_bytes_members_and_script_record() {
+        let (_dir, plan) = generated_fixture();
+        let source = Path::new(&plan.source_root);
+        let generated = Path::new(plan.generated_root.as_ref().unwrap());
+        let facts = LiveFacts::new();
+        let capture = || {
+            facts
+                .package(source, plan.source_kind, Some(generated))
+                .unwrap()
+        };
+        let first = capture();
+        assert_eq!(first.generated_files.len(), 1);
+        assert_eq!(
+            first.snapshot.file_bytes(GENERATED_ROOT, "value.rs"),
+            Some(b"pub const VALUE:u32=17;".as_slice())
+        );
+        assert!(Arc::ptr_eq(&first, &capture()));
+        first.verify_unchanged(source).unwrap();
+        first.verify_generated_disjoint(&plan).unwrap();
+        // The same source root requested without generated inputs has a
+        // distinct memo and cannot inherit the broader capture accidentally.
+        let plain = facts.package(source, plan.source_kind, None).unwrap();
+        assert!(plain.generated_files.is_empty());
+        assert!(plain.snapshot.manifest(GENERATED_ROOT).is_none());
+        std::fs::write(generated.join("value.rs"), b"pub const VALUE:u32=23;").unwrap();
+        assert!(first.verify_unchanged(source).is_err());
+        let changed = capture();
+        assert_ne!(first.generated_files, changed.generated_files);
+        let hidden = generated.join("transient.rs");
+        std::fs::write(&hidden, b"a new generated member").unwrap();
+        assert!(changed.verify_unchanged(source).is_err());
+        let added = capture();
+        assert_eq!(added.generated_files.len(), 2);
+        std::fs::rename(
+            &hidden,
+            generated.parent().unwrap().join("moved-transient.rs"),
+        )
+        .unwrap();
+        assert!(added.verify_unchanged(source).is_err());
+        assert!(
+            changed.verify_unchanged(source).is_err(),
+            "directory generation remembers transient membership"
+        );
+        let current = capture();
+        std::fs::write(
+            generated.parent().unwrap().join("run/stdout"),
+            b"cargo::rustc-env=MY_VALUE=example\n",
+        )
+        .unwrap();
+        assert!(current.verify_unchanged(source).is_err());
+        assert_ne!(current.build_script_output, capture().build_script_output);
+    }
+
+    #[test]
+    fn generated_inputs_refuse_symlinks_and_compiler_output_aliases() {
+        let (dir, plan) = generated_fixture();
+        let source = Path::new(&plan.source_root);
+        let generated = Path::new(plan.generated_root.as_ref().unwrap());
+        let facts = LiveFacts::new();
+        let captured = facts
+            .package(source, plan.source_kind, Some(generated))
+            .unwrap();
+        let output = Path::new(&plan.out_dir).join(plan.output_names()[0].clone());
+        std::fs::hard_link(generated.join("value.rs"), &output).unwrap();
+        assert!(
+            captured
+                .verify_generated_disjoint(&plan)
+                .unwrap_err()
+                .contains("aliases a declared compiler output")
+        );
+        std::fs::rename(&output, dir.path().join("displaced-output")).unwrap();
+        let alias = dir.path().join("script-parent-alias");
+        std::os::unix::fs::symlink(generated.parent().unwrap(), &alias).unwrap();
+        assert!(
+            facts
+                .package(source, plan.source_kind, Some(&alias.join("out")))
+                .is_err()
+        );
+        let moved = generated.parent().unwrap().join("moved-out");
+        std::fs::rename(generated, &moved).unwrap();
+        std::os::unix::fs::symlink(&moved, generated).unwrap();
+        assert!(captured.verify_unchanged(source).is_err());
+        assert!(
+            facts
+                .package(source, plan.source_kind, Some(generated))
+                .is_err()
+        );
+
+        let (_other, other_plan) = generated_fixture();
+        let other_generated = Path::new(other_plan.generated_root.as_ref().unwrap());
+        std::os::unix::fs::symlink("value.rs", other_generated.join("alias.rs")).unwrap();
+        assert!(
+            LiveFacts::new()
+                .package(
+                    Path::new(&other_plan.source_root),
+                    other_plan.source_kind,
+                    Some(other_generated)
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn generated_inputs_empty_tree_still_requires_real_cargo_output_record() {
+        let (dir, plan) = generated_fixture();
+        let generated = Path::new(plan.generated_root.as_ref().unwrap());
+        std::fs::rename(
+            generated.join("value.rs"),
+            dir.path().join("displaced-value.rs"),
+        )
+        .unwrap();
+        let facts = LiveFacts::new();
+        let captured = facts
+            .package(
+                Path::new(&plan.source_root),
+                plan.source_kind,
+                Some(generated),
+            )
+            .unwrap();
+        assert!(captured.generated_files.is_empty());
+        assert!(
+            captured
+                .snapshot
+                .manifest(GENERATED_ROOT)
+                .unwrap()
+                .members
+                .is_empty()
+        );
+        std::fs::rename(
+            generated.parent().unwrap().join("run/stdout"),
+            dir.path().join("displaced-cargo-output"),
+        )
+        .unwrap();
+        assert!(
+            captured
+                .verify_unchanged(Path::new(&plan.source_root))
+                .is_err()
+        );
+        assert!(
+            facts
+                .package(
+                    Path::new(&plan.source_root),
+                    plan.source_kind,
+                    Some(generated)
+                )
+                .is_err()
+        );
+    }
 
     #[test]
     fn dependency_candidates_revalidate_content_membership_and_root_type() {
@@ -1092,7 +1498,7 @@ mod tests {
         std::fs::write(root.join("src/lib.rs"), b"pub fn f() {}\n").unwrap();
         let facts = LiveFacts::new();
         let captured = facts
-            .package(&root, DependencySourceKind::RegistryPackage)
+            .package(&root, DependencySourceKind::RegistryPackage, None)
             .unwrap();
         assert_eq!(
             captured
@@ -1104,7 +1510,7 @@ mod tests {
         assert!(Arc::ptr_eq(
             &captured,
             &facts
-                .package(&root, DependencySourceKind::RegistryPackage)
+                .package(&root, DependencySourceKind::RegistryPackage, None)
                 .unwrap()
         ));
         captured.verify_unchanged(&root).unwrap();
@@ -1113,12 +1519,12 @@ mod tests {
         assert!(!Arc::ptr_eq(
             &captured,
             &facts
-                .package(&root, DependencySourceKind::RegistryPackage)
+                .package(&root, DependencySourceKind::RegistryPackage, None)
                 .unwrap()
         ));
         std::os::unix::fs::symlink("lib.rs", root.join("src/alias.rs")).unwrap();
         assert!(matches!(
-            facts.package(&root, DependencySourceKind::RegistryPackage),
+            facts.package(&root, DependencySourceKind::RegistryPackage, None),
             Err(FactsMiss::Refused(_))
         ));
     }
@@ -1147,7 +1553,7 @@ mod tests {
         write_git_checkout(&root);
         let facts = LiveFacts::new();
         let captured = facts
-            .package(&root, DependencySourceKind::GitCheckout)
+            .package(&root, DependencySourceKind::GitCheckout, None)
             .unwrap();
         assert_eq!(captured.source_kind, DependencySourceKind::GitCheckout);
         assert_eq!(captured.files.len(), 4);
@@ -1179,20 +1585,20 @@ mod tests {
         assert!(Arc::ptr_eq(
             &captured,
             &facts
-                .package(&root, DependencySourceKind::GitCheckout)
+                .package(&root, DependencySourceKind::GitCheckout, None)
                 .unwrap()
         ));
 
         // A strict registry request for this same physical root must not
         // inherit the Git cache's permission to omit metadata.
         assert!(matches!(
-            facts.package(&root, DependencySourceKind::RegistryPackage),
+            facts.package(&root, DependencySourceKind::RegistryPackage, None),
             Err(FactsMiss::Refused(_))
         ));
         assert!(Arc::ptr_eq(
             &captured,
             &facts
-                .package(&root, DependencySourceKind::GitCheckout)
+                .package(&root, DependencySourceKind::GitCheckout, None)
                 .unwrap()
         ));
     }
@@ -1204,7 +1610,7 @@ mod tests {
         write_git_checkout(&root);
         let facts = LiveFacts::new();
         let captured = facts
-            .package(&root, DependencySourceKind::GitCheckout)
+            .package(&root, DependencySourceKind::GitCheckout, None)
             .unwrap();
         let file_digest = |capture: &PackageFacts, relative: &str| {
             capture
@@ -1227,7 +1633,7 @@ mod tests {
         std::fs::write(root.join("README.md"), b"other\n").unwrap();
         assert!(captured.verify_unchanged(&root).is_err());
         let dirty = facts
-            .package(&root, DependencySourceKind::GitCheckout)
+            .package(&root, DependencySourceKind::GitCheckout, None)
             .unwrap();
         assert!(!Arc::ptr_eq(&captured, &dirty));
         assert_ne!(file_digest(&dirty, "README.md"), original);
@@ -1239,14 +1645,14 @@ mod tests {
         std::fs::write(root.join("README.md"), b"first\n").unwrap();
         assert!(dirty.verify_unchanged(&root).is_err());
         let restored = facts
-            .package(&root, DependencySourceKind::GitCheckout)
+            .package(&root, DependencySourceKind::GitCheckout, None)
             .unwrap();
         assert_eq!(file_digest(&restored, "README.md"), original);
 
         std::fs::write(root.join("crates/new.rs"), b"// untracked input\n").unwrap();
         assert!(restored.verify_unchanged(&root).is_err());
         let added = facts
-            .package(&root, DependencySourceKind::GitCheckout)
+            .package(&root, DependencySourceKind::GitCheckout, None)
             .unwrap();
         assert_eq!(added.files.len(), restored.files.len() + 1);
         assert_eq!(
@@ -1261,10 +1667,10 @@ mod tests {
         std::fs::write(dir.path().join("lib.rs"), b"pub fn f() {}\n").unwrap();
         let facts = LiveFacts::new();
         let git = facts
-            .package(dir.path(), DependencySourceKind::GitCheckout)
+            .package(dir.path(), DependencySourceKind::GitCheckout, None)
             .unwrap();
         let registry = facts
-            .package(dir.path(), DependencySourceKind::RegistryPackage)
+            .package(dir.path(), DependencySourceKind::RegistryPackage, None)
             .unwrap();
         assert_eq!(git.files, registry.files);
         assert!(!Arc::ptr_eq(&git, &registry));
@@ -1273,13 +1679,13 @@ mod tests {
         assert!(Arc::ptr_eq(
             &git,
             &facts
-                .package(dir.path(), DependencySourceKind::GitCheckout)
+                .package(dir.path(), DependencySourceKind::GitCheckout, None)
                 .unwrap()
         ));
         assert!(Arc::ptr_eq(
             &registry,
             &facts
-                .package(dir.path(), DependencySourceKind::RegistryPackage)
+                .package(dir.path(), DependencySourceKind::RegistryPackage, None)
                 .unwrap()
         ));
     }
@@ -1295,7 +1701,7 @@ mod tests {
             std::fs::create_dir_all(root.join("src")).unwrap();
             std::fs::write(root.join("src/lib.rs"), b"pub fn f() {}\n").unwrap();
             let facts = LiveFacts::new();
-            let captured = facts.package(&root, source_kind).unwrap();
+            let captured = facts.package(&root, source_kind, None).unwrap();
             let (members, _) = walk_package(&root, source_kind).unwrap();
 
             let moved = dir.path().join("another-parent/source");
@@ -1308,7 +1714,7 @@ mod tests {
                 "the symlink points at precisely the original member identities"
             );
             assert!(matches!(
-                facts.package(&root, source_kind),
+                facts.package(&root, source_kind, None),
                 Err(FactsMiss::Refused(reason)) if reason.contains("root is not a real directory")
             ));
             assert!(
@@ -1332,12 +1738,12 @@ mod tests {
             }
             let facts = LiveFacts::new();
             let captured = facts
-                .package(dir.path(), DependencySourceKind::GitCheckout)
+                .package(dir.path(), DependencySourceKind::GitCheckout, None)
                 .unwrap();
             assert_eq!(captured.files.len(), 1);
             assert!(captured.snapshot.file_bytes(PACKAGE_ROOT, ".git").is_none());
             assert!(matches!(
-                facts.package(dir.path(), DependencySourceKind::RegistryPackage),
+                facts.package(dir.path(), DependencySourceKind::RegistryPackage, None),
                 Err(FactsMiss::Refused(_))
             ));
         }
@@ -1354,7 +1760,7 @@ mod tests {
             }
             assert!(
                 matches!(
-                    LiveFacts::new().package(dir.path(), DependencySourceKind::GitCheckout),
+                    LiveFacts::new().package(dir.path(), DependencySourceKind::GitCheckout, None),
                     Err(FactsMiss::Refused(_))
                 ),
                 "Git capture must still refuse {excluded}"

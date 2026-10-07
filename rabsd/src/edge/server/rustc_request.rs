@@ -210,10 +210,11 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
             return Decided::Shadow(observation(&parsed));
         }
     };
-    let package = match live
-        .facts
-        .package(Path::new(&plan.source_root), plan.source_kind)
-    {
+    let package = match live.facts.package(
+        Path::new(&plan.source_root),
+        plan.source_kind,
+        plan.generated_root.as_deref().map(Path::new),
+    ) {
         Ok(package) => package,
         Err(miss) => {
             log(
@@ -227,7 +228,10 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
             return Decided::Reply(pass_through(&miss.to_string()));
         }
     };
-    let inputs = ActionInputManifest {
+    if let Err(reason) = package.verify_generated_disjoint(&plan) {
+        return Decided::Reply(pass_through(&reason));
+    }
+    let mut inputs = ActionInputManifest {
         schema_version: INPUT_EVIDENCE_SCHEMA_VERSION,
         inputs: package
             .files
@@ -242,6 +246,20 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
             .collect(),
         ..ActionInputManifest::default()
     };
+    inputs.inputs.extend(
+        package
+            .generated_files
+            .iter()
+            .map(|(relative, object, executable)| PositiveInput {
+                virtual_path: RawBytes::new(
+                    plan.generated_input_virtual_path(relative).into_bytes(),
+                ),
+                object: ObjectId(object.clone()),
+                file_type: InputFileType::Regular,
+                executable: *executable,
+                symlink_resolution: Vec::new(),
+            }),
+    );
     let mut externs = Vec::new();
     let dependencies = match live.facts.dependencies(&plan) {
         Ok(dependencies) => dependencies,
@@ -265,6 +283,7 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
         &toolchain,
         &externs,
         &dependencies.directories,
+        package.build_script_output.as_deref(),
         &inputs,
     ) {
         Ok(key) => key,
