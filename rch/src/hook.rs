@@ -280,6 +280,32 @@ fn is_remote_execution_unconfirmed(error: &anyhow::Error) -> bool {
         .is_some()
 }
 
+/// Keep failure evidence tied to the selected worker and the transfer's
+/// direction. An unresolved source/execution owner still takes precedence:
+/// its reservation cannot be completed merely because disk exhaustion was
+/// observed while preparing it.
+fn remote_release_faults<'a>(
+    result: &'a anyhow::Result<remote_result::RemoteExecutionResult>,
+    worker_id: &WorkerId,
+) -> (bool, bool, &'a [String]) {
+    match result {
+        Ok(result) => (
+            remote_failure_is_worker_fault(&result.stderr, result.exit_code),
+            remote_failure_is_disk_full(&result.stderr, result.exit_code),
+            &result.disk_roots,
+        ),
+        Err(error) if !is_remote_execution_unconfirmed(error) => {
+            match crate::transfer::find_remote_upload_disk_full(error)
+                .filter(|fault| fault.worker_id == worker_id.as_str())
+            {
+                Some(fault) => (true, true, &fault.roots),
+                None => (false, false, &[]),
+            }
+        }
+        Err(_) => (false, false, &[]),
+    }
+}
+
 fn is_ssh_command_timeout_error(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
         let message = cause.to_string();
@@ -3433,12 +3459,8 @@ pub async fn run_exec(
         });
         // A worker-caused failure must not warm that worker's cache for the
         // project (review of GH #81), or the next build is routed back to it.
-        let release_worker_fault = result
-            .as_ref()
-            .is_ok_and(|ok| remote_failure_is_worker_fault(&ok.stderr, ok.exit_code));
-        let release_worker_disk_full = result
-            .as_ref()
-            .is_ok_and(|ok| remote_failure_is_disk_full(&ok.stderr, ok.exit_code));
+        let (release_worker_fault, release_worker_disk_full, release_disk_roots) =
+            remote_release_faults(&result, &worker.id);
         let release_acknowledged = if retain_unconfirmed_ownership {
             warn!(
                 "Remote completion unconfirmed; retaining build {} ownership",
@@ -3458,7 +3480,7 @@ pub async fn run_exec(
                 Some(&wrapper_id),
                 release_worker_fault,
                 release_worker_disk_full,
-                result.as_ref().map_or(&[], |ok| ok.disk_roots.as_slice()),
+                release_disk_roots,
             )
             .await
             {
@@ -4664,6 +4686,8 @@ async fn handle_selection_response(
         timing.total = Some(remote_elapsed);
         timing
     });
+    let (release_worker_fault, release_worker_disk_full, release_disk_roots) =
+        remote_release_faults(&result, &worker.id);
     if retain_unconfirmed_ownership {
         warn!(
             "Remote completion unconfirmed; retaining worker {} ownership",
@@ -4679,13 +4703,9 @@ async fn handle_selection_response(
         None,
         release_timing.as_ref(),
         None,
-        result
-            .as_ref()
-            .is_ok_and(|ok| remote_failure_is_worker_fault(&ok.stderr, ok.exit_code)),
-        result
-            .as_ref()
-            .is_ok_and(|ok| remote_failure_is_disk_full(&ok.stderr, ok.exit_code)),
-        result.as_ref().map_or(&[], |ok| ok.disk_roots.as_slice()),
+        release_worker_fault,
+        release_worker_disk_full,
+        release_disk_roots,
     )
     .await
     {

@@ -3932,6 +3932,71 @@ fn remote_disk_exhaustion_requires_a_failed_execution_and_covers_quota_errors() 
 }
 
 #[test]
+fn source_upload_disk_release_requires_the_selected_worker_and_confirmed_ownership() {
+    let worker = WorkerId::new("upload-worker");
+    let error = anyhow::anyhow!("source receiver failed")
+        .context(crate::transfer::RemoteUploadDiskFull {
+            worker_id: worker.to_string(),
+            roots: vec!["/source-volume/project".into()],
+        })
+        .context("source preparation failed before remote command execution");
+    let result = Err(error);
+    let (worker_fault, disk_fault, roots) = remote_release_faults(&result, &worker);
+    assert!(worker_fault && disk_fault);
+    assert_eq!(roots, ["/source-volume/project"]);
+    assert_eq!(
+        remote_release_faults(&result, &WorkerId::new("other-worker")),
+        (false, false, &[] as &[String])
+    );
+    let error = result
+        .unwrap_err()
+        .context(crate::transfer::RemoteExecutionUnconfirmed);
+    assert_eq!(
+        classify_remote_pipeline_failure(&error),
+        RemotePipelineFailurePolicy::FailClosedNoLocalFallback
+    );
+    let result = Err(error);
+    assert_eq!(
+        remote_release_faults(&result, &worker),
+        (false, false, &[] as &[String])
+    );
+    assert!(is_remote_execution_unconfirmed(
+        result.as_ref().unwrap_err()
+    ));
+}
+
+#[test]
+fn source_upload_disk_release_never_infers_worker_pressure_from_untyped_transfer_errors() {
+    let worker = WorkerId::new("upload-worker");
+    let result = Err(TransferError::SyncFailed {
+        reason: "rsync artifact retrieval failed".into(),
+        exit_code: Some(23),
+        stderr: "rsync: [receiver] write failed on target/app: No space left on device (28)".into(),
+    }
+    .into());
+    assert_eq!(
+        remote_release_faults(&result, &worker),
+        (false, false, &[] as &[String])
+    );
+    // Existing remote-command evidence still follows its actual exit status.
+    for exit_code in [0, 101] {
+        let result = Ok(remote_result::RemoteExecutionResult {
+            deadline_triggered: false,
+            exit_code,
+            stderr: "No space left on device".into(),
+            duration_ms: 10,
+            timing: Default::default(),
+            result_dirs: Vec::new(),
+            disk_roots: vec!["/build-volume/target".into()],
+        });
+        let (worker_fault, disk_fault, roots) = remote_release_faults(&result, &worker);
+        assert_eq!(worker_fault, exit_code != 0);
+        assert_eq!(disk_fault, exit_code != 0);
+        assert_eq!(roots, ["/build-volume/target"]);
+    }
+}
+
+#[test]
 fn test_remote_failure_is_worker_fault_separates_worker_breakage_from_project_errors() {
     let _guard = test_guard!();
     // Review of GH #81: only these failures withhold the daemon's cache

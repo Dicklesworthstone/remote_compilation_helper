@@ -730,6 +730,40 @@ pub(crate) struct RemoteProcessSetupUnavailable;
 #[error("remote execution completion is unconfirmed; automatic replay is unsafe")]
 pub(crate) struct RemoteExecutionUnconfirmed;
 
+/// Confirmed receiver-side disk exhaustion from a failed POSIX source upload.
+/// Only the upload boundary may attach this context: the receiver of an
+/// artifact download is the dispatcher, not the worker.
+#[derive(Debug, thiserror::Error)]
+#[error("worker {worker_id} exhausted disk space while receiving source files")]
+pub(crate) struct RemoteUploadDiskFull {
+    pub(crate) worker_id: String,
+    pub(crate) roots: Vec<String>,
+}
+
+pub(crate) fn find_remote_upload_disk_full(error: &anyhow::Error) -> Option<&RemoteUploadDiskFull> {
+    error.downcast_ref::<RemoteUploadDiskFull>()
+}
+
+/// Modern rsync's rsyserr identifies the process role and terminates with
+/// strerror(errno) plus its number. Require both boundaries so a filename or
+/// a sender/SSH diagnostic mentioning ENOSPC cannot become worker evidence.
+fn rsync_receiver_disk_full(line: &str) -> bool {
+    let Some(message) = line
+        .strip_prefix("rsync: [receiver] ")
+        .or_else(|| line.strip_prefix("rsync: [generator] "))
+    else {
+        return false;
+    };
+    let Some((message, errno)) = message.rsplit_once(" (") else {
+        return false;
+    };
+    let Some(errno) = errno.strip_suffix(')') else {
+        return false;
+    };
+    (errno == "28" && message.ends_with(": No space left on device"))
+        || (matches!(errno, "69" | "122") && message.ends_with(": Disk quota exceeded"))
+}
+
 /// Typed source-sync stall error (issue #59): the transfer produced NO output
 /// at all — no rsync progress refresh, stats, or itemized line — for the
 /// configured silence window. Deliberately distinct from the wall-clock
@@ -1643,6 +1677,7 @@ pub(crate) struct CleanOverlayMaterialization {
 pub(crate) struct TransferAttemptsExhausted {
     pub(crate) attempts: Vec<TransferAttemptDiagnostic>,
     last_error: String,
+    cause: Option<anyhow::Error>,
 }
 
 impl std::fmt::Display for TransferAttemptsExhausted {
@@ -1656,7 +1691,13 @@ impl std::fmt::Display for TransferAttemptsExhausted {
     }
 }
 
-impl std::error::Error for TransferAttemptsExhausted {}
+impl std::error::Error for TransferAttemptsExhausted {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.cause
+            .as_ref()
+            .map(|error| error.as_ref() as &(dyn std::error::Error + 'static))
+    }
+}
 
 /// Run a source-transfer operation with a full timeout budget for each attempt.
 ///
@@ -1724,6 +1765,7 @@ where
                     return Err(TransferAttemptsExhausted {
                         attempts,
                         last_error: detail,
+                        cause: Some(error),
                     });
                 }
             }
@@ -5191,17 +5233,40 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         // large-but-moving transfer is never killed while a dead channel is
         // detected within the silence window instead of the 1-hour cap.
         let silence_policy = self.source_sync_silence_policy(worker);
-        let (output, duration_ms) = run_command_streaming_with_retry(
+        let mut receiver_disk_full = false;
+        let result = run_command_streaming_with_retry(
             &retry_config,
             "sync_to_remote_streaming",
             Some(attempt_timeout),
             silence_policy.as_ref(),
             build_cmd,
-            |line| {
+            |line, origin| {
+                if origin == StreamOrigin::Stderr && rsync_receiver_disk_full(line) {
+                    receiver_disk_full = true;
+                }
                 on_line(line);
             },
         )
-        .await?;
+        .await;
+        let (output, duration_ms) = result.map_err(|error| {
+            // Timeouts, silence aborts and local spawn/I/O errors do not
+            // establish a completed receiver failure. Preserve all their
+            // existing ownership and retry semantics.
+            let failed_exit = error.chain().any(|cause| {
+                matches!(
+                    cause.downcast_ref::<TransferError>(),
+                    Some(TransferError::SyncFailed { exit_code: Some(code), .. }) if *code != 0
+                )
+            });
+            if !self.worker_platform.is_windows() && receiver_disk_full && failed_exit {
+                error.context(RemoteUploadDiskFull {
+                    worker_id: worker.id.to_string(),
+                    roots: vec![remote_path.clone()],
+                })
+            } else {
+                error
+            }
+        })?;
 
         // Same exit-0-but-incomplete guard as the non-streaming sync_to_remote:
         // run_command_streaming returns the combined stdout+stderr, so scan it for
@@ -6697,7 +6762,7 @@ print('RCH_SOURCE_FRESHNESS_V2 unchanged=%d changed=%d' % (len(current) - len(ch
                 None,
                 None,
                 build_cmd,
-                &mut on_line,
+                |line, _origin| on_line(line),
             )
             .await?
             .0
@@ -7220,6 +7285,12 @@ fn parse_rsync_total_files(output: &str) -> Option<u32> {
     None
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamOrigin {
+    Stdout,
+    Stderr,
+}
+
 /// Pump a child stream into the segment channel, splitting on BOTH `\n` and
 /// `\r`.
 ///
@@ -7230,8 +7301,11 @@ fn parse_rsync_total_files(output: &str) -> Option<u32> {
 /// forward-progress event — exactly what the silence-based stall detector
 /// (issue #59) and the sync heartbeat need to distinguish "large but moving"
 /// from "dead". Empty segments (e.g. the gap inside `\r\n`) are dropped.
-async fn pump_stream_segments<R>(stream: R, tx: tokio::sync::mpsc::Sender<String>)
-where
+async fn pump_stream_segments<R>(
+    stream: R,
+    tx: tokio::sync::mpsc::Sender<(String, StreamOrigin)>,
+    origin: StreamOrigin,
+) where
     R: tokio::io::AsyncRead + Unpin,
 {
     let mut reader = BufReader::new(stream);
@@ -7247,7 +7321,7 @@ where
                 if !pending.is_empty() {
                     let segment = String::from_utf8_lossy(&pending).into_owned();
                     pending.clear();
-                    if tx.send(segment).await.is_err() {
+                    if tx.send((segment, origin)).await.is_err() {
                         return;
                     }
                 }
@@ -7258,7 +7332,7 @@ where
     }
     if !pending.is_empty() {
         let _ = tx
-            .send(String::from_utf8_lossy(&pending).into_owned())
+            .send((String::from_utf8_lossy(&pending).into_owned(), origin))
             .await;
     }
 }
@@ -7271,7 +7345,7 @@ async fn run_command_streaming<F>(
     mut on_line: F,
 ) -> Result<(String, u64)>
 where
-    F: FnMut(&str),
+    F: FnMut(&str, StreamOrigin),
 {
     let start = TokioInstant::now();
     cmd.kill_on_drop(true);
@@ -7290,8 +7364,8 @@ where
     let tx_stderr = tx.clone();
     let tx_stdout = tx.clone();
 
-    tokio::spawn(pump_stream_segments(stdout, tx_stdout));
-    tokio::spawn(pump_stream_segments(stderr, tx_stderr));
+    tokio::spawn(pump_stream_segments(stdout, tx_stdout, StreamOrigin::Stdout));
+    tokio::spawn(pump_stream_segments(stderr, tx_stderr, StreamOrigin::Stderr));
 
     // Drop the original tx so rx will close when both tasks are done
     drop(tx);
@@ -7319,8 +7393,8 @@ where
                 },
                 None => rx.recv().await,
             };
-            let Some(text) = received else { break };
-            on_line(&text);
+            let Some((text, origin)) = received else { break };
+            on_line(&text, origin);
             if combined.len() < MAX_RSYNC_OUTPUT {
                 combined.push_str(&text);
                 combined.push('\n');
@@ -7480,7 +7554,7 @@ async fn run_command_streaming_with_retry<F>(
     mut on_line: F,
 ) -> Result<(String, u64)>
 where
-    F: FnMut(&str),
+    F: FnMut(&str, StreamOrigin),
 {
     let start = std::time::Instant::now();
     let mut last_error: Option<anyhow::Error> = None;
@@ -7579,6 +7653,7 @@ where
                         return Err(anyhow::Error::new(TransferAttemptsExhausted {
                             attempts: source_attempts,
                             last_error: detail,
+                            cause: Some(err),
                         }));
                     }
                     return Err(err);
@@ -7596,6 +7671,7 @@ where
     }
 
     if source_attempt_timeout.is_some() {
+        let last_error_cause = last_error;
         let last_error = source_attempts
             .last()
             .map(|attempt| attempt.detail.clone())
@@ -7603,6 +7679,7 @@ where
         return Err(anyhow::Error::new(TransferAttemptsExhausted {
             attempts: source_attempts,
             last_error,
+            cause: last_error_cause,
         }));
     }
 
@@ -10298,6 +10375,209 @@ Number of files transferred: 42
             );
             assert!(path.ends_with(" rch-source-rsync"), "{path}");
         }
+    }
+
+    #[test]
+    fn source_upload_disk_error_requires_receiver_role_and_terminal_errno() {
+        for line in [
+            "rsync: [receiver] write failed on \"a\": No space left on device (28)",
+            "rsync: [generator] recv_generator: mkdir \"src\" failed: No space left on device (28)",
+            "rsync: [receiver] mkstemp \".a.XXXXXX\" failed: Disk quota exceeded (122)",
+            "rsync: [receiver] mkstemp \".a.XXXXXX\" failed: Disk quota exceeded (69)",
+        ] {
+            assert!(rsync_receiver_disk_full(line), "{line}");
+        }
+        for line in [
+            "rsync: [sender] write error: No space left on device (28)",
+            "ssh: write: No space left on device",
+            "No space left on device (28)",
+            "rsync: [receiver] mkstemp \"No space left on device (28)\" failed: Permission denied (13)",
+            "rsync: [receiver] write failed: No space left on device (0)",
+            "rsync: [receiver] write failed: No space left on device (28) ignored",
+            "rsync: [receiver] write failed: No space left on device (28",
+            "rsync: [receiver] write failed: Disk quota exceeded",
+            "rsync: [receiver] write failed: File too large (27)",
+        ] {
+            assert!(!rsync_receiver_disk_full(line), "{line}");
+        }
+    }
+
+    #[cfg(unix)]
+    fn source_upload_disk_fixture(directory: &Path, script: &str) -> TransferPipeline {
+        use std::os::unix::fs::PermissionsExt;
+        let child = directory.join("controlled-rsync");
+        std::fs::write(&child, format!("#!/bin/sh\n{script}\n")).unwrap();
+        std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut pipeline = TransferPipeline::new(
+            directory.to_owned(),
+            "disk-fault".into(),
+            "abcdef".into(),
+            TransferConfig {
+                retry: RetryConfig {
+                    max_attempts: 1,
+                    ..RetryConfig::default()
+                },
+                sync_timeout_ms: Some(30_000),
+                max_transfer_time_ms: Some(30_000),
+                source_sync_silence_timeout_secs: 0,
+                ..TransferConfig::default()
+            },
+        )
+        .with_remote_path_override("/worker-source-volume/project")
+        .with_rsync(ResolvedRsync {
+            path: child,
+            flavor: RsyncFlavor::Rsync {
+                major: 3,
+                minor: 2,
+                patch: 7,
+            },
+            version_line: String::new(),
+            source: RsyncSource::Config,
+            shadowed: None,
+        });
+        // The controlled executable ignores argv; the existing authority tests
+        // exercise the real remote grant. This tests the production streaming
+        // upload/error pipeline, not a live SSH worker or a filled filesystem.
+        pipeline.source_authority_prefix = Some("env RCH_SOURCE_TEST=owned".into());
+        pipeline
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn source_upload_disk_fault_requires_failed_remote_stderr_and_excludes_downloads() {
+        let _guard = test_guard!();
+        let _real = RealTransport::pin();
+        let worker = estimate_test_worker();
+        for (role, stream, exit, expected) in [
+            ("receiver", "2", 23, true),
+            ("generator", "2", 23, true),
+            ("sender", "2", 23, false),
+            ("receiver", "1", 23, false),
+            ("receiver", "2", 0, false),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let pipeline = source_upload_disk_fixture(
+                directory.path(),
+                &format!(
+                    "printf '%s\\n' 'rsync: [{role}] mkstemp failed: No space left on device (28)' >&{stream}\nexit {exit}"
+                ),
+            );
+            let result = pipeline.sync_to_remote_streaming(&worker, |_| {}).await;
+            let fault = result.as_ref().err().and_then(find_remote_upload_disk_full);
+            assert_eq!(
+                fault.is_some(),
+                expected,
+                "{role}, fd{stream}, exit{exit}: {result:?}"
+            );
+            assert_eq!(result.is_ok(), exit == 0);
+            if let Some(fault) = fault {
+                assert_eq!(fault.worker_id, worker.id.as_str());
+                assert_eq!(fault.roots, ["/worker-source-volume/project"]);
+            }
+            if expected {
+                let error = pipeline
+                    .retrieve_artifacts_streaming(&worker, &["target/app".into()], |_| {})
+                    .await
+                    .unwrap_err();
+                assert!(
+                    find_remote_upload_disk_full(&error).is_none(),
+                    "a download receiver is local: {error:#}"
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn source_upload_disk_fault_survives_output_capture_limit() {
+        let _guard = test_guard!();
+        let _real = RealTransport::pin();
+        let directory = tempfile::tempdir().unwrap();
+        let pipeline = source_upload_disk_fixture(
+            directory.path(),
+            "awk 'BEGIN { for (i=0; i<11000; i++) printf \"%01024d\\n\", i; }'\nprintf '%s\\n' 'rsync: [receiver] write failed on a: No space left on device (28)' >&2\nexit 11",
+        );
+        let mut observed_bytes = 0;
+        let error = pipeline
+            .sync_to_remote_streaming(&estimate_test_worker(), |line| observed_bytes += line.len())
+            .await
+            .unwrap_err();
+        assert!(observed_bytes > 10 * 1024 * 1024);
+        assert!(find_remote_upload_disk_full(&error).is_some(), "{error:#}");
+        assert!(error.downcast_ref::<TransferAttemptsExhausted>().is_some());
+        let stderr = error
+            .chain()
+            .find_map(|cause| match cause.downcast_ref::<TransferError>() {
+                Some(TransferError::SyncFailed { stderr, .. }) => Some(stderr),
+                _ => None,
+            })
+            .unwrap();
+        assert!(stderr.contains("[output truncated]"));
+        assert!(
+            !stderr.contains("No space left on device"),
+            "the fault must come from uncapped stderr observation"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn source_upload_disk_diagnostic_before_timeout_is_not_completed_fault_evidence() {
+        let _guard = test_guard!();
+        let _real = RealTransport::pin();
+        let directory = tempfile::tempdir().unwrap();
+        let mut pipeline = source_upload_disk_fixture(
+            directory.path(),
+            "printf '%s\\n' 'rsync: [receiver] mkstemp failed: No space left on device (28)' >&2\nexec sleep 5",
+        );
+        pipeline.transfer_config.sync_timeout_ms = Some(1_000);
+        let mut saw_diagnostic = false;
+        let error = pipeline
+            .sync_to_remote_streaming(&estimate_test_worker(), |line| {
+                saw_diagnostic |= line.contains("No space left on device");
+            })
+            .await
+            .unwrap_err();
+        assert!(saw_diagnostic);
+        assert!(error.to_string().contains("timed out"), "{error:#}");
+        assert!(find_remote_upload_disk_full(&error).is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn source_upload_disk_diagnostic_does_not_quarantine_a_successful_retry() {
+        let _guard = test_guard!();
+        let _real = RealTransport::pin();
+        let directory = tempfile::tempdir().unwrap();
+        let attempts = directory.path().join("attempts");
+        let mut pipeline = source_upload_disk_fixture(
+            directory.path(),
+            &format!(
+                "if [ ! -e {attempts} ]; then\n  printf 'first\\n' > {attempts}\n  printf '%s\\n' 'rsync: [receiver] write failed on a: No space left on device (28)' 'rsync: connection unexpectedly closed' >&2\n  exit 12\nfi\nprintf 'second\\n' >> {attempts}\nprintf 'sent 100 bytes  received 50 bytes\\n'\nexit 0",
+                attempts = escape(attempts.to_string_lossy()),
+            ),
+        );
+        // Owned source grants never retry in place. Exercise the existing
+        // ordinary-transfer retry policy, without relaxing that grant fence.
+        pipeline.source_authority_prefix = None;
+        pipeline.transfer_config.retry = RetryConfig {
+            max_attempts: 2,
+            base_delay_ms: 1,
+            max_delay_ms: 1,
+            jitter_factor: 0.0,
+            total_timeout_ms: 5_000,
+        };
+        let mut saw_disk_diagnostic = false;
+        let result = pipeline
+            .sync_to_remote_streaming(&estimate_test_worker(), |line| {
+                saw_disk_diagnostic |= line.contains("No space left on device");
+            })
+            .await;
+        assert!(saw_disk_diagnostic);
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(
+            std::fs::read_to_string(attempts).unwrap(),
+            "first\nsecond\n"
+        );
     }
 
     #[cfg(unix)]
@@ -15108,7 +15388,7 @@ Total file size: 123 bytes";
             "test_streaming_rsync",
             std::time::Duration::from_millis(25),
             None,
-            |_| {},
+            |_, _| {},
         )
         .await
         .expect_err("streaming child should time out");
@@ -15150,7 +15430,7 @@ Total file size: 123 bytes";
             "stalled_source_sync",
             std::time::Duration::from_secs(30),
             Some(&policy),
-            |_| {},
+            |_, _| {},
         )
         .await
         .expect_err("a silent child must be aborted by the silence timeout");
@@ -15189,7 +15469,7 @@ Total file size: 123 bytes";
             "progressing_source_sync",
             std::time::Duration::from_secs(30),
             Some(&policy),
-            |_| {},
+            |_, _| {},
         )
         .await
         .expect("slow-but-progressing stream must complete (total > silence window)");
@@ -15215,7 +15495,7 @@ Total file size: 123 bytes";
             "cr_segment_split",
             std::time::Duration::from_secs(10),
             None,
-            move |line| seen_in.lock().unwrap().push(line.to_string()),
+            move |line, _origin| seen_in.lock().unwrap().push(line.to_string()),
         )
         .await
         .expect("segmented stream completes");
@@ -15260,7 +15540,7 @@ Total file size: 123 bytes";
                 cmd.stderr(std::process::Stdio::piped());
                 cmd
             },
-            |_| {},
+            |_, _| {},
         )
         .await
         .expect_err("stalled sync must fail without in-place retries");
@@ -15347,7 +15627,7 @@ Total file size: 123 bytes";
                 cmd.stderr(std::process::Stdio::piped());
                 cmd
             },
-            |_line| {
+            |_line, _origin| {
                 lines_in.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             },
         )
@@ -15395,7 +15675,7 @@ Total file size: 123 bytes";
                 cmd.stderr(std::process::Stdio::piped());
                 cmd
             },
-            |_| {},
+            |_, _| {},
         )
         .await
         .expect_err("non-transport streaming failure should fail fast as Err");
@@ -15440,7 +15720,7 @@ Total file size: 123 bytes";
                 cmd.stderr(std::process::Stdio::piped());
                 cmd
             },
-            |_| {},
+            |_, _| {},
         )
         .await
         .expect("should recover on the second attempt");
@@ -15481,7 +15761,7 @@ Total file size: 123 bytes";
                 command.stdout(Stdio::piped()).stderr(Stdio::piped());
                 command
             },
-            |_| {},
+            |_, _| {},
         )
         .await
         .expect("attempt 2 should receive a fresh 200ms source-sync budget");
@@ -15521,7 +15801,7 @@ Total file size: 123 bytes";
                     .stderr(Stdio::piped());
                 command
             },
-            |_| {},
+            |_, _| {},
         )
         .await
         .expect_err("source streaming retries must exhaust exactly");
