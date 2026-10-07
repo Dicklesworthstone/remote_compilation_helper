@@ -3565,8 +3565,7 @@ impl TransferPipeline {
         let escaped_remote_path = escape(Cow::from(&remote_path));
         let destination = self.rsync_remote_spec(worker, &remote_path);
         let identity_file = shellexpand::tilde(&worker.identity_file);
-        let escaped_identity = escape(Cow::from(identity_file.as_ref()));
-        let ssh_command = self.build_rsync_ssh_command(escaped_identity.as_ref());
+        let ssh_command = self.build_rsync_ssh_command(identity_file.as_ref());
 
         let (mut cmd, capabilities) = self.rsync_command();
         cmd.arg("-azn")
@@ -4190,10 +4189,9 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         let (mut cmd, _capabilities) = self.rsync_command();
 
         let identity_file = shellexpand::tilde(&worker.identity_file);
-        let escaped_identity = escape(Cow::from(identity_file.as_ref()));
         let ssh_command = format!(
             "{} -o ConnectTimeout=5",
-            self.build_rsync_ssh_command(escaped_identity.as_ref())
+            self.build_rsync_ssh_command(identity_file.as_ref())
         );
 
         cmd.arg("-az");
@@ -4350,8 +4348,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         let (mut cmd, capabilities) = self.rsync_command();
 
         let identity_file = shellexpand::tilde(&worker.identity_file);
-        let escaped_identity = escape(Cow::from(identity_file.as_ref()));
-        let ssh_command = self.build_rsync_ssh_command(escaped_identity.as_ref());
+        let ssh_command = self.build_rsync_ssh_command(identity_file.as_ref());
 
         cmd.arg("-az"); // Archive mode + compression
         add_portable_rsync_archive_args(&mut cmd);
@@ -4414,8 +4411,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         let (mut cmd, capabilities) = self.rsync_command();
 
         let identity_file = shellexpand::tilde(&worker.identity_file);
-        let escaped_identity = escape(Cow::from(identity_file.as_ref()));
-        let ssh_command = self.build_rsync_ssh_command(escaped_identity.as_ref());
+        let ssh_command = self.build_rsync_ssh_command(identity_file.as_ref());
 
         cmd.arg("-az"); // Archive mode + compression
         add_portable_rsync_archive_args(&mut cmd);
@@ -4581,8 +4577,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         let escaped_remote_archive = escape(Cow::from(remote_archive_path.as_str()));
         let destination = self.rsync_remote_spec(worker, &remote_archive_path);
         let identity_file = shellexpand::tilde(&worker.identity_file);
-        let escaped_identity = escape(Cow::from(identity_file.as_ref()));
-        let ssh_command = self.build_rsync_ssh_command(escaped_identity.as_ref());
+        let ssh_command = self.build_rsync_ssh_command(identity_file.as_ref());
         let extraction_script = format!(
             "umask 0022\nmkdir -p {path}\nTAR_OPTIONS='' tar -xf {archive} -C {path}",
             path = escaped_remote_path,
@@ -4682,6 +4677,9 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
             self.ssh_options.connect_timeout.as_secs().max(1)
         ));
         cmd.arg("-i").arg(identity_file.as_ref());
+        if let Some(opts) = rch_common::ssh_utils::identities_only_args(identity_file.as_ref()) {
+            cmd.args(opts);
+        }
         if let Some(interval) = self.ssh_options.server_alive_interval {
             let secs = interval.as_secs();
             if secs > 0 {
@@ -5427,6 +5425,9 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
             self.ssh_options.connect_timeout.as_secs().max(1)
         ));
         cmd.arg("-i").arg(identity_file.as_ref());
+        if let Some(opts) = rch_common::ssh_utils::identities_only_args(identity_file.as_ref()) {
+            cmd.args(opts);
+        }
         cmd.arg(&destination).arg("sh").arg("-s");
         cmd.kill_on_drop(true);
         cmd.stdin(Stdio::piped())
@@ -5509,6 +5510,9 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
             self.ssh_options.connect_timeout.as_secs().max(1)
         ));
         cmd.arg("-i").arg(identity_file.as_ref());
+        if let Some(opts) = rch_common::ssh_utils::identities_only_args(identity_file.as_ref()) {
+            cmd.args(opts);
+        }
 
         if let Some(interval) = self.ssh_options.server_alive_interval {
             let secs = interval.as_secs();
@@ -5801,8 +5805,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         let (mut cmd, capabilities) = self.rsync_command();
 
         let identity_file = shellexpand::tilde(&worker.identity_file);
-        let escaped_identity = escape(Cow::from(identity_file.as_ref()));
-        let ssh_command = self.build_rsync_ssh_command(escaped_identity.as_ref());
+        let ssh_command = self.build_rsync_ssh_command(identity_file.as_ref());
 
         // Use --safe-links to prevent symlink traversal attacks from malicious workers.
         // --stats is required so parse_rsync_bytes/parse_rsync_files can read transfer
@@ -5909,9 +5912,8 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         let (mut cmd, capabilities) = self.rsync_command();
 
         let identity_file = shellexpand::tilde(&worker.identity_file);
-        let escaped_identity = escape(Cow::from(identity_file.as_ref()));
 
-        let ssh_command = self.build_rsync_ssh_command(escaped_identity.as_ref());
+        let ssh_command = self.build_rsync_ssh_command(identity_file.as_ref());
 
         cmd.arg("-az");
         add_portable_rsync_archive_args(&mut cmd);
@@ -5988,10 +5990,10 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         cmd
     }
 
-    fn build_rsync_ssh_command(&self, escaped_identity: &str) -> String {
+    fn build_rsync_ssh_command(&self, identity_file: &str) -> String {
         let mut command = format!(
-            "ssh -i {} -o StrictHostKeyChecking=accept-new -o BatchMode=yes",
-            escaped_identity
+            "ssh {} -o StrictHostKeyChecking=accept-new -o BatchMode=yes",
+            rch_common::ssh_utils::identity_shell_args(identity_file)
         );
 
         #[cfg(unix)]
@@ -6192,8 +6194,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         let (mut cmd, capabilities) = self.rsync_command();
 
         let identity_file = shellexpand::tilde(&worker.identity_file);
-        let escaped_identity = escape(Cow::from(identity_file.as_ref()));
-        let ssh_command = self.build_rsync_ssh_command(escaped_identity.as_ref());
+        let ssh_command = self.build_rsync_ssh_command(identity_file.as_ref());
 
         // Same transport hardening as artifact retrieval: --safe-links blocks
         // symlink traversal out of the declared tree.

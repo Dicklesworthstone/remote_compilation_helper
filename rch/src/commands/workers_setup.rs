@@ -944,6 +944,9 @@ pub(crate) async fn run_setup_ssh_command(
     cmd.arg("-o").arg("ConnectTimeout=10");
     cmd.arg("-o").arg("StrictHostKeyChecking=accept-new");
     cmd.arg("-i").arg(&worker.identity_file);
+    if let Some(opts) = rch_common::ssh_utils::identities_only_args(&worker.identity_file) {
+        cmd.args(opts);
+    }
     cmd.arg(format!("{}@{}", worker.user, worker.host));
     cmd.arg(remote_cmd);
 
@@ -1450,6 +1453,9 @@ async fn verify_worker_health(worker: &WorkerConfig) -> Result<bool> {
     cmd.arg("-o").arg("ConnectTimeout=10");
     cmd.arg("-o").arg("StrictHostKeyChecking=accept-new");
     cmd.arg("-i").arg(&worker.identity_file);
+    if let Some(opts) = rch_common::ssh_utils::identities_only_args(&worker.identity_file) {
+        cmd.args(opts);
+    }
     cmd.arg(format!("{}@{}", worker.user, worker.host));
     cmd.arg("rch-wkr capabilities >/dev/null 2>&1 && echo OK || echo DEGRADED");
 
@@ -1674,6 +1680,9 @@ async fn check_remote_toolchain(
     cmd.arg("-o").arg("ConnectTimeout=10");
     cmd.arg("-o").arg("StrictHostKeyChecking=accept-new");
     cmd.arg("-i").arg(&worker.identity_file);
+    if let Some(opts) = rch_common::ssh_utils::identities_only_args(&worker.identity_file) {
+        cmd.args(opts);
+    }
     cmd.arg(format!("{}@{}", worker.user, worker.host));
     cmd.arg(check_toolchain_command(&toolchain.channel));
 
@@ -1700,6 +1709,9 @@ async fn install_remote_toolchain(
     cmd.arg("-o").arg("BatchMode=yes");
     cmd.arg("-o").arg("ConnectTimeout=60"); // Toolchain install can take a while
     cmd.arg("-i").arg(&worker.identity_file);
+    if let Some(opts) = rch_common::ssh_utils::identities_only_args(&worker.identity_file) {
+        cmd.args(opts);
+    }
     cmd.arg(format!("{}@{}", worker.user, worker.host));
     cmd.arg(install_toolchain_command(toolchain));
 

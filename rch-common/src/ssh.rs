@@ -766,22 +766,7 @@ pub fn remote_shell_command(config: &WorkerConfig, command: &str) -> RemoteShell
     }
 }
 
-/// `-o IdentitiesOnly=yes` for a system-ssh spawn that passes `-i
-/// <identity_file>`, but only when that file exists (bd-ebszo).
-///
-/// Without it, ssh offers every ssh-agent key BEFORE the `-i` key. A
-/// dispatcher whose daemon inherited a desktop agent holding 7 keys spent 6
-/// wrong attempts per connection, tripped workers' MaxAuthTries, and OpenSSH
-/// PerSourcePenalties then locked the whole NAT address out of those workers
-/// (~600 failed auths/h, 2026-10-05/06). A missing identity file keeps the
-/// old agent-fallback behavior so agent-only setups still authenticate.
-#[must_use]
-pub fn identities_only_args(identity_file: &str) -> Option<[&'static str; 2]> {
-    let expanded = shellexpand::tilde(identity_file);
-    Path::new(expanded.as_ref())
-        .is_file()
-        .then_some(["-o", "IdentitiesOnly=yes"])
-}
+pub use crate::ssh_utils::identities_only_args;
 
 /// Build the argv for the system-ssh fallback, mirroring the proven CLI
 /// system-ssh pattern (see `rch/src/fleet/ssh.rs::SshExecutor::build_ssh_args`

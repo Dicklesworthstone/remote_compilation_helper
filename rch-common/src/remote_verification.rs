@@ -189,6 +189,10 @@ impl RemoteCompilationTest {
         if let Some(ref identity) = self.worker.identity_file {
             args.push("-i".to_string());
             args.push(identity.to_string_lossy().to_string());
+            if let Some(opts) = crate::ssh_utils::identities_only_args(&identity.to_string_lossy())
+            {
+                args.extend(opts.iter().map(|opt| (*opt).to_string()));
+            }
         }
         args.push(self.worker.ssh_host.clone());
         args

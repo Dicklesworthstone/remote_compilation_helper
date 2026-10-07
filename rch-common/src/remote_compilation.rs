@@ -539,7 +539,6 @@ impl RemoteCompilationTest {
         );
 
         let identity_file = shellexpand::tilde(&self.worker.identity_file);
-        let escaped_identity = escape(Cow::from(identity_file.as_ref()));
 
         let mut cmd = Command::new(&resolved.path);
         configure_rsync_remote_args(cmd.as_std_mut());
@@ -559,8 +558,8 @@ impl RemoteCompilationTest {
             .arg(".git/")
             .arg("-e")
             .arg(format!(
-                "ssh -i {} -o StrictHostKeyChecking=accept-new -o BatchMode=yes",
-                escaped_identity
+                "ssh {} -o StrictHostKeyChecking=accept-new -o BatchMode=yes",
+                crate::ssh_utils::identity_shell_args(identity_file.as_ref())
             ))
             .arg(format!("{}/", self.test_project.display()))
             .arg(&destination)
@@ -700,7 +699,6 @@ impl RemoteCompilationTest {
         );
 
         let identity_file = shellexpand::tilde(&self.worker.identity_file);
-        let escaped_identity = escape(Cow::from(identity_file.as_ref()));
 
         let mut cmd = Command::new(&resolved.path);
         configure_rsync_remote_args(cmd.as_std_mut());
@@ -715,8 +713,8 @@ impl RemoteCompilationTest {
             .arg("--no-group")
             .arg("-e")
             .arg(format!(
-                "ssh -i {} -o StrictHostKeyChecking=accept-new -o BatchMode=yes",
-                escaped_identity
+                "ssh {} -o StrictHostKeyChecking=accept-new -o BatchMode=yes",
+                crate::ssh_utils::identity_shell_args(identity_file.as_ref())
             ))
             .arg(&remote_target)
             .arg(format!("{}/", local_dest.display()))
