@@ -12,7 +12,8 @@ use rch_common::WorkerCapabilities;
 use rch_telemetry::protocol::ReceivedTelemetry;
 use serde::Serialize;
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 use tokio::time::interval;
 use tracing::{debug, info, warn};
 
@@ -147,6 +148,134 @@ impl PressureAssessment {
     /// Free GB on the capacity disk; see [`Self::capacity_disk`].
     pub fn capacity_free_gb(&self) -> Option<f64> {
         self.capacity_disk().0
+    }
+}
+
+/// A live capability probe's capacity sample. This is never serialized or
+/// refreshed by CPU telemetry, pressure reevaluation, or daemon restoration.
+#[derive(Debug, Clone)]
+pub struct DiskCapacityObservation {
+    worker_id: String,
+    free_gib: u64,
+    observed_at: Instant,
+    generation: u64,
+    current_generation: Arc<AtomicU64>,
+}
+
+impl DiskCapacityObservation {
+    pub(crate) fn from_capabilities(
+        worker_id: String,
+        capabilities: &WorkerCapabilities,
+        generation: u64,
+        current_generation: Arc<AtomicU64>,
+        observed_at: Instant,
+    ) -> Option<Self> {
+        // Pressure may describe /tmp instead of build storage. Older workers
+        // without an explicit complete build-root sample cannot prove this
+        // opt-in contract, even if their generic disk report looks healthy.
+        let (Some(free), Some(total)) = (
+            capabilities.build_disk_free_gb,
+            capabilities.build_disk_total_gb,
+        ) else {
+            return None;
+        };
+        if !free.is_finite() || !total.is_finite() || total <= 0.0 || free < 0.0 || free > total {
+            return None;
+        }
+        Some(Self {
+            worker_id,
+            // Worker df probes divide KiB by 1024²: these legacy *_gb fields
+            // carry GiB. Round down rather than granting fractional headroom.
+            free_gib: free.floor() as u64,
+            observed_at,
+            generation,
+            current_generation,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fixture(worker_id: &str, free_gib: f64, age: Duration) -> Self {
+        let mut sample = Self::from_capabilities(
+            worker_id.to_owned(),
+            &WorkerCapabilities {
+                build_disk_free_gb: Some(free_gib),
+                build_disk_total_gb: Some(free_gib.max(1.0)),
+                ..Default::default()
+            },
+            1,
+            Arc::new(AtomicU64::new(1)),
+            Instant::now(),
+        )
+        .unwrap();
+        sample.observed_at = Instant::now() - age;
+        sample
+    }
+}
+
+/// Explicit additional build space, including the operator's margin. Active
+/// reservations remain whole even when observed free space has already fallen;
+/// that conservative double counting avoids treating consumed bytes as a release.
+#[derive(Debug, Clone, Default)]
+pub struct DiskHeadroomAdmission {
+    pub requested_gib: u32,
+    pub capacity: Option<DiskCapacityObservation>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DiskHeadroomRejection {
+    Unknown,
+    Stale,
+    Insufficient { free_gib: u64, required_gib: u64 },
+}
+
+impl DiskHeadroomRejection {
+    pub(crate) fn reason_code(self) -> &'static str {
+        match self {
+            Self::Unknown => "disk_headroom_unknown",
+            Self::Stale => "disk_headroom_stale",
+            Self::Insufficient { .. } => "disk_headroom_insufficient",
+        }
+    }
+}
+
+impl std::fmt::Display for DiskHeadroomRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unknown => f.write_str("declared disk headroom requires a valid live capacity sample and durable budget accounting"),
+            Self::Stale => f.write_str("declared disk headroom capacity sample expired or was superseded"),
+            Self::Insufficient { free_gib, required_gib } => write!(f, "declared disk headroom requires {required_gib} GiB including active reservations; worker reported {free_gib} GiB free"),
+        }
+    }
+}
+
+impl DiskHeadroomAdmission {
+    pub(crate) fn check(
+        &self,
+        worker_id: &str,
+        reserved_gib: u64,
+    ) -> Result<(), DiskHeadroomRejection> {
+        if self.requested_gib == 0 {
+            return Ok(());
+        }
+        let capacity = self
+            .capacity
+            .as_ref()
+            .filter(|sample| sample.worker_id == worker_id)
+            .ok_or(DiskHeadroomRejection::Unknown)?;
+        if capacity.observed_at.elapsed()
+            > DiskPressurePolicyConfig::default().telemetry_stale_after
+            || capacity.current_generation.load(Ordering::Acquire) != capacity.generation
+        {
+            return Err(DiskHeadroomRejection::Stale);
+        }
+        let required_gib = reserved_gib.checked_add(u64::from(self.requested_gib));
+        if required_gib.is_none_or(|required| required > capacity.free_gib) {
+            return Err(DiskHeadroomRejection::Insufficient {
+                free_gib: capacity.free_gib,
+                required_gib: required_gib.unwrap_or(u64::MAX),
+            });
+        }
+        Ok(())
     }
 }
 
@@ -620,6 +749,92 @@ mod tests {
     use rch_telemetry::collect::disk::{DiskMetrics, DiskTelemetry};
     use rch_telemetry::collect::memory::{MemoryPressureStall, MemoryTelemetry};
     use rch_telemetry::protocol::{TelemetrySource, WorkerTelemetry};
+
+    #[test]
+    fn declared_disk_budget_requires_valid_recent_same_worker_capacity() {
+        let admission = |free, age| DiskHeadroomAdmission {
+            requested_gib: 64,
+            capacity: Some(DiskCapacityObservation::fixture("worker", free, age)),
+        };
+        assert!(matches!(
+            admission(51.0, Duration::ZERO).check("worker", 0),
+            Err(DiskHeadroomRejection::Insufficient { .. })
+        ));
+        assert!(admission(64.0, Duration::ZERO).check("worker", 0).is_ok());
+        assert!(admission(64.9, Duration::ZERO).check("worker", 1).is_err());
+        assert!(admission(80.0, Duration::ZERO).check("worker", 16).is_ok());
+        assert!(admission(80.0, Duration::ZERO).check("worker", 17).is_err());
+        assert_eq!(
+            admission(80.0, Duration::from_secs(91)).check("worker", 0),
+            Err(DiskHeadroomRejection::Stale)
+        );
+        assert_eq!(
+            admission(80.0, Duration::ZERO).check("other", 0),
+            Err(DiskHeadroomRejection::Unknown)
+        );
+        assert!(
+            admission(80.0, Duration::ZERO)
+                .check("worker", u64::MAX)
+                .is_err()
+        );
+        assert!(
+            DiskHeadroomAdmission::default()
+                .check("worker", u64::MAX)
+                .is_ok()
+        );
+        assert_eq!(
+            DiskHeadroomAdmission {
+                requested_gib: 1,
+                capacity: None
+            }
+            .check("worker", 0),
+            Err(DiskHeadroomRejection::Unknown)
+        );
+        let snapshot = admission(80.0, Duration::ZERO);
+        snapshot
+            .capacity
+            .as_ref()
+            .unwrap()
+            .current_generation
+            .fetch_add(1, Ordering::Release);
+        assert_eq!(
+            snapshot.check("worker", 0),
+            Err(DiskHeadroomRejection::Stale)
+        );
+    }
+
+    #[test]
+    fn declared_disk_budget_rejects_invalid_or_partial_build_sample() {
+        for (free, total) in [
+            (None, None),
+            (None, Some(100.0)),
+            (Some(100.0), None),
+            (Some(f64::NAN), Some(100.0)),
+            (Some(100.0), Some(f64::INFINITY)),
+            (Some(-1.0), Some(100.0)),
+            (Some(101.0), Some(100.0)),
+            (Some(0.0), Some(0.0)),
+        ] {
+            let caps = WorkerCapabilities {
+                build_disk_free_gb: free,
+                build_disk_total_gb: total,
+                disk_free_gb: Some(1_000.0),
+                disk_total_gb: Some(2_000.0),
+                ..Default::default()
+            };
+            assert!(
+                DiskCapacityObservation::from_capabilities(
+                    "worker".into(),
+                    &caps,
+                    1,
+                    Arc::new(AtomicU64::new(1)),
+                    Instant::now()
+                )
+                .is_none(),
+                "{caps:?}"
+            );
+        }
+    }
 
     #[test]
     fn disk_headroom_tracks_floor_comfort_and_recovery() {

@@ -4,7 +4,8 @@
 
 use crate::DaemonContext;
 use crate::disk_pressure::{
-    DiskPressurePolicyConfig, DiskSlotPolicy, PressureAssessment, evaluate_pressure_policy,
+    DiskCapacityObservation, DiskPressurePolicyConfig, DiskSlotPolicy, PressureAssessment,
+    evaluate_pressure_policy,
 };
 use crate::health::probe_worker_capabilities;
 use rch_common::{
@@ -15,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tracing::debug;
 
@@ -444,6 +445,8 @@ pub struct WorkerState {
     last_error_msg: RwLock<Option<String>>,
     /// Runtime capabilities (Bun, Node, Rust versions).
     capabilities: RwLock<WorkerCapabilities>,
+    disk_capacity_generation: Arc<AtomicU64>,
+    disk_capacity_observation: RwLock<Option<DiskCapacityObservation>>,
     /// Serialize daemon-side capability requests from health, operators and selection.
     capability_probe: tokio::sync::Mutex<()>,
     /// Cached per-toolchain preflight verdicts.
@@ -470,6 +473,12 @@ pub struct WorkerState {
     disabled_at: AtomicI64,
 }
 
+pub(crate) struct CapabilityProbeContext {
+    pub config: WorkerConfig,
+    started_at: Instant,
+    generation: u64,
+}
+
 impl WorkerState {
     /// Create a new worker state from configuration.
     pub fn new(config: WorkerConfig) -> Self {
@@ -490,6 +499,8 @@ impl WorkerState {
             circuit: RwLock::new(CircuitStats::new()),
             last_error_msg: RwLock::new(None),
             capabilities: RwLock::new(WorkerCapabilities::new()),
+            disk_capacity_generation: Arc::new(AtomicU64::new(0)),
+            disk_capacity_observation: RwLock::new(None),
             capability_probe: tokio::sync::Mutex::new(()),
             toolchain_preflight: RwLock::new(HashMap::new()),
             pressure_assessment: RwLock::new(PressureAssessment::default()),
@@ -504,6 +515,7 @@ impl WorkerState {
     pub async fn update_config(&self, new_config: WorkerConfig) {
         {
             let mut config = self.config.write().await;
+            self.disk_capacity_generation.fetch_add(1, Ordering::AcqRel);
             *config = new_config;
         }
 
@@ -893,8 +905,59 @@ impl WorkerState {
         self.capability_probe.try_lock().ok()
     }
 
-    /// Update worker capabilities.
+    /// Test fixtures publish through the same generation-checked boundary.
+    #[cfg(test)]
     pub async fn set_capabilities(&self, capabilities: WorkerCapabilities) {
+        let context = self.capability_probe_context().await;
+        assert!(self.publish_capabilities(context, capabilities).await);
+    }
+
+    pub(crate) async fn capability_probe_context(&self) -> CapabilityProbeContext {
+        let config = self.config.read().await;
+        CapabilityProbeContext {
+            config: config.clone(),
+            started_at: Instant::now(),
+            generation: self.disk_capacity_generation.load(Ordering::Acquire),
+        }
+    }
+
+    /// Publish a probe only for the endpoint/generation that launched it. No
+    /// config lock is held over SSH; this short read lock fences local publish
+    /// against retargeting while the three in-memory snapshots are updated.
+    pub(crate) async fn publish_capabilities(
+        &self,
+        context: CapabilityProbeContext,
+        capabilities: WorkerCapabilities,
+    ) -> bool {
+        let config = self.config.read().await;
+        if config.id != context.config.id
+            || config.host != context.config.host
+            || config.user != context.config.user
+            || config.identity_file != context.config.identity_file
+        {
+            return false;
+        }
+        let generation = context.generation.wrapping_add(1);
+        if self
+            .disk_capacity_generation
+            .compare_exchange(
+                context.generation,
+                generation,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return false;
+        }
+        let observation = DiskCapacityObservation::from_capabilities(
+            config.id.to_string(),
+            &capabilities,
+            generation,
+            Arc::clone(&self.disk_capacity_generation),
+            context.started_at,
+        );
+        *self.disk_capacity_observation.write().await = observation;
         let pressure_config = DiskPressurePolicyConfig::default();
         let pressure = evaluate_pressure_policy(&capabilities, None, &pressure_config);
         *self.capabilities.write().await = capabilities;
@@ -910,15 +973,20 @@ impl WorkerState {
             current.build_disk_free_gb = pressure.build_disk_free_gb;
             current.build_disk_total_gb = pressure.build_disk_total_gb;
             current.evaluated_at_unix_ms = now_ms;
-            return;
+            return true;
         }
 
         *current = pressure;
+        true
     }
 
     /// Get worker capabilities.
     pub async fn capabilities(&self) -> WorkerCapabilities {
         self.capabilities.read().await.clone()
+    }
+
+    pub(crate) async fn disk_capacity_observation(&self) -> Option<DiskCapacityObservation> {
+        self.disk_capacity_observation.read().await.clone()
     }
 
     /// Cache a toolchain preflight verdict for selection-time routing.
@@ -1629,10 +1697,7 @@ async fn refresh_worker_capabilities_for_worker(
     .await;
 
     match probe {
-        Ok(Some(capabilities)) => {
-            worker.set_capabilities(capabilities).await;
-            WorkerCapabilitiesRefreshInfo::live_probe()
-        }
+        Ok(Some(_capabilities)) => WorkerCapabilitiesRefreshInfo::live_probe(),
         Ok(None) => WorkerCapabilitiesRefreshInfo::cached_after_probe_failure(
             "capabilities probe failed; returning cached capability snapshot",
         ),
@@ -1833,6 +1898,126 @@ mod tests {
             tags: Vec::new(),
             tools: Vec::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn declared_disk_budget_observation_is_live_and_invalidated_by_capability_updates() {
+        use crate::disk_pressure::{DiskHeadroomAdmission, DiskHeadroomRejection};
+        let worker = WorkerState::new(recovered_worker_config("disk-worker", 8));
+        assert!(worker.disk_capacity_observation().await.is_none());
+        worker
+            .set_capabilities(WorkerCapabilities {
+                build_disk_free_gb: Some(80.0),
+                build_disk_total_gb: Some(100.0),
+                ..Default::default()
+            })
+            .await;
+        let first = DiskHeadroomAdmission {
+            requested_gib: 64,
+            capacity: worker.disk_capacity_observation().await,
+        };
+        assert!(first.check("disk-worker", 0).is_ok());
+        // A CPU/pressure cycle cannot manufacture or refresh disk evidence.
+        worker
+            .set_pressure_assessment(PressureAssessment {
+                state: crate::disk_pressure::PressureState::Healthy,
+                telemetry_fresh: true,
+                build_disk_free_gb: Some(1_000.0),
+                ..Default::default()
+            })
+            .await;
+        assert!(first.check("disk-worker", 17).is_err());
+        worker
+            .set_capabilities(WorkerCapabilities {
+                build_disk_free_gb: Some(51.0),
+                build_disk_total_gb: Some(100.0),
+                ..Default::default()
+            })
+            .await;
+        assert_eq!(
+            first.check("disk-worker", 0),
+            Err(DiskHeadroomRejection::Stale)
+        );
+        let second = DiskHeadroomAdmission {
+            requested_gib: 64,
+            capacity: worker.disk_capacity_observation().await,
+        };
+        assert!(matches!(
+            second.check("disk-worker", 0),
+            Err(DiskHeadroomRejection::Insufficient { .. })
+        ));
+        worker.set_capabilities(WorkerCapabilities::default()).await;
+        assert!(worker.disk_capacity_observation().await.is_none());
+        assert_eq!(
+            second.check("disk-worker", 0),
+            Err(DiskHeadroomRejection::Stale)
+        );
+        worker
+            .set_pressure_assessment(PressureAssessment {
+                telemetry_fresh: true,
+                ..Default::default()
+            })
+            .await;
+        assert!(worker.disk_capacity_observation().await.is_none());
+        worker
+            .set_capabilities(WorkerCapabilities {
+                build_disk_free_gb: Some(80.0),
+                build_disk_total_gb: Some(100.0),
+                ..Default::default()
+            })
+            .await;
+        let before_reload = DiskHeadroomAdmission {
+            requested_gib: 64,
+            capacity: worker.disk_capacity_observation().await,
+        };
+        let mut config = recovered_worker_config("disk-worker", 8);
+        config.host = "different-host".into();
+        worker.update_config(config).await;
+        assert_eq!(
+            before_reload.check("disk-worker", 0),
+            Err(DiskHeadroomRejection::Stale)
+        );
+        assert!(
+            WorkerState::new(recovered_worker_config("disk-worker", 8))
+                .disk_capacity_observation()
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn declared_disk_budget_probe_cannot_publish_after_retarget_or_newer_probe() {
+        use crate::disk_pressure::{DiskHeadroomAdmission, DiskHeadroomRejection};
+        let worker = WorkerState::new(recovered_worker_config("disk-worker", 8));
+        let old_endpoint = worker.capability_probe_context().await;
+        let mut new_config = recovered_worker_config("disk-worker", 8);
+        new_config.host = "new-host".into();
+        worker.update_config(new_config).await;
+        let caps = |free| WorkerCapabilities {
+            build_disk_free_gb: Some(free),
+            build_disk_total_gb: Some(100.0),
+            ..Default::default()
+        };
+        assert!(!worker.publish_capabilities(old_endpoint, caps(90.0)).await);
+        assert!(worker.disk_capacity_observation().await.is_none());
+        assert!(worker.capabilities().await.build_disk_free_gb.is_none());
+        let superseded = worker.capability_probe_context().await;
+        let current = worker.capability_probe_context().await;
+        assert!(worker.publish_capabilities(current, caps(51.0)).await);
+        assert!(!worker.publish_capabilities(superseded, caps(90.0)).await);
+        assert_eq!(worker.capabilities().await.build_disk_free_gb, Some(51.0));
+        let mut delayed = worker.capability_probe_context().await;
+        delayed.started_at = Instant::now() - Duration::from_secs(91);
+        assert!(worker.publish_capabilities(delayed, caps(90.0)).await);
+        assert_eq!(
+            DiskHeadroomAdmission {
+                requested_gib: 64,
+                capacity: worker.disk_capacity_observation().await,
+            }
+            .check("disk-worker", 0),
+            Err(DiskHeadroomRejection::Stale),
+            "probe duration is part of age"
+        );
     }
 
     #[tokio::test]

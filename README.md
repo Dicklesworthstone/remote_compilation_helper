@@ -496,6 +496,9 @@ remote_speedup_threshold = 1.2
 build_slots = 4
 test_slots = 8
 check_slots = 2
+# Optional additional build-disk headroom for each remote job (GiB).
+# Include expected output growth and a safety margin. Zero disables it.
+# disk_headroom_gib = 80
 build_timeout_sec = 300
 test_timeout_sec = 1800
 bun_timeout_sec = 600
@@ -572,6 +575,23 @@ and reports that the configured deadline expired. It does not retry on a larger
 worker or fall back locally. Machine-mode `rch exec` reports
 `outcome: "deadline_exceeded"`. This classification requires evidence from the
 launcher; exit 137 or elapsed time alone does not establish a timeout.
+
+For projects with large build outputs, set `compilation.disk_headroom_gib` in
+`.rch/config.toml`. A value of `80` requires 80 GiB of additional space on the
+worker's reported build filesystem. Selection requires a successful disk probe
+within 90 seconds and subtracts budgets already held by active builds in this
+daemon. Budgets survive daemon restart and remain held until the owning build
+completes; retries, queue recovery, and `rch diagnose` use the same requirement.
+Smaller CPU-slot estimates and cache affinity cannot bypass it. Older daemons
+reject the distinct budgeted selection endpoint rather than ignoring the
+requirement.
+
+This is admission accounting for the worker's reported canonical/alias build
+roots, not a filesystem quota or a measurement of arbitrary custom target
+mounts. Other dispatchers, undeclared jobs, and external writes are outside its
+accounting. The full budget stays reserved even after a disk sample reflects
+some of the build's output, so admission deliberately errs toward leaving extra
+space. The default is `0`, retaining ordinary disk-pressure admission.
 
 Unix artifact downloads estimate the files matched by the retrieval filters
 before transferring them. Their default total retry budget grows with that size

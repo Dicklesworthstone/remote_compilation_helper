@@ -35,6 +35,7 @@ async fn query_fixture(
         path.to_str().unwrap(),
         "owner",
         1,
+        0,
         "cargo build",
         None,
         RequiredRuntime::None,
@@ -131,6 +132,7 @@ async fn failures_before_connect_do_not_invent_unconfirmed_ownership() {
                 path.to_str().unwrap(),
                 "owner",
                 1,
+                0,
                 "cargo build",
                 None,
                 RequiredRuntime::None,
@@ -310,6 +312,7 @@ async fn unrequested_fixture(
         path.to_str().unwrap(),
         "owner",
         2,
+        0,
         "cargo build",
         None,
         RequiredRuntime::None,
@@ -458,6 +461,7 @@ async fn resuming_query_fixture(
         path.to_str().unwrap(),
         "queued project&variant=one",
         4,
+        0,
         "cargo +nightly-2026-09-01 test --features 'a&b'",
         Some(&toolchain),
         RequiredRuntime::Rust,
@@ -635,7 +639,7 @@ async fn resume_connects_when_the_daemon_socket_reappears() {
         (listener, request)
     };
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-    let client = resume_queued_selection(path.to_str().unwrap(), query, deadline);
+    let client = resume_queued_selection(path.to_str().unwrap(), query, deadline, 0);
     let (result, (listener, request)) = timeout(Duration::from_secs(3), async {
         tokio::join!(client, server)
     })
@@ -664,7 +668,12 @@ async fn unavailable_resume_socket_exhausts_only_the_original_deadline() {
         let budget = Duration::from_millis(160);
         let error = timeout(
             Duration::from_secs(2),
-            resume_queued_selection(path.to_str().unwrap(), "project=queued", started + budget),
+            resume_queued_selection(
+                path.to_str().unwrap(),
+                "project=queued",
+                started + budget,
+                0,
+            ),
         )
         .await
         .expect("absent and refused sockets must not create a fresh response budget")
@@ -707,7 +716,7 @@ async fn resumed_reply_wait_uses_time_left_after_reconnecting() {
     let deadline = started + Duration::from_millis(600);
     let client = async {
         let result =
-            resume_queued_selection(path.to_str().unwrap(), "project=queued", deadline).await;
+            resume_queued_selection(path.to_str().unwrap(), "project=queued", deadline, 0).await;
         finished_tx.send(()).unwrap();
         result
     };
@@ -747,6 +756,7 @@ async fn expired_resume_deadline_does_not_dispatch() {
         path.to_str().unwrap(),
         "project=queued",
         tokio::time::Instant::now() - Duration::from_millis(1),
+        0,
     )
     .await
     .unwrap_err();

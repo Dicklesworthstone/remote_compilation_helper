@@ -716,6 +716,7 @@ struct PartialCompilationConfig {
     build_slots: Option<u32>,
     test_slots: Option<u32>,
     check_slots: Option<u32>,
+    disk_headroom_gib: Option<u32>,
     build_timeout_sec: Option<u64>,
     test_timeout_sec: Option<u64>,
     bun_timeout_sec: Option<u64>,
@@ -1347,6 +1348,7 @@ fn default_sources_map() -> ConfigSourceMap {
         "compilation.build_slots",
         "compilation.test_slots",
         "compilation.check_slots",
+        "compilation.disk_headroom_gib",
         "compilation.build_timeout_sec",
         "compilation.test_timeout_sec",
         "compilation.bun_timeout_sec",
@@ -1446,6 +1448,10 @@ fn apply_layer(
     if let Some(check_slots) = layer.compilation.check_slots {
         config.compilation.check_slots = check_slots;
         set_source(sources, "compilation.check_slots", source.clone());
+    }
+    if let Some(disk_headroom_gib) = layer.compilation.disk_headroom_gib {
+        config.compilation.disk_headroom_gib = disk_headroom_gib;
+        set_source(sources, "compilation.disk_headroom_gib", source.clone());
     }
     if let Some(build_timeout_sec) = layer.compilation.build_timeout_sec {
         config.compilation.build_timeout_sec = build_timeout_sec;
@@ -1874,6 +1880,9 @@ fn merge_compilation(
     }
     if overlay.check_slots != default.check_slots {
         base.check_slots = overlay.check_slots;
+    }
+    if overlay.disk_headroom_gib != default.disk_headroom_gib {
+        base.disk_headroom_gib = overlay.disk_headroom_gib;
     }
     if overlay.build_timeout_sec != default.build_timeout_sec {
         base.build_timeout_sec = overlay.build_timeout_sec;
@@ -2791,6 +2800,9 @@ min_local_time_ms = 2000
 build_slots = 4
 test_slots = 8
 check_slots = 2
+# Additional build-disk headroom per remote job (GiB), including your margin.
+# Zero disables the explicit budget; positive budgets require fresh disk data.
+# disk_headroom_gib = 80
 # External-timeout caps per command kind (seconds). The wrapper SIGKILLs the
 # remote command at these budgets (exit 137), so cold-cache heavy graphs
 # (large dep trees, first build of a new toolchain) can exceed the build
@@ -3603,6 +3615,62 @@ identity_file = "/tmp/id_ed25519"
             .expect("general.log_level source present");
         assert_eq!(source, &ConfigValueSource::UserConfig(user_path));
         info!("PASS: User config source detected for general.log_level");
+    }
+
+    #[test]
+    fn disk_headroom_config_preserves_project_override_and_explicit_zero() {
+        let _guard = test_guard!();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let user_path = dir.path().join("user.toml");
+        let project_path = dir.path().join("project.toml");
+        std::fs::write(&user_path, "[compilation]\ndisk_headroom_gib = 128\n")
+            .expect("user disk budget");
+        let no_env = HashMap::new();
+        let user = load_config_with_sources_from_paths(Some(&user_path), None, Some(&no_env))
+            .expect("load user disk budget");
+        assert_eq!(user.config.compilation.disk_headroom_gib, 128);
+
+        for budget in [80, 0] {
+            std::fs::write(
+                &project_path,
+                format!("[compilation]\ndisk_headroom_gib = {budget}\n"),
+            )
+            .expect("project disk budget");
+            let loaded = load_config_with_sources_from_paths(
+                Some(&user_path),
+                Some(&project_path),
+                Some(&no_env),
+            )
+            .expect("load explicit project budget");
+            assert_eq!(loaded.config.compilation.disk_headroom_gib, budget);
+            assert_eq!(
+                loaded.sources.get("compilation.disk_headroom_gib"),
+                Some(&ConfigValueSource::ProjectConfig(project_path.clone()))
+            );
+            let cached = serde_json::to_vec(&loaded.config).expect("cache configuration");
+            let restored: RchConfig =
+                serde_json::from_slice(&cached).expect("restore configuration");
+            assert_eq!(restored.compilation.disk_headroom_gib, budget);
+        }
+    }
+
+    #[test]
+    fn disk_headroom_config_rejects_invalid_requirements() {
+        let _guard = test_guard!();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        let no_env = HashMap::new();
+        for invalid in ["-1", "1.5", "4294967296", "\"64\""] {
+            std::fs::write(
+                &path,
+                format!("[compilation]\ndisk_headroom_gib = {invalid}\n"),
+            )
+            .expect("invalid budget fixture");
+            assert!(
+                load_config_with_sources_from_paths(Some(&path), None, Some(&no_env)).is_err(),
+                "invalid disk requirement was ignored: {invalid}"
+            );
+        }
     }
 
     #[test]

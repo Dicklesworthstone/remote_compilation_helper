@@ -169,6 +169,7 @@ fn daemon_worker_selector(
 ) -> WorkerSelector {
     let mut selector =
         WorkerSelector::with_config(config.selection.clone(), config.circuit.clone());
+    selector.set_build_history(Arc::clone(&history));
     let headroom = Arc::new(headroom::HeadroomEstimator::new(
         history,
         headroom::HeadroomConfig {

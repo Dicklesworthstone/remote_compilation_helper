@@ -616,15 +616,12 @@ impl HealthMonitor {
                         let timeout = CAPABILITY_PROBE_TIMEOUT;
                         let probe_pool = ssh_pool.clone();
                         tokio::spawn(async move {
-                            if let Some(capabilities) = probe_worker_capabilities(
+                            let _ = probe_worker_capabilities(
                                 &worker_clone,
                                 timeout,
                                 probe_pool.as_ref(),
                             )
-                            .await
-                            {
-                                worker_clone.set_capabilities(capabilities).await;
-                            }
+                            .await;
                         });
                     } else {
                         warn!(
@@ -948,7 +945,8 @@ pub async fn probe_worker_capabilities(
         debug!("Skipping capability refresh: another probe is already running for this worker");
         return None;
     };
-    let worker_config = worker.config.read().await;
+    let context = worker.capability_probe_context().await;
+    let worker_config = &context.config;
 
     // Check if mock mode is enabled
     if is_mock_transport(worker) {
@@ -958,7 +956,11 @@ pub async fn probe_worker_capabilities(
             "Worker {} capabilities probe: mock mode, returning mock capabilities",
             worker_config.id
         );
-        return Some(WorkerCapabilities::mock_with_rust());
+        let capabilities = WorkerCapabilities::mock_with_rust();
+        return worker
+            .publish_capabilities(context, capabilities.clone())
+            .await
+            .then_some(capabilities);
     }
 
     let ssh_options = SshOptions {
@@ -986,7 +988,7 @@ pub async fn probe_worker_capabilities(
 
     // Pooled path: run over the warm shared ControlMaster.
     if let Some(pool) = ssh_pool {
-        match pool.run_with_timeout(&worker_config, cmd, timeout).await {
+        match pool.run_with_timeout(worker_config, cmd, timeout).await {
             Ok(result) => {
                 if result.success() {
                     match serde_json::from_str::<WorkerCapabilities>(&result.stdout) {
@@ -998,7 +1000,10 @@ pub async fn probe_worker_capabilities(
                                 capabilities.bun_version,
                                 capabilities.node_version
                             );
-                            return Some(capabilities);
+                            return worker
+                                .publish_capabilities(context, capabilities.clone())
+                                .await
+                                .then_some(capabilities);
                         }
                         Err(e) => {
                             debug!(
@@ -1045,7 +1050,10 @@ pub async fn probe_worker_capabilities(
                                     capabilities.bun_version,
                                     capabilities.node_version
                                 );
-                                return Some(capabilities);
+                                return worker
+                                    .publish_capabilities(context, capabilities.clone())
+                                    .await
+                                    .then_some(capabilities);
                             }
                             Err(e) => {
                                 debug!(
@@ -1529,6 +1537,7 @@ mod tests {
                 command: None,
                 command_priority: CommandPriority::Normal,
                 estimated_cores: cores,
+                disk_headroom_gib: 0,
                 preferred_workers: vec![],
                 toolchain: None,
                 required_runtime: RequiredRuntime::default(),

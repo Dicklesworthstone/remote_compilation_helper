@@ -2,6 +2,7 @@
 //!
 //! Maintains a ring buffer of recent builds for status reporting and analytics.
 
+use crate::disk_pressure::DiskHeadroomAdmission;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use rch_common::{
     BuildCancellationMetadata, BuildHeartbeatPhase, BuildHeartbeatRequest, BuildLocation,
@@ -146,6 +147,9 @@ pub struct ActiveBuildState {
     pub local_wrapper_id: Option<String>,
     pub remote_pgid_file: Option<String>,
     pub slots: u32,
+    /// Declared additional build space retained until this owner completes.
+    #[serde(default)]
+    pub disk_headroom_gib: u32,
     pub location: BuildLocation,
     pub heartbeat_phase: BuildHeartbeatPhase,
     pub heartbeat_detail: Option<String>,
@@ -425,6 +429,7 @@ impl BuildHistory {
             local_wrapper_id,
             remote_pgid_file: None,
             slots,
+            disk_headroom_gib: 0,
             location,
             heartbeat_phase: BuildHeartbeatPhase::SyncUp,
             heartbeat_detail: Some("build_started".to_string()),
@@ -490,6 +495,7 @@ impl BuildHistory {
             slots,
             location,
             None,
+            DiskHeadroomAdmission::default(),
         )
     }
 
@@ -504,6 +510,7 @@ impl BuildHistory {
         slots: u32,
         location: BuildLocation,
         waiter: Option<&QueuedWaiterClaim>,
+        disk: DiskHeadroomAdmission,
     ) -> std::io::Result<Option<ActiveBuildState>> {
         let id = self.next_id();
         if id >= QUEUE_ID_NAMESPACE {
@@ -525,6 +532,7 @@ impl BuildHistory {
             local_wrapper_id,
             remote_pgid_file: None,
             slots,
+            disk_headroom_gib: disk.requested_gib,
             location,
             heartbeat_phase: BuildHeartbeatPhase::SyncUp,
             heartbeat_detail: Some("build_started".to_string()),
@@ -555,6 +563,17 @@ impl BuildHistory {
         // healthy probe. Its transient lifecycle must not authorize a new
         // build while the newer fault is still awaiting durable quarantine.
         if self.has_pending_disk_fault(&state.worker_id) {
+            return Ok(None);
+        }
+        // This lock also serializes completion. Two selectors may have seen
+        // the same free-space sample; only durable admission spends its budget.
+        if disk
+            .check(
+                &state.worker_id,
+                reserved_disk_headroom(&active, &state.worker_id),
+            )
+            .is_err()
+        {
             return Ok(None);
         }
         {
@@ -616,6 +635,11 @@ impl BuildHistory {
             self.persist_ownership(&active, None)?;
         }
         Ok(Some(state))
+    }
+
+    pub(crate) fn reserved_disk_headroom_gib(&self, worker_id: &str) -> u64 {
+        let active = self.active.read().unwrap_or_else(|e| e.into_inner());
+        reserved_disk_headroom(&active, worker_id)
     }
 
     /// Record a heartbeat/progress update for an active build.
@@ -2128,6 +2152,15 @@ fn prune_terminal_receipts(terminal: &mut HashMap<u64, TerminalOwnership>, now: 
     }
 }
 
+fn reserved_disk_headroom(active: &HashMap<u64, ActiveBuildState>, worker_id: &str) -> u64 {
+    active
+        .values()
+        .filter(|state| state.worker_id == worker_id && state.location == BuildLocation::Remote)
+        .fold(0u64, |sum, state| {
+            sum.saturating_add(u64::from(state.disk_headroom_gib))
+        })
+}
+
 impl Default for BuildHistory {
     fn default() -> Self {
         Self::with_default_capacity()
@@ -2140,6 +2173,130 @@ mod tests {
     use rch_common::test_guard;
     use std::time::{SystemTime, UNIX_EPOCH};
     use tempfile::TempDir;
+
+    fn disk_budget_admit(
+        history: &BuildHistory,
+        project: &str,
+        worker: &str,
+        budget: u32,
+        free: f64,
+    ) -> Option<ActiveBuildState> {
+        history
+            .try_start_active_build_with_waiter(
+                project.into(),
+                worker.into(),
+                "cargo test".into(),
+                0,
+                Some(format!("owner-{project}-{worker}")),
+                1,
+                BuildLocation::Remote,
+                None,
+                DiskHeadroomAdmission {
+                    requested_gib: budget,
+                    capacity: Some(crate::disk_pressure::DiskCapacityObservation::fixture(
+                        worker,
+                        free,
+                        Duration::ZERO,
+                    )),
+                },
+            )
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn declared_disk_budget_is_atomic_across_projects_and_durable_until_owned_completion() {
+        use std::sync::{Arc, Barrier};
+        let root = TempDir::new().unwrap();
+        let path = root.path().join("history.jsonl");
+        let history = Arc::new(BuildHistory::new(10).with_persistence(path.clone()));
+        let barrier = Arc::new(Barrier::new(2));
+        let handles: Vec<_> = ["a", "b"]
+            .into_iter()
+            .map(|project| {
+                let history = Arc::clone(&history);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    disk_budget_admit(&history, project, "worker", 64, 100.0)
+                })
+            })
+            .collect();
+        let admitted: Vec<_> = handles
+            .into_iter()
+            .filter_map(|handle| handle.join().unwrap())
+            .collect();
+        assert_eq!(
+            admitted.len(),
+            1,
+            "the same free space cannot fund both projects"
+        );
+        assert_eq!(history.reserved_disk_headroom_gib("worker"), 64);
+        assert!(disk_budget_admit(&history, "other", "second-worker", 64, 100.0).is_some());
+        drop(history);
+        let restored = BuildHistory::load_from_file(&path, 10).unwrap();
+        assert_eq!(restored.reserved_disk_headroom_gib("worker"), 64);
+        assert!(disk_budget_admit(&restored, "c", "worker", 37, 100.0).is_none());
+        let exact = disk_budget_admit(&restored, "c", "worker", 36, 100.0).unwrap();
+        assert_eq!(restored.reserved_disk_headroom_gib("worker"), 100);
+        let completion = || BuildCompletion {
+            exit_code: 0,
+            duration_ms: None,
+            bytes_transferred: None,
+            timing: None,
+            cancellation: None,
+        };
+        assert!(
+            restored
+                .complete_durable(exact.id, "worker", Some("wrong-owner"), completion())
+                .is_err()
+        );
+        assert_eq!(restored.reserved_disk_headroom_gib("worker"), 100);
+        restored
+            .complete_durable(
+                exact.id,
+                "worker",
+                exact.local_wrapper_id.as_deref(),
+                completion(),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored.reserved_disk_headroom_gib("worker"), 64);
+        assert_eq!(restored.reserved_disk_headroom_gib("second-worker"), 64);
+        drop(restored);
+        let restored = BuildHistory::load_from_file(&path, 10).unwrap();
+        assert_eq!(restored.reserved_disk_headroom_gib("worker"), 64);
+        // Completed output still occupies disk: reduced telemetry plus the
+        // whole running budget is conservative, never an implicit release.
+        assert!(disk_budget_admit(&restored, "d", "worker", 1, 64.0).is_none());
+    }
+
+    #[test]
+    fn declared_disk_budget_rejects_stale_snapshot_at_final_admission() {
+        let history = BuildHistory::new(10);
+        let rejected = history
+            .try_start_active_build_with_waiter(
+                "a".into(),
+                "worker".into(),
+                "cargo test".into(),
+                0,
+                Some("owner".into()),
+                1,
+                BuildLocation::Remote,
+                None,
+                DiskHeadroomAdmission {
+                    requested_gib: 64,
+                    capacity: Some(crate::disk_pressure::DiskCapacityObservation::fixture(
+                        "worker",
+                        100.0,
+                        Duration::from_secs(91),
+                    )),
+                },
+            )
+            .unwrap();
+        assert!(rejected.is_none());
+        assert!(history.active_builds().is_empty());
+        assert_eq!(history.reserved_disk_headroom_gib("worker"), 0);
+    }
 
     fn queue_resume_enqueue(
         history: &BuildHistory,
@@ -2279,6 +2436,7 @@ mod tests {
                     2,
                     BuildLocation::Remote,
                     Some(&claim),
+                    DiskHeadroomAdmission::default(),
                 )
                 .unwrap()
                 .unwrap();
@@ -2295,6 +2453,7 @@ mod tests {
                         2,
                         BuildLocation::Remote,
                         Some(&claim),
+                        DiskHeadroomAdmission::default(),
                     )
                     .unwrap()
                     .is_none()
@@ -2339,6 +2498,7 @@ mod tests {
                         2,
                         BuildLocation::Remote,
                         Some(&claim),
+                        DiskHeadroomAdmission::default(),
                     )
                     .unwrap()
             });
@@ -2394,6 +2554,7 @@ mod tests {
                     2,
                     BuildLocation::Remote,
                     Some(&claim),
+                    DiskHeadroomAdmission::default(),
                 )
                 .is_err()
         );
