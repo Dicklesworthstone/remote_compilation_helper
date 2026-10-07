@@ -121,6 +121,11 @@ pub enum LiveDecision {
     Hit(PendingServe),
     /// Run the compiler as this admitted attempt, then complete it.
     Execute(LocalAttempt),
+    /// Another subscriber owns this action's dispatch. No execution or
+    /// destination writer was admitted for this request. A bounded follower
+    /// may resubmit its original request; the edge must reobserve its inputs
+    /// and all serving gates rather than treating leader completion as a hit.
+    InFlight,
     /// Run the compiler unobserved (reason code).
     PassThrough(String),
 }
@@ -489,7 +494,9 @@ impl LiveDependencyLane {
     }
 
     /// Preview a hit if a verified, replayable result exists; otherwise
-    /// admit a private execution of exactly this action.
+    /// admit one private execution or report its existing dispatch owner.
+    /// In-flight is not a cache hit: followers retry through this same preview
+    /// and sampling gate, including any additional private verification run.
     #[must_use]
     pub fn decide(&self, request: LiveDependencyRequest) -> LiveDecision {
         let request = match self.preview(request) {
@@ -500,7 +507,8 @@ impl LiveDependencyLane {
             Err(reason) => return LiveDecision::PassThrough(format!("serve-fault: {reason}")),
         };
         match self.begin_execution(request) {
-            Ok(attempt) => LiveDecision::Execute(attempt),
+            Ok(Some(attempt)) => LiveDecision::Execute(attempt),
+            Ok(None) => LiveDecision::InFlight,
             Err(reason) => LiveDecision::PassThrough(reason),
         }
     }
@@ -549,11 +557,14 @@ impl LiveDependencyLane {
         }
     }
 
-    fn begin_execution(&self, request: LiveDependencyRequest) -> Result<LocalAttempt, String> {
+    fn begin_execution(
+        &self,
+        request: LiveDependencyRequest,
+    ) -> Result<Option<LocalAttempt>, String> {
         let key = request.key.action_key.clone();
         let refusal = |error: SubmissionRefusal| format!("submission: {error:?}");
         if self.coord.submitted_actor(&key).map_err(refusal)?.is_some() {
-            return Err("in-flight: another subscriber is executing this action".into());
+            return Ok(None);
         }
         let worker = self.local_worker()?;
         {
@@ -594,11 +605,16 @@ impl LiveDependencyLane {
         self.coord
             .submit_action(submission, join, now_micros(), 0)
             .map_err(refusal)?;
-        let serial = self
+        let Some(serial) = self
             .coord
             .claim_submitted_dispatch(&key)
             .map_err(refusal)?
-            .ok_or("in-flight: the dispatch was claimed by another subscriber")?;
+        else {
+            // The atomic dispatch claim, not the optimistic lookup above,
+            // arbitrates concurrent requests. Losing it means wait, not a
+            // second unobserved compiler run in another subscriber's tree.
+            return Ok(None);
+        };
         let mut attempt = LocalAttempt {
             coord: Arc::clone(&self.coord),
             key,
@@ -620,7 +636,7 @@ impl LiveDependencyLane {
         ] {
             attempt.advance(state)?;
         }
-        Ok(attempt)
+        Ok(Some(attempt))
     }
 }
 

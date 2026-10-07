@@ -16,6 +16,11 @@
 //! - `{"kind":"rustc-decision","decision":"execute","attempt":…,"env":[…]}`
 //!   — run the compiler with EXACTLY `env` as an admitted attempt, then send
 //!   `{"kind":"rustc-complete",…}` on the same connection;
+//! - `{"kind":"rustc-decision","decision":"wait",…}` — only for requests
+//!   with `wait_for_inflight: true`: another subscriber owns the dispatch.
+//!   No writer or execution was admitted here. The wrapper may retry the
+//!   identical request on this connection under its own bounded backoff.
+//!   Each retry reobserves inputs and rechecks every serving/sampling gate;
 //! - anything else — run the compiler as if RABS were absent.
 //!
 //! Requests outside the live class keep the shadow plane's observation, so
@@ -301,9 +306,17 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
             .map(|fact| (fact.path, fact.content_digest))
             .collect(),
     });
+    decision_reply(
+        decision,
+        &key_text,
+        request.get("wait_for_inflight").and_then(Value::as_bool) == Some(true),
+    )
+}
+
+fn decision_reply(decision: LiveDecision, key_text: &str, wait_for_inflight: bool) -> Decided {
     match decision {
         LiveDecision::Hit(pending) => {
-            log("hit", &[("key", &key_text)]);
+            log("hit", &[("key", key_text)]);
             Decided::Hit {
                 reply: json!({
                     "kind": "rustc-decision", "decision": "hit",
@@ -316,7 +329,7 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
         LiveDecision::Execute(attempt) => {
             log(
                 "execute",
-                &[("key", &key_text), ("attempt", &attempt.attempt_hex())],
+                &[("key", key_text), ("attempt", &attempt.attempt_hex())],
             );
             let reply = json!({
                 "kind": "rustc-decision", "decision": "execute",
@@ -330,8 +343,24 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
                 attempt: Box::new(attempt),
             }
         }
+        LiveDecision::InFlight if wait_for_inflight => {
+            log("wait", &[("key", key_text)]);
+            // Reply releases the blocking lane immediately. No waiter task,
+            // actor, or output ownership is retained: the existing connection
+            // quota bounds retries, and every retry passes through decide.
+            Decided::Reply(json!({
+                "kind": "rustc-decision", "decision": "wait",
+                "action_key": key_text, "reason": "in-flight",
+                "compiler_skip_authorized": false, "materialization_started": false,
+            }).to_string())
+        }
+        LiveDecision::InFlight => {
+            // Older wrappers do not understand wait. Keep their old healthy
+            // pass-through behavior instead of tripping their circuit breaker.
+            Decided::Reply(pass_through("in-flight: another subscriber is executing this action"))
+        }
         LiveDecision::PassThrough(reason) => {
-            log("pass-through", &[("key", &key_text), ("reason", &reason)]);
+            log("pass-through", &[("key", key_text), ("reason", &reason)]);
             Decided::Reply(pass_through(&reason))
         }
     }
@@ -439,5 +468,35 @@ mod tests {
         assert_eq!(unhex(&hex(&bytes)).unwrap(), bytes);
         assert!(unhex("abc").is_none());
         assert!(unhex("zz").is_none());
+    }
+
+    #[test]
+    fn in_flight_is_a_non_owning_retry_not_a_hit_or_execution() {
+        let Decided::Reply(reply) = decision_reply(LiveDecision::InFlight, "key", true) else {
+            panic!("a follower must not retain an attempt or install capability");
+        };
+        let reply: Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(reply["kind"], "rustc-decision");
+        assert_eq!(reply["decision"], "wait");
+        assert_eq!(reply["action_key"], "key");
+        assert_eq!(reply["compiler_skip_authorized"], false);
+        assert_eq!(reply["materialization_started"], false);
+        assert!(reply.get("attempt").is_none());
+        assert!(reply.get("env").is_none());
+    }
+
+    #[test]
+    fn only_opted_in_contention_waits_and_faults_remain_pass_through() {
+        for (decision, opted_in) in [
+            (LiveDecision::InFlight, false),
+            (LiveDecision::PassThrough("store unavailable".into()), true),
+        ] {
+            let Decided::Reply(reply) = decision_reply(decision, "key", opted_in) else {
+                panic!("no execution or output ownership on refusal");
+            };
+            let reply: Value = serde_json::from_str(&reply).unwrap();
+            assert_eq!(reply["decision"], "pass-through");
+            assert_eq!(reply["compiler_skip_authorized"], false);
+        }
     }
 }
