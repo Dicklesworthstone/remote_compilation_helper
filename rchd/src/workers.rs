@@ -15,7 +15,7 @@ use rch_common::{
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{RwLock, RwLockReadGuard, watch};
 use tracing::debug;
@@ -402,6 +402,11 @@ pub struct WorkerState {
     /// Invalidates network observations when a worker ID is retargeted. This is
     /// separate from disk admission generations, which also advance on probes.
     endpoint_generation: AtomicU64,
+    /// Runtime-only identity: restored ownership must not reuse a generation
+    /// from another daemon lifetime or a removed and reintroduced worker.
+    endpoint_incarnation: Arc<()>,
+    /// A retained Arc stops authorizing live evidence when pool removal wins.
+    endpoint_retired: AtomicBool,
     /// Authoritative worker lifecycle — the two-axis (admin intent + live
     /// eligibility) model from [`WorkerLifecycle`].
     ///
@@ -483,10 +488,13 @@ pub(crate) struct CapabilityProbeContext {
 }
 
 /// Configuration and identity of the endpoint a network operation actually used.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct WorkerEndpointSnapshot {
     pub config: WorkerConfig,
+    #[serde(skip)]
     pub generation: u64,
+    #[serde(skip)]
+    incarnation: Option<Arc<()>>,
 }
 
 fn same_endpoint(left: &WorkerConfig, right: &WorkerConfig) -> bool {
@@ -510,6 +518,8 @@ impl WorkerState {
         Self {
             config: RwLock::new(config),
             endpoint_generation: AtomicU64::new(0),
+            endpoint_incarnation: Arc::new(()),
+            endpoint_retired: AtomicBool::new(false),
             lifecycle: RwLock::new(WorkerLifecycle::new()),
             used_slots: Arc::new(AtomicU32::new(0)),
             speed_score: AtomicU64::new(50.0_f64.to_bits()), // Default mid-range score
@@ -536,6 +546,7 @@ impl WorkerState {
         WorkerEndpointSnapshot {
             config: config.clone(),
             generation: self.endpoint_generation.load(Ordering::Acquire),
+            incarnation: Some(Arc::clone(&self.endpoint_incarnation)),
         }
     }
 
@@ -547,9 +558,22 @@ impl WorkerState {
         snapshot: &WorkerEndpointSnapshot,
     ) -> Option<RwLockReadGuard<'_, WorkerConfig>> {
         let config = self.config.read().await;
-        (snapshot.generation == self.endpoint_generation.load(Ordering::Acquire)
+        (!self.endpoint_retired.load(Ordering::Acquire)
+            && snapshot
+                .incarnation
+                .as_ref()
+                .is_some_and(|incarnation| Arc::ptr_eq(incarnation, &self.endpoint_incarnation))
+            && snapshot.generation == self.endpoint_generation.load(Ordering::Acquire)
             && same_endpoint(&config, &snapshot.config))
         .then_some(config)
+    }
+
+    /// Pool removal uses workers -> config order. A publication that already
+    /// holds this config lock finishes before removal; one waiting elsewhere
+    /// can never credit the ID after a replacement is installed.
+    async fn retire_endpoint(&self) {
+        let _config = self.config.write().await;
+        self.endpoint_retired.store(true, Ordering::Release);
     }
 
     /// Update configuration, returning whether the connection endpoint changed.
@@ -1421,7 +1445,9 @@ impl WorkerPool {
     /// Remove a worker from the pool.
     pub async fn remove_worker(&self, id: &WorkerId) -> bool {
         let mut workers = self.workers.write().await;
-        if workers.remove(id).is_some() {
+        if let Some(worker) = workers.get(id) {
+            worker.retire_endpoint().await;
+            workers.remove(id);
             self.worker_count.fetch_sub(1, Ordering::SeqCst);
             debug!("Removed worker: {}", id);
             true
@@ -1469,7 +1495,9 @@ impl WorkerPool {
             let should_remove = worker.status().await == WorkerStatus::Drained
                 && worker.used_slots() == 0
                 && worker.remove_after_drain_pending().await;
-            if should_remove && workers.remove(&id).is_some() {
+            if should_remove {
+                worker.retire_endpoint().await;
+                workers.remove(&id);
                 count += 1;
                 debug!("Pruned drained worker: {}", id);
             }

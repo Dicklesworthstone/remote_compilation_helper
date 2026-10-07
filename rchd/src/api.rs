@@ -2739,7 +2739,8 @@ async fn handle_select_worker_mode(
                     });
                 };
 
-                let selected_worker_id = worker.config.read().await.id.clone();
+                let selected_endpoint = worker.endpoint_snapshot().await;
+                let selected_worker_id = selected_endpoint.config.id.clone();
 
                 // Reserve the slots.
                 //
@@ -2777,7 +2778,12 @@ async fn handle_select_worker_mode(
                     // A retarget between cloning the address and reading disk
                     // capacity must not fund the old host with the new host's
                     // free space. No SSH runs under this short read lock.
-                    let config = worker.config.read().await;
+                    let Some(config) = worker.lock_current_endpoint(&selected_endpoint).await
+                    else {
+                        worker.release_slots(reserve_slots).await;
+                        excluded_worker_ids.insert(selected_worker_id.as_str().to_string());
+                        continue;
+                    };
                     let (id, host, user, identity_file, declared_os) = (
                         config.id.clone(),
                         config.host.clone(),
@@ -2804,6 +2810,7 @@ async fn handle_select_worker_mode(
                             requested_gib: request.disk_headroom_gib,
                             capacity: worker.disk_capacity_observation().await,
                         },
+                        Some(selected_endpoint.clone()),
                     );
                     drop(config);
                     let state = match admission {
@@ -3338,7 +3345,7 @@ async fn handle_release_worker(ctx: &DaemonContext, request: ReleaseRequest) -> 
     let started = std::time::Instant::now();
     let exit_code = request.exit_code.unwrap_or(0);
     let worker_disk_full = exit_code != 0 && request.worker_disk_full;
-    let (release_worker_id, release_slots, record, remote_command_started) =
+    let (release_worker_id, release_slots, record, remote_command_started, worker_endpoint) =
         if let Some(build_id) = request.build_id {
             let completion = ctx.history.complete_durable_with_disk_fault(
                 build_id,
@@ -3367,6 +3374,7 @@ async fn handle_release_worker(ctx: &DaemonContext, request: ReleaseRequest) -> 
                 state.slots,
                 Some(record),
                 remote_command_started,
+                state.worker_endpoint,
             )
         } else {
             anyhow::bail!("release requires durable build_id; unowned slot release refused")
@@ -3419,9 +3427,11 @@ async fn handle_release_worker(ctx: &DaemonContext, request: ReleaseRequest) -> 
         // Only successful command completions are positive worker-health
         // signals. A nonzero command exit is a build/test result, not an
         // infrastructure failure for the worker circuit.
-        if let Some(ref worker_id) = rec.worker_id {
-            if let Some(worker) = ctx.pool.get(&rch_common::WorkerId::new(worker_id)).await
-                && exit_code == 0
+        if let Some(endpoint) = worker_endpoint.as_ref()
+            && let Some(worker) = ctx.pool.get(&endpoint.config.id).await
+        {
+            if exit_code == 0
+                && let Some(_endpoint_guard) = worker.lock_current_endpoint(endpoint).await
             {
                 worker.record_success().await;
             }
@@ -3430,8 +3440,9 @@ async fn handle_release_worker(ctx: &DaemonContext, request: ReleaseRequest) -> 
             // system library, SIGILL, full disk) says the worker is broken
             // for this project, not that its pool is worth returning to.
             ctx.worker_selector
-                .record_remote_completion(
-                    worker_id,
+                .record_bound_remote_completion(
+                    &worker,
+                    endpoint,
                     &rec.project_id,
                     &rec.command,
                     exit_code,
@@ -8214,16 +8225,23 @@ mod tests {
                 &store_path,
             )));
             ctx.bypass_store = Some(store.clone());
-            let build = ctx.history.start_active_build_with_wrapper(
-                "disk-project".into(),
-                "worker1".into(),
-                "cargo build".into(),
-                12345,
-                Some("owner".into()),
-                2,
-                rch_common::BuildLocation::Remote,
-            );
             let worker = pool.get(&WorkerId::new("worker1")).await.unwrap();
+            let build = ctx
+                .history
+                .try_start_active_build_with_waiter(
+                    "disk-project".into(),
+                    "worker1".into(),
+                    "cargo build".into(),
+                    12345,
+                    Some("owner".into()),
+                    2,
+                    rch_common::BuildLocation::Remote,
+                    None,
+                    crate::disk_pressure::DiskHeadroomAdmission::default(),
+                    Some(worker.endpoint_snapshot().await),
+                )
+                .unwrap()
+                .unwrap();
             assert!(worker.reserve_slots(2).await);
             ctx.history
                 .record_build_heartbeat(BuildHeartbeatRequest {
@@ -8550,18 +8568,26 @@ mod tests {
         let ctx = make_test_context(pool.clone());
 
         // Start a build first using the correct API
-        let build = ctx.history.start_active_build(
-            "test-project".to_string(),
-            "worker1".to_string(),
-            "cargo build".to_string(),
-            12345,
-            4,
-            rch_common::BuildLocation::Remote,
-        );
+        let worker = pool.get(&WorkerId::new("worker1")).await.unwrap();
+        let build = ctx
+            .history
+            .try_start_active_build_with_waiter(
+                "test-project".to_string(),
+                "worker1".to_string(),
+                "cargo build".to_string(),
+                12345,
+                None,
+                4,
+                rch_common::BuildLocation::Remote,
+                None,
+                crate::disk_pressure::DiskHeadroomAdmission::default(),
+                Some(worker.endpoint_snapshot().await),
+            )
+            .unwrap()
+            .unwrap();
         let build_id = build.id;
 
         // Reserve slots
-        let worker = pool.get(&WorkerId::new("worker1")).await.unwrap();
         worker.reserve_slots(4).await;
 
         let request = ReleaseRequest {
@@ -8596,6 +8622,139 @@ mod tests {
                 .await,
             Some("worker1".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn completed_build_feedback_is_bound_but_slot_release_survives_retarget_and_restart() {
+        for change in ["unchanged", "retarget", "aba", "restart", "legacy"] {
+            let directory = tempfile::tempdir().unwrap();
+            let history_path = directory.path().join("history.jsonl");
+            let original = make_test_worker("bound-completion", 8);
+            let pool = WorkerPool::new();
+            pool.add_worker(original.clone()).await;
+            let mut worker = pool.get(&original.id).await.unwrap();
+            let mut ctx = make_test_context(pool.clone());
+            ctx.history = Arc::new(BuildHistory::new(100).with_persistence(history_path.clone()));
+            let other = ctx.history.start_active_build(
+                "other-build".into(),
+                original.id.to_string(),
+                "cargo check".into(),
+                0,
+                1,
+                rch_common::BuildLocation::Remote,
+            );
+            assert!(worker.reserve_slots(1).await);
+
+            let build_id = if change == "legacy" {
+                assert!(worker.reserve_slots(2).await);
+                ctx.history
+                    .start_active_build(
+                        "finished-build".into(),
+                        original.id.to_string(),
+                        "cargo build".into(),
+                        0,
+                        2,
+                        rch_common::BuildLocation::Remote,
+                    )
+                    .id
+            } else {
+                let response = handle_select_worker(
+                    &ctx,
+                    SelectionRequest {
+                        job_mode: false,
+                        project: "finished-build".into(),
+                        command: Some("cargo build".into()),
+                        command_priority: CommandPriority::Normal,
+                        estimated_cores: 2,
+                        disk_headroom_gib: 0,
+                        preferred_workers: vec![],
+                        toolchain: None,
+                        required_runtime: RequiredRuntime::default(),
+                        classification_duration_us: None,
+                        hook_pid: None,
+                        required_tools: Vec::new(),
+                    },
+                    false,
+                    None,
+                )
+                .await
+                .unwrap();
+                let selected = response.worker.unwrap();
+                let id = response.build_id.unwrap();
+                let active = ctx.history.active_build(id).unwrap();
+                let endpoint = active.worker_endpoint.as_ref().unwrap();
+                assert_eq!(endpoint.config.id, selected.id);
+                assert_eq!(endpoint.config.host, selected.host);
+                assert_eq!(endpoint.config.user, selected.user);
+                assert_eq!(endpoint.config.identity_file, selected.identity_file);
+                assert_eq!(
+                    rch_common::declared_os(&endpoint.config.tags),
+                    selected.declared_os
+                );
+                id
+            };
+            assert_eq!(worker.used_slots(), 3);
+            if matches!(change, "retarget" | "aba") {
+                let mut replacement = original.clone();
+                replacement.host = "replacement.host".into();
+                pool.add_worker(replacement).await;
+                if change == "aba" {
+                    pool.add_worker(original.clone()).await;
+                }
+            } else if change == "restart" {
+                ctx.history = Arc::new(BuildHistory::load_from_file(&history_path, 100).unwrap());
+                ctx.pool = WorkerPool::new();
+                ctx.pool.add_worker(original.clone()).await;
+                worker = ctx.pool.get(&original.id).await.unwrap();
+                for active in ctx.history.active_builds() {
+                    worker.restore_slots(active.slots).unwrap();
+                }
+            }
+            worker
+                .record_failure(Some("current endpoint evidence".into()))
+                .await;
+            let release = ReleaseRequest {
+                local_wrapper_id: None,
+                worker_id: original.id.clone(),
+                slots: 999,
+                build_id: Some(build_id),
+                exit_code: Some(0),
+                duration_ms: None,
+                bytes_transferred: None,
+                timing: None,
+                worker_fault: false,
+                worker_disk_full: false,
+                worker_disk_roots: Vec::new(),
+            };
+            handle_release_worker(&ctx, release.clone()).await.unwrap();
+            assert_eq!(
+                worker.used_slots(),
+                1,
+                "{change}: release follows exact ownership"
+            );
+            let stats = worker.circuit_stats().await;
+            assert_eq!(
+                stats.consecutive_failures(),
+                u32::from(change != "unchanged"),
+                "{change}"
+            );
+            assert_eq!(
+                ctx.worker_selector
+                    .get_fallback_worker("finished-build")
+                    .await,
+                (change == "unchanged").then(|| original.id.to_string()),
+                "{change}: old ownership cannot pin the current worker"
+            );
+            handle_release_worker(&ctx, release).await.unwrap();
+            assert_eq!(
+                worker.used_slots(),
+                1,
+                "{change}: duplicate completion released another build"
+            );
+            assert!(ctx.history.active_build(other.id).is_some());
+            assert!(ctx.history.active_build(build_id).is_none());
+            assert_eq!(ctx.history.recent(10).len(), 1);
+        }
     }
 
     #[tokio::test]
@@ -8769,15 +8928,24 @@ mod tests {
         let ctx = make_test_context(pool.clone());
         let worker = pool.get(&WorkerId::new("worker1")).await.unwrap();
 
+        let endpoint = worker.endpoint_snapshot().await;
         let start = |project: &str| {
-            let build = ctx.history.start_active_build(
-                project.to_string(),
-                "worker1".to_string(),
-                "cargo build".to_string(),
-                12345,
-                2,
-                rch_common::BuildLocation::Remote,
-            );
+            let build = ctx
+                .history
+                .try_start_active_build_with_waiter(
+                    project.to_string(),
+                    "worker1".to_string(),
+                    "cargo build".to_string(),
+                    12345,
+                    None,
+                    2,
+                    rch_common::BuildLocation::Remote,
+                    None,
+                    crate::disk_pressure::DiskHeadroomAdmission::default(),
+                    Some(endpoint.clone()),
+                )
+                .unwrap()
+                .unwrap();
             build.id
         };
         let release = |build_id| ReleaseRequest {

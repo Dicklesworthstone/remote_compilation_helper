@@ -16,7 +16,7 @@ use crate::metrics::{
     latency::{DecisionTimer, DecisionType},
 };
 use crate::ui::workers::{debug_routing_enabled, log_routing_decision};
-use crate::workers::{WorkerPool, WorkerState};
+use crate::workers::{WorkerEndpointSnapshot, WorkerPool, WorkerState};
 use rand::RngExt;
 use rch_common::{
     CircuitBreakerConfig, CircuitState, CommandPriority, CompilationKind, RequiredRuntime,
@@ -1056,22 +1056,28 @@ impl WorkerSelector {
     /// pooled target dir holds the project's dependency artifacts. Record that
     /// as cache warmth only, so the next edit-fix-build is scored toward the
     /// warm pool instead of recompiling every dependency elsewhere (GH #81).
-    pub async fn record_remote_completion(
+    ///
+    /// Cache evidence from an admitted build belongs only to its original
+    /// live endpoint. Selection takes cache -> config locks; publication must
+    /// use the same order so a pending config writer cannot form a cycle.
+    pub(crate) async fn record_bound_remote_completion(
         &self,
-        worker_id: &str,
+        worker: &WorkerState,
+        endpoint: &WorkerEndpointSnapshot,
         project_id: &str,
         command: &str,
         exit_code: i32,
         remote_command_started: bool,
     ) {
+        let mut cache = self.cache_tracker.write().await;
+        let Some(_endpoint_guard) = worker.lock_current_endpoint(endpoint).await else {
+            return;
+        };
+        let worker_id = endpoint.config.id.as_str();
         if exit_code == 0 {
-            self.record_success(worker_id, project_id).await;
+            cache.record_success(worker_id, project_id);
         } else if remote_command_started {
-            let cache_use = cache_use_for_command(command);
-            self.cache_tracker
-                .write()
-                .await
-                .record_build(worker_id, project_id, cache_use);
+            cache.record_build(worker_id, project_id, cache_use_for_command(command));
         }
     }
 
@@ -7074,6 +7080,7 @@ mod tests {
                     requested_gib: 64,
                     capacity: worker.disk_capacity_observation().await,
                 },
+                Some(worker.endpoint_snapshot().await),
             )
             .unwrap()
             .unwrap();
@@ -8887,8 +8894,17 @@ mod tests {
         );
 
         // Failed before the remote command started: nothing is warm.
+        let worker = pool.get(&WorkerId::new("worker-a")).await.unwrap();
+        let endpoint = worker.endpoint_snapshot().await;
         selector
-            .record_remote_completion("worker-a", "poolrepro", "cargo build -j 2", 1, false)
+            .record_bound_remote_completion(
+                &worker,
+                &endpoint,
+                "poolrepro",
+                "cargo build -j 2",
+                1,
+                false,
+            )
             .await;
         assert_eq!(
             selector
@@ -8898,7 +8914,14 @@ mod tests {
         );
 
         selector
-            .record_remote_completion("worker-a", "poolrepro", "cargo build -j 2", 101, true)
+            .record_bound_remote_completion(
+                &worker,
+                &endpoint,
+                "poolrepro",
+                "cargo build -j 2",
+                101,
+                true,
+            )
             .await;
         assert_eq!(
             selector
@@ -8918,8 +8941,23 @@ mod tests {
     #[tokio::test]
     async fn remote_completion_records_test_warmth_and_success_pins() {
         let selector = WorkerSelector::new();
+        let first = WorkerState::new(WorkerConfig {
+            id: WorkerId::new("w1"),
+            ..WorkerConfig::default()
+        });
+        let second = WorkerState::new(WorkerConfig {
+            id: WorkerId::new("w2"),
+            ..WorkerConfig::default()
+        });
         selector
-            .record_remote_completion("w1", "proj", "cargo test --workspace", 130, true)
+            .record_bound_remote_completion(
+                &first,
+                &first.endpoint_snapshot().await,
+                "proj",
+                "cargo test --workspace",
+                130,
+                true,
+            )
             .await;
         assert_eq!(
             selector.cache_warmth("w1", "proj", CacheUse::Test).await,
@@ -8928,12 +8966,88 @@ mod tests {
         assert_eq!(selector.get_pinned_worker("proj").await, None);
 
         selector
-            .record_remote_completion("w2", "proj", "cargo build", 0, true)
+            .record_bound_remote_completion(
+                &second,
+                &second.endpoint_snapshot().await,
+                "proj",
+                "cargo build",
+                0,
+                true,
+            )
             .await;
         assert_eq!(
             selector.get_pinned_worker("proj").await.as_deref(),
             Some("w2")
         );
+    }
+
+    #[tokio::test]
+    async fn blocked_completion_cannot_publish_through_a_pruned_worker_arc() {
+        use std::future::{Future, poll_fn};
+        use std::task::Poll;
+
+        for prune in [false, true] {
+            let pool = WorkerPool::new();
+            let config = WorkerConfig {
+                id: WorkerId::new("reused-id"),
+                ..WorkerConfig::default()
+            };
+            pool.add_worker(config.clone()).await;
+            let old = pool.get(&config.id).await.unwrap();
+            let endpoint = old.endpoint_snapshot().await;
+            assert!(old.reserve_slots(1).await);
+            if prune {
+                old.drain_for_removal().await;
+            }
+            let selector = WorkerSelector::new();
+            let held_cache = selector.cache_tracker.write().await;
+            let completion = selector.record_bound_remote_completion(
+                &old,
+                &endpoint,
+                "owned-project",
+                "cargo build",
+                0,
+                true,
+            );
+            tokio::pin!(completion);
+            poll_fn(|cx| {
+                assert!(completion.as_mut().poll(cx).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+            pool.release_slots(&config.id, 1).await;
+            if prune {
+                assert_eq!(pool.prune_drained().await, 1);
+            } else {
+                assert!(pool.remove_worker(&config.id).await);
+            }
+            pool.add_worker(config.clone()).await;
+            let replacement = pool.get(&config.id).await.unwrap();
+            replacement
+                .record_failure(Some("replacement evidence".into()))
+                .await;
+            assert!(!Arc::ptr_eq(&old, &replacement));
+            assert!(old.lock_current_endpoint(&endpoint).await.is_none());
+            assert!(
+                old.lock_current_endpoint(&old.endpoint_snapshot().await)
+                    .await
+                    .is_none(),
+                "a new snapshot must not resurrect a detached Arc's authority"
+            );
+            assert!(replacement.lock_current_endpoint(&endpoint).await.is_none());
+            drop(held_cache);
+            tokio::time::timeout(Duration::from_secs(1), completion)
+                .await
+                .unwrap();
+            assert_eq!(selector.get_pinned_worker("owned-project").await, None);
+            assert_eq!(
+                selector
+                    .cache_warmth(config.id.as_str(), "owned-project", CacheUse::Build)
+                    .await,
+                0.0
+            );
+            assert_eq!(replacement.circuit_stats().await.consecutive_failures(), 1);
+        }
     }
 
     #[test]

@@ -3,6 +3,7 @@
 //! Maintains a ring buffer of recent builds for status reporting and analytics.
 
 use crate::disk_pressure::{DiskHeadroomAdmission, DiskHeadroomRejection};
+use crate::workers::WorkerEndpointSnapshot;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use rch_common::{
     BuildCancellationMetadata, BuildHeartbeatPhase, BuildHeartbeatRequest, BuildLocation,
@@ -136,6 +137,10 @@ pub struct ActiveBuildState {
     pub project_id: String,
     pub worker_id: String,
     pub command: String,
+    /// SSH coordinates admitted for this exact build. A worker ID may be
+    /// retargeted while the build runs; missing legacy coordinates stay unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) worker_endpoint: Option<WorkerEndpointSnapshot>,
     pub started_at: String,
     #[serde(skip, default = "Instant::now")]
     pub started_at_mono: Instant,
@@ -428,6 +433,7 @@ impl BuildHistory {
             project_id,
             worker_id,
             command,
+            worker_endpoint: None,
             started_at: started_at.clone(),
             hook_process_identity: process_identity(hook_pid),
             started_at_mono,
@@ -502,11 +508,12 @@ impl BuildHistory {
             location,
             None,
             DiskHeadroomAdmission::default(),
+            None,
         )
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn try_start_active_build_with_waiter(
+    pub(crate) fn try_start_active_build_with_waiter(
         &self,
         project_id: String,
         worker_id: String,
@@ -517,7 +524,16 @@ impl BuildHistory {
         location: BuildLocation,
         waiter: Option<&QueuedWaiterClaim>,
         disk: DiskHeadroomAdmission,
+        worker_endpoint: Option<WorkerEndpointSnapshot>,
     ) -> std::io::Result<Option<ActiveBuildState>> {
+        if worker_endpoint.as_ref().is_some_and(|endpoint| {
+            endpoint.config.id.as_str() != worker_id || location != BuildLocation::Remote
+        }) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "active build endpoint does not match its remote worker",
+            ));
+        }
         let id = self.next_id();
         if id >= QUEUE_ID_NAMESPACE {
             return Err(std::io::Error::other(
@@ -531,6 +547,7 @@ impl BuildHistory {
             project_id,
             worker_id,
             command,
+            worker_endpoint,
             started_at: started_at.clone(),
             hook_process_identity: process_identity(hook_pid),
             started_at_mono,
@@ -1630,6 +1647,10 @@ impl BuildHistory {
                     if state.id == 0
                         || state.id >= QUEUE_ID_NAMESPACE
                         || state.worker_id.is_empty()
+                        || state.worker_endpoint.as_ref().is_some_and(|endpoint| {
+                            endpoint.config.id.as_str() != state.worker_id
+                                || state.location != BuildLocation::Remote
+                        })
                         || active.contains_key(&state.id)
                         || state.local_wrapper_id.as_ref().is_some_and(|wrapper| {
                             wrapper.is_empty()
@@ -2224,7 +2245,7 @@ impl Default for BuildHistory {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rch_common::test_guard;
+    use rch_common::{WorkerId, test_guard};
     use std::time::{SystemTime, UNIX_EPOCH};
     use tempfile::TempDir;
 
@@ -2267,6 +2288,7 @@ mod tests {
                 BuildLocation::Remote,
                 None,
                 disk,
+                None,
             )
             .unwrap()
     }
@@ -2506,6 +2528,7 @@ mod tests {
                 BuildLocation::Local,
                 None,
                 sample.clone(),
+                None,
             )
             .unwrap()
             .unwrap();
@@ -2610,6 +2633,7 @@ mod tests {
                         Duration::from_secs(91),
                     )),
                 },
+                None,
             )
             .unwrap();
         assert!(rejected.is_none());
@@ -2756,6 +2780,7 @@ mod tests {
                     BuildLocation::Remote,
                     Some(&claim),
                     DiskHeadroomAdmission::default(),
+                    None,
                 )
                 .unwrap()
                 .unwrap();
@@ -2773,6 +2798,7 @@ mod tests {
                         BuildLocation::Remote,
                         Some(&claim),
                         DiskHeadroomAdmission::default(),
+                        None,
                     )
                     .unwrap()
                     .is_none()
@@ -2818,6 +2844,7 @@ mod tests {
                         BuildLocation::Remote,
                         Some(&claim),
                         DiskHeadroomAdmission::default(),
+                        None,
                     )
                     .unwrap()
             });
@@ -2874,6 +2901,7 @@ mod tests {
                     BuildLocation::Remote,
                     Some(&claim),
                     DiskHeadroomAdmission::default(),
+                    None,
                 )
                 .is_err()
         );
@@ -2943,6 +2971,170 @@ mod tests {
             std::fs::read(&temporary).unwrap().as_slice(),
             &prior_temporary[..]
         );
+    }
+
+    #[tokio::test]
+    async fn admitted_endpoint_persists_coordinates_without_restoring_runtime_authority() {
+        let root = TempDir::new().unwrap();
+        let path = root.path().join("history.jsonl");
+        let config = rch_common::WorkerConfig {
+            id: WorkerId::new("durable-endpoint"),
+            host: "admitted.example".into(),
+            user: "build-user".into(),
+            identity_file: "/keys/admitted key".into(),
+            tags: vec!["os:linux".into()],
+            ..rch_common::WorkerConfig::default()
+        };
+        let worker = crate::workers::WorkerState::new(config.clone());
+        let endpoint = worker.endpoint_snapshot().await;
+        let history = BuildHistory::new(10).with_persistence(path.clone());
+        let active = history
+            .try_start_active_build_with_waiter(
+                "persist-endpoint".into(),
+                config.id.to_string(),
+                "cargo test".into(),
+                std::process::id(),
+                Some("endpoint-owner".into()),
+                3,
+                BuildLocation::Remote,
+                None,
+                DiskHeadroomAdmission::default(),
+                Some(endpoint.clone()),
+            )
+            .unwrap()
+            .unwrap();
+        assert!(
+            worker
+                .lock_current_endpoint(active.worker_endpoint.as_ref().unwrap())
+                .await
+                .is_some()
+        );
+        let snapshot: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path.with_extension("ownership.json")).unwrap())
+                .unwrap();
+        let saved = snapshot["active"][0]["worker_endpoint"]
+            .as_object()
+            .unwrap();
+        assert_eq!(
+            saved.len(),
+            1,
+            "only endpoint coordinates are durable, never a process-local epoch"
+        );
+        assert_eq!(saved["config"]["host"], "admitted.example");
+        assert_eq!(saved["config"]["identity_file"], "/keys/admitted key");
+
+        let restored = BuildHistory::load_from_file(&path, 10).unwrap();
+        let recovered = restored.active_build(active.id).unwrap();
+        let recovered_endpoint = recovered.worker_endpoint.as_ref().unwrap();
+        assert!(recovered.recovered);
+        assert_eq!(recovered.slots, 3);
+        assert_eq!(recovered_endpoint.config.id, config.id);
+        assert_eq!(recovered_endpoint.config.host, config.host);
+        assert_eq!(recovered_endpoint.config.user, config.user);
+        assert_eq!(
+            recovered_endpoint.config.identity_file,
+            config.identity_file
+        );
+        assert_eq!(recovered_endpoint.config.tags, config.tags);
+        assert!(
+            worker
+                .lock_current_endpoint(recovered_endpoint)
+                .await
+                .is_none()
+        );
+        let restarted_worker = crate::workers::WorkerState::new(config);
+        assert!(
+            restarted_worker
+                .lock_current_endpoint(&endpoint)
+                .await
+                .is_none()
+        );
+        assert!(
+            restarted_worker
+                .lock_current_endpoint(recovered_endpoint)
+                .await
+                .is_none(),
+            "same coordinates and generation zero cannot credit an earlier daemon's build"
+        );
+    }
+
+    #[tokio::test]
+    async fn active_endpoint_rejects_mismatched_worker_at_admission_and_recovery() {
+        let config = rch_common::WorkerConfig {
+            id: WorkerId::new("original-worker"),
+            ..rch_common::WorkerConfig::default()
+        };
+        let worker = crate::workers::WorkerState::new(config);
+        let endpoint = worker.endpoint_snapshot().await;
+        for (worker_id, location) in [
+            ("other-worker", BuildLocation::Remote),
+            ("original-worker", BuildLocation::Local),
+        ] {
+            let history = BuildHistory::new(10);
+            let error = history
+                .try_start_active_build_with_waiter(
+                    "invalid-endpoint".into(),
+                    worker_id.into(),
+                    "cargo check".into(),
+                    0,
+                    None,
+                    2,
+                    location,
+                    None,
+                    DiskHeadroomAdmission::default(),
+                    Some(endpoint.clone()),
+                )
+                .unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+            assert!(history.active_builds().is_empty());
+        }
+        for version in [1, 2] {
+            for mismatch in ["worker_id", "location"] {
+                let root = TempDir::new().unwrap();
+                let path = root.path().join("history.jsonl");
+                let (mut snapshot, _) = recovery_validation_fixture(&path, version);
+                snapshot["active"][0]["worker_endpoint"] = serde_json::to_value(&endpoint).unwrap();
+                if mismatch == "worker_id" {
+                    snapshot["active"][0]["worker_endpoint"]["config"]["id"] =
+                        serde_json::json!("other-worker");
+                } else {
+                    snapshot["active"][0]["location"] =
+                        serde_json::to_value(BuildLocation::Local).unwrap();
+                }
+                assert_recovery_rejects_without_rewriting(&path, &snapshot);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_active_ownership_keeps_unknown_endpoint_after_recovery() {
+        for version in [1, 2] {
+            let root = TempDir::new().unwrap();
+            let path = root.path().join("history.jsonl");
+            let (snapshot, active) = recovery_validation_fixture(&path, version);
+            assert!(snapshot["active"][0].get("worker_endpoint").is_none());
+            std::fs::write(
+                path.with_extension("ownership.json"),
+                serde_json::to_vec(&snapshot).unwrap(),
+            )
+            .unwrap();
+            let restored = BuildHistory::load_from_file(&path, 10).unwrap();
+            let recovered = restored.active_build(active.id).unwrap();
+            assert!(recovered.worker_endpoint.is_none());
+            assert_eq!(recovered.worker_id, "original-worker");
+            assert_eq!(recovered.slots, 2);
+            let (completed, _) = restored
+                .complete_durable(
+                    active.id,
+                    "original-worker",
+                    Some("recovery-owner"),
+                    disk_budget_completion(0),
+                )
+                .unwrap()
+                .unwrap();
+            assert!(completed.worker_endpoint.is_none());
+            assert_eq!(completed.slots, 2);
+        }
     }
 
     #[test]
