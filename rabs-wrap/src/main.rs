@@ -13,13 +13,17 @@
 //!    shadow decisions are always pass-through;
 //! 4. `on_outcome` update persisted (probe starts persisted WRITE-AHEAD
 //!    per the breaker contract);
-//! 5. `exec` the real rustc — the wrapper process BECOMES the compiler,
-//!    so exit codes, signals, and stdio streaming are preserved by
-//!    construction (no buffering exists to get wrong).
+//! 5. on pass-through, `exec` the real rustc — the wrapper process
+//!    BECOMES the compiler, preserving exit codes, signals, and stdio.
+//!    An accepted hit instead awaits installation and replays the
+//!    transcript only after explicit compiler-skip authorization.
 //!
-//! Failure philosophy: every wrapper-side problem — no daemon, timeout,
-//! malformed reply, unreadable state file — degrades to local exec.
-//! A build must never fail because RABS had a bad day (fail-open).
+//! Failure philosophy: before hit acceptance, wrapper-side problems —
+//! no daemon, timeout, malformed reply, unreadable state file — degrade
+//! to local exec. After acceptance, the daemon may own output writes:
+//! uncertain delivery fails closed. Local exec resumes only after a
+//! complete, typed reply on the install connection explicitly
+//! confirms that the install writer has returned.
 
 use rabs_protocol::wrapper_breaker::{
     AttemptOutcome, BreakerPolicy, BreakerState, ConnectDecision, decide, decode_state,
@@ -130,7 +134,11 @@ mod reply_json {
         }
         fn hex4(&mut self) -> Option<u32> {
             let end = self.at.checked_add(4)?;
-            let digits = std::str::from_utf8(self.bytes.get(self.at..end)?).ok()?;
+            let bytes = self.bytes.get(self.at..end)?;
+            if !bytes.iter().all(u8::is_ascii_hexdigit) {
+                return None;
+            }
+            let digits = std::str::from_utf8(bytes).ok()?;
             self.at = end;
             u32::from_str_radix(digits, 16).ok()
         }
@@ -189,6 +197,42 @@ mod reply_json {
                 }
             }
         }
+        fn decimal_digits(&mut self) -> Option<()> {
+            let start = self.at;
+            while self.bytes.get(self.at).is_some_and(u8::is_ascii_digit) {
+                self.at += 1;
+            }
+            (self.at != start).then_some(())
+        }
+
+        fn number(&mut self) -> Option<Value> {
+            let start = self.at;
+            if self.bytes.get(self.at) == Some(&b'-') {
+                self.at += 1;
+            }
+            match self.bytes.get(self.at).copied()? {
+                b'0' => self.at += 1,
+                b'1'..=b'9' => self.decimal_digits()?,
+                _ => return None,
+            }
+            if self.bytes.get(self.at) == Some(&b'.') {
+                self.at += 1;
+                self.decimal_digits()?;
+            }
+            if matches!(self.bytes.get(self.at).copied(), Some(b'e' | b'E')) {
+                self.at += 1;
+                if matches!(self.bytes.get(self.at).copied(), Some(b'+' | b'-')) {
+                    self.at += 1;
+                }
+                self.decimal_digits()?;
+            }
+            Some(Value::Number(
+                std::str::from_utf8(&self.bytes[start..self.at])
+                    .ok()?
+                    .to_owned(),
+            ))
+        }
+
         fn value(&mut self, depth: usize) -> Option<Value> {
             if depth > MAX_DEPTH {
                 return None;
@@ -230,19 +274,7 @@ mod reply_json {
                         self.eat(b',')?;
                     }
                 }
-                b'-' | b'0'..=b'9' => {
-                    let start = self.at;
-                    while self.bytes.get(self.at).is_some_and(|b| {
-                        b.is_ascii_digit() || matches!(b, b'-' | b'+' | b'.' | b'e' | b'E')
-                    }) {
-                        self.at += 1;
-                    }
-                    Some(Value::Number(
-                        std::str::from_utf8(&self.bytes[start..self.at])
-                            .ok()?
-                            .to_owned(),
-                    ))
-                }
+                b'-' | b'0'..=b'9' => self.number(),
                 _ => None,
             }
         }
@@ -261,7 +293,7 @@ mod reply_json {
 }
 
 fn hex_decode(text: &str) -> Option<Vec<u8>> {
-    if !text.len().is_multiple_of(2) {
+    if !text.len().is_multiple_of(2) || !text.as_bytes().iter().all(u8::is_ascii_hexdigit) {
         return None;
     }
     text.as_bytes()
@@ -981,6 +1013,8 @@ mod tests {
             r#"{"kind":"rustc-decision","decision":"serve-failed","writer_returned":true,"writer_returned":false}"#,
             r#"{"kind":"rustc-decision","decision":"served","compiler_skip_authorized":true}"#,
             r#"{"kind":"rustc-decision","decision":"served","compiler_skip_authorized":true,"stderr_hex":"zz"}"#,
+            r#"{"kind":"rustc-decision","decision":"served","compiler_skip_authorized":true,"stderr_hex":"+a"}"#,
+            r#"{"kind":"rustc-decision","decision":"served","compiler_skip_authorized":true,"stderr_hex":"\u+030a"}"#,
             r#"{"kind":"rustc-decision","decision":"served","compiler_skip_authorized":true,"compiler_skip_authorized":false,"stderr_hex":""}"#,
             r#"{"kind":"rustc-decision","kind":"status","decision":"serve-failed","writer_returned":true}"#,
             r#"{"kind":"rustc-decision","decision":"serve-failed","decision":"served","writer_returned":true}"#,
@@ -992,7 +1026,7 @@ mod tests {
         }
         assert!(matches!(
             accepted_install_reply(
-                r#"{"kind":"rustc-decision","decision":"serve-failed","writer_returned":true}"#
+                r#"{"kind":"rustc-decision","decision":"serve-failed","writer_returned":true}"#,
             ),
             Live::PassThrough
         ));
@@ -1000,6 +1034,111 @@ mod tests {
             r#"{"kind":"rustc-decision","decision":"served","compiler_skip_authorized":true,"stderr_hex":"6f6b0a"}"#,
         );
         assert!(matches!(served, Live::Served(bytes) if bytes == b"ok\n"));
+    }
+
+    #[test]
+    fn reply_json_numbers_follow_exact_grammar() {
+        for number in [
+            "0",
+            "-0",
+            "1",
+            "-42",
+            "0.0",
+            "-0.25",
+            "1e0",
+            "1E+03",
+            "-1.25e-9",
+            "123456789012345678901234567890",
+            "1e9999",
+        ] {
+            assert!(
+                matches!(
+                    reply_json::parse(number),
+                    Some(reply_json::Value::Number(raw)) if raw == number
+                ),
+                "valid number must retain its exact spelling: {number}"
+            );
+        }
+        for number in [
+            "-", "+1", "01", "-01", ".5", "-.5", "1.", "1e", "1E+", "1e-", "--1", "1+2",
+            "1e+-2", "1..2", "0x1", "NaN", "inf",
+        ] {
+            assert!(
+                reply_json::parse(number).is_none(),
+                "malformed number must be rejected: {number}"
+            );
+        }
+    }
+
+    #[test]
+    fn reply_hex_fields_require_ascii_hex_digits() {
+        assert_eq!(hex_decode(""), Some(Vec::new()));
+        assert_eq!(hex_decode("0aFf"), Some(vec![0x0a, 0xff]));
+        for text in ["+a", "+0", "-0", "0+", "0g", "a"] {
+            assert!(
+                hex_decode(text).is_none(),
+                "malformed transcript hex must be rejected: {text}"
+            );
+        }
+        assert_eq!(
+            reply_json::parse(r#""\u0000\u0041\u00e9\uD83D\uDE80""#),
+            Some(reply_json::Value::Str("\0Aé🚀".into()))
+        );
+        for text in [r#""\u+000""#, r#""\u000g""#, r#""\u000""#] {
+            assert!(
+                reply_json::parse(text).is_none(),
+                "malformed Unicode escape must be rejected: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn accepted_install_reply_requires_valid_ignored_json() {
+        for ignored in [
+            "-",
+            "01",
+            "1.",
+            "1e",
+            "1E+",
+            "1+2",
+            "[1e]",
+            r#"{"nested":01}"#,
+            r#""\u+000""#,
+        ] {
+            let returned = format!(
+                r#"{{"kind":"rustc-decision","decision":"serve-failed","writer_returned":true,"ignored":{ignored}}}"#,
+            );
+            let served = format!(
+                r#"{{"kind":"rustc-decision","decision":"served","compiler_skip_authorized":true,"stderr_hex":"6f6b0a","ignored":{ignored}}}"#,
+            );
+            for line in [returned, served] {
+                assert!(
+                    matches!(accepted_install_reply(&line), Live::FailClosed(_)),
+                    "malformed ignored JSON cannot authorize execution: {line}"
+                );
+            }
+        }
+        for ignored in [
+            "1e9999",
+            r#"{"numbers":[-0,0.25,1E+03,-1.5e-2,123456789012345678901234567890]}"#,
+            r#""\u0000\u0041\u00e9\uD83D\uDE80""#,
+        ] {
+            let returned = format!(
+                r#"{{"kind":"rustc-decision","decision":"serve-failed","writer_returned":true,"ignored":{ignored}}}"#,
+            );
+            assert!(
+                matches!(accepted_install_reply(&returned), Live::PassThrough),
+                "valid ignored JSON must preserve explicit writer return: {ignored}"
+            );
+            let served = format!(
+                r#"{{"kind":"rustc-decision","decision":"served","compiler_skip_authorized":true,"stderr_hex":"6f6b0a","ignored":{ignored}}}"#,
+            );
+            let replay = accepted_install_reply(&served);
+            assert!(
+                matches!(replay, Live::Served(bytes) if bytes == b"ok\n"),
+                "valid ignored JSON must preserve authorized replay: {ignored}"
+            );
+        }
     }
 
     fn reply_from_peer(bytes: Vec<u8>) -> io::Result<String> {
