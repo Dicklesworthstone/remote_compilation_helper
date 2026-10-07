@@ -1690,10 +1690,9 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
                 "worker_fault" => worker_fault = matches!(value, "1" | "true"),
                 "worker_disk_full" => worker_disk_full = matches!(value, "1" | "true"),
                 "worker_disk_roots" => {
-                    worker_disk_roots = serde_json::from_str::<Vec<String>>(
-                        &percent_unescape_query_value(value),
-                    )
-                    .context("Invalid worker disk roots")?;
+                    worker_disk_roots =
+                        serde_json::from_str::<Vec<String>>(&percent_unescape_query_value(value))
+                            .context("Invalid worker disk roots")?;
                 }
                 _ => {} // Ignore unknown parameters
             }

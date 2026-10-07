@@ -741,7 +741,16 @@ pub(crate) struct RemoteUploadDiskFull {
 }
 
 pub(crate) fn find_remote_upload_disk_full(error: &anyhow::Error) -> Option<&RemoteUploadDiskFull> {
-    error.downcast_ref::<RemoteUploadDiskFull>()
+    error.downcast_ref::<RemoteUploadDiskFull>().or_else(|| {
+        // Archive uploads classify each completed attempt before the retry
+        // loop wraps its terminal cause. Keep the typed context reachable
+        // through that wrapper; never infer it from diagnostic history text.
+        error
+            .downcast_ref::<TransferAttemptsExhausted>()?
+            .cause
+            .as_ref()
+            .and_then(find_remote_upload_disk_full)
+    })
 }
 
 /// Modern rsync's rsyserr identifies the process role and terminates with
@@ -762,6 +771,42 @@ fn rsync_receiver_disk_full(line: &str) -> bool {
     };
     (errno == "28" && message.ends_with(": No space left on device"))
         || (matches!(errno, "69" | "122") && message.ends_with(": Disk quota exceeded"))
+}
+
+#[cfg(unix)]
+fn check_archive_upload_result(
+    output: &std::process::Output,
+    worker: &WorkerConfig,
+    remote_root: &str,
+) -> Result<()> {
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let disk_full = output.status.code().is_some_and(|code| code != 0)
+        && stderr.lines().any(rsync_receiver_disk_full);
+    let error = if is_retryable_transport_error_text(&stderr) {
+        anyhow::anyhow!(
+            "rsync transport error (exit {:?}): {}",
+            output.status.code(),
+            stderr.trim()
+        )
+    } else {
+        TransferError::SyncFailed {
+            reason: "clean-overlay base rsync failed".to_string(),
+            exit_code: output.status.code(),
+            stderr,
+        }
+        .into()
+    };
+    Err(if disk_full {
+        error.context(RemoteUploadDiskFull {
+            worker_id: worker.id.to_string(),
+            roots: vec![remote_root.to_string()],
+        })
+    } else {
+        error
+    })
 }
 
 /// Typed source-sync stall error (issue #59): the transfer produced NO output
@@ -4557,6 +4602,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
                     let ssh_command = ssh_command.clone();
                     let extraction_script = extraction_script.clone();
                     let archive_path = archive_path.clone();
+                    let remote_root = remote_path.clone();
                     let escaped_remote_path = escaped_remote_path.clone();
                     let remote_archive_path = remote_archive_path.clone();
                     let rsync_path = rsync_path.clone();
@@ -4588,22 +4634,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
                             .output()
                             .await
                             .context("run resumable clean-overlay base rsync")?;
-                        if !output.status.success() {
-                            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-                            if is_retryable_transport_error_text(&stderr) {
-                                anyhow::bail!(
-                                    "rsync transport error (exit {:?}): {}",
-                                    output.status.code(),
-                                    stderr.trim()
-                                );
-                            }
-                            return Err(TransferError::SyncFailed {
-                                reason: "clean-overlay base rsync failed".to_string(),
-                                exit_code: output.status.code(),
-                                stderr,
-                            }
-                            .into());
-                        }
+                        check_archive_upload_result(&output, worker, &remote_root)?;
                         self.run_remote_sh(worker, &extraction_script)
                             .await
                             .context("extract clean-overlay base archive")?;
@@ -7364,8 +7395,16 @@ where
     let tx_stderr = tx.clone();
     let tx_stdout = tx.clone();
 
-    tokio::spawn(pump_stream_segments(stdout, tx_stdout, StreamOrigin::Stdout));
-    tokio::spawn(pump_stream_segments(stderr, tx_stderr, StreamOrigin::Stderr));
+    tokio::spawn(pump_stream_segments(
+        stdout,
+        tx_stdout,
+        StreamOrigin::Stdout,
+    ));
+    tokio::spawn(pump_stream_segments(
+        stderr,
+        tx_stderr,
+        StreamOrigin::Stderr,
+    ));
 
     // Drop the original tx so rx will close when both tasks are done
     drop(tx);
@@ -7393,7 +7432,9 @@ where
                 },
                 None => rx.recv().await,
             };
-            let Some((text, origin)) = received else { break };
+            let Some((text, origin)) = received else {
+                break;
+            };
             on_line(&text, origin);
             if combined.len() < MAX_RSYNC_OUTPUT {
                 combined.push_str(&text);
@@ -10578,6 +10619,213 @@ Number of files transferred: 42
             std::fs::read_to_string(attempts).unwrap(),
             "first\nsecond\n"
         );
+    }
+
+    #[cfg(unix)]
+    async fn archive_upload_disk_git_fixture(root: &Path) -> String {
+        std::fs::write(root.join("source.txt"), "committed source\n").unwrap();
+        for args in [
+            vec!["init", "--quiet"],
+            vec!["add", "source.txt"],
+            vec![
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--quiet",
+                "-m",
+                "fixture",
+            ],
+        ] {
+            let mut command = Command::new("git");
+            configure_clean_git_command(&mut command);
+            let output = command.current_dir(root).args(args).output().await.unwrap();
+            assert!(output.status.success(), "{output:?}");
+        }
+        let mut command = Command::new("git");
+        configure_clean_git_command(&mut command);
+        let output = command
+            .current_dir(root)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .await
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        // The production Git archive must contain committed bytes, not dirt.
+        std::fs::write(root.join("source.txt"), "uncommitted source\n").unwrap();
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn archive_upload_disk_fault_survives_materialization_retry_wrapper() {
+        let _guard = test_guard!();
+        let _real = RealTransport::pin();
+        let directory = tempfile::tempdir().unwrap();
+        let base = archive_upload_disk_git_fixture(directory.path()).await;
+        let received = directory.path().join("received-source");
+        let pipeline = source_upload_disk_fixture(
+            directory.path(),
+            &format!(
+                "while [ \"$#\" -gt 2 ]; do shift; done\n\
+             tar -xOf \"$1\" source.txt > {received} || exit 99\n\
+             printf '%s\\n' 'rsync: [receiver] write failed: No space left on device (28)' >&2\n\
+             exit 11",
+                received = escape(received.to_string_lossy()),
+            ),
+        );
+        let worker = estimate_test_worker();
+        let error = pipeline
+            .materialize_git_archive(&worker, directory.path(), &base)
+            .await
+            .unwrap_err()
+            .context("materialize the immutable source base");
+        assert_eq!(
+            std::fs::read_to_string(received).unwrap(),
+            "committed source\n"
+        );
+        let attempts = error.downcast_ref::<TransferAttemptsExhausted>().unwrap();
+        assert_eq!(attempts.attempts.len(), 1);
+        let fault = find_remote_upload_disk_full(&error).expect("typed terminal receiver evidence");
+        assert_eq!(fault.worker_id, worker.id.as_str());
+        assert_eq!(fault.roots, ["/worker-source-volume/project"]);
+        // Attaching upload evidence must not erase a later ownership fence.
+        let unconfirmed = error.context(RemoteExecutionUnconfirmed);
+        assert!(
+            unconfirmed
+                .downcast_ref::<RemoteExecutionUnconfirmed>()
+                .is_some()
+        );
+        assert!(find_remote_upload_disk_full(&unconfirmed).is_some());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn archive_upload_disk_fault_excludes_stdout_sender_and_local_archive_errors() {
+        let _guard = test_guard!();
+        let _real = RealTransport::pin();
+        let directory = tempfile::tempdir().unwrap();
+        let base = archive_upload_disk_git_fixture(directory.path()).await;
+        let worker = estimate_test_worker();
+        for (role, stream) in [("sender", "2"), ("receiver", "1")] {
+            let pipeline = source_upload_disk_fixture(
+                directory.path(),
+                &format!(
+                    "printf '%s\\n' 'rsync: [{role}] write failed: No space left on device (28)' >&{stream}\nexit 11",
+                ),
+            );
+            let error = pipeline
+                .materialize_git_archive(&worker, directory.path(), &base)
+                .await
+                .unwrap_err();
+            assert!(error.downcast_ref::<TransferAttemptsExhausted>().is_some());
+            assert!(find_remote_upload_disk_full(&error).is_none(), "{error:#}");
+        }
+        let invoked = directory.path().join("unexpected-upload");
+        let pipeline = source_upload_disk_fixture(
+            directory.path(),
+            &format!(
+                "touch {}\nprintf '%s\\n' 'rsync: [receiver] write failed: No space left on device (28)' >&2\nexit 11",
+                escape(invoked.to_string_lossy()),
+            ),
+        );
+        let error = pipeline
+            .materialize_git_archive(&worker, directory.path(), &"0".repeat(40))
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("git archive failed"),
+            "{error:#}"
+        );
+        assert!(find_remote_upload_disk_full(&error).is_none());
+        assert!(
+            !invoked.exists(),
+            "local archive failure must precede upload"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn archive_upload_disk_diagnostic_before_timeout_has_no_completed_evidence() {
+        let _guard = test_guard!();
+        let _real = RealTransport::pin();
+        let directory = tempfile::tempdir().unwrap();
+        let base = archive_upload_disk_git_fixture(directory.path()).await;
+        let started = directory.path().join("upload-started");
+        let mut pipeline = source_upload_disk_fixture(
+            directory.path(),
+            &format!(
+                "printf '%s\\n' 'rsync: [receiver] write failed: No space left on device (28)' >&2\ntouch {}\nexec sleep 5",
+                escape(started.to_string_lossy()),
+            ),
+        );
+        pipeline.transfer_config.sync_timeout_ms = Some(1_000);
+        let error = pipeline
+            .materialize_git_archive(&estimate_test_worker(), directory.path(), &base)
+            .await
+            .unwrap_err();
+        assert!(started.exists(), "controlled child emitted its diagnostic");
+        assert!(error.to_string().contains("timed out"), "{error:#}");
+        assert!(find_remote_upload_disk_full(&error).is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn archive_upload_disk_fault_is_discarded_after_successful_or_unrelated_retry() {
+        let _guard = test_guard!();
+        let directory = tempfile::tempdir().unwrap();
+        let worker = estimate_test_worker();
+        let retry = RetryConfig {
+            max_attempts: 2,
+            base_delay_ms: 1,
+            max_delay_ms: 1,
+            jitter_factor: 0.0,
+            total_timeout_ms: 5_000,
+        };
+        // Exercise the actual upload completion/retry boundary. Successful
+        // materialization also performs SSH extraction, outside this fixture.
+        for final_exit in [0, 23] {
+            let result = run_source_transfer_attempts(
+                &retry,
+                std::time::Duration::from_secs(5),
+                "clean_overlay_base_sync",
+                |attempt| {
+                    let worker = &worker;
+                    let root = directory.path();
+                    async move {
+                        let script = if attempt == 1 {
+                            "printf '%s\\n' 'rsync: [receiver] write failed: No space left on device (28)' 'rsync: connection unexpectedly closed' >&2\nexit 12".to_string()
+                        } else {
+                            // Even matching stderr cannot make a success a
+                            // fault. The failure variant is sender-side only.
+                            let role = if final_exit == 0 { "receiver" } else { "sender" };
+                            format!("printf '%s\\n' 'rsync: [{role}] write failed: No space left on device (28)' >&2\nexit {final_exit}")
+                        };
+                        let output = Command::new("sh").args(["-c", &script])
+                            .current_dir(root).output().await?;
+                        check_archive_upload_result(&output, worker, "/worker-source-volume/project")
+                    }
+                },
+            ).await;
+            match result {
+                Ok(((), attempts)) => {
+                    assert_eq!(final_exit, 0);
+                    assert_eq!(attempts.len(), 2);
+                    assert_eq!(attempts[0].outcome, "retryable");
+                    assert_eq!(attempts[1].outcome, "succeeded");
+                }
+                Err(error) => {
+                    assert_eq!(final_exit, 23);
+                    assert_eq!(error.attempts.len(), 2);
+                    assert_eq!(error.attempts[0].outcome, "retryable");
+                    let error = anyhow::Error::new(error);
+                    assert!(find_remote_upload_disk_full(&error).is_none(), "{error:#}");
+                }
+            }
+        }
     }
 
     #[cfg(unix)]

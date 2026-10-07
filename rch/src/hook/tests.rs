@@ -3948,14 +3948,11 @@ fn source_upload_disk_release_requires_the_selected_worker_and_confirmed_ownersh
         remote_release_faults(&result, &WorkerId::new("other-worker")),
         (false, false, &[] as &[String])
     );
-    let error = result
-        .unwrap_err()
-        .context(crate::transfer::RemoteExecutionUnconfirmed);
+    let result = result.map_err(|error| error.context(crate::transfer::RemoteExecutionUnconfirmed));
     assert_eq!(
-        classify_remote_pipeline_failure(&error),
+        classify_remote_pipeline_failure(result.as_ref().unwrap_err()),
         RemotePipelineFailurePolicy::FailClosedNoLocalFallback
     );
-    let result = Err(error);
     assert_eq!(
         remote_release_faults(&result, &worker),
         (false, false, &[] as &[String])

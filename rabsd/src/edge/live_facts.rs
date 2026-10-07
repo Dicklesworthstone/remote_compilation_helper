@@ -720,10 +720,9 @@ impl LiveFacts {
                     if let Ok(mut memos) = facts.dependencies.lock() {
                         memos.insert(warm_key, slot);
                     }
-                }) {
-                    if let Ok(mut memos) = self.dependencies.lock() {
-                        memos.remove(&memo_key);
-                    }
+                }) && let Ok(mut memos) = self.dependencies.lock()
+                {
+                    memos.remove(&memo_key);
                 }
                 return Err(FactsMiss::Pending);
             }

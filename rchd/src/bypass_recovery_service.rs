@@ -511,8 +511,8 @@ pub fn validate_disk_fault_roots(roots: &[String]) -> anyhow::Result<Vec<String>
             "invalid disk-fault root length or control character"
         );
         let bytes = root.as_bytes();
-        let relative = if root.starts_with('/') {
-            &root[1..]
+        let relative = if let Some(relative) = root.strip_prefix('/') {
+            relative
         } else if bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && &bytes[1..3] == b":/" {
             &root[3..]
         } else {
