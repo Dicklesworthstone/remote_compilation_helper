@@ -43,7 +43,7 @@ jobs:
           python3 - <<'PY'
           import base64, hashlib, json, os, pathlib, subprocess, urllib.request
           expected = {
-              'rch/src/transfer.rs': 'c8f7e6351e78a6db695e89e7987e1aa6eddf645b',
+              'rch/src/transfer.rs': '3affa48a582819ba8438032fc6b91c4c370e8b73',
               'rch/src/hook/ssh.rs': '838b5412b8b32b696fdefa818a3cd4539645a13c',
               'rabs-scheduler/src/managed_pool.rs': 'c91e4b77b877c6ef32b68583aabffa61f90ae2c3',
           }
