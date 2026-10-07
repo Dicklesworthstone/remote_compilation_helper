@@ -814,7 +814,7 @@ mod tests {
             Some("/worker/target/debug/app"),
             false,
         );
-        let valid = receipt(&[output.clone()]);
+        let valid = receipt(std::slice::from_ref(&output));
         let root = Path::new("/worker/target");
         let incomplete = &valid[..valid.len() - 1];
         assert!(capture.parse_receipt(incomplete, root).is_err());

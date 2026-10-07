@@ -64,6 +64,43 @@ mod cargo_manifest;
 #[path = "retrieval_recovery.rs"]
 pub(crate) mod recovery;
 
+/// Read the durable completion receipt after the execution SSH session exits.
+///
+/// The read is idempotent (it only `cat`s an immutable, identity-bound file),
+/// so a transient SSH failure is retried briefly instead of turning a build
+/// that already finished into "completion unconfirmed", which retains its
+/// source ownership and fences later builds on that worker. Only errors are
+/// retried; an absent receipt is evidence and is returned at once.
+async fn read_completion_with_retry(
+    pipeline: &TransferPipeline,
+    worker: &WorkerConfig,
+) -> anyhow::Result<Option<i32>> {
+    retry_completion_probe(Duration::from_secs(1), async || {
+        pipeline.read_recovery_completion(worker).await
+    })
+    .await
+}
+
+/// Up to three probe attempts, sleeping `backoff` then twice that between
+/// failures (1 s and 2 s in production).
+async fn retry_completion_probe(
+    backoff: Duration,
+    mut probe: impl AsyncFnMut() -> anyhow::Result<Option<i32>>,
+) -> anyhow::Result<Option<i32>> {
+    const ATTEMPTS: u64 = 3;
+    let mut attempt = 1;
+    loop {
+        match probe().await {
+            Err(error) if attempt < ATTEMPTS => {
+                warn!(attempt, %error, "completion probe failed; retrying");
+                tokio::time::sleep(backoff * u32::try_from(attempt).unwrap_or(1)).await;
+                attempt += 1;
+            }
+            other => return other,
+        }
+    }
+}
+
 /// Keep ownership failures distinct from a confirmed pre-workload setup refusal.
 fn confirm_source_pair_execution(
     lock: Option<&mut super::ssh::RemoteSourceAuthorityLock>,
@@ -1855,8 +1892,7 @@ async fn execute_remote_compilation_inner(
 
     if let Some(session) = recovery_session.as_mut() {
         async {
-            let completed = pipeline
-                .read_recovery_completion(&worker_config)
+            let completed = read_completion_with_retry(&pipeline, &worker_config)
                 .await?
                 .context(
                     "SSH exit has no exact durable completion evidence; use jobs recover, never replay",
@@ -2757,6 +2793,45 @@ mod tests {
     use super::clean_overlay_source_pair_pool_name;
     use super::foreign_artifact_gate_disabled_from_value;
     use super::{CleanOverlaySpec, clean_overlay_freshness_identity};
+
+    /// A finished build must not be stranded by one transient SSH failure on
+    /// its receipt read; a persistent failure still surfaces after 3 tries,
+    /// and an absent receipt is returned at once (it is evidence, not noise).
+    #[tokio::test]
+    async fn completion_probe_retries_transport_errors_only() {
+        use std::cell::Cell;
+        let fast = std::time::Duration::from_millis(1);
+        let calls = Cell::new(0);
+        let flaky = super::retry_completion_probe(fast, async || {
+            calls.set(calls.get() + 1);
+            if calls.get() < 3 {
+                anyhow::bail!("completion probe SSH failed")
+            } else {
+                Ok(Some(0))
+            }
+        })
+        .await;
+        assert_eq!(flaky.unwrap(), Some(0));
+        assert_eq!(calls.get(), 3);
+
+        calls.set(0);
+        let down = super::retry_completion_probe(fast, async || {
+            calls.set(calls.get() + 1);
+            anyhow::bail!("completion probe SSH failed")
+        })
+        .await;
+        assert!(down.is_err());
+        assert_eq!(calls.get(), 3);
+
+        calls.set(0);
+        let absent = super::retry_completion_probe(fast, async || {
+            calls.set(calls.get() + 1);
+            Ok(None)
+        })
+        .await;
+        assert_eq!(absent.unwrap(), None);
+        assert_eq!(calls.get(), 1);
+    }
 
     #[test]
     fn source_pair_freshness_identity_binds_overlays_and_canonical_dependency_closure() {
