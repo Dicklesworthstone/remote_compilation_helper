@@ -802,25 +802,27 @@ impl CancellationOrchestrator {
         // process stays alive holding a socket until its own keepalive
         // gives up — at exactly the moment we're trying to clean up after
         // a stuck build. Force a SIGKILL on cancellation.
-        let ssh_result = tokio::time::timeout(
-            self.config.remote_kill_timeout,
-            tokio::process::Command::new("ssh")
-                .args([
-                    "-o",
-                    "StrictHostKeyChecking=no",
-                    "-o",
-                    "ConnectTimeout=5",
-                    "-o",
-                    "BatchMode=yes",
-                    "-i",
-                    &identity,
-                    &format!("{}@{}", user, host),
-                    &remote_kill_script,
-                ])
-                .kill_on_drop(true)
-                .output(),
-        )
-        .await;
+        let mut ssh = tokio::process::Command::new("ssh");
+        ssh.args([
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-o",
+            "ConnectTimeout=5",
+            "-o",
+            "BatchMode=yes",
+            "-i",
+            &identity,
+        ]);
+        // A fresh connection per cancel: offering ssh-agent keys first
+        // locked dispatchers out of workers (bd-ebszo).
+        if let Some(opts) = rch_common::ssh::identities_only_args(&identity) {
+            ssh.args(opts);
+        }
+        ssh.arg(format!("{}@{}", user, host))
+            .arg(&remote_kill_script)
+            .kill_on_drop(true);
+        let ssh_result =
+            tokio::time::timeout(self.config.remote_kill_timeout, ssh.output()).await;
 
         match ssh_result {
             Ok(Ok(output)) => {

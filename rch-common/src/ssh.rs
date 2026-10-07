@@ -766,6 +766,23 @@ pub fn remote_shell_command(config: &WorkerConfig, command: &str) -> RemoteShell
     }
 }
 
+/// `-o IdentitiesOnly=yes` for a system-ssh spawn that passes `-i
+/// <identity_file>`, but only when that file exists (bd-ebszo).
+///
+/// Without it, ssh offers every ssh-agent key BEFORE the `-i` key. A
+/// dispatcher whose daemon inherited a desktop agent holding 7 keys spent 6
+/// wrong attempts per connection, tripped workers' MaxAuthTries, and OpenSSH
+/// PerSourcePenalties then locked the whole NAT address out of those workers
+/// (~600 failed auths/h, 2026-10-05/06). A missing identity file keeps the
+/// old agent-fallback behavior so agent-only setups still authenticate.
+#[must_use]
+pub fn identities_only_args(identity_file: &str) -> Option<[&'static str; 2]> {
+    let expanded = shellexpand::tilde(identity_file);
+    Path::new(expanded.as_ref())
+        .is_file()
+        .then_some(["-o", "IdentitiesOnly=yes"])
+}
+
 /// Build the argv for the system-ssh fallback, mirroring the proven CLI
 /// system-ssh pattern (see `rch/src/fleet/ssh.rs::SshExecutor::build_ssh_args`
 /// and `rch/src/commands/workers_init.rs`). Pure / testable: no process is
@@ -797,10 +814,13 @@ pub(crate) fn system_ssh_argv(
     let identity_path = shellexpand::tilde(&config.identity_file);
     let destination = format!("{}@{}", config.user, config.host);
 
-    let mut argv: Vec<OsString> = Vec::with_capacity(10);
+    let mut argv: Vec<OsString> = Vec::with_capacity(12);
     argv.push(OsString::from("ssh"));
     argv.push(OsString::from("-i"));
     argv.push(OsString::from(identity_path.as_ref()));
+    if let Some(opts) = identities_only_args(&config.identity_file) {
+        argv.extend(opts.map(OsString::from));
+    }
     argv.push(OsString::from("-o"));
     argv.push(OsString::from("BatchMode=yes"));
     argv.push(OsString::from("-o"));
@@ -2214,6 +2234,32 @@ mod tests {
             "tilde-expanded path appears in argv: {:?}",
             s
         );
+    }
+
+    #[test]
+    fn test_identities_only_only_when_identity_file_exists() {
+        // bd-ebszo: an existing `-i` key must be the ONLY key offered (no agent
+        // keys first); a missing key file keeps agent fallback working.
+        let _guard = test_guard!();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key = dir.path().join("worker_key");
+        std::fs::write(&key, b"not a real key").expect("write key");
+        let key = key.to_string_lossy().into_owned();
+        assert_eq!(
+            identities_only_args(&key),
+            Some(["-o", "IdentitiesOnly=yes"])
+        );
+        assert_eq!(identities_only_args("/nonexistent/rch/worker_key"), None);
+
+        let mut cfg = windows_worker("wsurf");
+        cfg.identity_file = key;
+        let command = remote_shell_command(&cfg, "true");
+        let argv = system_ssh_argv(&cfg, &command, Duration::ZERO);
+        assert!(argv.contains(&OsString::from("IdentitiesOnly=yes")));
+
+        cfg.identity_file = "/nonexistent/rch/worker_key".to_string();
+        let argv = system_ssh_argv(&cfg, &command, Duration::ZERO);
+        assert!(!argv.contains(&OsString::from("IdentitiesOnly=yes")));
     }
 
     #[test]
