@@ -48,6 +48,7 @@ RCH currently recognizes and can offload:
 |---|---|
 | Rust | `cargo build`, `cargo check`, `cargo clippy`, `cargo doc`, `cargo test`, `cargo nextest run`, `cargo bench`, `rustc` |
 | Bun/TypeScript | `bun test`, `bun typecheck` |
+| Go | `go build -o <file>`, ordinary `go test`, `go vet` |
 | C/C++ | `gcc`, `g++`, `clang`, `clang++` |
 | Build Systems | `make`, `cmake --build`, `ninja`, `meson compile` |
 | Nix | `nix build`, `nix-build`, `nix flake check`, `nix develop -c <cmd>`, `nix shell -c <cmd>` |
@@ -59,6 +60,34 @@ with Bun/Node). Nix outputs stay in the worker's `/nix/store` behind a `result`
 symlink, so these run as streaming, exit-status-only commands (no artifacts are
 copied back — the flake source is synced out, the build runs, the result stays
 remote).
+
+Go builds support an explicit, project-relative **file** output, for example
+`go build -o bin/app ./cmd/app` or `go build -o 'products/app [dev]*?' main.go`.
+The output is returned to that exact path, including when `CARGO_TARGET_DIR` is
+set. Common build flags such as `-p`, `-tags`, `-trimpath`, and `-race` are
+supported, as are linker stripping flags (`-ldflags '-s -w'`) and `-X` variable
+definitions. Builds require the durable Unix execution path and a local Go
+installation. Both endpoints must report empty effective `GOFLAGS` and the
+dispatcher's native `GOOS`/`GOARCH`. The caller's selected Go version, CGO
+configuration, experiments, and architecture tuning settings are captured
+before upload and must match the worker exactly before compilation starts.
+Ordinary builds with CGO enabled remain supported when those settings match.
+
+The worker compiles into a fresh private file outside the source root, preserving
+wildcard `go:embed` inputs. Only after successful compilation produces a regular
+file does it create output parents and an adjacent stage for atomic replacement
+of the previous worker file. Retrieval then stages and validates that file before
+replacing the local output. A missing download cannot be satisfied by an old
+local binary, and durable recovery resumes collection without rerunning Go.
+Directory outputs, symlinks or symlinked output parents, cross compilation,
+native-library modes such as `c-shared`/`c-archive`, and low-level flags that can
+create extra files are outside this output contract. Implicit forms such as
+`go build`, `go build .`, and `go build ./...` stay local because their output
+names depend on which packages they select. Go test options that write binaries,
+profiles, or fuzz corpora (`-c`, `-o`, `-coverprofile`, `-cpuprofile`, `-trace`,
+`-fuzz`, and related flags, including `-test.*` forms after `-args`) also stay
+local. Strict remote mode refuses
+unsupported forms instead of executing them locally.
 
 RCH explicitly does **not** intercept local-mutating or interactive patterns (examples):
 

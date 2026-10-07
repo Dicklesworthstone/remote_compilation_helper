@@ -668,6 +668,24 @@ async fn execute_remote_compilation_inner(
     // Windows build base and syncs via tar-over-ssh (no rsync/streaming).
     let worker_is_windows = WorkerPlatform::from_worker(&worker_config).is_windows();
 
+    let go_build_environment = if kind == Some(CompilationKind::GoBuild) {
+        anyhow::ensure!(
+            !worker_is_windows
+                && durable_lease.is_some()
+                && !super::ssh::should_skip_remote_preflight(&worker_config),
+            "Go output delivery requires the durable Unix worker path"
+        );
+        Some(
+            super::artifact_patterns::direct_compiler::validate_go_build_output(
+                command,
+                &normalized_project_root,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+
     let clean_overlay_cargo = clean_overlay.is_some()
         && (kind.is_some_and(|kind| kind.command_base() == "cargo")
             || classify_command(command)
@@ -1735,6 +1753,18 @@ async fn execute_remote_compilation_inner(
     // Only execution consumes the stamp. `policy_command` still names the
     // original contract already persisted in the recovery recipe above.
     let command = stamped_command.as_deref().unwrap_or(command);
+    let guarded_go_command = if let Some(environment) = go_build_environment.as_ref() {
+        Some(
+            super::artifact_patterns::direct_compiler::go_build_execution_command(
+                command,
+                environment,
+            )
+            .context("Go build lost its validated file output contract")?,
+        )
+    } else {
+        None
+    };
+    let command = guarded_go_command.as_deref().unwrap_or(command);
 
     // Step 2: Execute command remotely with streaming output
     // Mask sensitive data (API keys, tokens, passwords) before logging

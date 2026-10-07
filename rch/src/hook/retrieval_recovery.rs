@@ -1571,6 +1571,434 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn go_fixture_command(go: &str, args: &[&str], environment: &[&str]) -> String {
+        shell_words::join(
+            [
+                "env",
+                "GOENV=off",
+                "GOTOOLCHAIN=local",
+                "GOWORK=off",
+                "GOFLAGS=",
+                "GOOS=",
+                "GOARCH=",
+                "CGO_ENABLED=0",
+                "GOMAXPROCS=1",
+            ]
+            .into_iter()
+            .chain(environment.iter().copied())
+            .chain(std::iter::once(go))
+            .chain(args.iter().copied()),
+        )
+    }
+
+    #[cfg(unix)]
+    async fn run_go_fixture(command: &mut tokio::process::Command) -> std::process::Output {
+        command.stdin(Stdio::null()).kill_on_drop(true);
+        tokio::time::timeout(Duration::from_secs(120), command.output())
+            .await
+            .expect("Go output fixture exceeded its bound")
+            .expect("Go and rsync are required for the Go delivery regression")
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn go_build_explicit_output_survives_recovery_and_missing_delivery() {
+        use super::super::artifact_patterns::direct_compiler::{
+            go_build_execution_command, validate_go_build_output,
+        };
+        use tokio::process::Command;
+
+        let _guard = test_guard!();
+        for (relative, inline_output) in [
+            ("app", false),
+            ("products/app [dev]*?", false),
+            ("target/app", true),
+        ] {
+            let identity = format!("go-output-{}", uuid::Uuid::new_v4());
+            let (_owner, writer, worker) = preparation_fixture_with_identity(&identity);
+            let base = writer.path.parent().unwrap();
+            let local = base.join("checkout");
+            let remote = base.join("worker");
+            let missing = base.join("missing-worker");
+            let unrelated_target = base.join("unrelated-cargo-target");
+            for root in [&local, &remote, &missing, &unrelated_target] {
+                std::fs::create_dir_all(root.join("products")).unwrap();
+                std::fs::create_dir_all(root.join("target")).unwrap();
+            }
+            for root in [&local, &remote] {
+                std::fs::write(
+                    root.join("go.mod"),
+                    b"module fixture.invalid/output\n\ngo 1.20\n",
+                )
+                .unwrap();
+            }
+            let (source, expected_stdout): (&[u8], &[u8]) = if relative == "app" {
+                // The previous output can also be a build input. Moving it
+                // away before compilation would break this real embed case.
+                (
+                    b"package main\nimport (\"fmt\"; _ \"embed\")\nvar label = \"unset\"\n//go:embed app\nvar previous string\nfunc main() { fmt.Println(label + \":\" + previous) }\n",
+                    b"go-delivered-37:old remote output\n",
+                )
+            } else {
+                (
+                    b"package main\nimport \"fmt\"\nvar label = \"unset\"\nfunc main() { fmt.Println(label) }\n",
+                    b"go-delivered-37\n",
+                )
+            };
+            std::fs::write(remote.join("main.go"), source).unwrap();
+            std::fs::write(local.join("main.go"), b"local source sentinel").unwrap();
+            std::fs::write(local.join(relative), b"old local output").unwrap();
+            std::fs::write(remote.join(relative), b"old remote output").unwrap();
+            std::fs::write(local.join("foreign.o"), b"other job's object").unwrap();
+            std::fs::write(unrelated_target.join("sentinel"), b"unrelated Cargo target").unwrap();
+            let output_option = format!("-o={relative}");
+            let mut argv = vec![
+                "build",
+                "-p=1",
+                "-ldflags",
+                "-s -w -X main.label=go-delivered-37",
+            ];
+            if inline_output {
+                argv.push(&output_option);
+            } else {
+                argv.extend(["-o", relative]);
+            }
+            argv.push("main.go");
+            let command = go_fixture_command("go", &argv, &[]);
+            assert_eq!(
+                rch_common::classify_command(&command).kind,
+                Some(CompilationKind::GoBuild)
+            );
+            let environment = validate_go_build_output(&command, &local).await.unwrap();
+            assert_eq!(
+                std::fs::read(local.join(relative)).unwrap(),
+                b"old local output"
+            );
+            let pipeline = TransferPipeline::new(
+                local.clone(),
+                "go-fixture".into(),
+                identity.clone(),
+                TransferConfig::default(),
+            )
+            .with_remote_path_override(remote.to_str().unwrap().to_owned());
+            let mut session = RecoverySession::prepare(
+                &writer,
+                &worker,
+                &pipeline,
+                vec!["/data/projects/source-recovery".into()],
+                None,
+                None,
+                TransferConfig::default(),
+                local.clone(),
+                Some(&unrelated_target),
+                Some(CompilationKind::GoBuild),
+                &command,
+                &[],
+                identity,
+            )
+            .unwrap();
+            assert!(session.has_native_output_contract());
+            assert_eq!(session.recipe.phases.len(), 1);
+            assert_eq!(session.recipe.phases[0].name, "project");
+            assert!(session.returned(0).is_err());
+            session.starting_execution().unwrap();
+            let guarded = go_build_execution_command(&command, &environment).unwrap();
+            let mut compiler = Command::new("sh");
+            compiler.args(["-c", &guarded]).current_dir(&remote);
+            let output = run_go_fixture(&mut compiler).await;
+            assert!(output.status.success(), "{output:?}");
+            session.completed(0).unwrap();
+            let mut session = reload_publication(&session);
+            assert_eq!(
+                session.recipe.phases[0]
+                    .native_outputs
+                    .as_ref()
+                    .unwrap()
+                    .required_files,
+                std::collections::BTreeSet::from([PathBuf::from(relative)])
+            );
+            for root in [&remote, &missing] {
+                std::fs::write(root.join("foreign.o"), b"unrelated remote object").unwrap();
+                std::fs::write(root.join("source.go"), b"unselected remote source").unwrap();
+                std::fs::write(root.join("products/app d-decoy"), b"wildcard decoy").unwrap();
+            }
+            for complete in [false, true] {
+                let stage = session.stage(0);
+                let staged = session.staging_pipeline("project", &pipeline).unwrap();
+                let patterns = session.cargo_artifact_patterns("project").unwrap();
+                let mut rsync = staged.local_artifact_retrieval_for_test(
+                    &worker,
+                    if complete { &remote } else { &missing },
+                    &patterns,
+                );
+                let output = run_go_fixture(&mut rsync).await;
+                assert!(output.status.success(), "{output:?}");
+                assert!(!stage.join("foreign.o").exists());
+                assert!(!stage.join("source.go").exists());
+                assert!(!stage.join("products/app d-decoy").exists());
+                let journal_before = std::fs::read(&writer.path).unwrap();
+                if !complete {
+                    assert!(session.publish("project").await.is_err());
+                    assert!(session.returned(0).is_err());
+                    assert!(session.retain_failed_delivery_evidence());
+                    assert_eq!(std::fs::read(&writer.path).unwrap(), journal_before);
+                    assert_eq!(
+                        std::fs::read(local.join(relative)).unwrap(),
+                        b"old local output"
+                    );
+                    session = reload_publication(&session);
+                    assert!(session.recipe.phases[0].published.is_empty());
+                    assert!(session.recipe.phases[0].pending.is_none());
+                } else {
+                    session.publish("project").await.unwrap();
+                    session.returned(0).unwrap();
+                    session = reload_publication(&session);
+                    assert!(session.recipe.phases[0].complete);
+                    session.publish("project").await.unwrap();
+                    assert_eq!(
+                        std::fs::read(local.join(relative)).unwrap(),
+                        std::fs::read(remote.join(relative)).unwrap()
+                    );
+                    let mut executable = Command::new(local.join(relative));
+                    let output = run_go_fixture(&mut executable).await;
+                    assert!(output.status.success(), "{output:?}");
+                    assert_eq!(output.stdout, expected_stdout);
+                }
+            }
+            assert_eq!(
+                std::fs::read(local.join("main.go")).unwrap(),
+                b"local source sentinel"
+            );
+            assert_eq!(
+                std::fs::read(local.join("foreign.o")).unwrap(),
+                b"other job's object"
+            );
+            assert_eq!(
+                std::fs::read(unrelated_target.join("sentinel")).unwrap(),
+                b"unrelated Cargo target"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn go_output_guards_preserve_old_files_on_invalid_or_empty_builds() {
+        use super::super::artifact_patterns::direct_compiler::{
+            go_build_execution_command, validate_go_build_output,
+        };
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        use tokio::process::Command;
+
+        let _guard = test_guard!();
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        std::fs::write(
+            root.join("go.mod"),
+            b"module fixture.invalid/guard\n\ngo 1.20\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("main.go"), b"package main\nfunc main() {}\n").unwrap();
+        std::fs::write(
+            root.join("broken.go"),
+            b"package main\nthis is invalid Go\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("app"), b"old output must survive").unwrap();
+        std::fs::create_dir(root.join("directory-output")).unwrap();
+        std::fs::create_dir(root.join("outside")).unwrap();
+        std::fs::write(root.join("outside/app"), b"outside sentinel").unwrap();
+        symlink(root.join("outside/app"), root.join("linked-output")).unwrap();
+        symlink(root.join("outside"), root.join("linked-parent")).unwrap();
+        std::fs::write(root.join("file-parent"), b"parent sentinel").unwrap();
+        let foreign_os = if std::env::consts::OS == "linux" {
+            "GOOS=darwin"
+        } else {
+            "GOOS=linux"
+        };
+        let foreign_arch = if std::env::consts::ARCH == "x86_64" {
+            "GOARCH=arm64"
+        } else {
+            "GOARCH=amd64"
+        };
+        let baseline_command =
+            go_fixture_command("go", &["build", "-p=1", "-o", "app", "main.go"], &[]);
+        let baseline = validate_go_build_output(&baseline_command, root)
+            .await
+            .unwrap();
+        for (output_path, environment, reason) in [
+            ("app", vec!["GOFLAGS=-n"], "empty GOFLAGS"),
+            ("app", vec![foreign_os], "native GOOS/GOARCH"),
+            ("app", vec![foreign_arch], "native GOOS/GOARCH"),
+            ("directory-output", vec![], "regular file"),
+            ("linked-output", vec![], "regular file"),
+            ("linked-parent/app", vec![], "real directories"),
+            ("file-parent/app", vec![], "real directories"),
+        ] {
+            let command = go_fixture_command(
+                "go",
+                &["build", "-p=1", "-o", output_path, "main.go"],
+                &environment,
+            );
+            let error = validate_go_build_output(&command, root).await.unwrap_err();
+            assert!(format!("{error:#}").contains(reason), "{error:#}");
+            let guarded = go_build_execution_command(&command, &baseline).unwrap();
+            let mut process = Command::new("sh");
+            process.args(["-c", &guarded]).current_dir(root);
+            let output = run_go_fixture(&mut process).await;
+            assert_eq!(output.status.code(), Some(113), "{output:?}");
+            let remote_reason = if environment.is_empty() {
+                reason
+            } else {
+                "settings differ"
+            };
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains(remote_reason),
+                "{output:?}"
+            );
+            assert_eq!(
+                std::fs::read(root.join("app")).unwrap(),
+                b"old output must survive"
+            );
+            assert_eq!(
+                std::fs::read(root.join("outside/app")).unwrap(),
+                b"outside sentinel"
+            );
+        }
+        // An ambient build setting that is absent on the worker is a mismatch,
+        // even when both endpoints still report the same GOOS/GOARCH.
+        for changed in ["CGO_ENABLED=1", "GOEXPERIMENT=none", "GOAMD64=v2"] {
+            let command =
+                go_fixture_command("go", &["build", "-p=1", "-o", "app", "main.go"], &[changed]);
+            validate_go_build_output(&command, root).await.unwrap();
+            let guarded = go_build_execution_command(&command, &baseline).unwrap();
+            let mut process = Command::new("sh");
+            process.args(["-c", &guarded]).current_dir(root);
+            let output = run_go_fixture(&mut process).await;
+            assert_eq!(output.status.code(), Some(113), "{changed}: {output:?}");
+            assert!(String::from_utf8_lossy(&output.stderr).contains("settings differ"));
+            assert_eq!(
+                std::fs::read(root.join("app")).unwrap(),
+                b"old output must survive"
+            );
+        }
+        // Matching CGO_ENABLED=1 remains supported; the guard does not force
+        // otherwise ordinary Go builds into a pure-Go-only policy.
+        let cgo_command = go_fixture_command(
+            "go",
+            &["build", "-p=1", "-o", "cgo-enabled-app", "main.go"],
+            &["CGO_ENABLED=1"],
+        );
+        let cgo_environment = validate_go_build_output(&cgo_command, root).await.unwrap();
+        let guarded = go_build_execution_command(&cgo_command, &cgo_environment).unwrap();
+        let mut process = Command::new("sh");
+        process.args(["-c", &guarded]).current_dir(root);
+        let output = run_go_fixture(&mut process).await;
+        assert!(output.status.success(), "{output:?}");
+        assert!(root.join("cgo-enabled-app").is_file());
+
+        // Both are real Go failures, including the explicit -o/no-packages
+        // case. Neither may replace a previous successful build's output.
+        for package in ["broken.go", "./missing/..."] {
+            let command = go_fixture_command("go", &["build", "-p=1", "-o", "app", package], &[]);
+            let environment = validate_go_build_output(&command, root).await.unwrap();
+            let guarded = go_build_execution_command(&command, &environment).unwrap();
+            let mut process = Command::new("sh");
+            process.args(["-c", &guarded]).current_dir(root);
+            let output = run_go_fixture(&mut process).await;
+            assert_eq!(output.status.code(), Some(1), "{output:?}");
+            assert_eq!(
+                std::fs::read(root.join("app")).unwrap(),
+                b"old output must survive"
+            );
+        }
+
+        // Package loading must see exactly the caller's embed inputs. An
+        // adjacent empty staging directory or a newly created output parent
+        // changes `go:embed *` and makes an otherwise valid package fail.
+        for (fixture, output_path) in [
+            ("wildcard-root-output", "app"),
+            ("wildcard-new-parent", "new-products/app"),
+        ] {
+            let project = root.join(fixture);
+            std::fs::create_dir(&project).unwrap();
+            std::fs::write(
+                project.join("go.mod"),
+                b"module fixture.invalid/embed\n\ngo 1.20\n",
+            )
+            .unwrap();
+            std::fs::write(project.join("app"), b"embedded prior output").unwrap();
+            std::fs::write(
+                project.join("main.go"),
+                b"package main\nimport (\"embed\"; \"fmt\")\n//go:embed *\nvar inputs embed.FS\nfunc main() { previous, err := inputs.ReadFile(\"app\"); if err != nil { panic(err) }; fmt.Println(string(previous)) }\n",
+            )
+            .unwrap();
+            assert!(!project.join("new-products").exists());
+            let command = go_fixture_command("go", &["build", "-p=1", "-o", output_path, "."], &[]);
+            let environment = validate_go_build_output(&command, &project).await.unwrap();
+            let guarded = go_build_execution_command(&command, &environment).unwrap();
+            let mut compiler = Command::new("sh");
+            compiler.args(["-c", &guarded]).current_dir(&project);
+            let output = run_go_fixture(&mut compiler).await;
+            assert!(output.status.success(), "{fixture}: {output:?}");
+            let mut executable = Command::new(project.join(output_path));
+            let output = run_go_fixture(&mut executable).await;
+            assert!(output.status.success(), "{fixture}: {output:?}");
+            assert_eq!(output.stdout, b"embedded prior output\n");
+            if output_path != "app" {
+                assert_eq!(
+                    std::fs::read(project.join("app")).unwrap(),
+                    b"embedded prior output"
+                );
+            }
+        }
+
+        // Failure injection: a Go shim reports success but creates no file.
+        // Its env probe forwards to the actual compiler; an
+        // old destination must still not satisfy the fresh-output contract.
+        let mut real_env = Command::new("sh");
+        real_env
+            .args(["-c", &go_fixture_command("go", &["env", "GOROOT"], &[])])
+            .current_dir(root);
+        let goroot = run_go_fixture(&mut real_env).await;
+        assert!(goroot.status.success(), "{goroot:?}");
+        let go = PathBuf::from(String::from_utf8(goroot.stdout).unwrap().trim()).join("bin/go");
+        let go = shell_escape::escape(go.to_string_lossy());
+        let shim = root.join("shim/go");
+        std::fs::create_dir(shim.parent().unwrap()).unwrap();
+        std::fs::write(
+            &shim,
+            format!("#!/bin/sh\nif [ \"$1\" = env ]; then exec {go} \"$@\"; fi\nexit 0\n"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let command = go_fixture_command(
+            shim.to_str().unwrap(),
+            &["build", "-o", "app", "main.go"],
+            &[],
+        );
+        let environment = validate_go_build_output(&command, root).await.unwrap();
+        let guarded = go_build_execution_command(&command, &environment).unwrap();
+        let mut process = Command::new("sh");
+        process.args(["-c", &guarded]).current_dir(root);
+        let output = run_go_fixture(&mut process).await;
+        assert_eq!(output.status.code(), Some(113), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("without its required output file")
+        );
+        assert_eq!(
+            std::fs::read(root.join("app")).unwrap(),
+            b"old output must survive"
+        );
+        assert!(!std::fs::read_dir(root).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".rch-go-output.")
+        }));
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn real_native_outputs_are_complete_before_publication_and_survive_recovery() {
         use tokio::process::Command;

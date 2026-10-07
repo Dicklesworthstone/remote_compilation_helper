@@ -113,6 +113,7 @@ pub(crate) fn native_output_contract(
         rch_common::CompilationKind::Clangpp => {
             c_family_outputs(command, &["clang++"], true, posix_defaults)
         }
+        rch_common::CompilationKind::GoBuild if posix_defaults => go_output_contract(command),
         _ => None,
     }
 }
@@ -135,8 +136,233 @@ pub(super) fn patterns(
         (Some(rch_common::CompilationKind::Clangpp), Some(command)) => {
             c_family_patterns(command, &["clang++"], true)
         }
+        (Some(rch_common::CompilationKind::GoBuild), Some(command)) => {
+            go_output_contract(command)?.patterns().ok()
+        }
         _ => None,
     }
+}
+
+fn go_output_selection(command: &str) -> Option<rch_common::patterns::GoBuildOutput> {
+    let args = compiler_arguments(command, &["go"])?;
+    let plain = shell_words::join(std::iter::once("go").chain(args.iter().map(String::as_str)));
+    rch_common::patterns::go_build_output(&plain)
+}
+
+fn go_output_contract(command: &str) -> Option<NativeOutputContract> {
+    NativeOutputContract::from_paths([go_output_selection(command)?.path])
+}
+
+// Query names explicitly: older Go versions return an empty string for newer
+// settings, so a worker gaining a new default cannot silently skip comparison.
+const GO_BUILD_ENVIRONMENT: &[&str] = &[
+    "GOFLAGS",
+    "GOOS",
+    "GOARCH",
+    "GOVERSION",
+    "CGO_ENABLED",
+    "GOEXPERIMENT",
+    "GODEBUG",
+    "GO386",
+    "GOAMD64",
+    "GOARM",
+    "GOARM64",
+    "GOMIPS",
+    "GOMIPS64",
+    "GOPPC64",
+    "GORISCV64",
+    "GOWASM",
+    "GOFIPS140",
+    "CC",
+    "CXX",
+    "FC",
+    "AR",
+    "PKG_CONFIG",
+    "CGO_CFLAGS",
+    "CGO_CPPFLAGS",
+    "CGO_CXXFLAGS",
+    "CGO_FFLAGS",
+    "CGO_LDFLAGS",
+];
+
+/// The caller's effective compiler and code-generation settings at admission.
+/// Kept until the remote execution guard is built; recovery only collects the
+/// completed output and never needs to run the compiler or its probe again.
+#[derive(Clone, Debug)]
+pub(in crate::hook) struct GoBuildEnvironment {
+    settings: String,
+}
+
+/// Check the caller's effective Go configuration and output path before any
+/// upload or compiler execution. A worker-only default must not silently turn
+/// a native binary into another platform's binary, or a GOFLAGS dry run into a
+/// successful delivery of an old file.
+pub(in crate::hook) async fn validate_go_build_output(
+    command: &str,
+    project_root: &Path,
+) -> anyhow::Result<GoBuildEnvironment> {
+    use anyhow::Context;
+    let probe = guarded_go_command(command, None)
+        .context("Go build has no supported explicit file output contract")?;
+    let mut go = tokio::process::Command::new("sh");
+    go.args(["-c", &probe])
+        .current_dir(project_root)
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true);
+    let output = tokio::time::timeout(std::time::Duration::from_secs(10), go.output())
+        .await
+        .context("local Go output preflight timed out")?
+        .context("local Go output preflight could not run")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "local Go output preflight refused remote execution: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    anyhow::ensure!(
+        output.stdout.len() <= 65_536,
+        "oversized Go build environment"
+    );
+    let settings = String::from_utf8(output.stdout).context("non-UTF-8 Go build environment")?;
+    let values: BTreeMap<String, String> =
+        serde_json::from_str(&settings).context("invalid Go build environment")?;
+    anyhow::ensure!(
+        values.len() == GO_BUILD_ENVIRONMENT.len()
+            && GO_BUILD_ENVIRONMENT
+                .iter()
+                .all(|name| values.contains_key(*name)),
+        "incomplete Go build environment"
+    );
+    let (goos, goarch) = native_go_target().context("unsupported native Go target")?;
+    anyhow::ensure!(
+        values["GOFLAGS"].is_empty() && values["GOOS"] == goos && values["GOARCH"] == goarch,
+        "Go output delivery requires empty GOFLAGS and the dispatcher native GOOS/GOARCH"
+    );
+    Ok(GoBuildEnvironment {
+        settings: settings.trim_end_matches('\n').to_owned(),
+    })
+}
+
+/// Preserve the original wrappers and argv while validating the worker's Go
+/// configuration. The compiler writes outside its source root, then stages a
+/// fresh private file beside the destination for atomic replacement. Creating
+/// output parents or a staging directory before package loading would change
+/// wildcard go:embed inputs, including introducing empty-directory errors.
+/// A zero exit without that fresh file cannot validate stale files uploaded
+/// from the caller or left by an earlier remote build.
+pub(in crate::hook) fn go_build_execution_command(
+    command: &str,
+    environment: &GoBuildEnvironment,
+) -> Option<String> {
+    guarded_go_command(command, Some(environment))
+}
+
+fn native_go_target() -> Option<(&'static str, &'static str)> {
+    let goos = match std::env::consts::OS {
+        "linux" => "linux",
+        "macos" => "darwin",
+        "freebsd" => "freebsd",
+        "openbsd" => "openbsd",
+        "netbsd" => "netbsd",
+        "dragonfly" => "dragonfly",
+        _ => return None,
+    };
+    let goarch = match std::env::consts::ARCH {
+        "x86_64" => "amd64",
+        "x86" => "386",
+        "aarch64" => "arm64",
+        "arm" => "arm",
+        "riscv64" => "riscv64",
+        "s390x" => "s390x",
+        _ => return None,
+    };
+    Some((goos, goarch))
+}
+
+fn guarded_go_command(command: &str, environment: Option<&GoBuildEnvironment>) -> Option<String> {
+    let selection = go_output_selection(command)?;
+    let contract = NativeOutputContract::from_paths([selection.path])?;
+    let output = contract.required_files.first()?;
+    let mut words = literal_words(command)?;
+    let mut args = compiler_arguments(command, &["go"])?;
+    let go_index = words.len().checked_sub(args.len() + 1)?;
+    let go = words.get(go_index)?.clone();
+    let query = shell_words::join(GO_BUILD_ENVIRONMENT);
+    let output_text = shell_escape::escape(format!("./{}", output.to_str()?).into());
+    let mut path_checks = String::new();
+    for parent in output
+        .ancestors()
+        .skip(1)
+        .filter(|path| !path.as_os_str().is_empty())
+    {
+        let parent = shell_escape::escape(format!("./{}", parent.to_str()?).into());
+        path_checks.push_str(&format!(
+            "if [ -L {parent} ] || {{ [ -e {parent} ] && [ ! -d {parent} ]; }}; then \
+             printf '%s\\n' 'RCH: Go output parents must be real directories' >&2; return 113; fi; "
+        ));
+    }
+    path_checks.push_str(&format!(
+        "if [ -L {output_text} ] || {{ [ -e {output_text} ] && [ ! -f {output_text} ]; }}; then \
+         printf '%s\\n' 'RCH: Go -o must name a regular file, not a directory or symlink' >&2; return 113; fi; "
+    ));
+    let terminal = if let Some(environment) = environment {
+        // The shared parser supplies the actual option's position. Opaque
+        // values such as `-tags -o` must not be rewritten as output options.
+        let output_index = selection.option_index.checked_sub(1)?;
+        let count = if args.get(output_index)? == "-o" {
+            2
+        } else {
+            1
+        };
+        args.drain(output_index..output_index + count);
+        args.remove(0); // build is supplied before the private -o below.
+        let parent = shell_escape::escape(format!("./{}", output.parent()?.to_str()?).into());
+        let expected = shell_escape::escape(environment.settings.as_str().into());
+        format!(
+            "rch_go_settings=$(\"$rch_go\" env -json {query}) || exit 113; \
+             if [ \"$rch_go_settings\" != {expected} ]; then \
+               printf '%s\\n' 'RCH: worker Go compiler/code-generation settings differ from the dispatcher' >&2; exit 113; fi; \
+             rch_go_root=$(pwd -P) || exit 113; \
+             rch_go_build=$(mktemp -d \"${{TMPDIR:-/tmp}}/rch-go-build.XXXXXXXXXX\") || exit 113; \
+             rch_go_stage=; \
+             trap 'rm -f \"$rch_go_build/output\"; rmdir \"$rch_go_build\"; \
+               if [ -n \"$rch_go_stage\" ]; then rm -f \"$rch_go_stage/output\"; rmdir \"$rch_go_stage\"; fi' EXIT; \
+             trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM; \
+             rch_go_build_root=$(cd \"$rch_go_build\" && pwd -P) || exit 113; \
+             case \"$rch_go_build_root/\" in \"${{rch_go_root%/}}/\"*) \
+               printf '%s\\n' 'RCH: Go build temporary directory must be outside the source root' >&2; exit 113;; esac; \
+             \"$rch_go\" build -o \"$rch_go_build/output\" \"$@\"; \
+             rch_go_status=$?; \
+             if [ \"$rch_go_status\" -ne 0 ]; then exit \"$rch_go_status\"; fi; \
+             if [ -L \"$rch_go_build/output\" ] || [ ! -f \"$rch_go_build/output\" ]; then \
+               printf '%s\\n' 'RCH: Go build succeeded without its required output file' >&2; exit 113; fi; \
+             rch_go_parent={parent}; \
+             rch_go_check_output || exit 113; \
+             mkdir -p \"$rch_go_parent\" || exit 113; \
+             rch_go_check_output || exit 113; \
+             rch_go_stage=$(mktemp -d \"$rch_go_parent/.rch-go-output.XXXXXXXXXX\") || exit 113; \
+             cp -p \"$rch_go_build/output\" \"$rch_go_stage/output\" || exit 113; \
+             rch_go_check_output || exit 113; \
+             mv -f \"$rch_go_stage/output\" {output_text} || exit 113"
+        )
+    } else {
+        format!("\"$rch_go\" env -json {query}")
+    };
+    let script = format!(
+        "rch_go=$1; shift; \
+         rch_go_check_output() {{ {path_checks} return 0; }}; \
+         rch_go_check_output || exit 113; \
+         {terminal}"
+    );
+    words.truncate(go_index);
+    words.extend([
+        "sh".to_owned(),
+        "-c".to_owned(),
+        script,
+        "rch-go-output".to_owned(),
+        go,
+    ]);
+    words.extend(args);
+    Some(super::super::join_exec_command(&words))
 }
 
 /// Shell-words is a tokenizer, not an expansion engine. Admit only a literal
@@ -785,6 +1011,56 @@ fn c_family_outputs(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn go_outputs_are_exact_required_project_files() {
+        use rch_common::CompilationKind;
+        let kind = Some(CompilationKind::GoBuild);
+        for (command, path, pattern) in [
+            ("go build -o app main.go", "app", "app"),
+            (
+                "env GOFLAGS= /usr/bin/time -p go build -o './products/app [dev]*?' .",
+                "products/app [dev]*?",
+                "products/app [[]dev[]][*][?]",
+            ),
+            ("go build -o=target/app .", "target/app", "target/app"),
+        ] {
+            let contract = native_output_contract(kind, command, true).unwrap();
+            assert_eq!(
+                contract.required_files,
+                BTreeSet::from([PathBuf::from(path)])
+            );
+            assert_eq!(contract.patterns().unwrap(), vec![pattern]);
+            assert_eq!(
+                super::super::get_artifact_patterns(kind, Some(command)),
+                vec![pattern]
+            );
+            assert_eq!(
+                super::super::get_project_artifact_patterns(kind, Some(command), true),
+                vec![pattern],
+                "forwarded Cargo target must not suppress Go outputs"
+            );
+            assert!(
+                super::super::get_custom_target_artifact_patterns(kind, Some(command)).is_empty()
+            );
+            assert!(super::super::kind_produces_transferable_artifacts(kind));
+            assert!(native_output_contract(kind, command, false).is_none());
+        }
+        for command in [
+            "go build .",
+            "go build -o app -n .",
+            "go build -o app -buildmode=c-shared .",
+            "env -C other go build -o app .",
+            "time -o timing.txt go build -o app .",
+            "sh -c 'go build -o app .'",
+        ] {
+            assert!(
+                native_output_contract(kind, command, true).is_none(),
+                "{command}"
+            );
+            assert!(guarded_go_command(command, None).is_none(), "{command}");
+        }
+    }
 
     #[test]
     fn native_implicit_outputs_are_enumerated_per_source_and_selected_worker() {

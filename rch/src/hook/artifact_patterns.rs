@@ -128,11 +128,9 @@ pub(super) fn get_artifact_patterns(
         // symlink that is meaningless on a nix-less local host, so nothing is
         // synced back — the exit status is the payload (streaming only).
         Some(CompilationKind::NixBuild) => Vec::new(),
-        // Go and TypeScript kinds are stream-only by construction: the classifier
-        // only accepts the non-emitting forms (`go build` without `-o`, `go test`,
-        // `go vet`, `tsc --noEmit`), so there is no output file to bring home and
-        // the exit status is the payload. Emitting forms are declined in
-        // classify_go/classify_tsc and run locally. Falling through to the
+        // Explicit Go builds were selected by direct_compiler above. Other Go
+        // and TS commands stream their results; unsupported emitting forms
+        // are declined by their classifiers. Falling through to the
         // `_ => default_rust_artifact_patterns()` catch-all would sync back
         // `target/**` — the wrong tree entirely.
         Some(CompilationKind::GoBuild)
@@ -437,6 +435,7 @@ pub(super) fn kind_produces_transferable_artifacts(kind: Option<CompilationKind>
         // Zig cross-build produces a real binary under target/<triple>/ that the
         // caller needs locally, so a failed sync-back is a build failure.
         | Some(CompilationKind::CargoZigbuild)
+        | Some(CompilationKind::GoBuild)
         | Some(CompilationKind::Gcc)
         | Some(CompilationKind::Gpp)
         | Some(CompilationKind::Clang)
@@ -458,9 +457,7 @@ pub(super) fn kind_produces_transferable_artifacts(kind: Option<CompilationKind>
         // Jobs are arbitrary admitted commands: no artifact contract exists in
         // this phase, so a sync-back miss can never fail a job.
         | Some(CompilationKind::Job)
-        // Go/TS: only non-emitting forms are ever offloaded (see classify_go /
-        // classify_tsc), so there is no required local artifact.
-        | Some(CompilationKind::GoBuild)
+        // Go tests/vet and TS typechecks have no selected local artifact.
         | Some(CompilationKind::GoTest)
         | Some(CompilationKind::GoVet)
         | Some(CompilationKind::Tsc) => false,
