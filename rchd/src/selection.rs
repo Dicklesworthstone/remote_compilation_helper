@@ -2660,14 +2660,50 @@ impl WorkerSelector {
             return Ok(eligible);
         }
 
+        // Degrade rather than fall local when the ONLY thing standing between
+        // this request and a healthy available worker is an estimate that
+        // worker can never meet. Deliberately last-resort: every other candidate list —
+        // including the below-health fail-open lists — must be empty first, so
+        // only fully vetted workers with otherwise unusable capacity qualify.
+        //
+        // Two guards keep existing admission contracts intact:
+        //   * `!has_preferred` — an explicit `preferred_workers` pin is an
+        //     allow-set, and "this exact worker is too small" must stay
+        //     terminal rather than quietly running somewhere the caller did
+        //     not ask for.
+        //   * `filtered_by_slots == 0` — if any worker is merely BUSY it can
+        //     still satisfy the request once it drains, so the pool is
+        //     queueable and waiting beats degrading.
+        //
+        // Active-project exclusions apply to individual workers, not the
+        // whole fleet: those workers were skipped before collecting degraded
+        // candidates. A concurrent build on one worker must not prevent using
+        // another safe, free worker (bd-d2jav). Check this before job-mode
+        // queueing as well, since useful capacity is already available.
+        if !has_preferred
+            && filtered_by_slots == 0
+            && eligible.is_empty()
+            && preferred.is_empty()
+            && eligible_without_health.is_empty()
+            && preferred_without_health.is_empty()
+            && !capacity_degraded.is_empty()
+        {
+            debug!(
+                "No available candidate can satisfy estimated_cores={}; degrading to {} worker(s) \
+                 with free capacity below the estimate rather than falling back to local",
+                request.estimated_cores,
+                capacity_degraded.len()
+            );
+            metrics::inc_reliability_error("selection", "capacity_degraded_admission");
+            return Ok(capacity_degraded);
+        }
+
         // bd-g7rpy (GH#27 P4, job mode ONLY): the one-active-job-per-project-
         // per-worker guard means an N-shard `--job` burst can occupy at most
-        // one slot per worker for this project, so a burst larger than the
-        // worker count leaves every otherwise-eligible worker excluded by an
-        // ACTIVE job — a transient state that resolves as those jobs finish.
-        // Returning an empty eligible set maps to AllWorkersBusy upstream,
-        // which keeps RCH_QUEUE_WHEN_BUSY polling (initial admission AND
-        // queue polls) instead of failing excess shards to local execution.
+        // one slot per worker for this project. Once no normal or degraded
+        // candidate remains, active-project exclusions are a transient state
+        // that resolves as those jobs finish. Returning an empty eligible set
+        // maps to AllWorkersBusy upstream, keeping queue polls remote.
         // Compilation requests keep the immediate NoAdmissibleWorkers below.
         if request.job_mode
             && filtered_by_active_project > 0
@@ -2676,42 +2712,6 @@ impl WorkerSelector {
             && preferred_without_health.is_empty()
         {
             return Ok(Vec::new());
-        }
-
-        // Degrade rather than fall local when the ONLY thing standing between
-        // this request and a healthy idle worker is an estimate the fleet can
-        // never meet. Deliberately last-resort: every other candidate list —
-        // including the below-health fail-open lists — must be empty first, so
-        // this can only turn a guaranteed LOCAL build into a remote one.
-        //
-        // Three guards keep existing admission contracts intact:
-        //   * `!has_preferred` — an explicit `preferred_workers` pin is an
-        //     allow-set, and "this exact worker is too small" must stay
-        //     terminal rather than quietly running somewhere the caller did
-        //     not ask for.
-        //   * `filtered_by_slots == 0` — if any worker is merely BUSY it can
-        //     still satisfy the request once it drains, so the pool is
-        //     queueable and waiting beats degrading. Only degrade when nothing
-        //     in the fleet could ever fit.
-        //   * `filtered_by_active_project == 0` — the one-job-per-project-per-
-        //     worker guard is a correctness rule, not a capacity hint.
-        if !has_preferred
-            && filtered_by_slots == 0
-            && filtered_by_active_project == 0
-            && eligible.is_empty()
-            && preferred.is_empty()
-            && eligible_without_health.is_empty()
-            && preferred_without_health.is_empty()
-            && !capacity_degraded.is_empty()
-        {
-            debug!(
-                "No worker can satisfy estimated_cores={}; degrading to {} worker(s) \
-                 with free capacity below the estimate rather than falling back to local",
-                request.estimated_cores,
-                capacity_degraded.len()
-            );
-            metrics::inc_reliability_error("selection", "capacity_degraded_admission");
-            return Ok(capacity_degraded);
         }
 
         // A worker that passed every gate up to slot accounting and is merely
@@ -6827,6 +6827,176 @@ mod tests {
              degraded candidate instead of silently falling back to local; reason={:?}",
             result.reason
         );
+    }
+
+    async fn active_project_capacity_fixture() -> (WorkerPool, WorkerSelector, SelectionRequest) {
+        let pool = WorkerPool::new();
+        for id in ["active-project", "free-small"] {
+            let worker = make_worker(id, 3, 80.0);
+            prepare_fixture_worker(
+                &worker,
+                Some("1.97.0-nightly"),
+                PressureState::Healthy,
+                "healthy",
+            )
+            .await;
+            pool.add_worker_state(worker).await;
+        }
+        let selector = crate::daemon_worker_selector(
+            &rch_common::RchConfig::default(),
+            Arc::new(crate::history::BuildHistory::new(10)),
+            None,
+        );
+        // Even a warm affinity pin must not resurrect the excluded owner.
+        selector
+            .record_success("active-project", "concurrent-project")
+            .await;
+        let request = SelectionRequest {
+            job_mode: false,
+            project: "concurrent-project".to_string(),
+            command: Some("cargo build".to_string()),
+            command_priority: CommandPriority::Normal,
+            estimated_cores: 4,
+            preferred_workers: vec![],
+            toolchain: None,
+            required_runtime: RequiredRuntime::Rust,
+            classification_duration_us: None,
+            hook_pid: None,
+            required_tools: Vec::new(),
+        };
+        (pool, selector, request)
+    }
+
+    #[tokio::test]
+    async fn capacity_degraded_active_project_sibling_uses_other_free_worker() {
+        for job_mode in [false, true] {
+            let (pool, selector, mut request) = active_project_capacity_fixture().await;
+            request.job_mode = job_mode;
+            let active = pool.get(&WorkerId::new("active-project")).await.unwrap();
+            let small = pool.get(&WorkerId::new("free-small")).await.unwrap();
+            assert!(active.reserve_slots(1).await);
+            // A different project can already occupy part of the small worker.
+            assert!(small.reserve_slots(1).await);
+            let excluded = HashSet::from(["active-project".to_string()]);
+            let preview = selector
+                .preview_with_exclusions(&pool, &request, &excluded)
+                .await;
+            let selected = selector
+                .select_with_exclusions(&pool, &request, &excluded)
+                .await;
+            for result in [preview, selected] {
+                let worker = result
+                    .worker
+                    .unwrap_or_else(|| panic!("job_mode={job_mode}: {:?}", result.reason));
+                assert_eq!(worker.config.read().await.id.as_str(), "free-small");
+                assert_eq!(worker.available_slots().await, 2);
+            }
+            assert_eq!(
+                active.used_slots(),
+                1,
+                "selection must preserve active ownership"
+            );
+            assert_eq!(
+                small.used_slots(),
+                1,
+                "selection itself must not reserve slots"
+            );
+
+            // Once this worker also owns the project, neither can be reused.
+            let all_active =
+                HashSet::from(["active-project".to_string(), "free-small".to_string()]);
+            let result = selector
+                .select_with_exclusions(&pool, &request, &all_active)
+                .await;
+            assert!(result.worker.is_none());
+            if job_mode {
+                assert_eq!(result.reason, SelectionReason::AllWorkersBusy);
+            } else {
+                assert!(matches!(
+                    result.reason,
+                    SelectionReason::NoAdmissibleWorkers(_)
+                ));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn capacity_degraded_active_project_still_queues_for_capable_busy_worker() {
+        for job_mode in [false, true] {
+            let (pool, selector, mut request) = active_project_capacity_fixture().await;
+            request.job_mode = job_mode;
+            let capable = make_worker("capable-busy", 4, 90.0);
+            prepare_fixture_worker(
+                &capable,
+                Some("1.97.0-nightly"),
+                PressureState::Healthy,
+                "healthy",
+            )
+            .await;
+            assert!(capable.reserve_slots(4).await);
+            pool.add_worker_state(capable).await;
+            let excluded = HashSet::from(["active-project".to_string()]);
+            let result = selector
+                .select_with_exclusions(&pool, &request, &excluded)
+                .await;
+            assert!(
+                result.worker.is_none(),
+                "a capable busy worker preserves queue policy"
+            );
+            assert_eq!(result.reason, SelectionReason::AllWorkersBusy);
+
+            let capable = pool.get(&WorkerId::new("capable-busy")).await.unwrap();
+            capable.release_slots(4).await;
+            let result = selector
+                .select_with_exclusions(&pool, &request, &excluded)
+                .await;
+            assert_eq!(
+                result.worker.unwrap().config.read().await.id.as_str(),
+                "capable-busy"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn capacity_degraded_active_project_never_bypasses_candidate_gates_or_pins() {
+        for job_mode in [false, true] {
+            for blocker in ["critical", "topology", "runtime", "full", "pin"] {
+                let (pool, selector, mut request) = active_project_capacity_fixture().await;
+                request.job_mode = job_mode;
+                let small = pool.get(&WorkerId::new("free-small")).await.unwrap();
+                match blocker {
+                    "critical" => {
+                        let mut pressure = small.pressure_assessment().await;
+                        pressure.state = PressureState::Critical;
+                        pressure.disk_free_gb = Some(0.0);
+                        pressure.disk_free_ratio = Some(0.0);
+                        small.set_pressure_assessment(pressure).await;
+                    }
+                    "topology" => {
+                        let mut capabilities = small.capabilities().await;
+                        capabilities.projects_root_ok = Some(false);
+                        small.set_capabilities(capabilities).await;
+                    }
+                    "runtime" => {
+                        let mut capabilities = small.capabilities().await;
+                        capabilities.rustc_version = None;
+                        small.set_capabilities(capabilities).await;
+                    }
+                    "full" => assert!(small.reserve_slots(3).await),
+                    "pin" => request.preferred_workers = vec![WorkerId::new("active-project")],
+                    _ => unreachable!(),
+                }
+                let excluded = HashSet::from(["active-project".to_string()]);
+                let result = selector
+                    .select_with_exclusions(&pool, &request, &excluded)
+                    .await;
+                assert!(
+                    result.worker.is_none(),
+                    "job_mode={job_mode}, blocker={blocker}"
+                );
+                assert_eq!(small.used_slots(), if blocker == "full" { 3 } else { 0 });
+            }
+        }
     }
 
     /// Regression: a degraded (undersized) candidate must still clear EVERY
