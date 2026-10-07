@@ -7,6 +7,8 @@ on:
       - 'rch/src/update/lock.rs'
       - 'rch/src/update/mod.rs'
       - 'rch/src/update/types.rs'
+      - 'rch/src/update/install.rs'
+      - 'rch/src/update/install/daemon_shutdown.rs'
       - 'rch-common/src/process_identity.rs'
       - '.github/workflows/update-lock.yml'
   workflow_dispatch:
@@ -44,6 +46,7 @@ jobs:
           cargo test --locked -p rch --bin rch installation_verification_ -- --nocapture 2>&1 | tee "$evidence/installed-binaries.log"
           cargo test --locked -p rch --bin rch test_verify_installation_ -- --nocapture 2>&1 | tee "$evidence/failed-client-probes.log"
           cargo test --locked -p rch --bin rch update_verification_ -- --nocapture 2>&1 | tee "$evidence/authorization.log"
+          cargo test --locked -p rch --bin rch update_shutdown_ -- --nocapture 2>&1 | tee "$evidence/shutdown.log"
           cargo clippy --locked -p rch --all-targets -- -D warnings 2>&1 | tee "$evidence/clippy.log"
       - name: Check client verification formatting
         if: success() || failure()
@@ -51,7 +54,7 @@ jobs:
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/update-client-evidence"
           rustfmt --edition 2024 --config skip_children=true --emit stdout rch/src/update/mod.rs > "$RUNNER_TEMP/update-client-evidence/mod.formatted.rs"
-          rustfmt --edition 2024 --config skip_children=true --check rch/src/update/mod.rs
+          rustfmt --edition 2024 --config skip_children=true --check rch/src/update/mod.rs rch/src/update/install.rs rch/src/update/install/daemon_shutdown.rs
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -78,9 +81,9 @@ jobs:
         run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy
       # Copy exact production code, including the real process observer and
       # UpdateError types. No simulated PID/lock implementation is substituted.
-      # This bounds the ownership regression independently of unrelated RABS
-      # dependencies; it is not a full-workspace or installation qualification.
-      - name: Compile and exercise real cross-process ownership
+      # Unix additionally exercises the actual shutdown client against owned
+      # Unix-socket fixtures. This is not full installation/fleet qualification.
+      - name: Compile and exercise real cross-process ownership and shutdown
         run: |
           set -euo pipefail
           work="$RUNNER_TEMP/update-lock-tests"
@@ -90,6 +93,15 @@ jobs:
           cp rch-common/src/process_identity.rs "$work/src/"
           printf 'extern crate self as rch_common;\npub mod process_identity;\npub mod update;\n' > "$work/src/lib.rs"
           printf 'pub mod types;\npub mod lock;\n' > "$work/src/update/mod.rs"
+          if [ "$RUNNER_OS" != Windows ]; then
+            cp rch/src/update/install/daemon_shutdown.rs "$work/src/daemon_shutdown.rs"
+            cat >> "$work/src/lib.rs" <<'RS'
+          mod daemon_shutdown;
+          pub async fn stop_daemon(path: &std::path::Path, drain_timeout: std::time::Duration) -> Result<bool, String> {
+              daemon_shutdown::stop(path, drain_timeout).await
+          }
+          RS
+          fi
           cat > "$work/Cargo.toml" <<'TOML'
           [package]
           name = "rch-update-lock-validation"
@@ -102,19 +114,26 @@ jobs:
           thiserror = "2"
           tempfile = "3.25"
           uuid = { version = "1", features = ["v4"] }
+          tokio = { version = "1.49.0", features = ["full"] }
           [target.'cfg(target_os = "macos")'.dependencies]
           libproc = "=0.14.11"
           rustix = { version = "1.1.5", features = ["process"] }
           TOML
-          cargo test --manifest-path "$work/Cargo.toml" -- --nocapture 2>&1 | tee "$evidence/tests.log"
-          cargo clippy --manifest-path "$work/Cargo.toml" --all-targets -- -D warnings 2>&1 | tee "$evidence/clippy.log"
-      - name: Check update-lock formatting
+          # Cargo discovers configuration from the working directory even
+          # with --manifest-path. The copied stable crate must not inherit the
+          # main workspace's nightly-only -Z rustflags. The real-client job
+          # above still uses the unmodified repository config and pinned Rust.
+          cd "$work"
+          cargo test -- --nocapture 2>&1 | tee "$evidence/tests.log"
+          cargo clippy --all-targets -- -D warnings 2>&1 | tee "$evidence/clippy.log"
+      - name: Check update-lock and shutdown formatting
         if: success() || failure()
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/update-lock-evidence"
           rustfmt --edition 2024 --emit stdout rch/src/update/lock.rs > "$RUNNER_TEMP/update-lock-evidence/lock.formatted.rs"
-          rustfmt --edition 2024 --check rch/src/update/lock.rs
+          rustfmt --edition 2024 --emit stdout rch/src/update/install/daemon_shutdown.rs > "$RUNNER_TEMP/update-lock-evidence/shutdown.formatted.rs"
+          rustfmt --edition 2024 --check rch/src/update/lock.rs rch/src/update/install/daemon_shutdown.rs
       - uses: actions/upload-artifact@v4
         if: always()
         with:

@@ -3,13 +3,16 @@
 use super::download::DownloadedRelease;
 use super::lock::UpdateLock;
 use super::types::{BackupEntry, MAX_BACKUPS, UpdateError};
-use crate::commands::{configured_socket_path, send_daemon_command};
+use crate::commands::configured_socket_path;
 use crate::ui::OutputContext;
 use flate2::read::GzDecoder;
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
+
+#[cfg(unix)]
+mod daemon_shutdown;
 
 #[cfg(not(windows))]
 const UPDATE_BINARIES: &[&str] = &["rch", "rchd", "rch-wkr"];
@@ -796,31 +799,12 @@ async fn stop_daemon_gracefully(_timeout_secs: u64) -> Result<bool, UpdateError>
 #[cfg(unix)]
 async fn stop_daemon_gracefully(timeout_secs: u64) -> Result<bool, UpdateError> {
     let socket_path = configured_update_socket_path()?;
-    if !socket_path.exists() {
-        return Ok(false);
-    }
-
-    // Try graceful shutdown via socket
-    let _ = send_daemon_command("POST /shutdown\n").await;
-
-    // Wait for socket to disappear
-    for _ in 0..shutdown_poll_attempts(timeout_secs) {
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        if !socket_path.exists() {
-            return Ok(true);
-        }
-    }
-
-    // Try pkill as fallback
-    let _ = tokio::process::Command::new("pkill")
-        .args(["-f", "rchd"])
-        .output()
-        .await;
-
-    // Remove stale socket if present
-    let _ = tokio::fs::remove_file(&socket_path).await;
-
-    Ok(true)
+    // Both installation and rollback call this before modifying any binaries.
+    // The interactive stop path can force a process-level stop; an update
+    // never has that authority, even when its drain timeout has elapsed.
+    daemon_shutdown::stop(&socket_path, std::time::Duration::from_secs(timeout_secs))
+        .await
+        .map_err(UpdateError::InstallFailed)
 }
 
 /// Start the daemon.
@@ -858,10 +842,6 @@ fn configured_update_socket_path() -> Result<PathBuf, UpdateError> {
 
 fn daemon_start_args(socket_path: &Path) -> [&std::ffi::OsStr; 2] {
     [std::ffi::OsStr::new("--socket"), socket_path.as_os_str()]
-}
-
-fn shutdown_poll_attempts(timeout_secs: u64) -> u64 {
-    timeout_secs.saturating_mul(10)
 }
 
 #[cfg(test)]
@@ -1444,12 +1424,5 @@ mod tests {
 
         assert_eq!(args[0], std::ffi::OsStr::new("--socket"));
         assert_eq!(args[1], socket_path.as_os_str());
-    }
-
-    #[test]
-    fn shutdown_poll_attempts_respects_requested_timeout() {
-        assert_eq!(shutdown_poll_attempts(0), 0);
-        assert_eq!(shutdown_poll_attempts(1), 10);
-        assert_eq!(shutdown_poll_attempts(30), 300);
     }
 }
