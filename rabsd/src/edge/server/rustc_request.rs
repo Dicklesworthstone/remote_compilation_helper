@@ -25,10 +25,10 @@ use crate::coord::live_dependency::{
     CompletionReport, InstallResult, LiveDecision, LiveDependencyLane, LiveDependencyRequest,
     LocalAttempt, MAX_TRANSCRIPT_BYTES, PendingServe,
 };
-use crate::edge::live_facts::{FactsMiss, LiveFacts};
+use crate::edge::live_facts::{FactsMiss, LiveFacts, build_script_env};
 use rabs_cas::metadata_store::digest_key;
 use rabs_key::live_dependency::{
-    ExternFact, LiveRustcRequest, PlannedExtern, constructed_environment, live_dependency_key,
+    BUILD_SCRIPT_OUT_DIR, LiveRustcRequest, constructed_environment, live_dependency_key,
     plan_dependency_action,
 };
 use rabs_protocol::input_evidence::{
@@ -37,8 +37,9 @@ use rabs_protocol::input_evidence::{
 use rabs_protocol::raw_bytes::RawBytes;
 use rabs_protocol::result_identity::ObjectId;
 use serde_json::{Value, json};
+use std::collections::HashSet;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// Largest completion frame: a bounded transcript in hex plus envelope.
 pub(super) const MAX_COMPLETION_FRAME_BYTES: usize = 2 * MAX_TRANSCRIPT_BYTES + 64 * 1024;
@@ -51,7 +52,16 @@ const MAX_ENV: usize = 4096;
 pub struct LiveEdge {
     lane: LiveDependencyLane,
     facts: Arc<LiveFacts>,
+    /// Relocatable keys of build-script packages whose compile was seen
+    /// reading `OUT_DIR`. Their requests are keyed in exact mode instead.
+    /// A hint only: soundness never depends on it (a relocatable compile
+    /// that reads `OUT_DIR` is not published), and losing it on restart
+    /// costs one unpublishable execution per package.
+    out_dir_readers: Mutex<HashSet<String>>,
 }
+
+/// Bound on remembered `OUT_DIR` readers before the hint set resets.
+const MAX_OUT_DIR_READERS: usize = 65_536;
 
 impl LiveEdge {
     /// Bind observation state to a coordinator lane.
@@ -60,6 +70,22 @@ impl LiveEdge {
         Self {
             lane,
             facts: LiveFacts::new(),
+            out_dir_readers: Mutex::new(HashSet::new()),
+        }
+    }
+
+    fn reads_out_dir(&self, relocatable_key: &str) -> bool {
+        self.out_dir_readers
+            .lock()
+            .is_ok_and(|readers| readers.contains(relocatable_key))
+    }
+
+    fn remember_out_dir_reader(&self, relocatable_key: String) {
+        if let Ok(mut readers) = self.out_dir_readers.lock() {
+            if readers.len() >= MAX_OUT_DIR_READERS {
+                readers.clear();
+            }
+            readers.insert(relocatable_key);
         }
     }
 }
@@ -194,20 +220,116 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
         log("shadow", &[("reason", "toolchain-host-unknown")]);
         return Decided::Shadow(observation(&parsed));
     };
+    // A package with a build script presents OUT_DIR; the variables its
+    // script set come from Cargo's own record of the script's output.
+    let build_script_env = match parsed
+        .env
+        .iter()
+        .find(|(name, _)| name == BUILD_SCRIPT_OUT_DIR)
+    {
+        None => None,
+        Some((_, out_dir)) => match build_script_env(Path::new(out_dir)) {
+            Ok(names) => Some(names),
+            Err(reason) => {
+                log(
+                    "shadow",
+                    &[
+                        ("reason", "LIVE_DEP_BUILD_SCRIPT_OUTPUT"),
+                        ("detail", &reason),
+                    ],
+                );
+                return Decided::Shadow(observation(&parsed));
+            }
+        },
+    };
+    // A build-script package is keyed relocatably unless its compile was
+    // already seen reading OUT_DIR; then the exact OUT_DIR mode applies.
+    let mut keyed = match key_request(
+        live,
+        &parsed,
+        &host,
+        &toolchain,
+        build_script_env.as_deref(),
+        false,
+    ) {
+        Ok(keyed) => keyed,
+        Err(decided) => return *decided,
+    };
+    if keyed.plan.build_script_out_dir.is_some()
+        && live.reads_out_dir(&digest_key(&keyed.key.action_key))
+    {
+        keyed = match key_request(
+            live,
+            &parsed,
+            &host,
+            &toolchain,
+            build_script_env.as_deref(),
+            true,
+        ) {
+            Ok(keyed) => keyed,
+            Err(decided) => return *decided,
+        };
+    }
+    let Keyed {
+        key,
+        plan,
+        inputs,
+        package,
+        dependencies,
+        externs,
+    } = keyed;
+    let key_text = digest_key(&key.action_key);
+    let decision = live.lane.decide(LiveDependencyRequest {
+        key,
+        plan,
+        inputs,
+        package,
+        dependencies,
+        externs: externs
+            .into_iter()
+            .map(|fact| (fact.path, fact.content_digest))
+            .collect(),
+    });
+    decided(decision, key_text)
+}
+
+/// One request planned and keyed in one `OUT_DIR` mode.
+struct Keyed {
+    key: rabs_key::live_dependency::LiveDependencyKey,
+    plan: rabs_key::live_dependency::DependencyActionPlan,
+    inputs: ActionInputManifest,
+    package: Arc<crate::edge::live_facts::PackageFacts>,
+    dependencies: Arc<crate::edge::live_facts::DependencyFacts>,
+    externs: Vec<rabs_key::live_dependency::ExternFact>,
+}
+
+/// Plan, observe and key one request (`generated_inputs` selects the exact
+/// `OUT_DIR` mode). `Err` carries the answer for a request that cannot be
+/// keyed this way.
+fn key_request(
+    live: &LiveEdge,
+    parsed: &Parsed,
+    host: &str,
+    toolchain: &rabs_key::live_dependency::ToolchainFacts,
+    build_script_env: Option<&[String]>,
+    generated_inputs: bool,
+) -> Result<Keyed, Box<Decided>> {
     let plan = match plan_dependency_action(
         LiveRustcRequest {
             argv: &parsed.argv,
             cwd: &parsed.cwd,
             env: &parsed.env,
+            build_script_env,
+            generated_inputs,
         },
-        &host,
+        host,
     ) {
         Ok(plan) => plan,
         Err(refusal) => {
-            // Out of class (workspace members, build scripts, ...): the
-            // reason code is the `rch why`-grade explanation.
+            // Out of class (workspace members, proc-macro consumers, ...):
+            // the reason code is the `rch why`-grade explanation.
             log("shadow", &[("reason", refusal.code())]);
-            return Decided::Shadow(observation(&parsed));
+            return Err(Box::new(Decided::Shadow(observation(parsed))));
         }
     };
     let package = match live.facts.package(
@@ -225,11 +347,11 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
                     ("reason", &miss.to_string()),
                 ],
             );
-            return Decided::Reply(pass_through(&miss.to_string()));
+            return Err(Box::new(Decided::Reply(pass_through(&miss.to_string()))));
         }
     };
     if let Err(reason) = package.verify_generated_disjoint(&plan) {
-        return Decided::Reply(pass_through(&reason));
+        return Err(Box::new(Decided::Reply(pass_through(&reason))));
     }
     let mut inputs = ActionInputManifest {
         schema_version: INPUT_EVIDENCE_SCHEMA_VERSION,
@@ -260,47 +382,45 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
                 symlink_resolution: Vec::new(),
             }),
     );
-    let mut externs = Vec::new();
+    // The direct externs are read by the same closure, so their exact
+    // identities and the referenced candidates come from one observation.
     let dependencies = match live.facts.dependencies(&plan) {
         Ok(dependencies) => dependencies,
-        Err(miss) => return Decided::Reply(pass_through(&miss.to_string())),
-    };
-    for planned in &plan.externs {
-        if let PlannedExtern::File { path, .. } = planned {
-            match live.facts.file_digest(Path::new(path)) {
-                Ok(digest) => externs.push(ExternFact {
-                    path: path.clone(),
-                    content_digest: digest,
-                }),
-                Err(error) => {
-                    return Decided::Reply(pass_through(&format!("extern-unreadable: {error}")));
-                }
-            }
+        Err(miss) => {
+            log(
+                "pass-through",
+                &[
+                    ("package", &plan.package_root),
+                    ("reason", &miss.to_string()),
+                ],
+            );
+            return Err(Box::new(Decided::Reply(pass_through(&miss.to_string()))));
         }
-    }
+    };
+    let externs = dependencies.externs.clone();
     let key = match live_dependency_key(
         &plan,
-        &toolchain,
+        toolchain,
         &externs,
         &dependencies.directories,
         package.build_script_output.as_deref(),
         &inputs,
     ) {
         Ok(key) => key,
-        Err(refusal) => return Decided::Reply(pass_through(refusal.code())),
+        Err(refusal) => return Err(Box::new(Decided::Reply(pass_through(refusal.code())))),
     };
-    let key_text = digest_key(&key.action_key);
-    let decision = live.lane.decide(LiveDependencyRequest {
+    Ok(Keyed {
         key,
         plan,
         inputs,
         package,
         dependencies,
-        externs: externs
-            .into_iter()
-            .map(|fact| (fact.path, fact.content_digest))
-            .collect(),
-    });
+        externs,
+    })
+}
+
+/// The connection's next step for the lane's decision.
+fn decided(decision: LiveDecision, key_text: String) -> Decided {
     match decision {
         LiveDecision::Hit(pending) => {
             log("hit", &[("key", &key_text)]);
@@ -401,6 +521,12 @@ pub(super) fn complete(live: &LiveEdge, attempt: Box<LocalAttempt>, frame: &[u8]
         log("completion-malformed", &[("key", &key_text)]);
         return super::refusal("malformed-completion", "");
     };
+    // A relocatable build-script compile that read OUT_DIR cannot publish;
+    // key this package in exact mode from now on.
+    if report.exit_code == Some(0) && attempt.observed_build_script_out_dir() {
+        log("out-dir-reader", &[("key", &key_text)]);
+        live.remember_out_dir_reader(key_text.clone());
+    }
     let (outcome, known) = attempt.complete(&report);
     for output in known {
         live.facts.remember(&output.path, output.sig, output.digest);

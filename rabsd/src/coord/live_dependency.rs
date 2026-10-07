@@ -46,9 +46,11 @@ use rabs_cas::metadata_store::{ActionEntryRow, RabsMetadataStore, SqlValue, dige
 use rabs_cas::publication::{
     OfferPreparedActionResult, PublicationOutcome, observable_result_digest_v1,
 };
+use rabs_key::dependency_candidates::{CandidateIdentity, GroupIdentity};
 use rabs_key::live_dependency::{
     DependencyActionPlan, LIVE_DEPENDENCY_KEY_EPOCH, LIVE_DEPENDENCY_PROJECTION_EPOCH,
-    LiveDependencyKey, canonicalize_placements, dep_info_closure_violation, render_placements,
+    LiveDependencyKey, canonicalize_placements, dep_info_closure_violation,
+    reads_build_script_out_dir, render_placements,
 };
 use rabs_key::output_declarations::OutputClass;
 use rabs_key::typed_digest::compute;
@@ -660,6 +662,28 @@ impl LocalAttempt {
         &self.key
     }
 
+    /// Whether this finished relocatable build-script compile observed its
+    /// `OUT_DIR` (from the dep-info it wrote). Such a result is never
+    /// published; the edge keys the package's later requests in exact mode.
+    #[must_use]
+    pub fn observed_build_script_out_dir(&self) -> bool {
+        let plan = &self.request.plan;
+        if plan.build_script_out_dir.is_none() || plan.generated_root.is_some() {
+            return false;
+        }
+        plan.outputs
+            .declarations
+            .iter()
+            .filter(|declaration| declaration.class == OutputClass::DepInfo)
+            .any(|declaration| {
+                read_stable(
+                    &Path::new(&plan.out_dir).join(&declaration.virtual_path),
+                    MAX_OUTPUT_BYTES,
+                )
+                .is_ok_and(|(_, raw)| reads_build_script_out_dir(plan, &raw))
+            })
+    }
+
     fn advance(&self, state: AttemptState) -> Result<(), String> {
         let authority = self.authority.as_ref().ok_or("attempt not admitted")?;
         self.coord
@@ -804,16 +828,37 @@ impl LocalAttempt {
                 "input_manifest": digest_key(&self.request.key.descriptor.action_inputs),
             }))
             .map_err(|error| error.to_string())?;
+            let identity = |identity: &CandidateIdentity| match identity {
+                CandidateIdentity::Metadata(digest) => {
+                    serde_json::json!({"metadata": digest_key(digest)})
+                }
+                CandidateIdentity::Bytes(digest) => {
+                    serde_json::json!({"bytes": digest_key(digest)})
+                }
+                CandidateIdentity::ObjectsOnly(digest) => {
+                    serde_json::json!({"objects_only": digest_key(digest)})
+                }
+                CandidateIdentity::NotRust => serde_json::json!("not-rust"),
+            };
             let observed = serde_json::to_vec(&serde_json::json!({
-                "kind": "rabs-live-dependency-observed-inputs-v1",
+                "kind": "rabs-live-dependency-observed-inputs-v2",
                 "externs": self.request.externs.iter()
                     .map(|(path, digest)| serde_json::json!([path, digest_key(digest)]))
                     .collect::<Vec<_>>(),
                 "dependency_directories": self.request.dependencies.directories.iter().map(|directory| {
                     serde_json::json!({
                         "path": directory.path,
-                        "artifacts": directory.artifacts.iter().map(|artifact| serde_json::json!([artifact.path, digest_key(&artifact.content_digest)])).collect::<Vec<_>>(),
-                        "dep_info_names": directory.dep_info_names,
+                        "referenced_groups": directory.groups.iter().map(|group| match &group.identity {
+                            GroupIdentity::Metadata(digest) => serde_json::json!({
+                                "stem": group.stem, "metadata": digest_key(digest),
+                            }),
+                            GroupIdentity::Members(members) => serde_json::json!({
+                                "stem": group.stem,
+                                "members": members.iter().map(|(name, _, member)| {
+                                    serde_json::json!([name, identity(member)])
+                                }).collect::<Vec<_>>(),
+                            }),
+                        }).collect::<Vec<_>>(),
                     })
                 }).collect::<Vec<_>>(),
                 "compiler": plan.compiler,

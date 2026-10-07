@@ -228,6 +228,41 @@ impl World {
             .expect("run rabs-wrap")
     }
 
+    /// [`World::args`] with Cargo's real `-{16 hex}` extra filename.
+    fn cargo_args(&self, name: &str, out: &Path, externs: &[(&str, PathBuf)]) -> Vec<String> {
+        self.args(name, out, externs)
+            .into_iter()
+            .map(|arg| {
+                let mut arg = arg;
+                for crate_name in ["leaf", "mid", "top"] {
+                    arg = arg.replace(&format!("{crate_name}0000c0ffee"), cargo_hash(crate_name));
+                }
+                arg
+            })
+            .collect()
+    }
+
+    fn wrapped_cargo(&self, name: &str, out: &Path, externs: &[(&str, PathBuf)]) -> Output {
+        Command::new(wrap())
+            .arg(&self.rustc)
+            .args(self.cargo_args(name, out, externs))
+            .current_dir(self.package(name))
+            .env_clear()
+            .envs(self.env(name))
+            .output()
+            .expect("run rabs-wrap")
+    }
+
+    fn stock_cargo(&self, name: &str, out: &Path, externs: &[(&str, PathBuf)]) -> Output {
+        Command::new(&self.rustc)
+            .args(self.cargo_args(name, out, externs))
+            .current_dir(self.package(name))
+            .env_clear()
+            .envs(self.env(name))
+            .output()
+            .expect("run rustc")
+    }
+
     /// Stock rustc, no wrapper, same argv: the oracle for served bytes.
     fn stock(&self, name: &str, out: &Path, externs: &[(&str, PathBuf)]) -> Output {
         Command::new(&self.rustc)
@@ -343,6 +378,54 @@ impl World {
         self.git_checkout = Some(checkout.clone());
         checkout
     }
+}
+
+/// A Cargo-shaped extra-filename hash for the busy-directory scenario.
+fn cargo_hash(name: &str) -> &'static str {
+    match name {
+        "leaf" => "6c65616600000000",
+        "mid" => "6d69640000000000",
+        "top" => "746f700000000000",
+        other => panic!("no hash for {other}"),
+    }
+}
+
+fn cargo_outputs(name: &str) -> [String; 3] {
+    let hash = cargo_hash(name);
+    [
+        format!("lib{name}-{hash}.rlib"),
+        format!("lib{name}-{hash}.rmeta"),
+        format!("{name}-{hash}.d"),
+    ]
+}
+
+/// What a long-lived target directory and a concurrent `cargo -jN` put
+/// beside the crates a compile actually reads: other crates, an unrelated
+/// proc-macro, test executables, rustc temporaries and stale versions.
+fn make_busy(out: &Path) {
+    std::fs::write(
+        out.join("libother-0123456789abcdef.rmeta"),
+        b"unrelated crate",
+    )
+    .unwrap();
+    std::fs::write(
+        out.join("libmacro-fedcba9876543210.so"),
+        b"\x7fELF unrelated proc-macro",
+    )
+    .unwrap();
+    std::fs::write(out.join("proj-1111111111111111"), b"test executable").unwrap();
+    std::fs::write(out.join("proj-1111111111111111.d"), b"dep-info").unwrap();
+    std::fs::write(
+        out.join("x-2222222222222222.x.1a2b-cgu.0.rcgu.o"),
+        b"object",
+    )
+    .unwrap();
+    std::fs::create_dir_all(out.join("rmetaTmp123")).unwrap();
+    std::fs::write(
+        out.join("libleaf-0000000000000000.rlib"),
+        b"stale other version",
+    )
+    .unwrap();
 }
 
 fn outputs(name: &str) -> [String; 3] {
@@ -707,4 +790,289 @@ fn git_workspace_dependency_commits_verifies_and_serves_with_a_complete_source_c
                     .is_some_and(|detail| detail.contains("Git metadata"))
         }));
     }
+}
+
+/// Real Cargo target directories are never clean: they hold every crate,
+/// test executable and proc-macro a project built, and a parallel build
+/// writes siblings while a compile runs. Only the files rustc's crate
+/// locator can examine key a compile, so busy worktrees still verify and
+/// hit, and a transitive dependency whose `.rlib` pipelining has not
+/// written yet keys the same as one whose `.rlib` exists.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn busy_target_directories_and_transitive_dependencies_still_serve() {
+    let dir = tempfile::Builder::new()
+        .prefix("rb")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let world = World {
+        root: dir.path().to_path_buf(),
+        socket: dir.path().join("d.sock"),
+        rustc: real_rustc(),
+        git_checkout: None,
+    };
+    world.write_package(
+        "leaf",
+        "#[inline]\npub fn twice<T: core::ops::Add<Output = T> + Copy>(x: T) -> T { x + x }\n",
+    );
+    world.write_package(
+        "mid",
+        "pub use leaf::twice;\npub fn four() -> u32 { twice(2) }\n",
+    );
+    // top names only mid; leaf is located transitively through mid's metadata.
+    world.write_package("top", "pub fn eight() -> u32 { mid::twice(mid::four()) }\n");
+    let daemon = Daemon::start(&world.root, &world.socket);
+    let rmeta = |name: &'static str, out: &Path| (name, out.join(&cargo_outputs(name)[1]));
+    let build = |name: &'static str, out: &Path| -> Vec<String> {
+        let externs: Vec<(&str, PathBuf)> = match name {
+            "mid" => vec![rmeta("leaf", out)],
+            "top" => vec![rmeta("mid", out)],
+            _ => Vec::new(),
+        };
+        let mark = daemon.decisions().len();
+        let output = world.wrapped_cargo(name, out, &externs);
+        assert_eq!(output.status.code(), Some(0), "{name}: {output:?}");
+        trail(&daemon, mark)
+    };
+
+    // Warm the toolchain probe with the first eligible compile.
+    let out_a = world.out_dir("wt-a");
+    let deadline = Instant::now() + Duration::from_secs(600);
+    loop {
+        let trail = build("leaf", &out_a);
+        if trail.contains(&"committed".to_owned()) {
+            assert_eq!(trail, ["execute", "committed"]);
+            break;
+        }
+        assert!(
+            trail.iter().all(|step| step == "toolchain-warming"),
+            "unexpected decisions while warming: {trail:?}"
+        );
+        assert!(Instant::now() < deadline, "toolchain probe never warmed");
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    for name in ["mid", "top"] {
+        assert_eq!(build(name, &out_a), ["execute", "committed"], "{name}");
+    }
+
+    // Busy worktrees verify under the same keys.
+    for worktree in ["wt-b", "wt-c"] {
+        let out = world.out_dir(worktree);
+        make_busy(&out);
+        for name in ["leaf", "mid", "top"] {
+            assert_eq!(
+                build(name, &out),
+                ["execute", "verified"],
+                "{worktree} {name}"
+            );
+        }
+    }
+
+    // A busy worktree is served every crate.
+    let out_d = world.out_dir("wt-d");
+    make_busy(&out_d);
+    for name in ["leaf", "mid", "top"] {
+        assert_eq!(build(name, &out_d), ["hit", "served"], "{name}");
+    }
+
+    // Pipelining: top starts while leaf's rlib does not exist yet.
+    let out_e = world.out_dir("wt-e");
+    make_busy(&out_e);
+    for name in ["leaf", "mid"] {
+        assert_eq!(build(name, &out_e), ["hit", "served"], "{name}");
+    }
+    std::fs::remove_file(out_e.join(&cargo_outputs("leaf")[0])).unwrap();
+    assert_eq!(build("top", &out_e), ["hit", "served"]);
+
+    // Served bytes equal stock rustc's, compiled in a clean directory.
+    let out_stock = world.out_dir("stock");
+    for name in ["leaf", "mid", "top"] {
+        let externs: Vec<(&str, PathBuf)> = match name {
+            "mid" => vec![rmeta("leaf", &out_stock)],
+            "top" => vec![rmeta("mid", &out_stock)],
+            _ => Vec::new(),
+        };
+        let stock = world.stock_cargo(name, &out_stock, &externs);
+        assert_eq!(stock.status.code(), Some(0), "{stock:?}");
+        for out in [&out_d, &out_e] {
+            for file in &cargo_outputs(name)[..2] {
+                if !out.join(file).exists() {
+                    continue; // leaf's rlib was removed in wt-e
+                }
+                assert_eq!(
+                    std::fs::read(out.join(file)).unwrap(),
+                    std::fs::read(out_stock.join(file)).unwrap(),
+                    "{file} in {} differs from stock",
+                    out.display()
+                );
+            }
+        }
+    }
+
+    // A transitive dependency whose metadata differs IS a different key:
+    // rebuild leaf in a fresh worktree from changed source.
+    world.write_package(
+        "leaf",
+        "#[inline]\npub fn twice<T: core::ops::Add<Output = T> + Copy>(x: T) -> T { let y = x; y + x }\n",
+    );
+    let out_f = world.out_dir("wt-f");
+    assert_eq!(build("leaf", &out_f), ["execute", "committed"]);
+    assert_eq!(build("mid", &out_f), ["execute", "committed"]);
+    assert_eq!(build("top", &out_f), ["execute", "committed"]);
+}
+
+/// Cargo's record of one build-script run in a worktree, in the build-dir
+/// layout the pinned Cargo writes: `build/<pkg>/<hash>/{out/, run/stdout,
+/// run/root-output}`. Returns `OUT_DIR`.
+fn build_script_record(worktree: &Path, name: &str, stdout: &str) -> PathBuf {
+    let unit = worktree.join(format!("target/debug/build/{name}/0123456789abcdef"));
+    let out = unit.join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    std::fs::create_dir_all(unit.join("run")).unwrap();
+    std::fs::write(unit.join("run/stdout"), stdout).unwrap();
+    std::fs::write(
+        unit.join("run/root-output"),
+        out.as_os_str().as_encoded_bytes(),
+    )
+    .unwrap();
+    out
+}
+
+/// A package with a build script is served when its compile uses only what
+/// the script set through Cargo (`--cfg` in argv, `rustc-env` keyed with its
+/// value) and never reads `OUT_DIR`; one that includes generated source from
+/// `OUT_DIR` executes every time and is never published.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn build_script_packages_serve_only_when_out_dir_is_never_read() {
+    let dir = tempfile::Builder::new()
+        .prefix("rs")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let world = World {
+        root: dir.path().to_path_buf(),
+        socket: dir.path().join("d.sock"),
+        rustc: real_rustc(),
+        git_checkout: None,
+    };
+    world.write_package(
+        "leaf",
+        "#[cfg(fast)]\npub fn speed() -> &'static str { env!(\"FLAVOR\") }\n\
+         #[cfg(not(fast))]\npub fn speed() -> &'static str { \"slow\" }\n",
+    );
+    world.write_package(
+        "mid",
+        "include!(concat!(env!(\"OUT_DIR\"), \"/generated.rs\"));\n",
+    );
+    let daemon = Daemon::start(&world.root, &world.socket);
+    let script = "cargo:rerun-if-changed=build.rs\ncargo:rustc-cfg=fast\n\
+                  cargo:rustc-env=FLAVOR=turbo\n";
+    let run = |name: &str, worktree: &str, stock: bool| -> (Output, PathBuf, PathBuf) {
+        let root = world.root.join(worktree);
+        let out = world.out_dir(worktree);
+        let build_out = build_script_record(&root, name, script);
+        std::fs::write(
+            build_out.join("generated.rs"),
+            "pub const GENERATED: u32 = 7;\n",
+        )
+        .unwrap();
+        let mut args = world.cargo_args(name, &out, &[]);
+        args.extend(["--cfg".to_owned(), "fast".to_owned()]);
+        let mut env = world.env(name);
+        env.push(("OUT_DIR".into(), build_out.display().to_string()));
+        env.push(("FLAVOR".into(), "turbo".into()));
+        let mut command = if stock {
+            Command::new(&world.rustc)
+        } else {
+            let mut command = Command::new(wrap());
+            command.arg(&world.rustc);
+            command
+        };
+        let output = command
+            .args(args)
+            .current_dir(world.package(name))
+            .env_clear()
+            .envs(env)
+            .output()
+            .expect("run compiler");
+        (output, out, build_out)
+    };
+    let build = |name: &str, worktree: &str| -> Vec<String> {
+        let mark = daemon.decisions().len();
+        let (output, _, _) = run(name, worktree, false);
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{name} {worktree}: {output:?}"
+        );
+        trail(&daemon, mark)
+    };
+
+    let deadline = Instant::now() + Duration::from_secs(600);
+    loop {
+        let trail = build("leaf", "wt-a");
+        if trail.contains(&"committed".to_owned()) {
+            assert_eq!(trail, ["execute", "committed"]);
+            break;
+        }
+        assert!(
+            trail.iter().all(|step| step == "toolchain-warming"),
+            "unexpected decisions while warming: {trail:?}"
+        );
+        assert!(Instant::now() < deadline, "toolchain probe never warmed");
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    for worktree in ["wt-b", "wt-c"] {
+        assert_eq!(
+            build("leaf", worktree),
+            ["execute", "verified"],
+            "{worktree}"
+        );
+    }
+    assert_eq!(build("leaf", "wt-d"), ["hit", "served"]);
+    let (stock, stock_out, _) = run("leaf", "stock", true);
+    assert_eq!(stock.status.code(), Some(0), "{stock:?}");
+    for file in &cargo_outputs("leaf")[..2] {
+        assert_eq!(
+            std::fs::read(world.root.join("wt-d/target/debug/deps").join(file)).unwrap(),
+            std::fs::read(stock_out.join(file)).unwrap(),
+            "served {file} differs from stock"
+        );
+    }
+
+    // Generated source from OUT_DIR. The relocatable attempt compiles
+    // correctly but cannot publish, and marks the package an OUT_DIR reader;
+    // its next request is keyed in exact mode (this worktree's OUT_DIR path
+    // and the generated tree) and commits under that different key.
+    let execute_key = |mark: usize| {
+        daemon.decisions()[mark..]
+            .iter()
+            .find(|decision| decision["decision"] == "execute")
+            .and_then(|decision| decision["key"].as_str().map(str::to_owned))
+            .unwrap()
+    };
+    let mark = daemon.decisions().len();
+    let (output, _, _) = run("mid", "wt-a", false);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(
+        trail(&daemon, mark),
+        ["execute", "out-dir-reader", "not-published"]
+    );
+    // The closure check names the read below OUT_DIR (or the tracked
+    // OUT_DIR read itself), whichever dep-info lists first.
+    assert!(daemon.decisions()[mark..].iter().any(|decision| {
+        decision["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("out/generated.rs") || detail.contains("OUT_DIR"))
+    }));
+    let relocatable = execute_key(mark);
+    let mark = daemon.decisions().len();
+    let (output, _, _) = run("mid", "wt-b", false);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(trail(&daemon, mark), ["execute", "committed"]);
+    assert_ne!(
+        execute_key(mark),
+        relocatable,
+        "exact mode keys differently"
+    );
 }

@@ -8,11 +8,11 @@
 use std::path::Path;
 use std::process::{Command, Output};
 
+use rabs_key::dependency_candidates::{read_candidate, referenced_candidates};
 use rabs_key::live_dependency::{
-    DependencyActionPlan, DependencyDirectoryFact, DependencySourceKind, ExternFact,
-    LiveRustcRequest, PlannedExtern, ToolchainFacts, canonicalize_out_dir, canonicalize_placements,
-    dep_info_closure_violation, live_dependency_key, plan_dependency_action, render_out_dir,
-    render_placements,
+    DependencyActionPlan, DependencySourceKind, ExternFact, LiveRustcRequest, PlannedExtern,
+    ToolchainFacts, canonicalize_out_dir, canonicalize_placements, dep_info_closure_violation,
+    live_dependency_key, plan_dependency_action, render_out_dir, render_placements,
 };
 
 // A transparent recorder around the actual compiler Cargo selected. The
@@ -216,38 +216,40 @@ fn try_actual_key(
             PlannedExtern::Toolchain { .. } => None,
         })
         .collect();
-    let directories: Vec<_> = plan
+    let listings: Vec<Vec<String>> = plan
         .dependency_dirs
         .iter()
         .map(|root| {
-            let mut artifacts = Vec::new();
-            let mut dep_info_names = Vec::new();
-            for entry in std::fs::read_dir(root).unwrap() {
-                let path = entry.unwrap().path();
-                let name = path.file_name().unwrap().to_str().unwrap().to_owned();
-                if root == &plan.out_dir && plan.output_names().contains(&name) {
-                    continue;
-                }
-                assert!(std::fs::symlink_metadata(&path).unwrap().is_file());
-                if name.ends_with(".d") {
-                    dep_info_names.push(name);
-                } else {
-                    assert!(name.ends_with(".rlib") || name.ends_with(".rmeta"));
-                    artifacts.push(ExternFact {
-                        path: path.to_str().unwrap().to_owned(),
-                        content_digest: object_file(&path),
-                    });
-                }
-            }
-            artifacts.sort_by(|a, b| a.path.cmp(&b.path));
-            dep_info_names.sort();
-            DependencyDirectoryFact {
-                path: root.clone(),
-                artifacts,
-                dep_info_names,
-            }
+            std::fs::read_dir(root)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+                .filter(|name| !(root == &plan.out_dir && plan.output_names().contains(name)))
+                .collect()
         })
         .collect();
+    let seeds: Vec<(usize, String)> = externs
+        .iter()
+        .map(|fact| {
+            let (directory, name) = fact.path.rsplit_once('/').unwrap();
+            let index = plan
+                .dependency_dirs
+                .iter()
+                .position(|root| root == directory)
+                .unwrap();
+            (index, name.to_owned())
+        })
+        .collect();
+    let directories = referenced_candidates(
+        &plan.dependency_dirs,
+        &listings,
+        &seeds,
+        |d, name, flavor| {
+            let path = Path::new(&plan.dependency_dirs[d]).join(name);
+            let bytes = std::fs::read(&path).map_err(|error| error.to_string())?;
+            Ok(read_candidate(flavor, &bytes, object_file(&path)))
+        },
+    )
+    .unwrap();
     let script_output = plan
         .generated_root
         .as_ref()
@@ -391,6 +393,8 @@ fn main() {
             argv: &repeat_argv,
             cwd: &plan.cwd,
             env: &plan.execution_env,
+            build_script_env: Some(&[]),
+            generated_inputs: true,
         },
         host,
     )
@@ -471,6 +475,26 @@ fn main() {
     assert!(
         matches!(try_actual_key(&fallback_plan, &toolchain), Err(rabs_key::live_dependency::LiveRefusal::RefusedEnv(name)) if name == "MY_VALUE")
     );
+    // What the live edge supplies: the names in Cargo's own run record. The
+    // script's variable is then keyed with its value and reaches rustc,
+    // instead of refusing the request.
+    let run_record =
+        std::fs::read_to_string(generated.parent().unwrap().join("run/stdout")).unwrap();
+    let names = rabs_key::live_dependency::build_script_env_names(&run_record).unwrap();
+    assert_eq!(names, ["MY_VALUE"]);
+    let keyed_plan = fallback_request.plan_with(host, Some(&names), true);
+    assert!(
+        keyed_plan
+            .keyed_env
+            .contains(&("MY_VALUE".into(), "example".into()))
+    );
+    assert!(
+        keyed_plan
+            .execution_env
+            .contains(&("MY_VALUE".into(), "example".into()))
+    );
+    let keyed = try_actual_key(&keyed_plan, &toolchain).unwrap();
+    assert_ne!(keyed.action_key, baseline.action_key);
     assert_eq!(
         checked(&mut Command::new(target.join("debug/generated_consumer"))).stdout,
         format!("17:example:{}\n", generated.display()).as_bytes()
@@ -706,12 +730,26 @@ impl Recorded {
         }
     }
 
+    /// A build-script package's request in exact `OUT_DIR` mode, with no
+    /// recorded rustc-env names; every other request as recorded.
     fn plan(&self, host: &str) -> DependencyActionPlan {
+        let build_script = self.env.iter().any(|(name, _)| name == "OUT_DIR");
+        self.plan_with(host, build_script.then_some(&[][..]), build_script)
+    }
+
+    fn plan_with(
+        &self,
+        host: &str,
+        build_script_env: Option<&[String]>,
+        generated_inputs: bool,
+    ) -> DependencyActionPlan {
         plan_dependency_action(
             LiveRustcRequest {
                 argv: &self.argv,
                 cwd: &self.cwd,
                 env: &self.env,
+                build_script_env,
+                generated_inputs,
             },
             host,
         )

@@ -22,11 +22,22 @@
 //!   `<cargo-home>/git/checkouts/<repository>/<revision>[/<member>]`;
 //!   rustc's working directory is `CARGO_MANIFEST_DIR`, `--cap-lints allow`
 //!   is present and `CARGO_PRIMARY_PACKAGE` is absent;
-//! - build scripts themselves still run normally; a compiler may consume
-//!   their complete, separately captured `OUT_DIR` tree. Its exact path and
-//!   environment value remain semantic inputs, never placement aliases;
-//!   Cargo's completed run record is bound to that tree and keyed too;
-//!   rustc-env directives outside the keyed environment refuse serving;
+//! - build scripts themselves still run normally under Cargo; the library
+//!   compile of a package with a build script is admitted in one of two
+//!   `OUT_DIR` modes ([`LiveRustcRequest::generated_inputs`]):
+//!   - **relocatable** (the default): `OUT_DIR` reaches the compiler
+//!     unkeyed, as placement, and the result is publishable only if the
+//!     compile never read it — a tracked `env!("OUT_DIR")` or any read below
+//!     it refuses publication through the ordinary closure check. Such a
+//!     result is reusable across worktrees;
+//!   - **exact**, for packages observed reading `OUT_DIR`: the complete,
+//!     separately captured `OUT_DIR` tree is an input, its exact path and
+//!     environment value remain semantic inputs (never placement aliases),
+//!     and Cargo's completed run record is bound to that tree and keyed.
+//!
+//!   In both modes the variables the build script set (`cargo:rustc-env`,
+//!   from Cargo's own run record) are keyed with their values, and its
+//!   `--cfg` flags are part of argv;
 //! - `lib`/`rlib` outputs only, through the bounded
 //!   [`derive_dependency_output_declarations`] adapter (Cargo's detached
 //!   metadata mode is modeled; other unstable output controls, incremental
@@ -61,8 +72,11 @@
 //!   is keyed as given — local-host serving only (`SubscriberPathPreserving`).
 //! - **Dependencies:** the exact bytes of every `--extern` artifact
 //!   (plan §17.7's conservative default), bound to their crate names.
-//!   Every Rust artifact candidate in every dependency search directory is
-//!   also keyed, including transitive candidates and negative membership.
+//!   Transitive crates are keyed through the locator-exact candidate
+//!   closure of [`crate::dependency_candidates`]: every search-directory
+//!   group the crate graph's metadata references, by metadata identity.
+//!   Unrelated directory members (other crates, executables, temporaries)
+//!   are not inputs; a reachable proc-macro or dylib refuses.
 //! - **Environment (`dependency-env-v1`):** the action's environment is
 //!   CONSTRUCTED, not inherited: `CARGO*`, `RUSTC*`, `RUST_*` and a short
 //!   fixed list are keyed with their values; the jobserver variables are
@@ -82,6 +96,7 @@ use rabs_protocol::result_identity::TypedDigest;
 
 use crate::action_key::{action_input_manifest_digest, compute_action_key};
 use crate::canonical::CanonicalEncoder;
+use crate::dependency_candidates::{GroupIdentity, encode_candidates};
 use crate::dependency_identity::{ConsumedArtifact, DependencyInputs};
 use crate::environment::{DESCRIPTOR_AUTH_VARS, EnvDisposition, PresentedEnvironment};
 use crate::extern_resolution::{
@@ -97,7 +112,7 @@ use crate::toolchain::ToolchainContract;
 use crate::typed_digest::compute;
 
 /// Key epoch of the live dependency class.
-pub const LIVE_DEPENDENCY_KEY_EPOCH: u32 = 1;
+pub const LIVE_DEPENDENCY_KEY_EPOCH: u32 = 2;
 /// Projection epoch: exact (unprojected) dependency artifacts.
 pub const LIVE_DEPENDENCY_PROJECTION_EPOCH: u32 = 1;
 /// Canonical spelling of the invocation's out-dir in keys, committed
@@ -124,28 +139,34 @@ pub const DOMAIN_LIVE_TARGET_SPEC: &str = "rabs.live-dependency.target-spec.v1";
 /// The registry isolation profile. Deliberately plain: it is NOT a
 /// sandbox, and the key says so. V2 requires new evidence after closing
 /// warm-root symlink and leave-and-reenter dep-info traversal gaps.
-pub const ISOLATION_PROFILE: &str = "live-dependency-v4: unsandboxed local edge process; \
-     environment constructed by dependency-env-v1 (allowlisted names keyed, jobserver \
-     passthrough unkeyed, all other names absent); source = complete registry package \
-     tree with a real directory root revalidated on every observation; closure enforced \
-     after execution by dep-info traversal bounded to the observed source root; proc-macro \
-     consumption refused; generated compiler inputs captured as a complete disjoint \
-     regular-file OUT_DIR tree, with exact OUT_DIR spelling keyed and generation revalidated; \
-     build-script execution is not cached; exact regular Rust dependency \
-     directory candidates revalidated before serving and after execution";
+pub const ISOLATION_PROFILE: &str = "live-dependency-v5: unsandboxed local edge process; \
+     environment constructed by dependency-env-v1 (allowlisted names and build-script \
+     rustc-env names keyed, jobserver passthrough unkeyed, all other names absent); source \
+     = complete registry package tree with a real directory root revalidated on every \
+     observation; closure enforced after execution by dep-info traversal bounded to the \
+     observed source root; build-script OUT_DIR either relocatable (passed through \
+     unkeyed, and a tracked OUT_DIR read or any read below it refuses publication) or \
+     exact (generated compiler inputs captured as a complete disjoint regular-file OUT_DIR \
+     tree, with exact OUT_DIR spelling keyed and generation revalidated); proc-macro \
+     consumption refused; build-script execution is not cached; locator-referenced \
+     dependency candidates (metadata identity, reachable dylibs refused) revalidated before \
+     serving and after execution";
 
 /// Git checkout capture includes all source members, including dirty and
 /// untracked files, but never authorizes reads of Git metadata.
-pub const GIT_ISOLATION_PROFILE: &str = "live-git-dependency-v3: unsandboxed local edge process; \
-     environment constructed by dependency-env-v1 (allowlisted names keyed, jobserver \
-     passthrough unkeyed, all other names absent); source = complete Cargo Git checkout \
-     tree including dirty and untracked source files, root .git excluded before capture; \
-     real directory root revalidated on every observation; closure enforced after execution \
-     by dep-info traversal bounded to the observed source root, Git metadata reads refused; \
-     proc-macro consumption refused; generated compiler inputs captured as a complete disjoint \
-     regular-file OUT_DIR tree, with exact OUT_DIR spelling keyed and generation revalidated; \
-     build-script execution is not cached; exact regular Rust dependency \
-     directory candidates revalidated before serving and after execution";
+pub const GIT_ISOLATION_PROFILE: &str = "live-git-dependency-v4: unsandboxed local edge process; \
+     environment constructed by dependency-env-v1 (allowlisted names and build-script \
+     rustc-env names keyed, jobserver passthrough unkeyed, all other names absent); source \
+     = complete Cargo Git checkout tree including dirty and untracked source files, root \
+     .git excluded before capture; real directory root revalidated on every observation; \
+     closure enforced after execution by dep-info traversal bounded to the observed source \
+     root, Git metadata reads refused; build-script OUT_DIR either relocatable (passed \
+     through unkeyed, and a tracked OUT_DIR read or any read below it refuses publication) \
+     or exact (generated compiler inputs captured as a complete disjoint regular-file \
+     OUT_DIR tree, with exact OUT_DIR spelling keyed and generation revalidated); proc-macro \
+     consumption refused; build-script execution is not cached; locator-referenced \
+     dependency candidates (metadata identity, reachable dylibs refused) revalidated before \
+     serving and after execution";
 
 /// What the executed compiler must produce for a publishable result.
 pub const EXECUTION_SEMANTICS: &str = "live-dependency-v1: rustc exit status 0 by normal \
@@ -172,6 +193,18 @@ const FIXED_KEYED_NAMES: &[&str] = &[
     "LD_LIBRARY_PATH",
     "OUT_DIR",
 ];
+
+/// Most distinct dependency search directories one compile may name.
+/// Cargo's build-dir layout gives every unit its own output directory, so a
+/// crate with a large graph passes one `-L dependency=` per transitive
+/// dependency (asupersync's own compile passes ~150).
+const MAX_DEPENDENCY_DIRECTORIES: usize = 1024;
+
+/// The build-script output directory Cargo presents to a package with a
+/// build script. In relocatable mode it is passed through unkeyed and a
+/// compile that reads it (a tracked `env!`/`option_env!` or a read below
+/// it) is never published; in exact mode its path and tree are keyed.
+pub const BUILD_SCRIPT_OUT_DIR: &str = "OUT_DIR";
 
 /// Names whose presence takes the request out of this class.
 const REFUSED_NAMES: &[&str] = &[
@@ -219,6 +252,9 @@ pub enum LiveRefusal {
     DiagnosticFormat,
     /// `target-cpu=native` has no resolved cohort here.
     NativeCpu,
+    /// The build script's recorded output was not observed, or does not
+    /// match the environment Cargo presented.
+    BuildScriptOutput(String),
     /// Supplied facts do not cover the plan (caller bug or a race).
     Facts(String),
 }
@@ -244,6 +280,7 @@ impl LiveRefusal {
             Self::NativeLibrary(_) => "LIVE_DEP_NATIVE_LIB",
             Self::DiagnosticFormat => "LIVE_DEP_DIAGNOSTIC_FORMAT",
             Self::NativeCpu => "LIVE_DEP_NATIVE_CPU",
+            Self::BuildScriptOutput(_) => "LIVE_DEP_BUILD_SCRIPT_OUTPUT",
             Self::Facts(_) => "LIVE_DEP_FACTS",
         }
     }
@@ -264,6 +301,7 @@ impl std::fmt::Display for LiveRefusal {
             | Self::Extern(detail)
             | Self::ProcMacroDependency(detail)
             | Self::NativeLibrary(detail)
+            | Self::BuildScriptOutput(detail)
             | Self::Facts(detail) => write!(f, "{}: {detail}", self.code()),
             Self::MissingEnv(name) => write!(f, "{}: {name}", self.code()),
             Self::NotDependencyCompile(why) => write!(f, "{}: {why}", self.code()),
@@ -282,6 +320,41 @@ pub struct LiveRustcRequest<'a> {
     pub cwd: &'a str,
     /// Every environment variable the wrapper received.
     pub env: &'a [(String, String)],
+    /// The `cargo:rustc-env` names of the package's build script, from
+    /// Cargo's own record of its output ([`build_script_env_names`]); the
+    /// caller supplies them when `OUT_DIR` is present and `None` otherwise.
+    pub build_script_env: Option<&'a [String]>,
+    /// The `OUT_DIR` mode for a package with a build script: `false` keys
+    /// it as relocatable placement that must never be read; `true` keys the
+    /// exact `OUT_DIR` path and its complete generated tree (for packages
+    /// whose compile was observed reading it). Ignored without `OUT_DIR`.
+    pub generated_inputs: bool,
+}
+
+/// The `cargo:rustc-env` / `cargo::rustc-env` names in a build script's
+/// recorded stdout (Cargo's `<OUT_DIR>/../output`), sorted and unique.
+/// These variables reach the package's compiler only because the build
+/// script set them, so the class keys them with their values.
+///
+/// # Errors
+/// A directive without `NAME=VALUE` form (Cargo itself rejects it).
+pub fn build_script_env_names(output: &str) -> Result<Vec<String>, String> {
+    use crate::build_script_directives::{Directive, capture_stdout};
+    let mut names = Vec::new();
+    for line in capture_stdout(output).lines {
+        if let Some(Directive::Rustc { kind, value }) = line.directive
+            && kind == "env"
+        {
+            let (name, _) = value
+                .split_once('=')
+                .filter(|(name, _)| !name.is_empty())
+                .ok_or_else(|| format!("malformed rustc-env directive {:?}", line.raw))?;
+            names.push(name.to_owned());
+        }
+    }
+    names.sort();
+    names.dedup();
+    Ok(names)
 }
 
 /// One `--extern` the action consumes.
@@ -361,8 +434,15 @@ pub struct DependencyActionPlan {
     /// Keyed environment, sorted by name.
     pub keyed_env: Vec<(String, String)>,
     /// The COMPLETE environment the compiler must execute with, sorted:
-    /// the keyed variables plus the unkeyed jobserver passthrough.
+    /// the keyed variables plus the unkeyed passthrough (jobserver, and the
+    /// build script's `OUT_DIR`).
     pub execution_env: Vec<(String, String)>,
+    /// The build script's `OUT_DIR`, when the package has one. Relocatable
+    /// mode leaves it unkeyed and publishes only a compile that never read
+    /// it; exact mode also sets [`Self::generated_root`].
+    pub build_script_out_dir: Option<String>,
+    /// Variables the build script set (`cargo:rustc-env`), keyed with values.
+    pub build_script_env: Vec<String>,
 }
 
 impl DependencyActionPlan {
@@ -475,18 +555,7 @@ pub struct ExternFact {
     pub content_digest: TypedDigest,
 }
 
-/// Complete candidate inventory of one dependency search directory.
-/// Only regular Rust artifacts and inert dep-info companions are admitted.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DependencyDirectoryFact {
-    /// Real absolute directory, in the plan's first-use order.
-    pub path: String,
-    /// Every `.rmeta`/`.rlib` candidate, sorted by absolute path.
-    pub artifacts: Vec<ExternFact>,
-    /// Regular `.d` companions, sorted by file name. Their bytes cannot
-    /// participate in rustc artifact resolution; their membership is bound.
-    pub dep_info_names: Vec<String>,
-}
+pub use crate::dependency_candidates::DependencyDirectoryFact;
 
 /// The exact key of one live dependency action.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -703,8 +772,8 @@ pub fn plan_dependency_action(
     {
         return Err(LiveRefusal::UnrepresentablePath(out_dir));
     }
-    let generated_root = env_value(request.env, "OUT_DIR").map(str::to_owned);
-    if let Some(root) = &generated_root
+    let build_script_out_dir = env_value(request.env, BUILD_SCRIPT_OUT_DIR).map(str::to_owned);
+    if let Some(root) = &build_script_out_dir
         && (!plain_path(root)
             // Dep-info replay substitutes the compiler output placement.
             // It must never rewrite a retained exact generated-input path.
@@ -722,7 +791,7 @@ pub fn plan_dependency_action(
             || within(path, &source_root)
             || within(&source_root, path)
             || (path != out_dir && (within(path, &out_dir) || within(&out_dir, path)))
-            || generated_root
+            || build_script_out_dir
                 .as_ref()
                 .is_some_and(|root| path == root || within(path, root) || within(root, path))
             || dependency_dirs
@@ -732,7 +801,7 @@ pub fn plan_dependency_action(
             return Err(LiveRefusal::SearchPath(path.to_owned()));
         }
         if !dependency_dirs.iter().any(|other| other == path) {
-            if dependency_dirs.len() >= 128 {
+            if dependency_dirs.len() >= MAX_DEPENDENCY_DIRECTORIES {
                 return Err(LiveRefusal::SearchPath(
                     "too many dependency directories".into(),
                 ));
@@ -785,10 +854,58 @@ pub fn plan_dependency_action(
         });
     }
 
-    let execution_env = constructed_environment(request.env);
+    // A build script's rustc-env variables are inputs only it sets. Its
+    // OUT_DIR is either placement the compile must not read (relocatable)
+    // or, for packages observed reading it, an exact input tree.
+    let relocatable = build_script_out_dir.is_some() && !request.generated_inputs;
+    let generated_root = build_script_out_dir
+        .clone()
+        .filter(|_| request.generated_inputs);
+    let build_script_env: Vec<String> = match (&build_script_out_dir, request.build_script_env) {
+        (None, None) => Vec::new(),
+        (None, Some([])) => Vec::new(),
+        (None, Some(_)) => {
+            return Err(LiveRefusal::BuildScriptOutput(
+                "build-script variables without OUT_DIR".into(),
+            ));
+        }
+        (Some(_), None) => {
+            return Err(LiveRefusal::BuildScriptOutput(
+                "the build script's recorded output was not observed".into(),
+            ));
+        }
+        (Some(_), Some(names)) => {
+            for name in names {
+                if name == BUILD_SCRIPT_OUT_DIR
+                    || REFUSED_NAMES.contains(&name.as_str())
+                    || DESCRIPTOR_AUTH_VARS.contains(&name.as_bytes())
+                {
+                    return Err(LiveRefusal::RefusedEnv(name.clone()));
+                }
+                if env_value(request.env, name).is_none() {
+                    return Err(LiveRefusal::BuildScriptOutput(format!(
+                        "{name} is recorded but absent from the compiler environment"
+                    )));
+                }
+            }
+            names.to_vec()
+        }
+    };
+    let mut execution_env: Vec<(String, String)> = request
+        .env
+        .iter()
+        .filter(|(name, _)| {
+            !matches!(env_role(name), EnvRole::Scrubbed) || build_script_env.contains(name)
+        })
+        .cloned()
+        .collect();
+    execution_env.sort();
     let keyed_env: Vec<(String, String)> = execution_env
         .iter()
-        .filter(|(name, _)| matches!(env_role(name), EnvRole::Keyed))
+        .filter(|(name, _)| {
+            (matches!(env_role(name), EnvRole::Keyed) || build_script_env.contains(name))
+                && !(relocatable && name == BUILD_SCRIPT_OUT_DIR)
+        })
         .cloned()
         .collect();
 
@@ -813,6 +930,8 @@ pub fn plan_dependency_action(
         outputs,
         keyed_env,
         execution_env,
+        build_script_out_dir,
+        build_script_env,
     })
 }
 
@@ -851,69 +970,48 @@ fn artifacts_component(
             "dependency directory inventory is incomplete".into(),
         ));
     }
-    let mut candidates = CanonicalEncoder::new();
-    candidates
-        .str("exact-dependency-candidates-v1")
-        .u64(directories.len() as u64);
+    let outputs = plan.output_names();
     for (root, directory) in plan.dependency_dirs.iter().zip(directories) {
         if &directory.path != root {
             return Err(LiveRefusal::Facts(
                 "dependency directories are reordered or missing".into(),
             ));
         }
-        candidates.str(&plan.virtual_dependency_path(root));
-        let prefix = format!("{root}/");
-        let mut previous = None;
-        candidates.u64(directory.artifacts.len() as u64);
-        for artifact in &directory.artifacts {
-            let name = artifact
-                .path
-                .strip_prefix(&prefix)
-                .filter(|name| {
-                    safe_component(name) && (name.ends_with(".rlib") || name.ends_with(".rmeta"))
-                })
-                .ok_or_else(|| LiveRefusal::Facts("invalid Rust dependency candidate".into()))?;
-            if previous.is_some_and(|old: &str| old >= name)
-                || (root == &plan.out_dir
-                    && plan.output_names().iter().any(|output| output == name))
+        let mut previous: Option<&str> = None;
+        for group in &directory.groups {
+            let aliases_output = root == &plan.out_dir
+                && match &group.identity {
+                    GroupIdentity::Metadata(_) => [".rlib", ".rmeta"]
+                        .iter()
+                        .any(|suffix| outputs.contains(&format!("{}{suffix}", group.stem))),
+                    GroupIdentity::Members(members) => {
+                        members.iter().any(|(name, _, _)| outputs.contains(name))
+                    }
+                };
+            if !safe_component(&group.stem)
+                || previous.is_some_and(|old| old >= group.stem.as_str())
+                || aliases_output
             {
                 return Err(LiveRefusal::Facts(
                     "duplicate, unsorted, or output-alias candidate".into(),
                 ));
             }
-            previous = Some(name);
-            candidates
-                .str(name)
-                .str(artifact.content_digest.domain)
-                .bytes(&artifact.content_digest.bytes);
-        }
-        previous = None;
-        candidates.u64(directory.dep_info_names.len() as u64);
-        for name in &directory.dep_info_names {
-            if !safe_component(name)
-                || !name.ends_with(".d")
-                || previous.is_some_and(|old| old >= name.as_str())
-                || (root == &plan.out_dir && plan.output_names().contains(name))
-            {
-                return Err(LiveRefusal::Facts(
-                    "invalid dep-info companion inventory".into(),
-                ));
-            }
-            previous = Some(name);
-            candidates.str(name);
+            previous = Some(&group.stem);
         }
     }
     for fact in facts {
-        if !directories
-            .iter()
-            .flat_map(|directory| &directory.artifacts)
-            .any(|candidate| candidate == fact)
-        {
+        if !plan.dependency_dirs.iter().any(|root| {
+            fact.path
+                .strip_prefix(root.as_str())
+                .and_then(|rest| rest.strip_prefix('/'))
+                .is_some_and(safe_component)
+        }) {
             return Err(LiveRefusal::Facts(
-                "extern not covered by the exact candidate inventory".into(),
+                "extern outside the planned dependency directories".into(),
             ));
         }
     }
+    let candidates = encode_candidates(directories, |root| plan.virtual_dependency_path(root));
     let identity_of = |path: &str| -> Option<DependencyArtifactIdentity> {
         let kind = plan.externs.iter().find_map(|planned| match planned {
             PlannedExtern::File {
@@ -962,7 +1060,7 @@ fn artifacts_component(
         .bytes(&digest.bytes)
         .str(names.domain)
         .bytes(&names.bytes)
-        .bytes(&candidates.finish());
+        .bytes(&candidates);
     Ok(compute(DOMAIN_LIVE_ARTIFACTS, &enc.finish()))
 }
 
@@ -1451,6 +1549,38 @@ pub fn dep_info_closure_violation(
     None
 }
 
+/// Whether a compile's dep-info shows it observed its build script's
+/// `OUT_DIR`: a tracked `env!`/`option_env!` read of it, or any rule path
+/// below it. A relocatable compile that did is never published; the caller
+/// keys that package's later requests in exact mode instead.
+#[must_use]
+pub fn reads_build_script_out_dir(plan: &DependencyActionPlan, dep_info: &[u8]) -> bool {
+    let Some(root) = plan.build_script_out_dir.as_deref() else {
+        return false;
+    };
+    let text = String::from_utf8_lossy(dep_info);
+    text.lines().any(|line| {
+        if let Some(comment) = line.strip_prefix('#') {
+            return comment
+                .trim_start()
+                .strip_prefix("env-dep:")
+                .is_some_and(|read| {
+                    read.split_once('=').map_or(read, |(name, _)| name) == BUILD_SCRIPT_OUT_DIR
+                });
+        }
+        line.split(|c: char| c.is_whitespace() || c == ':')
+            .filter(|token| !token.is_empty())
+            .any(|token| {
+                let absolute = if token.starts_with('/') {
+                    token.to_owned()
+                } else {
+                    format!("{}/{token}", plan.cwd)
+                };
+                absolute == root || normalized_within(&absolute, root).is_some()
+            })
+    })
+}
+
 fn observed_input_virtual_path(plan: &DependencyActionPlan, absolute: &str) -> Option<String> {
     if let Some(normalized) = normalized_within(absolute, &plan.source_root) {
         let relative = &normalized[plan.source_root.len() + 1..];
@@ -1467,6 +1597,7 @@ fn observed_input_virtual_path(plan: &DependencyActionPlan, absolute: &str) -> O
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dependency_candidates::CandidateGroupFact;
     use rabs_protocol::input_evidence::{INPUT_EVIDENCE_SCHEMA_VERSION, PositiveInput};
     use rabs_protocol::raw_bytes::RawBytes;
     use rabs_protocol::result_identity::ObjectId;
@@ -1477,28 +1608,16 @@ mod tests {
     const OUT_A: &str = "/work/a/target/debug/deps";
     const OUT_B: &str = "/work/b/target/debug/deps";
 
+    /// No transitive groups: the direct externs reference nothing.
     fn directory_facts(
         plan: &DependencyActionPlan,
-        externs: &[ExternFact],
+        _externs: &[ExternFact],
     ) -> Vec<DependencyDirectoryFact> {
         plan.dependency_dirs
             .iter()
-            .map(|root| {
-                let mut artifacts: Vec<_> = externs
-                    .iter()
-                    .filter(|fact| {
-                        fact.path
-                            .rsplit_once('/')
-                            .is_some_and(|(parent, _)| parent == root)
-                    })
-                    .cloned()
-                    .collect();
-                artifacts.sort_by(|a, b| a.path.cmp(&b.path));
-                DependencyDirectoryFact {
-                    path: root.clone(),
-                    artifacts,
-                    dep_info_names: Vec::new(),
-                }
+            .map(|root| DependencyDirectoryFact {
+                path: root.clone(),
+                groups: Vec::new(),
             })
             .collect()
     }
@@ -1590,6 +1709,8 @@ mod tests {
                 argv: &argv,
                 cwd: PACKAGE,
                 env: &env,
+                build_script_env: None,
+                generated_inputs: false,
             },
             "x86_64-unknown-linux-gnu",
         )
@@ -1667,6 +1788,8 @@ mod tests {
                 argv: &argv,
                 cwd: package,
                 env: &env,
+                build_script_env: None,
+                generated_inputs: false,
             },
             "x86_64-unknown-linux-gnu",
         )
@@ -1985,10 +2108,218 @@ mod tests {
         );
     }
 
+    fn plan_with_build_script(
+        out_dir: &str,
+        build_out: &str,
+        extra_env: &[(&str, &str)],
+        recorded: &[&str],
+    ) -> Result<DependencyActionPlan, LiveRefusal> {
+        let argv = argv(out_dir, &[]);
+        let mut extra = vec![("OUT_DIR", build_out)];
+        extra.extend_from_slice(extra_env);
+        let env = env(&extra);
+        let recorded: Vec<String> = recorded.iter().map(|name| (*name).to_owned()).collect();
+        plan_dependency_action(
+            LiveRustcRequest {
+                argv: &argv,
+                cwd: PACKAGE,
+                env: &env,
+                build_script_env: Some(&recorded),
+                generated_inputs: false,
+            },
+            "x86_64-unknown-linux-gnu",
+        )
+    }
+
+    #[test]
+    fn build_script_env_names_come_from_cargos_recorded_output() {
+        let output = "cargo:rustc-cfg=has_feature\n\
+                      cargo:rustc-env=BUILD_FLAVOR=fast\n\
+                      cargo::rustc-env=GIT_HASH=abc=def\n\
+                      cargo:rustc-env=BUILD_FLAVOR=fast\n\
+                      cargo:rerun-if-env-changed=OTHER\n\
+                      cargo:warning=hello\n\
+                      plain output\n";
+        assert_eq!(
+            build_script_env_names(output).unwrap(),
+            ["BUILD_FLAVOR", "GIT_HASH"]
+        );
+        assert!(build_script_env_names("").unwrap().is_empty());
+        assert!(build_script_env_names("cargo:rustc-env=NOVALUE\n").is_err());
+        assert!(build_script_env_names("cargo:rustc-env==value\n").is_err());
+    }
+
+    #[test]
+    fn build_script_out_dir_is_unkeyed_placement_and_its_env_is_keyed() {
+        let build_a = "/work/a/target/debug/build/itoa-0123456789abcdef/out";
+        let build_b = "/work/b/target/debug/build/itoa-0123456789abcdef/out";
+        let a = plan_with_build_script(
+            OUT_A,
+            build_a,
+            &[("BUILD_FLAVOR", "fast")],
+            &["BUILD_FLAVOR"],
+        )
+        .unwrap();
+        let b = plan_with_build_script(
+            OUT_B,
+            build_b,
+            &[("BUILD_FLAVOR", "fast")],
+            &["BUILD_FLAVOR"],
+        )
+        .unwrap();
+        // The compiler sees OUT_DIR and the script's variable; only the
+        // variable is keyed.
+        assert!(
+            a.execution_env
+                .iter()
+                .any(|(name, value)| name == "OUT_DIR" && value == build_a)
+        );
+        assert!(!a.keyed_env.iter().any(|(name, _)| name == "OUT_DIR"));
+        assert!(
+            a.keyed_env
+                .iter()
+                .any(|(name, value)| name == "BUILD_FLAVOR" && value == "fast")
+        );
+        assert_eq!(a.build_script_out_dir.as_deref(), Some(build_a));
+        // Two worktrees share the key.
+        assert_eq!(key(&a), key(&b));
+        // The script's variable value is an input.
+        let other = plan_with_build_script(
+            OUT_A,
+            build_a,
+            &[("BUILD_FLAVOR", "slow")],
+            &["BUILD_FLAVOR"],
+        )
+        .unwrap();
+        assert_ne!(key(&other), key(&a));
+        // An unrecorded variable stays absent from the compiler, as before.
+        let unrecorded =
+            plan_with_build_script(OUT_A, build_a, &[("BUILD_FLAVOR", "fast")], &[]).unwrap();
+        assert!(
+            !unrecorded
+                .execution_env
+                .iter()
+                .any(|(name, _)| name == "BUILD_FLAVOR")
+        );
+        assert_ne!(key(&unrecorded), key(&a));
+        // Relocatable OUT_DIR is placement, not an input: with nothing else
+        // different the key equals the same compile without it. That is
+        // sound only because every published result was proven never to
+        // read OUT_DIR (see a_compile_that_reads_out_dir_is_never_published),
+        // so its presence cannot have shaped the outputs.
+        assert_eq!(key(&unrecorded), key(&plan_for(OUT_A, &[], &[]).unwrap()));
+        // The exact mode keys OUT_DIR itself.
+        let exact = plan_exact(OUT_A, &[], &[("OUT_DIR", build_a)]).unwrap();
+        assert!(exact.keyed_env.iter().any(|(name, _)| name == "OUT_DIR"));
+        assert_eq!(exact.generated_root.as_deref(), Some(build_a));
+        assert_eq!(unrecorded.generated_root, None);
+    }
+
+    #[test]
+    fn build_script_inputs_that_cannot_be_modeled_refuse() {
+        let code = |result: Result<DependencyActionPlan, LiveRefusal>| result.unwrap_err().code();
+        let build = "/work/a/target/debug/build/itoa-0123456789abcdef/out";
+        // Recorded but not presented: Cargo and its record disagree.
+        assert_eq!(
+            code(plan_with_build_script(OUT_A, build, &[], &["MISSING"])),
+            "LIVE_DEP_BUILD_SCRIPT_OUTPUT"
+        );
+        // A script cannot launder passthrough or refused names into keys.
+        for name in ["OUT_DIR", "CARGO_MAKEFLAGS", "LD_PRELOAD"] {
+            assert!(
+                plan_with_build_script(OUT_A, build, &[(name, "x")], &[name]).is_err(),
+                "{name}"
+            );
+        }
+        // OUT_DIR inside the package, the out-dir or a dependency directory.
+        for placed in [
+            format!("{PACKAGE}/generated"),
+            format!("{OUT_A}/generated"),
+            OUT_A.to_owned(),
+            "relative/out".to_owned(),
+        ] {
+            assert_eq!(
+                code(plan_with_build_script(OUT_A, &placed, &[], &[])),
+                "LIVE_DEP_PATH",
+                "{placed}"
+            );
+        }
+        // Recorded variables without any OUT_DIR are inconsistent.
+        let argv = argv(OUT_A, &[]);
+        let env = env(&[("X", "1")]);
+        let recorded = vec!["X".to_owned()];
+        assert_eq!(
+            code(plan_dependency_action(
+                LiveRustcRequest {
+                    argv: &argv,
+                    cwd: PACKAGE,
+                    env: &env,
+                    build_script_env: Some(&recorded),
+                    generated_inputs: false,
+                },
+                "x86_64-unknown-linux-gnu",
+            )),
+            "LIVE_DEP_BUILD_SCRIPT_OUTPUT"
+        );
+    }
+
+    #[test]
+    fn a_compile_that_reads_out_dir_is_never_published() {
+        let build = "/work/a/target/debug/build/itoa-0123456789abcdef/out";
+        let plan = plan_with_build_script(OUT_A, build, &[], &[]).unwrap();
+        let dep_info = |extra: &str| {
+            format!(
+                "{OUT_A}/itoa-c2b2f4e1a6d0b3c9.d: {PACKAGE}/src/lib.rs{extra}\n\n{PACKAGE}/src/lib.rs:\n"
+            )
+        };
+        assert_eq!(
+            dep_info_closure_violation(&plan, dep_info("").as_bytes(), |_| true),
+            None
+        );
+        let tracked = format!("{}# env-dep:OUT_DIR={build}\n", dep_info(""));
+        assert!(
+            dep_info_closure_violation(&plan, tracked.as_bytes(), |_| true)
+                .unwrap()
+                .contains("OUT_DIR")
+        );
+        let read = dep_info(&format!(" {build}/generated.rs"));
+        assert!(dep_info_closure_violation(&plan, read.as_bytes(), |_| true).is_some());
+        // The detector the edge uses to switch the package to exact mode.
+        assert!(!reads_build_script_out_dir(&plan, dep_info("").as_bytes()));
+        assert!(reads_build_script_out_dir(&plan, tracked.as_bytes()));
+        assert!(reads_build_script_out_dir(&plan, read.as_bytes()));
+        let elsewhere = format!("{}# env-dep:OUT_DIR_EXTRA=x\n", dep_info(""));
+        assert!(!reads_build_script_out_dir(&plan, elsewhere.as_bytes()));
+        assert!(!reads_build_script_out_dir(
+            &plan_for(OUT_A, &[], &[]).unwrap(),
+            read.as_bytes()
+        ));
+    }
+
+    /// Exact `OUT_DIR` mode (generated inputs) with no recorded rustc-env.
+    fn plan_exact(
+        out_dir: &str,
+        extra_args: &[&str],
+        extra_env: &[(&str, &str)],
+    ) -> Result<DependencyActionPlan, LiveRefusal> {
+        let argv = argv(out_dir, extra_args);
+        let env = env(extra_env);
+        plan_dependency_action(
+            LiveRustcRequest {
+                argv: &argv,
+                cwd: PACKAGE,
+                env: &env,
+                build_script_env: Some(&[]),
+                generated_inputs: true,
+            },
+            "x86_64-unknown-linux-gnu",
+        )
+    }
+
     #[test]
     fn generated_inputs_key_exact_out_dir_and_content_and_close_observed_reads() {
         let generated = "/work/build/generated";
-        let plan = plan_for(OUT_A, &[], &[("OUT_DIR", generated)]).unwrap();
+        let plan = plan_exact(OUT_A, &[], &[("OUT_DIR", generated)]).unwrap();
         assert_eq!(plan.generated_root.as_deref(), Some(generated));
         assert!(
             plan.execution_env
@@ -2012,10 +2343,10 @@ mod tests {
                 .action_key
         };
         let original = keyed(&plan, &manifest);
-        let other_output = plan_for(OUT_B, &[], &[("OUT_DIR", generated)]).unwrap();
+        let other_output = plan_exact(OUT_B, &[], &[("OUT_DIR", generated)]).unwrap();
         assert_eq!(original, keyed(&other_output, &manifest));
         let other_generated =
-            plan_for(OUT_A, &[], &[("OUT_DIR", "/work/other/generated")]).unwrap();
+            plan_exact(OUT_A, &[], &[("OUT_DIR", "/work/other/generated")]).unwrap();
         assert_ne!(original, keyed(&other_generated, &manifest));
         manifest.inputs.last_mut().unwrap().object = ObjectId(digest(43));
         assert_ne!(original, keyed(&plan, &manifest));
@@ -2064,7 +2395,7 @@ mod tests {
 
     #[test]
     fn generated_input_run_records_are_required_bound_and_preserve_env_policy() {
-        let plan = plan_for(
+        let plan = plan_exact(
             OUT_A,
             &[],
             &[
@@ -2117,13 +2448,18 @@ mod tests {
             "relative/generated".into(),
             "/work/../generated".into(),
         ] {
+            // Overlap is refused in both OUT_DIR modes.
             assert!(
-                plan_for(OUT_A, &[], &[("OUT_DIR", &root)]).is_err(),
+                plan_exact(OUT_A, &[], &[("OUT_DIR", &root)]).is_err(),
+                "{root}"
+            );
+            assert!(
+                plan_with_build_script(OUT_A, &root, &[], &[]).is_err(),
                 "{root}"
             );
         }
         assert!(
-            plan_for(
+            plan_exact(
                 OUT_A,
                 &["-Ldependency=/generated"],
                 &[("OUT_DIR", "/generated")]
@@ -2132,9 +2468,9 @@ mod tests {
         );
         // The extension is about consuming generated Rust inputs, not
         // executing macros or resolving native library search paths.
-        assert!(plan_for(OUT_A, &["-Lnative=/native"], &[("OUT_DIR", "/generated")]).is_err());
+        assert!(plan_exact(OUT_A, &["-Lnative=/native"], &[("OUT_DIR", "/generated")]).is_err());
         assert!(
-            plan_for(
+            plan_exact(
                 OUT_A,
                 &["--extern=macro=/deps/libmacro.so"],
                 &[("OUT_DIR", "/generated")]
@@ -2146,6 +2482,11 @@ mod tests {
     #[test]
     fn out_of_class_requests_are_typed_refusals() {
         let code = |result: Result<DependencyActionPlan, LiveRefusal>| result.unwrap_err().code();
+        // A build script's OUT_DIR needs Cargo's record of that script's output.
+        assert_eq!(
+            code(plan_for(OUT_A, &[], &[("OUT_DIR", "/x/build/itoa-1/out")])),
+            "LIVE_DEP_BUILD_SCRIPT_OUTPUT"
+        );
         assert_eq!(
             code(plan_for(OUT_A, &[], &[("LD_PRELOAD", "/x")])),
             "LIVE_DEP_REFUSED_ENV"
@@ -2212,6 +2553,8 @@ mod tests {
                     argv: &uncapped,
                     cwd: PACKAGE,
                     env: &env,
+                    build_script_env: None,
+                    generated_inputs: false,
                 },
                 "x86_64-unknown-linux-gnu"
             )
@@ -2227,6 +2570,8 @@ mod tests {
                     argv: &argv,
                     cwd: "/work/a",
                     env: &env,
+                    build_script_env: None,
+                    generated_inputs: false,
                 },
                 "x86_64-unknown-linux-gnu"
             )
@@ -2304,6 +2649,8 @@ mod tests {
                     argv: &args,
                     cwd: PACKAGE,
                     env: &env(&[]),
+                    build_script_env: None,
+                    generated_inputs: false,
                 },
                 "x86_64-unknown-linux-gnu",
             )
@@ -2318,17 +2665,22 @@ mod tests {
             super::live_dependency_key(&a, &toolchain(), &direct, facts, None, &inputs(&a, 11))
         };
         assert!(keyed(&[]).is_err());
+        let group = |stem: &str, tag: u8| CandidateGroupFact {
+            stem: stem.to_owned(),
+            identity: GroupIdentity::Metadata(digest(tag)),
+        };
         let mut added = facts.clone();
-        added[0].artifacts.push(ExternFact {
-            path: format!("{}/libtransitive.rlib", a.dependency_dirs[0]),
-            content_digest: digest(30),
-        });
+        added[0]
+            .groups
+            .push(group("libtransitive-1111111111111111", 30));
         assert_ne!(keyed(&added).unwrap().action_key, key(&a));
         let original = keyed(&added).unwrap().action_key;
-        added[0].artifacts[1].content_digest = digest(31);
+        added[0].groups[0] = group("libtransitive-1111111111111111", 31);
         assert_ne!(keyed(&added).unwrap().action_key, original);
-        added[0].artifacts.reverse();
-        assert!(keyed(&added).is_err());
+        added[0]
+            .groups
+            .insert(0, group("libzzz-2222222222222222", 32));
+        assert!(keyed(&added).is_err(), "unsorted groups are refused");
         let raw = format!("{}: {} {}", a.out_dir, direct[0].path, a.dependency_dirs[0]);
         assert!(canonicalize_placements(raw.as_bytes(), &a).is_err());
         // A warning can quote a string literal authored in source. Its
@@ -2343,6 +2695,39 @@ mod tests {
         assert_eq!(
             render_placements(&canonical, &b),
             raw.replace("/work/a", "/work/b").as_bytes()
+        );
+    }
+
+    #[test]
+    fn a_referenced_group_naming_this_compiles_own_output_is_refused() {
+        // Cargo's layout: the out-dir is also the dependency directory.
+        let plan = plan_for(OUT_A, &[], &[]).unwrap();
+        let index = plan
+            .dependency_dirs
+            .iter()
+            .position(|dir| dir == &plan.out_dir)
+            .expect("out-dir is searched");
+        let own = plan
+            .output_names()
+            .into_iter()
+            .find(|name| name.ends_with(".rmeta"))
+            .unwrap();
+        let mut facts = directory_facts(&plan, &[]);
+        facts[index].groups.push(CandidateGroupFact {
+            stem: own.strip_suffix(".rmeta").unwrap().to_owned(),
+            identity: GroupIdentity::Metadata(digest(40)),
+        });
+        let externs = externs(&plan, 20);
+        assert!(
+            super::live_dependency_key(
+                &plan,
+                &toolchain(),
+                &externs,
+                &facts,
+                None,
+                &inputs(&plan, 11)
+            )
+            .is_err()
         );
     }
 

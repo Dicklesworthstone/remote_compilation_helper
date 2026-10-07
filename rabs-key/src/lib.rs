@@ -53,6 +53,7 @@ pub mod cargo_config_path_resolution;
 pub mod cargo_config_provenance;
 pub mod dag_browser;
 pub mod dep_info;
+pub mod dependency_candidates;
 pub mod dependency_identity;
 pub mod dependency_lane;
 pub mod dependency_projection;
