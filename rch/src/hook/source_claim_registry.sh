@@ -19,24 +19,7 @@ refuse() {
 }
 
 validate_record() {
-    record=$1
-    [ ! -L "$record" ] && [ -f "$record" ] || refuse 'invalid claim file'
-    name=${record##*/}
-    record_token=${name%%.*}
-    record_digest=${name#*.}
-    record_digest=${record_digest%%.*}
-    case "$record_token" in ''|*[!a-f0-9-]*) refuse 'invalid claim identity' ;; esac
-    case "$record_digest" in *[!a-f0-9]*) refuse 'invalid claim digest' ;; esac
-    [ "${#record_digest}" -eq 64 ] || refuse 'invalid claim digest length'
-    size=$(wc -c < "$record")
-    [ "$size" -gt 0 ] && [ "$size" -le 33554432 ] || refuse 'invalid claim size'
-    actual=$(sha256sum -- "$record")
-    [ "${actual%% *}" = "$record_digest" ] || refuse 'claim content digest mismatch'
-    while IFS= read -r root; do
-        case "$root" in /*) ;; *) refuse 'non-absolute claimed root' ;; esac
-        case "$root" in *//*|*/./*|*/../*|*/.|*/..) refuse 'non-canonical claimed root' ;; esac
-        [ "$root" = / ] || [ "${root%/}" = "$root" ] || refuse 'non-canonical claimed root'
-    done < "$record"
+    rch_claim_record_valid "$1" || refuse 'invalid claim record'
 }
 
 matches_request() {
@@ -72,7 +55,30 @@ for previous in "$registry/$token."*.claim "$registry/$token."*.pending \
     "$registry/$token."*.cancelling "$registry/released/$token."*.claim \
     "$registry/cancelled/$token."*.claim; do
     [ -e "$previous" ] || [ -L "$previous" ] || continue
+    case "$previous" in *.pending)
+        if ! rch_claim_record_valid "$previous"; then
+            rch_claim_quarantine_pending "$registry" "$previous" || refuse 'cannot quarantine pending claim'
+            continue
+        fi
+        ;;
+        *.cancelling)
+        if rch_claim_quarantine_fence "$registry" "$previous"; then
+            continue
+        fi
+        ;;
+    esac
     matches_request "$previous"
+done
+
+# Quarantining an incomplete write must never let its delayed acquire/recover
+# become a new grant. The filename still binds the original roots digest.
+# Cancellation may fence that exact unexecuted intent without granting cleanup
+# authority; a valid active record, if any, remains independently required.
+for previous in "$registry/quarantine/$token."*.pending; do
+    [ -e "$previous" ] || [ -L "$previous" ] || continue
+    [ ! -L "$previous" ] && [ -f "$previous" ] || refuse 'invalid quarantined claim'
+    [ "$previous" = "$registry/quarantine/$token.$digest.pending" ] || refuse 'quarantined source identity roots changed'
+    case "$operation" in acquire|recover) refuse 'source intent has an incomplete quarantined claim' ;; esac
 done
 
 if [ "$operation" = cancel ]; then
@@ -81,6 +87,16 @@ if [ "$operation" = cancel ]; then
     fi
     if [ -e "$cancelled" ] || [ -L "$cancelled" ]; then
         matches_request "$cancelled"
+        printf unowned
+        exit 0
+    fi
+    if rch_claim_quarantine_fence "$registry" "$cancelling"; then
+        # No source activity was granted. Publish the exact caller-bound
+        # cancellation receipt while retaining the legacy refusal fence.
+        rch_claim_write_atomic "$registry" "$cancelled" "$digest" "$requested" || refuse 'cannot persist quarantined source cancellation'
+        matches_request "$cancelled"
+        sync -f "$registry/cancelled"
+        sync -f "$registry"
         printf unowned
         exit 0
     fi
@@ -97,7 +113,7 @@ if [ "$operation" = cancel ]; then
     if [ -e "$cancelling" ] || [ -L "$cancelling" ]; then
         matches_request "$cancelling"
     else
-        (set -C; printf '%s\n' "$requested" > "$cancelling")
+        rch_claim_write_atomic "$registry" "$cancelling" "$digest" "$requested" || refuse 'cannot persist source cancellation'
         matches_request "$cancelling"
     fi
     sync -f "$cancelling"
@@ -174,10 +190,18 @@ $requested
 RCH_REQUESTED_ROOTS
 )
 
-# An interrupted pending write is an ownership uncertainty too. A valid one
-# participates in overlap checks; a corrupt one fails closed before admission.
+# Complete pending records retain their source exclusion. Incomplete legacy
+# writes cannot have authorized activity and are quarantined under this lock;
+# active-record corruption still refuses admission because ownership is unknown.
 for held in "$registry"/*.claim "$registry"/*.pending; do
     [ -e "$held" ] || [ -L "$held" ] || continue
+    case "$held" in *.pending)
+        if ! rch_claim_record_valid "$held"; then
+            rch_claim_quarantine_pending "$registry" "$held" || refuse 'cannot quarantine pending claim'
+            continue
+        fi
+        ;;
+    esac
     validate_record "$held"
     case "${held##*/}" in "$token".*)
         [ "$operation" = recover ] || refuse 'source identity already claimed'
@@ -215,7 +239,7 @@ if [ "$operation" = recover ]; then
 else
     [ ! -e "$active" ] && [ ! -L "$active" ] || refuse 'source grant already exists'
     [ ! -e "$pending" ] && [ ! -L "$pending" ] || refuse 'pending source grant already exists'
-    (set -C; printf '%s\n' "$requested" > "$pending")
+    rch_claim_write_atomic "$registry" "$pending" "$digest" "$requested" || refuse 'cannot persist source claim'
     matches_request "$pending"
 fi
 sync -f "$pending"

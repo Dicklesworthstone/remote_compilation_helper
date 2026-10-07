@@ -330,7 +330,7 @@ fn source_registry_setup(registry: &str) -> String {
     format!(
         "set -eu; umask 077; registry={registry}; \
          [ ! -L \"$registry\" ]; mkdir -p -- \"$registry\"; \
-         for directory in \"$registry/released\" \"$registry/cancelled\"; do \
+         for directory in \"$registry/released\" \"$registry/cancelled\" \"$registry/quarantine\"; do \
          [ ! -L \"$directory\" ]; mkdir -p -- \"$directory\"; done; \
          [ ! -L \"$registry/metadata.lock\" ]; sync -f \"$registry\";\n",
         registry = quote(registry),
@@ -344,10 +344,15 @@ fn source_registry_invocation(
     operation: &str,
 ) -> String {
     let quote = |value: &str| shell_escape::escape(value.into()).into_owned();
+    let script = format!(
+        "{}\n{}",
+        rch_common::stale_target_reap::SOURCE_CLAIM_RECORD_HELPERS,
+        SOURCE_CLAIM_REGISTRY,
+    );
     format!(
         "flock -x -- {lock} sh -c {script} rch-source-registry {registry} {identity} {digest} {operation}",
         lock = quote(&format!("{registry}/metadata.lock")),
-        script = quote(SOURCE_CLAIM_REGISTRY),
+        script = quote(&script),
         registry = quote(registry),
         identity = quote(identity),
         digest = quote(digest),
@@ -2093,6 +2098,277 @@ cat "$RCH_OWNERSHIP_TEST_DIR/payload"
             .output()
             .await
             .unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn durable_source_registry_quarantines_incomplete_pending_without_resurrection() {
+        use std::os::unix::fs::MetadataExt;
+        async fn legacy_preflight(registry: &Path, token: &str, marker: &Path) {
+            // Preserve the old script's identity preflight, before any
+            // acquire/recover/cancel branch. The full old script is also
+            // exercised during review; this small compatibility contract
+            // keeps its size/hash refusal guards committed without a copy
+            // of the whole superseded implementation.
+            let old_preflight = r#"
+set -eu; registry=$1; token=$2; marker=$3
+for previous in "$registry/$token."*.claim "$registry/$token."*.pending \
+    "$registry/$token."*.cancelling "$registry/released/$token."*.claim \
+    "$registry/cancelled/$token."*.claim; do
+    [ -e "$previous" ] || [ -L "$previous" ] || continue
+    [ ! -L "$previous" ] && [ -f "$previous" ] || exit 73
+    size=$(wc -c < "$previous")
+    [ "$size" -gt 0 ] && [ "$size" -le 33554432 ] || exit 73
+    name=${previous##*/}; record_digest=${name#*.}; record_digest=${record_digest%%.*}
+    actual=$(sha256sum -- "$previous")
+    [ "${actual%% *}" = "$record_digest" ] || exit 73
+done
+printf 'legacy identity escaped its fence\n' > "$marker"
+"#;
+            let output = Command::new("flock")
+                .arg("-x")
+                .arg(registry.join("metadata.lock"))
+                .args(["sh", "-c", old_preflight, "legacy-registry-preflight"])
+                .arg(registry)
+                .arg(token)
+                .arg(marker)
+                .kill_on_drop(true)
+                .output()
+                .await
+                .unwrap();
+            assert_eq!(output.status.code(), Some(73));
+            assert!(
+                !marker.exists(),
+                "delayed legacy admission crossed its identity fence"
+            );
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let registry = directory.path().join("registry");
+        std::fs::create_dir(&registry).unwrap();
+        let roots = vec![directory.path().join("source").display().to_string()];
+        let (contents, digest) = source_claim_roots(&roots).unwrap();
+        let damaged = [
+            ("aa01", b"".as_slice()),
+            ("aa02", b"/truncated".as_slice()),
+            ("aa06", b"/interrupted".as_slice()),
+        ];
+        for (token, bytes) in damaged {
+            let pending = registry.join(format!("{token}.{digest}.pending"));
+            std::fs::write(&pending, bytes).unwrap();
+            if token == "aa06" {
+                // Restart after the durable fence but before quarantine's
+                // rename. Only this exact hard link may resume that frontier.
+                std::fs::hard_link(
+                    &pending,
+                    registry.join(format!("{token}.{digest}.cancelling")),
+                )
+                .unwrap();
+            }
+        }
+        // Both admissions reach the real metadata flock concurrently. Exactly
+        // one receives this source closure after the failed writes are fenced.
+        let (first, second) = tokio::join!(
+            test_source_intent(&registry, &roots, "aa03", "acquire"),
+            test_source_intent(&registry, &roots, "aa04", "acquire"),
+        );
+        assert_ne!(first.status.success(), second.status.success());
+        let (winner, success, failure) = if first.status.success() {
+            ("aa03", first, second)
+        } else {
+            ("aa04", second, first)
+        };
+        assert!(String::from_utf8_lossy(&success.stderr).contains("RCH_SOURCE_CLAIM_QUARANTINED"));
+        assert!(String::from_utf8_lossy(&failure.stderr).contains("overlapping"));
+        for (token, bytes) in damaged {
+            let name = format!("{token}.{digest}.pending");
+            assert!(!registry.join(&name).exists());
+            assert_eq!(
+                std::fs::read(registry.join("quarantine").join(&name)).unwrap(),
+                bytes
+            );
+            let fence = registry.join(format!("{token}.{digest}.cancelling"));
+            assert_eq!(
+                std::fs::metadata(&fence).unwrap().ino(),
+                std::fs::metadata(registry.join("quarantine").join(&name))
+                    .unwrap()
+                    .ino(),
+                "legacy scripts must see the same malformed record as a cancellation fence",
+            );
+            let legacy_marker = directory.path().join(format!("escaped-{token}"));
+            legacy_preflight(&registry, token, &legacy_marker).await;
+            for operation in ["acquire", "recover"] {
+                let output = test_source_intent(&registry, &roots, token, operation).await;
+                assert_eq!(output.status.code(), Some(73));
+                assert!(String::from_utf8_lossy(&output.stderr).contains("quarantined"));
+            }
+            let changed = vec![directory.path().join("different").display().to_string()];
+            assert_eq!(
+                test_source_intent(&registry, &changed, token, "cancel")
+                    .await
+                    .status
+                    .code(),
+                Some(73)
+            );
+            let cancelled = test_source_intent(&registry, &roots, token, "cancel").await;
+            assert!(cancelled.status.success(), "{cancelled:?}");
+            assert_eq!(cancelled.stdout, b"unowned");
+            assert_eq!(
+                std::fs::read_to_string(
+                    registry
+                        .join("cancelled")
+                        .join(format!("{token}.{digest}.claim"))
+                )
+                .unwrap(),
+                contents,
+            );
+            assert!(
+                !test_source_intent(&registry, &roots, token, "acquire")
+                    .await
+                    .status
+                    .success()
+            );
+            legacy_preflight(&registry, token, &legacy_marker).await;
+        }
+        assert!(
+            test_source_intent(&registry, &roots, winner, "release")
+                .await
+                .status
+                .success()
+        );
+        assert!(
+            test_source_intent(&registry, &roots, "aa05", "acquire")
+                .await
+                .status
+                .success()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn durable_source_registry_does_not_bless_unrelated_corrupt_cancellation() {
+        let directory = tempfile::tempdir().unwrap();
+        let registry = directory.path().join("registry");
+        std::fs::create_dir_all(registry.join("quarantine")).unwrap();
+        let roots = vec![directory.path().join("source").display().to_string()];
+        let (_, digest) = source_claim_roots(&roots).unwrap();
+        let quarantined = registry
+            .join("quarantine")
+            .join(format!("ad01.{digest}.pending"));
+        let cancelling = registry.join(format!("ad01.{digest}.cancelling"));
+        std::fs::write(&quarantined, b"/truncated").unwrap();
+        std::fs::write(&cancelling, b"/truncated").unwrap();
+        let output = test_source_intent(&registry, &roots, "ad01", "cancel").await;
+        assert_eq!(output.status.code(), Some(73));
+        assert!(
+            !registry
+                .join("cancelled")
+                .join(format!("ad01.{digest}.claim"))
+                .exists()
+        );
+        assert_eq!(std::fs::read(quarantined).unwrap(), b"/truncated");
+        assert_eq!(std::fs::read(cancelling).unwrap(), b"/truncated");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn durable_source_registry_write_failure_keeps_partial_bytes_private() {
+        for limit in [0, 1] {
+            let directory = tempfile::tempdir().unwrap();
+            let registry = directory.path().join("registry");
+            // Real EFBIG from RLIMIT_FSIZE exercises zero-byte and truncated
+            // writes, without a mocked printf, filesystem, sync, or rename.
+            let roots = vec![format!(
+                "{}/{}source",
+                directory.path().display(),
+                "nested/".repeat(400)
+            )];
+            let (_, digest) = source_claim_roots(&roots).unwrap();
+            let script =
+                source_intent_command(registry.to_str().unwrap(), &roots, "bb01", "acquire")
+                    .unwrap();
+            let output = Command::new("sh")
+                .args(["-c", &format!("trap '' XFSZ; ulimit -f {limit}; {script}")])
+                .kill_on_drop(true)
+                .output()
+                .await
+                .unwrap();
+            assert!(
+                !output.status.success(),
+                "write limit must cause a real failure"
+            );
+            assert!(!registry.join(format!("bb01.{digest}.pending")).exists());
+            assert!(!registry.join(format!("bb01.{digest}.claim")).exists());
+            let private: Vec<_> = std::fs::read_dir(&registry)
+                .unwrap()
+                .map(Result::unwrap)
+                .filter(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".record-write.")
+                })
+                .collect();
+            assert_eq!(private.len(), 1, "retain the failed bytes for inspection");
+            let size = private[0].metadata().unwrap().len();
+            assert_eq!(size == 0, limit == 0);
+            assert!(size < roots[0].len() as u64);
+            let other = vec![directory.path().join("other").display().to_string()];
+            assert!(
+                test_source_intent(&registry, &other, "bb02", "acquire")
+                    .await
+                    .status
+                    .success()
+            );
+            let cancelled = test_source_intent(&registry, &roots, "bb01", "cancel").await;
+            assert!(cancelled.status.success(), "{cancelled:?}");
+            assert_eq!(cancelled.stdout, b"unowned");
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let registry = directory.path().join("registry");
+        let roots = vec![directory.path().join("source").display().to_string()];
+        let (contents, digest) = source_claim_roots(&roots).unwrap();
+        assert!(
+            test_source_intent(&registry, &roots, "bc01", "acquire")
+                .await
+                .status
+                .success()
+        );
+        let script =
+            source_intent_command(registry.to_str().unwrap(), &roots, "bc01", "cancel").unwrap();
+        let output = Command::new("sh")
+            .args(["-c", &format!("trap '' XFSZ; ulimit -f 0; {script}")])
+            .kill_on_drop(true)
+            .output()
+            .await
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(!registry.join(format!("bc01.{digest}.cancelling")).exists());
+        assert_eq!(
+            std::fs::read_to_string(registry.join(format!("bc01.{digest}.claim"))).unwrap(),
+            contents
+        );
+        assert!(
+            !test_source_intent(&registry, &roots, "bc02", "acquire")
+                .await
+                .status
+                .success()
+        );
+        let cancelled = test_source_intent(&registry, &roots, "bc01", "cancel").await;
+        assert!(cancelled.status.success());
+        assert_eq!(cancelled.stdout, b"owned");
+        assert!(
+            test_source_intent(&registry, &roots, "bc01", "finish-cancel")
+                .await
+                .status
+                .success()
+        );
+        assert!(
+            test_source_intent(&registry, &roots, "bc02", "acquire")
+                .await
+                .status
+                .success()
+        );
     }
 
     #[cfg(target_os = "linux")]
