@@ -784,7 +784,7 @@ mod tests {
             std::fs::write(dir.path().join(format!("{}.json", candidate.identity.local_wrapper_id)), serde_json::to_vec(candidate).unwrap()).unwrap();
         }
         assert_eq!(recoverable_lease_ids(dir.path(), now, |pid| pid == 22),
-            [pending.identity.local_wrapper_id.clone()]);
+            std::slice::from_ref(&pending.identity.local_wrapper_id));
     }
 
     #[test]

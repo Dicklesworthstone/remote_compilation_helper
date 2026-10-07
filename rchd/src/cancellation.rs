@@ -1145,6 +1145,9 @@ fn send_signal_to_process(pid: u32, force: bool) -> bool {
     }
 }
 
+// Only `wait_for_process_exit` (itself `#[cfg(test)]`) calls this; ungated it
+// was dead code in the daemon binary and failed `clippy -D warnings`.
+#[cfg(test)]
 fn is_process_alive(pid: u32) -> bool {
     use nix::errno::Errno;
     use nix::sys::signal::kill;
