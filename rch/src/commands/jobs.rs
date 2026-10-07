@@ -344,8 +344,7 @@ async fn run_unix(action: Option<JobsAction>, ctx: &OutputContext) -> Result<()>
             let reply: Value = serde_json::from_str(body)?;
             validate_queued_cancellation(&wrapper_id, &reply)?;
             if reply["status"] == "cancelled_before_start" {
-                writer.record_exit(130)?;
-                writer.acknowledge_terminal()?;
+                writer.confirm_selection_cancelled()?;
             } else if reply["status"] == "cancelled" {
                 let mut identity = lease.identity.clone();
                 identity.admit(

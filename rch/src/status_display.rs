@@ -43,10 +43,32 @@ fn format_duration_ms(ms: u64) -> String {
 /// Query daemon's /status API for comprehensive status.
 pub async fn query_daemon_full_status() -> Result<DaemonFullStatusResponse> {
     let response = send_status_command().await?;
+    parse_daemon_full_status(&response)
+}
 
+/// Keep failover telemetry on the exact endpoint that admitted this wrapper.
+/// Daemon recovery may have selected a socket different from global config.
+pub(crate) async fn query_daemon_full_status_at_socket(
+    socket_path: &str,
+) -> Result<DaemonFullStatusResponse> {
+    #[cfg(unix)]
+    let response = crate::commands::send_daemon_command_to_socket(
+        std::path::Path::new(socket_path),
+        "GET /status\n",
+    )
+    .await?;
+    #[cfg(not(unix))]
+    let response = {
+        let _ = socket_path;
+        send_status_command().await?
+    };
+    parse_daemon_full_status(&response)
+}
+
+fn parse_daemon_full_status(response: &str) -> Result<DaemonFullStatusResponse> {
     // Extract JSON body from HTTP response
     let json_body =
-        extract_json_body(&response).ok_or_else(|| anyhow::anyhow!("Invalid response format"))?;
+        extract_json_body(response).ok_or_else(|| anyhow::anyhow!("Invalid response format"))?;
 
     let status: DaemonFullStatusResponse =
         serde_json::from_str(json_body).context("Failed to parse status response")?;

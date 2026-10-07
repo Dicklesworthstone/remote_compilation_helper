@@ -923,42 +923,49 @@ impl BuildHistory {
         {
             return Ok(WrapperCancellation::Active(state.id));
         }
-        if let Some(receipt) = self
+        let queued = self.has_queued_wrapper(wrapper);
+        let completed = self
             .terminal
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .values()
-            .find(|receipt| receipt.local_wrapper_id.as_deref() == Some(wrapper))
-        {
-            return Ok(WrapperCancellation::Completed(Box::new(
-                receipt.record.clone(),
-            )));
-        }
-        if !self.wrapper_cancelled(wrapper)
-            && !self
-                .queued
-                .read()
-                .unwrap_or_else(|e| e.into_inner())
-                .iter()
-                .any(|state| state.local_wrapper_id.as_deref() == Some(wrapper))
-        {
+            .filter(|receipt| receipt.local_wrapper_id.as_deref() == Some(wrapper))
+            // A wrapper can fail over through several completed attempts.
+            // Its latest receipt must not depend on HashMap iteration order.
+            .max_by_key(|receipt| receipt.record.id)
+            .map(|receipt| receipt.record.clone());
+        let already_cancelled = self.wrapper_cancelled(wrapper);
+        if !queued && completed.is_none() && !already_cancelled {
             return Ok(WrapperCancellation::NotQueued);
         }
-        {
+        if !already_cancelled {
             let mut cancelled = self
                 .cancelled_wrappers
                 .write()
                 .unwrap_or_else(|e| e.into_inner());
-            if !cancelled.contains(wrapper) && cancelled.len() >= MAX_CANCELLED_WRAPPERS {
+            if cancelled.len() >= MAX_CANCELLED_WRAPPERS {
                 return Err(std::io::Error::other(
                     "queued cancellation journal is full; intent not accepted",
                 ));
             }
             cancelled.insert(wrapper.to_owned());
         }
-        // Queue removal and its no-start receipt are one ownership snapshot.
-        self.persist_ownership(&active, None)?;
-        Ok(WrapperCancellation::BeforeStart)
+        if !already_cancelled || queued {
+            // An older completion is not a fence against a delayed retry.
+            // Persist the cancellation before acknowledging either a queued
+            // no-start or an already-completed attempt. Existing terminal
+            // receipts remain exact and do not release any resources again.
+            self.persist_ownership(&active, None)?;
+        }
+        if queued {
+            Ok(WrapperCancellation::BeforeStart)
+        } else {
+            Ok(
+                completed.map_or(WrapperCancellation::BeforeStart, |record| {
+                    WrapperCancellation::Completed(Box::new(record))
+                }),
+            )
+        }
     }
 
     /// Decide queue departure against cancellation while admission is locked.
@@ -1646,13 +1653,16 @@ impl BuildHistory {
                     // Terminal attempts keep their own build IDs. Sequential
                     // worker failover may legitimately reuse a wrapper ID, so
                     // do not compare these wrappers with active_wrappers.
+                    // A cancellation may fence future attempts after completion;
+                    // its terminal receipts own no resources and remain valid.
                     if id == 0
                         || id >= QUEUE_ID_NAMESPACE
                         || active.contains_key(&id)
                         || terminal.contains_key(&id)
-                        || receipt.local_wrapper_id.as_ref().is_some_and(|wrapper| {
-                            wrapper.is_empty() || cancelled_wrappers.contains(wrapper)
-                        })
+                        || receipt
+                            .local_wrapper_id
+                            .as_ref()
+                            .is_some_and(|wrapper| wrapper.is_empty())
                     {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
@@ -2679,19 +2689,14 @@ mod tests {
     }
 
     #[test]
-    fn recovery_rejects_empty_and_cancelled_terminal_wrapper_identities() {
+    fn recovery_rejects_empty_terminal_wrapper_identities() {
         for version in [1, 2] {
-            for wrapper in ["", "cancelled-owner"] {
-                let root = TempDir::new().unwrap();
-                let path = root.path().join("history.jsonl");
-                let (mut snapshot, original) = recovery_validation_fixture(&path, version);
-                snapshot["cancelled_wrappers"] = serde_json::json!(["cancelled-owner"]);
-                snapshot["completed"] = serde_json::json!([recovery_validation_receipt(
-                    original.id - 1,
-                    Some(wrapper)
-                )]);
-                assert_recovery_rejects_without_rewriting(&path, &snapshot);
-            }
+            let root = TempDir::new().unwrap();
+            let path = root.path().join("history.jsonl");
+            let (mut snapshot, original) = recovery_validation_fixture(&path, version);
+            snapshot["completed"] =
+                serde_json::json!([recovery_validation_receipt(original.id - 1, Some(""))]);
+            assert_recovery_rejects_without_rewriting(&path, &snapshot);
         }
     }
 
@@ -3991,6 +3996,237 @@ mod tests {
     // =========================================================================
     // Queue Tests
     // =========================================================================
+
+    fn complete_retry_attempt(history: &BuildHistory, worker: &str, wrapper: &str) -> BuildRecord {
+        let attempt = history
+            .try_start_active_build_with_wrapper(
+                "retry-project".into(),
+                worker.into(),
+                "cargo build".into(),
+                0,
+                Some(wrapper.into()),
+                2,
+                BuildLocation::Remote,
+            )
+            .unwrap()
+            .unwrap();
+        history
+            .complete_durable(
+                attempt.id,
+                worker,
+                Some(wrapper),
+                BuildCompletion {
+                    exit_code: 137,
+                    duration_ms: Some(17),
+                    bytes_transferred: Some(23),
+                    timing: None,
+                    cancellation: None,
+                },
+            )
+            .unwrap()
+            .unwrap()
+            .1
+    }
+
+    #[tokio::test]
+    async fn retry_cancellation_fences_delayed_admission_without_releasing_other_ownership() {
+        let root = TempDir::new().unwrap();
+        let path = root.path().join("history.jsonl");
+        let history = BuildHistory::new(10).with_persistence(path.clone());
+        let first = complete_retry_attempt(&history, "worker-a", "retrying");
+        let latest = complete_retry_attempt(&history, "worker-b", "retrying");
+        let other = disk_budget_admit(&history, "other", "worker-b", 40, 100.0).unwrap();
+        let queued = history
+            .enqueue_build(
+                "queued".into(),
+                "build".into(),
+                0,
+                1,
+                Some("queued-owner".into()),
+            )
+            .unwrap();
+        let WrapperCancellation::Completed(cancelled) = history.cancel_wrapper("retrying").unwrap()
+        else {
+            panic!("a completed wrapper must retain its exact terminal receipt");
+        };
+        assert_eq!(
+            serde_json::to_value(&*cancelled).unwrap(),
+            serde_json::to_value(&latest).unwrap()
+        );
+        assert!(history.wrapper_cancelled("retrying"));
+        assert_eq!(history.reserved_disk_headroom_gib("worker-b"), 40);
+        assert_eq!(history.active_build(other.id).unwrap().slots, 1);
+        assert_eq!(history.queued_builds()[0].id, queued.id);
+        assert!(history.terminal_build(first.id, "retrying").is_some());
+        let durable = std::fs::read(path.with_extension("ownership.json")).unwrap();
+        assert!(
+            matches!(history.cancel_wrapper("retrying").unwrap(), WrapperCancellation::Completed(record) if record.id == latest.id)
+        );
+        assert_eq!(
+            std::fs::read(path.with_extension("ownership.json")).unwrap(),
+            durable
+        );
+        // A duplicate release remains idempotent; cancellation cannot consume
+        // someone else's slots or budget to satisfy the old completion again.
+        assert!(
+            history
+                .complete_durable(
+                    latest.id,
+                    "worker-b",
+                    Some("retrying"),
+                    BuildCompletion {
+                        exit_code: 0,
+                        duration_ms: None,
+                        bytes_transferred: None,
+                        timing: None,
+                        cancellation: None,
+                    }
+                )
+                .unwrap()
+                .is_none()
+        );
+        drop(history);
+        let restored = BuildHistory::load_from_file(&path, 10).unwrap();
+        assert!(restored.wrapper_cancelled("retrying"));
+        assert!(
+            restored
+                .try_start_active_build_with_wrapper(
+                    "retry-project".into(),
+                    "worker-c".into(),
+                    "cargo build".into(),
+                    0,
+                    Some("retrying".into()),
+                    2,
+                    BuildLocation::Remote,
+                )
+                .unwrap()
+                .is_none(),
+            "a request delivered after cancellation must not acquire ownership"
+        );
+        assert_eq!(restored.reserved_disk_headroom_gib("worker-b"), 40);
+        assert_eq!(restored.active_build(other.id).unwrap().slots, 1);
+        assert_eq!(restored.queued_builds()[0].id, queued.id);
+        assert_eq!(
+            serde_json::to_value(restored.terminal_build(latest.id, "retrying").unwrap()).unwrap(),
+            serde_json::to_value(&latest).unwrap()
+        );
+        assert!(
+            restored
+                .try_start_active_build_with_wrapper(
+                    "retry-project".into(),
+                    "worker-c".into(),
+                    "cargo build".into(),
+                    0,
+                    Some("unrelated".into()),
+                    2,
+                    BuildLocation::Remote,
+                )
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_cancellation_racing_admission_identifies_the_current_attempt() {
+        use std::sync::{Arc, Barrier};
+        for _ in 0..16 {
+            let root = TempDir::new().unwrap();
+            let path = root.path().join("history.jsonl");
+            let history = Arc::new(BuildHistory::new(10).with_persistence(path.clone()));
+            let completed = complete_retry_attempt(&history, "old-worker", "retrying");
+            let barrier = Arc::new(Barrier::new(2));
+            let admitting = Arc::clone(&history);
+            let admission_barrier = Arc::clone(&barrier);
+            let task = std::thread::spawn(move || {
+                admission_barrier.wait();
+                admitting
+                    .try_start_active_build_with_wrapper(
+                        "retry-project".into(),
+                        "new-worker".into(),
+                        "cargo build".into(),
+                        0,
+                        Some("retrying".into()),
+                        2,
+                        BuildLocation::Remote,
+                    )
+                    .unwrap()
+            });
+            barrier.wait();
+            let cancellation = history.cancel_wrapper("retrying").unwrap();
+            let admitted = task.join().unwrap();
+            drop(history);
+            let restored = BuildHistory::load_from_file(&path, 10).unwrap();
+            match cancellation {
+                WrapperCancellation::Completed(record) => {
+                    assert_eq!(record.id, completed.id);
+                    assert!(admitted.is_none());
+                    assert!(restored.wrapper_cancelled("retrying"));
+                    assert!(restored.active_builds().is_empty());
+                }
+                WrapperCancellation::Active(id) => {
+                    assert_eq!(admitted.unwrap().id, id);
+                    assert_ne!(id, completed.id);
+                    assert!(!restored.wrapper_cancelled("retrying"));
+                    assert_eq!(restored.active_build(id).unwrap().worker_id, "new-worker");
+                    assert_eq!(restored.active_build(id).unwrap().slots, 2);
+                }
+                _ => panic!("cancellation must fence the retry or identify its active attempt"),
+            }
+            assert!(restored.terminal_build(completed.id, "retrying").is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn retry_cancellation_uncertain_persistence_never_acknowledges_completion() {
+        let root = TempDir::new().unwrap();
+        let path = root.path().join("history.jsonl");
+        let history = BuildHistory::new(10).with_persistence(path.clone());
+        let completed = complete_retry_attempt(&history, "worker", "retrying");
+        history
+            .fail_after_ownership_rename
+            .store(true, Ordering::SeqCst);
+        assert!(history.cancel_wrapper("retrying").is_err());
+        assert!(history.ownership_failed());
+        assert!(history.cancel_wrapper("retrying").is_err());
+        assert!(
+            history
+                .try_start_active_build_with_wrapper(
+                    "project".into(),
+                    "worker".into(),
+                    "build".into(),
+                    0,
+                    Some("unrelated".into()),
+                    1,
+                    BuildLocation::Remote,
+                )
+                .unwrap()
+                .is_none()
+        );
+        drop(history);
+        let restored = BuildHistory::load_from_file(&path, 10).unwrap();
+        assert!(restored.wrapper_cancelled("retrying"));
+        assert!(
+            matches!(restored.cancel_wrapper("retrying").unwrap(), WrapperCancellation::Completed(record) if record.id == completed.id)
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_cancellation_full_journal_cannot_claim_a_completed_wrapper_is_fenced() {
+        let history = BuildHistory::new(10);
+        let completed = complete_retry_attempt(&history, "worker", "retrying");
+        *history.cancelled_wrappers.write().unwrap() = (0..MAX_CANCELLED_WRAPPERS)
+            .map(|id| format!("cancelled-{id}"))
+            .collect();
+        assert!(history.cancel_wrapper("retrying").is_err());
+        assert!(!history.wrapper_cancelled("retrying"));
+        assert!(history.terminal_build(completed.id, "retrying").is_some());
+        assert!(history.active_builds().is_empty());
+        assert!(!history.ownership_failed());
+        assert!(matches!(
+            history.cancel_wrapper("unknown").unwrap(),
+            WrapperCancellation::NotQueued
+        ));
+    }
 
     #[test]
     fn queued_cancellation_survives_restart_and_blocks_only_same_wrapper() {
