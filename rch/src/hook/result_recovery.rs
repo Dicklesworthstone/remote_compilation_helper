@@ -66,28 +66,60 @@ fn validate_directory(directory: &Path) -> anyhow::Result<&str> {
 // never follow a link below it. Only a failed lstat of one name relative to a
 // successfully opened parent directory proves absence. Failure to open the
 // root, permission errors, non-directories and a replacement during traversal
-// do NOT prove absence. The source grant held by the caller excludes writers.
+// do NOT prove absence. Bind each opened descriptor to its preceding lstat and
+// revalidate the root/ancestor names before reporting a missing child. An open
+// descriptor alone can outlive a renamed directory and describe the wrong tree.
+// The source grant held by the caller still excludes cooperating writers; these
+// checks do not replace that grant or promise an atomic snapshot against writers
+// outside the ownership protocol.
 const RESULT_DIRECTORY_PROBE: &str = r#"import os, stat, sys
 root, relative, token = sys.argv[1:]
 parts = relative.split('/')
 if not root.startswith('/') or not parts or any(p in ('', '.', '..') for p in parts):
     raise ValueError('invalid admitted result path')
-fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+held = [os.open(root, os.O_RDONLY | os.O_DIRECTORY)]
+edges = []
+def identity(metadata):
+    return (metadata.st_dev, metadata.st_ino)
+def unchanged_chain():
+    current = os.stat(root)
+    if not stat.S_ISDIR(current.st_mode) or identity(current) != root_identity:
+        raise ValueError('result source root changed during probe')
+    for parent, name, expected in edges:
+        current = os.stat(name, dir_fd=parent, follow_symlinks=False)
+        if not stat.S_ISDIR(current.st_mode) or identity(current) != expected:
+            raise ValueError('result parent changed during probe')
 try:
+    root_identity = identity(os.fstat(held[0]))
     for index, part in enumerate(parts):
+        fd = held[-1]
         try:
             metadata = os.stat(part, dir_fd=fd, follow_symlinks=False)
         except FileNotFoundError:
+            unchanged_chain()
+            # A directory created while its ancestors were checked invalidates
+            # the earlier miss. Do not persist a sticky absence from that race.
+            try:
+                os.stat(part, dir_fd=fd, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                raise ValueError('result path appeared during absence probe')
             print(token + ':absent')
             break
         if not stat.S_ISDIR(metadata.st_mode) or index == len(parts) - 1:
+            unchanged_chain()
             print(token + ':present')
             break
         child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
-        os.close(fd)
-        fd = child
+        held.append(child)
+        opened = os.fstat(child)
+        if not stat.S_ISDIR(opened.st_mode) or identity(opened) != identity(metadata):
+            raise ValueError('result parent replaced between inspection and open')
+        edges.append((fd, part, identity(opened)))
 finally:
-    os.close(fd)
+    for fd in reversed(held):
+        os.close(fd)
 "#;
 
 fn probe_command(root: &str, directory: &Path, token: &str) -> anyhow::Result<String> {
@@ -357,6 +389,130 @@ mod tests {
             local_probe(&root_alias, "reports/missing").unwrap(),
             Presence::Absent
         );
+    }
+
+    // These hooks arrange real renames/creation at the lookup/open boundary.
+    // The probe itself is the exact production program, not a test rewrite.
+    const SWAP_PARENT_ON_OPEN: &str = r#"import os
+_real_open = os.open
+_swapped = False
+def raced_open(path, *args, **kwargs):
+    global _swapped
+    if path == 'reports' and 'dir_fd' in kwargs and not _swapped:
+        _swapped = True
+        parent = kwargs['dir_fd']
+        os.rename('reports', 'retained-reports', src_dir_fd=parent, dst_dir_fd=parent)
+        os.mkdir('reports', dir_fd=parent)
+    return _real_open(path, *args, **kwargs)
+os.open = raced_open
+"#;
+
+    const SWAP_TREE_ON_STAT: &str = r#"import os, sys
+_real_stat = os.stat
+_swapped = False
+def raced_stat(path, *args, **kwargs):
+    global _swapped
+    if path == 'export' and 'dir_fd' in kwargs and not _swapped:
+        _swapped = True
+        root = sys.argv[1]
+        if REPLACE_ROOT:
+            os.rename(root, root + '-retained')
+            os.makedirs(root + '/reports/export')
+        else:
+            os.rename(root + '/reports', root + '/retained-reports')
+            os.makedirs(root + '/reports/export')
+    return _real_stat(path, *args, **kwargs)
+os.stat = raced_stat
+"#;
+
+    const CREATE_AFTER_MISS: &str = r#"import os
+_real_stat = os.stat
+_created = False
+def raced_stat(path, *args, **kwargs):
+    global _created
+    try:
+        return _real_stat(path, *args, **kwargs)
+    except FileNotFoundError:
+        if path == 'export' and 'dir_fd' in kwargs and not _created:
+            _created = True
+            os.mkdir('export', dir_fd=kwargs['dir_fd'])
+        raise
+os.stat = raced_stat
+"#;
+
+    fn raced_probe(root: &Path, prelude: &str) -> Output {
+        std::process::Command::new("python3")
+            .args(["-I", "-S", "-c"])
+            .arg(format!("{prelude}\n{RESULT_DIRECTORY_PROBE}"))
+            .arg(root)
+            .args(["reports/export", "test-receipt"])
+            .output()
+            .expect("run exact result probe with a controlled filesystem race")
+    }
+
+    fn assert_race_refused(output: &Output) {
+        assert!(!output.status.success(), "{output:?}");
+        assert!(output.stdout.is_empty(), "no absence receipt: {output:?}");
+        assert!(parse_probe(output, "test-receipt").is_err());
+    }
+
+    #[test]
+    fn descriptor_probe_refuses_replacement_between_inspection_and_open() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("source : with ' quotes");
+        std::fs::create_dir_all(root.join("reports/export")).unwrap();
+        std::fs::write(root.join("reports/export/evidence"), b"retained").unwrap();
+        assert_race_refused(&raced_probe(&root, SWAP_PARENT_ON_OPEN));
+        assert_eq!(
+            std::fs::read(root.join("retained-reports/export/evidence")).unwrap(),
+            b"retained"
+        );
+        assert!(root.join("reports").is_dir());
+    }
+
+    #[test]
+    fn descriptor_probe_rechecks_parent_and_root_names_before_absence() {
+        for replace_root in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path().join("source");
+            std::fs::create_dir_all(root.join("reports")).unwrap();
+            let replace_root = if replace_root { "True" } else { "False" };
+            let prelude = format!("REPLACE_ROOT = {replace_root}\n{SWAP_TREE_ON_STAT}");
+            assert_race_refused(&raced_probe(&root, &prelude));
+            assert!(root.join("reports/export").is_dir());
+        }
+    }
+
+    #[test]
+    fn descriptor_probe_refuses_creation_after_a_negative_lookup() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir(directory.path().join("reports")).unwrap();
+        assert_race_refused(&raced_probe(directory.path(), CREATE_AFTER_MISS));
+        assert!(directory.path().join("reports/export").is_dir());
+    }
+
+    #[tokio::test]
+    async fn raced_absence_cannot_settle_delivery_or_release_ownership() {
+        let (directory, mut session) = fixture(1);
+        std::fs::create_dir_all(directory.path().join("reports/export")).unwrap();
+        let before = std::fs::read(&session.writer.path).unwrap();
+        let output = raced_probe(directory.path(), SWAP_PARENT_ON_OPEN);
+        assert_race_refused(&output);
+        assert!(
+            settle_result_phase(
+                &mut session,
+                0,
+                async { parse_probe(&output, "test-receipt") },
+                async { panic!("a raced probe must not dispatch result transfer") },
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(std::fs::read(&session.writer.path).unwrap(), before);
+        assert!(!has_missing_results(&session.recipe));
+        assert!(session.writer.acknowledge_terminal().is_err());
+        assert!(session.writer.ensure_released_for_retry().is_err());
+        assert!(directory.path().join("retained-reports/export").is_dir());
     }
 
     #[test]
