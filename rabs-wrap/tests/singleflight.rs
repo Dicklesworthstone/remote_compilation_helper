@@ -43,7 +43,7 @@ fn hit(peer: &mut BufReader<UnixStream>) {
         peer,
         json!({
             "kind": "rustc-decision", "decision": "hit", "action_key": "key",
-            "compiler_skip_authorized": false,
+            "capture_protocol": 1, "compiler_skip_authorized": false,
         }),
     );
     let accept: Value = serde_json::from_str(&read(peer).unwrap()).unwrap();
@@ -190,7 +190,7 @@ fn follower_can_become_the_next_admitted_executor_and_reports_exact_completion()
         assert!(!marker.exists());
         send(peer, json!({
             "kind":"rustc-decision", "decision":"execute", "action_key":"key",
-            "compiler_skip_authorized":false, "attempt":"00ab",
+            "capture_protocol":1, "compiler_skip_authorized":false, "attempt":"00ab",
             "env":[["RABS_TEST_MARKER", marker.to_str().unwrap()], ["MODE_TOKEN", "constructed"]],
         }));
         let completion: Value = serde_json::from_str(&read(peer).unwrap()).unwrap();

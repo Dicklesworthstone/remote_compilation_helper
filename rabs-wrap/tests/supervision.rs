@@ -141,7 +141,7 @@ impl Fixture {
             }
             let reply = json!({"kind":"rustc-decision", "decision":"execute",
                 "action_key":"fixture", "attempt":"supervised-attempt",
-                "compiler_skip_authorized":false,
+                "capture_protocol":1, "compiler_skip_authorized":false,
                 "env":[["PATH","/usr/bin:/bin"],["EXACT","admitted value"]]});
             writeln!(writer, "{reply}").unwrap();
             line.clear();

@@ -139,6 +139,12 @@ impl Owner {
         })
     }
 
+    /// Recheck the original caller after output capture as well as before
+    /// execution. Caller death cannot turn a late capture into publication.
+    pub(super) fn can_acknowledge_capture(self) -> bool {
+        self.pid == std::process::id() && (!cfg!(target_os = "linux") || self.alive())
+    }
+
     fn alive(self) -> bool {
         self.caller_pid != 0
             && read_stat(self.pid).is_ok_and(|stat| {

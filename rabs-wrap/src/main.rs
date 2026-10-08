@@ -25,6 +25,7 @@
 //! complete, typed reply on the install connection explicitly
 //! confirms that the install writer has returned.
 
+mod capture;
 mod singleflight;
 mod supervision;
 
@@ -577,6 +578,11 @@ fn live_outcome(
     match reply.get("decision").and_then(reply_json::Value::as_str) {
         Some("pass-through") => Ok(Live::PassThrough),
         Some("execute") => {
+            // An older daemon may publish after the wrapper exits. Do not
+            // supply it an observed completion without a custody handshake.
+            if !capture::supported(reply) {
+                return Ok(Live::PassThrough);
+            }
             let attempt = reply.get("attempt").and_then(reply_json::Value::as_str);
             let env = reply.get("env").and_then(reply_json::Value::as_array);
             let (Some(attempt), Some(env)) = (attempt, env) else {
@@ -597,6 +603,11 @@ fn live_outcome(
             })
         }
         Some("hit") => {
+            // Decline before accepting output writes from an older daemon:
+            // its publications belong to the pre-custody key namespace.
+            if !capture::supported(reply) {
+                return Ok(Live::PassThrough);
+            }
             // Commit to waiting: from here on the daemon may write outputs,
             // so this process must not run the compiler unless a complete,
             // typed answer confirms that the install writer returned. Losing
@@ -877,10 +888,10 @@ fn exit_like(status: std::process::ExitStatus) -> ! {
     std::process::exit(1);
 }
 
-/// Run the compiler as the admitted attempt: the constructed environment
-/// exactly, streams forwarded live and captured, then one completion frame
-/// on the decision's connection. A capture that overflowed is not
-/// reported; the daemon then settles the attempt without publishing.
+/// Run the admitted compiler with exact environment and live streams, then
+/// retain output custody until the daemon has captured immutable bytes.
+/// Overflowed, abandoned or unacknowledged captures are never published;
+/// cache-population failure does not change the compiler's actual status.
 fn run_attempt(
     real_rustc: &OsStr,
     args: &[OsString],
@@ -924,7 +935,7 @@ fn run_attempt(
         let number =
             |value: Option<i32>| value.map_or_else(|| "null".to_owned(), |v| v.to_string());
         let frame = format!(
-            "{{\"kind\":\"rustc-complete\",\"attempt\":{},\"exit_code\":{},\"signal\":{},\
+            "{{\"kind\":\"rustc-complete\",\"capture_protocol\":1,\"attempt\":{},\"exit_code\":{},\"signal\":{},\
              \"stdout_hex\":\"{}\",\"stderr_hex\":\"{}\"}}\n",
             json_string(attempt),
             number(status.code()),
@@ -932,10 +943,12 @@ fn run_attempt(
             hex_encode(&stdout),
             hex_encode(&stderr),
         );
-        // The daemon harvests outputs on its own time; the compile's
-        // caller does not wait for publication.
-        session.get_mut().deadline = Instant::now() + Duration::from_secs(5);
-        let _ = session.get_mut().write_all(frame.as_bytes());
+        // A report is not publication consent. Hold Cargo's output lifetime
+        // until capture is acknowledged, using one bounded deadline. No ACK
+        // means no publication, including a receipt arriving after timeout.
+        let _ = capture::finish(&mut session, attempt, &frame, || {
+            owner.can_acknowledge_capture()
+        });
     }
     drop(session);
     exit_like(status);

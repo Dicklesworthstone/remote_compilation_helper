@@ -104,7 +104,7 @@ impl Fixture {
             let request = read(&mut reader).unwrap();
             received.push(request);
             let hit = "{\"kind\":\"rustc-decision\",\"decision\":\"hit\",\"action_key\":\"k\",\
-                       \"compiler_skip_authorized\":false}\n";
+                       \"capture_protocol\":1,\"compiler_skip_authorized\":false}\n";
             match script {
                 Script::Reply(line) => {
                     writer.write_all(format!("{line}\n").as_bytes()).unwrap();
@@ -147,7 +147,7 @@ impl Fixture {
                     let reply = serde_json::json!({
                         "kind": "rustc-decision", "decision": "execute",
                         "action_key": "k", "attempt": "00ab", "env": env,
-                        "compiler_skip_authorized": false,
+                        "capture_protocol": 1, "compiler_skip_authorized": false,
                     });
                     writer.write_all(format!("{reply}\n").as_bytes()).unwrap();
                     if let Some(completion) = read(&mut reader) {

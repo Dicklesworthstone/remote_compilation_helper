@@ -96,8 +96,9 @@ use crate::path_policy::{BuildPathSemanticPolicy, policy_component_digest};
 use crate::toolchain::ToolchainContract;
 use crate::typed_digest::compute;
 
-/// Key epoch of the live dependency class.
-pub const LIVE_DEPENDENCY_KEY_EPOCH: u32 = 1;
+/// Key epoch of the live dependency class. Epoch 2 requires acknowledged
+/// immutable output capture before publication; earlier entries are not reused.
+pub const LIVE_DEPENDENCY_KEY_EPOCH: u32 = 2;
 /// Projection epoch: exact (unprojected) dependency artifacts.
 pub const LIVE_DEPENDENCY_PROJECTION_EPOCH: u32 = 1;
 /// Canonical spelling of the invocation's out-dir in keys, committed
@@ -2403,5 +2404,25 @@ mod tests {
         );
         assert_eq!(normalized_within("/a/../a/c", "/a"), None);
         assert_eq!(normalized_within("/..", "/a"), None);
+    }
+
+    #[test]
+    fn acknowledged_capture_has_a_separate_live_key_namespace() {
+        for plan in [
+            plan_for(OUT_A, &[], &[]).unwrap(),
+            plan_in_package(GIT_ROOT, OUT_A, &[]).unwrap(),
+        ] {
+            let current =
+                live_dependency_key(&plan, &toolchain(), &externs(&plan, 20), &inputs(&plan, 11))
+                    .unwrap();
+            assert_eq!(current.descriptor.key_epoch, 2);
+            let mut previous = current.descriptor.clone();
+            previous.key_epoch = 1;
+            assert_ne!(current.action_key, compute_action_key(&previous).final_key);
+            assert_ne!(
+                current.descriptor_digest,
+                descriptor_digest(&descriptor_canonical_bytes(&previous))
+            );
+        }
     }
 }
