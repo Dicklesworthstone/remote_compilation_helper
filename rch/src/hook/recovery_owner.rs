@@ -89,7 +89,10 @@ fn absent_from_process_list(bytes: &[u8], owner: u32, observer: u32) -> anyhow::
             "malformed process listing"
         );
         let pid = pid.parse::<u32>()?;
-        anyhow::ensure!(pid > 0 && seen.insert(pid), "invalid or duplicate process id");
+        anyhow::ensure!(
+            pid > 0 && seen.insert(pid),
+            "invalid or duplicate process id"
+        );
     }
     anyhow::ensure!(
         seen.contains(&observer),
@@ -124,8 +127,14 @@ async fn owner_is_absent(lease: &DurableJobLease) -> anyhow::Result<bool> {
         .kill_on_drop(true)
         .spawn()
         .context("inspect original wrapper before detached recovery")?;
-    let stdout = child.stdout.take().context("process listing lacks stdout")?;
-    let stderr = child.stderr.take().context("process listing lacks stderr")?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("process listing lacks stdout")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("process listing lacks stderr")?;
     let inspection = async {
         let (stdout, stderr) = tokio::try_join!(
             crate::transfer::read_bounded_output_stream(stdout, 8 * 1024 * 1024),
@@ -174,7 +183,10 @@ where
         read()? == latest,
         "job journal changed during owner inspection; retry with its latest evidence"
     );
-    *writer.lease.lock().unwrap_or_else(|error| error.into_inner()) = latest;
+    *writer
+        .lease
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = latest;
     Ok(ownership)
 }
 

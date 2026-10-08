@@ -723,11 +723,7 @@ impl StagedBinaries {
         })
     }
 
-    async fn verify(
-        &self,
-        version: &str,
-        timeout: std::time::Duration,
-    ) -> Result<(), UpdateError> {
+    async fn verify(&self, version: &str, timeout: std::time::Duration) -> Result<(), UpdateError> {
         for binary in UPDATE_BINARIES {
             let path = if self.binaries.contains(binary) {
                 self.directory.path().join(binary)
@@ -991,20 +987,33 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let install = temp.path().join("install");
         fs::create_dir(&install).unwrap();
-        fs::write(install.join(REQUIRED_UPDATE_BINARY), b"working installation").unwrap();
+        fs::write(
+            install.join(REQUIRED_UPDATE_BINARY),
+            b"working installation",
+        )
+        .unwrap();
         let archive = temp.path().join("rch.tar.gz");
         fs::write(&archive, b"not a gzip archive").unwrap();
         assert!(
-            prepare_release(&archive, &install, "9.1.2", std::time::Duration::from_secs(1))
-                .await
-                .is_err()
+            prepare_release(
+                &archive,
+                &install,
+                "9.1.2",
+                std::time::Duration::from_secs(1)
+            )
+            .await
+            .is_err()
         );
-        create_tar_gz_with_entries(&archive, &[(optional_update_binary(), b"no client")])
-            .unwrap();
+        create_tar_gz_with_entries(&archive, &[(optional_update_binary(), b"no client")]).unwrap();
         assert!(
-            prepare_release(&archive, &install, "9.1.2", std::time::Duration::from_secs(1))
-                .await
-                .is_err()
+            prepare_release(
+                &archive,
+                &install,
+                "9.1.2",
+                std::time::Duration::from_secs(1)
+            )
+            .await
+            .is_err()
         );
         assert_eq!(
             fs::read(install.join(REQUIRED_UPDATE_BINARY)).unwrap(),
@@ -1064,7 +1073,11 @@ mod tests {
         let install = temp.path().join("install");
         fs::create_dir(&source).unwrap();
         fs::create_dir(&install).unwrap();
-        fs::write(install.join(REQUIRED_UPDATE_BINARY), b"working installation").unwrap();
+        fs::write(
+            install.join(REQUIRED_UPDATE_BINARY),
+            b"working installation",
+        )
+        .unwrap();
         assert!(stage_and_replace(&source, &install).is_err());
         assert_eq!(
             fs::read(install.join(REQUIRED_UPDATE_BINARY)).unwrap(),
@@ -1138,7 +1151,10 @@ mod tests {
             fs::write(install.join("rchd"), b"old daemon").unwrap();
             create_tar_gz_with_entries(
                 &archive,
-                &[("rch", &version_payload("rch", "9.1.2")), ("rchd", companion)],
+                &[
+                    ("rch", &version_payload("rch", "9.1.2")),
+                    ("rchd", companion),
+                ],
             )
             .unwrap();
             let result = prepare_release(
@@ -1167,21 +1183,30 @@ mod tests {
         let install = temp.path().join("install");
         fs::create_dir(&install).unwrap();
         fs::write(install.join("rch"), b"old client").unwrap();
-        create_tar_gz_with_entries(&archive, &[("rch", &version_payload("rch", "9.1.2"))])
-            .unwrap();
+        create_tar_gz_with_entries(&archive, &[("rch", &version_payload("rch", "9.1.2"))]).unwrap();
         // An actually absent companion is supported, as before.
         drop(
-            prepare_release(&archive, &install, "9.1.2", std::time::Duration::from_secs(1))
-                .await
-                .unwrap(),
+            prepare_release(
+                &archive,
+                &install,
+                "9.1.2",
+                std::time::Duration::from_secs(1),
+            )
+            .await
+            .unwrap(),
         );
         let companion = install.join("rchd");
         fs::write(&companion, version_payload("rchd", "9.1.1")).unwrap();
         set_update_binary_permissions(&companion).unwrap();
         assert!(
-            prepare_release(&archive, &install, "9.1.2", std::time::Duration::from_secs(1))
-                .await
-                .is_err()
+            prepare_release(
+                &archive,
+                &install,
+                "9.1.2",
+                std::time::Duration::from_secs(1)
+            )
+            .await
+            .is_err()
         );
         assert_eq!(fs::read(install.join("rch")).unwrap(), b"old client");
         fs::write(&companion, version_payload("rchd", "9.1.2")).unwrap();

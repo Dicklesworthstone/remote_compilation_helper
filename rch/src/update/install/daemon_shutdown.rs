@@ -209,7 +209,9 @@ fn launcher_status(
     if let Some(status) = status
         && !status.success()
     {
-        return Err(format!("installed daemon launcher exited {status}; restart failed"));
+        return Err(format!(
+            "installed daemon launcher exited {status}; restart failed"
+        ));
     }
     Ok(status)
 }
@@ -291,7 +293,9 @@ async fn start_with_timing(
                         let exited = launcher_status(&mut child)?;
                         match launched_pid {
                             Some(pid) if pid == peer && exited.is_some() => {
-                                return Err("daemon exited after replying; restart failed".to_owned());
+                                return Err(
+                                    "daemon exited after replying; restart failed".to_owned()
+                                );
                             }
                             Some(pid) if pid != peer && exited.is_none() => {
                                 last_error =

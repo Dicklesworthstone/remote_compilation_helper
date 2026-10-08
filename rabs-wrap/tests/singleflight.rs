@@ -29,17 +29,23 @@ fn send(peer: &mut BufReader<UnixStream>, value: Value) {
 }
 
 fn wait(peer: &mut BufReader<UnixStream>) {
-    send(peer, json!({
-        "kind": "rustc-decision", "decision": "wait", "action_key": "key",
-        "compiler_skip_authorized": false, "materialization_started": false,
-    }));
+    send(
+        peer,
+        json!({
+            "kind": "rustc-decision", "decision": "wait", "action_key": "key",
+            "compiler_skip_authorized": false, "materialization_started": false,
+        }),
+    );
 }
 
 fn hit(peer: &mut BufReader<UnixStream>) {
-    send(peer, json!({
-        "kind": "rustc-decision", "decision": "hit", "action_key": "key",
-        "compiler_skip_authorized": false,
-    }));
+    send(
+        peer,
+        json!({
+            "kind": "rustc-decision", "decision": "hit", "action_key": "key",
+            "compiler_skip_authorized": false,
+        }),
+    );
     let accept: Value = serde_json::from_str(&read(peer).unwrap()).unwrap();
     assert_eq!(accept["kind"], "rustc-accept");
 }
@@ -54,15 +60,24 @@ impl Fixture {
         let socket = root.path().join("edge.sock");
         let compiler = root.path().join("rustc");
         let marker = root.path().join("compiler-runs");
-        std::fs::write(&compiler, concat!(
-            "#!/bin/sh\n",
-            "printf 'run\\n' >> \"$RABS_TEST_MARKER\"\n",
-            "printf '%s\\n' \"$MODE_TOKEN\"\n",
-            "printf 'compiler stderr\\n' >&2\n",
-            "exit 7\n",
-        )).unwrap();
+        std::fs::write(
+            &compiler,
+            concat!(
+                "#!/bin/sh\n",
+                "printf 'run\\n' >> \"$RABS_TEST_MARKER\"\n",
+                "printf '%s\\n' \"$MODE_TOKEN\"\n",
+                "printf 'compiler stderr\\n' >&2\n",
+                "exit 7\n",
+            ),
+        )
+        .unwrap();
         std::fs::set_permissions(&compiler, std::fs::Permissions::from_mode(0o755)).unwrap();
-        Self { root, socket, compiler, marker }
+        Self {
+            root,
+            socket,
+            compiler,
+            marker,
+        }
     }
 
     fn daemon(
@@ -85,12 +100,19 @@ impl Fixture {
                     Err(error) => panic!("accept: {error}"),
                 }
             };
-            stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-            stream.set_write_timeout(Some(Duration::from_secs(10))).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
             let mut peer = BufReader::new(stream);
             let hello: Value = serde_json::from_str(&read(&mut peer).unwrap()).unwrap();
             assert_eq!(hello["kind"], "hello");
-            send(&mut peer, json!({"kind":"hello-ok", "transport":1, "application":1}));
+            send(
+                &mut peer,
+                json!({"kind":"hello-ok", "transport":1, "application":1}),
+            );
             let original = read(&mut peer).unwrap();
             let request: Value = serde_json::from_str(&original).unwrap();
             assert_eq!(request["kind"], "rustc-request");
@@ -134,15 +156,22 @@ fn follower_reuses_a_completed_result_without_running_its_compiler() {
     let daemon = fixture.daemon(move |peer, original, marker| {
         for _ in 0..2 {
             wait(peer);
-            assert_eq!(read(peer).as_deref(), Some(original), "retry exact request bytes");
+            assert_eq!(
+                read(peer).as_deref(),
+                Some(original),
+                "retry exact request bytes"
+            );
             assert!(!marker.exists(), "waiting is not permission to compile");
         }
         hit(peer);
         assert!(!marker.exists());
-        send(peer, json!({
-            "kind":"rustc-decision", "decision":"served", "action_key":"key",
-            "compiler_skip_authorized":true, "stderr_hex":hex(transcript),
-        }));
+        send(
+            peer,
+            json!({
+                "kind":"rustc-decision", "decision":"served", "action_key":"key",
+                "compiler_skip_authorized":true, "stderr_hex":hex(transcript),
+            }),
+        );
     });
     let output = fixture.run(5000);
     daemon.join().unwrap();
@@ -185,7 +214,10 @@ fn disabled_waiting_falls_back_without_acceptance_or_breaker_failure() {
     let fixture = Fixture::new();
     let daemon = fixture.daemon(|peer, _, _| {
         wait(peer);
-        assert!(read(peer).is_none(), "no retry or acceptance when the wait budget is zero");
+        assert!(
+            read(peer).is_none(),
+            "no retry or acceptance when the wait budget is zero"
+        );
     });
     let output = fixture.run(0);
     daemon.join().unwrap();
@@ -233,12 +265,18 @@ fn changed_action_identity_is_never_accepted_or_executed_as_the_followed_flight(
         let daemon = fixture.daemon(move |peer, original, _| {
             wait(peer);
             assert_eq!(read(peer).as_deref(), Some(original));
-            send(peer, json!({
-                "kind":"rustc-decision", "decision":decision, "action_key":"different",
-                "compiler_skip_authorized":false, "materialization_started":false,
-                "attempt":"unexpected", "env":[],
-            }));
-            assert!(read(peer).is_none(), "a different flight cannot receive acceptance");
+            send(
+                peer,
+                json!({
+                    "kind":"rustc-decision", "decision":decision, "action_key":"different",
+                    "compiler_skip_authorized":false, "materialization_started":false,
+                    "attempt":"unexpected", "env":[],
+                }),
+            );
+            assert!(
+                read(peer).is_none(),
+                "a different flight cannot receive acceptance"
+            );
         });
         let output = fixture.run(5000);
         daemon.join().unwrap();
@@ -261,5 +299,8 @@ fn follower_remains_fail_closed_after_accepting_a_hit() {
     assert_eq!(output.status.code(), Some(1));
     assert!(output.stdout.is_empty());
     assert!(String::from_utf8_lossy(&output.stderr).contains("refusing to run rustc"));
-    assert!(!fixture.marker.exists(), "ambiguous install cannot run a second compiler");
+    assert!(
+        !fixture.marker.exists(),
+        "ambiguous install cannot run a second compiler"
+    );
 }

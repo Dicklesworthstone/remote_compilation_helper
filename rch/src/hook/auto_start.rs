@@ -463,20 +463,16 @@ pub(super) async fn try_auto_start_daemon(
     config: &SelfHealingConfig,
     socket_path: &Path,
 ) -> Result<PathBuf, AutoStartError> {
-    discovery::recover_daemon(
-        config,
-        socket_path,
-        |socket| {
-            let rchd_path = which_rchd_path().ok_or(AutoStartError::BinaryNotFound)?;
-            info!(
-                target: "rch::hook::auto_start",
-                binary = %rchd_path.display(),
-                socket = %socket.display(),
-                "Spawning rchd"
-            );
-            spawn_rchd(&rchd_path, socket)
-        },
-    )
+    discovery::recover_daemon(config, socket_path, |socket| {
+        let rchd_path = which_rchd_path().ok_or(AutoStartError::BinaryNotFound)?;
+        info!(
+            target: "rch::hook::auto_start",
+            binary = %rchd_path.display(),
+            socket = %socket.display(),
+            "Spawning rchd"
+        );
+        spawn_rchd(&rchd_path, socket)
+    })
     .await
 }
 

@@ -605,11 +605,7 @@ impl LiveDependencyLane {
         self.coord
             .submit_action(submission, join, now_micros(), 0)
             .map_err(refusal)?;
-        let Some(serial) = self
-            .coord
-            .claim_submitted_dispatch(&key)
-            .map_err(refusal)?
-        else {
+        let Some(serial) = self.coord.claim_submitted_dispatch(&key).map_err(refusal)? else {
             // The atomic dispatch claim, not the optimistic lookup above,
             // arbitrates concurrent requests. Losing it means wait, not a
             // second unobserved compiler run in another subscriber's tree.

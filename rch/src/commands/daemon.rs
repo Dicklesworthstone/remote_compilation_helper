@@ -585,7 +585,10 @@ fn parse_shutdown_response(response: &str) -> Result<ShutdownApiResponse> {
     let shutdown: ShutdownApiResponse =
         serde_json::from_str(body).context("shutdown response was malformed")?;
     anyhow::ensure!(
-        matches!(shutdown.status.as_str(), "shutting_down" | "shutdown_blocked"),
+        matches!(
+            shutdown.status.as_str(),
+            "shutting_down" | "shutdown_blocked"
+        ),
         "unrecognized shutdown state: {}",
         shutdown.status
     );
@@ -1642,9 +1645,11 @@ mod tests {
             );
         }
         assert_eq!(
-            parse_shutdown_response("HTTP/1.1 200 OK\r\n\r\n{\"status\":\"shutdown_blocked\",\"active_build_ids\":[7]}")
-                .unwrap()
-                .active_build_ids,
+            parse_shutdown_response(
+                "HTTP/1.1 200 OK\r\n\r\n{\"status\":\"shutdown_blocked\",\"active_build_ids\":[7]}"
+            )
+            .unwrap()
+            .active_build_ids,
             vec![7]
         );
     }

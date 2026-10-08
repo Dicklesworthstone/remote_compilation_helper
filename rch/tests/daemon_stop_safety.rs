@@ -60,7 +60,10 @@ impl Daemon {
                     .set_write_timeout(Some(Duration::from_secs(2)))
                     .unwrap();
                 let mut request = String::new();
-                (&mut stream).take(8192).read_to_string(&mut request).unwrap();
+                (&mut stream)
+                    .take(8192)
+                    .read_to_string(&mut request)
+                    .unwrap();
                 let request = request.trim().to_owned();
                 seen.lock().unwrap().push(request.clone());
                 if matches!(reply, Reply::LostAdmission) {
@@ -180,13 +183,7 @@ fn run_cli(root: &Path, socket: &Path, action: &str, json_output: bool, flags: &
     child.wait_with_output().unwrap()
 }
 
-fn assert_refused(
-    root: &Path,
-    socket: &Path,
-    before: (u64, u64),
-    output: &Output,
-    machine: bool,
-) {
+fn assert_refused(root: &Path, socket: &Path, before: (u64, u64), output: &Output, machine: bool) {
     assert_eq!(output.status.code(), Some(1), "{output:?}");
     let metadata = std::fs::symlink_metadata(socket).expect("original endpoint must be retained");
     assert_eq!((metadata.dev(), metadata.ino()), before);
@@ -195,7 +192,8 @@ fn assert_refused(
         "kill or daemon start was attempted"
     );
     if machine {
-        let response: Value = serde_json::from_slice(&output.stdout).expect("one JSON error response");
+        let response: Value =
+            serde_json::from_slice(&output.stdout).expect("one JSON error response");
         assert_eq!(response["success"], false, "{response}");
         assert!(response.to_string().contains("unconfirmed"), "{response}");
     } else {
@@ -220,7 +218,10 @@ fn stop_lost_admission_never_kills_or_unlinks_even_with_force() {
             &output,
             machine,
         );
-        assert_eq!(*daemon.requests.lock().unwrap(), ["POST /restart-admission"]);
+        assert_eq!(
+            *daemon.requests.lock().unwrap(),
+            ["POST /restart-admission"]
+        );
     }
 }
 

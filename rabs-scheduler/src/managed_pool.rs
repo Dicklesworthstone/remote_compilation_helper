@@ -519,7 +519,16 @@ mod tests {
 
     #[test]
     fn rollback_matches_quotient_remainder_oracle_over_u64_extremes() {
-        let values = [0, 1, 999, 1_000, 1_151, u64::MAX / 2, u64::MAX - 1, u64::MAX];
+        let values = [
+            0,
+            1,
+            999,
+            1_000,
+            1_151,
+            u64::MAX / 2,
+            u64::MAX - 1,
+            u64::MAX,
+        ];
         for baseline in values {
             for tail in values {
                 let mut c = PoolController::new(true, 8, baseline);

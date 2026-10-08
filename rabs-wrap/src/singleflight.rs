@@ -9,8 +9,7 @@
 
 use super::reply_json::{self, Value};
 use super::{
-    ConsultStream, Live, MAX_LIVE_REPLY_BYTES, consult_succeeded, live_outcome,
-    read_reply_bounded,
+    ConsultStream, Live, MAX_LIVE_REPLY_BYTES, consult_succeeded, live_outcome, read_reply_bounded,
 };
 use std::io::{BufReader, Write};
 use std::time::{Duration, Instant};
@@ -61,8 +60,14 @@ pub(super) fn read_decision(
 }
 
 fn wait_key(reply: &Value) -> Option<&str> {
-    if reply.get("compiler_skip_authorized").and_then(Value::as_bool) != Some(false)
-        || reply.get("materialization_started").and_then(Value::as_bool) != Some(false)
+    if reply
+        .get("compiler_skip_authorized")
+        .and_then(Value::as_bool)
+        != Some(false)
+        || reply
+            .get("materialization_started")
+            .and_then(Value::as_bool)
+            != Some(false)
         || reply.get("attempt").is_some()
         || reply.get("env").is_some()
     {
@@ -190,12 +195,21 @@ mod tests {
         });
         assert!(matches!(
             read_with_policy(
-                reader(stream), "original bytes", Duration::from_secs(1), true, policy(3)
+                reader(stream),
+                "original bytes",
+                Duration::from_secs(1),
+                true,
+                policy(3)
             ),
             Ok(Live::PassThrough)
         ));
         assert_eq!(daemon.join().unwrap(), 3);
-        assert!(MAX_RETRIES + 1 < 64, "leave room below the edge request quota");
+        const {
+            assert!(
+                MAX_RETRIES + 1 < 64,
+                "leave room below the edge request quota"
+            );
+        }
     }
 
     #[test]
@@ -206,7 +220,11 @@ mod tests {
         settings.budget = Duration::ZERO;
         assert!(matches!(
             read_with_policy(
-                reader(stream), "original", Duration::from_secs(1), true, settings
+                reader(stream),
+                "original",
+                Duration::from_secs(1),
+                true,
+                settings
             ),
             Ok(Live::PassThrough)
         ));
@@ -217,17 +235,51 @@ mod tests {
     fn malformed_authority_or_unnegotiated_waits_are_not_followed() {
         for (line, negotiated) in [
             (WAIT.to_owned(), false),
-            (WAIT.replace("\"compiler_skip_authorized\":false", "\"compiler_skip_authorized\":true"), true),
-            (WAIT.replace("\"materialization_started\":false", "\"materialization_started\":true"), true),
-            (WAIT.replace("\"action_key\":\"key\"", "\"action_key\":\"\""), true),
-            (WAIT.replace("\"action_key\":\"key\"", "\"action_key\":\"key\",\"action_key\":\"other\""), true),
-            (WAIT.replace("\"materialization_started\":false", "\"attempt\":\"admitted\""), true),
+            (
+                WAIT.replace(
+                    "\"compiler_skip_authorized\":false",
+                    "\"compiler_skip_authorized\":true",
+                ),
+                true,
+            ),
+            (
+                WAIT.replace(
+                    "\"materialization_started\":false",
+                    "\"materialization_started\":true",
+                ),
+                true,
+            ),
+            (
+                WAIT.replace("\"action_key\":\"key\"", "\"action_key\":\"\""),
+                true,
+            ),
+            (
+                WAIT.replace(
+                    "\"action_key\":\"key\"",
+                    "\"action_key\":\"key\",\"action_key\":\"other\"",
+                ),
+                true,
+            ),
+            (
+                WAIT.replace(
+                    "\"materialization_started\":false",
+                    "\"attempt\":\"admitted\"",
+                ),
+                true,
+            ),
         ] {
             let (stream, mut peer) = UnixStream::pair().unwrap();
             peer.write_all(line.as_bytes()).unwrap();
-            assert!(read_with_policy(
-                reader(stream), "original", Duration::from_secs(1), negotiated, policy(3)
-            ).is_err());
+            assert!(
+                read_with_policy(
+                    reader(stream),
+                    "original",
+                    Duration::from_secs(1),
+                    negotiated,
+                    policy(3)
+                )
+                .is_err()
+            );
             assert_eq!(peer.read(&mut [0; 1]).unwrap(), 0);
         }
     }
@@ -254,9 +306,16 @@ mod tests {
         let mut settings = policy(60);
         settings.budget = Duration::from_millis(100);
         let outcome = read_with_policy(
-            reader(stream), "original", Duration::from_secs(10), true, settings
+            reader(stream),
+            "original",
+            Duration::from_secs(10),
+            true,
+            settings,
         );
         assert!(outcome.is_err());
-        assert!(daemon.join().unwrap(), "follower must close before the trickle ends");
+        assert!(
+            daemon.join().unwrap(),
+            "follower must close before the trickle ends"
+        );
     }
 }

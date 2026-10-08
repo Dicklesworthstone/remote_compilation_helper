@@ -23,7 +23,10 @@ impl Drop for Owned {
 fn until(mut predicate: impl FnMut() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(10);
     while !predicate() {
-        assert!(Instant::now() < deadline, "subprocess condition did not settle");
+        assert!(
+            Instant::now() < deadline,
+            "subprocess condition did not settle"
+        );
         std::thread::sleep(Duration::from_millis(10));
     }
 }
@@ -33,7 +36,8 @@ fn stopped(pid: u32) -> bool {
         Ok(bytes) => {
             let tail = &bytes[bytes.iter().rposition(|byte| *byte == b')').unwrap() + 1..];
             matches!(
-                tail.split(u8::is_ascii_whitespace).find(|part| !part.is_empty()),
+                tail.split(u8::is_ascii_whitespace)
+                    .find(|part| !part.is_empty()),
                 Some(b"Z" | b"X" | b"x")
             )
         }
@@ -53,14 +57,20 @@ fn wait(child: &mut Owned) -> ExitStatus {
 fn group_stopped(pids: &[u32]) {
     let deadline = Instant::now() + Duration::from_secs(2);
     while pids.iter().any(|pid| !stopped(*pid)) {
-        assert!(Instant::now() < deadline, "owned processes survived cancellation: {pids:?}");
+        assert!(
+            Instant::now() < deadline,
+            "owned processes survived cancellation: {pids:?}"
+        );
         std::thread::sleep(Duration::from_millis(10));
     }
 }
 
 fn no_success(completion: Option<Value>) {
     if let Some(completion) = completion {
-        assert_ne!(completion["exit_code"], 0, "cancelled execution reported success");
+        assert_ne!(
+            completion["exit_code"], 0,
+            "cancelled execution reported success"
+        );
     }
 }
 
@@ -109,8 +119,12 @@ impl Fixture {
                 Err(error) => panic!("accept: {error}"),
             });
             let mut writer = connection.unwrap();
-            writer.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-            writer.set_write_timeout(Some(Duration::from_secs(10))).unwrap();
+            writer
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            writer
+                .set_write_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
             let mut reader = BufReader::new(writer.try_clone().unwrap());
             let mut line = String::new();
             reader.read_line(&mut line).unwrap();
@@ -170,7 +184,11 @@ impl Fixture {
             ])
             .arg(wrapped.get_program())
             .args(wrapped.get_args())
-            .envs(wrapped.get_envs().filter_map(|(key, value)| value.map(|value| (key, value))))
+            .envs(
+                wrapped
+                    .get_envs()
+                    .filter_map(|(key, value)| value.map(|value| (key, value))),
+            )
             .current_dir(self.root.path())
             .process_group(0)
             .stdin(Stdio::null())
@@ -194,7 +212,9 @@ impl Fixture {
 
 #[test]
 fn supervised_execution_preserves_stdin_environment_streams_and_exit_code() {
-    let fixture = Fixture::new("IFS= read -r line\nprintf '%s:%s:%s' \"$EXACT\" \"$line\" \"${NOT_ADMITTED-unset}\"\nprintf 'diagnostic\\n' >&2\nexit 7");
+    let fixture = Fixture::new(
+        "IFS= read -r line\nprintf '%s:%s:%s' \"$EXACT\" \"$line\" \"${NOT_ADMITTED-unset}\"\nprintf 'diagnostic\\n' >&2\nexit 7",
+    );
     let daemon = fixture.daemon();
     let stdout_path = fixture.root.path().join("stdout");
     let stderr_path = fixture.root.path().join("stderr");
@@ -204,9 +224,18 @@ fn supervised_execution_preserves_stdin_environment_streams_and_exit_code() {
         .stdout(std::fs::File::create(&stdout_path).unwrap())
         .stderr(std::fs::File::create(&stderr_path).unwrap());
     let mut child = Owned(command.spawn().unwrap());
-    child.0.stdin.take().unwrap().write_all(b"input bytes\n").unwrap();
+    child
+        .0
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"input bytes\n")
+        .unwrap();
     assert_eq!(wait(&mut child).code(), Some(7));
-    assert_eq!(std::fs::read(stdout_path).unwrap(), b"admitted value:input bytes:unset");
+    assert_eq!(
+        std::fs::read(stdout_path).unwrap(),
+        b"admitted value:input bytes:unset"
+    );
     assert_eq!(std::fs::read(stderr_path).unwrap(), b"diagnostic\n");
     let completion = daemon.join().unwrap().unwrap();
     assert_eq!(completion["attempt"], "supervised-attempt");
@@ -255,7 +284,9 @@ fn wrapper_death_stops_compiler_and_descendant_without_touching_other_jobs() {
 
 #[test]
 fn normal_exit_cleans_background_descendants_before_completion() {
-    let fixture = Fixture::new("(/bin/sleep 3; printf 'late' > late-output) &\nprintf '%s\\n' \"$!\" > descendant.pid\nexit 0");
+    let fixture = Fixture::new(
+        "(/bin/sleep 3; printf 'late' > late-output) &\nprintf '%s\\n' \"$!\" > descendant.pid\nexit 0",
+    );
     let daemon = fixture.daemon();
     let mut child = Owned(fixture.command().spawn().unwrap());
     let descendant = fixture.pid("descendant.pid");
@@ -276,7 +307,14 @@ fn forged_guard_owner_never_starts_a_compiler() {
     let fixture = Fixture::new("exit 0");
     let mut command = Command::new(env!("CARGO_BIN_EXE_rabs-wrap"));
     command
-        .args(["--rabs-internal-compiler-guard-v1", "1", "1", "1", "1", "--"])
+        .args([
+            "--rabs-internal-compiler-guard-v1",
+            "1",
+            "1",
+            "1",
+            "1",
+            "--",
+        ])
         .arg(&fixture.compiler)
         .current_dir(fixture.root.path())
         .stdin(Stdio::null())

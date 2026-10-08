@@ -348,16 +348,21 @@ fn decision_reply(decision: LiveDecision, key_text: &str, wait_for_inflight: boo
             // Reply releases the blocking lane immediately. No waiter task,
             // actor, or output ownership is retained: the existing connection
             // quota bounds retries, and every retry passes through decide.
-            Decided::Reply(json!({
-                "kind": "rustc-decision", "decision": "wait",
-                "action_key": key_text, "reason": "in-flight",
-                "compiler_skip_authorized": false, "materialization_started": false,
-            }).to_string())
+            Decided::Reply(
+                json!({
+                    "kind": "rustc-decision", "decision": "wait",
+                    "action_key": key_text, "reason": "in-flight",
+                    "compiler_skip_authorized": false, "materialization_started": false,
+                })
+                .to_string(),
+            )
         }
         LiveDecision::InFlight => {
             // Older wrappers do not understand wait. Keep their old healthy
             // pass-through behavior instead of tripping their circuit breaker.
-            Decided::Reply(pass_through("in-flight: another subscriber is executing this action"))
+            Decided::Reply(pass_through(
+                "in-flight: another subscriber is executing this action",
+            ))
         }
         LiveDecision::PassThrough(reason) => {
             log("pass-through", &[("key", key_text), ("reason", &reason)]);

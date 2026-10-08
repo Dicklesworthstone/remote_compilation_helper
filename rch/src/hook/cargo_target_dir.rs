@@ -1199,8 +1199,7 @@ mod managed_build_dir_tests {
             "verification must execute the build script from the extracted archive"
         );
 
-        let plan =
-            super::ManagedCargoCommand::new(command, Some(pool.to_str().unwrap())).unwrap();
+        let plan = super::ManagedCargoCommand::new(command, Some(pool.to_str().unwrap())).unwrap();
         let patterns = get_custom_target_artifact_patterns(
             Some(rch_common::CompilationKind::CargoBuild),
             Some(plan.policy_command()),
@@ -1381,7 +1380,10 @@ mod managed_build_dir_tests {
             .into_iter()
             .map(PathBuf::from),
         );
-        for command in ["cargo package --offline", "cargo publish --dry-run --locked"] {
+        for command in [
+            "cargo package --offline",
+            "cargo publish --dry-run --locked",
+        ] {
             for target in [None, Some("/worker/managed pool")] {
                 let plan = super::ManagedCargoCommand::new(command, target).unwrap();
                 let stamped =

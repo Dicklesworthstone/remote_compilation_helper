@@ -238,8 +238,8 @@ async fn recover_default_with_paths(
     let cooldown_path = state_dir.join("startup.cooldown");
     let recovery = async {
         loop {
-            let effective = candidates_with_record(candidates, state_dir, uid)
-                .map_err(AutoStartError::Io)?;
+            let effective =
+                candidates_with_record(candidates, state_dir, uid).map_err(AutoStartError::Io)?;
             // A healthy daemon can be reused even while another starter owns
             // the gate or its cooldown is active.
             if let Discovery::Healthy(path) = discover(&effective, uid).await {
@@ -262,8 +262,8 @@ async fn recover_default_with_paths(
             };
             // Re-read after acquiring ownership: another context may have
             // published an endpoint that was absent from our original list.
-            let effective = candidates_with_record(candidates, state_dir, uid)
-                .map_err(AutoStartError::Io)?;
+            let effective =
+                candidates_with_record(candidates, state_dir, uid).map_err(AutoStartError::Io)?;
             match discover(&effective, uid).await {
                 Discovery::Healthy(path) => {
                     remember_endpoint(state_dir, &path).map_err(AutoStartError::Io)?;
@@ -448,7 +448,10 @@ mod tests {
                 42,
                 false,
             ),
-            [PathBuf::from("/configured.sock"), PathBuf::from("/tmp/rch.sock")]
+            [
+                PathBuf::from("/configured.sock"),
+                PathBuf::from("/tmp/rch.sock")
+            ]
         );
     }
 
@@ -618,12 +621,8 @@ mod tests {
             Ok(())
         };
         let (left, right) = tokio::join!(
-            recover_default_with_paths(
-                &config, &first, &first_candidates, &state, uid, launch,
-            ),
-            recover_default_with_paths(
-                &config, &second, &second_candidates, &state, uid, launch,
-            ),
+            recover_default_with_paths(&config, &first, &first_candidates, &state, uid, launch,),
+            recover_default_with_paths(&config, &second, &second_candidates, &state, uid, launch,),
         );
         assert_eq!(left.unwrap(), right.unwrap());
         assert_eq!(launches.load(Ordering::SeqCst), 1);
@@ -638,19 +637,13 @@ mod tests {
         let mut config = config();
         config.hook_starts_daemon = false;
         assert!(matches!(
-            recover_default_with_paths(
-                &config, &socket, &[], &state, uid, no_launch,
-            )
-            .await,
+            recover_default_with_paths(&config, &socket, &[], &state, uid, no_launch,).await,
             Err(AutoStartError::Disabled)
         ));
         config.hook_starts_daemon = true;
         config.auto_start_timeout_secs = 0;
         assert!(matches!(
-            recover_default_with_paths(
-                &config, &socket, &[], &state, uid, no_launch,
-            )
-            .await,
+            recover_default_with_paths(&config, &socket, &[], &state, uid, no_launch,).await,
             Err(AutoStartError::Timeout(0))
         ));
         assert!(!state.exists());
@@ -712,12 +705,8 @@ mod tests {
             Ok(())
         };
         let (left, right) = tokio::join!(
-            recover_default_with_paths(
-                &config, &first, &first_candidates, &state, uid, launch,
-            ),
-            recover_default_with_paths(
-                &config, &second, &second_candidates, &state, uid, launch,
-            ),
+            recover_default_with_paths(&config, &first, &first_candidates, &state, uid, launch,),
+            recover_default_with_paths(&config, &second, &second_candidates, &state, uid, launch,),
         );
         let endpoint = left.unwrap();
         assert_eq!(right.unwrap(), endpoint);
@@ -807,7 +796,12 @@ mod tests {
 
     #[test]
     fn endpoint_record_parser_rejects_ambiguous_or_oversized_paths() {
-        for invalid in [&b""[..], &b"relative"[..], &b"/tmp/\0bad"[..], &b"/tmp/\xff"[..]] {
+        for invalid in [
+            &b""[..],
+            &b"relative"[..],
+            &b"/tmp/\0bad"[..],
+            &b"/tmp/\xff"[..],
+        ] {
             assert!(parse_endpoint_record(invalid).is_err());
         }
         let oversized = format!("/{}", "x".repeat(ENDPOINT_RECORD_LIMIT as usize));

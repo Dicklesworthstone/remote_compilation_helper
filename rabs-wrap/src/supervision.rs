@@ -128,7 +128,9 @@ impl Owner {
         // An already-lost caller is cancellation, NOT a setup failure granting
         // direct-exec fallback. Retain an invalid binding so spawn refuses to
         // execute even if the wrapper has acquired a new parent meanwhile.
-        let caller = read_stat(stat.parent).ok().filter(|caller| !caller.exited());
+        let caller = read_stat(stat.parent)
+            .ok()
+            .filter(|caller| !caller.exited());
         Ok(Self {
             pid: stat.pid,
             start: stat.start,
@@ -194,13 +196,10 @@ fn kill_program() -> io::Result<&'static str> {
     ["/bin/kill", "/usr/bin/kill"]
         .into_iter()
         .find(|path| {
-            std::fs::metadata(path).is_ok_and(|meta| {
-                meta.is_file() && meta.permissions().mode() & 0o111 != 0
-            })
+            std::fs::metadata(path)
+                .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
         })
-        .ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, "system kill utility unavailable")
-        })
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "system kill utility unavailable"))
 }
 
 /// Called before the public wrapper argument decoder. All arguments after --
@@ -212,7 +211,10 @@ pub(super) fn run_if_guard() {
     }
     let result = (|| -> io::Result<ExitStatus> {
         let invalid = || {
-            io::Error::new(io::ErrorKind::InvalidInput, "invalid compiler guard request")
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid compiler guard request",
+            )
         };
         let owner = Owner {
             pid: args
@@ -266,9 +268,7 @@ pub(super) fn run_if_guard() {
         loop {
             let stat = read_stat(owned.child.id())?;
             if stat.parent != own.pid || stat.group != owned.child.id() {
-                return Err(io::Error::other(
-                    "compiler escaped its owned process group",
-                ));
+                return Err(io::Error::other("compiler escaped its owned process group"));
             }
             if !owner.alive() {
                 owned.finish()?;
