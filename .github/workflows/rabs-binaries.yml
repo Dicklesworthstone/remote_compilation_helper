@@ -72,6 +72,8 @@ jobs:
         run: |
           cargo test --release -p rabsd --test live_replay --locked
           cargo test --release -p rabs-wrap --test live_dependency_e2e --locked
+      - name: Real Cargo worktrees receive served dependencies (M4)
+        run: cargo test --release -p rabs-wrap --test live_cargo_worktrees --locked -- --nocapture
       - name: Doctor + wrapper overhead gate (release, enforcing)
         run: |
           cargo test --release -p rabsd --test doctor_live
