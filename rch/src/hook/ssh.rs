@@ -1197,6 +1197,9 @@ async fn run_offload_ssh_command_with_optional_stdin(
     let mut cmd = Command::new("ssh");
     cmd.arg("-o").arg("BatchMode=yes");
     cmd.arg("-o").arg("StrictHostKeyChecking=accept-new");
+    // The per-file verifier after the rsync barrier also requires clean stderr.
+    // Change only client INFO logging; preserve remote stderr and auth failures.
+    crate::transfer::source_content_barrier::configure_ssh_command(cmd.as_std_mut());
     cmd.arg("-o").arg(format!(
         "ConnectTimeout={}",
         timeout_duration.as_secs().max(1)

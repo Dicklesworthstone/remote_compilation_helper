@@ -3,6 +3,8 @@
 //! Handles synchronizing project files to remote workers, executing compilation
 //! commands, and retrieving build artifacts.
 
+pub(crate) mod source_content_barrier;
+
 use crate::error::TransferError;
 use anyhow::{Context, Result};
 use glob::Pattern;
@@ -3565,7 +3567,9 @@ impl TransferPipeline {
         let escaped_remote_path = escape(Cow::from(&remote_path));
         let destination = self.rsync_remote_spec(worker, &remote_path);
         let identity_file = shellexpand::tilde(&worker.identity_file);
-        let ssh_command = self.build_rsync_ssh_command(identity_file.as_ref());
+        let ssh_command = source_content_barrier::ssh_command(
+            &self.build_rsync_ssh_command(identity_file.as_ref()),
+        );
 
         let (mut cmd, capabilities) = self.rsync_command();
         cmd.arg("-azn")
@@ -3608,44 +3612,7 @@ impl TransferPipeline {
             self.source_sync_attempt_timeout(&effective_excludes),
         )
         .await?;
-        if !output.status.success() {
-            anyhow::bail!(
-                "source-content rsync barrier failed (exit {:?}): {}",
-                output.status.code(),
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
-        if !output.stderr.is_empty() {
-            anyhow::bail!(
-                "source-content rsync barrier produced stderr: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
-        let stdout = std::str::from_utf8(&output.stdout)
-            .context("source-content rsync barrier output was not UTF-8")?;
-        let changed = stdout
-            .lines()
-            .filter(|line| !line.is_empty())
-            .filter(|line| {
-                !line
-                    .split_once('\t')
-                    .is_some_and(|(itemized, _)| itemized.as_bytes().get(1) == Some(&b'd'))
-            })
-            .collect::<Vec<_>>();
-        if !changed.is_empty() {
-            let preview = changed
-                .iter()
-                .take(8)
-                .copied()
-                .collect::<Vec<_>>()
-                .join(" | ");
-            anyhow::bail!(
-                "source-content rsync barrier detected {} remote delta(s): {}",
-                changed.len(),
-                preview
-            );
-        }
-        Ok(())
+        source_content_barrier::verify_output(&output).map_err(anyhow::Error::msg)
     }
 
     /// Belt-and-suspenders source-integrity guard for retrieval (RCH bug
@@ -11150,6 +11117,33 @@ Number of files transferred: 42
     // =========================================================================
     // rsync flavour argv (issue #66)
     // =========================================================================
+
+    #[test]
+    fn source_content_barrier_changes_only_ssh_log_verbosity() {
+        let _guard = test_guard!();
+        let worker = flavour_test_worker();
+        let pipeline = flavour_test_pipeline(RsyncFlavor::Unknown, 0);
+        let remote = pipeline.remote_path();
+        let destination = pipeline.rsync_remote_spec(&worker, &remote);
+        let escaped = escape(Cow::from(remote.as_str()));
+        let upload =
+            command_args(&pipeline.build_sync_command(&worker, &destination, &escaped, &[]));
+        let barrier =
+            command_args(&pipeline.build_source_content_rsync_barrier_command(&worker, &[]));
+        let ssh = |args: &[String]| {
+            args.windows(2)
+                .find(|pair| pair[0] == "-e")
+                .expect("SSH transport")[1]
+                .clone()
+        };
+        let ordinary = ssh(&upload);
+        assert_eq!(ssh(&barrier), format!("{ordinary} -o LogLevel=ERROR"));
+        assert!(ordinary.contains("StrictHostKeyChecking=accept-new"));
+        assert!(ordinary.contains("BatchMode=yes"));
+        assert!(!ordinary.contains("LogLevel"));
+        assert!(barrier.contains(&"--checksum".to_owned()));
+        assert!(barrier.contains(&"-azn".to_owned()));
+    }
 
     #[test]
     fn rsync_remote_paths_cover_upload_barrier_estimate_and_retrieval() {
