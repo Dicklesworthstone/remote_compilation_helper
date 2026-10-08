@@ -6,9 +6,10 @@ use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
-use std::os::unix::process::ExitStatusExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 struct Owned(Child);
@@ -49,6 +50,20 @@ fn wait(child: &mut Owned) -> ExitStatus {
     status.unwrap()
 }
 
+fn group_stopped(pids: &[u32]) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while pids.iter().any(|pid| !stopped(*pid)) {
+        assert!(Instant::now() < deadline, "owned processes survived cancellation: {pids:?}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn no_success(completion: Option<Value>) {
+    if let Some(completion) = completion {
+        assert_ne!(completion["exit_code"], 0, "cancelled execution reported success");
+    }
+}
+
 struct Fixture {
     root: tempfile::TempDir,
     socket: PathBuf,
@@ -74,6 +89,13 @@ impl Fixture {
     }
 
     fn daemon(&self) -> std::thread::JoinHandle<Option<Value>> {
+        self.daemon_paused(None)
+    }
+
+    fn daemon_paused(
+        &self,
+        pause: Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>,
+    ) -> std::thread::JoinHandle<Option<Value>> {
         let listener = UnixListener::bind(&self.socket).unwrap();
         listener.set_nonblocking(true).unwrap();
         std::thread::spawn(move || {
@@ -99,6 +121,10 @@ impl Fixture {
             reader.read_line(&mut line).unwrap();
             let request: Value = serde_json::from_str(&line).unwrap();
             assert_eq!(request["kind"], "rustc-request");
+            if let Some((arrived, release)) = pause {
+                arrived.send(()).unwrap();
+                release.recv_timeout(Duration::from_secs(10)).unwrap();
+            }
             let reply = json!({"kind":"rustc-decision", "decision":"execute",
                 "action_key":"fixture", "attempt":"supervised-attempt",
                 "compiler_skip_authorized":false,
@@ -128,6 +154,29 @@ impl Fixture {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         command
+    }
+
+    /// A real, separately killable Cargo-like parent. The wrapper receives its
+    /// own PID, not an exec-replacement parent. Compiler paths remain arguments,
+    /// never interpolated into the shell source, including paths with spaces.
+    fn caller(&self) -> Command {
+        let wrapped = self.command();
+        let mut caller = Command::new("/bin/sh");
+        caller
+            .args([
+                "-c",
+                "\"$@\" & child=$!; printf '%s\\n' \"$child\" > wrapper.pid; wait \"$child\"",
+                "test-cargo-parent",
+            ])
+            .arg(wrapped.get_program())
+            .args(wrapped.get_args())
+            .envs(wrapped.get_envs().filter_map(|(key, value)| value.map(|value| (key, value))))
+            .current_dir(self.root.path())
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        caller
     }
 
     fn pid(&self, name: &str) -> u32 {
@@ -193,11 +242,7 @@ fn wrapper_death_stops_compiler_and_descendant_without_touching_other_jobs() {
     );
     child.0.kill().unwrap();
     assert_eq!(wait(&mut child).signal(), Some(9));
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while !stopped(compiler) || !stopped(descendant) {
-        assert!(Instant::now() < deadline, "compiler group outlived its wrapper");
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    group_stopped(&[compiler, descendant]);
     assert!(
         witness.0.try_wait().unwrap().is_none(),
         "unrelated job was signalled"
@@ -231,7 +276,7 @@ fn forged_guard_owner_never_starts_a_compiler() {
     let fixture = Fixture::new("exit 0");
     let mut command = Command::new(env!("CARGO_BIN_EXE_rabs-wrap"));
     command
-        .args(["--rabs-internal-compiler-guard-v1", "1", "1", "--"])
+        .args(["--rabs-internal-compiler-guard-v1", "1", "1", "1", "1", "--"])
         .arg(&fixture.compiler)
         .current_dir(fixture.root.path())
         .stdin(Stdio::null())
@@ -240,4 +285,63 @@ fn forged_guard_owner_never_starts_a_compiler() {
     let mut child = Owned(command.spawn().unwrap());
     assert!(!wait(&mut child).success());
     assert!(!fixture.root.path().join("compiler.pid").exists());
+}
+
+#[test]
+fn original_caller_death_cancels_a_still_living_wrapper_and_its_compiler() {
+    let fixture = Fixture::new("/bin/sleep 5 &\nprintf '%s\\n' \"$!\" > descendant.pid\nwait");
+    let daemon = fixture.daemon();
+    let mut caller = Owned(fixture.caller().spawn().unwrap());
+    let wrapper = fixture.pid("wrapper.pid");
+    let compiler = fixture.pid("compiler.pid");
+    let descendant = fixture.pid("descendant.pid");
+    assert!(!stopped(wrapper) && !stopped(compiler) && !stopped(descendant));
+    // Kill ONLY the original parent, not the wrapper, supervisor or compiler.
+    caller.0.kill().unwrap();
+    assert_eq!(wait(&mut caller).signal(), Some(9));
+    group_stopped(&[wrapper, compiler, descendant]);
+    no_success(daemon.join().unwrap());
+}
+
+#[test]
+fn parent_lost_during_the_decision_cannot_start_an_orphaned_compiler() {
+    let fixture = Fixture::new("printf 'must not run' > forbidden\nexit 0");
+    let (arrived, ready) = mpsc::channel();
+    let (release, released) = mpsc::channel();
+    let daemon = fixture.daemon_paused(Some((arrived, released)));
+    let mut caller = Owned(fixture.caller().spawn().unwrap());
+    ready.recv_timeout(Duration::from_secs(10)).unwrap();
+    let wrapper = fixture.pid("wrapper.pid");
+    assert!(!stopped(wrapper));
+    assert!(!fixture.root.path().join("compiler.pid").exists());
+    // The identity was captured before this request reached the daemon. Let
+    // the kernel reparent the surviving wrapper BEFORE replying with execute.
+    caller.0.kill().unwrap();
+    wait(&mut caller);
+    release.send(()).unwrap();
+    group_stopped(&[wrapper]);
+    no_success(daemon.join().unwrap());
+    assert!(!fixture.root.path().join("compiler.pid").exists());
+    assert!(!fixture.root.path().join("forbidden").exists());
+}
+
+#[test]
+fn cancelling_the_callers_process_group_does_not_kill_the_cleanup_guard() {
+    let fixture = Fixture::new("/bin/sleep 5 &\nprintf '%s\\n' \"$!\" > descendant.pid\nwait");
+    let daemon = fixture.daemon();
+    let mut caller = Owned(fixture.caller().spawn().unwrap());
+    let wrapper = fixture.pid("wrapper.pid");
+    let compiler = fixture.pid("compiler.pid");
+    let descendant = fixture.pid("descendant.pid");
+    assert!(caller.0.try_wait().unwrap().is_none());
+    // This PGID belongs to our unreaped test child, created with PGID=PID.
+    // The harness itself is in another group and cannot receive this signal.
+    let signalled = Command::new("/bin/kill")
+        .args(["-TERM", "--", &format!("-{}", caller.0.id())])
+        .status()
+        .unwrap();
+    assert!(signalled.success());
+    assert_eq!(wait(&mut caller).signal(), Some(15));
+    group_stopped(&[wrapper, compiler, descendant]);
+    assert!(daemon.join().unwrap().is_none());
 }

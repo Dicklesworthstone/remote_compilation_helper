@@ -2,10 +2,12 @@
 //!
 //! The wrapper remains Cargo's child. A separate invocation of THIS executable
 //! supervises rustc in its own process group, outside Cargo's foreground group.
-//! Losing the wrapper (including SIGKILL) stops that compiler group. The guard
-//! retains its unreaped child until the group has been killed, so a recycled PID
-//! can never become the target of cleanup. Normal compiler exit also kills any
-//! remaining group members before returning the compiler's status.
+//! Losing the wrapper (including SIGKILL) OR its original caller stops that
+//! compiler group. Both birth identities and the parent relation are captured
+//! before the daemon consult: reparenting cannot adopt an orphaned request.
+//! The guard retains its unreaped child until the group has been killed, so a
+//! recycled PID can never become the target of cleanup. Normal compiler exit
+//! also kills remaining group members before returning the compiler's status.
 //!
 //! No runtime, unsafe code, signal-handler thread, PATH-resolved kill utility,
 //! shell interpolation, or compiler environment additions. This is process-group
@@ -83,11 +85,13 @@ fn read_stat(pid: u32) -> io::Result<Stat> {
 }
 
 /// Captured before the daemon consult, never reconstructed from an orphan's
-/// new parent. Birth identity prevents another process borrowing a reused PID.
+/// new parent. Birth identities prevent another process borrowing either PID.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct Owner {
     pid: u32,
     start: u64,
+    caller_pid: u32,
+    caller_start: u64,
 }
 
 impl Owner {
@@ -97,6 +101,8 @@ impl Owner {
             return Ok(Self {
                 pid: std::process::id(),
                 start: 0,
+                caller_pid: 0,
+                caller_start: 0,
             });
         }
         if !cfg!(any(target_arch = "x86_64", target_arch = "aarch64")) {
@@ -119,19 +125,32 @@ impl Owner {
         let stat = parse_stat(&bytes)
             .filter(|stat| stat.pid == std::process::id())
             .ok_or_else(|| io::Error::other("procfs PID namespace mismatch"))?;
+        // An already-lost caller is cancellation, NOT a setup failure granting
+        // direct-exec fallback. Retain an invalid binding so spawn refuses to
+        // execute even if the wrapper has acquired a new parent meanwhile.
+        let caller = read_stat(stat.parent).ok().filter(|caller| !caller.exited());
         Ok(Self {
             pid: stat.pid,
             start: stat.start,
+            caller_pid: caller.map_or(0, |caller| caller.pid),
+            caller_start: caller.map_or(0, |caller| caller.start),
         })
     }
 
     fn alive(self) -> bool {
-        read_stat(self.pid).is_ok_and(|stat| stat.start == self.start && !stat.exited())
+        self.caller_pid != 0
+            && read_stat(self.pid).is_ok_and(|stat| {
+                stat.start == self.start && stat.parent == self.caller_pid && !stat.exited()
+            })
+            && read_stat(self.caller_pid)
+                .is_ok_and(|stat| stat.start == self.caller_start && !stat.exited())
     }
 }
 
 /// No compiler has started when this returns Err. The caller may abandon the
 /// admission and exec the original chain, without publishing an observed run.
+/// A lost caller instead terminates the wrapper: cancellation must never pass
+/// through that ordinary fail-open error path and start an orphaned compiler.
 pub(super) fn spawn(
     compiler: &OsStr,
     args: &[OsString],
@@ -147,14 +166,17 @@ pub(super) fn spawn(
             .stderr(Stdio::piped())
             .spawn();
     }
-    if !owner.alive() || owner.pid != std::process::id() {
-        return Err(io::Error::other("compiler owner was lost"));
+    if owner.pid != std::process::id() || !owner.alive() {
+        eprintln!("rabs-wrap: compiler caller disappeared before execution");
+        std::process::exit(1);
     }
     kill_program()?;
     Command::new("/proc/self/exe")
         .arg(GUARD_ARGUMENT)
         .arg(owner.pid.to_string())
         .arg(owner.start.to_string())
+        .arg(owner.caller_pid.to_string())
+        .arg(owner.caller_start.to_string())
         .arg("--")
         .arg(compiler)
         .args(args)
@@ -201,6 +223,14 @@ pub(super) fn run_if_guard() {
                 .next()
                 .and_then(|s| s.to_str()?.parse().ok())
                 .ok_or_else(invalid)?,
+            caller_pid: args
+                .next()
+                .and_then(|s| s.to_str()?.parse().ok())
+                .ok_or_else(invalid)?,
+            caller_start: args
+                .next()
+                .and_then(|s| s.to_str()?.parse().ok())
+                .ok_or_else(invalid)?,
         };
         if args.next().as_deref() != Some(OsStr::new("--")) {
             return Err(invalid());
@@ -210,7 +240,7 @@ pub(super) fn run_if_guard() {
         let stat = read_stat(own.pid)?;
         if stat.parent != owner.pid || stat.group != own.pid || !owner.alive() {
             return Err(io::Error::other(
-                "compiler guard is not owned by the requesting wrapper",
+                "compiler guard is not owned by the requesting wrapper and caller",
             ));
         }
         // An inherited ignored SIGCHLD would auto-reap children and remove our
@@ -244,7 +274,7 @@ pub(super) fn run_if_guard() {
                 owned.finish()?;
                 return Err(io::Error::new(
                     io::ErrorKind::Interrupted,
-                    "compiler owner disappeared",
+                    "compiler wrapper or original caller disappeared",
                 ));
             }
             if stat.exited() {
@@ -362,18 +392,51 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
-    #[test]
-    fn a_live_pid_with_a_different_birth_identity_is_not_the_owner() {
+    fn current_owner() -> Owner {
         let stat = read_stat(std::process::id()).unwrap();
-        let owner = Owner {
+        let caller = read_stat(stat.parent).unwrap();
+        Owner {
             pid: stat.pid,
             start: stat.start,
-        };
+            caller_pid: caller.pid,
+            caller_start: caller.start,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_live_pid_with_a_different_birth_identity_is_not_the_owner() {
+        let owner = current_owner();
         assert!(owner.alive());
         let reused = Owner {
-            start: stat.start.wrapping_add(1),
+            start: owner.start.wrapping_add(1),
             ..owner
         };
         assert!(!reused.alive());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn caller_birth_and_parent_relation_cannot_be_substituted() {
+        let owner = current_owner();
+        assert!(owner.alive());
+        for changed in [
+            Owner {
+                caller_start: owner.caller_start.wrapping_add(1),
+                ..owner
+            },
+            Owner {
+                caller_pid: owner.pid,
+                caller_start: owner.start,
+                ..owner
+            },
+            Owner {
+                caller_pid: 0,
+                caller_start: 0,
+                ..owner
+            },
+        ] {
+            assert!(!changed.alive(), "invalid owner accepted: {changed:?}");
+        }
     }
 }
