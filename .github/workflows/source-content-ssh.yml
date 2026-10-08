@@ -17,7 +17,7 @@ permissions:
 jobs:
   ssh-integrity:
     if: >-
-      github.event_name != 'push' || !contains(github.event.head_commit.message, '[source84-land-1fd489]')
+      github.event_name != 'push' || !contains(github.event.head_commit.message, '[source84-land-3993bd6]')
     runs-on: ubuntu-latest
     timeout-minutes: 15
     defaults:
@@ -57,8 +57,8 @@ jobs:
 
   land-reviewed-integration:
     if: >-
-      github.event_name == 'push' && contains(github.event.head_commit.message, '[source84-land-1fd489]')
-    runs-on: ubuntu-latest
+      github.event_name == 'push' && contains(github.event.head_commit.message, '[source84-land-3993bd6]')
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 20
     permissions:
       contents: write
@@ -73,7 +73,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - name: Apply only the reviewed integration to its inspected baselines
+      - name: Apply and hash-check the exact rebased integration
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -86,13 +86,19 @@ jobs:
               'rabs-scheduler/src/managed_pool.rs': 'c91e4b77b877c6ef32b68583aabffa61f90ae2c3',
               'rch/src/transfer/source_content_barrier.rs': 'd7db94dcc5dcd6fea5578f605514433fccf78a7c',
           }
+          patched = {
+              'rch/src/transfer.rs': 'e526b7541cdce2afb1370051143c79af74c543da',
+              'rch/src/hook/ssh.rs': '9f8ae192920da80e3c6948658e1385d7a1a6387b',
+              'rabs-scheduler/src/managed_pool.rs': '7764f25a28db90c94a42e0a2499ef162b15508b1',
+          }
+          def git_hash(path):
+              return subprocess.check_output(['git', 'hash-object', path], text=True).strip()
           for path, sha in expected.items():
-              actual = subprocess.check_output(['git', 'hash-object', path], text=True).strip()
-              if actual != sha:
-                  raise RuntimeError(f'{path}: expected {sha}, found {actual}; refusing stale publication')
+              if git_hash(path) != sha:
+                  raise RuntimeError(f'{path} changed; refusing stale publication')
           for path in ['scripts/test_source_content_ssh.py', '.github/workflows/source-content-ssh.yml']:
-              expected[path] = subprocess.check_output(['git', 'hash-object', path], text=True).strip()
-          sha = '373b8c9691c8128c8ef8c35da7ac93421cdc4fcf'
+              expected[path] = git_hash(path)
+          sha = '376094969d60956f794375eead0e3c5df1231321'
           request = urllib.request.Request(
               f"https://api.github.com/repos/{os.environ['GITHUB_REPOSITORY']}/git/blobs/{sha}",
               headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json'})
@@ -108,8 +114,11 @@ jobs:
           subprocess.run(['git', 'apply', '--whitespace=error-all', str(patch)], check=True)
           subprocess.run(['git', 'diff', '--check'], check=True)
           changed = subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines()
-          if set(changed) != {'rch/src/transfer.rs', 'rch/src/hook/ssh.rs', 'rabs-scheduler/src/managed_pool.rs'}:
+          if set(changed) != set(patched):
               raise RuntimeError(f'unexpected changed files: {changed}')
+          for path, sha in patched.items():
+              if git_hash(path) != sha:
+                  raise RuntimeError(f'{path}: patched bytes differ from reviewed candidate')
           (evidence / 'prepared.patch').write_bytes(subprocess.check_output(['git', 'diff', '--binary']))
           (evidence / 'baseline.json').write_text(json.dumps(expected, indent=2) + '\n')
           PY
@@ -152,34 +161,27 @@ jobs:
               if sha != subprocess.check_output(['git', 'hash-object', path], text=True).strip():
                   raise RuntimeError(f'published blob mismatch: {path}')
               tree.append({'path': path, 'mode': '100644', 'type': 'blob', 'sha': sha})
-          # Retain qualified blob identities even if publication conflicts.
           (evidence / 'prepared.json').write_text(json.dumps({'qualified_base': os.environ['GITHUB_SHA'], 'files': tree}, indent=2) + '\n')
           parent = api('git/ref/heads/main')['object']['sha']
           current = {path: api(f'contents/{path}?ref={parent}')['sha'] for path in expected}
           prepared = {entry['path']: entry['sha'] for entry in tree}
-          # A rerun is idempotent. Never replace a partially changed integration.
           if all(current[path] == prepared.get(path, sha) for path, sha in expected.items()):
               (evidence / 'published.json').write_text(json.dumps({'commit': parent, 'already_present': True, 'files': tree}, indent=2) + '\n')
               raise SystemExit(0)
           for path, sha in expected.items():
               if current[path] != sha:
                   raise RuntimeError(f'{path} changed on main; refusing to overwrite concurrent work')
-          # Unrelated commits are preserved by building on the just-inspected
-          # main tree. Related source, policy, fixture or workflow changes refuse.
           root = api(f'git/commits/{parent}')['tree']['sha']
           tree_sha = api('git/trees', {'base_tree': root, 'tree': tree})['sha']
           message = ('fix(transfer): activate qualified source-receipt checks (#84)\n\n'
-              'Wire the existing strict no-delta policy into the rsync barrier and both\n'
-              'direct SSH verification forms. Suppress client INFO host notices only;\n'
-              'retain host authentication, remote stderr, deletion and malformed-output\n'
-              'refusals. Preserve intervening Windows stdin, identity selection, disk\n'
-              'quarantine and native-output changes. Include the qualified pool format.\n\n'
-              'Validation: scoped rustfmt and diff checks, exact Rust policy tests, and\n'
+              'Wire the strict no-delta policy into the rsync barrier and direct\n'
+              'SSH verification. Keep host authentication, identity key pinning,\n'
+              'remote stderr, deletion and malformed-output refusals intact.\n'
+              'Preserve Windows transport, disk quarantine and native outputs.\n\n'
+              'Validation: exact patched hashes, rustfmt, Rust policy tests and\n'
               'real SSH/rsync qualification passed in Actions run ' + os.environ['GITHUB_RUN_ID'] + '.\n'
-              'This is not a full-workspace or complete RCH execution qualification.\n')
+              'This is not full-workspace or complete RCH execution qualification.\n')
           commit = api('git/commits', {'message': message, 'tree': tree_sha, 'parents': [parent]})['sha']
-          # One inspected parent plus force=false makes another main advance
-          # a rejected non-fast-forward, never a lost concurrent commit.
           api('git/refs/heads/main', {'sha': commit, 'force': False}, 'PATCH')
           report = {'parent': parent, 'commit': commit, 'tree': tree_sha, 'files': tree}
           (evidence / 'published.json').write_text(json.dumps(report, indent=2) + '\n')
