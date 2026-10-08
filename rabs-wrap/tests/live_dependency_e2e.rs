@@ -36,16 +36,18 @@ fn wrap() -> &'static str {
     env!("CARGO_BIN_EXE_rabs-wrap")
 }
 
+/// Always ask Cargo, once per test process: it is a no-op when fresh, and a
+/// daemon left over from an older tree must never answer for this one.
 fn rabsd_bin() -> PathBuf {
-    let path = Path::new(wrap()).with_file_name("rabsd");
-    if !path.exists() {
+    static BUILT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    BUILT.get_or_init(|| {
         let status = Command::new(env!("CARGO"))
             .args(["build", "-p", "rabsd", "--bin", "rabsd"])
             .status()
             .expect("build rabsd");
-        assert!(status.success());
-    }
-    path
+        assert!(status.success(), "rabsd build failed");
+    });
+    Path::new(wrap()).with_file_name("rabsd")
 }
 
 /// The real toolchain binary (`<sysroot>/bin/rustc`), not a proxy.
@@ -651,7 +653,12 @@ fn git_workspace_dependency_commits_verifies_and_serves_with_a_complete_source_c
     let mark = daemon.decisions().len();
     let served = world.wrapped("leaf", &out_served, &[], &[]);
     assert_eq!(served.status.code(), Some(0), "{served:?}");
-    assert_eq!(trail(&daemon, mark), ["hit", "served"]);
+    assert_eq!(
+        trail(&daemon, mark),
+        ["hit", "served"],
+        "{:?}",
+        &daemon.decisions()[mark..]
+    );
     assert!(served.stdout.is_empty());
     assert_eq!(
         String::from_utf8(served.stderr.clone()).unwrap(),
