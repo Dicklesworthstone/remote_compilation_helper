@@ -696,6 +696,63 @@ impl WorkerSelector {
             .err()
     }
 
+    /// Prefer workers whose free build disk can hold this project's learned
+    /// footprint (bd-wv746). One `cargo test --all-features` grew a pool to
+    /// 64 GiB on a worker admitted with 51 GiB free and filled it. Learned
+    /// growth is evidence, not a declared budget, so this only narrows the
+    /// candidate list when some candidate fits; it never refuses a build.
+    /// A declared `disk_headroom_gib` at least as large wins outright.
+    async fn steer_by_learned_footprint(
+        &self,
+        candidates: Vec<(Arc<WorkerState>, CircuitState)>,
+        request: &SelectionRequest,
+    ) -> Vec<(Arc<WorkerState>, CircuitState)> {
+        let (Some(history), Some(command)) = (&self.build_history, request.command.as_deref())
+        else {
+            return candidates;
+        };
+        let Some(footprint) = history.learned_footprint_gib(&request.project, command) else {
+            return candidates;
+        };
+        if footprint <= f64::from(request.disk_headroom_gib) {
+            return candidates;
+        }
+        let required = crate::headroom::footprint_requirement_gib(footprint);
+        let mut fits = Vec::with_capacity(candidates.len());
+        let mut short = Vec::new();
+        for candidate in &candidates {
+            let worker_id = candidate.0.config.read().await.id.to_string();
+            let available = candidate
+                .0
+                .disk_capacity_observation()
+                .await
+                .and_then(|sample| sample.current_free_gib(&worker_id))
+                .map(|free| {
+                    free as f64
+                        - history.reserved_disk_headroom_gib(&worker_id) as f64
+                        - history.pending_footprint_gib(&worker_id)
+                });
+            // No current probe is unknown space, not a full disk.
+            if available.is_none_or(|available| available >= required) {
+                fits.push(candidate.clone());
+            } else {
+                short.push(worker_id);
+            }
+        }
+        if fits.is_empty() || short.is_empty() {
+            return candidates;
+        }
+        info!(
+            project = %request.project,
+            footprint_gib = footprint,
+            required_gib = required,
+            avoided = ?short,
+            "Steering build away from workers without room for its learned disk footprint"
+        );
+        metrics::inc_reliability_error("selection", "footprint_steered");
+        fits
+    }
+
     /// Set the repo convergence service for pre-build freshness checks (bd-vvmd.3.3).
     pub fn set_repo_convergence(
         &mut self,
@@ -2720,7 +2777,7 @@ impl WorkerSelector {
         // (the `!matched_preferred_worker` return above) or refused for a
         // cause no specific branch names (e.g. an open circuit).
         if !eligible.is_empty() {
-            return Ok(eligible);
+            return Ok(self.steer_by_learned_footprint(eligible, request).await);
         }
 
         // Degrade rather than fall local when the ONLY thing standing between
@@ -7057,6 +7114,95 @@ mod tests {
         assert!(
             selector.select(&pool, &request).await.worker.is_some(),
             "undeclared jobs preserve existing admission"
+        );
+    }
+
+    /// bd-wv746: a project whose last unshared build grew a worker's build
+    /// disk by 64 GiB is steered to a worker with room, even against
+    /// affinity, but a fleet where nobody has room still gets a worker.
+    #[tokio::test]
+    async fn learned_footprint_steers_without_ever_refusing() {
+        let (pool, mut selector, mut request) = active_project_capacity_fixture().await;
+        let history = Arc::new(crate::history::BuildHistory::new(10));
+        selector.set_build_history(Arc::clone(&history));
+        request.estimated_cores = 1;
+        let seed = history
+            .try_start_active_build_with_waiter(
+                request.project.clone(),
+                "seed-worker".into(),
+                "cargo build --workspace".into(),
+                0,
+                Some("seed-owner".into()),
+                1,
+                rch_common::BuildLocation::Remote,
+                None,
+                crate::disk_pressure::DiskHeadroomAdmission {
+                    requested_gib: 0,
+                    capacity: Some(crate::disk_pressure::DiskCapacityObservation::fixture(
+                        "seed-worker",
+                        120.0,
+                        Duration::ZERO,
+                    )),
+                },
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        history.observe_build_disk("seed-worker", 56, Instant::now());
+        history
+            .complete_durable(
+                seed.id,
+                "seed-worker",
+                Some("seed-owner"),
+                crate::history::BuildCompletion {
+                    exit_code: 0,
+                    duration_ms: None,
+                    bytes_transferred: None,
+                    timing: None,
+                    cancellation: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            history.learned_footprint_gib(&request.project, "cargo build"),
+            Some(64.0)
+        );
+
+        let set_free = |id: &'static str, free: f64| {
+            let pool = pool.clone();
+            async move {
+                let worker = pool.get(&WorkerId::new(id)).await.unwrap();
+                let mut caps = worker.capabilities().await;
+                caps.build_disk_free_gb = Some(free);
+                caps.build_disk_total_gb = Some(400.0);
+                worker.set_capabilities(caps).await;
+            }
+        };
+        // The affinity-pinned worker has 51 GiB: the incident's shape.
+        set_free("active-project", 51.0).await;
+        set_free("free-small", 200.0).await;
+        for _ in 0..5 {
+            let selected = selector.select(&pool, &request).await;
+            let id = match &selected.worker {
+                Some(worker) => Some(worker.config.read().await.id.to_string()),
+                None => None,
+            };
+            assert_eq!(
+                id.as_deref(),
+                Some("free-small"),
+                "reason={:?}",
+                selected.reason
+            );
+        }
+
+        // Nobody has room: steering steps aside rather than refusing.
+        set_free("free-small", 40.0).await;
+        assert!(selector.select(&pool, &request).await.worker.is_some());
+
+        // A different command class has no footprint and is not steered.
+        assert_eq!(
+            history.learned_footprint_gib(&request.project, "cargo test"),
+            None
         );
     }
 

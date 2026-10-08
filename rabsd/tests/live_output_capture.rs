@@ -125,8 +125,8 @@ impl Fixture {
         };
         let toolchain = ToolchainFacts {
             compiler_binary_digest: compute("rabs.tool-binary.v1", b"fixture compiler"),
-            verbose_version:
-                "rustc fixture\nhost: x86_64-unknown-linux-gnu\nLLVM version: fixture".into(),
+            verbose_version: "rustc fixture\nhost: x86_64-unknown-linux-gnu\nLLVM version: fixture"
+                .into(),
             sysroot_root_digest: compute(
                 "rabs.live-dependency.sysroot-tree.v1",
                 b"fixture sysroot",
@@ -160,7 +160,11 @@ impl Fixture {
     }
 
     fn outputs(&self) {
-        std::fs::write(self.out.join("libfoo-123.rmeta"), b"original metadata fixture").unwrap();
+        std::fs::write(
+            self.out.join("libfoo-123.rmeta"),
+            b"original metadata fixture",
+        )
+        .unwrap();
         std::fs::write(
             self.out.join("foo-123.d"),
             format!(
@@ -227,7 +231,11 @@ fn publication_uses_captured_bytes_even_after_the_callers_entire_tree_is_replace
     let retained = fixture.out.with_file_name("retained-old-outputs");
     std::fs::rename(&fixture.out, &retained).unwrap();
     std::fs::create_dir_all(&fixture.out).unwrap();
-    std::fs::write(fixture.out.join("libfoo-123.rmeta"), b"unrelated later build").unwrap();
+    std::fs::write(
+        fixture.out.join("libfoo-123.rmeta"),
+        b"unrelated later build",
+    )
+    .unwrap();
     std::fs::write(fixture.package.join("lib.rs"), "pub fn changed() {}\n").unwrap();
     let (outcome, known) = captured.publish();
     assert_eq!(outcome, CompletionOutcome::Committed);
@@ -262,7 +270,11 @@ fn successful_capture_still_uses_the_real_same_key_conflict_gate() {
     assert_eq!(first.publish().0, CompletionOutcome::Committed);
     let next = fixture.begin();
     fixture.outputs();
-    std::fs::write(fixture.out.join("libfoo-123.rmeta"), b"divergent metadata fixture").unwrap();
+    std::fs::write(
+        fixture.out.join("libfoo-123.rmeta"),
+        b"divergent metadata fixture",
+    )
+    .unwrap();
     assert_eq!(
         next.capture(&success()).unwrap().publish().0,
         CompletionOutcome::Quarantined
@@ -279,7 +291,11 @@ fn incomplete_or_changed_outputs_never_form_a_publishable_capture() {
     let fixture = Fixture::new();
     let attempt = fixture.begin();
     let key = attempt.action_key().clone();
-    std::fs::write(fixture.out.join("libfoo-123.rmeta"), b"only one of two outputs").unwrap();
+    std::fs::write(
+        fixture.out.join("libfoo-123.rmeta"),
+        b"only one of two outputs",
+    )
+    .unwrap();
     assert!(attempt.capture(&success()).is_err());
     assert!(fixture.published(&key).is_none());
     let attempt = fixture.begin();

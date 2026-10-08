@@ -1502,7 +1502,8 @@ async fn main() -> Result<()> {
         worker_pool.clone(),
         telemetry_store.clone(),
         DiskPressurePolicyConfig::default(),
-    );
+    )
+    .with_build_history(context.history.clone());
     let _disk_pressure_handle = disk_pressure_monitor.start();
     info!("Disk pressure monitor started");
 

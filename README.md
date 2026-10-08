@@ -625,6 +625,20 @@ accounting. The full budget stays reserved even after a disk sample reflects
 some of the build's output, so admission deliberately errs toward leaving extra
 space. The default is `0`, retaining ordinary disk-pressure admission.
 
+Without a declaration, the daemon still learns each project's footprint. For
+every remote build that had a worker to itself (no other build from this
+daemon overlapped there), it records how far the worker's free build-disk
+space fell between the admission probe and the lowest probe seen while the
+build ran. Footprints are kept per project and command class (`cargo test` is
+learned separately from `cargo check`), for 30 days, in
+`history.footprints.json` beside the build history. When some candidate
+worker has room for the largest recent footprint plus 10% (at least 5 GiB),
+after declared budgets and the remaining growth of builds already running
+there, selection only considers those workers. If none has room, selection is
+unchanged. Learned footprints are evidence, not a budget, so they never refuse
+a build. Other dispatchers' builds can inflate a measurement and cache cleanup
+can shrink one; declare `disk_headroom_gib` when you need a hard requirement.
+
 Unix artifact downloads estimate the files matched by the retrieval filters
 before transferring them. Their default total retry budget grows with that size
 (30 seconds plus one second per MiB, adjusted for a slower `bwlimit_kbps`, up to

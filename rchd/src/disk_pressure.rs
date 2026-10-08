@@ -193,6 +193,20 @@ impl DiskCapacityObservation {
         })
     }
 
+    /// Free build-disk GiB, only while this sample is the worker's current,
+    /// unexpired probe. Footprint learning must not start from stale space.
+    pub(crate) fn current_free_gib(&self, worker_id: &str) -> Option<u64> {
+        (self.worker_id == worker_id
+            && self.observed_at.elapsed()
+                <= DiskPressurePolicyConfig::default().telemetry_stale_after
+            && self.current_generation.load(Ordering::Acquire) == self.generation)
+            .then_some(self.free_gib)
+    }
+
+    pub(crate) fn observed_at(&self) -> Instant {
+        self.observed_at
+    }
+
     #[cfg(test)]
     pub(crate) fn fixture(worker_id: &str, free_gib: f64, age: Duration) -> Self {
         let mut sample = Self::from_capabilities(
@@ -397,6 +411,8 @@ pub struct DiskPressureMonitor {
     pool: WorkerPool,
     telemetry: Arc<TelemetryStore>,
     config: DiskPressurePolicyConfig,
+    /// Receives build-disk probes for footprint learning (bd-wv746).
+    history: Option<Arc<crate::history::BuildHistory>>,
 }
 
 impl DiskPressureMonitor {
@@ -410,7 +426,15 @@ impl DiskPressureMonitor {
             pool,
             telemetry,
             config,
+            history: None,
         }
+    }
+
+    /// Feed each worker's current build-disk probe to running builds there.
+    #[must_use]
+    pub fn with_build_history(mut self, history: Arc<crate::history::BuildHistory>) -> Self {
+        self.history = Some(history);
+        self
     }
 
     /// Start periodic pressure evaluation.
@@ -442,6 +466,12 @@ impl DiskPressureMonitor {
             return;
         };
         let worker_id = endpoint.config.id.to_string();
+        if let Some(history) = &self.history
+            && let Some(sample) = worker.disk_capacity_observation().await
+            && let Some(free_gib) = sample.current_free_gib(&worker_id)
+        {
+            history.observe_build_disk(&worker_id, free_gib, sample.observed_at());
+        }
         let capabilities = worker.capabilities().await;
         let telemetry = self.telemetry.latest_for_endpoint(&endpoint);
         let next = evaluate_pressure_policy(&capabilities, telemetry.as_ref(), &self.config);

@@ -3,6 +3,7 @@
 //! Maintains a ring buffer of recent builds for status reporting and analytics.
 
 use crate::disk_pressure::{DiskHeadroomAdmission, DiskHeadroomRejection};
+use crate::headroom::{FootprintBook, footprint_key};
 use crate::workers::{WorkerEndpointIdentity, WorkerEndpointSnapshot};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use rch_common::{
@@ -179,6 +180,16 @@ pub struct ActiveBuildState {
     /// Declared additional build space retained until this owner completes.
     #[serde(default)]
     pub disk_headroom_gib: u32,
+    /// Free build-disk GiB on the worker at admission (bd-wv746 footprint).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_free_start_gib: Option<u64>,
+    /// Lowest free build-disk GiB probed on the worker while this build ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_free_min_gib: Option<u64>,
+    /// Another build admitted by this daemon overlapped on the same worker,
+    /// so the observed growth cannot be attributed to this build alone.
+    #[serde(default)]
+    pub disk_shared: bool,
     pub location: BuildLocation,
     pub heartbeat_phase: BuildHeartbeatPhase,
     pub heartbeat_detail: Option<String>,
@@ -315,6 +326,8 @@ pub struct BuildHistory {
     cancelled_wrappers: RwLock<HashSet<String>>,
     /// When each active build's heartbeat was last made durable.
     heartbeat_persisted: Mutex<HashMap<u64, Instant>>,
+    /// Learned per-project build-disk growth (bd-wv746). Advisory only.
+    footprints: Mutex<FootprintBook>,
     /// A duplicate release may resume a fault, but never race the first
     /// completion's slot release or its quarantine acknowledgment.
     release_lock: tokio::sync::Mutex<()>,
@@ -351,6 +364,7 @@ impl BuildHistory {
             terminal: RwLock::new(HashMap::new()),
             cancelled_wrappers: RwLock::new(HashSet::new()),
             heartbeat_persisted: Mutex::new(HashMap::new()),
+            footprints: Mutex::new(FootprintBook::default()),
             release_lock: tokio::sync::Mutex::new(()),
             ownership_failed: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
@@ -466,6 +480,9 @@ impl BuildHistory {
             remote_pgid_file: None,
             slots,
             disk_headroom_gib: 0,
+            disk_free_start_gib: None,
+            disk_free_min_gib: None,
+            disk_shared: false,
             location,
             heartbeat_phase: BuildHeartbeatPhase::SyncUp,
             heartbeat_detail: Some("build_started".to_string()),
@@ -566,7 +583,14 @@ impl BuildHistory {
         }
         let started_at = Utc::now().to_rfc3339();
         let started_at_mono = Instant::now();
-        let state = ActiveBuildState {
+        let disk_free_start_gib = if location == BuildLocation::Remote {
+            disk.capacity
+                .as_ref()
+                .and_then(|sample| sample.current_free_gib(&worker_id))
+        } else {
+            None
+        };
+        let mut state = ActiveBuildState {
             id,
             project_id,
             worker_id,
@@ -580,6 +604,9 @@ impl BuildHistory {
             remote_pgid_file: None,
             slots,
             disk_headroom_gib: disk.requested_gib,
+            disk_free_start_gib,
+            disk_free_min_gib: None,
+            disk_shared: false,
             location,
             heartbeat_phase: BuildHeartbeatPhase::SyncUp,
             heartbeat_detail: Some("build_started".to_string()),
@@ -676,6 +703,16 @@ impl BuildHistory {
         }) {
             return Ok(None);
         }
+        if state.location == BuildLocation::Remote {
+            // Overlapping builds on one worker share its free-space drop, so
+            // none of them can attribute that growth to itself (bd-wv746).
+            for other in active.values_mut().filter(|other| {
+                other.location == BuildLocation::Remote && other.worker_id == state.worker_id
+            }) {
+                other.disk_shared = true;
+                state.disk_shared = true;
+            }
+        }
         active.insert(id, state.clone());
         if let Some(claim) = waiter {
             let mut queue = self.queued.write().unwrap_or_else(|e| e.into_inner());
@@ -689,10 +726,95 @@ impl BuildHistory {
         Ok(Some(state))
     }
 
-    #[cfg(test)]
     pub(crate) fn reserved_disk_headroom_gib(&self, worker_id: &str) -> u64 {
         let active = self.active.read().unwrap_or_else(|e| e.into_inner());
         reserved_disk_headroom(&active, worker_id)
+    }
+
+    /// Feed one worker build-disk probe into every remote build running there.
+    /// Only probes taken after a build's admission can describe its growth.
+    pub(crate) fn observe_build_disk(&self, worker_id: &str, free_gib: u64, observed_at: Instant) {
+        let mut active = self.active.write().unwrap_or_else(|e| e.into_inner());
+        for state in active.values_mut().filter(|state| {
+            state.location == BuildLocation::Remote
+                && state.worker_id == worker_id
+                && state.disk_free_start_gib.is_some()
+                && observed_at > state.started_at_mono
+        }) {
+            state.disk_free_min_gib = Some(
+                state
+                    .disk_free_min_gib
+                    .map_or(free_gib, |min| min.min(free_gib)),
+            );
+        }
+    }
+
+    /// Learned build-disk growth for this project and command class.
+    pub(crate) fn learned_footprint_gib(&self, project_id: &str, command: &str) -> Option<f64> {
+        self.footprints
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .estimate_gib(&footprint_key(project_id, command), Utc::now().timestamp())
+    }
+
+    /// Learned growth still expected from builds running on this worker: each
+    /// one's footprint minus the growth already visible in its probes.
+    pub(crate) fn pending_footprint_gib(&self, worker_id: &str) -> f64 {
+        let builds: Vec<(String, String, f64)> = self
+            .active
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .filter(|state| state.location == BuildLocation::Remote && state.worker_id == worker_id)
+            .map(|state| {
+                let grown = match (state.disk_free_start_gib, state.disk_free_min_gib) {
+                    (Some(start), Some(min)) => start.saturating_sub(min) as f64,
+                    _ => 0.0,
+                };
+                (state.project_id.clone(), state.command.clone(), grown)
+            })
+            .collect();
+        builds
+            .into_iter()
+            .filter_map(|(project, command, grown)| {
+                self.learned_footprint_gib(&project, &command)
+                    .map(|footprint| (footprint - grown).max(0.0))
+            })
+            .sum()
+    }
+
+    /// Learn from a finished remote build that had the worker to itself.
+    fn learn_footprint(&self, state: &ActiveBuildState, exit_code: i32) {
+        // A cancelled build stopped early; its growth says little.
+        if state.location != BuildLocation::Remote || state.disk_shared || exit_code == 130 {
+            return;
+        }
+        let (Some(start), Some(min)) = (state.disk_free_start_gib, state.disk_free_min_gib) else {
+            return;
+        };
+        let growth = start.saturating_sub(min) as f64;
+        let now = Utc::now().timestamp();
+        let mut book = self.footprints.lock().unwrap_or_else(|e| e.into_inner());
+        if !book.record(
+            &footprint_key(&state.project_id, &state.command),
+            growth,
+            now,
+        ) {
+            return;
+        }
+        book.prune(now);
+        debug!(
+            build_id = state.id,
+            project = %state.project_id,
+            worker = %state.worker_id,
+            growth_gib = growth,
+            "learned remote build disk footprint"
+        );
+        if let Some(path) = self.persistence_path.as_deref().map(footprint_path)
+            && let Err(error) = book.persist(&path)
+        {
+            warn!(path = %path.display(), %error, "could not persist build footprints");
+        }
     }
 
     /// Advisory selection uses the same budget and completion boundary checked
@@ -1848,6 +1970,7 @@ impl BuildHistory {
             terminal: RwLock::new(terminal),
             cancelled_wrappers: RwLock::new(cancelled_wrappers),
             heartbeat_persisted: Mutex::new(HashMap::new()),
+            footprints: Mutex::new(FootprintBook::load(&footprint_path(path))),
             release_lock: tokio::sync::Mutex::new(()),
             ownership_failed: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
@@ -2182,6 +2305,7 @@ impl BuildHistory {
                 .insert(state.worker_id.clone(), Instant::now());
         }
         let state = active.remove(&build_id).expect("locked ownership exists");
+        self.learn_footprint(&state, exit_code);
         self.record(record.clone());
         Ok(Some((state, record)))
     }
@@ -2345,6 +2469,11 @@ fn prune_terminal_receipts(terminal: &mut HashMap<u64, TerminalOwnership>, now: 
     }
 }
 
+/// Learned footprints live beside the history log (`history.footprints.json`).
+fn footprint_path(history_path: &Path) -> PathBuf {
+    history_path.with_extension("footprints.json")
+}
+
 fn reserved_disk_headroom(active: &HashMap<u64, ActiveBuildState>, worker_id: &str) -> u64 {
     active
         .values()
@@ -2419,6 +2548,128 @@ mod tests {
             timing: None,
             cancellation: None,
         }
+    }
+
+    fn finish_owned(history: &BuildHistory, active: &ActiveBuildState, exit_code: i32) {
+        history
+            .complete_durable(
+                active.id,
+                &active.worker_id,
+                active.local_wrapper_id.as_deref(),
+                disk_budget_completion(exit_code),
+            )
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn footprint_is_learned_from_an_unshared_remote_build_and_persisted() {
+        let root = TempDir::new().unwrap();
+        let path = root.path().join("history.jsonl");
+        let history = BuildHistory::new(10).with_persistence(path.clone());
+        let active = disk_budget_admit(&history, "fgdb", "ovh-b", 0, 120.0).unwrap();
+        assert_eq!(active.disk_free_start_gib, Some(120));
+
+        // A probe taken before admission says nothing about this build.
+        history.observe_build_disk("ovh-b", 10, active.started_at_mono);
+        // Probes on another worker are not this build's.
+        history.observe_build_disk("other", 1, Instant::now());
+        history.observe_build_disk("ovh-b", 70, Instant::now());
+        history.observe_build_disk("ovh-b", 56, Instant::now());
+        history.observe_build_disk("ovh-b", 90, Instant::now());
+        assert_eq!(
+            history.active_build(active.id).unwrap().disk_free_min_gib,
+            Some(56)
+        );
+        // While running, the learned footprint is still unknown.
+        assert_eq!(history.pending_footprint_gib("ovh-b"), 0.0);
+
+        // A failing test run (101) still filled the disk: learn from it.
+        finish_owned(&history, &active, 101);
+        assert_eq!(
+            history.learned_footprint_gib("fgdb", "cargo test"),
+            Some(64.0)
+        );
+        // The command class is part of the identity.
+        assert_eq!(history.learned_footprint_gib("fgdb", "cargo check"), None);
+        assert_eq!(history.learned_footprint_gib("other", "cargo test"), None);
+
+        // The book survives a daemon restart beside the history log.
+        drop(history);
+        let reloaded = BuildHistory::load_from_file(&path, 10).unwrap();
+        assert_eq!(
+            reloaded.learned_footprint_gib("fgdb", "cargo test"),
+            Some(64.0)
+        );
+    }
+
+    #[test]
+    fn footprint_running_build_reserves_its_remaining_growth() {
+        let history = BuildHistory::new(10);
+        let first = disk_budget_admit(&history, "fgdb", "ovh-b", 0, 120.0).unwrap();
+        history.observe_build_disk("ovh-b", 56, Instant::now());
+        finish_owned(&history, &first, 0);
+
+        let second = disk_budget_admit(&history, "fgdb", "ovh-b", 0, 100.0).unwrap();
+        assert_eq!(history.pending_footprint_gib("ovh-b"), 64.0);
+        history.observe_build_disk("ovh-b", 80, Instant::now());
+        assert_eq!(history.pending_footprint_gib("ovh-b"), 44.0);
+        history.observe_build_disk("ovh-b", 10, Instant::now());
+        assert_eq!(history.pending_footprint_gib("ovh-b"), 0.0);
+        assert_eq!(history.pending_footprint_gib("elsewhere"), 0.0);
+        finish_owned(&history, &second, 0);
+        // The larger observation is now the estimate.
+        assert_eq!(
+            history.learned_footprint_gib("fgdb", "cargo test"),
+            Some(90.0)
+        );
+    }
+
+    #[test]
+    fn footprint_is_not_learned_from_shared_cancelled_or_unprobed_builds() {
+        let history = BuildHistory::new(10);
+
+        // Two of this daemon's builds overlapped on one worker: neither can
+        // claim the drop, including the one that finishes after the other.
+        let a = disk_budget_admit(&history, "a", "w", 0, 200.0).unwrap();
+        let b = disk_budget_admit(&history, "b", "w", 0, 200.0).unwrap();
+        history.observe_build_disk("w", 100, Instant::now());
+        finish_owned(&history, &a, 0);
+        history.observe_build_disk("w", 90, Instant::now());
+        finish_owned(&history, &b, 0);
+        assert_eq!(history.learned_footprint_gib("a", "cargo test"), None);
+        assert_eq!(history.learned_footprint_gib("b", "cargo test"), None);
+
+        // Cancelled builds stopped early.
+        let cancelled = disk_budget_admit(&history, "c", "w", 0, 200.0).unwrap();
+        history.observe_build_disk("w", 100, Instant::now());
+        finish_owned(&history, &cancelled, 130);
+        assert_eq!(history.learned_footprint_gib("c", "cargo test"), None);
+
+        // No probe arrived during the build.
+        let unprobed = disk_budget_admit(&history, "d", "w", 0, 200.0).unwrap();
+        finish_owned(&history, &unprobed, 0);
+        assert_eq!(history.learned_footprint_gib("d", "cargo test"), None);
+
+        // A stale admission sample cannot be a starting point.
+        let stale = disk_budget_admit_snapshot(
+            &history,
+            "e",
+            "w",
+            DiskHeadroomAdmission {
+                requested_gib: 0,
+                capacity: Some(crate::disk_pressure::DiskCapacityObservation::fixture(
+                    "w",
+                    200.0,
+                    Duration::from_secs(3600),
+                )),
+            },
+        )
+        .unwrap();
+        assert_eq!(stale.disk_free_start_gib, None);
+        history.observe_build_disk("w", 100, Instant::now());
+        finish_owned(&history, &stale, 0);
+        assert_eq!(history.learned_footprint_gib("e", "cargo test"), None);
     }
 
     #[tokio::test]
