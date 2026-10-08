@@ -29,7 +29,7 @@ use rabs_protocol::result_identity::TypedDigest;
 use rabs_sandbox::snapshot_capture::{
     MemberDisposition, MemberKind, SealedSourceSnapshot, capture_sealed_source, member_disposition,
 };
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::Read;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -301,19 +301,24 @@ pub struct DependencyFacts {
     roots: Vec<(PathBuf, Vec<String>)>,
     members: Vec<Vec<(String, FileSig)>>,
     output: DependencyOutput,
-    // Read-only roots must retain their directory generation as well as
-    // membership: a transient candidate can otherwise be added and removed.
-    // The invocation's own out-dir legitimately changes as outputs appear.
-    root_generations: Vec<Option<FileSig>>,
+    // Each root must remain the same real directory. Its generation is NOT
+    // bound: Cargo's parallel, pipelined compiles churn scratch entries in
+    // dependency directories that rustc never opens as crates. Candidate
+    // membership and identity are compared exactly instead. What this gives
+    // up: a crate-named file created AND removed between two walks is not
+    // seen. rustc and Cargo only rename finished crates into place and never
+    // remove them during a build; another local writer could, as it could
+    // equally rewrite package sources the instant after a check.
+    root_identities: Vec<(u64, u64)>,
 }
 
 impl DependencyFacts {
-    /// Refuse changes to any candidate, companion, member name or root type.
+    /// Refuse changes to any candidate, member name, root or root type.
     pub fn verify_unchanged(&self) -> Result<(), String> {
         let (members, _) = walk_dependencies(&self.roots)?;
         reject_dependency_output_aliases(&self.roots, &members, &self.output)?;
-        if dependency_root_generations(&self.roots, &self.output.0)? != self.root_generations {
-            return Err("read-only dependency directory generation changed".into());
+        if dependency_root_identities(&self.roots)? != self.root_identities {
+            return Err("dependency directory was replaced".into());
         }
         if members != self.members {
             return Err("dependency directory candidates changed".into());
@@ -326,19 +331,10 @@ type DependencyRoots = Vec<(PathBuf, Vec<String>)>;
 type DependencyMembers = Vec<Vec<(String, FileSig)>>;
 type DependencyOutput = (PathBuf, Vec<String>);
 
-fn dependency_root_generations(
-    roots: &DependencyRoots,
-    out_dir: &Path,
-) -> Result<Vec<Option<FileSig>>, String> {
+fn dependency_root_identities(roots: &DependencyRoots) -> Result<Vec<(u64, u64)>, String> {
     roots
         .iter()
-        .map(|(root, _)| {
-            let metadata = std::fs::symlink_metadata(root).map_err(|error| error.to_string())?;
-            if !metadata.is_dir() {
-                return Err("dependency root is not a real directory".into());
-            }
-            Ok((root != out_dir).then(|| FileSig::of(&metadata)))
-        })
+        .map(|(root, _)| dependency_root_identity(root))
         .collect()
 }
 
@@ -381,22 +377,43 @@ fn reject_dependency_output_aliases(
     Ok(())
 }
 
+/// Whether rustc's crate locator can ever open `name` as a crate for the
+/// Linux targets this class admits. Every flavor `find_library_crate`
+/// collects — rlib, rmeta, dylib (`.so`, proc-macros included), sdylib
+/// interface (`.rs`) and the static-library rejections — is spelled
+/// `lib<crate>…` (`rustc_metadata::locator`). Every other entry of a
+/// dependency directory is some compile's private scratch or a non-crate
+/// output: codegen units (`*.rcgu.o`), rustc's `rmeta*` and archive temp
+/// directories, dep-info, executables. None is ever a compiler input, and
+/// under Cargo's parallel, pipelined builds they appear and vanish while
+/// unrelated crates compile, so binding them made identical builds refuse
+/// or disagree by timing alone.
+fn crate_locator_may_open(name: &std::ffi::OsStr) -> bool {
+    name.as_encoded_bytes().starts_with(b"lib")
+}
+
+/// The same real directory, ignoring the generation churn that other
+/// compiles' scratch files cause; candidate changes are compared exactly.
+fn dependency_root_identity(root: &Path) -> Result<(u64, u64), String> {
+    let meta = std::fs::symlink_metadata(root).map_err(|e| e.to_string())?;
+    if !meta.is_dir() {
+        return Err("dependency root is not a real directory".to_owned());
+    }
+    Ok((meta.dev(), meta.ino()))
+}
+
 fn walk_dependencies(roots: &DependencyRoots) -> Result<(DependencyMembers, u64), String> {
     let mut inventories = Vec::new();
     let mut bytes = 0_u64;
     let mut count = 0_usize;
     for (root, excluded_outputs) in roots {
-        let root_identity = || {
-            let meta = std::fs::symlink_metadata(root).map_err(|e| e.to_string())?;
-            if !meta.is_dir() {
-                return Err("dependency root is not a real directory".to_owned());
-            }
-            Ok(FileSig::of(&meta))
-        };
-        let before = root_identity()?;
+        let before = dependency_root_identity(root)?;
         let mut members = Vec::new();
         for entry in std::fs::read_dir(root).map_err(|e| e.to_string())? {
             let entry = entry.map_err(|e| e.to_string())?;
+            if !crate_locator_may_open(&entry.file_name()) {
+                continue;
+            }
             let name = entry
                 .file_name()
                 .into_string()
@@ -410,28 +427,63 @@ fn walk_dependencies(roots: &DependencyRoots) -> Result<(DependencyMembers, u64)
                 return Err("dependency candidate count exceeds class bound".into());
             }
             let meta = std::fs::symlink_metadata(entry.path()).map_err(|e| e.to_string())?;
-            if !meta.is_file()
-                || !(name.ends_with(".rlib") || name.ends_with(".rmeta") || name.ends_with(".d"))
-            {
+            // Proc-macro/dylib (`.so`), interface (`.rs`) and static-library
+            // candidates stay refusals: the class keys plain Rust metadata.
+            if !meta.is_file() || !(name.ends_with(".rlib") || name.ends_with(".rmeta")) {
                 return Err(format!("unsupported dependency directory member {name}"));
-            }
-            if !name.ends_with(".d") {
-                bytes = bytes
-                    .checked_add(meta.len())
-                    .ok_or("dependency byte count overflow")?;
-                if bytes > MAX_DEPENDENCY_BYTES {
-                    return Err("dependency candidate bytes exceed class bound".into());
-                }
             }
             members.push((name, FileSig::of(&meta)));
         }
-        members.sort_by(|a, b| a.0.cmp(&b.0));
-        if root_identity()? != before {
+        if dependency_root_identity(root)? != before {
             return Err("dependency directory changed while enumerating".into());
+        }
+        let members = metadata_shadowed_rlibs_removed(members)?;
+        for (_, sig) in &members {
+            bytes = bytes
+                .checked_add(sig.size)
+                .ok_or("dependency byte count overflow")?;
+            if bytes > MAX_DEPENDENCY_BYTES {
+                return Err("dependency candidate bytes exceed class bound".into());
+            }
         }
         inventories.push(members);
     }
     Ok((inventories, bytes))
+}
+
+/// The class only compiles libraries, so rustc needs nothing but crate
+/// METADATA from dependencies (`only_needs_metadata` in the locator): once a
+/// crate's `.rmeta` fills the candidate slot, `extract_one` returns before
+/// opening any `.rlib` of that crate. Under Cargo pipelining a dependency's
+/// `.rlib` is still being written while its dependents compile, so keying
+/// it made identical builds disagree by timing. The locator skips an empty
+/// `.rmeta`, so only a non-empty sibling shadows the `.rlib`. An `.rlib`
+/// strictly OLDER than its `.rmeta` comes from a different compile than the
+/// metadata and might still be selected by hash: refuse that mixed pair.
+fn metadata_shadowed_rlibs_removed(
+    mut members: Vec<(String, FileSig)>,
+) -> Result<Vec<(String, FileSig)>, String> {
+    let metadata: BTreeMap<String, FileSig> = members
+        .iter()
+        .filter_map(|(name, sig)| Some((name.strip_suffix(".rmeta")?.to_owned(), *sig)))
+        .collect();
+    let mut kept = Vec::with_capacity(members.len());
+    for (name, sig) in members.drain(..) {
+        if let Some(stem) = name.strip_suffix(".rlib")
+            && let Some(rmeta) = metadata.get(stem)
+            && rmeta.size > 0
+        {
+            if sig.mtime_ns < rmeta.mtime_ns {
+                return Err(format!(
+                    "dependency {name} is older than its metadata sibling"
+                ));
+            }
+            continue;
+        }
+        kept.push((name, sig));
+    }
+    kept.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(kept)
 }
 
 fn capture_dependencies(
@@ -440,26 +492,20 @@ fn capture_dependencies(
     members: DependencyMembers,
     output: DependencyOutput,
 ) -> Result<DependencyFacts, String> {
-    let root_generations = dependency_root_generations(&roots, &output.0)?;
+    let root_identities = dependency_root_identities(&roots)?;
     let mut directories = Vec::new();
     for ((root, _), inventory) in roots.iter().zip(&members) {
         let mut artifacts = Vec::new();
-        let mut dep_info_names = Vec::new();
         for (name, _) in inventory {
-            if name.ends_with(".d") {
-                dep_info_names.push(name.clone());
-            } else {
-                let path = root.join(name);
-                artifacts.push(ExternFact {
-                    path: path.to_str().ok_or("non-UTF-8 dependency path")?.to_owned(),
-                    content_digest: facts.file_digest(&path).map_err(|e| e.to_string())?,
-                });
-            }
+            let path = root.join(name);
+            artifacts.push(ExternFact {
+                path: path.to_str().ok_or("non-UTF-8 dependency path")?.to_owned(),
+                content_digest: facts.file_digest(&path).map_err(|e| e.to_string())?,
+            });
         }
         directories.push(DependencyDirectoryFact {
             path: root.to_str().ok_or("non-UTF-8 dependency root")?.to_owned(),
             artifacts,
-            dep_info_names,
         });
     }
     let captured = DependencyFacts {
@@ -467,7 +513,7 @@ fn capture_dependencies(
         roots,
         members,
         output,
-        root_generations,
+        root_identities,
     };
     captured.verify_unchanged()?;
     Ok(captured)
@@ -578,12 +624,21 @@ fn observe_generated(root: &Path) -> Result<(GeneratedObservation, u64), String>
     if after != before {
         return Err("generated root changed during observation".into());
     }
-    // The pinned Cargo run record is a sibling of OUT_DIR. Unknown
-    // layouts remain unserved; root-output binds this record to our unit.
-    let run = root
-        .parent()
-        .ok_or("generated root has no parent")?
-        .join("run");
+    // Cargo's completed run record for this OUT_DIR. The build-dir layout
+    // keeps it in a `run/` sibling of OUT_DIR (`root-output`, `stdout`);
+    // the classic `build/<pkg>-<hash>/` layout that stable Cargo uses keeps
+    // the same two records beside `out/` (`root-output`, `output`). Any
+    // other layout remains unserved; root-output binds the record to our
+    // unit either way, and both directories' identities are revalidated.
+    let unit = root.parent().ok_or("generated root has no parent")?;
+    let (run, script_record) = match std::fs::symlink_metadata(unit.join("run")) {
+        Ok(meta) if meta.is_dir() => (unit.join("run"), "stdout"),
+        Ok(_) => return Err("build-script run directory is not real".into()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            (unit.to_path_buf(), "output")
+        }
+        Err(error) => return Err(format!("build-script run directory: {error}")),
+    };
     let run_meta = std::fs::symlink_metadata(&run)
         .map_err(|error| format!("build-script run directory: {error}"))?;
     if !run_meta.is_dir() {
@@ -596,7 +651,7 @@ fn observe_generated(root: &Path) -> Result<(GeneratedObservation, u64), String>
     if root_bytes != root.to_str().ok_or("non-UTF-8 generated root")?.as_bytes() {
         return Err("Cargo build-script record names a different OUT_DIR".into());
     }
-    let script_output = run.join("stdout");
+    let script_output = run.join(script_record);
     let script_sig =
         lstat_regular(&script_output).map_err(|error| format!("build-script stdout: {error}"))?;
     if script_sig.size > 1024 * 1024 {
@@ -868,8 +923,7 @@ impl LiveFacts {
         let (members, bytes) = walk_dependencies(&roots).map_err(FactsMiss::Refused)?;
         let output = (PathBuf::from(&plan.out_dir), plan.output_names());
         reject_dependency_output_aliases(&roots, &members, &output).map_err(FactsMiss::Refused)?;
-        let root_generations =
-            dependency_root_generations(&roots, &output.0).map_err(FactsMiss::Refused)?;
+        let root_identities = dependency_root_identities(&roots).map_err(FactsMiss::Refused)?;
         let memo_key = (roots.clone(), output.clone());
         {
             let mut memos = self
@@ -880,7 +934,7 @@ impl LiveFacts {
                 match slot {
                     Slot::Ready(captured)
                         if captured.members == members
-                            && captured.root_generations == root_generations =>
+                            && captured.root_identities == root_identities =>
                     {
                         return Ok(Arc::clone(captured));
                     }
@@ -1282,6 +1336,42 @@ mod tests {
     }
 
     #[test]
+    fn classic_cargo_layout_binds_the_run_record_beside_out_dir() {
+        // Stable Cargo: target/<profile>/build/<pkg>-<hash>/{out,output,root-output}.
+        let dir = tempfile::tempdir().unwrap();
+        let unit = dir.path().join("build/anyhow-5c8e82dba5ceda6b");
+        let out = unit.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(out.join("value.rs"), b"pub const VALUE: u32 = 17;").unwrap();
+        std::fs::write(unit.join("output"), b"cargo:rustc-cfg=std_backtrace\n").unwrap();
+        std::fs::write(unit.join("root-output"), out.to_str().unwrap()).unwrap();
+        std::fs::write(unit.join("stderr"), b"").unwrap();
+        std::fs::write(unit.join("invoked.timestamp"), b"This file has an mtime").unwrap();
+        let (observed, _) = observe_generated(&out).unwrap();
+        assert_eq!(observed.script_output.0, unit.join("output"));
+        assert_eq!(observed.root_output.0, unit.join("root-output"));
+        assert_eq!(observe_generated(&out).unwrap().0, observed);
+        // A rerun of the build script rewrites the record: never the same.
+        std::fs::write(unit.join("output"), b"cargo:rustc-cfg=other\n").unwrap();
+        assert_ne!(observe_generated(&out).unwrap().0, observed);
+        // The record must name THIS OUT_DIR.
+        std::fs::write(unit.join("root-output"), b"/elsewhere/out").unwrap();
+        assert!(
+            observe_generated(&out)
+                .unwrap_err()
+                .contains("different OUT_DIR")
+        );
+        // A `run` entry that is not a directory is neither layout: refuse.
+        std::fs::write(unit.join("root-output"), out.to_str().unwrap()).unwrap();
+        std::fs::write(unit.join("run"), b"not a directory").unwrap();
+        assert!(observe_generated(&out).unwrap_err().contains("not real"));
+        // Without any record there is nothing to bind: refuse.
+        std::fs::remove_file(unit.join("run")).unwrap();
+        std::fs::remove_file(unit.join("output")).unwrap();
+        assert!(observe_generated(&out).unwrap_err().contains("stdout"));
+    }
+
+    #[test]
     fn generated_inputs_empty_tree_still_requires_real_cargo_output_record() {
         let (dir, plan) = generated_fixture();
         let generated = Path::new(plan.generated_root.as_ref().unwrap());
@@ -1349,10 +1439,12 @@ mod tests {
             .unwrap()
         };
         let first = capture();
+        // Dep-info is never opened as a crate: it is neither listed nor keyed.
         assert_eq!(first.directories[0].artifacts.len(), 1);
-        assert_eq!(first.directories[0].dep_info_names, ["dep.d"]);
         // This invocation's exact declared outputs may appear while executing.
         std::fs::write(root.join("libcurrent.rmeta"), b"new output").unwrap();
+        first.verify_unchanged().unwrap();
+        std::fs::remove_file(root.join("dep.d")).unwrap();
         first.verify_unchanged().unwrap();
         std::fs::write(&artifact, b"other").unwrap();
         assert!(first.verify_unchanged().is_err());
@@ -1375,13 +1467,15 @@ mod tests {
     }
 
     #[test]
-    fn dependency_candidates_refuse_unmodeled_files_and_symlinks() {
+    fn dependency_candidates_refuse_unmodeled_crate_files_and_symlinks() {
+        // Everything rustc's locator could open that this class does not
+        // model (proc-macros/dylibs, interfaces, static libs) still refuses.
         for name in [
             "libmacro.so",
             "libmacro.dylib",
             "libnative.a",
-            "unknown",
-            "nested",
+            "libiface.rs",
+            "libunknown",
         ] {
             let dir = tempfile::tempdir().unwrap();
             std::fs::write(dir.path().join(name), b"not a Rust candidate").unwrap();
@@ -1391,8 +1485,96 @@ mod tests {
             );
         }
         let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("libnested.rlib")).unwrap();
+        assert!(walk_dependencies(&vec![(dir.path().to_path_buf(), Vec::new())]).is_err());
+        let dir = tempfile::tempdir().unwrap();
         std::os::unix::fs::symlink("missing", dir.path().join("libalias.rmeta")).unwrap();
         assert!(walk_dependencies(&vec![(dir.path().to_path_buf(), Vec::new())]).is_err());
+    }
+
+    #[test]
+    fn entries_the_crate_locator_never_opens_are_not_inputs() {
+        // The scratch real Cargo leaves in a shared or pipelined dependency
+        // directory while OTHER crates compile, observed on crates.io builds.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        std::fs::write(root.join("libdep-0123.rmeta"), b"metadata").unwrap();
+        let roots = vec![(root.clone(), Vec::new())];
+        let (members, _) = walk_dependencies(&roots).unwrap();
+        let captured = capture_dependencies(
+            &LiveFacts::new(),
+            roots.clone(),
+            members.clone(),
+            (dir.path().join("out"), Vec::new()),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("regex_syntax-0123.regex_syntax.ab12-cgu.13.rcgu.o"),
+            b"codegen unit",
+        )
+        .unwrap();
+        std::fs::create_dir(root.join("rmeta9POLSO")).unwrap();
+        std::fs::write(root.join("rmeta9POLSO/full.rmeta"), b"in flight").unwrap();
+        std::fs::write(root.join("serde_derive-0123.d"), b"dep-info").unwrap();
+        std::fs::write(root.join("app-0123"), b"executable").unwrap();
+        std::fs::create_dir(root.join(".tmpQx.temp-archive")).unwrap();
+        assert_eq!(walk_dependencies(&roots).unwrap().0, members);
+        captured.verify_unchanged().unwrap();
+        // A crate the locator CAN open still changes the inputs.
+        std::fs::write(root.join("libother-4567.rmeta"), b"other metadata").unwrap();
+        assert!(
+            captured
+                .verify_unchanged()
+                .unwrap_err()
+                .contains("candidates changed")
+        );
+    }
+
+    #[test]
+    fn a_pipelined_rlib_is_shadowed_by_its_metadata_and_stale_pairs_refuse() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let roots = vec![(root.clone(), Vec::new())];
+        let rmeta = root.join("libdep-0123.rmeta");
+        std::fs::write(&rmeta, b"metadata").unwrap();
+        let (before, _) = walk_dependencies(&roots).unwrap();
+        let captured = capture_dependencies(
+            &LiveFacts::new(),
+            roots.clone(),
+            before.clone(),
+            (dir.path().join("out"), Vec::new()),
+        )
+        .unwrap();
+        // rustc finishes the dependency's codegen while its dependent runs:
+        // the library compile only ever reads the metadata, so nothing moved.
+        std::thread::sleep(Duration::from_millis(5));
+        std::fs::write(root.join("libdep-0123.rlib"), b"archive").unwrap();
+        assert_eq!(walk_dependencies(&roots).unwrap().0, before);
+        captured.verify_unchanged().unwrap();
+        assert_eq!(captured.directories[0].artifacts.len(), 1);
+
+        // Metadata rewritten AFTER the archive: the pair is from two compiles.
+        std::thread::sleep(Duration::from_millis(5));
+        std::fs::write(&rmeta, b"newer metadata").unwrap();
+        assert!(
+            walk_dependencies(&roots)
+                .unwrap_err()
+                .contains("older than its metadata")
+        );
+
+        // The locator skips an empty rmeta, so the archive is the candidate.
+        std::fs::write(&rmeta, b"").unwrap();
+        std::fs::write(root.join("libdep-0123.rlib"), b"archive").unwrap();
+        let (members, _) = walk_dependencies(&roots).unwrap();
+        let names: Vec<_> = members[0].iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(names, ["libdep-0123.rlib", "libdep-0123.rmeta"]);
+
+        // Without any metadata sibling the archive is keyed like before.
+        let lone = tempfile::tempdir().unwrap();
+        std::fs::write(lone.path().join("libsolo-89.rlib"), b"archive").unwrap();
+        let (members, _) =
+            walk_dependencies(&vec![(lone.path().to_path_buf(), Vec::new())]).unwrap();
+        assert_eq!(members[0].len(), 1);
     }
 
     #[test]
@@ -1436,7 +1618,7 @@ mod tests {
     }
 
     #[test]
-    fn dependency_candidates_detect_transient_members_in_read_only_roots() {
+    fn dependency_roots_are_bound_by_identity_not_generation() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("dependency");
         let out = dir.path().join("out");
@@ -1452,22 +1634,36 @@ mod tests {
             (out, Vec::new()),
         )
         .unwrap();
+        // Scratch churn bumps the directory generation; it is not an input.
+        std::fs::write(root.join("stable-0.stable.1-cgu.0.rcgu.o"), b"o").unwrap();
+        std::fs::remove_file(root.join("stable-0.stable.1-cgu.0.rcgu.o")).unwrap();
+        captured.verify_unchanged().unwrap();
+        // Deliberately NOT detected any more: a crate-named file renamed in
+        // and out again between two walks. rustc and Cargo never do this
+        // (they rename finished crates into place and keep them for the
+        // build); binding the generation instead refused every pipelined
+        // compile whose dependency was still writing codegen units.
         let outside = dir.path().join("transient.rmeta");
         std::fs::write(&outside, b"transient candidate").unwrap();
         std::fs::rename(&outside, root.join("libtransient.rmeta")).unwrap();
         std::fs::rename(root.join("libtransient.rmeta"), &outside).unwrap();
+        captured.verify_unchanged().unwrap();
+        // The same path naming a DIFFERENT directory is still refused, even
+        // when it holds the very same candidate inode.
+        let moved = dir.path().join("moved");
+        std::fs::rename(&root, &moved).unwrap();
+        std::fs::create_dir(&root).unwrap();
+        std::fs::rename(moved.join("libstable.rlib"), root.join("libstable.rlib")).unwrap();
         assert_eq!(
-            walk_dependencies(&roots).unwrap().0,
-            members,
-            "final membership and file identities are deliberately identical"
+            walk_dependencies(&roots).unwrap().0[0][0].0,
+            "libstable.rlib"
         );
         assert!(
             captured
                 .verify_unchanged()
                 .unwrap_err()
-                .contains("directory generation changed")
+                .contains("was replaced")
         );
-        assert_eq!(std::fs::read(outside).unwrap(), b"transient candidate");
     }
 
     #[test]

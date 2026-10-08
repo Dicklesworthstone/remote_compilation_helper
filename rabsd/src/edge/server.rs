@@ -123,13 +123,25 @@ pub struct EdgeServerConfig {
     pub live_dependency: Option<crate::coord::live_dependency::LiveDependencyLane>,
 }
 
+/// One NDJSON event on stderr. Values are JSON-encoded, so a reason that
+/// quotes a path or an OS error with backslashes or newlines stays one
+/// parseable line instead of silently dropping out of the decision trail.
 fn log_line(kind: &str, fields: &[(&str, &str)]) {
-    let mut line = format!("{{\"v\":1,\"kind\":\"{kind}\"");
+    eprintln!("{}", render_log_line(kind, fields));
+}
+
+/// Field order is preserved (a `Map` would sort it) for human readers.
+fn render_log_line(kind: &str, fields: &[(&str, &str)]) -> String {
+    let mut line = format!("{{\"v\":1,\"kind\":{}", serde_json::Value::from(kind));
     for (key, value) in fields {
-        line.push_str(&format!(",\"{}\":\"{}\"", key, value.replace('"', "'")));
+        line.push_str(&format!(
+            ",{}:{}",
+            serde_json::Value::from(*key),
+            serde_json::Value::from(*value)
+        ));
     }
     line.push('}');
-    eprintln!("{line}");
+    line
 }
 
 /// Build the edge [`SubsystemWork`] for [`DaemonRunOptions`].
@@ -1339,6 +1351,23 @@ mod edge_liveness_tests {
     use std::sync::{Arc, mpsc};
     use std::task::{Context, Poll, Waker};
     use std::time::Instant;
+
+    #[test]
+    fn log_lines_stay_one_parseable_json_object_for_any_reason_text() {
+        let reason = "facts-refused: \"C:\\tmp\\x\" line one\nline two\t\u{7}";
+        let line = render_log_line(
+            "rabsd-live-dependency",
+            &[("decision", "pass-through"), ("reason", reason)],
+        );
+        assert!(!line.contains('\n'), "{line}");
+        let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(value["v"], 1);
+        assert_eq!(value["kind"], "rabsd-live-dependency");
+        assert_eq!(value["decision"], "pass-through");
+        assert_eq!(value["reason"], reason);
+        // Field order is kept for people reading the raw stream.
+        assert!(line.find("\"decision\"").unwrap() < line.find("\"reason\"").unwrap());
+    }
 
     #[test]
     fn prepared_preview_requires_exact_identity_attempt_and_cursor_fields() {

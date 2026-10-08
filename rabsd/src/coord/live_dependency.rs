@@ -879,7 +879,7 @@ impl LocalAttempt {
             }))
             .map_err(|error| error.to_string())?;
             let observed = serde_json::to_vec(&serde_json::json!({
-                "kind": "rabs-live-dependency-observed-inputs-v1",
+                "kind": "rabs-live-dependency-observed-inputs-v2",
                 "externs": self.request.externs.iter()
                     .map(|(path, digest)| serde_json::json!([path, digest_key(digest)]))
                     .collect::<Vec<_>>(),
@@ -887,7 +887,6 @@ impl LocalAttempt {
                     serde_json::json!({
                         "path": directory.path,
                         "artifacts": directory.artifacts.iter().map(|artifact| serde_json::json!([artifact.path, digest_key(&artifact.content_digest)])).collect::<Vec<_>>(),
-                        "dep_info_names": directory.dep_info_names,
                     })
                 }).collect::<Vec<_>>(),
                 "compiler": plan.compiler,

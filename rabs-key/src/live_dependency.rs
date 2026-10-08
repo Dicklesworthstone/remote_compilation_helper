@@ -113,7 +113,7 @@ pub const DOMAIN_LIVE_CWD: &str = "rabs.live-dependency.cwd.v1";
 /// Negative-dependency component domain.
 pub const DOMAIN_LIVE_NEGATIVE: &str = "rabs.live-dependency.negative.v1";
 /// Dependency-artifact component domain (inputs + name binding).
-pub const DOMAIN_LIVE_ARTIFACTS: &str = "rabs.live-dependency.artifacts.v3";
+pub const DOMAIN_LIVE_ARTIFACTS: &str = "rabs.live-dependency.artifacts.v4";
 /// Sandbox/isolation policy component domain.
 pub const DOMAIN_LIVE_ISOLATION: &str = "rabs.live-dependency.isolation.v1";
 /// Execution-semantics component domain.
@@ -124,19 +124,20 @@ pub const DOMAIN_LIVE_TARGET_SPEC: &str = "rabs.live-dependency.target-spec.v1";
 /// The registry isolation profile. Deliberately plain: it is NOT a
 /// sandbox, and the key says so. V2 requires new evidence after closing
 /// warm-root symlink and leave-and-reenter dep-info traversal gaps.
-pub const ISOLATION_PROFILE: &str = "live-dependency-v4: unsandboxed local edge process; \
+pub const ISOLATION_PROFILE: &str = "live-dependency-v5: unsandboxed local edge process; \
      environment constructed by dependency-env-v1 (allowlisted names keyed, jobserver \
      passthrough unkeyed, all other names absent); source = complete registry package \
      tree with a real directory root revalidated on every observation; closure enforced \
      after execution by dep-info traversal bounded to the observed source root; proc-macro \
      consumption refused; generated compiler inputs captured as a complete disjoint \
      regular-file OUT_DIR tree, with exact OUT_DIR spelling keyed and generation revalidated; \
-     build-script execution is not cached; exact regular Rust dependency \
-     directory candidates revalidated before serving and after execution";
+     build-script execution is not cached; exact crate-locator candidates of every \
+     dependency directory (lib-prefixed rlib/rmeta, metadata-shadowed rlibs excluded, \
+     other lib-prefixed kinds refused) revalidated before serving and after execution";
 
 /// Git checkout capture includes all source members, including dirty and
 /// untracked files, but never authorizes reads of Git metadata.
-pub const GIT_ISOLATION_PROFILE: &str = "live-git-dependency-v3: unsandboxed local edge process; \
+pub const GIT_ISOLATION_PROFILE: &str = "live-git-dependency-v4: unsandboxed local edge process; \
      environment constructed by dependency-env-v1 (allowlisted names keyed, jobserver \
      passthrough unkeyed, all other names absent); source = complete Cargo Git checkout \
      tree including dirty and untracked source files, root .git excluded before capture; \
@@ -144,8 +145,9 @@ pub const GIT_ISOLATION_PROFILE: &str = "live-git-dependency-v3: unsandboxed loc
      by dep-info traversal bounded to the observed source root, Git metadata reads refused; \
      proc-macro consumption refused; generated compiler inputs captured as a complete disjoint \
      regular-file OUT_DIR tree, with exact OUT_DIR spelling keyed and generation revalidated; \
-     build-script execution is not cached; exact regular Rust dependency \
-     directory candidates revalidated before serving and after execution";
+     build-script execution is not cached; exact crate-locator candidates of every \
+     dependency directory (lib-prefixed rlib/rmeta, metadata-shadowed rlibs excluded, \
+     other lib-prefixed kinds refused) revalidated before serving and after execution";
 
 /// What the executed compiler must produce for a publishable result.
 pub const EXECUTION_SEMANTICS: &str = "live-dependency-v1: rustc exit status 0 by normal \
@@ -475,17 +477,18 @@ pub struct ExternFact {
     pub content_digest: TypedDigest,
 }
 
-/// Complete candidate inventory of one dependency search directory.
-/// Only regular Rust artifacts and inert dep-info companions are admitted.
+/// Complete crate-candidate inventory of one dependency search directory:
+/// exactly the files rustc's crate locator can open for a library compile.
+/// Entries the locator never opens (no `lib` prefix: codegen scratch, temp
+/// directories, dep-info, executables) and `.rlib`s shadowed by a non-empty
+/// same-stem `.rmeta` are not inputs and are not listed; the edge refuses
+/// any other `lib*` entry (dylibs, proc-macros, interfaces, static libs).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DependencyDirectoryFact {
     /// Real absolute directory, in the plan's first-use order.
     pub path: String,
     /// Every `.rmeta`/`.rlib` candidate, sorted by absolute path.
     pub artifacts: Vec<ExternFact>,
-    /// Regular `.d` companions, sorted by file name. Their bytes cannot
-    /// participate in rustc artifact resolution; their membership is bound.
-    pub dep_info_names: Vec<String>,
 }
 
 /// The exact key of one live dependency action.
@@ -853,7 +856,7 @@ fn artifacts_component(
     }
     let mut candidates = CanonicalEncoder::new();
     candidates
-        .str("exact-dependency-candidates-v1")
+        .str("exact-crate-locator-candidates-v2")
         .u64(directories.len() as u64);
     for (root, directory) in plan.dependency_dirs.iter().zip(directories) {
         if &directory.path != root {
@@ -870,7 +873,9 @@ fn artifacts_component(
                 .path
                 .strip_prefix(&prefix)
                 .filter(|name| {
-                    safe_component(name) && (name.ends_with(".rlib") || name.ends_with(".rmeta"))
+                    safe_component(name)
+                        && name.starts_with("lib")
+                        && (name.ends_with(".rlib") || name.ends_with(".rmeta"))
                 })
                 .ok_or_else(|| LiveRefusal::Facts("invalid Rust dependency candidate".into()))?;
             if previous.is_some_and(|old: &str| old >= name)
@@ -886,21 +891,6 @@ fn artifacts_component(
                 .str(name)
                 .str(artifact.content_digest.domain)
                 .bytes(&artifact.content_digest.bytes);
-        }
-        previous = None;
-        candidates.u64(directory.dep_info_names.len() as u64);
-        for name in &directory.dep_info_names {
-            if !safe_component(name)
-                || !name.ends_with(".d")
-                || previous.is_some_and(|old| old >= name.as_str())
-                || (root == &plan.out_dir && plan.output_names().contains(name))
-            {
-                return Err(LiveRefusal::Facts(
-                    "invalid dep-info companion inventory".into(),
-                ));
-            }
-            previous = Some(name);
-            candidates.str(name);
         }
     }
     for fact in facts {
@@ -1497,7 +1487,6 @@ mod tests {
                 DependencyDirectoryFact {
                     path: root.clone(),
                     artifacts,
-                    dep_info_names: Vec::new(),
                 }
             })
             .collect()

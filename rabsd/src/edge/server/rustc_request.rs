@@ -120,6 +120,22 @@ fn log(decision: &str, fields: &[(&str, &str)]) {
     super::log_line("rabsd-live-dependency", &pairs);
 }
 
+/// The unit's `--crate-name`, so every request decision says which crate
+/// it answered. Cargo compiles many units at once; a key alone cannot
+/// explain which dependency missed or why (`rch why` needs both).
+fn crate_name(argv: &[String]) -> &str {
+    argv.iter()
+        .enumerate()
+        .find_map(|(at, arg)| {
+            arg.strip_prefix("--crate-name=").or_else(|| {
+                (arg == "--crate-name")
+                    .then(|| argv.get(at + 1).map(String::as_str))
+                    .flatten()
+            })
+        })
+        .unwrap_or("?")
+}
+
 struct Parsed {
     argv: Vec<String>,
     cwd: String,
@@ -177,6 +193,13 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
     let Some(parsed) = parse_request(request) else {
         return Decided::Reply(pass_through("malformed-request"));
     };
+    let unit = crate_name(&parsed.argv);
+    // Every refusal below is logged with its reason: an unexplained miss is
+    // indistinguishable from a lane that never saw the request.
+    let refuse = |reason: &str| {
+        log("pass-through", &[("crate", unit), ("reason", reason)]);
+        Decided::Reply(pass_through(reason))
+    };
     let constructed = constructed_environment(&parsed.env);
     let toolchain = match live
         .facts
@@ -184,19 +207,29 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
     {
         Ok(toolchain) => toolchain,
         Err(FactsMiss::Pending) => {
-            log("toolchain-warming", &[("compiler", &parsed.argv[0])]);
+            log(
+                "toolchain-warming",
+                &[("crate", unit), ("compiler", &parsed.argv[0])],
+            );
             return Decided::Shadow(observation(&parsed));
         }
         Err(FactsMiss::Refused(reason)) => {
             log(
                 "shadow",
-                &[("reason", "toolchain-refused"), ("detail", &reason)],
+                &[
+                    ("crate", unit),
+                    ("reason", "toolchain-refused"),
+                    ("detail", &reason),
+                ],
             );
             return Decided::Shadow(observation(&parsed));
         }
     };
     let Some(host) = toolchain.host_triple().map(str::to_owned) else {
-        log("shadow", &[("reason", "toolchain-host-unknown")]);
+        log(
+            "shadow",
+            &[("crate", unit), ("reason", "toolchain-host-unknown")],
+        );
         return Decided::Shadow(observation(&parsed));
     };
     let plan = match plan_dependency_action(
@@ -210,8 +243,16 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
         Ok(plan) => plan,
         Err(refusal) => {
             // Out of class (workspace members, build scripts, ...): the
-            // reason code is the `rch why`-grade explanation.
-            log("shadow", &[("reason", refusal.code())]);
+            // reason code is the `rch why`-grade explanation; the detail
+            // names the exact argument or variable that put it there.
+            log(
+                "shadow",
+                &[
+                    ("crate", unit),
+                    ("reason", refusal.code()),
+                    ("detail", &refusal.to_string()),
+                ],
+            );
             return Decided::Shadow(observation(&parsed));
         }
     };
@@ -225,6 +266,7 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
             log(
                 "pass-through",
                 &[
+                    ("crate", unit),
                     ("package", &plan.package_root),
                     ("source", &plan.source_root),
                     ("reason", &miss.to_string()),
@@ -234,7 +276,7 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
         }
     };
     if let Err(reason) = package.verify_generated_disjoint(&plan) {
-        return Decided::Reply(pass_through(&reason));
+        return refuse(&reason);
     }
     let mut inputs = ActionInputManifest {
         schema_version: INPUT_EVIDENCE_SCHEMA_VERSION,
@@ -268,7 +310,7 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
     let mut externs = Vec::new();
     let dependencies = match live.facts.dependencies(&plan) {
         Ok(dependencies) => dependencies,
-        Err(miss) => return Decided::Reply(pass_through(&miss.to_string())),
+        Err(miss) => return refuse(&miss.to_string()),
     };
     for planned in &plan.externs {
         if let PlannedExtern::File { path, .. } = planned {
@@ -277,9 +319,7 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
                     path: path.clone(),
                     content_digest: digest,
                 }),
-                Err(error) => {
-                    return Decided::Reply(pass_through(&format!("extern-unreadable: {error}")));
-                }
+                Err(error) => return refuse(&format!("extern-unreadable: {error}")),
             }
         }
     }
@@ -292,7 +332,17 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
         &inputs,
     ) {
         Ok(key) => key,
-        Err(refusal) => return Decided::Reply(pass_through(refusal.code())),
+        Err(refusal) => {
+            log(
+                "pass-through",
+                &[
+                    ("crate", unit),
+                    ("reason", refusal.code()),
+                    ("detail", &refusal.to_string()),
+                ],
+            );
+            return Decided::Reply(pass_through(refusal.code()));
+        }
     };
     let key_text = digest_key(&key.action_key);
     let decision = live.lane.decide(LiveDependencyRequest {
@@ -309,14 +359,20 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
     decision_reply(
         decision,
         &key_text,
+        unit,
         request.get("wait_for_inflight").and_then(Value::as_bool) == Some(true),
     )
 }
 
-fn decision_reply(decision: LiveDecision, key_text: &str, wait_for_inflight: bool) -> Decided {
+fn decision_reply(
+    decision: LiveDecision,
+    key_text: &str,
+    unit: &str,
+    wait_for_inflight: bool,
+) -> Decided {
     match decision {
         LiveDecision::Hit(pending) => {
-            log("hit", &[("key", key_text)]);
+            log("hit", &[("crate", unit), ("key", key_text)]);
             Decided::Hit {
                 reply: json!({
                     "kind": "rustc-decision", "decision": "hit",
@@ -329,7 +385,11 @@ fn decision_reply(decision: LiveDecision, key_text: &str, wait_for_inflight: boo
         LiveDecision::Execute(attempt) => {
             log(
                 "execute",
-                &[("key", key_text), ("attempt", &attempt.attempt_hex())],
+                &[
+                    ("crate", unit),
+                    ("key", key_text),
+                    ("attempt", &attempt.attempt_hex()),
+                ],
             );
             let reply = json!({
                 "kind": "rustc-decision", "decision": "execute",
@@ -344,7 +404,7 @@ fn decision_reply(decision: LiveDecision, key_text: &str, wait_for_inflight: boo
             }
         }
         LiveDecision::InFlight if wait_for_inflight => {
-            log("wait", &[("key", key_text)]);
+            log("wait", &[("crate", unit), ("key", key_text)]);
             // Reply releases the blocking lane immediately. No waiter task,
             // actor, or output ownership is retained: the existing connection
             // quota bounds retries, and every retry passes through decide.
@@ -365,7 +425,10 @@ fn decision_reply(decision: LiveDecision, key_text: &str, wait_for_inflight: boo
             ))
         }
         LiveDecision::PassThrough(reason) => {
-            log("pass-through", &[("key", key_text), ("reason", &reason)]);
+            log(
+                "pass-through",
+                &[("crate", unit), ("key", key_text), ("reason", &reason)],
+            );
             Decided::Reply(pass_through(&reason))
         }
     }
@@ -476,8 +539,27 @@ mod tests {
     }
 
     #[test]
+    fn decisions_name_the_crate_in_either_argv_spelling() {
+        let argv = |args: &[&str]| args.iter().map(|&arg| arg.to_owned()).collect::<Vec<_>>();
+        assert_eq!(
+            crate_name(&argv(&[
+                "/r",
+                "--crate-name",
+                "serde_json",
+                "--edition=2021"
+            ])),
+            "serde_json"
+        );
+        assert_eq!(crate_name(&argv(&["/r", "--crate-name=itoa"])), "itoa");
+        // Malformed or probe invocations still log, with an explicit unknown.
+        assert_eq!(crate_name(&argv(&["/r", "--crate-name"])), "?");
+        assert_eq!(crate_name(&argv(&["/r", "-vV"])), "?");
+    }
+
+    #[test]
     fn in_flight_is_a_non_owning_retry_not_a_hit_or_execution() {
-        let Decided::Reply(reply) = decision_reply(LiveDecision::InFlight, "key", true) else {
+        let Decided::Reply(reply) = decision_reply(LiveDecision::InFlight, "key", "leaf", true)
+        else {
             panic!("a follower must not retain an attempt or install capability");
         };
         let reply: Value = serde_json::from_str(&reply).unwrap();
@@ -496,7 +578,7 @@ mod tests {
             (LiveDecision::InFlight, false),
             (LiveDecision::PassThrough("store unavailable".into()), true),
         ] {
-            let Decided::Reply(reply) = decision_reply(decision, "key", opted_in) else {
+            let Decided::Reply(reply) = decision_reply(decision, "key", "leaf", opted_in) else {
                 panic!("no execution or output ownership on refusal");
             };
             let reply: Value = serde_json::from_str(&reply).unwrap();
