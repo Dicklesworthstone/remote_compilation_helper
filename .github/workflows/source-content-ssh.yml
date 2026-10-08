@@ -17,7 +17,7 @@ permissions:
 jobs:
   ssh-integrity:
     if: >-
-      github.event_name != 'push' || !contains(github.event.head_commit.message, '[source84-land-3993bd6]')
+      github.event_name != 'push' || !contains(github.event.head_commit.message, '[source84-land-two-files]')
     runs-on: ubuntu-latest
     timeout-minutes: 15
     defaults:
@@ -57,7 +57,7 @@ jobs:
 
   land-reviewed-integration:
     if: >-
-      github.event_name == 'push' && contains(github.event.head_commit.message, '[source84-land-3993bd6]')
+      github.event_name == 'push' && contains(github.event.head_commit.message, '[source84-land-two-files]')
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 20
     permissions:
@@ -83,13 +83,12 @@ jobs:
           expected = {
               'rch/src/transfer.rs': '3993bd67aabffaeea3c350e161badf493e6e37f5',
               'rch/src/hook/ssh.rs': 'cffe0da87755ae18979eb43459fafcc53eb37b30',
-              'rabs-scheduler/src/managed_pool.rs': 'c91e4b77b877c6ef32b68583aabffa61f90ae2c3',
+              'rabs-scheduler/src/managed_pool.rs': '7764f25a28db90c94a42e0a2499ef162b15508b1',
               'rch/src/transfer/source_content_barrier.rs': 'd7db94dcc5dcd6fea5578f605514433fccf78a7c',
           }
           patched = {
               'rch/src/transfer.rs': 'e526b7541cdce2afb1370051143c79af74c543da',
               'rch/src/hook/ssh.rs': '9f8ae192920da80e3c6948658e1385d7a1a6387b',
-              'rabs-scheduler/src/managed_pool.rs': '7764f25a28db90c94a42e0a2499ef162b15508b1',
           }
           def git_hash(path):
               return subprocess.check_output(['git', 'hash-object', path], text=True).strip()
@@ -98,7 +97,7 @@ jobs:
                   raise RuntimeError(f'{path} changed; refusing stale publication')
           for path in ['scripts/test_source_content_ssh.py', '.github/workflows/source-content-ssh.yml']:
               expected[path] = git_hash(path)
-          sha = '376094969d60956f794375eead0e3c5df1231321'
+          sha = '732e86d0641f08e14f338ba62596cd5a54cdc00d'
           request = urllib.request.Request(
               f"https://api.github.com/repos/{os.environ['GITHUB_REPOSITORY']}/git/blobs/{sha}",
               headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json'})
@@ -134,7 +133,7 @@ jobs:
           rustfmt --check --edition 2024 --config skip_children=true rch/src/transfer.rs rch/src/hook/ssh.rs rch/src/transfer/source_content_barrier.rs rabs-scheduler/src/managed_pool.rs
           git diff --check
           python3 scripts/test_source_content_ssh.py --evidence "$RUNNER_TEMP/source84-evidence" 2>&1 | tee "$RUNNER_TEMP/source84-evidence/run.log"
-      - name: Publish the three qualified files directly to main without force
+      - name: Publish the qualified transport files directly to main without force
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -142,7 +141,7 @@ jobs:
           python3 - <<'PY'
           import base64, json, os, pathlib, subprocess, urllib.request
           repo = os.environ['GITHUB_REPOSITORY']
-          paths = ['rch/src/transfer.rs', 'rch/src/hook/ssh.rs', 'rabs-scheduler/src/managed_pool.rs']
+          paths = ['rch/src/transfer.rs', 'rch/src/hook/ssh.rs']
           evidence = pathlib.Path(os.environ['RUNNER_TEMP']) / 'source84-evidence'
           expected = json.loads((evidence / 'baseline.json').read_text())
           def api(suffix, payload=None, method=None):
