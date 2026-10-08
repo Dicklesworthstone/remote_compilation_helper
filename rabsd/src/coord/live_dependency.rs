@@ -285,6 +285,56 @@ pub struct CompletionReport {
     pub stderr: Vec<u8>,
 }
 
+/// A complete immutable result, not yet an action publication. Capture has
+/// finished ALL reads from the subscriber's input/output tree. The opaque
+/// owner keeps the attempt alive without a store lock or blocking-lane permit.
+/// Dropping it settles the attempt without publishing, including on disconnect.
+#[derive(Debug)]
+pub struct CapturedLocalAttempt {
+    attempt: LocalAttempt,
+    result: CapturedLocalResult,
+}
+
+#[derive(Debug)]
+struct CapturedLocalResult {
+    offer: OfferPreparedActionResult,
+    transcript: ObjectId,
+    manifest_key: String,
+    known: Vec<KnownOutput>,
+}
+
+impl CapturedLocalAttempt {
+    /// Action whose exact outputs were captured.
+    #[must_use]
+    pub fn action_key(&self) -> &TypedDigest {
+        self.attempt.action_key()
+    }
+
+    /// Admitted execution identity, never supplied by the completion report.
+    #[must_use]
+    pub fn attempt_hex(&self) -> String {
+        self.attempt.attempt_hex()
+    }
+
+    /// Content identity of the already durable canonical result manifest.
+    #[must_use]
+    pub fn manifest_key(&self) -> &str {
+        &self.result.manifest_key
+    }
+
+    /// Publish the captured CAS objects through the existing coordinator gate.
+    /// This performs no reads from the subscriber's mutable target or inputs.
+    /// The transport must obtain the capture acknowledgment before calling it.
+    pub fn publish(mut self) -> (CompletionOutcome, Vec<KnownOutput>) {
+        let result = self.attempt.publish_captured(self.result);
+        self.attempt.settle();
+        match result {
+            Ok(outcome) => outcome,
+            Err(reason) => (CompletionOutcome::NotPublished(reason), Vec::new()),
+        }
+    }
+}
+
 /// Coordinator-side handle for the live dependency lane.
 #[derive(Debug, Clone)]
 pub struct LiveDependencyLane {
@@ -637,9 +687,8 @@ impl LiveDependencyLane {
 }
 
 /// One admitted local execution. Dropping it unsettled drains and
-/// finishes the attempt WITHOUT publication: an attempt that never
-/// reported completion can never offer, because offers are only built by
-/// [`LocalAttempt::complete`], which consumes it.
+/// finishes the attempt WITHOUT publication. Capturing consumes this owner
+/// and retains it until the result is published or abandoned.
 #[derive(Debug)]
 pub struct LocalAttempt {
     coord: Arc<CoordLive>,
@@ -712,22 +761,28 @@ impl LocalAttempt {
         }
     }
 
-    /// Complete the attempt from the subscriber's report: harvest, upload
-    /// and offer when the run is publishable, then settle.
-    pub fn complete(mut self, report: &CompletionReport) -> (CompletionOutcome, Vec<KnownOutput>) {
-        let result = self.publish(report);
-        self.settle();
-        match result {
-            Ok(outcome) => outcome,
+    /// Complete a locally owned execution without a transport handoff.
+    pub fn complete(self, report: &CompletionReport) -> (CompletionOutcome, Vec<KnownOutput>) {
+        match self.capture(report) {
+            Ok(captured) => captured.publish(),
             Err(reason) => (CompletionOutcome::NotPublished(reason), Vec::new()),
         }
     }
 
+    /// Capture every declared output, transcript and evidence object into CAS.
+    /// This never commits an action pointer. On failure the consumed attempt
+    /// is settled; on success the returned opaque owner can be acknowledged
+    /// and published later without reopening any caller-owned file.
+    pub fn capture(self, report: &CompletionReport) -> Result<CapturedLocalAttempt, String> {
+        let result = self.capture_result(report)?;
+        Ok(CapturedLocalAttempt {
+            attempt: self,
+            result,
+        })
+    }
+
     #[allow(clippy::too_many_lines)]
-    fn publish(
-        &self,
-        report: &CompletionReport,
-    ) -> Result<(CompletionOutcome, Vec<KnownOutput>), String> {
+    fn capture_result(&self, report: &CompletionReport) -> Result<CapturedLocalResult, String> {
         self.advance(AttemptState::ProcessExited)?;
         if report.signal.is_some() || report.exit_code != Some(0) {
             return Err(format!(
@@ -773,6 +828,13 @@ impl LocalAttempt {
             harvested.push((declaration, path, sig, committed_bytes));
         }
         let transcript = canonicalize_placements(&report.stderr, plan)?;
+        // The complete capture must be from one stable input generation, not
+        // just start with one. After this barrier publication uses CAS only.
+        self.request
+            .package
+            .verify_unchanged(Path::new(&plan.source_root))?;
+        self.request.package.verify_generated_disjoint(plan)?;
+        self.request.dependencies.verify_unchanged()?;
         self.advance(AttemptState::HarvestingOutputs)?;
 
         let cas = self.coord.live_cas().ok_or("no CAS mounted")?;
@@ -927,7 +989,25 @@ impl LocalAttempt {
             return Err("re-stamping changed the manifest bytes".into());
         }
         self.advance(AttemptState::PreparedResultOffered)?;
+        Ok(CapturedLocalResult {
+            offer,
+            transcript: transcript_id,
+            manifest_key: digest_key(&manifest_id.0),
+            known,
+        })
+    }
 
+    fn publish_captured(
+        &self,
+        captured: CapturedLocalResult,
+    ) -> Result<(CompletionOutcome, Vec<KnownOutput>), String> {
+        let CapturedLocalResult {
+            offer,
+            transcript,
+            known,
+            ..
+        } = captured;
+        let cas = self.coord.live_cas().ok_or("no CAS mounted")?;
         let outcome = match self
             .coord
             .commit_offer(&offer, &self.request.key.descriptor_digest)
@@ -956,7 +1036,7 @@ impl LocalAttempt {
             LIVE_TRANSCRIPT_RECEIPT,
             &digest_key(&self.key),
             0,
-            &digest_key(&transcript_id.0),
+            &digest_key(&transcript.0),
             "canonical stderr transcript of the committed live dependency result",
         );
         Ok((outcome, known))
