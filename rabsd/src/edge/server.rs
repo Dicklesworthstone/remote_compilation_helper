@@ -49,10 +49,10 @@ const PREPARED_ADMISSION_WORKERS: usize = 2;
 /// Live dependency decisions and hit installs: a compiler is waiting on
 /// each. Saturation answers pass-through, never waits.
 const LIVE_DECISION_WORKERS: usize = 8;
-/// Live dependency completions (harvest, durable uploads, publication).
-/// Nobody waits on these — the wrapper has already exited — so they get
-/// their own, larger lane instead of crowding out decisions (observed live
-/// under `cargo -j4`: a shared lane saturated and refused decisions).
+/// Live dependency completions (capture, durable uploads, publication).
+/// Wrappers retain their outputs until capture is acknowledged, but do not
+/// wait for publication. Keep this lane separate from decisions; no worker
+/// permit is held while awaiting the subscriber's acknowledgment.
 const LIVE_COMPLETION_WORKERS: usize = 8;
 /// How long an admitted local execution may run before its completion
 /// frame must arrive (the attempt lease is longer still).
@@ -625,22 +625,26 @@ async fn handle_connection(
                         } else {
                             None
                         };
-                        let live = live.clone();
-                        let settled = match (completion, live) {
-                            (Some(frame), Some(live)) => limits
-                                .live_completion
-                                .spawn(move || rustc_request::complete(&live, attempt, &frame)),
-                            (_, _) => limits.live_completion.spawn(move || {
+                        match (completion, live.clone()) {
+                            (Some(frame), Some(live)) => {
+                                rustc_request::complete_on_lane(
+                                    &limits.live_completion,
+                                    live,
+                                    attempt,
+                                    frame,
+                                    &mut stream,
+                                )
+                                .await
+                            }
+                            _ => match limits.live_completion.spawn(move || {
                                 drop(attempt);
                                 refusal("completion-lost", "")
-                            }),
-                        };
-                        match settled {
-                            Ok(mut work) => work
-                                .wait()
-                                .await
-                                .unwrap_or_else(|error| refusal("completion", &error.to_string())),
-                            Err(error) => refusal("completion", &error.to_string()),
+                            }) {
+                                Ok(mut work) => work.wait().await.unwrap_or_else(|error| {
+                                    refusal("completion", &error.to_string())
+                                }),
+                                Err(error) => refusal("completion", &error.to_string()),
+                            },
                         }
                     }
                     Err(error) => {

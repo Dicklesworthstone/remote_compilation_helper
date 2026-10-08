@@ -15,7 +15,9 @@
 //!   writer remains, so the compiler may run);
 //! - `{"kind":"rustc-decision","decision":"execute","attempt":…,"env":[…]}`
 //!   — run the compiler with EXACTLY `env` as an admitted attempt, then send
-//!   `{"kind":"rustc-complete",…}` on the same connection;
+//!   `{"kind":"rustc-complete","capture_protocol":1,…}` while retaining the
+//!   output paths. A `rustc-captured` receipt names the immutable candidate;
+//!   only its matching `rustc-capture-ack` permits coordinator publication;
 //! - `{"kind":"rustc-decision","decision":"wait",…}` — only for requests
 //!   with `wait_for_inflight: true`: another subscriber owns the dispatch.
 //!   No writer or execution was admitted here. The wrapper may retry the
@@ -105,7 +107,7 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 fn unhex(text: &str) -> Option<Vec<u8>> {
-    if !text.len().is_multiple_of(2) {
+    if !text.len().is_multiple_of(2) || !text.as_bytes().iter().all(u8::is_ascii_hexdigit) {
         return None;
     }
     text.as_bytes()
@@ -376,7 +378,8 @@ fn decision_reply(
             Decided::Hit {
                 reply: json!({
                     "kind": "rustc-decision", "decision": "hit",
-                    "action_key": key_text, "compiler_skip_authorized": false,
+                    "action_key": key_text, "capture_protocol": 1,
+                    "compiler_skip_authorized": false,
                 })
                 .to_string(),
                 pending: Box::new(pending),
@@ -394,7 +397,7 @@ fn decision_reply(
             let reply = json!({
                 "kind": "rustc-decision", "decision": "execute",
                 "action_key": key_text, "attempt": attempt.attempt_hex(),
-                "env": attempt.execution_env(),
+                "env": attempt.execution_env(), "capture_protocol": 1,
                 "compiler_skip_authorized": false,
             })
             .to_string();
@@ -467,48 +470,255 @@ pub(super) fn install(live: &LiveEdge, pending: Box<PendingServe>) -> String {
     }
 }
 
-/// Complete an admitted attempt from the subscriber's completion frame
-/// (blocking: harvest, upload, publication). A malformed or mismatched
-/// frame settles the attempt without publication.
-pub(super) fn complete(live: &LiveEdge, attempt: Box<LocalAttempt>, frame: &[u8]) -> String {
-    let report = serde_json::from_slice::<Value>(frame)
-        .ok()
-        .and_then(|value| {
-            if value.get("kind")?.as_str()? != "rustc-complete"
-                || value.get("attempt")?.as_str()? != attempt.attempt_hex()
-            {
-                return None;
-            }
-            let code = |field: &str| -> Option<Option<i32>> {
-                match value.get(field)? {
-                    Value::Null => Some(None),
-                    number => Some(Some(i32::try_from(number.as_i64()?).ok()?)),
-                }
-            };
-            Some(CompletionReport {
-                exit_code: code("exit_code")?,
-                signal: code("signal")?,
-                stdout: unhex(value.get("stdout_hex")?.as_str()?)?,
-                stderr: unhex(value.get("stderr_hex")?.as_str()?)?,
-            })
-        });
-    let key_text = digest_key(attempt.action_key());
-    let Some(report) = report else {
-        drop(attempt);
-        log("completion-malformed", &[("key", &key_text)]);
-        return super::refusal("malformed-completion", "");
-    };
-    let (outcome, known) = attempt.complete(&report);
-    for output in known {
-        live.facts.remember(&output.path, output.sig, output.digest);
+/// The version is required: an older wrapper that sends a report and exits
+/// never supplies output custody, so its completion cannot even be captured.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CompletionFrame {
+    kind: String,
+    capture_protocol: u32,
+    attempt: String,
+    exit_code: Value,
+    signal: Value,
+    stdout_hex: String,
+    stderr_hex: String,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CaptureAck {
+    kind: String,
+    attempt: String,
+    capture: String,
+}
+
+fn completion_report(frame: &[u8], attempt: &str) -> Option<CompletionReport> {
+    let value: CompletionFrame = serde_json::from_slice(frame).ok()?;
+    if value.kind != "rustc-complete"
+        || value.capture_protocol != 1
+        || value.attempt != attempt
+        || value.stdout_hex.len().saturating_add(value.stderr_hex.len()) > 2 * MAX_TRANSCRIPT_BYTES
+    {
+        return None;
     }
-    let detail = match &outcome {
-        crate::coord::live_dependency::CompletionOutcome::NotPublished(reason)
-        | crate::coord::live_dependency::CompletionOutcome::Refused(reason) => reason.clone(),
-        _ => String::new(),
+    let code = |value: &Value| -> Option<Option<i32>> {
+        match value {
+            Value::Null => Some(None),
+            number => Some(Some(i32::try_from(number.as_i64()?).ok()?)),
+        }
     };
-    log(outcome.label(), &[("key", &key_text), ("detail", &detail)]);
-    json!({"kind": "rustc-completion", "outcome": outcome.label(), "detail": detail}).to_string()
+    Some(CompletionReport {
+        exit_code: code(&value.exit_code)?,
+        signal: code(&value.signal)?,
+        stdout: unhex(&value.stdout_hex)?,
+        stderr: unhex(&value.stderr_hex)?,
+    })
+}
+
+fn capture_ack(frame: &[u8], attempt: &str, capture: &str) -> Option<CaptureAck> {
+    // Decode the raw frame directly. Parsing via Value first would silently
+    // collapse duplicate identity/authority fields before validation.
+    let ack: CaptureAck = serde_json::from_slice(frame).ok()?;
+    (ack.kind == "rustc-capture-ack" && ack.attempt == attempt && ack.capture == capture)
+        .then_some(ack)
+}
+
+fn completion_not_published(detail: &str) -> String {
+    json!({
+        "kind": "rustc-completion", "outcome": "not-published", "detail": detail,
+        "publication_authorized": false,
+    })
+    .to_string()
+}
+
+/// No CAS lock or blocking-worker permit is retained while waiting for the
+/// wrapper. A lost, truncated, malformed or expired ACK is non-publication.
+async fn acknowledge_capture(
+    stream: &mut asupersync::net::unix::UnixStream,
+    attempt: &str,
+    capture: &str,
+) -> Option<CaptureAck> {
+    let receipt = json!({
+        "kind": "rustc-captured", "capture_protocol": 1,
+        "attempt": attempt, "capture": capture, "publication_authorized": false,
+    })
+    .to_string();
+    if !super::write_frame(stream, &receipt).await {
+        return None;
+    }
+    // The existing absolute frame budget bounds the complete ACK, not each
+    // trickled byte. The wrapper's own deadline covers report + receipt + ACK.
+    capture_ack(&super::read_frame(stream).await?, attempt, capture)
+}
+
+/// Two-phase completion on the actual admitted session. Preparation copies
+/// every output into immutable CAS objects before requesting acknowledgment;
+/// publication only consumes those captured objects, never the target paths.
+pub(super) async fn complete_on_lane(
+    lane: &super::Limit,
+    live: Arc<LiveEdge>,
+    attempt: Box<LocalAttempt>,
+    frame: Vec<u8>,
+    stream: &mut asupersync::net::unix::UnixStream,
+) -> String {
+    let prepared = match lane.spawn(move || {
+        let report = completion_report(&frame, &attempt.attempt_hex())
+            .ok_or_else(|| "malformed or unversioned completion".to_owned())?;
+        (*attempt).capture(&report)
+    }) {
+        Ok(mut work) => match work.wait().await {
+            Ok(result) => result,
+            Err(error) => Err(error.to_string()),
+        },
+        Err(error) => Err(error.to_string()),
+    };
+    let captured = match prepared {
+        Ok(captured) => captured,
+        Err(detail) => return completion_not_published(&detail),
+    };
+    let attempt_hex = captured.attempt_hex();
+    let ack = acknowledge_capture(stream, &attempt_hex, captured.manifest_key()).await;
+    let finished = lane.spawn(move || {
+        let Some(ack) = ack else {
+            drop(captured);
+            return completion_not_published("output capture was not acknowledged");
+        };
+        // Recheck against the retained candidate, not values from a new
+        // request or a mutable source path. Publication consumes this owner.
+        if ack.attempt != captured.attempt_hex() || ack.capture != captured.manifest_key() {
+            drop(captured);
+            return completion_not_published("capture identity mismatch");
+        }
+        let key_text = digest_key(captured.action_key());
+        let (outcome, known) = captured.publish();
+        for output in known {
+            live.facts.remember(&output.path, output.sig, output.digest);
+        }
+        let detail = match &outcome {
+            crate::coord::live_dependency::CompletionOutcome::NotPublished(reason)
+            | crate::coord::live_dependency::CompletionOutcome::Refused(reason) => reason.clone(),
+            _ => String::new(),
+        };
+        log(outcome.label(), &[("key", &key_text), ("detail", &detail)]);
+        json!({"kind": "rustc-completion", "outcome": outcome.label(), "detail": detail}).to_string()
+    });
+    match finished {
+        // A panic here may follow a committed pointer. Do not report a
+        // fabricated non-publication or permit another compiler execution.
+        Ok(mut work) => work.wait().await.unwrap_or_else(|error| {
+            json!({
+                "kind": "rustc-completion", "outcome": "unconfirmed",
+                "detail": error.to_string(), "reexecute": false,
+            })
+            .to_string()
+        }),
+        Err(error) => completion_not_published(&error.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod completion_capture_tests {
+    use super::*;
+
+    #[test]
+    fn completion_requires_version_exact_identity_and_bounded_valid_hex() {
+        let report = json!({
+            "kind": "rustc-complete", "capture_protocol": 1, "attempt": "attempt-a",
+            "exit_code": 0, "signal": null, "stdout_hex": "", "stderr_hex": "0aff",
+        });
+        let encoded = report.to_string();
+        assert_eq!(
+            completion_report(encoded.as_bytes(), "attempt-a")
+                .unwrap()
+                .stderr,
+            [10, 255]
+        );
+        assert!(completion_report(encoded.as_bytes(), "another-attempt").is_none());
+        let mut old_wrapper = report.clone();
+        old_wrapper.as_object_mut().unwrap().remove("capture_protocol");
+        assert!(completion_report(old_wrapper.to_string().as_bytes(), "attempt-a").is_none());
+        for (field, bad) in [
+            ("capture_protocol", json!(2)),
+            ("capture_protocol", json!("1")),
+            ("exit_code", json!(2147483648_i64)),
+            ("signal", json!(1.5)),
+            ("stderr_hex", json!("+0")),
+            ("stderr_hex", json!("f")),
+            ("stderr_hex", json!("gg")),
+            ("stdout_hex", json!("00".repeat(MAX_TRANSCRIPT_BYTES + 1))),
+        ] {
+            let mut changed = report.clone();
+            changed[field] = bad;
+            assert!(completion_report(changed.to_string().as_bytes(), "attempt-a").is_none());
+        }
+        let duplicate = encoded.replacen("{", "{\"attempt\":\"attempt-a\",", 1);
+        assert!(completion_report(duplicate.as_bytes(), "attempt-a").is_none());
+    }
+
+    #[test]
+    fn capture_ack_rejects_mismatched_duplicate_or_invented_authority_fields() {
+        let good = br#"{"kind":"rustc-capture-ack","attempt":"a","capture":"c"}"#;
+        assert!(capture_ack(good, "a", "c").is_some());
+        assert!(capture_ack(good, "different", "c").is_none());
+        assert!(capture_ack(good, "a", "different").is_none());
+        for frame in [
+            br#"{"kind":"rustc-complete","attempt":"a","capture":"c"}"#.as_slice(),
+            br#"{"kind":"rustc-capture-ack","attempt":"a","capture":"c","capture":"c"}"#,
+            br#"{"kind":"rustc-capture-ack","attempt":"a","capture":"c","publish":true}"#,
+            br#"{"kind":"rustc-capture-ack","attempt":"a"}"#,
+            br#"{"kind":"rustc-capture-ack","attempt":"a","capture":null}"#,
+        ] {
+            assert!(capture_ack(frame, "a", "c").is_none());
+        }
+    }
+
+    #[test]
+    fn actual_capture_socket_requires_the_matching_post_capture_ack() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::time::Duration;
+        for reply in [
+            Some("{\"kind\":\"rustc-capture-ack\",\"attempt\":\"a\",\"capture\":\"c\"}\n"),
+            Some("{\"kind\":\"rustc-capture-ack\",\"attempt\":\"a\",\"capture\":\"other\"}\n"),
+            Some("{\"kind\":\"rustc-capture-ack\",\"attempt\":\"a\",\"capture\":\"c\"}"),
+            None,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("capture.sock");
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .unwrap();
+            let acknowledged = runtime.block_on(async {
+                let listener = asupersync::net::unix::UnixListener::bind(&path)
+                    .await
+                    .unwrap();
+                let peer = std::thread::spawn(move || {
+                    let socket = std::os::unix::net::UnixStream::connect(path).unwrap();
+                    socket
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    let mut socket = BufReader::new(socket);
+                    let mut line = String::new();
+                    socket.read_line(&mut line).unwrap();
+                    let receipt: Value = serde_json::from_str(&line).unwrap();
+                    assert_eq!(receipt["kind"], "rustc-captured");
+                    assert_eq!(receipt["attempt"], "a");
+                    assert_eq!(receipt["capture"], "c");
+                    assert_eq!(receipt["publication_authorized"], false);
+                    if let Some(reply) = reply {
+                        socket.get_mut().write_all(reply.as_bytes()).unwrap();
+                    }
+                });
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let acknowledged = acknowledge_capture(&mut socket, "a", "c").await.is_some();
+                peer.join().unwrap();
+                acknowledged
+            });
+            assert_eq!(
+                acknowledged,
+                reply.is_some_and(|reply| reply.ends_with('\n') && !reply.contains("other"))
+            );
+        }
+    }
 }
 
 #[cfg(test)]
