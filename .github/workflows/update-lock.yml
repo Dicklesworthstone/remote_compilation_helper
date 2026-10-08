@@ -10,7 +10,10 @@ on:
       - 'rch/src/update/install.rs'
       - 'rch/src/update/install/daemon_shutdown.rs'
       - 'rch/src/commands/daemon.rs'
+      - 'rch/src/commands/daemon/**'
       - 'rch/tests/daemon_stop_safety.rs'
+      - 'rch/tests/daemon_force_stop.rs'
+      - 'scripts/test_daemon_force_stop.py'
       - 'rch-common/src/process_identity.rs'
       - '.github/workflows/update-lock.yml'
   workflow_dispatch:
@@ -55,6 +58,7 @@ jobs:
           cargo test --locked -p rch --bin rch update::install::tests -- --nocapture 2>&1 | tee "$evidence/preflight-and-install.log"
           cargo test --locked -p rch --bin rch commands::daemon::tests -- --nocapture 2>&1 | tee "$evidence/lifecycle-policy.log"
           cargo test --locked -p rch --test daemon_stop_safety -- --nocapture 2>&1 | tee "$evidence/lifecycle-cli.log"
+          cargo test --locked -p rch --test daemon_force_stop -- --nocapture 2>&1 | tee "$evidence/force-stop-cli.log"
           cargo clippy --locked -p rch --all-targets -- -D warnings 2>&1 | tee "$evidence/clippy.log"
       - name: Check client verification formatting
         if: success() || failure()
@@ -65,7 +69,7 @@ jobs:
           rustfmt --edition 2024 --config skip_children=true --emit stdout < rch/src/update/mod.rs > "$RUNNER_TEMP/update-client-evidence/mod.formatted.rs"
           rustfmt --edition 2024 --config skip_children=true --emit stdout < rch/src/update/install.rs > "$RUNNER_TEMP/update-client-evidence/install.formatted.rs"
           rustfmt --edition 2024 --config skip_children=true --check rch/src/update/mod.rs rch/src/update/install.rs rch/src/update/install/daemon_shutdown.rs
-          rustfmt --edition 2024 --config skip_children=true --check rch/src/commands/daemon.rs rch/tests/daemon_stop_safety.rs
+          rustfmt --edition 2024 --config skip_children=true --check rch/src/commands/daemon.rs rch/tests/daemon_stop_safety.rs rch/src/commands/daemon/force_stop.rs rch/tests/daemon_force_stop.rs
       - uses: actions/upload-artifact@v4
         if: always()
         with:

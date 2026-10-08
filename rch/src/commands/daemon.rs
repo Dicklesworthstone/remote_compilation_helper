@@ -19,6 +19,9 @@ use super::types::{
 };
 use super::{config_dir, send_daemon_command};
 
+#[cfg(target_os = "linux")]
+mod force_stop;
+
 #[derive(Debug, Deserialize)]
 struct ReloadApiResponse {
     #[serde(default = "reload_success_default")]
@@ -738,11 +741,20 @@ async fn daemon_pid() -> Option<u32> {
 }
 
 /// Interrupt in-flight builds by terminating the daemon process. The socket
-/// API refuses to shut down while builds are active by design, so a forced
-/// stop has to go through the OS — but to the daemon's own PID, never a
-/// name match that could hit an unrelated process.
-async fn terminate_daemon_process(pid: u32) -> Result<()> {
-    #[cfg(unix)]
+/// API deliberately refuses an active shutdown. Linux binds a stable pidfd
+/// before rechecking the actual socket peer; it never falls back to a numeric
+/// signal. Other Unix platforms retain their targeted TERM implementation.
+/// No platform removes a lingering socket merely because a PID looks absent.
+async fn terminate_daemon_process(pid: u32, socket_path: &Path) -> Result<()> {
+    anyhow::ensure!(
+        pid > 1 && pid != std::process::id(),
+        "refusing unsafe daemon PID {pid}"
+    );
+    #[cfg(target_os = "linux")]
+    {
+        force_stop::stop(socket_path, pid).await
+    }
+    #[cfg(all(unix, not(target_os = "linux")))]
     {
         let output = Command::new("kill")
             .args(["-TERM", &pid.to_string()])
@@ -755,29 +767,16 @@ async fn terminate_daemon_process(pid: u32) -> Result<()> {
                 String::from_utf8_lossy(&output.stderr).trim()
             );
         }
+        anyhow::ensure!(
+            wait_for_socket_gone(socket_path, 100).await,
+            "TERM sent but daemon socket retirement is unconfirmed; endpoint retained"
+        );
         Ok(())
     }
     #[cfg(not(unix))]
     {
-        let _ = pid;
+        let _ = socket_path;
         anyhow::bail!("forced stop is not supported on this platform; use --drain");
-    }
-}
-
-/// Whether a process with this PID still exists (signal 0 probe).
-fn process_alive(pid: u32) -> bool {
-    #[cfg(unix)]
-    {
-        std::process::Command::new("kill")
-            .args(["-0", &pid.to_string()])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(true)
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = pid;
-        true
     }
 }
 
@@ -942,29 +941,22 @@ pub async fn daemon_stop(opts: StopOptions, ctx: &OutputContext) -> Result<()> {
                 release_admission().await;
                 anyhow::bail!("could not determine the daemon PID for a forced stop");
             };
-            if let Err(error) = terminate_daemon_process(pid).await {
-                release_admission().await;
-                return Err(error);
+            if let Err(error) = terminate_daemon_process(pid, socket_path).await {
+                // TERM may already have acted, or another endpoint may now
+                // own this name. Do not reopen an ambiguously shared barrier.
+                return Err(unconfirmed_stop(
+                    socket_path,
+                    format!("forced stop failed: {error:#}"),
+                ));
             }
-            let socket_gone = wait_for_socket_gone(socket_path, 100).await;
-            // A daemon that died without its shutdown path (no signal handler
-            // engaged) leaves the socket file behind; treat a dead PID with a
-            // lingering socket as stopped and clear the stale socket.
-            if socket_gone || !process_alive(pid) {
-                if !socket_gone {
-                    let _ = tokio::fs::remove_file(socket_path).await;
-                }
-                report_stopped(
-                    "daemon stop",
-                    "stop",
-                    &socket_path_str,
-                    "Daemon stopped (forced; in-flight builds interrupted)",
-                    ctx,
-                );
-                return Ok(());
-            }
-            release_admission().await;
-            anyhow::bail!("sent SIGTERM to daemon pid {pid} but it is still running");
+            report_stopped(
+                "daemon stop",
+                "stop",
+                &socket_path_str,
+                "Daemon stopped (forced; in-flight builds interrupted)",
+                ctx,
+            );
+            return Ok(());
         }
         StopDecision::Proceed => {}
         StopDecision::Drain => unreachable!("drain resolves to Proceed or Interrupt above"),
