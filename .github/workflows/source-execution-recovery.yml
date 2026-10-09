@@ -1,0 +1,132 @@
+name: Source execution recovery
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'rch/src/hook/ssh.rs'
+      - 'rch/src/hook/source_execution_probe.py'
+      - 'rch/src/hook/source_claim_registry.sh'
+      - 'scripts/test_source_execution_probe.py'
+      - '.github/workflows/source-execution-recovery.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  recovery:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    # Initial preparation stages blobs only. It cannot create commits or move
+    # refs. The final direct GitHub commit replaces this with read-only CI.
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_NET_RETRY: 2
+      CARGO_HTTP_TIMEOUT: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Prepare the exact reviewed candidate
+        if: contains(github.event.head_commit.message, '[execution-loss-stage-1]')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import base64, hashlib, json, os, pathlib, subprocess, urllib.request
+          def blob(sha):
+              req = urllib.request.Request(
+                  f"https://api.github.com/repos/{os.environ['GITHUB_REPOSITORY']}/git/blobs/{sha}",
+                  headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json'})
+              with urllib.request.urlopen(req, timeout=60) as response:
+                  data = base64.b64decode(json.load(response)['content'])
+              actual = hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
+              if actual != sha:
+                  raise RuntimeError('candidate blob digest mismatch')
+              return data
+          source = 'rch/src/hook/ssh.rs'
+          baseline = subprocess.check_output(['git', 'hash-object', source], text=True).strip()
+          if baseline != '9f8ae192920da80e3c6948658e1385d7a1a6387b':
+              raise RuntimeError('SSH source changed; refusing stale integration')
+          patch = pathlib.Path(os.environ['RUNNER_TEMP']) / 'execution-loss.patch'
+          patch.write_bytes(blob('c53ba696ce7e685d49576114a2b304ee64424cc3'))
+          subprocess.run(['git', 'apply', '--check', '--whitespace=error-all', str(patch)], check=True)
+          subprocess.run(['git', 'apply', '--whitespace=error-all', str(patch)], check=True)
+          if subprocess.check_output(['git', 'hash-object', source], text=True).strip() != '810e66f00a4e058e2ade2edc0ae78dd023f6fecb':
+              raise RuntimeError('integrated SSH source differs from reviewed candidate')
+          for path, sha in {
+              'rch/src/hook/source_execution_probe.py': 'c956a894613e0feef60714cde0b7e21da2a18994',
+              'scripts/test_source_execution_probe.py': '9300267c88f332e766bc92885be01cf4d799463d',
+          }.items():
+              with open(path, 'xb') as out:
+                  out.write(blob(sha))
+          subprocess.run(['git', 'diff', '--check'], check=True)
+          PY
+      - name: Exercise actual filesystem ownership and delayed activity
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/execution-evidence"
+          python3 scripts/test_source_execution_probe.py 2>&1 | tee "$RUNNER_TEMP/execution-evidence/native-tests.log"
+      - name: Select pinned Rust and format the candidate
+        run: |
+          set -euo pipefail
+          channel=$(python3 -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["channel"])')
+          rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
+          echo "RUSTUP_TOOLCHAIN=$channel" >> "$GITHUB_ENV"
+          rustfmt +"$channel" --edition 2024 --config skip_children=true rch/src/hook/ssh.rs
+          git diff --check
+      - name: Stage reviewed source blobs for direct GitHub publication
+        if: contains(github.event.head_commit.message, '[execution-loss-stage-1]')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import base64, json, os, pathlib, shutil, subprocess, urllib.request
+          paths = ['rch/src/hook/ssh.rs', 'rch/src/hook/source_execution_probe.py', 'scripts/test_source_execution_probe.py']
+          evidence = pathlib.Path(os.environ['RUNNER_TEMP']) / 'execution-evidence'
+          entries = []
+          for path in paths:
+              data = pathlib.Path(path).read_bytes()
+              req = urllib.request.Request(
+                  f"https://api.github.com/repos/{os.environ['GITHUB_REPOSITORY']}/git/blobs",
+                  data=json.dumps({'encoding': 'base64', 'content': base64.b64encode(data).decode()}).encode(),
+                  headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json', 'Content-Type': 'application/json'})
+              with urllib.request.urlopen(req, timeout=60) as response:
+                  sha = json.load(response)['sha']
+              if sha != subprocess.check_output(['git', 'hash-object', path], text=True).strip():
+                  raise RuntimeError('staged source digest mismatch')
+              entries.append({'path': path, 'mode': '100644', 'type': 'blob', 'sha': sha})
+              destination = evidence / path
+              destination.parent.mkdir(parents=True, exist_ok=True)
+              shutil.copyfile(path, destination)
+          report = {'base': os.environ['GITHUB_SHA'], 'files': entries,
+                    'validation': 'native helper tests and Rust formatter passed; full Rust checks follow separately'}
+          (evidence / 'prepared.json').write_text(json.dumps(report, indent=2) + '\n')
+          print(json.dumps(report, indent=2))
+          PY
+      - uses: actions/upload-artifact@v4
+        if: success() || failure()
+        with:
+          name: source-execution-prepared-${{ github.sha }}
+          path: ${{ runner.temp }}/execution-evidence
+          retention-days: 7
+      - name: Check the genuine client and exercise cancellation handoff
+        run: |
+          set -euo pipefail
+          cargo check --locked -p rch --bin rch 2>&1 | tee "$RUNNER_TEMP/execution-evidence/check.log"
+          cargo test --locked -p rch --bin rch remote_execution_probe_ -- --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/execution-evidence/rust-tests.log"
+          cargo clippy --locked -p rch --bin rch -- -D warnings 2>&1 | tee "$RUNNER_TEMP/execution-evidence/clippy.log"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: source-execution-results-${{ github.sha }}
+          path: ${{ runner.temp }}/execution-evidence
+          if-no-files-found: warn
+          retention-days: 7
