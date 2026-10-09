@@ -34,6 +34,7 @@ use crate::coord::live_dependency::{
 };
 use crate::edge::live_facts::{FactsMiss, LiveFacts};
 use rabs_cas::metadata_store::digest_key;
+use rabs_key::build_script_directives::bind_rustc_environment;
 use rabs_key::live_dependency::{
     ExternFact, LiveRustcRequest, PlannedExtern, constructed_environment, live_dependency_key,
     plan_dependency_action,
@@ -234,7 +235,7 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
         );
         return Decided::Shadow(observation(&parsed));
     };
-    let plan = match plan_dependency_action(
+    let mut plan = match plan_dependency_action(
         LiveRustcRequest {
             argv: &parsed.argv,
             cwd: &parsed.cwd,
@@ -279,6 +280,16 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
     };
     if let Err(reason) = package.verify_generated_disjoint(&plan) {
         return refuse(&reason);
+    }
+    // This record comes from the generated-tree capture, never a wire field.
+    // Keying below binds these same bytes; PackageFacts revalidates the run
+    // record and generated inputs before serving and after execution.
+    if let Err(reason) = bind_rustc_environment(
+        &mut plan,
+        package.build_script_output.as_deref(),
+        &parsed.env,
+    ) {
+        return refuse(&reason.to_string());
     }
     let mut inputs = ActionInputManifest {
         schema_version: INPUT_EVIDENCE_SCHEMA_VERSION,
@@ -795,5 +806,85 @@ mod tests {
             assert_eq!(reply["decision"], "pass-through");
             assert_eq!(reply["compiler_skip_authorized"], false);
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn captured_run_record_controls_live_environment_not_request_fields() {
+        use crate::coord::live::CoordLive;
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{Duration, Instant};
+
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().canonicalize().unwrap();
+        let cargo = root.join("cargo");
+        let package = cargo.join("registry/src/fixture-index/demo-1.0.0");
+        let generated = root.join("build/demo/out");
+        let output = root.join("target/deps");
+        let toolchain = root.join("toolchain");
+        let compiler = toolchain.join("bin/rustc");
+        for directory in [
+            package.clone(), generated.clone(), output.clone(), toolchain.join("bin"),
+            toolchain.join("lib/rustlib/x86_64-unknown-linux-gnu/lib"),
+        ] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+        std::fs::write(package.join("lib.rs"), b"pub const LABEL: &str = env!(\"BUILD_LABEL\");\n").unwrap();
+        std::fs::write(generated.parent().unwrap().join("root-output"), generated.to_str().unwrap()).unwrap();
+        std::fs::write(generated.parent().unwrap().join("output"), b"cargo::rustc-env=BUILD_LABEL=pinned\n").unwrap();
+        // Only identity probes are scripted. No fake compile or publication is
+        // credited here: the assertion exercises the real live admission path.
+        std::fs::write(&compiler, concat!(
+            "#!/bin/sh\ncase \"$1\" in\n",
+            "-vV) printf 'rustc fixture\\nhost: x86_64-unknown-linux-gnu\\n';;\n",
+            "--print) bin=${0%/*}; printf '%s\\n' \"${bin%/*}\";;\n",
+            "*) exit 99;;\nesac\n",
+        )).unwrap();
+        std::fs::set_permissions(&compiler, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut request = json!({
+            "kind":"rustc-request",
+            "argv":[compiler.to_str().unwrap(), "--crate-name=demo", "--crate-type=lib",
+                "--emit=metadata,dep-info", "--out-dir", output.to_str().unwrap(),
+                "--cap-lints=allow", "--error-format=json", package.join("lib.rs").to_str().unwrap()],
+            "cwd":package.to_str().unwrap(),
+            "env":[["CARGO_HOME", cargo.to_str().unwrap()],
+                ["CARGO_MANIFEST_DIR", package.to_str().unwrap()], ["CARGO_PKG_NAME", "demo"],
+                ["OUT_DIR", generated.to_str().unwrap()], ["BUILD_LABEL", "pinned"],
+                ["UNDECLARED", "ambient"]],
+        });
+        let cas = Arc::new(crate::janitor::store::mount_and_reconcile(&root.join("cas")).unwrap());
+        let coord = Arc::new(CoordLive::with_cas(cas));
+        coord.acquire_boot_authority("build-script-environment-fixture").unwrap();
+        coord.mark_up();
+        let live = LiveEdge::new(LiveDependencyLane::new(coord));
+        let env = constructed_environment(&parse_request(&request).unwrap().env);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match live.facts.toolchain(&compiler, &env) {
+                Ok(_) => break,
+                Err(FactsMiss::Pending) => {
+                    assert!(Instant::now() < deadline, "fixture toolchain did not warm");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("fixture toolchain: {error}"),
+            }
+        }
+        let Decided::Execute { reply, attempt } = decide(&live, &request) else {
+            panic!("a captured custom rustc-env must reach live execution admission");
+        };
+        assert!(attempt.execution_env().contains(&("BUILD_LABEL".into(), "pinned".into())));
+        assert!(!attempt.execution_env().iter().any(|(name, _)| name == "UNDECLARED"));
+        let reply: Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(reply["compiler_skip_authorized"], false);
+        drop(attempt);
+        request["env"][4][1] = json!("stale");
+        request["build_script_output"] = json!("cargo::rustc-env=BUILD_LABEL=stale\n");
+        let Decided::Reply(reply) = decide(&live, &request) else {
+            panic!("wire fields cannot replace the captured run record");
+        };
+        let reply: Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(reply["decision"], "pass-through");
+        assert!(reply["reason"].as_str().unwrap().contains("LIVE_DEP_REFUSED_ENV"));
+        assert_eq!(std::fs::read_dir(output).unwrap().count(), 0);
     }
 }
