@@ -423,8 +423,8 @@ fn main() {
         Some("--check-config") => match load_config() {
             Ok(config) => {
                 println!(
-                    "{{\"v\":1,\"kind\":\"rabsd-config\",\"socket_path\":\"{}\",\"log_level\":\"{}\"}}",
-                    config.socket_path, config.log_level
+                    "{{\"v\":1,\"kind\":\"rabsd-config\",\"socket_path\":\"{}\",\"log_level\":\"{}\",\"live_dependency\":{}}}",
+                    config.socket_path, config.log_level, config.live_dependency
                 );
                 return;
             }
