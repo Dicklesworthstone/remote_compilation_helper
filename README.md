@@ -349,6 +349,22 @@ partially transferable fails loudly (`RCH-E309`, exit 102) regardless of the
 job's own exit status. Paths must be repository-relative; conflicts with
 `--clean-overlay` / `--source-content-receipt` are refused.
 
+Native Apple commands can use job mode too: direct `xcodebuild` and `xcrun`
+invocations require a worker declaring `os = "darwin"`. This preserves the OS
+fence: ordinary jobs cannot consume that worker, and Linux workers cannot take
+an Xcode job. Invoke the tool directly; RCH does not inspect arbitrary scripts
+or infer a Mac requirement from text merely mentioning Xcode.
+
+```bash
+RCH_REQUIRE_REMOTE=1 RCH_BUILD_SLOTS=1 rch exec --job -- \
+  xcodebuild -project ios/App.xcodeproj -scheme App -jobs 1 build
+```
+
+This is host routing, not proof that Xcode, signing credentials, or a Simulator
+are ready. Native test and Simulator safety checks still apply. Both `rch` and
+`rchd` need the native-command routing support; keep explicit strict-remote
+mode when qualifying a build so an older daemon cannot silently run it locally.
+
 #### Requiring a verified tool
 
 A job that needs a tool the fleet does not uniformly have can demand a worker

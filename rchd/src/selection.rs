@@ -5506,6 +5506,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_native_apple_job_selects_only_declared_darwin_worker() {
+        for command in [
+            "xcodebuild -scheme App -jobs 1 build",
+            "/usr/bin/xcrun --sdk macosx xcodebuild -scheme App test",
+        ] {
+            let (pool, selector, mut request) = os_gate_fixture(command).await;
+            request.job_mode = true;
+            assert!(
+                selector.select(&pool, &request).await.worker.is_none(),
+                "Linux and Windows cannot execute native Apple tools: {command}"
+            );
+            pool.add_worker_state(make_worker_with_os("mac-worker", 8, 50.0, Some("darwin")))
+                .await;
+            let result = selector.select(&pool, &request).await;
+            let selected = result
+                .worker
+                .expect("native Apple job should select the Mac");
+            assert_eq!(selected.config.read().await.id.as_str(), "mac-worker");
+
+            let diagnostics = selector
+                .build_selection_diagnostics(&pool, &request, &HashSet::new())
+                .await;
+            for worker in diagnostics
+                .workers
+                .iter()
+                .filter(|w| w.worker_id.as_str() != "mac-worker")
+            {
+                assert_eq!(
+                    worker.final_decision,
+                    WorkerSelectionDiagnosticDecision::Deny
+                );
+                assert!(
+                    worker
+                        .reason_codes
+                        .iter()
+                        .any(|code| code == "os.declared_mismatch")
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_native_apple_job_mentions_do_not_claim_darwin_worker() {
+        for command in [
+            "./run_shards.sh",
+            "echo 'xcodebuild build'",
+            "env NOTE=xcrun bun test",
+        ] {
+            let (pool, selector, mut request) = os_gate_fixture(command).await;
+            request.job_mode = true;
+            pool.add_worker_state(make_worker_with_os("mac-worker", 8, 50.0, Some("darwin")))
+                .await;
+            let selected = selector
+                .select(&pool, &request)
+                .await
+                .worker
+                .expect("ordinary job still runs on Linux");
+            assert_eq!(
+                selected.config.read().await.id.as_str(),
+                "linux-worker",
+                "{command}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn test_undeclared_worker_cannot_satisfy_os_requirement() {
         // Only the windows worker can claim the MSVC target, so removing it must
         // leave nothing selectable rather than falling back to a Linux box.

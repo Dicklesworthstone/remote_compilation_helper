@@ -20,7 +20,7 @@ use crate::admission_rejection::{AdmissionRejectionSummary, RejectionClass};
 use crate::capability_probe::CapabilityRequirement;
 use crate::patterns::{
     CompilationKind, classify_command, classify_command_detailed, is_cargo_xwin_build,
-    split_shell_commands,
+    normalize_command, split_shell_commands, split_wrapper_word,
 };
 
 /// The decisive recommendation `rch admit` returns.
@@ -70,8 +70,8 @@ pub struct RequiredCapabilities {
     pub needs_targets: Vec<String>,
     /// Explicit toolchain overrides (`cargo +nightly-…`).
     pub needs_toolchains: Vec<String>,
-    /// Host OS the worker must run, when a requested `--target` triple implies
-    /// one (e.g. `*-pc-windows-msvc` → `windows`). `None` for the ordinary
+    /// Host OS the worker must run, when a native tool or requested `--target`
+    /// triple implies one (e.g. `xcodebuild` → `darwin`). `None` for the ordinary
     /// native build, which stays schedulable on any worker.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub needs_os: Option<String>,
@@ -265,7 +265,30 @@ pub fn required_os_for_command(command: &str) -> Option<String> {
             triples.extend(host_bound_targets(part, &required.needs_targets));
         }
     }
-    os_from_target_triples(&triples)
+    os_from_command_and_targets(command, &triples)
+}
+
+/// Native Apple tools need a Darwin host even in explicit job mode, where the
+/// compilation classifier deliberately does not recognize them. Only inspect
+/// the invoked command word, never an argument mentioning a tool. Opaque shell
+/// scripts are not inferred: callers must invoke the Apple tool directly.
+fn os_from_command_and_targets(command: &str, triples: &[String]) -> Option<String> {
+    let native_hosts = split_shell_commands(command)
+        .into_iter()
+        .filter_map(|part| {
+            let normalized = normalize_command(part);
+            let (word, _) = split_wrapper_word(&normalized)?;
+            match word.rsplit('/').next()? {
+                "xcodebuild" | "xcrun" => Some("darwin"),
+                _ => None,
+            }
+        });
+    unique_host_os(
+        triples
+            .iter()
+            .filter_map(|triple| target_host_os(triple))
+            .chain(native_hosts),
+    )
 }
 
 /// The host OS a set of `--target` triples demands, when they agree on one.
@@ -282,16 +305,23 @@ pub fn required_os_for_command(command: &str) -> Option<String> {
 /// OSes cannot succeed on any single worker regardless, and returning `None`
 /// keeps that no worse than it is today rather than inventing a new refusal.
 fn os_from_target_triples(triples: &[String]) -> Option<String> {
+    unique_host_os(triples.iter().filter_map(|triple| target_host_os(triple)))
+}
+
+fn target_host_os(triple: &str) -> Option<&'static str> {
+    let lower = triple.to_ascii_lowercase();
+    if lower.contains("-windows-msvc") {
+        Some("windows")
+    } else if lower.contains("-apple-") {
+        Some("darwin")
+    } else {
+        None
+    }
+}
+
+fn unique_host_os(hosts: impl IntoIterator<Item = &'static str>) -> Option<String> {
     let mut required: Option<String> = None;
-    for triple in triples {
-        let lower = triple.to_ascii_lowercase();
-        let os = if lower.contains("-windows-msvc") {
-            "windows"
-        } else if lower.contains("-apple-") {
-            "darwin"
-        } else {
-            continue;
-        };
+    for os in hosts {
         match &required {
             Some(existing) if existing != os => return None,
             Some(_) => {}
@@ -349,7 +379,7 @@ pub fn preflight(command: &str, proof_policy: bool) -> AdmitPreflight {
     required.needs_toolchains.dedup();
     // Recomputed over the merged target set: a compound command whose parts
     // disagree on the required OS must not inherit one part's answer.
-    required.needs_os = os_from_target_triples(&host_targets);
+    required.needs_os = os_from_command_and_targets(command, &host_targets);
 
     let base_recommendation = if is_compilation {
         AdmitRecommendation::Offload
@@ -678,6 +708,73 @@ mod tests {
                 "triple={triple}"
             );
         }
+    }
+
+    #[test]
+    fn native_apple_jobs_require_darwin_without_rust_target_flags() {
+        for command in [
+            "xcodebuild -version",
+            "/usr/bin/xcodebuild -project ios/App.xcodeproj -scheme App build",
+            "'xcodebuild' -scheme App test",
+            "'/Applications/Xcode Beta.app/Contents/Developer/usr/bin/xcodebuild' -version",
+            "env DEVELOPER_DIR='/Applications/Xcode Beta.app' xcodebuild -jobs 1 test",
+            "timeout 1200 xcodebuild -destination 'platform=macOS,variant=Mac Catalyst' test",
+            "xcrun --sdk iphoneos xcodebuild -scheme App build",
+            "/usr/bin/xcrun --find swift",
+            "cd ios && xcodebuild -scheme App build",
+        ] {
+            assert_eq!(
+                required_os_for_command(command).as_deref(),
+                Some("darwin"),
+                "{command}"
+            );
+            let job = preflight(command, true).as_job(Vec::new());
+            assert_eq!(
+                job.required.needs_os.as_deref(),
+                Some("darwin"),
+                "{command}"
+            );
+            assert!(
+                job.required.needs_targets.is_empty(),
+                "not a Rust target: {command}"
+            );
+            assert!(!job.required.needs_cargo, "not a Cargo job: {command}");
+        }
+    }
+
+    #[test]
+    fn native_apple_job_inference_does_not_claim_mentions_or_opaque_scripts() {
+        for command in [
+            "echo xcodebuild -version",
+            "printf '%s' 'xcrun --sdk macosx'",
+            "br comments add bd-example 'xcodebuild -scheme App build'",
+            "env NOTE=xcodebuild bun test",
+            "env -u xcodebuild bun test",
+            "xcodebuild-wrapper -scheme App build",
+            "./check.sh --target aarch64-apple-darwin",
+            "bash -c 'echo xcodebuild'",
+            "bash -c 'xcodebuild -version'",
+            "'xcodebuild -version'",
+            "\"${TOOL}/xcodebuild\" -version",
+            "'unterminated/xcodebuild -version",
+        ] {
+            assert_eq!(required_os_for_command(command), None, "{command}");
+            assert_eq!(
+                preflight(command, true)
+                    .as_job(Vec::new())
+                    .required
+                    .needs_os,
+                None,
+                "{command}"
+            );
+        }
+        assert_eq!(
+            required_os_for_command(
+                "xcodebuild build && cargo build --target x86_64-pc-windows-msvc"
+            ),
+            None,
+            "mixed native host requirements must not inherit just the Rust half"
+        );
     }
 
     #[test]

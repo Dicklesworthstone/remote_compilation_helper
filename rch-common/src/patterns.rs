@@ -1474,7 +1474,7 @@ fn looks_like_duration_or_priority(token: &str) -> bool {
 /// quotes literal flags such as `-f%U` when rebuilding its shell command.
 /// Mixed/unterminated quoting is left unrecognized rather than guessing where
 /// the wrapped command starts.
-fn split_wrapper_word(input: &str) -> Option<(&str, &str)> {
+pub(crate) fn split_wrapper_word(input: &str) -> Option<(&str, &str)> {
     let input = input.trim_start();
     let first = input.chars().next()?;
     if matches!(first, '\'' | '"') {
