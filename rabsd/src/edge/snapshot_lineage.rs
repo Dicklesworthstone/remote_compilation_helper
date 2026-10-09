@@ -25,6 +25,14 @@
 //! - lockfile replay to the worktree runs under a content precondition
 //!   and cannot express mutation of sealed history (there is no API
 //!   that changes a generation's digest).
+//!
+//! ### Relationship to Protocol Lineage (`bd-l108t`)
+//!
+//! This module represents the local edge state machine wired into
+//! [`crate::edge::cargo_resolution::seal_offline_resolution`].
+//! For the shared wire-protocol model of snapshot lineage closures across
+//! distributed RPC and replay verification, see
+//! `rabs_protocol::snapshot_lineage::SnapshotLineage` (bead A024).
 
 /// The immutable requested-command snapshot (D018 manifest identity).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
