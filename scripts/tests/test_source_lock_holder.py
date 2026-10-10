@@ -59,8 +59,13 @@ def _default_sighup():
     signal.signal(signal.SIGHUP, signal.SIG_DFL)
 
 
+def _ignored_sighup():
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+
+
 class Holder:
-    def __init__(self, script, args, env, plan, claim="claim input", fd_limit=None):
+    def __init__(self, script, args, env, plan, claim="claim input", fd_limit=None,
+                 closed_stdin=False, ignore_hup=False):
         command = "set -eu\n"
         if fd_limit:
             command += "ulimit -n {}\n".format(fd_limit)
@@ -72,8 +77,9 @@ class Holder:
             shlex.quote(script), shlex.quote(script), shlex.join(args))
         self.process = subprocess.Popen(
             ["/bin/sh", "-c", command], env=env,
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            preexec_fn=_default_sighup,
+            stdin=subprocess.DEVNULL if closed_stdin else subprocess.PIPE,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            preexec_fn=_ignored_sighup if ignore_hup else _default_sighup,
         )
         self.buffer = b""
 
@@ -103,6 +109,12 @@ class Holder:
             self.process.stdin.close()
             self.process.stdin = None
         return self.process.communicate(timeout=5)
+
+    def failure(self):
+        # A malformed plan or bootstrap must fail with a LIVE requester.
+        # Closing stdin first would let disconnect refusal mask the defect.
+        self.process.wait(timeout=5)
+        return self.finish()
 
     def close(self):
         if self.process.poll() is None:
@@ -138,6 +150,7 @@ class SourceLockHolderTests(unittest.TestCase):
         if portable or not gnu_flock:
             # A successful test must never invoke GNU flock on this path.
             flock = directory / "flock"
+            self.assertFalse(flock.is_symlink(), "must not overwrite a real tool through a symlink")
             flock.write_text("#!/bin/sh\nprintf 'unexpected flock invocation\\n' >&2\nexit 97\n")
             flock.chmod(0o700)
         elif FLOCK:
@@ -243,7 +256,7 @@ class SourceLockHolderTests(unittest.TestCase):
     def test_fd_exhaustion_fails_before_readiness_and_releases_partial_plan(self):
         paths = [self.root / str(i) for i in range(80)]
         holder = self.start([("x", path) for path in paths], fd_limit=32)
-        stdout, stderr = holder.finish()
+        stdout, stderr = holder.failure()
         self.assertEqual(holder.process.returncode, 73, stderr)
         self.assertEqual(stdout, b"")
         self.assertIn(b"native source lock acquisition failed", stderr)
@@ -256,7 +269,7 @@ class SourceLockHolderTests(unittest.TestCase):
                             (valid + valid, 2), (valid + "s /extra\n", 1),
                             ("x relative\n", 1), ("x /bad\rpath\n", 1)]:
             holder = self.start([], plan=plan, count=count)
-            stdout, stderr = holder.finish()
+            stdout, stderr = holder.failure()
             self.assertEqual(holder.process.returncode, 73, (plan, stderr))
             self.assertEqual(stdout, b"", plan)
             self.assertTrue(available(path))
@@ -270,7 +283,7 @@ class SourceLockHolderTests(unittest.TestCase):
         os.mkfifo(fifo)
         for path in (link, fifo, self.root):
             holder = self.start([("x", path)])
-            stdout, stderr = holder.finish()
+            stdout, stderr = holder.failure()
             self.assertEqual(holder.process.returncode, 73, stderr)
             self.assertEqual(stdout, b"")
         self.assertEqual(target.read_bytes(), b"do not truncate")
@@ -298,7 +311,7 @@ class SourceLockHolderTests(unittest.TestCase):
     def test_missing_darwin_prerequisite_is_explicit_and_grants_nothing(self):
         holder = self.start([("x", self.root / "absent")],
                             env=self.environment(python=False))
-        stdout, stderr = holder.finish()
+        stdout, stderr = holder.failure()
         self.assertEqual(holder.process.returncode, 73, stderr)
         self.assertIn(b"Darwin source locking requires python3", stderr)
         self.assertEqual(stdout, b"")
@@ -370,7 +383,7 @@ class SourceLockHolderTests(unittest.TestCase):
         self.assertEqual((holder.process.returncode, stdout, stderr), (0, b"", b""))
         large = [self.root / ("large-{}".format(i)) for i in range(32)]
         holder = self.start([("x", path) for path in large], portable=False, env=env)
-        stdout, stderr = holder.finish()
+        stdout, stderr = holder.failure()
         self.assertEqual((holder.process.returncode, stdout), (97, b""))
         self.assertIn(b"native bootstrap failed", stderr)
         self.assertTrue(all(not path.exists() for path in large))
@@ -405,8 +418,9 @@ class SourceLockHolderTests(unittest.TestCase):
                         {"plan": "".join("x {}\n".format(path) for path in paths[:-1])},
                         {"plan": "".join("x {}\n".format(path) for path in paths) + "s /extra\n"}):
             holder = self.start(specs, portable=False, env=env, **options)
-            stdout, stderr = holder.finish()
+            stdout, stderr = holder.failure()
             self.assertEqual((holder.process.returncode, stdout), (73, b""), stderr)
+            self.assertNotIn(b"requester ended", stderr)
             self.assertTrue(all(available(path) for path in paths))
 
     def test_linux_native_refuses_symlink_and_fifo_after_partial_acquisition(self):
@@ -421,11 +435,104 @@ class SourceLockHolderTests(unittest.TestCase):
         for invalid in (link, fifo, self.root):
             holder = self.start([("x", path) for path in paths + [invalid]],
                                 portable=False, env=env)
-            stdout, stderr = holder.finish()
+            stdout, stderr = holder.failure()
             self.assertEqual((holder.process.returncode, stdout), (73, b""), stderr)
+            self.assertNotIn(b"requester ended", stderr)
             self.assertTrue(all(available(path) for path in paths))
             self.assertEqual(target.read_bytes(), b"unchanged")
             self.assertTrue(link.is_symlink())
+
+
+    def terminal_witness(self, witness):
+        return ('set -eu; printf entered > {}; '
+                'printf "%s\\n" "$1"; exec cat >/dev/null').format(shlex.quote(str(witness)))
+
+    def assert_requester_refused(self, holder, stdout, stderr):
+        self.assertEqual((holder.process.returncode, stdout), (73, b""), stderr)
+        self.assertIn(b"source lock requester ended or sent input before readiness", stderr)
+
+    def test_native_disconnected_waiter_releases_partial_plan_without_terminal(self):
+        for portable in (False, True):
+            paths = [self.root / ("{}-{}".format(portable, i)) for i in range(32)]
+            paths[-1].write_bytes(b"other owner lock evidence")
+            witness = self.root / ("terminal-" + str(portable))
+            fd = os.open(paths[-1], os.O_RDWR)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+                holder = self.start([("x", path) for path in paths], portable=portable,
+                                    env=self.environment(portable, gnu_flock=False),
+                                    terminal=self.terminal_witness(witness))
+                eventually(lambda: not available(paths[-2]), "waiter did not reach final lock")
+                self.assertIsNone(holder.line(0.05))
+                stdout, stderr = holder.finish()  # Requester EOF, NO signal.
+                self.assert_requester_refused(holder, stdout, stderr)
+                self.assertFalse(witness.exists(), "abandoned acquisition ran the terminal protocol")
+                self.assertTrue(all(available(path) for path in paths[:-1]))
+                self.assertFalse(available(paths[-1]), "another owner's lock must remain held")
+                self.assertEqual(paths[-1].read_bytes(), b"other owner lock evidence")
+            finally:
+                os.close(fd)
+            # No orphaned partial holder may prevent the next real acquisition.
+            follower = self.start([("x", path) for path in paths], portable=portable,
+                                  env=self.environment(portable, gnu_flock=False))
+            self.assertEqual(follower.line(), b"READY")
+            follower.finish()
+            self.assertEqual(follower.process.returncode, 0)
+            self.assertTrue(all(available(path) for path in paths))
+
+    def test_native_initial_eof_creates_no_lock_or_terminal_state(self):
+        for portable in (False, True):
+            paths = [self.root / ("{}-{}".format(portable, i)) for i in range(32)]
+            witness = self.root / ("terminal-" + str(portable))
+            holder = self.start([("x", path) for path in paths], portable=portable,
+                                env=self.environment(portable, gnu_flock=False),
+                                terminal=self.terminal_witness(witness), closed_stdin=True)
+            stdout, stderr = holder.failure()
+            self.assert_requester_refused(holder, stdout, stderr)
+            self.assertFalse(witness.exists())
+            self.assertTrue(all(not path.exists() for path in paths))
+
+    def test_native_early_input_refuses_without_consuming_a_terminal_release(self):
+        for portable in (False, True):
+            paths = [self.root / ("{}-{}".format(portable, i)) for i in range(32)]
+            witness = self.root / ("terminal-" + str(portable))
+            fd = os.open(paths[-1], os.O_CREAT | os.O_RDWR, 0o600)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+                holder = self.start([("x", path) for path in paths], portable=portable,
+                                    env=self.environment(portable, gnu_flock=False),
+                                    terminal=self.terminal_witness(witness))
+                eventually(lambda: not available(paths[-2]), "waiter did not reach final lock")
+                self.assertIsNone(holder.line(0.05))
+                holder.send("RELEASE\n")
+                stdout, stderr = holder.failure()  # Stdin stays OPEN until refusal.
+                self.assert_requester_refused(holder, stdout, stderr)
+                self.assertFalse(witness.exists())
+                self.assertTrue(all(available(path) for path in paths[:-1]))
+                self.assertFalse(available(paths[-1]))
+            finally:
+                os.close(fd)
+
+    def test_native_eof_cancels_waiter_even_when_sighup_is_ignored(self):
+        paths = [self.root / str(i) for i in range(32)]
+        witness = self.root / "terminal"
+        fd = os.open(paths[-1], os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            holder = self.start([("x", path) for path in paths], portable=False,
+                                env=self.environment(portable=False, gnu_flock=False),
+                                terminal=self.terminal_witness(witness), ignore_hup=True)
+            eventually(lambda: not available(paths[-2]), "waiter did not reach final lock")
+            holder.process.send_signal(signal.SIGHUP)
+            self.assertIsNone(holder.line(0.05))
+            self.assertIsNone(holder.process.poll(), "fixture did not inherit ignored SIGHUP")
+            stdout, stderr = holder.finish()
+            self.assert_requester_refused(holder, stdout, stderr)
+            self.assertFalse(witness.exists())
+            self.assertTrue(all(available(path) for path in paths[:-1]))
+            self.assertFalse(available(paths[-1]))
+        finally:
+            os.close(fd)
 
 
 if __name__ == "__main__":

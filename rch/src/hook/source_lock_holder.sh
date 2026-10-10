@@ -46,8 +46,10 @@ if [ "$portable" = yes ]; then
         exit 73
     }
     exec python3 -I -c '
+import errno
 import fcntl
 import os
+import select
 import signal
 import stat
 import sys
@@ -57,6 +59,18 @@ try:
     ready = os.fsencode(sys.argv[2])
     if count < 1 or not ready or len(ready) >= 4096 or any(c in ready for c in (0, 10, 13)):
         raise ValueError("invalid source lock count or ready marker")
+    # The requester sends no stdin bytes until the terminal announces ready.
+    # Observe, never consume, stdin so the terminal still owns its exact
+    # release protocol. EOF/early input before handoff grants nothing. Once
+    # exec begins, the existing durable claim/cancellation protocol remains
+    # authoritative, including a disconnect racing that final boundary.
+    requester = select.poll()
+    requester.register(0, select.POLLIN | select.POLLHUP | select.POLLERR)
+
+    def requester_open(wait_ms=0):
+        if requester.poll(wait_ms):
+            raise ValueError("source lock requester ended or sent input before readiness")
+
     held = []
     seen = set()
     with os.fdopen(3, "rb", closefd=True) as plan:
@@ -72,12 +86,25 @@ try:
             seen.add(path)
             # Preserve the canonical-root order supplied by Rust. Sorting the
             # hashed lock names here would deadlock against existing holders.
+            requester_open()
             fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
             held.append(fd)
             before = os.fstat(fd)
             if not stat.S_ISREG(before.st_mode):
                 raise ValueError("source lock is not a regular file")
-            fcntl.flock(fd, fcntl.LOCK_EX if record[:1] == b"x" else fcntl.LOCK_SH)
+            mode = fcntl.LOCK_EX if record[:1] == b"x" else fcntl.LOCK_SH
+            while True:
+                requester_open()
+                try:
+                    fcntl.flock(fd, mode | fcntl.LOCK_NB)
+                    break
+                except OSError as error:
+                    if error.errno not in (errno.EACCES, errno.EAGAIN):
+                        raise
+                    # A blocking flock cannot notice requester EOF, and may
+                    # hold earlier roots forever when SIGHUP is ignored.
+                    # Only contention waits; uncontended plans do not sleep.
+                    requester_open(50)
             after = os.stat(path, follow_symlinks=False)
             if not stat.S_ISREG(after.st_mode) or (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
                 raise ValueError("source lock path changed during acquisition")
@@ -87,6 +114,7 @@ try:
             os.set_inheritable(fd, True)
         if plan.read(1):
             raise ValueError("source lock count does not match the plan")
+    requester_open()
     # Python ignores SIGPIPE by default; do not pass that policy to the
     # existing terminal shell. A lost reply must still terminate the holder.
     signal.signal(signal.SIGPIPE, signal.SIG_DFL)
