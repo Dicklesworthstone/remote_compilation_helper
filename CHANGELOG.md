@@ -5,7 +5,8 @@ Compilation Helper): the PreToolUse hook + CLI (`rch`), the local daemon (`rchd`
 worker agent (`rch-wkr`), the RABS build sidecar (`rabs-*`, `rabsd`), and the fleet
 dashboard (`dashboard/`).
 
-Scope window: project inception (`v0.1.0`, 2026-01-25) through `v2.1.17` (2026-10-09).
+Scope window: project inception (`v0.1.0`, 2026-01-25) through `v2.1.16` (2026-10-04), plus the
+unreleased 2.1.17 candidate below.
 
 This document was rebuilt from git history (`git log --no-merges` per tag range, `git show`
 on representative commits), version tags (`git for-each-ref`), GitHub release metadata
@@ -29,7 +30,11 @@ but those particular links will 404.
 
 Repository: <https://github.com/Dicklesworthstone/remote_compilation_helper>
 
-## 2.1.17 — 2026-10-09
+## 2.1.17 — unreleased
+
+Release candidate, not yet tagged or published: the 2026-10-09 release gate on 49c712a4 failed
+(`bd-31r0m`). Give this section its release date when the tag is cut, and add anything that lands
+before then.
 
 Recovery and admission hardening from the 2026-10-05..08 fleet sweeps: dead jobs give back
 their worker source and daemon slots, full disks quarantine their worker, SSH stalls and
