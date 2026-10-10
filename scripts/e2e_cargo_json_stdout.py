@@ -378,8 +378,8 @@ def main():
     require(retry.returncode == 0 and retry.stdout == first.stdout
             and retry.stderr == diagnostic_bytes and sha256(diagnostic_path) == diagnostic_sha,
             "A failed stdout write consumed or changed the retained same-id delivery")
-    conflict, _ = run("recovery-machine-envelope-conflict",
-                      [str(args.rch), "--json", "jobs", "recover", wrapper_id, "--cargo-json"], env)
+    conflict_command = [str(args.rch), "--json", "jobs", "recover", wrapper_id, "--cargo-json"]
+    conflict, _ = run("recovery-machine-envelope-conflict", conflict_command, env)
     # --json requests the normal API error envelope even when the requested
     # raw Cargo recovery mode conflicts. It must not replay compiler records.
     conflict_payload = json.loads(conflict.stdout)
@@ -396,6 +396,41 @@ def main():
     require(sha256(diagnostic_path) == diagnostic_sha
             and all(sha256(paths[name]) == first_hashes[name] for name in names),
             "Mode-conflict rejection changed the original retained output bytes")
+    # The general machine-error branch must handle output failure as well as
+    # the jobs-specific delivery path. Reuse the exact conflict command above;
+    # its positive case binds the error to the deliberate mode rejection.
+    for collect_stderr in (True, False):
+        name = ("recovery-conflict-closed-stdout" if collect_stderr
+                else "recovery-conflict-closed-stdout-and-stderr")
+        case = evidence / name
+        case.mkdir()
+        (case / "argv.json").write_text(json.dumps(conflict_command) + "\n")
+        if collect_stderr:
+            with (case / "stderr.bin").open("xb") as diagnostics:
+                child = spawn_with_closed_stdout(conflict_command, env, diagnostics)
+        else:
+            child = spawn_with_closed_stdout(conflict_command, env, None)
+        try:
+            code = child.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            (case / "termination.json").write_text(json.dumps({
+                "state": "timeout", "timeout_seconds": 30, "child_pid": child.pid,
+                "child_stopped": False}) + "\n")
+            raise
+        (case / "returncode.txt").write_text(str(code) + "\n")
+        outcomes.append({"case": name, "returncode": code})
+        require(code == 1, "Closed output changed the general machine-error exit path")
+        if collect_stderr:
+            diagnostics = (case / "stderr.bin").read_bytes()
+            sys.stderr.buffer.write(diagnostics)
+            sys.stderr.buffer.flush()
+            require(b"Failed to write JSON error response" in diagnostics
+                    and b"broken pipe" in diagnostics.lower() and b"panicked" not in diagnostics,
+                    "The general machine-error branch hid a delivery failure or panicked")
+        # When both streams are closed, only the actual exit status is observable.
+        require(sha256(diagnostic_path) == diagnostic_sha
+                and all(sha256(paths[name]) == first_hashes[name] for name in names),
+                "Closed machine-error output changed the retained compiler delivery")
     paths = repeated_paths
     # Exercise the actual Bash consumer and all its real-stream negatives.
     consume, _ = run("actual-installer-consumer", [sys.executable,
