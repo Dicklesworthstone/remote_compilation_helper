@@ -43,6 +43,9 @@ pub(crate) struct RecoveryRecipe {
     /// Complete same-attempt stdout retained outside disposable staging trees.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     cargo_stdout: Option<RetainedCargoStdout>,
+    /// Complete diagnostics retained before retirement can remove the log.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cargo_stderr: Option<RetainedCargoStderr>,
     /// Persist the caller's output contract before execution so detached
     /// recovery cannot downgrade it to ordinary glob-only Cargo delivery.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -82,6 +85,38 @@ struct RetainedCargoStdout {
     remote_root: PathBuf,
     remote_project_root: PathBuf,
     exit_code: i32,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct RetainedCargoStderr {
+    path: PathBuf,
+    blake3: String,
+    bytes: u64,
+    exit_code: i32,
+}
+
+impl RetainedCargoStderr {
+    fn read(&self) -> anyhow::Result<Vec<u8>> {
+        let limit = super::super::cargo_output_contract::MAX_CARGO_OUTPUT_RECEIPT_BYTES;
+        anyhow::ensure!(
+            self.bytes <= limit as u64,
+            "retained Cargo stderr exceeds its bound"
+        );
+        let metadata = std::fs::symlink_metadata(&self.path)?;
+        anyhow::ensure!(
+            metadata.is_file() && !metadata.file_type().is_symlink(),
+            "retained Cargo stderr is not a regular file"
+        );
+        let mut file = File::open(&self.path)?.take(limit as u64 + 1);
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        anyhow::ensure!(
+            bytes.len() as u64 == self.bytes
+                && blake3::hash(&bytes).to_hex().to_string() == self.blake3,
+            "retained Cargo stderr failed its exact byte binding"
+        );
+        Ok(bytes)
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -484,6 +519,7 @@ impl RecoverySession {
             package_archive: false,
             cargo_output_capture: None,
             cargo_stdout: None,
+            cargo_stderr: None,
             caller_json_policy: None,
             caller_delivery: None,
             phases: Vec::new(),
@@ -682,6 +718,7 @@ impl RecoverySession {
             package_archive: sync_back_verified_zero_package_archives(Some(0), command),
             cargo_output_capture,
             cargo_stdout: None,
+            cargo_stderr: None,
             caller_json_policy: None,
             caller_delivery: None,
             phases,
@@ -914,6 +951,54 @@ impl RecoverySession {
         Ok(())
     }
 
+    pub(crate) async fn collect_cargo_stderr(
+        &mut self,
+        pipeline: &TransferPipeline,
+        worker: &WorkerConfig,
+    ) -> anyhow::Result<()> {
+        let Some(project) = self.recipe.caller_json_policy.clone() else {
+            return Ok(());
+        };
+        let exit = self
+            .recipe
+            .exit_code
+            .context("Cargo diagnostics have no exact completion")?;
+        if let Some(receipt) = self.recipe.cargo_stderr.as_ref() {
+            anyhow::ensure!(
+                receipt.exit_code == exit,
+                "Cargo stderr contradicts its completion"
+            );
+            receipt.read()?;
+            return Ok(());
+        }
+        anyhow::ensure!(
+            self.recipe.execution_started,
+            "Cargo stderr has no admitted invocation"
+        );
+        let bytes = pipeline
+            .clone()
+            .with_remote_path_override(
+                project
+                    .to_str()
+                    .context("persisted Cargo source root is not UTF-8")?,
+            )
+            .read_cargo_stderr_evidence(worker, exit)
+            .await?;
+        let path = retain_cargo_bytes(&self.recipe.wrapper_id, "cargo-stderr", &bytes)?;
+        let receipt = RetainedCargoStderr {
+            path,
+            blake3: blake3::hash(&bytes).to_hex().to_string(),
+            bytes: bytes.len() as u64,
+            exit_code: exit,
+        };
+        receipt.read()?;
+        let mut next_recipe = self.recipe.clone();
+        next_recipe.cargo_stderr = Some(receipt);
+        self.writer.set_recovery(serde_json::to_value(&next_recipe)?)?;
+        self.recipe = next_recipe;
+        Ok(())
+    }
+
     /// A success record may reach compiler stdout only after actual delivery.
     /// Check the exact publication fingerprints again under the same physical
     /// output-root lock, so an ambient old executable cannot satisfy the API.
@@ -995,6 +1080,8 @@ impl RecoverySession {
             "published_output_root": local_root,
             "caller_output_root": caller_root,
             "remote_project_root": receipt.remote_project_root,
+            "stderr": self.recipe.cargo_stderr.as_ref()
+                .context("caller Cargo delivery has no retained complete diagnostics")?,
         });
         let roots = [Path::new(&phase.remote), receipt.remote_root.as_path()];
         let source_roots = [remote_project_root, receipt.remote_project_root.as_path()];
@@ -1473,6 +1560,11 @@ impl RecoverySession {
                 .await?,
             )
         };
+        if self.recipe.tree_retired {
+            // Do not reopen released worker paths. Any first caller delivery
+            // must already have enough retained local evidence to verify here.
+            self.prepare_caller_delivery().await?;
+        }
         if !self.recipe.tree_retired {
             let sources = sources
                 .as_mut()
@@ -1481,6 +1573,19 @@ impl RecoverySession {
             if let Some(pair) = pair.as_mut() {
                 pair.ensure_held()?;
             }
+            if self.recipe.caller_json_policy.is_some() {
+                let pipeline = self.completion_pipeline(
+                    TransferPipeline::new(
+                        self.recipe.project_root.clone(),
+                        "recovery".into(),
+                        self.recipe.identity.clone(),
+                        self.recipe.transfer.clone(),
+                    )
+                    .with_source_authority(self.recipe.identity.clone())?,
+                );
+                self.collect_cargo_stderr(&pipeline, &worker).await?;
+            }
+            self.prepare_caller_delivery().await?;
             if let Some(root) = &self.recipe.retire_root {
                 TransferPipeline::new(
                     self.recipe.project_root.clone(),
@@ -1597,7 +1702,9 @@ fn load_recipe(writer: &DurableLeaseWriter) -> anyhow::Result<RecoveryRecipe> {
         );
     } else {
         anyhow::ensure!(
-            recipe.cargo_stdout.is_none() && recipe.caller_delivery.is_none(),
+            recipe.cargo_stdout.is_none()
+                && recipe.cargo_stderr.is_none()
+                && recipe.caller_delivery.is_none(),
             "retained caller Cargo output has no original opt-in policy"
         );
     }
@@ -1605,6 +1712,12 @@ fn load_recipe(writer: &DurableLeaseWriter) -> anyhow::Result<RecoveryRecipe> {
         anyhow::ensure!(
             recipe.execution_started && recipe.exit_code == Some(producer.exit_code),
             "retained Cargo producer contradicts the original completion"
+        );
+    }
+    if let Some(diagnostics) = recipe.cargo_stderr.as_ref() {
+        anyhow::ensure!(
+            recipe.execution_started && recipe.exit_code == Some(diagnostics.exit_code),
+            "retained Cargo diagnostics contradict the original completion"
         );
     }
     if recipe.caller_delivery.is_some() {
@@ -1746,7 +1859,7 @@ pub(crate) async fn recover_job(writer: &DurableLeaseWriter) -> anyhow::Result<i
 /// An ordinary job cannot acquire a Cargo output contract after execution.
 pub(crate) async fn recover_job_cargo_json(
     writer: &DurableLeaseWriter,
-) -> anyhow::Result<(i32, Option<Vec<u8>>)> {
+) -> anyhow::Result<(i32, Option<Vec<u8>>, Vec<u8>)> {
     {
         let _ownership = recovery_owner::claim(writer).await?;
         let recipe = load_recipe(writer)?;
@@ -1805,7 +1918,16 @@ pub(crate) async fn recover_job_cargo_json(
         // Compiler success with failed delivery must not advertise success.
         None
     };
-    Ok((exit, stdout))
+    let diagnostics = session
+        .recipe
+        .cargo_stderr
+        .as_ref()
+        .context("Cargo recovery has no retained complete compiler stderr")?;
+    anyhow::ensure!(
+        session.recipe.exit_code == Some(diagnostics.exit_code),
+        "recovered Cargo stderr contradicts its compiler completion"
+    );
+    Ok((exit, stdout, diagnostics.read()?))
 }
 
 async fn recover_job_with_daemon(
@@ -1840,7 +1962,6 @@ async fn recover_job_with_daemon(
             recipe,
             writer: writer.clone(),
         };
-        session.prepare_caller_delivery().await?;
         session.retire_returned().await?;
         writer.record_exit(exit)?;
         recovery_completion::finish(writer, &mut daemon).await?;
@@ -1909,6 +2030,7 @@ async fn recover_job_with_daemon(
     let base = base.with_source_authority(session.recipe.identity.clone())?;
     session.completed(exit)?;
     let command_exit = exit;
+    session.collect_cargo_stderr(&base, &worker).await?;
     // A wrapper can disappear after Cargo finishes but before it records the
     // output set locally. Re-read the complete same-attempt receipt; never
     // rerun Cargo and never silently downgrade to the old glob-only policy.

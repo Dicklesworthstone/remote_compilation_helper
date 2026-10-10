@@ -2074,6 +2074,13 @@ async fn execute_remote_compilation_inner(
     let mut artifacts_result: Option<SyncResult> = None;
     let mut artifacts_failed = false;
     let mut cargo_evidence_terminal = false;
+    if reporter.cargo_json_stdout {
+        recovery_session
+            .as_mut()
+            .context("caller Cargo diagnostics have no admitted recovery session")?
+            .collect_cargo_stderr(&pipeline, &worker_config)
+            .await?;
+    }
     if result.success()
         && let Some(session) = recovery_session.as_mut()
         && let Some(remote_root) = session.cargo_artifact_remote_root().map(str::to_owned)

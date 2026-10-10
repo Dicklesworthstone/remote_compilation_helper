@@ -323,12 +323,18 @@ async fn run_unix(action: Option<JobsAction>, ctx: &OutputContext) -> Result<()>
             "Cargo JSON recovery conflicts with machine envelopes"
         );
         let writer = DurableLeaseWriter::load(&wrapper_id)?;
-        let (code, stdout) = within_job_deadline(
+        let (code, stdout, stderr) = within_job_deadline(
             deadline,
             "Cargo JSON recovery (use the retained journal for same-id retry)",
             crate::hook::recover_job_cargo_json(&writer),
         )
         .await?;
+        {
+            use std::io::Write;
+            let mut diagnostics = std::io::stderr().lock();
+            diagnostics.write_all(&stderr)?;
+            diagnostics.flush()?;
+        }
         if let Some(bytes) = stdout {
             use std::io::Write;
             let mut output = std::io::stdout().lock();

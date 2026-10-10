@@ -156,6 +156,15 @@ def main():
             receipt = Path(binding["receipt"]["path"])
             require(receipt.is_absolute() and receipt.is_file() and not receipt.is_symlink(), "Exact producer receipt is not retained")
             require(blake3(receipt, case) == binding["receipt"]["blake3"], "Producer receipt bytes differ from the binding")
+            diagnostic = binding["receipt"]["stderr"]
+            diagnostic_path = Path(diagnostic["path"])
+            require(diagnostic_path.is_absolute() and diagnostic_path.is_file()
+                    and not diagnostic_path.is_symlink()
+                    and diagnostic_path.stat().st_size == diagnostic["bytes"]
+                    and diagnostic["exit_code"] == 0,
+                    "Complete stderr is not retained for the original successful invocation")
+            require(blake3(diagnostic_path, case) == diagnostic["blake3"],
+                    "Actual retained diagnostic bytes differ from their receipt binding")
             require(blake3(path, case) == binding["executable_blake3"], "Actual executable differs from its publication fingerprint")
             producer_rows = []
             for line in receipt.read_text().splitlines():
@@ -192,16 +201,25 @@ def main():
     require(first_bindings and len({item["wrapper_id"] for item in first_bindings}) == 1,
             "Actual first delivery does not bind one original wrapper")
     wrapper_id = first_bindings[0]["wrapper_id"]
+    first_diagnostic = first_bindings[0]["stderr"]
+    require(all(item["stderr"] == first_diagnostic for item in first_bindings),
+            "Selected records disagree on their original complete stderr receipt")
+    diagnostic_path = Path(first_diagnostic["path"])
+    diagnostic_bytes = diagnostic_path.read_bytes()
+    diagnostic_sha = sha256(diagnostic_path)
     recovery_command = [str(args.rch), "jobs", "recover", wrapper_id, "--cargo-json"]
     recovered, _ = run("completed-cargo-json-recovery", recovery_command, env)
-    require(recovered.returncode == 0 and recovered.stdout == first.stdout,
-            "Completed same-id recovery changed the original caller paths or JSON bytes")
+    require(recovered.returncode == 0 and recovered.stdout == first.stdout
+            and recovered.stderr == diagnostic_bytes,
+            "Completed same-id recovery changed original caller JSON or complete compiler stderr")
     repeat, repeat_case = run("cached-build", command, env)
     repeated_paths = check_success(repeat, repeat_case, True)
     require(all(paths[name] != repeated_paths[name] and sha256(paths[name]) == first_hashes[name] for name in names),
             "Repeat publication reused or changed an earlier invocation's retained executable")
     recovered_after, _ = run("completed-recovery-after-later-build", recovery_command, env)
     require(recovered_after.returncode == 0 and recovered_after.stdout == first.stdout
+            and recovered_after.stderr == diagnostic_bytes
+            and sha256(diagnostic_path) == diagnostic_sha
             and all(sha256(paths[name]) == first_hashes[name] for name in names),
             "Recovery selected a later invocation's outputs or changed the retained originals")
     # Close the read end of our own new recovery child's actual stdout pipe.
@@ -228,10 +246,12 @@ def main():
     sys.stderr.buffer.flush()
     outcomes.append({"case": "completed-recovery-broken-stdout", "returncode": broken_code})
     require(broken_code != 0 and (broken_code == -signal.SIGPIPE
-            or b"broken pipe" in broken_stderr.lower()),
+            or b"broken pipe" in broken_stderr.lower())
+            and broken_stderr.startswith(diagnostic_bytes),
             "Closed stdout did not reach an actual broken-pipe failure")
     retry, _ = run("completed-recovery-after-broken-stdout", recovery_command, env)
-    require(retry.returncode == 0 and retry.stdout == first.stdout,
+    require(retry.returncode == 0 and retry.stdout == first.stdout
+            and retry.stderr == diagnostic_bytes and sha256(diagnostic_path) == diagnostic_sha,
             "A failed stdout write consumed or changed the retained same-id delivery")
     conflict, _ = run("recovery-machine-envelope-conflict",
                       [str(args.rch), "--json", "jobs", "recover", wrapper_id, "--cargo-json"], env)
@@ -254,6 +274,10 @@ def main():
     payload = json.loads(envelope.stdout)
     require(payload.get("outcome") == "completed" and payload.get("location") == "remote"
             and payload.get("remote_exit_code") == 0, "Machine stdout contains compiler records or lacks its remote envelope")
+    before_failure, _ = run("jobs-before-genuine-failure", [str(args.rch), "--json", "jobs"], env)
+    require(before_failure.returncode == 0, "Actual pre-failure job observation failed")
+    prior_ids = {item["lease"]["identity"]["local_wrapper_id"]
+                 for item in json.loads(before_failure.stdout)["jobs"]}
     missing = "absent-cargo-json-" + token
     failure, _ = run("genuine-cargo-target-failure", ["cargo", "build", "-j1", "--locked", "--release",
         "-p", "franken-snowflake-cli", "--bin", missing, "--message-format=json,json-render-diagnostics"], env)
@@ -261,6 +285,42 @@ def main():
             and missing.encode() in failure.stderr, "Negative case did not reach the real Cargo target-selection failure")
     require(not any(json.loads(line).get("success") is True for line in failure.stdout.decode().splitlines()
                     if line.startswith('{"reason":"build-finished"')), "Compiler failure advertised Cargo success")
+    after_failure, failure_jobs_case = run("jobs-after-genuine-failure",
+                                          [str(args.rch), "--json", "jobs"], env)
+    require(after_failure.returncode == 0, "Actual post-failure job observation failed")
+    failures = []
+    for item in json.loads(after_failure.stdout)["jobs"]:
+        lease = item["lease"]
+        recipe = lease.get("recovery") or {}
+        identity = lease["identity"]
+        project_root = recipe.get("project_root")
+        if (identity["local_wrapper_id"] in prior_ids or lease.get("worker_id") != args.worker
+                or lease.get("exit_code") != 101 or lease.get("terminal_acknowledged") is not True
+                or lease.get("strict_remote") is not True or recipe.get("exit_code") != 101
+                or recipe.get("returned") != 101 or recipe.get("retired") is not True
+                or not isinstance(project_root, str) or not Path(project_root).is_absolute()
+                or Path(project_root).resolve() != source):
+            continue
+        diagnostic = recipe.get("cargo_stderr")
+        if not diagnostic:
+            continue
+        path = Path(diagnostic["path"])
+        require(path.is_absolute() and path.is_file() and not path.is_symlink(),
+                "Observed failed invocation has no regular retained diagnostic log")
+        actual_diagnostic = path.read_bytes()
+        if b"error: no bin target named" not in actual_diagnostic or missing.encode() not in actual_diagnostic:
+            continue
+        require(diagnostic["exit_code"] == 101 and diagnostic["bytes"] == len(actual_diagnostic)
+                and blake3(path, failure_jobs_case) == diagnostic["blake3"],
+                "Actual failed compiler diagnostics contradict their exact receipt")
+        failures.append((identity["local_wrapper_id"], actual_diagnostic))
+    require(len(failures) == 1, "The genuine failure did not bind one new same-id retained invocation")
+    failed_wrapper, failed_diagnostics = failures[0]
+    failed_recovery, _ = run("genuine-failure-complete-output-recovery",
+                            [str(args.rch), "jobs", "recover", failed_wrapper, "--cargo-json"], env)
+    require(failed_recovery.returncode == 101 and failed_recovery.stdout == failure.stdout
+            and failed_recovery.stderr == failed_diagnostics,
+            "Same-id recovery changed actual compiler failure status, stdout or complete stderr")
     unsupported, _ = run("unsupported-target-selection", ["cargo", "build", "--bins", "--message-format=json"], env)
     require(unsupported.returncode != 0 and not unsupported.stdout
             and b"requires cargo build with literal --bin targets" in unsupported.stderr,

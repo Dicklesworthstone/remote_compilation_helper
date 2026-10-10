@@ -918,6 +918,21 @@ const MAX_CARGO_ARTIFACT_EVIDENCE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_CARGO_ARTIFACT_ROOT_BYTES: usize = 4096;
 const CARGO_ARTIFACT_EVIDENCE_REJECTION: &str = "RCH_CARGO_ARTIFACT_EVIDENCE_REJECTED";
 
+#[derive(Clone, Copy)]
+enum CargoOutputLog {
+    Stdout,
+    Stderr,
+}
+
+impl CargoOutputLog {
+    fn suffix(self) -> &'static str {
+        match self {
+            Self::Stdout => "stdout",
+            Self::Stderr => "stderr",
+        }
+    }
+}
+
 fn cargo_artifact_evidence_script(
     path: &str,
     identity: &str,
@@ -925,6 +940,7 @@ fn cargo_artifact_evidence_script(
     remote_project_root: Option<&str>,
     max_bytes: usize,
     expected_exit: i32,
+    log: CargoOutputLog,
 ) -> String {
     let quote = |value: &str| escape(Cow::from(value)).into_owned();
     // Ordinary detached recovery does not reconstruct a source pipeline.
@@ -956,7 +972,7 @@ fn cargo_artifact_evidence_script(
          {{ [ -f {done} ] && [ ! -L {done} ] && [ -f {out} ] && [ ! -L {out} ]; }} || reject 'receipt or log changed during collection'; \
          [ \"$(cat -- {done})\" = \"$expected\" ] || reject 'completion changed during collection'",
         done = quote(path),
-        out = quote(&format!("{path}.stdout")),
+        out = quote(&format!("{path}.{}", log.suffix())),
         expected = quote(&format!("{identity} {expected_exit}")),
         identity = quote(identity),
         root = quote(remote_output_root),
@@ -2676,7 +2692,7 @@ impl TransferPipeline {
         worker: &WorkerConfig,
         remote_output_root: &str,
     ) -> Result<CargoArtifactEvidence> {
-        self.read_cargo_evidence(worker, remote_output_root, 0, None)
+        self.read_cargo_evidence(worker, remote_output_root, 0, None, CargoOutputLog::Stdout)
             .await
     }
 
@@ -2690,8 +2706,36 @@ impl TransferPipeline {
         expected_exit: i32,
     ) -> Result<CargoArtifactEvidence> {
         let project = self.remote_path();
-        self.read_cargo_evidence(worker, remote_output_root, expected_exit, Some(&project))
-            .await
+        self.read_cargo_evidence(
+            worker,
+            remote_output_root,
+            expected_exit,
+            Some(&project),
+            CargoOutputLog::Stdout,
+        )
+        .await
+    }
+
+    /// Collect complete diagnostic bytes from the same immutable completion.
+    /// Failed Cargo may never create a target tree, so resolve its executed
+    /// source root. The shared frame carries this log on transport stdout;
+    /// these bytes are returned only as diagnostics, never Cargo artifact JSON.
+    pub(crate) async fn read_cargo_stderr_evidence(
+        &self,
+        worker: &WorkerConfig,
+        expected_exit: i32,
+    ) -> Result<Vec<u8>> {
+        let project = self.remote_path();
+        let evidence = self
+            .read_cargo_evidence(
+                worker,
+                &project,
+                expected_exit,
+                Some(&project),
+                CargoOutputLog::Stderr,
+            )
+            .await?;
+        Ok(evidence.stdout)
     }
 
     async fn read_cargo_evidence(
@@ -2700,6 +2744,7 @@ impl TransferPipeline {
         remote_output_root: &str,
         expected_exit: i32,
         remote_project_root: Option<&str>,
+        log: CargoOutputLog,
     ) -> Result<CargoArtifactEvidence> {
         anyhow::ensure!(
             (0..=255).contains(&expected_exit),
@@ -2725,6 +2770,7 @@ impl TransferPipeline {
             remote_project_root,
             MAX_CARGO_ARTIFACT_EVIDENCE_BYTES,
             expected_exit,
+            log,
         );
         let command =
             self.worker_ssh_command(worker, &["sh", "-c", &escape(Cow::from(script.as_str()))]);
@@ -8096,6 +8142,7 @@ mod tests {
             Some(directory.path().to_str().unwrap()),
             MAX_CARGO_ARTIFACT_EVIDENCE_BYTES,
             0,
+            CargoOutputLog::Stdout,
         );
         let mut command = Command::new("sh");
         command.arg("-c").arg(script);
@@ -8123,6 +8170,7 @@ mod tests {
             None,
             MAX_CARGO_ARTIFACT_EVIDENCE_BYTES,
             0,
+            CargoOutputLog::Stdout,
         ));
         let evidence = collect_cargo_artifact_evidence(
             ordinary,
@@ -8157,6 +8205,7 @@ mod tests {
                 Some(directory.path().to_str().unwrap()),
                 limit,
                 0,
+                CargoOutputLog::Stdout,
             );
             let mut command = Command::new("sh");
             command.arg("-c").arg(script);
@@ -8217,6 +8266,7 @@ mod tests {
                 Some(directory.path().to_str().unwrap()),
                 64,
                 0,
+                CargoOutputLog::Stdout,
             ));
             assert!(
                 collect_cargo_artifact_evidence(command, "job", 64, Duration::from_secs(3))

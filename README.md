@@ -371,8 +371,14 @@ and uses the original exit status. Repeating it returns the first delivery's
 exact JSON bytes and private paths, including after later builds or a failed
 stdout write. A live unacknowledged wrapper or unknown owner identity refuses
 detached recovery. `--json` machine envelopes conflict with `--cargo-json`.
-Failed compiler stdout is retained from the exact nonzero completion; detached
-recovery does not yet replay the compiler's complete stderr.
+The complete compiler stderr is collected from the same supervisor log with
+the original completion status and retained before retirement. Its path,
+length, BLAKE3 and compiler status appear in the selected record's receipt.
+Recovery verifies those bytes and writes them to stderr without line or UTF-8
+conversion. Failed compiler stdout and stderr use the exact nonzero completion;
+no successful Cargo record is advertised when artifact delivery failed. Older
+completed journals lacking retained diagnostics refuse this explicit output
+mode rather than fabricate diagnostic parity.
 
 Use the exit status together with the record binding. This route does not
 provide native Windows delivery, an installer transaction, a source-content
