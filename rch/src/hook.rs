@@ -3016,19 +3016,26 @@ pub async fn run_exec(
     // defeat the entire peer-dirt exclusion guarantee.
     // Opt-in through the canonical Cargo shim without modifying its installed
     // body. Hook protocol and machine envelopes keep their stdout contracts.
-    let cargo_json_stdout = std::env::var("RCH_CARGO_JSON_STDOUT")
-        .is_ok_and(|value| env_flag_enabled(&value));
+    let cargo_json_stdout =
+        std::env::var("RCH_CARGO_JSON_STDOUT").is_ok_and(|value| env_flag_enabled(&value));
     if cargo_json_stdout {
-        anyhow::ensure!(!out_ctx.is_json() && !job, "RCH_CARGO_JSON_STDOUT conflicts with machine envelopes and arbitrary jobs");
+        anyhow::ensure!(
+            !out_ctx.is_json() && !job,
+            "RCH_CARGO_JSON_STDOUT conflicts with machine envelopes and arbitrary jobs"
+        );
         let classified = classify_command(&command);
         anyhow::ensure!(
             classified.kind == Some(CompilationKind::CargoBuild)
-                && cargo_output_contract::CargoOutputCapture::for_command(classified.kind, &command)
-                    .is_some_and(|capture| capture.caller_json_supported()),
+                && cargo_output_contract::CargoOutputCapture::for_command(
+                    classified.kind,
+                    &command
+                )
+                .is_some_and(|capture| capture.caller_json_supported()),
             "RCH_CARGO_JSON_STDOUT requires cargo build with literal --bin targets and an explicit JSON message format"
         );
     }
-    let require_remote = exec_requires_remote() || clean_overlay || source_content_receipt || cargo_json_stdout;
+    let require_remote =
+        exec_requires_remote() || clean_overlay || source_content_receipt || cargo_json_stdout;
 
     // Classify the command. In explicit job-admission mode (`rch exec --job`,
     // bd-bu3fb) the classifier is bypassed entirely and the command is admitted
@@ -3140,7 +3147,8 @@ pub async fn run_exec(
         info!("role=dispatcher: offloadable build defaults to fail-closed + queue");
     }
 
-    let reporter = HookReporter::new(config.output.visibility).with_cargo_json_stdout(cargo_json_stdout);
+    let reporter =
+        HookReporter::new(config.output.visibility).with_cargo_json_stdout(cargo_json_stdout);
 
     // Build path topology policy from loaded config so that any normalization
     // warnings reference the configured roots rather than compiled-in defaults.
@@ -3738,20 +3746,27 @@ pub async fn run_exec(
                     // workload after inspecting its diagnostics. Release and
                     // durable acknowledgment precede every stdout byte.
                     if result.exit_code == 0 {
-                        if let Err(error) = record_build(
-                            &config.general.socket_path, &worker.id, &project, false,
-                        ).await {
+                        if let Err(error) =
+                            record_build(&config.general.socket_path, &worker.id, &project, false)
+                                .await
+                        {
                             warn!("Failed to record build: {}", error);
                         }
                     }
-                    durable_lease.acknowledge_terminal()
-                        .context("compiler stdout remains withheld: durable terminal acknowledgment failed")?;
+                    durable_lease.acknowledge_terminal().context(
+                        "compiler stdout remains withheld: durable terminal acknowledgment failed",
+                    )?;
                     if let Some(bytes) = result.cargo_stdout.as_deref() {
                         let mut stdout = io::stdout().lock();
-                        stdout.write_all(bytes).context("write verified Cargo stdout")?;
+                        stdout
+                            .write_all(bytes)
+                            .context("write verified Cargo stdout")?;
                         stdout.flush().context("flush verified Cargo stdout")?;
                     } else {
-                        anyhow::ensure!(result.exit_code != 0, "successful Cargo delivery supplied no verified compiler stdout");
+                        anyhow::ensure!(
+                            result.exit_code != 0,
+                            "successful Cargo delivery supplied no verified compiler stdout"
+                        );
                         reporter.summary_critical("[RCH] compiler output retained; artifact delivery failed, so caller-local success records were withheld");
                     }
                     std::process::exit(result.exit_code);
@@ -4314,7 +4329,10 @@ struct HookReporter {
 
 impl HookReporter {
     fn new(visibility: OutputVisibility) -> Self {
-        Self { visibility, cargo_json_stdout: false }
+        Self {
+            visibility,
+            cargo_json_stdout: false,
+        }
     }
 
     fn with_cargo_json_stdout(mut self, enabled: bool) -> Self {

@@ -426,11 +426,7 @@ mod tests {
             ("dangling", Presence::Symlink),
             ("alias/missing", Presence::Symlink),
         ] {
-            assert_eq!(
-                local_probe(&root, path).unwrap(),
-                expected,
-                "{path}"
-            );
+            assert_eq!(local_probe(&root, path).unwrap(), expected, "{path}");
         }
         assert!(local_probe(&directory.path().join("missing-root"), "reports").is_err());
         assert!(local_probe(&root.join("dangling"), "reports").is_err());
@@ -458,7 +454,10 @@ mod tests {
                 local_probe(&root, "link/evidence").unwrap(),
                 Presence::Symlink
             );
-            assert_eq!(local_probe(&root, "socket").unwrap(), Presence::NotDirectory);
+            assert_eq!(
+                local_probe(&root, "socket").unwrap(),
+                Presence::NotDirectory
+            );
             assert_eq!(
                 local_probe(&root, "socket/child").unwrap(),
                 Presence::NotDirectory
@@ -761,9 +760,12 @@ os.stat = raced_stat
         std::fs::rename(&path, &saved).unwrap();
         std::fs::create_dir(&path).unwrap();
         assert!(
-            settle_result_phase(&mut session, 0, async { Ok(Presence::NotDirectory) }, async {
-                panic!("invalid output must not transfer, even on a persistence failure")
-            })
+            settle_result_phase(
+                &mut session,
+                0,
+                async { Ok(Presence::NotDirectory) },
+                async { panic!("invalid output must not transfer, even on a persistence failure") }
+            )
             .await
             .is_err()
         );
@@ -775,9 +777,12 @@ os.stat = raced_stat
         std::fs::remove_dir(&path).unwrap();
         std::fs::rename(&saved, &path).unwrap();
         assert!(
-            !settle_result_phase(&mut session, 0, async { Ok(Presence::NotDirectory) }, async {
-                panic!("retry still must not transfer an invalid directory")
-            })
+            !settle_result_phase(
+                &mut session,
+                0,
+                async { Ok(Presence::NotDirectory) },
+                async { panic!("retry still must not transfer an invalid directory") }
+            )
             .await
             .unwrap()
         );

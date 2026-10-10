@@ -2,7 +2,9 @@
 use super::super::artifact_patterns::direct_compiler::{
     NativeOutputContract, native_output_contract,
 };
-use super::super::cargo_output_contract::{CargoCallerPaths, CargoOutputCapture, CargoOutputContract};
+use super::super::cargo_output_contract::{
+    CargoCallerPaths, CargoOutputCapture, CargoOutputContract,
+};
 use super::*;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -137,8 +139,8 @@ impl RetainedCargoDelivery {
 }
 
 fn retain_cargo_bytes(wrapper: &str, label: &str, bytes: &[u8]) -> anyhow::Result<PathBuf> {
-    let path = default_job_lease_directory()
-        .join(format!("{wrapper}.{label}-{}", uuid::Uuid::new_v4()));
+    let path =
+        default_job_lease_directory().join(format!("{wrapper}.{label}-{}", uuid::Uuid::new_v4()));
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -149,16 +151,26 @@ fn retain_cargo_bytes(wrapper: &str, label: &str, bytes: &[u8]) -> anyhow::Resul
     let mut file = options.open(&path)?;
     file.write_all(bytes)?;
     file.sync_all()?;
-    File::open(path.parent().context("retained Cargo bytes have no parent")?)?.sync_all()?;
+    File::open(
+        path.parent()
+            .context("retained Cargo bytes have no parent")?,
+    )?
+    .sync_all()?;
     Ok(path)
 }
 
 impl RetainedCargoStdout {
     fn read(&self) -> anyhow::Result<Vec<u8>> {
         let limit = super::super::cargo_output_contract::MAX_CARGO_OUTPUT_RECEIPT_BYTES;
-        anyhow::ensure!(self.bytes <= limit as u64, "retained Cargo stdout exceeds its receipt bound");
+        anyhow::ensure!(
+            self.bytes <= limit as u64,
+            "retained Cargo stdout exceeds its receipt bound"
+        );
         let metadata = std::fs::symlink_metadata(&self.path)?;
-        anyhow::ensure!(metadata.is_file() && !metadata.file_type().is_symlink(), "retained Cargo stdout is not a regular file");
+        anyhow::ensure!(
+            metadata.is_file() && !metadata.file_type().is_symlink(),
+            "retained Cargo stdout is not a regular file"
+        );
         let mut file = File::open(&self.path)?.take(limit as u64 + 1);
         let mut stdout = Vec::new();
         file.read_to_end(&mut stdout)?;
@@ -231,13 +243,26 @@ fn fingerprint(path: &Path) -> anyhow::Result<Option<String>> {
     Ok(Some(hasher.finalize().to_hex().to_string()))
 }
 
-fn copy_published_output(source_path: &Path, destination: &Path, expected: &str) -> anyhow::Result<()> {
+fn copy_published_output(
+    source_path: &Path,
+    destination: &Path,
+    expected: &str,
+) -> anyhow::Result<()> {
     let mut source = File::open(source_path)?;
     let metadata = source.metadata()?;
-    anyhow::ensure!(metadata.is_file(), "published Cargo output is not a regular file");
+    anyhow::ensure!(
+        metadata.is_file(),
+        "published Cargo output is not a regular file"
+    );
     let length = metadata.len();
-    let bound = length.checked_add(1).context("published Cargo output length overflow")?;
-    std::fs::create_dir_all(destination.parent().context("caller Cargo output has no parent")?)?;
+    let bound = length
+        .checked_add(1)
+        .context("published Cargo output length overflow")?;
+    std::fs::create_dir_all(
+        destination
+            .parent()
+            .context("caller Cargo output has no parent")?,
+    )?;
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -252,14 +277,17 @@ fn copy_published_output(source_path: &Path, destination: &Path, expected: &str)
     let mut reader = (&mut source).take(bound);
     loop {
         let count = reader.read(&mut buffer)?;
-        if count == 0 { break; }
+        if count == 0 {
+            break;
+        }
         count_total += count as u64;
         hasher.update(&buffer[..count]);
         copy.write_all(&buffer[..count])?;
     }
     anyhow::ensure!(
         count_total == length && hasher.finalize().to_hex().to_string() == expected,
-        "published Cargo output changed before stdout delivery: {}", source_path.display()
+        "published Cargo output changed before stdout delivery: {}",
+        source_path.display()
     );
     copy.sync_all()?;
     std::fs::set_permissions(destination, metadata.permissions())?;
@@ -691,10 +719,18 @@ impl RecoverySession {
 
     pub(crate) fn request_caller_json(&mut self, remote_project_root: &Path) -> anyhow::Result<()> {
         anyhow::ensure!(
-            !self.recipe.execution_started && self.recipe.exit_code.is_none()
-                && self.recipe.cargo_output_capture.as_ref().is_some_and(CargoOutputCapture::caller_json_supported)
+            !self.recipe.execution_started
+                && self.recipe.exit_code.is_none()
+                && self
+                    .recipe
+                    .cargo_output_capture
+                    .as_ref()
+                    .is_some_and(CargoOutputCapture::caller_json_supported)
                 && remote_project_root.is_absolute()
-                && !remote_project_root.to_string_lossy().chars().any(char::is_control),
+                && !remote_project_root
+                    .to_string_lossy()
+                    .chars()
+                    .any(char::is_control),
             "caller Cargo JSON requires a fresh admitted named-binary contract"
         );
         self.recipe.caller_json_policy = Some(remote_project_root.to_owned());
@@ -710,7 +746,10 @@ impl RecoverySession {
             self.retain_cargo_stdout(
                 &evidence.stdout,
                 &evidence.remote_root,
-                evidence.remote_project_root.as_deref().context("caller Cargo JSON has no verified source root")?,
+                evidence
+                    .remote_project_root
+                    .as_deref()
+                    .context("caller Cargo JSON has no verified source root")?,
                 0,
             )?;
         }
@@ -869,7 +908,8 @@ impl RecoverySession {
             remote_project_root: remote_project_root.to_owned(),
             exit_code,
         });
-        self.writer.set_recovery(serde_json::to_value(&next_recipe)?)?;
+        self.writer
+            .set_recovery(serde_json::to_value(&next_recipe)?)?;
         self.recipe = next_recipe;
         Ok(())
     }
@@ -882,21 +922,47 @@ impl RecoverySession {
             self.recipe.returned == Some(0) && self.recipe.exit_code == Some(0),
             "caller Cargo JSON requires successful compilation and artifact delivery"
         );
-        let receipt = self.recipe.cargo_stdout.as_ref().context("complete retained Cargo stdout is unavailable")?;
-        anyhow::ensure!(receipt.exit_code == 0, "retained Cargo stdout failed its invocation binding");
+        let receipt = self
+            .recipe
+            .cargo_stdout
+            .as_ref()
+            .context("complete retained Cargo stdout is unavailable")?;
+        anyhow::ensure!(
+            receipt.exit_code == 0,
+            "retained Cargo stdout failed its invocation binding"
+        );
         if let Some(delivery) = self.recipe.caller_delivery.as_ref() {
             return delivery.read(receipt);
         }
-        let remote_project_root = self.recipe.caller_json_policy.as_deref()
+        let remote_project_root = self
+            .recipe
+            .caller_json_policy
+            .as_deref()
             .context("caller Cargo JSON has no persisted source policy")?;
         let stdout = receipt.read()?;
-        let phase = self.recipe.phases.iter().find(|phase| phase.output_gate).context("caller Cargo JSON has no output phase")?;
-        anyhow::ensure!(phase.complete && phase.pending.is_none(), "caller Cargo JSON output phase is incomplete");
+        let phase = self
+            .recipe
+            .phases
+            .iter()
+            .find(|phase| phase.output_gate)
+            .context("caller Cargo JSON has no output phase")?;
+        anyhow::ensure!(
+            phase.complete && phase.pending.is_none(),
+            "caller Cargo JSON output phase is incomplete"
+        );
         let _publication = lock_output_root(&phase.local).await?;
         let local_root = phase.local.canonicalize()?;
-        phase.cargo_outputs.as_ref().context("caller Cargo JSON has no output contract")?.verify_staged(&local_root)?;
+        phase
+            .cargo_outputs
+            .as_ref()
+            .context("caller Cargo JSON has no output contract")?
+            .verify_staged(&local_root)?;
         let source_root = self.recipe.project_root.canonicalize()?;
-        let capture = self.recipe.cargo_output_capture.as_ref().context("caller Cargo JSON has no capture policy")?;
+        let capture = self
+            .recipe
+            .cargo_output_capture
+            .as_ref()
+            .context("caller Cargo JSON has no capture policy")?;
         // Other builds can legitimately publish into the shared target root
         // after this lock is released. Give this invocation independent copies
         // before advertising paths, so later atomic replacements cannot change
@@ -906,9 +972,14 @@ impl RecoverySession {
         } else {
             local_root.join("target").canonicalize()?
         };
-        anyhow::ensure!(caller_parent.starts_with(&local_root), "caller Cargo target root escapes its verified output phase");
+        anyhow::ensure!(
+            caller_parent.starts_with(&local_root),
+            "caller Cargo target root escapes its verified output phase"
+        );
         let caller_root = caller_parent.join(format!(
-            ".rch-delivered-{}-{}", self.recipe.wrapper_id, uuid::Uuid::new_v4(),
+            ".rch-delivered-{}-{}",
+            self.recipe.wrapper_id,
+            uuid::Uuid::new_v4(),
         ));
         std::fs::create_dir(&caller_root)?;
         #[cfg(unix)]
@@ -927,31 +998,57 @@ impl RecoverySession {
         });
         let roots = [Path::new(&phase.remote), receipt.remote_root.as_path()];
         let source_roots = [remote_project_root, receipt.remote_project_root.as_path()];
-        let projected = capture.caller_json(&stdout, &CargoCallerPaths {
-            remote_output_roots: &roots,
-            local_output_root: &caller_root,
-            remote_project_roots: &source_roots,
-            local_project_root: &source_root,
-            published: &phase.published,
-            receipt_binding: &binding,
-        })?;
-        CargoOutputContract { required_files: projected.files.clone() }.verify_staged(&local_root)?;
+        let projected = capture.caller_json(
+            &stdout,
+            &CargoCallerPaths {
+                remote_output_roots: &roots,
+                local_output_root: &caller_root,
+                remote_project_roots: &source_roots,
+                local_project_root: &source_root,
+                published: &phase.published,
+                receipt_binding: &binding,
+            },
+        )?;
+        CargoOutputContract {
+            required_files: projected.files.clone(),
+        }
+        .verify_staged(&local_root)?;
         for relative in &projected.files {
-            let expected = phase.published.get(relative).context("caller Cargo filename lacks a publication fingerprint")?;
-            copy_published_output(&local_root.join(relative), &caller_root.join(relative), expected)?;
+            let expected = phase
+                .published
+                .get(relative)
+                .context("caller Cargo filename lacks a publication fingerprint")?;
+            copy_published_output(
+                &local_root.join(relative),
+                &caller_root.join(relative),
+                expected,
+            )?;
         }
         File::open(&caller_root)?.sync_all()?;
         File::open(&caller_parent)?.sync_all()?;
-        CargoOutputContract { required_files: projected.files.clone() }.verify_staged(&caller_root)?;
+        CargoOutputContract {
+            required_files: projected.files.clone(),
+        }
+        .verify_staged(&caller_root)?;
         let limit = super::super::cargo_output_contract::MAX_CARGO_OUTPUT_RECEIPT_BYTES
             .checked_mul(2)
             .context("caller Cargo JSON size limit overflow")?;
-        anyhow::ensure!(projected.stdout.len() <= limit, "projected caller Cargo JSON exceeds its bound");
-        let path = retain_cargo_bytes(&self.recipe.wrapper_id, "cargo-delivery", &projected.stdout)?;
+        anyhow::ensure!(
+            projected.stdout.len() <= limit,
+            "projected caller Cargo JSON exceeds its bound"
+        );
+        let path =
+            retain_cargo_bytes(&self.recipe.wrapper_id, "cargo-delivery", &projected.stdout)?;
         let mut files = BTreeMap::new();
         for relative in &projected.files {
-            files.insert(relative.clone(), phase.published.get(relative)
-                .context("caller Cargo output lacks its publication fingerprint")?.clone());
+            files.insert(
+                relative.clone(),
+                phase
+                    .published
+                    .get(relative)
+                    .context("caller Cargo output lacks its publication fingerprint")?
+                    .clone(),
+            );
         }
         let delivery = RetainedCargoDelivery {
             path,
@@ -964,7 +1061,8 @@ impl RecoverySession {
         delivery.read(receipt)?;
         let mut next_recipe = self.recipe.clone();
         next_recipe.caller_delivery = Some(delivery);
-        self.writer.set_recovery(serde_json::to_value(&next_recipe)?)?;
+        self.writer
+            .set_recovery(serde_json::to_value(&next_recipe)?)?;
         self.recipe = next_recipe;
         Ok(projected.stdout)
     }
@@ -977,8 +1075,15 @@ impl RecoverySession {
     }
 
     pub(crate) fn failed_cargo_stdout(&self) -> anyhow::Result<Vec<u8>> {
-        let receipt = self.recipe.cargo_stdout.as_ref().context("complete failed Cargo stdout is unavailable")?;
-        anyhow::ensure!(receipt.exit_code != 0 && self.recipe.exit_code == Some(receipt.exit_code), "failed Cargo stdout requires the exact nonzero completion");
+        let receipt = self
+            .recipe
+            .cargo_stdout
+            .as_ref()
+            .context("complete failed Cargo stdout is unavailable")?;
+        anyhow::ensure!(
+            receipt.exit_code != 0 && self.recipe.exit_code == Some(receipt.exit_code),
+            "failed Cargo stdout requires the exact nonzero completion"
+        );
         let stdout = receipt.read()?;
         // Telemetry follows the real workload's terminal output and is not
         // part of Cargo stdout. Keep every preceding byte, including failures.
@@ -986,7 +1091,10 @@ impl RecoverySession {
         let end = if stdout.starts_with(marker[1..].as_bytes()) {
             0
         } else {
-            stdout.windows(marker.len()).position(|window| window == marker.as_bytes()).map_or(stdout.len(), |index| index + 1)
+            stdout
+                .windows(marker.len())
+                .position(|window| window == marker.as_bytes())
+                .map_or(stdout.len(), |index| index + 1)
         };
         Ok(stdout[..end].to_vec())
     }
@@ -1477,10 +1585,13 @@ fn load_recipe(writer: &DurableLeaseWriter) -> anyhow::Result<RecoveryRecipe> {
     );
     if let Some(project) = recipe.caller_json_policy.as_ref() {
         anyhow::ensure!(
-            recipe.prepared && project.is_absolute()
+            recipe.prepared
+                && project.is_absolute()
                 && !project.to_string_lossy().chars().any(char::is_control)
                 && !WorkerPlatform::from_worker(&recipe.worker).is_windows()
-                && recipe.cargo_output_capture.as_ref()
+                && recipe
+                    .cargo_output_capture
+                    .as_ref()
                     .is_some_and(CargoOutputCapture::caller_json_supported),
             "caller Cargo JSON recovery has an invalid admitted source/output policy"
         );
@@ -1498,9 +1609,16 @@ fn load_recipe(writer: &DurableLeaseWriter) -> anyhow::Result<RecoveryRecipe> {
     }
     if recipe.caller_delivery.is_some() {
         anyhow::ensure!(
-            recipe.exit_code == Some(0) && recipe.returned == Some(0)
-                && recipe.cargo_stdout.as_ref().is_some_and(|producer| producer.exit_code == 0)
-                && recipe.phases.iter().filter(|phase| phase.output_gate)
+            recipe.exit_code == Some(0)
+                && recipe.returned == Some(0)
+                && recipe
+                    .cargo_stdout
+                    .as_ref()
+                    .is_some_and(|producer| producer.exit_code == 0)
+                && recipe
+                    .phases
+                    .iter()
+                    .filter(|phase| phase.output_gate)
                     .all(|phase| phase.complete && phase.pending.is_none()),
             "retained caller Cargo delivery precedes successful publication"
         );
@@ -1635,7 +1753,9 @@ pub(crate) async fn recover_job_cargo_json(
         anyhow::ensure!(
             recipe.execution_started
                 && recipe.caller_json_policy.is_some()
-                && recipe.cargo_output_capture.as_ref()
+                && recipe
+                    .cargo_output_capture
+                    .as_ref()
                     .is_some_and(CargoOutputCapture::caller_json_supported),
             "Cargo JSON recovery requires the original admitted opt-in named-binary invocation"
         );
@@ -1647,8 +1767,10 @@ pub(crate) async fn recover_job_cargo_json(
     let recipe = load_recipe(writer)?;
     let lease = writer.snapshot();
     anyhow::ensure!(
-        lease.terminal_acknowledged && lease.exit_code == Some(exit)
-            && recipe.returned == Some(exit) && recipe.retired
+        lease.terminal_acknowledged
+            && lease.exit_code == Some(exit)
+            && recipe.returned == Some(exit)
+            && recipe.retired
             && recipe.caller_json_policy.is_some(),
         "Cargo JSON recovery lacks its exact acknowledged delivery result"
     );
@@ -1661,12 +1783,21 @@ pub(crate) async fn recover_job_cargo_json(
             session.recipe.exit_code == Some(0),
             "successful Cargo recovery contradicts its compiler completion"
         );
-        let producer = session.recipe.cargo_stdout.as_ref()
+        let producer = session
+            .recipe
+            .cargo_stdout
+            .as_ref()
             .context("successful Cargo recovery has no retained producer stdout")?;
-        let delivery = session.recipe.caller_delivery.as_ref()
+        let delivery = session
+            .recipe
+            .caller_delivery
+            .as_ref()
             .context("successful Cargo recovery has no retained caller delivery")?;
         Some(delivery.read(producer)?)
-    } else if session.recipe.cargo_stdout.as_ref()
+    } else if session
+        .recipe
+        .cargo_stdout
+        .as_ref()
         .is_some_and(|receipt| receipt.exit_code != 0)
     {
         Some(session.failed_cargo_stdout()?)
@@ -1794,7 +1925,11 @@ async fn recover_job_with_daemon(
             // The generic recovery pipeline is not the executed source root.
             // Restore only the exact opt-in path persisted before execution.
             base.clone()
-                .with_remote_path_override(project.to_str().context("persisted Cargo source root is not UTF-8")?)
+                .with_remote_path_override(
+                    project
+                        .to_str()
+                        .context("persisted Cargo source root is not UTF-8")?,
+                )
                 .read_cargo_stdout_evidence(&worker, &root, 0)
                 .await
         } else {
@@ -1802,9 +1937,7 @@ async fn recover_job_with_daemon(
         };
         match evidence {
             Ok(evidence) => {
-                if let Err(error) =
-                    session.install_complete_cargo_evidence(&evidence)
-                {
+                if let Err(error) = session.install_complete_cargo_evidence(&evidence) {
                     if !error.is::<CargoOutputContractRejected>() {
                         return Err(error);
                     }
@@ -1835,17 +1968,27 @@ async fn recover_job_with_daemon(
             exit = EXIT_ARTIFACT_TRANSFER_FAILED;
         }
     }
-    if command_exit != 0 && let Some(project) = session.recipe.caller_json_policy.clone() {
+    if command_exit != 0
+        && let Some(project) = session.recipe.caller_json_policy.clone()
+    {
         if session.recipe.cargo_stdout.is_none() {
             // Failed Cargo need not create a target tree. Use the executed
             // source root for physical-path proof, and preserve the complete
             // same-attempt nonzero stdout before retiring its supervisor log.
-            let source = project.to_str().context("persisted Cargo source root is not UTF-8")?;
-            let evidence = base.clone().with_remote_path_override(source)
-                .read_cargo_stdout_evidence(&worker, source, command_exit).await?;
+            let source = project
+                .to_str()
+                .context("persisted Cargo source root is not UTF-8")?;
+            let evidence = base
+                .clone()
+                .with_remote_path_override(source)
+                .read_cargo_stdout_evidence(&worker, source, command_exit)
+                .await?;
             session.retain_cargo_stdout(
-                &evidence.stdout, &evidence.remote_root,
-                evidence.remote_project_root.as_deref()
+                &evidence.stdout,
+                &evidence.remote_root,
+                evidence
+                    .remote_project_root
+                    .as_deref()
                     .context("recovered Cargo stdout has no verified source root")?,
                 command_exit,
             )?;

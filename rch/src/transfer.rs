@@ -1004,7 +1004,9 @@ fn parse_cargo_artifact_evidence(
     anyhow::ensure!(
         remote_root.is_absolute()
             && !root.chars().any(char::is_control)
-            && !root.split('/').any(|component| matches!(component, "." | ".."))
+            && !root
+                .split('/')
+                .any(|component| matches!(component, "." | ".."))
             && remote_root.components().all(|component| {
                 matches!(component, Component::RootDir | Component::Normal(_))
             }),
@@ -1015,7 +1017,10 @@ fn parse_cargo_artifact_evidence(
         .iter()
         .position(|byte| *byte == b'\n')
         .context("Cargo artifact evidence has no complete source root")?;
-    anyhow::ensure!(project_length <= MAX_CARGO_ARTIFACT_ROOT_BYTES, "Cargo artifact evidence source root exceeds its size limit");
+    anyhow::ensure!(
+        project_length <= MAX_CARGO_ARTIFACT_ROOT_BYTES,
+        "Cargo artifact evidence source root exceeds its size limit"
+    );
     let project = std::str::from_utf8(&bytes[project_start..project_start + project_length])?;
     let remote_project_root = if project.is_empty() {
         None
@@ -1025,7 +1030,9 @@ fn parse_cargo_artifact_evidence(
             root.is_absolute()
                 && root.parent().is_some()
                 && !project.chars().any(char::is_control)
-                && !project.split('/').any(|component| matches!(component, "." | ".."))
+                && !project
+                    .split('/')
+                    .any(|component| matches!(component, "." | ".."))
                 && root.components().all(|component| {
                     matches!(component, Component::RootDir | Component::Normal(_))
                 }),
@@ -2694,7 +2701,10 @@ impl TransferPipeline {
         expected_exit: i32,
         remote_project_root: Option<&str>,
     ) -> Result<CargoArtifactEvidence> {
-        anyhow::ensure!((0..=255).contains(&expected_exit), "invalid expected Cargo completion status");
+        anyhow::ensure!(
+            (0..=255).contains(&expected_exit),
+            "invalid expected Cargo completion status"
+        );
         let (path, identity) = self
             .recovery_completion
             .as_ref()
@@ -8099,7 +8109,10 @@ mod tests {
         .unwrap();
         assert_eq!(evidence.stdout, log);
         assert_eq!(evidence.remote_root, root.canonicalize().unwrap());
-        assert_eq!(evidence.remote_project_root, Some(directory.path().canonicalize().unwrap()));
+        assert_eq!(
+            evidence.remote_project_root,
+            Some(directory.path().canonicalize().unwrap())
+        );
         // Ordinary collection must still succeed without reconstructing the
         // source path from a generic detached-recovery pipeline.
         let mut ordinary = Command::new("sh");
@@ -8233,10 +8246,14 @@ mod tests {
             assert!(parse_cargo_artifact_evidence(bytes.to_vec(), "job", 64).is_err());
         }
         let evidence =
-            parse_cargo_artifact_evidence(b"job 3\n/target\n/source\nabc".to_vec(), "job", 64).unwrap();
+            parse_cargo_artifact_evidence(b"job 3\n/target\n/source\nabc".to_vec(), "job", 64)
+                .unwrap();
         assert_eq!(evidence.stdout, b"abc");
         assert_eq!(evidence.remote_root, Path::new("/target"));
-        assert_eq!(evidence.remote_project_root.as_deref(), Some(Path::new("/source")));
+        assert_eq!(
+            evidence.remote_project_root.as_deref(),
+            Some(Path::new("/source"))
+        );
         let ordinary =
             parse_cargo_artifact_evidence(b"job 3\n/target\n\nabc".to_vec(), "job", 64).unwrap();
         assert_eq!(ordinary.stdout, b"abc");

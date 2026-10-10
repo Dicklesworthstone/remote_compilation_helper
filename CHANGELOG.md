@@ -5,7 +5,7 @@ Compilation Helper): the PreToolUse hook + CLI (`rch`), the local daemon (`rchd`
 worker agent (`rch-wkr`), the RABS build sidecar (`rabs-*`, `rabsd`), and the fleet
 dashboard (`dashboard/`).
 
-Scope window: project inception (`v0.1.0`, 2026-01-25) through `v2.1.16` (2026-10-04).
+Scope window: project inception (`v0.1.0`, 2026-01-25) through `v2.1.17` (2026-10-09).
 
 This document was rebuilt from git history (`git log --no-merges` per tag range, `git show`
 on representative commits), version tags (`git for-each-ref`), GitHub release metadata
@@ -28,6 +28,213 @@ history. They are kept as-is because the descriptions were verified against the 
 but those particular links will 404.
 
 Repository: <https://github.com/Dicklesworthstone/remote_compilation_helper>
+
+## 2.1.17 — 2026-10-09
+
+Recovery and admission hardening from the 2026-10-05..08 fleet sweeps: dead jobs give back
+their worker source and daemon slots, full disks quarantine their worker, SSH stalls and
+multi-key agents no longer wedge or lock out dispatchers, and `rch update` and
+`rch daemon stop` fail closed.
+
+- **`rch jobs recover` finishes jobs whose results never appeared** (`bd-t5c8p`, #87, #90).
+  A dead job whose declared result directory did not exist failed recovery forever
+  (`rsync … change_dir … No such file or directory`, exit 23). Its lease kept the worker
+  source claim, so every overlapping build of that project was refused with "unfinished
+  overlapping source owner" for 16–32h (css, 2026-10-08). Recovery now probes the declared
+  directories first. A missing one is recorded as a failed result, never as success, and
+  the original exit code is kept. The other results are still collected, and ownership is
+  released. Entries that turn out to be symlinks or the wrong type are settled the same
+  way, without retrying or following links. A job whose remote activity holder is still
+  alive without a completion receipt is not covered yet
+  ([`efd57745`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/efd5774545be218c6186b13d5d579cb787db3e92),
+  [`ce4409c8`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/ce4409c8a985d12ab71d8a25465c73dad552c61d),
+  [`bd930f30`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/bd930f30c4e438e2744d154c8acd8fa6b1ee461a)).
+- **Leases recorded with a trailing slash can be recovered** (`bd-4d1hs`). A project path
+  like `/data/tmp/landing/c9-beads/` reached the durable lease verbatim. The source lock
+  plan refused it, the wrapper died before preparing, and `rch jobs recover` refused the
+  same root forever, so the daemon never got the slots back (9 phantom builds holding 24
+  slots on one dispatcher, 2026-10-06). New leases record the canonical spelling, and older
+  leases are canonicalized when loaded
+  ([`efe7131d`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/efe7131d1cf282a4473ba803d664916fddf8200d)).
+- **Recovered jobs return their daemon slots.** `rch jobs recover` now reconciles the
+  daemon's reservation for the build before it acknowledges the job as recovered. rchd's
+  automatic lease recovery (2.1.8) worked through leases one at a time, so one stalled
+  worker held up all the others. It now runs up to 4 recoveries at once, at most one per
+  worker, oldest heartbeat first, and keeps per-lease backoff. It retries pending daemon
+  handoffs, checks that each recovery actually finished, and reaps recovery clients that
+  time out
+  ([`4adefd36`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/4adefd366af141b00e521b90860cb0f7f3b469c3),
+  [`b313a080`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/b313a08074d98cdef5a61b91e8988b4625e530fa),
+  [`95e073b7`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/95e073b777b03a4fe7c45ee52b58726ec9ad4cd4),
+  [`46fda37b`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/46fda37bdea0b5787721828ac8dbf8239a307c93),
+  [`0e4e0fbb`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/0e4e0fbbc086dec5b897532ae74f191678530326)).
+- **A truncated source claim no longer blocks a worker.** On a full disk, an interrupted
+  write could leave a zero-byte or truncated pending claim in the worker's source-claim
+  registry, and every later admission and GC scan on that worker was refused. Claims are
+  now written to a private file, synced, and renamed into place under the registry lock. A
+  malformed pending claim is moved to `quarantine/` with a cancellation fence that 2.1.16
+  dispatchers also honor. A malformed active claim still refuses
+  ([`c81d4d6e`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/c81d4d6ea304a3f5074354a4e62a530bc981418c)).
+- **One failed SSH read no longer makes a finished build "unconfirmed".** After the remote
+  command exited, the hook read the completion receipt with a single 10s SSH attempt. A
+  transient failure turned a finished build into an unconfirmed one that kept its source
+  ownership: a 15-minute frankensearch check on hz4 printed `Finished` and then fenced
+  asupersync builds on that worker (2026-10-06). The read is now tried 3 times, waiting 1s
+  and then 2s. A missing receipt is still reported at once
+  ([`a84024a2`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/a84024a2c7d24045d4e31ce159f9bf383043e184)).
+- **A worker that runs out of disk leaves rotation until it recovers.** Two cases now put
+  the worker into a durable bypass on that dispatcher: a failed remote command whose
+  stderr reports `No space left on device`, `ENOSPC` or `Disk quota exceeded`, and a source
+  upload that fails with an rsync disk error on the worker. 2.1.16 counted the first case
+  as an ordinary worker fault. The bypass survives rchd restarts. The worker rejoins after
+  two consecutive recovery probes show at least 5 GB and 10,000 inodes free on every
+  filesystem that failed (the remote build base is now probed too), and a canary command
+  then passes
+  ([`3633b38d`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/3633b38decd35cf6802a817aa9cc99d904362de5),
+  [`d5cf2df7`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/d5cf2df749710a64565a58a04b480cc5a9f8fa95),
+  [`58a4a074`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/58a4a074c42bb3fea13e7f25e0fa7518bcb97294),
+  [`0e501a3c`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/0e501a3c2bd55d061cb9eb87e75151160152eba0)).
+- **Placement steers builds away from workers without room for them** (`bd-wv746`). One
+  `cargo test --all-features` grew its pool to 64 GiB on a worker admitted with 51 GiB free,
+  and filled it. rchd now learns each project's disk footprint per command kind. It
+  measures how far the worker's free space drops during builds that no other build from the
+  same daemon overlapped, and keeps 8 samples for 30 days in `history.footprints.json` next
+  to the history log. The requirement is the largest recent footprint plus 10%, at least
+  5 GiB. When some eligible worker has room for it, only those workers are considered, even
+  against affinity. It never refuses a build: if no worker has room, selection is
+  unchanged
+  ([`27a299bd`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/27a299bd53034f4ab2f820a6e32a5d549dcacf31)).
+  Projects can also declare a hard per-build budget with the new opt-in
+  `compilation.disk_headroom_gib` (default 0, off). The budget is held in durable
+  ownership until the build completes. It uses a selection route that 2.1.16 daemons
+  refuse, so set it only after every rchd it can reach runs 2.1.17
+  ([`7b6bdeaa`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/7b6bdeaa94ac31c07a8b61a0aff263a21fccc921),
+  [`f215cca3`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/f215cca39d88fc93d7d0964c17a1d84ad131c075)).
+- **A worker stuck in SSH authentication no longer wedges rchd** (`bd-s528w`). When a
+  worker's sshd stalled during authentication, rchd held a lock across the connect with no
+  deadline for that phase and stopped serving for about 7 minutes. The worker's backoff
+  also survived a change of host. Now one 10s deadline covers the whole connect: client
+  capability check, authentication and control-socket readiness. SSH masters are child
+  processes that rchd owns and reaps when a connect is cancelled, and workers are probed
+  concurrently. Changing a worker's host, user, key or declared OS restarts its recovery
+  immediately. Cancellation and completion go to the endpoint that admitted the build
+  ([`6e699f6e`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/6e699f6e35ee1a044addc90b7a1b4b48461e64f6),
+  [`04edefad`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/04edefadc05d4fe56b3cf07db48660b7ad168ac1),
+  [`60ee09f5`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/60ee09f55db8acce2c566bac1a90849c4d22bfd0)).
+- **rch offers workers only the configured key** (`bd-ebszo`). rchd's cancel SSH offered
+  every ssh-agent key before the configured `-i` key. One daemon had inherited a desktop
+  agent holding 7 keys. It made ~600 failed authentications per hour per worker, hit
+  `MaxAuthTries`, and OpenSSH `PerSourcePenalties` locked the whole NAT address out of
+  those workers (2026-10-05/06). Every ssh spawn, including rsync's transport, now passes
+  `IdentitiesOnly=yes` when the configured identity file exists. If the file is missing,
+  the agent is still used
+  ([`e0dc9f3c`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/e0dc9f3caebb689d0814b2fa3f5adc47abfaa102),
+  [`10fcc004`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/10fcc004694477086cebaf55c7649f0e020f0e56)).
+- **No second rchd from cron or a different `XDG_RUNTIME_DIR`** (`bd-hvos9`, `bd-mrug7`).
+  From cron, `at` or a session-less SSH login, `systemctl --user` could not see
+  `rchd.service`, so a hook-spawned daemon took the socket while the real unit waited
+  (css, 2026-10-06). rchd now supplies `/run/user/<uid>` when the variable is unset, and
+  defers to the unit. When the service and the shell disagree on `XDG_RUNTIME_DIR`, the
+  hook finds the live default daemon and uses its socket for the whole invocation instead
+  of starting another
+  ([`27eaeb97`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/27eaeb97f6b25e77e578531db1f14d8025153252),
+  [`2ae9b426`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/2ae9b4267805144e592194e4411afc0596f1ff81),
+  [`9543f3aa`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/9543f3aacee857e7504af6bf2aa4b46c8029c46d)).
+- **Free undersized workers take a build while another worker runs the same project**
+  (`bd-d2jav`). The worker already running the project was rightly excluded. But its
+  presence also vetoed every capacity-degraded candidate in the fleet, so free undersized
+  workers were refused. They are now considered before job-mode queueing. Per-worker
+  project exclusion, worker pins, critical pressure and topology checks are unchanged
+  ([`77a8ce82`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/77a8ce82212779364c04c1fcd87bce3df3084661)).
+- **macOS workers and Xcode jobs.**
+  - Mac workers could not take source locks, because the lock holder needed GNU
+    `flock --no-fork`. On Darwin it now uses `fcntl.flock` through python3 (the same
+    `flock(2)` lock, so it excludes GNU holders), and it refuses with exit 73 when python3
+    is missing. Linux is unchanged (#83,
+    [`30f41346`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/30f413465748b79af07a94c9e0f23a85a6b6be4b)).
+  - Direct `xcodebuild` and `xcrun` jobs had no inferred OS, so Darwin-fenced workers never
+    accepted them. They are now routed to workers declared Darwin (`bd-nknnm`,
+    [`78964643`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/789646435f8a159b294816dbed2a34f515f6d4fd)).
+  - Leases and heartbeats on macOS dispatchers record the kernel's process birth time to
+    the microsecond, replacing the second-resolution `ps` start time
+    ([`3c3df8c6`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/3c3df8c6a74c5de47eebf5f5eb4a32071455e11f)).
+- **Paths with spaces or quotes sync to the right place on rsync ≥ 3.2.4** (#91). Modern
+  rsync passes remote arguments literally, so rch's shell quoting became part of the path
+  and such projects landed in a misnamed directory. rch now passes literal operands to
+  rsync ≥ 3.2.4, and keeps the quoting for older rsync and openrsync
+  ([`399e50fb`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/399e50fb980df0197000384baf52e97954b6b746)).
+- **Missing build outputs fail the build instead of disappearing.** A transfer could
+  publish one requested binary and silently miss another. Every expected file must now
+  arrive before anything is published, for these commands:
+  - `cargo build --bin …`. When the command has no message format, rch adds
+    `--message-format=json,json-render-diagnostics` on the worker and hides the JSON
+    records from the output.
+  - Named `--no-run` tests and benches.
+  - GCC/Clang `-o` outputs, including objects and depfiles.
+  - `go build -o`, which can now be offloaded (`bd-ow7t6`).
+
+  Recovery also refuses success until delivery completes, without recompiling
+  ([`f9ff0f9d`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/f9ff0f9d52aa705a5e9c31ce33fb66561fe9a967),
+  [`3b3d8eb9`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/3b3d8eb9b0003e2f72569f32f81825fef5e5704f),
+  [`15490569`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/1549056911569c3cf50d4a92823f90d05a5a2982),
+  [`a7b3f53e`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/a7b3f53ecf8a1a847cb59a152e483e5ac90ab344)).
+  `cargo package` and `cargo publish --dry-run` can now be offloaded (#86,
+  [`8746567d`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/8746567d5b38a0be636e8246199aa1e20ed4faf3)).
+- **`rch daemon stop` and `restart` never kill by process name.** When the daemon did not
+  answer, they ran `pkill -f rchd`, deleted the socket and reported success. They now
+  return an error and leave the daemon running; use the service manager or `--force`.
+  `--force` on Linux now signals through a pidfd and needs python3 ≥ 3.9
+  ([`f01c2322`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/f01c232292646cf9307f0139953630805175f63f),
+  [`513435f9`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/513435f9038971b4d591a70ab12f2e1604a21932)).
+- **`rch update` fails closed.**
+  - It installs only when both the checksum and the signature were verified. A missing
+    `.minisig` is refused unless `--skip-verify` is given.
+  - Before stopping the daemon, it unpacks every binary and runs its `--version`.
+  - It waits for an idle daemon (`--drain-timeout`, default 60s) instead of killing it.
+  - It reports success only once the new daemon answers at the expected version.
+  - Installs and rollbacks are serialized by a kernel-held lock.
+  - The published `.github/rch-minisign.pub` now matches the key the updater trusts,
+    69B3955C (#89).
+
+  ([`15fa15ee`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/15fa15ee7e04b3c332954f11b6e88654a5bd30ca),
+  [`2209de1e`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/2209de1e99e369cc1d9c10c2b0d0f4fc5080ca71),
+  [`541a0dde`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/541a0dde047ddc1454571a1442c0151d32fa6c93),
+  [`3a737137`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/3a7371376a25ffd8c373fd005c8ab0ffa9fb5fb9),
+  [`21a08b89`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/21a08b8968f01705f8efd665b8350b20f9fcc367),
+  [`d1bb3b0c`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/d1bb3b0cd3aec8274b4828c0a8e9f5760125b5ed),
+  [`998d2fef`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/998d2fef1c831c256a294dc472a20d022c420825))
+- Smaller fixes:
+  - `rch gc --apply` skips a target whose path cannot be embedded in a remote command (one
+    containing a space, say) instead of collecting nothing on that worker. On vmi1264463,
+    23 idle caches (20 GB) had to be removed by hand (`bd-kr4qb`,
+    [`17b1e22f`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/17b1e22f50ed72ee14611ca5813cb35c1bc3f658)).
+  - A project's own `force_local = true` is no longer reported as "invalid config:
+    force_local+force_remote" when the shim exports `RCH_REQUIRE_REMOTE=1`. Execution was
+    already local; the wrong label inflated fallback warnings (358 a day on one Mac)
+    (`bd-nfo8f`,
+    [`47bde035`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/47bde035907220e1db2b48a01570b3cee4ff0067)).
+  - rch-wkr waits up to 15s instead of 1s for the rustup inventory lock. On a saturated
+    disk, concurrent health checks reported no Rust runtime
+    ([`31b9f919`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/31b9f91915e7f1db1e972a31acebf417aba9ad1b)).
+  - A build waiting in rchd's queue can reclaim its place after an rchd restart, without a
+    fresh selection or a longer deadline. Queue entries written by 2.1.16 cannot be resumed
+    ([`ddc52325`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/ddc52325f6e8ad547a8a2e0f0dfa511a3942285a)).
+  - A failover retry keeps admission ownership across lost replies. A lost reply can no
+    longer lead to a local fallback, or let recovery mistake the previous attempt's
+    completion for the new one
+    ([`c6d93190`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/c6d93190ff09efd86fc122982f93c0ecf4d90b57)).
+  - The opt-in `rch exec --source-content-receipt` proof mode now verifies the worker's
+    copy of the source byte for byte (#84,
+    [`64075374`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/640753741b399467ed6a8c3c9c3b355ca8c7be23)).
+  - Opt-in `RCH_CARGO_JSON_STDOUT=1` applies to `cargo build` with literal `--bin` targets
+    and an explicit JSON message format. After delivery, it prints Cargo's JSON records for
+    the selected binaries, with paths pointing into the caller's tree.
+    `rch jobs recover --cargo-json` replays them for a detached job
+    ([`70ad4c0d`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/70ad4c0dfb5438a03732a9f81b498d7a69f8a5ff)).
+
+RABS (`rabs-*`, `rabsd`): work continued on the live dependency cache (`bd-k52xe`) and
+related beads. None of it is in the shipped `rch`, `rchd` or `rch-wkr` binaries, and none
+of it is enabled by them.
 
 ## 2.1.16 — 2026-10-04
 
