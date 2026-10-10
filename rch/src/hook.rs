@@ -1160,7 +1160,7 @@ fn max_remote_attempts() -> u32 {
 /// violation (the same class the #61 fix closed), so job admission counts as
 /// strict-remote once every remote option is exhausted. The refusal exits
 /// with the retryable [`EXIT_REMOTE_REQUIRED_REFUSED`] code and a `refused`
-/// envelope, so wrappers can back off and retry rather than misreading a
+/// envelope, so wrappers can back off and retry instead of misreading a
 /// local build's exit status as the remote result.
 fn strict_remote_for_exhausted_admission(require_remote: bool, job_admission: bool) -> bool {
     require_remote || job_admission
@@ -3025,13 +3025,9 @@ pub async fn run_exec(
         );
         let classified = classify_command(&command);
         anyhow::ensure!(
-            classified.kind == Some(CompilationKind::CargoBuild)
-                && cargo_output_contract::CargoOutputCapture::for_command(
-                    classified.kind,
-                    &command
-                )
+            cargo_output_contract::CargoOutputCapture::for_command(classified.kind, &command)
                 .is_some_and(|capture| capture.caller_json_supported()),
-            "RCH_CARGO_JSON_STDOUT requires cargo build with literal --bin targets and an explicit JSON message format"
+            "RCH_CARGO_JSON_STDOUT requires cargo build --bin, cargo test --no-run --test, or cargo bench --no-run --bench with literal named targets and an explicit JSON message format"
         );
     }
     let require_remote =
