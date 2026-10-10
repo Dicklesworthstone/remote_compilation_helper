@@ -226,11 +226,19 @@ multi-key agents no longer wedge or lock out dispatchers, and `rch update` and
   - The opt-in `rch exec --source-content-receipt` proof mode now verifies the worker's
     copy of the source byte for byte (#84,
     [`64075374`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/640753741b399467ed6a8c3c9c3b355ca8c7be23)).
+  - Worker source-claim transactions resolve physical roots in batches (at most 64 roots
+    or 60 KiB per `realpath`) instead of once per root, so the registry lock is held for
+    less time. In an isolated 256-root benchmark, `realpath` processes fell from 512 to 8
+    and the median transaction from 4.16s to 2.51s. Claim records, lock order and alias
+    handling are unchanged, and 2.1.16 dispatchers sharing a worker are still fenced
+    ([`81705328`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/81705328f8eb643a6bb1d05f8332b4cbd2fef928)).
   - Opt-in `RCH_CARGO_JSON_STDOUT=1` applies to `cargo build` with literal `--bin` targets
     and an explicit JSON message format. After delivery, it prints Cargo's JSON records for
     the selected binaries, with paths pointing into the caller's tree.
-    `rch jobs recover --cargo-json` replays them for a detached job
-    ([`70ad4c0d`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/70ad4c0dfb5438a03732a9f81b498d7a69f8a5ff)).
+    `rch jobs recover --cargo-json` replays them for a detached job, along with the
+    compiler's complete retained stderr
+    ([`70ad4c0d`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/70ad4c0dfb5438a03732a9f81b498d7a69f8a5ff),
+    [`1da56848`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/1da56848d73dfae2529926a23c5f31e76869d401)).
 
 RABS (`rabs-*`, `rabsd`): work continued on the live dependency cache (`bd-k52xe`) and
 related beads. None of it is in the shipped `rch`, `rchd` or `rch-wkr` binaries, and none
