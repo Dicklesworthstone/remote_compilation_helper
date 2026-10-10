@@ -895,6 +895,16 @@ rch_sync_refuse() {{
     exit 73
 }}
 case "$rch_destination" in /*) ;; *) rch_sync_refuse 'destination is not absolute';; esac
+case "$rch_destination" in
+    *[!/]*) ;;
+    *) rch_sync_refuse 'destination is the filesystem root';;
+esac
+# Do not resolve dot components through a missing ancestor. Setup could create
+# that ancestor and make the same spelling enter a previously hidden checkout.
+# Reject instead of lexical normalization, which changes symlink semantics.
+case "$rch_destination/" in
+    */./*|*/../*) rch_sync_refuse 'destination contains dot components';;
+esac
 rch_ancestor=$rch_destination
 while [ ! -e "$rch_ancestor" ] && [ ! -L "$rch_ancestor" ]; do
     rch_ancestor=$(dirname "$rch_ancestor") || rch_sync_refuse 'cannot inspect ancestors'
@@ -10442,6 +10452,89 @@ Number of files transferred: 42
 
         assert!(args.iter().any(|arg| arg == "--compress-choice=zstd"));
         assert!(args.iter().any(|arg| arg == "--compress-level=7"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_checkout_guard_refuses_root_and_dot_components_before_setup() {
+        let retained = tempfile::tempdir().unwrap().keep();
+        let checkout = retained.join("worker's live checkout");
+        std::fs::create_dir(&checkout).unwrap();
+        let git = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .arg(&checkout)
+            .output()
+            .unwrap();
+        assert!(git.status.success(), "{git:?}");
+        let edited = checkout.join("uncommitted.rs");
+        std::fs::write(&edited, b"worker's original edit\n").unwrap();
+        let missing = retained.join("missing");
+        let marker = retained.join("setup-ran");
+
+        for (destination, reason) in [
+            (missing.join("../worker's live checkout"), "dot components"),
+            (missing.join("./child"), "dot components"),
+            (PathBuf::from("/"), "filesystem root"),
+            (PathBuf::from("////"), "filesystem root"),
+            (PathBuf::from("/./"), "dot components"),
+        ] {
+            let command = format!(
+                "{} || exit 73; printf setup > {}",
+                live_checkout_sync_guard(destination.to_str().unwrap()),
+                escape(marker.to_string_lossy()),
+            );
+            let output = std::process::Command::new("sh")
+                .args(["-c", &command])
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(73), "{destination:?}: {output:?}");
+            let diagnostics = String::from_utf8_lossy(&output.stderr);
+            assert!(diagnostics.contains("RCH_SYNC_LIVE_CHECKOUT_REFUSED"));
+            assert!(diagnostics.contains(reason), "{destination:?}: {output:?}");
+            assert!(output.stdout.is_empty());
+            assert!(!marker.exists());
+            assert!(!missing.exists());
+            assert_eq!(std::fs::read(&edited).unwrap(), b"worker's original edit\n");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_checkout_guard_allows_literal_dot_names_and_physical_aliases() {
+        use std::os::unix::fs::symlink;
+
+        let retained = tempfile::tempdir().unwrap().keep();
+        let mirror = retained.join("mirror..cache's α");
+        std::fs::create_dir(&mirror).unwrap();
+        let original = mirror.join("existing.rs");
+        std::fs::write(&original, b"retained source\n").unwrap();
+        let alias = retained.join(".alias..cache");
+        symlink(&mirror, &alias).unwrap();
+
+        for (index, destination) in [
+            mirror.clone(),
+            mirror.join(".generated..cache/new"),
+            alias.join("newchild"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let marker = retained.join(format!("allowed-{index}"));
+            let command = format!(
+                "{} || exit 73; printf ready > {}",
+                live_checkout_sync_guard(destination.to_str().unwrap()),
+                escape(marker.to_string_lossy()),
+            );
+            let output = std::process::Command::new("sh")
+                .args(["-c", &command])
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{destination:?}: {output:?}");
+            assert_eq!(std::fs::read(marker).unwrap(), b"ready");
+            assert_eq!(std::fs::read(&original).unwrap(), b"retained source\n");
+            assert!(!mirror.join(".generated..cache").exists());
+            assert!(!mirror.join("newchild").exists());
+        }
     }
 
     #[cfg(unix)]
