@@ -325,6 +325,18 @@ fn source_claim_roots(authority_roots: &[String]) -> anyhow::Result<(String, Str
     Ok((roots, digest))
 }
 
+/// Reject an unusable intent before its durable journal can strand recovery.
+/// Use the same identity and closure checks as remote acquisition; no path
+/// normalization or new ownership authority is introduced here.
+pub(super) fn validate_source_authority_intent(
+    authority_roots: &[String],
+    identity: &str,
+) -> anyhow::Result<()> {
+    validate_source_identity(identity)?;
+    source_claim_roots(authority_roots)?;
+    Ok(())
+}
+
 fn source_registry_setup(registry: &str) -> String {
     let quote = |value: &str| shell_escape::escape(value.into()).into_owned();
     format!(
@@ -2026,6 +2038,18 @@ cat "$RCH_OWNERSHIP_TEST_DIR/payload"
     }
 
     #[cfg(target_os = "linux")]
+    fn source_lock_test_dir() -> PathBuf {
+        // RCH places TMPDIR inside its exclusively held source snapshot.
+        // These tests acquire real hierarchical source locks, so their
+        // independent repositories must be outside that enclosing grant.
+        tempfile::Builder::new()
+            .prefix("rch-source-lock-test-")
+            .tempdir_in("/tmp")
+            .unwrap()
+            .keep()
+    }
+
+    #[cfg(target_os = "linux")]
     async fn claim_test_source_closure(roots: &[String]) -> RemoteSourceAuthorityLock {
         let locks = source_authority_lock_plan(roots, true).unwrap();
         let script = build_remote_source_authority_lock_cmd(
@@ -2099,7 +2123,7 @@ cat "$RCH_OWNERSHIP_TEST_DIR/payload"
     #[tokio::test]
     async fn durable_source_holder_loss_preserves_snapshot_until_surviving_activity_drains() {
         use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
-        let directory = tempfile::tempdir().unwrap().keep();
+        let directory = source_lock_test_dir();
         let registry = directory.join("registry");
         let parent = directory.join("parent with ' quotes; $cash");
         let nested = parent.join("nested");
@@ -2213,7 +2237,7 @@ cat "$RCH_OWNERSHIP_TEST_DIR/payload"
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn durable_source_intent_cancel_fences_absent_and_late_claims() {
-        let directory = tempfile::tempdir().unwrap().keep();
+        let directory = source_lock_test_dir();
         let registry = directory.join("registry");
         let roots = vec![directory.join("source").display().to_string()];
         let identity = uuid::Uuid::new_v4().simple().to_string();
@@ -2264,7 +2288,7 @@ cat "$RCH_OWNERSHIP_TEST_DIR/payload"
     #[tokio::test]
     async fn durable_source_activity_serializes_surviving_writer_before_compiler() {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-        let directory = tempfile::tempdir().unwrap().keep();
+        let directory = source_lock_test_dir();
         let registry = directory.join("registry");
         let root = directory.join("source");
         std::fs::create_dir_all(&root).unwrap();
@@ -2354,7 +2378,7 @@ cat "$RCH_OWNERSHIP_TEST_DIR/payload"
     #[tokio::test]
     async fn durable_source_cancellation_blocks_overlapping_writers_through_cleanup() {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-        let directory = tempfile::tempdir().unwrap().keep();
+        let directory = source_lock_test_dir();
         let registry = directory.join("registry");
         let parent = directory.join("parent");
         let nested = parent.join("nested");
@@ -2432,7 +2456,7 @@ cat "$RCH_OWNERSHIP_TEST_DIR/payload"
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn durable_source_siblings_and_exact_pending_recovery_preserve_authority() {
-        let directory = tempfile::tempdir().unwrap().keep();
+        let directory = source_lock_test_dir();
         let registry = directory.join("registry");
         let left = vec![directory.join("left").display().to_string()];
         let right = vec![directory.join("right").display().to_string()];
@@ -2473,7 +2497,7 @@ cat "$RCH_OWNERSHIP_TEST_DIR/payload"
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn durable_source_claims_fence_worker_path_aliases_after_holder_loss() {
-        let directory = tempfile::tempdir().unwrap().keep();
+        let directory = source_lock_test_dir();
         let registry = directory.join("registry");
         let real = directory.join("physical");
         std::fs::create_dir_all(real.join("nested")).unwrap();
@@ -2510,7 +2534,7 @@ cat "$RCH_OWNERSHIP_TEST_DIR/payload"
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn explicit_topology_setup_waits_for_sources_and_cancellation_fences_late_retarget() {
-        let directory = tempfile::tempdir().unwrap().keep();
+        let directory = source_lock_test_dir();
         let registry = directory.join("registry");
         for (index, job_uses_alias) in [false, true].into_iter().enumerate() {
             let fixture = directory.join(format!("topology-{index}"));
@@ -2610,7 +2634,7 @@ cat "$RCH_OWNERSHIP_TEST_DIR/payload"
         use super::super::dependency_closure::build_sync_closure_plan;
         use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 
-        let dir = tempfile::tempdir().unwrap().keep();
+        let dir = source_lock_test_dir();
         let parent = dir.join("repository");
         let nested = parent.join("standalone");
         std::fs::create_dir_all(nested.join("src")).unwrap();
@@ -2731,7 +2755,7 @@ cat "$RCH_OWNERSHIP_TEST_DIR/payload"
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn source_authority_hierarchy_disjoint_siblings_proceed_concurrently() {
-        let dir = tempfile::tempdir().unwrap().keep();
+        let dir = source_lock_test_dir();
         let first_root = dir.join("left");
         let second_root = dir.join("right");
         std::fs::create_dir_all(&first_root).unwrap();
@@ -2773,7 +2797,7 @@ cat "$RCH_OWNERSHIP_TEST_DIR/payload"
             guard.release().await.unwrap();
             output.stdout
         }
-        let dir = tempfile::tempdir().unwrap().keep();
+        let dir = source_lock_test_dir();
         let parent = dir.join("a");
         let nested = parent.join("child");
         let sibling = dir.join("z");

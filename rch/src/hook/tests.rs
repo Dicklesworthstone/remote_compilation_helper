@@ -9848,6 +9848,46 @@ async fn test_spawn_blocking_performance_budget() {
 // ── Multi-root sync manifest & partial failure tests (bd-vvmd.2.3 AC5) ──
 
 #[test]
+fn test_source_intent_topology_root_has_no_trailing_separator() {
+    let _guard = test_guard!();
+    let (directory, policy) = topology_tempdir();
+    let project_root = directory.path().to_path_buf();
+    let plan = build_sync_closure_plan(
+        std::slice::from_ref(&project_root),
+        &project_root,
+        "topology-root-hash",
+        &policy,
+    );
+    assert_eq!(plan.len(), 1);
+    assert!(plan[0].is_primary);
+    assert_eq!(
+        plan[0].remote_root,
+        policy.canonical_root().to_str().unwrap()
+    );
+    let target = format!("{}/.rch-target", plan[0].remote_root);
+    assert_eq!(
+        target,
+        policy
+            .canonical_root()
+            .join(".rch-target")
+            .to_str()
+            .unwrap()
+    );
+
+    // A child still maps beneath the same root, rather than losing its suffix.
+    let child = project_root.join("nested");
+    std::fs::create_dir(&child).unwrap();
+    let child_plan = build_sync_closure_plan(
+        std::slice::from_ref(&child),
+        &child,
+        "topology-child-hash",
+        &policy,
+    );
+    assert_eq!(child_plan.len(), 1);
+    assert_eq!(child_plan[0].remote_root, child.to_str().unwrap());
+}
+
+#[test]
 fn test_build_sync_closure_manifest_deterministic_entries() {
     let _guard = test_guard!();
     let (temp_dir, policy) = topology_tempdir();

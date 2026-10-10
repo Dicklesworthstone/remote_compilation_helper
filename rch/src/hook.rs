@@ -3111,50 +3111,49 @@ pub async fn run_exec(
 
             // Recover one daemon, then keep that endpoint for selection,
             // heartbeats, retries and releases throughout this operation.
-            let retry =
-                if let Ok(recovered_socket) =
-                    auto_start::try_auto_start_daemon(&config.self_healing, Path::new(&socket_path))
-                        .await
-                {
-                    config.general.socket_path = recovered_socket.to_string_lossy().into_owned();
-                    // The original endpoint's restart gate says nothing about
-                    // a daemon discovered in another runtime-directory context.
-                    if restart_admission_is_closed(&config.general.socket_path)
-                        .await
-                        .unwrap_or(false)
-                    {
-                        durable_lease.heartbeat("restart_admission_blocked")?;
-                        anyhow::bail!(
-                            "remote build admission is paused while daemon restart remediation is active"
-                        );
-                    }
-                    match query_daemon(
-                        &config.general.socket_path,
-                        &selection_project,
-                        estimated_cores,
-                        &remote_command,
-                        toolchain.as_ref(),
-                        required_runtime,
-                        command_priority,
-                        0,
-                        Some(std::process::id()),
-                        Some(&wrapper_id),
-                        wait_for_worker,
-                        &preferred_workers,
-                        classification.kind == Some(CompilationKind::Job),
-                        &required_tools,
-                    )
+            let retry = if let Ok(recovered_socket) =
+                auto_start::try_auto_start_daemon(&config.self_healing, Path::new(&socket_path))
                     .await
-                    {
-                        Ok(response) => Some(response),
-                        Err(error) => {
-                            let _ = selection_error_for_recovery(error, &durable_lease)?;
-                            None
-                        }
+            {
+                config.general.socket_path = recovered_socket.to_string_lossy().into_owned();
+                // The original endpoint's restart gate says nothing about
+                // a daemon discovered in another runtime-directory context.
+                if restart_admission_is_closed(&config.general.socket_path)
+                    .await
+                    .unwrap_or(false)
+                {
+                    durable_lease.heartbeat("restart_admission_blocked")?;
+                    anyhow::bail!(
+                        "remote build admission is paused while daemon restart remediation is active"
+                    );
+                }
+                match query_daemon(
+                    &config.general.socket_path,
+                    &selection_project,
+                    estimated_cores,
+                    &remote_command,
+                    toolchain.as_ref(),
+                    required_runtime,
+                    command_priority,
+                    0,
+                    Some(std::process::id()),
+                    Some(&wrapper_id),
+                    wait_for_worker,
+                    &preferred_workers,
+                    classification.kind == Some(CompilationKind::Job),
+                    &required_tools,
+                )
+                .await
+                {
+                    Ok(response) => Some(response),
+                    Err(error) => {
+                        let _ = selection_error_for_recovery(error, &durable_lease)?;
+                        None
                     }
-                } else {
-                    None
-                };
+                }
+            } else {
+                None
+            };
 
             match decide_recovery_action(retry.is_some(), strict_remote) {
                 // Daemon came back after autostart + retry — proceed remotely.
