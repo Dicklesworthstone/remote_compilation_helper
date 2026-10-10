@@ -3745,13 +3745,12 @@ pub async fn run_exec(
                     // The compiler-output API never replays a completed
                     // workload after inspecting its diagnostics. Release and
                     // durable acknowledgment precede every stdout byte.
-                    if result.exit_code == 0 {
-                        if let Err(error) =
+                    if result.exit_code == 0
+                        && let Err(error) =
                             record_build(&config.general.socket_path, &worker.id, &project, false)
                                 .await
-                        {
-                            warn!("Failed to record build: {}", error);
-                        }
+                    {
+                        warn!("Failed to record build: {}", error);
                     }
                     durable_lease.acknowledge_terminal().context(
                         "compiler stdout remains withheld: durable terminal acknowledgment failed",

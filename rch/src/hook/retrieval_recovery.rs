@@ -994,7 +994,8 @@ impl RecoverySession {
         receipt.read()?;
         let mut next_recipe = self.recipe.clone();
         next_recipe.cargo_stderr = Some(receipt);
-        self.writer.set_recovery(serde_json::to_value(&next_recipe)?)?;
+        self.writer
+            .set_recovery(serde_json::to_value(&next_recipe)?)?;
         self.recipe = next_recipe;
         Ok(())
     }
@@ -1175,7 +1176,7 @@ impl RecoverySession {
         // Telemetry follows the real workload's terminal output and is not
         // part of Cargo stdout. Keep every preceding byte, including failures.
         let marker = format!("\n{}\n", rch_telemetry::protocol::PIGGYBACK_MARKER);
-        let end = if stdout.starts_with(marker[1..].as_bytes()) {
+        let end = if stdout.starts_with(&marker.as_bytes()[1..]) {
             0
         } else {
             stdout
