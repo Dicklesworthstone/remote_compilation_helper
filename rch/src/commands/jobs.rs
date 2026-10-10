@@ -222,15 +222,25 @@ fn validate_queued_cancellation(wrapper: &str, reply: &Value) -> Result<()> {
     Ok(())
 }
 
-fn emit(ctx: &OutputContext, payload: &Value) {
-    if ctx.is_json() {
-        let _ = ctx.json(payload);
-    } else {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(payload).unwrap_or_default()
-        );
+/// Output failures must not produce a success status or a second stdout document.
+#[derive(Debug, thiserror::Error)]
+#[error("job output could not be delivered")]
+pub(crate) struct JobOutputFailure(#[source] serde_json::Error);
+
+impl From<std::io::Error> for JobOutputFailure {
+    fn from(error: std::io::Error) -> Self {
+        Self(serde_json::Error::io(error))
     }
+}
+
+fn emit(ctx: &OutputContext, payload: &Value) -> Result<()> {
+    let result = if ctx.is_json() {
+        ctx.json(payload)
+    } else {
+        ctx.json_force(payload)
+    };
+    result.map_err(JobOutputFailure)?;
+    Ok(())
 }
 
 /// A durable identity exists before the daemon admits the build. A live
@@ -303,8 +313,22 @@ fn read_job_journal_at(
     let mut file = std::fs::File::from(descriptor);
     anyhow::ensure!(file.metadata()?.is_file(), "journal is not a regular file");
     let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes).context("journal read failed")?;
+    file.read_to_end(&mut bytes)
+        .context("journal read failed")?;
     Ok(serde_json::from_slice(&bytes)?)
+}
+
+#[cfg(unix)]
+fn job_journal_error(path: &std::path::Path, error: String) -> Value {
+    use std::os::unix::ffi::OsStrExt;
+
+    // Path's Serialize implementation rejects non-UTF-8, and json! unwraps
+    // that error. Keep a printable diagnostic and the exact Unix path bytes.
+    let mut report = json!({"path": path.to_string_lossy(), "error": error});
+    if path.to_str().is_none() {
+        report["path_bytes"] = json!(path.as_os_str().as_bytes());
+    }
+    report
 }
 
 #[cfg(unix)]
@@ -325,11 +349,13 @@ fn read_job_listing(directory: &std::path::Path) -> Result<Value> {
     };
     if let Some(descriptor) = descriptor {
         let mut entries = Dir::new(descriptor)?;
-        while let Some(entry) = entries.next() {
+        // Use Dir's read API so the loop can borrow its descriptor between
+        // entries without a for-loop iterator retaining a mutable borrow.
+        while let Some(entry) = entries.read() {
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(error) => {
-                    journal_errors.push(json!({"path": directory, "error": error.to_string()}));
+                    journal_errors.push(job_journal_error(directory, error.to_string()));
                     continue;
                 }
             };
@@ -356,7 +382,7 @@ fn read_job_listing(directory: &std::path::Path) -> Result<Value> {
                     }));
                 }
                 Err(error) => {
-                    journal_errors.push(json!({"path": path, "error": format!("{error:#}")}));
+                    journal_errors.push(job_journal_error(&path, format!("{error:#}")));
                 }
             }
         }
@@ -373,7 +399,7 @@ async fn run_unix(action: Option<JobsAction>, ctx: &OutputContext) -> Result<()>
     use crate::hook::DurableLeaseWriter;
     let Some(action) = action else {
         let listing = read_job_listing(&default_job_lease_directory())?;
-        emit(ctx, &listing);
+        emit(ctx, &listing)?;
         if listing["complete"] != true {
             eprintln!(
                 "[RCH] job listing is incomplete; inspect journal_errors before reconciling ownership"
@@ -412,14 +438,16 @@ async fn run_unix(action: Option<JobsAction>, ctx: &OutputContext) -> Result<()>
         {
             use std::io::Write;
             let mut diagnostics = std::io::stderr().lock();
-            diagnostics.write_all(&stderr)?;
-            diagnostics.flush()?;
+            diagnostics
+                .write_all(&stderr)
+                .map_err(JobOutputFailure::from)?;
+            diagnostics.flush().map_err(JobOutputFailure::from)?;
         }
         if let Some(bytes) = stdout {
             use std::io::Write;
             let mut output = std::io::stdout().lock();
-            output.write_all(&bytes)?;
-            output.flush()?;
+            output.write_all(&bytes).map_err(JobOutputFailure::from)?;
+            output.flush().map_err(JobOutputFailure::from)?;
         } else {
             eprintln!("[RCH] recovered invocation has no deliverable Cargo stdout (exit {code})");
         }
@@ -432,7 +460,7 @@ async fn run_unix(action: Option<JobsAction>, ctx: &OutputContext) -> Result<()>
             emit(
                 ctx,
                 &json!({"status":"completed", "identity":lease.identity, "exit_code":lease.exit_code, "terminal_acknowledged":true}),
-            );
+            )?;
             return Ok(());
         }
         if !cancel && waiting_for_admission(&lease, process_matches(&lease))? {
@@ -467,14 +495,14 @@ async fn run_unix(action: Option<JobsAction>, ctx: &OutputContext) -> Result<()>
                 let path = default_job_lease_directory().join(format!("{wrapper_id}.cancel"));
                 crate::state::primitives::atomic_write(&path, &serde_json::to_vec(&identity)?)?;
             }
-            emit(ctx, &reply);
+            emit(ctx, &reply)?;
             return Ok(());
         }
         let status = within_job_deadline(deadline, "job status", query(&lease)).await?;
         if cancel {
             if status["status"] == "completed" {
                 let code = validate_completion(&lease, &status)?;
-                emit(ctx, &completed_cancellation_report(&lease, code));
+                emit(ctx, &completed_cancellation_report(&lease, code))?;
                 return Ok(());
             }
             let id = lease
@@ -504,7 +532,7 @@ async fn run_unix(action: Option<JobsAction>, ctx: &OutputContext) -> Result<()>
             if let AdmittedCancellation::AlreadyCompleted(code) =
                 validate_admitted_cancellation(&lease, &reply)?
             {
-                emit(ctx, &completed_cancellation_report(&lease, code));
+                emit(ctx, &completed_cancellation_report(&lease, code))?;
                 return Ok(());
             }
             // The original wrapper consumes this exact-identity receipt itself.
@@ -514,7 +542,7 @@ async fn run_unix(action: Option<JobsAction>, ctx: &OutputContext) -> Result<()>
             emit(
                 ctx,
                 &json!({"status":"cancelled", "identity":lease.identity, "wrapper_stop_requested":true}),
-            );
+            )?;
             return Ok(());
         }
         if recover && process_matches(&lease) && lease.recovery.is_some() {
@@ -529,7 +557,7 @@ async fn run_unix(action: Option<JobsAction>, ctx: &OutputContext) -> Result<()>
                 emit(
                     ctx,
                     &json!({"status":"recover_requested", "identity":lease.identity}),
-                );
+                )?;
                 return Ok(());
             }
         }
@@ -543,7 +571,7 @@ async fn run_unix(action: Option<JobsAction>, ctx: &OutputContext) -> Result<()>
             emit(
                 ctx,
                 &json!({"status":"recovered", "identity":lease.identity, "exit_code":code, "terminal_acknowledged":writer.snapshot().terminal_acknowledged}),
-            );
+            )?;
             return Ok(());
         }
         if status["status"] == "completed"
@@ -566,7 +594,7 @@ async fn run_unix(action: Option<JobsAction>, ctx: &OutputContext) -> Result<()>
             emit(
                 ctx,
                 &json!({"status":"completed", "identity":latest.identity, "exit_code":code, "terminal_acknowledged":true}),
-            );
+            )?;
             return Ok(());
         }
         if !process_matches(&lease) {
@@ -632,6 +660,122 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn job_listing_preserves_jobs_and_exact_non_utf8_error_paths() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let retained = tempfile::tempdir().unwrap().keep();
+        let directory = retained.join(std::ffi::OsStr::from_bytes(b"journals-\xfe"));
+        std::fs::create_dir(&directory).unwrap();
+        let lease = queued_lease();
+        let valid = directory.join(std::ffi::OsStr::from_bytes(b"valid-\xfe.json"));
+        let valid_bytes = serde_json::to_vec(&lease).unwrap();
+        std::fs::write(&valid, &valid_bytes).unwrap();
+        let corrupt = directory.join(std::ffi::OsStr::from_bytes(b"corrupt-\xff.json"));
+        let corrupt_bytes = b"{\"identity\":";
+        std::fs::write(&corrupt, corrupt_bytes).unwrap();
+
+        let listing = read_job_listing(&directory).unwrap();
+        assert_eq!(listing["complete"], false);
+        assert_eq!(listing["jobs"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            listing["jobs"][0]["lease"],
+            serde_json::to_value(lease).unwrap()
+        );
+        assert_eq!(listing["jobs"][0]["owner_presence"], "unknown");
+        assert_eq!(listing["jobs"][0]["wrapper_alive"], false);
+        assert_eq!(listing["journal_errors"].as_array().unwrap().len(), 1);
+        let error = &listing["journal_errors"][0];
+        assert_eq!(error["path"], json!(corrupt.to_string_lossy()));
+        assert_eq!(error["path_bytes"], json!(corrupt.as_os_str().as_bytes()));
+        assert!(error["error"].as_str().unwrap().contains("EOF"));
+        let encoded = serde_json::to_vec(&listing).unwrap();
+        assert_eq!(serde_json::from_slice::<Value>(&encoded).unwrap(), listing);
+        assert_eq!(std::fs::read(valid).unwrap(), valid_bytes);
+        assert_eq!(std::fs::read(corrupt).unwrap(), corrupt_bytes);
+    }
+
+    #[test]
+    fn job_output_preserves_json_toon_and_plain_formats_in_real_files() {
+        use crate::ui::context::{ColorChoice, OutputConfig, OutputFormat, OutputMode};
+        use crate::ui::writer::OutputWriter;
+
+        let retained = tempfile::tempdir().unwrap().keep();
+        let payload = json!({"status": "observed", "owner_presence": "unknown"});
+        for mode in [OutputMode::Json, OutputMode::Plain] {
+            for format in [OutputFormat::Json, OutputFormat::Toon] {
+                let path = retained.join(format!("{mode:?}-{format:?}.output"));
+                let stdout = OutputWriter::new(std::fs::File::create_new(&path).unwrap(), false);
+                let ctx = OutputContext::with_writers(
+                    OutputConfig {
+                        force_mode: Some(mode),
+                        color: ColorChoice::Never,
+                        format,
+                        ..Default::default()
+                    },
+                    stdout,
+                    OutputWriter::stderr(),
+                );
+                emit(&ctx, &payload).unwrap();
+                let bytes = std::fs::read(path).unwrap();
+                assert!(bytes.ends_with(b"\n"));
+                let observed = if mode == OutputMode::Json && format == OutputFormat::Toon {
+                    let text = std::str::from_utf8(&bytes).unwrap();
+                    assert!(!text.trim_start().starts_with('{'));
+                    serde_json::from_str::<Value>(&toon_rust::toon_to_json(text).unwrap()).unwrap()
+                } else {
+                    serde_json::from_slice::<Value>(&bytes).unwrap()
+                };
+                assert_eq!(observed, payload);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn job_output_reports_real_closed_socket_write_and_flush_failures() {
+        use crate::ui::context::{ColorChoice, OutputConfig, OutputFormat, OutputMode};
+        use crate::ui::writer::OutputWriter;
+        use std::os::unix::net::UnixStream;
+
+        for mode in [OutputMode::Json, OutputMode::Plain] {
+            for format in [OutputFormat::Json, OutputFormat::Toon] {
+                for buffered in [false, true] {
+                    let (socket, peer) = UnixStream::pair().unwrap();
+                    socket
+                        .set_write_timeout(Some(Duration::from_secs(2)))
+                        .unwrap();
+                    drop(peer);
+                    let stdout = if buffered {
+                        // The small payload fits in the buffer; the real socket
+                        // failure must be observed when the writer flushes.
+                        OutputWriter::new(std::io::BufWriter::with_capacity(8192, socket), false)
+                    } else {
+                        OutputWriter::new(socket, false)
+                    };
+                    let ctx = OutputContext::with_writers(
+                        OutputConfig {
+                            force_mode: Some(mode),
+                            color: ColorChoice::Never,
+                            format,
+                            ..Default::default()
+                        },
+                        stdout,
+                        OutputWriter::stderr(),
+                    );
+                    let error = emit(&ctx, &json!({"status": "observed"})).unwrap_err();
+                    let failure = error.downcast_ref::<JobOutputFailure>().unwrap();
+                    assert_eq!(
+                        failure.0.io_error_kind(),
+                        Some(std::io::ErrorKind::BrokenPipe)
+                    );
+                    assert!(format!("{error:#}").contains("job output could not be delivered"));
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn job_listing_rejects_nonregular_journals_and_preserves_them() {
         let retained = tempfile::tempdir().unwrap().keep();
         let target = retained.join("retained-evidence");
@@ -652,8 +796,7 @@ mod tests {
             (&directory, "journal is not a regular file"),
         ] {
             assert!(errors.iter().any(|error| {
-                error["path"] == json!(path)
-                    && error["error"].as_str().unwrap().contains(reason)
+                error["path"] == json!(path) && error["error"].as_str().unwrap().contains(reason)
             }));
         }
         assert!(
@@ -768,7 +911,12 @@ mod tests {
         let original = retained.join("observed-original.retained");
         assert!(!original.exists());
         std::fs::rename(&journal, &original).unwrap();
-        rustix::fs::mkfifoat(descriptor.as_fd(), c"observed.json", Mode::RUSR | Mode::WUSR).unwrap();
+        rustix::fs::mkfifoat(
+            descriptor.as_fd(),
+            c"observed.json",
+            Mode::RUSR | Mode::WUSR,
+        )
+        .unwrap();
 
         // No writer is started. Bound observation so a missing NONBLOCK flag
         // fails this case instead of hanging the complete test runner.

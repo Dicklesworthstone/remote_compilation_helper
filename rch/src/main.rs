@@ -2043,6 +2043,18 @@ async fn async_main() {
         if let Some(exit) = error.downcast_ref::<doctor::DoctorExit>() {
             std::process::exit(exit.0);
         }
+        if error
+            .downcast_ref::<commands::jobs::JobOutputFailure>()
+            .is_some()
+        {
+            // A job document may have been partially written already. Never
+            // retry stdout with an error envelope or report delivery success.
+            use std::io::Write;
+            // Even a closed stderr must not turn this delivery failure into
+            // a panic or a successful exit.
+            let _ = writeln!(std::io::stderr().lock(), "Error: {error:#}");
+            std::process::exit(1);
+        }
         if let Some(failure) = error.downcast_ref::<GcFailure>() {
             if wants_machine_output {
                 let ctx = OutputContext::new(OutputConfig {

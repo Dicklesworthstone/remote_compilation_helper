@@ -17,7 +17,6 @@ import json
 import os
 from pathlib import Path
 import shutil
-import signal
 import subprocess
 import sys
 import uuid
@@ -115,6 +114,80 @@ def main():
         sys.stderr.buffer.flush()
         outcomes.append({"case": name, "returncode": result.returncode})
         return result, case
+
+    def spawn_with_closed_stdout(argv, environment, diagnostics):
+        # Close the read endpoint before spawning: closing child.stdout after
+        # spawn races a child that writes before the parent closes it.
+        reader, writer = os.pipe()
+        os.close(reader)
+        try:
+            return subprocess.Popen(argv, cwd=source, env=environment,
+                                    stdout=writer,
+                                    stderr=writer if diagnostics is None else diagnostics)
+        finally:
+            os.close(writer)
+
+    # Exercise actual CLI delivery and exit routing in an isolated, initially
+    # absent journal namespace. These are not real-worker ownership positives;
+    # the real build/failure/recovery cases below retain that responsibility.
+    jobs_env = dict(env)
+    jobs_state = evidence / "jobs-output-state"
+    jobs_env["RCH_STATE_HOME"] = str(jobs_state)
+    jobs_env.pop("RCH_JSON", None)
+    jobs_env.pop("RCH_OUTPUT_FORMAT", None)
+    for mode, flags in [("json", ["--json", "--format", "json"]),
+                        ("plain", ["--color", "never"])]:
+        argv = [str(args.rch)] + flags + ["jobs"]
+        positive, _ = run("jobs-empty-output-" + mode, argv, jobs_env)
+        require(positive.returncode == 0 and json.loads(positive.stdout) ==
+                {"jobs": [], "complete": True, "journal_errors": []},
+                "Actual job listing did not deliver one complete empty document")
+
+    for mode, flags in [("json", ["--json", "--format", "json"]),
+                        ("toon", ["--json", "--format", "toon"]),
+                        ("plain", ["--color", "never"])]:
+        name = "jobs-closed-stdout-" + mode
+        case = evidence / name
+        case.mkdir()
+        argv = [str(args.rch)] + flags + ["jobs"]
+        (case / "argv.json").write_text(json.dumps(argv) + "\n")
+        with (case / "stderr.bin").open("xb") as diagnostics:
+            child = spawn_with_closed_stdout(argv, jobs_env, diagnostics)
+            try:
+                code = child.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                (case / "termination.json").write_text(json.dumps({
+                    "state": "timeout", "timeout_seconds": 30, "child_pid": child.pid,
+                    "child_stopped": False}) + "\n")
+                raise
+        (case / "returncode.txt").write_text(str(code) + "\n")
+        diagnostics = (case / "stderr.bin").read_bytes()
+        sys.stderr.buffer.write(diagnostics)
+        sys.stderr.buffer.flush()
+        outcomes.append({"case": name, "returncode": code})
+        require(code == 1 and b"job output could not be delivered" in diagnostics
+                and b"broken pipe" in diagnostics.lower() and b"panicked" not in diagnostics,
+                "Actual jobs CLI hid output failure or panicked instead of returning exit 1")
+    # With both output streams closed, diagnostics cannot be collected. Keep
+    # that limitation explicit and require the actual exit path to remain 1.
+    name = "jobs-closed-stdout-and-stderr"
+    case = evidence / name
+    case.mkdir()
+    argv = [str(args.rch), "--json", "--format", "json", "jobs"]
+    (case / "argv.json").write_text(json.dumps(argv) + "\n")
+    child = spawn_with_closed_stdout(argv, jobs_env, None)
+    try:
+        code = child.wait(timeout=30)
+    except subprocess.TimeoutExpired:
+        (case / "termination.json").write_text(json.dumps({
+            "state": "timeout", "timeout_seconds": 30, "child_pid": child.pid,
+            "child_stopped": False}) + "\n")
+        raise
+    (case / "returncode.txt").write_text(str(code) + "\n")
+    outcomes.append({"case": name, "returncode": code})
+    require(code == 1, "Closing stderr as well as stdout changed the actual jobs failure exit")
+    require(not (jobs_state / "job-leases").exists(),
+            "Read-only job output cases created an initially absent journal directory")
 
     def blake3(path, case):
         result = subprocess.run([str(args.b3sum), "--no-names", str(path)],
@@ -229,10 +302,7 @@ def main():
     broken_case.mkdir()
     (broken_case / "argv.json").write_text(json.dumps(recovery_command) + "\n")
     with (broken_case / "stderr.bin").open("xb") as diagnostics:
-        child = subprocess.Popen(recovery_command, cwd=source, env=env,
-                                 stdout=subprocess.PIPE, stderr=diagnostics)
-        require(child.stdout is not None, "Recovery child did not receive its own stdout pipe")
-        child.stdout.close()
+        child = spawn_with_closed_stdout(recovery_command, env, diagnostics)
         try:
             broken_code = child.wait(timeout=1800)
         except subprocess.TimeoutExpired:
@@ -245,10 +315,11 @@ def main():
     sys.stderr.buffer.write(broken_stderr)
     sys.stderr.buffer.flush()
     outcomes.append({"case": "completed-recovery-broken-stdout", "returncode": broken_code})
-    require(broken_code != 0 and (broken_code == -signal.SIGPIPE
-            or b"broken pipe" in broken_stderr.lower())
+    require(broken_code == 1 and b"broken pipe" in broken_stderr.lower()
+            and b"job output could not be delivered" in broken_stderr
+            and b"panicked" not in broken_stderr
             and broken_stderr.startswith(diagnostic_bytes),
-            "Closed stdout did not reach an actual broken-pipe failure")
+            "Closed recovery stdout did not report delivery failure with exit 1 and original diagnostics")
     retry, _ = run("completed-recovery-after-broken-stdout", recovery_command, env)
     require(retry.returncode == 0 and retry.stdout == first.stdout
             and retry.stderr == diagnostic_bytes and sha256(diagnostic_path) == diagnostic_sha,

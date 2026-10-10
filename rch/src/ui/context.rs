@@ -614,15 +614,17 @@ impl OutputContext {
             return Ok(());
         }
         let output = self.encode_machine(value, true)?;
-        self.stdout.write_line(&output);
-        Ok(())
+        self.stdout
+            .write_line_checked(&output)
+            .map_err(serde_json::Error::io)
     }
 
     /// Output JSON regardless of current mode.
     pub fn json_force<T: Serialize>(&self, value: &T) -> serde_json::Result<()> {
         let json = serde_json::to_string_pretty(value)?;
-        self.stdout.write_line(&json);
-        Ok(())
+        self.stdout
+            .write_line_checked(&json)
+            .map_err(serde_json::Error::io)
     }
 
     /// Output compact machine format (JSON or TOON) in JSON mode.
@@ -631,8 +633,9 @@ impl OutputContext {
             return Ok(());
         }
         let output = self.encode_machine(value, false)?;
-        self.stdout.write_line(&output);
-        Ok(())
+        self.stdout
+            .write_line_checked(&output)
+            .map_err(serde_json::Error::io)
     }
 
     fn encode_machine<T: Serialize>(&self, value: &T, pretty: bool) -> serde_json::Result<String> {

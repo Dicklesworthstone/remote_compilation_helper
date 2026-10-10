@@ -882,6 +882,40 @@ fn remote_path_probe_script(path: &str) -> String {
     )
 }
 
+/// Receiver-side safety fence for dual-role Unix workers (bd-fbtws).
+/// Inspect physical ancestors (including aliases), linked-worktree markers,
+/// and nested repositories before *any* upload setup or pruning. Never infer
+/// permission to replace an editor's checkout from a clean `git status`.
+pub(crate) fn live_checkout_sync_guard(path: &str) -> String {
+    format!(
+        r#"(set -eu
+rch_destination={path}
+rch_sync_refuse() {{
+    printf 'RCH_SYNC_LIVE_CHECKOUT_REFUSED: %s (%s); use an isolated source mirror\n' "$rch_destination" "$1" >&2
+    exit 73
+}}
+case "$rch_destination" in /*) ;; *) rch_sync_refuse 'destination is not absolute';; esac
+rch_ancestor=$rch_destination
+while [ ! -e "$rch_ancestor" ] && [ ! -L "$rch_ancestor" ]; do
+    rch_ancestor=$(dirname "$rch_ancestor") || rch_sync_refuse 'cannot inspect ancestors'
+done
+rch_ancestor=$(CDPATH='' cd -P "$rch_ancestor" && pwd -P) || rch_sync_refuse 'unresolvable destination'
+while :; do
+    if [ -e "$rch_ancestor/.git" ] || [ -L "$rch_ancestor/.git" ]; then
+        rch_sync_refuse "Git checkout at $rch_ancestor"
+    fi
+    [ "$rch_ancestor" = / ] && break
+    rch_ancestor=$(dirname "$rch_ancestor") || rch_sync_refuse 'cannot inspect ancestors'
+done
+if [ -d "$rch_destination" ]; then
+    rch_nested=$(find -H "$rch_destination" -name .git -print -quit) || rch_sync_refuse 'cannot inspect destination'
+    [ -z "$rch_nested" ] || rch_sync_refuse "nested Git checkout at $rch_nested"
+fi
+)"#,
+        path = escape(Cow::from(path))
+    )
+}
+
 /// Removes every file the durable supervisor writes beside `path`; the claim
 /// is an empty `mkdir` directory. Succeeds when nothing is left.
 fn recovery_completion_cleanup_script(path: &str) -> String {
@@ -2464,9 +2498,23 @@ impl TransferPipeline {
     /// rsync appends its server argv to this shell fragment. Forward those
     /// arguments inside the lease, after any destination setup has completed.
     fn source_rsync_path(&self, command: String) -> String {
+        // Source leases serialize RCH jobs, not editors on dual-role workers.
+        // Fence the receiver before even cache pruning or mkdir can run. A
+        // clean worktree is protected too: a status-based check would race an
+        // editor and would still delete new, untracked files (bd-fbtws).
+        let command = if self.worker_platform.is_windows() {
+            command
+        } else {
+            format!(
+                "{} || exit 73; {command}",
+                live_checkout_sync_guard(&self.remote_path())
+            )
+        };
         self.source_rsync_path_at(command, &self.remote_path())
     }
 
+    // Activity fencing also wraps read-only retrieval. Keep the upload safety
+    // check out of that path: a test result may legitimately contain .git.
     fn source_rsync_path_at(&self, command: String, remote_path: &str) -> String {
         let command = self
             .resolved_rsync()
@@ -4669,7 +4717,8 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         let identity_file = shellexpand::tilde(&worker.identity_file);
         let ssh_command = self.build_rsync_ssh_command(identity_file.as_ref());
         let extraction_script = format!(
-            "umask 0022\nmkdir -p {path}\nTAR_OPTIONS='' tar -xf {archive} -C {path}",
+            "{guard} || exit 73\numask 0022\nmkdir -p {path}\nTAR_OPTIONS='' tar -xf {archive} -C {path}",
+            guard = live_checkout_sync_guard(&remote_path),
             path = escaped_remote_path,
             archive = escaped_remote_archive
         );
@@ -4707,7 +4756,10 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
                             .arg(ssh_command)
                             .arg("--rsync-path")
                             .arg(self.source_rsync_path_at(
-                                format!("mkdir -p {escaped_remote_path} && rsync"),
+                                format!(
+                                    "{} || exit 73; mkdir -p {escaped_remote_path} && rsync",
+                                    live_checkout_sync_guard(&remote_root)
+                                ),
                                 &remote_archive_path,
                             ))
                             .arg(archive_path)
@@ -10394,6 +10446,137 @@ Number of files transferred: 42
 
     #[cfg(unix)]
     #[test]
+    fn live_checkout_guard_preserves_edits_and_allows_isolated_rsync() {
+        use std::os::unix::fs::symlink;
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("incoming");
+        let checkout = directory.path().join("worker's live checkout");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&checkout).unwrap();
+        let git = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .arg(&checkout)
+            .output()
+            .unwrap();
+        assert!(git.status.success(), "{git:?}");
+        std::fs::write(checkout.join("tracked.txt"), "committed\n").unwrap();
+        let staged = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&checkout)
+            .args(["add", "tracked.txt"])
+            .output()
+            .unwrap();
+        assert!(staged.status.success(), "{staged:?}");
+        std::fs::write(checkout.join("tracked.txt"), "worker edit\n").unwrap();
+        std::fs::write(checkout.join("untracked.txt"), "irreplaceable\n").unwrap();
+        std::fs::write(source.join("tracked.txt"), "dispatcher copy\n").unwrap();
+        let alias = directory.path().join("alias");
+        symlink(&checkout, &alias).unwrap();
+        let nested = directory.path().join("nested");
+        std::fs::create_dir_all(nested.join("project/.git")).unwrap();
+        let linked = directory.path().join("linked");
+        std::fs::create_dir_all(&linked).unwrap();
+        std::fs::write(linked.join(".git"), "gitdir: /not/available\n").unwrap();
+        let broken = directory.path().join("broken");
+        symlink(directory.path().join("missing"), &broken).unwrap();
+
+        // Execute the exact receiver wrapper, followed by a real destructive
+        // rsync in this disposable fixture. The post-prune marker also catches
+        // shell-precedence bugs where a refused first command continues later.
+        let run = |destination: &Path| {
+            let pipeline = TransferPipeline::new(
+                source.clone(),
+                "guard-test".into(),
+                "abcdef".into(),
+                TransferConfig::default(),
+            )
+            .with_remote_path_override(destination.to_str().unwrap());
+            let marker = directory.path().join("setup-ran");
+            let command = format!(
+                "printf touched > {}; mkdir -p {} && rsync -a --delete {}/ {}/",
+                escape(marker.to_string_lossy()),
+                escape(destination.to_string_lossy()),
+                escape(source.to_string_lossy()),
+                escape(destination.to_string_lossy()),
+            );
+            std::process::Command::new("sh")
+                .arg("-c")
+                .arg(pipeline.source_rsync_path(command))
+                .output()
+                .unwrap()
+        };
+        for destination in [
+            &checkout,
+            &alias,
+            &checkout.join("new/subdir"),
+            &nested,
+            &linked,
+            &broken,
+        ] {
+            let output = run(destination);
+            assert_eq!(
+                output.status.code(),
+                Some(73),
+                "{destination:?}: {output:?}"
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains("RCH_SYNC_LIVE_CHECKOUT_REFUSED")
+            );
+            assert!(!directory.path().join("setup-ran").exists());
+            assert_eq!(
+                std::fs::read_to_string(checkout.join("tracked.txt")).unwrap(),
+                "worker edit\n"
+            );
+            assert_eq!(
+                std::fs::read_to_string(checkout.join("untracked.txt")).unwrap(),
+                "irreplaceable\n"
+            );
+            assert!(!checkout.join("new").exists());
+        }
+        let mirror = directory.path().join("isolated mirror");
+        let output = run(&mirror);
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(
+            std::fs::read_to_string(mirror.join("tracked.txt")).unwrap(),
+            "dispatcher copy\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_checkout_guard_does_not_block_read_only_result_retrieval() {
+        let directory = tempfile::tempdir().unwrap();
+        let result = directory.path().join("test-result-with-a-checkout");
+        std::fs::create_dir_all(result.join(".git")).unwrap();
+        let mut pipeline = TransferPipeline::new(
+            directory.path().to_owned(),
+            "result-read".into(),
+            "abcdef".into(),
+            TransferConfig::default(),
+        )
+        .with_remote_path_override(result.to_str().unwrap());
+        pipeline.source_authority_prefix = Some("env RCH_ACTIVITY_TEST=owned".into());
+        let read = pipeline.source_rsync_path_at(
+            "test \"$RCH_ACTIVITY_TEST\" = owned && printf readable".into(),
+            result.to_str().unwrap(),
+        );
+        let output = std::process::Command::new("sh")
+            .args(["-c", &read])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(output.stdout, b"readable");
+        let upload = pipeline.source_rsync_path("printf must-not-run".into());
+        let output = std::process::Command::new("sh")
+            .args(["-c", &upload])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(73), "{output:?}");
+        assert!(output.stdout.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn source_activity_rsync_wrapper_preserves_server_argv_and_fences_setup() {
         let directory = tempfile::tempdir().unwrap();
         let destination = directory.path().join("source with spaces");
@@ -11054,7 +11237,8 @@ Number of files transferred: 42
 
         // bd-wfumv: every source upload reaps stale worker-side runtime state
         // ahead of the transfer, with durable caches on a much longer floor.
-        assert!(path_val.starts_with("find "));
+        assert!(path_val.starts_with("(set -eu\n"));
+        assert!(path_val.contains("RCH_SYNC_LIVE_CHECKOUT_REFUSED"));
         assert!(path_val.contains(&format!(
             "find {root}/.rch-tmp -mindepth 1 -maxdepth 1 ! -name 'rch-cargo-cache-*' -mmin +{WORKER_TMP_PRUNE_MAX_AGE_MINS}"
         )));

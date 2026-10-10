@@ -1059,6 +1059,34 @@ async fn execute_remote_compilation_inner(
         &transfer_config.remote_base,
         &ownership_scan_roots,
     )?;
+    // bd-fbtws: reject live checkouts before ownership repair or repo-updater
+    // convergence can mutate them, not merely when rsync starts. The receiver
+    // repeats the guard immediately before pruning/upload under its grant.
+    if !worker_is_windows && !super::ssh::should_skip_remote_preflight(&worker_config) {
+        let guard = sync_plan
+            .iter()
+            .map(|entry| {
+                format!(
+                    "{} || exit 73;\n",
+                    crate::transfer::live_checkout_sync_guard(&entry.remote_root)
+                )
+            })
+            .collect::<String>();
+        let output = super::ssh::run_offload_ssh_command_with_stdin(
+            &worker_config,
+            "sh -s",
+            guard.as_bytes(),
+            Duration::from_secs(30),
+        )
+        .await?;
+        anyhow::ensure!(
+            output.status.success(),
+            "source destination safety check refused on {} (status {:?}): {}",
+            worker_config.id,
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).trim(),
+        );
+    }
     // Build transfer pipelines with color mode, command timeout, and compilation kind.
     // When the in-session watchdog is active it enforces the real build cap
     // remotely (same timeout_for_kind value). Give the local SSH stream a grace

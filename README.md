@@ -486,6 +486,9 @@ the opened descriptor must represent a regular file before any bytes are read.
 The directory root itself must be a directory rather than a symlink.
 `complete` describes this scan, not an immutable ownership snapshot: entries
 and regular-file contents can still change during observation.
+If a journal path contains non-UTF-8 bytes, its error has a printable `path`
+and an exact Unix `path_bytes` array. A job command whose output cannot be written
+or flushed exits with an error rather than reporting successful delivery.
 
 These commands never replay the original command. Recovery requires retained
 identity and completion/retrieval evidence; ambiguous or missing evidence is
