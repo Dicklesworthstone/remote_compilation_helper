@@ -19,8 +19,14 @@ pub(super) async fn request(socket: &str, command: &str) -> Result<String> {
         stream.write_all(command.as_bytes()).await?;
         stream.shutdown().await?;
         let mut bytes = Vec::new();
-        stream.take(MAX_REPLY_BYTES + 1).read_to_end(&mut bytes).await?;
-        anyhow::ensure!(bytes.len() as u64 <= MAX_REPLY_BYTES, "oversized recovery daemon reply");
+        stream
+            .take(MAX_REPLY_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .await?;
+        anyhow::ensure!(
+            bytes.len() as u64 <= MAX_REPLY_BYTES,
+            "oversized recovery daemon reply"
+        );
         String::from_utf8(bytes).context("non-UTF-8 recovery daemon reply")
     })
     .await
@@ -28,7 +34,10 @@ pub(super) async fn request(socket: &str, command: &str) -> Result<String> {
 }
 
 fn body(response: &str) -> Result<Value> {
-    anyhow::ensure!(response.len() as u64 <= MAX_REPLY_BYTES, "oversized recovery daemon reply");
+    anyhow::ensure!(
+        response.len() as u64 <= MAX_REPLY_BYTES,
+        "oversized recovery daemon reply"
+    );
     let (header, body) = response
         .split_once("\r\n\r\n")
         .or_else(|| response.split_once("\n\n"))
@@ -69,7 +78,9 @@ pub(super) async fn finish(
 ) -> Result<()> {
     let lease = writer.snapshot();
     let mut recipe = load_recipe(writer)?;
-    let exit = recipe.returned.context("recovery delivery is not settled")?;
+    let exit = recipe
+        .returned
+        .context("recovery delivery is not settled")?;
     anyhow::ensure!(
         recipe.retired
             && recipe.build_id > 0
@@ -84,7 +95,10 @@ pub(super) async fn finish(
     let worker = recipe.worker.id.as_str();
     let build_id = recipe.build_id;
     let encode = super::super::super::daemon_ipc::urlencoding_encode;
-    let query = format!("GET /builds/{build_id}?local_wrapper_id={}\n", encode(wrapper));
+    let query = format!(
+        "GET /builds/{build_id}?local_wrapper_id={}\n",
+        encode(wrapper)
+    );
     let mut reply = body(&send(&query).await?)?;
     if reply["status"] == "active" {
         let active = &reply["active"];
@@ -99,7 +113,8 @@ pub(super) async fn finish(
             .context("active daemon reservation has no valid slot count")?;
         let release = format!(
             "POST /release-worker?worker={}&slots={slots}&build_id={build_id}&local_wrapper_id={}&exit_code={exit}\n",
-            encode(worker), encode(wrapper)
+            encode(worker),
+            encode(wrapper)
         );
         // A 200 status alone is insufficient: the release endpoint also treats
         // duplicate/unknown releases as no-ops. Conversely, a lost reply does
@@ -116,7 +131,9 @@ pub(super) async fn finish(
     );
     if daemon_exit != exit {
         tracing::warn!(
-            build_id, daemon_exit, delivery_exit = exit,
+            build_id,
+            daemon_exit,
+            delivery_exit = exit,
             "Recovered delivery outcome differs from the daemon's earlier completion"
         );
     }
@@ -137,21 +154,40 @@ mod tests {
     fn fixture(exit: i32) -> (tempfile::TempDir, DurableLeaseWriter) {
         let directory = tempfile::tempdir().unwrap();
         let worker = WorkerConfig {
-            id: WorkerId::new("worker & one"), host: "unreachable.invalid".into(),
-            user: "test".into(), identity_file: "/unused/key".into(),
-            total_slots: 4, priority: 100, tags: Vec::new(), tools: Vec::new(),
+            id: WorkerId::new("worker & one"),
+            host: "unreachable.invalid".into(),
+            user: "test".into(),
+            identity_file: "/unused/key".into(),
+            total_slots: 4,
+            priority: 100,
+            tags: Vec::new(),
+            tools: Vec::new(),
         };
         let writer = DurableLeaseWriter {
             path: directory.path().join("lease.json"),
             lease: Arc::new(Mutex::new(DurableJobLease::new(
-                JobIdentity::new_local(), 0, None, None, 0, true, false, "fingerprint".into(),
+                JobIdentity::new_local(),
+                0,
+                None,
+                None,
+                0,
+                true,
+                false,
+                "fingerprint".into(),
             ))),
         };
         writer.admit(41, &worker.id).unwrap();
         super::super::RecoverySession::begin(
-            &writer, &worker, vec!["/owned/project".into()], None, None,
-            TransferConfig::default(), directory.path().to_owned(), "abc123".into(),
-        ).unwrap();
+            &writer,
+            &worker,
+            vec!["/owned/project".into()],
+            None,
+            None,
+            TransferConfig::default(),
+            directory.path().to_owned(),
+            "abc123".into(),
+        )
+        .unwrap();
         let mut recipe = load_recipe(&writer).unwrap();
         recipe.prepared = true;
         recipe.execution_started = true;
@@ -159,7 +195,9 @@ mod tests {
         recipe.returned = Some(exit);
         recipe.retired = true;
         recipe.sources_released = true;
-        writer.set_recovery(serde_json::to_value(recipe).unwrap()).unwrap();
+        writer
+            .set_recovery(serde_json::to_value(recipe).unwrap())
+            .unwrap();
         writer.record_exit(exit).unwrap();
         (directory, writer)
     }
@@ -201,10 +239,13 @@ mod tests {
                 3 => Ok(response(terminal(&writer, 102))),
                 _ => panic!("unexpected request: {command}"),
             }
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
         assert_eq!(calls.len(), 3);
         assert_eq!(calls[0], calls[2]);
-        let disk: DurableJobLease = serde_json::from_slice(&std::fs::read(&writer.path).unwrap()).unwrap();
+        let disk: DurableJobLease =
+            serde_json::from_slice(&std::fs::read(&writer.path).unwrap()).unwrap();
         assert!(disk.terminal_acknowledged);
         assert_eq!(disk.exit_code, Some(102));
         assert_eq!(disk.recovery.unwrap()["daemon_exit_code"], 102);
@@ -222,7 +263,9 @@ mod tests {
                 3 => Ok(response(terminal(&writer, 0))),
                 _ => panic!("duplicate release"),
             }
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
         assert_eq!(count, 3);
         assert!(writer.snapshot().terminal_acknowledged);
     }
@@ -239,7 +282,8 @@ mod tests {
                 2 => Ok("HTTP/1.1 200 OK\r\n".into()),
                 _ => anyhow::bail!("daemon disconnected"),
             }
-        }).await;
+        })
+        .await;
         assert!(result.is_err());
         assert_eq!(std::fs::read(&writer.path).unwrap(), before);
         let mut queries = 0;
@@ -247,7 +291,9 @@ mod tests {
             assert!(command.starts_with("GET /builds/41?"));
             queries += 1;
             Ok(response(terminal(&writer, 130)))
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
         assert_eq!(queries, 1);
         assert_eq!(writer.snapshot().exit_code, Some(137));
         assert_eq!(load_recipe(&writer).unwrap().daemon_exit_code, Some(130));
@@ -268,18 +314,28 @@ mod tests {
         replies.push(changed);
         for invalid in replies {
             let before = std::fs::read(&writer.path).unwrap();
-            let result = finish(&writer, async |_command: &str| Ok(response(invalid.clone()))).await;
+            let result = finish(&writer, async |_command: &str| {
+                Ok(response(invalid.clone()))
+            })
+            .await;
             assert!(result.is_err(), "{invalid}");
             assert_eq!(std::fs::read(&writer.path).unwrap(), before);
         }
         let mut foreign = active(&writer);
         foreign["active"]["worker_id"] = Value::String("other".into());
         let mut calls = 0;
-        assert!(finish(&writer, async |_command: &str| {
-            calls += 1;
-            Ok(response(foreign.clone()))
-        }).await.is_err());
-        assert_eq!(calls, 1, "foreign active ownership must never authorize POST");
+        assert!(
+            finish(&writer, async |_command: &str| {
+                calls += 1;
+                Ok(response(foreign.clone()))
+            })
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            calls, 1,
+            "foreign active ownership must never authorize POST"
+        );
     }
 
     #[tokio::test]
@@ -294,17 +350,23 @@ mod tests {
                 _ => Value::Null,
             };
             writer.set_recovery(value).unwrap();
-            assert!(finish(&writer, async |_command: &str| {
-                panic!("unfinished or malformed ownership contacted daemon")
-            }).await.is_err());
+            assert!(
+                finish(&writer, async |_command: &str| {
+                    panic!("unfinished or malformed ownership contacted daemon")
+                })
+                .await
+                .is_err()
+            );
         }
     }
 
     #[test]
     fn replies_require_complete_successful_http_and_typed_terminal_evidence() {
         for reply in [
-            "HTTP/1.1 200 OK\r\n", "HTTP/1.1 500 Error\r\n\r\n{}",
-            "HTTP/1.1 200 OK\r\n\r\n{", "garbage 200 OK\n\n{}",
+            "HTTP/1.1 200 OK\r\n",
+            "HTTP/1.1 500 Error\r\n\r\n{}",
+            "HTTP/1.1 200 OK\r\n\r\n{",
+            "garbage 200 OK\n\n{}",
         ] {
             assert!(body(reply).is_err(), "{reply}");
         }
@@ -322,12 +384,17 @@ mod tests {
             let mut received = String::new();
             stream.read_to_string(&mut received).await.unwrap();
             assert_eq!(received, command);
-            stream.write_all(b"HTTP/1.1 200 OK\r\n\r\n{\"status\":\"not_found\"}").await.unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\n\r\n{\"status\":\"not_found\"}")
+                .await
+                .unwrap();
         };
         let client = request(socket.to_str().unwrap(), command);
         let (reply, ()) = tokio::time::timeout(Duration::from_secs(2), async {
             tokio::join!(client, server)
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
         assert_eq!(body(&reply.unwrap()).unwrap()["status"], "not_found");
     }
 
@@ -341,14 +408,21 @@ mod tests {
             assert!(command.starts_with("GET /builds/41?"));
             queries += 1;
             Ok(response(terminal(&writer, 102)))
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
         assert_eq!(exit, 102);
         assert_eq!(queries, 1);
         assert!(writer.snapshot().terminal_acknowledged);
         // The remote worker is deliberately unreachable. A second pass must
         // remain read-only and not even call the daemon transport.
-        assert_eq!(super::super::recover_job_with_daemon(&writer, async |_command: &str| {
-            panic!("acknowledged recovery contacted a peer")
-        }).await.unwrap(), 102);
+        assert_eq!(
+            super::super::recover_job_with_daemon(&writer, async |_command: &str| {
+                panic!("acknowledged recovery contacted a peer")
+            })
+            .await
+            .unwrap(),
+            102
+        );
     }
 }

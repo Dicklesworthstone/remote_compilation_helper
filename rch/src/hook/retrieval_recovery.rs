@@ -278,6 +278,7 @@ impl RecoverySession {
             lease.worker_id.as_deref() == Some(worker.id.as_str()) && lease.recovery.is_none(),
             "source ownership requires a fresh admitted lease; recover the previous attempt first"
         );
+        super::super::ssh::validate_source_authority_intent(&source_roots, &identity)?;
         let completion = format!(
             "{}/recovery-{}-{}.done",
             transfer.remote_base.trim_end_matches('/'),
@@ -1450,7 +1451,7 @@ pub(crate) async fn assert_cargo_fixture_publication(
 mod tests {
     use super::*;
 
-    fn preparation_fixture() -> (tempfile::TempDir, DurableLeaseWriter, WorkerConfig) {
+    fn admitted_preparation_fixture() -> (tempfile::TempDir, DurableLeaseWriter, WorkerConfig) {
         let directory = tempfile::tempdir().unwrap();
         let worker = WorkerConfig {
             id: WorkerId::new("source-recovery"),
@@ -1476,6 +1477,11 @@ mod tests {
             ))),
         };
         writer.admit(41, &worker.id).unwrap();
+        (directory, writer, worker)
+    }
+
+    fn preparation_fixture() -> (tempfile::TempDir, DurableLeaseWriter, WorkerConfig) {
+        let (directory, writer, worker) = admitted_preparation_fixture();
         RecoverySession::begin(
             &writer,
             &worker,
@@ -2467,6 +2473,49 @@ mod tests {
             b"new report"
         );
         assert!(session.recipe.phases[0].complete);
+    }
+
+    #[test]
+    fn source_intent_rejects_invalid_paths_and_identity_before_journaling() {
+        let invalid_roots = [
+            "relative",
+            "/data/projects/source-recovery/",
+            "/data/projects//source-recovery",
+            "/data/projects/./source-recovery",
+            "/data/projects/../source-recovery",
+            "/data/projects/source\nrecovery",
+            "/data/projects/source\rrecovery",
+            "/data/projects/source\0recovery",
+        ];
+        for (roots, identity) in invalid_roots
+            .into_iter()
+            .map(|root| (vec![root.to_owned()], "abc123"))
+            .chain([
+                (Vec::new(), "abc123"),
+                (vec!["/data/projects/source-recovery".into()], ""),
+                (vec!["/data/projects/source-recovery".into()], "bad/token"),
+            ])
+        {
+            let (directory, writer, worker) = admitted_preparation_fixture();
+            let before = std::fs::read(&writer.path).unwrap();
+            let result = RecoverySession::begin(
+                &writer,
+                &worker,
+                roots.clone(),
+                None,
+                None,
+                TransferConfig::default(),
+                directory.path().to_owned(),
+                identity.into(),
+            );
+            assert!(
+                result.is_err(),
+                "admitted invalid intent {roots:?}/{identity:?}"
+            );
+            assert_eq!(std::fs::read(&writer.path).unwrap(), before);
+            assert!(writer.snapshot().recovery.is_none());
+            assert_eq!(writer.snapshot().identity.remote_build_id, Some(41));
+        }
     }
 
     #[test]
