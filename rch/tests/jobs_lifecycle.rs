@@ -376,8 +376,11 @@ fn matching_cancellation_requests_only_the_original_wrapper() {
 #[test]
 fn owner_exit_during_status_does_not_erase_a_new_recovery_intent() {
     let mut fixture = Fixture::new(true);
-    // Positive absence of this synthetic process, without ever signalling it.
-    fixture.lease.wrapper_pid = u32::MAX;
+    // Positive absence of this synthetic process, without ever signalling it. Since
+    // 3c3df8c6 a pid outside i32 (e.g. u32::MAX) is Unknown, not Absent, which skips
+    // the completed-and-absent race this test exists for; i32::MAX is a valid pid
+    // that is far above any kernel's pid_max, so it is positively absent.
+    fixture.lease.wrapper_pid = i32::MAX as u32;
     write_lease(&fixture.lease_path, &fixture.lease);
     let path = fixture.lease_path.clone();
     let mut latest = fixture.lease.clone();

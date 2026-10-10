@@ -52,6 +52,13 @@ def available(path, shared=False):
         os.close(fd)
 
 
+def _default_sighup():
+    # rch's remote wrapper runs `trap '' HUP`, and an ignored disposition is inherited
+    # and cannot be reset by `trap - HUP` in a non-interactive sh. Restore the default
+    # so the SIGHUP case really kills the holder when this suite runs under rch.
+    signal.signal(signal.SIGHUP, signal.SIG_DFL)
+
+
 class Holder:
     def __init__(self, script, args, env, plan, claim="claim input", fd_limit=None):
         command = "set -eu\n"
@@ -66,6 +73,7 @@ class Holder:
         self.process = subprocess.Popen(
             ["/bin/sh", "-c", command], env=env,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            preexec_fn=_default_sighup,
         )
         self.buffer = b""
 
