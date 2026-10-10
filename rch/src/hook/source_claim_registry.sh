@@ -69,11 +69,91 @@ physical_roots() {
     fi
 }
 
-roots_overlap() {
-    [ "$1" != / ] && [ "$2" != / ] || return 0
-    case "$1" in "$2"|"$2"/*) return 0 ;; esac
-    case "$2" in "$1"/*) return 0 ;; esac
-    return 1
+closures_overlap() {
+    # Index path COMPONENTS, not every requested/held pair. Large dependency
+    # closures must not do quadratic shell work while excluding the entire
+    # worker registry. A trie stores each component once, rather than copying
+    # every ancestor prefix of every root. Names remain literal byte strings.
+    # The roots stay on stdin (never awk -v or exec argv, both of which impose
+    # extra interpretation/size limits). $2 selects a validated record file or
+    # already resolved roots. Explicit framing detects a failed producer even
+    # on POSIX shells without pipefail; no partial inventory proves disjointness.
+    overlap_verdict=$(
+        {
+            printf '%s\n' "$1" &&
+            printf 'RCH_HELD_ROOTS_BEGIN\n' &&
+            {
+                case "$2" in
+                    file) cat -- "$3" ;;
+                    roots) printf '%s\n' "$3" ;;
+                    *) false ;;
+                esac
+            } &&
+            printf 'RCH_ROOTS_END\n'
+        } | LC_ALL=C awk '
+            BEGIN { nodes = 1; phase = 0 }
+            $0 == "RCH_HELD_ROOTS_BEGIN" {
+                if (phase != 0 || !wanted) bad = 1
+                phase = 1
+                next
+            }
+            $0 == "RCH_ROOTS_END" {
+                if (phase != 1 || !held) bad = 1
+                phase = 2
+                next
+            }
+            {
+                if (phase > 1 || substr($0, 1, 1) != "/" ||
+                    index($0, "\r") || index($0, sprintf("%c", 0))) {
+                    bad = 1
+                    next
+                }
+                count = split($0, parts, "/")
+                if ($0 == "/") count = 1
+                for (i = 2; i <= count; i++) {
+                    if (parts[i] == "" || parts[i] == "." || parts[i] == "..") bad = 1
+                }
+                if (bad) next
+                node = 1
+                if (phase == 0) {
+                    wanted++
+                    for (i = 2; i <= count; i++) {
+                        key = node SUBSEP parts[i]
+                        if (!(key in child)) {
+                            # Bound index memory as well as the record bytes.
+                            if (nodes >= 1000000) { bad = 1; break }
+                            child[key] = ++nodes
+                        }
+                        node = child[key]
+                    }
+                    terminal[node] = 1
+                } else {
+                    held++
+                    if (terminal[node]) overlap = 1
+                    for (i = 2; i <= count; i++) {
+                        key = node SUBSEP parts[i]
+                        if (!(key in child)) break
+                        node = child[key]
+                        if (terminal[node]) overlap = 1
+                    }
+                    # The held root ended inside the requested trie: it is
+                    # equal to, or an ancestor of, at least one wanted root.
+                    if (i > count) overlap = 1
+                }
+            }
+            END {
+                if (bad || phase != 2 || !wanted || !held) exit 73
+                print overlap ? "overlap" : "disjoint"
+            }
+        '
+    ) || refuse 'cannot compare complete source root closures'
+    # An awk error exit is NOT a no-overlap answer. Require a complete verdict
+    # and success status, rather than treating an arbitrary nonzero as false.
+    case "$overlap_verdict" in
+        overlap) return 0 ;;
+        disjoint) return 1 ;;
+        *) refuse 'invalid source root comparison verdict' ;;
+    esac
 }
 
 # An identity is bound to one exact closure for its entire history, including
@@ -238,26 +318,14 @@ for held in "$registry"/*.claim "$registry"/*.pending; do
         continue
         ;;
     esac
-    while IFS= read -r old; do
-        while IFS= read -r wanted; do
-            if roots_overlap "$wanted" "$old"; then refuse 'unfinished overlapping source owner'; fi
-        done <<RCH_REQUESTED_ROOTS
-$requested
-RCH_REQUESTED_ROOTS
-    done < "$held"
+    if closures_overlap "$requested" file "$held"; then
+        refuse 'unfinished overlapping source owner'
+    fi
     held_physical=$(physical_roots < "$held") || refuse 'cannot resolve physical source roots'
-    while IFS= read -r old_physical; do
-        while IFS= read -r wanted_physical; do
-            if roots_overlap "$wanted_physical" "$old_physical"; then
-                refuse 'unfinished overlapping physical source owner'
-            fi
-        done <<RCH_PHYSICAL_ROOTS
-$requested_physical
-RCH_PHYSICAL_ROOTS
-    done <<RCH_HELD_PHYSICAL_ROOTS
-$held_physical
-RCH_HELD_PHYSICAL_ROOTS
- done
+    if closures_overlap "$requested_physical" roots "$held_physical"; then
+        refuse 'unfinished overlapping physical source owner'
+    fi
+done
 
 if [ "$operation" = recover ]; then
     if [ -e "$active" ] || [ -L "$active" ]; then
