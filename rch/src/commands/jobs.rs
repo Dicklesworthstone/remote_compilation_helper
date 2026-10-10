@@ -305,14 +305,24 @@ fn read_job_listing(directory: &std::path::Path) -> Result<Value> {
                 continue;
             }
             let observed = (|| -> Result<DurableJobLease> {
-                // Listing cannot follow a journal symlink or block opening a
-                // FIFO. An invalid entry is evidence, not an absent job.
+                // Reject entries observed as symlinks or nonregular files
+                // before opening. An invalid entry is evidence, not absence.
                 anyhow::ensure!(entry.file_type()?.is_file(), "journal is not a regular file");
                 Ok(serde_json::from_slice(&std::fs::read(&path)?)?)
             })();
             match observed {
                 Ok(lease) => {
-                    jobs.push(json!({"lease": lease, "wrapper_alive": process_matches(&lease)}));
+                    let presence = owner_presence(&lease);
+                    let status = match presence {
+                        OwnerPresence::Live => "live",
+                        OwnerPresence::Absent => "absent",
+                        OwnerPresence::Unknown => "unknown",
+                    };
+                    jobs.push(json!({
+                        "lease": lease,
+                        "wrapper_alive": presence == OwnerPresence::Live,
+                        "owner_presence": status,
+                    }));
                 }
                 Err(error) => {
                     journal_errors.push(json!({"path": path, "error": error.to_string()}));
@@ -568,10 +578,20 @@ mod tests {
         let listing = read_job_listing(&retained).unwrap();
         assert_eq!(listing["complete"], false);
         assert_eq!(listing["jobs"].as_array().unwrap().len(), 1);
-        assert_eq!(listing["jobs"][0]["lease"], serde_json::to_value(&lease).unwrap());
+        assert_eq!(
+            listing["jobs"][0]["lease"],
+            serde_json::to_value(&lease).unwrap()
+        );
+        assert_eq!(listing["jobs"][0]["owner_presence"], "unknown");
+        assert_eq!(listing["jobs"][0]["wrapper_alive"], false);
         assert_eq!(listing["journal_errors"].as_array().unwrap().len(), 1);
         assert_eq!(listing["journal_errors"][0]["path"], json!(corrupt));
-        assert!(listing["journal_errors"][0]["error"].as_str().unwrap().contains("EOF"));
+        assert!(
+            listing["journal_errors"][0]["error"]
+                .as_str()
+                .unwrap()
+                .contains("EOF")
+        );
         assert_eq!(std::fs::read(valid).unwrap(), valid_bytes);
         assert_eq!(std::fs::read(corrupt).unwrap(), corrupt_bytes);
         assert_eq!(std::fs::read(pending).unwrap(), b"pending evidence");
@@ -579,7 +599,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn job_listing_refuses_nonregular_entries_without_following_or_removing_them() {
+    fn job_listing_reports_observed_nonregular_entries_and_preserves_them() {
         let retained = tempfile::tempdir().unwrap().keep();
         let target = retained.join("retained-evidence");
         std::fs::write(&target, b"evidence stays intact").unwrap();
@@ -594,10 +614,16 @@ mod tests {
         let errors = listing["journal_errors"].as_array().unwrap();
         assert_eq!(errors.len(), 2);
         for path in [&link, &directory] {
-            assert!(errors.iter().any(|error| error["path"] == json!(path)
-                && error["error"] == "journal is not a regular file"));
+            assert!(errors.iter().any(|error| {
+                error["path"] == json!(path) && error["error"] == "journal is not a regular file"
+            }));
         }
-        assert!(std::fs::symlink_metadata(link).unwrap().file_type().is_symlink());
+        assert!(
+            std::fs::symlink_metadata(link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
         assert!(directory.is_dir());
         assert_eq!(std::fs::read(target).unwrap(), b"evidence stays intact");
     }
@@ -608,7 +634,10 @@ mod tests {
         let retained = tempfile::tempdir().unwrap().keep();
         let absent = retained.join("no-journals-yet");
         let listing = read_job_listing(&absent).unwrap();
-        assert_eq!(listing, json!({"jobs": [], "complete": true, "journal_errors": []}));
+        assert_eq!(
+            listing,
+            json!({"jobs": [], "complete": true, "journal_errors": []})
+        );
         assert!(!absent.exists());
     }
 

@@ -474,7 +474,9 @@ rch jobs recover <wrapper-id> --timeout-secs 300
 
 `rch --json jobs` reports valid leases alongside `journal_errors`. An unreadable,
 malformed or nonregular journal makes `complete` false and the command exits 1,
-while the valid jobs remain visible in the same JSON document. The listing
+while the valid jobs remain visible in the same JSON document. Each valid row
+also reports `owner_presence` as `live`, `absent` or `unknown`; a false legacy
+`wrapper_alive` value alone does not establish that an owner is absent. The listing
 does not remove, repair or treat the unreadable entry as an absent owner. An
 initially missing journal directory is an empty, complete listing.
 
