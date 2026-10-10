@@ -14,20 +14,20 @@ use std::path::Path;
 
 /// One bounded parse shared by the transfer optimization and the required
 /// output capture. The latter must never guess selectors from the globs.
-pub(in crate::hook) struct NamedCargoSelection<'a> {
-    pub(in crate::hook) bins: BTreeSet<&'a str>,
-    pub(in crate::hook) examples: BTreeSet<&'a str>,
-    pub(in crate::hook) tests: BTreeSet<&'a str>,
-    pub(in crate::hook) benches: BTreeSet<&'a str>,
-    pub(in crate::hook) message_formats: Vec<&'a str>,
-    targets: BTreeSet<&'a str>,
-    profile: &'a str,
+pub(in crate::hook) struct NamedCargoSelection {
+    pub(in crate::hook) bins: BTreeSet<String>,
+    pub(in crate::hook) examples: BTreeSet<String>,
+    pub(in crate::hook) tests: BTreeSet<String>,
+    pub(in crate::hook) benches: BTreeSet<String>,
+    pub(in crate::hook) message_formats: Vec<String>,
+    targets: BTreeSet<String>,
+    profile: String,
 }
 
 pub(in crate::hook) fn selection(
     kind: Option<CompilationKind>,
     command: &str,
-) -> Option<NamedCargoSelection<'_>> {
+) -> Option<NamedCargoSelection> {
     let kind = kind?;
     let args = build_arguments(kind, command)?;
     let mut bins = BTreeSet::new();
@@ -38,7 +38,7 @@ pub(in crate::hook) fn selection(
     let mut targets = BTreeSet::new();
     let mut message_formats = Vec::new();
     let mut profile = None;
-    let mut iter = args.into_iter();
+    let mut iter = args.iter().map(String::as_str);
     while let Some(arg) = iter.next() {
         let (flag, inline) = arg
             .split_once('=')
@@ -141,13 +141,13 @@ pub(in crate::hook) fn selection(
         return None;
     }
     Some(NamedCargoSelection {
-        bins,
-        examples,
-        tests,
-        benches,
-        message_formats,
-        targets,
-        profile: profile.unwrap_or("debug"),
+        bins: bins.into_iter().map(str::to_string).collect(),
+        examples: examples.into_iter().map(str::to_string).collect(),
+        tests: tests.into_iter().map(str::to_string).collect(),
+        benches: benches.into_iter().map(str::to_string).collect(),
+        message_formats: message_formats.into_iter().map(str::to_string).collect(),
+        targets: targets.into_iter().map(str::to_string).collect(),
+        profile: profile.unwrap_or("debug").to_owned(),
     })
 }
 
@@ -235,24 +235,30 @@ fn component(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
 }
 
-/// Deliberately a bounded literal subset, not a second shell parser. Quoted or
-/// expanded commands are valid elsewhere but cannot authorize this narrowing.
-fn build_arguments(kind: CompilationKind, command: &str) -> Option<Vec<&str>> {
+/// Reuse the managed Cargo parser's literal-shell validation and decoding.
+/// `rch exec` reconstructs argv with shell_words::join, so even an ordinary
+/// manifest/target path containing spaces or quotes reaches this policy quoted.
+/// Splitting that string on whitespace either lost the argument boundary or
+/// disabled the required-output contract entirely. Only decoded literal words
+/// may select outputs; this remains narrower than the managed execution grammar.
+fn build_arguments(kind: CompilationKind, command: &str) -> Option<Vec<String>> {
     if command.len() > 65_536
-        || !command.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric()
-                || matches!(
-                    byte,
-                    b' ' | b'\t' | b'_' | b'-' | b'.' | b'/' | b'=' | b'+' | b':' | b','
-                )
-        })
+        || command.chars().any(|ch| ch.is_control() && ch != '\t')
+        // Comments could swallow appended instrumentation; brace syntax is
+        // shell-dependent. Neither spelling belongs to this bounded subset,
+        // including quoted occurrences. Do not silently reinterpret either.
+        || command.contains(['#', '{', '}'])
     {
         return None;
     }
-    let words: Vec<_> = command.split_ascii_whitespace().collect();
-    if words.len() > 4096 {
+    let (tokens, _) =
+        crate::hook::cargo_target_dir::managed_clean_overlay_cargo_tokens(command).ok()?;
+    if tokens.len() > 4096 || tokens.iter().any(|word| word.chars().any(char::is_control)) {
         return None;
     }
+    // Keep the original wrapper allowlist below: using the shared lexer does
+    // not admit chdir, arbitrary wrappers, or a different Cargo subcommand.
+    let words: Vec<_> = tokens.iter().map(String::as_str).collect();
     let mut index = 0;
     loop {
         while words.get(index).is_some_and(|word| {
@@ -317,8 +323,11 @@ fn build_arguments(kind: CompilationKind, command: &str) -> Option<Vec<&str>> {
     ) {
         return None;
     }
-    Some(words[index + 1..].to_vec())
+    Some(tokens.into_iter().skip(index + 1).collect())
 }
+
+#[cfg(test)]
+mod quoted_tests;
 
 #[cfg(test)]
 mod tests {
@@ -606,8 +615,8 @@ mod tests {
 
         for forwarded in [false, true] {
             let root = tempfile::tempdir().unwrap();
-            let source = root.path().join("source");
-            let local = root.path().join("local");
+            let source = root.path().join("source λ with ' quote");
+            let local = root.path().join("local λ with ' quote");
             std::fs::create_dir_all(source.join("src")).unwrap();
             std::fs::create_dir_all(source.join("examples")).unwrap();
             std::fs::create_dir_all(&local).unwrap();
@@ -641,16 +650,21 @@ mod tests {
             )
             .unwrap();
             let remote_target = if forwarded {
-                root.path().join("worker-target")
+                root.path().join("worker target λ with ' quote")
             } else {
                 source.join("target")
             };
-            let command_text = "cargo build --bin app --bin helper --example demo --example demo-lib --profile lean --offline --jobs=1";
+            let manifest = source.join("Cargo.toml");
+            let manifest_arg = shell_words::join([manifest.to_str().unwrap()]);
+            let command_storage = format!(
+                "cargo build --bin app --bin helper --example demo --example demo-lib --profile lean --offline --jobs=1 --manifest-path {manifest_arg}"
+            );
+            let command_text = command_storage.as_str();
             let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
             let mut compile = Command::new(&cargo);
             compile
                 .current_dir(&source)
-                .args(command_text.split_ascii_whitespace().skip(1))
+                .args(shell_words::split(command_text).unwrap().into_iter().skip(1))
                 .arg("--message-format=json")
                 .env("CARGO_HOME", root.path().join("cargo-home"))
                 .env("CARGO_TARGET_DIR", &remote_target)
@@ -704,8 +718,10 @@ mod tests {
                 CargoOutputCapture::for_command(Some(CompilationKind::CargoBuild), command_text)
                     .is_none()
             );
-            let binary_command =
-                "cargo build --bin app --bin helper --profile lean --offline --jobs=1";
+            let binary_storage = format!(
+                "cargo build --bin app --bin helper --profile lean --offline --jobs=1 --manifest-path {manifest_arg}"
+            );
+            let binary_command = binary_storage.as_str();
             let capture =
                 CargoOutputCapture::for_command(Some(CompilationKind::CargoBuild), binary_command)
                     .unwrap();
@@ -713,7 +729,7 @@ mod tests {
             let mut binaries = Command::new(&cargo);
             binaries
                 .current_dir(&source)
-                .args(instrumented.split_ascii_whitespace().skip(1))
+                .args(shell_words::split(&instrumented).unwrap().into_iter().skip(1))
                 .stdin(Stdio::null())
                 .kill_on_drop(true);
             for (key, value) in compile.as_std().get_envs() {
