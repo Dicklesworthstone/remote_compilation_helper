@@ -380,9 +380,22 @@ def main():
             "A failed stdout write consumed or changed the retained same-id delivery")
     conflict, _ = run("recovery-machine-envelope-conflict",
                       [str(args.rch), "--json", "jobs", "recover", wrapper_id, "--cargo-json"], env)
-    require(conflict.returncode != 0 and not conflict.stdout
-            and b"conflicts with machine envelopes" in conflict.stderr,
-            "Cargo JSON recovery contaminated a machine envelope or failed for another reason")
+    # --json requests the normal API error envelope even when the requested
+    # raw Cargo recovery mode conflicts. It must not replay compiler records.
+    conflict_payload = json.loads(conflict.stdout)
+    conflict_error = conflict_payload.get("error") or {}
+    require(conflict.returncode == 1 and conflict_payload.get("api_version") == "1.0"
+            and conflict_payload.get("command") == "rch"
+            and conflict_payload.get("success") is False
+            and conflict_payload.get("data") is None
+            and "reason" not in conflict_payload
+            and conflict_error.get("code") == "RCH-E504"
+            and conflict_error.get("details") == "Cargo JSON recovery conflicts with machine envelopes"
+            and b"panicked" not in conflict.stderr,
+            "Conflicting recovery modes did not return one exact failed machine envelope")
+    require(sha256(diagnostic_path) == diagnostic_sha
+            and all(sha256(paths[name]) == first_hashes[name] for name in names),
+            "Mode-conflict rejection changed the original retained output bytes")
     paths = repeated_paths
     # Exercise the actual Bash consumer and all its real-stream negatives.
     consume, _ = run("actual-installer-consumer", [sys.executable,
