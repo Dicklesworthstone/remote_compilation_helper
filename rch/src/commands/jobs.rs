@@ -283,25 +283,64 @@ async fn wait_for_job_poll(deadline: Instant) -> Result<()> {
 }
 
 #[cfg(unix)]
+fn read_job_listing(directory: &std::path::Path) -> Result<Value> {
+    let mut jobs = Vec::new();
+    let mut journal_errors = Vec::new();
+    let entries = match std::fs::read_dir(directory) {
+        Ok(entries) => Some(entries),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    if let Some(entries) = entries {
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    journal_errors.push(json!({"path": directory, "error": error.to_string()}));
+                    continue;
+                }
+            };
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            let observed = (|| -> Result<DurableJobLease> {
+                // Listing cannot follow a journal symlink or block opening a
+                // FIFO. An invalid entry is evidence, not an absent job.
+                anyhow::ensure!(entry.file_type()?.is_file(), "journal is not a regular file");
+                Ok(serde_json::from_slice(&std::fs::read(&path)?)?)
+            })();
+            match observed {
+                Ok(lease) => {
+                    jobs.push(json!({"lease": lease, "wrapper_alive": process_matches(&lease)}));
+                }
+                Err(error) => {
+                    journal_errors.push(json!({"path": path, "error": error.to_string()}));
+                }
+            }
+        }
+    }
+    Ok(json!({
+        "jobs": jobs,
+        "complete": journal_errors.is_empty(),
+        "journal_errors": journal_errors,
+    }))
+}
+
+#[cfg(unix)]
 async fn run_unix(action: Option<JobsAction>, ctx: &OutputContext) -> Result<()> {
     use crate::hook::DurableLeaseWriter;
     let Some(action) = action else {
-        let mut jobs = Vec::new();
-        match std::fs::read_dir(default_job_lease_directory()) {
-            Ok(entries) => {
-                for entry in entries {
-                    let path = entry?.path();
-                    if path.extension().and_then(|v| v.to_str()) != Some("json") {
-                        continue;
-                    }
-                    let lease: DurableJobLease = serde_json::from_slice(&std::fs::read(&path)?)?;
-                    jobs.push(json!({"lease": lease, "wrapper_alive": process_matches(&lease)}));
-                }
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
+        let listing = read_job_listing(&default_job_lease_directory())?;
+        emit(ctx, &listing);
+        if listing["complete"] != true {
+            eprintln!(
+                "[RCH] job listing is incomplete; inspect journal_errors before reconciling ownership"
+            );
+            // The structured listing was already emitted. Returning Err
+            // would append a second JSON error envelope in async_main.
+            std::process::exit(1);
         }
-        emit(ctx, &json!({"jobs": jobs}));
         return Ok(());
     };
     let (wrapper_id, recover, cancel, timeout_secs, cargo_json) = match action {
@@ -502,6 +541,77 @@ async fn run_unix(action: Option<JobsAction>, ctx: &OutputContext) -> Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn job_listing_preserves_valid_jobs_and_reports_corrupt_journals() {
+        let retained = tempfile::tempdir().unwrap().keep();
+        let lease = DurableJobLease::new(
+            rch_common::job_identity::JobIdentity::new_local(),
+            1,
+            None,
+            None,
+            0,
+            true,
+            false,
+            "hash".into(),
+        );
+        let valid = retained.join("valid.json");
+        let valid_bytes = serde_json::to_vec(&lease).unwrap();
+        std::fs::write(&valid, &valid_bytes).unwrap();
+        let corrupt = retained.join("corrupt.json");
+        let corrupt_bytes = b"{\"identity\":";
+        std::fs::write(&corrupt, corrupt_bytes).unwrap();
+        let pending = retained.join("not-a-journal.pending");
+        std::fs::write(&pending, b"pending evidence").unwrap();
+
+        let listing = read_job_listing(&retained).unwrap();
+        assert_eq!(listing["complete"], false);
+        assert_eq!(listing["jobs"].as_array().unwrap().len(), 1);
+        assert_eq!(listing["jobs"][0]["lease"], serde_json::to_value(&lease).unwrap());
+        assert_eq!(listing["journal_errors"].as_array().unwrap().len(), 1);
+        assert_eq!(listing["journal_errors"][0]["path"], json!(corrupt));
+        assert!(listing["journal_errors"][0]["error"].as_str().unwrap().contains("EOF"));
+        assert_eq!(std::fs::read(valid).unwrap(), valid_bytes);
+        assert_eq!(std::fs::read(corrupt).unwrap(), corrupt_bytes);
+        assert_eq!(std::fs::read(pending).unwrap(), b"pending evidence");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn job_listing_refuses_nonregular_entries_without_following_or_removing_them() {
+        let retained = tempfile::tempdir().unwrap().keep();
+        let target = retained.join("retained-evidence");
+        std::fs::write(&target, b"evidence stays intact").unwrap();
+        let link = retained.join("symlink.json");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let directory = retained.join("directory.json");
+        std::fs::create_dir(&directory).unwrap();
+
+        let listing = read_job_listing(&retained).unwrap();
+        assert_eq!(listing["complete"], false);
+        assert!(listing["jobs"].as_array().unwrap().is_empty());
+        let errors = listing["journal_errors"].as_array().unwrap();
+        assert_eq!(errors.len(), 2);
+        for path in [&link, &directory] {
+            assert!(errors.iter().any(|error| error["path"] == json!(path)
+                && error["error"] == "journal is not a regular file"));
+        }
+        assert!(std::fs::symlink_metadata(link).unwrap().file_type().is_symlink());
+        assert!(directory.is_dir());
+        assert_eq!(std::fs::read(target).unwrap(), b"evidence stays intact");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn job_listing_of_absent_directory_is_complete_and_does_not_create_it() {
+        let retained = tempfile::tempdir().unwrap().keep();
+        let absent = retained.join("no-journals-yet");
+        let listing = read_job_listing(&absent).unwrap();
+        assert_eq!(listing, json!({"jobs": [], "complete": true, "journal_errors": []}));
+        assert!(!absent.exists());
+    }
+
     #[test]
     fn queued_cancellation_receipt_requires_exact_identity_and_terminal_evidence() {
         let valid = json!({"status":"cancelled_before_start", "local_wrapper_id":"wrapper", "exit_code":130});

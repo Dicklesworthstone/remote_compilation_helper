@@ -472,6 +472,12 @@ rch jobs cancel <wrapper-id>                   # cancel the identity-matched job
 rch jobs recover <wrapper-id> --timeout-secs 300
 ```
 
+`rch --json jobs` reports valid leases alongside `journal_errors`. An unreadable,
+malformed or nonregular journal makes `complete` false and the command exits 1,
+while the valid jobs remain visible in the same JSON document. The listing
+does not remove, repair or treat the unreadable entry as an absent owner. An
+initially missing journal directory is an empty, complete listing.
+
 These commands never replay the original command. Recovery requires retained
 identity and completion/retrieval evidence; ambiguous or missing evidence is
 reported as an error. For a live wrapper stalled during artifact retrieval,

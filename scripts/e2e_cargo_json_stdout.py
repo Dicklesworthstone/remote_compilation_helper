@@ -276,8 +276,11 @@ def main():
             and payload.get("remote_exit_code") == 0, "Machine stdout contains compiler records or lacks its remote envelope")
     before_failure, _ = run("jobs-before-genuine-failure", [str(args.rch), "--json", "jobs"], env)
     require(before_failure.returncode == 0, "Actual pre-failure job observation failed")
+    before_listing = json.loads(before_failure.stdout)
+    require(before_listing.get("complete") is True and before_listing.get("journal_errors") == [],
+            "Pre-failure ownership observation has unreadable journals or lacks a complete listing contract")
     prior_ids = {item["lease"]["identity"]["local_wrapper_id"]
-                 for item in json.loads(before_failure.stdout)["jobs"]}
+                 for item in before_listing["jobs"]}
     missing = "absent-cargo-json-" + token
     failure, _ = run("genuine-cargo-target-failure", ["cargo", "build", "-j1", "--locked", "--release",
         "-p", "franken-snowflake-cli", "--bin", missing, "--message-format=json,json-render-diagnostics"], env)
@@ -288,8 +291,11 @@ def main():
     after_failure, failure_jobs_case = run("jobs-after-genuine-failure",
                                           [str(args.rch), "--json", "jobs"], env)
     require(after_failure.returncode == 0, "Actual post-failure job observation failed")
+    after_listing = json.loads(after_failure.stdout)
+    require(after_listing.get("complete") is True and after_listing.get("journal_errors") == [],
+            "Post-failure ownership observation has unreadable journals or lacks a complete listing contract")
     failures = []
-    for item in json.loads(after_failure.stdout)["jobs"]:
+    for item in after_listing["jobs"]:
         lease = item["lease"]
         recipe = lease.get("recovery") or {}
         identity = lease["identity"]
