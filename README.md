@@ -48,6 +48,7 @@ RCH currently recognizes and can offload:
 |---|---|
 | Rust | `cargo build`, `cargo check`, `cargo clippy`, `cargo doc`, `cargo test`, `cargo nextest run`, `cargo bench`, `rustc` |
 | Bun/TypeScript | `bun test`, `bun typecheck` |
+| Go | `go build -o <file>`, ordinary `go test`, `go vet` |
 | C/C++ | `gcc`, `g++`, `clang`, `clang++` |
 | Build Systems | `make`, `cmake --build`, `ninja`, `meson compile` |
 | Nix | `nix build`, `nix-build`, `nix flake check`, `nix develop -c <cmd>`, `nix shell -c <cmd>` |
@@ -59,6 +60,34 @@ with Bun/Node). Nix outputs stay in the worker's `/nix/store` behind a `result`
 symlink, so these run as streaming, exit-status-only commands (no artifacts are
 copied back — the flake source is synced out, the build runs, the result stays
 remote).
+
+Go builds support an explicit, project-relative **file** output, for example
+`go build -o bin/app ./cmd/app` or `go build -o 'products/app [dev]*?' main.go`.
+The output is returned to that exact path, including when `CARGO_TARGET_DIR` is
+set. Common build flags such as `-p`, `-tags`, `-trimpath`, and `-race` are
+supported, as are linker stripping flags (`-ldflags '-s -w'`) and `-X` variable
+definitions. Builds require the durable Unix execution path and a local Go
+installation. Both endpoints must report empty effective `GOFLAGS` and the
+dispatcher's native `GOOS`/`GOARCH`. The caller's selected Go version, CGO
+configuration, experiments, and architecture tuning settings are captured
+before upload and must match the worker exactly before compilation starts.
+Ordinary builds with CGO enabled remain supported when those settings match.
+
+The worker compiles into a fresh private file outside the source root, preserving
+wildcard `go:embed` inputs. Only after successful compilation produces a regular
+file does it create output parents and an adjacent stage for atomic replacement
+of the previous worker file. Retrieval then stages and validates that file before
+replacing the local output. A missing download cannot be satisfied by an old
+local binary, and durable recovery resumes collection without rerunning Go.
+Directory outputs, symlinks or symlinked output parents, cross compilation,
+native-library modes such as `c-shared`/`c-archive`, and low-level flags that can
+create extra files are outside this output contract. Implicit forms such as
+`go build`, `go build .`, and `go build ./...` stay local because their output
+names depend on which packages they select. Go test options that write binaries,
+profiles, or fuzz corpora (`-c`, `-o`, `-coverprofile`, `-cpuprofile`, `-trace`,
+`-fuzz`, and related flags, including `-test.*` forms after `-args`) also stay
+local. Strict remote mode refuses
+unsupported forms instead of executing them locally.
 
 RCH explicitly does **not** intercept local-mutating or interactive patterns (examples):
 
@@ -301,6 +330,66 @@ rch capabilities --json
 rch robot-docs guide
 ```
 
+### Named Cargo JSON for installer consumers
+
+An installer selecting explicit binary targets can request caller-visible
+Cargo JSON through the canonical Cargo shim:
+
+```bash
+RCH_CARGO_JSON_STDOUT=1 RCH_REQUIRE_REMOTE=1 cargo build --locked --release \
+  --bin my-tool --bin my-alias --message-format=json,json-render-diagnostics
+```
+
+This opt-in requires the durable POSIX worker route and refuses local fallback,
+arbitrary jobs, machine envelopes, and unsupported target selections. Selected
+binary records reach stdout after artifact publication and acknowledged worker
+release. Their executable, filenames, manifest, and source paths refer to the
+caller tree. Selected output files are copied into an invocation-private retained
+directory beneath the caller's actual target root and checked against the exact
+publication fingerprints. A later build cannot replace these copies by publishing
+into the shared target paths. Each record carries an `rch` extension retaining the original worker
+record, exact retained stdout receipt, wrapper/build identity, and executable
+BLAKE3 publication fingerprint. Unselected dependency records keep their worker
+metadata and do not assert local delivery of intermediates. Diagnostics stay on
+stderr. Compiler failure stdout comes from the same invocation's immutable
+nonzero completion receipt; a successful compile with failed artifact delivery
+advertises no caller-local success records. The ordinary hook and `rch --json
+exec` envelope contracts are unchanged.
+
+The delivery JSON, its private file paths, and their fingerprints are persisted
+before source retirement and worker release. After the original wrapper has
+exited, recover that same invocation without compiling again:
+
+```bash
+rch jobs recover ORIGINAL_WRAPPER_ID --cargo-json
+```
+
+This explicit output mode requires an invocation originally admitted with
+`RCH_CARGO_JSON_STDOUT=1`; it cannot upgrade an ordinary job. It returns verified
+retained stdout only after the original recovery and acknowledgement complete,
+and uses the original exit status. Repeating it returns the first delivery's
+exact JSON bytes and private paths, including after later builds or a failed
+stdout write. A live unacknowledged wrapper or unknown owner identity refuses
+detached recovery. `--json` machine envelopes conflict with `--cargo-json`.
+The complete compiler stderr is collected from the same supervisor log with
+the original completion status and retained before retirement. Its path,
+length, BLAKE3 and compiler status appear in the selected record's receipt.
+Recovery verifies those bytes and writes them to stderr without line or UTF-8
+conversion. Failed compiler stdout and stderr use the exact nonzero completion;
+no successful Cargo record is advertised when artifact delivery failed. Older
+completed journals lacking retained diagnostics refuse this explicit output
+mode rather than fabricate diagnostic parity.
+
+Use the exit status together with the record binding. This route does not
+provide native Windows delivery, an installer transaction, a source-content
+receipt, or performance qualification. `scripts/e2e_cargo_json_stdout.py` checks
+the actual shim, retained producer bytes, both real native binaries, cached
+delivery, completed same-id stdout recovery, a broken stdout pipe, and a genuine
+Cargo target-selection failure against an externally
+admitted source and artifact root. No test result is implied by this description.
+Wrapper-loss, pending recovery, cancellation, full installers, native Windows,
+and same-invocation live-incumbent/A/A performance acceptance remain open.
+
 ### Job Mode (non-compilation workloads)
 
 `rch exec --job` admits an arbitrary NON-compilation workload (sharded tests,
@@ -319,6 +408,22 @@ rerun heuristics apply. A declared `--result-dir` that is missing or only
 partially transferable fails loudly (`RCH-E309`, exit 102) regardless of the
 job's own exit status. Paths must be repository-relative; conflicts with
 `--clean-overlay` / `--source-content-receipt` are refused.
+
+Native Apple commands can use job mode too: direct `xcodebuild` and `xcrun`
+invocations require a worker declaring `os = "darwin"`. This preserves the OS
+fence: ordinary jobs cannot consume that worker, and Linux workers cannot take
+an Xcode job. Invoke the tool directly; RCH does not inspect arbitrary scripts
+or infer a Mac requirement from text merely mentioning Xcode.
+
+```bash
+RCH_REQUIRE_REMOTE=1 RCH_BUILD_SLOTS=1 rch exec --job -- \
+  xcodebuild -project ios/App.xcodeproj -scheme App -jobs 1 build
+```
+
+This is host routing, not proof that Xcode, signing credentials, or a Simulator
+are ready. Native test and Simulator safety checks still apply. Both `rch` and
+`rchd` need the native-command routing support; keep explicit strict-remote
+mode when qualifying a build so an older daemon cannot silently run it locally.
 
 #### Requiring a verified tool
 
@@ -366,6 +471,24 @@ rch jobs attach <wrapper-id> --timeout-secs 300 # observe the original job
 rch jobs cancel <wrapper-id>                   # cancel the identity-matched job
 rch jobs recover <wrapper-id> --timeout-secs 300
 ```
+
+`rch --json jobs` reports valid leases alongside `journal_errors`. An unreadable
+or malformed journal, or an entry observed as nonregular, makes `complete` false
+and the command exits 1, while valid jobs remain visible in the same JSON document.
+Each valid row
+also reports `owner_presence` as `live`, `absent` or `unknown`; a false legacy
+`wrapper_alive` value alone does not establish that an owner is absent. The listing
+does not remove, repair or treat the unreadable entry as an absent owner. An
+initially missing journal directory is an empty, complete listing.
+The directory is opened once and journal names are read relative to its file
+descriptor. Journal opens reject symlinks and do not wait for a FIFO writer;
+the opened descriptor must represent a regular file before any bytes are read.
+The directory root itself must be a directory rather than a symlink.
+`complete` describes this scan, not an immutable ownership snapshot: entries
+and regular-file contents can still change during observation.
+If a journal path contains non-UTF-8 bytes, its error has a printable `path`
+and an exact Unix `path_bytes` array. A job command whose output cannot be written
+or flushed exits with an error rather than reporting successful delivery.
 
 These commands never replay the original command. Recovery requires retained
 identity and completion/retrieval evidence; ambiguous or missing evidence is
@@ -496,6 +619,9 @@ remote_speedup_threshold = 1.2
 build_slots = 4
 test_slots = 8
 check_slots = 2
+# Optional additional build-disk headroom for each remote job (GiB).
+# Include expected output growth and a safety margin. Zero disables it.
+# disk_headroom_gib = 80
 build_timeout_sec = 300
 test_timeout_sec = 1800
 bun_timeout_sec = 600
@@ -572,6 +698,40 @@ and reports that the configured deadline expired. It does not retry on a larger
 worker or fall back locally. Machine-mode `rch exec` reports
 `outcome: "deadline_exceeded"`. This classification requires evidence from the
 launcher; exit 137 or elapsed time alone does not establish a timeout.
+
+For projects with large build outputs, set `compilation.disk_headroom_gib` in
+`.rch/config.toml`. A value of `80` requires 80 GiB of additional space on the
+worker's reported build filesystem. Selection requires a successful disk probe
+within 90 seconds and subtracts budgets already held by active builds in this
+daemon. Budgets survive daemon restart and remain held until the owning build
+completes. Releasing a budget does not prove its output files freed any space:
+the next budgeted admission requires a disk probe started after that completion.
+A probe already in flight cannot reuse the earlier free-space reading. Retries,
+queue recovery, and `rch diagnose` use the same requirement.
+Smaller CPU-slot estimates and cache affinity cannot bypass it. Older daemons
+reject the distinct budgeted selection endpoint rather than ignoring the
+requirement.
+
+This is admission accounting for the worker's reported canonical/alias build
+roots, not a filesystem quota or a measurement of arbitrary custom target
+mounts. Other dispatchers, undeclared jobs, and external writes are outside its
+accounting. The full budget stays reserved even after a disk sample reflects
+some of the build's output, so admission deliberately errs toward leaving extra
+space. The default is `0`, retaining ordinary disk-pressure admission.
+
+Without a declaration, the daemon still learns each project's footprint. For
+every remote build that had a worker to itself (no other build from this
+daemon overlapped there), it records how far the worker's free build-disk
+space fell between the admission probe and the lowest probe seen while the
+build ran. Footprints are kept per project and command class (`cargo test` is
+learned separately from `cargo check`), for 30 days, in
+`history.footprints.json` beside the build history. When some candidate
+worker has room for the largest recent footprint plus 10% (at least 5 GiB),
+after declared budgets and the remaining growth of builds already running
+there, selection only considers those workers. If none has room, selection is
+unchanged. Learned footprints are evidence, not a budget, so they never refuse
+a build. Other dispatchers' builds can inflate a measurement and cache cleanup
+can shrink one; declare `disk_headroom_gib` when you need a hard requirement.
 
 Unix artifact downloads estimate the files matched by the retrieval filters
 before transferring them. Their default total retry budget grows with that size

@@ -12,7 +12,7 @@ use anyhow::{Context, Result};
 use rch_common::CompilationKind;
 use rch_telemetry::protocol::PIGGYBACK_MARKER;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 
 /// The transport must return the complete receipt or report an error. The
@@ -60,6 +60,21 @@ pub(super) struct CargoOutputContract {
     pub(super) required_files: BTreeSet<PathBuf>,
 }
 
+pub(super) struct CargoCallerPaths<'a> {
+    pub(super) remote_output_roots: &'a [&'a Path],
+    pub(super) local_output_root: &'a Path,
+    pub(super) remote_project_roots: &'a [&'a Path],
+    pub(super) local_project_root: &'a Path,
+    pub(super) published: &'a BTreeMap<PathBuf, String>,
+    pub(super) receipt_binding: &'a serde_json::Value,
+}
+
+pub(super) struct CargoCallerOutput {
+    pub(super) stdout: Vec<u8>,
+    /// Only caller-visible selected files need another fingerprint read.
+    pub(super) files: BTreeSet<PathBuf>,
+}
+
 #[derive(Deserialize)]
 struct ArtifactTarget {
     name: String,
@@ -77,6 +92,17 @@ struct CompilerArtifact {
 }
 
 impl CargoOutputCapture {
+    /// The caller explicitly requested Cargo JSON for literal binary targets.
+    /// Instrumentation of human output does not opt into a stdout API.
+    pub(super) fn caller_json_supported(&self) -> bool {
+        !self.instrumented
+            && !self.selected.is_empty()
+            && self
+                .selected
+                .iter()
+                .all(|target| target.kind == TargetKind::Bin)
+    }
+
     pub(super) fn for_command(kind: Option<CompilationKind>, command: &str) -> Option<Self> {
         let selection = cargo_bins::selection(kind, command)?;
         if !selection.examples.is_empty() {
@@ -278,6 +304,268 @@ impl CargoOutputCapture {
         anyhow::ensure!(!required_files.is_empty(), "Cargo output contract is empty");
         Ok(CargoOutputContract { required_files })
     }
+
+    /// Validate selected caller metadata before any file can be published and
+    /// return every filename advertised by those records, including sidecars.
+    pub(super) fn validate_caller_metadata(
+        &self,
+        stdout: &[u8],
+        remote_output_roots: &[&Path],
+        remote_project_roots: &[&Path],
+        local_project_root: &Path,
+    ) -> Result<BTreeSet<PathBuf>> {
+        anyhow::ensure!(
+            self.caller_json_supported(),
+            "caller JSON requires explicitly named binary targets and an explicit JSON format"
+        );
+        self.parse_receipt_with_roots(stdout, remote_output_roots)?;
+        let mut selected = BTreeSet::new();
+        let mut required_files = BTreeSet::new();
+        for line in std::str::from_utf8(stdout)?.lines() {
+            if line == PIGGYBACK_MARKER {
+                break;
+            }
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            if value.get("reason").and_then(serde_json::Value::as_str) != Some("compiler-artifact")
+            {
+                continue;
+            }
+            let Some(name) = value
+                .pointer("/target/name")
+                .and_then(serde_json::Value::as_str)
+            else {
+                continue;
+            };
+            let kinds = value
+                .pointer("/target/kind")
+                .and_then(serde_json::Value::as_array)
+                .context("Cargo target kinds are not an array")?;
+            if !self.selected.iter().any(|target| target.name == name)
+                || !kinds.iter().any(|kind| kind.as_str() == Some("bin"))
+            {
+                continue;
+            }
+            anyhow::ensure!(
+                selected.insert(name.to_owned()),
+                "caller JSON has ambiguous duplicate selected targets"
+            );
+            anyhow::ensure!(
+                kinds.len() == 1
+                    && value
+                        .pointer("/profile/test")
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(false),
+                "caller JSON selected a test or ambiguous binary target"
+            );
+            let manifest = value
+                .get("manifest_path")
+                .and_then(serde_json::Value::as_str)
+                .context("selected Cargo record has no manifest path")?;
+            let relative = relative_output_path(manifest, remote_project_roots)?;
+            anyhow::ensure!(
+                relative
+                    .file_name()
+                    .is_some_and(|name| name == "Cargo.toml"),
+                "selected Cargo manifest is not Cargo.toml"
+            );
+            let local = local_project_root
+                .join(relative)
+                .canonicalize()
+                .context("selected caller Cargo manifest is unavailable")?;
+            anyhow::ensure!(
+                local.starts_with(local_project_root) && local.is_file(),
+                "selected caller Cargo manifest escapes its source root"
+            );
+            if let Some(source) = value
+                .pointer("/target/src_path")
+                .and_then(serde_json::Value::as_str)
+            {
+                relative_output_path(source, remote_project_roots)?;
+            }
+            for filename in value
+                .get("filenames")
+                .and_then(serde_json::Value::as_array)
+                .context("selected Cargo record has no filenames")?
+            {
+                required_files.insert(relative_output_path(
+                    filename
+                        .as_str()
+                        .context("selected Cargo filename is not a string")?,
+                    remote_output_roots,
+                )?);
+            }
+            anyhow::ensure!(
+                value.get("rch").is_none(),
+                "Cargo record already contains an RCH binding"
+            );
+        }
+        anyhow::ensure!(
+            selected.len() == self.selected.len(),
+            "caller JSON did not uniquely bind every selected binary target"
+        );
+        Ok(required_files)
+    }
+
+    /// Project selected executable records into the caller's delivered tree.
+    /// The caller checks publication fingerprints under the output-root lock.
+    /// Unselected dependency records retain their original worker metadata.
+    pub(super) fn caller_json(
+        &self,
+        stdout: &[u8],
+        paths: &CargoCallerPaths<'_>,
+    ) -> Result<CargoCallerOutput> {
+        let CargoCallerPaths {
+            remote_output_roots,
+            local_output_root,
+            remote_project_roots,
+            local_project_root,
+            published,
+            receipt_binding,
+        } = paths;
+        anyhow::ensure!(
+            self.caller_json_supported(),
+            "caller JSON requires explicitly named binary targets and an explicit JSON format"
+        );
+        let contract = self.parse_receipt_with_roots(stdout, remote_output_roots)?;
+        self.validate_caller_metadata(
+            stdout,
+            remote_output_roots,
+            remote_project_roots,
+            local_project_root,
+        )?;
+        validate_absolute_path(local_output_root)?;
+        for root in *remote_project_roots {
+            validate_absolute_path(root)?;
+        }
+        validate_absolute_path(local_project_root)?;
+        anyhow::ensure!(
+            contract
+                .required_files
+                .iter()
+                .all(|file| published.contains_key(file)),
+            "caller JSON cannot name an executable outside this invocation's published set"
+        );
+        let mut output = Vec::new();
+        let mut selected = BTreeSet::new();
+        let mut files = BTreeSet::new();
+        for line in std::str::from_utf8(stdout)?.split_inclusive('\n') {
+            if line.trim_end_matches(['\r', '\n']) == PIGGYBACK_MARKER {
+                break;
+            }
+            let Ok(mut value) = serde_json::from_str::<serde_json::Value>(line) else {
+                output.extend_from_slice(line.as_bytes());
+                continue;
+            };
+            let named = value.get("reason").and_then(serde_json::Value::as_str)
+                == Some("compiler-artifact")
+                && self.selected.iter().any(|target| {
+                    value
+                        .pointer("/target/name")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(target.name.as_str())
+                        && value
+                            .pointer("/target/kind")
+                            .and_then(serde_json::Value::as_array)
+                            .is_some_and(|kinds| {
+                                kinds
+                                    .iter()
+                                    .any(|kind| kind.as_str() == Some(target.kind.as_str()))
+                            })
+                });
+            if !named {
+                output.extend_from_slice(line.as_bytes());
+                continue;
+            }
+            let original = value.clone();
+            let name = value
+                .pointer("/target/name")
+                .and_then(serde_json::Value::as_str)
+                .context("selected Cargo record has no target name")?
+                .to_owned();
+            anyhow::ensure!(
+                selected.insert(name),
+                "caller JSON has ambiguous duplicate selected targets"
+            );
+            anyhow::ensure!(
+                value
+                    .pointer("/profile/test")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(false),
+                "caller JSON selected a test executable"
+            );
+            let manifest = value
+                .get("manifest_path")
+                .and_then(serde_json::Value::as_str)
+                .context("selected Cargo record has no manifest path")?;
+            let relative_manifest = relative_output_path(manifest, remote_project_roots)?;
+            anyhow::ensure!(
+                relative_manifest
+                    .file_name()
+                    .is_some_and(|name| name == "Cargo.toml"),
+                "selected Cargo manifest is not Cargo.toml"
+            );
+            let local_manifest = local_project_root.join(relative_manifest);
+            let canonical_manifest = local_manifest
+                .canonicalize()
+                .context("selected caller Cargo manifest is unavailable")?;
+            anyhow::ensure!(
+                canonical_manifest.starts_with(local_project_root) && canonical_manifest.is_file(),
+                "selected caller Cargo manifest escapes its source root"
+            );
+            value["manifest_path"] = serde_json::to_value(canonical_manifest)?;
+            let executable = original
+                .get("executable")
+                .and_then(serde_json::Value::as_str)
+                .context("selected Cargo record has no executable")?;
+            let relative = relative_output_path(executable, remote_output_roots)?;
+            value["executable"] = serde_json::to_value(local_output_root.join(&relative))?;
+            files.insert(relative.clone());
+            let filenames = original
+                .get("filenames")
+                .and_then(serde_json::Value::as_array)
+                .context("selected Cargo record has no filenames")?;
+            let mut local_filenames = Vec::new();
+            for filename in filenames {
+                let filename = filename
+                    .as_str()
+                    .context("selected Cargo filename is not a string")?;
+                let relative = relative_output_path(filename, remote_output_roots)?;
+                anyhow::ensure!(
+                    published.contains_key(&relative),
+                    "selected Cargo filename was not published by this invocation: {}",
+                    relative.display()
+                );
+                local_filenames.push(local_output_root.join(&relative));
+                files.insert(relative);
+            }
+            value["filenames"] = serde_json::to_value(local_filenames)?;
+            if let Some(source) = original
+                .pointer("/target/src_path")
+                .and_then(serde_json::Value::as_str)
+            {
+                let relative = relative_output_path(source, remote_project_roots)?;
+                value["target"]["src_path"] =
+                    serde_json::to_value(local_project_root.join(relative))?;
+            }
+            anyhow::ensure!(
+                value.get("rch").is_none(),
+                "Cargo record already contains an RCH binding"
+            );
+            value["rch"] = serde_json::json!({
+                "worker_record": original,
+                "receipt": receipt_binding,
+                "executable_blake3": published.get(&relative).context("selected executable has no publication fingerprint")?,
+            });
+            serde_json::to_writer(&mut output, &value)?;
+            output.push(b'\n');
+        }
+        Ok(CargoCallerOutput {
+            stdout: output,
+            files,
+        })
+    }
 }
 
 impl CargoOutputContract {
@@ -414,6 +702,34 @@ fn relative_output_path(name: &str, roots: &[&Path]) -> Result<PathBuf> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn caller_json_support_requires_explicit_named_binary_json() {
+        for (command, expected) in [
+            (
+                "cargo build --bin cli --bin alias --locked --release --message-format=json,json-render-diagnostics",
+                true,
+            ),
+            ("cargo build --bin cli --message-format=json", true),
+            ("cargo build --bin cli", false),
+            ("cargo build --bins --message-format=json", false),
+            ("cargo build --bin cli --message-format=human", false),
+            ("cargo build --example cli --message-format=json", false),
+        ] {
+            assert_eq!(
+                CargoOutputCapture::for_command(Some(CompilationKind::CargoBuild), command)
+                    .is_some_and(|capture| capture.caller_json_supported()),
+                expected,
+                "{command}"
+            );
+        }
+        let no_run = CargoOutputCapture::for_command(
+            Some(CompilationKind::CargoTest),
+            "cargo test --test integration --no-run --message-format=json",
+        )
+        .unwrap();
+        assert!(!no_run.caller_json_supported());
+    }
 
     fn capture(command: &str) -> CargoOutputCapture {
         CargoOutputCapture::for_command(Some(CompilationKind::CargoBuild), command).unwrap()
@@ -814,7 +1130,7 @@ mod tests {
             Some("/worker/target/debug/app"),
             false,
         );
-        let valid = receipt(&[output.clone()]);
+        let valid = receipt(std::slice::from_ref(&output));
         let root = Path::new("/worker/target");
         let incomplete = &valid[..valid.len() - 1];
         assert!(capture.parse_receipt(incomplete, root).is_err());

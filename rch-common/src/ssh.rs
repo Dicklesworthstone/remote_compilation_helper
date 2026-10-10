@@ -7,15 +7,17 @@
 
 use crate::types::{WorkerConfig, WorkerId, declared_os};
 use anyhow::{Context, Result};
-use openssh::{ControlPersist, KnownHosts, Session, SessionBuilder, Stdio};
+use openssh::{Session, Stdio};
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::num::NonZeroUsize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::ExitStatus;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::{RwLock, mpsc, watch};
+use tokio::time::Instant;
 use tracing::{debug, error, warn};
 
 // Re-export platform-independent utilities for backwards compatibility
@@ -40,6 +42,192 @@ const HEALTH_CHECK_COMMAND: &str = "echo ok";
 /// caller for the client's multi-minute command timeout.
 const POOL_LIVENESS_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Reaping a killed local SSH process must not wedge disconnect/reload either.
+const SSH_CLEANUP_TIMEOUT: Duration = Duration::from_secs(1);
+const SSH_READY_POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+#[derive(Clone)]
+struct SshProcessState {
+    active_commands: usize,
+    idle_since: Instant,
+    draining: bool,
+    stopping: bool,
+    outcome: Option<std::result::Result<ExitStatus, String>>,
+}
+
+/// Owns a foreground SSH process from spawn through wait/reap. Dropping a
+/// connect future or a client requests termination; the supervisor retains the
+/// child and socket directory until it has reaped the child.
+struct OwnedSshProcess {
+    state: watch::Sender<SshProcessState>,
+    supervisor: tokio::task::JoinHandle<()>,
+}
+
+impl OwnedSshProcess {
+    fn spawn(
+        command: &mut tokio::process::Command,
+        control_dir: Option<Arc<tempfile::TempDir>>,
+        idle_timeout: Option<Duration>,
+    ) -> Result<Self> {
+        let mut child = command.kill_on_drop(true).spawn()?;
+        let (state, mut changes) = watch::channel(SshProcessState {
+            active_commands: 0,
+            idle_since: Instant::now(),
+            draining: false,
+            stopping: false,
+            outcome: None,
+        });
+        let updates = state.clone();
+        let supervisor = tokio::spawn(async move {
+            // In particular, do not unlink a control socket while its master
+            // is still alive following cancellation of the caller.
+            let _control_dir = control_dir;
+            let outcome = loop {
+                let current = changes.borrow_and_update().clone();
+                if current.stopping {
+                    if let Err(error) = child.start_kill() {
+                        debug!("Failed to signal owned SSH child: {error}");
+                    }
+                    break child.wait().await;
+                }
+                let idle_deadline = idle_timeout
+                    .filter(|_| current.active_commands == 0)
+                    .and_then(|idle| current.idle_since.checked_add(idle));
+                tokio::select! {
+                    outcome = child.wait() => break outcome,
+                    _ = changes.changed() => {},
+                    _ = async {
+                        if let Some(deadline) = idle_deadline {
+                            tokio::time::sleep_until(deadline).await;
+                        } else {
+                            std::future::pending::<()>().await;
+                        }
+                    } => {
+                        // Serialize expiry with command admission: a command
+                        // starting as the timer fires either owns a use guard
+                        // or observes a closing session before it is spawned.
+                        updates.send_if_modified(|state| {
+                            if !state.stopping && state.active_commands == 0
+                                && idle_timeout.is_some_and(|idle| {
+                                    state.idle_since.elapsed() >= idle
+                                })
+                            {
+                                state.stopping = true;
+                                true
+                            } else {
+                                false
+                            }
+                        });
+                    }
+                }
+            };
+            updates.send_modify(|state| {
+                state.stopping = true;
+                state.outcome = Some(outcome.map_err(|error| error.to_string()));
+            });
+        });
+        Ok(Self { state, supervisor })
+    }
+
+    fn is_running(&self) -> bool {
+        let state = self.state.borrow();
+        !state.draining
+            && !state.stopping
+            && state.outcome.is_none()
+            && !self.supervisor.is_finished()
+    }
+
+    fn begin_use(&self) -> Result<SshProcessUse> {
+        let mut admitted = false;
+        self.state.send_if_modified(|state| {
+            if !state.draining
+                && !state.stopping
+                && state.outcome.is_none()
+                && let Some(active) = state.active_commands.checked_add(1)
+            {
+                state.active_commands = active;
+                admitted = true;
+            }
+            admitted
+        });
+        anyhow::ensure!(admitted, "SSH connection is closing or disconnected");
+        Ok(SshProcessUse {
+            state: self.state.clone(),
+            completed: false,
+        })
+    }
+
+    fn request_stop(&self) {
+        self.state.send_modify(|state| state.stopping = true);
+    }
+
+    async fn wait_until(&self, deadline: Instant) -> Result<ExitStatus> {
+        let mut changes = self.state.subscribe();
+        loop {
+            if let Some(outcome) = changes.borrow_and_update().outcome.clone() {
+                return outcome.map_err(anyhow::Error::msg);
+            }
+            tokio::time::timeout_at(deadline, changes.changed())
+                .await
+                .context(
+                    "SSH connection timed out during authentication or control socket readiness",
+                )?
+                .context("SSH child supervisor stopped unexpectedly")?;
+        }
+    }
+
+    async fn stop_before(&mut self, deadline: Instant) -> Result<()> {
+        self.request_stop();
+        tokio::time::timeout_at(deadline, &mut self.supervisor)
+            .await
+            .context("Timed out reaping owned SSH child")?
+            .context("SSH child supervisor failed")
+    }
+}
+
+impl Drop for OwnedSshProcess {
+    fn drop(&mut self) {
+        // Do not abort the supervisor: it must wait/reap after signalling the
+        // child, even when our caller was itself cancelled at its deadline.
+        self.request_stop();
+    }
+}
+
+struct SshProcessUse {
+    state: watch::Sender<SshProcessState>,
+    completed: bool,
+}
+
+impl SshProcessUse {
+    fn complete(mut self) {
+        self.completed = true;
+    }
+}
+
+impl Drop for SshProcessUse {
+    fn drop(&mut self) {
+        self.state.send_modify(|state| {
+            // A cancelled/failed command may leave remote work attached to
+            // the mux. Retire the transport after its already-running users
+            // finish, without disconnecting those unrelated commands.
+            state.draining |= !self.completed;
+            state.active_commands = state.active_commands.saturating_sub(1);
+            if state.active_commands == 0 {
+                state.idle_since = Instant::now();
+                state.stopping |= state.draining;
+            }
+        });
+    }
+}
+
+struct OwnedSshSession {
+    // Session::resume does not run openssh's unbounded synchronous `ssh -O
+    // exit` in Drop. Our foreground process supervisor performs that cleanup.
+    session: Session,
+    process: OwnedSshProcess,
+    _control_dir: Arc<tempfile::TempDir>,
+}
+
 fn is_expected_health_check_output(stdout: &str) -> bool {
     stdout
         .trim()
@@ -55,7 +243,8 @@ fn is_health_check_sentinel(line: &str) -> bool {
 /// SSH connection options.
 #[derive(Debug, Clone)]
 pub struct SshOptions {
-    /// Connection timeout.
+    /// Wall-clock deadline for connection setup, including authentication and
+    /// ControlMaster readiness. A mux fallback shares the same deadline.
     pub connect_timeout: Duration,
     /// Command execution timeout.
     pub command_timeout: Duration,
@@ -66,11 +255,11 @@ pub struct SshOptions {
     /// How long the SSH ControlMaster should remain alive while idle.
     ///
     /// Only applies when `control_master` is true (connection reuse). `Some(n)`
-    /// with n > 0 keeps the master warm for n idle seconds (`ControlPersist=Ns`).
-    /// `Some(0s)`/`None`, or ANY non-mux per-call session, closes the master
-    /// after the initial connection (`ControlPersist=no`). The OpenSSH crate
-    /// `ControlPersist=yes` (forever) default is never used — it leaked a
-    /// master process per per-call SSH. See `control_persist_mode`.
+    /// with n > 0 keeps the master warm for n idle seconds. Active commands
+    /// prevent expiry. `Some(0s)`/`None`, or a non-mux per-call session, keeps
+    /// the master only for this client's lifetime. RCH owns this idle timer:
+    /// OpenSSH's `ControlPersist` forks an unowned process even without `-f`,
+    /// so the SSH child always uses `ControlPersist=no`.
     pub control_persist_idle: Option<Duration>,
     /// SSH control master mode for connection reuse.
     pub control_master: bool,
@@ -148,7 +337,7 @@ pub struct SshClient {
     /// SSH options.
     options: SshOptions,
     /// Active SSH session (if connected).
-    session: Option<Session>,
+    session: Option<OwnedSshSession>,
 }
 
 impl SshClient {
@@ -168,45 +357,69 @@ impl SshClient {
 
     /// Check if connected to the worker.
     pub fn is_connected(&self) -> bool {
-        self.session.is_some()
+        self.session
+            .as_ref()
+            .is_some_and(|session| session.process.is_running())
     }
 
+    #[cfg(test)]
     fn is_configured_for(&self, config: &WorkerConfig) -> bool {
-        self.config.id == config.id
-            && self.config.host == config.host
-            && self.config.user == config.user
-            && self.config.identity_file == config.identity_file
-            && declared_os(&self.config.tags) == declared_os(&config.tags)
+        same_ssh_endpoint(&self.config, config)
     }
 
     /// Connect to the remote worker.
     pub async fn connect(&mut self) -> Result<()> {
-        if self.session.is_some() {
+        self.connect_using(Path::new("ssh"), None).await
+    }
+
+    async fn connect_using(
+        &mut self,
+        ssh_program: &Path,
+        control_directory: Option<&Path>,
+    ) -> Result<()> {
+        if self.is_connected() {
             debug!("Already connected to {}", self.config.id);
             return Ok(());
         }
+        // A master that exited or expired is no longer a usable session.
+        self.session.take();
+        let deadline = Instant::now()
+            .checked_add(self.options.connect_timeout)
+            .context("SSH connect_timeout exceeds the supported clock range")?;
 
         let destination = format!("{}@{}", self.config.user, self.config.host);
         debug!("Connecting to {} via SSH...", destination);
 
         let session = match self
-            .connect_with_mode(&destination, self.options.control_master)
+            .connect_with_mode(
+                &destination,
+                self.options.control_master,
+                ssh_program,
+                control_directory,
+                deadline,
+            )
             .await
         {
             Ok(session) => session,
-            Err(primary_error) if self.options.control_master => {
+            Err(primary_error) if self.options.control_master && Instant::now() < deadline => {
                 warn!(
                     "SSH ControlMaster connection to {} failed ({}). Retrying without ControlMaster.",
                     destination, primary_error
                 );
-                self.connect_with_mode(&destination, false)
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "Failed to connect to {} after retrying without ControlMaster",
-                            destination
-                        )
-                    })?
+                self.connect_with_mode(
+                    &destination,
+                    false,
+                    ssh_program,
+                    control_directory,
+                    deadline,
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "Failed to connect to {} after retrying without ControlMaster",
+                        destination
+                    )
+                })?
             }
             Err(primary_error) => {
                 return Err(primary_error)
@@ -221,120 +434,146 @@ impl SshClient {
         Ok(())
     }
 
-    async fn connect_with_mode(&self, destination: &str, control_master: bool) -> Result<Session> {
-        let mut builder = SessionBuilder::default();
-        self.configure_builder(&mut builder, control_master);
-
-        builder.connect(destination).await.with_context(|| {
-            if control_master {
-                format!(
-                    "Failed to connect to {} with ControlMaster enabled",
-                    destination
-                )
-            } else {
-                format!(
-                    "Failed to connect to {} with ControlMaster disabled",
-                    destination
-                )
-            }
+    async fn connect_with_mode(
+        &self,
+        destination: &str,
+        control_master: bool,
+        ssh_program: &Path,
+        control_directory: Option<&Path>,
+        deadline: Instant,
+    ) -> Result<OwnedSshSession> {
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "SSH connection timed out before spawn"
+        );
+        let directory = control_directory
+            .map(Path::to_path_buf)
+            .unwrap_or_else(ssh_control_directory);
+        std::fs::create_dir_all(&directory)
+            .with_context(|| format!("Failed to create SSH control directory {directory:?}"))?;
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
+                .context("Failed to protect SSH control directory")?;
+        }
+        let control_dir = Arc::new(
+            tempfile::Builder::new()
+                .prefix("rch-")
+                .tempdir_in(directory)
+                .context("Failed to create private SSH control directory")?,
+        );
+        let socket = control_dir.path().join("master");
+        let log = control_dir.path().join("log");
+        let idle_timeout =
+            match control_persist_mode(control_master, self.options.control_persist_idle) {
+                ControlPersistMode::IdleFor(seconds) => {
+                    Some(Duration::from_secs(seconds.get() as u64))
+                }
+                ControlPersistMode::TooLarge(seconds) => {
+                    warn!("control_persist_idle too large ({seconds}s); closing with client");
+                    None
+                }
+                ControlPersistMode::Closed => None,
+            };
+        if let Some(idle) = idle_timeout {
+            anyhow::ensure!(
+                Instant::now().checked_add(idle).is_some(),
+                "SSH idle timeout exceeds the supported clock range"
+            );
+        }
+        // -F /dev/null probes the client itself without running user Match
+        // directives. Older clients do not understand ForkAfterAuthentication;
+        // a global IgnoreUnknown override would break the user's own list.
+        let can_disable_background =
+            ssh_can_disable_background(ssh_program, control_dir.clone(), deadline).await?;
+        let mut command = self.master_command(
+            ssh_program,
+            destination,
+            &socket,
+            &log,
+            can_disable_background,
+        );
+        let mut process =
+            OwnedSshProcess::spawn(&mut command, Some(control_dir.clone()), idle_timeout)
+                .with_context(|| format!("Failed to spawn SSH connection to {destination}"))?;
+        // Authentication is activity too; a short idle policy must not cut it
+        // off before the connection deadline.
+        let connecting = process.begin_use()?;
+        let ready = wait_for_ssh_master(&process, ssh_program, &socket, &log, deadline).await;
+        if let Err(error) = ready {
+            // Cleanup consumes only the remaining connection budget. If the
+            // caller's deadline already fired, the supervisor still owns and
+            // reaps the child after this future returns or is cancelled.
+            let _ = process.stop_before(deadline).await;
+            return Err(error).with_context(|| format!("Failed to connect to {destination}"));
+        }
+        connecting.complete();
+        Ok(OwnedSshSession {
+            session: Session::resume(socket.into_boxed_path(), Some(log.into_boxed_path())),
+            process,
+            _control_dir: control_dir,
         })
     }
 
-    fn configure_builder(&self, builder: &mut SessionBuilder, control_master: bool) {
-        let known_hosts = match self.options.known_hosts {
-            KnownHostsPolicy::Strict => KnownHosts::Strict,
-            KnownHostsPolicy::Add => KnownHosts::Add,
-            KnownHostsPolicy::AcceptAll => KnownHosts::Accept,
-        };
-
-        builder
-            .known_hosts_check(known_hosts)
-            .connect_timeout(self.options.connect_timeout);
-
+    fn master_command(
+        &self,
+        ssh_program: &Path,
+        destination: &str,
+        socket: &Path,
+        log: &Path,
+        can_disable_background: bool,
+    ) -> tokio::process::Command {
+        let mut command = tokio::process::Command::new(ssh_program);
+        command
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .arg("-E")
+            .arg(log)
+            .arg("-S")
+            .arg(socket)
+            .args(["-M", "-N", "-T", "-o", "BatchMode=yes"])
+            // ControlPersist forks after authentication even without `-f`.
+            // Keep the master in this owned foreground child instead.
+            .args(["-o", "ControlPersist=no"])
+            .arg("-o")
+            .arg(match self.options.known_hosts {
+                KnownHostsPolicy::Strict => "StrictHostKeyChecking=yes",
+                KnownHostsPolicy::Add => "StrictHostKeyChecking=accept-new",
+                KnownHostsPolicy::AcceptAll => "StrictHostKeyChecking=no",
+            })
+            .arg("-o")
+            .arg(format!(
+                "ConnectTimeout={}",
+                self.options.connect_timeout.as_secs()
+            ));
+        if can_disable_background {
+            command.args(["-o", "ForkAfterAuthentication=no"]);
+        }
         if let Some(interval) = self.options.server_alive_interval {
-            builder.server_alive_interval(interval);
+            command
+                .arg("-o")
+                .arg(format!("ServerAliveInterval={}", interval.as_secs()));
         }
-
-        // Add identity file if specified
-        let identity_path = shellexpand::tilde(&self.config.identity_file);
-        if Path::new(identity_path.as_ref()).exists() {
-            builder.keyfile(identity_path.as_ref());
+        let identity = shellexpand::tilde(&self.config.identity_file);
+        if Path::new(identity.as_ref()).exists() {
+            command
+                .arg("-i")
+                .arg(identity.as_ref())
+                .args(["-o", "IdentitiesOnly=yes"]);
         }
-
-        // Always pin ControlPersist explicitly. The openssh crate ALWAYS
-        // spawns a control-master; leaving it unset defaults to
-        // `ControlPersist=yes` (Forever), which leaks a master process for
-        // every short-lived per-call SSH (telemetry/health/capabilities run
-        // with control_master=false). ClosedAfterInitialConnection lets
-        // non-mux masters self-terminate; only the explicit mux-reuse path
-        // with a configured idle keeps a warm master.
-        match control_persist_mode(control_master, self.options.control_persist_idle) {
-            ControlPersistMode::IdleFor(nonzero) => {
-                builder.control_persist(ControlPersist::IdleFor(nonzero));
-            }
-            ControlPersistMode::TooLarge(secs) => {
-                warn!("control_persist_idle too large ({secs}s); closing after initial connection");
-                builder.control_persist(ControlPersist::ClosedAfterInitialConnection);
-            }
-            ControlPersistMode::Closed => {
-                builder.control_persist(ControlPersist::ClosedAfterInitialConnection);
-            }
-        }
-
-        // Control-master socket directory only matters when reusing connections.
-        if control_master {
-            // Use a short control directory path to stay within the Unix domain
-            // socket path limit (104 bytes on macOS, 108 on Linux).  The openssh
-            // crate appends a `%C` hash (~32 chars) to form the socket filename,
-            // so the directory path itself must be short.
-            //
-            // On macOS `std::env::temp_dir()` returns a long path under
-            // /var/folders/…/T/ which, combined with the hash, exceeds 104 bytes.
-            // We therefore prefer `~/.ssh/rch` (short, stable, correct perms).
-            let control_dir = {
-                let home_ssh = dirs::home_dir().map(|h| h.join(".ssh").join("rch"));
-
-                if let Some(ref dir) = home_ssh {
-                    dir.clone()
-                } else if let Some(runtime_dir) = dirs::runtime_dir() {
-                    runtime_dir.join("rch-ssh")
-                } else {
-                    let username = whoami::username().unwrap_or_else(|_| "unknown".to_string());
-                    std::env::temp_dir().join(format!("rch-ssh-{}", username))
-                }
-            };
-
-            if let Err(e) = std::fs::create_dir_all(&control_dir) {
-                warn!(
-                    "Failed to create SSH control directory {:?}: {}",
-                    control_dir, e
-                );
-            } else {
-                // Set restrictive permissions (0700) to prevent symlink attacks
-                // and unauthorized access to SSH control sockets
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    if let Err(e) = std::fs::set_permissions(
-                        &control_dir,
-                        std::fs::Permissions::from_mode(0o700),
-                    ) {
-                        warn!(
-                            "Failed to set permissions on SSH control directory {:?}: {}",
-                            control_dir, e
-                        );
-                    }
-                }
-            }
-            builder.control_directory(&control_dir);
-        }
+        command.arg(destination);
+        command
     }
 
     /// Disconnect from the worker.
     pub async fn disconnect(&mut self) -> Result<()> {
-        if let Some(session) = self.session.take() {
+        if let Some(mut session) = self.session.take() {
             debug!("Disconnecting from {}", self.config.id);
-            session.close().await?;
+            session
+                .process
+                .stop_before(Instant::now() + SSH_CLEANUP_TIMEOUT)
+                .await?;
             // debug, not info: paired with the connect log above; floods at info.
             debug!("Disconnected from {}", self.config.id);
         }
@@ -343,12 +582,8 @@ impl SshClient {
 
     /// Force a fresh connection, dropping any existing (possibly dead) session.
     ///
-    /// [`connect`](Self::connect) is a no-op when a `Session` object already
-    /// exists, so a pooled client whose underlying SSH ControlMaster has died
-    /// cannot recover through it. `reconnect` tears the stale session down first
-    /// (closing it best-effort — a dead master may itself error on close, but
-    /// [`disconnect`](Self::disconnect) `take()`s the session before closing so
-    /// it is gone regardless) and then establishes a new one.
+    /// `reconnect` tears the old master down even if its local process is
+    /// running but its transport no longer answers, then establishes a new one.
     pub async fn reconnect(&mut self) -> Result<()> {
         if let Err(e) = self.disconnect().await {
             debug!(
@@ -379,10 +614,9 @@ impl SshClient {
         // Windows fallback (bd-kzy2x): the openssh crate cannot execute
         // commands on Windows OpenSSH (the slave never completes the
         // command channel), so we dispatch through the system `ssh` binary
-        // for declared-OS Windows workers. The connect path above is
-        // untouched and still uses the openssh crate (it succeeds); only
-        // the execute step swaps. Linux / unlabelled workers keep the
-        // openssh-crate path verbatim.
+        // for declared-OS Windows workers. Connection setup still uses our
+        // supervised SSH master; Linux / unlabelled workers execute through
+        // the openssh session attached to that master.
         if prefers_system_ssh(&self.config) {
             return system_ssh_execute(
                 &self.config,
@@ -396,6 +630,7 @@ impl SshClient {
         }
 
         let session = self.session.as_ref().context("Not connected to worker")?;
+        let activity = session.process.begin_use()?;
 
         let start = std::time::Instant::now();
         debug!(
@@ -405,6 +640,7 @@ impl SshClient {
         );
 
         let mut child = session
+            .session
             .command("sh")
             .arg("-c")
             .arg(command)
@@ -480,6 +716,7 @@ impl SshClient {
                     duration.as_millis()
                 );
 
+                activity.complete();
                 Ok(CommandResult {
                     exit_code,
                     stdout,
@@ -488,12 +725,10 @@ impl SshClient {
                 })
             }
             Err(_) => {
-                // Timeout occurred. The inner future (which owns `child`) is dropped,
-                // but dropping an openssh RemoteChild does NOT kill the remote process
-                // if a ControlMaster is active. The remote process will only terminate
-                // when the caller disconnects the SshClient (closing the Session/
-                // ControlMaster). Callers should ensure disconnect() is called after
-                // a timeout to avoid leaked remote processes.
+                // openssh kills the local slave when its RemoteChild drops.
+                // The incomplete activity guard also retires the master once
+                // other active commands finish, so cancelled remote work is
+                // not left attached to an indefinitely warm connection.
                 warn!(
                     "Command timed out on {} after {:?}",
                     self.config.id, command_timeout
@@ -515,6 +750,7 @@ impl SshClient {
         G: FnMut(&str),
     {
         let session = self.session.as_ref().context("Not connected to worker")?;
+        let activity = session.process.begin_use()?;
 
         let start = std::time::Instant::now();
         debug!(
@@ -524,6 +760,7 @@ impl SshClient {
         );
 
         let mut child = session
+            .session
             .command("sh")
             .arg("-c")
             .arg(command)
@@ -628,6 +865,7 @@ impl SshClient {
                 let duration = start.elapsed();
                 let exit_code = status.code().unwrap_or(-1);
 
+                activity.complete();
                 Ok(CommandResult {
                     exit_code,
                     stdout: stdout_acc,
@@ -636,21 +874,13 @@ impl SshClient {
                 })
             }
             Err(_) => {
-                // Timeout occurred - the spawned reader tasks will terminate when they
-                // try to send on rx (which is dropped when this scope exits).
-                // The child process is also dropped here, but openssh may not kill
-                // the remote process immediately. Log the situation for visibility.
-                //
-                // Note: The reader tasks are detached (tokio::spawn) so they continue
-                // briefly until they hit EOF or the send fails. This is acceptable
-                // because they're lightweight and will terminate quickly once the
-                // channel closes.
+                // Dropping RemoteChild kills the local slave and closes its
+                // pipes, ending the reader tasks. The incomplete activity
+                // guard retires the master after other active commands finish.
                 warn!(
                     "Command (streaming) timed out on {} after {:?}, cleaning up",
                     self.config.id, self.options.command_timeout
                 );
-                // rx is dropped here, which will cause senders to fail on next send
-                // child is dropped here, which signals termination to openssh
                 anyhow::bail!("Command timed out after {:?}", self.options.command_timeout);
             }
         }
@@ -676,6 +906,114 @@ impl SshClient {
             }
         }
     }
+}
+
+fn ssh_control_directory() -> PathBuf {
+    // Keep socket names short on macOS, where temp_dir commonly lives under
+    // a long /var/folders path. Each connection gets a fresh private subdir.
+    if let Some(home) = dirs::home_dir() {
+        home.join(".ssh").join("rch")
+    } else if let Some(runtime) = dirs::runtime_dir() {
+        runtime.join("rch-ssh")
+    } else {
+        let username = whoami::username().unwrap_or_else(|_| "unknown".to_owned());
+        std::env::temp_dir().join(format!("rch-ssh-{username}"))
+    }
+}
+
+async fn ssh_can_disable_background(
+    ssh_program: &Path,
+    control_dir: Arc<tempfile::TempDir>,
+    deadline: Instant,
+) -> Result<bool> {
+    use std::io::Read;
+
+    anyhow::ensure!(
+        Instant::now() < deadline,
+        "SSH connection timed out before capability probe"
+    );
+    let configuration = control_dir.path().join("client-config");
+    let mut command = tokio::process::Command::new(ssh_program);
+    command
+        .args(["-G", "-F", "/dev/null", "-T", "none"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::fs::File::create(&configuration)?)
+        .stderr(std::process::Stdio::null());
+    let mut probe = OwnedSshProcess::spawn(&mut command, Some(control_dir.clone()), None)?;
+    let checked = probe.wait_until(deadline).await;
+    let _ = probe.stop_before(deadline).await;
+    anyhow::ensure!(checked?.success(), "SSH client capability probe failed");
+    let mut output = String::new();
+    std::fs::File::open(configuration)?
+        .take(65_537)
+        .read_to_string(&mut output)?;
+    anyhow::ensure!(
+        output.len() <= 65_536,
+        "SSH client capability response is too large"
+    );
+    anyhow::ensure!(
+        output.lines().any(|line| {
+            let mut words = line.split_whitespace();
+            words.next() == Some("hostname") && words.next() == Some("none")
+        }),
+        "SSH client returned an invalid capability response"
+    );
+    Ok(output.lines().any(|line| {
+        line.split_whitespace()
+            .next()
+            .is_some_and(|key| key.eq_ignore_ascii_case("forkafterauthentication"))
+    }))
+}
+
+async fn wait_for_ssh_master(
+    process: &OwnedSshProcess,
+    ssh_program: &Path,
+    socket: &Path,
+    log: &Path,
+    deadline: Instant,
+) -> Result<()> {
+    loop {
+        let outcome = process.state.borrow().outcome.clone();
+        if let Some(outcome) = outcome {
+            let status = outcome.map_err(anyhow::Error::msg)?;
+            let diagnostic = ssh_connect_diagnostic(log);
+            anyhow::bail!("SSH master exited before becoming ready ({status}): {diagnostic}");
+        }
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "SSH connection timed out during authentication or control socket readiness"
+        );
+        if socket.exists() {
+            // Socket existence alone does not prove the mux accepts commands.
+            // This probe is also owned and shares the authentication deadline;
+            // openssh::Session::check itself does not kill its child on drop.
+            let mut command = tokio::process::Command::new(ssh_program);
+            command
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .arg("-S")
+                .arg(socket)
+                .args(["-o", "BatchMode=yes", "-O", "check", "none"]);
+            let mut probe = OwnedSshProcess::spawn(&mut command, None, None)?;
+            let checked = probe.wait_until(deadline).await;
+            let _ = probe.stop_before(deadline).await;
+            if checked?.success() && process.is_running() {
+                return Ok(());
+            }
+        }
+        tokio::time::sleep_until(deadline.min(Instant::now() + SSH_READY_POLL_INTERVAL)).await;
+    }
+}
+
+fn ssh_connect_diagnostic(log: &Path) -> String {
+    use std::io::Read;
+
+    let mut diagnostic = Vec::new();
+    if let Ok(file) = std::fs::File::open(log) {
+        let _ = file.take(16 * 1024).read_to_end(&mut diagnostic);
+    }
+    String::from_utf8_lossy(&diagnostic).trim().to_owned()
 }
 
 /// Derive the per-worker [`SshOptions`] a pool hands to each pooled
@@ -717,9 +1055,9 @@ fn pooled_client_options(pool_options: &SshOptions, config: &WorkerConfig) -> Ss
 // declare `os = "windows"` we therefore spawn the system `ssh` binary at
 // command-execution time, mirroring the proven system-ssh pattern already
 // used by the fleet preflight path (`rch/src/fleet/ssh.rs::SshExecutor`) and
-// the CLI worker init / probe paths. The connect path stays the openssh
-// crate (it succeeds) — the fallback is purely an execute-time dispatch
-// inside `SshClient::execute_with_timeout`.
+// the CLI worker init / probe paths. Connection setup uses the supervised
+// master above; the fallback is an execute-time dispatch inside
+// `SshClient::execute_with_timeout`.
 //
 // Policy key (kept in lockstep with the existing pool-layer override
 // `pooled_client_options`): `declared_os(&config.tags) == Some("windows")`.
@@ -766,6 +1104,8 @@ pub fn remote_shell_command(config: &WorkerConfig, command: &str) -> RemoteShell
     }
 }
 
+pub use crate::ssh_utils::identities_only_args;
+
 /// Build the argv for the system-ssh fallback, mirroring the proven CLI
 /// system-ssh pattern (see `rch/src/fleet/ssh.rs::SshExecutor::build_ssh_args`
 /// and `rch/src/commands/workers_init.rs`). Pure / testable: no process is
@@ -797,10 +1137,13 @@ pub(crate) fn system_ssh_argv(
     let identity_path = shellexpand::tilde(&config.identity_file);
     let destination = format!("{}@{}", config.user, config.host);
 
-    let mut argv: Vec<OsString> = Vec::with_capacity(10);
+    let mut argv: Vec<OsString> = Vec::with_capacity(12);
     argv.push(OsString::from("ssh"));
     argv.push(OsString::from("-i"));
     argv.push(OsString::from(identity_path.as_ref()));
+    if let Some(opts) = identities_only_args(&config.identity_file) {
+        argv.extend(opts.map(OsString::from));
+    }
     argv.push(OsString::from("-o"));
     argv.push(OsString::from("BatchMode=yes"));
     argv.push(OsString::from("-o"));
@@ -970,10 +1313,27 @@ pub(crate) async fn system_ssh_execute(
     }
 }
 
+fn same_ssh_endpoint(left: &WorkerConfig, right: &WorkerConfig) -> bool {
+    left.id == right.id
+        && left.host == right.host
+        && left.user == right.user
+        && left.identity_file == right.identity_file
+        && declared_os(&left.tags) == declared_os(&right.tags)
+}
+
+#[derive(Clone)]
+struct PooledSshClient {
+    // Endpoint identity is immutable and does not require the client's lock.
+    // An old caller can hold that lock across authentication while a new
+    // endpoint is admitted independently into the pool.
+    config: WorkerConfig,
+    client: Arc<RwLock<SshClient>>,
+}
+
 /// Connection pool for managing multiple SSH connections.
 pub struct SshPool {
     /// Pool of active connections.
-    connections: Arc<RwLock<HashMap<WorkerId, Arc<RwLock<SshClient>>>>>,
+    connections: Arc<RwLock<HashMap<WorkerId, PooledSshClient>>>,
     /// Default SSH options.
     options: SshOptions,
 }
@@ -989,15 +1349,10 @@ impl SshPool {
 
     /// Get or create a connection to a worker.
     ///
-    /// Validates liveness on borrow: a pooled `SshClient` reports
-    /// [`is_connected`](SshClient::is_connected) purely from the presence of a
-    /// `Session` object, which cannot detect that the underlying SSH
-    /// ControlMaster has died (idle `ControlPersist` expiry, a network blip, or
-    /// the remote `sshd` being restarted). Returning such a client hands the
-    /// caller a dead master, and its next `execute()` fails with
-    /// broken-pipe/connection-closed and no chance to recover. So before reusing
-    /// a connected client this probes it with a lightweight health check, and on
-    /// failure reconnects once under the per-worker write lock.
+    /// Validates transport liveness on borrow. The client detects exited or
+    /// expired local masters, but a running master can still have a broken or
+    /// stalled remote transport. Probe before reuse and reconnect once under
+    /// the per-worker write lock if the transport no longer answers.
     pub async fn get_or_connect(&self, config: &WorkerConfig) -> Result<Arc<RwLock<SshClient>>> {
         self.get_or_connect_probing_within(config, POOL_LIVENESS_PROBE_TIMEOUT)
             .await
@@ -1063,18 +1418,14 @@ impl SshPool {
         let worker_id = config.id.clone();
 
         loop {
-            let existing_client = {
+            let existing_entry = {
                 let connections = self.connections.read().await;
                 connections.get(&worker_id).cloned()
             };
 
-            if let Some(client) = existing_client {
-                let is_configured_for_worker = {
-                    let guard = client.read().await;
-                    guard.is_configured_for(config)
-                };
-                if is_configured_for_worker {
-                    return client;
+            if let Some(entry) = existing_entry {
+                if same_ssh_endpoint(&entry.config, config) {
+                    return entry.client;
                 }
 
                 let replacement = Arc::new(RwLock::new(SshClient::new(
@@ -1085,9 +1436,15 @@ impl SshPool {
                     let mut connections = self.connections.write().await;
                     if connections
                         .get(&worker_id)
-                        .is_some_and(|current| Arc::ptr_eq(current, &client))
+                        .is_some_and(|current| Arc::ptr_eq(&current.client, &entry.client))
                     {
-                        connections.insert(worker_id.clone(), replacement.clone());
+                        connections.insert(
+                            worker_id.clone(),
+                            PooledSshClient {
+                                config: config.clone(),
+                                client: replacement.clone(),
+                            },
+                        );
                         true
                     } else {
                         false
@@ -1114,7 +1471,13 @@ impl SshPool {
                 if connections.contains_key(&worker_id) {
                     false
                 } else {
-                    connections.insert(worker_id.clone(), new_client.clone());
+                    connections.insert(
+                        worker_id.clone(),
+                        PooledSshClient {
+                            config: config.clone(),
+                            client: new_client.clone(),
+                        },
+                    );
                     true
                 }
             };
@@ -1129,7 +1492,7 @@ impl SshPool {
     pub async fn close(&self, worker_id: &WorkerId) -> Result<()> {
         let client = {
             let mut connections = self.connections.write().await;
-            connections.remove(worker_id)
+            connections.remove(worker_id).map(|entry| entry.client)
         };
 
         if let Some(client) = client {
@@ -1144,7 +1507,7 @@ impl SshPool {
     pub async fn close_all(&self) -> Result<()> {
         let clients: Vec<_> = {
             let mut connections = self.connections.write().await;
-            connections.drain().map(|(_, v)| v).collect()
+            connections.drain().map(|(_, entry)| entry.client).collect()
         };
 
         for client in clients {
@@ -1538,6 +1901,33 @@ mod tests {
 
         let replacement_guard = replacement.read().await;
         assert!(replacement_guard.is_configured_for(&new_config));
+    }
+
+    #[tokio::test]
+    async fn test_ssh_pool_retarget_does_not_wait_for_old_authentication_lock() {
+        let _guard = test_guard!();
+        let pool = SshPool::default();
+        let old_config = worker_config("worker-a", "old-endpoint", "builder", "~/.ssh/id_rsa");
+        let new_config = worker_config("worker-a", "new-endpoint", "builder", "~/.ssh/id_rsa");
+        let old = pool.get_or_create_client_entry(&old_config).await;
+        let authenticating = old.write().await;
+        let unchanged = tokio::time::timeout(
+            Duration::from_millis(100),
+            pool.get_or_create_client_entry(&old_config),
+        )
+        .await
+        .expect("immutable identity lookup must not wait on authentication");
+        assert!(Arc::ptr_eq(&old, &unchanged));
+        let replacement = tokio::time::timeout(
+            Duration::from_millis(100),
+            pool.get_or_create_client_entry(&new_config),
+        )
+        .await
+        .expect("new endpoint must not wait on the old endpoint's authentication");
+        assert!(!Arc::ptr_eq(&old, &replacement));
+        assert_eq!(pool.active_connections().await, 1);
+        assert!(replacement.read().await.is_configured_for(&new_config));
+        drop(authenticating);
     }
 
     #[tokio::test]
@@ -2217,6 +2607,32 @@ mod tests {
     }
 
     #[test]
+    fn test_identities_only_only_when_identity_file_exists() {
+        // bd-ebszo: an existing `-i` key must be the ONLY key offered (no agent
+        // keys first); a missing key file keeps agent fallback working.
+        let _guard = test_guard!();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key = dir.path().join("worker_key");
+        std::fs::write(&key, b"not a real key").expect("write key");
+        let key = key.to_string_lossy().into_owned();
+        assert_eq!(
+            identities_only_args(&key),
+            Some(["-o", "IdentitiesOnly=yes"])
+        );
+        assert_eq!(identities_only_args("/nonexistent/rch/worker_key"), None);
+
+        let mut cfg = windows_worker("wsurf");
+        cfg.identity_file = key;
+        let command = remote_shell_command(&cfg, "true");
+        let argv = system_ssh_argv(&cfg, &command, Duration::ZERO);
+        assert!(argv.contains(&OsString::from("IdentitiesOnly=yes")));
+
+        cfg.identity_file = "/nonexistent/rch/worker_key".to_string();
+        let argv = system_ssh_argv(&cfg, &command, Duration::ZERO);
+        assert!(!argv.contains(&OsString::from("IdentitiesOnly=yes")));
+    }
+
+    #[test]
     fn test_dispatch_helper_matches_declared_os_key() {
         // The dispatch key MUST be the same one `pooled_client_options` uses
         // so the two Windows fallbacks (no ControlMaster on the pool side,
@@ -2229,21 +2645,471 @@ mod tests {
     }
 }
 
-/// How an SSH session's `ControlPersist` should be configured.
+#[cfg(test)]
+mod ssh_connection_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    struct FakeSsh {
+        directory: tempfile::TempDir,
+        program: PathBuf,
+    }
+
+    impl FakeSsh {
+        fn new(mode: &str) -> Self {
+            let directory = tempfile::tempdir().unwrap();
+            let program = directory.path().join("fake-ssh");
+            let script = format!(
+                r#"#!/bin/sh
+root={root}
+mode={mode}
+operation=
+socket=
+log=
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -G) operation=config; shift ;;
+        -F) shift 2 ;;
+        -S) socket=$2; shift 2 ;;
+        -E) log=$2; shift 2 ;;
+        -O) operation=$2; shift 2 ;;
+        *) shift ;;
+    esac
+done
+if [ "$operation" = config ]; then
+    printf '%s\n' "$$" >> "$root/capability-pids"
+    case "$mode" in
+        capability-stall) exec sleep 30 ;;
+        old-client) printf 'hostname none\n' ;;
+        *) printf 'hostname none\nforkafterauthentication no\n' ;;
+    esac
+    exit 0
+fi
+if [ "$operation" = check ]; then
+    printf '%s\n' "$$" >> "$root/check-pids"
+    case "$mode" in
+        probe-stall) exec sleep 30 ;;
+        probe-reject) exit 37 ;;
+        *) exit 0 ;;
+    esac
+fi
+printf '%s\n' "$$" >> "$root/master-pids"
+case "$mode" in
+    ready|old-client|probe-stall|probe-reject) : > "$socket" ;;
+    fail) printf 'Permission denied (publickey).\n' > "$log"; exit 255 ;;
+esac
+exec sleep 30
+"#,
+                root = shell_escape_value(&directory.path().to_string_lossy())
+                    .expect("fixture path must be shell-escapable"),
+                mode = shell_escape_value(mode).expect("fixture mode must be shell-escapable"),
+            );
+            std::fs::write(&program, script).unwrap();
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+            Self { directory, program }
+        }
+
+        fn client(&self, timeout: Duration, reuse: bool) -> SshClient {
+            SshClient::new(
+                WorkerConfig {
+                    host: "auth-stalled.invalid".to_owned(),
+                    identity_file: "/nonexistent/rch/test-key".to_owned(),
+                    ..WorkerConfig::default()
+                },
+                SshOptions {
+                    connect_timeout: timeout,
+                    control_master: reuse,
+                    ..SshOptions::default()
+                },
+            )
+        }
+
+        async fn connect(&self, client: &mut SshClient) -> Result<()> {
+            client
+                .connect_using(&self.program, Some(self.directory.path()))
+                .await
+        }
+
+        fn pids(&self, filename: &str) -> Vec<u32> {
+            std::fs::read_to_string(self.directory.path().join(filename))
+                .unwrap_or_default()
+                .lines()
+                .map(|line| line.parse().unwrap())
+                .collect()
+        }
+
+        async fn wait_for_pid(&self, filename: &str) {
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while self.pids(filename).is_empty() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("fake SSH process must start");
+        }
+
+        async fn assert_reaped(&self) {
+            let pids: Vec<_> = self
+                .pids("master-pids")
+                .into_iter()
+                .chain(self.pids("check-pids"))
+                .chain(self.pids("capability-pids"))
+                .collect();
+            assert!(!pids.is_empty(), "test must launch a real SSH stand-in");
+            tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    let any_alive = pids.iter().any(|pid| {
+                        // kill -0 also sees zombies, so this checks reaping,
+                        // not just sending a termination signal. sh supplies
+                        // the same builtin on Linux and macOS.
+                        std::process::Command::new("sh")
+                            .args(["-c", &format!("kill -0 {pid} 2>/dev/null")])
+                            .stdin(std::process::Stdio::null())
+                            .stdout(std::process::Stdio::null())
+                            .stderr(std::process::Stdio::null())
+                            .status()
+                            .unwrap()
+                            .success()
+                    });
+                    let control_dir_exists =
+                        std::fs::read_dir(self.directory.path())
+                            .unwrap()
+                            .any(|entry| {
+                                entry
+                                    .unwrap()
+                                    .file_name()
+                                    .to_string_lossy()
+                                    .starts_with("rch-")
+                            });
+                    if !any_alive && !control_dir_exists {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("owned SSH children must be killed, reaped, and release their sockets");
+        }
+    }
+
+    #[test]
+    fn foreground_master_keeps_host_identity_and_keepalive_policy() {
+        let fake = FakeSsh::new("ready");
+        let key = fake.directory.path().join("identity");
+        std::fs::write(&key, "test identity").unwrap();
+        for (policy, expected) in [
+            (KnownHostsPolicy::Strict, "StrictHostKeyChecking=yes"),
+            (KnownHostsPolicy::Add, "StrictHostKeyChecking=accept-new"),
+            (KnownHostsPolicy::AcceptAll, "StrictHostKeyChecking=no"),
+        ] {
+            let mut client = fake.client(Duration::from_secs(7), true);
+            client.config.identity_file = key.to_string_lossy().into_owned();
+            client.options.known_hosts = policy;
+            client.options.server_alive_interval = Some(Duration::from_secs(13));
+            client.options.control_persist_idle = Some(Duration::from_secs(60));
+            let command = client.master_command(
+                &fake.program,
+                "builder@worker",
+                Path::new("/private/control/master"),
+                Path::new("/private/control/log"),
+                true,
+            );
+            let args: Vec<_> = command
+                .as_std()
+                .get_args()
+                .map(|argument| argument.to_string_lossy().into_owned())
+                .collect();
+            for expected in [
+                expected,
+                "BatchMode=yes",
+                "ConnectTimeout=7",
+                "ServerAliveInterval=13",
+                "IdentitiesOnly=yes",
+                "ControlPersist=no",
+                "ForkAfterAuthentication=no",
+                "-M",
+                "-N",
+                "builder@worker",
+            ] {
+                assert!(args.iter().any(|argument| argument == expected), "{args:?}");
+            }
+            assert!(
+                args.iter()
+                    .any(|argument| argument == key.to_str().unwrap())
+            );
+            assert!(!args.iter().any(|argument| argument == "-f"));
+            assert!(
+                !args
+                    .iter()
+                    .any(|argument| argument.starts_with("IgnoreUnknown="))
+            );
+        }
+
+        let client = fake.client(Duration::from_secs(1), false);
+        let command = client.master_command(
+            &fake.program,
+            "builder@worker",
+            Path::new("/private/master"),
+            Path::new("/private/log"),
+            false,
+        );
+        assert!(
+            command
+                .as_std()
+                .get_args()
+                .all(|arg| arg != "IdentitiesOnly=yes")
+        );
+        assert!(
+            command
+                .as_std()
+                .get_args()
+                .all(|arg| arg != "ForkAfterAuthentication=no")
+        );
+    }
+
+    #[tokio::test]
+    async fn capability_probe_deadline_and_cancellation_reap_before_authentication() {
+        for cancelled in [false, true] {
+            let fake = FakeSsh::new("capability-stall");
+            let timeout = if cancelled {
+                Duration::from_secs(30)
+            } else {
+                Duration::from_millis(200)
+            };
+            let mut client = fake.client(timeout, true);
+            let program = fake.program.clone();
+            let directory = fake.directory.path().to_owned();
+            let connecting =
+                tokio::spawn(async move { client.connect_using(&program, Some(&directory)).await });
+            if cancelled {
+                fake.wait_for_pid("capability-pids").await;
+                connecting.abort();
+                assert!(connecting.await.unwrap_err().is_cancelled());
+            } else {
+                let error = connecting.await.unwrap().unwrap_err();
+                assert!(format!("{error:#}").contains("timed out"), "{error:#}");
+            }
+            assert!(fake.pids("master-pids").is_empty());
+            assert_eq!(fake.pids("capability-pids").len(), 1);
+            fake.assert_reaped().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn client_without_fork_option_remains_supported() {
+        let fake = FakeSsh::new("old-client");
+        let mut client = fake.client(Duration::from_secs(3), true);
+        fake.connect(&mut client).await.unwrap();
+        assert!(client.is_connected());
+        client.disconnect().await.unwrap();
+        fake.assert_reaped().await;
+    }
+
+    #[tokio::test]
+    async fn foreground_options_preserve_user_ignore_unknown_configuration() {
+        let directory = Arc::new(tempfile::tempdir().unwrap());
+        let config = directory.path().join("user-config");
+        std::fs::write(
+            &config,
+            "IgnoreUnknown RchFixtureExtension\nRchFixtureExtension yes\n",
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let capability = ssh_can_disable_background(Path::new("ssh"), directory.clone(), deadline)
+            .await
+            .unwrap();
+        let client = SshClient::new(WorkerConfig::default(), SshOptions::default());
+        let master = client.master_command(
+            Path::new("ssh"),
+            "none",
+            &directory.path().join("master"),
+            &directory.path().join("log"),
+            capability,
+        );
+        // -G inspects the real client's configuration without connecting. Use
+        // precisely the master's options, including its backgrounding policy.
+        let mut command = tokio::process::Command::new("ssh");
+        command
+            .args(["-G", "-F"])
+            .arg(config)
+            .args(master.as_std().get_args())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let process = OwnedSshProcess::spawn(&mut command, Some(directory), None).unwrap();
+        assert!(process.wait_until(deadline).await.unwrap().success());
+    }
+
+    #[tokio::test]
+    async fn authentication_deadline_kills_and_reaps_without_starting_fallback() {
+        let fake = FakeSsh::new("auth-stall");
+        let mut client = fake.client(Duration::from_millis(200), true);
+        let start = Instant::now();
+        let error = fake.connect(&mut client).await.unwrap_err();
+        assert!(format!("{error:#}").contains("timed out"), "{error:#}");
+        assert!(start.elapsed() < Duration::from_secs(2));
+        assert!(!client.is_connected());
+        assert_eq!(fake.pids("master-pids").len(), 1);
+        fake.assert_reaped().await;
+    }
+
+    #[tokio::test]
+    async fn cancelling_authentication_kills_and_reaps_child() {
+        let fake = FakeSsh::new("auth-stall");
+        let mut client = fake.client(Duration::from_secs(30), true);
+        let program = fake.program.clone();
+        let directory = fake.directory.path().to_owned();
+        let connecting =
+            tokio::spawn(async move { client.connect_using(&program, Some(&directory)).await });
+        fake.wait_for_pid("master-pids").await;
+        connecting.abort();
+        assert!(connecting.await.unwrap_err().is_cancelled());
+        fake.assert_reaped().await;
+    }
+
+    #[tokio::test]
+    async fn stalled_readiness_probe_shares_deadline_and_is_reaped() {
+        let fake = FakeSsh::new("probe-stall");
+        let mut client = fake.client(Duration::from_millis(200), true);
+        let error = fake.connect(&mut client).await.unwrap_err();
+        assert!(format!("{error:#}").contains("timed out"), "{error:#}");
+        assert_eq!(fake.pids("master-pids").len(), 1);
+        assert_eq!(fake.pids("check-pids").len(), 1);
+        fake.assert_reaped().await;
+    }
+
+    #[tokio::test]
+    async fn unsuccessful_readiness_probe_never_marks_client_connected() {
+        let fake = FakeSsh::new("probe-reject");
+        let mut client = fake.client(Duration::from_millis(200), false);
+        assert!(fake.connect(&mut client).await.is_err());
+        assert!(!client.is_connected());
+        assert!(!fake.pids("check-pids").is_empty());
+        fake.assert_reaped().await;
+    }
+
+    #[tokio::test]
+    async fn dropping_and_disconnecting_ready_client_reap_master() {
+        let fake = FakeSsh::new("ready");
+        let mut client = fake.client(Duration::from_secs(3), true);
+        fake.connect(&mut client).await.unwrap();
+        assert!(client.is_connected());
+        client.disconnect().await.unwrap();
+        assert!(!client.is_connected());
+        fake.assert_reaped().await;
+
+        fake.connect(&mut client).await.unwrap();
+        assert!(client.is_connected());
+        drop(client);
+        fake.assert_reaped().await;
+        assert_eq!(fake.pids("master-pids").len(), 2);
+    }
+
+    #[tokio::test]
+    async fn failed_primary_retries_and_preserves_authentication_diagnostic() {
+        let fake = FakeSsh::new("fail");
+        let mut client = fake.client(Duration::from_secs(3), true);
+        let error = fake.connect(&mut client).await.unwrap_err();
+        assert!(
+            format!("{error:#}").contains("Permission denied (publickey)."),
+            "{error:#}"
+        );
+        assert_eq!(fake.pids("master-pids").len(), 2);
+        fake.assert_reaped().await;
+    }
+
+    #[tokio::test]
+    async fn active_commands_prevent_idle_expiry_and_release_restarts_timer() {
+        let mut command = tokio::process::Command::new("sleep");
+        command.arg("30");
+        let process =
+            OwnedSshProcess::spawn(&mut command, None, Some(Duration::from_millis(100))).unwrap();
+        let first = process.begin_use().unwrap();
+        let second = process.begin_use().unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        first.complete();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            process.is_running(),
+            "the remaining command still owns the master"
+        );
+        second.complete();
+        assert!(
+            process.is_running(),
+            "expiry starts after the last command completes"
+        );
+        let status = process
+            .wait_until(Instant::now() + Duration::from_secs(3))
+            .await
+            .unwrap();
+        assert!(!status.success());
+        assert!(!process.is_running());
+        assert!(process.begin_use().is_err());
+    }
+
+    #[tokio::test]
+    async fn cancelled_command_retires_master_after_other_commands_finish() {
+        let mut command = tokio::process::Command::new("sleep");
+        command.arg("30");
+        let process = OwnedSshProcess::spawn(&mut command, None, None).unwrap();
+        let cancelled = process.begin_use().unwrap();
+        let running = process.begin_use().unwrap();
+        drop(cancelled);
+        assert!(
+            process.begin_use().is_err(),
+            "a draining master rejects new work"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            process.state.borrow().outcome.is_none(),
+            "cancellation must not kill another active command's master"
+        );
+        running.complete();
+        let status = process
+            .wait_until(Instant::now() + Duration::from_secs(3))
+            .await
+            .unwrap();
+        assert!(!status.success());
+    }
+
+    #[tokio::test]
+    async fn expired_pooled_connection_can_connect_again() {
+        let fake = FakeSsh::new("ready");
+        let mut client = fake.client(Duration::from_secs(3), true);
+        client.options.control_persist_idle = Some(Duration::from_secs(1));
+        fake.connect(&mut client).await.unwrap();
+        client
+            .session
+            .as_ref()
+            .unwrap()
+            .process
+            .wait_until(Instant::now() + Duration::from_secs(3))
+            .await
+            .unwrap();
+        assert!(!client.is_connected());
+        fake.connect(&mut client).await.unwrap();
+        assert!(client.is_connected());
+        client.disconnect().await.unwrap();
+        fake.assert_reaped().await;
+        assert_eq!(fake.pids("master-pids").len(), 2);
+    }
+}
+
+/// The client-owned lifetime policy for an SSH control master.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ControlPersistMode {
-    /// Close the control-master once the initial connection ends (ControlPersist=no).
+    /// Close the control master when its client is dropped or disconnected.
     Closed,
-    /// Keep a warm control-master for the given idle seconds (ControlPersist=Ns).
+    /// Keep a warm control master for the given idle seconds between commands.
     IdleFor(NonZeroUsize),
     /// Requested idle exceeded usize; caller falls back to Closed.
     TooLarge(u64),
 }
 
-/// Decide `ControlPersist` for an SSH session. A warm master is kept ONLY for the
+/// Decide idle expiry for an SSH session. A warm master is kept ONLY for the
 /// explicit connection-reuse path (`control_master` + a configured non-zero idle);
-/// every other case closes after the initial connection so per-call SSH sessions
-/// (telemetry/health/capabilities) cannot leak `ControlPersist=yes` masters.
+/// every other case closes with its owning client. OpenSSH persistence is always
+/// disabled so cancellation can kill and reap the actual master process.
 fn control_persist_mode(control_master: bool, idle: Option<Duration>) -> ControlPersistMode {
     match idle {
         Some(idle) if control_master && !idle.is_zero() => match usize::try_from(idle.as_secs()) {

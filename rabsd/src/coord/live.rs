@@ -212,6 +212,9 @@ pub enum ReplayRefusal {
         /// Number of adverse observations retained for this action.
         observations: u64,
     },
+    /// The latest independently verified result has exhausted its replay
+    /// allowance, or no durable live comparison has established one yet.
+    FreshVerificationRequired,
     /// The existing class/evidence/sampling policy requires private execution.
     Sampling(PrivateExecutionReason),
 }
@@ -257,6 +260,11 @@ pub enum ServeOutcome {
         /// Why the running build is unproven.
         standing: ReleaseAuthorization,
     },
+    /// Preview only: every gate passed and the complete output plan
+    /// (including subscriber dep-info derivation in private scratch) was
+    /// prepared. Nothing was reserved or installed; a later install request
+    /// re-evaluates every gate under one store lock.
+    Servable,
     /// The committed result does not produce the output set the caller
     /// said its work would produce. NOT a hit: materializing it would
     /// leave the caller's build missing files it was promised, or
@@ -267,6 +275,15 @@ pub enum ServeOutcome {
         /// Present in the commit, not expected by the caller.
         unexpected: Vec<String>,
     },
+}
+
+/// Whether a serve request installs or only evaluates every gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServeMode {
+    /// Reserve destinations and install verified outputs.
+    Install,
+    /// Evaluate gates and prepare the complete plan; write no target file.
+    Preview,
 }
 
 /// What the caller says the work it is about to skip would produce.
@@ -394,8 +411,14 @@ const LIVE_PRIVATE_CLASS: &str = "private-only";
 // This is an additional floor, not a replacement for the stored serving policy.
 // In particular it never promotes a quarantined/evidence-pending record, renews
 // its TTL, or changes a trust-policy version. Every edge-delivered artifact
-// passes this floor; the Cargo wrapper itself remains in shadow mode.
+// passes this floor, including the opt-in live dependency lane.
 const LIVE_SAMPLING_POLICY: SamplingPolicy = SamplingPolicy::sample_all(2, 10_000);
+const LIVE_VERIFICATION_RECEIPT: &str = "rabs-live-verification-v1";
+const LIVE_INSTALL_RECEIPT: &str = "rabs-live-replay-install-v1";
+
+/// Maximum cache installations admitted after one new independent comparison.
+/// This fixed bound supplies ongoing verification; it is not an SPRT ratchet.
+pub const LIVE_REPLAY_INSTALL_LIMIT: u64 = 16;
 
 fn record_descriptor_class(
     store: &mut dyn RabsMetadataStore,
@@ -516,7 +539,96 @@ fn record_live_verification(
         .max()
         .map_or(Some(0), |seq| seq.checked_add(1))
         .ok_or_else(|| StoreError::Backend("verification sequence exhausted".to_owned()))?;
-    store.record_verification_sample(action, attempt, passed, seq)
+    store.record_verification_sample(action, attempt, passed, seq)?;
+    if passed {
+        // Only this admission path can renew replay authority. Raw samples,
+        // retransmissions, the original winner, and failed attempts cannot.
+        // If this second durable write fails, the old allowance remains in
+        // force; another independent comparison is needed to renew it.
+        store.record_decision_receipt(
+            LIVE_VERIFICATION_RECEIPT,
+            &digest_key(action),
+            seq,
+            &format!("{attempt:032x}"),
+            &digest_key(&offer.manifest_id.0),
+        )?;
+    }
+    Ok(())
+}
+
+struct ReplayInstallPermit {
+    subject: String,
+    seq: u64,
+}
+
+/// Inspect the durable allowance without spending it. Both preview and install
+/// read it afresh under the CAS lock; only an actual installation appends a
+/// receipt, before any output writes. The comparison and spent permits survive
+/// coordinator restarts and cannot be reset by replaying an old offer.
+fn live_replay_permit(
+    store: &mut dyn RabsMetadataStore,
+    action: &TypedDigest,
+    manifest_key: &str,
+) -> Result<Option<ReplayInstallPermit>, StoreError> {
+    let action_key = digest_key(action);
+    let rows = store.query(
+        "SELECT seq, decision, reason FROM decision_receipts \
+         WHERE kind = ?1 AND subject = ?2 ORDER BY seq DESC LIMIT 1",
+        &[
+            SqlValue::Text(LIVE_VERIFICATION_RECEIPT.to_owned()),
+            SqlValue::Text(action_key.clone()),
+        ],
+    )?;
+    let Some(row) = rows.first() else {
+        return Ok(None);
+    };
+    let [
+        SqlValue::Int(seq),
+        SqlValue::Text(attempt),
+        SqlValue::Text(manifest),
+    ] = row.as_slice()
+    else {
+        return Err(StoreError::Corruption(
+            "live verification receipt shape".into(),
+        ));
+    };
+    let seq = u64::try_from(*seq)
+        .map_err(|_| StoreError::Corruption("live verification sequence".into()))?;
+    if manifest != manifest_key
+        || attempt.len() != 32
+        || !attempt.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || !store
+            .list_verification_samples(action)?
+            .iter()
+            .any(|sample| sample.passed && sample.seq == seq && sample.attempt_hex == *attempt)
+    {
+        return Err(StoreError::Corruption(
+            "unbound live verification receipt".into(),
+        ));
+    }
+    let subject = format!("{action_key}:{seq}");
+    let installed = store.query(
+        "SELECT seq, decision, reason FROM decision_receipts \
+         WHERE kind = ?1 AND subject = ?2 ORDER BY seq",
+        &[
+            SqlValue::Text(LIVE_INSTALL_RECEIPT.to_owned()),
+            SqlValue::Text(subject.clone()),
+        ],
+    )?;
+    for (index, row) in installed.iter().enumerate() {
+        let expected_seq = i64::try_from(index)
+            .map_err(|_| StoreError::Corruption("live replay sequence exhausted".into()))?;
+        if !matches!(
+            row.as_slice(),
+            [SqlValue::Int(seq), SqlValue::Text(decision), SqlValue::Text(reason)]
+                if *seq == expected_seq && decision == "install" && reason == manifest_key
+        ) {
+            return Err(StoreError::Corruption("invalid live replay receipt".into()));
+        }
+    }
+    let used = u64::try_from(installed.len())
+        .map_err(|_| StoreError::Corruption("live replay count exhausted".into()))?;
+    Ok((used < LIVE_REPLAY_INSTALL_LIMIT).then_some(ReplayInstallPermit { subject, seq: used }))
 }
 
 /// Final live replay admission, called with the SAME store lock subsequently
@@ -826,29 +938,12 @@ impl ActionDispatch<'_> {
         &self,
         to: rabs_action::state_machines::AttemptState,
     ) -> Result<(), SubmissionRefusal> {
-        use crate::coord::action_actor::AdvanceAttemptReceipt;
         let authority = self
             .authority
             .as_ref()
             .ok_or(SubmissionRefusal::StaleDispatch)?;
-        let mut submissions = self
-            .coord
-            .submissions
-            .lock()
-            .map_err(|_| SubmissionRefusal::Unavailable)?;
-        let entry = submissions
-            .entries
-            .get_mut(&self.key)
-            .ok_or(SubmissionRefusal::StaleDispatch)?;
-        if entry.state != DispatchState::Started(self.serial) {
-            return Err(SubmissionRefusal::StaleDispatch);
-        }
-        match entry.actor.advance_attempt(authority.attempt_id, to) {
-            AdvanceAttemptReceipt::Advanced => Ok(()),
-            refusal => Err(SubmissionRefusal::Admission(format!(
-                "attempt transition: {refusal:?}"
-            ))),
-        }
+        self.coord
+            .advance_started_dispatch(&self.key, self.serial, authority, to)
     }
 
     /// Complete ownership after the worker has confirmed process/stream cleanup
@@ -859,24 +954,8 @@ impl ActionDispatch<'_> {
             .authority
             .as_ref()
             .ok_or(SubmissionRefusal::StaleDispatch)?;
-        let mut submissions = self
-            .coord
-            .submissions
-            .lock()
-            .map_err(|_| SubmissionRefusal::Unavailable)?;
-        let entry = submissions
-            .entries
-            .get_mut(&self.key)
-            .ok_or(SubmissionRefusal::StaleDispatch)?;
-        if entry.state != DispatchState::Started(self.serial)
-            || !entry.actor.attempts().any(|attempt| {
-                attempt.attempt == authority.attempt_id
-                    && attempt.state == rabs_action::state_machines::AttemptState::Finished
-            })
-        {
-            return Err(SubmissionRefusal::StaleDispatch);
-        }
-        entry.state = DispatchState::Finished;
+        self.coord
+            .complete_started_dispatch(&self.key, self.serial, authority)?;
         self.completed = true;
         Ok(())
     }
@@ -884,21 +963,8 @@ impl ActionDispatch<'_> {
 
 impl Drop for ActionDispatch<'_> {
     fn drop(&mut self) {
-        if self.completed {
-            return;
-        }
-        if let Ok(mut submissions) = self.coord.submissions.lock()
-            && let Some(entry) = submissions.entries.get_mut(&self.key)
-        {
-            match entry.state {
-                DispatchState::Claimed(serial) if serial == self.serial => {
-                    entry.state = DispatchState::Queued
-                }
-                DispatchState::Started(serial) if serial == self.serial => {
-                    entry.state = DispatchState::Abandoned
-                }
-                _ => {}
-            }
+        if !self.completed {
+            self.coord.release_dispatch_claim(&self.key, self.serial);
         }
     }
 }
@@ -957,6 +1023,7 @@ impl EdgeSubscriber {
             now_unix_micros,
             now_epoch,
             Some(LIVE_SAMPLING_POLICY),
+            ServeMode::Install,
         )
     }
 
@@ -1461,6 +1528,150 @@ impl CoordLive {
         Ok(authority)
     }
 
+    /// Claim the queued execution of ONE known key. The edge's live
+    /// dependency lane executes exactly the action its subscriber asked for;
+    /// it must not take whatever happens to rank first in the shared queue.
+    /// `None` when the key is not queued (another claim or attempt owns it).
+    pub(crate) fn claim_submitted_dispatch(
+        &self,
+        key: &TypedDigest,
+    ) -> Result<Option<u64>, SubmissionRefusal> {
+        if !self.available() {
+            return Err(SubmissionRefusal::Unavailable);
+        }
+        let mut submissions = self
+            .submissions
+            .lock()
+            .map_err(|_| SubmissionRefusal::Unavailable)?;
+        if !submissions
+            .entries
+            .get(key)
+            .is_some_and(|entry| entry.state == DispatchState::Queued)
+        {
+            return Ok(None);
+        }
+        let serial = submissions.next_serial()?;
+        let entry = submissions
+            .entries
+            .get_mut(key)
+            .ok_or(SubmissionRefusal::StaleDispatch)?;
+        entry.state = DispatchState::Claimed(serial);
+        Ok(Some(serial))
+    }
+
+    /// Admit a claimed dispatch: durable generation, attempt and lease.
+    pub(crate) fn begin_claimed_dispatch(
+        &self,
+        key: &TypedDigest,
+        serial: u64,
+        worker: &WorkerSessionOffer,
+        lease_ttl_ms: u64,
+    ) -> Result<AttemptAuthority, SubmissionRefusal> {
+        self.begin_submitted_dispatch(key, serial, worker, lease_ttl_ms)
+    }
+
+    /// One observed attempt transition through the actor machine, for the
+    /// dispatch claim `(key, serial)` that started `authority`.
+    pub(crate) fn advance_started_dispatch(
+        &self,
+        key: &TypedDigest,
+        serial: u64,
+        authority: &AttemptAuthority,
+        to: rabs_action::state_machines::AttemptState,
+    ) -> Result<(), SubmissionRefusal> {
+        use crate::coord::action_actor::AdvanceAttemptReceipt;
+        let mut submissions = self
+            .submissions
+            .lock()
+            .map_err(|_| SubmissionRefusal::Unavailable)?;
+        let entry = submissions
+            .entries
+            .get_mut(key)
+            .ok_or(SubmissionRefusal::StaleDispatch)?;
+        if entry.state != DispatchState::Started(serial) {
+            return Err(SubmissionRefusal::StaleDispatch);
+        }
+        match entry.actor.advance_attempt(authority.attempt_id, to) {
+            AdvanceAttemptReceipt::Advanced => Ok(()),
+            refusal => Err(SubmissionRefusal::Admission(format!(
+                "attempt transition: {refusal:?}"
+            ))),
+        }
+    }
+
+    /// Mark a started dispatch finished once its attempt reached `Finished`.
+    pub(crate) fn complete_started_dispatch(
+        &self,
+        key: &TypedDigest,
+        serial: u64,
+        authority: &AttemptAuthority,
+    ) -> Result<(), SubmissionRefusal> {
+        let mut submissions = self
+            .submissions
+            .lock()
+            .map_err(|_| SubmissionRefusal::Unavailable)?;
+        let entry = submissions
+            .entries
+            .get_mut(key)
+            .ok_or(SubmissionRefusal::StaleDispatch)?;
+        if entry.state != DispatchState::Started(serial)
+            || !entry.actor.attempts().any(|attempt| {
+                attempt.attempt == authority.attempt_id
+                    && attempt.state == rabs_action::state_machines::AttemptState::Finished
+            })
+        {
+            return Err(SubmissionRefusal::StaleDispatch);
+        }
+        entry.state = DispatchState::Finished;
+        Ok(())
+    }
+
+    /// Drop semantics of an unconfirmed claim: before admission the queue
+    /// regains it; after admission it is abandoned pending reconciliation,
+    /// never silently retried.
+    pub(crate) fn release_dispatch_claim(&self, key: &TypedDigest, serial: u64) {
+        if let Ok(mut submissions) = self.submissions.lock()
+            && let Some(entry) = submissions.entries.get_mut(key)
+        {
+            match entry.state {
+                DispatchState::Claimed(claimed) if claimed == serial => {
+                    entry.state = DispatchState::Queued;
+                }
+                DispatchState::Started(started) if started == serial => {
+                    entry.state = DispatchState::Abandoned;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// The mounted store, for coordinator-side lanes in this crate.
+    pub(crate) fn live_cas(&self) -> Option<&Arc<LiveCas>> {
+        self.cas.as_ref()
+    }
+
+    /// Serve under the edge's live evidence/sampling floor (the same gate
+    /// [`EdgeSubscriber::serve_action`] applies). `ServeMode::Preview`
+    /// answers [`ServeOutcome::Servable`] instead of installing.
+    pub(crate) fn serve_for_subscriber(
+        &self,
+        action_key: &TypedDigest,
+        destination_root: &Path,
+        expected: &ExpectedOutputs,
+        now_unix_micros: i64,
+        mode: ServeMode,
+    ) -> Result<ServeOutcome, ServeError> {
+        self.serve_action_inner(
+            action_key,
+            destination_root,
+            expected,
+            now_unix_micros,
+            0,
+            Some(LIVE_SAMPLING_POLICY),
+            mode,
+        )
+    }
+
     /// Read-only actor observation for subscriber delivery/diagnostics. Mutating
     /// this copy cannot mutate the coordinator or grant another dispatch.
     pub fn submitted_actor(
@@ -1862,9 +2073,11 @@ impl CoordLive {
             now_unix_micros,
             now_epoch,
             None,
+            ServeMode::Install,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn serve_action_inner(
         &self,
         action_key: &TypedDigest,
@@ -1873,6 +2086,7 @@ impl CoordLive {
         now_unix_micros: i64,
         now_epoch: u64,
         sampling: Option<SamplingPolicy>,
+        mode: ServeMode,
     ) -> Result<ServeOutcome, ServeError> {
         // Take the authority snapshot BEFORE the store lock, preserving the
         // existing authority -> store lock order during coordinator startup.
@@ -1952,6 +2166,20 @@ impl CoordLive {
             // action's otherwise valid, content-addressed output manifest.
             return Ok(ServeOutcome::ManifestUnavailable { key: manifest_key });
         }
+        let replay_permit = if sampling.is_some() {
+            match live_replay_permit(&mut *store, action_key, &manifest_key)
+                .map_err(|error| ServeError::Store(format!("{error:?}")))?
+            {
+                Some(permit) => Some(permit),
+                None => {
+                    return Ok(ServeOutcome::ExecutePrivately(
+                        ReplayRefusal::FreshVerificationRequired,
+                    ));
+                }
+            }
+        } else {
+            None
+        };
 
         // One complete logical-output map: do not silently discard .rmeta or
         // dep-info. Canonical .d files are verified and derived privately before
@@ -1961,6 +2189,23 @@ impl CoordLive {
                 Ok(plan) => plan,
                 Err(outcome) => return Ok(outcome),
             };
+        if mode == ServeMode::Preview {
+            return Ok(ServeOutcome::Servable);
+        }
+        if let Some(permit) = replay_permit {
+            // Spend durably while holding the same lock as admission and
+            // installation. A failed/partial install conservatively spends its
+            // allowance; a crash must never grant it a second time.
+            store
+                .record_decision_receipt(
+                    LIVE_INSTALL_RECEIPT,
+                    &permit.subject,
+                    permit.seq,
+                    "install",
+                    &manifest_key,
+                )
+                .map_err(|error| ServeError::Store(format!("{error:?}")))?;
+        }
         if plan.outputs.is_empty() {
             return Ok(ServeOutcome::Served { files: Vec::new() });
         }

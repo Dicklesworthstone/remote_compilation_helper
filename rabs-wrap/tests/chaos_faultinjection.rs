@@ -41,17 +41,18 @@ impl Lcg {
 }
 
 fn rabsd() -> std::path::PathBuf {
-    // The rabsd binary lives beside ours in the target dir; build it
-    // once if a chaos-only test run hasn't produced it yet.
-    let path = std::path::Path::new(env!("CARGO_BIN_EXE_rabs-wrap")).with_file_name("rabsd");
-    if !path.exists() {
+    // The rabsd binary lives beside ours in the target dir. Always ask
+    // Cargo, once per test process: it is a no-op when fresh, and a daemon
+    // left over from an older tree must never answer for this one.
+    static BUILT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    BUILT.get_or_init(|| {
         let status = Command::new(env!("CARGO"))
             .args(["build", "-p", "rabsd", "--bin", "rabsd"])
             .status()
             .expect("build rabsd");
         assert!(status.success(), "rabsd build failed");
-    }
-    path
+    });
+    std::path::Path::new(env!("CARGO_BIN_EXE_rabs-wrap")).with_file_name("rabsd")
 }
 
 fn spawn_daemon(dir: &std::path::Path) -> Child {

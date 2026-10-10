@@ -2036,12 +2036,25 @@ fn main() {
 }
 
 async fn async_main() {
+    use std::io::Write;
+
     let args: Vec<OsString> = env::args_os().collect();
     let wants_machine_output = top_level_machine_output_requested(&args);
 
     if let Err(error) = run(args).await {
         if let Some(exit) = error.downcast_ref::<doctor::DoctorExit>() {
             std::process::exit(exit.0);
+        }
+        if error
+            .downcast_ref::<commands::jobs::JobOutputFailure>()
+            .is_some()
+        {
+            // A job document may have been partially written already. Never
+            // retry stdout with an error envelope or report delivery success.
+            // Even a closed stderr must not turn this delivery failure into
+            // a panic or a successful exit.
+            let _ = writeln!(std::io::stderr().lock(), "Error: {error:#}");
+            std::process::exit(1);
         }
         if let Some(failure) = error.downcast_ref::<GcFailure>() {
             if wants_machine_output {
@@ -2051,23 +2064,43 @@ async fn async_main() {
                     ..Default::default()
                 });
                 if let Err(render_error) = ctx.json(&failure.response()) {
-                    eprintln!("Failed to serialize GC report: {render_error}");
+                    let _ = writeln!(
+                        std::io::stderr().lock(),
+                        "Failed to serialize GC report: {render_error}"
+                    );
                 }
             } else {
-                eprintln!("Error: {failure}");
+                let _ = writeln!(std::io::stderr().lock(), "Error: {failure}");
             }
         } else if wants_machine_output {
             let response: ApiResponse<()> =
                 ApiResponse::err(top_level_command_label(), top_level_api_error(&error));
             match serde_json::to_string_pretty(&response) {
-                Ok(json) => println!("{json}"),
+                Ok(json) => {
+                    // This error envelope may be only partly delivered. A
+                    // closed pipe must preserve exit 1 without panicking or
+                    // attempting another stdout document.
+                    let rendered = {
+                        let mut output = std::io::stdout().lock();
+                        writeln!(output, "{json}").and_then(|_| output.flush())
+                    };
+                    if let Err(render_error) = rendered {
+                        let _ = writeln!(
+                            std::io::stderr().lock(),
+                            "Failed to write JSON error response: {render_error}"
+                        );
+                    }
+                }
                 Err(serialize_error) => {
-                    eprintln!("Error: {error:#}");
-                    eprintln!("Failed to serialize JSON error response: {serialize_error}");
+                    let _ = writeln!(std::io::stderr().lock(), "Error: {error:#}");
+                    let _ = writeln!(
+                        std::io::stderr().lock(),
+                        "Failed to serialize JSON error response: {serialize_error}"
+                    );
                 }
             }
         } else {
-            eprintln!("Error: {error:#}");
+            let _ = writeln!(std::io::stderr().lock(), "Error: {error:#}");
         }
         std::process::exit(1);
     }
@@ -4901,8 +4934,22 @@ async fn handle_gc(
         let mut apply_error: Option<String> = None;
         let mut timed_out = false;
         let mut unknown_batch_paths: Vec<String> = Vec::new();
-        if apply && !targets.is_empty() {
-            for (batch_index, batch) in targets.chunks(GC_COLLECT_BATCH).enumerate() {
+        // One target that cannot be embedded in a remote command (a space in an
+        // ancestor dir, say) used to fail the whole batch, so the worker
+        // collected nothing (bd-kr4qb). Report each such target as a skip and
+        // collect the rest.
+        let mut embeddable: Vec<reap::GcCollectTarget> = Vec::with_capacity(targets.len());
+        for target in &targets {
+            match reap::collect_target_rejection(target) {
+                Some(reason) if apply => skipped.push(serde_json::json!({
+                    "path": target.path, "trigger": target.trigger, "reason": reason,
+                })),
+                Some(_) => {}
+                None => embeddable.push(target.clone()),
+            }
+        }
+        if apply && !embeddable.is_empty() {
+            for (batch_index, batch) in embeddable.chunks(GC_COLLECT_BATCH).enumerate() {
                 let command = match reap::collect_paths_command(batch) {
                     Ok(command) => command,
                     Err(e) => {

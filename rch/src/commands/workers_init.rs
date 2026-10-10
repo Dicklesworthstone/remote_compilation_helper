@@ -105,6 +105,9 @@ pub async fn workers_init(yes: bool, ctx: &OutputContext) -> Result<()> {
     cmd.arg("-o").arg("ConnectTimeout=10");
     cmd.arg("-o").arg("StrictHostKeyChecking=accept-new");
     cmd.arg("-i").arg(&identity_file);
+    if let Some(opts) = rch_common::ssh_utils::identities_only_args(&identity_file) {
+        cmd.args(opts);
+    }
 
     let target = format!("{}@{}", username, hostname);
     cmd.arg(&target);
@@ -158,6 +161,9 @@ pub async fn workers_init(yes: bool, ctx: &OutputContext) -> Result<()> {
     cmd.arg("-o").arg("BatchMode=yes");
     cmd.arg("-o").arg("ConnectTimeout=10");
     cmd.arg("-i").arg(&identity_file);
+    if let Some(opts) = rch_common::ssh_utils::identities_only_args(&identity_file) {
+        cmd.args(opts);
+    }
     cmd.arg(&target);
     cmd.arg("rustc --version 2>/dev/null || echo 'NOT_INSTALLED'");
 
@@ -635,6 +641,9 @@ async fn probe_host(host: &DiscoveredHost) -> Result<ProbeInfo> {
 
     if let Some(ref identity) = host.identity_file {
         cmd.arg("-i").arg(identity);
+        if let Some(opts) = rch_common::ssh_utils::identities_only_args(identity) {
+            cmd.args(opts);
+        }
     }
 
     let target = format!("{}@{}", host.user, host.hostname);

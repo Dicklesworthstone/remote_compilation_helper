@@ -52,6 +52,13 @@ def available(path, shared=False):
         os.close(fd)
 
 
+def _default_sighup():
+    # rch's remote wrapper runs `trap '' HUP`, and an ignored disposition is inherited
+    # and cannot be reset by `trap - HUP` in a non-interactive sh. Restore the default
+    # so the SIGHUP case really kills the holder when this suite runs under rch.
+    signal.signal(signal.SIGHUP, signal.SIG_DFL)
+
+
 class Holder:
     def __init__(self, script, args, env, plan, claim="claim input", fd_limit=None):
         command = "set -eu\n"
@@ -66,6 +73,7 @@ class Holder:
         self.process = subprocess.Popen(
             ["/bin/sh", "-c", command], env=env,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            preexec_fn=_default_sighup,
         )
         self.buffer = b""
 
@@ -111,8 +119,9 @@ class SourceLockHolderTests(unittest.TestCase):
         for holder in reversed(self.holders):
             holder.close()
 
-    def environment(self, portable=True, python=True):
-        directory = self.root / ("native-bin" if portable else "gnu-bin")
+    def environment(self, portable=True, python=True, gnu_flock=True):
+        directory = self.root / ("native-bin" if portable else
+                                 "linux-native-bin" if python else "gnu-bin")
         directory.mkdir(exist_ok=True)
         uname = directory / "uname"
         uname.write_text("#!/bin/sh\nprintf 'called\\n' >> {}\nprintf '%s\\n' {}\n".format(
@@ -126,7 +135,7 @@ class SourceLockHolderTests(unittest.TestCase):
             path = directory / "python3"
             if not path.exists():
                 path.symlink_to(sys.executable)
-        if portable:
+        if portable or not gnu_flock:
             # A successful test must never invoke GNU flock on this path.
             flock = directory / "flock"
             flock.write_text("#!/bin/sh\nprintf 'unexpected flock invocation\\n' >&2\nexit 97\n")
@@ -297,7 +306,7 @@ class SourceLockHolderTests(unittest.TestCase):
 
     @unittest.skipUnless(GNU_FLOCK, "GNU flock unavailable")
     def test_linux_still_uses_gnu_without_python_and_probes_platform_once(self):
-        paths = [self.root / str(i) for i in range(16)]
+        paths = [self.root / str(i) for i in range(64)]
         holder = self.start([("x", path) for path in paths], portable=False,
                             env=self.environment(portable=False, python=False))
         self.assertEqual(holder.line(), b"READY")
@@ -305,6 +314,118 @@ class SourceLockHolderTests(unittest.TestCase):
         holder.finish()
         self.assertEqual(holder.process.returncode, 0)
         self.assertEqual((self.root / "gnu-bin/uname.calls").read_text(), "called\n")
+
+    def test_linux_large_plan_uses_native_locks_and_preserves_handoff(self):
+        paths = [self.root / str(i) for i in range(96)]
+        env = self.environment(portable=False, gnu_flock=False)
+        terminal = ('set -eu; [ "$(cat <&4)" = "claim input" ]; exec 4<&-; '
+                    'if (: <&3) 2>/dev/null; then exit 98; fi; '
+                    'printf "%s\\n" "$1" "$$" "$2"; '
+                    'IFS= read -r reply; [ "$reply" = RELEASE ]')
+        specs = [("s" if i % 3 == 0 else "x", path) for i, path in enumerate(paths)]
+        holder = self.start(specs, portable=False, env=env, terminal=terminal,
+                            args=("literal $value; 'quotes'",))
+        self.assertEqual(holder.line(), b"READY")
+        self.assertEqual(int(holder.line()), holder.process.pid)
+        self.assertEqual(holder.line(), b"literal $value; 'quotes'")
+        for mode, path in specs:
+            self.assertFalse(available(path))
+            self.assertEqual(available(path, shared=True), mode == "s")
+        holder.send("RELEASE\n")
+        stdout, stderr = holder.finish()
+        self.assertEqual((holder.process.returncode, stdout, stderr), (0, b"", b""))
+        self.assertTrue(all(available(path) for path in paths))
+        self.assertEqual((self.root / "linux-native-bin/uname.calls").read_text(), "called\n")
+
+    @unittest.skipUnless(GNU_FLOCK, "GNU flock unavailable")
+    def test_linux_native_and_no_python_holders_share_kernel_exclusion(self):
+        paths = [self.root / str(i) for i in range(64)]
+        specs = [("x", path) for path in paths]
+        envs = [self.environment(portable=False, python=False),
+                self.environment(portable=False, gnu_flock=False)]
+        for first, second in (envs, envs[::-1]):
+            owner = self.start(specs, portable=False, env=first)
+            self.assertEqual(owner.line(), b"READY")
+            follower = self.start(specs, portable=False, env=second)
+            self.assertIsNone(follower.line(0.1))
+            self.assertTrue(all(not available(path) for path in paths))
+            owner.finish()
+            self.assertEqual(follower.line(), b"READY")
+            follower.finish()
+            self.assertTrue(all(available(path) for path in paths))
+
+    @unittest.skipUnless(GNU_FLOCK, "GNU flock unavailable")
+    def test_linux_small_plan_avoids_python_and_native_failure_never_falls_back(self):
+        directory = self.root / "broken-python"
+        directory.mkdir()
+        python = directory / "python3"
+        python.write_text("#!/bin/sh\nprintf 'native bootstrap failed\\n' >&2\nexit 97\n")
+        python.chmod(0o700)
+        env = self.environment(portable=False, python=False)
+        env["PATH"] = str(directory) + os.pathsep + env["PATH"]
+        small = [self.root / ("small-{}".format(i)) for i in range(31)]
+        holder = self.start([("x", path) for path in small], portable=False, env=env)
+        self.assertEqual(holder.line(), b"READY")
+        stdout, stderr = holder.finish()
+        self.assertEqual((holder.process.returncode, stdout, stderr), (0, b"", b""))
+        large = [self.root / ("large-{}".format(i)) for i in range(32)]
+        holder = self.start([("x", path) for path in large], portable=False, env=env)
+        stdout, stderr = holder.finish()
+        self.assertEqual((holder.process.returncode, stdout), (97, b""))
+        self.assertIn(b"native bootstrap failed", stderr)
+        self.assertTrue(all(not path.exists() for path in large))
+
+    def test_linux_native_waits_for_last_lock_and_dies_without_orphans(self):
+        paths = [self.root / str(i) for i in range(32)]
+        env = self.environment(portable=False, gnu_flock=False)
+        fd = os.open(paths[-1], os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            holder = self.start([("x", path) for path in paths], portable=False, env=env)
+            eventually(lambda: not available(paths[-2]), "native holder did not reach final lock")
+            self.assertIsNone(holder.line(0.05), "native readiness preceded final lock")
+            holder.process.kill()
+            stdout, stderr = holder.finish()
+            self.assertEqual(stdout, b"", stderr)
+            self.assertEqual(holder.process.returncode, -signal.SIGKILL)
+            self.assertTrue(all(available(path) for path in paths[:-1]))
+            self.assertFalse(available(paths[-1]))
+        finally:
+            os.close(fd)
+        follower = self.start([("x", path) for path in paths], portable=False, env=env)
+        self.assertEqual(follower.line(), b"READY")
+        follower.finish()
+        self.assertTrue(all(available(path) for path in paths))
+
+    def test_linux_native_invalid_plan_and_fd_exhaustion_release_partial_locks(self):
+        paths = [self.root / str(i) for i in range(64)]
+        specs = [("x", path) for path in paths]
+        env = self.environment(portable=False, gnu_flock=False)
+        for options in ({"fd_limit": 32},
+                        {"plan": "".join("x {}\n".format(path) for path in paths[:-1])},
+                        {"plan": "".join("x {}\n".format(path) for path in paths) + "s /extra\n"}):
+            holder = self.start(specs, portable=False, env=env, **options)
+            stdout, stderr = holder.finish()
+            self.assertEqual((holder.process.returncode, stdout), (73, b""), stderr)
+            self.assertTrue(all(available(path) for path in paths))
+
+    def test_linux_native_refuses_symlink_and_fifo_after_partial_acquisition(self):
+        paths = [self.root / str(i) for i in range(31)]
+        target = self.root / "target"
+        target.write_bytes(b"unchanged")
+        link = self.root / "link"
+        link.symlink_to(target)
+        fifo = self.root / "fifo"
+        os.mkfifo(fifo)
+        env = self.environment(portable=False, gnu_flock=False)
+        for invalid in (link, fifo, self.root):
+            holder = self.start([("x", path) for path in paths + [invalid]],
+                                portable=False, env=env)
+            stdout, stderr = holder.finish()
+            self.assertEqual((holder.process.returncode, stdout), (73, b""), stderr)
+            self.assertTrue(all(available(path) for path in paths))
+            self.assertEqual(target.read_bytes(), b"unchanged")
+            self.assertTrue(link.is_symlink())
 
 
 if __name__ == "__main__":

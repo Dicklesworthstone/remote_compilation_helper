@@ -1046,6 +1046,40 @@ mod tests {
         crate::test_daemon_context(pool)
     }
 
+    /// Admit like production selection does: with the worker's endpoint, so
+    /// cancellation can target the admitted SSH coordinates (60ee09f).
+    async fn admit_remote_build(
+        context: &DaemonContext,
+        project: String,
+        worker: &str,
+        hook_pid: u32,
+        wrapper: Option<String>,
+    ) -> crate::history::ActiveBuildState {
+        let endpoint = context
+            .pool
+            .get(&rch_common::WorkerId::new(worker))
+            .await
+            .unwrap()
+            .endpoint_snapshot()
+            .await;
+        context
+            .history
+            .try_start_active_build_with_waiter(
+                project,
+                worker.into(),
+                "sleep 180".into(),
+                hook_pid,
+                wrapper,
+                1,
+                rch_common::BuildLocation::Remote,
+                None,
+                crate::disk_pressure::DiskHeadroomAdmission::default(),
+                Some(endpoint),
+            )
+            .unwrap()
+            .unwrap()
+    }
+
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn restarted_observer_allows_reattachment_then_reaps_a_still_stale_job() {
@@ -1096,30 +1130,28 @@ mod tests {
             progress_counter: None,
             progress_percent: None,
         };
-        let builds: Vec<_> = jobs
-            .iter()
-            .enumerate()
-            .map(|(index, job)| {
-                std::fs::write(
-                    root.join(format!("{}.pgid", job.0.id())),
-                    job.0.id().to_string(),
-                )
-                .unwrap();
-                let build = context.history.start_active_build_with_wrapper(
-                    format!("restart-observer-{index}"),
-                    "restart-observer-worker".into(),
-                    "sleep 180".into(),
-                    job.0.id(),
-                    Some(format!("restart-wrapper-{index}")),
-                    1,
-                    rch_common::BuildLocation::Remote,
-                );
+        let mut builds = Vec::new();
+        for (index, job) in jobs.iter().enumerate() {
+            std::fs::write(
+                root.join(format!("{}.pgid", job.0.id())),
+                job.0.id().to_string(),
+            )
+            .unwrap();
+            let build = admit_remote_build(
+                &context,
+                format!("restart-observer-{index}"),
+                "restart-observer-worker",
+                job.0.id(),
+                Some(format!("restart-wrapper-{index}")),
+            )
+            .await;
+            builds.push(
                 context
                     .history
                     .record_build_heartbeat(heartbeat(&build))
-                    .unwrap()
-            })
-            .collect();
+                    .unwrap(),
+            );
+        }
 
         // Model downtime in durable timestamps, then use the production loader.
         // This is not a native kill/restart or an elapsed-time qualification.
@@ -1226,25 +1258,22 @@ mod tests {
             progress_counter: None,
             progress_percent: None,
         };
-        let builds: Vec<_> = jobs
-            .iter()
-            .enumerate()
-            .map(|(index, job)| {
-                let build = context.history.start_active_build(
-                    format!("observer-recovery-{index}"),
-                    "observer-worker".into(),
-                    "sleep 180".into(),
-                    job.0.id(),
-                    1,
-                    rch_common::BuildLocation::Remote,
-                );
-                context
-                    .history
-                    .record_build_heartbeat(heartbeat(build.id, job.0.id()))
-                    .unwrap();
-                context.history.active_build(build.id).unwrap()
-            })
-            .collect();
+        let mut builds = Vec::new();
+        for (index, job) in jobs.iter().enumerate() {
+            let build = admit_remote_build(
+                &context,
+                format!("observer-recovery-{index}"),
+                "observer-worker",
+                job.0.id(),
+                None,
+            )
+            .await;
+            context
+                .history
+                .record_build_heartbeat(heartbeat(build.id, job.0.id()))
+                .unwrap();
+            builds.push(context.history.active_build(build.id).unwrap());
+        }
         let mut observation = ObservationWindow::default();
         assert!(!observation.recovering(Instant::now()));
         // Real history uses std::time::Instant: age actual children and actual
@@ -1328,14 +1357,14 @@ mod tests {
         let context = cleanup_worker_context("shutdown-test-unbound-worker", 1).await;
         let pgid_file = root.join("shutdown.pgid");
         std::fs::write(&pgid_file, job.0.id().to_string()).unwrap();
-        let build = context.history.start_active_build(
+        let build = admit_remote_build(
+            &context,
             "shutdown-quiet-job".into(),
-            "shutdown-test-unbound-worker".into(),
-            "sleep 180".into(),
+            "shutdown-test-unbound-worker",
             job.0.id(),
-            1,
-            rch_common::BuildLocation::Remote,
-        );
+            None,
+        )
+        .await;
         context
             .history
             .record_build_heartbeat(rch_common::BuildHeartbeatRequest {

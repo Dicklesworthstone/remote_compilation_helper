@@ -3,6 +3,8 @@
 //! Handles synchronizing project files to remote workers, executing compilation
 //! commands, and retrieving build artifacts.
 
+pub(crate) mod source_content_barrier;
+
 use crate::error::TransferError;
 use anyhow::{Context, Result};
 use glob::Pattern;
@@ -730,6 +732,85 @@ pub(crate) struct RemoteProcessSetupUnavailable;
 #[error("remote execution completion is unconfirmed; automatic replay is unsafe")]
 pub(crate) struct RemoteExecutionUnconfirmed;
 
+/// Confirmed receiver-side disk exhaustion from a failed POSIX source upload.
+/// Only the upload boundary may attach this context: the receiver of an
+/// artifact download is the dispatcher, not the worker.
+#[derive(Debug, thiserror::Error)]
+#[error("worker {worker_id} exhausted disk space while receiving source files")]
+pub(crate) struct RemoteUploadDiskFull {
+    pub(crate) worker_id: String,
+    pub(crate) roots: Vec<String>,
+}
+
+pub(crate) fn find_remote_upload_disk_full(error: &anyhow::Error) -> Option<&RemoteUploadDiskFull> {
+    error.downcast_ref::<RemoteUploadDiskFull>().or_else(|| {
+        // Archive uploads classify each completed attempt before the retry
+        // loop wraps its terminal cause. Keep the typed context reachable
+        // through that wrapper; never infer it from diagnostic history text.
+        error
+            .downcast_ref::<TransferAttemptsExhausted>()?
+            .cause
+            .as_ref()
+            .and_then(find_remote_upload_disk_full)
+    })
+}
+
+/// Modern rsync's rsyserr identifies the process role and terminates with
+/// strerror(errno) plus its number. Require both boundaries so a filename or
+/// a sender/SSH diagnostic mentioning ENOSPC cannot become worker evidence.
+fn rsync_receiver_disk_full(line: &str) -> bool {
+    let Some(message) = line
+        .strip_prefix("rsync: [receiver] ")
+        .or_else(|| line.strip_prefix("rsync: [generator] "))
+    else {
+        return false;
+    };
+    let Some((message, errno)) = message.rsplit_once(" (") else {
+        return false;
+    };
+    let Some(errno) = errno.strip_suffix(')') else {
+        return false;
+    };
+    (errno == "28" && message.ends_with(": No space left on device"))
+        || (matches!(errno, "69" | "122") && message.ends_with(": Disk quota exceeded"))
+}
+
+#[cfg(unix)]
+fn check_archive_upload_result(
+    output: &std::process::Output,
+    worker: &WorkerConfig,
+    remote_root: &str,
+) -> Result<()> {
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let disk_full = output.status.code().is_some_and(|code| code != 0)
+        && stderr.lines().any(rsync_receiver_disk_full);
+    let error = if is_retryable_transport_error_text(&stderr) {
+        anyhow::anyhow!(
+            "rsync transport error (exit {:?}): {}",
+            output.status.code(),
+            stderr.trim()
+        )
+    } else {
+        TransferError::SyncFailed {
+            reason: "clean-overlay base rsync failed".to_string(),
+            exit_code: output.status.code(),
+            stderr,
+        }
+        .into()
+    };
+    Err(if disk_full {
+        error.context(RemoteUploadDiskFull {
+            worker_id: worker.id.to_string(),
+            roots: vec![remote_root.to_string()],
+        })
+    } else {
+        error
+    })
+}
+
 /// Typed source-sync stall error (issue #59): the transfer produced NO output
 /// at all — no rsync progress refresh, stats, or itemized line — for the
 /// configured silence window. Deliberately distinct from the wall-clock
@@ -801,6 +882,50 @@ fn remote_path_probe_script(path: &str) -> String {
     )
 }
 
+/// Receiver-side safety fence for dual-role Unix workers (bd-fbtws).
+/// Inspect physical ancestors (including aliases), linked-worktree markers,
+/// and nested repositories before *any* upload setup or pruning. Never infer
+/// permission to replace an editor's checkout from a clean `git status`.
+pub(crate) fn live_checkout_sync_guard(path: &str) -> String {
+    format!(
+        r#"(set -eu
+rch_destination={path}
+rch_sync_refuse() {{
+    printf 'RCH_SYNC_LIVE_CHECKOUT_REFUSED: %s (%s); use an isolated source mirror\n' "$rch_destination" "$1" >&2
+    exit 73
+}}
+case "$rch_destination" in /*) ;; *) rch_sync_refuse 'destination is not absolute';; esac
+case "$rch_destination" in
+    *[!/]*) ;;
+    *) rch_sync_refuse 'destination is the filesystem root';;
+esac
+# Do not resolve dot components through a missing ancestor. Setup could create
+# that ancestor and make the same spelling enter a previously hidden checkout.
+# Reject instead of lexical normalization, which changes symlink semantics.
+case "$rch_destination/" in
+    */./*|*/../*) rch_sync_refuse 'destination contains dot components';;
+esac
+rch_ancestor=$rch_destination
+while [ ! -e "$rch_ancestor" ] && [ ! -L "$rch_ancestor" ]; do
+    rch_ancestor=$(dirname "$rch_ancestor") || rch_sync_refuse 'cannot inspect ancestors'
+done
+rch_ancestor=$(CDPATH='' cd -P "$rch_ancestor" && pwd -P) || rch_sync_refuse 'unresolvable destination'
+while :; do
+    if [ -e "$rch_ancestor/.git" ] || [ -L "$rch_ancestor/.git" ]; then
+        rch_sync_refuse "Git checkout at $rch_ancestor"
+    fi
+    [ "$rch_ancestor" = / ] && break
+    rch_ancestor=$(dirname "$rch_ancestor") || rch_sync_refuse 'cannot inspect ancestors'
+done
+if [ -d "$rch_destination" ]; then
+    rch_nested=$(find -H "$rch_destination" -name .git -print -quit) || rch_sync_refuse 'cannot inspect destination'
+    [ -z "$rch_nested" ] || rch_sync_refuse "nested Git checkout at $rch_nested"
+fi
+)"#,
+        path = escape(Cow::from(path))
+    )
+}
+
 /// Removes every file the durable supervisor writes beside `path`; the claim
 /// is an empty `mkdir` directory. Succeeds when nothing is left.
 fn recovery_completion_cleanup_script(path: &str) -> String {
@@ -822,6 +947,8 @@ fn recovery_completion_cleanup_script(path: &str) -> String {
 pub(crate) struct CargoArtifactEvidence {
     pub(crate) stdout: Vec<u8>,
     pub(crate) remote_root: PathBuf,
+    /// Present only when the caller explicitly requests Cargo JSON paths.
+    pub(crate) remote_project_root: Option<PathBuf>,
 }
 
 /// A completed reader proved that this attempt cannot supply valid output
@@ -835,13 +962,40 @@ const MAX_CARGO_ARTIFACT_EVIDENCE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_CARGO_ARTIFACT_ROOT_BYTES: usize = 4096;
 const CARGO_ARTIFACT_EVIDENCE_REJECTION: &str = "RCH_CARGO_ARTIFACT_EVIDENCE_REJECTED";
 
+#[derive(Clone, Copy)]
+enum CargoOutputLog {
+    Stdout,
+    Stderr,
+}
+
+impl CargoOutputLog {
+    fn suffix(self) -> &'static str {
+        match self {
+            Self::Stdout => "stdout",
+            Self::Stderr => "stderr",
+        }
+    }
+}
+
 fn cargo_artifact_evidence_script(
     path: &str,
     identity: &str,
     remote_output_root: &str,
+    remote_project_root: Option<&str>,
     max_bytes: usize,
+    expected_exit: i32,
+    log: CargoOutputLog,
 ) -> String {
     let quote = |value: &str| escape(Cow::from(value)).into_owned();
+    // Ordinary detached recovery does not reconstruct a source pipeline.
+    // Do not add a source-path requirement to its existing receipt contract.
+    let project_resolution = match remote_project_root {
+        Some(project) => format!(
+            "project=$(CDPATH= cd -- {} && pwd -P) || reject 'Cargo source root is unavailable';",
+            quote(project)
+        ),
+        None => "project='';".to_owned(),
+    };
     // The identity receipt is immutable after completion. Check it before and
     // after copying the log, and frame the exact byte count so neither a lost
     // connection nor a changing log can turn a prefix into output authority.
@@ -855,14 +1009,15 @@ fn cargo_artifact_evidence_script(
          size=$(wc -c < {out}); size=$((size + 0)); \
          {{ [ \"$size\" -ge 0 ] && [ \"$size\" -le {max_bytes} ]; }} || reject 'Cargo output log exceeds size limit'; \
          root=$(CDPATH= cd -- {root} && pwd -P) || reject 'Cargo output root is unavailable'; \
-         printf '%s %s\\n%s\\n' {identity} \"$size\" \"$root\"; \
+         {project_resolution} \
+         printf '%s %s\\n%s\\n%s\\n' {identity} \"$size\" \"$root\" \"$project\"; \
          cat -- {out}; \
          [ \"$(wc -c < {out})\" -eq \"$size\" ] || reject 'Cargo output log changed during collection'; \
          {{ [ -f {done} ] && [ ! -L {done} ] && [ -f {out} ] && [ ! -L {out} ]; }} || reject 'receipt or log changed during collection'; \
          [ \"$(cat -- {done})\" = \"$expected\" ] || reject 'completion changed during collection'",
         done = quote(path),
-        out = quote(&format!("{path}.stdout")),
-        expected = quote(&format!("{identity} 0")),
+        out = quote(&format!("{path}.{}", log.suffix())),
+        expected = quote(&format!("{identity} {expected_exit}")),
         identity = quote(identity),
         root = quote(remote_output_root),
         rejection = quote(CARGO_ARTIFACT_EVIDENCE_REJECTION),
@@ -909,12 +1064,43 @@ fn parse_cargo_artifact_evidence(
     anyhow::ensure!(
         remote_root.is_absolute()
             && !root.chars().any(char::is_control)
+            && !root
+                .split('/')
+                .any(|component| matches!(component, "." | ".."))
             && remote_root.components().all(|component| {
                 matches!(component, Component::RootDir | Component::Normal(_))
             }),
         "Cargo artifact evidence has an invalid canonical output root"
     );
-    let body_start = root_start + root_length + 1;
+    let project_start = root_start + root_length + 1;
+    let project_length = bytes[project_start..]
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .context("Cargo artifact evidence has no complete source root")?;
+    anyhow::ensure!(
+        project_length <= MAX_CARGO_ARTIFACT_ROOT_BYTES,
+        "Cargo artifact evidence source root exceeds its size limit"
+    );
+    let project = std::str::from_utf8(&bytes[project_start..project_start + project_length])?;
+    let remote_project_root = if project.is_empty() {
+        None
+    } else {
+        let root = PathBuf::from(project);
+        anyhow::ensure!(
+            root.is_absolute()
+                && root.parent().is_some()
+                && !project.chars().any(char::is_control)
+                && !project
+                    .split('/')
+                    .any(|component| matches!(component, "." | ".."))
+                && root.components().all(|component| {
+                    matches!(component, Component::RootDir | Component::Normal(_))
+                }),
+            "Cargo artifact evidence has an invalid canonical source root"
+        );
+        Some(root)
+    };
+    let body_start = project_start + project_length + 1;
     anyhow::ensure!(
         bytes.len() - body_start == length,
         "Cargo artifact evidence log is incomplete or changed during collection"
@@ -922,6 +1108,7 @@ fn parse_cargo_artifact_evidence(
     Ok(CargoArtifactEvidence {
         stdout: bytes[body_start..].to_vec(),
         remote_root,
+        remote_project_root,
     })
 }
 
@@ -940,7 +1127,7 @@ async fn collect_cargo_artifact_evidence(
         "invalid Cargo artifact evidence identity"
     );
     let framed_limit = max_bytes
-        .checked_add(MAX_CARGO_ARTIFACT_ROOT_BYTES + identity.len() + 32)
+        .checked_add(2 * MAX_CARGO_ARTIFACT_ROOT_BYTES + identity.len() + 32)
         .context("Cargo artifact evidence size limit overflow")?;
     command
         .stdin(Stdio::null())
@@ -1643,6 +1830,7 @@ pub(crate) struct CleanOverlayMaterialization {
 pub(crate) struct TransferAttemptsExhausted {
     pub(crate) attempts: Vec<TransferAttemptDiagnostic>,
     last_error: String,
+    cause: Option<anyhow::Error>,
 }
 
 impl std::fmt::Display for TransferAttemptsExhausted {
@@ -1656,7 +1844,13 @@ impl std::fmt::Display for TransferAttemptsExhausted {
     }
 }
 
-impl std::error::Error for TransferAttemptsExhausted {}
+impl std::error::Error for TransferAttemptsExhausted {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.cause
+            .as_ref()
+            .map(|error| error.as_ref() as &(dyn std::error::Error + 'static))
+    }
+}
 
 /// Run a source-transfer operation with a full timeout budget for each attempt.
 ///
@@ -1724,6 +1918,7 @@ where
                     return Err(TransferAttemptsExhausted {
                         attempts,
                         last_error: detail,
+                        cause: Some(error),
                     });
                 }
             }
@@ -2313,9 +2508,23 @@ impl TransferPipeline {
     /// rsync appends its server argv to this shell fragment. Forward those
     /// arguments inside the lease, after any destination setup has completed.
     fn source_rsync_path(&self, command: String) -> String {
+        // Source leases serialize RCH jobs, not editors on dual-role workers.
+        // Fence the receiver before even cache pruning or mkdir can run. A
+        // clean worktree is protected too: a status-based check would race an
+        // editor and would still delete new, untracked files (bd-fbtws).
+        let command = if self.worker_platform.is_windows() {
+            command
+        } else {
+            format!(
+                "{} || exit 73; {command}",
+                live_checkout_sync_guard(&self.remote_path())
+            )
+        };
         self.source_rsync_path_at(command, &self.remote_path())
     }
 
+    // Activity fencing also wraps read-only retrieval. Keep the upload safety
+    // check out of that path: a test result may legitimately contain .git.
     fn source_rsync_path_at(&self, command: String, remote_path: &str) -> String {
         let command = self
             .resolved_rsync()
@@ -2541,6 +2750,64 @@ impl TransferPipeline {
         worker: &WorkerConfig,
         remote_output_root: &str,
     ) -> Result<CargoArtifactEvidence> {
+        self.read_cargo_evidence(worker, remote_output_root, 0, None, CargoOutputLog::Stdout)
+            .await
+    }
+
+    /// Read this invocation's exact stdout even on a compiler failure. The
+    /// caller supplies the already-confirmed completion status; accepting a
+    /// different status would turn another attempt's log into Cargo output.
+    pub(crate) async fn read_cargo_stdout_evidence(
+        &self,
+        worker: &WorkerConfig,
+        remote_output_root: &str,
+        expected_exit: i32,
+    ) -> Result<CargoArtifactEvidence> {
+        let project = self.remote_path();
+        self.read_cargo_evidence(
+            worker,
+            remote_output_root,
+            expected_exit,
+            Some(&project),
+            CargoOutputLog::Stdout,
+        )
+        .await
+    }
+
+    /// Collect complete diagnostic bytes from the same immutable completion.
+    /// Failed Cargo may never create a target tree, so resolve its executed
+    /// source root. The shared frame carries this log on transport stdout;
+    /// these bytes are returned only as diagnostics, never Cargo artifact JSON.
+    pub(crate) async fn read_cargo_stderr_evidence(
+        &self,
+        worker: &WorkerConfig,
+        expected_exit: i32,
+    ) -> Result<Vec<u8>> {
+        let project = self.remote_path();
+        let evidence = self
+            .read_cargo_evidence(
+                worker,
+                &project,
+                expected_exit,
+                Some(&project),
+                CargoOutputLog::Stderr,
+            )
+            .await?;
+        Ok(evidence.stdout)
+    }
+
+    async fn read_cargo_evidence(
+        &self,
+        worker: &WorkerConfig,
+        remote_output_root: &str,
+        expected_exit: i32,
+        remote_project_root: Option<&str>,
+        log: CargoOutputLog,
+    ) -> Result<CargoArtifactEvidence> {
+        anyhow::ensure!(
+            (0..=255).contains(&expected_exit),
+            "invalid expected Cargo completion status"
+        );
         let (path, identity) = self
             .recovery_completion
             .as_ref()
@@ -2558,7 +2825,10 @@ impl TransferPipeline {
             path,
             identity,
             remote_output_root,
+            remote_project_root,
             MAX_CARGO_ARTIFACT_EVIDENCE_BYTES,
+            expected_exit,
+            log,
         );
         let command =
             self.worker_ssh_command(worker, &["sh", "-c", &escape(Cow::from(script.as_str()))]);
@@ -3478,8 +3748,9 @@ impl TransferPipeline {
         let escaped_remote_path = escape(Cow::from(&remote_path));
         let destination = self.rsync_remote_spec(worker, &remote_path);
         let identity_file = shellexpand::tilde(&worker.identity_file);
-        let escaped_identity = escape(Cow::from(identity_file.as_ref()));
-        let ssh_command = self.build_rsync_ssh_command(escaped_identity.as_ref());
+        let ssh_command = source_content_barrier::ssh_command(
+            &self.build_rsync_ssh_command(identity_file.as_ref()),
+        );
 
         let (mut cmd, capabilities) = self.rsync_command();
         cmd.arg("-azn")
@@ -3522,44 +3793,7 @@ impl TransferPipeline {
             self.source_sync_attempt_timeout(&effective_excludes),
         )
         .await?;
-        if !output.status.success() {
-            anyhow::bail!(
-                "source-content rsync barrier failed (exit {:?}): {}",
-                output.status.code(),
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
-        if !output.stderr.is_empty() {
-            anyhow::bail!(
-                "source-content rsync barrier produced stderr: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
-        let stdout = std::str::from_utf8(&output.stdout)
-            .context("source-content rsync barrier output was not UTF-8")?;
-        let changed = stdout
-            .lines()
-            .filter(|line| !line.is_empty())
-            .filter(|line| {
-                !line
-                    .split_once('\t')
-                    .is_some_and(|(itemized, _)| itemized.as_bytes().get(1) == Some(&b'd'))
-            })
-            .collect::<Vec<_>>();
-        if !changed.is_empty() {
-            let preview = changed
-                .iter()
-                .take(8)
-                .copied()
-                .collect::<Vec<_>>()
-                .join(" | ");
-            anyhow::bail!(
-                "source-content rsync barrier detected {} remote delta(s): {}",
-                changed.len(),
-                preview
-            );
-        }
-        Ok(())
+        source_content_barrier::verify_output(&output).map_err(anyhow::Error::msg)
     }
 
     /// Belt-and-suspenders source-integrity guard for retrieval (RCH bug
@@ -4103,10 +4337,9 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         let (mut cmd, _capabilities) = self.rsync_command();
 
         let identity_file = shellexpand::tilde(&worker.identity_file);
-        let escaped_identity = escape(Cow::from(identity_file.as_ref()));
         let ssh_command = format!(
             "{} -o ConnectTimeout=5",
-            self.build_rsync_ssh_command(escaped_identity.as_ref())
+            self.build_rsync_ssh_command(identity_file.as_ref())
         );
 
         cmd.arg("-az");
@@ -4263,8 +4496,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         let (mut cmd, capabilities) = self.rsync_command();
 
         let identity_file = shellexpand::tilde(&worker.identity_file);
-        let escaped_identity = escape(Cow::from(identity_file.as_ref()));
-        let ssh_command = self.build_rsync_ssh_command(escaped_identity.as_ref());
+        let ssh_command = self.build_rsync_ssh_command(identity_file.as_ref());
 
         cmd.arg("-az"); // Archive mode + compression
         add_portable_rsync_archive_args(&mut cmd);
@@ -4327,8 +4559,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         let (mut cmd, capabilities) = self.rsync_command();
 
         let identity_file = shellexpand::tilde(&worker.identity_file);
-        let escaped_identity = escape(Cow::from(identity_file.as_ref()));
-        let ssh_command = self.build_rsync_ssh_command(escaped_identity.as_ref());
+        let ssh_command = self.build_rsync_ssh_command(identity_file.as_ref());
 
         cmd.arg("-az"); // Archive mode + compression
         add_portable_rsync_archive_args(&mut cmd);
@@ -4494,10 +4725,10 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         let escaped_remote_archive = escape(Cow::from(remote_archive_path.as_str()));
         let destination = self.rsync_remote_spec(worker, &remote_archive_path);
         let identity_file = shellexpand::tilde(&worker.identity_file);
-        let escaped_identity = escape(Cow::from(identity_file.as_ref()));
-        let ssh_command = self.build_rsync_ssh_command(escaped_identity.as_ref());
+        let ssh_command = self.build_rsync_ssh_command(identity_file.as_ref());
         let extraction_script = format!(
-            "umask 0022\nmkdir -p {path}\nTAR_OPTIONS='' tar -xf {archive} -C {path}",
+            "{guard} || exit 73\numask 0022\nmkdir -p {path}\nTAR_OPTIONS='' tar -xf {archive} -C {path}",
+            guard = live_checkout_sync_guard(&remote_path),
             path = escaped_remote_path,
             archive = escaped_remote_archive
         );
@@ -4515,6 +4746,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
                     let ssh_command = ssh_command.clone();
                     let extraction_script = extraction_script.clone();
                     let archive_path = archive_path.clone();
+                    let remote_root = remote_path.clone();
                     let escaped_remote_path = escaped_remote_path.clone();
                     let remote_archive_path = remote_archive_path.clone();
                     let rsync_path = rsync_path.clone();
@@ -4534,7 +4766,10 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
                             .arg(ssh_command)
                             .arg("--rsync-path")
                             .arg(self.source_rsync_path_at(
-                                format!("mkdir -p {escaped_remote_path} && rsync"),
+                                format!(
+                                    "{} || exit 73; mkdir -p {escaped_remote_path} && rsync",
+                                    live_checkout_sync_guard(&remote_root)
+                                ),
                                 &remote_archive_path,
                             ))
                             .arg(archive_path)
@@ -4546,22 +4781,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
                             .output()
                             .await
                             .context("run resumable clean-overlay base rsync")?;
-                        if !output.status.success() {
-                            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-                            if is_retryable_transport_error_text(&stderr) {
-                                anyhow::bail!(
-                                    "rsync transport error (exit {:?}): {}",
-                                    output.status.code(),
-                                    stderr.trim()
-                                );
-                            }
-                            return Err(TransferError::SyncFailed {
-                                reason: "clean-overlay base rsync failed".to_string(),
-                                exit_code: output.status.code(),
-                                stderr,
-                            }
-                            .into());
-                        }
+                        check_archive_upload_result(&output, worker, &remote_root)?;
                         self.run_remote_sh(worker, &extraction_script)
                             .await
                             .context("extract clean-overlay base archive")?;
@@ -4609,6 +4829,9 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
             self.ssh_options.connect_timeout.as_secs().max(1)
         ));
         cmd.arg("-i").arg(identity_file.as_ref());
+        if let Some(opts) = rch_common::ssh_utils::identities_only_args(identity_file.as_ref()) {
+            cmd.args(opts);
+        }
         if let Some(interval) = self.ssh_options.server_alive_interval {
             let secs = interval.as_secs();
             if secs > 0 {
@@ -5191,17 +5414,40 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         // large-but-moving transfer is never killed while a dead channel is
         // detected within the silence window instead of the 1-hour cap.
         let silence_policy = self.source_sync_silence_policy(worker);
-        let (output, duration_ms) = run_command_streaming_with_retry(
+        let mut receiver_disk_full = false;
+        let result = run_command_streaming_with_retry(
             &retry_config,
             "sync_to_remote_streaming",
             Some(attempt_timeout),
             silence_policy.as_ref(),
             build_cmd,
-            |line| {
+            |line, origin| {
+                if origin == StreamOrigin::Stderr && rsync_receiver_disk_full(line) {
+                    receiver_disk_full = true;
+                }
                 on_line(line);
             },
         )
-        .await?;
+        .await;
+        let (output, duration_ms) = result.map_err(|error| {
+            // Timeouts, silence aborts and local spawn/I/O errors do not
+            // establish a completed receiver failure. Preserve all their
+            // existing ownership and retry semantics.
+            let failed_exit = error.chain().any(|cause| {
+                matches!(
+                    cause.downcast_ref::<TransferError>(),
+                    Some(TransferError::SyncFailed { exit_code: Some(code), .. }) if *code != 0
+                )
+            });
+            if !self.worker_platform.is_windows() && receiver_disk_full && failed_exit {
+                error.context(RemoteUploadDiskFull {
+                    worker_id: worker.id.to_string(),
+                    roots: vec![remote_path.clone()],
+                })
+            } else {
+                error
+            }
+        })?;
 
         // Same exit-0-but-incomplete guard as the non-streaming sync_to_remote:
         // run_command_streaming returns the combined stdout+stderr, so scan it for
@@ -5331,6 +5577,9 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
             self.ssh_options.connect_timeout.as_secs().max(1)
         ));
         cmd.arg("-i").arg(identity_file.as_ref());
+        if let Some(opts) = rch_common::ssh_utils::identities_only_args(identity_file.as_ref()) {
+            cmd.args(opts);
+        }
         cmd.arg(&destination).arg("sh").arg("-s");
         cmd.kill_on_drop(true);
         cmd.stdin(Stdio::piped())
@@ -5413,6 +5662,9 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
             self.ssh_options.connect_timeout.as_secs().max(1)
         ));
         cmd.arg("-i").arg(identity_file.as_ref());
+        if let Some(opts) = rch_common::ssh_utils::identities_only_args(identity_file.as_ref()) {
+            cmd.args(opts);
+        }
 
         if let Some(interval) = self.ssh_options.server_alive_interval {
             let secs = interval.as_secs();
@@ -5674,6 +5926,27 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         }
     }
 
+    /// Exercise the production retrieval arguments with an owned local worker
+    /// tree in filesystem integration tests. Only the source operand changes;
+    /// no SSH connection or remote execution is claimed by these tests.
+    #[cfg(test)]
+    pub(crate) fn local_artifact_retrieval_for_test(
+        &self,
+        worker: &WorkerConfig,
+        source: &Path,
+        artifact_patterns: &[String],
+    ) -> Command {
+        let planned =
+            self.build_retrieve_command(worker, source.to_str().unwrap(), artifact_patterns);
+        let planned = planned.as_std();
+        let args: Vec<_> = planned.get_args().collect();
+        let mut command = Command::new(planned.get_program());
+        command.args(&args[..args.len() - 2]);
+        command.arg(format!("{}/", source.display()));
+        command.arg(args.last().unwrap());
+        command
+    }
+
     /// Build rsync command for retrieve_artifacts.
     fn build_retrieve_command(
         &self,
@@ -5684,8 +5957,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         let (mut cmd, capabilities) = self.rsync_command();
 
         let identity_file = shellexpand::tilde(&worker.identity_file);
-        let escaped_identity = escape(Cow::from(identity_file.as_ref()));
-        let ssh_command = self.build_rsync_ssh_command(escaped_identity.as_ref());
+        let ssh_command = self.build_rsync_ssh_command(identity_file.as_ref());
 
         // Use --safe-links to prevent symlink traversal attacks from malicious workers.
         // --stats is required so parse_rsync_bytes/parse_rsync_files can read transfer
@@ -5792,9 +6064,8 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         let (mut cmd, capabilities) = self.rsync_command();
 
         let identity_file = shellexpand::tilde(&worker.identity_file);
-        let escaped_identity = escape(Cow::from(identity_file.as_ref()));
 
-        let ssh_command = self.build_rsync_ssh_command(escaped_identity.as_ref());
+        let ssh_command = self.build_rsync_ssh_command(identity_file.as_ref());
 
         cmd.arg("-az");
         add_portable_rsync_archive_args(&mut cmd);
@@ -5871,10 +6142,10 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         cmd
     }
 
-    fn build_rsync_ssh_command(&self, escaped_identity: &str) -> String {
+    fn build_rsync_ssh_command(&self, identity_file: &str) -> String {
         let mut command = format!(
-            "ssh -i {} -o StrictHostKeyChecking=accept-new -o BatchMode=yes",
-            escaped_identity
+            "ssh {} -o StrictHostKeyChecking=accept-new -o BatchMode=yes",
+            rch_common::ssh_utils::identity_shell_args(identity_file)
         );
 
         #[cfg(unix)]
@@ -6075,8 +6346,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         let (mut cmd, capabilities) = self.rsync_command();
 
         let identity_file = shellexpand::tilde(&worker.identity_file);
-        let escaped_identity = escape(Cow::from(identity_file.as_ref()));
-        let ssh_command = self.build_rsync_ssh_command(escaped_identity.as_ref());
+        let ssh_command = self.build_rsync_ssh_command(identity_file.as_ref());
 
         // Same transport hardening as artifact retrieval: --safe-links blocks
         // symlink traversal out of the declared tree.
@@ -6676,7 +6946,7 @@ print('RCH_SOURCE_FRESHNESS_V2 unchanged=%d changed=%d' % (len(current) - len(ch
                 None,
                 None,
                 build_cmd,
-                &mut on_line,
+                |line, _origin| on_line(line),
             )
             .await?
             .0
@@ -7199,6 +7469,12 @@ fn parse_rsync_total_files(output: &str) -> Option<u32> {
     None
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamOrigin {
+    Stdout,
+    Stderr,
+}
+
 /// Pump a child stream into the segment channel, splitting on BOTH `\n` and
 /// `\r`.
 ///
@@ -7209,8 +7485,11 @@ fn parse_rsync_total_files(output: &str) -> Option<u32> {
 /// forward-progress event — exactly what the silence-based stall detector
 /// (issue #59) and the sync heartbeat need to distinguish "large but moving"
 /// from "dead". Empty segments (e.g. the gap inside `\r\n`) are dropped.
-async fn pump_stream_segments<R>(stream: R, tx: tokio::sync::mpsc::Sender<String>)
-where
+async fn pump_stream_segments<R>(
+    stream: R,
+    tx: tokio::sync::mpsc::Sender<(String, StreamOrigin)>,
+    origin: StreamOrigin,
+) where
     R: tokio::io::AsyncRead + Unpin,
 {
     let mut reader = BufReader::new(stream);
@@ -7226,7 +7505,7 @@ where
                 if !pending.is_empty() {
                     let segment = String::from_utf8_lossy(&pending).into_owned();
                     pending.clear();
-                    if tx.send(segment).await.is_err() {
+                    if tx.send((segment, origin)).await.is_err() {
                         return;
                     }
                 }
@@ -7237,7 +7516,7 @@ where
     }
     if !pending.is_empty() {
         let _ = tx
-            .send(String::from_utf8_lossy(&pending).into_owned())
+            .send((String::from_utf8_lossy(&pending).into_owned(), origin))
             .await;
     }
 }
@@ -7250,7 +7529,7 @@ async fn run_command_streaming<F>(
     mut on_line: F,
 ) -> Result<(String, u64)>
 where
-    F: FnMut(&str),
+    F: FnMut(&str, StreamOrigin),
 {
     let start = TokioInstant::now();
     cmd.kill_on_drop(true);
@@ -7269,8 +7548,16 @@ where
     let tx_stderr = tx.clone();
     let tx_stdout = tx.clone();
 
-    tokio::spawn(pump_stream_segments(stdout, tx_stdout));
-    tokio::spawn(pump_stream_segments(stderr, tx_stderr));
+    tokio::spawn(pump_stream_segments(
+        stdout,
+        tx_stdout,
+        StreamOrigin::Stdout,
+    ));
+    tokio::spawn(pump_stream_segments(
+        stderr,
+        tx_stderr,
+        StreamOrigin::Stderr,
+    ));
 
     // Drop the original tx so rx will close when both tasks are done
     drop(tx);
@@ -7298,8 +7585,10 @@ where
                 },
                 None => rx.recv().await,
             };
-            let Some(text) = received else { break };
-            on_line(&text);
+            let Some((text, origin)) = received else {
+                break;
+            };
+            on_line(&text, origin);
             if combined.len() < MAX_RSYNC_OUTPUT {
                 combined.push_str(&text);
                 combined.push('\n');
@@ -7459,7 +7748,7 @@ async fn run_command_streaming_with_retry<F>(
     mut on_line: F,
 ) -> Result<(String, u64)>
 where
-    F: FnMut(&str),
+    F: FnMut(&str, StreamOrigin),
 {
     let start = std::time::Instant::now();
     let mut last_error: Option<anyhow::Error> = None;
@@ -7558,6 +7847,7 @@ where
                         return Err(anyhow::Error::new(TransferAttemptsExhausted {
                             attempts: source_attempts,
                             last_error: detail,
+                            cause: Some(err),
                         }));
                     }
                     return Err(err);
@@ -7575,6 +7865,7 @@ where
     }
 
     if source_attempt_timeout.is_some() {
+        let last_error_cause = last_error;
         let last_error = source_attempts
             .last()
             .map(|attempt| attempt.detail.clone())
@@ -7582,6 +7873,7 @@ where
         return Err(anyhow::Error::new(TransferAttemptsExhausted {
             attempts: source_attempts,
             last_error,
+            cause: last_error_cause,
         }));
     }
 
@@ -7909,7 +8201,10 @@ mod tests {
             receipt,
             "job_id",
             alias.to_str().unwrap(),
+            Some(directory.path().to_str().unwrap()),
             MAX_CARGO_ARTIFACT_EVIDENCE_BYTES,
+            0,
+            CargoOutputLog::Stdout,
         );
         let mut command = Command::new("sh");
         command.arg("-c").arg(script);
@@ -7923,6 +8218,33 @@ mod tests {
         .unwrap();
         assert_eq!(evidence.stdout, log);
         assert_eq!(evidence.remote_root, root.canonicalize().unwrap());
+        assert_eq!(
+            evidence.remote_project_root,
+            Some(directory.path().canonicalize().unwrap())
+        );
+        // Ordinary collection must still succeed without reconstructing the
+        // source path from a generic detached-recovery pipeline.
+        let mut ordinary = Command::new("sh");
+        ordinary.arg("-c").arg(cargo_artifact_evidence_script(
+            receipt,
+            "job_id",
+            alias.to_str().unwrap(),
+            None,
+            MAX_CARGO_ARTIFACT_EVIDENCE_BYTES,
+            0,
+            CargoOutputLog::Stdout,
+        ));
+        let evidence = collect_cargo_artifact_evidence(
+            ordinary,
+            "job_id",
+            MAX_CARGO_ARTIFACT_EVIDENCE_BYTES,
+            Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
+        assert_eq!(evidence.stdout, log);
+        assert_eq!(evidence.remote_root, root.canonicalize().unwrap());
+        assert_eq!(evidence.remote_project_root, None);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -7942,7 +8264,10 @@ mod tests {
                 receipt,
                 "job",
                 directory.path().to_str().unwrap(),
+                Some(directory.path().to_str().unwrap()),
                 limit,
+                0,
+                CargoOutputLog::Stdout,
             );
             let mut command = Command::new("sh");
             command.arg("-c").arg(script);
@@ -8000,7 +8325,10 @@ mod tests {
                 receipt,
                 "job",
                 directory.path().to_str().unwrap(),
+                Some(directory.path().to_str().unwrap()),
                 64,
+                0,
+                CargoOutputLog::Stdout,
             ));
             assert!(
                 collect_cargo_artifact_evidence(command, "job", 64, Duration::from_secs(3))
@@ -8013,20 +8341,35 @@ mod tests {
     #[test]
     fn cargo_artifact_evidence_framing_rejects_partial_or_mismatched_payloads() {
         for bytes in [
-            &b"job 3\n/target\nab"[..],
-            &b"job 2\n/target\nabc"[..],
-            &b"other 3\n/target\nabc"[..],
-            &b"job 3\ntarget\nabc"[..],
-            &b"job 3\n/target/../elsewhere\nabc"[..],
-            &b"job 3\n/target\r\nabc"[..],
+            &b"job 3\n/target\n/source\nab"[..],
+            &b"job 2\n/target\n/source\nabc"[..],
+            &b"other 3\n/target\n/source\nabc"[..],
+            &b"job 3\ntarget\n/source\nabc"[..],
+            &b"job 3\n/target/../elsewhere\n/source\nabc"[..],
+            &b"job 3\n/target/./elsewhere\n/source\nabc"[..],
+            &b"job 3\n/target\r\n/source\nabc"[..],
             &b"job 3\n/target"[..],
+            &b"job 3\n/target\n/source"[..],
+            &b"job 3\n/target\nsource\nabc"[..],
+            &b"job 3\n/target\n/source/../elsewhere\nabc"[..],
+            &b"job 3\n/target\n/source/./elsewhere\nabc"[..],
+            &b"job 3\n/target\n/\nabc"[..],
         ] {
             assert!(parse_cargo_artifact_evidence(bytes.to_vec(), "job", 64).is_err());
         }
         let evidence =
-            parse_cargo_artifact_evidence(b"job 3\n/target\nabc".to_vec(), "job", 64).unwrap();
+            parse_cargo_artifact_evidence(b"job 3\n/target\n/source\nabc".to_vec(), "job", 64)
+                .unwrap();
         assert_eq!(evidence.stdout, b"abc");
         assert_eq!(evidence.remote_root, Path::new("/target"));
+        assert_eq!(
+            evidence.remote_project_root.as_deref(),
+            Some(Path::new("/source"))
+        );
+        let ordinary =
+            parse_cargo_artifact_evidence(b"job 3\n/target\n\nabc".to_vec(), "job", 64).unwrap();
+        assert_eq!(ordinary.stdout, b"abc");
+        assert_eq!(ordinary.remote_project_root, None);
     }
 
     #[cfg(target_os = "linux")]
@@ -10113,6 +10456,220 @@ Number of files transferred: 42
 
     #[cfg(unix)]
     #[test]
+    fn live_checkout_guard_refuses_root_and_dot_components_before_setup() {
+        let retained = tempfile::tempdir().unwrap().keep();
+        let checkout = retained.join("worker's live checkout");
+        std::fs::create_dir(&checkout).unwrap();
+        let git = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .arg(&checkout)
+            .output()
+            .unwrap();
+        assert!(git.status.success(), "{git:?}");
+        let edited = checkout.join("uncommitted.rs");
+        std::fs::write(&edited, b"worker's original edit\n").unwrap();
+        let missing = retained.join("missing");
+        let marker = retained.join("setup-ran");
+
+        for (destination, reason) in [
+            (missing.join("../worker's live checkout"), "dot components"),
+            (missing.join("./child"), "dot components"),
+            (PathBuf::from("/"), "filesystem root"),
+            (PathBuf::from("////"), "filesystem root"),
+            (PathBuf::from("/./"), "dot components"),
+        ] {
+            let command = format!(
+                "{} || exit 73; printf setup > {}",
+                live_checkout_sync_guard(destination.to_str().unwrap()),
+                escape(marker.to_string_lossy()),
+            );
+            let output = std::process::Command::new("sh")
+                .args(["-c", &command])
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(73), "{destination:?}: {output:?}");
+            let diagnostics = String::from_utf8_lossy(&output.stderr);
+            assert!(diagnostics.contains("RCH_SYNC_LIVE_CHECKOUT_REFUSED"));
+            assert!(diagnostics.contains(reason), "{destination:?}: {output:?}");
+            assert!(output.stdout.is_empty());
+            assert!(!marker.exists());
+            assert!(!missing.exists());
+            assert_eq!(std::fs::read(&edited).unwrap(), b"worker's original edit\n");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_checkout_guard_allows_literal_dot_names_and_physical_aliases() {
+        use std::os::unix::fs::symlink;
+
+        let retained = tempfile::tempdir().unwrap().keep();
+        let mirror = retained.join("mirror..cache's α");
+        std::fs::create_dir(&mirror).unwrap();
+        let original = mirror.join("existing.rs");
+        std::fs::write(&original, b"retained source\n").unwrap();
+        let alias = retained.join(".alias..cache");
+        symlink(&mirror, &alias).unwrap();
+
+        for (index, destination) in [
+            mirror.clone(),
+            mirror.join(".generated..cache/new"),
+            alias.join("newchild"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let marker = retained.join(format!("allowed-{index}"));
+            let command = format!(
+                "{} || exit 73; printf ready > {}",
+                live_checkout_sync_guard(destination.to_str().unwrap()),
+                escape(marker.to_string_lossy()),
+            );
+            let output = std::process::Command::new("sh")
+                .args(["-c", &command])
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{destination:?}: {output:?}");
+            assert_eq!(std::fs::read(marker).unwrap(), b"ready");
+            assert_eq!(std::fs::read(&original).unwrap(), b"retained source\n");
+            assert!(!mirror.join(".generated..cache").exists());
+            assert!(!mirror.join("newchild").exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_checkout_guard_preserves_edits_and_allows_isolated_rsync() {
+        use std::os::unix::fs::symlink;
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("incoming");
+        let checkout = directory.path().join("worker's live checkout");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&checkout).unwrap();
+        let git = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .arg(&checkout)
+            .output()
+            .unwrap();
+        assert!(git.status.success(), "{git:?}");
+        std::fs::write(checkout.join("tracked.txt"), "committed\n").unwrap();
+        let staged = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&checkout)
+            .args(["add", "tracked.txt"])
+            .output()
+            .unwrap();
+        assert!(staged.status.success(), "{staged:?}");
+        std::fs::write(checkout.join("tracked.txt"), "worker edit\n").unwrap();
+        std::fs::write(checkout.join("untracked.txt"), "irreplaceable\n").unwrap();
+        std::fs::write(source.join("tracked.txt"), "dispatcher copy\n").unwrap();
+        let alias = directory.path().join("alias");
+        symlink(&checkout, &alias).unwrap();
+        let nested = directory.path().join("nested");
+        std::fs::create_dir_all(nested.join("project/.git")).unwrap();
+        let linked = directory.path().join("linked");
+        std::fs::create_dir_all(&linked).unwrap();
+        std::fs::write(linked.join(".git"), "gitdir: /not/available\n").unwrap();
+        let broken = directory.path().join("broken");
+        symlink(directory.path().join("missing"), &broken).unwrap();
+
+        // Execute the exact receiver wrapper, followed by a real destructive
+        // rsync in this disposable fixture. The post-prune marker also catches
+        // shell-precedence bugs where a refused first command continues later.
+        let run = |destination: &Path| {
+            let pipeline = TransferPipeline::new(
+                source.clone(),
+                "guard-test".into(),
+                "abcdef".into(),
+                TransferConfig::default(),
+            )
+            .with_remote_path_override(destination.to_str().unwrap());
+            let marker = directory.path().join("setup-ran");
+            let command = format!(
+                "printf touched > {}; mkdir -p {} && rsync -a --delete {}/ {}/",
+                escape(marker.to_string_lossy()),
+                escape(destination.to_string_lossy()),
+                escape(source.to_string_lossy()),
+                escape(destination.to_string_lossy()),
+            );
+            std::process::Command::new("sh")
+                .arg("-c")
+                .arg(pipeline.source_rsync_path(command))
+                .output()
+                .unwrap()
+        };
+        for destination in [
+            &checkout,
+            &alias,
+            &checkout.join("new/subdir"),
+            &nested,
+            &linked,
+            &broken,
+        ] {
+            let output = run(destination);
+            assert_eq!(
+                output.status.code(),
+                Some(73),
+                "{destination:?}: {output:?}"
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains("RCH_SYNC_LIVE_CHECKOUT_REFUSED")
+            );
+            assert!(!directory.path().join("setup-ran").exists());
+            assert_eq!(
+                std::fs::read_to_string(checkout.join("tracked.txt")).unwrap(),
+                "worker edit\n"
+            );
+            assert_eq!(
+                std::fs::read_to_string(checkout.join("untracked.txt")).unwrap(),
+                "irreplaceable\n"
+            );
+            assert!(!checkout.join("new").exists());
+        }
+        let mirror = directory.path().join("isolated mirror");
+        let output = run(&mirror);
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(
+            std::fs::read_to_string(mirror.join("tracked.txt")).unwrap(),
+            "dispatcher copy\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_checkout_guard_does_not_block_read_only_result_retrieval() {
+        let directory = tempfile::tempdir().unwrap();
+        let result = directory.path().join("test-result-with-a-checkout");
+        std::fs::create_dir_all(result.join(".git")).unwrap();
+        let mut pipeline = TransferPipeline::new(
+            directory.path().to_owned(),
+            "result-read".into(),
+            "abcdef".into(),
+            TransferConfig::default(),
+        )
+        .with_remote_path_override(result.to_str().unwrap());
+        pipeline.source_authority_prefix = Some("env RCH_ACTIVITY_TEST=owned".into());
+        let read = pipeline.source_rsync_path_at(
+            "test \"$RCH_ACTIVITY_TEST\" = owned && printf readable".into(),
+            result.to_str().unwrap(),
+        );
+        let output = std::process::Command::new("sh")
+            .args(["-c", &read])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(output.stdout, b"readable");
+        let upload = pipeline.source_rsync_path("printf must-not-run".into());
+        let output = std::process::Command::new("sh")
+            .args(["-c", &upload])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(73), "{output:?}");
+        assert!(output.stdout.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn source_activity_rsync_wrapper_preserves_server_argv_and_fences_setup() {
         let directory = tempfile::tempdir().unwrap();
         let destination = directory.path().join("source with spaces");
@@ -10279,6 +10836,416 @@ Number of files transferred: 42
         }
     }
 
+    #[test]
+    fn source_upload_disk_error_requires_receiver_role_and_terminal_errno() {
+        for line in [
+            "rsync: [receiver] write failed on \"a\": No space left on device (28)",
+            "rsync: [generator] recv_generator: mkdir \"src\" failed: No space left on device (28)",
+            "rsync: [receiver] mkstemp \".a.XXXXXX\" failed: Disk quota exceeded (122)",
+            "rsync: [receiver] mkstemp \".a.XXXXXX\" failed: Disk quota exceeded (69)",
+        ] {
+            assert!(rsync_receiver_disk_full(line), "{line}");
+        }
+        for line in [
+            "rsync: [sender] write error: No space left on device (28)",
+            "ssh: write: No space left on device",
+            "No space left on device (28)",
+            "rsync: [receiver] mkstemp \"No space left on device (28)\" failed: Permission denied (13)",
+            "rsync: [receiver] write failed: No space left on device (0)",
+            "rsync: [receiver] write failed: No space left on device (28) ignored",
+            "rsync: [receiver] write failed: No space left on device (28",
+            "rsync: [receiver] write failed: Disk quota exceeded",
+            "rsync: [receiver] write failed: File too large (27)",
+        ] {
+            assert!(!rsync_receiver_disk_full(line), "{line}");
+        }
+    }
+
+    #[cfg(unix)]
+    fn source_upload_disk_fixture(directory: &Path, script: &str) -> TransferPipeline {
+        use std::os::unix::fs::PermissionsExt;
+        let child = directory.join("controlled-rsync");
+        std::fs::write(&child, format!("#!/bin/sh\n{script}\n")).unwrap();
+        std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut pipeline = TransferPipeline::new(
+            directory.to_owned(),
+            "disk-fault".into(),
+            "abcdef".into(),
+            TransferConfig {
+                retry: RetryConfig {
+                    max_attempts: 1,
+                    ..RetryConfig::default()
+                },
+                sync_timeout_ms: Some(30_000),
+                max_transfer_time_ms: Some(30_000),
+                source_sync_silence_timeout_secs: 0,
+                ..TransferConfig::default()
+            },
+        )
+        .with_remote_path_override("/worker-source-volume/project")
+        .with_rsync(ResolvedRsync {
+            path: child,
+            flavor: RsyncFlavor::Rsync {
+                major: 3,
+                minor: 2,
+                patch: 7,
+            },
+            version_line: String::new(),
+            source: RsyncSource::Config,
+            shadowed: None,
+        });
+        // The controlled executable ignores argv; the existing authority tests
+        // exercise the real remote grant. This tests the production streaming
+        // upload/error pipeline, not a live SSH worker or a filled filesystem.
+        pipeline.source_authority_prefix = Some("env RCH_SOURCE_TEST=owned".into());
+        pipeline
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn source_upload_disk_fault_requires_failed_remote_stderr_and_excludes_downloads() {
+        let _guard = test_guard!();
+        let _real = RealTransport::pin();
+        let worker = estimate_test_worker();
+        for (role, stream, exit, expected) in [
+            ("receiver", "2", 23, true),
+            ("generator", "2", 23, true),
+            ("sender", "2", 23, false),
+            ("receiver", "1", 23, false),
+            ("receiver", "2", 0, false),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let pipeline = source_upload_disk_fixture(
+                directory.path(),
+                &format!(
+                    "printf '%s\\n' 'rsync: [{role}] mkstemp failed: No space left on device (28)' >&{stream}\nexit {exit}"
+                ),
+            );
+            let result = pipeline.sync_to_remote_streaming(&worker, |_| {}).await;
+            let fault = result.as_ref().err().and_then(find_remote_upload_disk_full);
+            assert_eq!(
+                fault.is_some(),
+                expected,
+                "{role}, fd{stream}, exit{exit}: {result:?}"
+            );
+            assert_eq!(result.is_ok(), exit == 0);
+            if let Some(fault) = fault {
+                assert_eq!(fault.worker_id, worker.id.as_str());
+                assert_eq!(fault.roots, ["/worker-source-volume/project"]);
+            }
+            if expected {
+                let error = pipeline
+                    .retrieve_artifacts_streaming(&worker, &["target/app".into()], |_| {})
+                    .await
+                    .unwrap_err();
+                assert!(
+                    find_remote_upload_disk_full(&error).is_none(),
+                    "a download receiver is local: {error:#}"
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn source_upload_disk_fault_survives_output_capture_limit() {
+        let _guard = test_guard!();
+        let _real = RealTransport::pin();
+        let directory = tempfile::tempdir().unwrap();
+        let pipeline = source_upload_disk_fixture(
+            directory.path(),
+            "awk 'BEGIN { for (i=0; i<11000; i++) printf \"%01024d\\n\", i; }'\nprintf '%s\\n' 'rsync: [receiver] write failed on a: No space left on device (28)' >&2\nexit 11",
+        );
+        let mut observed_bytes = 0;
+        let error = pipeline
+            .sync_to_remote_streaming(&estimate_test_worker(), |line| observed_bytes += line.len())
+            .await
+            .unwrap_err();
+        assert!(observed_bytes > 10 * 1024 * 1024);
+        assert!(find_remote_upload_disk_full(&error).is_some(), "{error:#}");
+        assert!(error.downcast_ref::<TransferAttemptsExhausted>().is_some());
+        let stderr = error
+            .chain()
+            .find_map(|cause| match cause.downcast_ref::<TransferError>() {
+                Some(TransferError::SyncFailed { stderr, .. }) => Some(stderr),
+                _ => None,
+            })
+            .unwrap();
+        assert!(stderr.contains("[output truncated]"));
+        assert!(
+            !stderr.contains("No space left on device"),
+            "the fault must come from uncapped stderr observation"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn source_upload_disk_diagnostic_before_timeout_is_not_completed_fault_evidence() {
+        let _guard = test_guard!();
+        let _real = RealTransport::pin();
+        let directory = tempfile::tempdir().unwrap();
+        let mut pipeline = source_upload_disk_fixture(
+            directory.path(),
+            "printf '%s\\n' 'rsync: [receiver] mkstemp failed: No space left on device (28)' >&2\nexec sleep 5",
+        );
+        pipeline.transfer_config.sync_timeout_ms = Some(1_000);
+        let mut saw_diagnostic = false;
+        let error = pipeline
+            .sync_to_remote_streaming(&estimate_test_worker(), |line| {
+                saw_diagnostic |= line.contains("No space left on device");
+            })
+            .await
+            .unwrap_err();
+        assert!(saw_diagnostic);
+        assert!(error.to_string().contains("timed out"), "{error:#}");
+        assert!(find_remote_upload_disk_full(&error).is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn source_upload_disk_diagnostic_does_not_quarantine_a_successful_retry() {
+        let _guard = test_guard!();
+        let _real = RealTransport::pin();
+        let directory = tempfile::tempdir().unwrap();
+        let attempts = directory.path().join("attempts");
+        let mut pipeline = source_upload_disk_fixture(
+            directory.path(),
+            &format!(
+                "if [ ! -e {attempts} ]; then\n  printf 'first\\n' > {attempts}\n  printf '%s\\n' 'rsync: [receiver] write failed on a: No space left on device (28)' 'rsync: connection unexpectedly closed' >&2\n  exit 12\nfi\nprintf 'second\\n' >> {attempts}\nprintf 'sent 100 bytes  received 50 bytes\\n'\nexit 0",
+                attempts = escape(attempts.to_string_lossy()),
+            ),
+        );
+        // Owned source grants never retry in place. Exercise the existing
+        // ordinary-transfer retry policy, without relaxing that grant fence.
+        pipeline.source_authority_prefix = None;
+        pipeline.transfer_config.retry = RetryConfig {
+            max_attempts: 2,
+            base_delay_ms: 1,
+            max_delay_ms: 1,
+            jitter_factor: 0.0,
+            total_timeout_ms: 5_000,
+        };
+        let mut saw_disk_diagnostic = false;
+        let result = pipeline
+            .sync_to_remote_streaming(&estimate_test_worker(), |line| {
+                saw_disk_diagnostic |= line.contains("No space left on device");
+            })
+            .await;
+        assert!(saw_disk_diagnostic);
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(
+            std::fs::read_to_string(attempts).unwrap(),
+            "first\nsecond\n"
+        );
+    }
+
+    #[cfg(unix)]
+    async fn archive_upload_disk_git_fixture(root: &Path) -> String {
+        std::fs::write(root.join("source.txt"), "committed source\n").unwrap();
+        for args in [
+            vec!["init", "--quiet"],
+            vec!["add", "source.txt"],
+            vec![
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--quiet",
+                "-m",
+                "fixture",
+            ],
+        ] {
+            let mut command = Command::new("git");
+            configure_clean_git_command(&mut command);
+            let output = command.current_dir(root).args(args).output().await.unwrap();
+            assert!(output.status.success(), "{output:?}");
+        }
+        let mut command = Command::new("git");
+        configure_clean_git_command(&mut command);
+        let output = command
+            .current_dir(root)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .await
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        // The production Git archive must contain committed bytes, not dirt.
+        std::fs::write(root.join("source.txt"), "uncommitted source\n").unwrap();
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn archive_upload_disk_fault_survives_materialization_retry_wrapper() {
+        let _guard = test_guard!();
+        let _real = RealTransport::pin();
+        let directory = tempfile::tempdir().unwrap();
+        let base = archive_upload_disk_git_fixture(directory.path()).await;
+        let received = directory.path().join("received-source");
+        let pipeline = source_upload_disk_fixture(
+            directory.path(),
+            &format!(
+                "while [ \"$#\" -gt 2 ]; do shift; done\n\
+             tar -xOf \"$1\" source.txt > {received} || exit 99\n\
+             printf '%s\\n' 'rsync: [receiver] write failed: No space left on device (28)' >&2\n\
+             exit 11",
+                received = escape(received.to_string_lossy()),
+            ),
+        );
+        let worker = estimate_test_worker();
+        let error = pipeline
+            .materialize_git_archive(&worker, directory.path(), &base)
+            .await
+            .unwrap_err()
+            .context("materialize the immutable source base");
+        assert_eq!(
+            std::fs::read_to_string(received).unwrap(),
+            "committed source\n"
+        );
+        let attempts = error.downcast_ref::<TransferAttemptsExhausted>().unwrap();
+        assert_eq!(attempts.attempts.len(), 1);
+        let fault = find_remote_upload_disk_full(&error).expect("typed terminal receiver evidence");
+        assert_eq!(fault.worker_id, worker.id.as_str());
+        assert_eq!(fault.roots, ["/worker-source-volume/project"]);
+        // Attaching upload evidence must not erase a later ownership fence.
+        let unconfirmed = error.context(RemoteExecutionUnconfirmed);
+        assert!(
+            unconfirmed
+                .downcast_ref::<RemoteExecutionUnconfirmed>()
+                .is_some()
+        );
+        assert!(find_remote_upload_disk_full(&unconfirmed).is_some());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn archive_upload_disk_fault_excludes_stdout_sender_and_local_archive_errors() {
+        let _guard = test_guard!();
+        let _real = RealTransport::pin();
+        let directory = tempfile::tempdir().unwrap();
+        let base = archive_upload_disk_git_fixture(directory.path()).await;
+        let worker = estimate_test_worker();
+        for (role, stream) in [("sender", "2"), ("receiver", "1")] {
+            let pipeline = source_upload_disk_fixture(
+                directory.path(),
+                &format!(
+                    "printf '%s\\n' 'rsync: [{role}] write failed: No space left on device (28)' >&{stream}\nexit 11",
+                ),
+            );
+            let error = pipeline
+                .materialize_git_archive(&worker, directory.path(), &base)
+                .await
+                .unwrap_err();
+            assert!(error.downcast_ref::<TransferAttemptsExhausted>().is_some());
+            assert!(find_remote_upload_disk_full(&error).is_none(), "{error:#}");
+        }
+        let invoked = directory.path().join("unexpected-upload");
+        let pipeline = source_upload_disk_fixture(
+            directory.path(),
+            &format!(
+                "touch {}\nprintf '%s\\n' 'rsync: [receiver] write failed: No space left on device (28)' >&2\nexit 11",
+                escape(invoked.to_string_lossy()),
+            ),
+        );
+        let error = pipeline
+            .materialize_git_archive(&worker, directory.path(), &"0".repeat(40))
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("git archive failed"),
+            "{error:#}"
+        );
+        assert!(find_remote_upload_disk_full(&error).is_none());
+        assert!(
+            !invoked.exists(),
+            "local archive failure must precede upload"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn archive_upload_disk_diagnostic_before_timeout_has_no_completed_evidence() {
+        let _guard = test_guard!();
+        let _real = RealTransport::pin();
+        let directory = tempfile::tempdir().unwrap();
+        let base = archive_upload_disk_git_fixture(directory.path()).await;
+        let started = directory.path().join("upload-started");
+        let mut pipeline = source_upload_disk_fixture(
+            directory.path(),
+            &format!(
+                "printf '%s\\n' 'rsync: [receiver] write failed: No space left on device (28)' >&2\ntouch {}\nexec sleep 5",
+                escape(started.to_string_lossy()),
+            ),
+        );
+        pipeline.transfer_config.sync_timeout_ms = Some(1_000);
+        let error = pipeline
+            .materialize_git_archive(&estimate_test_worker(), directory.path(), &base)
+            .await
+            .unwrap_err();
+        assert!(started.exists(), "controlled child emitted its diagnostic");
+        assert!(error.to_string().contains("timed out"), "{error:#}");
+        assert!(find_remote_upload_disk_full(&error).is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn archive_upload_disk_fault_is_discarded_after_successful_or_unrelated_retry() {
+        let _guard = test_guard!();
+        let directory = tempfile::tempdir().unwrap();
+        let worker = estimate_test_worker();
+        let retry = RetryConfig {
+            max_attempts: 2,
+            base_delay_ms: 1,
+            max_delay_ms: 1,
+            jitter_factor: 0.0,
+            total_timeout_ms: 5_000,
+        };
+        // Exercise the actual upload completion/retry boundary. Successful
+        // materialization also performs SSH extraction, outside this fixture.
+        for final_exit in [0, 23] {
+            let result = run_source_transfer_attempts(
+                &retry,
+                std::time::Duration::from_secs(5),
+                "clean_overlay_base_sync",
+                |attempt| {
+                    let worker = &worker;
+                    let root = directory.path();
+                    async move {
+                        let script = if attempt == 1 {
+                            "printf '%s\\n' 'rsync: [receiver] write failed: No space left on device (28)' 'rsync: connection unexpectedly closed' >&2\nexit 12".to_string()
+                        } else {
+                            // Even matching stderr cannot make a success a
+                            // fault. The failure variant is sender-side only.
+                            let role = if final_exit == 0 { "receiver" } else { "sender" };
+                            format!("printf '%s\\n' 'rsync: [{role}] write failed: No space left on device (28)' >&2\nexit {final_exit}")
+                        };
+                        let output = Command::new("sh").args(["-c", &script])
+                            .current_dir(root).output().await?;
+                        check_archive_upload_result(&output, worker, "/worker-source-volume/project")
+                    }
+                },
+            ).await;
+            match result {
+                Ok(((), attempts)) => {
+                    assert_eq!(final_exit, 0);
+                    assert_eq!(attempts.len(), 2);
+                    assert_eq!(attempts[0].outcome, "retryable");
+                    assert_eq!(attempts[1].outcome, "succeeded");
+                }
+                Err(error) => {
+                    assert_eq!(final_exit, 23);
+                    assert_eq!(error.attempts.len(), 2);
+                    assert_eq!(error.attempts[0].outcome, "retryable");
+                    let error = anyhow::Error::new(error);
+                    assert!(find_remote_upload_disk_full(&error).is_none(), "{error:#}");
+                }
+            }
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn source_grant_does_not_authorize_pruning_sibling_target_pools() {
@@ -10363,7 +11330,8 @@ Number of files transferred: 42
 
         // bd-wfumv: every source upload reaps stale worker-side runtime state
         // ahead of the transfer, with durable caches on a much longer floor.
-        assert!(path_val.starts_with("find "));
+        assert!(path_val.starts_with("(set -eu\n"));
+        assert!(path_val.contains("RCH_SYNC_LIVE_CHECKOUT_REFUSED"));
         assert!(path_val.contains(&format!(
             "find {root}/.rch-tmp -mindepth 1 -maxdepth 1 ! -name 'rch-cargo-cache-*' -mmin +{WORKER_TMP_PRUNE_MAX_AGE_MINS}"
         )));
@@ -10600,6 +11568,33 @@ Number of files transferred: 42
     // =========================================================================
     // rsync flavour argv (issue #66)
     // =========================================================================
+
+    #[test]
+    fn source_content_barrier_changes_only_ssh_log_verbosity() {
+        let _guard = test_guard!();
+        let worker = flavour_test_worker();
+        let pipeline = flavour_test_pipeline(RsyncFlavor::Unknown, 0);
+        let remote = pipeline.remote_path();
+        let destination = pipeline.rsync_remote_spec(&worker, &remote);
+        let escaped = escape(Cow::from(remote.as_str()));
+        let upload =
+            command_args(&pipeline.build_sync_command(&worker, &destination, &escaped, &[]));
+        let barrier =
+            command_args(&pipeline.build_source_content_rsync_barrier_command(&worker, &[]));
+        let ssh = |args: &[String]| {
+            args.windows(2)
+                .find(|pair| pair[0] == "-e")
+                .expect("SSH transport")[1]
+                .clone()
+        };
+        let ordinary = ssh(&upload);
+        assert_eq!(ssh(&barrier), format!("{ordinary} -o LogLevel=ERROR"));
+        assert!(ordinary.contains("StrictHostKeyChecking=accept-new"));
+        assert!(ordinary.contains("BatchMode=yes"));
+        assert!(!ordinary.contains("LogLevel"));
+        assert!(barrier.contains(&"--checksum".to_owned()));
+        assert!(barrier.contains(&"-azn".to_owned()));
+    }
 
     #[test]
     fn rsync_remote_paths_cover_upload_barrier_estimate_and_retrieval() {
@@ -15087,7 +16082,7 @@ Total file size: 123 bytes";
             "test_streaming_rsync",
             std::time::Duration::from_millis(25),
             None,
-            |_| {},
+            |_, _| {},
         )
         .await
         .expect_err("streaming child should time out");
@@ -15129,7 +16124,7 @@ Total file size: 123 bytes";
             "stalled_source_sync",
             std::time::Duration::from_secs(30),
             Some(&policy),
-            |_| {},
+            |_, _| {},
         )
         .await
         .expect_err("a silent child must be aborted by the silence timeout");
@@ -15168,7 +16163,7 @@ Total file size: 123 bytes";
             "progressing_source_sync",
             std::time::Duration::from_secs(30),
             Some(&policy),
-            |_| {},
+            |_, _| {},
         )
         .await
         .expect("slow-but-progressing stream must complete (total > silence window)");
@@ -15194,7 +16189,7 @@ Total file size: 123 bytes";
             "cr_segment_split",
             std::time::Duration::from_secs(10),
             None,
-            move |line| seen_in.lock().unwrap().push(line.to_string()),
+            move |line, _origin| seen_in.lock().unwrap().push(line.to_string()),
         )
         .await
         .expect("segmented stream completes");
@@ -15239,7 +16234,7 @@ Total file size: 123 bytes";
                 cmd.stderr(std::process::Stdio::piped());
                 cmd
             },
-            |_| {},
+            |_, _| {},
         )
         .await
         .expect_err("stalled sync must fail without in-place retries");
@@ -15326,7 +16321,7 @@ Total file size: 123 bytes";
                 cmd.stderr(std::process::Stdio::piped());
                 cmd
             },
-            |_line| {
+            |_line, _origin| {
                 lines_in.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             },
         )
@@ -15374,7 +16369,7 @@ Total file size: 123 bytes";
                 cmd.stderr(std::process::Stdio::piped());
                 cmd
             },
-            |_| {},
+            |_, _| {},
         )
         .await
         .expect_err("non-transport streaming failure should fail fast as Err");
@@ -15419,7 +16414,7 @@ Total file size: 123 bytes";
                 cmd.stderr(std::process::Stdio::piped());
                 cmd
             },
-            |_| {},
+            |_, _| {},
         )
         .await
         .expect("should recover on the second attempt");
@@ -15460,7 +16455,7 @@ Total file size: 123 bytes";
                 command.stdout(Stdio::piped()).stderr(Stdio::piped());
                 command
             },
-            |_| {},
+            |_, _| {},
         )
         .await
         .expect("attempt 2 should receive a fresh 200ms source-sync budget");
@@ -15500,7 +16495,7 @@ Total file size: 123 bytes";
                     .stderr(Stdio::piped());
                 command
             },
-            |_| {},
+            |_, _| {},
         )
         .await
         .expect_err("source streaming retries must exhaust exactly");

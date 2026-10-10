@@ -302,6 +302,10 @@ pub struct BypassRecord {
     pub auto_rejoin: AutoRejoinCriteria,
     /// Whether local fallback was allowed for commands affected by this bypass.
     pub local_fallback_allowed: bool,
+    /// Remote source/output roots from confirmed disk failures. Retained
+    /// through canary and restart so recovery cannot inspect another volume.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disk_roots: Vec<String>,
     /// Compact, ordered free-form details (small, bounded; not for secrets).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub details: BTreeMap<String, String>,
@@ -337,6 +341,7 @@ impl BypassRecord {
             last_diagnostic: String::new(),
             auto_rejoin: AutoRejoinCriteria::default(),
             local_fallback_allowed: true,
+            disk_roots: Vec::new(),
             details: BTreeMap::new(),
         }
     }
@@ -561,8 +566,8 @@ impl BypassRecordStore {
         Ok(removed)
     }
 
-    /// Atomically write the current records to disk (temp-file + rename), so a
-    /// concurrent reader never observes a partial file.
+    /// Atomically and durably publish the records. The file and directory
+    /// must reach storage before an owner-bound failure receipt is acknowledged.
     fn persist(&self) -> std::io::Result<()> {
         if let Some(parent) = self.path.parent()
             && !parent.as_os_str().is_empty()
@@ -576,7 +581,11 @@ impl BypassRecordStore {
         let body = serde_json::to_vec_pretty(&doc)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
-        let parent = self.path.parent().unwrap_or_else(|| Path::new("."));
+        let parent = self
+            .path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
         let tmp = parent.join(format!(".bypass_records.{}.tmp", std::process::id()));
         {
             let mut tmp_file = OpenOptions::new()
@@ -586,14 +595,12 @@ impl BypassRecordStore {
                 .open(&tmp)?;
             tmp_file.write_all(&body)?;
             tmp_file.flush()?;
+            tmp_file.sync_all()?;
         }
-        match fs::rename(&tmp, &self.path) {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                let _ = fs::remove_file(&tmp);
-                Err(e)
-            }
-        }
+        fs::rename(&tmp, &self.path)?;
+        #[cfg(unix)]
+        fs::File::open(parent)?.sync_all()?;
+        Ok(())
     }
 }
 

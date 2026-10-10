@@ -43,6 +43,7 @@ async fn resume_queued_selection(
     socket_path: &str,
     query: &str,
     deadline: tokio::time::Instant,
+    disk_headroom_gib: u32,
 ) -> anyhow::Result<SelectionResponse> {
     let result = async {
         let stream = loop {
@@ -72,7 +73,8 @@ async fn resume_queued_selection(
             }
         };
         let (reader, mut writer) = stream.into_split();
-        let request = format!("GET /select-worker/resume-queued?{query}\n");
+        let route = selection_route(disk_headroom_gib, true);
+        let request = format!("GET {route}?{query}\n");
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         anyhow::ensure!(
             !remaining.is_zero(),
@@ -324,6 +326,7 @@ pub(crate) async fn query_daemon(
     socket_path: &str,
     project: &str,
     cores: u32,
+    disk_headroom_gib: u32,
     command: &str,
     toolchain: Option<&ToolchainInfo>,
     required_runtime: RequiredRuntime,
@@ -340,6 +343,7 @@ pub(crate) async fn query_daemon(
         socket_path,
         project,
         cores,
+        disk_headroom_gib,
         command,
         toolchain,
         required_runtime,
@@ -364,6 +368,7 @@ pub(crate) async fn query_daemon_dry_run(
     socket_path: &str,
     project: &str,
     cores: u32,
+    disk_headroom_gib: u32,
     command: &str,
     toolchain: Option<&ToolchainInfo>,
     required_runtime: RequiredRuntime,
@@ -373,6 +378,7 @@ pub(crate) async fn query_daemon_dry_run(
         socket_path,
         project,
         cores,
+        disk_headroom_gib,
         command,
         toolchain,
         required_runtime,
@@ -394,6 +400,7 @@ async fn query_daemon_with_mode(
     socket_path: &str,
     project: &str,
     cores: u32,
+    disk_headroom_gib: u32,
     command: &str,
     toolchain: Option<&ToolchainInfo>,
     required_runtime: RequiredRuntime,
@@ -444,6 +451,9 @@ async fn query_daemon_with_mode(
 
     // Build query string
     let mut query = format!("project={}&cores={}", urlencoding_encode(project), cores);
+    if disk_headroom_gib > 0 {
+        query.push_str(&format!("&disk_headroom_gib={disk_headroom_gib}"));
+    }
     query.push_str(&format!("&command={}", urlencoding_encode(command)));
 
     if let Some(tc) = toolchain
@@ -528,7 +538,8 @@ async fn query_daemon_with_mode(
     }
 
     // Bound writes independently from the longer, queue-aware response wait.
-    let request = format!("GET /select-worker?{}\n", query);
+    let route = selection_route(disk_headroom_gib, false);
+    let request = format!("GET {route}?{query}\n");
     let response_budget = daemon_response_timeout(wait_for_worker);
     let deadline = tokio::time::Instant::now() + response_budget;
     let result = timeout(
@@ -565,7 +576,7 @@ async fn query_daemon_with_mode(
             // The query is byte-identical, including the original timeout,
             // worker pins and toolchain/tool constraints. The daemon checks
             // these against durable queue ownership before selecting.
-            resume_queued_selection(socket_path, &query, deadline).await?
+            resume_queued_selection(socket_path, &query, deadline, disk_headroom_gib).await?
         }
         Err(error) => return Err(error),
     };
@@ -622,6 +633,18 @@ async fn query_daemon_with_mode(
     Ok(response)
 }
 
+/// Positive budgets use an exact route that older daemons cannot admit.
+/// Merely adding a query parameter would let an older daemon ignore the hard
+/// requirement and reserve a worker without accounting for any disk budget.
+fn selection_route(disk_headroom_gib: u32, resume: bool) -> &'static str {
+    match (disk_headroom_gib > 0, resume) {
+        (false, false) => "/select-worker",
+        (false, true) => "/select-worker/resume-queued",
+        (true, false) => "/select-worker/disk-budget",
+        (true, true) => "/select-worker/resume-queued/disk-budget",
+    }
+}
+
 /// Release reserved slots on a worker.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn release_worker(
@@ -646,6 +669,8 @@ pub(crate) async fn release_worker(
         timing,
         local_wrapper_id,
         false,
+        false,
+        &[],
     )
     .await
 }
@@ -653,7 +678,8 @@ pub(crate) async fn release_worker(
 /// [`release_worker`] for a completed remote run, also telling the daemon
 /// whether the failure blamed the worker (`worker_fault`, see
 /// `remote_failure_is_worker_fault`). The daemon then records no cache warmth
-/// for it. Older daemons ignore the unknown query parameter.
+/// for it. Confirmed disk exhaustion also enters temporary bypass until the
+/// recovery service measures headroom. Older daemons ignore unknown parameters.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn release_worker_with_fault(
     socket_path: &str,
@@ -666,6 +692,8 @@ pub(crate) async fn release_worker_with_fault(
     timing: Option<&CommandTimingBreakdown>,
     local_wrapper_id: Option<&str>,
     worker_fault: bool,
+    worker_disk_full: bool,
+    worker_disk_roots: &[String],
 ) -> anyhow::Result<()> {
     if !Path::new(socket_path).exists() {
         anyhow::bail!("daemon socket is missing; release was not acknowledged");
@@ -704,6 +732,13 @@ pub(crate) async fn release_worker_with_fault(
     }
     if worker_fault {
         request.push_str("&worker_fault=1");
+    }
+    if worker_disk_full {
+        request.push_str("&worker_disk_full=1");
+        request.push_str(&format!(
+            "&worker_disk_roots={}",
+            urlencoding_encode(&serde_json::to_string(worker_disk_roots)?)
+        ));
     }
     request.push('\n');
 
@@ -980,6 +1015,7 @@ mod bounded_ipc_tests {
                     path.to_str().unwrap(),
                     "project",
                     1,
+                    0,
                     "cargo build",
                     toolchain.as_ref(),
                     RequiredRuntime::Rust,
@@ -1010,6 +1046,7 @@ mod bounded_ipc_tests {
                 path.to_str().unwrap(),
                 "project",
                 1,
+                0,
                 "cargo build",
                 toolchain.as_ref(),
                 RequiredRuntime::Rust,
@@ -1076,6 +1113,7 @@ mod bounded_ipc_tests {
             path.to_str().unwrap(),
             "project",
             1,
+            0,
             "cargo build",
             Some(&info),
             RequiredRuntime::Rust,
@@ -1214,7 +1252,9 @@ mod bounded_ipc_tests {
     async fn release_carries_the_worker_fault_flag_only_when_set() {
         // Review of GH #81: the daemon withholds cache warmth for a failure
         // the hook blamed on the worker, so the flag must reach the wire.
-        for worker_fault in [true, false] {
+        for (worker_fault, worker_disk_full) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
             let root = tempfile::tempdir().unwrap().keep();
             let path = root.join("ipc.sock");
             let listener = tokio::net::UnixListener::bind(&path).unwrap();
@@ -1241,6 +1281,8 @@ mod bounded_ipc_tests {
                 None,
                 None,
                 worker_fault,
+                worker_disk_full,
+                &[],
             );
             let (result, request) = timeout(Duration::from_secs(2), async {
                 tokio::join!(client, server)
@@ -1255,6 +1297,11 @@ mod bounded_ipc_tests {
             assert_eq!(
                 request.contains("&worker_fault=1"),
                 worker_fault,
+                "{request}"
+            );
+            assert_eq!(
+                request.contains("&worker_disk_full=1"),
+                worker_disk_full,
                 "{request}"
             );
         }

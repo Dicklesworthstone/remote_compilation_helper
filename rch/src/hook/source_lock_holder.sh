@@ -4,8 +4,20 @@ set -eu
 portable=no
 if [ "${1-}" = --rch-gnu-holder ]; then
     shift
-elif [ "$(uname -s)" = Darwin ]; then
-    portable=yes
+else
+    platform=$(uname -s)
+    case "$platform" in
+        Darwin) portable=yes ;;
+        Linux)
+            # Large closures otherwise exec flock AND sh once per lock. Reuse
+            # the native single-process holder when Python is available. Keep
+            # small plans on GNU: interpreter startup dominates their cost.
+            # The recursive marker above pins the backend for the whole plan.
+            if [ "${1-0}" -ge 32 ] && command -v python3 >/dev/null 2>&1; then
+                portable=yes
+            fi
+            ;;
+    esac
 fi
 remaining=$1
 shift
@@ -22,14 +34,15 @@ if [ "$remaining" -eq 0 ]; then
     exec cat >/dev/null
 fi
 if [ "$portable" = yes ]; then
-    # Darwin flock implementations need not provide GNU --no-fork. Acquire
-    # native flock(2) locks in ONE process instead; do not replace them with
+    # Darwin requires this backend; Linux large closures use it to avoid the
+    # per-root exec chain. Acquire native flock(2) locks in ONE process; never
+    # retry a failed native acquisition through GNU or replace these locks with
     # process-associated POSIX record locks or a shell/flock process per root.
     # Python is only a bootstrap: exec preserves PID and every acquired FD.
     # fd 3 is the plan, fd 4 (when present) is the durable claim input, and
     # stdin remains untouched for the release/disconnect protocol.
     command -v python3 >/dev/null 2>&1 || {
-        printf '%s\n' 'RCH: Darwin source locking requires python3 with fcntl; no source grant acquired' >&2
+        printf 'RCH: %s source locking requires python3 with fcntl; no source grant acquired\n' "$platform" >&2
         exit 73
     }
     exec python3 -I -c '

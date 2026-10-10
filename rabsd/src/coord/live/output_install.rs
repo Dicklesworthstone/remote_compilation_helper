@@ -365,9 +365,13 @@ pub(super) fn prepare(
                 }
                 for dep in deps {
                     let input = PathBuf::from(std::ffi::OsString::from_vec(dep));
-                    if !input.is_absolute()
-                        || input.components().any(|part| part == Component::ParentDir)
-                    {
+                    // rustc reports `include_str!("../../README.md")` from
+                    // `src/` as `<abs>/src/../../README.md`. Publication's
+                    // closure check already proved such a read inside the
+                    // keyed, symlink-free capture, and Cargo stats exactly
+                    // this spelling for freshness, so stat it as written.
+                    // Only a cwd-relative spelling lacks a contract.
+                    if !input.is_absolute() {
                         return Err(preparation(
                             &output.destination,
                             "relative dep-info inputs require a subscriber working-directory contract",

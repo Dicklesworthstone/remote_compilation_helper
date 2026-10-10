@@ -1214,7 +1214,7 @@ mod managed_build_dir_tests {
             .partition_staged_artifact_paths(&inventory, &patterns)
             .unwrap();
         let archive = PathBuf::from("package/managed_package_fixture-0.1.0.crate");
-        assert_eq!(selected, [archive.clone()]);
+        assert_eq!(selected, std::slice::from_ref(&archive));
         let mut rsync = Command::new("/usr/bin/timeout") // ubs:ignore — copies only production-selected fixture archives, locally.
             .args([
                 "--kill-after=5",

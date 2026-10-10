@@ -11,17 +11,19 @@ use std::time::{Duration, Instant};
 
 const SLO_MS: f64 = 10.0;
 
+/// Always ask Cargo, once per test process: it is a no-op when fresh, and a
+/// daemon left over from an older tree must never answer for this one.
 fn rabsd_bin() -> std::path::PathBuf {
-    let path = std::path::Path::new(env!("CARGO_BIN_EXE_rabs-wrap")).with_file_name("rabsd");
-    if !path.exists() {
+    static BUILT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    BUILT.get_or_init(|| {
         let mut build = Command::new(env!("CARGO"));
         build.args(["build", "-p", "rabsd", "--bin", "rabsd"]);
         if !cfg!(debug_assertions) {
             build.arg("--release");
         }
         assert!(build.status().expect("build rabsd").success());
-    }
-    path
+    });
+    std::path::Path::new(env!("CARGO_BIN_EXE_rabs-wrap")).with_file_name("rabsd")
 }
 
 #[test]

@@ -21,7 +21,7 @@ pub use types::{Channel, UpdateCheck};
 
 use crate::commands;
 use crate::ui::OutputContext;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use types::UpdateError;
 
 /// Main entry point for the update command.
@@ -102,22 +102,34 @@ pub async fn run_update(
     // Download and verify
     let download = download_release(ctx, &update_info, skip_verify).await?;
 
-    if !download.checksum_verified {
-        let asset = download
-            .archive_path
-            .file_name()
-            .map(|name| name.to_string_lossy().to_string())
-            .unwrap_or_else(|| "unknown".to_string());
-
-        if skip_verify {
-            if !ctx.is_json() {
-                println!(
-                    "Warning: proceeding without checksum verification for {} (--skip-verify)",
-                    asset
-                );
-            }
-        } else {
-            return Err(UpdateError::ChecksumMissing { asset }.into());
+    let asset = download
+        .archive_path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    // A checksum obtained alongside an archive proves integrity, not who
+    // published it. Missing signature assets or a missing cosign executable
+    // must not silently downgrade an ordinary update to checksum-only.
+    // This gate precedes the install lock, daemon drain, replacement and fleet
+    // deployment, so an unauthenticated download cannot mutate installation.
+    require_update_verification(
+        &asset,
+        download.checksum_verified,
+        download.signature_verified,
+        skip_verify,
+    )?;
+    if skip_verify && (!download.checksum_verified || download.signature_verified != Some(true)) {
+        tracing::warn!(
+            asset = %asset,
+            checksum_verified = download.checksum_verified,
+            signature_verified = ?download.signature_verified,
+            "Installing an unverified update by explicit --skip-verify request"
+        );
+        if !ctx.is_json() {
+            println!(
+                "Warning: installing {} without complete checksum/signature verification (--skip-verify)",
+                asset
+            );
         }
     }
 
@@ -137,6 +149,41 @@ pub async fn run_update(
         update_fleet(ctx, &update_info, dry_run).await?;
     }
 
+    Ok(())
+}
+
+/// Authorize installation from completed cryptographic verification results,
+/// never from the presence of signature metadata alone. Both supported
+/// verifiers (pinned minisign or identity-bound Sigstore) report `Some(true)`.
+/// An explicit operator override may permit absent verification, but a known
+/// failed signature remains fatal. The download path already refuses invalid
+/// signatures and mismatched checksums before it can construct these results.
+fn require_update_verification(
+    asset: &str,
+    checksum_verified: bool,
+    signature_verified: Option<bool>,
+    skip_verify: bool,
+) -> Result<(), UpdateError> {
+    if signature_verified == Some(false) {
+        return Err(UpdateError::SignatureVerificationFailed(format!(
+            "refusing to install {asset}: its signature verification failed"
+        )));
+    }
+    if !skip_verify {
+        if !checksum_verified {
+            return Err(UpdateError::ChecksumMissing {
+                asset: asset.to_owned(),
+            });
+        }
+        if signature_verified != Some(true) {
+            return Err(UpdateError::SignatureVerificationFailed(format!(
+                "refusing to install {asset} without an authenticated signature; \
+                 a matching checksum alone does not prove release authenticity. \
+                 Use a release with a valid pinned-key .minisig or a verified \
+                 Sigstore bundle. --skip-verify is an explicit insecure override"
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -170,31 +217,159 @@ fn display_update_check(ctx: &OutputContext, info: &UpdateCheck, show_changelog:
     }
 }
 
-/// Verify the current installation integrity.
+/// Check installed executables, not release signatures or file authenticity.
 async fn verify_installation(ctx: &OutputContext) -> Result<()> {
     if !ctx.is_json() {
-        println!("Verifying installation...");
+        println!("Checking installed binary versions...");
     }
-
-    // Check that binaries exist and can report versions
-    let rch_version = std::process::Command::new(std::env::current_exe()?)
-        .arg("--version")
-        .output()?;
-
-    if rch_version.status.success() {
-        let version = String::from_utf8_lossy(&rch_version.stdout);
-        if !ctx.is_json() {
-            println!("rch: {}", version.trim());
+    let report = inspect_installation(
+        &std::env::current_exe()?,
+        env!("CARGO_PKG_VERSION"),
+        std::time::Duration::from_secs(10),
+    )
+    .await?;
+    if ctx.is_json() {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        for component in report["components"].as_array().into_iter().flatten() {
+            println!(
+                "{}: {}",
+                component["name"].as_str().unwrap_or_default(),
+                component["version"].as_str().unwrap_or_default()
+            );
         }
+        for name in report["absent_optional_components"]
+            .as_array()
+            .into_iter()
+            .flatten()
+        {
+            println!(
+                "{}: not installed (optional)",
+                name.as_str().unwrap_or_default()
+            );
+        }
+        println!("Installed binary version checks passed (not a checksum or signature check).");
     }
-
-    // Note: checksum verification is enforced during update downloads.
-
-    if !ctx.is_json() {
-        println!("Installation verified.");
-    }
-
     Ok(())
+}
+
+/// Never search PATH for companion binaries: that could validate an unrelated
+/// installation while the siblings actually used by this client are broken.
+/// Client-only installations are supported; absent companions are disclosed,
+/// but an unreadable, broken-link, or nonregular companion is not "absent".
+async fn inspect_installation(
+    executable: &std::path::Path,
+    expected_version: &str,
+    timeout: std::time::Duration,
+) -> Result<serde_json::Value> {
+    anyhow::ensure!(
+        executable.is_absolute(),
+        "installed client path must be absolute"
+    );
+    let directory = executable
+        .parent()
+        .context("installed client has no parent directory")?;
+    let mut components = Vec::new();
+    let mut absent = Vec::new();
+    for name in ["rch", "rchd", "rch-wkr"] {
+        let path = if name == "rch" {
+            executable.to_owned()
+        } else {
+            directory.join(format!("{name}{}", std::env::consts::EXE_SUFFIX))
+        };
+        match std::fs::symlink_metadata(&path) {
+            Err(error) if name != "rch" && error.kind() == std::io::ErrorKind::NotFound => {
+                absent.push(name);
+                continue;
+            }
+            result => {
+                result.with_context(|| {
+                    format!("cannot inspect installed {name}: {}", path.display())
+                })?;
+            }
+        }
+        anyhow::ensure!(
+            std::fs::metadata(&path)
+                .with_context(|| format!("cannot resolve installed {name}: {}", path.display()))?
+                .is_file(),
+            "installed {name} is not a regular executable file: {}",
+            path.display()
+        );
+        let version = probe_installed_version(&path, name, expected_version, timeout).await?;
+        components.push(serde_json::json!({"name": name, "path": path, "version": version}));
+    }
+    Ok(serde_json::json!({
+        "verified": true,
+        "verification_scope": "installed_binary_versions",
+        "cryptographic_verification": false,
+        "components": components,
+        "absent_optional_components": absent,
+    }))
+}
+
+/// A corrupt executable must not block the async runtime, consume unbounded
+/// output memory, or claim a successful verification on a failed --version.
+async fn probe_installed_version(
+    path: &std::path::Path,
+    name: &str,
+    expected: &str,
+    timeout: std::time::Duration,
+) -> Result<String> {
+    use crate::transfer::read_bounded_output_stream;
+    use std::process::Stdio;
+
+    let mut child = tokio::process::Command::new(path)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .with_context(|| format!("cannot execute installed {name}: {}", path.display()))?;
+    let stdout = child.stdout.take().context("version probe lacks stdout")?;
+    let stderr = child.stderr.take().context("version probe lacks stderr")?;
+    let captured = tokio::time::timeout(timeout, async {
+        tokio::try_join!(
+            read_bounded_output_stream(stdout, 64 * 1024),
+            read_bounded_output_stream(stderr, 64 * 1024),
+            child.wait(),
+        )
+    })
+    .await;
+    let (stdout, stderr, status) = match captured {
+        Ok(Ok(output)) => output,
+        Ok(Err(error)) => {
+            let _ = child.start_kill();
+            return Err(error).with_context(|| format!("installed {name} version probe failed"));
+        }
+        Err(_) => {
+            let _ = child.start_kill();
+            anyhow::bail!("installed {name} version probe timed out after {timeout:?}");
+        }
+    };
+    anyhow::ensure!(
+        status.success(),
+        "installed {name} --version failed ({status}): {}",
+        String::from_utf8_lossy(&stderr).trim()
+    );
+    anyhow::ensure!(
+        stderr.is_empty(),
+        "installed {name} --version produced diagnostics: {}",
+        String::from_utf8_lossy(&stderr).trim()
+    );
+    let output = std::str::from_utf8(&stdout)
+        .context("version output was not UTF-8")?
+        .trim();
+    let mut fields = output.split_whitespace();
+    let reported_name = fields.next().unwrap_or_default();
+    let version = fields.next().unwrap_or_default();
+    anyhow::ensure!(
+        !output.chars().any(char::is_control)
+            && reported_name.strip_suffix(".exe").unwrap_or(reported_name) == name
+            && version == expected,
+        "installed {name} did not report the expected version {expected}: {output:?}"
+    );
+    Ok(version.to_owned())
 }
 
 /// Update fleet of workers.
@@ -227,6 +402,49 @@ mod tests {
     use crate::commands::set_test_config_dir_override;
     use crate::ui::{OutputConfig, OutputMode};
     use types::Version;
+
+    #[test]
+    fn update_verification_rejects_checksum_only_installation() {
+        // Covers missing .minisig/.sigstore.json assets, and a Sigstore-only
+        // release on a host without cosign. All leave signature_verified=None
+        // even when an attacker supplied a matching recomputed checksum.
+        let error = require_update_verification("rch.tar.gz", true, None, false).unwrap_err();
+        assert!(matches!(
+            error,
+            UpdateError::SignatureVerificationFailed(ref reason)
+                if reason.contains("without an authenticated signature")
+                    && reason.contains("rch.tar.gz")
+        ));
+    }
+
+    #[test]
+    fn update_verification_requires_both_checksum_and_signature() {
+        assert!(require_update_verification("rch.tar.gz", true, Some(true), false).is_ok());
+        assert!(matches!(
+            require_update_verification("rch.tar.gz", false, Some(true), false),
+            Err(UpdateError::ChecksumMissing { asset }) if asset == "rch.tar.gz"
+        ));
+    }
+
+    #[test]
+    fn update_verification_requires_explicit_override_for_absent_proof() {
+        for checksum in [false, true] {
+            assert!(require_update_verification("rch.zip", checksum, None, false).is_err());
+            assert!(require_update_verification("rch.zip", checksum, None, true).is_ok());
+        }
+    }
+
+    #[test]
+    fn update_verification_never_permits_a_known_failed_signature() {
+        for checksum in [false, true] {
+            for skip_verify in [false, true] {
+                assert!(matches!(
+                    require_update_verification("rch.zip", checksum, Some(false), skip_verify),
+                    Err(UpdateError::SignatureVerificationFailed(_))
+                ));
+            }
+        }
+    }
 
     #[test]
     fn test_channel_default() {
@@ -354,18 +572,165 @@ mod tests {
     #[tokio::test]
     async fn test_verify_installation_plain_mode() {
         let ctx = create_test_output_context(false);
-
-        // This will run the current executable with --version
-        // It may fail in test environment but shouldn't panic
-        let _ = verify_installation(&ctx).await;
+        // The libtest executable is not an installed rch binary. Its failed
+        // --version probe used to be ignored and "Installation verified" printed.
+        assert!(verify_installation(&ctx).await.is_err());
     }
 
     #[tokio::test]
     async fn test_verify_installation_json_mode() {
         let ctx = create_test_output_context(true);
 
-        // Verify it doesn't panic in JSON mode
-        let _ = verify_installation(&ctx).await;
+        assert!(verify_installation(&ctx).await.is_err());
+    }
+
+    #[cfg(unix)]
+    fn installed_fixture(
+        directory: &std::path::Path,
+        name: &str,
+        body: &str,
+    ) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = directory.join(name);
+        std::fs::write(
+            &path,
+            format!("#!/bin/sh\n[ \"$#\" = 1 ] && [ \"$1\" = --version ] || exit 90\n{body}\n"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn installation_verification_checks_every_installed_sibling_without_mutation() {
+        let directory = tempfile::tempdir().unwrap();
+        for name in ["rch", "rchd", "rch-wkr"] {
+            installed_fixture(
+                directory.path(),
+                name,
+                &format!("printf '{name} 2.1.15 (commit 0123456789ab)\\n'"),
+            );
+        }
+        let before = std::fs::read(directory.path().join("rch")).unwrap();
+        let report = inspect_installation(
+            &directory.path().join("rch"),
+            "2.1.15",
+            std::time::Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        assert_eq!(report["components"].as_array().unwrap().len(), 3);
+        assert_eq!(report["absent_optional_components"], serde_json::json!([]));
+        assert_eq!(report["verification_scope"], "installed_binary_versions");
+        assert_eq!(report["cryptographic_verification"], false);
+        assert_eq!(std::fs::read(directory.path().join("rch")).unwrap(), before);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn installation_verification_discloses_client_only_installations() {
+        let directory = tempfile::tempdir().unwrap();
+        let client = installed_fixture(directory.path(), "rch", "printf 'rch 2.1.15\\n'");
+        let report = inspect_installation(&client, "2.1.15", std::time::Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(report["components"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            report["absent_optional_components"],
+            serde_json::json!(["rchd", "rch-wkr"])
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn installation_verification_refuses_failures_empty_and_misleading_output() {
+        let directory = tempfile::tempdir().unwrap();
+        for body in [
+            "printf 'rch 2.1.15\\n'; exit 7",
+            "exit 0",
+            "printf 'not-rch 2.1.15\\n'",
+            "printf 'rch 2.0.0\\n'",
+            "printf 'rch 2.1.15\\n'; printf 'loader failure\\n' >&2",
+            "printf 'rch 2.1.15\\nadditional output\\n'",
+            "printf '\\377'",
+        ] {
+            let client = installed_fixture(directory.path(), "rch", body);
+            assert!(
+                inspect_installation(&client, "2.1.15", std::time::Duration::from_secs(2))
+                    .await
+                    .is_err(),
+                "{body}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn installation_verification_refuses_broken_or_mismatched_companions() {
+        for body in ["exit 8", "printf 'rchd 2.0.0\\n'", "printf 'rch 2.1.15\\n'"] {
+            let directory = tempfile::tempdir().unwrap();
+            let client = installed_fixture(directory.path(), "rch", "printf 'rch 2.1.15\\n'");
+            installed_fixture(directory.path(), "rchd", body);
+            let error = inspect_installation(&client, "2.1.15", std::time::Duration::from_secs(2))
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("rchd"), "{error}");
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let client = installed_fixture(directory.path(), "rch", "printf 'rch 2.1.15\\n'");
+        std::os::unix::fs::symlink(
+            directory.path().join("missing"),
+            directory.path().join("rchd"),
+        )
+        .unwrap();
+        assert!(
+            inspect_installation(&client, "2.1.15", std::time::Duration::from_secs(2))
+                .await
+                .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn installation_verification_bounds_hung_and_flooding_probes() {
+        let directory = tempfile::tempdir().unwrap();
+        for (body, reason) in [
+            ("exec sleep 30", "timed out"),
+            (
+                "while :; do printf 'unbounded version output\\n'; done",
+                "exceeded",
+            ),
+            (
+                "while :; do printf 'unbounded diagnostics\\n' >&2; done",
+                "exceeded",
+            ),
+        ] {
+            let client = installed_fixture(directory.path(), "rch", body);
+            let start = std::time::Instant::now();
+            let error = inspect_installation(&client, "2.1.15", std::time::Duration::from_secs(1))
+                .await
+                .unwrap_err();
+            assert!(format!("{error:#}").contains(reason), "{error:#}");
+            assert!(start.elapsed() < std::time::Duration::from_secs(5));
+        }
+    }
+
+    #[tokio::test]
+    async fn installation_verification_requires_a_real_client_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let client = directory.path().join("rch");
+        assert!(
+            inspect_installation(&client, "2.1.15", std::time::Duration::from_secs(2))
+                .await
+                .is_err()
+        );
+        std::fs::create_dir(&client).unwrap();
+        assert!(
+            inspect_installation(&client, "2.1.15", std::time::Duration::from_secs(2))
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

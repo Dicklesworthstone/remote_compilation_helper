@@ -1,0 +1,160 @@
+name: Update ownership and verification
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'rch/src/update/lock.rs'
+      - 'rch/src/update/mod.rs'
+      - 'rch/src/update/types.rs'
+      - 'rch/src/update/install.rs'
+      - 'rch/src/update/install/daemon_shutdown.rs'
+      - 'rch/src/commands/daemon.rs'
+      - 'rch/src/commands/daemon/**'
+      - 'rch/tests/daemon_stop_safety.rs'
+      - 'rch/tests/daemon_force_stop.rs'
+      - 'scripts/test_daemon_force_stop.py'
+      - 'rch-common/src/process_identity.rs'
+      - '.github/workflows/update-lock.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  client-verification:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_NET_RETRY: 2
+      CARGO_HTTP_TIMEOUT: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Select the repository's pinned Rust toolchain
+        run: |
+          set -euo pipefail
+          channel=$(python3 -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["channel"])')
+          rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
+          echo "RUSTUP_TOOLCHAIN=$channel" >> "$GITHUB_ENV"
+      # Build the real client, including its production bounded-output reader.
+      # The isolated ownership job below is not a substitute for this check.
+      - name: Exercise installation probes, preflight and authorization in the client crate
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/update-client-evidence"
+          mkdir -p "$evidence"
+          cargo test --locked -p rch --bin rch installation_verification_ -- --nocapture 2>&1 | tee "$evidence/installed-binaries.log"
+          cargo test --locked -p rch --bin rch test_verify_installation_ -- --nocapture 2>&1 | tee "$evidence/failed-client-probes.log"
+          cargo test --locked -p rch --bin rch update_verification_ -- --nocapture 2>&1 | tee "$evidence/authorization.log"
+          cargo test --locked -p rch --bin rch update_shutdown_ -- --nocapture 2>&1 | tee "$evidence/shutdown.log"
+          cargo test --locked -p rch --bin rch update_start_ -- --nocapture 2>&1 | tee "$evidence/readiness.log"
+          # Include all existing archive, backup, replacement and restoration
+          # checks alongside the new staged preflight regressions.
+          cargo test --locked -p rch --bin rch update::install::tests -- --nocapture 2>&1 | tee "$evidence/preflight-and-install.log"
+          cargo test --locked -p rch --bin rch commands::daemon::tests -- --nocapture 2>&1 | tee "$evidence/lifecycle-policy.log"
+          cargo test --locked -p rch --test daemon_stop_safety -- --nocapture 2>&1 | tee "$evidence/lifecycle-cli.log"
+          cargo test --locked -p rch --test daemon_force_stop -- --nocapture 2>&1 | tee "$evidence/force-stop-cli.log"
+          cargo clippy --locked -p rch --all-targets -- -D warnings 2>&1 | tee "$evidence/clippy.log"
+      - name: Check client verification formatting
+        if: success() || failure()
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/update-client-evidence"
+          # Stdin avoids rustfmt's filename banner in the retained Rust source.
+          rustfmt --edition 2024 --config skip_children=true --emit stdout < rch/src/update/mod.rs > "$RUNNER_TEMP/update-client-evidence/mod.formatted.rs"
+          rustfmt --edition 2024 --config skip_children=true --emit stdout < rch/src/update/install.rs > "$RUNNER_TEMP/update-client-evidence/install.formatted.rs"
+          rustfmt --edition 2024 --config skip_children=true --check rch/src/update/mod.rs rch/src/update/install.rs rch/src/update/install/daemon_shutdown.rs
+          rustfmt --edition 2024 --config skip_children=true --check rch/src/commands/daemon.rs rch/tests/daemon_stop_safety.rs rch/src/commands/daemon/force_stop.rs rch/tests/daemon_force_stop.rs
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: update-client-${{ github.sha }}
+          path: ${{ runner.temp }}/update-client-evidence
+          retention-days: 7
+  ownership:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, windows-latest, macos-14]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+    env:
+      RUSTUP_TOOLCHAIN: stable
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install Rust tools
+        run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+      # Copy exact production code, including the real process observer and
+      # UpdateError types. No simulated PID/lock implementation is substituted.
+      # Unix additionally exercises the actual shutdown client against owned
+      # Unix-socket fixtures. This is not full installation/fleet qualification.
+      - name: Compile and exercise real cross-process ownership and shutdown
+        run: |
+          set -euo pipefail
+          work="$RUNNER_TEMP/update-lock-tests"
+          evidence="$RUNNER_TEMP/update-lock-evidence"
+          mkdir -p "$work/src/update" "$evidence"
+          cp rch/src/update/lock.rs rch/src/update/types.rs "$work/src/update/"
+          cp rch-common/src/process_identity.rs "$work/src/"
+          printf 'extern crate self as rch_common;\npub mod process_identity;\npub mod update;\n' > "$work/src/lib.rs"
+          printf 'pub mod types;\npub mod lock;\n' > "$work/src/update/mod.rs"
+          if [ "$RUNNER_OS" != Windows ]; then
+            cp rch/src/update/install/daemon_shutdown.rs "$work/src/daemon_shutdown.rs"
+            cat >> "$work/src/lib.rs" <<'RS'
+          mod daemon_shutdown;
+          pub async fn stop_daemon(path: &std::path::Path, drain_timeout: std::time::Duration) -> Result<bool, String> {
+              daemon_shutdown::stop(path, drain_timeout).await
+          }
+          pub async fn start_daemon(command: std::process::Command, path: &std::path::Path, version: Option<&str>) -> Result<(), String> {
+              daemon_shutdown::start(command, path, version).await
+          }
+          RS
+          fi
+          cat > "$work/Cargo.toml" <<'TOML'
+          [package]
+          name = "rch-update-lock-validation"
+          version = "0.0.0"
+          edition = "2024"
+          [dependencies]
+          dirs = "7"
+          serde = { version = "1", features = ["derive"] }
+          serde_json = "1"
+          thiserror = "2"
+          tempfile = "3.25"
+          uuid = { version = "1", features = ["v4"] }
+          tokio = { version = "1.49.0", features = ["full"] }
+          [target.'cfg(target_os = "macos")'.dependencies]
+          libproc = "=0.14.11"
+          rustix = { version = "1.1.5", features = ["process"] }
+          TOML
+          # Cargo discovers configuration from the working directory even
+          # with --manifest-path. The copied stable crate must not inherit the
+          # main workspace's nightly-only -Z rustflags. The real-client job
+          # above still uses the unmodified repository config and pinned Rust.
+          cd "$work"
+          cargo test -- --nocapture 2>&1 | tee "$evidence/tests.log"
+          cargo clippy --all-targets -- -D warnings 2>&1 | tee "$evidence/clippy.log"
+      - name: Check update-lock and shutdown formatting
+        if: success() || failure()
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/update-lock-evidence"
+          rustfmt --edition 2024 --emit stdout < rch/src/update/lock.rs > "$RUNNER_TEMP/update-lock-evidence/lock.formatted.rs"
+          rustfmt --edition 2024 --emit stdout < rch/src/update/install/daemon_shutdown.rs > "$RUNNER_TEMP/update-lock-evidence/shutdown.formatted.rs"
+          rustfmt --edition 2024 --check rch/src/update/lock.rs rch/src/update/install/daemon_shutdown.rs
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: update-lock-${{ matrix.runner }}-${{ github.sha }}
+          path: ${{ runner.temp }}/update-lock-evidence
+          retention-days: 7

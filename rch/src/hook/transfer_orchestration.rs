@@ -64,6 +64,43 @@ mod cargo_manifest;
 #[path = "retrieval_recovery.rs"]
 pub(crate) mod recovery;
 
+/// Read the durable completion receipt after the execution SSH session exits.
+///
+/// The read is idempotent (it only `cat`s an immutable, identity-bound file),
+/// so a transient SSH failure is retried briefly instead of turning a build
+/// that already finished into "completion unconfirmed", which retains its
+/// source ownership and fences later builds on that worker. Only errors are
+/// retried; an absent receipt is evidence and is returned at once.
+async fn read_completion_with_retry(
+    pipeline: &TransferPipeline,
+    worker: &WorkerConfig,
+) -> anyhow::Result<Option<i32>> {
+    retry_completion_probe(Duration::from_secs(1), async || {
+        pipeline.read_recovery_completion(worker).await
+    })
+    .await
+}
+
+/// Up to three probe attempts, sleeping `backoff` then twice that between
+/// failures (1 s and 2 s in production).
+async fn retry_completion_probe(
+    backoff: Duration,
+    mut probe: impl AsyncFnMut() -> anyhow::Result<Option<i32>>,
+) -> anyhow::Result<Option<i32>> {
+    const ATTEMPTS: u64 = 3;
+    let mut attempt = 1;
+    loop {
+        match probe().await {
+            Err(error) if attempt < ATTEMPTS => {
+                warn!(attempt, %error, "completion probe failed; retrying");
+                tokio::time::sleep(backoff * u32::try_from(attempt).unwrap_or(1)).await;
+                attempt += 1;
+            }
+            other => return other,
+        }
+    }
+}
+
 /// Keep ownership failures distinct from a confirmed pre-workload setup refusal.
 fn confirm_source_pair_execution(
     lock: Option<&mut super::ssh::RemoteSourceAuthorityLock>,
@@ -630,6 +667,32 @@ async fn execute_remote_compilation_inner(
     // needs drive-letter paths, so their whole remote layout lives under the
     // Windows build base and syncs via tar-over-ssh (no rsync/streaming).
     let worker_is_windows = WorkerPlatform::from_worker(&worker_config).is_windows();
+    if reporter.cargo_json_stdout {
+        anyhow::ensure!(
+            !worker_is_windows
+                && durable_lease.is_some()
+                && !super::ssh::should_skip_remote_preflight(&worker_config),
+            "caller Cargo JSON requires the admitted durable POSIX worker route"
+        );
+    }
+
+    let go_build_environment = if kind == Some(CompilationKind::GoBuild) {
+        anyhow::ensure!(
+            !worker_is_windows
+                && durable_lease.is_some()
+                && !super::ssh::should_skip_remote_preflight(&worker_config),
+            "Go output delivery requires the durable Unix worker path"
+        );
+        Some(
+            super::artifact_patterns::direct_compiler::validate_go_build_output(
+                command,
+                &normalized_project_root,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
 
     let clean_overlay_cargo = clean_overlay.is_some()
         && (kind.is_some_and(|kind| kind.command_base() == "cargo")
@@ -924,7 +987,8 @@ async fn execute_remote_compilation_inner(
     // non-streaming sync/retrieve paths.
     let progress_enabled = output_ctx.supports_rich()
         && reporter.visibility != OutputVisibility::None
-        && !worker_is_windows;
+        && !worker_is_windows
+        && !reporter.cargo_json_stdout;
     let remote_pgid_file = build_id.and_then(|id| {
         sync_plan
             .iter()
@@ -995,6 +1059,34 @@ async fn execute_remote_compilation_inner(
         &transfer_config.remote_base,
         &ownership_scan_roots,
     )?;
+    // bd-fbtws: reject live checkouts before ownership repair or repo-updater
+    // convergence can mutate them, not merely when rsync starts. The receiver
+    // repeats the guard immediately before pruning/upload under its grant.
+    if !worker_is_windows && !super::ssh::should_skip_remote_preflight(&worker_config) {
+        let guard = sync_plan
+            .iter()
+            .map(|entry| {
+                format!(
+                    "{} || exit 73;\n",
+                    crate::transfer::live_checkout_sync_guard(&entry.remote_root)
+                )
+            })
+            .collect::<String>();
+        let output = super::ssh::run_offload_ssh_command_with_stdin(
+            &worker_config,
+            "sh -s",
+            guard.as_bytes(),
+            Duration::from_secs(30),
+        )
+        .await?;
+        anyhow::ensure!(
+            output.status.success(),
+            "source destination safety check refused on {} (status {:?}): {}",
+            worker_config.id,
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).trim(),
+        );
+    }
     // Build transfer pipelines with color mode, command timeout, and compilation kind.
     // When the in-session watchdog is active it enforces the real build cap
     // remotely (same timeout_for_kind value). Give the local SSH stream a grace
@@ -1103,6 +1195,12 @@ async fn execute_remote_compilation_inner(
                 )
             },
         ));
+    }
+    // Record and lock the canonical spelling: a trailing-slash project path
+    // used to reach the lease verbatim and was then unlockable and
+    // unrecoverable (bd-4d1hs).
+    for root in &mut mutable_source_authority_roots {
+        *root = super::ssh::canonical_source_authority_root(root);
     }
     mutable_source_authority_roots.sort();
     mutable_source_authority_roots.dedup();
@@ -1585,6 +1683,12 @@ async fn execute_remote_compilation_inner(
         } else {
             None
         };
+    if reporter.cargo_json_stdout {
+        recovery_session
+            .as_mut()
+            .context("caller Cargo JSON has no admitted recovery session")?
+            .request_caller_json(Path::new(&pipeline.remote_path()))?;
+    }
     let pipeline = match recovery_session.as_ref() {
         Some(session) => session.completion_pipeline(pipeline),
         None => pipeline,
@@ -1595,6 +1699,14 @@ async fn execute_remote_compilation_inner(
     let cargo_output_capture = recovery_session
         .as_ref()
         .and_then(|_| CargoOutputCapture::for_command(kind, policy_command));
+    if reporter.cargo_json_stdout {
+        anyhow::ensure!(
+            cargo_output_capture
+                .as_ref()
+                .is_some_and(CargoOutputCapture::caller_json_supported),
+            "caller Cargo JSON lost its admitted named-output capture"
+        );
+    }
     let captured_command = cargo_output_capture
         .as_ref()
         .map(|capture| capture.execution_command(command));
@@ -1692,6 +1804,18 @@ async fn execute_remote_compilation_inner(
     // Only execution consumes the stamp. `policy_command` still names the
     // original contract already persisted in the recovery recipe above.
     let command = stamped_command.as_deref().unwrap_or(command);
+    let guarded_go_command = if let Some(environment) = go_build_environment.as_ref() {
+        Some(
+            super::artifact_patterns::direct_compiler::go_build_execution_command(
+                command,
+                environment,
+            )
+            .context("Go build lost its validated file output contract")?,
+        )
+    } else {
+        None
+    };
+    let command = guarded_go_command.as_deref().unwrap_or(command);
 
     // Step 2: Execute command remotely with streaming output
     // Mask sensitive data (API keys, tokens, passwords) before logging
@@ -1772,6 +1896,7 @@ async fn execute_remote_compilation_inner(
         .as_ref()
         .map(BuildHeartbeatLoop::shared_state);
     let mut suppress_telemetry = false;
+    let defer_cargo_stdout = reporter.cargo_json_stdout;
 
     if let Some(session) = recovery_session.as_mut() {
         session.starting_execution()?;
@@ -1791,6 +1916,12 @@ async fn execute_remote_compilation_inner(
             }
             if let Some(state) = heartbeat_state_stdout.as_ref() {
                 mark_heartbeat_progress(state);
+            }
+            // Do not publish worker paths or a successful terminal record
+            // before delivery. The complete supervisor log supplies stdout
+            // later; the streamer's bounded preview is not artifact authority.
+            if defer_cargo_stdout {
+                return;
             }
             if cargo_output_capture
                 .as_ref()
@@ -1855,8 +1986,7 @@ async fn execute_remote_compilation_inner(
 
     if let Some(session) = recovery_session.as_mut() {
         async {
-            let completed = pipeline
-                .read_recovery_completion(&worker_config)
+            let completed = read_completion_with_retry(&pipeline, &worker_config)
                 .await?
                 .context(
                     "SSH exit has no exact durable completion evidence; use jobs recover, never replay",
@@ -1972,16 +2102,28 @@ async fn execute_remote_compilation_inner(
     let mut artifacts_result: Option<SyncResult> = None;
     let mut artifacts_failed = false;
     let mut cargo_evidence_terminal = false;
+    if reporter.cargo_json_stdout {
+        recovery_session
+            .as_mut()
+            .context("caller Cargo diagnostics have no admitted recovery session")?
+            .collect_cargo_stderr(&pipeline, &worker_config)
+            .await?;
+    }
     if result.success()
         && let Some(session) = recovery_session.as_mut()
         && let Some(remote_root) = session.cargo_artifact_remote_root().map(str::to_owned)
     {
-        let evidence = pipeline
-            .read_cargo_artifact_evidence(&worker_config, &remote_root)
-            .await;
-        let installed = evidence.and_then(|evidence| {
-            session.install_cargo_artifact_evidence(&evidence.stdout, &evidence.remote_root)
-        });
+        let evidence = if reporter.cargo_json_stdout {
+            pipeline
+                .read_cargo_stdout_evidence(&worker_config, &remote_root, 0)
+                .await
+        } else {
+            pipeline
+                .read_cargo_artifact_evidence(&worker_config, &remote_root)
+                .await
+        };
+        let installed =
+            evidence.and_then(|evidence| session.install_complete_cargo_evidence(&evidence));
         if let Err(error) = installed {
             // A completed rejection cannot improve on retry. Lost transport
             // and local journal failures retain the exact attempt for recovery.
@@ -2001,6 +2143,23 @@ async fn execute_remote_compilation_inner(
                 );
             }
         }
+    }
+    if reporter.cargo_json_stdout && !result.success() {
+        let evidence = pipeline
+            .read_cargo_stdout_evidence(&worker_config, &pipeline.remote_path(), result.exit_code)
+            .await?;
+        recovery_session
+            .as_mut()
+            .context("failed Cargo stdout has no admitted recovery session")?
+            .retain_cargo_stdout(
+                &evidence.stdout,
+                &evidence.remote_root,
+                evidence
+                    .remote_project_root
+                    .as_deref()
+                    .context("caller Cargo JSON has no verified source root")?,
+                result.exit_code,
+            )?;
     }
     // Per-file evidence from the phase that carries the build's `target/`
     // outputs, for the zero-build-output loud-failure gate (bd-mpbav): the
@@ -2032,11 +2191,19 @@ async fn execute_remote_compilation_inner(
         // custom target dir exists to protect, and a failed stale-residue pull
         // spuriously fails an otherwise-complete build (rch#30). For cargo
         // build/doc/rustc the filtered list is empty, so the phase is skipped.
-        let mut artifact_patterns = get_project_artifact_patterns(
-            kind,
-            Some(policy_command),
-            forwarded_cargo_target_dir.is_some(),
-        );
+        let mut artifact_patterns = match recovery_session
+            .as_ref()
+            .filter(|session| session.has_native_output_contract())
+        {
+            // The persisted contract determines whether native retrieval is
+            // required, including explicit outputs underneath target/.
+            Some(session) => session.cargo_artifact_patterns("project")?,
+            None => get_project_artifact_patterns(
+                kind,
+                Some(policy_command),
+                forwarded_cargo_target_dir.is_some(),
+            ),
+        };
         if !artifact_patterns.is_empty() {
             if let Some(session) = recovery_session.as_ref() {
                 artifact_patterns = session.cargo_artifact_patterns("project")?;
@@ -2177,8 +2344,16 @@ async fn execute_remote_compilation_inner(
 
         if let Some(local_target_dir) = forwarded_cargo_target_dir.as_ref() {
             let remote_target_path = pipeline.remote_cargo_target_dir();
-            let mut custom_patterns =
-                get_custom_target_artifact_patterns(kind, Some(policy_command));
+            let mut custom_patterns = if recovery_session
+                .as_ref()
+                .is_some_and(recovery::RecoverySession::has_native_output_contract)
+            {
+                // Native compiler outputs belong to the project phase even
+                // when the caller forwards an unrelated CARGO_TARGET_DIR.
+                Vec::new()
+            } else {
+                get_custom_target_artifact_patterns(kind, Some(policy_command))
+            };
             if custom_patterns.is_empty() {
                 reporter.verbose(&format!(
                     "[RCH] custom target dir sync skipped for {} after command with no target artifacts",
@@ -2660,6 +2835,22 @@ async fn execute_remote_compilation_inner(
     if retrieval_complete && let Some(session) = recovery_session.as_mut() {
         session.returned(exit_code)?;
     }
+    let cargo_stdout = if reporter.cargo_json_stdout {
+        let session = recovery_session
+            .as_mut()
+            .context("caller Cargo JSON has no recovery session")?;
+        if exit_code == 0 {
+            Some(session.caller_cargo_json().await?)
+        } else if !result.success() {
+            Some(session.failed_cargo_stdout()?)
+        } else {
+            // The compiler succeeded but delivery failed. Its original
+            // success record stays retained, never advertised as local output.
+            None
+        }
+    } else {
+        None
+    };
 
     // Retire the materialized clean-overlay source after delivery. The durable
     // grant remains outstanding on failure so recovery can finish retirement
@@ -2725,6 +2916,13 @@ async fn execute_remote_compilation_inner(
         .into());
     }
 
+    let mut disk_roots: Vec<String> = sync_plan
+        .iter()
+        .map(|entry| entry.remote_root.clone())
+        .collect();
+    disk_roots.push(pipeline.remote_cargo_target_dir());
+    disk_roots.sort();
+    disk_roots.dedup();
     Ok(RemoteExecutionResult {
         deadline_triggered: exit_code == 137 && deadline_triggered.get(),
         exit_code,
@@ -2732,6 +2930,8 @@ async fn execute_remote_compilation_inner(
         duration_ms: result.duration_ms,
         timing,
         result_dirs: exec_dir_stats,
+        disk_roots,
+        cargo_stdout,
     })
 }
 
@@ -2741,6 +2941,45 @@ mod tests {
     use super::clean_overlay_source_pair_pool_name;
     use super::foreign_artifact_gate_disabled_from_value;
     use super::{CleanOverlaySpec, clean_overlay_freshness_identity};
+
+    /// A finished build must not be stranded by one transient SSH failure on
+    /// its receipt read; a persistent failure still surfaces after 3 tries,
+    /// and an absent receipt is returned at once (it is evidence, not noise).
+    #[tokio::test]
+    async fn completion_probe_retries_transport_errors_only() {
+        use std::cell::Cell;
+        let fast = std::time::Duration::from_millis(1);
+        let calls = Cell::new(0);
+        let flaky = super::retry_completion_probe(fast, async || {
+            calls.set(calls.get() + 1);
+            if calls.get() < 3 {
+                anyhow::bail!("completion probe SSH failed")
+            } else {
+                Ok(Some(0))
+            }
+        })
+        .await;
+        assert_eq!(flaky.unwrap(), Some(0));
+        assert_eq!(calls.get(), 3);
+
+        calls.set(0);
+        let down = super::retry_completion_probe(fast, async || {
+            calls.set(calls.get() + 1);
+            anyhow::bail!("completion probe SSH failed")
+        })
+        .await;
+        assert!(down.is_err());
+        assert_eq!(calls.get(), 3);
+
+        calls.set(0);
+        let absent = super::retry_completion_probe(fast, async || {
+            calls.set(calls.get() + 1);
+            Ok(None)
+        })
+        .await;
+        assert_eq!(absent.unwrap(), None);
+        assert_eq!(calls.get(), 1);
+    }
 
     #[test]
     fn source_pair_freshness_identity_binds_overlays_and_canonical_dependency_closure() {

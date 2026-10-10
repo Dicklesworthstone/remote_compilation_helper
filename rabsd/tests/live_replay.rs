@@ -19,7 +19,9 @@ use rabs_cas::test_support::{
     sample_expected_descriptor,
 };
 use rabs_protocol::result_identity::ObjectId;
-use rabsd::coord::live::{CoordLive, ExpectedOutputs, ServeOutcome, load_manifest};
+use rabsd::coord::live::{
+    CoordLive, ExpectedOutputs, ReplayRefusal, ServeError, ServeOutcome, load_manifest,
+};
 use rabsd::janitor::store::{LiveCas, mount_and_reconcile};
 
 fn now_micros() -> i64 {
@@ -48,6 +50,331 @@ fn store_manifest_object(cas: &LiveCas, offer: &OfferPreparedActionResult, bytes
         PutOutcome::Stored { .. } | PutOutcome::IdempotentDuplicate { .. }
     ));
     install_offer_closure(&mut *store, offer);
+}
+
+const REPLAY_ARTIFACT: &[u8] = b"independently verified replay bytes";
+
+fn replay_budget_fixture() -> (
+    tempfile::TempDir,
+    Arc<LiveCas>,
+    Arc<CoordLive>,
+    OfferPreparedActionResult,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let cas = Arc::new(mount_and_reconcile(&dir.path().join("cas")).unwrap());
+    let coord = Arc::new(CoordLive::with_cas(Arc::clone(&cas)));
+    let authority = coord
+        .acquire_boot_authority("replay-budget-fixture")
+        .unwrap();
+    coord.mark_up();
+    let object = {
+        let mut store = cas.store().lock().unwrap();
+        let digest = digest_set(REPLAY_ARTIFACT, DigestRequest::default(), None)
+            .unwrap()
+            .atp_content_id;
+        put_if_absent(
+            cas.layout(),
+            &mut *store,
+            &digest,
+            &mut &REPLAY_ARTIFACT[..],
+            PutLimits::default(),
+            DurabilityPolicy::FULL,
+        )
+        .unwrap();
+        install_admission_world(&mut *store, &authority);
+        store
+            .record_decision_receipt(
+                "rabs-live-action-class-v1",
+                &digest_key(&sample_action_key()),
+                0,
+                "rustc-dependency-compile",
+                "synthetic fixture classification",
+            )
+            .unwrap();
+        ObjectId(digest)
+    };
+    let (offer, bytes) = offer_serving_object(&authority, &object);
+    store_manifest_object(&cas, &offer, &bytes);
+    assert!(matches!(
+        coord
+            .commit_offer(&offer, &sample_expected_descriptor())
+            .unwrap(),
+        PublicationOutcome::Committed(_)
+    ));
+    (dir, cas, coord, offer)
+}
+
+fn matching_comparison(
+    cas: &LiveCas,
+    coord: &CoordLive,
+    original: &OfferPreparedActionResult,
+    number: u128,
+) -> OfferPreparedActionResult {
+    use rabs_cas::test_support::FixtureAttemptIds;
+    use rabs_protocol::generation::{ActionGenerationId, AttemptId, ExecutionLeaseId};
+
+    let authority = coord.authority().unwrap();
+    let ids = FixtureAttemptIds {
+        generation: 11 + number,
+        attempt: 20 + number,
+        lease: 30 + number,
+    };
+    install_admission_world_with_ids(&mut *cas.store().lock().unwrap(), &authority, ids);
+    let mut comparison = original.clone();
+    comparison.authority.coordinator = authority;
+    comparison.authority.action_generation.generation_id = ActionGenerationId(ids.generation);
+    comparison.authority.attempt_id = AttemptId(ids.attempt);
+    comparison.authority.execution_lease_id = ExecutionLeaseId(ids.lease);
+    comparison
+}
+
+fn commit_comparison(coord: &CoordLive, comparison: &OfferPreparedActionResult) {
+    assert_eq!(
+        coord
+            .commit_offer(comparison, &sample_expected_descriptor())
+            .unwrap(),
+        PublicationOutcome::IdempotentEvidenceAppended
+    );
+}
+
+#[test]
+fn live_replay_budget_survives_restart_and_only_new_comparisons_renew_it() {
+    let (dir, cas, coord, offer) = replay_budget_fixture();
+    for number in 1..=2 {
+        commit_comparison(&coord, &matching_comparison(&cas, &coord, &offer, number));
+    }
+    for number in 0..8 {
+        let destination = dir.path().join(format!("before-restart-{number}"));
+        assert!(matches!(
+            coord
+                .edge_subscriber()
+                .serve_action(
+                    &sample_action_key(),
+                    &destination,
+                    &ExpectedOutputs::WhateverWasCommitted,
+                    now_micros(),
+                    0,
+                )
+                .unwrap(),
+            ServeOutcome::Served { .. }
+        ));
+    }
+    // The winning offer and unadmitted positive samples are not new executions.
+    commit_comparison(&coord, &offer);
+    cas.store()
+        .lock()
+        .unwrap()
+        .record_verification_sample(&sample_action_key(), 999, true, 999)
+        .unwrap();
+    drop(coord);
+    drop(cas);
+
+    let cas = Arc::new(mount_and_reconcile(&dir.path().join("cas")).unwrap());
+    let coord = Arc::new(CoordLive::with_cas(Arc::clone(&cas)));
+    coord
+        .acquire_boot_authority("replay-budget-fixture")
+        .unwrap();
+    coord.mark_up();
+    for number in 8..16 {
+        let destination = dir.path().join(format!("after-restart-{number}"));
+        assert!(matches!(
+            coord
+                .edge_subscriber()
+                .serve_action(
+                    &sample_action_key(),
+                    &destination,
+                    &ExpectedOutputs::WhateverWasCommitted,
+                    now_micros(),
+                    0,
+                )
+                .unwrap(),
+            ServeOutcome::Served { .. }
+        ));
+        assert_eq!(
+            std::fs::read(destination.join("out/lib.rlib")).unwrap(),
+            REPLAY_ARTIFACT
+        );
+    }
+    let refused = dir.path().join("needs-fresh-comparison");
+    assert_eq!(
+        coord
+            .edge_subscriber()
+            .serve_action(
+                &sample_action_key(),
+                &refused,
+                &ExpectedOutputs::WhateverWasCommitted,
+                now_micros(),
+                0,
+            )
+            .unwrap(),
+        ServeOutcome::ExecutePrivately(ReplayRefusal::FreshVerificationRequired)
+    );
+    assert!(!refused.exists());
+    assert!(
+        coord
+            .commit_offer(&offer, &sample_expected_descriptor())
+            .is_err()
+    );
+
+    let comparison = matching_comparison(&cas, &coord, &offer, 3);
+    commit_comparison(&coord, &comparison);
+    for number in 0..16 {
+        // Replaying the newly verified attempt must not replenish its budget.
+        commit_comparison(&coord, &comparison);
+        let destination = dir.path().join(format!("renewed-{number}"));
+        assert!(matches!(
+            coord
+                .edge_subscriber()
+                .serve_action(
+                    &sample_action_key(),
+                    &destination,
+                    &ExpectedOutputs::WhateverWasCommitted,
+                    now_micros(),
+                    0,
+                )
+                .unwrap(),
+            ServeOutcome::Served { .. }
+        ));
+    }
+    assert_eq!(
+        coord
+            .edge_subscriber()
+            .serve_action(
+                &sample_action_key(),
+                &refused,
+                &ExpectedOutputs::WhateverWasCommitted,
+                now_micros(),
+                0,
+            )
+            .unwrap(),
+        ServeOutcome::ExecutePrivately(ReplayRefusal::FreshVerificationRequired)
+    );
+    assert!(!refused.exists());
+}
+
+#[test]
+fn live_replay_budget_is_atomic_and_failed_installation_spends_its_permit() {
+    use rabsd::edge::destination_arbiter::{BundleId, reserve_scoped};
+    use std::os::unix::ffi::OsStrExt;
+
+    let (dir, cas, coord, offer) = replay_budget_fixture();
+    for number in 1..=2 {
+        commit_comparison(&coord, &matching_comparison(&cas, &coord, &offer, number));
+    }
+    let blocked = dir.path().join("reserved-output");
+    let paths = vec![blocked.join("out/lib.rlib").as_os_str().as_bytes().to_vec()];
+    let reservation =
+        reserve_scoped(coord.arbiter(), BundleId("other-writer".into()), &paths).unwrap();
+    assert!(matches!(
+        coord.edge_subscriber().serve_action(
+            &sample_action_key(),
+            &blocked,
+            &ExpectedOutputs::WhateverWasCommitted,
+            now_micros(),
+            0,
+        ),
+        Err(ServeError::DestinationConflict { .. })
+    ));
+    assert!(!blocked.exists());
+    drop(reservation);
+
+    let outcomes = std::thread::scope(|scope| {
+        let barrier = Arc::new(std::sync::Barrier::new(24));
+        let threads: Vec<_> = (0..24)
+            .map(|number| {
+                let edge = coord.edge_subscriber();
+                let barrier = Arc::clone(&barrier);
+                let destination = dir.path().join(format!("concurrent-{number}"));
+                scope.spawn(move || {
+                    barrier.wait();
+                    let outcome = edge
+                        .serve_action(
+                            &sample_action_key(),
+                            &destination,
+                            &ExpectedOutputs::WhateverWasCommitted,
+                            now_micros(),
+                            0,
+                        )
+                        .unwrap();
+                    (outcome, destination)
+                })
+            })
+            .collect();
+        threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    let mut served = 0;
+    let mut refused = 0;
+    for (outcome, destination) in outcomes {
+        match outcome {
+            ServeOutcome::Served { .. } => {
+                served += 1;
+                assert_eq!(
+                    std::fs::read(destination.join("out/lib.rlib")).unwrap(),
+                    REPLAY_ARTIFACT
+                );
+            }
+            ServeOutcome::ExecutePrivately(ReplayRefusal::FreshVerificationRequired) => {
+                refused += 1;
+                assert!(!destination.exists());
+            }
+            other => panic!("unexpected concurrent replay outcome: {other:?}"),
+        }
+    }
+    assert_eq!((served, refused), (15, 9));
+}
+
+#[test]
+fn historical_samples_without_live_comparison_cannot_start_a_replay_budget() {
+    let (dir, cas, coord, offer) = replay_budget_fixture();
+    for number in 1..=2 {
+        let comparison = matching_comparison(&cas, &coord, &offer, number);
+        cas.store()
+            .lock()
+            .unwrap()
+            .record_verification_sample(
+                &sample_action_key(),
+                comparison.authority.attempt_id.0,
+                true,
+                u64::try_from(number).unwrap(),
+            )
+            .unwrap();
+    }
+    let destination = dir.path().join("legacy-publication");
+    assert_eq!(
+        coord
+            .edge_subscriber()
+            .serve_action(
+                &sample_action_key(),
+                &destination,
+                &ExpectedOutputs::WhateverWasCommitted,
+                now_micros(),
+                0,
+            )
+            .unwrap(),
+        ServeOutcome::ExecutePrivately(ReplayRefusal::FreshVerificationRequired)
+    );
+    assert!(!destination.exists());
+    commit_comparison(&coord, &matching_comparison(&cas, &coord, &offer, 3));
+    assert!(matches!(
+        coord
+            .edge_subscriber()
+            .serve_action(
+                &sample_action_key(),
+                &destination,
+                &ExpectedOutputs::WhateverWasCommitted,
+                now_micros(),
+                0,
+            )
+            .unwrap(),
+        ServeOutcome::Served { .. }
+    ));
+    assert_eq!(
+        std::fs::read(destination.join("out/lib.rlib")).unwrap(),
+        REPLAY_ARTIFACT
+    );
 }
 
 #[test]

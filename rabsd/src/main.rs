@@ -32,6 +32,11 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 struct RabsConfig {
     socket_path: String,
     log_level: String,
+    /// Opt-in live registry/Git dependency lane (bd-k52xe): exact keys,
+    /// admitted local executions, evidence-gated serving. Off keeps every
+    /// wrapper request in shadow mode (plan §154 rollout: observation →
+    /// shadow → opt-in sampled serving).
+    live_dependency: bool,
 }
 
 impl Default for RabsConfig {
@@ -39,6 +44,7 @@ impl Default for RabsConfig {
         Self {
             socket_path: default_under_home(".cache/rch/rabsd.sock"),
             log_level: "info".to_string(),
+            live_dependency: false,
         }
     }
 }
@@ -69,10 +75,15 @@ fn parse_config(text: &str) -> Result<RabsConfig, String> {
                         .ok_or_else(|| "rabs.log_level must be a string".to_string())?
                         .to_string();
                 }
+                "live_dependency" => {
+                    config.live_dependency = entry
+                        .as_bool()
+                        .ok_or_else(|| "rabs.live_dependency must be a boolean".to_string())?;
+                }
                 unknown => {
                     return Err(format!(
                         "unknown [rabs] config key {unknown:?} — refusing (config drift \
-                         must be loud); known keys: socket_path, log_level"
+                         must be loud); known keys: socket_path, log_level, live_dependency"
                     ));
                 }
             }
@@ -93,6 +104,16 @@ fn load_config() -> Result<RabsConfig, String> {
     }
     if let Ok(level) = std::env::var("RABS_LOG_LEVEL") {
         config.log_level = level;
+    }
+    match std::env::var("RABS_LIVE_DEPENDENCY").as_deref() {
+        Ok("1" | "true" | "on") => config.live_dependency = true,
+        Ok("0" | "false" | "off") => config.live_dependency = false,
+        Ok(other) => {
+            return Err(format!(
+                "RABS_LIVE_DEPENDENCY={other:?}: expected one of 1/true/on/0/false/off"
+            ));
+        }
+        Err(_) => {}
     }
     Ok(config)
 }
@@ -402,8 +423,8 @@ fn main() {
         Some("--check-config") => match load_config() {
             Ok(config) => {
                 println!(
-                    "{{\"v\":1,\"kind\":\"rabsd-config\",\"socket_path\":\"{}\",\"log_level\":\"{}\"}}",
-                    config.socket_path, config.log_level
+                    "{{\"v\":1,\"kind\":\"rabsd-config\",\"socket_path\":\"{}\",\"log_level\":\"{}\",\"live_dependency\":{}}}",
+                    config.socket_path, config.log_level, config.live_dependency
                 );
                 return;
             }
@@ -443,6 +464,10 @@ fn main() {
             ("version", VERSION),
             ("socket_path", &config.socket_path),
             ("log_level", &config.log_level),
+            (
+                "live_dependency",
+                if config.live_dependency { "on" } else { "off" },
+            ),
         ],
     );
 
@@ -496,6 +521,11 @@ fn main() {
                 state_dir: state_dir.clone(),
                 coord: coord.edge_subscriber(),
                 prepared_operations,
+                live_dependency: config.live_dependency.then(|| {
+                    rabsd::coord::live_dependency::LiveDependencyLane::new(std::sync::Arc::clone(
+                        &coord,
+                    ))
+                }),
             },
         )),
         coord_work: Some(coord_work),

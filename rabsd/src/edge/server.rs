@@ -20,6 +20,7 @@
 
 mod liveness;
 mod rustc_outputs;
+mod rustc_request;
 
 use asupersync::cx::Cx;
 use asupersync::io::{AsyncReadExt, AsyncWriteExt};
@@ -45,6 +46,17 @@ const CONTROL_WORKERS: usize = 2;
 const SHADOW_WORKERS: usize = 4;
 const MATERIALIZATION_WORKERS: usize = 2;
 const PREPARED_ADMISSION_WORKERS: usize = 2;
+/// Live dependency decisions and hit installs: a compiler is waiting on
+/// each. Saturation answers pass-through, never waits.
+const LIVE_DECISION_WORKERS: usize = 8;
+/// Live dependency completions (capture, durable uploads, publication).
+/// Wrappers retain their outputs until capture is acknowledged, but do not
+/// wait for publication. Keep this lane separate from decisions; no worker
+/// permit is held while awaiting the subscriber's acknowledgment.
+const LIVE_COMPLETION_WORKERS: usize = 8;
+/// How long an admitted local execution may run before its completion
+/// frame must arrive (the attempt lease is longer still).
+const LOCAL_EXECUTION_BUDGET: Duration = Duration::from_secs(2 * 60 * 60);
 
 #[derive(Clone)]
 struct EdgeLimits {
@@ -53,6 +65,8 @@ struct EdgeLimits {
     shadow: Limit,
     materialization: Limit,
     prepared_admission: Limit,
+    live: Limit,
+    live_completion: Limit,
 }
 impl EdgeLimits {
     fn new() -> Self {
@@ -62,6 +76,8 @@ impl EdgeLimits {
             shadow: Limit::new(SHADOW_WORKERS),
             materialization: Limit::new(MATERIALIZATION_WORKERS),
             prepared_admission: Limit::new(PREPARED_ADMISSION_WORKERS),
+            live: Limit::new(LIVE_DECISION_WORKERS),
+            live_completion: Limit::new(LIVE_COMPLETION_WORKERS),
         }
     }
 }
@@ -72,6 +88,7 @@ struct EdgeServices {
     coord: crate::coord::live::EdgeSubscriber,
     prepared_operations:
         Option<std::sync::Arc<crate::coord::prepared_operation::PreparedOperationStore>>,
+    live: Option<std::sync::Arc<rustc_request::LiveEdge>>,
 }
 
 /// The daemon's own hello (transport v1..=1, application v1..=1).
@@ -101,15 +118,30 @@ pub struct EdgeServerConfig {
     /// Execution-only prepared jobs. No action-cache publication capability.
     pub prepared_operations:
         Option<std::sync::Arc<crate::coord::prepared_operation::PreparedOperationStore>>,
+    /// The live registry/Git dependency lane (opt-in). `None` keeps every
+    /// `rustc-request` in shadow mode.
+    pub live_dependency: Option<crate::coord::live_dependency::LiveDependencyLane>,
 }
 
+/// One NDJSON event on stderr. Values are JSON-encoded, so a reason that
+/// quotes a path or an OS error with backslashes or newlines stays one
+/// parseable line instead of silently dropping out of the decision trail.
 fn log_line(kind: &str, fields: &[(&str, &str)]) {
-    let mut line = format!("{{\"v\":1,\"kind\":\"{kind}\"");
+    eprintln!("{}", render_log_line(kind, fields));
+}
+
+/// Field order is preserved (a `Map` would sort it) for human readers.
+fn render_log_line(kind: &str, fields: &[(&str, &str)]) -> String {
+    let mut line = format!("{{\"v\":1,\"kind\":{}", serde_json::Value::from(kind));
     for (key, value) in fields {
-        line.push_str(&format!(",\"{}\":\"{}\"", key, value.replace('"', "'")));
+        line.push_str(&format!(
+            ",{}:{}",
+            serde_json::Value::from(*key),
+            serde_json::Value::from(*value)
+        ));
     }
     line.push('}');
-    eprintln!("{line}");
+    line
 }
 
 /// Build the edge [`SubsystemWork`] for [`DaemonRunOptions`].
@@ -183,6 +215,10 @@ async fn serve(
         shadow,
         coord: config.coord.clone(),
         prepared_operations: config.prepared_operations.clone(),
+        live: config
+            .live_dependency
+            .clone()
+            .map(|lane| std::sync::Arc::new(rustc_request::LiveEdge::new(lane))),
     };
     let limits = EdgeLimits::new();
     let acceptor = cx
@@ -253,6 +289,17 @@ async fn accept_loop(
 
 /// One absolute budget covers the ENTIRE frame, not each trickled byte.
 async fn read_frame_with_budget(stream: &mut UnixStream, budget: Duration) -> Option<Vec<u8>> {
+    read_frame_bounded(stream, budget, MAX_FRAME_BYTES).await
+}
+
+/// [`read_frame_with_budget`] with an explicit frame bound, for the one
+/// frame kind (a live completion carrying its transcript) that may exceed
+/// the ordinary request bound.
+async fn read_frame_bounded(
+    stream: &mut UnixStream,
+    budget: Duration,
+    max_bytes: usize,
+) -> Option<Vec<u8>> {
     asupersync::time::timeout(asupersync::time::wall_now(), budget, async {
         let mut frame = Vec::new();
         let mut byte = [0u8; 1];
@@ -263,7 +310,7 @@ async fn read_frame_with_budget(stream: &mut UnixStream, budget: Duration) -> Op
                     if byte[0] == b'\n' {
                         return Some(frame);
                     }
-                    if frame.len() == MAX_FRAME_BYTES {
+                    if frame.len() == max_bytes {
                         return None;
                     }
                     frame.push(byte[0]);
@@ -326,6 +373,7 @@ async fn handle_connection(
         shadow,
         coord,
         prepared_operations,
+        live,
     } = services;
     let trace = format!("edge-conn-{id}");
     // Admission: kernel peer credentials against the policy.
@@ -469,6 +517,146 @@ async fn handle_connection(
             }
             Ok(value) if value.get("kind").and_then(|k| k.as_str()) == Some("serve") => {
                 serve_on_lane(&limits.materialization, coord.clone(), value).await
+            }
+            Ok(value) if value.get("kind").and_then(|k| k.as_str()) == Some("rustc-request") => {
+                let decided = match &live {
+                    Some(live) => {
+                        let live = std::sync::Arc::clone(live);
+                        match limits
+                            .live
+                            .spawn(move || rustc_request::decide(&live, &value))
+                        {
+                            Ok(mut work) => work.wait().await,
+                            Err(error) => Err(error),
+                        }
+                    }
+                    None => Ok(rustc_request::shadow_observation(&value).map_or_else(
+                        || {
+                            rustc_request::Decided::Reply(
+                                "{\"kind\":\"decision\",\"decision\":\"pass-through\",\
+                                 \"mode\":\"unshadowed\"}"
+                                    .to_owned(),
+                            )
+                        },
+                        rustc_request::Decided::Shadow,
+                    )),
+                };
+                match decided {
+                    Ok(rustc_request::Decided::Reply(reply)) => reply,
+                    Ok(rustc_request::Decided::Shadow(observation)) => {
+                        let shadow = std::sync::Arc::clone(&shadow);
+                        let coord = coord.clone();
+                        let work_trace = trace.clone();
+                        let result = match limits
+                            .shadow
+                            .spawn(move || shadow_reply(&work_trace, observation, shadow, coord))
+                        {
+                            Ok(mut work) => work.wait().await,
+                            Err(error) => Err(error),
+                        };
+                        match result {
+                            Ok((reply, flight)) => {
+                                if let Some(flight) = flight {
+                                    open_flights.push(flight);
+                                }
+                                reply
+                            }
+                            Err(_) => "{\"kind\":\"decision\",\"decision\":\"pass-through\",\
+                                       \"mode\":\"shadow-error\"}"
+                                .to_owned(),
+                        }
+                    }
+                    Ok(rustc_request::Decided::Hit { reply, pending }) => {
+                        // Nothing is written unless the subscriber commits to
+                        // waiting for the install. A subscriber that already
+                        // gave up (timeout, crash) never sees a late writer.
+                        let accepted = write_frame(&mut stream, &reply).await
+                            && read_frame(&mut stream).await.is_some_and(|frame| {
+                                serde_json::from_slice::<serde_json::Value>(&frame)
+                                    .ok()
+                                    .and_then(|value| {
+                                        value
+                                            .get("kind")
+                                            .and_then(|k| k.as_str())
+                                            .map(|kind| kind == "rustc-accept")
+                                    })
+                                    .unwrap_or(false)
+                            });
+                        if !accepted {
+                            drop(pending);
+                            break;
+                        }
+                        let live = live.clone();
+                        let installed = match live {
+                            Some(live) => limits
+                                .live
+                                .spawn(move || rustc_request::install(&live, pending)),
+                            None => break,
+                        };
+                        match installed {
+                            Ok(mut work) => work.wait().await.unwrap_or_else(|error| {
+                                // A panic may have interrupted a rename; the
+                                // thread has been joined, so no writer remains.
+                                format!(
+                                    "{{\"kind\":\"rustc-decision\",\"decision\":\"serve-failed\",\
+                                     \"reason\":\"{}\",\"writer_returned\":true}}",
+                                    error.to_string().replace('"', "'")
+                                )
+                            }),
+                            Err(error) => format!(
+                                "{{\"kind\":\"rustc-decision\",\"decision\":\"serve-failed\",\
+                                 \"reason\":\"{}\",\"writer_returned\":true}}",
+                                error.to_string().replace('"', "'")
+                            ),
+                        }
+                    }
+                    Ok(rustc_request::Decided::Execute { reply, attempt }) => {
+                        // The subscriber now runs the compiler as this
+                        // admitted attempt. Its completion arrives on THIS
+                        // connection; losing the connection settles the
+                        // attempt without publication.
+                        let completion = if write_frame(&mut stream, &reply).await {
+                            read_frame_bounded(
+                                &mut stream,
+                                LOCAL_EXECUTION_BUDGET,
+                                rustc_request::MAX_COMPLETION_FRAME_BYTES,
+                            )
+                            .await
+                        } else {
+                            None
+                        };
+                        match (completion, live.clone()) {
+                            (Some(frame), Some(live)) => {
+                                rustc_request::complete_on_lane(
+                                    &limits.live_completion,
+                                    live,
+                                    attempt,
+                                    frame,
+                                    &mut stream,
+                                )
+                                .await
+                            }
+                            _ => match limits.live_completion.spawn(move || {
+                                drop(attempt);
+                                refusal("completion-lost", "")
+                            }) {
+                                Ok(mut work) => work.wait().await.unwrap_or_else(|error| {
+                                    refusal("completion", &error.to_string())
+                                }),
+                                Err(error) => refusal("completion", &error.to_string()),
+                            },
+                        }
+                    }
+                    Err(error) => {
+                        log_line(
+                            "rabsd-live-dependency-error",
+                            &[("trace", &trace), ("error", &error.to_string())],
+                        );
+                        "{\"kind\":\"rustc-decision\",\"decision\":\"pass-through\",\
+                         \"reason\":\"edge-capacity\"}"
+                            .to_owned()
+                    }
+                }
             }
             Ok(other) => refusal(
                 "unknown-frame",
@@ -835,6 +1023,13 @@ fn serve_reply(coord: &crate::coord::live::EdgeSubscriber, value: &serde_json::V
         Ok(ServeOutcome::NoCommit) => {
             "{\"kind\":\"serve-result\",\"outcome\":\"no-commit\"}".to_string()
         }
+        // The serve frame always installs; a preview answer here would mean
+        // nothing was installed, which must never read as a hit.
+        Ok(ServeOutcome::Servable) => {
+            "{\"kind\":\"serve-result\",\"outcome\":\"error\",\"reason\":\"preview-only\",\
+             \"compiler_skip_authorized\":false,\"reexecution_authorized\":false}"
+                .to_string()
+        }
         // T011: the running build is not release-authorized. The
         // standing token is reported rather than a bare refusal,
         // because "no verdict was ever recorded" and "the deployed
@@ -1160,6 +1355,23 @@ mod edge_liveness_tests {
     use std::sync::{Arc, mpsc};
     use std::task::{Context, Poll, Waker};
     use std::time::Instant;
+
+    #[test]
+    fn log_lines_stay_one_parseable_json_object_for_any_reason_text() {
+        let reason = "facts-refused: \"C:\\tmp\\x\" line one\nline two\t\u{7}";
+        let line = render_log_line(
+            "rabsd-live-dependency",
+            &[("decision", "pass-through"), ("reason", reason)],
+        );
+        assert!(!line.contains('\n'), "{line}");
+        let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(value["v"], 1);
+        assert_eq!(value["kind"], "rabsd-live-dependency");
+        assert_eq!(value["decision"], "pass-through");
+        assert_eq!(value["reason"], reason);
+        // Field order is kept for people reading the raw stream.
+        assert!(line.find("\"decision\"").unwrap() < line.find("\"reason\"").unwrap());
+    }
 
     #[test]
     fn prepared_preview_requires_exact_identity_attempt_and_cursor_fields() {

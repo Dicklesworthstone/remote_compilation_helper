@@ -5,6 +5,38 @@
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
+/// `-o IdentitiesOnly=yes` for a system-ssh spawn that passes `-i
+/// <identity_file>`, but only when that file exists (bd-ebszo).
+///
+/// Without it, ssh offers every ssh-agent key BEFORE the `-i` key. A
+/// dispatcher whose daemon inherited a desktop agent holding 7 keys spent 6
+/// wrong attempts per connection, tripped workers' MaxAuthTries, and OpenSSH
+/// PerSourcePenalties then locked the whole NAT address out of those workers
+/// (~600 failed auths/h, 2026-10-05/06). A missing identity file keeps the
+/// old agent-fallback behavior so agent-only setups still authenticate.
+#[must_use]
+pub fn identities_only_args(identity_file: &str) -> Option<[&'static str; 2]> {
+    let expanded = shellexpand::tilde(identity_file);
+    std::path::Path::new(expanded.as_ref())
+        .is_file()
+        .then_some(["-o", "IdentitiesOnly=yes"])
+}
+
+/// The `-i <key>` (plus [`identities_only_args`]) part of an `ssh` command
+/// line, shell-escaped, for `rsync -e "ssh ..."` transports (bd-ebszo).
+#[must_use]
+pub fn identity_shell_args(identity_file: &str) -> String {
+    let expanded = shellexpand::tilde(identity_file).into_owned();
+    let mut args = vec!["-i".to_owned(), expanded];
+    if let Some(opts) = identities_only_args(identity_file) {
+        args.extend(opts.iter().map(|opt| (*opt).to_owned()));
+    }
+    args.into_iter()
+        .map(|arg| shell_escape::escape(arg.into()).into_owned())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 // ============================================================================
 // Retry Classification
 // ============================================================================
@@ -238,6 +270,24 @@ fn escape_for_double_quotes(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// bd-ebszo: rsync's `-e` transport gets the same key pinning as direct ssh.
+    #[test]
+    fn identity_shell_args_pin_an_existing_key_for_rsync() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = dir.path().join("id_ed25519");
+        std::fs::write(&key, "k").unwrap();
+        let key = key.to_str().unwrap();
+        let escaped = shell_escape::escape(key.into()).into_owned();
+        assert_eq!(
+            super::identity_shell_args(key),
+            format!("-i {escaped} -o IdentitiesOnly=yes")
+        );
+        let missing = dir.path().join("absent");
+        let missing = missing.to_str().unwrap();
+        let escaped = shell_escape::escape(missing.into()).into_owned();
+        assert_eq!(super::identity_shell_args(missing), format!("-i {escaped}"));
+    }
     use super::*;
     use crate::test_guard;
 

@@ -81,7 +81,8 @@ pub struct Rollback {
     pub from: u32,
     /// Size restored.
     pub to: u32,
-    /// The observed regression (permille over baseline).
+    /// The observed regression (permille over baseline), capped at `u64::MAX`
+    /// for reporting only. The rollback decision uses the uncapped value.
     pub regression_permille: u64,
 }
 
@@ -129,14 +130,30 @@ impl PoolController {
         if !self.opted_in {
             return Err(ResizeRefusal::NotOptedIn);
         }
-        let stable: Vec<&ObservationWindow> = windows.iter().filter(|w| w.stable).collect();
-        let stable_count = u32::try_from(stable.len()).unwrap_or(u32::MAX);
-        if stable_count < MIN_STABLE_WINDOWS {
-            return Err(ResizeRefusal::InsufficientStableWindows(stable_count));
+        // Widen BEFORE accumulating. Individually valid u64 windows can
+        // overflow either total even though their mean fits in u64 (#73).
+        // A slice can hold at most usize::MAX windows, so these u128 totals
+        // are exact on the supported 32/64-bit targets. Count the same windows
+        // used by both sums; a capped diagnostic count is not a denominator.
+        let (stable_count, evidence, tail_sum) = windows.iter().filter(|w| w.stable).fold(
+            (0_u128, 0_u128, 0_u128),
+            |(count, samples, tails), window| {
+                (
+                    count + 1,
+                    samples + u128::from(window.samples),
+                    tails + u128::from(window.tail_latency_ms),
+                )
+            },
+        );
+        if stable_count < u128::from(MIN_STABLE_WINDOWS) {
+            return Err(ResizeRefusal::InsufficientStableWindows(
+                u32::try_from(stable_count).expect("count below the u32 gate fits in u32"),
+            ));
         }
-        let evidence: u64 = stable.iter().map(|w| w.samples).sum();
-        if evidence < MIN_EVIDENCE_SAMPLES {
-            return Err(ResizeRefusal::InsufficientEvidence(evidence));
+        if evidence < u128::from(MIN_EVIDENCE_SAMPLES) {
+            return Err(ResizeRefusal::InsufficientEvidence(
+                u64::try_from(evidence).expect("evidence below the u64 gate fits in u64"),
+            ));
         }
         if !proposal.replay_validated {
             return Err(ResizeRefusal::ReplayNotValidated);
@@ -149,8 +166,8 @@ impl PoolController {
             return Err(ResizeRefusal::CooldownActive(self.windows_since_resize));
         }
         // Applied: baseline is the stable-window tail going in.
-        let count = u64::from(stable_count);
-        self.baseline_tail_ms = stable.iter().map(|w| w.tail_latency_ms).sum::<u64>() / count;
+        self.baseline_tail_ms =
+            u64::try_from(tail_sum / stable_count).expect("the mean of u64 latencies fits in u64");
         self.previous_size = self.current_size;
         self.current_size = proposal.new_size;
         self.windows_since_resize = 0;
@@ -164,16 +181,18 @@ impl PoolController {
         if self.current_size == self.previous_size || self.baseline_tail_ms == 0 {
             return None; // nothing to roll back to
         }
-        let regression_permille = window
-            .tail_latency_ms
-            .saturating_sub(self.baseline_tail_ms)
-            .saturating_mul(1_000)
-            / self.baseline_tail_ms;
-        if regression_permille > ROLLBACK_REGRESSION_PERMILLE {
+        // Saturating the scaled numerator before division can turn a 100%
+        // regression into 1.8%, suppressing rollback (#73). Keep the existing
+        // integer-permille threshold, but decide in u128 and narrow only the
+        // reported value. Even the largest possible delta times 1000 fits.
+        let regression_permille =
+            u128::from(window.tail_latency_ms.saturating_sub(self.baseline_tail_ms)) * 1_000
+                / u128::from(self.baseline_tail_ms);
+        if regression_permille > u128::from(ROLLBACK_REGRESSION_PERMILLE) {
             let rollback = Rollback {
                 from: self.current_size,
                 to: self.previous_size,
-                regression_permille,
+                regression_permille: u64::try_from(regression_permille).unwrap_or(u64::MAX),
             };
             self.current_size = self.previous_size;
             self.windows_since_resize = 0;
@@ -350,6 +369,194 @@ mod tests {
         assert_eq!(c.current_size, 12);
         // And the cooldown has elapsed: a further resize may propose.
         assert!(c.windows_since_resize >= MIN_WINDOWS_BETWEEN_RESIZES);
+    }
+
+    #[test]
+    fn overflowing_evidence_does_not_panic_or_wrap_below_the_gate() {
+        let mut windows = stable_windows(6, 0, 800);
+        windows[0].samples = u64::MAX;
+        windows[1].samples = 1; // wraps to zero in the old u64 accumulator
+        let mut c = PoolController::new(true, 8, 900);
+        assert_eq!(c.propose(&windows, good_proposal()), Ok(12));
+        assert_eq!(c.baseline_tail_ms, 800);
+        assert_eq!(c.previous_size, 8);
+    }
+
+    #[test]
+    fn overflowing_latency_totals_keep_the_exact_representable_mean() {
+        let mut c = PoolController::new(true, 8, 800);
+        assert_eq!(
+            c.propose(&stable_windows(6, 100, u64::MAX), good_proposal()),
+            Ok(12)
+        );
+        assert_eq!(c.baseline_tail_ms, u64::MAX);
+
+        let mut windows = stable_windows(6, 100, 0);
+        for window in &mut windows[..3] {
+            window.tail_latency_ms = u64::MAX;
+        }
+        // Unstable windows must not enter either sum or the denominator.
+        windows.push(ObservationWindow {
+            samples: u64::MAX,
+            tail_latency_ms: u64::MAX,
+            stable: false,
+        });
+        let mut c = PoolController::new(true, 8, 800);
+        assert_eq!(c.propose(&windows, good_proposal()), Ok(12));
+        assert_eq!(c.baseline_tail_ms, u64::MAX / 2);
+    }
+
+    #[test]
+    fn large_evidence_still_requires_replay_delta_and_cooldown() {
+        let windows = stable_windows(6, u64::MAX, u64::MAX);
+        for (proposal, elapsed, refusal) in [
+            (
+                ResizeProposal {
+                    new_size: 12,
+                    replay_validated: false,
+                },
+                MIN_WINDOWS_BETWEEN_RESIZES,
+                ResizeRefusal::ReplayNotValidated,
+            ),
+            (
+                ResizeProposal {
+                    new_size: 9,
+                    replay_validated: true,
+                },
+                MIN_WINDOWS_BETWEEN_RESIZES,
+                ResizeRefusal::DeltaTooSmall(1),
+            ),
+            (good_proposal(), 1, ResizeRefusal::CooldownActive(1)),
+        ] {
+            let mut c = PoolController::new(true, 8, 800);
+            c.windows_since_resize = elapsed;
+            let before = c.clone();
+            assert_eq!(c.propose(&windows, proposal), Err(refusal));
+            assert_eq!(c, before, "a refused proposal must not change state");
+        }
+    }
+
+    #[test]
+    fn sample_gate_counts_only_stable_evidence_at_the_exact_boundary() {
+        let mut windows = stable_windows(6, 0, 800);
+        windows[0].samples = MIN_EVIDENCE_SAMPLES - 1;
+        windows.push(ObservationWindow {
+            samples: u64::MAX,
+            tail_latency_ms: u64::MAX,
+            stable: false,
+        });
+        let mut c = PoolController::new(true, 8, 900);
+        let before = c.clone();
+        assert_eq!(
+            c.propose(&windows, good_proposal()),
+            Err(ResizeRefusal::InsufficientEvidence(499))
+        );
+        assert_eq!(c, before);
+        windows[0].samples += 1;
+        assert_eq!(c.propose(&windows, good_proposal()), Ok(12));
+        assert_eq!(c.baseline_tail_ms, 800);
+    }
+
+    #[test]
+    fn doubled_large_tail_rolls_back_instead_of_reporting_eighteen_permille() {
+        let baseline = 1_000_000_000_000_000_000;
+        let mut c = PoolController::new(true, 8, baseline);
+        assert_eq!(
+            c.propose(&stable_windows(6, 100, baseline), good_proposal()),
+            Ok(12)
+        );
+        assert_eq!(
+            c.observe(ObservationWindow {
+                samples: 100,
+                tail_latency_ms: 2_000_000_000_000_000_000,
+                stable: true,
+            }),
+            Some(Rollback {
+                from: 12,
+                to: 8,
+                regression_permille: 1_000,
+            })
+        );
+        assert_eq!(c.current_size, 8);
+        assert_eq!(c.windows_since_resize, 0);
+    }
+
+    #[test]
+    fn rollback_keeps_the_strict_integer_permille_threshold_at_every_scale() {
+        for scale in [1, 1_000_000_000_000_000_u64] {
+            for (tail, expected) in [(1_149, None), (1_150, None), (1_151, Some(151))] {
+                let mut c = PoolController::new(true, 8, 1_000 * scale);
+                c.current_size = 12;
+                let rollback = c.observe(ObservationWindow {
+                    samples: 100,
+                    tail_latency_ms: tail * scale,
+                    stable: true,
+                });
+                assert_eq!(rollback.map(|r| r.regression_permille), expected);
+                assert_eq!(c.current_size, if expected.is_some() { 8 } else { 12 });
+            }
+        }
+    }
+
+    #[test]
+    fn only_the_report_saturates_for_an_unrepresentable_regression() {
+        let mut c = PoolController::new(true, 8, 1);
+        c.current_size = 12;
+        assert_eq!(
+            c.observe(ObservationWindow {
+                samples: 100,
+                tail_latency_ms: u64::MAX,
+                stable: true,
+            }),
+            Some(Rollback {
+                from: 12,
+                to: 8,
+                regression_permille: u64::MAX,
+            })
+        );
+        assert_eq!(c.current_size, 8);
+    }
+
+    #[test]
+    fn rollback_matches_quotient_remainder_oracle_over_u64_extremes() {
+        let values = [
+            0,
+            1,
+            999,
+            1_000,
+            1_151,
+            u64::MAX / 2,
+            u64::MAX - 1,
+            u64::MAX,
+        ];
+        for baseline in values {
+            for tail in values {
+                let mut c = PoolController::new(true, 8, baseline);
+                c.current_size = 12;
+                let observed = c.observe(ObservationWindow {
+                    samples: 100,
+                    tail_latency_ms: tail,
+                    stable: true,
+                });
+                // An independent decomposition avoids scaling the original
+                // numerator, the operation that overflowed in the defect.
+                let expected = if baseline == 0 || tail <= baseline {
+                    None
+                } else {
+                    let delta = tail - baseline;
+                    let ratio = u128::from(delta / baseline) * 1_000
+                        + u128::from(delta % baseline) * 1_000 / u128::from(baseline);
+                    (ratio > u128::from(ROLLBACK_REGRESSION_PERMILLE))
+                        .then(|| u64::try_from(ratio).unwrap_or(u64::MAX))
+                };
+                assert_eq!(
+                    observed.map(|r| r.regression_permille),
+                    expected,
+                    "baseline={baseline}, tail={tail}"
+                );
+                assert_eq!(c.current_size, if expected.is_some() { 8 } else { 12 });
+            }
+        }
     }
 
     #[test]

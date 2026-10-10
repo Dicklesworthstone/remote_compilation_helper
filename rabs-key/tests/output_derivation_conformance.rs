@@ -257,6 +257,59 @@ fn dependency_serving_declarations_match_real_build_and_check_in_two_roots() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn cargo_separate_metadata_mode_produces_every_declared_output() {
+    use rabs_key::output_derivation::derive_dependency_output_declarations;
+
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("lib.rs");
+    std::fs::write(&source, "pub fn answer() -> u32 { 42 }\n").unwrap();
+    let host = host_triple();
+    for emit in ["dep-info,metadata,link", "dep-info,metadata"] {
+        let out_dir = dir.path().join(emit);
+        let args = case(&[
+            "--crate-name",
+            "foo",
+            "--crate-type",
+            "lib",
+            "--edition=2024",
+            "--emit",
+            emit,
+            "-Z",
+            "embed-metadata=no",
+            "-C",
+            "embed-bitcode=no",
+            "-C",
+            "extra-filename=-123",
+            "--error-format=json",
+            "--json=diagnostic-rendered-ansi,artifacts,future-incompat",
+            "--cap-lints",
+            "allow",
+        ]);
+        let mut argv = vec!["rustc".to_owned()];
+        argv.extend(args.iter().cloned());
+        argv.extend([
+            "--out-dir".to_owned(),
+            out_dir.to_str().unwrap().to_owned(),
+            source.to_str().unwrap().to_owned(),
+        ]);
+        let invocation = parse(&argv, None).unwrap();
+        let declared: BTreeSet<_> = derive_dependency_output_declarations(&invocation, &host)
+            .unwrap()
+            .declarations
+            .into_iter()
+            .map(|output| output.virtual_path)
+            .collect();
+        assert!(declared.contains("libfoo-123.rmeta"));
+        assert_eq!(
+            declared,
+            actually_produced(&args, &source, &out_dir),
+            "Cargo's separate-metadata mode must not hide or add any output"
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn save_temps_really_adds_files_that_dependency_serving_must_not_omit() {
     use rabs_key::output_derivation::derive_dependency_output_declarations;
 

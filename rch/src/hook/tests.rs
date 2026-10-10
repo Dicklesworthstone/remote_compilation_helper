@@ -2064,6 +2064,7 @@ async fn test_daemon_query_missing_socket() {
         "/tmp/nonexistent_rch_test.sock",
         "testproj",
         4,
+        0,
         "cargo build",
         None,
         RequiredRuntime::None,
@@ -2100,6 +2101,485 @@ fn queued_selection_test_lease(path: PathBuf) -> DurableLeaseWriter {
     writer
 }
 
+fn retry_selection_test_lease(path: PathBuf) -> DurableLeaseWriter {
+    let writer = queued_selection_test_lease(path);
+    writer.admit(41, &WorkerId::new("previous-worker")).unwrap();
+    writer
+        .set_recovery(serde_json::json!({
+            "retired": true, "returned": 137,
+            "wrapper_id": writer.wrapper_id(), "build_id": 41,
+            "worker": {"id": "previous-worker"},
+        }))
+        .unwrap();
+    writer.record_exit(137).unwrap();
+    writer
+}
+
+fn read_retry_lease(writer: &DurableLeaseWriter) -> DurableJobLease {
+    serde_json::from_slice(&std::fs::read(&writer.path).unwrap()).unwrap()
+}
+
+fn retry_unassigned_response() -> SelectionResponse {
+    SelectionResponse {
+        worker: None,
+        build_id: None,
+        reason: SelectionReason::AllWorkersBusy,
+        diagnostics: None,
+    }
+}
+
+fn assert_retry_pending(writer: &DurableLeaseWriter, previous: &DurableJobLease) {
+    let disk = read_retry_lease(writer);
+    assert_eq!(disk, writer.snapshot());
+    assert_eq!(disk.phase, "selection_pending");
+    assert_eq!(
+        disk.state,
+        rch_common::job_identity::JobLifecycleState::Queued
+    );
+    assert_eq!(
+        disk.identity.local_wrapper_id,
+        previous.identity.local_wrapper_id
+    );
+    assert_eq!(disk.wrapper_pid, previous.wrapper_pid);
+    assert_eq!(disk.process_birth, previous.process_birth);
+    assert_eq!(disk.process_start_ticks, previous.process_start_ticks);
+    assert_eq!(disk.boot_id, previous.boot_id);
+    assert_eq!(disk.command_fingerprint, previous.command_fingerprint);
+    assert_eq!(disk.strict_remote, previous.strict_remote);
+    assert_eq!(disk.self_healing_enabled, previous.self_healing_enabled);
+    assert!(disk.identity.remote_build_id.is_none());
+    assert!(disk.worker_id.is_none());
+    assert!(disk.recovery.is_none());
+    assert!(disk.exit_code.is_none());
+    assert!(!disk.terminal_acknowledged);
+}
+
+#[tokio::test]
+async fn retry_selection_unconfirmed_retains_new_intent_and_never_exhausts() {
+    let directory = tempfile::tempdir().unwrap();
+    let writer = retry_selection_test_lease(directory.path().join("lease.json"));
+    let previous = writer.snapshot();
+    let mut exhausted = false;
+    let result: anyhow::Result<()> = async {
+        dispatch_retry_selection(&writer, true, async || {
+            // This is the production dispatch boundary. Evidence is durable
+            // before a request can create another reservation.
+            assert_retry_pending(&writer, &previous);
+            anyhow::bail!(
+                anyhow::anyhow!("reply lost after admission")
+                    .context(daemon_ipc::SelectionOutcomeUnconfirmed)
+                    .context("outer transport context")
+            );
+        })
+        .await?;
+        exhausted = true;
+        writer.acknowledge_terminal()?;
+        Ok(())
+    }
+    .await;
+    assert!(
+        result
+            .unwrap_err()
+            .downcast_ref::<daemon_ipc::SelectionOutcomeUnconfirmed>()
+            .is_some()
+    );
+    assert!(
+        !exhausted,
+        "uncertain selection must not reach fault.on_exhaust"
+    );
+    let disk = read_retry_lease(&writer);
+    assert_eq!(disk, writer.snapshot());
+    assert_eq!(disk.phase, "selection_unconfirmed");
+    assert!(disk.identity.remote_build_id.is_none());
+    assert!(disk.worker_id.is_none());
+    assert!(disk.recovery.is_none());
+    assert!(disk.exit_code.is_none());
+    assert!(!disk.terminal_acknowledged);
+    assert!(writer.acknowledge_terminal().is_err());
+    assert!(writer.record_exit(137).is_err());
+    assert!(writer.heartbeat("finalize").is_err());
+    assert!(writer.set_recovery(previous.recovery.unwrap()).is_err());
+    assert_eq!(read_retry_lease(&writer), disk);
+    assert!(
+        dispatch_retry_selection(&writer, true, async || {
+            panic!("an uncertain selection cannot dispatch again");
+        })
+        .await
+        .is_err()
+    );
+}
+
+#[tokio::test]
+async fn retry_selection_definitive_refusal_restores_previous_settled_evidence() {
+    for preconnect_error in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let writer = retry_selection_test_lease(directory.path().join("lease.json"));
+        let previous = writer.snapshot();
+        let bytes = std::fs::read(&writer.path).unwrap();
+        let response = dispatch_retry_selection(&writer, true, async || {
+            assert_retry_pending(&writer, &previous);
+            if preconnect_error {
+                anyhow::bail!(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "socket absent before dispatch"
+                ));
+            }
+            Ok(retry_unassigned_response())
+        })
+        .await
+        .unwrap();
+        assert_eq!(response.is_none(), preconnect_error);
+        assert_eq!(writer.snapshot(), previous);
+        assert_eq!(std::fs::read(&writer.path).unwrap(), bytes);
+        writer.acknowledge_terminal().unwrap();
+        assert_eq!(read_retry_lease(&writer).exit_code, Some(137));
+    }
+}
+
+#[tokio::test]
+async fn retry_selection_selected_response_stays_pending_until_new_admission() {
+    let directory = tempfile::tempdir().unwrap();
+    let writer = retry_selection_test_lease(directory.path().join("lease.json"));
+    let previous = writer.snapshot();
+    let response = dispatch_retry_selection(&writer, true, async || {
+        assert_retry_pending(&writer, &previous);
+        Ok(SelectionResponse {
+            worker: Some(rch_common::SelectedWorker {
+                id: WorkerId::new("next-worker"),
+                host: "not-contacted.invalid".into(),
+                user: "test".into(),
+                identity_file: "/unused/key".into(),
+                slots_available: 4,
+                speed_score: 90.0,
+                declared_os: None,
+            }),
+            build_id: Some(42),
+            reason: SelectionReason::Success,
+            diagnostics: None,
+        })
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert_retry_pending(&writer, &previous);
+    assert!(writer.acknowledge_terminal().is_err());
+    writer
+        .admit(response.build_id.unwrap(), &response.worker.unwrap().id)
+        .unwrap();
+    let disk = read_retry_lease(&writer);
+    assert_eq!(
+        disk.identity.local_wrapper_id,
+        previous.identity.local_wrapper_id
+    );
+    assert_eq!(disk.identity.remote_build_id, Some(42));
+    assert_eq!(disk.worker_id.as_deref(), Some("next-worker"));
+    assert_eq!(disk.phase, "sync_up");
+    assert!(disk.recovery.is_none() && disk.exit_code.is_none());
+    assert!(!disk.terminal_acknowledged);
+    assert!(writer.confirm_selection_cancelled().is_err());
+}
+
+#[tokio::test]
+async fn retry_selection_cancelled_response_requires_explicit_terminal_receipt() {
+    let directory = tempfile::tempdir().unwrap();
+    let writer = retry_selection_test_lease(directory.path().join("lease.json"));
+    let previous = writer.snapshot();
+    let response = dispatch_retry_selection(&writer, true, async || {
+        assert_retry_pending(&writer, &previous);
+        Ok(SelectionResponse {
+            reason: SelectionReason::SelectionError("job_cancelled_before_start".into()),
+            ..retry_unassigned_response()
+        })
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(selection_cancelled_before_start(&response));
+    assert_retry_pending(&writer, &previous);
+    assert!(writer.acknowledge_terminal().is_err());
+    writer.confirm_selection_cancelled().unwrap();
+    let disk = read_retry_lease(&writer);
+    assert_eq!(disk.exit_code, Some(130));
+    assert_eq!(disk.phase, "finished");
+    assert!(disk.terminal_acknowledged);
+    assert!(disk.identity.remote_build_id.is_none() && disk.worker_id.is_none());
+    assert!(writer.heartbeat("selection_unconfirmed").is_err());
+    assert_eq!(read_retry_lease(&writer), disk);
+}
+
+#[test]
+fn retry_selection_old_observed_completion_cannot_acknowledge_new_admission() {
+    let directory = tempfile::tempdir().unwrap();
+    let writer = retry_selection_test_lease(directory.path().join("lease.json"));
+    // An older heartbeat retained this observation while waiting for the
+    // daemon's cancellation/completion reply.
+    let observed = writer.snapshot();
+    writer.begin_retry_selection(true).unwrap();
+    let pending = std::fs::read(&writer.path).unwrap();
+    assert!(
+        writer
+            .acknowledge_observed_completion(&observed, 137)
+            .is_err()
+    );
+    assert_eq!(std::fs::read(&writer.path).unwrap(), pending);
+    writer.admit(42, &WorkerId::new("next-worker")).unwrap();
+    writer
+        .set_recovery(serde_json::json!({"retired": true, "returned": 0}))
+        .unwrap();
+    let next = writer.snapshot();
+    let bytes = std::fs::read(&writer.path).unwrap();
+    assert!(
+        writer
+            .acknowledge_observed_completion(&observed, 137)
+            .is_err()
+    );
+    assert_eq!(writer.snapshot(), next);
+    assert_eq!(std::fs::read(&writer.path).unwrap(), bytes);
+    assert_eq!(next.identity.remote_build_id, Some(42));
+    assert!(next.exit_code.is_none() && !next.terminal_acknowledged);
+    // The next attempt's own exact receipt can still complete normally.
+    writer.acknowledge_observed_completion(&next, 0).unwrap();
+    let finished = read_retry_lease(&writer);
+    assert_eq!(finished.identity, next.identity);
+    assert_eq!(finished.worker_id, next.worker_id);
+    assert_eq!(finished.exit_code, Some(0));
+    assert!(finished.terminal_acknowledged);
+}
+
+#[test]
+fn retry_selection_observed_completion_requires_worker_and_delivery_evidence() {
+    let directory = tempfile::tempdir().unwrap();
+    let writer = retry_selection_test_lease(directory.path().join("lease.json"));
+    let observed = writer.snapshot();
+    let mut wrong_worker = observed.clone();
+    wrong_worker.worker_id = Some("other-worker".into());
+    assert!(
+        writer
+            .acknowledge_observed_completion(&wrong_worker, 137)
+            .is_err()
+    );
+    assert_eq!(read_retry_lease(&writer), observed);
+    for recipe in [
+        serde_json::json!({"retired": false, "returned": 137}),
+        serde_json::json!({"retired": true}),
+    ] {
+        writer.set_recovery(recipe).unwrap();
+        let before = writer.snapshot();
+        assert!(
+            writer
+                .acknowledge_observed_completion(&observed, 137)
+                .is_err()
+        );
+        assert_eq!(writer.snapshot(), before);
+        assert_eq!(read_retry_lease(&writer), before);
+    }
+    writer
+        .set_recovery(observed.recovery.clone().unwrap())
+        .unwrap();
+    writer
+        .acknowledge_observed_completion(&observed, 137)
+        .unwrap();
+    let bytes = std::fs::read(&writer.path).unwrap();
+    writer
+        .acknowledge_observed_completion(&observed, 137)
+        .unwrap();
+    assert_eq!(std::fs::read(&writer.path).unwrap(), bytes);
+    assert!(
+        writer
+            .acknowledge_observed_completion(&observed, 130)
+            .is_err()
+    );
+    assert_eq!(std::fs::read(&writer.path).unwrap(), bytes);
+}
+
+#[tokio::test]
+async fn retry_selection_requires_both_release_and_source_retirement_before_dispatch() {
+    for (release_acknowledged, source_retired) in [(false, true), (true, false)] {
+        let directory = tempfile::tempdir().unwrap();
+        let writer = retry_selection_test_lease(directory.path().join("lease.json"));
+        if !source_retired {
+            let mut recipe = writer.snapshot().recovery.unwrap();
+            recipe["retired"] = serde_json::Value::Bool(false);
+            writer.set_recovery(recipe).unwrap();
+        }
+        let previous = writer.snapshot();
+        let bytes = std::fs::read(&writer.path).unwrap();
+        let result = dispatch_retry_selection(&writer, release_acknowledged, async || {
+            panic!("unreleased prior ownership must prevent query dispatch");
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(writer.snapshot(), previous);
+        assert_eq!(std::fs::read(&writer.path).unwrap(), bytes);
+    }
+}
+
+#[tokio::test]
+async fn retry_selection_failed_intent_publication_does_not_dispatch_or_change_memory() {
+    let directory = tempfile::tempdir().unwrap();
+    let writer = retry_selection_test_lease(directory.path().join("lease.json"));
+    let previous = writer.snapshot();
+    let bytes = std::fs::read(&writer.path).unwrap();
+    // A real atomic file publication cannot replace a directory. Keep the
+    // original journal available to establish that no state was lost.
+    let blocked = DurableLeaseWriter {
+        path: directory.path().to_path_buf(),
+        lease: writer.lease.clone(),
+    };
+    let result = dispatch_retry_selection(&blocked, true, async || {
+        panic!("failed durable intent must prevent network dispatch");
+    })
+    .await;
+    assert!(result.is_err());
+    assert_eq!(writer.snapshot(), previous);
+    assert_eq!(std::fs::read(&writer.path).unwrap(), bytes);
+}
+
+#[tokio::test]
+async fn retry_selection_late_refusal_cannot_restore_over_confirmed_cancellation() {
+    let directory = tempfile::tempdir().unwrap();
+    let writer = retry_selection_test_lease(directory.path().join("lease.json"));
+    let result = dispatch_retry_selection(&writer, true, async || {
+        writer.confirm_selection_cancelled().unwrap();
+        Ok(retry_unassigned_response())
+    })
+    .await;
+    assert!(result.is_err());
+    let disk = read_retry_lease(&writer);
+    assert_eq!(disk, writer.snapshot());
+    assert!(disk.terminal_acknowledged);
+    assert_eq!(disk.exit_code, Some(130));
+    assert!(disk.identity.remote_build_id.is_none());
+    assert!(disk.recovery.is_none());
+}
+
+#[tokio::test]
+async fn retry_selection_dropped_query_leaves_durable_pending_without_old_receipt() {
+    let directory = tempfile::tempdir().unwrap();
+    let writer = retry_selection_test_lease(directory.path().join("lease.json"));
+    let previous = writer.snapshot();
+    let result = tokio::time::timeout(
+        Duration::from_millis(10),
+        dispatch_retry_selection(&writer, true, async || {
+            assert_retry_pending(&writer, &previous);
+            std::future::pending().await
+        }),
+    )
+    .await;
+    assert!(result.is_err());
+    assert_retry_pending(&writer, &previous);
+    assert!(writer.heartbeat("finalize").is_err());
+    assert!(writer.record_exit(137).is_err());
+    assert!(
+        writer
+            .set_recovery(previous.recovery.clone().unwrap())
+            .is_err()
+    );
+    assert!(writer.acknowledge_terminal().is_err());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn retry_failover_socket_preserves_endpoint_and_admission_constraints() {
+    let _guard = test_guard!();
+    let directory = tempfile::Builder::new()
+        .prefix("rch-retry-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let socket = directory.path().join("selected.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let mut config = rch_common::RchConfig::default();
+    config.general.socket_path = directory.path().join("wrong.sock").display().to_string();
+    let _config_guard = ConfigOverrideGuard::set(config);
+    let writer = retry_selection_test_lease(directory.path().join("lease.json"));
+    let previous = writer.snapshot();
+    let server_writer = writer.clone();
+    let status = serde_json::json!({
+        "daemon": {"pid": 9, "uptime_secs": 1, "version": "retry-endpoint", "socket_path": socket,
+            "started_at": "2026-10-07T00:00:00Z", "workers_total": 1, "workers_healthy": 1,
+            "slots_total": 16, "slots_available": 16},
+        "workers": [{"id": "next-worker", "host": "unused.invalid", "user": "test",
+            "status": "healthy", "circuit_state": "closed", "used_slots": 0,
+            "total_slots": 16, "speed_score": 90.0, "last_error": null}],
+        "active_builds": [], "recent_builds": [], "issues": [],
+        "stats": {"total_builds": 0, "success_count": 0, "failure_count": 0,
+            "remote_count": 0, "local_count": 0, "avg_duration_ms": 0}
+    });
+    let server = tokio::spawn(async move {
+        for attempt in 0..2 {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, mut output) = stream.into_split();
+            let mut reader = TokioBufReader::new(reader);
+            let mut request = String::new();
+            reader.read_line(&mut request).await.unwrap();
+            let body = if attempt == 0 {
+                assert_eq!(request, "GET /status\n");
+                status.to_string()
+            } else {
+                assert_retry_pending(&server_writer, &previous);
+                assert!(request.starts_with("GET /select-worker/disk-budget?"));
+                for parameter in [
+                    "&cores=3",
+                    "&disk_headroom_gib=12",
+                    "&runtime=rust",
+                    "&job_mode=1",
+                    "&require_tool=git",
+                    "&require_tool=cmake",
+                    "&worker=next-worker",
+                    "&preferred_workers=next-worker",
+                ] {
+                    assert!(
+                        request.contains(parameter),
+                        "missing {parameter}: {request}"
+                    );
+                }
+                assert!(
+                    request.contains(&format!("&local_wrapper_id={}", server_writer.wrapper_id()))
+                );
+                assert!(!request.contains("&wait=1"));
+                serde_json::to_string(&SelectionResponse {
+                    reason: SelectionReason::SelectionError("job_cancelled_before_start".into()),
+                    ..retry_unassigned_response()
+                })
+                .unwrap()
+            };
+            output
+                .write_all(format!("HTTP/1.0 200 OK\r\n\r\n{body}").as_bytes())
+                .await
+                .unwrap();
+            output.shutdown().await.unwrap();
+        }
+    });
+    let response = timeout(
+        Duration::from_secs(3),
+        try_retry_on_bigger_worker(
+            socket.to_str().unwrap(),
+            "job-project",
+            3,
+            12,
+            "git status",
+            None,
+            RequiredRuntime::Rust,
+            CommandPriority::Normal,
+            &[WorkerId::new("previous-worker")],
+            &[WorkerId::new("next-worker")],
+            true,
+            &["git".into(), "cmake".into()],
+            &writer,
+            true,
+            &HookReporter::new(OutputVisibility::None),
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
+    server.await.unwrap();
+    assert!(selection_cancelled_before_start(&response.0));
+    assert_eq!(response.1, WorkerId::new("next-worker"));
+    assert_eq!(read_retry_lease(&writer).phase, "selection_pending");
+}
+
 #[tokio::test]
 async fn queued_selection_lost_or_malformed_response_never_reaches_recovery() {
     let _guard = test_guard!();
@@ -2131,6 +2611,7 @@ async fn queued_selection_lost_or_malformed_response_never_reaches_recovery() {
                 socket.to_str().unwrap(),
                 "queued",
                 2,
+                0,
                 "cargo build",
                 None,
                 RequiredRuntime::None,
@@ -2189,6 +2670,7 @@ async fn queued_selection_preconnect_failure_preserves_recovery() {
             socket.to_str().unwrap(),
             "queued",
             2,
+            0,
             "cargo build",
             None,
             RequiredRuntime::None,
@@ -2283,6 +2765,7 @@ async fn test_daemon_query_protocol() {
         &socket_path,
         "test-project",
         4,
+        0,
         "cargo build",
         None,
         RequiredRuntime::None,
@@ -2372,6 +2855,7 @@ async fn test_daemon_query_sends_preferred_workers() {
         &socket_path,
         "test-project",
         4,
+        0,
         "cargo build",
         None,
         RequiredRuntime::None,
@@ -2475,6 +2959,7 @@ async fn test_daemon_query_releases_worker_outside_requested_set() {
         &socket_path,
         "test-project",
         2,
+        0,
         "cargo build",
         None,
         RequiredRuntime::None,
@@ -2574,6 +3059,7 @@ async fn test_daemon_query_surfaces_unacknowledged_unrequested_worker_release() 
         &socket_path,
         "test-project",
         2,
+        0,
         "cargo build",
         None,
         RequiredRuntime::None,
@@ -2669,6 +3155,7 @@ async fn test_daemon_query_wait_parameters() {
         &socket_path,
         "test-project",
         4,
+        0,
         "cargo build",
         None,
         RequiredRuntime::None,
@@ -2741,6 +3228,7 @@ async fn test_daemon_query_url_encoding() {
         &socket_path,
         "my project/test",
         2,
+        0,
         "cargo build --release",
         None,
         RequiredRuntime::None,
@@ -3907,6 +4395,91 @@ The file `x11.pc` needs to be installed and the PKG_CONFIG_PATH environment vari
     assert_eq!(failure.pkg_config_file.as_deref(), Some("x11.pc"));
     assert_eq!(failure.summary(), "missing worker system package x11.pc");
     assert!(failure.remediation().contains("x11.pc"));
+}
+
+#[test]
+fn remote_disk_exhaustion_requires_a_failed_execution_and_covers_quota_errors() {
+    for stderr in [
+        "error: failed to write: No space left on device (os error 28)",
+        "ld: output failed: ENOSPC",
+        "rustup: Disk quota exceeded",
+        "error[E0308]: mismatched types\nerror: write failed: no space left on device",
+    ] {
+        assert!(remote_failure_is_disk_full(stderr, 101), "{stderr}");
+        assert!(remote_failure_is_worker_fault(stderr, 101), "{stderr}");
+        assert!(!remote_failure_is_disk_full(stderr, 0), "{stderr}");
+    }
+    for stderr in [
+        "error[E0308]: mismatched types",
+        "test result: FAILED. 3 passed; 1 failed",
+        "error: Permission denied (os error 13)",
+        "",
+    ] {
+        assert!(!remote_failure_is_disk_full(stderr, 101), "{stderr}");
+    }
+}
+
+#[test]
+fn source_upload_disk_release_requires_the_selected_worker_and_confirmed_ownership() {
+    let worker = WorkerId::new("upload-worker");
+    let error = anyhow::anyhow!("source receiver failed")
+        .context(crate::transfer::RemoteUploadDiskFull {
+            worker_id: worker.to_string(),
+            roots: vec!["/source-volume/project".into()],
+        })
+        .context("source preparation failed before remote command execution");
+    let result = Err(error);
+    let (worker_fault, disk_fault, roots) = remote_release_faults(&result, &worker);
+    assert!(worker_fault && disk_fault);
+    assert_eq!(roots, ["/source-volume/project"]);
+    assert_eq!(
+        remote_release_faults(&result, &WorkerId::new("other-worker")),
+        (false, false, &[] as &[String])
+    );
+    let result = result.map_err(|error| error.context(crate::transfer::RemoteExecutionUnconfirmed));
+    assert_eq!(
+        classify_remote_pipeline_failure(result.as_ref().unwrap_err()),
+        RemotePipelineFailurePolicy::FailClosedNoLocalFallback
+    );
+    assert_eq!(
+        remote_release_faults(&result, &worker),
+        (false, false, &[] as &[String])
+    );
+    assert!(is_remote_execution_unconfirmed(
+        result.as_ref().unwrap_err()
+    ));
+}
+
+#[test]
+fn source_upload_disk_release_never_infers_worker_pressure_from_untyped_transfer_errors() {
+    let worker = WorkerId::new("upload-worker");
+    let result = Err(TransferError::SyncFailed {
+        reason: "rsync artifact retrieval failed".into(),
+        exit_code: Some(23),
+        stderr: "rsync: [receiver] write failed on target/app: No space left on device (28)".into(),
+    }
+    .into());
+    assert_eq!(
+        remote_release_faults(&result, &worker),
+        (false, false, &[] as &[String])
+    );
+    // Existing remote-command evidence still follows its actual exit status.
+    for exit_code in [0, 101] {
+        let result = Ok(remote_result::RemoteExecutionResult {
+            deadline_triggered: false,
+            exit_code,
+            stderr: "No space left on device".into(),
+            duration_ms: 10,
+            timing: Default::default(),
+            result_dirs: Vec::new(),
+            disk_roots: vec!["/build-volume/target".into()],
+            cargo_stdout: None,
+        });
+        let (worker_fault, disk_fault, roots) = remote_release_faults(&result, &worker);
+        assert_eq!(worker_fault, exit_code != 0);
+        assert_eq!(disk_fault, exit_code != 0);
+        assert_eq!(roots, ["/build-volume/target"]);
+    }
 }
 
 #[test]
@@ -8814,6 +9387,7 @@ async fn test_daemon_query_connect_timeout_fail_open() {
         &socket_path,
         "test-project",
         4,
+        0,
         "cargo build",
         None,
         RequiredRuntime::None,
@@ -8932,6 +9506,7 @@ async fn test_daemon_query_partial_response_timeout() {
         &socket_path,
         "test-project",
         4,
+        0,
         "cargo build",
         None,
         RequiredRuntime::None,

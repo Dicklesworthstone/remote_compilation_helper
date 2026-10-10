@@ -404,11 +404,16 @@ mod tests {
         writer.lease.lock().unwrap().wrapper_pid = 2_147_483_646;
         writer.persist().unwrap();
         let mut queries = 0;
-        let exit = super::super::recover_job_with_daemon(&writer, async |command: &str| {
-            assert!(command.starts_with("GET /builds/41?"));
-            queries += 1;
-            Ok(response(terminal(&writer, 102)))
-        })
+        // Boxed: the debug-build recovery future overflowed the test thread's
+        // stack and aborted the whole rch test binary.
+        let exit = Box::pin(super::super::recover_job_with_daemon(
+            &writer,
+            async |command: &str| {
+                assert!(command.starts_with("GET /builds/41?"));
+                queries += 1;
+                Ok(response(terminal(&writer, 102)))
+            },
+        ))
         .await
         .unwrap();
         assert_eq!(exit, 102);
@@ -417,9 +422,10 @@ mod tests {
         // The remote worker is deliberately unreachable. A second pass must
         // remain read-only and not even call the daemon transport.
         assert_eq!(
-            super::super::recover_job_with_daemon(&writer, async |_command: &str| {
-                panic!("acknowledged recovery contacted a peer")
-            })
+            Box::pin(super::super::recover_job_with_daemon(
+                &writer,
+                async |_command: &str| { panic!("acknowledged recovery contacted a peer") }
+            ))
             .await
             .unwrap(),
             102

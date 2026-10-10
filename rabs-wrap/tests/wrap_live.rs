@@ -15,18 +15,19 @@ fn wrap() -> &'static str {
     env!("CARGO_BIN_EXE_rabs-wrap")
 }
 
-/// The rabsd binary lives beside ours in the target dir; build it once
-/// if a fresh checkout hasn't yet.
+/// The rabsd binary lives beside ours in the target dir. Always ask Cargo,
+/// once per test process: it is a no-op when fresh, and a daemon left over
+/// from an older tree must never answer for this one.
 fn rabsd_bin() -> std::path::PathBuf {
-    let path = std::path::Path::new(wrap()).with_file_name("rabsd");
-    if !path.exists() {
+    static BUILT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    BUILT.get_or_init(|| {
         let status = Command::new(env!("CARGO"))
             .args(["build", "-p", "rabsd", "--bin", "rabsd"])
             .status()
             .expect("build rabsd");
-        assert!(status.success());
-    }
-    path
+        assert!(status.success(), "rabsd build failed");
+    });
+    std::path::Path::new(wrap()).with_file_name("rabsd")
 }
 
 fn write_script(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {

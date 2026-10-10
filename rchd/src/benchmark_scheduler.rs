@@ -587,11 +587,8 @@ impl BenchmarkScheduler {
         let conditions = score.benchmark_conditions.as_ref()?;
 
         // Need current telemetry for the worker
-        let config = worker.config.read().await;
-        let worker_id = config.id.clone();
-        drop(config);
-
-        let current = self.telemetry.latest(worker_id.as_str())?;
+        let endpoint = worker.endpoint_snapshot().await;
+        let current = self.telemetry.latest_for_endpoint(&endpoint)?;
         let current_cpu = current.telemetry.cpu.overall_percent;
         let current_mem = current.telemetry.memory.used_percent;
         let current_load = current.telemetry.cpu.load_average.one_min;
@@ -619,7 +616,7 @@ impl BenchmarkScheduler {
         // Negative drift (conditions improved) is never flagged.
         if composite_drift >= self.config.drift_threshold_pct {
             debug!(
-                worker_id = %worker_id,
+                worker_id = %endpoint.config.id,
                 cpu_drift = format!("{:.1}", cpu_drift),
                 mem_drift = format!("{:.1}", mem_drift),
                 load_drift = format!("{:.1}", load_drift),
@@ -639,6 +636,7 @@ impl BenchmarkScheduler {
         let Some(worker) = self.pool.get(worker_id).await else {
             return false;
         };
+        let endpoint = worker.endpoint_snapshot().await;
 
         // Check health status
         let status = worker.status().await;
@@ -660,8 +658,11 @@ impl BenchmarkScheduler {
             return false;
         }
 
+        let Some(_endpoint_guard) = worker.lock_current_endpoint(&endpoint).await else {
+            return false;
+        };
         let capabilities = worker.capabilities().await;
-        let telemetry = self.telemetry.latest(worker_id.as_str());
+        let telemetry = self.telemetry.latest_for_endpoint(&endpoint);
         if !benchmark_telemetry_allows_start(
             &capabilities,
             telemetry.as_ref(),
@@ -1125,6 +1126,9 @@ fn benchmark_ssh_command(
     cmd.arg("-o")
         .arg(format!("ConnectTimeout={}", timeout.as_secs().min(30)));
     cmd.arg("-i").arg(&identity_file);
+    if let Some(opts) = rch_common::ssh_utils::identities_only_args(&identity_file) {
+        cmd.args(opts);
+    }
     cmd.arg(format!("{}@{}", worker.user, worker.host));
     // Windows workers keep the plain call, matching the build path, which also
     // skips `timeout` there: depending on which `sh` the session resolves,
@@ -3171,6 +3175,55 @@ Benchmark complete
         assert_eq!(scheduler.pending_count().await, 1);
         assert_eq!(scheduler.running_count().await, 0);
         assert_eq!(worker.available_slots().await, 4);
+    }
+
+    #[tokio::test]
+    async fn replacement_benchmark_waits_for_its_own_telemetry() {
+        let pool = WorkerPool::new();
+        let worker_id = WorkerId::new("replacement-benchmark");
+        pool.add_worker(make_worker_config(worker_id.as_str()))
+            .await;
+        let worker = pool.get(&worker_id).await.unwrap();
+        let capabilities = WorkerCapabilities {
+            disk_free_gb: Some(50.0),
+            disk_total_gb: Some(100.0),
+            ..WorkerCapabilities::default()
+        };
+        worker.set_capabilities(capabilities.clone()).await;
+        let telemetry = Arc::new(TelemetryStore::new(Duration::from_secs(300), None));
+        let (scheduler, _handle) = BenchmarkScheduler::new(
+            make_test_config(),
+            pool,
+            telemetry.clone(),
+            EventBus::new(16),
+        );
+        let sample = make_telemetry_with_load(worker_id.as_str(), 10.0, 30.0, 0.5);
+        let before = worker.endpoint_snapshot().await;
+        telemetry.ingest_for_endpoint(sample.clone(), TelemetrySource::SshPoll, &before);
+        assert!(scheduler.is_worker_eligible(&worker_id).await);
+
+        let mut replacement = before.config;
+        replacement.host = "replacement.host".to_string();
+        assert!(worker.update_config(replacement).await);
+        worker
+            .apply_health_status(rch_common::WorkerStatus::Healthy)
+            .await;
+        worker.set_capabilities(capabilities).await;
+        assert!(!scheduler.is_worker_eligible(&worker_id).await);
+        telemetry.ingest(sample.clone(), TelemetrySource::Piggyback);
+        assert!(!scheduler.is_worker_eligible(&worker_id).await);
+
+        let current = worker.endpoint_snapshot().await;
+        telemetry.ingest_for_endpoint(sample, TelemetrySource::SshPoll, &current);
+        assert!(scheduler.is_worker_eligible(&worker_id).await);
+        telemetry.ingest(
+            make_telemetry_with_load(worker_id.as_str(), 100.0, 100.0, 100.0),
+            TelemetrySource::Piggyback,
+        );
+        assert!(
+            scheduler.is_worker_eligible(&worker_id).await,
+            "an unbound update cannot replace current endpoint evidence"
+        );
     }
 
     /// Build a SpeedScore with attached BenchmarkConditions.

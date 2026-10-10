@@ -823,7 +823,7 @@ mod tests {
         }
         assert_eq!(
             recoverable_lease_ids(dir.path(), now, |pid| pid == 22),
-            [pending.identity.local_wrapper_id.clone()]
+            std::slice::from_ref(&pending.identity.local_wrapper_id)
         );
     }
 

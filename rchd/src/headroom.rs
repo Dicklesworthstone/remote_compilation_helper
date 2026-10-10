@@ -21,7 +21,7 @@
 use crate::history::BuildHistory;
 use rch_common::{BuildLocation, WorkerId};
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, info};
@@ -376,6 +376,115 @@ impl HeadroomEstimator {
         let ratio = effective_free / required;
         (ratio / 2.0).clamp(0.0, 1.0)
     }
+}
+
+// =========================================================================
+// Learned build footprints (bd-wv746)
+// =========================================================================
+
+/// Samples retained per (project, command class).
+const FOOTPRINT_SAMPLES: usize = 8;
+/// A footprint older than this no longer describes the project.
+const FOOTPRINT_MAX_AGE_SECS: i64 = 30 * 24 * 60 * 60;
+/// Growth below this is measurement noise (free space is sampled in whole GiB).
+const FOOTPRINT_MIN_GROWTH_GIB: f64 = 1.0;
+
+/// Key a footprint by project and command class. `cargo test --all-features`
+/// can need 10x the space of `cargo check` in the same project, so the
+/// classifier kind is part of the identity; unclassified commands share one.
+pub fn footprint_key(project_id: &str, command: &str) -> String {
+    let kind = rch_common::classify_command(command)
+        .kind
+        .map_or_else(|| "other".to_string(), |kind| format!("{kind:?}"));
+    format!("{project_id}\u{1f}{kind}")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, serde::Deserialize)]
+struct FootprintSample {
+    growth_gib: f64,
+    observed_unix: i64,
+}
+
+/// Observed build-filesystem growth of recent remote builds.
+///
+/// A sample is the drop in a worker's free build-disk space between the
+/// admission-time probe and the lowest probe seen while the build ran. It is
+/// only taken when no other build this daemon admitted shared the worker, so
+/// the growth is attributable to the one build. Other dispatchers' builds can
+/// still inflate it; cache cleanup can deflate it. The estimate is therefore
+/// used to steer placement between workers, never to refuse a build.
+#[derive(Debug, Default, Serialize, serde::Deserialize)]
+pub struct FootprintBook {
+    #[serde(default)]
+    entries: HashMap<String, VecDeque<FootprintSample>>,
+}
+
+impl FootprintBook {
+    /// Load a persisted book. A missing or unreadable file is an empty book:
+    /// footprints are advisory and are relearned from the next builds.
+    pub fn load(path: &std::path::Path) -> Self {
+        match std::fs::read(path) {
+            Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|error| {
+                tracing::warn!(path = %path.display(), %error, "ignoring unreadable footprint book");
+                Self::default()
+            }),
+            Err(_) => Self::default(),
+        }
+    }
+
+    /// Persist with write-then-rename so a crash leaves the old book intact.
+    pub fn persist(&self, path: &std::path::Path) -> std::io::Result<()> {
+        let staged = path.with_extension(format!("tmp.{}", std::process::id()));
+        std::fs::write(&staged, serde_json::to_vec(self)?)?;
+        std::fs::rename(&staged, path)
+    }
+
+    /// Record one observed growth. Returns whether the book changed.
+    pub fn record(&mut self, key: &str, growth_gib: f64, now_unix: i64) -> bool {
+        if !growth_gib.is_finite() || growth_gib < FOOTPRINT_MIN_GROWTH_GIB {
+            return false;
+        }
+        let samples = self.entries.entry(key.to_string()).or_default();
+        if samples.len() >= FOOTPRINT_SAMPLES {
+            samples.pop_front();
+        }
+        samples.push_back(FootprintSample {
+            growth_gib,
+            observed_unix: now_unix,
+        });
+        true
+    }
+
+    /// The largest unexpired growth for this key. The maximum (not the mean)
+    /// is deliberate: an incremental rebuild grows a warm pool by little, but
+    /// the next placement may land on a worker without that pool.
+    pub fn estimate_gib(&self, key: &str, now_unix: i64) -> Option<f64> {
+        self.entries
+            .get(key)?
+            .iter()
+            .filter(|sample| {
+                now_unix.saturating_sub(sample.observed_unix) <= FOOTPRINT_MAX_AGE_SECS
+            })
+            .map(|sample| sample.growth_gib)
+            .reduce(f64::max)
+    }
+
+    /// Drop expired samples and empty keys.
+    pub fn prune(&mut self, now_unix: i64) {
+        for samples in self.entries.values_mut() {
+            samples.retain(|sample| {
+                now_unix.saturating_sub(sample.observed_unix) <= FOOTPRINT_MAX_AGE_SECS
+            });
+        }
+        self.entries.retain(|_, samples| !samples.is_empty());
+    }
+}
+
+/// Space a worker should have before taking a build with a learned footprint:
+/// the footprint plus 10% (at least 5 GiB), so the build does not end with the
+/// disk at zero bytes.
+pub fn footprint_requirement_gib(footprint_gib: f64) -> f64 {
+    footprint_gib + (footprint_gib * 0.1).max(5.0)
 }
 
 // =========================================================================
@@ -825,5 +934,86 @@ mod tests {
 
         let summary = estimator.reservation_summary().await;
         assert_eq!(summary.len(), 2);
+    }
+
+    // =====================================================================
+    // Learned footprint tests (bd-wv746)
+    // =====================================================================
+
+    #[test]
+    fn footprint_key_separates_command_classes_and_projects() {
+        let test = footprint_key("fgdb", "cargo test --all-features");
+        assert_eq!(test, footprint_key("fgdb", "cargo test -p core"));
+        assert_ne!(test, footprint_key("fgdb", "cargo check --workspace"));
+        assert_ne!(test, footprint_key("other", "cargo test --all-features"));
+        assert_eq!(
+            footprint_key("fgdb", "echo hi"),
+            footprint_key("fgdb", "ls -la")
+        );
+    }
+
+    #[test]
+    fn footprint_estimate_is_the_largest_unexpired_sample() {
+        let mut book = FootprintBook::default();
+        let now = 1_800_000_000;
+        assert_eq!(book.estimate_gib("k", now), None);
+        // Sub-GiB growth is noise in whole-GiB probes; non-finite is junk.
+        assert!(!book.record("k", 0.5, now));
+        assert!(!book.record("k", f64::NAN, now));
+        assert!(!book.record("k", f64::INFINITY, now));
+        assert_eq!(book.estimate_gib("k", now), None);
+
+        assert!(book.record("k", 64.0, now - FOOTPRINT_MAX_AGE_SECS - 1));
+        assert!(book.record("k", 3.0, now));
+        assert!(book.record("k", 12.0, now));
+        // The 64 GiB sample expired; a warm 3 GiB rebuild does not hide 12.
+        assert_eq!(book.estimate_gib("k", now), Some(12.0));
+        assert_eq!(
+            book.estimate_gib("k", now - FOOTPRINT_MAX_AGE_SECS),
+            Some(64.0)
+        );
+
+        book.prune(now);
+        assert_eq!(book.entries["k"].len(), 2);
+        book.prune(now + 2 * FOOTPRINT_MAX_AGE_SECS);
+        assert!(book.entries.is_empty());
+    }
+
+    #[test]
+    fn footprint_book_keeps_a_bounded_window() {
+        let mut book = FootprintBook::default();
+        let now = 1_800_000_000;
+        book.record("k", 100.0, now);
+        for growth in 0..FOOTPRINT_SAMPLES {
+            book.record("k", 2.0 + growth as f64, now);
+        }
+        assert_eq!(book.entries["k"].len(), FOOTPRINT_SAMPLES);
+        // The oldest (100 GiB) sample rolled out of the window.
+        assert_eq!(
+            book.estimate_gib("k", now),
+            Some(1.0 + FOOTPRINT_SAMPLES as f64)
+        );
+    }
+
+    #[test]
+    fn footprint_book_round_trips_and_tolerates_corruption() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("history.footprints.json");
+        assert!(FootprintBook::load(&path).entries.is_empty());
+
+        let mut book = FootprintBook::default();
+        book.record("k", 40.0, 1_800_000_000);
+        book.persist(&path).unwrap();
+        let loaded = FootprintBook::load(&path);
+        assert_eq!(loaded.estimate_gib("k", 1_800_000_000), Some(40.0));
+
+        std::fs::write(&path, b"{not json").unwrap();
+        assert!(FootprintBook::load(&path).entries.is_empty());
+    }
+
+    #[test]
+    fn footprint_requirement_adds_a_margin() {
+        assert!((footprint_requirement_gib(64.0) - 70.4).abs() < 1e-9);
+        assert!((footprint_requirement_gib(10.0) - 15.0).abs() < 1e-9);
     }
 }

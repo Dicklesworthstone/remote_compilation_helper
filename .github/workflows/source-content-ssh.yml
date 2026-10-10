@@ -1,0 +1,197 @@
+name: Source-content SSH integrity
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'rch/src/transfer.rs'
+      - 'rch/src/hook/ssh.rs'
+      - 'rch/src/transfer/source_content_barrier.rs'
+      - 'scripts/test_source_content_ssh.py'
+      - '.github/workflows/source-content-ssh.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ssh-integrity:
+    if: >-
+      github.event_name != 'push' || !contains(github.event.head_commit.message, '[source84-land-two-files]')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+    env:
+      RUSTUP_TOOLCHAIN: stable
+      RSYNC_OLD_ARGS: '0'
+      RSYNC_PROTECT_ARGS: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install native regression tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y rsync openssh-client openssh-server
+          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+      - name: Check receipt transport formatting
+        run: |
+          set -euo pipefail
+          rustfmt --check --edition 2024 --config skip_children=true rch/src/transfer.rs rch/src/hook/ssh.rs rch/src/transfer/source_content_barrier.rs rabs-scheduler/src/managed_pool.rs
+          git diff --check
+      - name: Test exact Rust policy with real SSH and rsync
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/source84-evidence"
+          python3 scripts/test_source_content_ssh.py --evidence "$RUNNER_TEMP/source84-evidence" 2>&1 | tee "$RUNNER_TEMP/source84-evidence/run.log"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: source-content-ssh-${{ github.sha }}
+          path: ${{ runner.temp }}/source84-evidence
+          if-no-files-found: warn
+          retention-days: 7
+
+  land-reviewed-integration:
+    if: >-
+      github.event_name == 'push' && contains(github.event.head_commit.message, '[source84-land-two-files]')
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: bash
+    env:
+      RUSTUP_TOOLCHAIN: stable
+      RSYNC_OLD_ARGS: '0'
+      RSYNC_PROTECT_ARGS: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Apply and hash-check the exact rebased integration
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import base64, hashlib, json, os, pathlib, subprocess, urllib.request
+          expected = {
+              'rch/src/transfer.rs': '3993bd67aabffaeea3c350e161badf493e6e37f5',
+              'rch/src/hook/ssh.rs': 'cffe0da87755ae18979eb43459fafcc53eb37b30',
+              'rabs-scheduler/src/managed_pool.rs': '7764f25a28db90c94a42e0a2499ef162b15508b1',
+              'rch/src/transfer/source_content_barrier.rs': 'd7db94dcc5dcd6fea5578f605514433fccf78a7c',
+          }
+          patched = {
+              'rch/src/transfer.rs': 'e526b7541cdce2afb1370051143c79af74c543da',
+              'rch/src/hook/ssh.rs': '9f8ae192920da80e3c6948658e1385d7a1a6387b',
+          }
+          def git_hash(path):
+              return subprocess.check_output(['git', 'hash-object', path], text=True).strip()
+          for path, sha in expected.items():
+              if git_hash(path) != sha:
+                  raise RuntimeError(f'{path} changed; refusing stale publication')
+          for path in ['scripts/test_source_content_ssh.py', '.github/workflows/source-content-ssh.yml']:
+              expected[path] = git_hash(path)
+          sha = '732e86d0641f08e14f338ba62596cd5a54cdc00d'
+          request = urllib.request.Request(
+              f"https://api.github.com/repos/{os.environ['GITHUB_REPOSITORY']}/git/blobs/{sha}",
+              headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json'})
+          with urllib.request.urlopen(request, timeout=60) as response:
+              patch_bytes = base64.b64decode(json.load(response)['content'])
+          if hashlib.sha1(b'blob ' + str(len(patch_bytes)).encode() + b'\0' + patch_bytes).hexdigest() != sha:
+              raise RuntimeError('reviewed patch digest mismatch')
+          evidence = pathlib.Path(os.environ['RUNNER_TEMP']) / 'source84-evidence'
+          evidence.mkdir()
+          patch = evidence / 'reviewed.patch'
+          patch.write_bytes(patch_bytes)
+          subprocess.run(['git', 'apply', '--check', '--whitespace=error-all', str(patch)], check=True)
+          subprocess.run(['git', 'apply', '--whitespace=error-all', str(patch)], check=True)
+          subprocess.run(['git', 'diff', '--check'], check=True)
+          changed = subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines()
+          if set(changed) != set(patched):
+              raise RuntimeError(f'unexpected changed files: {changed}')
+          for path, sha in patched.items():
+              if git_hash(path) != sha:
+                  raise RuntimeError(f'{path}: patched bytes differ from reviewed candidate')
+          (evidence / 'prepared.patch').write_bytes(subprocess.check_output(['git', 'diff', '--binary']))
+          (evidence / 'baseline.json').write_text(json.dumps(expected, indent=2) + '\n')
+          PY
+      - name: Install native regression tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y rsync openssh-client openssh-server
+          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+      - name: Qualify the integrated receipt policy without weakening its gates
+        run: |
+          set -euo pipefail
+          rustfmt --check --edition 2024 --config skip_children=true rch/src/transfer.rs rch/src/hook/ssh.rs rch/src/transfer/source_content_barrier.rs rabs-scheduler/src/managed_pool.rs
+          git diff --check
+          python3 scripts/test_source_content_ssh.py --evidence "$RUNNER_TEMP/source84-evidence" 2>&1 | tee "$RUNNER_TEMP/source84-evidence/run.log"
+      - name: Publish the qualified transport files directly to main without force
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import base64, json, os, pathlib, subprocess, urllib.request
+          repo = os.environ['GITHUB_REPOSITORY']
+          paths = ['rch/src/transfer.rs', 'rch/src/hook/ssh.rs']
+          evidence = pathlib.Path(os.environ['RUNNER_TEMP']) / 'source84-evidence'
+          expected = json.loads((evidence / 'baseline.json').read_text())
+          def api(suffix, payload=None, method=None):
+              data = None if payload is None else json.dumps(payload).encode()
+              request = urllib.request.Request(f'https://api.github.com/repos/{repo}/{suffix}', data=data, method=method,
+                  headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json', 'Content-Type': 'application/json'})
+              with urllib.request.urlopen(request, timeout=60) as response:
+                  return json.load(response)
+          changed = subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines()
+          if set(changed) != set(paths):
+              raise RuntimeError(f'unexpected publication paths: {changed}')
+          tree = []
+          for path in paths:
+              data = pathlib.Path(path).read_bytes()
+              sha = api('git/blobs', {'encoding': 'base64', 'content': base64.b64encode(data).decode()})['sha']
+              if sha != subprocess.check_output(['git', 'hash-object', path], text=True).strip():
+                  raise RuntimeError(f'published blob mismatch: {path}')
+              tree.append({'path': path, 'mode': '100644', 'type': 'blob', 'sha': sha})
+          (evidence / 'prepared.json').write_text(json.dumps({'qualified_base': os.environ['GITHUB_SHA'], 'files': tree}, indent=2) + '\n')
+          parent = api('git/ref/heads/main')['object']['sha']
+          current = {path: api(f'contents/{path}?ref={parent}')['sha'] for path in expected}
+          prepared = {entry['path']: entry['sha'] for entry in tree}
+          if all(current[path] == prepared.get(path, sha) for path, sha in expected.items()):
+              (evidence / 'published.json').write_text(json.dumps({'commit': parent, 'already_present': True, 'files': tree}, indent=2) + '\n')
+              raise SystemExit(0)
+          for path, sha in expected.items():
+              if current[path] != sha:
+                  raise RuntimeError(f'{path} changed on main; refusing to overwrite concurrent work')
+          root = api(f'git/commits/{parent}')['tree']['sha']
+          tree_sha = api('git/trees', {'base_tree': root, 'tree': tree})['sha']
+          message = ('fix(transfer): activate qualified source-receipt checks (#84)\n\n'
+              'Wire the strict no-delta policy into the rsync barrier and direct\n'
+              'SSH verification. Keep host authentication, identity key pinning,\n'
+              'remote stderr, deletion and malformed-output refusals intact.\n'
+              'Preserve Windows transport, disk quarantine and native outputs.\n\n'
+              'Validation: exact patched hashes, rustfmt, Rust policy tests and\n'
+              'real SSH/rsync qualification passed in Actions run ' + os.environ['GITHUB_RUN_ID'] + '.\n'
+              'This is not full-workspace or complete RCH execution qualification.\n')
+          commit = api('git/commits', {'message': message, 'tree': tree_sha, 'parents': [parent]})['sha']
+          api('git/refs/heads/main', {'sha': commit, 'force': False}, 'PATCH')
+          report = {'parent': parent, 'commit': commit, 'tree': tree_sha, 'files': tree}
+          (evidence / 'published.json').write_text(json.dumps(report, indent=2) + '\n')
+          if api('git/ref/heads/main')['object']['sha'] != commit:
+              raise RuntimeError(f'publication readback moved after {commit}; inspect before retrying')
+          print(json.dumps(report, indent=2))
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: source-content-publication-${{ github.sha }}
+          path: ${{ runner.temp }}/source84-evidence
+          if-no-files-found: warn
+          retention-days: 7
