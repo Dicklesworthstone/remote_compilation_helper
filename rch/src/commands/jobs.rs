@@ -283,16 +283,49 @@ async fn wait_for_job_poll(deadline: Instant) -> Result<()> {
 }
 
 #[cfg(unix)]
+fn read_job_journal_at(
+    directory: std::os::fd::BorrowedFd<'_>,
+    name: &std::ffi::CStr,
+) -> Result<DurableJobLease> {
+    use rustix::fs::{Mode, OFlags};
+    use std::io::Read;
+
+    // The directory descriptor pins the observed namespace. NOFOLLOW rejects
+    // a replacement symlink at open, and NONBLOCK prevents a replacement FIFO
+    // from waiting for a writer before we can inspect the opened object.
+    let descriptor = rustix::fs::openat(
+        directory,
+        name,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::NOCTTY,
+        Mode::empty(),
+    )
+    .context("journal open without following symlinks failed")?;
+    let mut file = std::fs::File::from(descriptor);
+    anyhow::ensure!(file.metadata()?.is_file(), "journal is not a regular file");
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).context("journal read failed")?;
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+#[cfg(unix)]
 fn read_job_listing(directory: &std::path::Path) -> Result<Value> {
+    use rustix::fs::{Dir, Mode, OFlags};
+    use std::os::unix::ffi::OsStrExt;
+
     let mut jobs = Vec::new();
     let mut journal_errors = Vec::new();
-    let entries = match std::fs::read_dir(directory) {
-        Ok(entries) => Some(entries),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+    let descriptor = match rustix::fs::open(
+        directory,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+        Mode::empty(),
+    ) {
+        Ok(descriptor) => Some(descriptor),
+        Err(rustix::io::Errno::NOENT) => None,
         Err(error) => return Err(error.into()),
     };
-    if let Some(entries) = entries {
-        for entry in entries {
+    if let Some(descriptor) = descriptor {
+        let mut entries = Dir::new(descriptor)?;
+        while let Some(entry) = entries.next() {
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(error) => {
@@ -300,15 +333,13 @@ fn read_job_listing(directory: &std::path::Path) -> Result<Value> {
                     continue;
                 }
             };
-            let path = entry.path();
+            let name = std::ffi::OsStr::from_bytes(entry.file_name().to_bytes());
+            let path = directory.join(name);
             if path.extension().and_then(|value| value.to_str()) != Some("json") {
                 continue;
             }
             let observed = (|| -> Result<DurableJobLease> {
-                // Reject entries observed as symlinks or nonregular files
-                // before opening. An invalid entry is evidence, not absence.
-                anyhow::ensure!(entry.file_type()?.is_file(), "journal is not a regular file");
-                Ok(serde_json::from_slice(&std::fs::read(&path)?)?)
+                read_job_journal_at(entries.fd()?, entry.file_name())
             })();
             match observed {
                 Ok(lease) => {
@@ -325,7 +356,7 @@ fn read_job_listing(directory: &std::path::Path) -> Result<Value> {
                     }));
                 }
                 Err(error) => {
-                    journal_errors.push(json!({"path": path, "error": error.to_string()}));
+                    journal_errors.push(json!({"path": path, "error": format!("{error:#}")}));
                 }
             }
         }
@@ -551,6 +582,8 @@ async fn run_unix(action: Option<JobsAction>, ctx: &OutputContext) -> Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::os::fd::AsFd;
 
     #[cfg(unix)]
     #[test]
@@ -599,10 +632,11 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn job_listing_reports_observed_nonregular_entries_and_preserves_them() {
+    fn job_listing_rejects_nonregular_journals_and_preserves_them() {
         let retained = tempfile::tempdir().unwrap().keep();
         let target = retained.join("retained-evidence");
-        std::fs::write(&target, b"evidence stays intact").unwrap();
+        let target_bytes = serde_json::to_vec(&queued_lease()).unwrap();
+        std::fs::write(&target, &target_bytes).unwrap();
         let link = retained.join("symlink.json");
         std::os::unix::fs::symlink(&target, &link).unwrap();
         let directory = retained.join("directory.json");
@@ -613,9 +647,13 @@ mod tests {
         assert!(listing["jobs"].as_array().unwrap().is_empty());
         let errors = listing["journal_errors"].as_array().unwrap();
         assert_eq!(errors.len(), 2);
-        for path in [&link, &directory] {
+        for (path, reason) in [
+            (&link, "journal open without following symlinks failed"),
+            (&directory, "journal is not a regular file"),
+        ] {
             assert!(errors.iter().any(|error| {
-                error["path"] == json!(path) && error["error"] == "journal is not a regular file"
+                error["path"] == json!(path)
+                    && error["error"].as_str().unwrap().contains(reason)
             }));
         }
         assert!(
@@ -625,7 +663,199 @@ mod tests {
                 .is_symlink()
         );
         assert!(directory.is_dir());
-        assert_eq!(std::fs::read(target).unwrap(), b"evidence stays intact");
+        assert_eq!(std::fs::read(target).unwrap(), target_bytes);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn job_listing_reads_all_regular_journals_with_spaces_and_unicode() {
+        let retained = tempfile::tempdir().unwrap().keep();
+        let leases = [queued_lease(), queued_lease()];
+        let names = ["first journal.json", "snowman-\u{2603}.json"];
+        for (name, lease) in names.iter().zip(&leases) {
+            std::fs::write(retained.join(name), serde_json::to_vec(lease).unwrap()).unwrap();
+        }
+
+        let listing = read_job_listing(&retained).unwrap();
+        assert_eq!(listing["complete"], true);
+        assert_eq!(listing["journal_errors"], json!([]));
+        let jobs = listing["jobs"].as_array().unwrap();
+        assert_eq!(jobs.len(), leases.len());
+        for job in jobs {
+            assert_eq!(job["owner_presence"], "unknown");
+            assert_eq!(job["wrapper_alive"], false);
+        }
+        let mut observed: Vec<_> = jobs.iter().map(|job| job["lease"].clone()).collect();
+        let mut expected: Vec<_> = leases
+            .iter()
+            .map(|lease| serde_json::to_value(lease).unwrap())
+            .collect();
+        for records in [&mut observed, &mut expected] {
+            records.sort_by_key(|record| {
+                record["identity"]["local_wrapper_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            });
+        }
+        assert_eq!(observed, expected);
+        for (name, lease) in names.iter().zip(&leases) {
+            assert_eq!(
+                std::fs::read(retained.join(name)).unwrap(),
+                serde_json::to_vec(lease).unwrap()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn job_journal_read_rejects_symlink_replacement_after_regular_observation() {
+        use rustix::fs::{Dir, Mode, OFlags};
+
+        let retained = tempfile::tempdir().unwrap().keep();
+        let journal = retained.join("observed.json");
+        let original_bytes = serde_json::to_vec(&queued_lease()).unwrap();
+        std::fs::write(&journal, &original_bytes).unwrap();
+        let target = retained.join("other-lease");
+        let target_bytes = serde_json::to_vec(&queued_lease()).unwrap();
+        std::fs::write(&target, &target_bytes).unwrap();
+        let entries = Dir::new(
+            rustix::fs::open(
+                &retained,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+                Mode::empty(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(std::fs::symlink_metadata(&journal).unwrap().is_file());
+
+        // Move the original into a fresh retained name; replace only the test's
+        // now-vacant journal name. No input or symlink target is discarded.
+        let original = retained.join("observed-original.retained");
+        assert!(!original.exists());
+        std::fs::rename(&journal, &original).unwrap();
+        std::os::unix::fs::symlink(&target, &journal).unwrap();
+        let error = read_job_journal_at(entries.fd().unwrap(), c"observed.json").unwrap_err();
+        assert!(format!("{error:#}").contains("journal open without following symlinks failed"));
+        assert_eq!(std::fs::read(original).unwrap(), original_bytes);
+        assert_eq!(std::fs::read(target).unwrap(), target_bytes);
+        assert!(
+            std::fs::symlink_metadata(journal)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn job_journal_read_rejects_fifo_replacement_without_waiting_for_a_writer() {
+        use rustix::fs::{Mode, OFlags};
+        use std::os::unix::fs::FileTypeExt;
+
+        let retained = tempfile::tempdir().unwrap().keep();
+        let journal = retained.join("observed.json");
+        let original_bytes = serde_json::to_vec(&queued_lease()).unwrap();
+        std::fs::write(&journal, &original_bytes).unwrap();
+        let descriptor = rustix::fs::open(
+            &retained,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+        )
+        .unwrap();
+        assert!(std::fs::symlink_metadata(&journal).unwrap().is_file());
+        let original = retained.join("observed-original.retained");
+        assert!(!original.exists());
+        std::fs::rename(&journal, &original).unwrap();
+        rustix::fs::mkfifoat(descriptor.as_fd(), c"observed.json", Mode::RUSR | Mode::WUSR).unwrap();
+
+        // No writer is started. Bound observation so a missing NONBLOCK flag
+        // fails this case instead of hanging the complete test runner.
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            sender
+                .send(read_job_journal_at(descriptor.as_fd(), c"observed.json"))
+                .unwrap();
+        });
+        let result = receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("journal read waited on a FIFO without a writer");
+        reader.join().unwrap();
+        assert!(format!("{:#}", result.unwrap_err()).contains("journal is not a regular file"));
+        assert!(
+            std::fs::symlink_metadata(journal)
+                .unwrap()
+                .file_type()
+                .is_fifo()
+        );
+        assert_eq!(std::fs::read(original).unwrap(), original_bytes);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn job_journal_read_keeps_the_open_directory_identity_after_path_replacement() {
+        use rustix::fs::{Dir, Mode, OFlags};
+
+        let retained = tempfile::tempdir().unwrap().keep();
+        let directory = retained.join("journals");
+        std::fs::create_dir(&directory).unwrap();
+        let lease = queued_lease();
+        let original_bytes = serde_json::to_vec(&lease).unwrap();
+        std::fs::write(directory.join("observed.json"), &original_bytes).unwrap();
+        let entries = Dir::new(
+            rustix::fs::open(
+                &directory,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+                Mode::empty(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let original = retained.join("journals-original.retained");
+        assert!(!original.exists());
+        std::fs::rename(&directory, &original).unwrap();
+        std::fs::create_dir(&directory).unwrap();
+        let replacement = queued_lease();
+        assert_ne!(replacement.identity, lease.identity);
+        let replacement_bytes = serde_json::to_vec(&replacement).unwrap();
+        std::fs::write(directory.join("observed.json"), &replacement_bytes).unwrap();
+
+        let observed = read_job_journal_at(entries.fd().unwrap(), c"observed.json").unwrap();
+        assert_eq!(
+            serde_json::to_value(observed).unwrap(),
+            serde_json::to_value(lease).unwrap()
+        );
+        assert_eq!(
+            std::fs::read(original.join("observed.json")).unwrap(),
+            original_bytes
+        );
+        assert_eq!(
+            std::fs::read(directory.join("observed.json")).unwrap(),
+            replacement_bytes
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn job_listing_refuses_a_symlink_root_and_preserves_its_journals() {
+        let retained = tempfile::tempdir().unwrap().keep();
+        let directory = retained.join("journals");
+        std::fs::create_dir(&directory).unwrap();
+        let journal = directory.join("valid.json");
+        let bytes = serde_json::to_vec(&queued_lease()).unwrap();
+        std::fs::write(&journal, &bytes).unwrap();
+        let link = retained.join("journal-link");
+        std::os::unix::fs::symlink(&directory, &link).unwrap();
+
+        assert!(read_job_listing(&link).is_err());
+        assert_eq!(std::fs::read(journal).unwrap(), bytes);
+        assert!(
+            std::fs::symlink_metadata(link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
     }
 
     #[cfg(unix)]

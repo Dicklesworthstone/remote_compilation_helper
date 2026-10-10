@@ -480,9 +480,12 @@ also reports `owner_presence` as `live`, `absent` or `unknown`; a false legacy
 `wrapper_alive` value alone does not establish that an owner is absent. The listing
 does not remove, repair or treat the unreadable entry as an absent owner. An
 initially missing journal directory is an empty, complete listing.
-`complete` describes this directory scan, not an immutable ownership snapshot:
-entries can change during observation, and the file-type check before reading
-does not atomically prevent replacement by a symlink or another file type.
+The directory is opened once and journal names are read relative to its file
+descriptor. Journal opens reject symlinks and do not wait for a FIFO writer;
+the opened descriptor must represent a regular file before any bytes are read.
+The directory root itself must be a directory rather than a symlink.
+`complete` describes this scan, not an immutable ownership snapshot: entries
+and regular-file contents can still change during observation.
 
 These commands never replay the original command. Recovery requires retained
 identity and completion/retrieval evidence; ambiguous or missing evidence is

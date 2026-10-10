@@ -97,6 +97,10 @@ ftui-backend = { workspace = true }
 dialoguer = { workspace = true }
 console = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+# Reuse the locked safe syscall API for descriptor-bound job journal reads.
+rustix = { version = "1.1.5", default-features = false, features = ["fs", "std"] }
+
 [features]
 default = ["rich-ui"]
 rich-ui = ["rich_rust"]
