@@ -858,6 +858,11 @@ fn map_sync_root_to_remote_root(path: &Path, policy: &PathTopologyPolicy) -> Str
 
     for root in effective_sync_topology_roots(policy) {
         if let Ok(relative) = path.strip_prefix(&root) {
+            // Joining an empty suffix appends a separator. A project at the
+            // topology root must retain its exact canonical authority spelling.
+            if relative.as_os_str().is_empty() {
+                return remote_root.to_string_lossy().to_string();
+            }
             return remote_root.join(relative).to_string_lossy().to_string();
         }
     }

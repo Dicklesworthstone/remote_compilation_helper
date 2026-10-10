@@ -316,10 +316,76 @@ fn remote_manifest_payload(manifest: &SourceContentRootManifest) -> anyhow::Resu
     Ok(payload)
 }
 
+// The portable shell verifier forks several utilities for every file. Large
+// admitted source trees can exhaust the verification deadline before Cargo
+// starts. When available, an isolated Python process streams the same bytes
+// and checks the same hash, length, type, executable bit and total denominator.
+// A failed Python verification never falls back to another verifier.
+const REMOTE_VERIFY_PYTHON: &str = r#"
+import hashlib
+import os
+import stat
+import sys
+
+def refuse(code, reason, relative=""):
+    if isinstance(relative, bytes):
+        relative = relative.decode("utf-8", errors="backslashreplace")
+    suffix = ":" + relative if relative else ""
+    sys.stderr.write("RCH_SOURCE_CONTENT_ERROR:" + reason + suffix + "\n")
+    raise SystemExit(code)
+
+root, expected_count, expected_total = sys.argv[1:]
+root = os.fsencode(root)
+count = 0
+total = 0
+try:
+    for line in sys.stdin.buffer:
+        if not line.endswith(b"\n"):
+            refuse(67, "count")
+        expected_hash, expected_bytes, expected_exec, relative = line[:-1].split(b"\t", 3)
+        relative.decode("utf-8")
+        if not relative:
+            refuse(62, "empty_path")
+        file = root + b"/" + relative
+        try:
+            metadata = os.lstat(file)
+        except OSError:
+            refuse(63, "not_regular", relative)
+        if not stat.S_ISREG(metadata.st_mode):
+            refuse(63, "not_regular", relative)
+        hasher = hashlib.sha256()
+        actual_bytes = 0
+        with open(file, "rb") as source:
+            while True:
+                chunk = source.read(1024 * 1024)
+                if not chunk:
+                    break
+                actual_bytes += len(chunk)
+                hasher.update(chunk)
+        if str(actual_bytes).encode("ascii") != expected_bytes:
+            refuse(64, "size", relative)
+        if hasher.hexdigest().encode("ascii") != expected_hash:
+            refuse(65, "sha256", relative)
+        actual_exec = b"1" if os.access(file, os.X_OK, effective_ids=True) else b"0"
+        if actual_exec != expected_exec:
+            refuse(66, "mode", relative)
+        count += 1
+        total += actual_bytes
+    if str(count) != expected_count:
+        refuse(67, "count", str(count))
+    if str(total) != expected_total:
+        refuse(68, "bytes", str(total))
+except (OSError, UnicodeError, ValueError, NotImplementedError) as error:
+    refuse(69, "read_or_manifest_" + type(error).__name__)
+sys.stdout.write("RCH_SOURCE_CONTENT_VERIFIED\t" + str(count) + "\t" + str(total) + "\n")
+"#;
+
 fn remote_verify_command(manifest: &SourceContentRootManifest) -> String {
     let root = shell_escape::escape(manifest.remote_root.clone().into());
+    let python = shell_escape::escape(REMOTE_VERIFY_PYTHON.into());
     format!(
         "set -eu; root={root}; tab=$(printf '\\t'); count=0; total=0; \
+         if command -v python3 >/dev/null 2>&1; then exec python3 -I -c {python} \"$root\" {file_count} {byte_count}; fi; \
          if command -v sha256sum >/dev/null 2>&1; then hash_file() {{ sha256sum -- \"$1\" | awk '{{print $1}}'; }}; \
          elif command -v shasum >/dev/null 2>&1; then hash_file() {{ shasum -a 256 -- \"$1\" | awk '{{print $1}}'; }}; \
          else printf 'RCH_SOURCE_CONTENT_ERROR:sha256_tool_missing\\n' >&2; exit 61; fi; \
@@ -718,6 +784,232 @@ mod tests {
         let mut invalid = manifest;
         invalid.files[0].path = "src\tlib.rs".to_string();
         assert!(remote_manifest_payload(&invalid).is_err());
+    }
+
+    #[cfg(unix)]
+    fn run_source_verifier(
+        manifest: &SourceContentRootManifest,
+        payload: &[u8],
+        path_override: Option<&Path>,
+    ) -> std::process::Output {
+        use std::io::Write as _;
+        use std::process::Stdio;
+
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .args(["-c", &remote_verify_command(manifest)])
+            .current_dir(&manifest.remote_root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if let Some(path) = path_override {
+            command.env("PATH", path);
+        }
+        let mut child = command.spawn().expect("source verifier shell starts");
+        child
+            .stdin
+            .take()
+            .expect("source verifier has piped stdin")
+            .write_all(payload)
+            .expect("source manifest reaches verifier");
+        child.wait_with_output().expect("source verifier completes")
+    }
+
+    #[cfg(unix)]
+    fn check_source_verifier_controls(path_override: Option<&Path>) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = tempfile::tempdir().expect("private verifier test directory");
+        let root = temp.path().join("source root with spaces and ' quotes");
+        std::fs::create_dir(&root).unwrap();
+        let mut files = Vec::new();
+        for name in [
+            "ordinary.rs",
+            "literal ' ; café.rs",
+            "empty.rs",
+            "executable.sh",
+        ] {
+            let path = root.join(name);
+            let contents: &[u8] = if name == "empty.rs" {
+                b""
+            } else if name == "executable.sh" {
+                b"#!/bin/sh\nexit 0\n"
+            } else {
+                b"pub fn source_bytes() {}\n"
+            };
+            std::fs::write(&path, contents).unwrap();
+            let mode = if name == "executable.sh" {
+                0o755
+            } else {
+                0o644
+            };
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            let (sha256, byte_count, executable) = hash_file(&path).unwrap();
+            files.push(SourceContentFile {
+                path: name.to_owned(),
+                sha256,
+                byte_count,
+                executable,
+            });
+        }
+        // A compiler source tree cannot replace the verifier's standard
+        // library imports. Python's isolated mode must ignore this module.
+        std::fs::write(
+            root.join("hashlib.py"),
+            b"raise RuntimeError('untrusted source import')\n",
+        )
+        .unwrap();
+        let manifest = SourceContentRootManifest {
+            schema: ROOT_SCHEMA,
+            ordinal: 0,
+            project_id: "verifier-test".to_owned(),
+            local_root: root.to_str().unwrap().to_owned(),
+            remote_root: root.to_str().unwrap().to_owned(),
+            root_hash: "a".repeat(64),
+            is_primary: true,
+            mode: SyncClosureMode::Full,
+            filter_policy: SourceContentFilterPolicy {
+                schema: "rch.source_content_filter.v1",
+                include_patterns: None,
+                exclude_patterns: vec![],
+                delete_extraneous: true,
+                checksum_transfer: true,
+            },
+            file_count: files.len(),
+            byte_count: files.iter().map(|file| file.byte_count).sum(),
+            files,
+            content_root: "b".repeat(64),
+        };
+        let payload = remote_manifest_payload(&manifest).unwrap();
+        let output = run_source_verifier(&manifest, &payload, path_override);
+        assert!(output.status.success(), "{:?}", output);
+        assert!(output.stderr.is_empty(), "{:?}", output);
+        assert_eq!(
+            output.stdout,
+            format!(
+                "RCH_SOURCE_CONTENT_VERIFIED\t{}\t{}\n",
+                manifest.file_count, manifest.byte_count
+            )
+            .as_bytes()
+        );
+
+        let mut wrong_size = manifest.clone();
+        wrong_size.files[0].byte_count += 1;
+        let mut wrong_hash = manifest.clone();
+        wrong_hash.files[0].sha256 = "0".repeat(64);
+        let mut wrong_mode = manifest.clone();
+        wrong_mode.files[0].executable = true;
+        let mut wrong_executable = manifest.clone();
+        wrong_executable.files[3].executable = false;
+        let mut missing = manifest.clone();
+        missing.files[0].path = "missing.rs".to_owned();
+        let mut directory = manifest.clone();
+        std::fs::create_dir(root.join("directory.rs")).unwrap();
+        directory.files[0].path = "directory.rs".to_owned();
+        let mut symlink = manifest.clone();
+        std::os::unix::fs::symlink("ordinary.rs", root.join("symlink.rs")).unwrap();
+        symlink.files[0].path = "symlink.rs".to_owned();
+        let mut short = manifest.clone();
+        short.files.pop();
+        let mut extra = manifest.clone();
+        extra.files.push(extra.files[0].clone());
+        let mut wrong_total = manifest.clone();
+        wrong_total.byte_count += 1;
+        for (mutated, code) in [
+            (wrong_size, 64),
+            (wrong_hash, 65),
+            (wrong_mode, 66),
+            (wrong_executable, 66),
+            (missing, 63),
+            (directory, 63),
+            (symlink, 63),
+            (short, 67),
+            (extra, 67),
+            (wrong_total, 68),
+        ] {
+            let output = run_source_verifier(
+                &mutated,
+                &remote_manifest_payload(&mutated).unwrap(),
+                path_override,
+            );
+            assert_eq!(output.status.code(), Some(code), "{:?}", output);
+            assert!(output.stdout.is_empty(), "{:?}", output);
+            assert!(
+                output.stderr.starts_with(b"RCH_SOURCE_CONTENT_ERROR:"),
+                "{:?}",
+                output
+            );
+        }
+        for truncated in [&payload[..payload.len() - 1], &payload[..0]] {
+            let output = run_source_verifier(&manifest, truncated, path_override);
+            assert_eq!(output.status.code(), Some(67), "{:?}", output);
+            assert!(output.stdout.is_empty(), "{:?}", output);
+        }
+        if path_override.is_none() {
+            // This deliberately failing interpreter is a must-reject control.
+            // Its exit must survive; a failed Python run cannot be retried as
+            // portable verification, even when that would also reject input.
+            let bin = temp.path().join("failed-python-bin");
+            std::fs::create_dir(&bin).unwrap();
+            let python = bin.join("python3");
+            std::fs::write(
+                &python,
+                b"#!/bin/sh\nwhile IFS= read -r line; do :; done\nexit 73\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let output = run_source_verifier(&manifest, &payload, Some(&bin));
+            assert_eq!(output.status.code(), Some(73), "{:?}", output);
+            assert!(output.stdout.is_empty(), "{:?}", output);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn isolated_python_verifier_preserves_all_source_checks() {
+        let python = std::process::Command::new("python3")
+            .args(["-I", "-c", "import hashlib, os, stat, sys"])
+            .status()
+            .expect("Python verification must execute, not skip its assertions");
+        assert!(python.success());
+        check_source_verifier_controls(None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn portable_verifier_without_python_preserves_all_source_checks() {
+        let search = std::env::var_os("PATH").expect("test has a tool search path");
+        let resolve = |name: &str| {
+            std::env::split_paths(&search)
+                .map(|directory| directory.join(name))
+                .find(|path| path.is_file())
+        };
+        let mut verified_hash_tools = 0;
+        for hash_tool in ["sha256sum", "shasum"] {
+            let Some(hash_path) = resolve(hash_tool) else {
+                continue;
+            };
+            let bin = tempfile::tempdir().expect("private portable verifier PATH");
+            for (name, path) in std::iter::once((hash_tool, hash_path)).chain(
+                ["awk", "wc", "tr"].into_iter().map(|name| {
+                    (
+                        name,
+                        resolve(name).expect("portable verifier utility must be present"),
+                    )
+                }),
+            ) {
+                let executable = path
+                    .canonicalize()
+                    .expect("portable verifier utility path resolves");
+                std::os::unix::fs::symlink(executable, bin.path().join(name)).unwrap();
+            }
+            check_source_verifier_controls(Some(bin.path()));
+            verified_hash_tools += 1;
+        }
+        assert!(
+            verified_hash_tools > 0,
+            "portable verification must execute with a genuine SHA-256 tool"
+        );
     }
 
     fn build_source_stamp_git(root: &Path, args: &[&str]) -> String {
