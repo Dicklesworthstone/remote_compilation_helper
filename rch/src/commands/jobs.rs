@@ -401,7 +401,11 @@ async fn run_unix(action: Option<JobsAction>, ctx: &OutputContext) -> Result<()>
         let listing = read_job_listing(&default_job_lease_directory())?;
         emit(ctx, &listing)?;
         if listing["complete"] != true {
-            eprintln!(
+            use std::io::Write;
+            // The error document is already delivered and this branch always
+            // exits 1. A closed diagnostic stream must not turn it into a panic.
+            let _ = writeln!(
+                std::io::stderr().lock(),
                 "[RCH] job listing is incomplete; inspect journal_errors before reconciling ownership"
             );
             // The structured listing was already emitted. Returning Err
@@ -449,7 +453,14 @@ async fn run_unix(action: Option<JobsAction>, ctx: &OutputContext) -> Result<()>
             output.write_all(&bytes).map_err(JobOutputFailure::from)?;
             output.flush().map_err(JobOutputFailure::from)?;
         } else {
-            eprintln!("[RCH] recovered invocation has no deliverable Cargo stdout (exit {code})");
+            use std::io::Write;
+            let mut diagnostics = std::io::stderr().lock();
+            writeln!(
+                diagnostics,
+                "[RCH] recovered invocation has no deliverable Cargo stdout (exit {code})"
+            )
+            .map_err(JobOutputFailure::from)?;
+            diagnostics.flush().map_err(JobOutputFailure::from)?;
         }
         std::process::exit(code);
     }

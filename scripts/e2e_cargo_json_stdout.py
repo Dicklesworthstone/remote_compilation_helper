@@ -92,17 +92,17 @@ def main():
                "--bin", names[0], "--bin", names[1], "--message-format=json,json-render-diagnostics"]
     outcomes = []
 
-    def run(name, argv, environment):
+    def run(name, argv, environment, timeout_seconds=1800):
         case = evidence / name
         case.mkdir()
         (case / "argv.json").write_text(json.dumps(argv) + "\n")
         try:
             result = subprocess.run(argv, cwd=source, env=environment,
-                                    capture_output=True, timeout=1800)
+                                    capture_output=True, timeout=timeout_seconds)
         except subprocess.TimeoutExpired as error:
             (case / "stdout.bin").write_bytes(error.stdout or b"")
             (case / "stderr.bin").write_bytes(error.stderr or b"")
-            (case / "termination.json").write_text(json.dumps({"state": "timeout", "timeout_seconds": 1800}) + "\n")
+            (case / "termination.json").write_text(json.dumps({"state": "timeout", "timeout_seconds": timeout_seconds}) + "\n")
             sys.stderr.buffer.write(error.stderr or b"")
             sys.stderr.buffer.flush()
             raise
@@ -138,7 +138,7 @@ def main():
     for mode, flags in [("json", ["--json", "--format", "json"]),
                         ("plain", ["--color", "never"])]:
         argv = [str(args.rch)] + flags + ["jobs"]
-        positive, _ = run("jobs-empty-output-" + mode, argv, jobs_env)
+        positive, _ = run("jobs-empty-output-" + mode, argv, jobs_env, timeout_seconds=30)
         require(positive.returncode == 0 and json.loads(positive.stdout) ==
                 {"jobs": [], "complete": True, "journal_errors": []},
                 "Actual job listing did not deliver one complete empty document")
@@ -188,6 +188,60 @@ def main():
     require(code == 1, "Closing stderr as well as stdout changed the actual jobs failure exit")
     require(not (jobs_state / "job-leases").exists(),
             "Read-only job output cases created an initially absent journal directory")
+
+    # A delivered partial listing is still useful when its diagnostic stream
+    # breaks. Exercise that actual CLI branch with stdout retained, then prove
+    # the corrupt source journal was not rewritten or removed.
+    journal_directory = jobs_state / "job-leases"
+    journal_directory.mkdir(parents=True)
+    corrupt_journal = journal_directory / "corrupt.json"
+    corrupt_bytes = b'{"identity":'
+    with corrupt_journal.open("xb") as journal:
+        journal.write(corrupt_bytes)
+
+    def check_incomplete_listing(stdout):
+        listing = json.loads(stdout)
+        require(listing.get("complete") is False and listing.get("jobs") == []
+                and len(listing.get("journal_errors", [])) == 1,
+                "Actual CLI did not deliver one incomplete document with its corrupt journal")
+        error = listing["journal_errors"][0]
+        require(error.get("path") == str(corrupt_journal)
+                and "EOF" in error.get("error", ""),
+                "Actual CLI lost the exact corrupt path or parse diagnostic")
+
+    argv = [str(args.rch), "--json", "--format", "json", "jobs"]
+    incomplete, _ = run("jobs-incomplete-output-json", argv, jobs_env, timeout_seconds=30)
+    check_incomplete_listing(incomplete.stdout)
+    require(incomplete.returncode == 1 and b"job listing is incomplete" in incomplete.stderr
+            and b"panicked" not in incomplete.stderr,
+            "Actual incomplete listing did not retain its deliberate error status and diagnostic")
+
+    name = "jobs-incomplete-closed-stderr"
+    case = evidence / name
+    case.mkdir()
+    (case / "argv.json").write_text(json.dumps(argv) + "\n")
+    reader, writer = os.pipe()
+    os.close(reader)
+    try:
+        with (case / "stdout.bin").open("xb") as output:
+            child = subprocess.Popen(argv, cwd=source, env=jobs_env,
+                                     stdout=output, stderr=writer)
+    finally:
+        os.close(writer)
+    try:
+        code = child.wait(timeout=30)
+    except subprocess.TimeoutExpired:
+        (case / "termination.json").write_text(json.dumps({
+            "state": "timeout", "timeout_seconds": 30, "child_pid": child.pid,
+            "child_stopped": False}) + "\n")
+        raise
+    (case / "returncode.txt").write_text(str(code) + "\n")
+    outcomes.append({"case": name, "returncode": code})
+    check_incomplete_listing((case / "stdout.bin").read_bytes())
+    require(code == 1, "Closed stderr panicked or changed the delivered incomplete listing exit")
+    require(corrupt_journal.read_bytes() == corrupt_bytes
+            and list(journal_directory.iterdir()) == [corrupt_journal],
+            "Incomplete listing changed its retained source journal namespace")
 
     def blake3(path, case):
         result = subprocess.run([str(args.b3sum), "--no-names", str(path)],
