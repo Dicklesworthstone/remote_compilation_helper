@@ -45,6 +45,9 @@ pub(super) struct RemoteExecutionResult {
     pub(super) result_dirs: Vec<ExecResultDirStat>,
     /// Actual source/output filesystems that must recover after a disk fault.
     pub(super) disk_roots: Vec<String>,
+    /// Opt-in Cargo stdout, released only after daemon acknowledgment. A
+    /// delivery failure supplies no caller-local success records.
+    pub(super) cargo_stdout: Option<Vec<u8>>,
 }
 
 /// Collection outcome of one declared job result directory (bd-uoh4x).

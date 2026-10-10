@@ -4473,6 +4473,7 @@ fn source_upload_disk_release_never_infers_worker_pressure_from_untyped_transfer
             timing: Default::default(),
             result_dirs: Vec::new(),
             disk_roots: vec!["/build-volume/target".into()],
+            cargo_stdout: None,
         });
         let (worker_fault, disk_fault, roots) = remote_release_faults(&result, &worker);
         assert_eq!(worker_fault, exit_code != 0);

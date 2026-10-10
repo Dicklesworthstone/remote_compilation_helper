@@ -330,6 +330,60 @@ rch capabilities --json
 rch robot-docs guide
 ```
 
+### Named Cargo JSON for installer consumers
+
+An installer selecting explicit binary targets can request caller-visible
+Cargo JSON through the canonical Cargo shim:
+
+```bash
+RCH_CARGO_JSON_STDOUT=1 RCH_REQUIRE_REMOTE=1 cargo build --locked --release \
+  --bin my-tool --bin my-alias --message-format=json,json-render-diagnostics
+```
+
+This opt-in requires the durable POSIX worker route and refuses local fallback,
+arbitrary jobs, machine envelopes, and unsupported target selections. Selected
+binary records reach stdout after artifact publication and acknowledged worker
+release. Their executable, filenames, manifest, and source paths refer to the
+caller tree. Selected output files are copied into an invocation-private retained
+directory beneath the caller's actual target root and checked against the exact
+publication fingerprints. A later build cannot replace these copies by publishing
+into the shared target paths. Each record carries an `rch` extension retaining the original worker
+record, exact retained stdout receipt, wrapper/build identity, and executable
+BLAKE3 publication fingerprint. Unselected dependency records keep their worker
+metadata and do not assert local delivery of intermediates. Diagnostics stay on
+stderr. Compiler failure stdout comes from the same invocation's immutable
+nonzero completion receipt; a successful compile with failed artifact delivery
+advertises no caller-local success records. The ordinary hook and `rch --json
+exec` envelope contracts are unchanged.
+
+The delivery JSON, its private file paths, and their fingerprints are persisted
+before source retirement and worker release. After the original wrapper has
+exited, recover that same invocation without compiling again:
+
+```bash
+rch jobs recover ORIGINAL_WRAPPER_ID --cargo-json
+```
+
+This explicit output mode requires an invocation originally admitted with
+`RCH_CARGO_JSON_STDOUT=1`; it cannot upgrade an ordinary job. It returns verified
+retained stdout only after the original recovery and acknowledgement complete,
+and uses the original exit status. Repeating it returns the first delivery's
+exact JSON bytes and private paths, including after later builds or a failed
+stdout write. A live unacknowledged wrapper or unknown owner identity refuses
+detached recovery. `--json` machine envelopes conflict with `--cargo-json`.
+Failed compiler stdout is retained from the exact nonzero completion; detached
+recovery does not yet replay the compiler's complete stderr.
+
+Use the exit status together with the record binding. This route does not
+provide native Windows delivery, an installer transaction, a source-content
+receipt, or performance qualification. `scripts/e2e_cargo_json_stdout.py` checks
+the actual shim, retained producer bytes, both real native binaries, cached
+delivery, completed same-id stdout recovery, a broken stdout pipe, and a genuine
+Cargo target-selection failure against an externally
+admitted source and artifact root. No test result is implied by this description.
+Wrapper-loss, pending recovery, cancellation, full installers, native Windows,
+and same-invocation live-incumbent/A/A performance acceptance remain open.
+
 ### Job Mode (non-compilation workloads)
 
 `rch exec --job` admits an arbitrary NON-compilation workload (sharded tests,

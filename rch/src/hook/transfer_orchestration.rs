@@ -667,6 +667,13 @@ async fn execute_remote_compilation_inner(
     // needs drive-letter paths, so their whole remote layout lives under the
     // Windows build base and syncs via tar-over-ssh (no rsync/streaming).
     let worker_is_windows = WorkerPlatform::from_worker(&worker_config).is_windows();
+    if reporter.cargo_json_stdout {
+        anyhow::ensure!(
+            !worker_is_windows && durable_lease.is_some()
+                && !super::ssh::should_skip_remote_preflight(&worker_config),
+            "caller Cargo JSON requires the admitted durable POSIX worker route"
+        );
+    }
 
     let go_build_environment = if kind == Some(CompilationKind::GoBuild) {
         anyhow::ensure!(
@@ -979,7 +986,8 @@ async fn execute_remote_compilation_inner(
     // non-streaming sync/retrieve paths.
     let progress_enabled = output_ctx.supports_rich()
         && reporter.visibility != OutputVisibility::None
-        && !worker_is_windows;
+        && !worker_is_windows
+        && !reporter.cargo_json_stdout;
     let remote_pgid_file = build_id.and_then(|id| {
         sync_plan
             .iter()
@@ -1646,6 +1654,10 @@ async fn execute_remote_compilation_inner(
         } else {
             None
         };
+    if reporter.cargo_json_stdout {
+        recovery_session.as_mut().context("caller Cargo JSON has no admitted recovery session")?
+            .request_caller_json(Path::new(&pipeline.remote_path()))?;
+    }
     let pipeline = match recovery_session.as_ref() {
         Some(session) => session.completion_pipeline(pipeline),
         None => pipeline,
@@ -1656,6 +1668,12 @@ async fn execute_remote_compilation_inner(
     let cargo_output_capture = recovery_session
         .as_ref()
         .and_then(|_| CargoOutputCapture::for_command(kind, policy_command));
+    if reporter.cargo_json_stdout {
+        anyhow::ensure!(
+            cargo_output_capture.as_ref().is_some_and(CargoOutputCapture::caller_json_supported),
+            "caller Cargo JSON lost its admitted named-output capture"
+        );
+    }
     let captured_command = cargo_output_capture
         .as_ref()
         .map(|capture| capture.execution_command(command));
@@ -1845,6 +1863,7 @@ async fn execute_remote_compilation_inner(
         .as_ref()
         .map(BuildHeartbeatLoop::shared_state);
     let mut suppress_telemetry = false;
+    let defer_cargo_stdout = reporter.cargo_json_stdout;
 
     if let Some(session) = recovery_session.as_mut() {
         session.starting_execution()?;
@@ -1864,6 +1883,12 @@ async fn execute_remote_compilation_inner(
             }
             if let Some(state) = heartbeat_state_stdout.as_ref() {
                 mark_heartbeat_progress(state);
+            }
+            // Do not publish worker paths or a successful terminal record
+            // before delivery. The complete supervisor log supplies stdout
+            // later; the streamer's bounded preview is not artifact authority.
+            if defer_cargo_stdout {
+                return;
             }
             if cargo_output_capture
                 .as_ref()
@@ -2048,12 +2073,16 @@ async fn execute_remote_compilation_inner(
         && let Some(session) = recovery_session.as_mut()
         && let Some(remote_root) = session.cargo_artifact_remote_root().map(str::to_owned)
     {
-        let evidence = pipeline
-            .read_cargo_artifact_evidence(&worker_config, &remote_root)
-            .await;
-        let installed = evidence.and_then(|evidence| {
-            session.install_cargo_artifact_evidence(&evidence.stdout, &evidence.remote_root)
-        });
+        let evidence = if reporter.cargo_json_stdout {
+            pipeline
+                .read_cargo_stdout_evidence(&worker_config, &remote_root, 0)
+                .await
+        } else {
+            pipeline
+                .read_cargo_artifact_evidence(&worker_config, &remote_root)
+                .await
+        };
+        let installed = evidence.and_then(|evidence| session.install_complete_cargo_evidence(&evidence));
         if let Err(error) = installed {
             // A completed rejection cannot improve on retry. Lost transport
             // and local journal failures retain the exact attempt for recovery.
@@ -2073,6 +2102,18 @@ async fn execute_remote_compilation_inner(
                 );
             }
         }
+    }
+    if reporter.cargo_json_stdout && !result.success() {
+        let evidence = pipeline.read_cargo_stdout_evidence(
+            &worker_config, &pipeline.remote_path(), result.exit_code,
+        ).await?;
+        recovery_session.as_mut().context("failed Cargo stdout has no admitted recovery session")?
+            .retain_cargo_stdout(
+                &evidence.stdout,
+                &evidence.remote_root,
+                evidence.remote_project_root.as_deref().context("caller Cargo JSON has no verified source root")?,
+                result.exit_code,
+            )?;
     }
     // Per-file evidence from the phase that carries the build's `target/`
     // outputs, for the zero-build-output loud-failure gate (bd-mpbav): the
@@ -2748,6 +2789,20 @@ async fn execute_remote_compilation_inner(
     if retrieval_complete && let Some(session) = recovery_session.as_mut() {
         session.returned(exit_code)?;
     }
+    let cargo_stdout = if reporter.cargo_json_stdout {
+        let session = recovery_session.as_mut().context("caller Cargo JSON has no recovery session")?;
+        if exit_code == 0 {
+            Some(session.caller_cargo_json().await?)
+        } else if !result.success() {
+            Some(session.failed_cargo_stdout()?)
+        } else {
+            // The compiler succeeded but delivery failed. Its original
+            // success record stays retained, never advertised as local output.
+            None
+        }
+    } else {
+        None
+    };
 
     // Retire the materialized clean-overlay source after delivery. The durable
     // grant remains outstanding on failure so recovery can finish retirement
@@ -2828,6 +2883,7 @@ async fn execute_remote_compilation_inner(
         timing,
         result_dirs: exec_dir_stats,
         disk_roots,
+        cargo_stdout,
     })
 }
 

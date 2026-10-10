@@ -903,6 +903,8 @@ fn recovery_completion_cleanup_script(path: &str) -> String {
 pub(crate) struct CargoArtifactEvidence {
     pub(crate) stdout: Vec<u8>,
     pub(crate) remote_root: PathBuf,
+    /// Present only when the caller explicitly requests Cargo JSON paths.
+    pub(crate) remote_project_root: Option<PathBuf>,
 }
 
 /// A completed reader proved that this attempt cannot supply valid output
@@ -920,9 +922,20 @@ fn cargo_artifact_evidence_script(
     path: &str,
     identity: &str,
     remote_output_root: &str,
+    remote_project_root: Option<&str>,
     max_bytes: usize,
+    expected_exit: i32,
 ) -> String {
     let quote = |value: &str| escape(Cow::from(value)).into_owned();
+    // Ordinary detached recovery does not reconstruct a source pipeline.
+    // Do not add a source-path requirement to its existing receipt contract.
+    let project_resolution = match remote_project_root {
+        Some(project) => format!(
+            "project=$(CDPATH= cd -- {} && pwd -P) || reject 'Cargo source root is unavailable';",
+            quote(project)
+        ),
+        None => "project='';".to_owned(),
+    };
     // The identity receipt is immutable after completion. Check it before and
     // after copying the log, and frame the exact byte count so neither a lost
     // connection nor a changing log can turn a prefix into output authority.
@@ -936,14 +949,15 @@ fn cargo_artifact_evidence_script(
          size=$(wc -c < {out}); size=$((size + 0)); \
          {{ [ \"$size\" -ge 0 ] && [ \"$size\" -le {max_bytes} ]; }} || reject 'Cargo output log exceeds size limit'; \
          root=$(CDPATH= cd -- {root} && pwd -P) || reject 'Cargo output root is unavailable'; \
-         printf '%s %s\\n%s\\n' {identity} \"$size\" \"$root\"; \
+         {project_resolution} \
+         printf '%s %s\\n%s\\n%s\\n' {identity} \"$size\" \"$root\" \"$project\"; \
          cat -- {out}; \
          [ \"$(wc -c < {out})\" -eq \"$size\" ] || reject 'Cargo output log changed during collection'; \
          {{ [ -f {done} ] && [ ! -L {done} ] && [ -f {out} ] && [ ! -L {out} ]; }} || reject 'receipt or log changed during collection'; \
          [ \"$(cat -- {done})\" = \"$expected\" ] || reject 'completion changed during collection'",
         done = quote(path),
         out = quote(&format!("{path}.stdout")),
-        expected = quote(&format!("{identity} 0")),
+        expected = quote(&format!("{identity} {expected_exit}")),
         identity = quote(identity),
         root = quote(remote_output_root),
         rejection = quote(CARGO_ARTIFACT_EVIDENCE_REJECTION),
@@ -990,12 +1004,36 @@ fn parse_cargo_artifact_evidence(
     anyhow::ensure!(
         remote_root.is_absolute()
             && !root.chars().any(char::is_control)
+            && !root.split('/').any(|component| matches!(component, "." | ".."))
             && remote_root.components().all(|component| {
                 matches!(component, Component::RootDir | Component::Normal(_))
             }),
         "Cargo artifact evidence has an invalid canonical output root"
     );
-    let body_start = root_start + root_length + 1;
+    let project_start = root_start + root_length + 1;
+    let project_length = bytes[project_start..]
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .context("Cargo artifact evidence has no complete source root")?;
+    anyhow::ensure!(project_length <= MAX_CARGO_ARTIFACT_ROOT_BYTES, "Cargo artifact evidence source root exceeds its size limit");
+    let project = std::str::from_utf8(&bytes[project_start..project_start + project_length])?;
+    let remote_project_root = if project.is_empty() {
+        None
+    } else {
+        let root = PathBuf::from(project);
+        anyhow::ensure!(
+            root.is_absolute()
+                && root.parent().is_some()
+                && !project.chars().any(char::is_control)
+                && !project.split('/').any(|component| matches!(component, "." | ".."))
+                && root.components().all(|component| {
+                    matches!(component, Component::RootDir | Component::Normal(_))
+                }),
+            "Cargo artifact evidence has an invalid canonical source root"
+        );
+        Some(root)
+    };
+    let body_start = project_start + project_length + 1;
     anyhow::ensure!(
         bytes.len() - body_start == length,
         "Cargo artifact evidence log is incomplete or changed during collection"
@@ -1003,6 +1041,7 @@ fn parse_cargo_artifact_evidence(
     Ok(CargoArtifactEvidence {
         stdout: bytes[body_start..].to_vec(),
         remote_root,
+        remote_project_root,
     })
 }
 
@@ -1021,7 +1060,7 @@ async fn collect_cargo_artifact_evidence(
         "invalid Cargo artifact evidence identity"
     );
     let framed_limit = max_bytes
-        .checked_add(MAX_CARGO_ARTIFACT_ROOT_BYTES + identity.len() + 32)
+        .checked_add(2 * MAX_CARGO_ARTIFACT_ROOT_BYTES + identity.len() + 32)
         .context("Cargo artifact evidence size limit overflow")?;
     command
         .stdin(Stdio::null())
@@ -2630,6 +2669,32 @@ impl TransferPipeline {
         worker: &WorkerConfig,
         remote_output_root: &str,
     ) -> Result<CargoArtifactEvidence> {
+        self.read_cargo_evidence(worker, remote_output_root, 0, None)
+            .await
+    }
+
+    /// Read this invocation's exact stdout even on a compiler failure. The
+    /// caller supplies the already-confirmed completion status; accepting a
+    /// different status would turn another attempt's log into Cargo output.
+    pub(crate) async fn read_cargo_stdout_evidence(
+        &self,
+        worker: &WorkerConfig,
+        remote_output_root: &str,
+        expected_exit: i32,
+    ) -> Result<CargoArtifactEvidence> {
+        let project = self.remote_path();
+        self.read_cargo_evidence(worker, remote_output_root, expected_exit, Some(&project))
+            .await
+    }
+
+    async fn read_cargo_evidence(
+        &self,
+        worker: &WorkerConfig,
+        remote_output_root: &str,
+        expected_exit: i32,
+        remote_project_root: Option<&str>,
+    ) -> Result<CargoArtifactEvidence> {
+        anyhow::ensure!((0..=255).contains(&expected_exit), "invalid expected Cargo completion status");
         let (path, identity) = self
             .recovery_completion
             .as_ref()
@@ -2647,7 +2712,9 @@ impl TransferPipeline {
             path,
             identity,
             remote_output_root,
+            remote_project_root,
             MAX_CARGO_ARTIFACT_EVIDENCE_BYTES,
+            expected_exit,
         );
         let command =
             self.worker_ssh_command(worker, &["sh", "-c", &escape(Cow::from(script.as_str()))]);
@@ -8016,7 +8083,9 @@ mod tests {
             receipt,
             "job_id",
             alias.to_str().unwrap(),
+            Some(directory.path().to_str().unwrap()),
             MAX_CARGO_ARTIFACT_EVIDENCE_BYTES,
+            0,
         );
         let mut command = Command::new("sh");
         command.arg("-c").arg(script);
@@ -8030,6 +8099,29 @@ mod tests {
         .unwrap();
         assert_eq!(evidence.stdout, log);
         assert_eq!(evidence.remote_root, root.canonicalize().unwrap());
+        assert_eq!(evidence.remote_project_root, Some(directory.path().canonicalize().unwrap()));
+        // Ordinary collection must still succeed without reconstructing the
+        // source path from a generic detached-recovery pipeline.
+        let mut ordinary = Command::new("sh");
+        ordinary.arg("-c").arg(cargo_artifact_evidence_script(
+            receipt,
+            "job_id",
+            alias.to_str().unwrap(),
+            None,
+            MAX_CARGO_ARTIFACT_EVIDENCE_BYTES,
+            0,
+        ));
+        let evidence = collect_cargo_artifact_evidence(
+            ordinary,
+            "job_id",
+            MAX_CARGO_ARTIFACT_EVIDENCE_BYTES,
+            Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
+        assert_eq!(evidence.stdout, log);
+        assert_eq!(evidence.remote_root, root.canonicalize().unwrap());
+        assert_eq!(evidence.remote_project_root, None);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -8049,7 +8141,9 @@ mod tests {
                 receipt,
                 "job",
                 directory.path().to_str().unwrap(),
+                Some(directory.path().to_str().unwrap()),
                 limit,
+                0,
             );
             let mut command = Command::new("sh");
             command.arg("-c").arg(script);
@@ -8107,7 +8201,9 @@ mod tests {
                 receipt,
                 "job",
                 directory.path().to_str().unwrap(),
+                Some(directory.path().to_str().unwrap()),
                 64,
+                0,
             ));
             assert!(
                 collect_cargo_artifact_evidence(command, "job", 64, Duration::from_secs(3))
@@ -8120,20 +8216,31 @@ mod tests {
     #[test]
     fn cargo_artifact_evidence_framing_rejects_partial_or_mismatched_payloads() {
         for bytes in [
-            &b"job 3\n/target\nab"[..],
-            &b"job 2\n/target\nabc"[..],
-            &b"other 3\n/target\nabc"[..],
-            &b"job 3\ntarget\nabc"[..],
-            &b"job 3\n/target/../elsewhere\nabc"[..],
-            &b"job 3\n/target\r\nabc"[..],
+            &b"job 3\n/target\n/source\nab"[..],
+            &b"job 2\n/target\n/source\nabc"[..],
+            &b"other 3\n/target\n/source\nabc"[..],
+            &b"job 3\ntarget\n/source\nabc"[..],
+            &b"job 3\n/target/../elsewhere\n/source\nabc"[..],
+            &b"job 3\n/target/./elsewhere\n/source\nabc"[..],
+            &b"job 3\n/target\r\n/source\nabc"[..],
             &b"job 3\n/target"[..],
+            &b"job 3\n/target\n/source"[..],
+            &b"job 3\n/target\nsource\nabc"[..],
+            &b"job 3\n/target\n/source/../elsewhere\nabc"[..],
+            &b"job 3\n/target\n/source/./elsewhere\nabc"[..],
+            &b"job 3\n/target\n/\nabc"[..],
         ] {
             assert!(parse_cargo_artifact_evidence(bytes.to_vec(), "job", 64).is_err());
         }
         let evidence =
-            parse_cargo_artifact_evidence(b"job 3\n/target\nabc".to_vec(), "job", 64).unwrap();
+            parse_cargo_artifact_evidence(b"job 3\n/target\n/source\nabc".to_vec(), "job", 64).unwrap();
         assert_eq!(evidence.stdout, b"abc");
         assert_eq!(evidence.remote_root, Path::new("/target"));
+        assert_eq!(evidence.remote_project_root.as_deref(), Some(Path::new("/source")));
+        let ordinary =
+            parse_cargo_artifact_evidence(b"job 3\n/target\n\nabc".to_vec(), "job", 64).unwrap();
+        assert_eq!(ordinary.stdout, b"abc");
+        assert_eq!(ordinary.remote_project_root, None);
     }
 
     #[cfg(target_os = "linux")]

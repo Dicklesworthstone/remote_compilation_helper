@@ -23,6 +23,9 @@ pub enum JobsAction {
         wrapper_id: String,
         #[arg(long, default_value_t = 300)]
         timeout_secs: u64,
+        /// Emit the original opt-in invocation's retained Cargo JSON on stdout
+        #[arg(long)]
+        cargo_json: bool,
     },
 }
 
@@ -301,18 +304,41 @@ async fn run_unix(action: Option<JobsAction>, ctx: &OutputContext) -> Result<()>
         emit(ctx, &json!({"jobs": jobs}));
         return Ok(());
     };
-    let (wrapper_id, recover, cancel, timeout_secs) = match action {
+    let (wrapper_id, recover, cancel, timeout_secs, cargo_json) = match action {
         JobsAction::Attach {
             wrapper_id,
             timeout_secs,
-        } => (wrapper_id, false, false, timeout_secs),
+        } => (wrapper_id, false, false, timeout_secs, false),
         JobsAction::Recover {
             wrapper_id,
             timeout_secs,
-        } => (wrapper_id, true, false, timeout_secs),
-        JobsAction::Cancel { wrapper_id } => (wrapper_id, false, true, 30),
+            cargo_json,
+        } => (wrapper_id, true, false, timeout_secs, cargo_json),
+        JobsAction::Cancel { wrapper_id } => (wrapper_id, false, true, 30, false),
     };
     let deadline = Instant::now() + Duration::from_secs(timeout_secs.min(86400));
+    if cargo_json {
+        anyhow::ensure!(
+            !ctx.is_json(),
+            "Cargo JSON recovery conflicts with machine envelopes"
+        );
+        let writer = DurableLeaseWriter::load(&wrapper_id)?;
+        let (code, stdout) = within_job_deadline(
+            deadline,
+            "Cargo JSON recovery (use the retained journal for same-id retry)",
+            crate::hook::recover_job_cargo_json(&writer),
+        )
+        .await?;
+        if let Some(bytes) = stdout {
+            use std::io::Write;
+            let mut output = std::io::stdout().lock();
+            output.write_all(&bytes)?;
+            output.flush()?;
+        } else {
+            eprintln!("[RCH] recovered invocation has no deliverable Cargo stdout (exit {code})");
+        }
+        std::process::exit(code);
+    }
     loop {
         let writer = DurableLeaseWriter::load(&wrapper_id)?;
         let lease = writer.snapshot();
