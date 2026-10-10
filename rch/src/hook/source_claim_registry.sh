@@ -27,19 +27,46 @@ matches_request() {
     printf '%s\n' "$requested" | cmp -s - "$1" || refuse 'source claim roots changed'
 }
 
-physical_root() {
-    # Keep the path's own trailing newlines distinguishable from realpath's
-    # record delimiter. Ambiguous path bytes must fail closed, not split into
-    # multiple apparent roots after command substitution strips delimiters.
+physical_batch() {
+    # Keep every delimiter, including the last one. One output record per
+    # argument is essential: a newline in a symlink target must not turn one
+    # root into several apparently independent roots. realpath emits at least
+    # one line per input, so any embedded newline makes the count disagree.
+    physical=$(realpath -m -- "$@" && printf '.') || refuse 'cannot resolve physical source root'
+    physical=${physical%.}
     newline='
 '
-    carriage_return=$(printf '\r')
-    physical=$(realpath -m -- "$1" && printf '.') || refuse 'cannot resolve physical source root'
-    physical=${physical%.}
-    physical=${physical%"$newline"}
-    case "$physical" in /*) ;; *) refuse 'invalid physical source root' ;; esac
-    case "$physical" in *"$newline"*|*"$carriage_return"*) refuse 'ambiguous physical source root' ;; esac
-    printf '%s\n' "$physical"
+    case "$physical" in *"$newline") ;; *) refuse 'incomplete physical source roots' ;; esac
+    printf '%s' "$physical" | LC_ALL=C awk -v expected="$#" '
+        substr($0, 1, 1) != "/" || index($0, "\r") { bad = 1 }
+        END { if (bad || NR != expected) exit 1 }
+    ' || refuse 'ambiguous physical source root'
+    printf '%s' "$physical"
+}
+
+physical_roots() {
+    # This runs inside command substitution, not in the transaction shell.
+    # Count bytes, not locale-dependent characters, and bound both argv bytes
+    # and argc. The closure itself may be 32 MiB and must remain on stdin.
+    # No physical result is cached across transactions: aliases may change.
+    LC_ALL=C
+    export LC_ALL
+    set --
+    batch_bytes=0
+    while IFS= read -r batch_root || [ -n "$batch_root" ]; do
+        root_bytes=$((${#batch_root} + 1))
+        [ "$root_bytes" -le 61440 ] || refuse 'physical source root exceeds argument budget'
+        if [ "$#" -ge 64 ] || [ "$((batch_bytes + root_bytes))" -gt 61440 ]; then
+            physical_batch "$@"
+            set --
+            batch_bytes=0
+        fi
+        set -- "$@" "$batch_root"
+        batch_bytes=$((batch_bytes + root_bytes))
+    done
+    if [ "$#" -gt 0 ]; then
+        physical_batch "$@"
+    fi
 }
 
 roots_overlap() {
@@ -183,12 +210,13 @@ case "$operation" in acquire|recover) ;; *) refuse 'unknown claim operation' ;; 
 # Preserve lexical roots as immutable identity, but compare physical aliases
 # too. A durable GC claim uses its physical candidate path and must also fence
 # a source writer reaching that same tree through a worker-side symlink.
-# Resolve each requested root once, rather than spawning realpath per pair.
+# Resolve in bounded batches while holding the same registry lock. A resolver
+# failure in ANY batch refuses the whole closure before publishing a claim.
 requested_physical=$(
-    while IFS= read -r wanted; do physical_root "$wanted"; done <<RCH_REQUESTED_ROOTS
+    physical_roots <<RCH_REQUESTED_ROOTS
 $requested
 RCH_REQUESTED_ROOTS
-)
+) || refuse 'cannot resolve physical source roots'
 
 # Complete pending records retain their source exclusion. Incomplete legacy
 # writes cannot have authorized activity and are quarantined under this lock;
@@ -216,7 +244,9 @@ for held in "$registry"/*.claim "$registry"/*.pending; do
         done <<RCH_REQUESTED_ROOTS
 $requested
 RCH_REQUESTED_ROOTS
-        old_physical=$(physical_root "$old")
+    done < "$held"
+    held_physical=$(physical_roots < "$held") || refuse 'cannot resolve physical source roots'
+    while IFS= read -r old_physical; do
         while IFS= read -r wanted_physical; do
             if roots_overlap "$wanted_physical" "$old_physical"; then
                 refuse 'unfinished overlapping physical source owner'
@@ -224,8 +254,10 @@ RCH_REQUESTED_ROOTS
         done <<RCH_PHYSICAL_ROOTS
 $requested_physical
 RCH_PHYSICAL_ROOTS
-    done < "$held"
-done
+    done <<RCH_HELD_PHYSICAL_ROOTS
+$held_physical
+RCH_HELD_PHYSICAL_ROOTS
+ done
 
 if [ "$operation" = recover ]; then
     if [ -e "$active" ] || [ -L "$active" ]; then
