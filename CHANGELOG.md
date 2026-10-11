@@ -5,8 +5,7 @@ Compilation Helper): the PreToolUse hook + CLI (`rch`), the local daemon (`rchd`
 worker agent (`rch-wkr`), the RABS build sidecar (`rabs-*`, `rabsd`), and the fleet
 dashboard (`dashboard/`).
 
-Scope window: project inception (`v0.1.0`, 2026-01-25) through `v2.1.16` (2026-10-04), plus the
-unreleased 2.1.17 candidate below.
+Scope window: project inception (`v0.1.0`, 2026-01-25) through `v2.1.17` (2026-10-11).
 
 This document was rebuilt from git history (`git log --no-merges` per tag range, `git show`
 on representative commits), version tags (`git for-each-ref`), GitHub release metadata
@@ -30,11 +29,7 @@ but those particular links will 404.
 
 Repository: <https://github.com/Dicklesworthstone/remote_compilation_helper>
 
-## 2.1.17 — unreleased
-
-Release candidate, not yet tagged or published: the 2026-10-09 release gate on 49c712a4 failed
-(`bd-31r0m`). Give this section its release date when the tag is cut, and add anything that lands
-before then.
+## 2.1.17 — 2026-10-11
 
 Recovery and admission hardening from the 2026-10-05..08 fleet sweeps: dead jobs give back
 their worker source and daemon slots, full disks quarantine their worker, SSH stalls and
@@ -208,7 +203,57 @@ multi-key agents no longer wedge or lock out dispatchers, and `rch update` and
   [`21a08b89`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/21a08b8968f01705f8efd665b8350b20f9fcc367),
   [`d1bb3b0c`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/d1bb3b0cd3aec8274b4828c0a8e9f5760125b5ed),
   [`998d2fef`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/998d2fef1c831c256a294dc472a20d022c420825))
+- **Worker syncs no longer write into an editor's checkout on a dual-role host**
+  (`bd-fbtws`, `bd-tali9`). A worker that is also a dispatcher keeps people's and agents'
+  working trees at the canonical roots, and a multi-repo build from another dispatcher
+  synced into them with `rsync --delete` (a Mac-dispatched cass gate ran in ts1's live
+  checkout, 2026-10-09). A host that declares itself with `/etc/rch/live-checkouts` now
+  refuses an upload into a Git checkout, into a directory containing one, or through an
+  alias of one, before any setup or pruning runs. The build reports
+  `RCH_SYNC_LIVE_CHECKOUT_REFUSED` and retries on another worker. Undeclared workers still
+  sync into rch's own repo-convergence checkouts at those roots. Every worker refuses `/`
+  and destinations containing `.` or `..` components
+  ([`f0b96f07`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/f0b96f07423d74f7cbeae2b2a08f6749937d2669),
+  [`203fdfa9`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/203fdfa95fb5b677cc80169c433628879abf65b7),
+  [`c184a745`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/c184a745310ed770a0c778de57808368e316b878)).
 - Smaller fixes:
+  - A native source-lock holder whose requester went away no longer keeps the locks it
+    had already taken. It stops waiting and releases them before handoff
+    ([`2d7b2bdb`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/2d7b2bdb1a4510748f037fc71701a7479786166f)).
+  - `rch jobs` listings fail closed. A corrupt or non-regular journal (a symlink, FIFO or
+    directory) is reported in `journal_errors` and is neither followed nor deleted; the
+    listing then says `complete: false` and exits 1. Journals are read through a pinned
+    directory descriptor. Each row reports `owner_presence` as live, absent or unknown,
+    instead of treating a wrapper that looks dead as proof that it is gone
+    ([`423f2abb`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/423f2abb98a661bd644bc6b5bbcfd27c82eed196),
+    [`d1f17ef4`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/d1f17ef41081afa2de339b568e3ffa8f33bf0c90),
+    [`30abc7e1`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/30abc7e1603b468535463cde322852083f8ec114)).
+  - A closed stdout or stderr (`| head`, a vanished pipe) no longer panics rch. Job output,
+    the incomplete-listing warning and the top-level machine error report the broken pipe
+    and keep exit code 1
+    ([`f0b96f07`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/f0b96f07423d74f7cbeae2b2a08f6749937d2669),
+    [`8a87d239`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/8a87d23966424147d48eb664fa880ca2dc6ad2b8),
+    [`395bc89d`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/395bc89d2622fd79c59a3d178d9300676cc5cc69)).
+  - Admitting wide closures costs the worker less. Linux source-lock plans of 32 or more
+    locks are acquired in one native process, and source-ownership closures are indexed
+    with a component trie instead of pairwise shell comparisons. In isolated local
+    benchmarks, 256-lock readiness fell from 352 ms to 24 ms and a 256×256-root admission
+    from 2.85 s to 0.17 s; these are not fleet measurements
+    ([`7cf1cdb5`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/7cf1cdb5faa52d0cd7011c06d96101de5aa9409e),
+    [`4f0dc015`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/4f0dc015d553b539157893e9cccce943ef3e07db)).
+    Large admitted trees are verified on the worker in one streaming Python pass, which
+    fails closed, instead of one shell process per file
+    ([`440bad3f`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/440bad3fee93d9ffb51f76c7b3387940609803f9)).
+  - Durable lease recovery waits for the daemon's and the delivery's acknowledgement before
+    it reports a job recovered, and the hook's daemon auto-start no longer spawns a second
+    daemon while one is starting
+    ([`97bae78d`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/97bae78debf37c9bceb63b68de452f9c14ebc80a),
+    [`1a5419c2`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/1a5419c28fc130a03231517a002b380380977ef1)).
+  - Literal Cargo command parsing (the managed build directory and `RCH_CARGO_JSON_STDOUT`)
+    refuses a command that ends inside an escape or a quote. A shell reads a trailing
+    backslash as a line continuation, so the argv rch would have recorded was not the
+    command that ran
+    ([`d688b21a`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/d688b21a6f3797fa7327af13e3b9fec99530ebb6)).
   - `rch gc --apply` skips a target whose path cannot be embedded in a remote command (one
     containing a space, say) instead of collecting nothing on that worker. On vmi1264463,
     23 idle caches (20 GB) had to be removed by hand (`bd-kr4qb`,
@@ -244,6 +289,11 @@ multi-key agents no longer wedge or lock out dispatchers, and `rch update` and
     compiler's complete retained stderr
     ([`70ad4c0d`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/70ad4c0dfb5438a03732a9f81b498d7a69f8a5ff),
     [`1da56848`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/1da56848d73dfae2529926a23c5f31e76869d401)).
+    It also covers `cargo test --no-run --test <name>` and `cargo bench --no-run --bench
+    <name>`, and quoted literal arguments (spaces, apostrophes, Unicode paths) no longer
+    turn it off
+    ([`b54d9dfd`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/b54d9dfdff2180486a8f73b96cbd983e7c28e141),
+    [`6a364d68`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/6a364d682e6b62d89ed6e4b08e58effe233a7e5f)).
 
 RABS (`rabs-*`, `rabsd`): work continued on the live dependency cache (`bd-k52xe`) and
 related beads. None of it is in the shipped `rch`, `rchd` or `rch-wkr` binaries, and none
