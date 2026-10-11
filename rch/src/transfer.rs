@@ -882,10 +882,33 @@ fn remote_path_probe_script(path: &str) -> String {
     )
 }
 
+/// A worker whose canonical source roots hold editors' checkouts (a host that
+/// is also a dispatcher) declares it with this file. Only declared hosts get
+/// the Git-checkout fence: on a pure worker a `.git` at a canonical root is
+/// rch's own repo-convergence checkout (`hook::repo_updater`), and refusing it
+/// would refuse every multi-repo closure on the fleet (bd-tali9).
+pub(crate) const LIVE_CHECKOUT_HOST_MARKER: &str = "/etc/rch/live-checkouts";
+
+#[cfg(test)]
+thread_local! {
+    static LIVE_CHECKOUT_HOST_MARKER_FOR_TEST: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn live_checkout_host_marker() -> String {
+    #[cfg(test)]
+    if let Some(marker) = LIVE_CHECKOUT_HOST_MARKER_FOR_TEST.with(|m| m.borrow().clone()) {
+        return marker;
+    }
+    LIVE_CHECKOUT_HOST_MARKER.to_owned()
+}
+
 /// Receiver-side safety fence for dual-role Unix workers (bd-fbtws).
-/// Inspect physical ancestors (including aliases), linked-worktree markers,
-/// and nested repositories before *any* upload setup or pruning. Never infer
-/// permission to replace an editor's checkout from a clean `git status`.
+/// Root and dot-component destinations are always refused. On hosts that
+/// declare [`LIVE_CHECKOUT_HOST_MARKER`], also inspect physical ancestors
+/// (including aliases), linked-worktree markers, and nested repositories
+/// before *any* upload setup or pruning. Never infer permission to replace an
+/// editor's checkout from a clean `git status`.
 pub(crate) fn live_checkout_sync_guard(path: &str) -> String {
     format!(
         r#"(set -eu
@@ -905,6 +928,7 @@ esac
 case "$rch_destination/" in
     */./*|*/../*) rch_sync_refuse 'destination contains dot components';;
 esac
+[ -e {marker} ] || exit 0
 rch_ancestor=$rch_destination
 while [ ! -e "$rch_ancestor" ] && [ ! -L "$rch_ancestor" ]; do
     rch_ancestor=$(dirname "$rch_ancestor") || rch_sync_refuse 'cannot inspect ancestors'
@@ -922,7 +946,8 @@ if [ -d "$rch_destination" ]; then
     [ -z "$rch_nested" ] || rch_sync_refuse "nested Git checkout at $rch_nested"
 fi
 )"#,
-        path = escape(Cow::from(path))
+        path = escape(Cow::from(path)),
+        marker = escape(Cow::from(live_checkout_host_marker()))
     )
 }
 
@@ -10454,6 +10479,59 @@ Number of files transferred: 42
         assert!(args.iter().any(|arg| arg == "--compress-level=7"));
     }
 
+    /// Points this test thread's guard at `path` as the live-checkout host
+    /// marker (a missing path means an undeclared host); restored on drop.
+    struct LiveCheckoutHostMarker(Option<String>);
+
+    impl LiveCheckoutHostMarker {
+        fn at(path: &Path) -> Self {
+            Self(LIVE_CHECKOUT_HOST_MARKER_FOR_TEST.with(|marker| {
+                marker
+                    .borrow_mut()
+                    .replace(path.to_str().unwrap().to_owned())
+            }))
+        }
+
+        fn declared_in(directory: &Path) -> Self {
+            let path = directory.join("live-checkouts");
+            std::fs::write(&path, b"").unwrap();
+            Self::at(&path)
+        }
+    }
+
+    impl Drop for LiveCheckoutHostMarker {
+        fn drop(&mut self) {
+            LIVE_CHECKOUT_HOST_MARKER_FOR_TEST.with(|marker| *marker.borrow_mut() = self.0.take());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_checkout_guard_admits_convergence_checkouts_on_undeclared_hosts() {
+        // bd-tali9: a pure worker keeps rch's repo-convergence checkouts at the
+        // canonical roots, and multi-repo closures must still sync into them.
+        let directory = tempfile::tempdir().unwrap();
+        let _host = LiveCheckoutHostMarker::at(&directory.path().join("undeclared"));
+        let checkout = directory.path().join("converged");
+        std::fs::create_dir_all(checkout.join(".git")).unwrap();
+        std::fs::create_dir_all(checkout.join("vendor/nested/.git")).unwrap();
+        let run = |destination: &str| {
+            std::process::Command::new("sh")
+                .args(["-c", &live_checkout_sync_guard(destination)])
+                .output()
+                .unwrap()
+        };
+        for destination in [checkout.clone(), checkout.join("member")] {
+            let output = run(destination.to_str().unwrap());
+            assert!(output.status.success(), "{destination:?}: {output:?}");
+        }
+        // Path refusals do not depend on the host declaration.
+        for destination in ["/", "/data/projects/../projects/x", "relative/root"] {
+            let output = run(destination);
+            assert_eq!(output.status.code(), Some(73), "{destination}: {output:?}");
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn live_checkout_guard_refuses_root_and_dot_components_before_setup() {
@@ -10508,6 +10586,7 @@ Number of files transferred: 42
         use std::os::unix::fs::symlink;
 
         let retained = tempfile::tempdir().unwrap().keep();
+        let _host = LiveCheckoutHostMarker::declared_in(&retained);
         let mirror = retained.join("mirror..cache's α");
         std::fs::create_dir(&mirror).unwrap();
         let original = mirror.join("existing.rs");
@@ -10546,6 +10625,7 @@ Number of files transferred: 42
     fn live_checkout_guard_preserves_edits_and_allows_isolated_rsync() {
         use std::os::unix::fs::symlink;
         let directory = tempfile::tempdir().unwrap();
+        let _host = LiveCheckoutHostMarker::declared_in(directory.path());
         let source = directory.path().join("incoming");
         let checkout = directory.path().join("worker's live checkout");
         std::fs::create_dir_all(&source).unwrap();
@@ -10643,6 +10723,7 @@ Number of files transferred: 42
     #[test]
     fn live_checkout_guard_does_not_block_read_only_result_retrieval() {
         let directory = tempfile::tempdir().unwrap();
+        let _host = LiveCheckoutHostMarker::declared_in(directory.path());
         let result = directory.path().join("test-result-with-a-checkout");
         std::fs::create_dir_all(result.join(".git")).unwrap();
         let mut pipeline = TransferPipeline::new(

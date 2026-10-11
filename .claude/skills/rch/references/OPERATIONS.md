@@ -104,6 +104,16 @@ rch diagnose --dry-run "cargo build --release"
 rch exec -- cargo build --release
 ```
 
+### 7) Dual-role hosts: declare live checkouts
+
+A host that is both a dispatcher and a worker keeps people's and agents' working trees at the canonical roots, and a multi-repo build from another dispatcher syncs into those same roots with `rsync --delete`. Declare such a host so the worker refuses to sync into any Git checkout there:
+
+```bash
+ssh <user>@<host> 'sudo mkdir -p /etc/rch && sudo touch /etc/rch/live-checkouts'
+```
+
+A refused build prints `RCH_SYNC_LIVE_CHECKOUT_REFUSED` (exit 73) and retries on another worker. Do not declare pure workers: their `.git` checkouts at the canonical roots are rch's own repo-convergence clones, and multi-repo builds must be able to sync into them. Every worker refuses `/` and destinations containing `.` or `..` components, whether or not it is declared.
+
 ---
 
 ## Worker Fleet Lifecycle
