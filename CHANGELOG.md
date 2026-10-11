@@ -215,11 +215,18 @@ multi-key agents no longer wedge or lock out dispatchers, and `rch update` and
   and destinations containing `.` or `..` components
   ([`f0b96f07`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/f0b96f07423d74f7cbeae2b2a08f6749937d2669),
   [`203fdfa9`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/203fdfa95fb5b677cc80169c433628879abf65b7),
-  [`c184a745`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/c184a745310ed770a0c778de57808368e316b878)).
+  [`d7824ddd`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/d7824ddda95c9cb4626150876e80b51392525d10)).
 - Smaller fixes:
   - A native source-lock holder whose requester went away no longer keeps the locks it
     had already taken. It stops waiting and releases them before handoff
     ([`2d7b2bdb`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/2d7b2bdb1a4510748f037fc71701a7479786166f)).
+    Small plans and workers without Python get the same behavior from a GNU `flock`
+    holder that keeps its descriptors in one Bash shell, when Bash 4.1+ is available.
+    Before handoff, every held lock is checked again against its current pathname, and a
+    plan that names one lock file twice through hard links is refused instead of
+    deadlocking on itself
+    ([`c079e91b`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/c079e91b44f9e0429522182bf6fdbc4ecff3992a),
+    [`02c6bb0e`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/02c6bb0e310588d435fe95530e30647c1da70f5e)).
   - `rch jobs` listings fail closed. A corrupt or non-regular journal (a symlink, FIFO or
     directory) is reported in `journal_errors` and is neither followed nor deleted; the
     listing then says `complete: false` and exits 1. Journals are read through a pinned
@@ -253,7 +260,7 @@ multi-key agents no longer wedge or lock out dispatchers, and `rch update` and
     refuses a command that ends inside an escape or a quote. A shell reads a trailing
     backslash as a line continuation, so the argv rch would have recorded was not the
     command that ran
-    ([`d688b21a`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/d688b21a6f3797fa7327af13e3b9fec99530ebb6)).
+    ([`b2b39f57`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/b2b39f57fe1a5ffbb9c5a8235279e6073ad4155b)).
   - `rch gc --apply` skips a target whose path cannot be embedded in a remote command (one
     containing a space, say) instead of collecting nothing on that worker. On vmi1264463,
     23 idle caches (20 GB) had to be removed by hand (`bd-kr4qb`,
