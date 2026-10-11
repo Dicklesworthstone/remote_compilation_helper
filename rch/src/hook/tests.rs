@@ -1613,6 +1613,37 @@ fn test_parse_test_threads_variants() {
 }
 
 #[test]
+fn test_go_classification_drives_reservations_and_test_kind() {
+    let _guard = test_guard!();
+    let config = rch_common::CompilationConfig {
+        build_slots: 12,
+        test_slots: 8,
+        check_slots: 4,
+        ..Default::default()
+    };
+    for (verb, kind, default, is_test) in [
+        ("build", CompilationKind::GoBuild, 12, false),
+        ("test", CompilationKind::GoTest, 8, true),
+        ("vet", CompilationKind::GoVet, 4, false),
+    ] {
+        for (command, expected) in [
+            (format!("go {verb} ./..."), default),
+            (format!("go {verb} -p 2 ./..."), 2),
+        ] {
+            let classification = classify_command(&command);
+            assert!(classification.is_compilation, "{command}");
+            assert_eq!(classification.kind, Some(kind), "{command}");
+            assert_eq!(is_test_kind(classification.kind), is_test, "{command}");
+            assert_eq!(
+                estimate_cores_for_command(classification.kind, &command, &config),
+                expected,
+                "{command}"
+            );
+        }
+    }
+}
+
+#[test]
 fn test_estimate_cores_for_command() {
     let _guard = test_guard!();
     let config = rch_common::CompilationConfig {

@@ -551,6 +551,322 @@ pub(super) fn cargo_build_only_test(kind: Option<CompilationKind>, command: &str
     ) && cargo_build_only_test_options(command).is_some_and(|(selected, _)| Some(selected) == kind)
 }
 
+/// Decimal spellings whose meaning is identical for Go's flag parser and
+/// GOMAXPROCS. Other numeric forms retain the configured reservation.
+fn parse_go_parallelism(value: &str) -> Option<u32> {
+    if value.is_empty()
+        || value.starts_with('0')
+        || !value.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    value.parse().ok()
+}
+
+/// Locate a literal Go argv. Unknown wrappers retain the configured capacity;
+/// their option values must never become evidence of Go package parallelism.
+fn go_command_tokens(command: &str) -> Option<(Vec<String>, usize, Option<u32>)> {
+    // shell_words removes quotes but does not evaluate shell syntax. Reject
+    // substitutions/operators before trusting its result as an actual argv.
+    let (mut single, mut double, mut escaped) = (false, false, false);
+    for ch in command.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' && !single {
+            escaped = true;
+            continue;
+        }
+        if ch == '\'' && !double {
+            single = !single;
+            continue;
+        }
+        if ch == '"' && !single {
+            double = !double;
+            continue;
+        }
+        if (!single && matches!(ch, '$' | '`'))
+            || (!single
+                && !double
+                && matches!(
+                    ch,
+                    ';' | '&'
+                        | '|'
+                        | '<'
+                        | '>'
+                        | '('
+                        | ')'
+                        | '\n'
+                        | '\r'
+                        | '*'
+                        | '?'
+                        | '['
+                        | ']'
+                        | '{'
+                        | '}'
+                        | '#'
+                ))
+        {
+            return None;
+        }
+    }
+    let tokens = shell_words::split(command).ok()?;
+    let mut index = 0;
+    let mut inline_maxprocs = None;
+    let mut assignments_allowed = true;
+    let mut shell_assignments = true;
+    let mut opaque_goflags = false;
+    loop {
+        while let Some(word) = tokens.get(index) {
+            let Some((key, value)) = word.split_once('=') else {
+                break;
+            };
+            if !rch_common::ssh_utils::is_valid_env_key(key) {
+                break;
+            }
+            if !assignments_allowed {
+                return None;
+            }
+            if shell_assignments && command.split_whitespace().nth(index) != Some(word.as_str()) {
+                // Quoted shell assignment syntax is outside this estimator's
+                // evidence boundary. Env assignments are literal argv and
+                // may be quoted normally.
+                return None;
+            }
+            if key == "GOMAXPROCS" {
+                inline_maxprocs = parse_go_parallelism(value);
+            }
+            opaque_goflags |= key == "GOFLAGS" && !value.is_empty();
+            index += 1;
+        }
+        let executable = Path::new(tokens.get(index)?).file_name()?.to_str()?;
+        if matches!(executable, "go" | "go.exe") {
+            return Some((tokens, index, inline_maxprocs.filter(|_| !opaque_goflags)));
+        }
+        let is_env = match executable {
+            "env" => true,
+            "time" => false,
+            _ => return None,
+        };
+        // Do not infer inherited environment across a wrapper boundary. Only
+        // a fresh literal assignment to the actual Go invocation is evidence.
+        inline_maxprocs = None;
+        assignments_allowed = is_env;
+        shell_assignments = false;
+        index += 1;
+        while let Some(word) = tokens.get(index) {
+            if word == "--" {
+                index += 1;
+                break;
+            }
+            let takes_value = if is_env {
+                matches!(word.as_str(), "-u" | "--unset" | "-C" | "--chdir")
+            } else {
+                matches!(word.as_str(), "-f" | "--format" | "-o" | "--output")
+            };
+            if takes_value {
+                tokens.get(index + 1)?;
+                index += 2;
+                continue;
+            }
+            let flag = if is_env {
+                matches!(word.as_str(), "-i" | "--ignore-environment" | "--debug")
+                    || word.starts_with("--unset=")
+                    || word.starts_with("--chdir=")
+                    || word.starts_with("-u") && word.len() > 2
+                    || word.starts_with("-C") && word.len() > 2
+            } else {
+                matches!(
+                    word.as_str(),
+                    "-p" | "--portability"
+                        | "-v"
+                        | "--verbose"
+                        | "-a"
+                        | "--append"
+                        | "-q"
+                        | "--quiet"
+                ) || word.starts_with("--format=")
+                    || word.starts_with("--output=")
+                    || word.starts_with("-f") && word.len() > 2
+                    || word.starts_with("-o") && word.len() > 2
+            };
+            if flag {
+                index += 1;
+            } else if word.starts_with('-') {
+                return None;
+            } else {
+                break;
+            }
+        }
+    }
+}
+
+/// Go package parallelism belongs to Go's own argv, not test-binary flags,
+/// compiler/linker payloads, package names, or a dispatcher's ambient env.
+fn go_parallelism_for_command(command: &str, kind: CompilationKind) -> Option<u32> {
+    let (tokens, index, inline_maxprocs) = go_command_tokens(command)?;
+    let mut args = tokens[index + 1..].iter().peekable();
+    if args.peek().is_some_and(|arg| arg.as_str() == "-C") {
+        args.next();
+        args.next()?;
+    } else if args.peek().is_some_and(|arg| arg.starts_with("-C=")) {
+        args.next();
+    }
+    let selected = match args.next()?.as_str() {
+        "build" => CompilationKind::GoBuild,
+        "test" => CompilationKind::GoTest,
+        "vet" => CompilationKind::GoVet,
+        _ => return None,
+    };
+    if selected != kind {
+        return None;
+    }
+    let is_test = selected == CompilationKind::GoTest;
+    let mut jobs = None;
+    let mut saw_packages = false;
+    let mut in_packages = false;
+    while let Some(arg) = args.next() {
+        if arg == "--" || is_test && matches!(arg.as_str(), "-args" | "--args") {
+            break;
+        }
+        if !arg.starts_with('-') || arg == "-" {
+            // Build/vet stop parsing flags at their first package. Test permits
+            // flags after ONE contiguous package list; later positional args
+            // belong to the test executable and end Go's flag scan.
+            if !is_test || saw_packages && !in_packages {
+                break;
+            }
+            saw_packages = true;
+            in_packages = true;
+            continue;
+        }
+        in_packages = false;
+        let raw_flag = arg.strip_prefix("--").or_else(|| arg.strip_prefix('-'))?;
+        let (raw_flag, attached) = raw_flag
+            .split_once('=')
+            .map_or((raw_flag, None), |(flag, value)| (flag, Some(value)));
+        if raw_flag == "p" {
+            let value = match attached {
+                Some(value) => value,
+                None => args.next()?.as_str(),
+            };
+            // Last valid repeat wins. Any malformed occurrence invalidates
+            // the whole override, including an earlier low value.
+            jobs = Some(parse_go_parallelism(value)?);
+            continue;
+        }
+        let (flag, test_prefix) = match raw_flag.strip_prefix("test.") {
+            Some(flag) if is_test => (flag, true),
+            Some(_) => return None,
+            None => (raw_flag, false),
+        };
+        let common_value = !test_prefix
+            && matches!(
+                flag,
+                "C" | "asmflags"
+                    | "buildmode"
+                    | "compiler"
+                    | "gccgoflags"
+                    | "gcflags"
+                    | "installsuffix"
+                    | "ldflags"
+                    | "mod"
+                    | "modfile"
+                    | "overlay"
+                    | "pgo"
+                    | "pkgdir"
+                    | "tags"
+                    | "toolexec"
+                    | "covermode"
+                    | "coverpkg"
+            );
+        let test_value = is_test
+            && matches!(
+                flag,
+                "bench"
+                    | "benchtime"
+                    | "blockprofile"
+                    | "blockprofilerate"
+                    | "count"
+                    | "cpu"
+                    | "cpuprofile"
+                    | "fuzz"
+                    | "fuzztime"
+                    | "fuzzminimizetime"
+                    | "list"
+                    | "memprofile"
+                    | "memprofilerate"
+                    | "mutexprofile"
+                    | "mutexprofilefraction"
+                    | "outputdir"
+                    | "parallel"
+                    | "run"
+                    | "shuffle"
+                    | "skip"
+                    | "timeout"
+                    | "trace"
+            );
+        let command_value = !test_prefix
+            && (matches!(selected, CompilationKind::GoBuild | CompilationKind::GoTest) && flag == "o"
+                || is_test && matches!(flag, "exec" | "vet" | "coverprofile")
+                || selected == CompilationKind::GoVet && flag == "vettool");
+        if common_value || test_value || command_value {
+            if attached.is_none() {
+                args.next()?;
+            }
+            continue;
+        }
+        let common_bool = !test_prefix
+            && matches!(
+                flag,
+                "a" | "n"
+                    | "race"
+                    | "msan"
+                    | "asan"
+                    | "cover"
+                    | "v"
+                    | "work"
+                    | "x"
+                    | "linkshared"
+                    | "modcacherw"
+                    | "trimpath"
+                    | "buildvcs"
+                    | "json"
+            );
+        let test_bool = is_test
+            && matches!(
+                flag,
+                "benchmem" | "failfast" | "fullpath" | "short" | "v" | "artifacts"
+            );
+        if common_bool || test_bool || is_test && !test_prefix && flag == "c" {
+            if attached.is_some_and(|value| {
+                !matches!(
+                    value,
+                    "1" | "0"
+                        | "t"
+                        | "f"
+                        | "T"
+                        | "F"
+                        | "true"
+                        | "false"
+                        | "TRUE"
+                        | "FALSE"
+                        | "True"
+                        | "False"
+                ) && !(flag == "buildvcs" && value == "auto")
+            }) {
+                return None;
+            }
+            continue;
+        }
+        // Unknown flags may consume the following token, or be passed to a
+        // test binary. Neither permits retaining an earlier low reservation.
+        return None;
+    }
+    jobs.or(inline_maxprocs)
+}
+
 pub(crate) fn estimate_cores_for_command(
     kind: Option<CompilationKind>,
     command: &str,
@@ -637,15 +953,19 @@ pub(crate) fn estimate_cores_for_command(
             CompilationKind::CargoCheck
             | CompilationKind::CargoClippy
             | CompilationKind::BunTypecheck
-            // `go vet` and `tsc --noEmit` are diagnostic passes, not builds.
-            | CompilationKind::GoVet
+            // TypeScript's no-emit mode is a diagnostic pass.
             | CompilationKind::Tsc,
         ) => cargo_job_count_for_command(command)
             .unwrap_or(check_default)
             .max(1),
-        // Go: `-j/--jobs` is meaningless (go uses `-p`), so don't try to parse a
-        // cargo job count out of the command — take the default bucket directly.
-        Some(CompilationKind::GoBuild) => build_default.max(1),
+        Some(kind @ (CompilationKind::GoBuild | CompilationKind::GoTest | CompilationKind::GoVet)) => {
+            let default = match kind {
+                CompilationKind::GoTest => test_default,
+                CompilationKind::GoVet => check_default,
+                _ => build_default,
+            };
+            go_parallelism_for_command(command, kind).unwrap_or(default)
+        }
         Some(_) => cargo_job_count_for_command(command)
             .unwrap_or(build_default)
             .max(1),
@@ -799,6 +1119,205 @@ fn project_name_for_cwd(policy: &PathTopologyPolicy, warn_on_failure: bool) -> S
     let short_hash = &hash[..8];
 
     format!("{}-{}", name, short_hash)
+}
+
+#[cfg(test)]
+mod go_parallelism_tests {
+    use super::{CompilationKind, estimate_cores_for_command};
+
+    fn slots(kind: CompilationKind, command: &str) -> u32 {
+        let config = rch_common::CompilationConfig {
+            build_slots: 12,
+            test_slots: 8,
+            check_slots: 4,
+            ..Default::default()
+        };
+        estimate_cores_for_command(Some(kind), command, &config)
+    }
+
+    #[test]
+    fn go_kinds_use_their_own_default_and_never_cargo_job_flags() {
+        for (kind, verb, expected) in [
+            (CompilationKind::GoBuild, "build", 12),
+            (CompilationKind::GoTest, "test", 8),
+            (CompilationKind::GoVet, "vet", 4),
+        ] {
+            for command in [
+                format!("go {verb} ./..."),
+                format!("CARGO_BUILD_JOBS=1 RUST_TEST_THREADS=1 go {verb} ./..."),
+                format!("go {verb} -j1 ./..."),
+                format!("go {verb} --jobs=1 ./..."),
+            ] {
+                assert_eq!(slots(kind, &command), expected, "{command}");
+            }
+            let config = rch_common::CompilationConfig {
+                build_slots: 0,
+                test_slots: 0,
+                check_slots: 0,
+                ..Default::default()
+            };
+            assert_eq!(
+                estimate_cores_for_command(Some(kind), &format!("go {verb}"), &config),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn go_parallelism_is_taken_from_the_actual_argv() {
+        for (kind, command, expected) in [
+            (CompilationKind::GoTest, "go test -p 2 ./...", 2),
+            (CompilationKind::GoTest, "go test ./... -p=3", 3),
+            (CompilationKind::GoTest, "go test -p 2 -p=5 ./...", 5),
+            (CompilationKind::GoTest, "go test --p=64 ./...", 64),
+            (CompilationKind::GoTest, "go test --p 64 ./...", 64),
+            (CompilationKind::GoTest, "go test -p 2 --p=64 ./...", 64),
+            (CompilationKind::GoBuild, "go build --p 3 ./...", 3),
+            (CompilationKind::GoVet, "go vet --p=2 ./...", 2),
+            (
+                CompilationKind::GoTest,
+                "go test ./a ./b -run '^Test(a|b)$' -p 2",
+                2,
+            ),
+            (
+                CompilationKind::GoBuild,
+                "go build -p 3 -tags='slow -p=1' ./...",
+                3,
+            ),
+            (CompilationKind::GoVet, "go vet -p=2 -tags unit ./...", 2),
+            (
+                CompilationKind::GoBuild,
+                "env -- /usr/local/go/bin/go build -p 7 ./...",
+                7,
+            ),
+            (
+                CompilationKind::GoTest,
+                "time -p env -- go test -p 2 ./...",
+                2,
+            ),
+            (
+                CompilationKind::GoTest,
+                "/usr/bin/time -f 'go test -p 1' -- go test -p 6 ./...",
+                6,
+            ),
+            (
+                CompilationKind::GoTest,
+                "env -u '-p=1' go test -p=4 ./...",
+                4,
+            ),
+            (CompilationKind::GoTest, "go test -run -p=1 -p=3", 3),
+            (CompilationKind::GoTest, "go test -ldflags -p=1 -p=3", 3),
+            (CompilationKind::GoTest, "go test -tags -p=1 -p=3", 3),
+            (CompilationKind::GoTest, "go test --run --p=64 --p=3", 3),
+            (CompilationKind::GoTest, "go test --tags --p=64 --p=3", 3),
+        ] {
+            assert_eq!(slots(kind, command), expected, "{command}");
+        }
+    }
+
+    #[test]
+    fn go_package_and_test_binary_boundaries_do_not_change_package_parallelism() {
+        for (kind, command, expected) in [
+            (CompilationKind::GoBuild, "go build -p 5 ./... -p 1", 5),
+            (CompilationKind::GoVet, "go vet -p 5 ./... -p 1", 5),
+            (CompilationKind::GoBuild, "go build ./... -p 1", 12),
+            (CompilationKind::GoVet, "go vet ./... -p 1", 4),
+            (
+                CompilationKind::GoTest,
+                "go test ./... -p 5 -args -p 1",
+                5,
+            ),
+            (
+                CompilationKind::GoTest,
+                "go test ./... -p 5 --args -p=1",
+                5,
+            ),
+            (CompilationKind::GoTest, "go test ./... -p 5 -- -p=1", 5),
+            (CompilationKind::GoTest, "go test -p 2 -- -p 0", 2),
+            (
+                CompilationKind::GoTest,
+                "go test ./... -p 5 -run Test opaque -p 1",
+                5,
+            ),
+        ] {
+            assert_eq!(slots(kind, command), expected, "{command}");
+        }
+    }
+
+    #[test]
+    fn ambiguous_or_malformed_go_options_keep_default_capacity() {
+        for command in [
+            "go test -run '-p=1'",
+            "go test -ldflags '-p=1'",
+            "go test -tags '-p=1'",
+            "go test -run 'go test -p 1'",
+            "go test -args -p 1",
+            "go test --args -p=1",
+            "go test -- -p 1",
+            "time -p go test ./...",
+            "printf '%s' 'go test -p 1'",
+            "go test -p 1 -unknown -p 2",
+            "go test -p 1 -unknown=-p=2",
+            "go test -p 1 -run",
+            "go test -p1",
+            "go test ---p=1",
+            "go test -p",
+            "go test -p=",
+            "go test -p=0",
+            "go test -p -2",
+            "go test -p=4294967296",
+            "go test -p=999999999999999999999999999999",
+            "go test -p 2 -p 0",
+            "go test -p 2 -p -1",
+            "go test -p 2 -p invalid",
+            "go test -p 2 -p 4294967296",
+            "go test -p 01",
+            "go test -p 0x10",
+            "go test -p 2 $GO_TEST_FLAGS",
+            "go test -p 2 {-p=64,./...}",
+            "go test -p 2 && go test -p 32",
+            "go test -p 2 | go test -p 32",
+            "go test -p 'unterminated",
+            "env -S 'go test -p 1'",
+            "time --unknown go test -p 1",
+        ] {
+            assert_eq!(slots(CompilationKind::GoTest, command), 8, "{command}");
+        }
+        assert_eq!(slots(CompilationKind::GoBuild, "go test -p 1"), 12);
+        assert_eq!(slots(CompilationKind::GoVet, "go build -p 1"), 4);
+    }
+
+    #[test]
+    fn gomaxprocs_requires_literal_environment_evidence_for_go() {
+        for (command, expected) in [
+            ("GOMAXPROCS=6 go test ./...", 6),
+            ("env GOMAXPROCS=6 go test ./...", 6),
+            ("env 'GOMAXPROCS=6' go test ./...", 6),
+            ("GOMAXPROCS=6 go test -p 2 ./...", 2),
+            ("GOMAXPROCS=3 GOMAXPROCS=5 go test", 5),
+            ("GOMAXPROCS=3 GOMAXPROCS=invalid go test", 8),
+            ("GOMAXPROCS=0 go test", 8),
+            ("GOMAXPROCS=-2 go test", 8),
+            ("GOMAXPROCS=4294967296 go test", 8),
+            ("GOMAXPROCS=3 env -u GOMAXPROCS go test", 8),
+            ("env GOMAXPROCS=3 env -i go test", 8),
+            ("GOMAXPROCS=3 /usr/bin/time -p go test", 8),
+            ("env -u GOMAXPROCS GOMAXPROCS=5 go test", 5),
+            ("GOMAXPROCS=3 env GOMAXPROCS=5 go test", 5),
+            ("env GOFLAGS=-p=64 GOMAXPROCS=2 go test", 8),
+            ("env GOFLAGS=-p=64 GOMAXPROCS=2 go test -p 3", 3),
+            ("env -S 'GOMAXPROCS=2 go test'", 8),
+            ("time GOMAXPROCS=1 go test", 8),
+            ("'GOMAXPROCS=1' go test", 8),
+            ("NOTE='GOMAXPROCS=1' go test", 8),
+            ("go test -run GOMAXPROCS=1", 8),
+            ("go test 'GOMAXPROCS=1'", 8),
+        ] {
+            assert_eq!(slots(CompilationKind::GoTest, command), expected, "{command}");
+        }
+        assert_eq!(slots(CompilationKind::GoBuild, "GOMAXPROCS=6 go build"), 6);
+        assert_eq!(slots(CompilationKind::GoVet, "GOMAXPROCS=6 go vet"), 6);
+    }
 }
 
 #[cfg(test)]
