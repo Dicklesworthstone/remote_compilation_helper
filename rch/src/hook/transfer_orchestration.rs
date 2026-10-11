@@ -1056,6 +1056,7 @@ async fn execute_remote_compilation_inner(
     let remote_topology_policy = remote_preflight_topology_policy(
         topology_policy,
         clean_overlay.is_some() && !worker_is_windows,
+        source_content_receipt && !worker_is_windows,
         &transfer_config.remote_base,
         &ownership_scan_roots,
     )?;
@@ -1280,9 +1281,10 @@ async fn execute_remote_compilation_inner(
     .await?;
     // Hold source and output authorities through retrieval, not only execution.
     // Best-effort repo convergence for ordinary multi-repo dependency graphs.
-    // A clean-overlay run already names an immutable base; mutating repositories
-    // behind that receipt would break the source identity guarantee.
-    if clean_overlay.is_none() {
+    // Both isolated modes already name their complete staged source roots.
+    // Converging canonical worker checkouts would mutate paths outside this
+    // job's source grant and cannot prepare any of its selected destinations.
+    if clean_overlay.is_none() && !source_content_receipt {
         maybe_sync_repo_set_with_repo_updater(
             &worker_config,
             &sync_roots,
@@ -1290,6 +1292,9 @@ async fn execute_remote_compilation_inner(
             source_identity,
         )
         .await?;
+    } else {
+        reporter
+            .verbose("[RCH] isolated sources selected; canonical repository convergence skipped");
     }
 
     let mut primary_pipeline: Option<TransferPipeline> = None;
