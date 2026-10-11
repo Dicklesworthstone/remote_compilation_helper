@@ -605,16 +605,7 @@ async fn run_single_worker_test(
                     remote_time_ms: Some(outcome.compilation_ms),
                     error: outcome.error,
                 },
-                Ok(Err(err)) => SelfTestResultRecord {
-                    run_id,
-                    worker_id: worker_id.clone(),
-                    passed: false,
-                    local_hash: None,
-                    remote_hash: None,
-                    local_time_ms: None,
-                    remote_time_ms: None,
-                    error: Some(err.to_string()),
-                },
+                Ok(Err(err)) => failed_worker_result(run_id, &worker_id, &err),
                 Err(_elapsed) => SelfTestResultRecord {
                     run_id,
                     worker_id: worker_id.clone(),
@@ -658,6 +649,25 @@ async fn run_single_worker_test(
                 timeout_total
             )),
         },
+    }
+}
+
+/// Keep the complete failure chain in persisted and returned self-test results.
+/// Unknown hashes/timings stay absent; diagnostics do not establish execution.
+fn failed_worker_result(
+    run_id: u64,
+    worker_id: &str,
+    error: &anyhow::Error,
+) -> SelfTestResultRecord {
+    SelfTestResultRecord {
+        run_id,
+        worker_id: worker_id.to_owned(),
+        passed: false,
+        local_hash: None,
+        remote_hash: None,
+        local_time_ms: None,
+        remote_time_ms: None,
+        error: Some(format!("{error:#}")),
     }
 }
 
@@ -729,6 +739,39 @@ pub fn default_history_path() -> Result<PathBuf> {
 mod tests {
     use super::*;
     use rch_common::test_guard;
+
+    #[test]
+    fn failed_worker_result_retains_real_io_cause_through_serialization() {
+        let retained = tempfile::tempdir().unwrap().keep();
+        let missing = retained.join("never-created-artifact");
+        let cause = fs::read(&missing).unwrap_err();
+        assert_eq!(cause.kind(), std::io::ErrorKind::NotFound);
+        let cause_message = cause.to_string();
+        let error = anyhow::Error::new(cause)
+            .context("Returned artifact could not be read")
+            .context("Canary identity was not verified");
+        let expected = format!(
+            "Canary identity was not verified: Returned artifact could not be read: {cause_message}"
+        );
+        let record = failed_worker_result(47, "reader-case", &error);
+        assert_eq!(record.error.as_deref(), Some(expected.as_str()));
+        assert_eq!(record.run_id, 47);
+        assert_eq!(record.worker_id, "reader-case");
+        assert!(!record.passed);
+        assert!(record.local_hash.is_none() && record.remote_hash.is_none());
+        assert!(record.local_time_ms.is_none() && record.remote_time_ms.is_none());
+
+        let document = serde_json::to_vec(&record).unwrap();
+        let restored: SelfTestResultRecord = serde_json::from_slice(&document).unwrap();
+        assert_eq!(restored.error.as_deref(), Some(expected.as_str()));
+        assert_eq!(restored.run_id, 47);
+        assert_eq!(restored.worker_id, "reader-case");
+        assert!(!restored.passed);
+        assert!(restored.local_hash.is_none() && restored.remote_hash.is_none());
+        assert!(restored.local_time_ms.is_none() && restored.remote_time_ms.is_none());
+        assert!(!missing.exists());
+        assert_eq!(fs::read_dir(retained).unwrap().count(), 0);
+    }
 
     // ==================== parse_duration tests ====================
 
