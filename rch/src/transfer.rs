@@ -2701,6 +2701,8 @@ impl TransferPipeline {
         // lock and continue to fence recovery until they actually exit. Keep
         // the failure diagnostic in the saved log: even a short write to an
         // abandoned SSH channel can block before the EXIT cleanup runs.
+        // Exit 255 keeps the caller's source ownership unconfirmed; an
+        // ordinary compiler failure would incorrectly authorize release.
         format!(
             "set -e; rch_umask=$(umask); umask 077; mkdir -p -- {directory}; mkdir {claim}; : > {out}; : > {err}; : > {out_progress}; : > {err_progress}; umask \"$rch_umask\"; \
              nohup sh -c {supervisor} </dev/null >{out} 2>{err} & \
@@ -2714,7 +2716,7 @@ impl TransferPipeline {
              rch_follow {out} {out_progress} & a=$!; rch_follow {err} {err_progress} >&2 & b=$!; \
              trap 'kill \"$a\" \"$b\" 2>/dev/null || :; wait \"$a\" 2>/dev/null || :; wait \"$b\" 2>/dev/null || :' EXIT; \
              wait \"$p\" || :; \
-             [ -f {done} ] || {{ printf '%s\\n' 'RCH: remote execution ended without a durable completion receipt' 2>/dev/null >> {err} || :; exit 1; }}; \
+             [ -f {done} ] && [ ! -L {done} ] || {{ printf '%s\\n' 'RCH: remote execution ended without a durable completion receipt; execution outcome remains unconfirmed' 2>/dev/null >> {err} || :; exit 255; }}; \
              last=; still=0; \
              while [ \"$(cat {out_progress} {err_progress})\" != \"$(printf 'done\\ndone')\" ]; do \
                now=$(cat {out_progress} {err_progress}); \
@@ -8647,7 +8649,7 @@ mod tests {
                 .unwrap()
         };
         let output = run();
-        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        assert_eq!(output.status.code(), Some(255), "{output:?}");
         assert!(
             std::fs::read_to_string(format!("{receipt}.stderr"))
                 .unwrap()
@@ -8718,9 +8720,12 @@ mod tests {
             .args(["sh", "-c", &command])
             .output()
             .unwrap();
-        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        assert_eq!(output.status.code(), Some(255), "{output:?}");
         assert!(!Path::new(receipt).exists());
-        assert!(!finished.exists(), "workload ended before fencing was tested");
+        assert!(
+            !finished.exists(),
+            "workload ended before fencing was tested"
+        );
         let lock_is_free = || {
             std::process::Command::new("flock")
                 .args(["-n", "-x"])
@@ -8799,7 +8804,7 @@ mod tests {
             .stderr(Stdio::from(OwnedFd::from(writer)))
             .status()
             .unwrap();
-        assert_eq!(status.code(), Some(1), "{status:?}");
+        assert_eq!(status.code(), Some(255), "{status:?}");
         assert!(!Path::new(receipt).exists());
         assert!(Path::new(&format!("{receipt}.started")).is_dir());
         assert!(

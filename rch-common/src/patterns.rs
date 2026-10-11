@@ -3035,7 +3035,11 @@ mod tests {
                 "/home/ubuntu/.local/bin/cargo-xwin xwin",
             ] {
                 let command = format!("{prefix} {subcommand} {arguments}");
-                assert_eq!(cargo_xwin_compilation_kind(&command), Some(kind), "{command}");
+                assert_eq!(
+                    cargo_xwin_compilation_kind(&command),
+                    Some(kind),
+                    "{command}"
+                );
                 let classification = classify_command(&command);
                 assert!(classification.is_compilation, "{command}");
                 assert_eq!(classification.kind, Some(kind), "{command}");

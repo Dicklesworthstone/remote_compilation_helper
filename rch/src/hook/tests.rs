@@ -1773,15 +1773,24 @@ fn test_cargo_xwin_quoted_options_preserve_classification_and_admission() {
                 }
                 let command = shell_words::join(&argv);
                 assert!(command.contains("'--config=build.jobs=2'"), "{command}");
-                assert!(command.contains(&format!("'{target_argument}'")), "{command}");
-                assert_eq!(cargo_xwin_compilation_kind(&command), Some(kind), "{command}");
+                assert!(
+                    command.contains(&format!("'{target_argument}'")),
+                    "{command}"
+                );
+                assert_eq!(
+                    cargo_xwin_compilation_kind(&command),
+                    Some(kind),
+                    "{command}"
+                );
                 let classification = classify_command(&command);
                 assert!(classification.is_compilation, "{command}");
                 assert_eq!(classification.kind, Some(kind), "{command}");
 
                 let result = preflight(&command, true);
-                let expected_toolchains: Vec<String> =
-                    toolchain.into_iter().map(|value| value.to_string()).collect();
+                let expected_toolchains: Vec<String> = toolchain
+                    .into_iter()
+                    .map(|value| value.to_string())
+                    .collect();
                 assert!(result.is_compilation, "{command}");
                 assert_eq!(result.family.as_deref(), Some(family), "{command}");
                 assert!(result.required.needs_cargo, "{command}");
@@ -1791,11 +1800,14 @@ fn test_cargo_xwin_quoted_options_preserve_classification_and_admission() {
                     "{command}"
                 );
                 assert_eq!(
-                    result.required.needs_toolchains,
-                    expected_toolchains,
+                    result.required.needs_toolchains, expected_toolchains,
                     "{command}"
                 );
-                assert_eq!(result.required.needs_os.as_deref(), expected_os, "{command}");
+                assert_eq!(
+                    result.required.needs_os.as_deref(),
+                    expected_os,
+                    "{command}"
+                );
                 assert_eq!(
                     required_os_for_command(&command).as_deref(),
                     expected_os,
@@ -1804,13 +1816,11 @@ fn test_cargo_xwin_quoted_options_preserve_classification_and_admission() {
                 let requirement = result.required.to_requirement(1);
                 assert!(requirement.needs_cargo, "{command}");
                 assert_eq!(
-                    requirement.needs_targets,
-                    result.required.needs_targets,
+                    requirement.needs_targets, result.required.needs_targets,
                     "{command}"
                 );
                 assert_eq!(
-                    requirement.needs_toolchains,
-                    result.required.needs_toolchains,
+                    requirement.needs_toolchains, result.required.needs_toolchains,
                     "{command}"
                 );
                 assert_eq!(requirement.needs_os.as_deref(), expected_os, "{command}");

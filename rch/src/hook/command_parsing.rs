@@ -808,7 +808,8 @@ fn go_parallelism_for_command(command: &str, kind: CompilationKind) -> Option<u3
                     | "trace"
             );
         let command_value = !test_prefix
-            && (matches!(selected, CompilationKind::GoBuild | CompilationKind::GoTest) && flag == "o"
+            && (matches!(selected, CompilationKind::GoBuild | CompilationKind::GoTest)
+                && flag == "o"
                 || is_test && matches!(flag, "exec" | "vet" | "coverprofile")
                 || selected == CompilationKind::GoVet && flag == "vettool");
         if common_value || test_value || command_value {
@@ -1222,16 +1223,8 @@ mod go_parallelism_tests {
             (CompilationKind::GoVet, "go vet -p 5 ./... -p 1", 5),
             (CompilationKind::GoBuild, "go build ./... -p 1", 12),
             (CompilationKind::GoVet, "go vet ./... -p 1", 4),
-            (
-                CompilationKind::GoTest,
-                "go test ./... -p 5 -args -p 1",
-                5,
-            ),
-            (
-                CompilationKind::GoTest,
-                "go test ./... -p 5 --args -p=1",
-                5,
-            ),
+            (CompilationKind::GoTest, "go test ./... -p 5 -args -p 1", 5),
+            (CompilationKind::GoTest, "go test ./... -p 5 --args -p=1", 5),
             (CompilationKind::GoTest, "go test ./... -p 5 -- -p=1", 5),
             (CompilationKind::GoTest, "go test -p 2 -- -p 0", 2),
             (
@@ -1313,7 +1306,11 @@ mod go_parallelism_tests {
             ("go test -run GOMAXPROCS=1", 8),
             ("go test 'GOMAXPROCS=1'", 8),
         ] {
-            assert_eq!(slots(CompilationKind::GoTest, command), expected, "{command}");
+            assert_eq!(
+                slots(CompilationKind::GoTest, command),
+                expected,
+                "{command}"
+            );
         }
         assert_eq!(slots(CompilationKind::GoBuild, "GOMAXPROCS=6 go build"), 6);
         assert_eq!(slots(CompilationKind::GoVet, "GOMAXPROCS=6 go vet"), 6);

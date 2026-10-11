@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import shlex
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -148,10 +149,25 @@ class DurableExecution(unittest.TestCase):
             handle.close()
         self.temporary.cleanup()
 
-    def start(self, command: str, blocked_reader: bool = False) -> subprocess.Popen:
+    def start(
+        self, command: str, blocked_reader: bool = False, blocked_stderr: bool = False,
+    ) -> subprocess.Popen:
         stdout = subprocess.PIPE if blocked_reader else open(self.root / 'client.stdout', 'wb')
-        stderr = open(self.root / 'client.stderr', 'wb')
-        self.handles.append(stderr)
+        if blocked_stderr:
+            stderr, unread_peer = socket.socketpair()
+            self.handles.extend([stderr, unread_peer])
+            stderr.setblocking(False)
+            for _ in range(16384):
+                try:
+                    self.assertEqual(stderr.send(b'x'), 1)
+                except BlockingIOError:
+                    break
+            else:
+                self.fail('stderr transport did not reach backpressure')
+            stderr.setblocking(True)
+        else:
+            stderr = open(self.root / 'client.stderr', 'wb')
+            self.handles.append(stderr)
         if not blocked_reader:
             self.handles.append(stdout)
         process = subprocess.Popen(
@@ -178,7 +194,7 @@ class DurableExecution(unittest.TestCase):
         self.assertFalse(self.receipt.exists(), 'must not fabricate a completion receipt')
         self.assertTrue(Path(str(self.receipt) + '.started').is_dir())
         self.assertIn(b'execution outcome remains unconfirmed',
-                      (self.root / 'client.stderr').read_bytes())
+                      Path(str(self.receipt) + '.stderr').read_bytes())
 
     def test_supervisor_death_does_not_wait_forever_or_release_unrelated_jobs(self) -> None:
         witness = subprocess.Popen(['sleep', '30'], start_new_session=True)
@@ -213,12 +229,37 @@ class DurableExecution(unittest.TestCase):
         self.wait_free()
         self.assertFalse(self.receipt.exists(), 'descendant exit is not a completion receipt')
 
+    def test_symlink_cannot_stand_in_for_a_failed_completion_receipt(self) -> None:
+        Path(str(self.receipt) + '.pending').mkdir()
+        witness = self.root / 'foreign-receipt'
+        witness.write_bytes(b'abc123 0\n')
+        self.receipt.symlink_to(witness)
+        process = self.start('printf run > executed; exit 0')
+        self.assertEqual(process.wait(timeout=5), 255)
+        self.wait_free()
+        self.assertTrue(self.receipt.is_symlink())
+        self.assertEqual(witness.read_bytes(), b'abc123 0\n')
+        self.assertEqual((self.root / 'executed').read_bytes(), b'run')
+        self.assertTrue(Path(str(self.receipt) + '.started').is_dir())
+        self.assertIn(b'execution outcome remains unconfirmed',
+                      Path(str(self.receipt) + '.stderr').read_bytes())
+
     def test_missing_receipt_stops_followers_blocked_on_an_unread_client_pipe(self) -> None:
         command = shlex.quote(sys.executable) + " -c 'import os; os.write(1, b\"x\" * 4194304)'"
         process = self.start(command + '; sleep 0.4; kill -KILL "$$"', blocked_reader=True)
         self.assert_unconfirmed(process)
         self.wait_free()
         self.assertEqual(Path(str(self.receipt) + '.stdout').stat().st_size, 4194304)
+
+    def test_missing_receipt_cleanup_does_not_write_to_saturated_client_stderr(self) -> None:
+        Path(str(self.receipt) + '.pending').mkdir()
+        process = self.start(
+            "printf 'compiled\\n'; printf 'diagnostic\\n' >&2; exit 0", blocked_stderr=True,
+        )
+        self.assert_unconfirmed(process)
+        self.wait_free()
+        self.assertEqual(Path(str(self.receipt) + '.stdout').read_bytes(), b'compiled\n')
+        self.assertIn(b'diagnostic\n', Path(str(self.receipt) + '.stderr').read_bytes())
 
     def test_normal_nonzero_completion_preserves_exact_streams_status_and_umask(self) -> None:
         process = self.start("printf 'out\\000\\377'; printf 'err\\000\\376' >&2; umask > workload.umask; exit 7")

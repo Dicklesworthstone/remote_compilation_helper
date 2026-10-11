@@ -605,7 +605,10 @@ mod tests {
             ] {
                 for (target_argument, target) in [
                     ("--target x86_64-pc-windows-msvc", "x86_64-pc-windows-msvc"),
-                    ("--target=aarch64-pc-windows-msvc", "aarch64-pc-windows-msvc"),
+                    (
+                        "--target=aarch64-pc-windows-msvc",
+                        "aarch64-pc-windows-msvc",
+                    ),
                 ] {
                     let passthrough = if subcommand == "clippy" {
                         " -- -D warnings"
@@ -616,8 +619,10 @@ mod tests {
                         "{prefix} {subcommand} --locked --all-targets {target_argument}{passthrough}"
                     );
                     let result = preflight(&command, true);
-                    let expected_toolchains: Vec<String> =
-                        toolchain.into_iter().map(|value| value.to_string()).collect();
+                    let expected_toolchains: Vec<String> = toolchain
+                        .into_iter()
+                        .map(|value| value.to_string())
+                        .collect();
                     assert!(result.is_compilation, "{command}");
                     assert!(result.required.needs_cargo, "{command}");
                     assert_eq!(result.family.as_deref(), Some(family), "{command}");
@@ -627,8 +632,7 @@ mod tests {
                         "{command}"
                     );
                     assert_eq!(
-                        result.required.needs_toolchains,
-                        expected_toolchains,
+                        result.required.needs_toolchains, expected_toolchains,
                         "{command}"
                     );
                     assert_eq!(result.required.needs_os, None, "{command}");
@@ -637,13 +641,11 @@ mod tests {
                     assert!(requirement.needs_cargo, "{command}");
                     assert_eq!(requirement.min_protocol, 1, "{command}");
                     assert_eq!(
-                        requirement.needs_targets,
-                        result.required.needs_targets,
+                        requirement.needs_targets, result.required.needs_targets,
                         "{command}"
                     );
                     assert_eq!(
-                        requirement.needs_toolchains,
-                        result.required.needs_toolchains,
+                        requirement.needs_toolchains, result.required.needs_toolchains,
                         "{command}"
                     );
                     assert_eq!(requirement.needs_os, None, "{command}");
