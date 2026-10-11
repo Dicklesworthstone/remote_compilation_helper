@@ -9,6 +9,68 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::path::Path;
 
+/// Read a regular file relative to an already held directory. The descriptor
+/// binds the namespace; NOFOLLOW and NONBLOCK reject symlinks and special
+/// files without waiting for a FIFO writer. Preserve complete large receipts.
+#[cfg(unix)]
+pub(crate) fn read_regular_file_at(
+    directory: std::os::fd::BorrowedFd<'_>,
+    name: &std::ffi::CStr,
+) -> Result<Vec<u8>> {
+    use rustix::fs::{Mode, OFlags};
+    use std::io::Read;
+
+    let descriptor = rustix::fs::openat(
+        directory,
+        name,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::NOCTTY,
+        Mode::empty(),
+    )
+    .context("journal open without following symlinks failed")?;
+    let mut file = File::from(descriptor);
+    anyhow::ensure!(file.metadata()?.is_file(), "journal is not a regular file");
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).context("journal read failed")?;
+    Ok(bytes)
+}
+
+/// Open the journal's parent without following its final symlink, then use the
+/// same descriptor-bound reader as listing. Refuse a replaced parent rather
+/// than constructing a writer whose path names a different journal namespace.
+#[cfg(unix)]
+pub(crate) fn read_regular_file(path: &Path) -> Result<Vec<u8>> {
+    use rustix::fs::{Mode, OFlags};
+    use std::os::fd::AsFd;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let name = std::ffi::CString::new(
+        path.file_name()
+            .context("journal has no file name")?
+            .as_bytes(),
+    )?;
+    let directory = File::from(
+        rustix::fs::open(
+            parent,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+            Mode::empty(),
+        )
+        .context("journal directory open without following symlinks failed")?,
+    );
+    let bytes = read_regular_file_at(directory.as_fd(), &name)?;
+    let held = directory.metadata()?;
+    let named = fs::symlink_metadata(parent)?;
+    anyhow::ensure!(
+        named.is_dir() && held.dev() == named.dev() && held.ino() == named.ino(),
+        "journal directory changed during observation"
+    );
+    Ok(bytes)
+}
+
 /// Result of an idempotent operation.
 ///
 /// These results allow callers to distinguish between:
@@ -481,6 +543,25 @@ mod tests {
 
     fn log_test_pass(name: &str) {
         info!("TEST PASS: {}", name);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn regular_file_reader_preserves_large_bytes_and_rejects_nonregular_or_linked_roots() {
+        let retained = tempfile::tempdir().unwrap().keep();
+        let path = retained.join("large.json");
+        let bytes = vec![b'x'; 2 * 1024 * 1024];
+        fs::write(&path, &bytes).unwrap();
+        assert_eq!(read_regular_file(&path).unwrap(), bytes);
+        let link = retained.join("linked.json");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert!(read_regular_file(&link).is_err());
+        assert!(read_regular_file(&retained).is_err());
+        let linked_root = retained.join("linked-root");
+        std::os::unix::fs::symlink(&retained, &linked_root).unwrap();
+        assert!(read_regular_file(&linked_root.join("large.json")).is_err());
+        assert_eq!(fs::read(path).unwrap(), bytes);
+        // Retained real filesystem bytes only; no remote or recovery ownership.
     }
 
     #[test]

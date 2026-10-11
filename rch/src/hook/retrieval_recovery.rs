@@ -14,7 +14,7 @@ use std::io::{Read, Write};
 #[path = "recovery_completion.rs"]
 mod recovery_completion;
 #[path = "recovery_owner.rs"]
-mod recovery_owner;
+pub(in crate::hook) mod recovery_owner;
 #[path = "result_recovery.rs"]
 mod result_recovery;
 
@@ -1843,11 +1843,18 @@ async fn cancel_source_grant(mut session: RecoverySession) -> anyhow::Result<boo
 }
 
 /// Recollect the admitted command's outputs; no execution path is reachable.
-pub(crate) async fn recover_job(writer: &DurableLeaseWriter) -> anyhow::Result<i32> {
+pub(crate) async fn recover_job(writer: &DurableLeaseWriter) -> anyhow::Result<(i32, DurableLeaseWriter)> {
+    let owned = recovery_owner::claim(writer).await?;
+    let exit = Box::pin(recover_owned_job(&owned)).await?;
+    owned.recovery_ownership.as_ref().context("recovery has no journal owner")?.verify()?;
+    Ok((exit, owned))
+}
+
+async fn recover_owned_job(writer: &DurableLeaseWriter) -> anyhow::Result<i32> {
     // Resolve lazily so an already acknowledged journal stays a read-only
     // operation, but pin the chosen endpoint across the entire handoff.
     let mut socket = None;
-    Box::pin(recover_job_with_daemon(writer, async |command: &str| {
+    Box::pin(recover_owned_job_with_daemon(writer, async |command: &str| {
         if socket.is_none() {
             let config = crate::config::load_config()?;
             socket = Some(shellexpand::tilde(&config.general.socket_path).into_owned());
@@ -1862,8 +1869,9 @@ pub(crate) async fn recover_job(writer: &DurableLeaseWriter) -> anyhow::Result<i
 pub(crate) async fn recover_job_cargo_json(
     writer: &DurableLeaseWriter,
 ) -> anyhow::Result<(i32, Option<Vec<u8>>, Vec<u8>)> {
+    let owned = recovery_owner::claim(writer).await?;
+    let writer = &owned;
     {
-        let _ownership = recovery_owner::claim(writer).await?;
         let recipe = load_recipe(writer)?;
         anyhow::ensure!(
             recipe.execution_started
@@ -1875,10 +1883,8 @@ pub(crate) async fn recover_job_cargo_json(
             "Cargo JSON recovery requires the original admitted opt-in named-binary invocation"
         );
     }
-    let exit = recover_job(writer).await?;
-    // Recovery above releases its journal lock after acknowledgement. Acquire
-    // it again and reload the actual durable result before emitting any bytes.
-    let _ownership = recovery_owner::claim(writer).await?;
+    let exit = Box::pin(recover_owned_job(writer)).await?;
+    // Keep the same namespace and lock through acknowledgement and readback.
     let recipe = load_recipe(writer)?;
     let lease = writer.snapshot();
     anyhow::ensure!(
@@ -1929,10 +1935,23 @@ pub(crate) async fn recover_job_cargo_json(
         session.recipe.exit_code == Some(diagnostics.exit_code),
         "recovered Cargo stderr contradicts its compiler completion"
     );
-    Ok((exit, stdout, diagnostics.read()?))
+    let stderr = diagnostics.read()?;
+    writer.recovery_ownership.as_ref().context("recovery has no journal owner")?.verify()?;
+    Ok((exit, stdout, stderr))
 }
 
+#[cfg(test)]
 async fn recover_job_with_daemon(
+    writer: &DurableLeaseWriter,
+    daemon: impl AsyncFnMut(&str) -> anyhow::Result<String>,
+) -> anyhow::Result<i32> {
+    let owned = recovery_owner::claim(writer).await?;
+    let exit = Box::pin(recover_owned_job_with_daemon(&owned, daemon)).await?;
+    owned.recovery_ownership.as_ref().context("recovery has no journal owner")?.verify()?;
+    Ok(exit)
+}
+
+async fn recover_owned_job_with_daemon(
     writer: &DurableLeaseWriter,
     mut daemon: impl AsyncFnMut(&str) -> anyhow::Result<String>,
 ) -> anyhow::Result<i32> {
@@ -1940,7 +1959,7 @@ async fn recover_job_with_daemon(
     // worker probes, source release and final daemon reservation reconciliation.
     // claim reloads the latest disk state after acquisition and never mistakes
     // an unverified wrapper for a dead one.
-    let _ownership = recovery_owner::claim(writer).await?;
+    writer.recovery_ownership.as_ref().context("recovery has no journal owner")?.verify()?;
     let recipe = load_recipe(writer)?;
     let lease = writer.snapshot();
     if lease.terminal_acknowledged {
@@ -2272,6 +2291,7 @@ mod tests {
         };
         let writer = DurableLeaseWriter {
             path: directory.path().join("lease.json"),
+            recovery_ownership: None,
             lease: Arc::new(Mutex::new(DurableJobLease::new(
                 JobIdentity::new_local(),
                 std::process::id(),
@@ -2994,6 +3014,7 @@ mod tests {
     fn reload_publication(session: &RecoverySession) -> RecoverySession {
         let writer = DurableLeaseWriter {
             path: session.writer.path.clone(),
+            recovery_ownership: None,
             lease: Arc::new(Mutex::new(
                 serde_json::from_slice(&std::fs::read(&session.writer.path).unwrap()).unwrap(),
             )),
@@ -3795,6 +3816,7 @@ mod tests {
         // in-memory session. Only the already-staged bytes are published.
         let writer = DurableLeaseWriter {
             path: session.writer.path.clone(),
+            recovery_ownership: None,
             lease: Arc::new(Mutex::new(serde_json::from_slice(&before).unwrap())),
         };
         let mut resumed = RecoverySession {

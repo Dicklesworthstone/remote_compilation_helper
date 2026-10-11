@@ -297,24 +297,7 @@ fn read_job_journal_at(
     directory: std::os::fd::BorrowedFd<'_>,
     name: &std::ffi::CStr,
 ) -> Result<DurableJobLease> {
-    use rustix::fs::{Mode, OFlags};
-    use std::io::Read;
-
-    // The directory descriptor pins the observed namespace. NOFOLLOW rejects
-    // a replacement symlink at open, and NONBLOCK prevents a replacement FIFO
-    // from waiting for a writer before we can inspect the opened object.
-    let descriptor = rustix::fs::openat(
-        directory,
-        name,
-        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::NOCTTY,
-        Mode::empty(),
-    )
-    .context("journal open without following symlinks failed")?;
-    let mut file = std::fs::File::from(descriptor);
-    anyhow::ensure!(file.metadata()?.is_file(), "journal is not a regular file");
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)
-        .context("journal read failed")?;
+    let bytes = crate::state::primitives::read_regular_file_at(directory, name)?;
     Ok(serde_json::from_slice(&bytes)?)
 }
 
@@ -468,10 +451,7 @@ async fn run_unix(action: Option<JobsAction>, ctx: &OutputContext) -> Result<()>
         let writer = DurableLeaseWriter::load(&wrapper_id)?;
         let lease = writer.snapshot();
         if lease.terminal_acknowledged {
-            emit(
-                ctx,
-                &json!({"status":"completed", "identity":lease.identity, "exit_code":lease.exit_code, "terminal_acknowledged":true}),
-            )?;
+            emit(ctx, &writer.terminal_job_report(&wrapper_id, "completed", None)?)?;
             return Ok(());
         }
         if !cancel && waiting_for_admission(&lease, process_matches(&lease))? {
@@ -573,7 +553,7 @@ async fn run_unix(action: Option<JobsAction>, ctx: &OutputContext) -> Result<()>
             }
         }
         if !process_matches(&lease) && recover && lease.recovery.is_some() {
-            let code = within_job_deadline(
+            let (code, recovered_writer) = within_job_deadline(
                 deadline,
                 "artifact recovery (use the retained journal for same-id retry)",
                 crate::hook::recover_job(&writer),
@@ -581,7 +561,7 @@ async fn run_unix(action: Option<JobsAction>, ctx: &OutputContext) -> Result<()>
             .await?;
             emit(
                 ctx,
-                &json!({"status":"recovered", "identity":lease.identity, "exit_code":code, "terminal_acknowledged":writer.snapshot().terminal_acknowledged}),
+                &recovered_writer.terminal_job_report(&wrapper_id, "recovered", Some(code))?,
             )?;
             return Ok(());
         }
@@ -589,7 +569,12 @@ async fn run_unix(action: Option<JobsAction>, ctx: &OutputContext) -> Result<()>
             && lease.recovery.is_none()
             && owner_presence(&lease) == OwnerPresence::Absent
         {
-            let latest_writer = DurableLeaseWriter::load(&wrapper_id)?;
+            let latest_writer = within_job_deadline(
+                deadline,
+                "terminal journal ownership",
+                writer.claim_recovery(),
+            )
+            .await?;
             let latest = latest_writer.snapshot();
             if !same_unfinished_owner_without_recovery(&lease, &latest) {
                 wait_for_job_poll(deadline).await?;
@@ -604,7 +589,7 @@ async fn run_unix(action: Option<JobsAction>, ctx: &OutputContext) -> Result<()>
             latest_writer.acknowledge_terminal()?;
             emit(
                 ctx,
-                &json!({"status":"completed", "identity":latest.identity, "exit_code":code, "terminal_acknowledged":true}),
+                &latest_writer.terminal_job_report(&wrapper_id, "completed", Some(code))?,
             )?;
             return Ok(());
         }

@@ -2148,6 +2148,8 @@ async fn test_daemon_query_missing_socket() {
 fn queued_selection_test_lease(path: PathBuf) -> DurableLeaseWriter {
     let writer = DurableLeaseWriter {
         path,
+        #[cfg(unix)]
+        recovery_ownership: None,
         lease: Arc::new(std::sync::Mutex::new(DurableJobLease::new(
             JobIdentity::new_local(),
             std::process::id(),
@@ -2228,6 +2230,108 @@ fn compiler_admission_reference_binds_one_durable_attempt_without_rounding() {
     // Real retained journal I/O with supplied fixture identity, not a live
     // worker, SDK, reservation or compilation proof.
     assert!(journal.is_file());
+}
+
+#[cfg(unix)]
+#[test]
+fn recovery_journal_reader_keeps_large_receipts_and_rejects_redirected_entries() {
+    use rustix::fs::{Mode, OFlags};
+    use std::os::fd::AsFd;
+    use std::os::unix::fs::FileTypeExt;
+
+    let _guard = test_guard!();
+    let retained = tempfile::tempdir().unwrap().keep();
+    let journal = retained.join("valid.json");
+    let writer = queued_selection_test_lease(journal.clone());
+    writer.set_recovery(serde_json::json!({"retained_fixture": "x".repeat(2 * 1024 * 1024)})).unwrap();
+    let original = std::fs::read(&journal).unwrap();
+    let wrapper = writer.wrapper_id();
+    let read = DurableLeaseWriter::read_journal(&journal, &wrapper).unwrap();
+    assert_eq!(read, writer.snapshot());
+    assert!(DurableLeaseWriter::read_journal(&journal, "different-wrapper").is_err());
+    let link = retained.join("linked.json");
+    std::os::unix::fs::symlink(&journal, &link).unwrap();
+    assert!(DurableLeaseWriter::read_journal(&link, &wrapper).is_err());
+    let linked_directory = retained.join("linked-directory");
+    std::os::unix::fs::symlink(&retained, &linked_directory).unwrap();
+    assert!(DurableLeaseWriter::read_journal(&linked_directory.join("valid.json"), &wrapper).is_err());
+    let wrong_schema = retained.join("wrong-schema.json");
+    let mut changed = read;
+    changed.schema_version = 2;
+    std::fs::write(&wrong_schema, serde_json::to_vec(&changed).unwrap()).unwrap();
+    assert!(DurableLeaseWriter::read_journal(&wrong_schema, &wrapper).is_err());
+    let directory = rustix::fs::open(&retained, OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty()).unwrap();
+    rustix::fs::mkfifoat(directory.as_fd(), c"fifo.json", Mode::RUSR | Mode::WUSR).unwrap();
+    let fifo = retained.join("fifo.json");
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let fifo_read = fifo.clone();
+    let reader = std::thread::spawn(move || {
+        sender.send(DurableLeaseWriter::read_journal(&fifo_read, &wrapper)).unwrap();
+    });
+    let error = receiver.recv_timeout(std::time::Duration::from_secs(2))
+        .expect("recovery journal read blocked on a FIFO with no writer").unwrap_err();
+    reader.join().unwrap();
+    assert!(format!("{error:#}").contains("journal is not a regular file"));
+    assert!(std::fs::symlink_metadata(fifo).unwrap().file_type().is_fifo());
+    assert_eq!(std::fs::read(&journal).unwrap(), original);
+    assert_eq!(std::fs::read_link(link).unwrap(), journal);
+    // Actual retained file I/O and supplied journal identity only; no daemon,
+    // owner takeover, compiler execution, SDK or native qualification.
+}
+
+#[test]
+fn terminal_job_report_uses_one_current_admission_and_observed_exit() {
+    let _guard = test_guard!();
+    let retained = tempfile::tempdir().unwrap().keep();
+    let writer = queued_selection_test_lease(retained.join("job.json"));
+    let wrapper = writer.wrapper_id();
+    assert!(writer.terminal_job_report(&wrapper, "completed", None).is_err());
+    let build = 9_007_199_254_740_993_u64;
+    let worker = WorkerId::new("recovery-worker-fixture");
+    writer.admit(build, &worker).unwrap();
+    writer.record_exit(102).unwrap();
+    assert!(writer.terminal_job_report(&wrapper, "recovered", Some(102)).is_err());
+    writer.acknowledge_terminal().unwrap();
+    let report = writer.terminal_job_report(&wrapper, "recovered", Some(102)).unwrap();
+    assert_eq!(report["identity"]["remote_build_id"], build);
+    assert_eq!(report["admission"]["remote_build_id"], "9007199254740993");
+    assert_eq!(report["admission"]["worker_id"], worker.as_str());
+    assert_eq!(report["admission"]["terminal_acknowledged"], true);
+    assert_eq!(report["exit_code"], 102);
+    assert_eq!(report["admission"]["local_wrapper_id"], report["identity"]["local_wrapper_id"]);
+    assert!(writer.terminal_job_report(&wrapper, "recovered", Some(0)).is_err());
+    assert!(writer.terminal_job_report("other-wrapper", "completed", None).is_err());
+    assert!(writer.terminal_job_report(&wrapper, "active", None).is_err());
+    let unadmitted = queued_selection_test_lease(retained.join("unadmitted.json"));
+    let unadmitted_wrapper = unadmitted.wrapper_id();
+    unadmitted.record_exit(EXIT_BUILD_ERROR).unwrap();
+    unadmitted.acknowledge_terminal().unwrap();
+    let no_admission = unadmitted.terminal_job_report(&unadmitted_wrapper, "completed", Some(EXIT_BUILD_ERROR)).unwrap();
+    assert!(no_admission["admission"].is_null());
+    assert!(no_admission["identity"]["remote_build_id"].is_null());
+    let missing_exit = queued_selection_test_lease(retained.join("missing-exit.json"));
+    missing_exit.acknowledge_terminal().unwrap();
+    assert!(missing_exit.terminal_job_report(&missing_exit.wrapper_id(), "completed", None).is_err());
+    for admitted in [true, false] {
+        let mut incomplete = writer.snapshot();
+        if admitted {
+            incomplete.worker_id = None;
+        } else {
+            incomplete.identity.remote_build_id = None;
+        }
+        let invalid = DurableLeaseWriter {
+            path: retained.join("incomplete-admission-fixture.json"),
+            #[cfg(unix)]
+            recovery_ownership: None,
+            lease: Arc::new(std::sync::Mutex::new(incomplete)),
+        };
+        assert!(invalid.terminal_job_report(&wrapper, "completed", None).is_err());
+    }
+    let original = std::fs::read(&writer.path).unwrap();
+    assert_eq!(writer.terminal_job_report(&wrapper, "recovered", Some(102)).unwrap(), report);
+    assert_eq!(std::fs::read(&writer.path).unwrap(), original);
+    // Supplied fixture identity/terminal journal are not an actual reservation
+    // or replayed original ExecResultEnvelope, SDK or returned-artifact proof.
 }
 
 fn retry_selection_test_lease(path: PathBuf) -> DurableLeaseWriter {
@@ -2553,6 +2657,8 @@ async fn retry_selection_failed_intent_publication_does_not_dispatch_or_change_m
     // original journal available to establish that no state was lost.
     let blocked = DurableLeaseWriter {
         path: directory.path().to_path_buf(),
+        #[cfg(unix)]
+        recovery_ownership: None,
         lease: writer.lease.clone(),
     };
     let result = dispatch_retry_selection(&blocked, true, async || {

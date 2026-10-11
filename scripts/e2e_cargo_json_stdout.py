@@ -1079,7 +1079,24 @@ def main():
     require(payload.get("outcome") == "completed" and payload.get("location") == "remote"
             and payload.get("worker_id") == args.worker and payload.get("remote_exit_code") == 0,
             "Machine stdout contains compiler records or lacks its exact-worker remote envelope")
-    admitted_journal(payload, envelope_case)
+    original_admission = admitted_journal(payload, envelope_case)
+    terminal_journal = Path(original_admission["journal_path"])
+    before_terminal_readback = terminal_journal.read_bytes()
+    terminal_readback, _ = run("ordinary-machine-terminal-recovery-readback",
+        [str(args.rch), "--json", "jobs", "recover", original_admission["local_wrapper_id"],
+         "--timeout-secs", "30"], ordinary_env, timeout_seconds=30)
+    require(terminal_readback.returncode == 0, "Actual same-id terminal recovery readback failed")
+    recovered = json.loads(terminal_readback.stdout)
+    require(recovered.get("status") == "completed" and recovered.get("exit_code") == 0
+            and recovered.get("terminal_acknowledged") is True
+            and recovered.get("admission") == original_admission
+            and recovered.get("identity", {}).get("local_wrapper_id") == original_admission["local_wrapper_id"]
+            and recovered.get("identity", {}).get("remote_build_id") == int(original_admission["remote_build_id"]),
+            "Recovery mixed old identity, command exit or terminal fields")
+    require(terminal_journal.read_bytes() == before_terminal_readback,
+            "Already-completed recovery readback rewrote its retained journal")
+    # Same-origin journal/reference custody, not SDK/native/slot qualification
+    # or reconstruction of the original ExecResultEnvelope/output bytes.
     before_failure, _ = run("jobs-before-genuine-failure", [str(args.rch), "--json", "jobs"], env)
     require(before_failure.returncode == 0, "Actual pre-failure job observation failed")
     before_listing = json.loads(before_failure.stdout)

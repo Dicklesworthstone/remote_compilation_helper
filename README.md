@@ -494,11 +494,28 @@ The directory is opened once and journal names are read relative to its file
 descriptor. Journal opens reject symlinks and do not wait for a FIFO writer;
 the opened descriptor must represent a regular file before any bytes are read.
 The directory root itself must be a directory rather than a symlink.
+Initial attach/recover loads and recovery-owner reloads use the same regular-file,
+nofollow, nonblocking reader. A changed parent directory is refused; a FIFO
+cannot block these journal reads while waiting for a writer.
+Detached recovery retains the opened directory and persistent lock through
+journal publication and terminal reporting. Its clones share that ownership;
+reads and atomic writes use the held directory. A replaced directory or lock
+refuses acknowledgement. Failed recovery publications retain their exclusive
+temporary bytes for diagnosis; recovery does not remove them. Ordinary running
+wrappers keep their existing journal writer.
 `complete` describes this scan, not an immutable ownership snapshot: entries
 and regular-file contents can still change during observation.
 If a journal path contains non-UTF-8 bytes, its error has a printable `path`
 and an exact Unix `path_bytes` array. A job command whose output cannot be written
 or flushed exits with an error rather than reporting successful delivery.
+
+Completed/recovered reports include an `admission` reference from one committed
+terminal observation: exact decimal build ID, wrapper, worker, journal path and
+caller fingerprint, matching the ordinary execution reference. Unadmitted
+terminal jobs have `admission: null`. Unknown exit, incomplete identity or
+unacknowledged state cannot become a completed report. This reports journal
+identity/custody; it does not replay the original execution envelope or attest
+compiler, SDK, slots or artifact contents.
 
 These commands never replay the original command. Recovery requires retained
 identity and completion/retrieval evidence; ambiguous or missing evidence is

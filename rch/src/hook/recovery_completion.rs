@@ -165,6 +165,7 @@ mod tests {
         };
         let writer = DurableLeaseWriter {
             path: directory.path().join("lease.json"),
+            recovery_ownership: None,
             lease: Arc::new(Mutex::new(DurableJobLease::new(
                 JobIdentity::new_local(),
                 0,

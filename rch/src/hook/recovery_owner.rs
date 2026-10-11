@@ -7,16 +7,135 @@
 
 use super::*;
 use std::future::Future;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::MetadataExt;
 
 /// The inode stays on disk. Unlinking it on release would let a waiting opener
 /// lock the old inode while a new recovery command locks its replacement.
-pub(super) struct RecoveryOwnership {
+pub(in crate::hook) struct RecoveryOwnership {
     _gate: File,
+    directory: File,
+    parent: PathBuf,
+    gate_name: std::ffi::CString,
+    journal_name: std::ffi::CString,
+}
+
+impl RecoveryOwnership {
+    /// Both the persistent gate and journal must still name the held directory.
+    /// Reads/writes use that descriptor even if a rename races this check.
+    pub(in crate::hook) fn verify(&self) -> anyhow::Result<()> {
+        use rustix::fs::{Mode, OFlags};
+        use std::os::fd::AsFd;
+
+        let held_directory = self.directory.metadata()?;
+        let named_directory = std::fs::symlink_metadata(&self.parent)?;
+        anyhow::ensure!(
+            named_directory.is_dir()
+                && held_directory.dev() == named_directory.dev()
+                && held_directory.ino() == named_directory.ino(),
+            "recovery journal directory changed; retry the retained same wrapper"
+        );
+        let named_gate = File::from(rustix::fs::openat(
+            self.directory.as_fd(),
+            self.gate_name.as_c_str(),
+            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::NOCTTY,
+            Mode::empty(),
+        )?);
+        let held = self._gate.metadata()?;
+        let named = named_gate.metadata()?;
+        anyhow::ensure!(
+            named.is_file() && held.is_file()
+                && named.dev() == held.dev() && named.ino() == held.ino()
+                && named.uid() == held.uid() && named.nlink() == 1
+                && held.nlink() == 1 && named.mode() & 0o077 == 0,
+            "recovery lock changed; no journal mutation acknowledged"
+        );
+        Ok(())
+    }
+
+    fn read(&self, wrapper_id: &str) -> anyhow::Result<DurableJobLease> {
+        use std::os::fd::AsFd;
+        self.verify()?;
+        let bytes = crate::state::primitives::read_regular_file_at(
+            self.directory.as_fd(), &self.journal_name,
+        )?;
+        self.verify()?;
+        DurableLeaseWriter::decode_journal(&bytes, wrapper_id)
+    }
+
+    pub(in crate::hook) fn publish(&self, bytes: &[u8]) -> anyhow::Result<()> {
+        use rustix::fs::{Mode, OFlags};
+        use std::os::fd::AsFd;
+
+        self.verify()?;
+        // An exclusive fresh name cannot truncate an existing receipt. A failed
+        // publication retains its temporary bytes for diagnosis, never cleanup.
+        let temporary = std::ffi::CString::new(format!(
+            ".recovery-{}.tmp", uuid::Uuid::new_v4().simple(),
+        ))?;
+        let mut file = File::from(rustix::fs::openat(
+            self.directory.as_fd(), temporary.as_c_str(),
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::RUSR | Mode::WUSR,
+        )?);
+        use std::io::Write;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        self.publish_temporary(&file, &temporary)
+    }
+
+    fn require_named_file(&self, held: &File, name: &std::ffi::CStr) -> anyhow::Result<()> {
+        use rustix::fs::{Mode, OFlags};
+        use std::os::fd::AsFd;
+
+        let named = File::from(rustix::fs::openat(
+            self.directory.as_fd(), name,
+            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::NOCTTY,
+            Mode::empty(),
+        )?);
+        let held = held.metadata()?;
+        let named = named.metadata()?;
+        anyhow::ensure!(
+            held.is_file() && named.is_file()
+                && held.dev() == named.dev() && held.ino() == named.ino()
+                && held.nlink() == 1 && named.nlink() == 1,
+            "recovery publication file changed; committed bytes are unverified"
+        );
+        Ok(())
+    }
+
+    fn publish_temporary(&self, file: &File, temporary: &std::ffi::CStr) -> anyhow::Result<()> {
+        use std::os::fd::AsFd;
+
+        self.verify()?;
+        self.require_named_file(file, temporary)?;
+        rustix::fs::renameat(
+            self.directory.as_fd(), temporary,
+            self.directory.as_fd(), self.journal_name.as_c_str(),
+        )?;
+        self.require_named_file(file, &self.journal_name)?;
+        self.directory.sync_all()
+            .context("sync held recovery journal directory before advancing ownership")?;
+        self.verify()?;
+        self.require_named_file(file, &self.journal_name)?;
+        Ok(())
+    }
 }
 
 fn acquire_gate(lease_path: &Path) -> anyhow::Result<RecoveryOwnership> {
+    use rustix::fs::{Mode, OFlags};
+    use std::os::fd::AsFd;
+    use std::os::unix::ffi::OsStrExt;
+
     let path = lease_path.with_extension("recovery.lock");
+    let parent = path.parent().context("recovery lock has no parent")?;
+    let name = std::ffi::CString::new(
+        path.file_name().context("recovery lock has no name")?.as_bytes(),
+    )?;
+    let directory = File::from(rustix::fs::open(
+        parent,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+        Mode::empty(),
+    )?);
     let (socket, _peer) = tokio::net::UnixStream::pair()?;
     let uid = socket.peer_cred()?.uid();
     let safe = |metadata: &std::fs::Metadata| {
@@ -30,25 +149,47 @@ fn acquire_gate(lease_path: &Path) -> anyhow::Result<RecoveryOwnership> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
-    let gate = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .open(&path)?;
+    // A replaced parent cannot redirect creation. The leaf is never followed
+    // or truncated, and the persistent inode remains the cross-recovery gate.
+    let flags = OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::NOCTTY;
+    let gate = File::from(rustix::fs::openat(
+        directory.as_fd(),
+        name.as_c_str(),
+        OFlags::RDWR | OFlags::CREATE | flags,
+        Mode::RUSR | Mode::WUSR,
+    )?);
+    anyhow::ensure!(safe(&gate.metadata()?), "unsafe recovery lock file");
     gate.try_lock().map_err(|error| {
         anyhow::anyhow!(
             "cannot acquire exclusive job recovery: {error}; another recovery may be active; retry the same wrapper"
         )
     })?;
     let held = gate.metadata()?;
-    let named = std::fs::symlink_metadata(&path)?;
+    let named_gate = File::from(rustix::fs::openat(
+        directory.as_fd(),
+        name.as_c_str(),
+        OFlags::RDONLY | flags,
+        Mode::empty(),
+    )?);
+    let named = named_gate.metadata()?;
+    let held_directory = directory.metadata()?;
+    let named_directory = std::fs::symlink_metadata(parent)?;
     anyhow::ensure!(
-        safe(&held) && safe(&named) && held.dev() == named.dev() && held.ino() == named.ino(),
+        safe(&held) && safe(&named) && held.dev() == named.dev() && held.ino() == named.ino()
+            && named_directory.is_dir()
+            && held_directory.dev() == named_directory.dev()
+            && held_directory.ino() == named_directory.ino(),
         "recovery lock path changed during acquisition"
     );
-    Ok(RecoveryOwnership { _gate: gate })
+    Ok(RecoveryOwnership {
+        _gate: gate,
+        directory,
+        parent: parent.to_owned(),
+        gate_name: name,
+        journal_name: std::ffi::CString::new(
+            lease_path.file_name().context("journal has no name")?.as_bytes(),
+        )?,
+    })
 }
 
 fn validate_same_owner(observed: &DurableJobLease, latest: &DurableJobLease) -> anyhow::Result<()> {
@@ -152,22 +293,23 @@ async fn owner_is_absent(lease: &DurableJobLease) -> anyhow::Result<bool> {
         .context("original wrapper inspection timed out; no recovery started")?
 }
 
-pub(super) async fn claim(writer: &DurableLeaseWriter) -> anyhow::Result<RecoveryOwnership> {
+pub(in crate::hook) async fn claim(writer: &DurableLeaseWriter) -> anyhow::Result<DurableLeaseWriter> {
     claim_with(writer, |lease| async move { owner_is_absent(&lease).await }).await
 }
 
 async fn claim_with<F, Fut>(
     writer: &DurableLeaseWriter,
     inspect: F,
-) -> anyhow::Result<RecoveryOwnership>
+) -> anyhow::Result<DurableLeaseWriter>
 where
     F: FnOnce(DurableJobLease) -> Fut,
     Fut: Future<Output = anyhow::Result<bool>>,
 {
     let observed = writer.snapshot();
+    anyhow::ensure!(writer.recovery_ownership.is_none(), "recovery writer is already owned");
     let ownership = acquire_gate(&writer.path)?;
     let read = || -> anyhow::Result<DurableJobLease> {
-        Ok(serde_json::from_slice(&std::fs::read(&writer.path)?)?)
+        ownership.read(&observed.identity.local_wrapper_id)
     };
     let latest = read()?;
     validate_same_owner(&observed, &latest)?;
@@ -187,7 +329,9 @@ where
         .lease
         .lock()
         .unwrap_or_else(|error| error.into_inner()) = latest;
-    Ok(ownership)
+    let mut bound = writer.clone();
+    bound.recovery_ownership = Some(Arc::new(ownership));
+    Ok(bound)
 }
 
 #[cfg(test)]
@@ -211,6 +355,7 @@ mod tests {
         let writer = DurableLeaseWriter {
             path: directory.path().join("lease.json"),
             lease: Arc::new(Mutex::new(lease)),
+            recovery_ownership: None,
         };
         writer.persist().unwrap();
         (directory, writer)
@@ -220,6 +365,7 @@ mod tests {
         DurableLeaseWriter {
             path: writer.path.clone(),
             lease: Arc::new(Mutex::new(writer.snapshot())),
+            recovery_ownership: None,
         }
     }
 
@@ -245,8 +391,8 @@ mod tests {
         let inode = std::fs::metadata(&lock_path).unwrap().ino();
         let (_other_directory, other) = fixture();
         let _other_guard = claim_with(&other, |_| async { Ok(true) }).await.unwrap();
-        writer.record_exit(102).unwrap();
-        writer.acknowledge_terminal().unwrap();
+        guard.record_exit(102).unwrap();
+        guard.acknowledge_terminal().unwrap();
         drop(guard);
         let _next = claim_with(&stale, |_| async {
             panic!("already acknowledged terminal state needs no owner probe")
@@ -274,6 +420,129 @@ mod tests {
         let _guard = claim_with(&stale, |_| async { Ok(true) }).await.unwrap();
         assert_eq!(stale.snapshot(), writer.snapshot());
         assert_eq!(std::fs::read(&writer.path).unwrap(), bytes);
+    }
+
+    fn retained_namespace_fixture() -> (PathBuf, DurableLeaseWriter) {
+        let root = tempfile::tempdir().unwrap().keep();
+        let directory = root.join("jobs");
+        std::fs::create_dir(&directory).unwrap();
+        let mut lease = DurableJobLease::new(
+            JobIdentity::new_local(), 12345, None, None, 0,
+            true, false, "namespace-fixture".into(),
+        );
+        lease.admit(42, "worker".into(), 1);
+        let writer = DurableLeaseWriter {
+            path: directory.join("lease.json"),
+            lease: Arc::new(Mutex::new(lease)),
+            recovery_ownership: None,
+        };
+        writer.persist().unwrap();
+        (root, writer)
+    }
+
+    #[tokio::test]
+    async fn replacement_during_owner_inspection_cannot_rebind_recovery() {
+        let (root, writer) = retained_namespace_fixture();
+        let original = writer.snapshot();
+        let bytes = std::fs::read(&writer.path).unwrap();
+        let result = claim_with(&writer, |_| async {
+            std::fs::rename(root.join("jobs"), root.join("original-jobs"))?;
+            std::fs::create_dir(root.join("jobs"))?;
+            // A copied, valid same-wrapper journal must not pass the namespace fence.
+            std::fs::write(&writer.path, &bytes)?;
+            Ok(true)
+        }).await;
+        assert!(result.is_err());
+        assert_eq!(writer.snapshot(), original);
+        assert_eq!(std::fs::read(&writer.path).unwrap(), bytes);
+        assert_eq!(std::fs::read(root.join("original-jobs/lease.json")).unwrap(), bytes);
+        assert!(root.join("original-jobs/lease.recovery.lock").is_file());
+    }
+
+    #[tokio::test]
+    async fn recovery_clones_retain_lock_and_never_write_replacement_namespace() {
+        let (root, writer) = retained_namespace_fixture();
+        let bound = claim_with(&writer, |_| async { Ok(true) }).await.unwrap();
+        let clone = bound.clone();
+        drop(bound);
+        assert!(acquire_gate(&writer.path).is_err());
+        clone.record_exit(102).unwrap();
+        clone.acknowledge_terminal().unwrap();
+        let wrapper = clone.wrapper_id();
+        let report = clone.terminal_job_report(&wrapper, "recovered", Some(102)).unwrap();
+        assert_eq!(report["exit_code"], 102);
+        assert_eq!(report["admission"]["remote_build_id"], "42");
+        let original = clone.snapshot();
+        let bytes = std::fs::read(&writer.path).unwrap();
+        // Preserve both namespaces and the persistent original gate, with no unlink.
+        std::fs::rename(root.join("jobs"), root.join("original-jobs")).unwrap();
+        std::fs::create_dir(root.join("jobs")).unwrap();
+        std::fs::write(&writer.path, &bytes).unwrap();
+        let before = std::fs::read_dir(root.join("jobs")).unwrap().count();
+        assert!(clone.record_exit(103).is_err());
+        assert!(clone.persist().is_err());
+        assert!(clone.terminal_job_report(&wrapper, "recovered", Some(102)).is_err());
+        assert!(clone.recovery_ownership.as_ref().unwrap().read(&wrapper).is_err());
+        assert_eq!(clone.snapshot(), original);
+        assert_eq!(std::fs::read(&writer.path).unwrap(), bytes);
+        assert_eq!(std::fs::read(root.join("original-jobs/lease.json")).unwrap(), bytes);
+        assert_eq!(std::fs::read_dir(root.join("jobs")).unwrap().count(), before);
+        // A new lock in the replacement directory does not own the original.
+        let replacement = acquire_gate(&writer.path).unwrap();
+        assert!(clone.persist().is_err());
+        drop(replacement);
+        drop(clone);
+        let _released = acquire_gate(&root.join("original-jobs/lease.json")).unwrap();
+    }
+
+    #[tokio::test]
+    async fn replaced_gate_refuses_without_changing_lease_or_journal() {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let (root, writer) = retained_namespace_fixture();
+        let bound = claim_with(&writer, |_| async { Ok(true) }).await.unwrap();
+        let original = bound.snapshot();
+        let bytes = std::fs::read(&writer.path).unwrap();
+        let gate_path = writer.path.with_extension("recovery.lock");
+        let original_gate = root.join("jobs/original-recovery.lock");
+        std::fs::rename(&gate_path, &original_gate).unwrap();
+        let replacement = std::fs::OpenOptions::new().write(true).create_new(true)
+            .mode(0o600).open(&gate_path).unwrap();
+        assert!(bound.record_exit(103).is_err());
+        assert!(bound.persist().is_err());
+        assert_eq!(bound.snapshot(), original);
+        assert_eq!(std::fs::read(&writer.path).unwrap(), bytes);
+        assert_eq!(std::fs::metadata(&original_gate).unwrap().ino(),
+                   bound.recovery_ownership.as_ref().unwrap()._gate.metadata().unwrap().ino());
+        assert_eq!(replacement.metadata().unwrap().len(), 0);
+        // Both real lock files and the journal remain retained; no replacement
+        // gate can grant this bound writer authority over a new journal epoch.
+    }
+
+    #[tokio::test]
+    async fn substituted_publication_leaf_does_not_replace_the_journal() {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let (root, writer) = retained_namespace_fixture();
+        let bound = claim_with(&writer, |_| async { Ok(true) }).await.unwrap();
+        let ownership = bound.recovery_ownership.as_ref().unwrap();
+        let bytes = std::fs::read(&writer.path).unwrap();
+        let temporary_path = root.join("jobs/.publication-fixture.tmp");
+        let mut held = std::fs::OpenOptions::new().write(true).create_new(true)
+            .mode(0o600).open(&temporary_path).unwrap();
+        held.write_all(b"intended lease bytes").unwrap();
+        held.sync_all().unwrap();
+        std::fs::rename(&temporary_path, root.join("jobs/original-publication.tmp")).unwrap();
+        std::fs::write(&temporary_path, b"substituted bytes").unwrap();
+        let error = ownership.publish_temporary(&held, c".publication-fixture.tmp").unwrap_err();
+        assert!(format!("{error:#}").contains("publication file changed"));
+        assert_eq!(std::fs::read(&writer.path).unwrap(), bytes);
+        assert_eq!(std::fs::read(&temporary_path).unwrap(), b"substituted bytes");
+        assert_eq!(std::fs::read(root.join("jobs/original-publication.tmp")).unwrap(),
+                   b"intended lease bytes");
+        // The real publication helper is exercised against real replaced files;
+        // no synthetic compiler/daemon success, no temporary-file deletion.
     }
 
     #[tokio::test]
@@ -350,6 +619,43 @@ mod tests {
         assert!(claim_with(&writer, |_| async { Ok(true) }).await.is_err());
         assert_eq!(std::fs::read_link(&path).unwrap(), sentinel);
         assert_eq!(std::fs::read(&sentinel).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn recovery_owner_refuses_fifo_journal_before_owner_inspection() {
+        use rustix::fs::{Mode, OFlags};
+        use std::os::fd::AsFd;
+        use std::os::unix::fs::FileTypeExt;
+
+        let retained = tempfile::tempdir().unwrap().keep();
+        let directory = rustix::fs::open(&retained, OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty()).unwrap();
+        rustix::fs::mkfifoat(directory.as_fd(), c"lease.json", Mode::RUSR | Mode::WUSR).unwrap();
+        let writer = DurableLeaseWriter {
+            path: retained.join("lease.json"),
+            recovery_ownership: None,
+            lease: Arc::new(Mutex::new(DurableJobLease::new(
+                JobIdentity::new_local(), std::process::id(), None, None, 0,
+                true, false, "filesystem-fixture".into(),
+            ))),
+        };
+        let original = writer.snapshot();
+        let other = writer.clone();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            let result = runtime.block_on(claim_with(&other, |_| async {
+                panic!("invalid FIFO must be refused before any owner or worker probe")
+            })).map(|_| ());
+            sender.send(result).unwrap();
+        });
+        let error = receiver.recv_timeout(Duration::from_secs(2))
+            .expect("recovery-owner reload waited for a FIFO writer").unwrap_err();
+        reader.join().unwrap();
+        assert!(format!("{error:#}").contains("journal is not a regular file"));
+        assert_eq!(writer.snapshot(), original);
+        assert!(std::fs::symlink_metadata(&writer.path).unwrap().file_type().is_fifo());
+        // Retained real FIFO/lock I/O only, no successful owner takeover,
+        // daemon reservation, compiler replay or native/SDK qualification.
     }
 
     #[test]

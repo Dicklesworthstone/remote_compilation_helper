@@ -1525,6 +1525,8 @@ fn now_unix_ms() -> u64 {
 pub(crate) struct DurableLeaseWriter {
     path: PathBuf,
     lease: Arc<Mutex<DurableJobLease>>,
+    #[cfg(unix)]
+    recovery_ownership: Option<Arc<transfer_orchestration::recovery::recovery_owner::RecoveryOwnership>>,
 }
 
 struct RetrySelectionIntent {
@@ -1556,15 +1558,37 @@ impl DurableLeaseWriter {
             "invalid wrapper identity"
         );
         let path = absolute_lease_path(durable_lease_path(wrapper_id))?;
-        let lease: DurableJobLease = serde_json::from_slice(&std::fs::read(&path)?)?;
+        let lease = Self::read_journal(&path, wrapper_id)?;
+        Ok(Self {
+            path,
+            lease: Arc::new(Mutex::new(lease)),
+            #[cfg(unix)]
+            recovery_ownership: None,
+        })
+    }
+
+    fn read_journal(path: &Path, wrapper_id: &str) -> anyhow::Result<DurableJobLease> {
+        #[cfg(unix)]
+        let bytes = crate::state::primitives::read_regular_file(path)?;
+        // Detached job recovery is Unix-only; retain the existing non-Unix
+        // reader without claiming descriptor/nofollow parity on that platform.
+        #[cfg(not(unix))]
+        let bytes = std::fs::read(path)?;
+        Self::decode_journal(&bytes, wrapper_id)
+    }
+
+    fn decode_journal(bytes: &[u8], wrapper_id: &str) -> anyhow::Result<DurableJobLease> {
+        let lease: DurableJobLease = serde_json::from_slice(bytes)?;
         anyhow::ensure!(
             lease.schema_version == 1 && lease.identity.local_wrapper_id == wrapper_id,
             "durable lease identity or schema mismatch"
         );
-        Ok(Self {
-            path,
-            lease: Arc::new(Mutex::new(lease)),
-        })
+        Ok(lease)
+    }
+
+    #[cfg(unix)]
+    pub(crate) async fn claim_recovery(&self) -> anyhow::Result<Self> {
+        transfer_orchestration::recovery::recovery_owner::claim(self).await
     }
 
     pub(crate) fn snapshot(&self) -> DurableJobLease {
@@ -1581,9 +1605,19 @@ impl DurableLeaseWriter {
         // potentially large recovery recipe. Transitions publish before the
         // mutex-protected state advances, including terminal acknowledgement.
         let lease = self.lease.lock().unwrap_or_else(|p| p.into_inner());
+        self.admission_reference_from_lease(&lease, wrapper_id, build_id, worker_id)
+    }
+
+    fn admission_reference_from_lease(
+        &self,
+        lease: &DurableJobLease,
+        wrapper_id: &str,
+        build_id: u64,
+        worker_id: &WorkerId,
+    ) -> anyhow::Result<ExecAdmissionReference> {
         anyhow::ensure!(
             lease.schema_version == 1
-                && !selection_is_pending(&lease)
+                && !selection_is_pending(lease)
                 && build_id > 0
                 && build_id < (1_u64 << 63)
                 && !worker_id.as_str().trim().is_empty()
@@ -1607,6 +1641,57 @@ impl DurableLeaseWriter {
             strict_remote: lease.strict_remote,
             caller_command_fingerprint: lease.command_fingerprint.clone(),
         })
+    }
+
+    /// Report one committed terminal observation, including its actual current
+    /// admission reference. Never mix a pre-recovery identity with later exit
+    /// or acknowledgement fields, and never clone the large recovery recipe.
+    pub(crate) fn terminal_job_report(
+        &self,
+        wrapper_id: &str,
+        status: &str,
+        expected_exit: Option<i32>,
+    ) -> anyhow::Result<serde_json::Value> {
+        #[cfg(unix)]
+        if let Some(ownership) = &self.recovery_ownership {
+            ownership.verify()?;
+        }
+        let lease = self.lease.lock().unwrap_or_else(|p| p.into_inner());
+        anyhow::ensure!(
+            matches!(status, "completed" | "recovered")
+                && lease.schema_version == 1
+                && lease.identity.local_wrapper_id == wrapper_id
+                && lease.terminal_acknowledged
+                && !selection_is_pending(&lease),
+            "job report requires the exact acknowledged terminal journal"
+        );
+        let exit = lease.exit_code.context("terminal job has no observed exit code")?;
+        anyhow::ensure!(
+            expected_exit.is_none_or(|expected| expected == exit),
+            "job recovery exit differs from its committed terminal journal"
+        );
+        let admission = match (lease.identity.remote_build_id, lease.worker_id.as_deref()) {
+            (Some(build), Some(worker)) => Some(self.admission_reference_from_lease(
+                &lease,
+                wrapper_id,
+                build,
+                &WorkerId::new(worker),
+            )?),
+            (None, None) => None,
+            _ => anyhow::bail!("terminal job has an incomplete admission identity"),
+        };
+        let report = serde_json::json!({
+            "status": status,
+            "identity": lease.identity.clone(),
+            "exit_code": exit,
+            "terminal_acknowledged": true,
+            "admission": admission,
+        });
+        #[cfg(unix)]
+        if let Some(ownership) = &self.recovery_ownership {
+            ownership.verify()?;
+        }
+        Ok(report)
     }
 
     fn machine_admission_reference(
@@ -1675,6 +1760,8 @@ impl DurableLeaseWriter {
         let writer = Self {
             path,
             lease: Arc::new(Mutex::new(lease)),
+            #[cfg(unix)]
+            recovery_ownership: None,
         };
         writer.persist()?;
         Ok(writer)
@@ -1884,7 +1971,14 @@ impl DurableLeaseWriter {
         lease: &mut DurableJobLease,
         next: DurableJobLease,
     ) -> anyhow::Result<()> {
-        atomic_write(&self.path, &serde_json::to_vec_pretty(&next)?)?;
+        let bytes = serde_json::to_vec_pretty(&next)?;
+        #[cfg(unix)]
+        if let Some(ownership) = &self.recovery_ownership {
+            ownership.publish(&bytes)?;
+            *lease = next;
+            return Ok(());
+        }
+        atomic_write(&self.path, &bytes)?;
         let parent = self
             .path
             .parent()
@@ -1898,6 +1992,10 @@ impl DurableLeaseWriter {
     }
 
     fn persist(&self) -> anyhow::Result<()> {
+        #[cfg(unix)]
+        if let Some(ownership) = &self.recovery_ownership {
+            return self.persist_snapshot(|_, bytes| ownership.publish(bytes));
+        }
         self.persist_snapshot(atomic_write)
     }
 
