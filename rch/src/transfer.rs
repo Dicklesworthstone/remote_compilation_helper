@@ -10487,7 +10487,11 @@ Number of files transferred: 42
                 .args(["-c", &command])
                 .output()
                 .unwrap();
-            assert_eq!(output.status.code(), Some(73), "{destination:?}: {output:?}");
+            assert_eq!(
+                output.status.code(),
+                Some(73),
+                "{destination:?}: {output:?}"
+            );
             let diagnostics = String::from_utf8_lossy(&output.stderr);
             assert!(diagnostics.contains("RCH_SYNC_LIVE_CHECKOUT_REFUSED"));
             assert!(diagnostics.contains(reason), "{destination:?}: {output:?}");
