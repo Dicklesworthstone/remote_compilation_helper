@@ -2691,6 +2691,14 @@ impl TransferPipeline {
         // Once the workload has finished, followers that make no progress
         // for `stall_secs` are killed. Any live reader drains 1 MiB well
         // within that window.
+        //
+        // Wait for the supervisor we spawned, not for the receipt it intends
+        // to publish (bd-t5c8p). A killed supervisor or failed receipt write
+        // cannot create that file later. Polling for it kept this shell and
+        // both followers alive forever, so recovery could never acquire the
+        // activity lock to prove the execution lost. Reap the followers on
+        // that failure too; surviving workload descendants still inherit the
+        // lock and continue to fence recovery until they actually exit.
         format!(
             "set -e; rch_umask=$(umask); umask 077; mkdir -p -- {directory}; mkdir {claim}; : > {out}; : > {err}; : > {out_progress}; : > {err_progress}; umask \"$rch_umask\"; \
              nohup sh -c {supervisor} </dev/null >{out} 2>{err} & \
@@ -2702,9 +2710,9 @@ impl TransferPipeline {
                o=$((o + n)); echo \"$o\" > \"$2\"; continue; fi; \
                [ -n \"$d\" ] && {{ echo done > \"$2\"; return 0; }}; sleep 0.2 2>/dev/null || sleep 1; done; }}; \
              rch_follow {out} {out_progress} & a=$!; rch_follow {err} {err_progress} >&2 & b=$!; \
-             trap 'kill \"$a\" \"$b\" 2>/dev/null || :' EXIT; \
-             while [ ! -f {done} ]; do sleep 1; done; \
+             trap 'kill \"$a\" \"$b\" 2>/dev/null || :; wait \"$a\" 2>/dev/null || :; wait \"$b\" 2>/dev/null || :' EXIT; \
              wait \"$p\" || :; \
+             [ -f {done} ] || {{ printf '%s\\n' 'RCH: remote execution ended without a durable completion receipt' >&2; exit 1; }}; \
              last=; still=0; \
              while [ \"$(cat {out_progress} {err_progress})\" != \"$(printf 'done\\ndone')\" ]; do \
                now=$(cat {out_progress} {err_progress}); \
@@ -8599,6 +8607,141 @@ mod tests {
             .status()
             .unwrap();
         assert!(free.success(), "a leftover follower still holds the lock");
+    }
+
+    /// A successful workload is not a completed job until its receipt is
+    /// durable. Publication failure must stop the stream followers, preserve
+    /// the logs and start claim, and leave recovery able to prove it is lost.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn durable_execution_reaps_followers_if_receipt_cannot_be_published() {
+        let directory = tempfile::tempdir().unwrap();
+        let receipt = directory.path().join("recovery-9-id");
+        let receipt = receipt.to_str().unwrap();
+        let lock = directory.path().join("activity.lock");
+        let invocations = directory.path().join("invocations");
+        // An actual filesystem error at the publication boundary, after the
+        // workload ran; no completion is injected by the test.
+        std::fs::create_dir(format!("{receipt}.pending")).unwrap();
+        let pipeline = TransferPipeline::new(
+            PathBuf::from("/home/user/project"),
+            "myproject".to_string(),
+            "abc123".to_string(),
+            TransferConfig::default(),
+        )
+        .with_recovery_completion(receipt.to_owned(), "id".to_string());
+        let command = pipeline.durable_execution_command(format!(
+            "printf 'once\\n' >> {}; printf 'compiled\\n'; printf 'diagnostic\\n' >&2",
+            escape(Cow::from(invocations.to_str().unwrap()))
+        ));
+        let run = || {
+            // Bound the fixture's entire process group if the receipt loop
+            // regresses, so a failing test cannot leave idle followers behind.
+            std::process::Command::new("timeout")
+                .args(["--kill-after=2s", "10s", "flock", "-x"])
+                .arg(&lock)
+                .args(["sh", "-c", &command])
+                .output()
+                .unwrap()
+        };
+        let output = run();
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("remote execution ended without a durable completion receipt"),
+            "{output:?}"
+        );
+        assert!(!Path::new(receipt).exists());
+        assert_eq!(
+            std::fs::read_to_string(format!("{receipt}.stdout")).unwrap(),
+            "compiled\n"
+        );
+        assert!(
+            std::fs::read_to_string(format!("{receipt}.stderr"))
+                .unwrap()
+                .contains("diagnostic\n")
+        );
+        assert!(Path::new(&format!("{receipt}.started")).is_dir());
+        assert!(
+            std::process::Command::new("flock")
+                .args(["-n", "-x"])
+                .arg(&lock)
+                .arg("true")
+                .status()
+                .unwrap()
+                .success(),
+            "failed publication left an activity holder alive"
+        );
+        // Reconnecting cannot launch the same command a second time just
+        // because no receipt was published.
+        assert!(!run().status.success());
+        assert_eq!(std::fs::read_to_string(invocations).unwrap(), "once\n");
+    }
+
+    /// Receipt publication may fail while a background workload descendant
+    /// remains alive. Only that descendant's exit can make recovery safe.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn durable_execution_missing_receipt_preserves_descendant_fencing() {
+        let directory = tempfile::tempdir().unwrap();
+        let receipt = directory.path().join("recovery-9-id");
+        let receipt = receipt.to_str().unwrap();
+        let lock = directory.path().join("activity.lock");
+        let release = directory.path().join("release-workload");
+        let finished = directory.path().join("workload-finished");
+        std::fs::create_dir(format!("{receipt}.pending")).unwrap();
+        let pipeline = TransferPipeline::new(
+            PathBuf::from("/home/user/project"),
+            "myproject".to_string(),
+            "abc123".to_string(),
+            TransferConfig::default(),
+        )
+        .with_recovery_completion(receipt.to_owned(), "id".to_string());
+        // The supervisor exits naturally on the real receipt-write error.
+        // No test guesses or signals a parent process.
+        let descendant = format!(
+            "i=0; while [ ! -f {} ] && [ \"$i\" -lt 300 ]; do \
+             sleep 0.1; i=$((i + 1)); done; printf 'finished\\n' > {}",
+            escape(Cow::from(release.to_str().unwrap())),
+            escape(Cow::from(finished.to_str().unwrap()))
+        );
+        let command = pipeline.durable_execution_command(format!(
+            "sh -c {} </dev/null >/dev/null 2>&1 &",
+            escape(Cow::from(descendant))
+        ));
+        let output = std::process::Command::new("timeout")
+            .args(["--kill-after=2s", "10s", "flock", "-x"])
+            .arg(&lock)
+            .args(["sh", "-c", &command])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        assert!(!Path::new(receipt).exists());
+        assert!(!finished.exists(), "workload ended before fencing was tested");
+        let lock_is_free = || {
+            std::process::Command::new("flock")
+                .args(["-n", "-x"])
+                .arg(&lock)
+                .arg("true")
+                .status()
+                .unwrap()
+                .success()
+        };
+        assert!(
+            !lock_is_free(),
+            "receipt failure released a surviving workload's activity lock"
+        );
+        std::fs::write(release, b"release\n").unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !lock_is_free() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "idle followers retained the activity lock after the workload exited"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(std::fs::read_to_string(finished).unwrap(), "finished\n");
+        assert!(!Path::new(receipt).exists());
     }
 
     #[test]
