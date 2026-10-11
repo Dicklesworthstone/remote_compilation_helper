@@ -6,7 +6,10 @@ retain-all admission. Requires a real Snowflake source/build identity, the
 canonical PATH Cargo shim, a qualified RCH binary, a real b3sum, and an admitted
 RCH_TARGET_BASE. Builds are serial, request one normal worker slot, and retain
 every target tree and output. No direct SSH, local compiler, cleanup or mock.
-This checks the named-output route and completed same-id stdout recovery;
+Also requires a real multi-repository closure source/package for the explicit
+source-content receipt case; a single-root input fails that gate.
+This checks that isolated mode's actual build/receipt and verbose routing,
+the named-output route and completed same-id stdout recovery;
 full installer, wrapper-loss/pending recovery, Windows and
 same-invocation live-incumbent/A/A performance acceptance remain separate.
 """
@@ -15,7 +18,7 @@ import argparse
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import shutil
 import subprocess
 import sys
@@ -37,9 +40,9 @@ def sha256(path):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    for name in ("source", "evidence-root", "rch", "b3sum"):
+    for name in ("source", "closure-source", "evidence-root", "rch", "b3sum"):
         parser.add_argument("--" + name, required=True, type=Path)
-    for name in ("worker", "version", "git-sha", "source-digest", "target"):
+    for name in ("worker", "version", "git-sha", "source-digest", "target", "closure-package"):
         parser.add_argument("--" + name, required=True)
     args = parser.parse_args()
     require(os.name != "nt", "This acceptance route requires a native POSIX caller")
@@ -54,6 +57,13 @@ def main():
     if sys.platform == "darwin":
         require(str(target_base).startswith("/Volumes/USB_NVME/"), "Mac target isolation must use the external NVMe")
     source = args.source.resolve(strict=True)
+    closure_source = args.closure_source.resolve(strict=True)
+    require(closure_source.is_dir() and (closure_source / "Cargo.toml").is_file()
+            and (closure_source / "Cargo.lock").is_file(),
+            "A real locked multi-repository closure project is required")
+    require(args.closure_package and all(c.isascii() and (c.isalnum() or c in "-_")
+                                        for c in args.closure_package),
+            "The real closure package must be a literal Cargo package name")
     manifest = source / "crates/franken-snowflake-cli/Cargo.toml"
     require(manifest.is_file() and (source / "Cargo.lock").is_file(), "The real locked CLI source is required")
     require(len(args.source_digest) == 64 and all(c in "0123456789abcdef" for c in args.source_digest)
@@ -92,22 +102,32 @@ def main():
                "--bin", names[0], "--bin", names[1], "--message-format=json,json-render-diagnostics"]
     outcomes = []
 
-    def run(name, argv, environment, timeout_seconds=1800):
+    def run(name, argv, environment, timeout_seconds=1800, working_directory=None):
         case = evidence / name
         case.mkdir()
         (case / "argv.json").write_text(json.dumps(argv) + "\n")
-        try:
-            result = subprocess.run(argv, cwd=source, env=environment,
-                                    capture_output=True, timeout=timeout_seconds)
-        except subprocess.TimeoutExpired as error:
-            (case / "stdout.bin").write_bytes(error.stdout or b"")
-            (case / "stderr.bin").write_bytes(error.stderr or b"")
-            (case / "termination.json").write_text(json.dumps({"state": "timeout", "timeout_seconds": timeout_seconds}) + "\n")
-            sys.stderr.buffer.write(error.stderr or b"")
-            sys.stderr.buffer.flush()
-            raise
-        (case / "stdout.bin").write_bytes(result.stdout)
-        (case / "stderr.bin").write_bytes(result.stderr)
+        case_cwd = source if working_directory is None else working_directory
+        (case / "cwd.txt").write_text(str(case_cwd) + "\n")
+        stdout_path = case / "stdout.bin"
+        stderr_path = case / "stderr.bin"
+        # subprocess.run kills its child on timeout. An observation deadline
+        # must not kill an RCH wrapper or close its output pipes while remote
+        # ownership may still be active. Child-owned regular-file descriptors
+        # continue retaining output if the harness exits at its original cap.
+        with stdout_path.open("xb") as stdout_file, stderr_path.open("xb") as stderr_file:
+            child = subprocess.Popen(argv, cwd=case_cwd, env=environment,
+                                     stdout=stdout_file, stderr=stderr_file)
+            try:
+                code = child.wait(timeout=timeout_seconds)
+            except subprocess.TimeoutExpired:
+                (case / "termination.json").write_text(json.dumps({
+                    "state": "timeout", "timeout_seconds": timeout_seconds,
+                    "child_pid": child.pid, "child_stopped": False,
+                    "output_complete": False}) + "\n")
+                sys.stderr.buffer.write(stderr_path.read_bytes())
+                sys.stderr.buffer.flush()
+                raise
+        result = subprocess.CompletedProcess(argv, code, stdout_path.read_bytes(), stderr_path.read_bytes())
         (case / "returncode.txt").write_text(str(result.returncode) + "\n")
         # Diagnostics are retained in full, including successful builds.
         sys.stderr.buffer.write(result.stderr)
@@ -126,6 +146,491 @@ def main():
                                     stderr=writer if diagnostics is None else diagnostics)
         finally:
             os.close(writer)
+
+    # Exercise the explicit isolated-source mode through the actual CLI/worker.
+    # It has its own machine envelope, so the Cargo-stdout opt-in stays absent.
+    # This is not the ordinary closure route, a Windows positive, or proof that
+    # every canonical checkout byte/metadata stayed unchanged; those need their
+    # original independent before/after and runtime qualification.
+    closure_target = target_base / ("source-content closure " + token)
+    closure_target.mkdir()
+    closure_env = dict(env)
+    closure_env.pop("RCH_CARGO_JSON_STDOUT", None)
+    closure_env.pop("RCH_JSON", None)
+    closure_env.pop("RCH_OUTPUT_FORMAT", None)
+    closure_env.pop("RCH_QUIET", None)
+    closure_env["RCH_VISIBILITY"] = "verbose"
+    closure_env["RCH_VERBOSE"] = "1"
+    closure_env["RCH_DISABLE_CONFIG_CACHE"] = "1"
+    closure_env["RCH_NO_UPDATE_CHECK"] = "1"
+    closure_env["RCH_LOG_FILE"] = str(evidence / "source-content-closure.log")
+    closure_env["CARGO_TARGET_DIR"] = str(closure_target)
+    closure_command = ["cargo", "check", "--locked", "-j1", "-p", args.closure_package]
+    closure_manifests = {str(path): sha256(path) for path in
+                         (closure_source / "Cargo.toml", closure_source / "Cargo.lock")}
+    isolated, _ = run("source-content-isolated-closure",
+                      [str(args.rch), "--json", "--format", "json", "exec",
+                       "--source-content-receipt", "--"] + closure_command,
+                      closure_env, working_directory=closure_source)
+    envelope = json.loads(isolated.stdout)
+    require(isolated.returncode == 0 and envelope.get("api_version") == "1.0"
+            and envelope.get("command") == " ".join(closure_command)
+            and envelope.get("outcome") == "completed" and envelope.get("location") == "remote"
+            and envelope.get("worker_id") == args.worker and envelope.get("remote_exit_code") == 0
+            and envelope.get("error_code") is None,
+            "The actual isolated closure did not finish on its admitted worker")
+    receipt_prefix = b"[RCH] source content receipt: "
+    receipts = [json.loads(line[len(receipt_prefix):]) for line in isolated.stderr.splitlines()
+                if line.startswith(receipt_prefix)]
+    require(len(receipts) == 1, "The actual isolated closure must emit exactly one source receipt")
+    receipt = receipts[0]
+    roots = receipt.get("roots", [])
+    build_id = receipt.get("build_id", "")
+    require(receipt.get("schema") == "rch.source_content_receipt.v1"
+            and receipt.get("worker_id") == args.worker and isinstance(build_id, str)
+            and build_id.isascii() and build_id.isdecimal() and int(build_id) > 0
+            and receipt.get("command_sha256") == hashlib.sha256(" ".join(closure_command).encode()).hexdigest()
+            and receipt.get("command_exit_code") == 0
+            and receipt.get("root_count") == len(roots) and len(roots) >= 2
+            and sum(root.get("is_primary") is True for root in roots) == 1,
+            "The actual source receipt lost worker/command/closure identity")
+    primary_root = next(root for root in roots if root.get("is_primary") is True)
+    primary_manifests = [file for file in primary_root.get("files", [])
+                         if file.get("path") == "Cargo.toml"]
+    require(Path(primary_root.get("local_root", "")).resolve(strict=True) == closure_source
+            and len(primary_manifests) == 1
+            and primary_manifests[0].get("sha256") == closure_manifests[str(closure_source / "Cargo.toml")],
+            "The actual source receipt was not bound to the selected caller manifest")
+    require(all(root.get("schema") == "rch.source_content_root.v1"
+                and any(part.startswith("source-content-" + build_id + "-")
+                        for part in Path(root.get("remote_root", "")).parts)
+                and root.get("filter_policy", {}).get("checksum_transfer") is True
+                and root.get("file_count") == len(root.get("files", []))
+                and root.get("file_count", 0) > 0 for root in roots),
+            "The actual closure did not bind every selected root to isolated checked sources")
+    staging_bases = set()
+    for root in roots:
+        remote = PurePosixPath(root["remote_root"])
+        require(remote.is_absolute(), "The isolated source receipt must name absolute worker roots")
+        container = next(index for index, part in enumerate(remote.parts)
+                         if part.startswith("source-content-" + build_id + "-"))
+        staging_bases.add(str(PurePosixPath(*remote.parts[:container])))
+    require(len(staging_bases) == 1, "The isolated closure must use one admitted staging topology")
+    staging_base = next(iter(staging_bases))
+    topology_line = ("[RCH] topology preflight ok on " + args.worker + " ("
+                     + staging_base + " -> " + staging_base + " enforced)").encode()
+    require(isolated.stderr.splitlines().count(topology_line) == 1,
+            "The actual isolated build did not preflight its receipt-bound staging topology")
+    root_fields = ["schema", "ordinal", "project_id", "local_root", "remote_root", "root_hash",
+                   "is_primary", "mode", "filter_policy", "file_count", "byte_count", "files"]
+    for root in roots:
+        preimage = {key: root[key] for key in root_fields}
+        encoded = json.dumps(preimage, ensure_ascii=False, separators=(",", ":")).encode()
+        require(root.get("content_root") == hashlib.sha256(encoded).hexdigest(),
+                "The actual isolated source manifest lost its content-root binding")
+    receipt_fields = ["schema", "worker_id", "build_id", "command_sha256", "command_exit_code",
+                      "root_count", "roots"]
+    preimage = {key: receipt[key] for key in receipt_fields}
+    encoded = json.dumps(preimage, ensure_ascii=False, separators=(",", ":")).encode()
+    require(receipt.get("receipt_root") == hashlib.sha256(encoded).hexdigest(),
+            "The actual isolated source receipt lost its root-set binding")
+    require(b"[RCH] canonical checkout convergence skipped for isolated source" in isolated.stderr
+            and b"[RCH] repo_updater" not in isolated.stderr
+            and b"[RCH] local" not in isolated.stderr,
+            "The explicit isolated build entered canonical convergence or local fallback")
+    require(all(sha256(Path(path)) == digest for path, digest in closure_manifests.items()),
+            "The explicit isolated build changed its retained caller manifests")
+
+    # Exercise general structured output with private user configuration and an
+    # explicit socket setting; normal project/system layers may still be read.
+    # Background update warming is outside these cases; its existing opt-out
+    # prevents an unrelated network/cache side effect, not a release qualification.
+    config_state = evidence / "config-output-state"
+    config_state.mkdir()
+    config_runtime = evidence / "configuration runtime's α \"quoted\""
+    config_runtime.mkdir()
+    config_path = config_state / "config.toml"
+    config_bytes = b"[general]\nenabled = true\n"
+    with config_path.open("xb") as config_file:
+        config_file.write(config_bytes)
+    config_socket = str(config_state / "unused.sock")
+    config_env = dict(env)
+    config_env.update({"RCH_CONFIG_DIR": str(config_state),
+                       "RCH_SOCKET_PATH": config_socket,
+                       "XDG_RUNTIME_DIR": str(config_runtime),
+                       "RCH_DISABLE_CONFIG_CACHE": "1",
+                       "RCH_NO_UPDATE_CHECK": "1",
+                       "RCH_LOG_FILE": str(evidence / "config-output.log")})
+    config_env.pop("RCH_DAEMON_SOCKET", None)
+    config_env.pop("RCH_JSON", None)
+    config_env.pop("RCH_OUTPUT_FORMAT", None)
+    for action, arguments in [
+        ("get", ["config", "get", "general.socket_path"]),
+        ("show", ["config", "show"]),
+        ("export", ["config", "export", "--format", "json"]),
+    ]:
+        argv = [str(args.rch), "--json", "--format", "json"] + arguments
+        positive, _ = run("config-output-" + action, argv, config_env, timeout_seconds=30)
+        document = json.loads(positive.stdout)
+        require(positive.returncode == 0 and document.get("success") is True
+                and document.get("command") == "config " + action
+                and document.get("api_version") == "1.0" and document.get("error") is None,
+                "Actual configuration CLI did not deliver its exact successful envelope")
+        if action == "get":
+            require(document.get("data") == {"key": "general.socket_path", "value": config_socket},
+                    "Configuration get was not bound to the isolated socket setting")
+        else:
+            require(document.get("data", {}).get("general", {}).get("socket_path") == config_socket,
+                    "Configuration output did not preserve the isolated socket setting")
+        for collect_stderr in (True, False):
+            name = "config-closed-output-" + action + ("" if collect_stderr else "-both")
+            case = evidence / name
+            case.mkdir()
+            (case / "argv.json").write_text(json.dumps(argv) + "\n")
+            if collect_stderr:
+                with (case / "stderr.bin").open("xb") as diagnostics:
+                    child = spawn_with_closed_stdout(argv, config_env, diagnostics)
+            else:
+                child = spawn_with_closed_stdout(argv, config_env, None)
+            try:
+                code = child.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                (case / "termination.json").write_text(json.dumps({
+                    "state": "timeout", "timeout_seconds": 30, "child_pid": child.pid,
+                    "child_stopped": False}) + "\n")
+                raise
+            (case / "returncode.txt").write_text(str(code) + "\n")
+            outcomes.append({"case": name, "returncode": code})
+            require(code == 1, "Configuration CLI swallowed a failed structured delivery")
+            if collect_stderr:
+                diagnostics = (case / "stderr.bin").read_bytes()
+                sys.stderr.buffer.write(diagnostics)
+                sys.stderr.buffer.flush()
+                require(b"structured output could not be delivered" in diagnostics
+                        and b"broken pipe" in diagnostics.lower() and b"panicked" not in diagnostics,
+                        "Configuration output failure lost its cause or panicked")
+            # With both streams closed, only the exit status is observable.
+            require(config_path.read_bytes() == config_bytes
+                    and list(config_state.iterdir()) == [config_path],
+                    "Read-only configuration output changed its private input namespace")
+
+    # Initialization writes only inside each retained private user config root.
+    # Repeat it to prove that existing files are reported and never replaced.
+    for mode, flags in [("simple", []), ("wizard-defaults", ["--wizard", "--non-interactive"])]:
+        init_state = evidence / ("config-init-state-" + mode)
+        init_state.mkdir()
+        init_env = dict(config_env)
+        init_env["RCH_CONFIG_DIR"] = str(init_state)
+        init_env["RCH_SOCKET_PATH"] = str(init_state / "unused.sock")
+        # A real nested Git root bounds project-config discovery even when the
+        # admitted evidence directory is inside another checkout. Disable
+        # template copying and inherited Git path redirects for this fixture.
+        git_env = {key: value for key, value in init_env.items() if not key.startswith("GIT_")}
+        git, _ = run("config-init-" + mode + "-private-git-root",
+                     ["git", "init", "--quiet", "--initial-branch=main", "--template=", str(init_state)],
+                     git_env, timeout_seconds=30, working_directory=init_state)
+        require(git.returncode == 0 and (init_state / ".git").is_dir(),
+                "The real private configuration discovery boundary could not be established")
+        argv = [str(args.rch), "--json", "--format", "json", "config", "init"] + flags
+        files = [init_state / "config.toml", init_state / "workers.toml"]
+        namespace = files + [init_state / ".git"]
+        expected_paths = [str(path) for path in files]
+        persisted_env = dict(init_env)
+        persisted_env.pop("RCH_SOCKET_PATH", None)
+        persisted_env.pop("RCH_DAEMON_SOCKET", None)
+        getter = [str(args.rch), "--json", "--format", "json", "config", "get", "general.socket_path"]
+        expected_socket_data = {"key": "general.socket_path", "value": str(config_runtime / "rch.sock")}
+        # The empty user root binds the real caller default. Use a private cwd
+        # so project config cannot mask the setting persisted by initialization.
+        default, _ = run("config-init-" + mode + "-caller-default", getter, persisted_env,
+                         timeout_seconds=30, working_directory=init_state)
+        default_document = json.loads(default.stdout)
+        require(default.returncode == 0 and default_document.get("success") is True
+                and default_document.get("api_version") == "1.0"
+                and default_document.get("command") == "config get"
+                and default_document.get("error") is None
+                and default_document.get("data") == expected_socket_data,
+                "Actual caller default did not honor the retained private runtime directory")
+        initial_bytes = None
+        for existing in (False, True):
+            result, _ = run("config-init-" + mode + ("-existing" if existing else "-fresh"),
+                            argv, init_env, timeout_seconds=30)
+            document = json.loads(result.stdout)
+            require(result.returncode == 0 and document.get("success") is True
+                    and document.get("command") == "config init"
+                    and document.get("data") == {
+                        "created": [] if existing else expected_paths,
+                        "already_existed": expected_paths if existing else []},
+                    "Actual initialization did not distinguish created and retained files")
+            actual_bytes = [path.read_bytes() for path in files]
+            require(all(actual_bytes) and sorted(init_state.iterdir()) == sorted(namespace),
+                    "Initialization changed its retained configuration/Git namespace")
+            if existing:
+                require(actual_bytes == initial_bytes, "Repeated initialization replaced existing bytes")
+            else:
+                initial_bytes = actual_bytes
+            persisted, _ = run("config-init-" + mode + ("-existing-socket" if existing else "-fresh-socket"),
+                               getter, persisted_env, timeout_seconds=30, working_directory=init_state)
+            persisted_document = json.loads(persisted.stdout)
+            require(persisted.returncode == 0 and persisted_document.get("success") is True
+                    and persisted_document.get("api_version") == "1.0"
+                    and persisted_document.get("command") == "config get"
+                    and persisted_document.get("error") is None
+                    and persisted_document.get("data") == expected_socket_data,
+                    "Generated configuration changed the caller's shared socket default")
+            require([path.read_bytes() for path in files] == initial_bytes
+                    and sorted(init_state.iterdir()) == sorted(namespace),
+                    "Reading persisted defaults changed the retained configuration namespace")
+        case = evidence / ("config-init-" + mode + "-closed-stdout")
+        case.mkdir()
+        (case / "argv.json").write_text(json.dumps(argv) + "\n")
+        with (case / "stderr.bin").open("xb") as diagnostics:
+            child = spawn_with_closed_stdout(argv, init_env, diagnostics)
+        try:
+            code = child.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            (case / "termination.json").write_text(json.dumps({
+                "state": "timeout", "timeout_seconds": 30, "child_pid": child.pid,
+                "child_stopped": False}) + "\n")
+            raise
+        (case / "returncode.txt").write_text(str(code) + "\n")
+        diagnostics = (case / "stderr.bin").read_bytes()
+        sys.stderr.buffer.write(diagnostics)
+        sys.stderr.buffer.flush()
+        outcomes.append({"case": case.name, "returncode": code})
+        require(code == 1 and b"structured output could not be delivered" in diagnostics
+                and b"broken pipe" in diagnostics.lower() and b"panicked" not in diagnostics,
+                "Initialization swallowed its acknowledgement failure or panicked")
+        require([path.read_bytes() for path in files] == initial_bytes
+                and sorted(init_state.iterdir()) == sorted(namespace),
+                "Failed initialization acknowledgement changed retained inputs")
+
+    # Admission and URL reporting never contact the daemon/dashboard or launch
+    # a browser. Check resolves its private, absent socket and reports
+    # not_ready; no fake daemon is substituted. None of these cases compiles.
+    # Output delivery failures must reach the same typed exit path as config.
+    dashboard_url = "https://dashboard.example.invalid/fleet/"
+    for action, arguments, expected_code in [
+        ("admit", ["admit", "--", "cargo", "build", "--release"], 0),
+        ("web", ["web", "--url", dashboard_url, "--no-open"], 0),
+        ("check", ["check"], 2),
+    ]:
+        require(not Path(config_socket).exists(),
+                "The private output-case daemon socket must remain absent")
+        argv = [str(args.rch), "--json", "--format", "json"] + arguments
+        positive, _ = run("read-only-output-" + action, argv, config_env, timeout_seconds=30)
+        document = json.loads(positive.stdout)
+        require(positive.returncode == expected_code and document.get("api_version") == "1.0"
+                and document.get("command") == action and document.get("success") is True
+                and document.get("error") is None,
+                "Read-only CLI did not deliver exactly one report with its original exit status")
+        data = document.get("data", {})
+        if action == "admit":
+            require(data.get("command") == "cargo build --release"
+                    and data.get("is_compilation") is True
+                    and data.get("family") == "cargo_build"
+                    and data.get("base_recommendation") == "offload"
+                    and data.get("proof_policy") is True
+                    and data.get("required", {}).get("needs_cargo") is True,
+                    "Actual admission reporter lost its classification or strict policy")
+        elif action == "web":
+            require(data == {"url": dashboard_url,
+                             "agent_endpoint": "https://dashboard.example.invalid/fleet/api/fleet?view=help",
+                             "opened": False},
+                    "Actual no-open dashboard reporter lost its URL or browser state")
+        else:
+            # This verifies delivery of an actual unavailable-daemon report,
+            # not healthy-daemon/worker readiness or successful compilation.
+            require(data.get("status") == "not_ready" and data.get("exit_code") == 2
+                    and data.get("daemon") == {"running": False, "pid": None, "uptime_secs": None}
+                    and data.get("workers") == {"total": 0, "healthy": 0, "unhealthy": []}
+                    and data.get("issues") == ["Daemon not running"],
+                    "Readiness check lost its real unavailable-daemon state")
+        require(config_path.read_bytes() == config_bytes
+                and list(config_state.iterdir()) == [config_path]
+                and not Path(config_socket).exists(),
+                "Delivered read-only reporting changed its private input namespace")
+        for collect_stderr in (True, False):
+            name = "read-only-closed-output-" + action + ("" if collect_stderr else "-both")
+            case = evidence / name
+            case.mkdir()
+            (case / "argv.json").write_text(json.dumps(argv) + "\n")
+            (case / "cwd.txt").write_text(str(source) + "\n")
+            if collect_stderr:
+                with (case / "stderr.bin").open("xb") as diagnostics:
+                    child = spawn_with_closed_stdout(argv, config_env, diagnostics)
+            else:
+                child = spawn_with_closed_stdout(argv, config_env, None)
+            try:
+                code = child.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                (case / "termination.json").write_text(json.dumps({
+                    "state": "timeout", "timeout_seconds": 30, "child_pid": child.pid,
+                    "child_stopped": False}) + "\n")
+                raise
+            (case / "returncode.txt").write_text(str(code) + "\n")
+            outcomes.append({"case": name, "returncode": code})
+            require(code == 1, "Read-only CLI swallowed a failed structured delivery")
+            if collect_stderr:
+                diagnostics = (case / "stderr.bin").read_bytes()
+                sys.stderr.buffer.write(diagnostics)
+                sys.stderr.buffer.flush()
+                require(b"structured output could not be delivered" in diagnostics
+                        and b"broken pipe" in diagnostics.lower() and b"panicked" not in diagnostics,
+                        "Read-only output failure lost its cause or panicked")
+            # Both closed streams expose only the process status.
+            require(config_path.read_bytes() == config_bytes
+                    and list(config_state.iterdir()) == [config_path]
+                    and not Path(config_socket).exists(),
+                    "Read-only reporting changed the private configuration input namespace")
+
+    # These actual dry-run self-tests only report plans against the same absent
+    # private daemon socket. They do not qualify canaries, scheduler admission,
+    # remote identities or live storm invariants. Smoke may retain a planned
+    # JSONL trace in the platform cache; it must never report executed events.
+    self_test_env = dict(config_env)
+    self_test_env.update({"RCH_LOAD_WAVES": "1", "RCH_LOAD_CONCURRENCY": "1"})
+    for mode, flags in [("smoke", []), ("load", ["--load"])]:
+        require(not Path(config_socket).exists(),
+                "The private self-test daemon socket must remain absent")
+        argv = [str(args.rch), "--json", "--format", "json", "self-test",
+                "--smoke", "--dry-run"] + flags
+        positive, _ = run("self-test-output-" + mode, argv, self_test_env, timeout_seconds=30)
+        document = json.loads(positive.stdout)
+        require(positive.returncode == 0 and document.get("mode") == mode
+                and document.get("dry_run") is True
+                and document.get("daemon_reachable") is False
+                and isinstance(document.get("run_id"), str) and document["run_id"]
+                and "passed" not in document,
+                "Dry-run self-test did not deliver one honest plan document")
+        if mode == "load":
+            require(document.get("executed") is False
+                    and document.get("schedulable_workers") == 0
+                    and document.get("planned_jobs") == 0
+                    and document.get("waves") == 1 and document.get("concurrency") == 1
+                    and document.get("reason") == "dry-run: planned the load swarm but executed nothing"
+                    and "events" not in document and "invariants" not in document,
+                    "Unavailable-daemon load planning manufactured execution or qualification")
+        else:
+            events = document.get("events", [])
+            plan = document.get("plan", {})
+            require(document.get("remote_execution_available") is False
+                    and document.get("overall_skipped") is True
+                    and plan.get("mode") == "smoke" and plan.get("overall_skipped") is True
+                    and events and len(events) == len(plan.get("scenarios", []))
+                    and all(event.get("event") == "planned"
+                            and event.get("run_id") == document["run_id"]
+                            and event.get("duration_ms") == 0
+                            and "remote_job_id" not in event
+                            and "artifact_summary" not in event for event in events),
+                    "Dry-run smoke planning manufactured executed or returned-artifact outcomes")
+        for collect_stderr in (True, False):
+            name = "self-test-closed-output-" + mode + ("" if collect_stderr else "-both")
+            case = evidence / name
+            case.mkdir()
+            (case / "argv.json").write_text(json.dumps(argv) + "\n")
+            (case / "cwd.txt").write_text(str(source) + "\n")
+            if collect_stderr:
+                with (case / "stderr.bin").open("xb") as diagnostics:
+                    child = spawn_with_closed_stdout(argv, self_test_env, diagnostics)
+            else:
+                child = spawn_with_closed_stdout(argv, self_test_env, None)
+            try:
+                code = child.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                (case / "termination.json").write_text(json.dumps({
+                    "state": "timeout", "timeout_seconds": 30, "child_pid": child.pid,
+                    "child_stopped": False}) + "\n")
+                raise
+            (case / "returncode.txt").write_text(str(code) + "\n")
+            outcomes.append({"case": name, "returncode": code})
+            require(code == 1, "Self-test swallowed a failed structured delivery")
+            if collect_stderr:
+                diagnostics = (case / "stderr.bin").read_bytes()
+                sys.stderr.buffer.write(diagnostics)
+                sys.stderr.buffer.flush()
+                require(b"structured output could not be delivered" in diagnostics
+                        and b"broken pipe" in diagnostics.lower() and b"panicked" not in diagnostics,
+                        "Self-test output failure lost its cause or panicked")
+            require(config_path.read_bytes() == config_bytes
+                    and list(config_state.iterdir()) == [config_path]
+                    and not Path(config_socket).exists(),
+                    "Dry-run self-test output changed its private configuration/socket namespace")
+
+    # Real OS launch refusal: no fake browser, daemon or replacement executable.
+    # A missing launcher must produce one error document, never an earlier
+    # success followed by a second document. This is not a browser-open positive.
+    browser_path = evidence / "empty-browser-launcher-path"
+    browser_path.mkdir()
+    browser_env = dict(config_env)
+    browser_env["PATH"] = str(browser_path)
+    browser_failure, _ = run("web-missing-browser-launcher",
+                             [str(args.rch), "--json", "--format", "json", "web", "--url", dashboard_url],
+                             browser_env, timeout_seconds=30)
+    failure_document = json.loads(browser_failure.stdout)
+    failure_error = failure_document.get("error") or {}
+    require(browser_failure.returncode == 1
+            and failure_document.get("api_version") == "1.0"
+            and failure_document.get("command") == "rch"
+            and failure_document.get("success") is False
+            and failure_document.get("data") is None
+            and failure_error.get("code") == "RCH-E504"
+            and failure_error.get("message") == "Unexpected internal state"
+            and b"panicked" not in browser_failure.stderr,
+            "Missing real browser launchers did not produce one failed web envelope")
+    failure_details = failure_error.get("details", "")
+    if sys.platform in ("darwin", "linux"):
+        require("no such file" in failure_details.lower(),
+                "Missing native launcher error lost its real OS cause")
+    else:
+        require(failure_details == "Opening the dashboard browser is unsupported on this platform",
+                "Unsupported POSIX browser launch did not preserve its explicit refusal")
+    require(list(browser_path.iterdir()) == [] and config_path.read_bytes() == config_bytes
+            and list(config_state.iterdir()) == [config_path],
+            "Browser launch refusal changed the retained inputs or empty launcher namespace")
+
+    # Dashboard UI query/fragment fields must never absorb the API path. These
+    # are actual no-open CLI cases, without a dashboard request or browser.
+    for index, (url, endpoint) in enumerate([
+        ("https://dashboard.example.invalid/fleet/?tab=workers#selection",
+         "https://dashboard.example.invalid/fleet/api/fleet?view=help"),
+        ("https://dashboard.example.invalid/?tab=workers#selection",
+         "https://dashboard.example.invalid/api/fleet?view=help"),
+        ("https://dashboard.example.invalid/team%20α/?view=old#selection",
+         "https://dashboard.example.invalid/team%20%CE%B1/api/fleet?view=help"),
+        ("http://[::1]:8080/fleet?tab=workers#selection",
+         "http://[::1]:8080/fleet/api/fleet?view=help"),
+    ]):
+        actual, _ = run("web-structured-endpoint-" + str(index),
+                        [str(args.rch), "--json", "--format", "json", "web", "--url", url, "--no-open"],
+                        config_env, timeout_seconds=30)
+        document = json.loads(actual.stdout)
+        require(actual.returncode == 0 and document.get("api_version") == "1.0"
+                and document.get("command") == "web" and document.get("success") is True
+                and document.get("error") is None
+                and document.get("data") == {"url": url, "agent_endpoint": endpoint, "opened": False},
+                "Actual dashboard endpoint lost path identity or mixed UI query/fragment fields")
+        require(config_path.read_bytes() == config_bytes and list(config_state.iterdir()) == [config_path],
+                "Dashboard endpoint reporting changed its retained configuration inputs")
+    for index, url in enumerate(["https://", "https://dashboard.example.invalid:99999"]):
+        # Empty PATH distinguishes the required URL cause from a launcher
+        # error; this fixture does not instrument or prove zero launch attempts.
+        actual, _ = run("web-malformed-http-url-" + str(index),
+                        [str(args.rch), "--json", "--format", "json", "web", "--url", url],
+                        browser_env, timeout_seconds=30)
+        document = json.loads(actual.stdout)
+        failure = document.get("error") or {}
+        require(actual.returncode == 1 and document.get("api_version") == "1.0"
+                and document.get("command") == "rch" and document.get("success") is False
+                and document.get("data") is None
+                and failure.get("code") == "RCH-E504"
+                and failure.get("message") == "Unexpected internal state"
+                and failure.get("details") == "Dashboard URL " + json.dumps(url) + " is not an http(s) URL"
+                and b"panicked" not in actual.stderr,
+                "Malformed HTTP URL did not preserve the exact validation refusal")
+        require(list(browser_path.iterdir()) == [] and config_path.read_bytes() == config_bytes
+                and list(config_state.iterdir()) == [config_path],
+                "Malformed dashboard URL refusal changed retained inputs")
 
     # Exercise actual CLI delivery and exit routing in an isolated, initially
     # absent journal namespace. These are not real-worker ownership positives;
