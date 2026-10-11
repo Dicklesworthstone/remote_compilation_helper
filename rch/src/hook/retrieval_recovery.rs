@@ -2353,7 +2353,7 @@ mod tests {
             ("products/app [dev]*?", false),
             ("target/app", true),
         ] {
-            let identity = format!("go-output-{}", uuid::Uuid::new_v4());
+            let identity = uuid::Uuid::new_v4().to_string();
             let (_owner, writer, worker) = preparation_fixture_with_identity(&identity);
             let base = writer.path.parent().unwrap();
             let local = base.join("checkout");
@@ -2791,7 +2791,7 @@ mod tests {
                 0,
             ),
         ] {
-            let identity = format!("native-output-{}", uuid::Uuid::new_v4());
+            let identity = uuid::Uuid::new_v4().to_string();
             let (_owner, writer, worker) = preparation_fixture_with_identity(&identity);
             let base = writer.path.parent().unwrap();
             let local = base.join("checkout");

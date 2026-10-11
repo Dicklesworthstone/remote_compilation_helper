@@ -470,6 +470,11 @@ fn literal_cargo_tokens(
             anyhow::bail!("cannot safely bind Cargo build directory across shell evaluation");
         }
     }
+    // A shell reads a trailing backslash as a line continuation, so the command
+    // it runs is not the argv the tokenizer below would return.
+    if escaped || quote.is_some() {
+        anyhow::bail!("cannot safely bind Cargo build directory across shell evaluation");
+    }
     cargo_command_tokens_with_wrappers(command, allow_classified_wrappers)
 }
 
