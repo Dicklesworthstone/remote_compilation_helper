@@ -1214,7 +1214,24 @@ mod managed_build_dir_tests {
             .partition_staged_artifact_paths(&inventory, &patterns)
             .unwrap();
         let archive = PathBuf::from("package/managed_package_fixture-0.1.0.crate");
-        assert_eq!(selected, std::slice::from_ref(&archive));
+        // Cargo can retain its identical archive staging copy. The production
+        // policy deliberately retrieves tmp-crate archives for dry-run publish;
+        // keep that contract while rejecting every unrelated selected file.
+        let temporary_archive =
+            PathBuf::from("package/tmp-crate/managed_package_fixture-0.1.0.crate");
+        let mut expected = vec![archive.clone()];
+        if pool.join(&temporary_archive).is_file() {
+            assert_eq!(
+                fs::read(pool.join(&temporary_archive)).unwrap(),
+                fs::read(pool.join(&archive)).unwrap(),
+                "Cargo's staging archive must be byte-identical to its final archive"
+            );
+            expected.push(temporary_archive.clone());
+        }
+        expected.sort();
+        let mut selected_set = selected.clone();
+        selected_set.sort();
+        assert_eq!(selected_set, expected);
         let mut rsync = Command::new("/usr/bin/timeout") // ubs:ignore — copies only production-selected fixture archives, locally.
             .args([
                 "--kill-after=5",
@@ -1243,6 +1260,15 @@ mod managed_build_dir_tests {
         }
         let transferred = rsync.wait_with_output().unwrap();
         assert!(transferred.status.success(), "{transferred:?}");
+        for relative in &selected {
+            let original = fs::read(pool.join(relative)).unwrap();
+            let returned = fs::read(root.join("returned").join(relative)).unwrap();
+            assert_eq!(
+                blake3::hash(&returned),
+                blake3::hash(&original),
+                "returned archive bytes differ for {relative:?}"
+            );
+        }
         let original = fs::read(pool.join(&archive)).unwrap();
         let returned = fs::read(root.join("returned").join(&archive)).unwrap();
         assert_eq!(blake3::hash(&returned), blake3::hash(&original));
@@ -1265,11 +1291,8 @@ mod managed_build_dir_tests {
         // The worktree remains buildable, but the archive deliberately omits
         // the required input. Verification must fail, not silently build the
         // working tree or reuse artifacts from the earlier verified package.
-        fs::write(
-            root.join("src/lib.rs"),
-            b"pub const MESSAGE: &str = include_str!(\"../worktree-only.txt\");\n",
-        )
-        .unwrap();
+        let failing_source = b"pub const MESSAGE: &str = include_str!(\"../worktree-only.txt\");\n";
+        fs::write(root.join("src/lib.rs"), failing_source).unwrap();
         let check = run(
             "worktree",
             "cargo check --offline -j1",
@@ -1280,9 +1303,55 @@ mod managed_build_dir_tests {
         let failed = run("package-missing-input", command, &failed_pool);
         assert_eq!(failed.status.code(), Some(101), "{failed:?}");
         assert!(String::from_utf8_lossy(&failed.stderr).contains("worktree-only.txt"));
+        // Cargo promotes the staged archive only after verification succeeds.
+        // The failed package must retain the new source in staging without
+        // presenting it as a successfully verified final archive.
         assert!(
-            failed_pool.join(&archive).is_file(),
-            "failure must occur after archive creation"
+            failed_pool.join(&temporary_archive).is_file(),
+            "verification failure must occur after staging the archive"
+        );
+        assert!(
+            !failed_pool.join(&archive).exists(),
+            "failed verification must not promote a final archive"
+        );
+        let failed_archive = fs::read(failed_pool.join(&temporary_archive)).unwrap();
+        assert_ne!(
+            failed_archive, original,
+            "failed package must use the new source"
+        );
+        let mut members =
+            tar::Archive::new(flate2::read::GzDecoder::new(failed_archive.as_slice()));
+        let mut saw_failing_source = false;
+        let mut saw_packaged_input = false;
+        for entry in members.entries().unwrap() {
+            let mut entry = entry.unwrap();
+            let path = entry.path().unwrap().into_owned();
+            assert!(!path.ends_with("worktree-only.txt"));
+            if path == Path::new("managed_package_fixture-0.1.0/src/lib.rs") {
+                let mut bytes = Vec::new();
+                entry.read_to_end(&mut bytes).unwrap();
+                assert_eq!(bytes.as_slice(), &failing_source[..]);
+                saw_failing_source = true;
+            } else if path == Path::new("managed_package_fixture-0.1.0/packaged.txt") {
+                let mut bytes = Vec::new();
+                entry.read_to_end(&mut bytes).unwrap();
+                assert_eq!(bytes, b"archive-owned input\n");
+                saw_packaged_input = true;
+            }
+        }
+        assert!(saw_failing_source && saw_packaged_input);
+        let mut failed_inventory = Vec::new();
+        files(&failed_pool, &failed_pool, &mut failed_inventory);
+        let failed_extracted = failed_pool.join("package/managed_package_fixture-0.1.0");
+        assert!(
+            failed_inventory.iter().any(|relative| {
+                relative
+                    .file_name()
+                    .is_some_and(|name| name == "rch-package-origin")
+                    && fs::read_to_string(failed_pool.join(relative)).unwrap()
+                        == failed_extracted.to_str().unwrap()
+            }),
+            "failed verification must execute the build script from the extracted archive"
         );
         assert_eq!(
             fs::read(root.join("worktree-only.txt")).unwrap(),
