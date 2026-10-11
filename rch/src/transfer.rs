@@ -623,10 +623,11 @@ fn pooled_target_prune_max_age_mins(idle_hours: u32) -> Option<u64> {
 /// scratch, orphaned per-worker Cargo caches, and superseded
 /// `.rch-target-*-pool-*` stores cannot grow without bound or feed stale
 /// manifests into later builds (bd-wfumv). All sweeps are age-bounded
-/// `-maxdepth 1` finds: anything in active use is minutes old and can never
-/// match (per-worker Cargo caches additionally refresh their own mtime on
-/// every job via `add_cargo_isolation`). Failures are swallowed — pruning is
-/// opportunistic hygiene and must never fail a transfer.
+/// `-maxdepth 1` finds; age alone is not proof that a job has stopped using a
+/// directory. Durable source-granted uploads omit this prefix entirely via
+/// `source_sync_prune_prefix`, as they also omit sibling-target pruning.
+/// Transfers without durable source grants retain these configured sweeps.
+/// Failures are swallowed — pruning is opportunistic and must never fail a transfer.
 fn worker_cache_prune_rsync_path_prefix(
     escaped_remote_path: &str,
     pooled_target_idle_hours: u32,
@@ -2503,6 +2504,20 @@ impl TransferPipeline {
             Some(prefix) => format!("{prefix} sh -c {}", escape(Cow::from(command))),
             None => command.to_owned(),
         }
+    }
+
+    /// A durable source grant is not permission for opportunistic cache
+    /// reclamation. Keep all transfer-start sweeps out of its activity; source
+    /// synchronization and the explicit retirement protocol remain separate.
+    fn source_sync_prune_prefix(&self, escaped_remote_path: &str) -> String {
+        if self.source_authority_prefix.is_some() {
+            return String::new();
+        }
+        worker_cache_prune_rsync_path_prefix(
+            escaped_remote_path,
+            self.pooled_target_prune_idle_hours,
+            self.escaped_pooled_target_override_parent().as_deref(),
+        )
     }
 
     /// rsync appends its server argv to this shell fragment. Forward those
@@ -4515,15 +4530,11 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
 
         // Create remote directory implicitly using rsync-path wrapper
         // This saves a separate SSH handshake for 'mkdir -p'. The same remote
-        // shell invocation also reaps stale worker-side runtime state
-        // (bd-wfumv) — see worker_cache_prune_rsync_path_prefix.
+        // shell invocation includes pruning only without a durable
+        // source grant (bd-wfumv); ownership-bound transfers omit all sweeps.
         cmd.arg("--rsync-path").arg(self.source_rsync_path(format!(
             "{}mkdir -p {} && rsync",
-            worker_cache_prune_rsync_path_prefix(
-                escaped_remote_path,
-                self.pooled_target_prune_idle_hours,
-                self.escaped_pooled_target_override_parent().as_deref()
-            ),
+            self.source_sync_prune_prefix(escaped_remote_path),
             escaped_remote_path
         )));
 
@@ -4580,15 +4591,11 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         }
 
         // Create remote directory implicitly using rsync-path wrapper; the
-        // same remote shell invocation reaps stale worker-side runtime state
-        // (bd-wfumv) — see worker_cache_prune_rsync_path_prefix.
+        // same remote shell invocation includes pruning only without a
+        // durable source grant (bd-wfumv); ownership-bound transfers omit it.
         cmd.arg("--rsync-path").arg(self.source_rsync_path(format!(
             "{}mkdir -p {} && rsync",
-            worker_cache_prune_rsync_path_prefix(
-                escaped_remote_path,
-                self.pooled_target_prune_idle_hours,
-                self.escaped_pooled_target_override_parent().as_deref()
-            ),
+            self.source_sync_prune_prefix(escaped_remote_path),
             escaped_remote_path
         )));
 
@@ -11248,17 +11255,29 @@ Number of files transferred: 42
 
     #[cfg(unix)]
     #[test]
-    fn source_grant_does_not_authorize_pruning_sibling_target_pools() {
-        let directory = tempfile::tempdir().unwrap();
-        let mut pipeline = TransferPipeline::new(
-            directory.path().to_owned(),
+    fn source_grant_does_not_authorize_transfer_start_or_sibling_pruning() {
+        let directory = tempfile::tempdir().unwrap().keep();
+        let pipeline = TransferPipeline::new(
+            directory,
             "activity".into(),
             "abcdef".into(),
             TransferConfig::default(),
         )
         .with_remote_path_override("/worker/sources/current")
-        .with_remote_cargo_target_dir_override("/worker/pools/.rch-target-current-pool-abcdef");
-        pipeline.source_authority_prefix = Some("env RCH_ACTIVITY_TEST=owned".into());
+        .with_remote_cargo_target_dir_override("/worker/pools/.rch-target-current-pool-abcdef")
+        .with_source_authority("ab12".into())
+        .unwrap()
+        .with_rsync(ResolvedRsync {
+            path: PathBuf::from("rsync"),
+            flavor: RsyncFlavor::Rsync {
+                major: 3,
+                minor: 2,
+                patch: 7,
+            },
+            version_line: String::new(),
+            source: RsyncSource::Config,
+            shadowed: None,
+        });
         assert_eq!(pipeline.escaped_pooled_target_override_parent(), None);
         let worker = estimate_test_worker();
         for command in [
@@ -11283,9 +11302,99 @@ Number of files transferred: 42
                 .to_string_lossy();
             assert!(!wrapper.contains("find /worker/pools"), "{wrapper}");
             assert!(
-                wrapper.contains("find /worker/sources/current"),
+                !wrapper.contains("find /worker/sources/current"),
                 "{wrapper}"
             );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_sync_pruning_preserves_grant_fencing_and_ungranted_policy() {
+        // Command construction only: no remote claim, transport, deletion or
+        // compiler is executed, and this is not live-worker retention proof.
+        let worker = WorkerConfig {
+            id: WorkerId::new("pruning-argv-worker"),
+            host: "worker.example.invalid".into(),
+            user: "builder".into(),
+            identity_file: "/workspaces/fixture-key".into(),
+            total_slots: 1,
+            priority: 100,
+            tags: vec![],
+            tools: Vec::new(),
+        };
+        let root = "/worker/sources/current";
+        for mode in ["ungranted", "active", "cleanup"] {
+            for hours in [0, 168] {
+                for delete in [false, true] {
+                    let pipeline = TransferPipeline::new(
+                        PathBuf::from("/workspaces/project"),
+                        "project".into(),
+                        "abcdef".into(),
+                        TransferConfig::default(),
+                    )
+                    .with_remote_path_override(root)
+                    .with_remote_cargo_target_dir_override(
+                        "/worker/pools/.rch-target-current-pool-abcdef",
+                    )
+                    .with_pooled_target_prune_idle_hours(hours)
+                    .with_sync_delete(delete)
+                    .with_rsync(ResolvedRsync {
+                        path: PathBuf::from("rsync"),
+                        flavor: RsyncFlavor::Rsync {
+                            major: 3,
+                            minor: 2,
+                            patch: 7,
+                        },
+                        version_line: String::new(),
+                        source: RsyncSource::Config,
+                        shadowed: None,
+                    });
+                    let pipeline = match mode {
+                        "active" => pipeline.with_source_authority("ab12".into()).unwrap(),
+                        "cleanup" => pipeline
+                            .with_source_authority_cleanup("ab12".into())
+                            .unwrap(),
+                        _ => pipeline,
+                    };
+                    for command in [
+                        pipeline.build_sync_command(
+                            &worker,
+                            "builder@worker:/worker/sources/current",
+                            root,
+                            &[],
+                        ),
+                        pipeline.build_sync_streaming_command(
+                            &worker,
+                            "builder@worker:/worker/sources/current",
+                            root,
+                            &[],
+                        ),
+                    ] {
+                        let arguments: Vec<_> = command.as_std().get_args().collect();
+                        assert_eq!(arguments.iter().any(|arg| *arg == "--delete"), delete);
+                        let wrapper = arguments
+                            .windows(2)
+                            .find(|pair| pair[0] == "--rsync-path")
+                            .unwrap()[1]
+                            .to_string_lossy();
+                        assert!(wrapper.contains("RCH_SYNC_LIVE_CHECKOUT_REFUSED"));
+                        assert!(wrapper.contains("mkdir -p /worker/sources/current && rsync"));
+                        if mode == "ungranted" {
+                            assert!(wrapper.contains("find /worker/sources/current/.rch-tmp"));
+                            assert!(wrapper.contains("-name 'rch-cargo-cache-*'"));
+                            assert_eq!(wrapper.contains("find /worker/pools"), hours != 0);
+                        } else {
+                            assert!(wrapper.contains("flock -x --"));
+                            assert!(wrapper.contains(&format!("ab12 {mode} sh -c ")));
+                            assert!(wrapper.contains("source grant is not active"));
+                            assert!(wrapper.contains("source grant content changed"));
+                            assert!(!wrapper.contains("-mmin +"));
+                            assert!(!wrapper.contains("find /worker/pools"));
+                        }
+                    }
+                }
+            }
         }
     }
 

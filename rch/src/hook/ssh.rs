@@ -1311,39 +1311,40 @@ fn build_remote_shell_command(platform: WorkerPlatform, remote_cmd: &str) -> Str
     format!("sh -lc {}", shell_escape::escape(remote_cmd.into()))
 }
 
-/// Isolated Git overlays live beneath the configured worker staging base,
+/// Isolated Git overlays and source-content receipts use the worker staging base,
 /// not beneath the controller's canonical source root. Keep the controller
 /// policy for ordinary mirrors and validate every isolated destination before
 /// any remote topology command can create or repair a path.
 pub(super) fn remote_preflight_topology_policy(
     controller_policy: &PathTopologyPolicy,
     clean_overlay: bool,
+    source_content_receipt: bool,
     remote_base: &str,
     dispatch_closure_roots: &[PathBuf],
 ) -> anyhow::Result<PathTopologyPolicy> {
-    if !clean_overlay {
+    if !clean_overlay && !source_content_receipt {
         return Ok(controller_policy.clone());
     }
 
     let remote_base = rch_common::types::validate_remote_base(remote_base)
-        .map_err(|error| anyhow::anyhow!("invalid clean-overlay staging base: {error}"))?;
+        .map_err(|error| anyhow::anyhow!("invalid isolated-source staging base: {error}"))?;
     if remote_base.chars().any(char::is_control) || remote_base.contains('\\') {
-        anyhow::bail!("clean-overlay staging base contains an invalid path character");
+        anyhow::bail!("isolated-source staging base contains an invalid path character");
     }
     let staging_root = PathBuf::from(remote_base);
     if dispatch_closure_roots.is_empty() {
-        anyhow::bail!("clean-overlay staging preflight requires a planned source root");
+        anyhow::bail!("isolated-source staging preflight requires a planned source root");
     }
     for root in dispatch_closure_roots {
         let literal = root.to_str().ok_or_else(|| {
-            anyhow::anyhow!("clean-overlay source destination is not a UTF-8 path")
+            anyhow::anyhow!("isolated-source destination is not a UTF-8 path")
         })?;
         if literal.chars().any(char::is_control)
             || literal.contains('\\')
             || literal.split('/').any(|part| part == "." || part == "..")
         {
             anyhow::bail!(
-                "invalid clean-overlay source destination: {}",
+                "invalid isolated-source destination: {}",
                 root.display()
             );
         }
@@ -1355,13 +1356,13 @@ pub(super) fn remote_preflight_topology_policy(
         });
         if relative.is_none() {
             anyhow::bail!(
-                "clean-overlay source destination {} is not a strict descendant of staging base {}",
+                "isolated-source destination {} is not a strict descendant of staging base {}",
                 root.display(),
                 staging_root.display()
             );
         }
     }
-    // No worker-global alias is required for an invocation-owned archive.
+    // Invocation-owned archives and receipt sources need no worker-global alias.
     Ok(PathTopologyPolicy::new(staging_root.clone(), staging_root))
 }
 
@@ -3836,19 +3837,28 @@ printf 'legacy identity escaped its fence\n' > "$marker"
     }
 
     #[test]
-    fn clean_overlay_staging_maps_worker_paths_without_changing_controller_policy() {
+    fn isolated_source_staging_maps_worker_paths_without_changing_controller_policy() {
         let controller = PathTopologyPolicy::default();
         let base = "/Users/jemanuel/.cache/rch-release";
         let roots = vec![PathBuf::from(format!("{base}/asupersync/job-1"))];
-        let staged = remote_preflight_topology_policy(&controller, true, base, &roots)
+        for (clean_overlay, source_content_receipt) in [(true, false), (false, true)] {
+            let staged = remote_preflight_topology_policy(
+                &controller,
+                clean_overlay,
+                source_content_receipt,
+                base,
+                &roots,
+            )
             .expect("Mac staging path is independent of Linux controller source path");
-        assert_eq!(staged.canonical_root(), Path::new(base));
-        assert_eq!(staged.alias_root(), staged.canonical_root());
+            assert_eq!(staged.canonical_root(), Path::new(base));
+            assert_eq!(staged.alias_root(), staged.canonical_root());
+        }
         assert_eq!(controller.canonical_root(), Path::new("/data/projects"));
         assert_eq!(controller.alias_root(), Path::new("/dp"));
 
         let ordinary = remote_preflight_topology_policy(
             &controller,
+            false,
             false,
             base,
             &[PathBuf::from("/data/projects/asupersync")],
@@ -3859,7 +3869,7 @@ printf 'legacy identity escaped its fence\n' > "$marker"
     }
 
     #[test]
-    fn clean_overlay_staging_refuses_every_destination_outside_the_exact_base() {
+    fn isolated_source_staging_refuses_every_destination_outside_the_exact_base() {
         let controller = PathTopologyPolicy::default();
         let base = "/Users/jemanuel/.cache/rch-release";
         let valid = PathBuf::from(format!("{base}/asupersync/job-1"));
@@ -3875,12 +3885,32 @@ printf 'legacy identity escaped its fence\n' > "$marker"
             "asupersync/job-1".to_string(),
         ] {
             let roots = vec![valid.clone(), PathBuf::from(&invalid)];
+            for (clean_overlay, source_content_receipt) in [(true, false), (false, true)] {
+                assert!(
+                    remote_preflight_topology_policy(
+                        &controller,
+                        clean_overlay,
+                        source_content_receipt,
+                        base,
+                        &roots,
+                    )
+                    .is_err(),
+                    "a valid first root must not hide invalid destination {invalid:?}"
+                );
+            }
+        }
+        for (clean_overlay, source_content_receipt) in [(true, false), (false, true)] {
             assert!(
-                remote_preflight_topology_policy(&controller, true, base, &roots).is_err(),
-                "a valid first root must not hide invalid destination {invalid:?}"
+                remote_preflight_topology_policy(
+                    &controller,
+                    clean_overlay,
+                    source_content_receipt,
+                    base,
+                    &[],
+                )
+                .is_err()
             );
         }
-        assert!(remote_preflight_topology_policy(&controller, true, base, &[]).is_err());
         for invalid_base in [
             "/",
             "/tmp",
@@ -3888,22 +3918,25 @@ printf 'legacy identity escaped its fence\n' > "$marker"
             "/tmp/rch/../peer",
             "/tmp/rch\n",
         ] {
-            assert!(
-                remote_preflight_topology_policy(
-                    &controller,
-                    true,
-                    invalid_base,
-                    std::slice::from_ref(&valid),
-                )
-                .is_err(),
-                "invalid staging base {invalid_base:?} must refuse before any remote command"
-            );
+            for (clean_overlay, source_content_receipt) in [(true, false), (false, true)] {
+                assert!(
+                    remote_preflight_topology_policy(
+                        &controller,
+                        clean_overlay,
+                        source_content_receipt,
+                        invalid_base,
+                        std::slice::from_ref(&valid),
+                    )
+                    .is_err(),
+                    "invalid staging base {invalid_base:?} must refuse before any remote command"
+                );
+            }
         }
     }
 
     #[cfg(unix)]
     #[test]
-    fn clean_overlay_staging_preflight_creates_only_its_base_without_an_alias() {
+    fn isolated_source_staging_preflight_creates_only_its_base_without_an_alias() {
         let _guard = test_guard!();
         let raw = tempfile::tempdir().expect("owned topology fixture");
         let fixture = raw.path().canonicalize().expect("physical fixture path");
@@ -3917,16 +3950,24 @@ printf 'legacy identity escaped its fence\n' > "$marker"
             .expect("peer alias sentinel");
         let controller = PathTopologyPolicy::new(controller_root.clone(), controller_alias.clone());
         let staging_base = fixture.join("worker staging");
-        let source_root = staging_base.join("asupersync/job-1");
-        let staged = remote_preflight_topology_policy(
-            &controller,
-            true,
-            staging_base.to_str().expect("UTF-8 fixture path"),
-            std::slice::from_ref(&source_root),
-        )
-        .expect("valid isolated staging topology");
-        let command = build_worker_projects_topology_cmd(&staged, true);
-        for _ in 0..2 {
+        let source_roots = [
+            staging_base.join("source-content-42-job/primary"),
+            staging_base.join("source-content-42-job/dependency"),
+        ];
+        // Receipt mode must work with absent staging, then both modes must be
+        // idempotent without consulting the unusable controller sentinels.
+        for (clean_overlay, source_content_receipt) in
+            [(false, true), (true, false), (false, true), (true, false)]
+        {
+            let staged = remote_preflight_topology_policy(
+                &controller,
+                clean_overlay,
+                source_content_receipt,
+                staging_base.to_str().expect("UTF-8 fixture path"),
+                &source_roots,
+            )
+            .expect("valid isolated staging topology");
+            let command = build_worker_projects_topology_cmd(&staged, true);
             let output = std::process::Command::new("sh")
                 .args(["-c", &command])
                 .output()
@@ -3945,7 +3986,7 @@ printf 'legacy identity escaped its fence\n' > "$marker"
                 "alias==canonical stays a directory"
             );
             assert!(
-                !source_root.exists(),
+                source_roots.iter().all(|root| !root.exists()),
                 "preflight only prepares the staging base"
             );
             assert_eq!(
