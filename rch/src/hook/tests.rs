@@ -1720,6 +1720,194 @@ fn test_estimate_cores_for_command() {
 // =========================================================================
 
 #[test]
+fn test_cargo_xwin_quoted_options_preserve_classification_and_admission() {
+    use rch_common::admit_preflight::{preflight, required_os_for_command};
+    use rch_common::patterns::cargo_xwin_compilation_kind;
+
+    let _guard = test_guard!();
+    for (subcommand, kind, family) in [
+        ("build", CompilationKind::CargoBuild, "cargo_build"),
+        ("check", CompilationKind::CargoCheck, "cargo_check"),
+        ("clippy", CompilationKind::CargoClippy, "cargo_clippy"),
+    ] {
+        for (prefix, toolchain) in [
+            (vec!["cargo", "--config=build.jobs=2", "xwin"], None),
+            (
+                vec![
+                    "cargo",
+                    "+nightly-2026-08-31",
+                    "--config=build.jobs=2",
+                    "xwin",
+                ],
+                Some("nightly-2026-08-31"),
+            ),
+            (vec!["cargo-xwin"], None),
+            (vec!["cargo-xwin", "xwin"], None),
+            (
+                vec![
+                    "env",
+                    "RCH_XWIN_NOTE=placeholder --target=aarch64-apple-darwin",
+                    "cargo",
+                    "--config=build.jobs=2",
+                    "xwin",
+                ],
+                None,
+            ),
+        ] {
+            for (target, expected_os) in [
+                ("x86_64-pc-windows-msvc", None),
+                ("aarch64-pc-windows-msvc", None),
+                ("aarch64-apple-darwin", Some("darwin")),
+            ] {
+                let target_argument = format!("--target={target}");
+                let mut argv = prefix.clone();
+                argv.extend([
+                    subcommand,
+                    "--config=build.jobs=2",
+                    "--locked",
+                    "--all-targets",
+                    target_argument.as_str(),
+                ]);
+                if subcommand == "clippy" {
+                    argv.extend(["--", "-D", "warnings"]);
+                }
+                let command = shell_words::join(&argv);
+                assert!(command.contains("'--config=build.jobs=2'"), "{command}");
+                assert!(command.contains(&format!("'{target_argument}'")), "{command}");
+                assert_eq!(cargo_xwin_compilation_kind(&command), Some(kind), "{command}");
+                let classification = classify_command(&command);
+                assert!(classification.is_compilation, "{command}");
+                assert_eq!(classification.kind, Some(kind), "{command}");
+
+                let result = preflight(&command, true);
+                let expected_toolchains: Vec<String> =
+                    toolchain.into_iter().map(|value| value.to_string()).collect();
+                assert!(result.is_compilation, "{command}");
+                assert_eq!(result.family.as_deref(), Some(family), "{command}");
+                assert!(result.required.needs_cargo, "{command}");
+                assert_eq!(
+                    result.required.needs_targets,
+                    vec![target.to_string()],
+                    "{command}"
+                );
+                assert_eq!(
+                    result.required.needs_toolchains,
+                    expected_toolchains,
+                    "{command}"
+                );
+                assert_eq!(result.required.needs_os.as_deref(), expected_os, "{command}");
+                assert_eq!(
+                    required_os_for_command(&command).as_deref(),
+                    expected_os,
+                    "{command}"
+                );
+                let requirement = result.required.to_requirement(1);
+                assert!(requirement.needs_cargo, "{command}");
+                assert_eq!(
+                    requirement.needs_targets,
+                    result.required.needs_targets,
+                    "{command}"
+                );
+                assert_eq!(
+                    requirement.needs_toolchains,
+                    result.required.needs_toolchains,
+                    "{command}"
+                );
+                assert_eq!(requirement.needs_os.as_deref(), expected_os, "{command}");
+            }
+        }
+    }
+}
+
+#[test]
+fn test_cargo_xwin_quoted_mentions_and_nonliteral_options_do_not_authorize_offload() {
+    use rch_common::admit_preflight::{preflight, required_os_for_command};
+    use rch_common::patterns::cargo_xwin_compilation_kind;
+
+    let _guard = test_guard!();
+    for (subcommand, kind) in [
+        ("build", CompilationKind::CargoBuild),
+        ("check", CompilationKind::CargoCheck),
+        ("clippy", CompilationKind::CargoClippy),
+    ] {
+        for argv in [
+            vec![
+                "cargo",
+                "--config=xwin",
+                subcommand,
+                "--target",
+                "x86_64-pc-windows-msvc",
+            ],
+            vec![
+                "cargo",
+                "--config",
+                "xwin",
+                subcommand,
+                "--target",
+                "x86_64-pc-windows-msvc",
+            ],
+            vec![
+                "cargo",
+                subcommand,
+                "--manifest-path",
+                "cargo xwin check",
+                "--target",
+                "x86_64-pc-windows-msvc",
+            ],
+        ] {
+            let command = shell_words::join(&argv);
+            assert_eq!(cargo_xwin_compilation_kind(&command), None, "{command}");
+            assert_eq!(classify_command(&command).kind, Some(kind), "{command}");
+            assert_eq!(
+                preflight(&command, true).required.needs_os.as_deref(),
+                Some("windows"),
+                "{command}"
+            );
+            assert_eq!(
+                required_os_for_command(&command).as_deref(),
+                Some("windows"),
+                "{command}"
+            );
+        }
+    }
+    for command in [
+        "cargo 'xwin' check '--target=x86_64-pc-windows-msvc'",
+        "cargo xwin 'check' '--target=x86_64-pc-windows-msvc'",
+        "cargo-xwin 'xwin' clippy '--target=x86_64-pc-windows-msvc'",
+        "cargo-xwin 'clippy' '--target=x86_64-pc-windows-msvc'",
+        "'cargo-xwin' check '--target=x86_64-pc-windows-msvc'",
+        "cargo xwin check '--help'",
+        "cargo xwin check --config='build.jobs=2'",
+    ] {
+        assert_eq!(cargo_xwin_compilation_kind(command), None, "{command}");
+        assert!(!classify_command(command).is_compilation, "{command}");
+    }
+    for value in [
+        "two words",
+        "a\"b",
+        "a'b",
+        r"a\b",
+        "$value",
+        "`value`",
+        "a;b",
+        "a|b",
+        "a&b",
+        "<value>",
+        "(value)",
+        "{a,b}",
+        "*",
+        "[value]",
+        "#value",
+        "~value",
+    ] {
+        let option = format!("--config={value}");
+        let command = shell_words::join(["cargo", "xwin", "check", option.as_str()]);
+        assert_eq!(cargo_xwin_compilation_kind(&command), None, "{command}");
+        assert!(!classify_command(&command).is_compilation, "{command}");
+    }
+}
+
+#[test]
 fn test_classification_confidence_levels() {
     let _guard = test_guard!();
     // High confidence: explicit cargo build

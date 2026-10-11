@@ -20,7 +20,7 @@ use crate::admission_rejection::{AdmissionRejectionSummary, RejectionClass};
 use crate::capability_probe::CapabilityRequirement;
 use crate::patterns::{
     CompilationKind, cargo_xwin_compilation_kind, classify_command, classify_command_detailed,
-    normalize_command, split_shell_commands, split_wrapper_word,
+    normalize_command, split_shell_commands, split_wrapper_word, unquote_literal_option_word,
 };
 
 /// The decisive recommendation `rch admit` returns.
@@ -202,8 +202,23 @@ fn derive_capabilities(command: &str, kind: Option<CompilationKind>) -> Required
         // exactly as for a plain `cargo build --target ...`.
         req.needs_zig = matches!(kind, CompilationKind::CargoZigbuild);
     }
+    // The xwin matcher validates the entire normalized suffix before admitting
+    // quoted option words. Scan that same suffix so an env/wrapper payload cannot
+    // introduce a target and a quoted --target= option cannot lose its requirement.
+    let xwin = cargo_xwin_compilation_kind(command).is_some();
+    let normalized = xwin.then(|| normalize_command(command));
+    let token_command = normalized.as_deref().unwrap_or(command);
     // Scan tokens for `--target <triple>` / `--target=<triple>` and `+toolchain`.
-    let tokens: Vec<&str> = command.split_whitespace().collect();
+    let tokens: Vec<&str> = token_command
+        .split_whitespace()
+        .map(|token| {
+            if xwin {
+                unquote_literal_option_word(token)
+            } else {
+                token
+            }
+        })
+        .collect();
     let mut i = 0;
     while i < tokens.len() {
         let tok = tokens[i];

@@ -2545,10 +2545,14 @@ pub fn is_cargo_package_verification(command: &str) -> bool {
 pub fn cargo_xwin_compilation_kind(command: &str) -> Option<CompilationKind> {
     let normalized = normalize_command(command);
     let cmd = normalized.as_ref();
-    if check_structure(cmd).is_some() || cmd.contains(['\'', '"', '\\', '$', '`']) {
+    let mut tokens = cmd.split_whitespace().map(unquote_literal_option_word);
+    if check_structure(cmd).is_some()
+        || tokens
+            .clone()
+            .any(|token| token.contains(['\'', '"', '\\', '$', '`']))
+    {
         return None;
     }
-    let mut tokens = cmd.split_whitespace();
     let subcommand = match tokens.next() {
         Some("cargo-xwin") => {
             let subcommand = tokens.next();
@@ -2598,6 +2602,22 @@ fn unquote_whole_word(token: &str) -> &str {
         .and_then(|rest| rest.strip_suffix('\''))
         .filter(|inner| !inner.contains('\''))
         .unwrap_or(token)
+}
+
+/// Read simple option words quoted by `shell_words::join` without interpreting
+/// quoted command names, standalone values, mixed quoting, or shell syntax.
+/// Keeping this decoder shared with admission preserves quoted target options.
+pub(crate) fn unquote_literal_option_word(token: &str) -> &str {
+    let word = unquote_whole_word(token);
+    if word.starts_with('-')
+        && word
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-_./=:+,".contains(&byte))
+    {
+        word
+    } else {
+        token
+    }
 }
 
 /// Classify cargo subcommands.
