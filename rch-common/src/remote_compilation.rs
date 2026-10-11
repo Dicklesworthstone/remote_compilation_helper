@@ -10,7 +10,7 @@
 //! 6. Comparing binary hashes to verify correctness
 
 use crate::binary_hash::{
-    BinaryHashResult, CanaryVerdict, binary_contains_marker, classify_canary, compute_binary_hash,
+    BinaryHashResult, CanaryVerdict, classify_returned_canary, compute_binary_hash,
 };
 use crate::gc_roots::{remote_cargo_home_base_prelude, remote_cargo_home_expr};
 use crate::mock::{self, MockConfig, MockRsync, MockRsyncConfig, MockSshClient};
@@ -298,9 +298,13 @@ impl RemoteCompilationTest {
         // identical* toolchain is a genuine miscompile. Toolchain parity is not
         // probed in this path, so a mismatch with the marker present resolves to
         // advisory drift (PASS) rather than a false failure.
-        let marker_present =
-            binary_contains_marker(&remote_binary_path, &test_marker).unwrap_or(true);
-        let verdict = classify_canary(&local_hash, &remote_hash, marker_present, None);
+        let verdict = classify_returned_canary(
+            &remote_binary_path,
+            &test_marker,
+            &local_hash,
+            &remote_hash,
+            None,
+        )?;
         let success = verdict.passed();
         let total_ms = start.elapsed().as_millis() as u64;
 
