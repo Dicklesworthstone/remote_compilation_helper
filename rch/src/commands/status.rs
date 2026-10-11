@@ -1017,22 +1017,27 @@ pub async fn admit(
 
     // Proof/strict-remote policy mirrors the ControlState surface
     // (RCH_REQUIRE_REMOTE / RCH_FORCE_REMOTE).
-    let proof_policy = ["RCH_REQUIRE_REMOTE", "RCH_FORCE_REMOTE"]
-        .iter()
-        .any(|key| {
-            std::env::var(key).is_ok_and(|v| {
-                matches!(
-                    v.trim().to_ascii_lowercase().as_str(),
-                    "1" | "true" | "yes" | "on"
-                )
-            })
-        });
+    let proof_policy = !require_tool.is_empty()
+        || ["RCH_REQUIRE_REMOTE", "RCH_FORCE_REMOTE"]
+            .iter()
+            .any(|key| {
+                std::env::var(key).is_ok_and(|v| {
+                    matches!(
+                        v.trim().to_ascii_lowercase().as_str(),
+                        "1" | "true" | "yes" | "on"
+                    )
+                })
+            });
 
     // Job mode bypasses the classifier rather than consulting it, so the
     // preflight must say so too: a fuzz script is not a compilation and would
     // otherwise be reported `local` — the opposite of what `exec --job` does.
     let pf = preflight(command, proof_policy);
-    let pf = if job { pf.as_job(require_tool) } else { pf };
+    let pf = if job {
+        pf.as_job(require_tool)
+    } else {
+        pf.with_required_tools(require_tool)
+    };
 
     if ctx.is_json() {
         ctx.json(&ApiResponse::ok("admit", &pf))?;

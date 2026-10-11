@@ -880,11 +880,11 @@ fn selected_worker_is_requested(worker: &WorkerId, requested_workers: &[WorkerId
 
 fn exec_worker_preferences(
     exact_worker: Option<WorkerId>,
-    inherited_preferences: Vec<WorkerId>,
+    inherited_preferences: impl FnOnce() -> Vec<WorkerId>,
 ) -> Vec<WorkerId> {
     match exact_worker {
         Some(worker) => vec![worker],
-        None => inherited_preferences,
+        None => inherited_preferences(),
     }
 }
 
@@ -1086,6 +1086,7 @@ fn exit_with_local_fallback_recording(
                 timing: None,
                 result_dirs: None,
                 error_code: None,
+                admission: None,
             });
             if remote_required_refusal_is_retryable(reason) {
                 std::process::exit(EXIT_REMOTE_REQUIRED_REFUSED);
@@ -1117,6 +1118,7 @@ fn exit_with_local_fallback_recording(
                 timing: None,
                 result_dirs: None,
                 error_code: None,
+                admission: None,
             });
             std::process::exit(code)
         }
@@ -1134,6 +1136,7 @@ fn exit_with_local_fallback_recording(
                 timing: None,
                 result_dirs: None,
                 error_code: None,
+                admission: None,
             });
             std::process::exit(EXIT_BUILD_ERROR);
         }
@@ -1536,13 +1539,23 @@ fn selection_is_pending(lease: &DurableJobLease) -> bool {
     )
 }
 
+fn absolute_lease_path(path: PathBuf) -> anyhow::Result<PathBuf> {
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        Ok(std::env::current_dir()
+            .context("resolve relative durable journal root before admission")?
+            .join(path))
+    }
+}
+
 impl DurableLeaseWriter {
     pub(crate) fn load(wrapper_id: &str) -> anyhow::Result<Self> {
         anyhow::ensure!(
             wrapper_id.starts_with("rchw-") && uuid::Uuid::parse_str(&wrapper_id[5..]).is_ok(),
             "invalid wrapper identity"
         );
-        let path = durable_lease_path(wrapper_id);
+        let path = absolute_lease_path(durable_lease_path(wrapper_id))?;
         let lease: DurableJobLease = serde_json::from_slice(&std::fs::read(&path)?)?;
         anyhow::ensure!(
             lease.schema_version == 1 && lease.identity.local_wrapper_id == wrapper_id,
@@ -1556,6 +1569,57 @@ impl DurableLeaseWriter {
 
     pub(crate) fn snapshot(&self) -> DurableJobLease {
         self.lease.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    fn admission_reference(
+        &self,
+        wrapper_id: &str,
+        build_id: u64,
+        worker_id: &WorkerId,
+    ) -> anyhow::Result<ExecAdmissionReference> {
+        // One consistent committed-state observation, without copying the
+        // potentially large recovery recipe. Transitions publish before the
+        // mutex-protected state advances, including terminal acknowledgement.
+        let lease = self.lease.lock().unwrap_or_else(|p| p.into_inner());
+        anyhow::ensure!(
+            lease.schema_version == 1
+                && !selection_is_pending(&lease)
+                && build_id > 0
+                && build_id < (1_u64 << 63)
+                && !worker_id.as_str().trim().is_empty()
+                && self.path.is_absolute()
+                && !wrapper_id.is_empty()
+                && lease.identity.local_wrapper_id == wrapper_id
+                && lease.identity.remote_build_id == Some(build_id)
+                && lease.worker_id.as_deref() == Some(worker_id.as_str()),
+            "compiler admission reference does not match the current durable attempt"
+        );
+        Ok(ExecAdmissionReference {
+            local_wrapper_id: lease.identity.local_wrapper_id.clone(),
+            remote_build_id: build_id.to_string(),
+            worker_id: worker_id.as_str().to_owned(),
+            journal_path: self
+                .path
+                .to_str()
+                .context("admission journal path is not UTF-8")?
+                .to_owned(),
+            terminal_acknowledged: lease.terminal_acknowledged,
+            strict_remote: lease.strict_remote,
+            caller_command_fingerprint: lease.command_fingerprint.clone(),
+        })
+    }
+
+    fn machine_admission_reference(
+        &self,
+        wrapper_id: &str,
+        build_id: u64,
+        worker_id: &WorkerId,
+    ) -> anyhow::Result<Option<ExecAdmissionReference>> {
+        if !remote_result::machine_output() {
+            return Ok(None);
+        }
+        self.admission_reference(wrapper_id, build_id, worker_id)
+            .map(Some)
     }
 
     pub(crate) fn set_recovery(&self, recovery: serde_json::Value) -> anyhow::Result<()> {
@@ -1585,7 +1649,7 @@ impl DurableLeaseWriter {
         self_healing_enabled: bool,
     ) -> anyhow::Result<Self> {
         let identity = JobIdentity::new_local();
-        let path = durable_lease_path(&identity.local_wrapper_id);
+        let path = absolute_lease_path(durable_lease_path(&identity.local_wrapper_id))?;
         let command_fingerprint = format!("blake3:{}", blake3::hash(command.as_bytes()).to_hex());
         let process_birth = rch_common::process_identity::current_process_identity();
         let process_start_ticks =
@@ -1626,6 +1690,12 @@ impl DurableLeaseWriter {
     }
 
     fn admit(&self, remote_build_id: u64, worker_id: &WorkerId) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            remote_build_id > 0
+                && remote_build_id < (1_u64 << 63)
+                && !worker_id.as_str().trim().is_empty(),
+            "daemon admission requires a positive supported build ID and a nonempty worker ID"
+        );
         let mut lease = self
             .lease
             .lock()
@@ -3019,6 +3089,7 @@ pub async fn run_exec(
             timing: None,
             result_dirs: None,
             error_code: Some("RCH-E301"),
+            admission: None,
         });
         std::process::exit(EXIT_BUILD_ERROR);
     }
@@ -3046,7 +3117,8 @@ pub async fn run_exec(
         || clean_overlay
         || source_content_receipt
         || cargo_json_stdout
-        || exact_worker_requested;
+        || exact_worker_requested
+        || !required_tools.is_empty();
 
     // Classify the command. In explicit job-admission mode (`rch exec --job`,
     // bd-bu3fb) the classifier is bypassed entirely and the command is admitted
@@ -3072,6 +3144,7 @@ pub async fn run_exec(
                 timing: None,
                 result_dirs: None,
                 error_code: Some("RCH-E001"),
+                admission: None,
             });
             std::process::exit(2);
         }
@@ -3126,6 +3199,8 @@ pub async fn run_exec(
         }
         tools
     };
+    let required_tools_requested = !required_tools.is_empty();
+    let require_remote = require_remote || required_tools_requested;
 
     // Issue #55: honor the same config knobs the hook honors, so
     // `general.force_local` / `general.enabled` / `execution.allowlist` mean the
@@ -3137,7 +3212,11 @@ pub async fn run_exec(
         let reporter = HookReporter::new(config.output.visibility);
         let reason = policy.reason();
         let refuse_local = if policy.overrides_require_remote() {
-            clean_overlay || source_content_receipt || cargo_json_stdout || exact_worker_requested
+            clean_overlay
+                || source_content_receipt
+                || cargo_json_stdout
+                || exact_worker_requested
+                || required_tools_requested
         } else {
             require_remote || role_requires_remote(config.general.role)
         };
@@ -3294,8 +3373,7 @@ pub async fn run_exec(
     let wait_for_worker = queue_when_busy_enabled();
     // A CLI pin is a singleton admission constraint, never the environment /
     // project preference union. Every retry keeps this same allowed set.
-    let preferred_workers =
-        exec_worker_preferences(exact_worker, command_parsing::preferred_workers());
+    let preferred_workers = exec_worker_preferences(exact_worker, command_parsing::preferred_workers);
     let durable_lease = DurableLeaseWriter::create(
         &command,
         require_remote,
@@ -3608,7 +3686,9 @@ pub async fn run_exec(
             } else {
                 reason
             };
-            reporter.summary(&format!("[RCH] local ({reason})"));
+            if !require_remote {
+                reporter.summary(&format!("[RCH] local ({reason})"));
+            }
             exit_with_local_fallback(&command, &reporter, &reason, require_remote);
         }
 
@@ -3827,6 +3907,9 @@ pub async fn run_exec(
                         timing: Some(&result.timing),
                         result_dirs: Some(&result.result_dirs),
                         error_code: None,
+                        admission: durable_lease.machine_admission_reference(
+                            &wrapper_id, remote_build_id, &worker.id,
+                        )?,
                     });
                     std::process::exit(0);
                 // bd-bu3fb: a job's completed remote command is terminal truth.
@@ -3843,6 +3926,10 @@ pub async fn run_exec(
                         "[RCH] remote {} exceeded its configured deadline (exit {}); not retrying",
                         worker.id, result.exit_code
                     ));
+                    if release_acknowledged && let Err(error) = durable_lease.acknowledge_terminal()
+                    {
+                        warn!("Failed to persist acknowledged deadline terminal state: {error}");
+                    }
                     emit_exec_envelope(&ExecResultEnvelope {
                         api_version: "1.0",
                         command: &remote_command,
@@ -3855,11 +3942,10 @@ pub async fn run_exec(
                         timing: exec_timing.as_ref(),
                         result_dirs: exec_dir_stats.as_deref(),
                         error_code: None,
+                        admission: durable_lease.machine_admission_reference(
+                            &wrapper_id, remote_build_id, &worker.id,
+                        )?,
                     });
-                    if release_acknowledged && let Err(error) = durable_lease.acknowledge_terminal()
-                    {
-                        warn!("Failed to persist acknowledged deadline terminal state: {error}");
-                    }
                     std::process::exit(result.exit_code);
                 } else if !job && is_toolchain_failure(&result.stderr, result.exit_code) {
                     // Worker missing the toolchain — another worker may have it.
@@ -4010,6 +4096,19 @@ pub async fn run_exec(
                         },
                     }
                 } else {
+                    // Genuine build/test failure retains its observed status;
+                    // finish the existing ack attempt before exposing state.
+                    reporter.summary(&format!(
+                        "[RCH] remote {} failed (exit {})",
+                        worker.id, result.exit_code
+                    ));
+                    if release_acknowledged && let Err(error) = durable_lease.acknowledge_terminal()
+                    {
+                        warn!(
+                            "Failed to persist acknowledged durable lease terminal state: {}",
+                            error
+                        );
+                    }
                     emit_exec_envelope(&ExecResultEnvelope {
                         api_version: "1.0",
                         command: &remote_command,
@@ -4022,20 +4121,10 @@ pub async fn run_exec(
                         timing: exec_timing.as_ref(),
                         result_dirs: exec_dir_stats.as_deref(),
                         error_code: None,
+                        admission: durable_lease.machine_admission_reference(
+                            &wrapper_id, remote_build_id, &worker.id,
+                        )?,
                     });
-                    // Genuine build/test failure — the crate is broken and fails
-                    // identically on every worker, so do NOT retry or flood local.
-                    reporter.summary(&format!(
-                        "[RCH] remote {} failed (exit {})",
-                        worker.id, result.exit_code
-                    ));
-                    if release_acknowledged && let Err(error) = durable_lease.acknowledge_terminal()
-                    {
-                        warn!(
-                            "Failed to persist acknowledged durable lease terminal state: {}",
-                            error
-                        );
-                    }
                     std::process::exit(result.exit_code);
                 }
             }
@@ -4131,6 +4220,9 @@ pub async fn run_exec(
                         remote_exit_code: None,
                         duration_ms: Some(exec_start.elapsed().as_millis() as u64),
                         error_code: None,
+                        admission: durable_lease.machine_admission_reference(
+                            &wrapper_id, remote_build_id, &worker.id,
+                        )?,
                     });
                     std::process::exit(EXIT_BUILD_ERROR);
                 }
@@ -4243,6 +4335,12 @@ pub async fn run_exec(
                 // Terminal non-zero exit: the line explaining it must reach the
                 // agent even at stock visibility (rch#31).
                 reporter.summary_critical(&summary);
+                if release_acknowledged && let Err(error) = durable_lease.acknowledge_terminal() {
+                    warn!(
+                        "Failed to persist acknowledged durable lease terminal state: {}",
+                        error
+                    );
+                }
                 emit_exec_envelope(&ExecResultEnvelope {
                     api_version: "1.0",
                     command: &remote_command,
@@ -4255,13 +4353,10 @@ pub async fn run_exec(
                     timing: exec_timing.as_ref(),
                     result_dirs: exec_dir_stats.as_deref(),
                     error_code: None,
+                    admission: durable_lease.machine_admission_reference(
+                        &wrapper_id, remote_build_id, &fault.failed_worker,
+                    )?,
                 });
-                if release_acknowledged && let Err(error) = durable_lease.acknowledge_terminal() {
-                    warn!(
-                        "Failed to persist acknowledged durable lease terminal state: {}",
-                        error
-                    );
-                }
                 std::process::exit(code);
             }
             RemoteFaultExhaustAction::ExitWithEnvRemediation {
@@ -4296,6 +4391,9 @@ pub async fn run_exec(
                     timing: exec_timing.as_ref(),
                     result_dirs: exec_dir_stats.as_deref(),
                     error_code: None,
+                    admission: durable_lease.machine_admission_reference(
+                        &wrapper_id, remote_build_id, &fault.failed_worker,
+                    )?,
                 });
                 std::process::exit(code);
             }
@@ -4510,7 +4608,8 @@ mod source_fidelity;
 // directly from `super::remote_result`.
 mod remote_result;
 use remote_result::{
-    ExecResultDirStat, ExecResultEnvelope, detect_cargo_workspace_inheritance_failure,
+    ExecAdmissionReference, ExecResultDirStat, ExecResultEnvelope,
+    detect_cargo_workspace_inheritance_failure,
     detect_worker_system_dependency_failure, emit_exec_envelope, is_cpu_capability_signal,
     is_signal_killed, is_toolchain_failure, remote_failure_is_disk_full,
     remote_failure_is_worker_fault, set_machine_output, signal_name, wrapped_cpu_capability_signal,

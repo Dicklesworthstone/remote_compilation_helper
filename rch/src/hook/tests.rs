@@ -2061,12 +2061,29 @@ fn exact_exec_worker_overrides_preferences_and_retries_cannot_escape() {
         WorkerId::new("project-worker"),
         WorkerId::new("environment-worker"),
     ];
-    let pinned = exec_worker_preferences(Some(WorkerId::new("native-worker")), inherited.clone());
+    let mut inherited_reads = 0;
+    let pinned = exec_worker_preferences(Some(WorkerId::new("native-worker")), || {
+        inherited_reads += 1;
+        inherited.clone()
+    });
+    assert_eq!(
+        inherited_reads, 0,
+        "an explicit pin must not read merged preferences"
+    );
     assert_eq!(pinned, vec![WorkerId::new("native-worker")]);
-    assert!(selected_worker_is_requested(&WorkerId::new("native-worker"), &pinned));
-    assert!(!selected_worker_is_requested(&WorkerId::new("project-worker"), &pinned));
-    assert!(!selected_worker_is_requested(&WorkerId::new("environment-worker"), &pinned));
-    assert_eq!(exec_worker_preferences(None, inherited.clone()), inherited);
+    assert!(selected_worker_is_requested(
+        &WorkerId::new("native-worker"),
+        &pinned
+    ));
+    assert!(!selected_worker_is_requested(
+        &WorkerId::new("project-worker"),
+        &pinned
+    ));
+    assert!(!selected_worker_is_requested(
+        &WorkerId::new("environment-worker"),
+        &pinned
+    ));
+    assert_eq!(exec_worker_preferences(None, || inherited.clone()), inherited);
     // The same original singleton feeds the capacity retry picker. These are
     // policy inputs, not a live worker/reservation or compilation receipt.
     let snapshots = vec![
@@ -2144,6 +2161,73 @@ fn queued_selection_test_lease(path: PathBuf) -> DurableLeaseWriter {
     };
     writer.persist().unwrap();
     writer
+}
+
+#[test]
+fn compiler_admission_reference_binds_one_durable_attempt_without_rounding() {
+    let _guard = test_guard!();
+    let retained = tempfile::tempdir().unwrap().keep();
+    let journal = retained.join("lease.json");
+    let writer = queued_selection_test_lease(journal.clone());
+    let wrapper = writer.wrapper_id();
+    let worker = WorkerId::new("attempt-worker-fixture");
+    let build = 9_007_199_254_740_993_u64;
+    let before = std::fs::read(&journal).unwrap();
+    for invalid_build in [0, 1_u64 << 63, u64::MAX] {
+        assert!(writer.admit(invalid_build, &worker).is_err());
+        assert!(writer.admission_reference(&wrapper, invalid_build, &worker).is_err());
+    }
+    for invalid_worker in ["", " \t"] {
+        assert!(writer.admit(build, &WorkerId::new(invalid_worker)).is_err());
+    }
+    assert_eq!(std::fs::read(&journal).unwrap(), before);
+    assert_eq!(
+        absolute_lease_path(PathBuf::from("relative-journal.json")).unwrap(),
+        std::env::current_dir().unwrap().join("relative-journal.json")
+    );
+    assert_eq!(absolute_lease_path(journal.clone()).unwrap(), journal);
+    assert!(writer.admission_reference(&wrapper, build, &worker).is_err());
+    writer.admit(build, &worker).unwrap();
+    let reference = writer.admission_reference(&wrapper, build, &worker).unwrap();
+    let value = serde_json::to_value(&reference).unwrap();
+    assert_eq!(value["remote_build_id"], "9007199254740993");
+    assert_eq!(value["local_wrapper_id"], wrapper);
+    assert_eq!(value["worker_id"], worker.as_str());
+    assert_eq!(value["journal_path"], journal.to_str().unwrap());
+    assert_eq!(value["terminal_acknowledged"], false);
+    let persisted: DurableJobLease =
+        serde_json::from_slice(&std::fs::read(&journal).unwrap()).unwrap();
+    assert_eq!(persisted.identity.remote_build_id, Some(build));
+    assert_eq!(persisted.worker_id.as_deref(), Some(worker.as_str()));
+    assert!(
+        writer.admission_reference("other-wrapper", build, &worker).is_err()
+    );
+    assert!(writer.admission_reference(&wrapper, build + 1, &worker).is_err());
+    assert!(
+        writer.admission_reference(&wrapper, build, &WorkerId::new("other-worker")).is_err()
+    );
+    writer.record_exit(0).unwrap();
+    let intent = writer.begin_retry_selection(true).unwrap();
+    assert!(writer.admission_reference(&wrapper, build, &worker).is_err());
+    writer.restore_after_unadmitted_retry(intent).unwrap();
+    assert!(
+        !writer.admission_reference(&wrapper, build, &worker).unwrap().terminal_acknowledged
+    );
+    assert!(writer.admission_reference(&wrapper, build + 1, &worker).is_err());
+    writer.acknowledge_terminal().unwrap();
+    assert!(
+        writer.admission_reference(&wrapper, build, &worker).unwrap().terminal_acknowledged
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        let mut invalid_path = writer.clone();
+        invalid_path.path = retained.join(std::ffi::OsString::from_vec(vec![0xff]));
+        assert!(invalid_path.admission_reference(&wrapper, build, &worker).is_err());
+    }
+    // Real retained journal I/O with supplied fixture identity, not a live
+    // worker, SDK, reservation or compilation proof.
+    assert!(journal.is_file());
 }
 
 fn retry_selection_test_lease(path: PathBuf) -> DurableLeaseWriter {

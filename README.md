@@ -427,11 +427,13 @@ mode when qualifying a build so an older daemon cannot silently run it locally.
 
 #### Requiring a verified tool
 
-A job that needs a tool the fleet does not uniformly have can demand a worker
+A compilation or job that needs a tool the fleet does not uniformly have can demand a worker
 that has **verified** it:
 
 ```bash
 rch exec --job --require-tool clang -- ./native_fuzz.sh
+rch exec --require-tool cargo-xwin --require-tool llvm-ar -- \
+  cargo xwin build --locked --release --target x86_64-pc-windows-msvc --bin my-cli
 ```
 
 The gate runs before any slot is reserved, and it is evidence-based: the worker
@@ -444,16 +446,24 @@ make the requirement a default for all of its jobs:
 required_tools = ["clang"]
 ```
 
-Project defaults ADD to `--require-tool` rather than being replaced by it, and
-both apply to job mode only — a project-wide requirement that silently narrowed
-every ordinary build's worker pool would be a surprising way to lose the fleet.
+Project defaults ADD to `--require-tool` in job mode. These `[jobs]` defaults
+apply only to jobs; explicit CLI requirements also apply to compilations while
+preserving their classifier, Rust target and toolchain checks. Any required tool
+makes execution strict remote, including when configuration forces local or
+disables RCH. Both client and daemon must support the verified-tools endpoint;
+an older daemon refuses the request instead of silently ignoring requirements.
 
-`rch admit --job [--require-tool NAME]... -- <command>` preflights the same
+A successful named probe establishes cached tool presence. It does not bind the
+executable bytes, compiler version or SDK inventory used by a particular build.
+
+`rch admit [--job] [--require-tool NAME]... -- <command>` preflights the same
 decision read-only — it syncs nothing and reserves nothing. Without `--job` the
 preflight consults the compilation classifier, so a fuzz script answers
 `local`; with it the classifier is bypassed exactly as `exec --job` does, and
 the answer is `offload`. The classification facts are still reported, so a
 compilation accidentally passed to `--job` still shows its family.
+This static preflight reports requirements and classification; it does not
+verify current worker readiness or establish native release qualification.
 
 A required name that no worker has verified admits **no worker at all**,
 including when the name is a typo. That is deliberate: silently dropping the

@@ -67,6 +67,20 @@ pub(super) struct ExecResultDirStat {
 /// remote command ran and its outputs were handled (whatever the exit code),
 /// `deadline_exceeded` means the launcher enforced its deadline (exit 137),
 /// `transport_error` / `collection_error` mean RCH itself failed to deliver.
+/// Observed admission/journal reference, not a source, SDK or slot attestation.
+/// Decimal build IDs preserve the daemon's complete u64 identity in JS clients.
+/// Journal acknowledgement is not an acknowledgement of this stdout delivery.
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct ExecAdmissionReference {
+    pub local_wrapper_id: String,
+    pub remote_build_id: String,
+    pub worker_id: String,
+    pub journal_path: String,
+    pub terminal_acknowledged: bool,
+    pub strict_remote: bool,
+    pub caller_command_fingerprint: String,
+}
+
 #[derive(Debug, serde::Serialize)]
 pub(crate) struct ExecResultEnvelope<'a> {
     pub api_version: &'static str,
@@ -87,6 +101,8 @@ pub(crate) struct ExecResultEnvelope<'a> {
     pub result_dirs: Option<&'a [ExecResultDirStat]>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_code: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub admission: Option<ExecAdmissionReference>,
 }
 
 /// Whether THIS invocation requested machine output on stdout (bd-uoh4x).
@@ -103,13 +119,25 @@ pub(super) fn machine_output() -> bool {
 }
 
 /// Print the execution envelope to stdout when machine output is active.
-/// Never prints otherwise and never touches stderr (diagnostics stream).
+/// Never prints otherwise; delivery failures use stderr and a nonzero exit.
 pub(super) fn emit_exec_envelope(env: &ExecResultEnvelope<'_>) {
     if !machine_output() {
         return;
     }
-    if let Ok(line) = serde_json::to_string(env) {
-        println!("{line}");
+    use std::io::Write;
+    let delivered = serde_json::to_string(env)
+        .map_err(|error| error.to_string())
+        .and_then(|line| {
+            writeln!(std::io::stdout().lock(), "{line}").map_err(|error| error.to_string())
+        });
+    if let Err(error) = delivered {
+        // A lost result is failure even if compilation succeeded. Avoid a
+        // panic or a second stdout document when either stream is closed.
+        let _ = writeln!(
+            std::io::stderr().lock(),
+            "[RCH] execution result output failed: {error}"
+        );
+        std::process::exit(super::EXIT_BUILD_ERROR);
     }
 }
 

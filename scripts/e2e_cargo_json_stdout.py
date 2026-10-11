@@ -135,13 +135,54 @@ def main():
         outcomes.append({"case": name, "returncode": result.returncode})
         return result, case
 
-    def spawn_with_closed_stdout(argv, environment, diagnostics):
+    def admitted_journal(payload, case, expected_build=None):
+        # Read the real producer's stored journal. This is identity/recovery
+        # linkage only, not a composite source/toolchain/SDK/slot attestation.
+        reference = payload.get("admission")
+        require(isinstance(reference, dict), "Machine compiler output lacks its admission reference")
+        wrapper = reference.get("local_wrapper_id", "")
+        build = reference.get("remote_build_id", "")
+        require(isinstance(wrapper, str) and wrapper.startswith("rchw-")
+                and isinstance(build, str) and build.isascii() and build.isdecimal() and int(build) > 0
+                and reference.get("worker_id") == args.worker
+                and reference.get("terminal_acknowledged") is True
+                and reference.get("strict_remote") is True,
+                "Machine compiler identity is missing, unconfirmed or bound to a different worker")
+        require(str(uuid.UUID(wrapper[5:])) == wrapper[5:], "Machine wrapper identity is not canonical")
+        if expected_build is not None:
+            require(build == expected_build, "Machine admission and real source receipt name different builds")
+        selected = reference.get("journal_path")
+        require(isinstance(selected, str), "Machine admission lacks its actual journal path")
+        journal_path = Path(selected)
+        require(journal_path.is_absolute() and not journal_path.is_symlink() and journal_path.is_file(),
+                "Machine admission journal is missing, a symlink or relative")
+        original = journal_path.read_bytes()
+        journal = json.loads(original)
+        require(journal.get("schema_version") == 1
+                and journal.get("identity", {}).get("local_wrapper_id") == wrapper
+                and journal.get("identity", {}).get("remote_build_id") == int(build)
+                and journal.get("worker_id") == args.worker
+                and journal.get("terminal_acknowledged") is True
+                and journal.get("strict_remote") is True
+                and journal.get("command_fingerprint") == reference.get("caller_command_fingerprint"),
+                "Machine admission disagrees with its real durable ownership record")
+        observed_exit = payload.get("remote_exit_code")
+        if observed_exit is not None:
+            require(type(observed_exit) is int and type(journal.get("exit_code")) is int
+                    and journal["exit_code"] == observed_exit,
+                    "Machine command status differs from its actual retained exit observation")
+        with (case / "admission-journal.bin").open("xb") as retained:
+            retained.write(original)
+        require(journal_path.read_bytes() == original, "Journal changed while checking terminal identity")
+        return reference
+
+    def spawn_with_closed_stdout(argv, environment, diagnostics, working_directory=None):
         # Close the read endpoint before spawning: closing child.stdout after
         # spawn races a child that writes before the parent closes it.
         reader, writer = os.pipe()
         os.close(reader)
         try:
-            return subprocess.Popen(argv, cwd=source, env=environment,
+            return subprocess.Popen(argv, cwd=source if working_directory is None else working_directory, env=environment,
                                     stdout=writer,
                                     stderr=writer if diagnostics is None else diagnostics)
         finally:
@@ -152,6 +193,89 @@ def main():
     # This is not the ordinary closure route, a Windows positive, or proof that
     # every canonical checkout byte/metadata stayed unchanged; those need their
     # original independent before/after and runtime qualification.
+    # Explicit-worker policy is checked using real private configuration, with
+    # no compiler/service substitute. The deliberately absent bin cannot be a
+    # positive build; these cases qualify only refusal before local execution.
+    for policy, settings, reason in [
+        ("force-local", b"[general]\nenabled = true\nforce_local = true\nforce_remote = false\n", "force_local"),
+        ("disabled", b"[general]\nenabled = false\n", "rch disabled (general.enabled=false)"),
+    ]:
+        policy_root = evidence / ("exact-worker-policy-" + policy)
+        policy_root.mkdir()
+        policy_config = policy_root / "config.toml"
+        with policy_config.open("xb") as config_file:
+            config_file.write(settings)
+        policy_env = {key: value for key, value in env.items() if not key.startswith("GIT_")}
+        for name in ("RCH_CARGO_JSON_STDOUT", "RCH_JSON", "RCH_OUTPUT_FORMAT", "RCH_DAEMON_SOCKET",
+                     "RCH_ENABLED", "RCH_FORCE_REMOTE"):
+            policy_env.pop(name, None)
+        policy_env.update({"RCH_CONFIG_DIR": str(policy_root), "RCH_REQUIRE_REMOTE": "0",
+                           "RCH_DISABLE_CONFIG_CACHE": "1", "RCH_NO_UPDATE_CHECK": "1",
+                           "XDG_STATE_HOME": str(policy_root / "state"),
+                           "RCH_LOG_FILE": str(policy_root / "policy.log")})
+        git_env = {key: value for key, value in policy_env.items() if not key.startswith("GIT_")}
+        boundary, _ = run("exact-worker-policy-root-" + policy,
+                          ["git", "init", "--quiet", "--initial-branch=main", "--template=", str(policy_root)],
+                          git_env, timeout_seconds=30, working_directory=policy_root)
+        require(boundary.returncode == 0, "Could not bound actual private policy discovery")
+        refused, _ = run("exact-worker-refuses-" + policy,
+                         [str(args.rch), "--json", "exec", "--worker", args.worker, "--",
+                          "cargo", "build", "--bin", "absent-policy-target-" + token],
+                         policy_env, timeout_seconds=30, working_directory=policy_root)
+        result = json.loads(refused.stdout)
+        require(refused.returncode != 0 and result.get("outcome") == "refused"
+                and result.get("fallback_reason") == reason and result.get("worker_id") is None
+                and result.get("remote_exit_code") is None and result.get("admission") is None
+                and b"[RCH] local" not in refused.stderr,
+                "Explicit native worker permitted configured local execution or lost the refusal")
+        require(policy_config.read_bytes() == settings and not (policy_root / "target").exists()
+                and not any(physical_target.iterdir()),
+                "Policy refusal changed private input or produced local Cargo output")
+        tool_refusal, _ = run("compiler-tool-refuses-" + policy,
+            [str(args.rch), "--json", "exec", "--require-tool", "cargo-xwin", "--",
+             "cargo", "build", "--bin", "absent-policy-target-" + token],
+            policy_env, timeout_seconds=30, working_directory=policy_root)
+        tool_result = json.loads(tool_refusal.stdout)
+        require(tool_refusal.returncode != 0 and tool_result.get("outcome") == "refused"
+                and tool_result.get("fallback_reason") == reason
+                and tool_result.get("worker_id") is None and tool_result.get("admission") is None
+                and tool_result.get("remote_exit_code") is None
+                and b"[RCH] local" not in tool_refusal.stderr
+                and policy_config.read_bytes() == settings and not (policy_root / "target").exists()
+                and not any(physical_target.iterdir()),
+                "Verified compiler tool requirement permitted explicit configured local execution")
+        if policy == "force-local":
+            for closed_stderr in (False, True):
+                name = "admission-refusal-closed-" + ("both-streams" if closed_stderr else "stdout")
+                case = evidence / name
+                case.mkdir()
+                argv = [str(args.rch), "--json", "exec", "--worker", args.worker, "--",
+                        "cargo", "build", "--bin", "absent-policy-target-" + token]
+                (case / "argv.json").write_text(json.dumps(argv) + "\n")
+                with (case / "stderr.bin").open("xb") as diagnostics:
+                    child = spawn_with_closed_stdout(argv, policy_env,
+                        None if closed_stderr else diagnostics, working_directory=policy_root)
+                    try:
+                        code = child.wait(timeout=30)
+                    except subprocess.TimeoutExpired:
+                        (case / "termination.json").write_text(json.dumps({
+                            "state": "timeout", "timeout_seconds": 30, "child_pid": child.pid,
+                            "child_stopped": False, "output_complete": False}) + "\n")
+                        raise
+                (case / "returncode.txt").write_text(str(code) + "\n")
+                outcomes.append({"case": name, "returncode": code})
+                require(code == 1, "Lost compiler-refusal output was swallowed or panicked")
+                if not closed_stderr:
+                    transcript = (case / "stderr.bin").read_bytes()
+                    sys.stderr.buffer.write(transcript)
+                    sys.stderr.buffer.flush()
+                    require(b"execution result output failed" in transcript
+                            and b"broken pipe" in transcript.lower() and b"panicked" not in transcript,
+                            "Compiler-refusal delivery lost the actual output error")
+                # Both closed streams expose status only, not diagnostics.
+                require(policy_config.read_bytes() == settings and not any(physical_target.iterdir()),
+                        "Lost refusal output changed private policy or generated compiler artifacts")
+
     closure_target = target_base / ("source-content closure " + token)
     closure_target.mkdir()
     closure_env = dict(env)
@@ -168,9 +292,9 @@ def main():
     closure_command = ["cargo", "check", "--locked", "-j1", "-p", args.closure_package]
     closure_manifests = {str(path): sha256(path) for path in
                          (closure_source / "Cargo.toml", closure_source / "Cargo.lock")}
-    isolated, _ = run("source-content-isolated-closure",
+    isolated, isolated_case = run("source-content-isolated-closure",
                       [str(args.rch), "--json", "--format", "json", "exec",
-                       "--source-content-receipt", "--"] + closure_command,
+                       "--worker", args.worker, "--source-content-receipt", "--"] + closure_command,
                       closure_env, working_directory=closure_source)
     envelope = json.loads(isolated.stdout)
     require(isolated.returncode == 0 and envelope.get("api_version") == "1.0"
@@ -194,6 +318,7 @@ def main():
             and receipt.get("root_count") == len(roots) and len(roots) >= 2
             and sum(root.get("is_primary") is True for root in roots) == 1,
             "The actual source receipt lost worker/command/closure identity")
+    admitted_journal(envelope, isolated_case, expected_build=build_id)
     primary_root = next(root for root in roots if root.get("is_primary") is True)
     primary_manifests = [file for file in primary_root.get("files", [])
                          if file.get("path") == "Cargo.toml"]
@@ -947,11 +1072,14 @@ def main():
     require(consume.returncode == 0, "The actual installer consumer or its real-artifact negatives failed")
     ordinary_env = env.copy()
     ordinary_env.pop("RCH_CARGO_JSON_STDOUT")
-    envelope, _ = run("ordinary-machine-envelope", [str(args.rch), "--json", "exec", "--"] + command, ordinary_env)
+    envelope, envelope_case = run("ordinary-machine-envelope",
+                      [str(args.rch), "--json", "exec", "--worker", args.worker, "--"] + command, ordinary_env)
     require(envelope.returncode == 0, "The ordinary machine-envelope build failed")
     payload = json.loads(envelope.stdout)
     require(payload.get("outcome") == "completed" and payload.get("location") == "remote"
-            and payload.get("remote_exit_code") == 0, "Machine stdout contains compiler records or lacks its remote envelope")
+            and payload.get("worker_id") == args.worker and payload.get("remote_exit_code") == 0,
+            "Machine stdout contains compiler records or lacks its exact-worker remote envelope")
+    admitted_journal(payload, envelope_case)
     before_failure, _ = run("jobs-before-genuine-failure", [str(args.rch), "--json", "jobs"], env)
     require(before_failure.returncode == 0, "Actual pre-failure job observation failed")
     before_listing = json.loads(before_failure.stdout)

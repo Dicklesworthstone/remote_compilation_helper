@@ -1939,15 +1939,19 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
         }
     }
 
-    let Some((query, resume_queued, disk_budget_route)) = [
-        ("/select-worker", false, false),
-        ("/select-worker/resume-queued", true, false),
-        ("/select-worker/disk-budget", false, true),
-        ("/select-worker/resume-queued/disk-budget", true, true),
+    let Some((query, resume_queued, disk_budget_route, tools_route)) = [
+        ("/select-worker", false, false, false),
+        ("/select-worker/resume-queued", true, false, false),
+        ("/select-worker/disk-budget", false, true, false),
+        ("/select-worker/resume-queued/disk-budget", true, true, false),
+        ("/select-verified-tools", false, false, true),
+        ("/select-verified-tools/resume-queued", true, false, true),
+        ("/select-verified-tools/disk-budget", false, true, true),
+        ("/select-verified-tools/resume-queued/disk-budget", true, true, true),
     ]
     .into_iter()
-    .find_map(|(route, resume, disk_budget)| {
-        query_for_exact_route(path, route).map(|query| (query, resume, disk_budget))
+    .find_map(|(route, resume, disk_budget, tools)| {
+        query_for_exact_route(path, route).map(|query| (query, resume, disk_budget, tools))
     }) else {
         return Err(anyhow!("Unknown endpoint: {}", path));
     };
@@ -2061,6 +2065,10 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
     anyhow::ensure!(
         disk_budget_route == (disk_headroom_gib > 0),
         "A positive disk_headroom_gib requires the exact disk-budget selection route"
+    );
+    anyhow::ensure!(
+        !tools_route || !required_tools.is_empty(),
+        "The verified-tools selection route requires explicit tool requirements"
     );
     if resume_queued
         && (dry_run || !wait_for_worker || local_wrapper_id.is_none() || hook_pid.is_none())
@@ -5033,6 +5041,54 @@ mod tests {
             assert!(parse_request(line).is_err(), "{line}");
         }
         assert!(parse_request(&format!("{base}&dry_run=1")).is_err());
+    }
+
+    #[test]
+    fn verified_tools_routes_bind_requirements_to_selection_and_queue_recovery() {
+        for (route, resume, budget) in [
+            ("/select-verified-tools", false, 0),
+            ("/select-verified-tools/resume-queued", true, 0),
+            ("/select-verified-tools/disk-budget", false, 64),
+            ("/select-verified-tools/resume-queued/disk-budget", true, 64),
+        ] {
+            let disk = if budget == 0 {
+                String::new()
+            } else {
+                format!("&disk_headroom_gib={budget}")
+            };
+            let base = format!(
+                "GET {route}?project=p&command=cargo%20xwin%20build&wait=1&local_wrapper_id=rchw-owner&hook_pid=123{disk}"
+            );
+            assert!(parse_request(&base).is_err(), "missing tools: {base}");
+            let ApiRequest::SelectWorker {
+                mut request,
+                resume_queued,
+                ..
+            } = parse_request(&format!(
+                "{base}&require_tool=cargo-xwin&require_tool=llvm-ar&require_tool=cargo-xwin"
+            ))
+            .expect("explicit verified tool requirements")
+            else {
+                panic!("expected selection")
+            };
+            assert_eq!(request.required_tools, vec!["cargo-xwin", "llvm-ar"]);
+            assert_eq!(request.command.as_deref(), Some("cargo xwin build"));
+            assert_eq!(request.disk_headroom_gib, budget);
+            assert_eq!(resume_queued, resume);
+            assert!(!request.job_mode);
+            let constrained = queue_selection_digest(&request, Some(30)).unwrap();
+            request.required_tools.pop();
+            assert_ne!(constrained, queue_selection_digest(&request, Some(30)).unwrap());
+        }
+        for line in [
+            "GET /select-verified-tools-extra?project=p&require_tool=cargo-xwin",
+            "GET /select-verified-tools?project=p&require_tool=&require_tool=%20",
+            "GET /select-verified-tools?project=p&require_tool=cargo-xwin&disk_headroom_gib=64",
+            "GET /select-verified-tools/disk-budget?project=p&require_tool=cargo-xwin",
+            "GET /select-verified-tools/resume-queued?project=p&require_tool=cargo-xwin",
+        ] {
+            assert!(parse_request(line).is_err(), "accepted {line}");
+        }
     }
 
     #[test]

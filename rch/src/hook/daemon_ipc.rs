@@ -44,6 +44,7 @@ async fn resume_queued_selection(
     query: &str,
     deadline: tokio::time::Instant,
     disk_headroom_gib: u32,
+    required_tools: bool,
 ) -> anyhow::Result<SelectionResponse> {
     let result = async {
         let stream = loop {
@@ -73,7 +74,7 @@ async fn resume_queued_selection(
             }
         };
         let (reader, mut writer) = stream.into_split();
-        let route = selection_route(disk_headroom_gib, true);
+        let route = selection_route(disk_headroom_gib, true, required_tools);
         let request = format!("GET {route}?{query}\n");
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         anyhow::ensure!(
@@ -512,9 +513,8 @@ async fn query_daemon_with_mode(
         query.push_str("&job_mode=1");
     }
 
-    // Verified named-tool requirements (bd-ceewf), repeatable. Job mode only —
-    // the compilation classifier never produces them, so ordinary offloaded
-    // builds send a byte-identical query.
+    // Verified named-tool requirements are valid for compilation and jobs.
+    // Their dedicated endpoint prevents older daemons ignoring these keys.
     for tool in required_tools {
         query.push_str(&format!("&require_tool={}", urlencoding_encode(tool)));
     }
@@ -538,7 +538,7 @@ async fn query_daemon_with_mode(
     }
 
     // Bound writes independently from the longer, queue-aware response wait.
-    let route = selection_route(disk_headroom_gib, false);
+    let route = selection_route(disk_headroom_gib, false, !required_tools.is_empty());
     let request = format!("GET {route}?{query}\n");
     let response_budget = daemon_response_timeout(wait_for_worker);
     let deadline = tokio::time::Instant::now() + response_budget;
@@ -576,7 +576,14 @@ async fn query_daemon_with_mode(
             // The query is byte-identical, including the original timeout,
             // worker pins and toolchain/tool constraints. The daemon checks
             // these against durable queue ownership before selecting.
-            resume_queued_selection(socket_path, &query, deadline, disk_headroom_gib).await?
+            resume_queued_selection(
+                socket_path,
+                &query,
+                deadline,
+                disk_headroom_gib,
+                !required_tools.is_empty(),
+            )
+            .await?
         }
         Err(error) => return Err(error),
     };
@@ -633,15 +640,19 @@ async fn query_daemon_with_mode(
     Ok(response)
 }
 
-/// Positive budgets use an exact route that older daemons cannot admit.
-/// Merely adding a query parameter would let an older daemon ignore the hard
-/// requirement and reserve a worker without accounting for any disk budget.
-fn selection_route(disk_headroom_gib: u32, resume: bool) -> &'static str {
-    match (disk_headroom_gib > 0, resume) {
-        (false, false) => "/select-worker",
-        (false, true) => "/select-worker/resume-queued",
-        (true, false) => "/select-worker/disk-budget",
-        (true, true) => "/select-worker/resume-queued/disk-budget",
+/// Hard requirements use exact routes that older daemons cannot admit.
+/// The tools endpoint deliberately has a different prefix: a daemon with an
+/// old permissive /select-worker prefix parser must not ignore tool constraints.
+fn selection_route(disk_headroom_gib: u32, resume: bool, required_tools: bool) -> &'static str {
+    match (disk_headroom_gib > 0, resume, required_tools) {
+        (false, false, false) => "/select-worker",
+        (false, true, false) => "/select-worker/resume-queued",
+        (true, false, false) => "/select-worker/disk-budget",
+        (true, true, false) => "/select-worker/resume-queued/disk-budget",
+        (false, false, true) => "/select-verified-tools",
+        (false, true, true) => "/select-verified-tools/resume-queued",
+        (true, false, true) => "/select-verified-tools/disk-budget",
+        (true, true, true) => "/select-verified-tools/resume-queued/disk-budget",
     }
 }
 
@@ -997,6 +1008,20 @@ mod daemon_io_timeout_tests {
 #[cfg(test)]
 mod bounded_ipc_tests {
     use super::*;
+
+    #[test]
+    fn tool_requirement_routes_never_fall_back_to_legacy_selection() {
+        for (budget, resume, expected) in [
+            (0, false, "/select-verified-tools"),
+            (0, true, "/select-verified-tools/resume-queued"),
+            (64, false, "/select-verified-tools/disk-budget"),
+            (64, true, "/select-verified-tools/resume-queued/disk-budget"),
+        ] {
+            assert_eq!(selection_route(budget, resume, true), expected);
+            assert!(!selection_route(budget, resume, true).starts_with("/select-worker"));
+        }
+        assert_eq!(selection_route(0, false, false), "/select-worker");
+    }
 
     #[tokio::test]
     async fn unresolved_rust_queries_never_connect_or_create_a_queue_owner() {

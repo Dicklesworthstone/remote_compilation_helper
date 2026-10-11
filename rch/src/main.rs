@@ -51,6 +51,17 @@ fn parse_exec_worker(value: &str) -> std::result::Result<rch_common::WorkerId, S
     Ok(rch_common::WorkerId::new(value))
 }
 
+fn parse_required_tool(value: &str) -> std::result::Result<String, String> {
+    if value.is_empty()
+        || !value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'+')
+        })
+    {
+        return Err("--require-tool must name one declared tool using letters, digits, - _ . +".into());
+    }
+    Ok(value.to_owned())
+}
+
 #[derive(Parser)]
 #[command(name = "rch")]
 #[command(
@@ -566,9 +577,9 @@ wiped. Without --force (or with --dry-run) it only previews the plan."#)]
         /// workload preflights as offload-eligible rather than `local`.
         #[arg(long)]
         job: bool,
-        /// Named tool the job requires a worker to have verified. Repeatable;
-        /// requires --job. Read-only here — nothing is synced or reserved.
-        #[arg(long, value_name = "NAME", requires = "job")]
+        /// Named tool the compilation or job requires a worker to have verified.
+        /// Repeatable. Read-only here — nothing is synced or reserved.
+        #[arg(long, value_name = "NAME", value_parser = parse_required_tool)]
         require_tool: Vec<String>,
         /// Command to preflight (quote or pass as multiple args)
         #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
@@ -641,7 +652,7 @@ USAGE:
         result_dir: Vec<PathBuf>,
         /// Require a worker that has VERIFIED this operator-declared tool
         /// (`[[workers]] tools = [{ name = "...", command = [...] }]`).
-        /// Repeatable; requires --job.
+        /// Repeatable for compilation or jobs; requires verified remote execution.
         ///
         /// The gate runs before any slot is reserved, and it is evidence-based:
         /// the worker must have run the declared probe successfully. A name no
@@ -650,7 +661,7 @@ USAGE:
         /// machine that cannot run it, and job mode returns the remote exit
         /// status verbatim, so that failure is indistinguishable from the
         /// job's own.
-        #[arg(long, value_name = "NAME", requires = "job")]
+        #[arg(long, value_name = "NAME", value_parser = parse_required_tool)]
         require_tool: Vec<String>,
         /// Execute on this exact worker; overrides environment/project preferences.
         /// Refuses local execution or a different worker when unavailable.
@@ -7221,6 +7232,30 @@ mod tests {
             "--result-dir",
         ] {
             assert!(help.contains(flag), "exec help missing {flag}: {help}");
+        }
+    }
+
+    #[test]
+    fn explicit_tools_remain_compiler_requirements_without_job_bypass() {
+        let _guard = test_guard!();
+        for verb in ["exec", "admit"] {
+            let cli = Cli::try_parse_from([
+                "rch", verb, "--require-tool", "cargo-xwin", "--require-tool", "llvm-ar",
+                "--", "cargo", "xwin", "build", "--release",
+            ]).unwrap();
+            match cli.command {
+                Some(Commands::Exec { require_tool, job, .. })
+                | Some(Commands::Admit { require_tool, job, .. }) => {
+                    assert!(!job);
+                    assert_eq!(require_tool, vec!["cargo-xwin", "llvm-ar"]);
+                }
+                _ => fail_expected("Expected normal compiler requirements"),
+            }
+            for name in ["", "tool one", "one,two", "tool=value", "tool\n"] {
+                assert!(Cli::try_parse_from([
+                    "rch", verb, "--require-tool", name, "--", "cargo", "build",
+                ]).is_err());
+            }
         }
     }
 

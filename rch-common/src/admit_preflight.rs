@@ -416,6 +416,16 @@ pub fn preflight(command: &str, proof_policy: bool) -> AdmitPreflight {
 }
 
 impl AdmitPreflight {
+    /// Add explicit compiler capabilities without bypassing classification or
+    /// replacing the command's existing Rust/target/toolchain requirements.
+    #[must_use]
+    pub fn with_required_tools(mut self, required_tools: Vec<String>) -> Self {
+        self.required.needs_tools.extend(required_tools);
+        self.required.needs_tools.sort();
+        self.required.needs_tools.dedup();
+        self
+    }
+
     /// Re-frame a preflight as a JOB-mode admission (`rch exec --job`).
     ///
     /// Job mode bypasses the compilation classifier rather than consulting it,
@@ -499,6 +509,23 @@ mod tests {
     use crate::admission_rejection::{
         AdmissionRejectionCategory, CandidateRejection, aggregate_rejections,
     };
+
+    #[test]
+    fn compiler_tool_requirements_preserve_rust_target_and_classification() {
+        let original = preflight("cargo build --target x86_64-pc-windows-msvc --release", true);
+        let observed = original.clone().with_required_tools(vec![
+            "cargo-xwin".into(), "llvm-ar".into(), "cargo-xwin".into(),
+        ]);
+        assert_eq!(observed.is_compilation, original.is_compilation);
+        assert_eq!(observed.family, original.family);
+        assert_eq!(observed.base_recommendation, original.base_recommendation);
+        assert_eq!(observed.required.needs_targets, original.required.needs_targets);
+        assert_eq!(observed.required.needs_toolchains, original.required.needs_toolchains);
+        assert!(observed.required.needs_cargo);
+        assert!(!observed.job_mode);
+        assert!(observed.proof_policy);
+        assert_eq!(observed.required.needs_tools, vec!["cargo-xwin", "llvm-ar"]);
+    }
 
     #[test]
     fn job_mode_preflight_is_offload_eligible_whatever_the_classifier_said() {

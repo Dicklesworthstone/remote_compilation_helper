@@ -256,10 +256,19 @@ Jobs require them with `rch exec --job --require-tool NAME`, or per project:
 required_tools = ["clang"]
 ```
 
-Project defaults add to `--require-tool` rather than replacing it, and both
-apply to **job mode only**. A required tool no worker has verified admits no
+Project defaults add to `--require-tool` in **job mode only**. Explicit
+`--require-tool NAME` also applies to normal compilations without bypassing
+their classifier or Rust target/toolchain requirements. Required tools demand
+strict remote execution; forced-local or disabled configuration refuses them.
+Both client and daemon need the verified-tools endpoint; older daemons reject
+it before worker reservation instead of ignoring the requirement.
+
+A required tool no worker has verified admits no
 worker at all; selection reports
 `capability_missing:tool:<name>:probe_failed` or `...:not_declared`.
+These cached presence probes do not identify the actual compiler or SDK bytes
+used in a particular build. `rch admit --require-tool NAME -- <command>` is a
+static requirement preview, not live worker or release qualification.
 
 ## Daemon Config (`daemon.toml`)
 
