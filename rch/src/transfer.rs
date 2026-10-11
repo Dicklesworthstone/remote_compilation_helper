@@ -2698,7 +2698,9 @@ impl TransferPipeline {
         // both followers alive forever, so recovery could never acquire the
         // activity lock to prove the execution lost. Reap the followers on
         // that failure too; surviving workload descendants still inherit the
-        // lock and continue to fence recovery until they actually exit.
+        // lock and continue to fence recovery until they actually exit. Keep
+        // the failure diagnostic in the saved log: even a short write to an
+        // abandoned SSH channel can block before the EXIT cleanup runs.
         format!(
             "set -e; rch_umask=$(umask); umask 077; mkdir -p -- {directory}; mkdir {claim}; : > {out}; : > {err}; : > {out_progress}; : > {err_progress}; umask \"$rch_umask\"; \
              nohup sh -c {supervisor} </dev/null >{out} 2>{err} & \
@@ -2712,7 +2714,7 @@ impl TransferPipeline {
              rch_follow {out} {out_progress} & a=$!; rch_follow {err} {err_progress} >&2 & b=$!; \
              trap 'kill \"$a\" \"$b\" 2>/dev/null || :; wait \"$a\" 2>/dev/null || :; wait \"$b\" 2>/dev/null || :' EXIT; \
              wait \"$p\" || :; \
-             [ -f {done} ] || {{ printf '%s\\n' 'RCH: remote execution ended without a durable completion receipt' >&2; exit 1; }}; \
+             [ -f {done} ] || {{ printf '%s\\n' 'RCH: remote execution ended without a durable completion receipt' 2>/dev/null >> {err} || :; exit 1; }}; \
              last=; still=0; \
              while [ \"$(cat {out_progress} {err_progress})\" != \"$(printf 'done\\ndone')\" ]; do \
                now=$(cat {out_progress} {err_progress}); \
@@ -8647,7 +8649,8 @@ mod tests {
         let output = run();
         assert_eq!(output.status.code(), Some(1), "{output:?}");
         assert!(
-            String::from_utf8_lossy(&output.stderr)
+            std::fs::read_to_string(format!("{receipt}.stderr"))
+                .unwrap()
                 .contains("remote execution ended without a durable completion receipt"),
             "{output:?}"
         );
@@ -8742,6 +8745,86 @@ mod tests {
         }
         assert_eq!(std::fs::read_to_string(finished).unwrap(), "finished\n");
         assert!(!Path::new(receipt).exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn durable_execution_missing_receipt_does_not_block_on_unread_stderr() {
+        use std::io::{ErrorKind, Write};
+        use std::os::fd::OwnedFd;
+        use std::os::unix::net::UnixStream;
+        use std::process::Stdio;
+
+        let directory = tempfile::tempdir().unwrap();
+        let receipt = directory.path().join("recovery-9-id");
+        let receipt = receipt.to_str().unwrap();
+        let lock = directory.path().join("activity.lock");
+        std::fs::create_dir(format!("{receipt}.pending")).unwrap();
+        let pipeline = TransferPipeline::new(
+            PathBuf::from("/home/user/project"),
+            "myproject".to_string(),
+            "abc123".to_string(),
+            TransferConfig::default(),
+        )
+        .with_recovery_completion(receipt.to_owned(), "id".to_string());
+        let command = pipeline.durable_execution_command(
+            "printf 'compiled\\n'; printf 'diagnostic\\n' >&2".to_string(),
+        );
+
+        // Fill a real transport before starting the wrapper; its peer remains
+        // open but never drains. A direct stderr diagnostic must block here.
+        let (mut writer, _unread_stderr) = UnixStream::pair().unwrap();
+        writer.set_nonblocking(true).unwrap();
+        let mut full = false;
+        for _ in 0..16_384 {
+            match writer.write(b"x") {
+                Ok(1) => {}
+                Ok(_) => panic!("stderr transport closed during prefill"),
+                Err(error) if error.kind() == ErrorKind::Interrupted => {}
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                    full = true;
+                    break;
+                }
+                Err(error) => panic!("prefill stderr transport: {error}"),
+            }
+        }
+        assert!(full, "stderr transport did not reach backpressure");
+        writer.set_nonblocking(false).unwrap();
+        let status = std::process::Command::new("timeout")
+            .args(["--kill-after=2s", "10s", "flock", "-x"])
+            .arg(&lock)
+            .args(["sh", "-c", &command])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(OwnedFd::from(writer)))
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(1), "{status:?}");
+        assert!(!Path::new(receipt).exists());
+        assert!(Path::new(&format!("{receipt}.started")).is_dir());
+        assert!(
+            std::fs::read_to_string(format!("{receipt}.stderr"))
+                .unwrap()
+                .contains("remote execution ended without a durable completion receipt")
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if std::process::Command::new("flock")
+                .args(["-n", "-x"])
+                .arg(&lock)
+                .arg("true")
+                .status()
+                .unwrap()
+                .success()
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "missing receipt left activity holders after stderr backpressure"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     #[test]
