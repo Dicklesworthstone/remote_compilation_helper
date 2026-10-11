@@ -2545,10 +2545,16 @@ pub fn is_cargo_package_verification(command: &str) -> bool {
 pub fn is_cargo_xwin_build(command: &str) -> bool {
     let normalized = normalize_command(command);
     let cmd = normalized.as_ref();
-    if check_structure(cmd).is_some() || cmd.contains(['\'', '"', '\\', '$', '`']) {
+    if check_structure(cmd).is_some() {
         return false;
     }
-    let mut tokens = cmd.split_whitespace();
+    // Explicit exec quotes whole argv words containing '='. Decode only that
+    // existing literal spelling, preserving refusal for partial quoting and
+    // every expansion/escape form this bounded recognizer cannot bind.
+    let mut tokens = cmd.split_whitespace().map(unquote_whole_word);
+    if tokens.clone().any(|word| word.contains(['\'', '"', '\\', '$', '`'])) {
+        return false;
+    }
     match tokens.next() {
         Some("cargo-xwin") => {
             let mut subcommand = tokens.next();
@@ -2987,6 +2993,7 @@ mod tests {
         for command in [
             "cargo xwin build --release --locked --target x86_64-pc-windows-msvc",
             "cargo +nightly-2026-08-31 xwin build --target=aarch64-pc-windows-msvc",
+            "cargo +nightly xwin build '--target=x86_64-pc-windows-msvc' --bin cli '--message-format=json'",
             "cargo --color never --locked xwin build",
             "env CARGO_HOME=/root/.cargo cargo xwin build --release",
             "cargo-xwin build --release",

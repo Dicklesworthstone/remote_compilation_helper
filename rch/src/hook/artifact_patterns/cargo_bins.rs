@@ -260,6 +260,7 @@ fn build_arguments(kind: CompilationKind, command: &str) -> Option<Vec<String>> 
     // not admit chdir, arbitrary wrappers, or a different Cargo subcommand.
     let words: Vec<_> = tokens.iter().map(String::as_str).collect();
     let mut index = 0;
+    let mut standalone_xwin = false;
     loop {
         while words.get(index).is_some_and(|word| {
             word.split_once('=')
@@ -270,6 +271,10 @@ fn build_arguments(kind: CompilationKind, command: &str) -> Option<Vec<String>> 
         let executable = Path::new(words.get(index)?).file_name()?.to_str()?;
         match executable.strip_suffix(".exe").unwrap_or(executable) {
             "cargo" => break,
+            "cargo-xwin" if kind == CompilationKind::CargoBuild => {
+                standalone_xwin = true;
+                break;
+            }
             "env" => {
                 index += 1;
                 while let Some(word) = words.get(index) {
@@ -311,10 +316,19 @@ fn build_arguments(kind: CompilationKind, command: &str) -> Option<Vec<String>> 
         }
     }
     index += 1;
-    if words.get(index).is_some_and(|word| word.starts_with('+')) {
+    if !standalone_xwin && words.get(index).is_some_and(|word| word.starts_with('+')) {
+        index += 1;
+    }
+    // Keep the plugin invocation intact for execution; only parse the Cargo
+    // build options after its explicit verb for named-output custody.
+    let plugin = words.get(index) == Some(&"xwin");
+    if kind == CompilationKind::CargoBuild && plugin {
         index += 1;
     }
     let subcommand = words.get(index).copied()?;
+    if (standalone_xwin || plugin) && subcommand != "build" {
+        return None;
+    }
     if !matches!(
         (kind, subcommand),
         (CompilationKind::CargoBuild, "build" | "b")
@@ -397,6 +411,30 @@ mod tests {
                 .unwrap()
                 .contains(&"target/b/debug/app".into())
         );
+    }
+
+    #[test]
+    fn xwin_builds_keep_named_output_target_and_profile_custody() {
+        for command in [
+            "cargo xwin build --locked --release --target x86_64-pc-windows-msvc --bin app",
+            "cargo +nightly xwin build --release --target=x86_64-pc-windows-msvc --bin=app",
+            "cargo-xwin build --release --target x86_64-pc-windows-msvc --bin app",
+            "env CARGO_HOME=/opt/cargo cargo-xwin xwin build --release --target x86_64-pc-windows-msvc --bin app",
+        ] {
+            let selected = select(command).unwrap();
+            assert!(selected.contains(&"target/x86_64-pc-windows-msvc/release/app".to_owned()));
+            assert!(selected.iter().all(|path| path.starts_with("target/x86_64-pc-windows-msvc/release/")));
+            assert!(!selected.iter().any(|path| path.ends_with("release/**")));
+        }
+        for command in [
+            "cargo xwin check --bin app",
+            "cargo-xwin install --bin app",
+            "cargo xwin b --bin app",
+            "cargo xwin build --bin app --help",
+            "cargo xwin build --bin app; cargo build --bin other",
+        ] {
+            assert!(select(command).is_none(), "accepted unsupported plugin command {command}");
+        }
     }
 
     #[test]

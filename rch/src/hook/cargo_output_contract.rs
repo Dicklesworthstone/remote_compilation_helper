@@ -690,6 +690,24 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn named_xwin_instrumentation_preserves_the_actual_plugin_argv() {
+        let command = "cargo +nightly xwin build --locked --release --target x86_64-pc-windows-msvc --bin cli";
+        let capture = CargoOutputCapture::for_command(Some(CompilationKind::CargoBuild), command).unwrap();
+        assert_eq!(capture.execution_command(command), format!("{command} --message-format=json,json-render-diagnostics"));
+        assert!(!capture.caller_json_supported());
+        let explicit = format!("{command} --message-format=json");
+        let capture = CargoOutputCapture::for_command(Some(CompilationKind::CargoBuild), &explicit).unwrap();
+        assert_eq!(capture.execution_command(&explicit), explicit);
+        assert!(capture.caller_json_supported());
+        let reconstructed = "cargo +nightly xwin build '--target=x86_64-pc-windows-msvc' --bin cli '--message-format=json'";
+        let classification = rch_common::classify_command(reconstructed);
+        assert_eq!(classification.kind, Some(CompilationKind::CargoBuild));
+        let capture = CargoOutputCapture::for_command(classification.kind, reconstructed).unwrap();
+        assert!(capture.caller_json_supported());
+        assert_eq!(capture.execution_command(reconstructed), reconstructed);
+    }
+
+    #[test]
     fn caller_json_support_requires_explicit_named_executable_json() {
         for (command, expected) in [
             (
@@ -701,6 +719,10 @@ mod tests {
             ("cargo build --bins --message-format=json", false),
             ("cargo build --bin cli --message-format=human", false),
             ("cargo build --example cli --message-format=json", false),
+            ("cargo xwin build --release --target x86_64-pc-windows-msvc --bin cli --message-format=json", true),
+            ("cargo-xwin xwin build --bin cli --message-format=json,json-render-diagnostics", true),
+            ("cargo xwin build --bins --message-format=json", false),
+            ("cargo xwin check --bin cli --message-format=json", false),
         ] {
             assert_eq!(
                 CargoOutputCapture::for_command(Some(CompilationKind::CargoBuild), command)

@@ -647,19 +647,19 @@ pub(super) fn managed_clean_overlay_cargo_build_dir(
         "managed Cargo build directory must be a nonempty path without control characters"
     );
     let (mut tokens, cargo_index) = managed_clean_overlay_cargo_tokens(command)?;
+    let executable = Path::new(&tokens[cargo_index])
+        .file_name()
+        .and_then(|name| name.to_str());
+    let standalone_xwin = matches!(executable, Some("cargo-xwin" | "cargo-xwin.exe"));
     anyhow::ensure!(
-        matches!(
-            Path::new(&tokens[cargo_index])
-                .file_name()
-                .and_then(|name| name.to_str()),
-            Some("cargo" | "cargo.exe")
-        ),
-        "managed clean-overlay build directory requires the Cargo executable"
+        standalone_xwin || matches!(executable, Some("cargo" | "cargo.exe")),
+        "managed clean-overlay build directory requires Cargo or an exact xwin build"
     );
     let mut index = cargo_index + 1;
-    if tokens
-        .get(index)
-        .is_some_and(|token| token.starts_with('+'))
+    if !standalone_xwin
+        && tokens
+            .get(index)
+            .is_some_and(|token| token.starts_with('+'))
     {
         index += 1;
     }
@@ -691,10 +691,23 @@ pub(super) fn managed_clean_overlay_cargo_build_dir(
     let subcommand = tokens
         .get(index)
         .ok_or_else(|| anyhow::anyhow!("missing Cargo subcommand"))?;
-    if subcommand == "fmt" {
+    let xwin = standalone_xwin || subcommand == "xwin";
+    if xwin {
+        anyhow::ensure!(
+            rch_common::patterns::is_cargo_xwin_build(command),
+            "managed xwin requires an exact classified xwin build"
+        );
+        if subcommand == "xwin" {
+            index += 1;
+        }
+    }
+    let subcommand = tokens
+        .get(index)
+        .ok_or_else(|| anyhow::anyhow!("missing Cargo build subcommand"))?;
+    if !xwin && subcommand == "fmt" {
         return Ok(command.to_string());
     }
-    let packaging = matches!(subcommand.as_str(), "package" | "publish");
+    let packaging = !xwin && matches!(subcommand.as_str(), "package" | "publish");
     if packaging {
         // Apply the SAME authority check as classification, before inserting
         // any worker configuration. A dry-run token inside an option value,
@@ -2357,6 +2370,40 @@ mod managed_build_dir_tests {
             "build-source real Cargo evidence retained at {}",
             root.display()
         );
+    }
+
+    #[test]
+    fn managed_xwin_build_preserves_plugin_argv_and_original_output_policy() {
+        for command in [
+            "cargo xwin build --release --target=x86_64-pc-windows-msvc --bin cli",
+            "cargo +nightly xwin build --release '--target=aarch64-pc-windows-msvc' --bin cli",
+            "cargo-xwin build --release --target=x86_64-pc-windows-msvc --bin cli",
+            "cargo-xwin xwin build --release --target=x86_64-pc-windows-msvc --bin cli",
+        ] {
+            let managed = super::ManagedCargoCommand::new(command, Some("/managed/cache")).unwrap();
+            let original = shell_words::split(command).unwrap();
+            let actual = shell_words::split(managed.execution_command()).unwrap();
+            assert_eq!(&actual[..original.len()], original.as_slice(), "{command}");
+            assert_eq!(actual[original.len()], "--config");
+            assert_eq!(actual[original.len() + 1], "build.build-dir=\"/managed/cache\"");
+            assert_eq!(actual.len(), original.len() + 2);
+            assert_eq!(managed.policy_command(), command);
+            assert!(rch_common::patterns::is_cargo_xwin_build(managed.policy_command()));
+        }
+        for command in [
+            "cargo xwin check --bin cli",
+            "cargo xwin build --help",
+            "cargo xwin install cli",
+            "cargo-xwin +nightly build --bin cli",
+            "cargo-xwin xwin test --bin cli",
+            "cargo xwin build --build-dir=/unmanaged",
+            "cargo xwin build --bin cli; echo surprise",
+        ] {
+            assert!(
+                super::ManagedCargoCommand::new(command, Some("/managed/cache")).is_err(),
+                "{command}"
+            );
+        }
     }
 
     #[test]
