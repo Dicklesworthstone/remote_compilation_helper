@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use crate::admission_rejection::{AdmissionRejectionSummary, RejectionClass};
 use crate::capability_probe::CapabilityRequirement;
 use crate::patterns::{
-    CompilationKind, classify_command, classify_command_detailed, is_cargo_xwin_build,
+    CompilationKind, cargo_xwin_compilation_kind, classify_command, classify_command_detailed,
     normalize_command, split_shell_commands, split_wrapper_word,
 };
 
@@ -237,7 +237,7 @@ fn derive_capabilities(command: &str, kind: Option<CompilationKind>) -> Required
 /// the SDK can reside on Linux. Keep native constraints for ordinary Cargo and
 /// for targets the selected cross-build tool does not support here.
 fn host_bound_targets(command: &str, targets: &[String]) -> Vec<String> {
-    let cross_msvc = is_cargo_xwin_build(command);
+    let cross_msvc = cargo_xwin_compilation_kind(command).is_some();
     let cross_darwin = classify_command(command).kind == Some(CompilationKind::CargoZigbuild);
     targets
         .iter()
@@ -295,7 +295,7 @@ fn os_from_command_and_targets(command: &str, triples: &[String]) -> Option<Stri
 ///
 /// Only a triple naming an OS the worker must *be* counts. `x86_64-pc-windows-msvc`
 /// ordinarily links against the native MSVC toolchain, so it yields `windows`;
-/// explicit cargo-xwin builds remove their MSVC targets before this step.
+/// explicit cargo-xwin compilations remove their MSVC targets before this step.
 /// Every `*-apple-*` target (darwin, ios, tvos, watchos, visionos)
 /// needs the macOS SDK, so it yields `darwin`. `x86_64-pc-windows-gnu` and
 /// `wasm32-unknown-unknown` cross-compile happily from Linux and yield nothing.
@@ -576,29 +576,81 @@ mod tests {
     }
 
     #[test]
-    fn cargo_xwin_keeps_rust_target_requirements_without_a_native_windows_gate() {
-        for command in [
-            "cargo xwin build --target x86_64-pc-windows-msvc",
-            "cargo +nightly-2026-08-31 xwin build --target=aarch64-pc-windows-msvc",
-            "cargo-xwin xwin build --target x86_64-pc-windows-msvc",
+    fn cargo_xwin_keeps_rust_requirements_without_a_native_windows_gate() {
+        for (subcommand, family) in [
+            ("build", "cargo_build"),
+            ("check", "cargo_check"),
+            ("clippy", "cargo_clippy"),
         ] {
-            let result = preflight(command, true);
-            assert!(result.is_compilation, "{command}");
-            assert!(result.required.needs_cargo, "{command}");
-            assert_eq!(result.family.as_deref(), Some("cargo_build"));
-            assert_eq!(result.required.needs_targets.len(), 1);
-            assert!(result.required.needs_targets[0].contains("-windows-msvc"));
-            assert_eq!(result.required.needs_os, None);
-            assert_eq!(required_os_for_command(command), None);
+            for (prefix, toolchain) in [
+                ("cargo xwin", None),
+                ("cargo +nightly-2026-08-31 xwin", Some("nightly-2026-08-31")),
+                ("cargo-xwin", None),
+                ("cargo-xwin xwin", None),
+            ] {
+                for (target_argument, target) in [
+                    ("--target x86_64-pc-windows-msvc", "x86_64-pc-windows-msvc"),
+                    ("--target=aarch64-pc-windows-msvc", "aarch64-pc-windows-msvc"),
+                ] {
+                    let passthrough = if subcommand == "clippy" {
+                        " -- -D warnings"
+                    } else {
+                        ""
+                    };
+                    let command = format!(
+                        "{prefix} {subcommand} --locked --all-targets {target_argument}{passthrough}"
+                    );
+                    let result = preflight(&command, true);
+                    let expected_toolchains: Vec<String> =
+                        toolchain.into_iter().map(|value| value.to_string()).collect();
+                    assert!(result.is_compilation, "{command}");
+                    assert!(result.required.needs_cargo, "{command}");
+                    assert_eq!(result.family.as_deref(), Some(family), "{command}");
+                    assert_eq!(
+                        result.required.needs_targets,
+                        vec![target.to_string()],
+                        "{command}"
+                    );
+                    assert_eq!(
+                        result.required.needs_toolchains,
+                        expected_toolchains,
+                        "{command}"
+                    );
+                    assert_eq!(result.required.needs_os, None, "{command}");
+                    assert_eq!(required_os_for_command(&command), None, "{command}");
+                    let requirement = result.required.to_requirement(1);
+                    assert!(requirement.needs_cargo, "{command}");
+                    assert_eq!(requirement.min_protocol, 1, "{command}");
+                    assert_eq!(
+                        requirement.needs_targets,
+                        result.required.needs_targets,
+                        "{command}"
+                    );
+                    assert_eq!(
+                        requirement.needs_toolchains,
+                        result.required.needs_toolchains,
+                        "{command}"
+                    );
+                    assert_eq!(requirement.needs_os, None, "{command}");
+                }
+            }
         }
     }
 
     #[test]
     fn cargo_xwin_does_not_relax_other_commands_or_apple_targets() {
         for command in [
+            "cargo check --target x86_64-pc-windows-msvc",
+            "cargo clippy --target x86_64-pc-windows-msvc -- -D warnings",
             "cargo xwin build --target x86_64-pc-windows-msvc && cargo build --target x86_64-pc-windows-msvc",
+            "cargo xwin check --target x86_64-pc-windows-msvc && cargo check --target x86_64-pc-windows-msvc",
+            "cargo xwin clippy --target x86_64-pc-windows-msvc && cargo clippy --target x86_64-pc-windows-msvc",
             "cargo --config xwin build --target x86_64-pc-windows-msvc",
+            "cargo --config xwin check --target x86_64-pc-windows-msvc",
+            "cargo --config xwin clippy --target x86_64-pc-windows-msvc",
             "cargo build --manifest-path cargo-xwin --target x86_64-pc-windows-msvc",
+            "cargo check --manifest-path 'cargo xwin check' --target x86_64-pc-windows-msvc",
+            "cargo clippy --config 'alias.cross=xwin' --target x86_64-pc-windows-msvc",
         ] {
             assert_eq!(
                 required_os_for_command(command).as_deref(),
@@ -613,7 +665,12 @@ mod tests {
         }
         for command in [
             "cargo xwin build --target aarch64-apple-darwin",
+            "cargo xwin check --target aarch64-apple-darwin",
+            "cargo xwin clippy --target aarch64-apple-darwin",
+            "cargo-xwin check --target aarch64-apple-darwin",
+            "cargo-xwin xwin clippy --target aarch64-apple-darwin",
             "cargo xwin build --target x86_64-pc-windows-msvc && cargo build --target aarch64-apple-darwin",
+            "cargo xwin check --target x86_64-pc-windows-msvc && cargo check --target aarch64-apple-darwin",
         ] {
             assert_eq!(
                 required_os_for_command(command).as_deref(),

@@ -1964,8 +1964,8 @@ fn classify_full(cmd: &str) -> Classification {
     }
 
     if cmd.starts_with("cargo-xwin ") || cmd.eq("cargo-xwin") {
-        return if is_cargo_xwin_build(cmd) {
-            Classification::compilation(CompilationKind::CargoBuild, 0.95, "cargo-xwin build")
+        return if let Some(kind) = cargo_xwin_compilation_kind(cmd) {
+            Classification::compilation(kind, 0.95, "cargo-xwin compilation")
         } else {
             Classification::not_compilation("cargo-xwin subcommand not interceptable")
         };
@@ -2536,40 +2536,34 @@ pub fn is_cargo_package_verification(command: &str) -> bool {
     matches!(subcommand, Some("package")) || (subcommand == Some("publish") && dry_run)
 }
 
-/// Recognize the explicit cargo-xwin build entry points, without treating a
-/// mention in a Cargo option value as permission to relax the native MSVC gate.
-/// The worker must still have the requested Rust target, cargo-xwin and its SDK.
-/// Non-build commands (including cache mutation and environment inspection) are
-/// deliberately outside this offload surface.
+/// Recognize explicit cargo-xwin build, check, and clippy entry points, without
+/// treating a mention in a Cargo option value as permission to relax the native
+/// MSVC gate. Requested Rust targets and toolchains still go through admission.
+/// Cache mutation, environment inspection, and other subcommands are deliberately
+/// outside this offload surface.
 #[must_use]
-pub fn is_cargo_xwin_build(command: &str) -> bool {
+pub fn cargo_xwin_compilation_kind(command: &str) -> Option<CompilationKind> {
     let normalized = normalize_command(command);
     let cmd = normalized.as_ref();
     if check_structure(cmd).is_some() || cmd.contains(['\'', '"', '\\', '$', '`']) {
-        return false;
+        return None;
     }
     let mut tokens = cmd.split_whitespace();
-    match tokens.next() {
+    let subcommand = match tokens.next() {
         Some("cargo-xwin") => {
-            let mut subcommand = tokens.next();
+            let subcommand = tokens.next();
             if subcommand == Some("xwin") {
-                subcommand = tokens.next();
-            }
-            if subcommand != Some("build") {
-                return false;
+                tokens.next()
+            } else {
+                subcommand
             }
         }
         Some("cargo") => loop {
             match tokens.next() {
-                Some("xwin") => {
-                    if tokens.next() != Some("build") {
-                        return false;
-                    }
-                    break;
-                }
+                Some("xwin") => break tokens.next(),
                 Some("--color" | "--config" | "-Z" | "-C") => {
                     if tokens.next().is_none_or(|value| value.starts_with('-')) {
-                        return false;
+                        return None;
                     }
                 }
                 Some("--locked" | "--offline" | "--frozen" | "-v" | "-vv" | "-q") => {}
@@ -2577,12 +2571,21 @@ pub fn is_cargo_xwin_build(command: &str) -> bool {
                     if token.starts_with('+')
                         || token.starts_with("--color=")
                         || token.starts_with("--config=") => {}
-                _ => return false,
+                _ => return None,
             }
         },
-        _ => return false,
+        _ => return None,
+    };
+    let kind = match subcommand? {
+        "build" => CompilationKind::CargoBuild,
+        "check" => CompilationKind::CargoCheck,
+        "clippy" => CompilationKind::CargoClippy,
+        _ => return None,
+    };
+    if tokens.any(|token| matches!(token, "--help" | "-h" | "--version" | "-V")) {
+        return None;
     }
-    !tokens.any(|token| matches!(token, "--help" | "-h" | "--version" | "-V"))
+    Some(kind)
 }
 
 /// `rch exec` rebuilds its command with `shell_words::join`, which single-quotes
@@ -2672,8 +2675,8 @@ fn classify_cargo(cmd: &str) -> Classification {
             Classification::compilation(CompilationKind::CargoZigbuild, 0.95, "cargo zigbuild")
         }
         "xwin" => {
-            if is_cargo_xwin_build(cmd) {
-                Classification::compilation(CompilationKind::CargoBuild, 0.95, "cargo xwin build")
+            if let Some(kind) = cargo_xwin_compilation_kind(cmd) {
+                Classification::compilation(kind, 0.95, "cargo xwin compilation")
             } else {
                 Classification::not_compilation("cargo xwin subcommand not interceptable")
             }
@@ -2983,50 +2986,94 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cargo_xwin_builds_use_the_cargo_build_contract() {
-        for command in [
-            "cargo xwin build --release --locked --target x86_64-pc-windows-msvc",
-            "cargo +nightly-2026-08-31 xwin build --target=aarch64-pc-windows-msvc",
-            "cargo --color never --locked xwin build",
-            "env CARGO_HOME=/root/.cargo cargo xwin build --release",
-            "cargo-xwin build --release",
-            "cargo-xwin xwin build --release",
-            "/home/ubuntu/.local/bin/cargo-xwin xwin build --release",
+    fn cargo_xwin_compilations_use_their_cargo_contracts() {
+        for (subcommand, kind, arguments) in [
+            (
+                "build",
+                CompilationKind::CargoBuild,
+                "--release --locked --target x86_64-pc-windows-msvc",
+            ),
+            (
+                "check",
+                CompilationKind::CargoCheck,
+                "--locked --all-targets --target aarch64-pc-windows-msvc",
+            ),
+            (
+                "clippy",
+                CompilationKind::CargoClippy,
+                "--locked --all-targets --target=x86_64-pc-windows-msvc -- -D warnings",
+            ),
         ] {
-            assert!(is_cargo_xwin_build(command), "{command}");
-            let classification = classify_command(command);
-            assert!(classification.is_compilation, "{command}");
-            assert_eq!(
-                classification.kind,
-                Some(CompilationKind::CargoBuild),
-                "{command}"
-            );
+            for prefix in [
+                "cargo xwin",
+                "cargo +nightly-2026-08-31 xwin",
+                "cargo --color never --locked xwin",
+                "cargo --config build.jobs=2 xwin",
+                "env CARGO_HOME=/root/.cargo cargo xwin",
+                "cargo-xwin",
+                "cargo-xwin xwin",
+                "/home/ubuntu/.local/bin/cargo-xwin xwin",
+            ] {
+                let command = format!("{prefix} {subcommand} {arguments}");
+                assert_eq!(cargo_xwin_compilation_kind(&command), Some(kind), "{command}");
+                let classification = classify_command(&command);
+                assert!(classification.is_compilation, "{command}");
+                assert_eq!(classification.kind, Some(kind), "{command}");
+            }
         }
     }
 
     #[test]
-    fn cargo_xwin_recognition_declines_non_builds_and_argument_mentions() {
+    fn cargo_xwin_recognition_declines_unsupported_commands_and_argument_mentions() {
         for command in [
             "cargo xwin",
             "cargo xwin env",
             "cargo xwin cache clear",
-            "cargo xwin check",
             "cargo xwin publish",
+            "cargo xwin test",
+            "cargo xwin run",
+            "cargo xwin unknown",
             "cargo xwin build --help",
+            "cargo xwin check --help",
+            "cargo xwin clippy --version",
             "cargo-xwin --version",
             "cargo-xwin cache clear",
             "cargo-xwin xwin build --help",
+            "cargo-xwin xwin check -h",
+            "cargo-xwin clippy -V",
+            "cargo-xwin xwin env",
+            "cargo-xwin check-extra",
+            "cargo xwin --help check",
+            "cargo xwin 'check'",
+            "cargo xwin $SUBCOMMAND",
             "cargo --config xwin build --target x86_64-pc-windows-msvc",
+            "cargo --config xwin check --target x86_64-pc-windows-msvc",
+            "cargo --config xwin clippy --target x86_64-pc-windows-msvc",
             "cargo build --manifest-path cargo-xwin --target x86_64-pc-windows-msvc",
-            "echo cargo xwin build",
+            "cargo check --manifest-path 'cargo xwin check' --target x86_64-pc-windows-msvc",
+            "cargo clippy --config 'alias.cross=xwin' --target x86_64-pc-windows-msvc",
+            "echo cargo xwin check",
             "cargo xwin build && cargo build",
+            "cargo xwin check && cargo check",
+            "cargo xwin clippy | cat",
         ] {
-            assert!(!is_cargo_xwin_build(command), "{command}");
+            assert_eq!(cargo_xwin_compilation_kind(command), None, "{command}");
         }
         for command in [
             "cargo xwin env",
             "cargo xwin cache clear",
+            "cargo xwin publish",
+            "cargo xwin test",
+            "cargo xwin run",
+            "cargo xwin unknown",
+            "cargo xwin check --help",
+            "cargo xwin clippy --version",
             "cargo-xwin --version",
+            "cargo-xwin xwin check -h",
+            "cargo-xwin clippy -V",
+            "cargo-xwin xwin env",
+            "cargo-xwin check-extra",
+            "cargo xwin 'check'",
         ] {
             assert!(!classify_command(command).is_compilation, "{command}");
         }
