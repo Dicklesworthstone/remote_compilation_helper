@@ -3486,7 +3486,12 @@ printf 'legacy identity escaped its fence\n' > "$marker"
     #[test]
     fn source_authority_lock_is_held_until_owner_stdin_closes() {
         let _guard = test_guard!();
-        let (mut first, first_ready) = spawn_local_source_lock("/tmp", "FIRST_READY");
+        // Production locks are hashed regular files (source_authority_lock_path);
+        // the GNU holder refuses a directory, so never lock a root directly.
+        let locks = tempfile::tempdir().unwrap();
+        let lock = locks.path().join("authority.lock");
+        let lock = lock.to_string_lossy();
+        let (mut first, first_ready) = spawn_local_source_lock(&lock, "FIRST_READY");
         assert_eq!(
             first_ready
                 .recv_timeout(Duration::from_secs(2))
@@ -3496,7 +3501,7 @@ printf 'legacy identity escaped its fence\n' > "$marker"
             "FIRST_READY"
         );
 
-        let (mut second, second_ready) = spawn_local_source_lock("/tmp", "SECOND_READY");
+        let (mut second, second_ready) = spawn_local_source_lock(&lock, "SECOND_READY");
         assert!(
             matches!(
                 second_ready.recv_timeout(Duration::from_millis(200)),
@@ -3758,10 +3763,13 @@ printf 'legacy identity escaped its fence\n' > "$marker"
     #[test]
     fn disjoint_source_authorities_do_not_serialize() {
         let _guard = test_guard!();
-        let current_dir = std::env::current_dir().expect("current directory");
-        let current_dir = current_dir.to_string_lossy().to_string();
-        let (mut first, first_ready) = spawn_local_source_lock("/tmp", "TMP_READY");
-        let (mut second, second_ready) = spawn_local_source_lock(&current_dir, "REPO_READY");
+        let locks = tempfile::tempdir().unwrap();
+        let tmp_lock = locks.path().join("tmp.lock");
+        let repo_lock = locks.path().join("repo.lock");
+        let (mut first, first_ready) =
+            spawn_local_source_lock(&tmp_lock.to_string_lossy(), "TMP_READY");
+        let (mut second, second_ready) =
+            spawn_local_source_lock(&repo_lock.to_string_lossy(), "REPO_READY");
 
         assert_eq!(
             first_ready
