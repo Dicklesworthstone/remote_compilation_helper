@@ -232,6 +232,18 @@ mod tests {
         (directory, path)
     }
 
+    /// Status of a lock this test just released; see [`reacquire_released`].
+    fn released(path: &Path) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while UpdateLock::is_locked_at(path) {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        true
+    }
+
     /// Re-acquire a lock this test just released. The gate is an flock on an
     /// open file description, and a process another test forks in parallel
     /// shares it until its exec closes the descriptor, so wait that out.
@@ -269,7 +281,7 @@ mod tests {
         drop(first);
         assert!(!path.exists());
         assert!(path.with_extension("gate").is_file());
-        assert!(!UpdateLock::is_locked_at(&path));
+        assert!(released(&path));
         drop(reacquire_released(&path));
     }
 
@@ -284,7 +296,7 @@ mod tests {
             uuid::Uuid::new_v4()
         );
         fs::write(&path, &stale).unwrap();
-        assert!(!UpdateLock::is_locked_at(&path));
+        assert!(released(&path));
         assert_eq!(
             fs::read_to_string(&path).unwrap(),
             stale,
@@ -578,7 +590,7 @@ mod tests {
             owner.0.wait().unwrap();
             // No Drop ran in the child. Kernel release, not PID guessing or
             // a manual sentinel sweep, must allow the next update on all OSes.
-            assert!(!UpdateLock::is_locked_at(&path));
+            assert!(released(&path));
             drop(reacquire_released(&path));
             assert!(!path.exists());
             assert!(path.with_extension("gate").is_file());
