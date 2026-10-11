@@ -56,9 +56,14 @@ pub async fn run_exec(
     source_content_receipt: bool,
     job: bool,
     result_dirs: Vec<PathBuf>,
+    required_tools: Vec<String>,
+    exact_worker: Option<WorkerId>,
     command_parts: Vec<String>,
     _out_ctx: &crate::ui::context::OutputContext,
 ) -> anyhow::Result<()> {
+    if exact_worker.is_some() {
+        anyhow::bail!("--worker remote admission requires the Unix daemon transport");
+    }
     if clean_overlay
         || base.is_some()
         || !dependency_bases.is_empty()
@@ -78,6 +83,9 @@ pub async fn run_exec(
     }
     if !result_dirs.is_empty() {
         anyhow::bail!("--result-dir requires the Unix rsync transport");
+    }
+    if !required_tools.is_empty() {
+        anyhow::bail!("--require-tool requires the Unix daemon transport");
     }
     let command = command_parts.join(" ");
     if command.is_empty() {

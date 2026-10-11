@@ -41,6 +41,16 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use ui::{ColorChoice, OutputConfig, OutputContext, OutputFormat};
 
+fn parse_exec_worker(value: &str) -> std::result::Result<rch_common::WorkerId, String> {
+    if value.is_empty()
+        || value.contains(',')
+        || value.chars().any(|c| c.is_whitespace() || c.is_control())
+    {
+        return Err("--worker requires one nonempty worker ID, without whitespace or commas".into());
+    }
+    Ok(rch_common::WorkerId::new(value))
+}
+
 #[derive(Parser)]
 #[command(name = "rch")]
 #[command(
@@ -642,6 +652,10 @@ USAGE:
         /// job's own.
         #[arg(long, value_name = "NAME", requires = "job")]
         require_tool: Vec<String>,
+        /// Execute on this exact worker; overrides environment/project preferences.
+        /// Refuses local execution or a different worker when unavailable.
+        #[arg(long, value_name = "ID", value_parser = parse_exec_worker)]
+        worker: Option<rch_common::WorkerId>,
         /// The compilation command to execute remotely
         #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
         command: Vec<String>,
@@ -2035,6 +2049,38 @@ fn main() {
         .block_on(async_main());
 }
 
+/// A failed load report was delivered in full; do not append an error document.
+#[derive(Debug, thiserror::Error)]
+#[error("storm-control invariants failed: {held}/{total} held")]
+struct LoadStormReportFailure {
+    held: usize,
+    total: usize,
+}
+
+fn load_storm_report_delivered(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<LoadStormReportFailure>().is_some()
+        || error
+            .chain()
+            .any(|cause| cause.downcast_ref::<LoadStormReportFailure>().is_some())
+}
+
+fn output_delivery_failed(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<commands::jobs::JobOutputFailure>()
+        .is_some()
+        || matches!(
+            error.downcast_ref::<ui::context::OutputError>(),
+            Some(ui::context::OutputError::Delivery(_))
+        )
+        || error.chain().any(|cause| {
+            cause.downcast_ref::<commands::jobs::JobOutputFailure>().is_some()
+                || matches!(
+                    cause.downcast_ref::<ui::context::OutputError>(),
+                    Some(ui::context::OutputError::Delivery(_))
+                )
+        })
+}
+
 async fn async_main() {
     use std::io::Write;
 
@@ -2045,12 +2091,9 @@ async fn async_main() {
         if let Some(exit) = error.downcast_ref::<doctor::DoctorExit>() {
             std::process::exit(exit.0);
         }
-        if error
-            .downcast_ref::<commands::jobs::JobOutputFailure>()
-            .is_some()
-        {
-            // A job document may have been partially written already. Never
-            // retry stdout with an error envelope or report delivery success.
+        if output_delivery_failed(&error) || load_storm_report_delivered(&error) {
+            // A structured document may be partial, or the failed load report
+            // was already delivered in full. Never append an error envelope.
             // Even a closed stderr must not turn this delivery failure into
             // a panic or a successful exit.
             let _ = writeln!(std::io::stderr().lock(), "Error: {error:#}");
@@ -2379,6 +2422,7 @@ async fn dispatch_command(cli: Cli, ctx: Arc<OutputContext>) -> Result<()> {
                 job,
                 result_dir,
                 require_tool,
+                worker,
                 command,
             } => {
                 hook::run_exec(
@@ -2391,6 +2435,7 @@ async fn dispatch_command(cli: Cli, ctx: Arc<OutputContext>) -> Result<()> {
                     job,
                     result_dir,
                     require_tool,
+                    worker,
                     command,
                     &ctx,
                 )
@@ -6419,32 +6464,46 @@ async fn handle_fleet(action: FleetAction, ctx: &OutputContext) -> Result<()> {
 /// installed `rch` could ever find. Now it resolves the URL and opens it.
 fn handle_web(url: Option<String>, no_open: bool, ctx: &OutputContext) -> Result<()> {
     let url = resolve_dashboard_url(url)?;
-    let api = format!("{}/api/fleet?view=help", url.trim_end_matches('/'));
+    let api = dashboard_agent_endpoint(&url)?;
 
+    // A launch failure must precede the success document, otherwise the
+    // top-level error handler would append a second document to stdout.
+    if !no_open {
+        open_browser(&url)?;
+    }
     if ctx.is_json() {
-        let _ = ctx.json(&ApiResponse::ok(
+        ctx.json(&ApiResponse::ok(
             "web",
             serde_json::json!({
                 "url": url,
                 "agent_endpoint": api,
                 "opened": !no_open,
             }),
-        ));
+        ))?;
     } else {
         ctx.info(&format!("Fleet dashboard: {url}"));
         ctx.info(&format!("Agent endpoint:  {api}   (help needs no key)"));
-    }
-    if !no_open {
-        open_browser(&url)?;
     }
     Ok(())
 }
 
 /// `--url`, then `RCH_DASHBOARD_URL`, then `[dashboard] url` in config.toml.
 fn resolve_dashboard_url(flag: Option<String>) -> Result<String> {
+    // A higher-priority URL needs no configuration read or default creation.
+    // Validate it through the same precedence rule, including invalid values.
+    if flag.as_deref().is_some_and(|url| !url.trim().is_empty()) {
+        return resolve_dashboard_url_from(flag, None, None);
+    }
+    let environment = std::env::var("RCH_DASHBOARD_URL").ok();
+    if environment
+        .as_deref()
+        .is_some_and(|url| !url.trim().is_empty())
+    {
+        return resolve_dashboard_url_from(flag, environment, None);
+    }
     resolve_dashboard_url_from(
         flag,
-        std::env::var("RCH_DASHBOARD_URL").ok(),
+        environment,
         config::load_config().ok().and_then(|c| c.dashboard.url),
     )
 }
@@ -6468,26 +6527,48 @@ fn resolve_dashboard_url_from(
     }
 }
 
+/// Append the agent API to the dashboard path, replacing its UI query/fragment.
+/// String concatenation would otherwise place the suffix inside those fields.
+fn dashboard_agent_endpoint(url: &str) -> Result<String> {
+    let mut endpoint = reqwest::Url::parse(url).map_err(|_| error::WebError::InvalidDashboardUrl {
+        url: url.to_owned(),
+    })?;
+    if !matches!(endpoint.scheme(), "http" | "https") || endpoint.host_str().is_none() {
+        return Err(error::WebError::InvalidDashboardUrl {
+            url: url.to_owned(),
+        }
+        .into());
+    }
+    let path = format!("{}/api/fleet", endpoint.path().trim_end_matches('/'));
+    endpoint.set_path(&path);
+    endpoint.set_query(Some("view=help"));
+    endpoint.set_fragment(None);
+    Ok(endpoint.to_string())
+}
+
 /// Open a URL in the default browser
 fn open_browser(url: &str) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
         std::process::Command::new("open").arg(url).spawn()?;
+        Ok(())
     }
 
     #[cfg(target_os = "linux")]
     {
-        // Try xdg-open first, then fall back to common browsers
-        let result = std::process::Command::new("xdg-open").arg(url).spawn();
-
-        if result.is_err() {
-            // Try common browsers
-            for browser in &["firefox", "chromium", "chromium-browser", "google-chrome"] {
-                if std::process::Command::new(browser).arg(url).spawn().is_ok() {
-                    break;
-                }
+        // Preserve the existing fallback order, but never acknowledge a launch
+        // if every real executable failed to start.
+        let mut last_error = match std::process::Command::new("xdg-open").arg(url).spawn() {
+            Ok(_) => return Ok(()),
+            Err(error) => error,
+        };
+        for browser in &["firefox", "chromium", "chromium-browser", "google-chrome"] {
+            match std::process::Command::new(browser).arg(url).spawn() {
+                Ok(_) => return Ok(()),
+                Err(error) => last_error = error,
             }
         }
+        Err(last_error).context("Could not start a dashboard browser launcher")
     }
 
     #[cfg(target_os = "windows")]
@@ -6495,9 +6576,13 @@ fn open_browser(url: &str) -> Result<()> {
         std::process::Command::new("cmd")
             .args(&["/C", "start", "", url])
             .spawn()?;
+        Ok(())
     }
 
-    Ok(())
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        anyhow::bail!("Opening the dashboard browser is unsupported on this platform")
+    }
 }
 
 // =============================================================================
@@ -6508,6 +6593,69 @@ fn open_browser(url: &str) -> Result<()> {
 mod tests {
     use super::*;
     use rch_common::test_guard;
+
+    #[test]
+    fn delivered_load_failure_keeps_typed_identity_without_message_matching() {
+        let error = anyhow::Error::new(LoadStormReportFailure { held: 2, total: 5 })
+            .context("load caller context");
+        assert!(load_storm_report_delivered(&error));
+        assert!(!output_delivery_failed(&error));
+        assert!(format!("{error:#}").contains("storm-control invariants failed: 2/5 held"));
+
+        #[derive(Debug, thiserror::Error)]
+        #[error("load report caller")]
+        struct CallerFailure(#[source] LoadStormReportFailure);
+
+        let wrapped = anyhow::Error::new(CallerFailure(LoadStormReportFailure {
+            held: 1,
+            total: 5,
+        }));
+        assert!(load_storm_report_delivered(&wrapped));
+        assert!(!output_delivery_failed(&wrapped));
+
+        let unrelated = anyhow::anyhow!("storm-control invariants failed: 2/5 held");
+        assert!(!load_storm_report_delivered(&unrelated));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_delivery_classification_retains_real_error_identity_through_context() {
+        use std::collections::BTreeMap;
+        use std::os::unix::net::UnixStream;
+
+        let (socket, peer) = UnixStream::pair().unwrap();
+        socket
+            .set_write_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        drop(peer);
+        let ctx = OutputContext::with_writers(
+            OutputConfig {
+                force_mode: Some(ui::context::OutputMode::Json),
+                color: ui::context::ColorChoice::Never,
+                ..Default::default()
+            },
+            ui::OutputWriter::new(socket, false),
+            ui::OutputWriter::stderr(),
+        );
+        let failure = ctx.json(&serde_json::json!({"status": "observed"})).unwrap_err();
+        let error = anyhow::Error::new(failure).context("outer caller context");
+        assert!(output_delivery_failed(&error));
+        assert!(format!("{error:#}").contains("structured output could not be delivered"));
+
+        let invalid = BTreeMap::from([(vec![1_u8, 2], "unsupported key")]);
+        let failure = ctx.json(&invalid).unwrap_err();
+        assert!(matches!(&failure, ui::context::OutputError::Encoding(_)));
+        let error = anyhow::Error::new(failure).context("encoding caller context");
+        assert!(!output_delivery_failed(&error));
+
+        let retained = tempfile::tempdir().unwrap().keep();
+        let absent = retained.join("missing-input.json");
+        let failure = std::fs::File::open(&absent).unwrap_err();
+        assert_eq!(failure.kind(), std::io::ErrorKind::NotFound);
+        let error = anyhow::Error::new(failure).context("input file context");
+        assert!(!output_delivery_failed(&error));
+        assert!(!absent.exists());
+    }
 
     #[test]
     fn reliability_metrics_leave_hook_and_nonreporting_modes_uninstrumented() {
@@ -6971,6 +7119,7 @@ mod tests {
                 job,
                 result_dir,
                 require_tool: _,
+                worker: _,
                 command,
             }) => {
                 assert_eq!(base.as_deref(), Some("HEAD"));
@@ -7017,6 +7166,7 @@ mod tests {
                 job,
                 result_dir,
                 require_tool: _,
+                worker: _,
                 command,
             }) => {
                 assert_eq!(base.as_deref(), Some("HEAD"));
@@ -7061,6 +7211,7 @@ mod tests {
             .expect("exec subcommand");
         let help = exec.render_long_help().to_string();
         for flag in [
+            "--worker",
             "--base",
             "--clean-overlay",
             "--overlay-path",
@@ -7070,6 +7221,56 @@ mod tests {
             "--result-dir",
         ] {
             assert!(help.contains(flag), "exec help missing {flag}: {help}");
+        }
+    }
+
+    #[test]
+    fn cli_parses_exact_exec_worker_for_native_compilation() {
+        let _guard = test_guard!();
+        let cli = Cli::try_parse_from([
+            "rch",
+            "exec",
+            "--worker",
+            "native-worker",
+            "--base",
+            "HEAD",
+            "--clean-overlay",
+            "--no-overlay",
+            "--",
+            "cargo",
+            "build",
+            "--release",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Exec {
+                worker,
+                clean_overlay,
+                no_overlay,
+                command,
+                job,
+                ..
+            }) => {
+                assert_eq!(worker, Some(rch_common::WorkerId::new("native-worker")));
+                assert!(clean_overlay && no_overlay);
+                assert!(!job);
+                assert_eq!(command, vec!["cargo", "build", "--release"]);
+            }
+            _ => fail_expected("Expected exact-worker native compilation"),
+        }
+    }
+
+    #[test]
+    fn cli_rejects_empty_or_multiple_exec_worker_ids() {
+        let _guard = test_guard!();
+        for worker in ["", " ", "one,two", "one two", "one\ntwo", "worker\0"] {
+            assert!(
+                Cli::try_parse_from([
+                    "rch", "exec", "--worker", worker, "--", "cargo", "build",
+                ])
+                .is_err(),
+                "accepted malformed worker {worker:?}"
+            );
         }
     }
 
@@ -9587,6 +9788,117 @@ mod tests {
             ),
             "expected WebError::NoDashboardUrl, got {err:?}"
         );
+    }
+
+    #[test]
+    fn dashboard_agent_endpoint_preserves_path_and_replaces_ui_query_and_fragment() {
+        for (url, expected) in [
+            (
+                "https://dashboard.example.invalid",
+                "https://dashboard.example.invalid/api/fleet?view=help",
+            ),
+            (
+                "https://dashboard.example.invalid/fleet/?tab=workers#selection",
+                "https://dashboard.example.invalid/fleet/api/fleet?view=help",
+            ),
+            (
+                "https://dashboard.example.invalid/?tab=workers#selection",
+                "https://dashboard.example.invalid/api/fleet?view=help",
+            ),
+            (
+                "https://dashboard.example.invalid/team%20α/?view=old#selection",
+                "https://dashboard.example.invalid/team%20%CE%B1/api/fleet?view=help",
+            ),
+            (
+                "http://[::1]:8080/fleet?tab=workers#selection",
+                "http://[::1]:8080/fleet/api/fleet?view=help",
+            ),
+        ] {
+            assert_eq!(dashboard_agent_endpoint(url).unwrap(), expected, "{url}");
+        }
+        for url in [
+            "https://",
+            "http://[::1",
+            "https://dashboard.example.invalid:99999",
+            "ftp://dashboard.example.invalid/fleet",
+        ] {
+            let error = dashboard_agent_endpoint(url).unwrap_err();
+            assert!(matches!(
+                error.downcast_ref::<error::WebError>(),
+                Some(error::WebError::InvalidDashboardUrl { url: rejected }) if rejected == url
+            ));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn web_no_open_delivers_formats_and_propagates_real_output_failures() {
+        use std::os::unix::net::UnixStream;
+
+        let retained = tempfile::tempdir().unwrap().keep();
+        let url = "https://dashboard.example.invalid/fleet/";
+        for format in [OutputFormat::Json, OutputFormat::Toon] {
+            for closed in [false, true] {
+                let path = retained.join(format!("{format:?}-{closed}.output"));
+                let stdout = if closed {
+                    let (socket, peer) = UnixStream::pair().unwrap();
+                    socket
+                        .set_write_timeout(Some(std::time::Duration::from_secs(2)))
+                        .unwrap();
+                    drop(peer);
+                    ui::OutputWriter::new(socket, false)
+                } else {
+                    ui::OutputWriter::new(std::fs::File::create_new(&path).unwrap(), false)
+                };
+                let ctx = OutputContext::with_writers(
+                    OutputConfig {
+                        force_mode: Some(ui::context::OutputMode::Json),
+                        color: ui::context::ColorChoice::Never,
+                        format,
+                        ..Default::default()
+                    },
+                    stdout,
+                    ui::OutputWriter::stderr(),
+                );
+                // The explicit URL resolves without reading user configuration;
+                // no-open exercises the actual reporter without a browser launch.
+                let result = handle_web(Some(url.into()), true, &ctx);
+                if closed {
+                    let error = result.unwrap_err();
+                    assert!(output_delivery_failed(&error));
+                    assert!(matches!(
+                        error.downcast_ref::<ui::context::OutputError>(),
+                        Some(ui::context::OutputError::Delivery(cause))
+                            if cause.kind() == std::io::ErrorKind::BrokenPipe
+                    ));
+                    assert!(!path.exists());
+                } else {
+                    result.unwrap();
+                    let bytes = std::fs::read(path).unwrap();
+                    let report = if format == OutputFormat::Toon {
+                        serde_json::from_str::<serde_json::Value>(
+                            &toon_rust::toon_to_json(std::str::from_utf8(&bytes).unwrap()).unwrap(),
+                        )
+                        .unwrap()
+                    } else {
+                        serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+                    };
+                    assert_eq!(report["api_version"], "1.0");
+                    assert_eq!(report["command"], "web");
+                    assert_eq!(report["success"], true);
+                    assert!(report["error"].is_null());
+                    assert_eq!(
+                        report["data"],
+                        serde_json::json!({
+                            "url": url,
+                            "agent_endpoint": "https://dashboard.example.invalid/fleet/api/fleet?view=help",
+                            "opened": false,
+                        })
+                    );
+                }
+            }
+        }
+        assert_eq!(std::fs::read_dir(retained).unwrap().count(), 2);
     }
 
     // -------------------------------------------------------------------------

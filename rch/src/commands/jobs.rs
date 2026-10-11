@@ -225,11 +225,11 @@ fn validate_queued_cancellation(wrapper: &str, reply: &Value) -> Result<()> {
 /// Output failures must not produce a success status or a second stdout document.
 #[derive(Debug, thiserror::Error)]
 #[error("job output could not be delivered")]
-pub(crate) struct JobOutputFailure(#[source] serde_json::Error);
+pub(crate) struct JobOutputFailure(#[source] crate::ui::context::OutputError);
 
 impl From<std::io::Error> for JobOutputFailure {
     fn from(error: std::io::Error) -> Self {
-        Self(serde_json::Error::io(error))
+        Self(crate::ui::context::OutputError::Delivery(error))
     }
 }
 
@@ -775,10 +775,10 @@ mod tests {
                     );
                     let error = emit(&ctx, &json!({"status": "observed"})).unwrap_err();
                     let failure = error.downcast_ref::<JobOutputFailure>().unwrap();
-                    assert_eq!(
-                        failure.0.io_error_kind(),
-                        Some(std::io::ErrorKind::BrokenPipe)
-                    );
+                    let crate::ui::context::OutputError::Delivery(cause) = &failure.0 else {
+                        panic!("closed socket must report a delivery error: {error:#}");
+                    };
+                    assert_eq!(cause.kind(), std::io::ErrorKind::BrokenPipe);
                     assert!(format!("{error:#}").contains("job output could not be delivered"));
                 }
             }

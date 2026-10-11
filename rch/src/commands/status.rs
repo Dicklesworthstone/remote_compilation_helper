@@ -609,7 +609,7 @@ pub async fn diagnose(command: &str, dry_run: bool, ctx: &OutputContext) -> Resu
             placement: placement.clone(),
             dry_run: dry_run_summary.clone(),
         };
-        let _ = ctx.json(&ApiResponse::ok("diagnose", response));
+        ctx.json(&ApiResponse::ok("diagnose", response))?;
         return Ok(());
     }
 
@@ -1035,7 +1035,7 @@ pub async fn admit(
     let pf = if job { pf.as_job(require_tool) } else { pf };
 
     if ctx.is_json() {
-        let _ = ctx.json(&ApiResponse::ok("admit", &pf));
+        ctx.json(&ApiResponse::ok("admit", &pf))?;
         return Ok(());
     }
 
@@ -1143,7 +1143,7 @@ async fn self_test_status(ctx: &OutputContext) -> Result<()> {
     let json = extract_json_body(&response).ok_or_else(|| anyhow::anyhow!("Invalid response"))?;
     let status: SelfTestStatusResponseFromApi = serde_json::from_str(json)?;
 
-    let _ = ctx.json(&status);
+    ctx.json(&status)?;
     if ctx.is_json() {
         return Ok(());
     }
@@ -1205,7 +1205,7 @@ async fn self_test_history(limit: usize, ctx: &OutputContext) -> Result<()> {
     let json = extract_json_body(&response).ok_or_else(|| anyhow::anyhow!("Invalid response"))?;
     let history: SelfTestHistoryResponseFromApi = serde_json::from_str(json)?;
 
-    let _ = ctx.json(&history);
+    ctx.json(&history)?;
     if ctx.is_json() {
         return Ok(());
     }
@@ -1359,7 +1359,7 @@ async fn self_test_run(
     let json = extract_json_body(&response).ok_or_else(|| anyhow::anyhow!("Invalid response"))?;
     let run: SelfTestRunResponseFromApi = serde_json::from_str(json)?;
 
-    let _ = ctx.json(&run);
+    ctx.json(&run)?;
     if ctx.is_json() {
         return Ok(());
     }
@@ -2117,7 +2117,7 @@ async fn run_load_storm(
             "executed": false,
             "reason": reason,
         });
-        let _ = ctx.json(&payload);
+        ctx.json(&payload)?;
         if !ctx.is_json() {
             render_load_skip(reason, specs.len(), schedulable, ctx);
         }
@@ -2157,18 +2157,32 @@ async fn run_load_storm(
         "events": run.events,
         "log_path": log_path,
     });
-    let _ = ctx.json(&payload);
     if !ctx.is_json() {
         render_load_report(&run, &reports, log_path.as_deref(), ctx);
     }
-    if passed {
+    publish_load_storm_report(&payload, &reports, ctx)
+}
+
+/// Deliver one load report before returning its existing invariant verdict.
+/// This only handles publication; the live observation/identity gaps remain.
+fn publish_load_storm_report(
+    payload: &serde_json::Value,
+    reports: &[InvariantReport],
+    ctx: &OutputContext,
+) -> Result<()> {
+    ctx.json(payload)?;
+    if all_passed(reports) {
         Ok(())
     } else {
         let held = reports.iter().filter(|r| r.passed).count();
-        anyhow::bail!(
-            "storm-control invariants failed: {held}/{} held",
-            reports.len()
-        )
+        let total = reports.len();
+        if ctx.is_json() {
+            // Main must preserve the completed failed report, not write a
+            // second JSON/TOON document for this command's nonzero exit.
+            Err(crate::LoadStormReportFailure { held, total }.into())
+        } else {
+            anyhow::bail!("storm-control invariants failed: {held}/{total} held")
+        }
     }
 }
 
@@ -2465,7 +2479,7 @@ async fn self_test_smoke(
         "events": events,
         "log_path": log_path,
     });
-    let _ = ctx.json(&payload);
+    ctx.json(&payload)?;
     if ctx.is_json() {
         return Ok(());
     }
@@ -2754,10 +2768,10 @@ pub async fn status_overview(
     if fleet {
         let report = build_fleet_status_report(&status);
         if ctx.is_json() {
-            let _ = ctx.json(&ApiResponse::ok(
+            ctx.json(&ApiResponse::ok(
                 "status-fleet",
                 status_view_with_local_builds(&report, &local_hints)?,
-            ));
+            ))?;
         } else {
             crate::status_display::render_fleet_status(&report, ctx.style());
         }
@@ -2774,10 +2788,10 @@ pub async fn status_overview(
             .clone()
             .unwrap_or_else(|| build_remediation_view_from_status(&status));
         if ctx.is_json() {
-            let _ = ctx.json(&ApiResponse::ok(
+            ctx.json(&ApiResponse::ok(
                 "status-remediation",
                 status_view_with_local_builds(&view, &local_hints)?,
-            ));
+            ))?;
         } else {
             crate::status_display::render_remediation_view(&view, ctx.style());
         }
@@ -2878,7 +2892,7 @@ pub async fn status_overview(
             convergence,
             remediation_hints,
         };
-        let _ = ctx.json(&ApiResponse::ok("status", &cli_status));
+        ctx.json(&ApiResponse::ok("status", &cli_status))?;
         return Ok(());
     }
 
@@ -3428,7 +3442,7 @@ pub async fn check(ctx: &OutputContext) -> Result<()> {
 
     // JSON output
     if ctx.is_json() {
-        let _ = ctx.json(&ApiResponse::ok("check", &response));
+        ctx.json(&ApiResponse::ok("check", &response))?;
         if exit_code != 0 {
             std::process::exit(exit_code);
         }
@@ -3563,6 +3577,160 @@ mod tests {
     use super::*;
     use crate::ui::context::OutputConfig;
     use crate::ui::writer::SharedOutputBuffer;
+
+    #[cfg(unix)]
+    #[test]
+    fn load_report_preserves_verdict_formats_and_real_delivery_failure() {
+        use crate::ui::context::{ColorChoice, OutputError, OutputFormat, OutputMode};
+        use crate::ui::writer::OutputWriter;
+        use std::os::unix::net::UnixStream;
+
+        // Publication tests only: these are not live storm observations.
+        let retained = tempfile::tempdir().unwrap().keep();
+        for format in [OutputFormat::Json, OutputFormat::Toon] {
+            for passed in [false, true] {
+                for closed in [false, true] {
+                    let reports = vec![InvariantReport {
+                        name: "load_fairness".to_owned(),
+                        passed,
+                        detail: "publication test verdict".to_owned(),
+                        violations: if passed {
+                            Vec::new()
+                        } else {
+                            vec!["publication test failure".to_owned()]
+                        },
+                    }];
+                    let payload = serde_json::json!({
+                        "run_id": "publication-test",
+                        "passed": passed,
+                        "invariants": reports,
+                    });
+                    let path = retained.join(format!("{format:?}-{passed}-{closed}.output"));
+                    let stdout = if closed {
+                        let (socket, peer) = UnixStream::pair().unwrap();
+                        socket
+                            .set_write_timeout(Some(std::time::Duration::from_secs(2)))
+                            .unwrap();
+                        drop(peer);
+                        OutputWriter::new(socket, false)
+                    } else {
+                        OutputWriter::new(std::fs::File::create_new(&path).unwrap(), false)
+                    };
+                    let ctx = OutputContext::with_writers(
+                        OutputConfig {
+                            force_mode: Some(OutputMode::Json),
+                            color: ColorChoice::Never,
+                            format,
+                            ..Default::default()
+                        },
+                        stdout,
+                        OutputWriter::stderr(),
+                    );
+                    let result = publish_load_storm_report(&payload, &reports, &ctx);
+                    if closed {
+                        let error = result.unwrap_err();
+                        assert!(matches!(
+                            error.downcast_ref::<OutputError>(),
+                            Some(OutputError::Delivery(cause))
+                                if cause.kind() == std::io::ErrorKind::BrokenPipe
+                        ));
+                        assert!(!crate::load_storm_report_delivered(&error));
+                        assert!(!path.exists());
+                    } else {
+                        if passed {
+                            result.unwrap();
+                        } else {
+                            let error = result.unwrap_err();
+                            let failure = error
+                                .downcast_ref::<crate::LoadStormReportFailure>()
+                                .expect("delivered failed report retains its typed verdict");
+                            assert_eq!((failure.held, failure.total), (0, 1));
+                            assert!(crate::load_storm_report_delivered(&error));
+                            assert!(!crate::output_delivery_failed(&error));
+                        }
+                        let bytes = std::fs::read(path).unwrap();
+                        let report = if format == OutputFormat::Toon {
+                            serde_json::from_str::<serde_json::Value>(
+                                &toon_rust::toon_to_json(std::str::from_utf8(&bytes).unwrap()).unwrap(),
+                            )
+                            .unwrap()
+                        } else {
+                            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+                        };
+                        assert_eq!(report, payload);
+                    }
+                }
+            }
+        }
+        assert_eq!(std::fs::read_dir(retained).unwrap().count(), 4);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn admit_delivers_formats_and_propagates_real_output_failures() {
+        use crate::ui::context::{ColorChoice, OutputError, OutputFormat, OutputMode};
+        use crate::ui::writer::OutputWriter;
+        use std::os::unix::net::UnixStream;
+
+        let retained = tempfile::tempdir().unwrap().keep();
+        for format in [OutputFormat::Json, OutputFormat::Toon] {
+            for closed in [false, true] {
+                let path = retained.join(format!("{format:?}-{closed}.output"));
+                let stdout = if closed {
+                    let (socket, peer) = UnixStream::pair().unwrap();
+                    socket
+                        .set_write_timeout(Some(std::time::Duration::from_secs(2)))
+                        .unwrap();
+                    drop(peer);
+                    OutputWriter::new(socket, false)
+                } else {
+                    OutputWriter::new(std::fs::File::create_new(&path).unwrap(), false)
+                };
+                let ctx = OutputContext::with_writers(
+                    OutputConfig {
+                        force_mode: Some(OutputMode::Json),
+                        color: ColorChoice::Never,
+                        format,
+                        ..Default::default()
+                    },
+                    stdout,
+                    OutputWriter::stderr(),
+                );
+                // Classification only: no compiler, daemon or worker is run.
+                let result = admit("cargo build --release", false, Vec::new(), &ctx).await;
+                if closed {
+                    let error = result.unwrap_err();
+                    assert!(matches!(
+                        error.downcast_ref::<OutputError>(),
+                        Some(OutputError::Delivery(cause))
+                            if cause.kind() == std::io::ErrorKind::BrokenPipe
+                    ));
+                    assert!(!path.exists());
+                } else {
+                    result.unwrap();
+                    let bytes = std::fs::read(path).unwrap();
+                    let report = if format == OutputFormat::Toon {
+                        serde_json::from_str::<serde_json::Value>(
+                            &toon_rust::toon_to_json(std::str::from_utf8(&bytes).unwrap()).unwrap(),
+                        )
+                        .unwrap()
+                    } else {
+                        serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+                    };
+                    assert_eq!(report["api_version"], "1.0");
+                    assert_eq!(report["command"], "admit");
+                    assert_eq!(report["success"], true);
+                    assert!(report["error"].is_null());
+                    assert_eq!(report["data"]["command"], "cargo build --release");
+                    assert_eq!(report["data"]["is_compilation"], true);
+                    assert_eq!(report["data"]["family"], "cargo_build");
+                    assert_eq!(report["data"]["base_recommendation"], "offload");
+                    assert_eq!(report["data"]["required"]["needs_cargo"], true);
+                }
+            }
+        }
+        assert_eq!(std::fs::read_dir(retained).unwrap().count(), 2);
+    }
 
     #[test]
     fn local_fallback_issue_counts_recent_reasons_only() {

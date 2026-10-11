@@ -176,7 +176,7 @@ pub fn config_show(show_sources: bool, ctx: &OutputContext) -> Result<()> {
             sources,
             value_sources,
         };
-        let _ = ctx.json(&ApiResponse::ok("config show", response));
+        ctx.json(&ApiResponse::ok("config show", response))?;
         return Ok(());
     }
 
@@ -686,7 +686,7 @@ pub fn config_get(key: &str, show_sources: bool, ctx: &OutputContext) -> Result<
             value: entry.value.clone(),
             source: show_sources.then(|| entry.source.clone()),
         };
-        let _ = ctx.json(&ApiResponse::ok("config get", response));
+        ctx.json(&ApiResponse::ok("config get", response))?;
         return Ok(());
     }
 
@@ -1050,7 +1050,7 @@ pub fn config_validate(ctx: &OutputContext) -> Result<()> {
                     warnings: vec![],
                     valid: false,
                 };
-                let _ = ctx.json(&ApiResponse::ok("config validate", response));
+                ctx.json(&ApiResponse::ok("config validate", response))?;
                 std::process::exit(1);
             }
             println!(
@@ -1108,7 +1108,7 @@ pub fn config_validate(ctx: &OutputContext) -> Result<()> {
             warnings: warning_items,
             valid,
         };
-        let _ = ctx.json(&ApiResponse::ok("config validate", response));
+        ctx.json(&ApiResponse::ok("config validate", response))?;
         if !valid {
             std::process::exit(1);
         }
@@ -1178,14 +1178,14 @@ fn config_set_at(config_path: &Path, key: &str, value: &str, ctx: &OutputContext
     apply_config_set(config_path, key, value)?;
 
     if ctx.is_json() {
-        let _ = ctx.json(&ApiResponse::ok(
+        ctx.json(&ApiResponse::ok(
             "config set",
             ConfigSetResponse {
                 key: key.to_string(),
                 value: value.to_string(),
                 config_path: config_path.display().to_string(),
             },
-        ));
+        ))?;
     } else {
         println!("Updated {:?}: {} = {}", config_path, key, value);
     }
@@ -1613,14 +1613,14 @@ fn config_reset_at(config_path: &Path, key: &str, ctx: &OutputContext) -> Result
         .with_context(|| format!("Failed to write {:?}", config_path))?;
 
     if ctx.is_json() {
-        let _ = ctx.json(&ApiResponse::ok(
+        ctx.json(&ApiResponse::ok(
             "config reset",
             ConfigResetResponse {
                 key: key.to_string(),
                 value,
                 config_path: config_path.display().to_string(),
             },
-        ));
+        ))?;
     } else {
         println!("Reset {:?}: {} = {}", config_path, key, value);
     }
@@ -1730,7 +1730,7 @@ pub fn config_export(format: &str, ctx: &OutputContext) -> Result<()> {
         }
         "json" => {
             // JSON format (ignore ctx.is_json() since user explicitly requested JSON)
-            let _ = ctx.json_force(&ApiResponse::ok(
+            ctx.json_force(&ApiResponse::ok(
                 "config export",
                 serde_json::json!({
                     "general": {
@@ -1768,7 +1768,7 @@ pub fn config_export(format: &str, ctx: &OutputContext) -> Result<()> {
                     "remediation": serde_json::to_value(config.remediation.redacted())
                         .unwrap_or(serde_json::Value::Null),
                 }),
-            ));
+            ))?;
         }
         _ => {
             return Err(ConfigError::InvalidValue {

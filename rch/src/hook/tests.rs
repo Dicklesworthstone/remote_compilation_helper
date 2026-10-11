@@ -23,6 +23,7 @@ use super::daemon_ipc::{
     DEFAULT_DAEMON_RESPONSE_TIMEOUT_SECS, DEFAULT_DAEMON_WAIT_RESPONSE_TIMEOUT_SECS,
     daemon_response_timeout_for, queue_when_busy_enabled_from, urlencoding_encode,
 };
+use super::fallback_selection::WorkerCapacitySnapshot;
 use super::dependency_closure::{
     DEPENDENCY_PREFLIGHT_CODE_MISSING, DEPENDENCY_PREFLIGHT_CODE_STALE,
     DEPENDENCY_PREFLIGHT_REMEDIATION_MISSING, DEPENDENCY_PREFLIGHT_REMEDIATION_STALE,
@@ -2053,6 +2054,50 @@ fn test_selected_worker_must_belong_to_requested_set() {
     ));
 }
 
+#[test]
+fn exact_exec_worker_overrides_preferences_and_retries_cannot_escape() {
+    let _guard = test_guard!();
+    let inherited = vec![
+        WorkerId::new("project-worker"),
+        WorkerId::new("environment-worker"),
+    ];
+    let pinned = exec_worker_preferences(Some(WorkerId::new("native-worker")), inherited.clone());
+    assert_eq!(pinned, vec![WorkerId::new("native-worker")]);
+    assert!(selected_worker_is_requested(&WorkerId::new("native-worker"), &pinned));
+    assert!(!selected_worker_is_requested(&WorkerId::new("project-worker"), &pinned));
+    assert!(!selected_worker_is_requested(&WorkerId::new("environment-worker"), &pinned));
+    assert_eq!(exec_worker_preferences(None, inherited.clone()), inherited);
+    // The same original singleton feeds the capacity retry picker. These are
+    // policy inputs, not a live worker/reservation or compilation receipt.
+    let snapshots = vec![
+        WorkerCapacitySnapshot {
+            id: WorkerId::new("project-worker"),
+            healthy: true,
+            pressure_critical: false,
+            free_slots: 64,
+            total_slots: 64,
+            speed_score: 100.0,
+            memory_pressure: None,
+        },
+        WorkerCapacitySnapshot {
+            id: WorkerId::new("native-worker"),
+            healthy: true,
+            pressure_critical: false,
+            free_slots: 4,
+            total_slots: 4,
+            speed_score: 50.0,
+            memory_pressure: None,
+        },
+    ];
+    assert_eq!(
+        pick_bigger_worker(&snapshots, &[], &pinned),
+        Some(WorkerId::new("native-worker"))
+    );
+    assert!(
+        pick_bigger_worker(&snapshots, &[WorkerId::new("native-worker")], &pinned).is_none()
+    );
+}
+
 // =========================================================================
 // Mock daemon socket tests
 // =========================================================================
@@ -2484,16 +2529,25 @@ async fn retry_failover_socket_preserves_endpoint_and_admission_constraints() {
     let _guard = test_guard!();
     let directory = tempfile::Builder::new()
         .prefix("rch-retry-")
-        .tempdir_in("/tmp")
-        .unwrap();
-    let socket = directory.path().join("selected.sock");
+        .tempdir()
+        .unwrap()
+        .keep();
+    let socket = directory.join("selected.sock");
     let listener = UnixListener::bind(&socket).unwrap();
     let mut config = rch_common::RchConfig::default();
-    config.general.socket_path = directory.path().join("wrong.sock").display().to_string();
+    config.general.socket_path = directory.join("wrong.sock").display().to_string();
     let _config_guard = ConfigOverrideGuard::set(config);
-    let writer = retry_selection_test_lease(directory.path().join("lease.json"));
+    let writer = retry_selection_test_lease(directory.join("lease.json"));
     let previous = writer.snapshot();
     let server_writer = writer.clone();
+    // A Rust admission deliberately refuses a missing caller toolchain before
+    // dispatch. Bind one explicitly so this fixture reaches the retry socket.
+    let toolchain = ToolchainInfo::new(
+        "nightly",
+        Some("2026-10-07".into()),
+        "fixture toolchain identity",
+    );
+    let server_toolchain = toolchain.clone();
     let status = serde_json::json!({
         "daemon": {"pid": 9, "uptime_secs": 1, "version": "retry-endpoint", "socket_path": socket,
             "started_at": "2026-10-07T00:00:00Z", "workers_total": 1, "workers_healthy": 1,
@@ -2505,7 +2559,7 @@ async fn retry_failover_socket_preserves_endpoint_and_admission_constraints() {
         "stats": {"total_builds": 0, "success_count": 0, "failure_count": 0,
             "remote_count": 0, "local_count": 0, "avg_duration_ms": 0}
     });
-    let server = tokio::spawn(async move {
+    let server = async move {
         for attempt in 0..2 {
             let (stream, _) = listener.accept().await.unwrap();
             let (reader, mut output) = stream.into_split();
@@ -2536,6 +2590,9 @@ async fn retry_failover_socket_preserves_endpoint_and_admission_constraints() {
                 assert!(
                     request.contains(&format!("&local_wrapper_id={}", server_writer.wrapper_id()))
                 );
+                let encoded_toolchain =
+                    urlencoding_encode(&serde_json::to_string(&server_toolchain).unwrap());
+                assert!(request.contains(&format!("&toolchain={encoded_toolchain}")));
                 assert!(!request.contains("&wait=1"));
                 serde_json::to_string(&SelectionResponse {
                     reason: SelectionReason::SelectionError("job_cancelled_before_start".into()),
@@ -2549,16 +2606,15 @@ async fn retry_failover_socket_preserves_endpoint_and_admission_constraints() {
                 .unwrap();
             output.shutdown().await.unwrap();
         }
-    });
-    let response = timeout(
-        Duration::from_secs(3),
+    };
+    let client = async {
         try_retry_on_bigger_worker(
             socket.to_str().unwrap(),
             "job-project",
             3,
             12,
             "git status",
-            None,
+            Some(&toolchain),
             RequiredRuntime::Rust,
             CommandPriority::Normal,
             &[WorkerId::new("previous-worker")],
@@ -2568,13 +2624,15 @@ async fn retry_failover_socket_preserves_endpoint_and_admission_constraints() {
             &writer,
             true,
             &HookReporter::new(OutputVisibility::None),
-        ),
-    )
+        )
+        .await
+    };
+    let (response, ()) = timeout(Duration::from_secs(3), async {
+        tokio::join!(client, server)
+    })
     .await
-    .unwrap()
-    .unwrap()
     .unwrap();
-    server.await.unwrap();
+    let response = response.unwrap().unwrap();
     assert!(selection_cancelled_before_start(&response.0));
     assert_eq!(response.1, WorkerId::new("next-worker"));
     assert_eq!(read_retry_lease(&writer).phase, "selection_pending");
@@ -2590,23 +2648,32 @@ async fn queued_selection_lost_or_malformed_response_never_reaches_recovery() {
         "HTTP/1.0 503 Unavailable\r\n\r\n{}",
         "HTTP/1.0 200 OK\r\n", // Truncated HTTP headers.
     ] {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let socket = tmp.path().join("daemon.sock");
+        let retained = tempfile::tempdir().unwrap().keep();
+        let socket = retained.join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let (reader, mut writer) = stream.into_split();
-            let mut reader = TokioBufReader::new(reader);
-            let mut request = String::new();
-            reader.read_line(&mut request).await.unwrap();
-            writer.write_all(wire_response.as_bytes()).await.unwrap();
-            writer.shutdown().await.unwrap();
-            request
-        });
-        let lease = queued_selection_test_lease(tmp.path().join("lease.json"));
+        let resumes_lost_reply = wire_response.is_empty();
+        let server = async move {
+            let mut requests = Vec::new();
+            // A lost original reply now permits exactly one identity-preserving
+            // resume. Model an older daemon rejecting that endpoint promptly;
+            // all complete invalid replies still allow no resume at all.
+            for reply in std::iter::once(wire_response).chain(
+                resumes_lost_reply.then_some("HTTP/1.0 404 Not Found\r\n\r\n{}"),
+            ) {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (reader, mut writer) = stream.into_split();
+                let mut reader = TokioBufReader::new(reader);
+                let mut request = String::new();
+                reader.read_line(&mut request).await.unwrap();
+                writer.write_all(reply.as_bytes()).await.unwrap();
+                writer.shutdown().await.unwrap();
+                requests.push(request);
+            }
+            requests
+        };
+        let lease = queued_selection_test_lease(retained.join("lease.json"));
         let wrapper = lease.wrapper_id();
-        let error = timeout(
-            Duration::from_secs(2),
+        let client = async {
             query_daemon(
                 socket.to_str().unwrap(),
                 "queued",
@@ -2623,14 +2690,27 @@ async fn queued_selection_lost_or_malformed_response_never_reaches_recovery() {
                 &[],
                 false,
                 &[],
-            ),
-        )
+            )
+            .await
+        };
+        let (result, requests) = timeout(Duration::from_secs(2), async {
+            tokio::join!(client, server)
+        })
         .await
-        .unwrap()
-        .unwrap_err();
-        let request = server.await.unwrap();
+        .unwrap();
+        let error = result.unwrap_err();
+        assert_eq!(requests.len(), if resumes_lost_reply { 2 } else { 1 });
+        let request = &requests[0];
         assert!(request.contains("&wait=1"));
         assert!(request.contains(&format!("local_wrapper_id={wrapper}")));
+        if resumes_lost_reply {
+            let query = request.strip_prefix("GET /select-worker?").unwrap();
+            assert_eq!(
+                requests[1],
+                format!("GET /select-worker/resume-queued?{query}"),
+                "resume changes only the endpoint, never identity or constraints"
+            );
+        }
         assert!(
             error
                 .downcast_ref::<daemon_ipc::SelectionOutcomeUnconfirmed>()
@@ -7541,7 +7621,9 @@ async fn test_artifact_sync_failure_fails_an_artifact_producing_build() {
     let reporter = HookReporter::new(OutputVisibility::None);
 
     // Artifact-producing kind (cargo build): a failed sync-back is FATAL.
-    let build = execute_remote_compilation(
+    // Keep both large awaited compilation futures out of this test's state
+    // machine; qualification must still run with the default test-thread stack.
+    let build = Box::pin(execute_remote_compilation(
         &worker,
         "cargo build",
         TransferConfig::default(),
@@ -7563,13 +7645,13 @@ async fn test_artifact_sync_failure_fails_an_artifact_producing_build() {
         &[],
         rch_common::remediation_config::DEFAULT_POOLED_REAPER_POOLED_IDLE_HOURS,
         None,
-    )
+    ))
     .await;
 
     // Test kind (cargo test): output streamed, no required artifact — the
     // remote exit code (0) is preserved despite the same artifact failure.
     mock::clear_global_invocations();
-    let test_run = execute_remote_compilation(
+    let test_run = Box::pin(execute_remote_compilation(
         &worker,
         "cargo test",
         TransferConfig::default(),
@@ -7591,7 +7673,7 @@ async fn test_artifact_sync_failure_fails_an_artifact_producing_build() {
         &[],
         rch_common::remediation_config::DEFAULT_POOLED_REAPER_POOLED_IDLE_HOURS,
         None,
-    )
+    ))
     .await;
 
     if let Some(prev) = prev_cwd {

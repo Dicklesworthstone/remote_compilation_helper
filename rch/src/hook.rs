@@ -878,6 +878,16 @@ fn selected_worker_is_requested(worker: &WorkerId, requested_workers: &[WorkerId
     requested_workers.is_empty() || requested_workers.contains(worker)
 }
 
+fn exec_worker_preferences(
+    exact_worker: Option<WorkerId>,
+    inherited_preferences: Vec<WorkerId>,
+) -> Vec<WorkerId> {
+    match exact_worker {
+        Some(worker) => vec![worker],
+        None => inherited_preferences,
+    }
+}
+
 fn local_fallback_command(command: &str) -> std::process::Command {
     let mut child = std::process::Command::new("sh");
     child
@@ -2979,6 +2989,7 @@ pub async fn run_exec(
     job: bool,
     result_dirs: Vec<PathBuf>,
     required_tools: Vec<String>,
+    exact_worker: Option<WorkerId>,
     command_parts: Vec<String>,
     out_ctx: &crate::ui::context::OutputContext,
 ) -> anyhow::Result<()> {
@@ -3030,8 +3041,12 @@ pub async fn run_exec(
             "RCH_CARGO_JSON_STDOUT requires cargo build --bin, cargo test --no-run --test, or cargo bench --no-run --bench with literal named targets and an explicit JSON message format"
         );
     }
-    let require_remote =
-        exec_requires_remote() || clean_overlay || source_content_receipt || cargo_json_stdout;
+    let exact_worker_requested = exact_worker.is_some();
+    let require_remote = exec_requires_remote()
+        || clean_overlay
+        || source_content_receipt
+        || cargo_json_stdout
+        || exact_worker_requested;
 
     // Classify the command. In explicit job-admission mode (`rch exec --job`,
     // bd-bu3fb) the classifier is bypassed entirely and the command is admitted
@@ -3122,7 +3137,7 @@ pub async fn run_exec(
         let reporter = HookReporter::new(config.output.visibility);
         let reason = policy.reason();
         let refuse_local = if policy.overrides_require_remote() {
-            clean_overlay || source_content_receipt || cargo_json_stdout
+            clean_overlay || source_content_receipt || cargo_json_stdout || exact_worker_requested
         } else {
             require_remote || role_requires_remote(config.general.role)
         };
@@ -3277,7 +3292,10 @@ pub async fn run_exec(
     };
     let command_priority = command_priority_from_env(&reporter);
     let wait_for_worker = queue_when_busy_enabled();
-    let preferred_workers = command_parsing::preferred_workers();
+    // A CLI pin is a singleton admission constraint, never the environment /
+    // project preference union. Every retry keeps this same allowed set.
+    let preferred_workers =
+        exec_worker_preferences(exact_worker, command_parsing::preferred_workers());
     let durable_lease = DurableLeaseWriter::create(
         &command,
         require_remote,

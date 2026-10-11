@@ -462,7 +462,7 @@ fn output_doctor_results(ctx: &OutputContext, diagnostics: Vec<DoctorDiagnostic>
     };
 
     if ctx.is_json() {
-        let _ = ctx.json(&response);
+        ctx.json(&response)?;
         if error_count > 0 {
             std::process::exit(1);
         }
@@ -535,6 +535,69 @@ fn output_doctor_results(ctx: &OutputContext, diagnostics: Vec<DoctorDiagnostic>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn doctor_reporter_delivers_formats_and_propagates_real_output_failures() {
+        use crate::ui::context::{ColorChoice, OutputConfig, OutputError, OutputFormat, OutputMode};
+        use crate::ui::writer::OutputWriter;
+        use std::os::unix::net::UnixStream;
+
+        let retained = tempfile::tempdir().unwrap().keep();
+        for format in [OutputFormat::Json, OutputFormat::Toon] {
+            for closed in [false, true] {
+                let path = retained.join(format!("{format:?}-{closed}.output"));
+                let stdout = if closed {
+                    let (socket, peer) = UnixStream::pair().unwrap();
+                    socket
+                        .set_write_timeout(Some(std::time::Duration::from_secs(2)))
+                        .unwrap();
+                    drop(peer);
+                    OutputWriter::new(socket, false)
+                } else {
+                    OutputWriter::new(std::fs::File::create_new(&path).unwrap(), false)
+                };
+                let ctx = OutputContext::with_writers(
+                    OutputConfig {
+                        force_mode: Some(OutputMode::Json),
+                        color: ColorChoice::Never,
+                        format,
+                        ..Default::default()
+                    },
+                    stdout,
+                    OutputWriter::stderr(),
+                );
+                // Reporter-only test: an empty diagnostic set is not a claim
+                // about actual configuration, daemon or worker health.
+                let result = output_doctor_results(&ctx, Vec::new());
+                if closed {
+                    let error = result.unwrap_err();
+                    assert!(matches!(
+                        error.downcast_ref::<OutputError>(),
+                        Some(OutputError::Delivery(cause))
+                            if cause.kind() == std::io::ErrorKind::BrokenPipe
+                    ));
+                    assert!(!path.exists());
+                } else {
+                    result.unwrap();
+                    let bytes = std::fs::read(path).unwrap();
+                    let report = if format == OutputFormat::Toon {
+                        serde_json::from_str::<serde_json::Value>(
+                            &toon_rust::toon_to_json(std::str::from_utf8(&bytes).unwrap()).unwrap(),
+                        )
+                        .unwrap()
+                    } else {
+                        serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+                    };
+                    assert_eq!(report["healthy"], true);
+                    assert_eq!(report["diagnostics"], serde_json::json!([]));
+                    for count in ["error_count", "warning_count", "info_count"] {
+                        assert_eq!(report[count], 0);
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn configured_socket_path_expands_tilde() {
