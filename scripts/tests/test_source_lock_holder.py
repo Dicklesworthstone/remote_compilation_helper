@@ -549,6 +549,108 @@ class SourceLockHolderTests(unittest.TestCase):
         finally:
             os.close(fd)
 
+    def test_native_replaced_earlier_path_cannot_handoff_a_lock_on_an_old_inode(self):
+        for portable in (False, True):
+            with self.subTest(portable=portable):
+                paths = [self.root / f"native-replaced-{portable}-{i}" for i in range(32)]
+                old = self.root / f"retained-old-{portable}"
+                witness = self.root / f"terminal-replaced-{portable}"
+                paths[0].write_bytes(b"original lock evidence")
+                final = os.open(paths[-1], os.O_CREAT | os.O_RDWR, 0o600)
+                replacement = None
+                try:
+                    fcntl.flock(final, fcntl.LOCK_EX)
+                    holder = self.start([("x", path) for path in paths], portable=portable,
+                                        env=self.environment(portable, gnu_flock=False),
+                                        terminal=self.terminal_witness(witness))
+                    eventually(lambda: not available(paths[-2]), "native waiter did not reach last root")
+                    self.assertIsNone(holder.line(0.05))
+                    paths[0].rename(old)  # Keep the old locked inode and its bytes.
+                    paths[0].write_bytes(b"another owner's replacement")
+                    replacement = os.open(paths[0], os.O_RDWR)
+                    fcntl.flock(replacement, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    self.assertFalse(available(old))
+                    fcntl.flock(final, fcntl.LOCK_UN)
+                    self.assertIsNone(holder.line(), "native holder granted ownership on a replaced inode")
+                    stdout, stderr = holder.failure()
+                    self.assertEqual((holder.process.returncode, stdout), (73, b""), stderr)
+                    self.assertIn(b"path changed during acquisition", stderr)
+                    self.assertNotIn(b"requester ended", stderr)
+                    self.assertFalse(witness.exists())
+                    self.assertTrue(available(old))
+                    self.assertTrue(all(available(path) for path in paths[1:]))
+                    self.assertFalse(available(paths[0]), "refusal released another owner's lock")
+                    self.assertEqual(old.read_bytes(), b"original lock evidence")
+                    self.assertEqual(paths[0].read_bytes(), b"another owner's replacement")
+                finally:
+                    if replacement is not None:
+                        os.close(replacement)
+                    os.close(final)
+
+    def test_native_missing_or_symlinked_earlier_path_cannot_reach_terminal(self):
+        for portable in (False, True):
+            for change in ("missing", "symlink"):
+                with self.subTest(portable=portable, change=change):
+                    paths = [self.root / f"native-{portable}-{change}-{i}" for i in range(32)]
+                    old = self.root / f"retained-{portable}-{change}"
+                    witness = self.root / f"terminal-{portable}-{change}"
+                    final = os.open(paths[-1], os.O_CREAT | os.O_RDWR, 0o600)
+                    try:
+                        fcntl.flock(final, fcntl.LOCK_EX)
+                        holder = self.start([("x", path) for path in paths], portable=portable,
+                                            env=self.environment(portable, gnu_flock=False),
+                                            terminal=self.terminal_witness(witness))
+                        eventually(lambda: not available(paths[-2]), "native waiter did not reach last root")
+                        self.assertIsNone(holder.line(0.05))
+                        paths[0].rename(old)
+                        if change == "symlink":
+                            # Even a link resolving to the SAME held inode is not
+                            # the real, regular lock pathname that was acquired.
+                            paths[0].symlink_to(old)
+                        fcntl.flock(final, fcntl.LOCK_UN)
+                        self.assertIsNone(holder.line(), "native holder accepted a missing/symlinked root")
+                        stdout, stderr = holder.failure()
+                        self.assertEqual((holder.process.returncode, stdout), (73, b""), stderr)
+                        self.assertIn(b"native source lock acquisition failed", stderr)
+                        self.assertNotIn(b"requester ended", stderr)
+                        self.assertFalse(witness.exists())
+                        self.assertTrue(available(old))
+                        self.assertTrue(all(available(path) for path in paths[1:]))
+                        if change == "symlink":
+                            self.assertTrue(paths[0].is_symlink())
+                        else:
+                            self.assertFalse(paths[0].exists(), "refusal recreated an absent lock pathname")
+                    finally:
+                        os.close(final)
+
+    def test_native_hardlink_aliases_refuse_instead_of_self_deadlocking_or_granting(self):
+        for portable in (False, True):
+            for first_mode, second_mode in (("x", "x"), ("s", "x"), ("x", "s"), ("s", "s")):
+                with self.subTest(portable=portable, modes=(first_mode, second_mode)):
+                    tag = f"{portable}-{first_mode}-{second_mode}"
+                    paths = [self.root / f"native-alias-{tag}-{i}" for i in range(32)]
+                    paths[0].write_bytes(b"one inode, two names")
+                    os.link(paths[0], paths[1])
+                    witness = self.root / f"terminal-alias-{tag}"
+                    specs = [(first_mode, paths[0]), (second_mode, paths[1])]
+                    specs.extend(("x", path) for path in paths[2:])
+                    holder = self.start(specs, portable=portable,
+                                        env=self.environment(portable, gnu_flock=False),
+                                        terminal=self.terminal_witness(witness))
+                    self.assertIsNone(holder.line(0.5), "aliased locks granted source authority")
+                    # Leave stdin OPEN: an eventual disconnect must not hide
+                    # a self-deadlock against another descriptor in this plan.
+                    holder.process.wait(timeout=1)
+                    stdout, stderr = holder.failure()
+                    self.assertEqual((holder.process.returncode, stdout), (73, b""), stderr)
+                    self.assertIn(b"duplicate source lock inode", stderr)
+                    self.assertNotIn(b"requester ended", stderr)
+                    self.assertFalse(witness.exists())
+                    self.assertTrue(available(paths[0]) and available(paths[1]))
+                    self.assertTrue(all(not path.exists() for path in paths[2:]))
+                    self.assertEqual(paths[0].read_bytes(), b"one inode, two names")
+                    self.assertTrue(os.path.samefile(paths[0], paths[1]))
+
     @unittest.skipUnless(GNU_CANCELLABLE, "GNU flock and Bash 4.1+ are required")
     def test_gnu_disconnected_waiters_release_small_and_no_python_large_plans(self):
         env = self.environment(portable=False, python=False)

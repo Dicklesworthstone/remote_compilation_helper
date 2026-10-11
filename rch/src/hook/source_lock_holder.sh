@@ -74,8 +74,14 @@ try:
         if requester.poll(wait_ms):
             raise ValueError("source lock requester ended or sent input before readiness")
 
+    def verify_lock_path(path, identity):
+        current = os.stat(path, follow_symlinks=False)
+        if not stat.S_ISREG(current.st_mode) or identity != (current.st_dev, current.st_ino):
+            raise ValueError("source lock path changed during acquisition")
+
     held = []
     seen = set()
+    inodes = set()
     with os.fdopen(3, "rb", closefd=True) as plan:
         for _ in range(count):
             record = plan.readline(1024 * 1024 + 1)
@@ -91,10 +97,18 @@ try:
             # hashed lock names here would deadlock against existing holders.
             requester_open()
             fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
-            held.append(fd)
             before = os.fstat(fd)
             if not stat.S_ISREG(before.st_mode):
                 raise ValueError("source lock is not a regular file")
+            identity = (before.st_dev, before.st_ino)
+            # flock locks an open file description, not this process. Two
+            # different names for one inode can self-deadlock through distinct
+            # descriptors, or alias two supposedly independent shared roots.
+            # Reject, never coalesce or upgrade, an ambiguous physical plan.
+            if identity in inodes:
+                raise ValueError("duplicate source lock inode")
+            inodes.add(identity)
+            held.append((fd, path, identity))
             mode = fcntl.LOCK_EX if record[:1] == b"x" else fcntl.LOCK_SH
             while True:
                 requester_open()
@@ -108,15 +122,18 @@ try:
                     # hold earlier roots forever when SIGHUP is ignored.
                     # Only contention waits; uncontended plans do not sleep.
                     requester_open(50)
-            after = os.stat(path, follow_symlinks=False)
-            if not stat.S_ISREG(after.st_mode) or (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
-                raise ValueError("source lock path changed during acquisition")
+            verify_lock_path(path, identity)
             # Python defaults new descriptors to close-on-exec. Inheritance
             # is essential: the terminal protocol, not this bootstrap, owns
             # the locks until its final exit. Never reuse fd 3 or fd 4.
             os.set_inheritable(fd, True)
         if plan.read(1):
             raise ValueError("source lock count does not match the plan")
+    # An earlier pathname may change while a later lock is contended. Match
+    # EVERY retained descriptor to its current regular pathname at handoff,
+    # not merely when each lock was acquired. No path is recreated here.
+    for _, path, identity in held:
+        verify_lock_path(path, identity)
     requester_open()
     # Python ignores SIGPIPE by default; do not pass that policy to the
     # existing terminal shell. A lost reply must still terminate the holder.
@@ -140,7 +157,7 @@ if [ "$gnu_cancellable" = yes ]; then
     # flock(1) locks the inherited open file description, so its successful
     # exit does not release the parent's descriptor. A bounded contention
     # wait lets that parent notice requester EOF without a watchdog, signals,
-    # PID races or a live process per acquired root. Never retry tool errors.
+    # PID races or a live process per root. Never retry tool errors.
     # -p ignores BASH_ENV, imported functions and inherited shell options;
     # this bootstrap must not execute a worker's interactive startup hooks.
     exec bash --noprofile --norc -p -c '
