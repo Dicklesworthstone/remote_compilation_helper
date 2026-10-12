@@ -2349,6 +2349,69 @@ printf 'legacy identity escaped its fence\n' > "$marker"
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
+    async fn durable_source_registry_repairs_empty_legacy_cancellation_as_unowned() {
+        let directory = tempfile::tempdir().unwrap();
+        let registry = directory.path().join("registry");
+        std::fs::create_dir_all(&registry).unwrap();
+        let roots = vec![directory.path().join("source").display().to_string()];
+        let (content, digest) = source_claim_roots(&roots).unwrap();
+        // rch <= 2.1.16 left exactly this when its cancellation redirect hit
+        // ENOSPC: the record was created and never written.
+        let cancelling = registry.join(format!("ad02.{digest}.cancelling"));
+        std::fs::write(&cancelling, b"").unwrap();
+        let acquire = test_source_intent(&registry, &roots, "ad02", "acquire").await;
+        assert_eq!(acquire.status.code(), Some(73));
+        assert_eq!(std::fs::read(&cancelling).unwrap(), b"");
+        let other_roots = vec![directory.path().join("other").display().to_string()];
+        let mismatched = test_source_intent(&registry, &other_roots, "ad02", "cancel").await;
+        assert_eq!(mismatched.status.code(), Some(73));
+        assert_eq!(std::fs::read(&cancelling).unwrap(), b"");
+        for _ in 0..2 {
+            let output = test_source_intent(&registry, &roots, "ad02", "cancel").await;
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(output.stdout, b"unowned");
+        }
+        let cancelled = registry
+            .join("cancelled")
+            .join(format!("ad02.{digest}.claim"));
+        assert_eq!(std::fs::read(cancelled).unwrap(), content.as_bytes());
+        assert!(!cancelling.exists());
+        let late = test_source_intent(&registry, &roots, "ad02", "acquire").await;
+        assert_eq!(late.status.code(), Some(73));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn durable_source_registry_keeps_empty_cancellation_beside_a_claim() {
+        let directory = tempfile::tempdir().unwrap();
+        let registry = directory.path().join("registry");
+        std::fs::create_dir_all(&registry).unwrap();
+        let roots = vec![directory.path().join("source").display().to_string()];
+        let (content, digest) = source_claim_roots(&roots).unwrap();
+        // An active grant means ownership is real: the empty record is not
+        // provably the never-granted legacy case, so it must still refuse.
+        let active = registry.join(format!("ad03.{digest}.claim"));
+        let cancelling = registry.join(format!("ad03.{digest}.cancelling"));
+        std::fs::write(&active, content.as_bytes()).unwrap();
+        std::fs::write(&cancelling, b"").unwrap();
+        let output = test_source_intent(&registry, &roots, "ad03", "cancel").await;
+        assert_eq!(output.status.code(), Some(73));
+        assert_eq!(std::fs::read(&cancelling).unwrap(), b"");
+        assert_eq!(std::fs::read(&active).unwrap(), content.as_bytes());
+        assert!(
+            !registry
+                .join("cancelled")
+                .join(format!("ad03.{digest}.claim"))
+                .exists()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
     async fn durable_source_registry_write_failure_keeps_partial_bytes_private() {
         for limit in [0, 1] {
             let directory = tempfile::tempdir().unwrap();

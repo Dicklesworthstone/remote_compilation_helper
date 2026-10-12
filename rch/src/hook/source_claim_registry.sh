@@ -156,6 +156,38 @@ closures_overlap() {
     esac
 }
 
+# rch <= 2.1.16 created .cancelling with a plain `set -C` redirect, so a full
+# disk could leave it EMPTY: created, never written, never hard-linked. That
+# write came only after any pending claim had been renamed active, so an empty
+# record with no claim, pending, receipt or quarantine record of its identity
+# never held source rights. Its filename binds this token and roots digest, so
+# the cancelling caller's request is its only possible content: rewrite it
+# atomically and let cancellation tombstone it as unowned. Every other invalid
+# record, and every operation except cancel, still refuses.
+repair_empty_legacy_cancelling() {
+    [ "$operation" = cancel ] && [ "$1" = "$cancelling" ] || return 0
+    [ ! -L "$1" ] && [ -f "$1" ] && [ ! -s "$1" ] || return 0
+    for other in "$registry/$token."*.claim "$registry/$token."*.pending \
+        "$registry/$token."*.cancelling "$registry/released/$token."* \
+        "$registry/cancelled/$token."* "$registry/quarantine/$token."*; do
+        [ "$other" = "$1" ] && continue
+        [ ! -e "$other" ] && [ ! -L "$other" ] || return 0
+    done
+    repair=$(mktemp "$registry/.record-write.XXXXXXXXXX") \
+        || refuse 'cannot repair empty legacy cancellation'
+    if ! printf '%s\n' "$requested" > "$repair" \
+        || ! rch_claim_content_valid "$repair" "$digest" \
+        || ! sync -f "$repair"; then
+        printf 'RCH_SOURCE_CLAIM_WRITE_FAILED %s\n' "$repair" >&2
+        refuse 'cannot repair empty legacy cancellation'
+    fi
+    [ ! -L "$1" ] && [ -f "$1" ] && [ ! -s "$1" ] \
+        || refuse 'legacy cancellation changed during repair'
+    mv -T -- "$repair" "$1"
+    sync -f "$registry"
+    printf 'RCH_SOURCE_CLAIM_REPAIRED_EMPTY_CANCELLATION %s\n' "$1" >&2
+}
+
 # An identity is bound to one exact closure for its entire history, including
 # cancellation before acquisition and receipts after the active slot is gone.
 for previous in "$registry/$token."*.claim "$registry/$token."*.pending \
@@ -172,6 +204,7 @@ for previous in "$registry/$token."*.claim "$registry/$token."*.pending \
         if rch_claim_quarantine_fence "$registry" "$previous"; then
             continue
         fi
+        repair_empty_legacy_cancelling "$previous"
         ;;
     esac
     matches_request "$previous"
