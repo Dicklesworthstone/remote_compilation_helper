@@ -157,6 +157,8 @@ for prefix in '' '*' './'; do
 done
 sidecar=$(extract_checksum_from_manifest "$digest" "$name" true) || checksum_ok=false
 [[ "$sidecar" == "$digest" ]] || checksum_ok=false
+sidecar=$(extract_checksum_from_manifest "$(printf '%s\r\n\r\n' "$digest")" "$name" true) || checksum_ok=false
+[[ "$sidecar" == "$digest" ]] || checksum_ok=false
 upper=$(printf '%s' "$digest" | tr '[:lower:]' '[:upper:]')
 [[ "$(extract_checksum_from_manifest "$upper  $name" "$name")" == "$digest" ]] || checksum_ok=false
 index=0

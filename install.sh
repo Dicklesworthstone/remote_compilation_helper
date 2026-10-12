@@ -1063,9 +1063,10 @@ extract_checksum_from_manifest() {
     local allow_bare="${3:-false}"
 
     printf '%s\n' "$manifest_content" | awk -v file="$filename" -v bare="$allow_bare" '
-        NF {
-            records++
+        {
             sub(/\r$/, "")
+            if (!NF) next
+            records++
             path = $2
             sub(/^\*/, "", path)
             sub(/^\.\//, "", path)
