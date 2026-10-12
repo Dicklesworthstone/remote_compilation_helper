@@ -1558,7 +1558,13 @@ impl DurableLeaseWriter {
             "invalid wrapper identity"
         );
         let path = absolute_lease_path(durable_lease_path(wrapper_id))?;
-        let lease = Self::read_journal(&path, wrapper_id)?;
+        // Name the lease: a bare ENOENT read as a daemon fault (bd-ilds6).
+        let lease = Self::read_journal(&path, wrapper_id).with_context(|| {
+            format!(
+                "no readable job lease for wrapper {wrapper_id} at {}",
+                path.display()
+            )
+        })?;
         Ok(Self {
             path,
             lease: Arc::new(Mutex::new(lease)),
