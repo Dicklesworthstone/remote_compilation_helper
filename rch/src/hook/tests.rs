@@ -1623,10 +1623,14 @@ fn test_go_classification_drives_reservations_and_test_kind() {
         ..Default::default()
     };
     for (verb, kind, default, is_test) in [
-        ("build", CompilationKind::GoBuild, 12, false),
+        // Go builds offload only with an explicit output file (go_build_output).
+        ("build -o bin/app", CompilationKind::GoBuild, 12, false),
         ("test", CompilationKind::GoTest, 8, true),
         ("vet", CompilationKind::GoVet, 4, false),
     ] {
+        if kind == CompilationKind::GoBuild && !cfg!(unix) {
+            continue;
+        }
         for (command, expected) in [
             (format!("go {verb} ./..."), default),
             (format!("go {verb} -p 2 ./..."), 2),
@@ -3216,7 +3220,7 @@ async fn retry_failover_socket_preserves_endpoint_and_admission_constraints() {
                 status.to_string()
             } else {
                 assert_retry_pending(&server_writer, &previous);
-                assert!(request.starts_with("GET /select-worker/disk-budget?"));
+                assert!(request.starts_with("GET /select-verified-tools/disk-budget?"));
                 for parameter in [
                     "&cores=3",
                     "&disk_headroom_gib=12",

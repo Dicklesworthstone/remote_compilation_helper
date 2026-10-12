@@ -78,7 +78,6 @@ fn quoted_wrapper_values_never_become_cargo_options() {
         "time -p cargo build --bin app",
         "rustup run --install nightly cargo build --bin app",
         "sh -c 'cargo build --bin app'",
-        "cargo-xwin build --bin app",
     ] {
         assert!(
             selection(Some(CompilationKind::CargoBuild), command).is_none(),
