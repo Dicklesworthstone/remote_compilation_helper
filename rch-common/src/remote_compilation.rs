@@ -789,7 +789,8 @@ mod tests {
                 remote.full_hash = "supplied-remote-full-hash".to_owned();
                 remote.code_hash = "supplied-remote-code-hash".to_owned();
             }
-            let verdict = classify_returned_canary(&local, &remote, &present, marker).unwrap();
+            let verdict =
+                classify_returned_canary(&present, marker, &local, &remote, None).unwrap();
             assert_eq!(
                 verdict,
                 if drift {
@@ -801,14 +802,14 @@ mod tests {
             assert!(verdict.passed());
             assert_eq!(verdict.is_advisory(), drift);
 
-            let verdict = classify_returned_canary(&local, &remote, &absent, marker).unwrap();
+            let verdict = classify_returned_canary(&absent, marker, &local, &remote, None).unwrap();
             assert_eq!(verdict, CanaryVerdict::MissingMarker);
             assert!(!verdict.passed());
 
             for artifact in [&missing, &directory] {
                 let error =
-                    classify_returned_canary(&local, &remote, artifact, marker).unwrap_err();
-                assert!(format!("{error:#}").contains("Failed to inspect returned canary marker"));
+                    classify_returned_canary(artifact, marker, &local, &remote, None).unwrap_err();
+                assert!(format!("{error:#}").contains("Failed to verify returned canary identity"));
                 assert!(format!("{error:#}").contains("Failed to read binary"));
                 let cause = error
                     .chain()
@@ -818,8 +819,8 @@ mod tests {
                     assert_eq!(cause.kind(), std::io::ErrorKind::NotFound);
                 }
             }
-            let error = classify_returned_canary(&local, &remote, &present, "").unwrap_err();
-            assert!(error.to_string().contains("empty marker"));
+            let error = classify_returned_canary(&present, "", &local, &remote, None).unwrap_err();
+            assert!(error.to_string().contains("empty identity marker"));
         }
         assert_eq!(std::fs::read(&present).unwrap(), present_bytes);
         assert_eq!(std::fs::read(&absent).unwrap(), absent_bytes);
