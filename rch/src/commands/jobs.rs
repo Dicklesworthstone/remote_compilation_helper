@@ -907,12 +907,25 @@ mod tests {
         let original = retained.join("observed-original.retained");
         assert!(!original.exists());
         std::fs::rename(&journal, &original).unwrap();
+        #[cfg(not(target_vendor = "apple"))]
         rustix::fs::mkfifoat(
             descriptor.as_fd(),
             c"observed.json",
             Mode::RUSR | Mode::WUSR,
         )
         .unwrap();
+        // rustix has no mkfifoat on Apple targets and this crate forbids
+        // unsafe code, so make the FIFO by path; `descriptor` is open on that
+        // same directory.
+        #[cfg(target_vendor = "apple")]
+        assert!(
+            std::process::Command::new("/usr/bin/mkfifo")
+                .args(["-m", "600"])
+                .arg(&journal)
+                .status()
+                .unwrap()
+                .success()
+        );
 
         // No writer is started. Bound observation so a missing NONBLOCK flag
         // fails this case instead of hanging the complete test runner.
