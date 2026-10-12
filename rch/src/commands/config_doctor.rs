@@ -593,8 +593,9 @@ mod tests {
                     };
                     assert_eq!(report["healthy"], true);
                     assert_eq!(report["diagnostics"], serde_json::json!([]));
+                    // TOON decodes every number as f64, so compare numerically.
                     for count in ["error_count", "warning_count", "info_count"] {
-                        assert_eq!(report[count], 0);
+                        assert_eq!(report[count].as_f64(), Some(0.0), "{format:?} {count}");
                     }
                 }
             }

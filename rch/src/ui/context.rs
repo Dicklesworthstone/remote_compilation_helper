@@ -794,7 +794,11 @@ mod tests {
             } else {
                 serde_json::from_slice::<Value>(encoded).unwrap()
             };
-            assert_eq!(actual, payload);
+            // TOON decodes every number as f64 (`7` comes back as `7.0`).
+            assert!(
+                json_values_loose_eq(&actual, &payload),
+                "{format:?} compact={compact} forced={forced}: {actual}"
+            );
         }
     }
 
