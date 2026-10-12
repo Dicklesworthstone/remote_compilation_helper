@@ -1943,11 +1943,21 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
         ("/select-worker", false, false, false),
         ("/select-worker/resume-queued", true, false, false),
         ("/select-worker/disk-budget", false, true, false),
-        ("/select-worker/resume-queued/disk-budget", true, true, false),
+        (
+            "/select-worker/resume-queued/disk-budget",
+            true,
+            true,
+            false,
+        ),
         ("/select-verified-tools", false, false, true),
         ("/select-verified-tools/resume-queued", true, false, true),
         ("/select-verified-tools/disk-budget", false, true, true),
-        ("/select-verified-tools/resume-queued/disk-budget", true, true, true),
+        (
+            "/select-verified-tools/resume-queued/disk-budget",
+            true,
+            true,
+            true,
+        ),
     ]
     .into_iter()
     .find_map(|(route, resume, disk_budget, tools)| {
@@ -5078,7 +5088,10 @@ mod tests {
             assert!(!request.job_mode);
             let constrained = queue_selection_digest(&request, Some(30)).unwrap();
             request.required_tools.pop();
-            assert_ne!(constrained, queue_selection_digest(&request, Some(30)).unwrap());
+            assert_ne!(
+                constrained,
+                queue_selection_digest(&request, Some(30)).unwrap()
+            );
         }
         for line in [
             "GET /select-verified-tools-extra?project=p&require_tool=cargo-xwin",

@@ -423,7 +423,11 @@ mod tests {
         ] {
             let selected = select(command).unwrap();
             assert!(selected.contains(&"target/x86_64-pc-windows-msvc/release/app".to_owned()));
-            assert!(selected.iter().all(|path| path.starts_with("target/x86_64-pc-windows-msvc/release/")));
+            assert!(
+                selected
+                    .iter()
+                    .all(|path| path.starts_with("target/x86_64-pc-windows-msvc/release/"))
+            );
             assert!(!selected.iter().any(|path| path.ends_with("release/**")));
         }
         for command in [
@@ -433,7 +437,10 @@ mod tests {
             "cargo xwin build --bin app --help",
             "cargo xwin build --bin app; cargo build --bin other",
         ] {
-            assert!(select(command).is_none(), "accepted unsupported plugin command {command}");
+            assert!(
+                select(command).is_none(),
+                "accepted unsupported plugin command {command}"
+            );
         }
     }
 

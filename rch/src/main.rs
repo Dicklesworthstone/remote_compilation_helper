@@ -46,18 +46,22 @@ fn parse_exec_worker(value: &str) -> std::result::Result<rch_common::WorkerId, S
         || value.contains(',')
         || value.chars().any(|c| c.is_whitespace() || c.is_control())
     {
-        return Err("--worker requires one nonempty worker ID, without whitespace or commas".into());
+        return Err(
+            "--worker requires one nonempty worker ID, without whitespace or commas".into(),
+        );
     }
     Ok(rch_common::WorkerId::new(value))
 }
 
 fn parse_required_tool(value: &str) -> std::result::Result<String, String> {
     if value.is_empty()
-        || !value.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'+')
-        })
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'+'))
     {
-        return Err("--require-tool must name one declared tool using letters, digits, - _ . +".into());
+        return Err(
+            "--require-tool must name one declared tool using letters, digits, - _ . +".into(),
+        );
     }
     Ok(value.to_owned())
 }
@@ -2084,7 +2088,9 @@ fn output_delivery_failed(error: &anyhow::Error) -> bool {
             Some(ui::context::OutputError::Delivery(_))
         )
         || error.chain().any(|cause| {
-            cause.downcast_ref::<commands::jobs::JobOutputFailure>().is_some()
+            cause
+                .downcast_ref::<commands::jobs::JobOutputFailure>()
+                .is_some()
                 || matches!(
                     cause.downcast_ref::<ui::context::OutputError>(),
                     Some(ui::context::OutputError::Delivery(_))
@@ -6541,9 +6547,10 @@ fn resolve_dashboard_url_from(
 /// Append the agent API to the dashboard path, replacing its UI query/fragment.
 /// String concatenation would otherwise place the suffix inside those fields.
 fn dashboard_agent_endpoint(url: &str) -> Result<String> {
-    let mut endpoint = reqwest::Url::parse(url).map_err(|_| error::WebError::InvalidDashboardUrl {
-        url: url.to_owned(),
-    })?;
+    let mut endpoint =
+        reqwest::Url::parse(url).map_err(|_| error::WebError::InvalidDashboardUrl {
+            url: url.to_owned(),
+        })?;
     if !matches!(endpoint.scheme(), "http" | "https") || endpoint.host_str().is_none() {
         return Err(error::WebError::InvalidDashboardUrl {
             url: url.to_owned(),
@@ -6617,10 +6624,8 @@ mod tests {
         #[error("load report caller")]
         struct CallerFailure(#[source] LoadStormReportFailure);
 
-        let wrapped = anyhow::Error::new(CallerFailure(LoadStormReportFailure {
-            held: 1,
-            total: 5,
-        }));
+        let wrapped =
+            anyhow::Error::new(CallerFailure(LoadStormReportFailure { held: 1, total: 5 }));
         assert!(load_storm_report_delivered(&wrapped));
         assert!(!output_delivery_failed(&wrapped));
 
@@ -6648,7 +6653,9 @@ mod tests {
             ui::OutputWriter::new(socket, false),
             ui::OutputWriter::stderr(),
         );
-        let failure = ctx.json(&serde_json::json!({"status": "observed"})).unwrap_err();
+        let failure = ctx
+            .json(&serde_json::json!({"status": "observed"}))
+            .unwrap_err();
         let error = anyhow::Error::new(failure).context("outer caller context");
         assert!(output_delivery_failed(&error));
         assert!(format!("{error:#}").contains("structured output could not be delivered"));
@@ -7240,21 +7247,44 @@ mod tests {
         let _guard = test_guard!();
         for verb in ["exec", "admit"] {
             let cli = Cli::try_parse_from([
-                "rch", verb, "--require-tool", "cargo-xwin", "--require-tool", "llvm-ar",
-                "--", "cargo", "xwin", "build", "--release",
-            ]).unwrap();
+                "rch",
+                verb,
+                "--require-tool",
+                "cargo-xwin",
+                "--require-tool",
+                "llvm-ar",
+                "--",
+                "cargo",
+                "xwin",
+                "build",
+                "--release",
+            ])
+            .unwrap();
             match cli.command {
-                Some(Commands::Exec { require_tool, job, .. })
-                | Some(Commands::Admit { require_tool, job, .. }) => {
+                Some(Commands::Exec {
+                    require_tool, job, ..
+                })
+                | Some(Commands::Admit {
+                    require_tool, job, ..
+                }) => {
                     assert!(!job);
                     assert_eq!(require_tool, vec!["cargo-xwin", "llvm-ar"]);
                 }
                 _ => fail_expected("Expected normal compiler requirements"),
             }
             for name in ["", "tool one", "one,two", "tool=value", "tool\n"] {
-                assert!(Cli::try_parse_from([
-                    "rch", verb, "--require-tool", name, "--", "cargo", "build",
-                ]).is_err());
+                assert!(
+                    Cli::try_parse_from([
+                        "rch",
+                        verb,
+                        "--require-tool",
+                        name,
+                        "--",
+                        "cargo",
+                        "build",
+                    ])
+                    .is_err()
+                );
             }
         }
     }
@@ -7300,10 +7330,8 @@ mod tests {
         let _guard = test_guard!();
         for worker in ["", " ", "one,two", "one two", "one\ntwo", "worker\0"] {
             assert!(
-                Cli::try_parse_from([
-                    "rch", "exec", "--worker", worker, "--", "cargo", "build",
-                ])
-                .is_err(),
+                Cli::try_parse_from(["rch", "exec", "--worker", worker, "--", "cargo", "build",])
+                    .is_err(),
                 "accepted malformed worker {worker:?}"
             );
         }

@@ -451,7 +451,10 @@ async fn run_unix(action: Option<JobsAction>, ctx: &OutputContext) -> Result<()>
         let writer = DurableLeaseWriter::load(&wrapper_id)?;
         let lease = writer.snapshot();
         if lease.terminal_acknowledged {
-            emit(ctx, &writer.terminal_job_report(&wrapper_id, "completed", None)?)?;
+            emit(
+                ctx,
+                &writer.terminal_job_report(&wrapper_id, "completed", None)?,
+            )?;
             return Ok(());
         }
         if !cancel && waiting_for_admission(&lease, process_matches(&lease))? {

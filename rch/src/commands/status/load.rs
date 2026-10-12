@@ -198,7 +198,8 @@ fn classify_load_outcome(spec: &LoadJobSpec, result: SelfTestResultRecordFromApi
         outcome.state = LoadState::CanaryPassed;
         outcome.reason_code = MISSING_SCHEDULER_EVIDENCE.to_string();
         outcome.detail = Some(
-            "Canary passed; admitted execution and scheduler behavior remain unverified".to_string(),
+            "Canary passed; admitted execution and scheduler behavior remain unverified"
+                .to_string(),
         );
     }
     outcome
@@ -210,7 +211,10 @@ fn decode_load_response(spec: &LoadJobSpec, response: &str) -> Result<LoadOutcom
             .lines()
             .next()
             .and_then(|line| line.split_whitespace().nth(1));
-        anyhow::ensure!(status == Some("200"), "Unsuccessful self-test HTTP response");
+        anyhow::ensure!(
+            status == Some("200"),
+            "Unsuccessful self-test HTTP response"
+        );
     }
     let json = extract_json_body(response).context("Missing self-test response body")?;
     let run: SelfTestRunResponseFromApi =
@@ -587,7 +591,9 @@ pub(super) async fn run_load_storm(
         outcomes.len()
     );
     println!("  {}", summary);
-    println!("  Admission identities, queue contention, slots, fairness and native artifacts: NOT OBSERVED");
+    println!(
+        "  Admission identities, queue contention, slots, fairness and native artifacts: NOT OBSERVED"
+    );
     if let Some(problem) = problem {
         println!("  {problem}");
     }
@@ -597,7 +603,9 @@ pub(super) async fn run_load_storm(
     if dry_run {
         return Ok(());
     }
-    anyhow::bail!("{MISSING_SCHEDULER_EVIDENCE}: legacy canary diagnostics cannot qualify a live fleet")
+    anyhow::bail!(
+        "{MISSING_SCHEDULER_EVIDENCE}: legacy canary diagnostics cannot qualify a live fleet"
+    )
 }
 
 fn refuse_load_plan(specs: &[LoadJobSpec], detail: &str) -> Vec<LoadOutcome> {
@@ -691,7 +699,11 @@ mod tests {
                 .iter()
                 .all(|outcome| outcome.state == LoadState::Unknown)
         );
-        assert!(outcomes.iter().all(|outcome| outcome.remote_job_id.is_none()));
+        assert!(
+            outcomes
+                .iter()
+                .all(|outcome| outcome.remote_job_id.is_none())
+        );
         assert!(
             outcomes
                 .iter()
@@ -808,11 +820,13 @@ mod tests {
         assert!(decode_load_response(&spec, &valid.to_string()).is_ok());
         assert!(decode_load_response(&spec, "not json").is_err());
         assert!(decode_load_response(&spec, "").is_err());
-        assert!(decode_load_response(
-            &spec,
-            &format!("HTTP/1.1 500 Internal Server Error\r\n\r\n{valid}")
-        )
-        .is_err());
+        assert!(
+            decode_load_response(
+                &spec,
+                &format!("HTTP/1.1 500 Internal Server Error\r\n\r\n{valid}")
+            )
+            .is_err()
+        );
 
         let mut missing = valid.clone();
         missing["results"] = serde_json::json!([]);
@@ -824,7 +838,13 @@ mod tests {
         wrong_history["run"]["id"] = serde_json::json!(99);
         let mut inconsistent = valid;
         inconsistent["run"]["workers_passed"] = serde_json::json!(0);
-        for bad in [missing, duplicated, wrong_worker, wrong_history, inconsistent] {
+        for bad in [
+            missing,
+            duplicated,
+            wrong_worker,
+            wrong_history,
+            inconsistent,
+        ] {
             assert!(decode_load_response(&spec, &bad.to_string()).is_err());
         }
     }

@@ -2567,10 +2567,15 @@ mod managed_build_dir_tests {
             let actual = shell_words::split(managed.execution_command()).unwrap();
             assert_eq!(&actual[..original.len()], original.as_slice(), "{command}");
             assert_eq!(actual[original.len()], "--config");
-            assert_eq!(actual[original.len() + 1], "build.build-dir=\"/managed/cache\"");
+            assert_eq!(
+                actual[original.len() + 1],
+                "build.build-dir=\"/managed/cache\""
+            );
             assert_eq!(actual.len(), original.len() + 2);
             assert_eq!(managed.policy_command(), command);
-            assert!(rch_common::patterns::is_cargo_xwin_build(managed.policy_command()));
+            assert!(rch_common::patterns::is_cargo_xwin_build(
+                managed.policy_command()
+            ));
         }
         for command in [
             "cargo xwin check --bin cli",

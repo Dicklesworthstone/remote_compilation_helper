@@ -1526,7 +1526,8 @@ pub(crate) struct DurableLeaseWriter {
     path: PathBuf,
     lease: Arc<Mutex<DurableJobLease>>,
     #[cfg(unix)]
-    recovery_ownership: Option<Arc<transfer_orchestration::recovery::recovery_owner::RecoveryOwnership>>,
+    recovery_ownership:
+        Option<Arc<transfer_orchestration::recovery::recovery_owner::RecoveryOwnership>>,
 }
 
 struct RetrySelectionIntent {
@@ -1671,7 +1672,9 @@ impl DurableLeaseWriter {
                 && !selection_is_pending(&lease),
             "job report requires the exact acknowledged terminal journal"
         );
-        let exit = lease.exit_code.context("terminal job has no observed exit code")?;
+        let exit = lease
+            .exit_code
+            .context("terminal job has no observed exit code")?;
         anyhow::ensure!(
             expected_exit.is_none_or(|expected| expected == exit),
             "job recovery exit differs from its committed terminal journal"
@@ -1928,7 +1931,9 @@ impl DurableLeaseWriter {
                 if recovery.get("retired").and_then(serde_json::Value::as_bool) != Some(true) {
                     return None;
                 }
-                recovery.get("returned").and_then(serde_json::Value::as_i64)
+                recovery
+                    .get("returned")
+                    .and_then(serde_json::Value::as_i64)
                     .and_then(|returned| i32::try_from(returned).ok())
             })
             .context("terminal command exit is not observed; acknowledgement refused")?;
@@ -3512,7 +3517,8 @@ pub async fn run_exec(
     let wait_for_worker = queue_when_busy_enabled();
     // A CLI pin is a singleton admission constraint, never the environment /
     // project preference union. Every retry keeps this same allowed set.
-    let preferred_workers = exec_worker_preferences(exact_worker, command_parsing::preferred_workers);
+    let preferred_workers =
+        exec_worker_preferences(exact_worker, command_parsing::preferred_workers);
     let durable_lease = DurableLeaseWriter::create(
         &command,
         require_remote,
@@ -4052,7 +4058,9 @@ pub async fn run_exec(
                         result_dirs: Some(&result.result_dirs),
                         error_code: None,
                         admission: durable_lease.machine_admission_reference(
-                            &wrapper_id, remote_build_id, &worker.id,
+                            &wrapper_id,
+                            remote_build_id,
+                            &worker.id,
                         )?,
                     });
                     std::process::exit(0);
@@ -4087,7 +4095,9 @@ pub async fn run_exec(
                         result_dirs: exec_dir_stats.as_deref(),
                         error_code: None,
                         admission: durable_lease.machine_admission_reference(
-                            &wrapper_id, remote_build_id, &worker.id,
+                            &wrapper_id,
+                            remote_build_id,
+                            &worker.id,
                         )?,
                     });
                     std::process::exit(result.exit_code);
@@ -4266,7 +4276,9 @@ pub async fn run_exec(
                         result_dirs: exec_dir_stats.as_deref(),
                         error_code: None,
                         admission: durable_lease.machine_admission_reference(
-                            &wrapper_id, remote_build_id, &worker.id,
+                            &wrapper_id,
+                            remote_build_id,
+                            &worker.id,
                         )?,
                     });
                     std::process::exit(result.exit_code);
@@ -4370,7 +4382,9 @@ pub async fn run_exec(
                         duration_ms: Some(exec_start.elapsed().as_millis() as u64),
                         error_code: None,
                         admission: durable_lease.machine_admission_reference(
-                            &wrapper_id, remote_build_id, &worker.id,
+                            &wrapper_id,
+                            remote_build_id,
+                            &worker.id,
                         )?,
                     });
                     std::process::exit(EXIT_BUILD_ERROR);
@@ -4503,7 +4517,9 @@ pub async fn run_exec(
                     result_dirs: exec_dir_stats.as_deref(),
                     error_code: None,
                     admission: durable_lease.machine_admission_reference(
-                        &wrapper_id, remote_build_id, &fault.failed_worker,
+                        &wrapper_id,
+                        remote_build_id,
+                        &fault.failed_worker,
                     )?,
                 });
                 std::process::exit(code);
@@ -4541,7 +4557,9 @@ pub async fn run_exec(
                     result_dirs: exec_dir_stats.as_deref(),
                     error_code: None,
                     admission: durable_lease.machine_admission_reference(
-                        &wrapper_id, remote_build_id, &fault.failed_worker,
+                        &wrapper_id,
+                        remote_build_id,
+                        &fault.failed_worker,
                     )?,
                 });
                 std::process::exit(code);
@@ -4758,10 +4776,10 @@ mod source_fidelity;
 mod remote_result;
 use remote_result::{
     ExecAdmissionReference, ExecResultDirStat, ExecResultEnvelope,
-    detect_cargo_workspace_inheritance_failure,
-    detect_worker_system_dependency_failure, emit_exec_envelope, is_cpu_capability_signal,
-    is_signal_killed, is_toolchain_failure, remote_failure_is_disk_full,
-    remote_failure_is_worker_fault, set_machine_output, signal_name, wrapped_cpu_capability_signal,
+    detect_cargo_workspace_inheritance_failure, detect_worker_system_dependency_failure,
+    emit_exec_envelope, is_cpu_capability_signal, is_signal_killed, is_toolchain_failure,
+    remote_failure_is_disk_full, remote_failure_is_worker_fault, set_machine_output, signal_name,
+    wrapped_cpu_capability_signal,
 };
 
 // The remote cargo target-dir resolution / naming / command-rewrite cluster

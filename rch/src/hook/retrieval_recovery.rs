@@ -1956,10 +1956,16 @@ async fn cancel_source_grant(mut session: RecoverySession) -> anyhow::Result<boo
 }
 
 /// Recollect the admitted command's outputs; no execution path is reachable.
-pub(crate) async fn recover_job(writer: &DurableLeaseWriter) -> anyhow::Result<(i32, DurableLeaseWriter)> {
+pub(crate) async fn recover_job(
+    writer: &DurableLeaseWriter,
+) -> anyhow::Result<(i32, DurableLeaseWriter)> {
     let owned = recovery_owner::claim(writer).await?;
     let exit = Box::pin(recover_owned_job(&owned)).await?;
-    owned.recovery_ownership.as_ref().context("recovery has no journal owner")?.verify()?;
+    owned
+        .recovery_ownership
+        .as_ref()
+        .context("recovery has no journal owner")?
+        .verify()?;
     Ok((exit, owned))
 }
 
@@ -1967,13 +1973,16 @@ async fn recover_owned_job(writer: &DurableLeaseWriter) -> anyhow::Result<i32> {
     // Resolve lazily so an already acknowledged journal stays a read-only
     // operation, but pin the chosen endpoint across the entire handoff.
     let mut socket = None;
-    Box::pin(recover_owned_job_with_daemon(writer, async |command: &str| {
-        if socket.is_none() {
-            let config = crate::config::load_config()?;
-            socket = Some(shellexpand::tilde(&config.general.socket_path).into_owned());
-        }
-        recovery_completion::request(socket.as_deref().expect("resolved socket"), command).await
-    }))
+    Box::pin(recover_owned_job_with_daemon(
+        writer,
+        async |command: &str| {
+            if socket.is_none() {
+                let config = crate::config::load_config()?;
+                socket = Some(shellexpand::tilde(&config.general.socket_path).into_owned());
+            }
+            recovery_completion::request(socket.as_deref().expect("resolved socket"), command).await
+        },
+    ))
     .await
 }
 
@@ -2049,7 +2058,11 @@ pub(crate) async fn recover_job_cargo_json(
         "recovered Cargo stderr contradicts its compiler completion"
     );
     let stderr = diagnostics.read()?;
-    writer.recovery_ownership.as_ref().context("recovery has no journal owner")?.verify()?;
+    writer
+        .recovery_ownership
+        .as_ref()
+        .context("recovery has no journal owner")?
+        .verify()?;
     Ok((exit, stdout, stderr))
 }
 
@@ -2060,7 +2073,11 @@ async fn recover_job_with_daemon(
 ) -> anyhow::Result<i32> {
     let owned = recovery_owner::claim(writer).await?;
     let exit = Box::pin(recover_owned_job_with_daemon(&owned, daemon)).await?;
-    owned.recovery_ownership.as_ref().context("recovery has no journal owner")?.verify()?;
+    owned
+        .recovery_ownership
+        .as_ref()
+        .context("recovery has no journal owner")?
+        .verify()?;
     Ok(exit)
 }
 
@@ -2072,7 +2089,11 @@ async fn recover_owned_job_with_daemon(
     // worker probes, source release and final daemon reservation reconciliation.
     // claim reloads the latest disk state after acquisition and never mistakes
     // an unverified wrapper for a dead one.
-    writer.recovery_ownership.as_ref().context("recovery has no journal owner")?.verify()?;
+    writer
+        .recovery_ownership
+        .as_ref()
+        .context("recovery has no journal owner")?
+        .verify()?;
     let recipe = load_recipe(writer)?;
     let lease = writer.snapshot();
     if lease.terminal_acknowledged {

@@ -708,7 +708,10 @@ mod tests {
             .into_iter()
             .map(|writer| writer.join().unwrap())
             .collect::<Vec<_>>();
-        let winners = outcomes.iter().filter(|outcome| outcome.1).collect::<Vec<_>>();
+        let winners = outcomes
+            .iter()
+            .filter(|outcome| outcome.1)
+            .collect::<Vec<_>>();
         assert_eq!(winners.len(), 1);
         assert_eq!(std::fs::read(&path).unwrap(), winners[0].0.as_bytes());
         assert!(!write_configuration(&path, "later initializer\n", false).unwrap());
@@ -788,18 +791,25 @@ mod tests {
                     assert_eq!(report["command"], "config init");
                     assert_eq!(report["success"], true);
                     let paths = serde_json::json!([
-                        config.display().to_string(), workers.display().to_string()
+                        config.display().to_string(),
+                        workers.display().to_string()
                     ]);
-                    assert_eq!(report["data"]["created"], if existing {
-                        serde_json::json!([])
-                    } else {
-                        paths.clone()
-                    });
-                    assert_eq!(report["data"]["already_existed"], if existing {
-                        paths
-                    } else {
-                        serde_json::json!([])
-                    });
+                    assert_eq!(
+                        report["data"]["created"],
+                        if existing {
+                            serde_json::json!([])
+                        } else {
+                            paths.clone()
+                        }
+                    );
+                    assert_eq!(
+                        report["data"]["already_existed"],
+                        if existing {
+                            paths
+                        } else {
+                            serde_json::json!([])
+                        }
+                    );
                 }
                 let config_bytes = std::fs::read(&config).unwrap();
                 let worker_bytes = std::fs::read(&workers).unwrap();
@@ -807,10 +817,9 @@ mod tests {
                     assert_eq!(config_bytes, b"owned configuration bytes\n");
                     assert_eq!(worker_bytes, b"owned worker bytes\n");
                 } else {
-                    let parsed = toml::from_str::<toml::Value>(
-                        std::str::from_utf8(&config_bytes).unwrap(),
-                    )
-                    .unwrap();
+                    let parsed =
+                        toml::from_str::<toml::Value>(std::str::from_utf8(&config_bytes).unwrap())
+                            .unwrap();
                     let expected_socket = rch_common::default_socket_path();
                     assert_eq!(
                         parsed["general"]["socket_path"].as_str(),

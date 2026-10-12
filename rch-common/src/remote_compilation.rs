@@ -129,8 +129,6 @@ fn cargo_package_name(project: &Path) -> Option<String> {
         .map(ToString::to_string)
 }
 
-
-
 fn use_mock_transport(worker: &WorkerConfig) -> bool {
     mock::is_mock_enabled() || mock::is_mock_worker(worker)
 }

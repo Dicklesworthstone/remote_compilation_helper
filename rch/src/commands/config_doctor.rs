@@ -539,7 +539,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn doctor_reporter_delivers_formats_and_propagates_real_output_failures() {
-        use crate::ui::context::{ColorChoice, OutputConfig, OutputError, OutputFormat, OutputMode};
+        use crate::ui::context::{
+            ColorChoice, OutputConfig, OutputError, OutputFormat, OutputMode,
+        };
         use crate::ui::writer::OutputWriter;
         use std::os::unix::net::UnixStream;
 

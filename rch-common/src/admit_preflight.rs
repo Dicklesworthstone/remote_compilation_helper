@@ -527,15 +527,26 @@ mod tests {
 
     #[test]
     fn compiler_tool_requirements_preserve_rust_target_and_classification() {
-        let original = preflight("cargo build --target x86_64-pc-windows-msvc --release", true);
+        let original = preflight(
+            "cargo build --target x86_64-pc-windows-msvc --release",
+            true,
+        );
         let observed = original.clone().with_required_tools(vec![
-            "cargo-xwin".into(), "llvm-ar".into(), "cargo-xwin".into(),
+            "cargo-xwin".into(),
+            "llvm-ar".into(),
+            "cargo-xwin".into(),
         ]);
         assert_eq!(observed.is_compilation, original.is_compilation);
         assert_eq!(observed.family, original.family);
         assert_eq!(observed.base_recommendation, original.base_recommendation);
-        assert_eq!(observed.required.needs_targets, original.required.needs_targets);
-        assert_eq!(observed.required.needs_toolchains, original.required.needs_toolchains);
+        assert_eq!(
+            observed.required.needs_targets,
+            original.required.needs_targets
+        );
+        assert_eq!(
+            observed.required.needs_toolchains,
+            original.required.needs_toolchains
+        );
         assert!(observed.required.needs_cargo);
         assert!(!observed.job_mode);
         assert!(observed.proof_policy);

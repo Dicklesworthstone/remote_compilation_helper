@@ -30,7 +30,8 @@ pub(crate) fn read_regular_file_at(
     let mut file = File::from(descriptor);
     anyhow::ensure!(file.metadata()?.is_file(), "journal is not a regular file");
     let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes).context("journal read failed")?;
+    file.read_to_end(&mut bytes)
+        .context("journal read failed")?;
     Ok(bytes)
 }
 
@@ -56,7 +57,11 @@ pub(crate) fn read_regular_file(path: &Path) -> Result<Vec<u8>> {
     let directory = File::from(
         rustix::fs::open(
             parent,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+            OFlags::RDONLY
+                | OFlags::DIRECTORY
+                | OFlags::CLOEXEC
+                | OFlags::NOFOLLOW
+                | OFlags::NONBLOCK,
             Mode::empty(),
         )
         .context("journal directory open without following symlinks failed")?,
