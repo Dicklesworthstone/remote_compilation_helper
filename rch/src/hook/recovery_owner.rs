@@ -700,6 +700,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(target_vendor = "apple", allow(unused_imports, unused_variables))]
     fn recovery_owner_refuses_fifo_journal_before_owner_inspection() {
         use rustix::fs::{Mode, OFlags};
         use std::os::fd::AsFd;
@@ -708,7 +709,19 @@ mod tests {
         let retained = tempfile::tempdir().unwrap().keep();
         let directory =
             rustix::fs::open(&retained, OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty()).unwrap();
+        #[cfg(not(target_vendor = "apple"))]
         rustix::fs::mkfifoat(directory.as_fd(), c"lease.json", Mode::RUSR | Mode::WUSR).unwrap();
+        // rustix has no mkfifoat on Apple targets and this crate forbids unsafe
+        // code, so make the FIFO by path; `directory` is open on `retained`.
+        #[cfg(target_vendor = "apple")]
+        assert!(
+            std::process::Command::new("/usr/bin/mkfifo")
+                .args(["-m", "600"])
+                .arg(retained.join("lease.json"))
+                .status()
+                .unwrap()
+                .success()
+        );
         let writer = DurableLeaseWriter {
             path: retained.join("lease.json"),
             recovery_ownership: None,

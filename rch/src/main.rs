@@ -30,7 +30,7 @@ pub mod tui;
 pub mod ui;
 mod update;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::CompleteEnv;
 use rch_common::{ApiError, ApiResponse, ErrorCode, LogConfig, init_logging};
@@ -6574,6 +6574,7 @@ fn open_browser(url: &str) -> Result<()> {
 
     #[cfg(target_os = "linux")]
     {
+        use anyhow::Context as _;
         // Preserve the existing fallback order, but never acknowledge a launch
         // if every real executable failed to start.
         let mut last_error = match std::process::Command::new("xdg-open").arg(url).spawn() {

@@ -2506,6 +2506,7 @@ fn compiler_admission_reference_binds_one_durable_attempt_without_rounding() {
 
 #[cfg(unix)]
 #[test]
+#[cfg_attr(target_vendor = "apple", allow(unused_imports, unused_variables))]
 fn recovery_journal_reader_keeps_large_receipts_and_rejects_redirected_entries() {
     use rustix::fs::{Mode, OFlags};
     use std::os::fd::AsFd;
@@ -2538,8 +2539,20 @@ fn recovery_journal_reader_keeps_large_receipts_and_rejects_redirected_entries()
     assert!(DurableLeaseWriter::read_journal(&wrong_schema, &wrapper).is_err());
     let directory =
         rustix::fs::open(&retained, OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty()).unwrap();
+    #[cfg(not(target_vendor = "apple"))]
     rustix::fs::mkfifoat(directory.as_fd(), c"fifo.json", Mode::RUSR | Mode::WUSR).unwrap();
     let fifo = retained.join("fifo.json");
+    // rustix has no mkfifoat on Apple targets and this crate forbids unsafe
+    // code, so make the FIFO by path; `directory` is open on `retained`.
+    #[cfg(target_vendor = "apple")]
+    assert!(
+        std::process::Command::new("/usr/bin/mkfifo")
+            .args(["-m", "600"])
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success()
+    );
     let (sender, receiver) = std::sync::mpsc::channel();
     let fifo_read = fifo.clone();
     let reader = std::thread::spawn(move || {

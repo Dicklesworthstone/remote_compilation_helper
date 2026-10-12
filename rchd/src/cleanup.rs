@@ -363,7 +363,7 @@ impl ActiveBuildCleanup {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     async fn check_active_builds(&self) {
         self.check_active_builds_observed(&mut ObservationWindow::default())
             .await;
@@ -1048,6 +1048,7 @@ mod tests {
 
     /// Admit like production selection does: with the worker's endpoint, so
     /// cancellation can target the admitted SSH coordinates (60ee09f).
+    #[cfg(target_os = "linux")]
     async fn admit_remote_build(
         context: &DaemonContext,
         project: String,
