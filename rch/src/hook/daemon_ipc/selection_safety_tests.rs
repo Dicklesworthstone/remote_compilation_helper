@@ -639,7 +639,7 @@ async fn resume_connects_when_the_daemon_socket_reappears() {
         (listener, request)
     };
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-    let client = resume_queued_selection(path.to_str().unwrap(), query, deadline, 0);
+    let client = resume_queued_selection(path.to_str().unwrap(), query, deadline, 0, false);
     let (result, (listener, request)) = timeout(Duration::from_secs(3), async {
         tokio::join!(client, server)
     })
@@ -673,6 +673,7 @@ async fn unavailable_resume_socket_exhausts_only_the_original_deadline() {
                 "project=queued",
                 started + budget,
                 0,
+                false,
             ),
         )
         .await
@@ -716,7 +717,8 @@ async fn resumed_reply_wait_uses_time_left_after_reconnecting() {
     let deadline = started + Duration::from_millis(600);
     let client = async {
         let result =
-            resume_queued_selection(path.to_str().unwrap(), "project=queued", deadline, 0).await;
+            resume_queued_selection(path.to_str().unwrap(), "project=queued", deadline, 0, false)
+                .await;
         finished_tx.send(()).unwrap();
         result
     };
@@ -757,6 +759,7 @@ async fn expired_resume_deadline_does_not_dispatch() {
         "project=queued",
         tokio::time::Instant::now() - Duration::from_millis(1),
         0,
+        false,
     )
     .await
     .unwrap_err();

@@ -129,10 +129,9 @@ impl BuildHeartbeatLoop {
                                 && serde_json::from_slice::<JobIdentity>(&bytes).ok().as_ref() == Some(&evidence.identity)
                                 && let Ok(status) = crate::commands::jobs::query(&evidence).await
                                 && let Ok(code) = crate::commands::jobs::validate_completion(&evidence, &status)
+                                && lease.acknowledge_observed_completion(&evidence, code).is_ok()
                             {
-                                if lease.acknowledge_observed_completion(&evidence, code).is_ok() {
-                                    std::process::exit(code);
-                                }
+                                std::process::exit(code);
                             }
                             let observed = crate::commands::jobs::query(&evidence).await;
                             let mut state = rch_common::job_recovery::WrapperState::waiting(evidence.state);

@@ -4299,6 +4299,7 @@ mod tests {
             let before = std::fs::read(&writer.path).unwrap();
             let disk_writer = DurableLeaseWriter {
                 path: writer.path.clone(),
+                recovery_ownership: None,
                 lease: Arc::new(Mutex::new(serde_json::from_slice(&before).unwrap())),
             };
             assert!(
