@@ -56,8 +56,8 @@ fn exec_requoting_round_trips_literal_quotes_backslashes_and_dollar_bytes() {
             argv[2..].to_vec(),
             "{command}"
         );
-        let capture = CargoOutputCapture::for_command(Some(CompilationKind::CargoBuild), &command)
-            .unwrap();
+        let capture =
+            CargoOutputCapture::for_command(Some(CompilationKind::CargoBuild), &command).unwrap();
         assert!(capture.caller_json_supported());
         assert_eq!(capture.execution_command(&command), command);
     }
@@ -89,7 +89,8 @@ fn quoted_wrapper_values_never_become_cargo_options() {
 
 #[test]
 fn quoted_named_outputs_keep_the_existing_transfer_policy() {
-    let plain = "cargo build --bin app --example demo-lib --profile lean --target x86_64-unknown-linux-gnu";
+    let plain =
+        "cargo build --bin app --example demo-lib --profile lean --target x86_64-unknown-linux-gnu";
     let quoted = r#"cargo build '--bin=app' --example 'demo-lib' --profile "lean" --target='x86_64-unknown-linux-gnu' --manifest-path 'source tree/Cargo.toml'"#;
     let kind = Some(CompilationKind::CargoBuild);
     assert_eq!(patterns(kind, Some(plain)), patterns(kind, Some(quoted)));
@@ -135,7 +136,13 @@ fn quoting_does_not_admit_evaluation_comments_or_additional_outputs() {
         );
     }
     // Whitespace between words is not a control byte inside a path.
-    assert!(selection(Some(CompilationKind::CargoBuild), "cargo\tbuild\t--bin\t'app'").is_some());
+    assert!(
+        selection(
+            Some(CompilationKind::CargoBuild),
+            "cargo\tbuild\t--bin\t'app'"
+        )
+        .is_some()
+    );
 }
 
 #[test]
@@ -172,7 +179,10 @@ fn quoted_opaque_values_cannot_supply_a_missing_target_or_mode() {
 
 #[test]
 fn quoted_commands_retain_byte_and_word_budgets() {
-    let too_long = format!("cargo build --bin app --manifest-path '{}'", "λ".repeat(32_768));
+    let too_long = format!(
+        "cargo build --bin app --manifest-path '{}'",
+        "λ".repeat(32_768)
+    );
     assert!(selection(Some(CompilationKind::CargoBuild), &too_long).is_none());
     let too_many = format!("cargo build --bin app {}", "'-q' ".repeat(4093));
     assert!(selection(Some(CompilationKind::CargoBuild), &too_many).is_none());
@@ -232,7 +242,12 @@ async fn decoded_arguments_agree_with_a_real_shell_without_running_a_compiler() 
         (
             r#"cargo build --bin ap''p --manifest-path 'it'\''s λ/Cargo.toml' --features "first second""#,
             strings(&[
-                "--bin", "app", "--manifest-path", "it's λ/Cargo.toml", "--features", "first second",
+                "--bin",
+                "app",
+                "--manifest-path",
+                "it's λ/Cargo.toml",
+                "--features",
+                "first second",
             ]),
         ),
         (
@@ -246,7 +261,12 @@ async fn decoded_arguments_agree_with_a_real_shell_without_running_a_compiler() 
         (
             r#"cargo build --bin app --manifest-path back\\slash/Cargo.toml --target-dir target\ tree"#,
             strings(&[
-                "--bin", "app", "--manifest-path", "back\\slash/Cargo.toml", "--target-dir", "target tree",
+                "--bin",
+                "app",
+                "--manifest-path",
+                "back\\slash/Cargo.toml",
+                "--target-dir",
+                "target tree",
             ]),
         ),
     ] {

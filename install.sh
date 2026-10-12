@@ -39,7 +39,7 @@ set -euo pipefail
 # Last-resort floor used only when every release-discovery path fails. Keep it in
 # step with the newest published release; enforce_no_downgrade() stops a stale
 # value here from clobbering a newer install.
-INSTALLER_VERSION="1.0.57"
+INSTALLER_VERSION="2.1.17"
 VERSION="${VERSION:-}"  # Set dynamically based on install mode
 # Records whether the caller pinned a version (VERSION=... or --version), which
 # suppresses the no-downgrade guard so deliberate rollbacks still work.
@@ -669,7 +669,13 @@ build_from_source() {
         die "Cannot find RCH source directory. Run from project root or clone the repo first."
     fi
 
+    project_dir=$(cd "$project_dir" && pwd) || return 1
     cd "$project_dir"
+    if [[ "${VERSION_EXPLICIT:-false}" == "true" ]]; then
+        local requested_tag
+        requested_tag=$(installer_release_tag "$VERSION") || return 1
+        verify_source_release "$project_dir" "$requested_tag" || return 1
+    fi
 
     # A021 split profiles: hook CLI under wrapper-release (startup +
     # footprint first), daemon/worker under daemon-release (throughput,
@@ -681,21 +687,21 @@ build_from_source() {
     fi
 
     if $USE_GUM; then
-        spin "Building rch (wrapper-release profile)..." cargo +nightly build --profile wrapper-release -p rch
-        spin "Building rchd + rch-wkr (daemon-release profile)..." cargo +nightly build --profile daemon-release -p rchd -p rch-wkr
+        spin "Building rch (wrapper-release profile)..." cargo build --locked --profile wrapper-release -p rch
+        spin "Building rchd + rch-wkr (daemon-release profile)..." cargo build --locked --profile daemon-release -p rchd -p rch-wkr
         info "Building RABS spine binaries (best-effort)..."
-        if ! { cargo +nightly build --profile wrapper-release -p rabs-wrap \
-            && cargo +nightly build --profile daemon-release -p rabsd -p rabs-wkr; }; then
+        if ! { cargo build --locked --profile wrapper-release -p rabs-wrap \
+            && cargo build --locked --profile daemon-release -p rabsd -p rabs-wkr; }; then
             info "RABS spine build unavailable; installing core binaries only"
         fi
     else
         info "Building rch (wrapper-release profile; this may take a while)..."
-        cargo +nightly build --profile wrapper-release -p rch
+        cargo build --locked --profile wrapper-release -p rch
         info "Building rchd + rch-wkr (daemon-release profile)..."
-        cargo +nightly build --profile daemon-release -p rchd -p rch-wkr
+        cargo build --locked --profile daemon-release -p rchd -p rch-wkr
         info "Building RABS spine binaries (best-effort)..."
-        if ! { cargo +nightly build --profile wrapper-release -p rabs-wrap \
-            && cargo +nightly build --profile daemon-release -p rabsd -p rabs-wkr; }; then
+        if ! { cargo build --locked --profile wrapper-release -p rabs-wrap \
+            && cargo build --locked --profile daemon-release -p rabsd -p rabs-wkr; }; then
             info "RABS spine build unavailable; installing core binaries only"
         fi
     fi
@@ -717,13 +723,50 @@ build_from_source() {
     success "Build complete"
 }
 
+installer_release_tag() {
+    local version="${1:-}"
+    local tag="v${version#v}"
+    if [[ -z "$version" || ! "$tag" =~ ^v[0-9][A-Za-z0-9._+-]*$ ]]; then
+        error "Cannot bind installation to release version: $version"
+        return 1
+    fi
+    printf '%s\n' "$tag"
+}
+
+release_download_url() {
+    local tag="$1" asset="$2"
+    if [[ ! "$tag" =~ ^v[0-9][A-Za-z0-9._+-]*$ ||
+          ! "$asset" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ]]; then
+        error "Invalid release tag or asset name"
+        return 1
+    fi
+    printf 'https://github.com/%s/releases/download/%s/%s\n' "$GITHUB_REPO" "$tag" "$asset"
+}
+
+verify_source_release() {
+    local source_root="$1" source_tag
+    local source_commit release_commit source_status
+    source_tag=$(installer_release_tag "$2") || return 1
+    source_commit=$(git -C "$source_root" rev-parse --verify HEAD) || return 1
+    release_commit=$(git -C "$source_root" rev-parse --verify "refs/tags/${source_tag}^{commit}") || return 1
+    if [[ "$source_commit" != "$release_commit" ]]; then
+        error "Source checkout does not match release tag $source_tag; build refused"
+        return 1
+    fi
+    source_status=$(git -C "$source_root" status --porcelain --untracked-files=all) || return 1
+    if [[ -n "$source_status" ]]; then
+        error "Source checkout has changes outside release tag $source_tag; build refused"
+        return 1
+    fi
+}
+
 download_binaries() {
     # Try to download pre-built binaries first
     # If not available, automatically fall back to building from source
 
     info "Checking for pre-built binaries..."
 
-    # Prefer versioned GH Actions artifacts (matches release workflow)
+    # Prefer versioned release artifacts, bound to the one resolved tag.
     local asset_name=""
     local checksum_url=""
     local downloaded=false
@@ -736,13 +779,15 @@ download_binaries() {
     trap 'rm -rf "$TEMP_DIR"; cleanup_lock' EXIT
 
     if [[ -n "${VERSION:-}" ]]; then
-        tag_name="v${VERSION#v}"
+        tag_name=$(installer_release_tag "$VERSION") || return 1
     else
         local release_url="${GITHUB_API}/releases/latest"
         release_info=$(curl -sL --connect-timeout 10 "${PROXY_ARGS[@]}" "$release_url" 2>/dev/null || echo "")
         if [[ -n "$release_info" ]] && echo "$release_info" | grep -q '"tag_name"'; then
             tag_name=$(echo "$release_info" | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -1)
         fi
+        tag_name=$(installer_release_tag "$tag_name") || return 1
+        VERSION="${tag_name#v}"
     fi
 
     if [[ -n "$tag_name" && ${#RELEASE_TARGETS[@]} -gt 0 ]]; then
@@ -752,12 +797,13 @@ download_binaries() {
         local candidate_target
         for candidate_target in "${RELEASE_TARGETS[@]}"; do
             local versioned_asset="rch-${tag_name}-${candidate_target}.${asset_ext}"
-            local versioned_url="https://github.com/${GITHUB_REPO}/releases/download/${tag_name}/${versioned_asset}"
+            local versioned_url
+            versioned_url=$(release_download_url "$tag_name" "$versioned_asset") || return 1
             info "Downloading $versioned_asset from $tag_name..."
             if curl -fsSL "${PROXY_ARGS[@]}" "$versioned_url" -o "$TEMP_DIR/$versioned_asset" 2>/dev/null; then
                 downloaded=true
                 asset_name="$versioned_asset"
-                checksum_url="https://github.com/${GITHUB_REPO}/releases/download/${tag_name}/${versioned_asset}.sha256"
+                checksum_url=$(release_download_url "$tag_name" "${versioned_asset}.sha256") || return 1
                 checksum_tag="$tag_name"
                 break
             fi
@@ -765,26 +811,19 @@ download_binaries() {
     fi
 
     if [[ "$downloaded" != "true" ]]; then
-        local unversioned_asset="rch-${TARGET}.${asset_ext}"
-        local latest_url="https://github.com/${GITHUB_REPO}/releases/latest/download/${unversioned_asset}"
-        info "Downloading $unversioned_asset from latest release..."
-        if curl -fsSL "${PROXY_ARGS[@]}" "$latest_url" -o "$TEMP_DIR/$unversioned_asset" 2>/dev/null; then
-            downloaded=true
-            asset_name="$unversioned_asset"
-            checksum_tag="$tag_name"
-        fi
-    fi
-
-    if [[ "$downloaded" != "true" && -n "${VERSION:-}" ]]; then
-        local version_tag="v${VERSION#v}"
-        local unversioned_asset="rch-${TARGET}.${asset_ext}"
-        local version_url="https://github.com/${GITHUB_REPO}/releases/download/${version_tag}/${unversioned_asset}"
-        info "Downloading $unversioned_asset from $version_tag..."
-        if curl -fsSL "${PROXY_ARGS[@]}" "$version_url" -o "$TEMP_DIR/$unversioned_asset" 2>/dev/null; then
-            downloaded=true
-            asset_name="$unversioned_asset"
-            checksum_tag="$version_tag"
-        fi
+        local candidate_target unversioned_asset version_url
+        for candidate_target in "${RELEASE_TARGETS[@]}" "$TARGET"; do
+            unversioned_asset="rch-${candidate_target}.${asset_ext}"
+            version_url=$(release_download_url "$tag_name" "$unversioned_asset") || return 1
+            info "Downloading $unversioned_asset from $tag_name..."
+            if curl -fsSL "${PROXY_ARGS[@]}" "$version_url" -o "$TEMP_DIR/$unversioned_asset" 2>/dev/null; then
+                downloaded=true
+                asset_name="$unversioned_asset"
+                checksum_tag="$tag_name"
+                checksum_url=$(release_download_url "$tag_name" "${unversioned_asset}.sha256") || return 1
+                break
+            fi
+        done
     fi
 
     if [[ "$downloaded" != "true" ]]; then
@@ -795,39 +834,24 @@ download_binaries() {
         return
     fi
 
-    if [[ -n "$checksum_url" || -n "$checksum_tag" ]]; then
-        info "Verifying checksum..."
-        local expected=""
-        if [[ -n "$checksum_url" ]]; then
-            expected=$(curl -fsSL "${PROXY_ARGS[@]}" "$checksum_url" 2>/dev/null | cut -d' ' -f1 || true)
+    local checksum_file="$TEMP_DIR/SHA256SUMS"
+    local sidecar_file="$TEMP_DIR/${asset_name}.sha256"
+    if curl -fsSL "${PROXY_ARGS[@]}" "$checksum_url" -o "$sidecar_file"; then
+        local expected
+        if ! expected=$(extract_checksum_from_manifest "$(cat "$sidecar_file")" "$asset_name" true); then
+            error "Invalid or ambiguous checksum sidecar for $asset_name"
+            return 1
         fi
-        if [[ -z "$expected" && -n "$checksum_tag" ]]; then
-            local manifest_url="https://github.com/${GITHUB_REPO}/releases/download/${checksum_tag}/SHA256SUMS"
-            local manifest_content=""
-            manifest_content=$(curl -fsSL "${PROXY_ARGS[@]}" "$manifest_url" 2>/dev/null || true)
-            if [[ -n "$manifest_content" ]]; then
-                expected=$(extract_checksum_from_manifest "$manifest_content" "$asset_name")
-            fi
-        fi
-        if [[ -n "$expected" ]]; then
-            local actual=""
-            if command -v sha256sum >/dev/null 2>&1; then
-                actual=$(sha256sum "$TEMP_DIR/$asset_name" | cut -d' ' -f1)
-            else
-                actual=$(shasum -a 256 "$TEMP_DIR/$asset_name" | cut -d' ' -f1)
-            fi
-            if [[ "$expected" != "$actual" ]]; then
-                warn "Checksum verification failed"
-                info "Falling back to building from source..."
-                rm -rf "$TEMP_DIR"  # Clean up before fallback to avoid leak
-                clone_and_build_from_source
-                return
-            fi
-            success "Checksum verified"
-        else
-            warn "Checksum file not found for $asset_name"
+        printf '%s  %s\n' "$expected" "$asset_name" > "$checksum_file"
+    else
+        local manifest_url
+        manifest_url=$(release_download_url "$checksum_tag" SHA256SUMS) || return 1
+        if ! curl -fsSL "${PROXY_ARGS[@]}" "$manifest_url" -o "$checksum_file"; then
+            error "No checksum available for $asset_name from $checksum_tag; installation refused"
+            return 1
         fi
     fi
+    verify_checksum "$TEMP_DIR/$asset_name" "$checksum_file" "$asset_name" || return 1
 
     # Extract and install
     info "Extracting binaries..."
@@ -889,6 +913,8 @@ clone_and_build_from_source() {
     # Clone the repository and build from source
     # This is the fallback when pre-built binaries aren't available
 
+    local source_tag
+    source_tag=$(installer_release_tag "$VERSION") || return 1
     ensure_command git
 
     # Check for Rust toolchain
@@ -904,16 +930,17 @@ clone_and_build_from_source() {
 
     info "Cloning repository..."
     if $USE_GUM; then
-        if ! spin "Cloning RCH repository..." git clone --depth 1 "$REPO_URL" "$TEMP_DIR/rch"; then
+        if ! spin "Cloning RCH release $source_tag..." git clone --depth 1 --branch "$source_tag" -- "$REPO_URL" "$TEMP_DIR/rch"; then
             die "Failed to clone repository from $REPO_URL"
         fi
     else
-        if ! git clone --depth 1 "$REPO_URL" "$TEMP_DIR/rch"; then
+        if ! git clone --depth 1 --branch "$source_tag" -- "$REPO_URL" "$TEMP_DIR/rch"; then
             die "Failed to clone repository from $REPO_URL"
         fi
     fi
 
     cd "$TEMP_DIR/rch" || die "Failed to change to cloned repository directory"
+    verify_source_release "$TEMP_DIR/rch" "$source_tag" || return 1
 
     # A021 split profiles (see build_from_source for rationale).
     if [[ -n "${CARGO_TARGET_DIR:-}" ]]; then
@@ -923,29 +950,29 @@ clone_and_build_from_source() {
     fi
 
     if $USE_GUM; then
-        if ! spin "Building rch (wrapper-release profile; this may take a few minutes)..." cargo +nightly build --profile wrapper-release -p rch; then
+        if ! spin "Building rch (wrapper-release profile; this may take a few minutes)..." cargo build --locked --profile wrapper-release -p rch; then
             die "Build failed. Check that Rust nightly is installed: rustup toolchain install nightly"
         fi
-        if ! spin "Building rchd + rch-wkr (daemon-release profile)..." cargo +nightly build --profile daemon-release -p rchd -p rch-wkr; then
+        if ! spin "Building rchd + rch-wkr (daemon-release profile)..." cargo build --locked --profile daemon-release -p rchd -p rch-wkr; then
             die "Build failed. Check that Rust nightly is installed: rustup toolchain install nightly"
         fi
         info "Building RABS spine binaries (best-effort)..."
-        if ! { cargo +nightly build --profile wrapper-release -p rabs-wrap \
-            && cargo +nightly build --profile daemon-release -p rabsd -p rabs-wkr; }; then
+        if ! { cargo build --locked --profile wrapper-release -p rabs-wrap \
+            && cargo build --locked --profile daemon-release -p rabsd -p rabs-wkr; }; then
             info "RABS spine build unavailable; installing core binaries only"
         fi
     else
         info "Building rch (wrapper-release profile; this may take a few minutes)..."
-        if ! cargo +nightly build --profile wrapper-release -p rch; then
+        if ! cargo build --locked --profile wrapper-release -p rch; then
             die "Build failed. Check that Rust nightly is installed: rustup toolchain install nightly"
         fi
         info "Building rchd + rch-wkr (daemon-release profile)..."
-        if ! cargo +nightly build --profile daemon-release -p rchd -p rch-wkr; then
+        if ! cargo build --locked --profile daemon-release -p rchd -p rch-wkr; then
             die "Build failed. Check that Rust nightly is installed: rustup toolchain install nightly"
         fi
         info "Building RABS spine binaries (best-effort)..."
-        if ! { cargo +nightly build --profile wrapper-release -p rabs-wrap \
-            && cargo +nightly build --profile daemon-release -p rabsd -p rabs-wkr; }; then
+        if ! { cargo build --locked --profile wrapper-release -p rabs-wrap \
+            && cargo build --locked --profile daemon-release -p rabsd -p rabs-wkr; }; then
             info "RABS spine build unavailable; installing core binaries only"
         fi
     fi
@@ -1000,7 +1027,10 @@ verify_checksum() {
     info "Verifying checksum..."
 
     local expected
-    expected=$(grep "$filename" "$checksum_file" | awk '{print $1}')
+    if ! expected=$(extract_checksum_from_manifest "$(cat "$checksum_file")" "$filename"); then
+        error "Checksum missing, malformed or ambiguous for $filename"
+        return 1
+    fi
 
     if [[ -z "$expected" ]]; then
         error "Checksum not found for $filename"
@@ -1030,15 +1060,27 @@ verify_checksum() {
 extract_checksum_from_manifest() {
     local manifest_content="$1"
     local filename="$2"
+    local allow_bare="${3:-false}"
 
-    printf '%s\n' "$manifest_content" | awk -v file="$filename" '
-        NF >= 2 {
-            checksum = $1
-            path = $NF
-            if (path == file || path ~ ("/" file "$") || path ~ ("\\\\" file "$")) {
-                print checksum
-                exit
+    printf '%s\n' "$manifest_content" | awk -v file="$filename" -v bare="$allow_bare" '
+        NF {
+            records++
+            sub(/\r$/, "")
+            path = $2
+            sub(/^\*/, "", path)
+            sub(/^\.\//, "", path)
+            if (path == file || (bare == "true" && NF == 1)) {
+                count++
+                if ((NF != 2 && !(bare == "true" && NF == 1)) ||
+                    length($1) != 64 || $1 !~ /^[[:xdigit:]]+$/) {
+                    invalid = 1
+                }
+                checksum = tolower($1)
             }
+        }
+        END {
+            if (count != 1 || invalid || (bare == "true" && records != 1)) exit 1
+            print checksum
         }
     '
 }

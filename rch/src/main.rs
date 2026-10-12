@@ -30,7 +30,7 @@ pub mod tui;
 pub mod ui;
 mod update;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::CompleteEnv;
 use rch_common::{ApiError, ApiResponse, ErrorCode, LogConfig, init_logging};

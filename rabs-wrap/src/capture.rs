@@ -201,7 +201,10 @@ mod tests {
             Err(std::sync::mpsc::TryRecvError::Empty)
         ));
         release.send(()).unwrap();
-        result.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
+        result
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
         wrapper.join().unwrap();
         assert_eq!(
             server.join().unwrap(),

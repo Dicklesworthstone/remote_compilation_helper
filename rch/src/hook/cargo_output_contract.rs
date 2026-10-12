@@ -737,7 +737,10 @@ mod tests {
         ] {
             for (arguments, expected) in [
                 ("--no-run --message-format=json", true),
-                ("--no-run --message-format=json,json-render-diagnostics", true),
+                (
+                    "--no-run --message-format=json,json-render-diagnostics",
+                    true,
+                ),
                 ("--message-format=json", false),
                 ("--no-run", false),
                 ("--no-run --message-format=human", false),
@@ -859,7 +862,11 @@ mod tests {
                 restored.caller_json(&data, &paths).unwrap().stdout,
                 output.stdout
             );
-            assert!(output.stdout.starts_with(format!("{unrelated}\n").as_bytes()));
+            assert!(
+                output
+                    .stdout
+                    .starts_with(format!("{unrelated}\n").as_bytes())
+            );
             let records: Vec<serde_json::Value> = std::str::from_utf8(&output.stdout)
                 .unwrap()
                 .lines()
@@ -874,7 +881,10 @@ mod tests {
                 assert_eq!(record["profile"]["test"], true);
                 assert_eq!(record["rch"]["worker_record"], *original);
                 assert_eq!(record["rch"]["receipt"], binding);
-                assert_eq!(record["rch"]["executable_blake3"], json!(published[relative]));
+                assert_eq!(
+                    record["rch"]["executable_blake3"],
+                    json!(published[relative])
+                );
             }
             // A stale local file cannot stand in for a missing member of this
             // invocation's publication, including non-executable sidecars.
@@ -995,12 +1005,7 @@ mod tests {
                     String::from_utf8_lossy(&result.stderr)
                 );
                 let files = capture
-                    .validate_caller_metadata(
-                        &result.stdout,
-                        &[&remote_target],
-                        &[&source],
-                        &local,
-                    )
+                    .validate_caller_metadata(&result.stdout, &[&remote_target], &[&source], &local)
                     .unwrap();
                 let mut published = BTreeMap::new();
                 for relative in &files {

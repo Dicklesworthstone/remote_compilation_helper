@@ -184,6 +184,7 @@ mod tests {
             vec!["/owned/project".into()],
             None,
             None,
+            None,
             TransferConfig::default(),
             directory.path().to_owned(),
             "abc123".into(),

@@ -162,7 +162,10 @@ impl Fixture {
         assert_eq!(output.status.code(), Some(code));
         assert!(output.stdout.is_empty());
         assert_eq!(output.stderr, b"diagnostic\n");
-        assert_eq!(std::fs::read(self.root.path().join("runs")).unwrap(), b"run\n");
+        assert_eq!(
+            std::fs::read(self.root.path().join("runs")).unwrap(),
+            b"run\n"
+        );
         assert_eq!(
             std::fs::read(self.root.path().join("artifact")).unwrap(),
             token
@@ -197,7 +200,9 @@ fn wrapper_retains_cargo_output_lifetime_until_capture_is_complete() {
         );
     });
     let mut wrapper = fixture.spawn(10_000);
-    captured_report.recv_timeout(Duration::from_secs(10)).unwrap();
+    captured_report
+        .recv_timeout(Duration::from_secs(10))
+        .unwrap();
     assert!(wrapper.0.as_mut().unwrap().try_wait().unwrap().is_none());
     release.send(()).unwrap();
     let output = wrapper.output();
@@ -264,7 +269,12 @@ fn old_daemon_hit_is_declined_before_accepting_output_writes() {
             "kind": "rustc-decision", "decision": "hit", "action_key": "action",
             "compiler_skip_authorized": false,
         }),
-        |peer| assert!(read(peer).is_none(), "no rustc-accept to a pre-custody daemon"),
+        |peer| {
+            assert!(
+                read(peer).is_none(),
+                "no rustc-accept to a pre-custody daemon"
+            )
+        },
     );
     let output = fixture.spawn(5000).output();
     daemon.join().unwrap();

@@ -408,8 +408,8 @@ mod environment_binding_tests {
     ) -> Result<LiveDependencyKey, crate::live_dependency::LiveRefusal> {
         let toolchain = ToolchainFacts {
             compiler_binary_digest: compute("rabs.tool-binary.v1", b"compiler"),
-            verbose_version:
-                "rustc fixture\nhost: x86_64-unknown-linux-gnu\nLLVM version: fixture".into(),
+            verbose_version: "rustc fixture\nhost: x86_64-unknown-linux-gnu\nLLVM version: fixture"
+                .into(),
             sysroot_root_digest: compute("rabs.live-dependency.sysroot-tree.v1", b"sysroot"),
             runtime_libraries: Vec::new(),
         };
@@ -449,7 +449,11 @@ mod environment_binding_tests {
         }
         assert!(!plan.execution_env.iter().any(|(n, _)| n == "UNDECLARED"));
         assert!(!plan.keyed_env.iter().any(|(n, _)| n == "CARGO_MAKEFLAGS"));
-        assert!(plan.execution_env.iter().any(|(n, _)| n == "CARGO_MAKEFLAGS"));
+        assert!(
+            plan.execution_env
+                .iter()
+                .any(|(n, _)| n == "CARGO_MAKEFLAGS")
+        );
         let current = key(&plan, record).unwrap();
         assert_eq!(
             current.action_key,
@@ -533,7 +537,11 @@ mod environment_binding_tests {
     fn run_record_and_environment_bounds_are_fail_closed() {
         let (plan, env) = fixture(&[]);
         let oversized_record = vec![b'x'; 1024 * 1024 + 1];
-        for record in [None, Some(b"\xff".as_slice()), Some(oversized_record.as_slice())] {
+        for record in [
+            None,
+            Some(b"\xff".as_slice()),
+            Some(oversized_record.as_slice()),
+        ] {
             let mut changed = plan.clone();
             assert!(bind_rustc_environment(&mut changed, record, &env).is_err());
             assert_eq!(changed, plan);
@@ -555,10 +563,16 @@ mod environment_binding_tests {
         let (mut plan, env) = fixture(&[("BUILD_LABEL", "ok")]);
         bind_rustc_environment(&mut plan, Some(record), &env).unwrap();
         assert_eq!(
-            plan.execution_env.iter().filter(|(n, _)| n == "BUILD_LABEL").count(),
+            plan.execution_env
+                .iter()
+                .filter(|(n, _)| n == "BUILD_LABEL")
+                .count(),
             1
         );
-        assert_eq!(plan.keyed_env.iter().filter(|(n, _)| n == "HOME").count(), 1);
+        assert_eq!(
+            plan.keyed_env.iter().filter(|(n, _)| n == "HOME").count(),
+            1
+        );
         assert!(key(&plan, record).is_ok());
     }
 }

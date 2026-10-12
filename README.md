@@ -1014,9 +1014,11 @@ RCH_REQUIRE_REMOTE=1 rch exec --source-content-receipt -- \
   cargo test --locked --workspace
 ```
 
-Receipt mode resolves the active Cargo path-dependency closure, gives every
-root an invocation-unique worker path, transfers with checksum comparison, and
-reopens every selected file before and after the command. The emitted
+Receipt mode resolves the active Cargo path-dependency closure, stages its
+roots beneath the configured worker build base, transfers with checksum
+comparison, and reopens every selected file before and after the command.
+Preflight initializes the isolated staging topology and skips canonical worker
+repository convergence. The emitted
 `rch.source_content_receipt.v1` JSON binds the worker and build IDs, exact
 command digest and exit code, transfer filter policy, per-root file paths,
 lengths, executable bits, SHA-256 digests, and content roots. Any unproved
@@ -1024,6 +1026,34 @@ dependency closure, transfer delta, worker verification error, local lasting
 change, retry, or local fallback refuses the invocation instead of emitting a
 receipt. Receipt mode currently requires the Unix rsync transport and cannot be
 combined with clean-overlay mode.
+
+On Linux with target reuse enabled, supported Cargo commands use an owned
+source/target pair. The source layout preserves sibling dependencies, selected
+manifests, and enclosing workspace metadata under a stable
+`source-content-pair-<key>/projects/` container. Every invocation materializes
+fresh source files there while holding the pair and its complete source grant.
+Uploads use checksums without deleting entries or running cache sweeps; the
+read-only rsync barrier still rejects surplus selected files. Cargo's target
+and build directories are bound to the granted pool outside that container.
+
+An unchanged file can reuse its previous compiler-visible timestamp only when
+the previous attempt completed its source-content verification. An interrupted
+or unverified attempt forces fresh timestamps beyond the pool's artifacts on
+the next invocation. After artifact delivery, the source container moves to
+its recorded `.retained-<attempt>` sibling using Linux no-replace rename. The
+job journal retains both paths before acquisition, so recovery can reconcile
+an interrupted move without replacing an existing retained tree. Python 3 and
+the Linux rename capability are checked before source ownership is acquired.
+
+This owned route validates Cargo manifests and configuration against the
+captured transfer inventory. Relative and absolute `--manifest-path` selectors
+map into that inventory. File-based `--config`, custom target-specification
+files, directory-changing wrappers, and caller overrides of managed output
+paths or Cargo home currently refuse before execution. Other Unix platforms,
+invocations with `RCH_DISABLE_TARGET_REUSE=1`, and external Cargo drivers such
+as Nextest, Zigbuild, and xwin retain invocation-unique staging paths. The
+owned route currently covers the built-in build, test, check, documentation,
+benchmark, and verified packaging families, plus Clippy.
 
 The receipt is emitted after the remote command and its post-command source
 barrier, but before ordinary artifact retrieval completes. Artifact-grade

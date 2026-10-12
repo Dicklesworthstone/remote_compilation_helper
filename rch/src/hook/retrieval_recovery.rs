@@ -29,6 +29,14 @@ pub(crate) struct RecoveryRecipe {
     source_roots: Vec<String>,
     pair: Option<(String, String)>,
     retire_root: Option<String>,
+    /// An owned source pair retires by moving to this exact sibling. Persist
+    /// both names before acquisition so recovery never invents new authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    retained_root: Option<String>,
+    /// True acknowledges a durable retained tree. False records preparation
+    /// that never materialized source; it is not a retained-source receipt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    retained_materialized: Option<bool>,
     transfer: TransferConfig,
     project_root: PathBuf,
     kind: Option<CompilationKind>,
@@ -470,6 +478,37 @@ async fn lock_output_root(root: &Path) -> anyhow::Result<File> {
     }
 }
 
+fn validate_retained_source_intent(
+    source_roots: &[String],
+    pair: Option<&(String, String)>,
+    retire_root: Option<&str>,
+    retained_root: Option<&str>,
+    identity: &str,
+) -> anyhow::Result<()> {
+    let Some(retained) = retained_root else {
+        return Ok(());
+    };
+    let root = retire_root.context("retained source intent has no original source root")?;
+    anyhow::ensure!(
+        identity.len() == 32
+            && identity
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+        "retained source identity must be 32 lowercase hexadecimal characters"
+    );
+    anyhow::ensure!(
+        retained == format!("{root}.retained-{identity}")
+            && source_roots.iter().any(|path| path == root)
+            && source_roots.iter().any(|path| path == retained)
+            && pair.is_some_and(|(pair_root, token)| pair_root == root && token == identity),
+        "retained source intent must bind the exact pair and both sibling authorities"
+    );
+    super::super::ssh::validate_source_authority_intent(
+        &[root.to_owned(), retained.to_owned()],
+        identity,
+    )
+}
+
 impl RecoverySession {
     /// Save the recovery identity before even a queued remote grant can exist.
     /// Until `starting_execution` is durable, recovery can drain transfers and
@@ -481,6 +520,7 @@ impl RecoverySession {
         source_roots: Vec<String>,
         pair: Option<(String, String)>,
         retire_root: Option<String>,
+        retained_root: Option<String>,
         transfer: TransferConfig,
         project_root: PathBuf,
         identity: String,
@@ -495,6 +535,13 @@ impl RecoverySession {
             "source ownership requires a fresh admitted lease; recover the previous attempt first"
         );
         super::super::ssh::validate_source_authority_intent(&source_roots, &identity)?;
+        validate_retained_source_intent(
+            &source_roots,
+            pair.as_ref(),
+            retire_root.as_deref(),
+            retained_root.as_deref(),
+            &identity,
+        )?;
         let completion = format!(
             "{}/recovery-{}-{}.done",
             transfer.remote_base.trim_end_matches('/'),
@@ -511,6 +558,8 @@ impl RecoverySession {
             source_roots,
             pair,
             retire_root,
+            retained_root,
+            retained_materialized: None,
             transfer,
             project_root,
             kind: None,
@@ -546,6 +595,7 @@ impl RecoverySession {
         source_roots: Vec<String>,
         pair: Option<(String, String)>,
         retire_root: Option<String>,
+        retained_root: Option<String>,
         transfer: TransferConfig,
         project_root: PathBuf,
         target: Option<&Path>,
@@ -577,6 +627,9 @@ impl RecoverySession {
                 && intent.source_roots == source_roots
                 && intent.pair == pair
                 && intent.retire_root == retire_root
+                && intent.retained_root == retained_root
+                && intent.retained_materialized.is_none()
+                && !intent.tree_retired
                 && !intent.execution_started
                 && !intent.preparation_cancelled
                 && !intent.retired,
@@ -708,6 +761,8 @@ impl RecoverySession {
             source_roots,
             pair,
             retire_root,
+            retained_root,
+            retained_materialized: None,
             transfer,
             project_root,
             kind: delivery_kind,
@@ -1461,8 +1516,45 @@ impl RecoverySession {
         self.persist()
     }
     pub(crate) fn tree_retired(&mut self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.recipe.retained_root.is_none() || self.recipe.retained_materialized.is_some(),
+            "retained source retirement has no durable filesystem acknowledgment"
+        );
+        anyhow::ensure!(
+            self.recipe.retained_materialized != Some(false)
+                || (!self.recipe.execution_started && self.recipe.preparation_cancelled),
+            "an executed source pair cannot retire as unmaterialized preparation"
+        );
         self.recipe.tree_retired = true;
         self.persist()
+    }
+    /// The caller holds the complete active or drained cleanup grant. A lost
+    /// acknowledgment leaves the recipe pending; the identity-bound rename
+    /// protocol verifies the exact retained sibling on the next attempt.
+    pub(crate) async fn retire_source_tree(
+        &mut self,
+        pipeline: &TransferPipeline,
+    ) -> anyhow::Result<()> {
+        if self.recipe.tree_retired {
+            return Ok(());
+        }
+        if let Some(root) = self.recipe.retire_root.as_deref() {
+            if let Some(retained) = self.recipe.retained_root.as_deref() {
+                let materialized = pipeline
+                    .retain_remote_tree(
+                        &self.recipe.worker,
+                        root,
+                        retained,
+                        &self.recipe.identity,
+                        !self.recipe.execution_started && self.recipe.preparation_cancelled,
+                    )
+                    .await?;
+                self.recipe.retained_materialized = Some(materialized);
+            } else {
+                pipeline.reap_remote_tree(&self.recipe.worker, root).await?;
+            }
+        }
+        self.tree_retired()
     }
     pub(crate) fn pair_released(&mut self) -> anyhow::Result<()> {
         self.recipe.pair_released = true;
@@ -1588,18 +1680,14 @@ impl RecoverySession {
                 self.collect_cargo_stderr(&pipeline, &worker).await?;
             }
             self.prepare_caller_delivery().await?;
-            if let Some(root) = &self.recipe.retire_root {
-                TransferPipeline::new(
-                    self.recipe.project_root.clone(),
-                    "recovery".into(),
-                    self.recipe.identity.clone(),
-                    self.recipe.transfer.clone(),
-                )
-                .with_source_authority(self.recipe.identity.clone())?
-                .reap_remote_tree(&worker, root)
-                .await?;
-            }
-            self.tree_retired()?;
+            let pipeline = TransferPipeline::new(
+                self.recipe.project_root.clone(),
+                "recovery".into(),
+                self.recipe.identity.clone(),
+                self.recipe.transfer.clone(),
+            )
+            .with_source_authority(self.recipe.identity.clone())?;
+            self.retire_source_tree(&pipeline).await?;
         }
         if let Some(sources) = sources.take() {
             sources.release().await?;
@@ -1672,6 +1760,26 @@ fn load_recipe(writer: &DurableLeaseWriter) -> anyhow::Result<RecoveryRecipe> {
             && lease.worker_id.as_deref() == Some(recipe.worker.id.as_str()),
         "recovery recipe identity mismatch or unsupported source ownership version"
     );
+    validate_retained_source_intent(
+        &recipe.source_roots,
+        recipe.pair.as_ref(),
+        recipe.retire_root.as_deref(),
+        recipe.retained_root.as_deref(),
+        &recipe.identity,
+    )?;
+    anyhow::ensure!(
+        recipe.retained_materialized.is_none() || recipe.retained_root.is_some(),
+        "retained source acknowledgment has no original destination"
+    );
+    if recipe.retained_root.is_some() {
+        anyhow::ensure!(
+            recipe.tree_retired == recipe.retained_materialized.is_some()
+                && (!recipe.retired || recipe.tree_retired)
+                && (recipe.retained_materialized != Some(false)
+                    || (!recipe.execution_started && recipe.preparation_cancelled)),
+            "retained source acknowledgment contradicts the execution or retirement boundary"
+        );
+    }
     anyhow::ensure!(
         recipe.cargo_output_capture.is_none()
             || (recipe.prepared
@@ -1807,21 +1915,17 @@ async fn cancel_source_grant(mut session: RecoverySession) -> anyhow::Result<boo
         if let Some(pair) = pair.as_mut() {
             pair.ensure_held()?;
         }
-        if let Some(root) = session.recipe.retire_root.as_ref() {
-            // The full durable grant still excludes every overlapping owner.
-            // Cleanup activity survives its SSH client and is drained again
-            // before final cancellation can make these paths writable.
-            TransferPipeline::new(
-                session.recipe.project_root.clone(),
-                "recovery".into(),
-                session.recipe.identity.clone(),
-                session.recipe.transfer.clone(),
-            )
-            .with_source_authority_cleanup(session.recipe.identity.clone())?
-            .reap_remote_tree(&worker, root)
-            .await?;
-        }
-        session.tree_retired()?;
+        // The full durable grant still excludes every overlapping owner.
+        // Cleanup activity survives its SSH client and is drained again
+        // before final cancellation can make these paths writable.
+        let pipeline = TransferPipeline::new(
+            session.recipe.project_root.clone(),
+            "recovery".into(),
+            session.recipe.identity.clone(),
+            session.recipe.transfer.clone(),
+        )
+        .with_source_authority_cleanup(session.recipe.identity.clone())?;
+        session.retire_source_tree(&pipeline).await?;
         if let Some(pair) = pair.take() {
             pair.release().await?;
         }
@@ -1834,6 +1938,15 @@ async fn cancel_source_grant(mut session: RecoverySession) -> anyhow::Result<boo
     }
     // Without a full grant, cancellation only fences delayed acquisition and
     // abandons pair metadata. The paths may belong to another parent-root job.
+    if !owned && session.recipe.retained_root.is_some() && !session.recipe.tree_retired {
+        anyhow::ensure!(
+            !session.recipe.execution_started && session.recipe.preparation_cancelled,
+            "an executed source pair cannot be retired without its full source grant"
+        );
+        // No activity was admitted for this identity. Do not inspect paths
+        // now owned by someone else or manufacture a retained tree receipt.
+        session.recipe.retained_materialized = Some(false);
+    }
     session.tree_retired()?;
     session.pair_released()?;
     session.sources_released()?;
@@ -2241,10 +2354,7 @@ async fn recover_owned_job_with_daemon(
     // independently and must never cause a second output write.
     session.returned(exit)?;
     session.prepare_caller_delivery().await?;
-    if let Some(root) = &session.recipe.retire_root {
-        base.reap_remote_tree(&worker, root).await?;
-    }
-    session.tree_retired()?;
+    session.retire_source_tree(&base).await?;
     if let Some(pair) = pair.take() {
         pair.release().await?;
     }
@@ -2321,8 +2431,30 @@ mod tests {
             vec!["/data/projects/source-recovery".into()],
             None,
             None,
+            None,
             TransferConfig::default(),
             directory.path().to_owned(),
+            identity.into(),
+        )
+        .unwrap();
+        (directory, writer, worker)
+    }
+
+    fn retained_preparation_fixture() -> (PathBuf, DurableLeaseWriter, WorkerConfig) {
+        let (directory, writer, worker) = admitted_preparation_fixture();
+        let directory = directory.keep();
+        let identity = "0123456789abcdef0123456789abcdef";
+        let root = "/data/tmp/rch/source-content-pair-recovery";
+        let retained = format!("{root}.retained-{identity}");
+        RecoverySession::begin(
+            &writer,
+            &worker,
+            vec![root.into(), retained.clone()],
+            Some((root.into(), identity.into())),
+            Some(root.into()),
+            Some(retained),
+            TransferConfig::default(),
+            directory.clone(),
             identity.into(),
         )
         .unwrap();
@@ -2373,7 +2505,7 @@ mod tests {
             ("products/app [dev]*?", false),
             ("target/app", true),
         ] {
-            let identity = format!("go-output-{}", uuid::Uuid::new_v4());
+            let identity = uuid::Uuid::new_v4().to_string();
             let (_owner, writer, worker) = preparation_fixture_with_identity(&identity);
             let base = writer.path.parent().unwrap();
             let local = base.join("checkout");
@@ -2445,6 +2577,7 @@ mod tests {
                 &worker,
                 &pipeline,
                 vec!["/data/projects/source-recovery".into()],
+                None,
                 None,
                 None,
                 TransferConfig::default(),
@@ -2811,7 +2944,7 @@ mod tests {
                 0,
             ),
         ] {
-            let identity = format!("native-output-{}", uuid::Uuid::new_v4());
+            let identity = uuid::Uuid::new_v4().to_string();
             let (_owner, writer, worker) = preparation_fixture_with_identity(&identity);
             let base = writer.path.parent().unwrap();
             let local = base.join("checkout");
@@ -2849,6 +2982,7 @@ mod tests {
                 &worker,
                 &pipeline,
                 vec!["/data/projects/source-recovery".into()],
+                None,
                 None,
                 None,
                 TransferConfig::default(),
@@ -3955,6 +4089,262 @@ mod tests {
     }
 
     #[test]
+    fn retained_source_intent_binds_siblings_pair_and_authority_before_journaling() {
+        let _guard = test_guard!();
+        for case in [
+            "different-sibling",
+            "missing-original-authority",
+            "missing-retained-authority",
+            "missing-pair",
+            "different-pair-root",
+            "different-pair-token",
+            "missing-original-root",
+            "noncanonical-identity",
+        ] {
+            let (directory, writer, worker) = admitted_preparation_fixture();
+            let directory = directory.keep();
+            let root = "/data/tmp/rch/source-content-pair-recovery".to_owned();
+            let mut identity = "0123456789abcdef0123456789abcdef".to_owned();
+            let mut retained = format!("{root}.retained-{identity}");
+            let mut roots = vec![root.clone(), retained.clone()];
+            let mut pair = Some((root.clone(), identity.clone()));
+            let mut retire_root = Some(root.clone());
+            match case {
+                "different-sibling" => {
+                    retained = format!("{root}.retained-1123456789abcdef0123456789abcdef");
+                    roots[1] = retained.clone();
+                }
+                "missing-original-authority" => roots = vec![retained.clone()],
+                "missing-retained-authority" => roots = vec![root.clone()],
+                "missing-pair" => pair = None,
+                "different-pair-root" => {
+                    pair = Some((format!("{root}-other"), identity.clone()));
+                }
+                "different-pair-token" => {
+                    pair = Some((root.clone(), "1123456789abcdef0123456789abcdef".into()));
+                }
+                "missing-original-root" => retire_root = None,
+                "noncanonical-identity" => {
+                    identity = "ABCDEF0123456789ABCDEF0123456789".into();
+                    retained = format!("{root}.retained-{identity}");
+                    roots[1] = retained.clone();
+                    pair = Some((root.clone(), identity.clone()));
+                }
+                _ => unreachable!(),
+            }
+            let before = std::fs::read(&writer.path).unwrap();
+            let result = RecoverySession::begin(
+                &writer,
+                &worker,
+                roots,
+                pair,
+                retire_root,
+                Some(retained),
+                TransferConfig::default(),
+                directory,
+                identity,
+            );
+            assert!(result.is_err(), "admitted invalid retained intent: {case}");
+            assert_eq!(std::fs::read(&writer.path).unwrap(), before, "{case}");
+            assert!(writer.snapshot().recovery.is_none(), "{case}");
+            assert_eq!(writer.snapshot().identity.remote_build_id, Some(41));
+        }
+    }
+
+    #[test]
+    fn retained_source_prepare_cannot_drop_or_change_the_admitted_destination() {
+        let _guard = test_guard!();
+        let (directory, writer, worker) = retained_preparation_fixture();
+        let intent = load_recipe(&writer).unwrap();
+        let pipeline = TransferPipeline::new(
+            directory.clone(),
+            "retained-recovery".into(),
+            intent.identity.clone(),
+            intent.transfer.clone(),
+        )
+        .with_remote_path_override(format!(
+            "{}/projects/app",
+            intent.retire_root.as_deref().unwrap()
+        ));
+        let before = std::fs::read(&writer.path).unwrap();
+        for changed in [
+            None,
+            Some(format!(
+                "{}-other",
+                intent.retained_root.as_deref().unwrap()
+            )),
+        ] {
+            let result = RecoverySession::prepare(
+                &writer,
+                &worker,
+                &pipeline,
+                intent.source_roots.clone(),
+                intent.pair.clone(),
+                intent.retire_root.clone(),
+                changed,
+                intent.transfer.clone(),
+                directory.clone(),
+                None,
+                Some(CompilationKind::CargoBuild),
+                "cargo build",
+                &[],
+                intent.identity.clone(),
+            );
+            assert!(
+                result.is_err(),
+                "preparation replaced retained-source authority"
+            );
+            assert_eq!(std::fs::read(&writer.path).unwrap(), before);
+        }
+        let session = RecoverySession::prepare(
+            &writer,
+            &worker,
+            &pipeline,
+            intent.source_roots.clone(),
+            intent.pair.clone(),
+            intent.retire_root.clone(),
+            intent.retained_root.clone(),
+            intent.transfer.clone(),
+            directory,
+            None,
+            Some(CompilationKind::CargoBuild),
+            "cargo build",
+            &[],
+            intent.identity.clone(),
+        )
+        .unwrap();
+        let persisted = reload_publication(&session).recipe;
+        assert!(persisted.prepared);
+        assert_eq!(persisted.retained_root, intent.retained_root);
+        assert_eq!(persisted.retire_root, intent.retire_root);
+        assert_eq!(persisted.pair, intent.pair);
+        assert_eq!(persisted.source_roots, intent.source_roots);
+        assert_eq!(persisted.retained_materialized, None);
+        assert!(!persisted.tree_retired);
+        assert!(!persisted.execution_started);
+    }
+
+    #[test]
+    fn retained_source_tree_retirement_requires_an_acknowledged_filesystem_outcome() {
+        let _guard = test_guard!();
+        let (_directory, writer, _worker) = retained_preparation_fixture();
+        let mut session = RecoverySession {
+            recipe: load_recipe(&writer).unwrap(),
+            writer: writer.clone(),
+        };
+        let before = std::fs::read(&writer.path).unwrap();
+        assert!(session.tree_retired().is_err());
+        assert!(!session.recipe.tree_retired);
+        assert_eq!(std::fs::read(&writer.path).unwrap(), before);
+        session.recipe.retained_materialized = Some(false);
+        assert!(session.tree_retired().is_err());
+        assert!(!session.recipe.tree_retired);
+        assert_eq!(std::fs::read(&writer.path).unwrap(), before);
+        assert!(writer.ensure_released_for_retry().is_err());
+    }
+
+    #[test]
+    fn retained_source_recovery_rejects_contradictory_durable_acknowledgments() {
+        let _guard = test_guard!();
+        for case in [
+            "tree-without-acknowledgment",
+            "acknowledgment-before-tree",
+            "acknowledgment-without-destination",
+            "absent-after-execution",
+            "absent-without-cancellation",
+            "terminal-without-tree",
+            "changed-destination",
+            "changed-pair-token",
+            "missing-retained-authority",
+        ] {
+            let (_directory, writer, _worker) = retained_preparation_fixture();
+            let mut recipe = load_recipe(&writer).unwrap();
+            match case {
+                "tree-without-acknowledgment" => recipe.tree_retired = true,
+                "acknowledgment-before-tree" => recipe.retained_materialized = Some(true),
+                "acknowledgment-without-destination" => {
+                    recipe.retained_root = None;
+                    recipe.retained_materialized = Some(true);
+                    recipe.tree_retired = true;
+                }
+                "absent-after-execution" => {
+                    recipe.prepared = true;
+                    recipe.execution_started = true;
+                    recipe.preparation_cancelled = true;
+                    recipe.retained_materialized = Some(false);
+                    recipe.tree_retired = true;
+                }
+                "absent-without-cancellation" => {
+                    recipe.retained_materialized = Some(false);
+                    recipe.tree_retired = true;
+                }
+                "terminal-without-tree" => recipe.retired = true,
+                "changed-destination" => {
+                    recipe.retained_root = Some(format!(
+                        "{}-other",
+                        recipe.retained_root.as_deref().unwrap()
+                    ));
+                }
+                "changed-pair-token" => {
+                    recipe.pair.as_mut().unwrap().1 = "1123456789abcdef0123456789abcdef".into();
+                }
+                "missing-retained-authority" => {
+                    recipe.source_roots = vec![recipe.retire_root.clone().unwrap()];
+                }
+                _ => unreachable!(),
+            }
+            writer
+                .set_recovery(serde_json::to_value(recipe).unwrap())
+                .unwrap();
+            let before = std::fs::read(&writer.path).unwrap();
+            let disk_writer = DurableLeaseWriter {
+                path: writer.path.clone(),
+                lease: Arc::new(Mutex::new(serde_json::from_slice(&before).unwrap())),
+            };
+            assert!(
+                load_recipe(&disk_writer).is_err(),
+                "accepted contradictory state: {case}"
+            );
+            assert_eq!(std::fs::read(&writer.path).unwrap(), before, "{case}");
+        }
+    }
+
+    #[test]
+    fn retained_source_recovery_distinguishes_retained_bytes_from_cancelled_absence() {
+        let _guard = test_guard!();
+        for materialized in [true, false] {
+            let (_directory, writer, _worker) = retained_preparation_fixture();
+            let mut session = RecoverySession {
+                recipe: load_recipe(&writer).unwrap(),
+                writer: writer.clone(),
+            };
+            if materialized {
+                session.recipe.prepared = true;
+                session.starting_execution().unwrap();
+                session.completed(0).unwrap();
+            } else {
+                session.recipe.preparation_cancelled = true;
+                session.persist().unwrap();
+            }
+            // This fixture supplies the filesystem acknowledgment to exercise
+            // journal validation. The rename protocol has separate OS tests.
+            session.recipe.retained_materialized = Some(materialized);
+            session.tree_retired().unwrap();
+            let persisted = reload_publication(&session).recipe;
+            assert!(persisted.tree_retired);
+            assert_eq!(persisted.retained_materialized, Some(materialized));
+            assert_eq!(persisted.execution_started, materialized);
+            assert_eq!(persisted.preparation_cancelled, !materialized);
+            assert_eq!(persisted.retained_root, session.recipe.retained_root);
+            assert_eq!(persisted.pair, session.recipe.pair);
+            assert!(!persisted.sources_released);
+            assert!(!persisted.pair_released);
+            assert!(!persisted.retired);
+            assert!(writer.ensure_released_for_retry().is_err());
+        }
+    }
+
+    #[test]
     fn source_intent_rejects_invalid_paths_and_identity_before_journaling() {
         let invalid_roots = [
             "relative",
@@ -3981,6 +4371,7 @@ mod tests {
                 &writer,
                 &worker,
                 roots.clone(),
+                None,
                 None,
                 None,
                 TransferConfig::default(),

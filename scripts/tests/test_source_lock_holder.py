@@ -27,6 +27,12 @@ GNU_FLOCK = bool(FLOCK and b"--no-fork" in subprocess.run(
     [FLOCK, "--help"], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
     timeout=5, check=False,
 ).stdout)
+BASH = shutil.which("bash")
+GNU_CANCELLABLE = bool(GNU_FLOCK and BASH and subprocess.run(
+    [BASH, "--noprofile", "--norc", "-p", "-c",
+     "(( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 1) ))"],
+    stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5, check=False,
+).returncode == 0)
 
 
 def eventually(predicate, detail):
@@ -71,7 +77,12 @@ class Holder:
             command += "ulimit -n {}\n".format(fd_limit)
         # This is the production transport contract: plan on fd 3, claim on
         # fd 4, release input on stdin, script as both -c program and argv[0].
-        command += "exec 3<<'RCH_TEST_PLAN'\n{}RCH_TEST_PLAN\n".format(plan)
+        if isinstance(plan, Path):
+            # Raw bytes (including NUL/truncation) must not pass through argv
+            # or a here-document that would repair their framing for the test.
+            command += "exec 3<{}\n".format(shlex.quote(str(plan)))
+        else:
+            command += "exec 3<<'RCH_TEST_PLAN'\n{}RCH_TEST_PLAN\n".format(plan)
         command += "exec 4<<'RCH_TEST_CLAIM'\n{}\nRCH_TEST_CLAIM\n".format(claim)
         command += "exec sh -c {} {} {}".format(
             shlex.quote(script), shlex.quote(script), shlex.join(args))
@@ -131,9 +142,9 @@ class SourceLockHolderTests(unittest.TestCase):
         for holder in reversed(self.holders):
             holder.close()
 
-    def environment(self, portable=True, python=True, gnu_flock=True):
-        directory = self.root / ("native-bin" if portable else
-                                 "linux-native-bin" if python else "gnu-bin")
+    def environment(self, portable=True, python=True, gnu_flock=True, bash=True):
+        name = "native-bin" if portable else "linux-native-bin" if python else "gnu-bin"
+        directory = self.root / (name if bash else name + "-legacy")
         directory.mkdir(exist_ok=True)
         uname = directory / "uname"
         uname.write_text("#!/bin/sh\nprintf 'called\\n' >> {}\nprintf '%s\\n' {}\n".format(
@@ -143,6 +154,10 @@ class SourceLockHolderTests(unittest.TestCase):
             path = directory / name
             if not path.exists():
                 path.symlink_to(target)
+        if bash and BASH:
+            path = directory / "bash"
+            if not path.exists():
+                path.symlink_to(BASH)
         if python:
             path = directory / "python3"
             if not path.exists():
@@ -533,6 +548,338 @@ class SourceLockHolderTests(unittest.TestCase):
             self.assertFalse(available(paths[-1]))
         finally:
             os.close(fd)
+
+    def test_native_replaced_earlier_path_cannot_handoff_a_lock_on_an_old_inode(self):
+        for portable in (False, True):
+            with self.subTest(portable=portable):
+                paths = [self.root / f"native-replaced-{portable}-{i}" for i in range(32)]
+                old = self.root / f"retained-old-{portable}"
+                witness = self.root / f"terminal-replaced-{portable}"
+                paths[0].write_bytes(b"original lock evidence")
+                final = os.open(paths[-1], os.O_CREAT | os.O_RDWR, 0o600)
+                replacement = None
+                try:
+                    fcntl.flock(final, fcntl.LOCK_EX)
+                    holder = self.start([("x", path) for path in paths], portable=portable,
+                                        env=self.environment(portable, gnu_flock=False),
+                                        terminal=self.terminal_witness(witness))
+                    eventually(lambda: not available(paths[-2]), "native waiter did not reach last root")
+                    self.assertIsNone(holder.line(0.05))
+                    paths[0].rename(old)  # Keep the old locked inode and its bytes.
+                    paths[0].write_bytes(b"another owner's replacement")
+                    replacement = os.open(paths[0], os.O_RDWR)
+                    fcntl.flock(replacement, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    self.assertFalse(available(old))
+                    fcntl.flock(final, fcntl.LOCK_UN)
+                    self.assertIsNone(holder.line(), "native holder granted ownership on a replaced inode")
+                    stdout, stderr = holder.failure()
+                    self.assertEqual((holder.process.returncode, stdout), (73, b""), stderr)
+                    self.assertIn(b"path changed during acquisition", stderr)
+                    self.assertNotIn(b"requester ended", stderr)
+                    self.assertFalse(witness.exists())
+                    self.assertTrue(available(old))
+                    self.assertTrue(all(available(path) for path in paths[1:]))
+                    self.assertFalse(available(paths[0]), "refusal released another owner's lock")
+                    self.assertEqual(old.read_bytes(), b"original lock evidence")
+                    self.assertEqual(paths[0].read_bytes(), b"another owner's replacement")
+                finally:
+                    if replacement is not None:
+                        os.close(replacement)
+                    os.close(final)
+
+    def test_native_missing_or_symlinked_earlier_path_cannot_reach_terminal(self):
+        for portable in (False, True):
+            for change in ("missing", "symlink"):
+                with self.subTest(portable=portable, change=change):
+                    paths = [self.root / f"native-{portable}-{change}-{i}" for i in range(32)]
+                    old = self.root / f"retained-{portable}-{change}"
+                    witness = self.root / f"terminal-{portable}-{change}"
+                    final = os.open(paths[-1], os.O_CREAT | os.O_RDWR, 0o600)
+                    try:
+                        fcntl.flock(final, fcntl.LOCK_EX)
+                        holder = self.start([("x", path) for path in paths], portable=portable,
+                                            env=self.environment(portable, gnu_flock=False),
+                                            terminal=self.terminal_witness(witness))
+                        eventually(lambda: not available(paths[-2]), "native waiter did not reach last root")
+                        self.assertIsNone(holder.line(0.05))
+                        paths[0].rename(old)
+                        if change == "symlink":
+                            # Even a link resolving to the SAME held inode is not
+                            # the real, regular lock pathname that was acquired.
+                            paths[0].symlink_to(old)
+                        fcntl.flock(final, fcntl.LOCK_UN)
+                        self.assertIsNone(holder.line(), "native holder accepted a missing/symlinked root")
+                        stdout, stderr = holder.failure()
+                        self.assertEqual((holder.process.returncode, stdout), (73, b""), stderr)
+                        self.assertIn(b"native source lock acquisition failed", stderr)
+                        self.assertNotIn(b"requester ended", stderr)
+                        self.assertFalse(witness.exists())
+                        self.assertTrue(available(old))
+                        self.assertTrue(all(available(path) for path in paths[1:]))
+                        if change == "symlink":
+                            self.assertTrue(paths[0].is_symlink())
+                        else:
+                            self.assertFalse(paths[0].exists(), "refusal recreated an absent lock pathname")
+                    finally:
+                        os.close(final)
+
+    def test_native_hardlink_aliases_refuse_instead_of_self_deadlocking_or_granting(self):
+        for portable in (False, True):
+            for first_mode, second_mode in (("x", "x"), ("s", "x"), ("x", "s"), ("s", "s")):
+                with self.subTest(portable=portable, modes=(first_mode, second_mode)):
+                    tag = f"{portable}-{first_mode}-{second_mode}"
+                    paths = [self.root / f"native-alias-{tag}-{i}" for i in range(32)]
+                    paths[0].write_bytes(b"one inode, two names")
+                    os.link(paths[0], paths[1])
+                    witness = self.root / f"terminal-alias-{tag}"
+                    specs = [(first_mode, paths[0]), (second_mode, paths[1])]
+                    specs.extend(("x", path) for path in paths[2:])
+                    holder = self.start(specs, portable=portable,
+                                        env=self.environment(portable, gnu_flock=False),
+                                        terminal=self.terminal_witness(witness))
+                    self.assertIsNone(holder.line(0.5), "aliased locks granted source authority")
+                    # Leave stdin OPEN: an eventual disconnect must not hide
+                    # a self-deadlock against another descriptor in this plan.
+                    holder.process.wait(timeout=1)
+                    stdout, stderr = holder.failure()
+                    self.assertEqual((holder.process.returncode, stdout), (73, b""), stderr)
+                    self.assertIn(b"duplicate source lock inode", stderr)
+                    self.assertNotIn(b"requester ended", stderr)
+                    self.assertFalse(witness.exists())
+                    self.assertTrue(available(paths[0]) and available(paths[1]))
+                    self.assertTrue(all(not path.exists() for path in paths[2:]))
+                    self.assertEqual(paths[0].read_bytes(), b"one inode, two names")
+                    self.assertTrue(os.path.samefile(paths[0], paths[1]))
+
+    @unittest.skipUnless(GNU_CANCELLABLE, "GNU flock and Bash 4.1+ are required")
+    def test_gnu_disconnected_waiters_release_small_and_no_python_large_plans(self):
+        env = self.environment(portable=False, python=False)
+        for count, ignore_hup in [(2, False), (2, True), (64, False), (64, True)]:
+            paths = [self.root / f"gnu-{count}-{ignore_hup}-{i}" for i in range(count)]
+            paths[-1].write_bytes(b"another owner's lock evidence")
+            witness = self.root / f"terminal-{count}-{ignore_hup}"
+            fd = os.open(paths[-1], os.O_RDWR)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+                holder = self.start([("x", path) for path in paths], env=env,
+                                    terminal=self.terminal_witness(witness), ignore_hup=ignore_hup)
+                eventually(lambda: not available(paths[-2]), "GNU waiter did not reach final root")
+                if ignore_hup:
+                    holder.process.send_signal(signal.SIGHUP)
+                self.assertIsNone(holder.line(0.05))
+                self.assertIsNone(holder.process.poll())
+                stdout, stderr = holder.finish()  # Disconnect without signalling.
+                self.assert_requester_refused(holder, stdout, stderr)
+                self.assertFalse(witness.exists())
+                self.assertTrue(all(available(path) for path in paths[:-1]))
+                self.assertFalse(available(paths[-1]))
+                self.assertEqual(paths[-1].read_bytes(), b"another owner's lock evidence")
+            finally:
+                os.close(fd)
+            follower = self.start([("x", path) for path in paths], env=env)
+            self.assertEqual(follower.line(), b"READY")
+            stdout, stderr = follower.finish()
+            self.assertEqual((follower.process.returncode, stdout, stderr), (0, b"", b""))
+            self.assertTrue(all(available(path) for path in paths))
+
+    @unittest.skipUnless(GNU_CANCELLABLE, "GNU flock and Bash 4.1+ are required")
+    def test_gnu_initial_eof_and_early_input_grant_no_authority(self):
+        env = self.environment(portable=False, python=False)
+        witness = self.root / "terminal"
+        path = self.root / "absent"
+        holder = self.start([("x", path)], env=env, closed_stdin=True,
+                            terminal=self.terminal_witness(witness))
+        stdout, stderr = holder.failure()
+        self.assert_requester_refused(holder, stdout, stderr)
+        self.assertFalse(path.exists())
+        for index, early in enumerate(("RELEASE\n", "\0", "partial")):
+            first, last = self.root / f"first-{index}", self.root / f"last-{index}"
+            fd = os.open(last, os.O_CREAT | os.O_RDWR, 0o600)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+                holder = self.start([("x", first), ("x", last)], env=env,
+                                    terminal=self.terminal_witness(witness))
+                eventually(lambda: not available(first), "GNU waiter did not acquire first root")
+                holder.send(early)
+                stdout, stderr = holder.failure()
+                self.assert_requester_refused(holder, stdout, stderr)
+                self.assertTrue(available(first))
+                self.assertFalse(available(last))
+                self.assertFalse(witness.exists())
+            finally:
+                os.close(fd)
+
+    @unittest.skipUnless(GNU_CANCELLABLE, "GNU flock and Bash 4.1+ are required")
+    def test_gnu_descriptor_handoff_preserves_claim_stdin_pid_modes_and_literal_paths(self):
+        names = ["space name", "single'and\"double", "$(printf hacked)", "[x]*?",
+                 "back\\slash", "unicode-λ", "trailing ", "a];echo hacked", "byte-" + chr(0xdcff)]
+        paths = [self.root / name for name in names] + [self.root / f"root-{i}" for i in range(80)]
+        specs = [("s" if i % 3 == 0 else "x", path) for i, path in enumerate(paths)]
+        terminal = ('set -eu; [ "$(cat <&4)" = "claim input" ]; exec 4<&-; '
+                    'if (: <&3) 2>/dev/null; then exit 98; fi; '
+                    '[ "${LC_ALL-unset}" = unset ]; '
+                    'printf "%s\\n" "$1" "$$" "$2"; '
+                    'IFS= read -r reply; [ "$reply" = RELEASE ]; printf "RELEASED\\n"')
+        env = self.environment(portable=False, python=False)
+        env.pop("LC_ALL")
+        holder = self.start(specs, env=env, terminal=terminal, args=("literal $value; 'quotes'",))
+        self.assertEqual(holder.line(), b"READY")
+        self.assertEqual(int(holder.line()), holder.process.pid)
+        self.assertEqual(holder.line(), b"literal $value; 'quotes'")
+        for mode, path in specs:
+            self.assertFalse(available(path))
+            self.assertEqual(available(path, shared=True), mode == "s")
+        holder.send("RELEASE\n")
+        self.assertEqual(holder.line(), b"RELEASED")
+        stdout, stderr = holder.finish()
+        self.assertEqual((holder.process.returncode, stdout, stderr), (0, b"", b""))
+        self.assertTrue(all(available(path) for path in paths))
+        self.assertEqual((self.root / "gnu-bin/uname.calls").read_text(), "called\n")
+
+    @unittest.skipUnless(GNU_CANCELLABLE, "GNU flock and Bash 4.1+ are required")
+    def test_gnu_native_and_legacy_backends_share_the_same_kernel_locks(self):
+        envs = [self.environment(portable=False, python=False),
+                self.environment(portable=False, python=False, bash=False),
+                self.environment(portable=True)]
+        paths = [self.root / str(i) for i in range(3)]
+        specs = [("s", paths[0]), ("x", paths[1]), ("x", paths[2])]
+        for i, first in enumerate(envs):
+            for j, second in enumerate(envs):
+                if i == j:
+                    continue
+                owner = self.start(specs, env=first)
+                self.assertEqual(owner.line(), b"READY")
+                follower = self.start(specs, env=second)
+                self.assertIsNone(follower.line(0.1))
+                owner.finish()
+                self.assertEqual(follower.line(), b"READY")
+                self.assertTrue(available(paths[0], shared=True))
+                self.assertTrue(all(not available(path) for path in paths))
+                follower.finish()
+                self.assertTrue(all(available(path) for path in paths))
+
+    @unittest.skipUnless(GNU_CANCELLABLE, "GNU flock and Bash 4.1+ are required")
+    def test_gnu_bad_plans_fail_with_a_live_requester_before_any_terminal(self):
+        env = self.environment(portable=False, python=False)
+        path = self.root / "first"
+        valid = f"x {path}\n".encode()
+        witness = self.root / "terminal"
+        for index, (content, count) in enumerate([
+            (valid, 2), (valid + valid, 2), (valid + b"s /extra\n", 1),
+            (valid[:-1], 1), (valid + b"x /bad\0path\n", 2),
+            (valid + b"s /bad\rpath\n", 2), (b"x relative\n", 1),
+            (valid + b"invalid\n", 2), (b"x /" + b"x" * 1048576 + b"\n", 1),
+        ]):
+            plan = self.root / f"invalid-plan-{index}"
+            plan.write_bytes(content)
+            holder = self.start([], env=env, plan=plan, count=count,
+                                terminal=self.terminal_witness(witness))
+            stdout, stderr = holder.failure()
+            self.assertEqual((holder.process.returncode, stdout), (73, b""), (index, stderr))
+            self.assertIn(b"GNU source lock acquisition failed", stderr)
+            self.assertNotIn(b"requester ended", stderr)
+            self.assertTrue(available(path))
+            self.assertFalse(witness.exists())
+
+    @unittest.skipUnless(GNU_CANCELLABLE, "GNU flock and Bash 4.1+ are required")
+    def test_gnu_partial_acquisition_refuses_nonregular_files_and_fd_exhaustion(self):
+        env = self.environment(portable=False, python=False)
+        paths = [self.root / f"root-{i}" for i in range(64)]
+        holder = self.start([("x", path) for path in paths], env=env, fd_limit=32)
+        stdout, stderr = holder.failure()
+        self.assertEqual((holder.process.returncode, stdout), (73, b""), stderr)
+        self.assertNotIn(b"requester ended", stderr)
+        self.assertTrue(all(available(path) for path in paths))
+        target, link, fifo = self.root / "target", self.root / "link", self.root / "fifo"
+        target.write_bytes(b"do not truncate or lock via symlink")
+        link.symlink_to(target)
+        os.mkfifo(fifo)
+        for invalid in (link, fifo, self.root):
+            holder = self.start([("x", paths[0]), ("x", invalid)], env=env)
+            stdout, stderr = holder.failure()
+            self.assertEqual((holder.process.returncode, stdout), (73, b""), stderr)
+            self.assertIn(b"not a regular file", stderr)
+            self.assertTrue(available(paths[0]))
+            self.assertEqual(target.read_bytes(), b"do not truncate or lock via symlink")
+            self.assertTrue(link.is_symlink())
+
+    @unittest.skipUnless(GNU_CANCELLABLE, "GNU flock and Bash 4.1+ are required")
+    def test_gnu_replaced_earlier_inode_is_rejected_after_the_final_wait(self):
+        env = self.environment(portable=False, python=False)
+        first, last, old = (self.root / name for name in ("first", "last", "old-first"))
+        witness = self.root / "terminal"
+        fd = os.open(last, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            holder = self.start([("x", first), ("x", last)], env=env,
+                                terminal=self.terminal_witness(witness))
+            eventually(lambda: not available(first), "GNU waiter did not acquire first root")
+            self.assertIsNone(holder.line(0.05))
+            first.rename(old)  # Retain the old inode; nothing is deleted.
+            first.write_bytes(b"replacement lock evidence")
+            self.assertFalse(available(old))
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            stdout, stderr = holder.failure()
+            self.assertEqual((holder.process.returncode, stdout), (73, b""), stderr)
+            self.assertIn(b"path changed during acquisition", stderr)
+            self.assertFalse(witness.exists())
+            self.assertTrue(available(old) and available(first) and available(last))
+            self.assertEqual(first.read_bytes(), b"replacement lock evidence")
+        finally:
+            os.close(fd)
+
+    @unittest.skipUnless(GNU_CANCELLABLE, "GNU flock and Bash 4.1+ are required")
+    def test_gnu_tool_error_is_not_contention_and_never_retries_or_falls_back(self):
+        env = self.environment(portable=False, python=False)
+        directory = self.root / "broken-flock"
+        directory.mkdir()
+        counter = self.root / "flock-called"
+        tool = directory / "flock"
+        tool.write_text("#!/bin/sh\nif [ -e {0} ]; then echo tool-failure >&2; exit 97; fi\n"
+                        "printf called > {0}\nexec {1} \"$@\"\n".format(
+                            shlex.quote(str(counter)), shlex.quote(FLOCK)))
+        tool.chmod(0o700)
+        env["PATH"] = str(directory) + os.pathsep + env["PATH"]
+        paths = [self.root / str(i) for i in range(3)]
+        witness = self.root / "terminal"
+        holder = self.start([("x", path) for path in paths], env=env,
+                            terminal=self.terminal_witness(witness))
+        stdout, stderr = holder.failure()
+        self.assertEqual((holder.process.returncode, stdout), (73, b""), stderr)
+        self.assertEqual(stderr.count(b"tool-failure"), 1)
+        self.assertIn(b"flock failed without a contention verdict", stderr)
+        self.assertTrue(all(available(path) for path in paths[:2]))
+        self.assertFalse(paths[2].exists())
+        self.assertFalse(witness.exists())
+
+    @unittest.skipUnless(GNU_CANCELLABLE, "GNU flock and Bash 4.1+ are required")
+    def test_gnu_bootstrap_ignores_imported_startup_code_and_functions(self):
+        env = self.environment(portable=False, python=False)
+        marker = self.root / "unwanted-startup"
+        startup = self.root / "bash-env"
+        startup.write_text(f"printf bad > {shlex.quote(str(marker))}\nexit 97\n")
+        env.update({"BASH_ENV": str(startup), "SHELLOPTS": "verbose",
+                    "BASH_FUNC_flock%%": "() { printf bad; return 0; }"})
+        path = self.root / "locked"
+        holder = self.start([("x", path)], env=env)
+        self.assertEqual(holder.line(), b"READY")
+        self.assertFalse(available(path), "an imported function fabricated successful flock")
+        stdout, stderr = holder.finish()
+        self.assertEqual((holder.process.returncode, stdout, stderr), (0, b"", b""))
+        self.assertFalse(marker.exists())
+        self.assertTrue(available(path))
+
+    @unittest.skipUnless(GNU_CANCELLABLE, "GNU flock and Bash 4.1+ are required")
+    def test_gnu_holder_death_releases_only_its_locks(self):
+        env = self.environment(portable=False, python=False)
+        paths = [self.root / str(i) for i in range(16)]
+        for sig in (signal.SIGHUP, signal.SIGKILL):
+            holder = self.start([("x", path) for path in paths], env=env)
+            self.assertEqual(holder.line(), b"READY")
+            holder.process.send_signal(sig)
+            holder.finish()
+            self.assertEqual(holder.process.returncode, -sig)
+            self.assertTrue(all(available(path) for path in paths))
 
 
 if __name__ == "__main__":

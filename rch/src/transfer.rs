@@ -883,10 +883,33 @@ fn remote_path_probe_script(path: &str) -> String {
     )
 }
 
+/// A worker whose canonical source roots hold editors' checkouts (a host that
+/// is also a dispatcher) declares it with this file. Only declared hosts get
+/// the Git-checkout fence: on a pure worker a `.git` at a canonical root is
+/// rch's own repo-convergence checkout (`hook::repo_updater`), and refusing it
+/// would refuse every multi-repo closure on the fleet (bd-tali9).
+pub(crate) const LIVE_CHECKOUT_HOST_MARKER: &str = "/etc/rch/live-checkouts";
+
+#[cfg(test)]
+thread_local! {
+    static LIVE_CHECKOUT_HOST_MARKER_FOR_TEST: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn live_checkout_host_marker() -> String {
+    #[cfg(test)]
+    if let Some(marker) = LIVE_CHECKOUT_HOST_MARKER_FOR_TEST.with(|m| m.borrow().clone()) {
+        return marker;
+    }
+    LIVE_CHECKOUT_HOST_MARKER.to_owned()
+}
+
 /// Receiver-side safety fence for dual-role Unix workers (bd-fbtws).
-/// Inspect physical ancestors (including aliases), linked-worktree markers,
-/// and nested repositories before *any* upload setup or pruning. Never infer
-/// permission to replace an editor's checkout from a clean `git status`.
+/// Root and dot-component destinations are always refused. On hosts that
+/// declare [`LIVE_CHECKOUT_HOST_MARKER`], also inspect physical ancestors
+/// (including aliases), linked-worktree markers, and nested repositories
+/// before *any* upload setup or pruning. Never infer permission to replace an
+/// editor's checkout from a clean `git status`.
 pub(crate) fn live_checkout_sync_guard(path: &str) -> String {
     format!(
         r#"(set -eu
@@ -906,6 +929,7 @@ esac
 case "$rch_destination/" in
     */./*|*/../*) rch_sync_refuse 'destination contains dot components';;
 esac
+[ -e {marker} ] || exit 0
 rch_ancestor=$rch_destination
 while [ ! -e "$rch_ancestor" ] && [ ! -L "$rch_ancestor" ]; do
     rch_ancestor=$(dirname "$rch_ancestor") || rch_sync_refuse 'cannot inspect ancestors'
@@ -923,7 +947,8 @@ if [ -d "$rch_destination" ]; then
     [ -z "$rch_nested" ] || rch_sync_refuse "nested Git checkout at $rch_nested"
 fi
 )"#,
-        path = escape(Cow::from(path))
+        path = escape(Cow::from(path)),
+        marker = escape(Cow::from(live_checkout_host_marker()))
     )
 }
 
@@ -2227,6 +2252,9 @@ pub struct TransferPipeline {
     sync_delete: bool,
     /// Whether uploads must compare file contents instead of size and mtime.
     sync_checksum: bool,
+    /// The caller holds the source pair and proved a fresh materialization.
+    /// Source preparation must not prune or delete any retained data.
+    owned_source_materialization: bool,
     /// Build ID for tracking and cancellation.
     build_id: Option<u64>,
     /// Remote worker OS family. Selects transport (rsync vs tar) and path
@@ -2356,6 +2384,7 @@ impl TransferPipeline {
             sync_include_patterns: None,
             sync_delete: true,
             sync_checksum: false,
+            owned_source_materialization: false,
             build_id: None,
             worker_platform: WorkerPlatform::Posix,
             pooled_target_prune_idle_hours:
@@ -2510,7 +2539,7 @@ impl TransferPipeline {
     /// reclamation. Keep all transfer-start sweeps out of its activity; source
     /// synchronization and the explicit retirement protocol remain separate.
     fn source_sync_prune_prefix(&self, escaped_remote_path: &str) -> String {
-        if self.source_authority_prefix.is_some() {
+        if self.source_authority_prefix.is_some() || self.owned_source_materialization {
             return String::new();
         }
         worker_cache_prune_rsync_path_prefix(
@@ -2681,6 +2710,18 @@ impl TransferPipeline {
         // Once the workload has finished, followers that make no progress
         // for `stall_secs` are killed. Any live reader drains 1 MiB well
         // within that window.
+        //
+        // Wait for the supervisor we spawned, not for the receipt it intends
+        // to publish (bd-t5c8p). A killed supervisor or failed receipt write
+        // cannot create that file later. Polling for it kept this shell and
+        // both followers alive forever, so recovery could never acquire the
+        // activity lock to prove the execution lost. Reap the followers on
+        // that failure too; surviving workload descendants still inherit the
+        // lock and continue to fence recovery until they actually exit. Keep
+        // the failure diagnostic in the saved log: even a short write to an
+        // abandoned SSH channel can block before the EXIT cleanup runs.
+        // Exit 255 keeps the caller's source ownership unconfirmed; an
+        // ordinary compiler failure would incorrectly authorize release.
         format!(
             "set -e; rch_umask=$(umask); umask 077; mkdir -p -- {directory}; mkdir {claim}; : > {out}; : > {err}; : > {out_progress}; : > {err_progress}; umask \"$rch_umask\"; \
              nohup sh -c {supervisor} </dev/null >{out} 2>{err} & \
@@ -2692,9 +2733,9 @@ impl TransferPipeline {
                o=$((o + n)); echo \"$o\" > \"$2\"; continue; fi; \
                [ -n \"$d\" ] && {{ echo done > \"$2\"; return 0; }}; sleep 0.2 2>/dev/null || sleep 1; done; }}; \
              rch_follow {out} {out_progress} & a=$!; rch_follow {err} {err_progress} >&2 & b=$!; \
-             trap 'kill \"$a\" \"$b\" 2>/dev/null || :' EXIT; \
-             while [ ! -f {done} ]; do sleep 1; done; \
+             trap 'kill \"$a\" \"$b\" 2>/dev/null || :; wait \"$a\" 2>/dev/null || :; wait \"$b\" 2>/dev/null || :' EXIT; \
              wait \"$p\" || :; \
+             [ -f {done} ] && [ ! -L {done} ] || {{ printf '%s\\n' 'RCH: remote execution ended without a durable completion receipt; execution outcome remains unconfirmed' 2>/dev/null >> {err} || :; exit 255; }}; \
              last=; still=0; \
              while [ \"$(cat {out_progress} {err_progress})\" != \"$(printf 'done\\ndone')\" ]; do \
                now=$(cat {out_progress} {err_progress}); \
@@ -3025,13 +3066,22 @@ impl TransferPipeline {
 
     /// Control whether sync-to-remote deletes extraneous remote files.
     pub fn with_sync_delete(mut self, delete: bool) -> Self {
-        self.sync_delete = delete;
+        self.sync_delete = delete && !self.owned_source_materialization;
         self
     }
 
     /// Force content checks for sync-to-remote uploads.
     pub fn with_sync_checksum(mut self, checksum: bool) -> Self {
-        self.sync_checksum = checksum;
+        self.sync_checksum = checksum || self.owned_source_materialization;
+        self
+    }
+
+    /// Select retained fresh-source uploads after source-pair acquisition.
+    /// The caller must prove the container absent before materialization.
+    pub(crate) fn with_owned_source_materialization(mut self) -> Self {
+        self.owned_source_materialization = true;
+        self.sync_delete = false;
+        self.sync_checksum = true;
         self
     }
 
@@ -3758,6 +3808,7 @@ impl TransferPipeline {
         &self,
         worker: &WorkerConfig,
         effective_excludes: &[String],
+        owned_managed_timestamps: Option<bool>,
     ) -> Command {
         let remote_path = self.remote_path();
         let escaped_remote_path = escape(Cow::from(&remote_path));
@@ -3768,6 +3819,11 @@ impl TransferPipeline {
         );
 
         let (mut cmd, capabilities) = self.rsync_command();
+        let receiver = if owned_managed_timestamps.is_some() {
+            self.source_rsync_path("rsync".to_owned())
+        } else {
+            self.source_rsync_path(format!("mkdir -p {} && rsync", escaped_remote_path))
+        };
         cmd.arg("-azn")
             .arg("--checksum")
             .arg("--itemize-changes")
@@ -3776,10 +3832,13 @@ impl TransferPipeline {
             .arg("-e")
             .arg(ssh_command)
             .arg("--rsync-path")
-            .arg(self.source_rsync_path(format!("mkdir -p {} && rsync", escaped_remote_path)));
+            .arg(receiver);
         add_portable_rsync_archive_args(&mut cmd);
-        if self.sync_delete {
+        if self.sync_delete || owned_managed_timestamps.is_some() {
             cmd.arg("--delete");
+        }
+        if owned_managed_timestamps == Some(true) {
+            cmd.arg("--no-times");
         }
         self.append_sync_filter_args(&mut cmd, effective_excludes);
         cmd.arg(format!("{}/", self.project_root.display()))
@@ -3800,11 +3859,40 @@ impl TransferPipeline {
             anyhow::bail!("source-content receipts require the rsync transport");
         }
         let effective_excludes = self.get_effective_excludes();
-        let cmd = self.build_source_content_rsync_barrier_command(worker, &effective_excludes);
+        let cmd =
+            self.build_source_content_rsync_barrier_command(worker, &effective_excludes, None);
 
         let output = run_source_content_rsync_capture(
             cmd,
             "source-content rsync no-delta barrier",
+            self.source_sync_attempt_timeout(&effective_excludes),
+        )
+        .await?;
+        source_content_barrier::verify_output(&output).map_err(anyhow::Error::msg)
+    }
+
+    /// Verify a freshly owned source tree without creating receiver paths.
+    /// Surplus selected entries always refuse, even when uploads retain all
+    /// existing files. Only an explicit completed freshness ledger may ignore
+    /// mtime deltas; type, content, permissions and namespace stay strict.
+    pub(crate) async fn verify_owned_source_content_rsync_barrier(
+        &self,
+        worker: &WorkerConfig,
+        managed_timestamps: bool,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            !self.worker_platform.is_windows() && self.source_authority_prefix.is_some(),
+            "owned source-content verification requires the Unix source grant"
+        );
+        let effective_excludes = self.get_effective_excludes();
+        let cmd = self.build_source_content_rsync_barrier_command(
+            worker,
+            &effective_excludes,
+            Some(managed_timestamps),
+        );
+        let output = run_source_content_rsync_capture(
+            cmd,
+            "owned source-content rsync no-delta barrier",
             self.source_sync_attempt_timeout(&effective_excludes),
         )
         .await?;
@@ -6384,6 +6472,319 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         cmd
     }
 
+    /// Refresh a completely materialized owned closure once, including any
+    /// workspace-metadata ancestors of full package roots. Source, target and
+    /// control directory must all be in the same durable source grant.
+    pub(crate) async fn refresh_owned_source_closure(
+        &self,
+        worker: &WorkerConfig,
+        identity: &str,
+        source_container: &str,
+        control_dir: &str,
+        attempt: &str,
+    ) -> Result<()> {
+        let active = crate::hook::source_authority_activity_prefix(attempt)?;
+        anyhow::ensure!(
+            !self.worker_platform.is_windows()
+                && self.source_authority_prefix.as_deref() == Some(active.as_str()),
+            "owned source freshness requires this attempt's active Linux source grant"
+        );
+        let command = self.owned_source_freshness_command(
+            identity,
+            source_container,
+            control_dir,
+            attempt,
+            false,
+        )?;
+        tokio::time::timeout(
+            Duration::from_secs(120),
+            self.run_remote_sh(worker, &command),
+        )
+        .await
+        .context("timed out proving owned source-closure freshness")?
+    }
+
+    /// Qualify this attempt's ledger only after the post-execution source
+    /// proof succeeds. Recovery without that proof must leave it unqualified.
+    pub(crate) async fn mark_owned_source_closure_verified(
+        &self,
+        worker: &WorkerConfig,
+        identity: &str,
+        source_container: &str,
+        control_dir: &str,
+        attempt: &str,
+    ) -> Result<()> {
+        let active = crate::hook::source_authority_activity_prefix(attempt)?;
+        anyhow::ensure!(
+            !self.worker_platform.is_windows()
+                && self.source_authority_prefix.as_deref() == Some(active.as_str()),
+            "owned source verification requires this attempt's active Linux source grant"
+        );
+        let script = self.owned_source_freshness_command(
+            identity,
+            source_container,
+            control_dir,
+            attempt,
+            true,
+        )?;
+        let quoted = escape(Cow::from(script));
+        let mut command = self.worker_ssh_command(worker, &["sh", "-c", &quoted]);
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let output = run_source_content_rsync_capture(
+            command,
+            "owned source freshness qualification",
+            Duration::from_secs(120),
+        )
+        .await?;
+        anyhow::ensure!(
+            output.status.success()
+                && output.stderr.is_empty()
+                && output.stdout == b"RCH_SOURCE_FRESHNESS_VERIFIED\n",
+            "owned source freshness qualification failed (exit {:?}): {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).trim(),
+        );
+        Ok(())
+    }
+
+    fn owned_source_freshness_command(
+        &self,
+        identity: &str,
+        source_container: &str,
+        control_dir: &str,
+        attempt: &str,
+        mark_verified: bool,
+    ) -> Result<String> {
+        anyhow::ensure!(
+            identity.len() == 64 && identity.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "invalid owned source freshness identity"
+        );
+        anyhow::ensure!(
+            attempt.len() == 32
+                && attempt
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+            "invalid owned source freshness attempt"
+        );
+        anyhow::ensure!(
+            self.remote_path() == source_container
+                && control_dir == format!("{source_container}.freshness"),
+            "owned source freshness requires the entire source container and its exact control sibling"
+        );
+        let program = if mark_verified {
+            Self::owned_source_refresh_preparation_script().to_owned()
+        } else {
+            format!(
+                "{}\n{}",
+                Self::owned_source_refresh_preparation_script(),
+                Self::clean_overlay_freshness_ledger_script()
+            )
+        };
+        Ok(format!(
+            "python3 -I -c {} {} {} {} {} {} {}",
+            escape(Cow::from(program)),
+            escape(Cow::from(source_container)),
+            escape(Cow::from(self.remote_cargo_target_dir())),
+            escape(Cow::from(format!("{control_dir}/epoch-v1"))),
+            escape(Cow::from(identity)),
+            escape(Cow::from(attempt)),
+            if mark_verified { "verify" } else { "refresh" },
+        ))
+    }
+
+    fn owned_source_refresh_preparation_script() -> &'static str {
+        r#"import hashlib, json, os, stat, sys
+
+def rch_owned_require(condition, reason):
+    if not condition:
+        raise RuntimeError('RCH: owned source freshness refused: ' + reason)
+
+rch_owned_require(sys.platform == 'linux', 'Linux worker required')
+rch_owned_require(len(sys.argv) == 7, 'invalid freshness arguments')
+rch_root, rch_pool, rch_epoch, rch_identity, rch_attempt, rch_operation = sys.argv[1:]
+rch_control = os.path.dirname(rch_epoch)
+def rch_literal(path):
+    return (path.startswith('/') and not path.endswith('/') and '\\' not in path
+            and not any(ord(ch) < 32 or 127 <= ord(ch) <= 159 for ch in path)
+            and all(part not in ('', '.', '..') for part in path[1:].split('/')))
+rch_owned_require(all(rch_literal(path) for path in (rch_root, rch_pool, rch_control)),
+                  'nonliteral source, target or control path')
+rch_owned_require(rch_control == rch_root + '.freshness'
+                  and os.path.basename(rch_epoch) == 'epoch-v1',
+                  'control directory is outside its exact authority')
+rch_owned_require(rch_pool != rch_root and not rch_pool.startswith(rch_root + '/')
+                  and rch_pool != rch_control and not rch_pool.startswith(rch_control + '/'),
+                  'stable target must be outside source and control trees')
+rch_owned_require(len(rch_identity) == 64
+                  and all(ch in '0123456789abcdefABCDEF' for ch in rch_identity),
+                  'invalid freshness identity')
+rch_owned_require(len(rch_attempt) == 32
+                  and all(ch in '0123456789abcdef' for ch in rch_attempt),
+                  'invalid freshness attempt')
+rch_owned_require(rch_operation in ('refresh', 'verify'), 'invalid freshness operation')
+rch_owned_previous_qualified = False
+rch_intent = {'schema': 'rch.source_freshness_attempt.v1', 'source_root': rch_root,
+              'target_root': rch_pool, 'content_identity': rch_identity, 'attempt': rch_attempt}
+def rch_encoded(value):
+    return json.dumps(value, sort_keys=True, separators=(',', ':'), ensure_ascii=True).encode('ascii')
+
+def rch_sha256(value):
+    return hashlib.sha256(value).hexdigest()
+
+rch_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+rch_parent = os.open('/', rch_flags)
+try:
+    for rch_part in os.path.dirname(rch_root).split('/')[1:]:
+        if rch_part:
+            rch_child = os.open(rch_part, rch_flags, dir_fd=rch_parent)
+            os.close(rch_parent)
+            rch_parent = rch_child
+    rch_source_fd = os.open(os.path.basename(rch_root), rch_flags, dir_fd=rch_parent)
+    try:
+        rch_owned_require(os.fstat(rch_source_fd).st_uid == os.geteuid(),
+                          'source container has a foreign owner')
+    finally:
+        os.close(rch_source_fd)
+    if rch_operation == 'refresh':
+        try:
+            os.mkdir(os.path.basename(rch_control), mode=0o700, dir_fd=rch_parent)
+        except FileExistsError:
+            pass
+    rch_control_fd = os.open(os.path.basename(rch_control), rch_flags, dir_fd=rch_parent)
+    try:
+        rch_info = os.fstat(rch_control_fd)
+        rch_owned_require(rch_info.st_uid == os.geteuid()
+                          and stat.S_IMODE(rch_info.st_mode) & 0o077 == 0,
+                          'control directory must be private and owned by this worker user')
+        os.fsync(rch_control_fd)
+        os.fsync(rch_parent)
+
+        def rch_read_control(name, cap):
+            try:
+                descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK,
+                                     dir_fd=rch_control_fd)
+            except FileNotFoundError:
+                return None
+            with os.fdopen(descriptor, 'rb') as stream:
+                before = os.fstat(stream.fileno())
+                rch_owned_require(stat.S_ISREG(before.st_mode) and before.st_uid == os.geteuid(),
+                                  'freshness control must be a regular owned file')
+                if before.st_size > cap:
+                    return None
+                data = stream.read(cap + 1)
+                after = os.fstat(stream.fileno())
+                rch_owned_require((before.st_dev, before.st_ino, before.st_size,
+                                   before.st_mtime_ns, before.st_ctime_ns)
+                                  == (after.st_dev, after.st_ino, after.st_size,
+                                      after.st_mtime_ns, after.st_ctime_ns)
+                                  and len(data) == before.st_size,
+                                  'freshness control changed while reading')
+                return data, before
+
+        def rch_decode_intent(encoded):
+            if encoded is None:
+                return None
+            try:
+                value = json.loads(encoded[0])
+                if (set(value) == set(rch_intent) and rch_encoded(value) == encoded[0]
+                    and value['schema'] == rch_intent['schema']
+                    and value['source_root'] == rch_root and value['target_root'] == rch_pool
+                    and isinstance(value['attempt'], str) and len(value['attempt']) == 32
+                    and all(ch in '0123456789abcdef' for ch in value['attempt'])
+                    and isinstance(value['content_identity'], str)
+                    and len(value['content_identity']) == 64
+                    and all(ch in '0123456789abcdefABCDEF' for ch in value['content_identity'])):
+                    return value
+            except (ValueError, TypeError, KeyError, UnicodeError):
+                pass
+            return None
+
+        def rch_qualification(intent):
+            if intent is None:
+                return None
+            epoch = rch_read_control('epoch-v1', 65)
+            ledger = rch_read_control('epoch-v1.files-v2', 64 * 1024**2)
+            if epoch is None or ledger is None:
+                return None
+            try:
+                document = json.loads(ledger[0])
+                payload = document['payload']
+                if (epoch[0] == (intent['content_identity'] + '\n').encode('ascii')
+                    and payload['identity'] == intent['content_identity']
+                    and payload['schema'] == 2 and payload['epoch_ns'] == epoch[1].st_mtime_ns
+                    and document['sha256'] == rch_sha256(rch_encoded(payload))):
+                    return rch_encoded({'schema': 'rch.source_freshness_verified.v1',
+                                        'intent': intent, 'epoch_sha256': rch_sha256(epoch[0]),
+                                        'ledger_sha256': rch_sha256(ledger[0]),
+                                        'epoch_mtime_ns': epoch[1].st_mtime_ns})
+            except (ValueError, TypeError, KeyError, UnicodeError):
+                pass
+            return None
+
+        def rch_stage_control(prefix, data):
+            name = prefix + '.pending.' + os.urandom(16).hex()
+            descriptor = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                                 0o600, dir_fd=rch_control_fd)
+            with os.fdopen(descriptor, 'wb') as stream:
+                stream.write(data)
+                stream.flush()
+                os.fsync(stream.fileno())
+            return name
+
+        current = rch_read_control('current-attempt-v1', 64 * 1024)
+        if rch_operation == 'refresh':
+            previous = rch_decode_intent(current)
+            expected = rch_qualification(previous)
+            if expected is not None and previous['attempt'] != rch_attempt:
+                proof = rch_read_control('verified-' + previous['attempt'] + '.json', 64 * 1024)
+                rch_owned_previous_qualified = proof is not None and proof[0] == expected
+            # Publish this unqualified attempt before the shared ledger changes
+            # source timestamps. A crash or failed post-proof cannot authorize
+            # the next invocation to reuse the previous successful attempt.
+            pending = rch_stage_control('current-attempt-v1', rch_encoded(rch_intent))
+            os.replace(pending, 'current-attempt-v1',
+                       src_dir_fd=rch_control_fd, dst_dir_fd=rch_control_fd)
+            os.fsync(rch_control_fd)
+        else:
+            rch_owned_require(current is not None and current[0] == rch_encoded(rch_intent),
+                              'verified attempt does not match the current preparation')
+            expected = rch_qualification(rch_intent)
+            rch_owned_require(expected is not None, 'verified attempt has no matching ledger and epoch')
+            name = 'verified-' + rch_attempt + '.json'
+            existing = rch_read_control(name, 64 * 1024)
+            if existing is None:
+                pending = rch_stage_control(name, expected)
+                try:
+                    # A hard link publishes the fully durable record without
+                    # replacing any existing entry. Keep its staging link too.
+                    os.link(pending, name, src_dir_fd=rch_control_fd,
+                            dst_dir_fd=rch_control_fd, follow_symlinks=False)
+                except FileExistsError:
+                    pass
+                existing = rch_read_control(name, 64 * 1024)
+            rch_owned_require(existing is not None and existing[0] == expected,
+                              'verified attempt conflicts with retained evidence')
+            descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=rch_control_fd)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            os.fsync(rch_control_fd)
+            print('RCH_SOURCE_FRESHNESS_VERIFIED')
+            sys.exit(0)
+    finally:
+        os.close(rch_control_fd)
+finally:
+    os.close(rch_parent)
+# Keep the existing ledger's argument contract unchanged. Its optional gate
+# defaults to true for clean-overlay callers, which do not run this prelude.
+sys.argv = sys.argv[:5]
+"#
+    }
+
     /// Apply a content epoch while the source-pair lease is held, after complete
     /// fresh-root materialization and overlay verification. Identical selected
     /// bytes reuse their timestamp; changed bytes must be newer than artifacts
@@ -6537,7 +6938,8 @@ def parent_fd(relative):
 epoch_info = regular_control(epoch)
 ledger_info = regular_control(ledger)
 previous = {}
-if epoch_info and ledger_info and ledger_info.st_size <= MAX_LEDGER:
+if (globals().get('rch_owned_previous_qualified', True)
+    and epoch_info and ledger_info and ledger_info.st_size <= MAX_LEDGER):
     try:
         with os.fdopen(os.open(ledger, os.O_RDONLY | os.O_NOFOLLOW), 'rb') as stream:
             encoded = stream.read(MAX_LEDGER + 1)
@@ -6679,6 +7081,255 @@ try:
 finally:
     os.close(directory_fd)
 print('RCH_SOURCE_FRESHNESS_V2 unchanged=%d changed=%d' % (len(current) - len(changed), len(changed)))
+"#
+    }
+
+    /// Read-only admission probe for retained source pairs. It checks the
+    /// actual Linux no-replace syscall through libc, never a guessed syscall
+    /// number or a replacing/copying fallback. The eventual filesystem rename
+    /// can still refuse; that leaves the durable source grant outstanding.
+    pub(crate) fn remote_tree_retention_capability_command() -> String {
+        format!(
+            "python3 -I -c {} probe",
+            escape(Cow::from(Self::remote_tree_retention_program()))
+        )
+    }
+
+    /// Move this invocation's owned source into its exact retained sibling.
+    ///
+    /// Both paths must already be in the durable activity grant. True means
+    /// the retained directory and its identity marker are durable and the old
+    /// source is absent. False is possible only for cancelled preparation that
+    /// was explicitly allowed to have created neither path.
+    pub(crate) async fn retain_remote_tree(
+        &self,
+        worker: &WorkerConfig,
+        root: &str,
+        retained_root: &str,
+        identity: &str,
+        allow_absent_before_materialization: bool,
+    ) -> Result<bool> {
+        anyhow::ensure!(
+            !self.worker_platform.is_windows() && self.source_authority_prefix.is_some(),
+            "retained source retirement requires an active Linux source grant"
+        );
+        let active = crate::hook::source_authority_activity_prefix(identity)?;
+        let cleanup = crate::hook::source_authority_cleanup_prefix(identity)?;
+        anyhow::ensure!(
+            self.source_authority_prefix.as_deref() == Some(active.as_str())
+                || self.source_authority_prefix.as_deref() == Some(cleanup.as_str()),
+            "retained source identity does not match this pipeline's source grant"
+        );
+        let script = Self::remote_tree_retention_command(
+            root,
+            retained_root,
+            identity,
+            allow_absent_before_materialization,
+        )?;
+        let quoted = escape(Cow::from(script));
+        let mut command = self.worker_ssh_command(worker, &["sh", "-c", &quoted]);
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let output = run_source_content_rsync_capture(
+            command,
+            "owned source retention",
+            Duration::from_secs(120),
+        )
+        .await?;
+        anyhow::ensure!(
+            output.status.success() && output.stderr.is_empty(),
+            "remote source retention failed (exit {:?}): {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).trim(),
+        );
+        match output.stdout.as_slice() {
+            b"RCH_SOURCE_RETAINED\n" => Ok(true),
+            b"RCH_SOURCE_ABSENT_BEFORE_MATERIALIZATION\n"
+                if allow_absent_before_materialization =>
+            {
+                Ok(false)
+            }
+            _ => anyhow::bail!("remote source retention returned an invalid completion envelope"),
+        }
+    }
+
+    fn remote_tree_retention_command(
+        root: &str,
+        retained_root: &str,
+        identity: &str,
+        allow_absent_before_materialization: bool,
+    ) -> Result<String> {
+        let valid_path = |path: &str| {
+            path.starts_with('/')
+                && !path.ends_with('/')
+                && !path.chars().any(char::is_control)
+                && !path.contains('\\')
+                && path[1..]
+                    .split('/')
+                    .all(|part| !part.is_empty() && part != "." && part != "..")
+        };
+        anyhow::ensure!(
+            valid_path(root)
+                && valid_path(retained_root)
+                && root != retained_root
+                && Path::new(root).parent() == Path::new(retained_root).parent(),
+            "retained source paths must be distinct absolute literal siblings"
+        );
+        anyhow::ensure!(
+            identity.len() == 32
+                && identity
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+            "retained source identity must be 32 lowercase hexadecimal characters"
+        );
+        Ok(format!(
+            "python3 -I -c {} retain {} {} {} {}",
+            escape(Cow::from(Self::remote_tree_retention_program())),
+            escape(Cow::from(root)),
+            escape(Cow::from(retained_root)),
+            escape(Cow::from(identity)),
+            u8::from(allow_absent_before_materialization),
+        ))
+    }
+
+    fn remote_tree_retention_program() -> &'static str {
+        r#"import ctypes
+import errno
+import hashlib
+import json
+import os
+import stat
+import sys
+
+def require(condition, reason):
+    if not condition:
+        raise RuntimeError(reason)
+
+def run():
+    require(sys.platform == "linux", "Linux source retention required")
+    require(all(hasattr(os, name) for name in ("O_DIRECTORY", "O_NOFOLLOW", "O_CLOEXEC")),
+            "directory descriptor support unavailable")
+    require(all(function in os.supports_dir_fd for function in
+                (os.open, os.stat, os.symlink, os.readlink)),
+            "relative directory operations unavailable")
+    library = ctypes.CDLL(None, use_errno=True)
+    rename = getattr(library, "renameat2", None)
+    require(rename is not None, "libc renameat2 unavailable")
+    rename.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int,
+                       ctypes.c_char_p, ctypes.c_uint)
+    rename.restype = ctypes.c_int
+    # Linux renameat2(2), RENAME_NOREPLACE = 1. Empty names cannot mutate a
+    # path; ENOENT distinguishes an available syscall from ENOSYS/EPERM.
+    require(rename(-1, b"", -1, b"", 1) == -1 and ctypes.get_errno() == errno.ENOENT,
+            "Linux no-replace rename syscall unavailable")
+    if sys.argv[1:] == ["probe"]:
+        print("RCH_SOURCE_RETENTION_CAPABLE")
+        return
+    require(len(sys.argv) == 6 and sys.argv[1] == "retain", "invalid retention arguments")
+    root, retained, identity, allow_absent = sys.argv[2:]
+    def literal(path):
+        return (path.startswith("/") and not path.endswith("/") and "\\" not in path
+                and not any(ord(ch) < 32 or 127 <= ord(ch) <= 159 for ch in path)
+                and all(part not in ("", ".", "..") for part in path[1:].split("/")))
+    require(literal(root) and literal(retained) and root != retained
+            and os.path.dirname(root) == os.path.dirname(retained), "invalid retained siblings")
+    require(len(identity) == 32 and all(ch in "0123456789abcdef" for ch in identity),
+            "invalid source identity")
+    require(allow_absent in ("0", "1"), "invalid absence policy")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    parent = os.open("/", flags)
+    try:
+        for component in os.path.dirname(root).split("/")[1:]:
+            if component:
+                try:
+                    descendant = os.open(component, flags, dir_fd=parent)
+                except FileNotFoundError:
+                    require(allow_absent == "1", "materialized source parent is missing")
+                    print("RCH_SOURCE_ABSENT_BEFORE_MATERIALIZATION")
+                    return
+                os.close(parent)
+                parent = descendant
+        source_name = os.path.basename(root)
+        retained_name = os.path.basename(retained)
+        marker_name = ".rch-retention-v1"
+        preimage = json.dumps(["rch.source_retention.v1", identity, root, retained],
+                             ensure_ascii=True, separators=(",", ":")).encode("ascii")
+        marker_value = "rch-retention-v1:" + identity + ":" + hashlib.sha256(preimage).hexdigest()
+        def metadata(name):
+            try:
+                return os.stat(name, dir_fd=parent, follow_symlinks=False)
+            except FileNotFoundError:
+                return None
+        def directory(name):
+            descriptor = os.open(name, flags, dir_fd=parent)
+            require(os.fstat(descriptor).st_uid == os.geteuid(), "source directory has a foreign owner")
+            return descriptor
+        def marker(descriptor, create):
+            if create:
+                try:
+                    # symlink creation is atomic and never replaces an entry.
+                    # Its target is metadata only; it is never followed.
+                    os.symlink(marker_value, marker_name, dir_fd=descriptor)
+                except FileExistsError:
+                    pass
+            entry = os.stat(marker_name, dir_fd=descriptor, follow_symlinks=False)
+            require(stat.S_ISLNK(entry.st_mode) and entry.st_uid == os.geteuid()
+                    and os.readlink(marker_name, dir_fd=descriptor) == marker_value,
+                    "source retention marker does not bind this identity and both paths")
+            os.fsync(descriptor)
+        source = metadata(source_name)
+        destination = metadata(retained_name)
+        if source is None:
+            if destination is None:
+                require(allow_absent == "1", "materialized source and retained snapshot are both missing")
+                print("RCH_SOURCE_ABSENT_BEFORE_MATERIALIZATION")
+                return
+            descriptor = directory(retained_name)
+            try:
+                marker(descriptor, False)
+                os.fsync(parent)
+                require(metadata(source_name) is None, "source appeared during retention reconciliation")
+                current = metadata(retained_name)
+                held = os.fstat(descriptor)
+                require(current is not None and (current.st_dev, current.st_ino) == (held.st_dev, held.st_ino),
+                        "retained source changed during reconciliation")
+            finally:
+                os.close(descriptor)
+            print("RCH_SOURCE_RETAINED")
+            return
+        require(stat.S_ISDIR(source.st_mode), "source root is not a real directory")
+        require(destination is None, "retained destination already exists while source is present")
+        descriptor = directory(source_name)
+        try:
+            held = os.fstat(descriptor)
+            require((source.st_dev, source.st_ino) == (held.st_dev, held.st_ino),
+                    "source changed before retention")
+            marker(descriptor, True)
+            current = metadata(source_name)
+            require(current is not None and (current.st_dev, current.st_ino) == (held.st_dev, held.st_ino),
+                    "source changed before no-replace rename")
+            if rename(parent, os.fsencode(source_name), parent, os.fsencode(retained_name), 1) != 0:
+                code = ctypes.get_errno()
+                raise OSError(code, "source no-replace rename refused: " + os.strerror(code))
+            os.fsync(parent)
+            current = metadata(retained_name)
+            require(metadata(source_name) is None and current is not None
+                    and (current.st_dev, current.st_ino) == (held.st_dev, held.st_ino),
+                    "source retention did not preserve the exact directory")
+            marker(descriptor, False)
+        finally:
+            os.close(descriptor)
+        print("RCH_SOURCE_RETAINED")
+    finally:
+        os.close(parent)
+
+try:
+    run()
+except (AttributeError, OSError, RuntimeError, TypeError, ValueError) as error:
+    sys.stderr.write("RCH_SOURCE_RETENTION_REFUSED: " + str(error) + "\n")
+    raise SystemExit(74)
 "#
     }
 
@@ -8583,6 +9234,225 @@ mod tests {
         assert!(free.success(), "a leftover follower still holds the lock");
     }
 
+    /// A successful workload is not a completed job until its receipt is
+    /// durable. Publication failure must stop the stream followers, preserve
+    /// the logs and start claim, and leave recovery able to prove it is lost.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn durable_execution_reaps_followers_if_receipt_cannot_be_published() {
+        let directory = tempfile::tempdir().unwrap();
+        let receipt = directory.path().join("recovery-9-id");
+        let receipt = receipt.to_str().unwrap();
+        let lock = directory.path().join("activity.lock");
+        let invocations = directory.path().join("invocations");
+        // An actual filesystem error at the publication boundary, after the
+        // workload ran; no completion is injected by the test.
+        std::fs::create_dir(format!("{receipt}.pending")).unwrap();
+        let pipeline = TransferPipeline::new(
+            PathBuf::from("/home/user/project"),
+            "myproject".to_string(),
+            "abc123".to_string(),
+            TransferConfig::default(),
+        )
+        .with_recovery_completion(receipt.to_owned(), "id".to_string());
+        let command = pipeline.durable_execution_command(format!(
+            "printf 'once\\n' >> {}; printf 'compiled\\n'; printf 'diagnostic\\n' >&2",
+            escape(Cow::from(invocations.to_str().unwrap()))
+        ));
+        let run = || {
+            // Bound the fixture's entire process group if the receipt loop
+            // regresses, so a failing test cannot leave idle followers behind.
+            std::process::Command::new("timeout")
+                .args(["--kill-after=2s", "10s", "flock", "-x"])
+                .arg(&lock)
+                .args(["sh", "-c", &command])
+                .output()
+                .unwrap()
+        };
+        let output = run();
+        assert_eq!(output.status.code(), Some(255), "{output:?}");
+        assert!(
+            std::fs::read_to_string(format!("{receipt}.stderr"))
+                .unwrap()
+                .contains("remote execution ended without a durable completion receipt"),
+            "{output:?}"
+        );
+        assert!(!Path::new(receipt).exists());
+        assert_eq!(
+            std::fs::read_to_string(format!("{receipt}.stdout")).unwrap(),
+            "compiled\n"
+        );
+        assert!(
+            std::fs::read_to_string(format!("{receipt}.stderr"))
+                .unwrap()
+                .contains("diagnostic\n")
+        );
+        assert!(Path::new(&format!("{receipt}.started")).is_dir());
+        assert!(
+            std::process::Command::new("flock")
+                .args(["-n", "-x"])
+                .arg(&lock)
+                .arg("true")
+                .status()
+                .unwrap()
+                .success(),
+            "failed publication left an activity holder alive"
+        );
+        // Reconnecting cannot launch the same command a second time just
+        // because no receipt was published.
+        assert!(!run().status.success());
+        assert_eq!(std::fs::read_to_string(invocations).unwrap(), "once\n");
+    }
+
+    /// Receipt publication may fail while a background workload descendant
+    /// remains alive. Only that descendant's exit can make recovery safe.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn durable_execution_missing_receipt_preserves_descendant_fencing() {
+        let directory = tempfile::tempdir().unwrap();
+        let receipt = directory.path().join("recovery-9-id");
+        let receipt = receipt.to_str().unwrap();
+        let lock = directory.path().join("activity.lock");
+        let release = directory.path().join("release-workload");
+        let finished = directory.path().join("workload-finished");
+        std::fs::create_dir(format!("{receipt}.pending")).unwrap();
+        let pipeline = TransferPipeline::new(
+            PathBuf::from("/home/user/project"),
+            "myproject".to_string(),
+            "abc123".to_string(),
+            TransferConfig::default(),
+        )
+        .with_recovery_completion(receipt.to_owned(), "id".to_string());
+        // The supervisor exits naturally on the real receipt-write error.
+        // No test guesses or signals a parent process.
+        let descendant = format!(
+            "i=0; while [ ! -f {} ] && [ \"$i\" -lt 300 ]; do \
+             sleep 0.1; i=$((i + 1)); done; printf 'finished\\n' > {}",
+            escape(Cow::from(release.to_str().unwrap())),
+            escape(Cow::from(finished.to_str().unwrap()))
+        );
+        let command = pipeline.durable_execution_command(format!(
+            "sh -c {} </dev/null >/dev/null 2>&1 &",
+            escape(Cow::from(descendant))
+        ));
+        let output = std::process::Command::new("timeout")
+            .args(["--kill-after=2s", "10s", "flock", "-x"])
+            .arg(&lock)
+            .args(["sh", "-c", &command])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(255), "{output:?}");
+        assert!(!Path::new(receipt).exists());
+        assert!(
+            !finished.exists(),
+            "workload ended before fencing was tested"
+        );
+        let lock_is_free = || {
+            std::process::Command::new("flock")
+                .args(["-n", "-x"])
+                .arg(&lock)
+                .arg("true")
+                .status()
+                .unwrap()
+                .success()
+        };
+        assert!(
+            !lock_is_free(),
+            "receipt failure released a surviving workload's activity lock"
+        );
+        std::fs::write(release, b"release\n").unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !lock_is_free() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "idle followers retained the activity lock after the workload exited"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(std::fs::read_to_string(finished).unwrap(), "finished\n");
+        assert!(!Path::new(receipt).exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn durable_execution_missing_receipt_does_not_block_on_unread_stderr() {
+        use std::io::{ErrorKind, Write};
+        use std::os::fd::OwnedFd;
+        use std::os::unix::net::UnixStream;
+        use std::process::Stdio;
+
+        let directory = tempfile::tempdir().unwrap();
+        let receipt = directory.path().join("recovery-9-id");
+        let receipt = receipt.to_str().unwrap();
+        let lock = directory.path().join("activity.lock");
+        std::fs::create_dir(format!("{receipt}.pending")).unwrap();
+        let pipeline = TransferPipeline::new(
+            PathBuf::from("/home/user/project"),
+            "myproject".to_string(),
+            "abc123".to_string(),
+            TransferConfig::default(),
+        )
+        .with_recovery_completion(receipt.to_owned(), "id".to_string());
+        let command = pipeline.durable_execution_command(
+            "printf 'compiled\\n'; printf 'diagnostic\\n' >&2".to_string(),
+        );
+
+        // Fill a real transport before starting the wrapper; its peer remains
+        // open but never drains. A direct stderr diagnostic must block here.
+        let (mut writer, _unread_stderr) = UnixStream::pair().unwrap();
+        writer.set_nonblocking(true).unwrap();
+        let mut full = false;
+        for _ in 0..16_384 {
+            match writer.write(b"x") {
+                Ok(1) => {}
+                Ok(_) => panic!("stderr transport closed during prefill"),
+                Err(error) if error.kind() == ErrorKind::Interrupted => {}
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                    full = true;
+                    break;
+                }
+                Err(error) => panic!("prefill stderr transport: {error}"),
+            }
+        }
+        assert!(full, "stderr transport did not reach backpressure");
+        writer.set_nonblocking(false).unwrap();
+        let status = std::process::Command::new("timeout")
+            .args(["--kill-after=2s", "10s", "flock", "-x"])
+            .arg(&lock)
+            .args(["sh", "-c", &command])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(OwnedFd::from(writer)))
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(255), "{status:?}");
+        assert!(!Path::new(receipt).exists());
+        assert!(Path::new(&format!("{receipt}.started")).is_dir());
+        assert!(
+            std::fs::read_to_string(format!("{receipt}.stderr"))
+                .unwrap()
+                .contains("remote execution ended without a durable completion receipt")
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if std::process::Command::new("flock")
+                .args(["-n", "-x"])
+                .arg(&lock)
+                .arg("true")
+                .status()
+                .unwrap()
+                .success()
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "missing receipt left activity holders after stderr backpressure"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     #[test]
     fn remote_path_probe_reports_absence_only_for_missing_paths() {
         let dir = tempfile::tempdir().unwrap();
@@ -10461,6 +11331,59 @@ Number of files transferred: 42
         assert!(args.iter().any(|arg| arg == "--compress-level=7"));
     }
 
+    /// Points this test thread's guard at `path` as the live-checkout host
+    /// marker (a missing path means an undeclared host); restored on drop.
+    struct LiveCheckoutHostMarker(Option<String>);
+
+    impl LiveCheckoutHostMarker {
+        fn at(path: &Path) -> Self {
+            Self(LIVE_CHECKOUT_HOST_MARKER_FOR_TEST.with(|marker| {
+                marker
+                    .borrow_mut()
+                    .replace(path.to_str().unwrap().to_owned())
+            }))
+        }
+
+        fn declared_in(directory: &Path) -> Self {
+            let path = directory.join("live-checkouts");
+            std::fs::write(&path, b"").unwrap();
+            Self::at(&path)
+        }
+    }
+
+    impl Drop for LiveCheckoutHostMarker {
+        fn drop(&mut self) {
+            LIVE_CHECKOUT_HOST_MARKER_FOR_TEST.with(|marker| *marker.borrow_mut() = self.0.take());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_checkout_guard_admits_convergence_checkouts_on_undeclared_hosts() {
+        // bd-tali9: a pure worker keeps rch's repo-convergence checkouts at the
+        // canonical roots, and multi-repo closures must still sync into them.
+        let directory = tempfile::tempdir().unwrap();
+        let _host = LiveCheckoutHostMarker::at(&directory.path().join("undeclared"));
+        let checkout = directory.path().join("converged");
+        std::fs::create_dir_all(checkout.join(".git")).unwrap();
+        std::fs::create_dir_all(checkout.join("vendor/nested/.git")).unwrap();
+        let run = |destination: &str| {
+            std::process::Command::new("sh")
+                .args(["-c", &live_checkout_sync_guard(destination)])
+                .output()
+                .unwrap()
+        };
+        for destination in [checkout.clone(), checkout.join("member")] {
+            let output = run(destination.to_str().unwrap());
+            assert!(output.status.success(), "{destination:?}: {output:?}");
+        }
+        // Path refusals do not depend on the host declaration.
+        for destination in ["/", "/data/projects/../projects/x", "relative/root"] {
+            let output = run(destination);
+            assert_eq!(output.status.code(), Some(73), "{destination}: {output:?}");
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn live_checkout_guard_refuses_root_and_dot_components_before_setup() {
@@ -10494,7 +11417,11 @@ Number of files transferred: 42
                 .args(["-c", &command])
                 .output()
                 .unwrap();
-            assert_eq!(output.status.code(), Some(73), "{destination:?}: {output:?}");
+            assert_eq!(
+                output.status.code(),
+                Some(73),
+                "{destination:?}: {output:?}"
+            );
             let diagnostics = String::from_utf8_lossy(&output.stderr);
             assert!(diagnostics.contains("RCH_SYNC_LIVE_CHECKOUT_REFUSED"));
             assert!(diagnostics.contains(reason), "{destination:?}: {output:?}");
@@ -10511,6 +11438,7 @@ Number of files transferred: 42
         use std::os::unix::fs::symlink;
 
         let retained = tempfile::tempdir().unwrap().keep();
+        let _host = LiveCheckoutHostMarker::declared_in(&retained);
         let mirror = retained.join("mirror..cache's α");
         std::fs::create_dir(&mirror).unwrap();
         let original = mirror.join("existing.rs");
@@ -10549,6 +11477,7 @@ Number of files transferred: 42
     fn live_checkout_guard_preserves_edits_and_allows_isolated_rsync() {
         use std::os::unix::fs::symlink;
         let directory = tempfile::tempdir().unwrap();
+        let _host = LiveCheckoutHostMarker::declared_in(directory.path());
         let source = directory.path().join("incoming");
         let checkout = directory.path().join("worker's live checkout");
         std::fs::create_dir_all(&source).unwrap();
@@ -10646,6 +11575,7 @@ Number of files transferred: 42
     #[test]
     fn live_checkout_guard_does_not_block_read_only_result_retrieval() {
         let directory = tempfile::tempdir().unwrap();
+        let _host = LiveCheckoutHostMarker::declared_in(directory.path());
         let result = directory.path().join("test-result-with-a-checkout");
         std::fs::create_dir_all(result.join(".git")).unwrap();
         let mut pipeline = TransferPipeline::new(
@@ -11679,6 +12609,66 @@ Number of files transferred: 42
     // =========================================================================
 
     #[test]
+    fn owned_source_uploads_keep_checksums_without_deletion_or_cache_pruning() {
+        let _guard = test_guard!();
+        let worker = flavour_test_worker();
+        let pipeline = flavour_test_pipeline(RsyncFlavor::Unknown, 0)
+            .with_owned_source_materialization()
+            .with_sync_delete(true)
+            .with_sync_checksum(false);
+        let remote = pipeline.remote_path();
+        let destination = pipeline.rsync_remote_spec(&worker, &remote);
+        let escaped = escape(Cow::from(remote.as_str()));
+        for command in [
+            pipeline.build_sync_command(&worker, &destination, &escaped, &[]),
+            pipeline.build_sync_streaming_command(&worker, &destination, &escaped, &[]),
+        ] {
+            let args = command_args(&command);
+            assert!(args.contains(&"--checksum".to_owned()));
+            assert!(!args.iter().any(|arg| arg.starts_with("--delete")));
+            let receiver = &args
+                .windows(2)
+                .find(|pair| pair[0] == "--rsync-path")
+                .unwrap()[1];
+            assert!(!receiver.contains("rm -rf"), "{receiver}");
+            assert!(!receiver.contains("-mmin"), "{receiver}");
+            assert!(
+                receiver.contains("RCH_SYNC_LIVE_CHECKOUT_REFUSED"),
+                "{receiver}"
+            );
+        }
+    }
+
+    #[test]
+    fn owned_source_barriers_are_read_only_and_detect_surplus_after_retained_upload() {
+        let _guard = test_guard!();
+        let worker = flavour_test_worker();
+        let pipeline =
+            flavour_test_pipeline(RsyncFlavor::Unknown, 0).with_owned_source_materialization();
+        for managed_times in [false, true] {
+            let args = command_args(&pipeline.build_source_content_rsync_barrier_command(
+                &worker,
+                &[],
+                Some(managed_times),
+            ));
+            for required in ["-azn", "--checksum", "--itemize-changes", "--delete"] {
+                assert!(args.iter().any(|arg| arg == required), "{args:?}");
+            }
+            assert_eq!(args.iter().any(|arg| arg == "--no-times"), managed_times);
+            let receiver = &args
+                .windows(2)
+                .find(|pair| pair[0] == "--rsync-path")
+                .unwrap()[1];
+            assert!(!receiver.contains("mkdir"), "{receiver}");
+            assert!(!receiver.contains("rm -rf"), "{receiver}");
+            assert!(
+                receiver.contains("RCH_SYNC_LIVE_CHECKOUT_REFUSED"),
+                "{receiver}"
+            );
+        }
+    }
+
+    #[test]
     fn source_content_barrier_changes_only_ssh_log_verbosity() {
         let _guard = test_guard!();
         let worker = flavour_test_worker();
@@ -11689,7 +12679,7 @@ Number of files transferred: 42
         let upload =
             command_args(&pipeline.build_sync_command(&worker, &destination, &escaped, &[]));
         let barrier =
-            command_args(&pipeline.build_source_content_rsync_barrier_command(&worker, &[]));
+            command_args(&pipeline.build_source_content_rsync_barrier_command(&worker, &[], None));
         let ssh = |args: &[String]| {
             args.windows(2)
                 .find(|pair| pair[0] == "-e")
@@ -11737,7 +12727,7 @@ Number of files transferred: 42
                     pipeline.build_sync_command(&worker, &destination, &escaped, &[]),
                     pipeline.build_sync_streaming_command(&worker, &destination, &escaped, &[]),
                     pipeline.build_estimate_command(&worker),
-                    pipeline.build_source_content_rsync_barrier_command(&worker, &[]),
+                    pipeline.build_source_content_rsync_barrier_command(&worker, &[], None),
                     pipeline.build_retrieve_command(&worker, &remote, &patterns),
                     pipeline.build_retrieve_streaming_command(&worker, &remote, &patterns),
                 ];
@@ -13107,6 +14097,549 @@ Number of files transferred: 42
                     && message["target"]["name"] == "external_fixture"
                     && message["fresh"] == true
             })
+    }
+
+    #[test]
+    fn retained_source_command_requires_exact_sibling_paths_and_identity() {
+        let identity = "1234567890abcdef1234567890abcdef";
+        let retained = "/tmp/rch/pair-retained";
+        for root in [
+            "/",
+            "relative",
+            "/tmp/rch/pair/",
+            "/tmp/rch/./pair",
+            "/tmp/rch/../pair",
+            "/tmp//rch/pair",
+            "/tmp/rch/pair\n",
+            "/tmp/rch/pair\\alias",
+            "/tmp/peer/pair",
+            retained,
+        ] {
+            assert!(
+                TransferPipeline::remote_tree_retention_command(root, retained, identity, false)
+                    .is_err(),
+                "invalid retention source admitted: {root:?}"
+            );
+        }
+        for invalid in [
+            "",
+            "short",
+            "1234567890abcdef1234567890abcdeg",
+            "1234567890ABCDEF1234567890ABCDEF",
+        ] {
+            assert!(
+                TransferPipeline::remote_tree_retention_command(
+                    "/tmp/rch/pair",
+                    retained,
+                    invalid,
+                    false,
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn native_retained_source(
+        source: &Path,
+        retained: &Path,
+        identity: &str,
+        allow_absent: bool,
+    ) -> std::process::Output {
+        let command = TransferPipeline::remote_tree_retention_command(
+            source.to_str().unwrap(),
+            retained.to_str().unwrap(),
+            identity,
+            allow_absent,
+        )
+        .unwrap();
+        std::process::Command::new("/bin/sh")
+            .args(["-c", &command])
+            .output()
+            .expect("execute actual retained-source command")
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn source_retention_preserves_real_files_links_and_retry_identity() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+        let fixture = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
+        let source = fixture.join("source with ' quotes and α");
+        let retained = fixture.join("retained with ' quotes and α");
+        let identity = "1234567890abcdef1234567890abcdef";
+        std::fs::create_dir(&source).unwrap();
+        std::fs::create_dir(source.join("nested")).unwrap();
+        let file = source.join("nested/input");
+        std::fs::write(&file, b"\0retained source\xff\n").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o751)).unwrap();
+        std::fs::hard_link(&file, source.join("hardlink")).unwrap();
+        symlink("nested/input", source.join("link")).unwrap();
+        symlink("../missing", source.join("dangling")).unwrap();
+        let before = std::fs::metadata(&file).unwrap();
+        let source_inode = std::fs::metadata(&source).unwrap().ino();
+        for _ in 0..2 {
+            let output = native_retained_source(&source, &retained, identity, false);
+            assert!(output.status.success(), "{output:?}");
+            assert!(output.stderr.is_empty(), "{output:?}");
+            assert_eq!(output.stdout, b"RCH_SOURCE_RETAINED\n");
+            assert!(!source.exists());
+            assert_eq!(std::fs::metadata(&retained).unwrap().ino(), source_inode);
+            assert_eq!(
+                std::fs::read(retained.join("nested/input")).unwrap(),
+                b"\0retained source\xff\n"
+            );
+            let after = std::fs::metadata(retained.join("nested/input")).unwrap();
+            assert_eq!(
+                (
+                    after.dev(),
+                    after.ino(),
+                    after.nlink(),
+                    after.mode(),
+                    after.mtime(),
+                    after.mtime_nsec()
+                ),
+                (
+                    before.dev(),
+                    before.ino(),
+                    before.nlink(),
+                    before.mode(),
+                    before.mtime(),
+                    before.mtime_nsec()
+                ),
+            );
+            assert_eq!(
+                std::fs::metadata(retained.join("hardlink")).unwrap().ino(),
+                before.ino()
+            );
+            assert_eq!(
+                std::fs::read_link(retained.join("link")).unwrap(),
+                Path::new("nested/input")
+            );
+            assert_eq!(
+                std::fs::read_link(retained.join("dangling")).unwrap(),
+                Path::new("../missing")
+            );
+        }
+        let foreign_identity = "abcdef1234567890abcdef1234567890";
+        let output = native_retained_source(&source, &retained, foreign_identity, false);
+        assert!(!output.status.success(), "{output:?}");
+        assert_eq!(std::fs::metadata(&retained).unwrap().ino(), source_inode);
+
+        // Restore the same owned directory to the pre-rename state, with its
+        // already-durable marker, to exercise interruption reconciliation.
+        std::fs::rename(&retained, &source).unwrap();
+        let output = native_retained_source(&source, &retained, identity, false);
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(output.stdout, b"RCH_SOURCE_RETAINED\n");
+        assert_eq!(std::fs::metadata(&retained).unwrap().ino(), source_inode);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn source_retention_never_replaces_foreign_destinations_or_markers() {
+        use std::os::unix::fs::symlink;
+        let fixture = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
+        let identity = "1234567890abcdef1234567890abcdef";
+        for (index, foreign_file) in [false, true].into_iter().enumerate() {
+            let source = fixture.join(format!("source-{index}"));
+            let retained = fixture.join(format!("retained-{index}"));
+            std::fs::create_dir(&source).unwrap();
+            std::fs::write(source.join("input"), b"original source").unwrap();
+            std::fs::create_dir(&retained).unwrap();
+            if foreign_file {
+                std::fs::write(retained.join("foreign"), b"retained peer").unwrap();
+            }
+            let output = native_retained_source(&source, &retained, identity, false);
+            assert!(!output.status.success(), "{output:?}");
+            assert_eq!(
+                std::fs::read(source.join("input")).unwrap(),
+                b"original source"
+            );
+            assert!(!source.join(".rch-retention-v1").is_symlink());
+            assert_eq!(
+                std::fs::read_dir(&retained).unwrap().count(),
+                usize::from(foreign_file)
+            );
+            if foreign_file {
+                assert_eq!(
+                    std::fs::read(retained.join("foreign")).unwrap(),
+                    b"retained peer"
+                );
+            }
+        }
+        let source = fixture.join("marker-conflict");
+        let retained = fixture.join("marker-retained");
+        std::fs::create_dir(&source).unwrap();
+        symlink("foreign identity marker", source.join(".rch-retention-v1")).unwrap();
+        let output = native_retained_source(&source, &retained, identity, false);
+        assert!(!output.status.success(), "{output:?}");
+        assert!(!retained.exists());
+        assert_eq!(
+            std::fs::read_link(source.join(".rch-retention-v1")).unwrap(),
+            Path::new("foreign identity marker")
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn source_retention_distinguishes_unmaterialized_cancellation_and_missing_source() {
+        let fixture = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
+        let identity = "1234567890abcdef1234567890abcdef";
+        for parent in [fixture.clone(), fixture.join("uncreated-parent")] {
+            let source = parent.join("source");
+            let retained = parent.join("retained");
+            let output = native_retained_source(&source, &retained, identity, false);
+            assert!(!output.status.success(), "{output:?}");
+            let output = native_retained_source(&source, &retained, identity, true);
+            assert!(output.status.success(), "{output:?}");
+            assert_eq!(output.stdout, b"RCH_SOURCE_ABSENT_BEFORE_MATERIALIZATION\n");
+            assert!(output.stderr.is_empty(), "{output:?}");
+            assert!(!source.exists() && !retained.exists());
+        }
+        assert!(!fixture.join("uncreated-parent").exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    fn native_owned_source_freshness(
+        pipeline: &TransferPipeline,
+        identity: &str,
+        source: &Path,
+        control: &Path,
+        attempt: &str,
+        mark_verified: bool,
+    ) -> std::process::Output {
+        let command = pipeline
+            .owned_source_freshness_command(
+                identity,
+                source.to_str().unwrap(),
+                control.to_str().unwrap(),
+                attempt,
+                mark_verified,
+            )
+            .unwrap();
+        std::process::Command::new("/bin/sh")
+            .args(["-c", &command])
+            .output()
+            .unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn owned_closure_freshness_preserves_unchanged_inputs_and_invalidates_rollback() {
+        use std::os::unix::fs::MetadataExt;
+        let fixture = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
+        let source = fixture.join("owned source with ' quotes");
+        let control = PathBuf::from(format!("{}.freshness", source.display()));
+        let pool = fixture.join("stable target");
+        std::fs::create_dir(&pool).unwrap();
+        let pipeline = TransferPipeline::new(
+            fixture.clone(),
+            "owned".into(),
+            "freshness".into(),
+            TransferConfig::default(),
+        )
+        .with_remote_path_override(source.to_str().unwrap())
+        .with_remote_cargo_target_dir_override(pool.to_str().unwrap());
+        let mut previous_input_time = None;
+        let mut metadata_time = None;
+        for (run, contents) in [
+            b"original".as_slice(),
+            b"original",
+            b"changed!",
+            b"original",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let identity = if contents == b"original" {
+                "1".repeat(64)
+            } else {
+                "2".repeat(64)
+            };
+            let attempt = format!("{:032x}", run + 1);
+            let workspace = source.join("projects/foreign");
+            let package = workspace.join("crates/member");
+            std::fs::create_dir_all(package.join("src")).unwrap();
+            let metadata = workspace.join("Cargo.toml");
+            let input = package.join("src/lib.rs");
+            std::fs::write(&metadata, b"[workspace]\n").unwrap();
+            std::fs::write(&input, contents).unwrap();
+            let artifact = pool.join("prior-artifact");
+            std::fs::write(&artifact, format!("artifact before run {run}")).unwrap();
+            let artifact_time = std::fs::metadata(&artifact).unwrap().modified().unwrap();
+            let output = native_owned_source_freshness(
+                &pipeline, &identity, &source, &control, &attempt, false,
+            );
+            assert!(output.status.success(), "{output:?}");
+            assert!(output.stderr.is_empty(), "{output:?}");
+            let input_time = std::fs::metadata(&input).unwrap().modified().unwrap();
+            if run == 1 {
+                assert_eq!(Some(input_time), previous_input_time);
+            } else {
+                assert!(input_time > artifact_time);
+            }
+            previous_input_time = Some(input_time);
+            let current_metadata = std::fs::metadata(&metadata).unwrap().modified().unwrap();
+            if let Some(expected) = metadata_time {
+                assert_eq!(current_metadata, expected);
+            } else {
+                metadata_time = Some(current_metadata);
+            }
+            assert_eq!(std::fs::read(&input).unwrap(), contents);
+            assert!(control.join("epoch-v1").is_file());
+            assert!(control.join("epoch-v1.files-v2").is_file());
+            assert_eq!(std::fs::metadata(&control).unwrap().mode() & 0o077, 0);
+            let proof = control.join(format!("verified-{attempt}.json"));
+            assert!(!proof.exists());
+            let output = native_owned_source_freshness(
+                &pipeline, &identity, &source, &control, &attempt, true,
+            );
+            assert!(output.status.success(), "{output:?}");
+            assert_eq!(output.stdout, b"RCH_SOURCE_FRESHNESS_VERIFIED\n");
+            let before = std::fs::metadata(&proof).unwrap();
+            let expected = std::fs::read(&proof).unwrap();
+            let output = native_owned_source_freshness(
+                &pipeline, &identity, &source, &control, &attempt, true,
+            );
+            assert!(output.status.success(), "{output:?}");
+            assert_eq!(std::fs::metadata(&proof).unwrap().ino(), before.ino());
+            assert_eq!(std::fs::read(&proof).unwrap(), expected);
+            let retained = fixture.join(format!("retained-{run}"));
+            let output = native_retained_source(
+                &source,
+                &retained,
+                "1234567890abcdef1234567890abcdef",
+                false,
+            );
+            assert!(output.status.success(), "{output:?}");
+            assert_eq!(
+                std::fs::read(retained.join("projects/foreign/crates/member/src/lib.rs")).unwrap(),
+                contents
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unverified_owned_attempts_force_freshness_beyond_cached_artifacts() {
+        let fixture = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
+        let identity = "1".repeat(64);
+        let first = "00000000000000000000000000000001";
+        let unfinished = "00000000000000000000000000000002";
+        let next = "00000000000000000000000000000003";
+        for boundary in [
+            "unverified-build",
+            "before-ledger",
+            "malformed-attempt",
+            "changed-ledger",
+        ] {
+            let case = fixture.join(boundary);
+            let source = case.join("source");
+            let control = case.join("source.freshness");
+            let pool = case.join("pool");
+            std::fs::create_dir_all(&source).unwrap();
+            std::fs::create_dir(&pool).unwrap();
+            std::fs::write(source.join("input"), b"A").unwrap();
+            let pipeline = TransferPipeline::new(
+                case.clone(),
+                "owned".into(),
+                "qualified".into(),
+                TransferConfig::default(),
+            )
+            .with_remote_path_override(source.to_str().unwrap())
+            .with_remote_cargo_target_dir_override(pool.to_str().unwrap());
+            for mark in [false, true] {
+                let output = native_owned_source_freshness(
+                    &pipeline, &identity, &source, &control, first, mark,
+                );
+                assert!(output.status.success(), "{boundary}: {output:?}");
+            }
+            let original_time = std::fs::metadata(source.join("input"))
+                .unwrap()
+                .modified()
+                .unwrap();
+            let original_proof =
+                std::fs::read(control.join(format!("verified-{first}.json"))).unwrap();
+            let output =
+                native_retained_source(&source, &case.join("first-retained"), first, false);
+            assert!(output.status.success(), "{boundary}: {output:?}");
+            std::fs::create_dir(&source).unwrap();
+            std::fs::write(source.join("input"), b"A").unwrap();
+            match boundary {
+                "unverified-build" => {
+                    let output = native_owned_source_freshness(
+                        &pipeline, &identity, &source, &control, unfinished, false,
+                    );
+                    assert!(output.status.success(), "{output:?}");
+                    assert_eq!(
+                        std::fs::metadata(source.join("input"))
+                            .unwrap()
+                            .modified()
+                            .unwrap(),
+                        original_time,
+                    );
+                    // Cargo may have consumed B while the receipt still names
+                    // A. No successful post-execution proof follows this edit.
+                    std::fs::write(source.join("input"), b"B").unwrap();
+                }
+                "before-ledger" => {
+                    // Run the exact durable preparation prefix but stop before
+                    // the shared ledger executes, as an interrupted SSH can.
+                    let output = std::process::Command::new("python3")
+                        .args([
+                            "-I",
+                            "-c",
+                            TransferPipeline::owned_source_refresh_preparation_script(),
+                        ])
+                        .arg(&source)
+                        .arg(&pool)
+                        .arg(control.join("epoch-v1"))
+                        .arg(&identity)
+                        .arg(unfinished)
+                        .arg("refresh")
+                        .output()
+                        .unwrap();
+                    assert!(output.status.success(), "{output:?}");
+                }
+                "malformed-attempt" => {
+                    std::fs::write(control.join("current-attempt-v1"), b"incomplete attempt")
+                        .unwrap();
+                }
+                "changed-ledger" => {
+                    // Still-valid ledger JSON must not inherit qualification
+                    // when its exact bytes differ from the verified marker.
+                    let path = control.join("epoch-v1.files-v2");
+                    let mut data = std::fs::read(&path).unwrap();
+                    data.push(b'\n');
+                    std::fs::write(path, data).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            std::fs::write(pool.join("artifact"), b"unverified cached output").unwrap();
+            let artifact_time = std::fs::metadata(pool.join("artifact"))
+                .unwrap()
+                .modified()
+                .unwrap();
+            let output = native_retained_source(
+                &source,
+                &case.join("unfinished-retained"),
+                unfinished,
+                false,
+            );
+            assert!(output.status.success(), "{boundary}: {output:?}");
+            std::fs::create_dir(&source).unwrap();
+            std::fs::write(source.join("input"), b"A").unwrap();
+            let output =
+                native_owned_source_freshness(&pipeline, &identity, &source, &control, next, false);
+            assert!(output.status.success(), "{boundary}: {output:?}");
+            let input_time = std::fs::metadata(source.join("input"))
+                .unwrap()
+                .modified()
+                .unwrap();
+            assert!(input_time > artifact_time, "{boundary}");
+            assert!(input_time > original_time, "{boundary}");
+            assert!(!control.join(format!("verified-{unfinished}.json")).exists());
+            assert_eq!(
+                std::fs::read(control.join(format!("verified-{first}.json"))).unwrap(),
+                original_proof,
+            );
+            assert_eq!(
+                std::fs::read(pool.join("artifact")).unwrap(),
+                b"unverified cached output",
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn owned_freshness_qualification_binds_attempt_and_never_replaces_evidence() {
+        let fixture = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
+        let source = fixture.join("source");
+        let control = fixture.join("source.freshness");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join("input"), b"selected source").unwrap();
+        let pipeline = TransferPipeline::new(
+            fixture.clone(),
+            "owned".into(),
+            "qualification".into(),
+            TransferConfig::default(),
+        )
+        .with_remote_path_override(source.to_str().unwrap())
+        .with_remote_cargo_target_dir_override(fixture.join("pool").to_str().unwrap());
+        let identity = "1".repeat(64);
+        let foreign_identity = "2".repeat(64);
+        let attempt = "00000000000000000000000000000001";
+        let foreign_attempt = "00000000000000000000000000000002";
+        let output =
+            native_owned_source_freshness(&pipeline, &identity, &source, &control, attempt, false);
+        assert!(output.status.success(), "{output:?}");
+        for (content, owner) in [(&foreign_identity, attempt), (&identity, foreign_attempt)] {
+            let output =
+                native_owned_source_freshness(&pipeline, content, &source, &control, owner, true);
+            assert!(!output.status.success(), "{output:?}");
+            assert!(!control.join(format!("verified-{owner}.json")).exists());
+        }
+        let ledger = control.join("epoch-v1.files-v2");
+        let original_ledger = std::fs::read(&ledger).unwrap();
+        let mut document: serde_json::Value = serde_json::from_slice(&original_ledger).unwrap();
+        document["payload"]["identity"] = serde_json::Value::String(foreign_identity);
+        std::fs::write(&ledger, serde_json::to_vec(&document).unwrap()).unwrap();
+        let output =
+            native_owned_source_freshness(&pipeline, &identity, &source, &control, attempt, true);
+        assert!(!output.status.success(), "{output:?}");
+        std::fs::write(&ledger, original_ledger).unwrap();
+        let proof = control.join(format!("verified-{attempt}.json"));
+        std::fs::write(&proof, b"foreign retained evidence").unwrap();
+        let output =
+            native_owned_source_freshness(&pipeline, &identity, &source, &control, attempt, true);
+        assert!(!output.status.success(), "{output:?}");
+        assert_eq!(std::fs::read(&proof).unwrap(), b"foreign retained evidence");
+        assert_eq!(
+            std::fs::read(source.join("input")).unwrap(),
+            b"selected source",
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn owned_closure_freshness_refuses_a_symlinked_control_authority() {
+        use std::os::unix::fs::symlink;
+        let fixture = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
+        let source = fixture.join("source");
+        let control = fixture.join("source.freshness");
+        let foreign = fixture.join("foreign");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::create_dir(&foreign).unwrap();
+        std::fs::write(source.join("input"), b"owned source").unwrap();
+        std::fs::write(foreign.join("sentinel"), b"foreign original").unwrap();
+        symlink(&foreign, &control).unwrap();
+        let pipeline = TransferPipeline::new(
+            fixture.clone(),
+            "owned".into(),
+            "freshness".into(),
+            TransferConfig::default(),
+        )
+        .with_remote_path_override(source.to_str().unwrap())
+        .with_remote_cargo_target_dir_override(fixture.join("pool").to_str().unwrap());
+        let output = native_owned_source_freshness(
+            &pipeline,
+            &"1234567890abcdef".repeat(4),
+            &source,
+            &control,
+            "1234567890abcdef1234567890abcdef",
+            false,
+        );
+        assert!(!output.status.success(), "{output:?}");
+        assert_eq!(
+            std::fs::read(source.join("input")).unwrap(),
+            b"owned source"
+        );
+        assert_eq!(
+            std::fs::read(foreign.join("sentinel")).unwrap(),
+            b"foreign original"
+        );
+        assert_eq!(std::fs::read_dir(&foreign).unwrap().count(), 1);
+        assert_eq!(std::fs::read_link(&control).unwrap(), foreign);
     }
 
     #[cfg(target_os = "linux")]

@@ -702,7 +702,12 @@ mod tests {
             let mut compile = Command::new(&cargo);
             compile
                 .current_dir(&source)
-                .args(shell_words::split(command_text).unwrap().into_iter().skip(1))
+                .args(
+                    shell_words::split(command_text)
+                        .unwrap()
+                        .into_iter()
+                        .skip(1),
+                )
                 .arg("--message-format=json")
                 .env("CARGO_HOME", root.path().join("cargo-home"))
                 .env("CARGO_TARGET_DIR", &remote_target)
@@ -767,7 +772,12 @@ mod tests {
             let mut binaries = Command::new(&cargo);
             binaries
                 .current_dir(&source)
-                .args(shell_words::split(&instrumented).unwrap().into_iter().skip(1))
+                .args(
+                    shell_words::split(&instrumented)
+                        .unwrap()
+                        .into_iter()
+                        .skip(1),
+                )
                 .stdin(Stdio::null())
                 .kill_on_drop(true);
             for (key, value) in compile.as_std().get_envs() {

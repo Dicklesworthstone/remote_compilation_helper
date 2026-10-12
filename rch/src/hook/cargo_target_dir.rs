@@ -757,6 +757,104 @@ pub(super) fn managed_clean_overlay_cargo_build_dir(
     Ok(join_exec_command(&tokens))
 }
 
+/// Bind the owned closure's final artifacts to its granted pool using Cargo's
+/// actual CLI option, which takes precedence over environment and configuration.
+/// This is applied only to execution after the caller's output policy is saved.
+pub(super) fn bind_owned_cargo_target_dir(
+    command: &str,
+    managed_target: &str,
+) -> anyhow::Result<String> {
+    anyhow::ensure!(
+        Path::new(managed_target).is_absolute()
+            && Path::new(managed_target).file_name().is_some()
+            && !managed_target.chars().any(char::is_control)
+            && !managed_target.contains('\\')
+            && !managed_target
+                .split('/')
+                .any(|part| part == "." || part == ".."),
+        "owned Cargo target must be an absolute literal pool path"
+    );
+    let (mut tokens, cargo_index) = managed_clean_overlay_cargo_tokens(command)?;
+    anyhow::ensure!(
+        Path::new(&tokens[cargo_index])
+            .file_name()
+            .is_some_and(|name| name == "cargo" || name == "cargo.exe"),
+        "owned target binding requires the Cargo executable"
+    );
+    let mut index = cargo_index + 1;
+    if tokens
+        .get(index)
+        .is_some_and(|token| token.starts_with('+'))
+    {
+        index += 1;
+    }
+    while let Some(token) = tokens.get(index) {
+        match token.as_str() {
+            "--config" | "--color" | "-Z" => {
+                anyhow::ensure!(
+                    tokens.get(index + 1).is_some_and(|value| value != "--"),
+                    "missing Cargo global option value"
+                );
+                index += 2;
+            }
+            "-v" | "-vv" | "-q" | "--verbose" | "--quiet" | "--locked" | "--offline"
+            | "--frozen" => index += 1,
+            value
+                if value.starts_with("--config=")
+                    || value.starts_with("--color=")
+                    || value.starts_with("-Z") && value.len() > 2 =>
+            {
+                index += 1
+            }
+            value if value.starts_with('-') => {
+                anyhow::bail!("unsupported owned Cargo global option: {value}")
+            }
+            _ => break,
+        }
+    }
+    let subcommand = tokens
+        .get(index)
+        .ok_or_else(|| anyhow::anyhow!("missing Cargo subcommand"))?;
+    anyhow::ensure!(
+        matches!(
+            subcommand.as_str(),
+            "build"
+                | "b"
+                | "check"
+                | "c"
+                | "test"
+                | "t"
+                | "clippy"
+                | "doc"
+                | "d"
+                | "bench"
+                | "run"
+                | "r"
+                | "rustc"
+                | "rustdoc"
+                | "fix"
+                | "package"
+                | "publish"
+        ),
+        "unsupported Cargo subcommand for owned target binding: {subcommand}"
+    );
+    let end = tokens[index + 1..]
+        .iter()
+        .position(|token| token == "--")
+        .map_or(tokens.len(), |offset| index + 1 + offset);
+    anyhow::ensure!(
+        !tokens[index + 1..end]
+            .iter()
+            .any(|token| token == "--target-dir" || token.starts_with("--target-dir=")),
+        "owned Cargo target binding requires the caller's target selector to be absent"
+    );
+    tokens.splice(
+        end..end,
+        ["--target-dir".to_owned(), managed_target.to_owned()],
+    );
+    Ok(join_exec_command(&tokens))
+}
+
 /// Keep the caller's output contract separate from execution-only rewrites.
 /// In particular, injected TOML configuration contains shell quotes which the
 /// conservative package classifier must not interpret as publication authority.
@@ -1069,7 +1167,92 @@ pub(super) fn extract_cargo_target_dir_from_command_tokens(tokens: &[String]) ->
 
 #[cfg(test)]
 mod managed_build_dir_tests {
-    use super::{managed_clean_overlay_cargo_build_dir, managed_clean_overlay_cargo_tokens};
+    use super::{
+        bind_owned_cargo_target_dir, managed_clean_overlay_cargo_build_dir,
+        managed_clean_overlay_cargo_tokens,
+    };
+
+    #[test]
+    fn owned_target_binding_preserves_wrappers_and_passthrough() {
+        let target = "/worker/pools/target with ' quotes";
+        for argv in [
+            vec![
+                "cargo",
+                "build",
+                "--config",
+                "build.target-dir=\"/unselected\"",
+            ],
+            vec![
+                "env",
+                "--",
+                "CARGO_TARGET_DIR=/unselected",
+                "cargo",
+                "+nightly",
+                "test",
+                "--",
+                "--target-dir=/test-payload",
+            ],
+            vec![
+                "time",
+                "-f",
+                "literal --target-dir",
+                "cargo",
+                "--color",
+                "never",
+                "clippy",
+                "--",
+                "-D",
+                "warnings",
+            ],
+            vec![
+                "rustup",
+                "run",
+                "nightly",
+                "cargo",
+                "check",
+                "--all-targets",
+            ],
+        ] {
+            let command = shell_words::join(&argv);
+            let managed = managed_clean_overlay_cargo_build_dir(&command, target).unwrap();
+            let mut expected = shell_words::split(&managed).unwrap();
+            let (_, cargo_index) = managed_clean_overlay_cargo_tokens(&managed).unwrap();
+            let separator = expected[cargo_index + 1..]
+                .iter()
+                .position(|token| token == "--")
+                .map_or(expected.len(), |offset| cargo_index + 1 + offset);
+            expected.splice(
+                separator..separator,
+                ["--target-dir".to_owned(), target.to_owned()],
+            );
+            let bound = bind_owned_cargo_target_dir(&managed, target).unwrap();
+            assert_eq!(shell_words::split(&bound).unwrap(), expected, "{command}");
+        }
+    }
+
+    #[test]
+    fn owned_target_binding_refuses_unsupported_or_duplicate_output_authority() {
+        for command in [
+            "cargo fmt",
+            "cargo clean",
+            "cargo build --target-dir /unselected",
+            "cargo build --target-dir=/unselected",
+            "cargo -C /elsewhere build",
+            "cargo-xwin build",
+            "cargo build; echo changed",
+        ] {
+            assert!(
+                bind_owned_cargo_target_dir(command, "/worker/pool").is_err(),
+                "{command}"
+            );
+        }
+        for target in ["relative", "/", "/worker/../pool", "/worker/pool\nother"] {
+            assert!(
+                bind_owned_cargo_target_dir("cargo build", target).is_err(),
+                "{target:?}"
+            );
+        }
+    }
 
     /// Real Cargo verifies the extracted archive, not merely the working tree.
     /// The transfer below is local rsync fed by the production artifact policy;
@@ -1309,8 +1492,7 @@ mod managed_build_dir_tests {
         // The worktree remains buildable, but the archive deliberately omits
         // the required input. Verification must fail, not silently build the
         // working tree or reuse artifacts from the earlier verified package.
-        let failing_source =
-            b"pub const MESSAGE: &str = include_str!(\"../worktree-only.txt\");\n";
+        let failing_source = b"pub const MESSAGE: &str = include_str!(\"../worktree-only.txt\");\n";
         fs::write(root.join("src/lib.rs"), failing_source).unwrap();
         let check = run(
             "worktree",

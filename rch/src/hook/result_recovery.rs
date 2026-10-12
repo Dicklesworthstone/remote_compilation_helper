@@ -361,6 +361,7 @@ mod tests {
             vec!["/test/source".into()],
             None,
             None,
+            None,
             TransferConfig::default(),
             directory.path().to_owned(),
             uuid::Uuid::new_v4().simple().to_string(),

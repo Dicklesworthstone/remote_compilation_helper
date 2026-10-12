@@ -10,7 +10,7 @@
 //! 6. Comparing binary hashes to verify correctness
 
 use crate::binary_hash::{
-    BinaryHashResult, CanaryVerdict, binary_contains_marker, classify_canary, compute_binary_hash,
+    BinaryHashResult, CanaryVerdict, classify_returned_canary, compute_binary_hash,
 };
 use crate::gc_roots::{remote_cargo_home_base_prelude, remote_cargo_home_expr};
 use crate::mock::{self, MockConfig, MockRsync, MockRsyncConfig, MockSshClient};
@@ -129,21 +129,7 @@ fn cargo_package_name(project: &Path) -> Option<String> {
         .map(ToString::to_string)
 }
 
-/// Inspect the returned artifact before applying the existing canary policy.
-/// A missing marker is a verdict; an unreadable artifact is an inspection error.
-fn classify_returned_canary(
-    local_hash: &BinaryHashResult,
-    remote_hash: &BinaryHashResult,
-    artifact: &Path,
-    marker: &str,
-) -> Result<CanaryVerdict> {
-    if marker.is_empty() {
-        bail!("Cannot verify returned canary identity with an empty marker");
-    }
-    let marker_present = binary_contains_marker(artifact, marker)
-        .with_context(|| format!("Failed to inspect returned canary marker in {artifact:?}"))?;
-    Ok(classify_canary(local_hash, remote_hash, marker_present, None))
-}
+
 
 fn use_mock_transport(worker: &WorkerConfig) -> bool {
     mock::is_mock_enabled() || mock::is_mock_worker(worker)
@@ -315,10 +301,11 @@ impl RemoteCompilationTest {
         // probed in this path, so a mismatch with the marker present resolves to
         // advisory drift (PASS) rather than a false failure.
         let verdict = classify_returned_canary(
-            &local_hash,
-            &remote_hash,
             &remote_binary_path,
             &test_marker,
+            &local_hash,
+            &remote_hash,
+            None,
         )?;
         let success = verdict.passed();
         let total_ms = start.elapsed().as_millis() as u64;

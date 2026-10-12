@@ -1614,6 +1614,37 @@ fn test_parse_test_threads_variants() {
 }
 
 #[test]
+fn test_go_classification_drives_reservations_and_test_kind() {
+    let _guard = test_guard!();
+    let config = rch_common::CompilationConfig {
+        build_slots: 12,
+        test_slots: 8,
+        check_slots: 4,
+        ..Default::default()
+    };
+    for (verb, kind, default, is_test) in [
+        ("build", CompilationKind::GoBuild, 12, false),
+        ("test", CompilationKind::GoTest, 8, true),
+        ("vet", CompilationKind::GoVet, 4, false),
+    ] {
+        for (command, expected) in [
+            (format!("go {verb} ./..."), default),
+            (format!("go {verb} -p 2 ./..."), 2),
+        ] {
+            let classification = classify_command(&command);
+            assert!(classification.is_compilation, "{command}");
+            assert_eq!(classification.kind, Some(kind), "{command}");
+            assert_eq!(is_test_kind(classification.kind), is_test, "{command}");
+            assert_eq!(
+                estimate_cores_for_command(classification.kind, &command, &config),
+                expected,
+                "{command}"
+            );
+        }
+    }
+}
+
+#[test]
 fn test_estimate_cores_for_command() {
     let _guard = test_guard!();
     let config = rch_common::CompilationConfig {
@@ -1688,6 +1719,204 @@ fn test_estimate_cores_for_command() {
 // =========================================================================
 // Classification + threshold interaction tests
 // =========================================================================
+
+#[test]
+fn test_cargo_xwin_quoted_options_preserve_classification_and_admission() {
+    use rch_common::admit_preflight::{preflight, required_os_for_command};
+    use rch_common::patterns::cargo_xwin_compilation_kind;
+
+    let _guard = test_guard!();
+    for (subcommand, kind, family) in [
+        ("build", CompilationKind::CargoBuild, "cargo_build"),
+        ("check", CompilationKind::CargoCheck, "cargo_check"),
+        ("clippy", CompilationKind::CargoClippy, "cargo_clippy"),
+    ] {
+        for (prefix, toolchain) in [
+            (vec!["cargo", "--config=build.jobs=2", "xwin"], None),
+            (
+                vec![
+                    "cargo",
+                    "+nightly-2026-08-31",
+                    "--config=build.jobs=2",
+                    "xwin",
+                ],
+                Some("nightly-2026-08-31"),
+            ),
+            (vec!["cargo-xwin"], None),
+            (vec!["cargo-xwin", "xwin"], None),
+            (
+                vec![
+                    "env",
+                    "RCH_XWIN_NOTE=placeholder --target=aarch64-apple-darwin",
+                    "cargo",
+                    "--config=build.jobs=2",
+                    "xwin",
+                ],
+                None,
+            ),
+        ] {
+            for (target, expected_os) in [
+                ("x86_64-pc-windows-msvc", None),
+                ("aarch64-pc-windows-msvc", None),
+                ("aarch64-apple-darwin", Some("darwin")),
+            ] {
+                let target_argument = format!("--target={target}");
+                let mut argv = prefix.clone();
+                argv.extend([
+                    subcommand,
+                    "--config=build.jobs=2",
+                    "--locked",
+                    "--all-targets",
+                    target_argument.as_str(),
+                ]);
+                if subcommand == "clippy" {
+                    argv.extend(["--", "-D", "warnings"]);
+                }
+                let command = shell_words::join(&argv);
+                assert!(command.contains("'--config=build.jobs=2'"), "{command}");
+                assert!(
+                    command.contains(&format!("'{target_argument}'")),
+                    "{command}"
+                );
+                assert_eq!(
+                    cargo_xwin_compilation_kind(&command),
+                    Some(kind),
+                    "{command}"
+                );
+                let classification = classify_command(&command);
+                assert!(classification.is_compilation, "{command}");
+                assert_eq!(classification.kind, Some(kind), "{command}");
+
+                let result = preflight(&command, true);
+                let expected_toolchains: Vec<String> = toolchain
+                    .into_iter()
+                    .map(|value| value.to_string())
+                    .collect();
+                assert!(result.is_compilation, "{command}");
+                assert_eq!(result.family.as_deref(), Some(family), "{command}");
+                assert!(result.required.needs_cargo, "{command}");
+                assert_eq!(
+                    result.required.needs_targets,
+                    vec![target.to_string()],
+                    "{command}"
+                );
+                assert_eq!(
+                    result.required.needs_toolchains, expected_toolchains,
+                    "{command}"
+                );
+                assert_eq!(
+                    result.required.needs_os.as_deref(),
+                    expected_os,
+                    "{command}"
+                );
+                assert_eq!(
+                    required_os_for_command(&command).as_deref(),
+                    expected_os,
+                    "{command}"
+                );
+                let requirement = result.required.to_requirement(1);
+                assert!(requirement.needs_cargo, "{command}");
+                assert_eq!(
+                    requirement.needs_targets, result.required.needs_targets,
+                    "{command}"
+                );
+                assert_eq!(
+                    requirement.needs_toolchains, result.required.needs_toolchains,
+                    "{command}"
+                );
+                assert_eq!(requirement.needs_os.as_deref(), expected_os, "{command}");
+            }
+        }
+    }
+}
+
+#[test]
+fn test_cargo_xwin_quoted_mentions_and_nonliteral_options_do_not_authorize_offload() {
+    use rch_common::admit_preflight::{preflight, required_os_for_command};
+    use rch_common::patterns::cargo_xwin_compilation_kind;
+
+    let _guard = test_guard!();
+    for (subcommand, kind) in [
+        ("build", CompilationKind::CargoBuild),
+        ("check", CompilationKind::CargoCheck),
+        ("clippy", CompilationKind::CargoClippy),
+    ] {
+        for argv in [
+            vec![
+                "cargo",
+                "--config=xwin",
+                subcommand,
+                "--target",
+                "x86_64-pc-windows-msvc",
+            ],
+            vec![
+                "cargo",
+                "--config",
+                "xwin",
+                subcommand,
+                "--target",
+                "x86_64-pc-windows-msvc",
+            ],
+            vec![
+                "cargo",
+                subcommand,
+                "--manifest-path",
+                "cargo xwin check",
+                "--target",
+                "x86_64-pc-windows-msvc",
+            ],
+        ] {
+            let command = shell_words::join(&argv);
+            assert_eq!(cargo_xwin_compilation_kind(&command), None, "{command}");
+            assert_eq!(classify_command(&command).kind, Some(kind), "{command}");
+            assert_eq!(
+                preflight(&command, true).required.needs_os.as_deref(),
+                Some("windows"),
+                "{command}"
+            );
+            assert_eq!(
+                required_os_for_command(&command).as_deref(),
+                Some("windows"),
+                "{command}"
+            );
+        }
+    }
+    for command in [
+        "cargo 'xwin' check '--target=x86_64-pc-windows-msvc'",
+        "cargo xwin 'check' '--target=x86_64-pc-windows-msvc'",
+        "cargo-xwin 'xwin' clippy '--target=x86_64-pc-windows-msvc'",
+        "cargo-xwin 'clippy' '--target=x86_64-pc-windows-msvc'",
+        "'cargo-xwin' check '--target=x86_64-pc-windows-msvc'",
+        "cargo xwin check '--help'",
+        "cargo xwin check --config='build.jobs=2'",
+    ] {
+        assert_eq!(cargo_xwin_compilation_kind(command), None, "{command}");
+        assert!(!classify_command(command).is_compilation, "{command}");
+    }
+    for value in [
+        "two words",
+        "a\"b",
+        "a'b",
+        r"a\b",
+        "$value",
+        "`value`",
+        "a;b",
+        "a|b",
+        "a&b",
+        "<value>",
+        "(value)",
+        "{a,b}",
+        "*",
+        "[value]",
+        "#value",
+        "~value",
+    ] {
+        let option = format!("--config={value}");
+        let command = shell_words::join(["cargo", "xwin", "check", option.as_str()]);
+        assert_eq!(cargo_xwin_compilation_kind(&command), None, "{command}");
+        assert!(!classify_command(&command).is_compilation, "{command}");
+    }
+}
 
 #[test]
 fn test_classification_confidence_levels() {
@@ -2962,9 +3191,9 @@ async fn queued_selection_lost_or_malformed_response_never_reaches_recovery() {
             // A lost original reply now permits exactly one identity-preserving
             // resume. Model an older daemon rejecting that endpoint promptly;
             // all complete invalid replies still allow no resume at all.
-            for reply in std::iter::once(wire_response).chain(
-                resumes_lost_reply.then_some("HTTP/1.0 404 Not Found\r\n\r\n{}"),
-            ) {
+            for reply in std::iter::once(wire_response)
+                .chain(resumes_lost_reply.then_some("HTTP/1.0 404 Not Found\r\n\r\n{}"))
+            {
                 let (stream, _) = listener.accept().await.unwrap();
                 let (reader, mut writer) = stream.into_split();
                 let mut reader = TokioBufReader::new(reader);
@@ -7580,7 +7809,7 @@ async fn registered_preflight_rejection_sends_heartbeat_and_stops_guard() {
         declared_os: Some("windows".to_string()),
     };
     let reporter = HookReporter::new(OutputVisibility::None);
-    let result = execute_remote_compilation(
+    let result = Box::pin(execute_remote_compilation(
         &worker,
         "cargo check",
         TransferConfig::default(),
@@ -7602,7 +7831,7 @@ async fn registered_preflight_rejection_sends_heartbeat_and_stops_guard() {
         &[],
         rch_common::remediation_config::DEFAULT_POOLED_REAPER_POOLED_IDLE_HOURS,
         None,
-    )
+    ))
     .await;
     assert!(result.unwrap_err().to_string().contains("require the Unix"));
     let heartbeat = received_rx.try_recv().expect("heartbeat before rejection");
@@ -7704,7 +7933,7 @@ async fn test_execute_remote_compilation_syncs_custom_cargo_target_dir_artifacts
     };
 
     let reporter = HookReporter::new(OutputVisibility::None);
-    let result = execute_remote_compilation(
+    let result = Box::pin(execute_remote_compilation(
         &worker,
         "cargo build",
         TransferConfig::default(),
@@ -7726,7 +7955,7 @@ async fn test_execute_remote_compilation_syncs_custom_cargo_target_dir_artifacts
         &[],
         rch_common::remediation_config::DEFAULT_POOLED_REAPER_POOLED_IDLE_HOURS,
         None,
-    )
+    ))
     .await;
 
     // Restore cwd before any assertion so a failure doesn't poison other tests.
@@ -7821,7 +8050,7 @@ async fn test_terminal_source_sync_failure_never_launches_remote_cargo() {
     };
     let reporter = HookReporter::new(OutputVisibility::Summary);
 
-    let result = execute_remote_compilation(
+    let result = Box::pin(execute_remote_compilation(
         &worker,
         "cargo check",
         transfer_config,
@@ -7843,7 +8072,7 @@ async fn test_terminal_source_sync_failure_never_launches_remote_cargo() {
         &[],
         rch_common::remediation_config::DEFAULT_POOLED_REAPER_POOLED_IDLE_HOURS,
         None,
-    )
+    ))
     .await;
 
     if let Some(prev) = prev_cwd {

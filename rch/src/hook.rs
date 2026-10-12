@@ -4861,7 +4861,12 @@ use fallback_selection::{build_capacity_snapshots, pick_bigger_worker};
 fn is_test_kind(kind: Option<CompilationKind>) -> bool {
     matches!(
         kind,
-        Some(CompilationKind::CargoTest | CompilationKind::CargoNextest | CompilationKind::BunTest)
+        Some(
+            CompilationKind::CargoTest
+                | CompilationKind::CargoNextest
+                | CompilationKind::BunTest
+                | CompilationKind::GoTest
+        )
     )
 }
 
