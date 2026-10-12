@@ -1718,12 +1718,21 @@ impl DurableLeaseWriter {
         self.publish_transition(&mut lease, next)
     }
 
+    /// Record the wrapper's outcome, including a failed delivery after compiler
+    /// success. Once acknowledged, that value is immutable; repeats are read-only.
     pub(crate) fn record_exit(&self, exit_code: i32) -> anyhow::Result<()> {
         let mut lease = self.lease.lock().unwrap_or_else(|p| p.into_inner());
         anyhow::ensure!(
             !selection_is_pending(&lease),
             "selection is pending; stale exit update refused"
         );
+        if lease.terminal_acknowledged {
+            anyhow::ensure!(
+                lease.exit_code == Some(exit_code),
+                "recorded exit contradicts the acknowledged terminal result"
+            );
+            return Ok(());
+        }
         let mut next = lease.clone();
         next.exit_code = Some(exit_code);
         self.publish_transition(&mut lease, next)
@@ -1897,7 +1906,8 @@ impl DurableLeaseWriter {
     }
 
     /// A terminal acknowledgement requires observed delivery completion: the
-    /// exact command result is recorded, no validated retrieval recipe is
+    /// exact wrapper result is recorded and agrees with retained delivery,
+    /// no validated retrieval recipe is
     /// outstanding (or it reports fully-returned outputs), and no later
     /// heartbeats are expected. Refuses to fake completion otherwise.
     pub(crate) fn acknowledge_terminal(&self) -> anyhow::Result<()> {
@@ -1905,8 +1915,22 @@ impl DurableLeaseWriter {
             .lease
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        Self::ensure_terminal_evidence(&lease)?;
+        let exit_code = lease
+            .exit_code
+            .or_else(|| {
+                let recovery = lease.recovery.as_ref()?;
+                if recovery.get("retired").and_then(serde_json::Value::as_bool) != Some(true) {
+                    return None;
+                }
+                recovery.get("returned").and_then(serde_json::Value::as_i64)
+                    .and_then(|returned| i32::try_from(returned).ok())
+            })
+            .context("terminal command exit is not observed; acknowledgement refused")?;
+        Self::ensure_terminal_evidence(&lease, exit_code)?;
         let mut next = lease.clone();
+        // A retired delivery receipt is an observed result too. Publish its
+        // exact finite exit and acknowledgement in the same transition.
+        next.exit_code = Some(exit_code);
         next.acknowledge_terminal(now_unix_ms());
         self.publish_transition(&mut lease, next)
     }
@@ -1930,7 +1954,7 @@ impl DurableLeaseWriter {
                 && lease.worker_id == observed.worker_id,
             "observed completion belongs to another admission; acknowledgement refused"
         );
-        Self::ensure_terminal_evidence(&lease)?;
+        Self::ensure_terminal_evidence(&lease, exit_code)?;
         if lease.terminal_acknowledged {
             anyhow::ensure!(
                 lease.exit_code == Some(exit_code),
@@ -1944,10 +1968,14 @@ impl DurableLeaseWriter {
         self.publish_transition(&mut lease, next)
     }
 
-    fn ensure_terminal_evidence(lease: &DurableJobLease) -> anyhow::Result<()> {
+    fn ensure_terminal_evidence(lease: &DurableJobLease, exit_code: i32) -> anyhow::Result<()> {
         anyhow::ensure!(
             !selection_is_pending(lease),
             "selection is pending; terminal acknowledgement refused"
+        );
+        anyhow::ensure!(
+            lease.exit_code.is_none_or(|observed| observed == exit_code),
+            "daemon completion contradicts the observed wrapper result; acknowledgement refused"
         );
         if let Some(recovery) = lease.recovery.as_ref()
             && (recovery
@@ -1958,6 +1986,13 @@ impl DurableLeaseWriter {
         {
             anyhow::bail!(
                 "durable retrieval or source release evidence is incomplete; terminal acknowledgement refused (state stays recoverable)"
+            );
+        }
+        if let Some(recovery) = lease.recovery.as_ref() {
+            anyhow::ensure!(
+                recovery.get("returned").and_then(serde_json::Value::as_i64)
+                    == Some(i64::from(exit_code)),
+                "terminal command result contradicts durable delivery; acknowledgement refused"
             );
         }
         Ok(())
@@ -3771,7 +3806,12 @@ pub async fn run_exec(
                     "Failed to release unrequested worker {} after selection refusal: {}",
                     worker.id, error
                 );
-            } else if let Err(error) = durable_lease.acknowledge_terminal() {
+            } else if let Err(error) = durable_lease
+                // This is the explicit pre-execution refusal sent with release,
+                // not an inferred compiler exit. Persist it before acknowledging.
+                .record_exit(EXIT_BUILD_ERROR)
+                .and_then(|_| durable_lease.acknowledge_terminal())
+            {
                 warn!(
                     "Failed to persist acknowledged durable lease terminal state: {}",
                     error
@@ -4247,7 +4287,12 @@ pub async fn run_exec(
                     ));
                     let fallback_reason =
                         format!("dependency preflight failed: {evidence_summary}");
-                    if release_acknowledged && let Err(error) = durable_lease.acknowledge_terminal()
+                    if release_acknowledged
+                        && let Err(error) = durable_lease
+                            // This typed planner refusal precedes execution and
+                            // uses the same failure outcome sent with release.
+                            .record_exit(EXIT_BUILD_ERROR)
+                            .and_then(|_| durable_lease.acknowledge_terminal())
                     {
                         warn!(
                             "Failed to persist acknowledged durable lease terminal state: {}",

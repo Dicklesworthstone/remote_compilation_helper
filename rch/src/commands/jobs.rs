@@ -100,7 +100,7 @@ fn validate_identity(lease: &DurableJobLease, record: &Value) -> Result<()> {
 /// Completion may win before cancellation or while its request is in flight.
 /// Accept only a complete receipt for the original wrapper/build/worker tuple;
 /// a status string alone is not authority to stop a wrapper or retire its work.
-fn validate_completion(lease: &DurableJobLease, reply: &Value) -> Result<i32> {
+pub(crate) fn validate_completion(lease: &DurableJobLease, reply: &Value) -> Result<i32> {
     anyhow::ensure!(
         reply["status"] == "completed"
             && reply["local_wrapper_id"].as_str() == Some(lease.identity.local_wrapper_id.as_str()),

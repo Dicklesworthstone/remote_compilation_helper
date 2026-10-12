@@ -128,9 +128,8 @@ impl BuildHeartbeatLoop {
                             if let Ok(bytes) = std::fs::read(cancellation)
                                 && serde_json::from_slice::<JobIdentity>(&bytes).ok().as_ref() == Some(&evidence.identity)
                                 && let Ok(status) = crate::commands::jobs::query(&evidence).await
-                                && status["status"] == "completed"
+                                && let Ok(code) = crate::commands::jobs::validate_completion(&evidence, &status)
                             {
-                                let code = status["record"]["exit_code"].as_i64().and_then(|n| i32::try_from(n).ok()).unwrap_or(130);
                                 if lease.acknowledge_observed_completion(&evidence, code).is_ok() {
                                     std::process::exit(code);
                                 }

@@ -2310,8 +2310,24 @@ fn terminal_job_report_uses_one_current_admission_and_observed_exit() {
     assert!(no_admission["admission"].is_null());
     assert!(no_admission["identity"]["remote_build_id"].is_null());
     let missing_exit = queued_selection_test_lease(retained.join("missing-exit.json"));
-    missing_exit.acknowledge_terminal().unwrap();
-    assert!(missing_exit.terminal_job_report(&missing_exit.wrapper_id(), "completed", None).is_err());
+    let missing_bytes = std::fs::read(&missing_exit.path).unwrap();
+    assert!(missing_exit.acknowledge_terminal().is_err());
+    assert_eq!(std::fs::read(&missing_exit.path).unwrap(), missing_bytes);
+    // Retain the old malformed-journal reader negative without allowing the
+    // actual writer to create that state. This is a supplied legacy fixture.
+    let mut legacy = missing_exit.snapshot();
+    legacy.acknowledge_terminal(1);
+    let legacy_path = retained.join("legacy-unknown-exit.json");
+    std::fs::write(&legacy_path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+    let legacy_writer = DurableLeaseWriter {
+        lease: Arc::new(std::sync::Mutex::new(
+            DurableLeaseWriter::read_journal(&legacy_path, &legacy.identity.local_wrapper_id).unwrap(),
+        )),
+        path: legacy_path,
+        #[cfg(unix)]
+        recovery_ownership: None,
+    };
+    assert!(legacy_writer.terminal_job_report(&missing_exit.wrapper_id(), "completed", None).is_err());
     for admitted in [true, false] {
         let mut incomplete = writer.snapshot();
         if admitted {
@@ -2346,6 +2362,105 @@ fn retry_selection_test_lease(path: PathBuf) -> DurableLeaseWriter {
         .unwrap();
     writer.record_exit(137).unwrap();
     writer
+}
+
+#[test]
+fn terminal_acknowledgement_requires_an_observed_result_and_preserves_its_final_value() {
+    let _guard = test_guard!();
+    let retained = tempfile::tempdir().unwrap().keep();
+    for exit in [0, EXIT_BUILD_ERROR, 102, 130] {
+        let writer = queued_selection_test_lease(retained.join(format!("exit-{exit}.json")));
+        let pending = writer.snapshot();
+        let bytes = std::fs::read(&writer.path).unwrap();
+        assert!(writer.acknowledge_terminal().is_err());
+        assert_eq!(writer.snapshot(), pending);
+        assert_eq!(std::fs::read(&writer.path).unwrap(), bytes);
+        writer.record_exit(exit).unwrap();
+        writer.acknowledge_terminal().unwrap();
+        let terminal = writer.snapshot();
+        let bytes = std::fs::read(&writer.path).unwrap();
+        assert!(terminal.terminal_acknowledged);
+        assert_eq!(terminal.exit_code, Some(exit));
+        writer.record_exit(exit).unwrap();
+        assert_eq!(std::fs::read(&writer.path).unwrap(), bytes);
+        assert!(writer.record_exit(exit + 1).is_err());
+        assert_eq!(writer.snapshot(), terminal);
+        assert_eq!(std::fs::read(&writer.path).unwrap(), bytes);
+    }
+    // Actual retained writer I/O with supplied result values, no daemon,
+    // compiler execution or performance/native qualification.
+}
+
+#[test]
+fn daemon_completion_cannot_replace_known_command_or_delivery_results() {
+    let _guard = test_guard!();
+    let retained = tempfile::tempdir().unwrap().keep();
+    let writer = queued_selection_test_lease(retained.join("known-command.json"));
+    writer.admit(42, &WorkerId::new("worker-fixture")).unwrap();
+    writer.record_exit(102).unwrap();
+    let observed = writer.snapshot();
+    let bytes = std::fs::read(&writer.path).unwrap();
+    assert!(writer.acknowledge_observed_completion(&observed, 0).is_err());
+    assert_eq!(writer.snapshot(), observed);
+    assert_eq!(std::fs::read(&writer.path).unwrap(), bytes);
+    writer.acknowledge_observed_completion(&observed, 102).unwrap();
+    assert_eq!(writer.snapshot().exit_code, Some(102));
+    assert!(writer.snapshot().terminal_acknowledged);
+
+    let delivery = queued_selection_test_lease(retained.join("known-delivery.json"));
+    delivery.admit(43, &WorkerId::new("worker-fixture")).unwrap();
+    // These are explicitly distinct facts: compiler/daemon success and a
+    // failed artifact delivery. Retirement cannot make either one the other.
+    delivery.set_recovery(serde_json::json!({
+        "returned": 102, "retired": true, "daemon_exit_code": 0,
+    })).unwrap();
+    let observed = delivery.snapshot();
+    let bytes = std::fs::read(&delivery.path).unwrap();
+    assert!(delivery.acknowledge_observed_completion(&observed, 0).is_err());
+    assert_eq!(delivery.snapshot(), observed);
+    assert_eq!(std::fs::read(&delivery.path).unwrap(), bytes);
+    delivery.record_exit(0).unwrap();
+    let wrong_result = delivery.snapshot();
+    let wrong_bytes = std::fs::read(&delivery.path).unwrap();
+    assert!(delivery.acknowledge_terminal().is_err());
+    assert_eq!(delivery.snapshot(), wrong_result);
+    assert_eq!(std::fs::read(&delivery.path).unwrap(), wrong_bytes);
+    delivery.record_exit(102).unwrap();
+    delivery.acknowledge_terminal().unwrap();
+    let terminal = delivery.snapshot();
+    assert_eq!(terminal.exit_code, Some(102));
+    assert!(terminal.terminal_acknowledged);
+    assert_eq!(terminal.recovery.unwrap()["daemon_exit_code"], 0);
+
+    let receipt = queued_selection_test_lease(retained.join("retired-receipt.json"));
+    receipt.admit(44, &WorkerId::new("worker-fixture")).unwrap();
+    receipt.set_recovery(serde_json::json!({
+        "returned": 130, "retired": true, "daemon_exit_code": 0,
+    })).unwrap();
+    assert!(receipt.snapshot().exit_code.is_none());
+    receipt.acknowledge_terminal().unwrap();
+    let terminal = receipt.snapshot();
+    let disk: DurableJobLease = serde_json::from_slice(&std::fs::read(&receipt.path).unwrap()).unwrap();
+    assert_eq!(disk, terminal);
+    assert_eq!(terminal.exit_code, Some(130));
+    assert!(terminal.terminal_acknowledged);
+    assert_eq!(terminal.recovery.unwrap()["daemon_exit_code"], 0);
+
+    let unfinished = queued_selection_test_lease(retained.join("unfinished-receipt.json"));
+    for recipe in [
+        serde_json::json!({"returned": 130, "retired": false}),
+        serde_json::json!({"retired": true}),
+        serde_json::json!({"returned": i64::from(i32::MAX) + 1, "retired": true}),
+    ] {
+        unfinished.set_recovery(recipe).unwrap();
+        let before = unfinished.snapshot();
+        let bytes = std::fs::read(&unfinished.path).unwrap();
+        assert!(unfinished.acknowledge_terminal().is_err());
+        assert_eq!(unfinished.snapshot(), before);
+        assert_eq!(std::fs::read(&unfinished.path).unwrap(), bytes);
+    }
+    // Supplied delivery/daemon facts test the real transactional writer only;
+    // they are not live service, source-release or SDK observations.
 }
 
 fn read_retry_lease(writer: &DurableLeaseWriter) -> DurableJobLease {
