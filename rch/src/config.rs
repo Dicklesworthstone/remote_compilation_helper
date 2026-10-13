@@ -2131,6 +2131,23 @@ pub fn set_first_run_complete(value: bool) -> Result<()> {
     Ok(())
 }
 
+/// The alias for an ad-hoc `RCH_CANONICAL_PROJECT_ROOT` without an explicit
+/// `RCH_ALIAS_PROJECT_ROOT`: a sibling `<canonical>.rch-alias`, which worker
+/// topology setup creates next to the scratch root (bd-xz7at). `None` when the
+/// override is empty, `/`, or names the canonical root already in effect,
+/// which keeps its configured alias.
+fn derived_scratch_alias_root(
+    canonical_env: Option<&str>,
+    canonical_before: &Path,
+) -> Option<String> {
+    let canonical = shellexpand::tilde(canonical_env?.trim()).into_owned();
+    let canonical = canonical.trim_end_matches('/');
+    if canonical.is_empty() || Path::new(canonical) == canonical_before {
+        return None;
+    }
+    Some(format!("{canonical}.rch-alias"))
+}
+
 fn apply_env_overrides_inner(
     config: &mut RchConfig,
     mut sources: Option<&mut ConfigSourceMap>,
@@ -2573,6 +2590,11 @@ fn apply_env_overrides_inner(
     }
 
     // Path topology overrides
+    let canonical_before_env = config
+        .path_topology
+        .to_policy()
+        .canonical_root()
+        .to_path_buf();
     if let Some(val) = get_env("RCH_CANONICAL_PROJECT_ROOT") {
         config.path_topology.canonical_root = Some(val);
         if let Some(ref mut sources) = sources {
@@ -2590,6 +2612,22 @@ fn apply_env_overrides_inner(
                 sources,
                 "path_topology.alias_root",
                 ConfigValueSource::EnvVar("RCH_ALIAS_PROJECT_ROOT".to_string()),
+            );
+        }
+    } else if let Some(alias) = derived_scratch_alias_root(
+        get_env("RCH_CANONICAL_PROJECT_ROOT").as_deref(),
+        &canonical_before_env,
+    ) {
+        // bd-xz7at: worker topology setup makes the alias point at the
+        // canonical root. Keeping `/dp` (already -> /data/projects on workers)
+        // for a scratch canonical root claimed `/dp`, i.e. all of
+        // /data/projects, and was refused as an overlapping source owner.
+        config.path_topology.alias_root = Some(alias);
+        if let Some(ref mut sources) = sources {
+            set_source(
+                sources,
+                "path_topology.alias_root",
+                ConfigValueSource::EnvVar("RCH_CANONICAL_PROJECT_ROOT".to_string()),
             );
         }
     }
@@ -4319,6 +4357,70 @@ canonical_root = "/from/toml"
         assert_eq!(
             source,
             &ConfigValueSource::EnvVar("RCH_CANONICAL_PROJECT_ROOT".to_string())
+        );
+    }
+
+    #[test]
+    fn scratch_canonical_root_gets_its_own_alias_unless_one_is_given() {
+        // bd-xz7at: keeping `/dp` for a scratch canonical root claimed all of
+        // /data/projects on workers and was refused as an overlapping owner.
+        let _guard = test_guard!();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let user_path = dir.path().join("user.toml");
+        std::fs::write(
+            &user_path,
+            "[path_topology]\ncanonical_root = \"/data/projects\"\nalias_root = \"/dp\"\n",
+        )
+        .expect("write user config");
+        let load = |pairs: &[(&str, &str)]| {
+            let env: HashMap<String, String> = pairs
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                .collect();
+            load_config_with_sources_from_paths(Some(&user_path), None, Some(&env)).expect("load")
+        };
+        let scratch = load(&[("RCH_CANONICAL_PROJECT_ROOT", "/data/tmp/je-flc-test/")]);
+        assert_eq!(
+            scratch.config.path_topology.alias_root.as_deref(),
+            Some("/data/tmp/je-flc-test.rch-alias")
+        );
+        assert_eq!(
+            scratch.sources.get("path_topology.alias_root"),
+            Some(&ConfigValueSource::EnvVar(
+                "RCH_CANONICAL_PROJECT_ROOT".to_string()
+            ))
+        );
+        let explicit = load(&[
+            ("RCH_CANONICAL_PROJECT_ROOT", "/data/tmp/je-flc-test"),
+            ("RCH_ALIAS_PROJECT_ROOT", "/data/tmp/my-alias"),
+        ]);
+        assert_eq!(
+            explicit.config.path_topology.alias_root.as_deref(),
+            Some("/data/tmp/my-alias")
+        );
+        // Naming the canonical root already in effect keeps its alias.
+        let same = load(&[("RCH_CANONICAL_PROJECT_ROOT", "/data/projects")]);
+        assert_eq!(same.config.path_topology.alias_root.as_deref(), Some("/dp"));
+        let unset = load(&[]);
+        assert_eq!(
+            unset.config.path_topology.alias_root.as_deref(),
+            Some("/dp")
+        );
+    }
+
+    #[test]
+    fn derived_scratch_alias_ignores_empty_root_and_unchanged_overrides() {
+        let current = Path::new("/data/projects");
+        assert_eq!(derived_scratch_alias_root(None, current), None);
+        assert_eq!(derived_scratch_alias_root(Some(""), current), None);
+        assert_eq!(derived_scratch_alias_root(Some("/"), current), None);
+        assert_eq!(
+            derived_scratch_alias_root(Some("/data/projects/"), current),
+            None
+        );
+        assert_eq!(
+            derived_scratch_alias_root(Some(" /tmp/scratch-root "), current).as_deref(),
+            Some("/tmp/scratch-root.rch-alias")
         );
     }
 
