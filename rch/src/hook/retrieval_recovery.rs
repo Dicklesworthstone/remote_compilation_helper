@@ -1776,12 +1776,16 @@ impl RecoverySession {
                 timeout <= 86_400_000,
                 "recovery transfer timeout must not exceed 24 hours"
             );
-            let floor = next
+            // Zero, like None, means adaptive timing in TransferPipeline.
+            // Do not turn that sentinel into a hard ceiling or compare an
+            // extension against zero instead of the persisted retry floor.
+            let explicit = next
                 .transfer
                 .max_transfer_time_ms
-                .unwrap_or(next.transfer.retry.total_timeout_ms);
+                .filter(|value| *value > 0);
+            let floor = explicit.unwrap_or(next.transfer.retry.total_timeout_ms);
             if timeout > floor {
-                if next.transfer.max_transfer_time_ms.is_some() {
+                if explicit.is_some() {
                     next.transfer.max_transfer_time_ms = Some(timeout);
                 } else {
                     // Preserve size-derived budgets: an extension of the
@@ -3797,19 +3801,49 @@ mod tests {
 
     #[test]
     fn clean_overlay_recovery_extension_preserves_adaptive_budget() {
-        let (_directory, _stage_owner, mut session) = publication_fixture();
-        session.recipe.transfer.max_transfer_time_ms = None;
-        session.recipe.transfer.retry.total_timeout_ms = 30_000;
-        session
-            .apply_retrieval_config(&TransferConfig {
-                max_transfer_time_ms: Some(60_000),
-                ..Default::default()
-            })
-            .unwrap();
-        let reloaded = reload_publication(&session);
-        assert!(reloaded.recipe.transfer.max_transfer_time_ms.is_none());
-        assert_eq!(reloaded.recipe.transfer.retry.total_timeout_ms, 60_000);
-        assert!(!reloaded.writer.snapshot().terminal_acknowledged);
+        for sentinel in [None, Some(0)] {
+            for (initial_floor, requested, expected_floor) in [
+                (138_000, 900_000, 900_000),
+                (1_200_000, 900_000, 1_200_000),
+                (900_000, 900_000, 900_000),
+                (900_000, 0, 900_000),
+            ] {
+                let (_directory, _stage_owner, mut session) = publication_fixture();
+                session.recipe.transfer.max_transfer_time_ms = sentinel;
+                session.recipe.transfer.retry.total_timeout_ms = initial_floor;
+                session.persist().unwrap();
+                let mut expected = serde_json::to_value(&session.recipe).unwrap();
+                expected["transfer"]["retry"]["total_timeout_ms"] = expected_floor.into();
+                let stage = session.stage(0);
+                std::fs::write(stage.join("worker-output"), b"retained output").unwrap();
+                session
+                    .apply_retrieval_config(&TransferConfig {
+                        max_transfer_time_ms: Some(requested),
+                        ..Default::default()
+                    })
+                    .unwrap();
+                let mut reloaded = reload_publication(&session);
+                assert_eq!(reloaded.recipe.transfer.max_transfer_time_ms, sentinel);
+                assert_eq!(reloaded.recipe.transfer.retry.total_timeout_ms, expected_floor);
+                // Compare the whole recipe, including worker/source authority,
+                // output policy, publication checkpoints and original exit.
+                assert_eq!(serde_json::to_value(&reloaded.recipe).unwrap(), expected);
+                assert_eq!(reloaded.stage(0), stage);
+                assert_eq!(
+                    std::fs::read(stage.join("worker-output")).unwrap(),
+                    b"retained output"
+                );
+                assert!(!reloaded.writer.snapshot().terminal_acknowledged);
+                assert!(reloaded.recipe.returned.is_none());
+                assert!(!reloaded.recipe.phases[0].complete);
+                // A retry without an invocation override keeps the extension.
+                reloaded
+                    .apply_retrieval_config(&TransferConfig::default())
+                    .unwrap();
+                let reloaded = reload_publication(&reloaded);
+                assert_eq!(serde_json::to_value(&reloaded.recipe).unwrap(), expected);
+            }
+        }
     }
 
     #[tokio::test]
