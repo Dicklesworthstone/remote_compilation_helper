@@ -16383,12 +16383,29 @@ fn main() {
         )
         .unwrap();
         std::fs::write(destination.path().join("Cargo.toml"), b"local manifest").unwrap();
+        // Windows workers run this script with Git for Windows' GNU find at
+        // /usr/bin/find. macOS ships BSD find there, so use Homebrew's gfind.
+        let inventory_script = windows_artifact_inventory_script(source.path().to_str().unwrap());
+        let gnu_find = |find: &str| {
+            std::process::Command::new(find)
+                .args([".", "-maxdepth", "0", "-printf", ""])
+                .output()
+                .is_ok_and(|output| output.status.success())
+        };
+        let inventory_script = if gnu_find("/usr/bin/find") {
+            inventory_script
+        } else if gnu_find("gfind") {
+            inventory_script.replace("/usr/bin/find ", "gfind ")
+        } else {
+            eprintln!("skipping: no GNU find (/usr/bin/find lacks -printf and gfind is absent)");
+            return;
+        };
         let mut inventory = Vec::new();
         let mut shell = Command::new("sh");
         shell.arg("-s");
         run_windows_artifact_process(
             shell,
-            &windows_artifact_inventory_script(source.path().to_str().unwrap()),
+            &inventory_script,
             &mut inventory,
             1024 * 1024,
             TokioInstant::now() + Duration::from_secs(10),

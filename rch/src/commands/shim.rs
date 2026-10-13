@@ -2900,6 +2900,12 @@ esac
         write_path_candidate(&shim, b"#!/bin/sh\nprintf SHIM\n", true);
         write_path_candidate(&real_dir.join("cargo"), b"#!/bin/sh\nprintf LOCAL\n", true);
         std::os::unix::fs::symlink(&shim, literal_tilde.join("cargo")).unwrap();
+        // bash, which is macOS's /bin/sh, tilde-expands PATH entries during
+        // lookup; dash and execvp(3) take `~` literally, as the model does.
+        let sh_is_bash = std::process::Command::new("/bin/sh")
+            .args(["-c", "printf %s \"${BASH_VERSION:-}\""])
+            .output()
+            .is_ok_and(|output| !output.stdout.is_empty());
         for (path, expected, output) in [
             ("bin:./shims", Interception::None, "LOCAL"),
             ("./shims:bin", Interception::Direct, "SHIM"),
@@ -2910,6 +2916,9 @@ esac
                 expected,
                 "{path}"
             );
+            if sh_is_bash && path.starts_with('~') {
+                continue;
+            }
             assert_eq!(
                 shell_cargo_output(path.as_ref(), dir.path()),
                 output,
