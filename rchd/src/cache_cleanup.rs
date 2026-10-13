@@ -2118,8 +2118,8 @@ flock -n "$__gc_source_registry/metadata.lock" true;
             .join(".rch-target-pool-deadbeefcafe");
         std::fs::create_dir_all(pool.join("deps")).expect("pool tree");
         age_dir(&pool);
-        let (stdout, _stderr, code) = run_sweep(base.path(), &[]);
-        assert_eq!(code, Some(0));
+        let (stdout, stderr, code) = run_sweep(base.path(), &[]);
+        assert_eq!(code, Some(0), "{stdout}{stderr}");
         assert!(stdout.contains("removed=1"), "{stdout}");
         assert!(stdout.contains("remove_errors=0"), "{stdout}");
     }
