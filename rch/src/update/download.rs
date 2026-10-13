@@ -325,10 +325,24 @@ async fn download_file(url: &str, dest: &PathBuf) -> Result<(), UpdateError> {
         // Body-read failures (truncated/reset mid-stream) are transient too.
         .map_err(|e| UpdateError::NetworkError(e.to_string()))?;
 
-    file.write_all(&bytes)
+    write_downloaded_bytes(&mut file, &bytes).await
+}
+
+/// Finish the asynchronous file write before another handle verifies its bytes.
+/// Tokio's write_all can return with the final blocking write still queued;
+/// dropping the handle is not a completion barrier. Flush also reports delayed
+/// local errors, which must never be mistaken for a retryable CDN failure.
+/// This is reader visibility, not a claim of crash-durable installation.
+async fn write_downloaded_bytes(
+    file: &mut tokio::fs::File,
+    bytes: &[u8],
+) -> Result<(), UpdateError> {
+    file.write_all(bytes)
         .await
         .map_err(|e| UpdateError::DownloadFailed(format!("Failed to write file: {}", e)))?;
-
+    file.flush()
+        .await
+        .map_err(|e| UpdateError::DownloadFailed(format!("Failed to complete file write: {}", e)))?;
     Ok(())
 }
 
@@ -502,6 +516,113 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    // The same independently generated, throwaway-key fixture as verify.rs.
+    // Never replace the production pinned key or relax the signature parser.
+    const SIGNED_PAYLOAD: &[u8] = b"rch minisign test payload v1\n";
+    const FIXTURE_KEY: &str = "RWTZPaZ0gaEhqMa/pPZEdaALWkxxAm/EtQzB6egPldD4Uh1cCRlw/b0w";
+    const FIXTURE_SIGNATURE: &str = "untrusted comment: signature from minisign secret key\n\
+RUTZPaZ0gaEhqDSXunnChY49+8G9WeMdP7wwnCG9s382LwYf7h09hfwypAG0pKwYrhcX+N1Ujyzv1r4ZpRClO4To6jTL1DR1ewo=\n\
+trusted comment: rch test fixture\n\
+xfmvGjlaWGXfdNKtFwBNm45V0V6VPZ3lLFhIzfLmQ7xUjPzacD1iHPC0MO2oczUBCt2gAZtoGnuQMxpswMpMCw==\n";
+
+    #[test]
+    fn signature_handoff_waits_for_the_actual_file_write() {
+        use std::future::Future;
+        use std::task::Poll;
+
+        // Own the runtime and its sole blocking thread: no timing race, global
+        // environment mutation, worker access, or dependency on host load.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            for complete_write in [false, true] {
+                let directory = TempDir::new().unwrap();
+                let path = directory.path().join("release.minisig");
+                let mut file = tokio::fs::File::from_std(std::fs::File::create(&path).unwrap());
+                let (release, held) = std::sync::mpsc::channel();
+                let (ready, started) = tokio::sync::oneshot::channel();
+                let blocker = tokio::task::spawn_blocking(move || {
+                    ready.send(()).unwrap();
+                    held.recv_timeout(Duration::from_secs(10))
+                });
+                started.await.unwrap();
+
+                let mut write = Box::pin(async {
+                    if complete_write {
+                        write_downloaded_bytes(&mut file, FIXTURE_SIGNATURE.as_bytes()).await
+                    } else {
+                        // Exact old handoff as a negative control. Tokio may
+                        // acknowledge the buffer before its file write runs.
+                        file.write_all(FIXTURE_SIGNATURE.as_bytes())
+                            .await
+                            .map_err(|error| UpdateError::DownloadFailed(error.to_string()))
+                    }
+                });
+                let polled = std::future::poll_fn(|cx| Poll::Ready(write.as_mut().poll(cx))).await;
+                let was_pending = polled.is_pending();
+                let before = std::fs::read(&path).unwrap();
+                // Release before assertions so failures cannot strand a task.
+                release.send(()).unwrap();
+                let result = match polled {
+                    Poll::Ready(result) => result,
+                    Poll::Pending => write.as_mut().await,
+                };
+                drop(write);
+                blocker.await.unwrap().unwrap();
+                // Drain the deliberately unsafe old control before teardown.
+                file.flush().await.unwrap();
+                result.unwrap();
+                assert_eq!(was_pending, complete_write);
+                assert!(before.is_empty(), "the held write must not have run");
+                let completed = std::fs::read_to_string(&path).unwrap();
+                assert_eq!(completed, FIXTURE_SIGNATURE);
+                let signature = minisign_verify::Signature::decode(&completed).unwrap();
+                let key = minisign_verify::PublicKey::from_base64(FIXTURE_KEY).unwrap();
+                key.verify(SIGNED_PAYLOAD, &signature, false).unwrap();
+                assert!(key.verify(b"modified payload", &signature, false).is_err());
+                if !complete_write {
+                    assert!(minisign_verify::Signature::decode(
+                        std::str::from_utf8(&before).unwrap()
+                    ).is_err());
+                }
+            }
+        });
+    }
+
+    #[tokio::test]
+    async fn delayed_local_write_failure_is_not_success_or_retryable() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("read-only-handle");
+        std::fs::write(&path, b"preserve existing bytes").unwrap();
+        // A read-only descriptor deterministically fails its queued write,
+        // including when the tests run as root. No permission-bit assumption.
+        let mut file = tokio::fs::File::from_std(std::fs::File::open(&path).unwrap());
+        let error = write_downloaded_bytes(&mut file, FIXTURE_SIGNATURE.as_bytes())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, UpdateError::DownloadFailed(_)));
+        assert!(!is_transient_error(&error));
+        assert_eq!(std::fs::read(&path).unwrap(), b"preserve existing bytes");
+    }
+
+    #[tokio::test]
+    async fn completed_download_writes_are_immediately_visible_at_buffer_boundaries() {
+        let directory = TempDir::new().unwrap();
+        for length in [0, 1, 4095, 4096, 4097, 131_073] {
+            let path = directory.path().join(format!("asset-{length}"));
+            let mut file = tokio::fs::File::from_std(std::fs::File::create(&path).unwrap());
+            file.set_max_buf_size(4096);
+            let bytes: Vec<u8> = (0..length).map(|index| (index % 251) as u8).collect();
+            write_downloaded_bytes(&mut file, &bytes).await.unwrap();
+            // Deliberately use a different synchronous reader with no runtime
+            // yield/flush between return and verification.
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        }
+    }
+
     #[test]
     fn signature_enforced_only_with_bundle_cosign_and_no_skip() {
         // Full enforcement: a bundle is published, no --skip-verify, cosign present.
@@ -593,7 +714,7 @@ mod tests {
         assert!(is_transient_error(&e));
 
         // 429 → NetworkError (transient → retried).
-        let e = classify_http_status(StatusCode::TOO_MANY_REQUESTS);
+        let e = classify_http_status(reqwest::StatusCode::TOO_MANY_REQUESTS);
         assert!(is_transient_error(&e));
 
         // 404 → DownloadFailed (terminal → NOT retried).
