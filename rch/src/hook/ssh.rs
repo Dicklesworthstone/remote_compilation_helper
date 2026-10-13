@@ -2627,6 +2627,98 @@ printf 'legacy identity escaped its fence\n' > "$marker"
         }
     }
 
+    /// The registry runs under the WORKER's `sh`. macOS workers have bash 3.2
+    /// there (a bare `pattern)` inside `$(...)` is a parse error), BSD awk
+    /// (no NUL in strings) and BSD realpath/mv, so every source-claimed build
+    /// to a Mac worker was refused at the registry (2026-10-13).
+    #[test]
+    fn source_registry_script_parses_under_the_system_sh() {
+        let script = format!(
+            "{}\n{}",
+            rch_common::stale_target_reap::SOURCE_CLAIM_RECORD_HELPERS,
+            SOURCE_CLAIM_REGISTRY,
+        );
+        let output = std::process::Command::new("/bin/sh")
+            .args(["-n", "-c", &script])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn durable_source_registry_lifecycle_runs_on_the_workers_userland() {
+        let gnu_realpath = ["realpath -m /", "grealpath -m /"].iter().any(|probe| {
+            std::process::Command::new("sh")
+                .args(["-c", &format!("{probe} >/dev/null 2>&1")])
+                .status()
+                .is_ok_and(|status| status.success())
+        });
+        let flock = std::process::Command::new("sh")
+            .args(["-c", "command -v flock >/dev/null"])
+            .status()
+            .is_ok_and(|status| status.success());
+        if !gnu_realpath || !flock {
+            eprintln!("skipping: needs flock and GNU realpath (grealpath on macOS)");
+            return;
+        }
+        let directory = tempfile::Builder::new()
+            .prefix("rch-source-registry-portable-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let registry = directory.path().join("registry");
+        let root = directory.path().join("source");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::create_dir_all(directory.path().join("other")).unwrap();
+        let roots = |path: &Path| vec![path.display().to_string()];
+        let run = |path: PathBuf, identity: String, operation: &'static str| {
+            let registry = registry.clone();
+            async move {
+                let command = source_intent_command(
+                    registry.to_str().unwrap(),
+                    &roots(&path),
+                    &identity,
+                    operation,
+                )
+                .unwrap();
+                Command::new("sh")
+                    .args(["-c", &command])
+                    .kill_on_drop(true)
+                    .output()
+                    .await
+                    .unwrap()
+            }
+        };
+        let id = || uuid::Uuid::new_v4().simple().to_string();
+        let owner = id();
+        let ok = |output: &Output| {
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+
+        ok(&run(root.clone(), owner.clone(), "acquire").await);
+        let overlapping = run(root.join("sub"), id(), "acquire").await;
+        assert!(!overlapping.status.success());
+        assert!(
+            String::from_utf8_lossy(&overlapping.stderr).contains("overlapping source owner"),
+            "{}",
+            String::from_utf8_lossy(&overlapping.stderr)
+        );
+        ok(&run(directory.path().join("other"), id(), "acquire").await);
+        ok(&run(root.clone(), owner.clone(), "recover").await);
+        ok(&run(root.clone(), owner, "release").await);
+        ok(&run(root.join("sub"), id(), "acquire").await);
+        // Cancelling an intent that never acquired leaves an unowned tombstone.
+        ok(&run(directory.path().join("never"), id(), "cancel").await);
+    }
+
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn durable_source_intent_cancel_fences_absent_and_late_claims() {

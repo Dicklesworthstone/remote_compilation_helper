@@ -53,6 +53,15 @@ const SOURCE_GC_CHECKED_RETIREMENT: &str = "if ! __gc_source_end; then \
 /// quarantined: active or cancelling records may already authorize activity.
 /// Private writes stay outside the record globs until their bytes are durable.
 pub const SOURCE_CLAIM_RECORD_HELPERS: &str = r#"
+rch_realpath_m() {
+    # GNU `realpath -m` and `mv -T`. macOS workers put BSD tools first on PATH
+    # and GNU coreutils g-prefixed (Homebrew); without coreutils this still
+    # fails closed, as it always has.
+    if command -v grealpath >/dev/null 2>&1; then grealpath -m -- "$@"; else realpath -m -- "$@"; fi;
+};
+rch_mv_T() {
+    if command -v gmv >/dev/null 2>&1; then gmv -T -- "$@"; else mv -T -- "$@"; fi;
+};
 rch_claim_name() {
     __rch_name=${1##*/}; __rch_token=${__rch_name%%.*};
     __rch_digest=${__rch_name#*.}; __rch_digest=${__rch_digest%%.*};
@@ -115,12 +124,13 @@ rch_claim_quarantine_pending() {
     # Old in-flight dispatcher scripts do not know quarantine/. They DO
     # reject this incomplete cancelling record, so cannot revive the token.
     sync -f "$1" || return 1;
-    mv -T -- "$2" "$__rch_quarantined" || return 1;
+    rch_mv_T "$2" "$__rch_quarantined" || return 1;
     sync -f "$1/quarantine" && sync -f "$1" || return 1;
     printf 'RCH_SOURCE_CLAIM_QUARANTINED %s\n' "$__rch_quarantined" >&2;
 };
 rch_claim_write_atomic() {
-    # The existing workers already require GNU sync -f/sha256sum/realpath.
+    # Workers need GNU realpath -m and mv -T (see rch_realpath_m); BSD
+    # sync ignores -f, and macOS sha256sum prints the GNU format.
     # A failed write/fsync/rename leaves private evidence, never a partially
     # visible .pending or .cancelling record. No failure path deletes bytes.
     [ ! -e "$2" ] && [ ! -L "$2" ] || return 1;
@@ -132,7 +142,7 @@ rch_claim_write_atomic() {
         return 1;
     fi;
     [ ! -e "$2" ] && [ ! -L "$2" ] || return 1;
-    mv -T -- "$__rch_temporary" "$2" && sync -f "$1";
+    rch_mv_T "$__rch_temporary" "$2" && sync -f "$1";
 };
 "#;
 
@@ -467,7 +477,7 @@ __gc_source_recent_activity() {
     return 2;
 };
 __gc_source_realpath() {
-    __gc_resolved=$(realpath -m -- "$1" && printf '.') || return 1;
+    __gc_resolved=$(rch_realpath_m "$1" && printf '.') || return 1;
     __gc_resolved=${__gc_resolved%.}; __gc_resolved=${__gc_resolved%?};
     __gc_lines=$(printf '%s\n' "$__gc_resolved" | wc -l);
     __gc_cr=$(printf '\r');

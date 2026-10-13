@@ -32,7 +32,7 @@ physical_batch() {
     # argument is essential: a newline in a symlink target must not turn one
     # root into several apparently independent roots. realpath emits at least
     # one line per input, so any embedded newline makes the count disagree.
-    physical=$(realpath -m -- "$@" && printf '.') || refuse 'cannot resolve physical source root'
+    physical=$(rch_realpath_m "$@" && printf '.') || refuse 'cannot resolve physical source root'
     physical=${physical%.}
     newline='
 '
@@ -83,15 +83,20 @@ closures_overlap() {
             printf '%s\n' "$1" &&
             printf 'RCH_HELD_ROOTS_BEGIN\n' &&
             {
+                # Leading-paren patterns: bash 3.2 (macOS /bin/sh) misparses
+                # a bare `pattern)` inside $(...) as closing the substitution.
                 case "$2" in
-                    file) cat -- "$3" ;;
-                    roots) printf '%s\n' "$3" ;;
-                    *) false ;;
+                    (file) cat -- "$3" ;;
+                    (roots) printf '%s\n' "$3" ;;
+                    (*) false ;;
                 esac
             } &&
             printf 'RCH_ROOTS_END\n'
         } | LC_ALL=C awk '
-            BEGIN { nodes = 1; phase = 0 }
+            # BSD awk (macOS) cannot hold NUL: sprintf("%c", 0) is "" there,
+            # and index(s, "") is 1, which refused every root. A shell value
+            # cannot carry NUL either, so the check needs a real NUL to test.
+            BEGIN { nodes = 1; phase = 0; nul = sprintf("%c", 0) }
             $0 == "RCH_HELD_ROOTS_BEGIN" {
                 if (phase != 0 || !wanted) bad = 1
                 phase = 1
@@ -104,7 +109,7 @@ closures_overlap() {
             }
             {
                 if (phase > 1 || substr($0, 1, 1) != "/" ||
-                    index($0, "\r") || index($0, sprintf("%c", 0))) {
+                    index($0, "\r") || (length(nul) == 1 && index($0, nul))) {
                     bad = 1
                     next
                 }
@@ -183,7 +188,7 @@ repair_empty_legacy_cancelling() {
     fi
     [ ! -L "$1" ] && [ -f "$1" ] && [ ! -s "$1" ] \
         || refuse 'legacy cancellation changed during repair'
-    mv -T -- "$repair" "$1"
+    rch_mv_T "$repair" "$1"
     sync -f "$registry"
     printf 'RCH_SOURCE_CLAIM_REPAIRED_EMPTY_CANCELLATION %s\n' "$1" >&2
 }
