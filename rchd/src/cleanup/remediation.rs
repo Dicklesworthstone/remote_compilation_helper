@@ -302,10 +302,7 @@ impl Remediations {
             // observer pause may have occurred since this future was queued.
             // There is then no await before cancel_build's synchronous admission.
             let wait = async move {
-                let Some(current) = fresh_candidate(&owner, &build, &mut admission_observation)
-                else {
-                    return None;
-                };
+                let current = fresh_candidate(&owner, &build, &mut admission_observation)?;
                 let response = owner
                     .context
                     .cancellation
