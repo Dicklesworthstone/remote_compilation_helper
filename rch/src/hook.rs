@@ -711,6 +711,31 @@ fn rustup_toolchain_from_command_tokens(tokens: &[String]) -> Option<String> {
     None
 }
 
+/// Wait (bounded) while a daemon restart holds admission closed, keeping the
+/// durable lease's heartbeat fresh and telling the caller once why it waits.
+async fn await_restart_admission(
+    socket_path: &str,
+    durable_lease: &DurableLeaseWriter,
+    reporter: &HookReporter,
+) -> RestartAdmissionWait {
+    let mut polls: u32 = 0;
+    wait_for_restart_admission(
+        async || restart_admission_is_closed(socket_path).await,
+        restart_admission_wait_bound(),
+        std::time::Duration::from_secs(1),
+        || {
+            if polls == 0 {
+                reporter.summary("[RCH] waiting: daemon restart in progress (admission paused)");
+            }
+            if polls.is_multiple_of(10) {
+                let _ = durable_lease.heartbeat("restart_admission_wait");
+            }
+            polls = polls.saturating_add(1);
+        },
+    )
+    .await
+}
+
 fn exec_requires_remote() -> bool {
     std::env::var(RCH_REQUIRE_REMOTE_ENV).is_ok_and(|value| env_flag_enabled(&value))
 }
@@ -3592,9 +3617,10 @@ pub async fn run_exec(
     )?;
     let wrapper_id = durable_lease.wrapper_id();
 
-    if restart_admission_is_closed(&config.general.socket_path)
-        .await
-        .unwrap_or(false)
+    // A daemon restart closes admission for its drain window. Wait for it
+    // (bounded) instead of failing every build that arrives meanwhile.
+    if await_restart_admission(&config.general.socket_path, &durable_lease, &reporter).await
+        == RestartAdmissionWait::StillClosed
     {
         durable_lease.heartbeat("restart_admission_blocked")?;
         return Err(anyhow::anyhow!(
@@ -3659,9 +3685,9 @@ pub async fn run_exec(
                 config.general.socket_path = recovered_socket.to_string_lossy().into_owned();
                 // The original endpoint's restart gate says nothing about
                 // a daemon discovered in another runtime-directory context.
-                if restart_admission_is_closed(&config.general.socket_path)
+                if await_restart_admission(&config.general.socket_path, &durable_lease, &reporter)
                     .await
-                    .unwrap_or(false)
+                    == RestartAdmissionWait::StillClosed
                 {
                     durable_lease.heartbeat("restart_admission_blocked")?;
                     anyhow::bail!(
@@ -4928,11 +4954,12 @@ use rabs_recorder::record_invocation;
 // `record_build` / `queue_when_busy_enabled` are re-exported for the hook hot
 // path. The timeout helpers and `urlencoding_encode` stay `pub(super)` for tests.
 mod daemon_ipc;
+pub(crate) use daemon_ipc::{
+    RestartAdmissionWait, query_daemon, query_daemon_dry_run, release_worker,
+    restart_admission_is_closed, restart_admission_wait_bound, wait_for_restart_admission,
+};
 use daemon_ipc::{
     disable_worker_for_fault, queue_when_busy_enabled, record_build, release_worker_with_fault,
-};
-pub(crate) use daemon_ipc::{
-    query_daemon, query_daemon_dry_run, release_worker, restart_admission_is_closed,
 };
 
 // Command-string parsing utilities (tokenization + cargo flag/env analyzers +
