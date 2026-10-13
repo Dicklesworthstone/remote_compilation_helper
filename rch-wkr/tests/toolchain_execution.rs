@@ -151,7 +151,10 @@ impl Fixture {
 
     fn assert_not_run(&self, output: &Output) {
         assert!(!output.status.success(), "unexpected success: {output:?}");
-        assert!(!self.path("cargo").exists(), "default compiler was executed");
+        assert!(
+            !self.path("cargo").exists(),
+            "default compiler was executed"
+        );
         assert!(
             !self.events().iter().any(|event| event == "execute"),
             "a user-command dispatch was attempted after preparation failure"

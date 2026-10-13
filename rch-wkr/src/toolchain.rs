@@ -120,7 +120,10 @@ pub fn install_toolchain(toolchain: &str) -> Result<()> {
                 toolchain
             )));
         }
-        info!("Successfully installed and verified toolchain {}", toolchain);
+        info!(
+            "Successfully installed and verified toolchain {}",
+            toolchain
+        );
         Ok(())
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
