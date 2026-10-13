@@ -19,6 +19,8 @@ use tokio::sync::{Mutex, Notify, RwLock};
 use tokio::time::interval;
 use tracing::{debug, info, warn};
 
+mod registry_health;
+
 fn is_mock_transport(_worker: &WorkerState) -> bool {
     // In mock mode, we assume mock config is active
     // We can't easily check worker.config without async lock here,
@@ -535,16 +537,19 @@ impl HealthMonitor {
                     // selection never consulted.
                     //
                     // A probe that connected but whose command never completed
-                    // is command-class evidence (issue #48): it must block a
-                    // half-open close and trip the breaker on its own threshold
-                    // even when interleaved liveness probes succeed.
-                    let (previous_circuit_state, new_circuit_state) = if result.command_failure {
-                        worker.record_command_outcome(false, &config.circuit).await
-                    } else {
-                        worker
-                            .record_health_check(result.healthy, result.transient, &config.circuit)
-                            .await
-                    };
+                    // is command-class evidence (issue #48). Successful real
+                    // probes now execute storage operations too, so they can
+                    // supply command-class recovery rather than just liveness.
+                    let (previous_circuit_state, new_circuit_state) =
+                        if result.command_failure || result.healthy {
+                            worker
+                                .record_command_outcome(result.healthy, &config.circuit)
+                                .await
+                        } else {
+                            worker
+                                .record_health_check(result.healthy, result.transient, &config.circuit)
+                                .await
+                        };
 
                     if result.healthy {
                         worker.set_last_latency_ms(Some(result.response_time_ms));
@@ -555,10 +560,10 @@ impl HealthMonitor {
                     // Derive the health-facing status from the authoritative
                     // circuit outcome via the shared mapping, then apply it to the
                     // worker lifecycle (respecting admin intent / quarantine).
-                    let new_status = derive_worker_status(
+                    let new_status = registry_health::status_after_probe(
+                        previous_effective_status,
                         new_circuit_state,
-                        result.healthy,
-                        result.response_time_ms,
+                        &result,
                         &config,
                     );
                     let effective_status = worker.apply_health_status(new_status).await;
@@ -587,6 +592,9 @@ impl HealthMonitor {
                         &worker_id,
                     );
                     health.set_last_result(result.clone());
+                    // Keep health separate from admin intent, but include the
+                    // storage exclusion rather than the circuit-only projection.
+                    health.current_status = new_status;
 
                     // Track unreachable workers for all-workers-offline alert
                     if effective_status == WorkerStatus::Unreachable {
@@ -891,7 +899,7 @@ fn pooled_error_stage(message: &str, retryable: bool) -> ProbeStage {
     }
 }
 
-/// Perform ONE health-probe attempt (connect + `echo health_check`) against a
+/// Perform ONE health-probe attempt (connect + source-registry storage probe) against a
 /// worker over a throwaway SSH session. Returns `Ok(())` on the expected
 /// sentinel, or a classified [`HealthProbeError`] otherwise. The retry policy
 /// lives in the caller ([`check_worker_health`]).
@@ -900,6 +908,7 @@ async fn probe_health_once(
     ssh_options: SshOptions,
     ssh_pool: Option<&Arc<rch_common::SshPool>>,
 ) -> Result<(), HealthProbeError> {
+    let command = registry_health::command();
     // Pooled path: run over the warm shared ControlMaster. run_with_timeout
     // collapses connect+execute into one call; classify any error as retryable
     // via the shared transport-error heuristic so the caller's retry/transient
@@ -907,7 +916,7 @@ async fn probe_health_once(
     if let Some(pool) = ssh_pool {
         let command_timeout = ssh_options.command_timeout;
         return match pool
-            .run_with_timeout(worker_config, "echo health_check", command_timeout)
+            .run_with_timeout(worker_config, &command, command_timeout)
             .await
         {
             Ok(result) => classify_health_output(&result),
@@ -927,7 +936,7 @@ async fn probe_health_once(
     let mut client = SshClient::new(worker_config.clone(), ssh_options);
 
     match client.connect().await {
-        Ok(()) => match client.execute("echo health_check").await {
+        Ok(()) => match client.execute(&command).await {
             Ok(result) => {
                 let _ = client.disconnect().await;
                 classify_health_output(&result)
@@ -953,23 +962,10 @@ async fn probe_health_once(
     }
 }
 
-/// Map a health-probe command result onto the expected `echo health_check`
-/// sentinel. A command that ran but produced the wrong output is not a transport
-/// blip (not retryable).
+/// Classify the storage probe, preserving explicit refusal evidence even when
+/// diagnostic output must be truncated for display.
 fn classify_health_output(result: &rch_common::CommandResult) -> Result<(), HealthProbeError> {
-    if result.success() && result.stdout.trim().eq("health_check") {
-        Ok(())
-    } else {
-        Err(HealthProbeError {
-            message: format!(
-                "Unexpected response: exit={}, stdout={}",
-                result.exit_code,
-                result.stdout.trim()
-            ),
-            retryable: false,
-            stage: ProbeStage::Command,
-        })
-    }
+    registry_health::classify_output(result)
 }
 
 /// Perform a one-time health check on a worker.
