@@ -13,10 +13,28 @@ rch_valid_boot() {
     return 1
 }
 
+# /proc can belong to an ancestor PID namespace while kill uses ours. Never
+# interpret that foreign view as ownership, or as proof that a group is empty.
+# NSpid lists IDs from procfs's namespace through our active namespace. Require
+# exactly our own ID: equality with just the first ID can occur by coincidence.
+# Use builtin read so /proc/self describes this shell, not a spawned reader.
+# Missing namespace evidence (including older kernels) fails closed.
+rch_check_procfs_namespace() {
+    while IFS= read -r rch_status_line; do
+        case "$rch_status_line" in
+            NSpid:*)
+                set -- ${rch_status_line#NSpid:}
+                [ "$#" -eq 1 ] && [ "$1" = "$$" ]
+                return $?;;
+        esac
+    done < /proc/self/status 2>/dev/null
+    return 1
+}
+
 # Read a member of the bound group, including comm with spaces or parentheses.
 # Function positional arguments do not replace the launcher's command arguments.
 rch_read_process() {
-    rch_valid_pgid "$1" || return 1
+    rch_valid_pgid "$1" && rch_check_procfs_namespace || return 1
     rch_proc_pid=$1
     rch_observed_boot=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null) || return 1
     rch_valid_boot "$rch_observed_boot" || return 1
@@ -25,7 +43,9 @@ rch_read_process() {
     rch_stat=${rch_stat##*) }
     set -- $rch_stat
     [ "$#" -ge 20 ] && [ "$3" = "$rch_pgid" ] || return 1
-    case "$1" in Z|X) return 1;; esac
+    # Keep the same conservative state grammar as process_identity.rs. An
+    # unknown future state is not authority to signal a process group.
+    case "$1" in R|S|D|T|t|K|W|P|I) ;; *) return 1;; esac
     shift 19
     rch_observed_start=$1
     case "$rch_observed_start" in ''|*[!0-9]*|0*) return 1;; esac
@@ -89,11 +109,12 @@ rch_read_record() {
 # 0: no executing members; 1: live members; 2: observation unavailable.
 # kill -0 cannot distinguish ESRCH from EPERM, or live processes from zombies.
 rch_group_state() {
+    rch_check_procfs_namespace || return 2
     rch_snapshot=$(LC_ALL=C ps -e -o pid= -o pgid= -o stat=) || return 2
     printf '%s\n' "$rch_snapshot" | LC_ALL=C awk -v group="$rch_pgid" -v observer="$$" '
-        NF != 3 || $1 !~ /^[0-9]+$/ || $2 !~ /^[0-9]+$/ || $3 !~ /^[A-Za-z][A-Za-z0-9+<>-]*$/ { bad = 1; next }
+        NF != 3 || $1 !~ /^[0-9]+$/ || $2 !~ /^[0-9]+$/ || $3 !~ /^[RSDTtKWPIXZx][A-Za-z0-9+<>-]*$/ { bad = 1; next }
         $1 == observer { seen = 1; if ($2 == group) bad = 1 }
-        $2 == group && $3 !~ /^[ZX]/ { live = 1 }
+        $2 == group && $3 !~ /^[ZXx]/ { live = 1 }
         END { if (bad || !seen) exit 2; if (live) exit 1; exit 0 }
     '
 }
@@ -108,7 +129,7 @@ rch_capture_group_witnesses() {
     [ "$rch_identified" -eq 1 ] && rch_remote_leader_matches || return 43
     # rch_group_state already validated this snapshot, including our observer.
     rch_member_pids=$(printf '%s\n' "$rch_snapshot" | LC_ALL=C awk -v group="$rch_pgid" '
-        $2 == group && $3 !~ /^[ZX]/ { print $1 }
+        $2 == group && $3 !~ /^[ZXx]/ { print $1 }
     ') || return 44
     for rch_member_pid in $rch_member_pids; do
         if rch_read_process "$rch_member_pid" && [ "$rch_observed_boot" = "$rch_boot" ]; then
