@@ -5,6 +5,45 @@
 # This is the existing rch-build argv ABI, not a new worker installation.
 # V1 owns a process group; only configured V2 scopes cover setsid descendants.
 
+# Dash redirects an asynchronous command's stdin to /dev/null BEFORE applying
+# that command's redirections: <&0 alone cannot preserve the original input.
+# Borrow an unused descriptor, duplicate the original open file description,
+# then explicitly bind it back to fd 0 in the child. Never reopen a pathname
+# (which resets file offsets), spool input, or overwrite inherited authority FDs.
+# Procfs is already a launch prerequisite and the namespace check names THIS
+# shell, including when a function is invoked from a subshell.
+rch_scope_launch_save_input() {
+    __sl_input= __sl_input_redirect=
+    rch_check_procfs_namespace || return 1
+    __sl_fd_dir=/proc/$rch_self_pid/fd
+    [ -r "$__sl_fd_dir" ] && [ -x "$__sl_fd_dir" ] || return 1
+    if [ ! -e "$__sl_fd_dir/0" ] && [ ! -L "$__sl_fd_dir/0" ]; then
+        __sl_input_redirect='0<&-'
+        return 0
+    fi
+    for __sl_input_candidate in 4 5 6 7 8 9; do
+        if [ ! -e "$__sl_fd_dir/$__sl_input_candidate" ] &&
+            [ ! -L "$__sl_fd_dir/$__sl_input_candidate" ]; then
+            __sl_input=$__sl_input_candidate
+            # Only this literal single-digit selection enters eval. No input,
+            # path, argument or environment value becomes shell program text.
+            eval "exec $__sl_input<&0" || return 1
+            __sl_input_redirect="0<&$__sl_input $__sl_input<&-"
+            return 0
+        fi
+    done
+    return 1
+}
+
+rch_scope_launch_close_input() {
+    case "$__sl_input" in
+        [4-9]) eval "exec $__sl_input<&-" || return 1;;
+        '') return 0;;
+        *) return 1;;
+    esac
+    __sl_input=
+}
+
 # Snapshot receiver policy once. Never let removal/change between route selection
 # and child launch silently put a requested scope on the legacy PGID-only route.
 rch_scope_launch_select() {
@@ -145,7 +184,13 @@ rch_scope_launch_child() {
             sleep 0.2 3>&- || exit 255
         done
     ) >/dev/null 2>&1 </dev/null &
-    "$@" 3>&- & __sl_payload=$!
+    # Start the watchdog first so it never inherits the borrowed input FD.
+    # Admission has already occurred: failure here is uncertain execution,
+    # never the pre-workload capability refusal that permits fallback.
+    rch_scope_launch_save_input || { rch_scope_launch_kill_self; exit 255; }
+    eval '"$@" 3>&- '"$__sl_input_redirect"' &'
+    __sl_payload=$!
+    rch_scope_launch_close_input
     wait "$__sl_payload"; __sl_status=$?
     [ "$__sl_cancelled" != 1 ] || __sl_status=143
     # This is only a command-status report, NEVER a completion receipt. The
@@ -207,12 +252,19 @@ rch_scope_launch_supervise() {
     __sl_control=$(umask 077; mktemp -d "$__sl_record.supervisor.XXXXXXXX") || return 125
     __sl_cancelled=0
     trap '__sl_cancelled=1' HUP INT TERM
-    setsid /bin/sh -c "$rch_launch_source
+    rch_scope_launch_save_input || {
+        printf '\n%s_IDENTITY_UNAVAILABLE\n' "$__sl_marker" >&2
+        return 125
+    }
+    # Arguments and the literal source expand as QUOTED argument values inside
+    # eval; only the fixed descriptor redirection is assembled as syntax.
+    eval 'setsid /bin/sh -c "$rch_launch_source
 rch_scope_launch_child \"\$@\"" rch-scoped-child \
         "$__sl_record" "$__sl_control" "$__sl_marker" "$__sl_build" \
         "$$" "$__sl_parent_start" "$__sl_limit" \
-        "$rch_launch_nice" "$rch_launch_slice" "$rch_launch_manager" "$@" &
+        "$rch_launch_nice" "$rch_launch_slice" "$rch_launch_manager" "$@" '"$__sl_input_redirect"' &'
     __sl_child=$!
+    rch_scope_launch_close_input
     __sl_child_start=; __sl_admitted=0; __sl_reason=setup
     rch_scope_launch_clock || return 255
     __sl_setup_started=$rch_launch_now
