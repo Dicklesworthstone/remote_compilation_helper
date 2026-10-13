@@ -1,12 +1,13 @@
 //! Command execution on worker.
 
+mod relay;
+
 use anyhow::Result;
 use rch_common::types::RequiredRuntime;
 use std::io::Write as _;
 use std::path::Path;
 use std::process::Stdio;
 use thiserror::Error;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tracing::{debug, error, info};
 
@@ -488,80 +489,27 @@ pub async fn execute(workdir: &str, command: &str) -> Result<()> {
 
     let mut child = cmd.spawn()?;
 
-    // Stream stdout
-    let mut stdout = child.stdout.take().expect("Failed to capture stdout");
-    let mut stderr = child.stderr.take().expect("Failed to capture stderr");
+    let stdout = child.stdout.take().expect("Failed to capture stdout");
+    let stderr = child.stderr.take().expect("Failed to capture stderr");
 
-    // Each relay task returns `true` only if it drained the child pipe to EOF and
-    // relayed every byte to the client. A read error (child output incomplete) or
-    // a write/flush error (the SSH channel back to the client closed/back-pressured
-    // then failed) returns `false` so the caller knows the client saw a truncated
-    // stream and must not trust a "success" exit status.
-    let stdout_task = tokio::spawn(async move {
-        let mut buffer = [0u8; 4096];
-        let mut out = tokio::io::stdout();
-        loop {
-            match stdout.read(&mut buffer).await {
-                Ok(0) => break, // EOF
-                Ok(n) => {
-                    if let Err(e) = out.write_all(&buffer[..n]).await {
-                        error!("Failed to write to stdout: {}", e);
-                        return false;
-                    }
-                    if let Err(e) = out.flush().await {
-                        error!("Failed to flush stdout: {}", e);
-                        return false;
-                    }
-                }
-                Err(e) => {
-                    error!("Failed to read from command stdout: {}", e);
-                    return false;
-                }
-            }
-        }
-        true
-    });
-
-    let stderr_task = tokio::spawn(async move {
-        let mut buffer = [0u8; 4096];
-        let mut err = tokio::io::stderr();
-        loop {
-            match stderr.read(&mut buffer).await {
-                Ok(0) => break, // EOF
-                Ok(n) => {
-                    if let Err(e) = err.write_all(&buffer[..n]).await {
-                        error!("Failed to write to stderr: {}", e);
-                        return false;
-                    }
-                    if let Err(e) = err.flush().await {
-                        error!("Failed to flush stderr: {}", e);
-                        return false;
-                    }
-                }
-                Err(e) => {
-                    error!("Failed to read from command stderr: {}", e);
-                    return false;
-                }
-            }
-        }
-        true
-    });
-
-    // Wait for process to complete
-    let status = child.wait().await?;
-
-    // Wait for output tasks; a panicked relay task (JoinError) is treated as a
-    // non-clean relay.
-    let stdout_relayed = stdout_task.await.unwrap_or(false);
-    let stderr_relayed = stderr_task.await.unwrap_or(false);
+    // A descendant may retain either pipe after the foreground command exits.
+    // Drain both while waiting, then bound the remaining EOF wait. Keeping the
+    // relays inside this future also prevents cancellation from detaching them.
+    let (status, stdout_relayed, stderr_relayed) = relay::collect(
+        child.wait(),
+        relay::stream(stdout, tokio::io::stdout(), "stdout"),
+        relay::stream(stderr, tokio::io::stderr(), "stderr"),
+        relay::POST_EXIT_DRAIN,
+    )
+    .await?;
 
     if status.success() {
         if !stdout_relayed || !stderr_relayed {
             // Exit status says success, but the client only received a truncated
             // output stream. Reporting success would make the result and the
             // (incomplete) output inconsistent — the client would trust a build
-            // whose output it never fully saw. Surface a distinct failure so the
-            // client fails open / retries instead.
+            // whose output it never fully saw. Surface a distinct failure;
+            // this does not authorize retrying a stateful command.
             error!(
                 "Command exited 0 but output relay was truncated (stdout_ok={stdout_relayed}, stderr_ok={stderr_relayed})"
             );
