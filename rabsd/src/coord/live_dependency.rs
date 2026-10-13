@@ -68,6 +68,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+mod capture_pins;
+use capture_pins::CapturePins;
+
 /// Decision-receipt kind binding an action key to its canonical
 /// transcript object. The binding is verified against the committed
 /// observable digest on every read; it is an index, never authority.
@@ -301,6 +304,8 @@ struct CapturedLocalResult {
     transcript: ObjectId,
     manifest_key: String,
     known: Vec<KnownOutput>,
+    // Retain every captured object while the wrapper acknowledges the handoff.
+    pins: CapturePins,
 }
 
 impl CapturedLocalAttempt {
@@ -367,10 +372,15 @@ fn object_id(bytes: &[u8]) -> Result<TypedDigest, String> {
         .map_err(|error| format!("digest: {error:?}"))
 }
 
-/// Durably store one object. The store lock is held for this object only.
-fn put_bytes(cas: &crate::janitor::store::LiveCas, bytes: &[u8]) -> Result<ObjectId, String> {
+/// Durably store and pin one object under the same per-object store lock.
+fn put_bytes(
+    cas: &crate::janitor::store::LiveCas,
+    bytes: &[u8],
+    pins: &mut CapturePins,
+) -> Result<ObjectId, String> {
     let id = object_id(bytes)?;
     let mut store = cas.store().lock().map_err(|_| "store lock poisoned")?;
+    pins.protect(&mut *store, &id)?;
     put_if_absent(
         cas.layout(),
         &mut *store,
@@ -392,6 +402,7 @@ fn put_bytes(cas: &crate::janitor::store::LiveCas, bytes: &[u8]) -> Result<Objec
 fn put_bundle_root(
     cas: &crate::janitor::store::LiveCas,
     outputs: &[LogicalOutput],
+    pins: &mut CapturePins,
 ) -> Result<(), String> {
     use std::io::Write;
     let bytes = rabs_key::logical_output_map::bundle_root_bytes(outputs)
@@ -401,6 +412,7 @@ fn put_bundle_root(
     // Held through the write and the location record: a concurrent
     // completion of the same result must not race the staging name.
     let mut store = cas.store().lock().map_err(|_| "store lock poisoned")?;
+    pins.protect(&mut *store, &root.0)?;
     if store
         .object_durably_located(&root.0)
         .map_err(|error| format!("{error:?}"))?
@@ -839,6 +851,7 @@ impl LocalAttempt {
 
         let cas = self.coord.live_cas().ok_or("no CAS mounted")?;
         let authority = self.authority.clone().ok_or("attempt not admitted")?;
+        let mut pins = CapturePins::new(Arc::clone(cas), &authority);
         let mut logical_outputs = Vec::with_capacity(harvested.len());
         let mut known = Vec::new();
         // Lock order is submissions -> store everywhere in the coordinator:
@@ -846,10 +859,12 @@ impl LocalAttempt {
         self.advance(AttemptState::UploadingOutputs)?;
         // Each put takes the store lock for itself only: decisions for other
         // compiles must not queue behind a whole completion's fsyncs. The
-        // commit transaction re-verifies the complete durable closure.
+        // pin installed by each put protects the object between those locks
+        // and across the asynchronous acknowledgment. The commit transaction
+        // still re-verifies the complete durable closure.
         let (transcript_id, evidence_parts) = {
             for (declaration, path, sig, bytes) in &harvested {
-                let object = put_bytes(cas, bytes)?;
+                let object = put_bytes(cas, bytes, &mut pins)?;
                 if declaration.class != OutputClass::DepInfo {
                     known.push(KnownOutput {
                         path: path.clone(),
@@ -863,8 +878,8 @@ impl LocalAttempt {
                     object,
                 });
             }
-            put_bundle_root(cas, &logical_outputs)?;
-            let transcript_id = put_bytes(cas, &transcript)?;
+            put_bundle_root(cas, &logical_outputs, &mut pins)?;
+            let transcript_id = put_bytes(cas, &transcript, &mut pins)?;
             let hex =
                 |bytes: &[u8]| -> String { bytes.iter().map(|b| format!("{b:02x}")).collect() };
             let snapshot = serde_json::to_vec(&serde_json::json!({
@@ -911,10 +926,10 @@ impl LocalAttempt {
             }))
             .map_err(|error| error.to_string())?;
             let parts = [
-                put_bytes(cas, &snapshot)?,
-                put_bytes(cas, &observed)?,
-                put_bytes(cas, &process)?,
-                put_bytes(cas, &provenance)?,
+                put_bytes(cas, &snapshot, &mut pins)?,
+                put_bytes(cas, &observed, &mut pins)?,
+                put_bytes(cas, &process, &mut pins)?,
+                put_bytes(cas, &provenance, &mut pins)?,
             ];
             (transcript_id, parts)
         };
@@ -971,8 +986,8 @@ impl LocalAttempt {
             }))
             .map_err(|error| error.to_string())
         };
-        let manifest_id = put_bytes(cas, &manifest_bytes)?;
-        let evidence_id = put_bytes(cas, &evidence_bytes(&manifest_id)?)?;
+        let manifest_id = put_bytes(cas, &manifest_bytes, &mut pins)?;
+        let evidence_id = put_bytes(cas, &evidence_bytes(&manifest_id)?, &mut pins)?;
         let offer = OfferPreparedActionResult::build(
             authority,
             stamped.manifest,
@@ -993,6 +1008,7 @@ impl LocalAttempt {
             transcript: transcript_id,
             manifest_key: digest_key(&manifest_id.0),
             known,
+            pins,
         })
     }
 
@@ -1004,6 +1020,9 @@ impl LocalAttempt {
             offer,
             transcript,
             known,
+            // Keep the owner through commit AND transcript indexing. The
+            // publication/evidence pins are independent of these capture pins.
+            pins: _pins,
             ..
         } = captured;
         let cas = self.coord.live_cas().ok_or("no CAS mounted")?;
