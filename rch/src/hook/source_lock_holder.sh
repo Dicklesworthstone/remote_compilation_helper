@@ -108,32 +108,44 @@ try:
             if identity in inodes:
                 raise ValueError("duplicate source lock inode")
             inodes.add(identity)
-            held.append((fd, path, identity))
             mode = fcntl.LOCK_EX if record[:1] == b"x" else fcntl.LOCK_SH
-            while True:
-                requester_open()
-                try:
-                    fcntl.flock(fd, mode | fcntl.LOCK_NB)
-                    break
-                except OSError as error:
-                    if error.errno not in (errno.EACCES, errno.EAGAIN):
-                        raise
-                    # A blocking flock cannot notice requester EOF, and may
-                    # hold earlier roots forever when SIGHUP is ignored.
-                    # Only contention waits; uncontended plans do not sleep.
-                    requester_open(50)
+            held.append((fd, path, identity, mode))
             verify_lock_path(path, identity)
-            # Python defaults new descriptors to close-on-exec. Inheritance
-            # is essential: the terminal protocol, not this bootstrap, owns
-            # the locks until its final exit. Never reuse fd 3 or fd 4.
-            os.set_inheritable(fd, True)
         if plan.read(1):
             raise ValueError("source lock count does not match the plan")
+    # Admission needs the whole closure, not a reserved prefix. A build
+    # blocked on one busy dependency must not monopolize other source roots
+    # throughout that build. Try in the supplied order; on contention release
+    # EVERY acquired lock before waiting. No source access or ready marker is
+    # allowed until the complete set is held. Existing blocking holders still
+    # use the same inodes and lock modes, so mutual exclusion is unchanged.
+    while True:
+        acquired = []
+        for fd, path, identity, mode in held:
+            requester_open()
+            verify_lock_path(path, identity)
+            try:
+                fcntl.flock(fd, mode | fcntl.LOCK_NB)
+                acquired.append(fd)
+            except OSError as error:
+                if error.errno not in (errno.EACCES, errno.EAGAIN):
+                    raise
+                break
+        else:
+            break
+        for fd in reversed(acquired):
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        # Observe requester EOF/early input without consuming terminal input.
+        # Only contention waits; the uncontended path does not sleep.
+        requester_open(50)
     # An earlier pathname may change while a later lock is contended. Match
     # EVERY retained descriptor to its current regular pathname at handoff,
     # not merely when each lock was acquired. No path is recreated here.
-    for _, path, identity in held:
+    for fd, path, identity, _ in held:
         verify_lock_path(path, identity)
+        # The terminal owns every lock until final exit. Python defaults new
+        # descriptors to close-on-exec; transfer them only after full admission.
+        os.set_inheritable(fd, True)
     requester_open()
     # Python ignores SIGPIPE by default; do not pass that policy to the
     # existing terminal shell. A lost reply must still terminate the holder.
