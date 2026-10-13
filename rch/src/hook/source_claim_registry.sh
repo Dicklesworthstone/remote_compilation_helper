@@ -239,6 +239,26 @@ for previous in "$registry/quarantine/$token."*.pending; do
     case "$operation" in acquire|recover) refuse 'source intent has an incomplete quarantined claim' ;; esac
 done
 
+# Terminal replies retire the caller's recovery obligations. Validate the
+# whole identity state before ANY handler can emit one or move another record:
+# valid bytes alone do not make contradictory active/terminal state safe.
+# A completed cancellation legitimately retains its cancelling marker (and a
+# quarantined unexecuted intent retains its hard-linked fence); neither can
+# coexist with an active or pending grant. Preserve all conflicting evidence.
+if [ -e "$released" ] || [ -L "$released" ]; then
+    for unfinished in "$active" "$pending" "$cancelling" "$cancelled" \
+        "$registry/quarantine/$token.$digest.pending"; do
+        [ ! -e "$unfinished" ] && [ ! -L "$unfinished" ] \
+            || refuse 'released source grant has conflicting ownership'
+    done
+fi
+if [ -e "$cancelled" ] || [ -L "$cancelled" ]; then
+    for unfinished in "$active" "$pending" "$released"; do
+        [ ! -e "$unfinished" ] && [ ! -L "$unfinished" ] \
+            || refuse 'cancelled source grant has conflicting ownership'
+    done
+fi
+
 if [ "$operation" = cancel ]; then
     if [ -e "$released" ] || [ -L "$released" ]; then
         refuse 'executed source grant was released, not cancelled'
@@ -294,7 +314,6 @@ fi
 if [ "$operation" = finish-cancel ]; then
     if [ -e "$cancelled" ] || [ -L "$cancelled" ]; then
         matches_request "$cancelled"
-        [ ! -e "$active" ] && [ ! -L "$active" ] || refuse 'duplicate cancelled grant'
         confirm_durable_record "$cancelled"
         exit 0
     fi
@@ -323,11 +342,6 @@ if [ "$operation" = release ]; then
         # must not strand the caller, but contradictory ownership is never a
         # receipt. In particular, a released grant is NOT a cancelled intent.
         matches_request "$released"
-        for unfinished in "$active" "$pending" "$cancelling" "$cancelled" \
-            "$registry/quarantine/$token.$digest.pending"; do
-            [ ! -e "$unfinished" ] && [ ! -L "$unfinished" ] \
-                || refuse 'released source grant has conflicting ownership'
-        done
         confirm_durable_record "$released"
         exit 0
     fi

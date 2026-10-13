@@ -452,6 +452,68 @@ class SourceClaimRegistryTests(unittest.TestCase):
         self.assert_granted(self.transact("bb", roots))
         self.assert_refused(self.transact("aa", roots, "recover"))
 
+    def test_terminal_verdicts_refuse_conflicting_identity_states_before_mutation(self):
+        pairs = [("released", state) for state in
+                 ("claim", "pending", "cancelling", "cancelled", "quarantine")]
+        pairs += [("cancelled", "claim"), ("cancelled", "pending")]
+        operations = ("acquire", "recover", "release", "released", "cancel", "finish-cancel")
+        for index, states in enumerate(pairs):
+            for operation in operations:
+                with self.subTest(states=states, operation=operation):
+                    # Every case has independent state so a buggy operation's
+                    # mutation cannot manufacture the next case's outcome.
+                    self.registry = self.root / (str(index) + "-" + operation)
+                    self.registry.mkdir()
+                    for directory in ("released", "cancelled", "quarantine"):
+                        (self.registry / directory).mkdir()
+                    (self.registry / ".lock").touch()
+                    roots = [self.root / "project"]
+                    for state in states:
+                        if state in ("released", "cancelled", "quarantine"):
+                            extension = "pending" if state == "quarantine" else "claim"
+                            path = self.registry / state / ("aa." + digest(roots) + "." + extension)
+                            path.write_bytes(body(roots))
+                        else:
+                            self.record("aa", roots, state)
+                    def snapshot():
+                        return {str(path.relative_to(self.registry)):
+                                (path.stat().st_ino, path.read_bytes())
+                                for path in self.registry.rglob("*") if path.is_file()}
+                    before = snapshot()
+                    result = self.transact("aa", roots, operation)
+                    self.assert_refused(result)
+                    self.assertEqual(result.stdout, b"")
+                    self.assertEqual(snapshot(), before, "conflicting evidence must be retained")
+
+    def test_terminal_checks_preserve_real_completed_and_quarantined_cancellations(self):
+        for quarantined, token in [(False, "aa"), (True, "ab")]:
+            roots = [self.root / token]
+            if quarantined:
+                pending = self.record(token, roots, "pending")
+                pending.write_bytes(b"partial write")
+                self.assert_granted(self.transact("bb", [self.root / "other"]))
+                result = self.transact(token, roots, "cancel")
+                self.assert_granted(result)
+                self.assertEqual(result.stdout, b"unowned")
+            else:
+                self.assert_granted(self.transact(token, roots))
+                result = self.transact(token, roots, "cancel")
+                self.assert_granted(result)
+                self.assertEqual(result.stdout, b"owned")
+                self.assert_granted(self.transact(token, roots, "finish-cancel"))
+            # Cancellation deliberately keeps its marker. The hard-linked
+            # quarantine fence can contain incomplete bytes, not a valid claim.
+            fence = self.registry / (token + "." + digest(roots) + ".cancelling")
+            before = (fence.stat().st_ino, fence.read_bytes())
+            for operation in ("cancel", "finish-cancel"):
+                result = self.transact(token, roots, operation)
+                self.assert_granted(result)
+                self.assertEqual(result.stdout, b"unowned" if operation == "cancel" else b"")
+            self.assertEqual((fence.stat().st_ino, fence.read_bytes()), before)
+            self.assert_granted(self.transact("cc" if quarantined else "cd", roots))
+            self.assert_refused(self.transact(token, roots, "recover"))
+            self.assert_refused(self.transact(token, roots, "release"))
+
 
 @unittest.skipUnless(shutil.which("bash"), "bash is unavailable")
 class SourceClaimRegistryBashTests(SourceClaimRegistryTests):
