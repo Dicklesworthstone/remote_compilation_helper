@@ -5,26 +5,29 @@
 //! A scoped child needs the same identity/policy implementation as its parent.
 //! The quoted heredoc passes these exact sources as data, without installing a
 //! launcher on the worker or resolving a mutable script from a source checkout.
+//! Load that single literal copy for the supervisor and pass the same bytes to
+//! the child. Duplicating it inline exhausts Linux's per-argument limit after
+//! the surrounding execution/ownership/SSH layers quote the launch program.
 
 /// The heredoc lives in a function body, not inside `$(...)`: bash 3.2 (macOS
 /// `/bin/sh`) scans a substitution's heredoc for the closing paren and fails on
 /// the first `pattern)` arm, which made every script that embeds this protocol
 /// a syntax error on macOS workers. Keep this `concat!` to string literals and
 /// `include_str!` lines only: `tests/remote_scoped_launch.py` re-assembles it.
+/// Only the compile-time literal is evaluated. Policy, environment, arguments
+/// and stdin never supply program text to the bootstrap.
 pub const REMOTE_PROCESS_IDENTITY_SCRIPT: &str = concat!(
-    include_str!("remote_process.sh"),
-    "\n",
-    include_str!("remote_scoped_launch.sh"),
-    "\nif [ \"$0\" = rch-build ]; then\n",
-    "    rch_scope_launch_select || { printf '\\n%s_IDENTITY_UNAVAILABLE\\n' \"$3\" >&2; exit 125; }\n",
-    "    if [ -n \"$rch_launch_slice\" ]; then\n",
-    "        rch_scope_launch_source() { cat <<'RCH_SCOPED_LAUNCH_SOURCE_104'\n",
+    "rch_scope_launch_source() { command cat <<'RCH_SCOPED_LAUNCH_SOURCE_104'\n",
     include_str!("remote_process.sh"),
     "\n",
     include_str!("remote_scoped_launch.sh"),
     "\nRCH_SCOPED_LAUNCH_SOURCE_104\n",
-    "        }\n",
-    "        rch_launch_source=$(rch_scope_launch_source) || { printf '\\n%s_IDENTITY_UNAVAILABLE\\n' \"$3\" >&2; exit 125; }\n",
+    "}\n",
+    "rch_launch_source=$(rch_scope_launch_source) || exit 125\n",
+    "command eval \"$rch_launch_source\" || exit 125\n",
+    "\nif [ \"$0\" = rch-build ]; then\n",
+    "    rch_scope_launch_select || { printf '\\n%s_IDENTITY_UNAVAILABLE\\n' \"$3\" >&2; exit 125; }\n",
+    "    if [ -n \"$rch_launch_slice\" ]; then\n",
     "        rch_scope_launch_supervise \"$@\"\n",
     "        exit $?\n",
     "    fi\n",
@@ -67,5 +70,24 @@ mod tests {
                     .any(|line| line == "RCH_SCOPED_LAUNCH_SOURCE_104")
             );
         }
+    }
+
+    #[test]
+    fn nested_transport_quoting_keeps_room_for_the_payload() {
+        // The tracked command is nested under durable execution, source
+        // activity and the login shell. A one-quote check misses amplification
+        // of quotes and backslashes before exec reaches the worker protocol.
+        let mut script = REMOTE_PROCESS_IDENTITY_SCRIPT.to_owned();
+        for _ in 0..4 {
+            script = format!(
+                "exec /bin/sh -c {} rch-transport",
+                shell_escape::unix::escape(script.into())
+            );
+        }
+        assert!(
+            script.len() < 110_000,
+            "nested script is {} bytes",
+            script.len()
+        );
     }
 }

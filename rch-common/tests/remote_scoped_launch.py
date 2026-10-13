@@ -16,6 +16,7 @@ from pathlib import Path
 import re
 import shlex
 import signal
+import string
 import subprocess
 import sys
 import tempfile
@@ -148,9 +149,68 @@ def protocol(instrument: bool = True, fixture: bool = True) -> str:
     if not instrument:
         return expanded
     core = (SOURCE / "remote_process.sh").read_text()
-    if expanded.count(core) != 2:
-        raise AssertionError("expected shared parent/child protocol copies")
+    if expanded.count(core) != 1:
+        raise AssertionError("expected one literal source shared by parent and child")
     return expanded.replace(core, core + SELECT + (MOCK_RESOURCE_BACKEND if fixture else ""))
+
+
+def transport_quote(value: str) -> str:
+    # shell-escape 0.1.5's Unix encoding, including its treatment of '!'.
+    # The Rust unit test applies that crate directly; here we must exercise
+    # real exec even when no Rust toolchain is installed on the test host.
+    safe = string.ascii_letters + string.digits + "-_=/,.+"
+    if value and all(char in safe for char in value):
+        return value
+    return "'" + "".join("'\\" + char + "'" if char in "'!" else char for char in value) + "'"
+
+
+def nest_transport(script: str, layers: int) -> str:
+    for _ in range(layers):
+        script = f'exec {shlex.quote(SHELL)} -c {transport_quote(script)} rch-transport "$@"'
+    return script
+
+
+class ScriptTransport(unittest.TestCase):
+    def invoke(self, script, *args, **options):
+        return subprocess.run([SHELL, "-c", script, "rch-observer", *args],
+                              capture_output=True, timeout=10, **options)
+
+    def test_one_literal_hydrates_the_exact_child_program(self):
+        source = protocol(instrument=False)
+        core = (SOURCE / "remote_process.sh").read_text()
+        launch = (SOURCE / "remote_scoped_launch.sh").read_text()
+        self.assertEqual(source.count(core), 1)
+        self.assertEqual(source.count(launch), 1)
+        expected = (core + "\n" + launch).rstrip("\n").encode()
+        result = self.invoke(source + '\nprintf "%s" "$rch_launch_source"\n')
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, expected, b""))
+
+    def test_hydration_preserves_binary_stdin_and_literal_arguments(self):
+        arguments = ["", "quote'!\\", "$(printf INJECTED)", "line\nRCH_SCOPED_LAUNCH_SOURCE_104\nend"]
+        body = protocol(instrument=False) + '\nprintf "%s\\0" "$@"; command cat\n'
+        payload = bytes(range(256)) * 64
+        result = self.invoke(body, *arguments, input=payload,
+                             env={**os.environ, "rch_launch_source": "printf INJECTED >&2; exit 99"})
+        expected = b"".join(arg.encode() + b"\0" for arg in arguments) + payload
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, expected, b""))
+
+    def test_four_quoted_transports_reach_the_protocol(self):
+        body = protocol(instrument=False) + '\nrch_valid_pgid 42 || exit 90; printf "%s" "$1"\n'
+        command = nest_transport(body, 4)
+        # Retain the original 110 KB headroom, now after the enclosing layers.
+        self.assertLess(len(command.encode()), 110_000)
+        result = self.invoke(command, "reached'!$()\\")
+        self.assertEqual((result.returncode, result.stdout, result.stderr),
+                         (0, b"reached'!$()\\", b""))
+
+    def test_failed_source_capture_does_not_evaluate_partial_output(self):
+        with tempfile.TemporaryDirectory(prefix="rch-source-capture-") as name:
+            program = Path(name) / "cat"
+            program.write_text("#!/bin/sh\nprintf 'printf INJECTED; exit 0\\n'\nexit 1\n")
+            program.chmod(0o700)
+            result = self.invoke(protocol(instrument=False) + '\nprintf AFTER\n',
+                                 env={**os.environ, "PATH": name})
+            self.assertEqual((result.returncode, result.stdout, result.stderr), (125, b"", b""))
 
 
 # Workload fixture: detached descendants ignore TERM and keep writing after the
@@ -230,7 +290,7 @@ class ScopedLaunch(unittest.TestCase):
         self.assertTrue(predicate(), "condition did not become true")
 
     def start(self, name="42", mode="exit", code=0, limit=10, *, fixture=True,
-              env=None, script=None) -> tuple[subprocess.Popen, Path, Path]:
+              env=None, script=None, transport_layers=0) -> tuple[subprocess.Popen, Path, Path]:
         job = self.root / f"job-{name}"
         job.mkdir()
         record = self.root / f"{name}.pgid"
@@ -239,7 +299,8 @@ class ScopedLaunch(unittest.TestCase):
         self.streams += [out, err]
         body = protocol(fixture=fixture) if script is None else script
         # fd 3 and argv match TransferPipeline's tracked rch-build entry.
-        command = f"exec {shlex.quote(SHELL)} -c {shlex.quote(body + chr(10) + 'echo UNCONFINED; exit 97')} rch-build \"$@\" 3>&2"
+        command = f"exec {shlex.quote(SHELL)} -c {transport_quote(body + chr(10) + 'echo UNCONFINED; exit 97')} rch-build \"$@\" 3>&2"
+        command = nest_transport(command, transport_layers)
         proc = subprocess.Popen(["/bin/sh", "-c", command, "scope-fixture", str(record), str(limit),
             "RCH_TEST_DEADLINE", name, sys.executable, "-c", WORKLOAD, str(job), mode, str(code)],
             cwd=job, env=env or self.env, stdin=subprocess.DEVNULL,
@@ -282,6 +343,14 @@ class ScopedLaunch(unittest.TestCase):
         (job / "release").touch()
         self.finish(proc, job)
         self.assertIn("streamed-stderr", (job / "stderr").read_text())
+
+    def test_nested_transport_keeps_scoped_cleanup_and_status(self) -> None:
+        # One rch-build quote above plus three surrounding transport layers.
+        # This formerly failed at exec before any workload could be launched.
+        proc, job, record = self.start(code=23, transport_layers=3)
+        self.finish(proc, job, 23)
+        self.assertTrue(record.read_text().startswith("RCH_REMOTE_PROCESS_V2:"))
+        self.assertEqual((job / "artifact").read_text(), "artifact-evidence")
 
     def test_deadline_reaps_scope_and_reports_marker(self) -> None:
         proc, job, _ = self.start(mode="hold", limit=1)
