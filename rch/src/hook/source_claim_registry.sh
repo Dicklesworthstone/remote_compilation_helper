@@ -54,6 +54,24 @@ confirm_durable_record() {
     fi
 }
 
+# A mutator's exit status is not proof that the requested alias was established:
+# ln -s can succeed inside a raced-in destination directory. Nor is a visible
+# namespace necessarily durable after a lost acknowledgement. Revalidate and
+# re-establish the barriers on both creation and the already-present fast path,
+# publishing exactly one readiness marker only after all checks succeed.
+confirm_topology() {
+    sh -c "$1" >/dev/null 2>&1 || refuse 'topology validation failed after initialization'
+    while IFS= read -r topology_root; do
+        [ -d "$topology_root" ] || refuse 'topology root is not a directory'
+        sync -f "$topology_root" && sync -f "$(dirname -- "$topology_root")" \
+            || refuse 'cannot confirm durable topology'
+    done <<RCH_TOPOLOGY_ROOTS
+$requested
+RCH_TOPOLOGY_ROOTS
+    sh -c "$1" >/dev/null 2>&1 || refuse 'topology changed during confirmation'
+    printf 'RCH_TOPOLOGY_OK\n'
+}
+
 physical_batch() {
     # Keep every delimiter, including the last one. One output record per
     # argument is essential: a newline in a symlink target must not turn one
@@ -383,7 +401,7 @@ if [ "$operation" = topology ]; then
     [ "$#" -eq 6 ] || refuse 'invalid topology transaction'
     closures_overlap "$requested" roots "$requested" || refuse 'invalid topology scope'
     if sh -c "$5" >/dev/null 2>&1; then
-        printf 'RCH_TOPOLOGY_OK\n'
+        confirm_topology "$5"
         exit 0
     fi
 fi
@@ -437,7 +455,23 @@ if [ "$operation" = topology ]; then
     # source acquisition uses the opposite order. The flock supervisor also
     # outlives its mutator if the dispatcher's control connection disappears.
     # No durable source claim is created for these shared topology parents.
-    sh -c "$6" || refuse 'topology initialization failed'
+    # The production mutator invokes ln inside a command substitution. Make
+    # that operation no-target-directory even if the destination changes after
+    # its absence test: no link may be created in a newly appeared directory or
+    # through a newly appeared symlink. GNU coreutils are already required by
+    # this protocol; Darwin workers use the g-prefixed tool when present.
+    topology_create='ln() {
+        if command -v gln >/dev/null 2>&1; then
+            command gln -T "$@"
+        else
+            command ln -T "$@"
+        fi
+    }
+'
+    # Suppress premature success from the mutator. Only the checked, durable
+    # postcondition below acknowledges this metadata-only transaction.
+    sh -c "$topology_create$6" >/dev/null || refuse 'topology initialization failed'
+    confirm_topology "$5"
     exit 0
 fi
 
