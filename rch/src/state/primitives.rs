@@ -122,8 +122,10 @@ impl std::fmt::Display for IdempotentResult {
 
 /// Atomically write content to a file using write-to-temp-then-rename.
 ///
-/// This ensures crash safety: either the old content or the new content
-/// will be present, never partial content.
+/// A temporary is created exclusively and retained on any failure. Unix
+/// publication checks the held directory/file identities and synchronizes the
+/// directory before returning success. A post-rename failure is an uncertain
+/// committed state, never permission to discard evidence or claim success.
 ///
 /// # Arguments
 ///
@@ -147,9 +149,39 @@ impl std::fmt::Display for IdempotentResult {
 /// # Ok::<(), anyhow::Error>(())
 /// ```
 pub fn atomic_write(path: &Path, content: &[u8]) -> Result<()> {
+    let mut temporary = std::ffi::OsString::from(".");
+    temporary.push(
+        path.file_name()
+            .context("atomic write has no destination name")?,
+    );
+    temporary.push(format!(".{}.tmp", uuid::Uuid::new_v4().simple()));
+    atomic_write_with_temporary_name(path, content, &temporary)
+}
+
+fn atomic_write_with_temporary_name(
+    path: &Path,
+    content: &[u8],
+    temporary: &std::ffi::OsStr,
+) -> Result<()> {
     let parent = path
         .parent()
+        .map(|parent| {
+            if parent.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                parent
+            }
+        })
         .ok_or_else(|| anyhow!("No parent directory for path: {:?}", path))?;
+    anyhow::ensure!(
+        Path::new(temporary).components().count() == 1
+            && matches!(
+                Path::new(temporary).components().next(),
+                Some(std::path::Component::Normal(_))
+            )
+            && path.file_name() != Some(temporary),
+        "atomic write temporary must be a distinct directory entry"
+    );
 
     // Ensure parent directory exists
     if !parent.exists() {
@@ -157,61 +189,138 @@ pub fn atomic_write(path: &Path, content: &[u8]) -> Result<()> {
             .with_context(|| format!("Failed to create directory: {:?}", parent))?;
     }
 
-    // Generate unique temp file name using timestamp and process ID
-    let temp_name = format!(
-        ".{}.{}.{}.tmp",
-        path.file_name()
-            .map(|n| n.to_string_lossy())
-            .unwrap_or_default(),
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    );
-    let temp_path = parent.join(temp_name);
-
-    // RAII guard: if any `?` between here and the successful rename bails
-    // out, unlink the half-written temp file. The previous implementation
-    // only cleaned up on rename failure (via the `.with_context` closure),
-    // leaving partial-write and fsync failures to accumulate
-    // `.<orig>.<pid>.<ns>.tmp` orphans next to the real file on every
-    // backup or atomic write.
-    struct TempGuard<'a>(Option<&'a std::path::Path>);
-    impl Drop for TempGuard<'_> {
-        fn drop(&mut self) {
-            if let Some(p) = self.0 {
-                let _ = fs::remove_file(p);
-            }
-        }
-    }
-    let mut guard = TempGuard(Some(temp_path.as_path()));
-
+    let temp_path = parent.join(temporary);
+    #[cfg(unix)]
     {
-        // Write to temp file
-        let mut file = File::create(&temp_path)
-            .with_context(|| format!("Failed to create temp file: {:?}", temp_path))?;
-
+        use rustix::fs::{Mode, OFlags};
+        use std::os::fd::AsFd;
+        // Preserve the caller's existing parent aliases, but retain their
+        // physical directory before creation. A later alias change is refused.
+        let directory = File::open(parent).context("open atomic write directory")?;
+        anyhow::ensure!(
+            directory.metadata()?.is_dir(),
+            "atomic write parent is not a directory"
+        );
+        let mut file = File::from(
+            rustix::fs::openat(
+                directory.as_fd(),
+                temporary,
+                OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+                Mode::from_bits_truncate(0o666),
+            )
+            .with_context(|| format!("create exclusive temporary {temp_path:?}"))?,
+        );
         file.write_all(content)
-            .with_context(|| format!("Failed to write to temp file: {:?}", temp_path))?;
-
-        // Sync data to disk
+            .with_context(|| format!("write retained temporary {temp_path:?}"))?;
         file.sync_all()
-            .with_context(|| format!("Failed to sync temp file: {:?}", temp_path))?;
+            .with_context(|| format!("sync retained temporary {temp_path:?}"))?;
+        publish_atomic_temporary(
+            &directory,
+            parent,
+            temporary,
+            path.file_name().context("atomic write has no name")?,
+            &file,
+            content,
+        )
     }
-
-    // Atomic rename
-    fs::rename(&temp_path, path)
-        .with_context(|| format!("Failed to rename {:?} to {:?}", temp_path, path))?;
-    // Rename succeeded — temp_path no longer exists, so skip cleanup.
-    guard.0 = None;
-
-    // Sync parent directory for extra safety (important on some filesystems)
-    if let Ok(dir) = File::open(parent) {
-        let _ = dir.sync_all();
+    #[cfg(not(unix))]
+    {
+        // Retain exclusive creation and failure bytes on every platform.
+        // Descriptor/checked-directory durability parity is Unix-only here.
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)?;
+        file.write_all(content)?;
+        file.sync_all()?;
+        fs::rename(&temp_path, path)?;
+        if let Ok(directory) = File::open(parent) {
+            let _ = directory.sync_all();
+        }
+        Ok(())
     }
+}
 
+#[cfg(unix)]
+fn verify_atomic_write_name(
+    directory: &File,
+    parent: &Path,
+    name: &std::ffi::OsStr,
+    file: &File,
+) -> Result<()> {
+    use rustix::fs::{AtFlags, FileType};
+    use std::os::fd::AsFd;
+    use std::os::unix::fs::MetadataExt;
+    let held_directory = directory.metadata()?;
+    let named_directory = fs::metadata(parent)?;
+    anyhow::ensure!(
+        held_directory.is_dir()
+            && named_directory.is_dir()
+            && held_directory.dev() == named_directory.dev()
+            && held_directory.ino() == named_directory.ino(),
+        "atomic write directory changed; retained publication is unverified"
+    );
+    // Inspect the name without adding a read-permission requirement. The
+    // original creation descriptor can still read a write-only-mode file.
+    let named = rustix::fs::statat(directory.as_fd(), name, AtFlags::SYMLINK_NOFOLLOW)?;
+    let held = rustix::fs::fstat(file.as_fd())?;
+    anyhow::ensure!(
+        FileType::from_raw_mode(held.st_mode) == FileType::RegularFile
+            && FileType::from_raw_mode(named.st_mode) == FileType::RegularFile
+            && held.st_dev == named.st_dev
+            && held.st_ino == named.st_ino
+            && held.st_nlink == 1
+            && named.st_nlink == 1,
+        "atomic write file identity or links changed; retained publication is unverified"
+    );
     Ok(())
+}
+
+#[cfg(unix)]
+fn verify_atomic_write_bytes(file: &File, expected: &[u8]) -> Result<()> {
+    use std::os::unix::fs::FileExt;
+    anyhow::ensure!(
+        file.metadata()?.len() == expected.len() as u64,
+        "atomic write length changed"
+    );
+    let mut offset = 0usize;
+    let mut buffer = [0u8; 65536];
+    while offset < expected.len() {
+        let size = (expected.len() - offset).min(buffer.len());
+        let count = file.read_at(&mut buffer[..size], offset as u64)?;
+        anyhow::ensure!(
+            count > 0 && buffer[..count] == expected[offset..offset + count],
+            "atomic write bytes changed; publication unverified"
+        );
+        offset += count;
+    }
+    anyhow::ensure!(
+        file.metadata()?.len() == expected.len() as u64,
+        "atomic write length changed"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+fn publish_atomic_temporary(
+    directory: &File,
+    parent: &Path,
+    temporary: &std::ffi::OsStr,
+    destination: &std::ffi::OsStr,
+    file: &File,
+    expected: &[u8],
+) -> Result<()> {
+    use std::os::fd::AsFd;
+    verify_atomic_write_name(directory, parent, temporary, file)?;
+    verify_atomic_write_bytes(file, expected)?;
+    rustix::fs::renameat(directory.as_fd(), temporary, directory.as_fd(), destination)
+        .with_context(|| format!("rename retained temporary {temporary:?} to {destination:?}"))?;
+    verify_atomic_write_name(directory, parent, destination, file)?;
+    directory
+        .sync_all()
+        .context("sync held atomic write directory before acknowledgment")?;
+    verify_atomic_write_name(directory, parent, destination, file)?;
+    verify_atomic_write_bytes(file, expected)
 }
 
 /// Create a file only if it doesn't exist.
@@ -572,7 +681,10 @@ mod tests {
     #[test]
     fn test_atomic_write_creates_file() {
         log_test_start("test_atomic_write_creates_file");
-        let tmp = TempDir::new().unwrap();
+        let tmp = tempfile::Builder::new()
+            .disable_cleanup(true)
+            .tempdir()
+            .unwrap();
         let path = tmp.path().join("test.txt");
 
         atomic_write(&path, b"hello").unwrap();
@@ -583,7 +695,10 @@ mod tests {
     #[test]
     fn test_atomic_write_overwrites() {
         log_test_start("test_atomic_write_overwrites");
-        let tmp = TempDir::new().unwrap();
+        let tmp = tempfile::Builder::new()
+            .disable_cleanup(true)
+            .tempdir()
+            .unwrap();
         let path = tmp.path().join("test.txt");
 
         atomic_write(&path, b"original").unwrap();
@@ -595,7 +710,10 @@ mod tests {
     #[test]
     fn test_atomic_write_creates_parent_dirs() {
         log_test_start("test_atomic_write_creates_parent_dirs");
-        let tmp = TempDir::new().unwrap();
+        let tmp = tempfile::Builder::new()
+            .disable_cleanup(true)
+            .tempdir()
+            .unwrap();
         let path = tmp.path().join("a/b/c/test.txt");
 
         atomic_write(&path, b"nested").unwrap();
@@ -606,7 +724,10 @@ mod tests {
     #[test]
     fn test_atomic_write_no_temp_files_left() {
         log_test_start("test_atomic_write_no_temp_files_left");
-        let tmp = TempDir::new().unwrap();
+        let tmp = tempfile::Builder::new()
+            .disable_cleanup(true)
+            .tempdir()
+            .unwrap();
         let path = tmp.path().join("test.txt");
 
         atomic_write(&path, b"content").unwrap();
@@ -617,8 +738,158 @@ mod tests {
             .filter_map(|e| e.ok())
             .filter(|e| e.path().extension().is_some_and(|ext| ext == "tmp"))
             .collect();
-        assert!(tmp_files.is_empty(), "Temp files should be cleaned up");
+        assert!(
+            tmp_files.is_empty(),
+            "Successful rename must consume its temporary name"
+        );
         log_test_pass("test_atomic_write_no_temp_files_left");
+    }
+
+    #[test]
+    fn atomic_write_retains_failed_rename_bytes_and_occupied_temporary() {
+        let directory = tempfile::Builder::new()
+            .disable_cleanup(true)
+            .tempdir()
+            .unwrap();
+        let blocked = directory.path().join("directory-target");
+        fs::create_dir(&blocked).unwrap();
+        fs::write(blocked.join("original"), b"original target evidence").unwrap();
+        assert!(atomic_write(&blocked, b"unpublished bytes").is_err());
+        let retained: Vec<_> = fs::read_dir(directory.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|extension| extension == "tmp"))
+            .collect();
+        assert_eq!(retained.len(), 1);
+        assert_eq!(fs::read(&retained[0]).unwrap(), b"unpublished bytes");
+        assert_eq!(
+            fs::read(blocked.join("original")).unwrap(),
+            b"original target evidence"
+        );
+        let target = directory.path().join("target");
+        let occupied = std::ffi::OsStr::new("occupied.tmp");
+        fs::write(&target, b"original destination").unwrap();
+        fs::write(directory.path().join(occupied), b"original temporary").unwrap();
+        // The same production writer takes its generated name as an argument;
+        // exercise a real collision without replacing randomness or I/O.
+        assert!(atomic_write_with_temporary_name(&target, b"replacement", occupied).is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"original destination");
+        assert_eq!(
+            fs::read(directory.path().join(occupied)).unwrap(),
+            b"original temporary"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_preserves_parent_aliases_and_rejects_late_file_changes() {
+        use std::io::Seek;
+        use std::os::unix::fs::{FileExt, MetadataExt, symlink};
+        let directory = tempfile::Builder::new()
+            .disable_cleanup(true)
+            .tempdir()
+            .unwrap();
+        let real = directory.path().join("real");
+        fs::create_dir(&real).unwrap();
+        let alias = directory.path().join("alias");
+        symlink(&real, &alias).unwrap();
+        atomic_write(&alias.join("positive"), b"published bytes").unwrap();
+        assert_eq!(fs::read(real.join("positive")).unwrap(), b"published bytes");
+        for change in ["links", "bytes"] {
+            let parent = directory.path().join(change);
+            fs::create_dir(&parent).unwrap();
+            let temporary = std::ffi::OsStr::new("held.tmp");
+            let destination = std::ffi::OsStr::new("target");
+            fs::write(parent.join(destination), b"prior target bytes").unwrap();
+            let mut file = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(parent.join(temporary))
+                .unwrap();
+            file.write_all(b"retained bytes").unwrap();
+            file.sync_all().unwrap();
+            let inode = file.metadata().unwrap().ino();
+            let position = file.stream_position().unwrap();
+            verify_atomic_write_bytes(&file, b"retained bytes").unwrap();
+            assert_eq!(file.stream_position().unwrap(), position);
+            let held_parent = File::open(&parent).unwrap();
+            if change == "links" {
+                fs::hard_link(parent.join(temporary), parent.join("original-alias")).unwrap();
+            } else {
+                assert_eq!(file.write_at(b"X", 0).unwrap(), 1);
+                file.sync_all().unwrap();
+            }
+            assert!(
+                publish_atomic_temporary(
+                    &held_parent,
+                    &parent,
+                    temporary,
+                    destination,
+                    &file,
+                    b"retained bytes"
+                )
+                .is_err()
+            );
+            assert_eq!(file.metadata().unwrap().ino(), inode);
+            assert_eq!(
+                fs::read(parent.join(destination)).unwrap(),
+                b"prior target bytes"
+            );
+            assert!(parent.join(temporary).is_file());
+            let retained = fs::read(parent.join(temporary)).unwrap();
+            if change == "links" {
+                assert_eq!(retained, b"retained bytes");
+                assert_eq!(
+                    fs::read(parent.join("original-alias")).unwrap(),
+                    b"retained bytes"
+                );
+            } else {
+                assert_eq!(retained, b"Xetained bytes");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_publishes_a_held_write_only_file_without_changing_global_umask() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let directory = tempfile::Builder::new()
+            .disable_cleanup(true)
+            .tempdir()
+            .unwrap();
+        let temporary = std::ffi::OsStr::new("write-only.tmp");
+        let destination = std::ffi::OsStr::new("target");
+        let mut file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(directory.path().join(temporary))
+            .unwrap();
+        file.write_all(b"held output bytes").unwrap();
+        file.set_permissions(fs::Permissions::from_mode(0o222))
+            .unwrap();
+        file.sync_all().unwrap();
+        let inode = file.metadata().unwrap().ino();
+        let parent = File::open(directory.path()).unwrap();
+        publish_atomic_temporary(
+            &parent,
+            directory.path(),
+            temporary,
+            destination,
+            &file,
+            b"held output bytes",
+        )
+        .unwrap();
+        assert_eq!(
+            fs::symlink_metadata(directory.path().join(destination))
+                .unwrap()
+                .ino(),
+            inode
+        );
+        assert_eq!(file.metadata().unwrap().mode() & 0o7777, 0o222);
+        verify_atomic_write_bytes(&file, b"held output bytes").unwrap();
+        assert!(!directory.path().join(temporary).exists());
     }
 
     #[test]

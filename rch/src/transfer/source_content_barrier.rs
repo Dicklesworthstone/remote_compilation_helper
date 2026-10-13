@@ -23,7 +23,8 @@ pub(crate) fn configure_ssh_command(command: &mut Command) {
 }
 
 /// Recognize only a complete directory-attribute record in rsync's
-/// `YXcstpoguax<TAB>path` format. Checking byte 1 alone is unsound: the
+/// `YXcstpoguax<TAB>path` format, or the file-flags build's
+/// `YXcstpoguaxf<TAB>path`. Checking byte 1 alone is unsound: the
 /// message `*deleting` ALSO has `d` there, for both files and directories.
 /// Creation, deletion, unknown flags and malformed records are not metadata.
 fn directory_metadata_only(line: &str) -> bool {
@@ -31,7 +32,12 @@ fn directory_metadata_only(line: &str) -> bool {
         return false;
     };
     let bytes = itemized.as_bytes();
-    if bytes.len() != 11 || !bytes.starts_with(b".d") {
+    let attributes: &[u8] = match bytes.len() {
+        11 => b"cstpoguax",
+        12 => b"cstpoguaxf",
+        _ => return false,
+    };
+    if !bytes.starts_with(b".d") {
         return false;
     }
     if path.is_empty()
@@ -48,7 +54,7 @@ fn directory_metadata_only(line: &str) -> bool {
     }
     bytes[2..]
         .iter()
-        .zip(b"cstpoguax")
+        .zip(attributes)
         .all(|(&actual, &attribute)| {
             actual == b'.'
                 || actual == attribute
@@ -170,6 +176,10 @@ mod tests {
             ".d...p.....\tsrc/\n",
             ".d..tp.....\tp q/x:y/\n",
             ".d         \tsrc/\n",
+            // Homebrew's file-flags rsync emits one extra, documented field.
+            ".d..t.......\t./\n",
+            ".d.........f\tsrc/\n",
+            ".d          \tsrc/\n",
         ] {
             assert!(verify_output(&output(0, line.as_bytes(), b"")).is_ok());
         }
@@ -213,6 +223,12 @@ mod tests {
             "*deleting  \told-directory/\n",
             "*deleting\tsrc/old.rs\n",
             "cd+++++++++\tnew-directory/\n",
+            // The extended record is metadata-only only for directories.
+            ".f.........f\tsrc/lib.rs\n",
+            ">fc.........\tsrc/lib.rs\n",
+            ">f++++++++++\tsrc/new.rs\n",
+            "*deleting   \tsrc/old.rs\n",
+            "cd++++++++++\tnew-directory/\n",
         ] {
             let stdout = format!(".d..t......\t./\n{line}");
             let error = verify_output(&output(0, stdout.as_bytes(), b"")).unwrap_err();
@@ -226,7 +242,9 @@ mod tests {
             "ad\tsrc/\n",
             ".d\tsrc/\n",
             ".d........\tsrc/\n",
-            ".d..........\tsrc/\n",
+            ".d...........\tsrc/\n",
+            ".d.........q\tsrc/\n",
+            ".d.........?\tsrc/\n",
             ".d..t.....?\tsrc/\n",
             ".d..t.....q\tsrc/\n",
             ".d..t......\t\n",
