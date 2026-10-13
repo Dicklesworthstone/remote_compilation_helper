@@ -28,6 +28,44 @@ SOURCE = Path(__file__).resolve().parents[1] / "src"
 THIS = Path(__file__).resolve()
 SHELL = os.environ.get("RCH_TEST_SHELL", "/bin/sh")
 
+def _neutral_python() -> str:
+    """The interpreter under a name no ananicy rule matches.
+
+    ananicy-cpp re-nices processes by name on the build fleet (``python3`` ->
+    nice 5), after the launcher has set the niceness these suites assert, so
+    the assertions failed run to run on those hosts. A symlink is the same
+    binary; only the process name (``comm``) differs, and child interpreters
+    inherit it through ``sys.executable``.
+    """
+    if sys.platform != "linux" or Path(sys.executable).name == "rchtestpy":
+        return sys.executable
+    alias = Path(tempfile.mkdtemp(prefix="rch-test-interp-")) / "rchtestpy"
+    alias.symlink_to(sys.executable)
+    return str(alias)
+
+
+PYTHON = _neutral_python()
+if PYTHON != sys.executable:
+    # Re-run this harness under the alias too: a child forked from a process
+    # named `python3` carries that name until it execs, and an ananicy pass
+    # landing in that window re-nices it for good.
+    os.execv(PYTHON, [PYTHON, *sys.argv])
+
+
+def _neutral_shell(shell: str) -> str:
+    """``shell`` under a name no ananicy rule matches (``bash`` -> nice -4 on
+    the fleet, inherited by everything it launches). Plain ``sh`` keeps its
+    name: a bash that runs as ``sh`` switches to POSIX mode by argv[0]."""
+    if sys.platform != "linux" or Path(shell).name == "sh":
+        return shell
+    alias = Path(tempfile.mkdtemp(prefix="rch-test-shell-")) / f"rchtest{Path(shell).name}"
+    alias.symlink_to(shell)
+    return str(alias)
+
+
+SHELL = _neutral_shell(SHELL)
+
+
 
 def assemble_protocol() -> str:
     rust = (SOURCE / "remote_scoped_launch.rs").read_text()
@@ -262,7 +300,7 @@ class ScopedLaunch(unittest.TestCase):
         self.policy.write_text(f"version=1\nnice={max(10, os.getpriority(os.PRIO_PROCESS, 0))}\nsystemd_slice=jobs.slice\n")
         self.policy.chmod(0o600)
         self.env = {**os.environ, "RCH_TEST_POLICY_FILE": str(self.policy),
-                    "RCH_TEST_ROOT": str(self.root), "RCH_TEST_PYTHON": sys.executable,
+                    "RCH_TEST_ROOT": str(self.root), "RCH_TEST_PYTHON": PYTHON,
                     "RCH_TEST_DRIVER": str(THIS)}
 
     def cleanup_owned(self) -> None:
@@ -303,7 +341,7 @@ class ScopedLaunch(unittest.TestCase):
         command = f"exec {shlex.quote(SHELL)} -c {transport_quote(body + chr(10) + 'echo UNCONFINED; exit 97')} rch-build \"$@\" 3>&2"
         command = nest_transport(command, transport_layers)
         proc = subprocess.Popen(["/bin/sh", "-c", command, "scope-fixture", str(record), str(limit),
-            "RCH_TEST_DEADLINE", name, sys.executable, "-c", workload, str(job), mode, str(code)],
+            "RCH_TEST_DEADLINE", name, PYTHON, "-c", workload, str(job), mode, str(code)],
             cwd=job, env=env or self.env, stdin=subprocess.DEVNULL,
             stdout=out, stderr=err, start_new_session=True)
         self.processes.append(proc)

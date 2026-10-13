@@ -29,6 +29,30 @@ rch_policy_select_file() {
 '''
 
 
+def _neutral_python() -> str:
+    """The interpreter under a name no ananicy rule matches.
+
+    ananicy-cpp re-nices processes by name on the build fleet (``python3`` ->
+    nice 5), after the launcher has set the niceness these suites assert, so
+    the assertions failed run to run on those hosts. A symlink is the same
+    binary; only the process name (``comm``) differs, and child interpreters
+    inherit it through ``sys.executable``.
+    """
+    if sys.platform != "linux" or Path(sys.executable).name == "rchtestpy":
+        return sys.executable
+    alias = Path(tempfile.mkdtemp(prefix="rch-test-interp-")) / "rchtestpy"
+    alias.symlink_to(sys.executable)
+    return str(alias)
+
+
+PYTHON = _neutral_python()
+if PYTHON != sys.executable:
+    # Re-run this harness under the alias too: a child forked from a process
+    # named `python3` carries that name until it execs, and an ananicy pass
+    # landing in that window re-nices it for good.
+    os.execv(PYTHON, [PYTHON, *sys.argv])
+
+
 def setUpModule() -> None:
     # ananicy-cpp rules on the build fleet put `cargo` and everything it spawns
     # in SCHED_IDLE, where procps prints NI as "-" and niceness cannot be
@@ -115,7 +139,7 @@ wait
 '''
         proc = subprocess.Popen(
             ["/bin/sh", "-c", SCRIPT + SELECT_FIXTURE + body, "rch-policy-test",
-             str(record), str(build), str(ready), sys.executable, child],
+             str(record), str(build), str(ready), PYTHON, child],
             env=self.env, text=True, stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
         )
