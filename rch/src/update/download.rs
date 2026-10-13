@@ -10,6 +10,8 @@ use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 
+mod transport;
+
 /// Progress callback for download updates.
 #[allow(dead_code)]
 pub type DownloadProgress = Box<dyn Fn(u64, u64) + Send>;
@@ -93,6 +95,7 @@ pub async fn download_release(
         &archive_asset.browser_download_url,
         &archive_path,
         &archive_asset.name,
+        archive_asset.size,
         MAX_DOWNLOAD_ATTEMPTS,
     )
     .await?;
@@ -112,6 +115,7 @@ pub async fn download_release(
             &checksum_asset.browser_download_url,
             &checksum_path,
             &checksum_asset.name,
+            checksum_asset.size,
             MAX_DOWNLOAD_ATTEMPTS,
         )
         .await?;
@@ -136,6 +140,7 @@ pub async fn download_release(
                     &sig_asset.browser_download_url,
                     &sig_path,
                     &sig_asset.name,
+                    sig_asset.size,
                     MAX_DOWNLOAD_ATTEMPTS,
                 )
                 .await?;
@@ -175,6 +180,7 @@ pub async fn download_release(
                     &sig_asset.browser_download_url,
                     &sig_path,
                     &sig_asset.name,
+                    sig_asset.size,
                     MAX_DOWNLOAD_ATTEMPTS,
                 )
                 .await?;
@@ -238,9 +244,8 @@ const MAX_DOWNLOAD_ATTEMPTS: u32 = 4;
 
 /// Backoff schedule (waited *before* the 2nd, 3rd, and 4th attempts).
 ///
-/// Kept intentionally bounded: 2s + 5s + 15s = 22s of worst-case waiting on
-/// top of the per-request timeouts, so even a fully-flaky CDN run finishes in
-/// well under a minute rather than hanging.
+/// At most 22 seconds of backoff, in addition to at most four 300-second
+/// request/body deadlines. Partial-range recovery uses the same attempt budget.
 const DOWNLOAD_BACKOFF: [Duration; 3] = [
     Duration::from_secs(2),
     Duration::from_secs(5),
@@ -250,18 +255,24 @@ const DOWNLOAD_BACKOFF: [Duration; 3] = [
 /// Download a file with retry-and-backoff for transient CDN failures.
 ///
 /// Retries only on RETRYABLE errors (HTTP 5xx — esp. 502/503/504 —, HTTP 429,
-/// request timeouts, and connection/reset errors). A genuine 404, a 4xx other
-/// than 429, or a local I/O failure aborts immediately.
+/// request timeouts, and connection/reset errors). A rejected resume consumes
+/// an attempt before a full GET. Other 4xx, invalid representations and local
+/// I/O failures abort immediately. No prefix is reused across invocations.
 async fn download_with_retry(
     url: &str,
     dest: &PathBuf,
     asset_name: &str,
+    expected_size: u64,
     max_attempts: u32,
 ) -> Result<(), UpdateError> {
+    if max_attempts == 0 {
+        return Err(UpdateError::DownloadFailed("No download attempts allowed".to_owned()));
+    }
+    let mut download = transport::AssetDownload::new(url, dest, expected_size).await?;
     let mut last_err: Option<UpdateError> = None;
 
     for attempt in 1..=max_attempts {
-        match download_file(url, dest).await {
+        match download.attempt().await {
             Ok(()) => return Ok(()),
             Err(e) if is_transient_error(&e) && attempt < max_attempts => {
                 // Backoff indices are 0-based and the schedule may be shorter
@@ -287,45 +298,6 @@ async fn download_with_retry(
             "Failed to download {asset_name} after {max_attempts} attempts"
         ))
     }))
-}
-
-/// Download a single file.
-async fn download_file(url: &str, dest: &PathBuf) -> Result<(), UpdateError> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(300)) // 5 minutes for large files
-        .connect_timeout(Duration::from_secs(30))
-        .build()
-        .map_err(|e| UpdateError::NetworkError(e.to_string()))?;
-
-    let response = client
-        .get(url)
-        .header("User-Agent", format!("rch/{}", env!("CARGO_PKG_VERSION")))
-        .send()
-        .await
-        // A reqwest send() failure is a connection/timeout/reset error — always
-        // transient. Classify as NetworkError so the retry loop rides it out.
-        .map_err(|e| UpdateError::NetworkError(e.to_string()))?;
-
-    let status = response.status();
-    if !status.is_success() {
-        // Distinguish retryable HTTP statuses (5xx, 429) from terminal ones
-        // (404 = asset genuinely missing, other 4xx). Retryable statuses map
-        // to NetworkError so `is_transient_error` permits a retry; terminal
-        // ones map to DownloadFailed and abort.
-        return Err(classify_http_status(status));
-    }
-
-    let mut file = tokio::fs::File::create(dest)
-        .await
-        .map_err(|e| UpdateError::DownloadFailed(format!("Failed to create file: {}", e)))?;
-
-    let bytes = response
-        .bytes()
-        .await
-        // Body-read failures (truncated/reset mid-stream) are transient too.
-        .map_err(|e| UpdateError::NetworkError(e.to_string()))?;
-
-    write_downloaded_bytes(&mut file, &bytes).await
 }
 
 /// Finish the asynchronous file write before another handle verifies its bytes.
@@ -357,7 +329,7 @@ fn classify_http_status(status: reqwest::StatusCode) -> UpdateError {
     }
 }
 
-/// HTTP statuses worth retrying: any 5xx (esp. 502/503/504 from the CDN) and
+/// HTTP statuses worth retrying: any 5xx (esp. CDN gateway errors) and
 /// 429 Too Many Requests. Notably NOT 404 (asset genuinely absent) or other
 /// 4xx (a request the retry can't fix).
 fn is_retryable_status(status: reqwest::StatusCode) -> bool {
