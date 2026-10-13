@@ -139,17 +139,36 @@ fn plan(
             }),
         "artifact exclusions cannot refine an explicit, priority, Cargo or non-Make output contract"
     );
+    let project = &recipe.phases[projects[0]];
+    anyhow::ensure!(
+        !project.complete,
+        "a completed project artifact policy cannot be changed; all evidence retained"
+    );
     anyhow::ensure!(
         recipe.phases.iter().all(|phase| {
-            !phase.complete
-                && phase.pending.is_none()
-                && phase.published.is_empty()
-                && phase.missing_result.is_none()
+            phase.missing_result.is_none() && (!phase.complete || phase.pending.is_none())
         }),
-        "artifact policy cannot change after publication began; all evidence retained"
+        "artifact policy cannot change a failed result or contradictory publication checkpoint"
     );
     for directory in &request.directories {
         let directory = Path::new(directory);
+        // Live collection can deliver a declared report even when its project
+        // pull fails. A detached publisher can also stop after committing some
+        // files. Those checkpoints are evidence to KEEP, not a reason to erase
+        // progress or replay Make. Only a disjoint, unfinished selection may
+        // be refined. Never exclude a path already written or being renamed.
+        for relative in project
+            .published
+            .keys()
+            .chain(project.pending.iter().map(|(relative, _)| relative))
+        {
+            validate_output_ancestors(&project.local, relative)?;
+            anyhow::ensure!(
+                !directory.starts_with(relative) && !relative.starts_with(directory),
+                "artifact exclusion overlaps a pending or published output: {}",
+                relative.display()
+            );
+        }
         for result in recipe
             .phases
             .iter()
@@ -162,6 +181,9 @@ fn plan(
             );
         }
     }
+    // Clone every phase unchanged. In particular, never clear a pending hash,
+    // reset a completed report or replace a published file's fingerprint when
+    // selecting a fresh stage. Recovery resumes its existing publication state.
     let mut next = recipe.clone();
     let patterns = &mut next.phases[projects[0]].patterns;
     let mut changed = false;
@@ -345,6 +367,13 @@ mod tests {
     use super::*;
 
     fn fixture(completed: bool) -> (PathBuf, RecoverySession, TransferPipeline, WorkerConfig) {
+        fixture_with_results(completed, &[])
+    }
+
+    fn fixture_with_results(
+        completed: bool,
+        result_dirs: &[PathBuf],
+    ) -> (PathBuf, RecoverySession, TransferPipeline, WorkerConfig) {
         let root = tempfile::Builder::new()
             .disable_cleanup(true)
             .tempdir()
@@ -407,7 +436,7 @@ mod tests {
             None,
             Some(CompilationKind::Make),
             "make test-gates",
-            &[],
+            result_dirs,
             identity,
         )
         .unwrap();
@@ -606,12 +635,13 @@ mod tests {
             let mut input = request(&session, &["build/tools"]);
             match boundary {
                 "pending" => {
-                    recipe.phases[0].pending = Some((PathBuf::from("build/app"), "hash".into()));
+                    recipe.phases[0].pending =
+                        Some((PathBuf::from("build/tools/app"), "hash".into()));
                 }
                 "published" => {
                     recipe.phases[0]
                         .published
-                        .insert(PathBuf::from("build/app"), "hash".into());
+                        .insert(PathBuf::from("build/tools/app"), "hash".into());
                 }
                 "complete" => recipe.phases[0].complete = true,
                 "returned" => recipe.returned = Some(102),
@@ -637,6 +667,217 @@ mod tests {
         }
     }
 
+    #[test]
+    fn refinement_checks_checkpoint_components_not_text_prefixes() {
+        for pending in [false, true] {
+            for (recorded, excluded, overlaps) in [
+                ("build/tools/app", "build/tools", true),
+                ("build/tools", "build/tools", true),
+                ("build", "build/tools", true),
+                ("build/tools", "build/tools/nested", true),
+                ("build/tools-sibling/app", "build/tools", false),
+                ("other/build/tools/app", "build/tools", false),
+                ("build/工具/app", "build/工具", true),
+                ("build/工具-sibling/app", "build/工具", false),
+                ("../outside/app", "build/tools", true),
+                ("/outside/app", "build/tools", true),
+            ] {
+                let (_root, session, _pipeline, _worker) = fixture(true);
+                let mut recipe = session.recipe.clone();
+                let phase = &mut recipe.phases[0];
+                if pending {
+                    phase.pending = Some((PathBuf::from(recorded), "original-hash".into()));
+                } else {
+                    phase
+                        .published
+                        .insert(recorded.into(), "original-hash".into());
+                }
+                let before = std::fs::read(&session.writer.path).unwrap();
+                let input = request(&session, &[excluded]);
+                let result = plan(&session.writer.snapshot(), &recipe, &input);
+                if overlaps {
+                    assert!(result.is_err(), "{recorded} / {excluded}; pending={pending}");
+                } else {
+                    let next = result.unwrap().unwrap();
+                    let mut expected = serde_json::to_value(&recipe).unwrap();
+                    expected["phases"][0]["patterns"]
+                        .as_array_mut()
+                        .unwrap()
+                        .insert(0, format!("- /{excluded}/").into());
+                    assert_eq!(serde_json::to_value(&next).unwrap(), expected);
+                }
+                assert_eq!(std::fs::read(&session.writer.path).unwrap(), before);
+                assert!(!session.writer.snapshot().terminal_acknowledged);
+            }
+        }
+    }
+
+    #[test]
+    fn refinement_cannot_reopen_a_complete_phase_with_pending_publication() {
+        let (_root, session, _pipeline, _worker) =
+            fixture_with_results(true, &[PathBuf::from("reports")]);
+        let mut recipe = session.recipe.clone();
+        recipe.phases[1].complete = true;
+        recipe.phases[1].pending = Some((PathBuf::from("reports/result"), "hash".into()));
+        assert!(
+            plan(
+                &session.writer.snapshot(),
+                &recipe,
+                &request(&session, &["build/tools"]),
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn refinement_resumes_pending_rename_without_rewriting_published_output() {
+        // Exercise the real pending/rename/published boundaries. These bytes
+        // model an interrupted collector; the separate Make fixture exercises
+        // an actual compiler and an independently completed result phase.
+        let (root, mut session, pipeline, worker) = fixture(true);
+        let local = session.recipe.project_root.clone();
+        let remote = root.join("worker");
+        let old_stage = session.stage(0);
+        let done = PathBuf::from("build/delivered.o");
+        let pending = PathBuf::from("out/pending.o");
+        for base in [&local, &remote, &old_stage] {
+            std::fs::create_dir_all(base.join("build")).unwrap();
+            std::fs::create_dir_all(base.join("out")).unwrap();
+        }
+        for base in [&remote, &old_stage] {
+            std::fs::write(base.join(&done), b"original delivered bytes").unwrap();
+            std::fs::write(base.join(&pending), b"original pending bytes").unwrap();
+        }
+        std::fs::write(local.join(&pending), b"previous caller output").unwrap();
+        let done_hash = fingerprint(&old_stage.join(&done)).unwrap().unwrap();
+        let pending_hash = fingerprint(&old_stage.join(&pending)).unwrap().unwrap();
+        let temporary_name = format!(".rch-return-{}", session.recipe.identity);
+        let pending_temporary = local.join("out").join(&temporary_name);
+        {
+            let _publication = lock_output_root(&local).await.unwrap();
+            session
+                .persist_output_baseline(0, &[done.clone(), pending.clone()])
+                .unwrap();
+            let prepared = prepare_output_temporary(
+                &old_stage.join(&done),
+                &local.join("build").join(&temporary_name),
+                &done_hash,
+            )
+            .unwrap();
+            prepared.directory.sync_all().unwrap();
+            session
+                .persist_pending_output(0, Some((done.clone(), done_hash.clone())))
+                .unwrap();
+            prepared.publish(&local.join(&done)).unwrap();
+            session
+                .persist_published_output(0, done.clone(), done_hash.clone())
+                .unwrap();
+            let prepared = prepare_output_temporary(
+                &old_stage.join(&pending),
+                &pending_temporary,
+                &pending_hash,
+            )
+            .unwrap();
+            prepared.directory.sync_all().unwrap();
+            session
+                .persist_pending_output(0, Some((pending.clone(), pending_hash.clone())))
+                .unwrap();
+            // Stop after durable pending, before rename. Its exact temporary
+            // remains evidence; refinement must not move, replace or reset it.
+        }
+        let delivered_inode = std::fs::metadata(local.join(&done)).unwrap().ino();
+        let pending_inode = std::fs::metadata(&pending_temporary).unwrap().ino();
+        session.writer.record_exit(EXIT_ARTIFACT_TRANSFER_FAILED).unwrap();
+        let before = std::fs::read(&session.writer.path).unwrap();
+        let old_phase = serde_json::to_value(&session.recipe.phases[0]).unwrap();
+        let input = request(&session, &["build/tools"]);
+        let current = TransferConfig {
+            retrieval_staging_dir: Some(root.join("fresh-stage")),
+            max_transfer_time_ms: Some(900_000),
+            ..Default::default()
+        };
+        apply(&session.writer, &input, &current).unwrap();
+        let mut recovered = RecoverySession {
+            recipe: load_recipe(&session.writer).unwrap(),
+            writer: session.writer.clone(),
+        };
+        let mut expected_phase = old_phase;
+        expected_phase["patterns"]
+            .as_array_mut()
+            .unwrap()
+            .insert(0, "- /build/tools/".into());
+        assert_eq!(
+            serde_json::to_value(&recovered.recipe.phases[0]).unwrap(),
+            expected_phase
+        );
+        assert_eq!(
+            recovered.writer.snapshot().exit_code,
+            Some(EXIT_ARTIFACT_TRANSFER_FAILED)
+        );
+        // The normal recovery configuration merge must accept the newly
+        // pinned root even though publication checkpoints are nonempty.
+        recovered.apply_retrieval_config(&current).unwrap();
+        let disk = DurableLeaseWriter::read_journal(
+            &recovered.writer.path,
+            &recovered.writer.wrapper_id(),
+        )
+        .unwrap();
+        assert_eq!(
+            disk.recovery.unwrap(),
+            serde_json::to_value(&recovered.recipe).unwrap()
+        );
+        let backups: Vec<_> = std::fs::read_dir(recovered.writer.path.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|extension| extension == "before"))
+            .collect();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(std::fs::read(&backups[0]).unwrap(), before);
+        assert_eq!(
+            std::fs::metadata(&pending_temporary).unwrap().ino(),
+            pending_inode
+        );
+        let staged = recovered.staging_pipeline("project", &pipeline).unwrap();
+        let mut copy = staged.local_artifact_retrieval_for_test(
+            &worker,
+            &remote,
+            &recovered.recipe.phases[0].patterns,
+        );
+        copy.stdin(Stdio::null()).kill_on_drop(true);
+        let output = tokio::time::timeout(Duration::from_secs(15), copy.output())
+            .await
+            .expect("owned rsync fixture timed out")
+            .expect("rsync is required for the pending-refinement regression");
+        assert!(output.status.success(), "{output:?}");
+        recovered.publish("project").await.unwrap();
+        assert_eq!(
+            std::fs::metadata(local.join(&done)).unwrap().ino(),
+            delivered_inode
+        );
+        assert_eq!(
+            std::fs::metadata(local.join(&pending)).unwrap().ino(),
+            pending_inode
+        );
+        assert_eq!(fingerprint(&local.join(&done)).unwrap(), Some(done_hash));
+        assert_eq!(fingerprint(&local.join(&pending)).unwrap(), Some(pending_hash));
+        assert!(recovered.recipe.phases[0].pending.is_none());
+        assert_eq!(recovered.recipe.phases[0].published.len(), 2);
+        assert!(recovered.recipe.phases[0].complete);
+        recovered.returned(0).unwrap();
+        assert!(recovered.writer.acknowledge_terminal().is_err());
+        assert!(!recovered.recipe.sources_released);
+        let committed = std::fs::read(&recovered.writer.path).unwrap();
+        apply(&recovered.writer, &input, &current).unwrap();
+        assert_eq!(std::fs::read(&recovered.writer.path).unwrap(), committed);
+        for (path, bytes) in [
+            (done, b"original delivered bytes".as_slice()),
+            (pending, b"original pending bytes".as_slice()),
+        ] {
+            assert_eq!(std::fs::read(old_stage.join(&path)).unwrap(), bytes);
+            assert_eq!(std::fs::read(remote.join(path)).unwrap(), bytes);
+        }
+    }
+
     #[tokio::test]
     async fn real_make_fixture_recovery_keeps_symlink_validation_and_never_replays() {
         use tokio::process::Command;
@@ -649,7 +890,8 @@ mod tests {
             assert!(output.status.success(), "{output:?}");
             output.stdout
         }
-        let (root, mut session, pipeline, worker) = fixture(false);
+        let (root, mut session, pipeline, worker) =
+            fixture_with_results(false, &[PathBuf::from("reports")]);
         let remote = root.join("worker");
         let directory = "build/test-gates/path-without-cosign";
         std::fs::write(
@@ -661,10 +903,11 @@ mod tests {
             remote.join("Makefile"),
             concat!(
                 ".PHONY: test-gates\ntest-gates:\n",
-                "\tmkdir -p build/results build/test-gates/path-without-cosign\n",
+                "\tmkdir -p build/results build/test-gates/path-without-cosign reports\n",
                 "\t$(CC) program.c -o build/results/app\n",
                 "\tprintf 'build\\n' >> build/invocations\n",
                 "\tprintf 'PASS\\n' > build/results/report.txt\n",
+                "\tprintf 'PASS\\n' > reports/summary.txt\n",
                 "\tln -s ../../results/app build/test-gates/path-without-cosign/printf\n",
             ),
         )
@@ -695,6 +938,27 @@ mod tests {
             regular_files(&old_stage).is_err(),
             "old selector must reach the safety refusal"
         );
+        assert!(session.publish("project").await.is_err());
+        // The live path still collects declared results when the project
+        // artifact phase fails. Deliver a real report before refining the
+        // failed phase; it must remain complete and must never be rewritten.
+        let result_pipeline = session
+            .staging_pipeline("result:reports", &pipeline)
+            .unwrap();
+        let mut result_copy = result_pipeline.local_artifact_retrieval_for_test(
+            &worker,
+            &remote,
+            &["reports/**".into()],
+        );
+        run(&mut result_copy).await;
+        session.publish("result:reports").await.unwrap();
+        let report = root.join("caller/reports/summary.txt");
+        let report_inode = std::fs::metadata(&report).unwrap().ino();
+        let result_phase = serde_json::to_value(&session.recipe.phases[1]).unwrap();
+        assert!(session.recipe.phases[1].complete);
+        assert!(!session.recipe.phases[0].complete);
+        assert!(!session.writer.snapshot().terminal_acknowledged);
+        session.writer.record_exit(EXIT_ARTIFACT_TRANSFER_FAILED).unwrap();
         let current = TransferConfig {
             retrieval_staging_dir: Some(root.join("fresh-stage")),
             ..Default::default()
@@ -704,6 +968,15 @@ mod tests {
             recipe: load_recipe(&session.writer).unwrap(),
             writer: session.writer.clone(),
         };
+        assert_eq!(
+            serde_json::to_value(&recovered.recipe.phases[1]).unwrap(),
+            result_phase
+        );
+        assert_eq!(std::fs::metadata(&report).unwrap().ino(), report_inode);
+        assert_eq!(
+            recovered.writer.snapshot().exit_code,
+            Some(EXIT_ARTIFACT_TRANSFER_FAILED)
+        );
         let staged = recovered.staging_pipeline("project", &pipeline).unwrap();
         let mut copy = staged.local_artifact_retrieval_for_test(
             &worker,
@@ -756,5 +1029,11 @@ mod tests {
             std::fs::read(root.join("caller/build/results/report.txt")).unwrap(),
             b"PASS\n"
         );
+        assert_eq!(
+            serde_json::to_value(&recovered.recipe.phases[1]).unwrap(),
+            result_phase
+        );
+        assert_eq!(std::fs::metadata(&report).unwrap().ino(), report_inode);
+        assert_eq!(std::fs::read(report).unwrap(), b"PASS\n");
     }
 }

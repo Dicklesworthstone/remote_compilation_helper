@@ -54,13 +54,28 @@ sibling, a same-named tree elsewhere, or a regular file bearing that name.
 
 ## What is retained and what may change
 
-A new refinement requires a persisted successful command outcome, an implicit
-Make project phase, and no pending, published, completed or failed-result phase.
-It cannot alter native or Cargo output contracts, priority includes, declared
-result directories, a delivered outcome, or released source ownership. It only
-adds directory-exclusion rules and pins the fresh staging base. Worker/build
-identity, source authority, verification flags, output baselines and original
-completion remain unchanged.
+A new refinement requires a persisted successful command outcome and an
+unfinished implicit Make project phase. It cannot alter native or Cargo output
+contracts, priority includes, declared result directories, failed results, a
+delivered outcome, or released source ownership. It only adds directory-exclusion
+rules and pins the fresh staging base. Worker/build identity, source authority,
+verification flags, output baselines and original completion remain unchanged.
+
+Previously delivered reports and disjoint partial publication no longer block
+refinement of the failed project phase. Every completed phase, published file
+fingerprint and pending rename remains in the recipe unchanged. An exclusion
+that equals, contains, or lies beneath a pending or published project output is
+refused before preparing staging or writing a journal. Declared result-directory
+overlap remains forbidden even when its phase is already complete. These checks
+compare path components, not text prefixes: `build/tools` does not overlap
+`build/tools-extra/app`. Contradictory completed-but-pending phases also refuse.
+
+The collector retrieves into the fresh stage under the original source grant.
+It skips completed result phases and resumes the existing publisher: already
+published files are not rewritten, and pending renames must still pass their
+original fingerprint and ownership checks. This explicit, audited refinement is
+different from an ordinary staging-location override, which remains forbidden
+after publication starts. It never clears a checkpoint to make a retry succeed.
 
 Before changing the recipe, RCH retains the exact previous journal bytes in an
 exclusive, synchronized, private `artifact-policy-<uuid>.before` file beside the
@@ -79,6 +94,7 @@ through the ordinary recovery path.
 Exclusions and the new staging location survive restart without the environment
 variable. Repeating an identical request is read-only and may resume partial
 publication or read back a terminal job; it cannot reset progress. A *new*
-exclusion after publication begins is refused. On retries, keep the same staging
-configuration or omit the override so the persisted location remains in force.
+exclusion must be disjoint from every pending and published project output and
+cannot modify an already completed project phase. On retries, keep the same
+staging configuration or omit the override so the persisted location remains in force.
 The overall `--timeout-secs` deadline and transfer budget remain independent.
