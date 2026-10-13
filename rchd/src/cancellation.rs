@@ -794,6 +794,20 @@ impl CancellationOrchestrator {
     async fn try_remote_kill(&self, record: &mut CancellationRecord) -> bool {
         record.remote_kill_attempted = true;
 
+        // The answer is known without asking: see `remote_answer_can_confirm`.
+        // A build fenced by a lease that still owns worker source is
+        // re-cancelled every stuck-detector tick, and on css on 2026-10-13
+        // each tick spent an SSH round trip per such build just to run
+        // `exit 42` on the worker (~1,400 an hour to one production worker).
+        if !remote_answer_can_confirm(record) {
+            debug!(
+                build_id = record.build_id,
+                worker_id = %record.worker_id,
+                "No remote process-group record; skipping an SSH that cannot confirm (reservation retained)"
+            );
+            return false;
+        }
+
         let Some(mut ssh) = build_remote_kill_command(record) else {
             warn!(
                 build_id = record.build_id,
@@ -1155,6 +1169,14 @@ fn build_remote_kill_script(remote_pgid_file: Option<&str>, build_id: u64) -> St
     )
 }
 
+/// Without a recorded process-group file both worker scripts are `exit 42`,
+/// which prints no receipt: no SSH answer can confirm a kill
+/// ([`remote_kill_confirmed`]) or prove the record absent
+/// ([`remote_record_absent`]), so the reservation is retained either way.
+fn remote_answer_can_confirm(record: &CancellationRecord) -> bool {
+    record.remote_pgid_file.is_some()
+}
+
 /// The worker no longer holds the build's process record (see
 /// `cancellation_remote.sh`). Proof of death only for an abandoned build.
 fn remote_record_absent(output: &std::process::Output, build_id: u64) -> bool {
@@ -1394,6 +1416,29 @@ mod tests {
             abandoned_unlaunched: false,
             legacy_probe_config: None,
         }
+    }
+
+    #[test]
+    fn a_record_without_a_pgid_file_can_never_confirm_remotely() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let mut record = test_record(CancellationState::TermSent, 0, false);
+        record.remote_pgid_file = None;
+        assert!(!remote_answer_can_confirm(&record));
+        // Both worker scripts degrade to `exit 42`, which prints no receipt,
+        // so skipping the SSH cannot change the outcome.
+        assert_eq!(build_remote_kill_script(None, 42), "exit 42");
+        assert_eq!(build_remote_record_probe_script(None, 42), "exit 42");
+        let output = std::process::Output {
+            status: std::process::ExitStatus::from_raw(42 << 8),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        };
+        assert!(!remote_kill_confirmed(&output, 42));
+        assert!(!remote_record_absent(&output, 42));
+
+        record.remote_pgid_file = Some("/tmp/rch/project/.rch-run/42.pgid".to_string());
+        assert!(remote_answer_can_confirm(&record));
     }
 
     #[test]
