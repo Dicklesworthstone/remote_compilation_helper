@@ -2187,7 +2187,12 @@ async fn run_benchmark(format: OutputFormat) -> Result<()> {
         results = results.with_compilation(c.clone());
     }
 
-    let score = rch_telemetry::speedscore::calculate_speedscore(&results);
+    // Score the same complete evidence that the daemon receives. A report
+    // without any measurements is a failed benchmark, not a zero-speed worker.
+    let report = rch_telemetry::benchmarks::report::BenchmarkReport::from_results(&results);
+    let score = report
+        .recalculate()
+        .context("No usable worker benchmark evidence")?;
     let elapsed = start.elapsed();
     let cores = std::thread::available_parallelism().map_or(0, std::num::NonZeroUsize::get);
 
@@ -2209,6 +2214,7 @@ async fn run_benchmark(format: OutputFormat) -> Result<()> {
             // `score` stays a top-level f64 for backward compatibility: rchd's
             // `execute_benchmark_on_worker` parses exactly that field.
             let payload = serde_json::json!({
+                "benchmark_report": report,
                 "score": round1(score.total),
                 "elapsed_secs": (elapsed.as_secs_f64() * 100.0).round() / 100.0,
                 "cores": cores,
@@ -2222,6 +2228,7 @@ async fn run_benchmark(format: OutputFormat) -> Result<()> {
                 "raw": {
                     "cpu_ops_per_second": finite(cpu.ops_per_second),
                     "memory_seq_bandwidth_gbps": finite(memory.seq_bandwidth_gbps),
+                    "memory_random_latency_ns": finite(memory.random_latency_ns),
                     "disk_seq_read_mbps": finite(disk.seq_read_mbps),
                     "disk_seq_write_mbps": finite(disk.seq_write_mbps),
                     "disk_random_read_iops": finite(disk.random_read_iops),
