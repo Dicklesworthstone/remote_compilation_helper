@@ -202,8 +202,20 @@ fn build_cleanup_command(
         escaped_run_root,
         max_cache_age_hours,
         min_free_gb,
+        placement_low_disk_permille(),
         &rch_common::stale_target_reap::source_claim_gc_guard_fragment(),
     )
+}
+
+/// rchd gives a worker zero slots once its free ratio falls to the placement
+/// policy's `critical_free_ratio`. Below that line no new build replaces these
+/// caches, so an age-only prune can leave a large worker starved with tens of
+/// GB free (bd-xxck3: css queue-timed-out ~466 builds/h on 2026-10-13). Low-disk
+/// eviction therefore also runs until the filesystem is back above that line
+/// with two percentage points of headroom.
+fn placement_low_disk_permille() -> u64 {
+    let critical = crate::disk_pressure::DiskPressurePolicyConfig::default().critical_free_ratio;
+    ((critical * 1000.0).ceil() as u64).saturating_add(20)
 }
 
 fn build_cleanup_command_with_source_guard(
@@ -211,6 +223,7 @@ fn build_cleanup_command_with_source_guard(
     escaped_run_root: &str,
     max_cache_age_hours: u64,
     min_free_gb: u64,
+    low_disk_permille: u64,
     source_guard: &str,
 ) -> String {
     let max_age_minutes = max_cache_age_hours.saturating_mul(60);
@@ -233,10 +246,15 @@ fn build_cleanup_command_with_source_guard(
          base={base}; \
          max_age_minutes={max_age_minutes}; \
          threshold_kb={threshold_kb}; \
+         low_disk_permille={low_disk_permille}; \
          active_grace_minutes={active_grace_minutes}; \
          orphan_after_minutes={orphan_after_minutes}; \
          if [ ! -d \"$base\" ]; then mkdir -p \"$base\"; fi; \
          if physical=$(cd \"$base\" 2>/dev/null && pwd -P); then base=$physical; fi; \
+         total_kb=$(df -Pk \"$base\" 2>/dev/null | awk 'NR==2 {{print $2}}'); \
+         case \"$total_kb\" in ''|*[!0-9]*) total_kb=0 ;; esac; \
+         ratio_kb=$((total_kb / 1000 * low_disk_permille)); \
+         if [ \"$ratio_kb\" -gt \"$threshold_kb\" ]; then threshold_kb=$ratio_kb; fi; \
          before_kb=$(df -Pk \"$base\" 2>/dev/null | awk 'NR==2 {{print $4}}'); \
          if [ -z \"$before_kb\" ]; then before_kb=0; fi; \
          removed=0; freed_kb=0; low_disk=0; remove_errors=0; orphans_killed=0; \
@@ -344,6 +362,7 @@ fn build_cleanup_command_with_source_guard(
         run_root = escaped_run_root,
         max_age_minutes = max_age_minutes,
         threshold_kb = threshold_kb,
+        low_disk_permille = low_disk_permille,
         active_grace_minutes = active_grace_minutes,
         orphan_after_minutes = orphan_after_minutes,
         empty_run_dir_minutes = empty_run_dir_minutes,
@@ -1761,6 +1780,8 @@ flock -n "$__gc_source_registry/metadata.lock" true;
         let _guard = test_guard!();
         let command = build_cleanup_command("'/tmp/rch'", REMOTE_RUN_ROOT, 72, 10);
         assert!(command.contains("threshold_kb=10485760"));
+        assert!(command.contains("low_disk_permille=70"));
+        assert!(command.contains("ratio_kb=$((total_kb / 1000 * low_disk_permille))"));
         assert!(command.contains("active_grace_minutes=5"));
         assert!(command.contains("-mmin -\"$active_grace_minutes\""));
         assert!(command.contains("case \"$dir\" in \"$base\"/*)"));
@@ -1948,6 +1969,17 @@ flock -n "$__gc_source_registry/metadata.lock" true;
         runs: &std::path::Path,
         prepend_path: &[std::path::PathBuf],
     ) -> (String, String, Option<i32>) {
+        // A zero ratio keeps low-disk mode independent of the test host's disk.
+        run_sweep_with(base, runs, prepend_path, 0, 0)
+    }
+
+    fn run_sweep_with(
+        base: &std::path::Path,
+        runs: &std::path::Path,
+        prepend_path: &[std::path::PathBuf],
+        max_cache_age_hours: u64,
+        low_disk_permille: u64,
+    ) -> (String, String, Option<i32>) {
         use std::env::{join_paths, split_paths};
         let escaped = format!("'{}'", base.display());
         // Registry records are protocol state, not a host-wide test fixture.
@@ -1966,8 +1998,9 @@ flock -n "$__gc_source_registry/metadata.lock" true;
         let command = build_cleanup_command_with_source_guard(
             &escaped,
             &format!("'{}'", runs.display()),
+            max_cache_age_hours,
             0,
-            0,
+            low_disk_permille,
             &source_guard,
         );
         let mut full_path: Vec<std::path::PathBuf> = prepend_path.to_vec();
@@ -1983,6 +2016,40 @@ flock -n "$__gc_source_registry/metadata.lock" true;
             String::from_utf8_lossy(&output.stderr).into_owned(),
             output.status.code(),
         )
+    }
+
+    /// A worker at or below the placement policy's critical free ratio gets no
+    /// slots, so the sweep must evict inactive caches there even when they are
+    /// younger than max_age (bd-xxck3). `find -printf` makes this Linux-only.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cleanup_command_evicts_young_inactive_caches_below_the_placement_ratio() {
+        let _guard = test_guard!();
+        assert_eq!(placement_low_disk_permille(), 70);
+        let base = tempfile::tempdir().expect("base");
+        let runs = tempfile::tempdir().expect("run root");
+        let pool = base
+            .path()
+            .join("busy_repo")
+            .join(".rch-target-pool-0123abcd");
+        std::fs::create_dir_all(pool.join("deps")).expect("pool tree");
+        // Past the 5-minute activity grace, far younger than 72 h.
+        age_dir(&pool);
+        let (stdout, stderr, code) = run_sweep_with(base.path(), runs.path(), &[], 72, 0);
+        assert_eq!(code, Some(0), "{stdout}{stderr}");
+        assert!(
+            stdout.contains("removed=0") && stdout.contains("low_disk=0"),
+            "{stdout}"
+        );
+        assert!(pool.exists());
+        // No filesystem has 100% free, so this ratio always demands eviction.
+        let (stdout, stderr, code) = run_sweep_with(base.path(), runs.path(), &[], 72, 1000);
+        assert_eq!(code, Some(0), "{stdout}{stderr}");
+        assert!(
+            stdout.contains("removed=1") && stdout.contains("low_disk=1"),
+            "{stdout}"
+        );
+        assert!(!pool.exists());
     }
 
     #[test]
