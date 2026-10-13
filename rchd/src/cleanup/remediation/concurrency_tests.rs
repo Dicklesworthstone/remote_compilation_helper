@@ -42,7 +42,7 @@ async fn never_ready_worker_cannot_hold_a_ready_peer_or_lose_a_later_wakeup() {
         waiting.await.expect("complete controlled waiter")
     }));
     assert!(flights.push(stamp_for(3, "ready-peer"), async { Some("failed".into()) }));
-    let (peer, result) = tokio::time::timeout(Duration::from_secs(2), flights.next_completed())
+    let (peer, result, _) = tokio::time::timeout(Duration::from_secs(2), flights.next_completed())
         .await
         .expect("a ready peer must not await the oldest worker");
     assert_eq!(peer.build_id, 3);
@@ -51,7 +51,7 @@ async fn never_ready_worker_cannot_hold_a_ready_peer_or_lose_a_later_wakeup() {
     assert!(!flights.can_start(&stamp_for(4, "stalled")));
 
     finish.send(Some("cancelled".into())).unwrap();
-    let (peer, result) = tokio::time::timeout(Duration::from_secs(2), flights.next_completed())
+    let (peer, result, _) = tokio::time::timeout(Duration::from_secs(2), flights.next_completed())
         .await
         .expect("a later wakeup must remain registered");
     assert_eq!(peer.build_id, 2);
@@ -79,7 +79,7 @@ async fn observer_tick_interrupts_waiting_without_dropping_inflight_work() {
     }
     assert_eq!(entered.load(Ordering::SeqCst), 1);
     finish.send(Some("failed".into())).unwrap();
-    let (completed, _) = flights.next_completed().await;
+    let (completed, _, _) = flights.next_completed().await;
     assert_eq!(completed.build_id, 1);
     assert!(flights.running.is_empty());
 }
@@ -162,7 +162,7 @@ async fn production_admission_skips_busy_workers_and_advances_past_a_failed_pref
         assert_eq!(workers.len(), flights.running.len());
         tokio::time::timeout(Duration::from_secs(30), async {
             while !flights.running.is_empty() {
-                let (stamp, status) = flights.next_completed().await;
+                let (stamp, status, _) = flights.next_completed().await;
                 assert_eq!(status.as_deref(), Some("failed"));
                 attempted.insert(stamp.build_id);
             }
@@ -203,7 +203,7 @@ async fn heartbeat_after_queuing_vetoes_cancellation_at_first_poll() {
             progress_percent: None,
         })
         .unwrap();
-    let (_, status) = flights.next_completed().await;
+    let (_, status, _) = flights.next_completed().await;
     assert!(status.is_none(), "new evidence must veto admission, not cancel the resumed job");
     assert!(cleanup.context.cancellation.active_cancellations().await.is_empty());
     assert!(cleanup.context.history.active_build(build.id).is_some());

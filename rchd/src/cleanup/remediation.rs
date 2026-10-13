@@ -14,6 +14,8 @@ use std::time::{Duration, Instant};
 use tokio::time::{MissedTickBehavior, interval};
 use tracing::warn;
 
+mod lease_wakeup;
+
 const RETRY_BASE: Duration = Duration::from_secs(30);
 const RETRY_MAX: Duration = Duration::from_secs(5 * 60);
 /// Bound both accepted automatic operations and new starts per observer tick.
@@ -58,6 +60,7 @@ struct FailedAttempt {
     stamp: RetryStamp,
     finished: Instant,
     delay: Duration,
+    lease: Option<lease_wakeup::LeaseStamp>,
 }
 
 #[derive(Default)]
@@ -67,17 +70,40 @@ struct RetryBackoff {
 
 impl RetryBackoff {
     fn ready(&mut self, stamp: &RetryStamp, now: Instant) -> bool {
+        if !self.failures.contains_key(&stamp.build_id) {
+            return true;
+        }
+        self.ready_after_lease_observation(stamp, now, lease_wakeup::observe(stamp))
+    }
+
+    fn ready_after_lease_observation(
+        &mut self,
+        stamp: &RetryStamp,
+        now: Instant,
+        lease: Option<lease_wakeup::LeaseStamp>,
+    ) -> bool {
         let Some(previous) = self.failures.get(&stamp.build_id) else {
             return true;
         };
-        if previous.stamp != *stamp {
+        if previous.stamp != *stamp || lease_wakeup::changed(&previous.lease, &lease) {
             self.failures.remove(&stamp.build_id);
             return true;
         }
         now.saturating_duration_since(previous.finished) >= previous.delay
     }
 
+    #[cfg(test)]
     fn failed(&mut self, stamp: RetryStamp, now: Instant) -> Duration {
+        let lease = lease_wakeup::observe(&stamp);
+        self.failed_with_lease(stamp, now, lease)
+    }
+
+    fn failed_with_lease(
+        &mut self,
+        stamp: RetryStamp,
+        now: Instant,
+        lease: Option<lease_wakeup::LeaseStamp>,
+    ) -> Duration {
         let delay = self
             .failures
             .get(&stamp.build_id)
@@ -88,6 +114,7 @@ impl RetryBackoff {
         self.failures.insert(
             stamp.build_id,
             FailedAttempt {
+                lease,
                 stamp,
                 finished: now,
                 delay,
@@ -129,6 +156,7 @@ fn record_outcome(
     backoff: &mut RetryBackoff,
     attempted: RetryStamp,
     status: &str,
+    lease_before: Option<lease_wakeup::LeaseStamp>,
 ) {
     // The retry controller never removes a build or releases a slot. Absence
     // only retires our local timer; the orchestrator owns durable completion.
@@ -139,12 +167,16 @@ fn record_outcome(
     }
     let id = attempted.build_id;
     let worker = attempted.worker_id.clone();
-    let delay = backoff.failed(attempted, Instant::now());
+    let recovery_hint = lease_wakeup::recovery_hint(&attempted);
+    // Watch from BEFORE the operation: recovery that races with a failed
+    // cancellation must not disappear behind a newly established deadline.
+    let delay = backoff.failed_with_lease(attempted, Instant::now(), lease_before);
     warn!(
         build_id = id,
         worker_id = %worker,
         status,
         retry_after_secs = delay.as_secs(),
+        recovery_hint = ?recovery_hint,
         "Automatic cancellation unconfirmed; ownership retained and retry deferred"
     );
     cleanup.context.events.emit(
@@ -154,6 +186,7 @@ fn record_outcome(
             "worker_id": worker,
             "status": status,
             "retry_after_secs": delay.as_secs(),
+            "recovery_hint": recovery_hint,
         }),
     );
 }
@@ -164,6 +197,7 @@ fn record_outcome(
 /// owns termination/finalization of operations it has already admitted.
 struct InFlight {
     stamp: RetryStamp,
+    lease_before: Option<lease_wakeup::LeaseStamp>,
     wait: Pin<Box<dyn Future<Output = Option<String>> + Send>>,
 }
 
@@ -191,13 +225,16 @@ impl Remediations {
             return false;
         }
         self.running.push(InFlight {
+            lease_before: lease_wakeup::observe(&stamp),
             stamp,
             wait: Box::pin(wait),
         });
         true
     }
 
-    async fn next_completed(&mut self) -> (RetryStamp, Option<String>) {
+    async fn next_completed(
+        &mut self,
+    ) -> (RetryStamp, Option<String>, Option<lease_wakeup::LeaseStamp>) {
         // At most four polls; all waits share this task's waker. A ready peer
         // is collected even when the oldest worker never wakes. Cancellation
         // of this poll by a timer tick leaves every owned future in the set.
@@ -205,7 +242,7 @@ impl Remediations {
             for index in 0..self.running.len() {
                 if let Poll::Ready(status) = self.running[index].wait.as_mut().poll(cx) {
                     let flight = self.running.swap_remove(index);
-                    return Poll::Ready((flight.stamp, status));
+                    return Poll::Ready((flight.stamp, status, flight.lease_before));
                 }
             }
             Poll::Pending
@@ -305,9 +342,9 @@ pub(super) async fn run(cleanup: ActiveBuildCleanup) {
                 let candidates = cleanup.collect_active_builds_observed(&mut observation);
                 flights.start_observed(&cleanup, &mut observation, &mut backoff, candidates);
             }
-            (attempted, status) = flights.next_completed(), if !flights.running.is_empty() => {
+            (attempted, status, lease_before) = flights.next_completed(), if !flights.running.is_empty() => {
                 if let Some(status) = status {
-                    record_outcome(&cleanup, &mut backoff, attempted, &status);
+                    record_outcome(&cleanup, &mut backoff, attempted, &status, lease_before);
                 } else {
                     // Fresh evidence vetoed this decision before any operation
                     // was admitted. It is not a failed cancellation or a receipt.
@@ -456,7 +493,7 @@ mod tests {
         let before = serde_json::to_value(&build).unwrap();
         let mut retry = RetryBackoff::default();
         for status in ["failed", "cancelling", "error", "cancelled"] {
-            record_outcome(&cleanup, &mut retry, RetryStamp::of(&build), status);
+            record_outcome(&cleanup, &mut retry, RetryStamp::of(&build), status, None);
             let retained = context.history.active_build(build.id).unwrap();
             assert_eq!(serde_json::to_value(retained).unwrap(), before);
             assert_eq!(worker.used_slots(), 3);
