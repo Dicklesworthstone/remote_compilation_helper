@@ -3041,7 +3041,7 @@ exec /bin/sh -c "$payload"
             // must keep cancellation unconfirmed after bounded escalation.
             let prefix = format!(
                 "kill() {{ return 0; }}; sleep() {{ :; }}; \
-                 ps() {{ printf '%s 1 S\\n{pgid} {pgid} S\\n' \"$$\"; }};"
+                 ps() {{ printf '%s %s 1 S 1\\n{pgid} {pgid} {pgid} S 1\\n' \"$$\" \"$$\"; }};"
             );
             let output = remote_cancel_probe_fixture(&path, &prefix).await;
             assert_eq!(output.status.code(), Some(45), "{output:?}");
