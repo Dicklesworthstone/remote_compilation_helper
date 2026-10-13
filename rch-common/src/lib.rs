@@ -44,6 +44,7 @@ pub mod gc_roots;
 pub mod hooks;
 pub mod incident;
 pub mod incident_ledger;
+pub mod isolated_staging;
 pub mod job_identity;
 pub mod job_recovery;
 pub mod log_retention;
