@@ -41,10 +41,9 @@ pub(super) const INPUT_NAMES: &[&str] = &[
 
 pub(super) fn fingerprint_hasher() -> Hasher {
     let mut hasher = Hasher::new();
-    // Invalidate stamps produced before locked-manager selection was enforced.
-    // The old Bun hint could install with Bun against an npm lock, so even an
-    // unchanged old manifest/lock stamp is not evidence of the selected install.
-    hasher.update(b"rch-dependency-install-v2\0");
+    // Root-only stamps cannot prove the workspace manifests were unchanged.
+    // Retain locked-manager selection and invalidate pre-workspace stamps.
+    hasher.update(b"rch-dependency-install-v3\0");
     hasher
 }
 
@@ -211,45 +210,16 @@ fn detect_package_manager(project_root: &Path) -> PackageManager {
         .manager
 }
 
-/// Compute a fingerprint over the project's manifest + lockfiles.
-///
-/// The fingerprint includes each file's NAME and SIZE (length-prefixed)
-/// alongside its content so that:
-///   1. Two files with adjacent contents like `("a", "bc")` vs `("ab", "c")`
-///      cannot collide (length-prefix removes the boundary ambiguity).
-///   2. Switching package manager (yarn → pnpm) produces a different hash
-///      even if the lockfile bytes happened to be identical.
+/// Compute the same bounded, workspace-aware observation used by the outer
+/// preparation transaction. Cache decisions and publication must not hash a
+/// different input set. The encoding length-prefixes file names and contents.
 pub async fn compute_fingerprint(project_root: &Path) -> Result<DependencyFingerprint> {
-    let mut hasher = fingerprint_hasher();
-    let mut sources = Vec::new();
-    // `bun.lock` (text, Bun ≥1.2) AND `bun.lockb` (binary, older Bun) are both
-    // probed so a project that switches Bun versions still hashes correctly.
-    for name in INPUT_NAMES {
-        let p = project_root.join(name);
-        if p.exists() {
-            let bytes = tokio::fs::read(&p)
-                .await
-                .with_context(|| format!("read {}", p.display()))?;
-            // Length-prefixed encoding eliminates the boundary ambiguity.
-            // `name_len:u32_le | name | content_len:u64_le | content`.
-            let name_bytes = name.as_bytes();
-            hasher.update(&(name_bytes.len() as u32).to_le_bytes());
-            hasher.update(name_bytes);
-            hasher.update(&(bytes.len() as u64).to_le_bytes());
-            hasher.update(&bytes);
-            sources.push(name.to_string());
-        }
-    }
-    if sources.is_empty() {
-        return Err(anyhow!(
-            "no package manifest found in {}",
-            project_root.display()
-        ));
-    }
-    Ok(DependencyFingerprint {
-        hash: hasher.finalize().to_hex().to_string(),
-        sources,
+    let project = project_root.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        super::DependencyInputs::capture(&project).map(|inputs| inputs.fingerprint)
     })
+    .await
+    .context("dependency input discovery task failed")?
 }
 
 const FINGERPRINT_FILE: &str = ".rch_dep_fingerprint.json";
@@ -1311,15 +1281,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_fingerprint_length_prefix_disambiguates() {
-        // br-4998x review fix: with length-prefixed encoding, two
-        // adjacent-content scenarios that would collide under simple
-        // concatenation produce distinct hashes.
+        // Two valid manifests plus their lock bytes concatenate identically,
+        // but moving a trailing space between files must change the digest.
         let a = TempDir::new().unwrap();
-        std::fs::write(a.path().join("package.json"), "ab").unwrap();
+        std::fs::write(a.path().join("package.json"), "{\"name\":\"x\"} ").unwrap();
         std::fs::write(a.path().join("bun.lock"), "c").unwrap();
         let b = TempDir::new().unwrap();
-        std::fs::write(b.path().join("package.json"), "a").unwrap();
-        std::fs::write(b.path().join("bun.lock"), "bc").unwrap();
+        std::fs::write(b.path().join("package.json"), "{\"name\":\"x\"}").unwrap();
+        std::fs::write(b.path().join("bun.lock"), " c").unwrap();
         let fp_a = compute_fingerprint(a.path()).await.unwrap();
         let fp_b = compute_fingerprint(b.path()).await.unwrap();
         assert_ne!(

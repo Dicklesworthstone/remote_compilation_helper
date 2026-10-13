@@ -8,6 +8,7 @@
 //! into a cache hit or start a competing installer in the same directory.
 
 mod install;
+mod workspace_inputs;
 
 use install::{INPUT_NAMES, InstallPlan};
 pub use install::{PrepareAction, PrepareReport};
@@ -66,6 +67,7 @@ struct InputObservation {
 }
 
 struct DependencyInputs {
+    names: Vec<String>,
     members: Vec<Option<InputObservation>>,
     fingerprint: install::DependencyFingerprint,
     #[cfg(unix)]
@@ -79,11 +81,13 @@ impl DependencyInputs {
             root.file_type().is_dir(),
             "dependency project is not a real directory"
         );
+        let inventory = workspace_inputs::discover(project, INPUT_NAMES)?;
+        let names = inventory.names.clone();
         let mut budget = MAX_INPUT_BYTES;
         let mut hasher = install::fingerprint_hasher();
         let mut sources = Vec::new();
         let mut members = Vec::new();
-        for name in INPUT_NAMES {
+        for name in &names {
             let path = project.join(name);
             let metadata = match std::fs::symlink_metadata(&path) {
                 Ok(metadata) => metadata,
@@ -114,19 +118,21 @@ impl DependencyInputs {
             hasher.update(name.as_bytes());
             hasher.update(&(bytes.len() as u64).to_le_bytes());
             hasher.update(&bytes);
-            sources.push((*name).to_owned());
+            sources.push(name.clone());
             members.push(Some(InputObservation {
                 identity: before,
                 digest: blake3::hash(&bytes),
             }));
         }
-        ensure!(
-            members[0].is_some(),
-            "package.json is required for dependency preparation"
-        );
+        let root_manifest = members[0]
+            .as_ref()
+            .context("package.json is required for dependency preparation")?;
+        // Discovery and file reads must describe the same root manifest and
+        // directory membership. A new glob-matched package is an input too.
+        inventory.verify(root_manifest)?;
         // Revalidate earlier inputs after reading the last one: a coherent
         // observation must not combine generations changed during this walk.
-        for (name, observed) in INPUT_NAMES.iter().zip(&members) {
+        for (name, observed) in names.iter().zip(&members) {
             let now = match std::fs::symlink_metadata(project.join(name)) {
                 Ok(metadata) => Some(InputIdentity::of(&metadata)?),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
@@ -148,12 +154,18 @@ impl DependencyInputs {
             );
             (root.dev(), root.ino())
         };
+        let fingerprint = install::DependencyFingerprint {
+            hash: hasher.finalize().to_hex().to_string(),
+            sources,
+        };
+        ensure!(
+            serde_json::to_vec(&fingerprint)?.len() as u64 <= MAX_FINGERPRINT_BYTES,
+            "dependency input inventory exceeds fingerprint byte limit"
+        );
         Ok(Self {
+            names,
             members,
-            fingerprint: install::DependencyFingerprint {
-                hash: hasher.finalize().to_hex().to_string(),
-                sources,
-            },
+            fingerprint,
             #[cfg(unix)]
             root,
         })
@@ -170,18 +182,22 @@ impl DependencyInputs {
             self.root == after.root,
             "dependency project was replaced during preparation"
         );
+        ensure!(
+            self.names == after.names,
+            "workspace manifest inventory changed during preparation"
+        );
         // Only the chosen installer's newly generated lockfile is permitted.
         // Existing files (including locks) must retain both bytes and identity.
         // Use the same selection as dispatch. A Bun test against an npm-locked
         // project still uses npm, and a frozen install may create no new lock.
         let generated =
             InstallPlan::for_sources(&self.fingerprint.sources, runtime)?.generated_lockfiles();
-        for ((name, before), current) in INPUT_NAMES.iter().zip(&self.members).zip(&after.members) {
+        for ((name, before), current) in self.names.iter().zip(&self.members).zip(&after.members) {
             match (before, current) {
                 (Some(before), Some(current)) if before == current => {}
                 (None, None) => {}
                 (None, Some(_))
-                    if action == PrepareAction::Installed && generated.contains(name) => {}
+                    if action == PrepareAction::Installed && generated.contains(&name.as_str()) => {}
                 _ => bail!("dependency input {name} changed during preparation"),
             }
         }
@@ -522,7 +538,12 @@ mod tests {
     async fn input_observation_matches_the_installers_fingerprint() {
         let fixture = tempfile::tempdir().unwrap();
         for name in INPUT_NAMES {
-            std::fs::write(fixture.path().join(name), format!("contents of {name}")).unwrap();
+            let contents = if *name == "package.json" {
+                r#"{"name":"fixture"}"#.to_owned()
+            } else {
+                format!("contents of {name}")
+            };
+            std::fs::write(fixture.path().join(name), contents).unwrap();
         }
         let inputs = DependencyInputs::capture(fixture.path()).unwrap();
         assert_eq!(
@@ -545,10 +566,10 @@ mod tests {
     fn preexisting_inputs_cannot_change_even_when_mtime_is_restored() {
         let fixture = tempfile::tempdir().unwrap();
         let manifest = fixture.path().join("package.json");
-        std::fs::write(&manifest, b"first").unwrap();
+        std::fs::write(&manifest, br#"{"name":"first"}"#).unwrap();
         let before = DependencyInputs::capture(fixture.path()).unwrap();
         let modified = std::fs::metadata(&manifest).unwrap().modified().unwrap();
-        std::fs::write(&manifest, b"other").unwrap();
+        std::fs::write(&manifest, br#"{"name":"other"}"#).unwrap();
         File::options()
             .write(true)
             .open(&manifest)
