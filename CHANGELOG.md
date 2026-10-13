@@ -5,7 +5,7 @@ Compilation Helper): the PreToolUse hook + CLI (`rch`), the local daemon (`rchd`
 worker agent (`rch-wkr`), the RABS build sidecar (`rabs-*`, `rabsd`), and the fleet
 dashboard (`dashboard/`).
 
-Scope window: project inception (`v0.1.0`, 2026-01-25) through `v2.1.21` (2026-10-13).
+Scope window: project inception (`v0.1.0`, 2026-01-25) through `v2.1.22` (2026-10-13).
 
 This document was rebuilt from git history (`git log --no-merges` per tag range, `git show`
 on representative commits), version tags (`git for-each-ref`), GitHub release metadata
@@ -28,6 +28,69 @@ history. They are kept as-is because the descriptions were verified against the 
 but those particular links will 404.
 
 Repository: <https://github.com/Dicklesworthstone/remote_compilation_helper>
+
+## 2.1.22 — 2026-10-13
+
+Starved workers are now actually reclaimed: the cache sweep reaches a worker that placement has
+zeroed even while its last builds drain, and the worker-wide reaper evicts idle target
+directories under disk pressure, including each project's default `.rch-target`. Worker-side
+scripts parse under macOS `sh`, though Darwin workers still cannot launch a build.
+
+- **Disk-starved workers are swept while they drain** (`bd-20ka9`). The cache sweep required
+  a worker with no used slots and an idle interval. A worker that placement has zeroed for
+  free space still runs the builds it already had, so the sweep never reached it: an hour
+  after 2.1.21 reached every dispatcher, one cycle checked 15 workers, cleaned three idle
+  ones and freed nothing, while two starved workers held 51-53 GB under the sweep's base. A
+  worker whose pressure is Critical for free space is now swept regardless of used slots.
+  Critical for I/O saturation, memory or stale telemetry still waits for idle ([`f0f9966e`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/f0f9966e3e19aa76e52f909d870e81cb6fa8f9d7)).
+- **The worker-wide reaper evicts under disk pressure** (`bd-20ka9`). It had only TTL
+  windows (hours per job, days per pool). While the sweep root's filesystem is below the
+  placement line (critical ratio plus two points), it now evicts target directories oldest
+  first until the worker is back above it. It re-measures free space before each removal,
+  takes candidates on the root's own filesystem only, and applies the 1 h idle floor rather
+  than the TTL window (one starved worker held 67 GB idle for an hour or more but 7 GB idle
+  for six). Both liveness gates and the source registry still apply, and removals log with
+  the `pressure` trigger. It acts where the reaper is enabled
+  (`RCH_WORKER_REAP_ENABLE=1`) ([`ec3d8a0c`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/ec3d8a0c30f3478a1f722bebf3289aef24a07dee), [`f0f9966e`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/f0f9966e3e19aa76e52f909d870e81cb6fa8f9d7)).
+- **The default `.rch-target` is collected as a pooled directory** (`bd-20ka9`). The hook
+  builds into `<mirror>/.rch-target` whenever the caller forwards no `CARGO_TARGET_DIR`.
+  No sweep matched that name, and workers held up to 50 GB of them each. It is now
+  classified as pooled: the pooled TTL pass, the pressure pass and `rch gc` cover it
+  ([`ec3d8a0c`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/ec3d8a0c30f3478a1f722bebf3289aef24a07dee)).
+- **Worker-side scripts run under macOS `sh`** (`bd-nat0c`). bash 3.2 misparsed a `case`
+  arm inside `$(...)` in the source registry and a heredoc inside `$(...)` in the
+  process-identity protocol, which every remote launch, cancellation, recovery and cleanup
+  script embeds. BSD awk cannot hold NUL, so the registry's overlap check refused every
+  root. `realpath -m`, `mv -T` and the `/proc` uuid have portable paths (GNU coreutils'
+  g-prefixed tools when installed, `uuidgen`). Linux behaviour is unchanged
+  ([`6c7e3879`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/6c7e38795da4e1dcb86861ed1f235cd4e031e28a), [`ee50e11d`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/ee50e11def10b66628adc75910a49b265f428257), [`d901a6f5`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/d901a6f508415b1a6845eb7fd1b799ddc5ac25fb)).
+  **Darwin workers still cannot run a build:** the launch needs `setsid` and Linux `/proc`
+  process identity.
+- **Recovery keeps process ownership it cannot disprove.** A zombie group leader with live
+  threads still owns its lease ([`e7a18a05`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/e7a18a05120b9eb56df11af879843afd8313b4d1)), release needs kernel evidence of absence
+  rather than a missing stat ([`82781afa`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/82781afa1ecf6d93b2bc8a03e2354751dea5f579)), and an authenticated cgroup scope is still
+  stopped when the process census fails ([`9427ec21`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/9427ec21bb14da354910ec5cea4bae5de5df6a9a)).
+- **Source recovery completes interrupted claim transitions** on retry and refuses
+  contradictory terminal records before acknowledging anything ([`89d47f07`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/89d47f0728819808b658ff307f5f072768d2b5d9),
+  [`56b5f378`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/56b5f378fc835cf42e682b1b59c53a2646b84286)).
+- **Worker dependency preparation is coordinated.** Bun/Node preparation is serialized
+  across processes under a private lock, bound to the manifest and lockfile bytes it
+  observed, and uses the installer the lockfile selects ([`78e99ad0`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/78e99ad07364a46a302ae22dba324e3d60c77a46), [`9dfa7abc`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/9dfa7abc0a8a2c046e551820f845bfd69f1b601b),
+  [`998f97e6`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/998f97e61ce058817f54f7c27fe08d76bca7d9a0)).
+- **Scoped builds** (the opt-in receiver execution policy): cancellation and recovery are
+  bound to the whole cgroup, and a scope-aware supervisor carries deadlines and complete
+  cleanup ([`fa064a64`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/fa064a64c08780d465e8d944def0c5192a763e1a), [`6e802394`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/6e802394b98adcbb78c41b5f58176a8632978b45)).
+- **Worker output completion is bounded.** After the foreground command exits, the worker
+  waits five seconds for pipe EOF instead of forever when a descendant inherited the pipe
+  ([`ceb2f858`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/ceb2f85885f2262d8cea82bd93f68bcb6cd7c765)).
+- **Temporary DNS failures are retried** for SSH and rsync; permanent resolver, authentication
+  and configuration refusals are not ([`2a8a897b`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/2a8a897b13357fc9addb5a3c0d7b8b2677343115)).
+- **Benchmarks** (`bd-uerk9`): automatic Cargo measurements run in fresh private projects
+  instead of `cargo clean` on shared state ([`ad47b90f`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/ad47b90f87336c6e21a37204e682aecc266b5aa9)), and a paired serial/parallel
+  rustc workload with an `rch-parallel-benchmark` CLI is available. It does not change
+  placement ([`055e5cdb`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/055e5cdb6acd9e7dae252aaaa6bf9fbbe53daa07), [`61dce9d5`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/61dce9d51d1a677c6e470385a4cdb8928345b018)).
+- **Tests.** The source-lock holder suite, red since 2.1.21, is ported to the
+  release-while-waiting acquisition it tests (`bd-n0bu8`, [`ab96f771`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/ab96f771d0d47792f366caab238ba8dbebbda6d7)).
 
 ## 2.1.21 — 2026-10-13
 
