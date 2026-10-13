@@ -5,24 +5,29 @@
 //! Losing the wrapper (including SIGKILL) OR its original caller stops that
 //! compiler group. Both birth identities and the parent relation are captured
 //! before the daemon consult: reparenting cannot adopt an orphaned request.
-//! The guard retains its unreaped child until the group has been killed, so a
-//! recycled PID can never become the target of cleanup. Normal compiler exit
-//! also kills remaining group members before returning the compiler's status.
+//! The guard retains its unreaped child until the group is observed quiescent,
+//! so a recycled PID can never become the target of cleanup. Signal delivery is
+//! not completion: normal compiler exit also waits for remaining group members
+//! and threads to stop before returning the compiler's status for output capture.
 //!
 //! No runtime, unsafe code, signal-handler thread, PATH-resolved kill utility,
 //! shell interpolation, or compiler environment additions. This is process-group
 //! ownership on Linux, NOT containment of a hostile process that calls setsid.
-//! The system kill utility and a matching procfs PID namespace are prerequisites.
+//! The system kill utility and a matching procfs PID namespace exposing the
+//! supervised group's members are prerequisites.
 
 use std::ffi::{OsStr, OsString};
 use std::io::{self, IsTerminal, Read};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::CommandExt;
+use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 const GUARD_ARGUMENT: &str = "--rabs-internal-compiler-guard-v1";
 const POLL: Duration = Duration::from_millis(20);
 const KILL_BUDGET: Duration = Duration::from_secs(2);
+const MAX_SCAN_ENTRIES: usize = 262_144;
 
 #[derive(Debug, Clone, Copy)]
 struct Stat {
@@ -71,9 +76,9 @@ fn parse_stat(bytes: &[u8]) -> Option<Stat> {
     })
 }
 
-fn read_stat(pid: u32) -> io::Result<Stat> {
+fn read_stat_path(path: &Path, pid: u32) -> io::Result<Stat> {
     let mut bytes = Vec::new();
-    std::fs::File::open(format!("/proc/{pid}/stat"))?
+    std::fs::File::open(path)?
         .take(8193)
         .read_to_end(&mut bytes)?;
     if bytes.len() > 8192 {
@@ -82,6 +87,126 @@ fn read_stat(pid: u32) -> io::Result<Stat> {
     parse_stat(&bytes)
         .filter(|stat| stat.pid == pid)
         .ok_or_else(|| io::Error::other("invalid process identity"))
+}
+
+fn read_stat(pid: u32) -> io::Result<Stat> {
+    read_stat_path(Path::new(&format!("/proc/{pid}/stat")), pid)
+}
+
+fn process_disappeared(error: &io::Error) -> bool {
+    // An already-open procfs descriptor can return ESRCH after its task exits.
+    error.kind() == io::ErrorKind::NotFound
+        || (cfg!(target_os = "linux") && error.raw_os_error() == Some(3))
+}
+
+fn scan_budget(entries: &mut usize, deadline: Instant) -> io::Result<()> {
+    if Instant::now() >= deadline {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "compiler group quiescence was not confirmed before the deadline",
+        ));
+    }
+    if *entries >= MAX_SCAN_ENTRIES {
+        return Err(io::Error::other("compiler group scan exceeded its entry bound"));
+    }
+    *entries += 1;
+    Ok(())
+}
+
+/// Observe every visible process in the pinned compiler group, including the
+/// threads of zombie process leaders. A leader's Z state alone does not prove
+/// that all of its threads have exited. Only disappearance is benign during
+/// enumeration; malformed or inaccessible identities leave cleanup unknown.
+///
+/// None means at least one member can still execute. Some records the birth
+/// identities of all terminal members, for a second independent sweep before
+/// reaping the leader. This is not a substitute for cgroup containment of a
+/// process that deliberately escapes its group or changes its credentials.
+fn quiescent_group_snapshot(
+    proc_root: &Path,
+    leader: u32,
+    parent: u32,
+    deadline: Instant,
+) -> io::Result<Option<Vec<(u32, u64)>>> {
+    let mut entries = 0;
+    scan_budget(&mut entries, deadline)?;
+    let leader_path = proc_root.join(leader.to_string()).join("stat");
+    let pinned = read_stat_path(&leader_path, leader)?;
+    if pinned.parent != parent || pinned.group != leader {
+        return Err(io::Error::other("compiler group lost its unreaped leader fence"));
+    }
+    if !pinned.exited() {
+        return Ok(None);
+    }
+    let mut terminal = Vec::new();
+    for entry in std::fs::read_dir(proc_root)? {
+        scan_budget(&mut entries, deadline)?;
+        let entry = entry?;
+        let Some(pid) = number::<u32>(entry.file_name().as_bytes()) else {
+            continue;
+        };
+        let process_path = entry.path();
+        let stat = match read_stat_path(&process_path.join("stat"), pid) {
+            Ok(stat) => stat,
+            Err(error) if process_disappeared(&error) => continue,
+            Err(error) => return Err(error),
+        };
+        if stat.group != leader {
+            continue;
+        }
+        if !stat.exited() {
+            return Ok(None);
+        }
+        terminal.push((stat.pid, stat.start));
+        let tasks = match std::fs::read_dir(process_path.join("task")) {
+            Ok(tasks) => tasks,
+            Err(error) if process_disappeared(&error) => {
+                // The task directory of a known group member is not optional.
+                // In particular, a terminated main thread can leave live tasks.
+                // Ignore only a process that has itself disappeared as well.
+                match read_stat_path(&process_path.join("stat"), pid) {
+                    Err(gone) if process_disappeared(&gone) && pid != leader => {
+                        continue;
+                    }
+                    _ => return Err(error),
+                }
+            }
+            Err(error) => return Err(error),
+        };
+        for task in tasks {
+            scan_budget(&mut entries, deadline)?;
+            let task = task?;
+            let tid = number::<u32>(task.file_name().as_bytes())
+                .ok_or_else(|| io::Error::other("invalid compiler task directory"))?;
+            let stat = match read_stat_path(&task.path().join("stat"), tid) {
+                Ok(stat) => stat,
+                Err(error) if process_disappeared(&error) => continue,
+                Err(error) => return Err(error),
+            };
+            if stat.group != leader {
+                return Err(io::Error::other("compiler task changed its process group"));
+            }
+            if !stat.exited() {
+                return Ok(None);
+            }
+            terminal.push((stat.pid, stat.start));
+        }
+    }
+    scan_budget(&mut entries, deadline)?;
+    let after = read_stat_path(&leader_path, leader)?;
+    if after.start != pinned.start
+        || after.parent != parent
+        || after.group != leader
+        || !after.exited()
+    {
+        return Err(io::Error::other("compiler leader changed during group observation"));
+    }
+    terminal.sort_unstable();
+    terminal.dedup();
+    if !terminal.contains(&(leader, pinned.start)) {
+        return Err(io::Error::other("compiler leader was absent from the group scan"));
+    }
+    Ok(Some(terminal))
 }
 
 /// Captured before the daemon consult, never reconstructed from an orphan's
@@ -346,9 +471,26 @@ impl OwnedCompiler {
 
     fn finish(&mut self) -> io::Result<ExitStatus> {
         self.kill_group()?;
-        let status = self.child.wait()?;
-        self.reaped = true;
-        Ok(status)
+        let deadline = Instant::now() + KILL_BUDGET;
+        let mut previous = None;
+        loop {
+            let current = quiescent_group_snapshot(
+                Path::new("/proc"),
+                self.child.id(),
+                std::process::id(),
+                deadline,
+            )?;
+            if current.is_some() && current == previous {
+                // Keep the PID fence through two independent terminal sweeps.
+                // Never expose a successful compiler status on signal delivery
+                // alone, while descendants could still change captured outputs.
+                let status = self.child.wait()?;
+                self.reaped = true;
+                return Ok(status);
+            }
+            previous = current;
+            std::thread::sleep(POLL.min(deadline.saturating_duration_since(Instant::now())));
+        }
     }
 }
 
@@ -444,5 +586,147 @@ mod tests {
         ] {
             assert!(!changed.alive(), "invalid owner accepted: {changed:?}");
         }
+    }
+
+    fn fake_stat(path: &Path, pid: u32, parent: u32, group: u32, state: char) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            path,
+            format!(
+                "{pid} (compiler ) worker) {state} {parent} {group} {} 456 0\n",
+                ["0"; 16].join(" ")
+            ),
+        )
+        .unwrap();
+    }
+
+    fn fake_process(root: &Path, pid: u32, group: u32, state: char) {
+        let process = root.join(pid.to_string());
+        fake_stat(&process.join("stat"), pid, 99, group, state);
+        fake_stat(
+            &process.join(format!("task/{pid}/stat")),
+            pid,
+            99,
+            group,
+            state,
+        );
+    }
+
+    fn snapshot(root: &Path) -> io::Result<Option<Vec<(u32, u64)>>> {
+        quiescent_group_snapshot(root, 123, 99, Instant::now() + Duration::from_secs(2))
+    }
+
+    #[test]
+    fn group_completion_requires_every_member_to_be_terminal() {
+        let dir = tempfile::tempdir().unwrap();
+        fake_process(dir.path(), 123, 123, 'Z');
+        // An unrelated process does not block this group's completion.
+        fake_process(dir.path(), 200, 200, 'R');
+        assert_eq!(snapshot(dir.path()).unwrap(), Some(vec![(123, 456)]));
+        for state in ['R', 'S', 'D', 'T', 't', 'I'] {
+            fake_process(dir.path(), 456, 123, state);
+            assert!(snapshot(dir.path()).unwrap().is_none(), "{state}");
+        }
+        fake_process(dir.path(), 456, 123, 'Z');
+        assert_eq!(
+            snapshot(dir.path()).unwrap(),
+            Some(vec![(123, 456), (456, 456)])
+        );
+    }
+
+    #[test]
+    fn zombie_process_leader_does_not_hide_a_live_thread() {
+        let dir = tempfile::tempdir().unwrap();
+        fake_process(dir.path(), 123, 123, 'Z');
+        fake_stat(&dir.path().join("123/task/124/stat"), 124, 99, 123, 'D');
+        assert!(snapshot(dir.path()).unwrap().is_none());
+        fake_stat(&dir.path().join("123/task/124/stat"), 124, 99, 123, 'Z');
+        assert_eq!(
+            snapshot(dir.path()).unwrap(),
+            Some(vec![(123, 456), (124, 456)])
+        );
+    }
+
+    #[test]
+    fn incomplete_process_observation_cannot_confirm_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(snapshot(dir.path()).is_err());
+        fake_process(dir.path(), 123, 123, 'Z');
+        fake_process(dir.path(), 456, 123, 'Z');
+        std::fs::write(dir.path().join("456/stat"), b"truncated").unwrap();
+        assert!(snapshot(dir.path()).is_err());
+        fake_process(dir.path(), 456, 123, 'Z');
+        // A known member with an unavailable task directory is uncertain,
+        // not evidence that it has no live threads.
+        std::fs::rename(dir.path().join("456/task"), dir.path().join("saved-task")).unwrap();
+        assert!(snapshot(dir.path()).is_err());
+    }
+
+    #[test]
+    fn group_observation_requires_the_original_parent_and_a_live_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        fake_process(dir.path(), 123, 123, 'Z');
+        assert!(
+            quiescent_group_snapshot(
+                dir.path(),
+                123,
+                100,
+                Instant::now() + Duration::from_secs(2)
+            )
+            .is_err()
+        );
+        let error = quiescent_group_snapshot(dir.path(), 123, 99, Instant::now()).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        let mut entries = MAX_SCAN_ENTRIES;
+        assert!(scan_budget(&mut entries, Instant::now() + Duration::from_secs(2)).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn successful_signal_helper_cannot_authorize_live_group_completion() {
+        let child = Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut owned = OwnedCompiler {
+            child,
+            kill: "/bin/true",
+            reaped: false,
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !read_stat(owned.child.id()).unwrap().exited() {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(POLL);
+        }
+        // Keep a second child in the same group while the unreaped leader
+        // already has exit 0. /bin/true simulates a successful signal send
+        // that has not actually stopped this member (e.g. pending fatal I/O).
+        let mut member = Command::new("/bin/sleep")
+            .arg("30")
+            .process_group(owned.child.id())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let result = owned.finish();
+        let retained_fence = !owned.reaped;
+        // Clean up before assertions, including when run against the old
+        // implementation, which incorrectly returned the leader's exit 0.
+        let _ = member.kill();
+        member.wait().unwrap();
+        owned.kill = kill_program().unwrap();
+        if !owned.reaped {
+            assert!(owned.finish().unwrap().success());
+        }
+        assert!(
+            retained_fence,
+            "unconfirmed group cleanup reaped the PID fence"
+        );
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
     }
 }
