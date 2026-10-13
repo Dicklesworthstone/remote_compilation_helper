@@ -86,38 +86,92 @@ fn parse_macos_pressure(output: &str) -> Option<MacOsPressure> {
     })
 }
 
-/// Fixed sysctl queries produce only a few lines. Poll their exit rather than
-/// waiting indefinitely on an overloaded host; failed/timed-out probes are
-/// unknown, not healthy. The child is killed and reaped on every error path.
-#[cfg(any(target_os = "macos", test))]
+/// A sysctl reply is a handful of numbers, never an unbounded output stream.
+#[cfg(all(unix, any(target_os = "macos", test)))]
+const MAX_PROBE_OUTPUT_BYTES: usize = 4096;
+
+/// Bound both process completion AND output collection. Waiting for exit and
+/// then calling `wait_with_output` loses the deadline if another process still
+/// holds stdout. A nonblocking socket also lets us reject oversized replies
+/// without allowing the probe to block on a full pipe.
+#[cfg(all(unix, any(target_os = "macos", test)))]
 fn bounded_probe(
     command: &mut std::process::Command,
     deadline: std::time::Duration,
 ) -> Option<String> {
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixStream;
     use std::process::Stdio;
-    let mut child = command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
+
+    if deadline.is_zero() {
+        return None;
+    }
     let started = std::time::Instant::now();
+    let (reader, writer) = UnixStream::pair().ok()?;
+    reader.set_nonblocking(true).ok()?;
+    let spawned = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(OwnedFd::from(writer)))
+        .stderr(Stdio::null())
+        .spawn();
+    // Command retains caller-supplied descriptors after spawn. Close its copy
+    // on success AND failure; otherwise even a healthy probe never reaches EOF.
+    command.stdout(Stdio::null());
+    let mut child = spawned.ok()?;
+    let output = collect_probe_output(&mut child, reader, started, deadline);
+    if output.is_none() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    output
+}
+
+#[cfg(all(unix, any(target_os = "macos", test)))]
+fn collect_probe_output(
+    child: &mut std::process::Child,
+    mut reader: std::os::unix::net::UnixStream,
+    started: std::time::Instant,
+    deadline: std::time::Duration,
+) -> Option<String> {
+    use std::io::{ErrorKind, Read};
+
+    let mut output = Vec::new();
+    let mut buffer = [0; 512];
+    let mut eof = false;
     loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                return status
-                    .success()
-                    .then(|| child.wait_with_output().ok())
-                    .flatten()
-                    .and_then(|output| String::from_utf8(output.stdout).ok());
+        if started.elapsed() >= deadline {
+            return None;
+        }
+        if !eof {
+            match reader.read(&mut buffer) {
+                Ok(0) => eof = true,
+                Ok(count) => {
+                    if count > MAX_PROBE_OUTPUT_BYTES - output.len() {
+                        return None;
+                    }
+                    output.extend_from_slice(&buffer[..count]);
+                    // Check the deadline between reads, including continuous
+                    // output. Never return a valid-looking truncated prefix.
+                    continue;
+                }
+                Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {}
+                Err(_) => return None,
             }
-            Ok(None) if started.elapsed() < deadline => {
-                std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        match child.try_wait().ok()? {
+            Some(status) if !status.success() => return None,
+            Some(_) if eof => {
+                if started.elapsed() >= deadline {
+                    return None;
+                }
+                return String::from_utf8(output).ok();
             }
             _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
+                std::thread::sleep(
+                    std::time::Duration::from_millis(5)
+                        .min(deadline.saturating_sub(started.elapsed())),
+                );
             }
         }
     }
@@ -283,6 +337,14 @@ pub(super) fn decide(
     min_local_ms: u64,
     now_secs: u64,
 ) -> SpeedGateDecision {
+    // TOML can represent NaN/infinity. The diagnostic validator rejects them,
+    // but ordinary loading must not turn an invalid threshold into permission
+    // for a local measurement (comparisons against NaN are always false).
+    if !threshold.is_finite() || threshold <= 0.0 {
+        return SpeedGateDecision::Remote(
+            "speed gate: invalid remote_speedup_threshold; offloading".into(),
+        );
+    }
     let Some(data) = data else {
         return SpeedGateDecision::Local("speed gate: measuring this build locally".into());
     };
@@ -344,14 +406,20 @@ fn memory_free_pct() -> Option<u8> {
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn meminfo_free_pct(meminfo: &str) -> Option<u8> {
     let field = |name: &str| {
-        meminfo.lines().find_map(|line| {
-            let rest = line.strip_prefix(name)?.strip_prefix(':')?;
-            rest.split_whitespace().next()?.parse::<u64>().ok()
-        })
+        let mut matches = meminfo
+            .lines()
+            .filter_map(|line| line.strip_prefix(name)?.strip_prefix(':'));
+        let mut fields = matches.next()?.split_whitespace();
+        let value = fields.next()?.parse::<u64>().ok()?;
+        if fields.next() != Some("kB") || fields.next().is_some() || matches.next().is_some() {
+            return None;
+        }
+        Some(value)
     };
     let total = field("MemTotal").filter(|total| *total > 0)?;
-    let available = field("MemAvailable")?;
-    u8::try_from((u128::from(available.min(total)) * 100) / u128::from(total)).ok()
+    // An inconsistent snapshot is unknown, not 100% available memory.
+    let available = field("MemAvailable").filter(|available| *available <= total)?;
+    u8::try_from((u128::from(available) * 100) / u128::from(total)).ok()
 }
 
 /// Unknown memory counts as short: the gate only adds load when it can see room.
@@ -557,6 +625,22 @@ mod tests {
         let marginal = data(&[11_000], &[10_000], 60);
         assert!(is_local(&decide(Some(&marginal), 1.2, 2000, NOW)));
         assert!(!is_local(&decide(Some(&marginal), 1.0, 2000, NOW)));
+    }
+
+    #[test]
+    fn invalid_speedup_threshold_never_authorizes_a_local_measurement() {
+        let fast_local = data(&[100], &[100_000], 0);
+        let fast_remote = data(&[100_000], &[100], 0);
+        let empty = data(&[], &[], 0);
+        for threshold in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 0.0, -1.0] {
+            for history in [None, Some(&empty), Some(&fast_local), Some(&fast_remote)] {
+                assert!(matches!(
+                    decide(history, threshold, 2000, NOW),
+                    SpeedGateDecision::Remote(reason)
+                        if reason.contains("invalid remote_speedup_threshold")
+                ));
+            }
+        }
     }
 
     #[test]
@@ -809,6 +893,34 @@ mod tests {
     }
 
     #[test]
+    fn ambiguous_or_inconsistent_meminfo_never_admits_a_local_build() {
+        for meminfo in [
+            "MemTotal: 100 kB\nMemAvailable: 101 kB\n",
+            "MemTotal: 100 kB\nMemAvailable: 40 MB\n",
+            "MemTotal: 100 MB\nMemAvailable: 40 kB\n",
+            "MemTotal: 100 kB\nMemAvailable: 40\n",
+            "MemTotal: 100\nMemAvailable: 40 kB\n",
+            "MemTotal: 100 kB\nMemAvailable: 40 kB junk\n",
+            "MemTotal: 100 kB junk\nMemAvailable: 40 kB\n",
+            "MemTotal: 100 kB\nMemAvailable: 1 kB\nMemAvailable: 40 kB\n",
+            "MemTotal: 100 kB\nMemAvailable: bad\nMemAvailable: 40 kB\n",
+            "MemTotal: 100 kB\nMemTotal: 100 kB\nMemAvailable: 40 kB\n",
+            "MemTotal: 100 kB\nMemAvailable: -1 kB\n",
+            "MemTotal: 100 kB\nMemAvailable: 18446744073709551616 kB\n",
+        ] {
+            assert_eq!(meminfo_free_pct(meminfo), None, "{meminfo}");
+            assert!(!resources_allow_local(meminfo_free_pct(meminfo), false, None));
+        }
+        for (available, admitted) in [(0, false), (24, false), (25, true), (100, true)] {
+            let meminfo = format!("MemTotal: 100 kB\nMemAvailable: {available} kB\n");
+            assert_eq!(
+                resources_allow_local(meminfo_free_pct(&meminfo), false, None),
+                admitted,
+            );
+        }
+    }
+
+    #[test]
     fn macos_sysctl_parser_rejects_missing_malformed_and_nonfinite_metrics() {
         for output in [
             "",
@@ -831,6 +943,106 @@ mod tests {
             assert!(parse_macos_pressure(output).is_none(), "{output:?}");
         }
         assert!(parse_macos_pressure(" 0\n100 \n{ 0.0 0.0 0.0 }\n8").is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exited_pressure_probe_cannot_turn_late_stdout_into_a_healthy_reply() {
+        use std::io::Write;
+        use std::os::unix::net::UnixStream;
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+
+        let (reader, mut writer) = UnixStream::pair().unwrap();
+        reader.set_nonblocking(true).unwrap();
+        writer.write_all(b"49\n100\n{ 1 2 3 }\n8\n").unwrap();
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        assert!(child.wait().unwrap().success());
+        let started = Instant::now();
+        // Model a second stdout owner without orphaning a child process.
+        // Eventually close it so a regression fails instead of hanging tests.
+        let holder = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            drop(writer);
+        });
+        let output = collect_probe_output(
+            &mut child,
+            reader,
+            started,
+            Duration::from_millis(10),
+        );
+        holder.join().unwrap();
+        assert!(output.is_none(), "late EOF authorized a healthy reply");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pressure_probes_bound_output_and_require_utf8_complete_success() {
+        use std::process::Command;
+        use std::time::Duration;
+
+        for bytes in [MAX_PROBE_OUTPUT_BYTES, MAX_PROBE_OUTPUT_BYTES + 1, 65_536] {
+            let output = bounded_probe(
+                Command::new("/bin/sh").args(["-c", &format!("printf '%{bytes}s' ''")]),
+                Duration::from_secs(1),
+            );
+            if bytes == MAX_PROBE_OUTPUT_BYTES {
+                assert_eq!(output.unwrap(), " ".repeat(bytes));
+            } else {
+                assert!(output.is_none(), "oversized probe output was accepted");
+            }
+        }
+        for script in [
+            "printf '\\377'",
+            "printf '25'; exit 1",
+            "exec 1>&-; exec sleep 10",
+        ] {
+            assert!(
+                bounded_probe(
+                    Command::new("/bin/sh").args(["-c", script]),
+                    Duration::from_millis(20),
+                )
+                .is_none(),
+                "accepted incomplete or invalid probe: {script}",
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pressure_probe_closes_parent_writer_and_can_reuse_command() {
+        use std::process::Command;
+        use std::time::Duration;
+
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "printf '25'"]);
+        for _ in 0..3 {
+            assert_eq!(
+                bounded_probe(&mut command, Duration::from_secs(1)),
+                Some("25".to_string()),
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn zero_probe_budget_does_not_execute_the_command() {
+        use std::process::Command;
+        use std::time::Duration;
+
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("executed");
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "printf executed > \"$1\"", "probe-test"]);
+        command.arg(&marker);
+        assert!(bounded_probe(&mut command, Duration::ZERO).is_none());
+        assert!(!marker.exists());
     }
 
     #[cfg(unix)]
