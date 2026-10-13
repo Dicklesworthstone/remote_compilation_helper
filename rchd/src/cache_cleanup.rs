@@ -218,6 +218,17 @@ pub(crate) fn placement_low_disk_permille() -> u64 {
     ((critical * 1000.0).ceil() as u64).saturating_add(20)
 }
 
+/// Whether placement has zeroed this worker for lack of free space. Only the
+/// two free-space verdicts count: a saturated-I/O or stale-telemetry critical
+/// must not attract a sweep.
+fn disk_starved(pressure: &crate::disk_pressure::PressureAssessment) -> bool {
+    pressure.state == crate::disk_pressure::PressureState::Critical
+        && matches!(
+            pressure.reason_code.as_str(),
+            "disk_free_below_critical_gb" | "disk_ratio_below_critical"
+        )
+}
+
 fn build_cleanup_command_with_source_guard(
     escaped_base: &str,
     escaped_run_root: &str,
@@ -560,9 +571,19 @@ impl CacheCleanupScheduler {
             return false;
         }
 
+        // Placement gives a worker no new builds once it is critically short
+        // of free space, but the builds it already runs can hold slots for
+        // hours, and a ghost reservation holds one indefinitely. Requiring an
+        // idle worker then keeps the sweep away from exactly the workers
+        // that need it (2026-10-13: css swept three idle workers and skipped
+        // every starved one). The script protects live trees itself (recent
+        // activity, retention holds, the source registry), so a starved
+        // worker is swept while it drains.
+        let disk_starved = disk_starved(&worker_state.pressure_assessment().await);
+
         // Check if worker is busy (has active slots)
         let used_slots = worker_state.used_slots();
-        if used_slots != 0 {
+        if used_slots != 0 && !disk_starved {
             debug!(
                 "Worker {} is busy ({} slots reserved), skipping cleanup",
                 worker_id, used_slots
@@ -573,7 +594,7 @@ impl CacheCleanupScheduler {
 
         // Enforce idle threshold before cleanup.
         let idle_threshold = Duration::from_secs(self.config.idle_threshold_secs);
-        if !idle_threshold.is_zero() {
+        if !idle_threshold.is_zero() && !disk_starved {
             let now = Instant::now();
             let idle_for = {
                 let mut idle_since = self.idle_since.write().await;
@@ -1140,6 +1161,41 @@ mod tests {
             .await;
         assert_eq!(worker.available_slots().await, 3);
         assert!(scheduler.is_worker_eligible(&worker).await);
+    }
+
+    #[tokio::test]
+    async fn test_disk_starved_worker_is_swept_while_its_builds_drain() {
+        use crate::disk_pressure::{PressureAssessment, PressureState};
+        let pool = WorkerPool::new();
+        pool.add_worker(create_test_worker_config("starved")).await;
+        let worker = pool.get(&WorkerId::new("starved")).await.unwrap();
+        // The default idle threshold: a busy worker never satisfies it.
+        let scheduler = CacheCleanupScheduler::new(pool, CacheCleanupConfig::default());
+        assert!(worker.reserve_slots(1).await);
+        let critical = |reason: &str| PressureAssessment {
+            state: PressureState::Critical,
+            reason_code: reason.to_string(),
+            ..Default::default()
+        };
+        for reason in ["disk_ratio_below_critical", "disk_free_below_critical_gb"] {
+            worker.set_pressure_assessment(critical(reason)).await;
+            assert!(scheduler.is_worker_eligible(&worker).await, "{reason}");
+        }
+        // Critical for another reason, or merely tight, still waits for idle.
+        for other in [
+            critical("memory_pressure_critical"),
+            critical("disk_io_saturated_with_low_headroom"),
+            critical("disk_critical_without_fresh_telemetry"),
+            PressureAssessment {
+                state: PressureState::Warning,
+                reason_code: "disk_ratio_below_warning".to_string(),
+                ..Default::default()
+            },
+        ] {
+            let reason = other.reason_code.clone();
+            worker.set_pressure_assessment(other).await;
+            assert!(!scheduler.is_worker_eligible(&worker).await, "{reason}");
+        }
     }
 
     #[tokio::test]

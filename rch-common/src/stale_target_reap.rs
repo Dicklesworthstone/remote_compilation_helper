@@ -1011,8 +1011,8 @@ fn worker_sweep_script(
 /// workers in that band). While the root's filesystem is below
 /// `low_disk_permille` free, this pass evicts reap-class dirs, including the
 /// shared default target ([`DEFAULT_TARGET_NAME`]), oldest first. It never
-/// takes a dir with activity inside the short idle window, one that fails
-/// either liveness gate, or one the source registry holds.
+/// takes a dir with activity inside the last [`MIN_IDLE_HOURS`], one that
+/// fails either liveness gate, or one the source registry holds.
 ///
 /// Free space is re-measured before every removal, so concurrent sweeps from
 /// several dispatchers stop as soon as the worker leaves the band instead of
@@ -1022,6 +1022,13 @@ fn worker_sweep_script(
 /// "not under pressure": a disk signal that cannot be read must never
 /// authorize removal.
 fn pressure_eviction_pass(idle_minutes: u64, low_disk_permille: u64) -> String {
+    // The TTL window (6-12 h in practice) is a warmth heuristic, and a
+    // starved worker's reclaimable dirs are mostly younger than it: hz3 held
+    // 67 GB idle >= 1 h but 7 GB idle >= 6 h. Under pressure only the floor
+    // applies. Eviction is oldest first and stops at the line, so the
+    // coldest dirs go and the warmest stay; liveness and ownership, not
+    // idleness, are what protect a build.
+    let idle_minutes = idle_minutes.min(u64::from(MIN_IDLE_HOURS) * 60);
     let dedup = dedup_candidate_file("__tmpf4");
     format!(
         "__fs_kb=$(df -Pk \"$__rt\" 2>/dev/null | awk 'NR==2 {{print $2}}'); \
@@ -2531,6 +2538,9 @@ mod tests {
         assert!(remeasure < same_fs && same_fs < idle && idle < gate);
         assert!(gate < admission && admission < removal);
         assert!(pass.contains("RCH_REAP_RM %s pressure %s"));
+        // Under pressure the idle floor applies, not the 12 h TTL window.
+        assert!(pass.contains("__gc_source_recent_activity \"$d\" 60;"));
+        assert!(!pass.contains("__gc_source_recent_activity \"$d\" 720;"));
         assert!(pass.contains("RCH_REAP_ERR pressure"));
         // An unreadable df never reads as pressure.
         assert!(cmd.contains("''|*[!0-9]*) __pa=unknown; return 1;; esac"));
