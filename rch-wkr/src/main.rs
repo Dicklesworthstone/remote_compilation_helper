@@ -10,7 +10,7 @@ mod executor;
 mod prepare;
 mod toolchain;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use rch_common::{DEFAULT_ALIAS_PROJECT_ROOT, DEFAULT_CANONICAL_PROJECT_ROOT, WorkerCapabilities};
 use rch_common::{LogConfig, init_logging};
@@ -185,35 +185,14 @@ async fn main() -> Result<()> {
                 // Parse toolchain string and ensure it's available
                 let tc_info = toolchain::parse_toolchain_string(&tc_str);
 
-                // Ensure toolchain is available (install if needed)
-                match toolchain::ensure_toolchain(&tc_info) {
-                    Ok(()) => {
-                        info!("Toolchain {} ready", tc_str);
-                    }
-                    Err(e) => {
-                        // Log but continue - fail-open behavior
-                        tracing::warn!(
-                            "Failed to ensure toolchain {}: {}. Continuing with default.",
-                            tc_str,
-                            e
-                        );
-                        // Fall through to execute without toolchain wrapping
-
-                        // Touch the project cache to prevent cleanup
-                        cache::touch_project(std::path::Path::new(&workdir));
-
-                        return match executor::execute(&workdir, &command).await {
-                            Ok(()) => Ok(()),
-                            Err(err) => {
-                                if let Some(failure) = err.downcast_ref::<executor::CommandFailed>()
-                                {
-                                    std::process::exit(failure.exit_code);
-                                }
-                                Err(err)
-                            }
-                        };
-                    }
-                }
+                // Toolchain selection is part of the requested build, not a
+                // best-effort optimization. A worker must never substitute its
+                // default compiler when preparation fails. No user command or
+                // project-cache touch has happened yet; report the error upstream.
+                toolchain::ensure_toolchain(&tc_info).with_context(|| {
+                    format!("Required toolchain {tc_str} is unavailable; command was not run")
+                })?;
+                info!("Toolchain {} ready", tc_str);
 
                 // Wrap command with rustup run
                 rch_common::wrap_command_with_toolchain(&command, Some(&tc_info))
