@@ -1130,7 +1130,10 @@ mod installed_output_tests {
         std::fs::write(&path, b"mutated!").unwrap();
         assert!(known_installed_output(&path, &expected).is_err());
         let actual = object_id(b"mutated!").unwrap();
-        assert_eq!(known_installed_output(&path, &actual).unwrap().digest, actual);
+        assert_eq!(
+            known_installed_output(&path, &actual).unwrap().digest,
+            actual
+        );
     }
 
     #[test]

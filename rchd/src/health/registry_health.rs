@@ -123,7 +123,11 @@ mod tests {
             "RCH_SOURCE_REGISTRY_UNWRITABLE /tmp/claims: write\n",
         ))
         .expect_err("unwritable storage must not succeed");
-        assert!(error.message.starts_with("RCH_SOURCE_REGISTRY_UNWRITABLE: "));
+        assert!(
+            error
+                .message
+                .starts_with("RCH_SOURCE_REGISTRY_UNWRITABLE: ")
+        );
         assert!(error.message.contains("write"));
         assert_eq!(error.stage, ProbeStage::Command);
         assert!(!error.retryable);
@@ -148,7 +152,11 @@ mod tests {
     fn refusal_beyond_excerpt_is_still_classified() {
         let stderr = format!("{}\n{REFUSAL} /tmp/claims: write\n", "λ".repeat(5000));
         let error = classify_output(&output(74, "", &stderr)).expect_err("must refuse");
-        assert!(error.message.starts_with("RCH_SOURCE_REGISTRY_UNWRITABLE: "));
+        assert!(
+            error
+                .message
+                .starts_with("RCH_SOURCE_REGISTRY_UNWRITABLE: ")
+        );
         assert!(error.message.chars().count() < 1200);
         assert!(error.message.ends_with('…'));
     }
@@ -195,12 +203,7 @@ mod tests {
             HealthCheckResult::failure("no usable response".into()),
         ] {
             assert_eq!(
-                status_after_probe(
-                    WorkerStatus::Unreachable,
-                    circuit.state(),
-                    &result,
-                    &config,
-                ),
+                status_after_probe(WorkerStatus::Unreachable, circuit.state(), &result, &config,),
                 WorkerStatus::Unreachable,
             );
         }

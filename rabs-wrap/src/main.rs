@@ -1003,9 +1003,7 @@ fn collect_stream(
         *output = match receiver.try_recv() {
             Ok(captured) => Some(captured),
             Err(std::sync::mpsc::TryRecvError::Empty) => None,
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                Some(CompilerStream::unavailable())
-            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(CompilerStream::unavailable()),
         };
     }
 }
@@ -1034,9 +1032,10 @@ fn collect_compiler_output(
             match poll_child() {
                 Ok(Some(status)) => {
                     terminal = Some(status);
-                    drain_deadline = Some(Instant::now().checked_add(drain_budget).ok_or_else(
-                        || io::Error::other("compiler output deadline is not representable"),
-                    )?);
+                    drain_deadline =
+                        Some(Instant::now().checked_add(drain_budget).ok_or_else(|| {
+                            io::Error::other("compiler output deadline is not representable")
+                        })?);
                 }
                 Ok(None) => {}
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
@@ -1464,14 +1463,16 @@ mod tests {
         }
         let (out_tx, out_rx) = std::sync::mpsc::channel();
         let (err_tx, err_rx) = std::sync::mpsc::channel();
-        assert!(collect_compiler_output(
-            || panic!("lost owner must not poll or start work"),
-            out_rx,
-            err_rx,
-            || false,
-            Duration::ZERO,
-        )
-        .is_err());
+        assert!(
+            collect_compiler_output(
+                || panic!("lost owner must not poll or start work"),
+                out_rx,
+                err_rx,
+                || false,
+                Duration::ZERO,
+            )
+            .is_err()
+        );
         drop((out_tx, err_tx));
     }
 

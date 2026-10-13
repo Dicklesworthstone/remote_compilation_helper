@@ -33,7 +33,11 @@ pub(super) fn build_source_roots(
     let mut roots = plan
         .iter()
         .map(|entry| entry.remote_root.as_str())
-        .chain([pair_source, retained_source, freshness_control, target].into_iter().flatten())
+        .chain(
+            [pair_source, retained_source, freshness_control, target]
+                .into_iter()
+                .flatten(),
+        )
         .map(canonical_source_authority_root)
         .collect::<Vec<_>>();
     roots.sort();

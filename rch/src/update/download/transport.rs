@@ -38,10 +38,12 @@ fn network(error: reqwest::Error) -> UpdateError {
 }
 
 impl AssetDownload {
-    pub(super) async fn new(url: &str, dest: &Path, expected_size: u64) -> Result<Self, UpdateError> {
-        let client = client_builder()
-            .build()
-            .map_err(network)?;
+    pub(super) async fn new(
+        url: &str,
+        dest: &Path,
+        expected_size: u64,
+    ) -> Result<Self, UpdateError> {
+        let client = client_builder().build().map_err(network)?;
         Self::with_client(client, url, dest, expected_size).await
     }
 
@@ -77,8 +79,15 @@ impl AssetDownload {
 
     pub(super) async fn attempt(&mut self) -> Result<(), UpdateError> {
         let previous_etag = self.resumable().cloned();
-        let start = if previous_etag.is_some() { self.offset } else { 0 };
-        let mut request = self.client.get(&self.url).header("Accept-Encoding", "identity");
+        let start = if previous_etag.is_some() {
+            self.offset
+        } else {
+            0
+        };
+        let mut request = self
+            .client
+            .get(&self.url)
+            .header("Accept-Encoding", "identity");
         if let Some(etag) = &previous_etag {
             request = request
                 .header("Range", format!("bytes={start}-"))
@@ -87,7 +96,10 @@ impl AssetDownload {
         let mut response = request.send().await.map_err(network)?;
         let status = response.status();
         if previous_etag.is_some()
-            && matches!(status, StatusCode::RANGE_NOT_SATISFIABLE | StatusCode::PRECONDITION_FAILED)
+            && matches!(
+                status,
+                StatusCode::RANGE_NOT_SATISFIABLE | StatusCode::PRECONDITION_FAILED
+            )
         {
             // Some CDNs refuse ranges instead of sending a full 200. Consume
             // an ordinary retry attempt, and make the next request a full GET.
@@ -97,7 +109,13 @@ impl AssetDownload {
                 "Release server refused resumption; retrying a full download".to_owned(),
             ));
         }
-        let plan = plan_response(status, response.headers(), start, previous_etag.as_ref(), self.expected_size)?;
+        let plan = plan_response(
+            status,
+            response.headers(),
+            start,
+            previous_etag.as_ref(),
+            self.expected_size,
+        )?;
         if plan.restart {
             self.file.set_len(0).await.map_err(local)?;
             self.file.seek(SeekFrom::Start(0)).await.map_err(local)?;
@@ -112,10 +130,14 @@ impl AssetDownload {
         );
 
         while let Some(chunk) = response.chunk().await.map_err(network)? {
-            let next = self.offset.checked_add(chunk.len() as u64)
+            let next = self
+                .offset
+                .checked_add(chunk.len() as u64)
                 .ok_or_else(|| invalid("byte count overflow"))?;
             if next > plan.end {
-                return Err(invalid("body exceeds its declared range or release asset size"));
+                return Err(invalid(
+                    "body exceeds its declared range or release asset size",
+                ));
             }
             // Each accepted prefix has completed local I/O before it becomes
             // eligible for resumption. This also preserves the signature-read
@@ -162,7 +184,10 @@ struct BodyPlan {
     etag: Option<HeaderValue>,
 }
 
-fn unique_header<'a>(headers: &'a HeaderMap, name: &str) -> Result<Option<&'a HeaderValue>, UpdateError> {
+fn unique_header<'a>(
+    headers: &'a HeaderMap,
+    name: &str,
+) -> Result<Option<&'a HeaderValue>, UpdateError> {
     let mut values = headers.get_all(name).iter();
     let first = values.next();
     if values.next().is_some() {
@@ -179,7 +204,9 @@ fn decimal(value: &str) -> Result<u64, UpdateError> {
 }
 
 fn header_text(value: &HeaderValue) -> Result<&str, UpdateError> {
-    value.to_str().map_err(|_| invalid("non-ASCII representation header"))
+    value
+        .to_str()
+        .map_err(|_| invalid("non-ASCII representation header"))
 }
 
 fn strong_etag(value: &HeaderValue) -> bool {
@@ -187,9 +214,9 @@ fn strong_etag(value: &HeaderValue) -> bool {
     bytes.len() >= 2
         && bytes[0] == b'"'
         && bytes[bytes.len() - 1] == b'"'
-        && bytes[1..bytes.len() - 1].iter().all(|byte| {
-            *byte == 0x21 || (0x23..=0x7e).contains(byte) || *byte >= 0x80
-        })
+        && bytes[1..bytes.len() - 1]
+            .iter()
+            .all(|byte| *byte == 0x21 || (0x23..=0x7e).contains(byte) || *byte >= 0x80)
 }
 
 fn plan_response(
@@ -205,12 +232,16 @@ fn plan_response(
     if let Some(encoding) = unique_header(headers, "content-encoding")?
         && !header_text(encoding)?.eq_ignore_ascii_case("identity")
     {
-        return Err(invalid("encoded representation cannot be resumed or verified as an archive"));
+        return Err(invalid(
+            "encoded representation cannot be resumed or verified as an archive",
+        ));
     }
     let length = unique_header(headers, "content-length")?
         .map(|value| decimal(header_text(value)?))
         .transpose()?;
-    let etag = unique_header(headers, "etag")?.filter(|value| strong_etag(value)).cloned();
+    let etag = unique_header(headers, "etag")?
+        .filter(|value| strong_etag(value))
+        .cloned();
     let range = unique_header(headers, "content-range")?;
     if status == StatusCode::OK {
         if range.is_some() || length.is_some_and(|length| length != expected_size) {
@@ -218,34 +249,53 @@ fn plan_response(
         }
         // The representation changed, the validator was absent/weak, or the
         // server ignored Range. Never concatenate a full body with old bytes.
-        return Ok(BodyPlan { restart: true, end: expected_size, etag });
+        return Ok(BodyPlan {
+            restart: true,
+            end: expected_size,
+            etag,
+        });
     }
-    if start == 0 || start >= expected_size || previous_etag.is_none()
+    if start == 0
+        || start >= expected_size
+        || previous_etag.is_none()
         || etag.as_ref() != previous_etag
     {
         return Err(invalid("partial response lacks the exact strong validator"));
     }
     let range = header_text(range.ok_or_else(|| invalid("partial response lacks Content-Range"))?)?;
-    let (positions, total) = range.strip_prefix("bytes ")
+    let (positions, total) = range
+        .strip_prefix("bytes ")
         .and_then(|value| value.split_once('/'))
         .ok_or_else(|| invalid("invalid Content-Range"))?;
-    let (first, last) = positions.split_once('-').ok_or_else(|| invalid("invalid Content-Range"))?;
+    let (first, last) = positions
+        .split_once('-')
+        .ok_or_else(|| invalid("invalid Content-Range"))?;
     let first = decimal(first)?;
     let last = decimal(last)?;
     let total = decimal(total)?;
     if first != start || last < first || last >= total || total != expected_size {
-        return Err(invalid("partial response range does not match retained bytes"));
+        return Err(invalid(
+            "partial response range does not match retained bytes",
+        ));
     }
-    let end = last.checked_add(1).ok_or_else(|| invalid("range end overflow"))?;
+    let end = last
+        .checked_add(1)
+        .ok_or_else(|| invalid("range end overflow"))?;
     if length.is_some_and(|length| length != end - start) {
         return Err(invalid("partial response length does not match its range"));
     }
     if let Some(content_type) = unique_header(headers, "content-type")?
-        && header_text(content_type)?.to_ascii_lowercase().starts_with("multipart/")
+        && header_text(content_type)?
+            .to_ascii_lowercase()
+            .starts_with("multipart/")
     {
         return Err(invalid("multipart ranges are not supported"));
     }
-    Ok(BodyPlan { restart: false, end, etag })
+    Ok(BodyPlan {
+        restart: false,
+        end,
+        etag,
+    })
 }
 
 #[cfg(test)]
@@ -265,8 +315,18 @@ mod tests {
         for value in ["\"\"", "\"asset-v1\"", "\"with\\backslash\""] {
             assert!(strong_etag(&HeaderValue::from_str(value).unwrap()));
         }
-        for value in ["", "asset-v1", "W/\"asset-v1\"", "\"a\", \"b\"", "\"a b\"", "\"a\"junk"] {
-            assert!(!strong_etag(&HeaderValue::from_str(value).unwrap()), "{value}");
+        for value in [
+            "",
+            "asset-v1",
+            "W/\"asset-v1\"",
+            "\"a\", \"b\"",
+            "\"a b\"",
+            "\"a\"junk",
+        ] {
+            assert!(
+                !strong_etag(&HeaderValue::from_str(value).unwrap()),
+                "{value}"
+            );
         }
     }
 
@@ -274,32 +334,69 @@ mod tests {
     fn full_responses_restart_and_ranges_require_exact_identity_and_offsets() {
         let etag = HeaderValue::from_static("\"v1\"");
         let full = headers(&[("content-length", "10"), ("etag", "\"v2\"")]);
-        assert!(plan_response(StatusCode::OK, &full, 4, Some(&etag), 10).unwrap().restart);
-        let partial = headers(&[("content-range", "bytes 4-9/10"), ("content-length", "6"), ("etag", "\"v1\"")]);
-        let plan = plan_response(StatusCode::PARTIAL_CONTENT, &partial, 4, Some(&etag), 10).unwrap();
+        assert!(
+            plan_response(StatusCode::OK, &full, 4, Some(&etag), 10)
+                .unwrap()
+                .restart
+        );
+        let partial = headers(&[
+            ("content-range", "bytes 4-9/10"),
+            ("content-length", "6"),
+            ("etag", "\"v1\""),
+        ]);
+        let plan =
+            plan_response(StatusCode::PARTIAL_CONTENT, &partial, 4, Some(&etag), 10).unwrap();
         assert!(!plan.restart);
         assert_eq!(plan.end, 10);
-        for (start, previous, size) in [(0, Some(&etag), 10), (3, Some(&etag), 10), (4, None, 10), (4, Some(&etag), 11)] {
-            assert!(plan_response(StatusCode::PARTIAL_CONTENT, &partial, start, previous, size).is_err());
+        for (start, previous, size) in [
+            (0, Some(&etag), 10),
+            (3, Some(&etag), 10),
+            (4, None, 10),
+            (4, Some(&etag), 11),
+        ] {
+            assert!(
+                plan_response(StatusCode::PARTIAL_CONTENT, &partial, start, previous, size)
+                    .is_err()
+            );
         }
     }
 
     #[test]
     fn malformed_or_ambiguous_ranges_never_authorize_append() {
         let etag = HeaderValue::from_static("\"v1\"");
-        for range in ["bytes 3-9/10", "bytes 5-9/10", "bytes 4-3/10", "bytes 4-10/10", "bytes 4-9/*", "bytes 4-9/11", "bytes +4-9/10", "bytes 4-18446744073709551615/10", "items 4-9/10", "bytes 4-9/10, 4-9/10"] {
+        for range in [
+            "bytes 3-9/10",
+            "bytes 5-9/10",
+            "bytes 4-3/10",
+            "bytes 4-10/10",
+            "bytes 4-9/*",
+            "bytes 4-9/11",
+            "bytes +4-9/10",
+            "bytes 4-18446744073709551615/10",
+            "items 4-9/10",
+            "bytes 4-9/10, 4-9/10",
+        ] {
             let mut input = headers(&[("etag", "\"v1\"")]);
             input.insert("content-range", HeaderValue::from_str(range).unwrap());
-            assert!(plan_response(StatusCode::PARTIAL_CONTENT, &input, 4, Some(&etag), 10).is_err(), "{range}");
+            assert!(
+                plan_response(StatusCode::PARTIAL_CONTENT, &input, 4, Some(&etag), 10).is_err(),
+                "{range}"
+            );
         }
         for extra in [
-            ("etag", "\"v2\""), ("etag", "W/\"v1\""),
-            ("content-range", "bytes 4-9/10"), ("content-length", "7"),
-            ("content-encoding", "gzip"), ("content-type", "multipart/byteranges; boundary=x"),
+            ("etag", "\"v2\""),
+            ("etag", "W/\"v1\""),
+            ("content-range", "bytes 4-9/10"),
+            ("content-length", "7"),
+            ("content-encoding", "gzip"),
+            ("content-type", "multipart/byteranges; boundary=x"),
         ] {
             let mut input = headers(&[("etag", "\"v1\""), ("content-range", "bytes 4-9/10")]);
             input.append(extra.0, HeaderValue::from_static(extra.1));
-            assert!(plan_response(StatusCode::PARTIAL_CONTENT, &input, 4, Some(&etag), 10).is_err(), "{extra:?}");
+            assert!(
+                plan_response(StatusCode::PARTIAL_CONTENT, &input, 4, Some(&etag), 10).is_err(),
+                "{extra:?}"
+            );
         }
     }
 

@@ -33,7 +33,9 @@ impl Peer {
             let mut requests = Vec::new();
             for reply in replies {
                 let (mut socket, _) = tokio::time::timeout(BOUND, listener.accept())
-                    .await.unwrap().unwrap();
+                    .await
+                    .unwrap()
+                    .unwrap();
                 let request = tokio::time::timeout(BOUND, async {
                     let mut bytes = Vec::new();
                     while !bytes.ends_with(b"\r\n\r\n") {
@@ -41,12 +43,15 @@ impl Peer {
                         bytes.push(socket.read_u8().await.unwrap());
                     }
                     String::from_utf8(bytes).unwrap()
-                }).await.unwrap();
+                })
+                .await
+                .unwrap();
                 requests.push(request);
                 // A deliberately invalid response may make the client close
                 // early. The client verdict and retained bytes are asserted.
                 let _ = tokio::time::timeout(BOUND, socket.write_all(&reply.wire))
-                    .await.unwrap();
+                    .await
+                    .unwrap();
                 if let Some(hold) = reply.hold {
                     let _ = tokio::time::timeout(BOUND, hold).await.unwrap();
                 }
@@ -54,12 +59,17 @@ impl Peer {
             }
             requests
         });
-        Self { url, task: Some(task) }
+        Self {
+            url,
+            task: Some(task),
+        }
     }
 
     async fn finish(mut self) -> Vec<String> {
         tokio::time::timeout(BOUND, self.task.as_mut().unwrap())
-            .await.unwrap().unwrap()
+            .await
+            .unwrap()
+            .unwrap()
     }
 }
 
@@ -82,19 +92,27 @@ fn full(size: usize, etag: &str, body: &[u8]) -> Vec<u8> {
 }
 
 fn partial(start: usize, end: usize, total: usize, body: &[u8]) -> Vec<u8> {
-    response("206 Partial Content", &format!(
-        "ETag: \"v1\"\r\nContent-Range: bytes {start}-{end}/{total}\r\nContent-Length: {}\r\n",
-        end - start + 1,
-    ), body)
+    response(
+        "206 Partial Content",
+        &format!(
+            "ETag: \"v1\"\r\nContent-Range: bytes {start}-{end}/{total}\r\nContent-Length: {}\r\n",
+            end - start + 1,
+        ),
+        body,
+    )
 }
 
 async fn transfer(peer: &Peer, path: &Path, size: usize) -> AssetDownload {
     let client = client_builder().no_proxy().timeout(BOUND).build().unwrap();
-    AssetDownload::with_client(client, &peer.url, path, size as u64).await.unwrap()
+    AssetDownload::with_client(client, &peer.url, path, size as u64)
+        .await
+        .unwrap()
 }
 
 fn request_header<'a>(request: &'a str, name: &str) -> Option<&'a str> {
-    request.lines().filter_map(|line| line.split_once(':'))
+    request
+        .lines()
+        .filter_map(|line| line.split_once(':'))
         .find(|(key, _)| key.eq_ignore_ascii_case(name))
         .map(|(_, value)| value.trim())
 }
@@ -107,9 +125,13 @@ async fn flushed_prefix_is_visible_before_eof_and_resumes_only_the_suffix() {
     let split = 65_537;
     let (release, hold) = oneshot::channel();
     let peer = Peer::new(vec![
-        Reply { wire: full(body.len(), "ETag: \"v1\"\r\n", &body[..split]), hold: Some(hold) },
+        Reply {
+            wire: full(body.len(), "ETag: \"v1\"\r\n", &body[..split]),
+            hold: Some(hold),
+        },
         partial(split, body.len() - 1, body.len(), &body[split..]).into(),
-    ]).await;
+    ])
+    .await;
     let mut download = transfer(&peer, &path, body.len()).await;
     let attempt = tokio::spawn(async move {
         let result = download.attempt().await;
@@ -119,10 +141,13 @@ async fn flushed_prefix_is_visible_before_eof_and_resumes_only_the_suffix() {
     // writing (the old path) cannot meet this assertion, regardless of speed.
     let observed = tokio::time::timeout(BOUND, async {
         loop {
-            if std::fs::metadata(&path).unwrap().len() == split as u64 { break; }
+            if std::fs::metadata(&path).unwrap().len() == split as u64 {
+                break;
+            }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-    }).await;
+    })
+    .await;
     let before_eof = std::fs::read(&path).unwrap();
     let _ = release.send(());
     let (mut download, result) = tokio::time::timeout(BOUND, attempt).await.unwrap().unwrap();
@@ -136,7 +161,11 @@ async fn flushed_prefix_is_visible_before_eof_and_resumes_only_the_suffix() {
     assert_eq!(request_header(&requests[0], "Range"), None);
     assert_eq!(request_header(&requests[1], "Range"), Some("bytes=65537-"));
     assert_eq!(request_header(&requests[1], "If-Range"), Some("\"v1\""));
-    assert!(requests.iter().all(|r| request_header(r, "Accept-Encoding") == Some("identity")));
+    assert!(
+        requests
+            .iter()
+            .all(|r| request_header(r, "Accept-Encoding") == Some("identity"))
+    );
 }
 
 #[tokio::test]
@@ -147,7 +176,8 @@ async fn ignored_ranges_or_changed_representations_replace_instead_of_concatenat
         let peer = Peer::new(vec![
             full(10, "ETag: \"v1\"\r\n", b"OLD!").into(),
             full(10, etag, b"0123456789").into(),
-        ]).await;
+        ])
+        .await;
         let mut download = transfer(&peer, &path, 10).await;
         assert!(download.attempt().await.is_err());
         assert_eq!(std::fs::read(&path).unwrap(), b"OLD!");
@@ -166,7 +196,8 @@ async fn absent_or_weak_validators_force_a_fresh_request() {
         let peer = Peer::new(vec![
             full(10, etag, b"OLD!").into(),
             full(10, "ETag: \"v2\"\r\n", b"0123456789").into(),
-        ]).await;
+        ])
+        .await;
         let mut download = transfer(&peer, &path, 10).await;
         assert!(download.attempt().await.is_err());
         download.attempt().await.unwrap();
@@ -192,7 +223,8 @@ async fn mismatched_or_duplicate_partial_headers_preserve_the_existing_prefix() 
         let peer = Peer::new(vec![
             full(10, "ETag: \"v1\"\r\n", b"0123").into(),
             response("206 Partial Content", headers, b"ATTACK!").into(),
-        ]).await;
+        ])
+        .await;
         let mut download = transfer(&peer, &path, 10).await;
         assert!(download.attempt().await.is_err());
         let error = download.attempt().await.unwrap_err();
@@ -210,9 +242,15 @@ async fn refused_ranges_require_a_new_full_response_never_infer_completion() {
         let path = directory.path().join("archive");
         let peer = Peer::new(vec![
             full(10, "ETag: \"v1\"\r\n", b"0123").into(),
-            response(status, "Content-Range: bytes */4\r\nContent-Length: 0\r\n", b"").into(),
+            response(
+                status,
+                "Content-Range: bytes */4\r\nContent-Length: 0\r\n",
+                b"",
+            )
+            .into(),
             full(10, "ETag: \"v2\"\r\n", b"9876543210").into(),
-        ]).await;
+        ])
+        .await;
         let mut download = transfer(&peer, &path, 10).await;
         assert!(download.attempt().await.is_err());
         let error = download.attempt().await.unwrap_err();
@@ -235,7 +273,8 @@ async fn transient_status_keeps_the_prefix_and_short_contiguous_ranges_progress(
         response("503 Service Unavailable", "Content-Length: 0\r\n", b"").into(),
         partial(4, 6, 10, b"456").into(),
         partial(7, 9, 10, b"789").into(),
-    ]).await;
+    ])
+    .await;
     let mut download = transfer(&peer, &path, 10).await;
     for expected in [4, 4, 7] {
         let error = download.attempt().await.unwrap_err();
@@ -255,12 +294,19 @@ async fn chunked_bodies_obey_metadata_size_without_content_length() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("archive");
         let body = format!("{length:x}\r\n{}\r\n0\r\n\r\n", "x".repeat(length));
-        let peer = Peer::new(vec![response("200 OK", "Transfer-Encoding: chunked\r\n", body.as_bytes()).into()]).await;
+        let peer = Peer::new(vec![
+            response("200 OK", "Transfer-Encoding: chunked\r\n", body.as_bytes()).into(),
+        ])
+        .await;
         let mut download = transfer(&peer, &path, 10).await;
         let result = download.attempt().await;
-        if length == 10 { result.unwrap(); }
-        else if length < 10 { assert!(super::super::is_transient_error(&result.unwrap_err())); }
-        else { assert!(matches!(result, Err(UpdateError::DownloadFailed(_)))); }
+        if length == 10 {
+            result.unwrap();
+        } else if length < 10 {
+            assert!(super::super::is_transient_error(&result.unwrap_err()));
+        } else {
+            assert!(matches!(result, Err(UpdateError::DownloadFailed(_))));
+        }
         assert!(std::fs::metadata(&path).unwrap().len() <= 10);
         peer.finish().await;
     }
@@ -274,17 +320,23 @@ async fn complete_range_bytes_still_require_a_valid_signature() {
 RUTZPaZ0gaEhqDSXunnChY49+8G9WeMdP7wwnCG9s382LwYf7h09hfwypAG0pKwYrhcX+N1Ujyzv1r4ZpRClO4To6jTL1DR1ewo=\n\
 trusted comment: rch test fixture\n\
 xfmvGjlaWGXfdNKtFwBNm45V0V6VPZ3lLFhIzfLmQ7xUjPzacD1iHPC0MO2oczUBCt2gAZtoGnuQMxpswMpMCw==\n";
-    let key = minisign_verify::PublicKey::from_base64("RWTZPaZ0gaEhqMa/pPZEdaALWkxxAm/EtQzB6egPldD4Uh1cCRlw/b0w").unwrap();
+    let key = minisign_verify::PublicKey::from_base64(
+        "RWTZPaZ0gaEhqMa/pPZEdaALWkxxAm/EtQzB6egPldD4Uh1cCRlw/b0w",
+    )
+    .unwrap();
     for tamper in [false, true] {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("archive");
         let mut body = payload.to_vec();
-        if tamper { body[8] ^= 1; }
+        if tamper {
+            body[8] ^= 1;
+        }
         let split = 7;
         let peer = Peer::new(vec![
             full(body.len(), "ETag: \"v1\"\r\n", &body[..split]).into(),
             partial(split, body.len() - 1, body.len(), &body[split..]).into(),
-        ]).await;
+        ])
+        .await;
         let mut download = transfer(&peer, &path, body.len()).await;
         assert!(download.attempt().await.is_err());
         download.attempt().await.unwrap();
@@ -300,12 +352,21 @@ async fn existing_files_and_zero_attempts_are_never_overwritten() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("keep");
     std::fs::write(&path, b"caller bytes").unwrap();
-    assert!(AssetDownload::new("http://127.0.0.1:1/unused", &path, 12).await.is_err());
+    assert!(
+        AssetDownload::new("http://127.0.0.1:1/unused", &path, 12)
+            .await
+            .is_err()
+    );
     assert_eq!(std::fs::read(&path).unwrap(), b"caller bytes");
     let never_created = directory.path().join("absent");
     let result = super::super::download_with_retry(
-        "http://127.0.0.1:1/unused", &never_created, "unused", 12, 0,
-    ).await;
+        "http://127.0.0.1:1/unused",
+        &never_created,
+        "unused",
+        12,
+        0,
+    )
+    .await;
     assert!(matches!(result, Err(UpdateError::DownloadFailed(_))));
     assert!(!never_created.exists());
 }

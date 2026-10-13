@@ -266,7 +266,9 @@ async fn download_with_retry(
     max_attempts: u32,
 ) -> Result<(), UpdateError> {
     if max_attempts == 0 {
-        return Err(UpdateError::DownloadFailed("No download attempts allowed".to_owned()));
+        return Err(UpdateError::DownloadFailed(
+            "No download attempts allowed".to_owned(),
+        ));
     }
     let mut download = transport::AssetDownload::new(url, dest, expected_size).await?;
     let mut last_err: Option<UpdateError> = None;
@@ -312,9 +314,9 @@ async fn write_downloaded_bytes(
     file.write_all(bytes)
         .await
         .map_err(|e| UpdateError::DownloadFailed(format!("Failed to write file: {}", e)))?;
-    file.flush()
-        .await
-        .map_err(|e| UpdateError::DownloadFailed(format!("Failed to complete file write: {}", e)))?;
+    file.flush().await.map_err(|e| {
+        UpdateError::DownloadFailed(format!("Failed to complete file write: {}", e))
+    })?;
     Ok(())
 }
 
@@ -556,9 +558,10 @@ xfmvGjlaWGXfdNKtFwBNm45V0V6VPZ3lLFhIzfLmQ7xUjPzacD1iHPC0MO2oczUBCt2gAZtoGnuQMxps
                 key.verify(SIGNED_PAYLOAD, &signature, false).unwrap();
                 assert!(key.verify(b"modified payload", &signature, false).is_err());
                 if !complete_write {
-                    assert!(minisign_verify::Signature::decode(
-                        std::str::from_utf8(&before).unwrap()
-                    ).is_err());
+                    assert!(
+                        minisign_verify::Signature::decode(std::str::from_utf8(&before).unwrap())
+                            .is_err()
+                    );
                 }
             }
         });

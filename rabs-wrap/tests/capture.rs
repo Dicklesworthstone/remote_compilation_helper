@@ -315,7 +315,10 @@ fn failed_output_delivery_refuses_success_but_preserves_compiler_failures() {
             daemon.join().unwrap();
             let expected = if compiler_code == 0 { 122 } else { 7 };
             assert_eq!(output.status.code(), Some(expected));
-            assert_eq!(std::fs::read(fixture.root.path().join("runs")).unwrap(), b"run\n");
+            assert_eq!(
+                std::fs::read(fixture.root.path().join("runs")).unwrap(),
+                b"run\n"
+            );
         }
     }
 }
@@ -332,7 +335,10 @@ fn exited_compiler_cannot_leave_wrapper_joining_a_stalled_output_consumer() {
         )
         .unwrap();
         let daemon = fixture.daemon(true, |peer| {
-            assert!(read(peer).is_none(), "incomplete delivery cannot consent to publication");
+            assert!(
+                read(peer).is_none(),
+                "incomplete delivery cannot consent to publication"
+            );
         });
         // Fill an inherited output stream BEFORE launching the wrapper. Keep
         // the consumer alive and unread until the wrapper exits; this is real
@@ -362,15 +368,23 @@ fn exited_compiler_cannot_leave_wrapper_joining_a_stalled_output_consumer() {
         drop(consumer);
         daemon.join().unwrap();
         assert_eq!(output.status.code(), Some(122));
-        assert_eq!(std::fs::read(fixture.root.path().join("finished")).unwrap(), b"done");
-        assert_eq!(std::fs::read(fixture.root.path().join("runs")).unwrap(), b"run\n");
+        assert_eq!(
+            std::fs::read(fixture.root.path().join("finished")).unwrap(),
+            b"done"
+        );
+        assert_eq!(
+            std::fs::read(fixture.root.path().join("runs")).unwrap(),
+            b"run\n"
+        );
     }
 }
 
 #[test]
 fn large_binary_streams_stay_successful_and_complete_without_cache_publication() {
     let fixture = Fixture::new(0);
-    let bytes: Vec<u8> = (0..1024 * 1024 + 37).map(|index| (index % 251) as u8).collect();
+    let bytes: Vec<u8> = (0..1024 * 1024 + 37)
+        .map(|index| (index % 251) as u8)
+        .collect();
     std::fs::write(fixture.root.path().join("input"), &bytes).unwrap();
     std::fs::write(
         &fixture.compiler,
@@ -378,7 +392,10 @@ fn large_binary_streams_stay_successful_and_complete_without_cache_publication()
     )
     .unwrap();
     let daemon = fixture.daemon(true, |peer| {
-        assert!(read(peer).is_none(), "overflow disables optional capture only");
+        assert!(
+            read(peer).is_none(),
+            "overflow disables optional capture only"
+        );
     });
     // Files avoid introducing the very pipe backpressure this case does NOT
     // exercise. Both raw output streams exceed the optional capture budget.
@@ -393,5 +410,8 @@ fn large_binary_streams_stay_successful_and_complete_without_cache_publication()
     assert!(output.status.success());
     assert_eq!(std::fs::read(stdout).unwrap(), bytes);
     assert_eq!(std::fs::read(stderr).unwrap(), bytes);
-    assert_eq!(std::fs::read(fixture.root.path().join("runs")).unwrap(), b"run\n");
+    assert_eq!(
+        std::fs::read(fixture.root.path().join("runs")).unwrap(),
+        b"run\n"
+    );
 }

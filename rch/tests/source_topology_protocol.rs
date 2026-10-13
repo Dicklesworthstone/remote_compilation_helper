@@ -25,11 +25,17 @@ fn source_topology_acknowledgement_and_release_protocol() {
         rch_common::stale_target_reap::SOURCE_CLAIM_RECORD_HELPERS,
     )
     .expect("write compiled helpers");
-    std::fs::write(&retry, include_str!("../src/hook/source_claim_admission.sh"))
-        .expect("write compiled admission retry");
+    std::fs::write(
+        &retry,
+        include_str!("../src/hook/source_claim_admission.sh"),
+    )
+    .expect("write compiled admission retry");
 
-    std::fs::write(&paths, include_str!("../src/hook/source_namespace_paths.sh"))
-        .expect("write compiled namespace paths");
+    std::fs::write(
+        &paths,
+        include_str!("../src/hook/source_namespace_paths.sh"),
+    )
+    .expect("write compiled namespace paths");
 
     for suite in ["test_source_topology.py", "test_source_namespace.py"] {
         let output = Command::new("python3")

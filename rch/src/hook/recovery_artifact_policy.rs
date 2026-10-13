@@ -357,7 +357,9 @@ fn apply(
         })?;
     eprintln!(
         "[RCH] refined implicit Make artifact selection for {}: excluded directories {:?}; prior journal {}; prior staging retained; compilation was not replayed",
-        request.wrapper_id, request.directories, previous.display()
+        request.wrapper_id,
+        request.directories,
+        previous.display()
     );
     Ok(())
 }
@@ -531,7 +533,10 @@ mod tests {
         let backups: Vec<_> = std::fs::read_dir(writer.path.parent().unwrap())
             .unwrap()
             .map(|entry| entry.unwrap().path())
-            .filter(|path| path.extension().is_some_and(|extension| extension == "before"))
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "before")
+            })
             .collect();
         assert_eq!(backups.len(), 1);
         assert_eq!(std::fs::read(&backups[0]).unwrap(), before);
@@ -586,7 +591,8 @@ mod tests {
                     use std::os::unix::fs::PermissionsExt;
                     let base = root.join("world-writable");
                     std::fs::create_dir(&base).unwrap();
-                    std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o777)).unwrap();
+                    std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o777))
+                        .unwrap();
                     base
                 }
                 _ => unreachable!(),
@@ -599,7 +605,12 @@ mod tests {
                 ..Default::default()
             };
             assert!(
-                apply(&session.writer, &request(&session, &["build/tools"]), &current).is_err(),
+                apply(
+                    &session.writer,
+                    &request(&session, &["build/tools"]),
+                    &current
+                )
+                .is_err(),
                 "{location}"
             );
             assert_eq!(
@@ -696,7 +707,10 @@ mod tests {
                 let input = request(&session, &[excluded]);
                 let result = plan(&session.writer.snapshot(), &recipe, &input);
                 if overlaps {
-                    assert!(result.is_err(), "{recorded} / {excluded}; pending={pending}");
+                    assert!(
+                        result.is_err(),
+                        "{recorded} / {excluded}; pending={pending}"
+                    );
                 } else {
                     let next = result.unwrap().unwrap();
                     let mut expected = serde_json::to_value(&recipe).unwrap();
@@ -787,7 +801,10 @@ mod tests {
         }
         let delivered_inode = std::fs::metadata(local.join(&done)).unwrap().ino();
         let pending_inode = std::fs::metadata(&pending_temporary).unwrap().ino();
-        session.writer.record_exit(EXIT_ARTIFACT_TRANSFER_FAILED).unwrap();
+        session
+            .writer
+            .record_exit(EXIT_ARTIFACT_TRANSFER_FAILED)
+            .unwrap();
         let before = std::fs::read(&session.writer.path).unwrap();
         let old_phase = serde_json::to_value(&session.recipe.phases[0]).unwrap();
         let input = request(&session, &["build/tools"]);
@@ -829,7 +846,10 @@ mod tests {
         let backups: Vec<_> = std::fs::read_dir(recovered.writer.path.parent().unwrap())
             .unwrap()
             .map(|entry| entry.unwrap().path())
-            .filter(|path| path.extension().is_some_and(|extension| extension == "before"))
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "before")
+            })
             .collect();
         assert_eq!(backups.len(), 1);
         assert_eq!(std::fs::read(&backups[0]).unwrap(), before);
@@ -859,7 +879,10 @@ mod tests {
             pending_inode
         );
         assert_eq!(fingerprint(&local.join(&done)).unwrap(), Some(done_hash));
-        assert_eq!(fingerprint(&local.join(&pending)).unwrap(), Some(pending_hash));
+        assert_eq!(
+            fingerprint(&local.join(&pending)).unwrap(),
+            Some(pending_hash)
+        );
         assert!(recovered.recipe.phases[0].pending.is_none());
         assert_eq!(recovered.recipe.phases[0].published.len(), 2);
         assert!(recovered.recipe.phases[0].complete);
@@ -958,7 +981,10 @@ mod tests {
         assert!(session.recipe.phases[1].complete);
         assert!(!session.recipe.phases[0].complete);
         assert!(!session.writer.snapshot().terminal_acknowledged);
-        session.writer.record_exit(EXIT_ARTIFACT_TRANSFER_FAILED).unwrap();
+        session
+            .writer
+            .record_exit(EXIT_ARTIFACT_TRANSFER_FAILED)
+            .unwrap();
         let current = TransferConfig {
             retrieval_staging_dir: Some(root.join("fresh-stage")),
             ..Default::default()

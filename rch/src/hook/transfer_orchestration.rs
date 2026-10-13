@@ -1294,7 +1294,8 @@ async fn execute_remote_compilation_inner(
         if worker_projects_topology_requires_initialization(&worker_config, &remote_topology_policy)
             .await?
         {
-            reporter.verbose("[RCH] initializing shared path translation without claiming its bases");
+            reporter
+                .verbose("[RCH] initializing shared path translation without claiming its bases");
         }
         // Confirm the durable postcondition even when both paths already
         // exist: a prior initializer may have lost its final acknowledgment.
@@ -1305,22 +1306,27 @@ async fn execute_remote_compilation_inner(
         )
         .await?;
     }
-    let source_target_root = sync_plan.iter().find(|entry| entry.is_primary).map(|primary| {
-        pooled_target_dir_override.clone().unwrap_or_else(|| {
-            format!(
-                "{}/{}",
-                primary.remote_root,
-                remote_cargo_target_dir_name_override
-                    .as_deref()
-                    .unwrap_or(".rch-target")
-            )
-        })
-    });
+    let source_target_root = sync_plan
+        .iter()
+        .find(|entry| entry.is_primary)
+        .map(|primary| {
+            pooled_target_dir_override.clone().unwrap_or_else(|| {
+                format!(
+                    "{}/{}",
+                    primary.remote_root,
+                    remote_cargo_target_dir_name_override
+                        .as_deref()
+                        .unwrap_or(".rch-target")
+                )
+            })
+        });
     // Keep the complete dependency closure, any already-locked pair container,
     // retirement/freshness siblings and target pool in the same immutable grant.
     let mut mutable_source_authority_roots = source_namespace::build_source_roots(
         &sync_plan,
-        source_pair_pool.as_ref().and(overlay_remote_root.as_deref()),
+        source_pair_pool
+            .as_ref()
+            .and(overlay_remote_root.as_deref()),
         retained_source_root.as_deref(),
         source_freshness_control.as_deref(),
         source_target_root.as_deref(),

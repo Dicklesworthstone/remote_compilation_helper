@@ -3,10 +3,10 @@
 //! Handles synchronizing project files to remote workers, executing compilation
 //! commands, and retrieving build artifacts.
 
-pub(crate) mod source_content_barrier;
 #[cfg(test)]
 #[path = "transfer/node_prepare_tests.rs"]
 mod node_prepare_tests;
+pub(crate) mod source_content_barrier;
 
 use crate::error::TransferError;
 use anyhow::{Context, Result};

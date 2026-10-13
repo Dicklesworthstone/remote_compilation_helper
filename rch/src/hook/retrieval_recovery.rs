@@ -3824,7 +3824,10 @@ mod tests {
                     .unwrap();
                 let mut reloaded = reload_publication(&session);
                 assert_eq!(reloaded.recipe.transfer.max_transfer_time_ms, sentinel);
-                assert_eq!(reloaded.recipe.transfer.retry.total_timeout_ms, expected_floor);
+                assert_eq!(
+                    reloaded.recipe.transfer.retry.total_timeout_ms,
+                    expected_floor
+                );
                 // Compare the whole recipe, including worker/source authority,
                 // output policy, publication checkpoints and original exit.
                 assert_eq!(serde_json::to_value(&reloaded.recipe).unwrap(), expected);

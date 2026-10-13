@@ -39,7 +39,11 @@ fn dependency_preparation_is_inside_the_tracked_workload() {
 fn untracked_and_windows_commands_still_require_preparation_success() {
     let _guard = rch_common::test_guard!();
     for platform in [WorkerPlatform::Posix, WorkerPlatform::Windows] {
-        for kind in [CompilationKind::Tsc, CompilationKind::BunTest, CompilationKind::BunTypecheck] {
+        for kind in [
+            CompilationKind::Tsc,
+            CompilationKind::BunTest,
+            CompilationKind::BunTypecheck,
+        ] {
             let pipeline = pipeline(kind, false, platform);
             let command = pipeline.build_remote_command("compiler", None);
             assert_eq!(command.matches("rch-wkr prepare").count(), 1);
@@ -60,7 +64,10 @@ fn unrelated_command_payload_is_unchanged() {
         CompilationKind::Job,
     ] {
         let pipeline = pipeline(kind, true, WorkerPlatform::Posix);
-        assert_eq!(pipeline.wrap_with_dependency_preparation(original.to_owned()), original);
+        assert_eq!(
+            pipeline.wrap_with_dependency_preparation(original.to_owned()),
+            original
+        );
     }
 }
 
@@ -84,7 +91,10 @@ fn dependency_runtime_comes_from_the_kind_not_words_in_the_payload() {
 #[cfg(unix)]
 fn dependency_preparation_shell_protocol() {
     let status = std::process::Command::new("python3")
-        .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/node_prepare.py"))
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/node_prepare.py"
+        ))
         .status()
         .expect("run preparation shell regressions (requires python3)");
     assert!(status.success(), "preparation shell regression failed");
@@ -196,9 +206,13 @@ async fn source_refresh_preserves_only_worker_owned_dependency_state() {
     }
     let mut config = TransferConfig::default();
     config.exclude_patterns.clear();
-    let mut pipeline = TransferPipeline::new(source.clone(), "project".into(), "hash".into(), config);
+    let mut pipeline =
+        TransferPipeline::new(source.clone(), "project".into(), "hash".into(), config);
     let excludes = pipeline.get_effective_excludes();
-    for (index, manifest) in ["manifest-v1", "manifest-v2", "manifest-v3"].iter().enumerate() {
+    for (index, manifest) in ["manifest-v1", "manifest-v2", "manifest-v3"]
+        .iter()
+        .enumerate()
+    {
         if index > 0 {
             pipeline.sync_include_patterns = Some(vec!["*/".into(), "*".into()]);
         }
@@ -223,15 +237,25 @@ async fn source_refresh_preserves_only_worker_owned_dependency_state() {
             .await
             .expect("run native dependency-state transfer regression (requires rsync)");
         assert!(result.status.success(), "{:?}", result);
-        assert_eq!(std::fs::read(remote.join("package.json")).unwrap(), manifest.as_bytes());
-        assert_eq!(std::fs::read(remote.join("bun.lock")).unwrap(), b"selected-lock");
+        assert_eq!(
+            std::fs::read(remote.join("package.json")).unwrap(),
+            manifest.as_bytes()
+        );
+        assert_eq!(
+            std::fs::read(remote.join("bun.lock")).unwrap(),
+            b"selected-lock"
+        );
         for name in [
             "node_modules/.bin/compiler",
             ".rch_dep_fingerprint.json",
             ".rch_dep_fingerprint.json.tmp",
             ".rch_prepare_logs/install.log",
         ] {
-            assert_eq!(std::fs::read(remote.join(name)).unwrap(), b"worker-only bytes", "{name}");
+            assert_eq!(
+                std::fs::read(remote.join(name)).unwrap(),
+                b"worker-only bytes",
+                "{name}"
+            );
         }
         assert!(!remote.join("obsolete-source").exists());
     }
