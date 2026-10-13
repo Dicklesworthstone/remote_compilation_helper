@@ -2200,6 +2200,9 @@ impl DurableLeaseWriter {
         Ok(())
     }
 
+    // Unix wrappers publish through their journal gate from creation on; a
+    // full-snapshot persist remains for other platforms and test fixtures.
+    #[cfg(any(not(unix), test))]
     fn persist(&self) -> anyhow::Result<()> {
         #[cfg(unix)]
         if let Some(ownership) = &self.recovery_ownership {
@@ -2208,6 +2211,7 @@ impl DurableLeaseWriter {
         self.persist_snapshot(atomic_write)
     }
 
+    #[cfg(any(not(unix), test))]
     fn persist_snapshot(
         &self,
         publish: impl FnOnce(&Path, &[u8]) -> anyhow::Result<()>,
