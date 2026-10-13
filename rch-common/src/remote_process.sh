@@ -422,8 +422,31 @@ rch_policy_read_file() {
     esac
 }
 
+# Bound the ENTIRE control exchange, not just the manager client's lifetime.
+# A plain `timeout Ns command` can wait forever after TERM, or finish while a
+# descendant still holds a capture pipe. Keep capture and response publication
+# inside timeout's private process group and kill that group at the deadline.
+# These are control helpers, never the workload or its supervisor. Failure is
+# unavailable evidence: no partial/failed stdout may authorize scope admission.
+# Capture stderr too, so it cannot keep the outer SSH pipe open independently.
+# Successful warnings become unrecognized response data (fail closed); failed
+# exchanges retain their diagnostic on stderr. No payload is evaluated as code.
+rch_control_capture() {
+    case "$1" in 1s|5s) ;; *) return 125;; esac
+    timeout --signal=KILL "$1" /bin/sh -c '
+        shift
+        __rch_control_output=$("$@" 2>&1)
+        __rch_control_status=$?
+        if [ "$__rch_control_status" -ne 0 ]; then
+            printf "%s\n" "$__rch_control_output" >&2
+            exit "$__rch_control_status"
+        fi
+        printf "%s\n" "$__rch_control_output"
+    ' rch-control "$@" </dev/null
+}
+
 rch_policy_systemctl() {
-    timeout 5s systemctl "--$rch_policy_manager" --no-pager --no-ask-password "$@"
+    rch_control_capture 5s systemctl "--$rch_policy_manager" --no-pager --no-ask-password "$@"
 }
 
 # Read the launcher's actual unified cgroup. A successful D-Bus job submission
@@ -459,7 +482,7 @@ rch_policy_enter_scope() {
     # Attach the EXISTING setsid leader, rather than starting an independent
     # transient service. All subsequently spawned work keeps the same PGID and
     # stdio, so the existing watchdog, cancellation and recovery remain owners.
-    busctl "--$rch_policy_manager" --timeout=5s --allow-interactive-authorization=no \
+    rch_control_capture 5s busctl "--$rch_policy_manager" --timeout=5s --allow-interactive-authorization=no \
         call org.freedesktop.systemd1 /org/freedesktop/systemd1 \
         org.freedesktop.systemd1.Manager StartTransientUnit 'ssa(sv)a(sa(sv))' \
         "$rch_policy_scope" fail 3 PIDs au 1 "$rch_pgid" \
@@ -592,7 +615,7 @@ rch_scope_root() {
 # One manager snapshot, with a bounded wait. Missing/duplicate fields and
 # unknown states are unavailable evidence, not an inactive scope.
 rch_scope_snapshot() {
-    rch_scope_properties=$(LC_ALL=C timeout 1s systemctl "--$rch_scope_manager" \
+    rch_scope_properties=$(LC_ALL=C rch_control_capture 1s systemctl "--$rch_scope_manager" \
         --no-pager --no-ask-password show --all --property=LoadState \
         --property=ActiveState --property=InvocationID --property=ControlGroup \
         -- "$rch_scope_unit") || return 2
