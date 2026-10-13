@@ -128,7 +128,11 @@ impl IsolatedStagingLayout {
     /// Map only paths inside a declared root, with component-boundary checks.
     pub fn remote_path(&self, local_path: &str) -> Result<String, StagingError> {
         validate_absolute(local_path)?;
-        if !self.roots.iter().any(|root| contains_path(root, local_path)) {
+        if !self
+            .roots
+            .iter()
+            .any(|root| contains_path(root, local_path))
+        {
             return Err(refused("path is outside the declared source closure"));
         }
         Ok(format!("{}{local_path}", self.source_container()))
@@ -307,7 +311,11 @@ mod tests {
         let first = layout(ID);
         let second = layout("fedcba9876543210fedcba9876543210");
         assert_ne!(first.source_container(), second.source_container());
-        assert!(first.local_path(&second.remote_working_directory()).is_err());
+        assert!(
+            first
+                .local_path(&second.remote_working_directory())
+                .is_err()
+        );
     }
 
     #[test]
@@ -329,7 +337,12 @@ mod tests {
     #[test]
     fn boundaries_and_artifact_traversal_are_refused() {
         let layout = layout(ID);
-        for path in ["/data/application", "/data/app/../other", "/data/app//x", "/"] {
+        for path in [
+            "/data/application",
+            "/data/app/../other",
+            "/data/app//x",
+            "/",
+        ] {
             assert!(layout.remote_path(path).is_err(), "{path}");
         }
         for relative in [
@@ -341,7 +354,11 @@ mod tests {
         ] {
             assert!(layout.artifact_mapping(relative).is_err(), "{relative}");
         }
-        assert!(layout.receiver_command("/data/app/undeclared-child").is_err());
+        assert!(
+            layout
+                .receiver_command("/data/app/undeclared-child")
+                .is_err()
+        );
         assert_eq!(
             layout
                 .local_path(&layout.remote_path("/data/shared/src/lib.rs").unwrap())

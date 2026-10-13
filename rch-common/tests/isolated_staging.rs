@@ -10,5 +10,8 @@ fn isolated_staging_receiver_contract() {
         ))
         .status()
         .expect("Linux staging integration tests require python3");
-    assert!(status.success(), "isolated staging receiver contract failed");
+    assert!(
+        status.success(),
+        "isolated staging receiver contract failed"
+    );
 }
