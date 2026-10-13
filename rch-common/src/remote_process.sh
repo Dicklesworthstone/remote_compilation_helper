@@ -248,7 +248,17 @@ rch_remote_cancel() {
     rch_witness_identity=
     rch_term_sent=0
     rch_read_record "$1" "$2" || return $?
-    rch_mode=$3
+    rch_remote_cancel_loaded "$3"
+}
+
+# Operate on the already validated identity. The in-session supervisor has
+# additionally bound it to its direct child; rereading a mutable receipt here
+# could replace that authority between its check and the first scope operation.
+rch_remote_cancel_loaded() {
+    rch_witnesses=
+    rch_witness_identity=
+    rch_term_sent=0
+    rch_mode=$1
     rch_group_state
     case $? in 0) return 0;; 1) ;; *) return 44;; esac
     if [ "$rch_mode" = term ]; then
