@@ -449,6 +449,7 @@ mod tests {
                 confidence_threshold: 0.8,
                 min_local_time_ms: 1000,
                 remote_speedup_threshold: 1.2,
+                local_slots: 0,
                 build_slots: 4,
                 test_slots: 8,
                 check_slots: 2,

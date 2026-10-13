@@ -286,6 +286,58 @@ pub(crate) async fn restart_admission_is_closed(socket_path: &str) -> anyhow::Re
     Ok(status.admission_closed)
 }
 
+/// Default bound on how long a build waits for a daemon restart's admission
+/// barrier to reopen. Override with `RCH_RESTART_ADMISSION_WAIT_SECS` (0 keeps
+/// the old fail-fast behaviour).
+pub(crate) const DEFAULT_RESTART_ADMISSION_WAIT: Duration = Duration::from_secs(600);
+
+pub(crate) fn restart_admission_wait_bound() -> Duration {
+    std::env::var("RCH_RESTART_ADMISSION_WAIT_SECS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .map_or(DEFAULT_RESTART_ADMISSION_WAIT, Duration::from_secs)
+}
+
+/// How a wait for restart admission ended.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum RestartAdmissionWait {
+    /// Admission is open, or there was no barrier to wait for.
+    Open,
+    /// The barrier was still closed when the bound expired.
+    StillClosed,
+}
+
+/// A daemon restart (`rch daemon restart --drain`) closes admission for its
+/// drain window. Every build arriving then used to fail outright: on
+/// 2026-10-13 the 2.1.19 rollout failed about 30 agent builds on css alone.
+/// Wait, bounded, for the barrier to reopen instead. Once a closed barrier has
+/// been seen, an unreachable daemon is the restart in progress, so keep
+/// waiting for it. If no barrier was ever seen, a probe error keeps the
+/// previous meaning: proceed and let selection and recovery handle the daemon.
+/// `on_wait` runs before each sleep (the caller heartbeats and reports).
+pub(crate) async fn wait_for_restart_admission(
+    mut probe: impl AsyncFnMut() -> anyhow::Result<bool>,
+    bound: Duration,
+    poll: Duration,
+    mut on_wait: impl FnMut(),
+) -> RestartAdmissionWait {
+    let started = tokio::time::Instant::now();
+    let mut saw_closed = false;
+    loop {
+        match probe().await {
+            Ok(false) => return RestartAdmissionWait::Open,
+            Ok(true) => saw_closed = true,
+            Err(_) if !saw_closed => return RestartAdmissionWait::Open,
+            Err(_) => {}
+        }
+        if started.elapsed() >= bound {
+            return RestartAdmissionWait::StillClosed;
+        }
+        on_wait();
+        tokio::time::sleep(poll.min(bound.saturating_sub(started.elapsed()))).await;
+    }
+}
+
 /// An optional field must not turn a failed client-side Rustup resolution into
 /// permission to use the worker's default compiler. Apply the same preflight to
 /// actual admission and dry-run diagnostics, before any socket or queue owner
@@ -1475,6 +1527,57 @@ mod bounded_ipc_tests {
         assert_eq!(
             daemon_response_timeout_for(true, Some("90"), Some("450")),
             Duration::from_secs(90)
+        );
+    }
+    #[tokio::test]
+    async fn restart_admission_wait_reopens_tolerates_the_restart_gap_and_is_bounded() {
+        use std::collections::VecDeque;
+        // Real time with millisecond polls (rch does not enable tokio's test-util).
+        async fn run(
+            script: &[Option<bool>],
+            bound_ms: u64,
+        ) -> (RestartAdmissionWait, usize, usize) {
+            let mut script: VecDeque<Option<bool>> = script.iter().copied().collect();
+            let mut probes = 0;
+            let mut waits = 0;
+            let outcome = wait_for_restart_admission(
+                async || {
+                    probes += 1;
+                    match script.pop_front().unwrap_or(Some(true)) {
+                        Some(closed) => Ok(closed),
+                        None => Err(anyhow::anyhow!("socket missing")),
+                    }
+                },
+                Duration::from_millis(bound_ms),
+                Duration::from_millis(1),
+                || waits += 1,
+            )
+            .await;
+            (outcome, probes, waits)
+        }
+        // Open at once: no wait.
+        assert_eq!(
+            run(&[Some(false)], 60_000).await,
+            (RestartAdmissionWait::Open, 1, 0)
+        );
+        // No daemon and no barrier seen: proceed as before (selection recovers).
+        assert_eq!(
+            run(&[None], 60_000).await,
+            (RestartAdmissionWait::Open, 1, 0)
+        );
+        // Closed, daemon gone while it restarts, then open on the new daemon.
+        assert_eq!(
+            run(&[Some(true), Some(true), None, None, Some(false)], 60_000).await,
+            (RestartAdmissionWait::Open, 5, 4)
+        );
+        // Never reopens: bounded.
+        let (outcome, probes, _) = run(&[], 20).await;
+        assert_eq!(outcome, RestartAdmissionWait::StillClosed);
+        assert!(probes >= 2, "{probes}");
+        // A zero bound keeps the old fail-fast behaviour.
+        assert_eq!(
+            run(&[Some(true)], 0).await,
+            (RestartAdmissionWait::StillClosed, 1, 0)
         );
     }
 }

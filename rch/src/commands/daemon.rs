@@ -202,6 +202,63 @@ async fn restart_via_systemd(scope: SystemdUnitScope) -> std::result::Result<(),
     }
 }
 
+/// The launchd agent that `rch daemon install`-style setups (and the fleet's
+/// Macs) use to keep rchd alive: `~/Library/LaunchAgents/com.rch.daemon.plist`,
+/// `KeepAlive = true`.
+#[cfg(target_os = "macos")]
+const RCHD_LAUNCHD_LABEL: &str = "com.rch.daemon";
+
+/// The loaded launchd service target (`gui/<uid>/com.rch.daemon`) managing
+/// rchd on this Mac, if any (bd-5pmwm). Like the systemd case, the manual
+/// shutdown + `nohup rchd` spawn fights KeepAlive's own respawn, so Mac
+/// rollouts used launchctl directly, without draining, and killed queued
+/// builds. Restarting through launchd keeps `--drain` meaningful on Macs.
+#[cfg(target_os = "macos")]
+async fn detect_rchd_launchd_target() -> Option<String> {
+    // Effective UID without unsafe code: the kernel reports our own
+    // credentials on our own socket pair.
+    let (socket, _peer) = tokio::net::UnixStream::pair().ok()?;
+    let uid = socket.peer_cred().ok()?.uid();
+    let target = format!("gui/{uid}/{RCHD_LAUNCHD_LABEL}");
+    let loaded = Command::new("/bin/launchctl")
+        .args(["print", &target])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .is_ok_and(|status| status.success());
+    loaded.then_some(target)
+}
+
+#[cfg(not(target_os = "macos"))]
+async fn detect_rchd_launchd_target() -> Option<String> {
+    None
+}
+
+/// `launchctl kickstart -k` the agent (launchd re-execs the plist's binary,
+/// so a freshly installed rchd takes over), then wait for a live listener.
+/// rchd re-adopts in-flight builds from durable ownership on startup, which
+/// can take a few seconds, so this waits longer than the systemd path.
+async fn restart_via_launchd(target: &str) -> std::result::Result<(), String> {
+    let status = Command::new("/bin/launchctl")
+        .args(["kickstart", "-k", target])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .map_err(|e| format!("failed to invoke launchctl: {e}"))?;
+    if !status.success() {
+        return Err(format!("launchctl kickstart -k {target} exited {status}"));
+    }
+    for _ in 0..200 {
+        if daemon_responds_on_configured_socket().await {
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    Err("launchd restarted rchd but no daemon responded on the socket within 20s".to_string())
+}
+
 fn ensure_socket_parent(socket_path: &Path) -> Result<()> {
     if let Some(parent) = socket_path
         .parent()
@@ -1176,7 +1233,47 @@ pub async fn daemon_restart(opts: StopOptions, ctx: &OutputContext) -> Result<()
         }
     }
 
-    // Manual path: user-launched daemon (no unit) and macOS launchd hosts.
+    if let Some(target) = detect_rchd_launchd_target().await {
+        match restart_via_launchd(&target).await {
+            Ok(()) => {
+                let socket_path_str = configured_socket_path()?;
+                if ctx.is_json() {
+                    let _ = ctx.json(&ApiResponse::ok(
+                        "daemon restart",
+                        DaemonActionResponse {
+                            action: "restart".to_string(),
+                            success: true,
+                            socket_path: socket_path_str,
+                            message: Some(format!(
+                                "Daemon restarted via launchctl kickstart -k {target}"
+                            )),
+                        },
+                    ));
+                } else {
+                    println!(
+                        "{}",
+                        StatusIndicator::Success
+                            .with_label(style, "Daemon restarted via its launchd agent.")
+                    );
+                    println!(
+                        "  {} {} {}",
+                        style.key("Agent"),
+                        style.muted(":"),
+                        style.value(&target)
+                    );
+                }
+                return Ok(());
+            }
+            Err(reason) => {
+                eprintln!(
+                    "rch: launchd agent restart did not complete ({reason}); \
+                     falling back to manual stop+start"
+                );
+            }
+        }
+    }
+
+    // Manual path: user-launched daemon (no unit or launchd agent).
     // Pass true for skip_confirm since we already prompted above.
     daemon_stop(
         StopOptions {

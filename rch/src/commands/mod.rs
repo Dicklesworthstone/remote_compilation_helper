@@ -650,6 +650,7 @@ mod tests {
                 confidence_threshold: 0.85,
                 min_local_time_ms: 2000,
                 remote_speedup_threshold: 1.2,
+                local_slots: 0,
                 build_slots: 4,
                 test_slots: 8,
                 check_slots: 2,
@@ -890,6 +891,7 @@ mod tests {
             capabilities_warnings: Vec::new(),
             worker_selection: None,
             placement: rch_common::resolve_placement(|_| None),
+            speed_gate: None,
             dry_run: None,
         };
 
@@ -1369,6 +1371,7 @@ mod tests {
             capabilities_warnings: Vec::new(),
             worker_selection: Some(worker_selection),
             placement: rch_common::resolve_placement(|_| None),
+            speed_gate: None,
             dry_run: Some(dry_run),
         };
 

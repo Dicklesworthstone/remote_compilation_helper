@@ -87,38 +87,27 @@ impl RecoveredQueueCleanup {
     }
 }
 
-/// No signal is sent. ESRCH proves absence. Linux's boot ID/start ticks also
-/// prove replacement; formatted `ps` timestamps on other platforms do not.
-/// Permission errors and missing identity are not death.
+/// No signal is sent. An absent (or reaped zombie) PID proves exit. The kernel
+/// birth identity (Linux boot ID/start ticks, Darwin boot ID/start
+/// microseconds) also proves replacement: on macOS a queued owner's PID is
+/// often reused while the row waits. Failed inspection and missing or
+/// unparseable identity are not death.
 fn recovered_queue_owner_gone(row: &QueuedBuildState) -> Option<&'static str> {
-    if !row.recovered || row.hook_pid <= 1 {
+    use rch_common::process_identity::{
+        OwnerPresence, ProcessIdentity, ProcessObservation, observe_process,
+    };
+
+    if !row.recovered || row.hook_pid <= 1 || i32::try_from(row.hook_pid).is_err() {
         return None;
     }
-    #[cfg(unix)]
-    {
-        use nix::{errno::Errno, sys::signal::kill, unistd::Pid};
-
-        let pid = i32::try_from(row.hook_pid).ok()?;
-        match kill(Pid::from_raw(pid), None) {
-            Err(Errno::ESRCH) => Some("queued_owner_exited"),
-            Ok(()) | Err(Errno::EPERM) => {
-                #[cfg(target_os = "linux")]
-                {
-                    let recorded = row.hook_process_identity.as_deref()?;
-                    let observed = crate::history::process_identity(row.hook_pid)?;
-                    (observed != recorded).then_some("queued_owner_replaced")
-                }
-                #[cfg(not(target_os = "linux"))]
-                {
-                    None
-                }
-            }
-            Err(_) => None,
+    match observe_process(row.hook_pid) {
+        ProcessObservation::Absent => Some("queued_owner_exited"),
+        ProcessObservation::Unknown => None,
+        observed @ ProcessObservation::Present(_) => {
+            let recorded = ProcessIdentity::from_record(row.hook_process_identity.as_deref()?)?;
+            (recorded.presence(&observed) == OwnerPresence::Absent)
+                .then_some("queued_owner_replaced")
         }
-    }
-    #[cfg(not(unix))]
-    {
-        None
     }
 }
 
@@ -639,15 +628,36 @@ mod tests {
                 "unknown is not dead"
             );
             // Model a different incarnation, not actual operating-system PID reuse.
-            #[cfg(target_os = "linux")]
-            {
-                let actual = crate::history::process_identity(owner.0.id()).unwrap();
-                row.hook_process_identity = Some(format!("{actual}-prior"));
-                assert_eq!(
-                    recovered_queue_owner_gone(&row),
-                    Some("queued_owner_replaced")
-                );
-            }
+            let actual = crate::history::process_identity(owner.0.id()).unwrap();
+            let mut prior = rch_common::process_identity::ProcessIdentity::from_record(&actual)
+                .expect("the daemon records a parseable birth identity");
+            prior.start = match prior.start {
+                rch_common::process_identity::ProcessStart::Linux { ticks } => {
+                    rch_common::process_identity::ProcessStart::Linux { ticks: ticks + 1 }
+                }
+                rch_common::process_identity::ProcessStart::Darwin {
+                    seconds,
+                    microseconds,
+                } => rch_common::process_identity::ProcessStart::Darwin {
+                    seconds: seconds + 1,
+                    microseconds,
+                },
+            };
+            row.hook_process_identity = prior.to_record();
+            assert_eq!(
+                recovered_queue_owner_gone(&row),
+                Some("queued_owner_replaced")
+            );
+            row.hook_process_identity = Some(format!("{actual}-prior"));
+            assert!(
+                recovered_queue_owner_gone(&row).is_none(),
+                "an unparseable record proves nothing"
+            );
+            row.hook_process_identity = Some(actual);
+            assert!(
+                recovered_queue_owner_gone(&row).is_none(),
+                "same incarnation"
+            );
             assert!(owner.0.try_wait().unwrap().is_none());
             for pid in [0, 1, u32::MAX] {
                 row.hook_pid = pid;

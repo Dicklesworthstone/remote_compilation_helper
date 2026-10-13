@@ -711,6 +711,47 @@ fn rustup_toolchain_from_command_tokens(tokens: &[String]) -> Option<String> {
     None
 }
 
+/// rchd's select-worker refusal while a restart holds admission closed.
+fn is_restart_barrier_refusal(response: &SelectionResponse) -> bool {
+    response.worker.is_none()
+        && matches!(
+            &response.reason,
+            SelectionReason::SelectionError(reason) if reason == "restart_admission_barrier_active"
+        )
+}
+
+/// Wait (bounded) while a daemon restart holds admission closed, keeping the
+/// durable lease's heartbeat fresh and telling the caller once why it waits.
+async fn await_restart_admission(
+    socket_path: &str,
+    durable_lease: &DurableLeaseWriter,
+    reporter: &HookReporter,
+) -> RestartAdmissionWait {
+    let mut polls: u32 = 0;
+    let outcome = wait_for_restart_admission(
+        async || restart_admission_is_closed(socket_path).await,
+        restart_admission_wait_bound(),
+        std::time::Duration::from_secs(1),
+        || {
+            if polls == 0 {
+                reporter.summary("[RCH] waiting: daemon restart in progress (admission paused)");
+            }
+            if polls.is_multiple_of(10) {
+                let _ = durable_lease.heartbeat("restart_admission_wait");
+            }
+            polls = polls.saturating_add(1);
+        },
+    )
+    .await;
+    // Hand the lease back to admission. The selection query that follows can
+    // sit in the daemon queue for a long time without heartbeating, and a
+    // frozen "restart_admission_wait" would misdescribe a queued wrapper.
+    if outcome == RestartAdmissionWait::Open && polls > 0 {
+        let _ = durable_lease.heartbeat("admission");
+    }
+    outcome
+}
+
 fn exec_requires_remote() -> bool {
     std::env::var(RCH_REQUIRE_REMOTE_ENV).is_ok_and(|value| env_flag_enabled(&value))
 }
@@ -1043,6 +1084,25 @@ fn exit_with_local_fallback_recording(
     require_remote: bool,
     error: Option<&str>,
 ) -> ! {
+    exit_with_local_run(command, reporter, reason, require_remote, error, None)
+}
+
+/// Where a local run's duration is recorded (bd-2spi4 speed gate).
+struct LocalRunTiming<'a> {
+    project: &'a str,
+    kind: Option<CompilationKind>,
+}
+
+/// Run `command` locally and exit with its status. With `timing`, a successful
+/// run's duration is recorded as a local sample and reported in the envelope.
+fn exit_with_local_run(
+    command: &str,
+    reporter: &HookReporter,
+    reason: &str,
+    require_remote: bool,
+    error: Option<&str>,
+    timing: Option<LocalRunTiming<'_>>,
+) -> ! {
     // bd-uoh4x: exactly ONE envelope per invocation, emitted at the
     // TERMINAL path only. A pre-run emit here would double-emit on the
     // completed path (once before the child runs, again below with the
@@ -1095,8 +1155,18 @@ fn exit_with_local_fallback_recording(
         }
     };
 
-    match child.status() {
+    let started = std::time::Instant::now();
+    let status = child.status();
+    let duration_ms = timing
+        .as_ref()
+        .map(|_| u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
+    match status {
         Ok(status) => {
+            if let (Some(timing), Some(duration_ms)) = (&timing, duration_ms)
+                && status.success()
+            {
+                record_build_timing(timing.project, timing.kind, duration_ms, false);
+            }
             // A signal death reports 128+N like a shell, not a generic 1 that
             // would hide an OOM kill or interrupt from the caller.
             let code = {
@@ -1114,7 +1184,7 @@ fn exit_with_local_fallback_recording(
                 fallback_reason: Some(reason),
                 worker_id: None,
                 remote_exit_code: Some(code),
-                duration_ms: None,
+                duration_ms,
                 timing: None,
                 result_dirs: None,
                 error_code: None,
@@ -3405,6 +3475,43 @@ pub async fn run_exec(
     // Extract project name honoring configured path topology.
     let project = extract_project_name_with_policy(&topology_policy);
 
+    // bd-2spi4: speed gate. Like `general.force_local` it is a deliberate
+    // placement, so it outranks the shim's blanket RCH_REQUIRE_REMOTE=1 (and
+    // the dispatcher role default), but never a caller's explicit force-remote
+    // or a mode whose guarantee a local run cannot meet.
+    let caller_force_remote = std::env::var("RCH_FORCE_REMOTE")
+        .is_ok_and(|value| env_flag_enabled(&value))
+        || (config.general.force_remote && !exec_requires_remote());
+    if let Some((reason, _local_slot)) = speed_gate::evaluate(
+        &config,
+        &project,
+        speed_gate::SpeedGateInputs {
+            local_slots: config.compilation.local_slots,
+            kind: classification.kind,
+            job,
+            strict_remote_mode: clean_overlay
+                || source_content_receipt
+                || cargo_json_stdout
+                || exact_worker_requested
+                || required_tools_requested,
+            caller_force_remote,
+        },
+    ) {
+        // `_local_slot` stays held until this process exits with the build.
+        reporter.summary(&format!("[RCH] local ({reason})"));
+        exit_with_local_run(
+            &command,
+            &reporter,
+            &reason,
+            false,
+            None,
+            Some(LocalRunTiming {
+                project: &project,
+                kind: classification.kind,
+            }),
+        );
+    }
+
     // Layer 0 pack (bd-bqu38): resolve knob env pairs once; empty unless the
     // `[layer0]` section enables the pack.
     let layer0_env: Vec<(String, String)> = config
@@ -3526,9 +3633,10 @@ pub async fn run_exec(
     )?;
     let wrapper_id = durable_lease.wrapper_id();
 
-    if restart_admission_is_closed(&config.general.socket_path)
-        .await
-        .unwrap_or(false)
+    // A daemon restart closes admission for its drain window. Wait for it
+    // (bounded) instead of failing every build that arrives meanwhile.
+    if await_restart_admission(&config.general.socket_path, &durable_lease, &reporter).await
+        == RestartAdmissionWait::StillClosed
     {
         durable_lease.heartbeat("restart_admission_blocked")?;
         return Err(anyhow::anyhow!(
@@ -3593,9 +3701,9 @@ pub async fn run_exec(
                 config.general.socket_path = recovered_socket.to_string_lossy().into_owned();
                 // The original endpoint's restart gate says nothing about
                 // a daemon discovered in another runtime-directory context.
-                if restart_admission_is_closed(&config.general.socket_path)
+                if await_restart_admission(&config.general.socket_path, &durable_lease, &reporter)
                     .await
-                    .unwrap_or(false)
+                    == RestartAdmissionWait::StillClosed
                 {
                     durable_lease.heartbeat("restart_admission_blocked")?;
                     anyhow::bail!(
@@ -3695,6 +3803,43 @@ pub async fn run_exec(
     let mut current_query_preferred = preferred_workers.clone();
     let mut attempt: u32 = 1;
     let mut response = response;
+
+    // bd-5pmwm: the barrier can close after the pre-check, or while this build
+    // waits in the daemon's queue. Before any admission the same wrapper may
+    // simply ask again, as daemon recovery does, so wait for admission to
+    // reopen and re-query instead of failing (or building locally).
+    for _ in 0..3 {
+        if !is_restart_barrier_refusal(&response) {
+            break;
+        }
+        if await_restart_admission(&config.general.socket_path, &durable_lease, &reporter).await
+            == RestartAdmissionWait::StillClosed
+        {
+            break;
+        }
+        response = match query_daemon(
+            &config.general.socket_path,
+            &selection_project,
+            estimated_cores,
+            config.compilation.disk_headroom_gib,
+            &remote_command,
+            toolchain.as_ref(),
+            required_runtime,
+            command_priority,
+            0,
+            Some(std::process::id()),
+            Some(&wrapper_id),
+            wait_for_worker,
+            &preferred_workers,
+            classification.kind == Some(CompilationKind::Job),
+            &required_tools,
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(error) => return Err(selection_error_for_recovery(error, &durable_lease)?),
+        };
+    }
 
     loop {
         // Retry selection also preserves an explicit no-start cancellation.
@@ -4043,6 +4188,16 @@ pub async fn run_exec(
                         warn!(
                             "Failed to persist acknowledged durable lease terminal state: {}",
                             error
+                        );
+                    }
+                    // bd-2spi4: the speed gate compares this end-to-end time
+                    // (queueing, sync and retrieval included) with local runs.
+                    if config.compilation.local_slots > 0 {
+                        record_build_timing(
+                            &project,
+                            classification.kind,
+                            u64::try_from(exec_start.elapsed().as_millis()).unwrap_or(u64::MAX),
+                            true,
                         );
                     }
                     emit_exec_envelope(&ExecResultEnvelope {
@@ -4835,6 +4990,11 @@ use selection_response::parse_selection_response;
 mod timing_history;
 use timing_history::record_build_timing;
 
+// bd-2spi4: opt-in, bounded local execution when this machine's measured
+// history says offloading is not faster (`compilation.local_slots`).
+mod speed_gate;
+pub(crate) use speed_gate::{SpeedGateDiagnosis, diagnose as diagnose_speed_gate};
+
 // RABS B002: redacted invocation recorder — every completed offloaded
 // build emits one B001 corpus record, off the SLO path, fail-open.
 mod rabs_recorder;
@@ -4847,11 +5007,12 @@ use rabs_recorder::record_invocation;
 // `record_build` / `queue_when_busy_enabled` are re-exported for the hook hot
 // path. The timeout helpers and `urlencoding_encode` stay `pub(super)` for tests.
 mod daemon_ipc;
+pub(crate) use daemon_ipc::{
+    RestartAdmissionWait, query_daemon, query_daemon_dry_run, release_worker,
+    restart_admission_is_closed, restart_admission_wait_bound, wait_for_restart_admission,
+};
 use daemon_ipc::{
     disable_worker_for_fault, queue_when_busy_enabled, record_build, release_worker_with_fault,
-};
-pub(crate) use daemon_ipc::{
-    query_daemon, query_daemon_dry_run, release_worker, restart_admission_is_closed,
 };
 
 // Command-string parsing utilities (tokenization + cargo flag/env analyzers +

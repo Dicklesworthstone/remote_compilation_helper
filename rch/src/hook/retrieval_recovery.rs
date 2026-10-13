@@ -224,13 +224,20 @@ impl RetainedCargoStdout {
             use rustix::fs::{Mode, OFlags};
             File::from(rustix::fs::open(
                 &self.path,
-                OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::NOCTTY,
+                OFlags::RDONLY
+                    | OFlags::CLOEXEC
+                    | OFlags::NOFOLLOW
+                    | OFlags::NONBLOCK
+                    | OFlags::NOCTTY,
                 Mode::empty(),
             )?)
         };
         #[cfg(not(unix))]
         let file = File::open(&self.path)?;
-        anyhow::ensure!(file.metadata()?.is_file(), "retained Cargo stdout is not a regular file");
+        anyhow::ensure!(
+            file.metadata()?.is_file(),
+            "retained Cargo stdout is not a regular file"
+        );
         let mut file = file.take(limit as u64 + 1);
         let mut stdout = Vec::new();
         file.read_to_end(&mut stdout)?;
@@ -1193,8 +1200,13 @@ impl RecoverySession {
                 .context("caller Cargo delivery has no retained complete diagnostics")?,
         });
         let roots = [Path::new(&phase.remote), receipt.remote_root.as_path()];
-        let source_roots = [remote_project_root, receipt.remote_project_root.as_deref()
-            .context("caller Cargo delivery has no retained verified source root")?];
+        let source_roots = [
+            remote_project_root,
+            receipt
+                .remote_project_root
+                .as_deref()
+                .context("caller Cargo delivery has no retained verified source root")?,
+        ];
         let projected = capture.caller_json(
             &stdout,
             &CargoCallerPaths {
@@ -1865,8 +1877,7 @@ fn load_recipe(writer: &DurableLeaseWriter) -> anyhow::Result<RecoveryRecipe> {
         );
     } else {
         anyhow::ensure!(
-            recipe.cargo_stderr.is_none()
-                && recipe.caller_delivery.is_none(),
+            recipe.cargo_stderr.is_none() && recipe.caller_delivery.is_none(),
             "retained caller Cargo output has no original opt-in policy"
         );
     }
@@ -1877,7 +1888,8 @@ fn load_recipe(writer: &DurableLeaseWriter) -> anyhow::Result<RecoveryRecipe> {
                 && recipe.cargo_output_capture.is_some()
                 && (recipe.caller_json_policy.is_some() || producer.exit_code == 0)
                 && (recipe.caller_json_policy.is_none() || producer.remote_project_root.is_some())
-                && producer.bytes <= super::super::cargo_output_contract::MAX_CARGO_OUTPUT_RECEIPT_BYTES as u64,
+                && producer.bytes
+                    <= super::super::cargo_output_contract::MAX_CARGO_OUTPUT_RECEIPT_BYTES as u64,
             "retained Cargo producer contradicts the original completion"
         );
     }
@@ -3409,7 +3421,7 @@ mod tests {
         let remote_root = Path::new("/retained-cargo-output");
         let (directory, stage_owner, mut session) = captured_publication_fixture(
             CompilationKind::CargoBuild,
-            "cargo build --bins --profile lean",
+            "cargo build --bin app --bin helper --profile lean",
             remote_root,
             false,
         );
@@ -3417,19 +3429,38 @@ mod tests {
         let _stage = stage_owner.keep();
         let stdout = cargo_bin_receipt(remote_root, false);
         assert!(session.recipe.caller_json_policy.is_none());
-        assert!(session.retained_cargo_artifact_evidence().unwrap().is_none());
+        assert!(
+            session
+                .retained_cargo_artifact_evidence()
+                .unwrap()
+                .is_none()
+        );
         // Model interruption after producer custody, before contract install.
-        session.retain_cargo_stdout(&stdout, remote_root, None, 0).unwrap();
+        session
+            .retain_cargo_stdout(&stdout, remote_root, None, 0)
+            .unwrap();
         let mut recovered = reload_publication(&session);
         assert!(recovered.needs_cargo_artifact_evidence());
-        let retained = recovered.retained_cargo_artifact_evidence().unwrap().unwrap();
+        let retained = recovered
+            .retained_cargo_artifact_evidence()
+            .unwrap()
+            .unwrap();
         assert_eq!(retained.stdout, stdout);
         assert_eq!(retained.remote_root, remote_root);
         assert!(retained.remote_project_root.is_none());
-        recovered.install_complete_cargo_evidence(&retained).unwrap();
+        recovered
+            .install_complete_cargo_evidence(&retained)
+            .unwrap();
         let completed = reload_publication(&recovered);
         assert!(!completed.needs_cargo_artifact_evidence());
-        assert_eq!(completed.retained_cargo_artifact_evidence().unwrap().unwrap().stdout, stdout);
+        assert_eq!(
+            completed
+                .retained_cargo_artifact_evidence()
+                .unwrap()
+                .unwrap()
+                .stdout,
+            stdout
+        );
         assert!(completed.recipe.caller_json_policy.is_none());
         assert!(completed.recipe.cargo_stderr.is_none());
         assert!(completed.recipe.caller_delivery.is_none());
@@ -3440,31 +3471,41 @@ mod tests {
         let remote_root = Path::new("/retained-cargo-output");
         let (directory, stage_owner, mut session) = captured_publication_fixture(
             CompilationKind::CargoBuild,
-            "cargo build --bins --profile lean",
+            "cargo build --bin app --bin helper --profile lean",
             remote_root,
             false,
         );
         let _directory = directory.keep();
         let _stage = stage_owner.keep();
         let stdout = cargo_bin_receipt(remote_root, false);
-        session.install_complete_cargo_evidence(&crate::transfer::CargoArtifactEvidence {
-            stdout: stdout.clone(),
-            remote_root: remote_root.to_path_buf(),
-            remote_project_root: None,
-        }).unwrap();
+        session
+            .install_complete_cargo_evidence(&crate::transfer::CargoArtifactEvidence {
+                stdout: stdout.clone(),
+                remote_root: remote_root.to_path_buf(),
+                remote_project_root: None,
+            })
+            .unwrap();
         let path = session.recipe.cargo_stdout.as_ref().unwrap().path.clone();
         std::fs::write(&path, b"changed same-attempt producer bytes").unwrap();
         let mut corrupted = reload_publication(&session);
         assert!(!corrupted.needs_cargo_artifact_evidence());
         assert!(corrupted.retained_cargo_artifact_evidence().is_err());
-        assert!(corrupted.retain_cargo_stdout(&stdout, remote_root, None, 0).is_err());
+        assert!(
+            corrupted
+                .retain_cargo_stdout(&stdout, remote_root, None, 0)
+                .is_err()
+        );
         assert_eq!(corrupted.recipe.cargo_stdout.as_ref().unwrap().path, path);
         // Preserve the corrupt original while making the recorded path absent.
         corrupted.recipe.cargo_stdout.as_mut().unwrap().path = _directory.join("absent-producer");
         corrupted.persist().unwrap();
         let mut missing = reload_publication(&corrupted);
         assert!(missing.retained_cargo_artifact_evidence().is_err());
-        assert!(missing.retain_cargo_stdout(&stdout, remote_root, None, 0).is_err());
+        assert!(
+            missing
+                .retain_cargo_stdout(&stdout, remote_root, None, 0)
+                .is_err()
+        );
         missing.recipe.exit_code = Some(7);
         missing.persist().unwrap();
         assert!(load_recipe(&missing.writer).is_err());
@@ -3479,8 +3520,12 @@ mod tests {
             "remote_root": "/worker/target",
             "remote_project_root": "/worker/source",
             "exit_code": 0,
-        })).unwrap();
-        assert_eq!(receipt.remote_project_root.as_deref(), Some(Path::new("/worker/source")));
+        }))
+        .unwrap();
+        assert_eq!(
+            receipt.remote_project_root.as_deref(),
+            Some(Path::new("/worker/source"))
+        );
     }
 
     #[test]
@@ -3491,16 +3536,21 @@ mod tests {
         let remote_root = Path::new("C:/rch/retained-cargo-output");
         let (directory, stage_owner, mut session) = captured_publication_fixture(
             CompilationKind::CargoBuild,
-            "cargo build --bins --profile lean",
+            "cargo build --bin app --bin helper --profile lean",
             remote_root,
             false,
         );
         let _directory = directory.keep();
         let _stage = stage_owner.keep();
         let stdout = cargo_bin_receipt(remote_root, false);
-        session.retain_cargo_stdout(&stdout, remote_root, None, 0).unwrap();
+        session
+            .retain_cargo_stdout(&stdout, remote_root, None, 0)
+            .unwrap();
         let recovered = reload_publication(&session);
-        let retained = recovered.retained_cargo_artifact_evidence().unwrap().unwrap();
+        let retained = recovered
+            .retained_cargo_artifact_evidence()
+            .unwrap()
+            .unwrap();
         assert_eq!(retained.remote_root, remote_root);
         assert_eq!(retained.stdout, stdout);
     }

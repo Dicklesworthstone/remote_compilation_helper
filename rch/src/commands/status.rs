@@ -585,6 +585,16 @@ pub async fn diagnose(command: &str, dry_run: bool, ctx: &OutputContext) -> Resu
         None
     };
 
+    // bd-2spi4: what the speed gate would decide for this project and kind,
+    // before its local-slot and free-memory checks.
+    let speed_gate = would_intercept.then(|| {
+        crate::hook::diagnose_speed_gate(
+            &config,
+            &extract_project_name_with_policy(&topology_policy),
+            details.classification.kind,
+        )
+    });
+
     if ctx.is_json() {
         let response = DiagnoseResponse {
             classification: details.classification.clone(),
@@ -605,6 +615,7 @@ pub async fn diagnose(command: &str, dry_run: bool, ctx: &OutputContext) -> Resu
             capabilities_warnings: capabilities_warnings.clone(),
             worker_selection,
             placement: placement.clone(),
+            speed_gate: speed_gate.clone(),
             dry_run: dry_run_summary.clone(),
         };
         ctx.json(&ApiResponse::ok("diagnose", response))?;
@@ -733,6 +744,21 @@ pub async fn diagnose(command: &str, dry_run: bool, ctx: &OutputContext) -> Resu
         style.key("Reason:"),
         style.value(&decision.reason)
     );
+    if let Some(gate) = speed_gate.as_ref().filter(|gate| gate.enabled) {
+        println!(
+            "  {} {} {}",
+            style.key("Speed gate:"),
+            style.value(gate.decision.as_deref().unwrap_or("unknown")),
+            style.muted(&format!(
+                "# {} (local_slots {}, free memory {}%, needs {}%)",
+                gate.reason.as_deref().unwrap_or(""),
+                gate.local_slots,
+                gate.free_memory_pct
+                    .map_or_else(|| "?".to_string(), |pct| pct.to_string()),
+                gate.min_free_memory_pct
+            ))
+        );
+    }
     println!();
 
     println!("{}", style.highlight("Runtime Capabilities"));

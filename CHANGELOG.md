@@ -5,7 +5,7 @@ Compilation Helper): the PreToolUse hook + CLI (`rch`), the local daemon (`rchd`
 worker agent (`rch-wkr`), the RABS build sidecar (`rabs-*`, `rabsd`), and the fleet
 dashboard (`dashboard/`).
 
-Scope window: project inception (`v0.1.0`, 2026-01-25) through `v2.1.18` (2026-10-12).
+Scope window: project inception (`v0.1.0`, 2026-01-25) through `v2.1.20` (2026-10-13).
 
 This document was rebuilt from git history (`git log --no-merges` per tag range, `git show`
 on representative commits), version tags (`git for-each-ref`), GitHub release metadata
@@ -28,6 +28,77 @@ history. They are kept as-is because the descriptions were verified against the 
 but those particular links will 404.
 
 Repository: <https://github.com/Dicklesworthstone/remote_compilation_helper>
+
+## 2.1.20 — 2026-10-13
+
+Daemon restarts no longer fail the builds that arrive during them, Macs get a draining
+restart path, and scratch clones offload with only `RCH_CANONICAL_PROJECT_ROOT`.
+
+- **Builds wait out a daemon restart instead of failing.**
+  - `rch daemon restart --drain` closes admission for its drain window. Every build that
+    arrived then failed outright. The 2.1.19 rollout failed about 30 builds on one
+    dispatcher alone.
+  - `rch exec` now waits, polling once a second for up to 600 s
+    (`RCH_RESTART_ADMISSION_WAIT_SECS`; 0 restores fail-fast). It rides out the moment the
+    daemon is gone between processes, refreshes the job lease, and prints one waiting line
+    (`bd-o6kdp`, [`fae0a9e9`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/fae0a9e9e41a044a58a2b92e9bf330eb0d324c30)).
+  - A build refused because the barrier closed just after its check, or while it waited in
+    the daemon's queue, now re-queries once admission reopens instead of failing or
+    building locally (`bd-5pmwm`, [`93b7e104`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/93b7e1049fb4f79d3892aa4972daa0d3435952d5)).
+- **Macs can drain a restart** (`bd-5pmwm`). On macOS, `rch daemon restart` now restarts a
+  launchd-managed rchd with `launchctl kickstart -k` after the drain, instead of the manual
+  stop-and-spawn that fought launchd's KeepAlive. It then waits up to 20 s for the
+  re-adopting daemon. Mac rollouts can use `rch daemon restart --drain` like Linux
+  ([`7f18af79`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/7f18af79207154ea17fd50a823fbb7b92bb0ed2f)).
+- **Scratch clones offload with only `RCH_CANONICAL_PROJECT_ROOT`** (`bd-xz7at`). The override
+  kept the `/dp` alias, which is `/data/projects` on workers. Worker topology setup then
+  claimed all of `/data/projects`, and every worker refused the build as an "unfinished
+  overlapping physical source owner". Without `RCH_ALIAS_PROJECT_ROOT` the alias is now
+  `<canonical>.rch-alias` ([`ff1d34c7`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/ff1d34c7285affe165072351c57bcf259960a21b)).
+- Tests no longer write fake projects into the operator's real timing history, which the
+  2.1.19 speed gate learns from ([`4c62cb8c`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/4c62cb8c64561738cbb6f37fe98fc14b1368c16b)).
+
+## 2.1.19 — 2026-10-13
+
+A dispatcher that is faster than its workers can now keep builds local, bounded by local
+slots and free memory, instead of always offloading. Also: interrupted recoveries retain and
+verify complete Cargo artifact evidence, and the test suite and `cargo fmt --check` are green
+again.
+
+- **Opt-in speed gate: run a build locally when this machine's measured history says
+  offloading is slower** (`bd-2spi4`). `compilation.remote_speedup_threshold` and
+  `compilation.min_local_time_ms` were parsed and displayed but never consulted. On
+  mac-studio (M5 Ultra) a cold `cargo check -p rch-common --lib` took 12.4 s locally and 143 s
+  on a worker, yet every build was offloaded.
+  - **Enable it** with `compilation.local_slots = N`, `RCH_LOCAL_SLOTS`, or `rch config set
+    compilation.local_slots N`. The default 0 leaves behaviour unchanged.
+  - **How it decides:** for each project and command kind, it measures one local run and one
+    remote run. After that, a build runs locally when the local median is below
+    `min_local_time_ms`, or when remote is less than `remote_speedup_threshold` times faster.
+    A side whose samples are over a week old is measured again.
+  - **When it runs locally:** only with a free local slot (lock files the kernel releases if
+    the process dies) and at least 25% free memory. Otherwise the build offloads as before.
+  - **Precedence:** like `general.force_local`, the gate outranks the shim's blanket
+    `RCH_REQUIRE_REMOTE=1` and the dispatcher-role default. `RCH_FORCE_REMOTE`, a configured
+    `force_remote`, `--job`, `--worker`, required tools, clean overlays, source receipts and
+    Cargo JSON stdout all disable it.
+  - **Inspect it:** `rch diagnose` reports the gate's medians, threshold and decision.
+  - **Why not SpeedScore:** it cannot rank a dispatcher against its workers. Every host scores
+    cpu ≈ 70 (`bd-uerk9`).
+  - Timing samples are now merged across concurrent `rch exec` processes instead of being
+    overwritten
+    ([`de5ffdc5`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/de5ffdc584dad80eee7b60b90bc2329ce38f6ee2)).
+- **Recovery keeps complete Cargo artifact evidence across attempts.** An interrupted
+  recovery re-reads the same attempt's retained Cargo stdout, remote root and remote project
+  root instead of downgrading to glob policy. Corrupt or missing producer bytes refuse to
+  re-baseline, and a worker's path spelling (for example a Windows drive root) is kept
+  verbatim
+  ([`21043623`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/21043623608a18a224aa3856faca486813129718)).
+- **Tests and formatting are green again.** Three retained-Cargo fixtures used unnamed
+  `--bins`, which output capture deliberately refuses, so they failed their own setup
+  assertion. They now name `--bin app --bin helper`. Twelve unformatted hunks in
+  `retrieval_recovery.rs` are rustfmt'd
+  ([`95e07e1c`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/95e07e1c55f21ec11f9be97891fc50faca4843e8)).
 
 ## 2.1.18 — 2026-10-12
 
