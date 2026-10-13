@@ -2248,7 +2248,8 @@ mod tests {
         // Still a directory, still idle, still unheld — checked in that order,
         // immediately before the rm, so the enumerate→apply window is closed.
         assert!(cmd.contains("if [ ! -d \"$d\" ]; then printf 'RCH_GC_SKIP %s missing"));
-        assert!(cmd.contains("find \"$d\" -mmin -\"$__mins\" -print -quit"));
+        // 13da097f: the idle check is the shared, checked activity helper.
+        assert!(cmd.contains("if __gc_source_recent_activity \"$d\" \"$__mins\"; then"));
         assert!(cmd.contains("if ! __gc_gates_ok \"$d\"; then printf 'RCH_GC_SKIP %s gate"));
         assert!(cmd.contains("rm -rf -- \"$d\""));
         assert!(cmd.contains("RCH_WORKER_REAP_METRICS"));
@@ -2756,7 +2757,11 @@ mod tests {
         assert!(cmd.contains("sort -n"));
         // The active-build safety floor uses the SHORT idle window: once for
         // the TTL pass, once inside the eviction loop.
-        assert!(cmd.matches("-mmin -720").count() >= 2);
+        assert!(
+            cmd.matches("__gc_source_recent_activity \"$d\" 720")
+                .count()
+                >= 2
+        );
         // Counter mutations survive: eviction loop reads from a file.
         assert!(cmd.contains("done < \"$__tmpf3\""));
         assert!(!cmd.contains("| while"));
@@ -2780,7 +2785,7 @@ mod tests {
         assert!(!cmd.contains("| while"));
         assert!(cmd.contains("RCH_WORKER_REAP_METRICS removed=%s freed_kb=%s"));
         // The idle window (already minutes) reaches the predicate verbatim.
-        assert!(cmd.contains("-mmin -720"));
+        assert!(cmd.contains("__gc_source_recent_activity \"$d\" 720"));
     }
 
     #[test]
@@ -4048,7 +4053,7 @@ flock -n "$__gc_source_registry/metadata.lock" true;
         assert!(cmd.contains("RCH_REAP_CAP final_kb=%s"));
         // Cap skips now speak the parseable `RCH_GC_SKIP <trigger> <reason>
         // <path>` shape the gc surfaces read back, and carry the gate reason.
-        assert!(cmd.contains("RCH_GC_SKIP cap active %s"));
+        assert!(cmd.contains("printf 'RCH_GC_SKIP %s active %s\\n' cap \"$d\""));
         assert!(cmd.contains("RCH_GC_SKIP cap gate %s"));
     }
 
