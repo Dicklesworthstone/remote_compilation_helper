@@ -2520,14 +2520,22 @@ pub struct CompilationConfig {
     /// Minimum confidence score to intercept (0.0-1.0).
     #[serde(default = "default_confidence")]
     pub confidence_threshold: f64,
-    /// Skip interception if estimated local time < this (ms).
+    /// Run locally when this build's measured local median is below this (ms).
+    /// Consulted only by the speed gate, i.e. when `local_slots > 0`.
     #[serde(default = "default_min_local_time")]
     pub min_local_time_ms: u64,
-    /// Minimum expected speedup ratio (local_time / remote_time) to offload.
-    /// If predicted speedup < threshold, run locally. Default: 1.2 (20% faster).
-    /// Set to 1.0 to always offload when other criteria are met.
+    /// Minimum measured speedup ratio (local_time / remote_time) to offload.
+    /// If the measured speedup < threshold, run locally. Default: 1.2 (20% faster).
+    /// Consulted only by the speed gate, i.e. when `local_slots > 0`.
     #[serde(default = "default_speedup_threshold")]
     pub remote_speedup_threshold: f64,
+    /// Speed gate (bd-2spi4): how many offloadable builds may run concurrently
+    /// on THIS machine because its own measured build history says remote is
+    /// not worth it. Zero (default) disables the gate, so every offloadable
+    /// build is offloaded as before. Set it only on a dispatcher that is faster
+    /// than its workers; local runs also need free memory (see the hook).
+    #[serde(default)]
+    pub local_slots: u32,
     /// Default slot estimate for build commands (cargo build, gcc, etc.).
     #[serde(default = "default_build_slots")]
     pub build_slots: u32,
@@ -2689,6 +2697,7 @@ impl Default for CompilationConfig {
             confidence_threshold: 0.85,
             min_local_time_ms: 2000,
             remote_speedup_threshold: default_speedup_threshold(),
+            local_slots: 0,
             build_slots: default_build_slots(),
             test_slots: default_test_slots(),
             check_slots: default_check_slots(),

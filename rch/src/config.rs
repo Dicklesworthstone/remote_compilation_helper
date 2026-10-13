@@ -713,6 +713,7 @@ struct PartialCompilationConfig {
     confidence_threshold: Option<f64>,
     min_local_time_ms: Option<u64>,
     remote_speedup_threshold: Option<f64>,
+    local_slots: Option<u32>,
     build_slots: Option<u32>,
     test_slots: Option<u32>,
     check_slots: Option<u32>,
@@ -1345,6 +1346,7 @@ fn default_sources_map() -> ConfigSourceMap {
         "compilation.confidence_threshold",
         "compilation.min_local_time_ms",
         "compilation.remote_speedup_threshold",
+        "compilation.local_slots",
         "compilation.build_slots",
         "compilation.test_slots",
         "compilation.check_slots",
@@ -1436,6 +1438,10 @@ fn apply_layer(
             "compilation.remote_speedup_threshold",
             source.clone(),
         );
+    }
+    if let Some(local_slots) = layer.compilation.local_slots {
+        config.compilation.local_slots = local_slots;
+        set_source(sources, "compilation.local_slots", source.clone());
     }
     if let Some(build_slots) = layer.compilation.build_slots {
         config.compilation.build_slots = build_slots;
@@ -1872,6 +1878,9 @@ fn merge_compilation(
     if (overlay.remote_speedup_threshold - default.remote_speedup_threshold).abs() > EPSILON {
         base.remote_speedup_threshold = overlay.remote_speedup_threshold;
     }
+    if overlay.local_slots != default.local_slots {
+        base.local_slots = overlay.local_slots;
+    }
     if overlay.build_slots != default.build_slots {
         base.build_slots = overlay.build_slots;
     }
@@ -2264,6 +2273,18 @@ fn apply_env_overrides_inner(
                 sources,
                 "compilation.remote_speedup_threshold",
                 ConfigValueSource::EnvVar("RCH_REMOTE_SPEEDUP_THRESHOLD".to_string()),
+            );
+        }
+    }
+    if let Some(val) = get_env("RCH_LOCAL_SLOTS")
+        && let Ok(slots) = val.parse()
+    {
+        config.compilation.local_slots = slots;
+        if let Some(ref mut sources) = sources {
+            set_source(
+                sources,
+                "compilation.local_slots",
+                ConfigValueSource::EnvVar("RCH_LOCAL_SLOTS".to_string()),
             );
         }
     }

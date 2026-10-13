@@ -1043,6 +1043,25 @@ fn exit_with_local_fallback_recording(
     require_remote: bool,
     error: Option<&str>,
 ) -> ! {
+    exit_with_local_run(command, reporter, reason, require_remote, error, None)
+}
+
+/// Where a local run's duration is recorded (bd-2spi4 speed gate).
+struct LocalRunTiming<'a> {
+    project: &'a str,
+    kind: Option<CompilationKind>,
+}
+
+/// Run `command` locally and exit with its status. With `timing`, a successful
+/// run's duration is recorded as a local sample and reported in the envelope.
+fn exit_with_local_run(
+    command: &str,
+    reporter: &HookReporter,
+    reason: &str,
+    require_remote: bool,
+    error: Option<&str>,
+    timing: Option<LocalRunTiming<'_>>,
+) -> ! {
     // bd-uoh4x: exactly ONE envelope per invocation, emitted at the
     // TERMINAL path only. A pre-run emit here would double-emit on the
     // completed path (once before the child runs, again below with the
@@ -1095,8 +1114,18 @@ fn exit_with_local_fallback_recording(
         }
     };
 
-    match child.status() {
+    let started = std::time::Instant::now();
+    let status = child.status();
+    let duration_ms = timing
+        .as_ref()
+        .map(|_| u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
+    match status {
         Ok(status) => {
+            if let (Some(timing), Some(duration_ms)) = (&timing, duration_ms)
+                && status.success()
+            {
+                record_build_timing(timing.project, timing.kind, duration_ms, false);
+            }
             // A signal death reports 128+N like a shell, not a generic 1 that
             // would hide an OOM kill or interrupt from the caller.
             let code = {
@@ -1114,7 +1143,7 @@ fn exit_with_local_fallback_recording(
                 fallback_reason: Some(reason),
                 worker_id: None,
                 remote_exit_code: Some(code),
-                duration_ms: None,
+                duration_ms,
                 timing: None,
                 result_dirs: None,
                 error_code: None,
@@ -3405,6 +3434,43 @@ pub async fn run_exec(
     // Extract project name honoring configured path topology.
     let project = extract_project_name_with_policy(&topology_policy);
 
+    // bd-2spi4: speed gate. Like `general.force_local` it is a deliberate
+    // placement, so it outranks the shim's blanket RCH_REQUIRE_REMOTE=1 (and
+    // the dispatcher role default), but never a caller's explicit force-remote
+    // or a mode whose guarantee a local run cannot meet.
+    let caller_force_remote = std::env::var("RCH_FORCE_REMOTE")
+        .is_ok_and(|value| env_flag_enabled(&value))
+        || (config.general.force_remote && !exec_requires_remote());
+    if let Some((reason, _local_slot)) = speed_gate::evaluate(
+        &config,
+        &project,
+        speed_gate::SpeedGateInputs {
+            local_slots: config.compilation.local_slots,
+            kind: classification.kind,
+            job,
+            strict_remote_mode: clean_overlay
+                || source_content_receipt
+                || cargo_json_stdout
+                || exact_worker_requested
+                || required_tools_requested,
+            caller_force_remote,
+        },
+    ) {
+        // `_local_slot` stays held until this process exits with the build.
+        reporter.summary(&format!("[RCH] local ({reason})"));
+        exit_with_local_run(
+            &command,
+            &reporter,
+            &reason,
+            false,
+            None,
+            Some(LocalRunTiming {
+                project: &project,
+                kind: classification.kind,
+            }),
+        );
+    }
+
     // Layer 0 pack (bd-bqu38): resolve knob env pairs once; empty unless the
     // `[layer0]` section enables the pack.
     let layer0_env: Vec<(String, String)> = config
@@ -4043,6 +4109,16 @@ pub async fn run_exec(
                         warn!(
                             "Failed to persist acknowledged durable lease terminal state: {}",
                             error
+                        );
+                    }
+                    // bd-2spi4: the speed gate compares this end-to-end time
+                    // (queueing, sync and retrieval included) with local runs.
+                    if config.compilation.local_slots > 0 {
+                        record_build_timing(
+                            &project,
+                            classification.kind,
+                            u64::try_from(exec_start.elapsed().as_millis()).unwrap_or(u64::MAX),
+                            true,
                         );
                     }
                     emit_exec_envelope(&ExecResultEnvelope {
@@ -4834,6 +4910,11 @@ use selection_response::parse_selection_response;
 // estimator surface stay `pub(super)` for the test suite and otherwise private.
 mod timing_history;
 use timing_history::record_build_timing;
+
+// bd-2spi4: opt-in, bounded local execution when this machine's measured
+// history says offloading is not faster (`compilation.local_slots`).
+mod speed_gate;
+pub(crate) use speed_gate::{SpeedGateDiagnosis, diagnose as diagnose_speed_gate};
 
 // RABS B002: redacted invocation recorder — every completed offloaded
 // build emits one B001 corpus record, off the SLO path, fail-open.
