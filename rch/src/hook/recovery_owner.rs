@@ -9,6 +9,9 @@ use super::*;
 use std::future::Future;
 use std::os::unix::fs::MetadataExt;
 
+#[path = "recovery_artifact_policy.rs"]
+mod artifact_policy;
+
 /// The inode stays on disk. Unlinking it on release would let a waiting opener
 /// lock the old inode while a new recovery command locks its replacement.
 pub(in crate::hook) struct RecoveryOwnership {
@@ -364,7 +367,9 @@ async fn owner_is_absent(lease: &DurableJobLease) -> anyhow::Result<bool> {
 pub(in crate::hook) async fn claim(
     writer: &DurableLeaseWriter,
 ) -> anyhow::Result<DurableLeaseWriter> {
-    claim_with(writer, |lease| async move { owner_is_absent(&lease).await }).await
+    let owned = claim_with(writer, |lease| async move { owner_is_absent(&lease).await }).await?;
+    artifact_policy::apply_from_environment(&owned)?;
+    Ok(owned)
 }
 
 async fn claim_with<F, Fut>(
