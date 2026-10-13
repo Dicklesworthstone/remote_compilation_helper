@@ -46,11 +46,36 @@ fn native_retry_preserves_identity_and_complete_grant() {
     }
 }
 
+#[test]
+fn gnu_waiter_does_not_reserve_unavailable_source_closure() {
+    for backend in ["gnu", "gnu_large"] {
+        for scenario in ["convoy_exclusive", "convoy_shared", "cancelled_waiter"] {
+            check(backend, scenario);
+        }
+    }
+}
+
+#[test]
+fn gnu_retry_preserves_identity_and_complete_grant() {
+    for backend in ["gnu", "gnu_large"] {
+        for scenario in [
+            "path_replacement",
+            "inode_alias",
+            "terminal_handoff",
+            "mutual_exclusion",
+            "malformed_plan",
+        ] {
+            check(backend, scenario);
+        }
+    }
+}
+
 const DRIVER: &str = r#"
 import fcntl
 import os
 from pathlib import Path
 import select
+import shutil
 import subprocess
 import sys
 import time
@@ -58,7 +83,18 @@ import time
 script_path, root_path, backend, scenario = sys.argv[1:]
 script = Path(script_path).read_text()
 root = Path(root_path)
-count = 32 if backend == "native" else 2
+count = {"native": 32, "gnu": 2, "gnu_large": 64}[backend]
+environment = os.environ.copy()
+if backend == "gnu_large":
+    # Exercise large GNU plans on workers without Python in PATH. The driver
+    # itself still uses Python; the actual holder gets only its existing tools.
+    binary_dir = root / "gnu-bin"
+    binary_dir.mkdir()
+    for name in ["sh", "bash", "flock", "cat", "uname"]:
+        executable = shutil.which(name)
+        assert executable is not None, "required fixture tool missing: " + name
+        (binary_dir / name).symlink_to(executable)
+    environment["PATH"] = str(binary_dir)
 holders = []
 blockers = []
 
@@ -78,7 +114,7 @@ class Holder:
         if terminal is not None:
             args += [terminal]
         self.process = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                        stderr=subprocess.PIPE)
+                                        stderr=subprocess.PIPE, env=environment)
         self.buffer = b""
         holders.append(self)
 
@@ -216,11 +252,15 @@ def inode_alias():
     alias = root / "physical alias.lock"
     os.link(items[0], alias)
     items[1] = alias
-    waiting = Holder(items)
-    error = waiting.finished(73)
-    assert "duplicate source lock inode" in error, error
-    assert waiting.process.stdout.read() == b""
-    assert all(available(path) for path in items)
+    items[0].write_bytes(b"retained original lock bytes")
+    for first, second in [("x", "x"), ("x", "s"), ("s", "x"), ("s", "s")]:
+        modes = [first, second] + ["x"] * (count - 2)
+        waiting = Holder(items, modes)
+        error = waiting.finished(73)
+        assert "duplicate source lock inode" in error, error
+        assert waiting.process.stdout.read() == b""
+        assert all(available(path) for path in items)
+        assert items[0].read_bytes() == alias.read_bytes() == b"retained original lock bytes"
 
 
 def terminal_handoff():

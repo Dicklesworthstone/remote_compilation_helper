@@ -222,6 +222,7 @@ unset plan
 declare -A seen=()
 paths=()
 descriptors=()
+modes=()
 for ((i = 0; i < count; i++)); do
     IFS= read -r record <&3 || refuse "incomplete source lock plan"
     [[ ${#record} -lt 1048576 && "$record" != *"$cr"* ]] || refuse "invalid source lock record"
@@ -238,23 +239,54 @@ for ((i = 0; i < count; i++)); do
     if ! exec {lock_fd}<>"$lock"; then
         refuse "cannot open source lock descriptor"
     fi
+    [[ -f /dev/fd/"$lock_fd" && ! -L "$lock" && "$lock" -ef /dev/fd/"$lock_fd" ]] || refuse "source lock path changed during open"
+    # Compare retained descriptors, not pathnames that may have moved. Distinct
+    # opens of one inode can self-deadlock or alias supposedly disjoint roots.
+    # Reject every mode combination, including two shared locks, before flock.
+    for ((j = 0; j < i; j++)); do
+        [[ ! /dev/fd/"$lock_fd" -ef /dev/fd/"${descriptors[j]}" ]] || refuse "duplicate source lock inode"
+    done
     paths+=("$lock")
     descriptors+=("$lock_fd")
-    [[ -f /dev/fd/"$lock_fd" && ! -L "$lock" && "$lock" -ef /dev/fd/"$lock_fd" ]] || refuse "source lock path changed during open"
-    while :; do
-        requester_open
-        if flock "$mode" -w 0.05 -E 75 "$lock_fd"; then
-            break
-        else
-            result=$?
-            [[ "$result" -eq 75 ]] || refuse "flock failed without a contention verdict"
-        fi
-    done
+    modes+=("$mode")
 done
 if IFS= read -r extra <&3 || [[ -n "$extra" ]]; then
     refuse "source lock count does not match the plan"
 fi
 exec 3<&-
+# Like the native backend, validate the complete plan before acquiring any
+# lock, and never wait while reserving only a prefix of the source closure.
+# Keep the supplied order and the existing flock inodes/modes for mixed fleets.
+while :; do
+    for ((i = 0; i < count; i++)); do
+        requester_open
+        lock=${paths[i]}
+        lock_fd=${descriptors[i]}
+        [[ ! -L "$lock" && -f "$lock" && "$lock" -ef /dev/fd/"$lock_fd" ]] || refuse "source lock path changed during acquisition"
+        if flock "${modes[i]}" -n -E 75 "$lock_fd"; then
+            :
+        else
+            result=$?
+            [[ "$result" -eq 75 ]] || refuse "flock failed without a contention verdict"
+            break
+        fi
+    done
+    [[ "$i" -lt "$count" ]] || break
+    for ((j = i - 1; j >= 0; j--)); do
+        flock -u "${descriptors[j]}" || refuse "cannot release partial source closure"
+    done
+    requester_open
+    # Wait briefly on ONLY the contested root with no prefix held. If it
+    # becomes available, drop this out-of-order lock before retrying the whole
+    # plan. flock supplies the wait; no sleep binary or input consumption is
+    # needed on minimal workers. Only the explicit contention code may retry.
+    if flock "${modes[i]}" -w 0.05 -E 75 "${descriptors[i]}"; then
+        flock -u "${descriptors[i]}" || refuse "cannot release contention wait lock"
+    else
+        result=$?
+        [[ "$result" -eq 75 ]] || refuse "flock failed without a contention verdict"
+    fi
+done
 # Revalidate the ENTIRE set after the final wait. Replacing an earlier lock
 # pathname while a later root is busy must never leave a grant on old inodes.
 for ((i = 0; i < count; i++)); do
