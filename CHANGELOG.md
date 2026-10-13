@@ -79,7 +79,8 @@ scripts parse under macOS `sh`, though Darwin workers still cannot launch a buil
   [`998f97e6`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/998f97e61ce058817f54f7c27fe08d76bca7d9a0)).
 - **Scoped builds** (the opt-in receiver execution policy): cancellation and recovery are
   bound to the whole cgroup, and a scope-aware supervisor carries deadlines and complete
-  cleanup ([`fa064a64`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/fa064a64c08780d465e8d944def0c5192a763e1a), [`6e802394`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/6e802394b98adcbb78c41b5f58176a8632978b45)).
+  cleanup ([`fa064a64`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/fa064a64c08780d465e8d944def0c5192a763e1a), [`6e802394`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/6e802394b98adcbb78c41b5f58176a8632978b45)). Its systemd exchanges are bounded and reject
+  failed responses ([`849846b0`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/849846b06f7fc1e6894a998babcd07f7bac8bf2d)).
 - **Worker output completion is bounded.** After the foreground command exits, the worker
   waits five seconds for pipe EOF instead of forever when a descendant inherited the pipe
   ([`ceb2f858`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/ceb2f85885f2262d8cea82bd93f68bcb6cd7c765)).
@@ -88,7 +89,15 @@ scripts parse under macOS `sh`, though Darwin workers still cannot launch a buil
 - **Benchmarks** (`bd-uerk9`): automatic Cargo measurements run in fresh private projects
   instead of `cargo clean` on shared state ([`ad47b90f`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/ad47b90f87336c6e21a37204e682aecc266b5aa9)), and a paired serial/parallel
   rustc workload with an `rch-parallel-benchmark` CLI is available. It does not change
-  placement ([`055e5cdb`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/055e5cdb6acd9e7dae252aaaa6bf9fbbe53daa07), [`61dce9d5`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/61dce9d51d1a677c6e470385a4cdb8928345b018)).
+  placement ([`055e5cdb`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/055e5cdb6acd9e7dae252aaaa6bf9fbbe53daa07), [`61dce9d5`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/61dce9d51d1a677c6e470385a4cdb8928345b018)). The worker emits the complete benchmark
+  evidence its score was computed from ([`3f3ba961`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/3f3ba9614fb38a1c660c2081b0554483dd0811f2)).
+- **Source ownership** (#105, opt-in): a pre-grant contention verdict with a retry driver
+  that drops its descriptors before waiting, and create-only topology initialization under
+  the registry mutex ([`335f5614`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/335f56149cc1967207ad87a31ea46d33153536ed)).
+- **Remote-command futures are small again** (`bd-uz82c`). An inline 16 KiB read buffer made
+  every future that runs a remote command about 33 KB, and in debug builds the pipeline's
+  poll frame reached 1.76 MB and overflowed the 2 MiB test-thread stack, aborting the whole
+  rch test binary. The read buffers are heap allocations now ([`eaf19dac`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/eaf19dacdff4d8b64a377e0a8c9dfad7e3835945)).
 - **Tests.** The source-lock holder suite, red since 2.1.21, is ported to the
   release-while-waiting acquisition it tests (`bd-n0bu8`, [`ab96f771`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/ab96f771d0d47792f366caab238ba8dbebbda6d7)).
 
