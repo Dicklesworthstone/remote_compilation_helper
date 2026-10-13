@@ -8,7 +8,10 @@ fn scoped_launch_lifecycle() {
         .expect("write compiled protocol");
     for shell in ["/bin/sh", "/bin/bash"] {
         let status = std::process::Command::new("python3")
-            .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/remote_scoped_launch.py"))
+            .arg(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/remote_scoped_launch.py"
+            ))
             .env("RCH_TEST_PROTOCOL_SCRIPT", &script)
             .env("RCH_TEST_SHELL", shell)
             .status()
