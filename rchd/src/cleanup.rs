@@ -6,8 +6,9 @@ use crate::{
 };
 use std::path::Path;
 use std::time::{Duration, Instant};
-use tokio::time::{MissedTickBehavior, interval};
 use tracing::{debug, warn};
+
+mod remediation;
 
 const HEARTBEAT_STALE_SECS: u64 = 20;
 /// Silence from a LIVE hook that corroborates a progress stall. The hook beats every 5 s, but on
@@ -337,18 +338,7 @@ impl ActiveBuildCleanup {
 
     pub fn start(self) -> ActiveBuildCleanupTask {
         ActiveBuildCleanupTask {
-            task: tokio::spawn(async move {
-                let mut ticker = interval(Duration::from_secs(5));
-                ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-                let mut observation = ObservationWindow::for_startup(Instant::now());
-                let mut recovered_queue = RecoveredQueueCleanup::default();
-                loop {
-                    ticker.tick().await;
-                    // This must also run when there are no active builds.
-                    recovered_queue.check(&self.context);
-                    self.check_active_builds_observed(&mut observation).await;
-                }
-            }),
+            task: tokio::spawn(remediation::run(self)),
         }
     }
 
@@ -358,49 +348,49 @@ impl ActiveBuildCleanup {
             .await;
     }
 
+    #[cfg(all(test, target_os = "linux"))]
     async fn check_active_builds_observed(&self, observation: &mut ObservationWindow) {
+        // The long-running service owns retry state. Existing process tests
+        // drain one observation, using the same fresh-evidence admission check.
+        for planned in self.collect_active_builds_observed(observation) {
+            if let Some(build) = remediation::fresh_candidate(self, &planned, observation) {
+                self.context
+                    .cancellation
+                    .cancel_build(
+                        &self.context,
+                        build.id,
+                        crate::cancellation::CancelReason::StuckDetector,
+                        false,
+                    )
+                    .await;
+            }
+        }
+    }
+
+    /// Collect evidence without waiting for remote termination. Retry policy
+    /// must not stop this observer, queue retirement, or peer observations.
+    fn collect_active_builds_observed(
+        &self,
+        observation: &mut ObservationWindow,
+    ) -> Vec<crate::history::ActiveBuildState> {
         let triage_started = Instant::now();
         observation.recovering(triage_started);
         let active_builds = self.context.history.active_builds();
         if active_builds.is_empty() {
-            return;
+            return Vec::new();
         }
         let active_build_count = active_builds.len();
+        let mut candidates = Vec::new();
 
         for candidate in active_builds {
-            // Cancellation of a previous candidate can await remote I/O. Never
-            // reuse the sweep's old heartbeat snapshot after that await.
+            // History can advance during a sweep; observe the current row.
+            // Remediation rechecks it again before acquiring cancellation rights.
             let Some(build) = self.context.history.active_build(candidate.id) else {
                 continue;
             };
             let now = Instant::now();
             let recovering = observation.recovering_build(now, build.recovered);
-            let hook_alive = build.hook_pid == 0 || is_process_alive(build.hook_pid);
-            let heartbeat_age_secs = now
-                .checked_duration_since(build.last_heartbeat_mono)
-                .unwrap_or_default()
-                .as_secs();
-            let progress_age_secs = now
-                .checked_duration_since(build.last_progress_mono)
-                .unwrap_or_default()
-                .as_secs();
-            let build_age_secs = now
-                .checked_duration_since(build.started_at_mono)
-                .unwrap_or_default()
-                .as_secs();
-            let slots_owned = build.slots;
-            let has_worker_binding = !build.worker_id.is_empty();
-            let evidence = score_stuck_evidence(StuckEvidenceInput {
-                hook_alive,
-                progress_stall_remediable_phase: is_progress_stall_remediable_phase(
-                    &build.heartbeat_phase,
-                ),
-                heartbeat_age_secs,
-                progress_age_secs,
-                build_age_secs,
-                slots_owned,
-                has_worker_binding,
-            });
+            let evidence = build_stuck_evidence(&build, now);
             let _ = self.context.history.record_stuck_detector_snapshot(
                 build.id,
                 StuckDetectorSnapshot {
@@ -436,36 +426,7 @@ impl ActiveBuildCleanup {
                 continue;
             }
 
-            warn!(
-                build_id = build.id,
-                project_id = %build.project_id,
-                worker_id = %build.worker_id,
-                phase = ?build.heartbeat_phase,
-                hook_alive = evidence.hook_alive,
-                heartbeat_stale = evidence.heartbeat_stale,
-                progress_stale = evidence.progress_stale,
-                remediable_progress_stale = evidence.remediable_progress_stale,
-                hb_age = evidence.heartbeat_age_secs,
-                progress_age = evidence.progress_age_secs,
-                build_age = evidence.build_age_secs,
-                slots = evidence.slots_owned,
-                confidence = evidence.confidence,
-                decision = "cancel",
-                reason = "stuck_detector",
-                "Cleaning up build due to high-confidence stuck evidence"
-            );
-
-            // Delegate to CancellationOrchestrator for deterministic cleanup.
-            let _ = self
-                .context
-                .cancellation
-                .cancel_build(
-                    &self.context,
-                    build.id,
-                    crate::cancellation::CancelReason::StuckDetector,
-                    false,
-                )
-                .await;
+            candidates.push(build);
         }
 
         let elapsed_ms = duration_millis_u64(triage_started.elapsed());
@@ -483,7 +444,37 @@ impl ActiveBuildCleanup {
                 }),
             );
         }
+        candidates
     }
+}
+
+fn build_stuck_evidence(build: &crate::history::ActiveBuildState, now: Instant) -> StuckEvidence {
+    let hook_alive = build.hook_pid == 0 || is_process_alive(build.hook_pid);
+    let heartbeat_age_secs = now
+        .checked_duration_since(build.last_heartbeat_mono)
+        .unwrap_or_default()
+        .as_secs();
+    let progress_age_secs = now
+        .checked_duration_since(build.last_progress_mono)
+        .unwrap_or_default()
+        .as_secs();
+    let build_age_secs = now
+        .checked_duration_since(build.started_at_mono)
+        .unwrap_or_default()
+        .as_secs();
+    let slots_owned = build.slots;
+    let has_worker_binding = !build.worker_id.is_empty();
+    score_stuck_evidence(StuckEvidenceInput {
+        hook_alive,
+        progress_stall_remediable_phase: is_progress_stall_remediable_phase(
+            &build.heartbeat_phase,
+        ),
+        heartbeat_age_secs,
+        progress_age_secs,
+        build_age_secs,
+        slots_owned,
+        has_worker_binding,
+    })
 }
 
 fn is_process_alive(pid: u32) -> bool {
