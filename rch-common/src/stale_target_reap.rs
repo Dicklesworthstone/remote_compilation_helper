@@ -548,7 +548,7 @@ __gc_source_begin() {
     if [ "$__gc_retention_status" -ne 1 ]; then
         __gc_source_end; return 2;
     fi;
-    __gc_token=fc-$(cat /proc/sys/kernel/random/uuid) || { __gc_source_end; return 2; };
+    __gc_token=fc-$(cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen | tr 'A-F' 'a-f') || { __gc_source_end; return 2; };
     case "$__gc_token" in *[!a-f0-9-]*) __gc_source_end; return 2;; esac;
     [ "${#__gc_token}" -eq 39 ] || { __gc_source_end; return 2; };
     for __gc_previous in "$__gc_source_registry/$__gc_token."* \
@@ -2548,9 +2548,8 @@ mod tests {
 
     /// The pressure pass on a real tree. A line of 1000 permille can never be
     /// met, so the pass evicts every eligible dir and the assertions pin
-    /// exactly which dirs are eligible and in what order. Linux only, like the
-    /// other source-registry runs: the registry gate needs GNU `realpath -m`.
-    #[cfg(target_os = "linux")]
+    /// exactly which dirs are eligible and in what order.
+    #[cfg(unix)]
     #[test]
     fn pressure_pass_evicts_idle_targets_oldest_first_and_nothing_else() {
         use std::process::Command;
