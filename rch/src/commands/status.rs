@@ -1294,6 +1294,20 @@ async fn self_test_history(limit: usize, ctx: &OutputContext) -> Result<()> {
     Ok(())
 }
 
+/// The worker a bare `rch self-test` checks: the first configured worker that
+/// is not administratively disabled. A disabled worker is out of rotation on
+/// purpose, and testing it only reports a timeout (bd-57nk9). With every
+/// worker disabled the first one is still tested, so the run says why.
+fn default_self_test_worker<'a>(
+    workers: &'a [WorkerConfig],
+    disabled: &rch_common::bypass_record::AdminDisableStore,
+) -> Option<&'a WorkerConfig> {
+    workers
+        .iter()
+        .find(|worker| disabled.get(worker.id.as_str()).is_none())
+        .or_else(|| workers.first())
+}
+
 async fn self_test_run(
     worker: Option<String>,
     all: bool,
@@ -1313,8 +1327,10 @@ async fn self_test_run(
         worker_ids.push(worker);
     } else {
         let workers = load_workers_from_config()?;
-        let first = workers
-            .first()
+        let disabled = rch_common::bypass_record::AdminDisableStore::load(
+            rch_common::bypass_record::default_admin_disable_path(),
+        );
+        let first = default_self_test_worker(&workers, &disabled)
             .ok_or_else(|| anyhow::anyhow!("No workers configured"))?;
         worker_ids.push(first.id.to_string());
     }
@@ -3734,6 +3750,63 @@ mod tests {
                 .iter()
                 .any(|issue| issue == "All workers are unreachable")
         );
+    }
+
+    #[test]
+    fn bare_self_test_skips_admin_disabled_workers() {
+        use rch_common::bypass_record::{AdminDisableRecord, AdminDisableStore};
+        let worker = |id: &str| WorkerConfig {
+            id: rch_common::WorkerId::new(id),
+            host: format!("{id}.invalid"),
+            user: "u".to_string(),
+            identity_file: "/dev/null".to_string(),
+            total_slots: 2,
+            priority: 100,
+            tags: vec![],
+            tools: Vec::new(),
+        };
+        let workers = vec![worker("ovh-a"), worker("hz3"), worker("hz4")];
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = AdminDisableStore::load(dir.path().join("admin_disables.json"));
+        assert_eq!(
+            default_self_test_worker(&workers, &store)
+                .unwrap()
+                .id
+                .as_str(),
+            "ovh-a"
+        );
+        store
+            .upsert(AdminDisableRecord {
+                worker_id: "ovh-a".into(),
+                reason: Some("maintenance".into()),
+                disabled_unix_ms: 1,
+            })
+            .unwrap();
+        assert_eq!(
+            default_self_test_worker(&workers, &store)
+                .unwrap()
+                .id
+                .as_str(),
+            "hz3"
+        );
+        // Every worker disabled: still test one, so the run explains itself.
+        for id in ["hz3", "hz4"] {
+            store
+                .upsert(AdminDisableRecord {
+                    worker_id: id.into(),
+                    reason: None,
+                    disabled_unix_ms: 1,
+                })
+                .unwrap();
+        }
+        assert_eq!(
+            default_self_test_worker(&workers, &store)
+                .unwrap()
+                .id
+                .as_str(),
+            "ovh-a"
+        );
+        assert!(default_self_test_worker(&[], &store).is_none());
     }
 
     #[test]
