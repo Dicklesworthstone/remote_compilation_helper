@@ -21,9 +21,10 @@ rch_valid_boot() {
 # Missing namespace evidence (including older kernels) fails closed.
 # Inside ( ... ) $$ still names the invoking shell while /proc/self is this
 # subshell (the watchdog's timer is one), so compare with this process's own
-# ID: a command exec'd from a substitution reports it as its parent.
+# ID: a command exec'd from a substitution reports it as its parent. Use an
+# absolute path: launch environments may carry a minimal PATH.
 rch_check_procfs_namespace() {
-    rch_self_pid=$(exec sh -c 'echo "$PPID"') || return 1
+    rch_self_pid=$(exec /bin/sh -c 'echo "$PPID"') || return 1
     while IFS= read -r rch_status_line; do
         case "$rch_status_line" in
             NSpid:*)
