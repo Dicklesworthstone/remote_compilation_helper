@@ -204,6 +204,25 @@ fn normalized_event_score(score: f64) -> f64 {
     }
 }
 
+/// Only comparable, finite measurements may enter live worker selection.
+/// Legacy values remain readable in history, but are not current calibration.
+fn selection_speedscore(score: &SpeedScore) -> Option<f64> {
+    let components = [
+        score.total,
+        score.cpu_score,
+        score.memory_score,
+        score.disk_score,
+        score.network_score,
+        score.compilation_score,
+    ];
+    (!score.is_outdated()
+        && score.weights.is_valid()
+        && components
+            .iter()
+            .all(|value| value.is_finite() && (0.0..=100.0).contains(value)))
+    .then_some(score.total)
+}
+
 fn benchmark_score_view(score: &SpeedScore) -> serde_json::Value {
     serde_json::json!({
         "total": score.total,
@@ -217,16 +236,18 @@ fn benchmark_score_view(score: &SpeedScore) -> serde_json::Value {
     })
 }
 
-/// Build a typed [`SpeedScore`] from a bare total (legacy/scalar sources).
+/// Build a diagnostic [`SpeedScore`] from a bare total (legacy/scalar sources).
 ///
-/// Mirrors the historical event view: the total doubles as the compilation
-/// component; other components are unknown and stay at zero.
+/// A scalar has no algorithm or measurement provenance. Never stamp it with
+/// the daemon's current version: that would silently relabel an old worker's
+/// saturated score as a newly calibrated result.
 fn speedscore_from_total(score: f64, measured_at: DateTime<Utc>) -> SpeedScore {
     let score = normalized_event_score(score);
     SpeedScore {
         total: score,
         compilation_score: score,
         calculated_at: measured_at,
+        version: 0,
         ..SpeedScore::default()
     }
 }
@@ -235,9 +256,9 @@ fn speedscore_from_total(score: f64, measured_at: DateTime<Utc>) -> SpeedScore {
 ///
 /// This is the single write path for benchmark results (issue #40): it stores
 /// the score through `TelemetryStore::record_speedscore` so `should_benchmark`
-/// stops classifying the worker as `NewWorker`, and pushes the total into the
-/// live `WorkerState` that selection reads. Persistence failures are surfaced
-/// as warnings but never fail the benchmark itself.
+/// stops classifying the worker as `NewWorker`, and pushes a comparable total
+/// into live selection. Unknown calibration uses the normal neutral default.
+/// Persistence failures are surfaced as warnings but never fail the benchmark.
 async fn commit_benchmark_score(
     telemetry: &TelemetryStore,
     pool: &WorkerPool,
@@ -245,7 +266,7 @@ async fn commit_benchmark_score(
     score: &SpeedScore,
 ) {
     if let Some(worker) = pool.get(worker_id).await {
-        worker.set_speed_score(score.total);
+        worker.set_speed_score(selection_speedscore(score).unwrap_or(50.0));
     }
     if let Err(error) = telemetry
         .record_speedscore(worker_id.as_str(), score.clone())
@@ -523,13 +544,33 @@ impl BenchmarkScheduler {
             ));
         };
 
-        // Hydrate the live selection state from the persisted score. After a
-        // daemon restart WorkerState boots with the default 50.0; the persisted
-        // benchmark result is authoritative until the next re-benchmark.
-        worker.set_speed_score(score.total);
-
         let age = Utc::now() - score.calculated_at;
         let age_duration = age.to_std().unwrap_or_default();
+
+        // Never hydrate a cached value from another calibration into placement.
+        // A persisted, versioned old score gets one prompt upgrade benchmark.
+        // Scalar-only reports are explicitly version 0 and must wait out the
+        // minimum interval, otherwise an old worker would benchmark forever.
+        let Some(comparable_total) = selection_speedscore(&score) else {
+            worker.set_speed_score(50.0);
+            if score.version == 0 && age_duration < self.config.min_interval {
+                return None;
+            }
+            debug!(
+                worker_id = %worker_id,
+                version = score.version,
+                "SpeedScore is not comparable; scheduling fresh measurements"
+            );
+            return Some(ScheduledBenchmarkRequest::new(
+                worker_id,
+                BenchmarkPriority::High,
+                BenchmarkReason::StaleScore { age },
+            ));
+        };
+
+        // After a daemon restart WorkerState boots with the default 50.0;
+        // only a compatible persisted measurement is authoritative.
+        worker.set_speed_score(comparable_total);
 
         // Score too old?
         if age_duration > self.config.max_age {
@@ -1256,15 +1297,8 @@ async fn execute_benchmark_process(
     }
 
     let stdout_str = String::from_utf8_lossy(&stdout_buf);
-
-    // Try to parse JSON output first (includes per-component scores)
-    if let Some(score) = parse_benchmark_json(&stdout_str) {
+    if let Some(score) = parse_benchmark_output(&stdout_str) {
         return Ok((score, exec_duration));
-    }
-
-    // Fall back to line-based parsing for non-JSON output
-    if let Some(score) = parse_benchmark_score(&stdout_str) {
-        return Ok((speedscore_from_total(score, Utc::now()), exec_duration));
     }
 
     Err(anyhow::anyhow!(
@@ -1273,14 +1307,77 @@ async fn execute_benchmark_process(
     ))
 }
 
+/// Structured output must pass structured validation. Do not salvage a
+/// misleading `score` number from a malformed JSON or invalid raw report.
+fn parse_benchmark_output(output: &str) -> Option<SpeedScore> {
+    let trimmed = output.trim_start();
+    if trimmed.starts_with('{') || trimmed.starts_with('[') {
+        parse_benchmark_json(trimmed)
+    } else {
+        parse_benchmark_score(output).map(|score| speedscore_from_total(score, Utc::now()))
+    }
+}
+
+/// Recalibrate the raw measurement fields emitted by deployed workers.
+///
+/// The flat wire report does not contain memory access latency or any network
+/// measurements. Those components must be absent, not reverse-engineered from
+/// clipped old component scores or filled with fabricated latency values.
+fn recalibrate_worker_raw(raw: &serde_json::Value) -> Option<SpeedScore> {
+    use rch_telemetry::benchmarks::{
+        CompilationBenchmarkResult, CpuBenchmarkResult, DiskBenchmarkResult,
+    };
+    use rch_telemetry::speedscore::BenchmarkResults;
+
+    raw.as_object()?;
+    let positive = |name: &str| {
+        raw.get(name)
+            .and_then(serde_json::Value::as_f64)
+            .filter(|value| value.is_finite() && *value > 0.0)
+    };
+    let mut results = BenchmarkResults::new();
+    if let Some(ops_per_second) = positive("cpu_ops_per_second") {
+        results.cpu = Some(CpuBenchmarkResult {
+            ops_per_second,
+            ..CpuBenchmarkResult::default()
+        });
+    }
+    if let (Some(seq_read_mbps), Some(seq_write_mbps), Some(random_read_iops)) = (
+        positive("disk_seq_read_mbps"),
+        positive("disk_seq_write_mbps"),
+        positive("disk_random_read_iops"),
+    ) {
+        results.disk = Some(DiskBenchmarkResult {
+            seq_read_mbps,
+            seq_write_mbps,
+            random_read_iops,
+            ..DiskBenchmarkResult::default()
+        });
+    }
+    if let Some(release_build_ms) = raw
+        .get("compilation_release_build_ms")
+        .and_then(serde_json::Value::as_u64)
+        .filter(|milliseconds| *milliseconds > 0)
+    {
+        results.compilation = Some(CompilationBenchmarkResult {
+            release_build_ms,
+            ..CompilationBenchmarkResult::default()
+        });
+    }
+    let score = SpeedScore::calculate(&results);
+    selection_speedscore(&score).map(|_| score)
+}
+
 /// Parse `rch-wkr benchmark --json` output into a typed [`SpeedScore`].
 ///
-/// The worker emits a top-level scalar `score` plus a `components` object
-/// (cpu/memory/disk/network/compilation). Components are optional: older
-/// workers that emit only the scalar still parse (components default to the
-/// scalar-only shape via [`speedscore_from_total`]).
+/// Raw measurements are authoritative and are recalibrated by the daemon so
+/// rolling upgrades do not mix worker algorithms. Older scalar/component-only
+/// reports remain readable as explicitly unversioned diagnostic results.
 fn parse_benchmark_json(output: &str) -> Option<SpeedScore> {
     let json = serde_json::from_str::<serde_json::Value>(output).ok()?;
+    if let Some(raw) = json.get("raw") {
+        return recalibrate_worker_raw(raw);
+    }
     let total = json.get("score").and_then(serde_json::Value::as_f64)?;
 
     let mut score = speedscore_from_total(total, Utc::now());
@@ -1981,10 +2078,9 @@ mod tests {
         assert_eq!(event["data"]["speedscore"]["total"], 75.0);
     }
 
-    /// Regression for issue #40: a successful benchmark must persist its
-    /// SpeedScore so the next scheduler pass does not classify the worker as
-    /// `NewWorker` again, and the persisted score must survive a daemon
-    /// restart (fresh scheduler + fresh TelemetryStore over the same storage).
+    /// Regression for issue #40: a successful legacy benchmark must persist its
+    /// diagnostic score and not immediately loop as a NewWorker after restart.
+    /// Its unknown calibration must not become a live selection measurement.
     #[tokio::test]
     async fn successful_benchmark_persistence_stops_new_worker_rescheduling() {
         use rch_telemetry::storage::TelemetryStorage;
@@ -2028,8 +2124,8 @@ mod tests {
             .mark_completed(&worker_id, 75.0, Duration::from_secs(30))
             .await;
 
-        // The next pass must NOT re-enqueue as NewWorker: the score is
-        // persisted and readable.
+        // The next pass must NOT re-enqueue as NewWorker: the legacy result is
+        // persisted and the minimum interval bounds any subsequent recheck.
         assert!(scheduler.should_benchmark(&worker).await.is_none());
         let persisted = telemetry
             .latest_speedscore(worker_id.as_str())
@@ -2038,13 +2134,14 @@ mod tests {
             .expect("persisted score should exist");
         assert_eq!(persisted.total, 75.0);
         assert_eq!(persisted.compilation_score, 75.0);
+        assert_eq!(persisted.version, 0);
 
-        // Live selection state was hydrated from the completed benchmark.
-        assert_eq!(worker.get_speed_score(), 75.0);
+        // Legacy diagnostics are not promoted into live calibrated selection.
+        assert_eq!(worker.get_speed_score(), 50.0);
 
         // Simulated daemon restart: fresh pool/store/scheduler over the same
-        // persistent storage. The worker must not be re-benchmarked and the
-        // live score must hydrate from storage on the first scheduling pass.
+        // persistent storage. Legacy workers must neither hot-loop nor hydrate
+        // an incompatible score into the new daemon's placement decisions.
         let restarted_pool = WorkerPool::new();
         restarted_pool
             .add_worker(make_worker_config("persist-test"))
@@ -2061,14 +2158,14 @@ mod tests {
             .get(&worker_id)
             .await
             .expect("restarted worker should exist");
-        assert_eq!(restarted_worker.get_speed_score(), 50.0); // default before hydration
+        assert_eq!(restarted_worker.get_speed_score(), 50.0);
         assert!(
             restarted_scheduler
                 .should_benchmark(&restarted_worker)
                 .await
                 .is_none()
         );
-        assert_eq!(restarted_worker.get_speed_score(), 75.0);
+        assert_eq!(restarted_worker.get_speed_score(), 50.0);
     }
 
     #[test]
@@ -2092,6 +2189,8 @@ mod tests {
         assert_eq!(score.disk_score, 63.2);
         assert_eq!(score.network_score, 0.0);
         assert_eq!(score.compilation_score, 88.8);
+        assert_eq!(score.version, 0);
+        assert!(selection_speedscore(&score).is_none());
     }
 
     #[test]
@@ -2105,6 +2204,149 @@ mod tests {
         // Non-JSON and score-less JSON are rejected.
         assert!(parse_benchmark_json("Score: 42.0").is_none());
         assert!(parse_benchmark_json(r#"{"elapsed_secs": 1.0}"#).is_none());
+    }
+
+    #[test]
+    fn raw_worker_report_is_recalibrated_without_inventing_missing_measurements() {
+        let report = r#"{
+            "score": 99.9,
+            "components": {"cpu": 100, "memory": 100, "disk": 100},
+            "raw": {
+                "cpu_ops_per_second": 250000,
+                "memory_seq_bandwidth_gbps": 4.0,
+                "disk_seq_read_mbps": 1000,
+                "disk_seq_write_mbps": 1000,
+                "disk_random_read_iops": 100000,
+                "compilation_release_build_ms": 3000
+            }
+        }"#;
+        let score = parse_benchmark_output(report).unwrap();
+        assert!(!score.is_outdated());
+        assert!((score.total - 50.0).abs() < 1e-9);
+        assert_eq!(score.cpu_score, 50.0);
+        assert_eq!(score.disk_score, 50.0);
+        assert_eq!(score.compilation_score, 50.0);
+        assert_eq!(score.weights.memory, 0.0);
+        assert_eq!(score.weights.network, 0.0);
+        assert!(score.weights.is_valid());
+        assert!(selection_speedscore(&score).is_some());
+    }
+
+    #[test]
+    fn malformed_structured_reports_cannot_fall_back_to_scalar_extraction() {
+        for report in [
+            r#"{"score":99,"raw":{}}"#,
+            r#"{"score":99,"raw":null}"#,
+            r#"{"score":99,"raw":{"cpu_ops_per_second":-5}}"#,
+            r#"{"score":99,"raw":{"cpu_ops_per_second":"fast"}}"#,
+            r#"{"score":99,"raw":{"compilation_release_build_ms":0}}"#,
+            r#"{"score":99,"raw":[]}"#,
+            r#"{"score":99,"raw":{"cpu_ops_per_second":250000}"#,
+            r#"[{"score":99}]"#,
+        ] {
+            assert!(parse_benchmark_output(report).is_none(), "{report}");
+        }
+        let legacy = parse_benchmark_output("Score: 75.0").unwrap();
+        assert_eq!(legacy.total, 75.0);
+        assert!(selection_speedscore(&legacy).is_none());
+    }
+
+    #[tokio::test]
+    async fn old_algorithm_score_is_not_hydrated_and_queues_an_upgrade_benchmark() {
+        use rch_telemetry::storage::TelemetryStorage;
+
+        let storage = Arc::new(TelemetryStorage::new_in_memory().unwrap());
+        let telemetry = Arc::new(TelemetryStore::new(Duration::from_secs(300), Some(storage)));
+        let pool = WorkerPool::new();
+        let worker_id = WorkerId::new("upgrade-score");
+        pool.add_worker(make_worker_config(worker_id.as_str())).await;
+        let worker = pool.get(&worker_id).await.unwrap();
+        worker.set_speed_score(100.0);
+        telemetry
+            .record_speedscore(
+                worker_id.as_str(),
+                SpeedScore {
+                    total: 100.0,
+                    version: 1,
+                    ..SpeedScore::default()
+                },
+            )
+            .await
+            .unwrap();
+        let (scheduler, _) = BenchmarkScheduler::new(
+            make_test_config(),
+            pool,
+            telemetry,
+            EventBus::new(16),
+        );
+        let request = scheduler.should_benchmark(&worker).await.unwrap();
+        assert_eq!(worker.get_speed_score(), 50.0);
+        assert_eq!(request.priority, BenchmarkPriority::High);
+        assert!(matches!(request.reason, BenchmarkReason::StaleScore { .. }));
+        scheduler.enqueue(request).await;
+        scheduler.process_pending_queue().await;
+        assert_eq!(scheduler.pending_count().await, 1);
+        assert_eq!(scheduler.running_count().await, 0);
+        assert_eq!(worker.available_slots().await, 4);
+    }
+
+    #[tokio::test]
+    async fn recalibrated_raw_score_persists_and_hydrates_after_restart() {
+        use rch_telemetry::storage::TelemetryStorage;
+
+        let storage = Arc::new(TelemetryStorage::new_in_memory().unwrap());
+        let telemetry = Arc::new(TelemetryStore::new(
+            Duration::from_secs(300),
+            Some(storage.clone()),
+        ));
+        let pool = WorkerPool::new();
+        let worker_id = WorkerId::new("current-score");
+        pool.add_worker(make_worker_config(worker_id.as_str())).await;
+        let worker = pool.get(&worker_id).await.unwrap();
+        let score = parse_benchmark_output(
+            r#"{"score":100,"raw":{"cpu_ops_per_second":750000}}"#,
+        )
+        .unwrap();
+        commit_benchmark_score(&telemetry, &pool, &worker_id, &score).await;
+        assert!((worker.get_speed_score() - 75.0).abs() < 1e-9);
+
+        let restarted_pool = WorkerPool::new();
+        restarted_pool
+            .add_worker(make_worker_config(worker_id.as_str()))
+            .await;
+        let restarted_worker = restarted_pool.get(&worker_id).await.unwrap();
+        let restarted_telemetry =
+            Arc::new(TelemetryStore::new(Duration::from_secs(300), Some(storage)));
+        let (scheduler, _) = BenchmarkScheduler::new(
+            make_test_config(),
+            restarted_pool,
+            restarted_telemetry,
+            EventBus::new(16),
+        );
+        assert_eq!(restarted_worker.get_speed_score(), 50.0);
+        assert!(scheduler.should_benchmark(&restarted_worker).await.is_none());
+        assert!((restarted_worker.get_speed_score() - 75.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn incompatible_or_invalid_scores_are_diagnostic_only() {
+        let current = SpeedScore {
+            total: 75.0,
+            ..SpeedScore::default()
+        };
+        assert_eq!(selection_speedscore(&current), Some(75.0));
+        for version in [0, 1, u32::MAX] {
+            let mut incompatible = current.clone();
+            incompatible.version = version;
+            assert!(selection_speedscore(&incompatible).is_none());
+        }
+        for total in [f64::NAN, f64::INFINITY, -1.0, 101.0] {
+            let mut invalid = current.clone();
+            invalid.total = total;
+            assert!(selection_speedscore(&invalid).is_none());
+        }
+        let empty = SpeedScore::calculate(&rch_telemetry::speedscore::BenchmarkResults::new());
+        assert!(selection_speedscore(&empty).is_none());
     }
 
     #[tokio::test]
