@@ -1,6 +1,7 @@
-//! The existing `rch-build` shell ABI gains a scope-aware supervisor. Other
-//! users of the shared protocol (cancellation, recovery, GC) only load functions.
-//! No policy and nice-only launches continue into the caller's legacy watchdog.
+//! The existing Linux `rch-build` shell ABI has an owned-group supervisor.
+//! Configured scopes add cgroup containment without changing the receipt ABI.
+//! Other protocol users (cancellation, recovery, GC) only load functions; non-Linux
+//! launches retain the caller's legacy path.
 //!
 //! A scoped child needs the same identity/policy implementation as its parent.
 //! The quoted heredoc passes these exact sources as data, without installing a
@@ -27,7 +28,8 @@ pub const REMOTE_PROCESS_IDENTITY_SCRIPT: &str = concat!(
     "command eval \"$rch_launch_source\" || exit 125\n",
     "\nif [ \"$0\" = rch-build ]; then\n",
     "    rch_scope_launch_select || { printf '\\n%s_IDENTITY_UNAVAILABLE\\n' \"$3\" >&2; exit 125; }\n",
-    "    if [ -n \"$rch_launch_slice\" ]; then\n",
+    "    rch_launch_platform=$(uname -s) || { printf '\\n%s_IDENTITY_UNAVAILABLE\\n' \"$3\" >&2; exit 125; }\n",
+    "    if [ -n \"$rch_launch_slice\" ] || [ \"$rch_launch_platform\" = Linux ]; then\n",
     "        rch_scope_launch_supervise \"$@\"\n",
     "        exit $?\n",
     "    fi\n",

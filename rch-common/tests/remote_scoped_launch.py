@@ -11,6 +11,7 @@ literal concat! expression and rejects any unknown Rust syntax.
 from __future__ import annotations
 
 import json
+import fcntl
 import os
 from pathlib import Path
 import re
@@ -290,7 +291,7 @@ class ScopedLaunch(unittest.TestCase):
         self.assertTrue(predicate(), "condition did not become true")
 
     def start(self, name="42", mode="exit", code=0, limit=10, *, fixture=True,
-              env=None, script=None, transport_layers=0) -> tuple[subprocess.Popen, Path, Path]:
+              env=None, script=None, transport_layers=0, workload=WORKLOAD) -> tuple[subprocess.Popen, Path, Path]:
         job = self.root / f"job-{name}"
         job.mkdir()
         record = self.root / f"{name}.pgid"
@@ -302,7 +303,7 @@ class ScopedLaunch(unittest.TestCase):
         command = f"exec {shlex.quote(SHELL)} -c {transport_quote(body + chr(10) + 'echo UNCONFINED; exit 97')} rch-build \"$@\" 3>&2"
         command = nest_transport(command, transport_layers)
         proc = subprocess.Popen(["/bin/sh", "-c", command, "scope-fixture", str(record), str(limit),
-            "RCH_TEST_DEADLINE", name, sys.executable, "-c", WORKLOAD, str(job), mode, str(code)],
+            "RCH_TEST_DEADLINE", name, sys.executable, "-c", workload, str(job), mode, str(code)],
             cwd=job, env=env or self.env, stdin=subprocess.DEVNULL,
             stdout=out, stderr=err, start_new_session=True)
         self.processes.append(proc)
@@ -438,13 +439,19 @@ class ScopedLaunch(unittest.TestCase):
         self.assertFalse(record.exists())
         self.assertIn("RCH_WORKER_POLICY_REFUSED", (job / "stderr").read_text())
 
-    def test_no_policy_and_nice_only_keep_legacy_entry(self) -> None:
-        for scope_policy in ("", "version=1\nnice=10\n"):
-            self.policy.write_text(scope_policy)
-            env = {**self.env, "RCH_TEST_POLICY_FILE": str(self.policy) if scope_policy else ""}
-            proc, job, _ = self.start(str(80 + len(scope_policy)), env=env)
-            self.assertEqual(proc.wait(timeout=5), 97)
-            self.assertIn("UNCONFINED", (job / "stdout").read_text())
+    def test_requested_scope_cannot_accept_a_v1_receipt(self) -> None:
+        proc, job, record = self.start(mode="hold", limit=0)
+        self.wait_for(lambda: (job / "ready").exists())
+        # V1 and V2 both exist in mixed fleets, but a requested scope must
+        # never silently adopt the weaker class on readback or recovery.
+        original = record.read_text()
+        record.write_text(":".join(original.strip().split(":")[:5]).replace(
+            "RCH_REMOTE_PROCESS_V2:", "RCH_REMOTE_PROCESS_V1:") + "\n")
+        (job / "release").touch()
+        self.assertEqual(proc.wait(timeout=8), 255)
+        self.assertIn("RCH_SCOPED_COMPLETION_UNCONFIRMED", (job / "stderr").read_text())
+        record.write_text(original)
+        self.assertEqual(self.recover(record).returncode, 0)
 
     def test_recovery_entry_does_not_parse_current_policy(self) -> None:
         self.policy.write_text("invalid current policy")
@@ -470,6 +477,136 @@ class ScopedLaunch(unittest.TestCase):
                 else:
                     if mode == "cancel": proc.terminate()
                     self.finish(proc, job, {"normal": 0, "deadline": 137, "cancel": 143}[mode])
+
+
+# V1 proves only its process group, not descendants which deliberately setsid.
+# Unlike the V2 tests above, this lane doubles NO resource/identity/signal APIs.
+GROUP_WORKLOAD = r'''
+import json, os, subprocess, sys, time
+from pathlib import Path
+root = Path(sys.argv[1]); mode = sys.argv[2]; code = int(sys.argv[3])
+child_code = """
+import fcntl, os, signal, sys, time
+from pathlib import Path
+root = Path(sys.argv[1])
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+lock = (root/'held.lock').open('a')
+fcntl.flock(lock, fcntl.LOCK_EX)
+for fd in (0, 1, 2): os.close(fd)
+pid = os.getpid()
+birth = Path(f'/proc/{pid}/stat').read_text().rsplit(') ', 1)[1].split()[19]
+(root/'child').write_text(f'{pid}:{birth}')
+while True:
+    with (root/'beats').open('a') as out: out.write('tick\\n')
+    time.sleep(.02)
+"""
+child = subprocess.Popen([sys.executable, '-c', child_code, str(root)])
+while not (root/'child').exists() or not (root/'beats').exists(): time.sleep(.01)
+(root/'observation').write_text(json.dumps({'nice': os.getpriority(os.PRIO_PROCESS, 0),
+    'cwd': os.getcwd(), 'group': os.getpgrp()}))
+os.write(1, b'bytes-stdout:\x00\xff\n')
+os.write(2, b'bytes-stderr:\x00\xfe\n')
+(root/'ready').write_text('ready')
+if mode == 'hold':
+    while not (root/'release').exists(): time.sleep(.02)
+(root/'artifact').write_text('artifact-evidence')
+sys.exit(code)
+'''
+
+
+@unittest.skipUnless(sys.platform == "linux", "Linux process-group protocol")
+class ProcessGroupLaunch(unittest.TestCase):
+    setUp = ScopedLaunch.setUp
+    cleanup_owned = ScopedLaunch.cleanup_owned
+    wait_for = ScopedLaunch.wait_for
+
+    def start(self, name="42", **options):
+        options.setdefault("env", {**self.env, "RCH_TEST_POLICY_FILE": ""})
+        return ScopedLaunch.start(self, name, fixture=False, workload=GROUP_WORKLOAD, **options)
+
+    def finish(self, proc, job, expected=0):
+        self.assertEqual(proc.wait(timeout=15), expected, (job / "stderr").read_bytes())
+        self.assertNotIn(b"UNCONFINED", (job / "stdout").read_bytes())
+        pid, birth = map(int, (job / "child").read_text().split(":"))
+        self.assertFalse(alive(pid, birth), "live descendant after terminal return")
+        before = (job / "beats").read_bytes()
+        time.sleep(.1)
+        self.assertEqual((job / "beats").read_bytes(), before)
+        with (job / "held.lock").open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def recover(self, record):
+        script = protocol(fixture=False) + '\nrch_remote_cancel "$1" "$2" "$3"\n'
+        return subprocess.run([SHELL, "-c", script, "rch-recover", str(record), record.stem, "kill"],
+                              env=self.env, capture_output=True, timeout=12)
+
+    def test_no_policy_reaps_closed_pipe_descendants_before_preserving_status(self):
+        for code in (0, 23, 125):
+            with self.subTest(code=code):
+                proc, job, record = self.start(str(code + 1), code=code)
+                self.finish(proc, job, code)
+                self.assertTrue(record.read_bytes().startswith(b"RCH_REMOTE_PROCESS_V1:"))
+                self.assertEqual((job / "artifact").read_text(), "artifact-evidence")
+                self.assertEqual((job / "stdout").read_bytes(), b"bytes-stdout:\x00\xff\n")
+                self.assertIn(b"bytes-stderr:\x00\xfe\n", (job / "stderr").read_bytes())
+                self.assertNotIn(b"IDENTITY_UNAVAILABLE", (job / "stderr").read_bytes())
+
+    def test_nice_only_enforces_priority_without_requiring_systemd(self):
+        nice = max(10, os.getpriority(os.PRIO_PROCESS, 0))
+        self.policy.write_text(f"version=1\nnice={nice}\n")
+        proc, job, record = self.start(env=self.env)
+        self.finish(proc, job)
+        observation = json.loads((job / "observation").read_text())
+        self.assertEqual(observation["nice"], nice)
+        self.assertEqual(observation["cwd"], str(job))
+        self.assertTrue(record.read_bytes().startswith(b"RCH_REMOTE_PROCESS_V1:"))
+
+    def test_deadline_stops_group_and_keeps_deadline_evidence(self):
+        started = time.monotonic()
+        proc, job, _ = self.start(mode="hold", limit=1)
+        self.finish(proc, job, 137)
+        self.assertGreaterEqual(time.monotonic() - started, 1)
+        self.assertIn(b"RCH_TEST_DEADLINE", (job / "stderr").read_bytes())
+
+    def test_supervisor_term_stops_group_with_unlimited_runtime(self):
+        proc, job, _ = self.start(mode="hold", limit=0)
+        self.wait_for(lambda: (job / "ready").exists())
+        self.assertIsNone(proc.poll())
+        self.assertEqual((job / "stdout").read_bytes(), b"bytes-stdout:\x00\xff\n")
+        proc.terminate()
+        self.finish(proc, job, 143)
+
+    def test_supervisor_sigkill_triggers_birth_fenced_in_group_watchdog(self):
+        proc, job, record = self.start(mode="hold", limit=0)
+        self.wait_for(lambda: (job / "ready").exists())
+        proc.kill(); proc.wait(timeout=3)
+        pid, birth = map(int, (job / "child").read_text().split(":"))
+        self.wait_for(lambda: not alive(pid, birth))
+        self.assertEqual(self.recover(record).returncode, 0)
+
+    def test_concurrent_groups_remain_independent(self):
+        one, first, _ = self.start("41", mode="hold", limit=0)
+        two, second, _ = self.start("42", mode="hold", code=17, limit=0)
+        self.wait_for(lambda: (first / "ready").exists() and (second / "ready").exists())
+        one.terminate()
+        self.finish(one, first, 143)
+        self.assertIsNone(two.poll())
+        (second / "release").touch()
+        self.finish(two, second, 17)
+
+    def test_fresh_channel_cancellation_and_repeated_recovery_preserve_record(self):
+        proc, job, record = self.start(mode="hold", limit=0)
+        self.wait_for(lambda: (job / "ready").exists())
+        before = record.read_bytes()
+        result = self.recover(record)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.finish(proc, job, 137)
+        self.assertEqual(self.recover(record).returncode, 0)
+        self.assertEqual(record.read_bytes(), before)
+
+    def test_nested_transport_keeps_group_ownership(self):
+        proc, job, _ = self.start(code=23, transport_layers=3)
+        self.finish(proc, job, 23)
 
 
 if __name__ == "__main__":

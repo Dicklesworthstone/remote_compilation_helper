@@ -1,8 +1,9 @@
-# Scoped rch-build lifecycle. The supervisor stays OUTSIDE the workload scope.
-# The scoped leader reports the command's status but remains alive until the
-# supervisor has reaped the complete scope. Only then may the outer durable
+# Owned rch-build lifecycle. The supervisor stays OUTSIDE the workload group.
+# The leader reports the command's status but remains alive until the supervisor
+# has stopped the group (and configured scope). Only then may the outer durable
 # execution wrapper publish completion and release source/output ownership.
 # This is the existing rch-build argv ABI, not a new worker installation.
+# V1 owns a process group; only configured V2 scopes cover setsid descendants.
 
 # Snapshot receiver policy once. Never let removal/change between route selection
 # and child launch silently put a requested scope on the legacy PGID-only route.
@@ -65,54 +66,80 @@ rch_scope_launch_deadline_marker() {
         >/dev/null 2>&1 </dev/null
 }
 
+# Policy selects the required authority class. Never accept a V1 downgrade of
+# a requested scope, or silently assume that an ordinary group has V2 rights.
+rch_scope_launch_binding_matches() {
+    if [ -n "$rch_launch_slice" ]; then
+        [ "$rch_scope_bound" = 1 ]
+    else
+        [ "$rch_scope_bound" = 0 ]
+    fi
+}
+
+# Used ONLY by the still-executing leader/watchdog inside its own group. Its
+# current membership pins that group even if the leader died. $$ in a watchdog
+# subshell names the leader, so obtain the actual caller PID from the verified
+# procfs view. This is not historical receipt authority or an orphan adopter;
+# the outside supervisor must still use birth-fenced cancellation and census.
+rch_scope_launch_kill_self() {
+    if [ "$rch_scope_bound" = 1 ]; then
+        rch_scope_operation kill
+    else
+        rch_check_procfs_namespace && rch_read_process "$rch_self_pid" &&
+            [ "$rch_observed_boot" = "$rch_boot" ] || return 1
+        kill -KILL -"$rch_pgid"
+    fi
+}
+
 # Called in a new setsid shell. No payload is allowed until the outside
-# supervisor validates the V2 record and acknowledges it with a private gate.
+# supervisor validates the selected record class and opens the private gate.
 rch_scope_launch_child() {
     __sl_record=$1; __sl_control=$2; __sl_marker=$3; __sl_build=$4
     __sl_parent=$5; __sl_parent_start=$6; __sl_limit=$7
     rch_launch_nice=$8; rch_launch_slice=$9; shift 9
     rch_launch_manager=$1; shift
     [ -z "$rch_launch_nice" ] || rch_policy_valid_nice "$rch_launch_nice" || exit 125
-    rch_policy_valid_slice "$rch_launch_slice" || exit 125
+    [ -z "$rch_launch_slice" ] || rch_policy_valid_slice "$rch_launch_slice" || exit 125
     case "$rch_launch_manager" in user|system) ;; *) exit 125;; esac
     rch_apply_configured_worker_policy() {
         rch_policy_nice=$rch_launch_nice
         rch_policy_slice=$rch_launch_slice
         rch_policy_manager=$rch_launch_manager
+        [ -n "$rch_policy_nice$rch_policy_slice" ] || return 0
         rch_policy_enforce
     }
     rch_remote_record "$__sl_record" "$__sl_build" || exit 125
-    [ "$rch_scope_bound" = 1 ] || exit 125
+    rch_scope_launch_binding_matches || exit 125
     __sl_cancelled=0
     trap '__sl_cancelled=1' HUP INT TERM
     while [ ! -f "$__sl_control/go" ]; do
         if [ "$__sl_cancelled" = 1 ] || ! rch_scope_launch_parent_alive; then
-            rch_scope_operation kill
+            rch_scope_launch_kill_self
             exit 255
         fi
         sleep 0.1 || exit 255
     done
     rch_scope_launch_clock || exit 255
     __sl_started=$rch_launch_now
-    # This watchdog lives in the scope and survives a SIGKILL of the outside
+    # This watchdog lives in the group and survives a SIGKILL of the outside
     # supervisor. It remains armed after the command reports its exit status,
-    # until the supervisor kills the scope. Thus detached descendants are never
-    # left behind merely because their original shell returned successfully.
+    # until the supervisor stops the group/scope. V2 additionally covers
+    # detached descendants; V1 makes no claim beyond its own process group.
     (
         trap '' HUP INT TERM
         while :; do
             if ! rch_scope_launch_parent_alive; then
-                rch_scope_operation kill
+                rch_scope_launch_kill_self
                 exit 255
             fi
             if ! rch_scope_launch_clock; then
-                rch_scope_operation kill
+                rch_scope_launch_kill_self
                 exit 255
             fi
             if [ "$__sl_limit" -gt 0 ] && [ "$((rch_launch_now - __sl_started))" -ge "$((__sl_limit * 100))" ]; then
                 (umask 077; set -C; printf '%s\n' deadline > "$__sl_control/deadline") || :
                 rch_scope_launch_deadline_marker "$__sl_marker"
-                rch_scope_operation kill
+                rch_scope_launch_kill_self
                 exit 255
             fi
             sleep 0.2 3>&- || exit 255
@@ -145,7 +172,7 @@ rch_scope_launch_read_result() {
 
 rch_scope_launch_read_owned_record() {
     rch_read_record "$__sl_record" "$__sl_build" &&
-        [ "$rch_scope_bound" = 1 ] && [ "$rch_pgid" = "$__sl_child" ] &&
+        rch_scope_launch_binding_matches && [ "$rch_pgid" = "$__sl_child" ] &&
         [ "$rch_start" = "$__sl_child_start" ]
 }
 
@@ -207,7 +234,7 @@ rch_scope_launch_child \"\$@\"" rch-scoped-child \
                 if ! rch_scope_launch_read_owned_record; then
                     __sl_reason=unknown; break
                 fi
-                rch_scope_operation state
+                rch_group_state
                 [ "$?" = 1 ] || { __sl_reason=unknown; break; }
                 rch_scope_launch_clock || { __sl_reason=unknown; break; }
                 __sl_started=$rch_launch_now
