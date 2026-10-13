@@ -129,13 +129,6 @@ fn observed_owner_presence(
 /// Read our own birth marker without accidentally inspecting an unrelated
 /// /proc/<getpid> when procfs belongs to a different PID namespace.
 pub fn current_process_identity() -> Option<ProcessIdentity> {
-    #[cfg(target_os = "linux")]
-    let observation = linux_stat(
-        &std::fs::read_to_string("/proc/self/stat").ok()?,
-        std::process::id(),
-        &boot_identity()?,
-    );
-    #[cfg(not(target_os = "linux"))]
     let observation = observe_process(std::process::id());
     match observation {
         ProcessObservation::Present(identity) => Some(identity),
@@ -190,35 +183,131 @@ pub fn observe_process(pid: u32) -> ProcessObservation {
         return ProcessObservation::Unknown;
     };
     match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
-        Ok(stat) => linux_stat(&stat, pid, &boot),
+        Ok(stat) => {
+            let observed = linux_stat(&stat, pid, &boot);
+            if observed != ProcessObservation::Unknown {
+                return observed;
+            }
+            let Some(leader) = parse_linux_stat(&stat, pid) else {
+                return ProcessObservation::Unknown;
+            };
+            observe_linux_threads(
+                &std::path::PathBuf::from(format!("/proc/{pid}")),
+                pid,
+                &boot,
+                leader,
+            )
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => ProcessObservation::Absent,
         Err(_) => ProcessObservation::Unknown,
     }
 }
 
 #[cfg(any(target_os = "linux", test))]
-fn linux_stat(stat: &str, pid: u32, boot: &str) -> ProcessObservation {
-    let Some((prefix, rest)) = stat.rsplit_once(") ") else {
-        return ProcessObservation::Unknown;
-    };
+#[derive(Clone, Copy)]
+struct LinuxTaskStat {
+    executing: bool,
+    threads: u32,
+    ticks: u64,
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn parse_linux_stat(stat: &str, pid: u32) -> Option<LinuxTaskStat> {
+    let (prefix, rest) = stat.rsplit_once(") ")?;
     if prefix.split_once(" (").and_then(|(pid, _)| decimal(pid)) != Some(u64::from(pid)) {
-        return ProcessObservation::Unknown;
+        return None;
     }
     let mut fields = rest.split_whitespace();
-    let state = fields.next();
-    let Some(ticks) = fields.nth(18).and_then(decimal) else {
+    let executing = match fields.next()? {
+        "Z" | "X" | "x" => false,
+        "R" | "S" | "D" | "T" | "t" | "K" | "W" | "P" | "I" => true,
+        _ => return None,
+    };
+    // After state (field 3), num_threads is field 20 and starttime is 22.
+    // A zero/malformed count cannot establish the death of the whole process.
+    let threads = u32::try_from(fields.nth(16).and_then(decimal)?).ok()?;
+    let ticks = fields.nth(1).and_then(decimal)?;
+    (threads > 0).then_some(LinuxTaskStat {
+        executing,
+        threads,
+        ticks,
+    })
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn linux_stat(stat: &str, pid: u32, boot: &str) -> ProcessObservation {
+    let Some(task) = parse_linux_stat(stat, pid) else {
         return ProcessObservation::Unknown;
     };
-    match state {
-        Some("Z" | "X" | "x") => ProcessObservation::Absent,
-        Some("R" | "S" | "D" | "T" | "t" | "K" | "W" | "P" | "I") => {
-            ProcessObservation::Present(ProcessIdentity {
-                boot_id: boot.into(),
-                start: ProcessStart::Linux { ticks },
-            })
-        }
-        _ => ProcessObservation::Unknown,
+    if task.executing {
+        ProcessObservation::Present(ProcessIdentity {
+            boot_id: boot.into(),
+            start: ProcessStart::Linux { ticks: task.ticks },
+        })
+    } else if task.threads == 1 {
+        ProcessObservation::Absent
+    } else {
+        // pthread_exit() can leave /proc/<pid>/stat in Z while other threads
+        // still execute. Never release a lease from the leader's state alone.
+        ProcessObservation::Unknown
     }
+}
+
+/// Task enumeration supplies POSITIVE liveness evidence only. An empty,
+/// inaccessible, changing or entirely terminal task inventory never proves
+/// absence. Keep the recorded group leader's birth identity, not a thread's.
+#[cfg(target_os = "linux")]
+fn observe_linux_threads(
+    process: &std::path::Path,
+    pid: u32,
+    boot: &str,
+    leader: LinuxTaskStat,
+) -> ProcessObservation {
+    const MAX_THREAD_OBSERVATIONS: usize = 4096;
+    let Ok(entries) = std::fs::read_dir(process.join("task")) else {
+        return ProcessObservation::Unknown;
+    };
+    for (index, entry) in entries.enumerate() {
+        if index >= MAX_THREAD_OBSERVATIONS {
+            return ProcessObservation::Unknown;
+        }
+        let Ok(entry) = entry else {
+            return ProcessObservation::Unknown;
+        };
+        let Some(tid) = entry
+            .file_name()
+            .to_str()
+            .and_then(decimal)
+            .and_then(|tid| u32::try_from(tid).ok())
+            .filter(|tid| *tid > 0 && i32::try_from(*tid).is_ok())
+        else {
+            return ProcessObservation::Unknown;
+        };
+        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+            return ProcessObservation::Unknown;
+        };
+        let Some(task) = parse_linux_stat(&stat, tid) else {
+            return ProcessObservation::Unknown;
+        };
+        if task.executing {
+            // The leader may have been reaped and this numeric PID reused
+            // while reading tasks. Such evidence cannot adopt the old lease.
+            let confirmed = std::fs::read_to_string(process.join("stat"))
+                .ok()
+                .and_then(|stat| parse_linux_stat(&stat, pid));
+            return if confirmed.is_some_and(|current| current.ticks == leader.ticks) {
+                ProcessObservation::Present(ProcessIdentity {
+                    boot_id: boot.into(),
+                    start: ProcessStart::Linux {
+                        ticks: leader.ticks,
+                    },
+                })
+            } else {
+                ProcessObservation::Unknown
+            };
+        }
+    }
+    ProcessObservation::Unknown
 }
 
 #[cfg(target_os = "macos")]
@@ -377,7 +466,7 @@ mod tests {
 
     #[test]
     fn proc_stat_handles_command_parentheses_and_refuses_wrong_pid_namespace() {
-        let stat = |state| format!("123 (rch (wrapper)) {state} {} 42", vec!["0"; 18].join(" "));
+        let stat = |state| linux_record(123, state, "1", 42);
         let expected = ProcessIdentity::from_record(&format!("{BOOT}:42")).unwrap();
         assert_eq!(
             expected.presence(&linux_stat(&stat("S"), 123, BOOT)),
@@ -399,6 +488,94 @@ mod tests {
         );
         assert_eq!(
             linux_stat("truncated", 123, BOOT),
+            ProcessObservation::Unknown
+        );
+    }
+
+    fn linux_record(pid: u32, state: &str, threads: &str, ticks: u64) -> String {
+        format!(
+            "{pid} (rch (wrapper)) {state} {} {threads} 0 {ticks}",
+            vec!["0"; 16].join(" ")
+        )
+    }
+
+    #[test]
+    fn a_terminal_leader_with_other_threads_is_not_an_absent_owner() {
+        for state in ["Z", "X", "x"] {
+            assert_eq!(
+                linux_stat(&linux_record(123, state, "2", 42), 123, BOOT),
+                ProcessObservation::Unknown
+            );
+        }
+        for threads in ["0", "-1", "invalid", "4294967296"] {
+            for state in ["Z", "S"] {
+                assert_eq!(
+                    linux_stat(&linux_record(123, state, threads, 42), 123, BOOT),
+                    ProcessObservation::Unknown
+                );
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn thread_fixture() -> (tempfile::TempDir, LinuxTaskStat) {
+        let directory = tempfile::tempdir().unwrap();
+        let stat = linux_record(123, "Z", "2", 42);
+        std::fs::write(directory.path().join("stat"), &stat).unwrap();
+        let leader = parse_linux_stat(&stat, 123).unwrap();
+        (directory, leader)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn write_task(process: &std::path::Path, tid: u32, state: &str) {
+        let directory = process.join("task").join(tid.to_string());
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("stat"), linux_record(tid, state, "2", 900)).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn surviving_thread_retains_the_group_leaders_birth_identity() {
+        let (directory, leader) = thread_fixture();
+        write_task(directory.path(), 456, "S");
+        let observed = observe_linux_threads(directory.path(), 123, BOOT, leader);
+        let expected = ProcessIdentity::from_record(&format!("{BOOT}:42")).unwrap();
+        assert_eq!(observed, ProcessObservation::Present(expected.clone()));
+        assert_eq!(expected.presence(&observed), OwnerPresence::Live);
+        assert_eq!(
+            observed_owner_presence(None, &observed),
+            OwnerPresence::Unknown
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn incomplete_and_dead_task_inventories_never_authorize_release() {
+        let (directory, leader) = thread_fixture();
+        let observe = || observe_linux_threads(directory.path(), 123, BOOT, leader);
+        assert_eq!(observe(), ProcessObservation::Unknown);
+        std::fs::create_dir(directory.path().join("task")).unwrap();
+        assert_eq!(observe(), ProcessObservation::Unknown);
+        write_task(directory.path(), 123, "Z");
+        assert_eq!(observe(), ProcessObservation::Unknown);
+        write_task(directory.path(), 456, "Z");
+        assert_eq!(observe(), ProcessObservation::Unknown);
+        std::fs::write(directory.path().join("task/456/stat"), "truncated").unwrap();
+        assert_eq!(observe(), ProcessObservation::Unknown);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_reused_leader_cannot_inherit_a_threads_liveness_evidence() {
+        let (directory, leader) = thread_fixture();
+        write_task(directory.path(), 456, "S");
+        std::fs::write(
+            directory.path().join("stat"),
+            linux_record(123, "S", "2", 43),
+        )
+        .unwrap();
+        assert_eq!(
+            observe_linux_threads(directory.path(), 123, BOOT, leader),
             ProcessObservation::Unknown
         );
     }
