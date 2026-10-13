@@ -12719,3 +12719,28 @@ async fn fast_passthrough_answers_only_what_process_hook_plainly_allows() {
     }
     assert!(!super::fast_passthrough_allows("{not json"));
 }
+
+#[test]
+fn only_the_daemon_restart_barrier_refusal_triggers_an_admission_wait() {
+    // bd-5pmwm: a refusal issued while a restart holds admission closed is
+    // re-queried after the barrier reopens; every other refusal keeps its
+    // normal handling.
+    let refusal = |reason: &str| SelectionResponse {
+        worker: None,
+        reason: SelectionReason::SelectionError(reason.into()),
+        build_id: None,
+        diagnostics: None,
+    };
+    assert!(is_restart_barrier_refusal(&refusal(
+        "restart_admission_barrier_active"
+    )));
+    assert!(!is_restart_barrier_refusal(&refusal(
+        "job_cancelled_before_start"
+    )));
+    assert!(!is_restart_barrier_refusal(&SelectionResponse {
+        worker: None,
+        reason: SelectionReason::AllWorkersBusy,
+        build_id: None,
+        diagnostics: None,
+    }));
+}

@@ -711,6 +711,15 @@ fn rustup_toolchain_from_command_tokens(tokens: &[String]) -> Option<String> {
     None
 }
 
+/// rchd's select-worker refusal while a restart holds admission closed.
+fn is_restart_barrier_refusal(response: &SelectionResponse) -> bool {
+    response.worker.is_none()
+        && matches!(
+            &response.reason,
+            SelectionReason::SelectionError(reason) if reason == "restart_admission_barrier_active"
+        )
+}
+
 /// Wait (bounded) while a daemon restart holds admission closed, keeping the
 /// durable lease's heartbeat fresh and telling the caller once why it waits.
 async fn await_restart_admission(
@@ -3787,6 +3796,43 @@ pub async fn run_exec(
     let mut current_query_preferred = preferred_workers.clone();
     let mut attempt: u32 = 1;
     let mut response = response;
+
+    // bd-5pmwm: the barrier can close after the pre-check, or while this build
+    // waits in the daemon's queue. Before any admission the same wrapper may
+    // simply ask again, as daemon recovery does, so wait for admission to
+    // reopen and re-query instead of failing (or building locally).
+    for _ in 0..3 {
+        if !is_restart_barrier_refusal(&response) {
+            break;
+        }
+        if await_restart_admission(&config.general.socket_path, &durable_lease, &reporter).await
+            == RestartAdmissionWait::StillClosed
+        {
+            break;
+        }
+        response = match query_daemon(
+            &config.general.socket_path,
+            &selection_project,
+            estimated_cores,
+            config.compilation.disk_headroom_gib,
+            &remote_command,
+            toolchain.as_ref(),
+            required_runtime,
+            command_priority,
+            0,
+            Some(std::process::id()),
+            Some(&wrapper_id),
+            wait_for_worker,
+            &preferred_workers,
+            classification.kind == Some(CompilationKind::Job),
+            &required_tools,
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(error) => return Err(selection_error_for_recovery(error, &durable_lease)?),
+        };
+    }
 
     loop {
         // Retry selection also preserves an explicit no-start cancellation.
