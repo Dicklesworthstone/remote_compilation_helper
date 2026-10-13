@@ -265,7 +265,7 @@ rch_scope_launch_child \"\$@\"" rch-scoped-child \
         "$rch_launch_nice" "$rch_launch_slice" "$rch_launch_manager" "$@" '"$__sl_input_redirect"' &'
     __sl_child=$!
     rch_scope_launch_close_input
-    __sl_child_start=; __sl_admitted=0; __sl_reason=setup
+    __sl_child_start=; __sl_admitted=0; __sl_admission_record=; __sl_reason=setup
     rch_scope_launch_clock || return 255
     __sl_setup_started=$rch_launch_now
     while :; do
@@ -292,6 +292,10 @@ rch_scope_launch_child \"\$@\"" rch-scoped-child \
                 __sl_started=$rch_launch_now
                 # Mark admitted before publication: an uncertain gate write
                 # cannot authorize the pre-payload group-only cleanup path.
+                # Keep the complete admitted binding in memory. Receipt loss or
+                # replacement must neither redirect cleanup nor erase our duty
+                # to stop this already-authorized workload.
+                __sl_admission_record=$rch_record
                 __sl_admitted=1
                 (umask 077; set -C; printf '%s\n' go > "$__sl_control/go") || {
                     __sl_reason=unknown; break;
@@ -311,20 +315,28 @@ rch_scope_launch_child \"\$@\"" rch-scoped-child \
         sleep 0.1 || { __sl_reason=unknown; break; }
     done
     __sl_cleanup=0
-    if [ "$__sl_admitted" = 0 ]; then
+    if [ "$__sl_admitted" = 1 ]; then
+        # Nothing after admission reloads the identity fields. The cancellation
+        # primitive revalidates their live process/scope authority before every
+        # signal and still requires the full post-kill emptiness proof.
+        rch_remote_cancel_loaded kill || __sl_cleanup=1
+        # A damaged durable record still forbids reporting confirmed completion.
+        # Read it ONLY in a subshell, after attempting owned cleanup: otherwise
+        # even a failed parse can replace the binding used for cancellation.
+        (rch_scope_launch_read_owned_record &&
+            [ "$rch_record" = "$__sl_admission_record" ]) || __sl_cleanup=1
+    else
         rch_scope_launch_stop_setup || __sl_cleanup=1
         # Wait before inspecting the receipt: publication cannot race recovery
         # once this setup child has stopped. No payload passed the private gate.
         if [ "$__sl_cleanup" = 0 ]; then wait "$__sl_child"; __sl_wait=$?; fi
-    fi
-    if [ -e "$__sl_record" ] || [ -L "$__sl_record" ]; then
-        if rch_scope_launch_read_owned_record; then
-            rch_remote_cancel_loaded kill || __sl_cleanup=1
-        else
-            __sl_cleanup=1
+        if [ -e "$__sl_record" ] || [ -L "$__sl_record" ]; then
+            if rch_scope_launch_read_owned_record; then
+                rch_remote_cancel_loaded kill || __sl_cleanup=1
+            else
+                __sl_cleanup=1
+            fi
         fi
-    elif [ "$__sl_admitted" = 1 ]; then
-        __sl_cleanup=1
     fi
     if [ "$__sl_cleanup" != 0 ]; then
         printf '%s\n' RCH_SCOPED_COMPLETION_UNCONFIRMED >&2

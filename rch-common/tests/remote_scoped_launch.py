@@ -225,6 +225,89 @@ def nest_transport(script: str, layers: int) -> str:
     return script
 
 
+def check_admitted_receipt_change(test, mutation: str, index: int) -> None:
+    """The original workload must stop, without trusting the replacement record.
+
+    Pause its whole private group, including the backup watchdog. This isolates
+    the outside supervisor's cleanup responsibility: a later parent-death timer
+    must not conceal a failed cancellation. V1 uses real process observations
+    and signals; the V2 cases retain the suite's explicit resource backend.
+    """
+    proc, job, record = test.start(str(600 + index), mode="hold", limit=0)
+    other, other_job, other_record = test.start(str(700 + index), mode="hold", limit=0)
+    test.wait_for(lambda: (job / "ready").exists() and (other_job / "ready").exists())
+    original = record.read_bytes()
+    other_original = other_record.read_bytes()
+    fields = original.decode().strip().split(":")
+    leader, birth = int(fields[3]), int(fields[4])
+
+    def stop_owned_group(pid, started):
+        # Only the exact private fixture group, never a receipt changed below.
+        if alive(pid, started):
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+    for bound in (fields, other_original.decode().strip().split(":")):
+        test.addCleanup(stop_owned_group, int(bound[3]), int(bound[4]))
+    test.assertTrue(alive(leader, birth))
+    os.killpg(leader, signal.SIGSTOP)
+    test.wait_for(lambda: (state := stat_process(leader)) is not None and state[0] == "T")
+    retained = record.with_suffix(".before")
+    record.rename(retained)
+    changed = list(fields)
+    if mutation == "missing":
+        pass
+    elif mutation == "symlink":
+        record.symlink_to(other_record)
+    else:
+        if mutation == "truncated":
+            replacement = original[:-1]
+        elif mutation == "foreign":
+            replacement = other_original
+        else:
+            if mutation == "build":
+                changed[1] = "another-build"
+            elif mutation == "birth":
+                changed[4] = str(birth + 1)
+            elif mutation == "boot":
+                changed[2] = "11111111-1111-1111-1111-111111111111"
+            elif mutation == "manager":
+                changed[6] = "system"
+            elif mutation == "invocation":
+                changed[7] = "abcdef0123456789abcdef0123456789"
+            elif mutation == "inode":
+                changed[10] = "1.999999"
+            elif mutation == "downgrade":
+                changed = ["RCH_REMOTE_PROCESS_V1", *fields[1:5]]
+            else:
+                raise AssertionError(f"unknown mutation {mutation}")
+            replacement = (":".join(changed) + "\n").encode()
+        record.write_bytes(replacement)
+        record.chmod(0o600)
+    proc.terminate()
+    test.finish(proc, job, 255)
+    test.assertIn(b"RCH_SCOPED_COMPLETION_UNCONFIRMED", (job / "stderr").read_bytes())
+    test.assertNotIn(b"IDENTITY_UNAVAILABLE", (job / "stderr").read_bytes())
+    test.assertEqual(retained.read_bytes(), original)
+    test.assertEqual(other_record.read_bytes(), other_original)
+    if mutation == "missing":
+        test.assertFalse(record.exists())
+    elif mutation == "symlink":
+        test.assertEqual(record.readlink(), other_record)
+    else:
+        test.assertEqual(record.read_bytes(), replacement)
+    # Both the unrelated leader and its actual writer must remain live.
+    test.assertIsNone(other.poll())
+    sibling_pid, sibling_birth = map(int, (other_job / "child").read_text().split(":"))
+    test.assertTrue(alive(sibling_pid, sibling_birth))
+    before = (other_job / "beats").stat().st_size
+    test.wait_for(lambda: (other_job / "beats").stat().st_size > before)
+    (other_job / "release").touch()
+    test.finish(other, other_job)
+
+
 class ScriptTransport(unittest.TestCase):
     def invoke(self, script, *args, **options):
         return subprocess.run([SHELL, "-c", script, "rch-observer", *args],
@@ -417,6 +500,16 @@ class ScopedLaunch(unittest.TestCase):
         self.wait_for(lambda: (job / "ready").exists())
         proc.terminate()
         self.finish(proc, job, 143)
+
+    def test_admitted_scope_cleanup_survives_receipt_loss_and_replacement(self) -> None:
+        for index, mutation in enumerate(("missing", "truncated", "foreign", "symlink", "build", "birth", "boot")):
+            with self.subTest(mutation=mutation):
+                check_admitted_receipt_change(self, mutation, index)
+
+    def test_admitted_scope_binding_cannot_change_or_downgrade(self) -> None:
+        for index, mutation in enumerate(("manager", "invocation", "inode", "downgrade")):
+            with self.subTest(mutation=mutation):
+                check_admitted_receipt_change(self, mutation, index)
 
     def test_concurrent_jobs_do_not_cancel_each_other(self) -> None:
         one, first, _ = self.start("41", mode="hold")
@@ -629,6 +722,11 @@ class ProcessGroupLaunch(unittest.TestCase):
         self.assertEqual((job / "stdout").read_bytes(), b"bytes-stdout:\x00\xff\n")
         proc.terminate()
         self.finish(proc, job, 143)
+
+    def test_admitted_group_cleanup_survives_receipt_loss_and_replacement(self):
+        for index, mutation in enumerate(("missing", "truncated", "foreign", "symlink", "build", "birth", "boot")):
+            with self.subTest(mutation=mutation):
+                check_admitted_receipt_change(self, mutation, index)
 
     def test_supervisor_sigkill_triggers_birth_fenced_in_group_watchdog(self):
         proc, job, record = self.start(mode="hold", limit=0)
