@@ -272,7 +272,21 @@ impl TimingHistory {
 
 /// Get the path to the timing history file.
 fn timing_history_path() -> Option<PathBuf> {
-    dirs::cache_dir().map(|dir| dir.join("rch").join("timing_history.json"))
+    // Tests record fake projects (`t18-*`). Written to the operator's real
+    // history they read as builds the speed gate learns from, and enough of
+    // them evict real projects from the 500-entry LRU (a full `rch` test run
+    // added 40 on mac-studio, 2026-10-13).
+    #[cfg(test)]
+    {
+        Some(std::env::temp_dir().join(format!(
+            "rch-test-timing-history-{}.json",
+            std::process::id()
+        )))
+    }
+    #[cfg(not(test))]
+    {
+        dirs::cache_dir().map(|dir| dir.join("rch").join("timing_history.json"))
+    }
 }
 
 /// Record a build timing to the history store.
