@@ -67,6 +67,9 @@ mod cargo_manifest;
 #[path = "retrieval_recovery.rs"]
 pub(crate) mod recovery;
 
+#[path = "source_namespace.rs"]
+mod source_namespace;
+
 /// Read the durable completion receipt after the execution SSH session exits.
 ///
 /// The read is idempotent (it only `cat`s an immutable, identity-bound file),
@@ -1281,68 +1284,47 @@ async fn execute_remote_compilation_inner(
     }
     let durable_sources =
         !worker_is_windows && !super::ssh::should_skip_remote_preflight(&worker_config);
-    // Initializing a shared alias changes the physical meaning of every path
-    // beneath it. Discover that need without mutation, then include both
-    // topology roots in the same saved grant before creating either path.
-    // Healthy topology needs no parent grant, so sibling builds stay parallel.
-    let initialize_topology = if durable_sources {
-        worker_projects_topology_requires_initialization(&worker_config, &remote_topology_policy)
+    // Translation bases are metadata, not build-lifetime source authority.
+    // Initialize under the registry mutex before any job intent or pair/source
+    // lock exists. Its bounded wait must not block exact-owner recovery.
+    if durable_sources {
+        durable_lease.context(
+            "remote source ownership requires an admitted durable job lease; use rch exec",
+        )?;
+        if worker_projects_topology_requires_initialization(&worker_config, &remote_topology_policy)
             .await?
-    } else {
-        false
-    };
-    let mut mutable_source_authority_roots: Vec<String> = sync_plan
-        .iter()
-        .map(|entry| entry.remote_root.clone())
-        .collect();
-    if initialize_topology {
-        for root in [
-            remote_topology_policy.canonical_root(),
-            remote_topology_policy.alias_root(),
-        ] {
-            mutable_source_authority_roots.push(
-                root.to_str()
-                    .context("worker topology root is not a UTF-8 path")?
-                    .to_owned(),
-            );
+        {
+            reporter.verbose("[RCH] initializing shared path translation without claiming its bases");
         }
+        // Confirm the durable postcondition even when both paths already
+        // exist: a prior initializer may have lost its final acknowledgment.
+        source_namespace::initialize_worker_namespace(
+            &worker_config,
+            &remote_topology_policy,
+            &recovery_identity,
+        )
+        .await?;
     }
-    if source_pair_pool.is_some()
-        && let Some(root) = overlay_remote_root.as_ref()
-    {
-        // Include the complete pair in the durable claim. Its already-owned
-        // kernel lock is omitted by the source grant using the live pair guard.
-        mutable_source_authority_roots.push(root.clone());
-    }
-    // Retirement and freshness metadata are outside the reusable source tree.
-    // Their exact siblings belong to this same saved grant before any write.
-    if let Some(root) = retained_source_root.as_ref() {
-        mutable_source_authority_roots.push(root.clone());
-    }
-    if let Some(root) = source_freshness_control.as_ref() {
-        mutable_source_authority_roots.push(root.clone());
-    }
-    if let Some(primary) = sync_plan.iter().find(|entry| entry.is_primary) {
-        mutable_source_authority_roots.push(pooled_target_dir_override.clone().unwrap_or_else(
-            || {
-                format!(
-                    "{}/{}",
-                    primary.remote_root,
-                    remote_cargo_target_dir_name_override
-                        .as_deref()
-                        .unwrap_or(".rch-target")
-                )
-            },
-        ));
-    }
-    // Record and lock the canonical spelling: a trailing-slash project path
-    // used to reach the lease verbatim and was then unlockable and
-    // unrecoverable (bd-4d1hs).
-    for root in &mut mutable_source_authority_roots {
-        *root = super::ssh::canonical_source_authority_root(root);
-    }
-    mutable_source_authority_roots.sort();
-    mutable_source_authority_roots.dedup();
+    let source_target_root = sync_plan.iter().find(|entry| entry.is_primary).map(|primary| {
+        pooled_target_dir_override.clone().unwrap_or_else(|| {
+            format!(
+                "{}/{}",
+                primary.remote_root,
+                remote_cargo_target_dir_name_override
+                    .as_deref()
+                    .unwrap_or(".rch-target")
+            )
+        })
+    });
+    // Keep the complete dependency closure, any already-locked pair container,
+    // retirement/freshness siblings and target pool in the same immutable grant.
+    let mut mutable_source_authority_roots = source_namespace::build_source_roots(
+        &sync_plan,
+        source_pair_pool.as_ref().and(overlay_remote_root.as_deref()),
+        retained_source_root.as_deref(),
+        source_freshness_control.as_deref(),
+        source_target_root.as_deref(),
+    );
     if worker_is_windows {
         mutable_source_authority_roots.clear();
     }
@@ -1415,7 +1397,7 @@ async fn execute_remote_compilation_inner(
         &remote_topology_policy,
         &ownership_scan_roots,
         source_identity,
-        initialize_topology,
+        false, // Namespace creation is separate; a raced disappearance must refuse.
     )
     .await?;
     // Hold source and output authorities through retrieval, not only execution.
