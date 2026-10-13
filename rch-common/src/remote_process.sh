@@ -260,7 +260,20 @@ rch_remote_cancel_loaded() {
     rch_term_sent=0
     rch_mode=$1
     rch_group_state
-    case $? in 0) return 0;; 1) ;; *) return 44;; esac
+    case $? in
+        0) return 0;;
+        1) ;;
+        2)
+            # A failed/incomplete process census cannot authorize POSIX
+            # signals, but must not strand a separately authenticated scope.
+            # Skip graceful group signalling and attempt only cgroup.kill:
+            # rch_signal_group revalidates the full V2 binding and pins its
+            # inode before writing. Unknown/reused scope authority still
+            # refuses, and the post-kill census below remains mandatory.
+            [ "${rch_scope_bound:-0}" = 1 ] || return 44
+            rch_mode=kill;;
+        *) return 44;;
+    esac
     if [ "$rch_mode" = term ]; then
         if [ "${rch_scope_bound:-0}" != 1 ]; then
             rch_capture_group_witnesses || return $?
@@ -269,7 +282,14 @@ rch_remote_cancel_loaded() {
         rch_term_sent=1
         sleep 1 || return 44
         rch_group_state
-        case $? in 0) return 0;; 1) ;; *) return 44;; esac
+        case $? in
+            0) return 0;;
+            1) ;;
+            # Losing the census after TERM must not suppress authenticated
+            # scoped escalation either. V1 still needs its live witnesses.
+            2) [ "${rch_scope_bound:-0}" = 1 ] || return 44;;
+            *) return 44;;
+        esac
     fi
     rch_signal_group KILL || return $?
     rch_attempt=0

@@ -193,6 +193,108 @@ rch_read_record "$1" 42 || exit $?
         self.assertEqual(result.returncode, 44, result.stderr)
         self.assertEqual((self.scope["directory"] / "cgroup.kill").read_text(), "")
 
+    def test_failed_census_still_stops_authenticated_scope_then_rechecks_both_views(self) -> None:
+        kill = self.scope["directory"] / "cgroup.kill"
+        events = self.scope["directory"] / "cgroup.events"
+        self.env.update(RCH_SCOPE_TEST_KILL=str(kill), RCH_SCOPE_TEST_EVENTS=str(events))
+        # Fault only the process census before kill. Afterwards use real ps,
+        # and let the cgroupfs double report the simulated kernel's empty tree.
+        self.executable("ps", r'''
+if [ ! -s "$RCH_SCOPE_TEST_KILL" ]; then
+    case "$RCH_SCOPE_TEST_CENSUS_FAULT" in
+        failed) exit 1;;
+        malformed) printf 'incomplete census\n'; exit 0;;
+    esac
+fi
+printf 'populated 0\nfrozen 0\n' > "$RCH_SCOPE_TEST_EVENTS"
+exec /usr/bin/ps "$@"
+''')
+        receipt = self.scope["record"].read_bytes()
+        for fault in ("failed", "malformed"):
+            self.env["RCH_SCOPE_TEST_CENSUS_FAULT"] = fault
+            for mode in ("kill", "term"):
+                with self.subTest(fault=fault, mode=mode):
+                    kill.write_text("")
+                    events.write_text("populated 1\nfrozen 0\n")
+                    result = self.run_shell('rch_remote_cancel "$1" 42 "$2"', self.scope["record"], mode)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(kill.read_text(), "1\n")
+                    self.assertEqual(self.scope["record"].read_bytes(), receipt)
+
+    def test_persistent_failed_census_stops_scope_without_claiming_completion(self) -> None:
+        self.executable("ps", "exit 1\n")
+        kill = self.scope["directory"] / "cgroup.kill"
+        for populated in (0, 1):
+            (self.scope["directory"] / "cgroup.events").write_text(f"populated {populated}\n")
+            for mode in ("kill", "term"):
+                with self.subTest(populated=populated, mode=mode):
+                    kill.write_text("")
+                    result = self.run_shell('rch_remote_cancel "$1" 42 "$2"', self.scope["record"], mode)
+                    self.assertEqual(result.returncode, 44, result.stderr)
+                    self.assertEqual(kill.read_text(), "1\n", "unknown census must not suppress scoped stop")
+
+    def test_failed_census_does_not_borrow_foreign_or_unavailable_scope_authority(self) -> None:
+        self.executable("ps", "exit 1\n")
+        snapshot = self.scope["snapshot"]
+        original_snapshot = snapshot.read_text()
+        snapshot.write_text(original_snapshot.replace(INVOCATION, "f" * 32))
+        result = self.run_shell('rch_remote_cancel "$1" 42 kill', self.scope["record"])
+        self.assertEqual(result.returncode, 43, result.stderr)
+        self.assertEqual((self.scope["directory"] / "cgroup.kill").read_text(), "")
+        snapshot.write_text(original_snapshot)
+        original = self.scope["record"].read_text()
+        # A changed boot also contradicts the unit name encoded in the same
+        # receipt, so it is rejected during parsing, before scope observation.
+        for index, value, expected in ((2, "00000000-0000-0000-0000-000000000000", 42),
+                                       (8, "1", 43), (9, "1.1", 43), (10, "1.1", 43)):
+            with self.subTest(field=index):
+                fields = list(self.scope["fields"])
+                fields[index] = value
+                self.scope["record"].write_text(":".join(fields) + "\n")
+                result = self.run_shell('rch_remote_cancel "$1" 42 kill', self.scope["record"])
+                self.assertEqual(result.returncode, expected, result.stderr)
+                self.assertEqual((self.scope["directory"] / "cgroup.kill").read_text(), "")
+        self.scope["record"].write_text(original)
+        (self.root / "manager-down").touch()
+        result = self.run_shell('rch_remote_cancel "$1" 42 kill', self.scope["record"])
+        self.assertEqual(result.returncode, 44, result.stderr)
+        self.assertEqual((self.scope["directory"] / "cgroup.kill").read_text(), "")
+
+    def test_failed_census_never_authorizes_legacy_group_signals(self) -> None:
+        self.executable("ps", "exit 1\n")
+        legacy = self.root / "legacy.pgid"
+        legacy.write_text(f"RCH_REMOTE_PROCESS_V1:42:{BOOT}:{self.pgid}:1\n")
+        signal_log = self.root / "unexpected-signal"
+        for mode in ("kill", "term"):
+            result = self.run_shell(r'''
+kill() { printf '%s\n' "$*" >> "$RCH_SCOPE_TEST_ROOT/unexpected-signal"; return 0; }
+rch_remote_cancel "$1" 42 "$2"
+''', legacy, mode)
+            self.assertEqual(result.returncode, 44, result.stderr)
+            self.assertFalse(signal_log.exists())
+            self.assertEqual((self.scope["directory"] / "cgroup.kill").read_text(), "")
+
+    def test_census_failure_after_graceful_term_cannot_prevent_scoped_escalation(self) -> None:
+        kill = self.scope["directory"] / "cgroup.kill"
+        events = self.scope["directory"] / "cgroup.events"
+        self.env.update(RCH_SCOPE_TEST_KILL=str(kill), RCH_SCOPE_TEST_EVENTS=str(events))
+        self.executable("ps", r'''
+count_file="$RCH_SCOPE_TEST_ROOT/census-count"
+count=0
+if [ -f "$count_file" ]; then read -r count < "$count_file"; fi
+count=$((count + 1))
+printf '%s\n' "$count" > "$count_file"
+[ "$count" != 2 ] || exit 1
+if [ -s "$RCH_SCOPE_TEST_KILL" ]; then
+    printf 'populated 0\nfrozen 0\n' > "$RCH_SCOPE_TEST_EVENTS"
+fi
+exec /usr/bin/ps "$@"
+''')
+        result = self.run_shell('rch_remote_cancel "$1" 42 term', self.scope["record"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(kill.read_text(), "1\n")
+        self.assertGreaterEqual(int((self.root / "census-count").read_text()), 3)
+
     def test_changed_boot_uid_namespace_mount_and_inode_refuse(self) -> None:
         original = list(self.scope["fields"])
         for index, value in ((2, "00000000-0000-0000-0000-000000000000"),
