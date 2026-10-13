@@ -173,33 +173,75 @@ pub fn observe_process(pid: u32) -> ProcessObservation {
     // matching numeric entry nor ENOENT there describes our signal namespace.
     // In particular, never release ownership because a live wrapper's PID is
     // absent from a foreign procfs view.
-    if !std::fs::read_to_string("/proc/self/stat").is_ok_and(|stat| {
-        stat.split_once(" (").and_then(|(pid, _)| decimal(pid))
-            == Some(u64::from(std::process::id()))
-    }) {
+    let namespace_matches = match (
+        std::fs::read_to_string("/proc/self/stat"),
+        std::fs::read_to_string("/proc/self/status"),
+    ) {
+        (Ok(stat), Ok(status)) => linux_namespace_matches(std::process::id(), &stat, &status),
+        _ => false,
+    };
+    if !namespace_matches {
         return ProcessObservation::Unknown;
     }
     let Some(boot) = boot_identity() else {
         return ProcessObservation::Unknown;
     };
-    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+    observe_linux_process(&std::path::PathBuf::from(format!("/proc/{pid}")), pid, &boot)
+}
+
+#[cfg(target_os = "linux")]
+fn observe_linux_process(process: &std::path::Path, pid: u32, boot: &str) -> ProcessObservation {
+    match std::fs::read_to_string(process.join("stat")) {
         Ok(stat) => {
-            let observed = linux_stat(&stat, pid, &boot);
+            let observed = linux_stat(&stat, pid, boot);
             if observed != ProcessObservation::Unknown {
                 return observed;
             }
             let Some(leader) = parse_linux_stat(&stat, pid) else {
                 return ProcessObservation::Unknown;
             };
-            observe_linux_threads(
-                &std::path::PathBuf::from(format!("/proc/{pid}")),
-                pid,
-                &boot,
-                leader,
-            )
+            observe_linux_threads(process, pid, boot, leader)
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => ProcessObservation::Absent,
+        // hidepid and restricted procfs views can hide a LIVE process. Only
+        // a signal-free kernel ESRCH confirms absence after a missing entry.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => kernel_absence(pid),
         Err(_) => ProcessObservation::Unknown,
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn linux_namespace_matches(pid: u32, stat: &str, status: &str) -> bool {
+    if parse_linux_stat(stat, pid).is_none() {
+        return false;
+    }
+    // The numeric PID can coincide in a parent-mounted procfs. NSpid lists
+    // the namespace hierarchy, so equality of the first number is insufficient.
+    // Missing, duplicate, malformed or multi-level evidence fails closed.
+    let mut records = status.lines().filter_map(|line| line.strip_prefix("NSpid:"));
+    let Some(record) = records.next() else {
+        return false;
+    };
+    if records.next().is_some() {
+        return false;
+    }
+    let mut ids = record.split_whitespace();
+    ids.next().and_then(decimal) == Some(u64::from(pid)) && ids.next().is_none()
+}
+
+/// A successful permission probe says nothing about birth identity; it cannot
+/// adopt a live PID. Only ESRCH independently establishes process absence.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn kernel_absence(pid: u32) -> ProcessObservation {
+    let Some(pid) = i32::try_from(pid)
+        .ok()
+        .filter(|pid| *pid > 1)
+        .and_then(rustix::process::Pid::from_raw)
+    else {
+        return ProcessObservation::Unknown;
+    };
+    match rustix::process::test_kill_process(pid) {
+        Err(rustix::io::Errno::SRCH) => ProcessObservation::Absent,
+        _ => ProcessObservation::Unknown,
     }
 }
 
@@ -330,12 +372,7 @@ pub fn observe_process(pid: u32) -> ProcessObservation {
         Err(_) => {
             // libproc's error is textual. Do not infer ESRCH from text or a
             // stale errno: perform a safe, signal-free kernel existence probe.
-            match rustix::process::test_kill_process(
-                rustix::process::Pid::from_raw(pid as i32).expect("validated positive PID"),
-            ) {
-                Err(rustix::io::Errno::SRCH) => ProcessObservation::Absent,
-                _ => ProcessObservation::Unknown,
-            }
+            kernel_absence(pid)
         }
     }
 }
@@ -497,6 +534,70 @@ mod tests {
             "{pid} (rch (wrapper)) {state} {} {threads} 0 {ticks}",
             vec!["0"; 16].join(" ")
         )
+    }
+
+    #[test]
+    fn namespace_validation_rejects_coincident_and_ambiguous_ids() {
+        let stat = linux_record(123, "S", "1", 42);
+        assert!(linux_namespace_matches(
+            123,
+            &stat,
+            "Name:\trch\nNSpid:\t123\n"
+        ));
+        for status in [
+            "NSpid:\t123\t123\n",
+            "NSpid:\t123\t7\n",
+            "NSpid:\t999\t123\n",
+            "NSpid:\t999\n",
+            "NSpid:\t123\nNSpid:\t123\n",
+            "NSpid:\n",
+            "NSpid:\t+123\n",
+            "NSpid:\t123 invalid\n",
+            "Name:\trch\n",
+            "",
+        ] {
+            assert!(!linux_namespace_matches(123, &stat, status), "{status:?}");
+        }
+        assert!(!linux_namespace_matches(456, &stat, "NSpid:\t456\n"));
+        assert!(!linux_namespace_matches(123, "truncated", "NSpid:\t123\n"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_missing_proc_entry_cannot_release_a_live_owner() {
+        let hidden = tempfile::tempdir().unwrap();
+        let pid = std::process::id();
+        let expected = current_process_identity().expect("native observer identity");
+        // Model a restricted procfs VIEW, not the kernel. The signal-free
+        // probe still observes this actual live process and must veto release.
+        let observed = observe_linux_process(hidden.path(), pid, &expected.boot_id);
+        assert_eq!(observed, ProcessObservation::Unknown);
+        assert_eq!(expected.presence(&observed), OwnerPresence::Unknown);
+        assert_eq!(
+            observed_owner_presence(None, &observed),
+            OwnerPresence::Unknown
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn signal_free_probe_never_supplies_a_live_birth_identity() {
+        assert_eq!(
+            kernel_absence(std::process::id()),
+            ProcessObservation::Unknown
+        );
+        for invalid in [0, 1, u32::MAX] {
+            assert_eq!(kernel_absence(invalid), ProcessObservation::Unknown);
+        }
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("20")
+            .spawn()
+            .unwrap();
+        let observed = kernel_absence(child.id());
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_eq!(observed, ProcessObservation::Unknown);
+        assert_eq!(kernel_absence(child.id()), ProcessObservation::Absent);
     }
 
     #[test]
