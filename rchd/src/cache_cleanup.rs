@@ -164,6 +164,8 @@ rch_cleanup_source_candidate_begin() {
             printf 'RCH_CLEANUP_RETENTION_HOLD dir=%s\n' "$1" >&2
             return 1
         fi
+        # Removed by someone else while this sweep waited for the registry lock.
+        if [ "$rch_source_admission_status" -eq 4 ]; then return 1; fi
         printf 'RCH_CLEANUP_SOURCE_OWNERSHIP_UNAVAILABLE dir=%s\n' "$1" >&2
         return 2
     fi

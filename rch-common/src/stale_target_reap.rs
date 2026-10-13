@@ -372,14 +372,18 @@ fn reap_loop_body_with_source_gate(
     )
 }
 
-/// Known ownership/retention holds skip one candidate. Unknown retention must
-/// stop the supervisor before it can emit successful sweep metrics.
+/// Known ownership/retention holds skip one candidate, and so does a candidate
+/// that vanished while the sweep waited for the registry lock (several
+/// dispatchers sweep the same worker; one removing a dir used to abort the
+/// other's whole sweep, pressure pass included). Unknown retention must stop
+/// the supervisor before it can emit successful sweep metrics.
 fn checked_source_admission(trigger_argument: &str) -> String {
     format!(
         "if __gc_source_begin \"$d\"; then d=$__gc_candidate; else \
            __gc_admission_status=$?; \
            case \"$__gc_admission_status\" in \
              1|3) printf 'RCH_GC_SKIP %s source-ownership %s\\n' {trigger_argument} \"$d\"; continue;; \
+             4) continue;; \
              *) printf 'RCH_GC_ADMISSION_UNKNOWN %s\\n' \"$d\" >&2; exit 1;; \
            esac; \
          fi; "
@@ -417,7 +421,8 @@ fn checked_source_recent_activity(
 /// A caller must check end after every successful begin, before leaving the
 /// candidate interval. Returning this fragment alone acquires no ownership.
 /// Begin returns 0 with ownership held, 1 for a verified ownership hold, 2 for
-/// unknown setup/publication/inspection, and 3 for a known retention hold.
+/// unknown setup/publication/inspection, 3 for a known retention hold, and 4
+/// when the candidate no longer exists.
 pub fn source_claim_gc_guard_fragment() -> String {
     source_claim_gate_fragment(SOURCE_CLAIM_REGISTRY)
 }
@@ -531,7 +536,16 @@ __gc_source_begin() {
     [ ! -L "$__gc_source_registry/metadata.lock" ] || return 2;
     exec 8>"$__gc_source_registry/metadata.lock" || return 2;
     if ! flock -x 8; then __gc_source_end; return 2; fi;
-    if [ ! -d "$1" ] || [ -L "$1" ]; then __gc_source_end; return 2; fi;
+    if [ -L "$1" ]; then __gc_source_end; return 2; fi;
+    if [ ! -e "$1" ]; then
+        # Gone while this sweep waited for the registry lock: another
+        # dispatcher's sweep, or the owning build's own teardown, removed it.
+        # Nothing is left to collect, and nothing about it is unknown.
+        printf 'RCH_GC_VANISHED %s\n' "$1" >&2;
+        if ! __gc_source_end; then return 2; fi;
+        return 4;
+    fi;
+    if [ ! -d "$1" ]; then __gc_source_end; return 2; fi;
     if __gc_source_records_free "$1"; then :; else
         __gc_records_status=$?;
         if ! __gc_source_end; then return 2; fi;
@@ -3271,6 +3285,130 @@ mod tests {
         let record = registry.join(format!("{token}.{digest}.{extension}"));
         std::fs::rename(pending, &record).unwrap();
         record
+    }
+
+    /// A candidate that disappears while the sweep waits for the registry
+    /// lock is skipped, not "unknown": with several dispatchers sweeping one
+    /// worker, one removing a dir aborted the other's whole sweep.
+    #[cfg(unix)]
+    #[test]
+    fn gc_admission_reports_a_vanished_candidate_as_gone_not_unknown() {
+        let flock = std::process::Command::new("sh")
+            .args(["-c", "command -v flock >/dev/null"])
+            .status()
+            .is_ok_and(|status| status.success());
+        if !flock {
+            return; // no flock here; the registry gate cannot run at all
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let registry = tmp.path().join("claims");
+        let gone = tmp.path().join("projects/repo/.rch-target-w-job-gone");
+        std::fs::create_dir_all(gone.parent().unwrap()).unwrap();
+        let link = tmp.path().join("projects/repo/.rch-target-w-job-link");
+        std::os::unix::fs::symlink(tmp.path(), &link).unwrap();
+        let script = format!(
+            "{}\nset -u; expected=$2;\n{}",
+            source_claim_gc_guard_fragment_with_registry(registry.to_str().unwrap()),
+            r#"
+if __gc_source_begin "$1"; then exit 10; else status=$?; fi;
+[ "$status" -eq "$expected" ] || exit "$((20 + status))";
+[ -z "$__gc_reservation" ] || exit 12;
+for record in "$__gc_source_registry"/*.claim "$__gc_source_registry"/*.pending; do
+    if [ -e "$record" ] || [ -L "$record" ]; then exit 13; fi;
+done;
+flock -n "$__gc_source_registry/metadata.lock" true || exit 14;
+"#
+        );
+        for (candidate, expected) in [(&gone, "4"), (&link, "2")] {
+            let output = std::process::Command::new("sh")
+                .args(["-c", &script, "source-gc-vanished"])
+                .arg(candidate)
+                .arg(expected)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{candidate:?}: {output:?}");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(
+                expected == "4",
+                stderr.contains("RCH_GC_VANISHED"),
+                "{stderr}"
+            );
+        }
+        // The sweep loop skips status 4 instead of aborting.
+        let admission = checked_source_admission("ttl");
+        assert!(admission.contains("4) continue;;"));
+        assert!(admission.find("4) continue;;") < admission.find("RCH_GC_ADMISSION_UNKNOWN"));
+    }
+
+    /// The race itself: the registry lock is held while the sweep starts, the
+    /// first candidate is removed, and the lock is released. The sweep must
+    /// finish and still reap the second candidate. (On a host too slow to
+    /// reach admission in time the loop's own `-d` check skips the dir; the
+    /// test then passes without exercising the race.)
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn worker_sweep_survives_a_candidate_removed_while_it_waits_for_the_registry() {
+        use std::process::{Command, Stdio};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("projects");
+        let private_tmp = tmp.path().join("tmp");
+        std::fs::create_dir_all(&private_tmp).unwrap();
+        let registry = tmp.path().join("claims");
+        std::fs::create_dir_all(&registry).unwrap();
+        let first = base.join("a").join(".rch-target-w-job-1-1-0");
+        let second = base.join("b").join(".rch-target-w-job-2-2-0");
+        for dir in [&first, &second] {
+            source_gc_fixture_dir(dir);
+        }
+        let lock = registry.join("metadata.lock");
+        let ready = tmp.path().join("holder-ready");
+        let release = tmp.path().join("holder-release");
+        let mut holder = Command::new("flock")
+            .arg("-x")
+            .arg(&lock)
+            .args([
+                "sh",
+                "-c",
+                "touch \"$1\"; while [ ! -e \"$2\" ]; do sleep 0.05; done",
+                "holder",
+            ])
+            .arg(&ready)
+            .arg(&release)
+            .spawn()
+            .unwrap();
+        while !ready.exists() {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let sweep = Command::new("sh")
+            .arg("-c")
+            .arg(worker_sweep_command_with_registry(
+                base.to_str().unwrap(),
+                60,
+                None,
+                None,
+                registry.to_str().unwrap(),
+            ))
+            .env("TMPDIR", &private_tmp)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        std::fs::remove_dir_all(&first).unwrap();
+        std::fs::write(&release, b"").unwrap();
+        let output = sweep.wait_with_output().unwrap();
+        holder.wait().unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "stdout: {stdout}\nstderr: {stderr}"
+        );
+        assert!(!stderr.contains("RCH_GC_ADMISSION_UNKNOWN"), "{stderr}");
+        assert!(!second.exists(), "the later candidate must still be reaped");
+        let (removed, _) = parse_worker_reap_metrics(&stdout).unwrap();
+        assert_eq!(removed, 1, "stdout: {stdout}\nstderr: {stderr}");
     }
 
     #[cfg(target_os = "linux")]
