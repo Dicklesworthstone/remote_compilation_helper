@@ -23,7 +23,9 @@
 //! to local exec. After acceptance, the daemon may own output writes:
 //! uncertain delivery fails closed. Local exec resumes only after a
 //! complete, typed reply on the install connection explicitly
-//! confirms that the install writer has returned.
+//! confirms that the install writer has returned. A lost original caller
+//! is cancellation, not a cache failure: it never authorizes local fallback,
+//! a new compiler attempt, or acceptance of a cache installation.
 
 mod capture;
 mod singleflight;
@@ -34,7 +36,9 @@ use rabs_protocol::wrapper_breaker::{
     encode_state, on_outcome,
 };
 use std::ffi::{OsStr, OsString};
-use std::io::{self, BufRead, BufReader, Read, Write};
+#[cfg(test)]
+use std::io::BufRead;
+use std::io::{self, BufReader, Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
@@ -470,10 +474,12 @@ impl Write for ConsultStream {
     }
 }
 
+#[cfg(test)]
 fn read_reply(reader: &mut BufReader<ConsultStream>) -> io::Result<String> {
     read_reply_bounded(reader, MAX_REPLY_BYTES)
 }
 
+#[cfg(test)]
 fn read_reply_bounded(reader: &mut BufReader<ConsultStream>, max_bytes: u64) -> io::Result<String> {
     // Check even when BufReader already has bytes: a pipelined reply
     // cannot make an expired attempt healthy without another socket read.
@@ -537,7 +543,7 @@ enum Live {
         attempt: String,
         env: Vec<(String, String)>,
     },
-    /// An accepted hit whose install outcome is unknown: fail the compile.
+    /// An accepted hit with an unknown outcome, or a cancelled caller.
     FailClosed(String),
 }
 
@@ -547,6 +553,20 @@ fn live_decision_timeout_ms(breaker_budget_ms: u32) -> u32 {
         .and_then(|value| value.parse().ok())
         .unwrap_or(LIVE_DECISION_TIMEOUT_MS)
         .max(breaker_budget_ms)
+}
+
+/// Unsupported supervision keeps its existing pass-through behavior. Once a
+/// caller was captured, however, losing that exact birth identity is terminal.
+/// Never recapture a reparented wrapper as a new, apparently healthy request.
+fn caller_still_owned(owner: Option<supervision::Owner>) -> bool {
+    owner.is_none_or(supervision::Owner::can_acknowledge_capture)
+}
+
+fn stop_if_caller_lost(owner: Option<supervision::Owner>) {
+    if !caller_still_owned(owner) {
+        eprintln!("rabs-wrap: original compiler caller disappeared; refusing further work");
+        std::process::exit(1);
+    }
 }
 
 /// The full live request, or `None` when it cannot be represented
@@ -574,7 +594,11 @@ fn live_request_frame(args: &[String], cwd: &str) -> Option<String> {
 fn live_outcome(
     reply: &reply_json::Value,
     mut reader: BufReader<ConsultStream>,
+    owned: &impl Fn() -> bool,
 ) -> Result<Live, ()> {
+    if !owned() {
+        return Ok(Live::FailClosed("original compiler caller disappeared".into()));
+    }
     match reply.get("decision").and_then(reply_json::Value::as_str) {
         Some("pass-through") => Ok(Live::PassThrough),
         Some("execute") => {
@@ -612,17 +636,22 @@ fn live_outcome(
             // so this process must not run the compiler unless a complete,
             // typed answer confirms that the install writer returned. Losing
             // a connection does not prove that its daemon or writer died.
-            reader.get_mut().deadline = Instant::now() + install_wait();
-            if reader
-                .get_mut()
-                .write_all(b"{\"kind\":\"rustc-accept\"}\n")
-                .is_err()
+            let Some(deadline) = Instant::now().checked_add(install_wait()) else {
+                return Ok(Live::FailClosed("RABS install deadline is not representable".into()));
+            };
+            if singleflight::write_owned(
+                &mut reader,
+                b"{\"kind\":\"rustc-accept\"}\n",
+                deadline,
+                owned,
+            )
+            .is_err()
             {
                 return Ok(Live::FailClosed(
                     "the RABS cache-hit acceptance could not be confirmed".into(),
                 ));
             }
-            match read_reply_bounded(&mut reader, MAX_LIVE_REPLY_BYTES) {
+            match singleflight::read_owned_reply(&mut reader, MAX_LIVE_REPLY_BYTES, deadline, owned) {
                 Ok(line) => Ok(accepted_install_reply(&line)),
                 // A socket read timeout surfaces as WouldBlock (EAGAIN) on
                 // Linux and TimedOut elsewhere; both mean "still alive, no
@@ -638,9 +667,9 @@ fn live_outcome(
                             .into(),
                     ))
                 }
-                // EOF/reset, invalid UTF-8, oversized or truncated frames
-                // are all uncertain delivery. A daemon's independently owned
-                // writer may still be running after its connection closes.
+                // Caller loss, EOF/reset, invalid UTF-8, oversized or truncated
+                // frames all fail closed. Closing our connection does not stop
+                // an independently owned daemon writer or authorize fallback.
                 Err(error) => Ok(Live::FailClosed(format!(
                     "the RABS cache-hit install outcome is unknown: {error}"
                 ))),
@@ -695,7 +724,11 @@ fn consult(
     connect_timeout_ms: u32,
     decision_timeout_ms: u32,
     args: &[String],
+    owned: &impl Fn() -> bool,
 ) -> Result<Live, ()> {
+    if !owned() {
+        return Err(());
+    }
     // std UDS has no connect timeout: connect on a helper thread and
     // bound the wait. A short-lived process reaps stragglers at exit.
     let (sender, receiver) = std::sync::mpsc::channel();
@@ -705,10 +738,23 @@ fn consult(
             let _ = sender.send(UnixStream::connect(socket_owned));
         })
         .map_err(|_| ())?;
-    let stream = receiver
-        .recv_timeout(Duration::from_millis(u64::from(connect_timeout_ms)))
-        .map_err(|_| ())?
-        .map_err(|_| ())?;
+    let connect_deadline = Instant::now()
+        .checked_add(Duration::from_millis(u64::from(connect_timeout_ms)))
+        .ok_or(())?;
+    let stream = loop {
+        if !owned() {
+            return Err(());
+        }
+        let remaining = connect_deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or(())?;
+        match receiver.recv_timeout(remaining.min(Duration::from_millis(100))) {
+            Ok(Ok(stream)) => break stream,
+            Ok(Err(_)) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Err(()),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    };
     let cwd = std::env::current_dir()
         .map_err(|_| ())?
         .into_os_string()
@@ -724,12 +770,10 @@ fn consult(
     let deadline = Instant::now().checked_add(budget).ok_or(())?;
     let mut reader = BufReader::new(ConsultStream { stream, deadline });
 
-    reader
-        .get_mut()
-        .write_all(HELLO.as_bytes())
+    singleflight::write_owned(&mut reader, HELLO.as_bytes(), deadline, owned).map_err(|_| ())?;
+    singleflight::write_owned(&mut reader, b"\n", deadline, owned).map_err(|_| ())?;
+    let line = singleflight::read_owned_reply(&mut reader, MAX_REPLY_BYTES, deadline, owned)
         .map_err(|_| ())?;
-    reader.get_mut().write_all(b"\n").map_err(|_| ())?;
-    let line = read_reply(&mut reader).map_err(|_| ())?;
     if !line.contains("hello-ok") {
         return Err(());
     }
@@ -754,12 +798,9 @@ fn consult(
             )
         }
     };
-    reader
-        .get_mut()
-        .write_all(frame.as_bytes())
-        .map_err(|_| ())?;
-    reader.get_mut().write_all(b"\n").map_err(|_| ())?;
-    singleflight::read_decision(reader, &frame, budget, may_wait)
+    singleflight::write_owned(&mut reader, frame.as_bytes(), deadline, owned).map_err(|_| ())?;
+    singleflight::write_owned(&mut reader, b"\n", deadline, owned).map_err(|_| ())?;
+    singleflight::read_decision(reader, &frame, budget, may_wait, owned)
 }
 
 /// Did the daemon actually answer this consult, or only admit that it
@@ -781,7 +822,16 @@ fn consult_succeeded(reply: &str) -> bool {
     !reply.contains("\"mode\":\"shadow-error\"")
 }
 
-fn observe_with_breaker(socket: &str, path: &str, args: &[String]) -> Live {
+fn observe_with_breaker(
+    socket: &str,
+    path: &str,
+    args: &[String],
+    owner: Option<supervision::Owner>,
+) -> Live {
+    let owned = || caller_still_owned(owner);
+    if !owned() {
+        return Live::FailClosed("original compiler caller disappeared".into());
+    }
     let policy = BreakerPolicy::default();
     // The breaker lock covers DECISIONS and RECORDS, not the consult. A
     // closed breaker admits concurrent consults: holding the lock across a
@@ -820,7 +870,13 @@ fn observe_with_breaker(socket: &str, path: &str, args: &[String]) -> Live {
             }
         }
     };
-    let outcome = consult(socket, connect_timeout_ms, decision_timeout_ms, args);
+    let outcome = consult(socket, connect_timeout_ms, decision_timeout_ms, args, &owned);
+    if !owned() {
+        // Cancellation is neither daemon failure nor evidence of its health.
+        // An abandoned probe keeps its already published cooldown reservation;
+        // the lock still drops here, and no compiler or install is retried.
+        return Live::FailClosed("original compiler caller disappeared".into());
+    }
     let attempt = match &outcome {
         Ok(Live::FailClosed(_)) | Err(()) => AttemptOutcome::Failed,
         Ok(_) => AttemptOutcome::Succeeded,
@@ -906,6 +962,7 @@ fn run_attempt(
             // No compiler started. Abandon admission and become the original
             // compiler, rather than leave an unsupervised observed child.
             drop(session);
+            stop_if_caller_lost(Some(owner));
             let error = std::process::Command::new(real_rustc).args(args).exec();
             eprintln!("rabs-wrap: exec {}: {error}", real_rustc.to_string_lossy());
             std::process::exit(127);
@@ -965,14 +1022,19 @@ fn main() {
 
     // Probes and unrepresentable argv: no state, no socket, no consult.
     if let Some(consult_argv) = shadow_argv(&real_rustc, &args) {
-        let owner = supervision::Owner::capture();
+        let owner = supervision::Owner::capture().ok();
+        stop_if_caller_lost(owner);
         // The consult argv is the FULL command the compiler runs:
         // argv[0] is the real tool (the daemon stats it for the
         // toolchain-identity key component and records it as argv0),
         // followed by every rustc argument. Sending only the args would
         // leave the daemon statting `--crate-name` and mislabeling
         // receipts.
-        match observe_with_breaker(&socket_path(), &breaker_path(), &consult_argv) {
+        let decision = observe_with_breaker(&socket_path(), &breaker_path(), &consult_argv, owner);
+        // Every return path, including errors, an open/contended breaker,
+        // legacy decisions and writer-returned fallback, keeps this fence.
+        stop_if_caller_lost(owner);
+        match decision {
             Live::PassThrough => {}
             Live::Served(stderr) => {
                 // The daemon installed and verified every declared output;
@@ -988,7 +1050,7 @@ fn main() {
                 attempt,
                 env,
             } => {
-                if let Ok(owner) = owner {
+                if let Some(owner) = owner {
                     run_attempt(&real_rustc, &args, *session, &attempt, &env, owner);
                 }
                 // No usable supervision evidence: drop the admission and exec
@@ -1001,6 +1063,7 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        stop_if_caller_lost(owner);
     }
 
     // Become the compiler. On success this never returns; exit codes,
@@ -1048,6 +1111,27 @@ mod tests {
             r#"{"kind":"rustc-decision","decision":"served","compiler_skip_authorized":true,"stderr_hex":"6f6b0a"}"#,
         );
         assert!(matches!(served, Live::Served(bytes) if bytes == b"ok\n"));
+    }
+
+    #[test]
+    fn cancelled_caller_cannot_accept_a_hit_or_admit_execution() {
+        for line in [
+            r#"{"kind":"rustc-decision","decision":"hit","capture_protocol":1}"#,
+            r#"{"kind":"rustc-decision","decision":"execute","capture_protocol":1,"attempt":"id","env":[]}"#,
+            r#"{"kind":"rustc-decision","decision":"pass-through"}"#,
+        ] {
+            let reply = reply_json::parse(line).unwrap();
+            let (stream, mut peer) = UnixStream::pair().unwrap();
+            let reader = BufReader::new(ConsultStream {
+                stream,
+                deadline: Instant::now() + Duration::from_secs(2),
+            });
+            assert!(matches!(
+                live_outcome(&reply, reader, &|| false),
+                Ok(Live::FailClosed(_))
+            ));
+            assert_eq!(peer.read(&mut [0; 1]).unwrap(), 0, "no install consent");
+        }
     }
 
     #[test]
@@ -1404,7 +1488,7 @@ mod tests {
         let socket_text = socket.to_str().unwrap().to_owned();
         let wrapper_path = path_text.clone();
         let wrapper = std::thread::spawn(move || {
-            observe_with_breaker(&socket_text, &wrapper_path, &["/tc/bin/rustc".to_owned()])
+            observe_with_breaker(&socket_text, &wrapper_path, &["/tc/bin/rustc".to_owned()], None)
         });
         mid_consult
             .recv_timeout(Duration::from_secs(5))
@@ -1432,7 +1516,7 @@ mod tests {
         };
         store_state(path, &state).unwrap();
 
-        observe_with_breaker(socket.to_str().unwrap(), path, &[]);
+        observe_with_breaker(socket.to_str().unwrap(), path, &[], None);
 
         assert_eq!(load_state(path), state);
         assert_eq!(
@@ -1466,7 +1550,7 @@ mod tests {
             // No outcome publication: model an owner lost mid-consult.
         }
 
-        observe_with_breaker(socket.to_str().unwrap(), path, &[]);
+        observe_with_breaker(socket.to_str().unwrap(), path, &[], None);
 
         assert_eq!(load_state(path), probing);
         assert_eq!(
@@ -1485,7 +1569,7 @@ mod tests {
         let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
         listener.set_nonblocking(true).unwrap();
 
-        observe_with_breaker(socket.to_str().unwrap(), path.to_str().unwrap(), &[]);
+        observe_with_breaker(socket.to_str().unwrap(), path.to_str().unwrap(), &[], None);
 
         assert_eq!(std::fs::read(parent).unwrap(), b"preserve me");
         assert_eq!(
@@ -1549,7 +1633,7 @@ mod tests {
     #[test]
     fn consult_against_nothing_fails_within_budget() {
         let start = std::time::Instant::now();
-        let result = consult("/nonexistent/rabsd.sock", 25, 50, &[]);
+        let result = consult("/nonexistent/rabsd.sock", 25, 50, &[], &|| true);
         assert!(result.is_err());
         assert!(
             start.elapsed() < Duration::from_millis(200),
