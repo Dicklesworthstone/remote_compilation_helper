@@ -80,17 +80,26 @@ impl RecoveryOwnership {
         let mut file = File::from(rustix::fs::openat(
             self.directory.as_fd(),
             self.journal_name.as_c_str(),
-            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NOFOLLOW,
             Mode::RUSR | Mode::WUSR,
         )?);
         file.write_all(bytes)?;
         file.sync_all()?;
-        self.require_named_file(&file, &self.journal_name)?;
+        self.finish_initialization(&file, bytes)
+    }
+
+    fn finish_initialization(&self, file: &File, expected: &[u8]) -> anyhow::Result<()> {
+        self.verify()?;
+        self.require_named_file(file, &self.journal_name)?;
+        crate::state::primitives::verify_atomic_write_bytes(file, expected)
+            .context("verify initial journal bytes before admission")?;
         self.directory
             .sync_all()
             .context("sync initial held job journal directory before admission")?;
         self.verify()?;
-        self.require_named_file(&file, &self.journal_name)
+        self.require_named_file(file, &self.journal_name)?;
+        crate::state::primitives::verify_atomic_write_bytes(file, expected)
+            .context("verify synchronized initial journal bytes before admission")
     }
 
     pub(in crate::hook) fn publish(&self, bytes: &[u8]) -> anyhow::Result<()> {
@@ -105,13 +114,13 @@ impl RecoveryOwnership {
         let mut file = File::from(rustix::fs::openat(
             self.directory.as_fd(),
             temporary.as_c_str(),
-            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NOFOLLOW,
             Mode::RUSR | Mode::WUSR,
         )?);
         use std::io::Write;
         file.write_all(bytes)?;
         file.sync_all()?;
-        self.publish_temporary(&file, &temporary)
+        self.publish_temporary(&file, &temporary, bytes)
     }
 
     fn require_named_file(&self, held: &File, name: &std::ffi::CStr) -> anyhow::Result<()> {
@@ -138,11 +147,18 @@ impl RecoveryOwnership {
         Ok(())
     }
 
-    fn publish_temporary(&self, file: &File, temporary: &std::ffi::CStr) -> anyhow::Result<()> {
+    fn publish_temporary(
+        &self,
+        file: &File,
+        temporary: &std::ffi::CStr,
+        expected: &[u8],
+    ) -> anyhow::Result<()> {
         use std::os::fd::AsFd;
 
         self.verify()?;
         self.require_named_file(file, temporary)?;
+        crate::state::primitives::verify_atomic_write_bytes(file, expected)
+            .context("verify recovery journal bytes before publication")?;
         rustix::fs::renameat(
             self.directory.as_fd(),
             temporary,
@@ -155,7 +171,8 @@ impl RecoveryOwnership {
             .context("sync held recovery journal directory before advancing ownership")?;
         self.verify()?;
         self.require_named_file(file, &self.journal_name)?;
-        Ok(())
+        crate::state::primitives::verify_atomic_write_bytes(file, expected)
+            .context("verify synchronized recovery journal bytes before acknowledgment")
     }
 }
 
@@ -473,6 +490,137 @@ mod tests {
         assert!(path.with_extension("recovery.lock").is_file());
     }
 
+    #[test]
+    fn owned_journal_bytes_are_bound_before_initial_admission_and_republication() {
+        use std::io::{Seek, Write};
+        use std::os::unix::fs::{FileExt, OpenOptionsExt};
+
+        for initial in [true, false] {
+            for change in ["unchanged", "rewrite", "growth"] {
+                let directory = tempfile::Builder::new()
+                    .disable_cleanup(true)
+                    .tempdir()
+                    .unwrap();
+                let path = directory.path().join("lease.json");
+                let ownership = acquire_gate(&path).unwrap();
+                let gate_inode = ownership._gate.metadata().unwrap().ino();
+                let mut lease = DurableJobLease::new(
+                    JobIdentity::new_local(),
+                    12345,
+                    None,
+                    None,
+                    0,
+                    true,
+                    false,
+                    "journal-byte-fixture".into(),
+                );
+                let original = serde_json::to_vec_pretty(&lease).unwrap();
+                if !initial {
+                    ownership.initialize(&original).unwrap();
+                }
+                lease.heartbeat("prepared", now_unix_ms());
+                let expected = serde_json::to_vec_pretty(&lease).unwrap();
+                let temporary = if initial {
+                    path.clone()
+                } else {
+                    directory.path().join(".prepared-journal.tmp")
+                };
+                let mut held = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(&temporary)
+                    .unwrap();
+                held.write_all(&expected).unwrap();
+                held.sync_all().unwrap();
+                let before = held.metadata().unwrap();
+                let cursor = held.stream_position().unwrap();
+                crate::state::primitives::verify_atomic_write_bytes(&held, &expected).unwrap();
+                assert_eq!(held.stream_position().unwrap(), cursor);
+                let mut retained = expected.clone();
+                match change {
+                    "rewrite" => {
+                        assert_eq!(held.write_at(b"X", 0).unwrap(), 1);
+                        retained[0] = b'X';
+                    }
+                    "growth" => {
+                        let extra = b"retained growth";
+                        assert_eq!(
+                            held.write_at(extra, expected.len() as u64).unwrap(),
+                            extra.len()
+                        );
+                        retained.extend_from_slice(extra);
+                    }
+                    "unchanged" => {}
+                    _ => unreachable!(),
+                }
+                held.sync_all().unwrap();
+                let after = held.metadata().unwrap();
+                assert_eq!(before.ino(), after.ino());
+                assert_eq!(before.dev(), after.dev());
+                assert_eq!(before.nlink(), after.nlink());
+                assert_eq!(before.mode(), after.mode());
+                let result = if initial {
+                    // This is the production initialize tail, after exclusive
+                    // creation/write/sync, with the real name and gate intact.
+                    ownership.finish_initialization(&held, &expected)
+                } else {
+                    // Exercise the actual rename/sync publisher, not a mock.
+                    ownership.publish_temporary(&held, c".prepared-journal.tmp", &expected)
+                };
+                if change == "unchanged" {
+                    result.unwrap();
+                    assert_eq!(std::fs::read(&path).unwrap(), expected);
+                    assert_eq!(std::fs::metadata(&path).unwrap().ino(), before.ino());
+                    assert_eq!(
+                        ownership.read(&lease.identity.local_wrapper_id).unwrap(),
+                        lease
+                    );
+                } else {
+                    let error = result.unwrap_err();
+                    assert!(format!("{error:#}").contains("atomic write"));
+                    assert_eq!(std::fs::read(&temporary).unwrap(), retained);
+                    if !initial {
+                        assert_eq!(std::fs::read(&path).unwrap(), original);
+                    }
+                }
+                assert_eq!(held.stream_position().unwrap(), cursor);
+                if initial || change != "unchanged" {
+                    assert_eq!(std::fs::metadata(&temporary).unwrap().ino(), before.ino());
+                } else {
+                    assert_eq!(
+                        std::fs::symlink_metadata(&temporary).unwrap_err().kind(),
+                        std::io::ErrorKind::NotFound
+                    );
+                }
+                assert_eq!(ownership._gate.metadata().unwrap().ino(), gate_inode);
+                ownership.verify().unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn live_owned_journal_publication_matches_the_installed_lease() {
+        let directory = tempfile::Builder::new()
+            .disable_cleanup(true)
+            .tempdir()
+            .unwrap();
+        let writer =
+            DurableLeaseWriter::create_in(directory.path(), "cargo build", true, false).unwrap();
+        assert!(writer.recovery_ownership.is_some());
+        let wrapper = writer.wrapper_id();
+        assert_eq!(
+            DurableLeaseWriter::read_journal(&writer.path, &wrapper).unwrap(),
+            writer.snapshot()
+        );
+        writer.heartbeat("queued").unwrap();
+        assert_eq!(
+            DurableLeaseWriter::read_journal(&writer.path, &wrapper).unwrap(),
+            writer.snapshot()
+        );
+    }
+
     fn fixture() -> (tempfile::TempDir, DurableLeaseWriter) {
         let directory = tempfile::tempdir().unwrap();
         let mut lease = DurableJobLease::new(
@@ -706,6 +854,7 @@ mod tests {
         let bytes = std::fs::read(&writer.path).unwrap();
         let temporary_path = root.join("jobs/.publication-fixture.tmp");
         let mut held = std::fs::OpenOptions::new()
+            .read(true)
             .write(true)
             .create_new(true)
             .mode(0o600)
@@ -716,7 +865,7 @@ mod tests {
         std::fs::rename(&temporary_path, root.join("jobs/original-publication.tmp")).unwrap();
         std::fs::write(&temporary_path, b"substituted bytes").unwrap();
         let error = ownership
-            .publish_temporary(&held, c".publication-fixture.tmp")
+            .publish_temporary(&held, c".publication-fixture.tmp", b"intended lease bytes")
             .unwrap_err();
         assert!(format!("{error:#}").contains("publication file changed"));
         assert_eq!(std::fs::read(&writer.path).unwrap(), bytes);

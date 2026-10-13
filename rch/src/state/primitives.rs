@@ -277,7 +277,7 @@ fn verify_atomic_write_name(
 }
 
 #[cfg(unix)]
-fn verify_atomic_write_bytes(file: &File, expected: &[u8]) -> Result<()> {
+pub(crate) fn verify_atomic_write_bytes(file: &File, expected: &[u8]) -> Result<()> {
     use std::os::unix::fs::FileExt;
     anyhow::ensure!(
         file.metadata()?.len() == expected.len() as u64,

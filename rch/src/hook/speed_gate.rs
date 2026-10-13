@@ -919,7 +919,11 @@ mod tests {
             "MemTotal: 100 kB\nMemAvailable: 18446744073709551616 kB\n",
         ] {
             assert_eq!(meminfo_free_pct(meminfo), None, "{meminfo}");
-            assert!(!resources_allow_local(meminfo_free_pct(meminfo), false, None));
+            assert!(!resources_allow_local(
+                meminfo_free_pct(meminfo),
+                false,
+                None
+            ));
         }
         for (available, admitted) in [(0, false), (24, false), (25, true), (100, true)] {
             let meminfo = format!("MemTotal: 100 kB\nMemAvailable: {available} kB\n");
@@ -981,12 +985,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(100));
             drop(writer);
         });
-        let output = collect_probe_output(
-            &mut child,
-            reader,
-            started,
-            Duration::from_millis(10),
-        );
+        let output = collect_probe_output(&mut child, reader, started, Duration::from_millis(10));
         holder.join().unwrap();
         assert!(output.is_none(), "late EOF authorized a healthy reply");
     }
