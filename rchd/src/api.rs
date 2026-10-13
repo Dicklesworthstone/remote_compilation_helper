@@ -6522,6 +6522,29 @@ mod tests {
     }
 
     #[test]
+    fn test_lease_blocks_restart_refused_before_admission_never_blocks() {
+        // A wrapper refused before admission keeps running the command
+        // locally under the same PID; its retired lease must not hold a drain.
+        let now = 10 * DEAD_WRAPPER_HEARTBEAT_STALE_MS;
+        let mut lease = DurableJobLease::new(
+            rch_common::job_identity::JobIdentity::new_local(),
+            1,
+            None,
+            None,
+            now,
+            false,
+            true,
+            "blake3:test".to_string(),
+        );
+        lease.state = rch_common::job_identity::JobLifecycleState::FailedBeforeAdmission;
+        lease.heartbeat("failed_before_admission", now);
+        lease.terminal_acknowledged = true;
+        assert!(!lease_blocks_restart(&lease, now, || unreachable!(
+            "a retired refusal must not probe liveness"
+        )));
+    }
+
+    #[test]
     fn test_lease_blocks_restart_fresh_heartbeat_blocks_without_liveness_probe() {
         let now = 10 * DEAD_WRAPPER_HEARTBEAT_STALE_MS;
         let lease = make_test_lease(now - DEAD_WRAPPER_HEARTBEAT_STALE_MS + 1, 1);
