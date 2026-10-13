@@ -6,13 +6,19 @@
 
 use super::{ActiveBuildCleanup, ObservationWindow, RecoveredQueueCleanup, build_stuck_evidence};
 use crate::history::ActiveBuildState;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::future::{Future, poll_fn};
+use std::pin::Pin;
+use std::task::Poll;
 use std::time::{Duration, Instant};
 use tokio::time::{MissedTickBehavior, interval};
 use tracing::warn;
 
 const RETRY_BASE: Duration = Duration::from_secs(30);
 const RETRY_MAX: Duration = Duration::from_secs(5 * 60);
+/// Bound both accepted automatic operations and new starts per observer tick.
+/// A worker may occupy only one of these lanes. User cancellation is separate.
+const MAX_AUTOMATIC_CANCELLATIONS: usize = 4;
 
 /// Immutable attempt identity plus the actual progress observed before it.
 /// A resumed/replaced wrapper must not inherit a previous observation's delay
@@ -152,35 +158,162 @@ fn record_outcome(
     );
 }
 
+/// Poll a small bounded set in the observer itself, rather than spawning a
+/// second task that could first admit a cancellation AFTER observer shutdown.
+/// Dropping this set drops only waiters. The cancellation orchestrator still
+/// owns termination/finalization of operations it has already admitted.
+struct InFlight {
+    stamp: RetryStamp,
+    wait: Pin<Box<dyn Future<Output = Option<String>> + Send>>,
+}
+
+#[derive(Default)]
+struct Remediations {
+    running: Vec<InFlight>,
+    pending: VecDeque<u64>,
+}
+
+impl Remediations {
+    fn can_start(&self, stamp: &RetryStamp) -> bool {
+        self.running.len() < MAX_AUTOMATIC_CANCELLATIONS
+            && !self.running.iter().any(|flight| {
+                flight.stamp.build_id == stamp.build_id
+                    || flight.stamp.worker_id == stamp.worker_id
+            })
+    }
+
+    fn push(
+        &mut self,
+        stamp: RetryStamp,
+        wait: impl Future<Output = Option<String>> + Send + 'static,
+    ) -> bool {
+        if !self.can_start(&stamp) {
+            return false;
+        }
+        self.running.push(InFlight {
+            stamp,
+            wait: Box::pin(wait),
+        });
+        true
+    }
+
+    async fn next_completed(&mut self) -> (RetryStamp, Option<String>) {
+        // At most four polls; all waits share this task's waker. A ready peer
+        // is collected even when the oldest worker never wakes. Cancellation
+        // of this poll by a timer tick leaves every owned future in the set.
+        poll_fn(|cx| {
+            for index in 0..self.running.len() {
+                if let Poll::Ready(status) = self.running[index].wait.as_mut().poll(cx) {
+                    let flight = self.running.swap_remove(index);
+                    return Poll::Ready((flight.stamp, status));
+                }
+            }
+            Poll::Pending
+        })
+        .await
+    }
+
+    fn start_observed(
+        &mut self,
+        cleanup: &ActiveBuildCleanup,
+        observation: &mut ObservationWindow,
+        backoff: &mut RetryBackoff,
+        mut candidates: Vec<ActiveBuildState>,
+    ) {
+        // Retain only scheduling order, never a stale build snapshot. Waiting
+        // IDs precede previously attempted IDs reintroduced by the next scan,
+        // so two jobs sharing a worker cannot starve one another behind an
+        // always-failing prefix. New IDs enter in deterministic order.
+        candidates.sort_by_key(|build| build.id);
+        let current_ids: HashSet<u64> = candidates.iter().map(|build| build.id).collect();
+        self.pending.retain(|id| current_ids.contains(id));
+        let mut queued: HashSet<u64> = self.pending.iter().copied().collect();
+        queued.extend(self.running.iter().map(|flight| flight.stamp.build_id));
+        for build in &candidates {
+            if queued.insert(build.id) {
+                self.pending.push_back(build.id);
+            }
+        }
+        let current: HashMap<u64, ActiveBuildState> =
+            candidates.into_iter().map(|build| (build.id, build)).collect();
+        let mut starts = 0;
+        // Examine each queued ID at most once. A busy/backed-off worker goes
+        // around the queue without spinning or blocking a disjoint peer.
+        for _ in 0..self.pending.len() {
+            if starts == MAX_AUTOMATIC_CANCELLATIONS
+                || self.running.len() == MAX_AUTOMATIC_CANCELLATIONS
+            {
+                break;
+            }
+            let id = self.pending.pop_front().expect("bounded pending iteration");
+            let planned = &current[&id];
+            let stamp = RetryStamp::of(planned);
+            if !self.can_start(&stamp) || !backoff.ready(&stamp, Instant::now()) {
+                self.pending.push_back(id);
+                continue;
+            }
+            let Some(build) = fresh_candidate(cleanup, planned, observation) else {
+                continue;
+            };
+            let owner = ActiveBuildCleanup::new(cleanup.context.clone());
+            let mut admission_observation = ObservationWindow {
+                last_observed: observation.last_observed,
+                recover_until: observation.recover_until,
+                startup_until: observation.startup_until,
+            };
+            // Recheck when the future is FIRST POLLED too: a heartbeat or an
+            // observer pause may have occurred since this future was queued.
+            // There is then no await before cancel_build's synchronous admission.
+            let wait = async move {
+                let Some(current) = fresh_candidate(&owner, &build, &mut admission_observation)
+                else {
+                    return None;
+                };
+                let response = owner
+                    .context
+                    .cancellation
+                    .cancel_build(
+                        &owner.context,
+                        current.id,
+                        crate::cancellation::CancelReason::StuckDetector,
+                        false,
+                    )
+                    .await;
+                Some(response.status)
+            };
+            if self.push(stamp, wait) {
+                starts += 1;
+            }
+        }
+    }
+}
+
 pub(super) async fn run(cleanup: ActiveBuildCleanup) {
     let mut ticker = interval(Duration::from_secs(5));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut observation = ObservationWindow::for_startup(Instant::now());
     let mut recovered_queue = RecoveredQueueCleanup::default();
     let mut backoff = RetryBackoff::default();
+    let mut flights = Remediations::default();
     loop {
-        ticker.tick().await;
-        recovered_queue.check(&cleanup.context);
-        backoff.retain_active(&cleanup.context.history.active_builds());
-        for planned in cleanup.collect_active_builds_observed(&mut observation) {
-            let stamp = RetryStamp::of(&planned);
-            if !backoff.ready(&stamp, Instant::now()) {
-                continue;
+        tokio::select! {
+            _ = ticker.tick() => {
+                // Neither remote termination nor another worker's backoff may
+                // delay queued-owner retirement or fresh stuck observations.
+                recovered_queue.check(&cleanup.context);
+                backoff.retain_active(&cleanup.context.history.active_builds());
+                let candidates = cleanup.collect_active_builds_observed(&mut observation);
+                flights.start_observed(&cleanup, &mut observation, &mut backoff, candidates);
             }
-            let Some(build) = fresh_candidate(&cleanup, &planned, &mut observation) else {
-                continue;
-            };
-            let response = cleanup
-                .context
-                .cancellation
-                .cancel_build(
-                    &cleanup.context,
-                    build.id,
-                    crate::cancellation::CancelReason::StuckDetector,
-                    false,
-                )
-                .await;
-            record_outcome(&cleanup, &mut backoff, stamp, &response.status);
+            (attempted, status) = flights.next_completed(), if !flights.running.is_empty() => {
+                if let Some(status) = status {
+                    record_outcome(&cleanup, &mut backoff, attempted, &status);
+                } else {
+                    // Fresh evidence vetoed this decision before any operation
+                    // was admitted. It is not a failed cancellation or a receipt.
+                    backoff.failures.remove(&attempted.build_id);
+                }
+            }
         }
     }
 }
@@ -354,3 +487,6 @@ mod tests {
         assert!(context.cancellation.active_cancellations().await.is_empty());
     }
 }
+
+#[cfg(test)]
+mod concurrency_tests;
