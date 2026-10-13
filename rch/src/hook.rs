@@ -3542,13 +3542,14 @@ pub async fn run_exec(
     // Extract project name honoring configured path topology.
     let project = extract_project_name_with_policy(&topology_policy);
 
-    // bd-2spi4: speed gate. Like `general.force_local` it is a deliberate
-    // placement, so it outranks the shim's blanket RCH_REQUIRE_REMOTE=1 (and
-    // the dispatcher role default), but never a caller's explicit force-remote
-    // or a mode whose guarantee a local run cannot meet.
+    // bd-2spi4: the speed gate may place a build locally only when the
+    // caller and configuration permit it. Resolved strict admission (including
+    // the canonical shim and dispatcher default) remains remote-only even
+    // when local speed measurements are enabled.
     let caller_force_remote = std::env::var("RCH_FORCE_REMOTE")
         .is_ok_and(|value| env_flag_enabled(&value))
-        || (config.general.force_remote && !exec_requires_remote());
+        || config.general.force_remote
+        || require_remote;
     if let Some((reason, _local_slot)) = speed_gate::evaluate(
         &config,
         &project,
@@ -3570,7 +3571,7 @@ pub async fn run_exec(
             &command,
             &reporter,
             &reason,
-            false,
+            caller_force_remote,
             None,
             Some(LocalRunTiming {
                 project: &project,
