@@ -5,7 +5,7 @@ Compilation Helper): the PreToolUse hook + CLI (`rch`), the local daemon (`rchd`
 worker agent (`rch-wkr`), the RABS build sidecar (`rabs-*`, `rabsd`), and the fleet
 dashboard (`dashboard/`).
 
-Scope window: project inception (`v0.1.0`, 2026-01-25) through `v2.1.18` (2026-10-12).
+Scope window: project inception (`v0.1.0`, 2026-01-25) through `v2.1.19` (2026-10-13).
 
 This document was rebuilt from git history (`git log --no-merges` per tag range, `git show`
 on representative commits), version tags (`git for-each-ref`), GitHub release metadata
@@ -28,6 +28,48 @@ history. They are kept as-is because the descriptions were verified against the 
 but those particular links will 404.
 
 Repository: <https://github.com/Dicklesworthstone/remote_compilation_helper>
+
+## 2.1.19 — 2026-10-13
+
+A dispatcher that is faster than its workers can now keep builds local, bounded by local
+slots and free memory, instead of always offloading. Also: interrupted recoveries retain and
+verify complete Cargo artifact evidence, and the test suite and `cargo fmt --check` are green
+again.
+
+- **Opt-in speed gate: run a build locally when this machine's measured history says
+  offloading is slower** (`bd-2spi4`). `compilation.remote_speedup_threshold` and
+  `compilation.min_local_time_ms` were parsed and displayed but never consulted. On
+  mac-studio (M5 Ultra) a cold `cargo check -p rch-common --lib` took 12.4 s locally and 143 s
+  on a worker, yet every build was offloaded.
+  - **Enable it** with `compilation.local_slots = N`, `RCH_LOCAL_SLOTS`, or `rch config set
+    compilation.local_slots N`. The default 0 leaves behaviour unchanged.
+  - **How it decides:** for each project and command kind, it measures one local run and one
+    remote run. After that, a build runs locally when the local median is below
+    `min_local_time_ms`, or when remote is less than `remote_speedup_threshold` times faster.
+    A side whose samples are over a week old is measured again.
+  - **When it runs locally:** only with a free local slot (lock files the kernel releases if
+    the process dies) and at least 25% free memory. Otherwise the build offloads as before.
+  - **Precedence:** like `general.force_local`, the gate outranks the shim's blanket
+    `RCH_REQUIRE_REMOTE=1` and the dispatcher-role default. `RCH_FORCE_REMOTE`, a configured
+    `force_remote`, `--job`, `--worker`, required tools, clean overlays, source receipts and
+    Cargo JSON stdout all disable it.
+  - **Inspect it:** `rch diagnose` reports the gate's medians, threshold and decision.
+  - **Why not SpeedScore:** it cannot rank a dispatcher against its workers. Every host scores
+    cpu ≈ 70 (`bd-uerk9`).
+  - Timing samples are now merged across concurrent `rch exec` processes instead of being
+    overwritten
+    ([`de5ffdc5`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/de5ffdc584dad80eee7b60b90bc2329ce38f6ee2)).
+- **Recovery keeps complete Cargo artifact evidence across attempts.** An interrupted
+  recovery re-reads the same attempt's retained Cargo stdout, remote root and remote project
+  root instead of downgrading to glob policy. Corrupt or missing producer bytes refuse to
+  re-baseline, and a worker's path spelling (for example a Windows drive root) is kept
+  verbatim
+  ([`21043623`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/21043623608a18a224aa3856faca486813129718)).
+- **Tests and formatting are green again.** Three retained-Cargo fixtures used unnamed
+  `--bins`, which output capture deliberately refuses, so they failed their own setup
+  assertion. They now name `--bin app --bin helper`. Twelve unformatted hunks in
+  `retrieval_recovery.rs` are rustfmt'd
+  ([`95e07e1c`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/95e07e1c55f21ec11f9be97891fc50faca4843e8)).
 
 ## 2.1.18 — 2026-10-12
 
