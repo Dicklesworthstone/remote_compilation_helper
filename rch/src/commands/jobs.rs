@@ -734,7 +734,13 @@ mod tests {
 
         let retained = tempfile::tempdir().unwrap().keep();
         let directory = retained.join(std::ffi::OsStr::from_bytes(b"journals-\xfe"));
-        std::fs::create_dir(&directory).unwrap();
+        match std::fs::create_dir(&directory) {
+            // APFS and other UTF-8-only filesystems cannot hold such a path.
+            Err(error) if error.raw_os_error() == Some(rustix::io::Errno::ILSEQ.raw_os_error()) => {
+                return;
+            }
+            result => result.unwrap(),
+        }
         let lease = queued_lease();
         let valid = directory.join(std::ffi::OsStr::from_bytes(b"valid-\xfe.json"));
         let valid_bytes = serde_json::to_vec(&lease).unwrap();
