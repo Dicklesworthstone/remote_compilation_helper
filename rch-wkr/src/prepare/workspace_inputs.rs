@@ -393,7 +393,19 @@ pub(super) fn discover(project: &Path, root_names: &[&str]) -> Result<Inventory>
         // bytes, not parsed/re-serialized settings, invalidate prior stamps.
         names.push(pnpm_workspace::FILE_NAME.to_owned());
     }
-    names.extend(walk.manifests);
+    for manifest in walk.manifests {
+        if pnpm_document.is_some() {
+            // With sharedWorkspaceLockfile=false, members have independent
+            // resolutions. Older pnpm also reads member .npmrc files. Track
+            // their absence as well as their bytes through the same capture.
+            let directory = manifest
+                .strip_suffix("package.json")
+                .context("workspace manifest name lost its package.json suffix")?;
+            names.push(format!("{directory}pnpm-lock.yaml"));
+            names.push(format!("{directory}.npmrc"));
+        }
+        names.push(manifest);
+    }
     Ok(Inventory {
         names,
         root_manifest,
@@ -662,6 +674,28 @@ mod tests {
         std::fs::rename(dir.path().join("pnpm-lock.yaml"), dir.path().join("retained-lock.yaml")).unwrap();
         let result = DependencyInputs::capture(dir.path());
         assert!(result.err().unwrap().to_string().contains("requires pnpm-lock.yaml"));
+    }
+
+    #[test]
+    fn pnpm_member_lock_and_config_changes_invalidate_the_shared_observation() {
+        for name in ["pnpm-lock.yaml", ".npmrc"] {
+            let dir = pnpm_project("packages: ['packages/*']\nsharedWorkspaceLockfile: false\n");
+            member(dir.path(), "packages/a", r#"{"name":"a"}"#);
+            let path = dir.path().join("packages/a").join(name);
+            let absent = DependencyInputs::capture(dir.path()).unwrap();
+            std::fs::write(&path, b"first version\n").unwrap();
+            let added = DependencyInputs::capture(dir.path()).unwrap();
+            assert_ne!(absent.fingerprint.hash, added.fingerprint.hash);
+            assert!(absent.verify_after(&added, RequiredRuntime::Node, PrepareAction::Installed).is_err());
+            std::fs::write(&path, b"other version\n").unwrap();
+            let edited = DependencyInputs::capture(dir.path()).unwrap();
+            assert_ne!(added.fingerprint.hash, edited.fingerprint.hash);
+            assert!(added.verify_after(&edited, RequiredRuntime::Node, PrepareAction::Installed).is_err());
+            std::fs::rename(&path, dir.path().join("retained-member-input")).unwrap();
+            let removed = DependencyInputs::capture(dir.path()).unwrap();
+            assert_eq!(absent.fingerprint, removed.fingerprint);
+            assert!(edited.verify_after(&removed, RequiredRuntime::Node, PrepareAction::Skipped).is_err());
+        }
     }
 
     #[cfg(unix)]
