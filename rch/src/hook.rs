@@ -1605,6 +1605,13 @@ struct RetrySelectionIntent {
     pending: DurableJobLease,
 }
 
+#[cfg(unix)]
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "cannot acquire exclusive job recovery: journal is held by another handle; retry the same wrapper"
+)]
+pub(crate) struct JobJournalBusy;
+
 fn selection_is_pending(lease: &DurableJobLease) -> bool {
     matches!(
         lease.phase.as_str(),
@@ -1821,8 +1828,23 @@ impl DurableLeaseWriter {
         strict_remote: bool,
         self_healing_enabled: bool,
     ) -> anyhow::Result<Self> {
+        Self::create_in(
+            &default_job_lease_directory(),
+            command,
+            strict_remote,
+            self_healing_enabled,
+        )
+    }
+
+    fn create_in(
+        directory: &Path,
+        command: &str,
+        strict_remote: bool,
+        self_healing_enabled: bool,
+    ) -> anyhow::Result<Self> {
         let identity = JobIdentity::new_local();
-        let path = absolute_lease_path(durable_lease_path(&identity.local_wrapper_id))?;
+        let path =
+            absolute_lease_path(directory.join(format!("{}.json", identity.local_wrapper_id)))?;
         let command_fingerprint = format!("blake3:{}", blake3::hash(command.as_bytes()).to_hex());
         let process_birth = rch_common::process_identity::current_process_identity();
         let process_start_ticks =
@@ -1845,12 +1867,21 @@ impl DurableLeaseWriter {
             command_fingerprint,
         );
         lease.process_birth = process_birth;
+        #[cfg(unix)]
+        let recovery_ownership = {
+            std::fs::create_dir_all(path.parent().context("job journal has no parent")?)?;
+            let ownership =
+                Arc::new(transfer_orchestration::recovery::recovery_owner::acquire_gate(&path)?);
+            ownership.initialize(&serde_json::to_vec_pretty(&lease)?)?;
+            Some(ownership)
+        };
         let writer = Self {
             path,
             lease: Arc::new(Mutex::new(lease)),
             #[cfg(unix)]
-            recovery_ownership: None,
+            recovery_ownership,
         };
+        #[cfg(not(unix))]
         writer.persist()?;
         Ok(writer)
     }
@@ -1954,8 +1985,33 @@ impl DurableLeaseWriter {
 
     /// The caller has validated a daemon no-start cancellation receipt. This
     /// is the only terminal transition allowed while selection is uncertain.
-    pub(crate) fn confirm_selection_cancelled(&self) -> anyhow::Result<()> {
+    /// False means the journal acknowledgment is deferred to its held owner;
+    /// it does not retract the daemon's already validated cancellation.
+    pub(crate) fn confirm_selection_cancelled(&self) -> anyhow::Result<bool> {
         let mut lease = self.lease.lock().unwrap_or_else(|p| p.into_inner());
+        #[cfg(unix)]
+        let cancellation_writer = if self.recovery_ownership.is_none() {
+            // A separately loaded cancellation writer must cooperate with the
+            // live wrapper's gate. Never overwrite a live owner's journal or
+            // acknowledge cancellation from a stale cached lease.
+            let ownership =
+                match transfer_orchestration::recovery::recovery_owner::acquire_gate(&self.path) {
+                    Ok(ownership) => Arc::new(ownership),
+                    Err(error) if error.downcast_ref::<JobJournalBusy>().is_some() => {
+                        return Ok(false);
+                    }
+                    Err(error) => return Err(error),
+                };
+            anyhow::ensure!(
+                ownership.read(&lease.identity.local_wrapper_id)? == *lease,
+                "job journal changed before no-start cancellation; reload the same wrapper"
+            );
+            let mut writer = self.clone();
+            writer.recovery_ownership = Some(ownership);
+            Some(writer)
+        } else {
+            None
+        };
         anyhow::ensure!(
             lease.identity.remote_build_id.is_none()
                 && lease.worker_id.is_none()
@@ -1966,7 +2022,11 @@ impl DurableLeaseWriter {
         let mut next = lease.clone();
         next.exit_code = Some(130);
         next.acknowledge_terminal(now_unix_ms());
-        self.publish_transition(&mut lease, next)
+        #[cfg(unix)]
+        if let Some(writer) = cancellation_writer {
+            return writer.publish_transition(&mut lease, next).map(|()| true);
+        }
+        self.publish_transition(&mut lease, next).map(|()| true)
     }
 
     pub(crate) fn heartbeat(&self, phase: &str) -> anyhow::Result<()> {
@@ -2095,14 +2155,21 @@ impl DurableLeaseWriter {
             return Ok(());
         }
         atomic_write(&self.path, &bytes)?;
-        let parent = self
-            .path
-            .parent()
-            .context("lease has no parent directory")?;
-        std::fs::File::open(parent)
-            .with_context(|| format!("open lease directory for durability: {}", parent.display()))?
-            .sync_all()
-            .context("sync lease directory before advancing ownership")?;
+        // Unix atomic_write already synchronizes and verifies its held parent;
+        // reopening the pathname here adds no durability to that publication.
+        #[cfg(not(unix))]
+        {
+            let parent = self
+                .path
+                .parent()
+                .context("lease has no parent directory")?;
+            std::fs::File::open(parent)
+                .with_context(|| {
+                    format!("open lease directory for durability: {}", parent.display())
+                })?
+                .sync_all()
+                .context("sync lease directory before advancing ownership")?;
+        }
         *lease = next;
         Ok(())
     }

@@ -56,7 +56,7 @@ impl RecoveryOwnership {
         Ok(())
     }
 
-    fn read(&self, wrapper_id: &str) -> anyhow::Result<DurableJobLease> {
+    pub(in crate::hook) fn read(&self, wrapper_id: &str) -> anyhow::Result<DurableJobLease> {
         use std::os::fd::AsFd;
         self.verify()?;
         let bytes = crate::state::primitives::read_regular_file_at(
@@ -65,6 +65,32 @@ impl RecoveryOwnership {
         )?;
         self.verify()?;
         DurableLeaseWriter::decode_journal(&bytes, wrapper_id)
+    }
+
+    /// The first lease must never replace an existing wrapper's evidence.
+    /// Readers can refuse an incomplete initial file; daemon admission starts
+    /// only after this write and its held directory have been synchronized.
+    /// An initialization failure retains its exact partial bytes, too.
+    pub(in crate::hook) fn initialize(&self, bytes: &[u8]) -> anyhow::Result<()> {
+        use rustix::fs::{Mode, OFlags};
+        use std::io::Write;
+        use std::os::fd::AsFd;
+
+        self.verify()?;
+        let mut file = File::from(rustix::fs::openat(
+            self.directory.as_fd(),
+            self.journal_name.as_c_str(),
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::RUSR | Mode::WUSR,
+        )?);
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        self.require_named_file(&file, &self.journal_name)?;
+        self.directory
+            .sync_all()
+            .context("sync initial held job journal directory before admission")?;
+        self.verify()?;
+        self.require_named_file(&file, &self.journal_name)
     }
 
     pub(in crate::hook) fn publish(&self, bytes: &[u8]) -> anyhow::Result<()> {
@@ -133,7 +159,7 @@ impl RecoveryOwnership {
     }
 }
 
-fn acquire_gate(lease_path: &Path) -> anyhow::Result<RecoveryOwnership> {
+pub(in crate::hook) fn acquire_gate(lease_path: &Path) -> anyhow::Result<RecoveryOwnership> {
     use rustix::fs::{Mode, OFlags};
     use std::os::fd::AsFd;
     use std::os::unix::ffi::OsStrExt;
@@ -150,8 +176,9 @@ fn acquire_gate(lease_path: &Path) -> anyhow::Result<RecoveryOwnership> {
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
         Mode::empty(),
     )?);
-    let (socket, _peer) = tokio::net::UnixStream::pair()?;
-    let uid = socket.peer_cred()?.uid();
+    // Gate acquisition is also used by the synchronous live constructor.
+    // It must not allocate a Tokio socket or require a running reactor.
+    let uid = rustix::process::geteuid().as_raw();
     let safe = |metadata: &std::fs::Metadata| {
         metadata.file_type().is_file()
             && metadata.uid() == uid
@@ -173,11 +200,6 @@ fn acquire_gate(lease_path: &Path) -> anyhow::Result<RecoveryOwnership> {
         Mode::RUSR | Mode::WUSR,
     )?);
     anyhow::ensure!(safe(&gate.metadata()?), "unsafe recovery lock file");
-    gate.try_lock().map_err(|error| {
-        anyhow::anyhow!(
-            "cannot acquire exclusive job recovery: {error}; another recovery may be active; retry the same wrapper"
-        )
-    })?;
     let held = gate.metadata()?;
     let named_gate = File::from(rustix::fs::openat(
         directory.as_fd(),
@@ -198,7 +220,14 @@ fn acquire_gate(lease_path: &Path) -> anyhow::Result<RecoveryOwnership> {
             && held_directory.ino() == named_directory.ino(),
         "recovery lock path changed during acquisition"
     );
-    Ok(RecoveryOwnership {
+    match gate.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => return Err(JobJournalBusy.into()),
+        Err(std::fs::TryLockError::Error(error)) => {
+            return Err(error).context("cannot inspect exclusive job journal ownership");
+        }
+    }
+    let ownership = RecoveryOwnership {
         _gate: gate,
         directory,
         parent: parent.to_owned(),
@@ -209,7 +238,9 @@ fn acquire_gate(lease_path: &Path) -> anyhow::Result<RecoveryOwnership> {
                 .context("journal has no name")?
                 .as_bytes(),
         )?,
-    })
+    };
+    ownership.verify()?;
+    Ok(ownership)
 }
 
 fn validate_same_owner(observed: &DurableJobLease, latest: &DurableJobLease) -> anyhow::Result<()> {
@@ -363,6 +394,84 @@ where
 mod tests {
     use super::*;
     use std::cell::Cell;
+
+    #[test]
+    fn live_journal_gate_survives_clones_and_loaded_cancellation_requires_current_bytes() {
+        // No Tokio runtime: the live constructor and cancellation fencing are
+        // synchronous. Retain every fixture, including setup failures.
+        let directory = tempfile::Builder::new()
+            .disable_cleanup(true)
+            .tempdir()
+            .unwrap();
+        let root = directory.path().join("new-journal-directory");
+        let writer = DurableLeaseWriter::create_in(&root, "cargo build", true, false).unwrap();
+        let path = writer.path.clone();
+        let wrapper = writer.wrapper_id();
+        let gate = path.with_extension("recovery.lock");
+        let gate_inode = std::fs::metadata(&gate).unwrap().ino();
+        let mut loaded = DurableLeaseWriter {
+            path: path.clone(),
+            lease: Arc::new(Mutex::new(
+                DurableLeaseWriter::read_journal(&path, &wrapper).unwrap(),
+            )),
+            recovery_ownership: None,
+        };
+        let initial = std::fs::read(&path).unwrap();
+        assert_eq!(loaded.snapshot(), writer.snapshot());
+        assert!(acquire_gate(&path).is_err());
+        assert!(!loaded.confirm_selection_cancelled().unwrap());
+        assert!(!loaded.snapshot().terminal_acknowledged);
+        assert_eq!(std::fs::read(&path).unwrap(), initial);
+        let clone = writer.clone();
+        drop(writer);
+        assert!(acquire_gate(&path).is_err());
+        clone.heartbeat("queued").unwrap();
+        let latest = std::fs::read(&path).unwrap();
+        assert_ne!(latest, initial);
+        assert_eq!(
+            DurableLeaseWriter::read_journal(&path, &wrapper).unwrap(),
+            clone.snapshot()
+        );
+        drop(clone);
+        // The gate is free now, but the independently cached lease is stale.
+        assert!(loaded.confirm_selection_cancelled().is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), latest);
+        assert!(!loaded.snapshot().terminal_acknowledged);
+        loaded.lease = Arc::new(Mutex::new(
+            DurableLeaseWriter::read_journal(&path, &wrapper).unwrap(),
+        ));
+        // This exercises publication of an assumed validated daemon no-start
+        // receipt, not a real daemon cancellation or compiler/SDK observation.
+        assert!(loaded.confirm_selection_cancelled().unwrap());
+        let committed = DurableLeaseWriter::read_journal(&path, &wrapper).unwrap();
+        assert_eq!(committed, loaded.snapshot());
+        assert!(committed.terminal_acknowledged);
+        assert_eq!(committed.exit_code, Some(130));
+        assert_eq!(std::fs::metadata(&gate).unwrap().ino(), gate_inode);
+        let _ownership = acquire_gate(&path).unwrap();
+    }
+
+    #[test]
+    fn initial_journal_publication_preserves_occupied_names() {
+        use std::io::Write;
+        let directory = tempfile::Builder::new()
+            .disable_cleanup(true)
+            .tempdir()
+            .unwrap();
+        let path = directory.path().join("occupied-wrapper.json");
+        let original = b"previous wrapper's retained journal";
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(original).unwrap();
+        file.sync_all().unwrap();
+        let ownership = acquire_gate(&path).unwrap();
+        assert!(ownership.initialize(b"replacement refused").is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert!(path.with_extension("recovery.lock").is_file());
+    }
 
     fn fixture() -> (tempfile::TempDir, DurableLeaseWriter) {
         let directory = tempfile::tempdir().unwrap();

@@ -60,11 +60,22 @@ pub(crate) async fn query(lease: &DurableJobLease) -> Result<Value> {
         lease.identity.local_wrapper_id
     ))
     .await?;
-    let body = response
+    parse_job_status(lease, &response)
+}
+
+#[cfg(unix)]
+fn parse_job_status(lease: &DurableJobLease, response: &str) -> Result<Value> {
+    let (header, body) = response
         .split_once("\r\n\r\n")
         .or_else(|| response.split_once("\n\n"))
-        .map(|(_, body)| body)
         .context("daemon response has no body")?;
+    // An error envelope is not authoritative absence or completion. In
+    // particular, never use a 5xx `not_found` body to settle ownership.
+    let mut status = header.lines().next().unwrap_or_default().split_whitespace();
+    anyhow::ensure!(
+        matches!(status.next(), Some("HTTP/1.0" | "HTTP/1.1")) && status.next() == Some("200"),
+        "daemon refused job status; ownership remains unresolved"
+    );
     let payload: Value = serde_json::from_str(body)?;
     match payload.get("status").and_then(Value::as_str) {
         Some("active") => validate_identity(lease, &payload["active"])?,
@@ -475,10 +486,14 @@ async fn run_unix(action: Option<JobsAction>, ctx: &OutputContext) -> Result<()>
                 .or_else(|| response.split_once("\n\n"))
                 .map(|(_, body)| body)
                 .context("missing queued cancellation response")?;
-            let reply: Value = serde_json::from_str(body)?;
+            let mut reply: Value = serde_json::from_str(body)?;
             validate_queued_cancellation(&wrapper_id, &reply)?;
             if reply["status"] == "cancelled_before_start" {
-                writer.confirm_selection_cancelled()?;
+                // Daemon cancellation already succeeded. A live wrapper owns
+                // its journal and acknowledges the selection response itself.
+                // Report deferred acknowledgment without overwriting that
+                // owner or misreporting its cancellation as a daemon failure.
+                reply["journal_acknowledged"] = json!(writer.confirm_selection_cancelled()?);
             } else if reply["status"] == "cancelled" {
                 let mut identity = lease.identity.clone();
                 identity.admit(
@@ -611,6 +626,49 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     use std::os::fd::AsFd;
+
+    #[cfg(unix)]
+    #[test]
+    fn job_status_accepts_successful_http_envelopes() {
+        let lease = queued_lease();
+        for protocol in ["HTTP/1.0", "HTTP/1.1"] {
+            for separator in ["\r\n", "\n"] {
+                let response = format!(
+                    "{protocol} 200 OK{separator}Content-Type: application/json{separator}{separator}{{\"status\":\"not_found\"}}"
+                );
+                assert_eq!(
+                    parse_job_status(&lease, &response).unwrap()["status"],
+                    "not_found"
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn job_status_refuses_error_envelopes_before_trusting_json() {
+        let lease = queued_lease();
+        let original = lease.clone();
+        for header in [
+            "HTTP/1.1 500 Internal Server Error",
+            "HTTP/1.1 503 Service Unavailable",
+            "HTTP/1.1 404 Not Found",
+            "HTTP/1.1 302 Found",
+            "HTTP/1.1 2000 Invalid Status",
+            "HTTP/2 200 OK",
+            "200 OK",
+            "",
+        ] {
+            for body in ["{\"status\":\"not_found\"}", "{\"status\":\"completed\"}"] {
+                let response = format!("{header}\r\n\r\n{body}");
+                let error = parse_job_status(&lease, &response).unwrap_err();
+                assert!(format!("{error:#}").contains("ownership remains unresolved"));
+                assert_eq!(lease, original);
+            }
+        }
+        assert!(parse_job_status(&lease, "HTTP/1.1 200 OK").is_err());
+        assert!(parse_job_status(&lease, "HTTP/1.1 200 OK\r\n\r\ninvalid JSON").is_err());
+    }
 
     #[cfg(unix)]
     #[test]
