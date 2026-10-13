@@ -28,13 +28,21 @@ struct DirectoryIdentity {
 
 impl DirectoryIdentity {
     fn of(metadata: &Metadata) -> Result<Self> {
-        ensure!(metadata.file_type().is_dir(), "workspace path is not a real directory");
+        ensure!(
+            metadata.file_type().is_dir(),
+            "workspace path is not a real directory"
+        );
         Ok(Self {
             modified: metadata.modified()?,
             #[cfg(unix)]
             inode: {
                 use std::os::unix::fs::MetadataExt;
-                (metadata.dev(), metadata.ino(), metadata.ctime(), metadata.ctime_nsec())
+                (
+                    metadata.dev(),
+                    metadata.ino(),
+                    metadata.ctime(),
+                    metadata.ctime_nsec(),
+                )
             },
         })
     }
@@ -88,7 +96,10 @@ fn prefix(pattern: &str) -> Result<Option<Prefix>> {
         // in the fingerprint costs a possible cache miss, never a false hit.
         return Ok(None);
     }
-    ensure!(!pattern.starts_with('/'), "workspace must stay inside the owned project");
+    ensure!(
+        !pattern.starts_with('/'),
+        "workspace must stay inside the owned project"
+    );
     let mut components = Vec::new();
     let mut recursive = false;
     for part in pattern.split('/') {
@@ -107,27 +118,47 @@ fn prefix(pattern: &str) -> Result<Option<Prefix>> {
             components.push(part.to_owned());
         }
     }
-    ensure!(components.len() <= MAX_DEPTH, "workspace path exceeds depth limit");
-    Ok(Some(Prefix { components, recursive }))
+    ensure!(
+        components.len() <= MAX_DEPTH,
+        "workspace path exceeds depth limit"
+    );
+    Ok(Some(Prefix {
+        components,
+        recursive,
+    }))
 }
 
 fn declarations(bytes: &[u8]) -> Result<Vec<Prefix>> {
-    let manifest: serde_json::Value = serde_json::from_slice(bytes).context("parse package.json")?;
-    let object = manifest.as_object().context("package.json must be an object")?;
+    let manifest: serde_json::Value =
+        serde_json::from_slice(bytes).context("parse package.json")?;
+    let object = manifest
+        .as_object()
+        .context("package.json must be an object")?;
     let Some(workspaces) = object.get("workspaces") else {
         return Ok(Vec::new());
     };
     // Yarn's object form is also accepted by npm's workspace reader.
     let declarations = if workspaces.is_object() {
-        workspaces.get("packages").context("workspaces object is missing packages")?
+        workspaces
+            .get("packages")
+            .context("workspaces object is missing packages")?
     } else {
         workspaces
     };
-    let declarations = declarations.as_array().context("workspaces must be an array of paths")?;
-    ensure!(declarations.len() <= MAX_PATTERNS, "too many workspace declarations");
+    let declarations = declarations
+        .as_array()
+        .context("workspaces must be an array of paths")?;
+    ensure!(
+        declarations.len() <= MAX_PATTERNS,
+        "too many workspace declarations"
+    );
     let mut prefixes = Vec::new();
     for declaration in declarations {
-        if let Some(prefix) = prefix(declaration.as_str().context("workspace path must be a string")?)? {
+        if let Some(prefix) = prefix(
+            declaration
+                .as_str()
+                .context("workspace path must be a string")?,
+        )? {
             prefixes.push(prefix);
         }
     }
@@ -147,16 +178,24 @@ impl Walk {
         let metadata = match std::fs::symlink_metadata(path) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-            Err(error) => return Err(error).with_context(|| format!("inspect workspace {}", path.display())),
+            Err(error) => {
+                return Err(error).with_context(|| format!("inspect workspace {}", path.display()));
+            }
         };
         // A declared directory must not be followed through a symlink. Its
         // canonical target could be outside the source ownership grant.
         let identity = DirectoryIdentity::of(&metadata)
             .with_context(|| format!("inspect workspace {}", path.display()))?;
         if let Some((_, previous)) = self.directories.iter().find(|(seen, _)| seen == path) {
-            ensure!(*previous == identity, "workspace directory changed during discovery");
+            ensure!(
+                *previous == identity,
+                "workspace directory changed during discovery"
+            );
         } else {
-            ensure!(self.directories.len() < MAX_DIRECTORIES, "workspace directory limit exceeded");
+            ensure!(
+                self.directories.len() < MAX_DIRECTORIES,
+                "workspace directory limit exceeded"
+            );
             self.directories.push((path.to_path_buf(), identity));
         }
         Ok(true)
@@ -166,8 +205,14 @@ impl Walk {
         let path = directory.join("package.json");
         match std::fs::symlink_metadata(&path) {
             Ok(metadata) => {
-                ensure!(metadata.file_type().is_file(), "workspace package.json is not a regular file: {}", path.display());
-                let relative = path.strip_prefix(&self.root).context("workspace escaped project")?;
+                ensure!(
+                    metadata.file_type().is_file(),
+                    "workspace package.json is not a regular file: {}",
+                    path.display()
+                );
+                let relative = path
+                    .strip_prefix(&self.root)
+                    .context("workspace escaped project")?;
                 // Slash-separated names are stable across filesystem backends.
                 let mut pieces = Vec::new();
                 for piece in relative.iter() {
@@ -177,7 +222,10 @@ impl Walk {
                 ensure!(name.len() <= 4096, "workspace manifest path exceeds limit");
                 if name != "package.json" {
                     self.manifests.insert(name);
-                    ensure!(self.manifests.len() <= MAX_MANIFESTS, "workspace manifest limit exceeded");
+                    ensure!(
+                        self.manifests.len() <= MAX_MANIFESTS,
+                        "workspace manifest limit exceeded"
+                    );
                 }
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -187,15 +235,23 @@ impl Walk {
     }
 
     fn scan(&mut self, directory: PathBuf, depth: usize) -> Result<()> {
-        ensure!(depth <= MAX_DEPTH, "workspace discovery exceeds depth limit");
+        ensure!(
+            depth <= MAX_DEPTH,
+            "workspace discovery exceeds depth limit"
+        );
         if !self.observe_directory(&directory)? || !self.expanded.insert(directory.clone()) {
             return Ok(());
         }
         self.manifest(&directory)?;
-        for entry in std::fs::read_dir(&directory).with_context(|| format!("read workspace {}", directory.display()))? {
+        for entry in std::fs::read_dir(&directory)
+            .with_context(|| format!("read workspace {}", directory.display()))?
+        {
             let entry = entry?;
             self.entries += 1;
-            ensure!(self.entries <= MAX_ENTRIES, "workspace entry limit exceeded");
+            ensure!(
+                self.entries <= MAX_ENTRIES,
+                "workspace entry limit exceeded"
+            );
             let name = entry.file_name();
             if name == "node_modules" || name == ".git" {
                 continue;
@@ -206,7 +262,10 @@ impl Walk {
             } else if file_type.is_symlink() {
                 // Conservatively refuse an uninspectable subtree rather than
                 // silently omitting a possible workspace. Never follow it.
-                bail!("workspace discovery encountered a symlink: {}", entry.path().display());
+                bail!(
+                    "workspace discovery encountered a symlink: {}",
+                    entry.path().display()
+                );
             }
         }
         Ok(())
@@ -221,14 +280,23 @@ pub(super) fn discover(project: &Path, root_names: &[&str]) -> Result<Inventory>
         manifests: BTreeSet::new(),
         entries: 0,
     };
-    ensure!(walk.observe_directory(project)?, "workspace project is missing");
+    ensure!(
+        walk.observe_directory(project)?,
+        "workspace project is missing"
+    );
     let path = project.join("package.json");
     let metadata = std::fs::symlink_metadata(&path)
         .with_context(|| format!("no package manifest found in {}", project.display()))?;
     let identity = InputIdentity::of(&metadata)?;
-    ensure!(identity.len <= MAX_INPUT_BYTES, "dependency inputs exceed byte limit");
+    ensure!(
+        identity.len <= MAX_INPUT_BYTES,
+        "dependency inputs exceed byte limit"
+    );
     let mut file = File::open(&path)?;
-    ensure!(InputIdentity::of(&file.metadata()?)? == identity, "package.json changed before workspace discovery");
+    ensure!(
+        InputIdentity::of(&file.metadata()?)? == identity,
+        "package.json changed before workspace discovery"
+    );
     let mut bytes = Vec::new();
     (&mut file).take(identity.len + 1).read_to_end(&mut bytes)?;
     ensure!(
@@ -238,7 +306,10 @@ pub(super) fn discover(project: &Path, root_names: &[&str]) -> Result<Inventory>
         "package.json changed during workspace discovery"
     );
     let prefixes = declarations(&bytes)?;
-    let root_manifest = InputObservation { identity, digest: blake3::hash(&bytes) };
+    let root_manifest = InputObservation {
+        identity,
+        digest: blake3::hash(&bytes),
+    };
     for prefix in prefixes {
         let mut directory = project.to_path_buf();
         let mut exists = true;
@@ -257,9 +328,16 @@ pub(super) fn discover(project: &Path, root_names: &[&str]) -> Result<Inventory>
             }
         }
     }
-    let names = root_names.iter().map(|name| (*name).to_owned())
-        .chain(walk.manifests).collect();
-    Ok(Inventory { names, root_manifest, directories: walk.directories })
+    let names = root_names
+        .iter()
+        .map(|name| (*name).to_owned())
+        .chain(walk.manifests)
+        .collect();
+    Ok(Inventory {
+        names,
+        root_manifest,
+        directories: walk.directories,
+    })
 }
 
 #[cfg(test)]
@@ -270,7 +348,11 @@ mod tests {
 
     fn project(workspaces: &str) -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("package.json"), format!(r#"{{"workspaces":{workspaces}}}"#)).unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            format!(r#"{{"workspaces":{workspaces}}}"#),
+        )
+        .unwrap();
         dir
     }
 
@@ -282,8 +364,10 @@ mod tests {
 
     #[test]
     fn discovers_literal_glob_recursive_and_object_workspaces_deterministically() {
-        for workspaces in [r#"["packages/*","literal","packages/**","!packages/excluded"]"#,
-            r#"{"packages":["packages/**","literal","packages/*"],"nohoist":["**"]}"#] {
+        for workspaces in [
+            r#"["packages/*","literal","packages/**","!packages/excluded"]"#,
+            r#"{"packages":["packages/**","literal","packages/*"],"nohoist":["**"]}"#,
+        ] {
             let dir = project(workspaces);
             member(dir.path(), "packages/z", "{}");
             member(dir.path(), "packages/a/nested", "{}");
@@ -293,9 +377,20 @@ mod tests {
             member(dir.path(), "packages/node_modules/generated", "{}");
             member(dir.path(), "packages/.git/generated", "{}");
             let inputs = DependencyInputs::capture(dir.path()).unwrap();
-            assert_eq!(inputs.fingerprint.sources, ["package.json", "literal/package.json",
-                "packages/a/nested/package.json", "packages/excluded/package.json", "packages/z/package.json"]);
-            assert_eq!(inputs.fingerprint, DependencyInputs::capture(dir.path()).unwrap().fingerprint);
+            assert_eq!(
+                inputs.fingerprint.sources,
+                [
+                    "package.json",
+                    "literal/package.json",
+                    "packages/a/nested/package.json",
+                    "packages/excluded/package.json",
+                    "packages/z/package.json"
+                ]
+            );
+            assert_eq!(
+                inputs.fingerprint,
+                DependencyInputs::capture(dir.path()).unwrap().fingerprint
+            );
         }
     }
 
@@ -307,15 +402,27 @@ mod tests {
         member(dir.path(), "packages/a", r#"{"name":"other"}"#);
         let edited = DependencyInputs::capture(dir.path()).unwrap();
         assert_ne!(original.fingerprint.hash, edited.fingerprint.hash);
-        assert!(original.verify_after(&edited, RequiredRuntime::Node, PrepareAction::Installed).is_err());
+        assert!(
+            original
+                .verify_after(&edited, RequiredRuntime::Node, PrepareAction::Installed)
+                .is_err()
+        );
         member(dir.path(), "packages/b", "{}");
         let added = DependencyInputs::capture(dir.path()).unwrap();
         assert_ne!(edited.fingerprint.hash, added.fingerprint.hash);
-        assert!(edited.verify_after(&added, RequiredRuntime::Bun, PrepareAction::Installed).is_err());
+        assert!(
+            edited
+                .verify_after(&added, RequiredRuntime::Bun, PrepareAction::Installed)
+                .is_err()
+        );
         std::fs::rename(dir.path().join("packages/b"), dir.path().join("retained-b")).unwrap();
         let removed = DependencyInputs::capture(dir.path()).unwrap();
         assert_ne!(added.fingerprint.hash, removed.fingerprint.hash);
-        assert!(added.verify_after(&removed, RequiredRuntime::Node, PrepareAction::Skipped).is_err());
+        assert!(
+            added
+                .verify_after(&removed, RequiredRuntime::Node, PrepareAction::Skipped)
+                .is_err()
+        );
     }
 
     #[test]
@@ -328,7 +435,9 @@ mod tests {
         member(dir.path(), "unrelated", "{}");
         let after = DependencyInputs::capture(dir.path()).unwrap();
         assert_eq!(before.fingerprint, after.fingerprint);
-        before.verify_after(&after, RequiredRuntime::Node, PrepareAction::Skipped).unwrap();
+        before
+            .verify_after(&after, RequiredRuntime::Node, PrepareAction::Skipped)
+            .unwrap();
     }
 
     #[test]
@@ -342,11 +451,24 @@ mod tests {
 
     #[test]
     fn escapes_unsupported_patterns_and_malformed_declarations_are_refused() {
-        for declaration in [r#"["../outside"]"#, r#"["/outside"]"#, r#"["packages/../outside"]"#,
-            r#"["packages/{a,b}"]"#, r#"["packages/[ab]"]"#, r#"["node_modules/*"]"#,
-            r#"["C:\\outside"]"#, r#"[42]"#, "null", r#"{}"#, r#""packages/*""#] {
+        for declaration in [
+            r#"["../outside"]"#,
+            r#"["/outside"]"#,
+            r#"["packages/../outside"]"#,
+            r#"["packages/{a,b}"]"#,
+            r#"["packages/[ab]"]"#,
+            r#"["node_modules/*"]"#,
+            r#"["C:\\outside"]"#,
+            r#"[42]"#,
+            "null",
+            r#"{}"#,
+            r#""packages/*""#,
+        ] {
             let dir = project(declaration);
-            assert!(DependencyInputs::capture(dir.path()).is_err(), "{declaration}");
+            assert!(
+                DependencyInputs::capture(dir.path()).is_err(),
+                "{declaration}"
+            );
         }
     }
 
@@ -358,9 +480,16 @@ mod tests {
         for pattern in [r#"["packages/a"]"#, r#"["packages/*"]"#] {
             let dir = project(pattern);
             std::fs::create_dir(dir.path().join("packages")).unwrap();
-            std::os::unix::fs::symlink(outside.path().join("private"), dir.path().join("packages/a")).unwrap();
+            std::os::unix::fs::symlink(
+                outside.path().join("private"),
+                dir.path().join("packages/a"),
+            )
+            .unwrap();
             assert!(DependencyInputs::capture(dir.path()).is_err());
-            assert_eq!(std::fs::read(outside.path().join("private/package.json")).unwrap(), b"{}");
+            assert_eq!(
+                std::fs::read(outside.path().join("private/package.json")).unwrap(),
+                b"{}"
+            );
         }
     }
 
@@ -370,7 +499,10 @@ mod tests {
         member(dir.path(), "packages/a", "{}");
         member(dir.path(), "packages/a/fixtures", "{}");
         let inputs = DependencyInputs::capture(dir.path()).unwrap();
-        assert_eq!(inputs.fingerprint.sources, ["package.json", "packages/a/package.json"]);
+        assert_eq!(
+            inputs.fingerprint.sources,
+            ["package.json", "packages/a/package.json"]
+        );
     }
 
     #[test]
@@ -381,7 +513,9 @@ mod tests {
         }
         assert!(DependencyInputs::capture(dir.path()).is_err());
         let deep = project(r#"["packages/**"]"#);
-        let nested = std::iter::repeat_n("d", MAX_DEPTH + 1).collect::<Vec<_>>().join("/");
+        let nested = std::iter::repeat_n("d", MAX_DEPTH + 1)
+            .collect::<Vec<_>>()
+            .join("/");
         member(deep.path(), &format!("packages/{nested}"), "{}");
         assert!(DependencyInputs::capture(deep.path()).is_err());
     }

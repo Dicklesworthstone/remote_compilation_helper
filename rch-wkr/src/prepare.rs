@@ -197,7 +197,8 @@ impl DependencyInputs {
                 (Some(before), Some(current)) if before == current => {}
                 (None, None) => {}
                 (None, Some(_))
-                    if action == PrepareAction::Installed && generated.contains(&name.as_str()) => {}
+                    if action == PrepareAction::Installed && generated.contains(&name.as_str()) => {
+                }
                 _ => bail!("dependency input {name} changed during preparation"),
             }
         }
