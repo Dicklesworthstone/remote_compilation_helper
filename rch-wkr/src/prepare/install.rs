@@ -7,7 +7,7 @@
 //!
 //! For non-Node runtimes (Rust, C/C++, plain shell) `prepare()` is a no-op.
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, ensure};
 use blake3::Hasher;
 use chrono::{DateTime, Utc};
 use rch_common::types::RequiredRuntime;
@@ -23,6 +23,30 @@ use tracing::{info, warn};
 /// install (network hang, registry stall) MUST NOT block the worker
 /// indefinitely. Override via `RCH_PREPARE_INSTALL_TIMEOUT_SECS`.
 const DEFAULT_INSTALL_TIMEOUT_SECS: u64 = 300; // 5 minutes
+
+// One vocabulary for installation, cache identity and the outer transaction's
+// stable-input checks. In particular, npm-shrinkwrap.json takes precedence over
+// package-lock.json in npm, and .npmrc can change the installed dependency tree.
+pub(super) const INPUT_NAMES: &[&str] = &[
+    "package.json",
+    "bun.lock",
+    "bun.lockb",
+    "package-lock.json",
+    "pnpm-lock.yaml",
+    "yarn.lock",
+    "bunfig.toml",
+    "npm-shrinkwrap.json",
+    ".npmrc",
+];
+
+pub(super) fn fingerprint_hasher() -> Hasher {
+    let mut hasher = Hasher::new();
+    // Invalidate stamps produced before locked-manager selection was enforced.
+    // The old Bun hint could install with Bun against an npm lock, so even an
+    // unchanged old manifest/lock stamp is not evidence of the selected install.
+    hasher.update(b"rch-dependency-install-v2\0");
+    hasher
+}
 
 /// Action taken during prepare.
 ///
@@ -104,23 +128,84 @@ impl PackageManager {
     }
 }
 
-/// Detect which package manager a Node-flavored project uses based on
-/// which lockfile is present. Defaults to npm when only `package.json` is.
-///
-/// Bun ≥1.2 emits a TEXT lockfile at `bun.lock` by default; older Bun
-/// emits a binary `bun.lockb`. Either signals a Bun project. We probe
-/// both forms.
-pub fn detect_package_manager(project_root: &Path) -> PackageManager {
-    if project_root.join("bun.lock").exists() || project_root.join("bun.lockb").exists() {
-        return PackageManager::Bun;
+/// Install intent derived from the observed inputs, before any cache hit or
+/// installer dispatch. A runtime hint chooses only a lockfile-free bootstrap;
+/// it cannot replace the package manager selected by an existing lockfile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct InstallPlan {
+    manager: PackageManager,
+    locked: bool,
+}
+
+impl InstallPlan {
+    pub(super) fn for_sources(sources: &[String], runtime: RequiredRuntime) -> Result<Self> {
+        let families: &[(PackageManager, &[&str])] = &[
+            (PackageManager::Bun, &["bun.lock", "bun.lockb"]),
+            (PackageManager::Pnpm, &["pnpm-lock.yaml"]),
+            (PackageManager::Yarn, &["yarn.lock"]),
+            (PackageManager::Npm, &["package-lock.json", "npm-shrinkwrap.json"]),
+        ];
+        let mut selected = None;
+        for (manager, locks) in families {
+            if sources.iter().any(|name| locks.contains(&name.as_str())) {
+                ensure!(
+                    selected.is_none(),
+                    "conflicting package-manager lockfiles; select one manager before preparation"
+                );
+                selected = Some(*manager);
+            }
+        }
+        Ok(Self {
+            manager: selected.unwrap_or(if runtime == RequiredRuntime::Bun {
+                PackageManager::Bun
+            } else {
+                PackageManager::Npm
+            }),
+            locked: selected.is_some(),
+        })
     }
-    if project_root.join("pnpm-lock.yaml").exists() {
-        return PackageManager::Pnpm;
+
+    fn command(self) -> Vec<String> {
+        if self.locked {
+            self.manager.install_command()
+        } else {
+            // npm ci REQUIRES a lockfile. Choose install before dispatch, not
+            // as a retry after a locked install fails or changes dependencies.
+            let program = match self.manager {
+                PackageManager::Bun => "bun",
+                PackageManager::Pnpm => "pnpm",
+                PackageManager::Yarn => "yarn",
+                PackageManager::Npm => "npm",
+            };
+            vec![program.into(), "install".into()]
+        }
     }
-    if project_root.join("yarn.lock").exists() {
-        return PackageManager::Yarn;
+
+    pub(super) fn generated_lockfiles(self) -> &'static [&'static str] {
+        if self.locked {
+            // A frozen install may not introduce another lockfile, even one
+            // from the same family. Existing files are checked independently.
+            return &[];
+        }
+        match self.manager {
+            PackageManager::Bun => &["bun.lock", "bun.lockb"],
+            PackageManager::Pnpm => &["pnpm-lock.yaml"],
+            PackageManager::Yarn => &["yarn.lock"],
+            PackageManager::Npm => &["package-lock.json"],
+        }
     }
-    PackageManager::Npm
+}
+
+#[cfg(test)]
+fn detect_package_manager(project_root: &Path) -> PackageManager {
+    let sources = INPUT_NAMES
+        .iter()
+        .filter(|name| project_root.join(name).exists())
+        .map(|name| (*name).to_owned())
+        .collect::<Vec<_>>();
+    InstallPlan::for_sources(&sources, RequiredRuntime::Node)
+        .expect("unambiguous test project")
+        .manager
 }
 
 /// Compute a fingerprint over the project's manifest + lockfiles.
@@ -132,19 +217,11 @@ pub fn detect_package_manager(project_root: &Path) -> PackageManager {
 ///   2. Switching package manager (yarn → pnpm) produces a different hash
 ///      even if the lockfile bytes happened to be identical.
 pub async fn compute_fingerprint(project_root: &Path) -> Result<DependencyFingerprint> {
-    let mut hasher = Hasher::new();
+    let mut hasher = fingerprint_hasher();
     let mut sources = Vec::new();
     // `bun.lock` (text, Bun ≥1.2) AND `bun.lockb` (binary, older Bun) are both
     // probed so a project that switches Bun versions still hashes correctly.
-    for name in [
-        "package.json",
-        "bun.lock",
-        "bun.lockb",
-        "package-lock.json",
-        "pnpm-lock.yaml",
-        "yarn.lock",
-        "bunfig.toml",
-    ] {
+    for name in INPUT_NAMES {
         let p = project_root.join(name);
         if p.exists() {
             let bytes = tokio::fs::read(&p)
@@ -407,10 +484,12 @@ async fn prepare_node_like(
     let _guard = lock.lock().await;
 
     let fingerprint = compute_fingerprint(project_root).await?;
+    let plan = InstallPlan::for_sources(&fingerprint.sources, runtime)?;
     let cached = read_cached_fingerprint(project_root).await;
 
     // Cache hit: skip install
     if let Some(prev) = &cached
+        && plan.locked
         && prev.hash == fingerprint.hash
         && project_root.join("node_modules").exists()
     {
@@ -433,27 +512,10 @@ async fn prepare_node_like(
         });
     }
 
-    // Cache miss: install. When the runtime hint is Bun and there's no
-    // lockfile that would otherwise specify a package manager, prefer
-    // `bun install` over the Npm default — the user explicitly asked for
-    // the Bun runtime, so respect that intent.
-    let pm = match (runtime, detect_package_manager(project_root)) {
-        // If runtime=Bun and detected fell back to Npm (no lockfile), use Bun.
-        (RequiredRuntime::Bun, PackageManager::Npm) => PackageManager::Bun,
-        (_, p) => p,
-    };
-    // Bun has both a binary lockfile (`bun.lockb`, older) and a text
-    // lockfile (`bun.lock`, Bun ≥1.2). EITHER form means a lockfile
-    // exists and `--frozen-lockfile` is appropriate. Only when NEITHER
-    // exists do we fall back to permissive `bun install` (first run on
-    // a fresh project).
-    let bun_has_lockfile =
-        project_root.join("bun.lockb").exists() || project_root.join("bun.lock").exists();
-    let cmd = if pm == PackageManager::Bun && !bun_has_lockfile {
-        vec!["bun".into(), "install".into()]
-    } else {
-        pm.install_command()
-    };
+    // Lockfile-free installs cannot reuse a stamp: neither the dependency
+    // resolution nor the runtime-selected manager is pinned in that case.
+    let pm = plan.manager;
+    let cmd = plan.command();
     tokio::fs::create_dir_all(log_dir).await.ok();
     let log_path = log_dir.join(format!(
         "prepare_{}.log",
@@ -579,6 +641,151 @@ async fn prepare_node_like(
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    fn plan(sources: &[&str], runtime: RequiredRuntime) -> InstallPlan {
+        InstallPlan::for_sources(
+            &sources.iter().map(|name| (*name).to_owned()).collect::<Vec<_>>(),
+            runtime,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn npm_bootstrap_uses_install_but_existing_npm_locks_always_use_ci() {
+        assert_eq!(plan(&[], RequiredRuntime::Node).command(), ["npm", "install"]);
+        assert_eq!(plan(&[], RequiredRuntime::Bun).command(), ["bun", "install"]);
+        for lock in ["package-lock.json", "npm-shrinkwrap.json"] {
+            for runtime in [RequiredRuntime::Node, RequiredRuntime::Bun] {
+                let selected = plan(&[lock], runtime);
+                assert_eq!(selected.command(), ["npm", "ci"], "{lock}/{runtime:?}");
+                assert!(selected.locked);
+                assert!(selected.generated_lockfiles().is_empty());
+            }
+        }
+        assert_eq!(
+            plan(
+                &["package-lock.json", "npm-shrinkwrap.json"],
+                RequiredRuntime::Bun,
+            )
+            .command(),
+            ["npm", "ci"]
+        );
+    }
+
+    #[test]
+    fn every_non_npm_lock_family_keeps_its_frozen_command_for_both_runtimes() {
+        for (lock, program) in [
+            ("bun.lock", "bun"),
+            ("bun.lockb", "bun"),
+            ("pnpm-lock.yaml", "pnpm"),
+            ("yarn.lock", "yarn"),
+        ] {
+            for runtime in [RequiredRuntime::Node, RequiredRuntime::Bun] {
+                assert_eq!(
+                    plan(&[lock], runtime).command(),
+                    [program, "install", "--frozen-lockfile"]
+                );
+                assert!(plan(&[lock], runtime).generated_lockfiles().is_empty());
+            }
+        }
+        assert_eq!(
+            plan(&["bun.lock", "bun.lockb"], RequiredRuntime::Node).command(),
+            ["bun", "install", "--frozen-lockfile"]
+        );
+    }
+
+    #[test]
+    fn mixed_manager_lockfiles_are_not_resolved_by_arbitrary_priority() {
+        let locks = ["bun.lock", "pnpm-lock.yaml", "yarn.lock", "package-lock.json"];
+        for first in 0..locks.len() {
+            for second in first + 1..locks.len() {
+                for runtime in [RequiredRuntime::Node, RequiredRuntime::Bun] {
+                    let sources = vec![locks[first].to_owned(), locks[second].to_owned()];
+                    let error = InstallPlan::for_sources(&sources, runtime).unwrap_err();
+                    assert!(
+                        error
+                            .to_string()
+                            .contains("conflicting package-manager lockfiles")
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn only_lockfile_free_bootstraps_may_generate_the_selected_managers_lock() {
+        let npm = plan(&["package.json", ".npmrc"], RequiredRuntime::Node);
+        let bun = plan(&["package.json", "bunfig.toml"], RequiredRuntime::Bun);
+        assert!(
+            !npm.locked && !bun.locked,
+            "unlocked resolution is not cacheable"
+        );
+        assert_eq!(npm.generated_lockfiles(), ["package-lock.json"]);
+        assert_eq!(bun.generated_lockfiles(), ["bun.lock", "bun.lockb"]);
+    }
+
+    #[tokio::test]
+    async fn shrinkwrap_and_project_npm_configuration_change_the_fingerprint() {
+        let fixture = TempDir::new().unwrap();
+        make_node_project(fixture.path(), "{}", Some(("package-lock.json", "locked")));
+        let initial = compute_fingerprint(fixture.path()).await.unwrap();
+        std::fs::write(fixture.path().join("npm-shrinkwrap.json"), b"shrinkwrap one").unwrap();
+        let shrinkwrap = compute_fingerprint(fixture.path()).await.unwrap();
+        assert_ne!(initial.hash, shrinkwrap.hash);
+        std::fs::write(fixture.path().join("npm-shrinkwrap.json"), b"shrinkwrap two").unwrap();
+        let changed = compute_fingerprint(fixture.path()).await.unwrap();
+        assert_ne!(changed.hash, shrinkwrap.hash);
+        std::fs::write(fixture.path().join(".npmrc"), b"legacy-peer-deps=true\n").unwrap();
+        let configured = compute_fingerprint(fixture.path()).await.unwrap();
+        assert_ne!(changed.hash, configured.hash);
+        assert!(configured.sources.contains(&".npmrc".to_owned()));
+        std::fs::write(fixture.path().join(".npmrc"), b"legacy-peer-deps=false\n").unwrap();
+        assert_ne!(
+            configured.hash,
+            compute_fingerprint(fixture.path()).await.unwrap().hash
+        );
+    }
+
+    #[tokio::test]
+    async fn conflicting_locks_cannot_reuse_a_matching_cached_success() {
+        let fixture = TempDir::new().unwrap();
+        make_node_project(fixture.path(), "{}", Some(("bun.lock", "locked")));
+        std::fs::write(fixture.path().join("package-lock.json"), b"also locked").unwrap();
+        let fingerprint = compute_fingerprint(fixture.path()).await.unwrap();
+        write_cached_fingerprint(fixture.path(), &fingerprint).await.unwrap();
+        std::fs::create_dir(fixture.path().join("node_modules")).unwrap();
+        let logs = fixture.path().join("logs");
+        let error = prepare(fixture.path(), RequiredRuntime::Bun, &logs)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("conflicting package-manager lockfiles")
+        );
+        assert!(
+            !logs.exists(),
+            "ambiguous inputs must be refused before installer setup"
+        );
+    }
+
+    #[tokio::test]
+    async fn old_unqualified_fingerprint_is_not_a_valid_installation_stamp() {
+        let fixture = TempDir::new().unwrap();
+        make_node_project(fixture.path(), "{}", Some(("package-lock.json", "locked")));
+        let mut legacy = Hasher::new();
+        for (name, bytes) in [
+            ("package.json", b"{}".as_slice()),
+            ("package-lock.json", b"locked".as_slice()),
+        ] {
+            legacy.update(&(name.len() as u32).to_le_bytes());
+            legacy.update(name.as_bytes());
+            legacy.update(&(bytes.len() as u64).to_le_bytes());
+            legacy.update(bytes);
+        }
+        let current = compute_fingerprint(fixture.path()).await.unwrap();
+        assert_ne!(legacy.finalize().to_hex().as_str(), current.hash);
+    }
 
     fn make_node_project(dir: &Path, package_json: &str, lockfile: Option<(&str, &str)>) {
         std::fs::write(dir.join("package.json"), package_json).unwrap();
@@ -754,7 +961,7 @@ mod tests {
     async fn test_prepare_cache_hit_returns_skipped() {
         // TEST START: cache hit yields Skipped without running install
         let tmp = TempDir::new().unwrap();
-        make_node_project(tmp.path(), r#"{"name":"x"}"#, None);
+        make_node_project(tmp.path(), r#"{"name":"x"}"#, Some(("bun.lock", "locked")));
         // Pre-populate fingerprint AND node_modules so the cache hit fires.
         let fp = compute_fingerprint(tmp.path()).await.unwrap();
         write_cached_fingerprint(tmp.path(), &fp).await.unwrap();
@@ -847,7 +1054,7 @@ mod tests {
         // must NOT race. Exercises the cache-hit fast path. Both must
         // succeed and the persisted fingerprint must remain valid.
         let tmp = TempDir::new().unwrap();
-        make_node_project(tmp.path(), r#"{"name":"x"}"#, None);
+        make_node_project(tmp.path(), r#"{"name":"x"}"#, Some(("bun.lock", "locked")));
         let fp = compute_fingerprint(tmp.path()).await.unwrap();
         write_cached_fingerprint(tmp.path(), &fp).await.unwrap();
         std::fs::create_dir_all(tmp.path().join("node_modules")).unwrap();
@@ -876,7 +1083,7 @@ mod tests {
         // exist (or used different keys for the same project), the
         // second call would race ahead and return immediately.
         let tmp = TempDir::new().unwrap();
-        make_node_project(tmp.path(), r#"{"name":"x"}"#, None);
+        make_node_project(tmp.path(), r#"{"name":"x"}"#, Some(("bun.lock", "locked")));
         let fp = compute_fingerprint(tmp.path()).await.unwrap();
         write_cached_fingerprint(tmp.path(), &fp).await.unwrap();
         std::fs::create_dir_all(tmp.path().join("node_modules")).unwrap();

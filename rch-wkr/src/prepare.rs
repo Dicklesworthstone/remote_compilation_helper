@@ -10,6 +10,7 @@
 mod install;
 
 pub use install::{PrepareAction, PrepareReport};
+use install::{INPUT_NAMES, InstallPlan};
 
 use anyhow::{Context, Result, bail, ensure};
 use chrono::Utc;
@@ -26,18 +27,6 @@ const MAX_FINGERPRINT_BYTES: u64 = 16 * 1024;
 const LOCK_WAIT: Duration = Duration::from_secs(300);
 const FINGERPRINT_FILE: &str = ".rch_dep_fingerprint.json";
 const MAX_INPUT_BYTES: u64 = 32 * 1024 * 1024;
-// This is the installer's fingerprint vocabulary, in its canonical order.
-// Comparing the computed fingerprint to its report also fails closed if the
-// installer later adds a new input without updating this observation contract.
-const INPUT_NAMES: &[&str] = &[
-    "package.json",
-    "bun.lock",
-    "bun.lockb",
-    "package-lock.json",
-    "pnpm-lock.yaml",
-    "yarn.lock",
-    "bunfig.toml",
-];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct InputIdentity {
@@ -91,7 +80,7 @@ impl DependencyInputs {
             "dependency project is not a real directory"
         );
         let mut budget = MAX_INPUT_BYTES;
-        let mut hasher = blake3::Hasher::new();
+        let mut hasher = install::fingerprint_hasher();
         let mut sources = Vec::new();
         let mut members = Vec::new();
         for name in INPUT_NAMES {
@@ -184,19 +173,10 @@ impl DependencyInputs {
         );
         // Only the chosen installer's newly generated lockfile is permitted.
         // Existing files (including locks) must retain both bytes and identity.
-        // This mirrors the installer's current Bun/runtime preference exactly.
-        let bun = self.members[1].is_some() || self.members[2].is_some();
-        let pnpm = self.members[4].is_some();
-        let yarn = self.members[5].is_some();
-        let generated: &[&str] = if bun || (runtime == RequiredRuntime::Bun && !pnpm && !yarn) {
-            &["bun.lock", "bun.lockb"]
-        } else if pnpm {
-            &["pnpm-lock.yaml"]
-        } else if yarn {
-            &["yarn.lock"]
-        } else {
-            &["package-lock.json"]
-        };
+        // Use the same selection as dispatch. A Bun test against an npm-locked
+        // project still uses npm, and a frozen install may create no new lock.
+        let generated = InstallPlan::for_sources(&self.fingerprint.sources, runtime)?
+            .generated_lockfiles();
         for ((name, before), current) in INPUT_NAMES
             .iter()
             .zip(&self.members)
@@ -429,6 +409,9 @@ pub async fn prepare(
         let mut transaction = PrepareTransaction::acquire(project_root).await?;
         preflight_cache_files(&transaction.project)?;
         let inputs = DependencyInputs::capture(&transaction.project)?;
+        // A conflicting lock inventory has not started an installation. Refuse
+        // before RUNNING so correcting that input does not require recovery.
+        InstallPlan::for_sources(&inputs.fingerprint.sources, runtime)?;
         transaction.record(RUNNING)?;
         let mut report = install::prepare(&transaction.project, runtime, log_dir).await?;
         match report.action {
@@ -488,6 +471,52 @@ pub async fn prepare(
 mod tests {
     use super::*;
 
+    #[test]
+    fn npm_locked_bun_execution_cannot_publish_a_new_bun_lock() {
+        for npm_lock in ["package-lock.json", "npm-shrinkwrap.json"] {
+            let fixture = tempfile::tempdir().unwrap();
+            std::fs::write(fixture.path().join("package.json"), b"{}").unwrap();
+            std::fs::write(fixture.path().join(npm_lock), b"locked").unwrap();
+            let before = DependencyInputs::capture(fixture.path()).unwrap();
+            before
+                .verify_after(
+                    &DependencyInputs::capture(fixture.path()).unwrap(),
+                    RequiredRuntime::Bun,
+                    PrepareAction::Skipped,
+                )
+                .unwrap();
+            std::fs::write(fixture.path().join("bun.lock"), b"unexpected migration").unwrap();
+            assert!(
+                before
+                    .verify_after(
+                        &DependencyInputs::capture(fixture.path()).unwrap(),
+                        RequiredRuntime::Bun,
+                        PrepareAction::Installed,
+                    )
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn shrinkwrap_and_project_config_cannot_change_during_installation() {
+        for name in ["npm-shrinkwrap.json", ".npmrc"] {
+            let fixture = tempfile::tempdir().unwrap();
+            std::fs::write(fixture.path().join("package.json"), b"{}").unwrap();
+            std::fs::write(fixture.path().join(name), b"first").unwrap();
+            let before = DependencyInputs::capture(fixture.path()).unwrap();
+            std::fs::write(fixture.path().join(name), b"other").unwrap();
+            let error = before
+                .verify_after(
+                    &DependencyInputs::capture(fixture.path()).unwrap(),
+                    RequiredRuntime::Node,
+                    PrepareAction::Installed,
+                )
+                .unwrap_err();
+            assert!(error.to_string().contains(name));
+        }
+    }
+
     #[tokio::test]
     async fn input_observation_matches_the_installers_fingerprint() {
         let fixture = tempfile::tempdir().unwrap();
@@ -499,13 +528,16 @@ mod tests {
             inputs.fingerprint,
             install::compute_fingerprint(fixture.path()).await.unwrap()
         );
-        inputs
-            .verify_after(
-                &DependencyInputs::capture(fixture.path()).unwrap(),
-                RequiredRuntime::Node,
-                PrepareAction::Skipped,
-            )
-            .unwrap();
+        assert!(
+            inputs
+                .verify_after(
+                    &DependencyInputs::capture(fixture.path()).unwrap(),
+                    RequiredRuntime::Node,
+                    PrepareAction::Skipped,
+                )
+                .is_err(),
+            "mixed-manager inventory cannot be a completed preparation"
+        );
     }
 
     #[test]
