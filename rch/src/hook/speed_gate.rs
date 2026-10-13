@@ -25,6 +25,7 @@
 //!   invalid pressure metrics never admit a local build.
 use super::timing_history::{ProjectTimingData, TimingRecord, timing_cache};
 use rch_common::CompilationKind;
+use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
@@ -196,20 +197,74 @@ pub(super) struct SpeedGateInputs {
     /// A mode a local run cannot satisfy: clean overlay, source-content
     /// receipt, retained Cargo JSON stdout, an exact worker, required tools.
     pub strict_remote_mode: bool,
-    /// The caller explicitly forced remote (`RCH_FORCE_REMOTE`, or
-    /// `general.force_remote` not explained by the shim's blanket
-    /// `RCH_REQUIRE_REMOTE=1`).
+    /// Additional force-remote policy resolved by the caller. The gate also
+    /// checks operator environment directly before considering local history.
     pub caller_force_remote: bool,
 }
 
-/// Like `general.force_local`, the gate is a deliberate placement rather than
-/// a fallback, so the shim's blanket `RCH_REQUIRE_REMOTE=1` does not disable
-/// it. An explicit caller force-remote and every strict mode do.
+/// Snapshot placement variables without modifying the process environment.
+#[derive(Debug, Default)]
+struct PlacementEnvironment {
+    require_remote: Option<OsString>,
+    shim_pid: Option<OsString>,
+    force_remote: Option<OsString>,
+    worker: Option<OsString>,
+}
+
+impl PlacementEnvironment {
+    fn read() -> Self {
+        Self {
+            require_remote: std::env::var_os("RCH_REQUIRE_REMOTE"),
+            shim_pid: std::env::var_os("RCH_SPEED_GATE_SHIM_PID"),
+            force_remote: std::env::var_os("RCH_FORCE_REMOTE"),
+            worker: std::env::var_os("RCH_WORKER"),
+        }
+    }
+
+    fn allows_local(&self, pid: u32) -> bool {
+        // Only the canonical shim's *default injection* may be relaxed. It
+        // clears stale markers and sets this PID immediately before exec, so
+        // an inherited marker cannot authorize a later child invocation. An
+        // explicit value is never overwritten or marked by either shim.
+        let expected_pid = pid.to_string();
+        let shim_default = self.require_remote.as_deref() == Some(OsStr::new("1"))
+            && self.shim_pid.as_deref() == Some(OsStr::new(&expected_pid));
+        !remote_flag_requested(self.force_remote.as_deref())
+            && !self.worker.as_ref().is_some_and(|worker| !worker.is_empty())
+            && (!remote_flag_requested(self.require_remote.as_deref()) || shim_default)
+    }
+}
+
+/// Only a recognized false value relaxes placement. Malformed/non-UTF-8
+/// operator settings must not accidentally authorize a local measurement.
+fn remote_flag_requested(value: Option<&OsStr>) -> bool {
+    value.is_some_and(|value| {
+        value.to_str().is_none_or(|value| {
+            !matches!(
+                value.to_ascii_lowercase().as_str(),
+                "" | "0" | "false" | "no" | "off"
+            )
+        })
+    })
+}
+
+/// Explicit remote-only requests always bypass the speed gate. Only a shim
+/// default bound to this exact exec process permits deliberate local placement;
+/// it still forbids local fallback after remote failure in the normal exec path.
 pub(super) fn gate_applies(inputs: SpeedGateInputs) -> bool {
+    gate_applies_with_environment(inputs, &PlacementEnvironment::read(), std::process::id())
+}
+
+fn gate_applies_with_environment(
+    inputs: SpeedGateInputs,
+    placement: &PlacementEnvironment,
+    pid: u32,
+) -> bool {
     inputs.local_slots > 0
         && !inputs.job
         && !inputs.strict_remote_mode
         && !inputs.caller_force_remote
+        && placement.allows_local(pid)
         && matches!(inputs.kind, Some(kind) if kind != CompilationKind::Job)
 }
 
@@ -550,34 +605,116 @@ mod tests {
     }
 
     #[test]
-    fn caller_force_remote_and_strict_modes_disable_the_gate_but_the_shim_does_not() {
-        // The shim's blanket RCH_REQUIRE_REMOTE=1 is not a caller force-remote,
-        // so a shim-routed build with the gate enabled is still gated.
-        assert!(gate_applies(inputs()));
-        assert!(!gate_applies(SpeedGateInputs {
+    fn caller_force_remote_and_strict_modes_override_even_a_verified_shim() {
+        let placement = PlacementEnvironment {
+            require_remote: Some("1".into()),
+            shim_pid: Some("42".into()),
+            ..PlacementEnvironment::default()
+        };
+        let applies = |inputs| gate_applies_with_environment(inputs, &placement, 42);
+        assert!(applies(inputs()));
+        assert!(!applies(SpeedGateInputs {
             local_slots: 0,
             ..inputs()
         }));
-        assert!(!gate_applies(SpeedGateInputs {
+        assert!(!applies(SpeedGateInputs {
             caller_force_remote: true,
             ..inputs()
         }));
-        assert!(!gate_applies(SpeedGateInputs {
+        assert!(!applies(SpeedGateInputs {
             strict_remote_mode: true,
             ..inputs()
         }));
-        assert!(!gate_applies(SpeedGateInputs {
+        assert!(!applies(SpeedGateInputs {
             job: true,
             ..inputs()
         }));
-        assert!(!gate_applies(SpeedGateInputs {
+        assert!(!applies(SpeedGateInputs {
             kind: Some(CompilationKind::Job),
             ..inputs()
         }));
-        assert!(!gate_applies(SpeedGateInputs {
+        assert!(!applies(SpeedGateInputs {
             kind: None,
             ..inputs()
         }));
+    }
+
+    #[test]
+    fn explicit_remote_requests_and_unrecognized_provenance_never_run_locally() {
+        for required in ["1", "true", "TRUE", "yes", "ON", "invalid"] {
+            for marker in [None, Some(""), Some("41"), Some("042"), Some("bad-pid")] {
+                let placement = PlacementEnvironment {
+                    require_remote: Some(required.into()),
+                    shim_pid: marker.map(Into::into),
+                    ..PlacementEnvironment::default()
+                };
+                assert!(!gate_applies_with_environment(inputs(), &placement, 42));
+            }
+        }
+        let mut placement = PlacementEnvironment {
+            require_remote: Some("1".into()),
+            shim_pid: Some("42".into()),
+            ..PlacementEnvironment::default()
+        };
+        assert!(gate_applies_with_environment(inputs(), &placement, 42));
+        // A child inherits the environment but not permission for a local run.
+        assert!(!gate_applies_with_environment(inputs(), &placement, 43));
+        // The marker identifies exactly the injected value, not every truthy one.
+        placement.require_remote = Some("true".into());
+        assert!(!gate_applies_with_environment(inputs(), &placement, 42));
+    }
+
+    #[test]
+    fn worker_and_force_remote_environment_override_shim_local_permission() {
+        let mut placement = PlacementEnvironment {
+            require_remote: Some("1".into()),
+            shim_pid: Some("42".into()),
+            ..PlacementEnvironment::default()
+        };
+        for force in ["1", "true", "YES", "on", "malformed"] {
+            placement.force_remote = Some(force.into());
+            assert!(!gate_applies_with_environment(inputs(), &placement, 42));
+        }
+        placement.force_remote = None;
+        for worker in ["vmi1153651", "another-worker", " "] {
+            placement.worker = Some(worker.into());
+            assert!(!gate_applies_with_environment(inputs(), &placement, 42));
+        }
+        placement.worker = Some("".into());
+        assert!(gate_applies_with_environment(inputs(), &placement, 42));
+    }
+
+    #[test]
+    fn absent_and_explicit_false_remote_policy_preserve_intentional_speed_gate() {
+        for value in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("false"),
+            Some("NO"),
+            Some("off"),
+        ] {
+            let placement = PlacementEnvironment {
+                require_remote: value.map(Into::into),
+                force_remote: value.map(Into::into),
+                ..PlacementEnvironment::default()
+            };
+            assert!(gate_applies_with_environment(inputs(), &placement, 42));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_placement_cannot_authorize_local_measurement() {
+        use std::os::unix::ffi::OsStringExt;
+        let mut placement = PlacementEnvironment {
+            require_remote: Some(std::ffi::OsString::from_vec(vec![0xff])),
+            shim_pid: Some("42".into()),
+            ..PlacementEnvironment::default()
+        };
+        assert!(!gate_applies_with_environment(inputs(), &placement, 42));
+        placement.force_remote = placement.require_remote.take();
+        assert!(!gate_applies_with_environment(inputs(), &placement, 42));
     }
 
     #[test]
