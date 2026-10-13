@@ -4,6 +4,9 @@
 //! commands, and retrieving build artifacts.
 
 pub(crate) mod source_content_barrier;
+#[cfg(test)]
+#[path = "transfer/node_prepare_tests.rs"]
+mod node_prepare_tests;
 
 use crate::error::TransferError;
 use anyhow::{Context, Result};
@@ -594,14 +597,23 @@ const REMOTE_RUNTIME_EXCLUDE_PATTERNS: &[&str] = &[
     // root must not wipe another build's in-flight Go cache.
     ".rch-go/",
     ".franken_whisper/tools/ffmpeg/",
+    ".rch_dep_fingerprint.json",
+    ".rch_dep_fingerprint.json.tmp",
+    ".rch_prepare_logs/",
 ];
 // Host-local language environments are neither source nor portable build
 // inputs.  They commonly contain absolute symlinks (for example
 // `.venv-*/lib64`) that rsync would otherwise copy into a foreign workspace
 // proof root.  Keep these exclusions unconditional even when a user replaces
 // the configurable default list.
-const SOURCE_EPHEMERAL_EXCLUDE_PATTERNS: &[&str] =
-    &[".venv/", ".venv-*/", "venv/", "venv-*/", "__pycache__/"];
+const SOURCE_EPHEMERAL_EXCLUDE_PATTERNS: &[&str] = &[
+    ".venv/",
+    ".venv-*/",
+    "venv/",
+    "venv-*/",
+    "__pycache__/",
+    "node_modules/",
+];
 
 /// Age floors (minutes) for worker-side runtime state reaped at transfer
 /// start (bd-wfumv). TMPDIR scratch under `.rch-tmp/` goes stale within a
@@ -3766,6 +3778,12 @@ impl TransferPipeline {
 
     fn append_sync_filter_args(&self, cmd: &mut Command, effective_excludes: &[String]) {
         if let Some(include_patterns) = &self.sync_include_patterns {
+            for pattern in REMOTE_RUNTIME_EXCLUDE_PATTERNS
+                .iter()
+                .chain(SOURCE_EPHEMERAL_EXCLUDE_PATTERNS)
+            {
+                cmd.arg("--exclude").arg(pattern);
+            }
             cmd.arg("--prune-empty-dirs");
             for pattern in include_patterns {
                 cmd.arg("--include").arg(pattern);
@@ -4124,6 +4142,7 @@ impl TransferPipeline {
         let remote_path = self.remote_path();
         let escaped_remote_path = escape(Cow::from(&remote_path));
         let toolchain_command = wrap_command_with_toolchain(command, toolchain);
+        let toolchain_command = self.wrap_with_dependency_preparation(toolchain_command);
 
         let env_plan = self.build_remote_env_plan(&remote_path);
         if !env_plan.env_prefix.applied.is_empty() {
@@ -4273,12 +4292,11 @@ setsid sh -c {} rch-build {} {} {} {} sh -lc {} 3>&2",
         };
 
         format!(
-            "export LC_ALL=C; {}{}touch {} && cd {} && {}{}{}",
+            "export LC_ALL=C; {}{}touch {} && cd {} && {}{}",
             cargo_home_base,
             build_jobs_fragment,
             escaped_remote_path,
             escaped_remote_path,
-            self.node_modules_bootstrap(),
             ensure_dirs_command,
             execution_command
         )
@@ -4303,40 +4321,17 @@ setsid sh -c {} rch-build {} {} {} {} sh -lc {} 3>&2",
         remote_build_jobs_fragment(policy, LINUX_MEMINFO_PATH)
     }
 
-    /// Provision `node_modules` on the worker for TypeScript kinds.
-    ///
-    /// The project sync deliberately EXCLUDES `node_modules/` (see
-    /// `default_excludes`), and that exclusion is correct: node_modules holds
-    /// platform-native binaries, so rsyncing a macOS tree onto a Linux worker
-    /// would ship unusable `.node` files. rch-wkr has a `prepare()` hook that
-    /// installs dependencies — but the hook's build path executes the command
-    /// over plain SSH and never invokes `rch-wkr execute`, so on this path
-    /// nothing provisions them.
-    ///
-    /// Without this, `tsc --noEmit` on a worker finds no project-local
-    /// TypeScript, and `npx` silently downloads the unrelated `tsc` stub package
-    /// from the registry — which prints "This is not the tsc command you are
-    /// looking for" and exits 1, turning a passing local typecheck into a failing
-    /// remote build.
-    ///
-    /// Install only when `node_modules` is absent. The worker's project directory
-    /// persists between builds, so this is a one-time cost per project. `npm ci`
-    /// is preferred (lockfile-exact, so the worker typechecks with the SAME
-    /// TypeScript version as local); `npm install` is the fallback for projects
-    /// with no lockfile. Installer output is routed to stderr so it can never
-    /// pollute the command's stdout.
-    ///
-    /// Deliberately scoped to `Tsc` only: Bun kinds keep their existing behavior.
-    fn node_modules_bootstrap(&self) -> &'static str {
-        match self.compilation_kind {
-            Some(CompilationKind::Tsc) => {
-                "if [ -f package.json ] && [ ! -d node_modules ]; then \
-                 (npm ci --no-audit --no-fund --loglevel=error || \
-                  npm install --no-audit --no-fund --loglevel=error) 1>&2 || exit 1; \
-                 fi && "
-            }
-            _ => "",
-        }
+    /// Prepare TypeScript and Bun dependencies through the worker's fingerprint
+    /// and transaction checks, including when `node_modules` already exists.
+    fn wrap_with_dependency_preparation(&self, command: String) -> String {
+        let runtime = match self.compilation_kind {
+            Some(CompilationKind::Tsc) => "node",
+            Some(CompilationKind::BunTest | CompilationKind::BunTypecheck) => "bun",
+            _ => return command,
+        };
+        let script = escape(Cow::Borrowed(include_str!("transfer/node_prepare.sh")));
+        let command = escape(Cow::from(command.as_str()));
+        format!("sh -c {script} rch-prepare {runtime} sh -c {command}")
     }
 
     /// Wrap a command with an external timeout to prevent zombie/stuck processes.
