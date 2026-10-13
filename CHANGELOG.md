@@ -43,6 +43,10 @@ compiling it with the default compiler.
   sweep reclaimed nothing (css queue-timed-out ~466 builds/h on 2026-10-13). The sweep now
   evicts inactive caches until the critical ratio plus two points (7%) is free. Placement
   thresholds are unchanged ([`e8cbf0af`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/e8cbf0afcb2a67130758e430c638797311cf22b8)).
+- **The cleanup retention guard tolerates busy temp dirs.** It now looks up each ancestor's
+  `.rch-retention-v1` marker directly. It used to list every ancestor with `find`, and a sibling
+  deleted between `readdir` and `lstat` in a busy `/data/tmp` failed the candidate closed, so
+  the sweep reclaimed nothing on exactly the workers it must reclaim ([`bb2aa0f4`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/bb2aa0f46cdd0d361ed518ee6fabf72ab9f0bbab)).
 - **A build refused before admission retires its lease.** When the daemon answers without a
   worker (queue timeout, no admissible worker, restart barrier still closed), the hook now
   records `failed_before_admission` and acknowledges the lease before the local run. The
@@ -65,6 +69,8 @@ compiling it with the default compiler.
   `nice`, `systemd_slice`, `systemd_manager`) is enforced before the launcher records process
   authority; any failure refuses the launch. No policy file keeps the old behavior
   ([`4e55351d`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/4e55351d1375f73924ebab7e0e374db0ef0adb66)).
+- **Staging backend for GH #104 (not wired yet):** an invocation-owned, journal-roundtrippable
+  source layout and a guarded rsync receiver. No build route uses it ([`7bb0f130`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/7bb0f1309e212c35699c263daadc8e6cfea5d684)).
 - **SpeedScore tells machines apart again** (`bd-uerk9`). Normalization no longer saturates,
   CPU is scored from measured throughput, missing measurements are excluded, and rchd
   recomputes scores from raw reports. Scores from the old algorithm are invalidated and
@@ -87,6 +93,10 @@ compiling it with the default compiler.
 - Gate and test fixes: the unix clippy gate ([`62542741`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/6254274174f44ef41a6650787a1071cdd5088fe1)), ananicy `SCHED_IDLE` in the
   receiver-policy harness ([`75b9defe`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/75b9defe30acb471b753cbc2c3a5a56416fb7362)), and macOS-only fixtures ([`437137d8`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/437137d8b292648fa8bb5096d3a39e39edc5bf73),
   [`203c03f0`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/203c03f078db3e4a30adb03a08d599803552d723)).
+
+- **Known at release:** `rch/tests/source_lock_holder.rs`, the pre-53a85a3e holder suite, is
+  red against the new release-while-waiting lock semantics. The new `source_lock_admission`
+  suite passes (`bd-n0bu8`).
 
 ## 2.1.20 — 2026-10-13
 
