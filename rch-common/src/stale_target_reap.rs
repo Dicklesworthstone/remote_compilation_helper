@@ -418,10 +418,13 @@ rch_retained_source_gc_hold() {
     rch_retained_parent=${1%/*}
     [ -n "$rch_retained_parent" ] || rch_retained_parent=/
     while :; do
-        if rch_retained_marker=$(find "$rch_retained_parent" -mindepth 1 -maxdepth 1 \
-            -name '.rch-retention-v1' -print -quit); then
-            if [ -n "$rch_retained_marker" ]; then return 0; fi
-        else
+        # Look the one name up directly instead of listing the ancestor: in a
+        # busy /data/tmp a sibling deleted between readdir and lstat made find
+        # fail, and every candidate failed closed. An unsearchable ancestor
+        # still cannot rule a marker out.
+        rch_retained_marker=${rch_retained_parent%/}/.rch-retention-v1
+        if [ -e "$rch_retained_marker" ] || [ -L "$rch_retained_marker" ]; then return 0; fi
+        if [ ! -d "$rch_retained_parent" ] || [ ! -x "$rch_retained_parent" ]; then
             printf 'RCH_CLEANUP_RETENTION_UNKNOWN dir=%s ancestor=%s\n' \
                 "$1" "$rch_retained_parent" >&2
             return 2
