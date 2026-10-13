@@ -261,7 +261,7 @@ cat() {
             printf ' 200\n';;
     esac
 }
-ps() { printf '%s %s S\n301 300 %s\n' "$$" "$$" "$test_state"; }
+ps() { printf '%s %s %s S 1\n301 301 300 %s 1\n' "$$" "$$" "$$" "$test_state"; }
 for test_state in R S D T t K W P I; do
     rch_read_process 301 || exit 1
     [ "$rch_observed_start" = 200 ] || exit 1

@@ -36,6 +36,9 @@ rch_check_procfs_namespace() {
 }
 
 # Read a member of the bound group, including comm with spaces or parentheses.
+# A member may be a non-leader TID: /proc/<tid>/stat has the same birth/group
+# fields. This preserves escalation when a process leader is already a zombie
+# but another thread of that process is still running.
 # Function positional arguments do not replace the launcher's command arguments.
 rch_read_process() {
     rch_valid_pgid "$1" && rch_check_procfs_namespace || return 1
@@ -115,15 +118,35 @@ rch_read_record() {
 
 # 0: no executing members; 1: live members; 2: observation unavailable.
 # kill -0 cannot distinguish ESRCH from EPERM, or live processes from zombies.
+# A zombie process leader does not prove its other threads have exited. Enumerate
+# LWPs, retaining their own IDs for live escalation witnesses. A terminal-only
+# snapshot must account for every reported thread; unsupported/incomplete thread
+# enumeration is unknown, never a fallback to a process-only empty-group claim.
 rch_group_state() {
     rch_check_procfs_namespace || return 2
-    rch_snapshot=$(LC_ALL=C ps -e -o pid= -o pgid= -o stat=) || return 2
-    printf '%s\n' "$rch_snapshot" | LC_ALL=C awk -v group="$rch_pgid" -v observer="$$" '
-        NF != 3 || $1 !~ /^[0-9]+$/ || $2 !~ /^[0-9]+$/ || $3 !~ /^[RSDTtKWPIXZx][A-Za-z0-9+<>-]*$/ { bad = 1; next }
-        $1 == observer { seen = 1; if ($2 == group) bad = 1 }
-        $2 == group && $3 !~ /^[ZXx]/ { live = 1 }
-        END { if (bad || !seen) exit 2; if (live) exit 1; exit 0 }
-    '
+    rch_task_snapshot=$(LC_ALL=C ps -e -L -o pid= -o lwp= -o pgid= -o stat= -o nlwp=) || return 2
+    rch_snapshot=$(printf '%s\n' "$rch_task_snapshot" | LC_ALL=C awk -v group="$rch_pgid" -v observer="$$" '
+        NF != 5 || $1 !~ /^[1-9][0-9]*$/ || $2 !~ /^[1-9][0-9]*$/ || $3 !~ /^[0-9]+$/ || $4 !~ /^[RSDTtKWPIXZx][A-Za-z0-9+<>-]*$/ || $5 !~ /^[1-9][0-9]*$/ { bad = 1; next }
+        seen_task[$2]++ { bad = 1 }
+        $2 == observer { seen = 1; if ($3 == group) bad = 1 }
+        $3 == group {
+            members[$1]++
+            if ($1 in expected && expected[$1] != $5) uncertain = 1
+            expected[$1] = $5
+            if ($4 !~ /^[ZXx]/) live = 1
+        }
+        { print $2, $3, $4 }
+        END {
+            if (bad || !seen) exit 2
+            # Positive liveness needs no complete census. Requiring a stable
+            # thread count here would prevent cancelling a busy compiler.
+            if (live) exit 1
+            for (pid in members) if (members[pid] != expected[pid]) uncertain = 1
+            if (uncertain) exit 2
+            exit 0
+        }
+    ')
+    return $?
 }
 
 # Capture live members while the recorded leader still authenticates the group.
@@ -134,7 +157,8 @@ rch_capture_group_witnesses() {
     rch_witnesses=
     rch_witness_identity=
     [ "$rch_identified" -eq 1 ] && rch_remote_leader_matches || return 43
-    # rch_group_state already validated this snapshot, including our observer.
+    # rch_group_state normalized the validated LWP census to ID/group/state.
+    # Retain live TIDs, not just process leaders, with the same birth fencing.
     rch_member_pids=$(printf '%s\n' "$rch_snapshot" | LC_ALL=C awk -v group="$rch_pgid" '
         $2 == group && $3 !~ /^[ZXx]/ { print $1 }
     ') || return 44
