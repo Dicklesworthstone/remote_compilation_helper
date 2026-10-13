@@ -6,6 +6,11 @@
 //! The quoted heredoc passes these exact sources as data, without installing a
 //! launcher on the worker or resolving a mutable script from a source checkout.
 
+/// The heredoc lives in a function body, not inside `$(...)`: bash 3.2 (macOS
+/// `/bin/sh`) scans a substitution's heredoc for the closing paren and fails on
+/// the first `pattern)` arm, which made every script that embeds this protocol
+/// a syntax error on macOS workers. Keep this `concat!` to string literals and
+/// `include_str!` lines only: `tests/remote_scoped_launch.py` re-assembles it.
 pub const REMOTE_PROCESS_IDENTITY_SCRIPT: &str = concat!(
     include_str!("remote_process.sh"),
     "\n",
@@ -13,10 +18,6 @@ pub const REMOTE_PROCESS_IDENTITY_SCRIPT: &str = concat!(
     "\nif [ \"$0\" = rch-build ]; then\n",
     "    rch_scope_launch_select || { printf '\\n%s_IDENTITY_UNAVAILABLE\\n' \"$3\" >&2; exit 125; }\n",
     "    if [ -n \"$rch_launch_slice\" ]; then\n",
-    // The heredoc lives in a function body, not inside `$(...)`: bash 3.2
-    // (macOS /bin/sh) scans a substitution's heredoc for the closing paren
-    // and fails on the first `pattern)` arm, which made every script that
-    // embeds this protocol a syntax error on macOS workers.
     "        rch_scope_launch_source() { cat <<'RCH_SCOPED_LAUNCH_SOURCE_104'\n",
     include_str!("remote_process.sh"),
     "\n",
