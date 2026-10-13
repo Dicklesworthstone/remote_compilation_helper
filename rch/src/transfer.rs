@@ -95,7 +95,12 @@ where
     R: AsyncRead + Unpin,
 {
     let mut output = Vec::new();
-    let mut chunk = [0_u8; 16 * 1024];
+    // Heap, not an inline array: an array is part of this future, and two of
+    // these (stdout and stderr) made every future that runs a remote command
+    // ~33 KB. In debug builds each await of one costs a stack slot that size,
+    // which put `execute_remote_compilation_inner`'s poll frame at 1.7 MB and
+    // overflowed the 2 MiB test-thread stack (bd-uz82c, again).
+    let mut chunk = vec![0_u8; 16 * 1024];
     loop {
         let read = reader.read(&mut chunk).await?;
         if read == 0 {
@@ -484,8 +489,8 @@ async fn run_windows_artifact_process<W: tokio::io::AsyncWrite + Unpin>(
                 written
             };
             let receive = async {
-                let mut out_buffer = [0_u8; 32 * 1024];
-                let mut err_buffer = [0_u8; 8192];
+                let mut out_buffer = vec![0_u8; 32 * 1024];
+                let mut err_buffer = vec![0_u8; 8192];
                 let mut out_open = true;
                 let mut err_open = true;
                 while out_open || err_open {
@@ -2448,8 +2453,8 @@ impl TransferPipeline {
             let mut stderr = child.stderr.take().context("retrieval stderr missing")?;
             let mut out = Vec::new();
             let mut err = Vec::new();
-            let mut out_buffer = [0_u8; 8192];
-            let mut err_buffer = [0_u8; 8192];
+            let mut out_buffer = vec![0_u8; 8192];
+            let mut err_buffer = vec![0_u8; 8192];
             let mut out_open = true;
             let mut err_open = true;
             let collected = async {
@@ -8154,7 +8159,7 @@ async fn pump_stream_segments<R>(
 {
     let mut reader = BufReader::new(stream);
     let mut pending: Vec<u8> = Vec::new();
-    let mut chunk = [0u8; 8192];
+    let mut chunk = vec![0u8; 8192];
     loop {
         let read = match reader.read(&mut chunk).await {
             Ok(0) | Err(_) => break,
