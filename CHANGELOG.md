@@ -5,7 +5,7 @@ Compilation Helper): the PreToolUse hook + CLI (`rch`), the local daemon (`rchd`
 worker agent (`rch-wkr`), the RABS build sidecar (`rabs-*`, `rabsd`), and the fleet
 dashboard (`dashboard/`).
 
-Scope window: project inception (`v0.1.0`, 2026-01-25) through `v2.1.20` (2026-10-13).
+Scope window: project inception (`v0.1.0`, 2026-01-25) through `v2.1.21` (2026-10-13).
 
 This document was rebuilt from git history (`git log --no-merges` per tag range, `git show`
 on representative commits), version tags (`git for-each-ref`), GitHub release metadata
@@ -28,6 +28,65 @@ history. They are kept as-is because the descriptions were verified against the 
 but those particular links will 404.
 
 Repository: <https://github.com/Dicklesworthstone/remote_compilation_helper>
+
+## 2.1.21 — 2026-10-13
+
+Workers that dropped below the disk-pressure line now reclaim their own caches, remote build
+deadlines and orphan cleanup work again, and builds refused before admission no longer leave
+dead leases. Workers now refuse a build whose requested toolchain they cannot run, instead of
+compiling it with the default compiler.
+
+- **Workers starved of slots reclaim their caches** (`bd-xxck3`). rchd gives a worker zero
+  slots at or below 5% free. The cache sweep escalated to oldest-first eviction only below
+  10 GB, and otherwise kept everything younger than 72 h. On 387-906 GB worker disks that
+  left a 10-45 GB dead zone: a worker took no builds, so nothing replaced its caches, and the
+  sweep reclaimed nothing (css queue-timed-out ~466 builds/h on 2026-10-13). The sweep now
+  evicts inactive caches until the critical ratio plus two points (7%) is free. Placement
+  thresholds are unchanged ([`e8cbf0af`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/e8cbf0afcb2a67130758e430c638797311cf22b8)).
+- **A build refused before admission retires its lease.** When the daemon answers without a
+  worker (queue timeout, no admissible worker, restart barrier still closed), the hook now
+  records `failed_before_admission` and acknowledges the lease before the local run. The
+  open lease used to block `rch daemon restart --drain` for the whole local fallback and then
+  stayed a dead "queued" journal; `rch jobs attach/cancel` report the new state ([`0409582b`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/0409582b235fb3730472dd68dbcd0b177399b8c4)).
+- **Remote process cleanup is fenced and thread-complete.**
+  - Observations are fenced to the active PID namespace ([`aded4fba`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/aded4fba0e91a830f45625e5caa9ac63130e63eb)), including from
+    subshells such as the build watchdog's timer ([`e8b0b19e`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/e8b0b19e928c7ca1b969ccdebde662506cb525cd), [`84a060fb`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/84a060fb97ad18e1249dac6b5f227455a107941a),
+    `bd-bv202`).
+  - Cleanup evidence covers every live thread, not just process leaders, so a zombie main
+    thread cannot hide a running compiler ([`be002dc0`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/be002dc0656982ee875a765afa2a550d3f7d60dc)).
+  - Cancellation keeps authenticated group authority through TERM escalation when TERM
+    removes the recorded leader ([`3f47eb68`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/3f47eb6835854c9d17e5630bc59b9db507c09f42)).
+- **Workers refuse an unavailable toolchain.** The worker's default-compiler fallback after
+  a failed toolchain preparation is gone, and an installation only counts once a fresh
+  `rustc` probe runs. The caller retries elsewhere or falls back with the requested
+  compiler ([`3d79aa0c`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/3d79aa0cba3f9b800ad716db7cb9648a58cbde40), [`6d545d52`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/6d545d522bd55316dc604b51d35e909983cb92c2)).
+- **Optional receiver-side execution policy for tracked Linux payloads** (GH #104, partial).
+  `/etc/rch/worker-execution.conf` or `~/.config/rch/worker-execution.conf` (`version=1`,
+  `nice`, `systemd_slice`, `systemd_manager`) is enforced before the launcher records process
+  authority; any failure refuses the launch. No policy file keeps the old behavior
+  ([`4e55351d`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/4e55351d1375f73924ebab7e0e374db0ef0adb66)).
+- **SpeedScore tells machines apart again** (`bd-uerk9`). Normalization no longer saturates,
+  CPU is scored from measured throughput, missing measurements are excluded, and rchd
+  recomputes scores from raw reports. Scores from the old algorithm are invalidated and
+  re-benchmarked after upgrade ([`ad0d0d9c`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/ad0d0d9c5e303bbe24844f16a93cd8adf27b03a1), [`cef5b73e`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/cef5b73ef1e4a08384cfeac5eb010191a06644ef), [`9e12ef41`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/9e12ef41aed2356cd09641508a8100f16c2bfc85)).
+- **Speed gate hardening** (#103): it fails closed under macOS compressor or load pressure
+  ([`7ac61b15`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/7ac61b15fa9afc45ddfb7f0fadb76dde156f66cf)); explicit remote placement, worker pins and `require_remote` always win
+  over local timing ([`39572fe8`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/39572fe896448588e539227b74b3642e5aa7fcee), [`5eebd8ba`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/5eebd8ba7ee84a43f74798d46753e985972f80b3), [`5c986bd9`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/5c986bd9c7a9857be0ccb40cfdff82becfc1a424)); shim v7 marks only its own
+  fail-closed default ([`af141ee6`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/af141ee6a65a9b4a5542ff3ec7d678fff391c43c)).
+- **Source locks no longer convoy.** Native and GNU lock plans release a partially acquired
+  closure before waiting ([`53a85a3e`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/53a85a3e14aab577f4721d0e94d655cd769e2bc0), [`8b475843`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/8b475843bbf6c37a480d44ea67a304c8b5500c42)).
+- **Recovery and journals.**
+  - The live wrapper owns its job journal for its lifetime ([`ed3cc816`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/ed3cc816b44d6cd2238f0c977eaf04cfe99d6ba7)).
+  - `rch jobs` trusts job status only from an HTTP 200 reply.
+  - Cache cleanup honours checked source retirement ([`13da097f`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/13da097f5ea47fd9ad8cea43a82dc11aa856b362)).
+  - Homebrew rsync file-flags directory metadata passes the source barrier ([`7a2a0702`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/7a2a07021b42095f6525447f5a58e31acd83d72d)).
+  - macOS rchd retires recovered queue rows whose dead owner's PID was reused
+    ([`ad0b11c1`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/ad0b11c170a12c26cbbfb558fda607bf8283e43c), `bd-21h25`).
+  - A wrapper that waited out a restart drain returns to phase `admission`
+    ([`382ca376`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/382ca37639684bf0044fd7706f044bef92a58760), `bd-d7f8q`).
+- Gate and test fixes: the unix clippy gate ([`62542741`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/6254274174f44ef41a6650787a1071cdd5088fe1)), ananicy `SCHED_IDLE` in the
+  receiver-policy harness ([`75b9defe`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/75b9defe30acb471b753cbc2c3a5a56416fb7362)), and macOS-only fixtures ([`437137d8`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/437137d8b292648fa8bb5096d3a39e39edc5bf73),
+  [`203c03f0`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/203c03f078db3e4a30adb03a08d599803552d723)).
 
 ## 2.1.20 — 2026-10-13
 
