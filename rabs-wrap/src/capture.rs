@@ -77,7 +77,10 @@ fn prepare_io(
             "compiler output capture deadline expired",
         ));
     }
-    session.get_mut().deadline = now.checked_add(OWNER_POLL).unwrap_or(deadline).min(deadline);
+    session.get_mut().deadline = now
+        .checked_add(OWNER_POLL)
+        .unwrap_or(deadline)
+        .min(deadline);
     Ok(())
 }
 
@@ -549,13 +552,19 @@ mod tests {
             assert_eq!(received, expected.as_bytes());
             server.write_all(receipt().as_bytes()).unwrap();
             let mut remainder = String::new();
-            BufReader::new(server).read_to_string(&mut remainder).unwrap();
+            BufReader::new(server)
+                .read_to_string(&mut remainder)
+                .unwrap();
             remainder
         });
         let mut client = session(client);
-        finish_with_budget(&mut client, ATTEMPT, &report, Duration::from_secs(5), || {
-            true
-        })
+        finish_with_budget(
+            &mut client,
+            ATTEMPT,
+            &report,
+            Duration::from_secs(5),
+            || true,
+        )
         .unwrap();
         drop(client);
         assert_eq!(

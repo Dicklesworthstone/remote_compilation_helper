@@ -81,9 +81,12 @@ mod tests {
     fn explicit_budget_and_compiler_are_not_lost() {
         let args = Args::try_parse_from([
             "rch-parallel-benchmark",
-            "--jobs", "4",
-            "--timeout-secs", "90",
-            "--rustc", "/toolchains/custom/bin/rustc",
+            "--jobs",
+            "4",
+            "--timeout-secs",
+            "90",
+            "--rustc",
+            "/toolchains/custom/bin/rustc",
             "--json",
         ])
         .unwrap();

@@ -44,8 +44,8 @@ fn stat_fields(pid: u32) -> Option<Vec<String>> {
 #[test]
 fn dead_main_thread_does_not_release_a_live_process_lease() {
     let directory = tempfile::tempdir().expect("native process fixture");
-    let factory = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/remote_process_threads.py");
+    let factory =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/remote_process_threads.py");
     let compiled = Command::new("python3")
         .args([
             "-I",
@@ -79,7 +79,9 @@ fn dead_main_thread_does_not_release_a_live_process_lease() {
     );
     let fields = stat_fields(pid).expect("retained group leader");
     let expected = ProcessIdentity {
-        boot_id: current_process_identity().expect("observer identity").boot_id,
+        boot_id: current_process_identity()
+            .expect("observer identity")
+            .boot_id,
         start: ProcessStart::Linux {
             ticks: fields[19].parse().expect("kernel birth ticks"),
         },

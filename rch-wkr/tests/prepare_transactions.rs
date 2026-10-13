@@ -11,5 +11,8 @@ fn prepare_transaction_process_contract() {
         .arg(env!("CARGO_BIN_EXE_rch-wkr"))
         .status()
         .expect("run real-worker preparation regressions (requires python3)");
-    assert!(status.success(), "worker preparation regression failed: {status}");
+    assert!(
+        status.success(),
+        "worker preparation regression failed: {status}"
+    );
 }

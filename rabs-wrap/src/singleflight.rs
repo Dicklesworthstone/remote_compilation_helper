@@ -22,7 +22,9 @@ fn check_owner(owned: &impl Fn() -> bool) -> io::Result<()> {
     } else {
         // Not Interrupted: generic Read/Write helpers retry that error. A
         // cancelled caller is terminal, even when the daemon is still healthy.
-        Err(io::Error::other("compiler caller disappeared during RABS consultation"))
+        Err(io::Error::other(
+            "compiler caller disappeared during RABS consultation",
+        ))
     }
 }
 
@@ -34,9 +36,15 @@ fn prepare_io(
     check_owner(owned)?;
     let now = Instant::now();
     if now >= deadline {
-        return Err(io::Error::new(io::ErrorKind::TimedOut, "RABS consult deadline elapsed"));
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "RABS consult deadline elapsed",
+        ));
     }
-    reader.get_mut().deadline = now.checked_add(OWNER_POLL).unwrap_or(deadline).min(deadline);
+    reader.get_mut().deadline = now
+        .checked_add(OWNER_POLL)
+        .unwrap_or(deadline)
+        .min(deadline);
     Ok(())
 }
 
@@ -58,7 +66,12 @@ pub(super) fn write_owned(
     while !bytes.is_empty() {
         prepare_io(reader, deadline, owned)?;
         match reader.get_mut().write(bytes) {
-            Ok(0) => return Err(io::Error::new(io::ErrorKind::WriteZero, "RABS peer stopped accepting bytes")),
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "RABS peer stopped accepting bytes",
+                ));
+            }
             Ok(written) => bytes = &bytes[written..],
             Err(error) if retryable_slice(&error) => {}
             Err(error) => return Err(error),
@@ -87,12 +100,18 @@ pub(super) fn read_owned_reply(
             Err(error) => return Err(error),
         };
         if available.is_empty() {
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "RABS reply ended before frame delimiter"));
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "RABS reply ended before frame delimiter",
+            ));
         }
         let newline = available.iter().position(|byte| *byte == b'\n');
         let count = newline.map_or(available.len(), |at| at + 1);
         if (line.len() as u64).saturating_add(count as u64) > max_bytes {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "RABS reply exceeds frame limit"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "RABS reply exceeds frame limit",
+            ));
         }
         line.extend_from_slice(&available[..count]);
         reader.consume(count);
@@ -106,7 +125,8 @@ pub(super) fn read_owned_reply(
 }
 
 fn sleep_owned(delay: Duration, owned: &impl Fn() -> bool) -> io::Result<()> {
-    let wake = Instant::now().checked_add(delay)
+    let wake = Instant::now()
+        .checked_add(delay)
         .ok_or_else(|| io::Error::other("RABS wait deadline overflow"))?;
     loop {
         check_owner(owned)?;
@@ -177,7 +197,9 @@ fn wait_key(reply: &Value) -> Option<&str> {
             .get("materialization_started")
             .and_then(Value::as_bool)
             != Some(false)
-        || fields.iter().any(|(name, _)| name == "attempt" || name == "env")
+        || fields
+            .iter()
+            .any(|(name, _)| name == "attempt" || name == "env")
     {
         return None;
     }
@@ -317,7 +339,10 @@ mod tests {
         ));
         assert_eq!(daemon.join().unwrap(), 3);
         const {
-            assert!(MAX_RETRIES + 1 < 64, "leave room below the edge request quota");
+            assert!(
+                MAX_RETRIES + 1 < 64,
+                "leave room below the edge request quota"
+            );
         }
     }
 
@@ -329,7 +354,12 @@ mod tests {
         settings.budget = Duration::ZERO;
         assert!(matches!(
             read_with_policy(
-                reader(stream), "original", Duration::from_secs(1), true, settings, &|| true,
+                reader(stream),
+                "original",
+                Duration::from_secs(1),
+                true,
+                settings,
+                &|| true,
             ),
             Ok(Live::PassThrough)
         ));
@@ -340,19 +370,66 @@ mod tests {
     fn malformed_authority_or_unnegotiated_waits_are_not_followed() {
         for (line, negotiated) in [
             (WAIT.to_owned(), false),
-            (WAIT.replace("\"compiler_skip_authorized\":false", "\"compiler_skip_authorized\":true"), true),
-            (WAIT.replace("\"materialization_started\":false", "\"materialization_started\":true"), true),
-            (WAIT.replace("\"action_key\":\"key\"", "\"action_key\":\"\""), true),
-            (WAIT.replace("\"action_key\":\"key\"", "\"action_key\":\"key\",\"action_key\":\"other\""), true),
-            (WAIT.replace("\"materialization_started\":false", "\"attempt\":\"admitted\""), true),
-            (WAIT.replace("\"action_key\":\"key\"", "\"action_key\":\"key\",\"attempt\":null,\"attempt\":null"), true),
-            (WAIT.replace("\"action_key\":\"key\"", "\"action_key\":\"key\",\"env\":[],\"env\":[]"), true),
+            (
+                WAIT.replace(
+                    "\"compiler_skip_authorized\":false",
+                    "\"compiler_skip_authorized\":true",
+                ),
+                true,
+            ),
+            (
+                WAIT.replace(
+                    "\"materialization_started\":false",
+                    "\"materialization_started\":true",
+                ),
+                true,
+            ),
+            (
+                WAIT.replace("\"action_key\":\"key\"", "\"action_key\":\"\""),
+                true,
+            ),
+            (
+                WAIT.replace(
+                    "\"action_key\":\"key\"",
+                    "\"action_key\":\"key\",\"action_key\":\"other\"",
+                ),
+                true,
+            ),
+            (
+                WAIT.replace(
+                    "\"materialization_started\":false",
+                    "\"attempt\":\"admitted\"",
+                ),
+                true,
+            ),
+            (
+                WAIT.replace(
+                    "\"action_key\":\"key\"",
+                    "\"action_key\":\"key\",\"attempt\":null,\"attempt\":null",
+                ),
+                true,
+            ),
+            (
+                WAIT.replace(
+                    "\"action_key\":\"key\"",
+                    "\"action_key\":\"key\",\"env\":[],\"env\":[]",
+                ),
+                true,
+            ),
         ] {
             let (stream, mut peer) = UnixStream::pair().unwrap();
             peer.write_all(line.as_bytes()).unwrap();
-            assert!(read_with_policy(
-                reader(stream), "original", Duration::from_secs(1), negotiated, policy(3), &|| true,
-            ).is_err());
+            assert!(
+                read_with_policy(
+                    reader(stream),
+                    "original",
+                    Duration::from_secs(1),
+                    negotiated,
+                    policy(3),
+                    &|| true,
+                )
+                .is_err()
+            );
             assert_eq!(peer.read(&mut [0; 1]).unwrap(), 0);
         }
     }
@@ -377,10 +454,18 @@ mod tests {
         let mut settings = policy(60);
         settings.budget = Duration::from_millis(100);
         let outcome = read_with_policy(
-            reader(stream), "original", Duration::from_secs(10), true, settings, &|| true,
+            reader(stream),
+            "original",
+            Duration::from_secs(10),
+            true,
+            settings,
+            &|| true,
         );
         assert!(outcome.is_err());
-        assert!(daemon.join().unwrap(), "follower must close before the trickle ends");
+        assert!(
+            daemon.join().unwrap(),
+            "follower must close before the trickle ends"
+        );
     }
 
     #[test]
@@ -389,21 +474,32 @@ mod tests {
         let revoked = Arc::clone(&owned);
         let (stream, mut peer) = UnixStream::pair().unwrap();
         peer.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
-        peer.write_all(b"{\"kind\":\"rustc-decision\",\"decision\":\"hit\"").unwrap();
+        peer.write_all(b"{\"kind\":\"rustc-decision\",\"decision\":\"hit\"")
+            .unwrap();
         let daemon = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(150));
             revoked.store(false, Ordering::Release);
             let mut bytes = Vec::new();
             let result = peer.read_to_end(&mut bytes);
-            assert!(result.is_ok() || matches!(result, Err(ref e) if e.kind() == io::ErrorKind::ConnectionReset));
+            assert!(
+                result.is_ok()
+                    || matches!(result, Err(ref e) if e.kind() == io::ErrorKind::ConnectionReset)
+            );
             bytes
         });
         let mut session = reader(stream);
         session.get_mut().deadline = Instant::now() + Duration::from_secs(30);
-        assert!(read_with_policy(
-            session, "original", Duration::from_secs(30), true, policy(60),
-            &|| owned.load(Ordering::Acquire),
-        ).is_err());
+        assert!(
+            read_with_policy(
+                session,
+                "original",
+                Duration::from_secs(30),
+                true,
+                policy(60),
+                &|| owned.load(Ordering::Acquire),
+            )
+            .is_err()
+        );
         assert!(daemon.join().unwrap().is_empty());
     }
 
@@ -419,32 +515,59 @@ mod tests {
             revoked.store(false, Ordering::Release);
             let mut bytes = Vec::new();
             let result = peer.read_to_end(&mut bytes);
-            assert!(result.is_ok() || matches!(result, Err(ref e) if e.kind() == io::ErrorKind::ConnectionReset));
+            assert!(
+                result.is_ok()
+                    || matches!(result, Err(ref e) if e.kind() == io::ErrorKind::ConnectionReset)
+            );
             bytes
         });
         let mut settings = policy(60);
         settings.budget = Duration::from_secs(30);
         settings.initial_delay = Duration::from_secs(10);
         settings.maximum_delay = Duration::from_secs(10);
-        assert!(read_with_policy(
-            reader(stream), "must not retry", Duration::from_secs(30), true, settings,
-            &|| owned.load(Ordering::Acquire),
-        ).is_err());
+        assert!(
+            read_with_policy(
+                reader(stream),
+                "must not retry",
+                Duration::from_secs(30),
+                true,
+                settings,
+                &|| owned.load(Ordering::Acquire),
+            )
+            .is_err()
+        );
         assert!(daemon.join().unwrap().is_empty());
     }
 
     #[test]
     fn buffered_hit_is_not_accepted_after_ownership_is_revoked() {
         let (stream, mut peer) = UnixStream::pair().unwrap();
-        peer.write_all(b"first\n{\"kind\":\"rustc-decision\",\"decision\":\"hit\",\"capture_protocol\":1}\n").unwrap();
+        peer.write_all(
+            b"first\n{\"kind\":\"rustc-decision\",\"decision\":\"hit\",\"capture_protocol\":1}\n",
+        )
+        .unwrap();
         let mut session = reader(stream);
         let deadline = session.get_ref().deadline;
-        assert_eq!(read_owned_reply(&mut session, 4096, deadline, &|| true).unwrap(), "first\n");
-        assert!(read_with_policy(
-            session, "original", Duration::from_secs(1), true, policy(3), &|| false,
-        ).is_err());
+        assert_eq!(
+            read_owned_reply(&mut session, 4096, deadline, &|| true).unwrap(),
+            "first\n"
+        );
+        assert!(
+            read_with_policy(
+                session,
+                "original",
+                Duration::from_secs(1),
+                true,
+                policy(3),
+                &|| false,
+            )
+            .is_err()
+        );
         let result = peer.read(&mut [0; 1]);
-        assert!(matches!(result, Ok(0)) || matches!(result, Err(ref e) if e.kind() == io::ErrorKind::ConnectionReset));
+        assert!(
+            matches!(result, Ok(0))
+                || matches!(result, Err(ref e) if e.kind() == io::ErrorKind::ConnectionReset)
+        );
     }
 
     #[test]
@@ -457,9 +580,15 @@ mod tests {
         });
         let mut session = reader(stream);
         let deadline = session.get_ref().deadline;
-        assert_eq!(read_owned_reply(&mut session, 4096, deadline, &|| true).unwrap(), "{\"decision\":\"pass-through\"}\n");
+        assert_eq!(
+            read_owned_reply(&mut session, 4096, deadline, &|| true).unwrap(),
+            "{\"decision\":\"pass-through\"}\n"
+        );
         assert_eq!(session.get_ref().deadline, deadline);
-        assert_eq!(read_owned_reply(&mut session, 4096, deadline, &|| true).unwrap(), "next\n");
+        assert_eq!(
+            read_owned_reply(&mut session, 4096, deadline, &|| true).unwrap(),
+            "next\n"
+        );
         sender.join().unwrap();
     }
 
@@ -469,13 +598,29 @@ mod tests {
         let mut session = reader(stream);
         let deadline = session.get_ref().deadline;
         assert!(write_owned(&mut session, b"consent\n", deadline, &|| false).is_err());
-        assert_eq!(write_owned(&mut session, b"consent\n", Instant::now(), &|| true).unwrap_err().kind(), io::ErrorKind::TimedOut);
+        assert_eq!(
+            write_owned(&mut session, b"consent\n", Instant::now(), &|| true)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
         peer.set_nonblocking(true).unwrap();
-        assert_eq!(peer.read(&mut [0; 1]).unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(
+            peer.read(&mut [0; 1]).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
         peer.set_nonblocking(false).unwrap();
         peer.write_all(b"ok\n").unwrap();
-        assert_eq!(read_owned_reply(&mut session, 3, deadline, &|| true).unwrap(), "ok\n");
+        assert_eq!(
+            read_owned_reply(&mut session, 3, deadline, &|| true).unwrap(),
+            "ok\n"
+        );
         peer.write_all(b"four\n").unwrap();
-        assert_eq!(read_owned_reply(&mut session, 4, deadline, &|| true).unwrap_err().kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            read_owned_reply(&mut session, 4, deadline, &|| true)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
     }
 }

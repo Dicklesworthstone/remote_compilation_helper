@@ -143,7 +143,10 @@ impl InstallPlan {
             (PackageManager::Bun, &["bun.lock", "bun.lockb"]),
             (PackageManager::Pnpm, &["pnpm-lock.yaml"]),
             (PackageManager::Yarn, &["yarn.lock"]),
-            (PackageManager::Npm, &["package-lock.json", "npm-shrinkwrap.json"]),
+            (
+                PackageManager::Npm,
+                &["package-lock.json", "npm-shrinkwrap.json"],
+            ),
         ];
         let mut selected = None;
         for (manager, locks) in families {
@@ -644,7 +647,10 @@ mod tests {
 
     fn plan(sources: &[&str], runtime: RequiredRuntime) -> InstallPlan {
         InstallPlan::for_sources(
-            &sources.iter().map(|name| (*name).to_owned()).collect::<Vec<_>>(),
+            &sources
+                .iter()
+                .map(|name| (*name).to_owned())
+                .collect::<Vec<_>>(),
             runtime,
         )
         .unwrap()
@@ -652,8 +658,14 @@ mod tests {
 
     #[test]
     fn npm_bootstrap_uses_install_but_existing_npm_locks_always_use_ci() {
-        assert_eq!(plan(&[], RequiredRuntime::Node).command(), ["npm", "install"]);
-        assert_eq!(plan(&[], RequiredRuntime::Bun).command(), ["bun", "install"]);
+        assert_eq!(
+            plan(&[], RequiredRuntime::Node).command(),
+            ["npm", "install"]
+        );
+        assert_eq!(
+            plan(&[], RequiredRuntime::Bun).command(),
+            ["bun", "install"]
+        );
         for lock in ["package-lock.json", "npm-shrinkwrap.json"] {
             for runtime in [RequiredRuntime::Node, RequiredRuntime::Bun] {
                 let selected = plan(&[lock], runtime);
@@ -696,7 +708,12 @@ mod tests {
 
     #[test]
     fn mixed_manager_lockfiles_are_not_resolved_by_arbitrary_priority() {
-        let locks = ["bun.lock", "pnpm-lock.yaml", "yarn.lock", "package-lock.json"];
+        let locks = [
+            "bun.lock",
+            "pnpm-lock.yaml",
+            "yarn.lock",
+            "package-lock.json",
+        ];
         for first in 0..locks.len() {
             for second in first + 1..locks.len() {
                 for runtime in [RequiredRuntime::Node, RequiredRuntime::Bun] {
@@ -729,10 +746,18 @@ mod tests {
         let fixture = TempDir::new().unwrap();
         make_node_project(fixture.path(), "{}", Some(("package-lock.json", "locked")));
         let initial = compute_fingerprint(fixture.path()).await.unwrap();
-        std::fs::write(fixture.path().join("npm-shrinkwrap.json"), b"shrinkwrap one").unwrap();
+        std::fs::write(
+            fixture.path().join("npm-shrinkwrap.json"),
+            b"shrinkwrap one",
+        )
+        .unwrap();
         let shrinkwrap = compute_fingerprint(fixture.path()).await.unwrap();
         assert_ne!(initial.hash, shrinkwrap.hash);
-        std::fs::write(fixture.path().join("npm-shrinkwrap.json"), b"shrinkwrap two").unwrap();
+        std::fs::write(
+            fixture.path().join("npm-shrinkwrap.json"),
+            b"shrinkwrap two",
+        )
+        .unwrap();
         let changed = compute_fingerprint(fixture.path()).await.unwrap();
         assert_ne!(changed.hash, shrinkwrap.hash);
         std::fs::write(fixture.path().join(".npmrc"), b"legacy-peer-deps=true\n").unwrap();
@@ -752,7 +777,9 @@ mod tests {
         make_node_project(fixture.path(), "{}", Some(("bun.lock", "locked")));
         std::fs::write(fixture.path().join("package-lock.json"), b"also locked").unwrap();
         let fingerprint = compute_fingerprint(fixture.path()).await.unwrap();
-        write_cached_fingerprint(fixture.path(), &fingerprint).await.unwrap();
+        write_cached_fingerprint(fixture.path(), &fingerprint)
+            .await
+            .unwrap();
         std::fs::create_dir(fixture.path().join("node_modules")).unwrap();
         let logs = fixture.path().join("logs");
         let error = prepare(fixture.path(), RequiredRuntime::Bun, &logs)

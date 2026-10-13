@@ -43,23 +43,31 @@ fn probe(program: &Path, argument: &str) -> Result<String, CompilationBenchmarkE
         .map_err(|error| failure(format!("Cannot probe benchmark compiler: {error}")))?;
     if !output.status.success() {
         return Err(CompilationBenchmarkError {
-            message: format!("Benchmark compiler probe {argument} failed: {}", output.status),
+            message: format!(
+                "Benchmark compiler probe {argument} failed: {}",
+                output.status
+            ),
             phase: "setup".to_owned(),
             stderr: Some(String::from_utf8_lossy(&output.stderr).into_owned()),
         });
     }
-    String::from_utf8(output.stdout)
-        .map_err(|_| failure("Benchmark compiler probe is not UTF-8"))
+    String::from_utf8(output.stdout).map_err(|_| failure("Benchmark compiler probe is not UTF-8"))
 }
 
 fn compiler_host(version: &str) -> Result<String, CompilationBenchmarkError> {
-    let mut hosts = version.lines().filter_map(|line| line.strip_prefix("host: "));
-    let host = hosts.next().ok_or_else(|| failure("Compiler identity has no host"))?;
+    let mut hosts = version
+        .lines()
+        .filter_map(|line| line.strip_prefix("host: "));
+    let host = hosts
+        .next()
+        .ok_or_else(|| failure("Compiler identity has no host"))?;
     if !version.starts_with("rustc ")
         || hosts.next().is_some()
         || host.is_empty()
         || host.starts_with('-')
-        || !host.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        || !host
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
     {
         return Err(failure("Invalid or ambiguous benchmark compiler identity"));
     }
@@ -67,7 +75,9 @@ fn compiler_host(version: &str) -> Result<String, CompilationBenchmarkError> {
 }
 
 fn cargo_path_setting(key: &str, path: &Path) -> Result<String, CompilationBenchmarkError> {
-    let text = path.to_str().ok_or_else(|| failure("Benchmark path is not representable in Cargo configuration"))?;
+    let text = path
+        .to_str()
+        .ok_or_else(|| failure("Benchmark path is not representable in Cargo configuration"))?;
     // JSON strings use TOML-compatible basic-string escapes here, including
     // quotes and Windows backslashes. Never interpolate a raw path into TOML.
     let quoted = serde_json::to_string(text).map_err(|error| failure(error.to_string()))?;
@@ -82,7 +92,8 @@ impl BuildContext {
         let host = compiler_host(&version)?;
         let sysroot = probe(&selected, "--print=sysroot")?;
         let sysroot = sysroot.trim_end_matches(['\r', '\n']);
-        if sysroot.is_empty() || sysroot.contains(['\r', '\n']) || !Path::new(sysroot).is_absolute() {
+        if sysroot.is_empty() || sysroot.contains(['\r', '\n']) || !Path::new(sysroot).is_absolute()
+        {
             return Err(failure("Compiler returned an invalid absolute sysroot"));
         }
         let compiler = Path::new(sysroot)
@@ -90,9 +101,16 @@ impl BuildContext {
             .join(format!("rustc{}", std::env::consts::EXE_SUFFIX));
         let direct_version = probe(&compiler, "-vV")?;
         if direct_version != version {
-            return Err(failure("Selected and direct benchmark compiler identities differ"));
+            return Err(failure(
+                "Selected and direct benchmark compiler identities differ",
+            ));
         }
-        Ok(Self { cargo, compiler, host, version: version.trim_end().to_owned() })
+        Ok(Self {
+            cargo,
+            compiler,
+            host,
+            version: version.trim_end().to_owned(),
+        })
     }
 
     /// Every phase owns a freshly generated project. Only the two incremental
@@ -103,20 +121,27 @@ impl BuildContext {
         release: bool,
         incremental: bool,
     ) -> Result<Command, CompilationBenchmarkError> {
-        let project = std::fs::canonicalize(project)
-            .map_err(|error| failure(format!("Cannot resolve private benchmark project: {error}")))?;
+        let project = std::fs::canonicalize(project).map_err(|error| {
+            failure(format!("Cannot resolve private benchmark project: {error}"))
+        })?;
         let target = project.join("target");
         let mut command = Command::new(&self.cargo);
         command
             .arg("build")
             .arg("--offline")
             .args(["--jobs", "1"])
-            .arg("--manifest-path").arg(project.join("Cargo.toml"))
-            .arg("--target-dir").arg(&target)
-            .arg("--target").arg(&self.host)
-            .arg("--profile").arg(if release { "release" } else { "dev" })
-            .arg("--config").arg(cargo_path_setting("build.build-dir", &target)?)
-            .arg("--config").arg(cargo_path_setting("build.rustc", &self.compiler)?)
+            .arg("--manifest-path")
+            .arg(project.join("Cargo.toml"))
+            .arg("--target-dir")
+            .arg(&target)
+            .arg("--target")
+            .arg(&self.host)
+            .arg("--profile")
+            .arg(if release { "release" } else { "dev" })
+            .arg("--config")
+            .arg(cargo_path_setting("build.build-dir", &target)?)
+            .arg("--config")
+            .arg(cargo_path_setting("build.rustc", &self.compiler)?)
             .args(["--config", "build.rustc-wrapper=\"\""])
             .args(["--config", "build.rustc-workspace-wrapper=\"\""])
             .args(["--config", "cache.auto-clean-frequency=\"never\""])
@@ -143,15 +168,25 @@ impl BuildContext {
         Ok(command)
     }
 
-    pub(super) fn verify_output(&self, project: &Path, release: bool) -> Result<(), CompilationBenchmarkError> {
-        let executable = project.join("target").join(&self.host)
+    pub(super) fn verify_output(
+        &self,
+        project: &Path,
+        release: bool,
+    ) -> Result<(), CompilationBenchmarkError> {
+        let executable = project
+            .join("target")
+            .join(&self.host)
             .join(if release { "release" } else { "debug" })
             .join(format!("rch_benchmark{}", std::env::consts::EXE_SUFFIX));
-        let metadata = std::fs::symlink_metadata(&executable).map_err(|error| failure(format!(
-            "Benchmark build did not produce its private executable: {error}"
-        )))?;
+        let metadata = std::fs::symlink_metadata(&executable).map_err(|error| {
+            failure(format!(
+                "Benchmark build did not produce its private executable: {error}"
+            ))
+        })?;
         if !metadata.is_file() || metadata.len() == 0 {
-            return Err(failure("Benchmark output is not a nonempty regular executable file"));
+            return Err(failure(
+                "Benchmark output is not a nonempty regular executable file",
+            ));
         }
         Ok(())
     }
@@ -173,7 +208,10 @@ mod tests {
 
     #[test]
     fn both_output_roots_and_compiler_are_explicit_on_every_phase() {
-        let directory = tempfile::Builder::new().prefix("rch bench ' ").tempdir().unwrap();
+        let directory = tempfile::Builder::new()
+            .prefix("rch bench ' ")
+            .tempdir()
+            .unwrap();
         let root = directory.path().canonicalize().unwrap();
         for (release, incremental) in [(false, false), (true, false), (true, true)] {
             let command = context().command(&root, release, incremental).unwrap();
@@ -183,13 +221,26 @@ mod tests {
             assert_eq!(command.get_current_dir(), Some(root.as_path()));
             assert_eq!(args[0], "build");
             assert!(!args.contains(&OsStr::new("clean")));
-            for name in ["CARGO_TARGET_DIR", "CARGO_BUILD_TARGET_DIR", "CARGO_BUILD_BUILD_DIR"] {
+            for name in [
+                "CARGO_TARGET_DIR",
+                "CARGO_BUILD_TARGET_DIR",
+                "CARGO_BUILD_BUILD_DIR",
+            ] {
                 assert_eq!(env[OsStr::new(name)], Some(root.join("target").as_os_str()));
             }
-            assert_eq!(env[OsStr::new("RUSTC")], Some(OsStr::new("/selected toolchain/bin/rustc")));
-            assert_eq!(env[OsStr::new("CARGO_INCREMENTAL")], Some(OsStr::new(if incremental { "1" } else { "0" })));
+            assert_eq!(
+                env[OsStr::new("RUSTC")],
+                Some(OsStr::new("/selected toolchain/bin/rustc"))
+            );
+            assert_eq!(
+                env[OsStr::new("CARGO_INCREMENTAL")],
+                Some(OsStr::new(if incremental { "1" } else { "0" }))
+            );
             let target = root.join("target");
-            assert!(args.windows(2).any(|pair| pair == [OsStr::new("--target-dir"), target.as_os_str()]));
+            assert!(
+                args.windows(2)
+                    .any(|pair| pair == [OsStr::new("--target-dir"), target.as_os_str()])
+            );
             let setting = cargo_path_setting("build.build-dir", &target).unwrap();
             assert!(args.contains(&OsStr::new(&setting)));
         }
@@ -200,18 +251,37 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let command = context().command(directory.path(), true, false).unwrap();
         let env: std::collections::BTreeMap<_, _> = command.get_envs().collect();
-        for name in ["RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER", "CARGO_BUILD_RUSTC_WRAPPER", "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER", "CARGO_ENCODED_RUSTFLAGS"] {
+        for name in [
+            "RUSTC_WRAPPER",
+            "RUSTC_WORKSPACE_WRAPPER",
+            "CARGO_BUILD_RUSTC_WRAPPER",
+            "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER",
+            "CARGO_ENCODED_RUSTFLAGS",
+        ] {
             assert_eq!(env[OsStr::new(name)], Some(OsStr::new("")));
         }
         assert_eq!(env[OsStr::new("RUSTFLAGS")], None);
         assert_eq!(env[OsStr::new("CARGO_BUILD_RUSTFLAGS")], None);
-        assert_eq!(env[OsStr::new("CARGO_CACHE_AUTO_CLEAN_FREQUENCY")], Some(OsStr::new("never")));
+        assert_eq!(
+            env[OsStr::new("CARGO_CACHE_AUTO_CLEAN_FREQUENCY")],
+            Some(OsStr::new("never"))
+        );
     }
 
     #[test]
     fn identity_needs_one_literal_host() {
-        assert_eq!(compiler_host("rustc 1.90\nhost: x86_64-unknown-linux-gnu\n").unwrap(), "x86_64-unknown-linux-gnu");
-        for identity in ["rustc unknown", "rustc unknown\nhost: \n", "rustc unknown\nhost: a\nhost: b\n", "rustc unknown\nhost: --help\n", "rustc unknown\nhost: a b\n", "other\nhost: a\n"] {
+        assert_eq!(
+            compiler_host("rustc 1.90\nhost: x86_64-unknown-linux-gnu\n").unwrap(),
+            "x86_64-unknown-linux-gnu"
+        );
+        for identity in [
+            "rustc unknown",
+            "rustc unknown\nhost: \n",
+            "rustc unknown\nhost: a\nhost: b\n",
+            "rustc unknown\nhost: --help\n",
+            "rustc unknown\nhost: a b\n",
+            "other\nhost: a\n",
+        ] {
             assert!(compiler_host(identity).is_err(), "{identity}");
         }
     }
@@ -231,7 +301,11 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let context = context();
         assert!(context.verify_output(directory.path(), true).is_err());
-        let output = directory.path().join("target").join(&context.host).join("release")
+        let output = directory
+            .path()
+            .join("target")
+            .join(&context.host)
+            .join("release")
             .join(format!("rch_benchmark{}", std::env::consts::EXE_SUFFIX));
         std::fs::create_dir_all(output.parent().unwrap()).unwrap();
         std::fs::write(&output, b"").unwrap();

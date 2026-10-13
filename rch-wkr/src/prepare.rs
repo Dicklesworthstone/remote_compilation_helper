@@ -9,8 +9,8 @@
 
 mod install;
 
-pub use install::{PrepareAction, PrepareReport};
 use install::{INPUT_NAMES, InstallPlan};
+pub use install::{PrepareAction, PrepareReport};
 
 use anyhow::{Context, Result, bail, ensure};
 use chrono::Utc;
@@ -93,8 +93,7 @@ impl DependencyInputs {
                 }
                 Err(error) => return Err(error).with_context(|| format!("inspect {name}")),
             };
-            let before = InputIdentity::of(&metadata)
-                .with_context(|| format!("inspect {name}"))?;
+            let before = InputIdentity::of(&metadata).with_context(|| format!("inspect {name}"))?;
             budget = budget
                 .checked_sub(before.len)
                 .context("dependency inputs exceed byte limit")?;
@@ -175,13 +174,9 @@ impl DependencyInputs {
         // Existing files (including locks) must retain both bytes and identity.
         // Use the same selection as dispatch. A Bun test against an npm-locked
         // project still uses npm, and a frozen install may create no new lock.
-        let generated = InstallPlan::for_sources(&self.fingerprint.sources, runtime)?
-            .generated_lockfiles();
-        for ((name, before), current) in INPUT_NAMES
-            .iter()
-            .zip(&self.members)
-            .zip(&after.members)
-        {
+        let generated =
+            InstallPlan::for_sources(&self.fingerprint.sources, runtime)?.generated_lockfiles();
+        for ((name, before), current) in INPUT_NAMES.iter().zip(&self.members).zip(&after.members) {
             match (before, current) {
                 (Some(before), Some(current)) if before == current => {}
                 (None, None) => {}
@@ -224,7 +219,9 @@ impl PrepareTransaction {
     }
 
     async fn acquire_in(project: &Path, directory: &Path, budget: Duration) -> Result<Self> {
-        let project = project.canonicalize().context("resolve preparation project")?;
+        let project = project
+            .canonicalize()
+            .context("resolve preparation project")?;
         ensure!(project.is_dir(), "preparation project is not a directory");
         let mut key = blake3::Hasher::new();
         key.update(b"rch-prepare-project-v1\0");
@@ -320,7 +317,10 @@ impl PrepareTransaction {
                 (named.dev(), named.ino()) == (opened.dev(), opened.ino()),
                 "preparation journal inode changed"
             );
-            ensure!(named.mode() & 0o077 == 0, "preparation journal is not private");
+            ensure!(
+                named.mode() & 0o077 == 0,
+                "preparation journal is not private"
+            );
         }
         Ok(())
     }
@@ -380,7 +380,8 @@ fn verified_fingerprint(project: &Path, report: &PrepareReport) -> Result<()> {
         "cached fingerprint is not a regular file"
     );
     let mut bytes = Vec::new();
-    file.take(MAX_FINGERPRINT_BYTES + 1).read_to_end(&mut bytes)?;
+    file.take(MAX_FINGERPRINT_BYTES + 1)
+        .read_to_end(&mut bytes)?;
     ensure!(
         bytes.len() as u64 <= MAX_FINGERPRINT_BYTES,
         "cached fingerprint exceeds byte limit"

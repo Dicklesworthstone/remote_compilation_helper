@@ -139,8 +139,12 @@ impl Fixture {
             Err(error) => panic!("accept: {error}"),
         });
         let stream = stream.unwrap();
-        stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-        stream.set_write_timeout(Some(Duration::from_secs(2))).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
         let mut peer = BufReader::new(stream);
         assert_eq!(read_frame(&mut peer)["kind"], "hello");
         let wrapper_pid = read_pid(&root.path().join("wrapper.pid"));
@@ -179,7 +183,10 @@ impl Fixture {
                 || matches!(result, Err(ref error) if error.kind() == io::ErrorKind::ConnectionReset),
             "cancelled wrapper retained its connection: {result:?}"
         );
-        assert!(bytes.is_empty(), "new request or consent after caller loss: {bytes:?}");
+        assert!(
+            bytes.is_empty(),
+            "new request or consent after caller loss: {bytes:?}"
+        );
         assert!(
             !self.root.path().join("compiler-runs").exists(),
             "cancelled request started the real compiler"
@@ -232,7 +239,10 @@ fn caller_loss_after_acceptance_fails_closed_without_waiting_for_install_timeout
     let mut fixture = Fixture::new();
     fixture.request();
     fixture.send(HIT.as_bytes()).unwrap();
-    assert_eq!(read_frame(fixture.peer.as_mut().unwrap())["kind"], "rustc-accept");
+    assert_eq!(
+        read_frame(fixture.peer.as_mut().unwrap())["kind"],
+        "rustc-accept"
+    );
     fixture.parent.cancel();
     fixture.assert_cancelled();
 }
@@ -244,13 +254,24 @@ fn living_caller_retains_exactly_once_fallback_and_original_exit_status() {
         fixture.request();
         if accepted {
             fixture.send(HIT.as_bytes()).unwrap();
-            assert_eq!(read_frame(fixture.peer.as_mut().unwrap())["kind"], "rustc-accept");
+            assert_eq!(
+                read_frame(fixture.peer.as_mut().unwrap())["kind"],
+                "rustc-accept"
+            );
             fixture.send(b"{\"kind\":\"rustc-decision\",\"decision\":\"serve-failed\",\"writer_returned\":true}\n").unwrap();
         } else {
-            fixture.send(b"{\"kind\":\"rustc-decision\",\"decision\":\"pass-through\"}\n").unwrap();
+            fixture
+                .send(b"{\"kind\":\"rustc-decision\",\"decision\":\"pass-through\"}\n")
+                .unwrap();
         }
         assert_eq!(fixture.parent.wait().code(), Some(7));
-        assert_eq!(std::fs::read(fixture.root.path().join("compiler-runs")).unwrap(), b"run\n");
-        assert_eq!(std::fs::read(&fixture.stdout).unwrap(), b"compiler stdout\n");
+        assert_eq!(
+            std::fs::read(fixture.root.path().join("compiler-runs")).unwrap(),
+            b"run\n"
+        );
+        assert_eq!(
+            std::fs::read(&fixture.stdout).unwrap(),
+            b"compiler stdout\n"
+        );
     }
 }

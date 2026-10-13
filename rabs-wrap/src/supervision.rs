@@ -107,7 +107,9 @@ fn scan_budget(entries: &mut usize, deadline: Instant) -> io::Result<()> {
         ));
     }
     if *entries >= MAX_SCAN_ENTRIES {
-        return Err(io::Error::other("compiler group scan exceeded its entry bound"));
+        return Err(io::Error::other(
+            "compiler group scan exceeded its entry bound",
+        ));
     }
     *entries += 1;
     Ok(())
@@ -133,7 +135,9 @@ fn quiescent_group_snapshot(
     let leader_path = proc_root.join(leader.to_string()).join("stat");
     let pinned = read_stat_path(&leader_path, leader)?;
     if pinned.parent != parent || pinned.group != leader {
-        return Err(io::Error::other("compiler group lost its unreaped leader fence"));
+        return Err(io::Error::other(
+            "compiler group lost its unreaped leader fence",
+        ));
     }
     if !pinned.exited() {
         return Ok(None);
@@ -199,12 +203,16 @@ fn quiescent_group_snapshot(
         || after.group != leader
         || !after.exited()
     {
-        return Err(io::Error::other("compiler leader changed during group observation"));
+        return Err(io::Error::other(
+            "compiler leader changed during group observation",
+        ));
     }
     terminal.sort_unstable();
     terminal.dedup();
     if !terminal.contains(&(leader, pinned.start)) {
-        return Err(io::Error::other("compiler leader was absent from the group scan"));
+        return Err(io::Error::other(
+            "compiler leader was absent from the group scan",
+        ));
     }
     Ok(Some(terminal))
 }

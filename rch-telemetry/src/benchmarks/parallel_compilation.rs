@@ -61,7 +61,10 @@ impl ParallelCompilationResult {
             && self.serial_ms > 0
             && self.parallel_ms > 0
             && self.rustc_version.starts_with("rustc ")
-            && self.rustc_version.lines().any(|line| line.starts_with("host: "))
+            && self
+                .rustc_version
+                .lines()
+                .any(|line| line.starts_with("host: "))
             && self.rustc_version.len() <= MAX_DIAGNOSTIC_BYTES as usize
     }
 
@@ -120,10 +123,20 @@ impl ParallelCompilationBenchmark {
         let root = TempDir::new().map_err(|error| io_failure("setup", error))?;
         let root = root.path();
         let selected_version = probe(&self.rustc_path, "-vV", root, "selected", deadline)?;
-        let sysroot = probe(&self.rustc_path, "--print=sysroot", root, "sysroot", deadline)?;
+        let sysroot = probe(
+            &self.rustc_path,
+            "--print=sysroot",
+            root,
+            "sysroot",
+            deadline,
+        )?;
         let sysroot = Path::new(sysroot.trim());
         if !sysroot.is_absolute() {
-            return Err(failure("setup", "rustc returned a non-absolute sysroot", None));
+            return Err(failure(
+                "setup",
+                "rustc returned a non-absolute sysroot",
+                None,
+            ));
         }
         // Resolve rustup ONCE. The pool never measures a cache wrapper or a
         // second machine, and killing one compiler kills its codegen threads.
@@ -228,7 +241,11 @@ fn probe(
         .stdout(File::create(&stdout).map_err(|error| io_failure("setup", error))?)
         .stderr(File::create(&stderr).map_err(|error| io_failure("setup", error))?);
     let mut pending = Pending {
-        child: Some(command.spawn().map_err(|error| io_failure("setup", error))?),
+        child: Some(
+            command
+                .spawn()
+                .map_err(|error| io_failure("setup", error))?,
+        ),
         output: stdout.clone(),
         stderr,
     };
@@ -451,7 +468,9 @@ fn spawn_compile(
             command.arg("--extern").arg(binding);
         }
     }
-    let child = command.spawn().map_err(|error| io_failure("compile", error))?;
+    let child = command
+        .spawn()
+        .map_err(|error| io_failure("compile", error))?;
     Ok(Pending {
         child: Some(child),
         output: artifact,
@@ -499,7 +518,10 @@ fn same_bytes(first: &Path, second: &Path, deadline: Instant) -> io::Result<bool
 
 fn setup_sources(root: &Path) -> io::Result<()> {
     for index in 0..PARALLEL_COMPILATION_CRATES - 1 {
-        fs::write(root.join(format!("{}.rs", crate_name(index))), LIBRARY_SOURCE)?;
+        fs::write(
+            root.join(format!("{}.rs", crate_name(index))),
+            LIBRARY_SOURCE,
+        )?;
     }
     let mut consumer = String::from("pub fn run(mut value: u64) -> u64 {\n");
     for index in 0..PARALLEL_COMPILATION_CRATES - 1 {
@@ -507,7 +529,10 @@ fn setup_sources(root: &Path) -> io::Result<()> {
     }
     consumer.push_str("value\n}\n");
     fs::write(
-        root.join(format!("{}.rs", crate_name(PARALLEL_COMPILATION_CRATES - 1))),
+        root.join(format!(
+            "{}.rs",
+            crate_name(PARALLEL_COMPILATION_CRATES - 1)
+        )),
         consumer,
     )
 }

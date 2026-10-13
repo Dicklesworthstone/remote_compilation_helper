@@ -400,13 +400,17 @@ impl CompilationBenchmark {
                 stderr: Some(String::from_utf8_lossy(&output.stderr).to_string()),
             });
         }
-        context.verify_output(project_dir, release).map_err(|mut error| {
-            error.phase = phase.to_owned();
-            error
-        })?;
+        context
+            .verify_output(project_dir, release)
+            .map_err(|mut error| {
+                error.phase = phase.to_owned();
+                error
+            })?;
         // Millisecond-resolution evidence must not label a completed, positive
         // duration as missing. This is quantization, not a throughput multiplier.
-        Ok(u64::try_from(duration.as_millis()).unwrap_or(u64::MAX).max(1))
+        Ok(u64::try_from(duration.as_millis())
+            .unwrap_or(u64::MAX)
+            .max(1))
     }
 }
 
@@ -1780,7 +1784,10 @@ mod tests {
     #[test]
     #[ignore = "requires real Cargo and rustc; compiles the reference workload"]
     fn test_full_compilation_benchmark() {
-        let result = CompilationBenchmark::new().with_warmup(false).run().unwrap();
+        let result = CompilationBenchmark::new()
+            .with_warmup(false)
+            .run()
+            .unwrap();
         assert!(result.score > 0.0);
         assert!(result.debug_build_ms > 0);
         assert!(result.release_build_ms > 0);
@@ -1810,8 +1817,16 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let project = setup_benchmark_project(temp_dir.path()).unwrap();
         let context = BuildContext::resolve(Path::new("cargo"), Path::new("rustc")).unwrap();
-        let output = context.command(&project, false, false).unwrap().output().unwrap();
-        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        let output = context
+            .command(&project, false, false)
+            .unwrap()
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         context.verify_output(&project, false).unwrap();
     }
 

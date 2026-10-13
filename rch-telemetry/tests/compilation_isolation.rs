@@ -123,11 +123,21 @@ impl Fixture {
             .tempdir()
             .unwrap();
         let root = directory.path().canonicalize().unwrap();
-        for name in ["calls", "scratch", "cargo-home", "protected/target", "protected/build"] {
+        for name in [
+            "calls",
+            "scratch",
+            "cargo-home",
+            "protected/target",
+            "protected/build",
+        ] {
             fs::create_dir_all(root.join(name)).unwrap();
         }
         for name in ["target", "build"] {
-            fs::write(root.join("protected").join(name).join("sentinel"), PROTECTED).unwrap();
+            fs::write(
+                root.join("protected").join(name).join("sentinel"),
+                PROTECTED,
+            )
+            .unwrap();
         }
         executable(&root.join("tools/cargo recorder"), CARGO_FIXTURE);
         executable(&root.join("tools/selected rustc"), RUSTC_FIXTURE);
@@ -164,11 +174,23 @@ impl Fixture {
             .env("CARGO_BUILD_TARGET_DIR", self.root.join("protected/target"))
             .env("CARGO_BUILD_BUILD_DIR", self.root.join("protected/build"))
             .env("RUSTC", self.root.join("not-the-selected-compiler"))
-            .env("CARGO_BUILD_RUSTC", self.root.join("not-the-selected-compiler"))
+            .env(
+                "CARGO_BUILD_RUSTC",
+                self.root.join("not-the-selected-compiler"),
+            )
             .env("RUSTC_WRAPPER", self.root.join("forbidden-wrapper"))
-            .env("RUSTC_WORKSPACE_WRAPPER", self.root.join("forbidden-wrapper"))
-            .env("CARGO_BUILD_RUSTC_WRAPPER", self.root.join("forbidden-wrapper"))
-            .env("CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER", self.root.join("forbidden-wrapper"))
+            .env(
+                "RUSTC_WORKSPACE_WRAPPER",
+                self.root.join("forbidden-wrapper"),
+            )
+            .env(
+                "CARGO_BUILD_RUSTC_WRAPPER",
+                self.root.join("forbidden-wrapper"),
+            )
+            .env(
+                "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER",
+                self.root.join("forbidden-wrapper"),
+            )
             .env("CARGO_ENCODED_RUSTFLAGS", "--invalid-ambient-flag")
             .env("RUSTFLAGS", "--also-invalid")
             .env("CARGO_BUILD_RUSTFLAGS", "--not-the-benchmark")
@@ -186,7 +208,10 @@ impl Fixture {
             if let Some(status) = child.0.try_wait().unwrap() {
                 break status;
             }
-            assert!(Instant::now() < deadline, "benchmark child exceeded fixture deadline");
+            assert!(
+                Instant::now() < deadline,
+                "benchmark child exceeded fixture deadline"
+            );
             std::thread::sleep(Duration::from_millis(10));
         };
         assert!(
@@ -219,7 +244,11 @@ impl Fixture {
         for name in ["target", "build"] {
             let protected = self.root.join("protected").join(name);
             assert_eq!(fs::read(protected.join("sentinel")).unwrap(), PROTECTED);
-            assert_eq!(fs::read_dir(protected).unwrap().count(), 1, "no shared output writes");
+            assert_eq!(
+                fs::read_dir(protected).unwrap().count(),
+                1,
+                "no shared output writes"
+            );
         }
         assert!(!self.root.join("unexpected-wrapper").exists());
         assert!(self.directory.path().exists());
@@ -228,11 +257,20 @@ impl Fixture {
 
 fn ambient_state() -> Vec<(String, Option<OsString>)> {
     [
-        "CARGO_TARGET_DIR", "CARGO_BUILD_TARGET_DIR", "CARGO_BUILD_BUILD_DIR",
-        "CARGO_HOME", "RUSTC", "CARGO_BUILD_RUSTC", "RUSTC_WRAPPER",
-        "RUSTC_WORKSPACE_WRAPPER", "CARGO_BUILD_RUSTC_WRAPPER",
-        "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER", "CARGO_ENCODED_RUSTFLAGS",
-        "RUSTFLAGS", "CARGO_BUILD_RUSTFLAGS", "CARGO_CACHE_AUTO_CLEAN_FREQUENCY",
+        "CARGO_TARGET_DIR",
+        "CARGO_BUILD_TARGET_DIR",
+        "CARGO_BUILD_BUILD_DIR",
+        "CARGO_HOME",
+        "RUSTC",
+        "CARGO_BUILD_RUSTC",
+        "RUSTC_WRAPPER",
+        "RUSTC_WORKSPACE_WRAPPER",
+        "CARGO_BUILD_RUSTC_WRAPPER",
+        "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER",
+        "CARGO_ENCODED_RUSTFLAGS",
+        "RUSTFLAGS",
+        "CARGO_BUILD_RUSTFLAGS",
+        "CARGO_CACHE_AUTO_CLEAN_FREQUENCY",
     ]
     .into_iter()
     .map(|name| (name.to_owned(), std::env::var_os(name)))
@@ -251,22 +289,39 @@ fn compilation_isolation_child() {
             PathBuf::from(std::env::var_os("RCH_BENCH_REAL_RUSTC").expect("real rustc path")),
         )
     } else if mode == "relative" {
-        (PathBuf::from("tools/cargo recorder"), PathBuf::from("tools/selected rustc"))
+        (
+            PathBuf::from("tools/cargo recorder"),
+            PathBuf::from("tools/selected rustc"),
+        )
     } else {
-        (root.join("tools/cargo recorder"), root.join("tools/selected rustc"))
+        (
+            root.join("tools/cargo recorder"),
+            root.join("tools/selected rustc"),
+        )
     };
     let mut benchmark = CompilationBenchmark::new()
         .with_cargo_path(cargo)
         .with_rustc_path(rustc);
     if mode == "stable" || mode == "real" {
-        benchmark = benchmark.with_debug(false).with_incremental(false).with_warmup(false);
+        benchmark = benchmark
+            .with_debug(false)
+            .with_incremental(false)
+            .with_warmup(false);
     }
-    let result = if mode == "stable" { benchmark.run_stable(3) } else { benchmark.run() };
+    let result = if mode == "stable" {
+        benchmark.run_stable(3)
+    } else {
+        benchmark.run()
+    };
     let json = match result {
         Ok(measurement) => serde_json::json!({"measurement": measurement}),
         Err(error) => serde_json::json!({"error": error}),
     };
-    assert_eq!(ambient_state(), before, "benchmark mutated its caller's environment");
+    assert_eq!(
+        ambient_state(),
+        before,
+        "benchmark mutated its caller's environment"
+    );
     fs::write(root.join("result.json"), serde_json::to_vec(&json).unwrap()).unwrap();
 }
 
@@ -278,20 +333,36 @@ fn phases_are_isolated_and_only_the_incremental_pair_reuses_outputs() {
     assert_eq!(fixture.count(), 5);
     let mut roots = BTreeSet::new();
     for (index, phase) in ["warmup", "debug", "release", "incremental", "incremental"]
-        .into_iter().enumerate()
+        .into_iter()
+        .enumerate()
     {
         let n = index + 1;
         assert_eq!(fixture.call(n, "phase").trim(), phase);
         let root = PathBuf::from(fixture.call(n, "cwd").trim());
         assert!(root.starts_with(fixture.root.join("scratch")));
         roots.insert(root.clone());
-        assert_eq!(fixture.call(n, "compiler").trim(), fixture.root.join("sysroot/bin/rustc").to_str().unwrap());
-        assert_eq!(fixture.call(n, "state"), if n == 5 { "seeded" } else { "cold" });
-        assert_eq!(fixture.call(n, "incremental").trim(), if n >= 4 { "1" } else { "0" });
+        assert_eq!(
+            fixture.call(n, "compiler").trim(),
+            fixture.root.join("sysroot/bin/rustc").to_str().unwrap()
+        );
+        assert_eq!(
+            fixture.call(n, "state"),
+            if n == 5 { "seeded" } else { "cold" }
+        );
+        assert_eq!(
+            fixture.call(n, "incremental").trim(),
+            if n >= 4 { "1" } else { "0" }
+        );
         let args = fixture.call(n, "args");
-        let build_dir = format!("build.build-dir={}", serde_json::to_string(root.join("target").to_str().unwrap()).unwrap());
+        let build_dir = format!(
+            "build.build-dir={}",
+            serde_json::to_string(root.join("target").to_str().unwrap()).unwrap()
+        );
         assert!(args.lines().any(|line| line == build_dir));
-        assert!(args.lines().any(|line| line == "cache.auto-clean-frequency=\"never\""));
+        assert!(
+            args.lines()
+                .any(|line| line == "cache.auto-clean-frequency=\"never\"")
+        );
     }
     assert_eq!(roots.len(), 4);
     let original = fixture.call(1, "source");
@@ -328,7 +399,12 @@ fn caller_relative_tool_paths_survive_switching_to_private_projects() {
 fn compiler_identity_mismatch_stops_before_any_cargo_invocation() {
     let fixture = Fixture::new();
     let result = fixture.run("mismatch");
-    assert!(result["error"]["message"].as_str().unwrap().contains("identities differ"));
+    assert!(
+        result["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("identities differ")
+    );
     assert_eq!(fixture.count(), 0);
 }
 
@@ -346,7 +422,12 @@ fn failed_warmups_and_unproven_outputs_never_become_measurements() {
         assert_eq!(result["error"]["phase"], phase);
         assert_eq!(fixture.count(), count);
         if mode.starts_with("fail-") {
-            assert!(result["error"]["stderr"].as_str().unwrap().contains("fixture-build-failed"));
+            assert!(
+                result["error"]["stderr"]
+                    .as_str()
+                    .unwrap()
+                    .contains("fixture-build-failed")
+            );
         }
     }
 }
@@ -357,15 +438,27 @@ fn real_cargo_preserves_unrelated_target_build_and_wrapper_state() {
     let fixture = Fixture::new();
     // Resolve in the unmodified caller environment, not inside the synthetic
     // CARGO_HOME. The child then executes the actual production public API.
-    let probe = Command::new("rustc").arg("--print=sysroot").output().unwrap();
-    assert!(probe.status.success(), "{}", String::from_utf8_lossy(&probe.stderr));
+    let probe = Command::new("rustc")
+        .arg("--print=sysroot")
+        .output()
+        .unwrap();
+    assert!(
+        probe.status.success(),
+        "{}",
+        String::from_utf8_lossy(&probe.stderr)
+    );
     let sysroot = PathBuf::from(String::from_utf8(probe.stdout).unwrap().trim());
     assert!(sysroot.is_absolute());
     let mut child = fixture.child("real");
-    child.env("RCH_BENCH_REAL_RUSTC", sysroot.join("bin/rustc"))
+    child
+        .env("RCH_BENCH_REAL_RUSTC", sysroot.join("bin/rustc"))
         .env("RCH_BENCH_REAL_CARGO", env!("CARGO"));
     let result = fixture.finish(&mut child);
     assert!(result.get("measurement").is_some(), "{result}");
     assert!(result["measurement"]["release_build_ms"].as_u64().unwrap() > 0);
-    assert_eq!(fixture.count(), 0, "the real test must not invoke synthetic Cargo");
+    assert_eq!(
+        fixture.count(),
+        0,
+        "the real test must not invoke synthetic Cargo"
+    );
 }

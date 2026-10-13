@@ -597,7 +597,9 @@ fn live_outcome(
     owned: &impl Fn() -> bool,
 ) -> Result<Live, ()> {
     if !owned() {
-        return Ok(Live::FailClosed("original compiler caller disappeared".into()));
+        return Ok(Live::FailClosed(
+            "original compiler caller disappeared".into(),
+        ));
     }
     match reply.get("decision").and_then(reply_json::Value::as_str) {
         Some("pass-through") => Ok(Live::PassThrough),
@@ -637,7 +639,9 @@ fn live_outcome(
             // typed answer confirms that the install writer returned. Losing
             // a connection does not prove that its daemon or writer died.
             let Some(deadline) = Instant::now().checked_add(install_wait()) else {
-                return Ok(Live::FailClosed("RABS install deadline is not representable".into()));
+                return Ok(Live::FailClosed(
+                    "RABS install deadline is not representable".into(),
+                ));
             };
             if singleflight::write_owned(
                 &mut reader,
@@ -651,7 +655,8 @@ fn live_outcome(
                     "the RABS cache-hit acceptance could not be confirmed".into(),
                 ));
             }
-            match singleflight::read_owned_reply(&mut reader, MAX_LIVE_REPLY_BYTES, deadline, owned) {
+            match singleflight::read_owned_reply(&mut reader, MAX_LIVE_REPLY_BYTES, deadline, owned)
+            {
                 Ok(line) => Ok(accepted_install_reply(&line)),
                 // A socket read timeout surfaces as WouldBlock (EAGAIN) on
                 // Linux and TimedOut elsewhere; both mean "still alive, no
@@ -870,7 +875,13 @@ fn observe_with_breaker(
             }
         }
     };
-    let outcome = consult(socket, connect_timeout_ms, decision_timeout_ms, args, &owned);
+    let outcome = consult(
+        socket,
+        connect_timeout_ms,
+        decision_timeout_ms,
+        args,
+        &owned,
+    );
     if !owned() {
         // Cancellation is neither daemon failure nor evidence of its health.
         // An abandoned probe keeps its already published cooldown reservation;
@@ -1488,7 +1499,12 @@ mod tests {
         let socket_text = socket.to_str().unwrap().to_owned();
         let wrapper_path = path_text.clone();
         let wrapper = std::thread::spawn(move || {
-            observe_with_breaker(&socket_text, &wrapper_path, &["/tc/bin/rustc".to_owned()], None)
+            observe_with_breaker(
+                &socket_text,
+                &wrapper_path,
+                &["/tc/bin/rustc".to_owned()],
+                None,
+            )
         });
         mid_consult
             .recv_timeout(Duration::from_secs(5))
