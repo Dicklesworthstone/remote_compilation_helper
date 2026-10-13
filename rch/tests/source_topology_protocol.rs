@@ -24,8 +24,11 @@ fn source_topology_acknowledgement_and_release_protocol() {
         rch_common::stale_target_reap::SOURCE_CLAIM_RECORD_HELPERS,
     )
     .expect("write compiled helpers");
-    std::fs::write(&retry, include_str!("../src/hook/source_claim_admission.sh"))
-        .expect("write compiled admission retry");
+    std::fs::write(
+        &retry,
+        include_str!("../src/hook/source_claim_admission.sh"),
+    )
+    .expect("write compiled admission retry");
 
     let output = Command::new("python3")
         .arg(root.join("scripts/tests/test_source_topology.py"))
