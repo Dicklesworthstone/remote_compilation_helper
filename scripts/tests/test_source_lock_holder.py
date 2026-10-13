@@ -185,6 +185,23 @@ class SourceLockHolderTests(unittest.TestCase):
         self.holders.append(holder)
         return holder
 
+    def assert_waiting(self, holder, paths, detail):
+        # The holder validates and opens the WHOLE plan before taking any
+        # lock, then retries the closure non-blocking and releases every
+        # acquired lock before each contention wait (53a85a3e, 8b475843). A
+        # blocked waiter is recognized by its opened plan and its silence,
+        # never by a held prefix: probing a prefix lock only catches a retry
+        # in flight.
+        eventually(lambda: all(path.exists() for path in paths), detail)
+        self.assertIsNone(holder.line(0.2), "readiness while a plan root is contended")
+        self.assertIsNone(holder.process.poll(), "waiter exited instead of waiting")
+
+    def assert_prefix_not_monopolized(self, paths):
+        # Admission needs the whole closure: a waiter blocked on one busy root
+        # must leave the roots before it to other builds.
+        eventually(lambda: all(available(path) for path in paths),
+                   "waiter monopolized earlier roots while contended")
+
     def test_all_locks_survive_terminal_exec_and_fd4_is_preserved(self):
         paths = [self.root / ("lock-{}".format(i)) for i in range(64)]
         terminal = ('set -eu; claim=$(cat <&4); exec 4<&-; '
@@ -211,8 +228,8 @@ class SourceLockHolderTests(unittest.TestCase):
         try:
             fcntl.flock(fd, fcntl.LOCK_EX)
             holder = self.start([("x", first), ("x", last)])
-            eventually(lambda: not available(first), "holder never acquired first ordered lock")
-            self.assertIsNone(holder.line(0.05), "readiness preceded final lock acquisition")
+            self.assert_waiting(holder, [first, last], "holder never opened its ordered plan")
+            self.assert_prefix_not_monopolized([first])
         finally:
             os.close(fd)
         self.assertEqual(holder.line(), b"READY")
@@ -410,8 +427,8 @@ class SourceLockHolderTests(unittest.TestCase):
         try:
             fcntl.flock(fd, fcntl.LOCK_EX)
             holder = self.start([("x", path) for path in paths], portable=False, env=env)
-            eventually(lambda: not available(paths[-2]), "native holder did not reach final lock")
-            self.assertIsNone(holder.line(0.05), "native readiness preceded final lock")
+            self.assert_waiting(holder, paths, "native holder did not open its plan")
+            self.assert_prefix_not_monopolized(paths[:-1])
             holder.process.kill()
             stdout, stderr = holder.finish()
             self.assertEqual(stdout, b"", stderr)
@@ -477,8 +494,7 @@ class SourceLockHolderTests(unittest.TestCase):
                 holder = self.start([("x", path) for path in paths], portable=portable,
                                     env=self.environment(portable, gnu_flock=False),
                                     terminal=self.terminal_witness(witness))
-                eventually(lambda: not available(paths[-2]), "waiter did not reach final lock")
-                self.assertIsNone(holder.line(0.05))
+                self.assert_waiting(holder, paths, "waiter did not open its plan")
                 stdout, stderr = holder.finish()  # Requester EOF, NO signal.
                 self.assert_requester_refused(holder, stdout, stderr)
                 self.assertFalse(witness.exists(), "abandoned acquisition ran the terminal protocol")
@@ -517,8 +533,7 @@ class SourceLockHolderTests(unittest.TestCase):
                 holder = self.start([("x", path) for path in paths], portable=portable,
                                     env=self.environment(portable, gnu_flock=False),
                                     terminal=self.terminal_witness(witness))
-                eventually(lambda: not available(paths[-2]), "waiter did not reach final lock")
-                self.assertIsNone(holder.line(0.05))
+                self.assert_waiting(holder, paths, "waiter did not open its plan")
                 holder.send("RELEASE\n")
                 stdout, stderr = holder.failure()  # Stdin stays OPEN until refusal.
                 self.assert_requester_refused(holder, stdout, stderr)
@@ -537,7 +552,7 @@ class SourceLockHolderTests(unittest.TestCase):
             holder = self.start([("x", path) for path in paths], portable=False,
                                 env=self.environment(portable=False, gnu_flock=False),
                                 terminal=self.terminal_witness(witness), ignore_hup=True)
-            eventually(lambda: not available(paths[-2]), "waiter did not reach final lock")
+            self.assert_waiting(holder, paths, "waiter did not open its plan")
             holder.process.send_signal(signal.SIGHUP)
             self.assertIsNone(holder.line(0.05))
             self.assertIsNone(holder.process.poll(), "fixture did not inherit ignored SIGHUP")
@@ -563,13 +578,16 @@ class SourceLockHolderTests(unittest.TestCase):
                     holder = self.start([("x", path) for path in paths], portable=portable,
                                         env=self.environment(portable, gnu_flock=False),
                                         terminal=self.terminal_witness(witness))
-                    eventually(lambda: not available(paths[-2]), "native waiter did not reach last root")
-                    self.assertIsNone(holder.line(0.05))
-                    paths[0].rename(old)  # Keep the old locked inode and its bytes.
-                    paths[0].write_bytes(b"another owner's replacement")
+                    self.assert_waiting(holder, paths, "native waiter did not open its plan")
+                    # Keep the old inode and its bytes under a second name, then
+                    # swap the pathname atomically: it is never even briefly
+                    # absent, so the refusal must be the identity check.
+                    os.link(paths[0], old)
+                    staged = self.root / f"staged-replacement-{portable}"
+                    staged.write_bytes(b"another owner's replacement")
+                    os.replace(staged, paths[0])
                     replacement = os.open(paths[0], os.O_RDWR)
                     fcntl.flock(replacement, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    self.assertFalse(available(old))
                     fcntl.flock(final, fcntl.LOCK_UN)
                     self.assertIsNone(holder.line(), "native holder granted ownership on a replaced inode")
                     stdout, stderr = holder.failure()
@@ -600,8 +618,7 @@ class SourceLockHolderTests(unittest.TestCase):
                         holder = self.start([("x", path) for path in paths], portable=portable,
                                             env=self.environment(portable, gnu_flock=False),
                                             terminal=self.terminal_witness(witness))
-                        eventually(lambda: not available(paths[-2]), "native waiter did not reach last root")
-                        self.assertIsNone(holder.line(0.05))
+                        self.assert_waiting(holder, paths, "native waiter did not open its plan")
                         paths[0].rename(old)
                         if change == "symlink":
                             # Even a link resolving to the SAME held inode is not
@@ -663,7 +680,7 @@ class SourceLockHolderTests(unittest.TestCase):
                 fcntl.flock(fd, fcntl.LOCK_EX)
                 holder = self.start([("x", path) for path in paths], env=env,
                                     terminal=self.terminal_witness(witness), ignore_hup=ignore_hup)
-                eventually(lambda: not available(paths[-2]), "GNU waiter did not reach final root")
+                self.assert_waiting(holder, paths, "GNU waiter did not open its plan")
                 if ignore_hup:
                     holder.process.send_signal(signal.SIGHUP)
                 self.assertIsNone(holder.line(0.05))
@@ -699,7 +716,7 @@ class SourceLockHolderTests(unittest.TestCase):
                 fcntl.flock(fd, fcntl.LOCK_EX)
                 holder = self.start([("x", first), ("x", last)], env=env,
                                     terminal=self.terminal_witness(witness))
-                eventually(lambda: not available(first), "GNU waiter did not acquire first root")
+                self.assert_waiting(holder, [first, last], "GNU waiter did not open its plan")
                 holder.send(early)
                 stdout, stderr = holder.failure()
                 self.assert_requester_refused(holder, stdout, stderr)
@@ -804,7 +821,7 @@ class SourceLockHolderTests(unittest.TestCase):
             self.assertTrue(link.is_symlink())
 
     @unittest.skipUnless(GNU_CANCELLABLE, "GNU flock and Bash 4.1+ are required")
-    def test_gnu_replaced_earlier_inode_is_rejected_after_the_final_wait(self):
+    def test_gnu_replaced_earlier_inode_is_rejected_before_any_grant(self):
         env = self.environment(portable=False, python=False)
         first, last, old = (self.root / name for name in ("first", "last", "old-first"))
         witness = self.root / "terminal"
@@ -813,11 +830,13 @@ class SourceLockHolderTests(unittest.TestCase):
             fcntl.flock(fd, fcntl.LOCK_EX)
             holder = self.start([("x", first), ("x", last)], env=env,
                                 terminal=self.terminal_witness(witness))
-            eventually(lambda: not available(first), "GNU waiter did not acquire first root")
-            self.assertIsNone(holder.line(0.05))
-            first.rename(old)  # Retain the old inode; nothing is deleted.
-            first.write_bytes(b"replacement lock evidence")
-            self.assertFalse(available(old))
+            self.assert_waiting(holder, [first, last], "GNU waiter did not open its plan")
+            # Retain the old inode under a second name and swap the pathname
+            # atomically; nothing is deleted and the name is never absent.
+            os.link(first, old)
+            staged = self.root / "staged-first"
+            staged.write_bytes(b"replacement lock evidence")
+            os.replace(staged, first)
             fcntl.flock(fd, fcntl.LOCK_UN)
             stdout, stderr = holder.failure()
             self.assertEqual((holder.process.returncode, stdout), (73, b""), stderr)
@@ -848,8 +867,9 @@ class SourceLockHolderTests(unittest.TestCase):
         self.assertEqual((holder.process.returncode, stdout), (73, b""), stderr)
         self.assertEqual(stderr.count(b"tool-failure"), 1)
         self.assertIn(b"flock failed without a contention verdict", stderr)
-        self.assertTrue(all(available(path) for path in paths[:2]))
-        self.assertFalse(paths[2].exists())
+        # The whole plan is opened before any lock is taken; the refusal
+        # leaves none of it locked.
+        self.assertTrue(all(available(path) for path in paths))
         self.assertFalse(witness.exists())
 
     @unittest.skipUnless(GNU_CANCELLABLE, "GNU flock and Bash 4.1+ are required")
