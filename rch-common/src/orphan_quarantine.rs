@@ -8,8 +8,9 @@
 //!
 //! The quarantine reason now carries the evidence needed to re-run the SAME
 //! kill probe later ([`kill_probe_script`]); the daemon clears the quarantine
-//! only when that probe reports the identity-matched group verified dead.
-//! Anything else (still alive, record missing, channel failure) keeps it.
+//! when that probe reports the identity-matched group verified dead, or when
+//! the worker-side record has stayed absent past a grace period (see rchd's
+//! `orphan_quarantine`). Still alive and channel failures keep it.
 
 use shell_escape::escape;
 use std::borrow::Cow;
@@ -30,7 +31,8 @@ pub struct QuarantineEvidence {
 /// POSIX `sh` script that SIGKILLs the process group recorded in `pgid_file`
 /// (only if its boot/start identity still matches) and verifies it is gone.
 /// Emits exactly one `RCH_E104_KILL=<verdict>` line and always exits 0, so a
-/// non-zero exit means the CHANNEL failed, not the probe.
+/// non-zero exit means the CHANNEL failed, not the probe. A missing record is
+/// reported as `record_absent`: nothing can re-probe a group without it.
 ///
 /// Group kill is `kill -KILL -PGID` with NO `--`: dash's kill builtin
 /// mishandles `kill -KILL -- -PGID`.
@@ -38,6 +40,7 @@ pub fn kill_probe_script(pgid_file: &str, build_id: u64) -> String {
     let escaped_file = escape(Cow::from(pgid_file));
     format!(
         "f={escaped_file}\n\
+         if [ ! -e \"$f\" ] && [ ! -L \"$f\" ]; then echo RCH_E104_KILL=record_absent; exit 0; fi\n\
          {identity}\n\
          if rch_remote_cancel \"$f\" {build_id} kill; then\n\
          echo RCH_E104_KILL=verified_dead\n\
@@ -48,12 +51,20 @@ pub fn kill_probe_script(pgid_file: &str, build_id: u64) -> String {
 
 /// Whether the probe's last verdict line proves the group dead.
 pub fn probe_verified_dead(stdout: &str) -> bool {
+    probe_verdict(stdout) == Some("RCH_E104_KILL=verified_dead")
+}
+
+/// Whether the probe found no worker-side record for the group.
+pub fn probe_record_absent(stdout: &str) -> bool {
+    probe_verdict(stdout) == Some("RCH_E104_KILL=record_absent")
+}
+
+fn probe_verdict(stdout: &str) -> Option<&str> {
     stdout
         .lines()
         .rev()
         .map(str::trim)
         .find(|line| line.starts_with("RCH_E104_KILL="))
-        == Some("RCH_E104_KILL=verified_dead")
 }
 
 /// The durable disable reason for an E104 orphan quarantine. With evidence
@@ -91,6 +102,24 @@ pub fn parse_quarantine_reason(reason: &str) -> Option<QuarantineEvidence> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_reports_an_absent_record_without_touching_anything() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("gone/7.pgid");
+        let output = std::process::Command::new("sh")
+            .args(["-c", &kill_probe_script(missing.to_str().unwrap(), 7)])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(probe_record_absent(&stdout), "{stdout}");
+        assert!(!probe_verified_dead(&stdout));
+        assert!(!missing.parent().unwrap().exists());
+        assert!(probe_verified_dead("x\nRCH_E104_KILL=verified_dead"));
+        assert!(!probe_record_absent("RCH_E104_KILL=still_alive"));
+    }
 
     #[test]
     fn reason_round_trips_evidence_including_awkward_paths() {

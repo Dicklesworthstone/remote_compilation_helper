@@ -1299,7 +1299,9 @@ pub(crate) fn parse_remote_timeout_kill_output(stdout: &str) -> Option<RemoteTim
         match line.trim() {
             "RCH_E104_KILL=verified_dead" => return Some(RemoteTimeoutCleanup::Verified),
             // A missing record cannot exclude a delayed, still-starting job.
-            "RCH_E104_KILL=no_pgid_file" => return Some(RemoteTimeoutCleanup::Unverified),
+            "RCH_E104_KILL=no_pgid_file" | "RCH_E104_KILL=record_absent" => {
+                return Some(RemoteTimeoutCleanup::Unverified);
+            }
             "RCH_E104_KILL=still_alive" => return Some(RemoteTimeoutCleanup::Unverified),
             _ => {}
         }
@@ -15436,6 +15438,11 @@ fn main() {
         );
         assert_eq!(
             parse_remote_timeout_kill_output("RCH_E104_KILL=no_pgid_file"),
+            Some(RemoteTimeoutCleanup::Unverified)
+        );
+        // At timeout a missing record may be a still-starting job.
+        assert_eq!(
+            parse_remote_timeout_kill_output("RCH_E104_KILL=record_absent"),
             Some(RemoteTimeoutCleanup::Unverified)
         );
         assert_eq!(
