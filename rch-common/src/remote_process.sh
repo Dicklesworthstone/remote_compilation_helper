@@ -68,6 +68,9 @@ rch_remote_record() {
     rch_valid_pgid "$rch_pgid" && rch_read_leader || return 1
     rch_boot=$rch_observed_boot
     rch_start=$rch_observed_start
+    # Refuse before publishing execution authority or spawning the payload.
+    # Scope placement moves this leader, not the workload into a separate tree.
+    rch_apply_configured_worker_policy || return 125
     rch_record_tmp="$1.$rch_pgid"
     (umask 077; set -C; printf 'RCH_REMOTE_PROCESS_V1:%s:%s:%s:%s\n' \
         "$2" "$rch_boot" "$rch_pgid" "$rch_start" > "$rch_record_tmp") || return 1
@@ -194,4 +197,214 @@ rch_remote_cancel() {
         sleep 0.1 || return 44
     done
     return 45
+}
+
+# Optional receiver-side execution policy for tracked Linux build payloads.
+# These functions travel with the launch protocol; no worker launcher is needed.
+# Sync, pre-launch package bootstrap, and untracked execution are NOT confined
+# here. This is not by itself admission for a dual-role worker (GH #104).
+#
+# Configure ONE of /etc/rch/worker-execution.conf (root owned) or
+# $HOME/.config/rch/worker-execution.conf (owned by the SSH user or root):
+#   version=1
+#   nice=10
+#   systemd_slice=jobs.slice
+#   systemd_manager=user
+# All specified settings are required. Missing policy preserves legacy behavior.
+# Unknown/duplicate keys, an unreadable file, or failed enforcement refuse setup.
+# No policy contents are ever evaluated as shell code.
+
+rch_policy_refuse() {
+    printf 'RCH_WORKER_POLICY_REFUSED:%s\n' "$1" >&2
+    return 125
+}
+
+rch_policy_valid_nice() {
+    case "$1" in 0|[1-9]|1[0-9]|-[1-9]|-1[0-9]|-20) return 0;; esac
+    return 1
+}
+
+rch_policy_valid_slice() {
+    case "$1" in *.slice) rch_policy_slice_base=${1%.slice};; *) return 1;; esac
+    [ -n "$rch_policy_slice_base" ] && [ "${#1}" -le 200 ] || return 1
+    case "$rch_policy_slice_base" in
+        -*|*-|*--*|*[!a-zA-Z0-9_-]*) return 1;;
+    esac
+}
+
+rch_policy_select_file() {
+    rch_policy_file=
+    rch_policy_uid=$(id -u) || { rch_policy_refuse uid; return 125; }
+    rch_policy_system=/etc/rch/worker-execution.conf
+    rch_policy_user=
+    case "${HOME:-}" in /*) rch_policy_user="$HOME/.config/rch/worker-execution.conf";; esac
+    # An inaccessible containing directory is not evidence of absent policy.
+    for rch_policy_dir in /etc/rch "${HOME:-/}/.config" "${HOME:-/}/.config/rch"; do
+        if [ -d "$rch_policy_dir" ] && [ ! -x "$rch_policy_dir" ]; then
+            rch_policy_refuse unreadable_directory; return 125
+        fi
+    done
+    if [ -e "$rch_policy_system" ] || [ -L "$rch_policy_system" ]; then
+        rch_policy_file=$rch_policy_system
+        rch_policy_owner=0
+    fi
+    if [ -n "$rch_policy_user" ] && { [ -e "$rch_policy_user" ] || [ -L "$rch_policy_user" ]; }; then
+        [ -z "$rch_policy_file" ] || { rch_policy_refuse multiple_policies; return 125; }
+        rch_policy_file=$rch_policy_user
+        rch_policy_owner=$rch_policy_uid
+    fi
+}
+
+# Parse the entire bounded, ASCII data file before changing process attributes.
+# owner is the expected uid; root-owned user policy is also accepted.
+rch_policy_read_file() {
+    rch_policy_nice=
+    rch_policy_slice=
+    rch_policy_manager=user
+    rch_policy_seen=':'
+    [ -f "$1" ] && [ ! -L "$1" ] && [ -r "$1" ] || {
+        rch_policy_refuse unreadable_file; return 125;
+    }
+    rch_policy_stat=$(LC_ALL=C stat -c '%u:%a:%s:%h' -- "$1") || {
+        rch_policy_refuse file_metadata; return 125;
+    }
+    rch_policy_file_uid=${rch_policy_stat%%:*}
+    rch_policy_stat=${rch_policy_stat#*:}
+    rch_policy_mode=${rch_policy_stat%%:*}
+    rch_policy_stat=${rch_policy_stat#*:}
+    rch_policy_size=${rch_policy_stat%%:*}
+    rch_policy_links=${rch_policy_stat#*:}
+    case "$rch_policy_mode" in [0-7][0-7][0-7]) ;; *) rch_policy_refuse file_mode; return 125;; esac
+    [ "$rch_policy_file_uid" = "$2" ] || [ "$rch_policy_file_uid" = 0 ] || {
+        rch_policy_refuse file_owner; return 125;
+    }
+    [ "$((0$rch_policy_mode & 022))" -eq 0 ] && [ "$rch_policy_links" = 1 ] || {
+        rch_policy_refuse writable_or_linked_file; return 125;
+    }
+    [ "$rch_policy_size" -le 8192 ] || { rch_policy_refuse file_size; return 125; }
+    # Shell read can discard NULs. Validate bytes before parsing, not afterwards.
+    LC_ALL=C tr -cd '\11\12\40-\176' < "$1" | cmp -s - "$1" || {
+        rch_policy_refuse file_encoding; return 125;
+    }
+    while IFS= read -r rch_policy_line || [ -n "$rch_policy_line" ]; do
+        case "$rch_policy_line" in ''|'#'*) continue;; esac
+        case "$rch_policy_line" in *=*) ;; *) rch_policy_refuse syntax; return 125;; esac
+        rch_policy_key=${rch_policy_line%%=*}
+        rch_policy_value=${rch_policy_line#*=}
+        case "$rch_policy_seen" in *":$rch_policy_key:"*) rch_policy_refuse duplicate_key; return 125;; esac
+        rch_policy_seen="$rch_policy_seen$rch_policy_key:"
+        case "$rch_policy_key" in
+            version) [ "$rch_policy_value" = 1 ] || { rch_policy_refuse version; return 125; };;
+            nice)
+                rch_policy_valid_nice "$rch_policy_value" || { rch_policy_refuse nice; return 125; }
+                rch_policy_nice=$rch_policy_value;;
+            systemd_slice)
+                rch_policy_valid_slice "$rch_policy_value" || { rch_policy_refuse slice; return 125; }
+                rch_policy_slice=$rch_policy_value;;
+            systemd_manager)
+                case "$rch_policy_value" in user|system) ;; *) rch_policy_refuse manager; return 125;; esac
+                rch_policy_manager=$rch_policy_value;;
+            *) rch_policy_refuse unknown_key; return 125;;
+        esac
+    done < "$1"
+    case "$rch_policy_seen" in *:version:*) ;; *) rch_policy_refuse missing_version; return 125;; esac
+    [ -n "$rch_policy_nice$rch_policy_slice" ] || { rch_policy_refuse empty_policy; return 125; }
+    case "$rch_policy_seen" in
+        *:systemd_manager:*)
+            [ -n "$rch_policy_slice" ] || { rch_policy_refuse manager_without_slice; return 125; };;
+    esac
+}
+
+rch_policy_systemctl() {
+    timeout 5s systemctl "--$rch_policy_manager" --no-pager --no-ask-password "$@"
+}
+
+# Read the launcher's actual unified cgroup. A successful D-Bus job submission
+# is not evidence that systemd moved it; cgroup v1/ambiguous evidence is refused.
+rch_policy_current_cgroup() (
+    rch_policy_cgroup_count=0
+    rch_policy_cgroup_value=
+    while IFS= read -r rch_policy_cgroup_line; do
+        case "$rch_policy_cgroup_line" in
+            0::/*)
+                rch_policy_cgroup_count=$((rch_policy_cgroup_count + 1))
+                rch_policy_cgroup_value=${rch_policy_cgroup_line#0::};;
+        esac
+    done < "/proc/$$/cgroup"
+    [ "$rch_policy_cgroup_count" -eq 1 ] || exit 125
+    printf '%s\n' "$rch_policy_cgroup_value"
+)
+
+rch_policy_enter_scope() {
+    command -v busctl >/dev/null 2>&1 && command -v systemctl >/dev/null 2>&1 &&
+        command -v timeout >/dev/null 2>&1 || { rch_policy_refuse systemd_tools; return 125; }
+    # An operator must start/configure the selected slice. Do not synthesize a
+    # missing slice and accidentally run without its intended resource limits.
+    [ "$(rch_policy_systemctl show --value --property=ActiveState -- "$rch_policy_slice")" = active ] || {
+        rch_policy_refuse slice_not_active; return 125;
+    }
+    rch_policy_slice_cgroup=$(rch_policy_systemctl show --value --property=ControlGroup -- "$rch_policy_slice") || {
+        rch_policy_refuse slice_cgroup; return 125;
+    }
+    case "$rch_policy_slice_cgroup" in /*) ;; *) rch_policy_refuse slice_cgroup; return 125;; esac
+    [ "$rch_policy_slice_cgroup" != / ] || { rch_policy_refuse root_slice; return 125; }
+    rch_policy_scope="rch-$rch_boot-$rch_pgid-$rch_start.scope"
+    # Attach the EXISTING setsid leader, rather than starting an independent
+    # transient service. All subsequently spawned work keeps the same PGID and
+    # stdio, so the existing watchdog, cancellation and recovery remain owners.
+    busctl "--$rch_policy_manager" --timeout=5s --allow-interactive-authorization=no \
+        call org.freedesktop.systemd1 /org/freedesktop/systemd1 \
+        org.freedesktop.systemd1.Manager StartTransientUnit 'ssa(sv)a(sa(sv))' \
+        "$rch_policy_scope" fail 3 PIDs au 1 "$rch_pgid" \
+        Slice s "$rch_policy_slice" Description s 'RCH tracked build' 0 >/dev/null || {
+        rch_policy_refuse scope_creation; return 125;
+    }
+    rch_policy_expected_cgroup="$rch_policy_slice_cgroup/$rch_policy_scope"
+    rch_policy_poll=0
+    while [ "$(rch_policy_current_cgroup)" != "$rch_policy_expected_cgroup" ]; do
+        rch_policy_poll=$((rch_policy_poll + 1))
+        [ "$rch_policy_poll" -lt 50 ] || { rch_policy_refuse scope_not_enforced; return 125; }
+        sleep 0.1 || { rch_policy_refuse scope_wait; return 125; }
+    done
+    [ "$(rch_policy_systemctl show --value --property=ActiveState -- "$rch_policy_scope")" = active ] &&
+        [ "$(rch_policy_systemctl show --value --property=Slice -- "$rch_policy_scope")" = "$rch_policy_slice" ] &&
+        [ "$(rch_policy_systemctl show --value --property=ControlGroup -- "$rch_policy_scope")" = "$rch_policy_expected_cgroup" ] || {
+        rch_policy_refuse scope_evidence; return 125;
+    }
+}
+
+rch_policy_enforce() {
+    [ "$(uname -s)" = Linux ] || { rch_policy_refuse platform; return 125; }
+    rch_remote_leader_matches || { rch_policy_refuse process_identity; return 125; }
+    if [ -n "$rch_policy_nice" ]; then
+        # util-linux -n becomes relative with POSIXLY_CORRECT. Clear that flag
+        # only in the helper process; never change the build's environment.
+        (unset POSIXLY_CORRECT; renice -n "$rch_policy_nice" -p "$rch_pgid") >/dev/null || {
+            rch_policy_refuse priority_change; return 125;
+        }
+        rch_policy_observed_nice=$(LC_ALL=C ps -o ni= -p "$rch_pgid") || {
+            rch_policy_refuse priority_observation; return 125;
+        }
+        # ps pads the numeric field; splitting is safe after the numeric check.
+        case "$rch_policy_observed_nice" in *[!\ 0-9-]*) rch_policy_refuse priority_observation; return 125;; esac
+        set -- $rch_policy_observed_nice
+        [ "$#" -eq 1 ] && [ "$1" = "$rch_policy_nice" ] || {
+            rch_policy_refuse priority_not_enforced; return 125;
+        }
+    fi
+    rch_policy_scope=
+    if [ -n "$rch_policy_slice" ]; then
+        rch_policy_enter_scope || return 125
+    fi
+    rch_remote_leader_matches || { rch_policy_refuse process_identity; return 125; }
+    printf 'RCH_WORKER_EXECUTION_POLICY:nice=%s,slice=%s,manager=%s,scope=%s\n' \
+        "${rch_policy_nice:-inherit}" "${rch_policy_slice:-none}" \
+        "$rch_policy_manager" "${rch_policy_scope:-none}" >&2
+}
+
+rch_apply_configured_worker_policy() {
+    rch_policy_select_file || return 125
+    [ -n "$rch_policy_file" ] || return 0
+    rch_policy_read_file "$rch_policy_file" "$rch_policy_owner" || return 125
+    rch_policy_enforce
 }
