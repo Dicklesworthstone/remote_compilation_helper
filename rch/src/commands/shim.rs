@@ -73,7 +73,10 @@ use crate::ui::theme::StatusIndicator;
 /// Rustup owns that syntax: it selects the named installation before invoking
 /// real Cargo. Passing `+nightly` to an ambient `cargo-rch-real` cannot select
 /// nightly, and dropping it would silently compile with a different toolchain.
-const SHIM_VERSION: &str = "6";
+///
+/// `7` preserves caller RCH_REQUIRE_REMOTE values and marks only the shim's
+/// default injection, bound to the exec process, for safe speed-gate admission.
+const SHIM_VERSION: &str = "7";
 
 /// Marker line embedded in the generated shim, used to recognize an rch-managed
 /// file (vs. a hand-rolled or unrelated `cargo` on `PATH`) and read its version.
@@ -97,6 +100,29 @@ fn cargo_clippy_shim_path() -> Result<PathBuf> {
     Ok(shim_dir()?.join("cargo-clippy"))
 }
 
+/// Share the placement contract between Cargo and direct cargo-clippy. The
+/// default still forbids local *fallback*, but an explicitly enabled speed
+/// gate may choose local placement. Caller values never acquire that exception.
+/// `exec` preserves the shell PID; inherited markers from another invocation
+/// are cleared, even on a fail-open installation. Keep this contract paired
+/// with hook::speed_gate::PlacementEnvironment.
+fn shim_offload(require_remote: bool, command: &str) -> String {
+    let policy = if require_remote {
+        r#"unset RCH_SPEED_GATE_SHIM_PID
+if [ "${RCH_REQUIRE_REMOTE+x}" != x ]; then
+  RCH_REQUIRE_REMOTE=1
+  RCH_SPEED_GATE_SHIM_PID=$$
+  export RCH_REQUIRE_REMOTE RCH_SPEED_GATE_SHIM_PID
+fi
+RCH_QUEUE_WHEN_BUSY=1
+export RCH_QUEUE_WHEN_BUSY
+"#
+    } else {
+        "unset RCH_SPEED_GATE_SHIM_PID\n"
+    };
+    format!("{policy}exec rch exec -- {command} \"$@\"")
+}
+
 /// Render the `cargo-clippy` shim.
 ///
 /// The `cargo` shim alone does not catch `cargo clippy`: build scripts, CI and
@@ -111,11 +137,7 @@ fn cargo_clippy_shim_path() -> Result<PathBuf> {
 ///   * `cargo-clippy ...` → invoked directly by a script. This is the leak, and
 ///     it is normalized to `cargo clippy ...` and offloaded.
 fn cargo_clippy_shim_body(require_remote: bool) -> String {
-    let offload = if require_remote {
-        "exec env RCH_REQUIRE_REMOTE=1 RCH_QUEUE_WHEN_BUSY=1 rch exec -- cargo clippy \"$@\""
-    } else {
-        "exec rch exec -- cargo clippy \"$@\""
-    };
+    let offload = shim_offload(require_remote, "cargo clippy");
     format!(
         r##"#!/bin/sh
 # rch cargo-clippy shim — MANAGED FILE, edit via `rch shim install`.
@@ -158,19 +180,12 @@ fi
 
 /// Render the canonical cargo shim.
 ///
-/// `require_remote` bakes fail-closed (queue-for-a-worker, never local rustc)
-/// vs. fail-open (attempt offload, fall back to local under load) into the file.
+/// `require_remote` bakes fail-closed (queue, no local fallback after failure)
+/// vs. fail-open into the file. An opt-in speed gate may still deliberately
+/// place a build locally, unless the caller explicitly requests remote-only.
 /// A dispatcher box wants fail-closed; that is the default on install.
 fn cargo_shim_body(require_remote: bool) -> String {
-    // The offload line differs only by the strict-remote policy. Keeping the
-    // rest identical makes drift detection a simple version-marker check.
-    let offload = if require_remote {
-        // Fail-closed: queue for a worker, never fall back to local rustc.
-        "exec env RCH_REQUIRE_REMOTE=1 RCH_QUEUE_WHEN_BUSY=1 rch exec -- cargo \"$@\""
-    } else {
-        // Fail-open: attempt offload but allow local fallback (rch default).
-        "exec rch exec -- cargo \"$@\""
-    };
+    let offload = shim_offload(require_remote, "cargo");
     format!(
         r##"#!/bin/sh
 # rch cargo shim — MANAGED FILE, edit via `rch shim install`.
@@ -855,7 +870,7 @@ pub fn shim_install(
     println!(
         "  policy: {}",
         if require_remote {
-            "fail-closed (queue for a worker; never build locally)"
+            "fail-closed (queue; no local failure fallback; opt-in speed gate may place locally)"
         } else {
             "fail-open (offload, but fall back to local under load)"
         }
@@ -1630,11 +1645,10 @@ exec "$HOME/.rustup/toolchains/selected/bin/cargo" "$@"
         args: &[std::ffi::OsString],
         env: &[(&str, &str)],
     ) -> std::process::Output {
-        let directory = tempfile::tempdir().unwrap();
-        let root = directory.path();
-        write_exe(&root.join("shim"), body);
-        write_exe(
-            &root.join("rch"),
+        record_shim_with_stub(
+            body,
+            args,
+            env,
             concat!(
                 "#!/bin/sh\n",
                 "printf '%s\\0' RCH \"${RCH_REQUIRE_REMOTE:-unset}\" ",
@@ -1642,7 +1656,20 @@ exec "$HOME/.rustup/toolchains/selected/bin/cargo" "$@"
                 "printf '%s\\0' \"$@\"\n",
                 "exit \"${STUB_RCH_EXIT:-0}\"\n",
             ),
-        );
+        )
+    }
+
+    #[cfg(unix)]
+    fn record_shim_with_stub(
+        body: &str,
+        args: &[std::ffi::OsString],
+        env: &[(&str, &str)],
+        rch_stub: &str,
+    ) -> std::process::Output {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        write_exe(&root.join("shim"), body);
+        write_exe(&root.join("rch"), rch_stub);
         write_exe(
             &root.join("real-cargo"),
             "#!/bin/sh\nprintf '%s\\0' LOCAL \"${CARGO_BUILD_JOBS:-unset}\"\nif [ \"$#\" -gt 0 ]; then printf '%s\\0' \"$@\"; fi\n",
@@ -1680,6 +1707,136 @@ exec "$HOME/.rustup/toolchains/selected/bin/cargo" "$@"
         let mut fields: Vec<_> = output.stdout.split(|byte| *byte == 0).collect();
         assert_eq!(fields.pop(), Some(&b""[..]), "unterminated argument record");
         fields
+    }
+
+    #[cfg(unix)]
+    const PLACEMENT_STUB: &str = r#"#!/bin/sh
+printf '%s\0' "${RCH_REQUIRE_REMOTE-unset}" "${RCH_SPEED_GATE_SHIM_PID-unset}" "$$" "${RCH_QUEUE_WHEN_BUSY-unset}" "${RCH_WORKER-unset}" "${RCH_FORCE_REMOTE-unset}" "${CARGO_BUILD_JOBS-unset}"
+printf '%s\0' "$@"
+exit "${STUB_RCH_EXIT:-0}"
+"#;
+
+    #[cfg(unix)]
+    #[test]
+    fn both_shims_preserve_caller_policy_and_mark_only_default_injections() {
+        for strict in [false, true] {
+            for (body, args) in [
+                (cargo_shim_body(strict), vec!["--locked", "build"]),
+                (cargo_clippy_shim_body(strict), vec!["--all-targets"]),
+            ] {
+                for required in [
+                    None,
+                    Some(""),
+                    Some("0"),
+                    Some("false"),
+                    Some("1"),
+                    Some("TRUE"),
+                ] {
+                    let mut env = vec![("RCH_SPEED_GATE_SHIM_PID", "stale")];
+                    if let Some(required) = required {
+                        env.push(("RCH_REQUIRE_REMOTE", required));
+                    }
+                    let output = record_shim_with_stub(
+                        &body,
+                        &argv_bytes(&args),
+                        &env,
+                        PLACEMENT_STUB,
+                    );
+                    assert!(output.status.success(), "{output:?}");
+                    let fields = recorded_fields(&output);
+                    let injected = strict && required.is_none();
+                    let expected = required.unwrap_or(if injected { "1" } else { "unset" });
+                    assert_eq!(fields[0], expected.as_bytes());
+                    if injected {
+                        assert_eq!(fields[1], fields[2], "exec must retain the marker's PID");
+                        let pid = std::str::from_utf8(fields[2])
+                            .unwrap()
+                            .parse::<u32>()
+                            .unwrap();
+                        assert!(pid > 0);
+                    } else {
+                        assert_eq!(fields[1], b"unset", "caller values must not be marked");
+                    }
+                    let queue = if strict { "1" } else { "unset" };
+                    assert_eq!(fields[3], queue.as_bytes());
+                    assert_eq!(
+                        fields[6], b"unset",
+                        "local job caps must not leak into offload"
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_caller_value_cannot_reuse_a_matching_inherited_marker() {
+        for strict in [false, true] {
+            for (body, args) in [
+                (cargo_shim_body(strict), vec!["build", "--release"]),
+                (cargo_clippy_shim_body(strict), vec!["--all-targets"]),
+            ] {
+                // Match this very process's PID, not merely an obviously stale
+                // value. The shim must clear it because the caller set policy.
+                let body = format!(
+                    "RCH_REQUIRE_REMOTE=1\nRCH_SPEED_GATE_SHIM_PID=$$\nexport RCH_REQUIRE_REMOTE RCH_SPEED_GATE_SHIM_PID\n{body}"
+                );
+                let output = record_shim_with_stub(
+                    &body,
+                    &argv_bytes(&args),
+                    &[],
+                    PLACEMENT_STUB,
+                );
+                assert!(output.status.success(), "{output:?}");
+                let fields = recorded_fields(&output);
+                assert_eq!(fields[0], b"1");
+                assert_eq!(fields[1], b"unset");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn placement_handoff_retains_worker_force_remote_arguments_and_refusal_exit() {
+        for (body, args, command) in [
+            (
+                cargo_shim_body(true),
+                vec!["+nightly", "build", "--release"],
+                vec!["cargo"],
+            ),
+            (
+                cargo_clippy_shim_body(true),
+                vec!["--all-targets"],
+                vec!["cargo", "clippy"],
+            ),
+        ] {
+            for exit in ["1", "101", "103", "137"] {
+                let output = record_shim_with_stub(
+                    &body,
+                    &argv_bytes(&args),
+                    &[
+                        ("RCH_REQUIRE_REMOTE", "1"),
+                        ("RCH_WORKER", "vmi1153651"),
+                        ("RCH_FORCE_REMOTE", "1"),
+                        ("STUB_RCH_EXIT", exit),
+                    ],
+                    PLACEMENT_STUB,
+                );
+                assert_eq!(output.status.code(), Some(exit.parse().unwrap()));
+                let fields = recorded_fields(&output);
+                assert_eq!(fields[0], b"1");
+                assert_eq!(fields[1], b"unset");
+                assert_eq!(fields[4], b"vmi1153651");
+                assert_eq!(fields[5], b"1");
+                let expected: Vec<_> = ["exec", "--"]
+                    .into_iter()
+                    .chain(command.iter().copied())
+                    .chain(args.iter().copied())
+                    .map(str::as_bytes)
+                    .collect();
+                assert_eq!(&fields[7..], expected);
+            }
+        }
     }
 
     #[cfg(unix)]
