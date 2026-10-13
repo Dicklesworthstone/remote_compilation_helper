@@ -316,3 +316,6 @@ mod tests {
         assert!(plan_response(StatusCode::PARTIAL_CONTENT, &HeaderMap::new(), 0, None, 0).is_err());
     }
 }
+
+#[cfg(test)]
+mod wire_tests;
