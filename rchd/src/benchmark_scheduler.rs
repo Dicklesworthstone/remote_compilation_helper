@@ -1209,7 +1209,10 @@ async fn read_benchmark_stream(
 ) -> std::io::Result<()> {
     use tokio::io::AsyncReadExt;
     let probe_limit = limit.checked_add(1).ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid benchmark output limit")
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid benchmark output limit",
+        )
     })?;
     reader.take(probe_limit).read_to_end(bytes).await?;
     if bytes.len() as u64 > limit {
@@ -1561,15 +1564,16 @@ mod complete_benchmark_report_tests {
         let mut bytes = VALID.as_bytes().to_vec();
         bytes.resize(1024 * 1024 + 1, b' ');
         std::fs::write(&payload, &bytes).unwrap();
-        for script in [
-            "exec cat \"$1\"",
-            "printf '%s' \"$2\"; exec cat \"$1\" >&2",
-        ] {
+        for script in ["exec cat \"$1\"", "printf '%s' \"$2\"; exec cat \"$1\" >&2"] {
             let mut command = tokio::process::Command::new("sh");
-            command.args(["-c", script, "benchmark-output-test"])
-                .arg(&payload).arg(VALID);
+            command
+                .args(["-c", script, "benchmark-output-test"])
+                .arg(&payload)
+                .arg(VALID);
             let error = execute_benchmark_process(command, None, Duration::from_secs(5))
-                .await.unwrap_err().to_string();
+                .await
+                .unwrap_err()
+                .to_string();
             assert!(error.contains("exceeds byte limit"), "{error}");
         }
     }
@@ -1586,9 +1590,13 @@ mod complete_benchmark_report_tests {
         // the production transport must instead reject the original bytes.
         assert!(parse_benchmark_output(&String::from_utf8_lossy(&bytes)).is_some());
         let mut command = tokio::process::Command::new("sh");
-        command.args(["-c", "exec cat \"$1\"", "benchmark-output-test"]).arg(&payload);
+        command
+            .args(["-c", "exec cat \"$1\"", "benchmark-output-test"])
+            .arg(&payload);
         let error = execute_benchmark_process(command, None, Duration::from_secs(5))
-            .await.unwrap_err().to_string();
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("not UTF-8"), "{error}");
     }
 }
