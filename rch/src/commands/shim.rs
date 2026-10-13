@@ -1736,12 +1736,8 @@ exit "${STUB_RCH_EXIT:-0}"
                     if let Some(required) = required {
                         env.push(("RCH_REQUIRE_REMOTE", required));
                     }
-                    let output = record_shim_with_stub(
-                        &body,
-                        &argv_bytes(&args),
-                        &env,
-                        PLACEMENT_STUB,
-                    );
+                    let output =
+                        record_shim_with_stub(&body, &argv_bytes(&args), &env, PLACEMENT_STUB);
                     assert!(output.status.success(), "{output:?}");
                     let fields = recorded_fields(&output);
                     let injected = strict && required.is_none();
@@ -1781,12 +1777,7 @@ exit "${STUB_RCH_EXIT:-0}"
                 let body = format!(
                     "RCH_REQUIRE_REMOTE=1\nRCH_SPEED_GATE_SHIM_PID=$$\nexport RCH_REQUIRE_REMOTE RCH_SPEED_GATE_SHIM_PID\n{body}"
                 );
-                let output = record_shim_with_stub(
-                    &body,
-                    &argv_bytes(&args),
-                    &[],
-                    PLACEMENT_STUB,
-                );
+                let output = record_shim_with_stub(&body, &argv_bytes(&args), &[], PLACEMENT_STUB);
                 assert!(output.status.success(), "{output:?}");
                 let fields = recorded_fields(&output);
                 assert_eq!(fields[0], b"1");

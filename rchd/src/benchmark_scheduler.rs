@@ -2259,7 +2259,8 @@ mod tests {
         let telemetry = Arc::new(TelemetryStore::new(Duration::from_secs(300), Some(storage)));
         let pool = WorkerPool::new();
         let worker_id = WorkerId::new("upgrade-score");
-        pool.add_worker(make_worker_config(worker_id.as_str())).await;
+        pool.add_worker(make_worker_config(worker_id.as_str()))
+            .await;
         let worker = pool.get(&worker_id).await.unwrap();
         worker.set_speed_score(100.0);
         telemetry
@@ -2273,12 +2274,8 @@ mod tests {
             )
             .await
             .unwrap();
-        let (scheduler, _) = BenchmarkScheduler::new(
-            make_test_config(),
-            pool,
-            telemetry,
-            EventBus::new(16),
-        );
+        let (scheduler, _) =
+            BenchmarkScheduler::new(make_test_config(), pool, telemetry, EventBus::new(16));
         let request = scheduler.should_benchmark(&worker).await.unwrap();
         assert_eq!(worker.get_speed_score(), 50.0);
         assert_eq!(request.priority, BenchmarkPriority::High);
@@ -2301,12 +2298,11 @@ mod tests {
         ));
         let pool = WorkerPool::new();
         let worker_id = WorkerId::new("current-score");
-        pool.add_worker(make_worker_config(worker_id.as_str())).await;
+        pool.add_worker(make_worker_config(worker_id.as_str()))
+            .await;
         let worker = pool.get(&worker_id).await.unwrap();
-        let score = parse_benchmark_output(
-            r#"{"score":100,"raw":{"cpu_ops_per_second":750000}}"#,
-        )
-        .unwrap();
+        let score =
+            parse_benchmark_output(r#"{"score":100,"raw":{"cpu_ops_per_second":750000}}"#).unwrap();
         commit_benchmark_score(&telemetry, &pool, &worker_id, &score).await;
         assert!((worker.get_speed_score() - 75.0).abs() < 1e-9);
 
@@ -2324,7 +2320,12 @@ mod tests {
             EventBus::new(16),
         );
         assert_eq!(restarted_worker.get_speed_score(), 50.0);
-        assert!(scheduler.should_benchmark(&restarted_worker).await.is_none());
+        assert!(
+            scheduler
+                .should_benchmark(&restarted_worker)
+                .await
+                .is_none()
+        );
         assert!((restarted_worker.get_speed_score() - 75.0).abs() < 1e-9);
     }
 

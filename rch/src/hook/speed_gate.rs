@@ -230,7 +230,10 @@ impl PlacementEnvironment {
         let shim_default = self.require_remote.as_deref() == Some(OsStr::new("1"))
             && self.shim_pid.as_deref() == Some(OsStr::new(&expected_pid));
         !remote_flag_requested(self.force_remote.as_deref())
-            && !self.worker.as_ref().is_some_and(|worker| !worker.is_empty())
+            && !self
+                .worker
+                .as_ref()
+                .is_some_and(|worker| !worker.is_empty())
             && (!remote_flag_requested(self.require_remote.as_deref()) || shim_default)
     }
 }
@@ -492,7 +495,11 @@ pub(crate) fn diagnose(
     let free_memory_pct = enabled.then(memory_free_pct).flatten();
     let pressure = enabled.then(macos_pressure).flatten();
     let resources_allow_local = enabled
-        && resources_allow_local(free_memory_pct, cfg!(target_os = "macos"), pressure.as_ref());
+        && resources_allow_local(
+            free_memory_pct,
+            cfg!(target_os = "macos"),
+            pressure.as_ref(),
+        );
     SpeedGateDiagnosis {
         enabled,
         local_slots: config.compilation.local_slots,
@@ -805,7 +812,10 @@ mod tests {
             )),
             Some(100)
         );
-        assert_eq!(meminfo_free_pct("MemTotal: 0 kB\nMemAvailable: 1 kB\n"), None);
+        assert_eq!(
+            meminfo_free_pct("MemTotal: 0 kB\nMemAvailable: 1 kB\n"),
+            None
+        );
     }
 
     #[test]
