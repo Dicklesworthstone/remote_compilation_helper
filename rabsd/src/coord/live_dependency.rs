@@ -36,7 +36,8 @@ use crate::coord::live::{
     load_manifest,
 };
 use crate::edge::live_facts::{
-    DependencyFacts, FileSig, GENERATED_ROOT, PACKAGE_ROOT, PackageFacts, read_stable,
+    DependencyFacts, FileSig, GENERATED_ROOT, PACKAGE_ROOT, PackageFacts, digest_stable,
+    read_stable,
 };
 use rabs_action::state_machines::AttemptState;
 use rabs_cas::blob_store::{DurabilityPolicy, PutLimits, put_if_absent};
@@ -113,6 +114,27 @@ pub struct KnownOutput {
     pub sig: FileSig,
     /// CAS object id of the bytes.
     pub digest: TypedDigest,
+}
+
+/// The materializer has returned, so another writer may already have replaced
+/// an output. A fresh metadata signature alone cannot be paired with the old
+/// committed digest: doing so would poison the edge's file-digest memo and key
+/// a later compiler invocation against bytes it never received. Establish both
+/// through the same stable read, or refuse this hit without publishing a memo.
+fn known_installed_output(path: &Path, expected: &TypedDigest) -> Result<KnownOutput, String> {
+    let (sig, digest) = digest_stable(path)
+        .map_err(|error| format!("installed output {}: {error}", path.display()))?;
+    if &digest != expected {
+        return Err(format!(
+            "installed output {} no longer matches its committed object",
+            path.display()
+        ));
+    }
+    Ok(KnownOutput {
+        path: path.to_path_buf(),
+        sig,
+        digest,
+    })
 }
 
 /// The lane's answer to one request.
@@ -207,12 +229,9 @@ impl PendingServe {
                     if committed.role == OutputRole::DepInfo {
                         continue;
                     }
-                    if let Ok(meta) = std::fs::symlink_metadata(path) {
-                        installed.push(KnownOutput {
-                            path: path.clone(),
-                            sig: FileSig::of(&meta),
-                            digest: committed.object.0.clone(),
-                        });
+                    match known_installed_output(path, &committed.object.0) {
+                        Ok(output) => installed.push(output),
+                        Err(reason) => return InstallResult::Fault(reason),
                     }
                 }
                 InstallResult::Served {
@@ -1064,5 +1083,72 @@ impl LocalAttempt {
 impl Drop for LocalAttempt {
     fn drop(&mut self) {
         self.settle();
+    }
+}
+
+#[cfg(test)]
+mod installed_output_tests {
+    use super::*;
+
+    #[test]
+    fn installed_output_digest_and_signature_describe_the_same_bytes() {
+        let dir = crate::test_util::private_tempdir();
+        let path = dir.path().join("libfoo.rlib");
+        for bytes in [b"".as_slice(), b"compiler output\0\xff\n".as_slice()] {
+            std::fs::write(&path, bytes).unwrap();
+            let expected = object_id(bytes).unwrap();
+            let known = known_installed_output(&path, &expected).unwrap();
+            assert_eq!(known.path, path);
+            assert_eq!(known.digest, expected);
+            assert_eq!(
+                known.sig,
+                FileSig::of(&std::fs::symlink_metadata(&path).unwrap())
+            );
+        }
+    }
+
+    #[test]
+    fn replacement_after_materialization_cannot_seed_the_old_digest() {
+        let dir = crate::test_util::private_tempdir();
+        let path = dir.path().join("libfoo.rlib");
+        std::fs::write(&path, b"original").unwrap();
+        let expected = object_id(b"original").unwrap();
+        // Same length, different inode/bytes after materialization returned.
+        let replacement = dir.path().join("replacement");
+        std::fs::write(&replacement, b"replaced").unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+        assert!(known_installed_output(&path, &expected).is_err());
+        assert!(known_installed_output(&path, &object_id(b"replaced").unwrap()).is_ok());
+    }
+
+    #[test]
+    fn in_place_write_after_materialization_cannot_seed_the_old_digest() {
+        let dir = crate::test_util::private_tempdir();
+        let path = dir.path().join("libfoo.rmeta");
+        std::fs::write(&path, b"original").unwrap();
+        let expected = object_id(b"original").unwrap();
+        std::fs::write(&path, b"mutated!").unwrap();
+        assert!(known_installed_output(&path, &expected).is_err());
+        let actual = object_id(b"mutated!").unwrap();
+        assert_eq!(known_installed_output(&path, &actual).unwrap().digest, actual);
+    }
+
+    #[test]
+    fn vanished_and_non_regular_outputs_refuse_instead_of_becoming_served() {
+        let dir = crate::test_util::private_tempdir();
+        let path = dir.path().join("libfoo.rlib");
+        std::fs::write(&path, b"output").unwrap();
+        let expected = object_id(b"output").unwrap();
+        let retained = dir.path().join("retained-output");
+        std::fs::rename(&path, &retained).unwrap();
+        assert!(known_installed_output(&path, &expected).is_err());
+        std::fs::create_dir(&path).unwrap();
+        assert!(known_installed_output(&path, &expected).is_err());
+        #[cfg(unix)]
+        {
+            let alias = dir.path().join("linked-output");
+            std::os::unix::fs::symlink(&retained, &alias).unwrap();
+            assert!(known_installed_output(&alias, &expected).is_err());
+        }
     }
 }
