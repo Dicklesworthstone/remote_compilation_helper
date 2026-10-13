@@ -144,6 +144,17 @@ pub const REAP_GLOBS: &[&str] = &[
     ".rch-target-*-pool-*",
 ];
 
+/// Basename of the remote target dir the hook uses when the caller forwards no
+/// `CARGO_TARGET_DIR`: `<mirror>/.rch-target`. Every such build of the project
+/// shares it, so it is a warm pool in all but name, and the worker-wide sweep
+/// and `rch gc` classify and collect it as one ([`GcClass::Pooled`]). Before
+/// this nothing ever reaped it; on 2026-10-13 workers held up to 50 GB of them each.
+///
+/// Deliberately NOT in [`REAP_GLOBS`]: the hook's per-project sibling reaper
+/// and the rsync exclude set treat those globs as per-job leftovers, and the
+/// shared default target is never another job's leftover.
+pub const DEFAULT_TARGET_NAME: &str = ".rch-target";
+
 /// Basename glob of the DURABLE per-worker Cargo cache dirs
 /// (`rch-cargo-cache-<worker>`, issue #42) that `rch gc` enumerates and — under
 /// the full gate set — may collect.
@@ -802,6 +813,70 @@ pub fn worker_sweep_command_with_registry(
     max_cache_kb: Option<u64>,
     registry: &str,
 ) -> String {
+    worker_sweep_script(
+        escaped_base,
+        idle_minutes,
+        pooled_idle_minutes,
+        max_cache_kb,
+        None,
+        registry,
+    )
+}
+
+/// [`worker_sweep_command`] plus the disk-pressure pass: while the sweep
+/// root's filesystem has less than `low_disk_permille` / 1000 of its size
+/// free, evict reap-class dirs oldest first until it is back above. rchd
+/// passes its placement line (critical ratio plus headroom), so a worker that
+/// placement has zeroed reclaims its own idle caches. The pass is bounded by
+/// the same floors as the byte cap: the short idle window, both liveness
+/// gates and the source registry.
+#[must_use]
+pub fn worker_sweep_command_under_pressure(
+    escaped_base: &str,
+    idle_minutes: u64,
+    pooled_idle_minutes: Option<u64>,
+    max_cache_kb: Option<u64>,
+    low_disk_permille: u64,
+) -> String {
+    worker_sweep_command_under_pressure_with_registry(
+        escaped_base,
+        idle_minutes,
+        pooled_idle_minutes,
+        max_cache_kb,
+        low_disk_permille,
+        SOURCE_CLAIM_REGISTRY,
+    )
+}
+
+/// [`worker_sweep_command_under_pressure`] against an explicit
+/// source-ownership registry (tests).
+#[must_use]
+pub fn worker_sweep_command_under_pressure_with_registry(
+    escaped_base: &str,
+    idle_minutes: u64,
+    pooled_idle_minutes: Option<u64>,
+    max_cache_kb: Option<u64>,
+    low_disk_permille: u64,
+    registry: &str,
+) -> String {
+    worker_sweep_script(
+        escaped_base,
+        idle_minutes,
+        pooled_idle_minutes,
+        max_cache_kb,
+        (low_disk_permille != 0).then_some(low_disk_permille),
+        registry,
+    )
+}
+
+fn worker_sweep_script(
+    escaped_base: &str,
+    idle_minutes: u64,
+    pooled_idle_minutes: Option<u64>,
+    max_cache_kb: Option<u64>,
+    low_disk_permille: Option<u64>,
+    registry: &str,
+) -> String {
     let loop_body = reap_loop_body_with_source_gate(
         idle_minutes,
         None,
@@ -826,8 +901,8 @@ pub fn worker_sweep_command_with_registry(
             let dedup2 = dedup_candidate_file("__tmpf2");
             format!(
                 "if __tmpf2=$(mktemp 2>/dev/null || mktemp -p \"$__tmpbase\" 2>/dev/null); then \
-                   find \"$__rt\" -maxdepth 8 -type d -name \".rch-target-*-pool-*\" -prune 2>/dev/null > \"$__tmpf2\"; \
-                   if [ -n \"$__tmpscan\" ]; then find \"$__tmpscan\" -maxdepth {TMPBASE_MAXDEPTH} -type d -name \".rch-target-*-pool-*\" -prune 2>/dev/null >> \"$__tmpf2\"; fi; \
+                   find \"$__rt\" -maxdepth 8 -type d \\( -name \".rch-target-*-pool-*\" -o -name \"{DEFAULT_TARGET_NAME}\" \\) -prune 2>/dev/null > \"$__tmpf2\"; \
+                   if [ -n \"$__tmpscan\" ]; then find \"$__tmpscan\" -maxdepth {TMPBASE_MAXDEPTH} -type d \\( -name \".rch-target-*-pool-*\" -o -name \"{DEFAULT_TARGET_NAME}\" \\) -prune 2>/dev/null >> \"$__tmpf2\"; fi; \
                    {dedup2}\
                    while IFS= read -r d; do {pooled_gate}{pooled_body} done < \"$__tmpf2\"; \
                    rm -f \"$__tmpf2\"; \
@@ -898,6 +973,9 @@ pub fn worker_sweep_command_with_registry(
         ),
         None => String::new(),
     };
+    let pressure_pass = low_disk_permille
+        .map(|permille| pressure_eviction_pass(idle_minutes, permille))
+        .unwrap_or_default();
     format!(
         "{preamble}\
          {source_gate}\
@@ -906,10 +984,85 @@ pub fn worker_sweep_command_with_registry(
          rm -f \"$__tmpf\"; \
          {pooled_pass}\
          {cap_pass}\
+         {pressure_pass}\
          {gate_cleanup}\
          printf 'RCH_WORKER_REAP_METRICS removed=%s freed_kb=%s\\n' \"$removed\" \"$freed_kb\"",
         gate_cleanup = gate_snapshot_cleanup(),
         source_gate = source_claim_gate_fragment(registry),
+    )
+}
+
+/// Disk-pressure eviction for [`worker_sweep_command_under_pressure`].
+///
+/// rchd gives a worker zero slots once its free ratio reaches the placement
+/// policy's critical line. No build on it can then replace these caches, and
+/// the TTL passes only reach dirs idle for hours or days, so the worker stays
+/// starved (css queue-timed-out ~300 builds/h on 2026-10-13 with seven
+/// workers in that band). While the root's filesystem is below
+/// `low_disk_permille` free, this pass evicts reap-class dirs, including the
+/// shared default target ([`DEFAULT_TARGET_NAME`]), oldest first. It never
+/// takes a dir with activity inside the short idle window, one that fails
+/// either liveness gate, or one the source registry holds.
+///
+/// Free space is re-measured before every removal, so concurrent sweeps from
+/// several dispatchers stop as soon as the worker leaves the band instead of
+/// each evicting its own estimate. Only candidates on the root's own
+/// filesystem are eligible: removing a tmp-base dir on another mount frees
+/// nothing here, and the loop would keep evicting. An unreadable `df` reads as
+/// "not under pressure": a disk signal that cannot be read must never
+/// authorize removal.
+fn pressure_eviction_pass(idle_minutes: u64, low_disk_permille: u64) -> String {
+    let dedup = dedup_candidate_file("__tmpf4");
+    format!(
+        "__fs_kb=$(df -Pk \"$__rt\" 2>/dev/null | awk 'NR==2 {{print $2}}'); \
+         case \"$__fs_kb\" in ''|*[!0-9]*) __fs_kb=0;; esac; \
+         __want_kb=$((__fs_kb / 1000 * {low_disk_permille})); __pa=unknown; \
+         __rt_mnt=$(df -Pk \"$__rt\" 2>/dev/null | awk 'NR==2 {{print $6}}'); \
+         __under_pressure() {{ \
+           __pa=$(df -Pk \"$__rt\" 2>/dev/null | awk 'NR==2 {{print $4}}'); \
+           case \"$__pa\" in ''|*[!0-9]*) __pa=unknown; return 1;; esac; \
+           [ \"$__pa\" -lt \"$__want_kb\" ]; \
+         }}; \
+         if [ \"$__want_kb\" -gt 0 ] && [ -n \"$__rt_mnt\" ] && __under_pressure \
+           && __lst4=$(mktemp 2>/dev/null || mktemp -p \"$__tmpbase\" 2>/dev/null) \
+           && __tmpf4=$(mktemp 2>/dev/null || mktemp -p \"$__tmpbase\" 2>/dev/null); then \
+           printf 'RCH_REAP_PRESSURE start avail_kb=%s want_kb=%s\\n' \"$__pa\" \"$__want_kb\"; \
+           find \"$__rt\" -maxdepth 8 -type d \\( -name \".rch-target-*-job-*\" -o -name \".rch-target-*-pid-*\" -o -name \".rch-target-*-pool-*\" -o -name \"{DEFAULT_TARGET_NAME}\" \\) -prune 2>/dev/null > \"$__tmpf4\"; \
+           if [ -n \"$__tmpscan\" ]; then find \"$__tmpscan\" -maxdepth 1 -type d -name \"rch_target_*\" -prune 2>/dev/null >> \"$__tmpf4\"; \
+             find \"$__tmpscan\" -maxdepth {TMPBASE_MAXDEPTH} -type d \\( -name \".rch-target-*-job-*\" -o -name \".rch-target-*-pid-*\" -o -name \".rch-target-*-pool-*\" -o -name \"{DEFAULT_TARGET_NAME}\" \\) -prune 2>/dev/null >> \"$__tmpf4\"; fi; \
+           {dedup}\
+           : > \"$__lst4\"; \
+           while IFS= read -r d; do \
+             [ -d \"$d\" ] || continue; \
+             __n=$(date -r \"$d\" +%s 2>/dev/null); [ -n \"$__n\" ] || __n=0; \
+             printf '%s %s\\n' \"$__n\" \"$d\" >> \"$__lst4\"; \
+           done < \"$__tmpf4\"; \
+           sort -n \"$__lst4\" > \"$__tmpf4\"; \
+           while IFS=' ' read -r __n d; do \
+             __under_pressure || break; \
+             [ -d \"$d\" ] || continue; \
+             [ \"$(df -Pk \"$d\" 2>/dev/null | awk 'NR==2 {{print $6}}')\" = \"$__rt_mnt\" ] || continue; \
+             {early_recent}\
+             if ! __gc_gates_ok \"$d\"; then printf 'RCH_GC_SKIP pressure gate %s\\n' \"$d\"; continue; fi; \
+             {source_begin}\
+             {held_recent}\
+             __k=$(du -sk \"$d\" 2>/dev/null | awk '{{print $1}}'); [ -n \"$__k\" ] || __k=0; \
+             if __rmerr=$(rm -rf -- \"$d\" 2>&1); then \
+               removed=$((removed + 1)); freed_kb=$((freed_kb + __k)); \
+               printf 'RCH_REAP_RM %s pressure %s\\n' \"$__k\" \"$d\"; \
+             else \
+               printf 'RCH_REAP_ERR pressure %s :: %s\\n' \"$d\" \"$(printf '%s' \"$__rmerr\" | head -1)\"; \
+             fi; \
+             {source_end}\
+           done < \"$__tmpf4\"; \
+           __under_pressure; \
+           printf 'RCH_REAP_PRESSURE final avail_kb=%s want_kb=%s\\n' \"$__pa\" \"$__want_kb\"; \
+           rm -f \"$__lst4\" \"$__tmpf4\"; \
+         fi; ",
+        source_begin = checked_source_admission("pressure"),
+        source_end = SOURCE_GC_CHECKED_RETIREMENT,
+        early_recent = checked_source_recent_activity(&idle_minutes.to_string(), "pressure", false),
+        held_recent = checked_source_recent_activity(&idle_minutes.to_string(), "pressure", true),
     )
 }
 
@@ -1040,9 +1193,9 @@ pub fn enumerate_targets_command(escaped_base: &str) -> String {
     let dedup = dedup_candidate_file("__tmpf");
     format!(
         "{preamble}\
-         find \"$__rt\" -maxdepth 8 -type d \\( -name \".rch-target-*-pool-*\" -o -name \"{cache_glob}\" \\) -prune 2>/dev/null >> \"$__tmpf\"; \
+         find \"$__rt\" -maxdepth 8 -type d \\( -name \".rch-target-*-pool-*\" -o -name \"{DEFAULT_TARGET_NAME}\" -o -name \"{cache_glob}\" \\) -prune 2>/dev/null >> \"$__tmpf\"; \
          if [ -n \"$__tmpscan\" ]; then \
-           find \"$__tmpscan\" -maxdepth {TMPBASE_MAXDEPTH} -type d \\( -name \".rch-target-*-pool-*\" -o -name \"{cache_glob}\" \\) -prune 2>/dev/null >> \"$__tmpf\"; fi; \
+           find \"$__tmpscan\" -maxdepth {TMPBASE_MAXDEPTH} -type d \\( -name \".rch-target-*-pool-*\" -o -name \"{DEFAULT_TARGET_NAME}\" -o -name \"{cache_glob}\" \\) -prune 2>/dev/null >> \"$__tmpf\"; fi; \
          {dedup}\
          while IFS= read -r d; do \
            [ -d \"$d\" ] || continue; \
@@ -1105,7 +1258,9 @@ impl RemoteTargetEntry {
 pub enum GcClass {
     /// `.rch-target-<worker>-job-<id>` / `-pid-<pid>-…`: one build's target dir.
     PerJob,
-    /// `.rch-target-<worker>-pool-<key>`: a warm target store shared by jobs.
+    /// `.rch-target-<worker>-pool-<key>`, or the project's shared default
+    /// `.rch-target` ([`DEFAULT_TARGET_NAME`]): a warm target store shared by
+    /// jobs.
     Pooled,
     /// `rch-cargo-cache-<worker>`: the durable per-worker `CARGO_HOME`.
     CargoCache,
@@ -1121,6 +1276,9 @@ impl GcClass {
     #[must_use]
     pub fn from_path(path: &str) -> Self {
         let name = path.trim_end_matches('/').rsplit('/').next().unwrap_or("");
+        if name == DEFAULT_TARGET_NAME {
+            return Self::Pooled;
+        }
         if let Some(rest) = name.strip_prefix(".rch-target-") {
             if rest.contains("-pool-") {
                 return Self::Pooled;
@@ -1940,12 +2098,23 @@ mod tests {
             GcClass::from_path("/data/tmp/rch_target_old"),
             GcClass::LegacyTarget
         );
+        // The hook's shared default target is a warm pool by another name.
+        assert_eq!(
+            GcClass::from_path("/data/projects/repo/.rch-target"),
+            GcClass::Pooled
+        );
+        assert_eq!(
+            GcClass::from_path("/data/projects/repo/.rch-target/"),
+            GcClass::Pooled
+        );
         // Never anything else: a bare target dir, a source tree, a git dir.
         for other in [
             "/data/projects/repo/target",
             "/data/projects/repo",
             "/data/projects/repo/.git",
             "/data/projects/repo/.rch-target-hz2",
+            "/data/projects/repo/.rch-targets",
+            "/data/projects/repo/rch-target",
             "/data/tmp/rch-cargo-home-hz2-run-7",
         ] {
             assert_eq!(
@@ -2322,6 +2491,138 @@ mod tests {
     }
 
     #[test]
+    fn pressure_pass_is_opt_in_and_bounded_like_the_byte_cap() {
+        // Without a line there is no pressure pass at all.
+        for cmd in [
+            worker_sweep_command("/data/projects", 720, Some(10_080), None),
+            worker_sweep_command_under_pressure("/data/projects", 720, Some(10_080), None, 0),
+        ] {
+            assert!(!cmd.contains("RCH_REAP_PRESSURE"));
+            assert!(!cmd.contains("__under_pressure"));
+        }
+        let cmd =
+            worker_sweep_command_under_pressure("/data/projects", 720, Some(10_080), None, 70);
+        assert!(cmd.contains("__want_kb=$((__fs_kb / 1000 * 70))"));
+        // It reaches the shared default target, which REAP_GLOBS never names.
+        assert!(cmd.contains(
+            "-o -name \".rch-target-*-pool-*\" -o -name \".rch-target\" \\) -prune 2>/dev/null > \"$__tmpf4\""
+        ));
+        // The same floors as the byte cap: the short idle window, both
+        // liveness gates and the source registry, in that order.
+        let pass = &cmd[cmd.find("RCH_REAP_PRESSURE start").unwrap()..];
+        let remeasure = pass.find("__under_pressure || break").unwrap();
+        let same_fs = pass.find("= \"$__rt_mnt\" ] || continue").unwrap();
+        let idle = pass
+            .find("printf 'RCH_GC_SKIP %s active %s\\n' pressure")
+            .unwrap();
+        let gate = pass.find("RCH_GC_SKIP pressure gate").unwrap();
+        let admission = pass.find("__gc_source_begin \"$d\"").unwrap();
+        let removal = pass.find("rm -rf -- \"$d\"").unwrap();
+        assert!(remeasure < same_fs && same_fs < idle && idle < gate);
+        assert!(gate < admission && admission < removal);
+        assert!(pass.contains("RCH_REAP_RM %s pressure %s"));
+        assert!(pass.contains("RCH_REAP_ERR pressure"));
+        // An unreadable df never reads as pressure.
+        assert!(cmd.contains("''|*[!0-9]*) __pa=unknown; return 1;; esac"));
+    }
+
+    /// The pressure pass on a real tree. A line of 1000 permille can never be
+    /// met, so the pass evicts every eligible dir and the assertions pin
+    /// exactly which dirs are eligible and in what order. Linux only, like the
+    /// other source-registry runs: the registry gate needs GNU `realpath -m`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pressure_pass_evicts_idle_targets_oldest_first_and_nothing_else() {
+        use std::process::Command;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("projects");
+        let private_tmp = tmp.path().join("tmp");
+        std::fs::create_dir_all(&private_tmp).unwrap();
+        let oldest_pool = base.join("a").join(".rch-target-w1-pool-0123abcd");
+        let old_default = base.join("b").join(".rch-target");
+        let recent_default = base.join("c").join(".rch-target");
+        let bare_target = base.join("d").join("target");
+        let source = base.join("b").join("src");
+        for d in [
+            &oldest_pool,
+            &old_default,
+            &recent_default,
+            &bare_target,
+            &source,
+        ] {
+            std::fs::create_dir_all(d).unwrap();
+            std::fs::write(d.join("artifact.o"), vec![b'x'; 8 * 1024]).unwrap();
+        }
+        for (d, stamp) in [
+            (&oldest_pool, "201901010000"),
+            (&old_default, "202001010000"),
+            (&bare_target, "201801010000"),
+            (&source, "201801010000"),
+        ] {
+            let ok = Command::new("find")
+                .arg(d)
+                .args(["-exec", "touch", "-t", stamp, "{}", "+"])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if !ok {
+                return; // no usable find/touch here; nothing to assert
+            }
+        }
+        let registry = tmp.path().join("claims-v1");
+        let run = |permille: u64| {
+            let cmd = worker_sweep_command_under_pressure_with_registry(
+                base.to_str().unwrap(),
+                60,
+                None,
+                None,
+                permille,
+                registry.to_str().unwrap(),
+            );
+            let out = Command::new("sh")
+                .arg("-c")
+                .arg(&cmd)
+                .env("TMPDIR", &private_tmp)
+                .output()
+                .expect("sweep should execute");
+            let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+            assert!(out.status.success(), "sweep failed; stderr: {stderr}");
+            assert!(
+                !stderr.contains("syntax error") && !stderr.contains("unexpected"),
+                "generated sweep emitted shell errors: {stderr}"
+            );
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+
+        // A line this host is surely above: nothing moves.
+        let stdout = run(1);
+        if !(stdout.contains("RCH_GC_GATES handles=1") && stdout.contains(" procs=1")) {
+            return; // no usable liveness gates here; the pass would skip everything
+        }
+        assert!(!stdout.contains("RCH_REAP_RM"), "{stdout}");
+        assert!(old_default.exists() && oldest_pool.exists());
+
+        let stdout = run(1000);
+        assert!(stdout.contains("RCH_REAP_PRESSURE start"), "{stdout}");
+        let events = parse_reap_events(&stdout);
+        let removed: Vec<&str> = events.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(events.len(), 2, "{stdout}");
+        assert!(events.iter().all(|e| e.trigger == "pressure"));
+        assert!(
+            removed[0].ends_with("/a/.rch-target-w1-pool-0123abcd"),
+            "{stdout}"
+        );
+        assert!(removed[1].ends_with("/b/.rch-target"), "{stdout}");
+        assert!(!oldest_pool.exists() && !old_default.exists());
+        assert!(recent_default.exists(), "inside the idle window");
+        assert!(bare_target.exists(), "never an rch dir");
+        assert!(source.join("artifact.o").exists(), "source beside a target");
+        let (count, _) = parse_worker_reap_metrics(&stdout).unwrap();
+        assert_eq!(count, 2, "{stdout}");
+    }
+
+    #[test]
     fn byte_cap_eviction_is_gated_on_liveness_too() {
         let cmd = worker_sweep_command("/data/projects", 720, Some(10_080), Some(1024));
         assert!(
@@ -2581,9 +2882,10 @@ mod tests {
         assert!(cmd.contains(&format!(
             "find \"$__tmpscan\" -maxdepth {TMPBASE_MAXDEPTH} -type d \\( -name \".rch-target-*-job-*\" -o -name \".rch-target-*-pid-*\" \\)"
         )));
-        // Pooled pass reaches the tmp base too.
+        // Pooled pass (pools and the shared default target) reaches the tmp
+        // base too.
         assert!(cmd.contains(&format!(
-            "find \"$__tmpscan\" -maxdepth {TMPBASE_MAXDEPTH} -type d -name \".rch-target-*-pool-*\""
+            "find \"$__tmpscan\" -maxdepth {TMPBASE_MAXDEPTH} -type d \\( -name \".rch-target-*-pool-*\" -o -name \".rch-target\" \\)"
         )));
         // The legacy depth-1 pass is retained, not replaced.
         assert!(cmd.contains("-maxdepth 1 -type d -name \"rch_target_*\""));
@@ -2728,10 +3030,11 @@ mod tests {
         let cmd = worker_sweep_command("/data/projects", 720, None, None);
         assert!(!cmd.contains("-pool-"));
 
-        // With one, a second pass targets exactly the pool glob under its own
-        // (floored) window, feeding the same counters.
+        // With one, a second pass targets exactly the pool glob and the shared
+        // default target under its own (floored) window, feeding the same
+        // counters.
         let cmd = worker_sweep_command("/data/projects", 720, Some(168 * 60), None);
-        assert!(cmd.contains("-name \".rch-target-*-pool-*\" -prune"));
+        assert!(cmd.contains("-name \".rch-target-*-pool-*\" -o -name \".rch-target\" \\) -prune"));
         assert!(
             cmd.contains("-mmin -10080"),
             "pooled window must reach the predicate"
@@ -2791,9 +3094,11 @@ mod tests {
     #[test]
     fn enumerate_command_is_read_only_and_includes_pooled_dirs() {
         let cmd = enumerate_targets_command("/data/projects");
-        // Pooled dirs AND the durable per-worker Cargo caches, in one pass.
+        // Pooled dirs, the shared default target AND the durable per-worker
+        // Cargo caches, in one pass: what the dry run lists is what the sweep
+        // acts on.
         assert!(cmd.contains(
-            "\\( -name \".rch-target-*-pool-*\" -o -name \"rch-cargo-cache-*\" \\) -prune"
+            "\\( -name \".rch-target-*-pool-*\" -o -name \".rch-target\" -o -name \"rch-cargo-cache-*\" \\) -prune"
         ));
         assert!(cmd.contains("RCH_TARGET_ENTRY"));
         assert!(cmd.contains("done < \"$__tmpf\""));

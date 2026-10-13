@@ -1365,7 +1365,9 @@ fn project_declares_cargo_build_jobs(project_root: &Path) -> bool {
         })
 }
 
-const DEFAULT_REMOTE_CARGO_TARGET_DIR_NAME: &str = ".rch-target";
+/// Shared with the worker-wide sweep, which collects it as a pooled dir.
+const DEFAULT_REMOTE_CARGO_TARGET_DIR_NAME: &str =
+    rch_common::stale_target_reap::DEFAULT_TARGET_NAME;
 
 /// Environment variables whose values we ALWAYS rewrite to a managed,
 /// worker-scoped path under the synchronized remote project root — regardless of
