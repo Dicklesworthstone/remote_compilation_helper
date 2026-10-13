@@ -754,7 +754,35 @@ fn pooled_collect_gate(idle_minutes: u64) -> String {
     )
 }
 
-fn candidate_discovery_preamble(escaped_base: &str, on_guard_exit: &str) -> String {
+/// Shell helper `__gc_select <file> <glob>...`: append to `<file>` every path
+/// in the sweep's one discovery list (`$__all`) whose basename matches one of
+/// the globs. The globs are the same `find -name` patterns the passes used to
+/// walk the tree with, matched by `case`, so selection cannot drift from
+/// discovery.
+const SELECT_CANDIDATES: &str = "__gc_select() { \
+    __sel_out=$1; shift; \
+    while IFS= read -r __sel_d; do \
+      __sel_b=${__sel_d##*/}; \
+      for __sel_p in \"$@\"; do \
+        case \"$__sel_b\" in $__sel_p) printf '%s\\n' \"$__sel_d\" >> \"$__sel_out\"; break;; esac; \
+      done; \
+    done < \"$__all\"; \
+  }; ";
+
+/// `-name` alternatives for one `find`, in the order given.
+fn find_name_alternatives(names: &[&str]) -> String {
+    names
+        .iter()
+        .map(|name| format!("-name \"{name}\""))
+        .collect::<Vec<_>>()
+        .join(" -o ")
+}
+
+/// `names` is every directory basename ANY pass of this script will look at.
+/// The tree is walked once for all of them (bd-2bsz0): a depth-8 walk of a
+/// worker's mirror root took 350-440 s with a cold dentry cache, and the
+/// sweep used to repeat it in every pass.
+fn candidate_discovery_preamble(escaped_base: &str, on_guard_exit: &str, names: &[&str]) -> String {
     // The tmp base is resolved by the SAME prelude that creates the durable
     // per-worker Cargo caches and stages target dirs
     // (`remote_cargo_home_base_prelude`), so the sweep cannot look somewhere
@@ -779,14 +807,18 @@ fn candidate_discovery_preamble(escaped_base: &str, on_guard_exit: &str) -> Stri
          case \"$__tmpscan\" in /*/*) ;; *) __tmpscan=\"\";; esac; \
          printf 'RCH_GC_ROOT tmp %s\\n' \"$__tmpscan\"; \
          {gates}\
-         __tmpf=$(mktemp 2>/dev/null || mktemp -p \"$__tmpbase\" 2>/dev/null) || {{ {cleanup}{on_guard_exit}exit 0; }}; \
-         find \"$__rt\" -maxdepth 8 -type d \\( -name \".rch-target-*-job-*\" -o -name \".rch-target-*-pid-*\" \\) -prune 2>/dev/null > \"$__tmpf\"; \
-         if [ -n \"$__tmpscan\" ]; then find \"$__tmpscan\" -maxdepth 1 -type d -name \"rch_target_*\" -prune 2>/dev/null >> \"$__tmpf\"; \
-           find \"$__tmpscan\" -maxdepth {TMPBASE_MAXDEPTH} -type d \\( -name \".rch-target-*-job-*\" -o -name \".rch-target-*-pid-*\" \\) -prune 2>/dev/null >> \"$__tmpf\"; fi; \
-         {dedup}",
+         __all=$(mktemp 2>/dev/null || mktemp -p \"$__tmpbase\" 2>/dev/null) || {{ {cleanup}{on_guard_exit}exit 0; }}; \
+         find \"$__rt\" -maxdepth 8 -type d \\( {name_alternatives} \\) -prune 2>/dev/null > \"$__all\"; \
+         if [ -n \"$__tmpscan\" ]; then find \"$__tmpscan\" -maxdepth 1 -type d -name \"rch_target_*\" -prune 2>/dev/null >> \"$__all\"; \
+           find \"$__tmpscan\" -maxdepth {TMPBASE_MAXDEPTH} -type d \\( {name_alternatives} \\) -prune 2>/dev/null >> \"$__all\"; fi; \
+         {dedup}\
+         {SELECT_CANDIDATES}\
+         __tmpf=$(mktemp 2>/dev/null || mktemp -p \"$__tmpbase\" 2>/dev/null) || {{ rm -f \"$__all\"; {cleanup}{on_guard_exit}exit 0; }}; \
+         __gc_select \"$__tmpf\" \".rch-target-*-job-*\" \".rch-target-*-pid-*\" \"rch_target_*\"; ",
         gates = gate_snapshot_fragment(),
         cleanup = gate_snapshot_cleanup(),
-        dedup = dedup_candidate_file("__tmpf")
+        dedup = dedup_candidate_file("__all"),
+        name_alternatives = find_name_alternatives(names),
     )
 }
 
@@ -910,7 +942,16 @@ fn worker_sweep_script(
         true,
     );
     let guard = "printf 'RCH_WORKER_REAP_METRICS removed=0 freed_kb=0\\n'; ";
-    let preamble = candidate_discovery_preamble(escaped_base, guard);
+    // One walk serves every pass, so it looks for every name an enabled pass
+    // will select and for nothing a disabled pass alone would want.
+    let mut names = vec![".rch-target-*-job-*", ".rch-target-*-pid-*"];
+    if pooled_idle_minutes.is_some() || max_cache_kb.is_some() || low_disk_permille.is_some() {
+        names.push(".rch-target-*-pool-*");
+    }
+    if pooled_idle_minutes.is_some() || low_disk_permille.is_some() {
+        names.push(DEFAULT_TARGET_NAME);
+    }
+    let preamble = candidate_discovery_preamble(escaped_base, guard, &names);
     let pooled_pass = match pooled_idle_minutes {
         Some(window) => {
             let window = window.max(MIN_POOLED_IDLE_MINUTES);
@@ -922,12 +963,9 @@ fn worker_sweep_script(
                 Some("pooled-ttl"),
                 true,
             );
-            let dedup2 = dedup_candidate_file("__tmpf2");
             format!(
                 "if __tmpf2=$(mktemp 2>/dev/null || mktemp -p \"$__tmpbase\" 2>/dev/null); then \
-                   find \"$__rt\" -maxdepth 8 -type d \\( -name \".rch-target-*-pool-*\" -o -name \"{DEFAULT_TARGET_NAME}\" \\) -prune 2>/dev/null > \"$__tmpf2\"; \
-                   if [ -n \"$__tmpscan\" ]; then find \"$__tmpscan\" -maxdepth {TMPBASE_MAXDEPTH} -type d \\( -name \".rch-target-*-pool-*\" -o -name \"{DEFAULT_TARGET_NAME}\" \\) -prune 2>/dev/null >> \"$__tmpf2\"; fi; \
-                   {dedup2}\
+                   __gc_select \"$__tmpf2\" \".rch-target-*-pool-*\" \"{DEFAULT_TARGET_NAME}\"; \
                    while IFS= read -r d; do {pooled_gate}{pooled_body} done < \"$__tmpf2\"; \
                    rm -f \"$__tmpf2\"; \
                  fi; ",
@@ -950,16 +988,12 @@ fn worker_sweep_script(
     // the TTL passes just removed entries; `sort -n` orders oldest-mtime
     // first; the eviction loop reads from a FILE so the counter mutations
     // survive (no pipe subshell).
-    let dedup3 = dedup_candidate_file("__tmpf3");
     let cap_pass = match max_cache_kb {
         Some(cap_kb) => format!(
             "if [ {cap_kb} -gt 0 ] \
                && __lst=$(mktemp 2>/dev/null || mktemp -p \"$__tmpbase\" 2>/dev/null) \
                && __tmpf3=$(mktemp 2>/dev/null || mktemp -p \"$__tmpbase\" 2>/dev/null); then \
-               find \"$__rt\" -maxdepth 8 -type d \\( -name \".rch-target-*-job-*\" -o -name \".rch-target-*-pid-*\" -o -name \".rch-target-*-pool-*\" \\) -prune 2>/dev/null > \"$__tmpf3\"; \
-               if [ -n \"$__tmpscan\" ]; then find \"$__tmpscan\" -maxdepth 1 -type d -name \"rch_target_*\" -prune 2>/dev/null >> \"$__tmpf3\"; \
-                 find \"$__tmpscan\" -maxdepth {TMPBASE_MAXDEPTH} -type d \\( -name \".rch-target-*-job-*\" -o -name \".rch-target-*-pid-*\" -o -name \".rch-target-*-pool-*\" \\) -prune 2>/dev/null >> \"$__tmpf3\"; fi; \
-               {dedup3}\
+               __gc_select \"$__tmpf3\" \".rch-target-*-job-*\" \".rch-target-*-pid-*\" \".rch-target-*-pool-*\" \"rch_target_*\"; \
                : > \"$__lst\"; total_kb=0; \
                while IFS= read -r d; do \
                  [ -d \"$d\" ] || continue; \
@@ -1009,6 +1043,7 @@ fn worker_sweep_script(
          {pooled_pass}\
          {cap_pass}\
          {pressure_pass}\
+         rm -f \"$__all\"; \
          {gate_cleanup}\
          printf 'RCH_WORKER_REAP_METRICS removed=%s freed_kb=%s\\n' \"$removed\" \"$freed_kb\"",
         gate_cleanup = gate_snapshot_cleanup(),
@@ -1043,7 +1078,6 @@ fn pressure_eviction_pass(idle_minutes: u64, low_disk_permille: u64) -> String {
     // coldest dirs go and the warmest stay; liveness and ownership, not
     // idleness, are what protect a build.
     let idle_minutes = idle_minutes.min(u64::from(MIN_IDLE_HOURS) * 60);
-    let dedup = dedup_candidate_file("__tmpf4");
     format!(
         "__fs_kb=$(df -Pk \"$__rt\" 2>/dev/null | awk 'NR==2 {{print $2}}'); \
          case \"$__fs_kb\" in ''|*[!0-9]*) __fs_kb=0;; esac; \
@@ -1058,10 +1092,7 @@ fn pressure_eviction_pass(idle_minutes: u64, low_disk_permille: u64) -> String {
            && __lst4=$(mktemp 2>/dev/null || mktemp -p \"$__tmpbase\" 2>/dev/null) \
            && __tmpf4=$(mktemp 2>/dev/null || mktemp -p \"$__tmpbase\" 2>/dev/null); then \
            printf 'RCH_REAP_PRESSURE start avail_kb=%s want_kb=%s\\n' \"$__pa\" \"$__want_kb\"; \
-           find \"$__rt\" -maxdepth 8 -type d \\( -name \".rch-target-*-job-*\" -o -name \".rch-target-*-pid-*\" -o -name \".rch-target-*-pool-*\" -o -name \"{DEFAULT_TARGET_NAME}\" \\) -prune 2>/dev/null > \"$__tmpf4\"; \
-           if [ -n \"$__tmpscan\" ]; then find \"$__tmpscan\" -maxdepth 1 -type d -name \"rch_target_*\" -prune 2>/dev/null >> \"$__tmpf4\"; \
-             find \"$__tmpscan\" -maxdepth {TMPBASE_MAXDEPTH} -type d \\( -name \".rch-target-*-job-*\" -o -name \".rch-target-*-pid-*\" -o -name \".rch-target-*-pool-*\" -o -name \"{DEFAULT_TARGET_NAME}\" \\) -prune 2>/dev/null >> \"$__tmpf4\"; fi; \
-           {dedup}\
+           __gc_select \"$__tmpf4\" \".rch-target-*-job-*\" \".rch-target-*-pid-*\" \".rch-target-*-pool-*\" \"{DEFAULT_TARGET_NAME}\" \"rch_target_*\"; \
            : > \"$__lst4\"; \
            while IFS= read -r d; do \
              [ -d \"$d\" ] || continue; \
@@ -1215,26 +1246,31 @@ pub fn parse_reap_errors(stdout: &str) -> Vec<ReapError> {
 /// validated with [`is_safe_reap_base`].
 #[must_use]
 pub fn enumerate_targets_command(escaped_base: &str) -> String {
-    let preamble = candidate_discovery_preamble(escaped_base, "");
-    // Pooled dirs are appended AFTER the preamble, so they need the tmp-base
-    // pass and a second dedup of their own: what `rch gc --dry-run` lists must
-    // be exactly what `worker_sweep_command` would act on, and the sweep's
-    // pooled pass reaches the tmp base. Without this the dry run would omit
-    // precisely the dirs the real run reaps.
-    let dedup = dedup_candidate_file("__tmpf");
+    let preamble = candidate_discovery_preamble(
+        escaped_base,
+        "",
+        &[
+            ".rch-target-*-job-*",
+            ".rch-target-*-pid-*",
+            ".rch-target-*-pool-*",
+            DEFAULT_TARGET_NAME,
+            CARGO_CACHE_GLOB,
+        ],
+    );
+    // The preamble's one walk already found pools, default targets and Cargo
+    // caches under both roots; add them to its per-job list. What `rch gc
+    // --dry-run` lists is then exactly what `worker_sweep_command` would act
+    // on, tmp base included.
     format!(
         "{preamble}\
-         find \"$__rt\" -maxdepth 8 -type d \\( -name \".rch-target-*-pool-*\" -o -name \"{DEFAULT_TARGET_NAME}\" -o -name \"{cache_glob}\" \\) -prune 2>/dev/null >> \"$__tmpf\"; \
-         if [ -n \"$__tmpscan\" ]; then \
-           find \"$__tmpscan\" -maxdepth {TMPBASE_MAXDEPTH} -type d \\( -name \".rch-target-*-pool-*\" -o -name \"{DEFAULT_TARGET_NAME}\" -o -name \"{cache_glob}\" \\) -prune 2>/dev/null >> \"$__tmpf\"; fi; \
-         {dedup}\
+         __gc_select \"$__tmpf\" \".rch-target-*-pool-*\" \"{DEFAULT_TARGET_NAME}\" \"{cache_glob}\"; \
          while IFS= read -r d; do \
            [ -d \"$d\" ] || continue; \
            set -- $(find \"$d\" -printf '%T@ %s\\n' 2>/dev/null | awk '{{ t=int($1); if (t>n) n=t; s+=$2 }} END {{ printf \"%d %d\", n, int(s/1024) }}'); \
            newest=${{1:-0}}; kb=${{2:-0}}; \
            printf 'RCH_TARGET_ENTRY %s %s %s %s %s\\n' \"$newest\" \"$kb\" \"$(__gc_handles \"$d\")\" \"$(__gc_procs \"$d\")\" \"$d\"; \
          done < \"$__tmpf\"; \
-         rm -f \"$__tmpf\"; \
+         rm -f \"$__tmpf\" \"$__all\"; \
          {gate_cleanup}exit 0",
         cache_glob = CARGO_CACHE_GLOB,
         gate_cleanup = gate_snapshot_cleanup()
@@ -2536,7 +2572,7 @@ mod tests {
         assert!(cmd.contains("__want_kb=$((__fs_kb / 1000 * 70))"));
         // It reaches the shared default target, which REAP_GLOBS never names.
         assert!(cmd.contains(
-            "-o -name \".rch-target-*-pool-*\" -o -name \".rch-target\" \\) -prune 2>/dev/null > \"$__tmpf4\""
+            "__gc_select \"$__tmpf4\" \".rch-target-*-job-*\" \".rch-target-*-pid-*\" \".rch-target-*-pool-*\" \".rch-target\" \"rch_target_*\";"
         ));
         // The same floors as the byte cap: the short idle window, both
         // liveness gates and the source registry, in that order.
@@ -2911,33 +2947,34 @@ mod tests {
     fn tmp_base_dot_prefixed_targets_are_discovered() {
         let cmd = worker_sweep_command("/data/projects", 720, Some(10_080), Some(1024));
 
-        // Job/pid pass reaches the tmp base, not just depth-1 `rch_target_*`.
+        // The one discovery walk reaches the tmp base for every name an
+        // enabled pass selects, not just depth-1 `rch_target_*`.
         assert!(cmd.contains(&format!(
-            "find \"$__tmpscan\" -maxdepth {TMPBASE_MAXDEPTH} -type d \\( -name \".rch-target-*-job-*\" -o -name \".rch-target-*-pid-*\" \\)"
-        )));
-        // Pooled pass (pools and the shared default target) reaches the tmp
-        // base too.
-        assert!(cmd.contains(&format!(
-            "find \"$__tmpscan\" -maxdepth {TMPBASE_MAXDEPTH} -type d \\( -name \".rch-target-*-pool-*\" -o -name \".rch-target\" \\)"
+            "find \"$__tmpscan\" -maxdepth {TMPBASE_MAXDEPTH} -type d \\( -name \".rch-target-*-job-*\" -o -name \".rch-target-*-pid-*\" -o -name \".rch-target-*-pool-*\" -o -name \".rch-target\" \\)"
         )));
         // The legacy depth-1 pass is retained, not replaced.
         assert!(cmd.contains("-maxdepth 1 -type d -name \"rch_target_*\""));
-        // A base that is also under the tmp base can list a dir twice; dedup
-        // keeps the byte-cap pass's total_kb honest.
-        for var in ["__tmpf", "__tmpf2", "__tmpf3"] {
-            assert!(
-                cmd.contains(&format!("sort -u \"${var}\" -o \"$__ded\"")),
-                "missing dedup for ${var}"
-            );
-            assert!(
-                cmd.contains(&format!("mv -f \"$__ded\" \"${var}\"")),
-                "dedup for ${var} must move the sorted temp back into place"
-            );
+        // Each pass selects its own names from that list.
+        for selection in [
+            "__gc_select \"$__tmpf\" \".rch-target-*-job-*\" \".rch-target-*-pid-*\" \"rch_target_*\";",
+            "__gc_select \"$__tmpf2\" \".rch-target-*-pool-*\" \".rch-target\";",
+            "__gc_select \"$__tmpf3\" \".rch-target-*-job-*\" \".rch-target-*-pid-*\" \".rch-target-*-pool-*\" \"rch_target_*\";",
+        ] {
+            assert!(cmd.contains(selection), "missing {selection}");
         }
+        // The walk happens once per root, however many passes are enabled.
+        assert_eq!(cmd.matches("find \"$__rt\" -maxdepth 8").count(), 1);
+        // A base that is also under the tmp base can list a dir twice; dedup
+        // of the one list keeps the byte-cap pass's total_kb honest.
+        assert!(cmd.contains("sort -u \"$__all\" -o \"$__ded\""));
+        assert!(
+            cmd.contains("mv -f \"$__ded\" \"$__all\""),
+            "dedup must move the sorted temp back into place"
+        );
         // Dedup must NEVER sort a candidate list onto itself: gc runs on full
         // disks, and a sort that fails after opening its output would empty the
         // list exactly when gc is needed most.
-        for var in ["__tmpf", "__tmpf2", "__tmpf3"] {
+        for var in ["__all", "__tmpf", "__tmpf2", "__tmpf3"] {
             assert!(
                 !cmd.contains(&format!("sort -u \"${var}\" -o \"${var}\"")),
                 "in-place sort of ${var} can truncate the candidate list"
@@ -2969,13 +3006,13 @@ mod tests {
         // ...and each such scan is gated on it being non-empty.
         let scans = cmd.matches("find \"$__tmpscan\"").count();
         let gates = cmd.matches("if [ -n \"$__tmpscan\" ]; then").count();
-        assert!(
-            scans >= 4,
-            "expected the job/pid, legacy, pooled and cap scans"
+        assert_eq!(
+            scans, 2,
+            "expected the one legacy scan and the one name scan"
         );
-        assert!(
-            gates >= 3,
-            "every tmp-base scan group must be gated on $__tmpscan being set"
+        assert_eq!(
+            gates, 1,
+            "the tmp-base scans must be gated on $__tmpscan being set"
         );
     }
 
@@ -3131,7 +3168,10 @@ mod tests {
         // Cargo caches, in one pass: what the dry run lists is what the sweep
         // acts on.
         assert!(cmd.contains(
-            "\\( -name \".rch-target-*-pool-*\" -o -name \".rch-target\" -o -name \"rch-cargo-cache-*\" \\) -prune"
+            "-o -name \".rch-target-*-pool-*\" -o -name \".rch-target\" -o -name \"rch-cargo-cache-*\" \\) -prune"
+        ));
+        assert!(cmd.contains(
+            "__gc_select \"$__tmpf\" \".rch-target-*-pool-*\" \".rch-target\" \"rch-cargo-cache-*\";"
         ));
         assert!(cmd.contains("RCH_TARGET_ENTRY"));
         assert!(cmd.contains("done < \"$__tmpf\""));
