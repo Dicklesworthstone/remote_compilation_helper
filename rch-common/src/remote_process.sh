@@ -72,6 +72,7 @@ rch_remote_leader_matches() {
 # Publish before starting any workload. A complete record appears in one rename.
 # The caller must already be the session/process-group leader created by setsid.
 rch_remote_record() {
+    rch_scope_reset
     rch_pgid=$$
     rch_valid_pgid "$rch_pgid" && rch_read_leader || return 1
     rch_boot=$rch_observed_boot
@@ -80,17 +81,29 @@ rch_remote_record() {
     # Scope placement moves this leader, not the workload into a separate tree.
     rch_apply_configured_worker_policy || return 125
     rch_record_tmp="$1.$rch_pgid"
-    (umask 077; set -C; printf 'RCH_REMOTE_PROCESS_V1:%s:%s:%s:%s\n' \
-        "$2" "$rch_boot" "$rch_pgid" "$rch_start" > "$rch_record_tmp") || return 1
+    if [ "$rch_scope_bound" = 1 ]; then
+        # One atomic record, not an optional sidecar: losing confinement
+        # evidence must never downgrade recovery to a PGID-only empty claim.
+        rch_record="RCH_REMOTE_PROCESS_V2:$2:$rch_boot:$rch_pgid:$rch_start:$rch_scope_uid:$rch_scope_manager:$rch_scope_invocation:$rch_scope_namespace:$rch_scope_root_id:$rch_scope_node_id:$rch_scope_cgroup"
+    else
+        rch_record="RCH_REMOTE_PROCESS_V1:$2:$rch_boot:$rch_pgid:$rch_start"
+    fi
+    (umask 077; set -C; printf '%s\n' "$rch_record" > "$rch_record_tmp") || return 1
     mv -f "$rch_record_tmp" "$1"
 }
 
 rch_read_record() {
+    rch_identified=0
+    rch_scope_reset
     case "$1" in /*) ;; *) return 42;; esac
     [ -f "$1" ] && [ ! -L "$1" ] && [ -r "$1" ] || return 42
+    rch_record_size=$(stat -c '%s' -- "$1") || return 42
+    [ "$rch_record_size" -le 4096 ] || return 42
     rch_record=$(cat "$1" 2>/dev/null) || return 42
-    rch_identified=0
     case "$rch_record" in
+        RCH_REMOTE_PROCESS_V2:*)
+            rch_read_scope_record "$1" "$2"
+            return $?;;
         RCH_REMOTE_PROCESS_V1:*)
             rch_fields=${rch_record#RCH_REMOTE_PROCESS_V1:}
             rch_record_build=${rch_fields%%:*}
@@ -147,7 +160,19 @@ rch_group_state() {
             exit 0
         }
     ')
-    return $?
+    rch_posix_state=$?
+    if [ "${rch_scope_bound:-0}" = 1 ]; then
+        # setsid/setpgid descendants can outlive this entire process group.
+        # Require BOTH the thread census and the bound scope to be empty.
+        rch_scope_operation state
+        rch_cgroup_state=$?
+        case "$rch_posix_state:$rch_cgroup_state" in
+            0:0) return 0;;
+            0:1|1:0|1:1) return 1;;
+            *) return 2;;
+        esac
+    fi
+    return "$rch_posix_state"
 }
 
 # Capture live members while the recorded leader still authenticates the group.
@@ -192,6 +217,23 @@ rch_remote_witness_matches() {
 # only an authenticated TERM in this call can authorize witnessed escalation.
 rch_signal_group() {
     [ "$rch_identified" -eq 1 ] || return 43
+    if [ "${rch_scope_bound:-0}" = 1 ]; then
+        case "$1" in
+            KILL)
+                rch_scope_operation kill
+                case $? in 0) return 0;; 3) return 43;; *) return 44;; esac;;
+            TERM)
+                # Preserve the authenticated group's graceful TERM. Detached
+                # groups are covered by the subsequent atomic cgroup.kill.
+                rch_scope_operation state
+                case $? in 0) return 0;; 1) ;; 3) return 43;; *) return 44;; esac
+                if rch_remote_leader_matches; then
+                    kill -TERM -"$rch_pgid" 2>/dev/null || :
+                fi
+                return 0;;
+            *) return 43;;
+        esac
+    fi
     if ! rch_remote_leader_matches; then
         [ "$1" = KILL ] && [ "${rch_term_sent:-0}" -eq 1 ] &&
             rch_remote_witness_matches || return 43
@@ -210,7 +252,9 @@ rch_remote_cancel() {
     rch_group_state
     case $? in 0) return 0;; 1) ;; *) return 44;; esac
     if [ "$rch_mode" = term ]; then
-        rch_capture_group_witnesses || return $?
+        if [ "${rch_scope_bound:-0}" != 1 ]; then
+            rch_capture_group_witnesses || return $?
+        fi
         rch_signal_group TERM || return $?
         rch_term_sent=1
         sleep 1 || return 44
@@ -219,7 +263,11 @@ rch_remote_cancel() {
     fi
     rch_signal_group KILL || return $?
     rch_attempt=0
-    while [ "$rch_attempt" -lt 20 ]; do
+    # Each scope observation uses two individually bounded manager reads.
+    # Keep fresh-channel cleanup within the existing 45-second SSH budget.
+    rch_attempt_limit=20
+    [ "${rch_scope_bound:-0}" != 1 ] || rch_attempt_limit=8
+    while [ "$rch_attempt" -lt "$rch_attempt_limit" ]; do
         rch_group_state
         case $? in 0) return 0;; 1) ;; *) return 44;; esac
         rch_attempt=$((rch_attempt + 1))
@@ -400,9 +448,13 @@ rch_policy_enter_scope() {
         [ "$(rch_policy_systemctl show --value --property=ControlGroup -- "$rch_policy_scope")" = "$rch_policy_expected_cgroup" ] || {
         rch_policy_refuse scope_evidence; return 125;
     }
+    # Admission includes the ability to stop and observe the whole subtree,
+    # not merely successful placement. Probe without writing cgroup.kill.
+    rch_scope_bind_created || { rch_scope_reset; rch_policy_refuse scope_cleanup_prerequisites; return 125; }
 }
 
 rch_policy_enforce() {
+    rch_scope_reset
     [ "$(uname -s)" = Linux ] || { rch_policy_refuse platform; return 125; }
     rch_remote_leader_matches || { rch_policy_refuse process_identity; return 125; }
     if [ -n "$rch_policy_nice" ]; then
@@ -436,4 +488,213 @@ rch_apply_configured_worker_policy() {
     [ -n "$rch_policy_file" ] || return 0
     rch_policy_read_file "$rch_policy_file" "$rch_policy_owner" || return 125
     rch_policy_enforce
+}
+
+# Scope-aware recovery (GH #104). RCH never reuses a scope name: it contains
+# boot UUID + leader birth identity. InvocationID and pinned cgroup inode add
+# independent fences against a removed/recreated unit or pathname. No signal
+# is ever sent to a unit by name; cgroup.kill is opened through a pinned parent.
+# This needs unified cgroups with a writable cgroup.kill (Linux 5.14+). A worker
+# able to create a scope but unable to reap it is refused before its payload.
+# This is lifecycle/resource containment, not a sandbox against a process with
+# permission to migrate itself out of the operator's resource hierarchy.
+
+rch_scope_reset() {
+    rch_scope_bound=0
+    rch_scope_uid= rch_scope_manager= rch_scope_invocation=
+    rch_scope_namespace= rch_scope_root_id= rch_scope_node_id=
+    rch_scope_cgroup= rch_scope_unit=
+}
+
+rch_scope_uint() {
+    case "$1" in ''|*[!0-9]*) return 1;; 0) return 0;; 0*) return 1;; esac
+    [ "${#1}" -le 20 ]
+}
+
+rch_scope_inode_id() {
+    case "$1" in *.*) ;; *) return 1;; esac
+    rch_scope_uint "${1%%.*}" && rch_scope_uint "${1#*.}"
+}
+
+rch_scope_binding_valid() {
+    rch_valid_boot "$rch_boot" && rch_valid_pgid "$rch_pgid" &&
+        rch_scope_uint "$rch_start" && [ "$rch_start" != 0 ] &&
+        rch_scope_uint "$rch_scope_uid" && rch_scope_uint "$rch_scope_namespace" &&
+        rch_scope_inode_id "$rch_scope_root_id" && rch_scope_inode_id "$rch_scope_node_id" || return 1
+    case "$rch_scope_manager" in user|system) ;; *) return 1;; esac
+    [ "${#rch_scope_invocation}" = 32 ] || return 1
+    case "$rch_scope_invocation" in *[!0-9a-f]*|00000000000000000000000000000000) return 1;; esac
+    [ "${#rch_scope_cgroup}" -le 2048 ] || return 1
+    case "$rch_scope_cgroup" in
+        /*) ;; *) return 1;;
+    esac
+    case "$rch_scope_cgroup" in
+        *[!a-zA-Z0-9_@./\\-]*|*//*|*/./*|*/../*|*/.|*/..|*/) return 1;;
+    esac
+    rch_scope_unit="rch-$rch_boot-$rch_pgid-$rch_start.scope"
+    [ "${rch_scope_cgroup##*/}" = "$rch_scope_unit" ]
+}
+
+rch_read_scope_record() {
+    IFS=: read -r rch_version rch_record_build rch_boot rch_pgid rch_start \
+        rch_scope_uid rch_scope_manager rch_scope_invocation rch_scope_namespace \
+        rch_scope_root_id rch_scope_node_id rch_scope_cgroup <<EOF_RECORD
+$rch_record
+EOF_RECORD
+    [ "$rch_version" = RCH_REMOTE_PROCESS_V2 ] || return 42
+    [ "$rch_record_build" = "$2" ] || return 43
+    rch_scope_binding_valid || return 42
+    rch_record_bytes=$(LC_ALL=C wc -c < "$1") || return 42
+    rch_record_lines=$(LC_ALL=C wc -l < "$1") || return 42
+    [ "$rch_record_bytes" -eq "$((${#rch_record} + 1))" ] &&
+        [ "$rch_record_lines" -eq 1 ] || return 42
+    # New records are private, single-link receipts created by the SSH user.
+    # Do not treat an imported or externally writable scope name as authority.
+    [ "$(LC_ALL=C stat -c '%u:%a:%h' -- "$1")" = "$rch_scope_uid:600:1" ] || return 42
+    rch_identified=1
+    rch_scope_bound=1
+}
+
+rch_scope_root() {
+    printf '%s\n' /sys/fs/cgroup
+}
+
+# One manager snapshot, with a bounded wait. Missing/duplicate fields and
+# unknown states are unavailable evidence, not an inactive scope.
+rch_scope_snapshot() {
+    rch_scope_properties=$(LC_ALL=C timeout 1s systemctl "--$rch_scope_manager" \
+        --no-pager --no-ask-password show --all --property=LoadState \
+        --property=ActiveState --property=InvocationID --property=ControlGroup \
+        -- "$rch_scope_unit") || return 2
+    rch_scope_load= rch_scope_active= rch_scope_observed_invocation= rch_scope_observed_cgroup=
+    rch_scope_seen=:
+    while IFS= read -r rch_scope_property; do
+        case "$rch_scope_property" in *=*) ;; *) return 2;; esac
+        rch_scope_key=${rch_scope_property%%=*}
+        rch_scope_value=${rch_scope_property#*=}
+        case "$rch_scope_seen" in *":$rch_scope_key:"*) return 2;; esac
+        rch_scope_seen="$rch_scope_seen$rch_scope_key:"
+        case "$rch_scope_key" in
+            LoadState) rch_scope_load=$rch_scope_value;;
+            ActiveState) rch_scope_active=$rch_scope_value;;
+            InvocationID) rch_scope_observed_invocation=$rch_scope_value;;
+            ControlGroup) rch_scope_observed_cgroup=$rch_scope_value;;
+            *) return 2;;
+        esac
+    done <<EOF_PROPERTIES
+$rch_scope_properties
+EOF_PROPERTIES
+    for rch_scope_key in LoadState ActiveState InvocationID ControlGroup; do
+        case "$rch_scope_seen" in *":$rch_scope_key:"*) ;; *) return 2;; esac
+    done
+    case "$rch_scope_load:$rch_scope_active" in
+        loaded:active|loaded:deactivating|loaded:inactive|loaded:failed|not-found:inactive) ;;
+        *) return 2;;
+    esac
+}
+
+rch_scope_same_view() {
+    rch_check_procfs_namespace &&
+        [ "$(cat /proc/sys/kernel/random/boot_id)" = "$rch_boot" ] &&
+        [ "$(id -u)" = "$rch_scope_uid" ] &&
+        [ "$(stat -Lc '%i' /proc/self/ns/cgroup)" = "$rch_scope_namespace" ] &&
+        [ "$(stat -c '%d.%i' -- "$rch_scope_mount")" = "$rch_scope_root_id" ] &&
+        [ "$(stat -fc '%T' -- "$rch_scope_mount")" = cgroup2fs ] &&
+        [ "$(CDPATH= cd -- "$rch_scope_mount" && pwd -P)" = "$rch_scope_mount" ]
+}
+
+# 0: proved absent from a searchable hierarchy; 1: present; 2: unknown.
+# A failed stat/test under an inaccessible ancestor is never absence evidence.
+rch_scope_path_state() {
+    rch_scope_walk=$rch_scope_mount
+    rch_scope_rest=${rch_scope_cgroup#/}
+    while [ -n "$rch_scope_rest" ]; do
+        [ -d "$rch_scope_walk" ] && [ ! -L "$rch_scope_walk" ] &&
+            [ -r "$rch_scope_walk" ] && [ -x "$rch_scope_walk" ] || return 2
+        rch_scope_walk="$rch_scope_walk/${rch_scope_rest%%/*}"
+        if [ ! -e "$rch_scope_walk" ] && [ ! -L "$rch_scope_walk" ]; then return 0; fi
+        case "$rch_scope_rest" in
+            */*) rch_scope_rest=${rch_scope_rest#*/};;
+            *) rch_scope_rest=;;
+        esac
+    done
+    [ -d "$rch_scope_walk" ] && [ ! -L "$rch_scope_walk" ] &&
+        [ -r "$rch_scope_walk" ] && [ -x "$rch_scope_walk" ] || return 2
+    return 1
+}
+
+rch_scope_snapshot_matches() {
+    [ "$rch_scope_load" = loaded ] &&
+        [ "$rch_scope_observed_invocation" = "$rch_scope_invocation" ] &&
+        [ "$rch_scope_observed_cgroup" = "$rch_scope_cgroup" ]
+}
+
+# Operations use subshell-private descriptors so caller lease/stream FDs are
+# untouched. 0: successful probe/kill or empty state; 1: populated state;
+# 2: unavailable evidence; 3: changed identity. kill success is NOT death proof.
+rch_scope_operation() (
+    rch_scope_binding_valid || exit 3
+    rch_scope_mount=$(rch_scope_root) || exit 2
+    rch_scope_same_view || exit 3
+    rch_scope_snapshot || exit 2
+    rch_scope_path_state
+    case $? in
+        0)
+            # Scope GC may already have removed its unit. Require BOTH a
+            # terminal manager snapshot and physical absence in the same view.
+            [ "$1" != probe ] || exit 2
+            case "$rch_scope_load:$rch_scope_active" in
+                not-found:inactive)
+                    case "$rch_scope_observed_invocation" in ''|00000000000000000000000000000000) ;; *) exit 3;; esac;;
+                loaded:inactive|loaded:failed)
+                    [ "$rch_scope_observed_invocation" = "$rch_scope_invocation" ] || exit 3;;
+                *) exit 2;;
+            esac
+            [ -z "$rch_scope_observed_cgroup" ] || exit 2
+            rch_scope_same_view || exit 3
+            exit 0;;
+        1) ;;
+        *) exit 2;;
+    esac
+    rch_scope_snapshot_matches || exit 3
+    exec 8<"$rch_scope_mount$rch_scope_cgroup" || exit 2
+    [ "$(stat -Lc '%d.%i' /proc/self/fd/8)" = "$rch_scope_node_id" ] &&
+        [ "$(stat -fLc '%T' /proc/self/fd/8)" = cgroup2fs ] || exit 3
+    # Repeat generation evidence AFTER pinning the inode. Holding this directory
+    # prevents inode reuse; subsequent opens never resolve its pathname again.
+    rch_scope_snapshot && rch_scope_snapshot_matches || exit 3
+    case "$1" in
+        state)
+            LC_ALL=C awk '
+                $1 == "populated" {
+                    n++; if (NF != 2 || ($2 != "0" && $2 != "1")) bad=1
+                    value=$2
+                }
+                END { if (bad || n != 1) exit 2; exit value }
+            ' /proc/self/fd/8/cgroup.events
+            exit $?;;
+        probe|kill)
+            [ "$(cat /proc/self/fd/8/cgroup.type)" = domain ] || exit 2
+            # Opening proves capability/permission without killing the launcher
+            # during admission. The kernel file atomically kills all descendant
+            # cgroups, including fork races and processes which called setsid.
+            [ -f /proc/self/fd/8/cgroup.kill ] || exit 2
+            exec 7>/proc/self/fd/8/cgroup.kill || exit 2
+            if [ "$1" = kill ]; then printf '1\n' >&7 || exit 2; fi
+            exit 0;;
+        *) exit 2;;
+    esac
+)
+
+rch_scope_bind_created() {
+    rch_scope_uid=$(id -u) || return 1
+    rch_scope_manager=$rch_policy_manager
+    rch_scope_cgroup=$rch_policy_expected_cgroup
+    rch_scope_invocation=$(rch_policy_systemctl show --value --property=InvocationID -- "$rch_policy_scope") || return 1
+    rch_scope_namespace=$(stat -Lc '%i' /proc/self/ns/cgroup) || return 1
+    rch_scope_mount=$(rch_scope_root) || return 1
+    rch_scope_root_id=$(stat -c '%d.%i' -- "$rch_scope_mount") || return 1
+    rch_scope_node_id=$(stat -c '%d.%i' -- "$rch_scope_mount$rch_scope_cgroup") || return 1
+    rch_scope_binding_valid && rch_scope_operation probe || return 1
+    rch_scope_bound=1
 }
