@@ -45,8 +45,24 @@ def _neutral_python() -> str:
     return str(alias)
 
 
+def _neutral_scheduling():
+    # cargo under ananicy runs at nice 19 in SCHED_IDLE and its tests inherit
+    # both: deadlines starve and requested priorities cannot be applied. Start
+    # from the defaults when the host allows it.
+    if sys.platform != "linux":
+        return
+    try:
+        if os.sched_getscheduler(0) == os.SCHED_IDLE:
+            os.sched_setscheduler(0, os.SCHED_OTHER, os.sched_param(0))
+        if os.getpriority(os.PRIO_PROCESS, 0) > 0:
+            os.setpriority(os.PRIO_PROCESS, 0, 0)
+    except OSError:
+        pass
+
+
 PYTHON = _neutral_python()
 if PYTHON != sys.executable:
+    _neutral_scheduling()
     # Re-run this harness under the alias too: a child forked from a process
     # named `python3` carries that name until it execs, and an ananicy pass
     # landing in that window re-nices it for good.
