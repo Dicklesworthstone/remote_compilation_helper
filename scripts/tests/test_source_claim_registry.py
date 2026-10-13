@@ -24,6 +24,7 @@ FLOCK = shutil.which("flock")
 AWK = shutil.which("awk")
 CAT = shutil.which("cat")
 REALPATH = shutil.which("realpath")
+SYNC = shutil.which("sync")
 
 
 def body(roots):
@@ -42,6 +43,8 @@ def reference_overlap(wanted, held):
 
 
 class SourceClaimRegistryTests(unittest.TestCase):
+    shell = "/bin/sh"
+
     def setUp(self):
         self.root = Path(tempfile.mkdtemp(prefix="rch-source-registry-"))
         self.registry = self.root / "registry"
@@ -59,7 +62,7 @@ class SourceClaimRegistryTests(unittest.TestCase):
 
     def command(self, token, roots, operation="acquire"):
         return [FLOCK, "--exclusive", "--no-fork", "--", str(self.registry / ".lock"),
-                "/bin/sh", str(self.script), str(self.registry), token,
+                self.shell, str(self.script), str(self.registry), token,
                 digest(roots), operation]
 
     def transact(self, token, roots, operation="acquire", env=None):
@@ -84,7 +87,7 @@ class SourceClaimRegistryTests(unittest.TestCase):
         script = ("set -eu\n" + functions + "\nrequested=$(cat)\n"
                   'if closures_overlap "$requested" file "$1"; then\n'
                   '  printf "overlap\\n"\nelse\n  printf "disjoint\\n"\nfi\n')
-        return subprocess.run(["/bin/sh", "-c", script, "comparison", str(held_file)],
+        return subprocess.run([self.shell, "-c", script, "comparison", str(held_file)],
                               input=body(wanted), stdout=subprocess.PIPE,
                               stderr=subprocess.PIPE, env=env or self.env,
                               timeout=10, check=False)
@@ -295,6 +298,164 @@ class SourceClaimRegistryTests(unittest.TestCase):
                 if process.poll() is None:
                     process.kill()  # Only the fixture child, never a worker.
                 process.communicate(timeout=5)
+
+    def fail_sync_after_move(self, destination):
+        # Real writes and renames run. Only sync reports an injected failure
+        # after the destination appears: the lost-durability-ack frontier.
+        return self.tool_env("sync", 'if [ -e {} ]; then\n'
+                             '  printf "injected post-rename sync failure\\n" >&2\n'
+                             '  exit 91\nfi\nexec {} "$@"'.format(
+                                 shlex.quote(str(destination)), shlex.quote(SYNC)))
+
+    def assert_unconfirmed(self, result):
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(result.stdout, b"", "no success/ownership verdict on failure")
+
+    def test_recovery_completes_failed_acquire_and_pending_promotion_sync(self):
+        for from_pending, token in [(False, "aa"), (True, "ab")]:
+            with self.subTest(from_pending=from_pending):
+                roots = [self.root / token]
+                active = self.registry / (token + "." + digest(roots) + ".claim")
+                operation = "acquire"
+                if from_pending:
+                    self.record(token, roots, "pending")
+                    operation = "recover"
+                env = self.fail_sync_after_move(active)
+                self.assert_unconfirmed(self.transact(token, roots, operation, env))
+                before = (active.stat().st_ino, active.read_bytes())
+                self.assertEqual(before[1], body(roots))
+                self.assert_unconfirmed(self.transact(token, roots, "recover", env))
+                self.assert_refused(self.transact("bb", roots))
+                self.assert_granted(self.transact(token, roots, "recover"))
+                self.assertEqual((active.stat().st_ino, active.read_bytes()), before)
+                self.assertFalse(active.with_suffix(".pending").exists())
+
+    def test_release_replay_finishes_durability_without_releasing_a_new_owner(self):
+        roots = [self.root / "project"]
+        self.assert_granted(self.transact("aa", roots))
+        active = self.registry / ("aa." + digest(roots) + ".claim")
+        before = (active.stat().st_ino, active.read_bytes())
+        receipt = self.registry / "released" / active.name
+        env = self.fail_sync_after_move(receipt)
+        self.assert_unconfirmed(self.transact("aa", roots, "release", env))
+        self.assertFalse(active.exists())
+        for operation in ("release", "released"):
+            self.assert_unconfirmed(self.transact("aa", roots, operation, env))
+        self.assert_granted(self.transact("aa", roots, "release"))
+        query = self.transact("aa", roots, "released")
+        self.assert_granted(query)
+        self.assertEqual(query.stdout, b"released")
+        # Normal completion cannot be relabelled as an unexecuted cancellation.
+        self.assert_refused(self.transact("aa", roots, "cancel"))
+        self.assert_refused(self.transact("aa", roots, "recover"))
+        self.assert_granted(self.transact("bb", roots))
+        next_owner = self.registry / ("bb." + digest(roots) + ".claim")
+        self.assert_granted(self.transact("aa", roots, "release"))
+        self.assertEqual((receipt.stat().st_ino, receipt.read_bytes()), before)
+        self.assertEqual(next_owner.read_bytes(), body(roots))
+        self.assert_refused(self.transact("cc", roots))
+
+    def test_cancel_replay_rechecks_post_rename_durability_for_every_frontier(self):
+        for frontier, token in [("active", "aa"), ("absent", "ab"), ("quarantine", "ac")]:
+            with self.subTest(frontier=frontier):
+                roots = [self.root / token]
+                receipt = self.registry / "cancelled" / (token + "." + digest(roots) + ".claim")
+                operation = "cancel"
+                if frontier == "active":
+                    self.assert_granted(self.transact(token, roots))
+                    self.assertEqual(self.transact(token, roots, "cancel").stdout, b"owned")
+                    operation = "finish-cancel"
+                elif frontier == "quarantine":
+                    pending = self.record(token, roots, "pending")
+                    pending.write_bytes(b"incomplete legacy write")
+                    self.assert_granted(self.transact("bb", [self.root / "other"]))
+                env = self.fail_sync_after_move(receipt)
+                self.assert_unconfirmed(self.transact(token, roots, operation, env))
+                before = (receipt.stat().st_ino, receipt.read_bytes())
+                self.assertEqual(before[1], body(roots))
+                for retry in ("cancel", "finish-cancel"):
+                    self.assert_unconfirmed(self.transact(token, roots, retry, env))
+                    result = self.transact(token, roots, retry)
+                    self.assert_granted(result)
+                    self.assertEqual(result.stdout, b"unowned" if retry == "cancel" else b"")
+                self.assertEqual((receipt.stat().st_ino, receipt.read_bytes()), before)
+                self.assert_refused(self.transact(token, roots))
+                self.assert_refused(self.transact(token, roots, "recover"))
+                self.assertFalse((self.registry / receipt.name).exists())
+                if frontier == "quarantine":
+                    self.assertEqual((self.registry / "quarantine" / pending.name).read_bytes(),
+                                     b"incomplete legacy write")
+
+    def test_every_terminal_replay_sync_barrier_is_required_before_success(self):
+        roots = [self.root / "project"]
+        for state, token, operations in [("released", "aa", ("released", "release")),
+                                         ("cancelled", "ab", ("cancel", "finish-cancel"))]:
+            self.assert_granted(self.transact(token, roots))
+            if state == "released":
+                self.assert_granted(self.transact(token, roots, "release"))
+            else:
+                self.assert_granted(self.transact(token, roots, "cancel"))
+                self.assert_granted(self.transact(token, roots, "finish-cancel"))
+            receipt = self.registry / state / (token + "." + digest(roots) + ".claim")
+            before = (receipt.stat().st_ino, receipt.read_bytes())
+            for path in (receipt, receipt.parent, self.registry):
+                env = self.tool_env("sync", 'if [ "$2" = {} ]; then exit 91; fi\n'
+                                    'exec {} "$@"'.format(shlex.quote(str(path)), shlex.quote(SYNC)))
+                for operation in operations:
+                    with self.subTest(state=state, path=path, operation=operation):
+                        self.assert_unconfirmed(self.transact(token, roots, operation, env))
+                        self.assertEqual((receipt.stat().st_ino, receipt.read_bytes()), before)
+                        self.assert_granted(self.transact(token, roots, operation))
+
+    def test_release_replay_rejects_conflicting_records_without_mutation(self):
+        for index, state in enumerate(("claim", "pending", "cancelling", "cancelled", "quarantine")):
+            with self.subTest(state=state):
+                token = "a" + format(index, "x")
+                roots = [self.root / token]
+                self.assert_granted(self.transact(token, roots))
+                self.assert_granted(self.transact(token, roots, "release"))
+                receipt = self.registry / "released" / (token + "." + digest(roots) + ".claim")
+                if state in ("cancelled", "quarantine"):
+                    extension = "pending" if state == "quarantine" else "claim"
+                    conflict = self.registry / state / (token + "." + digest(roots) + "." + extension)
+                    conflict.write_bytes(body(roots))
+                else:
+                    conflict = self.record(token, roots, state)
+                before = [(p.stat().st_ino, p.read_bytes()) for p in (receipt, conflict)]
+                self.assert_refused(self.transact(token, roots, "release"))
+                self.assertEqual([(p.stat().st_ino, p.read_bytes()) for p in (receipt, conflict)], before)
+
+    def test_concurrent_release_retries_preserve_one_receipt_and_later_grant(self):
+        roots = [self.root / "project"]
+        self.assert_granted(self.transact("aa", roots))
+        active = self.registry / ("aa." + digest(roots) + ".claim")
+        before = (active.stat().st_ino, active.read_bytes())
+        processes = [subprocess.Popen(self.command("aa", roots, "release"), stdin=subprocess.PIPE,
+                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                     env=self.env) for _ in range(4)]
+        try:
+            for process in processes:
+                process.stdin.write(body(roots))
+                process.stdin.close()
+                process.stdin = None
+            outputs = [process.communicate(timeout=20) for process in processes]
+            self.assertEqual([p.returncode for p in processes], [0] * 4, outputs)
+            self.assertTrue(all(stdout == b"" for stdout, _ in outputs))
+        finally:
+            for process in processes:
+                if process.poll() is None:
+                    process.kill()
+                process.communicate(timeout=5)
+        receipt = self.registry / "released" / active.name
+        self.assertEqual((receipt.stat().st_ino, receipt.read_bytes()), before)
+        self.assertFalse(active.exists())
+        self.assert_granted(self.transact("bb", roots))
+        self.assert_refused(self.transact("aa", roots, "recover"))
+
+
+@unittest.skipUnless(shutil.which("bash"), "bash is unavailable")
+class SourceClaimRegistryBashTests(SourceClaimRegistryTests):
+    shell = shutil.which("bash")
 
 
 if __name__ == "__main__":

@@ -27,6 +27,19 @@ matches_request() {
     printf '%s\n' "$requested" | cmp -s - "$1" || refuse 'source claim roots changed'
 }
 
+# A visible rename is not a durable acknowledgment. An earlier transaction
+# may have moved this exact record and then lost its connection or failed its
+# final sync. Re-establish the barriers even on an otherwise read-only retry,
+# before emitting any authority/retirement verdict. Callers validate the record
+# and its state first; this helper never creates, moves or repairs a claim.
+confirm_durable_record() {
+    sync -f "$1" && sync -f "${1%/*}" \
+        || refuse 'cannot confirm durable source record'
+    if [ "${1%/*}" != "$registry" ]; then
+        sync -f "$registry" || refuse 'cannot confirm durable source transition'
+    fi
+}
+
 physical_batch() {
     # Keep every delimiter, including the last one. One output record per
     # argument is essential: a newline in a symlink target must not turn one
@@ -232,6 +245,7 @@ if [ "$operation" = cancel ]; then
     fi
     if [ -e "$cancelled" ] || [ -L "$cancelled" ]; then
         matches_request "$cancelled"
+        confirm_durable_record "$cancelled"
         printf unowned
         exit 0
     fi
@@ -240,8 +254,7 @@ if [ "$operation" = cancel ]; then
         # cancellation receipt while retaining the legacy refusal fence.
         rch_claim_write_atomic "$registry" "$cancelled" "$digest" "$requested" || refuse 'cannot persist quarantined source cancellation'
         matches_request "$cancelled"
-        sync -f "$registry/cancelled"
-        sync -f "$registry"
+        confirm_durable_record "$cancelled"
         printf unowned
         exit 0
     fi
@@ -272,9 +285,7 @@ if [ "$operation" = cancel ]; then
         # An absent intent never acquired source rights. Its tombstone fences
         # delayed acquisition but grants no authority to inspect/remove a tree.
         mv -- "$cancelling" "$cancelled"
-        sync -f "$cancelled"
-        sync -f "$registry/cancelled"
-        sync -f "$registry"
+        confirm_durable_record "$cancelled"
         printf unowned
     fi
     exit 0
@@ -284,21 +295,21 @@ if [ "$operation" = finish-cancel ]; then
     if [ -e "$cancelled" ] || [ -L "$cancelled" ]; then
         matches_request "$cancelled"
         [ ! -e "$active" ] && [ ! -L "$active" ] || refuse 'duplicate cancelled grant'
+        confirm_durable_record "$cancelled"
         exit 0
     fi
     matches_request "$cancelling"
     matches_request "$active"
     [ ! -e "$pending" ] && [ ! -L "$pending" ] || refuse 'unfinished claim transition'
     mv -- "$active" "$cancelled"
-    sync -f "$cancelled"
-    sync -f "$registry/cancelled"
-    sync -f "$registry"
+    confirm_durable_record "$cancelled"
     exit 0
 fi
 
 if [ "$operation" = released ]; then
     if [ -e "$released" ] || [ -L "$released" ]; then
         matches_request "$released"
+        confirm_durable_record "$released"
         printf released
     else
         printf pending
@@ -307,6 +318,19 @@ if [ "$operation" = released ]; then
 fi
 
 if [ "$operation" = release ]; then
+    if [ -e "$released" ] || [ -L "$released" ]; then
+        # Resume a completed move, not a new release. A lost acknowledgment
+        # must not strand the caller, but contradictory ownership is never a
+        # receipt. In particular, a released grant is NOT a cancelled intent.
+        matches_request "$released"
+        for unfinished in "$active" "$pending" "$cancelling" "$cancelled" \
+            "$registry/quarantine/$token.$digest.pending"; do
+            [ ! -e "$unfinished" ] && [ ! -L "$unfinished" ] \
+                || refuse 'released source grant has conflicting ownership'
+        done
+        confirm_durable_record "$released"
+        exit 0
+    fi
     # The receipt is the original claim, never a newly manufactured token.
     # An acknowledged move therefore proves this exact set ceased to be active.
     matches_request "$active"
@@ -314,9 +338,7 @@ if [ "$operation" = release ]; then
     [ ! -e "$pending" ] && [ ! -L "$pending" ] || refuse 'unfinished claim transition'
     [ ! -e "$released" ] && [ ! -L "$released" ] || refuse 'duplicate release receipt'
     mv -- "$active" "$released"
-    sync -f "$released"
-    sync -f "$registry/released"
-    sync -f "$registry"
+    confirm_durable_record "$released"
     exit 0
 fi
 
@@ -369,6 +391,7 @@ if [ "$operation" = recover ]; then
     if [ -e "$active" ] || [ -L "$active" ]; then
         matches_request "$active"
         [ ! -e "$pending" ] && [ ! -L "$pending" ] || refuse 'duplicate source grant'
+        confirm_durable_record "$active"
         exit 0
     fi
     # Only an already-written complete claim may finish its interrupted rename.
@@ -382,4 +405,4 @@ else
 fi
 sync -f "$pending"
 mv -- "$pending" "$active"
-sync -f "$registry"
+confirm_durable_record "$active"
