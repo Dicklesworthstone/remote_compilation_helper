@@ -425,6 +425,25 @@ impl FleetExecutor {
                     return (idx, worker_id, false, DeploymentStatus::Failed);
                 }
 
+                // Guard against clobbering a worker's good binary with one built
+                // for the wrong OS/arch (e.g. pushing a macOS binary onto a
+                // linux/amd64 worker => `Exec format error`). Runs before the
+                // backup and SCP so a mismatch never touches the worker. A proven
+                // mismatch is a skip, not a failure: this controller has no binary
+                // for that worker, and counting it as failed made every Linux
+                // controller report its macOS/Windows workers as failed on every
+                // run, burying real failures (bd-ztpbq).
+                if let Err(e) = ensure_binary_matches_worker(&worker_config, &local_binary).await {
+                    if let Some(reason) = platform_mismatch_skip_reason(&e) {
+                        progress
+                            .worker_skipped_with_notice(&worker_id, &reason)
+                            .await;
+                        return (idx, worker_id, true, DeploymentStatus::Skipped);
+                    }
+                    progress.worker_failed(&worker_id, &format!("{}", e)).await;
+                    return (idx, worker_id, false, DeploymentStatus::Failed);
+                }
+
                 // Backup phase - create backup of current binary (best-effort, non-fatal)
                 // This runs before upload to capture the existing version
                 let mut previous_artifact_id: Option<String> = None;
@@ -451,15 +470,6 @@ impl FleetExecutor {
 
                 // Upload phase - create remote directory and copy binary
                 progress.set_phase(&worker_id, DeployPhase::Uploading).await;
-
-                // Guard against clobbering a worker's good binary with one built
-                // for the wrong OS/arch (e.g. pushing a macOS binary onto a
-                // linux/amd64 worker => `Exec format error`). Runs before SCP so
-                // a mismatch never overwrites the existing binary.
-                if let Err(e) = ensure_binary_matches_worker(&worker_config, &local_binary).await {
-                    progress.worker_failed(&worker_id, &format!("{}", e)).await;
-                    return (idx, worker_id, false, DeploymentStatus::Failed);
-                }
 
                 // Release-provenance gate (bd-...-7.4): prove this is the
                 // intended artifact for this worker before transfer, and record
@@ -1440,6 +1450,19 @@ pub(crate) async fn run_smoke_worker_scenarios(
 /// post-deploy health check stays as the final backstop — but fails loudly on a
 /// *proven* mismatch so a controller never clobbers a worker's good binary with
 /// an `Exec format error` time bomb.
+/// Skip reason for a deploy leg refused by [`ensure_binary_matches_worker`]
+/// because the local binary is proven to be for another OS/arch. `None` for
+/// any other error, which stays a failure.
+fn platform_mismatch_skip_reason(error: &anyhow::Error) -> Option<String> {
+    match error.downcast_ref::<FleetError>() {
+        Some(FleetError::BinaryPlatformMismatch { local, worker, .. }) => Some(format!(
+            "worker platform {worker} differs from this controller's binary ({local}); \
+             deploy from a matching controller or release artifact"
+        )),
+        _ => None,
+    }
+}
+
 async fn ensure_binary_matches_worker(worker: &WorkerConfig, local_binary: &Path) -> Result<()> {
     let header = match read_binary_header(local_binary) {
         Ok(header) => header,
@@ -2894,6 +2917,26 @@ mod tests {
         let platform = detect_binary_platform(&header).unwrap();
         assert_eq!(platform.os, BinaryOs::Linux);
         assert_eq!(platform.arch, Some(BinaryArch::X86_64));
+    }
+
+    #[test]
+    fn platform_mismatch_is_a_skip_with_a_reason_other_errors_are_not() {
+        let mismatch: anyhow::Error = FleetError::BinaryPlatformMismatch {
+            worker_id: "mac-mini-max".to_string(),
+            local: "linux/x86_64".to_string(),
+            worker: "macos/aarch64".to_string(),
+        }
+        .into();
+        let reason = platform_mismatch_skip_reason(&mismatch).expect("mismatch is a skip");
+        assert!(reason.contains("macos/aarch64"), "{reason}");
+        assert!(reason.contains("linux/x86_64"), "{reason}");
+
+        let other: anyhow::Error = FleetError::HealthCheckFailed {
+            reason: "rch-wkr health exited 1".to_string(),
+        }
+        .into();
+        assert!(platform_mismatch_skip_reason(&other).is_none());
+        assert!(platform_mismatch_skip_reason(&anyhow::anyhow!("scp failed")).is_none());
     }
 
     #[tokio::test]
