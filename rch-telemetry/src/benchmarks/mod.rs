@@ -11,6 +11,7 @@ pub mod error;
 pub mod memory;
 pub mod network;
 pub mod parallel_compilation;
+pub mod report;
 pub mod retry;
 
 pub use compilation::{
