@@ -186,7 +186,11 @@ pub fn observe_process(pid: u32) -> ProcessObservation {
     let Some(boot) = boot_identity() else {
         return ProcessObservation::Unknown;
     };
-    observe_linux_process(&std::path::PathBuf::from(format!("/proc/{pid}")), pid, &boot)
+    observe_linux_process(
+        &std::path::PathBuf::from(format!("/proc/{pid}")),
+        pid,
+        &boot,
+    )
 }
 
 #[cfg(target_os = "linux")]
@@ -217,7 +221,9 @@ fn linux_namespace_matches(pid: u32, stat: &str, status: &str) -> bool {
     // The numeric PID can coincide in a parent-mounted procfs. NSpid lists
     // the namespace hierarchy, so equality of the first number is insufficient.
     // Missing, duplicate, malformed or multi-level evidence fails closed.
-    let mut records = status.lines().filter_map(|line| line.strip_prefix("NSpid:"));
+    let mut records = status
+        .lines()
+        .filter_map(|line| line.strip_prefix("NSpid:"));
     let Some(record) = records.next() else {
         return false;
     };
