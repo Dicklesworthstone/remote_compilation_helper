@@ -5,7 +5,7 @@
 //!
 //! ## Scheduling Triggers
 //! - New workers: queue on detection, run once fresh telemetry permits it
-//! - Stale scores: re-benchmark when score exceeds max age
+//! - Stale scores: re-benchmark if telemetry suggests performance change
 //! - Drift detection: re-benchmark if telemetry suggests performance change
 //! - Manual triggers: user-initiated benchmarks via API
 
@@ -1199,6 +1199,28 @@ else exec ~/.local/bin/rch-wkr benchmark --json; fi"
     )
 }
 
+/// Read one complete bounded stream. Reaching a `take` limit is not EOF:
+/// reserve one extra byte to distinguish exact-bound output from truncation.
+/// Returning an error lets try_join stop the other stream and reap the child.
+async fn read_benchmark_stream(
+    reader: impl tokio::io::AsyncRead + Unpin,
+    bytes: &mut Vec<u8>,
+    limit: u64,
+) -> std::io::Result<()> {
+    use tokio::io::AsyncReadExt;
+    let probe_limit = limit.checked_add(1).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid benchmark output limit")
+    })?;
+    reader.take(probe_limit).read_to_end(bytes).await?;
+    if bytes.len() as u64 > limit {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "benchmark output exceeds byte limit",
+        ));
+    }
+    Ok(())
+}
+
 async fn execute_benchmark_process(
     mut cmd: tokio::process::Command,
     input: Option<String>,
@@ -1239,11 +1261,8 @@ async fn execute_benchmark_process(
     const MAX_BENCHMARK_OUTPUT: u64 = 1024 * 1024; // 1MB
 
     let read_future = async {
-        use tokio::io::AsyncReadExt;
-        let mut stdout_limited = stdout.take(MAX_BENCHMARK_OUTPUT);
-        let mut stderr_limited = stderr.take(MAX_BENCHMARK_OUTPUT);
-        let t1 = stdout_limited.read_to_end(&mut stdout_buf);
-        let t2 = stderr_limited.read_to_end(&mut stderr_buf);
+        let t1 = read_benchmark_stream(stdout, &mut stdout_buf, MAX_BENCHMARK_OUTPUT);
+        let t2 = read_benchmark_stream(stderr, &mut stderr_buf, MAX_BENCHMARK_OUTPUT);
         let write_input = async {
             if let (Some(stdin), Some(input)) = (stdin, input) {
                 rch_common::ssh::write_ssh_command_stdin(stdin, &input).await?;
@@ -1296,8 +1315,9 @@ async fn execute_benchmark_process(
         ));
     }
 
-    let stdout_str = String::from_utf8_lossy(&stdout_buf);
-    if let Some(score) = parse_benchmark_output(&stdout_str) {
+    let stdout_str = std::str::from_utf8(&stdout_buf)
+        .map_err(|error| anyhow::anyhow!("Benchmark output is not UTF-8: {error}"))?;
+    if let Some(score) = parse_benchmark_output(stdout_str) {
         return Ok((score, exec_duration));
     }
 
@@ -1320,12 +1340,12 @@ fn parse_benchmark_output(output: &str) -> Option<SpeedScore> {
 
 /// Recalibrate the raw measurement fields emitted by deployed workers.
 ///
-/// The flat wire report does not contain memory access latency or any network
-/// measurements. Those components must be absent, not reverse-engineered from
-/// clipped old component scores or filled with fabricated latency values.
+/// Older flat reports omit memory latency and all network measurements. Only
+/// use memory when BOTH measured inputs exist; never infer missing latency
+/// from a clipped component score. Current complete reports take the typed path.
 fn recalibrate_worker_raw(raw: &serde_json::Value) -> Option<SpeedScore> {
     use rch_telemetry::benchmarks::{
-        CompilationBenchmarkResult, CpuBenchmarkResult, DiskBenchmarkResult,
+        CompilationBenchmarkResult, CpuBenchmarkResult, DiskBenchmarkResult, MemoryBenchmarkResult,
     };
     use rch_telemetry::speedscore::BenchmarkResults;
 
@@ -1340,6 +1360,16 @@ fn recalibrate_worker_raw(raw: &serde_json::Value) -> Option<SpeedScore> {
         results.cpu = Some(CpuBenchmarkResult {
             ops_per_second,
             ..CpuBenchmarkResult::default()
+        });
+    }
+    if let (Some(seq_bandwidth_gbps), Some(random_latency_ns)) = (
+        positive("memory_seq_bandwidth_gbps"),
+        positive("memory_random_latency_ns"),
+    ) {
+        results.memory = Some(MemoryBenchmarkResult {
+            seq_bandwidth_gbps,
+            random_latency_ns,
+            ..MemoryBenchmarkResult::default()
         });
     }
     if let (Some(seq_read_mbps), Some(seq_write_mbps), Some(random_read_iops)) = (
@@ -1370,11 +1400,20 @@ fn recalibrate_worker_raw(raw: &serde_json::Value) -> Option<SpeedScore> {
 
 /// Parse `rch-wkr benchmark --json` output into a typed [`SpeedScore`].
 ///
-/// Raw measurements are authoritative and are recalibrated by the daemon so
-/// rolling upgrades do not mix worker algorithms. Older scalar/component-only
-/// reports remain readable as explicitly unversioned diagnostic results.
+/// Complete reports are authoritative and recalibrated from the original JSON
+/// so duplicate report/measurement fields cannot collapse into valid evidence.
+/// Older flat raw and scalar reports keep their existing, narrower semantics.
 fn parse_benchmark_json(output: &str) -> Option<SpeedScore> {
     let json = serde_json::from_str::<serde_json::Value>(output).ok()?;
+    if json.get("benchmark_report").is_some() {
+        // Presence commits this response to the complete evidence contract.
+        // Null, malformed or unsupported reports must not fall back to a
+        // convenient legacy score or partial raw object in the same response.
+        return rch_telemetry::benchmarks::report::BenchmarkReport::from_worker_json(output)
+            .ok()?
+            .recalculate()
+            .ok();
+    }
     if let Some(raw) = json.get("raw") {
         return recalibrate_worker_raw(raw);
     }
@@ -1405,6 +1444,153 @@ fn parse_benchmark_json(output: &str) -> Option<SpeedScore> {
         }
     }
     Some(score)
+}
+
+#[cfg(test)]
+mod complete_benchmark_report_tests {
+    use super::*;
+    use rch_telemetry::benchmarks::report::BenchmarkReport;
+    use rch_telemetry::benchmarks::{
+        CompilationBenchmarkResult, CpuBenchmarkResult, MemoryBenchmarkResult,
+    };
+    use rch_telemetry::speedscore::BenchmarkResults;
+
+    const VALID: &str = r#"{"benchmark_report":{"version":1,"cpu":{"ops_per_second":250000}}}"#;
+
+    #[test]
+    fn complete_report_reaches_selection_without_losing_memory_or_compilation() {
+        let results = BenchmarkResults::new()
+            .with_cpu(CpuBenchmarkResult {
+                ops_per_second: 250_000.0,
+                ..Default::default()
+            })
+            .with_memory(MemoryBenchmarkResult {
+                seq_bandwidth_gbps: 4.0,
+                random_latency_ns: 25.0,
+                ..Default::default()
+            })
+            .with_compilation(CompilationBenchmarkResult {
+                score: 1500.0,
+                ..Default::default()
+            });
+        let expected = SpeedScore::calculate(&results);
+        let wire = serde_json::json!({
+            "score": 100,
+            "components": {"memory": 0, "compilation": 0},
+            "raw": {"cpu_ops_per_second": 1},
+            "benchmark_report": BenchmarkReport::from_results(&results),
+        })
+        .to_string();
+        let actual = parse_benchmark_output(&wire).unwrap();
+        assert_eq!(actual.total, expected.total);
+        assert_eq!(actual.weights, expected.weights);
+        assert_eq!(actual.memory_score, expected.memory_score);
+        assert_eq!(actual.compilation_score, expected.compilation_score);
+        assert!(actual.weights.memory > 0.0);
+        assert!(actual.weights.compilation > 0.0);
+        assert_eq!(actual.weights.network, 0.0);
+        assert_eq!(selection_speedscore(&actual), Some(expected.total));
+    }
+
+    #[test]
+    fn invalid_advertised_reports_cannot_fall_back_to_legacy_evidence() {
+        for report in [
+            "null",
+            "{}",
+            r#"{"version":1}"#,
+            r#"{"version":2,"cpu":{"ops_per_second":250000}}"#,
+            r#"{"version":1,"cpu":{"ops_per_second":0}}"#,
+            r#"{"version":1,"memory":{"seq_bandwidth_gbps":4}}"#,
+            r#"{"version":1,"cpu":{"ops_per_second":250000},"memory":{"seq_bandwidth_gbps":4,"random_latency_ns":0}}"#,
+            r#"{"version":1,"cpu":{"ops_per_second":1,"ops_per_second":250000}}"#,
+        ] {
+            let wire = format!(
+                r#"{{"score":99,"raw":{{"cpu_ops_per_second":250000}},"benchmark_report":{report}}}"#
+            );
+            assert!(parse_benchmark_output(&wire).is_none(), "{wire}");
+        }
+    }
+
+    #[test]
+    fn duplicate_top_level_reports_are_rejected_before_placement() {
+        let wire = r#"{"score":99,"benchmark_report":{"version":1,"cpu":{"ops_per_second":1}},"benchmark_report":{"version":1,"cpu":{"ops_per_second":250000}}}"#;
+        assert!(parse_benchmark_output(wire).is_none());
+    }
+
+    #[test]
+    fn flat_reports_need_both_memory_inputs_and_never_invent_network() {
+        let missing = r#"{"raw":{"cpu_ops_per_second":250000,"memory_seq_bandwidth_gbps":4}}"#;
+        let score = parse_benchmark_output(missing).unwrap();
+        assert_eq!(score.weights.cpu, 1.0);
+        assert_eq!(score.weights.memory, 0.0);
+        let complete = r#"{"raw":{"cpu_ops_per_second":250000,"memory_seq_bandwidth_gbps":4,"memory_random_latency_ns":100}}"#;
+        let score = parse_benchmark_output(complete).unwrap();
+        assert!(score.weights.memory > 0.0);
+        assert_eq!(score.memory_score, 50.0);
+        assert_eq!(score.weights.network, 0.0);
+    }
+
+    #[test]
+    fn legacy_scalar_remains_unversioned_not_current_placement() {
+        let score = parse_benchmark_output(r#"{"score":99}"#).unwrap();
+        assert_eq!(score.version, 0);
+        assert!(selection_speedscore(&score).is_none());
+    }
+
+    #[tokio::test]
+    async fn stream_bound_requires_eof_and_rejects_a_valid_prefix() {
+        let mut output = Vec::new();
+        read_benchmark_stream(VALID.as_bytes(), &mut output, VALID.len() as u64)
+            .await
+            .unwrap();
+        assert_eq!(output, VALID.as_bytes());
+        let mut oversized = VALID.as_bytes().to_vec();
+        oversized.push(b' ');
+        let mut output = Vec::new();
+        let error = read_benchmark_stream(oversized.as_slice(), &mut output, VALID.len() as u64)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn process_rejects_oversized_stdout_or_stderr_even_with_valid_json() {
+        let directory = tempfile::tempdir().unwrap();
+        let payload = directory.path().join("oversized");
+        let mut bytes = VALID.as_bytes().to_vec();
+        bytes.resize(1024 * 1024 + 1, b' ');
+        std::fs::write(&payload, &bytes).unwrap();
+        for script in [
+            "exec cat \"$1\"",
+            "printf '%s' \"$2\"; exec cat \"$1\" >&2",
+        ] {
+            let mut command = tokio::process::Command::new("sh");
+            command.args(["-c", script, "benchmark-output-test"])
+                .arg(&payload).arg(VALID);
+            let error = execute_benchmark_process(command, None, Duration::from_secs(5))
+                .await.unwrap_err().to_string();
+            assert!(error.contains("exceeds byte limit"), "{error}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn process_does_not_repair_invalid_utf8_into_accepted_json() {
+        let directory = tempfile::tempdir().unwrap();
+        let payload = directory.path().join("invalid-utf8");
+        let mut bytes = VALID.as_bytes()[..VALID.len() - 1].to_vec();
+        bytes.extend_from_slice(b",\"note\":\"\xff\"}");
+        std::fs::write(&payload, &bytes).unwrap();
+        // Lossy conversion makes this syntactically valid with a usable score;
+        // the production transport must instead reject the original bytes.
+        assert!(parse_benchmark_output(&String::from_utf8_lossy(&bytes)).is_some());
+        let mut command = tokio::process::Command::new("sh");
+        command.args(["-c", "exec cat \"$1\"", "benchmark-output-test"]).arg(&payload);
+        let error = execute_benchmark_process(command, None, Duration::from_secs(5))
+            .await.unwrap_err().to_string();
+        assert!(error.contains("not UTF-8"), "{error}");
+    }
 }
 
 /// Parse benchmark score from text output.
@@ -1618,8 +1804,8 @@ mod tests {
 
         let home = tempfile::tempdir().unwrap();
         let bin = home.path().join(".local/bin");
-        std::fs::create_dir_all(&bin).unwrap();
         let worker_program = bin.join("rch-wkr");
+        std::fs::create_dir_all(&bin).unwrap();
         std::fs::write(&worker_program, "#!/bin/sh\nexec sleep 60\n").unwrap();
         std::fs::set_permissions(&worker_program, std::fs::Permissions::from_mode(0o755)).unwrap();
 
