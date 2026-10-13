@@ -96,11 +96,13 @@ impl BenchmarkReport {
         let weights = SpeedScore::calculate(results).weights;
         Self {
             version: BENCHMARK_REPORT_VERSION,
-            cpu: results.cpu.as_ref().filter(|_| weights.cpu > 0.0).map(|result| {
-                CpuMeasurement {
+            cpu: results
+                .cpu
+                .as_ref()
+                .filter(|_| weights.cpu > 0.0)
+                .map(|result| CpuMeasurement {
                     ops_per_second: result.ops_per_second,
-                }
-            }),
+                }),
             memory: results
                 .memory
                 .as_ref()
@@ -109,13 +111,15 @@ impl BenchmarkReport {
                     seq_bandwidth_gbps: result.seq_bandwidth_gbps,
                     random_latency_ns: result.random_latency_ns,
                 }),
-            disk: results.disk.as_ref().filter(|_| weights.disk > 0.0).map(|result| {
-                DiskMeasurement {
+            disk: results
+                .disk
+                .as_ref()
+                .filter(|_| weights.disk > 0.0)
+                .map(|result| DiskMeasurement {
                     seq_read_mbps: result.seq_read_mbps,
                     seq_write_mbps: result.seq_write_mbps,
                     random_read_iops: result.random_read_iops,
-                }
-            }),
+                }),
             network: results
                 .network
                 .as_ref()
@@ -348,7 +352,10 @@ mod tests {
     #[test]
     fn empty_unknown_or_invalid_evidence_is_not_a_successful_measurement() {
         let mut report = BenchmarkReport::from_results(&BenchmarkResults::new());
-        assert!(matches!(report.recalculate(), Err(BenchmarkReportError::Empty)));
+        assert!(matches!(
+            report.recalculate(),
+            Err(BenchmarkReportError::Empty)
+        ));
         report.version += 1;
         assert!(matches!(
             report.recalculate(),
