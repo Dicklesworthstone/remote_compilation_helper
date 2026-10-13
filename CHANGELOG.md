@@ -5,7 +5,7 @@ Compilation Helper): the PreToolUse hook + CLI (`rch`), the local daemon (`rchd`
 worker agent (`rch-wkr`), the RABS build sidecar (`rabs-*`, `rabsd`), and the fleet
 dashboard (`dashboard/`).
 
-Scope window: project inception (`v0.1.0`, 2026-01-25) through `v2.1.19` (2026-10-13).
+Scope window: project inception (`v0.1.0`, 2026-01-25) through `v2.1.20` (2026-10-13).
 
 This document was rebuilt from git history (`git log --no-merges` per tag range, `git show`
 on representative commits), version tags (`git for-each-ref`), GitHub release metadata
@@ -28,6 +28,35 @@ history. They are kept as-is because the descriptions were verified against the 
 but those particular links will 404.
 
 Repository: <https://github.com/Dicklesworthstone/remote_compilation_helper>
+
+## 2.1.20 — 2026-10-13
+
+Daemon restarts no longer fail the builds that arrive during them, Macs get a draining
+restart path, and scratch clones offload with only `RCH_CANONICAL_PROJECT_ROOT`.
+
+- **Builds wait out a daemon restart instead of failing.**
+  - `rch daemon restart --drain` closes admission for its drain window. Every build that
+    arrived then failed outright. The 2.1.19 rollout failed about 30 builds on one
+    dispatcher alone.
+  - `rch exec` now waits, polling once a second for up to 600 s
+    (`RCH_RESTART_ADMISSION_WAIT_SECS`; 0 restores fail-fast). It rides out the moment the
+    daemon is gone between processes, refreshes the job lease, and prints one waiting line
+    (`bd-o6kdp`, [`fae0a9e9`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/fae0a9e9e41a044a58a2b92e9bf330eb0d324c30)).
+  - A build refused because the barrier closed just after its check, or while it waited in
+    the daemon's queue, now re-queries once admission reopens instead of failing or
+    building locally (`bd-5pmwm`, [`93b7e104`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/93b7e1049fb4f79d3892aa4972daa0d3435952d5)).
+- **Macs can drain a restart** (`bd-5pmwm`). On macOS, `rch daemon restart` now restarts a
+  launchd-managed rchd with `launchctl kickstart -k` after the drain, instead of the manual
+  stop-and-spawn that fought launchd's KeepAlive. It then waits up to 20 s for the
+  re-adopting daemon. Mac rollouts can use `rch daemon restart --drain` like Linux
+  ([`7f18af79`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/7f18af79207154ea17fd50a823fbb7b92bb0ed2f)).
+- **Scratch clones offload with only `RCH_CANONICAL_PROJECT_ROOT`** (`bd-xz7at`). The override
+  kept the `/dp` alias, which is `/data/projects` on workers. Worker topology setup then
+  claimed all of `/data/projects`, and every worker refused the build as an "unfinished
+  overlapping physical source owner". Without `RCH_ALIAS_PROJECT_ROOT` the alias is now
+  `<canonical>.rch-alias` ([`ff1d34c7`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/ff1d34c7285affe165072351c57bcf259960a21b)).
+- Tests no longer write fake projects into the operator's real timing history, which the
+  2.1.19 speed gate learns from ([`4c62cb8c`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/4c62cb8c64561738cbb6f37fe98fc14b1368c16b)).
 
 ## 2.1.19 — 2026-10-13
 
