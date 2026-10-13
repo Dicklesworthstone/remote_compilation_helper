@@ -911,12 +911,34 @@ fn observe_with_breaker(
     outcome.unwrap_or(Live::PassThrough)
 }
 
-/// Copy a compiler stream to ours as bytes arrive (no buffering beyond
-/// one read), capturing up to `MAX_CAPTURE_BYTES`. Returns the capture and
-/// whether it overflowed.
-fn tee(mut source: impl Read, mut sink: impl Write) -> (Vec<u8>, bool) {
-    let mut captured = Vec::new();
-    let mut overflow = false;
+/// Capture limits are cache policy; delivery failures are build failures.
+/// Never conflate an intentionally uncached transcript with lost compiler IO.
+#[derive(Debug)]
+struct CompilerStream {
+    bytes: Vec<u8>,
+    overflowed: bool,
+    delivered: bool,
+}
+
+impl CompilerStream {
+    fn unavailable() -> Self {
+        Self {
+            bytes: Vec::new(),
+            overflowed: false,
+            delivered: false,
+        }
+    }
+}
+
+/// Copy raw bytes live, keeping only a bounded PREFIX for optional caching.
+/// After a sink error, drain the source without further writes: closing the
+/// pipe would change the compiler's status, and stopping reads could wedge it.
+fn tee(mut source: impl Read, mut sink: impl Write) -> CompilerStream {
+    let mut capture = CompilerStream {
+        bytes: Vec::new(),
+        overflowed: false,
+        delivered: true,
+    };
     let mut buffer = [0_u8; 8192];
     loop {
         let read = match source.read(&mut buffer) {
@@ -924,18 +946,125 @@ fn tee(mut source: impl Read, mut sink: impl Write) -> (Vec<u8>, bool) {
             Ok(read) => read,
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             Err(_) => {
-                overflow = true;
+                capture.delivered = false;
                 break;
             }
         };
-        let _ = sink.write_all(&buffer[..read]).and_then(|()| sink.flush());
-        if captured.len() + read <= MAX_CAPTURE_BYTES {
-            captured.extend_from_slice(&buffer[..read]);
-        } else {
-            overflow = true;
+        if capture.delivered && forward_compiler_bytes(&mut sink, &buffer[..read]).is_err() {
+            capture.delivered = false;
+        }
+        let retained = read.min(MAX_CAPTURE_BYTES.saturating_sub(capture.bytes.len()));
+        capture.bytes.extend_from_slice(&buffer[..retained]);
+        capture.overflowed |= retained != read;
+    }
+    capture
+}
+
+fn forward_compiler_bytes(sink: &mut impl Write, bytes: &[u8]) -> io::Result<()> {
+    sink.write_all(bytes)?;
+    loop {
+        match sink.flush() {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            result => return result,
         }
     }
-    (captured, overflow)
+}
+
+const COMPILER_POLL: Duration = Duration::from_millis(20);
+/// This starts only AFTER the supervised compiler has stopped. It does not
+/// impose a new runtime limit on a healthy, still-executing compiler.
+const OUTPUT_DRAIN_BUDGET: Duration = Duration::from_secs(5);
+const EXIT_OUTPUT_INCOMPLETE: i32 = 122;
+
+#[derive(Debug)]
+struct CompilerOutput {
+    status: std::process::ExitStatus,
+    stdout: CompilerStream,
+    stderr: CompilerStream,
+}
+
+impl CompilerOutput {
+    fn delivered(&self) -> bool {
+        self.stdout.delivered && self.stderr.delivered
+    }
+
+    fn capture_eligible(&self) -> bool {
+        self.delivered() && !self.stdout.overflowed && !self.stderr.overflowed
+    }
+}
+
+/// Each relay sends exactly one completed capture. No stream bytes or progress
+/// messages accumulate in this channel. A missing/panicked relay is incomplete.
+fn collect_stream(
+    receiver: &std::sync::mpsc::Receiver<CompilerStream>,
+    output: &mut Option<CompilerStream>,
+) {
+    if output.is_none() {
+        *output = match receiver.try_recv() {
+            Ok(captured) => Some(captured),
+            Err(std::sync::mpsc::TryRecvError::Empty) => None,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Some(CompilerStream::unavailable())
+            }
+        };
+    }
+}
+
+/// Never join a thread that may be blocked in inherited stdout/stderr. Observe
+/// the child AND the original caller while the relays run; a terminal status
+/// starts a single bounded drain window for both streams. The caller MUST exit
+/// the process on an incomplete result/error, which ends any blocked relays.
+/// This is private to the short-lived wrapper, not a reusable detached-IO API.
+fn collect_compiler_output(
+    mut poll_child: impl FnMut() -> io::Result<Option<std::process::ExitStatus>>,
+    stdout: std::sync::mpsc::Receiver<CompilerStream>,
+    stderr: std::sync::mpsc::Receiver<CompilerStream>,
+    owned: impl Fn() -> bool,
+    drain_budget: Duration,
+) -> io::Result<CompilerOutput> {
+    let mut terminal = None;
+    let mut drain_deadline = None;
+    let mut out = None;
+    let mut err = None;
+    loop {
+        if !owned() {
+            return Err(io::Error::other("original compiler caller disappeared"));
+        }
+        if terminal.is_none() {
+            match poll_child() {
+                Ok(Some(status)) => {
+                    terminal = Some(status);
+                    drain_deadline = Some(Instant::now().checked_add(drain_budget).ok_or_else(
+                        || io::Error::other("compiler output deadline is not representable"),
+                    )?);
+                }
+                Ok(None) => {}
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error),
+            }
+        }
+        collect_stream(&stdout, &mut out);
+        collect_stream(&stderr, &mut err);
+        if let Some(status) = terminal {
+            let expired = drain_deadline.is_some_and(|deadline| Instant::now() >= deadline);
+            if (out.is_some() && err.is_some()) || expired {
+                // Recheck after the last observation, before returning a result
+                // that could lead to capture/publication consent.
+                if !owned() {
+                    return Err(io::Error::other("original compiler caller disappeared"));
+                }
+                return Ok(CompilerOutput {
+                    status,
+                    stdout: out.unwrap_or_else(CompilerStream::unavailable),
+                    stderr: err.unwrap_or_else(CompilerStream::unavailable),
+                });
+            }
+        }
+        let pause = drain_deadline.map_or(COMPILER_POLL, |deadline| {
+            COMPILER_POLL.min(deadline.saturating_duration_since(Instant::now()))
+        });
+        std::thread::sleep(pause);
+    }
 }
 
 /// Terminate exactly as the compiler did: its exit code, or its signal.
@@ -957,8 +1086,9 @@ fn exit_like(status: std::process::ExitStatus) -> ! {
 
 /// Run the admitted compiler with exact environment and live streams, then
 /// retain output custody until the daemon has captured immutable bytes.
-/// Overflowed, abandoned or unacknowledged captures are never published;
-/// cache-population failure does not change the compiler's actual status.
+/// Overflowed, abandoned or unacknowledged captures are never published.
+/// Cache-population failure preserves compiler status; incomplete IO delivery
+/// refuses an otherwise successful result. Nonzero compiler exits/signals win.
 fn run_attempt(
     real_rustc: &OsStr,
     args: &[OsString],
@@ -981,24 +1111,55 @@ fn run_attempt(
     };
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
-    let out = std::thread::spawn(move || match stdout {
-        Some(pipe) => tee(pipe, io::stdout()),
-        None => (Vec::new(), true),
+    let (out_tx, out_rx) = std::sync::mpsc::sync_channel(1);
+    let (err_tx, err_rx) = std::sync::mpsc::sync_channel(1);
+    let out = std::thread::Builder::new().spawn(move || {
+        let capture = match stdout {
+            // Hold stdout's lock through the relay. On process exit Rust's
+            // best-effort stdout cleanup must not flush a buffer concurrently
+            // with a blocked relay (including between its write and flush).
+            Some(pipe) => tee(pipe, io::stdout().lock()),
+            None => CompilerStream::unavailable(),
+        };
+        let _ = out_tx.send(capture);
     });
-    let err = std::thread::spawn(move || match stderr {
-        Some(pipe) => tee(pipe, io::stderr()),
-        None => (Vec::new(), true),
+    let err = std::thread::Builder::new().spawn(move || {
+        let capture = match stderr {
+            Some(pipe) => tee(pipe, io::stderr().lock()),
+            None => CompilerStream::unavailable(),
+        };
+        let _ = err_tx.send(capture);
     });
-    let status = match child.wait() {
-        Ok(status) => status,
-        Err(error) => {
-            eprintln!("rabs-wrap: wait for compiler: {error}");
+    if out.is_err() || err.is_err() {
+        drop(session);
+        // No fallback/replay after spawn. Exiting also releases a partial
+        // relay setup; the Linux compiler guard observes its wrapper's death.
+        std::process::exit(1);
+    }
+    let output = match collect_compiler_output(
+        || child.try_wait(),
+        out_rx,
+        err_rx,
+        || owner.can_acknowledge_capture(),
+        OUTPUT_DRAIN_BUDGET,
+    ) {
+        Ok(output) => output,
+        Err(_) => {
+            drop(session);
+            // Do not print or join here: a relay may hold the stderr lock
+            // while its consumer is stalled. Process exit ends the relays;
+            // the existing guard owns compiler-group cancellation, not us.
             std::process::exit(1);
         }
     };
-    let (stdout, out_overflow) = out.join().unwrap_or((Vec::new(), true));
-    let (stderr, err_overflow) = err.join().unwrap_or((Vec::new(), true));
-    if !out_overflow && !err_overflow {
+    if !output.delivered() {
+        drop(session);
+        if output.status.success() {
+            std::process::exit(EXIT_OUTPUT_INCOMPLETE);
+        }
+        exit_like(output.status);
+    }
+    if output.capture_eligible() {
         use std::os::unix::process::ExitStatusExt;
         let number =
             |value: Option<i32>| value.map_or_else(|| "null".to_owned(), |v| v.to_string());
@@ -1006,10 +1167,10 @@ fn run_attempt(
             "{{\"kind\":\"rustc-complete\",\"capture_protocol\":1,\"attempt\":{},\"exit_code\":{},\"signal\":{},\
              \"stdout_hex\":\"{}\",\"stderr_hex\":\"{}\"}}\n",
             json_string(attempt),
-            number(status.code()),
-            number(status.signal()),
-            hex_encode(&stdout),
-            hex_encode(&stderr),
+            number(output.status.code()),
+            number(output.status.signal()),
+            hex_encode(&output.stdout.bytes),
+            hex_encode(&output.stderr.bytes),
         );
         // A report is not publication consent. Hold Cargo's output lifetime
         // until capture is acknowledged, using one bounded deadline. No ACK
@@ -1019,7 +1180,7 @@ fn run_attempt(
         });
     }
     drop(session);
-    exit_like(status);
+    exit_like(output.status);
 }
 
 fn main() {
@@ -1087,6 +1248,260 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn delivered_stream(bytes: &[u8]) -> CompilerStream {
+        CompilerStream {
+            bytes: bytes.to_vec(),
+            overflowed: false,
+            delivered: true,
+        }
+    }
+
+    fn compiler_status(code: i32) -> std::process::ExitStatus {
+        use std::os::unix::process::ExitStatusExt;
+        std::process::ExitStatus::from_raw(code << 8)
+    }
+
+    #[test]
+    fn compiler_tee_preserves_binary_bytes_and_unterminated_output() {
+        for bytes in [b"".as_slice(), b"\0\xff\r\ncompiler\x1b[0m"] {
+            let mut sink = Vec::new();
+            let capture = tee(bytes, &mut sink);
+            assert_eq!(sink, bytes);
+            assert_eq!(capture.bytes, bytes);
+            assert!(capture.delivered);
+            assert!(!capture.overflowed);
+        }
+    }
+
+    #[test]
+    fn compiler_tee_overflow_only_disables_caching_and_keeps_an_exact_prefix() {
+        let bytes = (0..MAX_CAPTURE_BYTES + 19)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        let mut sink = Vec::new();
+        let capture = tee(bytes.as_slice(), &mut sink);
+        assert_eq!(sink, bytes);
+        assert_eq!(capture.bytes, bytes[..MAX_CAPTURE_BYTES]);
+        assert!(capture.delivered && capture.overflowed);
+        let output = CompilerOutput {
+            status: compiler_status(0),
+            stdout: delivered_stream(b""),
+            stderr: capture,
+        };
+        assert!(output.delivered() && output.status.success());
+        assert!(!output.capture_eligible());
+        let exact = tee(&bytes[..MAX_CAPTURE_BYTES], io::sink());
+        assert!(exact.delivered && !exact.overflowed);
+    }
+
+    struct FailedSink {
+        writes: usize,
+        flushes: usize,
+        fail_flush: bool,
+    }
+
+    impl Write for FailedSink {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.writes += 1;
+            if self.fail_flush {
+                Ok(bytes.len())
+            } else {
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed output"))
+            }
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.flushes += 1;
+            Err(io::Error::other("failed output flush"))
+        }
+    }
+
+    #[test]
+    fn compiler_tee_drains_after_write_or_flush_failure_without_retrying_delivery() {
+        for fail_flush in [false, true] {
+            let bytes = vec![b'x'; 32 * 1024];
+            let mut source = io::Cursor::new(&bytes);
+            let mut sink = FailedSink {
+                writes: 0,
+                flushes: 0,
+                fail_flush,
+            };
+            let capture = tee(&mut source, &mut sink);
+            assert_eq!(source.position(), bytes.len() as u64);
+            assert_eq!(capture.bytes, bytes);
+            assert!(!capture.delivered);
+            assert!(!capture.overflowed);
+            assert_eq!(sink.writes, 1, "do not repeat failed delivery");
+            assert_eq!(sink.flushes, usize::from(fail_flush));
+        }
+    }
+
+    #[test]
+    fn compiler_tee_read_error_is_not_eof_or_capture_overflow() {
+        struct FailedRead;
+        impl Read for FailedRead {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::other("broken compiler stream"))
+            }
+        }
+        let mut sink = Vec::new();
+        let capture = tee(b"prefix".as_slice().chain(FailedRead), &mut sink);
+        assert_eq!(sink, b"prefix");
+        assert_eq!(capture.bytes, b"prefix");
+        assert!(!capture.delivered && !capture.overflowed);
+    }
+
+    #[test]
+    fn compiler_tee_retries_interrupted_io_without_duplicating_bytes() {
+        struct InterruptedSink {
+            bytes: Vec<u8>,
+            write_interrupted: bool,
+            flush_interrupted: bool,
+        }
+        impl Write for InterruptedSink {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if !self.write_interrupted {
+                    self.write_interrupted = true;
+                    return Err(io::ErrorKind::Interrupted.into());
+                }
+                let count = bytes.len().min(3);
+                self.bytes.extend_from_slice(&bytes[..count]);
+                Ok(count)
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                if !self.flush_interrupted {
+                    self.flush_interrupted = true;
+                    return Err(io::ErrorKind::Interrupted.into());
+                }
+                Ok(())
+            }
+        }
+        let mut sink = InterruptedSink {
+            bytes: Vec::new(),
+            write_interrupted: false,
+            flush_interrupted: false,
+        };
+        let bytes = b"partial\0binary\xffoutput";
+        let capture = tee(bytes.as_slice(), &mut sink);
+        assert!(capture.delivered && !capture.overflowed);
+        assert_eq!(sink.bytes, bytes);
+        assert_eq!(capture.bytes, bytes);
+    }
+
+    #[test]
+    fn compiler_stream_eof_does_not_start_a_running_compilers_drain_deadline() {
+        let (out_tx, out_rx) = std::sync::mpsc::channel();
+        let (err_tx, err_rx) = std::sync::mpsc::channel();
+        out_tx.send(delivered_stream(b"out")).unwrap();
+        err_tx.send(delivered_stream(b"err")).unwrap();
+        let mut polls = 0;
+        let result = collect_compiler_output(
+            || {
+                polls += 1;
+                Ok((polls == 3).then(|| compiler_status(0)))
+            },
+            out_rx,
+            err_rx,
+            || true,
+            Duration::ZERO,
+        )
+        .unwrap();
+        assert_eq!(polls, 3);
+        assert!(result.status.success() && result.capture_eligible());
+        assert_eq!(result.stdout.bytes, b"out");
+        assert_eq!(result.stderr.bytes, b"err");
+    }
+
+    #[test]
+    fn compiler_terminal_status_bounds_either_held_stream_without_masking_failure() {
+        use std::os::unix::process::ExitStatusExt;
+        for raw_status in [0, 41 << 8, 15] {
+            for held_stdout in [false, true] {
+                let (out_tx, out_rx) = std::sync::mpsc::channel();
+                let (err_tx, err_rx) = std::sync::mpsc::channel();
+                if held_stdout {
+                    err_tx.send(delivered_stream(b"err")).unwrap();
+                } else {
+                    out_tx.send(delivered_stream(b"out")).unwrap();
+                }
+                let result = collect_compiler_output(
+                    || Ok(Some(std::process::ExitStatus::from_raw(raw_status))),
+                    out_rx,
+                    err_rx,
+                    || true,
+                    Duration::ZERO,
+                )
+                .unwrap();
+                assert_eq!(result.status.into_raw(), raw_status);
+                assert!(!result.delivered() && !result.capture_eligible());
+                assert_eq!(result.stdout.delivered, !held_stdout);
+                assert_eq!(result.stderr.delivered, held_stdout);
+            }
+        }
+    }
+
+    #[test]
+    fn compiler_output_wait_observes_caller_loss_before_and_after_child_exit() {
+        use std::cell::Cell;
+        for completed in [false, true] {
+            let (out_tx, out_rx) = std::sync::mpsc::channel();
+            let (err_tx, err_rx) = std::sync::mpsc::channel();
+            let owned = Cell::new(true);
+            let error = collect_compiler_output(
+                || {
+                    owned.set(false);
+                    Ok(completed.then(|| compiler_status(0)))
+                },
+                out_rx,
+                err_rx,
+                || owned.get(),
+                Duration::ZERO,
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("caller disappeared"));
+            drop((out_tx, err_tx));
+        }
+        let (out_tx, out_rx) = std::sync::mpsc::channel();
+        let (err_tx, err_rx) = std::sync::mpsc::channel();
+        assert!(collect_compiler_output(
+            || panic!("lost owner must not poll or start work"),
+            out_rx,
+            err_rx,
+            || false,
+            Duration::ZERO,
+        )
+        .is_err());
+        drop((out_tx, err_tx));
+    }
+
+    #[test]
+    fn compiler_output_wait_rejects_missing_relays_and_propagates_wait_errors() {
+        let (out_tx, out_rx) = std::sync::mpsc::channel();
+        let (err_tx, err_rx) = std::sync::mpsc::channel();
+        drop((out_tx, err_tx));
+        let result = collect_compiler_output(
+            || Ok(Some(compiler_status(0))),
+            out_rx,
+            err_rx,
+            || true,
+            Duration::ZERO,
+        )
+        .unwrap();
+        assert!(!result.delivered() && !result.capture_eligible());
+        let (out_tx, out_rx) = std::sync::mpsc::channel();
+        let (err_tx, err_rx) = std::sync::mpsc::channel();
+        let error = collect_compiler_output(
+            || Err(io::Error::other("wait failed")),
+            out_rx,
+            err_rx,
+            || true,
+            Duration::ZERO,
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "wait failed");
+        drop((out_tx, err_tx));
+    }
 
     #[test]
     fn accepted_install_reply_requires_unambiguous_completion_authority() {

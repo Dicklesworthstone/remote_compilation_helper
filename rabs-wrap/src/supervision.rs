@@ -715,7 +715,7 @@ mod tests {
         // that has not actually stopped this member (e.g. pending fatal I/O).
         let mut member = Command::new("/bin/sleep")
             .arg("30")
-            .process_group(owned.child.id())
+            .process_group(i32::try_from(owned.child.id()).expect("compiler PID fits pid_t"))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())

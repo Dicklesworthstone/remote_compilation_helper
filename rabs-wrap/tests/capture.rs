@@ -137,8 +137,9 @@ impl Fixture {
         })
     }
 
-    fn spawn(&self, capture_wait_ms: u64) -> Running {
-        let child = Command::new(env!("CARGO_BIN_EXE_rabs-wrap"))
+    fn command(&self, capture_wait_ms: u64) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_rabs-wrap"));
+        command
             .arg(&self.compiler)
             .args(["--crate-name", "demo", "src/lib.rs"])
             .current_dir(self.root.path())
@@ -152,10 +153,12 @@ impl Fixture {
             .env("RABS_CAPTURE_WAIT_MS", capture_wait_ms.to_string())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        Running(Some(child))
+            .stderr(Stdio::piped());
+        command
+    }
+
+    fn spawn(&self, capture_wait_ms: u64) -> Running {
+        Running(Some(self.command(capture_wait_ms).spawn().unwrap()))
     }
 
     fn assert_once(&self, output: &Output, code: i32, token: &[u8]) {
@@ -279,4 +282,116 @@ fn old_daemon_hit_is_declined_before_accepting_output_writes() {
     let output = fixture.spawn(5000).output();
     daemon.join().unwrap();
     fixture.assert_once(&output, 7, b"original");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn failed_output_delivery_refuses_success_but_preserves_compiler_failures() {
+    for compiler_code in [0, 7] {
+        for fail_stderr in [false, true] {
+            let fixture = Fixture::new(compiler_code);
+            std::fs::write(
+                &fixture.compiler,
+                format!(
+                    "#!/bin/sh\nprintf 'run\\n' >> runs\nprintf stdout\nprintf stderr >&2\nexit {compiler_code}\n"
+                ),
+            )
+            .unwrap();
+            let daemon = fixture.daemon(true, |peer| {
+                assert!(read(peer).is_none(), "lost output cannot request capture");
+            });
+            let full = std::fs::OpenOptions::new()
+                .write(true)
+                .open("/dev/full")
+                .unwrap();
+            let mut command = fixture.command(5000);
+            command.stdout(Stdio::null()).stderr(Stdio::null());
+            if fail_stderr {
+                command.stderr(full);
+            } else {
+                command.stdout(full);
+            }
+            let output = Running(Some(command.spawn().unwrap())).output();
+            daemon.join().unwrap();
+            let expected = if compiler_code == 0 { 122 } else { 7 };
+            assert_eq!(output.status.code(), Some(expected));
+            assert_eq!(std::fs::read(fixture.root.path().join("runs")).unwrap(), b"run\n");
+        }
+    }
+}
+
+#[test]
+fn exited_compiler_cannot_leave_wrapper_joining_a_stalled_output_consumer() {
+    use std::os::fd::OwnedFd;
+
+    for stall_stderr in [false, true] {
+        let fixture = Fixture::new(0);
+        std::fs::write(
+            &fixture.compiler,
+            "#!/bin/sh\nprintf 'run\\n' >> runs\nprintf stdout\nprintf stderr >&2\nprintf done > finished\n",
+        )
+        .unwrap();
+        let daemon = fixture.daemon(true, |peer| {
+            assert!(read(peer).is_none(), "incomplete delivery cannot consent to publication");
+        });
+        // Fill an inherited output stream BEFORE launching the wrapper. Keep
+        // the consumer alive and unread until the wrapper exits; this is real
+        // backpressure, not a delay that disappears on a quiet host. Small
+        // compiler writes still fit into its separate interposed relay pipes.
+        let (consumer, mut producer) = UnixStream::pair().unwrap();
+        producer.set_nonblocking(true).unwrap();
+        loop {
+            match producer.write(b"x") {
+                Ok(1) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                result => panic!("fill inherited stream: {result:?}"),
+            }
+        }
+        producer.set_nonblocking(false).unwrap();
+        let sink = Stdio::from(OwnedFd::from(producer));
+        let mut command = fixture.command(5000);
+        command.stdout(Stdio::null()).stderr(Stdio::null());
+        if stall_stderr {
+            command.stderr(sink);
+        } else {
+            command.stdout(sink);
+        }
+        let output = Running(Some(command.spawn().unwrap())).output();
+        // Only now release the blocked relay's consumer. Running::output's
+        // outer deadline fails the old unbounded join implementation.
+        drop(consumer);
+        daemon.join().unwrap();
+        assert_eq!(output.status.code(), Some(122));
+        assert_eq!(std::fs::read(fixture.root.path().join("finished")).unwrap(), b"done");
+        assert_eq!(std::fs::read(fixture.root.path().join("runs")).unwrap(), b"run\n");
+    }
+}
+
+#[test]
+fn large_binary_streams_stay_successful_and_complete_without_cache_publication() {
+    let fixture = Fixture::new(0);
+    let bytes: Vec<u8> = (0..1024 * 1024 + 37).map(|index| (index % 251) as u8).collect();
+    std::fs::write(fixture.root.path().join("input"), &bytes).unwrap();
+    std::fs::write(
+        &fixture.compiler,
+        "#!/bin/sh\nprintf 'run\\n' >> runs\ncat input &\ncat input >&2 &\nwait\n",
+    )
+    .unwrap();
+    let daemon = fixture.daemon(true, |peer| {
+        assert!(read(peer).is_none(), "overflow disables optional capture only");
+    });
+    // Files avoid introducing the very pipe backpressure this case does NOT
+    // exercise. Both raw output streams exceed the optional capture budget.
+    let stdout = fixture.root.path().join("stdout");
+    let stderr = fixture.root.path().join("stderr");
+    let mut command = fixture.command(5000);
+    command
+        .stdout(std::fs::File::create(&stdout).unwrap())
+        .stderr(std::fs::File::create(&stderr).unwrap());
+    let output = Running(Some(command.spawn().unwrap())).output();
+    daemon.join().unwrap();
+    assert!(output.status.success());
+    assert_eq!(std::fs::read(stdout).unwrap(), bytes);
+    assert_eq!(std::fs::read(stderr).unwrap(), bytes);
+    assert_eq!(std::fs::read(fixture.root.path().join("runs")).unwrap(), b"run\n");
 }
