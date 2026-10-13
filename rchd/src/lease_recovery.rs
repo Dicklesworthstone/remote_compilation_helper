@@ -944,7 +944,12 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn recovery_scan_uses_canonical_regular_journals_and_oldest_owner_first() {
-        let dir = tempfile::tempdir().unwrap();
+        // The socket fixture's path must fit sockaddr_un (104 bytes on macOS,
+        // where the default TMPDIR alone is ~49).
+        let dir = tempfile::Builder::new()
+            .prefix("rch-lease-")
+            .tempdir_in("/tmp")
+            .unwrap();
         let now = 100 * 60 * 60 * 1000;
         let oldest = handoff_lease(0, 11, 102);
         let newer = handoff_lease(now - 30 * 60 * 1000, 11, 102);
