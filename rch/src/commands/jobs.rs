@@ -462,10 +462,22 @@ async fn run_unix(action: Option<JobsAction>, ctx: &OutputContext) -> Result<()>
         let writer = DurableLeaseWriter::load(&wrapper_id)?;
         let lease = writer.snapshot();
         if lease.terminal_acknowledged {
-            emit(
-                ctx,
-                &writer.terminal_job_report(&wrapper_id, "completed", None)?,
-            )?;
+            // The daemon refused before admission: no remote command ran, so
+            // there is no remote exit to report or recover.
+            let report = if lease.state
+                == rch_common::job_identity::JobLifecycleState::FailedBeforeAdmission
+            {
+                json!({
+                    "status": "failed_before_admission",
+                    "identity": lease.identity,
+                    "exit_code": null,
+                    "terminal_acknowledged": true,
+                    "admission": null,
+                })
+            } else {
+                writer.terminal_job_report(&wrapper_id, "completed", None)?
+            };
+            emit(ctx, &report)?;
             return Ok(());
         }
         if !cancel && waiting_for_admission(&lease, process_matches(&lease))? {

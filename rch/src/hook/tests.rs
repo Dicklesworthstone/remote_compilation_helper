@@ -3013,6 +3013,52 @@ async fn retry_selection_cancelled_response_requires_explicit_terminal_receipt()
 }
 
 #[test]
+fn a_selection_refusal_retires_only_an_unadmitted_lease() {
+    use rch_common::job_identity::JobLifecycleState;
+
+    let directory = tempfile::tempdir().unwrap();
+    let writer = queued_selection_test_lease(directory.path().join("lease.json"));
+    writer.confirm_failed_before_admission().unwrap();
+    let disk = read_retry_lease(&writer);
+    assert_eq!(disk.state, JobLifecycleState::FailedBeforeAdmission);
+    assert!(disk.state.is_terminal() && disk.terminal_acknowledged);
+    assert_eq!(disk.phase, "failed_before_admission");
+    assert!(disk.exit_code.is_none(), "no remote command ran");
+    assert!(disk.identity.remote_build_id.is_none() && disk.worker_id.is_none());
+    assert!(writer.heartbeat("admission").is_err());
+    assert!(writer.confirm_failed_before_admission().is_err());
+    assert!(writer.confirm_selection_cancelled().is_err());
+    assert_eq!(read_retry_lease(&writer), disk);
+
+    let admitted = queued_selection_test_lease(directory.path().join("admitted.json"));
+    admitted
+        .admit(42, &WorkerId::new("admitted-worker"))
+        .unwrap();
+    let before = read_retry_lease(&admitted);
+    assert!(admitted.confirm_failed_before_admission().is_err());
+    assert_eq!(read_retry_lease(&admitted), before);
+}
+
+#[tokio::test]
+async fn a_refused_retry_selection_keeps_the_previous_admission() {
+    let directory = tempfile::tempdir().unwrap();
+    let writer = retry_selection_test_lease(directory.path().join("lease.json"));
+    let previous = writer.snapshot();
+    let response = dispatch_retry_selection(&writer, true, async || {
+        Ok(SelectionResponse {
+            reason: SelectionReason::SelectionError("queue_timeout".into()),
+            ..retry_unassigned_response()
+        })
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(response.worker.is_none());
+    assert!(writer.confirm_failed_before_admission().is_err());
+    assert_eq!(read_retry_lease(&writer), previous);
+}
+
+#[test]
 fn retry_selection_old_observed_completion_cannot_acknowledge_new_admission() {
     let directory = tempfile::tempdir().unwrap();
     let writer = retry_selection_test_lease(directory.path().join("lease.json"));

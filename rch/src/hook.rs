@@ -2029,6 +2029,32 @@ impl DurableLeaseWriter {
         self.publish_transition(&mut lease, next).map(|()| true)
     }
 
+    /// The daemon answered this attempt's selection without a worker or build
+    /// id (queue timeout, no admissible worker, restart barrier still closed).
+    /// Every such reply is sent after the daemon dropped any queued row for
+    /// this wrapper, so no remote build can start for it. Record that before
+    /// the local run or refusal: a nonterminal lease of a live wrapper blocks
+    /// daemon restart for the whole local fallback, and stays `queued` in
+    /// `rch jobs` forever once the wrapper exits. No exit code is recorded,
+    /// because no remote command ran.
+    pub(crate) fn confirm_failed_before_admission(&self) -> anyhow::Result<()> {
+        let mut lease = self.lease.lock().unwrap_or_else(|p| p.into_inner());
+        anyhow::ensure!(
+            !selection_is_pending(&lease)
+                && lease.identity.remote_build_id.is_none()
+                && lease.worker_id.is_none()
+                && lease.recovery.is_none()
+                && lease.exit_code.is_none()
+                && !lease.terminal_acknowledged,
+            "a selection refusal cannot retire a pending, admitted or completed lease"
+        );
+        let mut next = lease.clone();
+        next.state = rch_common::job_identity::JobLifecycleState::FailedBeforeAdmission;
+        next.heartbeat("failed_before_admission", now_unix_ms());
+        next.terminal_acknowledged = true;
+        self.publish_transition(&mut lease, next)
+    }
+
     pub(crate) fn heartbeat(&self, phase: &str) -> anyhow::Result<()> {
         let mut lease = self
             .lease
@@ -3939,6 +3965,9 @@ pub async fn run_exec(
             // compiling locally on the orchestrator.
             if job && !require_remote {
                 reason = format!("job admission exhausted: {reason}");
+            }
+            if let Err(error) = durable_lease.confirm_failed_before_admission() {
+                debug!("Durable lease left open after selection refusal: {error:#}");
             }
             exit_with_gated_local_fallback(
                 &command,
