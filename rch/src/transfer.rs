@@ -232,6 +232,9 @@ struct ArtifactFilters {
 
 impl ArtifactFilters {
     fn selects(&self, path: &str) -> bool {
+        if is_internal_source_archive(Path::new(path)) {
+            return false;
+        }
         self.priority
             .iter()
             .any(|filter| filter.matches(path, false))
@@ -241,6 +244,11 @@ impl ArtifactFilters {
                 .any(|filter| filter.matches(path, false))
                 && !self.excludes.iter().any(|filter| filter.excludes(path)))
     }
+}
+
+pub(crate) fn is_internal_source_archive(path: &Path) -> bool {
+    path.components()
+        .any(|part| part.as_os_str() == ".rch-clean-overlay-base.tar")
 }
 
 fn windows_artifact_relative_path(path: &str) -> Result<&str> {
@@ -3185,23 +3193,19 @@ impl TransferPipeline {
         worker: &WorkerConfig,
         remote_path: &str,
         patterns: &[String],
-    ) -> RetryConfig {
+    ) -> Result<RetryConfig> {
+        self.retrieval_retry_config(|| self.build_retrieve_command(worker, remote_path, patterns))
+            .await
+    }
+
+    async fn retrieval_retry_config(&self, command: impl Fn() -> Command) -> Result<RetryConfig> {
         let fallback = self.effective_rsync_retry_config();
-        // An explicit operator ceiling remains the whole retrieval budget:
-        // do not spend an additional planning window before starting it.
-        if self
-            .transfer_config
-            .max_transfer_time_ms
-            .is_some_and(|ms| ms > 0)
-        {
-            return fallback;
-        }
         let estimate = self
             .execute_retrieval_rsync(
                 &fallback,
                 "estimate_artifact_retrieval",
                 || {
-                    let mut cmd = self.build_retrieve_command(worker, remote_path, patterns);
+                    let mut cmd = command();
                     cmd.arg("--dry-run");
                     cmd
                 },
@@ -3213,13 +3217,14 @@ impl TransferPipeline {
                 if let Some(bytes) =
                     parse_rsync_selected_size(&String::from_utf8_lossy(&output.stdout))
                 {
+                    self.check_retrieval_space(bytes)?;
                     let retry = self.artifact_retry_config_for_size(bytes);
                     info!(
                         selected_bytes = bytes,
                         total_timeout_ms = retry.total_timeout_ms,
                         "Artifact retrieval budget from selected remote files"
                     );
-                    return retry;
+                    return Ok(retry);
                 }
                 warn!("Artifact size estimate missing; retaining configured retrieval budget");
             }
@@ -3231,7 +3236,35 @@ impl TransferPipeline {
                 "Artifact size estimate failed: {error}; retaining configured retrieval budget"
             ),
         }
-        fallback
+        // Durable staging must fail closed if its selected size cannot be
+        // established. Ordinary non-staged transfers retain the old fallback.
+        anyhow::ensure!(
+            self.project_root == self.retrieval_reference_root,
+            "cannot establish artifact size for durable retrieval staging; outputs and ownership retained"
+        );
+        Ok(fallback)
+    }
+
+    fn check_retrieval_space(&self, selected_bytes: u64) -> Result<()> {
+        #[cfg(unix)]
+        {
+            std::fs::create_dir_all(&self.project_root)?;
+            let stats = rustix::fs::statvfs(&self.project_root)?;
+            let available = stats.f_bavail.saturating_mul(stats.f_frsize);
+            let required = selected_bytes
+                .checked_add(self.transfer_config.retrieval_min_free_bytes)
+                .context("retrieval staging size overflow")?;
+            anyhow::ensure!(
+                available >= required,
+                "insufficient controller retrieval storage at {}: need {} bytes, available {}; outputs and ownership retained",
+                self.project_root.display(),
+                required,
+                available
+            );
+        }
+        #[cfg(not(unix))]
+        let _ = selected_bytes;
+        Ok(())
     }
 
     fn source_sync_attempt_timeout(&self, effective_excludes: &[String]) -> std::time::Duration {
@@ -5241,6 +5274,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
             let selected_size = selected
                 .values()
                 .fold(0_u64, |total, size| total.saturating_add(*size));
+            self.check_retrieval_space(selected_size)?;
             let retry = self.artifact_retry_config_for_size(selected_size);
             let deadline = started + Duration::from_millis(retry.total_timeout_ms);
             let archive = tempfile::Builder::new()
@@ -6084,6 +6118,11 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
             .arg(ssh_command);
         self.append_source_rsync_path(&mut cmd, &format!("{remote_path}/"));
 
+        // Internal immutable source input is never an output, even for old
+        // recovery recipes or priority includes. Match the reserved basename
+        // at every depth before any include rule can select it.
+        cmd.arg("--exclude").arg(".rch-clean-overlay-base.tar");
+
         // Add zstd compression (zlib on a legacy binary; issue #66)
         self.append_compression_args(&mut cmd, &capabilities);
 
@@ -6184,6 +6223,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
             .arg("-e")
             .arg(ssh_command);
         self.append_source_rsync_path(&mut cmd, &format!("{remote_path}/"));
+        cmd.arg("--exclude").arg(".rch-clean-overlay-base.tar");
 
         // Add zstd compression (zlib on a legacy binary; issue #66)
         self.append_compression_args(&mut cmd, &capabilities);
@@ -6362,7 +6402,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         // Execute rsync with retry logic for transient errors
         let retry_config = self
             .artifact_retry_config(worker, &remote_path, artifact_patterns)
-            .await;
+            .await?;
         let output = self
             .execute_retrieval_rsync(
                 &retry_config,
@@ -6456,6 +6496,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         add_portable_rsync_archive_args(&mut cmd);
         cmd.arg("--stats")
             .arg("--safe-links")
+            .arg("--exclude=.rch-clean-overlay-base.tar")
             .arg("-e")
             .arg(ssh_command);
 
@@ -7458,7 +7499,11 @@ except (AttributeError, OSError, RuntimeError, TypeError, ValueError) as error:
         }
 
         let start = std::time::Instant::now();
-        let retry_config = self.effective_rsync_retry_config();
+        let retry_config = self
+            .retrieval_retry_config(|| {
+                self.build_result_dir_retrieve_command(worker, &remote_path, rel)
+            })
+            .await?;
         let output = self
             .execute_retrieval_rsync(
                 &retry_config,
@@ -7580,7 +7625,7 @@ except (AttributeError, OSError, RuntimeError, TypeError, ValueError) as error:
         let retrieval_start = std::time::Instant::now();
         let retry_config = self
             .artifact_retry_config(worker, &remote_path, artifact_patterns)
-            .await;
+            .await?;
         let output = if self.retrieval_control.is_some() {
             let output = self
                 .execute_retrieval_rsync(
@@ -17170,6 +17215,180 @@ Total file size: 123 bytes";
             parse_rsync_selected_size("Total file size: 0 bytes"),
             Some(0)
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clean_overlay_staging_space_refuses_without_deleting_outputs() {
+        let stage = tempfile::tempdir().unwrap().keep();
+        let retained = stage.join("retained-output");
+        std::fs::write(&retained, b"successful worker output").unwrap();
+        let pipeline = TransferPipeline::new(
+            stage,
+            "space".into(),
+            "identity".into(),
+            TransferConfig {
+                retrieval_min_free_bytes: u64::MAX - 1,
+                ..Default::default()
+            },
+        );
+        let error = pipeline.check_retrieval_space(1).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("insufficient controller retrieval storage")
+        );
+        assert_eq!(
+            std::fs::read(retained).unwrap(),
+            b"successful worker output"
+        );
+        assert!(
+            pipeline
+                .check_retrieval_space(2)
+                .unwrap_err()
+                .to_string()
+                .contains("overflow")
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn clean_overlay_make_real_rsync_excludes_archive_and_preserves_outputs() {
+        let _guard = test_guard!();
+        let _transport = RealTransport::pin();
+        let retained = tempfile::tempdir().unwrap().keep();
+        let source = retained.join("source");
+        let caller = retained.join("caller");
+        let stage = retained.join("durable-stage");
+        std::fs::create_dir_all(source.join("build")).unwrap();
+        std::fs::create_dir_all(&caller).unwrap();
+        std::fs::create_dir_all(&stage).unwrap();
+        std::fs::write(caller.join("main.c"), b"caller source").unwrap();
+        std::fs::write(source.join("main.c"), b"worker source").unwrap();
+        std::fs::write(source.join("Makefile"), b"all:\n\tprintf output > build/unit\n\tprintf object > unit.o\n\tprintf library > libunit.a\n\tprintf executable > a.out\n").unwrap();
+        std::fs::copy(source.join("Makefile"), caller.join("Makefile")).unwrap();
+        assert!(
+            Command::new("make")
+                .arg("-C")
+                .arg(&source)
+                .status()
+                .await
+                .unwrap()
+                .success()
+        );
+        std::fs::write(source.join("release.tar"), b"legitimate Make package").unwrap();
+        for archive in [
+            ".rch-clean-overlay-base.tar",
+            "build/.rch-clean-overlay-base.tar",
+        ] {
+            std::fs::File::create(source.join(archive))
+                .unwrap()
+                .set_len(112_000_000)
+                .unwrap();
+        }
+        let pipeline = TransferPipeline::new(
+            caller.clone(),
+            "make".into(),
+            "clean".into(),
+            TransferConfig::default(),
+        )
+        .with_local_root(stage.clone());
+        let worker = worker_with_os(None);
+        // An old recipe has only the broad include rules. Reserved exclusions
+        // must still apply to its dry-run, transfer and staged publication.
+        let patterns: Vec<_> = default_c_cpp_artifact_patterns()
+            .into_iter()
+            .filter(|pattern| !pattern.starts_with("- "))
+            .collect();
+        for streaming in [false, true] {
+            let mut cmd = if streaming {
+                pipeline.build_retrieve_streaming_command(
+                    &worker,
+                    source.to_str().unwrap(),
+                    &patterns,
+                )
+            } else {
+                pipeline.build_retrieve_command(&worker, source.to_str().unwrap(), &patterns)
+            };
+            cmd.args([
+                "-e",
+                r#"sh -c 'if [ "$1" = -l ]; then shift 2; fi; shift; exec "$@"' rch-local-peer"#,
+            ]);
+            let output = execute_rsync_attempt(cmd).await.unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(!stage.join(".rch-clean-overlay-base.tar").exists());
+            assert!(!stage.join("build/.rch-clean-overlay-base.tar").exists());
+            for file in ["build/unit", "unit.o", "libunit.a", "a.out", "release.tar"] {
+                assert_eq!(
+                    std::fs::read(stage.join(file)).unwrap(),
+                    std::fs::read(source.join(file)).unwrap()
+                );
+            }
+            assert!(!stage.join("main.c").exists());
+            assert!(!stage.join("Makefile").exists());
+        }
+        let paths = vec![
+            PathBuf::from(".rch-clean-overlay-base.tar"),
+            PathBuf::from("build/.rch-clean-overlay-base.tar"),
+            PathBuf::from("build/unit"),
+        ];
+        let (admitted, outside) = pipeline
+            .partition_staged_artifact_paths(&paths, &patterns)
+            .unwrap();
+        assert_eq!(admitted, vec![PathBuf::from("build/unit")]);
+        assert_eq!(outside.len(), 2);
+        let priority = vec![
+            "+ .rch-clean-overlay-base.tar".into(),
+            "+ build/.rch-clean-overlay-base.tar".into(),
+        ];
+        assert!(
+            pipeline
+                .validate_staged_artifact_paths(&paths[..2], &priority)
+                .is_err()
+        );
+        assert_eq!(
+            std::fs::metadata(source.join(".rch-clean-overlay-base.tar"))
+                .unwrap()
+                .len(),
+            112_000_000
+        );
+        assert_eq!(
+            std::fs::read(caller.join("main.c")).unwrap(),
+            b"caller source"
+        );
+        // Exercise production preflight in both entry points, with an explicit
+        // timeout too: a budget override must not bypass the storage refusal.
+        use std::os::unix::fs::PermissionsExt;
+        let rsync_peer = retained.join("local-rsync-peer");
+        std::fs::write(&rsync_peer, r#"#!/bin/sh
+exec /usr/bin/rsync "$@" -e "sh -c 'if [ \"\$1\" = -l ]; then shift 2; fi; shift; exec \"\$@\"' rch-local-peer"
+"#).unwrap();
+        std::fs::set_permissions(&rsync_peer, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut blocked = pipeline.with_remote_path_override(source.to_str().unwrap());
+        blocked.transfer_config.rsync_bin = Some(rsync_peer.to_string_lossy().into_owned());
+        blocked.transfer_config.max_transfer_time_ms = Some(900_000);
+        blocked.transfer_config.retrieval_min_free_bytes = u64::MAX / 2;
+        for streaming in [false, true] {
+            let result = if streaming {
+                blocked
+                    .retrieve_artifacts_streaming(&worker, &patterns, |_| {})
+                    .await
+            } else {
+                blocked.retrieve_artifacts(&worker, &patterns).await
+            };
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("insufficient controller retrieval storage")
+            );
+            assert_eq!(std::fs::read(stage.join("a.out")).unwrap(), b"executable");
+            assert!(!stage.join(".rch-clean-overlay-base.tar").exists());
+        }
     }
 
     #[cfg(target_os = "linux")]

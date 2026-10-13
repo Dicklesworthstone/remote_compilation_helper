@@ -2841,6 +2841,14 @@ impl Layer0Config {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransferConfig {
+    /// Durable controller retrieval staging base. Unset uses the job-lease
+    /// directory's retrieval subtree. Must be absolute; TMPDIR is not used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retrieval_staging_dir: Option<PathBuf>,
+    /// Free bytes to retain on the staging filesystem in addition to selected
+    /// uncompressed output bytes. The preflight never deletes retained data.
+    #[serde(default)]
+    pub retrieval_min_free_bytes: u64,
     /// zstd compression level (1-19).
     #[serde(default = "default_compression")]
     pub compression_level: u32,
@@ -2984,6 +2992,8 @@ pub struct TransferConfig {
 impl Default for TransferConfig {
     fn default() -> Self {
         Self {
+            retrieval_staging_dir: None,
+            retrieval_min_free_bytes: 0,
             compression_level: 3,
             exclude_patterns: default_excludes(),
             ssh_server_alive_interval_secs: None,

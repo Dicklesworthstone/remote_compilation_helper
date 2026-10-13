@@ -662,6 +662,8 @@ mod tests {
                 remote_build_jobs: "auto".to_string(),
             },
             transfer: ConfigTransferSection {
+                retrieval_staging_dir: None,
+                retrieval_min_free_bytes: 0,
                 compression_level: 3,
                 exclude_patterns: vec!["target/".to_string()],
                 remote_base: "/tmp/rch".to_string(),

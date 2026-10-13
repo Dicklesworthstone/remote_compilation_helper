@@ -1757,10 +1757,62 @@ impl RecoverySession {
         self.persist_next_recipe(next_recipe)
     }
     fn stage(&self, index: usize) -> PathBuf {
-        default_job_lease_directory()
-            .join("retrieval")
+        self.recipe
+            .transfer
+            .retrieval_staging_dir
+            .clone()
+            .unwrap_or_else(|| default_job_lease_directory().join("retrieval"))
             .join(&self.recipe.identity)
             .join(index.to_string())
+    }
+
+    /// Apply operator recovery settings under the exclusive journal claim.
+    /// Only extend the transfer budget; all output and source authority stays
+    /// bound to the original recipe. Never move or delete an old staging tree.
+    fn apply_retrieval_config(&mut self, current: &TransferConfig) -> anyhow::Result<()> {
+        let mut next = self.recipe.clone();
+        if let Some(timeout) = current.max_transfer_time_ms.filter(|value| *value > 0) {
+            anyhow::ensure!(
+                timeout <= 86_400_000,
+                "recovery transfer timeout must not exceed 24 hours"
+            );
+            let floor = next
+                .transfer
+                .max_transfer_time_ms
+                .unwrap_or(next.transfer.retry.total_timeout_ms);
+            if timeout > floor {
+                if next.transfer.max_transfer_time_ms.is_some() {
+                    next.transfer.max_transfer_time_ms = Some(timeout);
+                } else {
+                    // Preserve size-derived budgets: an extension of the
+                    // base must not introduce a smaller hard ceiling for a
+                    // large retained output set.
+                    next.transfer.retry.total_timeout_ms = timeout;
+                }
+            }
+        }
+        if let Some(root) = &current.retrieval_staging_dir {
+            anyhow::ensure!(
+                root.is_absolute(),
+                "transfer.retrieval_staging_dir must be absolute"
+            );
+            if next.transfer.retrieval_staging_dir.as_ref() != Some(root) {
+                anyhow::ensure!(
+                    !next.sources_released
+                        && next.returned.is_none()
+                        && next.phases.iter().all(|phase| !phase.complete
+                            && phase.published.is_empty()
+                            && phase.pending.is_none()),
+                    "cannot change retrieval staging after publication began; retained staging and ownership are unchanged"
+                );
+                next.transfer.retrieval_staging_dir = Some(root.clone());
+            }
+        }
+        next.transfer.retrieval_min_free_bytes = next
+            .transfer
+            .retrieval_min_free_bytes
+            .max(current.retrieval_min_free_bytes);
+        self.persist_next_recipe(next)
     }
     pub(crate) fn staging_pipeline(
         &self,
@@ -1774,6 +1826,10 @@ impl RecoverySession {
             .position(|phase| phase.name == name)
             .context("missing retrieval phase")?;
         let stage = self.stage(index);
+        anyhow::ensure!(
+            stage.is_absolute(),
+            "retrieval staging directory must be absolute"
+        );
         std::fs::create_dir_all(&stage)?;
         Ok(pipeline
             .clone()
@@ -1809,7 +1865,15 @@ impl RecoverySession {
             // pending rename can observe a redirected descendant as ours.
             validate_output_ancestors(&phase.local, relative)?;
         }
-        if phase.result_dir.is_none() {
+        if phase.result_dir.is_some() {
+            anyhow::ensure!(
+                phase.pending.as_ref().is_none_or(|(relative, _)| {
+                    !crate::transfer::is_internal_source_archive(relative)
+                }),
+                "internal source archive has a pending publication; retained evidence requires inspection"
+            );
+            files.retain(|relative| !crate::transfer::is_internal_source_archive(relative));
+        } else {
             // A resumed transfer can retain files selected by an older
             // collector. Ownership fingerprints alone do not authorize a
             // source file as an artifact, so only staged files the artifact
@@ -2213,6 +2277,14 @@ fn load_recipe(writer: &DurableLeaseWriter) -> anyhow::Result<RecoveryRecipe> {
         &recipe.identity,
     )?;
     anyhow::ensure!(
+        recipe
+            .transfer
+            .retrieval_staging_dir
+            .as_ref()
+            .is_none_or(|path| path.is_absolute()),
+        "persisted retrieval staging directory must be absolute"
+    );
+    anyhow::ensure!(
         recipe.retained_materialized.is_none() || recipe.retained_root.is_some(),
         "retained source acknowledgment has no original destination"
     );
@@ -2421,6 +2493,18 @@ pub(crate) async fn recover_job(
 }
 
 async fn recover_owned_job(writer: &DurableLeaseWriter) -> anyhow::Result<i32> {
+    // The recipe is reloaded after claim. Persist extensions before collection
+    // so a subsequent retry keeps them even without the invocation config.
+    if !writer.snapshot().terminal_acknowledged {
+        let config = crate::config::load_config()?;
+        let mut session = RecoverySession {
+            recipe: load_recipe(writer)?,
+            writer: writer.clone(),
+        };
+        if session.recipe.returned.is_none() {
+            session.apply_retrieval_config(&config.transfer)?;
+        }
+    }
     // Resolve lazily so an already acknowledged journal stays a read-only
     // operation, but pin the chosen endpoint across the entire handoff.
     let mut socket = None;
@@ -3635,6 +3719,139 @@ mod tests {
         let session = RecoverySession { recipe, writer };
         std::fs::create_dir(session.stage(0)).unwrap();
         (directory, stage_owner, session)
+    }
+
+    #[test]
+    fn clean_overlay_recovery_config_persists_extensions_and_retains_old_stage() {
+        let (_directory, _stage_owner, mut session) = publication_fixture();
+        let old = session.stage(0);
+        std::fs::write(old.join("worker-output"), b"retained").unwrap();
+        session.recipe.transfer.max_transfer_time_ms = Some(138_000);
+        let new = tempfile::tempdir().unwrap().keep();
+        let config = TransferConfig {
+            max_transfer_time_ms: Some(900_000),
+            retrieval_staging_dir: Some(new.clone()),
+            retrieval_min_free_bytes: 64 * 1024 * 1024,
+            ..Default::default()
+        };
+        let original_identity = session.recipe.identity.clone();
+        let original_phases = serde_json::to_value(&session.recipe.phases).unwrap();
+        session.apply_retrieval_config(&config).unwrap();
+        let mut reloaded = reload_publication(&session);
+        assert_eq!(reloaded.recipe.transfer.max_transfer_time_ms, Some(900_000));
+        assert_eq!(reloaded.stage(0), new.join(&original_identity).join("0"));
+        assert_eq!(
+            serde_json::to_value(&reloaded.recipe.phases).unwrap(),
+            original_phases
+        );
+        assert!(!reloaded.writer.snapshot().terminal_acknowledged);
+        assert_eq!(
+            std::fs::read(old.join("worker-output")).unwrap(),
+            b"retained"
+        );
+        reloaded
+            .apply_retrieval_config(&TransferConfig {
+                max_transfer_time_ms: Some(1),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(
+            load_recipe(&reloaded.writer)
+                .unwrap()
+                .transfer
+                .max_transfer_time_ms,
+            Some(900_000)
+        );
+        assert_eq!(
+            load_recipe(&reloaded.writer)
+                .unwrap()
+                .transfer
+                .retrieval_min_free_bytes,
+            64 * 1024 * 1024
+        );
+        reloaded.recipe.phases[0].pending = Some((PathBuf::from("worker-output"), "hash".into()));
+        assert!(
+            reloaded
+                .apply_retrieval_config(&TransferConfig {
+                    retrieval_staging_dir: Some(old),
+                    ..Default::default()
+                })
+                .is_err()
+        );
+        assert_eq!(reloaded.stage(0), new.join(original_identity).join("0"));
+        let journal = std::fs::read(&reloaded.writer.path).unwrap();
+        for invalid in [
+            TransferConfig {
+                retrieval_staging_dir: Some(PathBuf::from("relative")),
+                ..Default::default()
+            },
+            TransferConfig {
+                max_transfer_time_ms: Some(u64::MAX),
+                ..Default::default()
+            },
+        ] {
+            assert!(reloaded.apply_retrieval_config(&invalid).is_err());
+            assert_eq!(std::fs::read(&reloaded.writer.path).unwrap(), journal);
+        }
+    }
+
+    #[test]
+    fn clean_overlay_recovery_extension_preserves_adaptive_budget() {
+        let (_directory, _stage_owner, mut session) = publication_fixture();
+        session.recipe.transfer.max_transfer_time_ms = None;
+        session.recipe.transfer.retry.total_timeout_ms = 30_000;
+        session
+            .apply_retrieval_config(&TransferConfig {
+                max_transfer_time_ms: Some(60_000),
+                ..Default::default()
+            })
+            .unwrap();
+        let reloaded = reload_publication(&session);
+        assert!(reloaded.recipe.transfer.max_transfer_time_ms.is_none());
+        assert_eq!(reloaded.recipe.transfer.retry.total_timeout_ms, 60_000);
+        assert!(!reloaded.writer.snapshot().terminal_acknowledged);
+    }
+
+    #[tokio::test]
+    async fn clean_overlay_recovery_publication_skips_old_archive_without_acknowledging() {
+        let _guard = test_guard!();
+        let (_directory, _stage_owner, mut session) = publication_fixture();
+        let phases = session.recipe.phases.clone();
+        let project_root = session.recipe.project_root.clone();
+        let (_retained_directory, retained_writer, _worker) = retained_preparation_fixture();
+        session.recipe = load_recipe(&retained_writer).unwrap();
+        session.recipe.phases = phases;
+        session.recipe.project_root = project_root;
+        session.writer = retained_writer;
+        // Reproduce a persisted recipe from before the reserved exclusion.
+        session.recipe.phases[0].patterns = vec!["*".into(), "build/**".into()];
+        let stage = session.stage(0);
+        std::fs::create_dir_all(&stage).unwrap();
+        std::fs::write(
+            stage.join(".rch-clean-overlay-base.tar"),
+            b"immutable input",
+        )
+        .unwrap();
+        std::fs::write(stage.join("a.out"), b"worker executable").unwrap();
+        session.publish("project").await.unwrap();
+        assert_eq!(
+            std::fs::read(session.recipe.project_root.join("a.out")).unwrap(),
+            b"worker executable"
+        );
+        assert!(
+            !session
+                .recipe
+                .project_root
+                .join(".rch-clean-overlay-base.tar")
+                .exists()
+        );
+        assert!(!session.writer.snapshot().terminal_acknowledged);
+        assert!(!session.recipe.sources_released);
+        assert!(session.recipe.phases[0].complete);
+        assert_eq!(
+            std::fs::read(stage.join(".rch-clean-overlay-base.tar")).unwrap(),
+            b"immutable input"
+        );
     }
 
     fn reload_publication(session: &RecoverySession) -> RecoverySession {

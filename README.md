@@ -482,6 +482,39 @@ rch jobs cancel <wrapper-id>                   # cancel the identity-matched job
 rch jobs recover <wrapper-id> --timeout-secs 300
 ```
 
+For an unfinished detached retrieval, the current `[transfer]` configuration
+can extend the original recipe's `max_transfer_time_ms`. Recovery persists a
+larger positive budget under its exclusive journal lock; smaller values never
+shorten the retained budget. Recovery extensions are bounded to 24 hours.
+It keeps the original worker, build, output policy,
+verification settings and ownership evidence, and never replays compilation.
+Set `--timeout-secs` large enough for the entire recovery operation as well;
+that observation deadline is separate from the transfer budget.
+
+```toml
+[transfer]
+max_transfer_time_ms = 900000
+retrieval_staging_dir = "/mnt/controller-storage/rch-retrieval"
+retrieval_min_free_bytes = 67108864
+```
+
+`retrieval_staging_dir` is an absolute durable controller staging base, separate
+from the worker's `remote_base`, the checkout and `TMPDIR`. Unset uses the
+job-lease directory's `retrieval/` subtree. Before downloading, Unix retrieval
+checks the selected uncompressed file size plus `retrieval_min_free_bytes`
+against space available to the controller user. This preflight cannot reserve
+space against concurrent writers; a later storage failure remains retryable.
+Failure retains the outputs and ownership and does not acknowledge completion.
+Internal `.rch-clean-overlay-base.tar` source archives are excluded even when
+recovering an older broad Make artifact recipe.
+
+Recovery can redirect an old recipe's staging before any phase has published
+or recorded a pending publication. It leaves the old stage intact and collects
+the same worker outputs into the new location. Once publication begins, a
+location change is refused to preserve its pending and published evidence;
+extend its timeout or provide space on its existing filesystem instead.
+Terminal acknowledgment still requires verified delivery and source release.
+
 `rch --json jobs` reports valid leases alongside `journal_errors`. An unreadable
 or malformed journal, or an entry observed as nonregular, makes `complete` false
 and the command exits 1, while valid jobs remain visible in the same JSON document.
@@ -663,6 +696,10 @@ compression_level = 3
 # mirror — see `[remediation.pooled_target] store_base` below to place those
 # stores on another filesystem.
 remote_base = "/data/tmp/rch"
+# Optional durable controller staging base (absolute, independent of TMPDIR).
+# retrieval_staging_dir = "/mnt/controller-storage/rch-retrieval"
+# Free-space reserve in addition to the selected uncompressed outputs.
+# retrieval_min_free_bytes = 67108864
 # Optional per-attempt source-sync cap. When unset, the default is payload-aware:
 # 30 seconds plus one second per MiB, capped at one hour.
 # sync_timeout_ms = 120000

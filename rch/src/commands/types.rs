@@ -292,6 +292,8 @@ pub struct ConfigCompilationSection {
 /// Transfer configuration section.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct ConfigTransferSection {
+    pub retrieval_staging_dir: Option<std::path::PathBuf>,
+    pub retrieval_min_free_bytes: u64,
     pub compression_level: u32,
     pub exclude_patterns: Vec<String>,
     pub remote_base: String,

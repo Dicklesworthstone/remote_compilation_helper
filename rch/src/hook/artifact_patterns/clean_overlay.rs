@@ -160,7 +160,8 @@ mod tests {
         init.current_dir(&worker).args(["init", "-b", "main"]);
         run(init).await;
         let mut add = Command::new("git");
-        add.current_dir(&worker).args(["add", "source.c", "Makefile"]);
+        add.current_dir(&worker)
+            .args(["add", "source.c", "Makefile"]);
         run(add).await;
         let mut commit = Command::new("git");
         commit.current_dir(&worker).args([

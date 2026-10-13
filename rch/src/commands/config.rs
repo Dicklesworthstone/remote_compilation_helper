@@ -135,6 +135,8 @@ pub fn config_show(show_sources: bool, ctx: &OutputContext) -> Result<()> {
                 remote_build_jobs: config.compilation.remote_build_jobs.to_string(),
             },
             transfer: ConfigTransferSection {
+                retrieval_staging_dir: config.transfer.retrieval_staging_dir.clone(),
+                retrieval_min_free_bytes: config.transfer.retrieval_min_free_bytes,
                 compression_level: config.transfer.compression_level,
                 exclude_patterns: config.transfer.exclude_patterns.clone(),
                 remote_base: config.transfer.remote_base.clone(),
@@ -393,6 +395,14 @@ pub fn config_show(show_sources: bool, ctx: &OutputContext) -> Result<()> {
             &style.value(&format!("\"{}\"", config.transfer.remote_base)),
             &value_sources
         )
+    );
+    println!(
+        "  retrieval_staging_dir = {:?}",
+        config.transfer.retrieval_staging_dir
+    );
+    println!(
+        "  retrieval_min_free_bytes = {}",
+        config.transfer.retrieval_min_free_bytes
     );
 
     println!("\n{}", style.highlight("[environment]"));

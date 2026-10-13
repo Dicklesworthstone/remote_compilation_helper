@@ -728,6 +728,8 @@ struct PartialCompilationConfig {
 
 #[derive(Debug, Default, Deserialize)]
 struct PartialTransferConfig {
+    retrieval_staging_dir: Option<PathBuf>,
+    retrieval_min_free_bytes: Option<u64>,
     compression_level: Option<u32>,
     exclude_patterns: Option<Vec<String>>,
     remote_base: Option<String>,
@@ -1027,6 +1029,14 @@ pub fn validate_rch_config_file(path: &Path) -> FileValidation {
 
     if let Err(e) = validate_remote_base(&config.transfer.remote_base) {
         validation.error(format!("transfer.remote_base invalid: {}", e));
+    }
+    if config
+        .transfer
+        .retrieval_staging_dir
+        .as_ref()
+        .is_some_and(|path| !path.is_absolute())
+    {
+        validation.error("transfer.retrieval_staging_dir must be absolute".to_string());
     }
     if let Some(sync_timeout_ms) = config.transfer.sync_timeout_ms
         && !TransferConfig::valid_sync_timeout_ms(sync_timeout_ms)
@@ -1555,6 +1565,14 @@ fn apply_layer(
         config.transfer.ssh_control_persist_secs = Some(persist);
         set_source(sources, "transfer.ssh_control_persist_secs", source.clone());
     }
+    if let Some(path) = &layer.transfer.retrieval_staging_dir {
+        config.transfer.retrieval_staging_dir = Some(path.clone());
+        set_source(sources, "transfer.retrieval_staging_dir", source.clone());
+    }
+    if let Some(bytes) = layer.transfer.retrieval_min_free_bytes {
+        config.transfer.retrieval_min_free_bytes = bytes;
+        set_source(sources, "transfer.retrieval_min_free_bytes", source.clone());
+    }
     // Transfer optimization (bd-3hho)
     if let Some(max_mb) = layer.transfer.max_transfer_mb {
         config.transfer.max_transfer_mb = Some(max_mb);
@@ -1962,6 +1980,13 @@ fn merge_transfer(
     }
     if overlay.max_transfer_time_ms != default.max_transfer_time_ms {
         base.max_transfer_time_ms = overlay.max_transfer_time_ms;
+    }
+    if overlay.retrieval_staging_dir != default.retrieval_staging_dir {
+        base.retrieval_staging_dir
+            .clone_from(&overlay.retrieval_staging_dir);
+    }
+    if overlay.retrieval_min_free_bytes != default.retrieval_min_free_bytes {
+        base.retrieval_min_free_bytes = overlay.retrieval_min_free_bytes;
     }
     if overlay.bwlimit_kbps != default.bwlimit_kbps {
         base.bwlimit_kbps = overlay.bwlimit_kbps;
@@ -4107,6 +4132,34 @@ max_concurrent_workers = 3
         );
 
         info!("PASS: Custom exclude_patterns replace defaults");
+    }
+
+    #[test]
+    fn clean_overlay_retrieval_config_layering_and_roundtrip() {
+        let _guard = test_guard!();
+        let path = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(path.path(), "[transfer]\nretrieval_staging_dir = '/mnt/retrieval'\nretrieval_min_free_bytes = 67108864\nmax_transfer_time_ms = 900000\n").unwrap();
+        let config = load_config_uncached_from_paths(Some(path.path()), None).unwrap();
+        assert_eq!(
+            config.transfer.retrieval_staging_dir,
+            Some(PathBuf::from("/mnt/retrieval"))
+        );
+        assert_eq!(config.transfer.retrieval_min_free_bytes, 67108864);
+        assert_eq!(config.transfer.max_transfer_time_ms, Some(900000));
+        let roundtrip: RchConfig = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        assert_eq!(
+            roundtrip.transfer.retrieval_staging_dir,
+            config.transfer.retrieval_staging_dir
+        );
+        let old: TransferConfig = toml::from_str("").unwrap();
+        assert!(old.retrieval_staging_dir.is_none());
+        assert_eq!(old.retrieval_min_free_bytes, 0);
+        std::fs::write(
+            path.path(),
+            "[transfer]\nretrieval_staging_dir = 'relative'\n",
+        )
+        .unwrap();
+        assert!(!validate_rch_config_file(path.path()).errors.is_empty());
     }
 
     #[test]
