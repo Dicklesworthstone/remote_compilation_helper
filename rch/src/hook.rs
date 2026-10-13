@@ -728,7 +728,7 @@ async fn await_restart_admission(
     reporter: &HookReporter,
 ) -> RestartAdmissionWait {
     let mut polls: u32 = 0;
-    wait_for_restart_admission(
+    let outcome = wait_for_restart_admission(
         async || restart_admission_is_closed(socket_path).await,
         restart_admission_wait_bound(),
         std::time::Duration::from_secs(1),
@@ -742,7 +742,14 @@ async fn await_restart_admission(
             polls = polls.saturating_add(1);
         },
     )
-    .await
+    .await;
+    // Hand the lease back to admission. The selection query that follows can
+    // sit in the daemon queue for a long time without heartbeating, and a
+    // frozen "restart_admission_wait" would misdescribe a queued wrapper.
+    if outcome == RestartAdmissionWait::Open && polls > 0 {
+        let _ = durable_lease.heartbeat("admission");
+    }
+    outcome
 }
 
 fn exec_requires_remote() -> bool {

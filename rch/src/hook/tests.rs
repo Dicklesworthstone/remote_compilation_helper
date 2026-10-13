@@ -12720,6 +12720,53 @@ async fn fast_passthrough_answers_only_what_process_hook_plainly_allows() {
     assert!(!super::fast_passthrough_allows("{not json"));
 }
 
+#[tokio::test]
+async fn a_finished_restart_admission_wait_hands_the_lease_back_to_admission() {
+    // After a drain the wrapper queues in the daemon without heartbeating, so
+    // the lease must not stay labelled "restart_admission_wait" (2.1.20 css
+    // rollout: 16 queued wrappers kept that phase).
+    let retained = tempfile::tempdir().unwrap().keep();
+    let socket = retained.join("rchd.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let server = tokio::spawn(async move {
+        for closed in [true, false] {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = stream.into_split();
+            let mut request = String::new();
+            TokioBufReader::new(reader)
+                .read_line(&mut request)
+                .await
+                .unwrap();
+            assert!(request.starts_with("GET /restart-admission"), "{request}");
+            writer
+                .write_all(
+                    format!("HTTP/1.1 200 OK\r\n\r\n{{\"admission_closed\":{closed}}}").as_bytes(),
+                )
+                .await
+                .unwrap();
+        }
+    });
+    let lease = queued_selection_test_lease(retained.join("lease.json"));
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(10),
+        await_restart_admission(
+            socket.to_str().unwrap(),
+            &lease,
+            &HookReporter::new(OutputVisibility::None),
+        ),
+    )
+    .await
+    .expect("one closed poll must finish");
+    server.await.unwrap();
+    assert_eq!(outcome, RestartAdmissionWait::Open);
+    let snapshot = lease.snapshot();
+    assert_eq!(snapshot.phase, "admission");
+    assert!(
+        snapshot.heartbeat_unix_ms > 0,
+        "the hand-back is a heartbeat"
+    );
+}
+
 #[test]
 fn only_the_daemon_restart_barrier_refusal_triggers_an_admission_wait() {
     // bd-5pmwm: a refusal issued while a restart holds admission closed is
