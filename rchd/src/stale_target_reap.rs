@@ -533,8 +533,9 @@ mod tests {
         // Only the per-job globs are matched.
         assert!(cmd.contains(".rch-target-*-job-*"));
         assert!(cmd.contains(".rch-target-*-pid-*"));
-        // Shared idle predicate (no -type f) is present.
-        assert!(cmd.contains("find \"$d\" -mmin -720 -print -quit"));
+        // Shared, checked idle predicate (no -type f) is present (13da097f).
+        assert!(cmd.contains("if __gc_source_recent_activity \"$d\" 720; then"));
+        assert!(cmd.contains("find \"$1\" -mmin -\"$2\" -print -quit"));
         assert!(!cmd.contains("-type f"));
         // Never a bare `target` glob.
         assert!(!cmd.contains("/target "));

@@ -3000,15 +3000,22 @@ exec /bin/sh -c "$payload"
             ("ps() { return 1; };", 44),
             ("ps() { :; };", 44),
             ("ps() { printf 'not a process table\\n'; };", 44),
-            ("ps() { printf '10 10 S\\n'; };", 44),
-            ("ps() { printf '%s 123 S\\n' \"$$\"; };", 44),
-            ("ps() { printf '%s 99 S\\n100 123 R\\n' \"$$\"; };", 43),
+            // The thread census is pid, lwp, pgid, stat, nlwp (be002dc0).
+            ("ps() { printf '10 10 10 S 1\\n'; };", 44),
+            ("ps() { printf '%s %s 123 S 1\\n' \"$$\" \"$$\"; };", 44),
             (
-                "ps() { printf '%s 99 S\\n100 123 Z\\n101 123 S\\n' \"$$\"; };",
+                "ps() { printf '%s %s 99 S 1\\n100 100 123 R 1\\n' \"$$\" \"$$\"; };",
                 43,
             ),
-            ("ps() { printf '%s 99 S\\n100 123 Z\\n' \"$$\"; };", 0),
-            ("ps() { printf '%s 99 S\\n' \"$$\"; };", 0),
+            (
+                "ps() { printf '%s %s 99 S 1\\n100 100 123 Z 1\\n101 101 123 S 1\\n' \"$$\" \"$$\"; };",
+                43,
+            ),
+            (
+                "ps() { printf '%s %s 99 S 1\\n100 100 123 Z 1\\n' \"$$\" \"$$\"; };",
+                0,
+            ),
+            ("ps() { printf '%s %s 99 S 1\\n' \"$$\" \"$$\"; };", 0),
         ] {
             let prefix = format!("kill() {{ return 0; }}; sleep() {{ :; }}; {probe}");
             let output = remote_cancel_probe_fixture(&path, &prefix).await;
