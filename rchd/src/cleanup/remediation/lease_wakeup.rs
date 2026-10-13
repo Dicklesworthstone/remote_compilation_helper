@@ -44,7 +44,12 @@ fn observe_in(directory: &Path, wrapper: &str) -> Option<LeaseStamp> {
     #[cfg(unix)]
     let object = {
         use std::os::unix::fs::MetadataExt;
-        (metadata.dev(), metadata.ino(), metadata.ctime(), metadata.ctime_nsec())
+        (
+            metadata.dev(),
+            metadata.ino(),
+            metadata.ctime(),
+            metadata.ctime_nsec(),
+        )
     };
     Some(LeaseStamp::Present {
         length: metadata.len(),
@@ -58,7 +63,10 @@ pub(super) fn observe(attempted: &RetryStamp) -> Option<LeaseStamp> {
     if attempted.remote_pgid_file.is_some() {
         return None;
     }
-    observe_in(&default_job_lease_directory(), attempted.wrapper.as_deref()?)
+    observe_in(
+        &default_job_lease_directory(),
+        attempted.wrapper.as_deref()?,
+    )
 }
 
 pub(super) fn changed(previous: &Option<LeaseStamp>, current: &Option<LeaseStamp>) -> bool {
@@ -72,13 +80,15 @@ pub(super) fn recovery_hint(attempted: &RetryStamp) -> Option<String> {
     // The canonical prefix/UUID contains no shell metacharacters. Invalid
     // legacy identifiers must not be turned into executable operator advice.
     let wrapper = canonical_wrapper(attempted.wrapper.as_deref()?)?;
-    Some(format!("Resume source recovery: rch jobs recover {wrapper}"))
+    Some(format!(
+        "Resume source recovery: rch jobs recover {wrapper}"
+    ))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::{RETRY_BASE, RetryBackoff};
+    use super::*;
     use std::time::Instant;
 
     const WRAPPER: &str = "rchw-10000000-0000-4000-8000-000000000001";
@@ -128,7 +138,10 @@ mod tests {
         let path = root.path().join(format!("{WRAPPER}.json"));
         std::fs::write(&path, "original lease bytes").unwrap();
         let original = observe_in(root.path(), WRAPPER);
-        assert!(matches!(original.as_ref(), Some(LeaseStamp::Present { .. })));
+        assert!(matches!(
+            original.as_ref(),
+            Some(LeaseStamp::Present { .. })
+        ));
         assert!(!changed(&original, &observe_in(root.path(), WRAPPER)));
 
         // Atomic publication of a same-length replacement must still wake up.
@@ -144,7 +157,10 @@ mod tests {
         assert_eq!(missing, Some(LeaseStamp::Missing));
         assert!(changed(&replaced, &missing));
         assert!(!changed(&missing, &missing));
-        assert_eq!(std::fs::read(root.path().join("retired-fixture")).unwrap(), b"replaced lease bytes");
+        assert_eq!(
+            std::fs::read(root.path().join("retired-fixture")).unwrap(),
+            b"replaced lease bytes"
+        );
     }
 
     #[test]
@@ -168,7 +184,10 @@ mod tests {
         std::os::unix::fs::symlink(&outside, &path).unwrap();
         assert!(observe_in(root.path(), WRAPPER).is_none());
         std::fs::rename(&outside, root.path().join("moved-target")).unwrap();
-        assert!(observe_in(root.path(), WRAPPER).is_none(), "dangling is not absent");
+        assert!(
+            observe_in(root.path(), WRAPPER).is_none(),
+            "dangling is not absent"
+        );
     }
 
     #[test]
@@ -184,17 +203,24 @@ mod tests {
         assert!(!backoff.ready_after_lease_observation(&stamp, now, original));
         assert!(!backoff.ready_after_lease_observation(&stamp, now, None));
         std::fs::write(&path, "recovery retired the source recipe").unwrap();
-        assert!(backoff.ready_after_lease_observation(&stamp, now, observe_in(root.path(), WRAPPER)));
+        assert!(backoff.ready_after_lease_observation(
+            &stamp,
+            now,
+            observe_in(root.path(), WRAPPER)
+        ));
         assert!(backoff.failures.is_empty());
         assert_eq!(backoff.failed(stamp, now), RETRY_BASE);
-        assert_eq!(std::fs::read(&path).unwrap(), b"recovery retired the source recipe");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"recovery retired the source recipe"
+        );
     }
 }
 
 #[cfg(test)]
 mod racing_completion {
-    use super::*;
     use super::super::{RETRY_MAX, RetryBackoff};
+    use super::*;
     use std::time::Instant;
 
     #[test]

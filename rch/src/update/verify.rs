@@ -470,7 +470,10 @@ xfmvGjlaWGXfdNKtFwBNm45V0V6VPZ3lLFhIzfLmQ7xUjPzacD1iHPC0MO2oczUBCt2gAZtoGnuQMxps
                 reads: 0,
             };
             let error = verify_minisign_reader(&mut reader, &key, &signature).unwrap_err();
-            assert!(error.to_string().contains("injected read failure"), "{error}");
+            assert!(
+                error.to_string().contains("injected read failure"),
+                "{error}"
+            );
         }
     }
 
@@ -485,7 +488,10 @@ xfmvGjlaWGXfdNKtFwBNm45V0V6VPZ3lLFhIzfLmQ7xUjPzacD1iHPC0MO2oczUBCt2gAZtoGnuQMxps
         appended.push(0);
         assert!(verify_minisign_reader(&mut appended.as_slice(), &key, &signature).is_err());
 
-        let changed = SIGNATURE.replace("trusted comment: rch test fixture", "trusted comment: forged");
+        let changed = SIGNATURE.replace(
+            "trusted comment: rch test fixture",
+            "trusted comment: forged",
+        );
         let changed = minisign_verify::Signature::decode(&changed).unwrap();
         assert!(verify_minisign_reader(&mut &PAYLOAD[..], &key, &changed).is_err());
     }
@@ -1007,7 +1013,9 @@ mod bounded_verifier_tests {
         for length in [0, 1, 8191, 8192, 8193, 65536] {
             let bytes = vec![0xf0; length];
             assert_eq!(
-                read_verifier_output(bytes.as_slice(), length).await.unwrap(),
+                read_verifier_output(bytes.as_slice(), length)
+                    .await
+                    .unwrap(),
                 bytes,
             );
             if length > 0 {
@@ -1066,17 +1074,19 @@ mod bounded_verifier_tests {
             let error = capture_verifier_output(shell(script), Duration::from_secs(5), 64)
                 .await
                 .unwrap_err();
-            assert!(error.to_string().contains("output limit exceeded"), "{error}");
+            assert!(
+                error.to_string().contains("output limit exceeded"),
+                "{error}"
+            );
         }
     }
 
     #[cfg(unix)]
     #[tokio::test]
     async fn verifier_deadline_covers_a_silent_running_process() {
-        let error =
-            capture_verifier_output(shell("exec sleep 30"), Duration::from_millis(30), 64)
-                .await
-                .unwrap_err();
+        let error = capture_verifier_output(shell("exec sleep 30"), Duration::from_millis(30), 64)
+            .await
+            .unwrap_err();
         assert!(error.to_string().contains("timed out"), "{error}");
         assert!(!error.to_string().contains("teardown"), "{error}");
     }
@@ -1086,13 +1096,10 @@ mod bounded_verifier_tests {
     async fn verifier_zero_exit_without_pipe_eof_is_not_verification_success() {
         // The short-lived helper deliberately retains both pipes. This tests
         // the exchange deadline, NOT process-tree termination authority.
-        let error = capture_verifier_output(
-            shell("sleep 0.3 & exit 0"),
-            Duration::from_millis(30),
-            64,
-        )
-        .await
-        .unwrap_err();
+        let error =
+            capture_verifier_output(shell("sleep 0.3 & exit 0"), Duration::from_millis(30), 64)
+                .await
+                .unwrap_err();
         assert!(error.to_string().contains("timed out"), "{error}");
     }
 
@@ -1119,7 +1126,11 @@ mod bounded_verifier_tests {
         let pid_file = root.path().join("child.pid");
         let mut command = shell("printf '%s' \"$$\" > \"$1\"; exec sleep 30");
         command.arg("verifier-test").arg(&pid_file);
-        let task = tokio::spawn(capture_verifier_output(command, Duration::from_secs(30), 64));
+        let task = tokio::spawn(capture_verifier_output(
+            command,
+            Duration::from_secs(30),
+            64,
+        ));
         let pid = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 if let Ok(text) = tokio::fs::read_to_string(&pid_file).await

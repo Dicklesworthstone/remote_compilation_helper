@@ -211,8 +211,7 @@ impl Remediations {
     fn can_start(&self, stamp: &RetryStamp) -> bool {
         self.running.len() < MAX_AUTOMATIC_CANCELLATIONS
             && !self.running.iter().any(|flight| {
-                flight.stamp.build_id == stamp.build_id
-                    || flight.stamp.worker_id == stamp.worker_id
+                flight.stamp.build_id == stamp.build_id || flight.stamp.worker_id == stamp.worker_id
             })
     }
 
@@ -271,8 +270,10 @@ impl Remediations {
                 self.pending.push_back(build.id);
             }
         }
-        let current: HashMap<u64, ActiveBuildState> =
-            candidates.into_iter().map(|build| (build.id, build)).collect();
+        let current: HashMap<u64, ActiveBuildState> = candidates
+            .into_iter()
+            .map(|build| (build.id, build))
+            .collect();
         let mut starts = 0;
         // Examine each queued ID at most once. A busy/backed-off worker goes
         // around the queue without spinning or blocking a disjoint peer.

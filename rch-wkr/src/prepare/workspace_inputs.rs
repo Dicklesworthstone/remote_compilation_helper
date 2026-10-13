@@ -598,7 +598,11 @@ mod tests {
     fn pnpm_project(yaml: &str) -> tempfile::TempDir {
         let directory = tempfile::tempdir().unwrap();
         std::fs::write(directory.path().join("package.json"), b"{}").unwrap();
-        std::fs::write(directory.path().join("pnpm-lock.yaml"), b"lockfileVersion: '9.0'\n").unwrap();
+        std::fs::write(
+            directory.path().join("pnpm-lock.yaml"),
+            b"lockfileVersion: '9.0'\n",
+        )
+        .unwrap();
         std::fs::write(directory.path().join(pnpm_workspace::FILE_NAME), yaml).unwrap();
         directory
     }
@@ -609,12 +613,34 @@ mod tests {
         member(dir.path(), "packages/a", r#"{"name":"a"}"#);
         member(dir.path(), "unrelated", "{}");
         let first = DependencyInputs::capture(dir.path()).unwrap();
-        assert_eq!(first.fingerprint.sources, ["package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml", "packages/a/package.json"]);
-        first.verify_after(&DependencyInputs::capture(dir.path()).unwrap(), RequiredRuntime::Node, PrepareAction::Skipped).unwrap();
-        std::fs::write(dir.path().join(pnpm_workspace::FILE_NAME), "packages: ['packages/*']\ncatalog:\n chalk: ^5.0.0\n").unwrap();
+        assert_eq!(
+            first.fingerprint.sources,
+            [
+                "package.json",
+                "pnpm-lock.yaml",
+                "pnpm-workspace.yaml",
+                "packages/a/package.json"
+            ]
+        );
+        first
+            .verify_after(
+                &DependencyInputs::capture(dir.path()).unwrap(),
+                RequiredRuntime::Node,
+                PrepareAction::Skipped,
+            )
+            .unwrap();
+        std::fs::write(
+            dir.path().join(pnpm_workspace::FILE_NAME),
+            "packages: ['packages/*']\ncatalog:\n chalk: ^5.0.0\n",
+        )
+        .unwrap();
         let changed = DependencyInputs::capture(dir.path()).unwrap();
         assert_ne!(first.fingerprint.hash, changed.fingerprint.hash);
-        assert!(first.verify_after(&changed, RequiredRuntime::Node, PrepareAction::Installed).is_err());
+        assert!(
+            first
+                .verify_after(&changed, RequiredRuntime::Node, PrepareAction::Installed)
+                .is_err()
+        );
     }
 
     #[test]
@@ -622,18 +648,35 @@ mod tests {
         let dir = pnpm_project("packages: ['packages/*']\n");
         member(dir.path(), "packages/a", r#"{"name":"a"}"#);
         let root_files = ["package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml"];
-        let original: Vec<_> = root_files.iter().map(|name| std::fs::read(dir.path().join(name)).unwrap()).collect();
+        let original: Vec<_> = root_files
+            .iter()
+            .map(|name| std::fs::read(dir.path().join(name)).unwrap())
+            .collect();
         let mut before = DependencyInputs::capture(dir.path()).unwrap();
         for operation in ["edit", "add", "remove"] {
             match operation {
                 "edit" => member(dir.path(), "packages/a", r#"{"name":"changed"}"#),
                 "add" => member(dir.path(), "packages/b", "{}"),
-                _ => std::fs::rename(dir.path().join("packages/b"), dir.path().join("retained-b")).unwrap(),
+                _ => std::fs::rename(dir.path().join("packages/b"), dir.path().join("retained-b"))
+                    .unwrap(),
             }
             let after = DependencyInputs::capture(dir.path()).unwrap();
-            assert_ne!(before.fingerprint.hash, after.fingerprint.hash, "{operation}");
-            assert!(before.verify_after(&after, RequiredRuntime::Bun, PrepareAction::Installed).is_err());
-            assert_eq!(original, root_files.iter().map(|name| std::fs::read(dir.path().join(name)).unwrap()).collect::<Vec<_>>());
+            assert_ne!(
+                before.fingerprint.hash, after.fingerprint.hash,
+                "{operation}"
+            );
+            assert!(
+                before
+                    .verify_after(&after, RequiredRuntime::Bun, PrepareAction::Installed)
+                    .is_err()
+            );
+            assert_eq!(
+                original,
+                root_files
+                    .iter()
+                    .map(|name| std::fs::read(dir.path().join(name)).unwrap())
+                    .collect::<Vec<_>>()
+            );
             before = after;
         }
     }
@@ -642,13 +685,25 @@ mod tests {
     fn pnpm_discovery_rechecks_declaration_presence_and_contents() {
         let dir = pnpm_project("packages: ['packages/*']\n");
         let inventory = discover(dir.path(), super::super::install::INPUT_NAMES).unwrap();
-        std::fs::write(dir.path().join(pnpm_workspace::FILE_NAME), "packages: ['other/*']\n").unwrap();
+        std::fs::write(
+            dir.path().join(pnpm_workspace::FILE_NAME),
+            "packages: ['other/*']\n",
+        )
+        .unwrap();
         assert!(inventory.verify(&inventory.root_manifest).is_err());
         let inventory = discover(dir.path(), super::super::install::INPUT_NAMES).unwrap();
-        std::fs::rename(dir.path().join(pnpm_workspace::FILE_NAME), dir.path().join("retained.yaml")).unwrap();
+        std::fs::rename(
+            dir.path().join(pnpm_workspace::FILE_NAME),
+            dir.path().join("retained.yaml"),
+        )
+        .unwrap();
         assert!(inventory.verify(&inventory.root_manifest).is_err());
         let absent = discover(dir.path(), super::super::install::INPUT_NAMES).unwrap();
-        std::fs::write(dir.path().join(pnpm_workspace::FILE_NAME), "packages: ['packages/*']\n").unwrap();
+        std::fs::write(
+            dir.path().join(pnpm_workspace::FILE_NAME),
+            "packages: ['packages/*']\n",
+        )
+        .unwrap();
         assert!(absent.verify(&absent.root_manifest).is_err());
     }
 
@@ -658,22 +713,61 @@ mod tests {
         member(dir.path(), "packages/a", "{}");
         member(dir.path(), "node_modules/generated", "{}");
         let inputs = DependencyInputs::capture(dir.path()).unwrap();
-        assert!(inputs.fingerprint.sources.contains(&"packages/a/package.json".to_owned()));
-        assert!(!inputs.fingerprint.sources.iter().any(|name| name.contains("node_modules")));
-        std::fs::write(dir.path().join("package.json"), r#"{"workspaces":["other/*"]}"#).unwrap();
-        std::fs::write(dir.path().join(pnpm_workspace::FILE_NAME), "packages: ['packages/*']\n").unwrap();
+        assert!(
+            inputs
+                .fingerprint
+                .sources
+                .contains(&"packages/a/package.json".to_owned())
+        );
+        assert!(
+            !inputs
+                .fingerprint
+                .sources
+                .iter()
+                .any(|name| name.contains("node_modules"))
+        );
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"workspaces":["other/*"]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join(pnpm_workspace::FILE_NAME),
+            "packages: ['packages/*']\n",
+        )
+        .unwrap();
         member(dir.path(), "other/b", "{}");
         let inputs = DependencyInputs::capture(dir.path()).unwrap();
-        assert!(inputs.fingerprint.sources.contains(&"other/b/package.json".to_owned()));
-        assert!(inputs.fingerprint.sources.contains(&"packages/a/package.json".to_owned()));
+        assert!(
+            inputs
+                .fingerprint
+                .sources
+                .contains(&"other/b/package.json".to_owned())
+        );
+        assert!(
+            inputs
+                .fingerprint
+                .sources
+                .contains(&"packages/a/package.json".to_owned())
+        );
     }
 
     #[test]
     fn pnpm_config_without_its_lock_never_selects_the_default_manager() {
         let dir = pnpm_project("packages: ['packages/*']\n");
-        std::fs::rename(dir.path().join("pnpm-lock.yaml"), dir.path().join("retained-lock.yaml")).unwrap();
+        std::fs::rename(
+            dir.path().join("pnpm-lock.yaml"),
+            dir.path().join("retained-lock.yaml"),
+        )
+        .unwrap();
         let result = DependencyInputs::capture(dir.path());
-        assert!(result.err().unwrap().to_string().contains("requires pnpm-lock.yaml"));
+        assert!(
+            result
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("requires pnpm-lock.yaml")
+        );
     }
 
     #[test]
@@ -686,15 +780,27 @@ mod tests {
             std::fs::write(&path, b"first version\n").unwrap();
             let added = DependencyInputs::capture(dir.path()).unwrap();
             assert_ne!(absent.fingerprint.hash, added.fingerprint.hash);
-            assert!(absent.verify_after(&added, RequiredRuntime::Node, PrepareAction::Installed).is_err());
+            assert!(
+                absent
+                    .verify_after(&added, RequiredRuntime::Node, PrepareAction::Installed)
+                    .is_err()
+            );
             std::fs::write(&path, b"other version\n").unwrap();
             let edited = DependencyInputs::capture(dir.path()).unwrap();
             assert_ne!(added.fingerprint.hash, edited.fingerprint.hash);
-            assert!(added.verify_after(&edited, RequiredRuntime::Node, PrepareAction::Installed).is_err());
+            assert!(
+                added
+                    .verify_after(&edited, RequiredRuntime::Node, PrepareAction::Installed)
+                    .is_err()
+            );
             std::fs::rename(&path, dir.path().join("retained-member-input")).unwrap();
             let removed = DependencyInputs::capture(dir.path()).unwrap();
             assert_eq!(absent.fingerprint, removed.fingerprint);
-            assert!(edited.verify_after(&removed, RequiredRuntime::Node, PrepareAction::Skipped).is_err());
+            assert!(
+                edited
+                    .verify_after(&removed, RequiredRuntime::Node, PrepareAction::Skipped)
+                    .is_err()
+            );
         }
     }
 
@@ -706,6 +812,9 @@ mod tests {
         std::fs::rename(dir.path().join(pnpm_workspace::FILE_NAME), &retained).unwrap();
         std::os::unix::fs::symlink(&retained, dir.path().join(pnpm_workspace::FILE_NAME)).unwrap();
         assert!(DependencyInputs::capture(dir.path()).is_err());
-        assert_eq!(std::fs::read(retained).unwrap(), b"packages: ['packages/*']\n");
+        assert_eq!(
+            std::fs::read(retained).unwrap(),
+            b"packages: ['packages/*']\n"
+        );
     }
 }

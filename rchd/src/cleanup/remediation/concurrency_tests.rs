@@ -27,7 +27,10 @@ fn automatic_operations_are_bounded_globally_per_worker_and_per_build() {
     assert!(!flights.push(stamp_for(2, "worker-a"), std::future::pending()));
     assert!(!flights.push(stamp_for(1, "worker-b"), std::future::pending()));
     for id in 2..=MAX_AUTOMATIC_CANCELLATIONS as u64 {
-        assert!(flights.push(stamp_for(id, &format!("worker-{id}")), std::future::pending()));
+        assert!(flights.push(
+            stamp_for(id, &format!("worker-{id}")),
+            std::future::pending()
+        ));
     }
     assert_eq!(flights.running.len(), MAX_AUTOMATIC_CANCELLATIONS);
     assert!(!flights.push(stamp_for(100, "overflow"), std::future::pending()));
@@ -99,7 +102,10 @@ async fn stopping_before_first_poll_cannot_admit_an_automatic_cancellation() {
     drop(flights);
     tokio::task::yield_now().await;
     assert_eq!(entered.load(Ordering::SeqCst), 0);
-    assert!(weak.upgrade().is_none(), "no detached admission task may remain");
+    assert!(
+        weak.upgrade().is_none(),
+        "no detached admission task may remain"
+    );
 }
 
 /// Use the real durable history loader to model old observations. No remote
@@ -145,9 +151,8 @@ fn stale_builds(
 
 #[tokio::test]
 async fn production_admission_skips_busy_workers_and_advances_past_a_failed_prefix() {
-    let (_root, cleanup, candidates) = stale_builds(&[
-        "busy", "busy", "b", "c", "d", "e", "f", "g", "h", "i", "j",
-    ]);
+    let (_root, cleanup, candidates) =
+        stale_builds(&["busy", "busy", "b", "c", "d", "e", "f", "g", "h", "i", "j"]);
     let mut flights = Remediations::default();
     let mut observation = ObservationWindow::default();
     let mut backoff = RetryBackoff::default();
@@ -170,8 +175,15 @@ async fn production_admission_skips_busy_workers_and_advances_past_a_failed_pref
         .await
         .expect("no-endpoint cancellation must settle without SSH");
     }
-    assert_eq!(attempted.len(), candidates.len(), "a failed prefix starved the tail");
-    assert_eq!(cleanup.context.history.active_builds().len(), candidates.len());
+    assert_eq!(
+        attempted.len(),
+        candidates.len(),
+        "a failed prefix starved the tail"
+    );
+    assert_eq!(
+        cleanup.context.history.active_builds().len(),
+        candidates.len()
+    );
     assert!(cleanup.context.history.recent(100).is_empty());
 }
 
@@ -204,8 +216,18 @@ async fn heartbeat_after_queuing_vetoes_cancellation_at_first_poll() {
         })
         .unwrap();
     let (_, status, _) = flights.next_completed().await;
-    assert!(status.is_none(), "new evidence must veto admission, not cancel the resumed job");
-    assert!(cleanup.context.cancellation.active_cancellations().await.is_empty());
+    assert!(
+        status.is_none(),
+        "new evidence must veto admission, not cancel the resumed job"
+    );
+    assert!(
+        cleanup
+            .context
+            .cancellation
+            .active_cancellations()
+            .await
+            .is_empty()
+    );
     assert!(cleanup.context.history.active_build(build.id).is_some());
     assert!(cleanup.context.history.recent(100).is_empty());
 }
@@ -217,7 +239,10 @@ async fn observer_scans_continue_with_all_cancellation_lanes_stalled() {
     let base = candidates.iter().map(|build| build.id).max().unwrap();
     for offset in 1..=MAX_AUTOMATIC_CANCELLATIONS as u64 {
         let id = base.checked_add(offset).unwrap();
-        assert!(flights.push(stamp_for(id, &format!("blocked-{id}")), std::future::pending()));
+        assert!(flights.push(
+            stamp_for(id, &format!("blocked-{id}")),
+            std::future::pending()
+        ));
     }
     let mut observation = ObservationWindow::default();
     let mut backoff = RetryBackoff::default();
@@ -228,10 +253,23 @@ async fn observer_scans_continue_with_all_cancellation_lanes_stalled() {
         assert_eq!(fresh.len(), 1);
         flights.start_observed(&cleanup, &mut observation, &mut backoff, fresh);
         assert_eq!(flights.running.len(), MAX_AUTOMATIC_CANCELLATIONS);
-        assert!(cleanup.context.history.active_build(candidates[0].id).unwrap()
-            .detector_heartbeat_stale);
+        assert!(
+            cleanup
+                .context
+                .history
+                .active_build(candidates[0].id)
+                .unwrap()
+                .detector_heartbeat_stale
+        );
     }
-    assert!(cleanup.context.cancellation.active_cancellations().await.is_empty());
+    assert!(
+        cleanup
+            .context
+            .cancellation
+            .active_cancellations()
+            .await
+            .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -241,7 +279,10 @@ async fn refreshed_queue_drops_obsolete_ids_without_forgetting_running_operation
     let base = candidates.iter().map(|build| build.id).max().unwrap();
     for offset in 1..=MAX_AUTOMATIC_CANCELLATIONS as u64 {
         let id = base.checked_add(offset).unwrap();
-        assert!(flights.push(stamp_for(id, &format!("blocked-{id}")), std::future::pending()));
+        assert!(flights.push(
+            stamp_for(id, &format!("blocked-{id}")),
+            std::future::pending()
+        ));
     }
     let mut observation = ObservationWindow::default();
     let mut backoff = RetryBackoff::default();

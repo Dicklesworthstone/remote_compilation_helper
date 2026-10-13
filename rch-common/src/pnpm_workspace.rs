@@ -61,7 +61,8 @@ impl<'de> Deserialize<'de> for Workspace {
                                 return Err(de::Error::duplicate_field("packages"));
                             }
                             seen_packages = true;
-                            patterns = map.next_value::<Option<Patterns>>()?
+                            patterns = map
+                                .next_value::<Option<Patterns>>()?
                                 .map_or_else(Vec::new, |patterns| patterns.0);
                         }
                         "<<" => {
@@ -148,28 +149,47 @@ mod tests {
             b"packages: ['packages/*', 'components/**', '!**/test/**']\n",
             b"defaults: &paths ['packages/*', 'components/**', '!**/test/**']\npackages: *paths\n",
         ] {
-            assert_eq!(package_patterns(bytes).unwrap(), ["packages/*", "components/**", "!**/test/**"]);
+            assert_eq!(
+                package_patterns(bytes).unwrap(),
+                ["packages/*", "components/**", "!**/test/**"]
+            );
         }
     }
 
     #[test]
     fn unspecified_membership_is_a_cross_version_conservative_superset() {
-        for bytes in [b"".as_slice(), b"# empty\n", b"{}", b"packages: null", b"packages: []", b"catalog:\n chalk: ^4.0.0"] {
+        for bytes in [
+            b"".as_slice(),
+            b"# empty\n",
+            b"{}",
+            b"packages: null",
+            b"packages: []",
+            b"catalog:\n chalk: ^4.0.0",
+        ] {
             assert_eq!(package_patterns(bytes).unwrap(), ["**"]);
         }
-        assert_eq!(package_patterns(b"packages: ['!fixtures/**']").unwrap(), ["!fixtures/**", "**"]);
+        assert_eq!(
+            package_patterns(b"packages: ['!fixtures/**']").unwrap(),
+            ["!fixtures/**", "**"]
+        );
     }
 
     #[test]
     fn invalid_shapes_duplicates_merges_and_extra_documents_are_rejected() {
         for bytes in [
-            b"packages: false".as_slice(), b"packages: packages/*",
-            b"packages: [42]", b"packages: [true]", b"packages: [null]",
-            b"packages: [{path: packages/*}]", b"packages: ['']",
+            b"packages: false".as_slice(),
+            b"packages: packages/*",
+            b"packages: [42]",
+            b"packages: [true]",
+            b"packages: [null]",
+            b"packages: [{path: packages/*}]",
+            b"packages: ['']",
             b"packages: []\npackages: ['outside/*']",
             b"defaults: &d {packages: ['outside/*']}\n<<: *d",
             b"packages: ['packages/*']\n---\npackages: ['outside/*']",
-            b"- packages/*", b"packages: [*missing]", b"packages: ['unterminated]",
+            b"- packages/*",
+            b"packages: [*missing]",
+            b"packages: ['unterminated]",
         ] {
             assert!(package_patterns(bytes).is_err(), "{bytes:?}");
         }
@@ -178,9 +198,19 @@ mod tests {
     #[test]
     fn pattern_and_document_limits_do_not_return_partial_lists() {
         let document = |count| format!("packages: [{}]", vec!["'packages/*'"; count].join(","));
-        assert_eq!(package_patterns(document(MAX_PATTERNS).as_bytes()).unwrap().len(), MAX_PATTERNS);
+        assert_eq!(
+            package_patterns(document(MAX_PATTERNS).as_bytes())
+                .unwrap()
+                .len(),
+            MAX_PATTERNS
+        );
         assert!(package_patterns(document(MAX_PATTERNS + 1).as_bytes()).is_err());
-        assert!(package_patterns(format!("packages: ['{}']", "a".repeat(MAX_PATTERN_BYTES + 1)).as_bytes()).is_err());
+        assert!(
+            package_patterns(
+                format!("packages: ['{}']", "a".repeat(MAX_PATTERN_BYTES + 1)).as_bytes()
+            )
+            .is_err()
+        );
         assert!(package_patterns(&vec![b' '; MAX_DOCUMENT_BYTES + 1]).is_err());
     }
 }
