@@ -36,6 +36,21 @@ exec 3<&0
 "$rch_namespace_timer" --kill-after=1 15 sh -c '
 set -eu
 control=$1
+observer=$2
+# Prove that the direct parent leads a private process group BEFORE
+# installing a group-wide kill trap or reading any namespace program. A timer
+# wrapper using --foreground must not turn "kill 0" into a kill of the observer,
+# SSH session, or caller group. This inspects live ancestry, not a saved PID.
+group_state=$(LC_ALL=C ps -o pid= -o ppid= -o pgid= -p "$$") || exit 73
+set -f
+set -- $group_state
+[ "$#" -eq 3 ] || exit 73
+case "$1:$2:$3" in *[!0-9:]*) exit 73 ;; esac
+[ "$1" = "$$" ] && [ "$2" = "$3" ] && [ "$3" != "$$" ] &&
+    [ "$3" != "$observer" ] || {
+    printf "%s\n" "RCH: namespace timer did not establish a private process group" >&2
+    exit 73
+}
 # Unexpected setup/validation errors must also retire the execution group.
 # They leave no completion record, so the observer cannot report success.
 trap "kill -KILL 0" 0
@@ -82,7 +97,7 @@ printf "RCH_TOPOLOGY_OK\n" | cmp -s - "$control/stdout" || {
     exit 73
 }
 finish 0
-' rch-namespace-monitor "$control" <&3 3<&- &
+' rch-namespace-monitor "$control" "$$" <&3 3<&- &
 monitor=$!
 exec 3<&-
 set +e

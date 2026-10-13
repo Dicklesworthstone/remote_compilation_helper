@@ -18,7 +18,9 @@ import time
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
-CONTROL = ROOT / "rch/src/hook/source_namespace_control.sh"
+CONTROL = Path(os.environ.get("RCH_TEST_SOURCE_NAMESPACE_CONTROL",
+                              ROOT / "rch/src/hook/source_namespace_control.sh"))
+SHELL = os.environ.get("RCH_TEST_SHELL", "/bin/sh")
 READY = b"RCH_TOPOLOGY_OK\n"
 
 
@@ -52,7 +54,7 @@ class NamespaceGroupTeardown(unittest.TestCase):
 
     def run_control(self, program: str, *, timeout: float = 6) -> subprocess.CompletedProcess:
         env = dict(os.environ, TMPDIR=str(self.directory))
-        return subprocess.run(["sh", "-c", self.script], input=program.encode(),
+        return subprocess.run([SHELL, "-c", self.script], input=program.encode(),
                               capture_output=True, timeout=timeout, env=env)
 
     def descendant_program(self, exit_code: int) -> tuple[str, Path, Path]:
@@ -161,6 +163,45 @@ class NamespaceGroupTeardown(unittest.TestCase):
         self.assertFalse(running(pid))
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(result.stdout, b"")
+
+    def test_foreground_timer_cannot_kill_observer_or_run_namespace_program(self) -> None:
+        tools = self.directory / "tools"
+        tools.mkdir()
+        for name in ("timeout", "gtimeout"):
+            timer = tools / name
+            timer.write_text("#!/bin/sh\nexec " + shlex.quote(shutil.which("timeout")) +
+                             ' --foreground "$@"\n')
+            timer.chmod(0o700)
+        mutation = self.directory / "must-not-exist"
+        env = dict(os.environ, TMPDIR=str(self.directory),
+                   PATH=str(tools) + os.pathsep + os.environ["PATH"])
+        # The test itself stays outside the tested group, even on regression.
+        result = subprocess.run([SHELL, "-c", self.script],
+                                input=("touch " + shlex.quote(str(mutation)) +
+                                       "\nprintf 'RCH_TOPOLOGY_OK\\n'\n").encode(),
+                                capture_output=True, timeout=6, env=env,
+                                start_new_session=True)
+        self.assertEqual(result.returncode, 73, result.stderr)
+        self.assertEqual(result.stdout, b"")
+        self.assertFalse(mutation.exists())
+        self.assertIn(b"private process group", result.stderr)
+
+    def test_unverifiable_group_refuses_before_namespace_mutation(self) -> None:
+        tools = self.directory / "tools"
+        tools.mkdir()
+        ps = tools / "ps"
+        ps.write_text("#!/bin/sh\nprintf 'not a process identity\\n'\n")
+        ps.chmod(0o700)
+        mutation = self.directory / "must-not-exist"
+        env = dict(os.environ, TMPDIR=str(self.directory),
+                   PATH=str(tools) + os.pathsep + os.environ["PATH"])
+        result = subprocess.run([SHELL, "-c", self.script],
+                                input=("touch " + shlex.quote(str(mutation))).encode(),
+                                capture_output=True, timeout=6, env=env,
+                                start_new_session=True)
+        self.assertEqual(result.returncode, 73)
+        self.assertEqual(result.stdout, b"")
+        self.assertFalse(mutation.exists())
 
     def test_deadline_before_program_completion_never_creates_success(self) -> None:
         self.script = self.script.replace('--kill-after=1 15 sh -c', '--kill-after=1 0.2 sh -c')

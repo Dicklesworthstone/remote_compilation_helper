@@ -13,15 +13,20 @@ fn source_namespace_control_bounds_processes_and_complete_output() {
         include_str!("../src/hook/source_namespace_control.sh"),
     )
     .expect("write compiled control program");
-    let output = std::process::Command::new("python3")
-        .arg(root.join("scripts/tests/test_source_namespace_control.py"))
-        .env("RCH_TEST_SOURCE_NAMESPACE_CONTROL", control)
-        .output()
-        .expect("execute native namespace control tests");
-    assert!(
-        output.status.success(),
-        "stdout={}\nstderr={}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
+    for suite in [
+        "scripts/tests/test_source_namespace_control.py",
+        "scripts/test_namespace_group_teardown.py",
+    ] {
+        let output = std::process::Command::new("python3")
+            .arg(root.join(suite))
+            .env("RCH_TEST_SOURCE_NAMESPACE_CONTROL", &control)
+            .output()
+            .expect("execute native namespace control tests");
+        assert!(
+            output.status.success(),
+            "suite={suite}\nstdout={}\nstderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
 }

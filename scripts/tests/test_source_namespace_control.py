@@ -3,7 +3,7 @@
 
 The actual production shell runs GNU timeout and real flock/FIFO descriptors.
 A PATH double shortens only the timer's duration (and checks the production
-15s/1s policy); it does not substitute locking, signaling, or output handling.
+execution and observer phase policies); it does not substitute locking, signaling, or output handling.
 Owned fixtures are retained for inspection. The Rust target supplies compiled
 CONTROL bytes and otherwise runs these same tests.
 """
@@ -39,8 +39,14 @@ class SourceNamespaceControlTests(unittest.TestCase):
         self.tmp.mkdir()
         self.calls = self.root / "timer-calls"
         timer = ("#!/bin/sh\nset -eu\n"
-                 '[ "$1" = --kill-after=1 ] && [ "$2" = 15 ] || exit 96\n'
-                 'printf "call\\n" >> "$RCH_TIMER_CALLS"\nshift 2\n'
+                 '[ "$1" = --kill-after=1 ] || exit 96\n'
+                 'case "$2:$3" in\n'
+                 '  1:mktemp) ;;\n'
+                 '  15:sh) [ "${6-}" = rch-namespace-monitor ] || exit 96 ;;\n'
+                 '  2:sh) [ "${6-}" = rch-namespace-delivery ] || exit 96 ;;\n'
+                 '  1:sh) [ "${6-}" = rch-namespace-cleanup ] || exit 96 ;;\n'
+                 '  *) exit 96 ;;\nesac\n'
+                 'printf "%s %s\\n" "$2" "$3" >> "$RCH_TIMER_CALLS"\nshift 2\n'
                  'exec ' + shlex.quote(TIMEOUT) + ' --kill-after=0.15 0.6 "$@"\n')
         for name in ("timeout", "gtimeout"):
             path = self.tools / name
@@ -62,7 +68,10 @@ class SourceNamespaceControlTests(unittest.TestCase):
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 env=self.env, timeout=5, check=False)
         self.assertLess(time.monotonic() - started, 3, result.stderr)
-        self.assertEqual(self.calls.read_text().splitlines(), ["call"])
+        calls = self.calls.read_text().splitlines()
+        self.assertEqual(calls[:2], ["1 mktemp", "15 sh"])
+        self.assertEqual(calls[-1], "1 sh")
+        self.assertIn(calls[2:-1], ([], ["2 sh"]))
         return result
 
     def assert_no_control_processes(self, root=None):
