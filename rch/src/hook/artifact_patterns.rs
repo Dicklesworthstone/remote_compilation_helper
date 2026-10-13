@@ -39,6 +39,7 @@
 //! module and stays private.
 
 pub(super) mod cargo_bins;
+pub(super) mod clean_overlay;
 pub(super) mod direct_compiler;
 
 use super::command_parsing::{cargo_build_only_test, cargo_custom_profile_output_dir};
@@ -123,7 +124,11 @@ pub(super) fn get_artifact_patterns(
         | Some(CompilationKind::Make)
         | Some(CompilationKind::CmakeBuild)
         | Some(CompilationKind::Ninja)
-        | Some(CompilationKind::Meson) => default_c_cpp_artifact_patterns(),
+        | Some(CompilationKind::Meson) => {
+            let mut patterns = default_c_cpp_artifact_patterns();
+            clean_overlay::exclude_source_archive(&mut patterns);
+            patterns
+        }
         // Nix outputs live in the worker's `/nix/store` behind a `result`
         // symlink that is meaningless on a nix-less local host, so nothing is
         // synced back — the exit status is the payload (streaming only).
