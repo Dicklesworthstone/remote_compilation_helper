@@ -43,6 +43,11 @@
 
 const SOURCE_CLAIM_REGISTRY: &str = "/tmp/rch-source-authority-locks/claims-v1";
 
+/// Retirement failure leaves ambiguous durable ownership. Stop the entire
+/// supervisor before another candidate or successful metrics can hide it.
+const SOURCE_GC_CHECKED_RETIREMENT: &str = "if ! __gc_source_end; then \
+    printf 'RCH_GC_RETIREMENT_FAILED %s\\n' \"$d\" >&2; exit 1; fi; ";
+
 /// Shared worker-side record protocol for source admission and GC. Callers
 /// hold the registry metadata flock. Only incomplete *pending* records may be
 /// quarantined: active or cancelling records may already authorize activity.
@@ -291,16 +296,24 @@ fn reap_loop_body_with_source_gate(
         Some(tok) => format!("[ \"$d\" = \"{tok}\" ] && continue; "),
         None => String::new(),
     };
-    let (claim, unlock) = if source_gate {
+    let (claim, unlock, recent) = if source_gate {
         (
-            format!(
-                "if ! __gc_source_begin \"$d\"; then printf 'RCH_GC_SKIP {} source-ownership %s\\n' \"$d\"; continue; fi; ",
-                trigger.unwrap_or("ttl")
+            checked_source_admission(&shell_escape::escape(trigger.unwrap_or("ttl").into())),
+            SOURCE_GC_CHECKED_RETIREMENT,
+            checked_source_recent_activity(
+                &idle_minutes.to_string(),
+                &shell_escape::escape(trigger.unwrap_or("ttl").into()),
+                true,
             ),
-            "__gc_source_end; ",
         )
     } else {
-        (String::new(), "")
+        (
+            String::new(),
+            "",
+            format!(
+                "if find \"$d\" -mmin -{idle_minutes} -print -quit 2>/dev/null | grep -q .; then continue; fi; "
+            ),
+        )
     };
     // Account for size only when both counter var names are provided.
     let (size_capture, removal) = if removed_counter.is_empty() || freed_kb.is_empty() {
@@ -333,8 +346,42 @@ fn reap_loop_body_with_source_gate(
         "[ -d \"$d\" ] || continue; \
          {exclude}\
          {claim}\
-         if find \"$d\" -mmin -{idle_minutes} -print -quit 2>/dev/null | grep -q .; then {unlock}continue; fi; \
+         {recent}\
          {size_capture}{removal}{unlock}"
+    )
+}
+
+/// Known ownership/retention holds skip one candidate. Unknown retention must
+/// stop the supervisor before it can emit successful sweep metrics.
+fn checked_source_admission(trigger_argument: &str) -> String {
+    format!(
+        "if __gc_source_begin \"$d\"; then d=$__gc_candidate; else \
+           __gc_admission_status=$?; \
+           case \"$__gc_admission_status\" in \
+             1|3) printf 'RCH_GC_SKIP %s source-ownership %s\\n' {trigger_argument} \"$d\"; continue;; \
+             *) printf 'RCH_GC_ADMISSION_UNKNOWN %s\\n' \"$d\" >&2; exit 1;; \
+           esac; \
+         fi; "
+    )
+}
+
+/// Inspect the real find result, without letting a pipeline's matcher hide a
+/// traversal failure. A held claim must retire before either skip or refusal.
+fn checked_source_recent_activity(
+    minutes_argument: &str,
+    trigger_argument: &str,
+    source_held: bool,
+) -> String {
+    let end = if source_held {
+        SOURCE_GC_CHECKED_RETIREMENT
+    } else {
+        ""
+    };
+    format!(
+        "if __gc_source_recent_activity \"$d\" {minutes_argument}; then \
+           {end}printf 'RCH_GC_SKIP %s active %s\\n' {trigger_argument} \"$d\"; continue; \
+         else __gc_recent_status=$?; fi; \
+         if [ \"$__gc_recent_status\" -ne 1 ]; then {end}exit 1; fi; "
     )
 }
 
@@ -345,9 +392,66 @@ fn reap_loop_body_with_source_gate(
 /// inherited descriptors after the SSH connection disappears. Its durable GC
 /// claim remains after SIGKILL/OOM too; only completed child activity permits
 /// retirement, and an interrupted removal stays unavailable for inspection.
+/// Defines `__gc_source_begin` and `__gc_source_end` for the production registry.
+/// A caller must check end after every successful begin, before leaving the
+/// candidate interval. Returning this fragment alone acquires no ownership.
+/// Begin returns 0 with ownership held, 1 for a verified ownership hold, 2 for
+/// unknown setup/publication/inspection, and 3 for a known retention hold.
+pub fn source_claim_gc_guard_fragment() -> String {
+    source_claim_gate_fragment(SOURCE_CLAIM_REGISTRY)
+}
+
+/// Retired source trees keep this marker after their active claim is released.
+/// Hold a candidate containing a marker or nested beneath a marked ancestor.
+/// Inspect only each ancestor's immediate marker, never its sibling trees.
+/// Marker presence alone is a hold; symlink targets are not followed.
+/// Return 0 for retained, 1 for known unmarked, and 2 for unknown inspection.
+pub const RETAINED_SOURCE_GC_GUARD: &str = r#"
+rch_retained_source_gc_hold() {
+    case "$1" in /*) ;; *) return 2;; esac
+    if rch_retained_marker=$(find "$1" -name '.rch-retention-v1' -print -quit); then
+        if [ -n "$rch_retained_marker" ]; then return 0; fi
+    else
+        printf 'RCH_CLEANUP_RETENTION_UNKNOWN dir=%s\n' "$1" >&2
+        return 2
+    fi
+    rch_retained_parent=${1%/*}
+    [ -n "$rch_retained_parent" ] || rch_retained_parent=/
+    while :; do
+        if rch_retained_marker=$(find "$rch_retained_parent" -mindepth 1 -maxdepth 1 \
+            -name '.rch-retention-v1' -print -quit); then
+            if [ -n "$rch_retained_marker" ]; then return 0; fi
+        else
+            printf 'RCH_CLEANUP_RETENTION_UNKNOWN dir=%s ancestor=%s\n' \
+                "$1" "$rch_retained_parent" >&2
+            return 2
+        fi
+        [ "$rch_retained_parent" != / ] || break
+        rch_retained_parent=${rch_retained_parent%/*}
+        [ -n "$rch_retained_parent" ] || rch_retained_parent=/
+    done
+    return 1
+}
+"#;
+
+/// Generate the identical transaction for an isolated caller-owned registry.
+/// This permits local fixtures to exercise the real protocol without touching
+/// the worker's production registry. It does not acquire or waive ownership.
+pub fn source_claim_gc_guard_fragment_with_registry(registry: &str) -> String {
+    source_claim_gate_fragment(registry)
+}
+
 fn source_claim_gate_fragment(registry: &str) -> String {
     const GATE: &str = r#"
 trap '' HUP;
+__gc_source_recent_activity() {
+    if __gc_recent_path=$(find "$1" -mmin -"$2" -print -quit); then
+        if [ -n "$__gc_recent_path" ]; then return 0; fi;
+        return 1;
+    fi;
+    printf 'RCH_GC_ACTIVITY_UNKNOWN %s\n' "$1" >&2;
+    return 2;
+};
 __gc_source_realpath() {
     __gc_resolved=$(realpath -m -- "$1" && printf '.') || return 1;
     __gc_resolved=${__gc_resolved%.}; __gc_resolved=${__gc_resolved%?};
@@ -358,21 +462,21 @@ __gc_source_realpath() {
     case "$__gc_resolved" in *"$__gc_cr"*) return 1;; esac;
 };
 __gc_source_records_free() {
-    __gc_source_realpath "$1" || return 1; __gc_candidate=$__gc_resolved;
+    __gc_source_realpath "$1" || return 2; __gc_candidate=$__gc_resolved;
     for __gc_record in "$__gc_source_registry"/*.claim "$__gc_source_registry"/*.pending; do
         [ -e "$__gc_record" ] || [ -L "$__gc_record" ] || continue;
         if ! rch_claim_record_valid "$__gc_record"; then
-            rch_claim_quarantine_pending "$__gc_source_registry" "$__gc_record" || return 1;
+            rch_claim_quarantine_pending "$__gc_source_registry" "$__gc_record" || return 2;
             continue;
         fi;
         while IFS= read -r __gc_root || [ -n "$__gc_root" ]; do
-            case "$__gc_root" in /*) ;; *) return 1;; esac;
-            case "$__gc_root" in *//*|*/./*|*/../*|*/.|*/..) return 1;; esac;
-            [ "$__gc_root" = / ] || [ "${__gc_root%/}" = "$__gc_root" ] || return 1;
-            __gc_source_realpath "$__gc_root" || return 1; __gc_root=$__gc_resolved;
-            [ "$__gc_root" != / ] && [ "$__gc_candidate" != / ] || return 1;
-            case "$__gc_candidate" in "$__gc_root"|"$__gc_root"/*) return 1;; esac;
-            case "$__gc_root" in "$__gc_candidate"/*) return 1;; esac;
+            case "$__gc_root" in /*) ;; *) return 2;; esac;
+            case "$__gc_root" in *//*|*/./*|*/../*|*/.|*/..) return 2;; esac;
+            [ "$__gc_root" = / ] || [ "${__gc_root%/}" = "$__gc_root" ] || return 2;
+            __gc_source_realpath "$__gc_root" || return 2; __gc_root=$__gc_resolved;
+            [ "$__gc_root" != / ] && [ "$__gc_candidate" != / ] || return 2;
+            case "$__gc_candidate" in "$__gc_root"|"$__gc_root"/*) return 3;; esac;
+            case "$__gc_root" in "$__gc_candidate"/*) return 3;; esac;
         done < "$__gc_record";
     done;
 };
@@ -397,37 +501,51 @@ __gc_source_end() {
 };
 __gc_source_begin() {
     __gc_reservation="";
-    [ ! -L "$__gc_source_registry" ] || return 1;
-    [ ! -L "$__gc_source_registry/quarantine" ] || return 1;
-    (umask 077; mkdir -p -- "$__gc_source_registry") || return 1;
-    [ ! -L "$__gc_source_registry/metadata.lock" ] || return 1;
-    exec 8>"$__gc_source_registry/metadata.lock" || return 1;
-    if ! flock -x 8; then __gc_source_end; return 1; fi;
-    if [ ! -d "$1" ] || [ -L "$1" ] || ! __gc_source_records_free "$1"; then
-        __gc_source_end; return 1;
+    [ ! -L "$__gc_source_registry" ] || return 2;
+    [ ! -L "$__gc_source_registry/quarantine" ] || return 2;
+    (umask 077; mkdir -p -- "$__gc_source_registry") || return 2;
+    [ ! -L "$__gc_source_registry/metadata.lock" ] || return 2;
+    exec 8>"$__gc_source_registry/metadata.lock" || return 2;
+    if ! flock -x 8; then __gc_source_end; return 2; fi;
+    if [ ! -d "$1" ] || [ -L "$1" ]; then __gc_source_end; return 2; fi;
+    if __gc_source_records_free "$1"; then :; else
+        __gc_records_status=$?;
+        if ! __gc_source_end; then return 2; fi;
+        if [ "$__gc_records_status" -eq 3 ]; then return 1; fi;
+        return 2;
     fi;
-    __gc_token=fc-$(cat /proc/sys/kernel/random/uuid) || { __gc_source_end; return 1; };
-    case "$__gc_token" in *[!a-f0-9-]*) __gc_source_end; return 1;; esac;
-    [ "${#__gc_token}" -eq 39 ] || { __gc_source_end; return 1; };
+    if rch_retained_source_gc_hold "$__gc_candidate"; then
+        printf 'RCH_GC_RETENTION_HOLD %s\n' "$__gc_candidate" >&2;
+        if ! __gc_source_end; then return 2; fi;
+        return 3;
+    else
+        __gc_retention_status=$?;
+    fi;
+    if [ "$__gc_retention_status" -ne 1 ]; then
+        __gc_source_end; return 2;
+    fi;
+    __gc_token=fc-$(cat /proc/sys/kernel/random/uuid) || { __gc_source_end; return 2; };
+    case "$__gc_token" in *[!a-f0-9-]*) __gc_source_end; return 2;; esac;
+    [ "${#__gc_token}" -eq 39 ] || { __gc_source_end; return 2; };
     for __gc_previous in "$__gc_source_registry/$__gc_token."* \
         "$__gc_source_registry/released/$__gc_token."* "$__gc_source_registry/cancelled/$__gc_token."* \
         "$__gc_source_registry/quarantine/$__gc_token."*; do
-        if [ -e "$__gc_previous" ] || [ -L "$__gc_previous" ]; then __gc_source_end; return 1; fi;
+        if [ -e "$__gc_previous" ] || [ -L "$__gc_previous" ]; then __gc_source_end; return 2; fi;
     done;
-    __gc_actual=$(printf '%s\n' "$__gc_candidate" | sha256sum) || { __gc_source_end; return 1; };
+    __gc_actual=$(printf '%s\n' "$__gc_candidate" | sha256sum) || { __gc_source_end; return 2; };
     __gc_reservation_digest=${__gc_actual%% *};
     __gc_pending="$__gc_source_registry/$__gc_token.$__gc_reservation_digest.pending";
     if ! rch_claim_write_atomic "$__gc_source_registry" "$__gc_pending" \
-        "$__gc_reservation_digest" "$__gc_candidate"; then __gc_source_end; return 1; fi;
+        "$__gc_reservation_digest" "$__gc_candidate"; then __gc_source_end; return 2; fi;
     __gc_active="$__gc_source_registry/$__gc_token.$__gc_reservation_digest.claim";
     if ! mv -- "$__gc_pending" "$__gc_active" || ! sync -f "$__gc_source_registry"; then
-        __gc_source_end; return 1;
+        __gc_source_end; return 2;
     fi;
     __gc_reservation=$__gc_active;
 };
 "#;
     format!(
-        "__gc_source_registry={}; {SOURCE_CLAIM_RECORD_HELPERS}\n{GATE}",
+        "__gc_source_registry={}; {SOURCE_CLAIM_RECORD_HELPERS}\n{RETAINED_SOURCE_GC_GUARD}\n{GATE}",
         shell_escape::escape(registry.into())
     )
 }
@@ -754,26 +872,26 @@ pub fn worker_sweep_command_with_registry(
                  while IFS=' ' read -r __n __k d; do \
                    [ \"$total_kb\" -le {cap_kb} ] && break; \
                    [ -d \"$d\" ] || continue; \
-                   if find \"$d\" -mmin -{idle_minutes} -print -quit 2>/dev/null | grep -q .; then \
-                     printf 'RCH_GC_SKIP cap active %s\\n' \"$d\"; continue; \
-                   fi; \
+                   {early_recent}\
                    if ! __gc_gates_ok \"$d\"; then printf 'RCH_GC_SKIP cap gate %s\\n' \"$d\"; continue; fi; \
-                   if ! __gc_source_begin \"$d\"; then printf 'RCH_GC_SKIP cap source-ownership %s\\n' \"$d\"; continue; fi; \
-                   if find \"$d\" -mmin -{idle_minutes} -print -quit 2>/dev/null | grep -q .; then \
-                     __gc_source_end; printf 'RCH_GC_SKIP cap active %s\\n' \"$d\"; continue; \
-                   fi; \
+                   {source_begin}\
+                   {held_recent}\
                    if __rmerr=$(rm -rf -- \"$d\" 2>&1); then \
                      removed=$((removed + 1)); freed_kb=$((freed_kb + __k)); total_kb=$((total_kb - __k)); \
                      printf 'RCH_REAP_RM %s cap %s\\n' \"$__k\" \"$d\"; \
                    else \
                      printf 'RCH_REAP_ERR cap %s :: %s\\n' \"$d\" \"$(printf '%s' \"$__rmerr\" | head -1)\"; \
                    fi; \
-                   __gc_source_end; \
+                   {source_end}\
                  done < \"$__tmpf3\"; \
                  printf 'RCH_REAP_CAP final_kb=%s\\n' \"$total_kb\"; \
                fi; \
                rm -f \"$__lst\" \"$__tmpf3\"; \
-             fi; "
+             fi; ",
+            source_begin = checked_source_admission("cap"),
+            source_end = SOURCE_GC_CHECKED_RETIREMENT,
+            early_recent = checked_source_recent_activity(&idle_minutes.to_string(), "cap", false),
+            held_recent = checked_source_recent_activity(&idle_minutes.to_string(), "cap", true),
         ),
         None => String::new(),
     };
@@ -1442,12 +1560,10 @@ fn collect_paths_command_with_registry(
          for __e in{list}; do \
            __mins=${{__e%%:*}}; __r=${{__e#*:}}; __tag=${{__r%%:*}}; d=${{__r#*:}}; \
            if [ ! -d \"$d\" ]; then printf 'RCH_GC_SKIP %s missing %s\\n' \"$__tag\" \"$d\"; continue; fi; \
-           if find \"$d\" -mmin -\"$__mins\" -print -quit 2>/dev/null | grep -q .; then \
-             printf 'RCH_GC_SKIP %s active %s\\n' \"$__tag\" \"$d\"; continue; fi; \
+           {early_recent}\
            if ! __gc_gates_ok \"$d\"; then printf 'RCH_GC_SKIP %s gate %s\\n' \"$__tag\" \"$d\"; continue; fi; \
-           if ! __gc_source_begin \"$d\"; then printf 'RCH_GC_SKIP %s source-ownership %s\\n' \"$__tag\" \"$d\"; continue; fi; \
-           if find \"$d\" -mmin -\"$__mins\" -print -quit 2>/dev/null | grep -q .; then \
-             __gc_source_end; printf 'RCH_GC_SKIP %s active %s\\n' \"$__tag\" \"$d\"; continue; fi; \
+           {source_begin}\
+           {held_recent}\
            sz=$(du -sk \"$d\" 2>/dev/null | awk '{{print $1}}'); [ -z \"$sz\" ] && sz=0; \
            if __rmerr=$(rm -rf -- \"$d\" 2>&1); then \
              removed=$((removed + 1)); freed_kb=$((freed_kb + sz)); \
@@ -1455,13 +1571,17 @@ fn collect_paths_command_with_registry(
            else \
              printf 'RCH_REAP_ERR %s %s :: %s\\n' \"$__tag\" \"$d\" \"$(printf '%s' \"$__rmerr\" | head -1)\"; \
            fi; \
-           __gc_source_end; \
+           {source_end}\
          done; \
          {gate_cleanup}\
          printf 'RCH_WORKER_REAP_METRICS removed=%s freed_kb=%s\\n' \"$removed\" \"$freed_kb\"",
         gates = gate_snapshot_fragment(),
         gate_cleanup = gate_snapshot_cleanup(),
         source_gate = source_claim_gate_fragment(registry),
+        source_begin = checked_source_admission("\"$__tag\""),
+        source_end = SOURCE_GC_CHECKED_RETIREMENT,
+        early_recent = checked_source_recent_activity("\"$__mins\"", "\"$__tag\"", false),
+        held_recent = checked_source_recent_activity("\"$__mins\"", "\"$__tag\"", true),
     ))
 }
 
@@ -2204,7 +2324,7 @@ mod tests {
             cmd.contains("if ! __gc_gates_ok \"$d\"; then printf 'RCH_GC_SKIP cap gate"),
             "a disk budget must not evict a dir a build is holding open"
         );
-        assert!(cmd.contains("printf 'RCH_GC_SKIP cap active"));
+        assert!(cmd.contains("printf 'RCH_GC_SKIP %s active %s\\n' cap"));
     }
 
     #[test]
@@ -2944,15 +3064,11 @@ mod tests {
             .env("TMPDIR", scratch)
             .output()
             .unwrap();
-        assert!(output.status.success());
+        assert!(!output.status.success(), "{output:?}");
         assert!(candidate.join("artifact.o").exists());
         let stdout = String::from_utf8_lossy(&output.stdout);
-        assert_eq!(parse_worker_reap_metrics(&stdout).unwrap().0, 0);
-        assert!(
-            parse_gc_skips(&stdout)
-                .iter()
-                .any(|skip| skip.reason == "source-ownership")
-        );
+        assert!(parse_worker_reap_metrics(&stdout).is_none());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("RCH_GC_ADMISSION_UNKNOWN"));
     }
 
     #[cfg(target_os = "linux")]
@@ -3064,6 +3180,343 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn source_gc_registry_setup_failure_stops_before_success_metrics() {
+        use std::io::Write;
+
+        let directory = tempfile::Builder::new()
+            .prefix("source-gc-registry-failure-")
+            .disable_cleanup(true)
+            .tempdir()
+            .unwrap()
+            .keep();
+        let directory = directory.canonicalize().unwrap();
+        let candidate = directory.join("candidate");
+        std::fs::create_dir(&candidate).unwrap();
+        let original = candidate.join("original-input");
+        let registry = directory.join("occupied-registry");
+        for (path, bytes) in [
+            (&original, b"candidate bytes".as_slice()),
+            (&registry, b"registry obstruction".as_slice()),
+        ] {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+                .unwrap()
+                .write_all(bytes)
+                .unwrap();
+        }
+        let script = format!(
+            "{}\nset -eu; while IFS= read -r d; do {}\n\
+             __gc_source_end; done; printf 'RCH_WORKER_REAP_METRICS removed=0 freed_kb=0\\n'",
+            source_claim_gc_guard_fragment_with_registry(registry.to_str().unwrap()),
+            checked_source_admission("ttl"),
+        );
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", &script, "registry-failure"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        writeln!(child.stdin.take().unwrap(), "{}", candidate.display()).unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        assert!(output.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("RCH_GC_ADMISSION_UNKNOWN"));
+        assert_eq!(std::fs::read(original).unwrap(), b"candidate bytes");
+        assert_eq!(std::fs::read(registry).unwrap(), b"registry obstruction");
+    }
+
+    #[test]
+    fn source_gc_recent_activity_distinguishes_live_idle_and_missing_inputs() {
+        use std::io::Write;
+
+        let directory = tempfile::Builder::new()
+            .prefix("source-gc-recent-")
+            .disable_cleanup(true)
+            .tempdir()
+            .unwrap()
+            .keep();
+        let directory = directory.canonicalize().unwrap();
+        let original = directory.join("original-input");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&original)
+            .unwrap()
+            .write_all(b"recent input bytes")
+            .unwrap();
+        let script = format!(
+            "{}\n__gc_source_recent_activity \"$1\" 5",
+            source_claim_gc_guard_fragment_with_registry(
+                directory.join("unused-registry").to_str().unwrap()
+            ),
+        );
+        for expected in [0, 1] {
+            if expected == 1 {
+                let old = std::time::SystemTime::now() - std::time::Duration::from_secs(10 * 60);
+                for path in [&original, &directory] {
+                    std::fs::File::open(path)
+                        .unwrap()
+                        .set_modified(old)
+                        .unwrap();
+                }
+            }
+            let output = std::process::Command::new("sh")
+                .args(["-c", &script, "recent-activity"])
+                .arg(&directory)
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(expected), "{output:?}");
+            assert!(output.stdout.is_empty() && output.stderr.is_empty());
+            assert_eq!(std::fs::read(&original).unwrap(), b"recent input bytes");
+        }
+        let unknown = std::process::Command::new("sh")
+            .args(["-c", &script, "missing-activity"])
+            .arg(directory.join("missing-root"))
+            .output()
+            .unwrap();
+        assert_eq!(unknown.status.code(), Some(2), "{unknown:?}");
+        assert!(String::from_utf8_lossy(&unknown.stderr).contains("RCH_GC_ACTIVITY_UNKNOWN"));
+        assert_eq!(std::fs::read(original).unwrap(), b"recent input bytes");
+        assert!(!directory.join("unused-registry").exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn source_gc_retention_blocks_without_a_claim_and_keeps_unmarked_siblings_admissible() {
+        use std::io::Write;
+        use std::os::unix::fs::symlink;
+
+        for marker_location in ["candidate", "descendant", "ancestor", "sibling"] {
+            let directory = tempfile::Builder::new()
+                .prefix("source-gc-retention-")
+                .disable_cleanup(true)
+                .tempdir()
+                .unwrap()
+                .keep();
+            let directory = directory.canonicalize().unwrap();
+            let candidate = directory.join("project/candidate with ' quote");
+            let registry = directory.join("claims");
+            std::fs::create_dir_all(&candidate).unwrap();
+            let original = candidate.join("original-input");
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&original)
+                .unwrap()
+                .write_all(b"source retention input")
+                .unwrap();
+            let marker_root = match marker_location {
+                "candidate" => candidate.clone(),
+                "descendant" => candidate.join("retired-source"),
+                "ancestor" => directory.join("project"),
+                "sibling" => directory.join("project/marked-sibling"),
+                _ => unreachable!(),
+            };
+            std::fs::create_dir_all(&marker_root).unwrap();
+            symlink(
+                "retention-metadata-not-a-path",
+                marker_root.join(".rch-retention-v1"),
+            )
+            .unwrap();
+            let held = marker_location != "sibling";
+            let script = format!(
+                "{}\nset -eu; candidate=$1;\n{}",
+                source_claim_gc_guard_fragment_with_registry(registry.to_str().unwrap()),
+                if held {
+                    r#"
+if __gc_source_begin "$candidate"; then exit 10; else [ "$?" -eq 3 ]; fi;
+[ -z "$__gc_reservation" ];
+[ ! -e "$__gc_source_registry/released" ];
+for record in "$__gc_source_registry"/*.claim "$__gc_source_registry"/*.pending; do
+    [ ! -e "$record" ] && [ ! -L "$record" ];
+done;
+flock -n "$__gc_source_registry/metadata.lock" true;
+"#
+                } else {
+                    r#"
+__gc_source_begin "$candidate";
+claim=$__gc_reservation;
+rch_claim_record_valid "$claim";
+[ "$(cat "$claim")" = "$candidate" ];
+if flock -n -E 73 "$__gc_source_registry/metadata.lock" true; then exit 11;
+else [ "$?" -eq 73 ]; fi;
+__gc_source_end;
+[ ! -e "$claim" ];
+rch_claim_record_valid "$__gc_source_registry/released/${claim##*/}";
+[ "$(cat "$__gc_source_registry/released/${claim##*/}")" = "$candidate" ];
+flock -n "$__gc_source_registry/metadata.lock" true;
+"#
+                },
+            );
+            // Exercise the real private registry and kernel lock; never run
+            // candidate deletion or the shared worker registry in this fixture.
+            let output = std::process::Command::new("sh")
+                .args(["-c", &script, "source-gc-retention"])
+                .arg(&candidate)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{marker_location}: {output:?}");
+            assert_eq!(std::fs::read(original).unwrap(), b"source retention input");
+            assert!(
+                std::fs::symlink_metadata(marker_root.join(".rch-retention-v1"))
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+            if held {
+                assert!(String::from_utf8_lossy(&output.stderr).contains("RCH_GC_RETENTION_HOLD"));
+                assert!(!registry.join("released").exists());
+            } else {
+                assert_eq!(
+                    std::fs::read_dir(registry.join("released"))
+                        .unwrap()
+                        .count(),
+                    1
+                );
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn checked_source_admission_uses_the_same_physical_candidate_as_its_claim() {
+        use std::io::Write;
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::Builder::new()
+            .prefix("source-gc-physical-")
+            .disable_cleanup(true)
+            .tempdir()
+            .unwrap()
+            .keep();
+        let directory = directory.canonicalize().unwrap();
+        let candidate = directory.join("physical-parent/candidate");
+        std::fs::create_dir_all(&candidate).unwrap();
+        let original = candidate.join("original-input");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&original)
+            .unwrap()
+            .write_all(b"physical candidate bytes")
+            .unwrap();
+        let alias = directory.join("alias-parent");
+        symlink(candidate.parent().unwrap(), &alias).unwrap();
+        let registry = directory.join("claims");
+        let script = format!(
+            "{}\nset -eu; for d in \"$1\"; do {}\n\
+             [ \"$(cat \"$__gc_reservation\")\" = \"$d\" ]; \
+             __gc_source_end; printf '%s\\n' \"$d\"; done",
+            source_claim_gc_guard_fragment_with_registry(registry.to_str().unwrap()),
+            checked_source_admission("ttl"),
+        );
+        let output = std::process::Command::new("sh")
+            .args(["-c", &script, "source-gc-physical"])
+            .arg(alias.join("candidate"))
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            format!("{}\n", candidate.display())
+        );
+        assert_eq!(
+            std::fs::read(original).unwrap(),
+            b"physical candidate bytes"
+        );
+        assert_eq!(
+            std::fs::read_link(alias).unwrap(),
+            candidate.parent().unwrap()
+        );
+        assert_eq!(
+            std::fs::read_dir(registry.join("released"))
+                .unwrap()
+                .count(),
+            1
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn worker_gc_recent_skip_checks_real_source_retirement_before_success() {
+        use std::io::Write;
+
+        for failed_retirement in [false, true] {
+            let directory = tempfile::Builder::new()
+                .prefix("gc-retirement-skip-")
+                .disable_cleanup(true)
+                .tempdir()
+                .unwrap()
+                .keep();
+            let directory = directory.canonicalize().unwrap();
+            let registry = directory.join("claims");
+            let candidate = directory.join("candidate");
+            std::fs::create_dir(&registry).unwrap();
+            std::fs::create_dir(&candidate).unwrap();
+            let original = candidate.join("original-input");
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&original)
+                .unwrap()
+                .write_all(b"recent source bytes")
+                .unwrap();
+            if failed_retirement {
+                std::os::unix::fs::symlink(&directory, registry.join("released")).unwrap();
+            }
+            // The actual production loop's recent-input branch retires its
+            // real claim before continuing. No removal branch is reached.
+            let body = reap_loop_body_with_source_gate(60, None, "", "", Some("ttl"), true);
+            let script = format!(
+                "{}\nset -u; for d in \"$1\"; do {body} done; printf completed",
+                source_claim_gate_fragment(registry.to_str().unwrap())
+            );
+            let output = std::process::Command::new("sh")
+                .args(["-c", &script, "retirement-skip"])
+                .arg(&candidate)
+                .output()
+                .unwrap();
+            assert_eq!(std::fs::read(&original).unwrap(), b"recent source bytes");
+            assert_eq!(
+                output.status.code(),
+                Some(if failed_retirement { 1 } else { 0 }),
+                "{output:?}"
+            );
+            if failed_retirement {
+                assert!(!String::from_utf8_lossy(&output.stdout).contains("completed"));
+                assert!(
+                    String::from_utf8_lossy(&output.stderr).contains("RCH_GC_RETIREMENT_FAILED")
+                );
+                let claims: Vec<_> = std::fs::read_dir(&registry)
+                    .unwrap()
+                    .map(Result::unwrap)
+                    .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "claim"))
+                    .collect();
+                assert_eq!(claims.len(), 1);
+                assert_eq!(
+                    std::fs::read(claims[0].path()).unwrap(),
+                    format!("{}\n", candidate.display()).as_bytes()
+                );
+            } else {
+                assert_eq!(
+                    output.stdout,
+                    format!("RCH_GC_SKIP ttl active {}\ncompleted", candidate.display()).as_bytes()
+                );
+                assert_eq!(
+                    std::fs::read_dir(registry.join("released"))
+                        .unwrap()
+                        .count(),
+                    1
+                );
+            }
+        }
     }
 
     #[cfg(target_os = "linux")]
