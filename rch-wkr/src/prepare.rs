@@ -25,6 +25,208 @@ const MAX_JOURNAL_BYTES: u64 = 128;
 const MAX_FINGERPRINT_BYTES: u64 = 16 * 1024;
 const LOCK_WAIT: Duration = Duration::from_secs(300);
 const FINGERPRINT_FILE: &str = ".rch_dep_fingerprint.json";
+const MAX_INPUT_BYTES: u64 = 32 * 1024 * 1024;
+// This is the installer's fingerprint vocabulary, in its canonical order.
+// Comparing the computed fingerprint to its report also fails closed if the
+// installer later adds a new input without updating this observation contract.
+const INPUT_NAMES: &[&str] = &[
+    "package.json",
+    "bun.lock",
+    "bun.lockb",
+    "package-lock.json",
+    "pnpm-lock.yaml",
+    "yarn.lock",
+    "bunfig.toml",
+];
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct InputIdentity {
+    len: u64,
+    modified: std::time::SystemTime,
+    #[cfg(unix)]
+    inode: (u64, u64, i64, i64),
+}
+
+impl InputIdentity {
+    fn of(metadata: &std::fs::Metadata) -> Result<Self> {
+        ensure!(
+            metadata.file_type().is_file(),
+            "dependency input is not a regular file"
+        );
+        Ok(Self {
+            len: metadata.len(),
+            modified: metadata.modified()?,
+            #[cfg(unix)]
+            inode: {
+                use std::os::unix::fs::MetadataExt;
+                (
+                    metadata.dev(),
+                    metadata.ino(),
+                    metadata.ctime(),
+                    metadata.ctime_nsec(),
+                )
+            },
+        })
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct InputObservation {
+    identity: InputIdentity,
+    digest: blake3::Hash,
+}
+
+struct DependencyInputs {
+    members: Vec<Option<InputObservation>>,
+    fingerprint: install::DependencyFingerprint,
+    #[cfg(unix)]
+    root: (u64, u64),
+}
+
+impl DependencyInputs {
+    fn capture(project: &Path) -> Result<Self> {
+        let root = std::fs::symlink_metadata(project)?;
+        ensure!(
+            root.file_type().is_dir(),
+            "dependency project is not a real directory"
+        );
+        let mut budget = MAX_INPUT_BYTES;
+        let mut hasher = blake3::Hasher::new();
+        let mut sources = Vec::new();
+        let mut members = Vec::new();
+        for name in INPUT_NAMES {
+            let path = project.join(name);
+            let metadata = match std::fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    members.push(None);
+                    continue;
+                }
+                Err(error) => return Err(error).with_context(|| format!("inspect {name}")),
+            };
+            let before = InputIdentity::of(&metadata)
+                .with_context(|| format!("inspect {name}"))?;
+            budget = budget
+                .checked_sub(before.len)
+                .context("dependency inputs exceed byte limit")?;
+            let mut file = File::open(&path).with_context(|| format!("open {name}"))?;
+            ensure!(
+                InputIdentity::of(&file.metadata()?)? == before,
+                "{name} changed before read"
+            );
+            let mut bytes = Vec::new();
+            (&mut file).take(before.len + 1).read_to_end(&mut bytes)?;
+            ensure!(
+                bytes.len() as u64 == before.len
+                    && InputIdentity::of(&file.metadata()?)? == before
+                    && InputIdentity::of(&std::fs::symlink_metadata(&path)?)? == before,
+                "{name} changed during read"
+            );
+            hasher.update(&(name.len() as u32).to_le_bytes());
+            hasher.update(name.as_bytes());
+            hasher.update(&(bytes.len() as u64).to_le_bytes());
+            hasher.update(&bytes);
+            sources.push((*name).to_owned());
+            members.push(Some(InputObservation {
+                identity: before,
+                digest: blake3::hash(&bytes),
+            }));
+        }
+        ensure!(
+            members[0].is_some(),
+            "package.json is required for dependency preparation"
+        );
+        // Revalidate earlier inputs after reading the last one: a coherent
+        // observation must not combine generations changed during this walk.
+        for (name, observed) in INPUT_NAMES.iter().zip(&members) {
+            let now = match std::fs::symlink_metadata(project.join(name)) {
+                Ok(metadata) => Some(InputIdentity::of(&metadata)?),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error.into()),
+            };
+            ensure!(
+                now.as_ref() == observed.as_ref().map(|input| &input.identity),
+                "{name} changed during capture"
+            );
+        }
+        #[cfg(unix)]
+        let root = {
+            use std::os::unix::fs::MetadataExt;
+            let current = std::fs::symlink_metadata(project)?;
+            ensure!(
+                current.file_type().is_dir()
+                    && (root.dev(), root.ino()) == (current.dev(), current.ino()),
+                "dependency project changed during capture"
+            );
+            (root.dev(), root.ino())
+        };
+        Ok(Self {
+            members,
+            fingerprint: install::DependencyFingerprint {
+                hash: hasher.finalize().to_hex().to_string(),
+                sources,
+            },
+            #[cfg(unix)]
+            root,
+        })
+    }
+
+    fn verify_after(
+        &self,
+        after: &Self,
+        runtime: RequiredRuntime,
+        action: PrepareAction,
+    ) -> Result<()> {
+        #[cfg(unix)]
+        ensure!(
+            self.root == after.root,
+            "dependency project was replaced during preparation"
+        );
+        // Only the chosen installer's newly generated lockfile is permitted.
+        // Existing files (including locks) must retain both bytes and identity.
+        // This mirrors the installer's current Bun/runtime preference exactly.
+        let bun = self.members[1].is_some() || self.members[2].is_some();
+        let pnpm = self.members[4].is_some();
+        let yarn = self.members[5].is_some();
+        let generated: &[&str] = if bun || (runtime == RequiredRuntime::Bun && !pnpm && !yarn) {
+            &["bun.lock", "bun.lockb"]
+        } else if pnpm {
+            &["pnpm-lock.yaml"]
+        } else if yarn {
+            &["yarn.lock"]
+        } else {
+            &["package-lock.json"]
+        };
+        for ((name, before), current) in INPUT_NAMES
+            .iter()
+            .zip(&self.members)
+            .zip(&after.members)
+        {
+            match (before, current) {
+                (Some(before), Some(current)) if before == current => {}
+                (None, None) => {}
+                (None, Some(_))
+                    if action == PrepareAction::Installed && generated.contains(name) => {}
+                _ => bail!("dependency input {name} changed during preparation"),
+            }
+        }
+        Ok(())
+    }
+}
+
+fn preflight_cache_files(project: &Path) -> Result<()> {
+    for name in [FINGERPRINT_FILE, ".rch_dep_fingerprint.json.tmp"] {
+        match std::fs::symlink_metadata(project.join(name)) {
+            Ok(metadata) => ensure!(
+                metadata.file_type().is_file() && metadata.len() <= MAX_FINGERPRINT_BYTES,
+                "invalid dependency cache file: {name}"
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).with_context(|| format!("inspect {name}")),
+        }
+    }
+    Ok(())
+}
 
 /// A kernel lock and an in-place journal share one stable inode. Never unlink
 /// or atomically replace this file: doing so would split concurrent owners.
@@ -66,7 +268,10 @@ impl PrepareTransaction {
         // static symlinks/special files before an open and revalidate the inode
         // after acquisition. No source path is created to repair a failed open.
         match std::fs::symlink_metadata(&path) {
-            Ok(meta) => ensure!(meta.file_type().is_file(), "invalid preparation journal type"),
+            Ok(meta) => ensure!(
+                meta.file_type().is_file(),
+                "invalid preparation journal type"
+            ),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
@@ -173,7 +378,10 @@ fn failure(runtime: RequiredRuntime, started: Instant, error: &anyhow::Error) ->
 
 fn verified_fingerprint(project: &Path, report: &PrepareReport) -> Result<()> {
     match std::fs::symlink_metadata(project.join("node_modules")) {
-        Ok(meta) => ensure!(meta.file_type().is_dir(), "node_modules is not a real directory"),
+        Ok(meta) => ensure!(
+            meta.file_type().is_dir(),
+            "node_modules is not a real directory"
+        ),
         // An empty dependency set (or a non-node_modules package-manager
         // layout) can install successfully without creating this directory.
         // The installer will not reuse that case as a node_modules cache hit.
@@ -187,7 +395,10 @@ fn verified_fingerprint(project: &Path, report: &PrepareReport) -> Result<()> {
         .as_ref()
         .context("preparation fingerprint missing")?;
     let file = File::open(project.join(FINGERPRINT_FILE))?;
-    ensure!(file.metadata()?.is_file(), "cached fingerprint is not a regular file");
+    ensure!(
+        file.metadata()?.is_file(),
+        "cached fingerprint is not a regular file"
+    );
     let mut bytes = Vec::new();
     file.take(MAX_FINGERPRINT_BYTES + 1).read_to_end(&mut bytes)?;
     ensure!(
@@ -216,11 +427,23 @@ pub async fn prepare(
     let started = Instant::now();
     let result = async {
         let mut transaction = PrepareTransaction::acquire(project_root).await?;
+        preflight_cache_files(&transaction.project)?;
+        let inputs = DependencyInputs::capture(&transaction.project)?;
         transaction.record(RUNNING)?;
         let mut report = install::prepare(&transaction.project, runtime, log_dir).await?;
         match report.action {
             PrepareAction::Installed | PrepareAction::Skipped => {
-                if let Err(error) = verified_fingerprint(&transaction.project, &report) {
+                let verified = (|| {
+                    let after = DependencyInputs::capture(&transaction.project)?;
+                    inputs.verify_after(&after, runtime, report.action)?;
+                    ensure!(
+                        report.fingerprint.as_ref() == Some(&after.fingerprint),
+                        "published dependency fingerprint differs from observed inputs"
+                    );
+                    preflight_cache_files(&transaction.project)?;
+                    verified_fingerprint(&transaction.project, &report)
+                })();
+                if let Err(error) = verified {
                     tracing::warn!(
                         target: "rch::wkr::prepare", error = %format!("{error:#}"),
                         journal = %transaction.path.display(),
@@ -264,6 +487,107 @@ pub async fn prepare(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn input_observation_matches_the_installers_fingerprint() {
+        let fixture = tempfile::tempdir().unwrap();
+        for name in INPUT_NAMES {
+            std::fs::write(fixture.path().join(name), format!("contents of {name}")).unwrap();
+        }
+        let inputs = DependencyInputs::capture(fixture.path()).unwrap();
+        assert_eq!(
+            inputs.fingerprint,
+            install::compute_fingerprint(fixture.path()).await.unwrap()
+        );
+        inputs
+            .verify_after(
+                &DependencyInputs::capture(fixture.path()).unwrap(),
+                RequiredRuntime::Node,
+                PrepareAction::Skipped,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn preexisting_inputs_cannot_change_even_when_mtime_is_restored() {
+        let fixture = tempfile::tempdir().unwrap();
+        let manifest = fixture.path().join("package.json");
+        std::fs::write(&manifest, b"first").unwrap();
+        let before = DependencyInputs::capture(fixture.path()).unwrap();
+        let modified = std::fs::metadata(&manifest).unwrap().modified().unwrap();
+        std::fs::write(&manifest, b"other").unwrap();
+        File::options()
+            .write(true)
+            .open(&manifest)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        let after = DependencyInputs::capture(fixture.path()).unwrap();
+        let error = before
+            .verify_after(&after, RequiredRuntime::Node, PrepareAction::Installed)
+            .unwrap_err();
+        assert!(error.to_string().contains("package.json changed"));
+    }
+
+    #[test]
+    fn only_the_selected_installers_new_lockfile_may_appear() {
+        let fixture = tempfile::tempdir().unwrap();
+        std::fs::write(fixture.path().join("package.json"), b"{}").unwrap();
+        let before = DependencyInputs::capture(fixture.path()).unwrap();
+        std::fs::write(fixture.path().join("bun.lock"), b"new lock").unwrap();
+        let after = DependencyInputs::capture(fixture.path()).unwrap();
+        before
+            .verify_after(&after, RequiredRuntime::Bun, PrepareAction::Installed)
+            .unwrap();
+        assert!(
+            before
+                .verify_after(&after, RequiredRuntime::Node, PrepareAction::Installed)
+                .is_err()
+        );
+        assert!(
+            before
+                .verify_after(&after, RequiredRuntime::Bun, PrepareAction::Skipped)
+                .is_err()
+        );
+        std::fs::write(fixture.path().join("bunfig.toml"), b"new configuration").unwrap();
+        assert!(
+            before
+                .verify_after(
+                    &DependencyInputs::capture(fixture.path()).unwrap(),
+                    RequiredRuntime::Bun,
+                    PrepareAction::Installed,
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn input_capture_requires_a_manifest_and_bounds_regular_file_reads() {
+        let fixture = tempfile::tempdir().unwrap();
+        assert!(DependencyInputs::capture(fixture.path()).is_err());
+        let manifest = fixture.path().join("package.json");
+        std::fs::create_dir(&manifest).unwrap();
+        assert!(DependencyInputs::capture(fixture.path()).is_err());
+        std::fs::rename(&manifest, fixture.path().join("retained-directory")).unwrap();
+        let file = File::create(&manifest).unwrap();
+        file.set_len(MAX_INPUT_BYTES + 1).unwrap();
+        assert!(DependencyInputs::capture(fixture.path()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_temp_symlink_cannot_redirect_fingerprint_publication() {
+        let fixture = tempfile::tempdir().unwrap();
+        let sentinel = fixture.path().join("sentinel");
+        std::fs::write(&sentinel, b"retain these bytes").unwrap();
+        std::os::unix::fs::symlink(
+            &sentinel,
+            fixture.path().join(".rch_dep_fingerprint.json.tmp"),
+        )
+        .unwrap();
+        assert!(preflight_cache_files(fixture.path()).is_err());
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"retain these bytes");
+    }
 
     #[tokio::test]
     async fn transaction_excludes_other_handles_without_replacing_its_inode() {

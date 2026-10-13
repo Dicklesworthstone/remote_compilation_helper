@@ -203,12 +203,52 @@ class PrepareTransactions(unittest.TestCase):
 
     def test_failed_stamp_publication_is_not_success(self):
         project, state = self.project("stamp-error")
+        child = self.start(project, state, "blocked")
+        eventually(lambda: (state / "started").exists(), "installer did not start")
+        # Inject the publication failure AFTER preflight and actual install
+        # start; an early metadata refusal is not this scenario's evidence.
         (project / ".rch_dep_fingerprint.json").mkdir()
-        self.assertEqual(self.report(self.start(project, state), 1)["action"], "Failed")
+        (state / "release").write_bytes(b"release\n")
+        self.assertEqual(self.report(child, 1)["action"], "Failed")
         journal, = self.journals()
         self.assertEqual(journal.read_bytes(), RUNNING)
         self.assertEqual(self.report(self.start(project, state), 1)["action"], "Failed")
         self.assertEqual(self.events(state), ["install"])
+
+    def test_changed_manifest_or_lock_cannot_be_certified_by_the_install(self):
+        for index, name in enumerate(("package.json", "package-lock.json")):
+            with self.subTest(name=name):
+                project, state = self.project(f"changed-{index}")
+                child = self.start(project, state, "blocked")
+                eventually(lambda: (state / "started").exists(), "installer did not start")
+                (project / name).write_text('{"changed":"during installation"}\n')
+                (state / "release").write_bytes(b"release\n")
+                self.assertEqual(self.report(child, 1)["action"], "Failed")
+                # The private installer can have written a syntactically valid
+                # *new* stamp. The public transaction must still forbid reuse.
+                self.assertTrue((project / ".rch_dep_fingerprint.json").is_file())
+                self.assertEqual(self.report(self.start(project, state), 1)["action"], "Failed")
+                self.assertEqual(self.events(state), ["install"])
+
+    def test_special_input_and_cache_files_fail_before_an_installer_starts(self):
+        for index, name in enumerate(("package.json", ".rch_dep_fingerprint.json")):
+            with self.subTest(name=name):
+                project, state = self.project(f"special-{index}")
+                path = project / name
+                if path.exists():
+                    path.rename(path.with_suffix(".retained"))
+                os.mkfifo(path)
+                self.assertEqual(self.report(self.start(project, state), 1)["action"], "Failed")
+                self.assertEqual(self.events(state), [])
+
+    def test_fingerprint_temp_symlink_cannot_overwrite_a_retained_file(self):
+        project, state = self.project("temp-alias")
+        sentinel = self.root / "retained-fingerprint-target"
+        sentinel.write_bytes(b"original retained bytes")
+        (project / ".rch_dep_fingerprint.json.tmp").symlink_to(sentinel)
+        self.assertEqual(self.report(self.start(project, state), 1)["action"], "Failed")
+        self.assertEqual(self.events(state), [])
+        self.assertEqual(sentinel.read_bytes(), b"original retained bytes")
 
     def test_journal_symlink_is_refused_without_changing_its_target(self):
         project, state = self.project("journal-type")
