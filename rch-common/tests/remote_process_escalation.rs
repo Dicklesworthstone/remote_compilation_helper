@@ -223,6 +223,30 @@ fn foreign_procfs_cannot_authorize_signals_or_empty_group_claims() {
     run_case(NAMESPACE_FENCING);
 }
 
+const SUBSHELL_OBSERVATION: &str = r#"
+# $$ names the invoking shell inside ( ... ), but /proc/self is the subshell.
+# The watchdog's timer reads its own sleep from a subshell; failing closed
+# there silently disabled every remote build deadline.
+rch_check_procfs_namespace || exit 1
+( rch_check_procfs_namespace ) || exit 2
+( ( rch_check_procfs_namespace ) ) || exit 3
+(
+    sleep 30 &
+    test_sleep=$!
+    rch_pgid=$(ps -o pgid= -p "$test_sleep" | tr -d ' ')
+    rch_read_process "$test_sleep"
+    test_code=$?
+    kill "$test_sleep"
+    wait "$test_sleep" 2>/dev/null
+    [ "$test_code" = 0 ] && [ -n "$rch_observed_start" ]
+) || exit 4
+"#;
+
+#[test]
+fn subshells_observe_their_own_procfs_namespace() {
+    run_case(SUBSHELL_OBSERVATION);
+}
+
 const PROCESS_STATES: &str = r#"
 rch_pgid=300
 rch_check_procfs_namespace() { return 0; }

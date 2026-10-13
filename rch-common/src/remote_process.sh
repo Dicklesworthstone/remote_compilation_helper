@@ -19,12 +19,16 @@ rch_valid_boot() {
 # exactly our own ID: equality with just the first ID can occur by coincidence.
 # Use builtin read so /proc/self describes this shell, not a spawned reader.
 # Missing namespace evidence (including older kernels) fails closed.
+# Inside ( ... ) $$ still names the invoking shell while /proc/self is this
+# subshell (the watchdog's timer is one), so compare with this process's own
+# ID: a command exec'd from a substitution reports it as its parent.
 rch_check_procfs_namespace() {
+    rch_self_pid=$(exec sh -c 'echo "$PPID"') || return 1
     while IFS= read -r rch_status_line; do
         case "$rch_status_line" in
             NSpid:*)
                 set -- ${rch_status_line#NSpid:}
-                [ "$#" -eq 1 ] && [ "$1" = "$$" ]
+                [ "$#" -eq 1 ] && [ "$1" = "$rch_self_pid" ]
                 return $?;;
         esac
     done < /proc/self/status 2>/dev/null
