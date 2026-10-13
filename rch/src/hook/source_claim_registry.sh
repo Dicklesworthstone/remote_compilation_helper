@@ -1,5 +1,7 @@
-# This short transaction runs under the registry flock. The caller retains the
-# complete source hierarchy independently; no descriptor number is repurposed.
+# This short transaction runs under the registry flock. Source admission and
+# recovery callers retain their complete source hierarchy independently. The
+# create-only topology operation instead retains this mutex through mutation;
+# shared translation parents never become a build's durable source grant.
 set -eu
 umask 077
 registry=$1
@@ -16,6 +18,18 @@ cancelling="$registry/$token.$digest.cancelling"
 refuse() {
     printf 'RCH: durable source ownership: %s\n' "$1" >&2
     exit 73
+}
+
+# Only a validated overlap before a grant exists may request admission retry.
+# Recovery and the original acquire operation retain their fail-closed contract.
+busy() {
+    case "$operation" in
+        try-acquire|topology)
+            printf 'RCH: durable source ownership: %s\n' "$1" >&2
+            exit 75
+            ;;
+        *) refuse "$1" ;;
+    esac
 }
 
 validate_record() {
@@ -236,7 +250,7 @@ for previous in "$registry/quarantine/$token."*.pending; do
     [ -e "$previous" ] || [ -L "$previous" ] || continue
     [ ! -L "$previous" ] && [ -f "$previous" ] || refuse 'invalid quarantined claim'
     [ "$previous" = "$registry/quarantine/$token.$digest.pending" ] || refuse 'quarantined source identity roots changed'
-    case "$operation" in acquire|recover) refuse 'source intent has an incomplete quarantined claim' ;; esac
+    case "$operation" in acquire|try-acquire|recover|topology) refuse 'source intent has an incomplete quarantined claim' ;; esac
 done
 
 # Terminal replies retire the caller's recovery obligations. Validate the
@@ -356,10 +370,23 @@ if [ "$operation" = release ]; then
     exit 0
 fi
 
-case "$operation" in acquire|recover) ;; *) refuse 'unknown claim operation' ;; esac
+case "$operation" in acquire|try-acquire|recover|topology) ;; *) refuse 'unknown claim operation' ;; esac
 [ ! -e "$released" ] && [ ! -L "$released" ] || refuse 'source grant already released'
 [ ! -e "$cancelled" ] && [ ! -L "$cancelled" ] || refuse 'source intent cancelled'
 [ ! -e "$cancelling" ] && [ ! -L "$cancelling" ] || refuse 'source intent cancellation is unfinished'
+
+if [ "$operation" = topology ]; then
+    # The caller supplies the existing read-only topology validator and its
+    # create-only counterpart. Both run under THIS metadata flock. Recheck
+    # after waiting: another initializer may have finished and admitted a job.
+    # A healthy topology needs no mutation and therefore no source authority.
+    [ "$#" -eq 6 ] || refuse 'invalid topology transaction'
+    closures_overlap "$requested" roots "$requested" || refuse 'invalid topology scope'
+    if sh -c "$5" >/dev/null 2>&1; then
+        printf 'RCH_TOPOLOGY_OK\n'
+        exit 0
+    fi
+fi
 
 # Preserve lexical roots as immutable identity, but compare physical aliases
 # too. A durable GC claim uses its physical candidate path and must also fence
@@ -393,13 +420,26 @@ for held in "$registry"/*.claim "$registry"/*.pending; do
         ;;
     esac
     if closures_overlap "$requested" file "$held"; then
-        refuse 'unfinished overlapping source owner'
+        busy 'unfinished overlapping source owner'
     fi
     held_physical=$(physical_roots < "$held") || refuse 'cannot resolve physical source roots'
     if closures_overlap "$requested_physical" roots "$held_physical"; then
-        refuse 'unfinished overlapping physical source owner'
+        busy 'unfinished overlapping physical source owner'
     fi
 done
+
+if [ "$operation" = topology ]; then
+    # No active or complete pending lexical/physical source owner overlaps.
+    # Retain the metadata flock through the entire create-only mutation, not
+    # just its check. Every source activity needs an active claim; a claimant
+    # holding kernel locks but not yet admitted must wait and resolve physical
+    # paths AFTER this transaction. Never acquire source locks under metadata:
+    # source acquisition uses the opposite order. The flock supervisor also
+    # outlives its mutator if the dispatcher's control connection disappears.
+    # No durable source claim is created for these shared topology parents.
+    sh -c "$6" || refuse 'topology initialization failed'
+    exit 0
+fi
 
 if [ "$operation" = recover ]; then
     if [ -e "$active" ] || [ -L "$active" ]; then
@@ -417,6 +457,6 @@ else
     rch_claim_write_atomic "$registry" "$pending" "$digest" "$requested" || refuse 'cannot persist source claim'
     matches_request "$pending"
 fi
-sync -f "$pending"
-mv -- "$pending" "$active"
+sync -f "$pending" || refuse 'cannot sync pending source claim'
+mv -- "$pending" "$active" || refuse 'cannot activate source claim'
 confirm_durable_record "$active"

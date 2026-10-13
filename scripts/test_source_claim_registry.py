@@ -17,12 +17,16 @@ import os
 from pathlib import Path
 import shlex
 import shutil
+import signal
 import statistics
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
+
+if sys.platform.startswith("linux"):
+    import fcntl
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = Path(os.environ.get(
@@ -89,14 +93,17 @@ class Registry:
         path.write_bytes(root_bytes(roots))
         return path
 
-    def run(self, token: str, roots: list[str], operation: str = "acquire") -> subprocess.CompletedProcess:
+    def command(self, token: str, roots: list[str], operation: str = "acquire", *arguments: str) -> list[str]:
         body = root_bytes(roots)
         digest = hashlib.sha256(body).hexdigest()
+        return ["flock", "-x", "--", str(self.registry / "metadata.lock"),
+                "sh", "-c", self.script, "rch-source-registry", str(self.registry),
+                token, digest, operation, *arguments]
+
+    def run(self, token: str, roots: list[str], operation: str = "acquire", *arguments: str) -> subprocess.CompletedProcess:
         return subprocess.run(
-            ["flock", "-x", "--", str(self.registry / "metadata.lock"),
-             "sh", "-c", self.script, "rch-source-registry", str(self.registry),
-             token, digest, operation],
-            input=body, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            self.command(token, roots, operation, *arguments),
+            input=root_bytes(roots), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             env=self.env, timeout=45, check=False,
         )
 
@@ -261,6 +268,282 @@ class SourceClaimRegistryTests(unittest.TestCase):
         calls = self.fixture.resolutions()
         self.assertTrue(all(size <= 64 * 1024 for _, size in calls), calls)
         self.assertEqual(self.fixture.path("bb", roots).read_bytes(), root_bytes(roots))
+
+
+@unittest.skipUnless(sys.platform.startswith("linux"), "requires the GNU worker toolchain")
+class SourceAdmission105Tests(unittest.TestCase):
+    """Actual worker registry/retry programs, with local subprocess transports.
+
+    The representative source lock and topology commands isolate the protocol;
+    Rust tests cover production command construction. This is not fleet E2E.
+    """
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="rch-105-")
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.fixture = Registry(self.root)
+        self.canonical = self.root / "projects"
+        self.alias = self.root / "dp"
+        self.scope = [str(self.canonical), str(self.alias)]
+        self.roots = [str(self.canonical / "repo"), str(self.canonical / "repo/.rch-target")]
+        self.source_lock = self.root / "source.lock"
+        self.attempts = self.root / "attempts"
+
+    def accepted(self, result):
+        self.assertEqual(result.returncode, 0, result.stderr.decode(errors="replace"))
+
+    def topology_commands(self):
+        canonical, alias = map(shlex.quote, self.scope)
+        check = f'[ -d {canonical} ] && [ -L {alias} ] && [ "$(readlink -- {alias})" = {canonical} ]'
+        create = (f'set -eu; mkdir -p -- {canonical}; '
+                  f'ln -s -- {canonical} {alias}; printf "RCH_TOPOLOGY_OK\n"')
+        return check, create
+
+    def topology(self, token="cc"):
+        return self.fixture.run(token, self.scope, "topology", *self.topology_commands())
+
+    def wait_for(self, predicate, message):
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if predicate():
+                return
+            time.sleep(0.01)
+        self.fail(message)
+
+    def start_retry(self, attempts=3):
+        # Production retry loop, not a Python retry substitute. Its source-lock
+        # descriptor is opened INSIDE the fresh attempt subshell, as in ssh.rs.
+        command = shlex.join(self.fixture.command("bb", self.roots, "try-acquire"))
+        payload = root_bytes(self.roots).decode()
+        retry = (ROOT / "rch/src/hook/source_claim_admission.sh").read_text()
+        script = (
+            "rch_source_attempt() { (\nset -eu\n"
+            f"exec 9<>{shlex.quote(str(self.source_lock))}\nflock -x 9\n"
+            f"printf 'attempt\n' >> {shlex.quote(str(self.attempts))}\n"
+            f"exec {command} <<'RCH_TEST_ROOTS'\n{payload}RCH_TEST_ROOTS\n"
+            "); }\n"
+            f"rch_admission_attempts={attempts}\n{retry}"
+        )
+        child = subprocess.Popen(["sh"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE, env=self.fixture.env)
+        child.stdin.write(script.encode())
+        child.stdin.close()
+        child.stdin = None
+        self.addCleanup(self.reap, child)
+        self.wait_for(lambda: self.attempts.exists(), "first source attempt never started")
+        return child
+
+    @staticmethod
+    def reap(child):
+        if child.poll() is None:
+            child.kill()
+        child.communicate(timeout=10)
+
+    def finish(self, child, expected):
+        stdout, stderr = child.communicate(timeout=10)
+        self.assertEqual(child.returncode, expected, stderr.decode(errors="replace"))
+        self.assertEqual(stdout, b"", "admission must not synthesize build output")
+
+    def test_topology_does_not_own_shared_bases_and_unrelated_repos_coexist(self):
+        self.accepted(self.topology())
+        self.assertFalse(list(self.fixture.registry.glob("cc.*")))
+        self.accepted(self.fixture.run("aa", self.roots, "try-acquire"))
+        other = [str(self.alias / "different"), str(self.alias / "different/.rch-target")]
+        self.accepted(self.fixture.run("bb", other, "try-acquire"))
+        self.assertEqual(len(list(self.fixture.registry.glob("*.claim"))), 2)
+        self.assertEqual(self.fixture.path("aa", self.roots).read_bytes(), root_bytes(self.roots))
+        self.assertEqual(self.fixture.path("bb", other).read_bytes(), root_bytes(other))
+
+    def test_topology_rechecks_after_another_initializer_finished(self):
+        self.accepted(self.topology())
+        self.accepted(self.fixture.run("aa", self.roots))
+        check, _ = self.topology_commands()
+        result = self.fixture.run("cc", self.scope, "topology", check, "exit 97")
+        self.accepted(result)
+        self.assertEqual(result.stdout, b"RCH_TOPOLOGY_OK\n")
+        self.assertFalse(list(self.fixture.registry.glob("cc.*")))
+
+    def test_missing_alias_cannot_be_initialized_over_an_unfinished_owner(self):
+        self.fixture.seed("aa", self.roots)
+        result = self.topology()
+        self.assertEqual(result.returncode, 75, result.stderr)
+        self.assertFalse(self.canonical.exists())
+        self.assertFalse(self.alias.is_symlink())
+        self.assertEqual(self.fixture.path("aa", self.roots).read_bytes(), root_bytes(self.roots))
+
+    def test_topology_physical_alias_owner_is_not_ignored(self):
+        physical = self.root / "physical"
+        physical.mkdir()
+        self.canonical.symlink_to(physical, target_is_directory=True)
+        held = [str(physical / "repo")]
+        self.fixture.seed("aa", held)
+        result = self.topology()
+        self.assertEqual(result.returncode, 75, result.stderr)
+        self.assertIn(b"physical source owner", result.stderr)
+        self.assertFalse(self.alias.is_symlink())
+
+    def test_topology_corruption_and_invalid_scopes_refuse_before_mutation(self):
+        self.fixture.seed("aa", self.roots).write_bytes(b"corrupt")
+        self.assertEqual(self.topology().returncode, 73)
+        self.assertFalse(self.canonical.exists())
+        for scope in [[], ["relative"], ["/a/../b"]]:
+            result = self.fixture.run("cc", scope, "topology", "false", "exit 97")
+            self.assertEqual(result.returncode, 73, result.stderr)
+
+    def test_topology_retains_metadata_exclusion_through_mutation(self):
+        entered = self.root / "entered"
+        proceed = self.root / "proceed"
+        check, create = self.topology_commands()
+        paused = (f'touch {shlex.quote(str(entered))}; '
+                  f'while [ ! -f {shlex.quote(str(proceed))} ]; do sleep 0.01; done; {create}')
+        initializer = subprocess.Popen(
+            ["nohup", *self.fixture.command("cc", self.scope, "topology", check, paused)],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            env=self.fixture.env,
+        )
+        initializer.stdin.write(root_bytes(self.scope))
+        initializer.stdin.close()
+        initializer.stdin = None
+        self.addCleanup(self.reap, initializer)
+        try:
+            self.wait_for(entered.exists, "topology mutation never started")
+            # Production keeps the metadata supervisor HUP-resistant. Losing
+            # control transport must not drop exclusion beneath its mutator.
+            os.kill(initializer.pid, signal.SIGHUP)
+            with (self.fixture.registry / "metadata.lock").open("a") as lock:
+                with self.assertRaises(BlockingIOError):
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.assertFalse(list(self.fixture.registry.glob("*.claim")))
+        finally:
+            proceed.touch()
+        stdout, stderr = initializer.communicate(timeout=10)
+        self.assertEqual(initializer.returncode, 0, stderr)
+        self.assertEqual(stdout, b"RCH_TOPOLOGY_OK\n")
+        self.accepted(self.fixture.run("aa", self.roots))
+
+    def test_partial_topology_creation_is_idempotently_retryable_without_a_lease(self):
+        check, _ = self.topology_commands()
+        failed = self.fixture.run("cc", self.scope, "topology", check,
+                                  f'mkdir -p {shlex.quote(str(self.canonical))}; exit 75')
+        self.assertEqual(failed.returncode, 73, "mutator failure is not admission contention")
+        self.assertFalse(list(self.fixture.registry.glob("cc.*")))
+        self.accepted(self.topology("dd"))
+
+    def test_try_acquire_distinguishes_real_conflict_from_corruption(self):
+        self.fixture.seed("aa", self.roots)
+        self.assertEqual(self.fixture.run("bb", self.roots, "try-acquire").returncode, 75)
+        self.assertEqual(self.fixture.run("bb", self.roots, "recover").returncode, 73)
+        self.assertFalse(self.fixture.path("bb", self.roots).exists())
+        self.fixture.path("aa", self.roots).write_bytes(b"corrupt")
+        self.assertEqual(self.fixture.run("bb", self.roots, "try-acquire").returncode, 73)
+
+    def test_unrelated_primary_roots_still_conflict_on_a_shared_dependency_or_pool(self):
+        for shared in ("dependency", "target-pool"):
+            with self.subTest(shared=shared), tempfile.TemporaryDirectory() as tmp:
+                fixture = Registry(Path(tmp))
+                common = str(Path(tmp) / shared)
+                first = [str(Path(tmp) / "first"), common]
+                second = [str(Path(tmp) / "second"), common]
+                self.accepted(fixture.run("aa", first, "try-acquire"))
+                result = fixture.run("bb", second, "try-acquire")
+                self.assertEqual(result.returncode, 75, result.stderr)
+                self.assertFalse(fixture.path("bb", second).exists())
+                self.assertEqual(fixture.path("aa", first).read_bytes(), root_bytes(first))
+
+    def test_legacy_broad_grants_require_exact_recovery_and_release(self):
+        self.accepted(self.topology())
+        legacy = self.scope + self.roots
+        self.accepted(self.fixture.run("aa", legacy))
+        other = [str(self.alias / "other")]
+        self.assertEqual(self.fixture.run("bb", other, "try-acquire").returncode, 75)
+        self.assertEqual(self.fixture.run("aa", self.roots, "recover").returncode, 73)
+        self.accepted(self.fixture.run("aa", legacy, "recover"))
+        self.accepted(self.fixture.run("aa", legacy, "release"))
+        self.accepted(self.fixture.run("bb", other, "try-acquire"))
+        receipt = self.fixture.registry / "released" / self.fixture.path("aa", legacy).name
+        self.assertEqual(receipt.read_bytes(), root_bytes(legacy))
+
+    def test_late_release_acknowledgment_cannot_release_the_next_owner(self):
+        self.accepted(self.fixture.run("aa", self.roots, "try-acquire"))
+        self.accepted(self.fixture.run("aa", self.roots, "release"))
+        self.accepted(self.fixture.run("bb", self.roots, "try-acquire"))
+        self.accepted(self.fixture.run("aa", self.roots, "release"))
+        self.assertEqual(self.fixture.path("bb", self.roots).read_bytes(), root_bytes(self.roots))
+        self.assertEqual(self.fixture.run("cc", self.roots, "try-acquire").returncode, 75)
+        self.assertEqual(self.fixture.run("aa", self.roots, "cancel").returncode, 73)
+
+    def test_pending_sync_error_cannot_be_mistaken_for_retryable_contention(self):
+        sync = shutil.which("sync")
+        self.assertIsNotNone(sync)
+        shim = self.root / "tools/sync"
+        shim.write_text(
+            '#!/bin/sh\ncase "${2-}" in *.pending) exit 75;; esac\n'
+            f'exec {shlex.quote(sync)} "$@"\n', encoding="utf-8",
+        )
+        shim.chmod(0o700)
+        result = self.fixture.run("bb", self.roots, "try-acquire")
+        self.assertEqual(result.returncode, 73, result.stderr)
+        self.assertFalse(self.fixture.path("bb", self.roots).exists())
+        self.assertEqual(self.fixture.path("bb", self.roots, "pending").read_bytes(),
+                         root_bytes(self.roots))
+
+    def test_sequential_commands_on_one_worker_wait_for_exact_release(self):
+        # The first command is complete, but its ownership release is delayed.
+        # There is exactly ONE source lock and ONE registry: no worker failover.
+        self.accepted(self.fixture.run("aa", self.roots))
+        child = self.start_retry()
+        self.assertIsNone(child.poll())
+        self.assertFalse(self.fixture.path("bb", self.roots).exists())
+        # Recovery must be able to acquire that SAME lock between attempts.
+        with self.source_lock.open("a") as lock:
+            def recovery_can_lock():
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    return True
+                except BlockingIOError:
+                    return False
+            self.wait_for(recovery_can_lock, "waiting admission monopolized the recovery lock")
+            self.accepted(self.fixture.run("aa", self.roots, "recover"))
+            self.accepted(self.fixture.run("aa", self.roots, "release"))
+        self.finish(child, 0)
+        self.assertGreaterEqual(len(self.attempts.read_text().splitlines()), 2)
+        self.assertEqual(self.fixture.path("bb", self.roots).read_bytes(), root_bytes(self.roots))
+        self.assertTrue((self.fixture.registry / "released" / self.fixture.path("aa", self.roots).name).exists())
+
+    def test_live_owner_exhausts_bounded_attempts_without_losing_ownership(self):
+        self.accepted(self.fixture.run("aa", self.roots))
+        child = self.start_retry(attempts=2)
+        self.finish(child, 75)
+        self.assertEqual(len(self.attempts.read_text().splitlines()), 2)
+        self.assertFalse(self.fixture.path("bb", self.roots).exists())
+        self.assertEqual(self.fixture.path("aa", self.roots).read_bytes(), root_bytes(self.roots))
+
+    def test_cancellation_during_wait_fences_late_admission(self):
+        self.accepted(self.fixture.run("aa", self.roots))
+        child = self.start_retry()
+        self.accepted(self.fixture.run("bb", self.roots, "cancel"))
+        self.accepted(self.fixture.run("aa", self.roots, "release"))
+        self.finish(child, 73)
+        self.assertFalse(self.fixture.path("bb", self.roots).exists())
+        self.assertFalse(self.fixture.path("bb", self.roots, "pending").exists())
+
+    def test_unknown_ownership_is_not_retried(self):
+        self.fixture.seed("aa", self.roots).write_bytes(b"bad")
+        child = self.start_retry()
+        self.finish(child, 73)
+        self.assertEqual(len(self.attempts.read_text().splitlines()), 1)
+
+    def test_retry_does_not_disable_errexit_in_attempt_setup(self):
+        retry = (ROOT / "rch/src/hook/source_claim_admission.sh").read_text()
+        result = subprocess.run(
+            ["sh"], input=(
+                "rch_source_attempt() { ( set -eu; false; echo UNSAFE; ); }\n"
+                f"rch_admission_attempts=2\n{retry}"
+            ).encode(), capture_output=True, timeout=5, check=False,
+        )
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(result.stdout, b"", "failed setup must never reach admission")
 
 
 def benchmark():
