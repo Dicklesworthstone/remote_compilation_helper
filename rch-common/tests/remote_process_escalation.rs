@@ -190,3 +190,74 @@ done
 fn separate_calls_and_preexisting_orphans_cannot_inherit_authority() {
     run_case(NO_INHERITED_AUTHORITY);
 }
+
+const NAMESPACE_FENCING: &str = r#"
+rch_test_dir=$1
+# Simulate foreign, coincidentally equal, and missing namespace IDs through the
+# production builtin-read boundary; this test needs no namespace privileges.
+read() { rch_status_line=$test_status; }
+cat() { printf unexpected > "$rch_test_dir/cat-called"; return 1; }
+ps() { printf unexpected > "$rch_test_dir/ps-called"; return 1; }
+kill() { echo 'unexpected signal with foreign procfs' >&2; exit 99; }
+for test_status in "NSpid: $$ 1" "NSpid: $$ $$" "NSpid: 0" 'NSpid:'; do
+    rch_pgid=300
+    rch_read_process 301
+    [ "$?" = 1 ] || exit 1
+    rch_group_state
+    [ "$?" = 2 ] || exit 1
+    rch_remote_record "$rch_test_dir/receipt" regression
+    [ "$?" = 1 ] && [ ! -e "$rch_test_dir/receipt" ] || exit 1
+done
+rch_read_record() { rch_identified=1; rch_boot=boot; rch_pgid=300; rch_start=100; }
+rch_remote_cancel /unused regression term
+[ "$?" = 44 ] || exit 1
+# An unreadable status or a kernel with no NSpid must not prove group absence.
+read() { return 1; }
+rch_group_state
+[ "$?" = 2 ] || exit 1
+[ ! -e "$rch_test_dir/cat-called" ] && [ ! -e "$rch_test_dir/ps-called" ] || exit 1
+"#;
+
+#[test]
+fn foreign_procfs_cannot_authorize_signals_or_empty_group_claims() {
+    run_case(NAMESPACE_FENCING);
+}
+
+const PROCESS_STATES: &str = r#"
+rch_pgid=300
+rch_check_procfs_namespace() { return 0; }
+cat() {
+    case "$1" in
+        /proc/sys/kernel/random/boot_id)
+            printf '01234567-89ab-cdef-0123-456789abcdef\n';;
+        *)
+            printf '301 (worker (test)) %s 1 300' "$test_state"
+            field=0
+            while [ "$field" -lt 16 ]; do printf ' 0'; field=$((field + 1)); done
+            printf ' 200\n';;
+    esac
+}
+ps() { printf '%s %s S\n301 300 %s\n' "$$" "$$" "$test_state"; }
+for test_state in R S D T t K W P I; do
+    rch_read_process 301 || exit 1
+    [ "$rch_observed_start" = 200 ] || exit 1
+    rch_group_state
+    [ "$?" = 1 ] || exit 1
+done
+for test_state in Z X x; do
+    if rch_read_process 301; then echo 'dead member accepted' >&2; exit 1; fi
+    rch_group_state
+    [ "$?" = 0 ] || exit 1
+done
+for test_state in Q '?' SS; do
+    if rch_read_process 301; then echo 'unknown member state accepted' >&2; exit 1; fi
+done
+test_state=Q
+rch_group_state
+[ "$?" = 2 ] || exit 1
+"#;
+
+#[test]
+fn process_state_observation_is_conservative_and_handles_parentheses() {
+    run_case(PROCESS_STATES);
+}
