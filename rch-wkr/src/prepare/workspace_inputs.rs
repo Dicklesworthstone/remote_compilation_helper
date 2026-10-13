@@ -1,4 +1,4 @@
-//! Bounded input discovery for package.json workspaces.
+//! Bounded input discovery for package.json and pnpm workspaces.
 //!
 //! The package manager remains the authority on which packages to install.
 //! For a glob we fingerprint every package manifest below its literal prefix,
@@ -8,6 +8,7 @@
 
 use super::{InputIdentity, InputObservation, MAX_INPUT_BYTES};
 use anyhow::{Context, Result, bail, ensure};
+use rch_common::pnpm_workspace;
 use std::collections::BTreeSet;
 use std::fs::{File, Metadata};
 use std::io::Read;
@@ -48,11 +49,13 @@ impl DirectoryIdentity {
     }
 }
 
-/// Names plus the directory membership and root-manifest evidence used to
+/// Names plus the directory membership and declaration evidence used to
 /// discover them. Verify AFTER reading the named files, not before their read.
 pub(super) struct Inventory {
     pub(super) names: Vec<String>,
     root_manifest: InputObservation,
+    pnpm_path: PathBuf,
+    pnpm_manifest: Option<InputObservation>,
     directories: Vec<(PathBuf, DirectoryIdentity)>,
 }
 
@@ -61,6 +64,11 @@ impl Inventory {
         ensure!(
             self.root_manifest == *root_manifest,
             "package.json changed between workspace discovery and fingerprinting"
+        );
+        let current = read_pnpm_document(&self.pnpm_path)?.map(|(_, observed)| observed);
+        ensure!(
+            current == self.pnpm_manifest,
+            "pnpm-workspace.yaml changed between workspace discovery and fingerprinting"
         );
         for (path, observed) in &self.directories {
             ensure!(
@@ -71,6 +79,39 @@ impl Inventory {
         }
         Ok(())
     }
+}
+
+/// Observe optional YAML without following a static link or blocking on a FIFO.
+/// The complete raw document also enters DependencyInputs' shared byte budget.
+fn read_pnpm_document(path: &Path) -> Result<Option<(Vec<u8>, InputObservation)>> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("inspect pnpm-workspace.yaml"),
+    };
+    let identity = InputIdentity::of(&metadata).context("inspect pnpm-workspace.yaml")?;
+    ensure!(
+        identity.len <= pnpm_workspace::MAX_DOCUMENT_BYTES as u64,
+        "pnpm-workspace.yaml exceeds document byte limit"
+    );
+    let mut file = File::open(path).context("open pnpm-workspace.yaml")?;
+    ensure!(
+        InputIdentity::of(&file.metadata()?)? == identity,
+        "pnpm-workspace.yaml changed before read"
+    );
+    let mut bytes = Vec::new();
+    (&mut file).take(identity.len + 1).read_to_end(&mut bytes)?;
+    ensure!(
+        bytes.len() as u64 == identity.len
+            && InputIdentity::of(&file.metadata()?)? == identity
+            && InputIdentity::of(&std::fs::symlink_metadata(path)?)? == identity,
+        "pnpm-workspace.yaml changed during read"
+    );
+    let observation = InputObservation {
+        identity,
+        digest: blake3::hash(&bytes),
+    };
+    Ok(Some((bytes, observation)))
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -305,11 +346,29 @@ pub(super) fn discover(project: &Path, root_names: &[&str]) -> Result<Inventory>
             && InputIdentity::of(&std::fs::symlink_metadata(&path)?)? == identity,
         "package.json changed during workspace discovery"
     );
-    let prefixes = declarations(&bytes)?;
+    let mut prefixes = declarations(&bytes)?;
     let root_manifest = InputObservation {
         identity,
         digest: blake3::hash(&bytes),
     };
+    let pnpm_path = project.join(pnpm_workspace::FILE_NAME);
+    let pnpm_document = read_pnpm_document(&pnpm_path)?;
+    if let Some((bytes, _)) = &pnpm_document {
+        // The existing installer selects pnpm only from this lockfile. Do not
+        // silently bootstrap a YAML workspace with its npm/Bun default. This
+        // refusal is before RUNNING, so adding the lock permits a normal retry.
+        ensure!(
+            std::fs::symlink_metadata(project.join("pnpm-lock.yaml"))
+                .is_ok_and(|metadata| metadata.file_type().is_file()),
+            "pnpm workspace preparation requires pnpm-lock.yaml; refusing an npm/Bun bootstrap"
+        );
+        for pattern in pnpm_workspace::package_patterns(bytes).map_err(anyhow::Error::msg)? {
+            if let Some(prefix) = prefix(&pattern)? {
+                prefixes.push(prefix);
+            }
+        }
+    }
+    // Both declaration sources share one traversal and its global limits.
     for prefix in prefixes {
         let mut directory = project.to_path_buf();
         let mut exists = true;
@@ -328,14 +387,18 @@ pub(super) fn discover(project: &Path, root_names: &[&str]) -> Result<Inventory>
             }
         }
     }
-    let names = root_names
-        .iter()
-        .map(|name| (*name).to_owned())
-        .chain(walk.manifests)
-        .collect();
+    let mut names: Vec<String> = root_names.iter().map(|name| (*name).to_owned()).collect();
+    if !root_names.contains(&pnpm_workspace::FILE_NAME) {
+        // Include absence too, just like the optional root lockfiles. Raw YAML
+        // bytes, not parsed/re-serialized settings, invalidate prior stamps.
+        names.push(pnpm_workspace::FILE_NAME.to_owned());
+    }
+    names.extend(walk.manifests);
     Ok(Inventory {
         names,
         root_manifest,
+        pnpm_path,
+        pnpm_manifest: pnpm_document.map(|(_, observed)| observed),
         directories: walk.directories,
     })
 }
@@ -518,5 +581,97 @@ mod tests {
             .join("/");
         member(deep.path(), &format!("packages/{nested}"), "{}");
         assert!(DependencyInputs::capture(deep.path()).is_err());
+    }
+
+    fn pnpm_project(yaml: &str) -> tempfile::TempDir {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("package.json"), b"{}").unwrap();
+        std::fs::write(directory.path().join("pnpm-lock.yaml"), b"lockfileVersion: '9.0'\n").unwrap();
+        std::fs::write(directory.path().join(pnpm_workspace::FILE_NAME), yaml).unwrap();
+        directory
+    }
+
+    #[test]
+    fn pnpm_only_workspace_and_entire_config_participate_in_the_same_fingerprint() {
+        let dir = pnpm_project("packages: ['packages/*']\ncatalog:\n chalk: ^4.0.0\n");
+        member(dir.path(), "packages/a", r#"{"name":"a"}"#);
+        member(dir.path(), "unrelated", "{}");
+        let first = DependencyInputs::capture(dir.path()).unwrap();
+        assert_eq!(first.fingerprint.sources, ["package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml", "packages/a/package.json"]);
+        first.verify_after(&DependencyInputs::capture(dir.path()).unwrap(), RequiredRuntime::Node, PrepareAction::Skipped).unwrap();
+        std::fs::write(dir.path().join(pnpm_workspace::FILE_NAME), "packages: ['packages/*']\ncatalog:\n chalk: ^5.0.0\n").unwrap();
+        let changed = DependencyInputs::capture(dir.path()).unwrap();
+        assert_ne!(first.fingerprint.hash, changed.fingerprint.hash);
+        assert!(first.verify_after(&changed, RequiredRuntime::Node, PrepareAction::Installed).is_err());
+    }
+
+    #[test]
+    fn pnpm_member_changes_cannot_hide_behind_unchanged_yaml_and_lock() {
+        let dir = pnpm_project("packages: ['packages/*']\n");
+        member(dir.path(), "packages/a", r#"{"name":"a"}"#);
+        let root_files = ["package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml"];
+        let original: Vec<_> = root_files.iter().map(|name| std::fs::read(dir.path().join(name)).unwrap()).collect();
+        let mut before = DependencyInputs::capture(dir.path()).unwrap();
+        for operation in ["edit", "add", "remove"] {
+            match operation {
+                "edit" => member(dir.path(), "packages/a", r#"{"name":"changed"}"#),
+                "add" => member(dir.path(), "packages/b", "{}"),
+                _ => std::fs::rename(dir.path().join("packages/b"), dir.path().join("retained-b")).unwrap(),
+            }
+            let after = DependencyInputs::capture(dir.path()).unwrap();
+            assert_ne!(before.fingerprint.hash, after.fingerprint.hash, "{operation}");
+            assert!(before.verify_after(&after, RequiredRuntime::Bun, PrepareAction::Installed).is_err());
+            assert_eq!(original, root_files.iter().map(|name| std::fs::read(dir.path().join(name)).unwrap()).collect::<Vec<_>>());
+            before = after;
+        }
+    }
+
+    #[test]
+    fn pnpm_discovery_rechecks_declaration_presence_and_contents() {
+        let dir = pnpm_project("packages: ['packages/*']\n");
+        let inventory = discover(dir.path(), super::super::install::INPUT_NAMES).unwrap();
+        std::fs::write(dir.path().join(pnpm_workspace::FILE_NAME), "packages: ['other/*']\n").unwrap();
+        assert!(inventory.verify(&inventory.root_manifest).is_err());
+        let inventory = discover(dir.path(), super::super::install::INPUT_NAMES).unwrap();
+        std::fs::rename(dir.path().join(pnpm_workspace::FILE_NAME), dir.path().join("retained.yaml")).unwrap();
+        assert!(inventory.verify(&inventory.root_manifest).is_err());
+        let absent = discover(dir.path(), super::super::install::INPUT_NAMES).unwrap();
+        std::fs::write(dir.path().join(pnpm_workspace::FILE_NAME), "packages: ['packages/*']\n").unwrap();
+        assert!(absent.verify(&absent.root_manifest).is_err());
+    }
+
+    #[test]
+    fn pnpm_defaults_and_json_declarations_share_a_bounded_union() {
+        let dir = pnpm_project("catalog: {}\n");
+        member(dir.path(), "packages/a", "{}");
+        member(dir.path(), "node_modules/generated", "{}");
+        let inputs = DependencyInputs::capture(dir.path()).unwrap();
+        assert!(inputs.fingerprint.sources.contains(&"packages/a/package.json".to_owned()));
+        assert!(!inputs.fingerprint.sources.iter().any(|name| name.contains("node_modules")));
+        std::fs::write(dir.path().join("package.json"), r#"{"workspaces":["other/*"]}"#).unwrap();
+        std::fs::write(dir.path().join(pnpm_workspace::FILE_NAME), "packages: ['packages/*']\n").unwrap();
+        member(dir.path(), "other/b", "{}");
+        let inputs = DependencyInputs::capture(dir.path()).unwrap();
+        assert!(inputs.fingerprint.sources.contains(&"other/b/package.json".to_owned()));
+        assert!(inputs.fingerprint.sources.contains(&"packages/a/package.json".to_owned()));
+    }
+
+    #[test]
+    fn pnpm_config_without_its_lock_never_selects_the_default_manager() {
+        let dir = pnpm_project("packages: ['packages/*']\n");
+        std::fs::rename(dir.path().join("pnpm-lock.yaml"), dir.path().join("retained-lock.yaml")).unwrap();
+        let result = DependencyInputs::capture(dir.path());
+        assert!(result.err().unwrap().to_string().contains("requires pnpm-lock.yaml"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pnpm_yaml_symlink_is_not_followed() {
+        let dir = pnpm_project("packages: ['packages/*']\n");
+        let retained = dir.path().join("retained.yaml");
+        std::fs::rename(dir.path().join(pnpm_workspace::FILE_NAME), &retained).unwrap();
+        std::os::unix::fs::symlink(&retained, dir.path().join(pnpm_workspace::FILE_NAME)).unwrap();
+        assert!(DependencyInputs::capture(dir.path()).is_err());
+        assert_eq!(std::fs::read(retained).unwrap(), b"packages: ['packages/*']\n");
     }
 }

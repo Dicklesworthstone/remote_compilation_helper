@@ -58,6 +58,7 @@ pub mod patterns;
 #[cfg(test)]
 mod patterns_security_test;
 pub mod placement;
+pub mod pnpm_workspace;
 pub mod pooled_target_key;
 pub mod process_identity;
 pub mod proof_handoff;
