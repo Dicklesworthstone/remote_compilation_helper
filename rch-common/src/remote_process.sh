@@ -98,21 +98,68 @@ rch_group_state() {
     '
 }
 
-# Return 43 for unknown/reused identity, including a live orphan group whose
-# leader has exited. Never signal it based solely on a historical group number.
-rch_signal_group() {
+# Capture live members while the recorded leader still authenticates the group.
+# TERM can kill that leader before a child that ignores TERM. A surviving
+# member's birth identity lets THIS cancellation finish escalation without
+# treating a historical PGID as authority. These witnesses are never persisted.
+rch_capture_group_witnesses() {
+    rch_witnesses=
+    rch_witness_identity=
     [ "$rch_identified" -eq 1 ] && rch_remote_leader_matches || return 43
+    # rch_group_state already validated this snapshot, including our observer.
+    rch_member_pids=$(printf '%s\n' "$rch_snapshot" | LC_ALL=C awk -v group="$rch_pgid" '
+        $2 == group && $3 !~ /^[ZX]/ { print $1 }
+    ') || return 44
+    for rch_member_pid in $rch_member_pids; do
+        if rch_read_process "$rch_member_pid" && [ "$rch_observed_boot" = "$rch_boot" ]; then
+            rch_witnesses="$rch_witnesses $rch_member_pid:$rch_observed_start"
+        fi
+    done
+    # Do not transfer authority across a leader exit/reuse during collection.
+    rch_remote_leader_matches || { rch_witnesses=; return 43; }
+    rch_witness_identity="$rch_boot:$rch_pgid:$rch_start"
+}
+
+rch_remote_witness_matches() {
+    [ "${rch_witness_identity:-}" = "$rch_boot:$rch_pgid:$rch_start" ] || return 1
+    for rch_witness in $rch_witnesses; do
+        rch_witness_pid=${rch_witness%%:*}
+        rch_witness_start=${rch_witness#*:}
+        # rch_read_process also checks current group membership and liveness.
+        if rch_read_process "$rch_witness_pid" &&
+            [ "$rch_observed_boot" = "$rch_boot" ] &&
+            [ "$rch_observed_start" = "$rch_witness_start" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Return 43 for unknown/reused identity. A pre-existing orphan is never adopted;
+# only an authenticated TERM in this call can authorize witnessed escalation.
+rch_signal_group() {
+    [ "$rch_identified" -eq 1 ] || return 43
+    if ! rch_remote_leader_matches; then
+        [ "$1" = KILL ] && [ "${rch_term_sent:-0}" -eq 1 ] &&
+            rch_remote_witness_matches || return 43
+    fi
     # Revalidate immediately before EACH signal. dash requires no `--` here.
     kill -"$1" -"$rch_pgid" 2>/dev/null || :
 }
 
 rch_remote_cancel() {
+    # No authority may leak between calls, even when parsing the next record fails.
+    rch_witnesses=
+    rch_witness_identity=
+    rch_term_sent=0
     rch_read_record "$1" "$2" || return $?
     rch_mode=$3
     rch_group_state
     case $? in 0) return 0;; 1) ;; *) return 44;; esac
     if [ "$rch_mode" = term ]; then
+        rch_capture_group_witnesses || return $?
         rch_signal_group TERM || return $?
+        rch_term_sent=1
         sleep 1 || return 44
         rch_group_state
         case $? in 0) return 0;; 1) ;; *) return 44;; esac
