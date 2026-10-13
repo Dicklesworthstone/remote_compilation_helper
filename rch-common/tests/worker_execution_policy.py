@@ -29,6 +29,15 @@ rch_policy_select_file() {
 '''
 
 
+def setUpModule() -> None:
+    # ananicy-cpp rules on the build fleet put `cargo` and everything it spawns
+    # in SCHED_IDLE, where procps prints NI as "-" and niceness cannot be
+    # observed. Production launchers start from sshd in the normal class.
+    # Leaving SCHED_IDLE for SCHED_OTHER at the same niceness is unprivileged.
+    if sys.platform == "linux" and os.sched_getscheduler(0) not in (os.SCHED_OTHER, os.SCHED_BATCH):
+        os.sched_setscheduler(0, os.SCHED_OTHER, os.sched_param(0))
+
+
 @unittest.skipUnless(sys.platform == "linux", "Linux process identity backend")
 class WorkerExecutionPolicy(unittest.TestCase):
     def setUp(self) -> None:
