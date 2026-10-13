@@ -276,7 +276,13 @@ impl SpeedScoreWeights {
     }
 
     fn as_array(&self) -> [f64; 5] {
-        [self.cpu, self.memory, self.disk, self.network, self.compilation]
+        [
+            self.cpu,
+            self.memory,
+            self.disk,
+            self.network,
+            self.compilation,
+        ]
     }
 
     fn from_array(values: [f64; 5]) -> Self {
@@ -476,7 +482,11 @@ fn normalize_cpu(result: &CpuBenchmarkResult) -> f64 {
 
 fn normalize_memory(result: &MemoryBenchmarkResult) -> f64 {
     reference_score(result.seq_bandwidth_gbps, reference::MEMORY_GBPS, true) * 0.6
-        + reference_score(result.random_latency_ns, reference::MEMORY_LATENCY_NS, false) * 0.4
+        + reference_score(
+            result.random_latency_ns,
+            reference::MEMORY_LATENCY_NS,
+            false,
+        ) * 0.4
 }
 
 fn normalize_disk(result: &DiskBenchmarkResult) -> f64 {
@@ -556,7 +566,10 @@ fn calculate_weighted_total(
         .filter(|(_, weight)| *weight > 0.0)
         .map(|(score, weight)| score * weight)
         .sum();
-    (total.clamp(0.0, 100.0), SpeedScoreWeights::from_array(effective))
+    (
+        total.clamp(0.0, 100.0),
+        SpeedScoreWeights::from_array(effective),
+    )
 }
 
 /// Convenience function to calculate SpeedScore from benchmark results.
@@ -1181,10 +1194,8 @@ mod tests {
         assert_eq!(score.weights.cpu, 0.5);
         assert_eq!(score.weights.memory, 0.5);
         assert_eq!(score.total, (score.cpu_score + score.memory_score) / 2.0);
-        let empty = SpeedScore::calculate_with_weights(
-            &results,
-            &SpeedScoreWeights::from_array([0.0; 5]),
-        );
+        let empty =
+            SpeedScore::calculate_with_weights(&results, &SpeedScoreWeights::from_array([0.0; 5]));
         assert_eq!(empty.total, 0.0);
         assert_eq!(total_weight_sum(empty.weights), 0.0);
     }

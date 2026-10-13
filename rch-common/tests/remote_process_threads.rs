@@ -13,8 +13,8 @@ fn live_threads_behind_zombie_leaders_never_authorize_cleanup_success() {
     let protocol = directory.path().join("protocol.sh");
     std::fs::write(&protocol, rch_common::REMOTE_PROCESS_IDENTITY_SCRIPT)
         .expect("write exact embedded protocol");
-    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/remote_process_threads.py");
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/remote_process_threads.py");
     let output = Command::new("python3")
         .arg("-I")
         .arg(fixture)
