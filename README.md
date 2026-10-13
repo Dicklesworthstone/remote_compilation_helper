@@ -502,7 +502,9 @@ retrieval_min_free_bytes = 67108864
 from the worker's `remote_base`, the checkout and `TMPDIR`. Unset uses the
 job-lease directory's `retrieval/` subtree. Before downloading, Unix retrieval
 checks the selected uncompressed file size plus `retrieval_min_free_bytes`
-against space available to the controller user. This preflight cannot reserve
+against space available to the controller user. Windows-worker tar retrieval
+also stages its bounded archive there and budgets both the archive and extracted
+outputs while they coexist. This preflight cannot reserve
 space against concurrent writers; a later storage failure remains retryable.
 Failure retains the outputs and ownership and does not acknowledge completion.
 Internal `.rch-clean-overlay-base.tar` source archives are excluded even when

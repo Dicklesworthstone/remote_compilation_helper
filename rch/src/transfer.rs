@@ -3267,6 +3267,31 @@ impl TransferPipeline {
         Ok(())
     }
 
+    fn windows_retrieval_archive(
+        &self,
+        selected_bytes: u64,
+        files: u32,
+    ) -> Result<(tempfile::NamedTempFile, u64)> {
+        let bound = selected_bytes
+            .checked_add(u64::from(files).saturating_mul(8192))
+            .and_then(|bytes| bytes.checked_add(1024 * 1024))
+            .context("artifact archive size overflow")?;
+        // The archive and extracted outputs coexist until validation finishes.
+        // Stage both on the configured filesystem rather than spooling through
+        // an unrelated, possibly full TMPDIR/controller root filesystem.
+        std::fs::create_dir_all(&self.project_root)?;
+        self.check_retrieval_space(
+            selected_bytes
+                .checked_add(bound)
+                .context("artifact staging size overflow")?,
+        )?;
+        let archive = tempfile::Builder::new()
+            .prefix("rch-windows-artifacts-")
+            .suffix(".tar.gz")
+            .tempfile_in(&self.project_root)?;
+        Ok((archive, bound))
+    }
+
     fn source_sync_attempt_timeout(&self, effective_excludes: &[String]) -> std::time::Duration {
         if self.transfer_config.sync_timeout_ms.is_some() {
             return self.transfer_config.sync_timeout_for_payload(0);
@@ -5274,21 +5299,15 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
             let selected_size = selected
                 .values()
                 .fold(0_u64, |total, size| total.saturating_add(*size));
-            self.check_retrieval_space(selected_size)?;
             let retry = self.artifact_retry_config_for_size(selected_size);
             let deadline = started + Duration::from_millis(retry.total_timeout_ms);
-            let archive = tempfile::Builder::new()
-                .prefix("rch-windows-artifacts-")
-                .suffix(".tar.gz")
-                .tempfile()?;
+            let (archive, archive_bound) = self.windows_retrieval_archive(selected_size, count)?;
             let mut output = tokio::fs::File::from_std(archive.reopen()?);
             bytes = run_windows_artifact_process(
                 self.worker_ssh_command(worker, &["sh", "-s"]),
                 &windows_artifact_archive_script(remote_path, &selected),
                 &mut output,
-                selected_size
-                    .saturating_add(u64::from(count).saturating_mul(8192))
-                    .saturating_add(1024 * 1024),
+                archive_bound,
                 deadline,
                 cancel.clone(),
                 on_line,
@@ -16385,7 +16404,15 @@ fn main() {
         };
         let selected = windows_artifact_selection(&inventory, &filters).unwrap();
         assert_eq!(selected.len(), 3);
-        let archive = tempfile::NamedTempFile::new().unwrap();
+        let pipeline = TransferPipeline::new(
+            destination.path().to_owned(),
+            "archive-fixture".into(),
+            "identity".into(),
+            TransferConfig::default(),
+        );
+        let (archive, archive_bound) = pipeline
+            .windows_retrieval_archive(selected.values().sum(), selected.len().try_into().unwrap())
+            .unwrap();
         let mut output = tokio::fs::File::from_std(archive.reopen().unwrap());
         let mut shell = Command::new("sh");
         shell.arg("-s");
@@ -16393,7 +16420,7 @@ fn main() {
             shell,
             &windows_artifact_archive_script(source.path().to_str().unwrap(), &selected),
             &mut output,
-            1024 * 1024,
+            archive_bound,
             TokioInstant::now() + Duration::from_secs(10),
             None,
             &mut |_| {},
@@ -17249,6 +17276,41 @@ Total file size: 123 bytes";
                 .to_string()
                 .contains("overflow")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retrieval_archive_uses_durable_stage_and_refuses_insufficient_space() {
+        let stage = tempfile::tempdir().unwrap().keep();
+        let retained = stage.join("retained-output");
+        std::fs::write(&retained, b"retained worker bytes").unwrap();
+        let mut pipeline = TransferPipeline::new(
+            stage.clone(),
+            "archive".into(),
+            "identity".into(),
+            TransferConfig::default(),
+        );
+        let (archive, bound) = pipeline.windows_retrieval_archive(1024, 1).unwrap();
+        assert_eq!(archive.path().parent(), Some(stage.as_path()));
+        assert!(bound > 1024);
+        let (_file, archive_path) = archive.keep().unwrap();
+        pipeline.transfer_config.retrieval_min_free_bytes = u64::MAX / 2;
+        assert!(
+            pipeline
+                .windows_retrieval_archive(1024, 1)
+                .unwrap_err()
+                .to_string()
+                .contains("insufficient controller retrieval storage")
+        );
+        assert!(
+            pipeline
+                .windows_retrieval_archive(u64::MAX, 1)
+                .unwrap_err()
+                .to_string()
+                .contains("overflow")
+        );
+        assert!(archive_path.exists());
+        assert_eq!(std::fs::read(retained).unwrap(), b"retained worker bytes");
     }
 
     #[cfg(target_os = "linux")]
