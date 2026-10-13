@@ -1,0 +1,192 @@
+//! Exercise the actual embedded cancellation protocol, including a real Linux
+//! process group whose leader exits on TERM while its child ignores TERM.
+#![cfg(target_os = "linux")]
+
+use std::process::Command;
+
+fn run_case(body: &str) {
+    for shell in ["sh", "bash"] {
+        let directory = tempfile::tempdir().expect("create fixture directory");
+        std::fs::write(
+            directory.path().join("protocol.sh"),
+            rch_common::REMOTE_PROCESS_IDENTITY_SCRIPT,
+        )
+        .expect("write embedded production protocol");
+        let script = format!("{}\n{body}", rch_common::REMOTE_PROCESS_IDENTITY_SCRIPT);
+        let output = Command::new(shell)
+            .args(["-c", &script, "rch-process-test"])
+            .arg(directory.path())
+            .output()
+            .expect("run shell regression");
+        assert!(
+            output.status.success(),
+            "{shell}: {:?}\nstdout: {}\nstderr: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+}
+
+const LEADER_EXIT: &str = r#"
+rch_test_dir=$1
+rch_test_leader=
+cleanup() {
+    # Teardown also checks birth identity, never an unbound historical PGID.
+    if rch_read_record "$rch_test_dir/receipt" regression; then
+        if rch_remote_leader_matches; then
+            kill -KILL -"$rch_pgid" 2>/dev/null || :
+        elif [ -r "$rch_test_dir/witness" ]; then
+            read -r test_pid test_start < "$rch_test_dir/witness"
+            if rch_read_process "$test_pid" && [ "$rch_observed_start" = "$test_start" ]; then
+                kill -KILL -"$rch_pgid" 2>/dev/null || :
+            fi
+        fi
+    fi
+    if [ -n "$rch_test_leader" ]; then wait "$rch_test_leader" 2>/dev/null || :; fi
+}
+trap cleanup 0
+setsid sh -c '
+    . "$1/protocol.sh"
+    rch_remote_record "$1/receipt" regression || exit 70
+    trap "exit 0" TERM
+    sh -c '\''trap "" TERM; printf ready > "$1/ready"; exec sleep 30'\'' survivor "$1" &
+    printf "%s\n" "$!" > "$1/member"
+    wait
+' leader "$rch_test_dir" >/dev/null 2>&1 &
+rch_test_leader=$!
+attempt=0
+while [ ! -s "$rch_test_dir/member" ] || [ ! -f "$rch_test_dir/ready" ]; do
+    attempt=$((attempt + 1))
+    [ "$attempt" -lt 500 ] || { echo 'fixture did not start' >&2; exit 1; }
+    sleep 0.01
+done
+read -r test_member < "$rch_test_dir/member"
+rch_read_record "$rch_test_dir/receipt" regression || exit 1
+rch_read_process "$test_member" || exit 1
+printf '%s %s\n' "$test_member" "$rch_observed_start" > "$rch_test_dir/witness"
+rch_remote_cancel "$rch_test_dir/receipt" regression term || {
+    echo 'TERM-to-KILL escalation lost group ownership' >&2; exit 1;
+}
+if rch_read_process "$test_member"; then
+    echo 'TERM-ignoring child survived cancellation' >&2
+    exit 1
+fi
+wait "$rch_test_leader" || :
+"#;
+
+#[test]
+fn term_escalation_survives_leader_exit() {
+    run_case(LEADER_EXIT);
+}
+
+const WITNESS_FENCING: &str = r#"
+rch_identified=1
+rch_boot=boot
+rch_pgid=300
+rch_start=100
+rch_witness_identity=boot:300:100
+rch_witnesses='999:999 301:200'
+rch_term_sent=1
+test_boot=boot
+test_start=200
+test_member_live=1
+test_signals=0
+rch_remote_leader_matches() { return 1; }
+rch_read_process() {
+    [ "$1" = 301 ] && [ "$test_member_live" = 1 ] || return 1
+    rch_observed_boot=$test_boot
+    rch_observed_start=$test_start
+}
+kill() { test_signals=$((test_signals + 1)); }
+refused() {
+    rch_signal_group "$1"
+    code=$?
+    [ "$code" = 43 ] && [ "$test_signals" = 1 ] || exit 1
+}
+# An unavailable first witness must not hide a later live, matching witness.
+rch_signal_group KILL || exit 1
+[ "$test_signals" = 1 ] || exit 1
+# Witnesses authorize only escalation, never the initial TERM.
+refused TERM
+rch_term_sent=0
+refused KILL
+rch_term_sent=1
+# PID reuse, reboot, exit/group departure, and a different receipt all fence it.
+test_start=201
+refused KILL
+test_start=200
+test_boot=other-boot
+refused KILL
+test_boot=boot
+test_member_live=0
+refused KILL
+test_member_live=1
+rch_witness_identity=boot:400:100
+refused KILL
+rch_witness_identity=boot:300:101
+refused KILL
+rch_witness_identity=boot:300:100
+rch_identified=0
+refused KILL
+"#;
+
+#[test]
+fn witnesses_require_matching_birth_group_boot_and_current_term() {
+    run_case(WITNESS_FENCING);
+}
+
+const CAPTURE_RACE: &str = r#"
+rch_identified=1
+rch_boot=boot
+rch_pgid=300
+rch_start=100
+rch_snapshot='301 300 S'
+rch_witnesses=stale
+rch_witness_identity=stale
+test_leader_reads=0
+rch_remote_leader_matches() {
+    test_leader_reads=$((test_leader_reads + 1))
+    [ "$test_leader_reads" = 1 ]
+}
+rch_read_process() { rch_observed_boot=boot; rch_observed_start=200; }
+rch_capture_group_witnesses
+code=$?
+[ "$code" = 43 ] && [ -z "$rch_witnesses" ] && [ -z "$rch_witness_identity" ] || exit 1
+"#;
+
+#[test]
+fn leader_exit_during_capture_does_not_transfer_authority() {
+    run_case(CAPTURE_RACE);
+}
+
+const NO_INHERITED_AUTHORITY: &str = r#"
+# Even a parse failure must clear authority inherited from a previous call.
+rch_witnesses='301:200'
+rch_witness_identity=boot:300:100
+rch_term_sent=1
+rch_read_record() { return 42; }
+rch_remote_cancel /unused regression term
+code=$?
+[ "$code" = 42 ] && [ -z "$rch_witnesses" ] &&
+    [ -z "$rch_witness_identity" ] && [ "$rch_term_sent" = 0 ] || exit 1
+# A live group with no matching leader at entry must remain quarantined.
+rch_read_record() { rch_identified=1; rch_boot=boot; rch_pgid=300; rch_start=100; }
+rch_group_state() { rch_snapshot='301 300 S'; return 1; }
+rch_remote_leader_matches() { return 1; }
+rch_read_process() { rch_observed_boot=boot; rch_observed_start=200; }
+kill() { echo 'unexpected signal to unowned group' >&2; exit 99; }
+for mode in term kill; do
+    rch_witnesses='301:200'
+    rch_witness_identity=boot:300:100
+    rch_term_sent=1
+    rch_remote_cancel /unused regression "$mode"
+    code=$?
+    [ "$code" = 43 ] || exit 1
+done
+"#;
+
+#[test]
+fn separate_calls_and_preexisting_orphans_cannot_inherit_authority() {
+    run_case(NO_INHERITED_AUTHORITY);
+}
