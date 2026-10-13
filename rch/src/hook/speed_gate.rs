@@ -20,8 +20,9 @@
 //!   remote is less than `remote_speedup_threshold` times faster;
 //! - bounds local runs to `local_slots` concurrent builds through crash-safe
 //!   lock files, and to machines with at least
-//!   [`LOCAL_MIN_FREE_MEMORY_PCT`] free memory. Otherwise the build is
-//!   offloaded exactly as before.
+//!   [`LOCAL_MIN_FREE_MEMORY_PCT`] free memory. macOS additionally needs known
+//!   compressor-segment headroom and bounded CPU-normalized load. Unknown or
+//!   invalid pressure metrics never admit a local build.
 use super::timing_history::{ProjectTimingData, TimingRecord, timing_cache};
 use rch_common::CompilationKind;
 use std::fs::File;
@@ -31,10 +32,151 @@ use std::path::{Path, PathBuf};
 /// decision cannot outlive the fleet or project it was measured on.
 pub(super) const RESAMPLE_AFTER_SECS: u64 = 7 * 24 * 3600;
 
-/// Local runs need at least this much free memory. On 2026-10-12 mac-studio
-/// panicked when its VM compressor ran out of segments under swarm load, so
-/// the gate refuses to add local builds to a machine that is already short.
+/// Free memory alone is not a compressor-segment exhaustion guard (issue #103).
 pub(super) const LOCAL_MIN_FREE_MEMORY_PCT: u8 = 25;
+
+/// Keep at least half the compressor's segment capacity in reserve. This is
+/// an admission policy, not a prediction of the kernel's panic threshold.
+const LOCAL_MAX_COMPRESSOR_SEGMENT_PCT: u8 = 50;
+/// Refuse at or above two runnable tasks per logical CPU, on either the one-
+/// or five-minute window. A quiet short window cannot hide sustained pressure.
+const LOCAL_MAX_LOAD_PER_CPU: f64 = 2.0;
+
+#[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
+pub(crate) struct MacOsPressure {
+    pub compressor_segments: u64,
+    pub compressor_segment_limit: u64,
+    pub load_average: [f64; 3],
+    pub logical_cpus: u32,
+}
+
+/// Parse the four outputs of the fixed, ordered sysctl query below. Do not
+/// substitute compressed-page utilization for segment utilization: they can
+/// diverge dramatically. Reject partial, extra, malformed and non-finite data.
+#[cfg(any(target_os = "macos", test))]
+fn parse_macos_pressure(output: &str) -> Option<MacOsPressure> {
+    let mut lines = output.lines();
+    let compressor_segments = lines.next()?.trim().parse().ok()?;
+    let compressor_segment_limit = lines.next()?.trim().parse().ok()?;
+    let load = lines.next()?.trim().strip_prefix('{')?.strip_suffix('}')?;
+    let mut values = load.split_whitespace();
+    let load_average = [
+        values.next()?.parse::<f64>().ok()?,
+        values.next()?.parse::<f64>().ok()?,
+        values.next()?.parse::<f64>().ok()?,
+    ];
+    let logical_cpus = lines.next()?.trim().parse().ok()?;
+    if values.next().is_some()
+        || lines.next().is_some()
+        || compressor_segment_limit == 0
+        || compressor_segments > compressor_segment_limit
+        || logical_cpus == 0
+        || load_average
+            .iter()
+            .any(|load| !load.is_finite() || *load < 0.0)
+    {
+        return None;
+    }
+    Some(MacOsPressure {
+        compressor_segments,
+        compressor_segment_limit,
+        load_average,
+        logical_cpus,
+    })
+}
+
+/// Fixed sysctl queries produce only a few lines. Poll their exit rather than
+/// waiting indefinitely on an overloaded host; failed/timed-out probes are
+/// unknown, not healthy. The child is killed and reaped on every error path.
+#[cfg(any(target_os = "macos", test))]
+fn bounded_probe(
+    command: &mut std::process::Command,
+    deadline: std::time::Duration,
+) -> Option<String> {
+    use std::process::Stdio;
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let started = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return status
+                    .success()
+                    .then(|| child.wait_with_output().ok())
+                    .flatten()
+                    .and_then(|output| String::from_utf8(output.stdout).ok());
+            }
+            Ok(None) if started.elapsed() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_sysctl(names: &[&str]) -> Option<String> {
+    bounded_probe(
+        std::process::Command::new("/usr/sbin/sysctl")
+            .env("LC_ALL", "C")
+            .arg("-n")
+            .args(names),
+        std::time::Duration::from_millis(250),
+    )
+}
+
+fn macos_pressure() -> Option<MacOsPressure> {
+    #[cfg(target_os = "macos")]
+    {
+        parse_macos_pressure(&macos_sysctl(&[
+            "vm.compressor.segment.total",
+            "vm.compressor.segment.limit",
+            "vm.loadavg",
+            "hw.logicalcpu",
+        ])?)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
+fn resources_allow_local(
+    free_pct: Option<u8>,
+    require_macos_pressure: bool,
+    pressure: Option<&MacOsPressure>,
+) -> bool {
+    if !memory_allows_local(free_pct) {
+        return false;
+    }
+    if !require_macos_pressure {
+        return true;
+    }
+    let Some(pressure) = pressure else {
+        return false;
+    };
+    // Compare without truncating percentages or overflowing u64 counters.
+    pressure.compressor_segment_limit > 0
+        && u128::from(pressure.compressor_segments) * 100
+            < u128::from(pressure.compressor_segment_limit)
+                * u128::from(LOCAL_MAX_COMPRESSOR_SEGMENT_PCT)
+        && pressure.logical_cpus > 0
+        && pressure
+            .load_average
+            .iter()
+            .all(|load| load.is_finite() && *load >= 0.0)
+        && pressure.load_average[..2]
+            .iter()
+            .all(|load| *load < f64::from(pressure.logical_cpus) * LOCAL_MAX_LOAD_PER_CPU)
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub(super) enum SpeedGateDecision {
@@ -127,14 +269,10 @@ pub(super) fn decide(
 fn memory_free_pct() -> Option<u8> {
     #[cfg(target_os = "macos")]
     {
-        let output = std::process::Command::new("/usr/sbin/sysctl")
-            .args(["-n", "kern.memorystatus_level"])
-            .output()
-            .ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        String::from_utf8_lossy(&output.stdout).trim().parse().ok()
+        macos_sysctl(&["kern.memorystatus_level"])?
+            .trim()
+            .parse()
+            .ok()
     }
     #[cfg(target_os = "linux")]
     {
@@ -158,12 +296,12 @@ fn meminfo_free_pct(meminfo: &str) -> Option<u8> {
     };
     let total = field("MemTotal").filter(|total| *total > 0)?;
     let available = field("MemAvailable")?;
-    u8::try_from((available.min(total) * 100) / total).ok()
+    u8::try_from((u128::from(available.min(total)) * 100) / u128::from(total)).ok()
 }
 
 /// Unknown memory counts as short: the gate only adds load when it can see room.
 fn memory_allows_local(free_pct: Option<u8>) -> bool {
-    free_pct.is_some_and(|pct| pct >= LOCAL_MIN_FREE_MEMORY_PCT)
+    free_pct.is_some_and(|pct| (LOCAL_MIN_FREE_MEMORY_PCT..=100).contains(&pct))
 }
 
 fn local_slot_dir() -> Option<PathBuf> {
@@ -224,15 +362,6 @@ pub(super) fn evaluate(
         }
         SpeedGateDecision::Local(reason) => reason,
     };
-    let free_pct = memory_free_pct();
-    if !memory_allows_local(free_pct) {
-        tracing::info!(
-            target: "rch::hook::speed_gate",
-            free_pct = ?free_pct,
-            "speed gate prefers local, but free memory is below {LOCAL_MIN_FREE_MEMORY_PCT}%; offloading"
-        );
-        return None;
-    }
     let Some(slot) =
         local_slot_dir().and_then(|dir| try_acquire_local_slot(&dir, inputs.local_slots))
     else {
@@ -243,6 +372,22 @@ pub(super) fn evaluate(
         );
         return None;
     };
+    // Sample after acquiring the slot, as close to local admission as possible.
+    // A refused admission drops the slot; it cannot consume local capacity.
+    let free_pct = memory_free_pct();
+    let pressure = macos_pressure();
+    if !resources_allow_local(free_pct, cfg!(target_os = "macos"), pressure.as_ref()) {
+        tracing::info!(
+            target: "rch::hook::speed_gate",
+            free_pct = ?free_pct,
+            macos_pressure = ?pressure,
+            min_free_memory_pct = LOCAL_MIN_FREE_MEMORY_PCT,
+            max_compressor_segment_pct = LOCAL_MAX_COMPRESSOR_SEGMENT_PCT,
+            max_load_per_cpu = LOCAL_MAX_LOAD_PER_CPU,
+            "speed gate prefers local, but resource pressure is unsafe or unknown; offloading"
+        );
+        return None;
+    }
     Some((reason, slot))
 }
 
@@ -257,11 +402,16 @@ pub(crate) struct SpeedGateDiagnosis {
     pub remote_samples: usize,
     pub local_median_ms: Option<u64>,
     pub remote_median_ms: Option<u64>,
-    /// `local` or `remote`, before the slot and memory checks.
+    /// `local` or `remote`, before the placement, slot and resource checks.
     pub decision: Option<String>,
     pub reason: Option<String>,
     pub free_memory_pct: Option<u8>,
     pub min_free_memory_pct: u8,
+    pub macos_pressure: Option<MacOsPressure>,
+    pub max_compressor_segment_pct: u8,
+    pub max_load_per_cpu: f64,
+    /// Resource admission only; this does not grant a slot or override placement.
+    pub resources_allow_local: bool,
 }
 
 pub(crate) fn diagnose(
@@ -284,6 +434,10 @@ pub(crate) fn diagnose(
         Some(SpeedGateDecision::Remote(reason)) => (Some("remote".to_string()), Some(reason)),
         None => (None, None),
     };
+    let free_memory_pct = enabled.then(memory_free_pct).flatten();
+    let pressure = enabled.then(macos_pressure).flatten();
+    let resources_allow_local = enabled
+        && resources_allow_local(free_memory_pct, cfg!(target_os = "macos"), pressure.as_ref());
     SpeedGateDiagnosis {
         enabled,
         local_slots: config.compilation.local_slots,
@@ -295,8 +449,12 @@ pub(crate) fn diagnose(
         remote_median_ms: data.as_ref().and_then(|data| data.median_duration(true)),
         decision,
         reason,
-        free_memory_pct: enabled.then(memory_free_pct).flatten(),
+        free_memory_pct,
         min_free_memory_pct: LOCAL_MIN_FREE_MEMORY_PCT,
+        macos_pressure: pressure,
+        max_compressor_segment_pct: LOCAL_MAX_COMPRESSOR_SEGMENT_PCT,
+        max_load_per_cpu: LOCAL_MAX_LOAD_PER_CPU,
+        resources_allow_local,
     }
 }
 
@@ -431,5 +589,150 @@ mod tests {
             "MemTotal:       100000 kB\nMemFree:        1000 kB\nMemAvailable:   40000 kB\n";
         assert_eq!(meminfo_free_pct(meminfo), Some(40));
         assert_eq!(meminfo_free_pct("MemFree: 1 kB\n"), None);
+    }
+
+    fn healthy_macos() -> MacOsPressure {
+        parse_macos_pressure("49\n100\n{ 1.0 2.0 3.0 }\n8\n").unwrap()
+    }
+
+    #[test]
+    fn macos_segment_admission_is_strict_and_does_not_round_or_overflow() {
+        let mut pressure = healthy_macos();
+        assert!(resources_allow_local(Some(25), true, Some(&pressure)));
+        for used in [50, 51, 100, 101, u64::MAX] {
+            pressure.compressor_segments = used;
+            assert!(!resources_allow_local(Some(100), true, Some(&pressure)));
+        }
+        pressure.compressor_segments = 0;
+        pressure.compressor_segment_limit = 0;
+        assert!(!resources_allow_local(Some(100), true, Some(&pressure)));
+        pressure.compressor_segment_limit = u64::MAX;
+        pressure.compressor_segments = u64::MAX / 2;
+        assert!(resources_allow_local(Some(25), true, Some(&pressure)));
+        pressure.compressor_segments += 1;
+        assert!(!resources_allow_local(Some(25), true, Some(&pressure)));
+        // No integer percentage truncation at a non-integral half-limit.
+        pressure.compressor_segment_limit = 101;
+        pressure.compressor_segments = 50;
+        assert!(resources_allow_local(Some(25), true, Some(&pressure)));
+        pressure.compressor_segments = 51;
+        assert!(!resources_allow_local(Some(25), true, Some(&pressure)));
+    }
+
+    #[test]
+    fn macos_both_load_windows_must_be_below_the_cpu_normalized_limit() {
+        for cpus in [1, 8, 32] {
+            for window in [0, 1] {
+                let mut pressure = healthy_macos();
+                pressure.logical_cpus = cpus;
+                pressure.load_average = [0.0; 3];
+                pressure.load_average[window] = f64::from(cpus) * 2.0 - 0.01;
+                assert!(resources_allow_local(Some(100), true, Some(&pressure)));
+                pressure.load_average[window] = f64::from(cpus) * 2.0;
+                assert!(!resources_allow_local(Some(100), true, Some(&pressure)));
+                pressure.load_average[window] = 140.0;
+                assert!(!resources_allow_local(Some(100), true, Some(&pressure)));
+            }
+        }
+        let mut pressure = healthy_macos();
+        pressure.logical_cpus = 0;
+        assert!(!resources_allow_local(Some(100), true, Some(&pressure)));
+        pressure.logical_cpus = 8;
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0] {
+            for window in 0..3 {
+                pressure.load_average = [0.0; 3];
+                pressure.load_average[window] = value;
+                assert!(!resources_allow_local(Some(100), true, Some(&pressure)));
+            }
+        }
+    }
+
+    #[test]
+    fn all_required_metrics_must_be_known_and_free_memory_must_be_valid() {
+        let pressure = healthy_macos();
+        for free in [None, Some(0), Some(24), Some(101), Some(u8::MAX)] {
+            assert!(!resources_allow_local(free, true, Some(&pressure)));
+            assert!(!resources_allow_local(free, false, None));
+        }
+        for free in [25, 26, 100] {
+            assert!(resources_allow_local(Some(free), true, Some(&pressure)));
+            assert!(!resources_allow_local(Some(free), true, None));
+            // Linux needs its own known memory reading, not macOS-only sysctls.
+            assert!(resources_allow_local(Some(free), false, None));
+        }
+        assert_eq!(
+            meminfo_free_pct(&format!(
+                "MemTotal: {} kB\nMemAvailable: {} kB\n",
+                u64::MAX,
+                u64::MAX
+            )),
+            Some(100)
+        );
+        assert_eq!(meminfo_free_pct("MemTotal: 0 kB\nMemAvailable: 1 kB\n"), None);
+    }
+
+    #[test]
+    fn macos_sysctl_parser_rejects_missing_malformed_and_nonfinite_metrics() {
+        for output in [
+            "",
+            "49\n100\n{ 1 2 3 }\n",
+            "49\n100\n{ 1 2 3 }\n8\nunexpected\n",
+            "unknown oid\n100\n{ 1 2 3 }\n8\n",
+            "-1\n100\n{ 1 2 3 }\n8\n",
+            "49\n0\n{ 1 2 3 }\n8\n",
+            "101\n100\n{ 1 2 3 }\n8\n",
+            "49\n100\n{ 1 2 }\n8\n",
+            "49\n100\n{ 1 2 3 4 }\n8\n",
+            "49\n100\n1 2 3\n8\n",
+            "49\n100\n{ NaN 2 3 }\n8\n",
+            "49\n100\n{ 1 inf 3 }\n8\n",
+            "49\n100\n{ 1 2 -1 }\n8\n",
+            "49\n100\n{ 1 2 3 }\n0\n",
+            "49\n100\n{ 1 2 3 }\n-8\n",
+            "18446744073709551616\n100\n{ 1 2 3 }\n8\n",
+        ] {
+            assert!(parse_macos_pressure(output).is_none(), "{output:?}");
+        }
+        assert!(parse_macos_pressure(" 0\n100 \n{ 0.0 0.0 0.0 }\n8").is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pressure_probes_fail_closed_on_spawn_failure_exit_failure_and_timeout() {
+        use std::process::Command;
+        use std::time::Duration;
+        let missing = tempfile::tempdir().unwrap();
+        assert!(
+            bounded_probe(
+                &mut Command::new(missing.path().join("missing")),
+                Duration::from_secs(1),
+            )
+            .is_none()
+        );
+        assert!(
+            bounded_probe(
+                Command::new("/bin/sh")
+                    .args(["-c", "printf '49\\n100\\n{ 1 2 3 }\\n8\\n'; exit 1"]),
+                Duration::from_secs(1),
+            )
+            .is_none()
+        );
+        assert!(
+            bounded_probe(
+                Command::new("/bin/sh").args(["-c", "exec sleep 10"]),
+                Duration::from_millis(10),
+            )
+            .is_none()
+        );
+        let output = bounded_probe(
+            Command::new("/bin/sh").args(["-c", "printf '49\\n100\\n{ 1 2 3 }\\n8\\n'"]),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        assert!(resources_allow_local(
+            Some(25),
+            true,
+            parse_macos_pressure(&output).as_ref(),
+        ));
     }
 }
