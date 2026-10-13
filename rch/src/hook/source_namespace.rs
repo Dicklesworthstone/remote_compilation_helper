@@ -18,6 +18,7 @@ const REGISTRY: &str = "/tmp/rch-source-authority-locks/claims-v1";
 const PATHS: &str = include_str!("source_namespace_paths.sh");
 const ADMISSION: &str = include_str!("source_claim_admission.sh");
 const CLAIMS: &str = include_str!("source_claim_registry.sh");
+const CONTROL: &str = include_str!("source_namespace_control.sh");
 
 /// The only durable roots are actual sync destinations and exact auxiliary
 /// trees this job mutates. Deliberately accept no topology policy here. A base
@@ -104,11 +105,13 @@ pub(super) async fn initialize_worker_namespace(
     identity: &str,
 ) -> anyhow::Result<()> {
     let script = namespace_command(policy, identity, REGISTRY)?;
-    // Bound the entire exchange, including mutex acquisition and retry sleeps.
-    // Transport ambiguity is a failure, never a reason to replay a build.
+    // Bound the worker as well as the SSH client. Killing only the local SSH
+    // process can leave a queued initializer or a pipe-holding descendant on
+    // the worker, retaining the registry mutex after this future has failed.
+    // CONTROL owns only pre-intent namespace setup, never a source/build grant.
     let output = run_offload_ssh_command_with_stdin(
         worker,
-        "sh -s",
+        CONTROL,
         script.as_bytes(),
         Duration::from_secs(20),
     )
@@ -198,6 +201,9 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn source_namespace_production_command_initializes_without_a_claim() {
+        use std::io::Write as _;
+        use std::process::Stdio;
+
         let temp = tempfile::tempdir().unwrap();
         let canonical = temp.path().join("projects with ' quotes");
         let alias = temp.path().join("alias");
@@ -205,10 +211,20 @@ mod tests {
         let policy = PathTopologyPolicy::new(canonical.clone(), alias.clone());
         let command = namespace_command(&policy, "0123", registry.to_str().unwrap()).unwrap();
         for _ in 0..2 {
-            let output = std::process::Command::new("sh")
-                .args(["-c", &command])
-                .output()
+            let mut child = std::process::Command::new("sh")
+                .args(["-c", CONTROL])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
                 .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(command.as_bytes())
+                .unwrap();
+            let output = child.wait_with_output().unwrap();
             assert!(
                 output.status.success(),
                 "{}",
