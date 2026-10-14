@@ -5,7 +5,7 @@ Compilation Helper): the PreToolUse hook + CLI (`rch`), the local daemon (`rchd`
 worker agent (`rch-wkr`), the RABS build sidecar (`rabs-*`, `rabsd`), and the fleet
 dashboard (`dashboard/`).
 
-Scope window: project inception (`v0.1.0`, 2026-01-25) through `v2.1.25` (2026-10-14).
+Scope window: project inception (`v0.1.0`, 2026-01-25) through `v2.1.26` (2026-10-14).
 
 This document was rebuilt from git history (`git log --no-merges` per tag range, `git show`
 on representative commits), version tags (`git for-each-ref`), GitHub release metadata
@@ -28,6 +28,39 @@ history. They are kept as-is because the descriptions were verified against the 
 but those particular links will 404.
 
 Repository: <https://github.com/Dicklesworthstone/remote_compilation_helper>
+
+## 2.1.26 — 2026-10-14
+
+A project stops being placed on a worker whose live checkout of it refuses source syncs, a worker
+whose source registry cannot persist records is quarantined instead of staying selectable, and the
+disk-pressure log rate limit from 2.1.25 now actually holds. Agent-facing text no longer presents
+re-enabling an operator-disabled worker as the fix.
+
+- **Live-checkout selection fence** (`bd-fbtws`). A dual-role worker refuses every source sync into
+  its declared live checkout of a project, but selection kept choosing it: each build paid a
+  reservation and a refused sync before failing over, and the refusal (which rsync reports as
+  "connection unexpectedly closed") was retried in place as a transport drop. The refusal is now
+  non-retryable, the hook reports it on its release, and rchd keeps that (project, worker) pair out
+  of selection for 6 h ([`accfc2c8`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/accfc2c8106a5717ebc4c14ee637c83c34cdea76)).
+- **A full or quota-exhausted source registry quarantines its worker** (`bd-5ojmb`). On fmd the
+  worker user's /tmp quota filled and every registry write failed, while builds kept being routed
+  there. A source-authority failure reporting `RCH_SOURCE_CLAIM_WRITE_FAILED` now carries the worker's
+  storage fault, so the existing disk-fault path holds the worker out until probes measure headroom
+  ([`5d944bf2`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/5d944bf2a17b680d781219e3ed632e43f85cd803)).
+- **Disk-pressure logging, completed.** 2.1.25's limit compared against the worker's stored
+  assessment, which capability refreshes rewrite every poll, so css still logged every 30 s. The
+  monitor now compares with the verdict it last logged ([`831dc01a`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/831dc01a4fadfe1ca38abbfdfbc86611c45f3ff8)).
+- **Operator-disabled workers.** A pinned request answered "re-enable with `rch workers enable`" and
+  `rch status` printed it as the fix; an agent did exactly that to a production worker on 10-14. The
+  refusal now points at another worker and names re-enabling as the operator's decision
+  ([`df4e1574`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/df4e157475610c8cbc39829f9151245bf70da9c2)).
+- **Recovery** (#107): a successful journal's delivery is validated before source retirement and
+  the terminal shortcut, and live `returned(0)` gets the implicit Make and declared-report checks
+  ([`897a6f75`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/897a6f7570e2daff16f4abed725c36a078495201), [`2b5a3b76`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/2b5a3b76f937197358a33545d85bf2bcb6f271ca)).
+- **RABS Layer-0 pack:** lld is rejected where rust-lld is already the target default (x86_64 Linux,
+  Rust 1.90+), where the knob measured ~20% slower (`bd-k9wg8`, [`b0ee6cac`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/b0ee6cacc1d71a0d50f7ab209c85c8322f416f19)); RABS fixture updates
+  ([`f9fc9d68`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/f9fc9d6809dcadb35d8b90f23d7a909e0d7da9c9), [`585a0ae7`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/585a0ae70e2ceb322e13bd6e8ae040bc7a02bfde), [`d8dd08d2`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/d8dd08d27473446a9ccd35d80f8a06745d64349e)).
+- **Correction to 2.1.25:** its disk-pressure entry did not hold on css (see above).
 
 ## 2.1.25 — 2026-10-14
 
