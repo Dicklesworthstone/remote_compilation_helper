@@ -324,6 +324,32 @@ impl ProbedToolchain {
     }
 }
 
+/// Retain the exact toolchain observation used to key one live request.
+/// This is a read-only witness, not a filesystem lock or execution lease.
+/// A refreshed shared memo must never replace an in-flight request's original
+/// file/directory generations, even when the replacement has identical bytes.
+#[derive(Debug, Clone)]
+pub struct ToolchainGuard {
+    observed: Arc<ProbedToolchain>,
+}
+
+impl ToolchainGuard {
+    /// Recheck the original compiler path and all its observed inputs without
+    /// warming, probing, or adopting a newer memo generation.
+    ///
+    /// # Errors
+    /// The request names another compiler, or its toolchain changed since keying.
+    pub fn verify_unchanged(&self, compiler: &Path) -> Result<(), String> {
+        if compiler != self.observed.inputs.compiler.0.as_path() {
+            return Err("toolchain guard names a different compiler".into());
+        }
+        if !self.observed.still_current() {
+            return Err("toolchain inputs changed after request keying".into());
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug)]
 enum Slot<T> {
     Warming,
@@ -1391,6 +1417,34 @@ impl LiveFacts {
             toolchains.remove(compiler);
         }
         Err(FactsMiss::Pending)
+    }
+
+    /// Retain the ready observation that produced `expected` for this request.
+    /// The memo lock protects only acquisition; later validation uses the
+    /// retained observation and does not block unrelated requests on this lock.
+    ///
+    /// # Errors
+    /// No matching ready observation remains, or its filesystem inputs changed.
+    pub fn toolchain_guard(
+        &self,
+        compiler: &Path,
+        expected: &ToolchainFacts,
+    ) -> Result<ToolchainGuard, FactsMiss> {
+        let observed = {
+            let toolchains = self
+                .toolchains
+                .lock()
+                .map_err(|_| FactsMiss::Refused("toolchain memo poisoned".into()))?;
+            match toolchains.get(compiler) {
+                Some(Slot::Ready(probed)) if &probed.facts == expected => Arc::clone(probed),
+                _ => return Err(FactsMiss::Pending),
+            }
+        };
+        let guard = ToolchainGuard { observed };
+        guard
+            .verify_unchanged(compiler)
+            .map_err(FactsMiss::Refused)?;
+        Ok(guard)
     }
 
     /// The sealed source tree of a registry package or complete Cargo Git
@@ -2861,6 +2915,95 @@ esac
         std::fs::write(root.join("lib/rustlib/test-host/lib/libnew.rlib"), b"new").unwrap();
         assert_eq!(facts.toolchain(&compiler, &[]), Err(FactsMiss::Pending));
         assert!(!facts.toolchains.lock().unwrap().contains_key(&compiler));
+        assert_eq!(*facts.warming.lock().unwrap(), MAX_WARMING);
+    }
+
+    #[test]
+    fn toolchain_guard_requires_the_matching_ready_observation() {
+        let (_dir, compiler) = toolchain_fixture();
+        let probed = probe_toolchain(&compiler, &[]).unwrap();
+        let expected = probed.facts.clone();
+        let facts = LiveFacts::new();
+        assert!(matches!(
+            facts.toolchain_guard(&compiler, &expected),
+            Err(FactsMiss::Pending)
+        ));
+        facts
+            .toolchains
+            .lock()
+            .unwrap()
+            .insert(compiler.clone(), Slot::Ready(Arc::new(probed)));
+        let guard = facts.toolchain_guard(&compiler, &expected).unwrap();
+        guard.verify_unchanged(&compiler).unwrap();
+        let mut wrong_facts = expected;
+        wrong_facts.verbose_version.push_str(" changed");
+        assert!(matches!(
+            facts.toolchain_guard(&compiler, &wrong_facts),
+            Err(FactsMiss::Pending)
+        ));
+        assert!(
+            guard
+                .verify_unchanged(&compiler.with_file_name("another-rustc"))
+                .unwrap_err()
+                .contains("different compiler")
+        );
+    }
+
+    #[test]
+    fn retained_toolchain_guard_cannot_adopt_a_refreshed_equal_byte_generation() {
+        let (_dir, compiler) = toolchain_fixture();
+        let root = compiler.parent().unwrap().parent().unwrap();
+        let probed = probe_toolchain(&compiler, &[]).unwrap();
+        let expected = probed.facts.clone();
+        let facts = LiveFacts::new();
+        facts
+            .toolchains
+            .lock()
+            .unwrap()
+            .insert(compiler.clone(), Slot::Ready(Arc::new(probed)));
+        let original = facts.toolchain_guard(&compiler, &expected).unwrap();
+        facts.toolchains.lock().unwrap().clear();
+        original.verify_unchanged(&compiler).unwrap();
+
+        let library = root.join("lib/libdriver.so");
+        let retained = root.join("lib/retained-runtime");
+        std::fs::rename(&library, &retained).unwrap();
+        std::fs::write(&library, b"runtime-v1").unwrap();
+        let refreshed = probe_toolchain(&compiler, &[]).unwrap();
+        assert_eq!(refreshed.facts, expected, "canonical bytes did not change");
+        facts
+            .toolchains
+            .lock()
+            .unwrap()
+            .insert(compiler.clone(), Slot::Ready(Arc::new(refreshed)));
+        facts
+            .toolchain_guard(&compiler, &expected)
+            .unwrap()
+            .verify_unchanged(&compiler)
+            .unwrap();
+        assert!(original.verify_unchanged(&compiler).is_err());
+    }
+
+    #[test]
+    fn retained_toolchain_guard_detects_membership_without_consuming_warm_capacity() {
+        let (_dir, compiler) = toolchain_fixture();
+        let root = compiler.parent().unwrap().parent().unwrap();
+        let probed = probe_toolchain(&compiler, &[]).unwrap();
+        let expected = probed.facts.clone();
+        let facts = LiveFacts::new();
+        facts
+            .toolchains
+            .lock()
+            .unwrap()
+            .insert(compiler.clone(), Slot::Ready(Arc::new(probed)));
+        let guard = facts.toolchain_guard(&compiler, &expected).unwrap();
+        *facts.warming.lock().unwrap() = MAX_WARMING;
+        std::fs::write(root.join("lib/rustlib/test-host/lib/libnew.rlib"), b"new").unwrap();
+        assert!(guard.verify_unchanged(&compiler).is_err());
+        assert!(matches!(
+            facts.toolchain_guard(&compiler, &expected),
+            Err(FactsMiss::Refused(_))
+        ));
         assert_eq!(*facts.warming.lock().unwrap(), MAX_WARMING);
     }
 
