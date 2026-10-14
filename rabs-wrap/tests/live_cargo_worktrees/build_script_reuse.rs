@@ -118,9 +118,11 @@ fn config_only_build_script_compiles_are_served_across_real_cargo_worktrees() {
         assert_eq!(std::fs::read_dir(&generated).unwrap().count(), 0);
         // Every worktree runs its build script normally, even the served one.
         assert!(
-            stderr(&build)
-                .lines()
-                .any(|line| { line.contains("Running") && line.contains("build-script-build") }),
+            stderr(&build).lines().any(|line| {
+                line.contains("Running")
+                    && (line.contains("/build-script-build")
+                        || line.contains("/build_script_build"))
+            }),
             "build script must execute in {name}: {}",
             stderr(&build)
         );
