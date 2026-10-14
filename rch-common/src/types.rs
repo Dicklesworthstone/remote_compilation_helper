@@ -350,6 +350,19 @@ pub struct SelectionConfig {
         deserialize_with = "deserialize_disk_gb_per_slot"
     )]
     pub disk_gb_per_slot: f64,
+    /// Free-disk ratio at or below which rchd marks a worker Critical and
+    /// gives it no slots (bd-xxck3). Read by rchd at startup.
+    #[serde(default = "default_disk_critical_free_ratio")]
+    pub disk_critical_free_ratio: f64,
+    /// When set, the ratio rule above trips only while free space is also at
+    /// or below this many GB, so a large disk is judged by absolute headroom
+    /// (5% of 900 GB is 45 GB). Unset keeps the ratio rule unconditional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_critical_ratio_cap_gb: Option<f64>,
+}
+
+fn default_disk_critical_free_ratio() -> f64 {
+    0.05
 }
 
 impl Default for SelectionConfig {
@@ -363,6 +376,8 @@ impl Default for SelectionConfig {
             max_load_per_core: default_max_load_per_core(),
             min_free_gb: default_min_free_gb(),
             disk_gb_per_slot: default_disk_gb_per_slot(),
+            disk_critical_free_ratio: default_disk_critical_free_ratio(),
+            disk_critical_ratio_cap_gb: None,
         }
     }
 }

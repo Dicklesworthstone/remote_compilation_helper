@@ -1029,6 +1029,19 @@ async fn main() -> Result<()> {
     let mut rch_config = config::load_rch_config()
         .context("could not resolve RCH configuration before binding the daemon socket")?;
     rch_config.self_healing = rch_config.self_healing.with_env_overrides();
+    // Before any worker is evaluated: placement, the monitor and the sweep
+    // all read this one disk policy (bd-xxck3).
+    let disk_policy = DiskPressurePolicyConfig::from_selection(&rch_config.selection);
+    if disk_policy.critical_free_ratio != DiskPressurePolicyConfig::default().critical_free_ratio
+        || disk_policy.critical_free_ratio_cap_gb.is_some()
+    {
+        info!(
+            critical_free_ratio = disk_policy.critical_free_ratio,
+            critical_free_ratio_cap_gb = ?disk_policy.critical_free_ratio_cap_gb,
+            "disk pressure policy overridden by [selection]"
+        );
+    }
+    DiskPressurePolicyConfig::install(disk_policy);
     let (socket, client_socket) =
         daemon_socket_for_startup(&matches, &rch_config.general.socket_path, |name| {
             std::env::var(name).ok()
@@ -1501,7 +1514,7 @@ async fn main() -> Result<()> {
     let disk_pressure_monitor = DiskPressureMonitor::new(
         worker_pool.clone(),
         telemetry_store.clone(),
-        DiskPressurePolicyConfig::default(),
+        DiskPressurePolicyConfig::configured(),
     )
     .with_build_history(context.history.clone());
     let _disk_pressure_handle = disk_pressure_monitor.start();
