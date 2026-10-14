@@ -1097,6 +1097,23 @@ fn exit_with_local_fallback_recording(
     exit_with_local_run(command, reporter, reason, require_remote, error, None)
 }
 
+/// The Layer 0 pack's env pairs for one remote run (bd-bqu38). A verification
+/// lane (`--clean-overlay`, `--source-content-receipt`) builds exactly what the
+/// project declares, so it never receives the pack (bd-hoxgn).
+fn layer0_env_for_lane(
+    layer0: &rch_common::types::Layer0Config,
+    verification_lane: bool,
+) -> Vec<(String, String)> {
+    if verification_lane {
+        return Vec::new();
+    }
+    layer0
+        .active_env()
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect()
+}
+
 /// Where a local run's duration is recorded (bd-2spi4 speed gate).
 struct LocalRunTiming<'a> {
     project: &'a str,
@@ -3622,12 +3639,7 @@ pub async fn run_exec(
 
     // Layer 0 pack (bd-bqu38): resolve knob env pairs once; empty unless the
     // `[layer0]` section enables the pack.
-    let layer0_env: Vec<(String, String)> = config
-        .layer0
-        .active_env()
-        .into_iter()
-        .map(|(k, v)| (k.to_string(), v.to_string()))
-        .collect();
+    let layer0_env = layer0_env_for_lane(&config.layer0, clean_overlay || source_content_receipt);
 
     // Estimate cores needed
     let estimated_cores =

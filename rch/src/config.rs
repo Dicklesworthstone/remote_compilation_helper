@@ -685,6 +685,7 @@ struct PartialLayer0Config {
     enabled: Option<bool>,
     release_lto_thin: Option<bool>,
     release_codegen_units_1: Option<bool>,
+    debug_line_tables_only: Option<bool>,
 }
 #[derive(Debug, Default, Deserialize)]
 struct PartialGeneralConfig {
@@ -1754,6 +1755,10 @@ fn apply_layer(
         config.layer0.release_codegen_units_1 = cgu_1;
         set_source(sources, "layer0.release_codegen_units_1", source.clone());
     }
+    if let Some(line_tables) = layer.layer0.debug_line_tables_only {
+        config.layer0.debug_line_tables_only = line_tables;
+        set_source(sources, "layer0.debug_line_tables_only", source.clone());
+    }
 }
 
 fn set_source(sources: &mut ConfigSourceMap, key: &str, source: ConfigValueSource) {
@@ -1848,6 +1853,11 @@ fn merge_config(mut base: RchConfig, overlay: RchConfig) -> RchConfig {
         base.layer0
             .release_codegen_units_1
             .clone_from(&overlay.layer0.release_codegen_units_1);
+    }
+    if overlay.layer0.debug_line_tables_only != default.layer0.debug_line_tables_only {
+        base.layer0
+            .debug_line_tables_only
+            .clone_from(&overlay.layer0.debug_line_tables_only);
     }
 
     base
@@ -4370,6 +4380,40 @@ alias_root = "/home/alex/dp"
             "expected UserConfig, got {:?}",
             canonical_source
         );
+    }
+
+    /// The `[layer0]` knobs, including bd-hoxgn's `debug_line_tables_only`,
+    /// load from TOML with their sources tracked, and the project layer can
+    /// turn one off again.
+    #[test]
+    fn test_layer0_section_loaded_from_toml() {
+        let _guard = test_guard!();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let user_path = dir.path().join("user.toml");
+        std::fs::write(
+            &user_path,
+            "[layer0]\nenabled = true\ndebug_line_tables_only = true\n",
+        )
+        .expect("write user config");
+
+        let loaded = load_config_with_sources_from_paths(Some(&user_path), None, None)
+            .expect("load_config_with_sources_from_paths");
+        assert!(loaded.config.layer0.enabled);
+        assert!(loaded.config.layer0.debug_line_tables_only);
+        assert!(!loaded.config.layer0.release_lto_thin);
+        assert!(matches!(
+            loaded.sources.get("layer0.debug_line_tables_only"),
+            Some(ConfigValueSource::UserConfig(_))
+        ));
+
+        let project_path = dir.path().join("project.toml");
+        std::fs::write(&project_path, "[layer0]\ndebug_line_tables_only = false\n")
+            .expect("write project config");
+        let loaded =
+            load_config_with_sources_from_paths(Some(&user_path), Some(&project_path), None)
+                .expect("load_config_with_sources_from_paths");
+        assert!(loaded.config.layer0.enabled);
+        assert!(!loaded.config.layer0.debug_line_tables_only);
     }
 
     /// Regression test for issue #10: env vars must override TOML values.

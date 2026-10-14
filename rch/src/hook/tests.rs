@@ -8326,6 +8326,99 @@ async fn test_terminal_source_sync_failure_never_launches_remote_cargo() {
     );
 }
 
+/// bd-hoxgn: the Layer 0 pack must reach the command that actually runs. It
+/// used to be attached only to workspace-metadata roots, which never execute,
+/// so an enabled `[layer0]` changed nothing for an ordinary project.
+#[tokio::test]
+#[serial(mock_global)]
+async fn test_layer0_pack_reaches_the_executed_remote_command() {
+    let _lock = test_lock().lock().await;
+    let _guard = test_guard!();
+    let socket_path = format!(
+        "/tmp/rch_test_layer0_exec_{}_{}.sock",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock should be after epoch")
+            .as_nanos()
+    );
+    let _overrides = TestOverridesGuard::set(
+        &socket_path,
+        MockConfig::default(),
+        MockRsyncConfig::success(),
+    );
+    mock::clear_global_invocations();
+
+    let (temp_dir, policy) = topology_tempdir();
+    let project_dir = temp_dir.path().join("remote_compilation_helper");
+    std::fs::create_dir_all(&project_dir).expect("create project dir");
+    let prev_cwd = std::env::current_dir().ok();
+    std::env::set_current_dir(&project_dir).expect("cd into project dir");
+
+    let worker = SelectedWorker {
+        id: rch_common::WorkerId::new("mock-worker"),
+        host: "mock.host.local".to_string(),
+        user: "mockuser".to_string(),
+        identity_file: "~/.ssh/mock_key".to_string(),
+        slots_available: 8,
+        speed_score: 90.0,
+        declared_os: None,
+    };
+    let reporter = HookReporter::new(OutputVisibility::None);
+    let layer0 = rch_common::types::Layer0Config {
+        enabled: true,
+        debug_line_tables_only: true,
+        ..rch_common::types::Layer0Config::default()
+    };
+    assert!(layer0_env_for_lane(&layer0, true).is_empty());
+    let layer0_env = layer0_env_for_lane(&layer0, false);
+    let result = Box::pin(execute_remote_compilation(
+        &worker,
+        "cargo test",
+        TransferConfig::default(),
+        Vec::new(),
+        None,
+        &rch_common::CompilationConfig::default(),
+        None,
+        Some(CompilationKind::CargoTest),
+        &reporter,
+        &socket_path,
+        ColorMode::Auto,
+        None,
+        None,
+        None,
+        &policy,
+        None,
+        false,
+        &[],
+        &layer0_env,
+        rch_common::remediation_config::DEFAULT_POOLED_REAPER_POOLED_IDLE_HOURS,
+        None,
+    ))
+    .await;
+    if let Some(prev) = prev_cwd {
+        let _ = std::env::set_current_dir(prev);
+    }
+
+    let execution = result.expect("remote execution should succeed in mock mode");
+    assert_eq!(execution.exit_code, 0);
+    let ssh_logs = mock::global_ssh_invocations_snapshot();
+    let execute_command = ssh_logs
+        .iter()
+        .find(|entry| entry.phase == mock::Phase::Execute)
+        .and_then(|entry| entry.command.as_deref())
+        .expect("execute command should be recorded");
+    for assignment in [
+        "CARGO_PROFILE_DEV_DEBUG='line-tables-only'",
+        "CARGO_PROFILE_TEST_DEBUG='line-tables-only'",
+    ] {
+        assert!(
+            execute_command.contains(assignment),
+            "expected {assignment} on the executed command, got {execute_command}"
+        );
+    }
+}
+
 /// Issue #19 Fix 1: a SUCCESSFUL remote compile whose artifacts fail to sync
 /// back must NOT report exit 0 for an artifact-producing kind — the local
 /// build is incomplete, so the hook returns a non-zero, build-failure-class

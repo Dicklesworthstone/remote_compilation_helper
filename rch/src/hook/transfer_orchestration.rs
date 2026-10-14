@@ -1509,12 +1509,15 @@ async fn execute_remote_compilation_inner(
             root_pipeline =
                 root_pipeline.with_sync_include_patterns(workspace_metadata_sync_patterns());
             root_pipeline = root_pipeline.with_env_allowlist(effective_env_allowlist.clone());
-            if !layer0_env.is_empty() {
-                root_pipeline = root_pipeline.with_layer0_env(layer0_env.to_vec());
-            }
         }
         if entry.is_primary {
             root_pipeline = root_pipeline.with_env_allowlist(effective_env_allowlist.clone());
+            // The primary root's pipeline runs the command, so the Layer 0
+            // pack belongs here. Until bd-hoxgn it rode only on
+            // workspace-metadata roots, which never execute anything.
+            if !layer0_env.is_empty() {
+                root_pipeline = root_pipeline.with_layer0_env(layer0_env.to_vec());
+            }
             if let Some(overrides) = cargo_env_overrides.as_ref() {
                 root_pipeline = root_pipeline.with_env_overrides(overrides.clone());
             }

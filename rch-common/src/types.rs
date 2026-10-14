@@ -2815,7 +2815,7 @@ impl CompilationConfig {
 /// Bump when a knob is added, removed, or its meaning changes; consumers
 /// record the version alongside emitted baselines so regressions are
 /// attributable to a specific pack revision.
-pub const LAYER0_PACK_VERSION: &str = "1";
+pub const LAYER0_PACK_VERSION: &str = "2";
 
 /// Layer 0 configuration pack knobs (bd-bqu38).
 ///
@@ -2824,7 +2824,9 @@ pub const LAYER0_PACK_VERSION: &str = "1";
 /// representative p95, output equivalence, debugger behavior, or
 /// compatibility). Knobs are injected into remote cargo builds as
 /// `CARGO_PROFILE_*` environment variables, so enabling one never mutates any
-/// user-owned `.cargo/config.toml`.
+/// user-owned `.cargo/config.toml`. Verification lanes (`--clean-overlay`,
+/// `--source-content-receipt`) build exactly what the project declares and
+/// never receive the pack.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct Layer0Config {
@@ -2835,6 +2837,13 @@ pub struct Layer0Config {
     /// `profile.release.codegen-units = 1` via
     /// `CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1`.
     pub release_codegen_units_1: bool,
+    /// `debug = "line-tables-only"` for the dev and test profiles, via
+    /// `CARGO_PROFILE_{DEV,TEST}_DEBUG` (bd-hoxgn). Full DWARF was about 77%
+    /// of fleet debug/test binaries (2026-09-25 sweep), so this is the main
+    /// lever on worker target size. Backtraces keep file and line; debuggers
+    /// lose local variables. A host-level `.cargo/config.toml` cannot carry
+    /// it: clean-overlay builds refuse any ancestor Cargo config (RCH-E413).
+    pub debug_line_tables_only: bool,
 }
 
 impl Layer0Config {
@@ -2854,6 +2863,10 @@ impl Layer0Config {
         }
         if self.release_codegen_units_1 {
             env.push(("CARGO_PROFILE_RELEASE_CODEGEN_UNITS", "1"));
+        }
+        if self.debug_line_tables_only {
+            env.push(("CARGO_PROFILE_DEV_DEBUG", "line-tables-only"));
+            env.push(("CARGO_PROFILE_TEST_DEBUG", "line-tables-only"));
         }
         env
     }
@@ -4464,6 +4477,7 @@ retry_max = 2
             enabled: false,
             release_lto_thin: true,
             release_codegen_units_1: true,
+            debug_line_tables_only: true,
         };
         assert!(cfg.active_env().is_empty());
         assert!(knobs_on.active_env().is_empty());
@@ -4475,22 +4489,37 @@ retry_max = 2
         let lto_only = Layer0Config {
             enabled: true,
             release_lto_thin: true,
-            release_codegen_units_1: false,
+            ..Layer0Config::default()
         };
         assert_eq!(
             lto_only.active_env(),
             vec![("CARGO_PROFILE_RELEASE_LTO", "thin")]
         );
-        let both = Layer0Config {
+        let debug_only = Layer0Config {
+            enabled: true,
+            debug_line_tables_only: true,
+            ..Layer0Config::default()
+        };
+        assert_eq!(
+            debug_only.active_env(),
+            vec![
+                ("CARGO_PROFILE_DEV_DEBUG", "line-tables-only"),
+                ("CARGO_PROFILE_TEST_DEBUG", "line-tables-only"),
+            ]
+        );
+        let all = Layer0Config {
             enabled: true,
             release_lto_thin: true,
             release_codegen_units_1: true,
+            debug_line_tables_only: true,
         };
         assert_eq!(
-            both.active_env(),
+            all.active_env(),
             vec![
                 ("CARGO_PROFILE_RELEASE_LTO", "thin"),
                 ("CARGO_PROFILE_RELEASE_CODEGEN_UNITS", "1"),
+                ("CARGO_PROFILE_DEV_DEBUG", "line-tables-only"),
+                ("CARGO_PROFILE_TEST_DEBUG", "line-tables-only"),
             ],
             "emission order must stay stable for deterministic baselines"
         );

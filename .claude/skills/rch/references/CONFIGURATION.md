@@ -156,10 +156,11 @@ retry_delay_ms = 1000
 canonical_root = "/data/projects"   # env RCH_CANONICAL_PROJECT_ROOT; "" = unset; ~ expands
 alias_root = "/dp"                  # env RCH_ALIAS_PROJECT_ROOT; set equal to canonical_root if you have no alias
 
-[layer0]                    # Cargo profile pack forced onto remote release builds; hook path never injects
-enabled = false
+[layer0]                    # CARGO_PROFILE_* env on the remote command; never in --clean-overlay / --source-content-receipt lanes
+enabled = false             # master switch; every knob below is independent
 release_lto_thin = false
 release_codegen_units_1 = false
+debug_line_tables_only = false   # dev+test debug = "line-tables-only": far smaller worker targets; debuggers lose locals
 
 [remediation.pooled_target]
 pooling_enabled = true
