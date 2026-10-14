@@ -5,7 +5,7 @@ Compilation Helper): the PreToolUse hook + CLI (`rch`), the local daemon (`rchd`
 worker agent (`rch-wkr`), the RABS build sidecar (`rabs-*`, `rabsd`), and the fleet
 dashboard (`dashboard/`).
 
-Scope window: project inception (`v0.1.0`, 2026-01-25) through `v2.1.26` (2026-10-14).
+Scope window: project inception (`v0.1.0`, 2026-01-25) through `v2.1.27` (2026-10-14).
 
 This document was rebuilt from git history (`git log --no-merges` per tag range, `git show`
 on representative commits), version tags (`git for-each-ref`), GitHub release metadata
@@ -28,6 +28,42 @@ history. They are kept as-is because the descriptions were verified against the 
 but those particular links will 404.
 
 Repository: <https://github.com/Dicklesworthstone/remote_compilation_helper>
+
+## 2.1.27 — 2026-10-14
+
+The Layer 0 profile pack now reaches the command it was meant for, with a new opt-in knob that
+makes worker debug/test targets much smaller. A Mac daemon no longer wedges on its ownership
+snapshot. `rch daemon restart` reopens admission when its barrier verdict is lost. Recovery can
+move a retained staging area to a fresh location.
+
+- **Layer 0 pack wiring** (`bd-hoxgn`, `bd-bqu38`). Since its introduction the pack's
+  `CARGO_PROFILE_*` env was attached only to workspace-metadata roots, which sync manifests and
+  never run the command, so `[layer0] enabled = true` changed no remote build. It now rides on the
+  root that runs the command; a mock test fails without the change. Verification lanes
+  (`--clean-overlay`, `--source-content-receipt`) never receive the pack. New knob
+  `debug_line_tables_only` sets `debug = "line-tables-only"` for the dev and test profiles. Full
+  DWARF was about 77% of fleet debug/test binary bytes, and a host-level `.cargo/config.toml`
+  cannot carry the setting because clean-overlay builds refuse ancestor Cargo config (RCH-E413).
+  Backtraces keep file and line; debuggers lose locals. Every knob stays off by default
+  ([`845ada34`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/845ada34eb19d74f5d4a1b8986b92db50fb7552c)).
+- **rchd ownership snapshots are buffered.** The snapshot was serialized token by token onto an
+  unbuffered file (about 50k `write(2)` calls for 280 KB) while holding the `active` lock, and a
+  loaded Mac dispatcher stopped answering ([`21f1ce9f`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/21f1ce9fdeb7c06b19e9f1b326b3f48ee28233d8)).
+- **Restart barrier.** `rch daemon restart` closes the admission barrier through
+  `/restart-admission`; a late, lost or garbled reply used to leave it closed. Any failure to read
+  the verdict now releases it, and the reply may take up to 60 s ([`5da664a0`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/5da664a00abd68cf891af60e7cb9d42906ccd5ec)).
+- **Recovery staging relocation** (#107). `RCH_RECOVERY_RELOCATE_STAGING=<wrapper-id>` moves a
+  retained job's controller staging to a fresh location without resetting publication or replaying
+  the command; the prepared directories stay bound by descriptor through journal publication, and
+  free-space reserves are checked before anything is recorded
+  ([`9a669b67`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/9a669b674274c32c27b7cb6cd5395dda34c146b8), [`a2a18360`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/a2a183605fc7213c621f0ab89b8969ca26ea76cc)).
+- **Self-test on Windows workers.** The canary is POSIX-only; `rch self-test --all` now leaves
+  Windows workers out, and naming one returns at once instead of after a 600 s deadline
+  ([`bb5c4c89`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/bb5c4c897f7b30eb7bf808f8a1db18320cf83f6a)).
+- A queued waiter that resumes its recovered row after a daemon restart now logs one INFO line
+  (`bd-w2qrp`, [`063991a6`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/063991a6f551c9f18b52a786af093f6e69254f39)).
+- Tests: four lock and pipe tests no longer depend on concurrent forks
+  ([`ea79d089`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/ea79d089fabf69f166d75bcf87577fd746d7540b)).
 
 ## 2.1.26 — 2026-10-14
 
