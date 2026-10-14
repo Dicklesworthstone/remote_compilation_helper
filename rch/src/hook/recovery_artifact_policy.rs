@@ -10,6 +10,9 @@ use serde::Deserialize;
 use std::collections::BTreeSet;
 use std::os::fd::AsFd;
 
+#[path = "recovery_staging.rs"]
+mod staging;
+
 const REQUEST_ENV: &str = "RCH_RECOVERY_ARTIFACT_EXCLUSIONS";
 const MAX_REQUEST_BYTES: usize = 16 * 1024;
 const MAX_DIRECTORIES: usize = 64;
@@ -65,8 +68,16 @@ impl Request {
 }
 
 /// Called only AFTER claim has verified owner absence and reloaded the journal.
-/// An unset variable leaves every existing recovery path unchanged.
+/// With neither explicit request, every existing recovery path is unchanged.
 pub(super) fn apply_from_environment(writer: &DurableLeaseWriter) -> anyhow::Result<()> {
+    let relocation = std::env::var_os(staging::REQUEST_ENV);
+    if let Some(wrapper) = staging::requested_wrapper(
+        relocation.as_deref(),
+        std::env::var_os(REQUEST_ENV).is_some(),
+    )? {
+        let config = crate::config::load_config()?;
+        return staging::relocate(writer, wrapper, &config.transfer);
+    }
     let raw = match std::env::var(REQUEST_ENV) {
         Ok(raw) => raw,
         Err(std::env::VarError::NotPresent) => return Ok(()),
@@ -372,7 +383,7 @@ mod tests {
         fixture_with_results(completed, &[])
     }
 
-    fn fixture_with_results(
+    pub(super) fn fixture_with_results(
         completed: bool,
         result_dirs: &[PathBuf],
     ) -> (PathBuf, RecoverySession, TransferPipeline, WorkerConfig) {
