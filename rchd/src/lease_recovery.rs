@@ -617,7 +617,9 @@ mod tests {
             sender.shutdown().await.unwrap();
         };
         let consumer = drain_recovery_stderr(&mut receiver, &mut tail);
-        let ((), drained) = tokio::time::timeout(Duration::from_secs(10), async {
+        // Only a hang guard: 2 MiB through a 128-byte pipe is ~16k wakeups,
+        // which exceeded 10 s on a Mac at load 64.
+        let ((), drained) = tokio::time::timeout(Duration::from_secs(60), async {
             tokio::join!(producer, consumer)
         })
         .await

@@ -2930,6 +2930,21 @@ exec /bin/sh -c "$payload"
         }
     }
 
+    /// The bounded census runs `ps` in its own shell under a timeout
+    /// (14aea498), so a `ps()` function never reaches it. Install the fake as
+    /// an executable on PATH, written by the fixture shell itself so this
+    /// test process never holds its write descriptor (bd-p7auy). `$OBS` is
+    /// the fixture shell, which the census requires to see as its observer.
+    fn fake_ps_on_path(dir: &std::path::Path, body: &str) -> String {
+        let bin = dir.join("fake-ps-bin");
+        let bin = shell_escape::escape(bin.to_str().unwrap().into()).into_owned();
+        format!(
+            "mkdir -p {bin} && cat > {bin}/ps.tmp <<'RCH_FAKE_PS'\n#!/bin/sh\n{body}\nRCH_FAKE_PS\n\
+             chmod 700 {bin}/ps.tmp && mv -f {bin}/ps.tmp {bin}/ps || exit 99\n\
+             OBS=$$; PATH={bin}:$PATH; export OBS PATH\n"
+        )
+    }
+
     async fn remote_cancel_probe_fixture(
         path: &std::path::Path,
         prefix: &str,
@@ -3042,30 +3057,43 @@ exec /bin/sh -c "$payload"
         // Execute the production shell source with only OS failures injected.
         // All kill calls are inert; sleep is shortened for deterministic faults.
         for (probe, expected) in [
-            ("ps() { return 1; };", 44),
-            ("ps() { :; };", 44),
-            ("ps() { printf 'not a process table\\n'; };", 44),
+            ("exit 1", 44),
+            (":", 44),
+            ("printf 'not a process table\\n'", 44),
             // The thread census is pid, lwp, pgid, stat, nlwp (be002dc0).
-            ("ps() { printf '10 10 10 S 1\\n'; };", 44),
-            ("ps() { printf '%s %s 123 S 1\\n' \"$$\" \"$$\"; };", 44),
+            ("printf '10 10 10 S 1\\n'", 44),
+            ("printf '%s %s 123 S 1\\n' \"$OBS\" \"$OBS\"", 44),
             (
-                "ps() { printf '%s %s 99 S 1\\n100 100 123 R 1\\n' \"$$\" \"$$\"; };",
+                "printf '%s %s 99 S 1\\n100 100 123 R 1\\n' \"$OBS\" \"$OBS\"",
                 43,
             ),
             (
-                "ps() { printf '%s %s 99 S 1\\n100 100 123 Z 1\\n101 101 123 S 1\\n' \"$$\" \"$$\"; };",
+                "printf '%s %s 99 S 1\\n100 100 123 Z 1\\n101 101 123 S 1\\n' \"$OBS\" \"$OBS\"",
                 43,
             ),
             (
-                "ps() { printf '%s %s 99 S 1\\n100 100 123 Z 1\\n' \"$$\" \"$$\"; };",
+                "printf '%s %s 99 S 1\\n100 100 123 Z 1\\n' \"$OBS\" \"$OBS\"",
                 0,
             ),
-            ("ps() { printf '%s %s 99 S 1\\n' \"$$\" \"$$\"; };", 0),
+            ("printf '%s %s 99 S 1\\n' \"$OBS\" \"$OBS\"", 0),
         ] {
-            let prefix = format!("kill() {{ return 0; }}; sleep() {{ :; }}; {probe}");
+            let prefix = format!(
+                "kill() {{ return 0; }}; sleep() {{ :; }};\n{}",
+                fake_ps_on_path(&root, probe)
+            );
             let output = remote_cancel_probe_fixture(&path, &prefix).await;
-            assert_eq!(output.status.code(), Some(expected), "{probe}: {output:?}");
-            assert_eq!(remote_kill_confirmed(&output, 42), expected == 0);
+            #[cfg(target_os = "linux")]
+            {
+                assert_eq!(output.status.code(), Some(expected), "{probe}: {output:?}");
+                assert_eq!(remote_kill_confirmed(&output, 42), expected == 0);
+            }
+            // The protocol reads its record with GNU `stat -c` and procfs, so
+            // elsewhere it stops before observing and must never confirm.
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = expected;
+                assert!(!remote_kill_confirmed(&output, 42), "{probe}: {output:?}");
+            }
         }
 
         #[cfg(target_os = "linux")]
@@ -3085,8 +3113,13 @@ exec /bin/sh -c "$payload"
             // signals and observations are injected: the reported survivor
             // must keep cancellation unconfirmed after bounded escalation.
             let prefix = format!(
-                "kill() {{ return 0; }}; sleep() {{ :; }}; \
-                 ps() {{ printf '%s %s 1 S 1\\n{pgid} {pgid} {pgid} S 1\\n' \"$$\" \"$$\"; }};"
+                "kill() {{ return 0; }}; sleep() {{ :; }};\n{}",
+                fake_ps_on_path(
+                    &root,
+                    &format!(
+                        "printf '%s %s 1 S 1\\n{pgid} {pgid} {pgid} S 1\\n' \"$OBS\" \"$OBS\""
+                    )
+                )
             );
             let output = remote_cancel_probe_fixture(&path, &prefix).await;
             assert_eq!(output.status.code(), Some(45), "{output:?}");
@@ -3316,7 +3349,14 @@ exec /bin/sh -c "$payload"
             .await;
             std::fs::write(root.join("build-id"), active.id.to_string()).unwrap();
             let ctx = make_test_context(pool, history.clone());
-            let orch = CancellationOrchestrator::new(test_config(), test_events());
+            // A loaded Mac took over 1 s to run the fake ssh for "confirmed".
+            let orch = CancellationOrchestrator::new(
+                CancellationConfig {
+                    remote_kill_timeout: Duration::from_secs(10),
+                    ..test_config()
+                },
+                test_events(),
+            );
             for mode in [
                 "empty",
                 "truncated",

@@ -2110,6 +2110,29 @@ flock -n "$__gc_source_registry/metadata.lock" true;
         assert!(!pool.exists());
     }
 
+    /// Without procfs the sweep cannot prove a pool idle, so it keeps it and
+    /// reports why; the reap tests are Linux-only for that reason.
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn cleanup_command_keeps_aged_pool_when_activity_is_unprovable() {
+        let _guard = test_guard!();
+        let base = tempfile::tempdir().expect("base");
+        let pool = base
+            .path()
+            .join("gcverify_pool_repo")
+            .join(".rch-target-pool-deadbeefcafe");
+        std::fs::create_dir_all(pool.join("deps")).expect("pool tree");
+        age_dir(&pool);
+        let (stdout, stderr, _) = run_sweep(base.path(), &[]);
+        assert!(stdout.contains("removed=0"), "{stdout}");
+        assert!(
+            stderr.contains("RCH_CLEANUP_ACTIVITY_UNKNOWN") && stderr.contains("reason=proc"),
+            "{stderr}"
+        );
+        assert!(pool.join("deps").is_dir());
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn cleanup_command_reaps_aged_pool_normally() {
         let _guard = test_guard!();
@@ -2126,6 +2149,7 @@ flock -n "$__gc_source_registry/metadata.lock" true;
         assert!(stdout.contains("remove_errors=0"), "{stdout}");
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn cleanup_command_reaps_empty_husk_when_rmdir_succeeds() {
         let _guard = test_guard!();
@@ -2157,6 +2181,7 @@ flock -n "$__gc_source_registry/metadata.lock" true;
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn cleanup_command_reports_survivor_and_unreapable_husk_as_errors() {
         let _guard = test_guard!();
