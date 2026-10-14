@@ -265,7 +265,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin, I: Interrupts> OperatorPeer<'_, S, I> {
         }
         let stream = &mut self.inner.stream;
         let interrupts = &mut self.interrupts;
-        self.inner.runtime.block_on(async {
+        rabs_asupersync::daemon_runtime::block_on_top_level(&self.inner.runtime, async {
             asupersync::time::timeout(asupersync::time::wall_now(), budget, async {
                 let mut stopped = pin!(interrupts.wait());
                 let mut writing = pin!(async {
@@ -384,26 +384,27 @@ impl<S: AsyncRead + AsyncWrite + Unpin, I: Interrupts> OperatorPeer<'_, S, I> {
             } else {
                 self.preview.as_ref().and_then(PreviewSession::wake_at)
             };
-            let event = self.inner.runtime.block_on(async {
-                asupersync::time::timeout(
-                    asupersync::time::wall_now(),
-                    budget,
-                    next_event(
-                        &mut self.inner.stream,
-                        &mut self.inner.buffered,
-                        &mut self.interrupts,
-                        lease_wake,
-                        preview_wake,
-                    ),
-                )
-                .await
-                .map_err(|_| {
-                    worker_transport_error(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "worker read deadline",
-                    ))
-                })?
-            })?;
+            let event =
+                rabs_asupersync::daemon_runtime::block_on_top_level(&self.inner.runtime, async {
+                    asupersync::time::timeout(
+                        asupersync::time::wall_now(),
+                        budget,
+                        next_event(
+                            &mut self.inner.stream,
+                            &mut self.inner.buffered,
+                            &mut self.interrupts,
+                            lease_wake,
+                            preview_wake,
+                        ),
+                    )
+                    .await
+                    .map_err(|_| {
+                        worker_transport_error(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "worker read deadline",
+                        ))
+                    })?
+                })?;
             // Decoding an immediately available frame is not permission to
             // cross a deadline or obtain a new transfer budget afterward.
             self.inner.remaining()?;

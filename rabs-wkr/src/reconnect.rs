@@ -167,30 +167,31 @@ pub(super) fn run(
         let endpoint = coordinator.clone();
         let capability = Arc::clone(&report);
         let shutdown = controller.subscribe();
-        let (outcome, returned_journal, admitted_for) = runtime.block_on(async move {
-            handle
-                .spawn(async move {
-                    let cx = Cx::current().expect("runtime task Cx");
-                    let mut admitted_at: Option<Instant> = None;
-                    let outcome = drain_on_shutdown(
-                        &cx,
-                        shutdown,
-                        super::session_loop(
+        let (outcome, returned_journal, admitted_for) =
+            crate::block_on_worker_runtime(&runtime, async move {
+                handle
+                    .spawn(async move {
+                        let cx = Cx::current().expect("runtime task Cx");
+                        let mut admitted_at: Option<Instant> = None;
+                        let outcome = drain_on_shutdown(
                             &cx,
-                            &endpoint,
-                            &capability,
-                            once,
-                            &mut journal,
-                            &mut admitted_at,
-                        ),
-                    )
-                    .await;
-                    // session_loop has joined process cleanup and dropped both
-                    // range-transfer owners before we regain durable ownership.
-                    (outcome, journal, admitted_at.map(|start| start.elapsed()))
-                })
-                .await
-        });
+                            shutdown,
+                            super::session_loop(
+                                &cx,
+                                &endpoint,
+                                &capability,
+                                once,
+                                &mut journal,
+                                &mut admitted_at,
+                            ),
+                        )
+                        .await;
+                        // session_loop has joined process cleanup and dropped both
+                        // range-transfer owners before we regain durable ownership.
+                        (outcome, journal, admitted_at.map(|start| start.elapsed()))
+                    })
+                    .await
+            });
         journal = returned_journal;
         if controller.is_shutting_down() {
             // No spool reload, new handshake or new admission after shutdown.
@@ -241,7 +242,9 @@ pub(super) fn run(
         // The exclusive journal lock remains held, including during backoff.
         let handle = runtime.handle();
         let shutdown = controller.subscribe();
-        runtime.block_on(async move { handle.spawn(backoff_or_shutdown(shutdown, delay)).await });
+        crate::block_on_worker_runtime(&runtime, async move {
+            handle.spawn(backoff_or_shutdown(shutdown, delay)).await
+        });
     }
 }
 
@@ -293,7 +296,7 @@ mod tests {
     fn shutdown_polls_session_cleanup_instead_of_dropping_it() {
         let runtime = RuntimeBuilder::current_thread().build().unwrap();
         let handle = runtime.handle();
-        runtime.block_on(async move {
+        crate::block_on_worker_runtime(&runtime, async move {
             handle
                 .spawn(async move {
                     let cx = Cx::current().unwrap();
@@ -330,7 +333,7 @@ mod tests {
         controller.shutdown();
         let runtime = RuntimeBuilder::current_thread().build().unwrap();
         let handle = runtime.handle();
-        runtime.block_on(async move {
+        crate::block_on_worker_runtime(&runtime, async move {
             handle
                 .spawn(async move {
                     assert!(
@@ -450,7 +453,7 @@ mod tests {
             WorkerJournal::open(&root.path().join("state"), "shutdown-test", &address).unwrap();
         let spill_root = root.path().join("spills");
         let process_pid_file = pid_file.clone();
-        journal = runtime.block_on(async move {
+        journal = crate::block_on_worker_runtime(&runtime, async move {
             handle.spawn(async move {
                 let cx = Cx::current().unwrap();
                 let socket = asupersync::net::TcpStream::connect(address).await.unwrap();

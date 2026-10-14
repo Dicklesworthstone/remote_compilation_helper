@@ -968,7 +968,7 @@ mod tests {
             .build()
             .unwrap();
         let handle = runtime.handle();
-        runtime.block_on(async move {
+        crate::daemon_runtime::block_on_top_level(&runtime, async move {
             handle
                 .spawn(async move {
                     for writing in [false, true] {

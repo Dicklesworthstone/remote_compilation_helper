@@ -281,11 +281,10 @@ mod tests {
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .build()
             .unwrap();
-        let reply = runtime.block_on(super::super::serve_on_lane(
-            &lane,
-            coord.edge_subscriber(),
-            frame,
-        ));
+        let reply = rabs_asupersync::daemon_runtime::block_on_top_level(
+            &runtime,
+            super::super::serve_on_lane(&lane, coord.edge_subscriber(), frame),
+        );
         let reply: Value = serde_json::from_str(&reply).unwrap();
         assert_eq!(reply["reason"], "unsupported-rustc-outputs");
         assert_eq!(reply["materialization_started"], false);

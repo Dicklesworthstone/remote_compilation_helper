@@ -458,6 +458,21 @@ fn worker_state_path(worker: &str, coordinator: &str) -> io::Result<PathBuf> {
         .join(rabs_wkr::session::sha256_hex(binding.as_bytes())))
 }
 
+/// Drive one top-level future on the worker's owned current-thread runtime.
+///
+/// # Panics
+/// Panics if called from inside an active `asupersync` task (`Cx::current().is_some()`).
+pub(crate) fn block_on_worker_runtime<F: Future>(
+    runtime: &asupersync::runtime::Runtime,
+    future: F,
+) -> F::Output {
+    assert!(
+        Cx::current().is_none(),
+        "nested runtime entry is forbidden inside an active asupersync task"
+    );
+    runtime.block_on(future)
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {

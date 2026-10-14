@@ -770,32 +770,33 @@ mod completion_capture_tests {
             let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
                 .build()
                 .unwrap();
-            let acknowledged = runtime.block_on(async {
-                let listener = asupersync::net::unix::UnixListener::bind(&path)
-                    .await
-                    .unwrap();
-                let peer = std::thread::spawn(move || {
-                    let socket = std::os::unix::net::UnixStream::connect(path).unwrap();
-                    socket
-                        .set_read_timeout(Some(Duration::from_secs(5)))
+            let acknowledged =
+                rabs_asupersync::daemon_runtime::block_on_top_level(&runtime, async {
+                    let listener = asupersync::net::unix::UnixListener::bind(&path)
+                        .await
                         .unwrap();
-                    let mut socket = BufReader::new(socket);
-                    let mut line = String::new();
-                    socket.read_line(&mut line).unwrap();
-                    let receipt: Value = serde_json::from_str(&line).unwrap();
-                    assert_eq!(receipt["kind"], "rustc-captured");
-                    assert_eq!(receipt["attempt"], "a");
-                    assert_eq!(receipt["capture"], "c");
-                    assert_eq!(receipt["publication_authorized"], false);
-                    if let Some(reply) = reply {
-                        socket.get_mut().write_all(reply.as_bytes()).unwrap();
-                    }
+                    let peer = std::thread::spawn(move || {
+                        let socket = std::os::unix::net::UnixStream::connect(path).unwrap();
+                        socket
+                            .set_read_timeout(Some(Duration::from_secs(5)))
+                            .unwrap();
+                        let mut socket = BufReader::new(socket);
+                        let mut line = String::new();
+                        socket.read_line(&mut line).unwrap();
+                        let receipt: Value = serde_json::from_str(&line).unwrap();
+                        assert_eq!(receipt["kind"], "rustc-captured");
+                        assert_eq!(receipt["attempt"], "a");
+                        assert_eq!(receipt["capture"], "c");
+                        assert_eq!(receipt["publication_authorized"], false);
+                        if let Some(reply) = reply {
+                            socket.get_mut().write_all(reply.as_bytes()).unwrap();
+                        }
+                    });
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let acknowledged = acknowledge_capture(&mut socket, "a", "c").await.is_some();
+                    peer.join().unwrap();
+                    acknowledged
                 });
-                let (mut socket, _) = listener.accept().await.unwrap();
-                let acknowledged = acknowledge_capture(&mut socket, "a", "c").await.is_some();
-                peer.join().unwrap();
-                acknowledged
-            });
             assert_eq!(
                 acknowledged,
                 reply.is_some_and(|reply| reply.ends_with('\n') && !reply.contains("other"))

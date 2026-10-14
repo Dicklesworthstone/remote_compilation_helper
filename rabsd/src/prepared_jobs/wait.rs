@@ -184,11 +184,10 @@ pub(super) fn run(args: &[String], socket: &str) -> i32 {
             id,
             until,
             |request, deadline| {
-                runtime.block_on(exchange_until(
-                    UnixStream::connect(socket),
-                    request,
-                    deadline,
-                ))
+                rabs_asupersync::daemon_runtime::block_on_top_level(
+                    &runtime,
+                    exchange_until(UnixStream::connect(socket), request, deadline),
+                )
             },
             std::thread::sleep,
         )?;

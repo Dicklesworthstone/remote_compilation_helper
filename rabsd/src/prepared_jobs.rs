@@ -260,7 +260,10 @@ fn exchange(socket: &str, request: &Value) -> io::Result<Value> {
     let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
         .build()
         .map_err(|error| io::Error::other(format!("job client runtime: {error:?}")))?;
-    runtime.block_on(exchange_until(UnixStream::connect(socket), request, until))
+    rabs_asupersync::daemon_runtime::block_on_top_level(
+        &runtime,
+        exchange_until(UnixStream::connect(socket), request, until),
+    )
 }
 
 async fn exchange_until(
@@ -440,11 +443,14 @@ mod tests {
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .build()
             .unwrap();
-        let result = runtime.block_on(exchange_until(
-            PendingConnect(Arc::clone(&dropped)),
-            &json!({"kind":"prepared-status"}),
-            Instant::now() + Duration::from_millis(10),
-        ));
+        let result = rabs_asupersync::daemon_runtime::block_on_top_level(
+            &runtime,
+            exchange_until(
+                PendingConnect(Arc::clone(&dropped)),
+                &json!({"kind":"prepared-status"}),
+                Instant::now() + Duration::from_millis(10),
+            ),
+        );
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
         assert!(dropped.load(Ordering::Acquire));
     }
@@ -468,24 +474,23 @@ mod tests {
             .build()
             .unwrap();
         let mut released = false;
-        runtime
-            .block_on(async {
-                let mut finishing = pin!(drivers.finish());
-                poll_fn(|cx| match finishing.as_mut().poll(cx) {
-                    Poll::Ready(result) => Poll::Ready(result),
-                    Poll::Pending => {
-                        if !released {
-                            // This sibling work can release the executor only if
-                            // shutdown has yielded instead of joining synchronously.
-                            release.send(()).unwrap();
-                            released = true;
-                        }
-                        Poll::Pending
+        rabs_asupersync::daemon_runtime::block_on_top_level(&runtime, async {
+            let mut finishing = pin!(drivers.finish());
+            poll_fn(|cx| match finishing.as_mut().poll(cx) {
+                Poll::Ready(result) => Poll::Ready(result),
+                Poll::Pending => {
+                    if !released {
+                        // This sibling work can release the executor only if
+                        // shutdown has yielded instead of joining synchronously.
+                        release.send(()).unwrap();
+                        released = true;
                     }
-                })
-                .await
+                    Poll::Pending
+                }
             })
-            .unwrap();
+            .await
+        })
+        .unwrap();
         assert!(released);
         assert!(drivers.threads.is_empty());
     }

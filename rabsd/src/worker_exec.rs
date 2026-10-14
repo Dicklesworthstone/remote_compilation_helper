@@ -730,7 +730,7 @@ fn accept_tls_worker(
     let runtime = RuntimeBuilder::current_thread()
         .build()
         .map_err(|error| io::Error::other(format!("worker delivery runtime: {error:?}")))?;
-    let peer = runtime.block_on(async {
+    let peer = rabs_asupersync::daemon_runtime::block_on_top_level(&runtime, async {
         let listener = asupersync::net::TcpListener::bind(address)
             .await
             .map_err(|error| io::Error::new(error.kind(), format!("worker TLS listen: {error}")))?;

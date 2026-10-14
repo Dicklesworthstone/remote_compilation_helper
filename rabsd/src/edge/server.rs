@@ -1472,12 +1472,15 @@ mod edge_liveness_tests {
         let dir = tempfile::tempdir().unwrap();
         let destination = dir.path().join("untouched");
         let runtime = RuntimeBuilder::current_thread().build().unwrap();
-        let reply = runtime.block_on(serve_on_lane(
-            &lane,
-            coord.edge_subscriber(),
-            serde_json::json!({"kind":"serve", "action_key":"01".repeat(32),
-                "destination_root":destination.to_str().unwrap()}),
-        ));
+        let reply = rabs_asupersync::daemon_runtime::block_on_top_level(
+            &runtime,
+            serve_on_lane(
+                &lane,
+                coord.edge_subscriber(),
+                serde_json::json!({"kind":"serve", "action_key":"01".repeat(32),
+                    "destination_root":destination.to_str().unwrap()}),
+            ),
+        );
         let reply: serde_json::Value = serde_json::from_str(&reply).unwrap();
         assert_eq!(reply["outcome"], "error");
         assert_eq!(reply["materialization_started"], false);
@@ -1538,8 +1541,10 @@ mod edge_liveness_tests {
             release.send(()).unwrap();
             holder.join().unwrap();
             let runtime = RuntimeBuilder::current_thread().build().unwrap();
-            let reply: serde_json::Value =
-                serde_json::from_str(&runtime.block_on(request)).unwrap();
+            let reply: serde_json::Value = serde_json::from_str(
+                &rabs_asupersync::daemon_runtime::block_on_top_level(&runtime, request),
+            )
+            .unwrap();
             assert_eq!(reply["kind"], "serve-result");
             assert_ne!(reply["outcome"], "served");
             assert!(!dir.path().join("outputs").exists());
@@ -1552,7 +1557,7 @@ mod edge_liveness_tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("edge.sock");
         let runtime = RuntimeBuilder::current_thread().build().unwrap();
-        runtime.block_on(async {
+        rabs_asupersync::daemon_runtime::block_on_top_level(&runtime, async {
             let listener = UnixListener::bind(&path).await.unwrap();
             let path = path.clone();
             let writer = std::thread::spawn(move || {

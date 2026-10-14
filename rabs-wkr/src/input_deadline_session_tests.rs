@@ -142,7 +142,7 @@ impl AsyncWrite for Wire {
 fn in_runtime(future: impl Future<Output = ()> + Send + 'static) {
     let runtime = RuntimeBuilder::current_thread().build().unwrap();
     let handle = runtime.handle();
-    runtime.block_on(async move { handle.spawn(future).await });
+    crate::block_on_worker_runtime(&runtime, async move { handle.spawn(future).await });
 }
 
 /// Poll with the actual runtime task's waker. Source-thread completions wake
