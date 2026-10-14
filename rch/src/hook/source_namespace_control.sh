@@ -1,12 +1,19 @@
 # Fixed command argument; the namespace program stays on stdin. This is only
 # pre-intent namespace setup, never a source grant, pair lock or build workload.
 set -eu
-if command -v gtimeout >/dev/null 2>&1; then
+# GNU timeout kills its whole process group on --kill-after; uutils timeout
+# (Ubuntu 25.10+ /usr/bin/timeout) kills only its direct child, leaving a
+# TERM-resistant descendant holding the registry lock. Ubuntu keeps GNU's as
+# gnutimeout; macOS Homebrew installs it as gtimeout.
+if command -v gnutimeout >/dev/null 2>&1; then
+    rch_namespace_timer=gnutimeout
+elif command -v gtimeout >/dev/null 2>&1; then
     rch_namespace_timer=gtimeout
-elif command -v timeout >/dev/null 2>&1; then
+elif command -v timeout >/dev/null 2>&1 &&
+    timeout --version 2>/dev/null | head -n 1 | grep -q 'GNU coreutils'; then
     rch_namespace_timer=timeout
 else
-    printf '%s\n' 'RCH: namespace setup requires GNU timeout or gtimeout' >&2
+    printf '%s\n' 'RCH: namespace setup requires GNU timeout (gnutimeout or gtimeout)' >&2
     exit 73
 fi
 umask 077
