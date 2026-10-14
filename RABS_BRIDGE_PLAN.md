@@ -1,6 +1,155 @@
 # RABS Bridge Plan — From Proven Library to Living System
 
-## Reality check and execution order — September 26, 2026
+## Reality check and execution order — October 14, 2026
+
+This dated assessment updates the September 26 one against `main` @ `a6df23de`
+and shipped `v2.1.22` (`96a144b50904`, October 13, 2026). It is written for the
+operator and implementing agents choosing the next delivered capability. The
+original goals and acceptance below still stand. Revise this section in place
+when new execution evidence changes it. It waives no product acceptance.
+
+**Assessment revision:** `a6df23de` (568 non-merge commits / 622 total commits
+since the September 26 `fb0344cf` baseline: ~379 touching conventional `rch*`,
+~44 touching `rabs*`).
+**Released revision:** `v2.1.22` (`96a144b5`, October 13, 2026) — **23 releases
+(`v2.1.0` through `v2.1.22`) shipped in 15 days**, closing the 490-commit
+release gap noted on September 26 (`bd-iiyvx` closed). The installed operator
+binaries on `hetzner2` are `rch 2.1.22` and `rchd 2.1.22`, only 20 commits
+behind `HEAD`.
+
+**Conclusion:**
+1. **Conventional RCH has shipped major user-visible capabilities into
+   production (`v2.1.0`–`v2.1.22`)**, including mandatory minisign/Sigstore
+   verification in `rch update` (`bd-oxxnk`), Go (`go build -o`, `go test`,
+   `go vet`, `bd-ow7t6`), Nix (`nix build`/`nix-build`/`nix flake check`/`nix
+   develop -c`/`nix shell -c`), `cargo xwin`, `cargo package`/`publish
+   --dry-run`, named Cargo JSON (`RCH_CARGO_JSON_STDOUT=1` + `rch jobs recover
+   <id> --cargo-json`), `--require-tool` verified tool probes, Darwin
+   `xcodebuild`/`xcrun` OS-fenced routing (`bd-nknnm`), owned
+   `--source-content-receipt` pairs, `--clean-overlay`, learned build disk
+   footprints (`history.footprints.json`, `bd-wv746`), opt-in dispatcher speed
+   gate (`bd-2spi4`), SpeedScore v2 (`bd-uerk9`), stuck-detector exponential
+   backoff + lease wakeup (`bd-r1kcc`), and source-registry writability probes
+   (`bd-5ojmb`).
+2. **However, three concrete production bottlenecks still degrade live fleet
+   capacity and reliability today**:
+   - **Hardcoded 5% `critical_free_ratio` (`bd-xxck3`, open P1)** in
+     `rchd/src/disk_pressure.rs:381,400` zeroes 774–1,900 GiB workers even when
+     they have 30–70 GiB free (4 workers in `CRITICAL` with 0 slots and 5 in
+     `WARNING` on `hetzner2` right now; caused 466 queue timeouts/hr on `css`).
+   - **Selection ignores per-worker overlapping source claims (`bd-jqhno`, open
+     P1)**, repeatedly dispatching parallel builds of the same project to a
+     worker that already holds a canonical-mirror claim (298 `unfinished
+     overlapping source owner` failures/24h on `css`).
+   - **Dual-role live-checkout clobber risk (`bd-fbtws`, in_progress P1)** and
+     dispatcher PATH ordering (`rch shim status` on `hetzner2` warns `PATH does
+     NOT resolve the shim first` with 2 unmanaged local `rustc` processes).
+3. **RABS built a real opt-in local dependency cache lane (`bd-14t4j`,
+   `bd-k52xe` partial), but still serves ZERO production traffic and has 50.2%
+   unwired library modules**:
+   - Unlike September 26 (when `rabs-wrap` unconditionally exec'd `rustc`),
+     `rabs-wrap/src/main.rs:1210-1218` + `rabsd/src/edge/server/rustc_request.rs`
+     + `rabsd/src/coord/live_dependency.rs` now implement `rustc-request` →
+     `hit` → `rustc-accept` → `served` (`compiler_skip_authorized: true`) and
+     two-phase miss capture (`execute` → `rustc-complete` → `rustc-captured` →
+     `rustc-capture-ack` → `CoordLive::commit_offer`).
+   - **Why it is still not real production serving:** (a) `live_dependency`
+     defaults to `false` (`rabsd/src/main.rs:39,47`); (b) when enabled, it is
+     100% **local and unsandboxed** on the edge host (`edge-local:<host>`,
+     never touching `rabs-wkr` or `/__rabs/...` bwrap namespaces); (c)
+     `LIVE_SAMPLING_POLICY = SamplingPolicy::sample_all(2, 10_000)` requires 3
+     local compiles before the 4th short-circuits `rustc`, and refuses any
+     invocation whose `-L dependency=` directory contains a proc-macro `.so`
+     (`rabs-key/src/live_dependency.rs`); (d) `rabsd`, `rabs-wrap`, and
+     `rabs-wkr` are still omitted from `release.yml` tarballs and `rch fleet
+     deploy` (`bd-n8qt3`), and are not installed on `hetzner2`; and (e) **124
+     of 247 non-test modules (50.2%) across the 8 `rabs-*` library crates have
+     zero production callers**.
+
+### Evidence gathered for this revision (2026-10-14 @ `a6df23de`)
+
+- `RCH_REQUIRE_REMOTE=1 rch exec -- cargo clippy --workspace --all-targets -- -D warnings`
+  (worker `hz4`): **exit 0** in 13m38s (`bd-kuy6y` fixed and closed).
+- `cargo fmt --check -- -l`: **FAILS on 5 files** (`rabs-wrap/src/singleflight.rs`,
+  `rabs-wrap/tests/live_cargo_worktrees.rs`,
+  `rabsd/src/edge/server/rustc_request.rs`,
+  `rch-common/src/tool_requirement.rs`,
+  `rch-common/tests/exact_runtime_admission.rs`).
+- `RCH_REQUIRE_REMOTE=1 rch exec -- cargo test -p rabs-wrap --test live_cargo_worktrees -- --nocapture`
+  (worker `hz3`): **exit 137 (killed at 30m timeout)** after spending 26m19s
+  compiling an inner `rabsd` from scratch inside the test harness, and
+  `real_cargo_warms_large_packages_and_prebuilt_dependencies_before_execution`
+  **panicked** at `rabs-wrap/tests/live_cargo_worktrees.rs:320:5`:
+  `no package-facts-pending observation in real Cargo build: {"preparing": 183, "toolchain-warming": 183}`
+  (because `rabs-wrap` exhausted `MAX_RETRIES = 60` waiting on cold
+  `toolchain-warming` before `rustc_request::decide` ever reached package-facts
+  warming).
+- RABS workspace test suite (`bd-sopct`, `bd-h3fu2`, `bd-8hhef`, `bd-xo7x0`):
+  still fails on `serve_frame_live::the_running_daemon_serves_a_committed_hit_over_the_socket`
+  (`Sampling(ElevatedClassRisk)` because `commit_one_action` bypasses
+  `submit_action` and verification samples), `k007_failure_ttl_lifecycle_*` in
+  `rabs-cas/src/serving_state.rs:1337-1345` (`QuarantineRequiresRepair` after
+  the `bd-rhdef` fix), `nested_runtime_prohibition` in `rabs-asupersync` (11
+  non-allowlisted `.block_on(` files), `h015` crash-matrix divergence at
+  `commit-0`, and ~180 `umask 002`-sensitive `private_directory()` test
+  failures in `rabs-sandbox`.
+- Live fleet on `hetzner2` (`rch status --workers --jobs`, `rch doctor`,
+  `rch shim status`, `rch hook status`): daemon `v2.1.22` running (`uptime 1d
+  2h`), posture `degraded`, 11/12 workers healthy, 16/24 slots available;
+  `ovh-a` disabled (`/tmp` tmpfs usrquota exhausted, `bd-5ojmb`), 4 workers in
+  `CRITICAL` disk pressure with 0 slots (`vmi1156319` 10.6G free, `vmi1152480`
+  36.9G free, `hz1` 10.2G free, `vmi1149989` 28.5G free), 5 in `WARNING`
+  (`vmi1227854`, `vmi1167313`, `vmi1153651`, `vmi1293453`, `hz4`). `rch shim
+  status` reports 5 wrapped toolchains (`v7`) but `PATH does NOT resolve the
+  shim first` and `2 local rustc running`.
+- Authoritative Beads tracker (`.beads/issues.jsonl` truth): **2,185 total
+  beads — 1,979 closed (90.6%), 171 open, 33 in_progress, 2 deferred**, zero
+  dependency cycles (`has_cycles: false`). Note: `.beads/beads.db` has an open
+  `rusqlite` vs `fsqlite` WAL format conflict (`bd-zvam5`); always query
+  `.beads/issues.jsonl` or pass `--db .beads/issues.jsonl` to `bv`.
+
+### Vision checklist against current evidence (October 14, 2026)
+
+| # | Goal | Status | Reality at `a6df23de` (`v2.1.22`) | Blocking / Remaining Beads |
+|---|---|---|---|---|
+| 1 | Classify safe commands & preserve hook semantics | **WORKING** | 5-tier classifier handles Rust (`build/test/check/clippy/doc/bench/run/nextest/zigbuild/xwin/package/publish --dry-run`), Bun, `tsc --noEmit`, Go (`build -o`, `test`, `vet`), C/C++, Make/CMake/Ninja/Meson, Nix, `&&` chains, `bash -c`, and benign pager pipes. | Cargo shim (`rch/src/commands/shim.rs:347`) omits `package`/`publish`; `README.md:47-55,1192` & `AGENTS.md:360` stale (`NO_BEAD`). |
+| 2 | Execute remotely & return exact outputs/artifacts | **WORKING** | Linux rsync + Windows bounded tar, `--bin`/`--example` narrowing + payload-aware timeouts (`bd-3tkcz`), Named Cargo JSON (`RCH_CARGO_JSON_STDOUT=1`), Go `-o` delivery (`bd-ow7t6`), `--job --result-dir`. | Final fleet verification & close on `bd-3tkcz`, `bd-ow7t6`. |
+| 3 | Job mode (`--job`, `--require-tool`, Darwin `xcodebuild`/`xcrun`, `rch admit`) | **PARTIAL** | `rch exec --job --result-dir --require-tool` and Darwin OS-fenced routing (`bd-nknnm`) work. **However, `rch admit` (`rch/src/commands/status.rs:1031-1135`) never queries `rchd`** (`refine_recommendation` has 0 callers, so `Queue`/`Defer` are unreachable), ignores `.rch/config.toml` `[jobs] required_tools`, and omits 4 human fields. | `bd-nknnm` (live verify); **`NO_BEAD` gap** for `rch admit` daemon query & config wiring. |
+| 4 | Protect dispatcher CPU across harnesses | **PARTIAL** | Unmanaged local build detector (`rch/src/local_builds.rs`), remote `RCH_CARGO_WRAPPER_BYPASS=1` stripping, and opt-in speed gate (`bd-2spi4`) landed. Still 2 unmanaged local `rustc` on `hetzner2` because `~/.local/share/rch/shims` is not first on `PATH`. | `bd-g2ppt`, `bd-2spi4`, `bd-raobv`, `bd-qawj7`. |
+| 5 | Coherent source snapshots, receipts, & live-checkout safety | **PARTIAL** | `--source-content-receipt` (with owned source/target pairs and macOS 12-char rsync itemize fix `bd-3fudt`) and `--clean-overlay` work. Dual-role worker sync can still overwrite live checkouts unless `/etc/rch/live-checkouts` is configured (`bd-fbtws`). | `bd-fbtws`, `bd-3fudt`, `bd-n41ig`, `bd-p2m5h`, `…qe8dk`. |
+| 6 | Schedule within real fleet capacity & source ownership | **PARTIAL (DEGRADED)** | Learned footprints (`history.footprints.json`), `disk_headroom_gib`, SpeedScore v2 (`bd-uerk9`), and registry writability probe (`bd-5ojmb`) landed. **Still broken:** hardcoded 5% `critical_free_ratio` zeroes big disks with 30–70 GiB free (`bd-xxck3`), and selection ignores overlapping per-worker source claims (`bd-jqhno`). | `bd-xxck3` (P1), `bd-jqhno` (P1), `bd-81htz` (P0), `bd-5ojmb`, `bd-uerk9`. |
+| 7 | Recover surviving jobs after daemon/client loss | **PARTIAL** | Startup restores active slots from `history.jsonl` even for removed workers and reaps dead queue owners (`bd-w2qrp`); stuck detector has exponential backoff + lease wakeup (`bd-r1kcc`). **Still broken:** aged-out (`not_found`) leases with dangling target symlinks cannot be retired by `rch jobs cancel`/`recover` (`bd-ey7fr`), and startup does not actively SSH-probe workers (`ocv9i.10.3`). | `bd-ey7fr`, `bd-w2qrp`, `bd-r1kcc`, `bd-s528w`, `…ocv9i.10.3`. |
+| 8 | Truthful outcome & OTLP observability | **PARTIAL** | `exit_code == 0` build outcome (`bd-88fpl`), `rchd` OTLP export (`rch-telemetry/src/otlp.rs`), and `rch doctor` OTLP export work. Short-lived `rch` hook invocations still skip OTLP init (`rch/src/main.rs:2220`). | `bd-88fpl` (verify/close), `…62u24.17`, `bd-bddpd`. |
+| 9 | Meet hook (<1ms), selection (<10ms), & pipeline (<15%) budgets | **UNPROVEN** | Only in-process classifier latency is asserted; process-level hook spawn (~6–8ms) and 15% pipeline overhead remain unasserted. | `bd-1nhd`, `bd-1t3v`. |
+| 10 | Release cadence & update/install integrity | **WORKING (with `install.sh` gap)** | 23 releases shipped (`v2.1.0`→`v2.1.22`, `bd-iiyvx` closed). `rch update` enforces minisign/Sigstore verification (`bd-oxxnk` closed). **Gap:** `install.sh:837-855` still verifies only SHA-256 checksums on downloaded tarballs. | **`NO_BEAD` gap** for `install.sh` minisign verification (or explicit non-claim enforcement). |
+| 11 | Boot Asupersync RABS spine & green workspace tests | **PARTIAL (TESTS RED)** | `rabsd`, `rabs-wrap`, and `rabs-wkr` compile and pass `clippy -D warnings`, but `cargo fmt --check` fails on 5 files and the RABS test suite has 5 failing/hanging clusters (`serve_frame_live`, `k007`, `nested_runtime_prohibition`, `h015`, `umask 002`, plus 26m nested `cargo build -p rabsd` in E2E tests). | `bd-sopct`, `bd-h3fu2`, `bd-8hhef`, `bd-xo7x0`. |
+| 12 | Authenticated, resumable `rabs-wkr` sessions & canonical exec | **PARTIAL** | `rabs-wkr` runs bwrap canonical sandboxes over mTLS + newline JSON (`rabs-asupersync/src/worker_transport.rs`), driven only by operator CLI flags (`rabsd --worker-exec-tls` / `--job-submit`) with `publication_authorized: false`. Disconnected from `rabs-wrap`. | `bd-085cm` (S5). |
+| 13 | Serve automatic Cargo dependency hits (`bd-14t4j`, `bd-k52xe`) | **PARTIAL (OPT-IN LOCAL ONLY)** | `rabs-wrap` short-circuits `rustc` (`compiler_skip_authorized: true`) when `live_dependency = true`, after 3 local runs. **Limits:** off by default; runs locally unsandboxed on edge host; requires 3 compiles before 1st hit; refuses any crate whose `-L dependency=` dir has a proc-macro `.so` (`rabs-key/src/live_dependency.rs`); cold `toolchain-warming` times out `live_cargo_worktrees` (`NO_BEAD`). | `bd-k52xe` (P0), `bd-14t4j` (close/verify), plus proc-macro `.so` dir refusal & cold toolchain-warming timeout. |
+| 14 | Trust, SPRT sampling ladder, & CAS/GC correctness | **PARTIAL** | `bd-rhdef` (quarantine preservation) and `bd-2y15k` (`plan_swap` SHA-256) fixed in library code. **Still open:** `bd-okthi` is a fixed 16-install cap (not SPRT); `bd-2d0j0` (`gc_snapshot` ignores `expires_at_seq`); `bd-i7zop` (124/247 library modules have 0 production callers); `bd-9xawm` ($O(n\cdot m)$ `leak_scanner`). | `bd-okthi`, `bd-2d0j0`, `bd-i7zop`, `bd-9xawm` (close `bd-rhdef`, `bd-2y15k` after fixing `k007`). |
+| 15 | Ship & sustain RABS on the fleet + Phase 2–5 classes | **NOT_STARTED in prod** | `release.yml`, prebuilt `install.sh`, and `rch fleet deploy` still omit `rabsd`, `rabs-wrap`, and `rabs-wkr` (`bd-n8qt3`). 24h soak (`bd-rb754`) not run. Workspace/build-script/test/link/snapshot/speculation serving (M5–M16) exist only as unwired library modules. | `bd-n8qt3` (S7), `bd-rb754` (S8), W2 gates, M5–M16 epics. |
+
+### Bridge: prioritized order of work from `a6df23de`
+
+1. **Immediate Hygiene & Unblocking Fleet Capacity (Conventional RCH P0/P1)**
+   - Format the 5 unformatted files (`cargo fmt`) so `cargo fmt --check` is green alongside `cargo clippy`.
+   - Fix **`bd-xxck3`** (`rchd/src/disk_pressure.rs:381,400`, `main.rs:1504`, `workers.rs:1128`): cap the 5% ratio rule on multi-hundred-GB disks (e.g., `min(ratio * total, cap_gb)` + wire `[remediation.disk_pressure]`) and rely on learned footprints (`FootprintBook`) so workers with 30–70 GiB free are not zeroed out into `CRITICAL` pressure.
+   - Fix **`bd-jqhno`** (`rchd/src/selection.rs`): track active per-worker canonical source roots in `rchd` (and feed back `unfinished overlapping source owner` / `RCH_SYNC_LIVE_CHECKOUT_REFUSED` refusals) so selection never routes a build to a worker already holding an overlapping source claim.
+   - Complete **`bd-fbtws`** (dual-role live-checkout protection), **`bd-ey7fr`** (retiring aged-out `not_found` leases with dangling target symlinks via `rch jobs cancel`/`abandon`), and wire **`rch admit`** (`rch/src/commands/status.rs:1031-1135`) to query `rchd` (`refine_recommendation`) and load `.rch/config.toml` `[jobs] required_tools`.
+2. **Make the RABS Test Suite Deterministic & Green (`bd-sopct`, `bd-h3fu2`, `bd-8hhef`, `bd-xo7x0`)**
+   - Fix `rabsd/tests/serve_frame_live.rs` (`bd-8hhef`) to submit the action and satisfy or explicitly configure the sampling/replay gate.
+   - Fix `k007_failure_ttl_lifecycle_*` in `rabs-cas/src/serving_state.rs:1337-1345` to use the explicit quarantine-repair path introduced by `bd-rhdef`, then close `bd-rhdef` and `bd-2y15k`.
+   - Fix `nested_runtime_prohibition.rs` in `rabs-asupersync` by removing/refactoring the 11 unauthorized `.block_on(` sites and updating the stale `rabs-wkr/src/main.rs` allowlist entry.
+   - Fix `private_directory()` test helpers in `rabs-sandbox` to `chmod 0o700` explicitly under `umask 002`, fix `h015` `commit-0` migration/checkpoint parity in `rabs-cas/src/crash_matrix.rs`, and stop E2E tests (`live_cargo_worktrees.rs`, `chaos_faultinjection.rs`) from compiling `rabsd` from scratch into a cold temp target dir (use `CARGO_BIN_EXE_rabsd` or shared prebuilt binary) + fix cold `toolchain-warming` retry budget so `live_cargo_worktrees` passes in <60s instead of timing out at 30m.
+3. **Make RABS Phase 1 Dependency Serving Real Across Real Workspaces (`bd-k52xe`, `bd-okthi`, `bd-2d0j0`)**
+   - Fix `rabs-key/src/live_dependency.rs` so dependency directories containing unrelated proc-macro `.so` files do not cause every downstream crate in a real Cargo workspace to be refused (`dependency-dir-unsupported-entry`).
+   - Replace the hardcoded 3-compile warmup + 16-install fixed cap with the real SPRT-governed sampling ladder (`bd-okthi`) and fix `SqlMetadataStore::gc_snapshot` to honor `expires_at_seq` (`bd-2d0j0`).
+4. **Package, Deploy, and Soak RABS on the Fleet (`bd-n8qt3` S7, `bd-085cm` S5, `bd-rb754` S8)**
+   - Add `rabsd`, `rabs-wrap`, and `rabs-wkr` to `.github/workflows/release.yml`, `install.sh` prebuilt download + minisign verification, and `rch fleet deploy` (`bd-n8qt3`).
+   - Connect `rabsd`'s live dependency lane to `rabs-wkr` canonical sandbox execution (`bd-085cm`) and run the real 24h shadow/canary soak (`bd-rb754`) before expanding to Phase 2–5 action classes (`bd-i7zop`).
+
+---
+
+## Previous assessment — September 26, 2026 (superseded where the October 14 section above differs)
 
 This dated assessment replaces the September 15 one. It is written for the
 operator and the implementing agents who choose the next delivered
