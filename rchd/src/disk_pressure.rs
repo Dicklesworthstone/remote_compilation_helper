@@ -457,6 +457,9 @@ impl DiskPressurePolicyConfig {
 /// every 30 s poll of six critical workers wrote ~480 WARN lines an hour on css.
 const STEADY_PRESSURE_LOG_INTERVAL: Duration = Duration::from_secs(600);
 
+/// The verdict last logged for a worker, and when.
+type LoggedVerdict = (PressureState, PressureConfidence, String, Instant);
+
 /// Background monitor that computes and stores pressure assessments on workers.
 pub struct DiskPressureMonitor {
     pool: WorkerPool,
@@ -464,8 +467,9 @@ pub struct DiskPressureMonitor {
     config: DiskPressurePolicyConfig,
     /// Receives build-disk probes for footprint learning (bd-wv746).
     history: Option<Arc<crate::history::BuildHistory>>,
-    /// When each worker's verdict was last logged.
-    last_logged: std::sync::Mutex<std::collections::HashMap<String, Instant>>,
+    /// Each worker's last logged verdict. Compared here rather than with the
+    /// worker's stored assessment, which capability refreshes also rewrite.
+    last_logged: std::sync::Mutex<std::collections::HashMap<String, LoggedVerdict>>,
 }
 
 impl DiskPressureMonitor {
@@ -486,24 +490,25 @@ impl DiskPressureMonitor {
 
     /// Log a changed verdict now, and an unchanged non-healthy one once per
     /// [`STEADY_PRESSURE_LOG_INTERVAL`].
-    fn decision_log_due(
-        &self,
-        worker_id: &str,
-        changed: bool,
-        healthy: bool,
-        now: Instant,
-    ) -> bool {
+    fn decision_log_due(&self, worker_id: &str, next: &PressureAssessment, now: Instant) -> bool {
         let mut last = self
             .last_logged
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let due = changed
-            || !healthy
-                && last.get(worker_id).is_none_or(|logged| {
-                    now.saturating_duration_since(*logged) >= STEADY_PRESSURE_LOG_INTERVAL
-                });
+        let due = match last.get(worker_id) {
+            None => next.state != PressureState::Healthy,
+            Some((state, confidence, reason, logged)) => {
+                (*state, *confidence, reason.as_str())
+                    != (next.state, next.confidence, next.reason_code.as_str())
+                    || next.state != PressureState::Healthy
+                        && now.saturating_duration_since(*logged) >= STEADY_PRESSURE_LOG_INTERVAL
+            }
+        };
         if due {
-            last.insert(worker_id.to_owned(), now);
+            last.insert(
+                worker_id.to_owned(),
+                (next.state, next.confidence, next.reason_code.clone(), now),
+            );
         }
         due
     }
@@ -553,20 +558,9 @@ impl DiskPressureMonitor {
         let capabilities = worker.capabilities().await;
         let telemetry = self.telemetry.latest_for_endpoint(&endpoint);
         let next = evaluate_pressure_policy(&capabilities, telemetry.as_ref(), &self.config);
-        let prev = worker.pressure_assessment().await;
-
-        let state_changed = prev.state != next.state;
-        let confidence_changed = prev.confidence != next.confidence;
-        let reason_changed = prev.reason_code != next.reason_code;
-
         worker.set_pressure_assessment(next.clone()).await;
 
-        if self.decision_log_due(
-            &worker_id,
-            state_changed || confidence_changed || reason_changed,
-            next.state == PressureState::Healthy,
-            Instant::now(),
-        ) {
+        if self.decision_log_due(&worker_id, &next, Instant::now()) {
             let disk_free_gb = next.disk_free_gb.unwrap_or(-1.0);
             let disk_total_gb = next.disk_total_gb.unwrap_or(-1.0);
             let disk_free_ratio = next.disk_free_ratio.unwrap_or(-1.0);
@@ -1174,20 +1168,42 @@ mod tests {
             Arc::new(TelemetryStore::new(Duration::from_secs(300), None)),
             DiskPressurePolicyConfig::default(),
         );
+        let verdict = |state, confidence, reason: &str| PressureAssessment {
+            state,
+            confidence,
+            reason_code: reason.to_owned(),
+            ..Default::default()
+        };
+        let critical = verdict(
+            PressureState::Critical,
+            PressureConfidence::High,
+            "disk_free_below_critical_gb",
+        );
+        let medium = verdict(
+            PressureState::Critical,
+            PressureConfidence::Medium,
+            "disk_critical_without_fresh_telemetry",
+        );
+        let healthy = verdict(PressureState::Healthy, PressureConfidence::High, "ok");
         let start = Instant::now();
         let at = |secs| start + Duration::from_secs(secs);
-        // First critical verdict, then 30 s polls of the same verdict.
-        assert!(monitor.decision_log_due("w", true, false, at(0)));
-        assert!(!monitor.decision_log_due("w", false, false, at(30)));
-        assert!(!monitor.decision_log_due("w", false, false, at(599)));
-        assert!(monitor.decision_log_due("w", false, false, at(600)));
-        // Any change logs at once and restarts the interval.
-        assert!(monitor.decision_log_due("w", true, false, at(630)));
-        assert!(!monitor.decision_log_due("w", false, false, at(660)));
-        // Workers are independent; a steady healthy verdict never repeats.
-        assert!(monitor.decision_log_due("x", false, false, at(660)));
-        assert!(!monitor.decision_log_due("y", false, true, at(0)));
-        assert!(!monitor.decision_log_due("y", false, true, at(10_000)));
+        // First critical verdict, then 30 s polls of the same verdict. The
+        // stored assessment may have been rewritten in between (capability
+        // refresh); only the logged verdict counts.
+        assert!(monitor.decision_log_due("w", &critical, at(0)));
+        assert!(!monitor.decision_log_due("w", &critical, at(30)));
+        assert!(!monitor.decision_log_due("w", &critical, at(599)));
+        assert!(monitor.decision_log_due("w", &critical, at(600)));
+        // A different confidence or reason logs at once and restarts the interval.
+        assert!(monitor.decision_log_due("w", &medium, at(630)));
+        assert!(!monitor.decision_log_due("w", &medium, at(660)));
+        assert!(monitor.decision_log_due("w", &critical, at(690)));
+        // Recovery logs once; a steady healthy verdict never repeats.
+        assert!(monitor.decision_log_due("w", &healthy, at(720)));
+        assert!(!monitor.decision_log_due("w", &healthy, at(10_000)));
+        // Workers are independent; a first healthy sighting is not logged.
+        assert!(monitor.decision_log_due("x", &critical, at(660)));
+        assert!(!monitor.decision_log_due("y", &healthy, at(0)));
     }
 
     #[tokio::test]
