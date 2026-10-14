@@ -1190,6 +1190,62 @@ impl LiveFacts {
 mod tests {
     use super::*;
 
+    #[test]
+    fn observed_hashing_keeps_streaming_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, bytes) in [
+            ("empty", Vec::new()),
+            ("binary", vec![0, 255, 10, 0, 128]),
+            ("multiple-buffers", vec![137; 512 * 1024 + 17]),
+        ] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, &bytes).unwrap();
+            let observed = lstat_regular(&path).unwrap();
+            let mut writer =
+                StreamingObjectWriter::new(DigestRequest::default(), Some(bytes.len() as u64));
+            writer.write(&bytes).unwrap();
+            let expected = writer.finish().unwrap().atp_content_id;
+            assert_eq!(digest_stable_at(&path, observed).unwrap(), (observed, expected));
+        }
+    }
+
+    #[test]
+    fn observed_hashing_refuses_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("libdep.rmeta");
+        std::fs::write(&path, b"before").unwrap();
+        let observed = lstat_regular(&path).unwrap();
+        std::fs::rename(&path, dir.path().join("retained-original")).unwrap();
+        std::fs::write(&path, b"after!").unwrap();
+        assert!(digest_stable_at(&path, observed).is_err());
+        assert!(digest_stable(&path).is_ok());
+    }
+
+    #[test]
+    fn observed_hashing_refuses_growth_shrinkage_and_symlink_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("libdep.rmeta");
+        std::fs::write(&path, b"small").unwrap();
+        let observed = lstat_regular(&path).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(16 * 1024 * 1024)
+            .unwrap();
+        assert!(digest_stable_at(&path, observed).is_err());
+
+        let grown = lstat_regular(&path).unwrap();
+        std::fs::write(&path, b"x").unwrap();
+        assert!(digest_stable_at(&path, grown).is_err());
+
+        let current = lstat_regular(&path).unwrap();
+        let retained = dir.path().join("retained-bytes");
+        std::fs::rename(&path, &retained).unwrap();
+        std::os::unix::fs::symlink(&retained, &path).unwrap();
+        assert!(digest_stable_at(&path, current).is_err());
+    }
+
     fn generated_fixture() -> (tempfile::TempDir, DependencyActionPlan) {
         let dir = tempfile::tempdir().unwrap();
         let cargo_home = dir.path().join("cargo-home");
