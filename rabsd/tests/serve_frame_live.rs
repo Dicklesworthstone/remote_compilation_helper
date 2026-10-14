@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 
 use rabs_cas::blob_store::{DurabilityPolicy, PutLimits, put_if_absent};
 use rabs_cas::digest_set::{DigestRequest, digest_set};
-use rabs_cas::metadata_store::digest_key;
+use rabs_cas::metadata_store::{RabsMetadataStore, digest_key};
 use rabs_cas::publication::{OfferPreparedActionResult, PublicationOutcome};
 use rabs_cas::test_support::{
     FixtureAttemptIds, install_admission_world, install_admission_world_with_ids,
