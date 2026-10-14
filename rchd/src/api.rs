@@ -2624,15 +2624,22 @@ async fn handle_select_worker_mode(
         let wrapper = local_wrapper_id
             .as_deref()
             .ok_or_else(|| anyhow!("missing queued owner"))?;
-        Some(
-            ctx.history.resume_queued_build(
-                wrapper,
-                request
-                    .hook_pid
-                    .ok_or_else(|| anyhow!("missing queued process"))?,
-                &queue_selection_digest(&request, wait_timeout_secs)?,
-            )?,
-        )
+        let resumed = ctx.history.resume_queued_build(
+            wrapper,
+            request
+                .hook_pid
+                .ok_or_else(|| anyhow!("missing queued process"))?,
+            &queue_selection_digest(&request, wait_timeout_secs)?,
+        )?;
+        // One line per reattached waiter, so a restart can be checked for
+        // queued rows that resumed versus refused (bd-w2qrp).
+        info!(
+            queue_id = resumed.0.id,
+            project_id = %resumed.0.project_id,
+            wrapper,
+            "Queued waiter resumed its recovered row"
+        );
+        Some(resumed)
     } else {
         anyhow::ensure!(
             !local_wrapper_id
