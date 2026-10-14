@@ -242,12 +242,49 @@ rch_signal_group() {
     kill -"$1" -"$rch_pgid" 2>/dev/null || :
 }
 
+# A retained identity from an earlier kernel boot cannot still execute. Check
+# this only on the fresh-channel recovery path, after parsing the exact build's
+# record. The live supervisor's in-memory cancellation path must never use a
+# changed receipt as an alternative to stopping its still-owned child.
+# 0: same boot; 1: previous boot is gone; 2: evidence unavailable. No signal,
+# cgroup operation, record mutation, or compiler-success claim occurs here.
+rch_recovery_boot_state() (
+    [ "${rch_identified:-0}" = 1 ] && rch_check_procfs_namespace || exit 2
+    current=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null) || exit 2
+    for value in "$rch_boot" "$current"; do
+        rch_valid_boot "$value" || exit 2
+        # The legacy shape check permits '-' in a UUID's hex groups. That is
+        # not sufficient evidence to retire execution without a process census.
+        compact=
+        while :; do
+            compact=$compact${value%%-*}
+            case "$value" in *-*) value=${value#*-};; *) break;; esac
+        done
+        [ "${#compact}" = 32 ] || exit 2
+        case "$compact" in *[!0-9a-f]*|00000000000000000000000000000000) exit 2;; esac
+    done
+    [ "$current" != "$rch_boot" ] || exit 0
+    # Repeat both observations before accepting the discontinuity. A changed
+    # or inaccessible view is unknown, never a reason to touch a reused PGID.
+    confirmed=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null) || exit 2
+    [ "$confirmed" = "$current" ] && rch_check_procfs_namespace || exit 2
+    exit 1
+)
+
 rch_remote_cancel() {
     # No authority may leak between calls, even when parsing the next record fails.
     rch_witnesses=
     rch_witness_identity=
     rch_term_sent=0
     rch_read_record "$1" "$2" || return $?
+    if [ "$rch_identified" = 1 ]; then
+        rch_recovery_boot_state
+        case $? in
+            0) ;; # Same boot: retain all existing live birth/scope checks.
+            1) return 0;; # Only the old execution is gone, not a successful build.
+            *) return 44;;
+        esac
+    fi
     rch_remote_cancel_loaded "$3"
 }
 
