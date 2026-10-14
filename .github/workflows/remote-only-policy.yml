@@ -3,75 +3,48 @@ name: Remote-only policy regression
 on:
   push:
     branches: [main]
-    paths: ['.github/workflows/remote-only-policy.yml']
+    paths:
+      - 'rch/src/hook.rs'
+      - 'rch/src/hook/**'
+      - 'rch/src/config.rs'
+      - 'rch-common/src/types.rs'
+      - 'rch/tests/remote_only_policy.rs'
+      - '.github/workflows/remote-only-policy.yml'
+  pull_request:
+    paths:
+      - 'rch/src/hook.rs'
+      - 'rch/src/hook/**'
+      - 'rch/src/config.rs'
+      - 'rch-common/src/types.rs'
+      - 'rch/tests/remote_only_policy.rs'
+      - '.github/workflows/remote-only-policy.yml'
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: rch-remote-only-policy
-  cancel-in-progress: false
+  group: rch-remote-only-policy-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  apply-and-validate:
-    if: github.repository == 'Dicklesworthstone/remote_compilation_helper' && github.ref == 'refs/heads/main'
+  validate:
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    permissions:
-      contents: write
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 2
-      - name: Guard the reviewed source before applying the issue 114 fix
-        shell: bash
-        run: |
-          test "$(git hash-object rch/src/hook.rs)" = 761e90babeab98510af0fe26b2652c7428c239f2
-          test ! -e rch/src/hook/fallback_policy_tests.rs
-      - name: Apply the reviewed patch
-        shell: bash
-        run: |
-          # The compressed transport is checked against the exact reviewed patch.
-          # This one-shot application step is replaced by ordinary read-only CI
-          # after the implementation commit; it never force-pushes or opens a PR.
-          python3 - <<'PY'
-          import base64, gzip, hashlib, os
-          from pathlib import Path
-          encoded = 'H4sIAAAAAAAC/91c/XLbOJL/308Bc+4U6izRkr8tj7PjcZxJajNxVvHM7VbiomkKshhTpIYfcbyOqvYh7gnvSa67AZAgCcnyZKp2b1M1Y4kEGkB3o/vXjYZGwXjMut2bIGPeZuJPNtPE35zE8a2TpOy6/mSt2+02261tbGwY2v7wA+vu7+12dtkG/unvsx9+WGPjiPEv3HcT/lseJDyFD9M443abdZ+z6zgO2cMaw39pNhoMePR5MPjsJfbw9JU7PPvLL6+HZ/D35/OLM/fs7a9tJ0jd+Nb1opH99bMX5vwrgy7uOPRuXB551yEf2S160W6vbTD57+vXGnULyb88H54q4tYTKc/XNtY2Njc32ZCncfiZs2zCWTzjiZfFybOUiUUyuegpjzIWRz7vsGs+jhPOvOiezULPl68SQSzhfvyZJ/dsxP0gDeLIYWdfZmHgg7TC2PdCNovh2z0LUjaBmcKcWMpnHozKw3t2fU/TgHYhT5y1DWC9H0fj4CZP+KghAPFqwFogR9ePp9M4GgyG/uSUnnfU3GXzAclKFxpxt9oIGS3IOjc8AmaEDqzW118nccgXTKXog210Hl/AolJvyhkfj7mfBcBuyYeb3EtGKUtn3l0URDBp1MWCe2kH+DxiQeQHI2RzEt+lgi3ETHcMjLr2fBB6GMZ3IF/TkoEGvnWrXRawY73Gj1bL2HuNzdfYGsO1/Rh/6eJ6YdJjLw8zBgwDZU0CP+tKIvb1qHt3f5d+ag9AiZjHXrx+/+7k4vTV2RAG/9KhjdfvHW519tlGv9/b7RzSzmvKR65IvOJJEicDdj7LgFXft2DM5/CGlrQO6+lSmy9B5t4F2UQuIMkjG1UF2IoKMouTjCf4yUvjqK4yHTFEh72NIy53I6z4BQ+Da9woXOl0sQ/sUZDSTmOwPztM6A416rAojrow9CwIPZxwSQ/2QhSDNWOKu8wbw6zggeTf2AtC2AGO6PGNS8qSvL6wUpioqG+8exi8x2YwEzAEYEPgYwDGFQUL7QvTkEck2evf8u2DtsNOGOz8YBz4tDwh0/7WgZDpzmFFpmKSsHVfgboP1ZzVW5w4vAOBdpYpAXFjsW4v1RL8lwVT2HLFqzdIY5hHF/T4+2fu84o60Wghh03Ix3kKEj5m6yvtQvP+ax+JSQDTgYd5PNn5MgDRen4GdvD87RnynYdgkBnYZLAAn2PBVxDdNMgyGN/L0FhKPu/2Ov0tZPT+Nn4ATpP6B2PJTrZ+zKyaBjKpNRaZteq+l+t9Sn/BFekLhdT8OBm5aNFcZcLs1nUehKMaM8rXZW/8p9S6+lRqtlhh+bDC89J1ipc0uRqdCISSR8EXd5ra7do7sT/KZ20lr7kYFhVhmmfMn8BqQBWmXuZP6lZZTt+FjeMKe69vVH2+bV3BvpEuLbWtC+L81iZ6bXb8XFDWVnaWJDap/ktJfogUvBBcKU1tKCYqOj9Idds77JC2gckula3kttjPTprDpJJ710+CDMxCaLfEapX7RJdOY7mypS1Ei8zeWJFijTVmgg12K2kW4oY95RLKU9vObp3BVwBH4NLO1FZUyz/Y7ezA8rd6B/C3vnzaM+ZlBggYsuQeXYRaq5J8pXvdBz+RIKv/I/A4S2KfpymgSPAg9tlfX18oYCpx6gv48PKX92cv6uyZr61E7cdfXr954Z4Nh+dDoECs2jrokQPY7m1LB0BuhidgY8FzkvS6hd9DD1N4vZcnr9/8MjzrsBsPzV0ak4cM0LnKFmRKBMU4ArMJHilFgIEYUnhm8L8TDiYfQS27m/CoAnPRtILgUxZkDpFZ6yKtlzBIyvwwRntm4/LYVX19V21BTs4EVScnmxikSnwjQc2+qorzim0y4F08ZtN4xOHLVTNSAOrnQxpA0LjSrK5j8iZgKeBjyq8cdg4rTO6ClAt2EJ4WxkHhfTQQ6ePTh5nr2Peqo027I2iZpt4BpjOAQTO0XOC6hIFq02MaU0immHmQCloKOTnsPYFHVig2k9qeslvOZ4R/WL+3fQT6UMCtghw2kRRFQwcQajahHU66RaRK74r42pOT7Hq+nxOuU/7IEZSW8JS0j5YECqj8dxjccvbhqo7U1CSvLiEsIsVDSiCNBLaAD6BD7pnDnc4WmtftPpjZnQI2/U6oUwXETfPyUJovWMqpB14eTavUjW6hDop1dkV7mxrQdkqCizjgCmwAS14GXTWoqjwCTP9bQJdubOtOxW6BuoO/XbetD7CqS6mo9oOYzrxt1UEATGbduBs1lt55SbRuVz2E9aa6BQotth/b58e0y9tHQhjAPpbFBMSfPcyfKdNXMXoilKgGEgOm1mTVUNTUS2/dlEdpgEGqAhpKRu2yMXBC1xo0mV1pMaWeDIQZDiI0LxAhBRFNF54hjPw7T2KxQad5invdA5iDcFan6t1gTMU/g9EAsJtmMfDqMwTG10EYZPfMhnV+t93X9W0JUFDCrYlCiLpgZ804rSiQI1YqicYjnUmr+cyFAV6ptgUmbihy5ZGAyBuPwmPTorTXEgcX3zFglF9VgqOZjTCDMBnRLU7LoN0HEeihhykmEctZCUeKDnPGQUZ699pG/wOl364YiN9nYrrfbjlpXsp0YnyPjmV7d2cfc5vbuwDf9wu3MpdGTcS2kqEZCCUl/oIlEcFu9R1mG/l0lt3basZafyWxY0N6bdEQR3qEXaWiK//CbGDLN6b9lg3Z1sZcgKpkYu8xRTjCBIq0Wq/TNOfsu93dAZvEEZjgTGX/BDF2G8XXwvVTso8apR0AuFJKAJm3QUp7vR0tuFqVu6tmJ6XQcZet2kUPLIJoHIMW4/PjEuwNWDweh7E3IthG8FylBVP0VGPNTWwwkELOLRkpbO8eHnQOcNlb/U6gn/oMACJf/Pp6WQc4xotFP3M9AqIDe4pt7ZS2pgd0qHgts12Et/24kt6fmn8uMjuhv5Kofci9yMbMdeveUjI9zRMbApQxcFO5JHswyzdwjNKiQfVgeIz/BMmj2ZZmhwA0h7UOrNBCtMiAuJ6eH2yU5CrvqRKuxaqvpjOixwSPJ5zW39Gjm5hH3VHNJEplIFpFa7e30yObt7e139ipaVZspM860mo6icwlXj4pWmi5rTrfyiBS7mn6UqYbt/cM9TDVsH2ztdHYa00flTQEVcUxeBClssmP2zssmg0HE7+yWfAWbc9J2RAO7HtojCQkL3dsgQkvvh16aBuN7V/aXr+0W71RH0zWymA4Fb4tMVC2vY+qwWlIVN+Gn+Hp5blUfxldxjVwVjCQtk6uxyVbW6GBvq7ONenNw2OtsbTc4L/JyeE4z4q469XIh+gMPYVPkig4yRcFC6FtZozFBg8cKHryOYKLgKfRTgDyL08xLMrCYRJj97z/+hxGSLDIh4b1TlYQk+U60Eok8FkxnYQCR/xWRucJYHzXviOSPSZEIWYLgH2LjeyNBiCkwps8mXsRmHvDzFnUVjB08yTBL7SWBB5gdSANsTwCtxyGaEacqd0ntjJB90ag8PSwJUXQQX3NxMChMudNkn+DdUPY/ITEMBtXlHz8X/HPy6C7xZm6cuIgLbdCkh+ZijUa6aptHQmB55H0GBqLLa1v1LfGolW4yZhUrzBb9a5lT5qvYvEpY1FxbPVRcZsKNDU2smbc7Rj2jeJI0ElwsaEnAIx+CSS+CeAHDXeKHs5CrZt0l4CyAF4ix+7oHMKM4WsWTrN+8u0/7bcNWMqtXJWsusuP/PDXqPq4R3RU0ovtP14hFhiweS/mTtRIgcrEGSHyTwnxHPDHS1LKZ8DmIZDqOq3oFq1oCMbJUZsNITcpWHNgbVG3rm1RNJG2X6NgT7Yu58gEd6uL2K0CxBqgpUe0DH3w3BxC7oEf9xEcZh43fsxW/rsDFf0ez+y8narZA1Ky56wl1HfZ7eK64fbi11+lXQt9vDs/lNj2RoVtXhm5Mhm6IWK5jMBYYpmKRQ8pDCC4BlNzFyS3CMHhVFj/I6QI2BHC+0+vtGsB5IXgZqC5gB+jFCHCjm3If4ElahG3tziJvsoLQ/wgQvWC+tVNzZMROv09Fczv97Z445asfiK4vPnP4gyJig+/43ZFx5ai4ZpieFB8viZGXxcmLY+WnbOYVN3EtfK7vULEzd3b3tzEptbN7CHHRQlVfLMMlwKIKhjiAPvCS/j34ZD4Og5tJxh7mA/jvCEIKdKA+nl+A+JcYJElzZWLWEptc9HR5kjhCKq4vUUP11ZSPAlWkI6mrjLTk4uEOGYy9/rbMcT3NmZsVV0sNr6LBv1uTV9DoVTS7aFOf9/8fqGLwX8yICi8SL0rH4D7S22DGbA9ApYpeQgxz04x7ACxVvWenKASkjEvbHDafsKxCdurdA/y8ueGpKrItzvM77Dqn3AfRzbNJnAR/51TvQAq519tDh7uzt71tKOR5smnGXckW1PA0iAEyuwYQ3yBWWdyMj7TTyraJ98VhUQituAuiBhcV8tENOG+ZOcYaJ3EWgmmfPEFg5VJzR2vuZrIsxW5L7vR3OnvInZ1+5+Dpu/VfFGPW+ftviTBRfnsH+wQn9w4ODwGeoNP67oM/vrEz2CntyzWM/Rh+To/wHLPybgPfFQZK5J1c2Xa06AbCprFD817CwnZrEb9j4yDkorqi3+vt7ezQFYbNEf+8GeVhaLi6sJgccqHX6bGNfmerT8BsY3NzXZ1Q9fs74pBe6b0qSqekG1Wm02tApzm8pBp1YaGo2iqMb7AYHSOqNJ/xZDD4ryP5tXLWfSrUlnkpu4CJya/EcgDhMNLpKzwC//n8xZk4IoY9Kq43nLx58+PJ6Z/dd+dvXp/+zb04e3/hUmNLCgwXekkn0AULaHtRjaNdKao8v7WRp2gAqjcpytHbjXNiAOR5EklDNtdOC+VJ3jHDwy5XfLMxxz4DoG9b+BQiCpnWlFxVZ5eEEKz2kvPOlY45zXdS2pVJCsYfm+6OVHh6/vPPJ29fWG2ZGrWrk6P630eJDM9O3p+/XURDmCWgohd8i2OK8zyb5dmvRV3HYEBV6bJ7yjN36oFAI+7G1NLGsiCtHoi2yjHojMrcdMmsWLogcRJSDIq70vjI+tmCrWRpTst48s9BBMs+9ZKb+Ec8z2w3FrjaKSJ4onWZvsacRALwMHWrbWzzOdxKGFCSloefbfP53rxeX/II8DMAPROwa61ebbJivK71IHlYQfRJROPVQiZLYTRcIRWjgPnI/Yy9I3YMAWtJJRCqM6iZJqF6kgYgm1tels+JapTn8qVK3qUD9iv3v095MuLuJ6xqGfyKV6qwnaqGAYin1ErdMdJvNGw8cqNBP15c+aqD2Gr0CvdDvQiwQRjrnIu+VH3TYBnqdManM9Bl/INuaTDAT6MgsY3bXG4seC/7OOJMzfkUB5FtideF5SNRjEEKPvAHZgTdME+htiJ+N46iREEHdsaBCmE5KKGwYmuFlBf3FRXJolWlo2BuYfj1wnyyQA91ndUu/1hUPK8/wbHBjH2MrIauq2pA2Ule3VMVvtUeaCmpVYNMjAd1RIHO6QA05REiXVV/K7TkgZrNi300r8vmLgnAMNU3MMqmIlQni6ehpUdMReC/UQ3MZUXJ5ceocrHumD3o3+cfowed4fD9Yw0dftCMCFBbkCB8MD03UdOid6fQMAoLEqAu1eVh8Kd5VQC6bSClAk64sOe0DaLXJpSlc/inrt0U28FmkHXxAnGB8nmfeVpkFOQBAwKTFELFKI6oljLNvCxP8RbWCI/LRgVFhQII1EV0KksUCdoJPe+IGkvwpViTTFWZd3Eejtg1ZxMvmYZgLB0TrmgK2aKTlDF79p/pM/bR+g9ECacnw5/O3f8enrx7dzZ0f/zbu5P37z9a7LlIw+Bo+zpL0wkPQ5envjcDgyP+2tq2lRwG4wxiTdN7u617AdMlGg12CshRQhk/TxIUHaApTWSKEBEoZ+YACkjtDzWV7nap7LuuFRZCc9hEJmyuPS7xaoNAtws+gmeG5xGoxyxDB6i9u9TuCzt48xerlkARq09t69X5z2cQpmumr9Hkry9+AlD49uXrn9xma7nxv4xuusqiGwm8vzi5OFvcHxWWG7qSxoixX7weWli3VfoDU+Nq9Tl0MFSOMqtvFXWgzOrBlzqtMg7olFXmaCXLQg7sWgeZJVElUgPthYi7w4rS6kd6SHhdpFe09kqH0S/rUtVK5lX1HJUC1bG8G6e29e7k4pVVqY8npRSToZcdRr2rWBKI12HFAhqNC+sdFEqNHE5UQDXE6dRZgn4jFBBWQa0H/RVwB8s8pYHQzUbbiW+NOCJd0r9i2nWelzUksoqoss+w6j2tPJnCzL/i469Mx47jJJ6Su8BXmv3RpRuHeBJVTF3DaZJVncKMl0ual3C0uNEGuBQwaNGfUF8DyOroD7gSkyQEFpbTzbPxgbS8LSApBeSIxjqD1cALMbNgPPRayjoAnhBvuBoHH0xVZFghdUz3DaBHNLKth4+WNwtccHiYWv1oWe0/1VKSRkm0kMQHouc4l0Jrym7zZaLxUqAIvuS3dbtYuxNyisf6HbIdIopR94QQvamWAMYEM+bFpiiJgE+NXUBiiCsi/kXfDlLQejJE7kVV1ldJPAAfQZhfXPHDAy5BDPzNCFlXnrrFTxSoGKZdvfyM1ge3jOYGLeNBi7irN2DTIKXielkzC+qZ3M/ABVQcmykrWb5sXFMTtCttjEfn5WswzvIoN2XXeXpv6luc+eZRWfkuOqnmlyVUa9w4qtSFmjOcTFOBADYuXScTMbqGrzwsXKlw2JYF/fKPuBi1Lz7oALPWTv6pXzSRL0wdBWXx/2U3RB8loQ/9BBqVzr9vGhUS3zSNb2GG3vfpk1BqhhdiZQIuiIrNV73JUijiSKrgSCoffijVTKaCkI5QMIMVxcOpYz1/UTtRNI1A58dy9sby3hFPktV9CDSuk9HMaqUtBTx4Eov2leANrhY+W+rASNhUIFna1AVEhQd1vBT8OVgwyqAVTHMgVIoEBkTIog1gmZac0KVxWHJ5lxxoLZsAdfhgwcoADnLrUmDYYnxElxjtAnEsQyshp7zsj4jzceq141YcRWLJ5awpsymaK1uBwzrGAma0KrQ+9C4Xj6pafbDMZSw09VKlVyGkndsb2asKQnXuqsq95ewtxxjxDG+OW5dquJVYbOxPh5XYfXHm86jxswHr+pIM9SA05rot5OVgAZQXRAD9F1x/E4q+SLo6xfUGycqx8HJCcw1cFbFAA9LUg4wgiaOpuHpDdZ4uZjBcvF8u4Y7QlbRMa1dhTN3QGeEDM3ldYe/0M4jV7dPS31yokquYJYhAIxjWbi9BmsLIVIxIYR8WzFTfjcv2WmHcG2JR0bBbhsupq843XMr1Bb5bva1JYkPEqRKdBhmhW6OsKnirD5VMKqyqSJBe1o94mmLNI2JAzRPLPyQTOhU0OLDVpbrfXtLP4FjeK0eyoNsyiZZuQIucm2Kh2yjyqGbk1uKBa4Da/sSlbQOezU0nHp404mFQdZcIxA4cBUUJcxAoxEfrtuU46hfzKglyKp/0kqCBXWvpq2+5OtPIheFdgdd/Zf0BgJqZB5p43/XuYDnq1wvkmss7vWEczxzLkJM1TbXIm4ggoE3HeukMMBh3xCPHD2ljktNozE67tUgSEL99FIwqhNTDBollM0Nzr8IVV0xF/BiMDFvslpxfgAeFKkMEL4HVGKLBDuWjJjuB2QW91Jnl6cQu6Kilto9WnaR+b7NSK4fr584ovosAipINHwy+f1EEke9U25dCes9to+CfUAf1xBmrsq0z+kGNgfr6XoSmgA0kJp9jBgMe4poaMzw+ZuLm0btgxjGpIFcjEjCDAX49pWsMb+NK/bppsnpAYFNyArB9NCI4r228mj0UOx0nSTvZScFaZy7+jqOgUWYRnL7+EimXr3oNM7VuC8qax3/kUFlhABi0CgEWEjTFz49SWV8yr1VmpKUhUXeMnLNm+TUMeB/5TB72YlPb0pnZPBSdxfibGlRIgc1ljuoPKG1vVlwoZtRH/l4fGfbPX3L6pU4BfFCxZKm7sCtUpNI4EVG0iVLJ5T/4Xr5wjfO1/wNKGHjl7FUAAA=='
-          patch = gzip.decompress(base64.b64decode(encoded, validate=True))
-          assert hashlib.sha256(patch).hexdigest() == '23eb1978219dd990b8ddd0e9aff2a77d5ab1e2b5fbb4c53d4de76e9733064800'
-          Path(os.environ['RUNNER_TEMP'], 'rch-114.patch').write_bytes(patch)
-          PY
-          git apply --check "$RUNNER_TEMP/rch-114.patch"
-          git apply "$RUNNER_TEMP/rch-114.patch"
-          git diff --check
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: nightly-2026-06-06
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - name: Format the changed Rust files
-        run: rustfmt --edition 2024 --config skip_children=true rch/src/hook.rs rch/src/hook/fallback_policy_tests.rs
+      - name: Check regression coverage is present
+        run: test -s rch/src/hook/fallback_policy_tests.rs
       - name: Run spawn, envelope, ledger, and failure-path regressions
         run: cargo test -p rch --bin rch fallback_policy_tests -- --test-threads=1
       - name: Type-check all RCH targets
         run: cargo check -p rch --all-targets
       - name: Lint the RCH binary
         run: cargo clippy -p rch --bin rch -- -D warnings
-      - name: Commit the validated implementation directly to main
-        shell: bash
-        run: |
-          git diff --check
-          git add -- rch/src/hook.rs rch/src/hook/fallback_policy_tests.rs
-          git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m 'fix: enforce remote-only fallback policy across failure paths (#114)'
-          git push origin HEAD:main
-      - name: Retain the exact candidate for inspection
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: rch-114-candidate
-          path: |
-            rch/src/hook.rs
-            rch/src/hook/fallback_policy_tests.rs
-          retention-days: 7
+      - name: Check regression-test formatting
+        run: rustfmt --edition 2024 --check rch/src/hook/fallback_policy_tests.rs
