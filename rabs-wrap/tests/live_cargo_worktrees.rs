@@ -44,17 +44,12 @@ fn wrap() -> &'static str {
     env!("CARGO_BIN_EXE_rabs-wrap")
 }
 
-/// Ask Cargo once per test process, so a stale daemon never answers.
+#[path = "support/rabsd.rs"]
+mod daemon_binary;
+
+/// Use a prepared binary pair, or a profile-matched Cargo artifact.
 fn rabsd_bin() -> PathBuf {
-    static BUILT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-    BUILT.get_or_init(|| {
-        let status = Command::new(env!("CARGO"))
-            .args(["build", "-p", "rabsd", "--bin", "rabsd"])
-            .status()
-            .expect("build rabsd");
-        assert!(status.success(), "rabsd build failed");
-    });
-    Path::new(wrap()).with_file_name("rabsd")
+    daemon_binary::binary(wrap())
 }
 
 /// The real toolchain binary (`<sysroot>/bin/rustc`), not a rustup proxy.
