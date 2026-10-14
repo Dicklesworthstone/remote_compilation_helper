@@ -58,6 +58,9 @@ fn parse_required_tool(value: &str) -> std::result::Result<String, String> {
     Ok(value.to_owned())
 }
 
+#[cfg(test)]
+mod exact_runtime_cli_tests;
+
 #[derive(Parser)]
 #[command(name = "rch")]
 #[command(
