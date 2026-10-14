@@ -5,7 +5,7 @@ Compilation Helper): the PreToolUse hook + CLI (`rch`), the local daemon (`rchd`
 worker agent (`rch-wkr`), the RABS build sidecar (`rabs-*`, `rabsd`), and the fleet
 dashboard (`dashboard/`).
 
-Scope window: project inception (`v0.1.0`, 2026-01-25) through `v2.1.22` (2026-10-13).
+Scope window: project inception (`v0.1.0`, 2026-01-25) through `v2.1.23` (2026-10-14).
 
 This document was rebuilt from git history (`git log --no-merges` per tag range, `git show`
 on representative commits), version tags (`git for-each-ref`), GitHub release metadata
@@ -28,6 +28,109 @@ history. They are kept as-is because the descriptions were verified against the 
 but those particular links will 404.
 
 Repository: <https://github.com/Dicklesworthstone/remote_compilation_helper>
+
+## 2.1.23 — 2026-10-14
+
+Selection stops sending a project back to a worker that still holds its failed build's source,
+workers stop falling out of rotation for good, the worker sweep reads the disk once instead of
+once per pass, and automatic cancellation stops hammering workers over SSH. Worker shell
+protocols work with the uutils coreutils every fleet host now runs. Updates stream and resume
+their downloads. Linux builds run under an owned-group supervisor, and worker dependency
+preparation, source ownership (#105) and recovery delivery (#107) received a large batch of
+hardening.
+
+- **Selection skips a worker whose failed build still owns the project's source** (`bd-jqhno`).
+  After exit 102 (artifacts not retrieved) or 130 (interrupted) the client lease keeps the
+  worker's source claim for recovery, but the daemon released the slot and with it the
+  same-project exclusion. css re-picked that worker for the project's next job for 15-21 min,
+  and the worker's registry refused each attempt: 424 refusals in a day, each holding a slot
+  and a sync. A failed remote build now fences (project, worker) until the dispatcher's lease
+  no longer owns unretired source, at most 25 min ([`2a8f44bd`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/2a8f44bde2a0d12663fe4b5122eb06dc8fea0d0b)).
+- **Worker shell protocols run under uutils coreutils.** `/usr/bin/{ln,timeout}` on every
+  fleet host is uutils 0.10.0. It refuses a repeated flag, so the alias-namespace topology
+  wrapper's `ln -T -sT` failed every initialization ([`d9951475`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/d9951475468b4a267a6ba58fa3596529219afb8b)). Its `timeout
+  --kill-after` kills only the direct child, not the process group, so TERM-resistant namespace
+  and control-exchange descendants survived their deadlines holding locks or pipes. Both
+  timers now prefer GNU's `gnutimeout` ([`0f2a111a`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/0f2a111a90ccd8db16d564b51ab5915554691924), [`29b1c7c9`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/29b1c7c906da2296b59413790c7b1702a02b34f6)).
+- **An E104 quarantine clears once the worker-side record is gone** (`bd-sh0tr`). It cleared
+  only on a `verified_dead` probe, which needs the worker's process record; the orphan
+  watchdog, a build's own completion or a reboot removes that record, after which the worker
+  stayed disabled on that dispatcher for good (vmi1156319: 41 h on csd). The kill probe now
+  reports `RCH_E104_KILL=record_absent`, and rchd clears the quarantine on it once the
+  quarantine is older than 6 h, logging which evidence cleared it ([`0a58a503`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/0a58a5038c98b93bafb6e761df90d7a6e7bd4af2)).
+- **`rch self-test --all` works** (`bd-57nk9`). Every worker ran against one project tree and
+  overwrote the others' marker, so each test failed its hash comparison and slept into a
+  timeout. Each worker now gets a private canary project; with an operator `--project` the
+  workers run one at a time. "All" skips disabled and draining workers unless named, and a
+  bare `rch self-test` picks the first worker that is not admin-disabled ([`bd3bf5a5`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/bd3bf5a594136782da7462654e59790fcee98895)).
+- **The worker sweep walks the mirror root once** (`bd-2bsz0`). Each pass (per-job TTL,
+  pooled TTL, byte cap, pressure) walked `/data/projects` to depth 8 again: 350-440 s per
+  walk with a cold dentry cache on a worker with 684 mirrors, and sweeps hit the 1800 s limit
+  8 times in 14 h. One walk now feeds every pass, which selects its names from the list;
+  `rch gc --dry-run` uses the same walk ([`124620de`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/124620de8bff51a3303ecf329769cfca8ec00322)).
+- **A sweep survives another dispatcher's removal** (`bd-o9voz`). A candidate that vanished
+  while the sweep waited for the registry lock made the whole sweep exit before its pressure
+  pass. It is now skipped ([`02c8fa0b`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/02c8fa0b80e21e6f6e3cbe47dc9e218cf9e33c6e)).
+- **Workers with an unwritable source registry are excluded** (`bd-5ojmb`). Health checks
+  probe create, write, rename, read-back and cleanup in the real ownership registry instead
+  of trusting an SSH echo, and a confirmed write failure (EDQUOT, ENOSPC) takes the worker
+  out of selection immediately ([`36e5cbb5`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/36e5cbb586cf820ac94cd4e6c5990610d8699f62), [`a6df23de`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/a6df23de2726b522c1d4c21d896995febb3189d2)).
+- **Automatic cancellation backs off** (`bd-r1kcc`, `bd-5ojmb`). The stuck detector
+  re-cancelled lease-fenced builds every 5 s tick, about 2,000 SSH round trips an hour from
+  css. A cancellation that has no process-group record skips the SSH it cannot use
+  ([`fdddb7ea`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/fdddb7ea4a9b86b9ef013ac13adf96ad8ab2feb4)); unconfirmed retries wait 30 s doubling to 300 s ([`0cc77eeb`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/0cc77eeb3f5e18fa75df02e6cfe0f3adefeebdfc)); at
+  most four cancellation waits run at once, one per worker, without stalling observation
+  ([`0fdc1477`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/0fdc1477e11fe6b2328639e914560987f1397b01)); and a change to the build's client lease wakes a retry early
+  ([`523f4f75`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/523f4f758b2d6ddeaf39d2a3781b1648a165e4bc)).
+- **Updates stream and resume downloads.** Release assets are streamed rather than buffered,
+  and an interrupted download resumes with an HTTP range only under a strong ETag and exact
+  size ([`19b7c542`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/19b7c5423d12514c0f25452a8e2169663f3ae519), [`cc66e6da`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/cc66e6da09cb58dee6ba971059b758793329bcc8)). Files are flushed before checksum and signature checks
+  read them (#108, [`006d8212`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/006d8212f800640efa2b033465c930cc0fc8771c)). Minisign verification streams in 64 KiB chunks, and
+  Cosign is bounded to 120 s and 1 MiB per stream ([`07fe6c47`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/07fe6c475726c8cf8623f4c77506fecc6d73f34a)).
+- **Worker dependency preparation.** Node and Bun preparation runs inside the owned workload's
+  environment, timeout and process group ([`6ed0182a`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/6ed0182a2e1e2fcaa79d50ea06a5509d64d744c0), [`f9b53b63`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/f9b53b63c35e5f79613f97695ef8f963e87806d4)). npm/Bun workspace
+  member manifests ([`be6e788b`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/be6e788b4b7100225fdbb381369a3c82e1b2dad3), [`b5771189`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/b5771189282d63e7705d0cfb28c03c44796eb397)) and pnpm workspace declarations, member
+  locks and `.npmrc` ([`409175b6`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/409175b6e89615355668e80c8615754ab4d8ad27), [`8cc2c7cc`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/8cc2c7ccb572d9d52b60bdec71a7546521260243)) are part of the dependency cache identity,
+  so a member edit cannot reuse a root-only stamp.
+- **Linux build supervision.** Ordinary Linux build groups are supervised through confirmed
+  teardown without a systemd slice ([`02f769a9`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/02f769a94027043a703c2370e32c52703cbce743)); a record is launched at most once
+  ([`062b3698`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/062b36981363eb044ca616de174b9b0d75b59e25)), and a claim that cannot be created reports a never-started refusal rather
+  than "already owned" ([`137e3f36`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/137e3f36e66e11bd87b07ae08791525aff1be1f6)); a deadline kill is confirmed by census when the
+  group's own watchdog got there first, instead of being reported as an unconfirmed
+  completion ([`335b65fe`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/335b65fea25d3ba8695d4ef969db8e667a9c5620)); cleanup authority survives receipt loss
+  ([`a3cd3ad6`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/a3cd3ad6a2435bc4b81d6ff504d0337798c6ac25)) and census failures ([`df9f8758`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/df9f87586ecca91fb822e058549ffaea0b5d0576)); workload stdin survives owned
+  background launches ([`48a4a925`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/48a4a925d439b245d484bf810a699c910abb49c0)); scoped execution fits nested shell argument limits
+  ([`0dbfe957`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/0dbfe95799d601a731833ef4f4d971c862a5eb8b)). The wrapper bounds post-compile output completion to five seconds and
+  refuses lost stdout/stderr delivery with exit 122 ([`0db65415`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/0db65415be495929bf29eb3bdcac7842916c0b4a)).
+- **Source ownership** (#105). Namespace admission gets its own 15 s worker deadline
+  ([`129c19b5`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/129c19b52a1c6a2ff1e960d5453529b04237059f)), alias namespaces stay out of durable build roots ([`03d95f16`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/03d95f16048d89144798f5255ac4db7a097fa964)),
+  alias writes cannot race ([`3ef75937`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/3ef759377db38dc035232ef462653687b825047b)), and namespace process groups are retired and
+  their ownership verified before readiness or teardown ([`31c97a60`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/31c97a6021dde462de4ca7038061d62693172b1f), [`be2d753d`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/be2d753d4e5eab6ed5985543ee78d4fb9b5f07ac)).
+- **Recovery and retrieval** (#107). Retrieval staging is space-aware with durable timeout
+  extensions ([`4a07a91f`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/4a07a91f32b1fb95cd08a7f172126daf6bbbe4ac)); Windows retrieval archives spool on the staging filesystem
+  ([`60cf5196`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/60cf519658d528f5f273a01f10e2521c0fb273f0)); retained Make artifacts can be refined with
+  `RCH_RECOVERY_ARTIFACT_EXCLUSIONS` ([`3b4eab3e`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/3b4eab3ed954407d459a6c6fd32e2a8fabb541b2), [`b5d53692`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/b5d53692242462c4866fc6e295a3fe5acbae8569)); delivery checkpoints are
+  validated before terminal handoff ([`61ce6cdf`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/61ce6cdf0e7de3829d3b3d0db07e1c177e909e2c)); zero-valued adaptive transfer budgets
+  survive an extension ([`078e82cc`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/078e82cc1c1ac61c2879b29bc71e60f111aa6b58)); a record from before a worker reboot settles as gone
+  without signalling a reused process group ([`812d6a97`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/812d6a977802041537c3748e83a14e88a333481a)).
+- **Exact Node and Bun runtime requirements** (#106) are part of capability assessment
+  ([`8764f2c1`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/8764f2c14ad3b05d1c8816d3ee6bbe6772e460e9), [`48b53be5`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/48b53be5f0b71ae4891d293597846f5007b21acd)).
+- **`rch fleet deploy` reports another platform's worker as skipped, not failed**
+  (`bd-ztpbq`), so nightly installer runs stop counting macOS and Windows workers as failed
+  deploys on Linux controllers ([`36d166a7`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/36d166a7a7a63a80f402f89d25d4f3fa42104508)).
+- **The owned-source Cargo config guard matches by physical path** (`bd-ql5bu`). A remote
+  root reached through a symlink (macOS `/tmp`, `/var`) refused every captured
+  `.cargo/config.toml` with RCH-E413 ([`8261899d`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/8261899d0690b571f40b4bcec48dc3cc22d76b04)).
+- **Benchmarks** (`bd-uerk9`): the daemon ingests complete worker benchmark evidence and
+  refuses truncated or invalid reports ([`5f1f9072`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/5f1f9072652dc6635b10d207647dfd27590a988d)).
+- **RABS sidecar:** installed-output memo identities are bound to verified bytes, compiler
+  captures stay pinned through acknowledgment and publication ([`2d68f7b2`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/2d68f7b2347969f3e151ed374a62e3d3ad667c2c), [`14897b83`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/14897b83ca6e5b6c818a77d011faca1f840ce0c0)),
+  and a self-starting cargo subcommand serves the live dependency cache, waiting for cold live
+  facts before bypassing a first build ([`83639d5b`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/83639d5bc4a4a4e43f0f6585b8816cdc6eacb594), [`0b1d206b`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/0b1d206b452acaad584379071a5ef04d27229e5e), [`a16a9039`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/a16a9039515d21133cdc175257ebe4d11f39c3bb)).
+- **Tests.** The Python harnesses tolerate ananicy (process aliases, default scheduling under
+  cargo) (`bd-gjcnk`, [`5cc7085c`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/5cc7085cd6c5167a016c3a28d3a83c542c19a06c), [`e21703cf`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/e21703cf54cb7a25292c3da3b5a3ffe23ff46944)), and `cargo test -p rch --bin rch` passes
+  on macOS (`bd-ql5bu`, [`0afc8cd3`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/0afc8cd3b2a48678029bac83505d57aaee73f9e6)). Fixtures that predated the boot check follow it
+  ([`025ef543`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/025ef543dd919782402f3e02a4b8903bcd021b56), [`9c54d025`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/9c54d025a303ef6fa0bfebf718f7852a45570cf2)).
 
 ## 2.1.22 — 2026-10-13
 
