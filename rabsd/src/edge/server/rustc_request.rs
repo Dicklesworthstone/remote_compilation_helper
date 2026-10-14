@@ -43,7 +43,6 @@ use rabs_cas::metadata_store::digest_key;
 use rabs_key::build_script_directives::bind_rustc_environment;
 use rabs_key::live_dependency::{
     ExternFact, LiveRustcRequest, PlannedExtern, constructed_environment, live_dependency_key,
-    plan_dependency_action,
 };
 use rabs_protocol::input_evidence::{
     ActionInputManifest, INPUT_EVIDENCE_SCHEMA_VERSION, InputFileType, PositiveInput,
@@ -53,6 +52,9 @@ use rabs_protocol::result_identity::ObjectId;
 use serde_json::{Value, json};
 use std::path::Path;
 use std::sync::Arc;
+
+#[path = "directory_source.rs"]
+mod directory_source;
 
 /// Largest completion frame: a bounded transcript in hex plus envelope.
 pub(super) const MAX_COMPLETION_FRAME_BYTES: usize = 2 * MAX_TRANSCRIPT_BYTES + 64 * 1024;
@@ -281,7 +283,7 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
         );
         return Decided::Shadow(observation(&parsed));
     };
-    let mut plan = match plan_dependency_action(
+    let mut plan = match directory_source::plan_dependency_action(
         LiveRustcRequest {
             argv: &parsed.argv,
             cwd: &parsed.cwd,
