@@ -460,11 +460,17 @@ if [ "$operation" = topology ]; then
     # its absence test: no link may be created in a newly appeared directory or
     # through a newly appeared symlink. GNU coreutils are already required by
     # this protocol; Darwin workers use the g-prefixed tool when present.
+    # uutils coreutils (Ubuntu 25.10+) refuses a repeated -T, so add it only
+    # when the call does not already carry it (the namespace script's -sT).
     topology_create='ln() {
+        case "${1-}" in
+            -T|-sT|-Ts|--no-target-directory) ;;
+            *) set -- -T "$@" ;;
+        esac
         if command -v gln >/dev/null 2>&1; then
-            command gln -T "$@"
+            command gln "$@"
         else
-            command ln -T "$@"
+            command ln "$@"
         fi
     }
 '
