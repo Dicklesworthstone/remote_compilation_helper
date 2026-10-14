@@ -1,4 +1,4 @@
-//! Live registry and Git dependency action keys (bd-14t4j / bd-k52xe): the first
+//! Live registry, Git and directory-source dependency keys (bd-14t4j / bd-k52xe): the first
 //! production path from a real `RUSTC_WRAPPER` request to a real
 //! [`ActionDescriptor`].
 //!
@@ -20,6 +20,8 @@
 //! - rustc invoked by Cargo for a registry package at
 //!   `<cargo-home>/registry/src/<index>/<package>` or a Git dependency at
 //!   `<cargo-home>/git/checkouts/<repository>/<revision>[/<member>]`;
+//!   a Cargo directory source outside those caches is admitted separately
+//!   through a captured `.cargo-checksum.json` witness, not by a `vendor` name;
 //!   rustc's working directory is `CARGO_MANIFEST_DIR`, `--cap-lints allow`
 //!   is present and `CARGO_PRIMARY_PACKAGE` is absent;
 //! - build scripts themselves still run normally; a compiler may consume
@@ -41,7 +43,7 @@
 //!
 //! ## Exactness rules
 //!
-//! - **Source:** the COMPLETE registry package or Git checkout tree is the
+//! - **Source:** the COMPLETE registry/directory package or Git checkout tree is the
 //!   positive input set. Git workspace members can read sibling files in
 //!   that checkout. Git metadata is excluded, and reading it prevents
 //!   publication. Captured bytes, including dirty and untracked files,
@@ -149,6 +151,21 @@ pub const GIT_ISOLATION_PROFILE: &str = "live-git-dependency-v4: unsandboxed loc
      build-script execution is not cached; exact crate-locator candidates of every \
      dependency directory (lib-prefixed rlib/rmeta, metadata-shadowed rlibs excluded, \
      other lib-prefixed kinds refused) revalidated before serving and after execution";
+
+/// Directory sources retain their real paths and complete package contents.
+/// The checksum document identifies the source class, never the file closure:
+/// even files absent from its `files` map are captured, hashed and revalidated.
+pub const DIRECTORY_ISOLATION_PROFILE: &str = "live-directory-dependency-v1: unsandboxed local edge process; \
+     environment constructed by dependency-env-v1 (allowlisted names keyed, jobserver \
+     passthrough unkeyed, all other names absent); source = complete Cargo directory-source \
+     package tree including Cargo.toml and the exact observed .cargo-checksum.json witness; \
+     checksum declarations never substitute for captured bytes or exclude unlisted files; \
+     real directory root and complete tree revalidated before serving and after execution; \
+     symlinks and source-policy exclusions refuse capture; dep-info reads bounded to the \
+     source and generated trees; proc-macro consumption and native link inputs refused; \
+     generated inputs captured as a complete disjoint regular-file OUT_DIR tree with exact \
+     OUT_DIR spelling keyed and generation revalidated; build-script execution is not cached; \
+     exact dependency-directory crate candidates revalidated before serving and after execution";
 
 /// What the executed compiler must produce for a publishable result.
 pub const EXECUTION_SEMANTICS: &str = "live-dependency-v1: rustc exit status 0 by normal \
@@ -314,6 +331,8 @@ pub enum DependencySourceKind {
     RegistryPackage,
     /// One complete Git checkout, possibly containing workspace members.
     GitCheckout,
+    /// One Cargo directory-source package, witnessed before source capture.
+    DirectoryPackage,
 }
 
 impl DependencySourceKind {
@@ -323,6 +342,7 @@ impl DependencySourceKind {
         match self {
             Self::RegistryPackage => "registry-package",
             Self::GitCheckout => "git-checkout",
+            Self::DirectoryPackage => "directory-package",
         }
     }
 }
@@ -343,7 +363,11 @@ pub struct DependencyActionPlan {
     pub package_root: String,
     /// Capture policy for the Cargo-managed source tree.
     pub source_kind: DependencySourceKind,
-    /// Complete source closure: registry package or whole Git checkout.
+    /// Exact object identity of the observed Cargo directory-source checksum
+    /// document. It must also occur in the sealed input manifest. `None` for
+    /// the existing registry and Git source classes.
+    pub directory_source_manifest: Option<TypedDigest>,
+    /// Complete source closure: registry/directory package or whole Git checkout.
     pub source_root: String,
     /// Single safe component identifying the source's virtual root.
     pub source_dir_name: String,
@@ -578,6 +602,33 @@ fn dependency_source(
     Err(LiveRefusal::NotDependencySource(package_root.to_owned()))
 }
 
+fn directory_source(
+    cargo_home: &str,
+    package_root: &str,
+) -> Result<(DependencySourceKind, String, String), LiveRefusal> {
+    // A witness must not reinterpret an invalid/incomplete Cargo cache path
+    // as a standalone package and silently shrink a Git checkout's closure.
+    if !plain_path(cargo_home)
+        || !plain_path(package_root)
+        || git_metadata(package_root)
+        || package_root == cargo_home
+        || within(package_root, cargo_home)
+        || within(cargo_home, package_root)
+    {
+        return Err(LiveRefusal::NotDependencySource(package_root.to_owned()));
+    }
+    let name = package_root
+        .rsplit_once('/')
+        .map(|(_, name)| name)
+        .filter(|name| safe_component(name))
+        .ok_or_else(|| LiveRefusal::NotDependencySource(package_root.to_owned()))?;
+    Ok((
+        DependencySourceKind::DirectoryPackage,
+        package_root.to_owned(),
+        format!("directory-{name}"),
+    ))
+}
+
 /// Classify one environment variable under `dependency-env-v1`.
 enum EnvRole {
     Keyed,
@@ -626,10 +677,34 @@ fn env_value<'a>(env: &'a [(String, String)], name: &str) -> Option<&'a str> {
 ///
 /// # Errors
 /// A typed [`LiveRefusal`]: the request compiles normally, unkeyed.
-#[allow(clippy::too_many_lines)]
 pub fn plan_dependency_action(
     request: LiveRustcRequest<'_>,
     host_triple: &str,
+) -> Result<DependencyActionPlan, LiveRefusal> {
+    plan_with_directory_manifest(request, host_triple, None)
+}
+
+/// Plan a Cargo directory-source dependency after the edge observed a valid
+/// `.cargo-checksum.json` document at `CARGO_MANIFEST_DIR`. This is not an
+/// arbitrary path/workspace-crate admission switch. The key builder requires
+/// the same document identity in the complete captured package manifest.
+/// No source path or executed environment is rewritten.
+///
+/// # Errors
+/// The existing dependency-class refusals, or an unsupported directory root.
+pub fn plan_directory_dependency_action(
+    request: LiveRustcRequest<'_>,
+    host_triple: &str,
+    checksum_document: TypedDigest,
+) -> Result<DependencyActionPlan, LiveRefusal> {
+    plan_with_directory_manifest(request, host_triple, Some(checksum_document))
+}
+
+#[allow(clippy::too_many_lines)]
+fn plan_with_directory_manifest(
+    request: LiveRustcRequest<'_>,
+    host_triple: &str,
+    directory_source_manifest: Option<TypedDigest>,
 ) -> Result<DependencyActionPlan, LiveRefusal> {
     // Environment first: it is the cheapest way out of the class.
     let mut names: Vec<&str> = request.env.iter().map(|(name, _)| name.as_str()).collect();
@@ -656,8 +731,11 @@ pub fn plan_dependency_action(
     if !plain_path(&package_root) {
         return Err(LiveRefusal::UnrepresentablePath(package_root));
     }
-    let (source_kind, source_root, source_dir_name) =
-        dependency_source(&cargo_home, &package_root)?;
+    let (source_kind, source_root, source_dir_name) = if directory_source_manifest.is_some() {
+        directory_source(&cargo_home, &package_root)?
+    } else {
+        dependency_source(&cargo_home, &package_root)?
+    };
 
     if request.cwd != package_root {
         return Err(LiveRefusal::WorkingDirectory(request.cwd.to_owned()));
@@ -807,6 +885,7 @@ pub fn plan_dependency_action(
         out_dir,
         package_root,
         source_kind,
+        directory_source_manifest,
         source_root,
         source_dir_name,
         generated_root,
@@ -1054,6 +1133,7 @@ pub fn live_dependency_key(
         ));
     }
     validate_build_script_output(plan, build_script_output)?;
+    validate_directory_source_manifest(plan, inputs)?;
     let root = format!("{}/", plan.source_virtual_root());
     let generated = format!("{}/", plan.generated_virtual_root());
     if inputs.inputs.is_empty()
@@ -1069,7 +1149,10 @@ pub fn live_dependency_key(
                             .as_bytes()
                             .starts_with(generated.as_bytes())))
                 || (input.virtual_path.as_bytes().starts_with(root.as_bytes())
-                    && plan.source_kind == DependencySourceKind::GitCheckout
+                    && matches!(
+                        plan.source_kind,
+                        DependencySourceKind::GitCheckout | DependencySourceKind::DirectoryPackage
+                    )
                     && input.virtual_path.as_bytes()[root.len()..]
                         .split(|byte| *byte == b'/')
                         .any(|component| component == b".git"))
@@ -1111,6 +1194,12 @@ pub fn live_dependency_key(
             }
             DependencySourceKind::GitCheckout => {
                 enc.str("complete-git-checkout-tree-enumeration-v1")
+                    .str(plan.source_kind.as_str())
+                    .str(&plan.source_root)
+                    .str(&plan.source_virtual_root());
+            }
+            DependencySourceKind::DirectoryPackage => {
+                enc.str("complete-directory-package-tree-enumeration-v1")
                     .str(plan.source_kind.as_str())
                     .str(&plan.source_root)
                     .str(&plan.source_virtual_root());
@@ -1177,6 +1266,7 @@ pub fn live_dependency_key(
             match plan.source_kind {
                 DependencySourceKind::RegistryPackage => ISOLATION_PROFILE,
                 DependencySourceKind::GitCheckout => GIT_ISOLATION_PROFILE,
+                DependencySourceKind::DirectoryPackage => DIRECTORY_ISOLATION_PROFILE,
             }
             .as_bytes(),
         ),
@@ -1193,6 +1283,46 @@ pub fn live_dependency_key(
         action_key,
         descriptor_digest,
     })
+}
+
+fn validate_directory_source_manifest(
+    plan: &DependencyActionPlan,
+    inputs: &ActionInputManifest,
+) -> Result<(), LiveRefusal> {
+    if plan.source_kind != DependencySourceKind::DirectoryPackage {
+        return if plan.directory_source_manifest.is_none() {
+            Ok(())
+        } else {
+            Err(LiveRefusal::Facts(
+                "unexpected directory-source witness".into(),
+            ))
+        };
+    }
+    let witness = plan
+        .directory_source_manifest
+        .as_ref()
+        .ok_or_else(|| LiveRefusal::Facts("missing directory-source checksum witness".into()))?;
+    if plan.source_root != plan.package_root || git_metadata(&plan.source_root) {
+        return Err(LiveRefusal::Facts("invalid directory-source scope".into()));
+    }
+    for name in ["Cargo.toml", ".cargo-checksum.json"] {
+        let path = plan.input_virtual_path(name);
+        let mut matching = inputs
+            .inputs
+            .iter()
+            .filter(|input| input.virtual_path.as_bytes() == path.as_bytes());
+        let valid = matching.next().is_some_and(|input| {
+            input.file_type == InputFileType::Regular
+                && input.symlink_resolution.is_empty()
+                && (name != ".cargo-checksum.json" || &input.object.0 == witness)
+        }) && matching.next().is_none();
+        if !valid {
+            return Err(LiveRefusal::Facts(format!(
+                "directory-source capture does not bind the observed {name}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Cargo's persisted build-script stdout is a required eligibility witness
@@ -2424,5 +2554,267 @@ mod tests {
                 descriptor_digest(&descriptor_canonical_bytes(&previous))
             );
         }
+    }
+
+    const DIRECTORY_PACKAGE: &str = "/sources/vendor/itoa-1.0.15";
+
+    fn directory_plan(
+        package: &str,
+        out_dir: &str,
+        extra_args: &[&str],
+        extra_env: &[(&str, &str)],
+    ) -> Result<DependencyActionPlan, LiveRefusal> {
+        let argv = argv(out_dir, extra_args)
+            .into_iter()
+            .map(|arg| arg.replace(PACKAGE, package))
+            .collect::<Vec<_>>();
+        let mut env = env(extra_env);
+        env.iter_mut()
+            .find(|(name, _)| name == "CARGO_MANIFEST_DIR")
+            .unwrap()
+            .1 = package.to_owned();
+        plan_directory_dependency_action(
+            LiveRustcRequest {
+                argv: &argv,
+                cwd: package,
+                env: &env,
+            },
+            "x86_64-unknown-linux-gnu",
+            digest(40),
+        )
+    }
+
+    fn directory_inputs(plan: &DependencyActionPlan) -> ActionInputManifest {
+        let mut manifest = inputs(plan, 11);
+        manifest.inputs.push(PositiveInput {
+            virtual_path: RawBytes::new(
+                plan.input_virtual_path(".cargo-checksum.json").into_bytes(),
+            ),
+            object: ObjectId(digest(40)),
+            file_type: InputFileType::Regular,
+            executable: false,
+            symlink_resolution: Vec::new(),
+        });
+        manifest
+    }
+
+    fn directory_key(
+        plan: &DependencyActionPlan,
+        inputs: &ActionInputManifest,
+    ) -> Result<LiveDependencyKey, LiveRefusal> {
+        live_dependency_key(plan, &toolchain(), &externs(plan, 20), inputs)
+    }
+
+    #[test]
+    fn directory_sources_require_explicit_witnessed_planning_and_keep_real_paths() {
+        assert!(matches!(
+            plan_in_package(DIRECTORY_PACKAGE, OUT_A, &[]),
+            Err(LiveRefusal::NotDependencySource(_))
+        ));
+        let plan = directory_plan(DIRECTORY_PACKAGE, OUT_A, &[], &[]).unwrap();
+        assert_eq!(plan.source_kind, DependencySourceKind::DirectoryPackage);
+        assert_eq!(plan.source_kind.as_str(), "directory-package");
+        assert_eq!(plan.source_root, DIRECTORY_PACKAGE);
+        assert_eq!(plan.cwd, DIRECTORY_PACKAGE);
+        assert_eq!(plan.package_root, DIRECTORY_PACKAGE);
+        assert_eq!(plan.directory_source_manifest, Some(digest(40)));
+        assert!(
+            plan.execution_env
+                .contains(&("CARGO_MANIFEST_DIR".into(), DIRECTORY_PACKAGE.into()))
+        );
+        let key = directory_key(&plan, &directory_inputs(&plan)).unwrap();
+        assert_eq!(
+            key.descriptor.sandbox_semantic_policy,
+            compute(DOMAIN_LIVE_ISOLATION, DIRECTORY_ISOLATION_PROFILE.as_bytes())
+        );
+        let mut negative = CanonicalEncoder::new();
+        negative
+            .str("complete-directory-package-tree-enumeration-v1")
+            .str("directory-package")
+            .str(DIRECTORY_PACKAGE)
+            .str(&plan.source_virtual_root());
+        assert_eq!(
+            key.descriptor.negative_dependencies,
+            compute(DOMAIN_LIVE_NEGATIVE, &negative.finish())
+        );
+    }
+
+    #[test]
+    fn directory_source_key_binds_the_exact_captured_checksum_and_package_manifest() {
+        let plan = directory_plan(DIRECTORY_PACKAGE, OUT_A, &[], &[]).unwrap();
+        let original = directory_inputs(&plan);
+        directory_key(&plan, &original).unwrap();
+        for missing in ["Cargo.toml", ".cargo-checksum.json"] {
+            let mut incomplete = original.clone();
+            incomplete.inputs.retain(|input| {
+                input.virtual_path.as_bytes() != plan.input_virtual_path(missing).as_bytes()
+            });
+            assert!(directory_key(&plan, &incomplete).is_err(), "{missing}");
+        }
+        let mut changed = original.clone();
+        changed.inputs[2].object = ObjectId(digest(41));
+        assert!(
+            directory_key(&plan, &changed).is_err(),
+            "the pre-capture witness changed"
+        );
+        let mut duplicated = original.clone();
+        duplicated.inputs.push(original.inputs[2].clone());
+        assert!(directory_key(&plan, &duplicated).is_err());
+        let mut moved = original.clone();
+        moved.inputs[2].virtual_path = RawBytes::new(
+            plan.input_virtual_path("nested/.cargo-checksum.json")
+                .into_bytes(),
+        );
+        assert!(directory_key(&plan, &moved).is_err());
+        let mut without_witness = plan.clone();
+        without_witness.directory_source_manifest = None;
+        assert!(directory_key(&without_witness, &original).is_err());
+    }
+
+    #[test]
+    fn directory_checksum_declarations_never_replace_real_source_identity() {
+        let plan = directory_plan(DIRECTORY_PACKAGE, OUT_A, &[], &[]).unwrap();
+        let original = directory_inputs(&plan);
+        let base = directory_key(&plan, &original).unwrap().action_key;
+        let mut changed = original.clone();
+        changed.inputs[1].object = ObjectId(digest(42));
+        assert_ne!(base, directory_key(&plan, &changed).unwrap().action_key);
+        let mut added = original.clone();
+        let mut extra = original.inputs[1].clone();
+        extra.virtual_path = RawBytes::new(plan.input_virtual_path("unlisted.txt").into_bytes());
+        added.inputs.push(extra);
+        assert_ne!(base, directory_key(&plan, &added).unwrap().action_key);
+        // Source edits/additions above retained precisely the same witness.
+        assert_eq!(added.inputs[2], original.inputs[2]);
+        let mut new_witness = plan.clone();
+        new_witness.directory_source_manifest = Some(digest(43));
+        let mut new_manifest = original.clone();
+        new_manifest.inputs[2].object = ObjectId(digest(43));
+        assert_ne!(
+            base,
+            directory_key(&new_witness, &new_manifest).unwrap().action_key
+        );
+    }
+
+    #[test]
+    fn directory_sources_share_target_placements_but_not_source_locations() {
+        let a = directory_plan(DIRECTORY_PACKAGE, OUT_A, &[], &[]).unwrap();
+        let b = directory_plan(DIRECTORY_PACKAGE, OUT_B, &[], &[]).unwrap();
+        let other = directory_plan("/other/vendor/itoa-1.0.15", OUT_A, &[], &[]).unwrap();
+        let base = directory_key(&a, &directory_inputs(&a)).unwrap().action_key;
+        assert_eq!(
+            base,
+            directory_key(&b, &directory_inputs(&b)).unwrap().action_key
+        );
+        assert_ne!(
+            base,
+            directory_key(&other, &directory_inputs(&other))
+                .unwrap()
+                .action_key
+        );
+    }
+
+    #[test]
+    fn directory_witness_does_not_reinterpret_cargo_cache_or_git_metadata_paths() {
+        for path in [
+            PACKAGE,
+            GIT_PACKAGE,
+            "/home/agent/.cargo",
+            "/home/agent",
+            "/home/agent/.cargo/git/db/malformed",
+            "/sources/.git/vendor/pkg",
+            "/sources/vendor/../pkg",
+            "/sources/vendor/pkg/",
+            "relative/pkg",
+        ] {
+            assert!(directory_plan(path, OUT_A, &[], &[]).is_err(), "{path}");
+        }
+        // Neither the directory name `vendor` nor a claimed witness admits
+        // outputs inside the captured source closure.
+        assert!(
+            directory_plan(
+                DIRECTORY_PACKAGE,
+                &format!("{DIRECTORY_PACKAGE}/target/deps"),
+                &[],
+                &[],
+            )
+            .is_err()
+        );
+        let mut registry = plan_for(OUT_A, &[], &[]).unwrap();
+        registry.directory_source_manifest = Some(digest(40));
+        assert!(directory_key(&registry, &inputs(&registry, 11)).is_err());
+    }
+
+    #[test]
+    fn directory_sources_preserve_execution_class_and_environment_refusals() {
+        for extra in [
+            vec!["--extern=macro=/deps/libmacro.so"],
+            vec!["-Lnative=/native"],
+            vec!["-lssl"],
+            vec!["-Cincremental=/incremental"],
+        ] {
+            assert!(directory_plan(DIRECTORY_PACKAGE, OUT_A, &extra, &[]).is_err());
+        }
+        for env in [
+            vec![("CARGO_PRIMARY_PACKAGE", "1")],
+            vec![("LD_PRELOAD", "/inject.so")],
+        ] {
+            assert!(directory_plan(DIRECTORY_PACKAGE, OUT_A, &[], &env).is_err());
+        }
+        let mut argv = argv(OUT_A, &[])
+            .into_iter()
+            .map(|arg| arg.replace(PACKAGE, DIRECTORY_PACKAGE))
+            .collect::<Vec<_>>();
+        argv.truncate(argv.len() - 2);
+        let env = env(&[("CARGO_MANIFEST_DIR", DIRECTORY_PACKAGE)]);
+        assert!(matches!(
+            plan_directory_dependency_action(
+                LiveRustcRequest {
+                    argv: &argv,
+                    cwd: DIRECTORY_PACKAGE,
+                    env: &env,
+                },
+                "x86_64-unknown-linux-gnu",
+                digest(40),
+            ),
+            Err(LiveRefusal::NotDependencyCompile(_))
+        ));
+    }
+
+    #[test]
+    fn directory_source_dep_info_cannot_read_siblings_or_unlisted_uncaptured_inputs() {
+        let plan = directory_plan(DIRECTORY_PACKAGE, OUT_A, &[], &[]).unwrap();
+        let manifest = directory_inputs(&plan);
+        let covered = |path: &str| {
+            manifest
+                .inputs
+                .iter()
+                .any(|input| input.virtual_path.as_bytes() == path.as_bytes())
+        };
+        let good = format!("{OUT_A}/itoa.d: {DIRECTORY_PACKAGE}/src/lib.rs\n");
+        assert_eq!(
+            dep_info_closure_violation(&plan, good.as_bytes(), covered),
+            None
+        );
+        for read in [
+            format!("{DIRECTORY_PACKAGE}/../sibling/src/lib.rs"),
+            format!("{DIRECTORY_PACKAGE}/../itoa-1.0.15/src/lib.rs"),
+            format!("{DIRECTORY_PACKAGE}/uncaptured.txt"),
+            "/etc/hostname".into(),
+        ] {
+            assert!(
+                dep_info_closure_violation(
+                    &plan,
+                    format!("{OUT_A}/itoa.d: {read}\n").as_bytes(),
+                    covered,
+                )
+                .is_some(),
+                "{read}"
+            );
+        }
+        let mut git_metadata = manifest.clone();
+        git_metadata.inputs[1].virtual_path =
+            RawBytes::new(plan.input_virtual_path(".git/HEAD").into_bytes());
+        assert!(directory_key(&plan, &git_metadata).is_err());
     }
 }

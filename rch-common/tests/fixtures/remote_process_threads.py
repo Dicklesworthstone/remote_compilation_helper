@@ -79,17 +79,25 @@ code=$?
 printf '%s\n' "$code"
 """
 
+# The census runs `ps` in a separate bounded shell (14aea498), so a shell
+# function cannot stand in for it: SNAPSHOT_PS is a real executable on PATH.
 SNAPSHOT = r"""
 . "$1"
 rch_pgid=6000000
-test_snapshot=$2
-test_observer=$3
-ps() {
-    [ "$*" = '-e -L -o pid= -o lwp= -o pgid= -o stat= -o nlwp=' ] || return 99
-    if [ "$test_observer" = yes ]; then printf '%s %s %s S 1\n' "$$" "$$" "$$"; fi
-    if [ -n "$test_snapshot" ]; then printf '%s\n' "$test_snapshot"; fi
-}
+RCH_TEST_SNAPSHOT=$2
+RCH_TEST_OBSERVER_LINE=$3
+RCH_TEST_OBSERVER=$$
+PATH="$4:$PATH"
+export RCH_TEST_SNAPSHOT RCH_TEST_OBSERVER_LINE RCH_TEST_OBSERVER PATH
 rch_group_state
+"""
+
+SNAPSHOT_PS = r"""#!/bin/sh
+[ "$*" = '-e -L -o pid= -o lwp= -o pgid= -o stat= -o nlwp=' ] || exit 99
+if [ "$RCH_TEST_OBSERVER_LINE" = yes ]; then
+    printf '%s %s %s S 1\n' "$RCH_TEST_OBSERVER" "$RCH_TEST_OBSERVER" "$RCH_TEST_OBSERVER"
+fi
+if [ -n "$RCH_TEST_SNAPSHOT" ]; then printf '%s\n' "$RCH_TEST_SNAPSHOT"; fi
 """
 
 
@@ -210,6 +218,9 @@ def run(protocol):
             assert row["thread_alive"], row
             count += 1
 
+            fake_bin = Path(tempfile.mkdtemp(prefix="rch-snapshot-ps-"))
+            (fake_bin / "ps").write_text(SNAPSHOT_PS)
+            (fake_bin / "ps").chmod(0o700)
             samples = [
                 ("absent", "", "yes", 0),
                 ("one-zombie", "6000001 6000001 6000000 Z 1", "yes", 0),
@@ -226,7 +237,8 @@ def run(protocol):
             ]
             for name, snapshot, observer, expected in samples:
                 result = subprocess.run(
-                    [shell, "-c", SNAPSHOT, "rch-snapshot-test", str(protocol), snapshot, observer],
+                    [shell, "-c", SNAPSHOT, "rch-snapshot-test", str(protocol), snapshot, observer,
+                     str(fake_bin)],
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5,
                 )
                 assert result.returncode == expected, (shell, name, result.returncode, result.stderr)

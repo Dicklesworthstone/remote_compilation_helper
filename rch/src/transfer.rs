@@ -3245,7 +3245,13 @@ impl TransferPipeline {
                 "estimate_artifact_retrieval",
                 || {
                     let mut cmd = command();
-                    cmd.arg("--dry-run");
+                    // The builders leave stdio to each execution site. Unpiped,
+                    // the controlled path failed "retrieval stdout missing" and
+                    // the plain path printed the dry run into the hook's stdout,
+                    // so no estimate was ever parsed.
+                    cmd.arg("--dry-run")
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped());
                     cmd
                 },
                 |_| {},
@@ -5092,12 +5098,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
             }
             Ok::<(), anyhow::Error>(())
         };
-        let collect = async move {
-            child
-                .wait_with_output()
-                .await
-                .context("ssh sh -s wait")
-        };
+        let collect = async move { child.wait_with_output().await.context("ssh sh -s wait") };
         let (_, out) = tokio::try_join!(upload, collect)?;
         if !out.status.success() {
             return Err(anyhow::anyhow!(
@@ -15913,9 +15914,14 @@ fn main() {
             command.contains("wait \"$__c\""),
             "watchdog must wait on the job"
         );
-        // The build_id path must NOT shell out to `timeout --foreground` (the bug).
+        // The build_id path must NOT run the workload under `timeout
+        // --foreground` (the bug). 181b61ef bounds one literal printf message
+        // writer that way, and documents it; nothing else may.
+        let without_message_writer = command
+            .replace("timeout --foreground --signal=KILL 1s /bin/sh -c '", "")
+            .replace("--foreground targets that one", "");
         assert!(
-            !command.contains("--foreground"),
+            !without_message_writer.contains("--foreground"),
             "build_id path must not use timeout --foreground: {command}"
         );
         // The timer subshell must detach stdio: its orphaned `sleep` otherwise

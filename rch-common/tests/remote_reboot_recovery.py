@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import shutil
 from pathlib import Path
 import shlex
 import subprocess
@@ -53,8 +54,17 @@ class RebootRecovery(unittest.TestCase):
         # Trace, rather than replace, actual group inspection and signalling.
         # The V2 resource backend is deliberately unavailable; old-boot recovery
         # must not need a currently running manager or a previous cgroup inode.
+        # The census runs ps in a separate bounded shell (14aea498): trace it
+        # with a real wrapper on PATH, not a function that shell cannot see.
+        self.bin = self.root / "bin"
+        self.bin.mkdir()
+        real_ps = shutil.which("ps")
+        assert real_ps, "procps ps is required"
+        (self.bin / "ps").write_text(
+            "#!/bin/sh\nprintf 'census\\n' >> \"$RCH_REBOOT_TRACE\"\nexec "
+            + shlex.quote(real_ps) + ' "$@"\n')
+        (self.bin / "ps").chmod(0o700)
         self.observers = r'''
-ps() { printf 'census\n' >> "$RCH_REBOOT_TRACE"; command ps "$@"; }
 kill() { printf 'signal\n' >> "$RCH_REBOOT_TRACE"; command kill "$@"; }
 rch_scope_operation() { printf 'scope:%s\n' "$1" >> "$RCH_REBOOT_TRACE"; return 2; }
 '''
@@ -90,7 +100,8 @@ rch_scope_operation() { printf 'scope:%s\n' "$1" >> "$RCH_REBOOT_TRACE"; return 
         return subprocess.run([SHELL, "-c", self.script + "\n" + self.observers + extra + "\n" + body,
                                "rch-reboot-test", str(path), build, mode],
                               capture_output=True, timeout=10, check=False,
-                              env={**os.environ, "LC_ALL": "C", "RCH_REBOOT_TRACE": str(self.trace)})
+                              env={**os.environ, "LC_ALL": "C", "RCH_REBOOT_TRACE": str(self.trace),
+                                   "PATH": f"{self.bin}:{os.environ['PATH']}"})
 
     def operations(self):
         return self.trace.read_text().splitlines() if self.trace.exists() else []

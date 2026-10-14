@@ -325,7 +325,7 @@ wait
     def test_control_capture_rejects_binary_and_oversized_success(self) -> None:
         self.env["TMPDIR"] = str(self.root)
         for body in (
-            r"""printf 'active\\000junk\\n'""",
+            r"""printf 'active\000junk\n'""",
             r"""i=0; while [ "$i" -lt 7000 ]; do printf 0123456789; i=$((i + 1)); done""",
         ):
             with self.subTest(body=body):
@@ -341,7 +341,7 @@ wait
         failed = self.run_shell(r"""rch_control_capture 1s systemctl probe""")
         self.assertEqual(failed.returncode, 7)
         self.assertEqual(failed.stdout, "")
-        self.assertEqual(failed.stderr, "inactive\\n")
+        self.assertEqual(failed.stderr, "inactive\n")
         self.assertEqual(list(self.root.glob("rch-control-output.*")), [])
 
         self.fake("systemctl", "printf prefix; sleep 5")

@@ -25,9 +25,8 @@ const SOURCE_ADMISSION_WAIT: Duration = Duration::from_secs(60);
 fn retryable_source_admission_error(error: &anyhow::Error) -> bool {
     let detail = format!("{error:#}");
     detail.contains("RCH: durable source ownership: unfinished overlapping source owner")
-        || detail.contains(
-            "RCH: durable source ownership: unfinished overlapping physical source owner",
-        )
+        || detail
+            .contains("RCH: durable source ownership: unfinished overlapping physical source owner")
 }
 
 /// A single eligible worker should wait briefly for a completed predecessor
@@ -65,8 +64,7 @@ pub(super) async fn acquire_source_authority_with_retry(
                 if retryable_source_admission_error(&error)
                     && tokio::time::Instant::now() < deadline =>
             {
-                let remaining =
-                    deadline.saturating_duration_since(tokio::time::Instant::now());
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
                 if remaining.is_zero() {
                     return Err(error);
                 }
@@ -320,7 +318,9 @@ mod tests {
             "RCH: durable source ownership: source identity already claimed",
             "SSH command timed out",
         ] {
-            assert!(!retryable_source_admission_error(&anyhow::anyhow!("{terminal}")));
+            assert!(!retryable_source_admission_error(&anyhow::anyhow!(
+                "{terminal}"
+            )));
         }
     }
 

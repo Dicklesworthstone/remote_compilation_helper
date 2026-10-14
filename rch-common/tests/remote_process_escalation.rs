@@ -250,20 +250,32 @@ fn subshells_observe_their_own_procfs_namespace() {
 }
 
 const PROCESS_STATES: &str = r#"
+rch_test_dir=$1
 rch_pgid=300
 rch_check_procfs_namespace() { return 0; }
 cat() {
     case "$1" in
         /proc/sys/kernel/random/boot_id)
             printf '01234567-89ab-cdef-0123-456789abcdef\n';;
-        *)
+        /proc/*)
             printf '301 (worker (test)) %s 1 300' "$test_state"
             field=0
             while [ "$field" -lt 16 ]; do printf ' 0'; field=$((field + 1)); done
             printf ' 200\n';;
+        # The bounded census reads its captured output with cat.
+        *) command cat "$@";;
     esac
 }
-ps() { printf '%s %s %s S 1\n301 301 300 %s 1\n' "$$" "$$" "$$" "$test_state"; }
+# The census runs ps in a separate bounded shell (14aea498): a real fake ps on
+# PATH reports this shell as the observer and member 301 in test_state.
+mkdir -p "$rch_test_dir/bin"
+printf '%s\n' '#!/bin/sh' \
+    'printf "%s %s %s S 1\n301 301 300 %s 1\n" "$RCH_TEST_OBSERVER" "$RCH_TEST_OBSERVER" "$RCH_TEST_OBSERVER" "$test_state"' \
+    > "$rch_test_dir/bin/ps"
+chmod 700 "$rch_test_dir/bin/ps"
+RCH_TEST_OBSERVER=$$
+PATH="$rch_test_dir/bin:$PATH"
+export RCH_TEST_OBSERVER PATH test_state
 for test_state in R S D T t K W P I; do
     rch_read_process 301 || exit 1
     [ "$rch_observed_start" = 200 ] || exit 1
