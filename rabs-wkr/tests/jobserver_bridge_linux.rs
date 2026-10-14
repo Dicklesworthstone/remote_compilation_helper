@@ -19,14 +19,13 @@ fn worker_bin() -> &'static str {
     env!("CARGO_BIN_EXE_rabs-wkr")
 }
 
-fn toolchain_dir() -> String {
-    let cargo = std::env::var("CARGO").expect("CARGO set");
-    std::path::Path::new(&cargo)
-        .parent()
-        .and_then(std::path::Path::parent)
-        .expect("<root>/bin/cargo")
-        .display()
-        .to_string()
+fn toolchain_dir() -> tempfile::TempDir {
+    use std::os::unix::fs::PermissionsExt;
+    tempfile::Builder::new()
+        .prefix("rabs-i004-tc-")
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()
+        .expect("private toolchain dir")
 }
 
 fn canonical_supported() -> bool {
@@ -168,7 +167,7 @@ fn nested_make_tree_respects_the_worker_grant() {
          \"toolchain_backing\":\"{}\",\
          \"workspace_backing\":\"{}\",\
          \"jobserver_grant\":2}}",
-        toolchain,
+        toolchain.path().display(),
         workspace.path().display(),
     );
     writeln!(writer, "{request}").unwrap();

@@ -51,10 +51,38 @@ fn real_worker_delivers_complete_output_and_once_waits_for_ack() {
         return;
     }
     let cargo = std::env::var("CARGO").expect("Cargo test sets CARGO");
-    let toolchain = std::path::Path::new(&cargo)
+    let host_tc = std::path::Path::new(&cargo)
         .parent()
         .and_then(std::path::Path::parent)
         .expect("<toolchain>/bin/cargo");
+    let toolchain = {
+        use std::os::unix::fs::PermissionsExt;
+        let staged = tempfile::Builder::new()
+            .prefix("rabs-out-rustc-")
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap();
+        let root = staged.path();
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        std::fs::create_dir_all(root.join("lib")).unwrap();
+        let link_or_copy = |src: &std::path::Path, dst: &std::path::Path| {
+            if std::fs::hard_link(src, dst).is_err() {
+                std::fs::copy(src, dst).unwrap();
+            }
+        };
+        link_or_copy(&host_tc.join("bin/rustc"), &root.join("bin/rustc"));
+        for entry in std::fs::read_dir(host_tc.join("lib")).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if (name_str.starts_with("librustc_driver-") || name_str.starts_with("libLLVM"))
+                && entry.file_type().unwrap().is_file()
+            {
+                link_or_copy(&entry.path(), &root.join("lib").join(&name));
+            }
+        }
+        staged
+    };
     let workspace = tempfile::tempdir().unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
@@ -107,7 +135,7 @@ fn real_worker_delivers_complete_output_and_once_waits_for_ack() {
         json!({
             "kind": "canonical-exec", "request_id": 42,
             "program": "/__rabs/toolchain/bin/rustc", "args": ["--print", "sysroot"],
-            "toolchain_backing": toolchain, "workspace_backing": workspace.path(),
+            "toolchain_backing": toolchain.path(), "workspace_backing": workspace.path(),
         }),
     );
     let result = receive(&mut reader);
