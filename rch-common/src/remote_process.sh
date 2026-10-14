@@ -344,7 +344,13 @@ rch_remote_cancel_loaded() {
             *) return 44;;
         esac
     fi
-    rch_signal_group KILL || return $?
+    # 43: the recorded leader no longer authenticates the group, so nothing may
+    # be signalled. The group's own deadline watchdog may already have killed
+    # it (the leader dies first, members a moment later): keep the census
+    # running and confirm only if the group empties; otherwise still 43.
+    rch_kill_status=0
+    rch_signal_group KILL || rch_kill_status=$?
+    case "$rch_kill_status" in 0|43) ;; *) return "$rch_kill_status";; esac
     rch_attempt=0
     # Each scope observation uses two individually bounded manager reads.
     # Keep fresh-channel cleanup within the existing 45-second SSH budget.
@@ -352,10 +358,12 @@ rch_remote_cancel_loaded() {
     [ "${rch_scope_bound:-0}" != 1 ] || rch_attempt_limit=8
     while [ "$rch_attempt" -lt "$rch_attempt_limit" ]; do
         rch_group_state
-        case $? in 0) return 0;; 1) ;; *) return 44;; esac
+        # Without stop authority, an unavailable census keeps the refusal.
+        case $? in 0) return 0;; 1) ;; *) [ "$rch_kill_status" = 0 ] || return 43; return 44;; esac
         rch_attempt=$((rch_attempt + 1))
         sleep 0.1 || return 44
     done
+    [ "$rch_kill_status" = 0 ] || return "$rch_kill_status"
     return 45
 }
 
