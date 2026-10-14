@@ -5071,12 +5071,34 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let mut child = cmd.spawn().context("spawn ssh sh -s")?;
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(script.as_bytes()).await?;
-            stdin.write_all(b"\n").await?;
-            drop(stdin);
-        }
-        let out = child.wait_with_output().await.context("ssh sh -s wait")?;
+        let stdin = child.stdin.take();
+
+        // The remote shell may emit diagnostics before consuming the complete
+        // script. Poll upload and wait_with_output together so neither SSH
+        // direction can fill its pipe while the other side is not being
+        // serviced. worker_ssh_command sets kill_on_drop, so an upload failure
+        // cancels the collection future and closes the local channel.
+        let upload = async move {
+            if let Some(mut stdin) = stdin {
+                stdin
+                    .write_all(script.as_bytes())
+                    .await
+                    .context("write remote sh script")?;
+                stdin
+                    .write_all(b"\n")
+                    .await
+                    .context("finalize remote sh script")?;
+                drop(stdin);
+            }
+            Ok::<(), anyhow::Error>(())
+        };
+        let collect = async move {
+            child
+                .wait_with_output()
+                .await
+                .context("ssh sh -s wait")
+        };
+        let (_, out) = tokio::try_join!(upload, collect)?;
         if !out.status.success() {
             return Err(anyhow::anyhow!(
                 "remote sh script failed (exit {:?}): {}",
