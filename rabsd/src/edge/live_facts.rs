@@ -144,28 +144,41 @@ pub fn read_stable(path: &Path, max_bytes: u64) -> std::io::Result<(FileSig, Vec
 /// # Errors
 /// As [`read_stable`].
 pub fn digest_stable(path: &Path) -> std::io::Result<(FileSig, TypedDigest)> {
-    let before = lstat_regular(path)?;
+    digest_stable_at(path, lstat_regular(path)?)
+}
+
+fn digest_stable_at(path: &Path, before: FileSig) -> std::io::Result<(FileSig, TypedDigest)> {
     let mut file = std::fs::File::open(path)?;
-    let opened = FileSig::of(&file.metadata()?);
+    let opened = file.metadata()?;
+    if !opened.is_file() || FileSig::of(&opened) != before || lstat_regular(path)? != before {
+        return Err(std::io::Error::other("file changed before it was hashed"));
+    }
     let mut writer = StreamingObjectWriter::new(DigestRequest::default(), Some(before.size));
     let mut buffer = vec![0_u8; 256 * 1024];
-    loop {
-        let read = file.read(&mut buffer)?;
+    let mut remaining = before.size;
+    while remaining > 0 {
+        let limit = usize::try_from(remaining.min(buffer.len() as u64))
+            .map_err(std::io::Error::other)?;
+        let read = file.read(&mut buffer[..limit])?;
         if read == 0 {
-            break;
+            return Err(std::io::Error::other("file shrank while it was hashed"));
         }
         writer
             .write(&buffer[..read])
             .map_err(|error| std::io::Error::other(format!("{error:?}")))?;
+        remaining -= read as u64;
+    }
+    let mut extra = [0_u8; 1];
+    if file.read(&mut extra)? != 0 {
+        return Err(std::io::Error::other("file grew while it was hashed"));
+    }
+    if FileSig::of(&file.metadata()?) != before || lstat_regular(path)? != before {
+        return Err(std::io::Error::other("file changed while it was hashed"));
     }
     let digest = writer
         .finish()
         .map_err(|error| std::io::Error::other(format!("{error:?}")))?
         .atp_content_id;
-    let after = lstat_regular(path)?;
-    if opened != before || after != before {
-        return Err(std::io::Error::other("file changed while it was hashed"));
-    }
     Ok((before, digest))
 }
 
