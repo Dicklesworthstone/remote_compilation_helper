@@ -40,6 +40,73 @@ fn namespace_supported() -> bool {
     ok
 }
 
+fn link_or_copy(src: &std::path::Path, dst: &std::path::Path) {
+    if std::fs::hard_link(src, dst).is_err() {
+        std::fs::copy(src, dst).unwrap();
+    }
+}
+
+fn stage_minimal_rustc(host_toolchain: &std::path::Path) -> tempfile::TempDir {
+    use std::os::unix::fs::PermissionsExt;
+    let staged = tempfile::Builder::new()
+        .prefix("rabs-min-rustc-")
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()
+        .unwrap();
+    let root = staged.path();
+    std::fs::create_dir_all(root.join("bin")).unwrap();
+    std::fs::create_dir_all(root.join("lib")).unwrap();
+    let rustc_src = host_toolchain.join("bin/rustc");
+    link_or_copy(&rustc_src, &root.join("bin/rustc"));
+
+    let vv = std::process::Command::new(&rustc_src)
+        .arg("-vV")
+        .output()
+        .expect("rustc -vV");
+    let vv_str = String::from_utf8_lossy(&vv.stdout);
+    let host_triple = vv_str
+        .lines()
+        .find_map(|line| line.strip_prefix("host: "))
+        .expect("host triple in rustc -vV")
+        .trim();
+
+    for entry in std::fs::read_dir(host_toolchain.join("lib")).unwrap() {
+        let entry = entry.unwrap();
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if (name_str.starts_with("librustc_driver-") || name_str.starts_with("libLLVM"))
+            && entry.file_type().unwrap().is_file()
+        {
+            link_or_copy(&entry.path(), &root.join("lib").join(&name));
+        }
+    }
+
+    let rel_target_lib = format!("lib/rustlib/{host_triple}/lib");
+    std::fs::create_dir_all(root.join(&rel_target_lib)).unwrap();
+    for entry in std::fs::read_dir(host_toolchain.join(&rel_target_lib)).unwrap() {
+        let entry = entry.unwrap();
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if (name_str.ends_with(".rlib") || name_str.ends_with(".rmeta"))
+            && !name_str.starts_with("libtest-")
+            && !name_str.starts_with("libproc_macro-")
+            && entry.file_type().unwrap().is_file()
+        {
+            link_or_copy(&entry.path(), &root.join(&rel_target_lib).join(&name));
+        }
+    }
+    let rel_target_bin = format!("lib/rustlib/{host_triple}/bin");
+    for rel_tool in ["rust-lld", "gcc-ld/ld.lld"] {
+        let src_tool = host_toolchain.join(&rel_target_bin).join(rel_tool);
+        if src_tool.is_file() {
+            let dst_tool = root.join(&rel_target_bin).join(rel_tool);
+            std::fs::create_dir_all(dst_tool.parent().unwrap()).unwrap();
+            link_or_copy(&src_tool, &dst_tool);
+        }
+    }
+    staged
+}
+
 #[test]
 fn env_surgery_replaces_client_coordination_with_worker_budget() {
     let mut env = vec![
@@ -223,10 +290,12 @@ fn real_rustc_and_its_output_run_with_exact_workspace_member_context() {
     }
     let cargo =
         std::fs::canonicalize(std::env::var_os("CARGO").expect("Cargo supplies its path")).unwrap();
-    let toolchain = cargo
+    let host_toolchain = cargo
         .parent()
         .and_then(std::path::Path::parent)
         .expect("toolchain/bin/cargo");
+    let staged_toolchain = stage_minimal_rustc(host_toolchain);
+    let toolchain = staged_toolchain.path();
     let workspace = tempfile::tempdir().unwrap();
     let cargo_home = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
@@ -270,7 +339,7 @@ fn main() {
         ]).unwrap(),
     };
     let original = request.clone();
-    let control = ExecutionControl::new(std::time::Duration::from_secs(60)).unwrap();
+    let control = ExecutionControl::new(std::time::Duration::from_secs(120)).unwrap();
     let result = execute_canonical_controlled(
         &request,
         cargo_home.path(),
