@@ -1383,6 +1383,42 @@ impl LiveFacts {
 mod tests {
     use super::*;
 
+    fn dependency_observation(plan: &DependencyActionPlan) -> Arc<DependencyObservation> {
+        let roots: DependencyRoots = plan
+            .dependency_dirs
+            .iter()
+            .map(|root| {
+                (
+                    PathBuf::from(root),
+                    if root == &plan.out_dir {
+                        plan.output_names()
+                    } else {
+                        Vec::new()
+                    },
+                )
+            })
+            .collect();
+        let (members, _) = walk_dependencies(&roots).unwrap();
+        let output = (PathBuf::from(&plan.out_dir), plan.output_names());
+        reject_dependency_output_aliases(&roots, &members, &output).unwrap();
+        let root_identities = dependency_root_identities(&roots).unwrap();
+        Arc::new(DependencyObservation {
+            roots,
+            output,
+            members,
+            root_identities,
+        })
+    }
+
+    fn dependency_reservation(
+        facts: &Arc<LiveFacts>,
+        observation: &Arc<DependencyObservation>,
+    ) -> DependencyReservation {
+        let mut memos = facts.dependencies.lock().unwrap();
+        assert!(!memos.contains_key(observation));
+        DependencyReservation::insert(facts, &mut memos, Arc::clone(observation))
+    }
+
     // These exercise observation/admission, not rustc metadata validity or
     // serving qualification. The files are regular dependency candidates.
     fn dependency_budget_fixture(
@@ -1602,6 +1638,74 @@ mod tests {
         assert_eq!(facts.dependencies.lock().unwrap().len(), MAX_DEPENDENCY_MEMOS);
         assert!(facts.files.lock().unwrap().is_empty());
         assert_eq!(*facts.warming.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn newer_dependency_generation_is_not_blocked_by_older_reservation() {
+        let (_dir, plan, _paths) = dependency_budget_fixture(&[17]);
+        let facts = LiveFacts::new();
+        let original = dependency_observation(&plan);
+        let owner = dependency_reservation(&facts, &original);
+        std::fs::write(Path::new(&plan.out_dir).join("libnew.rmeta"), b"new").unwrap();
+
+        *facts.warming.lock().unwrap() = MAX_WARMING;
+        let newer = facts.dependencies(&plan).expect("new generation admitted");
+        assert_eq!(newer.directories[0].artifacts.len(), 2);
+        drop(owner);
+        assert!(Arc::ptr_eq(&newer, &facts.dependencies(&plan).unwrap()));
+        newer.verify_unchanged().unwrap();
+    }
+
+    #[test]
+    fn stale_reservation_token_cannot_replace_identical_successor() {
+        let (_dir, plan, _paths) = dependency_budget_fixture(&[17]);
+        let facts = LiveFacts::new();
+        let observation = dependency_observation(&plan);
+        let original = dependency_reservation(&facts, &observation);
+        facts.dependencies.lock().unwrap().remove(&observation);
+        let successor = dependency_reservation(&facts, &observation);
+        let successor_token = Arc::clone(&successor.token);
+
+        let captured = capture_dependencies(
+            &facts,
+            observation.roots.clone(),
+            observation.members.clone(),
+            observation.output.clone(),
+            None,
+        );
+        assert!(matches!(original.finish(captured, true), Err(FactsMiss::Pending)));
+        assert!(matches!(
+            facts.dependencies.lock().unwrap().get(&observation),
+            Some(DependencySlot::Warming(current)) if Arc::ptr_eq(current, &successor_token)
+        ));
+
+        let captured = capture_dependencies(
+            &facts,
+            observation.roots.clone(),
+            observation.members.clone(),
+            observation.output.clone(),
+            None,
+        );
+        successor.finish(captured, true).unwrap();
+        facts.dependencies(&plan).unwrap().verify_unchanged().unwrap();
+    }
+
+    #[test]
+    fn failed_observation_backoff_does_not_follow_changed_generation() {
+        let (_dir, plan, paths) = dependency_budget_fixture(&[17]);
+        let facts = LiveFacts::new();
+        let original = dependency_observation(&plan);
+        dependency_reservation(&facts, &original)
+            .finish(Err(FactsMiss::Refused("old generation failed".into())), true)
+            .unwrap_err();
+
+        assert!(matches!(
+            facts.dependencies(&plan),
+            Err(FactsMiss::Refused(reason)) if reason == "old generation failed"
+        ));
+
+        std::fs::write(&paths[0], b"changed generation").unwrap();
+        facts.dependencies(&plan).unwrap().verify_unchanged().unwrap();
     }
 
     #[test]
