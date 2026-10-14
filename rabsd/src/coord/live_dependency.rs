@@ -70,6 +70,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 mod capture_pins;
+mod output_capture;
 use capture_pins::CapturePins;
 
 /// Decision-receipt kind binding an action key to its canonical
@@ -856,13 +857,26 @@ impl LocalAttempt {
         self.request.package.verify_generated_disjoint(plan)?;
         self.request.dependencies.verify_unchanged()?;
         let input_roots = mappings_for_plan(plan);
-        // Harvest every declared output (and nothing else).
+        let transcript = canonicalize_placements(&report.stderr, plan)?;
+        let cas = self.coord.live_cas().ok_or("no CAS mounted")?;
+        let authority = self.authority.clone().ok_or("attempt not admitted")?;
+        let mut pins = CapturePins::new(Arc::clone(cas), &authority);
+        let mut logical_outputs = Vec::with_capacity(plan.outputs.declarations.len());
+        let mut known = Vec::new();
+        // Lock order is submissions -> store: never advance while holding
+        // the store. Each output is retained before the next one is read.
+        self.advance(AttemptState::HarvestingOutputs)?;
+        self.advance(AttemptState::UploadingOutputs)?;
+        // Keep only signatures and CAS identities, not a Vec containing every
+        // complete rlib/rmeta. Native outputs stream through private staging
+        // outside the metadata lock. Dep-info still needs the existing bounded
+        // parse/placement rewrite; its bytes are released after that one put.
         let mut harvested = Vec::new();
         for declaration in &plan.outputs.declarations {
             let path = Path::new(&plan.out_dir).join(&declaration.virtual_path);
-            let (sig, raw) = read_stable(&path, MAX_OUTPUT_BYTES)
-                .map_err(|error| format!("output {}: {error}", declaration.virtual_path))?;
-            let committed_bytes = if declaration.class == OutputClass::DepInfo {
+            let (sig, object) = if declaration.class == OutputClass::DepInfo {
+                let (sig, raw) = read_stable(&path, MAX_OUTPUT_BYTES)
+                    .map_err(|error| format!("output {}: {error}", declaration.virtual_path))?;
                 if let Some(violation) = dep_info_closure_violation(plan, &raw, |virtual_path| {
                     input_roots.iter().any(|(logical, visible)| {
                         virtual_path.strip_prefix(&format!("{visible}/")).is_some_and(|relative| {
@@ -874,13 +888,31 @@ impl LocalAttempt {
                 }) {
                     return Err(format!("closure: {violation}"));
                 }
-                canonicalize_placements(&raw, plan)?
+                let bytes = canonicalize_placements(&raw, plan)?;
+                (sig, put_bytes(cas, &bytes, &mut pins)?)
             } else {
-                raw
+                let captured = output_capture::put_output(cas, &path, MAX_OUTPUT_BYTES, &mut pins)?;
+                let object = ObjectId(captured.digest.clone());
+                let sig = captured.sig;
+                known.push(captured);
+                (sig, object)
             };
-            harvested.push((declaration, path, sig, committed_bytes));
+            harvested.push((path, sig));
+            logical_outputs.push(LogicalOutput {
+                role: output_role(declaration.class),
+                virtual_path: RawBytes::new(declaration.virtual_path.as_bytes().to_vec()),
+                object,
+            });
         }
-        let transcript = canonicalize_placements(&report.stderr, plan)?;
+        // Streaming a later artifact must not silently accept a replacement
+        // of an earlier output. This check retains the original identities,
+        // including dep-info, without rereading or retaining the artifact bytes.
+        for (path, sig) in &harvested {
+            let metadata = std::fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+            if !metadata.is_file() || FileSig::of(&metadata) != *sig {
+                return Err(format!("output {} changed during capture", path.display()));
+            }
+        }
         // The complete capture must be from one stable input generation, not
         // just start with one. After this barrier publication uses CAS only.
         self.request
@@ -889,37 +921,12 @@ impl LocalAttempt {
         self.request.package.verify_generated_disjoint(plan)?;
         self.request.dependencies.verify_unchanged()?;
         self.request.verify_toolchain()?;
-        self.advance(AttemptState::HarvestingOutputs)?;
-
-        let cas = self.coord.live_cas().ok_or("no CAS mounted")?;
-        let authority = self.authority.clone().ok_or("attempt not admitted")?;
-        let mut pins = CapturePins::new(Arc::clone(cas), &authority);
-        let mut logical_outputs = Vec::with_capacity(harvested.len());
-        let mut known = Vec::new();
-        // Lock order is submissions -> store everywhere in the coordinator:
-        // never advance the attempt while holding the store.
-        self.advance(AttemptState::UploadingOutputs)?;
         // Each put takes the store lock for itself only: decisions for other
         // compiles must not queue behind a whole completion's fsyncs. The
         // pin installed by each put protects the object between those locks
         // and across the asynchronous acknowledgment. The commit transaction
         // still re-verifies the complete durable closure.
         let (transcript_id, evidence_parts) = {
-            for (declaration, path, sig, bytes) in &harvested {
-                let object = put_bytes(cas, bytes, &mut pins)?;
-                if declaration.class != OutputClass::DepInfo {
-                    known.push(KnownOutput {
-                        path: path.clone(),
-                        sig: *sig,
-                        digest: object.0.clone(),
-                    });
-                }
-                logical_outputs.push(LogicalOutput {
-                    role: output_role(declaration.class),
-                    virtual_path: RawBytes::new(declaration.virtual_path.as_bytes().to_vec()),
-                    object,
-                });
-            }
             put_bundle_root(cas, &logical_outputs, &mut pins)?;
             let transcript_id = put_bytes(cas, &transcript, &mut pins)?;
             let hex =
