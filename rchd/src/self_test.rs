@@ -483,6 +483,8 @@ impl SelfTestService {
             // "All" means every worker that takes builds. One an operator
             // disabled or is draining is out of rotation on purpose; testing
             // it only reports a timeout. Name it explicitly to test it anyway.
+            // The canary cannot run on Windows (see `canary_unsupported`), so
+            // those workers are left out rather than counted as failures.
             for worker in workers {
                 if matches!(
                     worker.status().await,
@@ -493,6 +495,9 @@ impl SelfTestService {
                     continue;
                 }
                 let config = worker.config.read().await;
+                if canary_unsupported(&config).is_some() {
+                    continue;
+                }
                 result.push(config.clone());
             }
         }
@@ -594,6 +599,19 @@ async fn run_single_worker_test(
     let worker_id = worker.id.to_string();
     let timeout_total = options.timeout;
 
+    if let Some(reason) = canary_unsupported(worker) {
+        return SelfTestResultRecord {
+            run_id,
+            worker_id,
+            passed: false,
+            local_hash: None,
+            remote_hash: None,
+            local_time_ms: None,
+            remote_time_ms: None,
+            error: Some(reason),
+        };
+    }
+
     let retry_loop = async {
         let retry_delay =
             parse_duration(&config.retry_delay).unwrap_or_else(|| Duration::from_secs(300));
@@ -640,8 +658,12 @@ async fn run_single_worker_test(
             }
 
             warn!(
-                "Self-test failed for worker {} (attempt {}/{}), retrying in {:?}",
-                worker_id, attempt, retry_count, retry_delay
+                "Self-test failed for worker {} (attempt {}/{}), retrying in {:?}: {}",
+                worker_id,
+                attempt,
+                retry_count,
+                retry_delay,
+                record.error.as_deref().unwrap_or("no error recorded")
             );
             sleep(retry_delay).await;
         }
@@ -702,6 +724,25 @@ fn failed_worker_result(
         remote_time_ms: None,
         error: Some(format!("{error:#}")),
     }
+}
+
+/// Why the canary cannot run on `worker`, if it cannot.
+///
+/// `RemoteCompilationTest` syncs with rsync and builds through a POSIX shell,
+/// and it compares against a reference built on this host. A Windows worker
+/// has neither, so each attempt failed at the sync step and the run only
+/// ended at the per-worker deadline (600 s by default), reported as a
+/// timeout. Real builds reach Windows workers through the hook's
+/// Windows-aware transport; their health shows in probes and benchmarks.
+fn canary_unsupported(worker: &WorkerConfig) -> Option<String> {
+    let os = rch_common::declared_os(&worker.tags)?;
+    (os == "windows").then(|| {
+        format!(
+            "self-test canary is POSIX-only (rsync + sh) and cannot run on Windows worker {id}; \
+             check it with `rch workers probe {id}` and `rch workers benchmark {id}`",
+            id = worker.id
+        )
+    })
 }
 
 /// Canonical source of the self-test canary's `src/main.rs`. Kept as a constant
@@ -870,6 +911,75 @@ mod tests {
             ids(service.resolve_workers(named).await.unwrap()),
             ["disabled", "up"]
         );
+    }
+
+    #[tokio::test]
+    async fn windows_workers_are_left_out_of_all_and_refused_at_once_when_named() {
+        let pool = WorkerPool::new();
+        for (id, tags) in [
+            ("linux", vec![]),
+            (
+                "win",
+                vec!["rust".to_string(), rch_common::os_tag("Windows")],
+            ),
+        ] {
+            pool.add_worker(WorkerConfig {
+                id: WorkerId::new(id),
+                host: format!("{id}.invalid"),
+                user: "u".to_string(),
+                identity_file: "/dev/null".to_string(),
+                total_slots: 2,
+                priority: 100,
+                tags,
+                tools: Vec::new(),
+            })
+            .await;
+        }
+        let service = SelfTestService::new(
+            pool.clone(),
+            SelfTestConfig::default(),
+            Arc::new(SelfTestHistory::new(4, 4)),
+        );
+        let all = service.resolve_workers(None).await.unwrap();
+        assert_eq!(
+            all.iter().map(|w| w.id.to_string()).collect::<Vec<_>>(),
+            ["linux"]
+        );
+        assert!(canary_unsupported(&all[0]).is_none());
+
+        let named = service
+            .resolve_workers(Some(vec![WorkerId::new("win")]))
+            .await
+            .unwrap();
+        assert_eq!(named.len(), 1);
+        let options = SelfTestRunOptions {
+            run_type: SelfTestRunType::Manual,
+            worker_ids: None,
+            project_path: None,
+            timeout: Duration::from_secs(600),
+            release_mode: true,
+            retry_count_override: None,
+        };
+        // An unreachable host and a missing project: only the early refusal
+        // can answer before the 600 s deadline.
+        let record = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_single_worker_test(
+                9,
+                &named[0],
+                Path::new("/nonexistent/self-test-project"),
+                &options,
+                &SelfTestConfig::default(),
+                &pool,
+            ),
+        )
+        .await
+        .expect("a Windows worker is refused without attempting the canary");
+        assert!(!record.passed);
+        assert_eq!((record.run_id, record.worker_id.as_str()), (9, "win"));
+        let error = record.error.unwrap();
+        assert!(error.contains("POSIX-only"), "{error}");
+        assert!(error.contains("`rch workers probe win`"), "{error}");
     }
 
     #[test]
