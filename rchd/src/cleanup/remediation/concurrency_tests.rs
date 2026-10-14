@@ -113,6 +113,15 @@ async fn stopping_before_first_poll_cannot_admit_an_automatic_cancellation() {
 fn stale_builds(
     workers: &[&str],
 ) -> (tempfile::TempDir, ActiveBuildCleanup, Vec<ActiveBuildState>) {
+    stale_builds_with(workers, false)
+}
+
+/// `live_hook` binds each build to this test process and a wrapper id, as a
+/// reattached hook would be. A reloaded build accepts heartbeats only then.
+fn stale_builds_with(
+    workers: &[&str],
+    live_hook: bool,
+) -> (tempfile::TempDir, ActiveBuildCleanup, Vec<ActiveBuildState>) {
     use crate::history::BuildHistory;
 
     let root = tempfile::tempdir().unwrap();
@@ -135,11 +144,23 @@ fn stale_builds(
     // Below the 15-minute abandoned-before-remote threshold: a zero PID alone
     // cannot release these reservations, and cancellation remains unconfirmed.
     let old = (chrono::Utc::now() - chrono::Duration::seconds(600)).to_rfc3339();
-    for row in snapshot["active"].as_array_mut().unwrap() {
+    for (index, row) in snapshot["active"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .enumerate()
+    {
         for field in ["started_at", "last_heartbeat_at", "last_progress_at"] {
             row[field] = serde_json::json!(&old);
         }
         row["heartbeat_phase"] = serde_json::json!("sync_up");
+        if live_hook {
+            let pid = crate::history::observable_test_process_id();
+            row["hook_pid"] = serde_json::json!(pid);
+            row["hook_process_identity"] =
+                serde_json::json!(crate::history::process_identity(pid).unwrap());
+            row["local_wrapper_id"] = serde_json::json!(format!("live-hook-fixture-{index}"));
+        }
     }
     std::fs::write(&ownership, serde_json::to_vec(&snapshot).unwrap()).unwrap();
     context.history = Arc::new(BuildHistory::load_from_file(&path, 100).unwrap());
@@ -189,7 +210,7 @@ async fn production_admission_skips_busy_workers_and_advances_past_a_failed_pref
 
 #[tokio::test]
 async fn heartbeat_after_queuing_vetoes_cancellation_at_first_poll() {
-    let (_root, cleanup, candidates) = stale_builds(&["resumes-before-poll"]);
+    let (_root, cleanup, candidates) = stale_builds_with(&["resumes-before-poll"], true);
     let mut flights = Remediations::default();
     let mut observation = ObservationWindow::default();
     flights.start_observed(
