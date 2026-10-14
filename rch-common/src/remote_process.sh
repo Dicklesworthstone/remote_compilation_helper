@@ -213,6 +213,25 @@ rch_remote_witness_matches() {
     return 1
 }
 
+# Signal authority does not come from a system-wide census. Independently
+# prove that the observer is outside the target group in the same PID view,
+# then authenticate its live leader or THIS call's captured TERM witness.
+# Keep this guard at the signal boundary too: a failed census no longer supplies
+# its usual self-group check. A subshell must inspect its own PID, not just $$.
+rch_posix_signal_authorized() (
+    rch_requested_signal=$1
+    [ "${rch_identified:-0}" = 1 ] || exit 43
+    rch_check_procfs_namespace || exit 44
+    IFS= read -r rch_observer_stat < "/proc/$rch_self_pid/stat" 2>/dev/null || exit 44
+    case "$rch_observer_stat" in "$rch_self_pid ("*") "*) ;; *) exit 44;; esac
+    rch_observer_stat=${rch_observer_stat##*) }
+    set -- $rch_observer_stat
+    [ "$#" -ge 20 ] && rch_valid_pgid "$3" && [ "$3" != "$rch_pgid" ] || exit 44
+    rch_remote_leader_matches && exit 0
+    [ "$rch_requested_signal" = KILL ] && [ "${rch_term_sent:-0}" = 1 ] &&
+        rch_remote_witness_matches || exit 43
+)
+
 # Return 43 for unknown/reused identity. A pre-existing orphan is never adopted;
 # only an authenticated TERM in this call can authorize witnessed escalation.
 rch_signal_group() {
@@ -234,10 +253,7 @@ rch_signal_group() {
             *) return 43;;
         esac
     fi
-    if ! rch_remote_leader_matches; then
-        [ "$1" = KILL ] && [ "${rch_term_sent:-0}" -eq 1 ] &&
-            rch_remote_witness_matches || return 43
-    fi
+    rch_posix_signal_authorized "$1" || return $?
     # Revalidate immediately before EACH signal. dash requires no `--` here.
     kill -"$1" -"$rch_pgid" 2>/dev/null || :
 }
@@ -301,13 +317,12 @@ rch_remote_cancel_loaded() {
         0) return 0;;
         1) ;;
         2)
-            # A failed/incomplete process census cannot authorize POSIX
-            # signals, but must not strand a separately authenticated scope.
-            # Skip graceful group signalling and attempt only cgroup.kill:
-            # rch_signal_group revalidates the full V2 binding and pins its
-            # inode before writing. Unknown/reused scope authority still
-            # refuses, and the post-kill census below remains mandatory.
-            [ "${rch_scope_bound:-0}" = 1 ] || return 44
+            # A broken census is neither stop authority nor death proof.
+            # V2 has its separately bound cgroup. V1 may stop ONLY if the live
+            # leader independently authenticates a group outside our own; no
+            # witnesses from a prior call survive the reset above. Skip TERM
+            # because this census cannot safely establish escalation witnesses.
+            [ "${rch_scope_bound:-0}" = 1 ] || rch_posix_signal_authorized KILL || return 44
             rch_mode=kill;;
         *) return 44;;
     esac
@@ -322,9 +337,10 @@ rch_remote_cancel_loaded() {
         case $? in
             0) return 0;;
             1) ;;
-            # Losing the census after TERM must not suppress authenticated
-            # scoped escalation either. V1 still needs its live witnesses.
-            2) [ "${rch_scope_bound:-0}" = 1 ] || return 44;;
+            # After our TERM the leader may be gone. An already captured live
+            # witness can still authenticate escalation despite census loss.
+            # The signal boundary rechecks it; the post-kill census is mandatory.
+            2) [ "${rch_scope_bound:-0}" = 1 ] || rch_posix_signal_authorized KILL || return 44;;
             *) return 44;;
         esac
     fi

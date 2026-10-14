@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Real subprocess regressions for the production worker-control exchanges.
 
-Only systemctl/busctl are test executables. GNU timeout, pipe inheritance,
-process groups, signals, the policy gate and the snapshot parser are real.
+Manager clients and selected ps failures are test executables. GNU timeout,
+pipes, process groups, signals, the policy gate and snapshot parsers are real.
 This suite does not claim a live systemd, cgroup or SSH fleet qualification.
 The Rust integration target supplies the compiled protocol; direct Python
 runs use the checked-out production shell file. Test evidence is retained.
@@ -202,6 +202,245 @@ printf '%s\n' "$value"
                 self.assertEqual(self.run_shell(SNAPSHOT_CALL).returncode, 2)
         self.helper("systemctl", f'print({SNAPSHOT!r}, end=""); print("unverified warning", file=sys.stderr)\n')
         self.assertEqual(self.run_shell(SNAPSHOT_CALL).returncode, 2)
+
+
+@unittest.skipUnless(sys.platform == "linux" and hasattr(os, "pidfd_open"),
+                     "requires Linux process identities and pidfd test cleanup")
+class ProcessCensusRecovery(unittest.TestCase):
+    """The process census is faulted; record/identity/signal/lock code is real."""
+
+    def setUp(self) -> None:
+        self.root = Path(tempfile.mkdtemp(prefix="rch-census-recovery-"))
+        self.env = {**os.environ, "PATH": f"{self.root}:/usr/bin:/bin",
+                    "RCH_CENSUS_ROOT": str(self.root), "LC_ALL": "C"}
+        self.children = []
+        self.handles = []
+        self.addCleanup(self.stop_owned)
+        self.count = self.root / "count"
+        self.trace = self.root / "signals"
+        self.count.write_text("0")
+        ps = self.root / "ps"
+        ps.write_text(f"#!{sys.executable}\n" + '''
+import os, sys
+from pathlib import Path
+root = Path(os.environ["RCH_CENSUS_ROOT"])
+counter = root / "count"
+number = int(counter.read_text()) + 1
+counter.write_text(str(number))
+fault = os.environ.get("RCH_CENSUS_FAULT", "none")
+bad = (fault in ("failed", "malformed") and number == 1
+       or fault == "persistent"
+       or fault == "after-term" and number == 2
+       or fault == "persistent-after-term" and number >= 2)
+if bad:
+    if fault == "malformed":
+        print("not a process census")
+        sys.exit(0)
+    sys.exit(19)
+os.execv("/usr/bin/ps", ["ps", *sys.argv[1:]])
+''')
+        ps.chmod(0o700)
+        # The control channel records actual signals, never substitutes success.
+        self.observe = '''
+kill() { printf '%s\\n' "$*" >> "$RCH_CENSUS_ROOT/signals"; command kill "$@"; }
+'''
+        self.other = self.group()
+
+    def stop_owned(self) -> None:
+        for descriptor in self.handles:
+            try:
+                signal.pidfd_send_signal(descriptor, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        for child in self.children:
+            if child.poll() is None:
+                child.kill()
+            child.wait(timeout=5)
+        for descriptor in self.handles:
+            os.close(descriptor)
+
+    def group(self):
+        root = self.root / f"group-{len(self.children)}"
+        root.mkdir()
+        record = root / "record"
+        worker_code = '''
+import fcntl, os, signal, sys, time
+from pathlib import Path
+root = Path(sys.argv[1])
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+lock = (root / "held.lock").open("a")
+fcntl.flock(lock, fcntl.LOCK_EX)
+(root / "worker").write_text(str(os.getpid()))
+while True:
+    with (root / "beats").open("ab") as out: out.write(b"tick\\n")
+    time.sleep(.02)
+'''
+        leader_code = '''
+import os, subprocess, sys, time
+from pathlib import Path
+root = Path(sys.argv[1])
+worker = subprocess.Popen([sys.executable, "-I", "-S", "-c", sys.argv[2], str(root)])
+while not (root / "beats").exists(): time.sleep(.01)
+(root / "ready.tmp").write_text(str(worker.pid))
+(root / "ready.tmp").rename(root / "ready")
+time.sleep(60)
+'''
+        # No watchdog can mask a failed stop: this is exactly one recorded
+        # leader and one TERM-resistant child holding a real file lock.
+        body = PROTOCOL + '''
+rch_apply_configured_worker_policy() { return 0; }
+rch_remote_record "$1" 41 || exit 90
+shift
+exec "$@"
+'''
+        child = subprocess.Popen([SHELL, "-c", body, "rch-census-fixture", str(record),
+                                  sys.executable, "-I", "-S", "-c", leader_code,
+                                  str(root), worker_code], start_new_session=True,
+                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL)
+        self.children.append(child)
+        leader = os.pidfd_open(child.pid)
+        self.handles.append(leader)
+        deadline = time.monotonic() + 5
+        while not (root / "ready").exists() and time.monotonic() < deadline:
+            self.assertIsNone(child.poll(), "recorded fixture did not start")
+            time.sleep(.01)
+        self.assertTrue((root / "ready").exists(), "fixture did not acquire its lock")
+        worker = os.pidfd_open(int((root / "ready").read_text()))
+        self.handles.append(worker)
+        return child, record, leader, worker
+
+    def recover(self, group, fault="none", mode="kill", extra="", body=None):
+        _, record, _, _ = group
+        before = (record.lstat().st_ino, record.read_bytes())
+        command = body or 'rch_remote_cancel "$1" 41 "$2"'
+        result = subprocess.run([SHELL, "-c", PROTOCOL + "\n" + self.observe + extra
+                                 + "\n" + command, "rch-census-test", str(record), mode],
+                                capture_output=True, timeout=8, start_new_session=True,
+                                env={**self.env, "RCH_CENSUS_FAULT": fault})
+        self.assertEqual((record.lstat().st_ino, record.read_bytes()), before)
+        self.assert_alive(self.other)
+        return result
+
+    @staticmethod
+    def exited(descriptor, wait=0):
+        poll = select.poll()
+        poll.register(descriptor, select.POLLIN)
+        return bool(poll.poll(wait))
+
+    def assert_alive(self, group):
+        self.assertFalse(self.exited(group[2]), "unrelated leader was stopped")
+        self.assertFalse(self.exited(group[3]), "unrelated worker was stopped")
+        beats = group[1].parent / "beats"
+        before = beats.stat().st_size
+        deadline = time.monotonic() + 1
+        while beats.stat().st_size == before and time.monotonic() < deadline:
+            time.sleep(.01)
+        self.assertGreater(beats.stat().st_size, before, "live job stopped making progress")
+
+    def assert_stopped(self, group):
+        self.assertTrue(self.exited(group[2], 1500), "recorded leader survived cancellation")
+        self.assertTrue(self.exited(group[3], 1500), "TERM-resistant descendant survived")
+        import fcntl
+        with (group[1].parent / "held.lock").open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def signals(self):
+        return self.trace.read_text().splitlines() if self.trace.exists() else []
+
+    def test_failed_initial_census_stops_the_authenticated_group(self):
+        for mode in ("kill", "term"):
+            with self.subTest(mode=mode):
+                self.count.write_text("0")
+                group = self.group()
+                result = self.recover(group, "failed", mode)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assert_stopped(group)
+                self.assertEqual(self.signals()[-1], f"-KILL -{group[0].pid}")
+
+    def test_malformed_successful_census_does_not_strand_an_owned_group(self):
+        group = self.group()
+        result = self.recover(group, "malformed")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assert_stopped(group)
+
+    def test_persistent_census_failure_stops_work_but_cannot_confirm_cleanup(self):
+        group = self.group()
+        result = self.recover(group, "persistent")
+        self.assertEqual(result.returncode, 44, result.stderr)
+        self.assert_stopped(group)
+        # Only a later genuine census establishes the release postcondition.
+        self.assertEqual(self.recover(group).returncode, 0)
+
+    def test_census_failure_after_term_keeps_this_calls_live_escalation_witness(self):
+        group = self.group()
+        result = self.recover(group, "after-term", "term")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(group[0].wait(timeout=3), -signal.SIGTERM)
+        self.assert_stopped(group)
+        self.assertEqual(self.signals(), [f"-TERM -{group[0].pid}", f"-KILL -{group[0].pid}"])
+
+    def test_persistent_failure_after_term_still_escalates_without_claiming_completion(self):
+        group = self.group()
+        result = self.recover(group, "persistent-after-term", "term")
+        self.assertEqual(result.returncode, 44, result.stderr)
+        self.assert_stopped(group)
+        self.assertEqual(self.recover(group).returncode, 0)
+
+    def test_wrong_leader_birth_never_authorizes_a_signal(self):
+        group = self.group()
+        fields = group[1].read_text().strip().split(":")
+        fields[4] = str(int(fields[4]) + 1)
+        group[1].write_text(":".join(fields) + "\n")
+        result = self.recover(group, "failed")
+        self.assertNotEqual(result.returncode, 0)
+        self.assert_alive(group)
+        self.assertEqual(self.signals(), [])
+
+    def test_legacy_pid_never_borrows_an_authenticated_identity(self):
+        group = self.group()
+        group[1].write_text(str(group[0].pid) + "\n")
+        result = self.recover(group, "failed", extra="rch_identified=1\nrch_term_sent=1\n")
+        self.assertNotEqual(result.returncode, 0)
+        self.assert_alive(group)
+        self.assertEqual(self.signals(), [])
+
+    def test_preexisting_orphan_is_not_adopted_as_a_new_escalation_witness(self):
+        group = self.group()
+        group[0].terminate()
+        group[0].wait(timeout=3)
+        result = self.recover(group, "failed", "term")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(self.exited(group[3]))
+        self.assertEqual(self.signals(), [])
+
+    def test_unknown_namespace_cannot_authorize_cleanup(self):
+        group = self.group()
+        result = self.recover(group, "failed", extra="rch_check_procfs_namespace() { return 1; }\n")
+        self.assertEqual(result.returncode, 44, result.stderr)
+        self.assert_alive(group)
+        self.assertEqual(self.signals(), [])
+
+    def test_signal_path_independently_refuses_the_observers_own_group(self):
+        # All processes in this session are test-owned, so a missing guard is
+        # observable as signal death without threatening the harness's group.
+        for invocation in ('rch_signal_group KILL', '(rch_signal_group KILL)'):
+            with self.subTest(invocation=invocation):
+                body = '''
+rch_apply_configured_worker_policy() { return 0; }
+rch_remote_record "$1" 41 || exit 90
+rch_read_record "$1" 41 || exit 91
+''' + invocation + '''
+status=$?
+[ "$status" -ne 0 ] || exit 92
+printf survived
+'''
+                result = subprocess.run([SHELL, "-c", PROTOCOL + "\n" + self.observe + body,
+                                         "rch-census-self", str(self.root / "self-record")],
+                                        capture_output=True, timeout=5, start_new_session=True,
+                                        env=self.env)
+                self.assertEqual((result.returncode, result.stdout), (0, b"survived"), result.stderr)
+                self.assertEqual(self.signals(), [])
 
 
 if __name__ == "__main__":
