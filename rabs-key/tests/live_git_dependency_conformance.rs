@@ -81,6 +81,13 @@ fn object_file(path: &Path) -> rabs_protocol::result_identity::TypedDigest {
     }
 }
 
+fn real_rustc() -> std::path::PathBuf {
+    let sysroot =
+        String::from_utf8(checked(Command::new("rustc").args(["--print", "sysroot"])).stdout)
+            .unwrap();
+    Path::new(sysroot.trim()).join("bin/rustc")
+}
+
 fn real_toolchain(plan: &DependencyActionPlan) -> ToolchainFacts {
     use rabs_key::canonical::CanonicalEncoder;
     let compiler = Path::new(&plan.compiler);
@@ -353,13 +360,13 @@ fn main() {
         .arg(&target)
         .env("CARGO_HOME", root.join("cargo-home"))
         .env("CARGO_INCREMENTAL", "0")
+        .env("RUSTC", real_rustc())
         .env("RUSTC_WRAPPER", &wrapper)
         .env("RABS_TEST_RECORD", &record);
     for name in [
         "RUSTFLAGS",
         "CARGO_ENCODED_RUSTFLAGS",
         "RUSTC_WORKSPACE_WRAPPER",
-        "RUSTC",
         "CARGO_TARGET_DIR",
         "CARGO_BUILD_TARGET",
         "RABS_TEST_UNKEYED_ENV",
@@ -563,13 +570,13 @@ fn actual_cargo_dependency_chain_reuses_complete_keys_across_target_directories(
             .arg(&target)
             .env("CARGO_HOME", root.join("cargo-home"))
             .env("CARGO_INCREMENTAL", "0")
+            .env("RUSTC", real_rustc())
             .env("RUSTC_WRAPPER", &wrapper)
             .env("RABS_TEST_RECORD", &record);
         for name in [
             "RUSTFLAGS",
             "CARGO_ENCODED_RUSTFLAGS",
             "RUSTC_WORKSPACE_WRAPPER",
-            "RUSTC",
             "CARGO_TARGET_DIR",
             "CARGO_BUILD_TARGET",
         ] {
