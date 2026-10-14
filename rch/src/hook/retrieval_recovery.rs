@@ -4267,6 +4267,24 @@ mod tests {
             session
                 .retain_cargo_stdout(&stdout, remote_root, None, 0)
                 .unwrap();
+            // Real collection installs the output contract before any
+            // publication and checkpoints every required output; a
+            // successful terminal journal always carries both.
+            session
+                .install_cargo_artifact_evidence(&stdout, remote_root)
+                .unwrap();
+            let required = session.recipe.phases[0]
+                .cargo_outputs
+                .as_ref()
+                .unwrap()
+                .required_files
+                .clone();
+            for relative in required {
+                let hash = blake3::hash(relative.as_os_str().as_encoded_bytes());
+                session.recipe.phases[0]
+                    .published
+                    .insert(relative, hash.to_hex().to_string());
+            }
             let original = session.recipe.cargo_stdout.as_ref().unwrap().path.clone();
             let delivered_exit = if receipt_case == "failed-delivery-unbound" {
                 EXIT_ARTIFACT_TRANSFER_FAILED
