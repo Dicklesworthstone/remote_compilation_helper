@@ -36,6 +36,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+mod toolchain_hashing;
+
 /// Domain of the sysroot tree digest.
 pub const DOMAIN_SYSROOT_TREE: &str = "rabs.live-dependency.sysroot-tree.v1";
 /// Logical root name of a captured package in its sealed snapshot.
@@ -986,21 +988,14 @@ fn probe_toolchain(compiler: &Path, env: &[(String, String)]) -> Result<ProbedTo
         );
     }
 
-    let (_, compiler_binary_digest) = digest_stable_at(compiler, inputs.compiler.1)
-        .map_err(|error| format!("hash compiler: {error}"))?;
-    let mut runtime = Vec::new();
-    for (path, expected) in &inputs.runtime_libraries {
-        let (_, digest) = digest_stable_at(path, *expected)
-            .map_err(|error| format!("hash runtime {}: {error}", path.display()))?;
-        runtime.push(digest);
-    }
+    // One bounded batch owns every read. Its size-aware scheduling and
+    // hardlink coalescing never change canonical compiler/library ordering.
+    let digests = toolchain_hashing::hash(&inputs)?;
 
     // Every file below lib/rustlib/<target>/lib: std and friends, which a
     // compile links metadata and inlinable code from.
     let mut tree = Vec::new();
-    for (path, expected) in &inputs.sysroot_files {
-        let (_, digest) =
-            digest_stable_at(path, *expected).map_err(|error| format!("hash sysroot: {error}"))?;
+    for ((path, _), digest) in inputs.sysroot_files.iter().zip(digests.sysroot) {
         let relative = path
             .strip_prefix(sysroot)
             .map_err(|_| "sysroot member escaped")?
@@ -1017,10 +1012,10 @@ fn probe_toolchain(compiler: &Path, env: &[(String, String)]) -> Result<ProbedTo
     }
     let probed = ProbedToolchain {
         facts: ToolchainFacts {
-            compiler_binary_digest,
+            compiler_binary_digest: digests.compiler,
             verbose_version,
             sysroot_root_digest: compute(DOMAIN_SYSROOT_TREE, &enc.finish()),
-            runtime_libraries: runtime,
+            runtime_libraries: digests.runtime,
         },
         inputs,
     };
