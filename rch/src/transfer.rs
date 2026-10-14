@@ -5814,17 +5814,32 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
             let mut child = cmd
                 .spawn()
                 .map_err(|e| format!("failed to spawn kill ssh: {e}"))?;
-            if let Some(mut stdin) = child.stdin.take() {
-                stdin
-                    .write_all(script.as_bytes())
+            let stdin = child.stdin.take();
+
+            // Recovery must not inherit the build transport's historical
+            // upload-before-drain deadlock. Poll script upload and output
+            // collection together inside REMOTE_TIMEOUT_KILL_BUDGET so a
+            // diagnostic-producing remote shell cannot fill stdout/stderr
+            // while this side is still blocked writing the cancellation script.
+            let upload = async move {
+                if let Some(mut stdin) = stdin {
+                    stdin
+                        .write_all(script.as_bytes())
+                        .await
+                        .map_err(|e| format!("failed to write kill script: {e}"))?;
+                    drop(stdin);
+                }
+                Ok::<(), String>(())
+            };
+            let collect = async move {
+                child
+                    .wait_with_output()
                     .await
-                    .map_err(|e| format!("failed to write kill script: {e}"))?;
-                drop(stdin);
-            }
-            let output = child
-                .wait_with_output()
-                .await
-                .map_err(|e| format!("failed to await kill ssh: {e}"))?;
+                    .map_err(|e| format!("failed to await kill ssh: {e}"))
+            };
+            let (upload, output) = tokio::join!(upload, collect);
+            upload?;
+            let output = output?;
             if !output.status.success() {
                 return Err(format!(
                     "kill channel exited with {}: {}",
