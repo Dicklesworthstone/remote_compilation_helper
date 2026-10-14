@@ -58,7 +58,11 @@ rabs-wrap via RUSTC_WRAPPER, overriding Cargo's build.rustc-wrapper config.
 No project or global Cargo config is edited.
 
 New daemon logs: <RABS_STATE_DIR>/cargo-launcher/daemon-<pid>-<time>.log.
-Daemon startup coordination uses a private lifetime lock, not a PID-file lock.
+Daemon startup holds both state-directory and socket-endpoint lifetime locks.
+The endpoint lock is .rabs-<socket-name>.startup.lock beside the socket, so
+different state directories cannot start competing daemons for one endpoint.
+Starting a daemon requires a same-user socket parent without group/world write
+permission; attaching to an already-running daemon does not create any locks.
 Stale, foreign, malformed or unavailable existing sockets are left untouched.
 """
 
@@ -262,19 +266,49 @@ def private_directory(path):
     return descriptor
 
 
-class StartupLock:
-    """One stable flock inode, inherited only by a newly admitted daemon.
+def private_lock(directory, name):
+    descriptor = os.open(
+        name, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK,
+        0o600, dir_fd=directory,
+    )
+    try:
+        check_lock_metadata(os.fstat(descriptor))
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor
 
-    The daemon retains the lock after this launcher exits or times out. A
-    second launcher must not spawn another coordinator while the first is
-    alive but has not bound its socket yet. Ready-daemon callers bypass the
-    lock entirely. Close, never explicitly unlock, the parent's descriptor.
+
+def check_lock_metadata(metadata):
+    if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(metadata.st_mode) & 0o077 or metadata.st_nlink != 1):
+        raise SetupError("RABS startup lock has unsafe identity or permissions")
+
+
+class StartupLock:
+    """Two stable flock inodes, inherited only by a newly admitted daemon.
+
+    The state lock prevents two endpoints from opening one state store. The
+    endpoint lock prevents two state stores from racing to bind one socket.
+    Keep the original state lock path: an older launcher-owned daemon still
+    holds it. Always acquire state then endpoint, with the same deadline.
+
+    Both locks survive launcher exit/timeout in the daemon. Parent-directory
+    aliases converge on the endpoint lock's actual inode, not a path hash.
+    Ready-daemon callers bypass locks entirely. Close, never explicitly unlock,
+    the parent's descriptors: unlocking would release the child's locks too.
     """
-    def __init__(self, state, deadline):
+    def __init__(self, state, socket_path, deadline):
         self.directory = None
         self.lock = None
+        self.socket_directory = None
+        self.endpoint_lock = None
         self.deadline = deadline
         self.path = os.path.join(state, "cargo-launcher")
+        self.socket_parent, socket_name = os.path.split(socket_path)
+        if not socket_name or socket_name in (".", ".."):
+            raise SetupError("RABS socket must name a directory entry")
+        self.endpoint_name = ".rabs-{}.startup.lock".format(socket_name)
         parent = private_directory(state)
         try:
             try:
@@ -288,14 +322,13 @@ class StartupLock:
             metadata = os.fstat(self.directory)
             if metadata.st_uid != os.geteuid() or stat.S_IMODE(metadata.st_mode) & 0o077:
                 raise SetupError("RABS startup directory is not private to this user")
-            self.lock = os.open(
-                "startup.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC,
-                0o600, dir_fd=self.directory,
-            )
-            metadata = os.fstat(self.lock)
-            if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.geteuid()
-                    or stat.S_IMODE(metadata.st_mode) & 0o077 or metadata.st_nlink != 1):
-                raise SetupError("RABS startup lock has unsafe identity or permissions")
+            self.lock = private_lock(self.directory, "startup.lock")
+            # Resolve transport-parent aliases only, not a final socket entry.
+            # Verification below requires the original spelling to keep naming
+            # this directory. No socket or existing lock is repaired/unlinked.
+            self.socket_directory = private_directory(os.path.realpath(self.socket_parent))
+            self.endpoint_lock = private_lock(self.socket_directory, self.endpoint_name)
+            self.verify()
         except BaseException:
             self.close()
             raise
@@ -305,12 +338,48 @@ class StartupLock:
     def __enter__(self):
         return self
 
+    def verify(self):
+        # flock protects an inode, not a pathname. Never spawn with a lock
+        # whose entry or containing directory was replaced after we opened it.
+        for path, descriptor, follow, mask in [
+            (self.path, self.directory, False, 0o077),
+            (self.socket_parent, self.socket_directory, True, 0o022),
+        ]:
+            held = os.fstat(descriptor)
+            named = os.stat(path, follow_symlinks=follow)
+            if (not stat.S_ISDIR(named.st_mode) or named.st_uid != os.geteuid()
+                    or stat.S_IMODE(named.st_mode) & mask
+                    or (held.st_dev, held.st_ino) != (named.st_dev, named.st_ino)):
+                raise SetupError("RABS startup directory identity changed")
+        for directory, name, descriptor in [
+            (self.directory, "startup.lock", self.lock),
+            (self.socket_directory, self.endpoint_name, self.endpoint_lock),
+        ]:
+            held = os.fstat(descriptor)
+            named = os.stat(name, dir_fd=directory, follow_symlinks=False)
+            check_lock_metadata(held)
+            check_lock_metadata(named)
+            if (held.st_dev, held.st_ino) != (named.st_dev, named.st_ino):
+                raise SetupError("RABS startup lock identity changed")
+
+    def inherited_fds(self):
+        self.verify()
+        return self.lock, self.endpoint_lock
+
     def acquire(self, socket_path):
         """True: may start; False: the lock holder became a ready daemon."""
+        for descriptor in (self.lock, self.endpoint_lock):
+            if not self.acquire_one(descriptor, socket_path):
+                return False
+        return True
+
+    def acquire_one(self, descriptor, socket_path):
         while True:
             remaining(self.deadline)
+            self.verify()
             try:
-                fcntl.flock(self.lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                self.verify()
                 return True
             except BlockingIOError:
                 # The service deliberately owns this lock for its lifetime.
@@ -324,6 +393,7 @@ class StartupLock:
                 time.sleep(min(0.025, remaining(self.deadline)))
 
     def new_log(self):
+        self.verify()
         name = "daemon-{}-{}.log".format(os.getpid(), time.time_ns())
         descriptor = os.open(
             name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
@@ -332,7 +402,7 @@ class StartupLock:
         return descriptor, os.path.join(self.path, name)
 
     def close(self):
-        for name in ("lock", "directory"):
+        for name in ("endpoint_lock", "socket_directory", "lock", "directory"):
             descriptor = getattr(self, name)
             if descriptor is not None:
                 os.close(descriptor)
@@ -351,7 +421,7 @@ def ensure_daemon(daemon, socket_path, state, env, deadline, no_start):
         return
     if no_start:
         raise SetupError("no RABS daemon is listening and --rabs-no-start was requested")
-    with StartupLock(state, deadline) as lock:
+    with StartupLock(state, socket_path, deadline) as lock:
         if not lock.acquire(socket_path):
             return
         if socket_identity(socket_path) is not None:
@@ -364,7 +434,7 @@ def ensure_daemon(daemon, socket_path, state, env, deadline, no_start):
             child = subprocess.Popen(
                 [daemon], env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                 stderr=descriptor, close_fds=True, start_new_session=True,
-                pass_fds=(lock.lock,),
+                pass_fds=lock.inherited_fds(),
             )
         finally:
             os.close(descriptor)

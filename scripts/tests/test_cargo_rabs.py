@@ -67,6 +67,13 @@ if sys.argv[1:] == ["--check-config"]:
 with open(root / "starts", "a") as f:
     f.write(json.dumps({"pid": os.getpid(), "pgid": os.getpgrp(),
                         "live": os.environ.get("RABS_LIVE_DEPENDENCY")}) + "\n")
+if os.environ.get("TEST_START_GATE"):
+    gate = pathlib.Path(os.environ["TEST_START_GATE"])
+    deadline = time.monotonic() + 10
+    while not gate.exists() and root.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    if not gate.exists():
+        sys.exit(32)
 time.sleep(float(os.environ.get("TEST_START_DELAY", "0")))
 if not root.exists():
     sys.exit(0)
@@ -240,6 +247,221 @@ class LauncherTests(unittest.TestCase):
         third = self.cargo_result(self.launch(["check"]))
         self.assertEqual(third["env"].get("RUSTC_WRAPPER"), str(self.wrap))
         self.assertEqual(len(self.starts()), 1)
+
+    def assert_prebind_endpoint_is_shared(self, follower_endpoint):
+        # Hold the actual fixture daemon BEFORE bind, beyond two launchers'
+        # deadlines. A socket-only readiness check cannot serialize this.
+        gate = self.root / "allow-bind"
+        settings = {"TEST_START_GATE": str(gate), "CARGO_RABS_STARTUP_MS": "300"}
+        try:
+            first = self.cargo_result(self.launch(["check"], settings))
+            self.assertNotIn("RUSTC_WRAPPER", first["env"])
+            self.assertEqual(len(self.starts()), 1, "the first daemon must have started")
+            self.assertFalse(self.endpoint.exists(), "the bind gate must still be closed")
+            second = self.cargo_result(self.launch(["check"], dict(
+                settings, RABS_STATE_DIR=str(self.root / "other-state"),
+                RABS_SOCKET_PATH=str(follower_endpoint))))
+            self.assertNotIn("RUSTC_WRAPPER", second["env"])
+            self.assertEqual(len(self.starts()), 1,
+                             "another state directory must not admit a competing daemon")
+        finally:
+            gate.write_text("bind now")
+            deadline = time.monotonic() + 3
+            while not self.endpoint.exists() and time.monotonic() < deadline:
+                time.sleep(0.025)
+        third = self.cargo_result(self.launch(["check"], {
+            "RABS_STATE_DIR": str(self.root / "other-state"),
+            "RABS_SOCKET_PATH": str(follower_endpoint)}))
+        self.assertEqual(third["env"].get("RUSTC_WRAPPER"), str(self.wrap))
+        self.assertEqual(len(self.starts()), 1)
+
+    def test_prebind_lock_survives_timeout_across_distinct_state_directories(self):
+        self.assert_prebind_endpoint_is_shared(self.endpoint)
+
+    def test_prebind_lock_converges_across_socket_parent_aliases(self):
+        alias = self.root / "parent-alias"
+        alias.symlink_to(self.root, target_is_directory=True)
+        self.assert_prebind_endpoint_is_shared(alias / self.endpoint.name)
+
+    def test_parallel_distinct_state_callers_share_one_ready_endpoint(self):
+        with concurrent.futures.ThreadPoolExecutor(max_workers=12) as pool:
+            results = list(pool.map(lambda index: self.launch(["check"], {
+                "TEST_START_DELAY": "0.5",
+                "RABS_STATE_DIR": str(self.root / ("state-" + str(index))),
+            }), range(12)))
+        self.assertEqual(len(self.starts()), 1)
+        for result in results:
+            value = self.cargo_result(result)
+            self.assertEqual(value["env"].get("RUSTC_WRAPPER"), str(self.wrap), result.stderr)
+
+    def test_ready_daemon_attach_does_not_create_unused_state(self):
+        self.cargo_result(self.launch())
+        unused = self.root / "unused-state"
+        before = self.endpoint.stat().st_ino
+        value = self.cargo_result(self.launch(changes={"RABS_STATE_DIR": str(unused)}))
+        self.assertEqual(value["env"].get("RUSTC_WRAPPER"), str(self.wrap))
+        self.assertEqual(self.endpoint.stat().st_ino, before)
+        self.assertFalse(unused.exists())
+        self.assertEqual(len(self.starts()), 1)
+
+    def test_daemon_keeps_both_locks_after_its_launcher_is_killed(self):
+        gate = self.root / "allow-bind"
+        env = dict(self.env, TEST_START_GATE=str(gate))
+        child = subprocess.Popen(
+            [sys.executable, "-S", str(LAUNCHER), "rabs", "check"], env=env,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        try:
+            deadline = time.monotonic() + 3
+            while not self.starts() and time.monotonic() < deadline:
+                time.sleep(0.025)
+            self.assertEqual(len(self.starts()), 1)
+            self.assertIsNone(child.poll())
+            self.assertFalse(self.endpoint.exists())
+            child.kill()  # This test's launcher, never the shared daemon.
+            child.communicate(timeout=3)
+            self.assertEqual(child.returncode, -signal.SIGKILL)
+            follower = self.cargo_result(self.launch(changes={
+                "RABS_STATE_DIR": str(self.root / "other-state"),
+                "CARGO_RABS_STARTUP_MS": "300",
+                "TEST_START_GATE": str(gate),
+            }))
+            self.assertNotIn("RUSTC_WRAPPER", follower["env"])
+            self.assertEqual(len(self.starts()), 1)
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.communicate(timeout=3)
+            gate.write_text("bind now")
+            deadline = time.monotonic() + 3
+            while not self.endpoint.exists() and time.monotonic() < deadline:
+                time.sleep(0.025)
+        self.assertEqual(self.cargo_result(self.launch())["env"]["RUSTC_WRAPPER"], str(self.wrap))
+        self.assertEqual(len(self.starts()), 1)
+
+    def test_state_store_cannot_start_under_a_second_endpoint(self):
+        self.cargo_result(self.launch())
+        other = self.root / "other.sock"
+        result = self.launch(["--rabs-require-daemon"], {
+            "RABS_SOCKET_PATH": str(other), "CARGO_RABS_STARTUP_MS": "300",
+        })
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(result.stdout, b"")
+        self.assertEqual(len(self.starts()), 1)
+        self.assertFalse(other.exists())
+        self.assertTrue(rabs.probe(str(self.endpoint), time.monotonic() + 1))
+
+    def test_independent_states_and_endpoints_do_not_block_each_other(self):
+        self.cargo_result(self.launch())
+        other = self.root / "other.sock"
+        try:
+            result = self.cargo_result(self.launch(["--rabs-require-daemon"], {
+                "RABS_SOCKET_PATH": str(other), "RABS_STATE_DIR": str(self.root / "other-state"),
+            }))
+            self.assertEqual(result["env"].get("RUSTC_WRAPPER"), str(self.wrap))
+            self.assertEqual(len(self.starts()), 2)
+            self.assertTrue(rabs.probe(str(self.endpoint), time.monotonic() + 1))
+            self.assertTrue(rabs.probe(str(other), time.monotonic() + 1))
+        finally:
+            if other.exists():
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as peer:
+                    peer.settimeout(1)
+                    peer.connect(str(other))
+                    peer.sendall(b'{"kind":"test-stop"}\n')
+                deadline = time.monotonic() + 3
+                while other.exists() and time.monotonic() < deadline:
+                    time.sleep(0.025)
+                self.assertFalse(other.exists())
+
+    def test_unsafe_endpoint_lock_entries_refuse_before_daemon_start(self):
+        for fault in ["symlink", "hardlink", "public", "directory", "fifo"]:
+            with self.subTest(fault=fault):
+                endpoint = self.root / (fault + ".sock")
+                path = self.root / (".rabs-" + endpoint.name + ".startup.lock")
+                retained = self.root / ("retained-" + fault)
+                retained.write_bytes(b"untouched")
+                retained.chmod(0o600)
+                if fault == "symlink":
+                    path.symlink_to(retained)
+                elif fault == "hardlink":
+                    os.link(retained, path)
+                elif fault == "public":
+                    path.write_bytes(b"do not truncate")
+                    path.chmod(0o666)
+                elif fault == "directory":
+                    path.mkdir(mode=0o700)
+                else:
+                    os.mkfifo(path, 0o600)
+                before = path.lstat()
+                result = self.launch(["--rabs-require-daemon"], {
+                    "RABS_SOCKET_PATH": str(endpoint),
+                })
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(result.stdout, b"")
+                after = path.lstat()
+                self.assertEqual((before.st_dev, before.st_ino, before.st_mode, before.st_nlink),
+                                 (after.st_dev, after.st_ino, after.st_mode, after.st_nlink))
+                self.assertEqual(retained.read_bytes(), b"untouched")
+                if fault == "public":
+                    self.assertEqual(path.read_bytes(), b"do not truncate")
+                self.assertEqual(self.starts(), [])
+
+    def test_writable_socket_parent_is_not_silently_repaired(self):
+        parent = self.root / "shared"
+        parent.mkdir(mode=0o777)
+        parent.chmod(0o777)
+        result = self.launch(["--rabs-require-daemon"], {
+            "RABS_SOCKET_PATH": str(parent / "edge.sock"),
+        })
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(stat.S_IMODE(parent.stat().st_mode), 0o777)
+        self.assertEqual(list(parent.iterdir()), [])
+        self.assertEqual(self.starts(), [])
+
+    def test_replaced_lock_inodes_cannot_authorize_startup_or_handoff(self):
+        for name in ["state", "endpoint"]:
+            for after_acquire in [False, True]:
+                with self.subTest(name=name, after_acquire=after_acquire):
+                    suffix = name + str(after_acquire)
+                    state = self.root / ("state-" + suffix)
+                    endpoint = self.root / (suffix + ".sock")
+                    with rabs.StartupLock(str(state), str(endpoint), time.monotonic() + 2) as lock:
+                        if after_acquire:
+                            self.assertTrue(lock.acquire(str(endpoint)))
+                        path = (state / "cargo-launcher/startup.lock" if name == "state" else
+                                self.root / (".rabs-" + endpoint.name + ".startup.lock"))
+                        path.rename(self.root / ("retained-lock-" + suffix))
+                        path.write_bytes(b"replacement")
+                        path.chmod(0o600)
+                        with self.assertRaises(rabs.SetupError):
+                            if after_acquire:
+                                lock.inherited_fds()
+                            else:
+                                lock.acquire(str(endpoint))
+                        self.assertEqual(path.read_bytes(), b"replacement")
+
+    def test_retargeted_socket_parent_is_not_the_opened_endpoint_namespace(self):
+        parent = self.root / "socket-parent"
+        parent.mkdir(mode=0o700)
+        state = self.root / "state"
+        endpoint = parent / "edge.sock"
+        with rabs.StartupLock(str(state), str(endpoint), time.monotonic() + 2) as lock:
+            parent.rename(self.root / "retained-parent")
+            parent.mkdir(mode=0o700)
+            with self.assertRaises(rabs.SetupError):
+                lock.acquire(str(endpoint))
+            self.assertEqual(list(parent.iterdir()), [])
+
+    def test_failed_endpoint_open_releases_all_setup_descriptors(self):
+        target = self.root / "retained-lock"
+        target.write_bytes(b"keep")
+        (self.root / (".rabs-" + self.endpoint.name + ".startup.lock")).symlink_to(target)
+        before = len(os.listdir("/proc/self/fd"))
+        for _ in range(5):
+            with self.assertRaises(OSError):
+                rabs.StartupLock(str(self.root / "state"), str(self.endpoint), time.monotonic() + 1)
+        self.assertEqual(len(os.listdir("/proc/self/fd")), before)
+        self.assertEqual(target.read_bytes(), b"keep")
 
     def test_missing_accelerator_runs_original_cargo_and_environment(self):
         value = self.cargo_result(self.launch(["test", "--", "--nocapture"], {"CARGO_RABS_WRAP": "/absent"}))
