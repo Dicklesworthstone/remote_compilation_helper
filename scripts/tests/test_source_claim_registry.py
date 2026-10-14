@@ -21,8 +21,12 @@ SCRIPT = (REPO / "rch/src/hook/source_claim_registry.sh").read_text()
 HELPER_SOURCE = (REPO / "rch-common/src/stale_target_reap.rs").read_text()
 HELPERS = HELPER_SOURCE.split('pub const SOURCE_CLAIM_RECORD_HELPERS: &str = r#"', 1)[1].split('"#;', 1)[0]
 FLOCK = shutil.which("flock")
+# util-linux flock can exec the command in place; the BSD port Homebrew ships
+# on macOS has no --no-fork and always runs it as a child.
+FLOCK_NO_FORK = ["--no-fork"] if FLOCK and b"util-linux" in subprocess.run(
+    [FLOCK, "--version"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+    check=False).stdout else []
 AWK = shutil.which("awk")
-CAT = shutil.which("cat")
 REALPATH = shutil.which("realpath")
 SYNC = shutil.which("sync")
 
@@ -61,7 +65,7 @@ class SourceClaimRegistryTests(unittest.TestCase):
         return path
 
     def command(self, token, roots, operation="acquire"):
-        return [FLOCK, "--exclusive", "--no-fork", "--", str(self.registry / ".lock"),
+        return [FLOCK, "--exclusive", *FLOCK_NO_FORK, "--", str(self.registry / ".lock"),
                 self.shell, str(self.script), str(self.registry), token,
                 digest(roots), operation]
 
@@ -141,9 +145,12 @@ class SourceClaimRegistryTests(unittest.TestCase):
         self.assert_refused(result)
         # A failed producer that emitted apparently valid but partial roots
         # cannot be rescued by awk returning success for the shortened set.
-        env = self.tool_env("cat", 'if [ "$#" -gt 0 ]; then printf "/b\\n"; exit 1; fi\n'
-                            "exec " + shlex.quote(CAT))
-        self.assert_refused(self.comparison(["/a"], ["/b", "/a"], env=env))
+        # Held record files are read through tr (NUL -> CR for BSD awk).
+        held_file = self.root / "held-partial.roots"
+        held_file.write_bytes(body(["/b", "/a"]))
+        env = self.tool_env("tr", 'printf "/b\\n"; exit 1')
+        self.assert_refused(self.comparison(["/a"], None, env=env, held_file=held_file))
+        self.assert_granted(self.comparison(["/a"], None, held_file=held_file))
 
     def test_malformed_and_unterminated_records_are_refused(self):
         for roots in (["relative"], ["/a/../b"], ["/a//b"], ["/a/"],
@@ -259,9 +266,16 @@ class SourceClaimRegistryTests(unittest.TestCase):
 
     def test_resolver_failure_in_later_batch_does_not_publish(self):
         roots = [self.root / "wanted" / str(i) for i in range(130)]
-        env = self.tool_env("realpath", 'for root do\n'
-                            '  case "$root" in */wanted/129) exit 1;; esac\ndone\n'
-                            "exec " + shlex.quote(REALPATH) + ' "$@"')
+        program = ('for root do\n'
+                   '  case "$root" in */wanted/129) exit 1;; esac\ndone\n'
+                   'exec {} "$@"')
+        env = self.tool_env("realpath", program.format(shlex.quote(REALPATH)))
+        # rch_realpath_m prefers Homebrew's grealpath (macOS) when present.
+        grealpath = shutil.which("grealpath")
+        if grealpath:
+            tool = Path(env["PATH"].split(os.pathsep)[0]) / "grealpath"
+            tool.write_text("#!/bin/sh\n" + program.format(shlex.quote(grealpath)) + "\n")
+            tool.chmod(0o700)
         self.assert_refused(self.transact("aa", roots, env=env))
         self.assertFalse(list(self.registry.glob("aa.*.claim")))
         self.assertFalse(list(self.registry.glob("aa.*.pending")))
