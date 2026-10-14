@@ -5886,26 +5886,19 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
 
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
 
         let start = std::time::Instant::now();
         let mut child = cmd
             .spawn()
             .with_context(|| format!("Failed to spawn ssh to {}", destination))?;
 
-        if let Some(mut stdin) = child.stdin.take() {
-            // Feed the script, then close stdin so `sh -s` begins execution.
-            stdin
-                .write_all(remote_script.as_bytes())
-                .await
-                .context("Failed to write remote script to ssh stdin")?;
-            stdin
-                .write_all(b"\n")
-                .await
-                .context("Failed to finalize remote script")?;
-            drop(stdin);
-        }
-
+        // Take every pipe before uploading the script. SSH and the remote shell
+        // can produce diagnostics while stdin is still being consumed; draining
+        // stdout/stderr only after write_all() lets those pipes fill and deadlock
+        // the upload outside the command timeout.
+        let stdin = child.stdin.take();
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
 
@@ -5979,8 +5972,33 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         let mut drain_deadline: Option<tokio::time::Instant> = None;
         let mut drain_cap: Option<tokio::time::Instant> = None;
 
+        // Readers above are already running when this future starts, so script
+        // upload and remote output progress concurrently. Keep upload under the
+        // same absolute command budget as execution: a blocked ssh stdin is a
+        // transport failure, not an unbounded pre-execution phase.
+        let upload = async move {
+            if let Some(mut stdin) = stdin {
+                stdin
+                    .write_all(remote_script.as_bytes())
+                    .await
+                    .context("Failed to write remote script to ssh stdin")?;
+                stdin
+                    .write_all(b"\n")
+                    .await
+                    .context("Failed to finalize remote script")?;
+                drop(stdin);
+            }
+            Ok::<(), anyhow::Error>(())
+        };
+
         let status = match tokio::time::timeout(command_timeout, async {
+            let mut upload = Box::pin(upload);
+            let mut uploaded = false;
+            let mut streams_open = true;
             loop {
+                if uploaded && !streams_open {
+                    break;
+                }
                 let drain_expired = async move {
                     match drain_deadline {
                         Some(deadline) => tokio::time::sleep_until(deadline).await,
@@ -5988,8 +6006,19 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
                     }
                 };
                 let event = tokio::select! {
-                    event = rx.recv() => match event { Some(event) => event, None => break },
-                    _ = completion_tick.tick(), if self.recovery_completion.is_some() && durable_status.is_none() => {
+                    result = upload.as_mut(), if !uploaded => {
+                        result?;
+                        uploaded = true;
+                        continue;
+                    }
+                    event = rx.recv(), if streams_open => match event {
+                        Some(event) => event,
+                        None => {
+                            streams_open = false;
+                            continue;
+                        }
+                    },
+                    _ = completion_tick.tick(), if uploaded && self.recovery_completion.is_some() && durable_status.is_none() => {
                         if let Ok(Some(status)) = self.read_recovery_completion(worker).await {
                             durable_status = Some(status);
                             let now = tokio::time::Instant::now();
@@ -6032,7 +6061,20 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         })
         .await
         {
-            Ok(status) => status?,
+            Ok(Ok(status)) => status,
+            Ok(Err(error)) => {
+                // Some script bytes may already have reached sh -s and started
+                // work. Stop the local channel, then use the same identity-bound
+                // remote cleanup as timeout handling. Never convert an upload or
+                // stream failure into permission to replay elsewhere.
+                let _ = child.kill().await;
+                let (cleanup, detail) = self.kill_remote_process_group_after_timeout(worker).await;
+                return Err(error
+                    .context(format!(
+                        "SSH execution transport failed; remote cleanup: {cleanup} ({detail})"
+                    ))
+                    .context(RemoteExecutionUnconfirmed));
+            }
             Err(_) => {
                 // Best-effort: kill local ssh process first so the channel is closed.
                 let _ = child.kill().await;
