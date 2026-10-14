@@ -2528,7 +2528,7 @@ async fn handle_select_worker_dry_run(
 ) -> SelectionResponse {
     // Same exclusions as a real request: a worker already building this
     // project would not be handed a second build of it.
-    let excluded_worker_ids = ctx.history.active_workers_for_project(&request.project);
+    let excluded_worker_ids = project_excluded_workers(ctx, &request.project);
     let result = ctx
         .worker_selector
         .preview_with_exclusions(&ctx.pool, request, &excluded_worker_ids)
@@ -2730,7 +2730,7 @@ async fn handle_select_worker_mode(
             // Retry loop to handle race conditions where slots are taken between selection and reservation.
             let mut reservation_attempts = 0;
             const MAX_ATTEMPTS: u32 = 3;
-            let mut excluded_worker_ids = ctx.history.active_workers_for_project(&request.project);
+            let mut excluded_worker_ids = project_excluded_workers(ctx, &request.project);
 
             loop {
                 // Use the configured worker selector.
@@ -3323,6 +3323,21 @@ const DEAD_WRAPPER_HEARTBEAT_STALE_MS: u64 = 15 * 60 * 1000;
 /// overlapping build on that worker (bd-dmg2k: 69 such claims fleet-wide).
 /// Only a recipe that names worker-side ownership (source roots, a source
 /// pair, or a tree to retire) needs keeping.
+/// Workers this project must not be placed on: one running build per project
+/// per worker, plus workers whose failed build's client lease still owns
+/// worker source (their registry would refuse the same root, bd-jqhno).
+fn project_excluded_workers(
+    ctx: &DaemonContext,
+    project: &str,
+) -> std::collections::HashSet<String> {
+    let mut excluded = ctx.history.active_workers_for_project(project);
+    excluded.extend(
+        ctx.history
+            .source_fenced_workers(project, crate::cancellation::client_lease_owns_source),
+    );
+    excluded
+}
+
 pub(crate) fn lease_owns_unretired_source(lease: &DurableJobLease) -> bool {
     lease.recovery.as_ref().is_some_and(|recipe| {
         let owns = recipe

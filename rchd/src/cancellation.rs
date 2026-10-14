@@ -166,7 +166,7 @@ fn provably_abandoned_unlaunched(
 
 /// Whether this dispatcher's client lease for `wrapper` still owns worker
 /// source. An unreadable lease fails closed (treated as owning).
-fn client_lease_owns_source(wrapper: &str) -> bool {
+pub(crate) fn client_lease_owns_source(wrapper: &str) -> bool {
     let path =
         rch_common::job_identity::default_job_lease_directory().join(format!("{wrapper}.json"));
     match std::fs::read(&path) {
