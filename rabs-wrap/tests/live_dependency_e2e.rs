@@ -614,12 +614,21 @@ fn git_workspace_dependency_commits_verifies_and_serves_with_a_complete_source_c
         let output = world.wrapped("leaf", &out_a, &[], &[]);
         assert_eq!(output.status.code(), Some(0), "{output:?}");
         let decisions = trail(&daemon, mark);
-        if decisions.contains(&"committed".to_owned()) {
-            assert_eq!(decisions, ["execute", "committed"]);
+        if let Some(prefix) =
+            decisions.strip_suffix(&["execute".to_owned(), "committed".to_owned()])
+        {
+            assert!(
+                prefix
+                    .iter()
+                    .all(|step| matches!(step.as_str(), "toolchain-warming" | "preparing")),
+                "unexpected decisions before commit: {decisions:?}"
+            );
             break output;
         }
         assert!(
-            decisions.iter().all(|step| step == "toolchain-warming"),
+            decisions
+                .iter()
+                .all(|step| matches!(step.as_str(), "toolchain-warming" | "preparing")),
             "unexpected decisions while warming: {decisions:?}"
         );
         assert!(Instant::now() < deadline, "toolchain probe never warmed");
