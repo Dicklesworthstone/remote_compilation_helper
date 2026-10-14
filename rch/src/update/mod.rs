@@ -318,14 +318,31 @@ async fn probe_installed_version(
     use crate::transfer::read_bounded_output_stream;
     use std::process::Stdio;
 
-    let mut child = tokio::process::Command::new(path)
-        .arg("--version")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .with_context(|| format!("cannot execute installed {name}: {}", path.display()))?;
+    // A just-staged executable can be briefly busy: any process forked while
+    // its write descriptor was open holds that descriptor until it execs.
+    let mut busy_retries = 0;
+    let mut child = loop {
+        match tokio::process::Command::new(path)
+            .arg("--version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+        {
+            Err(error)
+                if error.kind() == std::io::ErrorKind::ExecutableFileBusy && busy_retries < 50 =>
+            {
+                busy_retries += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            result => {
+                break result.with_context(|| {
+                    format!("cannot execute installed {name}: {}", path.display())
+                })?;
+            }
+        }
+    };
     let stdout = child.stdout.take().context("version probe lacks stdout")?;
     let stderr = child.stderr.take().context("version probe lacks stderr")?;
     let captured = tokio::time::timeout(timeout, async {

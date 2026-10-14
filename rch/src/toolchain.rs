@@ -975,11 +975,25 @@ mod tests {
         )
     }
 
+    /// Written by a child process so this multi-threaded test binary never
+    /// holds a write descriptor a sibling test's fork could inherit, which
+    /// makes exec of the script fail with ETXTBSY (bd-p7auy).
     #[cfg(unix)]
     fn script(path: &Path, body: &str) {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::write(path, body).unwrap();
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        use std::io::Write as _;
+        let mut writer = std::process::Command::new("/bin/sh")
+            .args(["-c", "cat > \"$1\" && chmod 755 \"$1\"", "sh"])
+            .arg(path)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        writer
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(body.as_bytes())
+            .unwrap();
+        assert!(writer.wait().unwrap().success(), "{}", path.display());
     }
 
     #[cfg(unix)]
