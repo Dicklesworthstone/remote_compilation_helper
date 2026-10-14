@@ -53,6 +53,8 @@ use serde_json::{Value, json};
 use std::path::Path;
 use std::sync::Arc;
 
+#[path = "admission_preflight.rs"]
+mod admission_preflight;
 #[path = "build_script_reuse.rs"]
 mod build_script_reuse;
 #[path = "directory_source.rs"]
@@ -252,6 +254,25 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
         log("pass-through", &[("crate", unit), ("reason", reason)]);
         Decided::Reply(pass_through(reason))
     };
+    // Compiler probes and primary packages cannot be admitted, even once
+    // the sysroot is warm. Do not delay Cargo (or occupy a warmer) for them.
+    // Passing preflight grants no authority: the observed-host planner below
+    // still checks the entire source/output class and all serving gates.
+    if let Some(refusal) = admission_preflight::rejection(LiveRustcRequest {
+        argv: &parsed.argv,
+        cwd: &parsed.cwd,
+        env: &parsed.env,
+    }) {
+        log(
+            "shadow",
+            &[
+                ("crate", unit),
+                ("reason", refusal.code()),
+                ("detail", &refusal.to_string()),
+            ],
+        );
+        return Decided::Shadow(observation(&parsed));
+    }
     let constructed = constructed_environment(&parsed.env);
     let toolchain = match live
         .facts
