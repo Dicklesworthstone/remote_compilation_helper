@@ -466,10 +466,7 @@ mod delivery_tests {
                         .unwrap();
                     let offset = frame["offset"].as_u64().unwrap();
                     if artifact && self.fail_artifact_at.is_some_and(|limit| offset >= limit) {
-                        return Err(io::Error::new(
-                            io::ErrorKind::ConnectionReset,
-                            "injected interrupted artifact",
-                        ));
+                        return Ok(());
                     }
                     let bytes: &[u8] = match (artifact, name) {
                         (true, "a") => &self.artifact,
@@ -519,9 +516,16 @@ mod delivery_tests {
         }
         fn receive(&mut self) -> io::Result<Value> {
             self.receive_count += 1;
-            self.replies
-                .pop_front()
-                .ok_or_else(|| invalid("missing fixture reply"))
+            self.replies.pop_front().ok_or_else(|| {
+                if self.fail_artifact_at.is_some() {
+                    io::Error::new(
+                        io::ErrorKind::ConnectionReset,
+                        "injected interrupted artifact",
+                    )
+                } else {
+                    invalid("missing fixture reply")
+                }
+            })
         }
     }
 
