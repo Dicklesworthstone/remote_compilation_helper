@@ -1031,6 +1031,59 @@ pub async fn diagnose(command: &str, dry_run: bool, ctx: &OutputContext) -> Resu
 /// work starts. Pure classification — no network side effects; the daemon
 /// candidate/rejection query that further refines the recommendation lands with
 /// the selection-RPC work (bd-...12.3).
+pub(super) fn merge_job_required_tools(
+    mut tools: Vec<String>,
+    config_tools: &[String],
+    job: bool,
+) -> Vec<String> {
+    if job {
+        for tool in config_tools {
+            let tool = tool.trim();
+            if !tool.is_empty() && !tools.iter().any(|existing| existing == tool) {
+                tools.push(tool.to_string());
+            }
+        }
+    }
+    tools
+}
+
+pub(super) fn format_admit_required_capabilities(
+    req: &rch_common::admit_preflight::RequiredCapabilities,
+) -> Vec<String> {
+    let mut needs: Vec<String> = Vec::new();
+    if req.needs_cargo {
+        needs.push("cargo".to_string());
+    }
+    if req.needs_zig {
+        needs.push("zig".to_string());
+    }
+    if req.needs_bun {
+        needs.push("bun".to_string());
+    }
+    if req.needs_nix {
+        needs.push("nix".to_string());
+    }
+    if req.needs_go {
+        needs.push("go".to_string());
+    }
+    if req.needs_node {
+        needs.push("node".to_string());
+    }
+    if let Some(os) = &req.needs_os {
+        needs.push(format!("os:{os}"));
+    }
+    for t in &req.needs_targets {
+        needs.push(format!("target:{t}"));
+    }
+    for tc in &req.needs_toolchains {
+        needs.push(format!("toolchain:{tc}"));
+    }
+    for tool in &req.needs_tools {
+        needs.push(format!("tool:{tool}"));
+    }
+    needs
+}
+
 pub async fn admit(
     command: &str,
     job: bool,
@@ -1038,6 +1091,12 @@ pub async fn admit(
     ctx: &OutputContext,
 ) -> Result<()> {
     use rch_common::admit_preflight::preflight;
+
+    let require_tool = if job && let Ok(config) = crate::config::load_config() {
+        merge_job_required_tools(require_tool, &config.jobs.required_tools, true)
+    } else {
+        require_tool
+    };
 
     // Proof/strict-remote policy mirrors the ControlState surface
     // (RCH_REQUIRE_REMOTE / RCH_FORCE_REMOTE).
@@ -1097,26 +1156,7 @@ pub async fn admit(
             style.value(&pf.compound.len().to_string())
         );
     }
-    let req = &pf.required;
-    let mut needs: Vec<String> = Vec::new();
-    if req.needs_cargo {
-        needs.push("cargo".to_string());
-    }
-    if req.needs_zig {
-        needs.push("zig".to_string());
-    }
-    if req.needs_bun {
-        needs.push("bun".to_string());
-    }
-    for t in &req.needs_targets {
-        needs.push(format!("target:{t}"));
-    }
-    for tc in &req.needs_toolchains {
-        needs.push(format!("toolchain:{tc}"));
-    }
-    for tool in &req.needs_tools {
-        needs.push(format!("tool:{tool}"));
-    }
+    let needs = format_admit_required_capabilities(&pf.required);
     println!(
         "{} {}",
         style.key("Required capabilities:"),
@@ -4112,5 +4152,54 @@ mod tests {
             "last_error": null,
         }))
         .expect("worker status")
+    }
+
+    #[test]
+    fn admit_job_required_tools_merges_config_only_in_job_mode() {
+        let config_tools = vec![
+            "clang".to_string(),
+            "  llvm-cov  ".to_string(),
+            "".to_string(),
+        ];
+        assert_eq!(
+            merge_job_required_tools(vec!["clang".to_string()], &config_tools, true),
+            vec!["clang".to_string(), "llvm-cov".to_string()]
+        );
+        assert_eq!(
+            merge_job_required_tools(vec!["clang".to_string()], &config_tools, false),
+            vec!["clang".to_string()]
+        );
+    }
+
+    #[test]
+    fn admit_human_capabilities_include_nix_go_node_and_os() {
+        use rch_common::admit_preflight::RequiredCapabilities;
+        let req = RequiredCapabilities {
+            needs_cargo: true,
+            needs_zig: true,
+            needs_bun: true,
+            needs_nix: true,
+            needs_go: true,
+            needs_node: true,
+            needs_os: Some("darwin".to_string()),
+            needs_targets: vec!["aarch64-apple-darwin".to_string()],
+            needs_toolchains: vec!["nightly".to_string()],
+            needs_tools: vec!["clang".to_string()],
+        };
+        assert_eq!(
+            format_admit_required_capabilities(&req),
+            vec![
+                "cargo",
+                "zig",
+                "bun",
+                "nix",
+                "go",
+                "node",
+                "os:darwin",
+                "target:aarch64-apple-darwin",
+                "toolchain:nightly",
+                "tool:clang",
+            ]
+        );
     }
 }
