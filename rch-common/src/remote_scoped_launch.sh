@@ -105,6 +105,23 @@ rch_scope_launch_deadline_marker() {
         >/dev/null 2>&1 </dev/null
 }
 
+# A terminal refusal must not retain the supervisor's inherited source/activity
+# descriptors indefinitely because its diagnostic consumer stopped reading.
+# Only this literal printf writer is timed out: --foreground targets that one
+# child, never the workload group or the caller. It creates no descendants.
+# Suppress timeout's own diagnostics too; otherwise the failure path can block
+# on the same pipe again. Callers keep their original terminal status even if
+# delivery fails. No receipt, claim, or cleanup verdict is changed here.
+rch_scope_launch_message() (
+    timeout --foreground --signal=KILL 1s /bin/sh -c '
+        case "$2" in
+            line) printf "%s\n" "$1";;
+            setup) printf "\n%s_IDENTITY_UNAVAILABLE\n" "$1";;
+            *) exit 125;;
+        esac
+    ' rch-launch-message "$1" "${2:-line}" </dev/null
+) 2>/dev/null
+
 # Policy selects the required authority class. Never accept a V1 downgrade of
 # a requested scope, or silently assume that an ordinary group has V2 rights.
 rch_scope_launch_binding_matches() {
@@ -250,31 +267,31 @@ rch_scope_launch_supervise() {
     # Outer durable execution/source grants remain required: an older writer
     # that ignores this directory does not participate in its arbitration.
     if [ -e "$__sl_record" ] || [ -L "$__sl_record" ]; then
-        printf '%s\n' RCH_SCOPED_LAUNCH_ALREADY_OWNED >&2
+        rch_scope_launch_message RCH_SCOPED_LAUNCH_ALREADY_OWNED >&2
         return 255
     fi
     __sl_control="$__sl_record.supervisor.v1"
-    (umask 077; mkdir -m 700 -- "$__sl_control") || {
+    (umask 077; mkdir -m 700 -- "$__sl_control") 2>/dev/null || {
         # Only an existing claim means another launch owns this record. Any
         # other failure (missing parent, EDQUOT, ENOSPC) claimed and started
         # nothing: report the pre-workload refusal the caller may retry.
         if [ -e "$__sl_control" ] || [ -L "$__sl_control" ]; then
-            printf '%s\n' RCH_SCOPED_LAUNCH_ALREADY_OWNED >&2
+            rch_scope_launch_message RCH_SCOPED_LAUNCH_ALREADY_OWNED >&2
             return 255
         fi
-        printf '\n%s_IDENTITY_UNAVAILABLE\n' "$__sl_marker" >&2
+        rch_scope_launch_message "$__sl_marker" setup >&2
         return 125
     }
     # Recheck after acquisition for an older launcher which has no claim.
     # Do not remove/adopt either its record or this invocation's new fence.
     if [ -e "$__sl_record" ] || [ -L "$__sl_record" ]; then
-        printf '%s\n' RCH_SCOPED_LAUNCH_ALREADY_OWNED >&2
+        rch_scope_launch_message RCH_SCOPED_LAUNCH_ALREADY_OWNED >&2
         return 255
     fi
     # Claim before policy selection: a policy changed since an earlier run
     # must not turn its duplicate into a pre-workload fallback permission.
     rch_scope_launch_select || {
-        printf '\n%s_IDENTITY_UNAVAILABLE\n' "$__sl_marker" >&2
+        rch_scope_launch_message "$__sl_marker" setup >&2
         return 125
     }
     rch_scope_uint "$__sl_limit" && [ "${#__sl_limit}" -le 10 ] &&
@@ -288,7 +305,7 @@ rch_scope_launch_supervise() {
     __sl_cancelled=0
     trap '__sl_cancelled=1' HUP INT TERM
     rch_scope_launch_save_input || {
-        printf '\n%s_IDENTITY_UNAVAILABLE\n' "$__sl_marker" >&2
+        rch_scope_launch_message "$__sl_marker" setup >&2
         return 125
     }
     # Arguments and the literal source expand as QUOTED argument values inside
@@ -299,6 +316,23 @@ rch_scope_launch_child \"\$@\"" rch-scoped-child \
         "$$" "$__sl_parent_start" "$__sl_limit" \
         "$rch_launch_nice" "$rch_launch_slice" "$rch_launch_manager" "$@" '"$__sl_input_redirect"' &'
     __sl_child=$!
+    # Bash can print asynchronous "Killed" notices at ANY command boundary,
+    # not just wait. Once the child has inherited the real streams, keep the
+    # observer's own stderr quiet for the entire remaining lifecycle. Its
+    # otherwise-unused stdout carries only bounded refusal messages back to
+    # the original stderr. No inherited authority FD or payload stream changes.
+    # A deliberately closed stderr stays closed in the already-launched child.
+    if [ -L "/proc/$rch_self_pid/fd/2" ]; then
+        rch_scope_launch_finish 1>&2 2>/dev/null
+    else
+        rch_scope_launch_finish >/dev/null 2>&1
+    fi
+}
+
+# Same supervising shell and direct child: do not turn this into a subprocess,
+# which would break the child's parent-birth binding and cancellation traps.
+# stdout here is the original diagnostic stream, NOT the workload's stdout.
+rch_scope_launch_finish() {
     rch_scope_launch_close_input
     __sl_child_start=; __sl_admitted=0; __sl_admission_record=; __sl_reason=setup
     rch_scope_launch_clock || return 255
@@ -374,7 +408,7 @@ rch_scope_launch_child \"\$@\"" rch-scoped-child \
         fi
     fi
     if [ "$__sl_cleanup" != 0 ]; then
-        printf '%s\n' RCH_SCOPED_COMPLETION_UNCONFIRMED >&2
+        rch_scope_launch_message RCH_SCOPED_COMPLETION_UNCONFIRMED
         return 255
     fi
     if [ "$__sl_admitted" = 1 ]; then wait "$__sl_child"; __sl_wait=$?; fi
@@ -387,10 +421,10 @@ rch_scope_launch_child \"\$@\"" rch-scoped-child \
     [ "$__sl_cancelled" = 0 ] || return 143
     case "$__sl_reason" in
         result) return "$__sl_status";;
-        unknown) printf '%s\n' RCH_SCOPED_COMPLETION_UNCONFIRMED >&2; return 255;;
+        unknown) rch_scope_launch_message RCH_SCOPED_COMPLETION_UNCONFIRMED; return 255;;
         exited)
             if [ "$__sl_admitted" = 1 ]; then return "$__sl_wait"; fi;;
     esac
-    printf '\n%s_IDENTITY_UNAVAILABLE\n' "$__sl_marker" >&2
+    rch_scope_launch_message "$__sl_marker" setup
     return 125
 }
