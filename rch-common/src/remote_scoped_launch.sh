@@ -241,6 +241,35 @@ rch_scope_launch_stop_setup() {
 rch_scope_launch_supervise() {
     __sl_record=$1; __sl_limit=$2; __sl_marker=$3; __sl_build=$4; shift 4
     case "$__sl_record" in /*) ;; *) return 125;; esac
+    # The record names ONE admitted execution, not permission to launch it
+    # again. Keep the control directory as a one-shot claim, even if a lost
+    # caller never reached record publication or the record is later retired.
+    # mkdir is the atomic arbiter for simultaneous supervisors; a randomized
+    # control directory admitted both and let the second overwrite the record.
+    # Existing legacy records also refuse before any child or mutation starts.
+    # Outer durable execution/source grants remain required: an older writer
+    # that ignores this directory does not participate in its arbitration.
+    if [ -e "$__sl_record" ] || [ -L "$__sl_record" ]; then
+        printf '%s\n' RCH_SCOPED_LAUNCH_ALREADY_OWNED >&2
+        return 255
+    fi
+    __sl_control="$__sl_record.supervisor.v1"
+    (umask 077; mkdir -m 700 -- "$__sl_control") || {
+        printf '%s\n' RCH_SCOPED_LAUNCH_ALREADY_OWNED >&2
+        return 255
+    }
+    # Recheck after acquisition for an older launcher which has no claim.
+    # Do not remove/adopt either its record or this invocation's new fence.
+    if [ -e "$__sl_record" ] || [ -L "$__sl_record" ]; then
+        printf '%s\n' RCH_SCOPED_LAUNCH_ALREADY_OWNED >&2
+        return 255
+    fi
+    # Claim before policy selection: a policy changed since an earlier run
+    # must not turn its duplicate into a pre-workload fallback permission.
+    rch_scope_launch_select || {
+        printf '\n%s_IDENTITY_UNAVAILABLE\n' "$__sl_marker" >&2
+        return 125
+    }
     rch_scope_uint "$__sl_limit" && [ "${#__sl_limit}" -le 10 ] &&
         [ "$__sl_limit" -le 2147483647 ] || return 125
     [ "$#" -gt 0 ] && rch_check_procfs_namespace && command -v setsid >/dev/null 2>&1 || return 125
@@ -249,7 +278,6 @@ rch_scope_launch_supervise() {
     rch_scope_launch_process "$$" || return 125
     __sl_parent_start=$rch_launch_birth
     __sl_uid=$(id -u) || return 125
-    __sl_control=$(umask 077; mktemp -d "$__sl_record.supervisor.XXXXXXXX") || return 125
     __sl_cancelled=0
     trap '__sl_cancelled=1' HUP INT TERM
     rch_scope_launch_save_input || {
