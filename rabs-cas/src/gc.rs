@@ -5,7 +5,11 @@
 //! (H010's `gc_snapshot` — pinned roots + reachability closure + located
 //! objects, taken in a single store transaction) and refuses to touch:
 //!
-//! - pinned or pin-reachable objects (valid pins are law);
+//! - pinned or pin-reachable objects (every `released = 0` pin is a GC
+//!   root in `gc_snapshot`; expired leases stop protecting only after
+//!   [`crate::pin_leases::release_expired_pin_scoped`] confirms
+//!   reconciliation + grace under active coordinator authority and sets
+//!   `released = 1`);
 //! - anything an ACTIVE build, materialization, transfer, or open reader
 //!   is using (live protections supplied by the runtime);
 //! - authoritative evidence classes — publication roots and quarantine

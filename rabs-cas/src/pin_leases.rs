@@ -17,6 +17,13 @@
 //!   protecting until reconciliation has confirmed the expiry AND a
 //!   grace window has elapsed past it. Restart, partition, or clock
 //!   uncertainty therefore never turns "unresolved" into "deleted".
+//! - GC RECLAMATION IS TWO-STEP (`bd-2d0j0`): `gc_snapshot` protects
+//!   every row with `released = 0` so a raw sequence comparison inside
+//!   the snapshot query can never bypass reconciliation confirmation or
+//!   grace windows. [`PinProtection::Expired`] is the eligibility
+//!   verdict that authorizes [`release_expired_pin_scoped`] (under the
+//!   active [`CoordinatorAuthority`]) to transition `released = 1`,
+//!   which then removes the root from `gc_snapshot`.
 
 use crate::metadata_store::{RabsMetadataStore, StoreError};
 use rabs_protocol::result_identity::TypedDigest;
@@ -85,6 +92,7 @@ pub fn release_pin_scoped(
         }
         Releaser::Coordinator(authority) => {
             let presented: TypedDigest = authority_digest(authority);
+            store.intern_domain(presented.domain);
             match store.active_authority()? {
                 Some(active) if active.digest == presented => {
                     store.release_pin(pin_id, &row.owner)?;
@@ -105,8 +113,29 @@ pub enum PinProtection {
     /// the grace window has not elapsed: STILL protecting.
     GraceProtecting,
     /// Released, or expiry confirmed by reconciliation with grace
-    /// elapsed: no longer protecting.
+    /// elapsed: eligible for coordinator lease retirement via
+    /// [`release_expired_pin_scoped`].
     Expired,
+}
+
+/// Outcome of an authority-fenced expired-lease retirement
+/// ([`release_expired_pin_scoped`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExpiredReleaseOutcome {
+    /// Expired lease confirmed past grace and retired (`released = 1`).
+    Released,
+    /// Pin was already released: idempotent no-op.
+    AlreadyReleased,
+    /// No such pin.
+    UnknownPin,
+    /// Pin is a publication root (`action-publication`), which carries no
+    /// lease and can never be retired via lease expiry.
+    RefusedPublicationRoot,
+    /// Pin is still protecting (`Protecting` or `GraceProtecting`) under
+    /// H041 fail-toward-retention.
+    StillProtecting(PinProtection),
+    /// Coordinator attempted retirement without presenting the active authority.
+    RefusedNotActiveAuthority,
 }
 
 /// Judge one pin's protection at `now_seq`. `reconciliation_confirmed`
@@ -117,7 +146,12 @@ pub enum PinProtection {
 /// The asymmetry IS the specification: every uncertain branch lands on
 /// a protecting variant (restart, partition, missing reconciliation,
 /// in-grace), and only released or confirmed-and-grace-elapsed pins
-/// stop protecting.
+/// reach [`PinProtection::Expired`].
+///
+/// Note that `gc_snapshot` protects every row with `released = 0`; call
+/// [`release_expired_pin_scoped`] under the active [`CoordinatorAuthority`]
+/// to retire a [`PinProtection::Expired`] lease so GC can reclaim its
+/// closure (`bd-2d0j0`).
 ///
 /// # Errors
 /// Store errors from the pin lookup; an unknown pin is `Ok(None)`.
@@ -148,6 +182,54 @@ pub fn pin_protection(
         return Ok(Some(PinProtection::GraceProtecting));
     }
     Ok(Some(PinProtection::Expired))
+}
+
+/// Retire an expired pin lease (`released = 1`) so `gc_snapshot` stops
+/// treating it as a root, ONLY after [`pin_protection`] reaches
+/// [`PinProtection::Expired`] (expiry + confirmed reconciliation +
+/// elapsed grace window) and under the active [`CoordinatorAuthority`].
+///
+/// # Errors
+/// Store errors from the underlying reads/writes.
+pub fn release_expired_pin_scoped(
+    store: &mut dyn RabsMetadataStore,
+    pin_id: u128,
+    authority: &CoordinatorAuthority,
+    now_seq: u64,
+    reconciliation_confirmed: bool,
+    grace_windows: u64,
+) -> Result<ExpiredReleaseOutcome, StoreError> {
+    let Some(row) = store.pin_row(pin_id)? else {
+        return Ok(ExpiredReleaseOutcome::UnknownPin);
+    };
+    if row.released {
+        return Ok(ExpiredReleaseOutcome::AlreadyReleased);
+    }
+    if row.class == PUBLICATION_PIN_CLASS {
+        return Ok(ExpiredReleaseOutcome::RefusedPublicationRoot);
+    }
+    let protection = pin_protection(
+        store,
+        pin_id,
+        now_seq,
+        reconciliation_confirmed,
+        grace_windows,
+    )?
+    .ok_or(StoreError::UnknownPin)?;
+    if protection != PinProtection::Expired {
+        return Ok(ExpiredReleaseOutcome::StillProtecting(protection));
+    }
+    match release_pin_scoped(store, pin_id, &Releaser::Coordinator(authority.clone()))? {
+        ReleaseOutcome::Released => Ok(ExpiredReleaseOutcome::Released),
+        ReleaseOutcome::AlreadyReleased => Ok(ExpiredReleaseOutcome::AlreadyReleased),
+        ReleaseOutcome::UnknownPin => Ok(ExpiredReleaseOutcome::UnknownPin),
+        ReleaseOutcome::RefusedNotActiveAuthority => {
+            Ok(ExpiredReleaseOutcome::RefusedNotActiveAuthority)
+        }
+        ReleaseOutcome::RefusedWorkerOnPublicationRoot | ReleaseOutcome::RefusedNotOwner => {
+            unreachable!("coordinator release cannot return worker refusal")
+        }
+    }
 }
 
 #[cfg(test)]

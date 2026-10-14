@@ -25,8 +25,8 @@ use rabs_cas::metadata_store::{
     AuthorityRow, RabsMetadataStore, RusqliteEngine, SqlEngine, SqlMetadataStore, digest_key,
 };
 use rabs_cas::pin_leases::{
-    PUBLICATION_PIN_CLASS, PinProtection, ReleaseOutcome, Releaser, pin_protection,
-    release_pin_scoped,
+    ExpiredReleaseOutcome, PUBLICATION_PIN_CLASS, PinProtection, ReleaseOutcome, Releaser,
+    pin_protection, release_expired_pin_scoped, release_pin_scoped,
 };
 use rabs_cas::publication::authority_digest;
 use rabs_protocol::authority::{ClusterId, CoordinatorAuthority, CoordinatorIncarnationId};
@@ -249,23 +249,16 @@ fn t049_duplicate_release_is_idempotent_all_the_way_into_gc() {
 
 #[test]
 fn t049_gc_protects_by_release_state_alone_not_by_lease_expiry() {
-    // A DOCUMENTED DIVERGENCE, not a wish: `pin_protection` and
-    // `gc_snapshot` are different code answering related questions, and
-    // they do not agree at one end.
-    //
-    // `gc_snapshot` selects `pins WHERE released = 0`. It never reads
-    // `expires_at_seq`. So a lease that `pin_protection` has fully
-    // retired — expired, reconciliation confirmed, grace elapsed — is
-    // STILL a GC root.
-    //
-    // The direction is the safe one: GC retains more than the lease rule
-    // strictly requires, and T049's "GC honors all of it" is a retention
-    // claim, which holds. But it also means lease EXPIRY alone never
-    // frees anything; only a release does. Pinning that here so the next
-    // person reads it as a property rather than discovering it while
-    // wondering why disk never comes back (filed as its own bead).
+    // Two-step reclamation contract (bd-2d0j0):
+    // 1. `gc_snapshot` selects `pins WHERE released = 0` so a raw
+    //    sequence comparison can never bypass reconciliation
+    //    confirmation or grace windows.
+    // 2. `PinProtection::Expired` authorizes `release_expired_pin_scoped`
+    //    (under the active CoordinatorAuthority) to retire the expired
+    //    lease (`released = 1`), removing it from `gc_snapshot`.
     let mut store = fresh();
     let root = digest_key(&digest(3));
+    let active = authority(ACTIVE_TERM);
     let fully_expired = EXPIRES_AT + GRACE + 1;
     assert_eq!(
         protection(&mut store, fully_expired, true),
@@ -278,14 +271,32 @@ fn t049_gc_protects_by_release_state_alone_not_by_lease_expiry() {
             .expect("snapshot")
             .pinned_roots
             .contains(&root),
-        "GC still protects an expired-but-unreleased pin: expiry alone frees nothing"
+        "GC still protects an expired-but-unreleased pin until release_expired_pin_scoped retires it"
     );
 
-    // Releasing it is what actually hands the root to GC.
+    // Unconfirmed reconciliation or in-grace sequence refuses retirement.
     assert_eq!(
-        release_pin_scoped(&mut store, 3, &Releaser::Worker("worker-a".to_owned()))
-            .expect("release"),
-        ReleaseOutcome::Released
+        release_expired_pin_scoped(&mut store, 3, &active, fully_expired, false, GRACE)
+            .expect("unconfirmed retirement"),
+        ExpiredReleaseOutcome::StillProtecting(PinProtection::GraceProtecting)
+    );
+    assert_eq!(
+        release_expired_pin_scoped(&mut store, 3, &active, EXPIRES_AT + GRACE, true, GRACE)
+            .expect("in-grace retirement"),
+        ExpiredReleaseOutcome::StillProtecting(PinProtection::GraceProtecting)
+    );
+    assert_eq!(
+        release_expired_pin_scoped(&mut store, 1, &active, fully_expired, true, GRACE)
+            .expect("publication root retirement"),
+        ExpiredReleaseOutcome::RefusedPublicationRoot
+    );
+
+    // Confirmed + grace-elapsed retirement under active authority transitions
+    // `released = 1` and removes the root from `gc_snapshot`.
+    assert_eq!(
+        release_expired_pin_scoped(&mut store, 3, &active, fully_expired, true, GRACE)
+            .expect("retire expired pin"),
+        ExpiredReleaseOutcome::Released
     );
     assert!(
         !store
