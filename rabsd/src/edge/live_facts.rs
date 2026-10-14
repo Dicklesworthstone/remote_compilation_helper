@@ -182,18 +182,145 @@ fn digest_stable_at(path: &Path, before: FileSig) -> std::io::Result<(FileSig, T
     Ok((before, digest))
 }
 
-/// A probed toolchain plus the identity of every file its digests cover.
+/// Files and directory generations observed BEFORE running either probe.
+/// Unlike Cargo output directories, a toolchain must not change while an
+/// action uses it. Retaining only positive files misses newly installed
+/// libraries, newly populated target directories and transient membership.
+#[derive(Debug)]
+struct ToolchainInputs {
+    compiler: (PathBuf, FileSig),
+    runtime_libraries: Vec<(PathBuf, FileSig)>,
+    sysroot_files: Vec<(PathBuf, FileSig)>,
+    directories: Vec<(PathBuf, FileSig)>,
+}
+
+impl ToolchainInputs {
+    fn record_directory(&mut self, path: &Path) -> Result<(), String> {
+        let meta = std::fs::symlink_metadata(path)
+            .map_err(|error| format!("toolchain directory {}: {error}", path.display()))?;
+        if !meta.is_dir() {
+            return Err(format!(
+                "toolchain directory is not a real directory: {}",
+                path.display()
+            ));
+        }
+        self.directories.push((path.to_path_buf(), FileSig::of(&meta)));
+        Ok(())
+    }
+
+    fn still_current(&self) -> bool {
+        let directories_current = || {
+            self.directories.iter().all(|(path, sig)| {
+                std::fs::symlink_metadata(path)
+                    .is_ok_and(|meta| meta.is_dir() && FileSig::of(&meta) == *sig)
+            })
+        };
+        directories_current()
+            && std::iter::once(&self.compiler)
+                .chain(&self.runtime_libraries)
+                .chain(&self.sysroot_files)
+                .all(|(path, sig)| lstat_regular(path).is_ok_and(|now| now == *sig))
+            && directories_current()
+    }
+}
+
+/// Enumeration errors are unknown input closure, never an absent member.
+fn toolchain_entries(directory: &Path) -> Result<Vec<PathBuf>, String> {
+    let entries = std::fs::read_dir(directory)
+        .map_err(|error| format!("read {}: {error}", directory.display()))?;
+    let mut paths = entries
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<std::io::Result<Vec<_>>>()
+        .map_err(|error| format!("enumerate {}: {error}", directory.display()))?;
+    paths.sort();
+    Ok(paths)
+}
+
+fn observe_toolchain_inputs(compiler: &Path, sysroot: &Path) -> Result<ToolchainInputs, String> {
+    let compiler_sig = lstat_regular(compiler).map_err(|error| format!("compiler: {error}"))?;
+    let mut inputs = ToolchainInputs {
+        compiler: (compiler.to_path_buf(), compiler_sig),
+        runtime_libraries: Vec::new(),
+        sysroot_files: Vec::new(),
+        directories: Vec::new(),
+    };
+    let lib = sysroot.join("lib");
+    let rustlib = lib.join("rustlib");
+    for root in [
+        sysroot.to_path_buf(),
+        sysroot.join("bin"),
+        lib.clone(),
+        rustlib.clone(),
+    ] {
+        inputs.record_directory(&root)?;
+    }
+    // Preserve the existing Linux runtime-library selection and key order.
+    // A selected symlink or unreadable file can no longer disappear from
+    // the closure just because lstat_regular failed.
+    for path in toolchain_entries(&lib)? {
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or("non-UTF-8 toolchain runtime entry")?;
+        if name.contains(".so") {
+            let sig = lstat_regular(&path)
+                .map_err(|error| format!("toolchain runtime {name}: {error}"))?;
+            inputs.runtime_libraries.push((path, sig));
+        }
+    }
+    let mut pending = Vec::new();
+    for target in toolchain_entries(&rustlib)? {
+        let meta = std::fs::symlink_metadata(&target)
+            .map_err(|error| format!("toolchain target {}: {error}", target.display()))?;
+        if meta.is_file() {
+            // rustup's installer/component records are not target libraries.
+            // The containing directory still binds their membership changes.
+            continue;
+        }
+        inputs.record_directory(&target)?;
+        let target_lib = target.join("lib");
+        match std::fs::symlink_metadata(&target_lib) {
+            Ok(meta) if meta.is_dir() => pending.push(target_lib),
+            // Keep the target parent even when lib/ does not yet exist. A
+            // later target install must invalidate the warm toolchain memo.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(_) => return Err("toolchain target library root is not a real directory".into()),
+            Err(error) => return Err(format!("toolchain target library root: {error}")),
+        }
+    }
+    while let Some(directory) = pending.pop() {
+        inputs.record_directory(&directory)?;
+        for path in toolchain_entries(&directory)? {
+            let meta = std::fs::symlink_metadata(&path)
+                .map_err(|error| format!("toolchain input {}: {error}", path.display()))?;
+            if meta.is_dir() {
+                pending.push(path);
+            } else if meta.is_file() {
+                inputs.sysroot_files.push((path, FileSig::of(&meta)));
+            } else {
+                // No silent omission of a library or directory link. Linked
+                // toolchains need a separately closed link/target profile.
+                return Err(format!("non-regular toolchain input: {}", path.display()));
+            }
+        }
+    }
+    inputs.sysroot_files.sort_by(|a, b| a.0.cmp(&b.0));
+    if !inputs.still_current() {
+        return Err("toolchain inputs changed during enumeration".into());
+    }
+    Ok(inputs)
+}
+
+/// A probed toolchain plus its complete observed file/directory closure.
 #[derive(Debug)]
 struct ProbedToolchain {
     facts: ToolchainFacts,
-    covered: Vec<(PathBuf, FileSig)>,
+    inputs: ToolchainInputs,
 }
 
 impl ProbedToolchain {
     fn still_current(&self) -> bool {
-        self.covered
-            .iter()
-            .all(|(path, sig)| lstat_regular(path).is_ok_and(|now| now == *sig))
+        self.inputs.still_current()
     }
 }
 
@@ -808,6 +935,9 @@ fn probe_toolchain(compiler: &Path, env: &[(String, String)]) -> Result<ProbedTo
         return Err("compiler is not <sysroot>/bin/rustc".into());
     }
     let sysroot = bin.parent().ok_or("compiler has no sysroot")?;
+    // Probe output, binary bytes and library facts must belong to this one
+    // observed generation, not successive stages of a toolchain update.
+    let inputs = observe_toolchain_inputs(compiler, sysroot)?;
     let run = |args: &[&str]| -> Result<String, String> {
         let output = std::process::Command::new(compiler)
             .args(args)
@@ -829,60 +959,28 @@ fn probe_toolchain(compiler: &Path, env: &[(String, String)]) -> Result<ProbedTo
         );
     }
 
-    let mut covered = Vec::new();
-    let (compiler_sig, compiler_binary_digest) =
-        digest_stable(compiler).map_err(|error| format!("hash compiler: {error}"))?;
-    covered.push((compiler.to_path_buf(), compiler_sig));
-
-    let lib = sysroot.join("lib");
+    let (_, compiler_binary_digest) = digest_stable_at(compiler, inputs.compiler.1)
+        .map_err(|error| format!("hash compiler: {error}"))?;
     let mut runtime = Vec::new();
-    let mut entries: Vec<PathBuf> = std::fs::read_dir(&lib)
-        .map_err(|error| format!("read {}: {error}", lib.display()))?
-        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-        .collect();
-    entries.sort();
-    for path in entries {
-        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        if !name.contains(".so") || lstat_regular(&path).is_err() {
-            continue;
-        }
-        let (sig, digest) =
-            digest_stable(&path).map_err(|error| format!("hash {name}: {error}"))?;
-        covered.push((path.clone(), sig));
+    for (path, expected) in &inputs.runtime_libraries {
+        let (_, digest) = digest_stable_at(path, *expected)
+            .map_err(|error| format!("hash runtime {}: {error}", path.display()))?;
         runtime.push(digest);
     }
 
     // Every file below lib/rustlib/<target>/lib: std and friends, which a
     // compile links metadata and inlinable code from.
-    let rustlib = lib.join("rustlib");
     let mut tree = Vec::new();
-    let mut targets: Vec<PathBuf> = std::fs::read_dir(&rustlib)
-        .map_err(|error| format!("read {}: {error}", rustlib.display()))?
-        .filter_map(|entry| entry.ok().map(|entry| entry.path().join("lib")))
-        .filter(|path| path.is_dir())
-        .collect();
-    targets.sort();
-    while let Some(directory) = targets.pop() {
-        let entries = std::fs::read_dir(&directory)
-            .map_err(|error| format!("read {}: {error}", directory.display()))?;
-        for entry in entries {
-            let path = entry.map_err(|error| error.to_string())?.path();
-            let meta = std::fs::symlink_metadata(&path).map_err(|error| error.to_string())?;
-            if meta.is_dir() {
-                targets.push(path);
-            } else if meta.is_file() {
-                let (sig, digest) =
-                    digest_stable(&path).map_err(|error| format!("hash sysroot: {error}"))?;
-                let relative = path
-                    .strip_prefix(sysroot)
-                    .map_err(|_| "sysroot member escaped")?
-                    .to_str()
-                    .ok_or("non-UTF-8 sysroot member")?
-                    .to_owned();
-                covered.push((path, sig));
-                tree.push((relative, digest));
-            }
-        }
+    for (path, expected) in &inputs.sysroot_files {
+        let (_, digest) = digest_stable_at(path, *expected)
+            .map_err(|error| format!("hash sysroot: {error}"))?;
+        let relative = path
+            .strip_prefix(sysroot)
+            .map_err(|_| "sysroot member escaped")?
+            .to_str()
+            .ok_or("non-UTF-8 sysroot member")?
+            .to_owned();
+        tree.push((relative, digest));
     }
     tree.sort_by(|a, b| a.0.cmp(&b.0));
     let mut enc = CanonicalEncoder::new();
@@ -890,15 +988,19 @@ fn probe_toolchain(compiler: &Path, env: &[(String, String)]) -> Result<ProbedTo
     for (relative, digest) in &tree {
         enc.str(relative).str(digest.domain).bytes(&digest.bytes);
     }
-    Ok(ProbedToolchain {
+    let probed = ProbedToolchain {
         facts: ToolchainFacts {
             compiler_binary_digest,
             verbose_version,
             sysroot_root_digest: compute(DOMAIN_SYSROOT_TREE, &enc.finish()),
             runtime_libraries: runtime,
         },
-        covered,
-    })
+        inputs,
+    };
+    if !probed.still_current() {
+        return Err("toolchain inputs changed while it was probed".into());
+    }
+    Ok(probed)
 }
 
 /// The memoized observation state shared by every edge connection.
@@ -2553,6 +2655,213 @@ mod tests {
                 "Git capture must still refuse {excluded}"
             );
         }
+    }
+
+    // A scripted version/sysroot probe over real filesystem inputs. This
+    // exercises toolchain observation, not a real compiler or cache hit.
+    fn toolchain_fixture() -> (tempfile::TempDir, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        // Short paths also fit macOS's smaller Unix-domain socket address.
+        let dir = tempfile::Builder::new()
+            .prefix("rt-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let root = dir.path().join("toolchain");
+        for relative in [
+            "bin",
+            "lib/rustlib/test-host/lib/self-contained",
+            "lib/rustlib/future-target",
+        ] {
+            std::fs::create_dir_all(root.join(relative)).unwrap();
+        }
+        std::fs::write(root.join("lib/libdriver.so"), b"runtime-v1").unwrap();
+        std::fs::write(root.join("lib/rustlib/test-host/lib/libcore.rlib"), b"core-v1").unwrap();
+        std::fs::write(
+            root.join("lib/rustlib/test-host/lib/self-contained/crt.o"),
+            b"startup-v1",
+        )
+        .unwrap();
+        let compiler = root.join("bin/rustc");
+        std::fs::write(
+            &compiler,
+            br#"#!/bin/sh
+root=${0%/bin/rustc}
+if [ -n "${RABS_TEST_LOG:-}" ]; then
+    printf 'probe\n' >> "$RABS_TEST_LOG"
+fi
+case "$*" in
+    '-vV')
+        case "${RABS_TEST_MUTATE:-}" in
+            add) printf 'new\n' > "$root/lib/rustlib/test-host/lib/libinjected.rlib" ;;
+            change) printf 'runtime-v2' > "$root/lib/libdriver.so" ;;
+        esac
+        printf 'rustc fixture\nhost: x86_64-unknown-linux-gnu\n'
+        ;;
+    '--print sysroot') printf '%s\n' "$root" ;;
+    *) exit 64 ;;
+esac
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&compiler, std::fs::Permissions::from_mode(0o700)).unwrap();
+        (dir, compiler)
+    }
+
+    #[test]
+    fn complete_unchanged_toolchain_inputs_preserve_fact_identity() {
+        let (_dir, compiler) = toolchain_fixture();
+        let first = probe_toolchain(&compiler, &[]).unwrap();
+        assert!(first.still_current());
+        assert_eq!(first.inputs.runtime_libraries.len(), 1);
+        assert_eq!(first.inputs.sysroot_files.len(), 2);
+        assert_eq!(first.facts, probe_toolchain(&compiler, &[]).unwrap().facts);
+        assert!(first.still_current());
+    }
+
+    #[test]
+    fn added_toolchain_libraries_and_target_roots_invalidate_warm_facts() {
+        for relative in [
+            "lib/libanother.so",
+            "lib/rustlib/test-host/lib/libanother.rlib",
+            "lib/rustlib/test-host/lib/self-contained/another.o",
+            "lib/rustlib/new-target/lib/libcore.rlib",
+            "lib/rustlib/future-target/lib/libcore.rlib",
+        ] {
+            let (_dir, compiler) = toolchain_fixture();
+            let root = compiler.parent().unwrap().parent().unwrap();
+            let first = probe_toolchain(&compiler, &[]).unwrap();
+            let new = root.join(relative);
+            std::fs::create_dir_all(new.parent().unwrap()).unwrap();
+            std::fs::write(&new, b"new compiler input").unwrap();
+            // The old positive-file-only check accepts all of these: no
+            // previously hashed file has moved or changed its bytes.
+            assert!(
+                std::iter::once(&first.inputs.compiler)
+                    .chain(&first.inputs.runtime_libraries)
+                    .chain(&first.inputs.sysroot_files)
+                    .all(|(path, sig)| lstat_regular(path).unwrap() == *sig)
+            );
+            assert!(!first.still_current(), "missed new toolchain input {relative}");
+            let changed = probe_toolchain(&compiler, &[]).unwrap();
+            assert!(changed.still_current());
+            assert_ne!(first.facts, changed.facts, "new bytes must key {relative}");
+        }
+    }
+
+    #[test]
+    fn transient_toolchain_membership_invalidates_observation_not_canonical_bytes() {
+        let (dir, compiler) = toolchain_fixture();
+        let root = compiler.parent().unwrap().parent().unwrap();
+        let outside = dir.path().join("transient.rlib");
+        std::fs::write(&outside, b"temporary input").unwrap();
+        let first = probe_toolchain(&compiler, &[]).unwrap();
+        let inside = root.join("lib/rustlib/test-host/lib/libtransient.rlib");
+        std::fs::rename(&outside, &inside).unwrap();
+        std::fs::rename(&inside, &outside).unwrap();
+        assert!(!first.still_current());
+        // Directory generations are freshness evidence, NOT action-key
+        // fields. Re-observing the same complete bytes retains the same key.
+        let refreshed = probe_toolchain(&compiler, &[]).unwrap();
+        assert!(refreshed.still_current());
+        assert_eq!(first.facts, refreshed.facts);
+    }
+
+    #[test]
+    fn toolchain_root_links_cannot_reuse_the_same_positive_file_identities() {
+        for relative in [
+            "",
+            "lib",
+            "lib/rustlib/test-host/lib",
+            "lib/rustlib/test-host/lib/self-contained",
+        ] {
+            let (dir, compiler) = toolchain_fixture();
+            let root = compiler.parent().unwrap().parent().unwrap();
+            let first = probe_toolchain(&compiler, &[]).unwrap();
+            let selected = if relative.is_empty() {
+                root.to_path_buf()
+            } else {
+                root.join(relative)
+            };
+            let retained = dir.path().join("retained-directory");
+            std::fs::rename(&selected, &retained).unwrap();
+            std::os::unix::fs::symlink(&retained, &selected).unwrap();
+            assert!(
+                std::iter::once(&first.inputs.compiler)
+                    .chain(&first.inputs.runtime_libraries)
+                    .chain(&first.inputs.sysroot_files)
+                    .all(|(path, sig)| lstat_regular(path).unwrap() == *sig)
+            );
+            assert!(!first.still_current(), "linked directory {relative}");
+            assert!(probe_toolchain(&compiler, &[]).is_err());
+        }
+    }
+
+    #[test]
+    fn linked_toolchain_members_refuse_before_running_a_probe() {
+        for (relative, target) in [
+            ("lib/libalias.so", "libdriver.so"),
+            ("lib/rustlib/test-host/lib/libalias.rlib", "libcore.rlib"),
+            ("lib/rustlib/test-host/lib/nested", "self-contained"),
+            ("lib/rustlib/linked-target", "test-host"),
+            ("lib/rustlib/future-target/lib", "missing"),
+        ] {
+            let (dir, compiler) = toolchain_fixture();
+            let root = compiler.parent().unwrap().parent().unwrap();
+            std::os::unix::fs::symlink(target, root.join(relative)).unwrap();
+            let log = dir.path().join("probe.log");
+            let env = vec![("RABS_TEST_LOG".to_owned(), log.to_str().unwrap().to_owned())];
+            assert!(probe_toolchain(&compiler, &env).is_err(), "{relative}");
+            assert!(!log.exists(), "an incomplete inventory reached the probe");
+        }
+    }
+
+    #[test]
+    fn special_toolchain_library_members_are_not_silently_omitted() {
+        for relative in ["lib/libsocket.so", "lib/rustlib/test-host/lib/libsocket.rlib"] {
+            let (dir, compiler) = toolchain_fixture();
+            let root = compiler.parent().unwrap().parent().unwrap();
+            let _socket = std::os::unix::net::UnixListener::bind(root.join(relative)).unwrap();
+            let log = dir.path().join("probe.log");
+            let env = vec![("RABS_TEST_LOG".to_owned(), log.to_str().unwrap().to_owned())];
+            assert!(probe_toolchain(&compiler, &env).is_err());
+            assert!(!log.exists());
+        }
+    }
+
+    #[test]
+    fn a_probe_cannot_mix_version_output_with_changed_library_inputs() {
+        for mutation in ["add", "change"] {
+            let (dir, compiler) = toolchain_fixture();
+            let log = dir.path().join("probe.log");
+            let env = vec![
+                ("RABS_TEST_LOG".to_owned(), log.to_str().unwrap().to_owned()),
+                ("RABS_TEST_MUTATE".to_owned(), mutation.to_owned()),
+            ];
+            assert!(probe_toolchain(&compiler, &env).is_err(), "{mutation}");
+            assert_eq!(std::fs::read_to_string(&log).unwrap(), "probe\nprobe\n");
+            // A subsequent clean observation can accept the new generation.
+            assert!(probe_toolchain(&compiler, &[]).unwrap().still_current());
+        }
+    }
+
+    #[test]
+    fn public_toolchain_lookup_never_serves_stale_facts_when_rewarming_is_full() {
+        let (_dir, compiler) = toolchain_fixture();
+        let root = compiler.parent().unwrap().parent().unwrap();
+        let probed = probe_toolchain(&compiler, &[]).unwrap();
+        let expected = probed.facts.clone();
+        let facts = LiveFacts::new();
+        facts
+            .toolchains
+            .lock()
+            .unwrap()
+            .insert(compiler.clone(), Slot::Ready(Arc::new(probed)));
+        *facts.warming.lock().unwrap() = MAX_WARMING;
+        assert_eq!(facts.toolchain(&compiler, &[]).unwrap(), expected);
+        std::fs::write(root.join("lib/rustlib/test-host/lib/libnew.rlib"), b"new").unwrap();
+        assert_eq!(facts.toolchain(&compiler, &[]), Err(FactsMiss::Pending));
+        assert!(!facts.toolchains.lock().unwrap().contains_key(&compiler));
+        assert_eq!(*facts.warming.lock().unwrap(), MAX_WARMING);
     }
 
     #[test]
