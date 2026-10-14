@@ -11,6 +11,12 @@ use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 
+#[cfg(unix)]
+#[path = "publication_copy.rs"]
+mod publication_copy;
+#[cfg(unix)]
+use publication_copy::prepare_output_temporary;
+
 #[path = "recovery_completion.rs"]
 mod recovery_completion;
 #[path = "recovery_owner.rs"]
@@ -607,6 +613,7 @@ impl PreparedOutput {
 /// A failed pending checkpoint can leave this wrapper's unjournaled copy.
 /// Reuse only the exact staged bytes and permissions; never truncate a prior
 /// temporary file or discard a conflicting/partial copy to force a retry.
+#[cfg(not(unix))]
 fn prepare_output_temporary(
     source: &Path,
     temporary: &Path,
@@ -1862,6 +1869,9 @@ impl RecoverySession {
         self.verify_cargo_outputs(index)?;
         self.verify_native_outputs(index)?;
         let stage = self.stage(index);
+        #[cfg(unix)]
+        let mut files = publication_copy::staged_regular_files(&stage)?;
+        #[cfg(not(unix))]
         let mut files = regular_files(&stage)?;
         let phase = &self.recipe.phases[index];
         if let Some((relative, _)) = &phase.pending {
