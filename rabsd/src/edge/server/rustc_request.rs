@@ -41,9 +41,7 @@ use crate::coord::live_dependency::{
 use crate::edge::live_facts::{FactsMiss, LiveFacts};
 use rabs_cas::metadata_store::digest_key;
 use rabs_key::build_script_directives::bind_rustc_environment;
-use rabs_key::live_dependency::{
-    ExternFact, LiveRustcRequest, PlannedExtern, constructed_environment, live_dependency_key,
-};
+use rabs_key::live_dependency::{ExternFact, LiveRustcRequest, PlannedExtern, constructed_environment};
 use rabs_protocol::input_evidence::{
     ActionInputManifest, INPUT_EVIDENCE_SCHEMA_VERSION, InputFileType, PositiveInput,
 };
@@ -53,6 +51,8 @@ use serde_json::{Value, json};
 use std::path::Path;
 use std::sync::Arc;
 
+#[path = "build_script_reuse.rs"]
+mod build_script_reuse;
 #[path = "directory_source.rs"]
 mod directory_source;
 
@@ -67,6 +67,7 @@ const MAX_ENV: usize = 4096;
 pub struct LiveEdge {
     lane: LiveDependencyLane,
     facts: Arc<LiveFacts>,
+    reuse_empty_out_dir: bool,
 }
 
 impl LiveEdge {
@@ -76,6 +77,7 @@ impl LiveEdge {
         Self {
             lane,
             facts: LiveFacts::new(),
+            reuse_empty_out_dir: build_script_reuse::enabled(),
         }
     }
 }
@@ -399,13 +401,14 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
             }
         }
     }
-    let key = match live_dependency_key(
-        &plan,
+    let key = match build_script_reuse::key(
+        &mut plan,
         &toolchain,
         &externs,
         &dependencies.directories,
-        package.build_script_output.as_deref(),
+        &package,
         &inputs,
+        live.reuse_empty_out_dir,
     ) {
         Ok(key) => key,
         Err(refusal) => {
