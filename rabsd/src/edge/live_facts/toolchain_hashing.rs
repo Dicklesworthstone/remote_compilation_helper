@@ -6,6 +6,9 @@
 //! start first, but results retain the original canonical order. Hardlinked
 //! aliases share a read only while their complete observed identities agree.
 //! Every pathname is revalidated, including aliases that did not supply a read.
+//! Verified file generations survive toolchain re-warms in a bounded, process-
+//! local digest memo. This never supplies a toolchain observation or bypasses
+//! its directory checks. Scheduling counts only bytes that still need reading.
 
 use super::{FileSig, ToolchainInputs, digest_stable_at, lstat_regular};
 use rabs_protocol::result_identity::TypedDigest;
@@ -13,9 +16,48 @@ use std::collections::HashMap;
 use std::io;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{LazyLock, Mutex};
 
 const PARALLEL_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_TOOLCHAIN_DIGESTS: usize = 16_384;
 static HELPER_BUSY: AtomicBool = AtomicBool::new(false);
+static DIGESTS: LazyLock<DigestMemo> = LazyLock::new(DigestMemo::default);
+
+/// Advisory byte identities, never ready toolchain facts. A changed namespace
+/// still requires a new complete observation and new request guard. Nothing is
+/// persisted across process/reboot boundaries; no input payloads or paths stay.
+#[derive(Default)]
+struct DigestMemo {
+    entries: Mutex<HashMap<FileSig, TypedDigest>>,
+}
+
+impl DigestMemo {
+    fn get(&self, sig: &FileSig) -> Option<TypedDigest> {
+        self.entries.lock().ok()?.get(sig).cloned()
+    }
+
+    fn remember(&self, sig: FileSig, digest: &TypedDigest) -> io::Result<()> {
+        let Ok(mut entries) = self.entries.lock() else {
+            // Poisoned advisory state degrades to real verified reads. Do not
+            // adopt the poisoned contents or convert a valid read into failure.
+            return Ok(());
+        };
+        if let Some(previous) = entries.get(&sig) {
+            return if previous == digest {
+                Ok(())
+            } else {
+                Err(io::Error::other(
+                    "conflicting digests for one toolchain file generation",
+                ))
+            };
+        }
+        if entries.len() >= MAX_TOOLCHAIN_DIGESTS {
+            entries.clear();
+        }
+        entries.insert(sig, digest.clone());
+        Ok(())
+    }
+}
 
 /// This is an execution-capacity permit, not an input or serving witness.
 struct HelperPermit<'a>(&'a AtomicBool);
@@ -46,7 +88,7 @@ pub(super) fn hash(inputs: &ToolchainInputs) -> Result<ToolchainDigests, String>
         .chain(&inputs.sysroot_files)
         .map(|(path, sig)| (path.as_path(), *sig))
         .collect();
-    let mut digests = hash_files(&files, &HELPER_BUSY, |path, sig| {
+    let mut digests = hash_files(&files, &HELPER_BUSY, &DIGESTS, |path, sig| {
         digest_stable_at(path, sig).map(|(_, digest)| digest)
     })
     .map_err(|error| format!("hash toolchain: {error}"))?;
@@ -77,6 +119,7 @@ fn verify_files(files: &[(&Path, FileSig)]) -> io::Result<()> {
 fn hash_files(
     files: &[(&Path, FileSig)],
     helper_busy: &AtomicBool,
+    memo: &DigestMemo,
     hash: impl Fn(&Path, FileSig) -> io::Result<TypedDigest> + Sync,
 ) -> io::Result<Vec<TypedDigest>> {
     verify_files(files)?;
@@ -91,17 +134,49 @@ fn hash_files(
         });
         positions.push(index);
     }
-    let total = jobs
+    let mut digests: Vec<_> = jobs.iter().map(|(_, sig)| memo.get(sig)).collect();
+    let cold_positions: Vec<_> = digests
+        .iter()
+        .enumerate()
+        .filter_map(|(index, digest)| digest.is_none().then_some(index))
+        .collect();
+    let cold_jobs: Vec<_> = cold_positions.iter().map(|&index| jobs[index]).collect();
+    let total = cold_jobs
         .iter()
         .fold(0_u64, |sum, (_, sig)| sum.saturating_add(sig.size()));
-    let digests = hash_jobs(&jobs, helper_busy, total >= PARALLEL_BYTES, &hash)?;
+    let cold = hash_jobs(
+        &cold_jobs,
+        helper_busy,
+        total >= PARALLEL_BYTES,
+        &|path, sig| {
+            verify_files(&[(path, sig)])?;
+            // Another warm may have finished this file since planning. Neither
+            // lookup nor insertion holds a mutex over an actual filesystem read.
+            if let Some(digest) = memo.get(&sig) {
+                return Ok(digest);
+            }
+            let digest = hash(path, sig)?;
+            verify_files(&[(path, sig)])?;
+            // Keep individually verified work even if a later file fails. A partial
+            // batch cannot produce ToolchainFacts, but retry need not reread it all.
+            memo.remember(sig, &digest)?;
+            Ok(digest)
+        },
+    )?;
+    for (index, digest) in cold_positions.into_iter().zip(cold) {
+        digests[index] = Some(digest);
+    }
     // Coalescing must not hide a replaced or retargeted alias. Directory
     // generations are additionally checked by the owning ToolchainInputs.
     verify_files(files)?;
-    Ok(positions
+    positions
         .into_iter()
-        .map(|index| digests[index].clone())
-        .collect())
+        .map(|index| {
+            digests[index]
+                .clone()
+                .ok_or_else(|| io::Error::other("incomplete toolchain digest inventory"))
+        })
+        .collect()
 }
 
 fn hash_jobs(
@@ -292,23 +367,33 @@ mod tests {
         paths.push(alias.clone());
         let files = observed(&paths);
         let calls = AtomicUsize::new(0);
-        let actual = hash_files(&files, &AtomicBool::new(false), |path, sig| {
-            calls.fetch_add(1, Ordering::Relaxed);
-            digest(path, sig)
-        })
+        let actual = hash_files(
+            &files,
+            &AtomicBool::new(false),
+            &DigestMemo::default(),
+            |path, sig| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                digest(path, sig)
+            },
+        )
         .unwrap();
         assert_eq!(calls.load(Ordering::Relaxed), 3);
         assert_eq!(actual[0], actual[3]);
         // Replace just the alias during another read: a coalesced path is
         // still mandatory evidence even though it did not supply any bytes.
-        let result = hash_files(&files, &AtomicBool::new(false), |path, sig| {
-            let result = digest(path, sig);
-            if path == paths[2].as_path() {
-                std::fs::rename(&alias, dir.path().join("retained-alias")).unwrap();
-                std::fs::write(&alias, b"other").unwrap();
-            }
-            result
-        });
+        let result = hash_files(
+            &files,
+            &AtomicBool::new(false),
+            &DigestMemo::default(),
+            |path, sig| {
+                let result = digest(path, sig);
+                if path == paths[2].as_path() {
+                    std::fs::rename(&alias, dir.path().join("retained-alias")).unwrap();
+                    std::fs::write(&alias, b"other").unwrap();
+                }
+                result
+            },
+        );
         assert!(result.is_err());
     }
 
@@ -320,10 +405,15 @@ mod tests {
         std::os::unix::fs::symlink(dir.path().join("retained-small"), &paths[0]).unwrap();
         let calls = AtomicUsize::new(0);
         assert!(
-            hash_files(&files, &AtomicBool::new(false), |path, sig| {
-                calls.fetch_add(1, Ordering::Relaxed);
-                digest(path, sig)
-            })
+            hash_files(
+                &files,
+                &AtomicBool::new(false),
+                &DigestMemo::default(),
+                |path, sig| {
+                    calls.fetch_add(1, Ordering::Relaxed);
+                    digest(path, sig)
+                },
+            )
             .is_err()
         );
         assert_eq!(calls.load(Ordering::Relaxed), 0);
@@ -368,6 +458,221 @@ mod tests {
                 digest(files[1].0, files[1].1).unwrap(),
             ]
         );
+    }
+
+    #[test]
+    fn unchanged_files_are_not_reread_when_one_toolchain_member_changes() {
+        let (_dir, paths) = fixture();
+        let memo = DigestMemo::default();
+        let busy = AtomicBool::new(false);
+        let first = hash_files(&observed(&paths), &busy, &memo, digest).unwrap();
+        let warm = hash_files(&observed(&paths), &busy, &memo, |_, _| {
+            Err(io::Error::other("a warm file must not be reread"))
+        })
+        .unwrap();
+        assert_eq!(warm, first);
+        // An in-place, same-length edit is a new file generation, not a warm
+        // digest merely because its path and byte count are unchanged.
+        std::fs::write(&paths[0], b"other\0\xff").unwrap();
+        let reads = Mutex::new(Vec::new());
+        let changed = hash_files(&observed(&paths), &busy, &memo, |path, sig| {
+            assert!(memo.entries.try_lock().is_ok(), "hashing must not hold the memo lock");
+            reads.lock().unwrap().push(path.to_path_buf());
+            digest(path, sig)
+        })
+        .unwrap();
+        assert_eq!(*reads.lock().unwrap(), [paths[0].clone()]);
+        assert_ne!(changed[0], first[0]);
+        assert_eq!(changed[1..], first[1..]);
+    }
+
+    #[test]
+    fn a_large_warm_inventory_with_small_cold_files_uses_no_helper() {
+        let (_dir, paths) = fixture();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&paths[1])
+            .unwrap()
+            .set_len(PARALLEL_BYTES + 1)
+            .unwrap();
+        let files = observed(&paths);
+        let memo = DigestMemo::default();
+        let busy = AtomicBool::new(false);
+        hash_files(&files[1..2], &busy, &memo, digest).unwrap();
+        let owner = std::thread::current().id();
+        let reads = AtomicUsize::new(0);
+        let actual = hash_files(&files, &busy, &memo, |path, sig| {
+            assert_eq!(std::thread::current().id(), owner);
+            assert!(!busy.load(Ordering::Acquire));
+            assert_ne!(path, paths[1].as_path());
+            reads.fetch_add(1, Ordering::Relaxed);
+            digest(path, sig)
+        })
+        .unwrap();
+        assert_eq!(reads.load(Ordering::Relaxed), 2);
+        assert_eq!(actual[1], digest(files[1].0, files[1].1).unwrap());
+        // Entirely warm observations also succeed while another warm owns
+        // helper capacity, without releasing or waiting on that owner's permit.
+        let permit = HelperPermit::acquire(&busy).unwrap();
+        assert_eq!(
+            hash_files(&files, &busy, &memo, |_, _| {
+                Err(io::Error::other("warm bytes were scheduled for reading"))
+            })
+            .unwrap(),
+            actual
+        );
+        assert!(busy.load(Ordering::Acquire));
+        drop(permit);
+    }
+
+    #[test]
+    fn equal_byte_replacement_requires_a_new_read_and_cannot_reuse_old_observation() {
+        let (dir, paths) = fixture();
+        let before = observed(&paths);
+        let memo = DigestMemo::default();
+        let busy = AtomicBool::new(false);
+        let original = hash_files(&before, &busy, &memo, digest).unwrap();
+        let retained = dir.path().join("retained-original");
+        std::fs::rename(&paths[0], &retained).unwrap();
+        std::fs::copy(&retained, &paths[0]).unwrap();
+        let reads = AtomicUsize::new(0);
+        assert!(
+            hash_files(&before, &busy, &memo, |path, sig| {
+                reads.fetch_add(1, Ordering::Relaxed);
+                digest(path, sig)
+            })
+            .is_err()
+        );
+        assert_eq!(reads.load(Ordering::Relaxed), 0);
+        let refreshed = hash_files(&observed(&paths), &busy, &memo, |path, sig| {
+            assert_eq!(path, paths[0].as_path());
+            reads.fetch_add(1, Ordering::Relaxed);
+            digest(path, sig)
+        })
+        .unwrap();
+        assert_eq!(reads.load(Ordering::Relaxed), 1);
+        assert_eq!(refreshed, original);
+    }
+
+    #[test]
+    fn failed_batches_retain_only_individually_verified_work_for_retry() {
+        let (_dir, paths) = fixture();
+        let files = observed(&paths);
+        let memo = DigestMemo::default();
+        let busy = AtomicBool::new(false);
+        // This inventory is below the parallel threshold, so the empty file
+        // is deterministically last in the largest-first schedule.
+        let first = hash_files(&files, &busy, &memo, |path, sig| {
+            if path == paths[2].as_path() {
+                return Err(io::Error::other("last file unavailable"));
+            }
+            digest(path, sig)
+        });
+        assert!(first.is_err(), "partial work cannot authorize toolchain facts");
+        let retried = Mutex::new(Vec::new());
+        let complete = hash_files(&files, &busy, &memo, |path, sig| {
+            retried.lock().unwrap().push(path.to_path_buf());
+            digest(path, sig)
+        })
+        .unwrap();
+        assert_eq!(*retried.lock().unwrap(), [paths[2].clone()]);
+        assert_eq!(
+            complete,
+            files
+                .iter()
+                .map(|&(path, sig)| digest(path, sig).unwrap())
+                .collect::<Vec<_>>()
+        );
+
+        let cold = DigestMemo::default();
+        let result = hash_files(&files[..1], &busy, &cold, |path, sig| {
+            let result = digest(path, sig);
+            std::fs::write(path, b"changed after read").unwrap();
+            result
+        });
+        assert!(result.is_err());
+        assert!(cold.get(&files[0].1).is_none(), "moved input must not be memoized");
+    }
+
+    #[test]
+    fn a_memoized_alias_is_revalidated_after_an_unrelated_cold_read() {
+        let (dir, mut paths) = fixture();
+        let alias = dir.path().join("warm-alias");
+        std::fs::hard_link(&paths[0], &alias).unwrap();
+        paths.push(alias.clone());
+        let files = observed(&paths);
+        let memo = DigestMemo::default();
+        let busy = AtomicBool::new(false);
+        hash_files(&[files[0], files[3]], &busy, &memo, digest).unwrap();
+        let result = hash_files(&files, &busy, &memo, |path, sig| {
+            assert_ne!(path, paths[0].as_path(), "the original file is memoized");
+            assert_ne!(path, alias.as_path(), "the alias shares its digest");
+            let result = digest(path, sig);
+            if path == paths[1].as_path() {
+                std::fs::rename(&alias, dir.path().join("retained-warm-alias")).unwrap();
+                std::fs::write(&alias, b"new alias bytes").unwrap();
+            }
+            result
+        });
+        assert!(result.is_err(), "memo hits cannot exempt aliases from validation");
+    }
+
+    #[test]
+    fn memo_capacity_is_bounded_and_eviction_only_causes_verified_rereads() {
+        let (_dir, paths) = fixture();
+        let files = observed(&paths[..1]);
+        let memo = DigestMemo::default();
+        let busy = AtomicBool::new(false);
+        let original = hash_files(&files, &busy, &memo, digest).unwrap();
+        let mut contradictory = original[0].clone();
+        contradictory.bytes[0] ^= 1;
+        assert!(memo.remember(files[0].1, &contradictory).is_err());
+        assert_eq!(memo.get(&files[0].1), Some(original[0].clone()));
+        // Synthetic signatures exercise the map's capacity policy only. The
+        // subsequent actual read proves eviction cannot invent an input digest.
+        for index in 0..MAX_TOOLCHAIN_DIGESTS {
+            let mut sig = files[0].1;
+            sig.dev = sig.dev.wrapping_add(1);
+            sig.ino = index as u64;
+            memo.remember(sig, &original[0]).unwrap();
+            assert!(memo.entries.lock().unwrap().len() <= MAX_TOOLCHAIN_DIGESTS);
+        }
+        assert!(memo.get(&files[0].1).is_none());
+        let reads = AtomicUsize::new(0);
+        assert_eq!(
+            hash_files(&files, &busy, &memo, |path, sig| {
+                reads.fetch_add(1, Ordering::Relaxed);
+                digest(path, sig)
+            })
+            .unwrap(),
+            original
+        );
+        assert_eq!(reads.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn poisoned_advisory_memo_falls_back_to_verified_reads() {
+        let (_dir, paths) = fixture();
+        let files = observed(&paths);
+        let memo = DigestMemo::default();
+        let busy = AtomicBool::new(false);
+        let original = hash_files(&files, &busy, &memo, digest).unwrap();
+        let panic = std::panic::catch_unwind(|| {
+            let _held = memo.entries.lock().unwrap();
+            panic!("injected advisory memo poisoning");
+        });
+        assert!(panic.is_err());
+        let reads = AtomicUsize::new(0);
+        assert_eq!(
+            hash_files(&files, &busy, &memo, |path, sig| {
+                reads.fetch_add(1, Ordering::Relaxed);
+                digest(path, sig)
+            })
+            .unwrap(),
+            original
+        );
+        assert_eq!(reads.load(Ordering::Relaxed), files.len());
+        assert!(memo.entries.is_poisoned());
     }
 
     #[test]
