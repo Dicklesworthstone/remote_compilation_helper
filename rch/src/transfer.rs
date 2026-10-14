@@ -15533,9 +15533,11 @@ fn main() {
             let _ = child.wait();
         }
         let status = status.expect("deadline kill must not block on a full stderr pipe");
-        assert_eq!(
-            std::os::unix::process::ExitStatusExt::signal(&status),
-            Some(9),
+        // Linux launches run under the owned-group supervisor (02f769a9), which
+        // stays outside the killed group and reports it as 128+9.
+        assert!(
+            std::os::unix::process::ExitStatusExt::signal(&status) == Some(9)
+                || status.code() == Some(137),
             "{status:?}"
         );
     }

@@ -255,8 +255,15 @@ rch_scope_launch_supervise() {
     fi
     __sl_control="$__sl_record.supervisor.v1"
     (umask 077; mkdir -m 700 -- "$__sl_control") || {
-        printf '%s\n' RCH_SCOPED_LAUNCH_ALREADY_OWNED >&2
-        return 255
+        # Only an existing claim means another launch owns this record. Any
+        # other failure (missing parent, EDQUOT, ENOSPC) claimed and started
+        # nothing: report the pre-workload refusal the caller may retry.
+        if [ -e "$__sl_control" ] || [ -L "$__sl_control" ]; then
+            printf '%s\n' RCH_SCOPED_LAUNCH_ALREADY_OWNED >&2
+            return 255
+        fi
+        printf '\n%s_IDENTITY_UNAVAILABLE\n' "$__sl_marker" >&2
+        return 125
     }
     # Recheck after acquisition for an older launcher which has no claim.
     # Do not remove/adopt either its record or this invocation's new fence.
