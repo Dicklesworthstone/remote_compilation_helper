@@ -5,7 +5,7 @@ Compilation Helper): the PreToolUse hook + CLI (`rch`), the local daemon (`rchd`
 worker agent (`rch-wkr`), the RABS build sidecar (`rabs-*`, `rabsd`), and the fleet
 dashboard (`dashboard/`).
 
-Scope window: project inception (`v0.1.0`, 2026-01-25) through `v2.1.24` (2026-10-14).
+Scope window: project inception (`v0.1.0`, 2026-01-25) through `v2.1.25` (2026-10-14).
 
 This document was rebuilt from git history (`git log --no-merges` per tag range, `git show`
 on representative commits), version tags (`git for-each-ref`), GitHub release metadata
@@ -28,6 +28,48 @@ history. They are kept as-is because the descriptions were verified against the 
 but those particular links will 404.
 
 Repository: <https://github.com/Dicklesworthstone/remote_compilation_helper>
+
+## 2.1.25 — 2026-10-14
+
+Offloaded `cargo nextest run` works again, `rch daemon restart` on a Mac only restarts the daemon it
+was pointed at, dispatcher logs stop repeating unchanged disk-pressure verdicts, and staged artifact
+publication refuses subtrees that vanish mid-inventory (#107).
+
+- **`cargo nextest run` through rch no longer exits 96 before building** (`bd-k90ud`). The hook binds
+  the build-source stamp with two Cargo `--config` arguments, and cargo-nextest deserializes each one
+  as a whole `[env]` entry, so the lone `env.RCH_BUILD_SOURCE.force=true` was rejected ("data did not
+  match any variant of untagged enum CargoConfigEnv"); Cargo refuses the single inline-table form.
+  For nextest the hook now passes only the value and runs Cargo under `env RCH_BUILD_SOURCE=<stamp>`,
+  which is all `force` overrode. A test runs the bound command under real cargo-nextest
+  ([`1dda8141`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/1dda814152a0109961f4dc099b501bcff1f39f02)).
+- **`rch daemon restart` on macOS kickstarts launchd only for its own daemon.** With `com.rch.daemon`
+  loaded, every restart ran `launchctl kickstart -k` whatever socket was configured, so a sandboxed
+  restart (a test, a second daemon) restarted the user's real rchd and skipped that daemon's own
+  restart admission. launchd is used now only when the job's pid holds the configured socket
+  ([`83cdfdde`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/83cdfddea853f15774dd404c393ad46aad1a5b67)).
+- **Disk-pressure verdicts log on change.** An unchanged non-healthy verdict repeats at most every
+  10 minutes per worker; six Critical workers wrote ~480 WARN lines an hour on css ([`fa964a7a`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/fa964a7a9a47bedb571651b1ea2327b139434f7a)).
+- **Staged publication refuses disappearing subtrees** (#107): staging is enumerated
+  descriptor-relative and nofollow, with before/after identity checks, so a descendant that vanishes
+  or is replaced between classification and descent is an error rather than an empty output set
+  ([`b8379cde`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/b8379cde7ea4bece7e226af0688a0c36909b419a), [`1707447f`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/1707447ff15c3ba53e687d3c0a81333607d0ba8e)).
+- **Source registry on BSD awk:** a held claim record corrupted with a NUL byte was read as a valid
+  root on macOS workers; record files are now read through `tr` so every awk refuses it
+  ([`8e7d38f9`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/8e7d38f99c6edc4c2747df156d0dfb42537b06ed)).
+- **`rch update` retries a just-staged binary that is briefly busy** (ETXTBSY from a concurrent fork)
+  for up to half a second during its installation preflight (`bd-p7auy`, [`e892ee9a`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/e892ee9ace8551ac6c3e2c49686f909f7365bdb1)).
+- **Job admission** merges the project's configured `[jobs] required_tools` into the preflight, and
+  the capability display lists every required field ([`3293c7c2`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/3293c7c2037ba1bdc212ca2ecf5edd36619b8002)).
+- **RABS sidecar:** live compiler outputs stream into pinned CAS; captured empty build-script and
+  directory-source dependency outputs are reused across worktrees; toolchain hashing is bounded and
+  parallel, verified file generations are reused across toolchain warms, and live identity probes
+  are bounded; the live Cargo runner keeps inherited jobserver pipes; expired leases are retired
+  under active authority ([`41c0beed`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/41c0beed58059a4cf83c69483a08366fc5dc8ab2), [`0cba97ca`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/0cba97ca65fa22604d760ded3380e9391d4ebb87), [`7e938495`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/7e938495415a8703a5d87fd923bc97531b64d92d), [`89e8d41f`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/89e8d41f1b551f08b7d27ce7e1634b52d10e147b), [`d3967fdb`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/d3967fdb16727d9a8f3b3b7402f3fed037b6e69c), [`7b3daef3`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/7b3daef320da8f9afb0d24f9e9123a0eedd100f1), [`86fc7615`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/86fc76156aa2a86aae349f51959d987a23c02478), [`06a062e9`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/06a062e9bd14e61649f835f29aa687e15f05d043), [`475c8b7c`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/475c8b7c14e05b3049f15c0a06ae8ec09da15e5f), [`a97362e8`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/a97362e88a55b2f395fc8fdb727dafe6b294502f), [`ccfd5630`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/ccfd5630389fd524b6bcef56866e7fc10cbf0aa5), [`dd89ee4c`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/dd89ee4cdc2e1a697a61b637d85eef54d6e9133e), [`9131e879`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/9131e8790f46494d7bd8e03077e52c5bdafde4a3), [`34d9eb54`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/34d9eb544e42ffdf234900cd776dabc877d8301b)).
+- **Tests:** the rchd suite passes on macOS, and the cancellation observation probes use a fake `ps`
+  on PATH, which the bounded census (14aea498) actually runs, on Linux too (`bd-ql5bu`,
+  [`85b197b3`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/85b197b3da618afc9a25ae38572bd0dd03d82b77)); the source-registry suite runs under Homebrew's flock and grealpath
+  ([`8e7d38f9`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/8e7d38f99c6edc4c2747df156d0dfb42537b06ed)); delivery and recovery tests cover partial interruptions and cancellation versus
+  lease expiry ([`85bfb3b0`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/85bfb3b00d4ff7a58ebf3fa49072de86fd8edcc7), [`0d62751e`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/0d62751e77119f1af5d1dae84443fd8a7c37fbbb)).
 
 ## 2.1.24 — 2026-10-14
 
