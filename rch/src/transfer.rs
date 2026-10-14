@@ -5098,12 +5098,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
             }
             Ok::<(), anyhow::Error>(())
         };
-        let collect = async move {
-            child
-                .wait_with_output()
-                .await
-                .context("ssh sh -s wait")
-        };
+        let collect = async move { child.wait_with_output().await.context("ssh sh -s wait") };
         let (_, out) = tokio::try_join!(upload, collect)?;
         if !out.status.success() {
             return Err(anyhow::anyhow!(
