@@ -452,6 +452,11 @@ impl DiskPressurePolicyConfig {
     }
 }
 
+/// An unchanged non-healthy verdict is logged again at most this often per
+/// worker; any change of state, confidence or reason logs at once. Logging
+/// every 30 s poll of six critical workers wrote ~480 WARN lines an hour on css.
+const STEADY_PRESSURE_LOG_INTERVAL: Duration = Duration::from_secs(600);
+
 /// Background monitor that computes and stores pressure assessments on workers.
 pub struct DiskPressureMonitor {
     pool: WorkerPool,
@@ -459,6 +464,8 @@ pub struct DiskPressureMonitor {
     config: DiskPressurePolicyConfig,
     /// Receives build-disk probes for footprint learning (bd-wv746).
     history: Option<Arc<crate::history::BuildHistory>>,
+    /// When each worker's verdict was last logged.
+    last_logged: std::sync::Mutex<std::collections::HashMap<String, Instant>>,
 }
 
 impl DiskPressureMonitor {
@@ -473,7 +480,32 @@ impl DiskPressureMonitor {
             telemetry,
             config,
             history: None,
+            last_logged: std::sync::Mutex::default(),
         }
+    }
+
+    /// Log a changed verdict now, and an unchanged non-healthy one once per
+    /// [`STEADY_PRESSURE_LOG_INTERVAL`].
+    fn decision_log_due(
+        &self,
+        worker_id: &str,
+        changed: bool,
+        healthy: bool,
+        now: Instant,
+    ) -> bool {
+        let mut last = self
+            .last_logged
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let due = changed
+            || !healthy
+                && last.get(worker_id).is_none_or(|logged| {
+                    now.saturating_duration_since(*logged) >= STEADY_PRESSURE_LOG_INTERVAL
+                });
+        if due {
+            last.insert(worker_id.to_owned(), now);
+        }
+        due
     }
 
     /// Feed each worker's current build-disk probe to running builds there.
@@ -529,11 +561,12 @@ impl DiskPressureMonitor {
 
         worker.set_pressure_assessment(next.clone()).await;
 
-        if state_changed
-            || confidence_changed
-            || reason_changed
-            || next.state != PressureState::Healthy
-        {
+        if self.decision_log_due(
+            &worker_id,
+            state_changed || confidence_changed || reason_changed,
+            next.state == PressureState::Healthy,
+            Instant::now(),
+        ) {
             let disk_free_gb = next.disk_free_gb.unwrap_or(-1.0);
             let disk_total_gb = next.disk_total_gb.unwrap_or(-1.0);
             let disk_free_ratio = next.disk_free_ratio.unwrap_or(-1.0);
@@ -1132,6 +1165,29 @@ mod tests {
         let mut received = ReceivedTelemetry::new(telemetry, TelemetrySource::SshPoll);
         received.received_at = Utc::now() - ChronoDuration::seconds(age_secs);
         received
+    }
+
+    #[test]
+    fn unchanged_unhealthy_verdicts_log_once_per_interval() {
+        let monitor = DiskPressureMonitor::new(
+            WorkerPool::new(),
+            Arc::new(TelemetryStore::new(Duration::from_secs(300), None)),
+            DiskPressurePolicyConfig::default(),
+        );
+        let start = Instant::now();
+        let at = |secs| start + Duration::from_secs(secs);
+        // First critical verdict, then 30 s polls of the same verdict.
+        assert!(monitor.decision_log_due("w", true, false, at(0)));
+        assert!(!monitor.decision_log_due("w", false, false, at(30)));
+        assert!(!monitor.decision_log_due("w", false, false, at(599)));
+        assert!(monitor.decision_log_due("w", false, false, at(600)));
+        // Any change logs at once and restarts the interval.
+        assert!(monitor.decision_log_due("w", true, false, at(630)));
+        assert!(!monitor.decision_log_due("w", false, false, at(660)));
+        // Workers are independent; a steady healthy verdict never repeats.
+        assert!(monitor.decision_log_due("x", false, false, at(660)));
+        assert!(!monitor.decision_log_due("y", false, true, at(0)));
+        assert!(!monitor.decision_log_due("y", false, true, at(10_000)));
     }
 
     #[tokio::test]
