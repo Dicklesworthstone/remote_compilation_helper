@@ -148,8 +148,12 @@ def write_new_json(path, value):
 def collect_build(command, workspace, env, log):
     """Bound each JSON allocation; drain rejected output before reaping Cargo."""
     collector = CargoArtifacts(workspace)
+    # Preserve the caller's explicitly inheritable descriptors, as Cargo's
+    # normal exec path does. Keeping CARGO_MAKEFLAGS while closing its pipe
+    # descriptors breaks the jobserver; guessing/recreating tokens would invent
+    # capacity. Python-created log/pipe descriptors remain close-on-exec.
     process = subprocess.Popen(command, cwd=workspace, env=env, stdin=subprocess.DEVNULL,
-                               stdout=subprocess.PIPE)
+                               stdout=subprocess.PIPE, close_fds=False)
     failure = None
     total = 0
     try:
@@ -250,7 +254,8 @@ def run(args, workspace):
         env[MANIFEST_ENV] = str(manifest)
         print("RABS live Cargo tests -> prepared binary pair", file=sys.stderr, flush=True)
         started_test = time.monotonic()
-        status = subprocess.call(test, cwd=workspace, env=env)
+        # The test Cargo needs the SAME inherited jobserver, not just its env.
+        status = subprocess.call(test, cwd=workspace, env=env, close_fds=False)
         report["test_seconds"] = time.monotonic() - started_test
         report["test_exit"] = status
         return status
