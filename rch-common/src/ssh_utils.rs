@@ -62,6 +62,12 @@ pub fn is_retryable_transport_error_text(message: &str) -> bool {
     // a transient stale ControlMaster socket (retryable), and the genuinely-fatal
     // missing-key case is already covered by "identity file"/"keyfile". Keeping
     // it as an unconditional fatal mis-classified a recoverable mux-socket drop.
+    // A dual-role worker's receiver refuses a sync into its live checkout
+    // before rsync starts, so rsync reports "connection unexpectedly closed".
+    // The refusal is deterministic (bd-fbtws); retrying only repeats it.
+    if message.contains("rch_sync_live_checkout_refused") {
+        return false;
+    }
     if message.contains("permission denied")
         || message.contains("host key verification failed")
         || message.contains("identity file")

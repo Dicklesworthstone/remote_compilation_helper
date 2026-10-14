@@ -5217,12 +5217,12 @@ fn source_upload_disk_release_requires_the_selected_worker_and_confirmed_ownersh
         })
         .context("source preparation failed before remote command execution");
     let result = Err(error);
-    let (worker_fault, disk_fault, roots) = remote_release_faults(&result, &worker);
-    assert!(worker_fault && disk_fault);
-    assert_eq!(roots, ["/source-volume/project"]);
+    let faults = remote_release_faults(&result, &worker);
+    assert!(faults.worker_fault && faults.worker_disk_full && !faults.live_checkout_refused);
+    assert_eq!(faults.worker_disk_roots, ["/source-volume/project"]);
     assert_eq!(
         remote_release_faults(&result, &WorkerId::new("other-worker")),
-        (false, false, &[] as &[String])
+        daemon_ipc::ReleaseFaults::default()
     );
     let result = result.map_err(|error| error.context(crate::transfer::RemoteExecutionUnconfirmed));
     assert_eq!(
@@ -5231,7 +5231,7 @@ fn source_upload_disk_release_requires_the_selected_worker_and_confirmed_ownersh
     );
     assert_eq!(
         remote_release_faults(&result, &worker),
-        (false, false, &[] as &[String])
+        daemon_ipc::ReleaseFaults::default()
     );
     assert!(is_remote_execution_unconfirmed(
         result.as_ref().unwrap_err()
@@ -5249,7 +5249,7 @@ fn source_upload_disk_release_never_infers_worker_pressure_from_untyped_transfer
     .into());
     assert_eq!(
         remote_release_faults(&result, &worker),
-        (false, false, &[] as &[String])
+        daemon_ipc::ReleaseFaults::default()
     );
     // Existing remote-command evidence still follows its actual exit status.
     for exit_code in [0, 101] {
@@ -5263,11 +5263,56 @@ fn source_upload_disk_release_never_infers_worker_pressure_from_untyped_transfer
             disk_roots: vec!["/build-volume/target".into()],
             cargo_stdout: None,
         });
-        let (worker_fault, disk_fault, roots) = remote_release_faults(&result, &worker);
-        assert_eq!(worker_fault, exit_code != 0);
-        assert_eq!(disk_fault, exit_code != 0);
-        assert_eq!(roots, ["/build-volume/target"]);
+        let faults = remote_release_faults(&result, &worker);
+        assert_eq!(faults.worker_fault, exit_code != 0);
+        assert_eq!(faults.worker_disk_full, exit_code != 0);
+        assert_eq!(faults.worker_disk_roots, ["/build-volume/target"]);
     }
+}
+
+#[test]
+fn live_checkout_refusal_reaches_the_release_only_from_the_source_sync() {
+    // bd-fbtws: the receiver guard's refusal, as rsync reports it.
+    let worker = WorkerId::new("dual-role");
+    let refusal = "RCH_SYNC_LIVE_CHECKOUT_REFUSED: /data/projects/app (live checkout); use an isolated source mirror\n\
+                   rsync: connection unexpectedly closed (0 bytes received so far) [sender]\n\
+                   rsync error: unexplained error (code 73) at io.c(232) [sender=3.4.1]\n";
+    assert!(
+        !rch_common::ssh_utils::is_retryable_transport_error_text(refusal),
+        "a deterministic refusal must not be retried as a transport drop"
+    );
+    let sync_failed = |stderr: &str| -> anyhow::Error {
+        TransferError::SyncFailed {
+            reason: "rsync failed".into(),
+            exit_code: Some(73),
+            stderr: stderr.into(),
+        }
+        .into()
+    };
+    let result = Err(sync_failed(refusal).context("source sync failed"));
+    let faults = remote_release_faults(&result, &worker);
+    assert!(faults.live_checkout_refused);
+    assert!(!faults.worker_fault && !faults.worker_disk_full);
+    // Ownership loss after the refusal still releases nothing.
+    let unconfirmed =
+        result.map_err(|error| error.context(crate::transfer::RemoteExecutionUnconfirmed));
+    assert!(!remote_release_faults(&unconfirmed, &worker).live_checkout_refused);
+    // The marker inside a sentence, or in a build's own output, is not a refusal.
+    let quoted = Err(sync_failed(
+        "error: saw RCH_SYNC_LIVE_CHECKOUT_REFUSED: in a log\n",
+    ));
+    assert!(!remote_release_faults(&quoted, &worker).live_checkout_refused);
+    let build = Ok(remote_result::RemoteExecutionResult {
+        deadline_triggered: false,
+        exit_code: 101,
+        stderr: refusal.into(),
+        duration_ms: 10,
+        timing: Default::default(),
+        result_dirs: Vec::new(),
+        disk_roots: Vec::new(),
+        cargo_stdout: None,
+    });
+    assert!(!remote_release_faults(&build, &worker).live_checkout_refused);
 }
 
 #[test]

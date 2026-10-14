@@ -1670,6 +1670,7 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
         let mut worker_fault = false;
         let mut worker_disk_full = false;
         let mut worker_disk_roots = Vec::new();
+        let mut worker_live_checkout_refused = false;
 
         for param in query.split('&') {
             if param.is_empty() {
@@ -1689,6 +1690,9 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
                 "local_wrapper_id" => local_wrapper_id = Some(percent_unescape_query_value(value)),
                 "worker_fault" => worker_fault = matches!(value, "1" | "true"),
                 "worker_disk_full" => worker_disk_full = matches!(value, "1" | "true"),
+                "worker_live_checkout_refused" => {
+                    worker_live_checkout_refused = matches!(value, "1" | "true")
+                }
                 "worker_disk_roots" => {
                     worker_disk_roots =
                         serde_json::from_str::<Vec<String>>(&percent_unescape_query_value(value))
@@ -1713,6 +1717,7 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
             worker_fault,
             worker_disk_full,
             worker_disk_roots,
+            worker_live_checkout_refused,
         }));
     }
 
@@ -3324,8 +3329,9 @@ const DEAD_WRAPPER_HEARTBEAT_STALE_MS: u64 = 15 * 60 * 1000;
 /// Only a recipe that names worker-side ownership (source roots, a source
 /// pair, or a tree to retire) needs keeping.
 /// Workers this project must not be placed on: one running build per project
-/// per worker, plus workers whose failed build's client lease still owns
-/// worker source (their registry would refuse the same root, bd-jqhno).
+/// per worker, workers whose failed build's client lease still owns worker
+/// source (their registry would refuse the same root, bd-jqhno), and workers
+/// whose live checkout of the project refused a recent sync (bd-fbtws).
 fn project_excluded_workers(
     ctx: &DaemonContext,
     project: &str,
@@ -3335,6 +3341,7 @@ fn project_excluded_workers(
         ctx.history
             .source_fenced_workers(project, crate::cancellation::client_lease_owns_source),
     );
+    excluded.extend(ctx.history.live_checkout_fenced_workers(project));
     excluded
 }
 
@@ -3450,6 +3457,18 @@ async fn handle_release_worker(ctx: &DaemonContext, request: ReleaseRequest) -> 
     let slots_done = started.elapsed();
 
     if let Some(ref rec) = record {
+        // The owner-validated worker refused this project's source because it
+        // is a live checkout there; every later sync would be refused too.
+        if exit_code != 0 && request.worker_live_checkout_refused {
+            ctx.history
+                .fence_live_checkout(&rec.project_id, release_worker_id.as_str());
+            info!(
+                project_id = %rec.project_id,
+                worker_id = %release_worker_id,
+                hours = crate::history::LIVE_CHECKOUT_FENCE_MAX_AGE.as_secs() / 3600,
+                "Keeping project off worker: its live checkout refused the source sync (bd-fbtws)"
+            );
+        }
         if !cfg!(test) {
             metrics::dec_active_builds("remote");
             let outcome = if exit_code == 0 { "success" } else { "failure" };
@@ -5267,6 +5286,7 @@ mod tests {
             timing: None,
             worker_fault: false,
             worker_disk_full: false,
+            worker_live_checkout_refused: false,
             worker_disk_roots: Vec::new(),
         };
         assert!(
@@ -6716,6 +6736,7 @@ mod tests {
                 timing: None,
                 worker_fault: false,
                 worker_disk_full: false,
+                worker_live_checkout_refused: false,
                 worker_disk_roots: Vec::new(),
             },
         )
@@ -8454,6 +8475,63 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn live_checkout_refusal_keeps_the_project_off_the_owner_worker() {
+        // bd-fbtws: (exit, flag, owner, fenced)
+        for (exit, flag, wrapper, fenced) in [
+            (101, true, "owner", true),
+            (0, true, "owner", false),
+            (101, false, "owner", false),
+            (101, true, "wrong-owner", false),
+        ] {
+            let pool = WorkerPool::new();
+            pool.add_worker(make_test_worker("worker1", 8)).await;
+            let ctx = make_test_context(pool.clone());
+            let worker = pool.get(&WorkerId::new("worker1")).await.unwrap();
+            let build = ctx
+                .history
+                .try_start_active_build_with_waiter(
+                    "live-project".into(),
+                    "worker1".into(),
+                    "cargo build".into(),
+                    12345,
+                    Some("owner".into()),
+                    2,
+                    rch_common::BuildLocation::Remote,
+                    None,
+                    crate::disk_pressure::DiskHeadroomAdmission::default(),
+                    Some(worker.endpoint_snapshot().await),
+                )
+                .unwrap()
+                .unwrap();
+            assert!(worker.reserve_slots(2).await);
+            let request = parse_request(&format!(
+                "POST /release-worker?worker=worker1&build_id={}&local_wrapper_id={wrapper}&exit_code={exit}&worker_live_checkout_refused={}",
+                build.id,
+                u8::from(flag)
+            ))
+            .unwrap();
+            let ApiRequest::ReleaseWorker(request) = request else {
+                panic!("release request expected")
+            };
+            assert_eq!(request.worker_live_checkout_refused, flag);
+            let result = handle_release_worker(&ctx, request).await;
+            assert_eq!(result.is_ok(), wrapper == "owner", "{result:?}");
+            // A refused release keeps the build active, which excludes the
+            // worker on its own; the fence is what outlives completion.
+            assert_eq!(
+                ctx.history
+                    .live_checkout_fenced_workers("live-project")
+                    .contains("worker1"),
+                fenced
+            );
+            if fenced {
+                assert!(project_excluded_workers(&ctx, "live-project").contains("worker1"));
+            }
+            assert!(project_excluded_workers(&ctx, "other-project").is_empty());
+        }
+    }
+
     fn disk_fault_release_request(build_id: u64) -> ReleaseRequest {
         ReleaseRequest {
             local_wrapper_id: Some("disk-owner".into()),
@@ -8466,6 +8544,7 @@ mod tests {
             timing: None,
             worker_fault: true,
             worker_disk_full: true,
+            worker_live_checkout_refused: false,
             worker_disk_roots: vec!["/build-volume/rch".into()],
         }
     }
@@ -8838,6 +8917,7 @@ mod tests {
             timing: None,
             worker_fault: false,
             worker_disk_full: false,
+            worker_live_checkout_refused: false,
             worker_disk_roots: Vec::new(),
         };
 
@@ -8889,6 +8969,7 @@ mod tests {
             timing: None,
             worker_fault: false,
             worker_disk_full: false,
+            worker_live_checkout_refused: false,
             worker_disk_roots: Vec::new(),
         };
 
@@ -9012,6 +9093,7 @@ mod tests {
                 timing: None,
                 worker_fault: false,
                 worker_disk_full: false,
+                worker_live_checkout_refused: false,
                 worker_disk_roots: Vec::new(),
             };
             handle_release_worker(&ctx, release.clone()).await.unwrap();
@@ -9076,6 +9158,7 @@ mod tests {
             timing: None,
             worker_fault: false,
             worker_disk_full: false,
+            worker_live_checkout_refused: false,
             worker_disk_roots: Vec::new(),
         };
 
@@ -9115,6 +9198,7 @@ mod tests {
             timing: None,
             worker_fault: false,
             worker_disk_full: false,
+            worker_live_checkout_refused: false,
             worker_disk_roots: Vec::new(),
         };
         handle_release_worker(&ctx, release()).await.unwrap();
@@ -9162,6 +9246,7 @@ mod tests {
                         timing: None,
                         worker_fault: false,
                         worker_disk_full: false,
+                        worker_live_checkout_refused: false,
                         worker_disk_roots: Vec::new(),
                     },
                 )
@@ -9200,6 +9285,7 @@ mod tests {
                 timing: None,
                 worker_fault: false,
                 worker_disk_full: false,
+                worker_live_checkout_refused: false,
                 worker_disk_roots: Vec::new(),
             },
         )
@@ -9247,6 +9333,7 @@ mod tests {
             timing: None,
             worker_fault: false,
             worker_disk_full: false,
+            worker_live_checkout_refused: false,
             worker_disk_roots: Vec::new(),
         };
 
@@ -9362,6 +9449,7 @@ mod tests {
             timing: None,
             worker_fault: false,
             worker_disk_full: false,
+            worker_live_checkout_refused: false,
             worker_disk_roots: Vec::new(),
         };
 
@@ -9746,6 +9834,7 @@ mod tests {
                 timing: None,
                 worker_fault: false,
                 worker_disk_full: false,
+                worker_live_checkout_refused: false,
                 worker_disk_roots: Vec::new(),
             },
         )

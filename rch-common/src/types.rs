@@ -730,6 +730,11 @@ pub struct ReleaseRequest {
     /// Recovery must measure these filesystems as well as configured roots.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub worker_disk_roots: Vec<String>,
+    /// The worker's source receiver refused the sync because its copy of the
+    /// project is a declared live checkout (`RCH_SYNC_LIVE_CHECKOUT_REFUSED`,
+    /// bd-fbtws). The daemon keeps that project off the worker for a while.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub worker_live_checkout_refused: bool,
 }
 
 /// Build execution phase for daemon heartbeat tracking.

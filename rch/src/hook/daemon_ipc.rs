@@ -731,11 +731,21 @@ pub(crate) async fn release_worker(
         bytes_transferred,
         timing,
         local_wrapper_id,
-        false,
-        false,
-        &[],
+        ReleaseFaults::default(),
     )
     .await
+}
+
+/// What a failed remote attempt says about its worker, for the release.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ReleaseFaults<'a> {
+    /// The failure blamed the worker (`remote_failure_is_worker_fault`).
+    pub(crate) worker_fault: bool,
+    /// Confirmed disk exhaustion on `worker_disk_roots`.
+    pub(crate) worker_disk_full: bool,
+    pub(crate) worker_disk_roots: &'a [String],
+    /// The worker's live checkout of the project refused the source sync.
+    pub(crate) live_checkout_refused: bool,
 }
 
 /// [`release_worker`] for a completed remote run, also telling the daemon
@@ -754,9 +764,7 @@ pub(crate) async fn release_worker_with_fault(
     bytes_transferred: Option<u64>,
     timing: Option<&CommandTimingBreakdown>,
     local_wrapper_id: Option<&str>,
-    worker_fault: bool,
-    worker_disk_full: bool,
-    worker_disk_roots: &[String],
+    faults: ReleaseFaults<'_>,
 ) -> anyhow::Result<()> {
     if !Path::new(socket_path).exists() {
         anyhow::bail!("daemon socket is missing; release was not acknowledged");
@@ -793,15 +801,18 @@ pub(crate) async fn release_worker_with_fault(
     if let Some(bytes_transferred) = bytes_transferred {
         request.push_str(&format!("&bytes_transferred={}", bytes_transferred));
     }
-    if worker_fault {
+    if faults.worker_fault {
         request.push_str("&worker_fault=1");
     }
-    if worker_disk_full {
+    if faults.worker_disk_full {
         request.push_str("&worker_disk_full=1");
         request.push_str(&format!(
             "&worker_disk_roots={}",
-            urlencoding_encode(&serde_json::to_string(worker_disk_roots)?)
+            urlencoding_encode(&serde_json::to_string(faults.worker_disk_roots)?)
         ));
+    }
+    if faults.live_checkout_refused {
+        request.push_str("&worker_live_checkout_refused=1");
     }
     request.push('\n');
 
@@ -1329,9 +1340,13 @@ mod bounded_ipc_tests {
     async fn release_carries_the_worker_fault_flag_only_when_set() {
         // Review of GH #81: the daemon withholds cache warmth for a failure
         // the hook blamed on the worker, so the flag must reach the wire.
-        for (worker_fault, worker_disk_full) in
-            [(false, false), (true, false), (false, true), (true, true)]
-        {
+        for (worker_fault, worker_disk_full, live_checkout_refused) in [
+            (false, false, false),
+            (true, false, false),
+            (false, true, false),
+            (true, true, false),
+            (true, false, true),
+        ] {
             let root = tempfile::tempdir().unwrap().keep();
             let path = root.join("ipc.sock");
             let listener = tokio::net::UnixListener::bind(&path).unwrap();
@@ -1357,9 +1372,12 @@ mod bounded_ipc_tests {
                 None,
                 None,
                 None,
-                worker_fault,
-                worker_disk_full,
-                &[],
+                ReleaseFaults {
+                    worker_fault,
+                    worker_disk_full,
+                    worker_disk_roots: &[],
+                    live_checkout_refused,
+                },
             );
             let (result, request) = timeout(Duration::from_secs(2), async {
                 tokio::join!(client, server)
@@ -1379,6 +1397,11 @@ mod bounded_ipc_tests {
             assert_eq!(
                 request.contains("&worker_disk_full=1"),
                 worker_disk_full,
+                "{request}"
+            );
+            assert_eq!(
+                request.contains("&worker_live_checkout_refused=1"),
+                live_checkout_refused,
                 "{request}"
             );
         }

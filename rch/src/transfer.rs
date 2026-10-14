@@ -784,6 +784,25 @@ pub(crate) fn find_remote_upload_disk_full(error: &anyhow::Error) -> Option<&Rem
     })
 }
 
+/// The receiver guard's first word on a refused sync (bd-fbtws).
+const LIVE_CHECKOUT_REFUSAL_MARKER: &str = "RCH_SYNC_LIVE_CHECKOUT_REFUSED: ";
+
+/// A worker's source receiver refused this upload because the destination is
+/// a declared live checkout. Only a failed source rsync's own stderr is read;
+/// a build's output never becomes a `SyncFailed`.
+pub(crate) fn sync_refused_by_live_checkout(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<TransferError>(),
+            Some(TransferError::SyncFailed { stderr, .. })
+                if stderr.lines().any(|line| line.starts_with(LIVE_CHECKOUT_REFUSAL_MARKER))
+        )
+    }) || error
+        .downcast_ref::<TransferAttemptsExhausted>()
+        .and_then(|exhausted| exhausted.cause.as_ref())
+        .is_some_and(sync_refused_by_live_checkout)
+}
+
 /// Modern rsync's rsyserr identifies the process role and terminates with
 /// strerror(errno) plus its number. Require both boundaries so a filename or
 /// a sender/SSH diagnostic mentioning ENOSPC cannot become worker evidence.

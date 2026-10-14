@@ -287,22 +287,32 @@ fn is_remote_execution_unconfirmed(error: &anyhow::Error) -> bool {
 fn remote_release_faults<'a>(
     result: &'a anyhow::Result<remote_result::RemoteExecutionResult>,
     worker_id: &WorkerId,
-) -> (bool, bool, &'a [String]) {
+) -> daemon_ipc::ReleaseFaults<'a> {
     match result {
-        Ok(result) => (
-            remote_failure_is_worker_fault(&result.stderr, result.exit_code),
-            remote_failure_is_disk_full(&result.stderr, result.exit_code),
-            &result.disk_roots,
-        ),
+        Ok(result) => daemon_ipc::ReleaseFaults {
+            worker_fault: remote_failure_is_worker_fault(&result.stderr, result.exit_code),
+            worker_disk_full: remote_failure_is_disk_full(&result.stderr, result.exit_code),
+            worker_disk_roots: &result.disk_roots,
+            live_checkout_refused: false,
+        },
         Err(error) if !is_remote_execution_unconfirmed(error) => {
+            let live_checkout_refused = crate::transfer::sync_refused_by_live_checkout(error);
             match crate::transfer::find_remote_upload_disk_full(error)
                 .filter(|fault| fault.worker_id == worker_id.as_str())
             {
-                Some(fault) => (true, true, &fault.roots),
-                None => (false, false, &[]),
+                Some(fault) => daemon_ipc::ReleaseFaults {
+                    worker_fault: true,
+                    worker_disk_full: true,
+                    worker_disk_roots: &fault.roots,
+                    live_checkout_refused,
+                },
+                None => daemon_ipc::ReleaseFaults {
+                    live_checkout_refused,
+                    ..Default::default()
+                },
             }
         }
-        Err(_) => (false, false, &[]),
+        Err(_) => daemon_ipc::ReleaseFaults::default(),
     }
 }
 
@@ -4160,8 +4170,7 @@ pub async fn run_exec(
         });
         // A worker-caused failure must not warm that worker's cache for the
         // project (review of GH #81), or the next build is routed back to it.
-        let (release_worker_fault, release_worker_disk_full, release_disk_roots) =
-            remote_release_faults(&result, &worker.id);
+        let release_faults = remote_release_faults(&result, &worker.id);
         let release_acknowledged = if retain_unconfirmed_ownership {
             warn!(
                 "Remote completion unconfirmed; retaining build {} ownership",
@@ -4179,9 +4188,7 @@ pub async fn run_exec(
                 None,
                 release_timing.as_ref(),
                 Some(&wrapper_id),
-                release_worker_fault,
-                release_worker_disk_full,
-                release_disk_roots,
+                release_faults,
             )
             .await
             {
@@ -5489,8 +5496,7 @@ async fn handle_selection_response(
         timing.total = Some(remote_elapsed);
         timing
     });
-    let (release_worker_fault, release_worker_disk_full, release_disk_roots) =
-        remote_release_faults(&result, &worker.id);
+    let release_faults = remote_release_faults(&result, &worker.id);
     if retain_unconfirmed_ownership {
         warn!(
             "Remote completion unconfirmed; retaining worker {} ownership",
@@ -5506,9 +5512,7 @@ async fn handle_selection_response(
         None,
         release_timing.as_ref(),
         None,
-        release_worker_fault,
-        release_worker_disk_full,
-        release_disk_roots,
+        release_faults,
     )
     .await
     {

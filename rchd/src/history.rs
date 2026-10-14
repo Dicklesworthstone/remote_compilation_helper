@@ -121,6 +121,12 @@ struct SourceFence {
 pub(crate) const SOURCE_FENCE_MAX_AGE: Duration = Duration::from_secs(25 * 60);
 const SOURCE_FENCE_LIMIT: usize = 1024;
 
+/// A dual-role worker refuses every sync into its live checkout of a project
+/// (bd-fbtws), so selection skips that pair for hours rather than paying a
+/// reservation and a refused sync per build. Expiry lets a host that stopped
+/// declaring the checkout come back; another refusal fences it again.
+pub(crate) const LIVE_CHECKOUT_FENCE_MAX_AGE: Duration = Duration::from_secs(6 * 60 * 60);
+
 fn canonical_local_wrapper(wrapper: &str) -> bool {
     wrapper
         .strip_prefix(rch_common::job_identity::LOCAL_WRAPPER_ID_PREFIX)
@@ -338,6 +344,9 @@ pub struct BuildHistory {
     /// Failed remote builds whose client lease may still own worker source
     /// (bd-jqhno). Transient: selection consults them for the same project.
     source_fences: Mutex<Vec<SourceFence>>,
+    /// (project, worker) pairs whose live checkout refused a source sync, and
+    /// when (bd-fbtws). Transient, like `source_fences`.
+    live_checkout_fences: Mutex<HashMap<(String, String), Instant>>,
     /// Queued builds (waiting for workers). Membership changes take `active`
     /// first, so queue departure, cancellation and admission share one commit.
     queued: RwLock<VecDeque<QueuedBuildState>>,
@@ -387,6 +396,7 @@ impl BuildHistory {
             active: RwLock::new(HashMap::new()),
             disk_budget_completed_at: Mutex::new(HashMap::new()),
             source_fences: Mutex::new(Vec::new()),
+            live_checkout_fences: Mutex::new(HashMap::new()),
             queued: RwLock::new(VecDeque::new()),
             capacity,
             max_queue_depth: DEFAULT_MAX_QUEUE_DEPTH,
@@ -1168,6 +1178,36 @@ impl BuildHistory {
                 });
         }
         held.into_iter().map(|fence| fence.worker_id).collect()
+    }
+
+    /// Keep `project_id` off `worker_id`: its live checkout refused a sync.
+    pub fn fence_live_checkout(&self, project_id: &str, worker_id: &str) {
+        let mut fences = self
+            .live_checkout_fences
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        fences.retain(|_, created| created.elapsed() < LIVE_CHECKOUT_FENCE_MAX_AGE);
+        if fences.len() >= SOURCE_FENCE_LIMIT {
+            return;
+        }
+        fences.insert(
+            (project_id.to_owned(), worker_id.to_owned()),
+            Instant::now(),
+        );
+    }
+
+    /// Workers whose live checkout of `project_id` refused a recent sync.
+    pub fn live_checkout_fenced_workers(&self, project_id: &str) -> HashSet<String> {
+        let mut fences = self
+            .live_checkout_fences
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        fences.retain(|_, created| created.elapsed() < LIVE_CHECKOUT_FENCE_MAX_AGE);
+        fences
+            .keys()
+            .filter(|(project, _)| project == project_id)
+            .map(|(_, worker)| worker.clone())
+            .collect()
     }
 
     // =========================================================================
@@ -2031,6 +2071,7 @@ impl BuildHistory {
             active: RwLock::new(active),
             disk_budget_completed_at: Mutex::new(HashMap::new()),
             source_fences: Mutex::new(Vec::new()),
+            live_checkout_fences: Mutex::new(HashMap::new()),
             queued: RwLock::new(queued),
             capacity,
             max_queue_depth: DEFAULT_MAX_QUEUE_DEPTH,
@@ -2585,6 +2626,30 @@ mod tests {
     use rch_common::{WorkerId, test_guard};
     use std::time::{SystemTime, UNIX_EPOCH};
     use tempfile::TempDir;
+
+    #[test]
+    fn live_checkout_fences_are_per_project_and_expire() {
+        let history = BuildHistory::new(10);
+        assert!(history.live_checkout_fenced_workers("music").is_empty());
+        history.fence_live_checkout("music", "hz2");
+        history.fence_live_checkout("music", "hz2");
+        history.fence_live_checkout("music", "ts1");
+        assert_eq!(
+            history.live_checkout_fenced_workers("music"),
+            HashSet::from(["hz2".to_owned(), "ts1".to_owned()])
+        );
+        assert!(history.live_checkout_fenced_workers("other").is_empty());
+        *history
+            .live_checkout_fences
+            .lock()
+            .unwrap()
+            .get_mut(&("music".to_owned(), "hz2".to_owned()))
+            .unwrap() = Instant::now() - LIVE_CHECKOUT_FENCE_MAX_AGE;
+        assert_eq!(
+            history.live_checkout_fenced_workers("music"),
+            HashSet::from(["ts1".to_owned()])
+        );
+    }
 
     #[test]
     fn a_failed_remote_build_fences_its_worker_until_its_lease_releases_source() {
