@@ -547,17 +547,16 @@ fn reject_dependency_output_aliases(
     Ok(())
 }
 
-/// Whether rustc's crate locator can ever open `name` as a crate for the
-/// Linux targets this class admits. Every flavor `find_library_crate`
-/// collects — rlib, rmeta, dylib (`.so`, proc-macros included), sdylib
-/// interface (`.rs`) and the static-library rejections — is spelled
-/// `lib<crate>…` (`rustc_metadata::locator`). Every other entry of a
-/// dependency directory is some compile's private scratch or a non-crate
-/// output: codegen units (`*.rcgu.o`), rustc's `rmeta*` and archive temp
-/// directories, dep-info, executables. None is ever a compiler input, and
-/// under Cargo's parallel, pipelined builds they appear and vanish while
-/// unrelated crates compile, so binding them made identical builds refuse
-/// or disagree by timing alone.
+/// Whether rustc's crate locator can ever consider `name` as a crate.
+/// Every candidate family is `lib<crate>…`; scratch files and ordinary
+/// compiler outputs are therefore excluded before any metadata read.
+///
+/// Dynamic candidates need one additional class-specific rule below:
+/// Cargo passes an actually consumed proc-macro/dylib as an explicit
+/// `--extern name=/.../libname.so` (or `.dylib`), and action planning
+/// refuses that invocation before filesystem observation. A dynamic artifact
+/// merely sharing `-L dependency` with an admitted metadata-only compile is
+/// consequently not selectable by that compile and must not poison its key.
 fn crate_locator_may_open(name: &std::ffi::OsStr) -> bool {
     name.as_encoded_bytes().starts_with(b"lib")
 }
@@ -592,13 +591,22 @@ fn walk_dependencies(roots: &DependencyRoots) -> Result<(DependencyMembers, u64)
             if excluded_outputs.contains(&name) {
                 continue;
             }
+            // Actual dynamic extern consumption is refused by the planner.
+            // Shared Cargo dependency directories still contain proc-macro
+            // outputs for unrelated units; those files cannot be selected by
+            // this admitted metadata-only invocation, so they are not inputs.
+            if name.ends_with(".so") || name.ends_with(".dylib") {
+                continue;
+            }
             count += 1;
             if count > MAX_DEPENDENCY_FILES {
                 return Err("dependency candidate count exceeds class bound".into());
             }
             let meta = std::fs::symlink_metadata(entry.path()).map_err(|e| e.to_string())?;
-            // Proc-macro/dylib (`.so`), interface (`.rs`) and static-library
-            // candidates stay refusals: the class keys plain Rust metadata.
+            // Interface (`.rs`), static-library and unknown lib-prefixed
+            // candidates remain refusals: unlike unrelated dynamic outputs,
+            // the admitted class has no earlier argument-level proof that
+            // rustc cannot select these names.
             if !meta.is_file() || !(name.ends_with(".rlib") || name.ends_with(".rmeta")) {
                 return Err(format!("unsupported dependency directory member {name}"));
             }
@@ -2219,16 +2227,39 @@ mod tests {
     }
 
     #[test]
+    fn unrelated_dynamic_outputs_do_not_poison_metadata_dependency_closure() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        std::fs::write(root.join("libdep-0123.rmeta"), b"metadata").unwrap();
+        let roots = vec![(root.clone(), Vec::new())];
+        let (members, _) = walk_dependencies(&roots).unwrap();
+        let captured = capture_dependencies(
+            &LiveFacts::new(),
+            roots.clone(),
+            members.clone(),
+            (dir.path().join("out"), Vec::new()),
+            None,
+        )
+        .unwrap();
+
+        // Cargo puts proc-macro artifacts for sibling units in the same
+        // target/deps directory. An admitted action cannot consume either:
+        // an explicit dynamic --extern is rejected during planning.
+        std::fs::write(root.join("libderive-1111.so"), b"proc macro").unwrap();
+        std::fs::write(root.join("libderive-2222.dylib"), b"proc macro").unwrap();
+        assert_eq!(walk_dependencies(&roots).unwrap().0, members);
+        captured.verify_unchanged().unwrap();
+
+        // Metadata remains part of the exact negative/positive closure.
+        std::fs::write(root.join("libother-4567.rmeta"), b"other metadata").unwrap();
+        assert!(captured.verify_unchanged().is_err());
+    }
+
+    #[test]
     fn dependency_candidates_refuse_unmodeled_crate_files_and_symlinks() {
-        // Everything rustc's locator could open that this class does not
-        // model (proc-macros/dylibs, interfaces, static libs) still refuses.
-        for name in [
-            "libmacro.so",
-            "libmacro.dylib",
-            "libnative.a",
-            "libiface.rs",
-            "libunknown",
-        ] {
+        // Interface, static-library and unknown lib-prefixed candidates have
+        // no argument-level proof that this admitted class cannot select them.
+        for name in ["libnative.a", "libiface.rs", "libunknown"] {
             let dir = tempfile::tempdir().unwrap();
             std::fs::write(dir.path().join(name), b"not a Rust candidate").unwrap();
             assert!(
