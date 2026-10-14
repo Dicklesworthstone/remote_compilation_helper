@@ -253,7 +253,7 @@ fn prepare_fresh_stage(
     writer: &DurableLeaseWriter,
     recipe: &RecoveryRecipe,
     root: &Path,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<staging::FreshStage> {
     use rustix::fs::{Mode, OFlags};
     use std::os::unix::fs::DirBuilderExt;
     anyhow::ensure!(
@@ -277,17 +277,27 @@ fn prepare_fresh_stage(
     );
     let stage = root.join(&recipe.identity);
     // A stage must not become part of the caller's output set, or contain the
-    // journal that owns it. Resolve existing aliases before the overlap check.
-    for protected in recipe
+    // journal that owns it or enter an old retained stage. Keep original names
+    // so the held preparation can recheck aliases before journal publication.
+    let old_stage = recipe
+        .transfer
+        .retrieval_staging_dir
+        .clone()
+        .unwrap_or_else(|| default_job_lease_directory().join("retrieval"))
+        .join(&recipe.identity);
+    let protected: Vec<_> = recipe
         .phases
         .iter()
         .map(|phase| phase.local.as_path())
         .chain(writer.path.parent())
-    {
+        .chain(std::iter::once(old_stage.as_path()))
+        .map(Path::to_owned)
+        .collect();
+    for protected in &protected {
         let protected = output_lock_root_identity(protected)?;
         anyhow::ensure!(
             !stage.starts_with(&protected) && !protected.starts_with(&stage),
-            "fresh retrieval stage overlaps a publication or journal directory"
+            "fresh retrieval stage overlaps a publication, journal or retained staging directory"
         );
     }
     // Do not reuse even an empty pre-existing identity tree: it can contain
@@ -321,13 +331,7 @@ fn prepare_fresh_stage(
         Mode::RUSR | Mode::WUSR | Mode::XUSR,
     )
     .context("create exclusive fresh recovery stage; prior trees are never adopted")?;
-    directory.sync_all()?;
-    let named = std::fs::symlink_metadata(root)?;
-    anyhow::ensure!(
-        named.is_dir() && named.dev() == held.dev() && named.ino() == held.ino(),
-        "fresh staging directory changed; journal and previous staging retained"
-    );
-    Ok(())
+    staging::FreshStage::hold(directory, root, identity, protected)
 }
 
 fn apply(
@@ -349,23 +353,14 @@ fn apply(
     let root = current.retrieval_staging_dir.as_deref().context(
         "artifact policy refinement requires transfer.retrieval_staging_dir pointing to a fresh base; existing staging is retained"
     )?;
-    prepare_fresh_stage(writer, &recipe, root)?;
-    let previous = retain_previous_journal(ownership, writer, &lease)?;
-    anyhow::ensure!(
-        ownership.read(&writer.wrapper_id())? == lease,
-        "journal changed before artifact policy publication; previous evidence retained"
-    );
+    let stage = prepare_fresh_stage(writer, &recipe, root)?;
     // Store the SAME configured root used by the ordinary recovery config
     // merge, so that merge cannot redirect collection back into the old tree.
     next.transfer.retrieval_staging_dir = Some(root.to_owned());
-    writer
-        .set_recovery(serde_json::to_value(next)?)
-        .with_context(|| {
-            format!(
-                "artifact policy not acknowledged; prior journal retained at {}",
-                previous.display()
-            )
-        })?;
+    let reserve = current
+        .retrieval_min_free_bytes
+        .max(recipe.transfer.retrieval_min_free_bytes);
+    let previous = stage.publish(writer, &lease, serde_json::to_value(next)?, reserve)?;
     eprintln!(
         "[RCH] refined implicit Make artifact selection for {}: excluded directories {:?}; prior journal {}; prior staging retained; compilation was not replayed",
         request.wrapper_id,
@@ -632,6 +627,61 @@ mod tests {
             assert_eq!(std::fs::read(old).unwrap(), b"retained");
             assert!(!session.writer.snapshot().terminal_acknowledged);
         }
+    }
+
+    #[test]
+    fn refinement_honors_current_and_persisted_reserves_before_changing_policy() {
+        for persisted in [false, true] {
+            let (root, mut session, _, _) = fixture(true);
+            if persisted {
+                session.recipe.transfer.retrieval_min_free_bytes = u64::MAX;
+                session.persist().unwrap();
+            }
+            let old = session.stage(0).join("retained-result");
+            std::fs::write(&old, b"completed worker result").unwrap();
+            let before = std::fs::read(&session.writer.path).unwrap();
+            let lease = session.writer.snapshot();
+            let current = TransferConfig {
+                retrieval_staging_dir: Some(root.join("fresh-stage")),
+                retrieval_min_free_bytes: if persisted { 0 } else { u64::MAX },
+                ..Default::default()
+            };
+            let error = apply(
+                &session.writer,
+                &request(&session, &["build/tools"]),
+                &current,
+            )
+            .unwrap_err();
+            assert!(format!("{error:#}").contains("insufficient fresh retrieval staging space"));
+            assert_eq!(std::fs::read(&session.writer.path).unwrap(), before);
+            assert_eq!(session.writer.snapshot(), lease);
+            assert_eq!(std::fs::read(old).unwrap(), b"completed worker result");
+            assert!(!session.writer.snapshot().terminal_acknowledged);
+        }
+    }
+
+    #[test]
+    fn refinement_cannot_create_its_fresh_stage_inside_retained_staging() {
+        let (root, session, _, _) = fixture(true);
+        let old = session.stage(0).join(".rch-clean-overlay-base.tar");
+        std::fs::write(&old, b"retained source input").unwrap();
+        let current = TransferConfig {
+            retrieval_staging_dir: Some(session.stage(0).join("nested-stage")),
+            ..Default::default()
+        };
+        let before = std::fs::read(&session.writer.path).unwrap();
+        assert!(
+            apply(
+                &session.writer,
+                &request(&session, &["build/tools"]),
+                &current
+            )
+            .is_err()
+        );
+        assert_eq!(std::fs::read(&session.writer.path).unwrap(), before);
+        assert_eq!(std::fs::read(old).unwrap(), b"retained source input");
+        assert!(!session.stage(0).join("nested-stage").exists());
+        assert!(!root.join("fresh-stage").exists());
     }
 
     #[test]

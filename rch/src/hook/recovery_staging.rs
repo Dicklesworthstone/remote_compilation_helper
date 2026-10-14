@@ -8,12 +8,176 @@
 
 use super::*;
 use std::ffi::OsStr;
+use std::os::unix::fs::MetadataExt;
 
 #[cfg(test)]
 #[path = "recovery_staging_tests.rs"]
 mod integration_tests;
 
 pub(super) const REQUEST_ENV: &str = "RCH_RECOVERY_RELOCATE_STAGING";
+
+/// Keep the exact fresh namespace open until the journal has selected it.
+/// Dropping this guard only closes descriptors; failed preparations are never
+/// removed. This guards the preparation-to-publication handoff, not arbitrary
+/// later mutation by processes outside RCH's ownership protocol.
+pub(super) struct FreshStage {
+    base: File,
+    directory: File,
+    root: PathBuf,
+    identity: std::ffi::CString,
+    protected: Vec<PathBuf>,
+}
+
+impl FreshStage {
+    pub(super) fn hold(
+        base: File,
+        root: &Path,
+        identity: std::ffi::CString,
+        protected: Vec<PathBuf>,
+    ) -> anyhow::Result<Self> {
+        use rustix::fs::{Mode, OFlags};
+        let directory = File::from(rustix::fs::openat(
+            base.as_fd(),
+            identity.as_c_str(),
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+        )?);
+        let stage = Self {
+            base,
+            directory,
+            root: root.to_owned(),
+            identity,
+            protected,
+        };
+        stage.verify()?;
+        stage.directory.sync_all()?;
+        stage.base.sync_all()?;
+        stage.verify()?;
+        Ok(stage)
+    }
+
+    fn verify_names(&self) -> anyhow::Result<()> {
+        use rustix::fs::{Mode, OFlags};
+        let base = self.base.metadata()?;
+        let named_base = std::fs::symlink_metadata(&self.root)?;
+        let directory = self.directory.metadata()?;
+        let named_directory = File::from(rustix::fs::openat(
+            self.base.as_fd(),
+            self.identity.as_c_str(),
+            OFlags::RDONLY
+                | OFlags::DIRECTORY
+                | OFlags::CLOEXEC
+                | OFlags::NOFOLLOW
+                | OFlags::NONBLOCK,
+            Mode::empty(),
+        )?)
+        .metadata()?;
+        let uid = rustix::process::geteuid().as_raw();
+        anyhow::ensure!(
+            base.is_dir()
+                && named_base.is_dir()
+                && base.dev() == named_base.dev()
+                && base.ino() == named_base.ino()
+                && base.uid() == uid
+                && named_base.uid() == uid
+                && base.mode() & 0o022 == 0
+                && named_base.mode() & 0o022 == 0
+                && directory.is_dir()
+                && named_directory.is_dir()
+                && directory.dev() == named_directory.dev()
+                && directory.ino() == named_directory.ino()
+                && directory.uid() == uid
+                && named_directory.uid() == uid
+                && directory.mode() & 0o077 == 0
+                && named_directory.mode() & 0o077 == 0
+                && output_lock_root_identity(&self.root)? == self.root,
+            "prepared retrieval staging identity or permissions changed; all evidence retained"
+        );
+        let path = self.root.join(self.identity.to_str()?);
+        for protected in &self.protected {
+            let protected = output_lock_root_identity(protected)?;
+            anyhow::ensure!(
+                !path.starts_with(&protected) && !protected.starts_with(&path),
+                "prepared retrieval staging overlaps retained evidence or output ownership"
+            );
+        }
+        Ok(())
+    }
+
+    fn verify(&self) -> anyhow::Result<()> {
+        self.verify_names()?;
+        // A fresh tree populated by another actor is not ours to merge, even
+        // when it contains only empty directories or ordinary compiler files.
+        // Inspect through the held descriptor, not a reopened pathname.
+        let mut entries = rustix::fs::Dir::read_from(&self.directory)?;
+        entries.rewind();
+        while let Some(entry) = entries.read() {
+            let entry = entry?;
+            let name = entry.file_name().to_bytes();
+            anyhow::ensure!(
+                name == b"." || name == b"..",
+                "prepared retrieval staging is no longer empty; retained entries were not changed"
+            );
+        }
+        self.verify_names()
+    }
+
+    fn check_space(&self, reserve: u64) -> anyhow::Result<()> {
+        self.verify()?;
+        // Never reopen a possibly substituted path just to measure another
+        // filesystem. Both refinement and storage-only relocation use this.
+        let stats = rustix::fs::fstatvfs(self.directory.as_fd())?;
+        anyhow::ensure!(
+            stats.f_frsize > 0,
+            "staging filesystem has no allocation size"
+        );
+        let available = stats.f_bavail.saturating_mul(stats.f_frsize);
+        anyhow::ensure!(
+            available >= reserve,
+            "insufficient fresh retrieval staging space: available {available}, reserve {reserve}; \
+             journal and old staging retained; choose another fresh durable base"
+        );
+        self.verify()
+    }
+
+    pub(super) fn publish(
+        &self,
+        writer: &DurableLeaseWriter,
+        lease: &DurableJobLease,
+        next: serde_json::Value,
+        reserve: u64,
+    ) -> anyhow::Result<PathBuf> {
+        let ownership = writer
+            .recovery_ownership
+            .as_ref()
+            .context("fresh staging publication requires exclusive recovery ownership")?;
+        anyhow::ensure!(
+            next["transfer"]["retrieval_staging_dir"] == serde_json::to_value(&self.root)?,
+            "proposed retrieval recipe does not select the prepared staging base"
+        );
+        self.check_space(reserve)?;
+        let previous = retain_previous_journal(ownership, writer, lease)?;
+        // Retaining/syncing the audit copy is an I/O boundary, not proof that
+        // the prepared stage still exists at its original name afterward.
+        self.check_space(reserve)?;
+        anyhow::ensure!(
+            ownership.read(&writer.wrapper_id())? == *lease,
+            "journal changed before fresh staging publication; all evidence retained"
+        );
+        writer.set_recovery(next).with_context(|| {
+            format!(
+                "fresh staging publication unverified; prior journal {}",
+                previous.display()
+            )
+        })?;
+        // A post-publication error must not be reported as a rollback: leave
+        // the journal and both trees for reconciliation, never erase evidence.
+        self.verify().context(
+            "staging changed during journal publication; recorded location requires reconciliation",
+        )?;
+        Ok(previous)
+    }
+}
 
 pub(super) fn requested_wrapper(
     value: Option<&OsStr>,
@@ -129,38 +293,14 @@ pub(super) fn relocate(
         .and_then(serde_json::Value::as_object_mut)
         .context("invalid persisted transfer configuration")?
         .insert("retrieval_staging_dir".into(), serde_json::to_value(root)?);
-    prepare_fresh_stage(writer, &recipe, root)?;
+    let stage = prepare_fresh_stage(writer, &recipe, root)?;
     // Payload sizing still happens through the real, filtered collector after
     // source reacquisition. Check the configured reserve here too so a clearly
     // unusable destination cannot replace the recorded staging location.
-    let directory = File::from(rustix::fs::open(
-        &new_stage,
-        rustix::fs::OFlags::RDONLY
-            | rustix::fs::OFlags::DIRECTORY
-            | rustix::fs::OFlags::CLOEXEC
-            | rustix::fs::OFlags::NOFOLLOW,
-        rustix::fs::Mode::empty(),
-    )?);
-    let stats = rustix::fs::fstatvfs(directory.as_fd())?;
-    anyhow::ensure!(
-        stats.f_frsize > 0,
-        "staging filesystem has no allocation size"
-    );
-    let available = stats.f_bavail.saturating_mul(stats.f_frsize);
     let reserve = current
         .retrieval_min_free_bytes
         .max(recipe.transfer.retrieval_min_free_bytes);
-    anyhow::ensure!(
-        available >= reserve,
-        "insufficient relocation staging space: available {available}, reserve {reserve}; \
-         journal and old staging retained; choose another fresh durable base"
-    );
-    let previous = retain_previous_journal(ownership, writer, &lease)?;
-    anyhow::ensure!(
-        ownership.read(&writer.wrapper_id())? == lease,
-        "journal changed before staging relocation publication; all evidence retained"
-    );
-    writer.set_recovery(next)?;
+    let previous = stage.publish(writer, &lease, next, reserve)?;
     eprintln!(
         "[RCH] relocated collection for {wrapper} to {}; prior journal {}; \
          old staging {}; publication checkpoints preserved; compilation was not replayed",
@@ -176,6 +316,203 @@ mod tests {
     use super::super::tests::fixture_with_results;
     use super::*;
     use std::os::unix::ffi::OsStringExt;
+
+    fn next_stage(lease: &DurableJobLease, root: &Path) -> serde_json::Value {
+        let mut next = lease.recovery.clone().unwrap();
+        next["transfer"]["retrieval_staging_dir"] = serde_json::to_value(root).unwrap();
+        next
+    }
+
+    #[test]
+    fn replaced_prepared_names_never_switch_the_journal_or_touch_either_tree() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        for replacement in [
+            "base", "directory", "symlink", "file", "base-mode", "stage-mode",
+        ] {
+            let (root, session, _, _) = fixture_with_results(true, &[]);
+            let writer = &session.writer;
+            let lease = writer.snapshot();
+            let base = root.join("fresh-stage");
+            let stage_path = base.join(&session.recipe.identity);
+            let guard = prepare_fresh_stage(writer, &session.recipe, &base).unwrap();
+            let original_inode = guard.directory.metadata().unwrap().ino();
+            let retained = root.join("retained-preparation");
+            match replacement {
+                "base" => {
+                    std::fs::rename(&base, &retained).unwrap();
+                    std::fs::create_dir_all(&stage_path).unwrap();
+                    std::fs::set_permissions(&stage_path, std::fs::Permissions::from_mode(0o700))
+                        .unwrap();
+                }
+                "directory" | "symlink" | "file" => {
+                    std::fs::rename(&stage_path, &retained).unwrap();
+                    match replacement {
+                        "directory" => {
+                            std::fs::create_dir(&stage_path).unwrap();
+                            std::fs::set_permissions(
+                                &stage_path,
+                                std::fs::Permissions::from_mode(0o700),
+                            )
+                            .unwrap();
+                        }
+                        "symlink" => symlink(&retained, &stage_path).unwrap(),
+                        "file" => std::fs::write(&stage_path, b"other owner's evidence").unwrap(),
+                        _ => unreachable!(),
+                    }
+                }
+                "base-mode" | "stage-mode" => {
+                    let path = if replacement == "base-mode" {
+                        &base
+                    } else {
+                        &stage_path
+                    };
+                    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o777))
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let before = std::fs::read(&writer.path).unwrap();
+            let journal_entries = std::fs::read_dir(writer.path.parent().unwrap())
+                .unwrap()
+                .count();
+            assert!(
+                guard
+                    .publish(writer, &lease, next_stage(&lease, &base), 0)
+                    .is_err(),
+                "{replacement}"
+            );
+            assert_eq!(std::fs::read(&writer.path).unwrap(), before);
+            assert_eq!(writer.snapshot(), lease);
+            assert_eq!(
+                std::fs::read_dir(writer.path.parent().unwrap())
+                    .unwrap()
+                    .count(),
+                journal_entries,
+                "refused destination created a journal temporary or backup"
+            );
+            assert_eq!(guard.directory.metadata().unwrap().ino(), original_inode);
+            assert!(std::fs::symlink_metadata(&stage_path).is_ok());
+            if replacement == "file" {
+                assert_eq!(std::fs::read(&stage_path).unwrap(), b"other owner's evidence");
+            }
+            if replacement == "symlink" {
+                assert_eq!(std::fs::read_link(&stage_path).unwrap(), retained);
+            }
+            assert!(!writer.snapshot().terminal_acknowledged);
+            assert!(acquire_gate(&writer.path).is_err());
+        }
+    }
+
+    #[test]
+    fn populated_preparation_is_retained_not_merged_as_fresh_staging() {
+        for entry in ["file", "directory", "symlink"] {
+            let (root, session, _, _) = fixture_with_results(true, &[]);
+            let writer = &session.writer;
+            let lease = writer.snapshot();
+            let base = root.join("fresh-stage");
+            let guard = prepare_fresh_stage(writer, &session.recipe, &base).unwrap();
+            let name = base.join(&session.recipe.identity).join("unowned");
+            match entry {
+                "file" => std::fs::write(&name, b"retain unrelated bytes").unwrap(),
+                "directory" => std::fs::create_dir(&name).unwrap(),
+                "symlink" => std::os::unix::fs::symlink(&writer.path, &name).unwrap(),
+                _ => unreachable!(),
+            }
+            let before = std::fs::read(&writer.path).unwrap();
+            let inode = std::fs::symlink_metadata(&name).unwrap().ino();
+            assert!(
+                guard
+                    .publish(writer, &lease, next_stage(&lease, &base), 0)
+                    .is_err()
+            );
+            assert_eq!(std::fs::read(&writer.path).unwrap(), before);
+            assert_eq!(writer.snapshot(), lease);
+            assert_eq!(std::fs::symlink_metadata(&name).unwrap().ino(), inode);
+            if entry == "file" {
+                assert_eq!(std::fs::read(&name).unwrap(), b"retain unrelated bytes");
+            }
+        }
+    }
+
+    #[test]
+    fn prepared_stage_rechecks_output_aliases_before_journal_publication() {
+        let (root, mut session, _, _) = fixture_with_results(true, &[]);
+        let alias = root.join("output-alias");
+        std::os::unix::fs::symlink(&session.recipe.project_root, &alias).unwrap();
+        session.recipe.phases[0].local = alias.clone();
+        session.persist().unwrap();
+        let writer = &session.writer;
+        let lease = writer.snapshot();
+        let base = root.join("fresh-stage");
+        let guard = prepare_fresh_stage(writer, &session.recipe, &base).unwrap();
+        // Keep the original alias as evidence; a new output alias would now
+        // point publication into the staging tree. The handoff must refuse.
+        let original_alias = root.join("original-output-alias");
+        std::fs::rename(&alias, &original_alias).unwrap();
+        std::os::unix::fs::symlink(base.join(&session.recipe.identity), &alias).unwrap();
+        let before = std::fs::read(&writer.path).unwrap();
+        assert!(
+            guard
+                .publish(writer, &lease, next_stage(&lease, &base), 0)
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&writer.path).unwrap(), before);
+        assert_eq!(writer.snapshot(), lease);
+        assert_eq!(
+            std::fs::read_link(original_alias).unwrap(),
+            session.recipe.project_root
+        );
+        assert!(
+            std::fs::symlink_metadata(alias)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[test]
+    fn fresh_stage_budget_and_recipe_binding_precede_any_journal_write() {
+        let (root, session, _, _) = fixture_with_results(true, &[]);
+        let writer = &session.writer;
+        let lease = writer.snapshot();
+        let base = root.join("fresh-stage");
+        let guard = prepare_fresh_stage(writer, &session.recipe, &base).unwrap();
+        let before = std::fs::read(&writer.path).unwrap();
+        let count = std::fs::read_dir(writer.path.parent().unwrap())
+            .unwrap()
+            .count();
+        assert!(
+            guard
+                .publish(writer, &lease, next_stage(&lease, &base), u64::MAX)
+                .is_err()
+        );
+        assert!(
+            guard
+                .publish(writer, &lease, next_stage(&lease, &root.join("not-prepared")), 0)
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&writer.path).unwrap(), before);
+        assert_eq!(writer.snapshot(), lease);
+        assert_eq!(
+            std::fs::read_dir(writer.path.parent().unwrap())
+                .unwrap()
+                .count(),
+            count
+        );
+        // The exact same, still-empty preparation remains usable after a
+        // transient refusal. No need to delete or regenerate any output.
+        let backup = guard
+            .publish(writer, &lease, next_stage(&lease, &base), 0)
+            .unwrap();
+        assert_eq!(std::fs::read(backup).unwrap(), before);
+        assert_eq!(
+            writer.snapshot().recovery.unwrap(),
+            next_stage(&lease, &base)
+        );
+        assert!(guard.verify().is_ok());
+        assert!(!writer.snapshot().terminal_acknowledged);
+    }
 
     #[test]
     fn relocation_request_is_explicit_literal_and_not_combined_with_exclusions() {
