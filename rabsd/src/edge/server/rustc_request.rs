@@ -59,6 +59,8 @@ mod admission_preflight;
 mod build_script_reuse;
 #[path = "directory_source.rs"]
 mod directory_source;
+#[path = "input_preparation.rs"]
+mod input_preparation;
 
 /// Largest completion frame: a bounded transcript in hex plus envelope.
 pub(super) const MAX_COMPLETION_FRAME_BYTES: usize = 2 * MAX_TRANSCRIPT_BYTES + 64 * 1024;
@@ -343,14 +345,15 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
         Err(FactsMiss::Pending) if may_wait => return preparing(unit, PendingFacts::Toolchain),
         Err(miss) => return refuse(&miss.to_string()),
     };
-    let package = match live.facts.package(
-        Path::new(&plan.source_root),
-        plan.source_kind,
-        plan.generated_root.as_deref().map(Path::new),
-    ) {
-        Ok(package) => package,
-        Err(FactsMiss::Pending) if may_wait => return preparing(unit, PendingFacts::Package),
-        Err(miss) => {
+    let (package, dependencies) = match input_preparation::observe(&live.facts, &plan, may_wait) {
+        Ok(observed) => observed,
+        Err(input_preparation::InputMiss::Package(FactsMiss::Pending)) if may_wait => {
+            return preparing(unit, PendingFacts::Package);
+        }
+        Err(input_preparation::InputMiss::Dependencies(FactsMiss::Pending)) if may_wait => {
+            return preparing(unit, PendingFacts::Dependencies);
+        }
+        Err(input_preparation::InputMiss::Package(miss)) => {
             log(
                 "pass-through",
                 &[
@@ -362,6 +365,7 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
             );
             return Decided::Reply(pass_through(&miss.to_string()));
         }
+        Err(input_preparation::InputMiss::Dependencies(miss)) => return refuse(&miss.to_string()),
     };
     if let Err(reason) = package.verify_generated_disjoint(&plan) {
         return refuse(&reason);
@@ -406,13 +410,6 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
             }),
     );
     let mut externs = Vec::new();
-    let dependencies = match live.facts.dependencies(&plan) {
-        Ok(dependencies) => dependencies,
-        Err(FactsMiss::Pending) if may_wait => {
-            return preparing(unit, PendingFacts::Dependencies);
-        }
-        Err(miss) => return refuse(&miss.to_string()),
-    };
     for planned in &plan.externs {
         if let PlannedExtern::File { path, .. } = planned {
             match live.facts.file_digest(Path::new(path)) {
