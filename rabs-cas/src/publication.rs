@@ -618,6 +618,7 @@ pub fn process_offer(
 ) -> Result<PublicationOutcome, OfferRefusal> {
     // 1. Authority fence: active authority + F033 digest equality.
     let offered_authority = authority_digest(&offer.authority.coordinator);
+    store.intern_domain(offered_authority.domain);
     let active = store.active_authority()?;
     match active {
         Some(row) if row.digest == offered_authority => {}
@@ -658,6 +659,7 @@ pub fn process_offer(
     if offer.manifest.action_key != offer.authority.action_key {
         return Err(OfferRefusal::ActionKeyMismatch);
     }
+    store.intern_domain(offer.manifest.action_key.domain);
     let entry = store
         .lookup_action(&offer.manifest.action_key)?
         .ok_or(OfferRefusal::UnknownActionEntry)?;
