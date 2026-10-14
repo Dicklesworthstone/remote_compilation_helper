@@ -6,6 +6,7 @@
 //! claim. Existing source claims, including legacy broad ones, remain immutable.
 
 use super::super::ssh::{
+    RemoteSourceAuthorityLock, acquire_remote_source_authority_lock,
     canonical_source_authority_root, run_offload_ssh_command_with_stdin,
     validate_source_authority_intent,
 };
@@ -19,6 +20,62 @@ const PATHS: &str = include_str!("source_namespace_paths.sh");
 const ADMISSION: &str = include_str!("source_claim_admission.sh");
 const CLAIMS: &str = include_str!("source_claim_registry.sh");
 const CONTROL: &str = include_str!("source_namespace_control.sh");
+const SOURCE_ADMISSION_WAIT: Duration = Duration::from_secs(60);
+
+fn retryable_source_admission_error(error: &anyhow::Error) -> bool {
+    let detail = format!("{error:#}");
+    detail.contains("RCH: durable source ownership: unfinished overlapping source owner")
+        || detail.contains(
+            "RCH: durable source ownership: unfinished overlapping physical source owner",
+        )
+}
+
+/// A single eligible worker should wait briefly for a completed predecessor
+/// to retire instead of failing the remote-only command immediately. Retry only
+/// the two explicit pre-grant overlap verdicts. Every failed acquisition drops
+/// its remote holder before this function waits, so exact-owner recovery can
+/// still reacquire the source locks and finish retirement (#105).
+pub(super) async fn acquire_source_authority_with_retry(
+    worker: &WorkerConfig,
+    roots: &[String],
+    mut source_pair: Option<&mut RemoteSourceAuthorityLock>,
+    identity: &str,
+    wait_timeout: Duration,
+) -> anyhow::Result<RemoteSourceAuthorityLock> {
+    let deadline = tokio::time::Instant::now() + wait_timeout.min(SOURCE_ADMISSION_WAIT);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            anyhow::bail!(
+                "timed out waiting for overlapping source ownership on {}",
+                worker.id
+            );
+        }
+        match acquire_remote_source_authority_lock(
+            worker,
+            roots,
+            source_pair.as_deref_mut(),
+            identity,
+            remaining,
+        )
+        .await
+        {
+            Ok(guard) => return Ok(guard),
+            Err(error)
+                if retryable_source_admission_error(&error)
+                    && tokio::time::Instant::now() < deadline =>
+            {
+                let remaining =
+                    deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    return Err(error);
+                }
+                tokio::time::sleep(Duration::from_secs(1).min(remaining)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
 
 /// The only durable roots are actual sync destinations and exact auxiliary
 /// trees this job mutates. Deliberately accept no topology policy here. A base
@@ -243,6 +300,27 @@ mod tests {
                     Some("claim" | "pending")
                 )
             }));
+        }
+    }
+
+    #[test]
+    fn source_admission_retry_classifier_is_narrow() {
+        let lexical = anyhow::anyhow!(
+            "source-authority lock exited; stderr=RCH: durable source ownership: unfinished overlapping source owner"
+        );
+        let physical = anyhow::anyhow!(
+            "source-authority lock exited; stderr=RCH: durable source ownership: unfinished overlapping physical source owner"
+        );
+        assert!(retryable_source_admission_error(&lexical));
+        assert!(retryable_source_admission_error(&physical));
+
+        for terminal in [
+            "RCH: durable source ownership: invalid claim record",
+            "RCH: durable source ownership: source intent cancelled",
+            "RCH: durable source ownership: source identity already claimed",
+            "SSH command timed out",
+        ] {
+            assert!(!retryable_source_admission_error(&anyhow::anyhow!("{terminal}")));
         }
     }
 
