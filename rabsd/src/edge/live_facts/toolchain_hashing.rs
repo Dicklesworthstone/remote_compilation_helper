@@ -230,9 +230,9 @@ fn hash_jobs(
         let other = helper.map_or_else(
             || Ok(Vec::new()),
             |helper| {
-                helper.join().unwrap_or_else(|_| {
-                    Err(io::Error::other("toolchain digest helper panicked"))
-                })
+                helper
+                    .join()
+                    .unwrap_or_else(|_| Err(io::Error::other("toolchain digest helper panicked")))
             },
         );
         let mut complete = owner?;
@@ -245,9 +245,7 @@ fn hash_jobs(
     }
     ordered
         .into_iter()
-        .map(|digest| {
-            digest.ok_or_else(|| io::Error::other("incomplete toolchain digest batch"))
-        })
+        .map(|digest| digest.ok_or_else(|| io::Error::other("incomplete toolchain digest batch")))
         .collect()
 }
 
@@ -285,10 +283,7 @@ mod tests {
         let (_dir, paths) = fixture();
         let jobs = observed(&paths);
         let busy = AtomicBool::new(false);
-        let expected: Vec<_> = jobs
-            .iter()
-            .map(|&(p, s)| digest(p, s).unwrap())
-            .collect();
+        let expected: Vec<_> = jobs.iter().map(|&(p, s)| digest(p, s).unwrap()).collect();
         assert_eq!(hash_jobs(&jobs, &busy, false, &digest).unwrap(), expected);
         assert_eq!(hash_jobs(&jobs, &busy, true, &digest).unwrap(), expected);
         assert!(!busy.load(Ordering::Acquire));
@@ -450,7 +445,10 @@ mod tests {
         };
         let actual = hash(&inputs).unwrap();
         assert_eq!(actual.compiler, digest(files[0].0, files[0].1).unwrap());
-        assert_eq!(actual.runtime, vec![digest(files[1].0, files[1].1).unwrap()]);
+        assert_eq!(
+            actual.runtime,
+            vec![digest(files[1].0, files[1].1).unwrap()]
+        );
         assert_eq!(
             actual.sysroot,
             vec![
@@ -476,7 +474,10 @@ mod tests {
         std::fs::write(&paths[0], b"other\0\xff").unwrap();
         let reads = Mutex::new(Vec::new());
         let changed = hash_files(&observed(&paths), &busy, &memo, |path, sig| {
-            assert!(memo.entries.try_lock().is_ok(), "hashing must not hold the memo lock");
+            assert!(
+                memo.entries.try_lock().is_ok(),
+                "hashing must not hold the memo lock"
+            );
             reads.lock().unwrap().push(path.to_path_buf());
             digest(path, sig)
         })
@@ -568,7 +569,10 @@ mod tests {
             }
             digest(path, sig)
         });
-        assert!(first.is_err(), "partial work cannot authorize toolchain facts");
+        assert!(
+            first.is_err(),
+            "partial work cannot authorize toolchain facts"
+        );
         let retried = Mutex::new(Vec::new());
         let complete = hash_files(&files, &busy, &memo, |path, sig| {
             retried.lock().unwrap().push(path.to_path_buf());
@@ -591,7 +595,10 @@ mod tests {
             result
         });
         assert!(result.is_err());
-        assert!(cold.get(&files[0].1).is_none(), "moved input must not be memoized");
+        assert!(
+            cold.get(&files[0].1).is_none(),
+            "moved input must not be memoized"
+        );
     }
 
     #[test]
@@ -614,7 +621,10 @@ mod tests {
             }
             result
         });
-        assert!(result.is_err(), "memo hits cannot exempt aliases from validation");
+        assert!(
+            result.is_err(),
+            "memo hits cannot exempt aliases from validation"
+        );
     }
 
     #[test]
@@ -720,7 +730,10 @@ mod tests {
             gate.0.lock().unwrap().1 = true;
             gate.1.notify_all();
             reader.join().unwrap();
-            assert!(matches!(early, Err(std::sync::mpsc::RecvTimeoutError::Timeout)));
+            assert!(matches!(
+                early,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ));
             assert!(done_rx.recv_timeout(Duration::from_secs(1)).unwrap());
         });
         assert!(!busy.load(Ordering::Acquire));

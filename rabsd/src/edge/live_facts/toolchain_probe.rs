@@ -70,7 +70,9 @@ impl<'a> ProbeSession<'a> {
             return Err(timeout());
         }
         if self.remaining_bytes == 0 {
-            return Err(format!("probe {args:?}: toolchain probe output budget exhausted"));
+            return Err(format!(
+                "probe {args:?}: toolchain probe output budget exhausted"
+            ));
         }
         let limits = DrainLimits {
             // The aggregate cap includes BOTH lanes. A successful capture
@@ -204,7 +206,12 @@ mod tests {
 
         let mut short = ProbeSession::new(&compiler, &[], Duration::from_secs(5), 9).unwrap();
         short.run(&["-vV"]).unwrap();
-        assert!(short.run(&["--print", "sysroot"]).unwrap_err().contains("capture exceeds"));
+        assert!(
+            short
+                .run(&["--print", "sysroot"])
+                .unwrap_err()
+                .contains("capture exceeds")
+        );
         assert_eq!(std::fs::read_dir(short.scratch.path()).unwrap().count(), 0);
     }
 
@@ -230,9 +237,8 @@ mod tests {
     #[test]
     fn stdout_and_stderr_floods_are_failures_without_disk_spill() {
         for redirect in ["", ">&2"] {
-            let body = format!(
-                "trap 'exit 0' TERM; while :; do printf '%0200d' 0 {redirect}; done"
-            );
+            let body =
+                format!("trap 'exit 0' TERM; while :; do printf '%0200d' 0 {redirect}; done");
             let (_dir, compiler) = fixture(&body, "printf root");
             let mut probes =
                 ProbeSession::new(&compiler, &[], Duration::from_secs(5), 1024).unwrap();
@@ -265,7 +271,10 @@ mod tests {
         );
         let pid_file = dir.path().join("descendant");
         let env = vec![("PID_FILE".into(), pid_file.to_str().unwrap().into())];
-        assert_eq!(identity(&compiler, &env).unwrap(), ("version".into(), "root".into()));
+        assert_eq!(
+            identity(&compiler, &env).unwrap(),
+            ("version".into(), "root".into())
+        );
         assert_not_running(&pid_file);
     }
 
@@ -273,15 +282,22 @@ mod tests {
     fn expired_shared_deadline_cannot_start_a_second_query() {
         let (dir, compiler) = fixture("printf version", "printf root");
         let env = logged_env(dir.path());
-        let mut probes =
-            ProbeSession::new(&compiler, &env, Duration::from_secs(5), 1024).unwrap();
+        let mut probes = ProbeSession::new(&compiler, &env, Duration::from_secs(5), 1024).unwrap();
         let deadline = probes.deadline;
         probes.run(&["-vV"]).unwrap();
-        assert_eq!(probes.deadline, deadline, "a query must not renew the budget");
+        assert_eq!(
+            probes.deadline, deadline,
+            "a query must not renew the budget"
+        );
         // Deterministic boundary injection: no sleep-sensitive comparison of
         // two near-deadline wall-clock intervals is needed to prove no spawn.
         probes.deadline = Instant::now();
-        assert!(probes.run(&["--print", "sysroot"]).unwrap_err().contains("deadline expired"));
+        assert!(
+            probes
+                .run(&["--print", "sysroot"])
+                .unwrap_err()
+                .contains("deadline expired")
+        );
         assert_eq!(
             std::fs::read_to_string(dir.path().join("queries")).unwrap(),
             "-vV\n"

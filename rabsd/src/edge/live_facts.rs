@@ -3045,13 +3045,22 @@ while :; do printf '%0200d' 0; done
         for (compiler, root) in probes {
             std::fs::write(compiler, script).unwrap();
             let env = vec![
-                ("STARTED".into(), root.join("started").to_str().unwrap().into()),
-                ("RELEASE".into(), root.join("release").to_str().unwrap().into()),
+                (
+                    "STARTED".into(),
+                    root.join("started").to_str().unwrap().into(),
+                ),
+                (
+                    "RELEASE".into(),
+                    root.join("release").to_str().unwrap().into(),
+                ),
             ];
             assert_eq!(facts.toolchain(compiler, &env), Err(FactsMiss::Pending));
         }
         let deadline = Instant::now() + Duration::from_secs(8);
-        while probes.iter().any(|(_, root)| !root.join("started").exists()) {
+        while probes
+            .iter()
+            .any(|(_, root)| !root.join("started").exists())
+        {
             assert!(Instant::now() < deadline, "probe processes did not start");
             std::thread::sleep(Duration::from_millis(5));
         }
@@ -3064,7 +3073,10 @@ while :; do printf '%0200d' 0; done
         }
         let deadline = Instant::now() + Duration::from_secs(8);
         while *facts.warming.lock().unwrap() != 0 {
-            assert!(Instant::now() < deadline, "failed probes stranded warm capacity");
+            assert!(
+                Instant::now() < deadline,
+                "failed probes stranded warm capacity"
+            );
             std::thread::sleep(Duration::from_millis(5));
         }
         for (compiler, _) in probes {
@@ -3091,7 +3103,10 @@ while :; do printf '%0200d' 0; done
                     break;
                 }
                 Err(FactsMiss::Pending) => {
-                    assert!(Instant::now() < deadline, "healthy toolchain could not recover");
+                    assert!(
+                        Instant::now() < deadline,
+                        "healthy toolchain could not recover"
+                    );
                     std::thread::sleep(Duration::from_millis(5));
                 }
                 Err(error) => panic!("healthy probe refused after capacity recovery: {error}"),
