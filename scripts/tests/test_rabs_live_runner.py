@@ -22,15 +22,32 @@ runner = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(runner)
 
 FAKE_CARGO = r'''
-import hashlib, json, os, pathlib, signal, sys
+import hashlib, json, os, pathlib, signal, stat, sys
 root = pathlib.Path(os.environ["TEST_ROOT"])
 args = sys.argv[1:]
+token = None
+if "TEST_JOBSERVER_READ" in os.environ:
+    read_fd = int(os.environ["TEST_JOBSERVER_READ"])
+    write_fd = int(os.environ["TEST_JOBSERVER_WRITE"])
+    assert stat.S_ISFIFO(os.fstat(read_fd).st_mode)
+    assert stat.S_ISFIFO(os.fstat(write_fd).st_mode)
+    token = os.read(read_fd, 1)
+    assert token == b"+"
+    assert os.write(write_fd, token) == 1
+    token = token.hex()
+inherited = []
+for entry in pathlib.Path("/proc/self/fd").iterdir():
+    try:
+        inherited.append(os.readlink(entry))
+    except FileNotFoundError:
+        pass
 with (root / "calls.jsonl").open("a") as log:
     log.write(json.dumps({"argv": args, "cwd": os.getcwd(),
         "manifest": os.environ.get("RABS_TEST_BINARIES"),
         "toolchain": os.environ.get("RUSTUP_TOOLCHAIN"),
         "rustflags": os.environ.get("RUSTFLAGS"),
-        "makeflags": os.environ.get("CARGO_MAKEFLAGS")}) + "\n")
+        "makeflags": os.environ.get("CARGO_MAKEFLAGS"),
+        "jobserver_token": token, "inherited": inherited}) + "\n")
 mode = os.environ.get("TEST_MODE", "good")
 if args[0] == "build":
     target = pathlib.Path(args[args.index("--target-dir") + 1])
@@ -111,7 +128,7 @@ class RunnerTests(unittest.TestCase):
         self.cargo.chmod(0o700)
         self.count = 0
 
-    def launch(self, args=(), changes=None):
+    def launch(self, args=(), changes=None, pass_fds=()):
         self.count += 1
         self.output = self.root / ("run-" + str(self.count))
         env = {key: value for key, value in os.environ.items()
@@ -120,7 +137,8 @@ class RunnerTests(unittest.TestCase):
         env.update(changes or {})
         result = subprocess.run([sys.executable, "-S", str(self.program), "--cargo", str(self.cargo),
                                  "--output-dir", str(self.output)] + list(args),
-                                env=env, cwd=self.root, capture_output=True, timeout=15)
+                                env=env, cwd=self.root, capture_output=True, timeout=15,
+                                pass_fds=pass_fds)
         return result
 
     def calls(self):
@@ -175,6 +193,58 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(call["rustflags"], changes["RUSTFLAGS"])
             self.assertEqual(call["makeflags"], changes["CARGO_MAKEFLAGS"])
             self.assertNotEqual(call["manifest"], "/stale/manifest")
+
+    def test_real_jobserver_pipe_survives_both_cargo_process_boundaries(self):
+        for spelling in ["--jobserver-auth", "--jobserver-fds"]:
+            with self.subTest(spelling=spelling):
+                read_fd, write_fd = os.pipe()
+                try:
+                    os.write(write_fd, b"+")
+                    os.set_blocking(read_fd, False)
+                    flags = "-j {}={},{}".format(spelling, read_fd, write_fd)
+                    mark = len(self.calls())
+                    result = self.launch(changes={
+                        "CARGO_MAKEFLAGS": flags,
+                        "TEST_JOBSERVER_READ": str(read_fd),
+                        "TEST_JOBSERVER_WRITE": str(write_fd),
+                    }, pass_fds=(read_fd, write_fd))
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    calls = self.calls()[mark:]
+                    self.assertEqual([call["argv"][0] for call in calls], ["build", "test"])
+                    for call in calls:
+                        self.assertEqual(call["makeflags"], flags)
+                        self.assertEqual(call["jobserver_token"], "2b")
+                        self.assertNotIn(str(self.output / "cargo-build.jsonl"), call["inherited"])
+                    self.assertEqual(os.read(read_fd, 1), b"+")
+                    with self.assertRaises(BlockingIOError):
+                        os.read(read_fd, 1)  # The runner must not invent capacity.
+                finally:
+                    os.close(read_fd)
+                    os.close(write_fd)
+
+    def test_jobserver_capacity_survives_build_and_test_failure(self):
+        for changes, expected in [({"TEST_MODE": "nonzero"}, 31), ({"TEST_EXIT": "37"}, 37)]:
+            with self.subTest(changes=changes):
+                read_fd, write_fd = os.pipe()
+                try:
+                    os.write(write_fd, b"+")
+                    os.set_blocking(read_fd, False)
+                    result = self.launch(changes={
+                        **changes, "CARGO_MAKEFLAGS": "-j --jobserver-auth={},{}".format(read_fd, write_fd),
+                        "TEST_JOBSERVER_READ": str(read_fd),
+                        "TEST_JOBSERVER_WRITE": str(write_fd),
+                    }, pass_fds=(read_fd, write_fd))
+                    self.assertEqual(result.returncode, expected, result.stderr)
+                    self.assertEqual(os.read(read_fd, 1), b"+")
+                finally:
+                    os.close(read_fd)
+                    os.close(write_fd)
+
+    def test_runner_private_log_descriptor_does_not_leak_to_cargo(self):
+        result = self.launch()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for call in self.calls():
+            self.assertNotIn(str(self.output / "cargo-build.jsonl"), call["inherited"])
 
     def test_build_failure_propagates_and_never_runs_tests(self):
         result = self.launch(changes={"TEST_MODE": "nonzero"})

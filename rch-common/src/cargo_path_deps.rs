@@ -3563,10 +3563,15 @@ mod tests {
             error.kind(),
             &CargoPathDependencyErrorKind::MissingPathDependency
         );
+        // The error names the canonical path (macOS tempdirs live under the
+        // /var -> /private/var symlink).
+        let missing_manifest = missing.canonicalize().unwrap().join("Cargo.toml");
         assert!(
             error
                 .dependency_path()
-                .is_some_and(|path| path == missing.join("Cargo.toml"))
+                .is_some_and(|path| path == missing_manifest),
+            "{:?}",
+            error.dependency_path()
         );
     }
 

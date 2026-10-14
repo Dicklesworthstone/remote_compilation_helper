@@ -749,6 +749,8 @@ mod tests {
                         Err(error) => panic!("webhook accept failed: {error}"), // ubs:ignore — unexpected socket failure must fail this test.
                     }
                 };
+                // macOS (BSD) accepted sockets inherit the listener's O_NONBLOCK.
+                stream.set_nonblocking(false).unwrap();
                 stream
                     .set_read_timeout(Some(Duration::from_secs(5)))
                     .unwrap();
