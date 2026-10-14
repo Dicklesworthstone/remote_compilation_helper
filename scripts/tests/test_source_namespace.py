@@ -129,10 +129,12 @@ class NamespaceOrchestrationWiringTests(unittest.TestCase):
         self.assertLess(pair, acquire)
         self.assertNotIn("canonical_root()", body[plan:journal])
         self.assertNotIn("alias_root()", body[plan:journal])
-        self.assertIn("source_pair_pool.as_ref().and(overlay_remote_root.as_deref())", body[plan:journal])
-        self.assertIn("retained_source_root.as_deref()", body[plan:journal])
-        self.assertIn("source_freshness_control.as_deref()", body[plan:journal])
-        self.assertIn("source_target_root.as_deref()", body[plan:journal])
+        # rustfmt may split these chains across lines; compare without whitespace.
+        planned = "".join(body[plan:journal].split())
+        self.assertIn("source_pair_pool.as_ref().and(overlay_remote_root.as_deref())", planned)
+        self.assertIn("retained_source_root.as_deref()", planned)
+        self.assertIn("source_freshness_control.as_deref()", planned)
+        self.assertIn("source_target_root.as_deref()", planned)
         repair = body.split("    ensure_worker_projects_topology(", 1)[1].split(")\n", 1)[0]
         self.assertIn("false,", repair, "repair must not recreate shared bases under a build claim")
 
