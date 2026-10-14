@@ -6,6 +6,9 @@
 #[cfg(test)]
 #[path = "transfer/node_prepare_tests.rs"]
 mod node_prepare_tests;
+mod retrieval_space;
+#[cfg(all(test, unix))]
+mod retrieval_space_tests;
 pub(crate) mod source_content_barrier;
 
 use crate::error::TransferError;
@@ -3208,11 +3211,33 @@ impl TransferPipeline {
         remote_path: &str,
         patterns: &[String],
     ) -> Result<RetryConfig> {
-        self.retrieval_retry_config(|| self.build_retrieve_command(worker, remote_path, patterns))
-            .await
+        // Both artifact builders use the same flavour-specific integrity
+        // policy. Only checksummed staging can earn allocation reuse credit.
+        self.retrieval_retry_config_inner(
+            || self.build_retrieve_command(worker, remote_path, patterns),
+            Self::artifact_integrity_arg(self.resolved_rsync().flavor) == "--checksum",
+        )
+        .await
     }
 
     async fn retrieval_retry_config(&self, command: impl Fn() -> Command) -> Result<RetryConfig> {
+        self.retrieval_retry_config_inner(command, false).await
+    }
+
+    /// Openrsync does not universally implement --checksum. Never fall back
+    /// to metadata equality: force a refresh and budget the complete set.
+    fn artifact_integrity_arg(flavor: RsyncFlavor) -> &'static str {
+        match flavor {
+            RsyncFlavor::Rsync { .. } => "--checksum",
+            RsyncFlavor::OpenRsync { .. } | RsyncFlavor::Unknown => "--ignore-times",
+        }
+    }
+
+    async fn retrieval_retry_config_inner(
+        &self,
+        command: impl Fn() -> Command,
+        checksummed: bool,
+    ) -> Result<RetryConfig> {
         let fallback = self.effective_rsync_retry_config();
         let estimate = self
             .execute_retrieval_rsync(
@@ -3231,7 +3256,18 @@ impl TransferPipeline {
                 if let Some(bytes) =
                     parse_rsync_selected_size(&String::from_utf8_lossy(&output.stdout))
                 {
-                    self.check_retrieval_space(bytes)?;
+                    // Only credit checksum-verified existing staging, never
+                    // the caller's unowned output tree or ambiguous stats.
+                    // Network/delta bytes are NOT replacement allocation.
+                    let plan = if checksummed
+                        && self.project_root != self.retrieval_reference_root
+                        && output.stderr.is_empty()
+                    {
+                        retrieval_space::RsyncStoragePlan::parse(&output.stdout)
+                    } else {
+                        None
+                    };
+                    self.check_retrieval_space_for_plan(bytes, plan)?;
                     let retry = self.artifact_retry_config_for_size(bytes);
                     info!(
                         selected_bytes = bytes,
@@ -3260,14 +3296,28 @@ impl TransferPipeline {
     }
 
     fn check_retrieval_space(&self, selected_bytes: u64) -> Result<()> {
+        // Windows archive spooling and other full-copy consumers cannot
+        // reuse rsync staging; retain their complete allocation requirement.
+        self.check_retrieval_space_for_plan(selected_bytes, None)
+    }
+
+    fn check_retrieval_space_for_plan(
+        &self,
+        selected_bytes: u64,
+        plan: Option<retrieval_space::RsyncStoragePlan>,
+    ) -> Result<()> {
         #[cfg(unix)]
         {
             std::fs::create_dir_all(&self.project_root)?;
             let stats = rustix::fs::statvfs(&self.project_root)?;
             let available = stats.f_bavail.saturating_mul(stats.f_frsize);
-            let required = selected_bytes
-                .checked_add(self.transfer_config.retrieval_min_free_bytes)
-                .context("retrieval staging size overflow")?;
+            let required = retrieval_space::required_bytes(
+                selected_bytes,
+                plan,
+                stats.f_frsize,
+                self.transfer_config.retrieval_min_free_bytes,
+            )
+            .context("retrieval staging size overflow")?;
             anyhow::ensure!(
                 available >= required,
                 "insufficient controller retrieval storage at {}: need {} bytes, available {}; outputs and ownership retained",
@@ -3277,7 +3327,7 @@ impl TransferPipeline {
             );
         }
         #[cfg(not(unix))]
-        let _ = selected_bytes;
+        let _ = (selected_bytes, plan);
         Ok(())
     }
 
@@ -6123,7 +6173,11 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         // `.f` lines; without it an up-to-date no-op rebuild would look
         // indistinguishable from a zero-output miss. On openrsync / rsync 2.6.9
         // the `-vv` spelling is used instead (issue #66).
-        cmd.arg("-az");
+        // A retained partial or stale output may have the right size and
+        // timestamp. Both the planner and actual pull must compare bytes
+        // before reusing it; metadata equality is not completed delivery.
+        cmd.arg("-az")
+            .arg(Self::artifact_integrity_arg(self.resolved_rsync().flavor));
         add_portable_rsync_archive_args(&mut cmd);
         cmd.arg("--stats")
             .arg("--timeout=30")
@@ -6224,7 +6278,9 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
 
         let ssh_command = self.build_rsync_ssh_command(identity_file.as_ref());
 
-        cmd.arg("-az");
+        // Match the integrity policy of the non-streaming planner/collector.
+        cmd.arg("-az")
+            .arg(Self::artifact_integrity_arg(self.resolved_rsync().flavor));
         add_portable_rsync_archive_args(&mut cmd);
         // Flavour-specific spellings of progress / stats / per-file listing
         // (issue #66); see RsyncCapabilities for the mapping.
@@ -6508,7 +6564,11 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
 
         // Same transport hardening as artifact retrieval: --safe-links blocks
         // symlink traversal out of the declared tree.
-        cmd.arg("-az");
+        // A retained report with matching size and mtime is not proof of its
+        // contents. Use the same integrity policy as artifact collection,
+        // including the forced-refresh fallback for non-upstream rsync.
+        cmd.arg("-az")
+            .arg(Self::artifact_integrity_arg(self.resolved_rsync().flavor));
         add_portable_rsync_archive_args(&mut cmd);
         cmd.arg("--stats")
             .arg("--safe-links")
