@@ -1588,8 +1588,13 @@ mod tests {
             let mut memos = facts.dependencies.lock().unwrap();
             for index in 0..MAX_DEPENDENCY_MEMOS {
                 memos.insert(
-                    (Vec::new(), (dir.path().join(format!("out-{index}")), Vec::new())),
-                    Slot::Warming,
+                    Arc::new(DependencyObservation {
+                        roots: Vec::new(),
+                        output: (dir.path().join(format!("out-{index}")), Vec::new()),
+                        members: Vec::new(),
+                        root_identities: Vec::new(),
+                    }),
+                    DependencySlot::Warming(Arc::new(())),
                 );
             }
         }
