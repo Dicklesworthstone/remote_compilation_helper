@@ -131,7 +131,9 @@ closures_overlap() {
                 # Leading-paren patterns: bash 3.2 (macOS /bin/sh) misparses
                 # a bare `pattern)` inside $(...) as closing the substitution.
                 case "$2" in
-                    (file) cat -- "$3" ;;
+                    # BSD awk ends a line at NUL; as CR, which every awk
+                    # refuses below, a corrupt record cannot pass as valid.
+                    (file) LC_ALL=C tr '\000' '\r' < "$3" ;;
                     (roots) printf '%s\n' "$3" ;;
                     (*) false ;;
                 esac

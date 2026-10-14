@@ -220,14 +220,53 @@ async fn detect_rchd_launchd_target() -> Option<String> {
     let (socket, _peer) = tokio::net::UnixStream::pair().ok()?;
     let uid = socket.peer_cred().ok()?.uid();
     let target = format!("gui/{uid}/{RCHD_LAUNCHD_LABEL}");
-    let loaded = Command::new("/bin/launchctl")
+    let printed = Command::new("/bin/launchctl")
         .args(["print", &target])
-        .stdout(Stdio::null())
+        .stdin(Stdio::null())
         .stderr(Stdio::null())
-        .status()
+        .output()
         .await
-        .is_ok_and(|status| status.success());
-    loaded.then_some(target)
+        .ok()
+        .filter(|output| output.status.success())?;
+    // Only a job whose live process listens on the configured socket is the
+    // daemon being restarted. Without this check, a CLI pointed at another
+    // socket (a second daemon, a test sandbox) kickstarted the user's rchd.
+    let pid = launchd_job_pid(&String::from_utf8_lossy(&printed.stdout))?;
+    let socket = configured_socket_path().ok()?;
+    process_listens_on_unix_socket(pid, std::path::Path::new(&socket))
+        .await
+        .then_some(target)
+}
+
+/// The job's own `pid = N` line (one tab deep) in `launchctl print` output.
+#[cfg(target_os = "macos")]
+fn launchd_job_pid(printed: &str) -> Option<u32> {
+    printed
+        .lines()
+        .find_map(|line| line.strip_prefix("\tpid = ")?.trim().parse().ok())
+}
+
+/// Whether `pid` holds a Unix socket bound at `socket`, per `lsof -Fn`.
+#[cfg(target_os = "macos")]
+async fn process_listens_on_unix_socket(pid: u32, socket: &std::path::Path) -> bool {
+    let Ok(output) = Command::new("/usr/sbin/lsof")
+        .args(["-a", "-p", &pid.to_string(), "-U", "-Fn"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .await
+    else {
+        return false;
+    };
+    let wanted = [Some(socket.to_path_buf()), socket.canonicalize().ok()];
+    String::from_utf8_lossy(&output.stdout).lines().any(|line| {
+        line.strip_prefix('n').is_some_and(|name| {
+            wanted
+                .iter()
+                .flatten()
+                .any(|path| path.as_os_str() == std::ffi::OsStr::new(name))
+        })
+    })
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -1559,6 +1598,22 @@ pub fn daemon_logs(lines: usize, ctx: &OutputContext) -> Result<()> {
 mod tests {
     use super::*;
     use rch_common::test_guard;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn launchd_job_pid_reads_only_the_job_line() {
+        let printed = "gui/501/com.rch.daemon = {\n\tactive count = 1\n\tstate = running\n\
+                       \tendpoints = {\n\t\tpid = 99\n\t}\n\tpid = 10447\n}\n";
+        assert_eq!(super::launchd_job_pid(printed), Some(10447));
+        assert_eq!(super::launchd_job_pid("\tstate = not running\n"), None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn a_process_without_the_socket_is_not_its_listener() {
+        let socket = std::path::Path::new("/nonexistent/rch-test/daemon.sock");
+        assert!(!super::process_listens_on_unix_socket(std::process::id(), socket).await);
+    }
 
     #[test]
     fn daemon_start_args_pin_configured_socket_path() {
