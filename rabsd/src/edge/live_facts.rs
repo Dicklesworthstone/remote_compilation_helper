@@ -62,7 +62,7 @@ const MAX_DEPENDENCY_FILES: usize = 4096;
 const MAX_DEPENDENCY_MEMOS: usize = 128;
 
 /// Identity of one filesystem object at one moment.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FileSig {
     dev: u64,
     ino: u64,
@@ -907,11 +907,138 @@ pub struct LiveFacts {
     files: Mutex<HashMap<PathBuf, (FileSig, TypedDigest)>>,
     toolchains: Mutex<HashMap<PathBuf, Slot<ProbedToolchain>>>,
     packages: Mutex<HashMap<PackageKey, Slot<PackageFacts>>>,
-    dependencies: Mutex<HashMap<(DependencyRoots, DependencyOutput), Slot<DependencyFacts>>>,
+    dependencies: Mutex<DependencyMemos>,
     warming: Mutex<usize>,
 }
 
 type PackageKey = (PathBuf, DependencySourceKind, Option<PathBuf>);
+
+/// Host-local memo identity, NOT an action key or serving authority. A
+/// reservation/backoff for one observed inventory must not mask a newer
+/// generation of the same directories. Keeping generations in separate
+/// entries also keeps old in-flight work inside MAX_DEPENDENCY_MEMOS.
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct DependencyObservation {
+    roots: DependencyRoots,
+    output: DependencyOutput,
+    members: DependencyMembers,
+    root_identities: Vec<(u64, u64)>,
+}
+
+#[derive(Debug)]
+enum DependencySlot {
+    Warming(Arc<()>),
+    Ready(Arc<DependencyFacts>),
+    Failed { reason: String, at: Instant },
+}
+
+type DependencyMemos = HashMap<Arc<DependencyObservation>, DependencySlot>;
+
+/// One capture owns only its exact observation and reservation token.
+/// Abandonment must not erase another capture or leave a permanent Warming
+/// entry. The token also fences identical observations after eviction/retry.
+struct DependencyReservation {
+    facts: Arc<LiveFacts>,
+    observation: Arc<DependencyObservation>,
+    token: Arc<()>,
+}
+
+impl DependencyReservation {
+    fn insert(
+        facts: &Arc<LiveFacts>,
+        memos: &mut DependencyMemos,
+        observation: Arc<DependencyObservation>,
+    ) -> Self {
+        let token = Arc::new(());
+        memos.insert(
+            Arc::clone(&observation),
+            DependencySlot::Warming(Arc::clone(&token)),
+        );
+        Self {
+            facts: Arc::clone(facts),
+            observation,
+            token,
+        }
+    }
+
+    fn finish(
+        self,
+        captured: Result<DependencyFacts, FactsMiss>,
+        retain_failure: bool,
+    ) -> Result<Arc<DependencyFacts>, FactsMiss> {
+        let captured = captured.and_then(|captured| {
+            if captured.roots != self.observation.roots
+                || captured.output != self.observation.output
+                || captured.members != self.observation.members
+                || captured.root_identities != self.observation.root_identities
+            {
+                return Err(FactsMiss::Refused(
+                    "dependency capture does not match its admitted observation".into(),
+                ));
+            }
+            Ok(Arc::new(captured))
+        });
+        {
+            let mut memos = self
+                .facts
+                .dependencies
+                .lock()
+                .map_err(|_| FactsMiss::Refused("dependency memo poisoned".into()))?;
+            if !matches!(
+                memos.get(&self.observation),
+                Some(DependencySlot::Warming(token)) if Arc::ptr_eq(token, &self.token)
+            ) {
+                return Err(FactsMiss::Pending);
+            }
+            match &captured {
+                Ok(captured) => {
+                    memos.insert(
+                        Arc::clone(&self.observation),
+                        DependencySlot::Ready(Arc::clone(captured)),
+                    );
+                }
+                Err(FactsMiss::Refused(reason)) if retain_failure => {
+                    memos.insert(
+                        Arc::clone(&self.observation),
+                        DependencySlot::Failed {
+                            reason: reason.clone(),
+                            at: Instant::now(),
+                        },
+                    );
+                }
+                Err(_) => {}
+            }
+        }
+        captured
+    }
+}
+
+impl Drop for DependencyReservation {
+    fn drop(&mut self) {
+        if let Ok(mut memos) = self.facts.dependencies.lock()
+            && matches!(
+                memos.get(&self.observation),
+                Some(DependencySlot::Warming(token)) if Arc::ptr_eq(token, &self.token)
+            )
+        {
+            memos.remove(&self.observation);
+        }
+    }
+}
+
+/// Own the shared warm-pool slot through thread-start failure and unwinding,
+/// not only the happy-path tail of the work closure.
+struct WarmPermit {
+    facts: Arc<LiveFacts>,
+}
+
+impl Drop for WarmPermit {
+    fn drop(&mut self) {
+        if let Ok(mut warming) = self.facts.warming.lock() {
+            *warming = warming.saturating_sub(1);
+        }
+    }
+}
 
 impl LiveFacts {
     /// Empty state.
@@ -942,92 +1069,67 @@ impl LiveFacts {
                 )
             })
             .collect();
-        // Keep the full inventory and its aggregate byte/count bounds. This
-        // changes observation scheduling, never which candidates key a build.
         let (members, _) = walk_dependencies(&roots).map_err(FactsMiss::Refused)?;
         let output = (PathBuf::from(&plan.out_dir), plan.output_names());
         reject_dependency_output_aliases(&roots, &members, &output).map_err(FactsMiss::Refused)?;
         let root_identities = dependency_root_identities(&roots).map_err(FactsMiss::Refused)?;
-        let memo_key = (roots.clone(), output.clone());
-        {
+        let observation = Arc::new(DependencyObservation {
+            roots,
+            output,
+            members,
+            root_identities,
+        });
+        let reservation = {
             let mut memos = self
                 .dependencies
                 .lock()
                 .map_err(|_| FactsMiss::Refused("dependency memo poisoned".into()))?;
-            if let Some(slot) = memos.get(&memo_key) {
-                match slot {
-                    Slot::Ready(captured)
-                        if captured.members == members
-                            && captured.root_identities == root_identities =>
-                    {
-                        return Ok(Arc::clone(captured));
-                    }
-                    Slot::Warming => return Err(FactsMiss::Pending),
-                    Slot::Failed { reason, at } if at.elapsed() < PROBE_RETRY => {
-                        return Err(FactsMiss::Refused(reason.clone()));
-                    }
-                    _ => {}
+            match memos.get(&observation) {
+                Some(DependencySlot::Ready(captured)) => return Ok(Arc::clone(captured)),
+                Some(DependencySlot::Warming(_)) => return Err(FactsMiss::Pending),
+                Some(DependencySlot::Failed { reason, at }) if at.elapsed() < PROBE_RETRY => {
+                    return Err(FactsMiss::Refused(reason.clone()));
                 }
+                _ => {}
             }
             if memos.len() >= MAX_DEPENDENCY_MEMOS {
-                memos.retain(|_, slot| matches!(slot, Slot::Warming));
+                memos.retain(|_, slot| matches!(slot, DependencySlot::Warming(_)));
             }
             if memos.len() >= MAX_DEPENDENCY_MEMOS {
                 return Err(FactsMiss::Pending);
             }
-            // One owner performs this capture and any subsequent warm. Keep
-            // concurrent foreground captures inside the same memo count bound.
-            memos.insert(memo_key.clone(), Slot::Warming);
-        }
-        // Keep genuinely large cold inventories off the request path. This
-        // estimate grants no read authority: capture independently enforces
-        // the budget if a memo is evicted or a candidate changes afterward.
-        let captured = if self.dependency_budget_fits(&roots, &members, SYNCHRONOUS_PACKAGE_BYTES) {
+            DependencyReservation::insert(self, &mut memos, Arc::clone(&observation))
+        };
+
+        let captured = if self.dependency_budget_fits(
+            &observation.roots,
+            &observation.members,
+            SYNCHRONOUS_PACKAGE_BYTES,
+        ) {
             capture_dependencies(
                 self,
-                roots.clone(),
-                members.clone(),
-                output.clone(),
+                observation.roots.clone(),
+                observation.members.clone(),
+                observation.output.clone(),
                 Some(SYNCHRONOUS_PACKAGE_BYTES),
             )
         } else {
             Err(FactsMiss::Pending)
         };
-        match captured {
-            Ok(captured) => {
-                let captured = Arc::new(captured);
-                if let Ok(mut memos) = self.dependencies.lock() {
-                    memos.insert(memo_key, Slot::Ready(Arc::clone(&captured)));
-                }
-                return Ok(captured);
-            }
-            Err(FactsMiss::Refused(reason)) => {
-                if let Ok(mut memos) = self.dependencies.lock() {
-                    memos.remove(&memo_key);
-                }
-                return Err(FactsMiss::Refused(reason));
-            }
-            Err(FactsMiss::Pending) => {}
+        if !matches!(captured, Err(FactsMiss::Pending)) {
+            return reservation.finish(captured, false);
         }
-        // A bounded foreground pass may have memoized small cold inputs.
-        // The background capture reuses those exact identities, but still
-        // checks every root, candidate and output alias before returning.
-        let warm_key = memo_key.clone();
-        if !self.start_warm(move |facts| {
-            let slot = match capture_dependencies(facts, roots, members, output, None) {
-                Ok(captured) => Slot::Ready(Arc::new(captured)),
-                Err(error) => Slot::Failed {
-                    reason: error.to_string(),
-                    at: Instant::now(),
-                },
-            };
-            if let Ok(mut memos) = facts.dependencies.lock() {
-                memos.insert(warm_key, slot);
-            }
-        }) && let Ok(mut memos) = self.dependencies.lock()
-        {
-            memos.remove(&memo_key);
-        }
+
+        self.start_warm(move |facts| {
+            let captured = capture_dependencies(
+                facts,
+                observation.roots.clone(),
+                observation.members.clone(),
+                observation.output.clone(),
+                None,
+            );
+            let _ = reservation.finish(captured, true);
+        });
         Err(FactsMiss::Pending)
     }
 
@@ -1099,21 +1201,16 @@ impl LiveFacts {
             }
             *warming += 1;
         }
-        let facts = Arc::clone(self);
-        let spawned = std::thread::Builder::new()
+        let permit = WarmPermit {
+            facts: Arc::clone(self),
+        };
+        std::thread::Builder::new()
             .name("rabs-facts-warm".to_owned())
             .spawn(move || {
-                work(&facts);
-                if let Ok(mut warming) = facts.warming.lock() {
-                    *warming -= 1;
-                }
-            });
-        if spawned.is_err()
-            && let Ok(mut warming) = self.warming.lock()
-        {
-            *warming -= 1;
-        }
-        spawned.is_ok()
+                let active_permit = permit;
+                work(&active_permit.facts);
+            })
+            .is_ok()
     }
 
     /// The content digest of a regular file, memoized by identity.
