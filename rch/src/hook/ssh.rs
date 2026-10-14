@@ -1138,7 +1138,11 @@ async fn finish_source_authority_lock_acquisition(
         } else {
             String::new()
         };
-        anyhow::bail!("{failure}; stderr={stderr}");
+        let error = anyhow::anyhow!("{failure}; stderr={stderr}");
+        return Err(match source_claim_write_fault(&guard.worker_id, &stderr) {
+            Some(fault) => error.context(fault),
+            None => error,
+        });
     }
 
     guard.stdin = Some(stdin);
@@ -1147,6 +1151,32 @@ async fn finish_source_authority_lock_acquisition(
         MAX_SOURCE_LOCK_OUTPUT_BYTES,
     )));
     Ok(guard)
+}
+
+/// The worker's source registry could not persist a record (bd-5ojmb): a
+/// full disk, or an exhausted tmpfs quota as on fmd's /tmp. Report it as the
+/// worker's storage fault on the registry's filesystem, so the release
+/// quarantines the worker until recovery probes measure headroom there,
+/// instead of leaving it selectable for builds that fail at source admission.
+fn source_claim_write_fault(
+    worker_id: &WorkerId,
+    stderr: &str,
+) -> Option<crate::transfer::RemoteUploadDiskFull> {
+    let mut roots: Vec<String> = stderr
+        .lines()
+        .filter_map(|line| line.strip_prefix("RCH_SOURCE_CLAIM_WRITE_FAILED "))
+        .filter_map(|path| {
+            let parent = std::path::Path::new(path.trim()).parent()?;
+            (parent.is_absolute() && parent != std::path::Path::new("/"))
+                .then(|| parent.to_string_lossy().into_owned())
+        })
+        .collect();
+    roots.sort();
+    roots.dedup();
+    (!roots.is_empty()).then(|| crate::transfer::RemoteUploadDiskFull {
+        worker_id: worker_id.to_string(),
+        roots,
+    })
 }
 
 pub(super) fn should_skip_remote_preflight(worker: &WorkerConfig) -> bool {
@@ -1773,6 +1803,35 @@ async fn repair_worker_mirror_ownership(
 mod tests {
     use super::*;
     use rch_common::test_guard;
+
+    #[test]
+    fn claim_write_failure_is_a_storage_fault_on_the_registry_filesystem() {
+        let worker = WorkerId::new("ovh-a");
+        // As observed on fmd: the tmpfs quota for the worker user was full.
+        let stderr = "rch-source-registry: 74: printf: printf: I/O error\n\
+                      RCH_SOURCE_CLAIM_WRITE_FAILED /tmp/rch-source-authority-locks/claims-v1/.record-write.WpovmeJjGe\n\
+                      RCH: durable source ownership: cannot persist source cancellation";
+        let fault = source_claim_write_fault(&worker, stderr).unwrap();
+        assert_eq!(fault.worker_id, "ovh-a");
+        assert_eq!(fault.roots, ["/tmp/rch-source-authority-locks/claims-v1"]);
+        let error = anyhow::anyhow!("source-authority lock on ovh-a exited before acquisition")
+            .context(fault)
+            .context("source preparation failed");
+        assert!(crate::transfer::find_remote_upload_disk_full(&error).is_some());
+        // Other refusals, a quoted marker, and relative or bare paths are not faults.
+        for stderr in [
+            "RCH: durable source ownership: unfinished overlapping source owner",
+            "note: RCH_SOURCE_CLAIM_WRITE_FAILED /tmp/x/y",
+            "RCH_SOURCE_CLAIM_WRITE_FAILED relative/file",
+            "RCH_SOURCE_CLAIM_WRITE_FAILED /file",
+            "",
+        ] {
+            assert!(
+                source_claim_write_fault(&worker, stderr).is_none(),
+                "{stderr}"
+            );
+        }
+    }
 
     #[cfg(unix)]
     #[tokio::test]
