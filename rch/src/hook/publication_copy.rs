@@ -18,29 +18,15 @@ use std::os::unix::fs::{FileExt, MetadataExt, PermissionsExt};
 const COPY_MODE: u32 = 0o600;
 const BUFFER_BYTES: usize = 64 * 1024;
 
+#[path = "staged_inventory.rs"]
+mod staged_inventory;
+
 /// A missing stage is not an empty successful Make output set. The generic
 /// file enumerator also serves pre-build baselines, where absent output roots
 /// are normal; publication must first require a real, still-named directory.
 /// Completed phases bypass collection in the caller and need no stage readback.
 pub(super) fn staged_regular_files(root: &Path) -> Result<Vec<std::path::PathBuf>> {
-    let held = File::from(
-        rustix::fs::open(root, read_flags() | OFlags::DIRECTORY, Mode::empty()).context(
-            "retrieval staging directory is missing or invalid; delivery remains pending",
-        )?,
-    );
-    let metadata = held.metadata()?;
-    let verify = || -> Result<()> {
-        let named = std::fs::symlink_metadata(root)?;
-        anyhow::ensure!(
-            named.is_dir() && metadata.dev() == named.dev() && metadata.ino() == named.ino(),
-            "retrieval staging directory changed; delivery remains pending"
-        );
-        Ok(())
-    };
-    verify()?;
-    let files = super::regular_files(root)?;
-    verify()?;
-    Ok(files)
+    staged_inventory::regular_files(root)
 }
 
 fn read_flags() -> OFlags {
