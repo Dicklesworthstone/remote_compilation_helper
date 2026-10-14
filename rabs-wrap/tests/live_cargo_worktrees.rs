@@ -28,6 +28,9 @@
 //!    checksum document remains byte-identical; rebuilt bytes match stock.
 #![cfg(target_os = "linux")]
 
+#[path = "live_cargo_worktrees/build_script_reuse.rs"]
+mod build_script_reuse;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
