@@ -54,13 +54,32 @@ fn reload_success_default() -> bool {
 }
 
 async fn require_restart_admission() -> Result<()> {
-    let response = send_daemon_command("POST /restart-admission\n")
-        .await
-        .context("daemon did not acknowledge restart admission barrier")?;
-    let body =
-        extract_json_body(&response).context("restart admission response was missing JSON")?;
-    let admission: RestartAdmissionResponse =
-        serde_json::from_str(body).context("restart admission response was malformed")?;
+    let verdict = async {
+        let response = send_daemon_command("POST /restart-admission\n")
+            .await
+            .context("daemon did not acknowledge restart admission barrier")?;
+        let body =
+            extract_json_body(&response).context("restart admission response was missing JSON")?;
+        serde_json::from_str::<RestartAdmissionResponse>(body)
+            .context("restart admission response was malformed")
+    }
+    .await;
+    let admission = match verdict {
+        Ok(admission) => admission,
+        Err(error) => {
+            // The daemon may have closed the barrier before its reply was lost,
+            // late or garbled. This restart is abandoned, so reopen admission
+            // rather than leave every later worker selection refused.
+            if let Err(release_error) =
+                send_daemon_command("POST /restart-admission/release\n").await
+            {
+                tracing::warn!(
+                    "failed to release a possibly-closed restart-admission barrier: {release_error}"
+                );
+            }
+            return Err(error);
+        }
+    };
     if admission.restart_permitted {
         return Ok(());
     }

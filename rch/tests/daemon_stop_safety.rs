@@ -226,6 +226,34 @@ fn stop_lost_admission_never_kills_or_unlinks_even_with_force() {
 }
 
 #[test]
+fn restart_lost_admission_reply_releases_the_barrier_and_never_launches() {
+    // The daemon may have closed its admission barrier before the reply was
+    // lost. An abandoned restart must ask it to reopen, or every later worker
+    // selection is refused until someone releases it by hand.
+    let directory = tempfile::tempdir().unwrap();
+    let daemon = Daemon::start(directory.path(), Reply::LostAdmission);
+    let meta = std::fs::symlink_metadata(&daemon.socket).unwrap();
+    let output = run_cli(directory.path(), &daemon.socket, "restart", true, &[]);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let metadata = std::fs::symlink_metadata(&daemon.socket).expect("endpoint retained");
+    assert_eq!((metadata.dev(), metadata.ino()), (meta.dev(), meta.ino()));
+    assert!(
+        !directory.path().join("unsafe-commands.log").exists(),
+        "kill or daemon start was attempted"
+    );
+    let response: Value = serde_json::from_slice(&output.stdout).expect("one JSON error response");
+    assert_eq!(response["success"], false, "{response}");
+    assert_eq!(
+        *daemon.requests.lock().unwrap(),
+        [
+            "GET /restart-admission",
+            "POST /restart-admission",
+            "POST /restart-admission/release"
+        ]
+    );
+}
+
+#[test]
 fn stop_unreachable_socket_is_retained_without_process_fallback() {
     let directory = tempfile::tempdir().unwrap();
     let socket = directory.path().join("daemon.sock");
