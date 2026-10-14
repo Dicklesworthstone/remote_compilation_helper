@@ -122,7 +122,8 @@ class NamespaceOrchestrationWiringTests(unittest.TestCase):
         plan = body.index("source_namespace::build_source_roots(")
         journal = body.index("recovery::RecoverySession::begin(")
         pair = body.index("acquire_clean_overlay_source_pair(")
-        acquire = body.index("acquire_remote_source_authority_lock(")
+        # 0f5694ce (#105) acquires through the bounded same-worker retry.
+        acquire = body.index("source_namespace::acquire_source_authority_with_retry(")
         self.assertLess(initialize, plan)
         self.assertLess(plan, journal)
         self.assertLess(journal, pair)
