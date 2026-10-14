@@ -150,9 +150,14 @@ impl JobserverBridge {
         }
         // Never use a fixed child selected by source contents or a previous
         // action. A failed mint drops only this attempt's private directory.
-        let directory = tempfile::Builder::new()
-            .prefix(BRIDGE_PREFIX)
-            .tempdir_in(home_backing)?;
+        let mut builder = tempfile::Builder::new();
+        builder.prefix(BRIDGE_PREFIX);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            builder.permissions(std::fs::Permissions::from_mode(0o700));
+        }
+        let directory = builder.tempdir_in(home_backing)?;
         let (host_path, writer, _edge_auth_unused) =
             rabs_asupersync::jobserver::mint_fifo_jobserver(
                 (slots - 1) as usize,

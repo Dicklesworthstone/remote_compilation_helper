@@ -602,6 +602,11 @@ mod tests {
     use std::time::{Duration, Instant};
 
     fn target(root: &Path, id: u64) -> (WorkerJournal, RetentionTarget, String) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(root, fs::Permissions::from_mode(0o700)).unwrap();
+        }
         let mut journal = WorkerJournal::open(root, "worker", "coord").unwrap();
         let request = json!({"kind":"canonical-exec","request_id":id,"program":"rustc","args":[]});
         let timeout = Duration::from_secs(5);
@@ -859,6 +864,7 @@ mod tests {
         use rabs_sandbox::artifact_tree::TREE_FILES_VERSION;
         use std::os::unix::fs::PermissionsExt;
         let root = tempfile::tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let mut journal = WorkerJournal::open(root.path(), "worker", "coord").unwrap();
         let request = json!({"kind":"canonical-exec", "request_id":23, "program":"cargo",
             "artifacts":{"unit":"build", "files":["debug/app"], "tree":TREE_FILES_VERSION}});

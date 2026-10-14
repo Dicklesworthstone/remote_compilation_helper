@@ -374,10 +374,14 @@ pub fn install_delivery_outputs(
             Err(error) => return Err(error),
         }
         let parent = destination.parent().expect("named absolute destination");
-        let staging = tempfile::Builder::new()
-            .prefix(".rabs-output-staging-")
-            .tempdir_in(parent)?
-            .keep();
+        let mut builder = tempfile::Builder::new();
+        builder.prefix(".rabs-output-staging-");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            builder.permissions(fs::Permissions::from_mode(0o700));
+        }
+        let staging = builder.tempdir_in(parent)?.keep();
         let names = verified_artifact_names(request, &delivery.receipt["artifact_manifest"])?;
         super::worker_delivery::create_artifact_directories(
             &staging,

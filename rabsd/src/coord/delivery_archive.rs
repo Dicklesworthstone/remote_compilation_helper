@@ -605,10 +605,14 @@ pub fn restore_delivery(
         let parent = destination
             .parent()
             .ok_or_else(|| invalid("restore destination has no parent"))?;
-        let staging = tempfile::Builder::new()
-            .prefix(RESTORE_STAGING_PREFIX)
-            .tempdir_in(parent)?
-            .keep();
+        let mut builder = tempfile::Builder::new();
+        builder.prefix(RESTORE_STAGING_PREFIX);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            builder.permissions(fs::Permissions::from_mode(0o700));
+        }
+        let staging = builder.tempdir_in(parent)?.keep();
         retained_staging = Some(staging.clone());
         mkdir(&staging.join("diagnostics"))?;
         mkdir(&staging.join("artifacts"))?;

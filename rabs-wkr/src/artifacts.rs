@@ -137,9 +137,14 @@ impl PreparedArtifacts {
     /// Prepare fresh backing and declared parent directories. A later attempt
     /// cannot observe stale output files from an earlier successful compile.
     pub fn new(plan: ArtifactPlan) -> io::Result<Self> {
-        let directory = tempfile::Builder::new()
-            .prefix("rabs-artifacts-")
-            .tempdir()?;
+        let mut builder = tempfile::Builder::new();
+        builder.prefix("rabs-artifacts-");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            builder.permissions(fs::Permissions::from_mode(0o700));
+        }
+        let directory = builder.tempdir()?;
         for relative in &plan.directories {
             fs::create_dir_all(directory.path().join(relative))?;
         }

@@ -353,10 +353,14 @@ impl SourceTransferState {
             } else {
                 None
             };
-            let directory = tempfile::Builder::new()
-                .prefix("rabs-source-")
-                .tempdir()
-                .map_err(|error| error.to_string())?;
+            let mut builder = tempfile::Builder::new();
+            builder.prefix("rabs-source-");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                builder.permissions(std::fs::Permissions::from_mode(0o700));
+            }
+            let directory = builder.tempdir().map_err(|error| error.to_string())?;
             let mut receiver =
                 SourceReceiver::create(&directory.path().join("workspace"), manifest)
                     .map_err(|error| error.to_string())?;
@@ -627,6 +631,11 @@ mod tests {
     }
 
     fn cached_state(parent: &std::path::Path) -> SourceTransferState {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
         SourceTransferState {
             cache_override: Some(cache::SourceCache::open(parent).unwrap()),
             ..SourceTransferState::default()
