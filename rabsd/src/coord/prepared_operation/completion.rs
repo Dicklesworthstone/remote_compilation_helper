@@ -882,7 +882,7 @@ mod tests {
             assert!(!status.succeeded && !status.outputs_installed);
             assert_eq!(
                 status.state,
-                if stop.is_some() {
+                if stop == Some("cancelled") {
                     OperationState::Cancelled
                 } else {
                     OperationState::Completed
