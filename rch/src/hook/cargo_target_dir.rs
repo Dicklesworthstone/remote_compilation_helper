@@ -900,6 +900,18 @@ pub(super) fn bind_build_source_stamp(command: &str, stamp: &str) -> anyhow::Res
         "env.RCH_BUILD_SOURCE.value={}",
         toml::Value::String(stamp.to_owned())
     );
+    if cargo_subcommand_is_nextest(&tokens, cargo_index) {
+        // cargo-nextest deserializes each `--config` as a whole `[env]` entry,
+        // so a lone `force=true` has no `value` and nextest exits 96, and Cargo
+        // refuses the inline-table form. Bind the value alone and give Cargo's
+        // process environment the same stamp, which is all `force` overrides.
+        tokens.splice(end..end, ["--config".to_owned(), value]);
+        tokens.splice(
+            cargo_index..cargo_index,
+            ["env".to_owned(), format!("RCH_BUILD_SOURCE={stamp}")],
+        );
+        return Ok(join_exec_command(&tokens));
+    }
     tokens.splice(
         end..end,
         [
@@ -910,6 +922,26 @@ pub(super) fn bind_build_source_stamp(command: &str, stamp: &str) -> anyhow::Res
         ],
     );
     Ok(join_exec_command(&tokens))
+}
+
+/// Same subcommand rule as the classifier: skip `+toolchain` and global flags,
+/// including the separate value of `--color`, `-Z`, `-C` and `--config`.
+fn cargo_subcommand_is_nextest(tokens: &[String], cargo_index: usize) -> bool {
+    const CARGO_VALUE_FLAGS: &[&str] = &["--color", "-Z", "-C", "--config"];
+    let mut rest = tokens.iter().skip(cargo_index + 1);
+    while let Some(token) = rest.next() {
+        if token.starts_with('+') {
+            continue;
+        }
+        if token.starts_with('-') {
+            if !token.contains('=') && CARGO_VALUE_FLAGS.contains(&token.as_str()) {
+                rest.next();
+            }
+            continue;
+        }
+        return token == "nextest";
+    }
+    false
 }
 
 /// Refuse unselected worker Cargo configuration immediately before Unix Cargo.
@@ -2264,6 +2296,109 @@ mod managed_build_dir_tests {
                 assert_eq!(config_index, expected.len(), "{command}: {bound}");
             }
         }
+    }
+
+    #[test]
+    fn build_source_stamp_binds_nextest_with_value_config_and_process_env() {
+        let stamp = format!("{}-dirty", "a".repeat(40));
+        for (command, expected) in [
+            (
+                "cargo nextest run --workspace",
+                "env RCH_BUILD_SOURCE={stamp} cargo nextest run --workspace --config {value}",
+            ),
+            (
+                "cargo +nightly nextest run -- --nocapture",
+                "env RCH_BUILD_SOURCE={stamp} cargo +nightly nextest run --config {value} -- --nocapture",
+            ),
+            (
+                "cargo --color never --locked nextest run",
+                "env RCH_BUILD_SOURCE={stamp} cargo --color never --locked nextest run --config {value}",
+            ),
+            (
+                "CARGO_TERM_COLOR=never cargo nextest run",
+                "env CARGO_TERM_COLOR=never env RCH_BUILD_SOURCE={stamp} cargo nextest run --config {value}",
+            ),
+            (
+                "rustup run nightly cargo nextest run",
+                "rustup run nightly env RCH_BUILD_SOURCE={stamp} cargo nextest run --config {value}",
+            ),
+        ] {
+            let value = format!(
+                "env.RCH_BUILD_SOURCE.value={}",
+                toml::Value::String(stamp.clone())
+            );
+            let expected: Vec<String> = expected
+                .split(' ')
+                .map(|token| token.replace("{stamp}", &stamp).replace("{value}", &value))
+                .collect();
+            let bound = super::bind_build_source_stamp(command, &stamp)
+                .unwrap_or_else(|error| panic!("{command}: {error}"));
+            assert_eq!(shell_words::split(&bound).unwrap(), expected, "{command}");
+            assert!(!bound.contains("force"), "{command}: {bound}");
+        }
+        // Not nextest: a `nextest` package name or test filter keeps the cargo form.
+        for command in ["cargo test nextest", "cargo -C nextest build"] {
+            let bound = super::bind_build_source_stamp(command, &stamp).unwrap();
+            assert!(
+                bound.contains("env.RCH_BUILD_SOURCE.force=true") && !bound.starts_with("env "),
+                "{command}: {bound}"
+            );
+        }
+    }
+
+    /// The bound command must run under real cargo-nextest, which rejected the
+    /// former `--config env.RCH_BUILD_SOURCE.force=true` with exit 96 (bd-k90ud).
+    #[test]
+    fn build_source_stamp_real_nextest_accepts_bound_command() {
+        let cargo = std::path::PathBuf::from(env!("CARGO"));
+        let cargo_bin = cargo.parent().unwrap().to_path_buf();
+        let path = std::env::join_paths(std::iter::once(cargo_bin.clone()).chain(
+            std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+        ))
+        .unwrap();
+        let cargo_home_bin = std::env::var_os("CARGO_HOME")
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME").map(|home| std::path::Path::new(&home).join(".cargo"))
+            })
+            .map(|home| home.join("bin"));
+        let has_nextest = std::env::split_paths(&path)
+            .chain(cargo_home_bin)
+            .any(|directory| directory.join("cargo-nextest").is_file());
+        if !has_nextest {
+            eprintln!("skipping: cargo-nextest is not installed");
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("src")).unwrap();
+        std::fs::write(
+            root.path().join("Cargo.toml"),
+            "[package]\nname='nextest_stamp_fixture'\nversion='0.1.0'\nedition='2021'\n[workspace]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("src/lib.rs"),
+            "#[test]\nfn stamp() {\n    assert_eq!(env!(\"RCH_BUILD_SOURCE\"), \"bound\");\n    \
+             assert_eq!(std::env::var(\"RCH_BUILD_SOURCE\").unwrap(), \"bound\");\n}\n",
+        )
+        .unwrap();
+        let bound = super::bind_build_source_stamp("cargo nextest run", "bound").unwrap();
+        let output = std::process::Command::new("/bin/sh")
+            .args(["-c", &bound])
+            .current_dir(root.path())
+            .env("PATH", &path)
+            .env("CARGO_TARGET_DIR", root.path().join("target"))
+            .env("RCH_BUILD_SOURCE", "ambient")
+            .env("RCH_CARGO_WRAPPER_BYPASS", "1")
+            .env_remove("CARGO_BUILD_TARGET_DIR")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{bound}: {:?}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]
