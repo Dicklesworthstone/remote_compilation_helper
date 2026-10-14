@@ -307,6 +307,17 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
             return Decided::Shadow(observation(&parsed));
         }
     };
+    // Keep the original observation through the entire request lifecycle.
+    // Later cache refreshes must not substitute another toolchain generation
+    // after this invocation has been keyed or its compiler has started.
+    let toolchain_guard = match live
+        .facts
+        .toolchain_guard(Path::new(&plan.compiler), &toolchain)
+    {
+        Ok(guard) => guard,
+        Err(FactsMiss::Pending) if may_wait => return preparing(unit, PendingFacts::Toolchain),
+        Err(miss) => return refuse(&miss.to_string()),
+    };
     let package = match live.facts.package(
         Path::new(&plan.source_root),
         plan.source_kind,
@@ -416,6 +427,7 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
         inputs,
         package,
         dependencies,
+        toolchain: toolchain_guard,
         externs: externs
             .into_iter()
             .map(|fact| (fact.path, fact.content_digest))
