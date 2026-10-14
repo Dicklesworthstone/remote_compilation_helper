@@ -148,10 +148,12 @@ impl Drop for CapturePins {
 
 #[cfg(test)]
 mod tests {
+    use super::super::output_capture::put_output;
     use super::super::{put_bundle_root, put_bytes};
     use super::*;
     use crate::janitor::store::mount_and_reconcile;
     use rabs_cas::gc::{GcMode, GcWorld, plan_gc};
+    use rabs_cas::materialization::{MaterializationMode, MaterializeError, materialize_object};
     use rabs_protocol::authority::{ClusterId, CoordinatorAuthority, CoordinatorIncarnationId};
     use rabs_protocol::generation::{
         ActionGeneration, ActionGenerationId, AttemptId, ExecutionLeaseId, LeaseRenewalSeq,
@@ -357,5 +359,194 @@ mod tests {
         changed = original;
         changed.lease_renewal_seq.0 += 1;
         assert_eq!(capture_owner(&changed), owner);
+    }
+
+    #[test]
+    fn streamed_outputs_keep_independent_pins_across_idempotent_puts() {
+        use std::io::Write;
+        let dir = crate::test_util::private_tempdir();
+        let source = dir.path().join("libstream.rlib");
+        let chunk = [123_u8; 64 * 1024];
+        let size = 17 * chunk.len() as u64 + 3;
+        {
+            let mut file = std::fs::File::create(&source).unwrap();
+            for _ in 0..17 {
+                file.write_all(&chunk).unwrap();
+            }
+            file.write_all(b"end").unwrap();
+        }
+        let cas = Arc::new(mount_and_reconcile(&dir.path().join("cas")).unwrap());
+        let mut first = CapturePins::new(Arc::clone(&cas), &authority(1));
+        let mut second = CapturePins::new(Arc::clone(&cas), &authority(2));
+        let output = put_output(&cas, &source, size, &mut first).unwrap();
+        let repeated = put_output(&cas, &source, size, &mut first).unwrap();
+        let sibling = put_output(&cas, &source, size, &mut second).unwrap();
+        assert_eq!(output.digest, repeated.digest);
+        assert_eq!(output.digest, sibling.digest);
+        assert_eq!(first.held.len(), 1);
+        assert_eq!(second.held.len(), 1);
+        assert_ne!(first.held.keys().next(), second.held.keys().next());
+        assert!(collectible(&cas).is_empty());
+        assert_eq!(
+            crate::edge::live_facts::digest_stable(&source).unwrap(),
+            (output.sig, output.digest.clone())
+        );
+        let locations = cas
+            .store()
+            .lock()
+            .unwrap()
+            .object_locations(&output.digest)
+            .unwrap();
+        assert_eq!(
+            locations.len(),
+            1,
+            "equal outputs share one physical representation"
+        );
+        assert!(
+            cas.store()
+                .lock()
+                .unwrap()
+                .object_durably_located(&output.digest)
+                .unwrap()
+        );
+        assert_eq!(
+            std::fs::read_dir(cas.layout().root().join("staging"))
+                .unwrap()
+                .count(),
+            0
+        );
+        drop(first);
+        assert!(
+            collectible(&cas).is_empty(),
+            "sibling still awaits acknowledgment"
+        );
+        drop(second);
+        assert!(collectible(&cas).contains(&digest_key(&output.digest)));
+    }
+
+    #[test]
+    fn streamed_readonly_cas_materializes_as_an_independent_writable_output() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = crate::test_util::private_tempdir();
+        let source = dir.path().join("libsource.rmeta");
+        let destination = dir.path().join("subscriber/libsource.rmeta");
+        let original = b"metadata\0\xff\n";
+        std::fs::write(&source, original).unwrap();
+        let cas = Arc::new(mount_and_reconcile(&dir.path().join("cas")).unwrap());
+        let mut pins = CapturePins::new(Arc::clone(&cas), &authority(1));
+        let output = put_output(&cas, &source, 1024, &mut pins).unwrap();
+        let stored = cas
+            .store()
+            .lock()
+            .unwrap()
+            .object_locations(&output.digest)
+            .unwrap()[0]
+            .0
+            .clone();
+        let stored_meta = std::fs::metadata(&stored).unwrap();
+        assert_eq!(stored_meta.mode() & 0o222, 0);
+        assert_ne!(stored_meta.ino(), std::fs::metadata(&source).unwrap().ino());
+        std::fs::write(&source, b"later compiler output").unwrap();
+        let bytes = materialize_object(
+            &mut *cas.store().lock().unwrap(),
+            &output.digest,
+            &destination,
+            MaterializationMode::PrivateCopy,
+        )
+        .unwrap();
+        assert_eq!(bytes, original.len() as u64);
+        assert_eq!(std::fs::read(&destination).unwrap(), original);
+        let installed_meta = std::fs::metadata(&destination).unwrap();
+        assert_ne!(installed_meta.mode() & 0o200, 0);
+        assert_ne!(installed_meta.ino(), stored_meta.ino());
+        std::fs::write(&destination, b"subscriber-owned mutation").unwrap();
+        assert_eq!(std::fs::read(&stored).unwrap(), original);
+        assert_eq!(std::fs::read(&source).unwrap(), b"later compiler output");
+        assert!(collectible(&cas).is_empty());
+    }
+
+    #[test]
+    fn streamed_put_preserves_collision_evidence_and_refuses_materialization() {
+        let dir = crate::test_util::private_tempdir();
+        let source = dir.path().join("libsource.rmeta");
+        let expected = b"good metadata";
+        std::fs::write(&source, expected).unwrap();
+        let cas = Arc::new(mount_and_reconcile(&dir.path().join("cas")).unwrap());
+        let mut original = CapturePins::new(Arc::clone(&cas), &authority(1));
+        let object = put_bytes(&cas, expected, &mut original).unwrap();
+        let stored = cas
+            .store()
+            .lock()
+            .unwrap()
+            .object_locations(&object.0)
+            .unwrap()[0]
+            .0
+            .clone();
+        // Exercise the real existing-representation collision path, not a
+        // mocked publisher: a recorded raw copy now contains different bytes.
+        std::fs::write(&stored, b"bad! metadata").unwrap();
+        let mut incoming = CapturePins::new(Arc::clone(&cas), &authority(2));
+        let error = put_output(&cas, &source, 1024, &mut incoming).unwrap_err();
+        assert!(error.contains("CollisionIncident"), "{error}");
+        assert_eq!(std::fs::read(&stored).unwrap(), b"bad! metadata");
+        assert_eq!(std::fs::read(&source).unwrap(), expected);
+        let preserved = std::fs::read_dir(cas.layout().root().join("quarantine"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        assert!(preserved.iter().any(|path| {
+            std::fs::read(path).unwrap().as_slice() == expected.as_slice()
+        }));
+        assert_eq!(
+            std::fs::read_dir(cas.layout().root().join("staging"))
+                .unwrap()
+                .count(),
+            0
+        );
+        drop(incoming);
+        drop(original);
+        let destination = dir.path().join("must-not-install");
+        assert!(matches!(
+            materialize_object(
+                &mut *cas.store().lock().unwrap(),
+                &object.0,
+                &destination,
+                MaterializationMode::PrivateCopy,
+            ),
+            Err(MaterializeError::QuarantinedObject { .. })
+        ));
+        assert!(!destination.exists());
+        assert!(preserved.iter().any(|path| {
+            std::fs::read(path).unwrap().as_slice() == expected.as_slice()
+        }));
+    }
+
+    #[test]
+    fn a_later_failed_stream_abandons_only_its_own_capture_pins() {
+        let dir = crate::test_util::private_tempdir();
+        let source = dir.path().join("libsource.rmeta");
+        std::fs::write(&source, b"first output").unwrap();
+        let cas = Arc::new(mount_and_reconcile(&dir.path().join("cas")).unwrap());
+        let attempt = authority(1);
+        let mut pins = CapturePins::new(Arc::clone(&cas), &attempt);
+        let output = put_output(&cas, &source, 1024, &mut pins).unwrap();
+        let mut sibling = CapturePins::new(Arc::clone(&cas), &authority(2));
+        put_output(&cas, &source, 1024, &mut sibling).unwrap();
+        let reserved = pins.held.keys().copied().collect::<Vec<_>>();
+        assert!(put_output(&cas, &dir.path().join("missing.rlib"), 1024, &mut pins).is_err());
+        assert_eq!(pins.held.keys().copied().collect::<Vec<_>>(), reserved);
+        assert!(
+            cas.store()
+                .lock()
+                .unwrap()
+                .published_manifest_key(&attempt.action_key)
+                .unwrap()
+                .is_none()
+        );
+        drop(pins);
+        assert!(collectible(&cas).is_empty());
+        drop(sibling);
+        assert!(collectible(&cas).contains(&digest_key(&output.digest)));
+        assert_eq!(std::fs::read(&source).unwrap(), b"first output");
     }
 }

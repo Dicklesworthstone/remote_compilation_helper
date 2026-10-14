@@ -493,3 +493,178 @@ fn a_guard_for_one_compiler_cannot_admit_another_compiler_path() {
     assert!(fixture.published(&key).is_none());
     assert!(fixture.coord.submitted_actor(&key).unwrap().is_none());
 }
+
+fn linked_fixture() -> Fixture {
+    let mut fixture = Fixture::new();
+    *fixture
+        .argv
+        .iter_mut()
+        .find(|arg| arg.as_str() == "--emit=metadata,dep-info")
+        .unwrap() = "--emit=dep-info,metadata,link".to_owned();
+    fixture
+}
+
+/// Real files large enough to cross the streaming buffer boundary, not a
+/// claim that these fixture bytes are a valid rustc archive.
+fn linked_outputs(fixture: &Fixture) -> Vec<u8> {
+    fixture.outputs();
+    let archive = (0_u8..=255)
+        .cycle()
+        .take(2 * 64 * 1024 + 7)
+        .collect::<Vec<_>>();
+    std::fs::write(fixture.out.join("libfoo-123.rlib"), &archive).unwrap();
+    archive
+}
+
+fn gc_candidates(fixture: &Fixture) -> Vec<String> {
+    use rabs_cas::gc::{GcMode, GcWorld, plan_gc};
+    plan_gc(
+        &mut *fixture.cas.store().lock().unwrap(),
+        &GcWorld {
+            reclaim_budget: 1000,
+            reconciliation_complete: true,
+            ..GcWorld::default()
+        },
+        GcMode::Emergency,
+        u64::MAX / 2,
+    )
+    .unwrap()
+    .reclaim
+    .into_iter()
+    .map(|location| location.object_key)
+    .collect()
+}
+
+#[test]
+fn streamed_multiple_outputs_publish_only_as_one_complete_immutable_result() {
+    let fixture = linked_fixture();
+    let attempt = fixture.begin();
+    let key = attempt.action_key().clone();
+    let archive = linked_outputs(&fixture);
+    let expected = [
+        ("libfoo-123.rmeta", b"original metadata fixture".as_slice()),
+        ("libfoo-123.rlib", archive.as_slice()),
+    ]
+    .map(|(name, bytes)| {
+        (
+            name,
+            digest_set(bytes, DigestRequest::default(), None)
+                .unwrap()
+                .atp_content_id,
+        )
+    });
+    let captured = attempt.capture(&success()).unwrap();
+    assert!(fixture.published(&key).is_none());
+    let candidates = gc_candidates(&fixture);
+    for (_, digest) in &expected {
+        assert!(fixture
+            .cas
+            .store()
+            .lock()
+            .unwrap()
+            .object_durably_located(digest)
+            .unwrap());
+        assert!(!candidates.contains(&rabs_cas::metadata_store::digest_key(digest)));
+    }
+    let manifest = captured.manifest_key().to_owned();
+    std::fs::rename(
+        &fixture.out,
+        fixture.out.with_file_name("captured-outputs"),
+    )
+    .unwrap();
+    let (outcome, known) = captured.publish();
+    assert_eq!(outcome, CompletionOutcome::Committed);
+    assert_eq!(fixture.published(&key), Some(manifest));
+    assert_eq!(known.len(), expected.len());
+    for (name, digest) in &expected {
+        let output = known
+            .iter()
+            .find(|output| output.path == fixture.out.join(name))
+            .unwrap();
+        assert_eq!(&output.digest, digest);
+        let stored = fixture
+            .cas
+            .store()
+            .lock()
+            .unwrap()
+            .object_locations(digest)
+            .unwrap()[0]
+            .0
+            .clone();
+        assert_eq!(
+            rabsd::edge::live_facts::digest_stable(Path::new(&stored))
+                .unwrap()
+                .1,
+            *digest
+        );
+    }
+    assert!(
+        !fixture.out.exists(),
+        "publication must not reopen or recreate outputs"
+    );
+    assert!(fixture.coord.submitted_actor(&key).unwrap().is_none());
+}
+
+#[test]
+fn missing_later_output_retires_streamed_attempt_without_partial_publication() {
+    let fixture = linked_fixture();
+    let request = fixture.request();
+    let declared = request.plan.output_names();
+    let capture_order = request
+        .plan
+        .outputs
+        .declarations
+        .iter()
+        .map(|declaration| declaration.virtual_path.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(declared.len(), 3);
+    let key = request.key.action_key.clone();
+    let LiveDecision::Execute(attempt) = fixture.lane.decide(request) else {
+        panic!("expected an admitted multi-output attempt");
+    };
+    linked_outputs(&fixture);
+    // Omit the last DECLARED artifact so the real capture must already have
+    // staged and pinned at least one native output before the later failure.
+    let missing = fixture.out.join(capture_order.last().unwrap());
+    let retained = fixture.out.with_file_name("retained-missing-output");
+    std::fs::rename(&missing, &retained).unwrap();
+    let earlier = capture_order[..capture_order.len() - 1]
+        .iter()
+        .filter(|name| name.ends_with(".rlib") || name.ends_with(".rmeta"))
+        .map(|name| {
+            rabsd::edge::live_facts::digest_stable(&fixture.out.join(name))
+                .unwrap()
+                .1
+        })
+        .collect::<Vec<_>>();
+    assert!(!earlier.is_empty());
+    let report = success();
+    assert!(attempt.capture(&report).is_err());
+    assert_eq!(report.exit_code, Some(0));
+    assert!(fixture.published(&key).is_none());
+    assert!(fixture.coord.submitted_actor(&key).unwrap().is_none());
+    let candidates = gc_candidates(&fixture);
+    for digest in &earlier {
+        assert!(fixture
+            .cas
+            .store()
+            .lock()
+            .unwrap()
+            .object_durably_located(digest)
+            .unwrap());
+        assert!(candidates.contains(&rabs_cas::metadata_store::digest_key(digest)));
+    }
+    assert_eq!(
+        std::fs::read_dir(fixture.cas.layout().root().join("staging"))
+            .unwrap()
+            .count(),
+        0
+    );
+    // A later complete invocation owns a fresh attempt; the earlier failure
+    // cannot strand singleflight or leave released capture pins reusable.
+    std::fs::rename(&retained, &missing).unwrap();
+    let (outcome, known) = fixture.begin().complete(&success());
+    assert_eq!(outcome, CompletionOutcome::Committed);
+    assert_eq!(known.len(), 2);
+    assert!(fixture.published(&key).is_some());
+}
