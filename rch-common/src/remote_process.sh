@@ -138,7 +138,13 @@ rch_read_record() {
 # enumeration is unknown, never a fallback to a process-only empty-group claim.
 rch_group_state() {
     rch_check_procfs_namespace || return 2
-    rch_task_snapshot=$(LC_ALL=C ps -e -L -o pid= -o lwp= -o pgid= -o stat= -o nlwp=) || return 2
+    # Process observation is evidence, never an unbounded control dependency.
+    # Bound the COMPLETE census exchange, including an exited ps whose descendant
+    # still holds stdout open. rch_group_timeout prefers the fleet's GNU timeout,
+    # which kills the helper process group at the deadline. Timeout/failure stays
+    # unknown (2); it never becomes evidence that the workload is absent.
+    rch_task_snapshot=$(LC_ALL=C rch_control_capture 1s \
+        ps -e -L -o pid= -o lwp= -o pgid= -o stat= -o nlwp=) || return 2
     rch_snapshot=$(printf '%s\n' "$rch_task_snapshot" | LC_ALL=C awk -v group="$rch_pgid" -v observer="$$" '
         NF != 5 || $1 !~ /^[1-9][0-9]*$/ || $2 !~ /^[1-9][0-9]*$/ || $3 !~ /^[0-9]+$/ || $4 !~ /^[RSDTtKWPIXZx][A-Za-z0-9+<>-]*$/ || $5 !~ /^[1-9][0-9]*$/ { bad = 1; next }
         seen_task[$2]++ { bad = 1 }
@@ -515,29 +521,49 @@ rch_control_capture() {
     # bounded file owned by this still-live observer, outside the timed group.
     rch_control_base=${TMPDIR:-/tmp}
     case "$rch_control_base" in /*) ;; *) return 125;; esac
-    rch_control_file=$(umask 077; mktemp "$rch_control_base/rch-control-output.XXXXXXXXXX") || return 125
+    rch_control_dir=$(umask 077; mktemp -d "$rch_control_base/rch-control-output.XXXXXXXXXX") || return 125
+    rch_control_file=$rch_control_dir/output
+    rch_control_pipe=$rch_control_dir/pipe
+    (umask 077; : > "$rch_control_file" && mkfifo -m 600 "$rch_control_pipe") || {
+        rm -f -- "$rch_control_pipe" "$rch_control_file"
+        rmdir -- "$rch_control_dir" 2>/dev/null || :
+        return 125
+    }
     rch_control_status=0
     rch_group_timeout --signal=KILL "$rch_control_timeout" /bin/sh -c '
         output=$1
-        shift
-        "$@" > "$output" 2>&1
-    ' rch-control "$rch_control_file" "$@" </dev/null || rch_control_status=$?
+        pipe=$2
+        shift 2
+        cat -- "$pipe" > "$output" &
+        reader=$!
+        "$@" > "$pipe" 2>&1 &
+        command=$!
+        wait "$command"; status=$?
+        wait "$reader" || exit 125
+        exit "$status"
+    ' rch-control "$rch_control_file" "$rch_control_pipe" "$@" </dev/null || rch_control_status=$?
+
+    rm -f -- "$rch_control_pipe"
 
     rch_control_metadata=$(LC_ALL=C stat -c '%a:%h:%s' -- "$rch_control_file" 2>/dev/null) || {
         rm -f -- "$rch_control_file"
+        rmdir -- "$rch_control_dir" 2>/dev/null || :
         return 125
     }
     case "$rch_control_metadata" in
         600:1:*) ;;
-        *) rm -f -- "$rch_control_file"; return 125;;
+        *) rm -f -- "$rch_control_file"; rmdir -- "$rch_control_dir" 2>/dev/null || :; return 125;;
     esac
     rch_control_size=${rch_control_metadata##*:}
     case "$rch_control_size" in
-        ''|*[!0-9]*) rm -f -- "$rch_control_file"; return 125;;
+        ''|*[!0-9]*) rm -f -- "$rch_control_file"; rmdir -- "$rch_control_dir" 2>/dev/null || :; return 125;;
     esac
-    if [ "$rch_control_size" -gt 65536 ] ||
+    rch_control_limit=65536
+    [ "${1:-}" != ps ] || rch_control_limit=1048576
+    if [ "$rch_control_size" -gt "$rch_control_limit" ] ||
         ! LC_ALL=C tr -cd '\11\12\40-\176' < "$rch_control_file" | cmp -s - "$rch_control_file"; then
         rm -f -- "$rch_control_file"
+        rmdir -- "$rch_control_dir" 2>/dev/null || :
         return 125
     fi
 
@@ -545,12 +571,14 @@ rch_control_capture() {
         cat -- "$rch_control_file" >&2
         rch_control_output_status=$?
         rm -f -- "$rch_control_file"
+        rmdir -- "$rch_control_dir" 2>/dev/null || :
         [ "$rch_control_output_status" -eq 0 ] || return 125
         return "$rch_control_status"
     fi
     cat -- "$rch_control_file"
     rch_control_output_status=$?
     rm -f -- "$rch_control_file"
+    rmdir -- "$rch_control_dir" 2>/dev/null || :
     [ "$rch_control_output_status" -eq 0 ] || return 125
 }
 

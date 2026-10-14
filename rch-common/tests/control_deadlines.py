@@ -129,6 +129,24 @@ time.sleep(20)
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertEqual(result.stdout, b"")
 
+    def test_process_census_deadline_stops_a_term_resistant_ps(self) -> None:
+        self.stalled_helper("ps", "client")
+        result = self.run_shell(
+            "rch_pgid=424242; rch_scope_bound=0; rch_group_state",
+            stalled=True,
+        )
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(result.stdout, b"")
+
+    def test_process_census_deadline_includes_inherited_stdout_after_ps_exit(self) -> None:
+        self.stalled_helper("ps", "stdout")
+        result = self.run_shell(
+            "rch_pgid=424242; rch_scope_bound=0; rch_group_state",
+            stalled=True,
+        )
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(result.stdout, b"")
+
     def test_scope_creation_has_an_external_hard_deadline_and_no_admission(self) -> None:
         self.helper("systemctl", '''
 if "--property=ActiveState" in sys.argv: print("active")
