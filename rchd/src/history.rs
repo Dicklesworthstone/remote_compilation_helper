@@ -2533,12 +2533,16 @@ impl BuildHistory {
             .unwrap_or(Path::new("."));
         std::fs::create_dir_all(parent)?;
         let temporary = path.with_extension("tmp");
-        let mut file = std::fs::OpenOptions::new()
+        let file = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
             .open(&temporary)?;
-        serde_json::to_writer(&mut file, &snapshot)?;
+        // Unbuffered, serde_json issues one write(2) per JSON token (~50k for
+        // a 280 KB snapshot) while the caller holds the `active` write lock.
+        let mut writer = std::io::BufWriter::new(file);
+        serde_json::to_writer(&mut writer, &snapshot)?;
+        let file = writer.into_inner().map_err(|e| e.into_error())?;
         file.sync_all()?;
         std::fs::rename(&temporary, &path)?;
         #[cfg(test)]
