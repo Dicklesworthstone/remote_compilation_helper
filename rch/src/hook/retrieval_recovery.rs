@@ -674,6 +674,8 @@ fn prepare_output_temporary(
     }
 }
 
+// Unix publication reads the stage through `staged_inventory` instead.
+#[cfg(any(not(unix), test))]
 fn regular_files(root: &Path) -> anyhow::Result<Vec<PathBuf>> {
     fn visit(root: &Path, directory: &Path, files: &mut Vec<PathBuf>) -> anyhow::Result<()> {
         if !directory.exists() {

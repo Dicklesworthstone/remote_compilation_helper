@@ -142,8 +142,31 @@ fn visit(
 mod tests {
     use super::*;
     use std::ffi::OsString;
+    #[cfg(not(target_vendor = "apple"))]
     use std::os::unix::ffi::OsStringExt;
     use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+
+    #[cfg(not(target_vendor = "apple"))]
+    fn make_fifo(path: &Path) -> std::io::Result<()> {
+        Ok(rustix::fs::mkfifoat(CWD, path, Mode::RUSR | Mode::WUSR)?)
+    }
+
+    // rustix has no mkfifoat on Apple targets and this crate forbids unsafe code.
+    #[cfg(target_vendor = "apple")]
+    fn make_fifo(path: &Path) -> std::io::Result<()> {
+        let status = std::process::Command::new("/usr/bin/mkfifo")
+            .args(["-m", "600"])
+            .arg(path)
+            .status()?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(std::io::Error::other(format!(
+                "mkfifo {}: {status}",
+                path.display()
+            )))
+        }
+    }
 
     struct Fixture {
         root: PathBuf,
@@ -183,13 +206,17 @@ mod tests {
         let fixture = Fixture::new();
         std::fs::create_dir_all(fixture.stage.join("empty/nested")).unwrap();
         let mut expected = vec![PathBuf::from("build/deep/app")];
-        for name in [
+        #[cfg_attr(target_vendor = "apple", allow(unused_mut))]
+        let mut names = vec![
             OsString::from("library.a"),
             OsString::from("distribution.tar"),
             OsString::from("report with spaces.txt"),
             OsString::from(".rch-clean-overlay-base.tar"),
-            OsString::from_vec(b"object-\xff.o".to_vec()),
-        ] {
+        ];
+        // APFS refuses names that are not UTF-8 (EILSEQ).
+        #[cfg(not(target_vendor = "apple"))]
+        names.push(OsString::from_vec(b"object-\xff.o".to_vec()));
+        for name in names {
             let path = PathBuf::from("build").join(name);
             std::fs::write(fixture.stage.join(&path), b"retained bytes").unwrap();
             expected.push(path);
@@ -223,7 +250,9 @@ mod tests {
             b"original executable"
         );
         assert_eq!(
-            std::fs::metadata(fixture.retained.join("app")).unwrap().ino(),
+            std::fs::metadata(fixture.retained.join("app"))
+                .unwrap()
+                .ino(),
             inode
         );
         fixture.caller_unchanged();
@@ -252,7 +281,7 @@ mod tests {
                     match replacement {
                         "empty-directory" => std::fs::create_dir(&original)?,
                         "symlink" => symlink(&fixture.retained, &original)?,
-                        "fifo" => rustix::fs::mkfifoat(CWD, &original, Mode::RUSR | Mode::WUSR)?,
+                        "fifo" => make_fifo(&original)?,
                         _ => unreachable!(),
                     }
                 }
@@ -315,10 +344,7 @@ mod tests {
                         // deleting even one retained output byte.
                         let metadata = std::fs::metadata(&original)?;
                         let mode = metadata.mode() ^ 0o100;
-                        std::fs::set_permissions(
-                            &original,
-                            std::fs::Permissions::from_mode(mode),
-                        )?;
+                        std::fs::set_permissions(&original, std::fs::Permissions::from_mode(mode))?;
                     }
                 }
                 Ok(())
@@ -343,7 +369,7 @@ mod tests {
             match special {
                 "symlink" => symlink(fixture.stage.join("build/deep"), &name).unwrap(),
                 "dangling-symlink" => symlink(&fixture.retained, &name).unwrap(),
-                "fifo" => rustix::fs::mkfifoat(CWD, &name, Mode::RUSR | Mode::WUSR).unwrap(),
+                "fifo" => make_fifo(&name).unwrap(),
                 _ => unreachable!(),
             }
             assert!(regular_files(&fixture.stage).is_err(), "{special}");
