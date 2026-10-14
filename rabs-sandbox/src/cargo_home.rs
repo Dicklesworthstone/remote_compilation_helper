@@ -333,9 +333,15 @@ mod tests {
         }
     }
 
+    fn private() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        dir
+    }
+
     #[test]
     fn verified_cache_is_independent_writable_and_does_not_touch_original_home() {
-        let parent = tempfile::tempdir().unwrap();
+        let parent = private();
         let (source, projection) = fixture(parent.path());
         let prepared = projection
             .prepare(&source, &parent.path().join("cache-runtime"), || false)
@@ -373,7 +379,7 @@ mod tests {
     #[test]
     fn changed_bytes_mode_and_symlink_never_prepare_a_cargo_home() {
         for change in 0..3 {
-            let parent = tempfile::tempdir().unwrap();
+            let parent = private();
             let (source, projection) = fixture(parent.path());
             let path = source
                 .sealed_root()
@@ -397,7 +403,7 @@ mod tests {
 
     #[test]
     fn cancellation_and_existing_destinations_never_return_partial_owners() {
-        let parent = tempfile::tempdir().unwrap();
+        let parent = private();
         let (source, projection) = fixture(parent.path());
         let target = parent.path().join("refused");
         assert_eq!(
@@ -416,7 +422,7 @@ mod tests {
 
     #[test]
     fn mount_refusal_is_atomic_and_replaced_root_cannot_be_installed() {
-        let parent = tempfile::tempdir().unwrap();
+        let parent = private();
         let (source, projection) = fixture(parent.path());
         let prepared = projection
             .prepare(&source, &parent.path().join("cache-runtime"), || false)
