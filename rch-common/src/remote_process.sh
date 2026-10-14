@@ -484,9 +484,22 @@ rch_policy_read_file() {
 # Capture stderr too, so it cannot keep the outer SSH pipe open independently.
 # Successful warnings become unrecognized response data (fail closed); failed
 # exchanges retain their diagnostic on stderr. No payload is evaluated as code.
+# GNU timeout kills its whole process group at the deadline; uutils timeout
+# (Ubuntu 25.10+ /usr/bin/timeout) kills only its direct child, so a pipe
+# holder survives. Ubuntu keeps GNU's as gnutimeout; Homebrew as gtimeout.
+rch_group_timeout() {
+    if command -v gnutimeout >/dev/null 2>&1; then
+        gnutimeout "$@"
+    elif command -v gtimeout >/dev/null 2>&1; then
+        gtimeout "$@"
+    else
+        timeout "$@"
+    fi
+}
+
 rch_control_capture() {
     case "$1" in 1s|5s) ;; *) return 125;; esac
-    timeout --signal=KILL "$1" /bin/sh -c '
+    rch_group_timeout --signal=KILL "$1" /bin/sh -c '
         shift
         __rch_control_output=$("$@" 2>&1)
         __rch_control_status=$?
