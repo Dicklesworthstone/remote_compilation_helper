@@ -24,16 +24,15 @@ const BUFFER_BYTES: usize = 64 * 1024;
 /// Completed phases bypass collection in the caller and need no stage readback.
 pub(super) fn staged_regular_files(root: &Path) -> Result<Vec<std::path::PathBuf>> {
     let held = File::from(
-        rustix::fs::open(root, read_flags() | OFlags::DIRECTORY, Mode::empty())
-            .context("retrieval staging directory is missing or invalid; delivery remains pending")?,
+        rustix::fs::open(root, read_flags() | OFlags::DIRECTORY, Mode::empty()).context(
+            "retrieval staging directory is missing or invalid; delivery remains pending",
+        )?,
     );
     let metadata = held.metadata()?;
     let verify = || -> Result<()> {
         let named = std::fs::symlink_metadata(root)?;
         anyhow::ensure!(
-            named.is_dir()
-                && metadata.dev() == named.dev()
-                && metadata.ino() == named.ino(),
+            named.is_dir() && metadata.dev() == named.dev() && metadata.ino() == named.ino(),
             "retrieval staging directory changed; delivery remains pending"
         );
         Ok(())
@@ -82,7 +81,9 @@ fn verify_temporary(
     length: u64,
     mode: u32,
 ) -> Result<()> {
-    let parent = temporary.parent().context("output temporary has no parent")?;
+    let parent = temporary
+        .parent()
+        .context("output temporary has no parent")?;
     let held_directory = directory.metadata()?;
     // The caller may choose a symlinked output ROOT. Its referent must still
     // be the same held directory; descendant checks remain in the publisher.
@@ -94,7 +95,9 @@ fn verify_temporary(
             && held_directory.ino() == named_directory.ino(),
         "publication copy directory changed; evidence retained"
     );
-    let name = temporary.file_name().context("output temporary has no name")?;
+    let name = temporary
+        .file_name()
+        .context("output temporary has no name")?;
     let named = File::from(rustix::fs::openat(
         directory.as_fd(),
         name,
@@ -200,7 +203,9 @@ fn prepare_with_write(
     expected: &str,
     mut write: impl FnMut(&File, &[u8], u64) -> io::Result<usize>,
 ) -> Result<PreparedOutput> {
-    let parent = temporary.parent().context("output temporary has no parent")?;
+    let parent = temporary
+        .parent()
+        .context("output temporary has no parent")?;
     std::fs::create_dir_all(parent)?;
     let directory = File::open(parent)?;
     anyhow::ensure!(
@@ -209,8 +214,13 @@ fn prepare_with_write(
     );
     let source = File::from(rustix::fs::open(source_path, read_flags(), Mode::empty())?);
     let source_metadata = source.metadata()?;
-    anyhow::ensure!(source_metadata.is_file(), "staged output is not a regular file");
-    let name = temporary.file_name().context("output temporary has no name")?;
+    anyhow::ensure!(
+        source_metadata.is_file(),
+        "staged output is not a regular file"
+    );
+    let name = temporary
+        .file_name()
+        .context("output temporary has no name")?;
     let file = match rustix::fs::openat(directory.as_fd(), name, read_flags(), Mode::empty()) {
         Ok(file) => File::from(file),
         Err(rustix::io::Errno::NOENT) => {
@@ -240,12 +250,19 @@ fn prepare_with_write(
             && initial.uid() == rustix::process::geteuid().as_raw()
             && prefix_length <= source_metadata.len()
             && (initial.dev() != source_metadata.dev() || initial.ino() != source_metadata.ino())
-            && (mode == COPY_MODE || (prefix_length == source_metadata.len() && mode == final_mode)),
+            && (mode == COPY_MODE
+                || (prefix_length == source_metadata.len() && mode == final_mode)),
         "retained output is not a private partial copy or a complete correctly-permissioned copy"
     );
     verify_temporary(&directory, temporary, &file, &initial, prefix_length, mode)?;
     verify_source(&source, source_path, &source_metadata)?;
-    verify_prefix(&source, source_metadata.len(), &file, prefix_length, expected)?;
+    verify_prefix(
+        &source,
+        source_metadata.len(),
+        &file,
+        prefix_length,
+        expected,
+    )?;
     verify_source(&source, source_path, &source_metadata)?;
     anyhow::ensure!(
         same_version(&initial, &file.metadata()?),
@@ -314,7 +331,9 @@ fn prepare_with_write(
     }
     prepared.verify_name(temporary)?;
     prepared.verify_content()?;
-    prepared.file.set_permissions(source_metadata.permissions())?;
+    prepared
+        .file
+        .set_permissions(source_metadata.permissions())?;
     prepared.file.sync_all()?;
     PreparedOutput::hold(prepared.file, prepared.directory, temporary, expected)
 }
@@ -348,37 +367,61 @@ mod tests {
             std::fs::write(&source, &bytes).unwrap();
             std::fs::set_permissions(&source, Permissions::from_mode(0o755)).unwrap();
             std::fs::write(&destination, b"previous caller output").unwrap();
-            Self { root, source, temporary, destination, bytes, hash }
+            Self {
+                root,
+                source,
+                temporary,
+                destination,
+                bytes,
+                hash,
+            }
         }
 
         fn private_prefix(&self, length: usize) {
-            let file = File::from(rustix::fs::open(
-                &self.temporary,
-                OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-                Mode::RUSR | Mode::WUSR,
-            ).unwrap());
+            let file = File::from(
+                rustix::fs::open(
+                    &self.temporary,
+                    OFlags::RDWR
+                        | OFlags::CREATE
+                        | OFlags::EXCL
+                        | OFlags::CLOEXEC
+                        | OFlags::NOFOLLOW,
+                    Mode::RUSR | Mode::WUSR,
+                )
+                .unwrap(),
+            );
             file.write_all_at(&self.bytes[..length], 0).unwrap();
-            file.set_permissions(Permissions::from_mode(COPY_MODE)).unwrap();
+            file.set_permissions(Permissions::from_mode(COPY_MODE))
+                .unwrap();
             file.sync_all().unwrap();
         }
 
         fn check_originals(&self) {
             assert_eq!(std::fs::read(&self.source).unwrap(), self.bytes);
-            assert_eq!(std::fs::read(&self.destination).unwrap(), b"previous caller output");
+            assert_eq!(
+                std::fs::read(&self.destination).unwrap(),
+                b"previous caller output"
+            );
         }
     }
 
     fn fail_at(fixture: &Fixture, stop: u64) -> anyhow::Error {
         prepare_with_write(
-            &fixture.source, &fixture.temporary, &fixture.hash,
+            &fixture.source,
+            &fixture.temporary,
+            &fixture.hash,
             |file, bytes, offset| {
                 if offset >= stop {
-                    return Err(io::Error::from_raw_os_error(rustix::io::Errno::NOSPC.raw_os_error()));
+                    return Err(io::Error::from_raw_os_error(
+                        rustix::io::Errno::NOSPC.raw_os_error(),
+                    ));
                 }
                 let count = bytes.len().min((stop - offset) as usize);
                 file.write_at(&bytes[..count], offset)
             },
-        ).err().expect("fault injection must interrupt the copy")
+        )
+        .err()
+        .expect("fault injection must interrupt the copy")
     }
 
     #[test]
@@ -387,17 +430,29 @@ mod tests {
             let fixture = Fixture::new(196_739);
             let destination_inode = std::fs::metadata(&fixture.destination).unwrap().ino();
             let error = fail_at(&fixture, stop);
-            assert!(error.chain().any(|cause| cause.downcast_ref::<io::Error>()
-                .is_some_and(|error| error.raw_os_error() == Some(rustix::io::Errno::NOSPC.raw_os_error()))));
+            assert!(
+                error.chain().any(|cause| cause
+                    .downcast_ref::<io::Error>()
+                    .is_some_and(|error| error.raw_os_error()
+                        == Some(rustix::io::Errno::NOSPC.raw_os_error())))
+            );
             let initial = std::fs::metadata(&fixture.temporary).unwrap();
             assert_eq!(initial.len(), stop);
             assert_eq!(initial.mode() & 0o7777, COPY_MODE);
-            assert_eq!(std::fs::read(&fixture.temporary).unwrap(), fixture.bytes[..stop as usize]);
+            assert_eq!(
+                std::fs::read(&fixture.temporary).unwrap(),
+                fixture.bytes[..stop as usize]
+            );
             fixture.check_originals();
-            assert_eq!(std::fs::metadata(&fixture.destination).unwrap().ino(), destination_inode);
+            assert_eq!(
+                std::fs::metadata(&fixture.destination).unwrap().ino(),
+                destination_inode
+            );
             let mut appended = 0;
             let prepared = prepare_with_write(
-                &fixture.source, &fixture.temporary, &fixture.hash,
+                &fixture.source,
+                &fixture.temporary,
+                &fixture.hash,
                 |file, bytes, offset| {
                     assert_eq!(offset, stop + appended);
                     assert!(offset >= stop, "retained prefix was rewritten");
@@ -405,7 +460,8 @@ mod tests {
                     appended += written as u64;
                     Ok(written)
                 },
-            ).unwrap();
+            )
+            .unwrap();
             assert_eq!(appended, fixture.bytes.len() as u64 - stop);
             assert_eq!(prepared.file.metadata().unwrap().ino(), initial.ino());
             assert_eq!(std::fs::read(&fixture.temporary).unwrap(), fixture.bytes);
@@ -413,7 +469,10 @@ mod tests {
             fixture.check_originals();
             prepared.publish(&fixture.destination).unwrap();
             assert_eq!(std::fs::read(&fixture.destination).unwrap(), fixture.bytes);
-            assert_eq!(std::fs::metadata(&fixture.destination).unwrap().ino(), initial.ino());
+            assert_eq!(
+                std::fs::metadata(&fixture.destination).unwrap().ino(),
+                initial.ino()
+            );
             assert_eq!(std::fs::read(&fixture.source).unwrap(), fixture.bytes);
         }
     }
@@ -426,10 +485,14 @@ mod tests {
         for stop in [100, 65_535, 65_537] {
             let _ = fail_at(&fixture, stop);
             assert_eq!(std::fs::metadata(&fixture.temporary).unwrap().ino(), inode);
-            assert_eq!(std::fs::read(&fixture.temporary).unwrap(), fixture.bytes[..stop as usize]);
+            assert_eq!(
+                std::fs::read(&fixture.temporary).unwrap(),
+                fixture.bytes[..stop as usize]
+            );
             fixture.check_originals();
         }
-        let prepared = prepare_output_temporary(&fixture.source, &fixture.temporary, &fixture.hash).unwrap();
+        let prepared =
+            prepare_output_temporary(&fixture.source, &fixture.temporary, &fixture.hash).unwrap();
         assert_eq!(prepared.file.metadata().unwrap().ino(), inode);
         prepared.verify_content().unwrap();
     }
@@ -444,9 +507,12 @@ mod tests {
                 let inode = std::fs::metadata(&fixture.temporary).unwrap().ino();
                 for _ in 0..2 {
                     let prepared = prepare_with_write(
-                        &fixture.source, &fixture.temporary, &fixture.hash,
+                        &fixture.source,
+                        &fixture.temporary,
+                        &fixture.hash,
                         |_, _, _| panic!("complete copy must not allocate or rewrite payload"),
-                    ).unwrap();
+                    )
+                    .unwrap();
                     assert_eq!(prepared.mode, mode);
                     assert_eq!(prepared.file.metadata().unwrap().ino(), inode);
                     prepared.verify_content().unwrap();
@@ -458,14 +524,28 @@ mod tests {
 
     #[test]
     fn conflicting_prefix_hash_length_and_mode_are_refused_without_writing() {
-        for case in ["prefix", "suffix-hash", "oversized", "mode", "complete-mode", "hardlink"] {
+        for case in [
+            "prefix",
+            "suffix-hash",
+            "oversized",
+            "mode",
+            "complete-mode",
+            "hardlink",
+        ] {
             let fixture = Fixture::new(131_073);
             let complete = case == "complete-mode";
-            fixture.private_prefix(if complete { fixture.bytes.len() } else { 65_537 });
+            fixture.private_prefix(if complete {
+                fixture.bytes.len()
+            } else {
+                65_537
+            });
             let mut expected = fixture.hash.clone();
             match case {
                 "prefix" => {
-                    let file = std::fs::OpenOptions::new().write(true).open(&fixture.temporary).unwrap();
+                    let file = std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(&fixture.temporary)
+                        .unwrap();
                     file.write_all_at(b"X", 65_536).unwrap();
                 }
                 "suffix-hash" => {
@@ -474,21 +554,34 @@ mod tests {
                     expected = blake3::hash(&other).to_hex().to_string();
                 }
                 "oversized" => {
-                    let file = std::fs::OpenOptions::new().write(true).open(&fixture.temporary).unwrap();
+                    let file = std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(&fixture.temporary)
+                        .unwrap();
                     file.write_all_at(b"X", fixture.bytes.len() as u64).unwrap();
                 }
                 "mode" | "complete-mode" => {
-                    std::fs::set_permissions(&fixture.temporary, Permissions::from_mode(0o644)).unwrap();
+                    std::fs::set_permissions(&fixture.temporary, Permissions::from_mode(0o644))
+                        .unwrap();
                 }
-                "hardlink" => std::fs::hard_link(&fixture.temporary, fixture.root.join("retained-alias")).unwrap(),
+                "hardlink" => {
+                    std::fs::hard_link(&fixture.temporary, fixture.root.join("retained-alias"))
+                        .unwrap()
+                }
                 _ => unreachable!(),
             }
             let before = std::fs::read(&fixture.temporary).unwrap();
             let metadata = std::fs::metadata(&fixture.temporary).unwrap();
-            assert!(prepare_with_write(
-                &fixture.source, &fixture.temporary, &expected,
-                |_, _, _| panic!("rejected evidence reached a write: {case}"),
-            ).is_err(), "{case}");
+            assert!(
+                prepare_with_write(
+                    &fixture.source,
+                    &fixture.temporary,
+                    &expected,
+                    |_, _, _| panic!("rejected evidence reached a write: {case}"),
+                )
+                .is_err(),
+                "{case}"
+            );
             assert_eq!(std::fs::read(&fixture.temporary).unwrap(), before);
             let after = std::fs::metadata(&fixture.temporary).unwrap();
             assert_eq!(after.ino(), metadata.ino());
@@ -504,9 +597,17 @@ mod tests {
             let fixture = Fixture::new(99);
             let mut source = fixture.source.clone();
             match kind {
-                "symlink" => std::os::unix::fs::symlink(&fixture.destination, &fixture.temporary).unwrap(),
+                "symlink" => {
+                    std::os::unix::fs::symlink(&fixture.destination, &fixture.temporary).unwrap()
+                }
                 "fifo" => {
-                    assert!(std::process::Command::new("mkfifo").arg(&fixture.temporary).status().unwrap().success());
+                    assert!(
+                        std::process::Command::new("mkfifo")
+                            .arg(&fixture.temporary)
+                            .status()
+                            .unwrap()
+                            .success()
+                    );
                 }
                 "directory" => std::fs::create_dir(&fixture.temporary).unwrap(),
                 "source-symlink" => {
@@ -516,9 +617,15 @@ mod tests {
                 }
                 _ => unreachable!(),
             }
-            assert!(prepare_with_write(&source, &fixture.temporary, &fixture.hash,
-                |_, _, _| panic!("unsafe entry reached write")
-            ).is_err());
+            assert!(
+                prepare_with_write(
+                    &source,
+                    &fixture.temporary,
+                    &fixture.hash,
+                    |_, _, _| panic!("unsafe entry reached write")
+                )
+                .is_err()
+            );
             fixture.check_originals();
             assert!(std::fs::symlink_metadata(&fixture.temporary).is_ok());
         }
@@ -528,16 +635,23 @@ mod tests {
     fn complete_byte_verification_detects_in_place_mutation_after_prefix_validation() {
         let fixture = Fixture::new(131_077);
         fixture.private_prefix(101);
-        let result = prepare_with_write(&fixture.source, &fixture.temporary, &fixture.hash,
+        let result = prepare_with_write(
+            &fixture.source,
+            &fixture.temporary,
+            &fixture.hash,
             |file, bytes, offset| {
                 let count = file.write_at(bytes, offset)?;
                 // Same inode and size, but a test-owned prefix byte changed.
                 file.write_all_at(b"X", 0)?;
                 Ok(count)
-            });
+            },
+        );
         assert!(result.is_err());
         assert_eq!(std::fs::read(&fixture.temporary).unwrap()[0], b'X');
-        assert_eq!(std::fs::metadata(&fixture.temporary).unwrap().mode() & 0o7777, COPY_MODE);
+        assert_eq!(
+            std::fs::metadata(&fixture.temporary).unwrap().mode() & 0o7777,
+            COPY_MODE
+        );
         fixture.check_originals();
     }
 
@@ -553,7 +667,10 @@ mod tests {
                 fixture.root.join("retained-prefix")
             };
             let mut first = true;
-            let result = prepare_with_write(&fixture.source, &fixture.temporary, &fixture.hash,
+            let result = prepare_with_write(
+                &fixture.source,
+                &fixture.temporary,
+                &fixture.hash,
                 |file, bytes, offset| {
                     let count = file.write_at(bytes, offset)?;
                     if first {
@@ -567,18 +684,28 @@ mod tests {
                         std::fs::write(&fixture.temporary, b"replacement must not be touched")?;
                     }
                     Ok(count)
-                });
+                },
+            );
             assert!(result.is_err());
-            assert_eq!(std::fs::read(&fixture.temporary).unwrap(), b"replacement must not be touched");
+            assert_eq!(
+                std::fs::read(&fixture.temporary).unwrap(),
+                b"replacement must not be touched"
+            );
             let original = if replace_directory {
-                assert_eq!(std::fs::read(retained.join("caller-output")).unwrap(), b"previous caller output");
+                assert_eq!(
+                    std::fs::read(retained.join("caller-output")).unwrap(),
+                    b"previous caller output"
+                );
                 retained.join(".rch-return-copy-fixture")
             } else {
                 fixture.check_originals();
                 retained
             };
             assert_eq!(std::fs::metadata(&original).unwrap().ino(), original_inode);
-            assert_eq!(std::fs::read(&original).unwrap(), fixture.bytes[..31 + BUFFER_BYTES]);
+            assert_eq!(
+                std::fs::read(&original).unwrap(),
+                fixture.bytes[..31 + BUFFER_BYTES]
+            );
         }
     }
 
@@ -587,19 +714,34 @@ mod tests {
         let fixture = Fixture::new(1031);
         fixture.private_prefix(31);
         let before = std::fs::read(&fixture.temporary).unwrap();
-        let error = prepare_with_write(&fixture.source, &fixture.temporary, &fixture.hash,
-            |_, _, _| Ok(0)).err().unwrap();
-        assert!(error.downcast_ref::<io::Error>().is_some_and(|e| e.kind() == io::ErrorKind::WriteZero));
+        let error = prepare_with_write(
+            &fixture.source,
+            &fixture.temporary,
+            &fixture.hash,
+            |_, _, _| Ok(0),
+        )
+        .err()
+        .unwrap();
+        assert!(
+            error
+                .downcast_ref::<io::Error>()
+                .is_some_and(|e| e.kind() == io::ErrorKind::WriteZero)
+        );
         assert_eq!(std::fs::read(&fixture.temporary).unwrap(), before);
         let mut interrupted = false;
-        let prepared = prepare_with_write(&fixture.source, &fixture.temporary, &fixture.hash,
+        let prepared = prepare_with_write(
+            &fixture.source,
+            &fixture.temporary,
+            &fixture.hash,
             |file, bytes, offset| {
                 if !interrupted {
                     interrupted = true;
                     return Err(io::ErrorKind::Interrupted.into());
                 }
                 file.write_at(&bytes[..bytes.len().min(17)], offset)
-            }).unwrap();
+            },
+        )
+        .unwrap();
         prepared.verify_content().unwrap();
         assert_eq!(std::fs::read(&fixture.temporary).unwrap(), fixture.bytes);
         fixture.check_originals();
@@ -617,7 +759,10 @@ mod tests {
         fixture.private_prefix(9);
         let directory = File::open(&fixture.root).unwrap();
         assert!(check_copy_space(&directory, u64::MAX).is_err());
-        assert_eq!(std::fs::read(&fixture.temporary).unwrap(), fixture.bytes[..9]);
+        assert_eq!(
+            std::fs::read(&fixture.temporary).unwrap(),
+            fixture.bytes[..9]
+        );
         fixture.check_originals();
     }
 
@@ -629,7 +774,10 @@ mod tests {
         std::fs::create_dir(&stage).unwrap();
         assert!(staged_regular_files(&stage).unwrap().is_empty());
         std::fs::write(stage.join("output.o"), b"retained output").unwrap();
-        assert_eq!(staged_regular_files(&stage).unwrap(), [PathBuf::from("output.o")]);
+        assert_eq!(
+            staged_regular_files(&stage).unwrap(),
+            [PathBuf::from("output.o")]
+        );
 
         let retained = fixture.root.join("original-stage");
         std::fs::rename(&stage, &retained).unwrap();
@@ -637,7 +785,10 @@ mod tests {
         std::os::unix::fs::symlink(&retained, &stage).unwrap();
         assert!(staged_regular_files(&stage).is_err());
         assert_eq!(std::fs::read_link(&stage).unwrap(), retained);
-        assert_eq!(std::fs::read(retained.join("output.o")).unwrap(), b"retained output");
+        assert_eq!(
+            std::fs::read(retained.join("output.o")).unwrap(),
+            b"retained output"
+        );
         assert!(staged_regular_files(&fixture.source).is_err());
         fixture.check_originals();
     }
@@ -676,14 +827,20 @@ mod tests {
         std::fs::write(local.join("build/app"), b"previous caller executable").unwrap();
         std::fs::write(local.join("source.c"), b"caller source sentinel").unwrap();
         std::fs::write(local.join("Makefile"), b"caller Makefile sentinel").unwrap();
-        std::fs::write(remote.join("source.c"),
-            b"#include <stdio.h>\nint main(void) { puts(\"publication recovered\"); return 0; }\n"
-        ).unwrap();
-        std::fs::write(remote.join("Makefile"), concat!(
-            ".PHONY: all\nall:\n",
-            "\t$(CC) source.c -o build/app\n",
-            "\tprintf 'once\\n' >> build/invocations\n",
-        )).unwrap();
+        std::fs::write(
+            remote.join("source.c"),
+            b"#include <stdio.h>\nint main(void) { puts(\"publication recovered\"); return 0; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            remote.join("Makefile"),
+            concat!(
+                ".PHONY: all\nall:\n",
+                "\t$(CC) source.c -o build/app\n",
+                "\tprintf 'once\\n' >> build/invocations\n",
+            ),
+        )
+        .unwrap();
         let worker = WorkerConfig {
             id: WorkerId::new("publication-copy-fixture"),
             host: "unreachable.invalid".into(),
@@ -694,9 +851,8 @@ mod tests {
             tags: Vec::new(),
             tools: Vec::new(),
         };
-        let writer = DurableLeaseWriter::create_in(
-            &root.join("journals"), "make all", true, false,
-        ).unwrap();
+        let writer =
+            DurableLeaseWriter::create_in(&root.join("journals"), "make all", true, false).unwrap();
         writer.admit(41, &worker.id).unwrap();
         let identity = uuid::Uuid::new_v4().simple().to_string();
         let remote_name = remote.to_str().unwrap().to_owned();
@@ -708,27 +864,52 @@ mod tests {
             ..Default::default()
         };
         let pipeline = TransferPipeline::new(
-            local.clone(), "publication-fixture".into(), identity.clone(), transfer.clone(),
-        ).with_remote_path_override(remote_name.clone());
+            local.clone(),
+            "publication-fixture".into(),
+            identity.clone(),
+            transfer.clone(),
+        )
+        .with_remote_path_override(remote_name.clone());
         // Source-grant metadata is fixture input. The actual local Make,
         // transport and publisher run; no worker SSH or daemon is contacted.
         RecoverySession::begin(
-            &writer, &worker, source_roots.clone(), pair.clone(),
-            Some(remote_name.clone()), Some(retained.clone()), transfer.clone(),
-            local.clone(), identity.clone(),
-        ).unwrap();
+            &writer,
+            &worker,
+            source_roots.clone(),
+            pair.clone(),
+            Some(remote_name.clone()),
+            Some(retained.clone()),
+            transfer.clone(),
+            local.clone(),
+            identity.clone(),
+        )
+        .unwrap();
         let mut session = RecoverySession::prepare(
-            &writer, &worker, &pipeline, source_roots, pair,
-            Some(remote_name), Some(retained), transfer,
-            local.clone(), None, Some(CompilationKind::Make), "make all", &[], identity.clone(),
-        ).unwrap();
+            &writer,
+            &worker,
+            &pipeline,
+            source_roots,
+            pair,
+            Some(remote_name),
+            Some(retained),
+            transfer,
+            local.clone(),
+            None,
+            Some(CompilationKind::Make),
+            "make all",
+            &[],
+            identity.clone(),
+        )
+        .unwrap();
         session.starting_execution().unwrap();
         let output = run(Command::new("make").arg("all").current_dir(&remote)).await;
         session.completed(output.status.code().unwrap()).unwrap();
         let stage = session.stage(0);
         let staged = session.staging_pipeline("project", &pipeline).unwrap();
         let mut rsync = staged.local_artifact_retrieval_for_test(
-            &worker, &remote, &session.recipe.phases[0].patterns,
+            &worker,
+            &remote,
+            &session.recipe.phases[0].patterns,
         );
         run(&mut rsync).await;
         let source = stage.join("build/app");
@@ -741,7 +922,9 @@ mod tests {
             let _publication = lock_output_root(&local).await.unwrap();
             let result = prepare_with_write(&source, &temporary, &hash, |file, bytes, offset| {
                 if offset >= 127 {
-                    return Err(io::Error::from_raw_os_error(rustix::io::Errno::NOSPC.raw_os_error()));
+                    return Err(io::Error::from_raw_os_error(
+                        rustix::io::Errno::NOSPC.raw_os_error(),
+                    ));
                 }
                 file.write_at(&bytes[..bytes.len().min((127 - offset) as usize)], offset)
             });
@@ -752,7 +935,10 @@ mod tests {
         assert!(session.recipe.phases[0].published.is_empty());
         assert!(!session.recipe.phases[0].complete);
         assert_eq!(std::fs::read(&temporary).unwrap(), bytes[..127]);
-        assert_eq!(std::fs::read(local.join("build/app")).unwrap(), b"previous caller executable");
+        assert_eq!(
+            std::fs::read(local.join("build/app")).unwrap(),
+            b"previous caller executable"
+        );
         let inode = std::fs::metadata(&temporary).unwrap().ino();
         writer.record_exit(EXIT_ARTIFACT_TRANSFER_FAILED).unwrap();
         let disk = DurableLeaseWriter::read_journal(&writer.path, &writer.wrapper_id()).unwrap();
@@ -772,25 +958,50 @@ mod tests {
         assert!(!recovered.recipe.phases[0].complete);
         assert!(!writer.snapshot().terminal_acknowledged);
         assert_eq!(std::fs::read(&temporary).unwrap(), bytes[..127]);
-        assert_eq!(std::fs::read(local.join("build/app")).unwrap(), b"previous caller executable");
-        assert_eq!(std::fs::read(retained_stage.join("build/app")).unwrap(), bytes);
+        assert_eq!(
+            std::fs::read(local.join("build/app")).unwrap(),
+            b"previous caller executable"
+        );
+        assert_eq!(
+            std::fs::read(retained_stage.join("build/app")).unwrap(),
+            bytes
+        );
         std::fs::rename(&retained_stage, &stage).unwrap();
         // This invokes the normal publisher, stage checks and pending/rename
         // checkpoints. It must reach the copy helper through the production
         // import, not call the test's fault-injection seam a second time.
         recovered.publish("project").await.unwrap();
         recovered.returned(0).unwrap();
-        assert_eq!(std::fs::metadata(local.join("build/app")).unwrap().ino(), inode);
+        assert_eq!(
+            std::fs::metadata(local.join("build/app")).unwrap().ino(),
+            inode
+        );
         assert_eq!(std::fs::read(local.join("build/app")).unwrap(), bytes);
-        assert_eq!(run(&mut Command::new(local.join("build/app"))).await.stdout,
-            b"publication recovered\n");
-        assert_eq!(std::fs::read(remote.join("build/invocations")).unwrap(), b"once\n");
-        assert_eq!(std::fs::read(&source).unwrap(), bytes, "retained stage changed");
-        assert_eq!(std::fs::read(local.join("source.c")).unwrap(), b"caller source sentinel");
+        assert_eq!(
+            run(&mut Command::new(local.join("build/app"))).await.stdout,
+            b"publication recovered\n"
+        );
+        assert_eq!(
+            std::fs::read(remote.join("build/invocations")).unwrap(),
+            b"once\n"
+        );
+        assert_eq!(
+            std::fs::read(&source).unwrap(),
+            bytes,
+            "retained stage changed"
+        );
+        assert_eq!(
+            std::fs::read(local.join("source.c")).unwrap(),
+            b"caller source sentinel"
+        );
         let disk = DurableLeaseWriter::read_journal(&writer.path, &writer.wrapper_id()).unwrap();
         assert_eq!(disk.exit_code, Some(EXIT_ARTIFACT_TRANSFER_FAILED));
         assert!(!disk.terminal_acknowledged);
-        assert!(disk.recovery.as_ref().unwrap()["phases"][0]["complete"].as_bool().unwrap());
+        assert!(
+            disk.recovery.as_ref().unwrap()["phases"][0]["complete"]
+                .as_bool()
+                .unwrap()
+        );
         assert!(disk.recovery.as_ref().unwrap()["phases"][0]["pending"].is_null());
         assert!(!recovered.recipe.sources_released);
         assert!(writer.acknowledge_terminal().is_err());

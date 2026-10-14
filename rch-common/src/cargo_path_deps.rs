@@ -2811,11 +2811,7 @@ fn expand_workspace_members(
             )
             .with_manifest_path(manifest_path)
         })?;
-        excluded_manifests.extend(
-            expanded_paths
-                .into_iter()
-                .map(workspace_manifest_candidate),
-        );
+        excluded_manifests.extend(expanded_paths.into_iter().map(workspace_manifest_candidate));
     }
 
     let mut manifests = BTreeSet::new();
@@ -3529,13 +3525,13 @@ mod tests {
 
         let manifest = workspace.join("Cargo.toml");
         let policy = fixture.policy();
-        let expected = BTreeSet::from([
-            app.canonicalize().unwrap(),
-            probe.canonicalize().unwrap(),
-        ]);
+        let expected = BTreeSet::from([app.canonicalize().unwrap(), probe.canonicalize().unwrap()]);
 
         let graph = resolve_from_manifest_fallback(&manifest, &policy).unwrap();
-        assert_eq!(graph.root_packages.into_iter().collect::<BTreeSet<_>>(), expected);
+        assert_eq!(
+            graph.root_packages.into_iter().collect::<BTreeSet<_>>(),
+            expected
+        );
         assert!(
             !graph
                 .packages

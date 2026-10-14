@@ -113,7 +113,10 @@ fn artifact_and_declared_result_collectors_use_the_same_integrity_policy() {
     ] {
         assert!(built.as_std().get_args().any(|actual| actual == argument));
         assert!(!built.as_std().get_args().any(|argument| {
-            matches!(argument.to_str(), Some("--inplace" | "--append" | "--size-only"))
+            matches!(
+                argument.to_str(),
+                Some("--inplace" | "--append" | "--size-only")
+            )
         }));
     }
 }
@@ -152,28 +155,49 @@ async fn declared_result_recovery_repairs_equal_metadata_without_touching_caller
         .unwrap()
         .set_times(FileTimes::new().set_modified(timestamp))
         .unwrap();
-    let caller_inode = std::fs::metadata(caller.join("conformance.txt")).unwrap().ino();
+    let caller_inode = std::fs::metadata(caller.join("conformance.txt"))
+        .unwrap()
+        .ino();
 
     // The dry run is read-only. Current staging must not be treated as proof
     // of the successful conformance report merely because metadata matches.
     let mut estimate = result_command(&pipeline, &worker, &root, relative);
     estimate.arg("--dry-run");
     run(&mut estimate).await;
-    assert_eq!(std::fs::read(stage.join("conformance.txt")).unwrap(), b"FAIL\n");
+    assert_eq!(
+        std::fs::read(stage.join("conformance.txt")).unwrap(),
+        b"FAIL\n"
+    );
     assert!(!stage.join("fixture.bin").exists());
     run(&mut result_command(&pipeline, &worker, &root, relative)).await;
     for name in ["conformance.txt", "fixture.bin", "empty-result"] {
-        assert_eq!(std::fs::read(stage.join(name)).unwrap(), std::fs::read(remote.join(name)).unwrap());
+        assert_eq!(
+            std::fs::read(stage.join(name)).unwrap(),
+            std::fs::read(remote.join(name)).unwrap()
+        );
     }
     for directory in [Path::new(""), Path::new("nested")] {
-        assert!(!stage.join(directory).join(".rch-clean-overlay-base.tar").exists());
+        assert!(
+            !stage
+                .join(directory)
+                .join(".rch-clean-overlay-base.tar")
+                .exists()
+        );
         assert_eq!(
             std::fs::read(remote.join(directory).join(".rch-clean-overlay-base.tar")).unwrap(),
             b"immutable source input"
         );
     }
-    assert_eq!(std::fs::read(caller.join("conformance.txt")).unwrap(), b"previous caller report\n");
-    assert_eq!(std::fs::metadata(caller.join("conformance.txt")).unwrap().ino(), caller_inode);
+    assert_eq!(
+        std::fs::read(caller.join("conformance.txt")).unwrap(),
+        b"previous caller report\n"
+    );
+    assert_eq!(
+        std::fs::metadata(caller.join("conformance.txt"))
+            .unwrap()
+            .ino(),
+        caller_inode
+    );
 }
 
 #[tokio::test]
@@ -189,7 +213,10 @@ async fn declared_result_integrity_preserves_missing_and_empty_directory_semanti
         .await
         .expect("missing result-directory probe timed out")
         .expect("rsync is required for this regression");
-    assert!(!output.status.success(), "absent required source became success");
+    assert!(
+        !output.status.success(),
+        "absent required source became success"
+    );
     assert!(!root.join("worker").join(missing).exists());
     // An existing empty source is different: no required-file contract was
     // admitted, and zero files must not turn this into a failed collection.
@@ -197,7 +224,12 @@ async fn declared_result_integrity_preserves_missing_and_empty_directory_semanti
     std::fs::create_dir_all(root.join("worker").join(empty)).unwrap();
     run(&mut result_command(&pipeline, &worker, &root, empty)).await;
     assert!(root.join("stage").join(empty).is_dir());
-    assert_eq!(std::fs::read_dir(root.join("stage").join(empty)).unwrap().count(), 0);
+    assert_eq!(
+        std::fs::read_dir(root.join("stage").join(empty))
+            .unwrap()
+            .count(),
+        0
+    );
 }
 
 #[test]
@@ -214,7 +246,10 @@ fn openrsync_and_unknown_flavours_force_full_refresh_instead_of_metadata_reuse()
             patch: 1,
         },
     ] {
-        assert_eq!(TransferPipeline::artifact_integrity_arg(flavor), "--checksum");
+        assert_eq!(
+            TransferPipeline::artifact_integrity_arg(flavor),
+            "--checksum"
+        );
     }
     for flavor in [
         RsyncFlavor::OpenRsync { protocol: Some(29) },
@@ -269,7 +304,9 @@ async fn integrity_plan_repairs_equal_metadata_and_credits_only_verified_staged_
         b"immutable input",
     )
     .unwrap();
-    let inode = std::fs::metadata(stage.join("build/retained.o")).unwrap().ino();
+    let inode = std::fs::metadata(stage.join("build/retained.o"))
+        .unwrap()
+        .ino();
     let mut dry_run = command(&pipeline, &worker, &root);
     dry_run.arg("--dry-run");
     let output = run(&mut dry_run).await;
@@ -296,8 +333,14 @@ async fn integrity_plan_repairs_equal_metadata_and_credits_only_verified_staged_
         "allocation credit must not shorten the transfer deadline"
     );
     run(&mut command(&pipeline, &worker, &root)).await;
-    assert_eq!(std::fs::read(stage.join("build/changed.o")).unwrap(), replaced);
-    assert_eq!(std::fs::read(stage.join("build/retained.o")).unwrap(), retained);
+    assert_eq!(
+        std::fs::read(stage.join("build/changed.o")).unwrap(),
+        replaced
+    );
+    assert_eq!(
+        std::fs::read(stage.join("build/retained.o")).unwrap(),
+        retained
+    );
     if checksummed {
         assert_eq!(
             std::fs::metadata(stage.join("build/retained.o"))
@@ -306,7 +349,10 @@ async fn integrity_plan_repairs_equal_metadata_and_credits_only_verified_staged_
             inode
         );
     }
-    assert_eq!(std::fs::read(stage.join("build/report.txt")).unwrap(), b"PASS\n");
+    assert_eq!(
+        std::fs::read(stage.join("build/report.txt")).unwrap(),
+        b"PASS\n"
+    );
     assert!(!stage.join("build/.rch-clean-overlay-base.tar").exists());
 
     let mut complete = command(&pipeline, &worker, &root);

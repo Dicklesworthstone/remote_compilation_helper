@@ -64,7 +64,10 @@ impl RsyncStoragePlan {
             if let Some(value) = line.strip_prefix("Total file size:") {
                 set_once(&mut selected, count(value.trim().strip_suffix(" bytes")?))?;
             } else if let Some(value) = line.strip_prefix("Total transferred file size:") {
-                set_once(&mut replacements, count(value.trim().strip_suffix(" bytes")?))?;
+                set_once(
+                    &mut replacements,
+                    count(value.trim().strip_suffix(" bytes")?),
+                )?;
             } else if let Some(value) = line
                 .strip_prefix("Number of regular files transferred:")
                 .or_else(|| line.strip_prefix("Number of files transferred:"))
@@ -246,8 +249,7 @@ mod tests {
 
     #[test]
     fn full_fallback_reserve_and_selected_set_binding_are_preserved() {
-        let plan =
-            RsyncStoragePlan::parse(report("649047958", "1024", "1").as_bytes()).unwrap();
+        let plan = RsyncStoragePlan::parse(report("649047958", "1024", "1").as_bytes()).unwrap();
         let reserve = 64 * 1024 * 1024;
         let available = reserve + 1024 * 1024;
         let resumed = required_bytes(plan.selected_bytes, Some(plan), 4096, reserve).unwrap();

@@ -16,19 +16,16 @@ async fn versioned_pool() -> WorkerPool {
             tools: Vec::new(),
         })
         .await;
-        pool.set_status(&WorkerId::new(id), WorkerStatus::Healthy).await;
+        pool.set_status(&WorkerId::new(id), WorkerStatus::Healthy)
+            .await;
     }
     for worker in pool.all_workers().await {
         let matches = worker.config.read().await.id.as_str() == "matching";
         worker.set_speed_score(if matches { 1.0 } else { 99.0 });
         worker
             .set_capabilities(WorkerCapabilities {
-                node_version: Some(
-                    if matches { "v26.7.0" } else { "v22.0.0" }.to_owned(),
-                ),
-                bun_version: Some(
-                    if matches { "1.3.0" } else { "1.2.9" }.to_owned(),
-                ),
+                node_version: Some(if matches { "v26.7.0" } else { "v22.0.0" }.to_owned()),
+                bun_version: Some(if matches { "1.3.0" } else { "1.2.9" }.to_owned()),
                 num_cpus: Some(8),
                 disk_free_gb: Some(100.0),
                 disk_total_gb: Some(200.0),
@@ -109,8 +106,10 @@ async fn conflicting_or_unsupported_constraints_cannot_fall_back_to_another_work
         vec!["node@26.7.0", "bun@1.2.9"],
     ] {
         let pool = versioned_pool().await;
-        let selector =
-            WorkerSelector::with_config(SelectionConfig::default(), CircuitBreakerConfig::default());
+        let selector = WorkerSelector::with_config(
+            SelectionConfig::default(),
+            CircuitBreakerConfig::default(),
+        );
         let mut request = request(RequiredRuntime::Node, "node@26.7.0");
         request.required_tools = constraints.into_iter().map(str::to_owned).collect();
         assert!(selector.select(&pool, &request).await.worker.is_none());
