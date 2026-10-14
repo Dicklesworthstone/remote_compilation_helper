@@ -11,7 +11,6 @@ use rabs_cas::metadata_store::RabsMetadataStore;
 use rabs_key::live_dependency::{
     LiveRustcRequest, ToolchainFacts, live_dependency_key, plan_dependency_action,
 };
-use rabs_key::typed_digest::compute;
 use rabs_protocol::input_evidence::{
     ActionInputManifest, INPUT_EVIDENCE_SCHEMA_VERSION, InputFileType, PositiveInput,
 };
@@ -22,10 +21,36 @@ use rabsd::coord::live_dependency::{
     CapturedLocalAttempt, CompletionOutcome, CompletionReport, LiveDecision, LiveDependencyLane,
     LiveDependencyRequest, LocalAttempt,
 };
-use rabsd::edge::live_facts::LiveFacts;
+use rabsd::edge::live_facts::{FactsMiss, LiveFacts};
 use rabsd::janitor::store::{LiveCas, mount_and_reconcile};
-use std::path::PathBuf;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+/// Script only the two identity probes. The actual LiveFacts observer reads
+/// these files and retains their generations; no compiler execution is claimed.
+fn write_toolchain(root: &Path) -> PathBuf {
+    std::fs::create_dir_all(root.join("bin")).unwrap();
+    std::fs::create_dir_all(root.join("lib/rustlib/fixture-host/lib")).unwrap();
+    std::fs::write(root.join("lib/libdriver.so"), b"runtime-v1").unwrap();
+    std::fs::write(root.join("lib/rustlib/fixture-host/lib/libcore.rlib"), b"core-v1")
+        .unwrap();
+    let compiler = root.join("bin/rustc");
+    std::fs::write(
+        &compiler,
+        br#"#!/bin/sh
+case "$*" in
+    '-vV') printf 'rustc fixture\nhost: x86_64-unknown-linux-gnu\nLLVM version: fixture\n' ;;
+    '--print sysroot') printf '%s\n' "${0%/bin/rustc}" ;;
+    *) exit 64 ;;
+esac
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&compiler, std::fs::Permissions::from_mode(0o700)).unwrap();
+    compiler
+}
 
 struct Fixture {
     _dir: tempfile::TempDir,
@@ -48,8 +73,9 @@ impl Fixture {
         std::fs::create_dir_all(&package).unwrap();
         std::fs::create_dir_all(&out).unwrap();
         std::fs::write(package.join("lib.rs"), "pub fn answer() -> u32 { 42 }\n").unwrap();
+        let compiler = write_toolchain(&dir.path().join("toolchain"));
         let mut argv: Vec<String> = [
-            "/fixture/toolchain/bin/rustc",
+            compiler.to_str().unwrap(),
             "--crate-name",
             "foo",
             "--crate-type",
@@ -93,6 +119,28 @@ impl Fixture {
         }
     }
 
+    fn compiler(&self) -> &Path {
+        Path::new(&self.argv[0])
+    }
+
+    fn toolchain_root(&self) -> &Path {
+        self.compiler().parent().unwrap().parent().unwrap()
+    }
+
+    fn toolchain_facts(&self) -> ToolchainFacts {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match self.facts.toolchain(self.compiler(), &self.env) {
+                Ok(toolchain) => return toolchain,
+                Err(FactsMiss::Pending) => {
+                    assert!(Instant::now() < deadline, "fixture toolchain did not warm");
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("fixture toolchain: {error}"),
+            }
+        }
+    }
+
     fn request(&self) -> LiveDependencyRequest {
         let plan = plan_dependency_action(
             LiveRustcRequest {
@@ -123,16 +171,11 @@ impl Fixture {
                 .collect(),
             ..ActionInputManifest::default()
         };
-        let toolchain = ToolchainFacts {
-            compiler_binary_digest: compute("rabs.tool-binary.v1", b"fixture compiler"),
-            verbose_version: "rustc fixture\nhost: x86_64-unknown-linux-gnu\nLLVM version: fixture"
-                .into(),
-            sysroot_root_digest: compute(
-                "rabs.live-dependency.sysroot-tree.v1",
-                b"fixture sysroot",
-            ),
-            runtime_libraries: Vec::new(),
-        };
+        let toolchain = self.toolchain_facts();
+        let toolchain_guard = self
+            .facts
+            .toolchain_guard(self.compiler(), &toolchain)
+            .unwrap();
         let key = live_dependency_key(
             &plan,
             &toolchain,
@@ -148,6 +191,7 @@ impl Fixture {
             inputs,
             package,
             dependencies,
+            toolchain: toolchain_guard,
             externs: Vec::new(),
         }
     }
@@ -329,4 +373,123 @@ fn failed_or_signalled_compilers_cannot_capture_success() {
         assert!(attempt.capture(&report).is_err());
         assert!(fixture.published(&key).is_none());
     }
+}
+
+fn change_toolchain(fixture: &Fixture, mutation: &str) {
+    let root = fixture.toolchain_root();
+    match mutation {
+        "runtime" => std::fs::write(root.join("lib/libdriver.so"), b"runtime-v2").unwrap(),
+        "target" => {
+            let target = root.join("lib/rustlib/new-target/lib");
+            std::fs::create_dir_all(&target).unwrap();
+            std::fs::write(target.join("libcore.rlib"), b"another target").unwrap();
+        }
+        "compiler" => {
+            let retained = root.parent().unwrap().join("retained-compiler");
+            std::fs::rename(fixture.compiler(), &retained).unwrap();
+            std::fs::copy(&retained, fixture.compiler()).unwrap();
+        }
+        _ => panic!("unknown fixture mutation"),
+    }
+}
+
+#[test]
+fn changed_toolchain_is_refused_before_live_admission_without_output_writes() {
+    for mutation in ["runtime", "target", "compiler"] {
+        let fixture = Fixture::new();
+        let request = fixture.request();
+        let key = request.key.action_key.clone();
+        change_toolchain(&fixture, mutation);
+        request.package.verify_unchanged(&fixture.package).unwrap();
+        request.dependencies.verify_unchanged().unwrap();
+        assert!(matches!(
+            fixture.lane.decide(request),
+            LiveDecision::PassThrough(reason) if reason.contains("toolchain inputs changed")
+        ));
+        assert!(fixture.published(&key).is_none());
+        assert!(fixture.coord.submitted_actor(&key).unwrap().is_none());
+        assert_eq!(std::fs::read_dir(&fixture.out).unwrap().count(), 0);
+    }
+}
+
+#[test]
+fn changed_toolchain_cannot_publish_success_from_an_admitted_compiler() {
+    for mutation in ["runtime", "target", "compiler"] {
+        let fixture = Fixture::new();
+        let attempt = fixture.begin();
+        let key = attempt.action_key().clone();
+        fixture.outputs();
+        change_toolchain(&fixture, mutation);
+        let report = success();
+        let error = attempt.capture(&report).unwrap_err();
+        assert!(error.contains("toolchain inputs changed"), "{error}");
+        assert!(fixture.published(&key).is_none());
+        assert!(fixture.coord.submitted_actor(&key).unwrap().is_none());
+        assert_eq!(report.exit_code, Some(0));
+        assert_eq!(
+            std::fs::read(fixture.out.join("libfoo-123.rmeta")).unwrap(),
+            b"original metadata fixture"
+        );
+        // The failure retires only this attempt. A freshly observed toolchain
+        // can admit a new invocation rather than leave a stuck flight.
+        drop(fixture.begin());
+    }
+}
+
+#[test]
+fn an_old_attempt_cannot_adopt_a_rewarmed_equal_byte_toolchain() {
+    let fixture = Fixture::new();
+    let before = fixture.toolchain_facts();
+    let attempt = fixture.begin();
+    let key = attempt.action_key().clone();
+    fixture.outputs();
+    change_toolchain(&fixture, "compiler");
+    assert_eq!(fixture.toolchain_facts(), before);
+    let fresh = fixture.request();
+    assert_eq!(fresh.key.action_key, key, "canonical input bytes are identical");
+    fresh.toolchain.verify_unchanged(fixture.compiler()).unwrap();
+    assert!(
+        attempt
+            .capture(&success())
+            .unwrap_err()
+            .contains("toolchain inputs changed")
+    );
+    assert!(fixture.published(&key).is_none());
+    assert!(matches!(fixture.lane.decide(fresh), LiveDecision::Execute(_)));
+}
+
+#[test]
+fn immutable_capture_publishes_without_reopening_a_replaced_toolchain() {
+    let fixture = Fixture::new();
+    let captured = fixture.capture();
+    let key = captured.action_key().clone();
+    let manifest = captured.manifest_key().to_owned();
+    let retained = fixture.toolchain_root().with_file_name("retained-toolchain");
+    std::fs::rename(fixture.toolchain_root(), &retained).unwrap();
+    assert!(!fixture.compiler().exists());
+    let (outcome, known) = captured.publish();
+    assert_eq!(outcome, CompletionOutcome::Committed);
+    assert_eq!(fixture.published(&key), Some(manifest));
+    assert_eq!(known.len(), 1);
+    assert!(fixture.coord.submitted_actor(&key).unwrap().is_none());
+    assert!(!fixture.compiler().exists(), "publication must not repair the toolchain");
+}
+
+#[test]
+fn a_guard_for_one_compiler_cannot_admit_another_compiler_path() {
+    let fixture = Fixture::new();
+    let mut request = fixture.request();
+    let key = request.key.action_key.clone();
+    request.plan.compiler = fixture
+        .compiler()
+        .with_file_name("another-rustc")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    assert!(matches!(
+        fixture.lane.decide(request),
+        LiveDecision::PassThrough(reason) if reason.contains("different compiler")
+    ));
+    assert!(fixture.published(&key).is_none());
+    assert!(fixture.coord.submitted_actor(&key).unwrap().is_none());
 }

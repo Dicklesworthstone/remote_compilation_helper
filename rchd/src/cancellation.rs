@@ -166,7 +166,7 @@ fn provably_abandoned_unlaunched(
 
 /// Whether this dispatcher's client lease for `wrapper` still owns worker
 /// source. An unreadable lease fails closed (treated as owning).
-fn client_lease_owns_source(wrapper: &str) -> bool {
+pub(crate) fn client_lease_owns_source(wrapper: &str) -> bool {
     let path =
         rch_common::job_identity::default_job_lease_directory().join(format!("{wrapper}.json"));
     match std::fs::read(&path) {
@@ -3118,23 +3118,29 @@ exec /bin/sh -c "$payload"
         let prior_start = start.parse::<u64>().unwrap().checked_add(1).unwrap();
         let root = tempfile::tempdir().unwrap().keep();
         let path = root.join("identity.pgid");
-        for (case, record) in [
-            ("wrong-build", remote_cancel_record(41, pgid)),
+        // Since 812d6a97 a record from another boot is judged by boot evidence
+        // before any live check: the zero UUID is not valid evidence (44,
+        // unavailable). A valid prior boot settles as gone; remote_reboot_recovery.py
+        // covers that. Either way the reused occupant is never signalled.
+        for (case, record, expected) in [
+            ("wrong-build", remote_cancel_record(41, pgid), 43),
             (
                 "wrong-boot",
                 format!("RCH_REMOTE_PROCESS_V1:42:{other_boot}:{pgid}:{start}\n"),
+                44,
             ),
             (
                 // Model a reused leader PID with a different recorded start;
                 // the current PID occupant is a real controlled sentinel.
                 "reused-leader-start",
                 format!("RCH_REMOTE_PROCESS_V1:42:{boot}:{pgid}:{prior_start}\n"),
+                43,
             ),
-            ("legacy-live-group", format!("{pgid}\n")),
+            ("legacy-live-group", format!("{pgid}\n"), 43),
         ] {
             std::fs::write(&path, &record).unwrap();
             let output = remote_cancel_probe_fixture(&path, "").await;
-            assert_eq!(output.status.code(), Some(43), "{case}: {output:?}");
+            assert_eq!(output.status.code(), Some(expected), "{case}: {output:?}");
             assert!(
                 output.stdout.is_empty(),
                 "{case}: false cancellation receipt"
@@ -3331,14 +3337,14 @@ exec /bin/sh -c "$payload"
                 if mode == "hang" {
                     let bounded = CancellationOrchestrator::new(
                         CancellationConfig {
-                            cleanup_timeout: Duration::from_millis(200),
+                            cleanup_timeout: Duration::from_secs(1),
                             remote_kill_timeout: Duration::from_secs(60),
                             ..test_config()
                         },
                         test_events(),
                     );
                     tokio::time::timeout(
-                        Duration::from_secs(2),
+                        Duration::from_secs(5),
                         bounded.execute_cancellation(&mut record, true),
                     )
                     .await
@@ -3393,6 +3399,9 @@ exec /bin/sh -c "$payload"
         std::fs::write(
             &ssh,
             r#"#!/bin/sh
+# First, before any other spawn: a short deadline on a loaded host can stop
+# this process before the slower commands below run.
+printf '%s\n' "$$" > "$RCH_REMOTE_CANCEL_TEST_ROOT/hanging-ssh-pid"
 id=$(/bin/cat "$RCH_REMOTE_CANCEL_TEST_ROOT/build-id") || exit 99
 mode=$(/bin/cat "$RCH_REMOTE_CANCEL_TEST_ROOT/mode") || exit 99
 printf '%s\n' "$@" > "$RCH_REMOTE_CANCEL_TEST_ROOT/ssh-argv"
@@ -3402,7 +3411,7 @@ case "$mode" in
   wrong-id) printf 'RCH_REMOTE_CANCELLED_V1:0\n';;
   duplicate) printf 'RCH_REMOTE_CANCELLED_V1:%s\n' "$id" "$id";;
   failed) printf 'RCH_REMOTE_CANCELLED_V1:%s\n' "$id"; exit 255;;
-  hang) printf '%s\n' "$$" > "$RCH_REMOTE_CANCEL_TEST_ROOT/hanging-ssh-pid"; exec /bin/sleep 60;;
+  hang) exec /bin/sleep 60;;
   confirmed) printf 'RCH_REMOTE_CANCELLED_V1:%s\n' "$id";;
   *) exit 99;;
 esac

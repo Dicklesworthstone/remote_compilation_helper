@@ -379,6 +379,9 @@ pub struct DiskPressurePolicyConfig {
     pub warning_free_ratio: f64,
     /// Critical free-ratio threshold.
     pub critical_free_ratio: f64,
+    /// When set, the critical ratio rule applies only at or below this many
+    /// free GB (`[selection] disk_critical_ratio_cap_gb`, bd-xxck3).
+    pub critical_free_ratio_cap_gb: Option<f64>,
     /// Warning disk I/O saturation threshold.
     pub warning_disk_io_util_pct: f64,
     /// Critical disk I/O saturation threshold.
@@ -398,11 +401,54 @@ impl Default for DiskPressurePolicyConfig {
             critical_free_gb: 10.0,
             warning_free_ratio: 0.12,
             critical_free_ratio: 0.05,
+            critical_free_ratio_cap_gb: None,
             warning_disk_io_util_pct: 85.0,
             critical_disk_io_util_pct: 95.0,
             warning_memory_pressure: 80.0,
             critical_memory_pressure: 92.0,
         }
+    }
+}
+
+static CONFIGURED_POLICY: std::sync::OnceLock<DiskPressurePolicyConfig> =
+    std::sync::OnceLock::new();
+
+impl DiskPressurePolicyConfig {
+    /// The default policy with the operator's `[selection]` disk overrides.
+    /// Out-of-range values keep the default and are logged.
+    pub fn from_selection(selection: &rch_common::SelectionConfig) -> Self {
+        let mut policy = Self::default();
+        let ratio = selection.disk_critical_free_ratio;
+        if ratio.is_finite() && ratio > 0.0 && ratio < policy.warning_free_ratio {
+            policy.critical_free_ratio = ratio;
+        } else {
+            tracing::warn!(
+                ratio,
+                "ignoring selection.disk_critical_free_ratio outside (0, warning ratio)"
+            );
+        }
+        policy.critical_free_ratio_cap_gb = match selection.disk_critical_ratio_cap_gb {
+            Some(cap) if cap.is_finite() && cap >= policy.critical_free_gb => Some(cap),
+            Some(cap) => {
+                tracing::warn!(
+                    cap,
+                    "ignoring selection.disk_critical_ratio_cap_gb below critical_free_gb"
+                );
+                None
+            }
+            None => None,
+        };
+        policy
+    }
+
+    /// Install the daemon's policy once at startup.
+    pub fn install(policy: Self) {
+        let _ = CONFIGURED_POLICY.set(policy);
+    }
+
+    /// The installed policy, or the default before startup installs one.
+    pub fn configured() -> Self {
+        CONFIGURED_POLICY.get().cloned().unwrap_or_default()
     }
 }
 
@@ -650,6 +696,18 @@ fn absolute_gb_thresholds_apply(disk_total_gb: f64, config: &DiskPressurePolicyC
     disk_total_gb >= 2.0 * config.warning_free_gb
 }
 
+/// The critical ratio rule, bounded by the optional absolute cap.
+fn critical_ratio_breached(
+    disk_free_gb: f64,
+    disk_free_ratio: f64,
+    config: &DiskPressurePolicyConfig,
+) -> bool {
+    disk_free_ratio <= config.critical_free_ratio
+        && config
+            .critical_free_ratio_cap_gb
+            .is_none_or(|cap| disk_free_gb <= cap)
+}
+
 fn classify_with_fresh_telemetry(
     disk_free_gb: f64,
     disk_total_gb: f64,
@@ -667,7 +725,7 @@ fn classify_with_fresh_telemetry(
             "disk_free_gb<=critical_free_gb".to_string(),
         );
     }
-    if disk_free_ratio <= config.critical_free_ratio {
+    if critical_ratio_breached(disk_free_gb, disk_free_ratio, config) {
         return (
             PressureState::Critical,
             PressureConfidence::High,
@@ -756,7 +814,7 @@ fn classify_without_fresh_telemetry(
 ) -> (PressureState, PressureConfidence, String, String) {
     let absolute_gb = absolute_gb_thresholds_apply(disk_total_gb, config);
     if (absolute_gb && disk_free_gb <= config.critical_free_gb)
-        || disk_free_ratio <= config.critical_free_ratio
+        || critical_ratio_breached(disk_free_gb, disk_free_ratio, config)
     {
         return (
             PressureState::Critical,
@@ -1133,6 +1191,72 @@ mod tests {
     /// A nearly-empty small filesystem (a half-of-RAM tmpfs /tmp reported as
     /// the worst mount) must not trip the absolute free-GB thresholds it can
     /// never satisfy — ratio rules govern small mounts.
+    #[test]
+    fn ratio_cap_judges_large_disks_by_absolute_headroom() {
+        // 30 GB free of 900 GB is 3.3%: below the 5% ratio, well above 25 GB.
+        let caps = test_capabilities(30.0, 900.0);
+        let telemetry = test_received_telemetry(30.0, 40.0, 5);
+        let default = DiskPressurePolicyConfig::default();
+        let assessment = evaluate_pressure_policy(&caps, Some(&telemetry), &default);
+        assert_eq!(assessment.state, PressureState::Critical);
+        assert_eq!(assessment.reason_code, "disk_ratio_below_critical");
+
+        let capped = DiskPressurePolicyConfig {
+            critical_free_ratio_cap_gb: Some(25.0),
+            ..DiskPressurePolicyConfig::default()
+        };
+        let assessment = evaluate_pressure_policy(&caps, Some(&telemetry), &capped);
+        assert_ne!(assessment.state, PressureState::Critical);
+        let assessment = evaluate_pressure_policy(&caps, None, &capped);
+        assert_ne!(assessment.state, PressureState::Critical);
+        // At or below the cap the ratio rule still applies.
+        let low = test_capabilities(20.0, 900.0);
+        let assessment = evaluate_pressure_policy(&low, Some(&telemetry), &capped);
+        assert_eq!(assessment.state, PressureState::Critical);
+        assert_eq!(assessment.reason_code, "disk_ratio_below_critical");
+    }
+
+    #[test]
+    fn selection_overrides_feed_the_policy_and_bad_values_keep_defaults() {
+        let default = DiskPressurePolicyConfig::default();
+        let unset =
+            DiskPressurePolicyConfig::from_selection(&rch_common::SelectionConfig::default());
+        assert_eq!(unset.critical_free_ratio, default.critical_free_ratio);
+        assert_eq!(unset.critical_free_ratio_cap_gb, None);
+
+        let tuned = DiskPressurePolicyConfig::from_selection(&rch_common::SelectionConfig {
+            disk_critical_free_ratio: 0.03,
+            disk_critical_ratio_cap_gb: Some(25.0),
+            ..rch_common::SelectionConfig::default()
+        });
+        assert_eq!(tuned.critical_free_ratio, 0.03);
+        assert_eq!(tuned.critical_free_ratio_cap_gb, Some(25.0));
+
+        for (ratio, cap) in [
+            (0.0, Some(5.0)),
+            (0.2, Some(f64::NAN)),
+            (f64::NAN, Some(-1.0)),
+        ] {
+            let bad = DiskPressurePolicyConfig::from_selection(&rch_common::SelectionConfig {
+                disk_critical_free_ratio: ratio,
+                disk_critical_ratio_cap_gb: cap,
+                ..rch_common::SelectionConfig::default()
+            });
+            assert_eq!(
+                bad.critical_free_ratio, default.critical_free_ratio,
+                "{ratio}"
+            );
+            assert_eq!(bad.critical_free_ratio_cap_gb, None, "{cap:?}");
+        }
+
+        let parsed: rch_common::RchConfig = toml::from_str(
+            "[selection]\ndisk_critical_free_ratio = 0.04\ndisk_critical_ratio_cap_gb = 30.0\n",
+        )
+        .unwrap();
+        assert_eq!(parsed.selection.disk_critical_free_ratio, 0.04);
+        assert_eq!(parsed.selection.disk_critical_ratio_cap_gb, Some(30.0));
+    }
+
     #[test]
     fn small_tmpfs_nearly_empty_is_healthy_with_fresh_telemetry() {
         let caps = test_capabilities(15.9, 16.0);

@@ -1,4 +1,4 @@
-//! Bounded, non-owning followers for the live dependency singleflight.
+//! Bounded, non-owning readiness and live dependency singleflight waits.
 //!
 //! Waiting never grants execution or materialization authority. The same
 //! request bytes are resubmitted on the same connection, so the daemon
@@ -6,6 +6,11 @@
 //! before the edge's 64-request quota and one absolute wait deadline bounds
 //! all sleeps, writes and reads. The original caller must remain alive across
 //! every wait and protocol transition; cancellation never authorizes fallback.
+//!
+//! Cold facts have no action key yet: `preparing` may precede a keyed `wait`,
+//! but never follow it. Readiness and singleflight share ONE deadline and retry
+//! quota. Once an action key is bound it cannot change, even after more facts
+//! need warming. Unknown peers/frames remain ordinary pre-acceptance failures.
 
 use super::reply_json::{self, Value};
 use super::{ConsultStream, Live, MAX_LIVE_REPLY_BYTES, consult_succeeded, live_outcome};
@@ -183,7 +188,20 @@ pub(super) fn read_decision(
     )
 }
 
-fn wait_key(reply: &Value) -> Option<&str> {
+#[derive(Debug, PartialEq, Eq)]
+enum WaitFor<'a> {
+    Facts,
+    Action(&'a str),
+}
+
+fn action_key(reply: &Value) -> Option<&str> {
+    reply
+        .get("action_key")
+        .and_then(Value::as_str)
+        .filter(|key| !key.is_empty() && key.len() <= 256)
+}
+
+fn wait_for(reply: &Value) -> Option<WaitFor<'_>> {
     // get() deliberately conflates absent and duplicate fields. Neither a
     // single nor a repeated execution grant belongs on a non-owning wait.
     let Value::Object(fields) = reply else {
@@ -203,10 +221,23 @@ fn wait_key(reply: &Value) -> Option<&str> {
     {
         return None;
     }
-    reply
-        .get("action_key")
-        .and_then(Value::as_str)
-        .filter(|key| !key.is_empty() && key.len() <= 256)
+    match reply.get("decision").and_then(Value::as_str) {
+        Some("wait") => action_key(reply).map(WaitFor::Action),
+        Some("preparing")
+            if !fields.iter().any(|(name, _)| name == "action_key")
+                && matches!(
+                    reply.get("reason").and_then(Value::as_str),
+                    Some(
+                        "toolchain-facts-pending"
+                            | "package-facts-pending"
+                            | "dependency-facts-pending"
+                    )
+                ) =>
+        {
+            Some(WaitFor::Facts)
+        }
+        _ => None,
+    }
 }
 
 fn read_with_policy(
@@ -217,7 +248,8 @@ fn read_with_policy(
     policy: WaitPolicy,
     owned: &impl Fn() -> bool,
 ) -> Result<Live, ()> {
-    let mut following: Option<(String, Instant)> = None;
+    let mut following_key: Option<String> = None;
+    let mut wait_deadline = None;
     let mut retries = 0;
     loop {
         let response_deadline = reader.get_ref().deadline;
@@ -232,33 +264,48 @@ fn read_with_policy(
             };
         }
         let decision = reply.get("decision").and_then(Value::as_str);
-        if decision != Some("wait") {
+        if !matches!(decision, Some("wait" | "preparing")) {
             // A changing action identity is not the flight we followed. Drop
             // before accepting a hit or executing an admitted attempt. Any
             // reserved attempt is released by the daemon's connection guard.
-            if matches!(decision, Some("hit" | "execute"))
-                && following.as_ref().is_some_and(|(key, _)| {
-                    reply.get("action_key").and_then(Value::as_str) != Some(key.as_str())
-                })
-            {
-                return Err(());
+            if matches!(decision, Some("hit" | "execute")) && wait_deadline.is_some() {
+                let key = action_key(&reply).ok_or(())?;
+                if following_key
+                    .as_deref()
+                    .is_some_and(|expected| expected != key)
+                {
+                    return Err(());
+                }
             }
             return live_outcome(&reply, reader, owned);
         }
         if !may_wait {
             return Err(());
         }
-        let key = wait_key(&reply).ok_or(())?;
-        let now = Instant::now();
-        let deadline = if let Some((expected, deadline)) = &following {
-            if expected != key {
-                return Err(());
+        match wait_for(&reply).ok_or(())? {
+            WaitFor::Facts => {
+                // Do not turn a keyed flight back into an unkeyed readiness
+                // wait: that could disguise changed inputs or a new action.
+                if following_key.is_some() {
+                    return Err(());
+                }
             }
-            *deadline
-        } else {
-            let deadline = now.checked_add(policy.budget).ok_or(())?;
-            following = Some((key.to_owned(), deadline));
-            deadline
+            WaitFor::Action(key) => match &following_key {
+                Some(expected) if expected != key => return Err(()),
+                Some(_) => {}
+                None => following_key = Some(key.to_owned()),
+            },
+        }
+        let now = Instant::now();
+        // Preparing -> waiting must not buy a second timeout window. Nor
+        // may changing preparation stages reset retries or backoff.
+        let deadline = match wait_deadline {
+            Some(deadline) => deadline,
+            None => {
+                let deadline = now.checked_add(policy.budget).ok_or(())?;
+                wait_deadline = Some(deadline);
+                deadline
+            }
         };
         let delay = policy
             .initial_delay
@@ -266,8 +313,8 @@ fn read_with_policy(
             .min(policy.maximum_delay);
         check_owner(owned).map_err(|_| ())?;
         if retries >= policy.retries || delay >= deadline.saturating_duration_since(now) {
-            // Healthy contention, not a broken daemon. No request in this
-            // branch ever accepted installation or started our compiler.
+            // Healthy preparation/contention, not a broken daemon. Nothing
+            // here accepted installation or started our compiler.
             return Ok(Live::PassThrough);
         }
         sleep_owned(delay, owned).map_err(|_| ())?;
@@ -291,6 +338,8 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     const WAIT: &str = "{\"kind\":\"rustc-decision\",\"decision\":\"wait\",\"action_key\":\"key\",\"compiler_skip_authorized\":false,\"materialization_started\":false}\n";
+    const PREPARING: &str = "{\"kind\":\"rustc-decision\",\"decision\":\"preparing\",\"reason\":\"toolchain-facts-pending\",\"compiler_skip_authorized\":false,\"materialization_started\":false}\n";
+    const EXECUTE: &str = "{\"kind\":\"rustc-decision\",\"decision\":\"execute\",\"action_key\":\"key\",\"capture_protocol\":1,\"attempt\":\"admitted\",\"env\":[]}\n";
 
     fn policy(retries: u32) -> WaitPolicy {
         WaitPolicy {
@@ -306,6 +355,204 @@ mod tests {
             stream,
             deadline: Instant::now() + Duration::from_secs(2),
         })
+    }
+
+    fn exchange(replies: Vec<String>, settings: WaitPolicy) -> (Result<Live, ()>, Vec<String>) {
+        let (stream, peer) = UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let daemon = std::thread::spawn(move || {
+            let mut peer = BufReader::new(peer);
+            let mut requests = Vec::new();
+            let last = replies.len() - 1;
+            for (index, reply) in replies.into_iter().enumerate() {
+                peer.get_mut().write_all(reply.as_bytes()).unwrap();
+                if index != last {
+                    let mut line = String::new();
+                    if peer.read_line(&mut line).unwrap() == 0 {
+                        break;
+                    }
+                    requests.push(line);
+                }
+            }
+            requests
+        });
+        let result = read_with_policy(
+            reader(stream),
+            "original bytes",
+            Duration::from_secs(1),
+            true,
+            settings,
+            &|| true,
+        );
+        (result, daemon.join().unwrap())
+    }
+
+    #[test]
+    fn cold_facts_join_a_keyed_flight_then_one_admitted_execution() {
+        let (result, requests) = exchange(
+            vec![
+                PREPARING.to_owned(),
+                PREPARING.replace("toolchain-facts-pending", "package-facts-pending"),
+                PREPARING.replace("toolchain-facts-pending", "dependency-facts-pending"),
+                WAIT.to_owned(),
+                EXECUTE.to_owned(),
+            ],
+            policy(8),
+        );
+        match result {
+            Ok(Live::Execute { attempt, env, .. }) => {
+                assert_eq!(attempt, "admitted");
+                assert!(env.is_empty());
+            }
+            _ => panic!("only the final keyed decision may admit execution"),
+        }
+        assert_eq!(requests, vec!["original bytes\n"; 4]);
+    }
+
+    #[test]
+    fn preparation_can_finish_without_a_singleflight_wait() {
+        let (result, requests) =
+            exchange(vec![PREPARING.to_owned(), EXECUTE.to_owned()], policy(3));
+        assert!(matches!(result, Ok(Live::Execute { .. })));
+        assert_eq!(requests, ["original bytes\n"]);
+    }
+
+    #[test]
+    fn preparation_and_keyed_waiting_share_one_retry_quota() {
+        let (result, requests) = exchange(
+            vec![
+                PREPARING.to_owned(),
+                PREPARING.replace("toolchain-facts-pending", "package-facts-pending"),
+                WAIT.to_owned(),
+            ],
+            policy(2),
+        );
+        assert!(matches!(result, Ok(Live::PassThrough)));
+        assert_eq!(requests, vec!["original bytes\n"; 2]);
+    }
+
+    #[test]
+    fn preparation_cannot_erase_or_change_a_bound_action_key() {
+        for final_reply in [
+            PREPARING.to_owned(),
+            WAIT.replace("\"key\"", "\"different\""),
+            EXECUTE.replace("\"key\"", "\"different\""),
+        ] {
+            let (result, requests) = exchange(
+                vec![PREPARING.to_owned(), WAIT.to_owned(), final_reply],
+                policy(8),
+            );
+            assert!(result.is_err());
+            assert_eq!(requests, vec!["original bytes\n"; 2]);
+        }
+    }
+
+    #[test]
+    fn preparation_requires_a_real_unambiguous_key_before_execution() {
+        for final_reply in [
+            EXECUTE.replace("\"action_key\":\"key\",", ""),
+            EXECUTE.replace("\"action_key\":\"key\"", "\"action_key\":\"\""),
+            EXECUTE.replace(
+                "\"action_key\":\"key\"",
+                "\"action_key\":\"key\",\"action_key\":\"key\"",
+            ),
+        ] {
+            let (result, requests) = exchange(vec![PREPARING.to_owned(), final_reply], policy(3));
+            assert!(result.is_err());
+            assert_eq!(requests, ["original bytes\n"]);
+        }
+    }
+
+    #[test]
+    fn preparation_frames_never_smuggle_authority_or_unknown_stages() {
+        for bad in [
+            PREPARING.replace(
+                "\"compiler_skip_authorized\":false",
+                "\"compiler_skip_authorized\":true",
+            ),
+            PREPARING.replace(
+                "\"materialization_started\":false",
+                "\"materialization_started\":true",
+            ),
+            PREPARING.replace(
+                "\"materialization_started\":false",
+                "\"materialization_started\":false,\"materialization_started\":false",
+            ),
+            PREPARING.replace("\"reason\":", "\"attempt\":null,\"attempt\":null,\"reason\":"),
+            PREPARING.replace("\"reason\":", "\"env\":[],\"reason\":"),
+            PREPARING.replace("\"reason\":", "\"action_key\":null,\"reason\":"),
+            PREPARING.replace(
+                "\"reason\":",
+                "\"reason\":\"toolchain-facts-pending\",\"reason\":",
+            ),
+            PREPARING.replace("toolchain-facts-pending", "unknown-stage"),
+        ] {
+            assert!(wait_for(&reply_json::parse(&bad).unwrap()).is_none(), "{bad}");
+        }
+        assert_eq!(
+            wait_for(&reply_json::parse(PREPARING).unwrap()),
+            Some(WaitFor::Facts)
+        );
+    }
+
+    #[test]
+    fn a_prepared_hit_still_requires_acceptance_and_completed_installation() {
+        let (stream, peer) = UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let daemon = std::thread::spawn(move || {
+            let mut peer = BufReader::new(peer);
+            peer.get_mut().write_all(PREPARING.as_bytes()).unwrap();
+            let mut line = String::new();
+            peer.read_line(&mut line).unwrap();
+            assert_eq!(line, "original bytes\n");
+            peer.get_mut()
+                .write_all(
+                    b"{\"kind\":\"rustc-decision\",\"decision\":\"hit\",\"action_key\":\"key\",\"capture_protocol\":1,\"compiler_skip_authorized\":false}\n",
+                )
+                .unwrap();
+            line.clear();
+            peer.read_line(&mut line).unwrap();
+            assert_eq!(line, "{\"kind\":\"rustc-accept\"}\n");
+            peer.get_mut()
+                .write_all(
+                    b"{\"kind\":\"rustc-decision\",\"decision\":\"served\",\"compiler_skip_authorized\":true,\"stderr_hex\":\"6869\"}\n",
+                )
+                .unwrap();
+        });
+        let result = read_with_policy(
+            reader(stream),
+            "original bytes",
+            Duration::from_secs(1),
+            true,
+            policy(3),
+            &|| true,
+        );
+        assert!(matches!(result, Ok(Live::Served(bytes)) if bytes == b"hi"));
+        daemon.join().unwrap();
+    }
+
+    #[test]
+    fn preparation_budget_zero_and_unnegotiated_preparation_never_retry() {
+        for negotiated in [true, false] {
+            let (stream, mut peer) = UnixStream::pair().unwrap();
+            peer.write_all(PREPARING.as_bytes()).unwrap();
+            let mut settings = policy(3);
+            settings.budget = Duration::ZERO;
+            let result = read_with_policy(
+                reader(stream),
+                "original bytes",
+                Duration::from_secs(1),
+                negotiated,
+                settings,
+                &|| true,
+            );
+            if negotiated {
+                assert!(matches!(result, Ok(Live::PassThrough)));
+            } else {
+                assert!(result.is_err());
+            }
+            assert_eq!(peer.read(&mut [0; 1]).unwrap(), 0);
+        }
     }
 
     #[test]

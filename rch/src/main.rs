@@ -54,17 +54,12 @@ fn parse_exec_worker(value: &str) -> std::result::Result<rch_common::WorkerId, S
 }
 
 fn parse_required_tool(value: &str) -> std::result::Result<String, String> {
-    if value.is_empty()
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'+'))
-    {
-        return Err(
-            "--require-tool must name one declared tool using letters, digits, - _ . +".into(),
-        );
-    }
+    rch_common::tool_requirement::validate(value)?;
     Ok(value.to_owned())
 }
+
+#[cfg(test)]
+mod exact_runtime_cli_tests;
 
 #[derive(Parser)]
 #[command(name = "rch")]
@@ -581,9 +576,14 @@ wiped. Without --force (or with --dry-run) it only previews the plan."#)]
         /// workload preflights as offload-eligible rather than `local`.
         #[arg(long)]
         job: bool,
-        /// Named tool the compilation or job requires a worker to have verified.
+        /// Verified named tool, or exact node@VERSION / bun@VERSION requirement.
         /// Repeatable. Read-only here — nothing is synced or reserved.
-        #[arg(long, value_name = "NAME", value_parser = parse_required_tool)]
+        #[arg(
+            long,
+            visible_alias = "require-toolchain",
+            value_name = "NAME_OR_RUNTIME@VERSION",
+            value_parser = parse_required_tool
+        )]
         require_tool: Vec<String>,
         /// Command to preflight (quote or pass as multiple args)
         #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
@@ -654,18 +654,22 @@ USAGE:
         /// loudly (exit 102) regardless of the job's own exit status.
         #[arg(long, value_name = "DIR", requires = "job")]
         result_dir: Vec<PathBuf>,
-        /// Require a worker that has VERIFIED this operator-declared tool
-        /// (`[[workers]] tools = [{ name = "...", command = [...] }]`).
-        /// Repeatable for compilation or jobs; requires verified remote execution.
+        /// Require a verified named tool or exact node@VERSION / bun@VERSION.
+        /// Plain names refer to operator-declared worker tool probes.
+        /// Repeatable for compilation or jobs; all requirements must match.
+        /// Requires remote execution, with eligibility checked before reservation.
         ///
-        /// The gate runs before any slot is reserved, and it is evidence-based:
-        /// the worker must have run the declared probe successfully. A name no
-        /// worker has verified — including a typo — admits no worker at all,
-        /// because a silently dropped requirement would route the job to a
-        /// machine that cannot run it, and job mode returns the remote exit
-        /// status verbatim, so that failure is indistinguishable from the
-        /// job's own.
-        #[arg(long, value_name = "NAME", value_parser = parse_required_tool)]
+        /// Runtime versions must be complete MAJOR.MINOR.PATCH identities
+        /// (optional prerelease/build suffix), not ranges or aliases. They are
+        /// matched against worker-reported capabilities, never named-tool labels.
+        /// This does not install runtimes, override version managers, or attest
+        /// the executable a job later chooses. Unknown versions admit no worker.
+        #[arg(
+            long,
+            visible_alias = "require-toolchain",
+            value_name = "NAME_OR_RUNTIME@VERSION",
+            value_parser = parse_required_tool
+        )]
         require_tool: Vec<String>,
         /// Execute on this exact worker; overrides environment/project preferences.
         /// Refuses local execution or a different worker when unavailable.

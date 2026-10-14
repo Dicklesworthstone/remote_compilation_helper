@@ -216,7 +216,7 @@ fn build_cleanup_command(
 /// eviction therefore also runs until the filesystem is back above that line
 /// with two percentage points of headroom.
 pub(crate) fn placement_low_disk_permille() -> u64 {
-    let critical = crate::disk_pressure::DiskPressurePolicyConfig::default().critical_free_ratio;
+    let critical = crate::disk_pressure::DiskPressurePolicyConfig::configured().critical_free_ratio;
     ((critical * 1000.0).ceil() as u64).saturating_add(20)
 }
 

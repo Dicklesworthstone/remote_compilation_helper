@@ -167,9 +167,10 @@ class NamespaceGroupTeardown(unittest.TestCase):
     def test_foreground_timer_cannot_kill_observer_or_run_namespace_program(self) -> None:
         tools = self.directory / "tools"
         tools.mkdir()
-        for name in ("timeout", "gtimeout"):
+        real = shutil.which("gnutimeout") or shutil.which("gtimeout") or shutil.which("timeout")
+        for name in ("timeout", "gtimeout", "gnutimeout"):
             timer = tools / name
-            timer.write_text("#!/bin/sh\nexec " + shlex.quote(shutil.which("timeout")) +
+            timer.write_text("#!/bin/sh\nexec " + shlex.quote(real) +
                              ' --foreground "$@"\n')
             timer.chmod(0o700)
         mutation = self.directory / "must-not-exist"

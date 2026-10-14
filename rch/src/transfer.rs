@@ -6,6 +6,9 @@
 #[cfg(test)]
 #[path = "transfer/node_prepare_tests.rs"]
 mod node_prepare_tests;
+mod retrieval_space;
+#[cfg(all(test, unix))]
+mod retrieval_space_tests;
 pub(crate) mod source_content_barrier;
 
 use crate::error::TransferError;
@@ -1299,7 +1302,9 @@ pub(crate) fn parse_remote_timeout_kill_output(stdout: &str) -> Option<RemoteTim
         match line.trim() {
             "RCH_E104_KILL=verified_dead" => return Some(RemoteTimeoutCleanup::Verified),
             // A missing record cannot exclude a delayed, still-starting job.
-            "RCH_E104_KILL=no_pgid_file" => return Some(RemoteTimeoutCleanup::Unverified),
+            "RCH_E104_KILL=no_pgid_file" | "RCH_E104_KILL=record_absent" => {
+                return Some(RemoteTimeoutCleanup::Unverified);
+            }
             "RCH_E104_KILL=still_alive" => return Some(RemoteTimeoutCleanup::Unverified),
             _ => {}
         }
@@ -3206,11 +3211,33 @@ impl TransferPipeline {
         remote_path: &str,
         patterns: &[String],
     ) -> Result<RetryConfig> {
-        self.retrieval_retry_config(|| self.build_retrieve_command(worker, remote_path, patterns))
-            .await
+        // Both artifact builders use the same flavour-specific integrity
+        // policy. Only checksummed staging can earn allocation reuse credit.
+        self.retrieval_retry_config_inner(
+            || self.build_retrieve_command(worker, remote_path, patterns),
+            Self::artifact_integrity_arg(self.resolved_rsync().flavor) == "--checksum",
+        )
+        .await
     }
 
     async fn retrieval_retry_config(&self, command: impl Fn() -> Command) -> Result<RetryConfig> {
+        self.retrieval_retry_config_inner(command, false).await
+    }
+
+    /// Openrsync does not universally implement --checksum. Never fall back
+    /// to metadata equality: force a refresh and budget the complete set.
+    fn artifact_integrity_arg(flavor: RsyncFlavor) -> &'static str {
+        match flavor {
+            RsyncFlavor::Rsync { .. } => "--checksum",
+            RsyncFlavor::OpenRsync { .. } | RsyncFlavor::Unknown => "--ignore-times",
+        }
+    }
+
+    async fn retrieval_retry_config_inner(
+        &self,
+        command: impl Fn() -> Command,
+        checksummed: bool,
+    ) -> Result<RetryConfig> {
         let fallback = self.effective_rsync_retry_config();
         let estimate = self
             .execute_retrieval_rsync(
@@ -3218,7 +3245,13 @@ impl TransferPipeline {
                 "estimate_artifact_retrieval",
                 || {
                     let mut cmd = command();
-                    cmd.arg("--dry-run");
+                    // The builders leave stdio to each execution site. Unpiped,
+                    // the controlled path failed "retrieval stdout missing" and
+                    // the plain path printed the dry run into the hook's stdout,
+                    // so no estimate was ever parsed.
+                    cmd.arg("--dry-run")
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped());
                     cmd
                 },
                 |_| {},
@@ -3229,7 +3262,18 @@ impl TransferPipeline {
                 if let Some(bytes) =
                     parse_rsync_selected_size(&String::from_utf8_lossy(&output.stdout))
                 {
-                    self.check_retrieval_space(bytes)?;
+                    // Only credit checksum-verified existing staging, never
+                    // the caller's unowned output tree or ambiguous stats.
+                    // Network/delta bytes are NOT replacement allocation.
+                    let plan = if checksummed
+                        && self.project_root != self.retrieval_reference_root
+                        && output.stderr.is_empty()
+                    {
+                        retrieval_space::RsyncStoragePlan::parse(&output.stdout)
+                    } else {
+                        None
+                    };
+                    self.check_retrieval_space_for_plan(bytes, plan)?;
                     let retry = self.artifact_retry_config_for_size(bytes);
                     info!(
                         selected_bytes = bytes,
@@ -3258,14 +3302,28 @@ impl TransferPipeline {
     }
 
     fn check_retrieval_space(&self, selected_bytes: u64) -> Result<()> {
+        // Windows archive spooling and other full-copy consumers cannot
+        // reuse rsync staging; retain their complete allocation requirement.
+        self.check_retrieval_space_for_plan(selected_bytes, None)
+    }
+
+    fn check_retrieval_space_for_plan(
+        &self,
+        selected_bytes: u64,
+        plan: Option<retrieval_space::RsyncStoragePlan>,
+    ) -> Result<()> {
         #[cfg(unix)]
         {
             std::fs::create_dir_all(&self.project_root)?;
             let stats = rustix::fs::statvfs(&self.project_root)?;
             let available = stats.f_bavail.saturating_mul(stats.f_frsize);
-            let required = selected_bytes
-                .checked_add(self.transfer_config.retrieval_min_free_bytes)
-                .context("retrieval staging size overflow")?;
+            let required = retrieval_space::required_bytes(
+                selected_bytes,
+                plan,
+                stats.f_frsize,
+                self.transfer_config.retrieval_min_free_bytes,
+            )
+            .context("retrieval staging size overflow")?;
             anyhow::ensure!(
                 available >= required,
                 "insufficient controller retrieval storage at {}: need {} bytes, available {}; outputs and ownership retained",
@@ -3275,7 +3333,7 @@ impl TransferPipeline {
             );
         }
         #[cfg(not(unix))]
-        let _ = selected_bytes;
+        let _ = (selected_bytes, plan);
         Ok(())
     }
 
@@ -5019,12 +5077,29 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let mut child = cmd.spawn().context("spawn ssh sh -s")?;
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(script.as_bytes()).await?;
-            stdin.write_all(b"\n").await?;
-            drop(stdin);
-        }
-        let out = child.wait_with_output().await.context("ssh sh -s wait")?;
+        let stdin = child.stdin.take();
+
+        // The remote shell may emit diagnostics before consuming the complete
+        // script. Poll upload and wait_with_output together so neither SSH
+        // direction can fill its pipe while the other side is not being
+        // serviced. worker_ssh_command sets kill_on_drop, so an upload failure
+        // cancels the collection future and closes the local channel.
+        let upload = async move {
+            if let Some(mut stdin) = stdin {
+                stdin
+                    .write_all(script.as_bytes())
+                    .await
+                    .context("write remote sh script")?;
+                stdin
+                    .write_all(b"\n")
+                    .await
+                    .context("finalize remote sh script")?;
+                drop(stdin);
+            }
+            Ok::<(), anyhow::Error>(())
+        };
+        let collect = async move { child.wait_with_output().await.context("ssh sh -s wait") };
+        let (_, out) = tokio::try_join!(upload, collect)?;
         if !out.status.success() {
             return Err(anyhow::anyhow!(
                 "remote sh script failed (exit {:?}): {}",
@@ -5740,17 +5815,32 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
             let mut child = cmd
                 .spawn()
                 .map_err(|e| format!("failed to spawn kill ssh: {e}"))?;
-            if let Some(mut stdin) = child.stdin.take() {
-                stdin
-                    .write_all(script.as_bytes())
+            let stdin = child.stdin.take();
+
+            // Recovery must not inherit the build transport's historical
+            // upload-before-drain deadlock. Poll script upload and output
+            // collection together inside REMOTE_TIMEOUT_KILL_BUDGET so a
+            // diagnostic-producing remote shell cannot fill stdout/stderr
+            // while this side is still blocked writing the cancellation script.
+            let upload = async move {
+                if let Some(mut stdin) = stdin {
+                    stdin
+                        .write_all(script.as_bytes())
+                        .await
+                        .map_err(|e| format!("failed to write kill script: {e}"))?;
+                    drop(stdin);
+                }
+                Ok::<(), String>(())
+            };
+            let collect = async move {
+                child
+                    .wait_with_output()
                     .await
-                    .map_err(|e| format!("failed to write kill script: {e}"))?;
-                drop(stdin);
-            }
-            let output = child
-                .wait_with_output()
-                .await
-                .map_err(|e| format!("failed to await kill ssh: {e}"))?;
+                    .map_err(|e| format!("failed to await kill ssh: {e}"))
+            };
+            let (upload, output) = tokio::join!(upload, collect);
+            upload?;
+            let output = output?;
             if !output.status.success() {
                 return Err(format!(
                     "kill channel exited with {}: {}",
@@ -5834,26 +5924,19 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
 
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
 
         let start = std::time::Instant::now();
         let mut child = cmd
             .spawn()
             .with_context(|| format!("Failed to spawn ssh to {}", destination))?;
 
-        if let Some(mut stdin) = child.stdin.take() {
-            // Feed the script, then close stdin so `sh -s` begins execution.
-            stdin
-                .write_all(remote_script.as_bytes())
-                .await
-                .context("Failed to write remote script to ssh stdin")?;
-            stdin
-                .write_all(b"\n")
-                .await
-                .context("Failed to finalize remote script")?;
-            drop(stdin);
-        }
-
+        // Take every pipe before uploading the script. SSH and the remote shell
+        // can produce diagnostics while stdin is still being consumed; draining
+        // stdout/stderr only after write_all() lets those pipes fill and deadlock
+        // the upload outside the command timeout.
+        let stdin = child.stdin.take();
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
 
@@ -5927,8 +6010,33 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         let mut drain_deadline: Option<tokio::time::Instant> = None;
         let mut drain_cap: Option<tokio::time::Instant> = None;
 
+        // Readers above are already running when this future starts, so script
+        // upload and remote output progress concurrently. Keep upload under the
+        // same absolute command budget as execution: a blocked ssh stdin is a
+        // transport failure, not an unbounded pre-execution phase.
+        let upload = async move {
+            if let Some(mut stdin) = stdin {
+                stdin
+                    .write_all(remote_script.as_bytes())
+                    .await
+                    .context("Failed to write remote script to ssh stdin")?;
+                stdin
+                    .write_all(b"\n")
+                    .await
+                    .context("Failed to finalize remote script")?;
+                drop(stdin);
+            }
+            Ok::<(), anyhow::Error>(())
+        };
+
         let status = match tokio::time::timeout(command_timeout, async {
+            let mut upload = Box::pin(upload);
+            let mut uploaded = false;
+            let mut streams_open = true;
             loop {
+                if uploaded && !streams_open {
+                    break;
+                }
                 let drain_expired = async move {
                     match drain_deadline {
                         Some(deadline) => tokio::time::sleep_until(deadline).await,
@@ -5936,8 +6044,19 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
                     }
                 };
                 let event = tokio::select! {
-                    event = rx.recv() => match event { Some(event) => event, None => break },
-                    _ = completion_tick.tick(), if self.recovery_completion.is_some() && durable_status.is_none() => {
+                    result = upload.as_mut(), if !uploaded => {
+                        result?;
+                        uploaded = true;
+                        continue;
+                    }
+                    event = rx.recv(), if streams_open => match event {
+                        Some(event) => event,
+                        None => {
+                            streams_open = false;
+                            continue;
+                        }
+                    },
+                    _ = completion_tick.tick(), if uploaded && self.recovery_completion.is_some() && durable_status.is_none() => {
                         if let Ok(Some(status)) = self.read_recovery_completion(worker).await {
                             durable_status = Some(status);
                             let now = tokio::time::Instant::now();
@@ -5980,7 +6099,20 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         })
         .await
         {
-            Ok(status) => status?,
+            Ok(Ok(status)) => status,
+            Ok(Err(error)) => {
+                // Some script bytes may already have reached sh -s and started
+                // work. Stop the local channel, then use the same identity-bound
+                // remote cleanup as timeout handling. Never convert an upload or
+                // stream failure into permission to replay elsewhere.
+                let _ = child.kill().await;
+                let (cleanup, detail) = self.kill_remote_process_group_after_timeout(worker).await;
+                return Err(error
+                    .context(format!(
+                        "SSH execution transport failed; remote cleanup: {cleanup} ({detail})"
+                    ))
+                    .context(RemoteExecutionUnconfirmed));
+            }
             Err(_) => {
                 // Best-effort: kill local ssh process first so the channel is closed.
                 let _ = child.kill().await;
@@ -6121,7 +6253,11 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         // `.f` lines; without it an up-to-date no-op rebuild would look
         // indistinguishable from a zero-output miss. On openrsync / rsync 2.6.9
         // the `-vv` spelling is used instead (issue #66).
-        cmd.arg("-az");
+        // A retained partial or stale output may have the right size and
+        // timestamp. Both the planner and actual pull must compare bytes
+        // before reusing it; metadata equality is not completed delivery.
+        cmd.arg("-az")
+            .arg(Self::artifact_integrity_arg(self.resolved_rsync().flavor));
         add_portable_rsync_archive_args(&mut cmd);
         cmd.arg("--stats")
             .arg("--timeout=30")
@@ -6222,7 +6358,9 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
 
         let ssh_command = self.build_rsync_ssh_command(identity_file.as_ref());
 
-        cmd.arg("-az");
+        // Match the integrity policy of the non-streaming planner/collector.
+        cmd.arg("-az")
+            .arg(Self::artifact_integrity_arg(self.resolved_rsync().flavor));
         add_portable_rsync_archive_args(&mut cmd);
         // Flavour-specific spellings of progress / stats / per-file listing
         // (issue #66); see RsyncCapabilities for the mapping.
@@ -6506,7 +6644,11 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
 
         // Same transport hardening as artifact retrieval: --safe-links blocks
         // symlink traversal out of the declared tree.
-        cmd.arg("-az");
+        // A retained report with matching size and mtime is not proof of its
+        // contents. Use the same integrity policy as artifact collection,
+        // including the forced-refresh fallback for non-upstream rsync.
+        cmd.arg("-az")
+            .arg(Self::artifact_integrity_arg(self.resolved_rsync().flavor));
         add_portable_rsync_archive_args(&mut cmd);
         cmd.arg("--stats")
             .arg("--safe-links")
@@ -15438,6 +15580,11 @@ fn main() {
             parse_remote_timeout_kill_output("RCH_E104_KILL=no_pgid_file"),
             Some(RemoteTimeoutCleanup::Unverified)
         );
+        // At timeout a missing record may be a still-starting job.
+        assert_eq!(
+            parse_remote_timeout_kill_output("RCH_E104_KILL=record_absent"),
+            Some(RemoteTimeoutCleanup::Unverified)
+        );
         assert_eq!(
             parse_remote_timeout_kill_output("RCH_E104_KILL=still_alive"),
             Some(RemoteTimeoutCleanup::Unverified)
@@ -15526,9 +15673,11 @@ fn main() {
             let _ = child.wait();
         }
         let status = status.expect("deadline kill must not block on a full stderr pipe");
-        assert_eq!(
-            std::os::unix::process::ExitStatusExt::signal(&status),
-            Some(9),
+        // Linux launches run under the owned-group supervisor (02f769a9), which
+        // stays outside the killed group and reports it as 128+9.
+        assert!(
+            std::os::unix::process::ExitStatusExt::signal(&status) == Some(9)
+                || status.code() == Some(137),
             "{status:?}"
         );
     }
@@ -15765,9 +15914,14 @@ fn main() {
             command.contains("wait \"$__c\""),
             "watchdog must wait on the job"
         );
-        // The build_id path must NOT shell out to `timeout --foreground` (the bug).
+        // The build_id path must NOT run the workload under `timeout
+        // --foreground` (the bug). 181b61ef bounds one literal printf message
+        // writer that way, and documents it; nothing else may.
+        let without_message_writer = command
+            .replace("timeout --foreground --signal=KILL 1s /bin/sh -c '", "")
+            .replace("--foreground targets that one", "");
         assert!(
-            !command.contains("--foreground"),
+            !without_message_writer.contains("--foreground"),
             "build_id path must not use timeout --foreground: {command}"
         );
         // The timer subshell must detach stdio: its orphaned `sleep` otherwise
@@ -16376,12 +16530,29 @@ fn main() {
         )
         .unwrap();
         std::fs::write(destination.path().join("Cargo.toml"), b"local manifest").unwrap();
+        // Windows workers run this script with Git for Windows' GNU find at
+        // /usr/bin/find. macOS ships BSD find there, so use Homebrew's gfind.
+        let inventory_script = windows_artifact_inventory_script(source.path().to_str().unwrap());
+        let gnu_find = |find: &str| {
+            std::process::Command::new(find)
+                .args([".", "-maxdepth", "0", "-printf", ""])
+                .output()
+                .is_ok_and(|output| output.status.success())
+        };
+        let inventory_script = if gnu_find("/usr/bin/find") {
+            inventory_script
+        } else if gnu_find("gfind") {
+            inventory_script.replace("/usr/bin/find ", "gfind ")
+        } else {
+            eprintln!("skipping: no GNU find (/usr/bin/find lacks -printf and gfind is absent)");
+            return;
+        };
         let mut inventory = Vec::new();
         let mut shell = Command::new("sh");
         shell.arg("-s");
         run_windows_artifact_process(
             shell,
-            &windows_artifact_inventory_script(source.path().to_str().unwrap()),
+            &inventory_script,
             &mut inventory,
             1024 * 1024,
             TokioInstant::now() + Duration::from_secs(10),

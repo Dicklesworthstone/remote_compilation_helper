@@ -1531,6 +1531,28 @@ mod tests {
             ("clang", CompilationKind::Clang, true),
             ("clang", CompilationKind::Clang, false),
         ] {
+            // macOS: Homebrew's LLVM clang defaults to the Command Line Tools
+            // SDK, absent on Xcode-only Macs. Linux keeps the requirement.
+            if cfg!(target_os = "macos") {
+                let probe = root.join(format!("{driver}-probe.c"));
+                std::fs::write(
+                    &probe,
+                    b"#include <stdio.h>\nint main(void) { return 0; }\n",
+                )
+                .unwrap();
+                let compiles = Command::new(driver)
+                    .arg(&probe)
+                    .arg("-o")
+                    .arg(probe.with_extension("out"))
+                    .stdin(Stdio::null())
+                    .output()
+                    .await
+                    .is_ok_and(|output| output.status.success());
+                if !compiles {
+                    eprintln!("skipping {driver}: it cannot build a <stdio.h> program on this Mac");
+                    continue;
+                }
+            }
             let mode = if named_dependency { "named" } else { "default" };
             let source = root.join(driver).join(mode).join("worker");
             let local = root.join(driver).join(mode).join("local");

@@ -24,7 +24,8 @@ REPO = Path(__file__).resolve().parents[2]
 CONTROL = Path(os.environ.get("RCH_TEST_SOURCE_NAMESPACE_CONTROL",
                              REPO / "rch/src/hook/source_namespace_control.sh"))
 SHELL = os.environ.get("RCH_TEST_SHELL", "/bin/sh")
-TIMEOUT = shutil.which("timeout")
+# The real timer must be GNU: uutils timeout does not kill the whole group.
+TIMEOUT = shutil.which("gnutimeout") or shutil.which("gtimeout") or shutil.which("timeout")
 FLOCK = shutil.which("flock")
 
 
@@ -48,7 +49,7 @@ class SourceNamespaceControlTests(unittest.TestCase):
                  '  *) exit 96 ;;\nesac\n'
                  'printf "%s %s\\n" "$2" "$3" >> "$RCH_TIMER_CALLS"\nshift 2\n'
                  'exec ' + shlex.quote(TIMEOUT) + ' --kill-after=0.15 0.6 "$@"\n')
-        for name in ("timeout", "gtimeout"):
+        for name in ("timeout", "gtimeout", "gnutimeout"):
             path = self.tools / name
             path.write_text(timer)
             path.chmod(0o700)

@@ -187,7 +187,7 @@ fn benchmark_telemetry_allows_start(
     let pressure = evaluate_pressure_policy(
         capabilities,
         Some(telemetry),
-        &DiskPressurePolicyConfig::default(),
+        &DiskPressurePolicyConfig::configured(),
     );
     pressure.telemetry_fresh
         && matches!(

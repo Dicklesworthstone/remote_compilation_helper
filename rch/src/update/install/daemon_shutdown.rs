@@ -734,8 +734,10 @@ while time.monotonic() < deadline:
             raise ValueError('unexpected mutation: ' + repr(data))
         connection.sendall(b'HTTP/1.1 200 OK\r\n\r\n' + json.dumps(value).encode())
 server.close()
-with open(done, 'w') as output:
+# Publish atomically: the test polls for `done` and reads it at once.
+with open(done + '.tmp', 'w') as output:
     output.write('finished')
+os.replace(done + '.tmp', done)
 "#;
 
     #[tokio::test]

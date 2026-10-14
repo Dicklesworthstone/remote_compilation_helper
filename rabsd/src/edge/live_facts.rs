@@ -62,7 +62,7 @@ const MAX_DEPENDENCY_FILES: usize = 4096;
 const MAX_DEPENDENCY_MEMOS: usize = 128;
 
 /// Identity of one filesystem object at one moment.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FileSig {
     dev: u64,
     ino: u64,
@@ -144,43 +144,209 @@ pub fn read_stable(path: &Path, max_bytes: u64) -> std::io::Result<(FileSig, Vec
 /// # Errors
 /// As [`read_stable`].
 pub fn digest_stable(path: &Path) -> std::io::Result<(FileSig, TypedDigest)> {
-    let before = lstat_regular(path)?;
+    digest_stable_at(path, lstat_regular(path)?)
+}
+
+fn digest_stable_at(path: &Path, before: FileSig) -> std::io::Result<(FileSig, TypedDigest)> {
     let mut file = std::fs::File::open(path)?;
-    let opened = FileSig::of(&file.metadata()?);
+    let opened = file.metadata()?;
+    if !opened.is_file() || FileSig::of(&opened) != before || lstat_regular(path)? != before {
+        return Err(std::io::Error::other("file changed before it was hashed"));
+    }
     let mut writer = StreamingObjectWriter::new(DigestRequest::default(), Some(before.size));
     let mut buffer = vec![0_u8; 256 * 1024];
-    loop {
-        let read = file.read(&mut buffer)?;
+    let mut remaining = before.size;
+    while remaining > 0 {
+        let limit = usize::try_from(remaining.min(buffer.len() as u64))
+            .map_err(std::io::Error::other)?;
+        let read = file.read(&mut buffer[..limit])?;
         if read == 0 {
-            break;
+            return Err(std::io::Error::other("file shrank while it was hashed"));
         }
         writer
             .write(&buffer[..read])
             .map_err(|error| std::io::Error::other(format!("{error:?}")))?;
+        remaining -= read as u64;
+    }
+    let mut extra = [0_u8; 1];
+    if file.read(&mut extra)? != 0 {
+        return Err(std::io::Error::other("file grew while it was hashed"));
+    }
+    if FileSig::of(&file.metadata()?) != before || lstat_regular(path)? != before {
+        return Err(std::io::Error::other("file changed while it was hashed"));
     }
     let digest = writer
         .finish()
         .map_err(|error| std::io::Error::other(format!("{error:?}")))?
         .atp_content_id;
-    let after = lstat_regular(path)?;
-    if opened != before || after != before {
-        return Err(std::io::Error::other("file changed while it was hashed"));
-    }
     Ok((before, digest))
 }
 
-/// A probed toolchain plus the identity of every file its digests cover.
+/// Files and directory generations observed BEFORE running either probe.
+/// Unlike Cargo output directories, a toolchain must not change while an
+/// action uses it. Retaining only positive files misses newly installed
+/// libraries, newly populated target directories and transient membership.
+#[derive(Debug)]
+struct ToolchainInputs {
+    compiler: (PathBuf, FileSig),
+    runtime_libraries: Vec<(PathBuf, FileSig)>,
+    sysroot_files: Vec<(PathBuf, FileSig)>,
+    directories: Vec<(PathBuf, FileSig)>,
+}
+
+impl ToolchainInputs {
+    fn record_directory(&mut self, path: &Path) -> Result<(), String> {
+        let meta = std::fs::symlink_metadata(path)
+            .map_err(|error| format!("toolchain directory {}: {error}", path.display()))?;
+        if !meta.is_dir() {
+            return Err(format!(
+                "toolchain directory is not a real directory: {}",
+                path.display()
+            ));
+        }
+        self.directories.push((path.to_path_buf(), FileSig::of(&meta)));
+        Ok(())
+    }
+
+    fn still_current(&self) -> bool {
+        let directories_current = || {
+            self.directories.iter().all(|(path, sig)| {
+                std::fs::symlink_metadata(path)
+                    .is_ok_and(|meta| meta.is_dir() && FileSig::of(&meta) == *sig)
+            })
+        };
+        directories_current()
+            && std::iter::once(&self.compiler)
+                .chain(&self.runtime_libraries)
+                .chain(&self.sysroot_files)
+                .all(|(path, sig)| lstat_regular(path).is_ok_and(|now| now == *sig))
+            && directories_current()
+    }
+}
+
+/// Enumeration errors are unknown input closure, never an absent member.
+fn toolchain_entries(directory: &Path) -> Result<Vec<PathBuf>, String> {
+    let entries = std::fs::read_dir(directory)
+        .map_err(|error| format!("read {}: {error}", directory.display()))?;
+    let mut paths = entries
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<std::io::Result<Vec<_>>>()
+        .map_err(|error| format!("enumerate {}: {error}", directory.display()))?;
+    paths.sort();
+    Ok(paths)
+}
+
+fn observe_toolchain_inputs(compiler: &Path, sysroot: &Path) -> Result<ToolchainInputs, String> {
+    let compiler_sig = lstat_regular(compiler).map_err(|error| format!("compiler: {error}"))?;
+    let mut inputs = ToolchainInputs {
+        compiler: (compiler.to_path_buf(), compiler_sig),
+        runtime_libraries: Vec::new(),
+        sysroot_files: Vec::new(),
+        directories: Vec::new(),
+    };
+    let lib = sysroot.join("lib");
+    let rustlib = lib.join("rustlib");
+    for root in [
+        sysroot.to_path_buf(),
+        sysroot.join("bin"),
+        lib.clone(),
+        rustlib.clone(),
+    ] {
+        inputs.record_directory(&root)?;
+    }
+    // Preserve the existing Linux runtime-library selection and key order.
+    // A selected symlink or unreadable file can no longer disappear from
+    // the closure just because lstat_regular failed.
+    for path in toolchain_entries(&lib)? {
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or("non-UTF-8 toolchain runtime entry")?;
+        if name.contains(".so") {
+            let sig = lstat_regular(&path)
+                .map_err(|error| format!("toolchain runtime {name}: {error}"))?;
+            inputs.runtime_libraries.push((path, sig));
+        }
+    }
+    let mut pending = Vec::new();
+    for target in toolchain_entries(&rustlib)? {
+        let meta = std::fs::symlink_metadata(&target)
+            .map_err(|error| format!("toolchain target {}: {error}", target.display()))?;
+        if meta.is_file() {
+            // rustup's installer/component records are not target libraries.
+            // The containing directory still binds their membership changes.
+            continue;
+        }
+        inputs.record_directory(&target)?;
+        let target_lib = target.join("lib");
+        match std::fs::symlink_metadata(&target_lib) {
+            Ok(meta) if meta.is_dir() => pending.push(target_lib),
+            // Keep the target parent even when lib/ does not yet exist. A
+            // later target install must invalidate the warm toolchain memo.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(_) => return Err("toolchain target library root is not a real directory".into()),
+            Err(error) => return Err(format!("toolchain target library root: {error}")),
+        }
+    }
+    while let Some(directory) = pending.pop() {
+        inputs.record_directory(&directory)?;
+        for path in toolchain_entries(&directory)? {
+            let meta = std::fs::symlink_metadata(&path)
+                .map_err(|error| format!("toolchain input {}: {error}", path.display()))?;
+            if meta.is_dir() {
+                pending.push(path);
+            } else if meta.is_file() {
+                inputs.sysroot_files.push((path, FileSig::of(&meta)));
+            } else {
+                // No silent omission of a library or directory link. Linked
+                // toolchains need a separately closed link/target profile.
+                return Err(format!("non-regular toolchain input: {}", path.display()));
+            }
+        }
+    }
+    inputs.sysroot_files.sort_by(|a, b| a.0.cmp(&b.0));
+    if !inputs.still_current() {
+        return Err("toolchain inputs changed during enumeration".into());
+    }
+    Ok(inputs)
+}
+
+/// A probed toolchain plus its complete observed file/directory closure.
 #[derive(Debug)]
 struct ProbedToolchain {
     facts: ToolchainFacts,
-    covered: Vec<(PathBuf, FileSig)>,
+    inputs: ToolchainInputs,
 }
 
 impl ProbedToolchain {
     fn still_current(&self) -> bool {
-        self.covered
-            .iter()
-            .all(|(path, sig)| lstat_regular(path).is_ok_and(|now| now == *sig))
+        self.inputs.still_current()
+    }
+}
+
+/// Retain the exact toolchain observation used to key one live request.
+/// This is a read-only witness, not a filesystem lock or execution lease.
+/// A refreshed shared memo must never replace an in-flight request's original
+/// file/directory generations, even when the replacement has identical bytes.
+#[derive(Debug, Clone)]
+pub struct ToolchainGuard {
+    observed: Arc<ProbedToolchain>,
+}
+
+impl ToolchainGuard {
+    /// Recheck the original compiler path and all its observed inputs without
+    /// warming, probing, or adopting a newer memo generation.
+    ///
+    /// # Errors
+    /// The request names another compiler, or its toolchain changed since keying.
+    pub fn verify_unchanged(&self, compiler: &Path) -> Result<(), String> {
+        if compiler != self.observed.inputs.compiler.0.as_path() {
+            return Err("toolchain guard names a different compiler".into());
+        }
+        if !self.observed.still_current() {
+            return Err("toolchain inputs changed after request keying".into());
+        }
+        Ok(())
     }
 }
 
@@ -491,20 +657,27 @@ fn capture_dependencies(
     roots: DependencyRoots,
     members: DependencyMembers,
     output: DependencyOutput,
-) -> Result<DependencyFacts, String> {
-    let root_identities = dependency_root_identities(&roots)?;
+    mut cold_budget: Option<u64>,
+) -> Result<DependencyFacts, FactsMiss> {
+    let root_identities = dependency_root_identities(&roots).map_err(FactsMiss::Refused)?;
     let mut directories = Vec::new();
     for ((root, _), inventory) in roots.iter().zip(&members) {
         let mut artifacts = Vec::new();
-        for (name, _) in inventory {
+        for (name, sig) in inventory {
             let path = root.join(name);
             artifacts.push(ExternFact {
-                path: path.to_str().ok_or("non-UTF-8 dependency path")?.to_owned(),
-                content_digest: facts.file_digest(&path).map_err(|e| e.to_string())?,
+                path: path
+                    .to_str()
+                    .ok_or_else(|| FactsMiss::Refused("non-UTF-8 dependency path".into()))?
+                    .to_owned(),
+                content_digest: facts.dependency_digest(&path, *sig, &mut cold_budget)?,
             });
         }
         directories.push(DependencyDirectoryFact {
-            path: root.to_str().ok_or("non-UTF-8 dependency root")?.to_owned(),
+            path: root
+                .to_str()
+                .ok_or_else(|| FactsMiss::Refused("non-UTF-8 dependency root".into()))?
+                .to_owned(),
             artifacts,
         });
     }
@@ -515,7 +688,7 @@ fn capture_dependencies(
         output,
         root_identities,
     };
-    captured.verify_unchanged()?;
+    captured.verify_unchanged().map_err(FactsMiss::Refused)?;
     Ok(captured)
 }
 
@@ -788,6 +961,9 @@ fn probe_toolchain(compiler: &Path, env: &[(String, String)]) -> Result<ProbedTo
         return Err("compiler is not <sysroot>/bin/rustc".into());
     }
     let sysroot = bin.parent().ok_or("compiler has no sysroot")?;
+    // Probe output, binary bytes and library facts must belong to this one
+    // observed generation, not successive stages of a toolchain update.
+    let inputs = observe_toolchain_inputs(compiler, sysroot)?;
     let run = |args: &[&str]| -> Result<String, String> {
         let output = std::process::Command::new(compiler)
             .args(args)
@@ -809,60 +985,28 @@ fn probe_toolchain(compiler: &Path, env: &[(String, String)]) -> Result<ProbedTo
         );
     }
 
-    let mut covered = Vec::new();
-    let (compiler_sig, compiler_binary_digest) =
-        digest_stable(compiler).map_err(|error| format!("hash compiler: {error}"))?;
-    covered.push((compiler.to_path_buf(), compiler_sig));
-
-    let lib = sysroot.join("lib");
+    let (_, compiler_binary_digest) = digest_stable_at(compiler, inputs.compiler.1)
+        .map_err(|error| format!("hash compiler: {error}"))?;
     let mut runtime = Vec::new();
-    let mut entries: Vec<PathBuf> = std::fs::read_dir(&lib)
-        .map_err(|error| format!("read {}: {error}", lib.display()))?
-        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-        .collect();
-    entries.sort();
-    for path in entries {
-        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        if !name.contains(".so") || lstat_regular(&path).is_err() {
-            continue;
-        }
-        let (sig, digest) =
-            digest_stable(&path).map_err(|error| format!("hash {name}: {error}"))?;
-        covered.push((path.clone(), sig));
+    for (path, expected) in &inputs.runtime_libraries {
+        let (_, digest) = digest_stable_at(path, *expected)
+            .map_err(|error| format!("hash runtime {}: {error}", path.display()))?;
         runtime.push(digest);
     }
 
     // Every file below lib/rustlib/<target>/lib: std and friends, which a
     // compile links metadata and inlinable code from.
-    let rustlib = lib.join("rustlib");
     let mut tree = Vec::new();
-    let mut targets: Vec<PathBuf> = std::fs::read_dir(&rustlib)
-        .map_err(|error| format!("read {}: {error}", rustlib.display()))?
-        .filter_map(|entry| entry.ok().map(|entry| entry.path().join("lib")))
-        .filter(|path| path.is_dir())
-        .collect();
-    targets.sort();
-    while let Some(directory) = targets.pop() {
-        let entries = std::fs::read_dir(&directory)
-            .map_err(|error| format!("read {}: {error}", directory.display()))?;
-        for entry in entries {
-            let path = entry.map_err(|error| error.to_string())?.path();
-            let meta = std::fs::symlink_metadata(&path).map_err(|error| error.to_string())?;
-            if meta.is_dir() {
-                targets.push(path);
-            } else if meta.is_file() {
-                let (sig, digest) =
-                    digest_stable(&path).map_err(|error| format!("hash sysroot: {error}"))?;
-                let relative = path
-                    .strip_prefix(sysroot)
-                    .map_err(|_| "sysroot member escaped")?
-                    .to_str()
-                    .ok_or("non-UTF-8 sysroot member")?
-                    .to_owned();
-                covered.push((path, sig));
-                tree.push((relative, digest));
-            }
-        }
+    for (path, expected) in &inputs.sysroot_files {
+        let (_, digest) = digest_stable_at(path, *expected)
+            .map_err(|error| format!("hash sysroot: {error}"))?;
+        let relative = path
+            .strip_prefix(sysroot)
+            .map_err(|_| "sysroot member escaped")?
+            .to_str()
+            .ok_or("non-UTF-8 sysroot member")?
+            .to_owned();
+        tree.push((relative, digest));
     }
     tree.sort_by(|a, b| a.0.cmp(&b.0));
     let mut enc = CanonicalEncoder::new();
@@ -870,15 +1014,19 @@ fn probe_toolchain(compiler: &Path, env: &[(String, String)]) -> Result<ProbedTo
     for (relative, digest) in &tree {
         enc.str(relative).str(digest.domain).bytes(&digest.bytes);
     }
-    Ok(ProbedToolchain {
+    let probed = ProbedToolchain {
         facts: ToolchainFacts {
             compiler_binary_digest,
             verbose_version,
             sysroot_root_digest: compute(DOMAIN_SYSROOT_TREE, &enc.finish()),
             runtime_libraries: runtime,
         },
-        covered,
-    })
+        inputs,
+    };
+    if !probed.still_current() {
+        return Err("toolchain inputs changed while it was probed".into());
+    }
+    Ok(probed)
 }
 
 /// The memoized observation state shared by every edge connection.
@@ -887,11 +1035,138 @@ pub struct LiveFacts {
     files: Mutex<HashMap<PathBuf, (FileSig, TypedDigest)>>,
     toolchains: Mutex<HashMap<PathBuf, Slot<ProbedToolchain>>>,
     packages: Mutex<HashMap<PackageKey, Slot<PackageFacts>>>,
-    dependencies: Mutex<HashMap<(DependencyRoots, DependencyOutput), Slot<DependencyFacts>>>,
+    dependencies: Mutex<DependencyMemos>,
     warming: Mutex<usize>,
 }
 
 type PackageKey = (PathBuf, DependencySourceKind, Option<PathBuf>);
+
+/// Host-local memo identity, NOT an action key or serving authority. A
+/// reservation/backoff for one observed inventory must not mask a newer
+/// generation of the same directories. Keeping generations in separate
+/// entries also keeps old in-flight work inside MAX_DEPENDENCY_MEMOS.
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct DependencyObservation {
+    roots: DependencyRoots,
+    output: DependencyOutput,
+    members: DependencyMembers,
+    root_identities: Vec<(u64, u64)>,
+}
+
+#[derive(Debug)]
+enum DependencySlot {
+    Warming(Arc<()>),
+    Ready(Arc<DependencyFacts>),
+    Failed { reason: String, at: Instant },
+}
+
+type DependencyMemos = HashMap<Arc<DependencyObservation>, DependencySlot>;
+
+/// One capture owns only its exact observation and reservation token.
+/// Abandonment must not erase another capture or leave a permanent Warming
+/// entry. The token also fences identical observations after eviction/retry.
+struct DependencyReservation {
+    facts: Arc<LiveFacts>,
+    observation: Arc<DependencyObservation>,
+    token: Arc<()>,
+}
+
+impl DependencyReservation {
+    fn insert(
+        facts: &Arc<LiveFacts>,
+        memos: &mut DependencyMemos,
+        observation: Arc<DependencyObservation>,
+    ) -> Self {
+        let token = Arc::new(());
+        memos.insert(
+            Arc::clone(&observation),
+            DependencySlot::Warming(Arc::clone(&token)),
+        );
+        Self {
+            facts: Arc::clone(facts),
+            observation,
+            token,
+        }
+    }
+
+    fn finish(
+        self,
+        captured: Result<DependencyFacts, FactsMiss>,
+        retain_failure: bool,
+    ) -> Result<Arc<DependencyFacts>, FactsMiss> {
+        let captured = captured.and_then(|captured| {
+            if captured.roots != self.observation.roots
+                || captured.output != self.observation.output
+                || captured.members != self.observation.members
+                || captured.root_identities != self.observation.root_identities
+            {
+                return Err(FactsMiss::Refused(
+                    "dependency capture does not match its admitted observation".into(),
+                ));
+            }
+            Ok(Arc::new(captured))
+        });
+        {
+            let mut memos = self
+                .facts
+                .dependencies
+                .lock()
+                .map_err(|_| FactsMiss::Refused("dependency memo poisoned".into()))?;
+            if !matches!(
+                memos.get(&self.observation),
+                Some(DependencySlot::Warming(token)) if Arc::ptr_eq(token, &self.token)
+            ) {
+                return Err(FactsMiss::Pending);
+            }
+            match &captured {
+                Ok(captured) => {
+                    memos.insert(
+                        Arc::clone(&self.observation),
+                        DependencySlot::Ready(Arc::clone(captured)),
+                    );
+                }
+                Err(FactsMiss::Refused(reason)) if retain_failure => {
+                    memos.insert(
+                        Arc::clone(&self.observation),
+                        DependencySlot::Failed {
+                            reason: reason.clone(),
+                            at: Instant::now(),
+                        },
+                    );
+                }
+                Err(_) => {}
+            }
+        }
+        captured
+    }
+}
+
+impl Drop for DependencyReservation {
+    fn drop(&mut self) {
+        if let Ok(mut memos) = self.facts.dependencies.lock()
+            && matches!(
+                memos.get(&self.observation),
+                Some(DependencySlot::Warming(token)) if Arc::ptr_eq(token, &self.token)
+            )
+        {
+            memos.remove(&self.observation);
+        }
+    }
+}
+
+/// Own the shared warm-pool slot through thread-start failure and unwinding,
+/// not only the happy-path tail of the work closure.
+struct WarmPermit {
+    facts: Arc<LiveFacts>,
+}
+
+impl Drop for WarmPermit {
+    fn drop(&mut self) {
+        if let Ok(mut warming) = self.facts.warming.lock() {
+            *warming = warming.saturating_sub(1);
+        }
+    }
+}
 
 impl LiveFacts {
     /// Empty state.
@@ -901,7 +1176,9 @@ impl LiveFacts {
     }
 
     /// Capture exact dependency directory contents with bounded cold hashing.
-    /// Large cold inventories warm in the existing bounded background pool.
+    /// Only bytes missing from the identity-validated file memo consume the
+    /// request budget. A large inventory of known outputs needs no background
+    /// slot merely because this invocation has a different output mapping.
     pub fn dependencies(
         self: &Arc<Self>,
         plan: &DependencyActionPlan,
@@ -920,64 +1197,126 @@ impl LiveFacts {
                 )
             })
             .collect();
-        let (members, bytes) = walk_dependencies(&roots).map_err(FactsMiss::Refused)?;
+        let (members, _) = walk_dependencies(&roots).map_err(FactsMiss::Refused)?;
         let output = (PathBuf::from(&plan.out_dir), plan.output_names());
         reject_dependency_output_aliases(&roots, &members, &output).map_err(FactsMiss::Refused)?;
         let root_identities = dependency_root_identities(&roots).map_err(FactsMiss::Refused)?;
-        let memo_key = (roots.clone(), output.clone());
-        {
+        let observation = Arc::new(DependencyObservation {
+            roots,
+            output,
+            members,
+            root_identities,
+        });
+        let reservation = {
             let mut memos = self
                 .dependencies
                 .lock()
                 .map_err(|_| FactsMiss::Refused("dependency memo poisoned".into()))?;
-            if let Some(slot) = memos.get(&memo_key) {
-                match slot {
-                    Slot::Ready(captured)
-                        if captured.members == members
-                            && captured.root_identities == root_identities =>
-                    {
-                        return Ok(Arc::clone(captured));
-                    }
-                    Slot::Warming => return Err(FactsMiss::Pending),
-                    Slot::Failed { reason, at } if at.elapsed() < PROBE_RETRY => {
-                        return Err(FactsMiss::Refused(reason.clone()));
-                    }
-                    _ => {}
+            match memos.get(&observation) {
+                Some(DependencySlot::Ready(captured)) => return Ok(Arc::clone(captured)),
+                Some(DependencySlot::Warming(_)) => return Err(FactsMiss::Pending),
+                Some(DependencySlot::Failed { reason, at }) if at.elapsed() < PROBE_RETRY => {
+                    return Err(FactsMiss::Refused(reason.clone()));
                 }
+                _ => {}
             }
             if memos.len() >= MAX_DEPENDENCY_MEMOS {
-                memos.retain(|_, slot| matches!(slot, Slot::Warming));
+                memos.retain(|_, slot| matches!(slot, DependencySlot::Warming(_)));
             }
-            if bytes > SYNCHRONOUS_PACKAGE_BYTES {
-                memos.insert(memo_key.clone(), Slot::Warming);
-                drop(memos);
-                let warm_roots = roots.clone();
-                let warm_key = memo_key.clone();
-                if !self.start_warm(move |facts| {
-                    let slot = match capture_dependencies(facts, warm_roots, members, output) {
-                        Ok(captured) => Slot::Ready(Arc::new(captured)),
-                        Err(reason) => Slot::Failed {
-                            reason,
-                            at: Instant::now(),
-                        },
-                    };
-                    if let Ok(mut memos) = facts.dependencies.lock() {
-                        memos.insert(warm_key, slot);
-                    }
-                }) && let Ok(mut memos) = self.dependencies.lock()
-                {
-                    memos.remove(&memo_key);
-                }
+            if memos.len() >= MAX_DEPENDENCY_MEMOS {
                 return Err(FactsMiss::Pending);
             }
+            DependencyReservation::insert(self, &mut memos, Arc::clone(&observation))
+        };
+
+        let captured = if self.dependency_budget_fits(
+            &observation.roots,
+            &observation.members,
+            SYNCHRONOUS_PACKAGE_BYTES,
+        ) {
+            capture_dependencies(
+                self,
+                observation.roots.clone(),
+                observation.members.clone(),
+                observation.output.clone(),
+                Some(SYNCHRONOUS_PACKAGE_BYTES),
+            )
+        } else {
+            Err(FactsMiss::Pending)
+        };
+        if !matches!(captured, Err(FactsMiss::Pending)) {
+            return reservation.finish(captured, false);
         }
-        let captured = Arc::new(
-            capture_dependencies(self, roots, members, output).map_err(FactsMiss::Refused)?,
-        );
-        if let Ok(mut memos) = self.dependencies.lock() {
-            memos.insert(memo_key, Slot::Ready(Arc::clone(&captured)));
+
+        self.start_warm(move |facts| {
+            let captured = capture_dependencies(
+                facts,
+                observation.roots.clone(),
+                observation.members.clone(),
+                observation.output.clone(),
+                None,
+            );
+            let _ = reservation.finish(captured, true);
+        });
+        Err(FactsMiss::Pending)
+    }
+
+    /// Scheduling estimate only. The foreground capture independently charges
+    /// each actual cache miss, without holding this mutex over filesystem I/O.
+    fn dependency_budget_fits(
+        &self,
+        roots: &DependencyRoots,
+        members: &DependencyMembers,
+        mut budget: u64,
+    ) -> bool {
+        let files = self.files.lock().ok();
+        for ((root, _), inventory) in roots.iter().zip(members) {
+            for (name, sig) in inventory {
+                if files
+                    .as_ref()
+                    .and_then(|files| files.get(&root.join(name)))
+                    .is_some_and(|(cached, _)| cached == sig)
+                {
+                    continue;
+                }
+                let Some(remaining) = budget.checked_sub(sig.size) else {
+                    return false;
+                };
+                budget = remaining;
+            }
         }
-        Ok(captured)
+        true
+    }
+
+    /// Charge only a real memo miss, using the inventory's admitted size.
+    /// Eviction after the estimate must never permit an unbounded cold read.
+    fn dependency_digest(
+        &self,
+        path: &Path,
+        expected: FileSig,
+        cold_budget: &mut Option<u64>,
+    ) -> Result<TypedDigest, FactsMiss> {
+        let now = lstat_regular(path).map_err(|error| FactsMiss::Refused(error.to_string()))?;
+        if now != expected {
+            return Err(FactsMiss::Refused(
+                "dependency changed after enumeration".into(),
+            ));
+        }
+        if let Ok(files) = self.files.lock()
+            && let Some((sig, digest)) = files.get(path)
+            && *sig == expected
+        {
+            return Ok(digest.clone());
+        }
+        if let Some(remaining) = cold_budget {
+            *remaining = remaining
+                .checked_sub(expected.size)
+                .ok_or(FactsMiss::Pending)?;
+        }
+        let (sig, digest) = digest_stable_at(path, expected)
+            .map_err(|error| FactsMiss::Refused(error.to_string()))?;
+        self.remember(path, sig, digest.clone());
+        Ok(digest)
     }
 
     fn start_warm(self: &Arc<Self>, work: impl FnOnce(&Self) + Send + 'static) -> bool {
@@ -990,21 +1329,16 @@ impl LiveFacts {
             }
             *warming += 1;
         }
-        let facts = Arc::clone(self);
-        let spawned = std::thread::Builder::new()
+        let permit = WarmPermit {
+            facts: Arc::clone(self),
+        };
+        std::thread::Builder::new()
             .name("rabs-facts-warm".to_owned())
             .spawn(move || {
-                work(&facts);
-                if let Ok(mut warming) = facts.warming.lock() {
-                    *warming -= 1;
-                }
-            });
-        if spawned.is_err()
-            && let Ok(mut warming) = self.warming.lock()
-        {
-            *warming -= 1;
-        }
-        spawned.is_ok()
+                let active_permit = permit;
+                work(&active_permit.facts);
+            })
+            .is_ok()
     }
 
     /// The content digest of a regular file, memoized by identity.
@@ -1083,6 +1417,34 @@ impl LiveFacts {
             toolchains.remove(compiler);
         }
         Err(FactsMiss::Pending)
+    }
+
+    /// Retain the ready observation that produced `expected` for this request.
+    /// The memo lock protects only acquisition; later validation uses the
+    /// retained observation and does not block unrelated requests on this lock.
+    ///
+    /// # Errors
+    /// No matching ready observation remains, or its filesystem inputs changed.
+    pub fn toolchain_guard(
+        &self,
+        compiler: &Path,
+        expected: &ToolchainFacts,
+    ) -> Result<ToolchainGuard, FactsMiss> {
+        let observed = {
+            let toolchains = self
+                .toolchains
+                .lock()
+                .map_err(|_| FactsMiss::Refused("toolchain memo poisoned".into()))?;
+            match toolchains.get(compiler) {
+                Some(Slot::Ready(probed)) if &probed.facts == expected => Arc::clone(probed),
+                _ => return Err(FactsMiss::Pending),
+            }
+        };
+        let guard = ToolchainGuard { observed };
+        guard
+            .verify_unchanged(compiler)
+            .map_err(FactsMiss::Refused)?;
+        Ok(guard)
     }
 
     /// The sealed source tree of a registry package or complete Cargo Git
@@ -1176,6 +1538,387 @@ impl LiveFacts {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn dependency_observation(plan: &DependencyActionPlan) -> Arc<DependencyObservation> {
+        let roots: DependencyRoots = plan
+            .dependency_dirs
+            .iter()
+            .map(|root| {
+                (
+                    PathBuf::from(root),
+                    if root == &plan.out_dir {
+                        plan.output_names()
+                    } else {
+                        Vec::new()
+                    },
+                )
+            })
+            .collect();
+        let (members, _) = walk_dependencies(&roots).unwrap();
+        let output = (PathBuf::from(&plan.out_dir), plan.output_names());
+        reject_dependency_output_aliases(&roots, &members, &output).unwrap();
+        let root_identities = dependency_root_identities(&roots).unwrap();
+        Arc::new(DependencyObservation {
+            roots,
+            output,
+            members,
+            root_identities,
+        })
+    }
+
+    fn dependency_reservation(
+        facts: &Arc<LiveFacts>,
+        observation: &Arc<DependencyObservation>,
+    ) -> DependencyReservation {
+        let mut memos = facts.dependencies.lock().unwrap();
+        assert!(!memos.contains_key(observation));
+        DependencyReservation::insert(facts, &mut memos, Arc::clone(observation))
+    }
+
+    // These exercise observation/admission, not rustc metadata validity or
+    // serving qualification. The files are regular dependency candidates.
+    fn dependency_budget_fixture(
+        sizes: &[u64],
+    ) -> (tempfile::TempDir, DependencyActionPlan, Vec<PathBuf>) {
+        let (dir, mut plan) = generated_fixture();
+        plan.dependency_dirs = vec![plan.out_dir.clone()];
+        let paths = sizes
+            .iter()
+            .enumerate()
+            .map(|(index, size)| {
+                let path = Path::new(&plan.out_dir).join(format!("libbudget{index}.rmeta"));
+                std::fs::File::create(&path)
+                    .unwrap()
+                    .set_len(*size)
+                    .unwrap();
+                path
+            })
+            .collect();
+        (dir, plan, paths)
+    }
+
+    #[test]
+    fn warm_dependency_bytes_admit_new_output_mappings_without_a_warm_slot() {
+        let (dir, mut plan, paths) =
+            dependency_budget_fixture(&[SYNCHRONOUS_PACKAGE_BYTES + 1]);
+        let facts = LiveFacts::new();
+        let expected = facts.file_digest(&paths[0]).unwrap();
+        // Forbid a background rescue: warm identities must suffice even
+        // while the background pool is occupied with other observations.
+        *facts.warming.lock().unwrap() = MAX_WARMING;
+        let first = facts.dependencies(&plan).expect("warm dependency admitted");
+        first.verify_unchanged().unwrap();
+        assert_eq!(first.directories[0].artifacts[0].content_digest, expected);
+        assert!(Arc::ptr_eq(&first, &facts.dependencies(&plan).unwrap()));
+        let other = dir.path().join("another-output-mapping");
+        std::fs::create_dir(&other).unwrap();
+        plan.out_dir = other.to_str().unwrap().to_owned();
+        let second = facts.dependencies(&plan).expect("new mapping, same warm bytes");
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert_eq!(second.directories[0].artifacts[0].content_digest, expected);
+        assert_eq!(*facts.warming.lock().unwrap(), MAX_WARMING);
+    }
+
+    #[test]
+    fn small_cold_tail_in_a_large_warm_inventory_is_admitted() {
+        let (_dir, plan, paths) =
+            dependency_budget_fixture(&[SYNCHRONOUS_PACKAGE_BYTES + 1, 17]);
+        let facts = LiveFacts::new();
+        let warm = facts.file_digest(&paths[0]).unwrap();
+        *facts.warming.lock().unwrap() = MAX_WARMING;
+        let captured = facts.dependencies(&plan).expect("only 17 bytes are cold");
+        assert_eq!(captured.directories[0].artifacts.len(), 2);
+        assert_eq!(captured.directories[0].artifacts[0].content_digest, warm);
+        assert_eq!(
+            captured.directories[0].artifacts[1].content_digest,
+            digest_stable(&paths[1]).unwrap().1
+        );
+        captured.verify_unchanged().unwrap();
+    }
+
+    #[test]
+    fn dependency_read_budget_is_shared_and_memo_hits_are_free() {
+        let (_dir, _plan, paths) = dependency_budget_fixture(&[9, 7]);
+        let facts = LiveFacts::new();
+        let first = lstat_regular(&paths[0]).unwrap();
+        let second = lstat_regular(&paths[1]).unwrap();
+        let mut budget = Some(9);
+        let digest = facts.dependency_digest(&paths[0], first, &mut budget).unwrap();
+        assert_eq!(budget, Some(0));
+        assert_eq!(
+            facts.dependency_digest(&paths[0], first, &mut budget).unwrap(),
+            digest
+        );
+        assert_eq!(budget, Some(0));
+        assert_eq!(
+            facts.dependency_digest(&paths[1], second, &mut budget),
+            Err(FactsMiss::Pending)
+        );
+        assert_eq!(budget, Some(0));
+        assert!(!facts.files.lock().unwrap().contains_key(&paths[1]));
+    }
+
+    #[test]
+    fn memo_eviction_after_estimation_cannot_authorize_a_cold_read() {
+        let (_dir, plan, paths) = dependency_budget_fixture(&[17]);
+        let facts = LiveFacts::new();
+        facts.file_digest(&paths[0]).unwrap();
+        let roots = vec![(PathBuf::from(&plan.out_dir), plan.output_names())];
+        let (members, _) = walk_dependencies(&roots).unwrap();
+        assert!(facts.dependency_budget_fits(&roots, &members, 0));
+        facts.files.lock().unwrap().clear();
+        assert!(matches!(
+            capture_dependencies(
+                &facts,
+                roots,
+                members,
+                (PathBuf::from(&plan.out_dir), plan.output_names()),
+                Some(0),
+            ),
+            Err(FactsMiss::Pending)
+        ));
+        assert!(!facts.files.lock().unwrap().contains_key(&paths[0]));
+    }
+
+    #[test]
+    fn dependency_replacement_after_enumeration_refuses_before_spending_budget() {
+        let (dir, _plan, paths) = dependency_budget_fixture(&[17]);
+        let facts = LiveFacts::new();
+        let observed = lstat_regular(&paths[0]).unwrap();
+        std::fs::rename(&paths[0], dir.path().join("retained-old-input")).unwrap();
+        std::fs::write(&paths[0], b"replacement bytes").unwrap();
+        let mut budget = Some(17);
+        assert!(matches!(
+            facts.dependency_digest(&paths[0], observed, &mut budget),
+            Err(FactsMiss::Refused(reason)) if reason.contains("after enumeration")
+        ));
+        assert_eq!(budget, Some(17));
+        assert!(facts.files.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn replaced_warm_candidate_becomes_cold_and_cannot_reuse_its_old_digest() {
+        let (dir, plan, paths) =
+            dependency_budget_fixture(&[SYNCHRONOUS_PACKAGE_BYTES + 1]);
+        let facts = LiveFacts::new();
+        let old = facts.file_digest(&paths[0]).unwrap();
+        *facts.warming.lock().unwrap() = MAX_WARMING;
+        let captured = facts.dependencies(&plan).unwrap();
+        std::fs::rename(&paths[0], dir.path().join("retained-old-input")).unwrap();
+        std::fs::write(
+            &paths[0],
+            vec![1; usize::try_from(SYNCHRONOUS_PACKAGE_BYTES + 1).unwrap()],
+        )
+        .unwrap();
+        assert!(captured.verify_unchanged().is_err());
+        assert!(matches!(facts.dependencies(&plan), Err(FactsMiss::Pending)));
+        // Failed warm admission releases this inventory's reservation.
+        // After observing the new bytes the next request can try again.
+        let new = facts.file_digest(&paths[0]).unwrap();
+        assert_ne!(old, new);
+        let changed = facts.dependencies(&plan).unwrap();
+        assert_eq!(changed.directories[0].artifacts[0].content_digest, new);
+        changed.verify_unchanged().unwrap();
+    }
+
+    #[test]
+    fn warm_admission_preserves_negative_candidates_and_output_alias_refusals() {
+        let (_dir, plan, paths) =
+            dependency_budget_fixture(&[SYNCHRONOUS_PACKAGE_BYTES + 1]);
+        let facts = LiveFacts::new();
+        facts.file_digest(&paths[0]).unwrap();
+        *facts.warming.lock().unwrap() = MAX_WARMING;
+        let before = facts.dependencies(&plan).unwrap();
+        std::fs::write(Path::new(&plan.out_dir).join("libnew.rmeta"), b"new").unwrap();
+        assert!(before.verify_unchanged().is_err());
+        let after = facts.dependencies(&plan).unwrap();
+        assert_eq!(after.directories[0].artifacts.len(), 2);
+        let output = Path::new(&plan.out_dir).join(&plan.output_names()[0]);
+        std::fs::hard_link(&paths[0], output).unwrap();
+        assert!(matches!(
+            facts.dependencies(&plan),
+            Err(FactsMiss::Refused(reason)) if reason.contains("aliases a declared output")
+        ));
+    }
+
+    #[test]
+    fn cold_dependency_still_warms_in_the_existing_bounded_pool() {
+        let (_dir, plan, _paths) =
+            dependency_budget_fixture(&[SYNCHRONOUS_PACKAGE_BYTES + 1]);
+        let facts = LiveFacts::new();
+        assert!(matches!(facts.dependencies(&plan), Err(FactsMiss::Pending)));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            assert!(Instant::now() < deadline, "dependency warm did not finish");
+            match facts.dependencies(&plan) {
+                Ok(captured) => {
+                    captured.verify_unchanged().unwrap();
+                    assert_eq!(captured.directories[0].artifacts.len(), 1);
+                    break;
+                }
+                Err(FactsMiss::Pending) => std::thread::sleep(Duration::from_millis(5)),
+                Err(error) => panic!("dependency warm refused: {error}"),
+            }
+        }
+    }
+
+    #[test]
+    fn large_cold_inventory_does_not_spend_the_foreground_budget_before_deferral() {
+        let (_dir, plan, _paths) =
+            dependency_budget_fixture(&[SYNCHRONOUS_PACKAGE_BYTES / 2 + 1; 2]);
+        let facts = LiveFacts::new();
+        *facts.warming.lock().unwrap() = MAX_WARMING;
+        assert!(matches!(facts.dependencies(&plan), Err(FactsMiss::Pending)));
+        assert!(facts.files.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn foreground_capture_reservations_keep_the_inventory_memo_bounded() {
+        let (dir, plan, _paths) = dependency_budget_fixture(&[17]);
+        let facts = LiveFacts::new();
+        {
+            let mut memos = facts.dependencies.lock().unwrap();
+            for index in 0..MAX_DEPENDENCY_MEMOS {
+                memos.insert(
+                    Arc::new(DependencyObservation {
+                        roots: Vec::new(),
+                        output: (dir.path().join(format!("out-{index}")), Vec::new()),
+                        members: Vec::new(),
+                        root_identities: Vec::new(),
+                    }),
+                    DependencySlot::Warming(Arc::new(())),
+                );
+            }
+        }
+        assert!(matches!(facts.dependencies(&plan), Err(FactsMiss::Pending)));
+        assert_eq!(facts.dependencies.lock().unwrap().len(), MAX_DEPENDENCY_MEMOS);
+        assert!(facts.files.lock().unwrap().is_empty());
+        assert_eq!(*facts.warming.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn newer_dependency_generation_is_not_blocked_by_older_reservation() {
+        let (_dir, plan, _paths) = dependency_budget_fixture(&[17]);
+        let facts = LiveFacts::new();
+        let original = dependency_observation(&plan);
+        let owner = dependency_reservation(&facts, &original);
+        std::fs::write(Path::new(&plan.out_dir).join("libnew.rmeta"), b"new").unwrap();
+
+        *facts.warming.lock().unwrap() = MAX_WARMING;
+        let newer = facts.dependencies(&plan).expect("new generation admitted");
+        assert_eq!(newer.directories[0].artifacts.len(), 2);
+        drop(owner);
+        assert!(Arc::ptr_eq(&newer, &facts.dependencies(&plan).unwrap()));
+        newer.verify_unchanged().unwrap();
+    }
+
+    #[test]
+    fn stale_reservation_token_cannot_replace_identical_successor() {
+        let (_dir, plan, _paths) = dependency_budget_fixture(&[17]);
+        let facts = LiveFacts::new();
+        let observation = dependency_observation(&plan);
+        let original = dependency_reservation(&facts, &observation);
+        facts.dependencies.lock().unwrap().remove(&observation);
+        let successor = dependency_reservation(&facts, &observation);
+        let successor_token = Arc::clone(&successor.token);
+
+        let captured = capture_dependencies(
+            &facts,
+            observation.roots.clone(),
+            observation.members.clone(),
+            observation.output.clone(),
+            None,
+        );
+        assert!(matches!(original.finish(captured, true), Err(FactsMiss::Pending)));
+        assert!(matches!(
+            facts.dependencies.lock().unwrap().get(&observation),
+            Some(DependencySlot::Warming(current)) if Arc::ptr_eq(current, &successor_token)
+        ));
+
+        let captured = capture_dependencies(
+            &facts,
+            observation.roots.clone(),
+            observation.members.clone(),
+            observation.output.clone(),
+            None,
+        );
+        successor.finish(captured, true).unwrap();
+        facts.dependencies(&plan).unwrap().verify_unchanged().unwrap();
+    }
+
+    #[test]
+    fn failed_observation_backoff_does_not_follow_changed_generation() {
+        let (_dir, plan, paths) = dependency_budget_fixture(&[17]);
+        let facts = LiveFacts::new();
+        let original = dependency_observation(&plan);
+        dependency_reservation(&facts, &original)
+            .finish(Err(FactsMiss::Refused("old generation failed".into())), true)
+            .unwrap_err();
+
+        assert!(matches!(
+            facts.dependencies(&plan),
+            Err(FactsMiss::Refused(reason)) if reason == "old generation failed"
+        ));
+
+        std::fs::write(&paths[0], b"changed generation").unwrap();
+        facts.dependencies(&plan).unwrap().verify_unchanged().unwrap();
+    }
+
+    #[test]
+    fn observed_hashing_keeps_streaming_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, bytes) in [
+            ("empty", Vec::new()),
+            ("binary", vec![0, 255, 10, 0, 128]),
+            ("multiple-buffers", vec![137; 512 * 1024 + 17]),
+        ] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, &bytes).unwrap();
+            let observed = lstat_regular(&path).unwrap();
+            let mut writer =
+                StreamingObjectWriter::new(DigestRequest::default(), Some(bytes.len() as u64));
+            writer.write(&bytes).unwrap();
+            let expected = writer.finish().unwrap().atp_content_id;
+            assert_eq!(digest_stable_at(&path, observed).unwrap(), (observed, expected));
+        }
+    }
+
+    #[test]
+    fn observed_hashing_refuses_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("libdep.rmeta");
+        std::fs::write(&path, b"before").unwrap();
+        let observed = lstat_regular(&path).unwrap();
+        std::fs::rename(&path, dir.path().join("retained-original")).unwrap();
+        std::fs::write(&path, b"after!").unwrap();
+        assert!(digest_stable_at(&path, observed).is_err());
+        assert!(digest_stable(&path).is_ok());
+    }
+
+    #[test]
+    fn observed_hashing_refuses_growth_shrinkage_and_symlink_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("libdep.rmeta");
+        std::fs::write(&path, b"small").unwrap();
+        let observed = lstat_regular(&path).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(16 * 1024 * 1024)
+            .unwrap();
+        assert!(digest_stable_at(&path, observed).is_err());
+
+        let grown = lstat_regular(&path).unwrap();
+        std::fs::write(&path, b"x").unwrap();
+        assert!(digest_stable_at(&path, grown).is_err());
+
+        let current = lstat_regular(&path).unwrap();
+        let retained = dir.path().join("retained-bytes");
+        std::fs::rename(&path, &retained).unwrap();
+        std::os::unix::fs::symlink(&retained, &path).unwrap();
+        assert!(digest_stable_at(&path, current).is_err());
+    }
 
     fn generated_fixture() -> (tempfile::TempDir, DependencyActionPlan) {
         let dir = tempfile::tempdir().unwrap();
@@ -1435,6 +2178,7 @@ mod tests {
                 roots.clone(),
                 members,
                 (root.clone(), vec!["libcurrent.rmeta".into()]),
+                None,
             )
             .unwrap()
         };
@@ -1506,6 +2250,7 @@ mod tests {
             roots.clone(),
             members.clone(),
             (dir.path().join("out"), Vec::new()),
+            None,
         )
         .unwrap();
         std::fs::write(
@@ -1543,6 +2288,7 @@ mod tests {
             roots.clone(),
             before.clone(),
             (dir.path().join("out"), Vec::new()),
+            None,
         )
         .unwrap();
         // rustc finishes the dependency's codegen while its dependent runs:
@@ -1589,7 +2335,7 @@ mod tests {
         let roots = vec![(dependencies.clone(), Vec::new())];
         let output = (out.clone(), vec!["libcurrent.rlib".into()]);
         let (members, _) = walk_dependencies(&roots).unwrap();
-        let captured = capture_dependencies(&LiveFacts::new(), roots, members, output).unwrap();
+        let captured = capture_dependencies(&LiveFacts::new(), roots, members, output, None).unwrap();
         captured.verify_unchanged().unwrap();
         // An alias created after keying must also refuse at pre-hit / completion.
         std::fs::hard_link(
@@ -1632,6 +2378,7 @@ mod tests {
             roots.clone(),
             members.clone(),
             (out, Vec::new()),
+            None,
         )
         .unwrap();
         // Scratch churn bumps the directory generation; it is not an input.
@@ -1962,6 +2709,302 @@ mod tests {
                 "Git capture must still refuse {excluded}"
             );
         }
+    }
+
+    // A scripted version/sysroot probe over real filesystem inputs. This
+    // exercises toolchain observation, not a real compiler or cache hit.
+    fn toolchain_fixture() -> (tempfile::TempDir, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        // Short paths also fit macOS's smaller Unix-domain socket address.
+        let dir = tempfile::Builder::new()
+            .prefix("rt-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let root = dir.path().join("toolchain");
+        for relative in [
+            "bin",
+            "lib/rustlib/test-host/lib/self-contained",
+            "lib/rustlib/future-target",
+        ] {
+            std::fs::create_dir_all(root.join(relative)).unwrap();
+        }
+        std::fs::write(root.join("lib/libdriver.so"), b"runtime-v1").unwrap();
+        std::fs::write(root.join("lib/rustlib/test-host/lib/libcore.rlib"), b"core-v1").unwrap();
+        std::fs::write(
+            root.join("lib/rustlib/test-host/lib/self-contained/crt.o"),
+            b"startup-v1",
+        )
+        .unwrap();
+        let compiler = root.join("bin/rustc");
+        std::fs::write(
+            &compiler,
+            br#"#!/bin/sh
+root=${0%/bin/rustc}
+if [ -n "${RABS_TEST_LOG:-}" ]; then
+    printf 'probe\n' >> "$RABS_TEST_LOG"
+fi
+case "$*" in
+    '-vV')
+        case "${RABS_TEST_MUTATE:-}" in
+            add) printf 'new\n' > "$root/lib/rustlib/test-host/lib/libinjected.rlib" ;;
+            change) printf 'runtime-v2' > "$root/lib/libdriver.so" ;;
+        esac
+        printf 'rustc fixture\nhost: x86_64-unknown-linux-gnu\n'
+        ;;
+    '--print sysroot') printf '%s\n' "$root" ;;
+    *) exit 64 ;;
+esac
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&compiler, std::fs::Permissions::from_mode(0o700)).unwrap();
+        (dir, compiler)
+    }
+
+    #[test]
+    fn complete_unchanged_toolchain_inputs_preserve_fact_identity() {
+        let (_dir, compiler) = toolchain_fixture();
+        let first = probe_toolchain(&compiler, &[]).unwrap();
+        assert!(first.still_current());
+        assert_eq!(first.inputs.runtime_libraries.len(), 1);
+        assert_eq!(first.inputs.sysroot_files.len(), 2);
+        assert_eq!(first.facts, probe_toolchain(&compiler, &[]).unwrap().facts);
+        assert!(first.still_current());
+    }
+
+    #[test]
+    fn added_toolchain_libraries_and_target_roots_invalidate_warm_facts() {
+        for relative in [
+            "lib/libanother.so",
+            "lib/rustlib/test-host/lib/libanother.rlib",
+            "lib/rustlib/test-host/lib/self-contained/another.o",
+            "lib/rustlib/new-target/lib/libcore.rlib",
+            "lib/rustlib/future-target/lib/libcore.rlib",
+        ] {
+            let (_dir, compiler) = toolchain_fixture();
+            let root = compiler.parent().unwrap().parent().unwrap();
+            let first = probe_toolchain(&compiler, &[]).unwrap();
+            let new = root.join(relative);
+            std::fs::create_dir_all(new.parent().unwrap()).unwrap();
+            std::fs::write(&new, b"new compiler input").unwrap();
+            // The old positive-file-only check accepts all of these: no
+            // previously hashed file has moved or changed its bytes.
+            assert!(
+                std::iter::once(&first.inputs.compiler)
+                    .chain(&first.inputs.runtime_libraries)
+                    .chain(&first.inputs.sysroot_files)
+                    .all(|(path, sig)| lstat_regular(path).unwrap() == *sig)
+            );
+            assert!(!first.still_current(), "missed new toolchain input {relative}");
+            let changed = probe_toolchain(&compiler, &[]).unwrap();
+            assert!(changed.still_current());
+            assert_ne!(first.facts, changed.facts, "new bytes must key {relative}");
+        }
+    }
+
+    #[test]
+    fn transient_toolchain_membership_invalidates_observation_not_canonical_bytes() {
+        let (dir, compiler) = toolchain_fixture();
+        let root = compiler.parent().unwrap().parent().unwrap();
+        let outside = dir.path().join("transient.rlib");
+        std::fs::write(&outside, b"temporary input").unwrap();
+        let first = probe_toolchain(&compiler, &[]).unwrap();
+        let inside = root.join("lib/rustlib/test-host/lib/libtransient.rlib");
+        std::fs::rename(&outside, &inside).unwrap();
+        std::fs::rename(&inside, &outside).unwrap();
+        assert!(!first.still_current());
+        // Directory generations are freshness evidence, NOT action-key
+        // fields. Re-observing the same complete bytes retains the same key.
+        let refreshed = probe_toolchain(&compiler, &[]).unwrap();
+        assert!(refreshed.still_current());
+        assert_eq!(first.facts, refreshed.facts);
+    }
+
+    #[test]
+    fn toolchain_root_links_cannot_reuse_the_same_positive_file_identities() {
+        for relative in [
+            "",
+            "lib",
+            "lib/rustlib/test-host/lib",
+            "lib/rustlib/test-host/lib/self-contained",
+        ] {
+            let (dir, compiler) = toolchain_fixture();
+            let root = compiler.parent().unwrap().parent().unwrap();
+            let first = probe_toolchain(&compiler, &[]).unwrap();
+            let selected = if relative.is_empty() {
+                root.to_path_buf()
+            } else {
+                root.join(relative)
+            };
+            let retained = dir.path().join("retained-directory");
+            std::fs::rename(&selected, &retained).unwrap();
+            std::os::unix::fs::symlink(&retained, &selected).unwrap();
+            assert!(
+                std::iter::once(&first.inputs.compiler)
+                    .chain(&first.inputs.runtime_libraries)
+                    .chain(&first.inputs.sysroot_files)
+                    .all(|(path, sig)| lstat_regular(path).unwrap() == *sig)
+            );
+            assert!(!first.still_current(), "linked directory {relative}");
+            assert!(probe_toolchain(&compiler, &[]).is_err());
+        }
+    }
+
+    #[test]
+    fn linked_toolchain_members_refuse_before_running_a_probe() {
+        for (relative, target) in [
+            ("lib/libalias.so", "libdriver.so"),
+            ("lib/rustlib/test-host/lib/libalias.rlib", "libcore.rlib"),
+            ("lib/rustlib/test-host/lib/nested", "self-contained"),
+            ("lib/rustlib/linked-target", "test-host"),
+            ("lib/rustlib/future-target/lib", "missing"),
+        ] {
+            let (dir, compiler) = toolchain_fixture();
+            let root = compiler.parent().unwrap().parent().unwrap();
+            std::os::unix::fs::symlink(target, root.join(relative)).unwrap();
+            let log = dir.path().join("probe.log");
+            let env = vec![("RABS_TEST_LOG".to_owned(), log.to_str().unwrap().to_owned())];
+            assert!(probe_toolchain(&compiler, &env).is_err(), "{relative}");
+            assert!(!log.exists(), "an incomplete inventory reached the probe");
+        }
+    }
+
+    #[test]
+    fn special_toolchain_library_members_are_not_silently_omitted() {
+        for relative in ["lib/libsocket.so", "lib/rustlib/test-host/lib/libsocket.rlib"] {
+            let (dir, compiler) = toolchain_fixture();
+            let root = compiler.parent().unwrap().parent().unwrap();
+            let _socket = std::os::unix::net::UnixListener::bind(root.join(relative)).unwrap();
+            let log = dir.path().join("probe.log");
+            let env = vec![("RABS_TEST_LOG".to_owned(), log.to_str().unwrap().to_owned())];
+            assert!(probe_toolchain(&compiler, &env).is_err());
+            assert!(!log.exists());
+        }
+    }
+
+    #[test]
+    fn a_probe_cannot_mix_version_output_with_changed_library_inputs() {
+        for mutation in ["add", "change"] {
+            let (dir, compiler) = toolchain_fixture();
+            let log = dir.path().join("probe.log");
+            let env = vec![
+                ("RABS_TEST_LOG".to_owned(), log.to_str().unwrap().to_owned()),
+                ("RABS_TEST_MUTATE".to_owned(), mutation.to_owned()),
+            ];
+            assert!(probe_toolchain(&compiler, &env).is_err(), "{mutation}");
+            assert_eq!(std::fs::read_to_string(&log).unwrap(), "probe\nprobe\n");
+            // A subsequent clean observation can accept the new generation.
+            assert!(probe_toolchain(&compiler, &[]).unwrap().still_current());
+        }
+    }
+
+    #[test]
+    fn public_toolchain_lookup_never_serves_stale_facts_when_rewarming_is_full() {
+        let (_dir, compiler) = toolchain_fixture();
+        let root = compiler.parent().unwrap().parent().unwrap();
+        let probed = probe_toolchain(&compiler, &[]).unwrap();
+        let expected = probed.facts.clone();
+        let facts = LiveFacts::new();
+        facts
+            .toolchains
+            .lock()
+            .unwrap()
+            .insert(compiler.clone(), Slot::Ready(Arc::new(probed)));
+        *facts.warming.lock().unwrap() = MAX_WARMING;
+        assert_eq!(facts.toolchain(&compiler, &[]).unwrap(), expected);
+        std::fs::write(root.join("lib/rustlib/test-host/lib/libnew.rlib"), b"new").unwrap();
+        assert_eq!(facts.toolchain(&compiler, &[]), Err(FactsMiss::Pending));
+        assert!(!facts.toolchains.lock().unwrap().contains_key(&compiler));
+        assert_eq!(*facts.warming.lock().unwrap(), MAX_WARMING);
+    }
+
+    #[test]
+    fn toolchain_guard_requires_the_matching_ready_observation() {
+        let (_dir, compiler) = toolchain_fixture();
+        let probed = probe_toolchain(&compiler, &[]).unwrap();
+        let expected = probed.facts.clone();
+        let facts = LiveFacts::new();
+        assert!(matches!(
+            facts.toolchain_guard(&compiler, &expected),
+            Err(FactsMiss::Pending)
+        ));
+        facts
+            .toolchains
+            .lock()
+            .unwrap()
+            .insert(compiler.clone(), Slot::Ready(Arc::new(probed)));
+        let guard = facts.toolchain_guard(&compiler, &expected).unwrap();
+        guard.verify_unchanged(&compiler).unwrap();
+        let mut wrong_facts = expected;
+        wrong_facts.verbose_version.push_str(" changed");
+        assert!(matches!(
+            facts.toolchain_guard(&compiler, &wrong_facts),
+            Err(FactsMiss::Pending)
+        ));
+        assert!(
+            guard
+                .verify_unchanged(&compiler.with_file_name("another-rustc"))
+                .unwrap_err()
+                .contains("different compiler")
+        );
+    }
+
+    #[test]
+    fn retained_toolchain_guard_cannot_adopt_a_refreshed_equal_byte_generation() {
+        let (_dir, compiler) = toolchain_fixture();
+        let root = compiler.parent().unwrap().parent().unwrap();
+        let probed = probe_toolchain(&compiler, &[]).unwrap();
+        let expected = probed.facts.clone();
+        let facts = LiveFacts::new();
+        facts
+            .toolchains
+            .lock()
+            .unwrap()
+            .insert(compiler.clone(), Slot::Ready(Arc::new(probed)));
+        let original = facts.toolchain_guard(&compiler, &expected).unwrap();
+        facts.toolchains.lock().unwrap().clear();
+        original.verify_unchanged(&compiler).unwrap();
+
+        let library = root.join("lib/libdriver.so");
+        let retained = root.join("lib/retained-runtime");
+        std::fs::rename(&library, &retained).unwrap();
+        std::fs::write(&library, b"runtime-v1").unwrap();
+        let refreshed = probe_toolchain(&compiler, &[]).unwrap();
+        assert_eq!(refreshed.facts, expected, "canonical bytes did not change");
+        facts
+            .toolchains
+            .lock()
+            .unwrap()
+            .insert(compiler.clone(), Slot::Ready(Arc::new(refreshed)));
+        facts
+            .toolchain_guard(&compiler, &expected)
+            .unwrap()
+            .verify_unchanged(&compiler)
+            .unwrap();
+        assert!(original.verify_unchanged(&compiler).is_err());
+    }
+
+    #[test]
+    fn retained_toolchain_guard_detects_membership_without_consuming_warm_capacity() {
+        let (_dir, compiler) = toolchain_fixture();
+        let root = compiler.parent().unwrap().parent().unwrap();
+        let probed = probe_toolchain(&compiler, &[]).unwrap();
+        let expected = probed.facts.clone();
+        let facts = LiveFacts::new();
+        facts
+            .toolchains
+            .lock()
+            .unwrap()
+            .insert(compiler.clone(), Slot::Ready(Arc::new(probed)));
+        let guard = facts.toolchain_guard(&compiler, &expected).unwrap();
+        *facts.warming.lock().unwrap() = MAX_WARMING;
+        std::fs::write(root.join("lib/rustlib/test-host/lib/libnew.rlib"), b"new").unwrap();
+        assert!(guard.verify_unchanged(&compiler).is_err());
+        assert!(matches!(
+            facts.toolchain_guard(&compiler, &expected),
+            Err(FactsMiss::Refused(_))
+        ));
+        assert_eq!(*facts.warming.lock().unwrap(), MAX_WARMING);
     }
 
     #[test]

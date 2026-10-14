@@ -1269,6 +1269,14 @@ impl WorkerSelector {
         let worker_id = WorkerId::new(&fallback_id);
         let worker = pool.get(&worker_id).await?;
 
+        // Last-success history is only a preference, never capability evidence.
+        // In particular, an exact runtime or named-tool requirement must not
+        // disappear when the normal eligibility pass finds no usable worker.
+        let capabilities = worker.capabilities().await;
+        if required_tool_capability_mismatch(request, &capabilities).is_some() {
+            return None;
+        }
+
         if self
             .disk_headroom_failure(&worker, &fallback_id, request)
             .await
@@ -4174,6 +4182,13 @@ fn required_tool_capability_mismatch(
     capabilities: &WorkerCapabilities,
 ) -> Option<String> {
     request.required_tools.iter().find_map(|tool| {
+        if let Some(check) = rch_common::tool_requirement::check_exact_runtime(
+            tool,
+            capabilities.node_version.as_deref(),
+            capabilities.bun_version.as_deref(),
+        ) {
+            return check.err();
+        }
         (!capabilities.tools_present.iter().any(|t| t == tool)).then(|| {
             if capabilities.tools_absent.iter().any(|t| t == tool) {
                 format!("capability_missing:tool:{tool}:probe_failed")
@@ -4183,6 +4198,9 @@ fn required_tool_capability_mismatch(
         })
     })
 }
+
+#[cfg(test)]
+mod exact_runtime_tests;
 
 fn rustup_component_capability_mismatch(
     request: &SelectionRequest,

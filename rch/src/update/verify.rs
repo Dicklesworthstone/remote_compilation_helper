@@ -153,24 +153,13 @@ pub(crate) async fn verify_signature(
     file_path: &std::path::Path,
     bundle_path: &std::path::Path,
 ) -> Result<bool, UpdateError> {
-    which("cosign").map_err(|_| {
+    let executable = which("cosign").map_err(|_| {
         UpdateError::SignatureVerificationFailed("cosign not found in PATH".to_string())
     })?;
 
-    let output = Command::new("cosign")
-        .arg("verify-blob")
-        .arg("--bundle")
-        .arg(bundle_path)
-        .arg("--certificate-identity-regexp")
-        .arg(RCH_RELEASE_IDENTITY_PATTERN)
-        .arg("--certificate-oidc-issuer")
-        .arg(GITHUB_ACTIONS_OIDC_ISSUER)
-        .arg(file_path)
-        .output()
-        .await
-        .map_err(|e| {
-            UpdateError::SignatureVerificationFailed(format!("Failed to execute cosign: {}", e))
-        })?;
+    let command = cosign_command(&executable, file_path, bundle_path);
+    let output =
+        capture_verifier_output(command, std::time::Duration::from_secs(120), 1024 * 1024).await?;
 
     if output.status.success() {
         Ok(true)
@@ -187,6 +176,107 @@ pub(crate) async fn verify_signature(
             }
         )))
     }
+}
+
+fn cosign_command(
+    executable: &std::path::Path,
+    file_path: &std::path::Path,
+    bundle_path: &std::path::Path,
+) -> Command {
+    // Resolve PATH exactly once. Paths and policy are separate arguments,
+    // never a shell command or options obtained from the signature bundle.
+    let mut command = Command::new(executable);
+    command
+        .arg("verify-blob")
+        .arg("--bundle")
+        .arg(bundle_path)
+        .arg("--certificate-identity-regexp")
+        .arg(RCH_RELEASE_IDENTITY_PATTERN)
+        .arg("--certificate-oidc-issuer")
+        .arg(GITHUB_ACTIONS_OIDC_ISSUER)
+        .arg(file_path);
+    command
+}
+
+async fn read_verifier_output(
+    mut reader: impl tokio::io::AsyncRead + Unpin,
+    limit: usize,
+) -> std::io::Result<Vec<u8>> {
+    let mut output = Vec::new();
+    let mut buffer = [0u8; 8192];
+    loop {
+        let length = match reader.read(&mut buffer).await {
+            Ok(0) => return Ok(output),
+            Ok(length) => length,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        if length > limit.saturating_sub(output.len()) {
+            return Err(std::io::Error::other(
+                "signature verifier output limit exceeded",
+            ));
+        }
+        output.extend_from_slice(&buffer[..length]);
+    }
+}
+
+/// Own the local verifier for its entire exchange, not merely until it exits.
+/// A zero status without complete stdout/stderr is not successful verification.
+/// The deadline covers pipe EOF as well as the process; overflow and read errors
+/// fail closed instead of accepting a valid-looking prefix. On cancellation,
+/// kill_on_drop terminates the owned local child. This is not a process-tree or
+/// cgroup containment guarantee for helpers launched by an external verifier.
+async fn capture_verifier_output(
+    mut command: Command,
+    budget: std::time::Duration,
+    output_limit: usize,
+) -> Result<std::process::Output, UpdateError> {
+    use std::process::Stdio;
+
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| {
+            UpdateError::SignatureVerificationFailed(format!("Failed to execute cosign: {}", e))
+        })?;
+    let stdout = child.stdout.take().ok_or_else(|| {
+        UpdateError::SignatureVerificationFailed("missing verifier stdout pipe".to_owned())
+    })?;
+    let stderr = child.stderr.take().ok_or_else(|| {
+        UpdateError::SignatureVerificationFailed("missing verifier stderr pipe".to_owned())
+    })?;
+
+    let result = tokio::time::timeout(budget, async {
+        let (stdout, stderr, status) = tokio::try_join!(
+            read_verifier_output(stdout, output_limit),
+            read_verifier_output(stderr, output_limit),
+            child.wait(),
+        )?;
+        Ok::<_, std::io::Error>(std::process::Output {
+            status,
+            stdout,
+            stderr,
+        })
+    })
+    .await;
+    let mut failure = match result {
+        Ok(Ok(output)) => return Ok(output),
+        Ok(Err(error)) => format!("cosign output collection failed: {error}"),
+        Err(_) => format!("cosign verification timed out after {budget:?}"),
+    };
+
+    // The exchange future has dropped its pipe readers and child borrow.
+    // Reap the local child explicitly on failure, with a separate small bound;
+    // never turn failure to kill or reap into successful verification.
+    match tokio::time::timeout(std::time::Duration::from_secs(2), child.kill()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => failure.push_str(&format!("; verifier teardown failed: {error}")),
+        Err(_) => failure.push_str("; verifier teardown timed out"),
+    }
+    Err(UpdateError::SignatureVerificationFailed(failure))
 }
 
 /// Public key dsr signs every rch release archive with (minisign key id
@@ -213,9 +303,37 @@ fn verify_minisign_with_key(
         .map_err(|e| fail(format!("invalid pinned minisign key: {e}")))?;
     let signature = minisign_verify::Signature::decode(signature_text)
         .map_err(|e| fail(format!("malformed .minisig: {e}")))?;
-    let bytes = std::fs::read(archive)
+    let mut file = std::fs::File::open(archive)
         .map_err(|e| fail(format!("cannot read {}: {e}", archive.display())))?;
-    key.verify(&bytes, &signature, false)
+    verify_minisign_reader(&mut file, &key, &signature)
+}
+
+const VERIFICATION_CHUNK_BYTES: usize = 64 * 1024;
+
+/// Verify the entire archive without allocating an archive-sized buffer.
+/// Streaming retains the existing prehashed-only policy, checks the key ID,
+/// and verifies BOTH the payload signature and authenticated comment. A read
+/// error, including one after the last payload byte, is never an EOF verdict.
+fn verify_minisign_reader(
+    reader: &mut impl std::io::Read,
+    key: &minisign_verify::PublicKey,
+    signature: &minisign_verify::Signature,
+) -> Result<(), UpdateError> {
+    let fail = |detail: String| UpdateError::SignatureVerificationFailed(detail);
+    let mut verifier = key
+        .verify_stream(signature)
+        .map_err(|e| fail(format!("minisign verification failed: {e}")))?;
+    let mut buffer = vec![0u8; VERIFICATION_CHUNK_BYTES];
+    loop {
+        match reader.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(length) => verifier.update(&buffer[..length]),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(fail(format!("cannot read signed archive: {error}"))),
+        }
+    }
+    verifier
+        .finalize()
         .map_err(|e| fail(format!("minisign verification failed: {e}")))
 }
 
@@ -290,6 +408,150 @@ xfmvGjlaWGXfdNKtFwBNm45V0V6VPZ3lLFhIzfLmQ7xUjPzacD1iHPC0MO2oczUBCt2gAZtoGnuQMxps
     #[test]
     fn pinned_release_key_parses() {
         minisign_verify::PublicKey::from_base64(RELEASE_MINISIGN_PUBLIC_KEY).unwrap();
+    }
+
+    struct Chunked<'a> {
+        remaining: &'a [u8],
+        chunk: usize,
+        interrupt: bool,
+        fail_at_eof: bool,
+        reads: usize,
+    }
+
+    impl std::io::Read for Chunked<'_> {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            assert!(buffer.len() <= VERIFICATION_CHUNK_BYTES);
+            self.reads += 1;
+            if self.interrupt {
+                self.interrupt = false;
+                return Err(std::io::ErrorKind::Interrupted.into());
+            }
+            if self.remaining.is_empty() && self.fail_at_eof {
+                return Err(std::io::Error::other("injected read failure"));
+            }
+            let length = self.remaining.len().min(self.chunk).min(buffer.len());
+            buffer[..length].copy_from_slice(&self.remaining[..length]);
+            self.remaining = &self.remaining[length..];
+            Ok(length)
+        }
+    }
+
+    #[test]
+    fn minisign_stream_accepts_short_reads_and_interrupted_io() {
+        let key = minisign_verify::PublicKey::from_base64(TEST_KEY).unwrap();
+        let signature = minisign_verify::Signature::decode(SIGNATURE).unwrap();
+        for chunk in 1..=PAYLOAD.len() + 1 {
+            let mut reader = Chunked {
+                remaining: PAYLOAD,
+                chunk,
+                interrupt: true,
+                fail_at_eof: false,
+                reads: 0,
+            };
+            verify_minisign_reader(&mut reader, &key, &signature).unwrap();
+            assert!(reader.remaining.is_empty());
+            assert!(
+                reader.reads >= 3,
+                "interruption, payload and EOF are all required"
+            );
+        }
+    }
+
+    #[test]
+    fn minisign_stream_never_turns_read_failure_into_verified_eof() {
+        let key = minisign_verify::PublicKey::from_base64(TEST_KEY).unwrap();
+        let signature = minisign_verify::Signature::decode(SIGNATURE).unwrap();
+        for data in [&PAYLOAD[..0], &PAYLOAD[..5], PAYLOAD] {
+            let mut reader = Chunked {
+                remaining: data,
+                chunk: 3,
+                interrupt: false,
+                fail_at_eof: true,
+                reads: 0,
+            };
+            let error = verify_minisign_reader(&mut reader, &key, &signature).unwrap_err();
+            assert!(
+                error.to_string().contains("injected read failure"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn minisign_stream_checks_truncation_appended_bytes_and_trusted_comment() {
+        let key = minisign_verify::PublicKey::from_base64(TEST_KEY).unwrap();
+        let signature = minisign_verify::Signature::decode(SIGNATURE).unwrap();
+        assert!(
+            verify_minisign_reader(&mut &PAYLOAD[..PAYLOAD.len() - 1], &key, &signature).is_err()
+        );
+        let mut appended = PAYLOAD.to_vec();
+        appended.push(0);
+        assert!(verify_minisign_reader(&mut appended.as_slice(), &key, &signature).is_err());
+
+        let changed = SIGNATURE.replace(
+            "trusted comment: rch test fixture",
+            "trusted comment: forged",
+        );
+        let changed = minisign_verify::Signature::decode(&changed).unwrap();
+        assert!(verify_minisign_reader(&mut &PAYLOAD[..], &key, &changed).is_err());
+    }
+
+    #[test]
+    fn minisign_stream_rejects_a_foreign_key_before_reading_payload() {
+        let key = minisign_verify::PublicKey::from_base64(RELEASE_MINISIGN_PUBLIC_KEY).unwrap();
+        let signature = minisign_verify::Signature::decode(SIGNATURE).unwrap();
+        let mut reader = Chunked {
+            remaining: PAYLOAD,
+            chunk: 1,
+            interrupt: false,
+            fail_at_eof: true,
+            reads: 0,
+        };
+        assert!(verify_minisign_reader(&mut reader, &key, &signature).is_err());
+        assert_eq!(reader.reads, 0);
+    }
+
+    #[test]
+    fn minisign_stream_rejects_legacy_mode_without_reading_payload() {
+        // Changing only the algorithm preserves a well-formed signature
+        // container, not its validity. Legacy mode must be refused upfront.
+        let legacy = SIGNATURE.replace("\nRUTZ", "\nRWTZ");
+        let signature = minisign_verify::Signature::decode(&legacy).unwrap();
+        let key = minisign_verify::PublicKey::from_base64(TEST_KEY).unwrap();
+        let mut reader = Chunked {
+            remaining: PAYLOAD,
+            chunk: 1,
+            interrupt: false,
+            fail_at_eof: true,
+            reads: 0,
+        };
+        assert!(verify_minisign_reader(&mut reader, &key, &signature).is_err());
+        assert_eq!(reader.reads, 0);
+    }
+
+    #[test]
+    fn minisign_stream_authenticates_bytes_beyond_the_first_buffer() {
+        // Throwaway Ed25519 key, independently signed over BLAKE2b-512 of
+        // 1 MiB + 7 zero bytes. No production secret or signer is required.
+        const KEY: &str = "RWRSQ0h0ZXN0MmBwaHoVCw4YFi8NW0uVH5/PWQ4eAfqB4KheU+mLK3vO";
+        const SIG: &str = "untrusted comment: rch stream test\n\
+RURSQ0h0ZXN0Mi8mprmagbFizyF2eUefaE/5/jwR84KN9Yyf3OO1y5NwJP1Oe2voxuVRAyhv8L89lerNzNkvMbAIcENd/nq7KA0=\n\
+trusted comment: rch bounded verification fixture\n\
+Vcz52SNOvweQ+rHxeLsHlafJK6iWhND+nbrEl2yDfYyQfv/z3NEBaNwcXNt5QN5NQX3dPBymXHGFiMas/eJGCg==\n";
+        let key = minisign_verify::PublicKey::from_base64(KEY).unwrap();
+        let signature = minisign_verify::Signature::decode(SIG).unwrap();
+        let mut bytes = vec![0u8; 1024 * 1024 + 7];
+        let mut reader = Chunked {
+            remaining: &bytes,
+            chunk: usize::MAX,
+            interrupt: false,
+            fail_at_eof: false,
+            reads: 0,
+        };
+        verify_minisign_reader(&mut reader, &key, &signature).unwrap();
+        assert!(reader.reads > 16);
+        bytes[VERIFICATION_CHUNK_BYTES + 1] = 1;
+        assert!(verify_minisign_reader(&mut bytes.as_slice(), &key, &signature).is_err());
     }
 }
 
@@ -718,5 +980,194 @@ mod tests {
             "real cosign-signed binary should verify"
         );
         // TEST PASS: real signature verified end-to-end
+    }
+}
+
+#[cfg(test)]
+mod bounded_verifier_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn cosign_preserves_exact_executable_paths_and_trust_policy_arguments() {
+        let executable = std::path::Path::new("/verifiers/cosign with spaces");
+        let archive = std::path::Path::new("/download/é ' archive.tar.gz");
+        let bundle = std::path::Path::new("/download/bundle;not-a-command.json");
+        let command = cosign_command(executable, archive, bundle);
+        assert_eq!(command.as_std().get_program(), executable.as_os_str());
+        let expected = [
+            std::ffi::OsStr::new("verify-blob"),
+            std::ffi::OsStr::new("--bundle"),
+            bundle.as_os_str(),
+            std::ffi::OsStr::new("--certificate-identity-regexp"),
+            std::ffi::OsStr::new(RCH_RELEASE_IDENTITY_PATTERN),
+            std::ffi::OsStr::new("--certificate-oidc-issuer"),
+            std::ffi::OsStr::new(GITHUB_ACTIONS_OIDC_ISSUER),
+            archive.as_os_str(),
+        ];
+        assert_eq!(command.as_std().get_args().collect::<Vec<_>>(), expected);
+    }
+
+    #[tokio::test]
+    async fn verifier_output_accepts_exact_bound_and_refuses_one_extra_byte() {
+        for length in [0, 1, 8191, 8192, 8193, 65536] {
+            let bytes = vec![0xf0; length];
+            assert_eq!(
+                read_verifier_output(bytes.as_slice(), length)
+                    .await
+                    .unwrap(),
+                bytes,
+            );
+            if length > 0 {
+                assert!(
+                    read_verifier_output(bytes.as_slice(), length - 1)
+                        .await
+                        .is_err()
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn shell(script: &str) -> Command {
+        let mut command = Command::new("/bin/sh");
+        command.arg("-c").arg(script);
+        command
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn verifier_collects_both_streams_and_preserves_nonzero_status() {
+        let output = capture_verifier_output(
+            shell("printf out; printf err >&2; exit 7"),
+            Duration::from_secs(5),
+            64,
+        )
+        .await
+        .unwrap();
+        assert_eq!(output.status.code(), Some(7));
+        assert_eq!(output.stdout, b"out");
+        assert_eq!(output.stderr, b"err");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn verifier_has_no_interactive_stdin_and_requires_successful_exit() {
+        let output = capture_verifier_output(
+            shell("if read -r input; then exit 9; fi; printf verified"),
+            Duration::from_secs(5),
+            64,
+        )
+        .await
+        .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"verified");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn verifier_bounds_each_output_stream_and_never_accepts_a_prefix() {
+        for script in [
+            "i=0; while [ $i -lt 100 ]; do printf 0123456789; i=$((i+1)); done",
+            "i=0; while [ $i -lt 100 ]; do printf 0123456789 >&2; i=$((i+1)); done",
+        ] {
+            let error = capture_verifier_output(shell(script), Duration::from_secs(5), 64)
+                .await
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("output limit exceeded"),
+                "{error}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn verifier_deadline_covers_a_silent_running_process() {
+        let error = capture_verifier_output(shell("exec sleep 30"), Duration::from_millis(30), 64)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("timed out"), "{error}");
+        assert!(!error.to_string().contains("teardown"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn verifier_zero_exit_without_pipe_eof_is_not_verification_success() {
+        // The short-lived helper deliberately retains both pipes. This tests
+        // the exchange deadline, NOT process-tree termination authority.
+        let error =
+            capture_verifier_output(shell("sleep 0.3 & exit 0"), Duration::from_millis(30), 64)
+                .await
+                .unwrap_err();
+        assert!(error.to_string().contains("timed out"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn missing_verifier_is_an_error_not_a_successful_empty_exchange() {
+        let root = tempfile::tempdir().unwrap();
+        let error = capture_verifier_output(
+            Command::new(root.path().join("absent-verifier")),
+            Duration::from_secs(5),
+            64,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("Failed to execute cosign"),
+            "{error}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn cancelling_verification_terminates_the_owned_local_child() {
+        let root = tempfile::tempdir().unwrap();
+        let pid_file = root.path().join("child.pid");
+        let mut command = shell("printf '%s' \"$$\" > \"$1\"; exec sleep 30");
+        command.arg("verifier-test").arg(&pid_file);
+        let task = tokio::spawn(capture_verifier_output(
+            command,
+            Duration::from_secs(30),
+            64,
+        ));
+        let pid = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(text) = tokio::fs::read_to_string(&pid_file).await
+                    && let Ok(pid) = text.parse::<u32>()
+                {
+                    break pid;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("test child did not become ready");
+        let stat_path = format!("/proc/{pid}/stat");
+        let initial = tokio::fs::read_to_string(&stat_path).await.unwrap();
+        let (_, fields) = initial.rsplit_once(") ").unwrap();
+        let start = fields.split_whitespace().nth(19).unwrap().to_owned();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                match tokio::fs::read_to_string(&stat_path).await {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+                    Err(error) => panic!("cannot inspect owned test child: {error}"),
+                    Ok(stat) => {
+                        let (_, fields) = stat.rsplit_once(") ").unwrap();
+                        let fields = fields.split_whitespace().collect::<Vec<_>>();
+                        // Reaping is separate from termination; a zombie no
+                        // longer executes. A reused PID is not this child.
+                        if matches!(fields[0], "Z" | "X") || fields[19] != start {
+                            break;
+                        }
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("cancelled verification left its local child running");
     }
 }

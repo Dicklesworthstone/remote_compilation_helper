@@ -138,7 +138,13 @@ rch_read_record() {
 # enumeration is unknown, never a fallback to a process-only empty-group claim.
 rch_group_state() {
     rch_check_procfs_namespace || return 2
-    rch_task_snapshot=$(LC_ALL=C ps -e -L -o pid= -o lwp= -o pgid= -o stat= -o nlwp=) || return 2
+    # Process observation is evidence, never an unbounded control dependency.
+    # Bound the COMPLETE census exchange, including an exited ps whose descendant
+    # still holds stdout open. rch_group_timeout prefers the fleet's GNU timeout,
+    # which kills the helper process group at the deadline. Timeout/failure stays
+    # unknown (2); it never becomes evidence that the workload is absent.
+    rch_task_snapshot=$(LC_ALL=C rch_control_capture 1s \
+        ps -e -L -o pid= -o lwp= -o pgid= -o stat= -o nlwp=) || return 2
     rch_snapshot=$(printf '%s\n' "$rch_task_snapshot" | LC_ALL=C awk -v group="$rch_pgid" -v observer="$$" '
         NF != 5 || $1 !~ /^[1-9][0-9]*$/ || $2 !~ /^[1-9][0-9]*$/ || $3 !~ /^[0-9]+$/ || $4 !~ /^[RSDTtKWPIXZx][A-Za-z0-9+<>-]*$/ || $5 !~ /^[1-9][0-9]*$/ { bad = 1; next }
         seen_task[$2]++ { bad = 1 }
@@ -213,6 +219,25 @@ rch_remote_witness_matches() {
     return 1
 }
 
+# Signal authority does not come from a system-wide census. Independently
+# prove that the observer is outside the target group in the same PID view,
+# then authenticate its live leader or THIS call's captured TERM witness.
+# Keep this guard at the signal boundary too: a failed census no longer supplies
+# its usual self-group check. A subshell must inspect its own PID, not just $$.
+rch_posix_signal_authorized() (
+    rch_requested_signal=$1
+    [ "${rch_identified:-0}" = 1 ] || exit 43
+    rch_check_procfs_namespace || exit 44
+    IFS= read -r rch_observer_stat < "/proc/$rch_self_pid/stat" 2>/dev/null || exit 44
+    case "$rch_observer_stat" in "$rch_self_pid ("*") "*) ;; *) exit 44;; esac
+    rch_observer_stat=${rch_observer_stat##*) }
+    set -- $rch_observer_stat
+    [ "$#" -ge 20 ] && rch_valid_pgid "$3" && [ "$3" != "$rch_pgid" ] || exit 44
+    rch_remote_leader_matches && exit 0
+    [ "$rch_requested_signal" = KILL ] && [ "${rch_term_sent:-0}" = 1 ] &&
+        rch_remote_witness_matches || exit 43
+)
+
 # Return 43 for unknown/reused identity. A pre-existing orphan is never adopted;
 # only an authenticated TERM in this call can authorize witnessed escalation.
 rch_signal_group() {
@@ -234,13 +259,39 @@ rch_signal_group() {
             *) return 43;;
         esac
     fi
-    if ! rch_remote_leader_matches; then
-        [ "$1" = KILL ] && [ "${rch_term_sent:-0}" -eq 1 ] &&
-            rch_remote_witness_matches || return 43
-    fi
+    rch_posix_signal_authorized "$1" || return $?
     # Revalidate immediately before EACH signal. dash requires no `--` here.
     kill -"$1" -"$rch_pgid" 2>/dev/null || :
 }
+
+# A retained identity from an earlier kernel boot cannot still execute. Check
+# this only on the fresh-channel recovery path, after parsing the exact build's
+# record. The live supervisor's in-memory cancellation path must never use a
+# changed receipt as an alternative to stopping its still-owned child.
+# 0: same boot; 1: previous boot is gone; 2: evidence unavailable. No signal,
+# cgroup operation, record mutation, or compiler-success claim occurs here.
+rch_recovery_boot_state() (
+    [ "${rch_identified:-0}" = 1 ] && rch_check_procfs_namespace || exit 2
+    current=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null) || exit 2
+    for value in "$rch_boot" "$current"; do
+        rch_valid_boot "$value" || exit 2
+        # The legacy shape check permits '-' in a UUID's hex groups. That is
+        # not sufficient evidence to retire execution without a process census.
+        compact=
+        while :; do
+            compact=$compact${value%%-*}
+            case "$value" in *-*) value=${value#*-};; *) break;; esac
+        done
+        [ "${#compact}" = 32 ] || exit 2
+        case "$compact" in *[!0-9a-f]*|00000000000000000000000000000000) exit 2;; esac
+    done
+    [ "$current" != "$rch_boot" ] || exit 0
+    # Repeat both observations before accepting the discontinuity. A changed
+    # or inaccessible view is unknown, never a reason to touch a reused PGID.
+    confirmed=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null) || exit 2
+    [ "$confirmed" = "$current" ] && rch_check_procfs_namespace || exit 2
+    exit 1
+)
 
 rch_remote_cancel() {
     # No authority may leak between calls, even when parsing the next record fails.
@@ -248,6 +299,14 @@ rch_remote_cancel() {
     rch_witness_identity=
     rch_term_sent=0
     rch_read_record "$1" "$2" || return $?
+    if [ "$rch_identified" = 1 ]; then
+        rch_recovery_boot_state
+        case $? in
+            0) ;; # Same boot: retain all existing live birth/scope checks.
+            1) return 0;; # Only the old execution is gone, not a successful build.
+            *) return 44;;
+        esac
+    fi
     rch_remote_cancel_loaded "$3"
 }
 
@@ -264,13 +323,12 @@ rch_remote_cancel_loaded() {
         0) return 0;;
         1) ;;
         2)
-            # A failed/incomplete process census cannot authorize POSIX
-            # signals, but must not strand a separately authenticated scope.
-            # Skip graceful group signalling and attempt only cgroup.kill:
-            # rch_signal_group revalidates the full V2 binding and pins its
-            # inode before writing. Unknown/reused scope authority still
-            # refuses, and the post-kill census below remains mandatory.
-            [ "${rch_scope_bound:-0}" = 1 ] || return 44
+            # A broken census is neither stop authority nor death proof.
+            # V2 has its separately bound cgroup. V1 may stop ONLY if the live
+            # leader independently authenticates a group outside our own; no
+            # witnesses from a prior call survive the reset above. Skip TERM
+            # because this census cannot safely establish escalation witnesses.
+            [ "${rch_scope_bound:-0}" = 1 ] || rch_posix_signal_authorized KILL || return 44
             rch_mode=kill;;
         *) return 44;;
     esac
@@ -285,13 +343,20 @@ rch_remote_cancel_loaded() {
         case $? in
             0) return 0;;
             1) ;;
-            # Losing the census after TERM must not suppress authenticated
-            # scoped escalation either. V1 still needs its live witnesses.
-            2) [ "${rch_scope_bound:-0}" = 1 ] || return 44;;
+            # After our TERM the leader may be gone. An already captured live
+            # witness can still authenticate escalation despite census loss.
+            # The signal boundary rechecks it; the post-kill census is mandatory.
+            2) [ "${rch_scope_bound:-0}" = 1 ] || rch_posix_signal_authorized KILL || return 44;;
             *) return 44;;
         esac
     fi
-    rch_signal_group KILL || return $?
+    # 43: the recorded leader no longer authenticates the group, so nothing may
+    # be signalled. The group's own deadline watchdog may already have killed
+    # it (the leader dies first, members a moment later): keep the census
+    # running and confirm only if the group empties; otherwise still 43.
+    rch_kill_status=0
+    rch_signal_group KILL || rch_kill_status=$?
+    case "$rch_kill_status" in 0|43) ;; *) return "$rch_kill_status";; esac
     rch_attempt=0
     # Each scope observation uses two individually bounded manager reads.
     # Keep fresh-channel cleanup within the existing 45-second SSH budget.
@@ -299,10 +364,12 @@ rch_remote_cancel_loaded() {
     [ "${rch_scope_bound:-0}" != 1 ] || rch_attempt_limit=8
     while [ "$rch_attempt" -lt "$rch_attempt_limit" ]; do
         rch_group_state
-        case $? in 0) return 0;; 1) ;; *) return 44;; esac
+        # Without stop authority, an unavailable census keeps the refusal.
+        case $? in 0) return 0;; 1) ;; *) [ "$rch_kill_status" = 0 ] || return 43; return 44;; esac
         rch_attempt=$((rch_attempt + 1))
         sleep 0.1 || return 44
     done
+    [ "$rch_kill_status" = 0 ] || return "$rch_kill_status"
     return 45
 }
 
@@ -431,18 +498,88 @@ rch_policy_read_file() {
 # Capture stderr too, so it cannot keep the outer SSH pipe open independently.
 # Successful warnings become unrecognized response data (fail closed); failed
 # exchanges retain their diagnostic on stderr. No payload is evaluated as code.
+# GNU timeout kills its whole process group at the deadline; uutils timeout
+# (Ubuntu 25.10+ /usr/bin/timeout) kills only its direct child, so a pipe
+# holder survives. Ubuntu keeps GNU's as gnutimeout; Homebrew as gtimeout.
+rch_group_timeout() {
+    if command -v gnutimeout >/dev/null 2>&1; then
+        gnutimeout "$@"
+    elif command -v gtimeout >/dev/null 2>&1; then
+        gtimeout "$@"
+    else
+        timeout "$@"
+    fi
+}
+
 rch_control_capture() {
     case "$1" in 1s|5s) ;; *) return 125;; esac
-    timeout --signal=KILL "$1" /bin/sh -c '
-        shift
-        __rch_control_output=$("$@" 2>&1)
-        __rch_control_status=$?
-        if [ "$__rch_control_status" -ne 0 ]; then
-            printf "%s\n" "$__rch_control_output" >&2
-            exit "$__rch_control_status"
-        fi
-        printf "%s\n" "$__rch_control_output"
-    ' rch-control "$@" </dev/null
+    rch_control_timeout=$1
+    shift
+    # Never place untrusted control bytes in a shell variable before validating
+    # them: command substitution can discard NUL and turn malformed evidence
+    # into a valid-looking systemd property. Capture raw bytes in a private,
+    # bounded file owned by this still-live observer, outside the timed group.
+    rch_control_base=${TMPDIR:-/tmp}
+    case "$rch_control_base" in /*) ;; *) return 125;; esac
+    rch_control_dir=$(umask 077; mktemp -d "$rch_control_base/rch-control-output.XXXXXXXXXX") || return 125
+    rch_control_file=$rch_control_dir/output
+    rch_control_pipe=$rch_control_dir/pipe
+    (umask 077; : > "$rch_control_file" && mkfifo -m 600 "$rch_control_pipe") || {
+        rm -f -- "$rch_control_pipe" "$rch_control_file"
+        rmdir -- "$rch_control_dir" 2>/dev/null || :
+        return 125
+    }
+    rch_control_status=0
+    rch_group_timeout --signal=KILL "$rch_control_timeout" /bin/sh -c '
+        output=$1
+        pipe=$2
+        shift 2
+        cat -- "$pipe" > "$output" &
+        reader=$!
+        "$@" > "$pipe" 2>&1 &
+        command=$!
+        wait "$command"; status=$?
+        wait "$reader" || exit 125
+        exit "$status"
+    ' rch-control "$rch_control_file" "$rch_control_pipe" "$@" </dev/null || rch_control_status=$?
+
+    rm -f -- "$rch_control_pipe"
+
+    rch_control_metadata=$(LC_ALL=C stat -c '%a:%h:%s' -- "$rch_control_file" 2>/dev/null) || {
+        rm -f -- "$rch_control_file"
+        rmdir -- "$rch_control_dir" 2>/dev/null || :
+        return 125
+    }
+    case "$rch_control_metadata" in
+        600:1:*) ;;
+        *) rm -f -- "$rch_control_file"; rmdir -- "$rch_control_dir" 2>/dev/null || :; return 125;;
+    esac
+    rch_control_size=${rch_control_metadata##*:}
+    case "$rch_control_size" in
+        ''|*[!0-9]*) rm -f -- "$rch_control_file"; rmdir -- "$rch_control_dir" 2>/dev/null || :; return 125;;
+    esac
+    rch_control_limit=65536
+    [ "${1:-}" != ps ] || rch_control_limit=1048576
+    if [ "$rch_control_size" -gt "$rch_control_limit" ] ||
+        ! LC_ALL=C tr -cd '\11\12\40-\176' < "$rch_control_file" | cmp -s - "$rch_control_file"; then
+        rm -f -- "$rch_control_file"
+        rmdir -- "$rch_control_dir" 2>/dev/null || :
+        return 125
+    fi
+
+    if [ "$rch_control_status" -ne 0 ]; then
+        cat -- "$rch_control_file" >&2
+        rch_control_output_status=$?
+        rm -f -- "$rch_control_file"
+        rmdir -- "$rch_control_dir" 2>/dev/null || :
+        [ "$rch_control_output_status" -eq 0 ] || return 125
+        return "$rch_control_status"
+    fi
+    cat -- "$rch_control_file"
+    rch_control_output_status=$?
+    rm -f -- "$rch_control_file"
+    rmdir -- "$rch_control_dir" 2>/dev/null || :
+    [ "$rch_control_output_status" -eq 0 ] || return 125
 }
 
 rch_policy_systemctl() {

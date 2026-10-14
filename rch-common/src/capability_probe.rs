@@ -715,6 +715,21 @@ pub fn assess_admissibility(facts: &ProbedFacts, req: &CapabilityRequirement) ->
     // would be indistinguishable from the job's own nonzero exit (job mode
     // surfaces remote status verbatim).
     for needed in &req.needs_tools {
+        // Share exact-version semantics with the daemon's live selection gate.
+        // A versioned requirement cannot fall back to an operator-named label.
+        if let Some(check) = crate::tool_requirement::check_exact_runtime(
+            needed,
+            facts.runtimes.node_version.as_deref(),
+            facts.runtimes.bun_version.as_deref(),
+        ) {
+            if let Err(detail) = check {
+                return CapabilityVerdict::Rejected {
+                    reason: IncidentReasonCode::MissingRuntimeToolchainTarget,
+                    detail,
+                };
+            }
+            continue;
+        }
         if !facts.has_tool(needed) {
             return CapabilityVerdict::Rejected {
                 reason: IncidentReasonCode::MissingRuntimeToolchainTarget,

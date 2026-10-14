@@ -122,17 +122,20 @@ class NamespaceOrchestrationWiringTests(unittest.TestCase):
         plan = body.index("source_namespace::build_source_roots(")
         journal = body.index("recovery::RecoverySession::begin(")
         pair = body.index("acquire_clean_overlay_source_pair(")
-        acquire = body.index("acquire_remote_source_authority_lock(")
+        # 0f5694ce (#105) acquires through the bounded same-worker retry.
+        acquire = body.index("source_namespace::acquire_source_authority_with_retry(")
         self.assertLess(initialize, plan)
         self.assertLess(plan, journal)
         self.assertLess(journal, pair)
         self.assertLess(pair, acquire)
         self.assertNotIn("canonical_root()", body[plan:journal])
         self.assertNotIn("alias_root()", body[plan:journal])
-        self.assertIn("source_pair_pool.as_ref().and(overlay_remote_root.as_deref())", body[plan:journal])
-        self.assertIn("retained_source_root.as_deref()", body[plan:journal])
-        self.assertIn("source_freshness_control.as_deref()", body[plan:journal])
-        self.assertIn("source_target_root.as_deref()", body[plan:journal])
+        # rustfmt may split these chains across lines; compare without whitespace.
+        planned = "".join(body[plan:journal].split())
+        self.assertIn("source_pair_pool.as_ref().and(overlay_remote_root.as_deref())", planned)
+        self.assertIn("retained_source_root.as_deref()", planned)
+        self.assertIn("source_freshness_control.as_deref()", planned)
+        self.assertIn("source_target_root.as_deref()", planned)
         repair = body.split("    ensure_worker_projects_topology(", 1)[1].split(")\n", 1)[0]
         self.assertIn("false,", repair, "repair must not recreate shared bases under a build claim")
 

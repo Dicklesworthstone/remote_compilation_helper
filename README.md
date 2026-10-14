@@ -749,6 +749,10 @@ strategy = "balanced"
 # Reserve this much free disk, then budget space for each concurrent slot (GiB).
 min_free_gb = 10.0
 disk_gb_per_slot = 10.0
+# A worker at or below this free-disk ratio gets no slots (rchd reads it at start).
+# disk_critical_free_ratio = 0.05
+# Judge large disks by absolute headroom: the ratio rule applies only at or below this many GB.
+# disk_critical_ratio_cap_gb = 25.0
 
 [self_healing]
 hook_starts_daemon = true
@@ -837,6 +841,14 @@ builds retain their reservations when capacity drops; new work waits for space.
 `rch workers list` reports the effective total when the daemon is reachable.
 Change the budget with `rch config set selection.disk_gb_per_slot 10` and restart
 the daemon to apply it.
+
+Separately, rchd marks a worker Critical, with no slots at all, when its free
+space falls to `selection.disk_critical_free_ratio` (default `0.05`) or to 10 GB.
+On a 900 GB worker the ratio line is 45 GB. Set `selection.disk_critical_ratio_cap_gb`
+(for example `25.0`) so the ratio rule applies only at or below that many free GB and
+large disks are judged by absolute headroom. Both keys go in the daemon's
+`config.toml` and take effect when rchd restarts; the defaults keep the ratio rule
+unconditional.
 
 Balanced selection also favors free disk before a worker reaches the admission
 floor. `selection.weights.disk` (default `0.2`, range `0` to `1`) adds disk

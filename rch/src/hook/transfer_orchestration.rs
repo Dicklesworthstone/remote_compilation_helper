@@ -55,9 +55,8 @@ use super::source_fidelity::{
     verify_owned_source_content_roots, verify_source_content_roots,
 };
 use super::ssh::{
-    acquire_clean_overlay_source_pair, acquire_remote_source_authority_lock,
-    ensure_worker_projects_topology, remote_preflight_topology_policy,
-    worker_projects_topology_requires_initialization,
+    acquire_clean_overlay_source_pair, ensure_worker_projects_topology,
+    remote_preflight_topology_policy, worker_projects_topology_requires_initialization,
 };
 use super::*;
 
@@ -1381,7 +1380,7 @@ async fn execute_remote_compilation_inner(
             mutable_source_authority_roots.len(),
             worker_config.id
         ));
-        let guard = acquire_remote_source_authority_lock(
+        let guard = source_namespace::acquire_source_authority_with_retry(
             &worker_config,
             &mutable_source_authority_roots,
             source_pair_lock.as_mut(),

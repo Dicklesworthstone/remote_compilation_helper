@@ -822,7 +822,9 @@ mod profile_artifact_tests {
                 false,
             ),
         ] {
-            let root = tempfile::tempdir().unwrap().keep();
+            // Cargo reports artifact paths under its canonical cwd; on macOS
+            // the temp dir is reached through the /var -> /private/var link.
+            let root = std::fs::canonicalize(tempfile::tempdir().unwrap().keep()).unwrap();
             let source = root.join("source project");
             let local_project = root.join("local project");
             std::fs::create_dir_all(source.join("src")).unwrap();

@@ -5,15 +5,15 @@
 //! the units, chooses the flags, pipelines dependents on `.rmeta`
 //! notifications and fingerprints the results, exactly as for an agent.
 //!
-//! The registry is a Cargo directory source placed where Cargo unpacks
-//! registry packages (`$CARGO_HOME/registry/src/<index>/<pkg>-<ver>`), so
-//! the build is offline yet every dependency has the registry layout the
-//! lane admits.
+//! Sources use both Cargo's registry layout
+//! (`$CARGO_HOME/registry/src/<index>/<pkg>-<ver>`) and a separate `vendor/`
+//! directory outside CARGO_HOME. Both are offline Cargo directory sources;
+//! the latter must pass the live directory-source witness/capture adapter.
 //!
 //! What it proves:
 //!
-//! 1. worktrees climb the serving ladder for BOTH the leaf dependency and
-//!    the dependency that consumes it (first commits, then verifications);
+//! 1. the FIRST cold build commits every dependency without throwaway builds;
+//!    later worktrees climb the same keys' verification/serving ladder;
 //! 2. a later worktree's `cargo build` is served every dependency compile:
 //!    the daemon answers hit -> served and admits no execution, the build
 //!    succeeds, and the served `.rlib`/`.rmeta` bytes equal stock Cargo's;
@@ -22,6 +22,10 @@
 //!    rebuilds only that member;
 //! 4. the wall-clock of a served build versus a stock build is recorded
 //!    (printed, not asserted: tiny fixtures say nothing about real crates).
+//! 5. already-built large dependency metadata and a large source package
+//!    both warm during a single real Cargo invocation, then reach serving.
+//! 6. vendored source edits and added unlisted files miss even when Cargo's
+//!    checksum document remains byte-identical; rebuilt bytes match stock.
 #![cfg(target_os = "linux")]
 
 use std::path::{Path, PathBuf};
@@ -162,16 +166,30 @@ struct World {
     root: PathBuf,
     socket: PathBuf,
     rustc: PathBuf,
+    source: PathBuf,
 }
 
 impl World {
     fn new(root: &Path) -> Self {
+        Self::with_source(
+            root,
+            root.join("cargo-home/registry/src").join(INDEX),
+        )
+    }
+
+    fn vendored(root: &Path) -> Self {
+        Self::with_source(root, root.join("vendor"))
+    }
+
+    fn with_source(root: &Path, source: PathBuf) -> Self {
         let world = Self {
             root: root.to_path_buf(),
             socket: root.join("d.sock"),
             rustc: real_rustc(),
+            source,
         };
         std::fs::create_dir_all(world.root.join("home")).unwrap();
+        std::fs::create_dir_all(world.cargo_home()).unwrap();
         let registry = world.registry();
         std::fs::create_dir_all(&registry).unwrap();
         std::fs::write(
@@ -191,9 +209,9 @@ impl World {
         self.root.join("cargo-home")
     }
 
-    /// Registry packages live exactly where Cargo unpacks downloaded ones.
+    /// Cargo's directory source, in either registry-cache or vendored layout.
     fn registry(&self) -> PathBuf {
-        self.cargo_home().join("registry/src").join(INDEX)
+        self.source.clone()
     }
 
     fn write_dependency(&self, name: &str, dependencies: &str, lib: &str) {
@@ -230,11 +248,9 @@ impl World {
         worktree
     }
 
-    /// `cargo build -v` as an agent would run it, with or without RABS.
-    fn cargo_build(&self, worktree: &Path, wrapped: bool) -> Output {
+    fn cargo_command(&self, worktree: &Path, wrapped: bool) -> Command {
         let mut cargo = Command::new(env!("CARGO"));
         cargo
-            .args(["build", "-v"])
             .current_dir(worktree)
             .env_clear()
             .env("PATH", "/usr/local/bin:/usr/bin:/bin")
@@ -247,7 +263,16 @@ impl World {
         if wrapped {
             cargo.env("RUSTC_WRAPPER", wrap());
         }
-        let output = cargo.output().expect("run cargo");
+        cargo
+    }
+
+    /// `cargo build -v` as an agent would run it, with or without RABS.
+    fn cargo_build(&self, worktree: &Path, wrapped: bool) -> Output {
+        let output = self
+            .cargo_command(worktree, wrapped)
+            .args(["build", "-v"])
+            .output()
+            .expect("run cargo");
         assert!(
             output.status.success(),
             "cargo build failed in {}:\n{}",
@@ -307,8 +332,17 @@ fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
 }
 
+fn assert_preparing(decisions: &[serde_json::Value], reason: &str) {
+    assert!(
+        decisions.iter().any(|decision| {
+            decision["decision"] == "preparing" && decision["reason"] == reason
+        }),
+        "no {reason} observation in real Cargo build: {:?}",
+        tally(decisions)
+    );
+}
+
 #[test]
-#[allow(clippy::too_many_lines)]
 fn real_cargo_worktrees_receive_served_dependencies_that_stay_fresh() {
     // Short root: the daemon socket path must fit sun_path.
     let dir = tempfile::Builder::new()
@@ -316,6 +350,13 @@ fn real_cargo_worktrees_receive_served_dependencies_that_stay_fresh() {
         .tempdir_in("/tmp")
         .unwrap();
     let world = World::new(dir.path());
+    let _daemon = exercise_cargo_worktrees(&world);
+}
+
+/// The exact same acceptance ladder for registry and directory-source lanes.
+/// Return the daemon so the vendored case can check later source invalidation.
+#[allow(clippy::too_many_lines)]
+fn exercise_cargo_worktrees(world: &World) -> Daemon {
     world.write_dependency(
         "leaf",
         "",
@@ -346,38 +387,22 @@ fn real_cargo_worktrees_receive_served_dependencies_that_stay_fresh() {
     let expected_output = World::run_app(&stock);
     assert!(expected_output.starts_with("12 "), "{expected_output}");
 
-    // 1. The daemon hashes the toolchain in the background; until it is
-    //    warm every request is shadowed. Use throwaway worktrees until a
-    //    build's dependency compiles are admitted and commit.
-    let deadline = Instant::now() + Duration::from_secs(600);
-    let mut attempt = 0;
-    loop {
-        attempt += 1;
-        let worktree = world.worktree(&format!("warm-{attempt}"));
-        let mark = daemon.decisions().len();
-        world.cargo_build(&worktree, true);
-        let decisions = daemon.settled_since(mark);
-        if count(&decisions, "committed") > 0 {
-            assert_eq!(
-                count(&decisions, "committed"),
-                DEPENDENCIES.len(),
-                "every dependency compile commits in the same build: {:?}",
-                tally(&decisions)
-            );
-            assert_eq!(World::run_app(&worktree), expected_output);
-            break;
-        }
-        assert!(
-            decisions
-                .iter()
-                .all(|decision| decision["decision"] == "toolchain-warming"
-                    || decision["decision"] == "shadow"),
-            "unexpected decisions while warming: {:?}",
-            tally(&decisions)
-        );
-        assert!(Instant::now() < deadline, "toolchain probe never warmed");
-        std::thread::sleep(Duration::from_millis(250));
-    }
+    // 1. One FIRST cold build, not a retry-until-green warmup loop. Every
+    //    dependency must wait for live facts and populate the cache in this
+    //    invocation. Stock Cargo above never contacted this daemon.
+    let cold = world.worktree("cold");
+    let mark = daemon.decisions().len();
+    let cold_build = world.cargo_build(&cold, true);
+    let decisions = daemon.settled_since(mark);
+    assert_preparing(&decisions, "toolchain-facts-pending");
+    assert_eq!(
+        (count(&decisions, "execute"), count(&decisions, "committed")),
+        (DEPENDENCIES.len(), DEPENDENCIES.len()),
+        "the first cold build must admit and commit every dependency: {:?}\ncargo:\n{}",
+        tally(&decisions),
+        stderr(&cold_build)
+    );
+    assert_eq!(World::run_app(&cold), expected_output);
 
     // Two more worktrees: the SAME keys, each a verifying execution.
     for name in ["verify-1", "verify-2"] {
@@ -459,4 +484,191 @@ fn real_cargo_worktrees_receive_served_dependencies_that_stay_fresh() {
     }
     assert!(log.contains("Compiling app"), "{log}");
     assert_eq!(World::run_app(&served), "edited 4\n");
+    daemon
+}
+
+fn admitted_key(decisions: &[serde_json::Value], unit: &str) -> String {
+    let executions: Vec<_> = decisions
+        .iter()
+        .filter(|decision| decision["decision"] == "execute" && decision["crate"] == unit)
+        .collect();
+    assert_eq!(executions.len(), 1, "{unit}: {decisions:?}");
+    let key = executions[0]["key"].as_str().expect("admission key");
+    assert!(!key.is_empty());
+    assert!(
+        decisions
+            .iter()
+            .any(|decision| decision["decision"] == "committed" && decision["key"] == key),
+        "{unit} did not publish its new input identity: {decisions:?}"
+    );
+    key.to_owned()
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn real_cargo_vendored_dependencies_serve_and_invalidate_actual_source_changes() {
+    let dir = tempfile::Builder::new()
+        .prefix("rc-vendor")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let world = World::vendored(dir.path());
+    assert!(!world.registry().starts_with(world.cargo_home()));
+    let daemon = exercise_cargo_worktrees(&world);
+    let original_key = daemon
+        .decisions()
+        .into_iter()
+        .find(|decision| decision["decision"] == "execute" && decision["crate"] == "middle")
+        .expect("the cold build admitted middle")["key"]
+        .as_str()
+        .expect("admission key")
+        .to_owned();
+    let package = world.registry().join("middle-1.0.0");
+    let checksum_path = package.join(".cargo-checksum.json");
+    let checksum = std::fs::read(&checksum_path).unwrap();
+    // The empty file map is valid Cargo directory-source input. Keep it
+    // unchanged while changing what rustc actually reads: RABS must hash
+    // sealed source bytes, not trust the checksum document as an oracle.
+    assert_eq!(checksum, b"{\"files\":{}}");
+    std::fs::write(
+        package.join("src/lib.rs"),
+        "pub fn quad(x: u32) -> u32 { side::shift(leaf::twice(leaf::twice(x))) + 1 }\n\
+         pub fn leaf_origin() -> &'static str { leaf::origin() }\n",
+    )
+    .unwrap();
+    let stock = world.worktree("stock-changed");
+    world.cargo_build(&stock, false);
+    let expected = World::run_app(&stock);
+    assert!(expected.starts_with("13 "), "{expected}");
+    assert_ne!(expected, World::run_app(&world.root.join("stock")));
+
+    let changed = world.worktree("changed");
+    let mark = daemon.decisions().len();
+    world.cargo_build(&changed, true);
+    let decisions = daemon.settled_since(mark);
+    let changed_key = admitted_key(&decisions, "middle");
+    assert_ne!(changed_key, original_key);
+    assert_eq!(World::run_app(&changed), expected);
+    assert_eq!(
+        library_outputs(&changed, "middle"),
+        library_outputs(&stock, "middle")
+    );
+    assert_eq!(std::fs::read(&checksum_path).unwrap(), checksum);
+
+    // Negative membership is also semantic: a newly present file is an input
+    // even if it is not listed by the checksum document or read by this rustc.
+    std::fs::write(package.join("unlisted.txt"), b"new package member\n").unwrap();
+    let added = world.worktree("added-input");
+    let mark = daemon.decisions().len();
+    world.cargo_build(&added, true);
+    let decisions = daemon.settled_since(mark);
+    assert_ne!(admitted_key(&decisions, "middle"), changed_key);
+    assert_eq!(World::run_app(&added), expected);
+    assert_eq!(
+        library_outputs(&added, "middle"),
+        library_outputs(&stock, "middle")
+    );
+    assert_eq!(std::fs::read(&checksum_path).unwrap(), checksum);
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn real_cargo_warms_large_packages_and_prebuilt_dependencies_before_execution() {
+    let dir = tempfile::Builder::new()
+        .prefix("rc-large")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let world = World::new(dir.path());
+    // Both the source package and the external .rmeta must cross the live
+    // observer's 4 MiB synchronous budget. Non-repeating bytes avoid relying
+    // on an artifact compressor retaining a large all-zero allocation.
+    let mut state = 0x9e37_79b9_u32;
+    let payload: Vec<u8> = (0..5 * 1024 * 1024)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state.to_le_bytes()[0]
+        })
+        .collect();
+    world.write_dependency(
+        "leaf",
+        "",
+        "pub const DATA: &[u8; 5 * 1024 * 1024] = include_bytes!(\"payload.bin\");\n\
+         #[inline] pub fn twice(x: u32) -> u32 { x * 2 }\n\
+         pub fn origin() -> &'static str { file!() }\n",
+    );
+    world.write_dependency(
+        "middle",
+        "leaf = \"1.0\"\n",
+        "const LOCAL: &[u8] = include_bytes!(\"payload.bin\");\n\
+         pub fn quad(x: u32) -> u32 {\n\
+             leaf::twice(leaf::twice(x)) + u32::from(leaf::DATA[0] ^ LOCAL[0])\n\
+         }\n\
+         pub fn leaf_origin() -> &'static str { leaf::origin() }\n",
+    );
+    for name in ["leaf", "middle"] {
+        std::fs::write(
+            world.registry().join(format!("{name}-1.0.0/src/payload.bin")),
+            &payload,
+        )
+        .unwrap();
+    }
+    let worktree = world.worktree("prebuilt");
+    world.cargo_build(&worktree, false);
+    let expected_output = World::run_app(&worktree);
+    assert!(expected_output.starts_with("12 "), "{expected_output}");
+    let expected_artifacts = library_outputs(&worktree, "middle");
+    assert!(
+        library_outputs(&worktree, "leaf")
+            .iter()
+            .any(|(name, bytes)| name.ends_with(".rmeta") && bytes.len() > 4 * 1024 * 1024),
+        "fixture must produce genuinely large compiler metadata, not synthetic dependency bytes"
+    );
+    // Start after stock compilation: the daemon cannot have memoized the
+    // leaf's metadata via output capture. Cargo itself preserves the fresh
+    // leaf while cleaning middle; no handcrafted rustc argv or fake hits.
+    let daemon = Daemon::start(&world.root, &world.socket);
+    for outcome in ["committed", "verified", "verified", "served"] {
+        let clean = world
+            .cargo_command(&worktree, false)
+            .args(["clean", "-p", "middle"])
+            .output()
+            .expect("cargo clean middle");
+        assert!(clean.status.success(), "{}", stderr(&clean));
+        let mark = daemon.decisions().len();
+        let build = world.cargo_build(&worktree, true);
+        let decisions = daemon.settled_since(mark);
+        assert!(stderr(&build).contains("Fresh leaf"), "{}", stderr(&build));
+        if outcome == "committed" {
+            for reason in [
+                "toolchain-facts-pending",
+                "package-facts-pending",
+                "dependency-facts-pending",
+            ] {
+                assert_preparing(&decisions, reason);
+            }
+        }
+        assert_eq!(count(&decisions, outcome), 1, "{:?}", tally(&decisions));
+        assert_eq!(
+            count(&decisions, "execute"),
+            usize::from(outcome != "served"),
+            "{:?}",
+            tally(&decisions)
+        );
+        if outcome == "served" {
+            assert_eq!(count(&decisions, "hit"), 1, "{:?}", tally(&decisions));
+        }
+        assert_eq!(World::run_app(&worktree), expected_output);
+        assert_eq!(library_outputs(&worktree, "middle"), expected_artifacts);
+    }
+    let mark = daemon.decisions().len();
+    let fresh = world.cargo_build(&worktree, true);
+    for name in ["leaf", "middle", "app"] {
+        assert!(
+            stderr(&fresh).contains(&format!("Fresh {name}")),
+            "{}",
+            stderr(&fresh)
+        );
+    }
+    assert_eq!(daemon.decisions().len(), mark);
 }

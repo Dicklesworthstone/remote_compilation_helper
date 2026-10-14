@@ -1,0 +1,550 @@
+#!/usr/bin/env python3
+"""Opt-in Cargo entry point for the existing RABS live dependency lane.
+
+This is a launcher, not a cache or a second build executor. Cargo still plans
+and runs the build; rabs-wrap and rabsd retain all admission, capture, sampling,
+publication and compiler-skip authority. Requires Linux and Python 3.9+.
+"""
+
+import fcntl
+import json
+import os
+from pathlib import Path
+import selectors
+import shutil
+import socket
+import stat
+import struct
+import subprocess
+import sys
+import time
+
+
+MAX_FRAME = 64 * 1024
+DEFAULT_STARTUP_MS = 5000
+MAX_STARTUP_MS = 30000
+HELLO = {
+    "kind": "hello",
+    "transport": {"minimum_compatible": 1, "current": 1},
+    "application": {"minimum_compatible": 1, "current": 1},
+}
+HELP = """Usage: cargo rabs [--rabs-no-start] [--rabs-require-daemon] [--] [CARGO ARGS...]
+
+Run Cargo through RABS's evidence-gated live dependency cache. No arguments
+means `build`. Cargo arguments after the first non-launcher option are passed
+unchanged; `cargo +nightly rabs build` retains Cargo's selected toolchain.
+
+  --rabs-no-start        Only use an already-running daemon.
+  --rabs-require-daemon  Fail setup instead of falling back to stock Cargo.
+  --help                Show this help without starting a daemon or Cargo.
+
+The first invocation can start one shared rabsd with RABS_LIVE_DEPENDENCY=1.
+Later invocations reuse it. An existing daemon is never stopped, replaced, or
+reconfigured: its live/shadow setting remains its own. A connected daemon is
+not a promise of a cache hit. Unsupported units, warming facts and required
+verification runs still compile normally. This is the host-local dependency
+lane, not canonical cross-host execution or a cached build-script executor.
+
+RABS_CONFIG, RABS_SOCKET_PATH and RABS_STATE_DIR retain rabsd's meanings.
+CARGO_RABS_DAEMON and CARGO_RABS_WRAP select executable paths explicitly;
+otherwise installed siblings, PATH, then this checkout's target/release are
+searched. CARGO_RABS_STARTUP_MS bounds setup (default 5000, maximum 30000).
+
+An existing RUSTC_WRAPPER or CARGO_BUILD_RUSTC_WRAPPER environment override is
+preserved unless it already names this rabs-wrap. RUSTC_WORKSPACE_WRAPPER,
+jobserver descriptors, stdin, stdout, stderr and the toolchain environment are
+not rewritten. On successful setup this invocation explicitly selects
+rabs-wrap via RUSTC_WRAPPER, overriding Cargo's build.rustc-wrapper config.
+No project or global Cargo config is edited.
+
+New daemon logs: <RABS_STATE_DIR>/cargo-launcher/daemon-<pid>-<time>.log.
+Daemon startup holds both state-directory and socket-endpoint lifetime locks.
+The endpoint lock is .rabs-<socket-name>.startup.lock beside the socket, so
+different state directories cannot start competing daemons for one endpoint.
+Starting a daemon requires a same-user socket parent without group/world write
+permission; attaching to an already-running daemon does not create any locks.
+Stale, foreign, malformed or unavailable existing sockets are left untouched.
+"""
+
+
+class SetupError(Exception):
+    """Acceleration could not be set up; no compiler or output writer started."""
+
+
+def remaining(deadline):
+    duration = deadline - time.monotonic()
+    if duration <= 0:
+        raise SetupError("RABS setup deadline expired")
+    return duration
+
+
+def unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON field")
+        result[key] = value
+    return result
+
+
+def decode_object(data):
+    try:
+        result = json.loads(data.decode("utf-8"), object_pairs_hook=unique_object)
+    except (ValueError, UnicodeError) as error:
+        raise SetupError("RABS returned malformed JSON") from error
+    if not isinstance(result, dict):
+        raise SetupError("RABS returned a non-object reply")
+    return result
+
+
+def executable(name, override, env):
+    explicit = env.get(override)
+    if explicit is not None:
+        candidates = [explicit]
+    else:
+        here = Path(__file__).resolve().parent
+        candidates = [str(here / name), shutil.which(name, path=env.get("PATH"))]
+        if here.name == "scripts":
+            candidates.append(str(here.parent / "target" / "release" / name))
+    for candidate in candidates:
+        if candidate and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            # Do not resolve the executable's final symlink: rustup and other
+            # multi-call programs can depend on the invoked basename.
+            return os.path.abspath(candidate)
+    raise SetupError("{} is not installed (or {} is not executable)".format(name, override))
+
+
+def same_executable(value, expected, env):
+    if not value:
+        return False
+    candidate = shutil.which(value, path=env.get("PATH"))
+    try:
+        return candidate is not None and os.path.samefile(candidate, expected)
+    except OSError:
+        return False
+
+
+def check_wrapper_environment(env, wrapper):
+    for name in ("RUSTC_WRAPPER", "CARGO_BUILD_RUSTC_WRAPPER"):
+        if name in env and not same_executable(env[name], wrapper, env):
+            raise SetupError("{} already selects another wrapper or disables wrapping".format(name))
+
+
+def checked_config(daemon, env, deadline):
+    """Ask the real daemon to resolve its config; do not maintain a second parser.
+
+    Drain bounded stdout under one deadline. No inherited terminal input and
+    no unbounded communicate()/readline() allocation on the setup path.
+    """
+    process = subprocess.Popen(
+        [daemon, "--check-config"],
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        close_fds=True,
+    )
+    data = bytearray()
+    probe_deadline = min(deadline, time.monotonic() + 2.0)
+    try:
+        with selectors.DefaultSelector() as selector:
+            selector.register(process.stdout, selectors.EVENT_READ)
+            while True:
+                if not selector.select(remaining(probe_deadline)):
+                    raise SetupError("rabsd --check-config timed out")
+                chunk = os.read(process.stdout.fileno(), min(4096, MAX_FRAME + 1 - len(data)))
+                if not chunk:
+                    break
+                data.extend(chunk)
+                if len(data) > MAX_FRAME:
+                    raise SetupError("rabsd --check-config exceeded its output bound")
+        try:
+            status = process.wait(timeout=remaining(probe_deadline))
+        except subprocess.TimeoutExpired as error:
+            raise SetupError("rabsd --check-config did not exit") from error
+        if status != 0:
+            raise SetupError("rabsd refused its configuration (run rabsd --check-config)")
+    finally:
+        process.stdout.close()
+        if process.poll() is None:
+            # This is our short-lived config child, never a shared daemon.
+            process.kill()
+            try:
+                process.wait(timeout=0.2)
+            except subprocess.TimeoutExpired:
+                pass
+    config = decode_object(bytes(data))
+    if config.get("kind") != "rabsd-config" or config.get("live_dependency") is not True:
+        raise SetupError("installed rabsd does not acknowledge the opt-in live dependency lane")
+    path = config.get("socket_path")
+    if not isinstance(path, str) or not os.path.isabs(path) or "\0" in path:
+        raise SetupError("rabsd configured an invalid absolute socket path")
+    try:
+        encoded = path.encode("utf-8")
+    except UnicodeError as error:
+        raise SetupError("rabsd socket path is not UTF-8") from error
+    if len(encoded) > 107:
+        raise SetupError("rabsd socket path exceeds Linux sun_path")
+    return path
+
+
+def socket_identity(path):
+    try:
+        metadata = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISSOCK(metadata.st_mode):
+        raise SetupError("RABS endpoint exists but is not a socket; leaving it untouched")
+    if metadata.st_uid != os.geteuid() or stat.S_IMODE(metadata.st_mode) & 0o077:
+        raise SetupError("RABS socket is not private to this user; leaving it untouched")
+    return metadata.st_dev, metadata.st_ino
+
+
+class Frames:
+    def __init__(self, stream, deadline):
+        self.stream = stream
+        self.deadline = deadline
+        self.buffer = bytearray()
+
+    def send(self, value):
+        self.stream.settimeout(remaining(self.deadline))
+        self.stream.sendall(json.dumps(value, separators=(",", ":")).encode("utf-8") + b"\n")
+
+    def receive(self):
+        while True:
+            remaining(self.deadline)
+            end = self.buffer.find(b"\n")
+            if end >= 0:
+                if end + 1 > MAX_FRAME:
+                    raise SetupError("RABS reply exceeded its frame bound")
+                data = bytes(self.buffer[:end])
+                del self.buffer[:end + 1]
+                return decode_object(data)
+            if len(self.buffer) >= MAX_FRAME:
+                raise SetupError("RABS reply exceeded its frame bound")
+            self.stream.settimeout(remaining(self.deadline))
+            chunk = self.stream.recv(min(4096, MAX_FRAME - len(self.buffer)))
+            if not chunk:
+                raise SetupError("RABS closed before a complete reply")
+            self.buffer.extend(chunk)
+
+
+def probe(path, deadline):
+    """Readiness only, never evidence of a hit or authorization to skip rustc."""
+    identity = socket_identity(path)
+    if identity is None:
+        return False
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as stream:
+        stream.settimeout(remaining(deadline))
+        stream.connect(path)
+        credentials = stream.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
+        _, uid, _ = struct.unpack("3i", credentials)
+        if uid != os.geteuid() or socket_identity(path) != identity:
+            raise SetupError("RABS endpoint ownership changed during connection")
+        frames = Frames(stream, deadline)
+        frames.send(HELLO)
+        hello = frames.receive()
+        if (hello.get("kind") != "hello-ok"
+                or type(hello.get("transport")) is not int or hello["transport"] != 1
+                or type(hello.get("application")) is not int or hello["application"] != 1):
+            raise SetupError("RABS refused protocol version 1")
+        frames.send({"kind": "status"})
+        if frames.receive().get("kind") != "coord-status":
+            raise SetupError("RABS did not return coordinator status")
+        if socket_identity(path) != identity:
+            raise SetupError("RABS endpoint changed during the readiness exchange")
+    return True
+
+
+def private_directory(path):
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    metadata = os.fstat(descriptor)
+    if metadata.st_uid != os.geteuid() or stat.S_IMODE(metadata.st_mode) & 0o022:
+        os.close(descriptor)
+        raise SetupError("RABS startup directory has unsafe ownership or permissions")
+    return descriptor
+
+
+def private_lock(directory, name):
+    descriptor = os.open(
+        name, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK,
+        0o600, dir_fd=directory,
+    )
+    try:
+        check_lock_metadata(os.fstat(descriptor))
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
+def check_lock_metadata(metadata):
+    if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(metadata.st_mode) & 0o077 or metadata.st_nlink != 1):
+        raise SetupError("RABS startup lock has unsafe identity or permissions")
+
+
+class StartupLock:
+    """Two stable flock inodes, inherited only by a newly admitted daemon.
+
+    The state lock prevents two endpoints from opening one state store. The
+    endpoint lock prevents two state stores from racing to bind one socket.
+    Keep the original state lock path: an older launcher-owned daemon still
+    holds it. Always acquire state then endpoint, with the same deadline.
+
+    Both locks survive launcher exit/timeout in the daemon. Parent-directory
+    aliases converge on the endpoint lock's actual inode, not a path hash.
+    Ready-daemon callers bypass locks entirely. Close, never explicitly unlock,
+    the parent's descriptors: unlocking would release the child's locks too.
+    """
+    def __init__(self, state, socket_path, deadline):
+        self.directory = None
+        self.lock = None
+        self.socket_directory = None
+        self.endpoint_lock = None
+        self.deadline = deadline
+        self.path = os.path.join(state, "cargo-launcher")
+        self.socket_parent, socket_name = os.path.split(socket_path)
+        if not socket_name or socket_name in (".", ".."):
+            raise SetupError("RABS socket must name a directory entry")
+        self.endpoint_name = ".rabs-{}.startup.lock".format(socket_name)
+        parent = private_directory(state)
+        try:
+            try:
+                os.mkdir("cargo-launcher", mode=0o700, dir_fd=parent)
+            except FileExistsError:
+                pass
+            self.directory = os.open(
+                "cargo-launcher", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=parent,
+            )
+            metadata = os.fstat(self.directory)
+            if metadata.st_uid != os.geteuid() or stat.S_IMODE(metadata.st_mode) & 0o077:
+                raise SetupError("RABS startup directory is not private to this user")
+            self.lock = private_lock(self.directory, "startup.lock")
+            # Resolve transport-parent aliases only, not a final socket entry.
+            # Verification below requires the original spelling to keep naming
+            # this directory. No socket or existing lock is repaired/unlinked.
+            self.socket_directory = private_directory(os.path.realpath(self.socket_parent))
+            self.endpoint_lock = private_lock(self.socket_directory, self.endpoint_name)
+            self.verify()
+        except BaseException:
+            self.close()
+            raise
+        finally:
+            os.close(parent)
+
+    def __enter__(self):
+        return self
+
+    def verify(self):
+        # flock protects an inode, not a pathname. Never spawn with a lock
+        # whose entry or containing directory was replaced after we opened it.
+        for path, descriptor, follow, mask in [
+            (self.path, self.directory, False, 0o077),
+            (self.socket_parent, self.socket_directory, True, 0o022),
+        ]:
+            held = os.fstat(descriptor)
+            named = os.stat(path, follow_symlinks=follow)
+            if (not stat.S_ISDIR(named.st_mode) or named.st_uid != os.geteuid()
+                    or stat.S_IMODE(named.st_mode) & mask
+                    or (held.st_dev, held.st_ino) != (named.st_dev, named.st_ino)):
+                raise SetupError("RABS startup directory identity changed")
+        for directory, name, descriptor in [
+            (self.directory, "startup.lock", self.lock),
+            (self.socket_directory, self.endpoint_name, self.endpoint_lock),
+        ]:
+            held = os.fstat(descriptor)
+            named = os.stat(name, dir_fd=directory, follow_symlinks=False)
+            check_lock_metadata(held)
+            check_lock_metadata(named)
+            if (held.st_dev, held.st_ino) != (named.st_dev, named.st_ino):
+                raise SetupError("RABS startup lock identity changed")
+
+    def inherited_fds(self):
+        self.verify()
+        return self.lock, self.endpoint_lock
+
+    def acquire(self, socket_path):
+        """True: may start; False: the lock holder became a ready daemon."""
+        for descriptor in (self.lock, self.endpoint_lock):
+            if not self.acquire_one(descriptor, socket_path):
+                return False
+        return True
+
+    def acquire_one(self, descriptor, socket_path):
+        while True:
+            remaining(self.deadline)
+            self.verify()
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                self.verify()
+                return True
+            except BlockingIOError:
+                # The service deliberately owns this lock for its lifetime.
+                # Callers that arrived before bind must switch to the ready
+                # service instead of waiting for that healthy service to die.
+                try:
+                    if probe(socket_path, min(self.deadline, time.monotonic() + 0.25)):
+                        return False
+                except (SetupError, OSError):
+                    pass
+                time.sleep(min(0.025, remaining(self.deadline)))
+
+    def new_log(self):
+        self.verify()
+        name = "daemon-{}-{}.log".format(os.getpid(), time.time_ns())
+        descriptor = os.open(
+            name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o600, dir_fd=self.directory,
+        )
+        return descriptor, os.path.join(self.path, name)
+
+    def close(self):
+        for name in ("endpoint_lock", "socket_directory", "lock", "directory"):
+            descriptor = getattr(self, name)
+            if descriptor is not None:
+                os.close(descriptor)
+                setattr(self, name, None)
+
+    def __exit__(self, *_):
+        self.close()
+
+
+def ensure_daemon(daemon, socket_path, state, env, deadline, no_start):
+    if socket_identity(socket_path) is not None:
+        # A timeout/refusal is not proof of death. Never replace an existing
+        # endpoint, even when the operator intentionally disabled serving.
+        if not probe(socket_path, min(deadline, time.monotonic() + 1.0)):
+            raise SetupError("RABS endpoint disappeared during readiness checking")
+        return
+    if no_start:
+        raise SetupError("no RABS daemon is listening and --rabs-no-start was requested")
+    with StartupLock(state, socket_path, deadline) as lock:
+        if not lock.acquire(socket_path):
+            return
+        if socket_identity(socket_path) is not None:
+            if not probe(socket_path, min(deadline, time.monotonic() + 1.0)):
+                raise SetupError("RABS endpoint disappeared during readiness checking")
+            return
+        remaining(deadline)
+        descriptor, log = lock.new_log()
+        try:
+            child = subprocess.Popen(
+                [daemon], env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=descriptor, close_fds=True, start_new_session=True,
+                pass_fds=lock.inherited_fds(),
+            )
+        finally:
+            os.close(descriptor)
+        while True:
+            status = child.poll()
+            if status is not None:
+                raise SetupError("rabsd exited during startup; see {}".format(log))
+            try:
+                if probe(socket_path, min(deadline, time.monotonic() + 0.25)):
+                    return
+            except (SetupError, OSError):
+                # Only this newly-started daemon gets a readiness grace period.
+                # Its process and socket are never killed/unlinked on timeout;
+                # another Cargo caller may already be using the shared service.
+                pass
+            try:
+                time.sleep(min(0.025, remaining(deadline)))
+            except SetupError as error:
+                raise SetupError("rabsd startup was not confirmed; see {}".format(log)) from error
+
+
+def prepare(env, no_start):
+    if sys.platform != "linux":
+        raise SetupError("the live dependency launcher currently requires Linux")
+    try:
+        milliseconds = int(env.get("CARGO_RABS_STARTUP_MS", str(DEFAULT_STARTUP_MS)))
+    except ValueError as error:
+        raise SetupError("CARGO_RABS_STARTUP_MS must be an integer") from error
+    if not 0 <= milliseconds <= MAX_STARTUP_MS:
+        raise SetupError("CARGO_RABS_STARTUP_MS must be between 0 and 30000")
+    deadline = time.monotonic() + milliseconds / 1000
+    wrapper = executable("rabs-wrap", "CARGO_RABS_WRAP", env)
+    check_wrapper_environment(env, wrapper)
+    daemon = executable("rabsd", "CARGO_RABS_DAEMON", env)
+    daemon_env = dict(env)
+    daemon_env["RABS_LIVE_DEPENDENCY"] = "1"
+    socket_path = checked_config(daemon, daemon_env, deadline)
+    home = env.get("HOME")
+    state = env.get("RABS_STATE_DIR")
+    if state is None:
+        if not home or not os.path.isabs(home):
+            raise SetupError("an absolute HOME or RABS_STATE_DIR is required")
+        state = os.path.join(home, ".cache", "rch", "rabs-state")
+    if not state or not os.path.isabs(state):
+        raise SetupError("RABS_STATE_DIR must be an absolute directory")
+    daemon_env["RABS_SOCKET_PATH"] = socket_path
+    daemon_env["RABS_STATE_DIR"] = state
+    ensure_daemon(daemon, socket_path, state, daemon_env, deadline, no_start)
+    cargo_env = dict(env)
+    cargo_env["RUSTC_WRAPPER"] = wrapper
+    cargo_env["RABS_SOCKET_PATH"] = socket_path
+    return cargo_env
+
+
+def arguments(argv):
+    args = list(argv)
+    if args and args[0] == "rabs":
+        args.pop(0)  # Cargo's external-subcommand invocation contract.
+    no_start = False
+    required = False
+    while args:
+        if args[0] == "--":
+            args.pop(0)
+            break
+        if args[0] == "--help":
+            return None, False, False
+        if args[0] == "--rabs-no-start":
+            no_start = True
+        elif args[0] == "--rabs-require-daemon":
+            required = True
+        else:
+            break
+        args.pop(0)
+    return args or ["build"], no_start, required
+
+
+def main():
+    args, no_start, required = arguments(sys.argv[1:])
+    if args is None:
+        print(HELP, end="")
+        return 0
+    env = dict(os.environ)
+    cargo = env.get("CARGO") or shutil.which("cargo")
+    if not cargo:
+        print("cargo-rabs: cargo is not installed", file=sys.stderr)
+        return 127
+    try:
+        recursive = os.path.samefile(cargo, __file__)
+    except OSError:
+        recursive = False  # exec below retains ordinary command-not-found behavior.
+    if recursive:
+        print("cargo-rabs: CARGO resolves to cargo-rabs itself", file=sys.stderr)
+        return 127
+    try:
+        cargo_env = prepare(env, no_start)
+    except (SetupError, OSError, subprocess.SubprocessError) as error:
+        print("cargo-rabs: {}; {}".format(
+            error, "setup refused" if required else "running stock Cargo"
+        ), file=sys.stderr)
+        if required:
+            return 2
+        cargo_env = env
+    try:
+        # No Popen/wait boundary around the build: preserve its PID, signals,
+        # jobserver descriptors, terminal streams, opaque argv and exit status.
+        os.execvpe(cargo, [cargo] + args, cargo_env)
+    except OSError as error:
+        print("cargo-rabs: cannot execute Cargo: {}".format(error), file=sys.stderr)
+        return 127
+
+
+if __name__ == "__main__":
+    sys.exit(main())

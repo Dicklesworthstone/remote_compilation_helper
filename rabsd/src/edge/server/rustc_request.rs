@@ -23,6 +23,12 @@
 //!   No writer or execution was admitted here. The wrapper may retry the
 //!   identical request on this connection under its own bounded backoff.
 //!   Each retry reobserves inputs and rechecks every serving/sampling gate;
+//! - `{"kind":"rustc-decision","decision":"preparing",…}` — also only
+//!   with `wait_for_inflight: true`: shared input facts are warming. There
+//!   is no action identity or execution/install ownership yet. Retrying
+//!   allows the FIRST cold build to populate the cache instead of requiring
+//!   throwaway builds. Preparation and keyed waits share the wrapper's one
+//!   deadline and retry quota. Older wrappers can decline before any writes;
 //! - anything else — run the compiler as if RABS were absent.
 //!
 //! Requests outside the live class keep the shadow plane's observation, so
@@ -37,7 +43,6 @@ use rabs_cas::metadata_store::digest_key;
 use rabs_key::build_script_directives::bind_rustc_environment;
 use rabs_key::live_dependency::{
     ExternFact, LiveRustcRequest, PlannedExtern, constructed_environment, live_dependency_key,
-    plan_dependency_action,
 };
 use rabs_protocol::input_evidence::{
     ActionInputManifest, INPUT_EVIDENCE_SCHEMA_VERSION, InputFileType, PositiveInput,
@@ -47,6 +52,9 @@ use rabs_protocol::result_identity::ObjectId;
 use serde_json::{Value, json};
 use std::path::Path;
 use std::sync::Arc;
+
+#[path = "directory_source.rs"]
+mod directory_source;
 
 /// Largest completion frame: a bounded transcript in hex plus envelope.
 pub(super) const MAX_COMPLETION_FRAME_BYTES: usize = 2 * MAX_TRANSCRIPT_BYTES + 64 * 1024;
@@ -96,6 +104,42 @@ fn pass_through(reason: &str) -> String {
         "compiler_skip_authorized": false,
     })
     .to_string()
+}
+
+/// A pending observation is not an action key or a reserved dispatch. Keep
+/// this vocabulary separate from coordinator decisions: readiness cannot
+/// acquire execution, publication or output-install authority.
+#[derive(Clone, Copy)]
+enum PendingFacts {
+    Toolchain,
+    Package,
+    Dependencies,
+}
+
+impl PendingFacts {
+    const fn reason(self) -> &'static str {
+        match self {
+            Self::Toolchain => "toolchain-facts-pending",
+            Self::Package => "package-facts-pending",
+            Self::Dependencies => "dependency-facts-pending",
+        }
+    }
+}
+
+fn preparing(unit: &str, facts: PendingFacts) -> Decided {
+    let reason = facts.reason();
+    log("preparing", &[("crate", unit), ("reason", reason)]);
+    // Returning Reply releases the blocking lane. The existing bounded
+    // warmer owns the observation; this connection retains no waiter task,
+    // action reservation or writable output. Its next request reobserves
+    // everything through decide, rather than adopting a stale descriptor.
+    Decided::Reply(
+        json!({
+            "kind": "rustc-decision", "decision": "preparing", "reason": reason,
+            "compiler_skip_authorized": false, "materialization_started": false,
+        })
+        .to_string(),
+    )
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -197,6 +241,7 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
         return Decided::Reply(pass_through("malformed-request"));
     };
     let unit = crate_name(&parsed.argv);
+    let may_wait = request.get("wait_for_inflight").and_then(Value::as_bool) == Some(true);
     // Every refusal below is logged with its reason: an unexplained miss is
     // indistinguishable from a lane that never saw the request.
     let refuse = |reason: &str| {
@@ -214,6 +259,9 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
                 "toolchain-warming",
                 &[("crate", unit), ("compiler", &parsed.argv[0])],
             );
+            if may_wait {
+                return preparing(unit, PendingFacts::Toolchain);
+            }
             return Decided::Shadow(observation(&parsed));
         }
         Err(FactsMiss::Refused(reason)) => {
@@ -235,7 +283,7 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
         );
         return Decided::Shadow(observation(&parsed));
     };
-    let mut plan = match plan_dependency_action(
+    let mut plan = match directory_source::plan_dependency_action(
         LiveRustcRequest {
             argv: &parsed.argv,
             cwd: &parsed.cwd,
@@ -259,12 +307,24 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
             return Decided::Shadow(observation(&parsed));
         }
     };
+    // Keep the original observation through the entire request lifecycle.
+    // Later cache refreshes must not substitute another toolchain generation
+    // after this invocation has been keyed or its compiler has started.
+    let toolchain_guard = match live
+        .facts
+        .toolchain_guard(Path::new(&plan.compiler), &toolchain)
+    {
+        Ok(guard) => guard,
+        Err(FactsMiss::Pending) if may_wait => return preparing(unit, PendingFacts::Toolchain),
+        Err(miss) => return refuse(&miss.to_string()),
+    };
     let package = match live.facts.package(
         Path::new(&plan.source_root),
         plan.source_kind,
         plan.generated_root.as_deref().map(Path::new),
     ) {
         Ok(package) => package,
+        Err(FactsMiss::Pending) if may_wait => return preparing(unit, PendingFacts::Package),
         Err(miss) => {
             log(
                 "pass-through",
@@ -323,6 +383,9 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
     let mut externs = Vec::new();
     let dependencies = match live.facts.dependencies(&plan) {
         Ok(dependencies) => dependencies,
+        Err(FactsMiss::Pending) if may_wait => {
+            return preparing(unit, PendingFacts::Dependencies);
+        }
         Err(miss) => return refuse(&miss.to_string()),
     };
     for planned in &plan.externs {
@@ -364,17 +427,13 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
         inputs,
         package,
         dependencies,
+        toolchain: toolchain_guard,
         externs: externs
             .into_iter()
             .map(|fact| (fact.path, fact.content_digest))
             .collect(),
     });
-    decision_reply(
-        decision,
-        &key_text,
-        unit,
-        request.get("wait_for_inflight").and_then(Value::as_bool) == Some(true),
-    )
+    decision_reply(decision, &key_text, unit, may_wait)
 }
 
 fn decision_reply(
@@ -743,6 +802,28 @@ mod completion_capture_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preparing_facts_has_neither_action_identity_nor_execution_or_install_authority() {
+        for (facts, reason) in [
+            (PendingFacts::Toolchain, "toolchain-facts-pending"),
+            (PendingFacts::Package, "package-facts-pending"),
+            (PendingFacts::Dependencies, "dependency-facts-pending"),
+        ] {
+            let Decided::Reply(reply) = preparing("leaf", facts) else {
+                panic!("preparation must release the request lane without ownership");
+            };
+            let reply: Value = serde_json::from_str(&reply).unwrap();
+            assert_eq!(reply["kind"], "rustc-decision");
+            assert_eq!(reply["decision"], "preparing");
+            assert_eq!(reply["reason"], reason);
+            assert_eq!(reply["compiler_skip_authorized"], false);
+            assert_eq!(reply["materialization_started"], false);
+            for absent in ["action_key", "attempt", "env"] {
+                assert!(reply.get(absent).is_none(), "{absent} is not a readiness fact");
+            }
+        }
+    }
 
     #[test]
     fn request_parsing_is_strict_and_hex_round_trips() {

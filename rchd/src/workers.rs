@@ -1125,7 +1125,7 @@ impl WorkerState {
             context.started_at,
         );
         *self.disk_capacity_observation.write().await = observation;
-        let pressure_config = DiskPressurePolicyConfig::default();
+        let pressure_config = DiskPressurePolicyConfig::configured();
         let pressure = evaluate_pressure_policy(&capabilities, None, &pressure_config);
         *self.capabilities.write().await = capabilities;
 

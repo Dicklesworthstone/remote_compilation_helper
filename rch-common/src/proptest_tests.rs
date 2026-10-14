@@ -1704,6 +1704,7 @@ mod tests {
                             max_load_per_core,
                             min_free_gb,
                             disk_gb_per_slot,
+                            ..SelectionConfig::default()
                         }
                     },
                 )

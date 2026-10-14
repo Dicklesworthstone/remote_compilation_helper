@@ -36,7 +36,7 @@ use crate::coord::live::{
     load_manifest,
 };
 use crate::edge::live_facts::{
-    DependencyFacts, FileSig, GENERATED_ROOT, PACKAGE_ROOT, PackageFacts, digest_stable,
+    DependencyFacts, FileSig, GENERATED_ROOT, PACKAGE_ROOT, PackageFacts, ToolchainGuard, digest_stable,
     read_stable,
 };
 use rabs_action::state_machines::AttemptState;
@@ -101,8 +101,16 @@ pub struct LiveDependencyRequest {
     pub package: Arc<PackageFacts>,
     /// Exact dependency candidate inventory and identities.
     pub dependencies: Arc<DependencyFacts>,
+    /// The toolchain observation used for this request's key, not a later memo.
+    pub toolchain: ToolchainGuard,
     /// `(path, digest)` of every extern the key covers.
     pub externs: Vec<(String, TypedDigest)>,
+}
+
+impl LiveDependencyRequest {
+    fn verify_toolchain(&self) -> Result<(), String> {
+        self.toolchain.verify_unchanged(Path::new(&self.plan.compiler))
+    }
 }
 
 /// One output now present in the subscriber's out-dir with known bytes.
@@ -195,8 +203,12 @@ impl PendingServe {
         let plan = &self.request.plan;
         if let Err(reason) = self
             .request
-            .package
-            .verify_unchanged(Path::new(&plan.source_root))
+            .verify_toolchain()
+            .and_then(|()| {
+                self.request
+                    .package
+                    .verify_unchanged(Path::new(&plan.source_root))
+            })
             .and_then(|()| self.request.package.verify_generated_disjoint(plan))
             .and_then(|()| self.request.dependencies.verify_unchanged())
         {
@@ -233,6 +245,12 @@ impl PendingServe {
                         Ok(output) => installed.push(output),
                         Err(reason) => return InstallResult::Fault(reason),
                     }
+                }
+                // The synchronous writer has returned. A toolchain update
+                // during installation cannot authorize a skip under the old
+                // key; report a settled failure, never uncertain fallback.
+                if let Err(reason) = self.request.verify_toolchain() {
+                    return InstallResult::Fault(reason);
                 }
                 InstallResult::Served {
                     transcript: render_placements(&self.canonical_transcript, plan),
@@ -580,6 +598,9 @@ impl LiveDependencyLane {
     /// and sampling gate, including any additional private verification run.
     #[must_use]
     pub fn decide(&self, request: LiveDependencyRequest) -> LiveDecision {
+        if let Err(reason) = request.verify_toolchain() {
+            return LiveDecision::PassThrough(reason);
+        }
         let request = match self.preview(request) {
             Ok(Ok(pending)) => return LiveDecision::Hit(pending),
             Ok(Err(request)) => request,
@@ -827,6 +848,7 @@ impl LocalAttempt {
         if report.stderr.len() > MAX_TRANSCRIPT_BYTES {
             return Err("transcript exceeds the class bound".into());
         }
+        self.request.verify_toolchain()?;
         let plan = &self.request.plan;
         self.request
             .package
@@ -866,6 +888,7 @@ impl LocalAttempt {
             .verify_unchanged(Path::new(&plan.source_root))?;
         self.request.package.verify_generated_disjoint(plan)?;
         self.request.dependencies.verify_unchanged()?;
+        self.request.verify_toolchain()?;
         self.advance(AttemptState::HarvestingOutputs)?;
 
         let cas = self.coord.live_cas().ok_or("no CAS mounted")?;

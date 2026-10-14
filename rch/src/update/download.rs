@@ -260,7 +260,7 @@ const DOWNLOAD_BACKOFF: [Duration; 3] = [
 /// I/O failures abort immediately. No prefix is reused across invocations.
 async fn download_with_retry(
     url: &str,
-    dest: &PathBuf,
+    dest: &Path,
     asset_name: &str,
     expected_size: u64,
     max_attempts: u32,

@@ -466,9 +466,7 @@ fn build_stuck_evidence(build: &crate::history::ActiveBuildState, now: Instant) 
     let has_worker_binding = !build.worker_id.is_empty();
     score_stuck_evidence(StuckEvidenceInput {
         hook_alive,
-        progress_stall_remediable_phase: is_progress_stall_remediable_phase(
-            &build.heartbeat_phase,
-        ),
+        progress_stall_remediable_phase: is_progress_stall_remediable_phase(&build.heartbeat_phase),
         heartbeat_age_secs,
         progress_age_secs,
         build_age_secs,

@@ -667,19 +667,34 @@ pub(super) fn guard_owned_source_content_cargo_config(
                 .ok_or_else(|| anyhow::anyhow!("captured Cargo config path is not UTF-8"))
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
-    let cases = if allowed.is_empty() {
+    // The walk below sees physical directories (`pwd -P`, as Cargo does), so
+    // compare against the captured paths' physical spelling: a remote root
+    // reached through a symlink (macOS /tmp and /var) must not refuse them.
+    let resolve = if allowed.is_empty() {
         String::new()
     } else {
-        format!("{} ) return 0 ;;", allowed.join(" | "))
+        format!(
+            r#"for rch_config_path in {}; do
+    rch_config_dir=$(CDPATH= cd -P -- "${{rch_config_path%/*}}" 2>/dev/null && pwd -P) || continue
+    rch_config_allowed="$rch_config_allowed$rch_config_dir/${{rch_config_path##*/}}
+"
+done
+"#,
+            allowed.join(" ")
+        )
     };
     let guard = format!(
         r#"rch_config_refuse() {{
     printf '%s\n' 'RCH-E413 owned source closure has unselected Cargo configuration' >&2
     exit 113
 }}
-rch_config_selected() {{
-    case "$1" in
-        {cases}
+rch_config_allowed='
+'
+{resolve}rch_config_selected() {{
+    case "$rch_config_allowed" in
+        *"
+$1
+"*) return 0 ;;
         *) return 1 ;;
     esac
 }}
@@ -1479,15 +1494,34 @@ mod tests {
             let home = temp.path().join("cargo-home");
             fs::create_dir(&home).unwrap();
             let cwd = layout.plan.iter().find(|entry| entry.is_primary).unwrap();
-            let run = |home: &Path| {
+            let run_guard = |guard: &str, home: &Path| {
                 std::process::Command::new("/bin/sh")
-                    .args(["-c", &guarded])
+                    .args(["-c", guard])
                     .current_dir(&cwd.remote_root)
                     .env("CARGO_HOME", home)
                     .output()
                     .unwrap()
             };
+            let run = |home: &Path| run_guard(&guarded, home);
             let accepted = run(&home);
+            assert!(accepted.status.success(), "{accepted:?}");
+            assert_eq!(accepted.stdout, b"cargo-entered\n");
+            // The guard walks physical directories; a remote root spelled
+            // through a symlink must still select its captured config.
+            let alias = temp.path().join("alias");
+            std::os::unix::fs::symlink(temp.path(), &alias).unwrap();
+            let mut aliased = prepared.clone();
+            for root in &mut aliased {
+                root.manifest.remote_root = root.manifest.remote_root.replacen(
+                    temp.path().to_str().unwrap(),
+                    alias.to_str().unwrap(),
+                    1,
+                );
+                assert!(root.manifest.remote_root.contains("/alias/"));
+            }
+            let aliased_guard =
+                guard_owned_source_content_cargo_config(&command, &aliased).unwrap();
+            let accepted = run_guard(&aliased_guard, &home);
             assert!(accepted.status.success(), "{accepted:?}");
             assert_eq!(accepted.stdout, b"cargo-entered\n");
             fs::write(home.join("config.toml"), "[build]\njobs = 1\n").unwrap();

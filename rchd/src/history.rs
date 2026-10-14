@@ -103,6 +103,35 @@ impl PartialEq for PendingDiskFault {
 impl Eq for PendingDiskFault {}
 
 /// Terminal result supplied by completion or cancellation; ownership stays separate.
+/// A failed remote build's slot is released at completion, but its client
+/// lease keeps the worker's source claim until lease recovery retires it
+/// (exit 102 retrieval incomplete, 130 interrupted: 15-21 min on css). The
+/// worker's source registry refuses the same project meanwhile, so selection
+/// must not keep choosing it (bd-jqhno).
+#[derive(Debug, Clone)]
+struct SourceFence {
+    project_id: String,
+    worker_id: String,
+    wrapper: String,
+    created: Instant,
+}
+
+/// Lease recovery acts after 15 min of heartbeat staleness and scans every
+/// 5 min; a fence never outlives that window by much, whatever the lease says.
+pub(crate) const SOURCE_FENCE_MAX_AGE: Duration = Duration::from_secs(25 * 60);
+const SOURCE_FENCE_LIMIT: usize = 1024;
+
+fn canonical_local_wrapper(wrapper: &str) -> bool {
+    wrapper
+        .strip_prefix(rch_common::job_identity::LOCAL_WRAPPER_ID_PREFIX)
+        .and_then(|suffix| {
+            uuid::Uuid::parse_str(suffix)
+                .ok()
+                .map(|id| id.to_string() == suffix)
+        })
+        .unwrap_or(false)
+}
+
 pub struct BuildCompletion {
     pub exit_code: i32,
     pub duration_ms: Option<u64>,
@@ -306,6 +335,9 @@ pub struct BuildHistory {
     /// Transient: startup loads history before probing workers, and WorkerState
     /// never restores capacity observations from disk.
     disk_budget_completed_at: Mutex<HashMap<String, Instant>>,
+    /// Failed remote builds whose client lease may still own worker source
+    /// (bd-jqhno). Transient: selection consults them for the same project.
+    source_fences: Mutex<Vec<SourceFence>>,
     /// Queued builds (waiting for workers). Membership changes take `active`
     /// first, so queue departure, cancellation and admission share one commit.
     queued: RwLock<VecDeque<QueuedBuildState>>,
@@ -354,6 +386,7 @@ impl BuildHistory {
             records: RwLock::new(VecDeque::with_capacity(capacity)),
             active: RwLock::new(HashMap::new()),
             disk_budget_completed_at: Mutex::new(HashMap::new()),
+            source_fences: Mutex::new(Vec::new()),
             queued: RwLock::new(VecDeque::new()),
             capacity,
             max_queue_depth: DEFAULT_MAX_QUEUE_DEPTH,
@@ -1098,6 +1131,43 @@ impl BuildHistory {
             .filter(|state| state.project_id == project_id)
             .map(|state| state.worker_id.clone())
             .collect()
+    }
+
+    /// Workers fenced for `project_id` by a failed build whose client lease
+    /// still owns worker source. `owns_source(wrapper)` reads that lease; a
+    /// fence ends when it answers no, or after [`SOURCE_FENCE_MAX_AGE`].
+    pub fn source_fenced_workers(
+        &self,
+        project_id: &str,
+        owns_source: impl Fn(&str) -> bool,
+    ) -> HashSet<String> {
+        let candidates: Vec<SourceFence> = {
+            let mut fences = self.source_fences.lock().unwrap_or_else(|e| e.into_inner());
+            fences.retain(|fence| fence.created.elapsed() < SOURCE_FENCE_MAX_AGE);
+            fences
+                .iter()
+                .filter(|fence| fence.project_id == project_id)
+                .cloned()
+                .collect()
+        };
+        if candidates.is_empty() {
+            return HashSet::new();
+        }
+        // Lease reads happen outside the lock.
+        let (held, released): (Vec<_>, Vec<_>) = candidates
+            .into_iter()
+            .partition(|fence| owns_source(&fence.wrapper));
+        if !released.is_empty() {
+            self.source_fences
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain(|fence| {
+                    !released.iter().any(|gone| {
+                        gone.wrapper == fence.wrapper && gone.worker_id == fence.worker_id
+                    })
+                });
+        }
+        held.into_iter().map(|fence| fence.worker_id).collect()
     }
 
     // =========================================================================
@@ -1960,6 +2030,7 @@ impl BuildHistory {
             records: RwLock::new(records),
             active: RwLock::new(active),
             disk_budget_completed_at: Mutex::new(HashMap::new()),
+            source_fences: Mutex::new(Vec::new()),
             queued: RwLock::new(queued),
             capacity,
             max_queue_depth: DEFAULT_MAX_QUEUE_DEPTH,
@@ -2304,6 +2375,25 @@ impl BuildHistory {
                 .unwrap_or_else(|e| e.into_inner())
                 .insert(state.worker_id.clone(), Instant::now());
         }
+        if exit_code != 0
+            && state.location == BuildLocation::Remote
+            && let Some(wrapper) = state
+                .local_wrapper_id
+                .as_deref()
+                .filter(|wrapper| canonical_local_wrapper(wrapper))
+        {
+            let mut fences = self.source_fences.lock().unwrap_or_else(|e| e.into_inner());
+            fences.retain(|fence| fence.created.elapsed() < SOURCE_FENCE_MAX_AGE);
+            if fences.len() >= SOURCE_FENCE_LIMIT {
+                fences.remove(0);
+            }
+            fences.push(SourceFence {
+                project_id: state.project_id.clone(),
+                worker_id: state.worker_id.clone(),
+                wrapper: wrapper.to_owned(),
+                created: Instant::now(),
+            });
+        }
         let state = active.remove(&build_id).expect("locked ownership exists");
         self.learn_footprint(&state, exit_code);
         self.record(record.clone());
@@ -2495,6 +2585,89 @@ mod tests {
     use rch_common::{WorkerId, test_guard};
     use std::time::{SystemTime, UNIX_EPOCH};
     use tempfile::TempDir;
+
+    #[test]
+    fn a_failed_remote_build_fences_its_worker_until_its_lease_releases_source() {
+        let history = BuildHistory::new(10);
+        let held = "rchw-10000000-0000-4000-8000-0000000000f1";
+        let start = |worker: &str, wrapper: &str, location| {
+            history.start_active_build_with_wrapper(
+                "music".into(),
+                worker.into(),
+                "cargo test".into(),
+                0,
+                Some(wrapper.into()),
+                1,
+                location,
+            )
+        };
+        let failed = start("w1", held, BuildLocation::Remote);
+        let succeeded = start(
+            "w2",
+            "rchw-10000000-0000-4000-8000-0000000000f2",
+            BuildLocation::Remote,
+        );
+        let unkeyed = start("w3", "not-a-wrapper", BuildLocation::Remote);
+        let local = start(
+            "w4",
+            "rchw-10000000-0000-4000-8000-0000000000f4",
+            BuildLocation::Local,
+        );
+        for (build, exit_code) in [
+            (&failed, 102),
+            (&succeeded, 0),
+            (&unkeyed, 130),
+            (&local, 1),
+        ] {
+            history
+                .complete_durable(
+                    build.id,
+                    &build.worker_id,
+                    build.local_wrapper_id.as_deref(),
+                    BuildCompletion {
+                        exit_code,
+                        duration_ms: Some(1),
+                        bytes_transferred: None,
+                        timing: None,
+                        cancellation: None,
+                    },
+                )
+                .unwrap();
+        }
+        // The slot is gone, but the worker still refuses this project's root.
+        assert!(history.active_workers_for_project("music").is_empty());
+        let fenced = history.source_fenced_workers("music", |_| true);
+        assert_eq!(fenced, HashSet::from(["w1".to_owned()]));
+        assert!(history.source_fenced_workers("other", |_| true).is_empty());
+        // Once the lease no longer owns source the fence is gone for good.
+        assert!(
+            history
+                .source_fenced_workers("music", |wrapper| wrapper != held)
+                .is_empty()
+        );
+        assert!(history.source_fenced_workers("music", |_| true).is_empty());
+
+        // An unanswered lease cannot hold a worker past the recovery window.
+        let again = start("w1", held, BuildLocation::Remote);
+        history
+            .complete_durable(
+                again.id,
+                "w1",
+                Some(held),
+                BuildCompletion {
+                    exit_code: 130,
+                    duration_ms: Some(1),
+                    bytes_transferred: None,
+                    timing: None,
+                    cancellation: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(history.source_fenced_workers("music", |_| true).len(), 1);
+        history.source_fences.lock().unwrap()[0].created =
+            Instant::now().checked_sub(SOURCE_FENCE_MAX_AGE).unwrap();
+        assert!(history.source_fenced_workers("music", |_| true).is_empty());
+    }
 
     fn disk_budget_admit(
         history: &BuildHistory,
