@@ -346,7 +346,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn shutdown_receipt_cannot_certify_an_uncertain_admission() {
+        use std::os::unix::fs::PermissionsExt;
         let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let mut journal = WorkerJournal::open(root.path(), "shutdown-test", "coord").unwrap();
         let report = CapabilityReport {
             worker_id: "shutdown-test".to_owned(),

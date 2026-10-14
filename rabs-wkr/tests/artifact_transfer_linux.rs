@@ -56,7 +56,7 @@ fn connect_worker() -> (OwnedChild, BufReader<TcpStream>, TcpStream) {
             "artifact-test",
             "--once",
         ])
-        .env("RABS_WORKER_STATE_DIR", state.path())
+        .env("RABS_WORKER_STATE_DIR", state.path().join("state"))
         .stdout(Stdio::null())
         .stderr(Stdio::inherit())
         .spawn()

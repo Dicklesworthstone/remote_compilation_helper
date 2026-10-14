@@ -143,7 +143,7 @@ fn empty_files(root: &Path, count: usize) -> (ToolchainUpload, Value) {
 #[test]
 fn empty_files_share_windows_and_the_final_short_batch_is_drained() {
     for count in [0, 1, 2, 3, 4, 10] {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_util::private_tempdir();
         let (upload, request) = empty_files(root.path(), count);
         let mut peer = TracedPeer::new();
         upload.transmit(&mut peer, &request, false).unwrap();

@@ -111,8 +111,11 @@ struct ReceiverPeer {
 
 impl ReceiverPeer {
     fn new(fixture: &Fixture) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        let owner = tempfile::tempdir().unwrap();
+        fs::set_permissions(owner.path(), fs::Permissions::from_mode(0o700)).unwrap();
         Self {
-            owner: tempfile::tempdir().unwrap(),
+            owner,
             receiver: None,
             files: fixture.files.clone(),
             missing: None,

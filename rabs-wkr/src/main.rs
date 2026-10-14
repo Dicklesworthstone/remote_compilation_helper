@@ -2327,10 +2327,18 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn private_root() -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        root
+    }
+
+    #[cfg(unix)]
     #[test]
     fn invalid_command_context_is_refused_before_durable_admission() {
         use serde_json::{Value, json};
-        let root = tempfile::tempdir().unwrap();
+        let root = private_root();
         let mut journal = WorkerJournal::open(root.path(), "session-test", "coord").unwrap();
         let mut wire = Wire::default();
         let peer = wire.clone();
@@ -2374,7 +2382,7 @@ mod tests {
     #[test]
     fn admitted_context_reaches_execution_and_fences_changed_context_after_restart() {
         use serde_json::json;
-        let root = tempfile::tempdir().unwrap();
+        let root = private_root();
         let mut original = request(170);
         original["command_context"] = json!({"version":"env-cwd-v1",
             "cwd":"/__rabs/workspace/member","env":{"LABEL":"exact\n雪","EMPTY":""}});
@@ -2811,7 +2819,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn journaled_result_write_failure_reconciles_without_duplicate_execution() {
-        let root = tempfile::tempdir().unwrap();
+        let root = private_root();
         let mut journal = WorkerJournal::open(root.path(), "session-test", "coord").unwrap();
         let mut wire = Wire::default();
         wire.frame(request(40));
@@ -2870,7 +2878,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn journaled_disconnect_records_only_after_session_owned_cleanup() {
-        let root = tempfile::tempdir().unwrap();
+        let root = private_root();
         let mut journal = WorkerJournal::open(root.path(), "session-test", "coord").unwrap();
         let mut wire = Wire::default();
         wire.frame(request(50));
@@ -2911,7 +2919,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn journaled_unfinished_admission_blocks_replay_and_new_work() {
-        let root = tempfile::tempdir().unwrap();
+        let root = private_root();
         let mut journal = WorkerJournal::open(root.path(), "session-test", "coord").unwrap();
         journal
             .admit(&request(60), DEFAULT_EXECUTION_TIMEOUT)
@@ -2944,7 +2952,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn journaled_launch_failure_does_not_authorize_another_attempt() {
-        let root = tempfile::tempdir().unwrap();
+        let root = private_root();
         let mut journal = WorkerJournal::open(root.path(), "session-test", "coord").unwrap();
         let mut wire = Wire::default();
         let peer = wire.clone();
@@ -2973,7 +2981,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn journal_handshake_advertises_identity_and_recovery_version() {
-        let root = tempfile::tempdir().unwrap();
+        let root = private_root();
         let mut journal = WorkerJournal::open(root.path(), "session-test", "coord").unwrap();
         journal
             .admit(&request(80), DEFAULT_EXECUTION_TIMEOUT)
@@ -3020,7 +3028,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn unnegotiated_artifact_request_does_not_burn_durable_admission() {
-        let root = tempfile::tempdir().unwrap();
+        let root = private_root();
         let mut journal = WorkerJournal::open(root.path(), "session-test", "coord").unwrap();
         let mut wire = Wire::default();
         let peer = wire.clone();
@@ -3048,7 +3056,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn durable_artifact_identity_survives_restart_without_claiming_scratch_recovery() {
-        let root = tempfile::tempdir().unwrap();
+        let root = private_root();
         let mut journal = WorkerJournal::open(root.path(), "session-test", "coord").unwrap();
         let mut wire = Wire::default();
         let peer = wire.clone();
@@ -3143,7 +3151,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn retained_result_is_durable_before_failed_delivery_and_blocks_new_work() {
-        let root = tempfile::tempdir().unwrap();
+        let root = private_root();
         let mut journal = WorkerJournal::open(root.path(), "session-test", "coord").unwrap();
         let mut wire = Wire::default();
         wire.frame(artifact_request(110));
@@ -3204,7 +3212,7 @@ mod tests {
     #[test]
     fn retained_spool_is_released_only_after_both_identity_bound_acks() {
         for artifacts_first in [false, true] {
-            let root = tempfile::tempdir().unwrap();
+            let root = private_root();
             let mut journal = WorkerJournal::open(root.path(), "session-test", "coord").unwrap();
             let mut wire = Wire::default();
             let peer = wire.clone();
@@ -3312,7 +3320,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn restarted_session_resumes_exact_binary_ranges_without_launching_any_process() {
-        let root = tempfile::tempdir().unwrap();
+        let root = private_root();
         leave_retained_result(root.path(), 130);
         let mut journal = WorkerJournal::open(root.path(), "session-test", "coord").unwrap();
         journal.authorize_result_recipient(ResultRecipient::TlsSpki([7; 32]));
@@ -3359,7 +3367,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn resume_requires_negotiation_exact_original_request_and_original_tls_recipient() {
-        let root = tempfile::tempdir().unwrap();
+        let root = private_root();
         leave_retained_result(root.path(), 140);
         let mut journal = WorkerJournal::open(root.path(), "session-test", "coord").unwrap();
         for recipient in [
@@ -3429,7 +3437,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn disconnect_after_one_ack_retains_both_streams_for_a_second_restart() {
-        let root = tempfile::tempdir().unwrap();
+        let root = private_root();
         leave_retained_result(root.path(), 150);
         let mut original_offer = None;
         for _ in 0..2 {

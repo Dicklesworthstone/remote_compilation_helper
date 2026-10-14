@@ -1618,6 +1618,7 @@ mod tests {
         };
         use std::os::unix::fs::PermissionsExt;
 
+        std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700)).unwrap();
         let (upload, mut request, mut script, _) = source_fixture(root);
         let original = root.join("compiler-input");
         std::fs::create_dir(&original).unwrap();

@@ -839,7 +839,7 @@ mod tests {
     impl ReceiverPeer {
         fn new() -> Self {
             Self {
-                owner: tempfile::tempdir().unwrap(),
+                owner: crate::test_util::private_tempdir(),
                 receiver: None,
                 replies: VecDeque::new(),
                 sent: Vec::new(),
