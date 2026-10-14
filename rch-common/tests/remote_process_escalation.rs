@@ -172,6 +172,8 @@ code=$?
     [ -z "$rch_witness_identity" ] && [ "$rch_term_sent" = 0 ] || exit 1
 # A live group with no matching leader at entry must remain quarantined.
 rch_read_record() { rch_identified=1; rch_boot=boot; rch_pgid=300; rch_start=100; }
+# Same boot (812d6a97 checks boot first; remote_reboot_recovery.py covers it).
+rch_recovery_boot_state() { return 0; }
 rch_group_state() { rch_snapshot='301 300 S'; return 1; }
 rch_remote_leader_matches() { return 1; }
 rch_read_process() { rch_observed_boot=boot; rch_observed_start=200; }

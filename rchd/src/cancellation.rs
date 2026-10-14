@@ -3118,23 +3118,29 @@ exec /bin/sh -c "$payload"
         let prior_start = start.parse::<u64>().unwrap().checked_add(1).unwrap();
         let root = tempfile::tempdir().unwrap().keep();
         let path = root.join("identity.pgid");
-        for (case, record) in [
-            ("wrong-build", remote_cancel_record(41, pgid)),
+        // Since 812d6a97 a record from another boot is judged by boot evidence
+        // before any live check: the zero UUID is not valid evidence (44,
+        // unavailable). A valid prior boot settles as gone; remote_reboot_recovery.py
+        // covers that. Either way the reused occupant is never signalled.
+        for (case, record, expected) in [
+            ("wrong-build", remote_cancel_record(41, pgid), 43),
             (
                 "wrong-boot",
                 format!("RCH_REMOTE_PROCESS_V1:42:{other_boot}:{pgid}:{start}\n"),
+                44,
             ),
             (
                 // Model a reused leader PID with a different recorded start;
                 // the current PID occupant is a real controlled sentinel.
                 "reused-leader-start",
                 format!("RCH_REMOTE_PROCESS_V1:42:{boot}:{pgid}:{prior_start}\n"),
+                43,
             ),
-            ("legacy-live-group", format!("{pgid}\n")),
+            ("legacy-live-group", format!("{pgid}\n"), 43),
         ] {
             std::fs::write(&path, &record).unwrap();
             let output = remote_cancel_probe_fixture(&path, "").await;
-            assert_eq!(output.status.code(), Some(43), "{case}: {output:?}");
+            assert_eq!(output.status.code(), Some(expected), "{case}: {output:?}");
             assert!(
                 output.stdout.is_empty(),
                 "{case}: false cancellation receipt"
