@@ -115,6 +115,7 @@ pub(crate) fn require_active_authority(
     store: &mut dyn RabsMetadataStore,
     authority: &TypedDigest,
 ) -> Result<(), StoreError> {
+    store.intern_domain(authority.domain);
     match store.active_authority()? {
         Some(current) if &current.digest == authority => Ok(()),
         _ => Err(StoreError::NotActiveAuthority),
@@ -265,6 +266,7 @@ pub fn reevaluate_action(
     policies: &[TrustPolicy],
     seq: u64,
 ) -> Result<TrustReevaluation, TrustEvidenceError> {
+    store.intern_domain(action.domain);
     if !store.has_publication(action)? {
         return Err(TrustEvidenceError::NotPublished);
     }
