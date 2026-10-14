@@ -1639,6 +1639,33 @@ struct RetrySelectionIntent {
 )]
 pub(crate) struct JobJournalBusy;
 
+/// Tests only: retry an operation that re-acquires a job-journal gate the test
+/// has just released. While the gate was held, another test in this process
+/// may have spawned a child, which shares every descriptor until it execs
+/// (CLOEXEC only closes them at exec), so the flock'd gate can still look busy
+/// for a moment. Production never re-acquires a gate it released in the same
+/// process. A gate still held after the bound is a real leak and fails.
+#[cfg(all(test, unix))]
+pub(crate) async fn after_gate_release<T, Fut>(
+    mut attempt: impl FnMut() -> Fut,
+) -> anyhow::Result<T>
+where
+    Fut: std::future::Future<Output = anyhow::Result<T>>,
+{
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match attempt().await {
+            Err(error)
+                if error.downcast_ref::<JobJournalBusy>().is_some()
+                    && std::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            result => return result,
+        }
+    }
+}
+
 fn selection_is_pending(lease: &DurableJobLease) -> bool {
     matches!(
         lease.phase.as_str(),

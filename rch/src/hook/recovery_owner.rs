@@ -857,7 +857,10 @@ mod tests {
                 assert_eq!(std::fs::read_dir(root.join("caller")).unwrap().count(), 0);
                 // Only this failed collector's lock is released. The journal
                 // and source-ownership facts remain exactly as supplied.
-                let _retry_gate = acquire_gate(&writer.path).unwrap();
+                let _retry_gate =
+                    crate::hook::after_gate_release(|| async { acquire_gate(&writer.path) })
+                        .await
+                        .unwrap();
             }
         }
     }
@@ -890,7 +893,10 @@ mod tests {
             assert!(owned.acknowledge_terminal().is_err());
             drop(session);
             drop(owned);
-            let _retry = claim_with(&writer, |_| async { Ok(true) }).await.unwrap();
+            let _retry =
+                crate::hook::after_gate_release(|| claim_with(&writer, |_| async { Ok(true) }))
+                    .await
+                    .unwrap();
             assert_eq!(writer.snapshot(), disk);
             assert_eq!(
                 std::fs::read(root.join("worker/retained-output")).unwrap(),
@@ -977,8 +983,10 @@ mod tests {
         guard.record_exit(102).unwrap();
         guard.acknowledge_terminal().unwrap();
         drop(guard);
-        let _next = claim_with(&stale, |_| async {
-            panic!("already acknowledged terminal state needs no owner probe")
+        let _next = crate::hook::after_gate_release(|| {
+            claim_with(&stale, |_| async {
+                panic!("already acknowledged terminal state needs no owner probe")
+            })
         })
         .await
         .unwrap();
@@ -1104,7 +1112,10 @@ mod tests {
         assert!(clone.persist().is_err());
         drop(replacement);
         drop(clone);
-        let _released = acquire_gate(&root.join("original-jobs/lease.json")).unwrap();
+        let original = root.join("original-jobs/lease.json");
+        let _released = crate::hook::after_gate_release(|| async { acquire_gate(&original) })
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -1195,7 +1206,10 @@ mod tests {
             .is_err()
         );
         assert_eq!(std::fs::read(&writer.path).unwrap(), before);
-        let _retry = claim_with(&writer, |_| async { Ok(true) }).await.unwrap();
+        let _retry =
+            crate::hook::after_gate_release(|| claim_with(&writer, |_| async { Ok(true) }))
+                .await
+                .unwrap();
     }
 
     #[tokio::test]
@@ -1242,7 +1256,9 @@ mod tests {
         ));
         assert!(acquire_gate(&writer.path).is_err());
         drop(claim);
-        let _next = claim_with(&writer, |_| async { Ok(true) }).await.unwrap();
+        let _next = crate::hook::after_gate_release(|| claim_with(&writer, |_| async { Ok(true) }))
+            .await
+            .unwrap();
         assert_eq!(std::fs::read(&writer.path).unwrap(), before);
     }
 

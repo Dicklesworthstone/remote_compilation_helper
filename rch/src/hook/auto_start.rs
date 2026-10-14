@@ -1555,12 +1555,14 @@ mod tests {
         let link = dir.path().join("socket-link");
         std::fs::write(&regular, b"keep me").unwrap();
         std::os::unix::fs::symlink(&regular, &link).unwrap();
-        for socket in [&regular, &link] {
+        // One start lock per endpoint: re-taking a lock this test just released
+        // can race a concurrent test's forked child that still shares it.
+        for (socket, name) in [(&regular, "regular"), (&link, "link")] {
             let result = recover_daemon_with_paths(
                 &recovery_config(),
                 socket,
-                &dir.path().join("start.lock"),
-                &dir.path().join("cooldown"),
+                &dir.path().join(format!("{name}.start.lock")),
+                &dir.path().join(format!("{name}.cooldown")),
                 |_| panic!("invalid endpoint must not launch"),
             )
             .await;

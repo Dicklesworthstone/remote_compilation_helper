@@ -837,10 +837,10 @@ mod tests {
         // The remote worker is deliberately unreachable. A second pass must
         // remain read-only and not even call the daemon transport.
         assert_eq!(
-            Box::pin(super::super::recover_job_with_daemon(
+            crate::hook::after_gate_release(|| Box::pin(super::super::recover_job_with_daemon(
                 &writer,
                 async |_command: &str| { panic!("acknowledged recovery contacted a peer") }
-            ))
+            )))
             .await
             .unwrap(),
             102

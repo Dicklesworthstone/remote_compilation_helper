@@ -3268,6 +3268,12 @@ mod tests {
                     socket
                         .set_write_timeout(Some(std::time::Duration::from_secs(2)))
                         .unwrap();
+                    // A child forked by a concurrent test can hold a copy of
+                    // `peer` until it execs, keeping the pair open, and the
+                    // write then succeeds. Shutting down our write half (while
+                    // connected; macOS refuses it after the peer closes) makes
+                    // the delivery fail with EPIPE whoever holds the peer.
+                    socket.shutdown(std::net::Shutdown::Write).unwrap();
                     drop(peer);
                     OutputWriter::new(socket, false)
                 } else {
