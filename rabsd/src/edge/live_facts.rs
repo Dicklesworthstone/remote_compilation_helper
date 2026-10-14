@@ -504,20 +504,27 @@ fn capture_dependencies(
     roots: DependencyRoots,
     members: DependencyMembers,
     output: DependencyOutput,
-) -> Result<DependencyFacts, String> {
-    let root_identities = dependency_root_identities(&roots)?;
+    mut cold_budget: Option<u64>,
+) -> Result<DependencyFacts, FactsMiss> {
+    let root_identities = dependency_root_identities(&roots).map_err(FactsMiss::Refused)?;
     let mut directories = Vec::new();
     for ((root, _), inventory) in roots.iter().zip(&members) {
         let mut artifacts = Vec::new();
-        for (name, _) in inventory {
+        for (name, sig) in inventory {
             let path = root.join(name);
             artifacts.push(ExternFact {
-                path: path.to_str().ok_or("non-UTF-8 dependency path")?.to_owned(),
-                content_digest: facts.file_digest(&path).map_err(|e| e.to_string())?,
+                path: path
+                    .to_str()
+                    .ok_or_else(|| FactsMiss::Refused("non-UTF-8 dependency path".into()))?
+                    .to_owned(),
+                content_digest: facts.dependency_digest(&path, *sig, &mut cold_budget)?,
             });
         }
         directories.push(DependencyDirectoryFact {
-            path: root.to_str().ok_or("non-UTF-8 dependency root")?.to_owned(),
+            path: root
+                .to_str()
+                .ok_or_else(|| FactsMiss::Refused("non-UTF-8 dependency root".into()))?
+                .to_owned(),
             artifacts,
         });
     }
@@ -528,7 +535,7 @@ fn capture_dependencies(
         output,
         root_identities,
     };
-    captured.verify_unchanged()?;
+    captured.verify_unchanged().map_err(FactsMiss::Refused)?;
     Ok(captured)
 }
 
@@ -914,7 +921,9 @@ impl LiveFacts {
     }
 
     /// Capture exact dependency directory contents with bounded cold hashing.
-    /// Large cold inventories warm in the existing bounded background pool.
+    /// Only bytes missing from the identity-validated file memo consume the
+    /// request budget. A large inventory of known outputs needs no background
+    /// slot merely because this invocation has a different output mapping.
     pub fn dependencies(
         self: &Arc<Self>,
         plan: &DependencyActionPlan,
@@ -933,7 +942,9 @@ impl LiveFacts {
                 )
             })
             .collect();
-        let (members, bytes) = walk_dependencies(&roots).map_err(FactsMiss::Refused)?;
+        // Keep the full inventory and its aggregate byte/count bounds. This
+        // changes observation scheduling, never which candidates key a build.
+        let (members, _) = walk_dependencies(&roots).map_err(FactsMiss::Refused)?;
         let output = (PathBuf::from(&plan.out_dir), plan.output_names());
         reject_dependency_output_aliases(&roots, &members, &output).map_err(FactsMiss::Refused)?;
         let root_identities = dependency_root_identities(&roots).map_err(FactsMiss::Refused)?;
@@ -961,36 +972,121 @@ impl LiveFacts {
             if memos.len() >= MAX_DEPENDENCY_MEMOS {
                 memos.retain(|_, slot| matches!(slot, Slot::Warming));
             }
-            if bytes > SYNCHRONOUS_PACKAGE_BYTES {
-                memos.insert(memo_key.clone(), Slot::Warming);
-                drop(memos);
-                let warm_roots = roots.clone();
-                let warm_key = memo_key.clone();
-                if !self.start_warm(move |facts| {
-                    let slot = match capture_dependencies(facts, warm_roots, members, output) {
-                        Ok(captured) => Slot::Ready(Arc::new(captured)),
-                        Err(reason) => Slot::Failed {
-                            reason,
-                            at: Instant::now(),
-                        },
-                    };
-                    if let Ok(mut memos) = facts.dependencies.lock() {
-                        memos.insert(warm_key, slot);
-                    }
-                }) && let Ok(mut memos) = self.dependencies.lock()
-                {
-                    memos.remove(&memo_key);
-                }
+            if memos.len() >= MAX_DEPENDENCY_MEMOS {
                 return Err(FactsMiss::Pending);
             }
+            // One owner performs this capture and any subsequent warm. Keep
+            // concurrent foreground captures inside the same memo count bound.
+            memos.insert(memo_key.clone(), Slot::Warming);
         }
-        let captured = Arc::new(
-            capture_dependencies(self, roots, members, output).map_err(FactsMiss::Refused)?,
-        );
-        if let Ok(mut memos) = self.dependencies.lock() {
-            memos.insert(memo_key, Slot::Ready(Arc::clone(&captured)));
+        // Keep genuinely large cold inventories off the request path. This
+        // estimate grants no read authority: capture independently enforces
+        // the budget if a memo is evicted or a candidate changes afterward.
+        let captured = if self.dependency_budget_fits(&roots, &members, SYNCHRONOUS_PACKAGE_BYTES) {
+            capture_dependencies(
+                self,
+                roots.clone(),
+                members.clone(),
+                output.clone(),
+                Some(SYNCHRONOUS_PACKAGE_BYTES),
+            )
+        } else {
+            Err(FactsMiss::Pending)
+        };
+        match captured {
+            Ok(captured) => {
+                let captured = Arc::new(captured);
+                if let Ok(mut memos) = self.dependencies.lock() {
+                    memos.insert(memo_key, Slot::Ready(Arc::clone(&captured)));
+                }
+                return Ok(captured);
+            }
+            Err(FactsMiss::Refused(reason)) => {
+                if let Ok(mut memos) = self.dependencies.lock() {
+                    memos.remove(&memo_key);
+                }
+                return Err(FactsMiss::Refused(reason));
+            }
+            Err(FactsMiss::Pending) => {}
         }
-        Ok(captured)
+        // A bounded foreground pass may have memoized small cold inputs.
+        // The background capture reuses those exact identities, but still
+        // checks every root, candidate and output alias before returning.
+        let warm_key = memo_key.clone();
+        if !self.start_warm(move |facts| {
+            let slot = match capture_dependencies(facts, roots, members, output, None) {
+                Ok(captured) => Slot::Ready(Arc::new(captured)),
+                Err(error) => Slot::Failed {
+                    reason: error.to_string(),
+                    at: Instant::now(),
+                },
+            };
+            if let Ok(mut memos) = facts.dependencies.lock() {
+                memos.insert(warm_key, slot);
+            }
+        }) && let Ok(mut memos) = self.dependencies.lock()
+        {
+            memos.remove(&memo_key);
+        }
+        Err(FactsMiss::Pending)
+    }
+
+    /// Scheduling estimate only. The foreground capture independently charges
+    /// each actual cache miss, without holding this mutex over filesystem I/O.
+    fn dependency_budget_fits(
+        &self,
+        roots: &DependencyRoots,
+        members: &DependencyMembers,
+        mut budget: u64,
+    ) -> bool {
+        let files = self.files.lock().ok();
+        for ((root, _), inventory) in roots.iter().zip(members) {
+            for (name, sig) in inventory {
+                if files
+                    .as_ref()
+                    .and_then(|files| files.get(&root.join(name)))
+                    .is_some_and(|(cached, _)| cached == sig)
+                {
+                    continue;
+                }
+                let Some(remaining) = budget.checked_sub(sig.size) else {
+                    return false;
+                };
+                budget = remaining;
+            }
+        }
+        true
+    }
+
+    /// Charge only a real memo miss, using the inventory's admitted size.
+    /// Eviction after the estimate must never permit an unbounded cold read.
+    fn dependency_digest(
+        &self,
+        path: &Path,
+        expected: FileSig,
+        cold_budget: &mut Option<u64>,
+    ) -> Result<TypedDigest, FactsMiss> {
+        let now = lstat_regular(path).map_err(|error| FactsMiss::Refused(error.to_string()))?;
+        if now != expected {
+            return Err(FactsMiss::Refused(
+                "dependency changed after enumeration".into(),
+            ));
+        }
+        if let Ok(files) = self.files.lock()
+            && let Some((sig, digest)) = files.get(path)
+            && *sig == expected
+        {
+            return Ok(digest.clone());
+        }
+        if let Some(remaining) = cold_budget {
+            *remaining = remaining
+                .checked_sub(expected.size)
+                .ok_or(FactsMiss::Pending)?;
+        }
+        let (sig, digest) = digest_stable_at(path, expected)
+            .map_err(|error| FactsMiss::Refused(error.to_string()))?;
+        self.remember(path, sig, digest.clone());
+        Ok(digest)
     }
 
     fn start_warm(self: &Arc<Self>, work: impl FnOnce(&Self) + Send + 'static) -> bool {
@@ -1189,6 +1285,222 @@ impl LiveFacts {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // These exercise observation/admission, not rustc metadata validity or
+    // serving qualification. The files are regular dependency candidates.
+    fn dependency_budget_fixture(
+        sizes: &[u64],
+    ) -> (tempfile::TempDir, DependencyActionPlan, Vec<PathBuf>) {
+        let (dir, mut plan) = generated_fixture();
+        plan.dependency_dirs = vec![plan.out_dir.clone()];
+        let paths = sizes
+            .iter()
+            .enumerate()
+            .map(|(index, size)| {
+                let path = Path::new(&plan.out_dir).join(format!("libbudget{index}.rmeta"));
+                std::fs::File::create(&path)
+                    .unwrap()
+                    .set_len(*size)
+                    .unwrap();
+                path
+            })
+            .collect();
+        (dir, plan, paths)
+    }
+
+    #[test]
+    fn warm_dependency_bytes_admit_new_output_mappings_without_a_warm_slot() {
+        let (dir, mut plan, paths) =
+            dependency_budget_fixture(&[SYNCHRONOUS_PACKAGE_BYTES + 1]);
+        let facts = LiveFacts::new();
+        let expected = facts.file_digest(&paths[0]).unwrap();
+        // Forbid a background rescue: warm identities must suffice even
+        // while the background pool is occupied with other observations.
+        *facts.warming.lock().unwrap() = MAX_WARMING;
+        let first = facts.dependencies(&plan).expect("warm dependency admitted");
+        first.verify_unchanged().unwrap();
+        assert_eq!(first.directories[0].artifacts[0].content_digest, expected);
+        assert!(Arc::ptr_eq(&first, &facts.dependencies(&plan).unwrap()));
+        let other = dir.path().join("another-output-mapping");
+        std::fs::create_dir(&other).unwrap();
+        plan.out_dir = other.to_str().unwrap().to_owned();
+        let second = facts.dependencies(&plan).expect("new mapping, same warm bytes");
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert_eq!(second.directories[0].artifacts[0].content_digest, expected);
+        assert_eq!(*facts.warming.lock().unwrap(), MAX_WARMING);
+    }
+
+    #[test]
+    fn small_cold_tail_in_a_large_warm_inventory_is_admitted() {
+        let (_dir, plan, paths) =
+            dependency_budget_fixture(&[SYNCHRONOUS_PACKAGE_BYTES + 1, 17]);
+        let facts = LiveFacts::new();
+        let warm = facts.file_digest(&paths[0]).unwrap();
+        *facts.warming.lock().unwrap() = MAX_WARMING;
+        let captured = facts.dependencies(&plan).expect("only 17 bytes are cold");
+        assert_eq!(captured.directories[0].artifacts.len(), 2);
+        assert_eq!(captured.directories[0].artifacts[0].content_digest, warm);
+        assert_eq!(
+            captured.directories[0].artifacts[1].content_digest,
+            digest_stable(&paths[1]).unwrap().1
+        );
+        captured.verify_unchanged().unwrap();
+    }
+
+    #[test]
+    fn dependency_read_budget_is_shared_and_memo_hits_are_free() {
+        let (_dir, _plan, paths) = dependency_budget_fixture(&[9, 7]);
+        let facts = LiveFacts::new();
+        let first = lstat_regular(&paths[0]).unwrap();
+        let second = lstat_regular(&paths[1]).unwrap();
+        let mut budget = Some(9);
+        let digest = facts.dependency_digest(&paths[0], first, &mut budget).unwrap();
+        assert_eq!(budget, Some(0));
+        assert_eq!(
+            facts.dependency_digest(&paths[0], first, &mut budget).unwrap(),
+            digest
+        );
+        assert_eq!(budget, Some(0));
+        assert_eq!(
+            facts.dependency_digest(&paths[1], second, &mut budget),
+            Err(FactsMiss::Pending)
+        );
+        assert_eq!(budget, Some(0));
+        assert!(!facts.files.lock().unwrap().contains_key(&paths[1]));
+    }
+
+    #[test]
+    fn memo_eviction_after_estimation_cannot_authorize_a_cold_read() {
+        let (_dir, plan, paths) = dependency_budget_fixture(&[17]);
+        let facts = LiveFacts::new();
+        facts.file_digest(&paths[0]).unwrap();
+        let roots = vec![(PathBuf::from(&plan.out_dir), plan.output_names())];
+        let (members, _) = walk_dependencies(&roots).unwrap();
+        assert!(facts.dependency_budget_fits(&roots, &members, 0));
+        facts.files.lock().unwrap().clear();
+        assert!(matches!(
+            capture_dependencies(
+                &facts,
+                roots,
+                members,
+                (PathBuf::from(&plan.out_dir), plan.output_names()),
+                Some(0),
+            ),
+            Err(FactsMiss::Pending)
+        ));
+        assert!(!facts.files.lock().unwrap().contains_key(&paths[0]));
+    }
+
+    #[test]
+    fn dependency_replacement_after_enumeration_refuses_before_spending_budget() {
+        let (dir, _plan, paths) = dependency_budget_fixture(&[17]);
+        let facts = LiveFacts::new();
+        let observed = lstat_regular(&paths[0]).unwrap();
+        std::fs::rename(&paths[0], dir.path().join("retained-old-input")).unwrap();
+        std::fs::write(&paths[0], b"replacement bytes").unwrap();
+        let mut budget = Some(17);
+        assert!(matches!(
+            facts.dependency_digest(&paths[0], observed, &mut budget),
+            Err(FactsMiss::Refused(reason)) if reason.contains("after enumeration")
+        ));
+        assert_eq!(budget, Some(17));
+        assert!(facts.files.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn replaced_warm_candidate_becomes_cold_and_cannot_reuse_its_old_digest() {
+        let (dir, plan, paths) =
+            dependency_budget_fixture(&[SYNCHRONOUS_PACKAGE_BYTES + 1]);
+        let facts = LiveFacts::new();
+        let old = facts.file_digest(&paths[0]).unwrap();
+        *facts.warming.lock().unwrap() = MAX_WARMING;
+        let captured = facts.dependencies(&plan).unwrap();
+        std::fs::rename(&paths[0], dir.path().join("retained-old-input")).unwrap();
+        std::fs::write(
+            &paths[0],
+            vec![1; usize::try_from(SYNCHRONOUS_PACKAGE_BYTES + 1).unwrap()],
+        )
+        .unwrap();
+        assert!(captured.verify_unchanged().is_err());
+        assert!(matches!(facts.dependencies(&plan), Err(FactsMiss::Pending)));
+        // Failed warm admission releases this inventory's reservation.
+        // After observing the new bytes the next request can try again.
+        let new = facts.file_digest(&paths[0]).unwrap();
+        assert_ne!(old, new);
+        let changed = facts.dependencies(&plan).unwrap();
+        assert_eq!(changed.directories[0].artifacts[0].content_digest, new);
+        changed.verify_unchanged().unwrap();
+    }
+
+    #[test]
+    fn warm_admission_preserves_negative_candidates_and_output_alias_refusals() {
+        let (_dir, plan, paths) =
+            dependency_budget_fixture(&[SYNCHRONOUS_PACKAGE_BYTES + 1]);
+        let facts = LiveFacts::new();
+        facts.file_digest(&paths[0]).unwrap();
+        *facts.warming.lock().unwrap() = MAX_WARMING;
+        let before = facts.dependencies(&plan).unwrap();
+        std::fs::write(Path::new(&plan.out_dir).join("libnew.rmeta"), b"new").unwrap();
+        assert!(before.verify_unchanged().is_err());
+        let after = facts.dependencies(&plan).unwrap();
+        assert_eq!(after.directories[0].artifacts.len(), 2);
+        let output = Path::new(&plan.out_dir).join(&plan.output_names()[0]);
+        std::fs::hard_link(&paths[0], output).unwrap();
+        assert!(matches!(
+            facts.dependencies(&plan),
+            Err(FactsMiss::Refused(reason)) if reason.contains("aliases a declared output")
+        ));
+    }
+
+    #[test]
+    fn cold_dependency_still_warms_in_the_existing_bounded_pool() {
+        let (_dir, plan, _paths) =
+            dependency_budget_fixture(&[SYNCHRONOUS_PACKAGE_BYTES + 1]);
+        let facts = LiveFacts::new();
+        assert!(matches!(facts.dependencies(&plan), Err(FactsMiss::Pending)));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            assert!(Instant::now() < deadline, "dependency warm did not finish");
+            match facts.dependencies(&plan) {
+                Ok(captured) => {
+                    captured.verify_unchanged().unwrap();
+                    assert_eq!(captured.directories[0].artifacts.len(), 1);
+                    break;
+                }
+                Err(FactsMiss::Pending) => std::thread::sleep(Duration::from_millis(5)),
+                Err(error) => panic!("dependency warm refused: {error}"),
+            }
+        }
+    }
+
+    #[test]
+    fn large_cold_inventory_does_not_spend_the_foreground_budget_before_deferral() {
+        let (_dir, plan, _paths) =
+            dependency_budget_fixture(&[SYNCHRONOUS_PACKAGE_BYTES / 2 + 1; 2]);
+        let facts = LiveFacts::new();
+        *facts.warming.lock().unwrap() = MAX_WARMING;
+        assert!(matches!(facts.dependencies(&plan), Err(FactsMiss::Pending)));
+        assert!(facts.files.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn foreground_capture_reservations_keep_the_inventory_memo_bounded() {
+        let (dir, plan, _paths) = dependency_budget_fixture(&[17]);
+        let facts = LiveFacts::new();
+        {
+            let mut memos = facts.dependencies.lock().unwrap();
+            for index in 0..MAX_DEPENDENCY_MEMOS {
+                memos.insert(
+                    (Vec::new(), (dir.path().join(format!("out-{index}")), Vec::new())),
+                    Slot::Warming,
+                );
+            }
+        }
+        assert!(matches!(facts.dependencies(&plan), Err(FactsMiss::Pending)));
+        assert_eq!(facts.dependencies.lock().unwrap().len(), MAX_DEPENDENCY_MEMOS);
+        assert!(facts.files.lock().unwrap().is_empty());
+        assert_eq!(*facts.warming.lock().unwrap(), 0);
+    }
 
     #[test]
     fn observed_hashing_keeps_streaming_identity() {
@@ -1504,6 +1816,7 @@ mod tests {
                 roots.clone(),
                 members,
                 (root.clone(), vec!["libcurrent.rmeta".into()]),
+                None,
             )
             .unwrap()
         };
@@ -1575,6 +1888,7 @@ mod tests {
             roots.clone(),
             members.clone(),
             (dir.path().join("out"), Vec::new()),
+            None,
         )
         .unwrap();
         std::fs::write(
@@ -1612,6 +1926,7 @@ mod tests {
             roots.clone(),
             before.clone(),
             (dir.path().join("out"), Vec::new()),
+            None,
         )
         .unwrap();
         // rustc finishes the dependency's codegen while its dependent runs:
@@ -1658,7 +1973,7 @@ mod tests {
         let roots = vec![(dependencies.clone(), Vec::new())];
         let output = (out.clone(), vec!["libcurrent.rlib".into()]);
         let (members, _) = walk_dependencies(&roots).unwrap();
-        let captured = capture_dependencies(&LiveFacts::new(), roots, members, output).unwrap();
+        let captured = capture_dependencies(&LiveFacts::new(), roots, members, output, None).unwrap();
         captured.verify_unchanged().unwrap();
         // An alias created after keying must also refuse at pre-hit / completion.
         std::fs::hard_link(
@@ -1701,6 +2016,7 @@ mod tests {
             roots.clone(),
             members.clone(),
             (out, Vec::new()),
+            None,
         )
         .unwrap();
         // Scratch churn bumps the directory generation; it is not an input.
