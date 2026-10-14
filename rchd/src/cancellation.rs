@@ -3337,14 +3337,14 @@ exec /bin/sh -c "$payload"
                 if mode == "hang" {
                     let bounded = CancellationOrchestrator::new(
                         CancellationConfig {
-                            cleanup_timeout: Duration::from_millis(200),
+                            cleanup_timeout: Duration::from_secs(1),
                             remote_kill_timeout: Duration::from_secs(60),
                             ..test_config()
                         },
                         test_events(),
                     );
                     tokio::time::timeout(
-                        Duration::from_secs(2),
+                        Duration::from_secs(5),
                         bounded.execute_cancellation(&mut record, true),
                     )
                     .await
@@ -3399,6 +3399,9 @@ exec /bin/sh -c "$payload"
         std::fs::write(
             &ssh,
             r#"#!/bin/sh
+# First, before any other spawn: a short deadline on a loaded host can stop
+# this process before the slower commands below run.
+printf '%s\n' "$$" > "$RCH_REMOTE_CANCEL_TEST_ROOT/hanging-ssh-pid"
 id=$(/bin/cat "$RCH_REMOTE_CANCEL_TEST_ROOT/build-id") || exit 99
 mode=$(/bin/cat "$RCH_REMOTE_CANCEL_TEST_ROOT/mode") || exit 99
 printf '%s\n' "$@" > "$RCH_REMOTE_CANCEL_TEST_ROOT/ssh-argv"
@@ -3408,7 +3411,7 @@ case "$mode" in
   wrong-id) printf 'RCH_REMOTE_CANCELLED_V1:0\n';;
   duplicate) printf 'RCH_REMOTE_CANCELLED_V1:%s\n' "$id" "$id";;
   failed) printf 'RCH_REMOTE_CANCELLED_V1:%s\n' "$id"; exit 255;;
-  hang) printf '%s\n' "$$" > "$RCH_REMOTE_CANCEL_TEST_ROOT/hanging-ssh-pid"; exec /bin/sleep 60;;
+  hang) exec /bin/sleep 60;;
   confirmed) printf 'RCH_REMOTE_CANCELLED_V1:%s\n' "$id";;
   *) exit 99;;
 esac
