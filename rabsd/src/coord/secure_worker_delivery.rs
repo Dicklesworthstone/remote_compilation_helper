@@ -651,7 +651,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> WorkerPeer for RecordPeer<'_, S> {
         let bytes = self.outbound(frame)?;
         let budget = self.remaining()?;
         let stream = &mut self.stream;
-        let result = rabs_asupersync::daemon_runtime::block_on_top_level(&self.runtime, async {
+        let result = rabs_asupersync::daemon_runtime::block_on_top_level(self.runtime, async {
             asupersync::time::timeout(asupersync::time::wall_now(), budget, async {
                 stream
                     .write_all(&bytes)
@@ -675,7 +675,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> WorkerPeer for RecordPeer<'_, S> {
         let budget = self.remaining()?;
         let stream = &mut self.stream;
         let buffered = &mut self.buffered;
-        let result = rabs_asupersync::daemon_runtime::block_on_top_level(&self.runtime, async {
+        let result = rabs_asupersync::daemon_runtime::block_on_top_level(self.runtime, async {
             asupersync::time::timeout(
                 asupersync::time::wall_now(),
                 budget,

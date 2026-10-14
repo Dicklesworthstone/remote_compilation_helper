@@ -265,7 +265,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin, I: Interrupts> OperatorPeer<'_, S, I> {
         }
         let stream = &mut self.inner.stream;
         let interrupts = &mut self.interrupts;
-        rabs_asupersync::daemon_runtime::block_on_top_level(&self.inner.runtime, async {
+        rabs_asupersync::daemon_runtime::block_on_top_level(self.inner.runtime, async {
             asupersync::time::timeout(asupersync::time::wall_now(), budget, async {
                 let mut stopped = pin!(interrupts.wait());
                 let mut writing = pin!(async {
@@ -385,7 +385,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin, I: Interrupts> OperatorPeer<'_, S, I> {
                 self.preview.as_ref().and_then(PreviewSession::wake_at)
             };
             let event =
-                rabs_asupersync::daemon_runtime::block_on_top_level(&self.inner.runtime, async {
+                rabs_asupersync::daemon_runtime::block_on_top_level(self.inner.runtime, async {
                     asupersync::time::timeout(
                         asupersync::time::wall_now(),
                         budget,
