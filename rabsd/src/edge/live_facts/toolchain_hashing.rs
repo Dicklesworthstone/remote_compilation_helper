@@ -7,8 +7,11 @@
 //! aliases share a read only while their complete observed identities agree.
 //! Every pathname is revalidated, including aliases that did not supply a read.
 //! Verified file generations survive toolchain re-warms in a bounded, process-
-//! local digest memo. This never supplies a toolchain observation or bypasses
-//! its directory checks. Scheduling counts only bytes that still need reading.
+//! local digest memo, seeded on restart by an optional same-boot private journal.
+//! This never supplies a toolchain observation or bypasses its directory checks.
+//! Scheduling counts only bytes that still need reading.
+
+mod disk_memo;
 
 use super::{FileSig, ToolchainInputs, digest_stable_at, lstat_regular};
 use rabs_protocol::result_identity::TypedDigest;
@@ -21,17 +24,48 @@ use std::sync::{LazyLock, Mutex};
 const PARALLEL_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_TOOLCHAIN_DIGESTS: usize = 16_384;
 static HELPER_BUSY: AtomicBool = AtomicBool::new(false);
-static DIGESTS: LazyLock<DigestMemo> = LazyLock::new(DigestMemo::default);
+static DIGESTS: LazyLock<DigestMemo> = LazyLock::new(DigestMemo::configured);
 
 /// Advisory byte identities, never ready toolchain facts. A changed namespace
-/// still requires a new complete observation and new request guard. Nothing is
-/// persisted across process/reboot boundaries; no input payloads or paths stay.
+/// still requires a new complete observation and new request guard. Only exact
+/// same-boot file-generation digests may survive restart; no input payloads,
+/// probes, directory observations or action/serving authority are persisted.
 #[derive(Default)]
 struct DigestMemo {
     entries: Mutex<HashMap<FileSig, TypedDigest>>,
+    disk: Mutex<Option<disk_memo::DiskMemo>>,
 }
 
 impl DigestMemo {
+    fn configured() -> Self {
+        match disk_memo::DiskMemo::configured() {
+            Ok(Some((disk, entries))) => {
+                eprintln!(
+                    "{}",
+                    serde_json::json!({
+                        "v": 1, "kind": "rabsd-toolchain-digest-cache",
+                        "decision": "ready", "entries": entries.len(),
+                    })
+                );
+                Self {
+                    entries: Mutex::new(entries),
+                    disk: Mutex::new(Some(disk)),
+                }
+            }
+            Ok(None) => Self::default(),
+            Err(error) => {
+                eprintln!(
+                    "{}",
+                    serde_json::json!({
+                        "v": 1, "kind": "rabsd-toolchain-digest-cache",
+                        "decision": "cold", "reason": error.to_string(),
+                    })
+                );
+                Self::default()
+            }
+        }
+    }
+
     fn get(&self, sig: &FileSig) -> Option<TypedDigest> {
         self.entries.lock().ok()?.get(sig).cloned()
     }
@@ -55,6 +89,17 @@ impl DigestMemo {
             entries.clear();
         }
         entries.insert(sig, digest.clone());
+        drop(entries);
+        // A slow/contended/unavailable journal is only a lost optimization.
+        // Never hold the memory mutex over disk IO, wait for another writer,
+        // or turn a verified read into a failed warm because persistence failed.
+        if let Ok(mut disk) = self.disk.try_lock()
+            && disk
+                .as_mut()
+                .is_some_and(|disk| disk.remember(sig, digest).is_err())
+        {
+            *disk = None;
+        }
         Ok(())
     }
 }
