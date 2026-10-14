@@ -134,7 +134,9 @@ mod tests {
     use rabs_key::live_dependency::{
         LiveRustcRequest, dep_info_closure_violation, plan_dependency_action,
     };
-    use rabs_protocol::input_evidence::{INPUT_EVIDENCE_SCHEMA_VERSION, InputFileType, PositiveInput};
+    use rabs_protocol::input_evidence::{
+        INPUT_EVIDENCE_SCHEMA_VERSION, InputFileType, PositiveInput,
+    };
     use rabs_protocol::raw_bytes::RawBytes;
     use rabs_protocol::result_identity::ObjectId;
     use std::path::{Path, PathBuf};
@@ -183,7 +185,12 @@ mod tests {
             }
         }
 
-        fn capture(&self, label: &str, record: &[u8], members: &[(&str, Option<&[u8]>)]) -> Captured {
+        fn capture(
+            &self,
+            label: &str,
+            record: &[u8],
+            members: &[(&str, Option<&[u8]>)],
+        ) -> Captured {
             let output = self.root.join(label).join("deps");
             let generated = self.root.join(label).join("build/demo/out");
             std::fs::create_dir_all(&output).unwrap();
@@ -239,14 +246,16 @@ mod tests {
                 .facts
                 .package(&self.package, plan.source_kind, Some(&generated))
                 .unwrap();
-            bind_rustc_environment(&mut plan, package.build_script_output.as_deref(), &env).unwrap();
+            bind_rustc_environment(&mut plan, package.build_script_output.as_deref(), &env)
+                .unwrap();
             let mut inputs = ActionInputManifest {
                 schema_version: INPUT_EVIDENCE_SCHEMA_VERSION,
                 ..ActionInputManifest::default()
             };
             for (files, generated) in [(&package.files, false), (&package.generated_files, true)] {
-                inputs.inputs.extend(
-                    files.iter().map(|(relative, object, executable)| {
+                inputs
+                    .inputs
+                    .extend(files.iter().map(|(relative, object, executable)| {
                         let path = if generated {
                             plan.generated_input_virtual_path(relative)
                         } else {
@@ -259,8 +268,7 @@ mod tests {
                             executable: *executable,
                             symlink_resolution: Vec::new(),
                         }
-                    }),
-                );
+                    }));
             }
             Captured {
                 plan,
@@ -351,7 +359,10 @@ mod tests {
             assert_eq!(actual.execution_env, original.execution_env);
             assert_eq!(actual.generated_root, original.generated_root);
             assert!(
-                !actual.execution_env.iter().any(|(_, value)| value.contains(EMPTY_ROOT))
+                !actual
+                    .execution_env
+                    .iter()
+                    .any(|(_, value)| value.contains(EMPTY_ROOT))
             );
         }
     }
@@ -377,12 +388,16 @@ mod tests {
             "# env-dep:CARGO_MAKEFLAGS=-j\n".to_owned(),
         ] {
             assert!(
-                captured.closure(&(good.clone() + &suffix))
+                captured
+                    .closure(&(good.clone() + &suffix))
                     .unwrap()
                     .contains("unkeyed variable")
             );
         }
-        for path in [format!("{root}/generated.rs"), format!("{root}/../outside.rs")] {
+        for path in [
+            format!("{root}/generated.rs"),
+            format!("{root}/../outside.rs"),
+        ] {
             let dep_info = format!("{}/demo.d: {path}\n", captured.plan.out_dir);
             assert!(captured.closure(&dep_info).is_some());
         }
@@ -394,7 +409,10 @@ mod tests {
         for (label, members) in [
             (
                 "files",
-                vec![("value.rs", Some(b"pub const GENERATED: u32 = 9;".as_slice()))],
+                vec![(
+                    "value.rs",
+                    Some(b"pub const GENERATED: u32 = 9;".as_slice()),
+                )],
             ),
             ("directories", vec![("empty", None)]),
         ] {
@@ -404,7 +422,10 @@ mod tests {
             assert_eq!(captured.key(true).unwrap(), expected);
             assert_eq!(captured.plan, original);
             let root = captured.plan.generated_root.as_ref().unwrap();
-            assert_eq!(captured.closure(&format!("# env-dep:OUT_DIR={root}\n")), None);
+            assert_eq!(
+                captured.closure(&format!("# env-dep:OUT_DIR={root}\n")),
+                None
+            );
         }
     }
 
@@ -419,10 +440,18 @@ mod tests {
         cfg.plan.invocation.cfgs.push("another_cfg".to_owned());
         assert_ne!(cfg.key(true).unwrap().action_key, key);
         let mut env = fixture.capture("four", RECORD, &[]);
-        env.plan.keyed_env.push(("RUST_SOMETHING".into(), "semantic".into()));
-        env.plan.execution_env.push(("RUST_SOMETHING".into(), "semantic".into()));
+        env.plan
+            .keyed_env
+            .push(("RUST_SOMETHING".into(), "semantic".into()));
+        env.plan
+            .execution_env
+            .push(("RUST_SOMETHING".into(), "semantic".into()));
         assert_ne!(env.key(true).unwrap().action_key, key);
-        std::fs::write(fixture.package.join("src/lib.rs"), b"pub const VALUE: u32 = 8;\n").unwrap();
+        std::fs::write(
+            fixture.package.join("src/lib.rs"),
+            b"pub const VALUE: u32 = 8;\n",
+        )
+        .unwrap();
         let mut source = fixture.capture("five", RECORD, &[]);
         assert_ne!(source.key(true).unwrap().action_key, key);
     }
@@ -434,7 +463,10 @@ mod tests {
         for label in ["one", "two"] {
             let mut captured = fixture.capture(label, RECORD, &[]);
             let root = captured.plan.generated_root.clone().unwrap();
-            for env in [&mut captured.plan.keyed_env, &mut captured.plan.execution_env] {
+            for env in [
+                &mut captured.plan.keyed_env,
+                &mut captured.plan.execution_env,
+            ] {
                 env.push(("RUST_BUILD_PATH".into(), root.clone()));
             }
             keys.push(captured.key(true).unwrap().action_key);
@@ -455,8 +487,11 @@ mod tests {
         let exact = next.exact();
         assert_eq!(next.key(true).unwrap(), exact);
         assert_ne!(exact.action_key, previous);
-        std::fs::write(root.parent().unwrap().join("output"), b"different script output\n")
-            .unwrap();
+        std::fs::write(
+            root.parent().unwrap().join("output"),
+            b"different script output\n",
+        )
+        .unwrap();
         assert!(next.package.verify_unchanged(&fixture.package).is_err());
     }
 
@@ -471,7 +506,10 @@ mod tests {
         )
         .unwrap();
         assert!(
-            fixture.facts.package(&fixture.package, missing.plan.source_kind, Some(root)).is_err()
+            fixture
+                .facts
+                .package(&fixture.package, missing.plan.source_kind, Some(root))
+                .is_err()
         );
         assert!(missing.package.verify_unchanged(&fixture.package).is_err());
         let mut invalid = fixture.capture("two", RECORD, &[]);

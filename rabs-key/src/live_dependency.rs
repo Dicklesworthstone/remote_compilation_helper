@@ -2625,7 +2625,10 @@ mod tests {
         let key = directory_key(&plan, &directory_inputs(&plan)).unwrap();
         assert_eq!(
             key.descriptor.sandbox_semantic_policy,
-            compute(DOMAIN_LIVE_ISOLATION, DIRECTORY_ISOLATION_PROFILE.as_bytes())
+            compute(
+                DOMAIN_LIVE_ISOLATION,
+                DIRECTORY_ISOLATION_PROFILE.as_bytes()
+            )
         );
         let mut negative = CanonicalEncoder::new();
         negative
@@ -2692,7 +2695,9 @@ mod tests {
         new_manifest.inputs[2].object = ObjectId(digest(43));
         assert_ne!(
             base,
-            directory_key(&new_witness, &new_manifest).unwrap().action_key
+            directory_key(&new_witness, &new_manifest)
+                .unwrap()
+                .action_key
         );
     }
 

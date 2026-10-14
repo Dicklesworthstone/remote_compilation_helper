@@ -180,8 +180,8 @@ mod tests {
             vec![37; COPY_BUFFER_BYTES * 3 + 7],
         ] {
             let mut copied = Vec::new();
-            let observed = copy_exact(&mut Cursor::new(&bytes), &mut copied, bytes.len() as u64)
-                .unwrap();
+            let observed =
+                copy_exact(&mut Cursor::new(&bytes), &mut copied, bytes.len() as u64).unwrap();
             assert_eq!(copied, bytes);
             assert_eq!(
                 observed,

@@ -34,8 +34,11 @@ fn write_toolchain(root: &Path) -> PathBuf {
     std::fs::create_dir_all(root.join("bin")).unwrap();
     std::fs::create_dir_all(root.join("lib/rustlib/fixture-host/lib")).unwrap();
     std::fs::write(root.join("lib/libdriver.so"), b"runtime-v1").unwrap();
-    std::fs::write(root.join("lib/rustlib/fixture-host/lib/libcore.rlib"), b"core-v1")
-        .unwrap();
+    std::fs::write(
+        root.join("lib/rustlib/fixture-host/lib/libcore.rlib"),
+        b"core-v1",
+    )
+    .unwrap();
     let compiler = root.join("bin/rustc");
     std::fs::write(
         &compiler,
@@ -446,8 +449,14 @@ fn an_old_attempt_cannot_adopt_a_rewarmed_equal_byte_toolchain() {
     change_toolchain(&fixture, "compiler");
     assert_eq!(fixture.toolchain_facts(), before);
     let fresh = fixture.request();
-    assert_eq!(fresh.key.action_key, key, "canonical input bytes are identical");
-    fresh.toolchain.verify_unchanged(fixture.compiler()).unwrap();
+    assert_eq!(
+        fresh.key.action_key, key,
+        "canonical input bytes are identical"
+    );
+    fresh
+        .toolchain
+        .verify_unchanged(fixture.compiler())
+        .unwrap();
     assert!(
         attempt
             .capture(&success())
@@ -455,7 +464,10 @@ fn an_old_attempt_cannot_adopt_a_rewarmed_equal_byte_toolchain() {
             .contains("toolchain inputs changed")
     );
     assert!(fixture.published(&key).is_none());
-    assert!(matches!(fixture.lane.decide(fresh), LiveDecision::Execute(_)));
+    assert!(matches!(
+        fixture.lane.decide(fresh),
+        LiveDecision::Execute(_)
+    ));
 }
 
 #[test]
@@ -464,7 +476,9 @@ fn immutable_capture_publishes_without_reopening_a_replaced_toolchain() {
     let captured = fixture.capture();
     let key = captured.action_key().clone();
     let manifest = captured.manifest_key().to_owned();
-    let retained = fixture.toolchain_root().with_file_name("retained-toolchain");
+    let retained = fixture
+        .toolchain_root()
+        .with_file_name("retained-toolchain");
     std::fs::rename(fixture.toolchain_root(), &retained).unwrap();
     assert!(!fixture.compiler().exists());
     let (outcome, known) = captured.publish();
@@ -472,7 +486,10 @@ fn immutable_capture_publishes_without_reopening_a_replaced_toolchain() {
     assert_eq!(fixture.published(&key), Some(manifest));
     assert_eq!(known.len(), 1);
     assert!(fixture.coord.submitted_actor(&key).unwrap().is_none());
-    assert!(!fixture.compiler().exists(), "publication must not repair the toolchain");
+    assert!(
+        !fixture.compiler().exists(),
+        "publication must not repair the toolchain"
+    );
 }
 
 #[test]
@@ -557,21 +574,19 @@ fn streamed_multiple_outputs_publish_only_as_one_complete_immutable_result() {
     assert!(fixture.published(&key).is_none());
     let candidates = gc_candidates(&fixture);
     for (_, digest) in &expected {
-        assert!(fixture
-            .cas
-            .store()
-            .lock()
-            .unwrap()
-            .object_durably_located(digest)
-            .unwrap());
+        assert!(
+            fixture
+                .cas
+                .store()
+                .lock()
+                .unwrap()
+                .object_durably_located(digest)
+                .unwrap()
+        );
         assert!(!candidates.contains(&rabs_cas::metadata_store::digest_key(digest)));
     }
     let manifest = captured.manifest_key().to_owned();
-    std::fs::rename(
-        &fixture.out,
-        fixture.out.with_file_name("captured-outputs"),
-    )
-    .unwrap();
+    std::fs::rename(&fixture.out, fixture.out.with_file_name("captured-outputs")).unwrap();
     let (outcome, known) = captured.publish();
     assert_eq!(outcome, CompletionOutcome::Committed);
     assert_eq!(fixture.published(&key), Some(manifest));
@@ -645,13 +660,15 @@ fn missing_later_output_retires_streamed_attempt_without_partial_publication() {
     assert!(fixture.coord.submitted_actor(&key).unwrap().is_none());
     let candidates = gc_candidates(&fixture);
     for digest in &earlier {
-        assert!(fixture
-            .cas
-            .store()
-            .lock()
-            .unwrap()
-            .object_durably_located(digest)
-            .unwrap());
+        assert!(
+            fixture
+                .cas
+                .store()
+                .lock()
+                .unwrap()
+                .object_durably_located(digest)
+                .unwrap()
+        );
         assert!(candidates.contains(&rabs_cas::metadata_store::digest_key(digest)));
     }
     assert_eq!(

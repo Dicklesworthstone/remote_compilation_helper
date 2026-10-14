@@ -494,9 +494,11 @@ mod tests {
             .unwrap()
             .map(|entry| entry.unwrap().path())
             .collect::<Vec<_>>();
-        assert!(preserved.iter().any(|path| {
-            std::fs::read(path).unwrap().as_slice() == expected.as_slice()
-        }));
+        assert!(
+            preserved
+                .iter()
+                .any(|path| { std::fs::read(path).unwrap().as_slice() == expected.as_slice() })
+        );
         assert_eq!(
             std::fs::read_dir(cas.layout().root().join("staging"))
                 .unwrap()
@@ -516,9 +518,11 @@ mod tests {
             Err(MaterializeError::QuarantinedObject { .. })
         ));
         assert!(!destination.exists());
-        assert!(preserved.iter().any(|path| {
-            std::fs::read(path).unwrap().as_slice() == expected.as_slice()
-        }));
+        assert!(
+            preserved
+                .iter()
+                .any(|path| { std::fs::read(path).unwrap().as_slice() == expected.as_slice() })
+        );
     }
 
     #[test]

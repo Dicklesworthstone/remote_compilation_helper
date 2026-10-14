@@ -337,7 +337,9 @@ mod tests {
     #[test]
     fn existing_source_and_primary_package_classification_is_not_overridden() {
         let mut fixture = Fixture::new();
-        fixture.env.push(("CARGO_PRIMARY_PACKAGE".into(), "1".into()));
+        fixture
+            .env
+            .push(("CARGO_PRIMARY_PACKAGE".into(), "1".into()));
         assert!(matches!(
             plan_dependency_action(fixture.request(), HOST),
             Err(LiveRefusal::RefusedEnv(_))

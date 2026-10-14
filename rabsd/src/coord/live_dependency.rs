@@ -36,8 +36,8 @@ use crate::coord::live::{
     load_manifest,
 };
 use crate::edge::live_facts::{
-    DependencyFacts, FileSig, GENERATED_ROOT, PACKAGE_ROOT, PackageFacts, ToolchainGuard, digest_stable,
-    read_stable,
+    DependencyFacts, FileSig, GENERATED_ROOT, PACKAGE_ROOT, PackageFacts, ToolchainGuard,
+    digest_stable, read_stable,
 };
 use rabs_action::state_machines::AttemptState;
 use rabs_cas::blob_store::{DurabilityPolicy, PutLimits, put_if_absent};
@@ -110,7 +110,8 @@ pub struct LiveDependencyRequest {
 
 impl LiveDependencyRequest {
     fn verify_toolchain(&self) -> Result<(), String> {
-        self.toolchain.verify_unchanged(Path::new(&self.plan.compiler))
+        self.toolchain
+            .verify_unchanged(Path::new(&self.plan.compiler))
     }
 }
 

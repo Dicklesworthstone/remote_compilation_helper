@@ -118,9 +118,9 @@ fn config_only_build_script_compiles_are_served_across_real_cargo_worktrees() {
         assert_eq!(std::fs::read_dir(&generated).unwrap().count(), 0);
         // Every worktree runs its build script normally, even the served one.
         assert!(
-            stderr(&build).lines().any(|line| {
-                line.contains("Running") && line.contains("build-script-build")
-            }),
+            stderr(&build)
+                .lines()
+                .any(|line| { line.contains("Running") && line.contains("build-script-build") }),
             "build script must execute in {name}: {}",
             stderr(&build)
         );
@@ -135,7 +135,11 @@ fn config_only_build_script_compiles_are_served_across_real_cargo_worktrees() {
         assert_eq!(count(&decisions, "hit"), usize::from(outcome == "served"));
         let key = request_key(
             &decisions,
-            if outcome == "served" { "hit" } else { "execute" },
+            if outcome == "served" {
+                "hit"
+            } else {
+                "execute"
+            },
         );
         if let Some(expected) = &original_key {
             assert_eq!(&key, expected, "OUT_DIR placement must not fork this key");

@@ -113,8 +113,7 @@ fn commit_one_action(state_dir: &std::path::Path, artifact: &[u8], verified: boo
                 ids,
             );
             let mut compared = offer.clone();
-            compared.authority.action_generation.generation_id =
-                ActionGenerationId(ids.generation);
+            compared.authority.action_generation.generation_id = ActionGenerationId(ids.generation);
             compared.authority.attempt_id = AttemptId(ids.attempt);
             compared.authority.execution_lease_id = ExecutionLeaseId(ids.lease);
             assert_eq!(

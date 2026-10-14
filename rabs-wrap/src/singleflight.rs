@@ -478,7 +478,10 @@ mod tests {
                 "\"materialization_started\":false",
                 "\"materialization_started\":false,\"materialization_started\":false",
             ),
-            PREPARING.replace("\"reason\":", "\"attempt\":null,\"attempt\":null,\"reason\":"),
+            PREPARING.replace(
+                "\"reason\":",
+                "\"attempt\":null,\"attempt\":null,\"reason\":",
+            ),
             PREPARING.replace("\"reason\":", "\"env\":[],\"reason\":"),
             PREPARING.replace("\"reason\":", "\"action_key\":null,\"reason\":"),
             PREPARING.replace(
@@ -487,7 +490,10 @@ mod tests {
             ),
             PREPARING.replace("toolchain-facts-pending", "unknown-stage"),
         ] {
-            assert!(wait_for(&reply_json::parse(&bad).unwrap()).is_none(), "{bad}");
+            assert!(
+                wait_for(&reply_json::parse(&bad).unwrap()).is_none(),
+                "{bad}"
+            );
         }
         assert_eq!(
             wait_for(&reply_json::parse(PREPARING).unwrap()),

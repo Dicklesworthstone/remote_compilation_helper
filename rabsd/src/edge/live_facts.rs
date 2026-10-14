@@ -157,8 +157,8 @@ fn digest_stable_at(path: &Path, before: FileSig) -> std::io::Result<(FileSig, T
     let mut buffer = vec![0_u8; 256 * 1024];
     let mut remaining = before.size;
     while remaining > 0 {
-        let limit = usize::try_from(remaining.min(buffer.len() as u64))
-            .map_err(std::io::Error::other)?;
+        let limit =
+            usize::try_from(remaining.min(buffer.len() as u64)).map_err(std::io::Error::other)?;
         let read = file.read(&mut buffer[..limit])?;
         if read == 0 {
             return Err(std::io::Error::other("file shrank while it was hashed"));
@@ -204,7 +204,8 @@ impl ToolchainInputs {
                 path.display()
             ));
         }
-        self.directories.push((path.to_path_buf(), FileSig::of(&meta)));
+        self.directories
+            .push((path.to_path_buf(), FileSig::of(&meta)));
         Ok(())
     }
 
@@ -998,8 +999,8 @@ fn probe_toolchain(compiler: &Path, env: &[(String, String)]) -> Result<ProbedTo
     // compile links metadata and inlinable code from.
     let mut tree = Vec::new();
     for (path, expected) in &inputs.sysroot_files {
-        let (_, digest) = digest_stable_at(path, *expected)
-            .map_err(|error| format!("hash sysroot: {error}"))?;
+        let (_, digest) =
+            digest_stable_at(path, *expected).map_err(|error| format!("hash sysroot: {error}"))?;
         let relative = path
             .strip_prefix(sysroot)
             .map_err(|_| "sysroot member escaped")?
@@ -1599,8 +1600,7 @@ mod tests {
 
     #[test]
     fn warm_dependency_bytes_admit_new_output_mappings_without_a_warm_slot() {
-        let (dir, mut plan, paths) =
-            dependency_budget_fixture(&[SYNCHRONOUS_PACKAGE_BYTES + 1]);
+        let (dir, mut plan, paths) = dependency_budget_fixture(&[SYNCHRONOUS_PACKAGE_BYTES + 1]);
         let facts = LiveFacts::new();
         let expected = facts.file_digest(&paths[0]).unwrap();
         // Forbid a background rescue: warm identities must suffice even
@@ -1613,7 +1613,9 @@ mod tests {
         let other = dir.path().join("another-output-mapping");
         std::fs::create_dir(&other).unwrap();
         plan.out_dir = other.to_str().unwrap().to_owned();
-        let second = facts.dependencies(&plan).expect("new mapping, same warm bytes");
+        let second = facts
+            .dependencies(&plan)
+            .expect("new mapping, same warm bytes");
         assert!(!Arc::ptr_eq(&first, &second));
         assert_eq!(second.directories[0].artifacts[0].content_digest, expected);
         assert_eq!(*facts.warming.lock().unwrap(), MAX_WARMING);
@@ -1621,8 +1623,7 @@ mod tests {
 
     #[test]
     fn small_cold_tail_in_a_large_warm_inventory_is_admitted() {
-        let (_dir, plan, paths) =
-            dependency_budget_fixture(&[SYNCHRONOUS_PACKAGE_BYTES + 1, 17]);
+        let (_dir, plan, paths) = dependency_budget_fixture(&[SYNCHRONOUS_PACKAGE_BYTES + 1, 17]);
         let facts = LiveFacts::new();
         let warm = facts.file_digest(&paths[0]).unwrap();
         *facts.warming.lock().unwrap() = MAX_WARMING;
@@ -1643,10 +1644,14 @@ mod tests {
         let first = lstat_regular(&paths[0]).unwrap();
         let second = lstat_regular(&paths[1]).unwrap();
         let mut budget = Some(9);
-        let digest = facts.dependency_digest(&paths[0], first, &mut budget).unwrap();
+        let digest = facts
+            .dependency_digest(&paths[0], first, &mut budget)
+            .unwrap();
         assert_eq!(budget, Some(0));
         assert_eq!(
-            facts.dependency_digest(&paths[0], first, &mut budget).unwrap(),
+            facts
+                .dependency_digest(&paths[0], first, &mut budget)
+                .unwrap(),
             digest
         );
         assert_eq!(budget, Some(0));
@@ -1698,8 +1703,7 @@ mod tests {
 
     #[test]
     fn replaced_warm_candidate_becomes_cold_and_cannot_reuse_its_old_digest() {
-        let (dir, plan, paths) =
-            dependency_budget_fixture(&[SYNCHRONOUS_PACKAGE_BYTES + 1]);
+        let (dir, plan, paths) = dependency_budget_fixture(&[SYNCHRONOUS_PACKAGE_BYTES + 1]);
         let facts = LiveFacts::new();
         let old = facts.file_digest(&paths[0]).unwrap();
         *facts.warming.lock().unwrap() = MAX_WARMING;
@@ -1723,8 +1727,7 @@ mod tests {
 
     #[test]
     fn warm_admission_preserves_negative_candidates_and_output_alias_refusals() {
-        let (_dir, plan, paths) =
-            dependency_budget_fixture(&[SYNCHRONOUS_PACKAGE_BYTES + 1]);
+        let (_dir, plan, paths) = dependency_budget_fixture(&[SYNCHRONOUS_PACKAGE_BYTES + 1]);
         let facts = LiveFacts::new();
         facts.file_digest(&paths[0]).unwrap();
         *facts.warming.lock().unwrap() = MAX_WARMING;
@@ -1743,8 +1746,7 @@ mod tests {
 
     #[test]
     fn cold_dependency_still_warms_in_the_existing_bounded_pool() {
-        let (_dir, plan, _paths) =
-            dependency_budget_fixture(&[SYNCHRONOUS_PACKAGE_BYTES + 1]);
+        let (_dir, plan, _paths) = dependency_budget_fixture(&[SYNCHRONOUS_PACKAGE_BYTES + 1]);
         let facts = LiveFacts::new();
         assert!(matches!(facts.dependencies(&plan), Err(FactsMiss::Pending)));
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -1791,7 +1793,10 @@ mod tests {
             }
         }
         assert!(matches!(facts.dependencies(&plan), Err(FactsMiss::Pending)));
-        assert_eq!(facts.dependencies.lock().unwrap().len(), MAX_DEPENDENCY_MEMOS);
+        assert_eq!(
+            facts.dependencies.lock().unwrap().len(),
+            MAX_DEPENDENCY_MEMOS
+        );
         assert!(facts.files.lock().unwrap().is_empty());
         assert_eq!(*facts.warming.lock().unwrap(), 0);
     }
@@ -1829,7 +1834,10 @@ mod tests {
             observation.output.clone(),
             None,
         );
-        assert!(matches!(original.finish(captured, true), Err(FactsMiss::Pending)));
+        assert!(matches!(
+            original.finish(captured, true),
+            Err(FactsMiss::Pending)
+        ));
         assert!(matches!(
             facts.dependencies.lock().unwrap().get(&observation),
             Some(DependencySlot::Warming(current)) if Arc::ptr_eq(current, &successor_token)
@@ -1843,7 +1851,11 @@ mod tests {
             None,
         );
         successor.finish(captured, true).unwrap();
-        facts.dependencies(&plan).unwrap().verify_unchanged().unwrap();
+        facts
+            .dependencies(&plan)
+            .unwrap()
+            .verify_unchanged()
+            .unwrap();
     }
 
     #[test]
@@ -1852,7 +1864,10 @@ mod tests {
         let facts = LiveFacts::new();
         let original = dependency_observation(&plan);
         dependency_reservation(&facts, &original)
-            .finish(Err(FactsMiss::Refused("old generation failed".into())), true)
+            .finish(
+                Err(FactsMiss::Refused("old generation failed".into())),
+                true,
+            )
             .unwrap_err();
 
         assert!(matches!(
@@ -1861,7 +1876,11 @@ mod tests {
         ));
 
         std::fs::write(&paths[0], b"changed generation").unwrap();
-        facts.dependencies(&plan).unwrap().verify_unchanged().unwrap();
+        facts
+            .dependencies(&plan)
+            .unwrap()
+            .verify_unchanged()
+            .unwrap();
     }
 
     #[test]
@@ -1879,7 +1898,10 @@ mod tests {
                 StreamingObjectWriter::new(DigestRequest::default(), Some(bytes.len() as u64));
             writer.write(&bytes).unwrap();
             let expected = writer.finish().unwrap().atp_content_id;
-            assert_eq!(digest_stable_at(&path, observed).unwrap(), (observed, expected));
+            assert_eq!(
+                digest_stable_at(&path, observed).unwrap(),
+                (observed, expected)
+            );
         }
     }
 
@@ -2335,7 +2357,8 @@ mod tests {
         let roots = vec![(dependencies.clone(), Vec::new())];
         let output = (out.clone(), vec!["libcurrent.rlib".into()]);
         let (members, _) = walk_dependencies(&roots).unwrap();
-        let captured = capture_dependencies(&LiveFacts::new(), roots, members, output, None).unwrap();
+        let captured =
+            capture_dependencies(&LiveFacts::new(), roots, members, output, None).unwrap();
         captured.verify_unchanged().unwrap();
         // An alias created after keying must also refuse at pre-hit / completion.
         std::fs::hard_link(
@@ -2729,7 +2752,11 @@ mod tests {
             std::fs::create_dir_all(root.join(relative)).unwrap();
         }
         std::fs::write(root.join("lib/libdriver.so"), b"runtime-v1").unwrap();
-        std::fs::write(root.join("lib/rustlib/test-host/lib/libcore.rlib"), b"core-v1").unwrap();
+        std::fs::write(
+            root.join("lib/rustlib/test-host/lib/libcore.rlib"),
+            b"core-v1",
+        )
+        .unwrap();
         std::fs::write(
             root.join("lib/rustlib/test-host/lib/self-contained/crt.o"),
             b"startup-v1",
@@ -2795,7 +2822,10 @@ esac
                     .chain(&first.inputs.sysroot_files)
                     .all(|(path, sig)| lstat_regular(path).unwrap() == *sig)
             );
-            assert!(!first.still_current(), "missed new toolchain input {relative}");
+            assert!(
+                !first.still_current(),
+                "missed new toolchain input {relative}"
+            );
             let changed = probe_toolchain(&compiler, &[]).unwrap();
             assert!(changed.still_current());
             assert_ne!(first.facts, changed.facts, "new bytes must key {relative}");
@@ -2871,7 +2901,10 @@ esac
 
     #[test]
     fn special_toolchain_library_members_are_not_silently_omitted() {
-        for relative in ["lib/libsocket.so", "lib/rustlib/test-host/lib/libsocket.rlib"] {
+        for relative in [
+            "lib/libsocket.so",
+            "lib/rustlib/test-host/lib/libsocket.rlib",
+        ] {
             let (dir, compiler) = toolchain_fixture();
             let root = compiler.parent().unwrap().parent().unwrap();
             let _socket = std::os::unix::net::UnixListener::bind(root.join(relative)).unwrap();

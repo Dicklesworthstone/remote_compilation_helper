@@ -41,7 +41,9 @@ use crate::coord::live_dependency::{
 use crate::edge::live_facts::{FactsMiss, LiveFacts};
 use rabs_cas::metadata_store::digest_key;
 use rabs_key::build_script_directives::bind_rustc_environment;
-use rabs_key::live_dependency::{ExternFact, LiveRustcRequest, PlannedExtern, constructed_environment};
+use rabs_key::live_dependency::{
+    ExternFact, LiveRustcRequest, PlannedExtern, constructed_environment,
+};
 use rabs_protocol::input_evidence::{
     ActionInputManifest, INPUT_EVIDENCE_SCHEMA_VERSION, InputFileType, PositiveInput,
 };
@@ -823,7 +825,10 @@ mod tests {
             assert_eq!(reply["compiler_skip_authorized"], false);
             assert_eq!(reply["materialization_started"], false);
             for absent in ["action_key", "attempt", "env"] {
-                assert!(reply.get(absent).is_none(), "{absent} is not a readiness fact");
+                assert!(
+                    reply.get(absent).is_none(),
+                    "{absent} is not a readiness fact"
+                );
             }
         }
     }

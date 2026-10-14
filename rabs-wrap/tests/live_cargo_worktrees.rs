@@ -174,10 +174,7 @@ struct World {
 
 impl World {
     fn new(root: &Path) -> Self {
-        Self::with_source(
-            root,
-            root.join("cargo-home/registry/src").join(INDEX),
-        )
+        Self::with_source(root, root.join("cargo-home/registry/src").join(INDEX))
     }
 
     fn vendored(root: &Path) -> Self {
@@ -611,7 +608,9 @@ fn real_cargo_warms_large_packages_and_prebuilt_dependencies_before_execution() 
     );
     for name in ["leaf", "middle"] {
         std::fs::write(
-            world.registry().join(format!("{name}-1.0.0/src/payload.bin")),
+            world
+                .registry()
+                .join(format!("{name}-1.0.0/src/payload.bin")),
             &payload,
         )
         .unwrap();
