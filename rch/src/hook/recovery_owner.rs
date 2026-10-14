@@ -110,6 +110,12 @@ impl RecoveryOwnership {
         use std::os::fd::AsFd;
 
         self.verify()?;
+        // Validate prospective success before creating even a journal temp.
+        // The caller's cached lease may be locked while publishing, so inspect
+        // these exact serialized bytes, not a snapshot from the writer.
+        let prospective: DurableJobLease =
+            serde_json::from_slice(bytes).context("invalid prospective recovery journal")?;
+        super::recovery_completion::validate_recorded_delivery(&prospective)?;
         // An exclusive fresh name cannot truncate an existing receipt. A failed
         // publication retains its temporary bytes for diagnosis, never cleanup.
         let temporary =
@@ -391,6 +397,10 @@ where
     };
     let latest = read()?;
     validate_same_owner(&observed, &latest)?;
+    // A legacy premature `returned = 0` must not reach source retirement or
+    // the acknowledged shortcut. This is read-only and precedes every peer
+    // probe and artifact-policy/config mutation under the recovered owner.
+    super::recovery_completion::validate_recorded_delivery(&latest)?;
     if !latest.terminal_acknowledged {
         anyhow::ensure!(
             inspect(latest.clone()).await?,
@@ -415,6 +425,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rch_common::{CompilationKind, TransferConfig, WorkerConfig, WorkerId};
     use std::cell::Cell;
 
     #[test]
@@ -653,6 +664,285 @@ mod tests {
             path: writer.path.clone(),
             lease: Arc::new(Mutex::new(writer.snapshot())),
             recovery_ownership: None,
+        }
+    }
+
+    /// Deliberately supplied lifecycle facts, not a remote execution receipt.
+    /// Only the real local journal/ownership boundaries run in these tests.
+    fn delivery_fixture() -> (PathBuf, DurableLeaseWriter, RecoveryRecipe) {
+        let (root, writer) = retained_namespace_fixture();
+        let caller = root.join("caller");
+        let remote = root.join("worker");
+        std::fs::create_dir(&caller).unwrap();
+        std::fs::create_dir(&remote).unwrap();
+        std::fs::write(remote.join("retained-output"), b"completed worker output").unwrap();
+        let worker = WorkerConfig {
+            id: WorkerId::new("worker"),
+            host: "unreachable.invalid".into(),
+            user: "test".into(),
+            identity_file: "/unused/key".into(),
+            total_slots: 1,
+            priority: 100,
+            tags: Vec::new(),
+            tools: Vec::new(),
+        };
+        RecoverySession::begin(
+            &writer,
+            &worker,
+            vec![remote.to_str().unwrap().to_owned()],
+            None,
+            None,
+            None,
+            TransferConfig::default(),
+            caller.clone(),
+            uuid::Uuid::new_v4().simple().to_string(),
+        )
+        .unwrap();
+        let mut recipe = load_recipe(&writer).unwrap();
+        recipe.prepared = true;
+        recipe.execution_started = true;
+        recipe.kind = Some(CompilationKind::Make);
+        recipe.exit_code = Some(0);
+        recipe.returned = Some(0);
+        let project = RecoveryPhase {
+            name: "project".into(),
+            local: caller,
+            remote: remote.to_str().unwrap().to_owned(),
+            patterns: vec!["build/**".into()],
+            result_dir: None,
+            custom_target: false,
+            output_gate: false,
+            cargo_outputs: None,
+            native_outputs: None,
+            baseline: BTreeMap::new(),
+            published: BTreeMap::new(),
+            pending: None,
+            complete: true,
+            missing_result: None,
+        };
+        let mut report = project.clone();
+        report.name = "result:reports".into();
+        report.patterns.clear();
+        report.result_dir = Some("reports".into());
+        recipe.phases = vec![project, report];
+        (root, writer, recipe)
+    }
+
+    fn invalidate_delivery(recipe: &mut RecoveryRecipe, case: &str) {
+        match case {
+            "project" | "partial-project" => {
+                recipe.phases[0].complete = false;
+                if case == "partial-project" {
+                    recipe.phases[0].published.insert(
+                        "build/one.o".into(),
+                        blake3::hash(b"published bytes").to_hex().to_string(),
+                    );
+                }
+            }
+            "report" => recipe.phases[1].complete = false,
+            "pending-project" | "pending-report" => {
+                let index = usize::from(case == "pending-report");
+                recipe.phases[index].pending =
+                    Some(("build/pending".into(), "retained-hash".into()));
+            }
+            "unprepared" => recipe.prepared = false,
+            "unstarted" => recipe.execution_started = false,
+            "cancelled" => recipe.preparation_cancelled = true,
+            "failed" => recipe.exit_code = Some(7),
+            "unknown" => recipe.exit_code = None,
+            _ => panic!("unknown delivery fixture: {case}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn premature_make_success_cannot_be_persisted_by_the_live_return_boundary() {
+        for case in [
+            "project",
+            "partial-project",
+            "report",
+            "pending-project",
+            "pending-report",
+            "unprepared",
+            "unstarted",
+            "cancelled",
+            "failed",
+            "unknown",
+        ] {
+            let (root, writer, mut recipe) = delivery_fixture();
+            recipe.returned = None;
+            invalidate_delivery(&mut recipe, case);
+            writer
+                .set_recovery(serde_json::to_value(recipe).unwrap())
+                .unwrap();
+            writer.record_exit(EXIT_ARTIFACT_TRANSFER_FAILED).unwrap();
+            let owned = claim_with(&writer, |_| async { Ok(true) }).await.unwrap();
+            let mut session = RecoverySession {
+                recipe: load_recipe(&owned).unwrap(),
+                writer: owned.clone(),
+            };
+            let before = std::fs::read(&writer.path).unwrap();
+            let lease = writer.snapshot();
+            let entries = std::fs::read_dir(root.join("jobs")).unwrap().count();
+            let error = session.returned(0).unwrap_err();
+            assert!(
+                format!("{error:#}").contains("successful recovery"),
+                "{case}: {error:#}"
+            );
+            assert_eq!(writer.snapshot(), lease, "{case}");
+            assert_eq!(std::fs::read(&writer.path).unwrap(), before, "{case}");
+            assert_eq!(
+                std::fs::read_dir(root.join("jobs")).unwrap().count(),
+                entries
+            );
+            assert!(session.recipe.returned.is_none());
+            assert!(!session.recipe.sources_released);
+            assert!(!session.recipe.retired);
+            assert!(!writer.snapshot().terminal_acknowledged);
+            assert_eq!(
+                serde_json::to_value(&session.recipe).unwrap(),
+                lease.recovery.unwrap(),
+                "failed publication changed cached recovery evidence: {case}"
+            );
+            assert_eq!(
+                std::fs::read(root.join("worker/retained-output")).unwrap(),
+                b"completed worker output"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn old_premature_success_is_refused_before_recovery_or_terminal_shortcut() {
+        for acknowledged in [false, true] {
+            for case in [
+                "project",
+                "partial-project",
+                "report",
+                "pending-project",
+                "failed",
+            ] {
+                let (root, writer, mut recipe) = delivery_fixture();
+                invalidate_delivery(&mut recipe, case);
+                // Write adversarial old-format evidence with the unowned test
+                // writer; never manufacture an observed worker/daemon success.
+                writer
+                    .set_recovery(serde_json::to_value(recipe).unwrap())
+                    .unwrap();
+                writer.record_exit(0).unwrap();
+                if acknowledged {
+                    writer.lease.lock().unwrap().acknowledge_terminal(3);
+                    writer.persist().unwrap();
+                }
+                let before = std::fs::read(&writer.path).unwrap();
+                let lease = writer.snapshot();
+                let retained = root.join("worker/retained-output");
+                let inode = std::fs::metadata(&retained).unwrap().ino();
+                let inspected = Cell::new(false);
+                let result = claim_with(&writer, |_| async {
+                    inspected.set(true);
+                    Ok(true)
+                })
+                .await;
+                assert!(result.is_err(), "{case}, acknowledged={acknowledged}");
+                assert!(!inspected.get(), "invalid delivery reached owner inspection");
+                assert_eq!(writer.snapshot(), lease);
+                assert_eq!(std::fs::read(&writer.path).unwrap(), before);
+                assert_eq!(std::fs::read(&retained).unwrap(), b"completed worker output");
+                assert_eq!(std::fs::metadata(&retained).unwrap().ino(), inode);
+                assert_eq!(std::fs::read_dir(root.join("caller")).unwrap().count(), 0);
+                // Only this failed collector's lock is released. The journal
+                // and source-ownership facts remain exactly as supplied.
+                let _retry_gate = acquire_gate(&writer.path).unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn verified_delivery_can_precede_exit_reconciliation_and_source_release() {
+        for kind in [CompilationKind::Make, CompilationKind::CargoTest] {
+            let (root, writer, mut recipe) = delivery_fixture();
+            recipe.returned = None;
+            recipe.kind = Some(kind);
+            recipe.phases[0].complete = kind == CompilationKind::Make;
+            writer
+                .set_recovery(serde_json::to_value(recipe).unwrap())
+                .unwrap();
+            writer.record_exit(EXIT_ARTIFACT_TRANSFER_FAILED).unwrap();
+            let owned = claim_with(&writer, |_| async { Ok(true) }).await.unwrap();
+            let mut session = RecoverySession {
+                recipe: load_recipe(&owned).unwrap(),
+                writer: owned.clone(),
+            };
+            // Phony Make has a complete empty output set; streaming tests
+            // need no optional artifact phase. Both still require the report.
+            session.returned(0).unwrap();
+            let disk =
+                DurableLeaseWriter::read_journal(&writer.path, &writer.wrapper_id()).unwrap();
+            assert_eq!(disk.exit_code, Some(EXIT_ARTIFACT_TRANSFER_FAILED));
+            assert_eq!(disk.recovery.as_ref().unwrap()["returned"], 0);
+            assert!(!disk.terminal_acknowledged);
+            assert!(!session.recipe.sources_released);
+            assert!(owned.acknowledge_terminal().is_err());
+            drop(session);
+            drop(owned);
+            let _retry = claim_with(&writer, |_| async { Ok(true) }).await.unwrap();
+            assert_eq!(writer.snapshot(), disk);
+            assert_eq!(
+                std::fs::read(root.join("worker/retained-output")).unwrap(),
+                b"completed worker output"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_and_failed_collection_keep_their_incomplete_evidence() {
+        for returned in [None, Some(EXIT_ARTIFACT_TRANSFER_FAILED)] {
+            let (root, writer, mut recipe) = delivery_fixture();
+            recipe.returned = returned;
+            invalidate_delivery(&mut recipe, "partial-project");
+            let expected = serde_json::to_value(recipe).unwrap();
+            writer.set_recovery(expected.clone()).unwrap();
+            writer.record_exit(EXIT_ARTIFACT_TRANSFER_FAILED).unwrap();
+            let owned = claim_with(&writer, |_| async { Ok(true) }).await.unwrap();
+            owned.heartbeat("recovery").unwrap();
+            assert_eq!(owned.snapshot().recovery.as_ref(), Some(&expected));
+            assert!(!owned.snapshot().terminal_acknowledged);
+            assert_eq!(
+                std::fs::read(root.join("worker/retained-output")).unwrap(),
+                b"completed worker output"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn successful_delivery_must_belong_to_the_same_wrapper_build_and_worker() {
+        for field in ["version", "wrapper_id", "build_id", "worker"] {
+            let (root, writer, mut recipe) = delivery_fixture();
+            recipe.returned = None;
+            writer
+                .set_recovery(serde_json::to_value(&recipe).unwrap())
+                .unwrap();
+            let owned = claim_with(&writer, |_| async { Ok(true) }).await.unwrap();
+            recipe.returned = Some(0);
+            match field {
+                "version" => recipe.version = 99,
+                "wrapper_id" => recipe.wrapper_id = "rchw-other".into(),
+                "build_id" => recipe.build_id += 1,
+                "worker" => recipe.worker.id = WorkerId::new("other-worker"),
+                _ => unreachable!(),
+            }
+            let before = std::fs::read(&writer.path).unwrap();
+            let lease = writer.snapshot();
+            assert!(
+                owned
+                    .set_recovery(serde_json::to_value(recipe).unwrap())
+                    .is_err()
+            );
+            assert_eq!(writer.snapshot(), lease);
+            assert_eq!(std::fs::read(&writer.path).unwrap(), before);
+            assert_eq!(
+                std::fs::read(root.join("worker/retained-output")).unwrap(),
+                b"completed worker output"
+            );
         }
     }
 

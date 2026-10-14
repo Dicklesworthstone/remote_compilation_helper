@@ -1,7 +1,7 @@
 //! Finish detached recovery's daemon reservation before acknowledging the client.
 //! Output retirement is not slot release. The original wrapper may have died
 //! before its release request, or that request's reply may have been lost.
-use super::{DurableLeaseWriter, RecoveryRecipe, load_recipe};
+use super::{DurableJobLease, DurableLeaseWriter, RecoveryRecipe, load_recipe};
 use crate::hook::artifact_patterns::kind_produces_transferable_artifacts;
 use anyhow::{Context, Result};
 use serde_json::Value;
@@ -133,6 +133,32 @@ fn validate_successful_delivery(recipe: &RecoveryRecipe) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Refuse a premature success both when loading old journals and BEFORE a
+/// live writer publishes `returned = 0`. Waiting for `finish` is too late:
+/// detached recovery retires sources before that final daemon handoff.
+/// Pending collection and truthful failures retain their existing semantics.
+/// Do not compare the outer exit here: recovery can deliver successfully
+/// while the wrapper still records its original retrieval failure (102).
+pub(super) fn validate_recorded_delivery(lease: &DurableJobLease) -> Result<()> {
+    let Some(value) = lease.recovery.as_ref() else {
+        return Ok(());
+    };
+    if value.get("returned").and_then(Value::as_i64) != Some(0) {
+        return Ok(());
+    }
+    let recipe: RecoveryRecipe = serde_json::from_value(value.clone())
+        .context("successful recovery has an invalid retained delivery recipe")?;
+    anyhow::ensure!(
+        recipe.version == 2
+            && recipe.wrapper_id == lease.identity.local_wrapper_id
+            && recipe.build_id > 0
+            && Some(recipe.build_id) == lease.identity.remote_build_id
+            && lease.worker_id.as_deref() == Some(recipe.worker.id.as_str()),
+        "successful recovery has a different delivery identity; ownership retained"
+    );
+    validate_successful_delivery(&recipe)
 }
 
 /// Caller holds the same-wrapper recovery lock and has proved the original
