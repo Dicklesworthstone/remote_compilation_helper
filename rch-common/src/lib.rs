@@ -91,6 +91,7 @@ pub mod telemetry_explain;
 pub mod telemetry_freshness;
 pub mod test_change;
 pub mod testing;
+pub mod tool_requirement;
 pub mod toolchain;
 pub mod transfer_hardening;
 pub mod types;
