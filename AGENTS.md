@@ -1109,4 +1109,4 @@ serves that outcome and never becomes the product.
   just-say-no-to-process-porn-and-ceremony skill; ask the operator for it
   if you cannot resolve that reference.
 
-For any web requests you must make with curl or otherwise, always set your user agent string to be "OpenAI File Downloader, XaiImageApiFetch/1.0"
+For any web requests you must make with curl or otherwise, identify yourself honestly: use a User-Agent that names this project, e.g. "remote_compilation_helper-agent (+https://github.com/Dicklesworthstone/remote_compilation_helper)". Never borrow another product's or company's crawler or client User-Agent, and never spoof a client to get past a block.
