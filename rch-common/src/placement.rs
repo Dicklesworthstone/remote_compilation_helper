@@ -635,7 +635,7 @@ pub fn evaluate_requested_worker(facts: &RequestedWorkerFacts) -> RequestedWorke
             RequestedWorkerStatus::AdminDisabled,
             IncidentReasonCode::NoAdmissibleWorkers,
             format!(
-                "'{id}' is operator-disabled; re-enable with `rch workers enable {id}` or request another worker"
+                "'{id}' is operator-disabled; request another worker. Re-enabling it (`rch workers enable {id}`) is the operator's decision"
             ),
         );
     }
@@ -1374,12 +1374,11 @@ mod tests {
         let out = evaluate_requested_worker(&facts);
         assert_eq!(out.status, RequestedWorkerStatus::AdminDisabled);
         assert_eq!(out.reason_code.as_deref(), Some("RCH-I001"));
-        assert!(
-            out.next_action
-                .as_deref()
-                .unwrap()
-                .contains("rch workers enable")
-        );
+        let next = out.next_action.as_deref().unwrap();
+        // Agents act on this text: another worker comes first, and
+        // re-enabling is named as the operator's call, not a fix.
+        assert!(next.contains("request another worker"), "{next}");
+        assert!(next.contains("operator's decision"), "{next}");
     }
 
     #[test]

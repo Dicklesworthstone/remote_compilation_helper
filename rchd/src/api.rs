@@ -4153,7 +4153,11 @@ fn worker_issue(
             summary: format!(
                 "Worker '{worker_id}' is administratively disabled ({reason}); its slots are withheld, it is not polled for telemetry, and the disable is durable — restarting the daemon re-applies it"
             ),
-            remediation: Some(format!("rch workers enable {worker_id}")),
+            // Agents act on this line. An operator disable can protect a
+            // production host, so name the condition, not just the command.
+            remediation: Some(format!(
+                "only once the recorded reason no longer applies (an operator decision): rch workers enable {worker_id}"
+            )),
         });
     }
     if status == WorkerStatus::Drained {
