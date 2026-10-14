@@ -56,15 +56,35 @@ async fn recover_partial_publication(ram_caller: bool) {
     .unwrap();
     std::fs::copy(remote.join("program.c"), caller.join("program.c")).unwrap();
     std::fs::copy(remote.join("Makefile"), caller.join("Makefile")).unwrap();
-    run(Command::new("git").args(["init", "-b", "main"]).current_dir(&remote)).await;
-    run(Command::new("git").args(["add", "program.c", "Makefile"]).current_dir(&remote)).await;
-    run(Command::new("git").args([
-        "-c", "user.name=RCH fixture", "-c", "user.email=rch-fixture@localhost",
-        "commit", "-m", "owned staging fixture",
-    ]).current_dir(&remote)).await;
-    run(Command::new("git").args([
-        "archive", "--format=tar", "--output=.rch-clean-overlay-base.tar", "HEAD",
-    ]).current_dir(&remote)).await;
+    run(Command::new("git")
+        .args(["init", "-b", "main"])
+        .current_dir(&remote))
+    .await;
+    run(Command::new("git")
+        .args(["add", "program.c", "Makefile"])
+        .current_dir(&remote))
+    .await;
+    run(Command::new("git")
+        .args([
+            "-c",
+            "user.name=RCH fixture",
+            "-c",
+            "user.email=rch-fixture@localhost",
+            "commit",
+            "-m",
+            "owned staging fixture",
+        ])
+        .current_dir(&remote))
+    .await;
+    run(Command::new("git")
+        .args([
+            "archive",
+            "--format=tar",
+            "--output=.rch-clean-overlay-base.tar",
+            "HEAD",
+        ])
+        .current_dir(&remote))
+    .await;
     let archive = std::fs::read(remote.join(".rch-clean-overlay-base.tar")).unwrap();
     let worker = WorkerConfig {
         id: WorkerId::new("staging-relocation-fixture"),
@@ -76,8 +96,8 @@ async fn recover_partial_publication(ram_caller: bool) {
         tags: Vec::new(),
         tools: Vec::new(),
     };
-    let writer = DurableLeaseWriter::create_in(&root.join("journals"), "make all", true, false)
-        .unwrap();
+    let writer =
+        DurableLeaseWriter::create_in(&root.join("journals"), "make all", true, false).unwrap();
     writer.admit(41, &worker.id).unwrap();
     let identity = uuid::Uuid::new_v4().simple().to_string();
     let remote_name = remote.to_str().unwrap().to_owned();
@@ -89,30 +109,62 @@ async fn recover_partial_publication(ram_caller: bool) {
         ..Default::default()
     };
     let pipeline = TransferPipeline::new(
-        caller.clone(), "staging-fixture".into(), identity.clone(), config.clone(),
-    ).with_remote_path_override(remote_name.clone());
+        caller.clone(),
+        "staging-fixture".into(),
+        identity.clone(),
+        config.clone(),
+    )
+    .with_remote_path_override(remote_name.clone());
     RecoverySession::begin(
-        &writer, &worker, source_roots.clone(), pair.clone(), Some(remote_name.clone()),
-        Some(retained.clone()), config.clone(), caller.clone(), identity.clone(),
-    ).unwrap();
+        &writer,
+        &worker,
+        source_roots.clone(),
+        pair.clone(),
+        Some(remote_name.clone()),
+        Some(retained.clone()),
+        config.clone(),
+        caller.clone(),
+        identity.clone(),
+    )
+    .unwrap();
     let mut session = RecoverySession::prepare(
-        &writer, &worker, &pipeline, source_roots, pair, Some(remote_name), Some(retained),
-        config, caller.clone(), None, Some(CompilationKind::Make), "make all",
-        &["reports".into()], identity.clone(),
-    ).unwrap();
+        &writer,
+        &worker,
+        &pipeline,
+        source_roots,
+        pair,
+        Some(remote_name),
+        Some(retained),
+        config,
+        caller.clone(),
+        None,
+        Some(CompilationKind::Make),
+        "make all",
+        &["reports".into()],
+        identity.clone(),
+    )
+    .unwrap();
     session.starting_execution().unwrap();
     let outcome = run(Command::new("make").arg("all").current_dir(&remote)).await;
     session.completed(outcome.status.code().unwrap()).unwrap();
-    std::fs::write(remote.join("build/nested/.rch-clean-overlay-base.tar"), &archive).unwrap();
+    std::fs::write(
+        remote.join("build/nested/.rch-clean-overlay-base.tar"),
+        &archive,
+    )
+    .unwrap();
     let old_stage = session.stage(0);
     let old_pipeline = session.staging_pipeline("project", &pipeline).unwrap();
     run(&mut old_pipeline.local_artifact_retrieval_for_test(
-        &worker, &remote, &session.recipe.phases[0].patterns,
-    )).await;
-    let reports = session.staging_pipeline("result:reports", &pipeline).unwrap();
-    run(&mut reports.local_artifact_retrieval_for_test(
-        &worker, &remote, &["reports/**".into()],
-    )).await;
+        &worker,
+        &remote,
+        &session.recipe.phases[0].patterns,
+    ))
+    .await;
+    let reports = session
+        .staging_pipeline("result:reports", &pipeline)
+        .unwrap();
+    run(&mut reports.local_artifact_retrieval_for_test(&worker, &remote, &["reports/**".into()]))
+        .await;
     session.publish("result:reports").await.unwrap();
     let report = caller.join("reports/summary.txt");
     let report_inode = std::fs::metadata(&report).unwrap().ino();
@@ -123,18 +175,24 @@ async fn recover_partial_publication(ram_caller: bool) {
     let pending_hash = fingerprint(&old_stage.join(&pending)).unwrap().unwrap();
     {
         let _publication = lock_output_root(&caller).await.unwrap();
-        session.persist_output_baseline(0, &[done.clone(), pending.clone()]).unwrap();
+        session
+            .persist_output_baseline(0, &[done.clone(), pending.clone()])
+            .unwrap();
         for (relative, publish) in [(&done, true), (&pending, false)] {
             let destination = caller.join(relative);
             let temporary = destination.parent().unwrap().join(&temporary_name);
             let hash = fingerprint(&old_stage.join(relative)).unwrap().unwrap();
-            let prepared = prepare_output_temporary(&old_stage.join(relative), &temporary, &hash)
-                .unwrap();
+            let prepared =
+                prepare_output_temporary(&old_stage.join(relative), &temporary, &hash).unwrap();
             prepared.directory.sync_all().unwrap();
-            session.persist_pending_output(0, Some((relative.clone(), hash.clone()))).unwrap();
+            session
+                .persist_pending_output(0, Some((relative.clone(), hash.clone())))
+                .unwrap();
             if publish {
                 prepared.publish(&destination).unwrap();
-                session.persist_published_output(0, relative.clone(), hash).unwrap();
+                session
+                    .persist_published_output(0, relative.clone(), hash)
+                    .unwrap();
             }
         }
     }
@@ -158,7 +216,10 @@ async fn recover_partial_publication(ram_caller: bool) {
     };
     assert!(relocate(&writer, &writer.wrapper_id(), &current).is_err());
     assert_eq!(std::fs::read(&writer.path).unwrap(), before);
-    assert_eq!(std::fs::metadata(&pending_temporary).unwrap().ino(), pending_inode);
+    assert_eq!(
+        std::fs::metadata(&pending_temporary).unwrap().ino(),
+        pending_inode
+    );
     assert!(!writer.snapshot().terminal_acknowledged);
     current.retrieval_staging_dir = Some(root.join("fresh-stage"));
     current.retrieval_min_free_bytes = 0;
@@ -167,7 +228,10 @@ async fn recover_partial_publication(ram_caller: bool) {
         recipe: load_recipe(&writer).unwrap(),
         writer: writer.clone(),
     };
-    assert_eq!(serde_json::to_value(&recovered.recipe.phases).unwrap(), phases);
+    assert_eq!(
+        serde_json::to_value(&recovered.recipe.phases).unwrap(),
+        phases
+    );
     recovered.apply_retrieval_config(&current).unwrap();
     let fresh = recovered.stage(0);
     assert!(!fresh.starts_with(&caller));
@@ -179,32 +243,69 @@ async fn recover_partial_publication(ram_caller: bool) {
     assert!(!recovered.recipe.phases[0].complete);
     assert!(!writer.snapshot().terminal_acknowledged);
     run(&mut staged.local_artifact_retrieval_for_test(
-        &worker, &remote, &recovered.recipe.phases[0].patterns,
-    )).await;
+        &worker,
+        &remote,
+        &recovered.recipe.phases[0].patterns,
+    ))
+    .await;
     assert!(!fresh.join(".rch-clean-overlay-base.tar").exists());
-    assert!(!fresh.join("build/nested/.rch-clean-overlay-base.tar").exists());
+    assert!(
+        !fresh
+            .join("build/nested/.rch-clean-overlay-base.tar")
+            .exists()
+    );
     assert!(!fresh.join("old-fixture-link").exists());
     recovered.publish("project").await.unwrap();
     recovered.publish("result:reports").await.unwrap();
     recovered.returned(0).unwrap();
-    assert_eq!(std::fs::metadata(caller.join(&done)).unwrap().ino(), done_inode);
-    assert_eq!(std::fs::metadata(caller.join(&pending)).unwrap().ino(), pending_inode);
-    assert_eq!(fingerprint(&caller.join(&pending)).unwrap(), Some(pending_hash));
+    assert_eq!(
+        std::fs::metadata(caller.join(&done)).unwrap().ino(),
+        done_inode
+    );
+    assert_eq!(
+        std::fs::metadata(caller.join(&pending)).unwrap().ino(),
+        pending_inode
+    );
+    assert_eq!(
+        fingerprint(&caller.join(&pending)).unwrap(),
+        Some(pending_hash)
+    );
     assert_eq!(std::fs::metadata(&report).unwrap().ino(), report_inode);
     assert_eq!(std::fs::read(&report).unwrap(), b"PASS\n");
-    assert!(!recovered.stage(1).exists(), "completed report was recollected");
+    assert!(
+        !recovered.stage(1).exists(),
+        "completed report was recollected"
+    );
     for relative in ["build/app", "build/libfixture.a", "build/invocations"] {
-        assert_eq!(std::fs::read(caller.join(relative)).unwrap(), std::fs::read(remote.join(relative)).unwrap());
+        assert_eq!(
+            std::fs::read(caller.join(relative)).unwrap(),
+            std::fs::read(remote.join(relative)).unwrap()
+        );
     }
     assert_eq!(std::fs::read(old_stage.join("build/app")).unwrap(), old_app);
     assert_eq!(std::fs::read(&old_archive).unwrap(), archive[..127]);
-    assert_eq!(std::fs::read_link(&old_link).unwrap(), caller.join("caller-source"));
-    assert_eq!(std::fs::read(remote.join(".rch-clean-overlay-base.tar")).unwrap(), archive);
-    assert_eq!(std::fs::read(remote.join("build/invocations")).unwrap(), b"build\n");
-    assert_eq!(std::fs::read(caller.join("caller-source")).unwrap(), b"source sentinel");
+    assert_eq!(
+        std::fs::read_link(&old_link).unwrap(),
+        caller.join("caller-source")
+    );
+    assert_eq!(
+        std::fs::read(remote.join(".rch-clean-overlay-base.tar")).unwrap(),
+        archive
+    );
+    assert_eq!(
+        std::fs::read(remote.join("build/invocations")).unwrap(),
+        b"build\n"
+    );
+    assert_eq!(
+        std::fs::read(caller.join("caller-source")).unwrap(),
+        b"source sentinel"
+    );
     assert!(!recovered.recipe.sources_released);
     assert!(writer.acknowledge_terminal().is_err());
-    assert_eq!(writer.snapshot().exit_code, Some(EXIT_ARTIFACT_TRANSFER_FAILED));
+    assert_eq!(
+        writer.snapshot().exit_code,
+        Some(EXIT_ARTIFACT_TRANSFER_FAILED)
+    );
     let committed = std::fs::read(&writer.path).unwrap();
     relocate(&writer, &writer.wrapper_id(), &current).unwrap();
     assert_eq!(std::fs::read(&writer.path).unwrap(), committed);

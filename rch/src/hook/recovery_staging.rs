@@ -278,9 +278,9 @@ pub(super) fn relocate(
         {
             anyhow::ensure!(
                 !relative.as_os_str().is_empty()
-                    && relative.components().all(|part| {
-                        matches!(part, std::path::Component::Normal(_))
-                    }),
+                    && relative
+                        .components()
+                        .all(|part| { matches!(part, std::path::Component::Normal(_)) }),
                 "staging relocation has an invalid publication checkpoint"
             );
         }
@@ -288,7 +288,10 @@ pub(super) fn relocate(
     // Change ONE field in the original value, preserving even unknown fields
     // and old source-root spellings. load_recipe's normalization is for reads,
     // not permission to rewrite the admitted contract during relocation.
-    let mut next = lease.recovery.clone().context("missing relocation recipe")?;
+    let mut next = lease
+        .recovery
+        .clone()
+        .context("missing relocation recipe")?;
     next.get_mut("transfer")
         .and_then(serde_json::Value::as_object_mut)
         .context("invalid persisted transfer configuration")?
@@ -328,7 +331,12 @@ mod tests {
         use std::os::unix::fs::{PermissionsExt, symlink};
 
         for replacement in [
-            "base", "directory", "symlink", "file", "base-mode", "stage-mode",
+            "base",
+            "directory",
+            "symlink",
+            "file",
+            "base-mode",
+            "stage-mode",
         ] {
             let (root, session, _, _) = fixture_with_results(true, &[]);
             let writer = &session.writer;
@@ -367,8 +375,7 @@ mod tests {
                     } else {
                         &stage_path
                     };
-                    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o777))
-                        .unwrap();
+                    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o777)).unwrap();
                 }
                 _ => unreachable!(),
             }
@@ -394,7 +401,10 @@ mod tests {
             assert_eq!(guard.directory.metadata().unwrap().ino(), original_inode);
             assert!(std::fs::symlink_metadata(&stage_path).is_ok());
             if replacement == "file" {
-                assert_eq!(std::fs::read(&stage_path).unwrap(), b"other owner's evidence");
+                assert_eq!(
+                    std::fs::read(&stage_path).unwrap(),
+                    b"other owner's evidence"
+                );
             }
             if replacement == "symlink" {
                 assert_eq!(std::fs::read_link(&stage_path).unwrap(), retained);
@@ -489,7 +499,12 @@ mod tests {
         );
         assert!(
             guard
-                .publish(writer, &lease, next_stage(&lease, &root.join("not-prepared")), 0)
+                .publish(
+                    writer,
+                    &lease,
+                    next_stage(&lease, &root.join("not-prepared")),
+                    0
+                )
                 .is_err()
         );
         assert_eq!(std::fs::read(&writer.path).unwrap(), before);
@@ -533,8 +548,7 @@ mod tests {
     #[test]
     fn relocation_changes_only_the_stage_and_preserves_partial_and_completed_phases() {
         let (root, mut session, _, _) = fixture_with_results(true, &["reports".into()]);
-        session.recipe.phases[0].pending =
-            Some(("build/pending.o".into(), "pending-hash".into()));
+        session.recipe.phases[0].pending = Some(("build/pending.o".into(), "pending-hash".into()));
         session.recipe.phases[0]
             .published
             .insert("build/done.o".into(), "done-hash".into());
@@ -636,8 +650,7 @@ mod tests {
                         Some(("reports/result".into(), "hash".into()));
                 }
                 "unsafe-checkpoint" => {
-                    session.recipe.phases[0].pending =
-                        Some(("../foreign".into(), "hash".into()));
+                    session.recipe.phases[0].pending = Some(("../foreign".into(), "hash".into()));
                 }
                 _ => unreachable!(),
             }
@@ -688,11 +701,7 @@ mod tests {
             };
             let current = TransferConfig {
                 retrieval_staging_dir: Some(selected),
-                retrieval_min_free_bytes: if destination == "full" {
-                    u64::MAX
-                } else {
-                    0
-                },
+                retrieval_min_free_bytes: if destination == "full" { u64::MAX } else { 0 },
                 ..Default::default()
             };
             let before = std::fs::read(&session.writer.path).unwrap();
