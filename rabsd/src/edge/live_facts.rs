@@ -37,6 +37,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 mod toolchain_hashing;
+mod toolchain_probe;
 
 /// Domain of the sysroot tree digest.
 pub const DOMAIN_SYSROOT_TREE: &str = "rabs.live-dependency.sysroot-tree.v1";
@@ -967,21 +968,11 @@ fn probe_toolchain(compiler: &Path, env: &[(String, String)]) -> Result<ProbedTo
     // Probe output, binary bytes and library facts must belong to this one
     // observed generation, not successive stages of a toolchain update.
     let inputs = observe_toolchain_inputs(compiler, sysroot)?;
-    let run = |args: &[&str]| -> Result<String, String> {
-        let output = std::process::Command::new(compiler)
-            .args(args)
-            .env_clear()
-            .envs(env.iter().map(|(name, value)| (name, value)))
-            .stdin(std::process::Stdio::null())
-            .output()
-            .map_err(|error| format!("probe {args:?}: {error}"))?;
-        if !output.status.success() {
-            return Err(format!("probe {args:?} exited {}", output.status));
-        }
-        String::from_utf8(output.stdout).map_err(|_| format!("probe {args:?}: non-UTF-8"))
-    };
-    let verbose_version = run(&["-vV"])?.trim_end().to_owned();
-    let printed = run(&["--print", "sysroot"])?;
+    // The shared warm pool must not be held forever by a hung version/sysroot
+    // child, an inherited pipe, or unbounded diagnostic output. The existing
+    // process supervisor owns cleanup before a failed observation is returned.
+    let (verbose_version, printed) = toolchain_probe::identity(compiler, env)?;
+    let verbose_version = verbose_version.trim_end().to_owned();
     if Path::new(printed.trim_end()) != sysroot {
         return Err(
             "compiler resolves a different sysroot (a proxy, not a toolchain binary)".into(),
@@ -3033,6 +3024,117 @@ esac
             Err(FactsMiss::Refused(_))
         ));
         assert_eq!(*facts.warming.lock().unwrap(), MAX_WARMING);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn failed_probe_processes_release_the_actual_shared_warm_pool() {
+        let (first_dir, first) = toolchain_fixture();
+        let (second_dir, second) = toolchain_fixture();
+        let (_healthy_dir, healthy) = toolchain_fixture();
+        let facts = LiveFacts::new();
+        // Hold two real probe processes until both warm slots are in use.
+        // Marker files are outside the observed toolchain, not keyed inputs.
+        let script = br#"#!/bin/sh
+printf started > "$STARTED"
+while [ ! -f "$RELEASE" ]; do /bin/sleep 0.01; done
+trap 'exit 0' TERM
+while :; do printf '%0200d' 0; done
+"#;
+        let probes = [(&first, first_dir.path()), (&second, second_dir.path())];
+        for (compiler, root) in probes {
+            std::fs::write(compiler, script).unwrap();
+            let env = vec![
+                ("STARTED".into(), root.join("started").to_str().unwrap().into()),
+                ("RELEASE".into(), root.join("release").to_str().unwrap().into()),
+            ];
+            assert_eq!(facts.toolchain(compiler, &env), Err(FactsMiss::Pending));
+        }
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while probes.iter().any(|(_, root)| !root.join("started").exists()) {
+            assert!(Instant::now() < deadline, "probe processes did not start");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(*facts.warming.lock().unwrap(), MAX_WARMING);
+        assert_eq!(facts.toolchain(&healthy, &[]), Err(FactsMiss::Pending));
+        assert!(!facts.toolchains.lock().unwrap().contains_key(&healthy));
+
+        for (_, root) in probes {
+            std::fs::write(root.join("release"), b"continue").unwrap();
+        }
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while *facts.warming.lock().unwrap() != 0 {
+            assert!(Instant::now() < deadline, "failed probes stranded warm capacity");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        for (compiler, _) in probes {
+            assert!(matches!(
+                facts.toolchain(compiler, &[]),
+                Err(FactsMiss::Refused(reason)) if reason.contains("capture exceeds")
+            ));
+            assert!(matches!(
+                facts.toolchains.lock().unwrap().get(compiler),
+                Some(Slot::Failed { .. })
+            ));
+        }
+        // This is the ordinary public lookup, not an injected Ready slot or
+        // a manual capacity reset. Unrelated toolchains can now warm again.
+        let deadline = Instant::now() + Duration::from_secs(8);
+        loop {
+            match facts.toolchain(&healthy, &[]) {
+                Ok(toolchain) => {
+                    facts
+                        .toolchain_guard(&healthy, &toolchain)
+                        .unwrap()
+                        .verify_unchanged(&healthy)
+                        .unwrap();
+                    break;
+                }
+                Err(FactsMiss::Pending) => {
+                    assert!(Instant::now() < deadline, "healthy toolchain could not recover");
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("healthy probe refused after capacity recovery: {error}"),
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_failed_reprobe_cannot_resurrect_an_old_toolchain_guard() {
+        let (_dir, compiler) = toolchain_fixture();
+        let facts = LiveFacts::new();
+        let observed = probe_toolchain(&compiler, &[]).unwrap();
+        let expected = observed.facts.clone();
+        facts
+            .toolchains
+            .lock()
+            .unwrap()
+            .insert(compiler.clone(), Slot::Ready(Arc::new(observed)));
+        let guard = facts.toolchain_guard(&compiler, &expected).unwrap();
+        std::fs::write(
+            &compiler,
+            b"#!/bin/sh\nwhile :; do printf '%0200d' 0 >&2; done\n",
+        )
+        .unwrap();
+        assert!(guard.verify_unchanged(&compiler).is_err());
+        assert_eq!(facts.toolchain(&compiler, &[]), Err(FactsMiss::Pending));
+        let deadline = Instant::now() + Duration::from_secs(8);
+        loop {
+            match facts.toolchain(&compiler, &[]) {
+                Err(FactsMiss::Refused(reason)) => {
+                    assert!(reason.contains("capture exceeds"), "{reason}");
+                    break;
+                }
+                Err(FactsMiss::Pending) => {
+                    assert!(Instant::now() < deadline, "failed reprobe stayed pending");
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Ok(_) => panic!("a partial failed probe became ready toolchain facts"),
+            }
+        }
+        assert!(facts.toolchain_guard(&compiler, &expected).is_err());
+        assert!(guard.verify_unchanged(&compiler).is_err());
     }
 
     #[test]
