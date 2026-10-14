@@ -322,6 +322,36 @@ wait
                 self.assertFalse(self.payload.exists())
                 self.assertFalse(self.record.exists())
 
+    def test_control_capture_rejects_binary_and_oversized_success(self) -> None:
+        self.env["TMPDIR"] = str(self.root)
+        for body in (
+            r"""printf 'active\\000junk\\n'""",
+            r"""i=0; while [ "$i" -lt 7000 ]; do printf 0123456789; i=$((i + 1)); done""",
+        ):
+            with self.subTest(body=body):
+                self.fake("systemctl", body)
+                result = self.run_shell(r"""rch_control_capture 1s systemctl probe""")
+                self.assertEqual(result.returncode, 125, result.stderr)
+                self.assertEqual(result.stdout, "")
+                self.assertEqual(list(self.root.glob("rch-control-output.*")), [])
+
+    def test_control_capture_preserves_failure_status_and_cleans_timeout(self) -> None:
+        self.env["TMPDIR"] = str(self.root)
+        self.fake("systemctl", "printf 'inactive\\n' >&2; exit 7")
+        failed = self.run_shell(r"""rch_control_capture 1s systemctl probe""")
+        self.assertEqual(failed.returncode, 7)
+        self.assertEqual(failed.stdout, "")
+        self.assertEqual(failed.stderr, "inactive\\n")
+        self.assertEqual(list(self.root.glob("rch-control-output.*")), [])
+
+        self.fake("systemctl", "printf prefix; sleep 5")
+        started = time.monotonic()
+        timed = self.run_shell(r"""rch_control_capture 1s systemctl probe""", timeout=4)
+        self.assertLess(time.monotonic() - started, 3)
+        self.assertNotEqual(timed.returncode, 0)
+        self.assertEqual(timed.stdout, "")
+        self.assertEqual(list(self.root.glob("rch-control-output.*")), [])
+
     def mock_active_slice(self) -> None:
         self.fake("systemctl", r'''
 case " $* " in

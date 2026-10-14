@@ -507,16 +507,51 @@ rch_group_timeout() {
 
 rch_control_capture() {
     case "$1" in 1s|5s) ;; *) return 125;; esac
-    rch_group_timeout --signal=KILL "$1" /bin/sh -c '
+    rch_control_timeout=$1
+    shift
+    # Never place untrusted control bytes in a shell variable before validating
+    # them: command substitution can discard NUL and turn malformed evidence
+    # into a valid-looking systemd property. Capture raw bytes in a private,
+    # bounded file owned by this still-live observer, outside the timed group.
+    rch_control_base=${TMPDIR:-/tmp}
+    case "$rch_control_base" in /*) ;; *) return 125;; esac
+    rch_control_file=$(umask 077; mktemp "$rch_control_base/rch-control-output.XXXXXXXXXX") || return 125
+    rch_control_status=0
+    rch_group_timeout --signal=KILL "$rch_control_timeout" /bin/sh -c '
+        output=$1
         shift
-        __rch_control_output=$("$@" 2>&1)
-        __rch_control_status=$?
-        if [ "$__rch_control_status" -ne 0 ]; then
-            printf "%s\n" "$__rch_control_output" >&2
-            exit "$__rch_control_status"
-        fi
-        printf "%s\n" "$__rch_control_output"
-    ' rch-control "$@" </dev/null
+        "$@" > "$output" 2>&1
+    ' rch-control "$rch_control_file" "$@" </dev/null || rch_control_status=$?
+
+    rch_control_metadata=$(LC_ALL=C stat -c '%a:%h:%s' -- "$rch_control_file" 2>/dev/null) || {
+        rm -f -- "$rch_control_file"
+        return 125
+    }
+    case "$rch_control_metadata" in
+        600:1:*) ;;
+        *) rm -f -- "$rch_control_file"; return 125;;
+    esac
+    rch_control_size=${rch_control_metadata##*:}
+    case "$rch_control_size" in
+        ''|*[!0-9]*) rm -f -- "$rch_control_file"; return 125;;
+    esac
+    if [ "$rch_control_size" -gt 65536 ] ||
+        ! LC_ALL=C tr -cd '\11\12\40-\176' < "$rch_control_file" | cmp -s - "$rch_control_file"; then
+        rm -f -- "$rch_control_file"
+        return 125
+    fi
+
+    if [ "$rch_control_status" -ne 0 ]; then
+        cat -- "$rch_control_file" >&2
+        rch_control_output_status=$?
+        rm -f -- "$rch_control_file"
+        [ "$rch_control_output_status" -eq 0 ] || return 125
+        return "$rch_control_status"
+    fi
+    cat -- "$rch_control_file"
+    rch_control_output_status=$?
+    rm -f -- "$rch_control_file"
+    [ "$rch_control_output_status" -eq 0 ] || return 125
 }
 
 rch_policy_systemctl() {
