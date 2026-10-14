@@ -843,10 +843,16 @@ mod tests {
                 })
                 .await;
                 assert!(result.is_err(), "{case}, acknowledged={acknowledged}");
-                assert!(!inspected.get(), "invalid delivery reached owner inspection");
+                assert!(
+                    !inspected.get(),
+                    "invalid delivery reached owner inspection"
+                );
                 assert_eq!(writer.snapshot(), lease);
                 assert_eq!(std::fs::read(&writer.path).unwrap(), before);
-                assert_eq!(std::fs::read(&retained).unwrap(), b"completed worker output");
+                assert_eq!(
+                    std::fs::read(&retained).unwrap(),
+                    b"completed worker output"
+                );
                 assert_eq!(std::fs::metadata(&retained).unwrap().ino(), inode);
                 assert_eq!(std::fs::read_dir(root.join("caller")).unwrap().count(), 0);
                 // Only this failed collector's lock is released. The journal
