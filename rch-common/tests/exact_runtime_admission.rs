@@ -15,17 +15,27 @@ fn facts() -> rch_common::ProbedFacts {
 #[test]
 fn exact_runtime_admission_requires_every_runtime_and_named_tool() {
     let mut facts = facts();
-    let requirement = CapabilityRequirement::default()
-        .with_tools(["node@26.7.0", "bun@1.3.0", "clang"]);
-    assert_eq!(assess_admissibility(&facts, &requirement), CapabilityVerdict::Admissible);
+    let requirement =
+        CapabilityRequirement::default().with_tools(["node@26.7.0", "bun@1.3.0", "clang"]);
+    assert_eq!(
+        assess_admissibility(&facts, &requirement),
+        CapabilityVerdict::Admissible
+    );
     facts.runtimes.node_version = Some("v22.0.0".to_owned());
-    let CapabilityVerdict::Rejected { detail, .. } = assess_admissibility(&facts, &requirement) else {
+    let CapabilityVerdict::Rejected { detail, .. } = assess_admissibility(&facts, &requirement)
+    else {
         panic!("incompatible Node admitted");
     };
-    assert_eq!(detail, "capability_missing:runtime_version:node:required=26.7.0:observed=22.0.0");
+    assert_eq!(
+        detail,
+        "capability_missing:runtime_version:node:required=26.7.0:observed=22.0.0"
+    );
     facts.runtimes.node_version = Some("v26.7.0".to_owned());
     facts.tools_present.clear();
-    assert!(matches!(assess_admissibility(&facts, &requirement), CapabilityVerdict::Rejected { .. }));
+    assert!(matches!(
+        assess_admissibility(&facts, &requirement),
+        CapabilityVerdict::Rejected { .. }
+    ));
 }
 
 #[test]
@@ -34,13 +44,17 @@ fn exact_runtime_admission_never_substitutes_named_labels_for_version_facts() {
     facts.runtimes.node_version = None;
     facts.tools_present.push("node@26.7.0".to_owned());
     let requirement = CapabilityRequirement::default().with_tools(["node@26.7.0"]);
-    let CapabilityVerdict::Rejected { detail, .. } = assess_admissibility(&facts, &requirement) else {
+    let CapabilityVerdict::Rejected { detail, .. } = assess_admissibility(&facts, &requirement)
+    else {
         panic!("named label cannot prove runtime identity");
     };
     assert!(detail.ends_with("observed=<unknown>"));
     facts.tools_present.push("rust@1.90.0".to_owned());
     assert!(matches!(
-        assess_admissibility(&facts, &CapabilityRequirement::default().with_tools(["rust@1.90.0"])),
+        assess_admissibility(
+            &facts,
+            &CapabilityRequirement::default().with_tools(["rust@1.90.0"])
+        ),
         CapabilityVerdict::Rejected { .. }
     ));
 }
@@ -50,13 +64,22 @@ fn unconstrained_and_named_only_requests_keep_existing_meaning() {
     let mut facts = facts();
     facts.runtimes.node_version = None;
     facts.runtimes.bun_version = None;
-    assert_eq!(assess_admissibility(&facts, &CapabilityRequirement::default()), CapabilityVerdict::Admissible);
     assert_eq!(
-        assess_admissibility(&facts, &CapabilityRequirement::default().with_tools(["clang"])),
+        assess_admissibility(&facts, &CapabilityRequirement::default()),
+        CapabilityVerdict::Admissible
+    );
+    assert_eq!(
+        assess_admissibility(
+            &facts,
+            &CapabilityRequirement::default().with_tools(["clang"])
+        ),
         CapabilityVerdict::Admissible
     );
     assert!(matches!(
-        assess_admissibility(&facts, &CapabilityRequirement::default().with_tools(["node"])),
+        assess_admissibility(
+            &facts,
+            &CapabilityRequirement::default().with_tools(["node"])
+        ),
         CapabilityVerdict::Rejected { .. }
     ));
 }

@@ -23,9 +23,9 @@ pub fn validate(value: &str) -> Result<(), String> {
     if value.contains('@') {
         parse_exact(value).map(|_| ()).map_err(str::to_owned)
     } else if !value.is_empty()
-        && value.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'+')
-        })
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'+'))
     {
         Ok(())
     } else {
@@ -88,7 +88,9 @@ fn parse_exact(value: &str) -> Result<(&str, &str), &'static str> {
         return Err("supported exact runtime requirements are node@VERSION and bun@VERSION");
     }
     if !exact_version(version) {
-        return Err("VERSION must be a full MAJOR.MINOR.PATCH with optional prerelease/build suffix, not a range or alias");
+        return Err(
+            "VERSION must be a full MAJOR.MINOR.PATCH with optional prerelease/build suffix, not a range or alias",
+        );
     }
     Ok((runtime, version))
 }
@@ -114,8 +116,7 @@ fn exact_version(value: &str) -> bool {
         return false;
     }
     let mut components = core.split('.');
-    (0..3).all(|_| components.next().is_some_and(numeric_component))
-        && components.next().is_none()
+    (0..3).all(|_| components.next().is_some_and(numeric_component)) && components.next().is_none()
 }
 
 fn numeric_component(value: &str) -> bool {
@@ -144,7 +145,10 @@ mod tests {
     fn named_tools_keep_their_original_grammar_and_gate() {
         for name in ["clang", "g++", "clang-20", "my_tool.1", "node", "bun"] {
             validate(name).unwrap();
-            assert_eq!(check_exact_runtime(name, Some("v26.7.0"), Some("1.3.0")), None);
+            assert_eq!(
+                check_exact_runtime(name, Some("v26.7.0"), Some("1.3.0")),
+                None
+            );
         }
         for name in ["", "clang -v", "tool/path", "x=y", "x\n", "naïve"] {
             assert!(validate(name).is_err(), "{name:?}");
@@ -154,59 +158,148 @@ mod tests {
     #[test]
     fn exact_node_and_bun_versions_match_only_their_own_capabilities() {
         for node in ["v26.7.0", "26.7.0", "v26.7.0\n", " v26.7.0\r\n"] {
-            assert_eq!(check_exact_runtime("node@26.7.0", Some(node), None), Some(Ok(())));
+            assert_eq!(
+                check_exact_runtime("node@26.7.0", Some(node), None),
+                Some(Ok(()))
+            );
         }
-        assert_eq!(check_exact_runtime("bun@1.3.0", None, Some("1.3.0\n")), Some(Ok(())));
-        assert!(check_exact_runtime("node@26.7.0", None, Some("26.7.0")).unwrap().is_err());
-        assert!(check_exact_runtime("bun@1.3.0", Some("v1.3.0"), None).unwrap().is_err());
-        assert!(check_exact_runtime("bun@1.3.0", None, Some("v1.3.0")).unwrap().is_err());
+        assert_eq!(
+            check_exact_runtime("bun@1.3.0", None, Some("1.3.0\n")),
+            Some(Ok(()))
+        );
+        assert!(
+            check_exact_runtime("node@26.7.0", None, Some("26.7.0"))
+                .unwrap()
+                .is_err()
+        );
+        assert!(
+            check_exact_runtime("bun@1.3.0", Some("v1.3.0"), None)
+                .unwrap()
+                .is_err()
+        );
+        assert!(
+            check_exact_runtime("bun@1.3.0", None, Some("v1.3.0"))
+                .unwrap()
+                .is_err()
+        );
     }
 
     #[test]
     fn full_versions_are_not_prefixes_or_ranges() {
         for version in [
-            "26", "26.7", "26.7.0.1", "26.7.00", "026.7.0", "26.07.0",
-            "v26.7.0", "^26.7.0", "~26.7.0", ">=26.7.0", "26.*", "*",
-            "latest", "lts", " 26.7.0", "26.7.0 ", "26.7.0\n", "26.7.0 || 22.0.0",
-            "26.7.0@other", "26.7.0-", "26.7.0+", "26.7.0-rc..1", "26.7.0-01",
-            "26.7.0+one+two", "26.7.0+one..two", "２６.7.0",
+            "26",
+            "26.7",
+            "26.7.0.1",
+            "26.7.00",
+            "026.7.0",
+            "26.07.0",
+            "v26.7.0",
+            "^26.7.0",
+            "~26.7.0",
+            ">=26.7.0",
+            "26.*",
+            "*",
+            "latest",
+            "lts",
+            " 26.7.0",
+            "26.7.0 ",
+            "26.7.0\n",
+            "26.7.0 || 22.0.0",
+            "26.7.0@other",
+            "26.7.0-",
+            "26.7.0+",
+            "26.7.0-rc..1",
+            "26.7.0-01",
+            "26.7.0+one+two",
+            "26.7.0+one..two",
+            "２６.7.0",
         ] {
             let requirement = format!("node@{version}");
             assert!(validate(&requirement).is_err(), "{requirement:?}");
-            assert!(check_exact_runtime(&requirement, Some(version), None).unwrap().is_err());
+            assert!(
+                check_exact_runtime(&requirement, Some(version), None)
+                    .unwrap()
+                    .is_err()
+            );
         }
-        for observed in ["v26.7.1", "v26.7.00", "v26.7.01", "v26.7.0.1", "v26.7.0-rc.1"] {
-            assert!(check_exact_runtime("node@26.7.0", Some(observed), None).unwrap().is_err());
+        for observed in [
+            "v26.7.1",
+            "v26.7.00",
+            "v26.7.01",
+            "v26.7.0.1",
+            "v26.7.0-rc.1",
+        ] {
+            assert!(
+                check_exact_runtime("node@26.7.0", Some(observed), None)
+                    .unwrap()
+                    .is_err()
+            );
         }
     }
 
     #[test]
     fn prerelease_and_build_metadata_are_part_of_exact_identity() {
-        let versions = ["26.7.0", "26.7.0-rc.1", "26.7.0-rc.2", "26.7.0+one", "26.7.0+two", "26.7.0-rc.1+0001"];
+        let versions = [
+            "26.7.0",
+            "26.7.0-rc.1",
+            "26.7.0-rc.2",
+            "26.7.0+one",
+            "26.7.0+two",
+            "26.7.0-rc.1+0001",
+        ];
         for expected in versions {
             let requirement = format!("node@{expected}");
             validate(&requirement).unwrap();
             for observed in versions {
                 let actual = format!("v{observed}");
-                assert_eq!(check_exact_runtime(&requirement, Some(&actual), None).unwrap().is_ok(), expected == observed);
+                assert_eq!(
+                    check_exact_runtime(&requirement, Some(&actual), None)
+                        .unwrap()
+                        .is_ok(),
+                    expected == observed
+                );
             }
         }
     }
 
     #[test]
     fn unsupported_runtimes_never_become_named_tool_fallbacks() {
-        for requirement in ["rust@1.90.0", "npm@11.0.0", "Node@26.7.0", "@26.7.0", "clang@20.0.0"] {
+        for requirement in [
+            "rust@1.90.0",
+            "npm@11.0.0",
+            "Node@26.7.0",
+            "@26.7.0",
+            "clang@20.0.0",
+        ] {
             assert!(validate(requirement).is_err());
-            assert!(check_exact_runtime(requirement, Some("v26.7.0"), Some("1.90.0")).unwrap().is_err());
+            assert!(
+                check_exact_runtime(requirement, Some("v26.7.0"), Some("1.90.0"))
+                    .unwrap()
+                    .is_err()
+            );
         }
     }
 
     #[test]
     fn missing_malformed_and_multiline_observations_are_not_evidence() {
-        let unknown = check_exact_runtime("node@26.7.0", None, None).unwrap().unwrap_err();
-        assert_eq!(unknown, "capability_missing:runtime_version:node:required=26.7.0:observed=<unknown>");
-        for observed in ["", "node v26.7.0", "vv26.7.0", "v26.7.0\nother", "v26.7.0\0", "v26.7.0\x1b[0m"] {
-            let detail = check_exact_runtime("node@26.7.0", Some(observed), None).unwrap().unwrap_err();
+        let unknown = check_exact_runtime("node@26.7.0", None, None)
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(
+            unknown,
+            "capability_missing:runtime_version:node:required=26.7.0:observed=<unknown>"
+        );
+        for observed in [
+            "",
+            "node v26.7.0",
+            "vv26.7.0",
+            "v26.7.0\nother",
+            "v26.7.0\0",
+            "v26.7.0\x1b[0m",
+        ] {
+            let detail = check_exact_runtime("node@26.7.0", Some(observed), None)
+                .unwrap()
+                .unwrap_err();
             assert!(detail.ends_with("observed=<invalid>"), "{detail}");
             assert!(!detail.chars().any(char::is_control));
         }
@@ -227,7 +320,9 @@ mod tests {
     fn conflicting_exact_requirements_cannot_both_match() {
         for observed in ["v22.0.0", "v26.7.0", "v26.7.1"] {
             assert!(!["node@26.7.0", "node@26.7.1"].iter().all(|required| {
-                check_exact_runtime(required, Some(observed), None).unwrap().is_ok()
+                check_exact_runtime(required, Some(observed), None)
+                    .unwrap()
+                    .is_ok()
             }));
         }
     }
