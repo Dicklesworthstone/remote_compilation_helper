@@ -5,7 +5,7 @@ Compilation Helper): the PreToolUse hook + CLI (`rch`), the local daemon (`rchd`
 worker agent (`rch-wkr`), the RABS build sidecar (`rabs-*`, `rabsd`), and the fleet
 dashboard (`dashboard/`).
 
-Scope window: project inception (`v0.1.0`, 2026-01-25) through `v2.1.23` (2026-10-14).
+Scope window: project inception (`v0.1.0`, 2026-01-25) through `v2.1.24` (2026-10-14).
 
 This document was rebuilt from git history (`git log --no-merges` per tag range, `git show`
 on representative commits), version tags (`git for-each-ref`), GitHub release metadata
@@ -28,6 +28,52 @@ history. They are kept as-is because the descriptions were verified against the 
 but those particular links will 404.
 
 Repository: <https://github.com/Dicklesworthstone/remote_compilation_helper>
+
+## 2.1.24 — 2026-10-14
+
+Large workers stop being zeroed by the 5% free-disk rule when they still have plenty of absolute
+headroom, once an operator sets the new cap. Artifact retrieval sizes its budget from the selected
+files again. SSH helpers and cancellation are full duplex and bounded, exact Node and Bun runtime
+requirements are enforced at selection, and retrieval and recovery are hardened further (#107).
+
+- **Optional absolute cap on the critical disk ratio** (`bd-xxck3`). rchd gives a worker no slots
+  at 5% free, which is 39-45 GB on this fleet's 774-906 GB worker disks; workers sat zeroed at
+  29-35 GB free while the space above the line was synced project mirrors. Two `[selection]` keys,
+  read by rchd at startup: `disk_critical_free_ratio` (default `0.05`) and
+  `disk_critical_ratio_cap_gb` (default unset; when set, the ratio rule applies only at or below
+  that many free GB). With neither key set placement is unchanged. Placement, the pressure
+  monitor, the benchmark gate and the cache sweep now share one installed policy ([`b575ab89`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/b575ab8937420d809d2571f5de2317f5a5ac2b84)).
+- **The artifact retrieval estimate works again.** Its `rsync --dry-run --stats` command never had
+  its output piped: on the controlled path every build uses it failed with "retrieval stdout
+  missing", so the retrieval budget always fell back to the configured value and durable retrieval
+  staging (#107) refused every retrieval; on the plain path the dry-run listing went to the hook's
+  stdout. Present since the estimate was added ([`98e9c6c2`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/98e9c6c2b1ecd7b98ab07113708485ae95507ce1)).
+- **Full-duplex SSH helpers and bounded cancellation.** Script upload and output draining run
+  concurrently under one deadline, so a large remote script cannot stall against a full output
+  pipe ([`075c4631`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/075c46313515ccc08c3ea54f820887017635c0f0), [`a97bc5b1`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/a97bc5b1d05f3f3b7dddce495413bf96351748dc), [`e1edc5b8`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/e1edc5b82fb76dba2462612902251d33a39ae9c0)); the process census and control exchanges are
+  bounded by the control deadline ([`14aea498`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/14aea4989ee6f76b3f7282722d5e7a6f5fdf30b6)).
+- **Bounded same-worker source admission** (#105): an overlapping source claim on the chosen worker
+  is retried within a bound instead of failing at once ([`a41edf07`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/a41edf0787af77925ced39cd0709ac41345cfc4c), [`0f5694ce`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/0f5694ceeb7e4cfc9ceee4c495938b181d7e8d24)).
+- **Exact runtime admission** (#106): `--require-toolchain node@VERSION` / `bun@VERSION` (an alias
+  of `--require-tool`) is validated by the shared grammar, enforced against reported versions
+  before ranking, and rechecked on the cache-affinity fallback
+  ([`63e564e8`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/63e564e8fb1dbd5fb87f2e13c1e11df6c88805e5), [`4e8fb2d9`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/4e8fb2d99e28b0d657357a3561e8461732f85213), [`6895750b`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/6895750bc6a8b193bfb42ea44b1fcbe54060a913), [`13659e58`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/13659e58570866c172dd8823da31613517d720a4), [`60b078fc`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/60b078fcab4c9a00afaf6d7436d573d91a62c461)).
+- **Retrieval and recovery** (#107): staged outputs are checksummed so same-size, same-mtime
+  corruption is not accepted, and free-space credit budgets whole replaced files
+  ([`9347cb05`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/9347cb051f23c6d2c30e41d0fa772dc24259a14f)); an interrupted ENOSPC publication copy resumes after verifying the retained
+  prefix, and a vanished or symlinked stage is refused ([`96ca9bf3`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/96ca9bf33e4f02a765eb502d06c232cfb1cfefb2)).
+- **Supervisor robustness:** terminal refusal messages cannot block on an abandoned stderr pipe
+  while holding source locks ([`181b61ef`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/181b61efa8c318529d936ea00eafeba9337f5e2d)); systemd and bus control output is captured as raw
+  bytes before parsing, so NUL-injected output is refused ([`2be8b599`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/2be8b59902b73f4322fd2b792eeff65478e8af9b)).
+- **Cargo path dependencies honor `workspace.exclude`** (#72, [`37dba8eb`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/37dba8eb26bda0cb17f005cc48c3406cd28a40f5)).
+- **Quieter dispatcher logs:** decision-latency budget and panic-threshold violations log at most
+  once a minute per kind, with a suppressed count; the Prometheus counters stay exact. css logged
+  1,245 such ERROR lines in two hours ([`ad7add8d`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/ad7add8dc2c285b6aa9362aaca4a819c3d1eb72e)).
+- **RABS sidecar:** dependency hashing is bound to the observed file generation, and warm
+  dependency inventories are admitted without background deferral
+  ([`4a3f0f2a`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/4a3f0f2a022b891a0e365a0c6d25c4c3aa82af6e), [`d0670654`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/d067065404474b360a44283d856075524ba1d45b), [`7950fcf4`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/7950fcf421a2c69b860f0a3a670689cd8e4bf9e5), [`7b435e56`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/7b435e56c78a814aebb832503e391ec1aa109b5f), [`4c3e5558`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/4c3e5558c78f616a493f0d0f36c78a4ad3d21581), [`42747f21`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/42747f2136f0ef0cc5037ed92681957fbd74249d)).
+- **Tests:** a cancellation transport fixture no longer races a loaded Mac ([`cdcab831`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/cdcab8314a7742967af4770861ce4260fe09989f)), and
+  two over-escaped control-capture assertions are fixed ([`ae17d5db`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/ae17d5db94dc1151350f06cb0c703781b4613d59)).
 
 ## 2.1.23 — 2026-10-14
 
