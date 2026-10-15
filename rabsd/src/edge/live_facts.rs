@@ -36,6 +36,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+mod package_capture;
+mod stable_file;
 mod toolchain_hashing;
 mod toolchain_probe;
 
@@ -126,19 +128,7 @@ fn lstat_regular(path: &Path) -> std::io::Result<FileSig> {
 /// # Errors
 /// I/O failures, non-regular files, oversized files, or identity movement.
 pub fn read_stable(path: &Path, max_bytes: u64) -> std::io::Result<(FileSig, Vec<u8>)> {
-    let before = lstat_regular(path)?;
-    if before.size > max_bytes {
-        return Err(std::io::Error::other("file exceeds the byte bound"));
-    }
-    let file = std::fs::File::open(path)?;
-    let opened = FileSig::of(&file.metadata()?);
-    let mut bytes = Vec::with_capacity(usize::try_from(before.size).unwrap_or(0));
-    file.take(max_bytes + 1).read_to_end(&mut bytes)?;
-    let after = lstat_regular(path)?;
-    if opened != before || after != before || bytes.len() as u64 != before.size {
-        return Err(std::io::Error::other("file changed while it was read"));
-    }
-    Ok((before, bytes))
+    stable_file::read_at(path, lstat_regular(path)?, max_bytes)
 }
 
 /// Stream-hash a regular file into its CAS object identity, with the same
@@ -151,11 +141,7 @@ pub fn digest_stable(path: &Path) -> std::io::Result<(FileSig, TypedDigest)> {
 }
 
 fn digest_stable_at(path: &Path, before: FileSig) -> std::io::Result<(FileSig, TypedDigest)> {
-    let mut file = std::fs::File::open(path)?;
-    let opened = file.metadata()?;
-    if !opened.is_file() || FileSig::of(&opened) != before || lstat_regular(path)? != before {
-        return Err(std::io::Error::other("file changed before it was hashed"));
-    }
+    let mut file = stable_file::open(path, before)?;
     let mut writer = StreamingObjectWriter::new(DigestRequest::default(), Some(before.size));
     let mut buffer = vec![0_u8; 256 * 1024];
     let mut remaining = before.size;
@@ -175,9 +161,7 @@ fn digest_stable_at(path: &Path, before: FileSig) -> std::io::Result<(FileSig, T
     if file.read(&mut extra)? != 0 {
         return Err(std::io::Error::other("file grew while it was hashed"));
     }
-    if FileSig::of(&file.metadata()?) != before || lstat_regular(path)? != before {
-        return Err(std::io::Error::other("file changed while it was hashed"));
-    }
+    stable_file::verify(&file, path, before)?;
     let digest = writer
         .finish()
         .map_err(|error| std::io::Error::other(format!("{error:?}")))?
@@ -380,13 +364,13 @@ pub struct PackageFacts {
     bytes: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum MemberSig {
     Directory,
     File(FileSig),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct GeneratedObservation {
     root: PathBuf,
     members: Vec<(String, MemberSig)>,
@@ -1029,7 +1013,7 @@ fn probe_toolchain(compiler: &Path, env: &[(String, String)]) -> Result<ProbedTo
 pub struct LiveFacts {
     files: Mutex<HashMap<PathBuf, (FileSig, TypedDigest)>>,
     toolchains: Mutex<HashMap<PathBuf, Slot<ProbedToolchain>>>,
-    packages: Mutex<HashMap<PackageKey, Slot<PackageFacts>>>,
+    packages: Mutex<package_capture::PackageMemos>,
     dependencies: Mutex<DependencyMemos>,
     warming: Mutex<usize>,
 }
@@ -1455,78 +1439,7 @@ impl LiveFacts {
         source_kind: DependencySourceKind,
         generated_root: Option<&Path>,
     ) -> Result<Arc<PackageFacts>, FactsMiss> {
-        let key = (
-            root.to_path_buf(),
-            source_kind,
-            generated_root.map(Path::to_path_buf),
-        );
-        let (members, bytes) = walk_package(root, source_kind).map_err(FactsMiss::Refused)?;
-        let (generated, generated_bytes) = match generated_root {
-            Some(root) => {
-                let (observation, size) = observe_generated(root).map_err(FactsMiss::Refused)?;
-                (Some(observation), size)
-            }
-            None => (None, 0),
-        };
-        let bytes = bytes.saturating_add(generated_bytes);
-        {
-            let packages = self
-                .packages
-                .lock()
-                .map_err(|_| FactsMiss::Refused("package memo poisoned".into()))?;
-            match packages.get(&key) {
-                Some(Slot::Ready(facts))
-                    if facts.members == members && facts.generated == generated =>
-                {
-                    return Ok(Arc::clone(facts));
-                }
-                Some(Slot::Warming) => return Err(FactsMiss::Pending),
-                Some(Slot::Failed { reason, at }) if at.elapsed() < PROBE_RETRY => {
-                    return Err(FactsMiss::Refused(reason.clone()));
-                }
-                _ => {}
-            }
-        }
-        if bytes <= SYNCHRONOUS_PACKAGE_BYTES {
-            let captured =
-                capture_package(root, source_kind, generated_root).map_err(FactsMiss::Refused)?;
-            let captured = Arc::new(captured);
-            self.retain_package(key, Slot::Ready(Arc::clone(&captured)));
-            return Ok(captured);
-        }
-        self.retain_package(key.clone(), Slot::Warming);
-        let owned = key.clone();
-        let started = self.start_warm(move |facts| {
-            let slot = match capture_package(&owned.0, owned.1, owned.2.as_deref()) {
-                Ok(captured) => Slot::Ready(Arc::new(captured)),
-                Err(reason) => Slot::Failed {
-                    reason,
-                    at: Instant::now(),
-                },
-            };
-            facts.retain_package(owned, slot);
-        });
-        if !started && let Ok(mut packages) = self.packages.lock() {
-            packages.remove(&key);
-        }
-        Err(FactsMiss::Pending)
-    }
-
-    fn retain_package(&self, key: PackageKey, slot: Slot<PackageFacts>) {
-        let Ok(mut packages) = self.packages.lock() else {
-            return;
-        };
-        let retained: u64 = packages
-            .values()
-            .map(|slot| match slot {
-                Slot::Ready(facts) => facts.bytes,
-                _ => 0,
-            })
-            .sum();
-        if retained > MAX_RETAINED_PACKAGE_BYTES {
-            packages.retain(|_, slot| !matches!(slot, Slot::Ready(_)));
-        }
-        packages.insert(key, slot);
+        package_capture::observe(self, root, source_kind, generated_root)
     }
 }
 
@@ -1936,7 +1849,7 @@ mod tests {
         assert!(digest_stable_at(&path, current).is_err());
     }
 
-    fn generated_fixture() -> (tempfile::TempDir, DependencyActionPlan) {
+    pub(super) fn generated_fixture() -> (tempfile::TempDir, DependencyActionPlan) {
         let dir = tempfile::tempdir().unwrap();
         let cargo_home = dir.path().join("cargo-home");
         let source = cargo_home.join("registry/src/index/generated-1.0");
