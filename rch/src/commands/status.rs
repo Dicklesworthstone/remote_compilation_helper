@@ -292,9 +292,15 @@ fn summarize_capabilities(caps: &rch_common::WorkerCapabilities) -> String {
 /// per-worker selection diagnostics so an inadmissible requested worker yields a
 /// structured refusal instead of a silent swap
 /// (bd-...remediation-ocv9i.13.5).
-fn build_diagnose_placement(worker_selection: &Option<DiagnoseWorkerSelection>) -> PlacementPlan {
+/// `role` is the box's `general.role`: a dispatcher fails closed by default,
+/// exactly as the hook does (`role_requires_remote`), so diagnose must report
+/// that policy rather than the env-only one.
+fn build_diagnose_placement(
+    worker_selection: &Option<DiagnoseWorkerSelection>,
+    role: rch_common::BoxRole,
+) -> PlacementPlan {
     refine_diagnose_placement(
-        resolve_placement(|key| std::env::var(key).ok()),
+        rch_common::placement::resolve_placement_with_role(|key| std::env::var(key).ok(), role),
         worker_selection,
     )
 }
@@ -571,7 +577,7 @@ pub async fn diagnose(command: &str, dry_run: bool, ctx: &OutputContext) -> Resu
 
     // Resolve the canonical placement plan (env controls + requested-worker
     // admissibility against the simulated selection).
-    let placement = build_diagnose_placement(&worker_selection);
+    let placement = build_diagnose_placement(&worker_selection, config.general.role);
 
     // Build dry-run summary if requested
     let dry_run_summary = if dry_run {
