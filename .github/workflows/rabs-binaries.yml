@@ -15,10 +15,14 @@ on:
       - 'rabs-wkr/**'
       - 'rabs-asupersync/**'
       - 'rabs-cas/**'
+      - 'rch-common/src/toolchain.rs'
+      - 'rch-common/src/toolchain/**'
       - 'scripts/cargo-rabs'
+      - 'scripts/tests/test_cargo_rabs.py'
       - 'scripts/install-rabs'
       - 'tests/test_install_rabs*.py'
       - 'tests/test_rabs_sprt_evidence.py'
+      - 'tests/test_rabs_worker_cache.py'
       - '.github/workflows/release.yml'
       - '.github/workflows/rabs-binaries.yml'
   pull_request:
@@ -50,6 +54,10 @@ jobs:
         run: python3 -m unittest discover -s tests -p 'test_install_rabs*.py' -v
       - name: SPRT native SQL and boundary model (not a Rust execution proof)
         run: python3 -m unittest discover -s tests -p test_rabs_sprt_evidence.py -v
+      - name: Worker-local RABS bridge and managed launcher regressions
+        run: |
+          python3 scripts/tests/test_cargo_rabs.py -v
+          python3 tests/test_rabs_worker_cache.py -v
 
   # Exercise the accepted-hit delivery frontier independently of the slower
   # release/overhead lane. Local agent sandboxes may prohibit Unix sockets;
@@ -84,6 +92,8 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y bubblewrap
       - name: Release build the three spine binaries
         run: cargo build --release -p rabsd -p rabs-wrap -p rabs-wkr
+      - name: Worker-cache command assembly and opt-out parity
+        run: cargo test --release -p rch-common --lib toolchain::worker_cache --locked
       - name: Binary size budget (rabs-wrap < 2 MiB, A021)
         run: |
           size=$(stat -c%s target/release/rabs-wrap)
