@@ -279,6 +279,8 @@ struct RecoveryPhase {
     /// Cargo's target directory or target-root output gate.
     #[serde(default)]
     native_outputs: Option<NativeOutputContract>,
+    /// Predecessors observed under the publication lock. A pending rename
+    /// keeps its predecessor until the published checkpoint is durable.
     baseline: BTreeMap<PathBuf, String>,
     published: BTreeMap<PathBuf, String>,
     #[serde(default)]
@@ -1069,39 +1071,12 @@ impl RecoverySession {
                 missing_result: None,
             });
         }
-        for phase in &mut phases {
-            let patterns: Vec<_> = if let Some(dir) = &phase.result_dir {
-                vec![format!("{}/**/*", dir.display())]
-            } else {
-                phase
-                    .patterns
-                    .iter()
-                    .filter(|pattern| !pattern.starts_with("- "))
-                    .map(|pattern| {
-                        pattern
-                            .trim_start_matches("+ ")
-                            .trim_start_matches('/')
-                            .to_owned()
-                    })
-                    .collect()
-            };
-            for pattern in patterns {
-                let pattern = format!(
-                    "{}/{}",
-                    glob::Pattern::escape(&phase.local.to_string_lossy()),
-                    pattern
-                );
-                for path in glob::glob(&pattern)? {
-                    let path = path?;
-                    if path.is_file() {
-                        let relative = path.strip_prefix(&phase.local)?.to_owned();
-                        if let Some(hash) = fingerprint(&path)? {
-                            phase.baseline.insert(relative, hash);
-                        }
-                    }
-                }
-            }
-        }
+        // No destination ownership is acquired during the remote build. An
+        // eager glob/hash pass over a reused local target is both obsolete by
+        // publication time and expensive to carry through every checkpoint.
+        // Observe only the admitted staged set under the publication lock,
+        // before its first write. Old journals still resolve pending renames
+        // against their original predecessor before any baseline is refreshed.
         let cargo_output_capture = CargoOutputCapture::for_command(kind, command);
         anyhow::ensure!(
             cargo_output_capture.is_none()
@@ -1192,17 +1167,53 @@ impl RecoverySession {
         let phase = &mut self.recipe.phases[index];
         let previous_hash = phase.published.insert(relative.clone(), hash);
         let previous_pending = phase.pending.take();
+        // A published receipt replaces the need to remember its predecessor.
+        // Retire both in the SAME durable checkpoint, never before the rename
+        // has been verified. A failed checkpoint restores all three fields.
+        let previous_baseline = phase.baseline.remove(&relative);
         if let Err(error) = self.persist() {
             let phase = &mut self.recipe.phases[index];
             match previous_hash {
                 Some(hash) => {
-                    phase.published.insert(relative, hash);
+                    phase.published.insert(relative.clone(), hash);
                 }
                 None => {
                     phase.published.remove(&relative);
                 }
             }
+            if let Some(hash) = previous_baseline {
+                phase.baseline.insert(relative, hash);
+            }
             phase.pending = previous_pending;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Compact old preparation-wide baselines only after pending recovery and
+    /// complete stage/policy validation, under the same publication lock.
+    /// Keep the discarded entries as undo state until the refreshed baseline
+    /// is durable. This removes obsolete hashes, not output files or receipts.
+    fn persist_publication_baseline(&mut self, index: usize, files: &[PathBuf]) -> anyhow::Result<()> {
+        let phase = &mut self.recipe.phases[index];
+        anyhow::ensure!(
+            phase.pending.is_none(),
+            "pending output must be reconciled before baseline compaction"
+        );
+        let selected: BTreeSet<_> = files.iter().collect();
+        let mut discarded = BTreeMap::new();
+        for (relative, hash) in std::mem::take(&mut phase.baseline) {
+            if selected.contains(&relative) && !phase.published.contains_key(&relative) {
+                phase.baseline.insert(relative, hash);
+            } else {
+                discarded.insert(relative, hash);
+            }
+        }
+        if let Err(error) = self.persist_output_baseline(index, files) {
+            // The inner transaction restored selected entries (or made no
+            // changes on an inspection/cancellation failure). Restore the
+            // pruned entries too, so the borrowed session keeps one epoch.
+            self.recipe.phases[index].baseline.extend(discarded);
             return Err(error);
         }
         Ok(())
@@ -1991,14 +2002,11 @@ impl RecoverySession {
             }
             self.persist_published_output(index, relative, hash)?;
         }
-        // Re-baseline, under the publication lock, every output this job has
-        // not written yet. The preparation-time snapshot predates the remote
-        // build, and in a shared target dir other jobs legitimately replace
-        // these files meanwhile. Only this job's own interrupted write (the
-        // journaled `pending` entry above) has to match the older baseline;
-        // the refreshed one is persisted before any write so a crash mid-loop
-        // recovers against exactly what this publication observed.
-        self.persist_output_baseline(index, &files)?;
+        // Observe the predecessors of this admitted staged set while holding
+        // publication ownership. Legacy preparation-wide hashes are pruned
+        // in the same transaction. A journaled pending rename was reconciled
+        // against its ORIGINAL predecessor above, never a refreshed baseline.
+        self.persist_publication_baseline(index, &files)?;
         for relative in files {
             publication_runtime::checkpoint()?;
             let phase = &self.recipe.phases[index];

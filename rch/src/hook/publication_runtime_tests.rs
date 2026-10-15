@@ -463,3 +463,6 @@ async fn large_set_resumes_after_partial_durable_publication() {
     recovered.returned(0).unwrap();
     assert_acknowledged(&recovered);
 }
+
+#[path = "publication_baseline_tests.rs"]
+mod baseline_tests;
