@@ -1,56 +1,84 @@
-# Reusing dependencies across Cargo target directories
+# Reusing dependencies across Cargo build layouts
 
 The live dependency lane already treats the rustc output directory as placement.
-However, Cargo also passes `CARGO_TARGET_DIR` through its environment. The exact
-environment policy keys that value, so separate agent/CI target directories can
-still split otherwise identical dependency actions.
+Cargo also passes layout settings through its environment. The exact environment
+policy keys these values, so separate agent/CI directories can still split
+otherwise identical dependency actions.
 
 ## Opt in on the daemon
 
-Set `RABS_REUSE_CARGO_TARGET_DIR=1` (also `true` or `on`) **before starting rabsd**,
-in addition to `RABS_LIVE_DEPENDENCY=1`. It is off by default and is read once per
-daemon process. The `scripts/cargo-rabs` launcher passes this setting to a new
-daemon; it deliberately does not reconfigure an already-running shared daemon.
+Set `RABS_REUSE_CARGO_LAYOUT=1` (also `true` or `on`) **before starting rabsd**,
+in addition to `RABS_LIVE_DEPENDENCY=1`. This projects eligible values of:
 
-This profile removes only the value of a present `CARGO_TARGET_DIR` from the
-compiler key. It does not remove or rewrite the variable in rustc's execution
-environment, alter the invocation, or change the actual output directory.
-It composes with `RABS_REUSE_EMPTY_OUT_DIR=1`: the existing empty generated-tree
-proof remains mandatory before that separate projection can apply.
+- `CARGO_TARGET_DIR`: final artifact directory override.
+- `CARGO_BUILD_TARGET_DIR`: environment configuration for `build.target-dir`.
+- `CARGO_BUILD_BUILD_DIR`: environment configuration for the intermediate
+  `build.build-dir`, including Cargo's path-template spelling.
 
-## Why this does not cache an observed target path
+These are the settings documented in the Cargo configuration reference:
+https://doc.rust-lang.org/cargo/reference/config.html#buildtarget-dir and
+https://doc.rust-lang.org/cargo/reference/config.html#buildbuild-dir.
+Cargo still chooses the real directories; RABS does not reinterpret its config,
+precedence, templates or output paths.
 
-The real execution plan keeps `CARGO_TARGET_DIR`, but omits it from `keyed_env`.
-The existing post-compilation dep-info closure check consequently rejects
-publication after any tracked read of this variable, including `env!` and
-`option_env!`. Values are not rewritten inside outputs or diagnostics.
+The existing `RABS_REUSE_CARGO_TARGET_DIR=1` remains a narrower opt-in: it projects
+only `CARGO_TARGET_DIR`. Both settings are off by default and read once per daemon
+process. Selecting both is equivalent to selecting the complete layout profile.
+The `scripts/cargo-rabs` launcher passes these settings to a new daemon; it does
+not reconfigure an already-running shared daemon. For example, with installed
+binaries and no existing daemon:
 
-The profile has its own semantic-policy digest. An invocation with the variable
-absent retains the exact baseline key and cannot share the present-variable
-profile. This matters for code that observes absence: caching that result under
-a key shared with a present value would be unsound.
+```sh
+RABS_REUSE_CARGO_LAYOUT=1 cargo rabs build
+```
 
-Original evidence is validated first. A captured build-script
-`cargo::rustc-env=CARGO_TARGET_DIR=...` directive still requires exact keying;
-projection fails back to the validated baseline without leaking partial plan
-changes. Source bytes, generated files, script stdout, compiler/toolchain,
-dependencies, flags and other semantic environment values remain keyed.
-The existing comparison, sampling, quarantine, capture and installation gates
-are unchanged. There is no remote-execution or build-script-cache authority here.
+The profile removes only eligible values from the compiler key. It does not
+remove or rewrite variables in rustc's execution environment, alter the
+invocation, or change the actual output directory. It composes with
+`RABS_REUSE_EMPTY_OUT_DIR=1`: the existing empty generated-tree proof remains
+mandatory before that separate projection can apply.
+
+## Why this does not cache an observed build path
+
+The real execution plan retains each selected variable but omits it from
+`keyed_env`. The existing post-compilation dep-info closure check consequently
+rejects publication after any tracked read, including `env!` and `option_env!`.
+Values are not rewritten inside outputs or diagnostics.
+
+The semantic-policy digest binds the exact set of projected, present variable
+names. Absent and present-empty are distinct, as are different presence sets.
+An invocation with no eligible variables retains its baseline key. Projecting
+only `CARGO_TARGET_DIR` preserves the established single-variable policy identity,
+regardless of which opt-in selected it.
+
+Original evidence is validated first. Each captured build-script
+`cargo::rustc-env=NAME=...` directive still requires exact keying of its value.
+If one layout variable cannot be projected, it stays exact while the others may
+still be projected. Each trial reconstructs narrower profiles from the original
+plan, preserving their policy identities and tracked-read vetoes. Failed trials
+cannot leak partially modified execution plans.
+
+Source bytes, generated files, script stdout, compiler/toolchain, dependencies,
+flags and all other semantic environment values remain keyed. In particular,
+`CARGO_BUILD_TARGET` selects a target platform, not a directory: it is never
+projected. The existing comparison, sampling, quarantine, capture and installation
+gates are unchanged. There is no remote-execution or build-script-cache authority
+here.
 
 ## Scope and validation
 
-This is a narrowly scoped, opt-in host-local reuse profile, not general
-path-independent compilation. Other placement-bearing environment variables
-(e.g. `CARGO_BUILD_TARGET_DIR`) remain exact. Unsupported compilation classes
-still pass through. A new profile must gather fresh comparison evidence before
-serving; enabling it is not a promise that the next compile will be a hit.
+This is opt-in host-local reuse, not general path-independent compilation.
+Dependency-directory membership, path-sensitive generated inputs and other
+semantic differences may still prevent a hit. Unsupported compilation classes
+still pass through. New policy identities require fresh comparison evidence;
+enabling the profile is not a promise of an immediate cache hit.
 
-Regression coverage in `cargo_placement_reuse_tests.rs` exercises real action-key
-construction, output-directory relocation, unchanged execution plans, tracked
-reads, absent versus present/empty bindings, exact disabled behavior, semantic
-input changes, build-script directive fallback, and invalid/ambiguous inputs.
-The original empty-OUT_DIR implementation and its tests are retained in
+`cargo_placement_reuse_tests.rs` retains the original target-only regressions and
+adds complete-layout coverage: each variable and combination, all presence sets,
+tracked value/presence reads, legacy policy identity, independent script-directive
+fallback, bounded composition, rejected execution rewrites and semantic misses.
+These are action-key/closure tests, not an executed Cargo/fleet speedup claim.
+The original empty-OUT_DIR implementation and tests remain in
 `empty_out_dir_reuse.rs`.
 
 Validation commands on the project's configured build worker:
@@ -60,4 +88,3 @@ rch exec -- cargo test -p rabsd cargo_placement_reuse
 rch exec -- cargo test -p rabsd empty_out_dir
 rch exec -- cargo test -p rabs-wrap --bin rabs-wrap singleflight
 ```
-

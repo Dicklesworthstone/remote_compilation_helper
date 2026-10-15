@@ -21,7 +21,7 @@ pub(super) fn enabled() -> bool {
     empty_out_dir::enabled()
 }
 
-/// Keep the existing empty-OUT_DIR opt-in independent of Cargo target placement.
+/// Keep the existing empty-OUT_DIR opt-in independent of Cargo build layout.
 /// Cargo placement is projected first; the existing generated-tree capture then
 /// decides whether empty-OUT_DIR reuse is also sound for this exact invocation.
 pub(super) fn key(
@@ -33,15 +33,20 @@ pub(super) fn key(
     inputs: &ActionInputManifest,
     enable_empty_out_dir: bool,
 ) -> Result<LiveDependencyKey, LiveRefusal> {
-    cargo_placement::key(plan, cargo_placement::enabled(), |candidate| {
-        empty_out_dir::key(
-            candidate,
-            toolchain,
-            externs,
-            directories,
-            package,
-            inputs,
-            enable_empty_out_dir,
-        )
-    })
+    cargo_placement::key(
+        plan,
+        cargo_placement::enabled(),
+        cargo_placement::layout_enabled(),
+        |candidate| {
+            empty_out_dir::key(
+                candidate,
+                toolchain,
+                externs,
+                directories,
+                package,
+                inputs,
+                enable_empty_out_dir,
+            )
+        },
+    )
 }

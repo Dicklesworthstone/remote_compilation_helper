@@ -13,6 +13,19 @@ use std::cell::Cell;
 const PACKAGE: &str = "/home/agent/.cargo/registry/src/test-index/demo-1.0.0";
 const HOST: &str = "x86_64-unknown-linux-gnu";
 
+// Keep every original single-variable regression on its original opt-in.
+fn key(
+    plan: &mut DependencyActionPlan,
+    enabled: bool,
+    derive: impl Fn(&mut DependencyActionPlan) -> Result<LiveDependencyKey, LiveRefusal>,
+) -> Result<LiveDependencyKey, LiveRefusal> {
+    super::key(plan, enabled, false, derive)
+}
+
+fn single_value(env: &[(String, String)]) -> Option<&str> {
+    super::single_value(env, VARIABLE)
+}
+
 fn plan(target: Option<&str>) -> DependencyActionPlan {
     let output = format!(
         "{}/debug/deps",
@@ -291,4 +304,272 @@ fn failed_projection_preserves_another_profiles_read_veto() {
         )
         .is_some()
     );
+}
+
+fn binding(plan: &mut DependencyActionPlan, name: &str, value: &str) {
+    for env in [&mut plan.execution_env, &mut plan.keyed_env] {
+        env.retain(|(key, _)| key != name);
+        env.push((name.to_owned(), value.to_owned()));
+        env.sort();
+    }
+}
+
+fn layout_key(plan: &mut DependencyActionPlan) -> LiveDependencyKey {
+    super::key(plan, false, true, derive).unwrap()
+}
+
+#[test]
+fn each_layout_variable_reuses_values_without_rewriting_execution() {
+    for variable in LAYOUT_VARIABLES {
+        let mut a = plan(None);
+        let mut b = plan(None);
+        binding(&mut a, variable, "/agents/one/build");
+        binding(&mut b, variable, "/agents/two/build");
+        assert_ne!(derive(&mut a).unwrap(), derive(&mut b).unwrap());
+        let original_a = a.clone();
+        let original_b = b.clone();
+        assert_eq!(layout_key(&mut a), layout_key(&mut b));
+        for (actual, mut original) in [(a, original_a), (b, original_b)] {
+            original.keyed_env.retain(|(name, _)| name != variable);
+            assert_eq!(actual, original, "only {variable}'s read veto may change");
+        }
+    }
+}
+
+#[test]
+fn combined_layout_converges_and_vetoes_every_tracked_read() {
+    let mut a = plan(Some("/agents/one/final"));
+    let mut b = plan(Some("/agents/two/final"));
+    for variable in &LAYOUT_VARIABLES[1..] {
+        binding(&mut a, variable, "/agents/one/intermediate");
+        binding(&mut b, variable, "/agents/two/intermediate");
+    }
+    let original = a.clone();
+    assert_eq!(layout_key(&mut a), layout_key(&mut b));
+    let mut expected = original;
+    expected
+        .keyed_env
+        .retain(|(name, _)| !LAYOUT_VARIABLES.contains(&name.as_str()));
+    assert_eq!(a, expected);
+    let ordinary = format!("{}/demo.d: {PACKAGE}/src/lib.rs\n", a.out_dir);
+    assert_eq!(
+        dep_info_closure_violation(&a, ordinary.as_bytes(), |_| true),
+        None
+    );
+    for variable in LAYOUT_VARIABLES {
+        for suffix in [
+            String::new(),
+            "=".into(),
+            "=/agents/one/intermediate".into(),
+        ] {
+            let dep_info = format!("{ordinary}# env-dep:{variable}{suffix}\n");
+            let refusal = dep_info_closure_violation(&a, dep_info.as_bytes(), |_| true).unwrap();
+            assert!(
+                refusal.contains(&format!("unkeyed variable {variable}")),
+                "{refusal}"
+            );
+        }
+    }
+}
+
+#[test]
+fn every_layout_presence_set_has_a_distinct_key_even_for_empty_values() {
+    let mut identities = Vec::new();
+    for mask in 0..8 {
+        let mut empty = plan(None);
+        let mut present = plan(None);
+        for (bit, variable) in LAYOUT_VARIABLES.iter().enumerate() {
+            if mask & (1 << bit) != 0 {
+                binding(&mut empty, variable, "");
+                binding(&mut present, variable, "/another/place");
+            }
+        }
+        // Input order is not identity. Presence and the versioned variable
+        // set are: absence must not reuse a compile that could observe it.
+        present.execution_env.reverse();
+        present.keyed_env.reverse();
+        let identity = layout_key(&mut empty);
+        assert_eq!(identity, layout_key(&mut present));
+        assert!(
+            !identities.contains(&identity),
+            "presence mask {mask} collided"
+        );
+        identities.push(identity);
+    }
+}
+
+#[test]
+fn legacy_opt_in_keeps_its_exact_policy_and_does_not_expand_coverage() {
+    let mut old = plan(Some("/agents/one/target"));
+    let mut expected_plan = old.clone();
+    expected_plan.keyed_env.retain(|(name, _)| name != VARIABLE);
+    let mut expected = derive(&mut expected_plan).unwrap();
+    let previous = &expected.descriptor.sandbox_semantic_policy;
+    let mut policy = CanonicalEncoder::new();
+    policy
+        .str(POLICY_TAG)
+        .str(previous.domain)
+        .bytes(&previous.bytes)
+        .str("CARGO_TARGET_DIR present; tracked reads refuse publication");
+    expected.descriptor.sandbox_semantic_policy = compute(DOMAIN_LIVE_ISOLATION, &policy.finish());
+    expected.action_key = compute_action_key(&expected.descriptor).final_key;
+    expected.descriptor_digest =
+        descriptor_digest(&descriptor_canonical_bytes(&expected.descriptor));
+    assert_eq!(key(&mut old, true, derive).unwrap(), expected);
+    assert_eq!(old, expected_plan);
+    assert_eq!(
+        layout_key(&mut plan(Some("/agents/two/target"))),
+        expected
+    );
+    for variable in &LAYOUT_VARIABLES[1..] {
+        let mut exact = plan(None);
+        binding(&mut exact, variable, "/agents/one/build");
+        let before = exact.clone();
+        let identity = derive(&mut exact).unwrap();
+        assert_eq!(key(&mut exact, true, derive).unwrap(), identity);
+        assert_eq!(exact, before);
+    }
+}
+
+#[test]
+fn a_script_required_layout_binding_stays_exact_without_blocking_the_others() {
+    for required in LAYOUT_VARIABLES {
+        let mut candidate = plan(None);
+        for variable in LAYOUT_VARIABLES {
+            binding(&mut candidate, variable, "/agents/one/build");
+        }
+        candidate.generated_root = Some("/work/generated".into());
+        binding(&mut candidate, "OUT_DIR", "/work/generated");
+        let record = format!("cargo::rustc-env={required}=/agents/one/build\n");
+        let original = candidate.clone();
+        let projected = super::key(&mut candidate, false, true, |plan| {
+            derive_with(plan, 7, Some(record.as_bytes()))
+        })
+        .unwrap();
+        assert_eq!(candidate.execution_env, original.execution_env);
+        assert_eq!(candidate.generated_root, original.generated_root);
+        for variable in LAYOUT_VARIABLES {
+            assert_eq!(
+                super::single_value(&candidate.keyed_env, variable).is_some(),
+                variable == required,
+            );
+        }
+        let mut other = original.clone();
+        for variable in LAYOUT_VARIABLES
+            .into_iter()
+            .filter(|name| *name != required)
+        {
+            binding(&mut other, variable, "/agents/two/build");
+        }
+        assert_eq!(
+            projected,
+            super::key(&mut other, false, true, |plan| {
+                derive_with(plan, 7, Some(record.as_bytes()))
+            })
+            .unwrap()
+        );
+        let mut changed = original;
+        binding(&mut changed, required, "/explicit/new/value");
+        let changed_record = format!("cargo::rustc-env={required}=/explicit/new/value\n");
+        assert_ne!(
+            projected,
+            super::key(&mut changed, false, true, |plan| {
+                derive_with(plan, 7, Some(changed_record.as_bytes()))
+            })
+            .unwrap()
+        );
+    }
+}
+
+#[test]
+fn layout_trials_reconstruct_inner_projection_policy_from_original_inputs() {
+    let mut candidate = plan(None);
+    for variable in LAYOUT_VARIABLES {
+        binding(&mut candidate, variable, "/agents/one/build");
+    }
+    binding(&mut candidate, "CARGO_INNER_PLACEMENT", "/inner/value");
+    let original = candidate.clone();
+    let calls = Cell::new(0);
+    // Model a narrower profile that requires its original keyed binding,
+    // removes it, and derives a different policy. Starting the next trial
+    // from the prior mutated plan would silently lose that policy or refuse.
+    let inner = |plan: &mut DependencyActionPlan| {
+        calls.set(calls.get() + 1);
+        assert_eq!(
+            super::single_value(&plan.keyed_env, "CARGO_INNER_PLACEMENT"),
+            Some("/inner/value")
+        );
+        plan.keyed_env
+            .retain(|(name, _)| name != "CARGO_INNER_PLACEMENT");
+        let mut identity = derive(plan)?;
+        identity.descriptor.sandbox_semantic_policy =
+            compute(DOMAIN_LIVE_ISOLATION, b"inner policy");
+        identity.action_key = compute_action_key(&identity.descriptor).final_key;
+        identity.descriptor_digest =
+            descriptor_digest(&descriptor_canonical_bytes(&identity.descriptor));
+        Ok(identity)
+    };
+    let actual = super::key(&mut candidate, false, true, inner).unwrap();
+    assert_eq!(calls.get(), 4, "one baseline plus at most three trials");
+    let mut expected_plan = original;
+    expected_plan
+        .keyed_env
+        .retain(|(name, _)| !LAYOUT_VARIABLES.contains(&name.as_str()));
+    let mut expected = inner(&mut expected_plan).unwrap();
+    bind_policy(&mut expected, &LAYOUT_VARIABLES);
+    assert_eq!(actual, expected);
+    assert_eq!(candidate, expected_plan);
+}
+
+#[test]
+fn invalid_layout_baseline_is_not_rescued_and_execution_rewrites_are_refused() {
+    let mut candidate = plan(None);
+    binding(&mut candidate, "CARGO_BUILD_BUILD_DIR", "/agents/one/build");
+    let original = candidate.clone();
+    let calls = Cell::new(0);
+    let invalid = super::key(&mut candidate, false, true, |plan| {
+        calls.set(calls.get() + 1);
+        plan.execution_env.clear();
+        Err(LiveRefusal::Facts("invalid baseline".into()))
+    });
+    assert!(invalid.is_err());
+    assert_eq!(calls.get(), 1);
+    assert_eq!(candidate, original);
+    let expected = derive(&mut candidate).unwrap();
+    for restore_binding in [false, true] {
+        let result = super::key(&mut candidate, false, true, |plan| {
+            if super::single_value(&plan.keyed_env, "CARGO_BUILD_BUILD_DIR").is_none() {
+                if restore_binding {
+                    binding(plan, "CARGO_BUILD_BUILD_DIR", "/agents/one/build");
+                } else {
+                    plan.execution_env.clear();
+                }
+            }
+            derive(plan)
+        })
+        .unwrap();
+        assert_eq!(result, expected);
+        assert_eq!(candidate, original);
+    }
+}
+
+#[test]
+fn full_layout_opt_in_still_keys_other_environment_source_and_flags() {
+    let mut baseline = plan(None);
+    binding(&mut baseline, "CARGO_BUILD_BUILD_DIR", "/agents/one/build");
+    let identity = layout_key(&mut baseline);
+    for variant in 0..3 {
+        let mut changed = plan(None);
+        binding(&mut changed, "CARGO_BUILD_BUILD_DIR", "/agents/two/build");
+        if variant == 0 {
+            binding(&mut changed, "CARGO_BUILD_TARGET", "aarch64-unknown-linux-gnu");
+        } else if variant == 1 {
+            changed.invocation.cfgs.push("semantic_change".into());
+        }
+        let actual = super::key(&mut changed, false, true, |plan| {
+            derive_with(plan, if variant == 2 { 8 } else { 7 }, None)
+        })
+        .unwrap();
+        assert_ne!(actual, identity);
+    }
 }
