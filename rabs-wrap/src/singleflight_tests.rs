@@ -584,3 +584,59 @@ fn disabled_cold_wait_does_not_disable_keyed_waiting() {
     assert!(matches!(result, Ok(Live::Execute { .. })));
     assert_eq!(requests, ["original bytes\n"]);
 }
+
+
+#[test]
+fn cold_preparation_rolls_over_after_sixty_requests() {
+    use std::os::unix::net::UnixListener;
+    let base = std::env::temp_dir().join(format!(
+        "rabs-rollover-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id(),
+    ));
+    std::fs::create_dir(&base).unwrap();
+    let socket = base.join("edge.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let daemon = std::thread::spawn(move || {
+        let (first, _) = listener.accept().unwrap();
+        first.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut first = BufReader::new(first);
+        first.get_mut().write_all(PREPARING.as_bytes()).unwrap();
+        for _ in 0..59 {
+            let mut request = String::new();
+            first.read_line(&mut request).unwrap();
+            assert_eq!(request, "original bytes\n");
+            first.get_mut().write_all(PREPARING.as_bytes()).unwrap();
+        }
+        // The first connection's 60 requests have all received their
+        // replies before the follower may open a new connection.
+        let (second, _) = listener.accept().unwrap();
+        second.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut second = BufReader::new(second);
+        let mut hello = String::new();
+        second.read_line(&mut hello).unwrap();
+        assert_eq!(hello.trim_end(), HELLO);
+        second.get_mut().write_all(b"{\"kind\":\"hello-ok\"}\n").unwrap();
+        let mut request = String::new();
+        second.read_line(&mut request).unwrap();
+        assert_eq!(request, "original bytes\n");
+        second.get_mut().write_all(EXECUTE.as_bytes()).unwrap();
+    });
+    let client = UnixStream::connect(&socket).unwrap();
+    let mut settings = policy(70);
+    settings.budget = Duration::from_secs(8);
+    settings.preparation_budget = Duration::from_secs(8);
+    let result = read_with_policy(
+        reader(client),
+        "original bytes",
+        Duration::from_secs(1),
+        true,
+        settings,
+        Some((socket.to_str().unwrap(), Duration::from_secs(1))),
+        &|| true,
+    );
+    assert!(matches!(result, Ok(Live::Execute { .. })));
+    daemon.join().unwrap();
+    std::fs::remove_file(socket).unwrap();
+    std::fs::remove_dir(base).unwrap();
+}
