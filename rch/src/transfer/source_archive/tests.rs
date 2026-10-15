@@ -239,6 +239,52 @@ async fn explicit_windows_overlays_still_select_only_the_declared_files() {
 }
 
 #[tokio::test]
+async fn tracked_non_cargo_inputs_under_output_names_survive_archive_selection() {
+    let (retained, pipeline) = fixture();
+    let tracked = [
+        "formal/lean/coverage/inventory.json",
+        "fixtures/npm/dist/fixture.js",
+        "src/build/mod.rs",
+    ];
+    let excluded = [
+        "formal/lean/coverage/.ntm/session.json",
+        "fixtures/npm/dist/.beads-recovery/state.json",
+        "src/build/target/generated.o",
+        "src/build/.env",
+        "untracked/coverage/report.json",
+        "untracked/dist/bundle.js",
+    ];
+    for path in tracked.iter().chain(excluded.iter()) {
+        write(&pipeline.project_root, path, b"fixture bytes");
+    }
+    assert!(std::process::Command::new("git")
+        .args(["-c", "init.defaultBranch=main", "init", "-q"])
+        .current_dir(&pipeline.project_root)
+        .status()
+        .unwrap()
+        .success());
+    assert!(std::process::Command::new("git")
+        .arg("add")
+        .args(tracked)
+        .current_dir(&pipeline.project_root)
+        .status()
+        .unwrap()
+        .success());
+    let receipt = pipeline.enumerate_source_content_files().await.unwrap();
+    let destination = retained.join("tracked-worker");
+    upload(&pipeline, &destination).await;
+    for path in tracked {
+        assert!(receipt.contains(&PathBuf::from(path)), "receipt lost {path}");
+        assert_eq!(fs::read(destination.join(path)).unwrap(), b"fixture bytes");
+    }
+    for path in excluded {
+        assert!(!receipt.contains(&PathBuf::from(path)), "receipt included {path}");
+        assert!(!destination.join(path).exists(), "archive included {path}");
+        assert_eq!(fs::read(pipeline.project_root.join(path)).unwrap(), b"fixture bytes");
+    }
+}
+
+#[tokio::test]
 async fn manifest_refuses_windows_path_aliases_and_tar_ignores_ambient_options() {
     for name in [r"src/literal\name", "src/a:stream", "../outside", "a\nb"] {
         assert!(manifest(&[Member { path: PathBuf::from(name), kind: Kind::File }]).await.is_err());

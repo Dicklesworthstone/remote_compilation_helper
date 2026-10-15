@@ -43,7 +43,7 @@ jobs:
           else
             # Refuse a different parent implementation rather than guessing
             # around concurrent source changes or replacing the whole module.
-            test "$(git hash-object rch/src/transfer.rs)" = 6427d1c1ac98c0cf13ec8eba7aba508c6120a813
+            test "$(git hash-object rch/src/transfer.rs)" = 51a56fcebd297410aa8f37ef5c6945a3d690ef46
             git apply --check "$patch"
             git apply "$patch"
             echo 'needs_integration=true' >> "$GITHUB_OUTPUT"
