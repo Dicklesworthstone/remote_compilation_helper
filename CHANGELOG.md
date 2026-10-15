@@ -5,7 +5,7 @@ Compilation Helper): the PreToolUse hook + CLI (`rch`), the local daemon (`rchd`
 worker agent (`rch-wkr`), the RABS build sidecar (`rabs-*`, `rabsd`), and the fleet
 dashboard (`dashboard/`).
 
-Scope window: project inception (`v0.1.0`, 2026-01-25) through `v2.1.27` (2026-10-14).
+Scope window: project inception (`v0.1.0`, 2026-01-25) through `v2.1.28` (2026-10-14).
 
 This document was rebuilt from git history (`git log --no-merges` per tag range, `git show`
 on representative commits), version tags (`git for-each-ref`), GitHub release metadata
@@ -28,6 +28,21 @@ history. They are kept as-is because the descriptions were verified against the 
 but those particular links will 404.
 
 Repository: <https://github.com/Dicklesworthstone/remote_compilation_helper>
+
+## 2.1.28 — 2026-10-14
+
+The Layer 0 pack no longer overrides a profile setting the project declares itself, which makes
+the `debug_line_tables_only` knob safe to enable fleet-wide.
+
+- **Declared profile settings win** (`bd-hoxgn`). The pack is delivered as `CARGO_PROFILE_*` env,
+  which beats the manifest, so `debug_line_tables_only` would have raised a deliberate `debug = 0`
+  and erased a deliberate full `debug` (11 of 89 fleet workspaces declare one), and
+  `release_lto_thin` would have replaced an explicit `lto = "fat"`. The hook now drops any pack pair
+  whose profile setting is declared in the workspace root manifest or in a `.cargo/config.toml` from
+  the invocation directory up to that root; a declared dev value also covers test, which inherits
+  it. Measured for the knob: a cold `cargo test --no-run -p rch-common -p rchd` target is 10.6 GB
+  with full debuginfo and 5.1 GB with line tables only, and builds 8% faster
+  ([`914aeb30`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/914aeb3076042168ef2b8fc4d47d4b0c452316e9)).
 
 ## 2.1.27 — 2026-10-14
 
