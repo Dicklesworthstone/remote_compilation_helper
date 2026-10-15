@@ -25,9 +25,42 @@ fn test_config_override() -> &'static Mutex<Option<RchConfig>> {
     OVERRIDE.get_or_init(|| Mutex::new(None))
 }
 
+/// Serializes tests that set the override. The override is process-global, so
+/// a parallel test's set or reset landed between another test's set and its
+/// read (doctor and status_display socket-path tests flaked in full suites).
+#[cfg(test)]
+fn test_config_override_owner() -> &'static Mutex<()> {
+    static OWNER: Mutex<()> = Mutex::new(());
+    &OWNER
+}
+
+#[cfg(test)]
+thread_local! {
+    static HELD_OVERRIDE: std::cell::RefCell<Option<std::sync::MutexGuard<'static, ()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Setting `Some` makes this thread the override's owner until it sets `None`
+/// or exits; other setters wait. Readers are unchanged.
 #[cfg(test)]
 pub fn set_test_config_override(config: Option<RchConfig>) {
-    *test_config_override().lock().unwrap() = config;
+    HELD_OVERRIDE.with(|held| {
+        let mut held = held.borrow_mut();
+        if held.is_none() {
+            *held = Some(
+                test_config_override_owner()
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            );
+        }
+        let release = config.is_none();
+        *test_config_override()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = config;
+        if release {
+            *held = None;
+        }
+    });
 }
 
 /// Get the user config directory.
@@ -407,7 +440,11 @@ fn load_config_uncached_from_paths(
 /// top per invocation.
 pub fn load_config() -> Result<RchConfig> {
     #[cfg(test)]
-    if let Some(config) = test_config_override().lock().unwrap().clone() {
+    if let Some(config) = test_config_override()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+    {
         return Ok(config);
     }
 
