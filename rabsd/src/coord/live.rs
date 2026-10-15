@@ -416,8 +416,9 @@ const LIVE_SAMPLING_POLICY: SamplingPolicy = SamplingPolicy::sample_all(2, 10_00
 const LIVE_VERIFICATION_RECEIPT: &str = "rabs-live-verification-v1";
 const LIVE_INSTALL_RECEIPT: &str = "rabs-live-replay-install-v1";
 
-/// Maximum cache installations admitted after one new independent comparison.
-/// This fixed bound supplies ongoing verification; it is not an SPRT ratchet.
+/// Default cache installations after one new independent comparison.
+/// Opt-in SPRT replaces only this ceiling with its evidence-qualified limit;
+/// the same comparison binding and durable installation receipts remain required.
 pub const LIVE_REPLAY_INSTALL_LIMIT: u64 = 16;
 
 fn record_descriptor_class(
@@ -628,7 +629,13 @@ fn live_replay_permit(
     }
     let used = u64::try_from(installed.len())
         .map_err(|_| StoreError::Corruption("live replay count exhausted".into()))?;
-    Ok((used < LIVE_REPLAY_INSTALL_LIMIT).then_some(ReplayInstallPermit { subject, seq: used }))
+    // None means the opt-in is off, not that evidence failed. Some(0) is a
+    // hard verification requirement and must never inherit the fixed budget.
+    // Policy changes reuse these same receipts, so they cannot replenish it.
+    let limit = LIVE_SAMPLING_POLICY
+        .replay_install_limit(store, action)?
+        .unwrap_or(LIVE_REPLAY_INSTALL_LIMIT);
+    Ok((used < limit).then_some(ReplayInstallPermit { subject, seq: used }))
 }
 
 /// Final live replay admission, called with the SAME store lock subsequently

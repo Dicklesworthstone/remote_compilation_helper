@@ -30,7 +30,8 @@ class Fixture:
           kind TEXT NOT NULL, subject TEXT NOT NULL, seq INTEGER NOT NULL,
           decision TEXT NOT NULL, reason TEXT NOT NULL, PRIMARY KEY(kind,subject,seq));
         CREATE TABLE IF NOT EXISTS action_generations (id_hex TEXT PRIMARY KEY, action_key TEXT);
-        CREATE TABLE IF NOT EXISTS action_attempts (id_hex TEXT PRIMARY KEY, generation_hex TEXT);
+        CREATE TABLE IF NOT EXISTS action_attempts (
+          id_hex TEXT PRIMARY KEY, generation_hex TEXT, worker TEXT NOT NULL DEFAULT 'fixture-worker');
         CREATE TABLE IF NOT EXISTS verification_samples (
           action_key TEXT, attempt_hex TEXT, passed INTEGER, seq INTEGER,
           PRIMARY KEY(action_key,attempt_hex,seq));
@@ -51,13 +52,13 @@ class Fixture:
         self.db.execute("INSERT INTO action_generations VALUES(?,?)", (action, action))
         self.db.execute("INSERT INTO action_publications VALUES(?,?,?)",
                         (action, f"{0:032x}", "manifest-" + action))
-        self.db.execute("INSERT OR IGNORE INTO action_attempts VALUES(?,?)", (f"{0:032x}", action))
+        self.db.execute("INSERT OR IGNORE INTO action_attempts(id_hex,generation_hex) VALUES(?,?)", (f"{0:032x}", action))
         self.record(CONSTANTS["CLASS_KIND"], action, 0, classification, "fixture")
 
     def proof(self, attempt, seq=None, action="a", receipt=True, passed=1, generation=None, manifest=None):
         seq = attempt if seq is None else seq
         identity = f"{attempt:032x}"
-        self.db.execute("INSERT OR IGNORE INTO action_attempts VALUES(?,?)", (identity, generation or action))
+        self.db.execute("INSERT OR IGNORE INTO action_attempts(id_hex,generation_hex) VALUES(?,?)", (identity, generation or action))
         self.db.execute("INSERT OR REPLACE INTO verification_samples VALUES(?,?,?,?)",
                         (action, identity, passed, seq))
         self.db.commit()
@@ -162,7 +163,7 @@ class EvidenceTests(unittest.TestCase):
         for boundary in (STEP - 1, STEP, 2 * STEP - 1, 2 * STEP, FINAL - 1, FINAL):
             proofs = [(f"{number:032x}", number) for number in range(first, boundary + 1)]
             self.f.db.executemany(
-                "INSERT INTO action_attempts VALUES(?,?)",
+                "INSERT INTO action_attempts(id_hex,generation_hex) VALUES(?,?)",
                 ((identity, "a") for identity, _ in proofs),
             )
             self.f.db.executemany(
@@ -213,6 +214,14 @@ class EvidenceTests(unittest.TestCase):
         self.f.proof(1, action="b")
         self.f.proof(2, generation="b", action="a")
         self.assertEqual(self.f.drain()[0], 0)
+
+    def test_empty_worker_does_not_count_as_an_attributable_comparison(self):
+        self.f.proof(1)
+        self.f.db.execute("UPDATE action_attempts SET worker='' WHERE id_hex=?", (f"{1:032x}",))
+        self.f.db.commit()
+        self.assertEqual(self.f.drain()[0], 0)
+        self.f.proof(2)
+        self.assertEqual(self.f.drain()[0], 1)
 
     def test_repeated_samples_receipts_and_rowid_churn_cannot_double_count(self):
         self.f.proof(1)

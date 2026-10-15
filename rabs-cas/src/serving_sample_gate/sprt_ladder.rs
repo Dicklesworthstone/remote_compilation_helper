@@ -1,8 +1,9 @@
 //! Opt-in, evidence-driven verification floors for the live dependency class.
 //!
-//! RABS_SPRT_SAMPLING=1 enables this ADDITIONAL gate. The existing per-action
-//! evidence requirements and 16-install ceiling still apply; this module can
-//! require more verification, never mint an installation or renew its budget.
+//! RABS_SPRT_SAMPLING=1 enables this gate. The existing per-action evidence
+//! requirements still apply. The live coordinator also obtains its replay
+//! ceiling through SamplingPolicy::replay_install_limit, then validates and
+//! spends its existing durable installation receipt before writing outputs.
 //!
 //! Every failure is already a class-wide veto in class_quarantine. For the
 //! remaining zero-failure sequence, the plan's Bernoulli SPRT has an exact
@@ -56,20 +57,41 @@ JOIN action_generations AS g ON g.id_hex = a.generation_hex
 JOIN verification_samples AS v ON v.attempt_hex = a.id_hex
 JOIN action_publications AS p ON p.action_key = g.action_key
 JOIN decision_receipts AS c ON c.subject = g.action_key
-WHERE a.id_hex = ?1 AND g.action_key = ?2 AND v.action_key = ?2
+WHERE a.id_hex = ?1 AND a.worker != '' AND g.action_key = ?2 AND v.action_key = ?2
 AND v.seq = ?3 AND v.passed = 1 AND p.winner_attempt_hex != a.id_hex
 AND c.kind = ?4 AND c.seq = 0 AND c.decision = ?5
 LIMIT 1
 "#;
 
-pub(super) fn enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        matches!(
-            std::env::var("RABS_SPRT_SAMPLING").as_deref(),
-            Ok("1" | "true" | "on")
-        )
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Mode {
+    Fixed,
+    Sprt,
+    Invalid,
+}
+
+impl Mode {
+    fn parse(value: Option<&str>) -> Self {
+        match value {
+            None | Some("0" | "false" | "off") => Self::Fixed,
+            Some("1" | "true" | "on") => Self::Sprt,
+            Some(_) => Self::Invalid,
+        }
+    }
+}
+
+fn mode() -> Mode {
+    static MODE: OnceLock<Mode> = OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("RABS_SPRT_SAMPLING") {
+        Ok(value) => Mode::parse(Some(&value)),
+        Err(std::env::VarError::NotPresent) => Mode::Fixed,
+        Err(std::env::VarError::NotUnicode(_)) => Mode::Invalid,
     })
+}
+
+pub(super) fn enabled() -> bool {
+    // An invalid opt-in must reach refusal, not silently choose fixed replay.
+    mode() != Mode::Fixed
 }
 
 fn corrupt(reason: &str) -> StoreError {
@@ -309,14 +331,16 @@ fn used_since_comparison(
     }
 }
 
-/// Additional live-class gate, called only AFTER class-wide negative evidence
-/// was checked under this same lock. Generic/legacy CAS clients are unchanged.
-/// No cache-install permit is consumed here; the existing live coordinator
-/// revalidates and spends its own durable permit before writing any output.
+/// Live-class gate, called only AFTER class-wide negative evidence was checked
+/// under this same lock. No cache-install permit is consumed here; the live
+/// coordinator revalidates and spends its durable permit before output writes.
 pub(super) fn refusal(
     store: &mut dyn RabsMetadataStore,
     action: &str,
 ) -> Result<Option<PrivateExecutionReason>, StoreError> {
+    if mode() == Mode::Invalid {
+        return Err(corrupt("invalid RABS_SPRT_SAMPLING setting"));
+    }
     if !matches!(receipt(store, CLASS_KIND, action, 0)?, Some((class, _)) if class == CLASS) {
         return Ok(None);
     }
@@ -340,5 +364,190 @@ pub(super) fn refusal(
     Ok(None)
 }
 
+impl super::SamplingPolicy {
+    /// Evidence-qualified live replay ceiling, not an installation permit.
+    ///
+    /// `None` retains the caller's fixed policy when SPRT is explicitly off or
+    /// the action has no live-class binding. `Some(0)` requires fresh execution;
+    /// it MUST NOT fall back to the fixed allowance. With SPRT on, recheck the
+    /// existing class, evidence and cadence gates and return 0/3/19/99 from the
+    /// persisted, receipted checkpoint. Invalid configuration/state is an error.
+    ///
+    /// Hold the same exclusive metadata lock through this call, validation of
+    /// the comparison/manifest binding, durable receipt spending and install.
+    /// The caller must still enforce release qualification, TTL, output closure
+    /// and destination ownership. No receipt is spent or reset by this method.
+    ///
+    /// # Errors
+    /// [`StoreError`] for invalid configuration, unreadable evidence, malformed
+    /// state or failed durable checkpoint/promotion writes.
+    pub fn replay_install_limit(
+        &self,
+        store: &mut dyn RabsMetadataStore,
+        action: &rabs_protocol::result_identity::TypedDigest,
+    ) -> Result<Option<u64>, StoreError> {
+        replay_limit_with_mode(store, action, self, mode())
+    }
+}
+
+fn replay_limit_with_mode(
+    store: &mut dyn RabsMetadataStore,
+    action: &rabs_protocol::result_identity::TypedDigest,
+    policy: &super::SamplingPolicy,
+    selected: Mode,
+) -> Result<Option<u64>, StoreError> {
+    match selected {
+        Mode::Fixed => return Ok(None),
+        Mode::Invalid => return Err(corrupt("invalid RABS_SPRT_SAMPLING setting")),
+        Mode::Sprt => {}
+    }
+    let key = crate::metadata_store::digest_key(action);
+    match receipt(store, CLASS_KIND, &key, 0)? {
+        None => return Ok(None),
+        Some((class, _)) if class == CLASS => {}
+        Some(_) => return Ok(Some(0)),
+    }
+    // Reuse the actual policy gate, never a second interpretation of its
+    // evidence. In particular a checkpoint cannot overrule sibling divergence
+    // or reset the spent receipts of the latest independent comparison.
+    match super::decide(store, action, super::ActionClassRisk::LowRiskRegistry, policy, true)? {
+        super::SampleGateDecision::ExecutePrivately(_) => Ok(Some(0)),
+        super::SampleGateDecision::ServeFromCache => {
+            Ok(Some(Checkpoint::load(store)?.replay_limit()))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod replay_budget_tests {
+    use super::*;
+    use crate::metadata_store::{RusqliteEngine, SqlMetadataStore};
+    use crate::serving_sample_gate::SamplingPolicy;
+    use crate::serving_sample_gate::tests::{action, published, samples};
+
+    fn fixture(store: &mut dyn RabsMetadataStore) -> String {
+        let key = published(store, 1, 10);
+        store
+            .record_decision_receipt(CLASS_KIND, &key, 0, CLASS, "synthetic descriptor binding")
+            .unwrap();
+        samples(store, 1, 10, 3, 0);
+        store.record_attempt(20_001, 10, "verifier", 100).unwrap();
+        store
+            .record_verification_sample(&action(1), 20_001, true, 100)
+            .unwrap();
+        let manifest = store.published_manifest_key_str(&key).unwrap().unwrap();
+        store
+            .record_decision_receipt(VERIFIED, &key, 100, &format!("{:032x}", 20_001), &manifest)
+            .unwrap();
+        key
+    }
+
+    fn ceiling(store: &mut dyn RabsMetadataStore, selected: Mode) -> Result<Option<u64>, StoreError> {
+        replay_limit_with_mode(store, &action(1), &SamplingPolicy::sample_all(2, 10_000), selected)
+    }
+
+    #[test]
+    fn replay_budget_configuration_is_explicit_and_invalid_never_means_fixed() {
+        for value in [None, Some("0"), Some("false"), Some("off")] {
+            assert_eq!(Mode::parse(value), Mode::Fixed);
+        }
+        for value in ["1", "true", "on"] {
+            assert_eq!(Mode::parse(Some(value)), Mode::Sprt);
+        }
+        for value in ["", "yes", "TRUE", "01", " on", "on ", "-1"] {
+            assert_eq!(Mode::parse(Some(value)), Mode::Invalid);
+        }
+        let mut store = SqlMetadataStore::open(RusqliteEngine::open_in_memory().unwrap()).unwrap();
+        let before = store.differential_snapshot().unwrap();
+        assert_eq!(ceiling(&mut store, Mode::Fixed).unwrap(), None);
+        assert!(ceiling(&mut store, Mode::Invalid).is_err());
+        assert_eq!(store.differential_snapshot().unwrap(), before);
+    }
+
+    #[test]
+    fn every_sprt_stage_controls_the_actual_replay_ceiling_without_spending_receipts() {
+        for (stage, limit) in [(0, 0), (1, 3), (2, 19), (3, 99)] {
+            let mut store = SqlMetadataStore::open(RusqliteEngine::open_in_memory().unwrap()).unwrap();
+            let key = fixture(&mut store);
+            // Deliberately inject the checkpoint to isolate the consumer of a
+            // qualified boundary. This is NOT evidence that trials were earned;
+            // the reducer/attribution tests above exercise those independently.
+            Checkpoint { cursor: FINAL_PASSES as i64, passes: stage * PASSES_PER_STEP }
+                .persist(&mut store)
+                .unwrap();
+            let manifest = store.published_manifest_key_str(&key).unwrap().unwrap();
+            for used in 0..limit {
+                assert_eq!(ceiling(&mut store, Mode::Sprt).unwrap(), Some(limit));
+                assert_eq!(used_since_comparison(&mut store, &key).unwrap(), Some(used));
+                // Switching off is a policy choice, NOT a receipt reset.
+                assert_eq!(ceiling(&mut store, Mode::Fixed).unwrap(), None);
+                assert_eq!(used_since_comparison(&mut store, &key).unwrap(), Some(used));
+                store
+                    .record_decision_receipt(INSTALL, &format!("{key}:100"), used, "install", &manifest)
+                    .unwrap();
+            }
+            assert_eq!(ceiling(&mut store, Mode::Sprt).unwrap(), Some(0));
+            assert_eq!(used_since_comparison(&mut store, &key).unwrap(), Some(limit));
+            assert_eq!(store.published_manifest_key_str(&key).unwrap().as_deref(), Some(manifest.as_str()));
+        }
+    }
+
+    #[test]
+    fn advanced_checkpoint_cannot_override_class_safety_or_current_policy() {
+        let mut store = SqlMetadataStore::open(RusqliteEngine::open_in_memory().unwrap()).unwrap();
+        fixture(&mut store);
+        Checkpoint { cursor: FINAL_PASSES as i64, passes: FINAL_PASSES }
+            .persist(&mut store)
+            .unwrap();
+        assert_eq!(ceiling(&mut store, Mode::Sprt).unwrap(), Some(99));
+        for policy in [SamplingPolicy::sample_all(100, 10_000), SamplingPolicy::sample_all(2, 10_001)] {
+            assert_eq!(replay_limit_with_mode(&mut store, &action(1), &policy, Mode::Sprt).unwrap(), Some(0));
+        }
+        let sibling = published(&mut store, 2, 11);
+        store
+            .record_decision_receipt(CLASS_KIND, &sibling, 0, CLASS, "synthetic sibling")
+            .unwrap();
+        store.record_verification_sample(&action(2), 999_999, false, 1).unwrap();
+        let before = store.differential_snapshot().unwrap();
+        assert_eq!(ceiling(&mut store, Mode::Sprt).unwrap(), Some(0));
+        assert_eq!(store.differential_snapshot().unwrap(), before);
+    }
+
+    #[test]
+    fn unbound_and_private_classes_cannot_borrow_a_promoted_dependency_ceiling() {
+        let mut store = SqlMetadataStore::open(RusqliteEngine::open_in_memory().unwrap()).unwrap();
+        assert_eq!(ceiling(&mut store, Mode::Sprt).unwrap(), None);
+        let key = fixture(&mut store);
+        store.record_decision_receipt(CLASS_KIND, &key, 0, "private-only", "not a dependency").unwrap();
+        Checkpoint { cursor: FINAL_PASSES as i64, passes: FINAL_PASSES }.persist(&mut store).unwrap();
+        let before = store.differential_snapshot().unwrap();
+        assert_eq!(ceiling(&mut store, Mode::Sprt).unwrap(), Some(0));
+        assert_eq!(store.differential_snapshot().unwrap(), before);
+    }
+
+    #[test]
+    fn malformed_checkpoint_or_conflicting_promotion_never_falls_back_to_fixed() {
+        let mut store = SqlMetadataStore::open(RusqliteEngine::open_in_memory().unwrap()).unwrap();
+        fixture(&mut store);
+        store.record_decision_receipt(STATE, CLASS, 0, "not-a-counter", "100").unwrap();
+        assert!(ceiling(&mut store, Mode::Sprt).is_err());
+        Checkpoint { cursor: FINAL_PASSES as i64, passes: FINAL_PASSES }.persist(&mut store).unwrap();
+        store.record_decision_receipt(PROMOTION, CLASS, 1, "verification-bps=0", "forged").unwrap();
+        assert!(ceiling(&mut store, Mode::Sprt).is_err());
+    }
+
+    #[test]
+    fn empty_worker_identity_cannot_earn_positive_class_credit() {
+        let mut store = SqlMetadataStore::open(RusqliteEngine::open_in_memory().unwrap()).unwrap();
+        let key = fixture(&mut store);
+        store.record_attempt(20_002, 10, "", 101).unwrap();
+        store.record_verification_sample(&action(1), 20_002, true, 101).unwrap();
+        let manifest = store.published_manifest_key_str(&key).unwrap().unwrap();
+        store.record_decision_receipt(VERIFIED, &key, 101, &format!("{:032x}", 20_002), &manifest).unwrap();
+        assert!(!admitted(&mut store, &key, 101, &format!("{:032x}", 20_002), &manifest).unwrap());
+        assert!(admitted(&mut store, &key, 100, &format!("{:032x}", 20_001), &manifest).unwrap());
+    }
+}
