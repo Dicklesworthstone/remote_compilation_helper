@@ -27,30 +27,35 @@ WHERE kind = ?1 AND subject = ?2 AND seq = 0
 
 // Bound returned evidence to one witness per category. Do not load every
 // action, transcript, sample, or manifest on a compiler's serving path. The
-// receipt and evidence primary keys support these exact class/member joins.
+// receipt primary key resolves membership only AFTER finding negative evidence.
+// CROSS JOIN keeps SQLite from driving the scan from every healthy class member
+// and probing evidence tables once per key. No cached decision can hide a new
+// incident; positive sample/state scans remain linear until indexed separately.
 const INCIDENT_SQL: &str = r#"
-SELECT c.subject FROM decision_receipts AS c
-JOIN divergence_incidents AS d ON d.action_key = c.subject
-WHERE c.kind = ?1 AND c.seq = 0 AND c.decision = ?2
+SELECT d.action_key FROM divergence_incidents AS d
+CROSS JOIN decision_receipts AS c
+WHERE c.kind = ?1 AND c.subject = d.action_key AND c.seq = 0 AND c.decision = ?2
 LIMIT 1
 "#;
 const ADVERSE_SQL: &str = r#"
-SELECT c.subject FROM decision_receipts AS c
-JOIN verification_samples AS v ON v.action_key = c.subject
-WHERE c.kind = ?1 AND c.seq = 0 AND c.decision = ?2 AND v.passed != 1
+SELECT v.action_key FROM verification_samples AS v
+CROSS JOIN decision_receipts AS c
+WHERE v.passed != 1
+AND c.kind = ?1 AND c.subject = v.action_key AND c.seq = 0 AND c.decision = ?2
 LIMIT 1
 "#;
 const QUARANTINE_SQL: &str = r#"
-SELECT c.subject FROM decision_receipts AS c
-JOIN quarantines AS q ON q.subject = c.subject
-WHERE c.kind = ?1 AND c.seq = 0 AND c.decision = ?2 AND q.scope = 'action-entry'
+SELECT q.subject FROM quarantines AS q
+CROSS JOIN decision_receipts AS c
+WHERE q.scope = 'action-entry'
+AND c.kind = ?1 AND c.subject = q.subject AND c.seq = 0 AND c.decision = ?2
 LIMIT 1
 "#;
 const DISPOSITION_SQL: &str = r#"
-SELECT c.subject FROM decision_receipts AS c
-JOIN action_serving_states AS s ON s.action_key = c.subject
-WHERE c.kind = ?1 AND c.seq = 0 AND c.decision = ?2
-AND s.disposition IN ('quarantined', 'presentation-quarantined')
+SELECT s.action_key FROM action_serving_states AS s
+CROSS JOIN decision_receipts AS c
+WHERE s.disposition IN ('quarantined', 'presentation-quarantined')
+AND c.kind = ?1 AND c.subject = s.action_key AND c.seq = 0 AND c.decision = ?2
 LIMIT 1
 "#;
 
