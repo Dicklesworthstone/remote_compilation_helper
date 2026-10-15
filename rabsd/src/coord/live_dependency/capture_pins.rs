@@ -154,6 +154,20 @@ impl Drop for CapturePins {
                 ),
             }
         }
+        // Drain old-incarnation custody only AFTER this capture's ordinary
+        // handoff. Keep the same exclusive mount/store lock. Recovery is one
+        // bounded page per capture, not a full-history scan on rustc admission;
+        // its durable authority-scoped cursor makes later captures resume it.
+        // Failure retains unreconciled roots and cannot change compiler status
+        // or undo a publication that has already acquired independent pins.
+        match recovery::reconcile_page(&mut *store, &self.authority.coordinator) {
+            Ok(page) if page.released != 0 => eprintln!(
+                "rabsd: recovered {} fenced capture pins (scanned {}, complete {})",
+                page.released, page.scanned, page.complete
+            ),
+            Ok(_) => {}
+            Err(error) => eprintln!("rabsd: capture recovery incomplete: {error}"),
+        }
     }
 }
 

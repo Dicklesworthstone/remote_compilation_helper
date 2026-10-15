@@ -1,8 +1,11 @@
 //! Durable restart-recovery witness for compiler-output capture custody.
 //!
 //! Evidence is written in the SAME `create_pin` transaction as its root. It is
-//! a consistency witness, never release authority. A later reconciler must also
-//! prove the normalized attempt binding and durably fence its old generation.
+//! a consistency witness, never release authority. The bounded live reconciler
+//! also proves the normalized attempt binding and the old generation's fence.
+
+mod reconcile;
+pub(super) use reconcile::reconcile_page;
 
 use super::{capture_owner, digest_field, field, pin_id};
 use rabs_cas::metadata_store::digest_key;
