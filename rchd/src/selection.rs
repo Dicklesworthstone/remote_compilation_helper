@@ -4024,6 +4024,14 @@ fn record_no_worker_outcome(got_worker: bool) {
 
 fn record_selection_metrics(reason: &SelectionReason, duration: Duration) {
     metrics::observe_reliability_decision("selection", selection_outcome_label(reason), duration);
+    // A busy pool is saturation, not a local fallback: capable workers exist,
+    // and the request queues by default. Every queued waiter re-selects each
+    // second, so counting busy rounds kept the fleet-degraded alarm latched and
+    // inflated the local-fallback metrics whenever anything queued. A queue
+    // timeout that does fall back is counted where it happens (api.rs).
+    if *reason == SelectionReason::AllWorkersBusy {
+        return;
+    }
     let got_worker = matches!(
         reason,
         SelectionReason::Success
@@ -4816,6 +4824,20 @@ mod tests {
 
         assert!(decision_after > decision_before);
         assert!(fallback_after > fallback_before);
+    }
+
+    #[test]
+    fn busy_selection_rounds_are_not_local_fallbacks() {
+        let busy = || {
+            crate::metrics::LOCAL_FALLBACK_REASON_TOTAL
+                .with_label_values(&["all_workers_busy"])
+                .get()
+        };
+        let before = busy();
+        for _ in 0..(NO_WORKER_WINDOW * 2) {
+            record_selection_metrics(&SelectionReason::AllWorkersBusy, Duration::from_millis(1));
+        }
+        assert_eq!(busy(), before);
     }
 
     #[tokio::test]

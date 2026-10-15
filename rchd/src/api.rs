@@ -3092,6 +3092,7 @@ async fn handle_select_worker_mode(
             ctx.history.update_queue_estimates();
             if !cfg!(test) {
                 metrics::set_build_queue_depth(ctx.history.queue_depth());
+                metrics::inc_local_fallback_reason("queue_timeout");
             }
             ctx.events.emit(
                 "build_queue_removed",
