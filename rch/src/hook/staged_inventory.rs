@@ -85,6 +85,7 @@ fn visit(
     let before = fstat(directory)?;
     let mut entries = Dir::read_from(directory)?;
     while let Some(entry) = entries.read() {
+        super::super::publication_runtime::checkpoint()?;
         let entry = entry?;
         let name = entry.file_name().to_bytes();
         if name == b"." || name == b".." {

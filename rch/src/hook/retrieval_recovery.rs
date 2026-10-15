@@ -17,6 +17,13 @@ mod publication_copy;
 #[cfg(unix)]
 use publication_copy::prepare_output_temporary;
 
+#[path = "publication_runtime.rs"]
+mod publication_runtime;
+use publication_runtime::PublicationPoint;
+#[cfg(all(test, unix))]
+#[path = "publication_runtime_tests.rs"]
+mod publication_runtime_tests;
+
 #[path = "recovery_completion.rs"]
 mod recovery_completion;
 #[path = "recovery_owner.rs"]
@@ -308,6 +315,7 @@ fn fingerprint(path: &Path) -> anyhow::Result<Option<String>> {
     let mut hasher = blake3::Hasher::new();
     let mut bytes = [0u8; 65536];
     loop {
+        publication_runtime::checkpoint()?;
         let count = file.read(&mut bytes)?;
         if count == 0 {
             break;
@@ -394,6 +402,7 @@ fn copy_published_output(
     let mut count_total = 0u64;
     let mut reader = (&mut source).take(bound);
     loop {
+        publication_runtime::checkpoint()?;
         let count = reader.read(&mut buffer)?;
         if count == 0 {
             break;
@@ -478,7 +487,15 @@ impl PreparedOutput {
             mode,
         };
         prepared.verify_name(temporary)?;
-        prepared.verify_content()?;
+        if let Err(error) = prepared.verify_content() {
+            if error.is::<publication_runtime::PublicationCancelled>() {
+                // A cancelled full-byte check must retain its private copy,
+                // with the same best-effort salvage as interrupted writes.
+                let _ = prepared.file.sync_all();
+                let _ = prepared.directory.sync_all();
+            }
+            return Err(error);
+        }
         Ok(prepared)
     }
 
@@ -502,6 +519,7 @@ impl PreparedOutput {
             reader
         };
         while offset < bound {
+            publication_runtime::checkpoint()?;
             let size = (bound - offset).min(buffer.len() as u64) as usize;
             #[cfg(unix)]
             let count = {
@@ -583,6 +601,7 @@ impl PreparedOutput {
     fn publish(&self, destination: &Path) -> anyhow::Result<()> {
         self.verify_name(&self.temporary)?;
         self.verify_content()?;
+        publication_runtime::checkpoint()?;
         anyhow::ensure!(
             destination.parent() == Some(self.parent.as_path()),
             "output destination parent changed"
@@ -682,6 +701,7 @@ fn regular_files(root: &Path) -> anyhow::Result<Vec<PathBuf>> {
             return Ok(());
         }
         for entry in std::fs::read_dir(directory)? {
+            publication_runtime::checkpoint()?;
             let entry = entry?;
             let kind = entry.file_type()?;
             anyhow::ensure!(
@@ -706,8 +726,8 @@ fn regular_files(root: &Path) -> anyhow::Result<Vec<PathBuf>> {
 }
 
 /// How long a publication waits for another wrapper's publication into the
-/// same local output root. Publications only move already-staged files, so
-/// contention lasts seconds; the bound turns a wedged holder into an error.
+/// same local output root. Large artifact sets can take minutes to publish;
+/// the bound turns a wedged holder into an error without blocking the executor.
 const OUTPUT_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// Different spellings of one output directory must share publication
@@ -1195,6 +1215,7 @@ impl RecoverySession {
         let phase = &self.recipe.phases[index];
         let mut observations = Vec::new();
         for relative in files {
+            publication_runtime::checkpoint()?;
             if !phase.published.contains_key(relative) {
                 validate_output_ancestors(&phase.local, relative)?;
                 observations.push((relative.clone(), fingerprint(&phase.local.join(relative))?));
@@ -1850,6 +1871,14 @@ impl RecoverySession {
             .with_local_root(stage))
     }
     pub(crate) async fn publish(&mut self, name: &str) -> anyhow::Result<()> {
+        self.publish_with_observer(name, |_, _| Ok(())).await
+    }
+
+    async fn publish_with_observer(
+        &mut self,
+        name: &str,
+        observe: impl FnMut(PublicationPoint, &Path) -> anyhow::Result<()> + Send + 'static,
+    ) -> anyhow::Result<()> {
         let index = self
             .recipe
             .phases
@@ -1863,13 +1892,28 @@ impl RecoverySession {
         if self.recipe.phases[index].complete {
             return Ok(());
         }
-        // Exclusive for this publication only; see `lock_output_root`.
-        let _publication = lock_output_root(&self.recipe.phases[index].local).await?;
+        // Keep the asynchronous, cancellable lock wait. The worker owns the
+        // acquired descriptor until it stops, including on future cancellation.
+        let publication = lock_output_root(&self.recipe.phases[index].local).await?;
+        publication_runtime::run(self, publication, move |session| {
+            session.publish_blocking(index, observe)
+        })
+        .await
+    }
+
+    fn publish_blocking(
+        &mut self,
+        index: usize,
+        mut observe: impl FnMut(PublicationPoint, &Path) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        publication_runtime::checkpoint()?;
         // Validate the entire required set before the first journal/output
         // mutation. One executable or support library cannot satisfy another
         // selected Cargo target, and existing destination files are no proof.
         self.verify_cargo_outputs(index)?;
+        publication_runtime::checkpoint()?;
         self.verify_native_outputs(index)?;
+        publication_runtime::checkpoint()?;
         let stage = self.stage(index);
         #[cfg(unix)]
         let mut files = publication_copy::staged_regular_files(&stage)?;
@@ -1906,6 +1950,7 @@ impl RecoverySession {
             let (admitted, outside) =
                 policy.partition_staged_artifact_paths(&files, &phase.patterns)?;
             for path in &outside {
+                publication_runtime::checkpoint()?;
                 // Warn: a skip means collector and recipe disagree about the
                 // policy (as in bd-3kskq); keep that skew visible.
                 warn!(
@@ -1927,6 +1972,7 @@ impl RecoverySession {
                 }
             }
         }
+        publication_runtime::checkpoint()?;
         if let Some((relative, hash)) = self.recipe.phases[index].pending.clone() {
             let destination = self.recipe.phases[index].local.join(&relative);
             let parent = destination
@@ -1954,13 +2000,16 @@ impl RecoverySession {
         // recovers against exactly what this publication observed.
         self.persist_output_baseline(index, &files)?;
         for relative in files {
+            publication_runtime::checkpoint()?;
             let phase = &self.recipe.phases[index];
             if phase.published.contains_key(&relative) {
                 continue;
             }
+            let destination = phase.local.join(&relative);
+            observe(PublicationPoint::BeforeFile, &destination)?;
+            publication_runtime::checkpoint()?;
             validate_output_ancestors(&phase.local, &relative)?;
             let source = stage.join(&relative);
-            let destination = phase.local.join(&relative);
             let hash = fingerprint(&source)?.context("staged output disappeared")?;
             let current = fingerprint(&destination)?;
             anyhow::ensure!(
@@ -1973,6 +2022,8 @@ impl RecoverySession {
             let prepared = prepare_output_temporary(&source, &temporary, &hash)?;
             prepared.directory.sync_all()?;
             self.persist_pending_output(index, Some((relative.clone(), hash.clone())))?;
+            observe(PublicationPoint::PendingDurable, &destination)?;
+            publication_runtime::checkpoint()?;
             anyhow::ensure!(
                 fingerprint(&destination)?.as_ref()
                     == self.recipe.phases[index].baseline.get(&relative),
@@ -1980,15 +2031,21 @@ impl RecoverySession {
                 destination.display()
             );
             prepared.publish(&destination)?;
+            observe(PublicationPoint::Renamed, &destination)?;
+            publication_runtime::checkpoint()?;
             self.persist_published_output(index, relative, hash)?;
+            observe(PublicationPoint::PublishedDurable, &destination)?;
         }
+        publication_runtime::checkpoint()?;
         let mut next_recipe = self.recipe.clone();
         next_recipe.phases[index].complete = true;
         self.persist_next_recipe(next_recipe)?;
         // Ordinary successful delivery can release its duplicate staging.
         // A retained-source intent also protects its original delivery inputs,
         // including out-of-policy files kept private in this stage.
-        if !self.retain_source_lifecycle_evidence() {
+        if !self.retain_source_lifecycle_evidence()
+            && publication_runtime::checkpoint().is_ok()
+        {
             let _ = std::fs::remove_dir_all(&stage);
         }
         Ok(())

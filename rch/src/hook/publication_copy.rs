@@ -165,6 +165,7 @@ fn verify_prefix(
     let mut hasher = blake3::Hasher::new();
     let mut offset = 0;
     while offset < source_length {
+        super::publication_runtime::checkpoint()?;
         let count = (source_length - offset).min(BUFFER_BYTES as u64) as usize;
         source.read_exact_at(&mut source_bytes[..count], offset)?;
         hasher.update(&source_bytes[..count]);
@@ -206,7 +207,7 @@ pub(super) fn prepare_output_temporary(
 /// The writer seam injects real partial-write boundaries in tests. Production
 /// uses positional writes on the same descriptor, never seek/truncate/replace.
 #[cfg(test)]
-fn prepare_with_write(
+pub(super) fn prepare_with_write(
     source_path: &Path,
     temporary: &Path,
     expected: &str,
@@ -234,6 +235,21 @@ fn prepare_with_io(
     })
 }
 
+// Retain cancellation prefixes just like interrupted writes. Storage errors
+// during salvage never replace the cancellation that stopped this attempt.
+fn copy_checkpoint(
+    file: &File,
+    directory: &File,
+    sync: &mut impl FnMut(&File) -> io::Result<()>,
+) -> Result<()> {
+    if let Err(error) = super::publication_runtime::checkpoint() {
+        let _ = sync(file);
+        let _ = sync(directory);
+        return Err(error);
+    }
+    Ok(())
+}
+
 // A kernel copier reports None ONLY when no bytes were consumed and ordinary
 // positioned I/O should take over. Every positive partial result advances the
 // retained prefix; no fallback ever starts again from zero.
@@ -245,6 +261,7 @@ fn prepare_with_copier(
     mut sync: impl FnMut(&File) -> io::Result<()>,
     mut copy_range: impl FnMut(&File, &File, u64, usize) -> io::Result<Option<usize>>,
 ) -> Result<PreparedOutput> {
+    super::publication_runtime::checkpoint()?;
     let parent = temporary
         .parent()
         .context("output temporary has no parent")?;
@@ -333,6 +350,7 @@ fn prepare_with_copier(
     let mut buffer = Vec::new();
     let mut try_kernel = verified_source.is_none();
     while offset < source_metadata.len() {
+        copy_checkpoint(&file, &directory, &mut sync)?;
         verify_source(&source, source_path, &source_metadata)?;
         let count = (source_metadata.len() - offset).min(BUFFER_BYTES as u64) as usize;
         if try_kernel {
@@ -372,6 +390,7 @@ fn prepare_with_copier(
         };
         let mut written = 0;
         while written < count {
+            copy_checkpoint(&file, &directory, &mut sync)?;
             // The next write starts exactly at EOF. Another writer's growth
             // or truncation is not permission to overwrite retained bytes.
             verify_temporary(&directory, temporary, &file, &initial, offset, mode)?;
@@ -398,6 +417,7 @@ fn prepare_with_copier(
             }
         }
     }
+    copy_checkpoint(&file, &directory, &mut sync)?;
     verify_source(&source, source_path, &source_metadata)?;
     verify_temporary(&directory, temporary, &file, &initial, offset, mode)?;
     // Full-byte validation precedes chmod too. A complete 0600 copy left by a
