@@ -23,10 +23,15 @@ const VERIFIED_SOURCE_CACHE_BYTES: u64 = 1024 * 1024;
 
 #[path = "staged_inventory.rs"]
 mod staged_inventory;
+#[path = "publication_kernel_copy.rs"]
+mod kernel_copy;
 
 #[cfg(test)]
 #[path = "publication_copy_io_tests.rs"]
 mod io_tests;
+#[cfg(test)]
+#[path = "publication_copy_range_tests.rs"]
+mod range_tests;
 
 /// A missing stage is not an empty successful Make output set. The generic
 /// file enumerator also serves pre-build baselines, where absent output roots
@@ -188,13 +193,19 @@ pub(super) fn prepare_output_temporary(
     temporary: &Path,
     expected: &str,
 ) -> Result<PreparedOutput> {
-    prepare_with_write(source, temporary, expected, |file, bytes, offset| {
-        file.write_at(bytes, offset)
-    })
+    prepare_with_copier(
+        source,
+        temporary,
+        expected,
+        |file, bytes, offset| file.write_at(bytes, offset),
+        File::sync_all,
+        kernel_copy::copy_range,
+    )
 }
 
 /// The writer seam injects real partial-write boundaries in tests. Production
 /// uses positional writes on the same descriptor, never seek/truncate/replace.
+#[cfg(test)]
 fn prepare_with_write(
     source_path: &Path,
     temporary: &Path,
@@ -210,12 +221,29 @@ fn prepare_with_write(
 /// syncs the held directory BEFORE recording pending ownership; rename and the
 /// published checkpoint retain their own durability barriers.
 /// The sync seam lets tests fail this boundary without weakening production I/O.
+#[cfg(test)]
 fn prepare_with_io(
+    source_path: &Path,
+    temporary: &Path,
+    expected: &str,
+    write: impl FnMut(&File, &[u8], u64) -> io::Result<usize>,
+    sync: impl FnMut(&File) -> io::Result<()>,
+) -> Result<PreparedOutput> {
+    prepare_with_copier(source_path, temporary, expected, write, sync, |_, _, _, _| {
+        Ok(None)
+    })
+}
+
+// A kernel copier reports None ONLY when no bytes were consumed and ordinary
+// positioned I/O should take over. Every positive partial result advances the
+// retained prefix; no fallback ever starts again from zero.
+fn prepare_with_copier(
     source_path: &Path,
     temporary: &Path,
     expected: &str,
     mut write: impl FnMut(&File, &[u8], u64) -> io::Result<usize>,
     mut sync: impl FnMut(&File) -> io::Result<()>,
+    mut copy_range: impl FnMut(&File, &File, u64, usize) -> io::Result<Option<usize>>,
 ) -> Result<PreparedOutput> {
     let parent = temporary
         .parent()
@@ -302,20 +330,43 @@ fn prepare_with_io(
         file
     };
     let mut offset = prefix_length;
-    let mut buffer = if verified_source.is_none() {
-        vec![0; BUFFER_BYTES]
-    } else {
-        Vec::new()
-    };
+    let mut buffer = Vec::new();
+    let mut try_kernel = verified_source.is_none();
     while offset < source_metadata.len() {
         verify_source(&source, source_path, &source_metadata)?;
         let count = (source_metadata.len() - offset).min(BUFFER_BYTES as u64) as usize;
+        if try_kernel {
+            verify_temporary(&directory, temporary, &file, &initial, offset, mode)?;
+            match copy_range(&source, &file, offset, count) {
+                Ok(Some(0)) => return Err(io::Error::from(io::ErrorKind::WriteZero).into()),
+                Ok(Some(copied)) => {
+                    anyhow::ensure!(copied <= count, "invalid publication range length");
+                    offset += copied as u64;
+                    continue;
+                }
+                Ok(None) => try_kernel = false,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => {
+                    let _ = sync(&file);
+                    let _ = sync(&directory);
+                    return Err(error).with_context(|| {
+                        format!(
+                            "publication range copy interrupted at {}; prefix retained for recovery",
+                            temporary.display()
+                        )
+                    });
+                }
+            }
+        }
         // Only the fully hash-checked snapshot may bypass this second source
         // read. Name/version checks still run for every chunk, and the held
         // temporary is independently hashed before chmod and publication.
         let bytes = if let Some(verified) = &verified_source {
             &verified[offset as usize..offset as usize + count]
         } else {
+            if buffer.is_empty() {
+                buffer.resize(BUFFER_BYTES, 0);
+            }
             source.read_exact_at(&mut buffer[..count], offset)?;
             &buffer[..count]
         };
