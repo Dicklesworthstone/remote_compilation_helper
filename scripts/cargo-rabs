@@ -23,6 +23,8 @@ import time
 MAX_FRAME = 64 * 1024
 DEFAULT_STARTUP_MS = 5000
 MAX_STARTUP_MS = 30000
+OWNER_RECEIPT = "daemon-owner.json"
+MAX_OWNER_RECEIPT = 2048
 HELLO = {
     "kind": "hello",
     "transport": {"minimum_compatible": 1, "current": 1},
@@ -63,12 +65,50 @@ The endpoint lock is .rabs-<socket-name>.startup.lock beside the socket, so
 different state directories cannot start competing daemons for one endpoint.
 Starting a daemon requires a same-user socket parent without group/world write
 permission; attaching to an already-running daemon does not create any locks.
-Stale, foreign, malformed or unavailable existing sockets are left untouched.
+After a confirmed launcher-owned daemon crashes, a later invocation can restart
+it against the same state store. Recovery requires its private ownership receipt,
+the unchanged socket generation, both lifetime locks, and proof that the recorded
+process exited. rabsd performs its own stale-socket takeover; the launcher never
+unlinks an endpoint or kills a daemon. Unmanaged/legacy stale sockets, unknown
+ownership, live but unresponsive peers, and --rabs-no-start never trigger recovery.
 """
 
 
 class SetupError(Exception):
     """Acceleration could not be set up; no compiler or output writer started."""
+
+
+class StaleEndpoint(SetupError):
+    """A connect was refused by one unchanged private socket, not a read timeout."""
+
+    def __init__(self, identity):
+        super().__init__("RABS endpoint refused connection; recovery requires recorded ownership")
+        self.identity = identity
+
+
+def process_exited(pid):
+    """Observe exit without sending a terminating signal or trusting PID reuse.
+
+    A reused live PID conservatively prevents recovery. pidfds also recognize
+    an exited child awaiting reaping; a kill(0) fallback alone cannot do that.
+    Unsupported/denied pidfds fall back to the stricter absence-only test.
+    """
+    try:
+        descriptor = os.pidfd_open(pid, 0)
+    except ProcessLookupError:
+        return True
+    except (AttributeError, OSError):
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        return False
+    try:
+        with selectors.DefaultSelector() as selector:
+            selector.register(descriptor, selectors.EVENT_READ)
+            return bool(selector.select(0))
+    finally:
+        os.close(descriptor)
 
 
 def remaining(deadline):
@@ -90,7 +130,7 @@ def unique_object(pairs):
 def decode_object(data):
     try:
         result = json.loads(data.decode("utf-8"), object_pairs_hook=unique_object)
-    except (ValueError, UnicodeError) as error:
+    except (ValueError, UnicodeError, RecursionError) as error:
         raise SetupError("RABS returned malformed JSON") from error
     if not isinstance(result, dict):
         raise SetupError("RABS returned a non-object reply")
@@ -197,7 +237,8 @@ def socket_identity(path):
         raise SetupError("RABS endpoint exists but is not a socket; leaving it untouched")
     if metadata.st_uid != os.geteuid() or stat.S_IMODE(metadata.st_mode) & 0o077:
         raise SetupError("RABS socket is not private to this user; leaving it untouched")
-    return metadata.st_dev, metadata.st_ino
+    # A newly bound socket may reuse an old inode; bind/chmod changes ctime.
+    return metadata.st_dev, metadata.st_ino, metadata.st_ctime_ns
 
 
 class Frames:
@@ -229,18 +270,25 @@ class Frames:
             self.buffer.extend(chunk)
 
 
-def probe(path, deadline):
+def probe(path, deadline, expected_pid=None):
     """Readiness only, never evidence of a hit or authorization to skip rustc."""
     identity = socket_identity(path)
     if identity is None:
         return False
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as stream:
         stream.settimeout(remaining(deadline))
-        stream.connect(path)
+        try:
+            stream.connect(path)
+        except ConnectionRefusedError as error:
+            if socket_identity(path) != identity:
+                raise SetupError("RABS endpoint changed during connection") from error
+            raise StaleEndpoint(identity) from error
         credentials = stream.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
-        _, uid, _ = struct.unpack("3i", credentials)
+        pid, uid, _ = struct.unpack("3i", credentials)
         if uid != os.geteuid() or socket_identity(path) != identity:
             raise SetupError("RABS endpoint ownership changed during connection")
+        if expected_pid is not None and pid != expected_pid:
+            raise SetupError("RABS readiness peer is not the daemon this launcher started")
         frames = Frames(stream, deadline)
         frames.send(HELLO)
         hello = frames.receive()
@@ -303,6 +351,7 @@ class StartupLock:
         self.lock = None
         self.socket_directory = None
         self.endpoint_lock = None
+        self.acquired = False
         self.deadline = deadline
         self.path = os.path.join(state, "cargo-launcher")
         self.socket_parent, socket_name = os.path.split(socket_path)
@@ -371,7 +420,85 @@ class StartupLock:
         for descriptor in (self.lock, self.endpoint_lock):
             if not self.acquire_one(descriptor, socket_path):
                 return False
+        self.acquired = True
         return True
+
+    def owner_binding(self, pid, identity):
+        self.verify()
+        if not self.acquired:
+            raise SetupError("RABS recovery requires both held startup locks")
+        state = os.fstat(self.directory)
+        endpoint = os.fstat(self.endpoint_lock)
+        return {"v": 1, "pid": pid, "socket": list(identity),
+                "state": [state.st_dev, state.st_ino],
+                "endpoint_lock": [endpoint.st_dev, endpoint.st_ino]}
+
+    def record_owner(self, pid, identity):
+        """Persist only a socket whose SO_PEERCRED matched our own ready child.
+
+        One atomic replacement under both locks; no existing receipt is exposed
+        truncated. Missing/failed persistence disables later recovery, not builds.
+        """
+        value = self.owner_binding(pid, identity)
+        try:
+            existing = os.stat(OWNER_RECEIPT, dir_fd=self.directory, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            check_lock_metadata(existing)
+        name = "daemon-owner-{}-{}.tmp".format(os.getpid(), time.time_ns())
+        descriptor = os.open(
+            name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o600, dir_fd=self.directory,
+        )
+        with os.fdopen(descriptor, "wb") as receipt:
+            receipt.write(json.dumps(value, separators=(",", ":")).encode("utf-8"))
+            receipt.flush()
+            os.fsync(receipt.fileno())
+        self.verify()
+        os.replace(name, OWNER_RECEIPT, src_dir_fd=self.directory, dst_dir_fd=self.directory)
+        os.fsync(self.directory)
+
+    def authorize_recovery(self, identity):
+        """Uncertainty retains the endpoint; nothing in this method mutates it."""
+        self.verify()
+        descriptor = os.open(
+            OWNER_RECEIPT, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK,
+            dir_fd=self.directory,
+        )
+        with os.fdopen(descriptor, "rb") as receipt:
+            before = os.fstat(receipt.fileno())
+            check_lock_metadata(before)
+            if before.st_size > MAX_OWNER_RECEIPT:
+                raise SetupError("RABS owner receipt exceeds its bound")
+            data = receipt.read(MAX_OWNER_RECEIPT + 1)
+            after = os.fstat(receipt.fileno())
+            named = os.stat(OWNER_RECEIPT, dir_fd=self.directory, follow_symlinks=False)
+        signature = lambda metadata: (metadata.st_dev, metadata.st_ino, metadata.st_size,
+                                      metadata.st_ctime_ns, metadata.st_mtime_ns)
+        if (len(data) != before.st_size or signature(before) != signature(after)
+                or signature(before) != signature(named)):
+            raise SetupError("RABS owner receipt changed while reading")
+        check_lock_metadata(named)
+        value = decode_object(data)
+        pid = value.get("pid")
+        if type(pid) is not int or not 1 < pid <= 0x7fffffff:
+            raise SetupError("RABS owner receipt has no valid process identity")
+        expected = self.owner_binding(pid, identity)
+        # Validate shallow, typed fields without recursively comparing or
+        # re-encoding an untrusted JSON subtree. bool is not a device/inode/PID.
+        matches = (value.keys() == expected.keys() and type(value.get("v")) is int
+                   and value["v"] == expected["v"])
+        for field in ("socket", "state", "endpoint_lock"):
+            observed = value.get(field)
+            matches = matches and (type(observed) is list and len(observed) == len(expected[field])
+                                   and all(type(number) is int for number in observed)
+                                   and observed == expected[field])
+        if not matches:
+            raise SetupError("RABS stale endpoint does not match this launcher's ownership receipt")
+        if not process_exited(pid):
+            raise SetupError("RABS recorded daemon has not exited; leaving its endpoint untouched")
+        self.verify()
 
     def acquire_one(self, descriptor, socket_path):
         while True:
@@ -402,6 +529,7 @@ class StartupLock:
         return descriptor, os.path.join(self.path, name)
 
     def close(self):
+        self.acquired = False
         for name in ("endpoint_lock", "socket_directory", "lock", "directory"):
             descriptor = getattr(self, name)
             if descriptor is not None:
@@ -413,24 +541,35 @@ class StartupLock:
 
 
 def ensure_daemon(daemon, socket_path, state, env, deadline, no_start):
+    stale = None
     if socket_identity(socket_path) is not None:
-        # A timeout/refusal is not proof of death. Never replace an existing
-        # endpoint, even when the operator intentionally disabled serving.
-        if not probe(socket_path, min(deadline, time.monotonic() + 1.0)):
-            raise SetupError("RABS endpoint disappeared during readiness checking")
-        return
+        try:
+            if not probe(socket_path, min(deadline, time.monotonic() + 1.0)):
+                raise SetupError("RABS endpoint disappeared during readiness checking")
+            return
+        except StaleEndpoint as error:
+            stale = error.identity
+        # A connected peer's timeout, malformed reply or protocol refusal is
+        # never proof of death. Only connect-time ECONNREFUSED reaches recovery.
     if no_start:
         raise SetupError("no RABS daemon is listening and --rabs-no-start was requested")
     with StartupLock(state, socket_path, deadline) as lock:
         if not lock.acquire(socket_path):
             return
         if socket_identity(socket_path) is not None:
-            if not probe(socket_path, min(deadline, time.monotonic() + 1.0)):
-                raise SetupError("RABS endpoint disappeared during readiness checking")
-            return
+            try:
+                if not probe(socket_path, min(deadline, time.monotonic() + 1.0)):
+                    raise SetupError("RABS endpoint disappeared during readiness checking")
+                return
+            except StaleEndpoint as error:
+                if stale != error.identity:
+                    raise SetupError("RABS stale endpoint changed before recovery") from error
+                lock.authorize_recovery(stale)
         remaining(deadline)
         descriptor, log = lock.new_log()
         try:
+            if stale is not None and socket_identity(socket_path) != stale:
+                raise SetupError("RABS endpoint changed before daemon restart")
             child = subprocess.Popen(
                 [daemon], env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                 stderr=descriptor, close_fds=True, start_new_session=True,
@@ -443,7 +582,15 @@ def ensure_daemon(daemon, socket_path, state, env, deadline, no_start):
             if status is not None:
                 raise SetupError("rabsd exited during startup; see {}".format(log))
             try:
-                if probe(socket_path, min(deadline, time.monotonic() + 0.25)):
+                identity = socket_identity(socket_path)
+                if probe(socket_path, min(deadline, time.monotonic() + 0.25), child.pid):
+                    if socket_identity(socket_path) != identity:
+                        raise SetupError("RABS endpoint changed before recording its owner")
+                    try:
+                        lock.record_owner(child.pid, identity)
+                    except (SetupError, OSError) as error:
+                        print("cargo-rabs: daemon ready, but crash recovery ownership was not "
+                              "recorded: {}".format(error), file=sys.stderr)
                     return
             except (SetupError, OSError):
                 # Only this newly-started daemon gets a readiness grace period.
