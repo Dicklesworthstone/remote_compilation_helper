@@ -18,6 +18,15 @@ const HEARTBEAT_STALE_SECS: u64 = 20;
 /// `progress_age: 740` while this daemon's own log lagged the event by 12 s. A dead hook still
 /// needs only [`HEARTBEAT_STALE_SECS`].
 const LIVE_HOOK_HEARTBEAT_STALE_SECS: u64 = 120;
+/// The same corroboration in SyncDown or Finalize (#112). There the remote
+/// command has exited, so the worker is idle and the live hook is delivering a
+/// result that already succeeded. Publishing a large artifact set runs
+/// synchronously on the client's current-thread runtime and silences its
+/// heartbeat for minutes. Signalling it then frees no worker CPU and throws
+/// the result away, so only a much longer silence counts. A dead hook still
+/// needs only [`HEARTBEAT_STALE_SECS`], and a hung transfer is bounded by the
+/// client's own timeouts.
+const POST_EXECUTION_LIVE_HOOK_HEARTBEAT_STALE_SECS: u64 = 30 * 60;
 const PROGRESS_STALE_SECS: u64 = 90;
 const RECENT_PROGRESS_GRACE_SECS: u64 = 15;
 const MIN_BUILD_AGE_SECS: u64 = 30;
@@ -230,12 +239,20 @@ impl StuckEvidence {
     }
 }
 
+#[cfg(test)]
 fn score_stuck_evidence(input: StuckEvidenceInput) -> StuckEvidence {
+    score_stuck_evidence_with(input, LIVE_HOOK_HEARTBEAT_STALE_SECS)
+}
+
+fn score_stuck_evidence_with(
+    input: StuckEvidenceInput,
+    live_hook_heartbeat_stale_secs: u64,
+) -> StuckEvidence {
     let heartbeat_stale = input.heartbeat_age_secs >= HEARTBEAT_STALE_SECS;
     let progress_stale = input.progress_age_secs >= PROGRESS_STALE_SECS;
     let progress_recent = input.progress_age_secs <= RECENT_PROGRESS_GRACE_SECS;
     let progress_stall_corroborated =
-        !input.hook_alive || input.heartbeat_age_secs >= LIVE_HOOK_HEARTBEAT_STALE_SECS;
+        !input.hook_alive || input.heartbeat_age_secs >= live_hook_heartbeat_stale_secs;
     let remediable_progress_stale = input.progress_stall_remediable_phase
         && progress_stale
         && !progress_recent
@@ -464,15 +481,29 @@ fn build_stuck_evidence(build: &crate::history::ActiveBuildState, now: Instant) 
         .as_secs();
     let slots_owned = build.slots;
     let has_worker_binding = !build.worker_id.is_empty();
-    score_stuck_evidence(StuckEvidenceInput {
-        hook_alive,
-        progress_stall_remediable_phase: is_progress_stall_remediable_phase(&build.heartbeat_phase),
-        heartbeat_age_secs,
-        progress_age_secs,
-        build_age_secs,
-        slots_owned,
-        has_worker_binding,
-    })
+    score_stuck_evidence_with(
+        StuckEvidenceInput {
+            hook_alive,
+            progress_stall_remediable_phase: is_progress_stall_remediable_phase(
+                &build.heartbeat_phase,
+            ),
+            heartbeat_age_secs,
+            progress_age_secs,
+            build_age_secs,
+            slots_owned,
+            has_worker_binding,
+        },
+        live_hook_heartbeat_stale_secs(&build.heartbeat_phase),
+    )
+}
+
+fn live_hook_heartbeat_stale_secs(phase: &rch_common::BuildHeartbeatPhase) -> u64 {
+    match phase {
+        rch_common::BuildHeartbeatPhase::SyncDown | rch_common::BuildHeartbeatPhase::Finalize => {
+            POST_EXECUTION_LIVE_HOOK_HEARTBEAT_STALE_SECS
+        }
+        _ => LIVE_HOOK_HEARTBEAT_STALE_SECS,
+    }
 }
 
 fn is_process_alive(pid: u32) -> bool {
@@ -1525,6 +1556,41 @@ mod tests {
         assert!(evidence.progress_stale);
         assert!(evidence.remediable_progress_stale);
         assert!(evidence.should_remediate());
+    }
+
+    #[test]
+    fn post_execution_phases_keep_a_silent_live_hook_delivering_a_result() {
+        let _guard = test_guard!();
+        // #112: a live hook publishing a successful build's artifacts in SyncDown
+        // went 120+ s without a heartbeat and was SIGTERMed.
+        let input = |hook_alive, heartbeat_age_secs| StuckEvidenceInput {
+            hook_alive,
+            progress_stall_remediable_phase: true,
+            heartbeat_age_secs,
+            progress_age_secs: heartbeat_age_secs,
+            build_age_secs: heartbeat_age_secs + 300,
+            slots_owned: 2,
+            has_worker_binding: true,
+        };
+        for phase in [BuildHeartbeatPhase::SyncDown, BuildHeartbeatPhase::Finalize] {
+            let limit = live_hook_heartbeat_stale_secs(&phase);
+            assert_eq!(limit, POST_EXECUTION_LIVE_HOOK_HEARTBEAT_STALE_SECS);
+            assert!(!score_stuck_evidence_with(input(true, 600), limit).should_remediate());
+            assert!(score_stuck_evidence_with(input(true, limit + 1), limit).should_remediate());
+            // A dead hook is still reaped on the short limit.
+            assert!(
+                score_stuck_evidence_with(input(false, HEARTBEAT_STALE_SECS + 100), limit)
+                    .should_remediate()
+            );
+        }
+        for phase in [BuildHeartbeatPhase::SyncUp, BuildHeartbeatPhase::Execute] {
+            let limit = live_hook_heartbeat_stale_secs(&phase);
+            assert_eq!(limit, LIVE_HOOK_HEARTBEAT_STALE_SECS);
+            assert!(
+                score_stuck_evidence_with(input(true, LIVE_HOOK_HEARTBEAT_STALE_SECS + 1), limit)
+                    .should_remediate()
+            );
+        }
     }
 
     #[test]
