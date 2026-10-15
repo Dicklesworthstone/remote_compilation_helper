@@ -735,6 +735,10 @@ pub struct ReleaseRequest {
     /// bd-fbtws). The daemon keeps that project off the worker for a while.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub worker_live_checkout_refused: bool,
+    /// Another owner held this worker's source past the admission wait
+    /// (bd-p3kuz). The daemon keeps the project off the worker briefly.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub worker_source_busy: bool,
 }
 
 /// Build execution phase for daemon heartbeat tracking.

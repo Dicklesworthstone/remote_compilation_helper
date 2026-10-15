@@ -1095,6 +1095,7 @@ async fn finish_source_authority_lock_acquisition(
         };
         tokio::try_join!(write_bootstrap, read_ready)
     };
+    let mut timed_out = false;
     let failure = match timeout(wait_timeout, acquisition).await {
         Ok(Ok(((), 0))) => Some(format!(
             "source-authority lock on {} exited before acquisition",
@@ -1117,10 +1118,13 @@ async fn finish_source_authority_lock_acquisition(
             "failed writing source-authority lock bootstrap or reading readiness on {}: {err}",
             guard.worker_id
         )),
-        Err(_) => Some(format!(
-            "timed out waiting {:?} for source-authority locks on {}",
-            wait_timeout, guard.worker_id
-        )),
+        Err(_) => {
+            timed_out = true;
+            Some(format!(
+                "timed out waiting {:?} for source-authority locks on {}",
+                wait_timeout, guard.worker_id
+            ))
+        }
     };
     if let Some(failure) = failure {
         drop(stdin);
@@ -1138,7 +1142,13 @@ async fn finish_source_authority_lock_acquisition(
         } else {
             String::new()
         };
-        let error = anyhow::anyhow!("{failure}; stderr={stderr}");
+        let message = format!("{failure}; stderr={stderr}");
+        // Another owner still holds a lock in this closure (bd-p3kuz).
+        let error = if timed_out {
+            anyhow::Error::new(crate::transfer::SourceAuthorityBusy(message))
+        } else {
+            anyhow::anyhow!(message)
+        };
         return Err(match source_claim_write_fault(&guard.worker_id, &stderr) {
             Some(fault) => error.context(fault),
             None => error,
@@ -3859,7 +3869,11 @@ printf 'legacy identity escaped its fence\n' > "$marker"
             .await;
             let error = match result {
                 Ok(_) => panic!("invalid holder must fail acquisition"),
-                Err(error) => error.to_string(),
+                Err(error) => {
+                    // Only a wait that outlived its deadline is a busy source.
+                    assert!(!crate::transfer::source_authority_busy(&error));
+                    error.to_string()
+                }
             };
             assert!(error.contains(expected), "{error}");
             assert!(error.contains("lock refused"), "{error}");
@@ -3901,7 +3915,11 @@ printf 'legacy identity escaped its fence\n' > "$marker"
         .await;
         let error = match result {
             Ok(_) => panic!("combined write/readiness deadline must not reset"),
-            Err(error) => error.to_string(),
+            Err(error) => {
+                // bd-p3kuz: the release must tell rchd the source was held.
+                assert!(crate::transfer::source_authority_busy(&error));
+                error.to_string()
+            }
         };
         assert!(error.contains("timed out waiting"), "{error}");
         assert!(!Path::new(&format!("/proc/{pid}")).exists());

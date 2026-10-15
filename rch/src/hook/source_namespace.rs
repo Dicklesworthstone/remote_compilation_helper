@@ -45,10 +45,12 @@ pub(super) async fn acquire_source_authority_with_retry(
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
-            anyhow::bail!(
-                "timed out waiting for overlapping source ownership on {}",
-                worker.id
-            );
+            return Err(anyhow::Error::new(crate::transfer::SourceAuthorityBusy(
+                format!(
+                    "timed out waiting for overlapping source ownership on {}",
+                    worker.id
+                ),
+            )));
         }
         match acquire_remote_source_authority_lock(
             worker,
@@ -66,13 +68,25 @@ pub(super) async fn acquire_source_authority_with_retry(
             {
                 let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
                 if remaining.is_zero() {
-                    return Err(error);
+                    return Err(overlapping_owner_outlived_wait(error, worker));
                 }
                 tokio::time::sleep(Duration::from_secs(1).min(remaining)).await;
+            }
+            Err(error) if retryable_source_admission_error(&error) => {
+                return Err(overlapping_owner_outlived_wait(error, worker));
             }
             Err(error) => return Err(error),
         }
     }
+}
+
+/// An overlapping owner that never retired within the admission wait keeps
+/// this worker's source as surely as a held lock (bd-p3kuz).
+fn overlapping_owner_outlived_wait(error: anyhow::Error, worker: &WorkerConfig) -> anyhow::Error {
+    error.context(crate::transfer::SourceAuthorityBusy(format!(
+        "overlapping source owner on {} did not retire within the admission wait",
+        worker.id
+    )))
 }
 
 /// The only durable roots are actual sync destinations and exact auxiliary

@@ -294,9 +294,11 @@ fn remote_release_faults<'a>(
             worker_disk_full: remote_failure_is_disk_full(&result.stderr, result.exit_code),
             worker_disk_roots: &result.disk_roots,
             live_checkout_refused: false,
+            source_busy: false,
         },
         Err(error) if !is_remote_execution_unconfirmed(error) => {
             let live_checkout_refused = crate::transfer::sync_refused_by_live_checkout(error);
+            let source_busy = crate::transfer::source_authority_busy(error);
             match crate::transfer::find_remote_upload_disk_full(error)
                 .filter(|fault| fault.worker_id == worker_id.as_str())
             {
@@ -305,9 +307,11 @@ fn remote_release_faults<'a>(
                     worker_disk_full: true,
                     worker_disk_roots: &fault.roots,
                     live_checkout_refused,
+                    source_busy,
                 },
                 None => daemon_ipc::ReleaseFaults {
                     live_checkout_refused,
+                    source_busy,
                     ..Default::default()
                 },
             }

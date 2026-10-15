@@ -127,6 +127,13 @@ const SOURCE_FENCE_LIMIT: usize = 1024;
 /// declaring the checkout come back; another refusal fences it again.
 pub(crate) const LIVE_CHECKOUT_FENCE_MAX_AGE: Duration = Duration::from_secs(6 * 60 * 60);
 
+/// Another owner held a project's source on a worker past the admission wait
+/// (bd-p3kuz). A stopped client can hold it for hours after rchd retired its
+/// build; without a fence every placement there waits 60 s and is refused.
+/// The fence is short because most holders finish: a worker still held when
+/// it lapses costs one more probe, whose refusal fences it again.
+pub(crate) const SOURCE_BUSY_FENCE_MAX_AGE: Duration = Duration::from_secs(15 * 60);
+
 fn canonical_local_wrapper(wrapper: &str) -> bool {
     wrapper
         .strip_prefix(rch_common::job_identity::LOCAL_WRAPPER_ID_PREFIX)
@@ -363,6 +370,9 @@ pub struct BuildHistory {
     /// (project, worker) pairs whose live checkout refused a source sync, and
     /// when (bd-fbtws). Transient, like `source_fences`.
     live_checkout_fences: Mutex<HashMap<(String, String), Instant>>,
+    /// (project, worker) pairs whose source another owner held past the
+    /// admission wait, and when (bd-p3kuz). Transient.
+    source_busy_fences: Mutex<HashMap<(String, String), Instant>>,
     /// Queued builds (waiting for workers). Membership changes take `active`
     /// first, so queue departure, cancellation and admission share one commit.
     queued: RwLock<VecDeque<QueuedBuildState>>,
@@ -416,6 +426,7 @@ impl BuildHistory {
             disk_budget_completed_at: Mutex::new(HashMap::new()),
             source_fences: Mutex::new(Vec::new()),
             live_checkout_fences: Mutex::new(HashMap::new()),
+            source_busy_fences: Mutex::new(HashMap::new()),
             queued: RwLock::new(VecDeque::new()),
             queue_hold: Mutex::new(None),
             capacity,
@@ -1223,6 +1234,36 @@ impl BuildHistory {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         fences.retain(|_, created| created.elapsed() < LIVE_CHECKOUT_FENCE_MAX_AGE);
+        fences
+            .keys()
+            .filter(|(project, _)| project == project_id)
+            .map(|(_, worker)| worker.clone())
+            .collect()
+    }
+
+    /// Keep `project_id` off `worker_id` while another owner holds its source.
+    pub fn fence_source_busy(&self, project_id: &str, worker_id: &str) {
+        let mut fences = self
+            .source_busy_fences
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        fences.retain(|_, created| created.elapsed() < SOURCE_BUSY_FENCE_MAX_AGE);
+        if fences.len() >= SOURCE_FENCE_LIMIT {
+            return;
+        }
+        fences.insert(
+            (project_id.to_owned(), worker_id.to_owned()),
+            Instant::now(),
+        );
+    }
+
+    /// Workers where another owner recently held `project_id`'s source.
+    pub fn source_busy_fenced_workers(&self, project_id: &str) -> HashSet<String> {
+        let mut fences = self
+            .source_busy_fences
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        fences.retain(|_, created| created.elapsed() < SOURCE_BUSY_FENCE_MAX_AGE);
         fences
             .keys()
             .filter(|(project, _)| project == project_id)
@@ -2167,6 +2208,7 @@ impl BuildHistory {
             disk_budget_completed_at: Mutex::new(HashMap::new()),
             source_fences: Mutex::new(Vec::new()),
             live_checkout_fences: Mutex::new(HashMap::new()),
+            source_busy_fences: Mutex::new(HashMap::new()),
             queued: RwLock::new(queued),
             queue_hold: Mutex::new(None),
             capacity,
@@ -2748,6 +2790,37 @@ mod tests {
         assert_eq!(
             history.live_checkout_fenced_workers("music"),
             HashSet::from(["ts1".to_owned()])
+        );
+    }
+
+    #[test]
+    fn source_busy_fences_are_per_project_refresh_and_expire() {
+        let history = BuildHistory::new(10);
+        assert!(history.source_busy_fenced_workers("mtdt").is_empty());
+        history.fence_source_busy("mtdt", "vmi1293453");
+        history.fence_source_busy("mtdt", "vmi1264463");
+        assert_eq!(
+            history.source_busy_fenced_workers("mtdt"),
+            HashSet::from(["vmi1293453".to_owned(), "vmi1264463".to_owned()])
+        );
+        assert!(history.source_busy_fenced_workers("other").is_empty());
+        // Live-checkout fences are a separate verdict with a longer life.
+        assert!(history.live_checkout_fenced_workers("mtdt").is_empty());
+        let expired = Instant::now() - SOURCE_BUSY_FENCE_MAX_AGE;
+        for worker in ["vmi1293453", "vmi1264463"] {
+            *history
+                .source_busy_fences
+                .lock()
+                .unwrap()
+                .get_mut(&("mtdt".to_owned(), worker.to_owned()))
+                .unwrap() = expired;
+        }
+        // A worker still held when its fence lapses is fenced again by the
+        // next refusal.
+        history.fence_source_busy("mtdt", "vmi1293453");
+        assert_eq!(
+            history.source_busy_fenced_workers("mtdt"),
+            HashSet::from(["vmi1293453".to_owned()])
         );
     }
 

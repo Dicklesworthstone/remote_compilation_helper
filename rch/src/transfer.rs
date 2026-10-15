@@ -872,6 +872,31 @@ impl std::fmt::Display for LiveCheckoutRefused {
 
 impl std::error::Error for LiveCheckoutRefused {}
 
+/// Another owner kept this worker's source authority past the admission wait
+/// (bd-p3kuz): a lock wait timed out or an overlapping durable claim never
+/// retired. The holder is often a client that is alive but stopped (SIGSTOP by
+/// a disk guard), so it can hold the worker's source for hours while rchd,
+/// having retired its build, routes every later build of the project there.
+/// On css (2026-10-15) three such holders produced ~290 refusals in 5 hours.
+#[derive(Debug)]
+pub(crate) struct SourceAuthorityBusy(pub(crate) String);
+
+impl std::fmt::Display for SourceAuthorityBusy {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for SourceAuthorityBusy {}
+
+/// The attempt failed because another owner held this worker's source.
+pub(crate) fn source_authority_busy(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<SourceAuthorityBusy>().is_some()
+        || error
+            .chain()
+            .any(|cause| cause.downcast_ref::<SourceAuthorityBusy>().is_some())
+}
+
 /// The safety check's failure as an error, typed when its stderr carries the
 /// receiver guard's marker line (a quoted marker inside a sentence does not).
 pub(crate) fn destination_check_refusal(message: String, stderr: &str) -> anyhow::Error {

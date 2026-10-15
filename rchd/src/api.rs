@@ -1671,6 +1671,7 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
         let mut worker_disk_full = false;
         let mut worker_disk_roots = Vec::new();
         let mut worker_live_checkout_refused = false;
+        let mut worker_source_busy = false;
 
         for param in query.split('&') {
             if param.is_empty() {
@@ -1693,6 +1694,7 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
                 "worker_live_checkout_refused" => {
                     worker_live_checkout_refused = matches!(value, "1" | "true")
                 }
+                "worker_source_busy" => worker_source_busy = matches!(value, "1" | "true"),
                 "worker_disk_roots" => {
                     worker_disk_roots =
                         serde_json::from_str::<Vec<String>>(&percent_unescape_query_value(value))
@@ -1718,6 +1720,7 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
             worker_disk_full,
             worker_disk_roots,
             worker_live_checkout_refused,
+            worker_source_busy,
         }));
     }
 
@@ -3455,7 +3458,8 @@ const DEAD_WRAPPER_HEARTBEAT_STALE_MS: u64 = 15 * 60 * 1000;
 /// Workers this project must not be placed on: one running build per project
 /// per worker, workers whose failed build's client lease still owns worker
 /// source (their registry would refuse the same root, bd-jqhno), and workers
-/// whose live checkout of the project refused a recent sync (bd-fbtws).
+/// whose live checkout of the project refused a recent sync (bd-fbtws), and
+/// workers where another owner recently kept the project's source (bd-p3kuz).
 fn project_excluded_workers(
     ctx: &DaemonContext,
     project: &str,
@@ -3466,6 +3470,7 @@ fn project_excluded_workers(
             .source_fenced_workers(project, crate::cancellation::client_lease_owns_source),
     );
     excluded.extend(ctx.history.live_checkout_fenced_workers(project));
+    excluded.extend(ctx.history.source_busy_fenced_workers(project));
     excluded
 }
 
@@ -3591,6 +3596,19 @@ async fn handle_release_worker(ctx: &DaemonContext, request: ReleaseRequest) -> 
                 worker_id = %release_worker_id,
                 hours = crate::history::LIVE_CHECKOUT_FENCE_MAX_AGE.as_secs() / 3600,
                 "Keeping project off worker: its live checkout refused the source sync (bd-fbtws)"
+            );
+        }
+        // Another owner, often a stopped client whose build rchd already
+        // retired, holds this project's source there; every placement would
+        // wait out the admission timeout and be refused (bd-p3kuz).
+        if exit_code != 0 && request.worker_source_busy {
+            ctx.history
+                .fence_source_busy(&rec.project_id, release_worker_id.as_str());
+            info!(
+                project_id = %rec.project_id,
+                worker_id = %release_worker_id,
+                minutes = crate::history::SOURCE_BUSY_FENCE_MAX_AGE.as_secs() / 60,
+                "Keeping project off worker: another owner holds its source there (bd-p3kuz)"
             );
         }
         if !cfg!(test) {
@@ -5415,6 +5433,7 @@ mod tests {
             worker_fault: false,
             worker_disk_full: false,
             worker_live_checkout_refused: false,
+            worker_source_busy: false,
             worker_disk_roots: Vec::new(),
         };
         assert!(
@@ -6865,6 +6884,7 @@ mod tests {
                 worker_fault: false,
                 worker_disk_full: false,
                 worker_live_checkout_refused: false,
+                worker_source_busy: false,
                 worker_disk_roots: Vec::new(),
             },
         )
@@ -8796,6 +8816,56 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn source_busy_release_keeps_the_project_off_that_worker() {
+        // bd-p3kuz: (exit, flag, fenced)
+        for (exit, flag, fenced) in [(101, true, true), (0, true, false), (101, false, false)] {
+            let pool = WorkerPool::new();
+            pool.add_worker(make_test_worker("worker1", 8)).await;
+            let ctx = make_test_context(pool.clone());
+            let worker = pool.get(&WorkerId::new("worker1")).await.unwrap();
+            let build = ctx
+                .history
+                .try_start_active_build_with_waiter(
+                    "held-project".into(),
+                    "worker1".into(),
+                    "cargo test".into(),
+                    12345,
+                    Some("owner".into()),
+                    1,
+                    rch_common::BuildLocation::Remote,
+                    None,
+                    crate::disk_pressure::DiskHeadroomAdmission::default(),
+                    Some(worker.endpoint_snapshot().await),
+                )
+                .unwrap()
+                .unwrap();
+            assert!(worker.reserve_slots(1).await);
+            let request = parse_request(&format!(
+                "POST /release-worker?worker=worker1&build_id={}&local_wrapper_id=owner&exit_code={exit}&worker_source_busy={}",
+                build.id,
+                u8::from(flag)
+            ))
+            .unwrap();
+            let ApiRequest::ReleaseWorker(request) = request else {
+                panic!("release request expected")
+            };
+            assert_eq!(request.worker_source_busy, flag);
+            assert!(!request.worker_live_checkout_refused);
+            handle_release_worker(&ctx, request).await.unwrap();
+            assert_eq!(
+                project_excluded_workers(&ctx, "held-project").contains("worker1"),
+                fenced
+            );
+            assert!(
+                ctx.history
+                    .live_checkout_fenced_workers("held-project")
+                    .is_empty()
+            );
+            assert!(project_excluded_workers(&ctx, "other-project").is_empty());
+        }
+    }
+
     fn disk_fault_release_request(build_id: u64) -> ReleaseRequest {
         ReleaseRequest {
             local_wrapper_id: Some("disk-owner".into()),
@@ -8809,6 +8879,7 @@ mod tests {
             worker_fault: true,
             worker_disk_full: true,
             worker_live_checkout_refused: false,
+            worker_source_busy: false,
             worker_disk_roots: vec!["/build-volume/rch".into()],
         }
     }
@@ -9182,6 +9253,7 @@ mod tests {
             worker_fault: false,
             worker_disk_full: false,
             worker_live_checkout_refused: false,
+            worker_source_busy: false,
             worker_disk_roots: Vec::new(),
         };
 
@@ -9234,6 +9306,7 @@ mod tests {
             worker_fault: false,
             worker_disk_full: false,
             worker_live_checkout_refused: false,
+            worker_source_busy: false,
             worker_disk_roots: Vec::new(),
         };
 
@@ -9358,6 +9431,7 @@ mod tests {
                 worker_fault: false,
                 worker_disk_full: false,
                 worker_live_checkout_refused: false,
+                worker_source_busy: false,
                 worker_disk_roots: Vec::new(),
             };
             handle_release_worker(&ctx, release.clone()).await.unwrap();
@@ -9423,6 +9497,7 @@ mod tests {
             worker_fault: false,
             worker_disk_full: false,
             worker_live_checkout_refused: false,
+            worker_source_busy: false,
             worker_disk_roots: Vec::new(),
         };
 
@@ -9463,6 +9538,7 @@ mod tests {
             worker_fault: false,
             worker_disk_full: false,
             worker_live_checkout_refused: false,
+            worker_source_busy: false,
             worker_disk_roots: Vec::new(),
         };
         handle_release_worker(&ctx, release()).await.unwrap();
@@ -9511,6 +9587,7 @@ mod tests {
                         worker_fault: false,
                         worker_disk_full: false,
                         worker_live_checkout_refused: false,
+                        worker_source_busy: false,
                         worker_disk_roots: Vec::new(),
                     },
                 )
@@ -9550,6 +9627,7 @@ mod tests {
                 worker_fault: false,
                 worker_disk_full: false,
                 worker_live_checkout_refused: false,
+                worker_source_busy: false,
                 worker_disk_roots: Vec::new(),
             },
         )
@@ -9598,6 +9676,7 @@ mod tests {
             worker_fault: false,
             worker_disk_full: false,
             worker_live_checkout_refused: false,
+            worker_source_busy: false,
             worker_disk_roots: Vec::new(),
         };
 
@@ -9714,6 +9793,7 @@ mod tests {
             worker_fault: false,
             worker_disk_full: false,
             worker_live_checkout_refused: false,
+            worker_source_busy: false,
             worker_disk_roots: Vec::new(),
         };
 
@@ -10099,6 +10179,7 @@ mod tests {
                 worker_fault: false,
                 worker_disk_full: false,
                 worker_live_checkout_refused: false,
+                worker_source_busy: false,
                 worker_disk_roots: Vec::new(),
             },
         )

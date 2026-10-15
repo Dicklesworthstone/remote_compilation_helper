@@ -746,6 +746,8 @@ pub(crate) struct ReleaseFaults<'a> {
     pub(crate) worker_disk_roots: &'a [String],
     /// The worker's live checkout of the project refused the source sync.
     pub(crate) live_checkout_refused: bool,
+    /// Another owner held this worker's source past the admission wait.
+    pub(crate) source_busy: bool,
 }
 
 /// [`release_worker`] for a completed remote run, also telling the daemon
@@ -813,6 +815,9 @@ pub(crate) async fn release_worker_with_fault(
     }
     if faults.live_checkout_refused {
         request.push_str("&worker_live_checkout_refused=1");
+    }
+    if faults.source_busy {
+        request.push_str("&worker_source_busy=1");
     }
     request.push('\n');
 
@@ -1349,12 +1354,13 @@ mod bounded_ipc_tests {
     async fn release_carries_the_worker_fault_flag_only_when_set() {
         // Review of GH #81: the daemon withholds cache warmth for a failure
         // the hook blamed on the worker, so the flag must reach the wire.
-        for (worker_fault, worker_disk_full, live_checkout_refused) in [
-            (false, false, false),
-            (true, false, false),
-            (false, true, false),
-            (true, true, false),
-            (true, false, true),
+        for (worker_fault, worker_disk_full, live_checkout_refused, source_busy) in [
+            (false, false, false, false),
+            (true, false, false, false),
+            (false, true, false, false),
+            (true, true, false, false),
+            (true, false, true, false),
+            (true, false, false, true),
         ] {
             let root = tempfile::tempdir().unwrap().keep();
             let path = root.join("ipc.sock");
@@ -1386,6 +1392,7 @@ mod bounded_ipc_tests {
                     worker_disk_full,
                     worker_disk_roots: &[],
                     live_checkout_refused,
+                    source_busy,
                 },
             );
             let (result, request) = timeout(Duration::from_secs(2), async {
@@ -1411,6 +1418,11 @@ mod bounded_ipc_tests {
             assert_eq!(
                 request.contains("&worker_live_checkout_refused=1"),
                 live_checkout_refused,
+                "{request}"
+            );
+            assert_eq!(
+                request.contains("&worker_source_busy=1"),
+                source_busy,
                 "{request}"
             );
         }
