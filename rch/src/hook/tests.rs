@@ -1317,6 +1317,15 @@ impl CanonicalTempDir {
     fn path(&self) -> &Path {
         &self.path
     }
+
+    /// A test that points the process cwd here must leave the directory in
+    /// place: a child process another test spawns meanwhile inherits that
+    /// cwd, and once the directory is gone rsync fails with "getcwd(): No
+    /// such file or directory" (the recovery-staging flake in the 2.1.30 and
+    /// 2.1.32 gates).
+    fn keep_after_test(&mut self) {
+        self._dir.disable_cleanup(true);
+    }
 }
 
 /// Create a platform-portable tempdir and a matching `PathTopologyPolicy`
@@ -2112,7 +2121,7 @@ fn test_extract_project_name_honors_custom_policy() {
     if let Some(prev) = prev_cwd {
         let _ = std::env::set_current_dir(prev);
     }
-    let _ = fs::remove_dir_all(&tmp);
+    // Leave `tmp` in place: see `CanonicalTempDir::keep_after_test`.
 
     // The project name must be based on the configured root's subdir,
     // and crucially must not equal "unknown" (the fallback when
@@ -8154,7 +8163,8 @@ async fn test_execute_remote_compilation_syncs_custom_cargo_target_dir_artifacts
     // topology policy. Pin the cwd to a tempdir and build a policy that
     // recognises it so the test runs anywhere (including CI runners with
     // no `/data/projects`).
-    let (temp_dir, policy) = topology_tempdir();
+    let (mut temp_dir, policy) = topology_tempdir();
+    temp_dir.keep_after_test();
     let project_dir = temp_dir.path().join("remote_compilation_helper");
     std::fs::create_dir_all(&project_dir).expect("create project dir");
     let custom_target_dir_path = project_dir.join(".rch-test-target-cache");
@@ -8264,7 +8274,8 @@ async fn test_terminal_source_sync_failure_never_launches_remote_cargo() {
     let _overrides = TestOverridesGuard::set(&socket_path, MockConfig::default(), rsync_config);
     mock::clear_global_invocations();
 
-    let (temp_dir, policy) = topology_tempdir();
+    let (mut temp_dir, policy) = topology_tempdir();
+    temp_dir.keep_after_test();
     let project_dir = temp_dir.path().join("remote_compilation_helper");
     std::fs::create_dir_all(&project_dir).expect("create project dir");
     let prev_cwd = std::env::current_dir().ok();
@@ -8434,7 +8445,8 @@ async fn test_layer0_pack_reaches_the_executed_remote_command() {
     );
     mock::clear_global_invocations();
 
-    let (temp_dir, policy) = topology_tempdir();
+    let (mut temp_dir, policy) = topology_tempdir();
+    temp_dir.keep_after_test();
     let project_dir = temp_dir.path().join("remote_compilation_helper");
     std::fs::create_dir_all(&project_dir).expect("create project dir");
     let prev_cwd = std::env::current_dir().ok();
@@ -8533,7 +8545,8 @@ async fn test_artifact_sync_failure_fails_an_artifact_producing_build() {
     );
     mock::clear_global_invocations();
 
-    let (temp_dir, policy) = topology_tempdir();
+    let (mut temp_dir, policy) = topology_tempdir();
+    temp_dir.keep_after_test();
     let project_dir = temp_dir.path().join("remote_compilation_helper");
     std::fs::create_dir_all(&project_dir).expect("create project dir");
 
