@@ -5,7 +5,7 @@ Compilation Helper): the PreToolUse hook + CLI (`rch`), the local daemon (`rchd`
 worker agent (`rch-wkr`), the RABS build sidecar (`rabs-*`, `rabsd`), and the fleet
 dashboard (`dashboard/`).
 
-Scope window: project inception (`v0.1.0`, 2026-01-25) through `v2.1.31` (2026-10-15).
+Scope window: project inception (`v0.1.0`, 2026-01-25) through `v2.1.32` (2026-10-15).
 
 This document was rebuilt from git history (`git log --no-merges` per tag range, `git show`
 on representative commits), version tags (`git for-each-ref`), GitHub release metadata
@@ -28,6 +28,37 @@ history. They are kept as-is because the descriptions were verified against the 
 but those particular links will 404.
 
 Repository: <https://github.com/Dicklesworthstone/remote_compilation_helper>
+
+## 2.1.32 — 2026-10-15
+
+Linux ARM64 gets a prebuilt release. Publication no longer stalls build heartbeats. A dual-role
+worker's live checkout now fences the project for every refusal path, and tracked inputs under
+`build/`, `dist/` and `coverage/` reach workers.
+
+- **Linux ARM64 release** (#96). `rch-v2.1.32-aarch64-unknown-linux-gnu.tar.gz` is built with
+  cargo-zigbuild against glibc 2.28, signed like the other archives, and picked up by `install.sh` and
+  `rch update` on aarch64 Linux.
+- **Heartbeats during publication** (#112). Build heartbeats run independently of synchronous
+  artifact publication, and publication does less copy I/O without relaxing its recovery checks
+  ([`37d488cb`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/37d488cb9be884944e77a9564e866cbd698b3219), [`f1fd5ec1`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/f1fd5ec1369bf5396e81f5927155d6c6a466d3fe), [`cd4e8631`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/cd4e8631b112ccb9abda7ee6405da9cc8a779ddb)). With 2.1.31's detector change, a slow
+  delivery is no longer mistaken for a stuck build from either side.
+- **Live-checkout fence covers the pre-sync check** (`bd-fbtws`). The destination safety check
+  refuses a declared live checkout before rsync runs, and its refusal never set the release flag. The
+  6 h fence therefore never fired: one dispatcher re-selected the same worker for one project 1,148
+  times in two hours ([`da6f200f`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/da6f200fb14cf716dcdbbc6a23614236effb1bcc)).
+- **Tracked inputs are never build output** (`bd-xmgez`). A `build/`, `dist/` or `coverage/`
+  directory holding any tracked file is synced (a fresh clone has it); untracked generated output
+  stays excluded, and `target/` is readmitted only as a Cargo package. Rust modules named `build`
+  and `coverage`, npm fixtures under `dist/`, and `include_str!` data under `coverage/` were being
+  dropped ([`e58921fd`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/e58921fd6bb1a42eacd1397eae47ea70c2a96ea2)). Windows archives keep the same exceptions ([`962f31ff`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/962f31ff33a54dc745cfd7281cd9933dbfe74421)).
+- **macOS worker process identity** (#115). Remote process identity uses native Darwin birth
+  identities, accounts for kernel tasks in the cleanup census, and bounds its probes without GNU
+  coreutils ([`e123a60b`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/e123a60b1babe44ccb13850bdbac848d7c8f4206), [`d18ae6d1`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/d18ae6d1ae2db232332aa5be010ac84716f818f2), [`fed9e8a5`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/fed9e8a5cd97faea1ac655b5d9d18fe81cf53981), [`f0f6ba31`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/f0f6ba311cb4633282a73dcd4bc6c55a4c30474a)). Darwin workers
+  still need the `/data`/`/dp` layout fix (`bd-226ed`).
+- Windows source selection is unified with bounded tar transport, and Windows source namespace
+  collisions are rejected before archiving ([`5413f95b`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/5413f95b50696e69b7de157a1ae4a7bb5dedaf5d), [`1bc937c9`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/1bc937c9e1f21cefa5f88645d573c4db27559e3e)).
+- Opt-in: `RCH_RABS_WORKER_CACHE=1` prepares the RABS worker-local cache before running the
+  unchanged Cargo command. It is off by default ([`ad3107f5`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/ad3107f5c4fb231c4d35e512271518b719ea5c4b)).
 
 ## 2.1.31 — 2026-10-15
 
