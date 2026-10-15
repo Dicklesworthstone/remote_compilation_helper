@@ -14,6 +14,10 @@ on:
       - 'rabs-wrap/**'
       - 'rabs-wkr/**'
       - 'rabs-asupersync/**'
+      - 'scripts/cargo-rabs'
+      - 'scripts/install-rabs'
+      - 'tests/test_install_rabs.py'
+      - '.github/workflows/release.yml'
       - '.github/workflows/rabs-binaries.yml'
   pull_request:
   workflow_dispatch:
@@ -30,6 +34,19 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  installation:
+    name: complete RABS installation (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Native filesystem, process, archive and upgrade regressions
+        run: python3 -m unittest discover -s tests -p test_install_rabs.py -v
+
   # Exercise the accepted-hit delivery frontier independently of the slower
   # release/overhead lane. Local agent sandboxes may prohibit Unix sockets;
   # these tests must still run unchanged on a native runner.
