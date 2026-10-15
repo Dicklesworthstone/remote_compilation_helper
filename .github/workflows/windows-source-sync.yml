@@ -12,6 +12,11 @@ on:
       - '.github/patches/windows-source-parent.patch'
       - '.github/workflows/windows-source-sync.yml'
   workflow_dispatch:
+  # An owner can invoke the same checked integration after an API-only push
+  # by commenting /rch-verify-windows-source-sync on issue #109. No comment
+  # text is evaluated as code, a ref, a path, or a shell argument.
+  issue_comment:
+    types: [created]
 
 permissions:
   contents: read
@@ -22,6 +27,15 @@ concurrency:
 
 jobs:
   validate:
+    if: >-
+      github.repository == 'Dicklesworthstone/remote_compilation_helper' &&
+      github.ref == 'refs/heads/main' &&
+      (github.event_name != 'issue_comment' ||
+       (github.event.issue.number == 109 &&
+        !github.event.issue.pull_request &&
+        github.event.comment.user.login == 'Dicklesworthstone' &&
+        github.event.comment.author_association == 'OWNER' &&
+        github.event.comment.body == '/rch-verify-windows-source-sync'))
     runs-on: ubuntu-latest
     timeout-minutes: 45
     outputs:
