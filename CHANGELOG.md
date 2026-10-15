@@ -5,7 +5,7 @@ Compilation Helper): the PreToolUse hook + CLI (`rch`), the local daemon (`rchd`
 worker agent (`rch-wkr`), the RABS build sidecar (`rabs-*`, `rabsd`), and the fleet
 dashboard (`dashboard/`).
 
-Scope window: project inception (`v0.1.0`, 2026-01-25) through `v2.1.29` (2026-10-15).
+Scope window: project inception (`v0.1.0`, 2026-01-25) through `v2.1.30` (2026-10-15).
 
 This document was rebuilt from git history (`git log --no-merges` per tag range, `git show`
 on representative commits), version tags (`git for-each-ref`), GitHub release metadata
@@ -28,6 +28,22 @@ history. They are kept as-is because the descriptions were verified against the 
 but those particular links will 404.
 
 Repository: <https://github.com/Dicklesworthstone/remote_compilation_helper>
+
+## 2.1.30 — 2026-10-15
+
+Agent session state no longer rides along with source syncs, and queue polls no longer trip the
+fleet-degraded alarm.
+
+- **Agent state stays off workers** (#109). `.ntm/` and `.beads-recovery/` directories are excluded
+  from default rsync sources at every depth (`.beads/` already covered `.beads/.br_recovery/`). Up
+  to 15 GB of such state had accumulated in single worker mirrors. Files with those names, and
+  explicit exclusion lists, behave as before; copies already on workers are left in place
+  ([`952a986d`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/952a986da5efcd75dd9a7dad2db9b851573d41ba)).
+- **Queue polls are not local fallbacks.** Every 1 s queue poll counted as "got NO worker", so the
+  "RCH FLEET DEGRADED … falling back to LOCAL" alarm fired whenever a few jobs queued (8 times in
+  48 h on one dispatcher) and `rch_local_fallback_reason_total{reason="all_workers_busy"}` climbed.
+  Busy rounds now record only the reliability decision; a queue timeout counts as
+  `queue_timeout` ([`46c58b8b`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/46c58b8b7b469617d80712e482dbaa414b97db99)).
 
 ## 2.1.29 — 2026-10-15
 
