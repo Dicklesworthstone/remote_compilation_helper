@@ -250,3 +250,111 @@ fn production_capture_drop_recovers_old_custody_after_actual_cas_reopen() {
     let snapshot = store.gc_snapshot(900).unwrap();
     assert!(snapshot.reachable_from_pins.contains(&digest_key(&object.0)));
 }
+
+#[test]
+fn every_forged_witness_field_retains_its_original_pin() {
+    for field in 0..17 {
+        let (mut store, attempt) = fixture();
+        let object = root(1);
+        let owner = capture_owner(&attempt);
+        let id = pin_id(&owner, &object);
+        let mut witness = CaptureEvidence::new(&attempt, &object);
+        match field {
+            0 => witness.version += 1,
+            1 => witness.cluster.push_str("-foreign"),
+            2 => witness.credential_generation += 1,
+            3 => witness.term += 1,
+            4 => witness.coordinator_incarnation += 1,
+            5 => witness.action_domain.push_str("-different"),
+            6 => witness.action_bytes[0] ^= 1,
+            7 => witness.generation += 1,
+            8 => witness.ordinal += 1,
+            9 => witness.attempt += 1,
+            10 => witness.lease += 1,
+            11 => witness.renewal += 1,
+            12 => witness.worker.push_str("-different"),
+            13 => witness.worker_boot += 1,
+            14 => witness.worker_incarnation += 1,
+            15 => witness.root_domain.push_str("-different"),
+            16 => witness.root_bytes[0] ^= 1,
+            _ => unreachable!(),
+        }
+        // Construct a contradictory witness through the actual metadata API;
+        // no mutable SQL bypass is used. The original identity remains pinned.
+        let encoded = serde_json::to_string(&witness).unwrap();
+        store
+            .create_pin(
+                id, &object, &owner, CAPTURE_PIN_CLASS, None,
+                Some(&encoded), true, "forged witness control",
+            )
+            .unwrap();
+        let valid = capture(&mut store, &attempt, &root(2));
+        let next = next_boot(&mut store, &attempt.coordinator, true);
+        let page = reconcile_page(&mut store, &next).unwrap();
+        assert_eq!(page.scanned, 2, "mutation {field}");
+        assert_eq!(page.released, 1, "mutation {field}");
+        assert!(!released(&mut store, id), "mutation {field}");
+        assert!(released(&mut store, valid), "valid control {field}");
+    }
+}
+
+#[test]
+fn full_width_witnesses_recover_through_both_metadata_backends() {
+    use rabs_cas::metadata_store::FsqliteEngine;
+
+    let dir = crate::test_util::private_tempdir();
+    let stores: [Box<dyn RabsMetadataStore>; 2] = [
+        Box::new(SqlMetadataStore::open(RusqliteEngine::open_in_memory().unwrap()).unwrap()),
+        Box::new(SqlMetadataStore::open(
+            FsqliteEngine::open(&dir.path().join("metadata.db")).unwrap(),
+        ).unwrap()),
+    ];
+    for mut store in stores {
+        let mut attempt = fixture_attempt(u128::MAX - 2);
+        attempt.coordinator.incarnation_id.0 = u128::MAX - 10;
+        attempt.action_generation.generation_id.0 = u128::MAX - 3;
+        attempt.action_generation.per_key_ordinal = u64::MAX;
+        attempt.action_generation.created_under_authority_digest =
+            authority_digest(&attempt.coordinator);
+        attempt.execution_lease_id.0 = u128::MAX - 1;
+        attempt.worker_boot_generation.0 = u64::MAX;
+        attempt.worker_incarnation_id.0 = u128::MAX;
+        seed(&mut *store, &attempt);
+        let id = capture(&mut *store, &attempt, &root(7));
+        let next = next_boot(&mut *store, &attempt.coordinator, true);
+        assert_eq!(reconcile_page(&mut *store, &next).unwrap().released, 1);
+        assert!(released(&mut *store, id));
+        assert_eq!(reconcile_page(&mut *store, &next).unwrap().scanned, 0);
+    }
+}
+
+#[test]
+fn durable_cursor_resumes_after_the_metadata_connection_is_closed_and_reopened() {
+    let dir = crate::test_util::private_tempdir();
+    let path = dir.path().join("metadata.db");
+    let next;
+    let ids;
+    {
+        let mut store = SqlMetadataStore::open(RusqliteEngine::open(&path).unwrap()).unwrap();
+        let attempt = fixture_attempt(7);
+        seed(&mut store, &attempt);
+        ids = (0..(PAGE_SIZE + 3) as u64)
+            .map(|index| capture(&mut store, &attempt, &root(index)))
+            .collect::<Vec<_>>();
+        next = next_boot(&mut store, &attempt.coordinator, true);
+        let page = reconcile_page(&mut store, &next).unwrap();
+        assert_eq!(page.released, PAGE_SIZE);
+        assert!(!page.complete);
+    }
+    let mut store = SqlMetadataStore::open(RusqliteEngine::open(&path).unwrap()).unwrap();
+    // The recovery entry point re-declares the authority domain itself; no
+    // unrelated write or fixture interning is needed to read the saved cursor.
+    let page = reconcile_page(&mut store, &next).unwrap();
+    assert_eq!(page.scanned, 3);
+    assert_eq!(page.released, 3);
+    assert!(page.complete);
+    assert!(ids.into_iter().all(|id| released(&mut store, id)));
+    let before = store.differential_snapshot().unwrap();
+    assert_eq!(reconcile_page(&mut store, &next).unwrap().scanned, 0);
+    assert_eq!(store.differential_snapshot().unwrap(), before);
+}

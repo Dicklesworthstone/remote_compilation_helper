@@ -23,6 +23,7 @@ on:
       - 'tests/test_install_rabs*.py'
       - 'tests/test_rabs_sprt_evidence.py'
       - 'tests/test_rabs_worker_cache.py'
+      - 'tests/test_rabs_capture_recovery.py'
       - '.github/workflows/release.yml'
       - '.github/workflows/rabs-binaries.yml'
   pull_request:
@@ -58,6 +59,8 @@ jobs:
         run: |
           python3 scripts/tests/test_cargo_rabs.py -v
           python3 tests/test_rabs_worker_cache.py -v
+      - name: Capture recovery SQL and interruption model (not a Rust execution proof)
+        run: python3 tests/test_rabs_capture_recovery.py -v
 
   # Exercise the accepted-hit delivery frontier independently of the slower
   # release/overhead lane. Local agent sandboxes may prohibit Unix sockets;
@@ -109,6 +112,8 @@ jobs:
         run: |
           cargo test --release -p rabsd --lib janitor --locked
           cargo test --release -p rabsd --test janitor_gc_live --test janitor_reclaim_live --locked
+      - name: Compiler capture custody and durable restart recovery
+        run: cargo test --release -p rabsd --lib capture_pins --locked
       - name: Cargo layout projection keys and real split-directory builds
         run: |
           cargo test --release -p rabsd cargo_placement_reuse --locked
