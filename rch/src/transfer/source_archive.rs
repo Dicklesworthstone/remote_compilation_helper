@@ -9,6 +9,8 @@ use std::process::Stdio;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
+mod windows_paths;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Kind {
     File,
@@ -126,9 +128,25 @@ pub(super) fn regular_paths(members: Vec<Member>) -> Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
+/// Explicit regular-file overlays need the same Windows namespace admission
+/// as ordinary archives, without changing the POSIX receipt path contract.
+pub(super) fn validate_windows_paths(paths: &[PathBuf]) -> Result<()> {
+    let members = paths
+        .iter()
+        .map(|path| Member {
+            path: path.clone(),
+            kind: Kind::File,
+        })
+        .collect::<Vec<_>>();
+    windows_paths::validate(&members)
+}
+
 /// NUL-delimited names are data, never tar options, globs or recursive roots.
 /// Keep the tempfile alive until the producer exits or is cancelled.
 pub(super) async fn manifest(members: &[Member]) -> Result<(tempfile::NamedTempFile, u32)> {
+    // Reject the whole selected namespace before creating a manifest or
+    // contacting the receiver. A per-file check cannot detect parent aliases.
+    windows_paths::validate(members)?;
     let manifest = tempfile::Builder::new()
         .prefix("rch-source-members-")
         .tempfile()
@@ -137,15 +155,6 @@ pub(super) async fn manifest(members: &[Member]) -> Result<(tempfile::NamedTempF
     let mut count = 0_u32;
     for member in members {
         let path = member.path.to_str().context("non-UTF-8 archive member")?;
-        // Windows treats both separators and drive/stream prefixes specially.
-        // Refuse rather than archiving a different pathname from the selection.
-        anyhow::ensure!(
-            !path.contains(['\\', ':'])
-                && !path.is_empty()
-                && !path.chars().any(char::is_control)
-                && path.split('/').all(|part| !matches!(part, "" | "." | "..")),
-            "source filename cannot be represented on a Windows worker: {path:?}"
-        );
         writer.write_all(b"./").await?;
         writer.write_all(path.as_bytes()).await?;
         writer.write_all(&[0]).await?;

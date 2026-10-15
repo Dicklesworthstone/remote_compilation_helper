@@ -43,6 +43,8 @@ jobs:
           else
             # Refuse a different parent implementation rather than guessing
             # around concurrent source changes or replacing the whole module.
+            # Reviewed through e58921fd: preserve tracked build/dist/coverage
+            # inputs as well as the earlier Cargo-package exceptions.
             test "$(git hash-object rch/src/transfer.rs)" = 51a56fcebd297410aa8f37ef5c6945a3d690ef46
             git apply --check "$patch"
             git apply "$patch"
@@ -64,9 +66,9 @@ jobs:
         run: |
           set -euo pipefail
           if [ '${{ steps.integrate.outputs.needs_integration }}' = true ]; then
-            rustfmt --edition 2024 --config skip_children=true rch/src/transfer/source_archive.rs rch/src/transfer/source_archive/tests.rs
+            rustfmt --edition 2024 --config skip_children=true rch/src/transfer/source_archive.rs rch/src/transfer/source_archive/tests.rs rch/src/transfer/source_archive/windows_paths.rs
           else
-            rustfmt --edition 2024 --config skip_children=true --check rch/src/transfer/source_archive.rs rch/src/transfer/source_archive/tests.rs
+            rustfmt --edition 2024 --config skip_children=true --check rch/src/transfer/source_archive.rs rch/src/transfer/source_archive/tests.rs rch/src/transfer/source_archive/windows_paths.rs
           fi
           rustfmt --edition 2024 --config skip_children=true --check rch/src/transfer.rs
           git diff --check
@@ -74,7 +76,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo test --locked -p rch --bin rch source_archive::tests -- --test-threads=1
+          cargo test --locked -p rch --bin rch source_archive:: -- --test-threads=1
           cargo test --locked -p rch --bin rch source_content -- --test-threads=1
           cargo test --locked -p rch --bin rch selected_source_archive -- --test-threads=1
           cargo test --locked -p rch-common --test source_sync_excludes -- --test-threads=1
@@ -90,7 +92,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/source-sync-verified"
-          git diff --binary -- rch/src/transfer.rs rch/src/transfer/source_archive.rs rch/src/transfer/source_archive/tests.rs > "$RUNNER_TEMP/source-sync-verified/verified.patch"
+          git diff --binary -- rch/src/transfer.rs rch/src/transfer/source_archive.rs rch/src/transfer/source_archive/tests.rs rch/src/transfer/source_archive/windows_paths.rs > "$RUNNER_TEMP/source-sync-verified/verified.patch"
           digest=$(sha256sum "$RUNNER_TEMP/source-sync-verified/verified.patch" | cut -d' ' -f1)
           echo "patch_sha256=$digest" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@v4
@@ -136,6 +138,7 @@ jobs:
               b'rch/src/transfer.rs',
               b'rch/src/transfer/source_archive.rs',
               b'rch/src/transfer/source_archive/tests.rs',
+              b'rch/src/transfer/source_archive/windows_paths.rs',
           }
           paths = set(subprocess.check_output(['git', 'diff', '--cached', '--name-only', '-z']).split(b'\0')) - {b''}
           assert b'rch/src/transfer.rs' in paths and paths <= allowed, paths

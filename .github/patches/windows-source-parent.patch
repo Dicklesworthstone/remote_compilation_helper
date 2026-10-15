@@ -92,7 +92,17 @@ diff --git a/rch/src/transfer.rs b/rch/src/transfer.rs
 -        Ok(paths)
 +        source_archive::parse_members(&output.stdout)
      }
-@@ -5332,6 +5305,6 @@
+@@ -5292,6 +5265,9 @@
+     async fn selected_source_archive(&self) -> Result<(tempfile::NamedTempFile, u32)> {
+         let paths = self.enumerate_source_upload_files().await?;
++        if self.worker_platform.is_windows() {
++            source_archive::validate_windows_paths(&paths)?;
++        }
+         let files_transferred = u32::try_from(paths.len())
+             .context("selected source archive exceeds file-count limit")?;
+         let project_root = self.project_root.clone();
+         tokio::task::spawn_blocking(move || {
+@@ -5332,6 +5308,6 @@
 -    /// Windows source sync: create the remote dir, then `tar czf -` the project
 -    /// locally (honouring excludes) and pipe it into `tar xzf -` on the worker.
 -    /// Native `tar` on both ends — no rsync, no `C:`-colon path ambiguity.
@@ -102,7 +112,7 @@ diff --git a/rch/src/transfer.rs b/rch/src/transfer.rs
      async fn sync_to_remote_windows(
          &self,
          worker: &WorkerConfig,
-@@ -5358,72 +5331,26 @@
+@@ -5358,72 +5334,26 @@
              });
          }
  
