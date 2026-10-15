@@ -24,6 +24,7 @@ on:
       - 'tests/test_rabs_sprt_evidence.py'
       - 'tests/test_rabs_worker_cache.py'
       - 'tests/test_rabs_capture_recovery.py'
+      - 'tests/test_rabs_evidence_queries.py'
       - '.github/workflows/release.yml'
       - '.github/workflows/rabs-binaries.yml'
   pull_request:
@@ -61,6 +62,8 @@ jobs:
           python3 tests/test_rabs_worker_cache.py -v
       - name: Capture recovery SQL and interruption model (not a Rust execution proof)
         run: python3 tests/test_rabs_capture_recovery.py -v
+      - name: Indexed evidence queries (native SQLite, not Rust execution)
+        run: python3 tests/test_rabs_evidence_queries.py -v
 
   # Exercise the accepted-hit delivery frontier independently of the slower
   # release/overhead lane. Local agent sandboxes may prohibit Unix sockets;
@@ -110,6 +113,7 @@ jobs:
       - name: Durable replay allowance and real compiler verification
         run: |
           cargo test --release -p rabs-cas --lib serving_sample_gate --locked
+          cargo test --release -p rabs-cas --lib read_indexes --locked
           cargo test --release -p rabsd --test live_replay --test live_class_safety --test live_sprt_budget --locked
           cargo test --release -p rabsd --lib edge::server --locked
           cargo test --release -p rabs-wrap --test live_dependency_e2e --locked

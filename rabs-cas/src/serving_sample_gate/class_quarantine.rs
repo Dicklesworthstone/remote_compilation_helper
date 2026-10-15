@@ -30,7 +30,8 @@ WHERE kind = ?1 AND subject = ?2 AND seq = 0
 // receipt primary key resolves membership only AFTER finding negative evidence.
 // CROSS JOIN keeps SQLite from driving the scan from every healthy class member
 // and probing evidence tables once per key. No cached decision can hide a new
-// incident; positive sample/state scans remain linear until indexed separately.
+// incident. The live mount installs secondary outcome/disposition indexes so
+// healthy history is skipped. Queries remain correct without those indexes.
 const INCIDENT_SQL: &str = r#"
 SELECT d.action_key FROM divergence_incidents AS d
 CROSS JOIN decision_receipts AS c
@@ -40,10 +41,12 @@ LIMIT 1
 const ADVERSE_SQL: &str = r#"
 SELECT v.action_key FROM verification_samples AS v
 CROSS JOIN decision_receipts AS c
-WHERE v.passed != 1
+WHERE (v.passed < 1 OR v.passed > 1)
 AND c.kind = ?1 AND c.subject = v.action_key AND c.seq = 0 AND c.decision = ?2
 LIMIT 1
 "#;
+// Two ranges preserve != 1, including malformed non-Boolean integer values.
+// Unlike !=, this spelling permits outcome-index seeks over healthy history.
 const QUARANTINE_SQL: &str = r#"
 SELECT q.subject FROM quarantines AS q
 CROSS JOIN decision_receipts AS c
@@ -252,6 +255,22 @@ mod tests {
     fn class_demotion_is_enforced_by_the_existing_sample_gate() {
         let mut store = SqlMetadataStore::open(RusqliteEngine::open_in_memory().unwrap()).unwrap();
         interrupted_and_completed_scenarios(&mut store);
+    }
+
+    #[test]
+    fn outcome_ranges_keep_non_boolean_flags_adverse() {
+        use crate::metadata_store::SqlEngine;
+        let mut store = SqlMetadataStore::open(RusqliteEngine::open_in_memory().unwrap()).unwrap();
+        healthy(&mut store, 1, 10);
+        let culprit = healthy(&mut store, 2, 11);
+        store.record_verification_sample(&action(2), 999_999, false, 99).unwrap();
+        for flag in [-1, 0, 2, i64::MAX] {
+            store.engine_mut().execute(
+                "UPDATE verification_samples SET passed = ?1 WHERE action_key = ?2 AND seq = 99",
+                &[SqlValue::Int(flag), SqlValue::Text(culprit.clone())],
+            ).unwrap();
+            assert_hold(&mut store, 1, &culprit, "adverse-verification");
+        }
     }
 
     #[test]

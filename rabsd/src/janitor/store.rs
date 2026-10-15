@@ -285,6 +285,10 @@ pub fn mount_and_reconcile(cas_root: &Path) -> Result<LiveCas, String> {
     let engine = RusqliteEngine::open(&cas_root.join("meta.sqlite"))
         .map_err(|e| format!("metadata engine: {e:?}"))?;
     let mut store = SqlMetadataStore::open(engine).map_err(|e| format!("metadata store: {e:?}"))?;
+    // Secondary read indexes are installed once under exclusive mount ownership,
+    // never lazily on a compiler's consultation or while a writer is admitted.
+    rabs_cas::read_indexes::prepare_serving_indexes(&mut store)
+        .map_err(|e| format!("metadata query indexes: {e:?}"))?;
 
     let filesystem = OsFilesystem::new(vec![layout.root().to_path_buf()]);
     let report =
