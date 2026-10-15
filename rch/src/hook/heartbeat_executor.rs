@@ -29,9 +29,10 @@ pub(super) fn runtime() -> &'static Runtime {
 #[cfg(test)]
 mod tests {
     use super::super::*;
+    use crate::hook::transfer_orchestration::recovery::RecoverySession;
     use std::io::{Read, Write};
     use std::os::unix::net::UnixListener;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::mpsc;
     use std::thread;
     use std::time::Instant;
@@ -43,6 +44,7 @@ mod tests {
         root: PathBuf,
         socket: PathBuf,
         received: mpsc::Receiver<BuildHeartbeatRequest>,
+        publication_beats: Arc<AtomicUsize>,
         stop: Arc<AtomicBool>,
         worker: Option<thread::JoinHandle<anyhow::Result<()>>>,
     }
@@ -60,6 +62,8 @@ mod tests {
             let stop = Arc::new(AtomicBool::new(false));
             let stopped = Arc::clone(&stop);
             let (sender, received) = mpsc::channel();
+            let publication_beats = Arc::new(AtomicUsize::new(0));
+            let observed_publication = Arc::clone(&publication_beats);
             let worker = thread::spawn(move || -> anyhow::Result<()> {
                 let deadline = Instant::now() + Duration::from_secs(30);
                 while !stopped.load(Ordering::Acquire) {
@@ -97,10 +101,13 @@ mod tests {
                     let reply = format!(
                         "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n\r\n{response}\n"
                     );
-                    if stream.write_all(reply.as_bytes()).is_ok()
-                        && sender.send(heartbeat).is_err()
-                    {
-                        break;
+                    if stream.write_all(reply.as_bytes()).is_ok() {
+                        if heartbeat.phase == BuildHeartbeatPhase::SyncDown {
+                            observed_publication.fetch_add(1, Ordering::AcqRel);
+                        }
+                        if sender.send(heartbeat).is_err() {
+                            break;
+                        }
                     }
                 }
                 Ok(())
@@ -109,6 +116,7 @@ mod tests {
                 root,
                 socket,
                 received,
+                publication_beats,
                 stop,
                 worker: Some(worker),
             }
@@ -292,5 +300,234 @@ mod tests {
         drop(second);
         daemon.finish();
         outcome.expect("shared service starved or mixed concurrent build heartbeats");
+    }
+
+    /// Use the production preparation, staging and publication APIs. The
+    /// successful remote exit is an explicit fixture observation; no remote
+    /// command, replacement copy implementation or ambient daemon is involved.
+    struct Delivery {
+        session: RecoverySession,
+        writer: DurableLeaseWriter,
+        local: PathBuf,
+        stage: PathBuf,
+        count: usize,
+    }
+
+    impl Delivery {
+        fn prepare(root: &Path, count: usize) -> Self {
+            let local = root.join("caller");
+            std::fs::create_dir_all(&local).unwrap();
+            std::fs::write(local.join("source-sentinel"), b"not an artifact").unwrap();
+            let worker = WorkerConfig {
+                id: WorkerId::new("independent-worker"),
+                host: "unreachable.invalid".into(),
+                user: "worker".into(),
+                identity_file: "/unused/publication-key".into(),
+                total_slots: 1,
+                priority: 100,
+                tags: Vec::new(),
+                tools: Vec::new(),
+            };
+            let writer = DurableLeaseWriter {
+                path: root.join("lease.json"),
+                recovery_ownership: None,
+                lease: Arc::new(Mutex::new(DurableJobLease::new(
+                    JobIdentity::new_local(),
+                    std::process::id(),
+                    None,
+                    None,
+                    0,
+                    false,
+                    false,
+                    "real-publication-liveness-fixture".into(),
+                ))),
+            };
+            writer.admit(917, &worker.id).unwrap();
+            let identity = uuid::Uuid::new_v4().simple().to_string();
+            let transfer = TransferConfig {
+                retrieval_staging_dir: Some(root.join("staging")),
+                ..TransferConfig::default()
+            };
+            let sources = vec!["/data/projects/heartbeat-publication-fixture".into()];
+            RecoverySession::begin(
+                &writer,
+                &worker,
+                sources.clone(),
+                None,
+                None,
+                None,
+                transfer.clone(),
+                local.clone(),
+                identity.clone(),
+            )
+            .unwrap();
+            let pipeline = crate::transfer::TransferPipeline::new(
+                local.clone(),
+                "heartbeat-publication".into(),
+                identity.clone(),
+                transfer.clone(),
+            );
+            let mut session = RecoverySession::prepare(
+                &writer,
+                &worker,
+                &pipeline,
+                sources,
+                None,
+                None,
+                None,
+                transfer,
+                local.clone(),
+                None,
+                None,
+                "make",
+                &[PathBuf::from("doc")],
+                identity.clone(),
+            )
+            .unwrap();
+            session.starting_execution().unwrap();
+            session.completed(0).unwrap();
+            writer.heartbeat("sync_down").unwrap();
+            session.staging_pipeline("result:doc", &pipeline).unwrap();
+            let recovery = writer.snapshot().recovery.unwrap();
+            let index = recovery["phases"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .position(|phase| phase["name"] == "result:doc")
+                .unwrap();
+            // This is the configured, identity-bound stage layout. Requiring
+            // its existence checks that the production API selected it too.
+            let stage = root.join("staging").join(identity).join(index.to_string());
+            assert!(stage.is_dir());
+            std::fs::create_dir_all(stage.join("doc")).unwrap();
+            for index in 0..count {
+                std::fs::write(
+                    stage.join(format!("doc/fn.{index:05}.html")),
+                    Self::bytes(index),
+                )
+                .unwrap();
+            }
+            Self {
+                session,
+                writer,
+                local,
+                stage,
+                count,
+            }
+        }
+
+        fn bytes(index: usize) -> String {
+            format!("<html>documentation for function {index}</html>\n")
+        }
+
+        fn assert_delivered(&self) {
+            let disk: DurableJobLease =
+                serde_json::from_slice(&std::fs::read(&self.writer.path).unwrap()).unwrap();
+            let durable = disk.recovery.unwrap();
+            let phase = durable["phases"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|phase| phase["name"] == "result:doc")
+                .unwrap();
+            assert_eq!(phase["complete"], true);
+            assert!(phase["pending"].is_null());
+            assert_eq!(phase["published"].as_object().unwrap().len(), self.count);
+            assert_eq!(durable["exit_code"], 0);
+            assert_eq!(durable["returned"], 0);
+            assert_eq!(self.writer.snapshot().recovery.as_ref(), Some(&durable));
+            for index in 0..self.count {
+                assert_eq!(
+                    std::fs::read_to_string(self.local.join(format!("doc/fn.{index:05}.html")))
+                        .unwrap(),
+                    Self::bytes(index),
+                );
+            }
+            assert_eq!(
+                std::fs::read(self.local.join("source-sentinel")).unwrap(),
+                b"not an artifact",
+            );
+            // Successful delivery is not permission to pretend the outstanding
+            // source ownership was retired or the daemon acknowledged it.
+            assert!(!disk.terminal_acknowledged);
+            assert!(self.writer.acknowledge_terminal().is_err());
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn real_publication_completes_while_journal_contention_and_heartbeats_overlap() {
+        let _guard = rch_common::test_guard!();
+        let daemon = Daemon::start();
+        let mut delivery = Delivery::prepare(&daemon.root, 96);
+        let heartbeat = daemon.heartbeat(917, &delivery.writer.wrapper_id());
+        heartbeat.update_phase(BuildHeartbeatPhase::SyncDown, Some("real-publication".into()));
+        let lease = Arc::clone(&delivery.writer.lease);
+        let beats = Arc::clone(&daemon.publication_beats);
+        let (ready, locked) = oneshot::channel();
+        let (arm, armed) = mpsc::channel::<usize>();
+        let holder = thread::spawn(move || {
+            let _held = lease.lock().unwrap();
+            let _ = ready.send(());
+            let initial = armed.recv_timeout(Duration::from_secs(3)).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while beats.load(Ordering::Acquire).saturating_sub(initial) < 4
+                && Instant::now() < deadline
+            {
+                thread::sleep(Duration::from_millis(1));
+            }
+            beats.load(Ordering::Acquire).saturating_sub(initial)
+        });
+        locked.await.unwrap();
+        arm.send(daemon.publication_beats.load(Ordering::Acquire))
+            .unwrap();
+        // On the old implementation this awaits a function that blocks the
+        // sole caller thread on the real journal mutex. The holder's independent
+        // watchdog releases it with zero heartbeats, so the test fails, not hangs.
+        let publication = delivery.session.publish("result:doc").await;
+        let during_contention = holder.join().unwrap();
+        drop(heartbeat);
+        daemon.finish();
+        publication.unwrap();
+        assert!(
+            during_contention >= 4,
+            "real publication starved wire heartbeats"
+        );
+        delivery.session.returned(0).unwrap();
+        delivery.assert_delivered();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn missing_stage_retains_journal_and_same_session_retry_delivers_outputs() {
+        let _guard = rch_common::test_guard!();
+        let root = tempfile::Builder::new()
+            .disable_cleanup(true)
+            .tempdir()
+            .unwrap();
+        let mut delivery = Delivery::prepare(root.path(), 24);
+        let retained = delivery.stage.with_extension("temporarily-unavailable");
+        std::fs::rename(&delivery.stage, &retained).unwrap();
+        let before = std::fs::read(&delivery.writer.path).unwrap();
+        assert!(delivery.session.publish("result:doc").await.is_err());
+        assert_eq!(std::fs::read(&delivery.writer.path).unwrap(), before);
+        assert!(!delivery.local.join("doc").exists());
+        assert!(delivery.writer.acknowledge_terminal().is_err());
+        std::fs::rename(&retained, &delivery.stage).unwrap();
+        delivery.session.publish("result:doc").await.unwrap();
+        delivery.session.returned(0).unwrap();
+        delivery.assert_delivered();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "2048 real fsync-backed publications; run explicitly for large-artifact qualification"]
+    async fn large_rustdoc_set_is_durably_delivered() {
+        let _guard = rch_common::test_guard!();
+        let root = tempfile::Builder::new()
+            .disable_cleanup(true)
+            .tempdir()
+            .unwrap();
+        let mut delivery = Delivery::prepare(root.path(), 2048);
+        delivery.session.publish("result:doc").await.unwrap();
+        delivery.session.returned(0).unwrap();
+        delivery.assert_delivered();
     }
 }
