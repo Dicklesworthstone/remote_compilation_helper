@@ -11,6 +11,10 @@
 //! but never follow it. Readiness and singleflight share ONE deadline and retry
 //! quota. Once an action key is bound it cannot change, even after more facts
 //! need warming. Unknown peers/frames remain ordinary pre-acceptance failures.
+//! An explicit decision-capacity hint is different from a facts observation:
+//! no decision ran, so it may pause (but never erase) an already bound flight.
+//! Its wire decision remains pass-through for older wrappers. Only the versioned
+//! hint and explicit non-owning flags opt this wrapper into another bounded poll.
 
 #[path = "singleflight_policy.rs"]
 mod policy;
@@ -173,6 +177,7 @@ pub(super) fn read_decision(
 enum WaitFor<'a> {
     Facts,
     Action(&'a str),
+    Capacity,
 }
 
 fn action_key(reply: &Value) -> Option<&str> {
@@ -204,6 +209,13 @@ fn wait_for(reply: &Value) -> Option<WaitFor<'_>> {
     }
     match reply.get("decision").and_then(Value::as_str) {
         Some("wait") => action_key(reply).map(WaitFor::Action),
+        Some("pass-through")
+            if reply.get("retry").and_then(Value::as_str) == Some("decision-capacity-v1")
+                && reply.get("reason").and_then(Value::as_str) == Some("edge-capacity")
+                && !fields.iter().any(|(name, _)| name == "action_key") =>
+        {
+            Some(WaitFor::Capacity)
+        }
         Some("preparing")
             if !fields.iter().any(|(name, _)| name == "action_key")
                 && matches!(
@@ -287,7 +299,12 @@ fn read_with_policy(
             };
         }
         let decision = reply.get("decision").and_then(Value::as_str);
-        if !matches!(decision, Some("wait" | "preparing")) {
+        // A bare/legacy edge-capacity reason is NOT a retry grant: older
+        // daemons also used it for panics and thread-start failures. Detect
+        // duplicate hint fields as present here so wait_for rejects ambiguity.
+        let capacity_hint = decision == Some("pass-through")
+            && matches!(&reply, Value::Object(fields) if fields.iter().any(|(name, _)| name == "retry"));
+        if !matches!(decision, Some("wait" | "preparing")) && !(may_wait && capacity_hint) {
             // A changing action identity is not the flight we followed. Drop
             // before accepting a hit or executing an admitted attempt. Any
             // reserved attempt is released by the daemon's connection guard.
@@ -306,6 +323,14 @@ fn read_with_policy(
             return Err(());
         }
         match wait_for(&reply).ok_or(())? {
+            WaitFor::Capacity => {
+                // Saturation did not observe facts or mint an action. Preserve
+                // the previous key and deadline across the gap. Before any
+                // observation, use the existing cold-readiness budget once.
+                if wait_deadline.is_none() {
+                    policy = policy.for_preparation();
+                }
+            }
             WaitFor::Facts => {
                 // Do not turn a keyed flight back into an unkeyed readiness
                 // wait: that could disguise changed inputs or a new action.
@@ -378,3 +403,7 @@ fn read_with_policy(
 #[cfg(test)]
 #[path = "singleflight_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "capacity_wait_tests.rs"]
+mod capacity_wait_tests;
