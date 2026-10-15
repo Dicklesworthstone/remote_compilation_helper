@@ -92,10 +92,7 @@ fn preparation_syncs_complete_data_before_chmod_without_syncing_empty_creation()
                             metadata.mode() & 0o7777,
                             if syncs == 1 { COPY_MODE } else { mode }
                         );
-                        assert_eq!(
-                            std::fs::read(&fixture.temporary).unwrap(),
-                            fixture.bytes
-                        );
+                        assert_eq!(std::fs::read(&fixture.temporary).unwrap(), fixture.bytes);
                         file.sync_all()
                     },
                 )
@@ -195,7 +192,10 @@ fn write_error_remains_primary_when_both_salvage_syncs_fail() {
         Some(rustix::io::Errno::NOSPC.raw_os_error())
     );
     assert_eq!(sync_types, [false, true]);
-    assert_eq!(std::fs::read(&fixture.temporary).unwrap(), fixture.bytes[..17]);
+    assert_eq!(
+        std::fs::read(&fixture.temporary).unwrap(),
+        fixture.bytes[..17]
+    );
     fixture.caller_unchanged();
     let inode = std::fs::metadata(&fixture.temporary).unwrap().ino();
     let prepared = prepare_with_write(
@@ -209,7 +209,10 @@ fn write_error_remains_primary_when_both_salvage_syncs_fail() {
     )
     .unwrap();
     fixture.publish(prepared);
-    assert_eq!(std::fs::metadata(&fixture.destination).unwrap().ino(), inode);
+    assert_eq!(
+        std::fs::metadata(&fixture.destination).unwrap().ino(),
+        inode
+    );
 }
 
 #[test]

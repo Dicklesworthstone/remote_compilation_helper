@@ -67,10 +67,7 @@ mod tests {
             let worker = thread::spawn(move || -> anyhow::Result<()> {
                 let deadline = Instant::now() + Duration::from_secs(30);
                 while !stopped.load(Ordering::Acquire) {
-                    anyhow::ensure!(
-                        Instant::now() < deadline,
-                        "heartbeat peer watchdog expired"
-                    );
+                    anyhow::ensure!(Instant::now() < deadline, "heartbeat peer watchdog expired");
                     let (mut stream, _) = match listener.accept() {
                         Ok(stream) => stream,
                         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -246,8 +243,14 @@ mod tests {
         let daemon = Daemon::start();
         let first = daemon.heartbeat(814, "first-wrapper");
         let second = daemon.heartbeat(815, "second-wrapper");
-        first.update_phase(BuildHeartbeatPhase::SyncDown, Some("first-publication".into()));
-        second.update_phase(BuildHeartbeatPhase::Execute, Some("second-execution".into()));
+        first.update_phase(
+            BuildHeartbeatPhase::SyncDown,
+            Some("first-publication".into()),
+        );
+        second.update_phase(
+            BuildHeartbeatPhase::Execute,
+            Some("second-execution".into()),
+        );
         let outcome = (|| -> anyhow::Result<()> {
             let deadline = Instant::now() + Duration::from_secs(3);
             let mut counts = [0usize; 2];
@@ -460,7 +463,10 @@ mod tests {
         let daemon = Daemon::start();
         let mut delivery = Delivery::prepare(&daemon.root, 96);
         let heartbeat = daemon.heartbeat(917, &delivery.writer.wrapper_id());
-        heartbeat.update_phase(BuildHeartbeatPhase::SyncDown, Some("real-publication".into()));
+        heartbeat.update_phase(
+            BuildHeartbeatPhase::SyncDown,
+            Some("real-publication".into()),
+        );
         let lease = Arc::clone(&delivery.writer.lease);
         let beats = Arc::clone(&daemon.publication_beats);
         let (ready, locked) = oneshot::channel();

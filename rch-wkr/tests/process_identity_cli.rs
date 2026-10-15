@@ -22,7 +22,10 @@ fn invalid_identities_refuse_without_runtime_or_log_initialization() {
     for pid in [0, 1, u32::MAX] {
         let output = probe(pid);
         assert!(!output.status.success(), "invalid PID {pid} was accepted");
-        assert!(output.stdout.is_empty(), "failure emitted a partial witness");
+        assert!(
+            output.stdout.is_empty(),
+            "failure emitted a partial witness"
+        );
         let diagnostic = String::from_utf8_lossy(&output.stderr);
         assert!(
             diagnostic.contains("kernel process identity unavailable"),

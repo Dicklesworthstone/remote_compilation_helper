@@ -290,7 +290,10 @@ async fn maintain_durable_lease(
         let (evidence, cancelled) = match evidence {
             Ok(evidence) => evidence,
             Err(error) => {
-                debug!("durable lease observation failed for build {}: {}", build_id, error);
+                debug!(
+                    "durable lease observation failed for build {}: {}",
+                    build_id, error
+                );
                 continue;
             }
         };
@@ -327,10 +330,16 @@ async fn maintain_durable_lease(
             last_warning = Some(warning.class);
         }
         let phase = heartbeat_phase_token(
-            &heartbeat_state.lock().unwrap_or_else(|e| e.into_inner()).phase,
+            &heartbeat_state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .phase,
         );
         if let Err(error) = write_durable_heartbeat(&lease, phase).await {
-            debug!("durable lease heartbeat write failed for build {}: {}", build_id, error);
+            debug!(
+                "durable lease heartbeat write failed for build {}: {}",
+                build_id, error
+            );
         }
     }
 }
@@ -605,39 +614,44 @@ mod tests {
             })
         });
         ready_rx.await.unwrap();
-        let server = tokio::spawn(async move {
-            let mut publishing = 0;
-            while publishing < 4 {
-                let (mut stream, _) = listener.accept().await.unwrap();
-                let mut request = String::new();
-                stream.read_to_string(&mut request).await.unwrap();
-                let (route, body) = request.split_once('\n').unwrap();
-                assert_eq!(route, "POST /build-heartbeat");
-                let heartbeat: BuildHeartbeatRequest = serde_json::from_str(body).unwrap();
-                assert_eq!(heartbeat.build_id, 72);
-                // The service now runs concurrently with start()'s caller.
-                // An initial SyncUp can precede update_phase(); it does not
-                // count toward the four required publication heartbeats.
-                if heartbeat.phase == BuildHeartbeatPhase::SyncUp {
-                    assert_eq!(heartbeat.detail.as_deref(), Some("build_started"));
-                    assert_eq!(heartbeat.progress_counter, Some(0));
-                } else {
-                    assert_eq!(heartbeat.phase, BuildHeartbeatPhase::SyncDown);
-                    assert_eq!(heartbeat.detail.as_deref(), Some("publishing"));
-                    publishing += 1;
-                }
-                let response = serde_json::json!({
-                    "status": "ok", "build_id": heartbeat.build_id,
-                    "worker_id": heartbeat.worker_id,
-                    "phase": heartbeat_phase_token(&heartbeat.phase)
-                });
-                stream.write_all(format!(
+        let server =
+            tokio::spawn(async move {
+                let mut publishing = 0;
+                while publishing < 4 {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let mut request = String::new();
+                    stream.read_to_string(&mut request).await.unwrap();
+                    let (route, body) = request.split_once('\n').unwrap();
+                    assert_eq!(route, "POST /build-heartbeat");
+                    let heartbeat: BuildHeartbeatRequest = serde_json::from_str(body).unwrap();
+                    assert_eq!(heartbeat.build_id, 72);
+                    // The service now runs concurrently with start()'s caller.
+                    // An initial SyncUp can precede update_phase(); it does not
+                    // count toward the four required publication heartbeats.
+                    if heartbeat.phase == BuildHeartbeatPhase::SyncUp {
+                        assert_eq!(heartbeat.detail.as_deref(), Some("build_started"));
+                        assert_eq!(heartbeat.progress_counter, Some(0));
+                    } else {
+                        assert_eq!(heartbeat.phase, BuildHeartbeatPhase::SyncDown);
+                        assert_eq!(heartbeat.detail.as_deref(), Some("publishing"));
+                        publishing += 1;
+                    }
+                    let response = serde_json::json!({
+                        "status": "ok", "build_id": heartbeat.build_id,
+                        "worker_id": heartbeat.worker_id,
+                        "phase": heartbeat_phase_token(&heartbeat.phase)
+                    });
+                    stream.write_all(format!(
                     "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n\r\n{response}\n"
                 ).as_bytes()).await.unwrap();
-            }
-        });
+                }
+            });
         let mut heartbeat = BuildHeartbeatLoop::start_with_interval(
-            socket.to_str().unwrap(), 72, &worker, Some(&wrapper), Some(&lease),
+            socket.to_str().unwrap(),
+            72,
+            &worker,
+            Some(&wrapper),
+            Some(&lease),
             Duration::from_millis(20),
         );
         heartbeat.update_phase(BuildHeartbeatPhase::SyncDown, Some("publishing".into()));
@@ -650,7 +664,9 @@ mod tests {
         drop(heartbeat);
         let _ = release_tx.send(());
         holder.join().unwrap().unwrap();
-        result.expect("journal I/O stopped daemon heartbeats").unwrap();
+        result
+            .expect("journal I/O stopped daemon heartbeats")
+            .unwrap();
     }
 
     #[test]
@@ -661,7 +677,11 @@ mod tests {
         assert!(!cancellation_marker_matches(&marker, &identity));
         std::fs::write(&marker, b"not an identity").unwrap();
         assert!(!cancellation_marker_matches(&marker, &identity));
-        std::fs::write(&marker, serde_json::to_vec(&JobIdentity::new_local()).unwrap()).unwrap();
+        std::fs::write(
+            &marker,
+            serde_json::to_vec(&JobIdentity::new_local()).unwrap(),
+        )
+        .unwrap();
         assert!(!cancellation_marker_matches(&marker, &identity));
         std::fs::write(&marker, serde_json::to_vec(&identity).unwrap()).unwrap();
         assert!(cancellation_marker_matches(&marker, &identity));
