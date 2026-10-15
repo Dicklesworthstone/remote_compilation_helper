@@ -17,9 +17,16 @@ use std::os::unix::fs::{FileExt, MetadataExt, PermissionsExt};
 
 const COPY_MODE: u32 = 0o600;
 const BUFFER_BYTES: usize = 64 * 1024;
+// Reuse the bytes we must read to validate the source and retained prefix.
+// Bounded per artifact, never per inventory; large outputs still stream.
+const VERIFIED_SOURCE_CACHE_BYTES: u64 = 1024 * 1024;
 
 #[path = "staged_inventory.rs"]
 mod staged_inventory;
+
+#[cfg(test)]
+#[path = "publication_copy_io_tests.rs"]
+mod io_tests;
 
 /// A missing stage is not an empty successful Make output set. The generic
 /// file enumerator also serves pre-build baselines, where absent output roots
@@ -145,15 +152,20 @@ fn verify_prefix(
     copy: &File,
     prefix_length: u64,
     expected: &str,
-) -> Result<()> {
+) -> Result<Option<Vec<u8>>> {
     let mut source_bytes = vec![0; BUFFER_BYTES];
     let mut prefix_bytes = vec![0; BUFFER_BYTES];
+    let mut verified = (source_length <= VERIFIED_SOURCE_CACHE_BYTES)
+        .then(|| Vec::with_capacity(source_length as usize));
     let mut hasher = blake3::Hasher::new();
     let mut offset = 0;
     while offset < source_length {
         let count = (source_length - offset).min(BUFFER_BYTES as u64) as usize;
         source.read_exact_at(&mut source_bytes[..count], offset)?;
         hasher.update(&source_bytes[..count]);
+        if let Some(verified) = &mut verified {
+            verified.extend_from_slice(&source_bytes[..count]);
+        }
         let retained = prefix_length.saturating_sub(offset).min(count as u64) as usize;
         if retained > 0 {
             copy.read_exact_at(&mut prefix_bytes[..retained], offset)?;
@@ -168,7 +180,7 @@ fn verify_prefix(
         hasher.finalize().to_hex().as_str() == expected,
         "staged publication source does not match its fingerprint; evidence unchanged"
     );
-    Ok(())
+    Ok(verified)
 }
 
 pub(super) fn prepare_output_temporary(
@@ -187,7 +199,23 @@ fn prepare_with_write(
     source_path: &Path,
     temporary: &Path,
     expected: &str,
+    write: impl FnMut(&File, &[u8], u64) -> io::Result<usize>,
+) -> Result<PreparedOutput> {
+    prepare_with_io(source_path, temporary, expected, write, File::sync_all)
+}
+
+/// No journal checkpoint exists during preparation. Empty-file creation needs
+/// no durability barrier: the complete data is still synced BEFORE chmod, and
+/// changed permissions are synced before returning to the publisher. The caller
+/// syncs the held directory BEFORE recording pending ownership; rename and the
+/// published checkpoint retain their own durability barriers.
+/// The sync seam lets tests fail this boundary without weakening production I/O.
+fn prepare_with_io(
+    source_path: &Path,
+    temporary: &Path,
+    expected: &str,
     mut write: impl FnMut(&File, &[u8], u64) -> io::Result<usize>,
+    mut sync: impl FnMut(&File) -> io::Result<()>,
 ) -> Result<PreparedOutput> {
     let parent = temporary
         .parent()
@@ -220,8 +248,9 @@ fn prepare_with_write(
             // Only this exclusively created descriptor may normalize a more
             // restrictive umask. Never chmod pre-existing evidence here.
             file.set_permissions(Permissions::from_mode(COPY_MODE))?;
-            file.sync_all()?;
-            directory.sync_all()?;
+            // Persisting an empty temporary adds no recoverable payload. The
+            // stage remains authoritative until the caller's durable pending
+            // checkpoint; interruptions can resume or recreate this copy.
             file
         }
         Err(error) => return Err(error.into()),
@@ -242,7 +271,7 @@ fn prepare_with_write(
     );
     verify_temporary(&directory, temporary, &file, &initial, prefix_length, mode)?;
     verify_source(&source, source_path, &source_metadata)?;
-    verify_prefix(
+    let verified_source = verify_prefix(
         &source,
         source_metadata.len(),
         &file,
@@ -273,17 +302,29 @@ fn prepare_with_write(
         file
     };
     let mut offset = prefix_length;
-    let mut buffer = vec![0; BUFFER_BYTES];
+    let mut buffer = if verified_source.is_none() {
+        vec![0; BUFFER_BYTES]
+    } else {
+        Vec::new()
+    };
     while offset < source_metadata.len() {
         verify_source(&source, source_path, &source_metadata)?;
         let count = (source_metadata.len() - offset).min(BUFFER_BYTES as u64) as usize;
-        source.read_exact_at(&mut buffer[..count], offset)?;
+        // Only the fully hash-checked snapshot may bypass this second source
+        // read. Name/version checks still run for every chunk, and the held
+        // temporary is independently hashed before chmod and publication.
+        let bytes = if let Some(verified) = &verified_source {
+            &verified[offset as usize..offset as usize + count]
+        } else {
+            source.read_exact_at(&mut buffer[..count], offset)?;
+            &buffer[..count]
+        };
         let mut written = 0;
         while written < count {
             // The next write starts exactly at EOF. Another writer's growth
             // or truncation is not permission to overwrite retained bytes.
             verify_temporary(&directory, temporary, &file, &initial, offset, mode)?;
-            match write(&file, &buffer[written..count], offset) {
+            match write(&file, &bytes[written..count], offset) {
                 Ok(0) => return Err(io::Error::from(io::ErrorKind::WriteZero).into()),
                 Ok(bytes) => {
                     anyhow::ensure!(bytes <= count - written, "invalid publication write length");
@@ -294,8 +335,8 @@ fn prepare_with_write(
                 Err(error) => {
                     // Best effort only: a full or failed device can also
                     // refuse fsync. Never hide the original write failure.
-                    let _ = file.sync_all();
-                    let _ = directory.sync_all();
+                    let _ = sync(&file);
+                    let _ = sync(&directory);
                     return Err(error).with_context(|| {
                         format!(
                             "publication copy interrupted at {}; prefix retained for recovery",
@@ -311,7 +352,7 @@ fn prepare_with_write(
     // Full-byte validation precedes chmod too. A complete 0600 copy left by a
     // crash between data sync and permission installation can finish safely.
     let prepared = PreparedOutput::hold(file, directory, temporary, expected)?;
-    prepared.file.sync_all()?;
+    sync(&prepared.file)?;
     if mode == final_mode {
         return Ok(prepared);
     }
@@ -320,7 +361,7 @@ fn prepare_with_write(
     prepared
         .file
         .set_permissions(source_metadata.permissions())?;
-    prepared.file.sync_all()?;
+    sync(&prepared.file)?;
     PreparedOutput::hold(prepared.file, prepared.directory, temporary, expected)
 }
 
