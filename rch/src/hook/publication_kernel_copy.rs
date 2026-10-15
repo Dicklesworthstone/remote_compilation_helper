@@ -86,7 +86,7 @@ mod tests {
         ] {
             assert!(permits_fallback(error));
         }
-        for error in [Errno::NOSPC, Errno::IO, Errno::ACCES, Errno::INTR] {
+        for error in [Errno::NOSPC, Errno::IO, Errno::ACCESS, Errno::INTR] {
             assert!(!permits_fallback(error));
         }
     }
