@@ -215,30 +215,29 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     hex(&hasher.finalize())
 }
 
-/// SHA-256 of a G007 drained stream: the digest covers the FULL byte
-/// sequence the action wrote — resident head first, then every spilled
-/// byte read back incrementally from the archive — so a spilled stream
-/// and a fully-resident one with identical content hash identically.
+/// Hash the complete captured stream through the SAME descriptor-owned reader
+/// as output delivery. Digest-only execution must not reopen a mutable spill
+/// name or hash bytes beyond the completed drain's receipt. No temporary copy
+/// is needed on this path; resident memory remains one fixed-size buffer.
 ///
 /// # Errors
-/// Typed [`std::io::Error`] if the spill archive cannot be re-read; the
-/// caller reports a typed non-result rather than a fabricated digest.
+/// A missing/changed capture or read failure produces no successful digest.
+/// Interrupted reads retry without losing or double-hashing their prefix.
 fn stream_digest(lane: &rabs_asupersync::stream_drain::LaneDrain) -> std::io::Result<String> {
     use sha2::{Digest, Sha256};
     use std::io::Read as _;
+    let mut reader = lane.reader()?;
     let mut hasher = Sha256::new();
-    hasher.update(lane.resident());
-    if let Some(spill) = lane.spill() {
-        let file = std::fs::File::open(&spill.path)?;
-        let mut reader = std::io::BufReader::new(file);
-        let mut chunk = [0u8; 64 * 1024];
-        loop {
-            let n = reader.read(&mut chunk)?;
-            if n == 0 {
-                break;
-            }
-            hasher.update(&chunk[..n]);
+    let mut chunk = [0u8; 64 * 1024];
+    loop {
+        let n = match reader.read(&mut chunk) {
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            result => result?,
+        };
+        if n == 0 {
+            break;
         }
+        hasher.update(&chunk[..n]);
     }
     Ok(hex(&hasher.finalize()))
 }
@@ -577,7 +576,12 @@ fn execute_canonical_inner(
             } else {
                 match (stream_digest(&output.stdout), stream_digest(&output.stderr)) {
                     (Ok(s), Ok(e)) => (s, e),
-                    _ => return exec_error(request.request_id),
+                    (Err(error), _) | (_, Err(error)) => {
+                        let _ = control.retain_outputs(Err(format!(
+                            "diagnostic digest capture: {error}"
+                        )));
+                        return exec_error(request.request_id);
+                    }
                 }
             };
             if let Some(artifacts) = artifacts
@@ -851,5 +855,146 @@ mod tests {
         let mut extra = valid;
         extra["inherit_host"] = json!(true);
         assert!(parse_command_context(&json!({"command_context":extra})).is_err());
+    }
+
+    #[cfg(unix)]
+    fn digest_fixture(
+        bytes: &[u8],
+        resident_bound: usize,
+    ) -> (tempfile::TempDir, rabs_asupersync::stream_drain::LaneDrain) {
+        use rabs_asupersync::stream_drain::{DrainLimits, join_lane, spawn_lanes};
+        use std::process::{Command, Stdio};
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("input");
+        std::fs::write(&source, bytes).unwrap();
+        let mut child = Command::new("/bin/cat")
+            .arg(&source)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let (stdout, stderr) = spawn_lanes(
+            &mut child,
+            &DrainLimits {
+                resident_bound,
+                spill_dir: dir.path().join("spill"),
+            },
+        );
+        assert!(stderr.is_none());
+        assert!(child.wait().unwrap().success());
+        (dir, join_lane(stdout.unwrap()).unwrap())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stream_digest_matches_delivery_for_every_resident_partition() {
+        use crate::output::{CapturedStream, MAX_OUTPUT_CHUNK_BYTES};
+        for bytes in [Vec::new(), vec![0, 255, 128, 10], vec![37; 196_615]] {
+            let expected = sha256_hex(&bytes);
+            for resident in [0, 3, 1024 * 1024] {
+                let (_dir, lane) = digest_fixture(&bytes, resident);
+                assert_eq!(stream_digest(&lane).unwrap(), expected);
+                let mut capture = CapturedStream::from_lane(&lane).unwrap();
+                assert_eq!(capture.sha256(), expected);
+                let mut restored = Vec::new();
+                while (restored.len() as u64) < capture.len() {
+                    restored.extend(
+                        capture
+                            .read_chunk(restored.len() as u64, MAX_OUTPUT_CHUNK_BYTES)
+                            .unwrap(),
+                    );
+                }
+                assert_eq!(restored, bytes);
+                assert_eq!(stream_digest(&lane).unwrap(), expected);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stream_digest_cannot_adopt_replaced_or_linked_spill_names() {
+        for link in [false, true] {
+            let (dir, lane) = digest_fixture(b"original", 3);
+            let expected = sha256_hex(b"original");
+            assert_eq!(stream_digest(&lane).unwrap(), expected);
+            let path = &lane.spill().unwrap().path;
+            std::fs::rename(path, dir.path().join("retained-original")).unwrap();
+            if link {
+                let replacement = dir.path().join("replacement");
+                std::fs::write(&replacement, b"wrong").unwrap();
+                std::os::unix::fs::symlink(&replacement, path).unwrap();
+            } else {
+                std::fs::write(path, b"wrong").unwrap();
+            }
+            // Rename may alter ctime. Refusal is conservative; success must
+            // still certify the original, not the equal-length replacement.
+            if let Ok(digest) = stream_digest(&lane) {
+                assert_eq!(digest, expected);
+            }
+            assert_eq!(std::fs::read(path).unwrap(), b"wrong");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stream_digest_refuses_same_size_rewrite_with_restored_mtime() {
+        let (_dir, lane) = digest_fixture(b"original", 3);
+        assert_eq!(stream_digest(&lane).unwrap(), sha256_hex(b"original"));
+        let path = &lane.spill().unwrap().path;
+        let modified = std::fs::metadata(path).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        std::fs::write(path, b"wrong").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        assert!(stream_digest(&lane).is_err());
+        assert!(crate::output::CapturedStream::from_lane(&lane).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stream_digest_refuses_truncated_and_growing_spills() {
+        for length in [0, 4, 6] {
+            let (_dir, lane) = digest_fixture(b"original", 3);
+            assert_eq!(lane.spilled_bytes(), 5);
+            assert_eq!(stream_digest(&lane).unwrap(), sha256_hex(b"original"));
+            std::fs::File::options()
+                .write(true)
+                .open(&lane.spill().unwrap().path)
+                .unwrap()
+                .set_len(length)
+                .unwrap();
+            assert!(stream_digest(&lane).is_err());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stream_digest_and_delivery_keep_concurrent_cursors_independent() {
+        let bytes: Vec<u8> = (0..131_079).map(|n| (n % 251) as u8).collect();
+        let (_dir, lane) = digest_fixture(&bytes, 7);
+        let lane = std::sync::Arc::new(lane);
+        let threads: Vec<_> = (0..8)
+            .map(|index| {
+                let lane = std::sync::Arc::clone(&lane);
+                std::thread::spawn(move || {
+                    if index % 2 == 0 {
+                        stream_digest(&lane).unwrap()
+                    } else {
+                        crate::output::CapturedStream::from_lane(&lane)
+                            .unwrap()
+                            .sha256()
+                            .to_owned()
+                    }
+                })
+            })
+            .collect();
+        let expected = sha256_hex(&bytes);
+        for thread in threads {
+            assert_eq!(thread.join().unwrap(), expected);
+        }
     }
 }

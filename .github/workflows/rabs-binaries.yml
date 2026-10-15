@@ -102,6 +102,11 @@ jobs:
           size=$(stat -c%s target/release/rabs-wrap)
           echo "rabs-wrap release size: $size bytes"
           test "$size" -lt 2097152
+      - name: Worker diagnostic custody through real pipes and retained readers
+        run: |
+          cargo test --release -p rabs-asupersync --lib stream_drain --locked
+          cargo test --release -p rabs-wkr --lib output::tests --locked
+          cargo test --release -p rabs-wkr --lib session::tests --locked
       - name: Durable replay allowance and real compiler verification
         run: |
           cargo test --release -p rabs-cas --lib serving_sample_gate --locked
