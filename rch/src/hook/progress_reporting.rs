@@ -17,6 +17,9 @@
 
 use super::*;
 
+#[path = "heartbeat_executor.rs"]
+mod heartbeat_executor;
+
 const BUILD_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone)]
@@ -116,7 +119,7 @@ impl BuildHeartbeatLoop {
         // The wire heartbeat must not await a durable journal writer. Even on
         // a blocking thread, a long fsync or publication-held journal mutex
         // would otherwise prevent this loop's next daemon heartbeat (#112).
-        let task = tokio::spawn(async move {
+        let task = heartbeat_executor::runtime().spawn(async move {
             let mut ticker = tokio::time::interval(interval);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
@@ -153,7 +156,7 @@ impl BuildHeartbeatLoop {
         let (lease_stop_tx, lease_task) = if let Some(lease) = durable_lease.clone() {
             let (stop, stopped) = oneshot::channel();
             let state = Arc::clone(&state);
-            let task = tokio::spawn(maintain_durable_lease(
+            let task = heartbeat_executor::runtime().spawn(maintain_durable_lease(
                 lease, state, build_id, interval, stopped,
             ));
             (Some(stop), Some(task))
@@ -603,7 +606,8 @@ mod tests {
         });
         ready_rx.await.unwrap();
         let server = tokio::spawn(async move {
-            for _ in 0..4 {
+            let mut publishing = 0;
+            while publishing < 4 {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let mut request = String::new();
                 stream.read_to_string(&mut request).await.unwrap();
@@ -611,17 +615,28 @@ mod tests {
                 assert_eq!(route, "POST /build-heartbeat");
                 let heartbeat: BuildHeartbeatRequest = serde_json::from_str(body).unwrap();
                 assert_eq!(heartbeat.build_id, 72);
-                assert_eq!(heartbeat.phase, BuildHeartbeatPhase::SyncDown);
+                // The service now runs concurrently with start()'s caller.
+                // An initial SyncUp can precede update_phase(); it does not
+                // count toward the four required publication heartbeats.
+                if heartbeat.phase == BuildHeartbeatPhase::SyncUp {
+                    assert_eq!(heartbeat.detail.as_deref(), Some("build_started"));
+                    assert_eq!(heartbeat.progress_counter, Some(0));
+                } else {
+                    assert_eq!(heartbeat.phase, BuildHeartbeatPhase::SyncDown);
+                    assert_eq!(heartbeat.detail.as_deref(), Some("publishing"));
+                    publishing += 1;
+                }
                 let response = serde_json::json!({
                     "status": "ok", "build_id": heartbeat.build_id,
-                    "worker_id": heartbeat.worker_id, "phase": "sync_down"
+                    "worker_id": heartbeat.worker_id,
+                    "phase": heartbeat_phase_token(&heartbeat.phase)
                 });
                 stream.write_all(format!(
                     "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n\r\n{response}\n"
                 ).as_bytes()).await.unwrap();
             }
         });
-        let heartbeat = BuildHeartbeatLoop::start_with_interval(
+        let mut heartbeat = BuildHeartbeatLoop::start_with_interval(
             socket.to_str().unwrap(), 72, &worker, Some(&wrapper), Some(&lease),
             Duration::from_millis(20),
         );
@@ -629,6 +644,9 @@ mod tests {
         let result = tokio::time::timeout(Duration::from_secs(1), server).await;
         // Abort maintenance before unlocking it: this fixture must never query
         // a real job service after the blocked snapshot becomes available.
+        let maintenance = heartbeat.lease_task.take().unwrap();
+        maintenance.abort();
+        let _ = maintenance.await;
         drop(heartbeat);
         let _ = release_tx.send(());
         holder.join().unwrap().unwrap();
