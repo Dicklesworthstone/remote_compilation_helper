@@ -458,6 +458,33 @@ mod tests {
     use super::*;
     use rch_common::job_identity::JobIdentity;
 
+    /// A fake `rch` for recovery: a hard link to one shim written once per
+    /// process, whose behavior is the data file `body` beside the link.
+    /// Writing a fresh executable and exec'ing it at once fails with ETXTBSY
+    /// when a concurrent test forks while the write fd is open (the child holds
+    /// a copy until it execs); see `launchd_singleton_tests` in main.rs.
+    #[cfg(unix)]
+    fn fake_rch(dir: &std::path::Path, body: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        static SHIM: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+        let shim = SHIM.get_or_init(|| {
+            let shim = tempfile::tempdir().unwrap().keep().join("rch-shim");
+            std::fs::write(
+                &shim,
+                "#!/bin/sh\nexec /bin/sh \"$(dirname \"$0\")/body\" \"$@\"\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o700)).unwrap();
+            shim
+        });
+        std::fs::write(dir.join("body"), body).unwrap();
+        let child = dir.join("rch");
+        if !child.exists() {
+            std::fs::hard_link(shim, &child).unwrap();
+        }
+        child
+    }
+
     fn recoverable_lease_ids(
         directory: &Path,
         now: u64,
@@ -897,15 +924,12 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn child_exit_zero_without_journal_completion_is_not_auto_recovery_success() {
-        use std::os::unix::fs::PermissionsExt as _;
         let dir = tempfile::tempdir().unwrap();
         let pending = handoff_lease(0, 11, 102);
         let id = &pending.identity.local_wrapper_id;
         let path = dir.path().join(format!("{id}.json"));
         std::fs::write(&path, serde_json::to_vec(&pending).unwrap()).unwrap();
-        let child = dir.path().join("rch");
-        std::fs::write(&child, "#!/bin/sh\nexit 0\n").unwrap();
-        std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let child = fake_rch(dir.path(), "exit 0\n");
         let error = recover_in(
             &child,
             &dir.path().join("unused.sock"),
@@ -923,15 +947,14 @@ mod tests {
         std::fs::write(&receipt, serde_json::to_vec(&complete).unwrap()).unwrap();
         // The test-owned child simulates writing the final durable journal;
         // the daemon must inspect that journal rather than its exit alone.
-        std::fs::write(
-            &child,
-            format!(
-                "#!/bin/sh\ncp -- {} {}\n",
+        fake_rch(
+            dir.path(),
+            &format!(
+                "cp -- {} {}\n",
                 shell_escape::escape(receipt.to_str().unwrap().into()),
                 shell_escape::escape(path.to_str().unwrap().into())
             ),
-        )
-        .unwrap();
+        );
         recover_in(
             &child,
             &dir.path().join("unused.sock"),
