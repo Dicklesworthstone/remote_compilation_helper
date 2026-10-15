@@ -722,6 +722,43 @@ fn accepted_install_reply(line: &str) -> Live {
     }
 }
 
+/// Establish a bounded socket connection. The helper thread has no authority
+/// to send protocol frames or accept an installation.
+fn connect_owned(
+    socket: &str,
+    timeout: Duration,
+    owned: &impl Fn() -> bool,
+) -> io::Result<UnixStream> {
+    if !owned() {
+        return Err(io::Error::other("original compiler caller disappeared"));
+    }
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let socket_owned = socket.to_owned();
+    std::thread::Builder::new()
+        .spawn(move || {
+            let _ = sender.send(UnixStream::connect(socket_owned));
+        })?;
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| io::Error::other("RABS connect deadline overflow"))?;
+    loop {
+        if !owned() {
+            return Err(io::Error::other("original compiler caller disappeared"));
+        }
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "RABS connect deadline"))?;
+        match receiver.recv_timeout(remaining.min(Duration::from_millis(100))) {
+            Ok(result) => return result,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(io::Error::new(io::ErrorKind::BrokenPipe, "RABS connect worker stopped"));
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    }
+}
+
 /// One consult attempt under the breaker budgets. `Ok(_)` = a decision
 /// was received (shadow decisions are always pass-through).
 fn consult(
@@ -734,32 +771,8 @@ fn consult(
     if !owned() {
         return Err(());
     }
-    // std UDS has no connect timeout: connect on a helper thread and
-    // bound the wait. A short-lived process reaps stragglers at exit.
-    let (sender, receiver) = std::sync::mpsc::channel();
-    let socket_owned = socket.to_string();
-    std::thread::Builder::new()
-        .spawn(move || {
-            let _ = sender.send(UnixStream::connect(socket_owned));
-        })
+    let stream = connect_owned(socket, Duration::from_millis(u64::from(connect_timeout_ms)), owned)
         .map_err(|_| ())?;
-    let connect_deadline = Instant::now()
-        .checked_add(Duration::from_millis(u64::from(connect_timeout_ms)))
-        .ok_or(())?;
-    let stream = loop {
-        if !owned() {
-            return Err(());
-        }
-        let remaining = connect_deadline
-            .checked_duration_since(Instant::now())
-            .filter(|remaining| !remaining.is_zero())
-            .ok_or(())?;
-        match receiver.recv_timeout(remaining.min(Duration::from_millis(100))) {
-            Ok(Ok(stream)) => break stream,
-            Ok(Err(_)) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Err(()),
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-        }
-    };
     let cwd = std::env::current_dir()
         .map_err(|_| ())?
         .into_os_string()
@@ -805,7 +818,15 @@ fn consult(
     };
     singleflight::write_owned(&mut reader, frame.as_bytes(), deadline, owned).map_err(|_| ())?;
     singleflight::write_owned(&mut reader, b"\n", deadline, owned).map_err(|_| ())?;
-    singleflight::read_decision(reader, &frame, budget, may_wait, owned)
+    singleflight::read_decision(
+        reader,
+        &frame,
+        budget,
+        may_wait,
+        socket,
+        Duration::from_millis(u64::from(connect_timeout_ms)),
+        owned,
+    )
 }
 
 /// Did the daemon actually answer this consult, or only admit that it
