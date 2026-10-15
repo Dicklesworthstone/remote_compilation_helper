@@ -182,7 +182,7 @@ rch_group_state() {
         [ "${rch_scope_bound:-0}" != 1 ] || return 2
         rch_snapshot=$(LC_ALL=C rch_control_capture 1s ps -axo pid=,pgid=,stat=) || return 2
         printf '%s\n' "$rch_snapshot" | LC_ALL=C awk -v group="$rch_pgid" -v observer="$$" '
-            NF != 3 || $1 !~ /^[1-9][0-9]*$/ || $2 !~ /^[0-9]+$/ || $3 !~ /^[RSDTIUZ][A-Za-z0-9+<>-]*$/ { bad=1; next }
+            NF != 3 || $1 !~ /^[0-9]+$/ || $2 !~ /^[0-9]+$/ || $3 !~ /^[RSDTIUZE][A-Za-z0-9+<>-]*$/ { bad=1; next }
             seen_pid[$1]++ { bad=1 }
             $1 == observer { seen=1; if ($2 == group) bad=1 }
             $2 == group && $3 !~ /^Z/ { live=1 }

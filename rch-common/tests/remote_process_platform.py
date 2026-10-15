@@ -112,6 +112,55 @@ rch_pgid=2147483647
 if rch_read_process "$member"; then exit 3; fi
 ''')
 
+    def test_unavailable_observation_cannot_confirm_cleanup(self):
+        child = self.launch()
+        # Explicit fault injection after real launch/receipt creation. Losing
+        # both observations must neither signal the child nor assert its death.
+        result = self.run_protocol(
+            "rch_group_state() { return 2; }\n"
+            "rch_read_process() { return 1; }\n"
+            f"rch_remote_cancel {shlex.quote(str(self.receipt))} 115 kill")
+        self.assertEqual(result.returncode, 44, result.stderr)
+        self.assertIsNone(child.poll())
+
+
+class DarwinCensusBoundary(unittest.TestCase):
+    def test_kernel_task_live_terminal_and_invalid_snapshots(self):
+        # Deliberate census doubles complement (and do not replace) the native
+        # lifecycle tests above. Darwin may report kernel_task as PID/PGID 0.
+        script = CORE + r'''
+uname() { printf 'Darwin\n'; }
+rch_control_capture() { printf '%s\n' "$snapshot"; }
+rch_pgid=2147483647
+observer="$$ $$ S"
+snapshot="0 0 R
+$observer"
+rch_group_state; [ "$?" = 0 ] || exit 1
+snapshot="$snapshot
+432 2147483647 E"
+rch_group_state; [ "$?" = 1 ] || exit 2
+snapshot="0 0 R
+$observer
+432 2147483647 Z"
+rch_group_state; [ "$?" = 0 ] || exit 3
+snapshot="$snapshot
+malformed"
+rch_group_state; [ "$?" = 2 ] || exit 4
+snapshot="0 0 R
+$observer
+$observer"
+rch_group_state; [ "$?" = 2 ] || exit 5
+snapshot="0 0 R
+$$ 2147483647 S"
+rch_group_state; [ "$?" = 2 ] || exit 6
+rch_control_capture() { return 1; }
+rch_group_state; [ "$?" = 2 ] || exit 7
+'''
+        for shell in ("/bin/sh", "/bin/bash"):
+            result = subprocess.run([shell, "-c", script], capture_output=True,
+                                    text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, shell + result.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

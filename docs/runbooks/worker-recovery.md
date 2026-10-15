@@ -176,7 +176,7 @@ wrapper identity; delayed heartbeats cannot adopt that replacement process.
 Local signals use Linux pidfds after verifying the recorded boot and process
 start identity.
 
-For tracked Linux worker jobs launched by this version, the remote record binds
+For tracked Linux and macOS worker jobs launched by this version, the remote record binds
 the build ID, worker boot UUID, process-group leader and its start time. The
 daemon checks this identity before each remote signal and verifies that the
 group has no executing members. It then persists the terminal cancellation and
@@ -188,7 +188,14 @@ If SSH is unavailable, identity cannot be verified, or a live group survives
 after its recorded leader exits, the job and reservation remain active for
 retry. `--force` does not bypass these checks. Older numeric-only PGID records
 can confirm an already empty group, but cannot authorize killing a live group.
-This process-group recovery path requires Linux worker identity support;
+Linux requires procfs mounted in the active PID namespace and retains its
+complete thread census. macOS uses the updated `rch-wkr process-identity <pid>`
+helper on the remote PATH, kernel boot-session UUIDs, and libproc start times
+at microsecond precision. Update `rch-wkr` on macOS workers together with the
+dispatcher. A missing or older helper refuses setup before starting work.
+macOS also needs GNU timeout (`gtimeout` from Homebrew coreutils) for bounded
+control observations and the existing `setsid` launch capability. BSD stat and
+the native process census are used there; no Linux procfs is required.
 Windows jobs and unsupported worker launch capabilities do not gain that
 guarantee. Do not remove the retained ownership record to make capacity appear
 free while execution remains uncertain.
