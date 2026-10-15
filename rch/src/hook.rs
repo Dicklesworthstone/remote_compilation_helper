@@ -1100,18 +1100,96 @@ fn exit_with_local_fallback_recording(
 /// The Layer 0 pack's env pairs for one remote run (bd-bqu38). A verification
 /// lane (`--clean-overlay`, `--source-content-receipt`) builds exactly what the
 /// project declares, so it never receives the pack (bd-hoxgn).
+///
+/// A pack value never overrides a profile setting the project declares itself:
+/// Cargo env beats the manifest, so `debug_line_tables_only` would otherwise
+/// raise a deliberate `debug = 0` and erase a deliberate full `debug`.
 fn layer0_env_for_lane(
     layer0: &rch_common::types::Layer0Config,
     verification_lane: bool,
+    invocation_dir: Option<&Path>,
 ) -> Vec<(String, String)> {
     if verification_lane {
         return Vec::new();
     }
-    layer0
-        .active_env()
+    let pairs = layer0.active_env();
+    if pairs.is_empty() {
+        return Vec::new();
+    }
+    let declared = invocation_dir
+        .map(declared_cargo_profile_settings)
+        .unwrap_or_default();
+    pairs
         .into_iter()
+        .filter(|(key, _)| {
+            let Some((profile, setting)) = cargo_profile_env_setting(key) else {
+                return true;
+            };
+            // `test` inherits `dev`, so a declared dev value also covers test.
+            !(declared.contains(&(profile.clone(), setting.clone()))
+                || (profile == "test" && declared.contains(&("dev".to_owned(), setting))))
+        })
         .map(|(key, value)| (key.to_string(), value.to_string()))
         .collect()
+}
+
+/// `CARGO_PROFILE_RELEASE_CODEGEN_UNITS` -> ("release", "codegen-units").
+fn cargo_profile_env_setting(key: &str) -> Option<(String, String)> {
+    let rest = key.strip_prefix("CARGO_PROFILE_")?;
+    let (profile, setting) = rest.split_once('_')?;
+    Some((
+        profile.to_ascii_lowercase(),
+        setting.to_ascii_lowercase().replace('_', "-"),
+    ))
+}
+
+/// The `(profile, setting)` pairs the project sets for itself: `[profile.*]`
+/// in the workspace root manifest (Cargo ignores profiles elsewhere) and in
+/// any `.cargo/config.toml` (or legacy `.cargo/config`) from the invocation
+/// directory up to that root. That is the part of the tree the worker gets.
+fn declared_cargo_profile_settings(
+    invocation_dir: &Path,
+) -> std::collections::HashSet<(String, String)> {
+    fn collect(
+        table: Option<&toml::Value>,
+        into: &mut std::collections::HashSet<(String, String)>,
+    ) {
+        let Some(profiles) = table
+            .and_then(|t| t.get("profile"))
+            .and_then(|p| p.as_table())
+        else {
+            return;
+        };
+        for (profile, settings) in profiles {
+            if let Some(settings) = settings.as_table() {
+                for setting in settings.keys() {
+                    into.insert((profile.clone(), setting.clone()));
+                }
+            }
+        }
+    }
+    let read = |path: &Path| -> Option<toml::Value> {
+        toml::from_str(&std::fs::read_to_string(path).ok()?).ok()
+    };
+    let mut declared = std::collections::HashSet::new();
+    let mut nearest_manifest = None;
+    for dir in invocation_dir.ancestors().take(16) {
+        for name in ["config.toml", "config"] {
+            collect(read(&dir.join(".cargo").join(name)).as_ref(), &mut declared);
+        }
+        let manifest = dir.join("Cargo.toml");
+        let Some(parsed) = read(&manifest) else {
+            continue;
+        };
+        if parsed.get("workspace").is_some() {
+            collect(Some(&parsed), &mut declared);
+            return declared;
+        }
+        nearest_manifest.get_or_insert(parsed);
+    }
+    // No workspace above: the nearest package manifest is the root.
+    collect(nearest_manifest.as_ref(), &mut declared);
+    declared
 }
 
 /// Where a local run's duration is recorded (bd-2spi4 speed gate).
@@ -3666,7 +3744,11 @@ pub async fn run_exec(
 
     // Layer 0 pack (bd-bqu38): resolve knob env pairs once; empty unless the
     // `[layer0]` section enables the pack.
-    let layer0_env = layer0_env_for_lane(&config.layer0, clean_overlay || source_content_receipt);
+    let layer0_env = layer0_env_for_lane(
+        &config.layer0,
+        clean_overlay || source_content_receipt,
+        std::env::current_dir().ok().as_deref(),
+    );
 
     // Estimate cores needed
     let estimated_cores =

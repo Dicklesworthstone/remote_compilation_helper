@@ -8326,6 +8326,69 @@ async fn test_terminal_source_sync_failure_never_launches_remote_cargo() {
     );
 }
 
+/// bd-hoxgn: the pack never overrides a profile setting the project declares
+/// in its workspace root manifest or in `.cargo/config.toml` under that root.
+#[test]
+fn test_layer0_pack_respects_profile_settings_the_project_declares() {
+    let all = rch_common::types::Layer0Config {
+        enabled: true,
+        release_lto_thin: true,
+        release_codegen_units_1: true,
+        debug_line_tables_only: true,
+    };
+    let keys = |dir: &Path| -> Vec<String> {
+        layer0_env_for_lane(&all, false, Some(dir))
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect()
+    };
+    let every = [
+        "CARGO_PROFILE_RELEASE_LTO",
+        "CARGO_PROFILE_RELEASE_CODEGEN_UNITS",
+        "CARGO_PROFILE_DEV_DEBUG",
+        "CARGO_PROFILE_TEST_DEBUG",
+    ];
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let member = root.join("crates/member");
+    std::fs::create_dir_all(member.join(".cargo")).unwrap();
+    std::fs::write(
+        member.join("Cargo.toml"),
+        "[package]\nname = \"member\"\n[profile.dev]\ndebug = 2\n",
+    )
+    .unwrap();
+    // No workspace: the member is its own root, and its dev debug also
+    // covers test, which inherits dev.
+    assert_eq!(keys(&member), every[..2]);
+
+    // With a workspace root, only the root's profiles count.
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"crates/member\"]\n[profile.test]\ndebug = 0\n",
+    )
+    .unwrap();
+    assert_eq!(keys(&member), every[..3]);
+
+    // A `.cargo/config.toml` inside the tree counts too.
+    std::fs::write(
+        member.join(".cargo/config.toml"),
+        "[profile.release]\nlto = \"fat\"\n",
+    )
+    .unwrap();
+    assert_eq!(
+        keys(&member),
+        [
+            "CARGO_PROFILE_RELEASE_CODEGEN_UNITS",
+            "CARGO_PROFILE_DEV_DEBUG"
+        ]
+    );
+
+    // Nothing declared: every enabled knob applies.
+    let bare = tempfile::tempdir().unwrap();
+    assert_eq!(keys(bare.path()), every);
+    assert!(layer0_env_for_lane(&all, true, Some(bare.path())).is_empty());
+}
+
 /// bd-hoxgn: the Layer 0 pack must reach the command that actually runs. It
 /// used to be attached only to workspace-metadata roots, which never execute,
 /// so an enabled `[layer0]` changed nothing for an ordinary project.
@@ -8370,8 +8433,8 @@ async fn test_layer0_pack_reaches_the_executed_remote_command() {
         debug_line_tables_only: true,
         ..rch_common::types::Layer0Config::default()
     };
-    assert!(layer0_env_for_lane(&layer0, true).is_empty());
-    let layer0_env = layer0_env_for_lane(&layer0, false);
+    assert!(layer0_env_for_lane(&layer0, true, None).is_empty());
+    let layer0_env = layer0_env_for_lane(&layer0, false, None);
     let result = Box::pin(execute_remote_compilation(
         &worker,
         "cargo test",
