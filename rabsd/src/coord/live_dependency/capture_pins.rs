@@ -276,6 +276,72 @@ mod tests {
     }
 
     #[test]
+    fn native_output_duplicates_keep_independent_custody_and_original_sources() {
+        let dir = crate::test_util::private_tempdir();
+        let cas = Arc::new(mount_and_reconcile(dir.path()).unwrap());
+        let first_source = dir.path().join("first.rlib");
+        let second_source = dir.path().join("second.rlib");
+        let bytes = vec![19; 3 * 65536 + 7];
+        std::fs::write(&first_source, &bytes).unwrap();
+        std::fs::write(&second_source, &bytes).unwrap();
+        let mut first = CapturePins::new(Arc::clone(&cas), &authority(41));
+        let mut second = CapturePins::new(Arc::clone(&cas), &authority(42));
+        let captured = put_output(&cas, &first_source, 1 << 20, &mut first).unwrap();
+        assert_eq!(
+            put_output(&cas, &first_source, 1 << 20, &mut first).unwrap().digest,
+            captured.digest,
+        );
+        assert_eq!(
+            put_output(&cas, &second_source, 1 << 20, &mut second).unwrap().digest,
+            captured.digest,
+        );
+        assert_eq!(first.held.len(), 1);
+        assert_eq!(second.held.len(), 1);
+        assert_ne!(first.held.keys().next(), second.held.keys().next());
+        assert_eq!(captured.sig.size(), bytes.len() as u64);
+        assert_eq!(std::fs::read(first_source).unwrap(), bytes);
+        assert_eq!(std::fs::read(second_source).unwrap(), bytes);
+        drop(first);
+        assert!(collectible(&cas).is_empty());
+        drop(second);
+        assert!(collectible(&cas).contains(&digest_key(&captured.digest)));
+    }
+
+    #[test]
+    fn native_output_invalid_duplicate_refuses_without_waiting_for_metadata_lock() {
+        let dir = crate::test_util::private_tempdir();
+        let cas = Arc::new(mount_and_reconcile(dir.path()).unwrap());
+        let source = dir.path().join("caller.rlib");
+        std::fs::write(&source, b"original compiler artifact").unwrap();
+        let digest = rabs_cas::digest_set::digest_set(
+            b"original compiler artifact",
+            rabs_cas::digest_set::DigestRequest::default(),
+            None,
+        ).unwrap().atp_content_id;
+        let target = cas.layout().published_path(
+            &digest, rabs_cas::blob_store::RAW_PROFILE_V1, &digest,
+        );
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&source, &target).unwrap();
+        let held_store = cas.store().lock().unwrap();
+        let worker_cas = Arc::clone(&cas);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let mut pins = CapturePins::new(Arc::clone(&worker_cas), &authority(43));
+            let result = put_output(&worker_cas, &source, 1 << 20, &mut pins);
+            sender.send(result.map(|_| ()).map_err(|error| error.to_string())).unwrap();
+        });
+        let answer = receiver.recv_timeout(std::time::Duration::from_secs(5));
+        // Release before joining even on test failure: the negative control
+        // must fail, not strand a worker blocked behind the test's own lock.
+        drop(held_store);
+        worker.join().unwrap();
+        let error = answer.expect("duplicate observation waited behind the store lock").unwrap_err();
+        assert!(error.contains("observe output target"), "{error}");
+        assert!(target.symlink_metadata().unwrap().file_type().is_symlink());
+    }
+
+    #[test]
     fn publication_protection_survives_capture_release() {
         let dir = crate::test_util::private_tempdir();
         let cas = Arc::new(mount_and_reconcile(dir.path()).unwrap());

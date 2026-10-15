@@ -9,7 +9,9 @@
 use super::{CapturePins, KnownOutput};
 use crate::edge::live_facts::FileSig;
 use crate::janitor::store::LiveCas;
-use rabs_cas::blob_store::{DurabilityPolicy, publish_staged};
+use rabs_cas::blob_store::{
+    DurabilityPolicy, RawTargetObservation, publish_staged_with_observation,
+};
 use rabs_cas::digest_set::{DigestRequest, StreamingObjectWriter};
 use rabs_protocol::result_identity::TypedDigest;
 use std::fs::{File, Metadata};
@@ -139,20 +141,34 @@ pub(super) fn put_output(
 ) -> Result<KnownOutput, String> {
     let staged = StagedOutput::capture(&cas.layout().root().join("staging"), source, maximum)
         .map_err(|error| format!("output capture {}: {error}", source.display()))?;
-    {
-        let mut store = cas.store().lock().map_err(|_| "store lock poisoned")?;
-        // Recheck after waiting for the lock. The staging name stays private
-        // throughout; the CAS publisher remains the only location installer.
-        staged.verify().map_err(|error| error.to_string())?;
-        pins.protect(&mut *store, &staged.digest)?;
-        publish_staged(
-            cas.layout(),
-            &mut *store,
-            &staged.digest,
-            &staged.stage,
-            DurabilityPolicy::FULL,
-        )
-        .map_err(|error| format!("publish output capture: {error:?}"))?;
+    // Verification repeats commonly ingest the same large rlib/rmeta. Hash
+    // that possible duplicate before taking the ONE shared metadata lock.
+    // Retry at most twice if another publisher/GC changed the destination;
+    // keep the same captured stage and custody pin, never recopy the compiler.
+    let mut retries = 0;
+    loop {
+        let observation = RawTargetObservation::observe(cas.layout(), &staged.digest, maximum)
+            .map_err(|error| format!("observe output target: {error:?}"))?;
+        let result = {
+            let mut store = cas.store().lock().map_err(|_| "store lock poisoned")?;
+            staged.verify().map_err(|error| error.to_string())?;
+            pins.protect(&mut *store, &staged.digest)?;
+            publish_staged_with_observation(
+                cas.layout(),
+                &mut *store,
+                &staged.digest,
+                &staged.stage,
+                DurabilityPolicy::FULL,
+                &observation,
+            )
+        };
+        match result {
+            Ok(_) => break,
+            Err(error) if RawTargetObservation::changed(&error) && retries < 2 => {
+                retries += 1;
+            }
+            Err(error) => return Err(format!("publish output capture: {error:?}")),
+        }
     }
     // publish_staged consumes/removes the private staging name, not the
     // compiler output. Never manufacture a newer source identity here.
