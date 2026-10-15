@@ -43,6 +43,8 @@ the `debug_line_tables_only` knob safe to enable fleet-wide.
   it. Measured for the knob: a cold `cargo test --no-run -p rch-common -p rchd` target is 10.6 GB
   with full debuginfo and 5.1 GB with line tables only, and builds 8% faster
   ([`914aeb30`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/914aeb3076042168ef2b8fc4d47d4b0c452316e9)).
+- Tests: an rchd recovery test runs its fake `rch` through a shared shim, so a concurrent fork can no
+  longer make its exec fail with ETXTBSY ([`81dad67f`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/81dad67f0142c6e32eee9fa20eddad4865fac6c3)).
 
 ## 2.1.27 — 2026-10-14
 
