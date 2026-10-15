@@ -455,3 +455,180 @@ fn retrying_an_expired_failure_at_capacity_does_not_evict_another_package() {
     assert_eq!(memos.len(), MAX_PACKAGE_MEMOS);
     assert!(keys[..MAX_PACKAGE_MEMOS].iter().all(|key| memos.contains_key(key)));
 }
+
+#[test]
+fn saturated_warm_pool_cannot_evict_ready_snapshots_before_admission() {
+    let (_directory, facts, roots) = pressure_fixture();
+    let large = &roots[MAX_PACKAGE_MEMOS];
+    fs::OpenOptions::new()
+        .write(true)
+        .open(large.join("lib.rs"))
+        .unwrap()
+        .set_len(SYNCHRONOUS_PACKAGE_BYTES + 1)
+        .unwrap();
+    let keys: Vec<_> = roots[..MAX_PACKAGE_MEMOS]
+        .iter()
+        .map(|root| observation(root))
+        .collect();
+    let original: Vec<_> = {
+        let memos = facts.packages.lock().unwrap();
+        keys.iter()
+            .map(|key| match memos.get(key).unwrap() {
+                PackageSlot::Ready { captured, .. } => Arc::clone(captured),
+                _ => panic!("pressure fixture is not ready"),
+            })
+            .collect()
+    };
+    // Hold actual affine owners of the shared counter; no competing compiler
+    // or filesystem operation is fabricated to obtain these capacity slots.
+    let first = reserve_warm(&facts).unwrap();
+    let second = reserve_warm(&facts).unwrap();
+    assert!(reserve_warm(&facts).is_none());
+    for _ in 0..16 {
+        assert!(matches!(
+            observe_with(&facts, large, KIND, None, |_| {
+                panic!("a saturated warmer must not run capture")
+            }),
+            Err(FactsMiss::Pending)
+        ));
+        let memos = facts.packages.lock().unwrap();
+        assert_eq!(memos.len(), MAX_PACKAGE_MEMOS);
+        for (key, expected) in keys.iter().zip(&original) {
+            assert!(matches!(memos.get(key),
+                Some(PackageSlot::Ready { captured, .. }) if Arc::ptr_eq(captured, expected)));
+        }
+    }
+    assert_eq!(*facts.warming.lock().unwrap(), MAX_WARMING);
+    drop(first);
+    // Releasing just one owner admits a real large capture. No cache-wide
+    // reset, manual memo fill, or compiler fallback is needed to recover.
+    let captured = ready(&facts, large);
+    captured.verify_unchanged(large).unwrap();
+    assert_eq!(captured.bytes, SYNCHRONOUS_PACKAGE_BYTES + 1);
+    drop(second);
+    join_warm(&facts);
+    let memos = facts.packages.lock().unwrap();
+    assert_eq!(memos.len(), MAX_PACKAGE_MEMOS);
+    assert!(!memos.contains_key(&keys[0]));
+    for (key, expected) in keys[1..].iter().zip(&original[1..]) {
+        assert!(matches!(memos.get(key),
+            Some(PackageSlot::Ready { captured, .. }) if Arc::ptr_eq(captured, expected)));
+    }
+}
+
+#[test]
+fn large_ready_hits_and_small_captures_need_no_additional_warm_permit() {
+    let (_directory, large) = fixture(SYNCHRONOUS_PACKAGE_BYTES + 1);
+    let (_small_directory, small) = fixture(17);
+    let facts = LiveFacts::new();
+    let original = ready(&facts, &large);
+    join_warm(&facts);
+    let first = reserve_warm(&facts).unwrap();
+    let second = reserve_warm(&facts).unwrap();
+    let hit = observe_with(&facts, &large, KIND, None, |_| {
+        panic!("ready large package unnecessarily captured again")
+    })
+    .unwrap();
+    assert!(Arc::ptr_eq(&hit, &original));
+    let small_capture = facts.package(&small, KIND, None).unwrap();
+    small_capture.verify_unchanged(&small).unwrap();
+    assert_eq!(small_capture.bytes, 17);
+    assert_eq!(*facts.warming.lock().unwrap(), MAX_WARMING);
+    drop(first);
+    drop(second);
+    assert_eq!(*facts.warming.lock().unwrap(), 0);
+}
+
+#[test]
+fn large_capture_without_a_memo_slot_returns_its_reserved_warm_capacity() {
+    let (directory, large) = fixture(SYNCHRONOUS_PACKAGE_BYTES + 1);
+    let facts = LiveFacts::new();
+    let mut owners = Vec::new();
+    for index in 0..MAX_PACKAGE_MEMOS {
+        let root = directory.path().join(format!("pending-{index}"));
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("lib.rs"), b"pending").unwrap();
+        owners.push(reserve(&facts, &observation(&root)));
+    }
+    for _ in 0..4 {
+        assert!(matches!(
+            observe_with(&facts, &large, KIND, None, |_| {
+                panic!("all pending memo slots must refuse before spawning")
+            }),
+            Err(FactsMiss::Pending)
+        ));
+        assert_eq!(*facts.warming.lock().unwrap(), 0);
+        let memos = facts.packages.lock().unwrap();
+        assert_eq!(memos.len(), MAX_PACKAGE_MEMOS);
+        assert!(owners.iter().all(|owner| owner.owns(&memos)));
+    }
+    drop(owners.pop());
+    ready(&facts, &large).verify_unchanged(&large).unwrap();
+    join_warm(&facts);
+    let memos = facts.packages.lock().unwrap();
+    assert_eq!(memos.len(), MAX_PACKAGE_MEMOS);
+    assert!(owners.iter().all(|owner| owner.owns(&memos)));
+}
+
+#[test]
+fn entry_pressure_prefers_expired_failures_and_preserves_live_backoff() {
+    let (_directory, facts, roots) = pressure_fixture();
+    let keys: Vec<_> = roots.iter().map(|root| observation(root)).collect();
+    let base = Instant::now();
+    let now = base + PROBE_RETRY;
+    let mut memos = facts.packages.lock().unwrap();
+    memos.insert(
+        Arc::clone(&keys[0]),
+        PackageSlot::Failed {
+            reason: "expired".into(),
+            at: base,
+        },
+    );
+    memos.insert(
+        Arc::clone(&keys[1]),
+        PackageSlot::Failed {
+            reason: "live backoff".into(),
+            at: now,
+        },
+    );
+    assert!(make_entry_room(&mut memos, &keys[MAX_PACKAGE_MEMOS], now));
+    assert_eq!(memos.len(), MAX_PACKAGE_MEMOS - 1);
+    assert!(!memos.contains_key(&keys[0]));
+    assert!(keys[1..MAX_PACKAGE_MEMOS].iter().all(|key| memos.contains_key(key)));
+    assert!(matches!(memos.get_mut(&keys[1]).unwrap().reuse(now),
+        Some(Err(FactsMiss::Refused(reason))) if reason == "live backoff"));
+    memos.insert(
+        Arc::clone(&keys[MAX_PACKAGE_MEMOS]),
+        PackageSlot::Warming(Arc::new(())),
+    );
+    assert!(make_entry_room(&mut memos, &keys[0], now));
+    assert!(!memos.contains_key(&keys[2]), "oldest ready entry is next");
+    assert!(memos.contains_key(&keys[1]), "do not silently clear live backoff");
+    assert!(matches!(memos.get(&keys[MAX_PACKAGE_MEMOS]), Some(PackageSlot::Warming(_))));
+}
+
+#[test]
+fn failure_only_pressure_evicts_one_completed_failure_not_active_captures() {
+    let (_directory, facts, roots) = pressure_fixture();
+    let keys: Vec<_> = roots.iter().map(|root| observation(root)).collect();
+    let now = Instant::now();
+    let token = Arc::new(());
+    let mut memos = facts.packages.lock().unwrap();
+    for key in &keys[..MAX_PACKAGE_MEMOS] {
+        memos.insert(Arc::clone(key), PackageSlot::Warming(Arc::clone(&token)));
+    }
+    memos.insert(
+        Arc::clone(&keys[0]),
+        PackageSlot::Failed {
+            reason: "only completed entry".into(),
+            at: now,
+        },
+    );
+    assert!(make_entry_room(&mut memos, &keys[MAX_PACKAGE_MEMOS], now));
+    assert_eq!(memos.len(), MAX_PACKAGE_MEMOS - 1);
+    assert!(!memos.contains_key(&keys[0]));
+    for key in &keys[1..MAX_PACKAGE_MEMOS] {
+        assert!(matches!(memos.get(key),
+            Some(PackageSlot::Warming(held)) if Arc::ptr_eq(held, &token)));
+    }
+}

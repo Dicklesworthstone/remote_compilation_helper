@@ -6,11 +6,13 @@
 //! state. Reservations are local observation ownership, NOT action authority.
 //! Byte and entry pressure evict cold completed observations, not the entire
 //! ready cache. Recency is process-local policy, never input or key evidence.
+//! A large cold request reserves shared warm capacity BEFORE entry eviction;
+//! a saturated warmer cannot consume useful cache state without doing work.
 
 use super::{
     DependencySourceKind, FactsMiss, FileSig, GeneratedObservation, LiveFacts, MAX_PACKAGE_BYTES,
-    MAX_PACKAGE_FILES, MAX_RETAINED_PACKAGE_BYTES, MemberSig, PROBE_RETRY, PackageFacts, PackageKey,
-    SYNCHRONOUS_PACKAGE_BYTES, capture_package, observe_generated, walk_package,
+    MAX_PACKAGE_FILES, MAX_RETAINED_PACKAGE_BYTES, MAX_WARMING, MemberSig, PROBE_RETRY, PackageFacts,
+    PackageKey, SYNCHRONOUS_PACKAGE_BYTES, WarmPermit, capture_package, observe_generated, walk_package,
 };
 use std::collections::HashMap;
 use std::path::Path;
@@ -300,6 +302,21 @@ fn make_entry_room(memos: &mut PackageMemos, incoming: &Arc<Observation>, now: I
     true
 }
 
+/// Reuse LiveFacts' ONE warm counter and its existing affine release owner.
+/// The package memo lock precedes this short counter lock; neither is held
+/// during capture, thread creation, or filesystem validation. Other warm
+/// producers release the counter lock before entering any observation work.
+fn reserve_warm(facts: &Arc<LiveFacts>) -> Option<WarmPermit> {
+    let mut warming = facts.warming.lock().ok()?;
+    if *warming >= MAX_WARMING {
+        return None;
+    }
+    *warming += 1;
+    Some(WarmPermit {
+        facts: Arc::clone(facts),
+    })
+}
+
 pub(super) fn observe(
     facts: &Arc<LiveFacts>,
     root: &Path,
@@ -319,7 +336,7 @@ fn observe_with(
     let observation = Arc::new(
         Observation::read(root, source_kind, generated_root).map_err(FactsMiss::Refused)?,
     );
-    let reservation = {
+    let (reservation, warm) = {
         let mut memos = facts
             .packages
             .lock()
@@ -328,20 +345,38 @@ fn observe_with(
         if let Some(result) = memos.get_mut(&observation).and_then(|slot| slot.reuse(now)) {
             return result;
         }
+        // Ready hits and existing flights never need another warm permit.
+        // For a new large capture, refusal must precede cache mutation, not
+        // evict a ready snapshot then discover the shared warmer is full.
+        let warm = if observation.bytes > SYNCHRONOUS_PACKAGE_BYTES {
+            let Some(permit) = reserve_warm(facts) else {
+                return Err(FactsMiss::Pending);
+            };
+            Some(permit)
+        } else {
+            None
+        };
         // Check and insert are one critical section for BOTH capture paths.
         if !make_entry_room(&mut memos, &observation, now) {
             return Err(FactsMiss::Pending);
         }
-        Reservation::insert(facts, &mut memos, Arc::clone(&observation))
+        (
+            Reservation::insert(facts, &mut memos, Arc::clone(&observation)),
+            warm,
+        )
     };
-    if observation.bytes <= SYNCHRONOUS_PACKAGE_BYTES {
+    let Some(permit) = warm else {
         return reservation.finish(capture(&observation), false);
-    }
-    // Reuse the existing bounded warm pool. If spawn/admission fails, dropping
-    // this unstarted closure releases only its own exact reservation token.
-    facts.start_warm(move |_| {
-        let _ = reservation.finish(capture(&observation), true);
-    });
+    };
+    // Do not reacquire capacity after evicting. The existing WarmPermit owns
+    // accounting until capture/finish unwinds or returns. A failed thread
+    // start drops this unstarted closure and both exact reservation owners.
+    let _ = std::thread::Builder::new()
+        .name("rabs-facts-warm".to_owned())
+        .spawn(move || {
+            let _permit = permit;
+            let _ = reservation.finish(capture(&observation), true);
+        });
     Err(FactsMiss::Pending)
 }
 
