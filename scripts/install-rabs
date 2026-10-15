@@ -5,6 +5,11 @@ Accepts an extracted release bundle or Cargo's split-profile build directory.
 Generations are retained; one atomic symlink switch activates all four tools.
 The supplied files must already be trusted: hashing detects copy corruption,
 not publisher authenticity. Verify the release signature/checksum first.
+
+Repeat --ssh HOST to deploy the same trusted toolset to Linux workers. SSH
+requires an existing verified host key and never starts or restarts a daemon.
+The dispatcher may run on a different architecture. Transfers and generations
+are retained for recovery; a missing acknowledgment means activation is unknown.
 """
 
 import argparse
@@ -16,10 +21,14 @@ import os
 from pathlib import Path
 import platform
 import re
+import selectors
+import shlex
 import stat
+import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import zlib
 
 
@@ -29,10 +38,47 @@ CURRENT = ".rabs-current"
 MAX_FILE_BYTES = 2 * 1024 * 1024 * 1024
 MAX_ARCHIVE_BYTES = 4 * 1024 * 1024 * 1024
 ARCHIVE_MEMBERS = set(TOOLS) | {"rch", "rchd", "rch-wkr", "install-rabs"}
+TRANSFER_HEADER_BYTES = 64 * 1024
+MAX_INSTALLER_BYTES = 128 * 1024
+MAX_SSH_REPLY_BYTES = 128 * 1024
+MIN_DEPLOY_RESERVE = 64 * 1024 * 1024
+
+# Only this small, fixed bootstrap is a shell argument. All paths, metadata,
+# executable bytes and the installer itself travel over SSH's stdin, not through
+# shell interpolation. Authenticate the peer with SSH before sending any bytes.
+REMOTE_BOOTSTRAP = r'''
+import hashlib, json, sys
+def exact(count):
+    result = bytearray()
+    while len(result) < count:
+        chunk = sys.stdin.buffer.read(count - len(result))
+        if not chunk:
+            raise ValueError("truncated RABS deployment")
+        result.extend(chunk)
+    return bytes(result)
+def unique(pairs):
+    result = {}
+    for name, value in pairs:
+        if name in result:
+            raise ValueError("duplicate deployment field")
+        result[name] = value
+    return result
+header = json.loads(exact(65536), object_pairs_hook=unique)
+installer = header["files"][0]
+size = installer["bytes"]
+if installer["name"] != "install-rabs" or type(size) is not int or not 0 < size <= 131072:
+    raise ValueError("invalid deployment installer")
+source = exact(size)
+if hashlib.sha256(source).hexdigest() != installer["sha256"]:
+    raise ValueError("deployment installer digest mismatch")
+namespace = {"__name__": "rabs_ssh_receiver", "__file__": "<rabs-ssh-installer>"}
+exec(compile(source, "<rabs-ssh-installer>", "exec"), namespace)
+namespace["receive_deployment"](header, sys.stdin.buffer, source)
+'''
 
 
 class InstallError(Exception):
-    """No new generation was activated."""
+    """Installation or deployment failed; an SSH activation may be uncertain."""
 
 
 def signature(metadata):
@@ -85,7 +131,7 @@ class ReleaseMember(tarfile.TarInfo):
         return member
 
 
-def unpack_archive(path, destination):
+def unpack_archive(path, destination, reserve_bytes=0):
     """Read only a bounded, flat release inventory; never use extractall().
 
     Core RCH executables may share the signed archive but are not installed.
@@ -111,6 +157,8 @@ def unpack_archive(path, destination):
                     continue
                 if not member.mode & 0o111:
                     raise InstallError("release tool is not executable: " + member.name)
+                if reserve_bytes:
+                    deployment_space(destination, member.size + reserve_bytes)
                 with archive.extractfile(member) as source:
                     with (destination / member.name).open("xb") as output:
                         remaining = member.size
@@ -276,6 +324,277 @@ def install(paths, bin_dir, machine):
         os.close(directory)
 
 
+def deployment_space(path, required):
+    """Capacity preflight, not a reservation against unrelated filesystem users."""
+    path = Path(path)
+    while not path.exists() and path != path.parent:
+        path = path.parent
+    capacity = os.statvfs(path)
+    if capacity.f_bavail * capacity.f_frsize < required:
+        raise InstallError("insufficient deployment headroom on " + str(path))
+
+
+def copy_transfer_file(source, writer, limit, expected, executable):
+    """Snapshot a regular file, retaining the generation used for this transfer."""
+    descriptor = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    with os.fdopen(descriptor, "rb") as reader:
+        before = os.fstat(reader.fileno())
+        if (not stat.S_ISREG(before.st_mode) or not 0 < before.st_size <= limit
+                or signature(before) != expected or (executable and not before.st_mode & 0o111)):
+            raise InstallError("invalid deployment source: " + str(source))
+        digest = hashlib.sha256()
+        remaining = before.st_size
+        while remaining:
+            chunk = reader.read(min(1024 * 1024, remaining))
+            if not chunk:
+                raise InstallError("deployment source was truncated: " + str(source))
+            writer.write(chunk)
+            digest.update(chunk)
+            remaining -= len(chunk)
+        if (reader.read(1) or signature(os.fstat(reader.fileno())) != signature(before)
+                or signature(Path(source).lstat()) != signature(before)):
+            raise InstallError("deployment source changed: " + str(source))
+    return {"bytes": before.st_size, "sha256": digest.hexdigest()}, signature(before)
+
+
+def prepare_deployment(paths, bin_dir, reserve_bytes):
+    """Seal once, before contacting any worker. Never stream mutable build output."""
+    if bin_dir is not None and (not os.path.isabs(bin_dir) or "\0" in bin_dir):
+        raise InstallError("remote --bin-dir must be absolute (or omitted for the remote home)")
+    if type(reserve_bytes) is not int or reserve_bytes < MIN_DEPLOY_RESERVE:
+        raise InstallError("deployment reserve must be at least 64 MiB")
+    stage = Path(tempfile.mkdtemp(prefix="rabs-deploy-send-"))
+    if set(paths) != set(TOOLS):
+        raise InstallError("deployment requires exactly the four RABS tools")
+    sources = {"install-rabs": Path(__file__).resolve(), **paths}
+    observed_sources = {name: signature(path.lstat()) for name, path in sources.items()}
+    estimated = sum(observed[2] for observed in observed_sources.values())
+    if not 0 < estimated <= MAX_ARCHIVE_BYTES + MAX_INSTALLER_BYTES:
+        raise InstallError("deployment exceeds its total byte limit")
+    deployment_space(stage, estimated + TRANSFER_HEADER_BYTES + reserve_bytes)
+    header = {"schema": 1, "files": [], "bin_dir": bin_dir, "reserve_bytes": reserve_bytes}
+    identities = []
+    wire = stage / "transfer.bin"
+    with wire.open("xb") as writer:
+        writer.write(b" " * TRANSFER_HEADER_BYTES)
+        for name in ("install-rabs",) + TOOLS:
+            limit = MAX_INSTALLER_BYTES if name == "install-rabs" else MAX_FILE_BYTES
+            entry, observed = copy_transfer_file(sources[name], writer, limit,
+                                                 observed_sources[name], name != "install-rabs")
+            header["files"].append({"name": name, **entry})
+            identities.append((sources[name], observed))
+        # A later file must not hide replacement of an earlier input. This
+        # snapshot, including its hashes, is reused unchanged for every host.
+        for path, observed in identities:
+            if signature(path.lstat()) != observed:
+                raise InstallError("deployment input changed during capture: " + str(path))
+        validate_deployment_header(header)
+        encoded = json.dumps(header, sort_keys=True).encode("utf-8")
+        if len(encoded) > TRANSFER_HEADER_BYTES:
+            raise InstallError("deployment header exceeds its byte limit")
+        writer.seek(0)
+        writer.write(encoded.ljust(TRANSFER_HEADER_BYTES, b" "))
+        writer.flush()
+        os.fchmod(writer.fileno(), 0o400)
+        os.fsync(writer.fileno())
+    return wire, header, signature(wire.lstat())
+
+
+def validate_deployment_header(header):
+    if (not isinstance(header, dict) or type(header.get("schema")) is not int
+            or header["schema"] != 1 or set(header) != {"schema", "files", "bin_dir", "reserve_bytes"}):
+        raise InstallError("invalid deployment header")
+    root = header["bin_dir"]
+    if root is not None and (not isinstance(root, str) or not os.path.isabs(root) or "\0" in root):
+        raise InstallError("invalid remote installation root")
+    reserve = header["reserve_bytes"]
+    if type(reserve) is not int or not MIN_DEPLOY_RESERVE <= reserve <= 64 * 1024**3:
+        raise InstallError("invalid deployment disk reserve")
+    files = header["files"]
+    names = ("install-rabs",) + TOOLS
+    if not isinstance(files, list) or len(files) != len(names):
+        raise InstallError("incomplete deployment toolset")
+    total = 0
+    for name, entry in zip(names, files):
+        if not isinstance(entry, dict) or set(entry) != {"name", "bytes", "sha256"} or entry["name"] != name:
+            raise InstallError("invalid deployment member")
+        size, digest = entry["bytes"], entry["sha256"]
+        limit = MAX_INSTALLER_BYTES if name == "install-rabs" else MAX_FILE_BYTES
+        if (type(size) is not int or not 0 < size <= limit or not isinstance(digest, str)
+                or re.fullmatch(r"[0-9a-f]{64}", digest) is None):
+            raise InstallError("invalid deployment file identity")
+        total += size
+    if total > MAX_ARCHIVE_BYTES + MAX_INSTALLER_BYTES:
+        raise InstallError("deployment exceeds its total byte limit")
+    return total
+
+
+def receive_deployment(header, reader, installer_source):
+    """Worker entry: verify every transferred byte BEFORE invoking the installer.
+
+    No supplied executable is run. Only this authenticated installer performs
+    the existing native-ELF check and atomic generation activation. Staging is
+    retained on success and failure, and no service or Cargo setting is changed.
+    """
+    total = validate_deployment_header(header)
+    installer = header["files"][0]
+    if (len(installer_source) != installer["bytes"]
+            or hashlib.sha256(installer_source).hexdigest() != installer["sha256"]):
+        raise InstallError("deployment installer identity differs")
+    machine = host_machine()
+    root = Path(header["bin_dir"]) if header["bin_dir"] is not None else Path.home() / ".local" / "bin"
+    stage = Path(tempfile.mkdtemp(prefix="rabs-deploy-recv-"))
+    # Conservative for either one filesystem or two: transferred tool bytes
+    # plus a complete retained installation generation must fit with reserve.
+    reserve = header["reserve_bytes"]
+    deployment_space(stage, 2 * total + reserve)
+    deployment_space(root, 2 * total + reserve)
+    with (stage / "install-rabs").open("xb") as writer:
+        writer.write(installer_source)
+    for entry in header["files"][1:]:
+        path = stage / entry["name"]
+        digest = hashlib.sha256()
+        remaining = entry["bytes"]
+        with path.open("xb") as writer:
+            while remaining:
+                deployment_space(stage, reserve)
+                chunk = reader.read(min(1024 * 1024, remaining))
+                if not chunk:
+                    raise InstallError("truncated deployment member: " + entry["name"])
+                writer.write(chunk)
+                digest.update(chunk)
+                remaining -= len(chunk)
+            writer.flush()
+            os.fchmod(writer.fileno(), 0o700)
+            os.fsync(writer.fileno())
+        if digest.hexdigest() != entry["sha256"]:
+            raise InstallError("deployment member digest mismatch: " + entry["name"])
+    if reader.read(1):
+        raise InstallError("unexpected bytes after complete deployment")
+    deployment_space(root, total + reserve)
+    result = install(source_files(stage, None), str(root), machine)
+    result.update({"transport": "ssh", "staging_dir": str(stage),
+                   "installer_sha256": installer["sha256"]})
+    print(json.dumps(result, sort_keys=True), flush=True)
+
+
+def deployment_reply(stdout, expected):
+    def unique(pairs):
+        result = {}
+        for name, value in pairs:
+            if name in result:
+                raise InstallError("duplicate installation receipt field")
+            result[name] = value
+        return result
+
+    try:
+        receipt = json.loads(stdout.decode("utf-8"), object_pairs_hook=unique)
+    except (ValueError, UnicodeError) as error:
+        raise InstallError("missing or malformed remote installation receipt") from error
+    if (not isinstance(receipt, dict) or receipt.get("kind") != "rabs-installed"
+            or receipt.get("transport") != "ssh"
+            or receipt.get("services_started") is not False
+            or receipt.get("cargo_config_changed") is not False
+            or receipt.get("installer_sha256") != expected["files"][0]["sha256"]):
+        raise InstallError("remote installation receipt does not bind this deployment")
+    files = {entry["name"]: {"bytes": entry["bytes"], "sha256": entry["sha256"]}
+             for entry in expected["files"][1:]}
+    if (receipt.get("files") != files
+            or any(type(entry.get("bytes")) is not int for entry in receipt["files"].values())):
+        raise InstallError("remote installed file identities differ from the sent toolset")
+    generation = receipt.get("generation")
+    root = receipt.get("bin_dir")
+    if (not isinstance(generation, str) or re.fullmatch(r"gen-[a-zA-Z0-9_-]+", generation) is None
+            or not isinstance(root, str) or not os.path.isabs(root) or "\0" in root
+            or (expected["bin_dir"] is not None and root != str(Path(expected["bin_dir"]).absolute()))):
+        raise InstallError("remote installed generation or destination differs")
+    return receipt
+
+
+def ssh_exchange(argv, wire, identity, timeout):
+    """Bound both output streams and the entire SSH lifetime, not individual reads.
+
+    On timeout only our SSH client is killed. Remote activation may already have
+    happened: callers must report an unconfirmed outcome, never retry blindly.
+    """
+    with wire.open("rb") as source:
+        if (signature(os.fstat(source.fileno())) != identity or signature(wire.lstat()) != identity):
+            raise InstallError("sealed deployment image changed")
+        deadline = time.monotonic() + timeout
+        child = subprocess.Popen(argv, stdin=source, stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE, close_fds=True)
+        output = {"stdout": bytearray(), "stderr": bytearray()}
+        count = 0
+        try:
+            with selectors.DefaultSelector() as selector:
+                selector.register(child.stdout, selectors.EVENT_READ, "stdout")
+                selector.register(child.stderr, selectors.EVENT_READ, "stderr")
+                while selector.get_map():
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise InstallError("SSH deployment deadline expired")
+                    for key, _ in selector.select(remaining):
+                        chunk = os.read(key.fileobj.fileno(), 4096)
+                        if not chunk:
+                            selector.unregister(key.fileobj)
+                            continue
+                        count += len(chunk)
+                        if count > MAX_SSH_REPLY_BYTES:
+                            raise InstallError("SSH deployment output exceeded its bound")
+                        output[key.data].extend(chunk)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise InstallError("SSH deployment deadline expired")
+            status = child.wait(timeout=remaining)
+            if status != 0:
+                detail = bytes(output["stderr"]).decode("utf-8", errors="replace")[-4096:]
+                raise InstallError("SSH deployment exit {}: {}".format(status, detail))
+            if (signature(os.fstat(source.fileno())) != identity or signature(wire.lstat()) != identity):
+                raise InstallError("deployment image changed during transfer")
+            return bytes(output["stdout"])
+        finally:
+            if child.poll() is None:
+                child.kill()
+                try:
+                    child.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    pass
+            child.stdout.close()
+            child.stderr.close()
+
+
+def validate_deploy_options(hosts, bin_dir, timeout, reserve_bytes):
+    if (not 1 <= len(hosts) <= 32 or len(set(hosts)) != len(hosts)
+            or any(not host or host.startswith("-") or len(host) > 255
+                   or re.fullmatch(r"[a-zA-Z0-9_.@:%\[\]-]+", host) is None for host in hosts)):
+        raise InstallError("select 1..32 distinct SSH host aliases (no options or shell syntax)")
+    if type(timeout) is not int or not 1 <= timeout <= 3600:
+        raise InstallError("--ssh-timeout must be between 1 and 3600 seconds")
+    if bin_dir is not None and (not os.path.isabs(bin_dir) or "\0" in bin_dir):
+        raise InstallError("remote --bin-dir must be absolute (or omitted for the remote home)")
+    if type(reserve_bytes) is not int or not MIN_DEPLOY_RESERVE <= reserve_bytes <= 64 * 1024**3:
+        raise InstallError("--ssh-reserve-mib must be between 64 and 65536")
+
+
+def deploy(paths, hosts, bin_dir, timeout, reserve_bytes):
+    validate_deploy_options(hosts, bin_dir, timeout, reserve_bytes)
+    wire, header, identity = prepare_deployment(paths, bin_dir, reserve_bytes)
+    results = []
+    command = "python3 -c " + shlex.quote(REMOTE_BOOTSTRAP)
+    for host in hosts:
+        argv = ["ssh", "-T", "-oBatchMode=yes", "-oStrictHostKeyChecking=yes",
+                "-oForwardAgent=no", "-oClearAllForwardings=yes", "-oConnectionAttempts=1",
+                "-oConnectTimeout=" + str(min(timeout, 30)), "--", host, command]
+        try:
+            receipt = deployment_reply(ssh_exchange(argv, wire, identity, timeout), header)
+            results.append({"host": host, "state": "installed", "receipt": receipt})
+        except (InstallError, OSError, subprocess.SubprocessError) as error:
+            results.append({"host": host, "state": "unconfirmed", "error": str(error),
+                            "activation_may_have_occurred": True})
+    return {"kind": "rabs-deployed", "workers": results, "transfer_image": str(wire),
+            "services_started": False, "cargo_config_changed": False}
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     source = parser.add_mutually_exclusive_group()
@@ -285,9 +604,31 @@ def main(argv=None):
                         help="Cargo target directory containing wrapper-release and daemon-release")
     source.add_argument("--from-archive", metavar="TAR_GZ",
                         help="flat release archive whose publisher signature has already been verified")
-    parser.add_argument("--bin-dir", default=str(Path.home() / ".local" / "bin"))
+    parser.add_argument("--bin-dir", help="absolute destination; default is the destination user's ~/.local/bin")
+    parser.add_argument("--ssh", action="append", default=[], metavar="HOST",
+                        help="deploy over authenticated SSH; repeat for same-architecture workers")
+    parser.add_argument("--ssh-timeout", type=int, default=600, metavar="SECONDS",
+                        help="absolute transfer/install deadline per worker (1..3600)")
+    parser.add_argument("--ssh-reserve-mib", type=int, default=1024, metavar="MIB",
+                        help="required deployment headroom, minimum 64 MiB; not a disk reservation")
     args = parser.parse_args(argv)
     try:
+        if args.ssh:
+            reserve_bytes = args.ssh_reserve_mib * 1024 * 1024
+            validate_deploy_options(args.ssh, args.bin_dir, args.ssh_timeout, reserve_bytes)
+            if args.from_archive:
+                # Retain the authenticated extraction with the transfer image.
+                # Never use a mutable shared build directory as an SSH stream.
+                temporary = Path(tempfile.mkdtemp(prefix="rabs-deploy-bundle-"))
+                unpack_archive(args.from_archive, temporary, reserve_bytes=reserve_bytes)
+                paths = source_files(temporary, None)
+            else:
+                paths = source_files(args.from_bundle, args.from_build)
+            result = deploy(paths, args.ssh, args.bin_dir, args.ssh_timeout,
+                            reserve_bytes)
+            print(json.dumps(result, sort_keys=True))
+            return int(any(worker["state"] != "installed" for worker in result["workers"]))
+        args.bin_dir = args.bin_dir or str(Path.home() / ".local" / "bin")
         machine = host_machine()
         if args.from_archive:
             with tempfile.TemporaryDirectory(prefix="rabs-bundle-") as temporary:

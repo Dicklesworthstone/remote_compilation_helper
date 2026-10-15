@@ -17,7 +17,7 @@ on:
       - 'rabs-cas/**'
       - 'scripts/cargo-rabs'
       - 'scripts/install-rabs'
-      - 'tests/test_install_rabs.py'
+      - 'tests/test_install_rabs*.py'
       - '.github/workflows/release.yml'
       - '.github/workflows/rabs-binaries.yml'
   pull_request:
@@ -46,7 +46,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Native filesystem, process, archive and upgrade regressions
-        run: python3 -m unittest discover -s tests -p test_install_rabs.py -v
+        run: python3 -m unittest discover -s tests -p 'test_install_rabs*.py' -v
 
   # Exercise the accepted-hit delivery frontier independently of the slower
   # release/overhead lane. Local agent sandboxes may prohibit Unix sockets;
