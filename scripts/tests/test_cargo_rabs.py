@@ -20,6 +20,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 
 LAUNCHER = Path(__file__).resolve().parents[1] / "cargo-rabs"
 loader = importlib.machinery.SourceFileLoader("cargo_rabs", str(LAUNCHER))
@@ -80,6 +81,16 @@ if not root.exists():
 if os.environ.get("TEST_START_FAIL"):
     sys.exit(31)
 listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+if pathlib.Path(path).exists():
+    # Model rabsd's existing stale-socket takeover, only in this fixture.
+    # The production launcher must leave the endpoint for the daemon to own.
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+        try:
+            probe.connect(path)
+        except ConnectionRefusedError:
+            pathlib.Path(path).unlink()
+        else:
+            sys.exit(33)
 listener.bind(path)
 os.chmod(path, 0o600)
 listener.listen(64)
@@ -141,8 +152,9 @@ class LauncherTests(unittest.TestCase):
 
     def tearDown(self):
         # Stop only our fixture service through its test-only protocol. The
-        # production launcher has no stop, unlink, kill-group or restart path.
-        if (self.root / "starts").exists():
+        # production launcher never stops or unlinks an existing daemon.
+        if (self.root / "starts").exists() and any(
+                not rabs.process_exited(item["pid"]) for item in self.starts()):
             until = time.monotonic() + 3
             while time.monotonic() < until:
                 try:
@@ -592,6 +604,225 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(result.returncode, 127)
         self.assertEqual(self.starts(), [])
 
+    def owner_receipt(self):
+        return self.root / "state/cargo-launcher/daemon-owner.json"
+
+    def crash_service(self):
+        value = self.cargo_result(self.launch())
+        self.assertEqual(value["env"].get("RUSTC_WRAPPER"), str(self.wrap))
+        pid = self.starts()[-1]["pid"]
+        receipt = json.loads(self.owner_receipt().read_text())
+        identity = rabs.socket_identity(self.endpoint)
+        self.assertEqual(receipt["pid"], pid)
+        self.assertEqual(receipt["socket"], list(identity))
+        os.kill(pid, signal.SIGKILL)  # Only our recorded fixture daemon.
+        deadline = time.monotonic() + 3
+        while not rabs.process_exited(pid) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertTrue(rabs.process_exited(pid), "fixture must be dead before recovery")
+        self.assertEqual(rabs.socket_identity(self.endpoint), identity)
+        return pid, identity
+
+    def test_crashed_managed_daemon_restarts_and_keeps_existing_state(self):
+        old_pid, old_socket = self.crash_service()
+        retained = self.root / "state/retained-state"
+        retained.write_bytes(b"existing state must survive restart\0\xff")
+        args = ["check", "--manifest-path", "a path/Cargo.toml"]
+        value = self.cargo_result(self.launch(["--rabs-require-daemon"] + args))
+        self.assertEqual(value["env"].get("RUSTC_WRAPPER"), str(self.wrap))
+        self.assertEqual(value["argv"], [os.fsencode(arg).hex() for arg in args])
+        self.assertEqual(len(self.starts()), 2)
+        self.assertNotEqual(self.starts()[-1]["pid"], old_pid)
+        self.assertNotEqual(rabs.socket_identity(self.endpoint), old_socket)
+        self.assertEqual(retained.read_bytes(), b"existing state must survive restart\0\xff")
+        receipt = json.loads(self.owner_receipt().read_text())
+        self.assertEqual(receipt["pid"], self.starts()[-1]["pid"])
+        self.assertEqual(receipt["socket"], list(rabs.socket_identity(self.endpoint)))
+        self.assertEqual(stat.S_IMODE(self.owner_receipt().stat().st_mode), 0o600)
+
+    def test_parallel_recovery_starts_exactly_one_replacement(self):
+        self.crash_service()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=12) as pool:
+            results = list(pool.map(lambda _: self.launch(
+                ["--rabs-require-daemon", "check"], {"TEST_START_DELAY": "0.2"}), range(12)))
+        for result in results:
+            value = self.cargo_result(result)
+            self.assertEqual(value["env"].get("RUSTC_WRAPPER"), str(self.wrap), result.stderr)
+        self.assertEqual(len(self.starts()), 2, "one original plus one recovery")
+
+    def test_owner_binding_advances_across_multiple_crashes(self):
+        self.crash_service()
+        self.crash_service()
+        value = self.cargo_result(self.launch(["--rabs-require-daemon"]))
+        self.assertEqual(value["env"].get("RUSTC_WRAPPER"), str(self.wrap))
+        self.assertEqual(len(self.starts()), 3)
+        self.assertEqual(json.loads(self.owner_receipt().read_text())["pid"],
+                         self.starts()[-1]["pid"])
+
+    def test_no_start_never_recovers_even_with_a_valid_owner_receipt(self):
+        _, identity = self.crash_service()
+        receipt = self.owner_receipt().read_bytes()
+        result = self.launch(["--rabs-no-start", "--rabs-require-daemon"])
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, b"")
+        value = self.cargo_result(self.launch(["--rabs-no-start"]))
+        self.assertNotIn("RUSTC_WRAPPER", value["env"])
+        self.assertEqual(len(self.starts()), 1)
+        self.assertEqual(rabs.socket_identity(self.endpoint), identity)
+        self.assertEqual(self.owner_receipt().read_bytes(), receipt)
+
+    def test_recovery_never_adopts_a_different_state_directory(self):
+        _, identity = self.crash_service()
+        result = self.launch(["--rabs-require-daemon"], {
+            "RABS_STATE_DIR": str(self.root / "other-state"),
+        })
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(len(self.starts()), 1)
+        self.assertEqual(rabs.socket_identity(self.endpoint), identity)
+
+    def test_missing_and_malformed_owner_receipts_leave_stale_socket_untouched(self):
+        _, identity = self.crash_service()
+        receipt = self.owner_receipt()
+        receipt.rename(receipt.with_name("retained-owner.json"))
+        for content in [None, b"{", b"{}", b"x" * (rabs.MAX_OWNER_RECEIPT + 1),
+                        b'{"v":1,"v":1}', b"[]"]:
+            with self.subTest(content=content and content[:30]):
+                if content is not None:
+                    receipt.write_bytes(content)
+                    receipt.chmod(0o600)
+                result = self.launch(["--rabs-require-daemon"])
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(result.stdout, b"")
+                self.assertEqual(rabs.socket_identity(self.endpoint), identity)
+                self.assertEqual(len(self.starts()), 1)
+                if content is not None:
+                    self.assertEqual(receipt.read_bytes(), content)
+
+    def test_mismatched_receipt_or_live_pid_cannot_authorize_recovery(self):
+        _, identity = self.crash_service()
+        original = json.loads(self.owner_receipt().read_text())
+        cases = [("pid", os.getpid()), ("pid", True), ("pid", -1),
+                 ("pid", 0x80000000), ("v", True), ("v", 2),
+                 ("state", [0, 0]), ("endpoint_lock", [0, 0]),
+                 ("socket", [identity[0], identity[1], identity[2] + 1])]
+        for key, changed in cases:
+            with self.subTest(key=key, changed=changed):
+                value = dict(original)
+                value[key] = changed
+                self.owner_receipt().write_text(json.dumps(value))
+                result = self.launch(["--rabs-require-daemon"])
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(result.stdout, b"")
+                self.assertEqual(rabs.socket_identity(self.endpoint), identity)
+                self.assertEqual(len(self.starts()), 1)
+
+    def test_receipt_symlink_hardlink_fifo_directory_and_public_mode_are_not_repaired(self):
+        _, identity = self.crash_service()
+        receipt = self.owner_receipt()
+        original = receipt.read_bytes()
+        for fault in ["symlink", "hardlink", "fifo", "directory", "public"]:
+            with self.subTest(fault=fault):
+                receipt.rename(receipt.with_name("retained-" + fault))
+                target = self.root / ("receipt-target-" + fault)
+                target.write_bytes(original)
+                target.chmod(0o600)
+                if fault == "symlink":
+                    receipt.symlink_to(target)
+                elif fault == "hardlink":
+                    os.link(target, receipt)
+                elif fault == "fifo":
+                    os.mkfifo(receipt, 0o600)
+                elif fault == "directory":
+                    receipt.mkdir(mode=0o700)
+                else:
+                    receipt.write_bytes(original)
+                    receipt.chmod(0o666)
+                before = receipt.lstat()
+                started = time.monotonic()
+                result = self.launch(["--rabs-require-daemon"])
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertLess(time.monotonic() - started, 2)
+                after = receipt.lstat()
+                self.assertEqual((before.st_ino, before.st_mode, before.st_nlink),
+                                 (after.st_ino, after.st_mode, after.st_nlink))
+                self.assertEqual(target.read_bytes(), original)
+                self.assertEqual(rabs.socket_identity(self.endpoint), identity)
+                self.assertEqual(len(self.starts()), 1)
+
+    def test_live_unresponsive_recorded_daemon_is_not_restarted(self):
+        self.cargo_result(self.launch())
+        pid = self.starts()[0]["pid"]
+        identity = rabs.socket_identity(self.endpoint)
+        receipt = self.owner_receipt().read_bytes()
+        os.kill(pid, signal.SIGSTOP)  # Pause only this fixture, then restore it.
+        try:
+            result = self.launch(["--rabs-require-daemon"], {"CARGO_RABS_STARTUP_MS": "200"})
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertEqual(result.stdout, b"")
+            self.assertEqual(len(self.starts()), 1)
+            self.assertEqual(rabs.socket_identity(self.endpoint), identity)
+            self.assertEqual(self.owner_receipt().read_bytes(), receipt)
+        finally:
+            os.kill(pid, signal.SIGCONT)
+
+    def test_failed_recovery_preserves_stock_cargo_exit_and_original_state(self):
+        _, identity = self.crash_service()
+        receipt = self.owner_receipt().read_bytes()
+        result = self.launch(changes={"TEST_START_FAIL": "1", "TEST_CARGO_STATUS": "37"})
+        self.assertEqual(result.returncode, 37, result.stderr)
+        self.assertNotIn("RUSTC_WRAPPER", json.loads(result.stdout)["env"])
+        self.assertEqual(len(self.starts()), 2)
+        self.assertEqual(rabs.socket_identity(self.endpoint), identity)
+        self.assertEqual(self.owner_receipt().read_bytes(), receipt)
+
+    def test_recovery_timeout_leaves_replacement_holding_both_locks(self):
+        self.crash_service()
+        receipt = self.owner_receipt().read_bytes()
+        gate = self.root / "recovery-bind-gate"
+        changes = {"TEST_START_GATE": str(gate), "CARGO_RABS_STARTUP_MS": "200"}
+        try:
+            first = self.cargo_result(self.launch(changes=changes))
+            self.assertNotIn("RUSTC_WRAPPER", first["env"])
+            self.assertEqual(len(self.starts()), 2)
+            self.assertEqual(self.owner_receipt().read_bytes(), receipt)
+            second = self.cargo_result(self.launch(changes=changes))
+            self.assertNotIn("RUSTC_WRAPPER", second["env"])
+            self.assertEqual(len(self.starts()), 2, "the incomplete restart owns both locks")
+        finally:
+            gate.write_text("allow bind")
+        ready = self.cargo_result(self.launch(["--rabs-require-daemon"]))
+        self.assertEqual(ready["env"].get("RUSTC_WRAPPER"), str(self.wrap))
+        self.assertEqual(len(self.starts()), 2)
+
+    def test_recovery_accepts_socket_parent_alias_but_not_changed_socket_generation(self):
+        _, identity = self.crash_service()
+        alias = self.root / "parent-alias"
+        alias.symlink_to(self.root, target_is_directory=True)
+        value = self.cargo_result(self.launch(["--rabs-require-daemon"], {
+            "RABS_SOCKET_PATH": str(alias / self.endpoint.name),
+        }))
+        self.assertEqual(value["env"].get("RUSTC_WRAPPER"), str(self.wrap))
+        self.assertNotEqual(rabs.socket_identity(self.endpoint), identity)
+        self.assertEqual(len(self.starts()), 2)
+
+    def test_readiness_cannot_be_attributed_to_another_process(self):
+        self.cargo_result(self.launch())
+        with self.assertRaisesRegex(rabs.SetupError, "not the daemon"):
+            rabs.probe(str(self.endpoint), time.monotonic() + 1, os.getpid())
+        self.assertTrue(rabs.probe(str(self.endpoint), time.monotonic() + 1, self.starts()[0]["pid"]))
+
+    def test_recovery_receipt_read_failures_do_not_leak_descriptors(self):
+        _, identity = self.crash_service()
+        self.owner_receipt().write_bytes(b"{broken}")
+        with rabs.StartupLock(str(self.root / "state"), str(self.endpoint),
+                              time.monotonic() + 2) as lock:
+            self.assertTrue(lock.acquire(str(self.endpoint)))
+            before = len(os.listdir("/proc/self/fd"))
+            for _ in range(20):
+                with self.assertRaises(rabs.SetupError):
+                    lock.authorize_recovery(identity)
+            self.assertEqual(len(os.listdir("/proc/self/fd")), before)
+
 
 class ProtocolTests(unittest.TestCase):
     def test_argument_boundary_does_not_consume_cargo_options(self):
@@ -606,6 +837,13 @@ class ProtocolTests(unittest.TestCase):
                      b'{} {}', b'{"a":"\xff"}', b'{']:
             with self.subTest(data=data), self.assertRaises(rabs.SetupError):
                 rabs.decode_object(data)
+
+    def test_json_decoder_recursion_failure_is_a_setup_failure(self):
+        # The JSON implementation/host recursion limit differs across Python
+        # versions. Exercise its failure contract without changing global limits.
+        with mock.patch.object(rabs.json, "loads", side_effect=RecursionError("deep JSON")):
+            with self.assertRaises(rabs.SetupError):
+                rabs.decode_object(b'{"kind":"coord-status"}')
 
     def test_frame_bound_partial_io_and_buffered_deadline(self):
         for data in [b'x' * rabs.MAX_FRAME, b'{}', b'{"kind":"x"}\n']:
