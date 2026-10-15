@@ -3526,8 +3526,15 @@ fn default_excludes() -> Vec<String> {
         ".nuxt/".to_string(),
         ".turbo/".to_string(),
         ".parcel-cache/".to_string(),
-        // Beads runtime state (local issue DB + lock/temp files); not needed remotely.
+        // Agent/session state, not ordinary compilation inputs (issue #109).
+        // Directory-only basenames cover nested copies, not similarly named
+        // files or directories. .beads/ also covers .beads/.br_recovery/.
         ".beads/".to_string(),
+        ".ntm/".to_string(),
+        ".beads-recovery/".to_string(),
+        // Do not exclude scratch/, data/, artifacts/ or project configuration:
+        // they may contain required build inputs. .rchignore adds project-local
+        // exclusions; an explicit exclude_patterns list replaces these defaults.
         // Local diagnostic runs may contain host-specific symlinks and are not build inputs.
         ".doctor/".to_string(),
         // Coverage reports (generated during tests)
