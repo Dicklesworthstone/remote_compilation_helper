@@ -112,15 +112,40 @@ jobs:
         run: |
           cargo build --profile wrapper-release --target x86_64-unknown-linux-gnu -p rch
           cargo build --profile daemon-release --target x86_64-unknown-linux-gnu -p rchd -p rch-wkr
+      - name: Build complete opt-in RABS toolset (S7)
+        run: |
+          rustup toolchain install nightly-2026-08-31 --profile minimal --target x86_64-unknown-linux-gnu
+          cargo +nightly-2026-08-31 build --locked --profile wrapper-release --target x86_64-unknown-linux-gnu -p rabs-wrap
+          cargo +nightly-2026-08-31 build --locked --profile daemon-release --target x86_64-unknown-linux-gnu -p rabsd -p rabs-wkr
       - name: Package
         run: |
           mkdir -p dist
           T=x86_64-unknown-linux-gnu
           # Flat member names: install.sh extracts and installs $TEMP_DIR/<bin>.
-          tar -czf dist/rch-${{ needs.plan.outputs.tag }}-${T}.tar.gz \
-            -C "$PWD/target/${T}/wrapper-release" rch \
-            -C "$PWD/target/${T}/daemon-release" rchd rch-wkr
+          # Core installs remain unchanged; install-rabs explicitly selects RABS.
+          # USTAR avoids extension headers in the installer's bounded inventory.
+          tar --format=ustar -czf dist/rch-${{ needs.plan.outputs.tag }}-${T}.tar.gz \
+            -C "$PWD/target/${T}/wrapper-release" rch rabs-wrap \
+            -C "$PWD/target/${T}/daemon-release" rchd rch-wkr rabsd rabs-wkr \
+            -C "$PWD/scripts" cargo-rabs install-rabs
           sha256sum dist/rch-${{ needs.plan.outputs.tag }}-${T}.tar.gz > dist/rch-${{ needs.plan.outputs.tag }}-${T}.tar.gz.sha256
+      - name: Verify native RABS archive installation and upgrade
+        run: |
+          set -euo pipefail
+          archive="$PWD/dist/rch-${{ needs.plan.outputs.tag }}-x86_64-unknown-linux-gnu.tar.gz"
+          prefix=$(mktemp -d)
+          python3 scripts/install-rabs --from-archive "$archive" --bin-dir "$prefix/bin"
+          PATH="$prefix/bin:$PATH" cargo rabs --help
+          "$prefix/bin/rabs-wrap" "$(rustup which rustc)" --version
+          "$prefix/bin/rabs-wkr" --version
+          RABS_STATE_DIR="$prefix/state" RABS_SOCKET_PATH="$prefix/edge.sock" RABS_LIVE_DEPENDENCY=0 \
+            "$prefix/bin/rabsd" --check-config > "$prefix/config.json"
+          python3 -c 'import json,sys; c=json.load(open(sys.argv[1])); assert c["kind"]=="rabsd-config" and c["live_dependency"] is False' "$prefix/config.json"
+          previous=$(readlink "$prefix/bin/.rabs-current")
+          python3 scripts/install-rabs --from-archive "$archive" --bin-dir "$prefix/bin"
+          test "$previous" != "$(readlink "$prefix/bin/.rabs-current")"
+          test -f "$prefix/bin/$previous/rabsd"
+          test ! -e "$prefix/edge.sock"
       - uses: actions/upload-artifact@v4
         with:
           name: dist-linux-x86_64
@@ -182,14 +207,37 @@ jobs:
         run: |
           cargo build --profile wrapper-release --target aarch64-unknown-linux-gnu -p rch
           cargo build --profile daemon-release --target aarch64-unknown-linux-gnu -p rchd -p rch-wkr
+      - name: Build complete opt-in RABS toolset (S7)
+        run: |
+          rustup toolchain install nightly-2026-08-31 --profile minimal --target aarch64-unknown-linux-gnu
+          cargo +nightly-2026-08-31 build --locked --profile wrapper-release --target aarch64-unknown-linux-gnu -p rabs-wrap
+          cargo +nightly-2026-08-31 build --locked --profile daemon-release --target aarch64-unknown-linux-gnu -p rabsd -p rabs-wkr
       - name: Package
         run: |
           mkdir -p dist
           T=aarch64-unknown-linux-gnu
-          tar -czf dist/rch-${{ needs.plan.outputs.tag }}-${T}.tar.gz \
-            -C "$PWD/target/${T}/wrapper-release" rch \
-            -C "$PWD/target/${T}/daemon-release" rchd rch-wkr
+          tar --format=ustar -czf dist/rch-${{ needs.plan.outputs.tag }}-${T}.tar.gz \
+            -C "$PWD/target/${T}/wrapper-release" rch rabs-wrap \
+            -C "$PWD/target/${T}/daemon-release" rchd rch-wkr rabsd rabs-wkr \
+            -C "$PWD/scripts" cargo-rabs install-rabs
           sha256sum dist/rch-${{ needs.plan.outputs.tag }}-${T}.tar.gz > dist/rch-${{ needs.plan.outputs.tag }}-${T}.tar.gz.sha256
+      - name: Verify native RABS archive installation and upgrade
+        run: |
+          set -euo pipefail
+          archive="$PWD/dist/rch-${{ needs.plan.outputs.tag }}-aarch64-unknown-linux-gnu.tar.gz"
+          prefix=$(mktemp -d)
+          python3 scripts/install-rabs --from-archive "$archive" --bin-dir "$prefix/bin"
+          PATH="$prefix/bin:$PATH" cargo rabs --help
+          "$prefix/bin/rabs-wrap" "$(rustup which rustc)" --version
+          "$prefix/bin/rabs-wkr" --version
+          RABS_STATE_DIR="$prefix/state" RABS_SOCKET_PATH="$prefix/edge.sock" RABS_LIVE_DEPENDENCY=0 \
+            "$prefix/bin/rabsd" --check-config > "$prefix/config.json"
+          python3 -c 'import json,sys; c=json.load(open(sys.argv[1])); assert c["kind"]=="rabsd-config" and c["live_dependency"] is False' "$prefix/config.json"
+          previous=$(readlink "$prefix/bin/.rabs-current")
+          python3 scripts/install-rabs --from-archive "$archive" --bin-dir "$prefix/bin"
+          test "$previous" != "$(readlink "$prefix/bin/.rabs-current")"
+          test -f "$prefix/bin/$previous/rabsd"
+          test ! -e "$prefix/edge.sock"
       - uses: actions/upload-artifact@v4
         with:
           name: dist-linux-aarch64
@@ -528,14 +576,35 @@ jobs:
 
           Or check against \`checksums.txt\` which contains all checksums.
 
+          ### Opt-in RABS (Linux GNU x86_64 and ARM64)
+
+          The two Linux GNU archives also contain \`cargo-rabs\`, \`rabs-wrap\`,
+          \`rabsd\`, \`rabs-wkr\` and \`install-rabs\`. Normal RCH installation
+          still installs only RCH. RABS requires an explicit installation:
+          authenticate the archive with its Sigstore bundle and the expected
+          release-workflow identity and issuer BEFORE extracting or executing it.
+          Then extract \`install-rabs\` and run:
+
+          \`\`\`bash
+          python3 install-rabs --from-archive rch-${{ needs.plan.outputs.tag }}-<gnu-target>.tar.gz --bin-dir "\$HOME/.local/share/rabs/bin"
+          export PATH="\$HOME/.local/share/rabs/bin:\$PATH"
+          cargo rabs build
+          \`\`\`
+
+          Installation atomically activates a complete toolset, retains older
+          generations, and does not change Cargo configuration or start services.
+          \`cargo rabs\` explicitly opts a build into the existing host-local
+          dependency lane; it is not automatic fleet execution or a cache-hit
+          guarantee. Other platform archives do not contain this RABS bundle.
+
           ### Sigstore Verification
 
           Artifacts are signed with Sigstore for enhanced supply chain security.
           Verify with:
           \`\`\`bash
           cosign verify-blob --bundle rch-${{ needs.plan.outputs.tag }}-<target>.tar.gz.sigstore.json \\
-            --certificate-identity-regexp=".*" \\
-            --certificate-oidc-issuer-regexp=".*" \\
+            --certificate-identity="https://github.com/${{ github.workflow_ref }}" \\
+            --certificate-oidc-issuer="https://token.actions.githubusercontent.com" \\
             rch-${{ needs.plan.outputs.tag }}-<target>.tar.gz
           \`\`\`
 
