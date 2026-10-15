@@ -118,11 +118,30 @@ rch_scope_launch_select() {
 # fenced once before launch. Birth identity is rechecked before EVERY signal.
 # 0: live, 1: absent/dead, 2: unavailable. No kill -0 == dead inference.
 rch_scope_launch_process() {
+    rch_launch_group= rch_launch_birth=
     rch_valid_pgid "$1" || return 2
     if [ "$(uname -s)" = Darwin ]; then
-        # A failed native witness is unknown, NOT absence (EPERM and ESRCH
-        # are not interchangeable). The supervisor retains unconfirmed work.
-        rch_darwin_process "$1" || return 2
+        if ! rch_darwin_process "$1"; then
+            # libproc failure alone is unknown. A separate, signal-free kernel
+            # ESRCH can prove absence (including a setup child that exited
+            # before publishing). A live/reused PID, EPERM, timeout or failed
+            # helper supplies NO birth or signal authority. Do not conflate
+            # this one process with an empty workload group: the existing
+            # receipt-bound census remains mandatory after admission.
+            rch_launch_absence=$(rch_control_capture 1s python3 -I -c '
+import errno, os, sys
+try:
+    os.getpgid(int(sys.argv[1]))
+except OSError as error:
+    if error.errno == errno.ESRCH:
+        print("RCH_PROCESS_ABSENT_V1:" + sys.argv[1])
+        sys.exit(0)
+    raise
+sys.exit(1)
+' "$1") || return 2
+            [ "$rch_launch_absence" = "RCH_PROCESS_ABSENT_V1:$1" ] && return 1
+            return 2
+        fi
         rch_launch_group=$rch_observed_pgid
         rch_launch_birth=$rch_observed_start
         return 0
@@ -263,7 +282,11 @@ rch_scope_launch_child() {
     (
         trap '' HUP INT TERM
         while :; do
-            if ! rch_scope_launch_parent_alive; then
+            # The outside parent can still be alive after this group's leader
+            # crashes. Without the leader, fresh cancellation cannot acquire
+            # birth authority. This executing member still pins its own group
+            # and must stop it, even when no build deadline was requested.
+            if ! rch_scope_launch_parent_alive || ! rch_remote_leader_matches; then
                 rch_scope_launch_kill_self
                 exit 255
             fi

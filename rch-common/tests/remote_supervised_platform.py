@@ -158,6 +158,22 @@ class SupervisedPlatform(unittest.TestCase):
             self.assertLess(time.monotonic(), until, result.stderr)
             time.sleep(.05)
 
+    def test_leader_crash_without_deadline_is_cleaned_by_surviving_watchdog(self):
+        # A test-only last-resort guard prevents the broken incumbent from
+        # leaving a permanent orphan. It signals only its own live group.
+        # The real watchdog must prove cleanup long BEFORE this guard fires.
+        payload = "(sleep 12; kill -KILL 0) & " + self.blocking_payload()
+        run = self.start(payload, seconds=0)
+        self.wait_ready(run[0])
+        result = self.observe(
+            f"rch_read_record {shlex.quote(str(self.receipt))} 115 || exit $?; "
+            'rch_remote_leader_matches || exit 43; kill -KILL "$rch_pgid"')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        started = time.monotonic()
+        self.assertNotEqual(run[0].wait(timeout=8), 0)
+        self.assert_empty()
+        self.assertLess(time.monotonic() - started, 8)
+
     def test_deadline_stops_group_and_emits_marker(self):
         run = self.start(self.blocking_payload(), seconds=2)
         self.wait_ready(run[0])
@@ -213,6 +229,19 @@ class SupervisedPlatform(unittest.TestCase):
         self.assertEqual(out, b"")
         self.assertIn(b"IDENTITY_UNAVAILABLE", err)
         self.assertFalse(self.receipt.exists())
+
+    def test_child_refusal_before_record_is_retryable_setup_failure(self):
+        # Explicit setup failure, before any record or admission gate. Neither
+        # the requested command nor an unconfirmed-execution verdict is valid.
+        needle = "rch_scope_launch_child() {\n"
+        self.assertEqual(PROTOCOL.count(needle), 1)
+        refused = PROTOCOL.replace(needle, needle + "    exit 125\n")
+        out, err = self.finish(self.start("printf MUST_NOT_RUN", protocol=refused), 125)
+        self.assertEqual(out, b"")
+        self.assertIn(b"IDENTITY_UNAVAILABLE", err)
+        self.assertNotIn(b"COMPLETION_UNCONFIRMED", err)
+        self.assertFalse(self.receipt.exists())
+        self.assertFalse(Path(str(self.receipt) + ".supervisor.v1/go").exists())
 
     def test_fast_result_disarms_long_watchdog(self):
         started = time.monotonic()
@@ -301,6 +330,63 @@ class DarwinPrimitives(unittest.TestCase):
                    + body)
         return subprocess.run([SHELL, "-c", source], input=data,
                               capture_output=True, start_new_session=True, timeout=10)
+
+    def test_reaped_process_is_absent_without_a_birth_witness(self):
+        child = subprocess.Popen(["/bin/sh", "-c", "exit 0"])
+        child.wait(timeout=5)
+        result = self.run_adapter(f'''
+rch_darwin_process() {{ return 1; }}
+rch_scope_launch_process {child.pid}
+[ "$?" = 1 ] || exit 1
+[ -z "$rch_launch_birth$rch_launch_group" ] || exit 2
+''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_live_process_without_birth_remains_unknown_and_unsignalled(self):
+        child = subprocess.Popen(["/bin/sleep", "30"], start_new_session=True)
+        try:
+            result = self.run_adapter(f'''
+rch_darwin_process() {{ return 1; }}
+rch_launch_birth=stale
+rch_launch_group=stale
+rch_scope_launch_process {child.pid}
+[ "$?" = 2 ] || exit 1
+[ -z "$rch_launch_birth$rch_launch_group" ] || exit 2
+''')
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIsNone(child.poll())
+        finally:
+            if child.poll() is None:
+                child.kill()
+            child.wait(timeout=5)
+
+    def test_absence_probe_requires_exact_successful_evidence(self):
+        for exchange in (
+            "return 1",
+            "printf 'RCH_PROCESS_ABSENT_V1:123'; return 7",
+            "printf 'RCH_PROCESS_ABSENT_V1:456'",
+            "printf 'RCH_PROCESS_ABSENT_V1:123\\nextra'",
+            "printf ''",
+        ):
+            with self.subTest(exchange=exchange):
+                result = self.run_adapter(f'''
+rch_darwin_process() {{ return 1; }}
+rch_control_capture() {{ {exchange}; }}
+rch_scope_launch_process 123
+[ "$?" = 2 ] || exit 1
+''')
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_invalid_pid_never_reaches_absence_probe(self):
+        result = self.run_adapter(r'''
+rch_darwin_process() { exit 90; }
+rch_control_capture() { exit 91; }
+for pid in 0 1 -1 invalid 2147483648; do
+    rch_scope_launch_process "$pid"
+    [ "$?" = 2 ] || exit 1
+done
+''')
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_fstat_preserves_occupied_slots_and_current_input(self):
         result = self.run_adapter(r'''
