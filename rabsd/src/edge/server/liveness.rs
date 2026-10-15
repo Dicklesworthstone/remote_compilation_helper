@@ -198,6 +198,10 @@ impl<T> Drop for OwnedWork<T> {
     }
 }
 
+#[cfg(all(test, target_os = "linux"))]
+#[path = "completion_reservation_tests.rs"]
+mod completion_reservation_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
