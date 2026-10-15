@@ -33,6 +33,7 @@
 //! State-machine refusals reuse [`RevalidationError`] verbatim.
 
 mod class_quarantine;
+mod sprt_ladder;
 
 use sha2::{Digest, Sha256};
 
@@ -143,6 +144,16 @@ pub enum PrivateExecutionReason {
         /// Stable category of the blocking evidence, not an untrusted detail.
         reason: &'static str,
     },
+    /// The opt-in class verification ladder requires another actual execution.
+    /// This is readiness for verification, not evidence of a divergence.
+    ClassVerificationRequired {
+        /// Descriptor-bound class accumulating independent comparisons.
+        class: String,
+        /// Conservatively credited, distinct admitted comparisons.
+        credited_comparisons: u64,
+        /// Minimum verification share: 10000, 2500, 500, or 100 basis points.
+        verification_basis_points: u32,
+    },
     /// Eligible, but this key's deterministic share says run privately.
     NotSampledThisEpoch {
         /// The key's bucket in basis points (stable per key).
@@ -174,8 +185,11 @@ pub fn key_bucket_basis_points(action: &TypedDigest) -> u32 {
 }
 
 /// Decide whether ONE action is eligible for sampled cache serving or
-/// must execute privately. Checks run strictest-first; this never writes
-/// metadata or repairs a quarantine.
+/// must execute privately. Checks run strictest-first and never repair a
+/// quarantine. By default this is read-only. RABS_SPRT_SAMPLING=1 opts the
+/// descriptor-bound live class into additional verification floors; it folds
+/// a bounded journal page and records promotion evidence before reuse.
+/// Callers must hold their existing CAS lock through admission and delivery.
 ///
 /// # Errors
 /// [`StoreError`] from reading publication, serving, or evidence state.
@@ -184,6 +198,16 @@ pub fn serving_sample_decision(
     action: &TypedDigest,
     risk: ActionClassRisk,
     policy: &SamplingPolicy,
+) -> Result<SampleGateDecision, StoreError> {
+    decide(store, action, risk, policy, sprt_ladder::enabled())
+}
+
+fn decide(
+    store: &mut dyn RabsMetadataStore,
+    action: &TypedDigest,
+    risk: ActionClassRisk,
+    policy: &SamplingPolicy,
+    use_sprt: bool,
 ) -> Result<SampleGateDecision, StoreError> {
     if risk == ActionClassRisk::Elevated {
         return Ok(SampleGateDecision::ExecutePrivately(
@@ -267,6 +291,11 @@ pub fn serving_sample_decision(
                 key_bucket_basis_points: bucket,
             },
         ));
+    }
+    if use_sprt
+        && let Some(reason) = sprt_ladder::refusal(store, &action_key)?
+    {
+        return Ok(SampleGateDecision::ExecutePrivately(reason));
     }
     Ok(SampleGateDecision::ServeFromCache)
 }
