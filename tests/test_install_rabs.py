@@ -12,6 +12,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import unittest
 from unittest import mock
@@ -233,6 +234,99 @@ class InstallTests(unittest.TestCase):
                     self.assertEqual(installer.main(["--from-bundle", str(self.bundle),
                                                      "--bin-dir", str(self.bin)]), 1)
             self.assertFalse(self.bin.exists())
+
+    def archive(self, extra=None, omit=()):
+        path = self.root / "release.tar.gz"
+        with tarfile.open(path, "w:gz", format=tarfile.USTAR_FORMAT) as archive:
+            for name in installer.TOOLS:
+                if name not in omit:
+                    archive.add(self.bundle / name, arcname=name)
+            if extra is not None:
+                member, data = extra
+                archive.addfile(member, io.BytesIO(data))
+        return path
+
+    def test_archive_install_and_upgrade_keep_core_files_untouched(self):
+        member = tarfile.TarInfo("rch")
+        member.size = 4
+        path = self.archive(extra=(member, b"core"))
+        self.bin.mkdir()
+        core = self.bin / "rch"
+        core.write_bytes(b"existing core")
+        args = ["--from-archive", str(path), "--bin-dir", str(self.bin)]
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(installer.main(args), 0)
+            first = self.current()
+            self.assertEqual(installer.main(args), 0)
+        self.assertNotEqual(first, self.current())
+        self.assertEqual(core.read_bytes(), b"existing core")
+        self.assertTrue((self.bin / first / "rabsd").is_file())
+
+    def test_archive_missing_tool_is_not_a_best_effort_install(self):
+        path = self.archive(omit=("rabs-wkr",))
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(installer.main(["--from-archive", str(path),
+                                             "--bin-dir", str(self.bin)]), 1)
+        self.assertFalse(self.bin.exists())
+
+    def test_archive_traversal_duplicates_links_and_special_files_are_refused(self):
+        bad_members = []
+        for name in ("../escaped", "/absolute", "./rabsd", "rabsd", "unexpected"):
+            member = tarfile.TarInfo(name)
+            member.size = 1
+            bad_members.append((member, b"x"))
+        for kind in (tarfile.SYMTYPE, tarfile.LNKTYPE, tarfile.FIFOTYPE, tarfile.DIRTYPE):
+            member = tarfile.TarInfo("rch")
+            member.type = kind
+            member.linkname = "../escaped"
+            bad_members.append((member, b""))
+        for member, data in bad_members:
+            with self.subTest(name=member.name, kind=member.type):
+                path = self.archive(extra=(member, data))
+                with tempfile.TemporaryDirectory(dir=self.root) as destination:
+                    with self.assertRaises(installer.InstallError):
+                        installer.unpack_archive(path, Path(destination))
+                self.assertFalse((self.root / "escaped").exists())
+                self.assertFalse(self.bin.exists())
+
+    def test_expanded_archive_budget_is_enforced_before_activation(self):
+        path = self.archive()
+        # The compressed archive fits while its real ELF payload does not.
+        limit = path.stat().st_size + 1
+        with mock.patch.object(installer, "MAX_ARCHIVE_BYTES", limit):
+            with tempfile.TemporaryDirectory(dir=self.root) as destination:
+                with self.assertRaisesRegex(installer.InstallError, "expanded byte limit"):
+                    installer.unpack_archive(path, Path(destination))
+
+    def test_truncated_archive_cannot_switch_an_existing_installation(self):
+        self.run_install()
+        before = self.current()
+        path = self.archive()
+        path.write_bytes(path.read_bytes()[:100])
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(installer.main(["--from-archive", str(path),
+                                             "--bin-dir", str(self.bin)]), 1)
+        self.assertEqual(before, self.current())
+
+    def test_archive_symlink_is_not_followed(self):
+        path = self.archive()
+        alias = self.root / "archive-link"
+        alias.symlink_to(path)
+        with tempfile.TemporaryDirectory(dir=self.root) as destination:
+            with self.assertRaises(OSError):
+                installer.unpack_archive(alias, Path(destination))
+
+    def test_extension_headers_are_refused_before_payload_decoding(self):
+        for kind in (tarfile.XHDTYPE, tarfile.XGLTYPE, tarfile.GNUTYPE_LONGNAME,
+                     tarfile.GNUTYPE_SPARSE):
+            with self.subTest(kind=kind):
+                member = tarfile.TarInfo("rch")
+                member.type = kind
+                member.size = 1
+                path = self.archive(extra=(member, b"x"))
+                with tempfile.TemporaryDirectory(dir=self.root) as destination:
+                    with self.assertRaisesRegex(installer.InstallError, "unsupported release archive header"):
+                        installer.unpack_archive(path, Path(destination))
 
 
 if __name__ == "__main__":
