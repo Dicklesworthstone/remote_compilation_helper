@@ -5,7 +5,7 @@ Compilation Helper): the PreToolUse hook + CLI (`rch`), the local daemon (`rchd`
 worker agent (`rch-wkr`), the RABS build sidecar (`rabs-*`, `rabsd`), and the fleet
 dashboard (`dashboard/`).
 
-Scope window: project inception (`v0.1.0`, 2026-01-25) through `v2.1.28` (2026-10-14).
+Scope window: project inception (`v0.1.0`, 2026-01-25) through `v2.1.29` (2026-10-15).
 
 This document was rebuilt from git history (`git log --no-merges` per tag range, `git show`
 on representative commits), version tags (`git for-each-ref`), GitHub release metadata
@@ -28,6 +28,38 @@ history. They are kept as-is because the descriptions were verified against the 
 but those particular links will 404.
 
 Repository: <https://github.com/Dicklesworthstone/remote_compilation_helper>
+
+## 2.1.29 — 2026-10-15
+
+Queued `--job` requests that need several slots are no longer starved by single-slot work, and a
+job waits for a worker instead of being refused every five minutes. The `[layer0]` knobs are
+visible to `rch config`, and `rch diagnose` reports a dispatcher's fail-closed policy.
+
+- **Queue fairness for multi-slot jobs** (`bd-decdd`). css logged 8,470 queue timeouts in 24 h. Its
+  3-slot gate-of-record jobs waited for hours: every waiter re-ran selection each second and fresh
+  requests selected at once, so any freed slot went to a 1-slot request. Every wait was also capped
+  at `[queue] timeout_secs` (300 s). A job never falls back to local, so the cap only produced a
+  retryable refusal, and the resubmission started over. Now:
+  - `rch exec --job` waits up to 6 h for admission, and the daemon honours a job's wait up to
+    24 h. `RCH_DAEMON_WAIT_RESPONSE_TIMEOUT_SECS` still overrides. Compilations keep the 300 s cap.
+  - The oldest job waiter that needs more than one slot, once it has waited 2 min, holds one
+    worker that refused it only for lack of free slots. Younger requests that would land there go
+    elsewhere or queue, and the worker drains until the job fits. There is one hold at a time; it
+    moves if the worker stops qualifying and is released when the waiter leaves the queue
+    ([`005b0e32`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/005b0e32b498d2e41c0d2026459f627657ab69dd)).
+- **`[layer0]` in `rch config`.** `rch config get/set/reset/diff` and text `rch config show` know
+  the four `layer0.*` keys; 2.1.28 answered "unknown configuration key"
+  ([`94af021c`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/94af021c2c00ba6ef4ffcc7fed9ae2a5fc32c7ec)). `rch config show --json` includes the
+  section ([`5e1ca374`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/5e1ca374fd83ff6a40c70ed255c6f08fb3681515)).
+- **`rch diagnose` honours `general.role`.** On a dispatcher it reported "remote not required"
+  while the hook enforced fail-closed; it now uses the same role-aware placement as the hook
+  ([`1836ffa9`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/1836ffa908ebd2320e83787a743212c22aae976c)).
+- Docs: the config keys that currently do nothing are marked as such
+  (`transfer.verify_artifacts`, `fleet.max_load_average`, `self_healing.self_healing_log_level`,
+  and four `daemon.toml` keys) ([`cc65587d`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/cc65587df5db59d6b2f3d0f6962887c8eaa43ea9),
+  [`027c3819`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/027c3819febbb76663c84f25e2441629cd447c54)). The skill's advice to raise
+  `RCH_DAEMON_WAIT_RESPONSE_TIMEOUT_SECS` for a longer compile wait was corrected: the daemon caps
+  it at `[queue] timeout_secs`.
 
 ## 2.1.28 — 2026-10-14
 
