@@ -17,6 +17,8 @@ use rabs_protocol::result_identity::{DigestAlgorithm, TypedDigest};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+mod recovery;
+
 const CAPTURE_PIN_CLASS: &str = "live-dependency-capture-v1";
 
 fn field(bytes: &mut Vec<u8>, value: &[u8]) {
@@ -62,6 +64,7 @@ fn pin_id(owner: &str, root: &TypedDigest) -> u128 {
 pub(super) struct CapturePins {
     cas: Arc<LiveCas>,
     owner: String,
+    authority: AttemptAuthority,
     held: BTreeMap<u128, TypedDigest>,
 }
 
@@ -70,6 +73,7 @@ impl CapturePins {
         Self {
             cas,
             owner: capture_owner(authority),
+            authority: authority.clone(),
             held: BTreeMap::new(),
         }
     }
@@ -88,7 +92,10 @@ impl CapturePins {
         if let Some(held) = self.held.get(&id) {
             if held == root
                 && existing.is_some_and(|row| {
-                    row.owner == self.owner && row.class == CAPTURE_PIN_CLASS && !row.released
+                    row.owner == self.owner
+                        && row.class == CAPTURE_PIN_CLASS
+                        && row.root_key == digest_key(root)
+                        && !row.released
                 })
             {
                 return Ok(());
@@ -100,6 +107,9 @@ impl CapturePins {
         if existing.is_some() {
             return Err("capture pin identity already exists".into());
         }
+        // Root and attempt witness share create_pin's durable transaction.
+        // Encoding failure must not leave an unjournaled new capture pin.
+        let evidence = recovery::evidence(&self.authority, root)?;
         store
             .create_pin(
                 id,
@@ -107,7 +117,7 @@ impl CapturePins {
                 &self.owner,
                 CAPTURE_PIN_CLASS,
                 None,
-                None,
+                Some(&evidence),
                 true,
                 "compiler result capture awaiting acknowledgment/publication",
             )
@@ -129,9 +139,10 @@ impl Drop for CapturePins {
         // Check the class as well as the owner: even contradictory metadata
         // cannot turn capture abandonment into publication/incident release.
         let releaser = Releaser::Worker(self.owner.clone());
-        for id in self.held.keys() {
+        for (id, root) in &self.held {
             if !matches!(store.pin_row(*id), Ok(Some(row))
-                if row.owner == self.owner && row.class == CAPTURE_PIN_CLASS)
+                if row.owner == self.owner && row.class == CAPTURE_PIN_CLASS
+                    && row.root_key == digest_key(root))
             {
                 eprintln!("rabsd: retaining changed compiler capture pin {id:032x}");
                 continue;
@@ -163,7 +174,7 @@ mod tests {
     use rabs_protocol::result_identity::{LogicalOutput, OutputRole};
     use rabs_protocol::wire_time::PeerId;
 
-    fn authority(attempt: u128) -> AttemptAuthority {
+    pub(super) fn authority(attempt: u128) -> AttemptAuthority {
         let coordinator = CoordinatorAuthority {
             cluster_id: ClusterId("capture-tests".into()),
             credential_generation: 1,
