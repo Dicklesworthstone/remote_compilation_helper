@@ -7,7 +7,7 @@
 //! and every input guard. In particular, do not fabricate a host triple here
 //! or classify a directory source without its captured checksum witness.
 
-use rabs_key::invocation::parse;
+use rabs_key::invocation::{SourceInput, parse};
 use rabs_key::live_dependency::{LiveRefusal, LiveRustcRequest};
 
 /// A host-independent subset of the live dependency planner's refusals.
@@ -54,6 +54,42 @@ pub(super) fn rejection(request: LiveRustcRequest<'_>) -> Option<LiveRefusal> {
     if invocation.cap_lints.as_deref() != Some("allow") {
         return Some(LiveRefusal::NotDependencyCompile(
             "Cargo caps lints for external dependencies; this invocation does not",
+        ));
+    }
+    // Cargo also caps dependency build-script binaries and proc-macro
+    // producers. They are prerequisites of otherwise cacheable work, but
+    // this lane cannot serve their output classes. Do not make them wait
+    // behind a cold sysroot merely to discover that after hashing it.
+    // These checks mirror only the HOST-INDEPENDENT shape restrictions in
+    // derive_dependency_output_declarations; the full planner still owns
+    // target naming, option semantics and the complete output declaration.
+    if invocation.crate_types.is_empty()
+        || invocation
+            .crate_types
+            .iter()
+            .any(|kind| !matches!(kind.as_str(), "lib" | "rlib"))
+    {
+        return Some(LiveRefusal::NotDependencyCompile(
+            "dependency outputs require --crate-type lib or rlib",
+        ));
+    }
+    let compiler = invocation.compiler_argv0.rsplit(['/', '\\']).next();
+    if !matches!(compiler, Some("rustc" | "rustc.exe"))
+        || !invocation.wrapper_chain.is_empty()
+        || !invocation.stripped_wrapper_flags.is_empty()
+    {
+        return Some(LiveRefusal::NotDependencyCompile(
+            "dependency outputs require an unwrapped rustc invocation",
+        ));
+    }
+    if !matches!(&invocation.source, Some(SourceInput::Path(path)) if !path.starts_with('@')) {
+        return Some(LiveRefusal::NotDependencyCompile(
+            "dependency outputs require an explicit source file",
+        ));
+    }
+    if invocation.out_dir.as_deref().is_none_or(str::is_empty) {
+        return Some(LiveRefusal::NotDependencyCompile(
+            "dependency outputs require --out-dir",
         ));
     }
     if !invocation
@@ -271,6 +307,145 @@ mod tests {
                 };
                 assert_eq!(observed.argv[0], compiler.to_str().unwrap());
                 assert!(!marker.exists(), "preflight must not start an identity probe");
+            }
+        }
+    }
+
+    #[test]
+    fn non_library_producers_are_rejected_on_every_supported_host() {
+        for host in [
+            HOST,
+            "x86_64-unknown-linux-musl",
+            "aarch64-unknown-linux-gnu",
+            "aarch64-unknown-linux-musl",
+        ] {
+            for kind in ["", "bin", "proc-macro", "dylib", "cdylib", "staticlib", "lib,bin"] {
+                for split in [false, true] {
+                    let (mut argv, env) = fixture(PACKAGE);
+                    argv.retain(|arg| arg != "--crate-type=lib");
+                    if !kind.is_empty() {
+                        if split {
+                            argv.extend(["--crate-type".into(), kind.into()]);
+                        } else {
+                            argv.push(format!("--crate-type={kind}"));
+                        }
+                    }
+                    let request = LiveRustcRequest {
+                        argv: &argv,
+                        cwd: PACKAGE,
+                        env: &env,
+                    };
+                    assert!(rejection(request).is_some(), "{kind:?} on {host}");
+                    assert!(plan_dependency_action(request, host).is_err());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn supported_library_shapes_are_not_confused_with_producers() {
+        for host in [
+            HOST,
+            "x86_64-unknown-linux-musl",
+            "aarch64-unknown-linux-gnu",
+            "aarch64-unknown-linux-musl",
+        ] {
+            for kind in ["lib", "rlib"] {
+                for emit in ["metadata,dep-info", "link,metadata,dep-info"] {
+                    let (mut argv, env) = fixture(PACKAGE);
+                    argv.retain(|arg| {
+                        arg != "--crate-type=lib" && arg != "--emit=metadata,dep-info"
+                    });
+                    argv.extend([
+                        "--crate-type".into(),
+                        kind.into(),
+                        format!("--emit={emit}"),
+                        "--target".into(),
+                        host.into(),
+                    ]);
+                    let request = LiveRustcRequest {
+                        argv: &argv,
+                        cwd: PACKAGE,
+                        env: &env,
+                    };
+                    assert_eq!(rejection(request), None, "{kind} {emit} on {host}");
+                    assert!(plan_dependency_action(request, host).is_ok());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unmodeled_compiler_source_and_output_shapes_do_not_warm() {
+        for case in ["compiler", "stdin", "missing-source", "missing-out-dir", "empty-out-dir"] {
+            let (mut argv, env) = fixture(PACKAGE);
+            match case {
+                "compiler" => argv[0] = "/toolchain/bin/clippy-driver".into(),
+                "stdin" => *argv.last_mut().unwrap() = "-".into(),
+                "missing-source" => {
+                    argv.pop();
+                }
+                "missing-out-dir" | "empty-out-dir" => {
+                    let at = argv.iter().position(|arg| arg == "--out-dir").unwrap();
+                    argv.remove(at + 1);
+                    argv.remove(at);
+                    if case == "empty-out-dir" {
+                        argv.push("--out-dir=".into());
+                    }
+                }
+                _ => unreachable!(),
+            }
+            let request = LiveRustcRequest {
+                argv: &argv,
+                cwd: PACKAGE,
+                env: &env,
+            };
+            assert!(rejection(request).is_some(), "{case}");
+            assert!(plan_dependency_action(request, HOST).is_err(), "{case}");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn real_decide_never_prepares_capped_build_script_or_proc_macro_producers() {
+        use super::super::{Decided, LiveEdge, decide};
+        use crate::coord::live::CoordLive;
+        use crate::coord::live_dependency::LiveDependencyLane;
+        use serde_json::json;
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::Arc;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().canonicalize().unwrap();
+        let compiler = root.join("rustc");
+        let marker = root.join("probed");
+        std::fs::write(
+            &compiler,
+            format!("#!/bin/sh\nprintf invoked > '{}'\nexit 99\n", marker.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&compiler, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let cas = Arc::new(crate::janitor::store::mount_and_reconcile(&root.join("cas")).unwrap());
+        let coord = Arc::new(CoordLive::with_cas(cas));
+        coord.acquire_boot_authority("producer-preflight-fixture").unwrap();
+        coord.mark_up();
+        let live = LiveEdge::new(LiveDependencyLane::new(coord));
+        for may_wait in [true, false] {
+            for (kind, source) in [("bin", "build.rs"), ("proc-macro", "src/lib.rs")] {
+                let (mut argv, env) = fixture(PACKAGE);
+                argv[0] = compiler.to_str().unwrap().into();
+                argv.retain(|arg| arg != "--crate-type=lib");
+                *argv.last_mut().unwrap() = format!("{PACKAGE}/{source}");
+                argv.extend(["--crate-type".into(), kind.into()]);
+                let request = json!({
+                    "kind": "rustc-request", "argv": argv, "cwd": PACKAGE,
+                    "env": env, "wait_for_inflight": may_wait,
+                });
+                let Decided::Shadow(observed) = decide(&live, &request) else {
+                    panic!("{kind} must immediately pass through, not enter preparation");
+                };
+                assert_eq!(observed.argv, argv);
+                assert!(!marker.exists(), "unsupported producers must not probe rustc");
             }
         }
     }
