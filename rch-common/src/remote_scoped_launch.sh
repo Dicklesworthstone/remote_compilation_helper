@@ -10,20 +10,70 @@
 # Borrow an unused descriptor, duplicate the original open file description,
 # then explicitly bind it back to fd 0 in the child. Never reopen a pathname
 # (which resets file offsets), spool input, or overwrite inherited authority FDs.
-# Procfs is already a launch prerequisite and the namespace check names THIS
-# shell, including when a function is invoked from a subshell.
+# Linux still requires a fenced procfs view. Darwin inspects inherited FDs
+# with fstat, not /dev/fd path guesses or a Linux-only descriptor directory.
+rch_scope_launch_fds() {
+    __sl_open_fds=
+    case "$(uname -s)" in
+        Linux)
+            rch_check_procfs_namespace || return 1
+            __sl_fd_dir=/proc/$rch_self_pid/fd
+            [ -r "$__sl_fd_dir" ] && [ -x "$__sl_fd_dir" ] || return 1
+            for __sl_fd in 0 2 4 5 6 7 8 9; do
+                if [ -e "$__sl_fd_dir/$__sl_fd" ] || [ -L "$__sl_fd_dir/$__sl_fd" ]; then
+                    __sl_open_fds="$__sl_open_fds $__sl_fd"
+                fi
+            done;;
+        Darwin)
+            # NO command substitution: bash can allocate its capture pipe in
+            # closed fd 0/2, making the child observe a different descriptor set.
+            # Encode stdin/stderr presence and ONE free slot in exit 64..94.
+            # Startup errors, missing Python and signals are outside that range.
+            __sl_fd_probe=0
+            python3 -I -c '
+import errno, os, sys
+def opened(fd):
+    try:
+        os.fstat(fd)
+        return True
+    except OSError as error:
+        if error.errno != errno.EBADF:
+            raise
+        return False
+state = 64 + 8 * opened(0) + 16 * opened(2)
+for fd in range(4, 10):
+    if not opened(fd):
+        state += fd - 3
+        break
+sys.exit(state)
+' || __sl_fd_probe=$?
+            [ "$__sl_fd_probe" -ge 64 ] && [ "$__sl_fd_probe" -le 94 ] || return 1
+            __sl_free_fd=$((__sl_fd_probe & 7))
+            [ "$__sl_free_fd" -le 6 ] || return 1
+            [ "$((__sl_fd_probe & 8))" = 0 ] || __sl_open_fds=0
+            [ "$((__sl_fd_probe & 16))" = 0 ] || __sl_open_fds="$__sl_open_fds 2"
+            # Conservatively reserve all other slots; only one is borrowed.
+            for __sl_fd in 4 5 6 7 8 9; do
+                [ "$__sl_fd" = "$((__sl_free_fd + 3))" ] || __sl_open_fds="$__sl_open_fds $__sl_fd"
+            done;;
+        *) return 1;;
+    esac
+}
+
+rch_scope_launch_fd_open() {
+    case " $__sl_open_fds " in *" $1 "*) return 0;; esac
+    return 1
+}
+
 rch_scope_launch_save_input() {
     __sl_input= __sl_input_redirect=
-    rch_check_procfs_namespace || return 1
-    __sl_fd_dir=/proc/$rch_self_pid/fd
-    [ -r "$__sl_fd_dir" ] && [ -x "$__sl_fd_dir" ] || return 1
-    if [ ! -e "$__sl_fd_dir/0" ] && [ ! -L "$__sl_fd_dir/0" ]; then
+    rch_scope_launch_fds || return 1
+    if ! rch_scope_launch_fd_open 0; then
         __sl_input_redirect='0<&-'
         return 0
     fi
     for __sl_input_candidate in 4 5 6 7 8 9; do
-        if [ ! -e "$__sl_fd_dir/$__sl_input_candidate" ] &&
-            [ ! -L "$__sl_fd_dir/$__sl_input_candidate" ]; then
+        if ! rch_scope_launch_fd_open "$__sl_input_candidate"; then
             __sl_input=$__sl_input_candidate
             # Only this literal single-digit selection enters eval. No input,
             # path, argument or environment value becomes shell program text.
@@ -69,6 +119,14 @@ rch_scope_launch_select() {
 # 0: live, 1: absent/dead, 2: unavailable. No kill -0 == dead inference.
 rch_scope_launch_process() {
     rch_valid_pgid "$1" || return 2
+    if [ "$(uname -s)" = Darwin ]; then
+        # A failed native witness is unknown, NOT absence (EPERM and ESRCH
+        # are not interchangeable). The supervisor retains unconfirmed work.
+        rch_darwin_process "$1" || return 2
+        rch_launch_group=$rch_observed_pgid
+        rch_launch_birth=$rch_observed_start
+        return 0
+    fi
     [ -d "/proc/$1" ] || return 1
     IFS= read -r rch_launch_stat < "/proc/$1/stat" 2>/dev/null || return 2
     case "$rch_launch_stat" in "$1 ("*") "*) ;; *) return 2;; esac
@@ -85,6 +143,14 @@ rch_scope_launch_process() {
 # Linux uptime is monotonic, including suspend. Keep its hundredths so a cap
 # does not expire early because its starting fractional second was discarded.
 rch_scope_launch_clock() {
+    if [ "$(uname -s)" = Darwin ]; then
+        # Apple's CLOCK_MONOTONIC_RAW uses the continuous clock, including
+        # suspend; Python's monotonic() uses mach_absolute_time, which does not.
+        rch_launch_now=$(rch_control_capture 1s python3 -I -c \
+            'import time; print(time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW) // 10000000)') || return 1
+        rch_scope_uint "$rch_launch_now" && [ "${#rch_launch_now}" -le 15 ]
+        return $?
+    fi
     read -r rch_launch_uptime rch_launch_idle < /proc/uptime || return 1
     case "$rch_launch_uptime" in *.*) ;; *) return 1;; esac
     rch_launch_secs=${rch_launch_uptime%%.*}
@@ -99,21 +165,22 @@ rch_scope_launch_parent_alive() {
 }
 
 # Best-effort marker delivery must not delay hard cleanup behind a full pipe.
-# GNU timeout bounds AND reaps the writer; its own output FDs are closed.
+# The shared bounded helper supports Darwin without coreutils. Map fd 3 onto
+# stdout BEFORE it starts: its Python fallback does not inherit extra FDs.
 rch_scope_launch_deadline_marker() {
-    timeout -k 1s 1s /bin/sh -c 'printf "\n%s\n" "$1" >&3' rch-deadline "$1" \
-        >/dev/null 2>&1 </dev/null
+    rch_group_timeout --signal=KILL 1s /bin/sh -c 'printf "\n%s\n" "$1"' rch-deadline "$1" \
+        >&3 2>/dev/null </dev/null
 }
 
 # A terminal refusal must not retain the supervisor's inherited source/activity
 # descriptors indefinitely because its diagnostic consumer stopped reading.
-# Only this literal printf writer is timed out: --foreground targets that one
-# child, never the workload group or the caller. It creates no descendants.
+# Only this literal printf writer is timed out, in the helper's private group,
+# never the workload group or the caller. It creates no descendants.
 # Suppress timeout's own diagnostics too; otherwise the failure path can block
 # on the same pipe again. Callers keep their original terminal status even if
 # delivery fails. No receipt, claim, or cleanup verdict is changed here.
 rch_scope_launch_message() (
-    timeout --foreground --signal=KILL 1s /bin/sh -c '
+    rch_group_timeout --signal=KILL 1s /bin/sh -c '
         case "$2" in
             line) printf "%s\n" "$1";;
             setup) printf "\n%s_IDENTITY_UNAVAILABLE\n" "$1";;
@@ -140,6 +207,18 @@ rch_scope_launch_binding_matches() {
 rch_scope_launch_kill_self() {
     if [ "$rch_scope_bound" = 1 ]; then
         rch_scope_operation kill
+    elif [ "$(uname -s)" = Darwin ]; then
+        # This helper inherits the executing watchdog's group. Its kernel
+        # membership pins that group even if the native identity helper fails.
+        # No historical PID or receipt grants this in-session-only authority.
+        rch_valid_pgid "$rch_pgid" || return 1
+        python3 -I -c '
+import os, signal, sys
+group = os.getpgrp()
+if group <= 1 or group != int(sys.argv[1]):
+    sys.exit(1)
+os.killpg(group, signal.SIGKILL)
+' "$rch_pgid"
     else
         rch_check_procfs_namespace && rch_read_process "$rch_self_pid" &&
             [ "$rch_observed_boot" = "$rch_boot" ] || return 1
@@ -220,9 +299,16 @@ rch_scope_launch_child() {
 
 rch_scope_launch_read_result() {
     [ -f "$__sl_control/result" ] && [ ! -L "$__sl_control/result" ] || return 1
-    [ "$(stat -c '%u:%a:%h' -- "$__sl_control/result")" = "$__sl_uid:600:1" ] || return 1
-    __sl_result_size=$(stat -c '%s' -- "$__sl_control/result") || return 1
-    [ "$__sl_result_size" -le 256 ] || return 1
+    __sl_result_metadata=$(
+        case "$(uname -s)" in
+            Darwin) stat -f '%u:%Lp:%l:%z' "$__sl_control/result";;
+            Linux) stat -c '%u:%a:%h:%s' -- "$__sl_control/result";;
+            *) exit 1;;
+        esac
+    ) || return 1
+    case "$__sl_result_metadata" in "$__sl_uid:600:1:"*) ;; *) return 1;; esac
+    __sl_result_size=${__sl_result_metadata##*:}
+    rch_scope_uint "$__sl_result_size" && [ "$__sl_result_size" -le 256 ] || return 1
     __sl_result=$(cat "$__sl_control/result") || return 1
     __sl_prefix="RCH_SCOPED_RESULT_V1:$__sl_build:$__sl_child:$__sl_child_start:"
     case "$__sl_result" in "$__sl_prefix"*) ;; *) return 1;; esac
@@ -250,6 +336,17 @@ rch_scope_launch_stop_setup() {
     else
         kill -KILL "$__sl_child" 2>/dev/null || return 1
     fi
+}
+
+# Exec preserves the direct-child PID and all inherited authority/input FDs.
+# macOS has setsid(2), not a stock setsid(1). Never let a missing executable
+# silently turn a supervised group into an unowned legacy launch.
+rch_scope_launch_exec() {
+    case "$(uname -s)" in
+        Linux) exec setsid "$@";;
+        Darwin) exec python3 -I -c 'import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' "$@";;
+        *) return 125;;
+    esac
 }
 
 # Exit 255 on unconfirmed cleanup: transfer orchestration already treats it as
@@ -296,10 +393,18 @@ rch_scope_launch_supervise() {
     }
     rch_scope_uint "$__sl_limit" && [ "${#__sl_limit}" -le 10 ] &&
         [ "$__sl_limit" -le 2147483647 ] || return 125
-    [ "$#" -gt 0 ] && rch_check_procfs_namespace && command -v setsid >/dev/null 2>&1 || return 125
+    [ "$#" -gt 0 ] && rch_check_procfs_namespace || return 125
+    case "$(uname -s)" in
+        Linux) command -v setsid >/dev/null 2>&1 || return 125;;
+        Darwin) command -v python3 >/dev/null 2>&1 || return 125;;
+        *) return 125;;
+    esac
     # No observer may share the new child's group or cgroup. Capture this
     # supervisor's birth before launch for the child's lost-parent watchdog.
-    rch_scope_launch_process "$$" || return 125
+    rch_scope_launch_process "$$" && rch_scope_launch_clock || {
+        rch_scope_launch_message "$__sl_marker" setup >&2
+        return 125
+    }
     __sl_parent_start=$rch_launch_birth
     __sl_uid=$(id -u) || return 125
     __sl_cancelled=0
@@ -310,7 +415,7 @@ rch_scope_launch_supervise() {
     }
     # Arguments and the literal source expand as QUOTED argument values inside
     # eval; only the fixed descriptor redirection is assembled as syntax.
-    eval 'setsid /bin/sh -c "$rch_launch_source
+    eval 'rch_scope_launch_exec /bin/sh -c "$rch_launch_source
 rch_scope_launch_child \"\$@\"" rch-scoped-child \
         "$__sl_record" "$__sl_control" "$__sl_marker" "$__sl_build" \
         "$$" "$__sl_parent_start" "$__sl_limit" \
@@ -322,7 +427,7 @@ rch_scope_launch_child \"\$@\"" rch-scoped-child \
     # otherwise-unused stdout carries only bounded refusal messages back to
     # the original stderr. No inherited authority FD or payload stream changes.
     # A deliberately closed stderr stays closed in the already-launched child.
-    if [ -L "/proc/$rch_self_pid/fd/2" ]; then
+    if rch_scope_launch_fd_open 2; then
         rch_scope_launch_finish 1>&2 2>/dev/null
     else
         rch_scope_launch_finish >/dev/null 2>&1
