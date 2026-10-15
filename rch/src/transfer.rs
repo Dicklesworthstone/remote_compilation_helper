@@ -1488,29 +1488,42 @@ const CONFIG_EXCLUDE_REWRITES: &[(&str, &str)] = &[
 ];
 
 /// Build-output directory excludes that rch applies by basename at any depth.
-/// They exist to skip generated trees, never Cargo packages.
-const BUILD_OUTPUT_DIR_EXCLUDES: &[&str] = &["build/", "dist/", "coverage/", "target/"];
+/// They exist to skip generated trees, never tracked inputs.
+const BUILD_OUTPUT_DIR_EXCLUDES: &[&str] = &["build/", "dist/", "coverage/"];
+/// `target/` is Cargo's own output; only a Cargo package of that name is an input.
+const CARGO_TARGET_DIR_EXCLUDE: &str = "target/";
 
-/// Root-anchored, directory-only includes for tracked Cargo packages that a
-/// build-output exclude would cut off (#113). The default `build/` dropped a
-/// workspace member at `crates/build`, and dependency preflight then failed
-/// with RCH-E410 on every worker. A generated tree never has a `Cargo.toml`
-/// at its top, so this cannot readmit build output. A directory include keeps
-/// every other rule in force for the files inside (secret patterns, `target/`).
-/// User-chosen excludes keep their exact meaning. Without git, nothing changes.
-fn cargo_package_dir_includes(project_root: &Path, effective_excludes: &[String]) -> Vec<String> {
+/// Root-anchored, directory-only includes for tracked inputs that a default
+/// build-output exclude would cut off.
+/// - #113: the default `build/` dropped a workspace member at `crates/build`,
+///   and dependency preflight then failed with RCH-E410 on every worker.
+/// - bd-xmgez: `coverage/` dropped asupersync's tracked
+///   `formal/lean/coverage/*.json`, read by `include_str!`.
+///
+/// A `build/`, `dist/` or `coverage/` directory holding any tracked file is
+/// part of the source (a fresh clone has it). Generated output is untracked,
+/// so it stays excluded. A `target/` directory is readmitted only as a Cargo
+/// package (a tracked `Cargo.toml` directly inside). A directory include keeps
+/// every other rule in force for the files inside (secret patterns, nested
+/// `target/`). User-chosen excludes keep their exact meaning. Without git,
+/// nothing changes.
+fn tracked_input_dir_includes(project_root: &Path, effective_excludes: &[String]) -> Vec<String> {
     let names: Vec<&str> = effective_excludes
         .iter()
         .filter(|pattern| BUILD_OUTPUT_DIR_EXCLUDES.contains(&pattern.as_str()))
         .filter_map(|pattern| pattern.strip_suffix('/'))
         .collect();
-    if names.is_empty() {
+    let target_name = effective_excludes
+        .iter()
+        .any(|pattern| pattern == CARGO_TARGET_DIR_EXCLUDE)
+        .then_some("target");
+    if names.is_empty() && target_name.is_none() {
         return Vec::new();
     }
     let Ok(output) = std::process::Command::new("git")
         .arg("-C")
         .arg(project_root)
-        .args(["ls-files", "-z", "--", "*/Cargo.toml"])
+        .args(["ls-files", "-z"])
         .stdin(Stdio::null())
         .stderr(Stdio::null())
         .output()
@@ -1521,24 +1534,26 @@ fn cargo_package_dir_includes(project_root: &Path, effective_excludes: &[String]
         return Vec::new();
     }
     let mut includes = std::collections::BTreeSet::new();
-    for manifest in output.stdout.split(|byte| *byte == 0) {
-        let Ok(manifest) = std::str::from_utf8(manifest) else {
+    for path in output.stdout.split(|byte| *byte == 0) {
+        let Ok(path) = std::str::from_utf8(path) else {
             continue;
         };
-        let Some(dir) = manifest.strip_suffix("/Cargo.toml") else {
+        let Some((dir, file)) = path.rsplit_once('/') else {
             continue;
         };
         // An rsync pattern treats these as wildcards; never widen a match.
         if dir.contains(['*', '?', '[', '\\']) {
             continue;
         }
+        let components: Vec<&str> = dir.split('/').collect();
         let mut prefix = String::new();
-        for component in dir.split('/') {
+        for (index, component) in components.iter().enumerate() {
             if !prefix.is_empty() {
                 prefix.push('/');
             }
             prefix.push_str(component);
-            if names.contains(&component) {
+            let cargo_package = file == "Cargo.toml" && index + 1 == components.len();
+            if names.contains(component) || (cargo_package && target_name == Some(*component)) {
                 includes.insert(format!("/{prefix}/"));
             }
         }
@@ -3958,7 +3973,7 @@ impl TransferPipeline {
         } else {
             // rsync is first-match-wins: carve Cargo packages out of the
             // build-output excludes before any exclude is emitted (#113).
-            for pattern in cargo_package_dir_includes(&self.project_root, effective_excludes) {
+            for pattern in tracked_input_dir_includes(&self.project_root, effective_excludes) {
                 cmd.arg("--include").arg(pattern);
             }
             for pattern in effective_excludes {
@@ -19196,26 +19211,33 @@ exec /usr/bin/rsync "$@" -e "sh -c 'if [ \"\$1\" = -l ]; then shift 2; fi; shift
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn build_output_excludes_keep_cargo_packages_named_build() {
+    async fn build_output_excludes_keep_tracked_inputs() {
         let _guard = test_guard!();
         let root = tempfile::tempdir().expect("source fixture");
-        for (path, body) in [
-            (
-                "Cargo.toml",
-                "[workspace]\nmembers = [\"app\", \"crates/build\"]\n",
-            ),
-            ("app/Cargo.toml", "[package]\nname = \"app\"\n"),
-            ("app/src/lib.rs", "pub fn answer() {}\n"),
-            ("crates/build/Cargo.toml", "[package]\nname = \"helper\"\n"),
-            ("crates/build/src/lib.rs", "pub fn one() {}\n"),
-            ("crates/build/.env", "SECRET=1\n"),
-            ("crates/build/build/generated.rs", "output\n"),
-            ("build/generated.rs", "output\n"),
-            ("app/dist/bundle.js", "output\n"),
-        ] {
+        let write = |path: &str, body: &str| {
             let path = root.path().join(path);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, body).unwrap();
+        };
+        for (path, body) in [
+            (
+                "Cargo.toml",
+                "[workspace]\nmembers = [\"app\", \"crates/build\", \"tools/target\"]\n",
+            ),
+            ("app/Cargo.toml", "[package]\nname = \"app\"\n"),
+            ("app/src/lib.rs", "pub fn answer() {}\n"),
+            // #113: a workspace member in a directory named build/.
+            ("crates/build/Cargo.toml", "[package]\nname = \"helper\"\n"),
+            ("crates/build/src/lib.rs", "pub fn one() {}\n"),
+            ("crates/build/.env", "SECRET=1\n"),
+            // bd-xmgez: tracked data read by include_str!.
+            ("formal/lean/coverage/inventory.json", "{}\n"),
+            // A Cargo package named target is an input; other target/ trees are not.
+            ("tools/target/Cargo.toml", "[package]\nname = \"target\"\n"),
+            ("tools/target/src/lib.rs", "pub fn t() {}\n"),
+            ("vendor/target/readme.txt", "tracked, not a package\n"),
+        ] {
+            write(path, body);
         }
         for args in [&["init", "-q"][..], &["add", "-A"][..]] {
             let status = std::process::Command::new("git")
@@ -19224,6 +19246,15 @@ exec /usr/bin/rsync "$@" -e "sh -c 'if [ \"\$1\" = -l ]; then shift 2; fi; shift
                 .status()
                 .unwrap();
             assert!(status.success(), "git {args:?}");
+        }
+        // Generated output stays untracked.
+        for path in [
+            "build/generated.rs",
+            "app/dist/bundle.js",
+            "app/coverage/lcov.info",
+            "crates/build/target/debug/app",
+        ] {
+            write(path, "output\n");
         }
         let pipeline = TransferPipeline::new(
             root.path().to_path_buf(),
@@ -19243,6 +19274,9 @@ exec /usr/bin/rsync "$@" -e "sh -c 'if [ \"\$1\" = -l ]; then shift 2; fi; shift
             "crates/build/Cargo.toml",
             "crates/build/src/lib.rs",
             "app/src/lib.rs",
+            "formal/lean/coverage/inventory.json",
+            "tools/target/Cargo.toml",
+            "tools/target/src/lib.rs",
         ] {
             assert!(
                 selected.iter().any(|p| p == kept),
@@ -19251,18 +19285,20 @@ exec /usr/bin/rsync "$@" -e "sh -c 'if [ \"\$1\" = -l ]; then shift 2; fi; shift
         }
         for dropped in [
             "crates/build/.env",
-            "crates/build/build/generated.rs",
+            "crates/build/target/debug/app",
             "build/generated.rs",
             "app/dist/bundle.js",
+            "app/coverage/lcov.info",
+            "vendor/target/readme.txt",
         ] {
             assert!(!selected.iter().any(|p| p == dropped), "{dropped} selected");
         }
         assert_eq!(
-            cargo_package_dir_includes(root.path(), &["build/".to_string()]),
+            tracked_input_dir_includes(root.path(), &["build/".to_string()]),
             ["/crates/build/"]
         );
         // A user's own exclude keeps its exact meaning.
-        assert!(cargo_package_dir_includes(root.path(), &["crates/".to_string()]).is_empty());
+        assert!(tracked_input_dir_includes(root.path(), &["crates/".to_string()]).is_empty());
     }
 
     #[cfg(unix)]
