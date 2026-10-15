@@ -3,18 +3,42 @@
 Embedded by the existing Rust remote-command builder, after env controls.
 Import the installed cargo-rabs preparation API without invoking its CLI or a
 second Cargo. Neither this adapter nor readiness grants compiler-skip authority.
+Preparation is isolated under an outer deadline; Cargo itself is exec'd once.
+
+RCH_RABS_PREPARE_TIMEOUT_MS overrides the preparation budget (0 skips setup,
+maximum 35000). The default is CARGO_RABS_STARTUP_MS plus 2000 ms, or 7000 ms
+without a launcher override. Cleanup adds at most 250 ms of cooperative wait;
+a kernel-blocked helper can retain pending SIGKILL. Cargo execution has no new
+timeout. Existing/shared daemons are outside the preparer's process group.
 """
 
 import ast
+import json
 import os
+import selectors
 import shutil
 import signal
+import socket
 import stat
 import sys
+import time
 
 
 ACTIVE = "RCH_RABS_WORKER_ACTIVE"
 MAX_LAUNCHER_BYTES = 128 * 1024
+MAX_PREPARE_BYTES = 1024 * 1024
+MAX_PREPARE_LOG_BYTES = 16 * 1024
+MAX_PREPARE_MS = 35_000
+CLEANUP_SECONDS = 0.25
+
+
+class PreparationCancelled(BaseException):
+    def __init__(self, number):
+        self.number = number
+
+
+def cancel_preparation(number, _frame):
+    raise PreparationCancelled(number)
 
 
 def load_prepare(launcher):
@@ -45,6 +69,16 @@ def load_prepare(launcher):
     return prepare
 
 
+def valid_environment(environment):
+    # execve rejects NULs, empty names and '=' in names. Refuse during setup,
+    # when stock Cargo is still safe, not at the final one-way exec boundary.
+    return isinstance(environment, dict) and all(
+        isinstance(key, str) and isinstance(value, str)
+        and key and "=" not in key and "\0" not in key and "\0" not in value
+        for key, value in environment.items()
+    )
+
+
 def prepared_environment(original):
     if sys.platform != "linux" or sys.version_info < (3, 9) or original.get(ACTIVE) == "1":
         return original
@@ -60,9 +94,7 @@ def prepared_environment(original):
         candidate = dict(original)
         candidate[ACTIVE] = "1"
         prepared = prepare(candidate, no_start=False)
-        if not isinstance(prepared, dict) or not all(
-                isinstance(key, str) and isinstance(value, str)
-                for key, value in prepared.items()):
+        if not valid_environment(prepared):
             raise RuntimeError("installed cargo-rabs returned an invalid environment")
         return prepared
     except Exception as error:
@@ -72,6 +104,185 @@ def prepared_environment(original):
         print("rch: worker-local RABS setup unavailable: {}; using stock Cargo".format(error),
               file=sys.stderr)
         return original
+
+
+def preparation_seconds(environment):
+    def bounded_integer(name, default, maximum):
+        try:
+            value = int(environment.get(name, str(default)))
+        except (TypeError, ValueError):
+            return default
+        return min(maximum, max(0, value))
+
+    # Allow the launcher's own readiness deadline plus config/import overhead.
+    # An explicit worker bound also covers source loading and blocking filesystem
+    # operations that the in-process launcher's cooperative checks cannot stop.
+    startup = bounded_integer("CARGO_RABS_STARTUP_MS", 5000, 30000)
+    return bounded_integer("RCH_RABS_PREPARE_TIMEOUT_MS", startup + 2000,
+                           MAX_PREPARE_MS) / 1000
+
+
+def prepare_child(original, response, log_descriptor):
+    # This is a fresh, single-threaded Python adapter, not a daemon runtime.
+    # The parent retains Cargo's stdin, process identity and jobserver FDs.
+    # Setup helpers must neither consume those tokens nor keep their pipes alive.
+    os.setsid()
+    for number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(number, signal.SIG_DFL)
+    null = os.open(os.devnull, os.O_RDONLY | os.O_CLOEXEC)
+    os.dup2(null, 0)
+    os.dup2(log_descriptor, 1)
+    os.dup2(log_descriptor, 2)
+    keep = {0, 1, 2, response.fileno()}
+    for entry in os.listdir("/proc/self/fd"):
+        descriptor = int(entry)
+        if descriptor not in keep:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+    try:
+        environment = prepared_environment(original)
+        report = {"environment": environment}
+    except KeyboardInterrupt:
+        report = {"cancelled": True}
+    except BaseException as error:
+        # An installed launcher's sys.exit must not exit the Cargo adapter.
+        report = {"error": "{}: {}".format(type(error).__name__, error)[:4096]}
+    try:
+        data = json.dumps(report, ensure_ascii=True, separators=(",", ":")).encode("ascii")
+        if len(data) > MAX_PREPARE_BYTES:
+            data = b'{"error":"RABS preparation environment exceeded its frame bound"}'
+        # Never mix launcher output with the environment/control response.
+        response.sendall(data)
+        sys.stdout.flush()
+        sys.stderr.flush()
+    finally:
+        response.close()
+
+
+def cleanup_preparer(pid):
+    # The direct child has NOT been reaped, even after observed exit. Its PID
+    # therefore cannot have been recycled into an unrelated process/group.
+    # cargo-rabs starts shared daemons in separate sessions; never kill them.
+    for send in (lambda: os.killpg(pid, signal.SIGKILL),
+                 lambda: os.kill(pid, signal.SIGKILL)):
+        try:
+            send()
+        except ProcessLookupError:
+            pass
+    deadline = time.monotonic() + CLEANUP_SECONDS
+    while True:
+        try:
+            child, _ = os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            return
+        if child:
+            return
+        if time.monotonic() >= deadline:
+            # A kernel-blocked child can retain pending SIGKILL. Do not turn
+            # bounded setup into an unbounded waitpid; no compile was admitted.
+            print("rch: RABS setup cleanup remains pending; acceleration not used",
+                  file=sys.stderr)
+            return
+        time.sleep(0.01)
+
+
+def bounded_prepared_environment(original):
+    if sys.platform != "linux" or sys.version_info < (3, 9) or original.get(ACTIVE) == "1":
+        return original
+    budget = preparation_seconds(original)
+    if budget == 0:
+        return original
+    deadline = time.monotonic() + budget
+    parent = child = None
+    log_read = log_write = None
+    pid = None
+    logs = bytearray()
+    truncated = False
+    try:
+        parent, child = socket.socketpair()
+        log_read, log_write = os.pipe2(os.O_CLOEXEC)
+        pid = os.fork()
+        if pid == 0:
+            try:
+                parent.close()
+                os.close(log_read)
+                prepare_child(original, child, log_write)
+            except BaseException:
+                os._exit(1)
+            os._exit(0)
+        child.close()
+        child = None
+        os.close(log_write)
+        log_write = None
+        parent.setblocking(False)
+        os.set_blocking(log_read, False)
+        data = bytearray()
+        eof = False
+        log_eof = False
+        with selectors.DefaultSelector() as selector:
+            selector.register(parent, selectors.EVENT_READ, "response")
+            selector.register(log_read, selectors.EVENT_READ, "log")
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("RABS worker preparation deadline expired")
+                # WNOWAIT observes exit without relinquishing the identity used
+                # for cancellation and descendant cleanup in the finally block.
+                exited = os.waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+                if exited is not None and eof and log_eof:
+                    if exited.si_code != os.CLD_EXITED or exited.si_status != 0:
+                        raise RuntimeError("RABS preparation helper exited without success")
+                    break
+                for key, _ in selector.select(min(remaining, 0.05)):
+                    if key.data == "response":
+                        chunk = parent.recv(min(4096, MAX_PREPARE_BYTES + 1 - len(data)))
+                        if not chunk:
+                            eof = True
+                            selector.unregister(parent)
+                        else:
+                            data.extend(chunk)
+                            if len(data) > MAX_PREPARE_BYTES:
+                                raise RuntimeError("RABS preparation response exceeded its frame bound")
+                    else:
+                        chunk = os.read(log_read, 4096)
+                        if not chunk:
+                            log_eof = True
+                            selector.unregister(log_read)
+                        else:
+                            room = MAX_PREPARE_LOG_BYTES - len(logs)
+                            logs.extend(chunk[:room])
+                            truncated |= len(chunk) > room
+        report = json.loads(data)
+        if not isinstance(report, dict):
+            raise RuntimeError("RABS preparation returned a non-object response")
+        if report.get("cancelled") is True:
+            raise KeyboardInterrupt
+        if "error" in report:
+            raise RuntimeError(str(report["error"])[:4096])
+        environment = report.get("environment")
+        if not valid_environment(environment):
+            raise RuntimeError("RABS preparation returned an invalid environment")
+        return environment
+    except Exception as error:
+        print("rch: worker-local RABS setup unavailable: {}; using stock Cargo".format(error),
+              file=sys.stderr)
+        return original
+    finally:
+        if pid:
+            cleanup_preparer(pid)
+        for stream in (parent, child):
+            if stream is not None:
+                stream.close()
+        for descriptor in (log_read, log_write):
+            if descriptor is not None:
+                os.close(descriptor)
+        if logs:
+            sys.stderr.buffer.write(logs)
+            sys.stderr.buffer.flush()
+        if truncated:
+            print("rch: RABS preparation diagnostics truncated", file=sys.stderr)
 
 
 def main():
@@ -84,10 +295,20 @@ def main():
     # equivalent: it may select a different Cargo shim or lose custom-toolchain
     # fallback. Setup changes only the wrapper environment, never that choice.
     original = dict(os.environ)
+    previous_handlers = {
+        number: signal.signal(number, cancel_preparation)
+        for number in (getattr(signal, name, None) for name in ("SIGTERM", "SIGHUP"))
+        if number is not None
+    }
     try:
-        environment = prepared_environment(original)
+        environment = bounded_prepared_environment(original)
     except KeyboardInterrupt:
         return 130
+    except PreparationCancelled as cancelled:
+        return 128 + cancelled.number
+    finally:
+        for number, handler in previous_handlers.items():
+            signal.signal(number, handler)
     # Python ignores these signals for its own I/O. Restore the ordinary shell
     # defaults at the exec boundary rather than leaking Python's dispositions.
     for name in ("SIGPIPE", "SIGXFZ", "SIGXFSZ"):
