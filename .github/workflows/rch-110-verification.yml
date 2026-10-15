@@ -12,6 +12,10 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           persist-credentials: false
+      - name: Inspect transfer boundaries
+        run: |
+          grep -nE 'pub.*fn |async fn retrieve|dry.run|manifest_regular_files' rch/src/transfer.rs
+          grep -nE 'fn |retrieve_artifacts|expected_triple|pinned_triple' rch/src/hook/retrieval_recovery.rs
       - name: Export relevant source for review
         run: |
           git archive --format=zip --output=rch-110-source.zip HEAD rch/src rch/tests rch/Cargo.toml rch-common/src rch-common/Cargo.toml Cargo.toml Cargo.lock rust-toolchain.toml AGENTS.md
