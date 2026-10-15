@@ -30,7 +30,7 @@ rch_scope_launch_fds() {
             # Encode stdin/stderr presence and ONE free slot in exit 64..94.
             # Startup errors, missing Python and signals are outside that range.
             __sl_fd_probe=0
-            python3 -I -c '
+            python3 -I -S -c '
 import errno, os, sys
 def opened(fd):
     try:
@@ -128,7 +128,7 @@ rch_scope_launch_process() {
             # helper supplies NO birth or signal authority. Do not conflate
             # this one process with an empty workload group: the existing
             # receipt-bound census remains mandatory after admission.
-            rch_launch_absence=$(rch_control_capture 1s python3 -I -c '
+            rch_launch_absence=$(rch_control_capture 1s python3 -I -S -c '
 import errno, os, sys
 try:
     os.getpgid(int(sys.argv[1]))
@@ -165,7 +165,7 @@ rch_scope_launch_clock() {
     if [ "$(uname -s)" = Darwin ]; then
         # Apple's CLOCK_MONOTONIC_RAW uses the continuous clock, including
         # suspend; Python's monotonic() uses mach_absolute_time, which does not.
-        rch_launch_now=$(rch_control_capture 1s python3 -I -c \
+        rch_launch_now=$(rch_control_capture 1s python3 -I -S -c \
             'import time; print(time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW) // 10000000)') || return 1
         rch_scope_uint "$rch_launch_now" && [ "${#rch_launch_now}" -le 15 ]
         return $?
@@ -231,7 +231,7 @@ rch_scope_launch_kill_self() {
         # membership pins that group even if the native identity helper fails.
         # No historical PID or receipt grants this in-session-only authority.
         rch_valid_pgid "$rch_pgid" || return 1
-        python3 -I -c '
+        python3 -I -S -c '
 import os, signal, sys
 group = os.getpgrp()
 if group <= 1 or group != int(sys.argv[1]):
@@ -367,7 +367,7 @@ rch_scope_launch_stop_setup() {
 rch_scope_launch_exec() {
     case "$(uname -s)" in
         Linux) exec setsid "$@";;
-        Darwin) exec python3 -I -c 'import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' "$@";;
+        Darwin) exec python3 -I -S -c 'import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' "$@";;
         *) return 125;;
     esac
 }

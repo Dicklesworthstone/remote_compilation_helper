@@ -56,7 +56,13 @@ rch_darwin_process() {
 rch_read_boot() {
     case "$(uname -s)" in
         Linux) rch_check_procfs_namespace && cat /proc/sys/kernel/random/boot_id;;
-        Darwin) /usr/sbin/sysctl -n kern.bootsessionuuid | tr 'A-F' 'a-f';;
+        Darwin)
+            # Boot changes can retire execution without a process census.
+            # Require a successful, bounded, byte-validated observation BEFORE
+            # normalization: a pipeline hides sysctl failure, and substitution
+            # alone can discard NULs from otherwise plausible UUID output.
+            rch_boot_output=$(rch_control_capture 1s /usr/sbin/sysctl -n kern.bootsessionuuid) || return 1
+            printf '%s\n' "$rch_boot_output" | LC_ALL=C tr 'A-F' 'a-f';;
         *) return 1;;
     esac
 }
@@ -575,7 +581,10 @@ rch_group_timeout() {
         # or interrupted observer, signal that group, never a reaped child's PID
         # and never the caller's (possibly the compiler's) process group.
         command -v python3 >/dev/null 2>&1 || return 125
-        python3 -I -c '
+        # Isolated mode alone still imports installed .pth/sitecustomize hooks.
+        # This monitor uses only stdlib: do not run unrelated startup code
+        # before its alarm is armed or let it corrupt control observations.
+        python3 -I -S -c '
 import os
 import signal
 import subprocess

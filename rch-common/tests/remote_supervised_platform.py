@@ -19,6 +19,7 @@ import sys
 import tempfile
 import time
 import unittest
+import venv
 
 SOURCE = Path(__file__).resolve().parents[1] / "src"
 SHELL = os.environ.get("RCH_TEST_SHELL", "/bin/sh")
@@ -318,9 +319,14 @@ class SupervisedPlatform(unittest.TestCase):
 
 
 class DarwinPrimitives(unittest.TestCase):
-    def run_adapter(self, body, data=None):
+    def run_adapter(self, body, data=None, boot_probe=None, env=None):
         source = CORE.replace("rch_control_capture() {", "rch_native_control_capture() {")
         source += (SOURCE / "remote_scoped_launch.sh").read_text()
+        if boot_probe is not None:
+            # Replace only the external sysctl executable. The production
+            # capture, boot parser and recovery decision remain unchanged.
+            self.assertEqual(source.count("/usr/sbin/sysctl"), 1)
+            source = source.replace("/usr/sbin/sysctl", shlex.quote(str(boot_probe)))
         # Exercise these real portable syscalls without pretending Linux has
         # libproc/BSD stat. Native lifecycle selection is tested separately.
         source += ("\nuname() { printf 'Darwin\\n'; }\n"
@@ -328,8 +334,173 @@ class DarwinPrimitives(unittest.TestCase):
                    # only the launch syscall adapter is selected as Darwin.
                    "rch_control_capture() ( unset -f uname; rch_native_control_capture \"$@\"; )\n"
                    + body)
-        return subprocess.run([SHELL, "-c", source], input=data,
+        return subprocess.run([SHELL, "-c", source], input=data, env=env,
                               capture_output=True, start_new_session=True, timeout=10)
+
+    def site_environment(self):
+        # A real isolated venv, not a fake python executable. -I still loads
+        # its .pth hooks; every RCH-owned helper must also request -S.
+        temporary = tempfile.TemporaryDirectory(prefix="rch-site-hook-")
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        virtual = root / "venv"
+        venv.EnvBuilder(with_pip=False, symlinks=True).create(virtual)
+        python = virtual / "bin/python3"
+        site = Path(subprocess.check_output(
+            [str(python), "-I", "-c", "import sysconfig; print(sysconfig.get_path('purelib'))"],
+            text=True, timeout=10).strip())
+        marker = root / "site-ran"
+        (site / "rch_fixture_site_hook.py").write_text(
+            f"with open({str(marker)!r}, 'a') as out: out.write('site loaded\\n')\n"
+            "raise SystemExit(91)\n")
+        (site / "rch_fixture.pth").write_text("import rch_fixture_site_hook\n")
+        binaries = root / "bin"
+        binaries.mkdir()
+        for tool in ("awk", "cat", "cmp", "id", "mkdir", "mkfifo", "mktemp",
+                     "mv", "ps", "rm", "rmdir", "sh", "sleep", "stat", "tr", "uname", "wc"):
+            resolved = shutil.which(tool)
+            if resolved:
+                (binaries / tool).symlink_to(resolved)
+        env = dict(os.environ, PATH=f"{virtual / 'bin'}:{binaries}", TMPDIR=str(root))
+        baseline = subprocess.run(["python3", "-I", "-c", "pass"], env=env,
+                                  capture_output=True, timeout=10)
+        self.assertNotEqual(baseline.returncode, 0)
+        self.assertEqual(marker.read_text(), "site loaded\n")
+        return env, marker
+
+    def test_control_monitor_does_not_load_site_hooks(self):
+        env, marker = self.site_environment()
+        result = self.run_adapter("rch_control_capture 1s /bin/sh -c 'printf observed'", env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, b"observed")
+        self.assertEqual(marker.read_text(), "site loaded\n")
+
+    def test_darwin_lifecycle_helpers_do_not_load_site_hooks(self):
+        env, marker = self.site_environment()
+        child = subprocess.Popen(["/bin/sh", "-c", "exit 0"])
+        child.wait(timeout=5)
+        result = self.run_adapter(f'''
+rch_scope_launch_fds || exit 1
+rch_scope_launch_clock || exit 2
+rch_darwin_process() {{ return 1; }}
+rch_scope_launch_process {child.pid}
+[ "$?" = 1 ] || exit 3
+rch_scope_launch_exec /bin/sh -c 'printf launched' &
+wait "$!" || exit 4
+''', env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, b"launched")
+        result = self.run_adapter(
+            "rch_scope_bound=0; rch_pgid=$$; rch_scope_launch_kill_self", env=env)
+        self.assertEqual(result.returncode, -signal.SIGKILL, result.stderr)
+        self.assertEqual(marker.read_text(), "site loaded\n")
+
+    def test_session_exec_does_not_change_payload_python_startup(self):
+        env, marker = self.site_environment()
+        result = self.run_adapter(
+            "rch_scope_launch_exec python3 -I -c 'pass' & wait \"$!\"", env=env)
+        # The helper ignores site, but the requested payload must NOT: its
+        # original argv/environment still select the failing Python site hook.
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(marker.read_text(), "site loaded\nsite loaded\n")
+
+    def boot_observation(self, provider, body):
+        with tempfile.TemporaryDirectory(prefix="rch-boot-probe-") as directory:
+            probe = Path(directory) / "sysctl"
+            probe.write_text("#!/bin/sh\n" + provider)
+            probe.chmod(0o700)
+            return self.run_adapter(body, boot_probe=probe)
+
+    def test_failed_boot_probe_cannot_retire_execution(self):
+        result = self.boot_observation(
+            "printf '%s\\n' '13572468-1234-4ABC-8DEF-135724681357'; exit 7\n",
+            r'''
+rch_identified=1
+rch_boot=24681357-1234-4abc-8def-246813572468
+rch_recovery_boot_state
+[ "$?" = 2 ] || exit 1
+''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_boot_probe_preserves_same_and_confirmed_previous_boot(self):
+        result = self.boot_observation(
+            "printf '%s\\n' '13572468-1234-4ABC-8DEF-135724681357'\n",
+            r'''
+rch_identified=1
+rch_boot=13572468-1234-4abc-8def-135724681357
+rch_recovery_boot_state
+[ "$?" = 0 ] || exit 1
+rch_boot=24681357-1234-4abc-8def-246813572468
+rch_recovery_boot_state
+[ "$?" = 1 ] || exit 2
+''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_boot_discontinuity_requires_two_successful_probes(self):
+        result = self.boot_observation(r'''
+printf '%s\n' '13572468-1234-4abc-8def-135724681357'
+if [ -f "$0.seen" ]; then exit 7; fi
+: > "$0.seen"
+''', r'''
+rch_identified=1
+rch_boot=24681357-1234-4abc-8def-246813572468
+rch_recovery_boot_state
+[ "$?" = 2 ] || exit 1
+''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_changing_boot_probe_is_not_confirmed_discontinuity(self):
+        result = self.boot_observation(r'''
+if [ -f "$0.seen" ]; then
+    printf '%s\n' 'abcdef01-1234-4abc-8def-abcdefabcdef'
+else
+    printf '%s\n' '13572468-1234-4abc-8def-135724681357'
+    : > "$0.seen"
+fi
+''', r'''
+rch_identified=1
+rch_boot=24681357-1234-4abc-8def-246813572468
+rch_recovery_boot_state
+[ "$?" = 2 ] || exit 1
+''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_stalled_boot_probe_is_bounded_and_cannot_retire_execution(self):
+        started = time.monotonic()
+        result = self.boot_observation(
+            "printf '%s\\n' '13572468-1234-4abc-8def-135724681357'; sleep 6\n",
+            r'''
+rch_identified=1
+rch_boot=24681357-1234-4abc-8def-246813572468
+rch_recovery_boot_state
+[ "$?" = 2 ] || exit 1
+''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertLess(time.monotonic() - started, 4)
+
+    def test_invalid_boot_bytes_never_become_recovery_authority(self):
+        for provider in (
+            "printf '13572468-1234-4abc-8def-135724681357\\000\\n'\n",
+            "printf '%s\\n' '13572468-1234-4abc-8def-135724681357'; printf warning >&2\n",
+            "printf '%s\\n' '00000000-0000-0000-0000-000000000000'\n",
+            "printf '%s\\n' '13572468-1234-4abc-8def-135724681357' 'extra'\n",
+            "exit 0\n",
+        ):
+            with self.subTest(provider=provider):
+                result = self.boot_observation(provider, r'''
+rch_identified=1
+rch_boot=24681357-1234-4abc-8def-246813572468
+rch_recovery_boot_state
+[ "$?" = 2 ] || exit 1
+''')
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_failed_boot_read_publishes_no_stdout(self):
+        result = self.boot_observation(
+            "printf '%s\\n' '13572468-1234-4abc-8def-135724681357'; exit 7\n",
+            "rch_read_boot")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, b"")
 
     def test_reaped_process_is_absent_without_a_birth_witness(self):
         child = subprocess.Popen(["/bin/sh", "-c", "exit 0"])
