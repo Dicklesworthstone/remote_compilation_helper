@@ -16,7 +16,7 @@
 mod policy;
 
 use super::reply_json::{self, Value};
-use super::{ConsultStream, Live, MAX_LIVE_REPLY_BYTES, consult_succeeded, live_outcome};
+use super::{ConsultStream, HELLO, Live, MAX_LIVE_REPLY_BYTES, MAX_REPLY_BYTES, connect_owned, consult_succeeded, live_outcome};
 use policy::WaitPolicy;
 use std::io::{self, BufRead, BufReader, Write};
 use std::time::{Duration, Instant};
@@ -154,6 +154,8 @@ pub(super) fn read_decision(
     frame: &str,
     decision_budget: Duration,
     may_wait: bool,
+    socket: &str,
+    connect_timeout: Duration,
     owned: &impl Fn() -> bool,
 ) -> Result<Live, ()> {
     read_with_policy(
@@ -162,6 +164,7 @@ pub(super) fn read_decision(
         decision_budget,
         may_wait,
         WaitPolicy::from_environment(),
+        Some((socket, connect_timeout)),
         owned,
     )
 }
@@ -218,17 +221,56 @@ fn wait_for(reply: &Value) -> Option<WaitFor<'_>> {
     }
 }
 
+/// Start an entirely new, unowned consultation only after the prior
+/// non-owning response was completely parsed. No hit consent or execution
+/// grant can reach this path. A failed/ambiguous handshake never authorizes
+/// output writes or another compiler attempt.
+fn reconnect_waiter(
+    socket: &str,
+    connect_timeout: Duration,
+    decision_budget: Duration,
+    absolute_deadline: Instant,
+    owned: &impl Fn() -> bool,
+) -> io::Result<BufReader<ConsultStream>> {
+    check_owner(owned)?;
+    let remaining = absolute_deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(io::Error::new(io::ErrorKind::TimedOut, "RABS wait expired"));
+    }
+    let stream = connect_owned(socket, connect_timeout.min(remaining), owned)?;
+    let deadline = Instant::now()
+        .checked_add(decision_budget)
+        .ok_or_else(|| io::Error::other("RABS consult deadline overflow"))?
+        .min(absolute_deadline);
+    let mut reader = BufReader::new(ConsultStream { stream, deadline });
+    write_owned(&mut reader, HELLO.as_bytes(), deadline, owned)?;
+    write_owned(&mut reader, b"\n", deadline, owned)?;
+    let hello = read_owned_reply(&mut reader, MAX_REPLY_BYTES, deadline, owned)?;
+    if !hello.contains("hello-ok") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "RABS reconnect handshake rejected",
+        ));
+    }
+    Ok(reader)
+}
+
 fn read_with_policy(
     mut reader: BufReader<ConsultStream>,
     frame: &str,
     decision_budget: Duration,
     may_wait: bool,
     mut policy: WaitPolicy,
+    rollover: Option<(&str, Duration)>,
     owned: &impl Fn() -> bool,
 ) -> Result<Live, ()> {
     let mut following_key: Option<String> = None;
     let mut wait_deadline = None;
     let mut retries = 0;
+    // The first request was sent by consult(). Each reconnect starts a new
+    // edge connection with its own quota; retries and the absolute deadline
+    // remain owned by this logical consultation.
+    let mut requests_on_connection = 1_u32;
     loop {
         let response_deadline = reader.get_ref().deadline;
         let line = read_owned_reply(&mut reader, MAX_LIVE_REPLY_BYTES, response_deadline, owned)
@@ -300,9 +342,28 @@ fn read_with_policy(
         if now >= deadline {
             return Ok(Live::PassThrough);
         }
-        let request_deadline = now.checked_add(decision_budget).ok_or(())?.min(deadline);
+        if requests_on_connection >= 60 {
+            let (socket, connect_timeout) = rollover.ok_or(())?;
+            // Drop the old follower connection before opening a new one. The
+            // edge releases any connection-scoped flight accounting on drop.
+            drop(reader);
+            reader = reconnect_waiter(
+                socket,
+                connect_timeout,
+                decision_budget,
+                deadline,
+                owned,
+            )
+            .map_err(|_| ())?;
+            requests_on_connection = 0;
+        }
+        let request_deadline = Instant::now()
+            .checked_add(decision_budget)
+            .ok_or(())?
+            .min(deadline);
         write_owned(&mut reader, frame.as_bytes(), request_deadline, owned).map_err(|_| ())?;
         write_owned(&mut reader, b"\n", request_deadline, owned).map_err(|_| ())?;
+        requests_on_connection += 1;
         retries += 1;
     }
 }
