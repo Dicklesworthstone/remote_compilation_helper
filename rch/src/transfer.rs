@@ -792,15 +792,45 @@ const LIVE_CHECKOUT_REFUSAL_MARKER: &str = "RCH_SYNC_LIVE_CHECKOUT_REFUSED: ";
 /// a build's output never becomes a `SyncFailed`.
 pub(crate) fn sync_refused_by_live_checkout(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
-        matches!(
-            cause.downcast_ref::<TransferError>(),
-            Some(TransferError::SyncFailed { stderr, .. })
-                if stderr.lines().any(|line| line.starts_with(LIVE_CHECKOUT_REFUSAL_MARKER))
-        )
+        cause.downcast_ref::<LiveCheckoutRefused>().is_some()
+            || matches!(
+                cause.downcast_ref::<TransferError>(),
+                Some(TransferError::SyncFailed { stderr, .. })
+                    if stderr.lines().any(|line| line.starts_with(LIVE_CHECKOUT_REFUSAL_MARKER))
+            )
     }) || error
         .downcast_ref::<TransferAttemptsExhausted>()
         .and_then(|exhausted| exhausted.cause.as_ref())
         .is_some_and(sync_refused_by_live_checkout)
+}
+
+/// The pre-sync destination safety check refused a declared live checkout
+/// (bd-fbtws). It runs before rsync, so its refusal never becomes a
+/// `SyncFailed`. Without this type the release carried no refusal, rchd never
+/// fenced the pair, and css re-selected hz2 for one project 1,148 times in two
+/// hours (2026-10-15).
+#[derive(Debug)]
+pub(crate) struct LiveCheckoutRefused(pub(crate) String);
+
+impl std::fmt::Display for LiveCheckoutRefused {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for LiveCheckoutRefused {}
+
+/// The safety check's failure as an error, typed when its stderr carries the
+/// receiver guard's marker line (a quoted marker inside a sentence does not).
+pub(crate) fn destination_check_refusal(message: String, stderr: &str) -> anyhow::Error {
+    if stderr
+        .lines()
+        .any(|line| line.starts_with(LIVE_CHECKOUT_REFUSAL_MARKER))
+    {
+        anyhow::Error::new(LiveCheckoutRefused(message))
+    } else {
+        anyhow::anyhow!(message)
+    }
 }
 
 /// Modern rsync's rsyserr identifies the process role and terminates with

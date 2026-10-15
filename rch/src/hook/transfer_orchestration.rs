@@ -1186,13 +1186,18 @@ async fn execute_remote_compilation_inner(
             Duration::from_secs(30),
         )
         .await?;
-        anyhow::ensure!(
-            output.status.success(),
-            "source destination safety check refused on {} (status {:?}): {}",
-            worker_config.id,
-            output.status.code(),
-            String::from_utf8_lossy(&output.stderr).trim(),
-        );
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(crate::transfer::destination_check_refusal(
+                format!(
+                    "source destination safety check refused on {} (status {:?}): {}",
+                    worker_config.id,
+                    output.status.code(),
+                    stderr.trim(),
+                ),
+                &stderr,
+            ));
+        }
     }
     // Build transfer pipelines with color mode, command timeout, and compilation kind.
     // When the in-session watchdog is active it enforces the real build cap

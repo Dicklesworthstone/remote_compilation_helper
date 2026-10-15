@@ -5314,6 +5314,27 @@ fn live_checkout_refusal_reaches_the_release_only_from_the_source_sync() {
         cargo_stdout: None,
     });
     assert!(!remote_release_faults(&build, &worker).live_checkout_refused);
+
+    // The pre-sync destination safety check refuses before rsync runs: the
+    // same marker must reach the release through any context layers.
+    let checked = |stderr: &str| -> anyhow::Result<remote_result::RemoteExecutionResult> {
+        Err(crate::transfer::destination_check_refusal(
+            format!(
+                "source destination safety check refused on dual-role (status Some(73)): {stderr}"
+            ),
+            stderr,
+        )
+        .context("remote execution failed"))
+    };
+    assert!(remote_release_faults(&checked(refusal), &worker).live_checkout_refused);
+    assert!(
+        !remote_release_faults(
+            &checked("error: saw RCH_SYNC_LIVE_CHECKOUT_REFUSED: in a log"),
+            &worker
+        )
+        .live_checkout_refused
+    );
+    assert!(!remote_release_faults(&checked("Permission denied"), &worker).live_checkout_refused);
 }
 
 #[test]
