@@ -18,13 +18,17 @@ import platform
 import re
 import stat
 import sys
+import tarfile
 import tempfile
+import zlib
 
 
 TOOLS = ("cargo-rabs", "rabs-wrap", "rabsd", "rabs-wkr")
 VERSIONS = ".rabs-versions"
 CURRENT = ".rabs-current"
 MAX_FILE_BYTES = 2 * 1024 * 1024 * 1024
+MAX_ARCHIVE_BYTES = 4 * 1024 * 1024 * 1024
+ARCHIVE_MEMBERS = set(TOOLS) | {"rch", "rchd", "rch-wkr", "install-rabs"}
 
 
 class InstallError(Exception):
@@ -65,6 +69,63 @@ def source_files(bundle, build):
         if not 0 < metadata.st_size <= MAX_FILE_BYTES:
             raise InstallError("{} has an invalid file size".format(name))
     return paths
+
+
+class ReleaseMember(tarfile.TarInfo):
+    @classmethod
+    def frombuf(cls, buf, encoding, errors):
+        member = super().frombuf(buf, encoding, errors)
+        # Refuse extension headers BEFORE tarfile reads their payloads. A
+        # post-parse size check cannot bound a compressed PAX/longname record.
+        # Release jobs deliberately emit flat GNU/ustar regular-file entries.
+        if member.name not in ARCHIVE_MEMBERS or member.type not in (tarfile.REGTYPE, tarfile.AREGTYPE):
+            raise InstallError("unsupported release archive header: " + member.name)
+        if not 0 < member.size <= MAX_FILE_BYTES:
+            raise InstallError("release member exceeds its byte limit")
+        return member
+
+
+def unpack_archive(path, destination):
+    """Read only a bounded, flat release inventory; never use extractall().
+
+    Core RCH executables may share the signed archive but are not installed.
+    Reject duplicate names, links, special files and unexpected members even
+    when they would otherwise be ignored. The caller owns destination.
+    """
+    seen = set()
+    total = 0
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    with os.fdopen(descriptor, "rb") as reader:
+        before = os.fstat(reader.fileno())
+        if not stat.S_ISREG(before.st_mode) or not 0 < before.st_size <= MAX_ARCHIVE_BYTES:
+            raise InstallError("invalid release archive size or type")
+        with tarfile.open(fileobj=reader, mode="r:gz", tarinfo=ReleaseMember) as archive:
+            for member in archive:
+                if member.name in seen:
+                    raise InstallError("invalid/duplicate release archive member: " + member.name)
+                seen.add(member.name)
+                total += member.size
+                if not 0 < member.size <= MAX_FILE_BYTES or total > MAX_ARCHIVE_BYTES:
+                    raise InstallError("release archive exceeds its expanded byte limit")
+                if member.name not in TOOLS:
+                    continue
+                if not member.mode & 0o111:
+                    raise InstallError("release tool is not executable: " + member.name)
+                with archive.extractfile(member) as source:
+                    with (destination / member.name).open("xb") as output:
+                        remaining = member.size
+                        while remaining:
+                            chunk = source.read(min(1024 * 1024, remaining))
+                            if not chunk:
+                                raise InstallError("truncated release tool: " + member.name)
+                            output.write(chunk)
+                            remaining -= len(chunk)
+                        os.fchmod(output.fileno(), 0o700)
+        if (signature(os.fstat(reader.fileno())) != signature(before)
+                or signature(Path(path).lstat()) != signature(before)):
+            raise InstallError("release archive changed during extraction")
+    if not set(TOOLS).issubset(seen):
+        raise InstallError("release archive is missing RABS tools: " + ", ".join(sorted(set(TOOLS) - seen)))
 
 
 def open_directory(path, private=False):
@@ -222,13 +283,20 @@ def main(argv=None):
                         metavar="DIRECTORY", help="extracted, authenticated release bundle")
     source.add_argument("--from-build", metavar="TARGET_DIRECTORY",
                         help="Cargo target directory containing wrapper-release and daemon-release")
+    source.add_argument("--from-archive", metavar="TAR_GZ",
+                        help="flat release archive whose publisher signature has already been verified")
     parser.add_argument("--bin-dir", default=str(Path.home() / ".local" / "bin"))
     args = parser.parse_args(argv)
     try:
         machine = host_machine()
-        paths = source_files(args.from_bundle, args.from_build)
-        result = install(paths, args.bin_dir, machine)
-    except (InstallError, OSError, SyntaxError, UnicodeError) as error:
+        if args.from_archive:
+            with tempfile.TemporaryDirectory(prefix="rabs-bundle-") as temporary:
+                unpack_archive(args.from_archive, Path(temporary))
+                result = install(source_files(temporary, None), args.bin_dir, machine)
+        else:
+            paths = source_files(args.from_bundle, args.from_build)
+            result = install(paths, args.bin_dir, machine)
+    except (InstallError, OSError, SyntaxError, UnicodeError, tarfile.TarError, EOFError, zlib.error) as error:
         print("install-rabs: " + str(error), file=sys.stderr)
         return 1
     print(json.dumps(result, sort_keys=True))
