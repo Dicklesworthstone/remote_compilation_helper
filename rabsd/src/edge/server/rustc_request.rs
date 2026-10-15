@@ -628,8 +628,9 @@ fn completion_not_published(detail: &str) -> String {
     .to_string()
 }
 
-/// No CAS lock or blocking-worker permit is retained while waiting for the
-/// wrapper. A lost, truncated, malformed or expired ACK is non-publication.
+/// No CAS lock or worker thread is retained while waiting for the wrapper.
+/// The caller keeps its completion capacity reservation across this bounded
+/// exchange. A lost, truncated, malformed or expired ACK is non-publication.
 async fn acknowledge_capture(
     stream: &mut super::EdgeStream,
     attempt: &str,
@@ -658,16 +659,24 @@ pub(super) async fn complete_on_lane(
     frame: Vec<u8>,
     stream: &mut super::EdgeStream,
 ) -> String {
-    let prepared = match lane.spawn(move || {
+    // Reserve ONCE for capture -> acknowledgment -> publication/cleanup.
+    // A fresh burst must not steal the publication slot after we told Cargo
+    // that its outputs were captured. This permit grants capacity only: the
+    // exact acknowledgment and every coordinator publication gate still apply.
+    let Some(reservation) = lane.acquire() else {
+        return completion_not_published(&super::WorkError::Saturated.to_string());
+    };
+    let prepared = match reservation.stage(move || {
         let report = completion_report(&frame, &attempt.attempt_hex())
             .ok_or_else(|| "malformed or unversioned completion".to_owned())?;
         (*attempt).capture(&report)
     }) {
-        Ok(mut work) => match work.wait().await {
-            Ok(result) => result,
-            Err(error) => Err(error.to_string()),
-        },
+        Ok(mut work) => work.wait().await.map_err(|error| error.to_string()),
         Err(error) => Err(error.to_string()),
+    };
+    let (prepared, reservation) = match prepared {
+        Ok(result) => result,
+        Err(detail) => return completion_not_published(&detail),
     };
     let captured = match prepared {
         Ok(captured) => captured,
@@ -675,7 +684,9 @@ pub(super) async fn complete_on_lane(
     };
     let attempt_hex = captured.attempt_hex();
     let ack = acknowledge_capture(stream, &attempt_hex, captured.manifest_key()).await;
-    let finished = lane.spawn(move || {
+    // Capture's worker has been joined; acknowledgment held no thread or CAS
+    // lock. Consume the same non-clone reservation, never race a second acquire.
+    let finished = reservation.finish(move || {
         let Some(ack) = ack else {
             drop(captured);
             return completion_not_published("output capture was not acknowledged");
