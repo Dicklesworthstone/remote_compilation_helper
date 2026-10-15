@@ -566,8 +566,48 @@ rch_group_timeout() {
         gnutimeout "$@"
     elif command -v gtimeout >/dev/null 2>&1; then
         gtimeout "$@"
-    else
+    elif command -v timeout >/dev/null 2>&1; then
         timeout "$@"
+    else
+        # The Darwin launcher already uses Python when setsid is unavailable.
+        # Do not require Homebrew coreutils merely to observe a native identity.
+        # Keep this monitor alive as its OWN session/group leader. On a deadline
+        # or interrupted observer, signal that group, never a reaped child's PID
+        # and never the caller's (possibly the compiler's) process group.
+        command -v python3 >/dev/null 2>&1 || return 125
+        python3 -I -c '
+import os
+import signal
+import subprocess
+import sys
+
+if len(sys.argv) < 4 or sys.argv[1] != "--signal=KILL" or sys.argv[2] not in ("1s", "5s"):
+    sys.exit(125)
+try:
+    os.setsid()
+except OSError:
+    sys.exit(125)
+if os.getpgrp() != os.getpid():
+    sys.exit(125)
+
+def stop_group(signum=None, frame=None):
+    try:
+        os.killpg(os.getpid(), signal.SIGKILL)
+    finally:
+        os._exit(125)
+
+for signum in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM, signal.SIGALRM):
+    signal.signal(signum, stop_group)
+# Arm before spawning too: waiting for exec to complete is part of the probe.
+signal.alarm(int(sys.argv[2][:-1]))
+try:
+    child = subprocess.Popen(sys.argv[3:])
+except OSError:
+    sys.exit(125)
+status = child.wait()
+signal.alarm(0)
+sys.exit(status if status >= 0 else 128 - status)
+' "$@"
     fi
 }
 
