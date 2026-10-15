@@ -81,10 +81,20 @@ These are action-key/closure tests, not an executed Cargo/fleet speedup claim.
 The original empty-OUT_DIR implementation and tests remain in
 `empty_out_dir_reuse.rs`.
 
+`rabs-wrap/tests/live_cargo_layout.rs` exercises the actual daemon/wrapper and
+offline Cargo with separate final and intermediate directories. It requires a
+first publication, two independent comparisons, then a served build with no
+dependency compiler admission. Library bytes and executable output must match
+stock Cargo in the same test, and the next build must be fresh. Separate real
+`env!`/`option_env!` cases must compile and return each layout's actual value,
+never replay another layout. The test uses the existing prepared-binary helper;
+missing tools or failed builds are failures, not skipped acceptance.
+
 Validation commands on the project's configured build worker:
 
 ```sh
 rch exec -- cargo test -p rabsd cargo_placement_reuse
 rch exec -- cargo test -p rabsd empty_out_dir
+rch exec -- cargo test -p rabs-wrap --test live_cargo_layout --locked -- --nocapture
 rch exec -- cargo test -p rabs-wrap --bin rabs-wrap singleflight
 ```
