@@ -31,7 +31,7 @@ fn install(engine: &mut impl SqlEngine) -> Result<(), StoreError> {
     if let Err(error) = result {
         if let Err(rollback) = engine.execute("ROLLBACK", &[]) {
             return Err(StoreError::Backend(format!(
-                "read-index setup failed: {error}; rollback failed: {rollback}"
+                "read-index setup failed: {error:?}; rollback failed: {rollback:?}"
             )));
         }
         return Err(error);

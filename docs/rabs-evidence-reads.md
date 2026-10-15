@@ -44,9 +44,45 @@ Rust regressions exercise the index profile on both metadata engines and retain
 all original class-safety regressions. The authoring environment has no Rust
 toolchain; adding these tests is not evidence that they ran.
 
+## Exact per-action aggregation
+
+The shared `trust_evidence::verification_evidence` path now returns two scalar
+rows from SQL rather than transferring all samples and attributable attempts
+into Rust vectors, a per-attempt map, and a worker set. Both the serving sample
+gate and trust-tier reevaluation use this same path. No summary is persisted or
+cached: a new failure, later attempt attribution, or changed worker row is read
+afresh under the caller's existing CAS lock.
+
+Grouping occurs per same-action attempt before counting distinct passing
+workers. Duplicate observations do not create attempts; any failed observation
+dominates that attempt's later passes. Empty worker identities and foreign or
+unknown attempts earn no positive evidence, while their negative samples still
+count. Type/sequence validation runs even for unjoined samples, so aggregation
+cannot hide a malformed row by dropping it in an inner join. The existing
+nonnegative-integer, nonzero-is-true decoder contract is preserved; the separate
+class-safety gate still vetoes every non-one outcome. Invalid result shapes,
+negative counts, overflow and inconsistent totals return errors, not empty or
+successful evidence.
+
+The original trust/quarantine tests remain unchanged. Six added Rust tests cover
+list-oracle equivalence, both backends and reopening, malformed unknown samples,
+the integer flag contract, malformed workers, and aggregate result validation.
+Eight added native SQLite tests include 100 randomized histories, corruption,
+late attribution, failure dominance and a 100,000-sample workload. The optional
+`aggregate_benchmark` compares the old row queries and an independent Python
+decoder with the new exact SQL: 100,000 samples / 20,000 attempts produce 120,000
+rows versus two, with equal counts. Python allocation/timing measurements from
+that experiment are not Rust allocator or Cargo performance measurements.
+
+SQL still scans this action's history and may allocate grouping storage inside
+the engine. Other coordinator sample lookups have not all been replaced. This
+change bounds this helper's result allocations, not total database work, and
+does not relax evidence or convert unavailable SQL into a permissive fallback.
+
 ```sh
 python3 tests/test_rabs_evidence_queries.py -v
 rch exec -- cargo test -p rabs-cas --lib read_indexes --locked
+rch exec -- cargo test -p rabs-cas --lib trust_evidence --locked
 rch exec -- cargo test -p rabs-cas --lib serving_sample_gate --locked
 rch exec -- cargo test -p rabsd --lib janitor --locked
 ```

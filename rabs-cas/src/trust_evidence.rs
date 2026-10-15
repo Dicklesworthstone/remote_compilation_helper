@@ -36,13 +36,13 @@
 //! a more permissive one. The serving gate independently checks durable
 //! quarantine, including when the disposition update has not landed.
 
-use std::collections::{BTreeMap, BTreeSet};
+mod aggregate;
 
 use rabs_protocol::result_identity::TypedDigest;
 use rabs_protocol::serving::TrustEvidenceTier;
 
 use crate::metadata_store::{
-    QuarantineScope, RabsMetadataStore, SqlValue, StoreError, TrustEvaluationRow, digest_key,
+    QuarantineScope, RabsMetadataStore, StoreError, TrustEvaluationRow, digest_key,
 };
 use crate::serving_state::{action_quarantine_present, divergence_quarantine_disposition};
 
@@ -188,54 +188,13 @@ pub(crate) struct VerificationEvidence {
 /// Aggregate verification evidence without inventing executions or
 /// worker identities. Unknown and foreign-action attempts never count
 /// as positive evidence; their negative observations are still retained.
+/// Two scalar result rows replace unbounded sample/attempt collections. SQL
+/// still scans this action's evidence; callers retain the same CAS lock.
 pub(crate) fn verification_evidence(
     store: &mut dyn RabsMetadataStore,
     action: &TypedDigest,
 ) -> Result<VerificationEvidence, StoreError> {
-    let samples = store.list_verification_samples(action)?;
-    let adverse_samples = samples.iter().filter(|sample| !sample.passed).count() as u64;
-    let rows = store.query(
-        "SELECT DISTINCT a.id_hex, a.worker FROM verification_samples s \
-         JOIN action_attempts a ON a.id_hex = s.attempt_hex \
-         JOIN action_generations g ON g.id_hex = a.generation_hex \
-         WHERE s.action_key = ?1 AND g.action_key = ?1 \
-         ORDER BY a.id_hex",
-        &[SqlValue::Text(digest_key(action))],
-    )?;
-    let mut attempts = BTreeMap::new();
-    for row in rows {
-        match row.as_slice() {
-            [SqlValue::Text(attempt), SqlValue::Text(worker)] => {
-                if !worker.is_empty() {
-                    attempts.insert(attempt.clone(), (worker.clone(), true));
-                }
-            }
-            _ => {
-                return Err(StoreError::Backend(
-                    "invalid verification attempt attribution row".to_owned(),
-                ));
-            }
-        }
-    }
-    for sample in &samples {
-        if let Some((_, passed)) = attempts.get_mut(&sample.attempt_hex) {
-            *passed &= sample.passed;
-        }
-    }
-    let mut passed_workers = BTreeSet::new();
-    let mut passed_attempts = 0_u64;
-    for (worker, passed) in attempts.values() {
-        if *passed {
-            passed_attempts += 1;
-            passed_workers.insert(worker.as_str());
-        }
-    }
-    Ok(VerificationEvidence {
-        attempts: attempts.len() as u64,
-        passed_attempts,
-        passed_workers: passed_workers.len(),
-        adverse_samples,
-    })
+    aggregate::read(store, action)
 }
 
 /// Derive an observed evidence tier, never a semantic-correctness claim
@@ -407,7 +366,7 @@ mod tests {
     use super::*;
     use crate::metadata_store::{
         ActionEntryRow, AuthorityRow, CommitOutcome, FsqliteEngine, PublicationRow, ResultKindTag,
-        RusqliteEngine, SqlMetadataStore,
+        RusqliteEngine, SqlMetadataStore, SqlValue,
     };
     use crate::serving_state::{ServeDecision, serving_gate};
     use rabs_protocol::result_identity::DigestAlgorithm;

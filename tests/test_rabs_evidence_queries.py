@@ -212,6 +212,177 @@ class QueryTests(unittest.TestCase):
         self.assertNotIn("SCAN s", disposition)
 
 
+AGGREGATE_TEXT = (ROOT / "rabs-cas/src/trust_evidence/aggregate.rs").read_text()
+AGGREGATE_SQL = dict(re.findall(r'const (\w+)_SQL: &str = r#"(.*?)"#;', AGGREGATE_TEXT, re.S))
+ATTRIBUTION_SCHEMA = """
+CREATE TABLE action_generations (id_hex TEXT PRIMARY KEY, action_key TEXT NOT NULL);
+CREATE TABLE action_attempts (id_hex TEXT PRIMARY KEY, generation_hex TEXT NOT NULL, worker TEXT NOT NULL);
+"""
+ORIGINAL_SAMPLES = "SELECT attempt_hex, passed, seq FROM verification_samples WHERE action_key = ?1 ORDER BY attempt_hex, seq"
+ORIGINAL_ATTEMPTS = """
+SELECT DISTINCT a.id_hex, a.worker FROM verification_samples s
+JOIN action_attempts a ON a.id_hex = s.attempt_hex
+JOIN action_generations g ON g.id_hex = a.generation_hex
+WHERE s.action_key = ?1 AND g.action_key = ?1 ORDER BY a.id_hex
+"""
+
+
+def aggregate(db, action="a"):
+    sample_rows = db.execute(AGGREGATE_SQL["SAMPLES"], (action,)).fetchall()
+    assert len(sample_rows) == 1
+    samples, adverse, invalid = sample_rows[0]
+    if invalid or adverse > samples:
+        raise ValueError("sample corruption")
+    attempt_rows = db.execute(AGGREGATE_SQL["ATTEMPTS"], (action,)).fetchall()
+    assert len(attempt_rows) == 1
+    attempts, passed, workers, invalid = attempt_rows[0]
+    if invalid or not 0 <= workers <= passed <= attempts <= samples:
+        raise ValueError("attribution corruption")
+    return attempts, passed, workers, adverse
+
+
+def original_evidence(db, action="a"):
+    # Exact original row reads, followed by an independent model of the old
+    # Rust decoder/reduction. No new SQL aggregate is used to derive the oracle.
+    samples = db.execute(ORIGINAL_SAMPLES, (action,)).fetchall()
+    for attempt, passed, seq in samples:
+        if not isinstance(attempt, str) or type(passed) is not int or passed < 0 or type(seq) is not int or seq < 0:
+            raise ValueError("sample corruption")
+    attempts = {}
+    for attempt, worker in db.execute(ORIGINAL_ATTEMPTS, (action,)):
+        if not isinstance(attempt, str) or not isinstance(worker, str):
+            raise ValueError("attribution corruption")
+        if worker:
+            attempts[attempt] = [worker, True]
+    for attempt, passed, _ in samples:
+        if attempt in attempts:
+            attempts[attempt][1] &= passed != 0
+    workers = {worker for worker, passed in attempts.values() if passed}
+    return len(attempts), sum(passed for _, passed in attempts.values()), len(workers), sum(passed == 0 for _, passed, _ in samples)
+
+
+class AggregateTests(unittest.TestCase):
+    def setUp(self):
+        self.db = database()
+        self.db.executescript(ATTRIBUTION_SCHEMA)
+        self.db.executemany("INSERT INTO action_generations VALUES(?,?)", [("1", "a"), ("2", "b")])
+        self.db.executemany("INSERT INTO action_attempts VALUES(?,?,?)", [
+            ("1", "1", "worker-a"), ("2", "1", "worker-a"),
+            ("3", "1", "worker-b"), ("4", "1", ""), ("5", "2", "foreign")])
+
+    def tearDown(self):
+        self.db.close()
+
+    def assert_parity(self):
+        before = list(self.db.iterdump())
+        for key in ("a", "b", "unknown"):
+            self.assertEqual(aggregate(self.db, key), original_evidence(self.db, key), key)
+        self.assertEqual(list(self.db.iterdump()), before)
+
+    def test_empty_unknown_and_foreign_actions_do_not_invent_evidence(self):
+        self.assert_parity()
+        for n, identity in enumerate(["5", "unknown", "4"]):
+            self.db.execute("INSERT INTO verification_samples VALUES('a',?,1,?)", (identity, n))
+        self.assertEqual(aggregate(self.db), (0, 0, 0, 0))
+        self.assert_parity()
+
+    def test_failure_dominance_worker_counts_and_duplicates_match_each_step(self):
+        history = [("1",1), ("1",1), ("2",1), ("3",1), ("4",1),
+                   ("5",1), ("unknown",1), ("unknown",0), ("1",0), ("1",1), ("5",0)]
+        for seq, (identity, passed) in enumerate(history):
+            self.db.execute("INSERT INTO verification_samples VALUES('a',?,?,?)", (identity, passed, seq))
+            self.assert_parity()
+        self.assertEqual(aggregate(self.db), (3, 2, 2, 3))
+
+    def test_unknown_corrupt_samples_are_not_filtered_out_by_a_join(self):
+        self.db.execute("INSERT INTO verification_samples VALUES('a','unknown',1,1)")
+        for column, value in [("passed",-1), ("passed","bad"), ("passed",0.5),
+                              ("seq",-1), ("seq","bad"), ("seq",0.5), ("attempt_hex", b"bad")]:
+            self.db.execute("UPDATE verification_samples SET attempt_hex='unknown',passed=1,seq=1")
+            self.db.execute("UPDATE verification_samples SET " + column + "=?", (value,))
+            with self.assertRaises(ValueError):
+                original_evidence(self.db)
+            with self.assertRaises(ValueError):
+                aggregate(self.db)
+
+    def test_nonzero_integer_decoder_contract_is_unchanged(self):
+        self.db.execute("INSERT INTO verification_samples VALUES('a','1',1,1)")
+        for flag in (0,1,2,9223372036854775807):
+            self.db.execute("UPDATE verification_samples SET passed=?", (flag,))
+            self.assert_parity()
+            self.assertEqual(aggregate(self.db)[1], int(flag != 0))
+
+    def test_malformed_worker_still_refuses(self):
+        self.db.execute("INSERT INTO verification_samples VALUES('a','1',1,1)")
+        self.db.execute("UPDATE action_attempts SET worker=X'FF' WHERE id_hex='1'")
+        with self.assertRaises(ValueError):
+            original_evidence(self.db)
+        with self.assertRaises(ValueError):
+            aggregate(self.db)
+
+    def test_new_negative_evidence_and_late_attribution_are_read_afresh(self):
+        self.db.execute("INSERT INTO verification_samples VALUES('a','late',1,1)")
+        self.assertEqual(aggregate(self.db), (0,0,0,0))
+        self.db.execute("INSERT INTO action_attempts VALUES('late','1','late-worker')")
+        self.assertEqual(aggregate(self.db), (1,1,1,0))
+        self.db.execute("INSERT INTO verification_samples VALUES('a','late',0,2)")
+        self.assertEqual(aggregate(self.db), (1,0,0,1))
+        self.assert_parity()
+
+    def test_seeded_histories_match_the_original_reducer(self):
+        for seed in range(100):
+            db = database()
+            db.executescript(ATTRIBUTION_SCHEMA)
+            rng = random.Random(seed)
+            db.executemany("INSERT INTO action_generations VALUES(?,?)", [("1","a"),("2","b")])
+            for n in range(25):
+                db.execute("INSERT INTO action_attempts VALUES(?,?,?)", (str(n),rng.choice(["1","2","missing"]),rng.choice(["","a","b","c"])))
+            for seq in range(250):
+                db.execute("INSERT INTO verification_samples VALUES(?,?,?,?)", (rng.choice(["a","b"]), str(rng.randrange(30)), rng.choice([0,1,1,1,2]),seq))
+            for key in ("a","b","unknown"):
+                self.assertEqual(aggregate(db,key), original_evidence(db,key), (seed,key))
+            db.close()
+
+    def test_large_history_returns_two_scalar_rows_not_samples(self):
+        self.db.execute("BEGIN")
+        self.db.executemany("INSERT INTO verification_samples VALUES('a','1',1,?)", ((n,) for n in range(100000)))
+        self.db.execute("COMMIT")
+        self.assertEqual(aggregate(self.db), (1,1,1,0))
+        for sql in AGGREGATE_SQL.values():
+            self.assertEqual(len(self.db.execute(sql, ("a",)).fetchall()), 1)
+        self.assertEqual(aggregate(self.db), original_evidence(self.db))
+
+
+def aggregate_benchmark(destination):
+    # Returned-row and Python allocation comparison of exact SQL workloads,
+    # not a measurement of Rust allocator bytes or end-to-end build latency.
+    import gc
+    import tracemalloc
+    db = database()
+    db.executescript(ATTRIBUTION_SCHEMA)
+    db.execute("INSERT INTO action_generations VALUES('generation','a')")
+    db.execute("BEGIN")
+    db.executemany("INSERT INTO action_attempts VALUES(?,'generation',?)", ((str(n), 'w'+str(n%16)) for n in range(20000)))
+    db.executemany("INSERT INTO verification_samples VALUES('a',?,1,?)", ((str(n%20000),n) for n in range(100000)))
+    db.execute("COMMIT")
+    def measure(read):
+        gc.collect()
+        tracemalloc.start()
+        start = time.perf_counter_ns()
+        answer = read(db)
+        elapsed = time.perf_counter_ns()-start
+        _, peak = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+        return answer, {"elapsed_ns":elapsed, "python_peak_bytes":peak}
+    before = measure(original_evidence)
+    after = measure(aggregate)
+    assert before[0] == after[0] == (20000,20000,16,0)
+    record = {"scope":"native SQLite plus independent Python decoder; not Rust/Cargo/fleet", "samples":100000, "attempts":20000,
+              "incumbent":dict(before[1],returned_rows=120000), "aggregate":dict(after[1],returned_rows=2), "evidence_counts":after[0]}
+    Path(destination).write_text(json.dumps(record,indent=2)+"\n")
+    db.close()
+
+
 def benchmark(destination):
     """Compare incumbent and candidate on one unchanged native SQLite dataset."""
     db = database()
