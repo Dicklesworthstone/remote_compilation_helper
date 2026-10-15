@@ -1529,6 +1529,9 @@ pub struct FleetConfig {
     #[serde(default = "default_fleet_min_disk_space_mb")]
     pub min_disk_space_mb: u64,
     /// Maximum acceptable load average for worker health.
+    ///
+    /// Not read anywhere yet: setting it changes nothing. Selection already
+    /// accounts for load through telemetry pressure and SpeedScore.
     #[serde(default = "default_fleet_max_load_average")]
     pub max_load_average: f64,
     /// Maximum number of concurrent SSH connections.
@@ -1845,6 +1848,9 @@ pub struct SelfHealingConfig {
     pub auto_start_timeout_secs: u64,
     /// Log level for self-healing diagnostic events. Default: info.
     /// Override via `RCH_SELF_HEALING_LOG_LEVEL=debug|info|warn|error`.
+    ///
+    /// Parsed but not applied yet: self-healing events log at their own
+    /// levels under the normal `RUST_LOG` / `general.log_level` filter.
     #[serde(default)]
     pub self_healing_log_level: SelfHealingLogLevel,
 }
@@ -2936,9 +2942,10 @@ pub struct TransferConfig {
     pub retry: RetryConfig,
     /// Verify artifact integrity using blake3 hashes after transfer (bd-377q).
     ///
-    /// When enabled, computes blake3 hashes of key artifacts (binaries, test outputs)
-    /// on the worker after build, then verifies them locally after download.
-    /// Disabled by default to avoid extra overhead.
+    /// Not wired: no transfer path calls `artifact_verify`, so enabling this
+    /// has no effect. rsync already checks each transferred file against a
+    /// whole-file checksum, and recovery publication verifies delivered
+    /// outputs, which is why the extra pass was never connected.
     #[serde(default)]
     pub verify_artifacts: bool,
     /// Maximum file size (bytes) for artifact verification (bd-377q).
