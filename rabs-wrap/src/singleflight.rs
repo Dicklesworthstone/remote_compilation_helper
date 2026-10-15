@@ -271,6 +271,9 @@ fn read_with_policy(
     // edge connection with its own quota; retries and the absolute deadline
     // remain owned by this logical consultation.
     let mut requests_on_connection = 1_u32;
+    // Count reconnects separately from retries: a malicious or broken peer
+    // cannot turn the per-connection quota into unlimited socket attempts.
+    let mut rollovers = 0_u32;
     loop {
         let response_deadline = reader.get_ref().deadline;
         let line = read_owned_reply(&mut reader, MAX_LIVE_REPLY_BYTES, response_deadline, owned)
@@ -344,6 +347,10 @@ fn read_with_policy(
         }
         if requests_on_connection >= 60 {
             let (socket, connect_timeout) = rollover.ok_or(())?;
+            if rollovers >= 16 {
+                return Ok(Live::PassThrough);
+            }
+            rollovers += 1;
             // Drop the old follower connection before opening a new one. The
             // edge releases any connection-scoped flight accounting on drop.
             drop(reader);
