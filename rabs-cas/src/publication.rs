@@ -868,8 +868,9 @@ struct PendingAncestorCheck {
 ///
 /// Walks the offer's direct references plus, for every committed
 /// producer, the lineage rows recorded at THAT producer's commit —
-/// breadth-first with a visited set, so diamond graphs verify once and
-/// cycles terminate. Every reference (at every depth) must satisfy:
+/// breadth-first with a visited set for EXPANSION, so shared ancestry and
+/// cycles terminate without suppressing distinct consumption edges. Every
+/// reference (at every depth) must satisfy:
 /// producer committed, its canonical manifest resolves the (role, path)
 /// logical output, and that output is the EXACT consumed object or an
 /// explicit adoption edge from consumed to committed exists.
@@ -945,12 +946,11 @@ fn verify_provisional_ancestry(
                 adopted,
             });
         }
-        // Transitive expansion: the producer's own recorded lineage.
+        // Expand each producer once, but validate EVERY consumption edge.
+        // Another consumer may name a different role, path or object from a
+        // producer already visited through a valid direct or indirect edge.
         if walked_producers.insert(check.producer_key.clone()) {
             for row in store.list_provisional_ancestors(&check.producer_key)? {
-                if walked_producers.contains(&row.producer_action_key) {
-                    continue;
-                }
                 queue.push_back(PendingAncestorCheck {
                     producer_key: row.producer_action_key,
                     role_tag: row.role,
@@ -1696,6 +1696,162 @@ mod tests {
         );
         assert_eq!(recorded[0].object_key, digest_key(&object(111).0));
         assert!(!recorded[0].adopted);
+    }
+
+    #[test]
+    fn h028_shared_ancestor_checks_every_object_before_publication() {
+        let mut store = SqlMetadataStore::open(RusqliteEngine::open_in_memory().unwrap()).unwrap();
+        ready_store(&mut store);
+        let mut manifests = std::collections::BTreeMap::new();
+        plant_producer(
+            &mut store, &mut manifests, 100, 120, "out/a.rmeta", 110, 800, vec![],
+        );
+        let a_key = digest_key(&digest("rabs.action-key.sha256.v1", 100));
+        // Retained B lineage names a different A object. Visiting C's good
+        // direct edge to A cannot certify B's separate consumption of A.
+        plant_producer(
+            &mut store,
+            &mut manifests,
+            101,
+            121,
+            "out/b.rmeta",
+            111,
+            801,
+            vec![ProvisionalAncestorRow {
+                producer_action_key: a_key.clone(),
+                role: "provisional-metadata".to_owned(),
+                virtual_path: b"out/a.rmeta".to_vec(),
+                object_key: digest_key(&object(119).0),
+                adopted: false,
+            }],
+        );
+        let candidate = offer_with_ancestors(vec![
+            ancestor_ref(100, "out/a.rmeta", 110),
+            ancestor_ref(101, "out/b.rmeta", 111),
+        ]);
+        let before = store.differential_snapshot().unwrap();
+        assert_eq!(
+            process_offer(
+                &mut store,
+                &candidate,
+                &expected_descriptor(),
+                |key| manifests.get(key).cloned(),
+                900,
+                1,
+                CommitDurabilityProfile::RequireDurableClosure,
+                || 10,
+            ),
+            Err(OfferRefusal::DivergentProvisionalAncestor {
+                producer: a_key.clone(),
+                path: "out/a.rmeta".to_owned(),
+            })
+        );
+        assert_eq!(store.differential_snapshot().unwrap(), before);
+        assert!(!store.has_publication(&candidate.manifest.action_key).unwrap());
+        assert!(store.pin_row(900).unwrap().is_none());
+
+        // Only the existing authority-gated exact adoption edge can reconcile
+        // the mismatch. The rejection above neither manufactures it nor loses
+        // C's valid direct lineage when the same offer is later retried.
+        store
+            .record_adoption_edge(
+                &authority_digest(&coordinator_authority()),
+                &a_key,
+                "provisional-metadata",
+                b"out/a.rmeta",
+                &digest_key(&object(119).0),
+                &digest_key(&object(110).0),
+            )
+            .unwrap();
+        assert!(matches!(
+            process_offer(
+                &mut store,
+                &candidate,
+                &expected_descriptor(),
+                |key| manifests.get(key).cloned(),
+                900,
+                2,
+                CommitDurabilityProfile::RequireDurableClosure,
+                || 10,
+            )
+            .unwrap(),
+            PublicationOutcome::Committed(_)
+        ));
+        let recorded = store
+            .list_provisional_ancestors(&digest_key(&candidate.manifest.action_key))
+            .unwrap();
+        assert_eq!(recorded.len(), 2);
+        assert!(recorded.iter().all(|row| !row.adopted));
+    }
+
+    #[test]
+    fn h028_back_edges_are_validated_without_reexpanding_cycles() {
+        for consumed in [110, 119] {
+            let mut store =
+                SqlMetadataStore::open(RusqliteEngine::open_in_memory().unwrap()).unwrap();
+            ready_store(&mut store);
+            let mut manifests = std::collections::BTreeMap::new();
+            let a_key = digest_key(&digest("rabs.action-key.sha256.v1", 100));
+            let b_key = digest_key(&digest("rabs.action-key.sha256.v1", 101));
+            // Deliberately seeded retained metadata, not a claimed executable
+            // Cargo cycle. Admission must terminate AND inspect the back edge.
+            plant_producer(
+                &mut store,
+                &mut manifests,
+                100,
+                120,
+                "out/a.rmeta",
+                110,
+                800,
+                vec![ProvisionalAncestorRow {
+                    producer_action_key: b_key,
+                    role: "provisional-metadata".to_owned(),
+                    virtual_path: b"out/b.rmeta".to_vec(),
+                    object_key: digest_key(&object(111).0),
+                    adopted: false,
+                }],
+            );
+            plant_producer(
+                &mut store,
+                &mut manifests,
+                101,
+                121,
+                "out/b.rmeta",
+                111,
+                801,
+                vec![ProvisionalAncestorRow {
+                    producer_action_key: a_key.clone(),
+                    role: "provisional-metadata".to_owned(),
+                    virtual_path: b"out/a.rmeta".to_vec(),
+                    object_key: digest_key(&object(consumed).0),
+                    adopted: false,
+                }],
+            );
+            let candidate = offer_with_ancestors(vec![ancestor_ref(100, "out/a.rmeta", 110)]);
+            let resolutions = std::cell::Cell::new(0_usize);
+            let before = store.differential_snapshot().unwrap();
+            let outcome = verify_provisional_ancestry(&mut store, &candidate, &|key| {
+                resolutions.set(resolutions.get() + 1);
+                assert!(resolutions.get() <= 3, "cyclic ancestry was expanded twice");
+                manifests.get(key).cloned()
+            });
+            assert_eq!(resolutions.get(), 3, "the back edge must be checked");
+            if consumed == 110 {
+                let direct = outcome.unwrap();
+                assert_eq!(direct.len(), 1);
+                assert_eq!(direct[0].producer_action_key, a_key);
+                assert_eq!(direct[0].object_key, digest_key(&object(110).0));
+            } else {
+                assert_eq!(
+                    outcome,
+                    Err(OfferRefusal::DivergentProvisionalAncestor {
+                        producer: a_key,
+                        path: "out/a.rmeta".into(),
+                    })
+                );
+            }
+            assert_eq!(store.differential_snapshot().unwrap(), before);
+        }
     }
 
     #[test]
