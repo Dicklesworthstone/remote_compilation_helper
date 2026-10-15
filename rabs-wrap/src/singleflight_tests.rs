@@ -492,6 +492,7 @@ fn buffered_hit_is_not_accepted_after_ownership_is_revoked() {
             Duration::from_secs(1),
             true,
             policy(3),
+            None,
             &|| false,
         )
         .is_err()
