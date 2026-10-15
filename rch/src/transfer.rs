@@ -1457,6 +1457,65 @@ const CONFIG_EXCLUDE_REWRITES: &[(&str, &str)] = &[
     (".git/objects/", ".git/"),
 ];
 
+/// Build-output directory excludes that rch applies by basename at any depth.
+/// They exist to skip generated trees, never Cargo packages.
+const BUILD_OUTPUT_DIR_EXCLUDES: &[&str] = &["build/", "dist/", "coverage/", "target/"];
+
+/// Root-anchored, directory-only includes for tracked Cargo packages that a
+/// build-output exclude would cut off (#113). The default `build/` dropped a
+/// workspace member at `crates/build`, and dependency preflight then failed
+/// with RCH-E410 on every worker. A generated tree never has a `Cargo.toml`
+/// at its top, so this cannot readmit build output. A directory include keeps
+/// every other rule in force for the files inside (secret patterns, `target/`).
+/// User-chosen excludes keep their exact meaning. Without git, nothing changes.
+fn cargo_package_dir_includes(project_root: &Path, effective_excludes: &[String]) -> Vec<String> {
+    let names: Vec<&str> = effective_excludes
+        .iter()
+        .filter(|pattern| BUILD_OUTPUT_DIR_EXCLUDES.contains(&pattern.as_str()))
+        .filter_map(|pattern| pattern.strip_suffix('/'))
+        .collect();
+    if names.is_empty() {
+        return Vec::new();
+    }
+    let Ok(output) = std::process::Command::new("git")
+        .arg("-C")
+        .arg(project_root)
+        .args(["ls-files", "-z", "--", "*/Cargo.toml"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    let mut includes = std::collections::BTreeSet::new();
+    for manifest in output.stdout.split(|byte| *byte == 0) {
+        let Ok(manifest) = std::str::from_utf8(manifest) else {
+            continue;
+        };
+        let Some(dir) = manifest.strip_suffix("/Cargo.toml") else {
+            continue;
+        };
+        // An rsync pattern treats these as wildcards; never widen a match.
+        if dir.contains(['*', '?', '[', '\\']) {
+            continue;
+        }
+        let mut prefix = String::new();
+        for component in dir.split('/') {
+            if !prefix.is_empty() {
+                prefix.push('/');
+            }
+            prefix.push_str(component);
+            if names.contains(&component) {
+                includes.insert(format!("/{prefix}/"));
+            }
+        }
+    }
+    includes.into_iter().collect()
+}
+
 fn normalize_config_exclude_pattern(pattern: &str) -> &str {
     CONFIG_EXCLUDE_REWRITES
         .iter()
@@ -3867,6 +3926,11 @@ impl TransferPipeline {
             }
             cmd.arg("--exclude").arg("*");
         } else {
+            // rsync is first-match-wins: carve Cargo packages out of the
+            // build-output excludes before any exclude is emitted (#113).
+            for pattern in cargo_package_dir_includes(&self.project_root, effective_excludes) {
+                cmd.arg("--include").arg(pattern);
+            }
             for pattern in effective_excludes {
                 cmd.arg("--exclude").arg(pattern);
             }
@@ -19098,6 +19162,77 @@ exec /usr/bin/rsync "$@" -e "sh -c 'if [ \"\$1\" = -l ]; then shift 2; fi; shift
                 .to_string(),
             "source-content receipts require the rsync transport"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn build_output_excludes_keep_cargo_packages_named_build() {
+        let _guard = test_guard!();
+        let root = tempfile::tempdir().expect("source fixture");
+        for (path, body) in [
+            (
+                "Cargo.toml",
+                "[workspace]\nmembers = [\"app\", \"crates/build\"]\n",
+            ),
+            ("app/Cargo.toml", "[package]\nname = \"app\"\n"),
+            ("app/src/lib.rs", "pub fn answer() {}\n"),
+            ("crates/build/Cargo.toml", "[package]\nname = \"helper\"\n"),
+            ("crates/build/src/lib.rs", "pub fn one() {}\n"),
+            ("crates/build/.env", "SECRET=1\n"),
+            ("crates/build/build/generated.rs", "output\n"),
+            ("build/generated.rs", "output\n"),
+            ("app/dist/bundle.js", "output\n"),
+        ] {
+            let path = root.path().join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+        }
+        for args in [&["init", "-q"][..], &["add", "-A"][..]] {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(root.path())
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?}");
+        }
+        let pipeline = TransferPipeline::new(
+            root.path().to_path_buf(),
+            "fixture".to_string(),
+            "hash".to_string(),
+            TransferConfig::default(),
+        );
+        let selected = pipeline
+            .enumerate_source_content_files()
+            .await
+            .expect("rsync selection");
+        let selected: Vec<String> = selected
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect();
+        for kept in [
+            "crates/build/Cargo.toml",
+            "crates/build/src/lib.rs",
+            "app/src/lib.rs",
+        ] {
+            assert!(
+                selected.iter().any(|p| p == kept),
+                "{kept} missing: {selected:?}"
+            );
+        }
+        for dropped in [
+            "crates/build/.env",
+            "crates/build/build/generated.rs",
+            "build/generated.rs",
+            "app/dist/bundle.js",
+        ] {
+            assert!(!selected.iter().any(|p| p == dropped), "{dropped} selected");
+        }
+        assert_eq!(
+            cargo_package_dir_includes(root.path(), &["build/".to_string()]),
+            ["/crates/build/"]
+        );
+        // A user's own exclude keeps its exact meaning.
+        assert!(cargo_package_dir_includes(root.path(), &["crates/".to_string()]).is_empty());
     }
 
     #[cfg(unix)]
