@@ -223,6 +223,23 @@ impl LiveCas {
     pub fn cas_root(&self) -> &Path {
         &self.cas_root
     }
+
+    /// A pathname replaced after mounting must not redirect physical GC into
+    /// another store. Check the named fencing inode against the held descriptor.
+    pub(super) fn verify_mount_path(&self) -> Result<(), String> {
+        use std::os::unix::fs::MetadataExt;
+        let held = self._mount_lock.0.metadata().map_err(|e| e.to_string())?;
+        let named = std::fs::symlink_metadata(self.cas_root.join(MOUNT_LOCK))
+            .map_err(|e| format!("CAS mount lock disappeared: {e}"))?;
+        if !named.file_type().is_file()
+            || named.nlink() != 1
+            || named.mode() & 0o077 != 0
+            || (named.dev(), named.ino(), named.uid()) != (held.dev(), held.ino(), held.uid())
+        {
+            return Err("CAS mount lock changed after mounting".into());
+        }
+        Ok(())
+    }
 }
 
 impl std::fmt::Debug for LiveCas {
@@ -553,7 +570,8 @@ mod tests {
     /// `create_dir_all` honours the umask, so the mount used to create a
     /// 0775 CAS root and then refuse it for being group-writable: the
     /// daemon declined to mount a directory it had just made itself, and
-    /// no cold start could succeed on a stock host. The whole rabsd test
+    /// no cold start could succeed on a stock Debian/Ubuntu box at all.
+    /// The whole rabsd test
     /// suite failed on exactly those workers too, which is how this was
     /// found.
     #[cfg(unix)]
