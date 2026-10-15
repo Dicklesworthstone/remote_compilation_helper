@@ -5,7 +5,7 @@ Compilation Helper): the PreToolUse hook + CLI (`rch`), the local daemon (`rchd`
 worker agent (`rch-wkr`), the RABS build sidecar (`rabs-*`, `rabsd`), and the fleet
 dashboard (`dashboard/`).
 
-Scope window: project inception (`v0.1.0`, 2026-01-25) through `v2.1.30` (2026-10-15).
+Scope window: project inception (`v0.1.0`, 2026-01-25) through `v2.1.31` (2026-10-15).
 
 This document was rebuilt from git history (`git log --no-merges` per tag range, `git show`
 on representative commits), version tags (`git for-each-ref`), GitHub release metadata
@@ -28,6 +28,33 @@ history. They are kept as-is because the descriptions were verified against the 
 but those particular links will 404.
 
 Repository: <https://github.com/Dicklesworthstone/remote_compilation_helper>
+
+## 2.1.31 — 2026-10-15
+
+Namespace setup no longer dies on workers with a busy disk, and a successful build is no longer
+killed while it delivers. Two reported correctness bugs are fixed: a crate in a directory named
+`build/` no longer drops out of syncs, and `allow_local_fallback = false` now covers every
+remote-failure exit.
+
+- **Namespace setup on busy disks** (#111). Every worker namespace setup re-confirmed the topology
+  with four `sync -f` (syncfs) calls on the worker's data filesystem while holding the claim registry
+  lock. Each one first flushed every concurrent build's dirty pages. On hz3 and hz4 (one
+  saturated SATA SSD each) setups queued past their 15 s budget and were killed: about 150 failed
+  job starts in two days. The roots now get a directory fdatasync instead (0.02-0.04 s measured,
+  against seconds for syncfs) ([`caaf6d9e`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/caaf6d9ee93a9485c05807f920d31a6cc04e3162)).
+- **Delivering builds are not stuck builds** (#112). In SyncDown and Finalize the remote command
+  has already exited, so the stuck detector no longer SIGTERMs a live hook after 120 s of heartbeat
+  silence. Large artifact publication blocks the client's heartbeat. A live hook there now gets
+  30 min, while a dead hook is still reaped on the 20 s limit ([`fe04629b`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/fe04629bed3102fb5b2e2b594bfd26812ea34a5e)).
+- **Cargo packages named like build output** (#113). The default excludes `build/`, `dist/`,
+  `coverage/` and `target/` match at any depth, so a workspace member at `crates/build` never
+  reached the worker and dependency preflight failed with RCH-E410. The rsync filter now emits a
+  root-anchored directory include for every tracked package directory those patterns would cut off.
+  Files inside still pass through every other rule, so secrets stay excluded ([`160ba613`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/160ba613995fedd3aeff3a8f1218459f83a01c33)).
+- **`allow_local_fallback = false` is honoured everywhere** (#114). Daemon unavailable, dependency
+  preflight failure, transfer skip and an unrequested worker ran the build locally anyway; they now
+  refuse like the other remote-failure exits ([`732bfa69`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/732bfa69c93887c83bdb672d54b2c5f326bfc5d6)).
+- Docs: the minisign key `69B3955C` signs releases since 2.1.0, not 2.0.0 (#89).
 
 ## 2.1.30 — 2026-10-15
 
