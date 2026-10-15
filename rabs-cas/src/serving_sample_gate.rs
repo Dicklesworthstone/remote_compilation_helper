@@ -13,6 +13,8 @@
 //!   not repeated observations or invented worker identities;
 //! - failed observations remain a safety veto, even when unattributed or
 //!   outnumbered by enough passing attempts to meet the rate threshold;
+//! - descriptor-bound live dependency classes stop serving when any member
+//!   has adverse evidence, including interrupted divergence quarantine;
 //! - rates are validated basis points and zero evidence always refuses,
 //!   including when the configured minimum is zero;
 //! - eligible keys are sampled deterministically from their action-key
@@ -29,6 +31,8 @@
 //! An interrupted demotion remains blocked by the durable serving gate.
 //!
 //! State-machine refusals reuse [`RevalidationError`] verbatim.
+
+mod class_quarantine;
 
 use sha2::{Digest, Sha256};
 
@@ -127,6 +131,17 @@ pub enum PrivateExecutionReason {
     AdverseVerificationSamples {
         /// Failed observations, including unknown and foreign attempts.
         observed: u64,
+    },
+    /// Another member of the descriptor-bound live class has negative evidence.
+    /// This is a read-only safety hold, not a new per-action quarantine or a
+    /// claim that the requested action itself produced divergent bytes.
+    ClassSafetyHold {
+        /// Class recorded by coordinator submission, never a wire risk flag.
+        class: String,
+        /// Member whose durable negative evidence prevents class-wide replay.
+        culprit_action_key: String,
+        /// Stable category of the blocking evidence, not an untrusted detail.
+        reason: &'static str,
     },
     /// Eligible, but this key's deterministic share says run privately.
     NotSampledThisEpoch {
@@ -238,6 +253,12 @@ pub fn serving_sample_decision(
                 observed: evidence.adverse_samples,
             },
         ));
+    }
+    // The live coordinator holds the same CAS mutex through this check and
+    // installation. Check the durable class again for BOTH preview and install;
+    // a previous healthy preview is never an authorization token.
+    if let Some(reason) = class_quarantine::refusal(store, &action_key)? {
+        return Ok(SampleGateDecision::ExecutePrivately(reason));
     }
     let bucket = key_bucket_basis_points(action);
     if bucket >= policy.sample_rate_basis_points {
@@ -373,12 +394,12 @@ mod tests {
 
     static DB_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-    fn fresh_path(tag: &str) -> std::path::PathBuf {
+    pub(super) fn fresh_path(tag: &str) -> std::path::PathBuf {
         let n = DB_COUNTER.fetch_add(1, Ordering::SeqCst);
         std::env::temp_dir().join(format!("rabs-k008-{tag}-{}-{n}.db", std::process::id()))
     }
 
-    fn digest(domain: &'static str, tag: u8) -> TypedDigest {
+    pub(super) fn digest(domain: &'static str, tag: u8) -> TypedDigest {
         TypedDigest {
             algorithm: DigestAlgorithm::Sha256V1,
             domain,
@@ -386,7 +407,7 @@ mod tests {
         }
     }
 
-    fn action(tag: u8) -> TypedDigest {
+    pub(super) fn action(tag: u8) -> TypedDigest {
         digest("rabs.action-key.sha256.v1", tag)
     }
 
@@ -403,7 +424,7 @@ mod tests {
     /// Publish action `tag` at generation `generation` and return its
     /// canonical key string. Generations must strictly increase (the
     /// store enforces a high-water mark).
-    fn published(store: &mut dyn RabsMetadataStore, tag: u8, generation: u128) -> String {
+    pub(super) fn published(store: &mut dyn RabsMetadataStore, tag: u8, generation: u128) -> String {
         let active = digest("rabs.authority.sha256.v1", 1);
         store.acquire_authority(&authority_row(1)).unwrap();
         let entry = ActionEntryRow {
@@ -440,7 +461,7 @@ mod tests {
 
     /// Append independent attempts, never overwrite earlier failed
     /// samples to manufacture a healthy pass rate.
-    fn samples(
+    pub(super) fn samples(
         store: &mut dyn RabsMetadataStore,
         tag: u8,
         generation: u128,
