@@ -2827,7 +2827,7 @@ pub const LAYER0_PACK_VERSION: &str = "2";
 /// user-owned `.cargo/config.toml`. Verification lanes (`--clean-overlay`,
 /// `--source-content-receipt`) build exactly what the project declares and
 /// never receive the pack.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(default)]
 pub struct Layer0Config {
     /// Master switch: nothing is injected unless this is on.

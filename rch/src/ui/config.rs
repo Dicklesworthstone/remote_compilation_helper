@@ -499,6 +499,7 @@ mod tests {
                 auto_start_cooldown_secs: 60,
                 auto_start_timeout_secs: 10,
             },
+            layer0: Default::default(),
             sources: vec![
                 "Environment variables (RCH_*)".to_string(),
                 "Project config: .rch/config.toml".to_string(),

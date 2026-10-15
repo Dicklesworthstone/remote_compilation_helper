@@ -230,6 +230,8 @@ pub struct ConfigShowResponse {
     pub circuit: ConfigCircuitSection,
     pub output: ConfigOutputSection,
     pub self_healing: ConfigSelfHealingSection,
+    /// Layer 0 profile pack knobs (bd-bqu38, bd-hoxgn).
+    pub layer0: rch_common::types::Layer0Config,
     pub sources: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub value_sources: Option<Vec<ConfigValueSourceInfo>>,

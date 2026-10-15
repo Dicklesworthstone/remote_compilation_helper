@@ -700,11 +700,18 @@ mod tests {
                 auto_start_cooldown_secs: 30,
                 auto_start_timeout_secs: 3,
             },
+            layer0: rch_common::types::Layer0Config {
+                enabled: true,
+                debug_line_tables_only: true,
+                ..Default::default()
+            },
             sources: vec!["~/.config/rch/config.toml".to_string()],
             value_sources: None,
         };
         let json = serde_json::to_value(&response).unwrap();
         assert!(json["general"]["enabled"].as_bool().unwrap());
+        assert!(json["layer0"]["debug_line_tables_only"].as_bool().unwrap());
+        assert!(!json["layer0"]["release_lto_thin"].as_bool().unwrap());
         assert_eq!(json["compilation"]["confidence_threshold"], 0.85);
         assert_eq!(json["compilation"]["build_timeout_sec"], 300);
         assert_eq!(json["compilation"]["external_timeout_enabled"], true);

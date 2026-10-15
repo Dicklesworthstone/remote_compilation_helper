@@ -176,6 +176,7 @@ pub fn config_show(show_sources: bool, ctx: &OutputContext) -> Result<()> {
                 auto_start_cooldown_secs: config.self_healing.auto_start_cooldown_secs,
                 auto_start_timeout_secs: config.self_healing.auto_start_timeout_secs,
             },
+            layer0: config.layer0.clone(),
             sources,
             value_sources,
         };
