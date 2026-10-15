@@ -301,3 +301,157 @@ fn replaced_root_and_new_members_cannot_reuse_a_ready_snapshot() {
     assert!(replacement.verify_unchanged(&root).is_err());
     added.verify_unchanged(&root).unwrap();
 }
+
+// Explicit recency fixtures avoid sleeping or assuming filesystem/clock resolution.
+fn stamp_ready(facts: &Arc<LiveFacts>, root: &Path, stamp: Instant) {
+    let key = observation(root);
+    let mut memos = facts.packages.lock().unwrap();
+    let Some(PackageSlot::Ready { last_used, .. }) = memos.get_mut(&key) else {
+        panic!("fixture snapshot is not ready");
+    };
+    *last_used = stamp;
+}
+
+fn retained_bytes(memos: &PackageMemos) -> u64 {
+    memos.values().map(|slot| match slot {
+        PackageSlot::Ready { captured, .. } => captured.bytes,
+        _ => 0,
+    }).sum()
+}
+
+#[test]
+fn byte_pressure_preserves_hot_snapshots_and_only_recaptures_the_evicted_package() {
+    let fixtures = [fixture(17), fixture(9), fixture(4), fixture(8)];
+    let facts = LiveFacts::new();
+    let captured: Vec<_> = fixtures[..3].iter()
+        .map(|(_, root)| facts.package(root, KIND, None).unwrap())
+        .collect();
+    let base = Instant::now();
+    for (index, (_, root)) in fixtures[..3].iter().enumerate() {
+        stamp_ready(&facts, root, base + Duration::from_millis(index as u64));
+    }
+    let keys: Vec<_> = fixtures.iter().map(|(_, root)| observation(root)).collect();
+    let pending = reserve(&facts, &keys[3]);
+    {
+        let mut memos = facts.packages.lock().unwrap();
+        let reused = memos.get_mut(&keys[0]).unwrap()
+            .reuse(base + Duration::from_secs(1)).unwrap().unwrap();
+        assert!(Arc::ptr_eq(&reused, &captured[0]));
+        assert!(make_byte_room(&mut memos, 6, 30));
+        assert_eq!(retained_bytes(&memos), 21);
+        assert!(memos.contains_key(&keys[0]));
+        assert!(!memos.contains_key(&keys[1]));
+        assert!(memos.contains_key(&keys[2]));
+        assert!(pending.owns(&memos));
+    }
+    for index in [0, 2] {
+        let reused = observe_with(&facts, &fixtures[index].1, KIND, None, |_| {
+            panic!("pressure discarded a retained hot snapshot")
+        }).unwrap();
+        assert!(Arc::ptr_eq(&reused, &captured[index]));
+    }
+    // Eviction dropped only the memo reference. An existing subscriber keeps
+    // its exact immutable bytes, but new demand must perform a fresh capture.
+    captured[1].verify_unchanged(&fixtures[1].1).unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let count = Arc::clone(&calls);
+    let replacement = observe_with(&facts, &fixtures[1].1, KIND, None, move |observed| {
+        count.fetch_add(1, Ordering::SeqCst);
+        observed.capture()
+    }).unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(!Arc::ptr_eq(&replacement, &captured[1]));
+    assert_eq!(replacement.files, captured[1].files);
+    assert_eq!(*facts.warming.lock().unwrap(), 0);
+}
+
+#[test]
+fn unequal_byte_victims_stop_at_the_budget_and_keep_zero_byte_snapshots() {
+    let fixtures = [fixture(0), fixture(4), fixture(17), fixture(9)];
+    let facts = LiveFacts::new();
+    let base = Instant::now();
+    for (index, (_, root)) in fixtures.iter().enumerate() {
+        facts.package(root, KIND, None).unwrap();
+        stamp_ready(&facts, root, base + Duration::from_millis(index as u64));
+    }
+    let keys: Vec<_> = fixtures.iter().map(|(_, root)| observation(root)).collect();
+    let mut memos = facts.packages.lock().unwrap();
+    assert!(make_byte_room(&mut memos, 20, 30));
+    assert_eq!(retained_bytes(&memos), 9);
+    assert_eq!(memos.len(), 2);
+    assert!(memos.contains_key(&keys[0]), "zero bytes cannot relieve byte pressure");
+    assert!(memos.contains_key(&keys[3]), "do not flush the last ready snapshot");
+    assert!(make_byte_room(&mut memos, 21, 30), "exact bound must retain both");
+    assert_eq!(memos.len(), 2);
+    assert!(!make_byte_room(&mut memos, 31, 30));
+    assert!(!make_byte_room(&mut memos, u64::MAX, 30));
+    assert_eq!(memos.len(), 2, "unretainable incoming data must not flush the cache");
+}
+
+fn pressure_fixture() -> (tempfile::TempDir, Arc<LiveFacts>, Vec<PathBuf>) {
+    let directory = tempfile::tempdir().unwrap();
+    let facts = LiveFacts::new();
+    let base = Instant::now();
+    let mut roots = Vec::new();
+    for index in 0..=MAX_PACKAGE_MEMOS {
+        let root = directory.path().join(format!("package-{index}"));
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("lib.rs"), b"x").unwrap();
+        if index != MAX_PACKAGE_MEMOS {
+            facts.package(&root, KIND, None).unwrap();
+            stamp_ready(&facts, &root, base + Duration::from_millis(index as u64));
+        }
+        roots.push(root);
+    }
+    (directory, facts, roots)
+}
+
+#[test]
+fn actual_entry_pressure_keeps_127_ready_snapshots_instead_of_flushing_them() {
+    let (_directory, facts, roots) = pressure_fixture();
+    let keys: Vec<_> = roots.iter().map(|root| observation(root)).collect();
+    let hot = {
+        let mut memos = facts.packages.lock().unwrap();
+        memos.get_mut(&keys[0]).unwrap()
+            .reuse(Instant::now() + Duration::from_secs(1)).unwrap().unwrap()
+    };
+    facts.package(&roots[MAX_PACKAGE_MEMOS], KIND, None).unwrap();
+    {
+        let memos = facts.packages.lock().unwrap();
+        assert_eq!(memos.len(), MAX_PACKAGE_MEMOS);
+        assert!(!memos.contains_key(&keys[1]), "oldest unused snapshot is the sole victim");
+        assert!(memos.contains_key(&keys[0]));
+        assert_eq!(retained_bytes(&memos), MAX_PACKAGE_MEMOS as u64);
+    }
+    for index in (0..MAX_PACKAGE_MEMOS).filter(|index| *index != 1) {
+        let reused = observe_with(&facts, &roots[index], KIND, None, |_| {
+            panic!("entry pressure recaptured a surviving snapshot")
+        }).unwrap();
+        reused.verify_unchanged(&roots[index]).unwrap();
+        if index == 0 { assert!(Arc::ptr_eq(&reused, &hot)); }
+    }
+}
+
+#[test]
+fn retrying_an_expired_failure_at_capacity_does_not_evict_another_package() {
+    let (_directory, facts, roots) = pressure_fixture();
+    let keys: Vec<_> = roots.iter().map(|root| observation(root)).collect();
+    let base = Instant::now();
+    {
+        let mut memos = facts.packages.lock().unwrap();
+        memos.insert(Arc::clone(&keys[0]), PackageSlot::Failed {
+            reason: "expired fixture failure".into(), at: base,
+        });
+        assert!(memos.get_mut(&keys[0]).unwrap().reuse(base + PROBE_RETRY).is_none());
+        assert!(make_entry_room(&mut memos, &keys[0], base + PROBE_RETRY));
+        assert_eq!(memos.len(), MAX_PACKAGE_MEMOS);
+        assert!(keys[..MAX_PACKAGE_MEMOS].iter().all(|key| memos.contains_key(key)));
+    }
+    // Drive the same reservation/finish path used after that expired lookup.
+    let owner = reserve(&facts, &keys[0]);
+    let captured = owner.finish(keys[0].capture(), false).unwrap();
+    assert!(Arc::ptr_eq(&captured, &facts.package(&roots[0], KIND, None).unwrap()));
+    let memos = facts.packages.lock().unwrap();
+    assert_eq!(memos.len(), MAX_PACKAGE_MEMOS);
+    assert!(keys[..MAX_PACKAGE_MEMOS].iter().all(|key| memos.contains_key(key)));
+}

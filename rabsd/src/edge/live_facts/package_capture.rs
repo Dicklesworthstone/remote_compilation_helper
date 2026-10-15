@@ -4,6 +4,8 @@
 //! capture and hashing are singleflight: a changed source/generated tree gets a
 //! different reservation, never the previous generation's failure or pending
 //! state. Reservations are local observation ownership, NOT action authority.
+//! Byte and entry pressure evict cold completed observations, not the entire
+//! ready cache. Recency is process-local policy, never input or key evidence.
 
 use super::{
     DependencySourceKind, FactsMiss, FileSig, GeneratedObservation, LiveFacts, MAX_PACKAGE_BYTES,
@@ -96,8 +98,50 @@ impl Observation {
 #[derive(Debug)]
 pub(super) enum PackageSlot {
     Warming(Arc<()>),
-    Ready(Arc<PackageFacts>),
-    Failed { reason: String, at: Instant },
+    Ready {
+        captured: Arc<PackageFacts>,
+        last_used: Instant,
+    },
+    Failed {
+        reason: String,
+        at: Instant,
+    },
+}
+
+impl PackageSlot {
+    /// Called only after a fresh complete Observation matched this memo key.
+    /// Touching retention policy cannot extend a file-generation witness.
+    fn reuse(&mut self, now: Instant) -> Option<Result<Arc<PackageFacts>, FactsMiss>> {
+        match self {
+            Self::Ready {
+                captured,
+                last_used,
+            } => {
+                *last_used = (*last_used).max(now);
+                Some(Ok(Arc::clone(captured)))
+            }
+            Self::Warming(_) => Some(Err(FactsMiss::Pending)),
+            Self::Failed { reason, at } if now.saturating_duration_since(*at) < PROBE_RETRY => {
+                Some(Err(FactsMiss::Refused(reason.clone())))
+            }
+            Self::Failed { .. } => None,
+        }
+    }
+
+    fn eviction_rank(&self, now: Instant) -> Option<(u8, Instant)> {
+        match self {
+            // Expired negative observations no longer provide backoff value.
+            Self::Failed { at, .. } if now.saturating_duration_since(*at) >= PROBE_RETRY => {
+                Some((0, *at))
+            }
+            Self::Ready { last_used, .. } => Some((1, *last_used)),
+            // Preserve a live backoff while there is an ordinary cache victim.
+            // With only failures left, evict the oldest rather than preventing
+            // unrelated packages from entering the bounded observation cache.
+            Self::Failed { at, .. } => Some((2, *at)),
+            Self::Warming(_) => None,
+        }
+    }
 }
 
 pub(super) type PackageMemos = HashMap<Arc<Observation>, PackageSlot>;
@@ -155,11 +199,17 @@ impl Reservation {
             }
             match &captured {
                 Ok(captured) => {
-                    make_byte_room(&mut memos, captured.bytes, MAX_RETAINED_PACKAGE_BYTES);
-                    memos.insert(
-                        Arc::clone(&self.observation),
-                        PackageSlot::Ready(Arc::clone(captured)),
-                    );
+                    if make_byte_room(&mut memos, captured.bytes, MAX_RETAINED_PACKAGE_BYTES) {
+                        memos.insert(
+                            Arc::clone(&self.observation),
+                            PackageSlot::Ready {
+                                captured: Arc::clone(captured),
+                                last_used: Instant::now(),
+                            },
+                        );
+                    }
+                    // An unretainable result is still returned to its caller.
+                    // Drop removes our reservation, not a successor's entry.
                 }
                 Err(FactsMiss::Refused(reason)) if retain_failure => {
                     memos.insert(
@@ -190,14 +240,64 @@ impl Drop for Reservation {
 /// Bound memo-held snapshot bytes BEFORE insertion. Evicted snapshots held by
 /// subscribers remain alive; this is not a global process-memory bound. Active
 /// captures are never evicted and therefore never lose their singleflight owner.
-fn make_byte_room(memos: &mut PackageMemos, incoming: u64, limit: u64) {
-    let retained = memos.values().fold(0_u64, |total, slot| match slot {
-        PackageSlot::Ready(facts) => total.saturating_add(facts.bytes),
-        _ => total,
-    });
-    if retained.saturating_add(incoming) > limit {
-        memos.retain(|_, slot| !matches!(slot, PackageSlot::Ready(_)));
+fn make_byte_room(memos: &mut PackageMemos, incoming: u64, limit: u64) -> bool {
+    let Some(available) = limit.checked_sub(incoming) else {
+        return false;
+    };
+    let Some(mut retained) = memos.values().try_fold(0_u64, |total, slot| match slot {
+        PackageSlot::Ready { captured, .. } => total.checked_add(captured.bytes),
+        _ => Some(total),
+    }) else {
+        return false;
+    };
+    if retained <= available {
+        return true;
     }
+    // The map has at most MAX_PACKAGE_MEMOS entries. Sort once only under
+    // pressure and evict oldest-first until this insertion actually fits.
+    let mut victims: Vec<_> = memos
+        .iter()
+        .filter_map(|(observation, slot)| match slot {
+            PackageSlot::Ready {
+                captured,
+                last_used,
+            } if captured.bytes != 0 => Some((*last_used, Arc::clone(observation))),
+            _ => None,
+        })
+        .collect();
+    victims.sort_unstable_by_key(|(last_used, _)| *last_used);
+    for (_, observation) in victims {
+        if retained <= available {
+            break;
+        }
+        if let Some(PackageSlot::Ready { captured, .. }) = memos.remove(&observation) {
+            retained -= captured.bytes;
+        }
+    }
+    retained <= available
+}
+
+/// Reserve an entry without flushing all completed observations. Retrying an
+/// expired failure for this SAME key replaces its slot and needs no eviction.
+/// Pending captures remain unevictable even if they are the oldest entries.
+fn make_entry_room(memos: &mut PackageMemos, incoming: &Arc<Observation>, now: Instant) -> bool {
+    if memos.contains_key(incoming) {
+        return true;
+    }
+    while memos.len() >= MAX_PACKAGE_MEMOS {
+        let victim = memos
+            .iter()
+            .filter_map(|(observation, slot)| {
+                slot.eviction_rank(now)
+                    .map(|rank| (rank, Arc::clone(observation)))
+            })
+            .min_by_key(|(rank, _)| *rank);
+        let Some((_, victim)) = victim else {
+            return false;
+        };
+        memos.remove(&victim);
+    }
+    true
 }
 
 pub(super) fn observe(
@@ -224,19 +324,12 @@ fn observe_with(
             .packages
             .lock()
             .map_err(|_| FactsMiss::Refused("package memo poisoned".into()))?;
-        match memos.get(&observation) {
-            Some(PackageSlot::Ready(captured)) => return Ok(Arc::clone(captured)),
-            Some(PackageSlot::Warming(_)) => return Err(FactsMiss::Pending),
-            Some(PackageSlot::Failed { reason, at }) if at.elapsed() < PROBE_RETRY => {
-                return Err(FactsMiss::Refused(reason.clone()));
-            }
-            _ => {}
+        let now = Instant::now();
+        if let Some(result) = memos.get_mut(&observation).and_then(|slot| slot.reuse(now)) {
+            return result;
         }
         // Check and insert are one critical section for BOTH capture paths.
-        if memos.len() >= MAX_PACKAGE_MEMOS {
-            memos.retain(|_, slot| matches!(slot, PackageSlot::Warming(_)));
-        }
-        if memos.len() >= MAX_PACKAGE_MEMOS {
+        if !make_entry_room(&mut memos, &observation, now) {
             return Err(FactsMiss::Pending);
         }
         Reservation::insert(facts, &mut memos, Arc::clone(&observation))
