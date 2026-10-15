@@ -9,7 +9,7 @@
 use rabs_asupersync::stream_drain::LaneDrain;
 use sha2::{Digest, Sha256};
 use std::fs::File;
-use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 
 /// Maximum raw bytes in one retrieval response (hex encoding doubles this).
 pub const MAX_OUTPUT_CHUNK_BYTES: usize = 64 * 1024;
@@ -81,21 +81,9 @@ impl CapturedStream {
                 "invalid output capture length",
             ));
         }
-        let head = Cursor::new(lane.resident());
-        match lane.spill() {
-            None => Self::from_reader(head, expected),
-            Some(spill) => {
-                let file = File::open(&spill.path)?;
-                let metadata = file.metadata()?;
-                if !metadata.is_file() || metadata.len() != spill.bytes {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "spill receipt mismatch",
-                    ));
-                }
-                Self::from_reader(head.chain(file), expected)
-            }
-        }
+        // Retain the drain's descriptor through the entire handoff. A matching
+        // pathname and length are not proof of the bytes the compiler emitted.
+        Self::from_reader(lane.reader()?, expected)
     }
 
     /// Exact original stream length, including both drain tiers.
@@ -158,6 +146,92 @@ impl CapturedOutputs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    fn real_spilled_output() -> (tempfile::TempDir, LaneDrain) {
+        use rabs_asupersync::stream_drain::{DrainLimits, join_lane, spawn_lanes};
+        use std::process::{Command, Stdio};
+        let dir = tempfile::tempdir().unwrap();
+        let mut child = Command::new("sh")
+            .args(["-c", "printf 'A\\000\\377B'"])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let (lane, other) = spawn_lanes(
+            &mut child,
+            &DrainLimits {
+                resident_bound: 2,
+                spill_dir: dir.path().to_path_buf(),
+            },
+        );
+        assert!(other.is_none());
+        assert!(child.wait().unwrap().success());
+        (dir, join_lane(lane.unwrap()).unwrap())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn equal_length_path_replacement_cannot_change_the_offered_bytes() {
+        for link in [false, true] {
+            let (dir, lane) = real_spilled_output();
+            let path = &lane.spill().unwrap().path;
+            std::fs::rename(path, dir.path().join("original-spill")).unwrap();
+            if link {
+                let other = dir.path().join("unrelated");
+                std::fs::write(&other, b"XY").unwrap();
+                std::os::unix::fs::symlink(&other, path).unwrap();
+            } else {
+                std::fs::write(path, b"XY").unwrap();
+            }
+            // Some filesystems change ctime on rename: conservative refusal is
+            // allowed, but successful capture must contain the ORIGINAL bytes.
+            if let Ok(mut captured) = CapturedStream::from_lane(&lane) {
+                assert_eq!(captured.read_chunk(0, 10).unwrap(), b"A\0\xffB");
+                assert_eq!(
+                    captured.sha256(),
+                    crate::session::sha256_hex(b"A\0\xffB")
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn same_size_spill_rewrite_is_not_new_compiler_output() {
+        let (_dir, lane) = real_spilled_output();
+        let path = &lane.spill().unwrap().path;
+        let modified = std::fs::metadata(path).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        std::fs::write(path, b"XY").unwrap();
+        File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        assert!(CapturedStream::from_lane(&lane).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_worker_captures_each_hash_and_retain_the_complete_stream() {
+        let (_dir, lane) = real_spilled_output();
+        let lane = std::sync::Arc::new(lane);
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let lane = std::sync::Arc::clone(&lane);
+                std::thread::spawn(move || CapturedStream::from_lane(&lane).unwrap())
+            })
+            .collect();
+        for thread in threads {
+            let mut captured = thread.join().unwrap();
+            assert_eq!(captured.read_chunk(0, 10).unwrap(), b"A\0\xffB");
+            assert_eq!(
+                captured.sha256(),
+                crate::session::sha256_hex(b"A\0\xffB")
+            );
+        }
+    }
 
     #[test]
     fn binary_ranges_are_replayable_bounded_and_hash_the_complete_stream() {
