@@ -193,9 +193,10 @@ complete thread census. macOS uses the updated `rch-wkr process-identity <pid>`
 helper on the remote PATH, kernel boot-session UUIDs, and libproc start times
 at microsecond precision. Update `rch-wkr` on macOS workers together with the
 dispatcher. A missing or older helper refuses setup before starting work.
-macOS also needs GNU timeout (`gtimeout` from Homebrew coreutils) for bounded
-control observations and the existing `setsid` launch capability. BSD stat and
-the native process census are used there; no Linux procfs is required.
+Bounded control observations use GNU timeout when available, or Python 3
+otherwise. The existing `setsid` launch capability is still required. Missing
+both bounded helpers fails closed. BSD stat and the native process census are
+used on macOS; no Linux procfs is required.
 Windows jobs and unsupported worker launch capabilities do not gain that
 guarantee. Do not remove the retained ownership record to make capacity appear
 free while execution remains uncertain.

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Real kernel identity, watchdog, cancellation and recovery on Linux/Darwin.
 
-Darwin requires the candidate rch-wkr on PATH and GNU timeout (Homebrew
-coreutils). No identity observation is mocked. Receipts are altered only to
-exercise stale/reused birth and previous-boot recovery fences.
+Darwin requires the candidate rch-wkr on PATH. Bounded probes use GNU timeout
+when available, otherwise Python 3. No identity observation is mocked. Receipts
+are altered only to exercise stale/reused birth and previous-boot recovery fences.
 """
 import os
 from pathlib import Path
@@ -68,6 +68,53 @@ class PlatformIdentity(unittest.TestCase):
         child = self.launch(payload="exit 7")
         self.assertEqual(child.wait(timeout=10), 7)
         self.assertTrue(self.receipt.read_text().startswith("RCH_REMOTE_PROCESS_V1:115:"))
+
+    def test_fast_payload_disarms_long_watchdog(self):
+        child = self.launch(seconds=30, payload="exit 7")
+        # Completion must stop its own timer, not wait for the build deadline.
+        self.assertEqual(child.wait(timeout=5), 7)
+        self.assertEqual(self.cancel("kill").returncode, 0)
+
+    def test_wrong_build_cannot_signal_live_group(self):
+        child = self.launch()
+        result = self.run_protocol(
+            f"rch_remote_cancel {shlex.quote(str(self.receipt))} 116 kill")
+        self.assertEqual(result.returncode, 43, result.stderr)
+        self.assertIsNone(child.poll())
+
+    def test_numeric_receipt_cannot_adopt_live_group(self):
+        child = self.launch()
+        self.receipt.write_text(f"{child.pid}\n")
+        result = self.cancel("kill")
+        self.assertEqual(result.returncode, 43, result.stderr)
+        self.assertIsNone(child.poll())
+
+    def test_multiline_receipt_cannot_signal_live_group(self):
+        child = self.launch()
+        with self.receipt.open("a") as receipt:
+            receipt.write("\n")
+        result = self.cancel("kill")
+        self.assertEqual(result.returncode, 42, result.stderr)
+        self.assertIsNone(child.poll())
+
+    def test_missing_receipt_cannot_confirm_cleanup(self):
+        child = self.launch()
+        absent = self.root / "not-published"
+        result = self.run_protocol(
+            f"rch_remote_cancel {shlex.quote(str(absent))} 115 kill")
+        self.assertEqual(result.returncode, 42, result.stderr)
+        self.assertIsNone(child.poll())
+
+    def test_observer_cannot_cancel_its_own_group(self):
+        # Use a private session so a broken guard cannot reach the test runner.
+        # Both publication and cancellation perform actual kernel observations.
+        result = subprocess.run(
+            [SHELL, "-c", CORE + r'''
+rch_remote_record "$1" 115 || exit 90
+rch_remote_cancel "$1" 115 kill
+''', "rch-self-cancel-test", str(self.receipt)],
+            start_new_session=True, text=True, capture_output=True, timeout=20)
+        self.assertEqual(result.returncode, 44, result.stdout + result.stderr)
 
     def test_watchdog_and_timeout_recovery(self):
         child = self.launch(seconds=2)
