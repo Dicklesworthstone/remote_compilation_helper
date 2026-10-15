@@ -52,6 +52,7 @@ fn exchange(replies: Vec<String>, settings: WaitPolicy) -> (Result<Live, ()>, Ve
         Duration::from_secs(1),
         true,
         settings,
+        None,
         &|| true,
     );
     (result, daemon.join().unwrap())
@@ -201,6 +202,7 @@ fn a_prepared_hit_still_requires_acceptance_and_completed_installation() {
         Duration::from_secs(1),
         true,
         policy(3),
+        None,
         &|| true,
     );
     assert!(matches!(result, Ok(Live::Served(bytes)) if bytes == b"hi"));
@@ -221,6 +223,7 @@ fn preparation_budget_zero_and_unnegotiated_preparation_never_retry() {
             Duration::from_secs(1),
             negotiated,
             settings,
+            None,
             &|| true,
         );
         if negotiated {
@@ -257,6 +260,7 @@ fn retry_count_bounds_even_a_peer_that_answers_immediately() {
             Duration::from_secs(1),
             true,
             policy(3),
+            None,
             &|| true,
         ),
         Ok(Live::PassThrough)
@@ -283,6 +287,7 @@ fn zero_wait_budget_never_sends_a_retry_or_acceptance() {
             Duration::from_secs(1),
             true,
             settings,
+            None,
             &|| true,
         ),
         Ok(Live::PassThrough)
@@ -350,6 +355,7 @@ fn malformed_authority_or_unnegotiated_waits_are_not_followed() {
                 Duration::from_secs(1),
                 negotiated,
                 policy(3),
+                None,
                 &|| true,
             )
             .is_err()
@@ -383,6 +389,7 @@ fn trickling_peer_cannot_hold_a_follower_past_its_wait_budget() {
         Duration::from_secs(10),
         true,
         settings,
+        None,
         &|| true,
     );
     assert!(outcome.is_err());
@@ -420,6 +427,7 @@ fn caller_loss_interrupts_partial_decision_without_accepting_or_retrying() {
             Duration::from_secs(30),
             true,
             policy(60),
+            None,
             &|| owned.load(Ordering::Acquire),
         )
         .is_err()
@@ -456,6 +464,7 @@ fn cancelled_backoff_never_returns_permission_to_fall_back() {
             Duration::from_secs(30),
             true,
             settings,
+            None,
             &|| owned.load(Ordering::Acquire),
         )
         .is_err()
