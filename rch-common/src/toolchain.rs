@@ -9,6 +9,8 @@ use std::borrow::Cow;
 use crate::ssh_utils::is_valid_env_key;
 use crate::types::ColorMode;
 
+mod worker_cache;
+
 /// Detected Rust toolchain information.
 ///
 /// Contains the channel, optional date, and full version string needed
@@ -72,8 +74,33 @@ impl std::fmt::Display for ToolchainInfo {
 /// Wrap a command to run with a specific toolchain.
 ///
 /// If toolchain is provided, wraps the command with `rustup run <toolchain>`.
-/// Otherwise returns the original command unchanged.
+/// Otherwise returns the original command unchanged. An explicit
+/// `RCH_RABS_WORKER_CACHE=1` on the command-building process additionally
+/// prepares worker-local RABS for literal Cargo commands. Preparation runs
+/// after environment prefixes, preserving the original toolchain runner and
+/// Cargo executable selection. No preparation runs on the dispatcher.
 pub fn wrap_command_with_toolchain(command: &str, toolchain: Option<&ToolchainInfo>) -> String {
+    wrap_command_with_toolchain_policy(command, toolchain, worker_cache::enabled())
+}
+
+fn wrap_command_with_toolchain_policy(
+    command: &str,
+    toolchain: Option<&ToolchainInfo>,
+    worker_cache: bool,
+) -> String {
+    let cache_runner = worker_cache
+        .then(|| worker_cache::runner_for(command))
+        .flatten();
+    if let Some(cache_runner) = cache_runner {
+        let runner = match toolchain {
+            Some(tc) => format!(
+                "{cache_runner} rustup run {}",
+                shell_escape::escape(Cow::Owned(tc.rustup_toolchain()))
+            ),
+            None => cache_runner,
+        };
+        return insert_toolchain_runner(command, &runner);
+    }
     match toolchain {
         Some(tc) => insert_toolchain_runner(
             command,

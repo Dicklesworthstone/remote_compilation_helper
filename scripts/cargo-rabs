@@ -20,6 +20,11 @@ import sys
 import time
 
 
+# Versioned import contract for RCH's worker-local cache adapter. Importing
+# this module never runs Cargo; prepare(env, no_start) only sets up RABS and
+# returns a new environment. Bump this before changing that contract.
+RCH_WORKER_PREPARATION_API = 1
+
 MAX_FRAME = 64 * 1024
 DEFAULT_STARTUP_MS = 5000
 MAX_STARTUP_MS = 30000
