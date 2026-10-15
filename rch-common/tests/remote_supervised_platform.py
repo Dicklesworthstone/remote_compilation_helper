@@ -1,0 +1,363 @@
+#!/usr/bin/env python3
+"""Run the exact embedded rch-build supervisor, not the legacy watchdog tail.
+
+SupervisedPlatform uses native Linux/macOS identities without platform mocks.
+DarwinPrimitives selects Darwin's portable syscall adapters explicitly, also
+on Linux; those tests are not native libproc or macOS qualification. Darwin
+needs the candidate rch-wkr and Python 3.7+ (the harness needs Python 3.9+).
+RCH_TEST_NO_TIMEOUT=1 removes GNU timeout aliases from PATH on either OS.
+"""
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+import unittest
+
+SOURCE = Path(__file__).resolve().parents[1] / "src"
+SHELL = os.environ.get("RCH_TEST_SHELL", "/bin/sh")
+CORE = (SOURCE / "remote_process.sh").read_text()
+
+
+def assemble_protocol():
+    rust = (SOURCE / "remote_scoped_launch.rs").read_text()
+    expression = rust.split("= concat!(\n", 1)[1].split("\n);", 1)[0]
+    parts = []
+    for line in expression.splitlines():
+        item = line.strip().removesuffix(",")
+        include = re.fullmatch(r'include_str!\(("[^"\n]+")\)', item)
+        parts.append((SOURCE / json.loads(include[1])).read_text()
+                     if include else json.loads(item))
+    return "".join(parts)
+
+
+PROTOCOL = assemble_protocol()
+
+
+class SupervisedPlatform(unittest.TestCase):
+    def setUp(self):
+        # Retain failure receipts for diagnosis. Only our direct supervisor
+        # children are signalled during cleanup; their own watchdog owns work.
+        self.root = Path(tempfile.mkdtemp(prefix="rch-supervised-platform-"))
+        self.receipt = self.root / "receipt"
+        self.ready = self.root / "ready"
+        self.release = self.root / "release"
+        self.children = []
+        self.env = dict(os.environ, HOME=str(self.root), TMPDIR=str(self.root))
+        if os.environ.get("RCH_TEST_NO_TIMEOUT") == "1":
+            binaries = self.root / "bin"
+            binaries.mkdir()
+            for tool in ("awk", "cat", "cmp", "id", "mkdir", "mkfifo", "mktemp",
+                         "mv", "ps", "python3", "rch-wkr", "rm", "rmdir", "setsid",
+                         "sh", "sleep", "stat", "tr", "uname", "wc"):
+                resolved = shutil.which(tool)
+                if resolved:
+                    (binaries / tool).symlink_to(resolved)
+            self.env["PATH"] = str(binaries)
+            for tool in ("timeout", "gtimeout", "gnutimeout"):
+                self.assertIsNone(shutil.which(tool, path=self.env["PATH"]))
+        self.addCleanup(self.cleanup_owned)
+
+    def cleanup_owned(self):
+        for child in self.children:
+            if child.poll() is None:
+                child.kill()
+            child.wait(timeout=15)
+        if self.receipt.exists():
+            # An exact fresh-channel recovery, never a blind killpg(record).
+            self.cancel("kill")
+
+    def start(self, payload, seconds=0, prefix="", stdin=subprocess.DEVNULL,
+              protocol=PROTOCOL, diagnostic=None):
+        out = open(self.root / f"out-{len(self.children)}", "w+b")
+        err = open(self.root / f"err-{len(self.children)}", "w+b")
+        self.addCleanup(out.close)
+        self.addCleanup(err.close)
+        child = subprocess.Popen(
+            [SHELL, "-c", "exec 3>&2\n" + prefix + "\n" + protocol + "\nexit 79\n",
+             "rch-build", str(self.receipt), str(seconds), "RCH_TEST_DEADLINE",
+             "115", SHELL, "-c", payload],
+            env=self.env, stdin=stdin, stdout=out, stderr=err if diagnostic is None else diagnostic,
+            start_new_session=True,
+        )
+        self.children.append(child)
+        return child, out, err
+
+    def contents(self, file):
+        file.flush()
+        file.seek(0)
+        return file.read()
+
+    def finish(self, run, status=0):
+        child, out, err = run
+        actual = child.wait(timeout=20)
+        self.assertEqual(actual, status, self.contents(err).decode(errors="replace"))
+        return self.contents(out), self.contents(err)
+
+    def wait_ready(self, child):
+        until = time.monotonic() + 15
+        while not self.ready.exists():
+            self.assertIsNone(child.poll(), f"setup failed; fixtures: {self.root}")
+            self.assertLess(time.monotonic(), until, f"setup stalled: {self.root}")
+            time.sleep(.02)
+        self.assertTrue(self.receipt.exists())
+        self.assertTrue(Path(str(self.receipt) + ".supervisor.v1/go").exists())
+
+    def blocking_payload(self):
+        return (f"printf ready > {shlex.quote(str(self.ready))}; "
+                f"while [ ! -f {shlex.quote(str(self.release))} ]; do sleep .1; done")
+
+    def observe(self, body):
+        return subprocess.run([SHELL, "-c", CORE + "\n" + body], env=self.env,
+                              capture_output=True, timeout=30)
+
+    def cancel(self, mode="term"):
+        return self.observe(f"rch_remote_cancel {shlex.quote(str(self.receipt))} 115 {mode}")
+
+    def assert_empty(self):
+        result = self.observe(
+            f"rch_read_record {shlex.quote(str(self.receipt))} 115 || exit $?; rch_group_state")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_status_and_binary_stdin_survive_supervision(self):
+        data = b"original\x00input\nlast\xff"
+        with tempfile.TemporaryFile() as source:
+            source.write(b"consumed:" + data)
+            source.seek(len(b"consumed:"))
+            out, err = self.finish(self.start("cat; printf diagnostic >&2; exit 7", stdin=source), 7)
+        self.assertEqual(out, data)
+        self.assertEqual(err, b"diagnostic")
+        self.assert_empty()
+
+    def test_completion_stops_background_members_before_success(self):
+        late = self.root / "late-write"
+        payload = (f"(trap '' TERM; sleep 2; printf leaked > {shlex.quote(str(late))}) "
+                   "</dev/null >/dev/null 2>&1 & exit 0")
+        self.finish(self.start(payload))
+        self.assert_empty()
+        time.sleep(2.1)
+        self.assertFalse(late.exists(), "compiler descendant wrote after terminal success")
+
+    def test_parent_sigkill_is_cleaned_by_in_group_watchdog(self):
+        run = self.start(self.blocking_payload())
+        self.wait_ready(run[0])
+        run[0].kill()
+        run[0].wait(timeout=5)
+        until = time.monotonic() + 15
+        while True:
+            result = self.observe(
+                f"rch_read_record {shlex.quote(str(self.receipt))} 115 || exit $?; rch_group_state")
+            if result.returncode == 0:
+                break
+            self.assertLess(time.monotonic(), until, result.stderr)
+            time.sleep(.05)
+
+    def test_deadline_stops_group_and_emits_marker(self):
+        run = self.start(self.blocking_payload(), seconds=2)
+        self.wait_ready(run[0])
+        _, err = self.finish(run, 137)
+        self.assertIn(b"RCH_TEST_DEADLINE\n", err)
+        self.assert_empty()
+        self.assertEqual(self.cancel("kill").returncode, 0)
+
+    def test_supervisor_term_cleans_group(self):
+        run = self.start(self.blocking_payload())
+        self.wait_ready(run[0])
+        run[0].send_signal(signal.SIGTERM)
+        self.finish(run, 143)
+        self.assert_empty()
+
+    def test_fresh_channel_cancellation_cannot_be_success(self):
+        run = self.start(self.blocking_payload())
+        self.wait_ready(run[0])
+        result = self.cancel()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotEqual(run[0].wait(timeout=15), 0)
+        self.assert_empty()
+
+    def test_duplicate_admission_cannot_replace_live_receipt(self):
+        first = self.start(self.blocking_payload())
+        self.wait_ready(first[0])
+        receipt = self.receipt.read_bytes()
+        second = self.start("printf DUPLICATE")
+        out, err = self.finish(second, 255)
+        self.assertEqual(out, b"")
+        self.assertIn(b"RCH_SCOPED_LAUNCH_ALREADY_OWNED", err)
+        self.assertEqual(self.receipt.read_bytes(), receipt)
+        self.assertIsNone(first[0].poll())
+        self.release.touch()
+        self.finish(first)
+        self.assert_empty()
+
+    def test_inherited_descriptor_and_closed_stdin(self):
+        authority = self.root / "authority"
+        authority.write_bytes(b"owned descriptor")
+        prefix = f"exec 4<{shlex.quote(str(authority))}; exec 0<&-"
+        code = ('import errno, os; '
+                'print(os.read(4, 100).decode()); '
+                'os.fstat(0)')
+        out, err = self.finish(self.start("python3 -I -c " + shlex.quote(code), prefix=prefix), 1)
+        self.assertEqual(out, b"owned descriptor\n")
+        self.assertIn(b"Bad file descriptor", err)
+        self.assert_empty()
+
+    def test_all_borrowable_fds_occupied_refuses_before_payload(self):
+        prefix = "; ".join(f"exec {fd}</dev/null" for fd in range(4, 10))
+        out, err = self.finish(self.start("printf MUST_NOT_RUN", prefix=prefix), 125)
+        self.assertEqual(out, b"")
+        self.assertIn(b"IDENTITY_UNAVAILABLE", err)
+        self.assertFalse(self.receipt.exists())
+
+    def test_fast_result_disarms_long_watchdog(self):
+        started = time.monotonic()
+        self.finish(self.start("exit 7", seconds=120), 7)
+        self.assertLess(time.monotonic() - started, 10)
+        self.assert_empty()
+
+    def test_corrupted_receipt_cannot_redirect_owned_cleanup(self):
+        run = self.start(self.blocking_payload())
+        self.wait_ready(run[0])
+        original = self.root / "original-receipt"
+        original.write_bytes(self.receipt.read_bytes())
+        self.receipt.write_bytes(b"corrupted receipt\n")
+        self.release.touch()
+        _, err = self.finish(run, 255)
+        self.assertIn(b"RCH_SCOPED_COMPLETION_UNCONFIRMED", err)
+        result = self.observe(f"rch_read_record {shlex.quote(str(original))} 115 || exit $?; rch_group_state")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.receipt.read_bytes(), b"corrupted receipt\n")
+
+    def test_invalid_command_result_cannot_publish_success(self):
+        run = self.start(self.blocking_payload())
+        self.wait_ready(run[0])
+        result = Path(str(self.receipt) + ".supervisor.v1/result")
+        result.write_bytes(b"not an authenticated command result\n")
+        result.chmod(0o600)
+        self.finish(run, 255)
+        self.assert_empty()
+
+    def test_post_admission_census_loss_retains_uncertainty(self):
+        loss = self.root / "census-unavailable"
+        self.env["RCH_TEST_CENSUS_LOSS"] = str(loss)
+        # Explicit failure AFTER native launch and admission. No fake positive
+        # identity/death evidence is supplied. Fresh recovery uses real census.
+        needle = "rch_group_state() {\n"
+        self.assertEqual(PROTOCOL.count(needle), 1)
+        fault = PROTOCOL.replace(needle, needle + '    [ ! -f "$RCH_TEST_CENSUS_LOSS" ] || return 2\n')
+        run = self.start(self.blocking_payload(), protocol=fault)
+        self.wait_ready(run[0])
+        loss.touch()
+        self.release.touch()
+        _, err = self.finish(run, 255)
+        self.assertIn(b"RCH_SCOPED_COMPLETION_UNCONFIRMED", err)
+        self.assert_empty()
+        self.assertEqual(self.cancel("kill").returncode, 0)
+
+    def test_full_diagnostic_pipe_cannot_prevent_deadline_cleanup(self):
+        read_end, write_end = os.pipe()
+        try:
+            os.set_blocking(write_end, False)
+            while True:
+                try:
+                    os.write(write_end, b"x" * 4096)
+                except BlockingIOError:
+                    break
+            os.set_blocking(write_end, True)
+            run = self.start(self.blocking_payload(), seconds=2, diagnostic=write_end)
+            self.wait_ready(run[0])
+            started = time.monotonic()
+            self.finish(run, 137)
+            self.assertLess(time.monotonic() - started, 10)
+            # The consumer deliberately never read a byte from the full pipe.
+            self.assert_empty()
+        finally:
+            os.close(write_end)
+            os.close(read_end)
+
+    def test_closed_stderr_stays_closed_in_the_payload(self):
+        code = "import os\ntry:\n os.fstat(2)\nexcept OSError:\n print('closed')\nelse:\n raise SystemExit(9)"
+        out, err = self.finish(self.start("python3 -I -c " + shlex.quote(code), prefix="exec 2>&-"))
+        self.assertEqual(out, b"closed\n")
+        self.assertEqual(err, b"")
+        self.assert_empty()
+
+
+class DarwinPrimitives(unittest.TestCase):
+    def run_adapter(self, body, data=None):
+        source = CORE.replace("rch_control_capture() {", "rch_native_control_capture() {")
+        source += (SOURCE / "remote_scoped_launch.sh").read_text()
+        # Exercise these real portable syscalls without pretending Linux has
+        # libproc/BSD stat. Native lifecycle selection is tested separately.
+        source += ("\nuname() { printf 'Darwin\\n'; }\n"
+                   # Keep the real host's file metadata for bounded capture;
+                   # only the launch syscall adapter is selected as Darwin.
+                   "rch_control_capture() ( unset -f uname; rch_native_control_capture \"$@\"; )\n"
+                   + body)
+        return subprocess.run([SHELL, "-c", source], input=data,
+                              capture_output=True, start_new_session=True, timeout=10)
+
+    def test_fstat_preserves_occupied_slots_and_current_input(self):
+        result = self.run_adapter(r'''
+exec 4</dev/null 5>/dev/null
+rch_scope_launch_save_input || exit 1
+[ "$__sl_input" = 6 ] || exit 2
+eval 'cat '"$__sl_input_redirect"' &'
+wait "$!"
+''', b"bytes\x00through pipe\xff")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, b"bytes\x00through pipe\xff")
+
+    def test_fstat_observes_closed_input_and_stderr(self):
+        result = self.run_adapter(r'''
+exec 0<&- 2>&-
+rch_scope_launch_save_input || exit 1
+[ "$__sl_input_redirect" = '0<&-' ] || exit 2
+if rch_scope_launch_fd_open 2; then exit 3; fi
+''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_session_exec_keeps_child_pid_and_inherited_fd(self):
+        result = self.run_adapter(r'''
+exec 4</dev/null
+rch_scope_launch_exec python3 -I -c 'import os; os.fstat(4); print(os.getpid(), os.getpgrp(), os.getsid(0))' &
+child=$!
+wait "$child" || exit 1
+printf '%s\n' "$child"
+''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        pid, group, session, child = map(int, result.stdout.split())
+        self.assertEqual((pid, group, session), (child, child, child))
+
+    def test_self_group_signal_refuses_an_unrelated_live_group(self):
+        other = subprocess.Popen(["/bin/sleep", "20"], start_new_session=True)
+        try:
+            result = self.run_adapter(f"rch_scope_bound=0; rch_pgid={other.pid}; rch_scope_launch_kill_self")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIsNone(other.poll())
+            result = self.run_adapter("rch_scope_bound=0; rch_pgid=$$; rch_scope_launch_kill_self")
+            self.assertEqual(result.returncode, -signal.SIGKILL)
+            self.assertIsNone(other.poll())
+        finally:
+            if other.poll() is None:
+                other.kill()
+            other.wait(timeout=5)
+
+    def test_continuous_clock_is_positive_and_advances(self):
+        result = self.run_adapter(r'''
+rch_scope_launch_clock || exit 1
+before=$rch_launch_now
+sleep .1
+rch_scope_launch_clock || exit 2
+[ "$rch_launch_now" -gt "$before" ] || exit 3
+''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+
+if __name__ == "__main__":
+    unittest.main()

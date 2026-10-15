@@ -6,6 +6,9 @@ on:
     paths:
       - 'rch-common/src/process_identity.rs'
       - 'rch-common/src/remote_process.sh'
+      - 'rch-common/src/remote_scoped_launch.rs'
+      - 'rch-common/src/remote_scoped_launch.sh'
+      - 'rch-common/tests/remote_supervised_platform.py'
       - 'rch-common/tests/remote_process_platform.py'
       - 'rch-common/tests/remote_control_timeout.py'
       - 'rch-wkr/src/main.rs'
@@ -45,6 +48,13 @@ jobs:
           export PATH="$PWD/target/debug:$PATH"
           python3 rch-common/tests/remote_control_timeout.py -v
           RCH_TEST_SHELL=/bin/bash python3 rch-common/tests/remote_control_timeout.py -v
+      - name: Exercise the production owned-group supervisor on each platform
+        run: |
+          export PATH="$PWD/target/debug:$PATH"
+          for shell in /bin/sh /bin/bash; do
+            RCH_TEST_SHELL="$shell" python3 rch-common/tests/remote_supervised_platform.py -v
+            RCH_TEST_NO_TIMEOUT=1 RCH_TEST_SHELL="$shell" python3 rch-common/tests/remote_supervised_platform.py -v
+          done
       - name: Check shared native identity and Linux escalation
         run: |
           cargo test --locked -p rch-common process_identity

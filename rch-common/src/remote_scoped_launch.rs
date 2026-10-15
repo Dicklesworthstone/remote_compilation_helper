@@ -1,7 +1,6 @@
-//! The existing Linux `rch-build` shell ABI has an owned-group supervisor.
+//! Linux and Darwin share the `rch-build` owned-group supervisor.
 //! Configured scopes add cgroup containment without changing the receipt ABI.
-//! Other protocol users (cancellation, recovery, GC) only load functions; non-Linux
-//! launches retain the caller's legacy path.
+//! Other protocol users (cancellation, recovery, GC) only load functions.
 //!
 //! A scoped child needs the same identity/policy implementation as its parent.
 //! The quoted heredoc passes these exact sources as data, without installing a
@@ -28,15 +27,9 @@ pub const REMOTE_PROCESS_IDENTITY_SCRIPT: &str = concat!(
     "command eval \"$rch_launch_source\" || exit 125\n",
     "\nif [ \"$0\" = rch-build ]; then\n",
     "    rch_launch_platform=$(uname -s) || { printf '\\n%s_IDENTITY_UNAVAILABLE\\n' \"$3\" >&2; exit 125; }\n",
-    "    if [ \"$rch_launch_platform\" = Linux ]; then\n",
-    "        rch_scope_launch_supervise \"$@\"\n",
-    "        exit $?\n",
-    "    fi\n",
-    "    rch_scope_launch_select || { printf '\\n%s_IDENTITY_UNAVAILABLE\\n' \"$3\" >&2; exit 125; }\n",
-    "    if [ -n \"$rch_launch_slice\" ]; then\n",
-    "        rch_scope_launch_supervise \"$@\"\n",
-    "        exit $?\n",
-    "    fi\n",
+    "    case \"$rch_launch_platform\" in Linux|Darwin) ;; *) rch_scope_launch_message \"$3\" setup >&2; exit 125;; esac\n",
+    "    rch_scope_launch_supervise \"$@\"\n",
+    "    exit $?\n",
     "fi\n",
 );
 
