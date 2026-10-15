@@ -22,8 +22,9 @@ doctest = false
 rabs-protocol = { path = "../rabs-protocol" }
 sha2 = { workspace = true }
 
-[target.'cfg(target_os = "linux")'.dependencies]
-# Descriptor-relative source capture without unsafe code in this crate.
+[target.'cfg(unix)'.dependencies]
+# Descriptor-relative source capture and nonblocking regular-input acquisition
+# without unsafe code in this crate.
 rustix = { version = "1.1.4", features = ["fs"] }
 
 [dev-dependencies]
