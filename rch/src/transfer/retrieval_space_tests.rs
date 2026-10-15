@@ -7,6 +7,80 @@ use rch_common::{WorkerId, test_guard};
 use std::fs::{File, FileTimes};
 use std::os::unix::fs::MetadataExt;
 
+#[tokio::test]
+async fn platform_probe_reads_only_headers_of_a_large_suite_without_materializing_outputs() {
+    let _guard = test_guard!();
+    let root = tempfile::Builder::new()
+        .disable_cleanup(true)
+        .tempdir()
+        .unwrap();
+    let worker = root.path().join("worker λ with ' quote");
+    let stage = root.path().join("stage");
+    std::fs::create_dir_all(&worker).unwrap();
+    std::fs::create_dir_all(&stage).unwrap();
+    std::fs::write(stage.join("sentinel"), b"caller owned").unwrap();
+    let paths: Vec<String> = (0..1040).map(|n| format!("test-{n}")).collect();
+    for path in &paths {
+        let mut file = File::create(worker.join(path)).unwrap();
+        std::io::Write::write_all(&mut file, b"\x7fELF").unwrap();
+        // Sparse payload: the regression must never read/copy these 54 GB.
+        file.set_len(52_000_000).unwrap();
+    }
+    let (_, pipeline, config) = fixture();
+    let pipeline = pipeline.with_local_root(stage.clone());
+    for _ in 0..2 {
+        // The second pass models a recovery attempt: probing never consumes
+        // remote outputs or modifies already-owned local artifacts.
+        let mut selection = artifact_header_selection_command(
+            pipeline.local_artifact_retrieval_for_test(&config, &worker, &["test-*".into()]),
+        );
+        assert!(!selection.as_std().get_args().any(|arg| arg == "--checksum"));
+        let selected = tokio::time::timeout(Duration::from_secs(10), selection.output())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(selected.status.success(), "{selected:?}");
+        assert_eq!(
+            parse_rsync_selected_size(&String::from_utf8_lossy(&selected.stdout)),
+            Some(1040 * 52_000_000)
+        );
+        let selected_paths =
+            parse_rsync_itemized_regular_files(&String::from_utf8_lossy(&selected.stdout));
+        assert_eq!(selected_paths.len(), 1040);
+        let script =
+            artifact_header_probe_script(worker.to_str().unwrap(), &selected_paths).unwrap();
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let headers: Vec<(String, Vec<u8>)> = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(headers.len(), 1040);
+        assert_eq!(
+            headers.iter().map(|(_, h)| h.len()).sum::<usize>(),
+            1040 * 64
+        );
+        assert!(headers.iter().all(|(_, h)| h.starts_with(b"\x7fELF")));
+        assert_eq!(std::fs::read_dir(&stage).unwrap().count(), 1);
+        assert_eq!(
+            std::fs::read(stage.join("sentinel")).unwrap(),
+            b"caller owned"
+        );
+    }
+    std::os::unix::fs::symlink(stage.join("sentinel"), worker.join("escape")).unwrap();
+    for path in ["escape", "../stage/sentinel"] {
+        let script =
+            artifact_header_probe_script(worker.to_str().unwrap(), &[path.into()]).unwrap();
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+    }
+}
+
 fn fixture() -> (PathBuf, TransferPipeline, WorkerConfig) {
     let root = tempfile::Builder::new()
         .disable_cleanup(true)

@@ -11,6 +11,58 @@ mod retrieval_space;
 mod retrieval_space_tests;
 pub(crate) mod source_content_barrier;
 
+fn artifact_header_probe_script(remote: &str, paths: &[String]) -> anyhow::Result<String> {
+    use std::fmt::Write as _;
+    let bytes = serde_json::to_vec(&(remote, paths))?;
+    let mut payload = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        write!(payload, "{byte:02x}")?;
+    }
+    Ok(format!(
+        r#"python3 -I - <<'RCH_ARTIFACT_HEADERS'
+import json, os, stat
+root, paths = json.loads(bytes.fromhex('{payload}'))
+root = os.path.realpath(root)
+result = []
+for path in paths:
+    full = os.path.join(root, path)
+    if os.path.commonpath([root, os.path.realpath(full)]) != root:
+        raise RuntimeError('artifact header escapes output root')
+    fd = os.open(full, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise RuntimeError('artifact header is not a regular file')
+        result.append([path, list(os.read(fd, 64))])
+    finally:
+        os.close(fd)
+print(json.dumps(result))
+RCH_ARTIFACT_HEADERS
+"#
+    ))
+}
+
+/// Keep the production selection rules but never hash or transfer payloads.
+fn artifact_header_selection_command(planned: Command) -> Command {
+    let planned = planned.as_std();
+    let mut command = Command::new(planned.get_program());
+    command
+        .arg("--ignore-times")
+        .arg("--dry-run")
+        .args(planned.get_args().filter(|arg| *arg != "--checksum"));
+    for (key, value) in planned.get_envs() {
+        if let Some(value) = value {
+            command.env(key, value);
+        } else {
+            command.env_remove(key);
+        }
+    }
+    if let Some(directory) = planned.get_current_dir() {
+        command.current_dir(directory);
+    }
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    command
+}
+
 use crate::error::TransferError;
 use anyhow::{Context, Result};
 use glob::Pattern;
@@ -6637,6 +6689,75 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
     /// Uses retry logic with exponential backoff for transient network errors.
     /// Returns the transfer [`SyncResult`] plus the per-file manifest the
     /// zero-build-output detector consumes (bd-mpbav); see [`ArtifactRetrieval`].
+    /// Select without downloading, then read at most 64 bytes from each of a
+    /// selected candidate files. Uses the same rsync filters and source
+    /// activity fence as collection, including custom target roots.
+    pub(crate) async fn artifact_header_probe(
+        &self,
+        worker: &WorkerConfig,
+        patterns: &[String],
+        candidate: impl Fn(&str) -> bool,
+    ) -> Result<Vec<(String, Vec<u8>)>> {
+        if use_mock_transport(worker) || self.worker_platform.is_windows() {
+            return Ok(Vec::new());
+        }
+        let remote = self.remote_path();
+        let retry = self.effective_rsync_retry_config();
+        let selected = self
+            .execute_retrieval_rsync(
+                &retry,
+                "artifact_platform_preflight",
+                || {
+                    let planned = self.build_retrieve_command(worker, &remote, patterns);
+                    // Collection needs checksums; selection needs names only.
+                    // Do not hash tens of GB merely to inspect 64-byte headers.
+                    artifact_header_selection_command(planned)
+                },
+                |_| {},
+            )
+            .await?;
+        anyhow::ensure!(
+            selected.status.success(),
+            "artifact platform selection failed: {}",
+            String::from_utf8_lossy(&selected.stderr)
+        );
+        let paths: Vec<String> =
+            parse_rsync_itemized_regular_files(&String::from_utf8_lossy(&selected.stdout))
+                .into_iter()
+                .filter(|path| candidate(path))
+                .collect();
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Paths travel as JSON data, never shell arguments. Refuse symlinks and
+        // escapes; probing must not grant authority to read outside the output
+        // root. A missing/unreadable candidate is not evidence of compatibility.
+        let script = artifact_header_probe_script(&remote, &paths)?;
+        let mut command = self.worker_ssh_command(worker, &["sh", "-s"]);
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command.spawn()?;
+        let mut stdin = child
+            .stdin
+            .take()
+            .context("artifact header probe stdin missing")?;
+        let output = tokio::time::timeout(Duration::from_secs(30), async {
+            stdin.write_all(script.as_bytes()).await?;
+            drop(stdin);
+            child.wait_with_output().await
+        })
+        .await
+        .context("artifact header probe timed out")??;
+        anyhow::ensure!(
+            output.status.success(),
+            "artifact header probe failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).context("invalid artifact header evidence")
+    }
+
     pub async fn retrieve_artifacts(
         &self,
         worker: &WorkerConfig,

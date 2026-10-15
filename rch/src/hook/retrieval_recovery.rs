@@ -1194,7 +1194,11 @@ impl RecoverySession {
     /// complete stage/policy validation, under the same publication lock.
     /// Keep the discarded entries as undo state until the refreshed baseline
     /// is durable. This removes obsolete hashes, not output files or receipts.
-    fn persist_publication_baseline(&mut self, index: usize, files: &[PathBuf]) -> anyhow::Result<()> {
+    fn persist_publication_baseline(
+        &mut self,
+        index: usize,
+        files: &[PathBuf],
+    ) -> anyhow::Result<()> {
         let phase = &mut self.recipe.phases[index];
         anyhow::ensure!(
             phase.pending.is_none(),
@@ -2051,9 +2055,7 @@ impl RecoverySession {
         // Ordinary successful delivery can release its duplicate staging.
         // A retained-source intent also protects its original delivery inputs,
         // including out-of-policy files kept private in this stage.
-        if !self.retain_source_lifecycle_evidence()
-            && publication_runtime::checkpoint().is_ok()
-        {
+        if !self.retain_source_lifecycle_evidence() && publication_runtime::checkpoint().is_ok() {
             let _ = std::fs::remove_dir_all(&stage);
         }
         Ok(())
@@ -2929,6 +2931,36 @@ async fn recover_owned_job_with_daemon(
                 continue;
             }
         } else {
+            if phase.output_gate
+                && !session.recipe.allow_foreign
+                && kind_has_enumerable_output_contract(session.recipe.kind)
+            {
+                let preflight = preflight_artifact_platform(
+                    &pipeline,
+                    &worker,
+                    &phase.patterns,
+                    phase.custom_target,
+                    &session.recipe.expected_triple,
+                    session.recipe.pinned_triple.as_deref(),
+                )
+                .await;
+                match preflight {
+                    Ok(Some(rejection)) => {
+                        eprintln!("[RCH] {rejection}");
+                        exit = EXIT_ARTIFACT_TRANSFER_FAILED;
+                        break;
+                    }
+                    Ok(None) => {}
+                    Err(error) if pipeline.remote_path_absent(&worker, &phase.remote).await? => {
+                        eprintln!(
+                            "[RCH] recovered output root is gone before platform preflight: {error:#}"
+                        );
+                        exit = EXIT_ARTIFACT_TRANSFER_FAILED;
+                        break;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
             let retrieved = match pipeline.retrieve_artifacts(&worker, &phase.patterns).await {
                 Ok(retrieved) => retrieved,
                 // Outputs whose remote tree is gone (e.g. a GC'd target pool)

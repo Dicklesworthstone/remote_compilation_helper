@@ -512,6 +512,36 @@ pub(super) fn foreign_artifact_gate_disabled_from_value(value: Option<String>) -
 /// Environment variable name for [`foreign_artifact_gate_disabled`].
 pub(super) const RCH_ALLOW_FOREIGN_ARTIFACTS_ENV: &str = "RCH_ALLOW_FOREIGN_ARTIFACTS";
 
+/// Prove a mismatch before any artifact payload is downloaded. This is also
+/// used by detached recovery with the original, persisted delivery policy.
+async fn preflight_artifact_platform(
+    pipeline: &TransferPipeline,
+    worker: &WorkerConfig,
+    patterns: &[String],
+    custom_target: bool,
+    expected: &str,
+    pinned: Option<&str>,
+) -> anyhow::Result<Option<String>> {
+    if super::artifact_triple::expected_binary_format(expected).is_none() {
+        return Ok(None);
+    }
+    let headers = pipeline
+        .artifact_header_probe(worker, patterns, |path| {
+            super::artifact_triple::in_scope_output_path(path, custom_target, pinned).is_some()
+        })
+        .await?;
+    Ok(headers.into_iter().find_map(|(path, header)| {
+        super::artifact_triple::foreign_artifact_header(&header, expected).then(|| {
+            format!(
+                "{}: artifact {path} is incompatible with {expected}; rejected before \
+                 downloading build artifacts; local outputs were not replaced. Pin --target \
+                 or set {RCH_ALLOW_FOREIGN_ARTIFACTS_ENV}=1 for intentional foreign artifacts",
+                ErrorCode::BuildArtifactForeignTarget.code_string(),
+            )
+        })
+    }))
+}
+
 /// Execute a compilation command on a remote worker.
 ///
 /// This function:
@@ -2444,6 +2474,14 @@ async fn execute_remote_compilation_inner(
     // Local directory the retrieval manifest's paths are relative to, so the
     // #65 executable-typing gate can open the files that were actually placed.
     let mut retrieval_local_base: Option<PathBuf> = None;
+    let pinned_triple = explicit_target_triple_for_command(command);
+    let expected_triple = pinned_triple
+        .clone()
+        .unwrap_or_else(default_host_target_triple);
+    let artifact_kind = artifact_delivery_kind(kind, Some(policy_command));
+    let platform_preflight =
+        kind_has_enumerable_output_contract(artifact_kind) && !foreign_artifact_gate_disabled();
+    let mut platform_rejected = false;
     // Step 3: Retrieve artifacts
     if result.success() && !artifacts_failed {
         if let Some(loop_ref) = heartbeat_loop.as_ref() {
@@ -2501,6 +2539,21 @@ async fn execute_remote_compilation_inner(
                 &retrieval_pipeline,
                 durable_lease,
                 async |retrieval_pipeline| {
+                    if platform_preflight
+                        && let Some(rejection) = preflight_artifact_platform(
+                            retrieval_pipeline,
+                            &worker_config,
+                            &artifact_patterns,
+                            false,
+                            &expected_triple,
+                            pinned_triple.as_deref(),
+                        )
+                        .await?
+                    {
+                        platform_rejected = true;
+                        eprintln!("[RCH] {rejection}");
+                        anyhow::bail!(rejection);
+                    }
                     if let Some(progress) = &mut download_progress {
                         retrieval_pipeline
                             .retrieve_artifacts_streaming(
@@ -2668,6 +2721,21 @@ async fn execute_remote_compilation_inner(
                     &target_pipeline,
                     durable_lease,
                     async |target_pipeline| {
+                        if platform_preflight
+                            && let Some(rejection) = preflight_artifact_platform(
+                                target_pipeline,
+                                &worker_config,
+                                &custom_patterns,
+                                true,
+                                &expected_triple,
+                                pinned_triple.as_deref(),
+                            )
+                            .await?
+                        {
+                            platform_rejected = true;
+                            eprintln!("[RCH] {rejection}");
+                            anyhow::bail!(rejection);
+                        }
                         if let Some(progress) = &mut target_progress {
                             let heartbeat_state_target = heartbeat_loop
                                 .as_ref()
@@ -2918,14 +2986,9 @@ async fn execute_remote_compilation_inner(
     // retrieved outputs against the triple the caller's build was actually for.
     // Evidence-only: an unrecognized triple, an unreadable file, or unknown
     // magic yields no findings and never fails a build.
-    let pinned_triple = explicit_target_triple_for_command(command);
-    let expected_triple = pinned_triple
-        .clone()
-        .unwrap_or_else(default_host_target_triple);
     // Build-only test/bench outputs belong to the caller. They require the
     // same transfer-failure, metadata-only and foreign-target checks as builds;
     // the execution kind remains unchanged for telemetry and remote execution.
-    let artifact_kind = artifact_delivery_kind(kind, Some(policy_command));
     // Only the kinds whose contract is "materialize the caller's runnable
     // outputs under the cargo target tree" are typed. Test/bench/coverage kinds
     // retrieve reports and instrumented trees whose binaries are the WORKER's
@@ -2984,6 +3047,10 @@ async fn execute_remote_compilation_inner(
          returning exit {} so the caller knows declared outputs are missing",
             worker_config.id, result.exit_code, EXIT_ARTIFACT_TRANSFER_FAILED
         );
+        EXIT_ARTIFACT_TRANSFER_FAILED
+    } else if result.success() && platform_rejected {
+        // The preflight already reported E327 and preserved the remote output
+        // and durable lease. Do not replace it with a connectivity diagnosis.
         EXIT_ARTIFACT_TRANSFER_FAILED
     } else if result.success()
         && artifacts_failed
@@ -3224,6 +3291,142 @@ mod tests {
     use super::clean_overlay_source_pair_pool_name;
     use super::foreign_artifact_gate_disabled_from_value;
     use super::{CleanOverlaySpec, clean_overlay_freshness_identity};
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn platform_preflight_uses_real_selection_before_copying() {
+        use super::*;
+        use std::os::unix::fs::PermissionsExt;
+
+        // Substitute only SSH, in an isolated process: real rsync filters,
+        // header scripts and the production platform decision still execute.
+        if std::env::var_os("RCH110_PREFLIGHT_CHILD").is_none() {
+            let root = tempfile::Builder::new()
+                .disable_cleanup(true)
+                .tempdir()
+                .unwrap();
+            let ssh = root.path().join("ssh");
+            std::fs::write(&ssh, concat!(
+                "#!/bin/sh\n",
+                "while [ $# -gt 0 ]; do\n",
+                "  case \"$1\" in fixture.invalid|worker@fixture.invalid) shift; exec sh -c \"$*\";; esac\n",
+                "  shift\n",
+                "done\nexit 99\n",
+            )).unwrap();
+            std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let mut child = tokio::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .arg("platform_preflight_uses_real_selection_before_copying")
+                .arg("--nocapture")
+                .arg("--test-threads=1")
+                .env("RCH110_PREFLIGHT_CHILD", "1")
+                .env("RCH_MOCK_SSH", "0")
+                .env(
+                    "PATH",
+                    format!(
+                        "{}:{}",
+                        root.path().display(),
+                        std::env::var("PATH").unwrap()
+                    ),
+                )
+                .kill_on_drop(true);
+            let output = tokio::time::timeout(Duration::from_secs(45), child.output())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            return;
+        }
+        let root = tempfile::Builder::new()
+            .disable_cleanup(true)
+            .tempdir()
+            .unwrap();
+        let source = root.path().join("worker");
+        let local = root.path().join("local");
+        std::fs::create_dir_all(source.join("target/debug/deps")).unwrap();
+        std::fs::create_dir_all(&local).unwrap();
+        std::fs::write(local.join("sentinel"), b"owned local output").unwrap();
+        for n in 0..1040 {
+            let mut file =
+                std::fs::File::create(source.join(format!("target/debug/deps/test-{n}"))).unwrap();
+            std::io::Write::write_all(&mut file, b"\x7fELF").unwrap();
+            file.set_len(52_000_000).unwrap();
+        }
+        let triple = "x86_64-unknown-linux-gnu";
+        let cross = source.join(format!("target/{triple}/debug/deps/test-cross"));
+        std::fs::create_dir_all(cross.parent().unwrap()).unwrap();
+        std::fs::write(cross, b"\x7fELF").unwrap();
+        let worker = WorkerConfig {
+            id: WorkerId::new("platform-preflight"),
+            host: "fixture.invalid".into(),
+            user: "worker".into(),
+            identity_file: "/unused/test-key".into(),
+            total_slots: 1,
+            priority: 100,
+            tags: Vec::new(),
+            tools: Vec::new(),
+        };
+        for custom in [false, true] {
+            let remote = if custom {
+                source.join("target")
+            } else {
+                source.clone()
+            };
+            let pipeline = TransferPipeline::new(
+                local.clone(),
+                "platform".into(),
+                "platform".into(),
+                TransferConfig::default(),
+            )
+            .with_remote_path_override(remote.to_str().unwrap());
+            let kind = Some(CompilationKind::CargoTest);
+            let patterns = if custom {
+                get_custom_target_artifact_patterns(kind, Some("cargo test --no-run"))
+            } else {
+                get_project_artifact_patterns(kind, Some("cargo test --no-run"), false)
+            };
+            // Retry the same owned output root, as detached recovery does.
+            for _ in 0..2 {
+                let rejection = preflight_artifact_platform(
+                    &pipeline,
+                    &worker,
+                    &patterns,
+                    custom,
+                    "aarch64-apple-darwin",
+                    None,
+                )
+                .await
+                .unwrap()
+                .expect("foreign test suite must be rejected");
+                assert!(rejection.contains("RCH-E327"));
+                assert!(rejection.contains("before downloading"));
+            }
+            assert!(
+                preflight_artifact_platform(&pipeline, &worker, &patterns, custom, triple, None)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                preflight_artifact_platform(
+                    &pipeline,
+                    &worker,
+                    &patterns,
+                    custom,
+                    triple,
+                    Some(triple)
+                )
+                .await
+                .unwrap()
+                .is_none()
+            );
+            assert_eq!(std::fs::read_dir(&local).unwrap().count(), 1);
+            assert_eq!(
+                std::fs::read(local.join("sentinel")).unwrap(),
+                b"owned local output"
+            );
+        }
+    }
 
     #[test]
     fn owned_source_content_cargo_family_preserves_external_driver_receipts() {
