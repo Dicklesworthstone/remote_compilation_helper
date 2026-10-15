@@ -41,7 +41,10 @@ fn defaults_and_deserialization_share_agent_state_policy() {
 fn explicit_exclusion_lists_replace_defaults() {
     let custom: TransferConfig =
         toml::from_str("exclude_patterns = ['target/', '/scratch/session-only/']").unwrap();
-    assert_eq!(custom.exclude_patterns, ["target/", "/scratch/session-only/"]);
+    assert_eq!(
+        custom.exclude_patterns,
+        ["target/", "/scratch/session-only/"]
+    );
     let empty: TransferConfig = toml::from_str("exclude_patterns = []").unwrap();
     assert!(empty.exclude_patterns.is_empty());
     let roundtrip: TransferConfig =
@@ -135,7 +138,11 @@ mod rsync {
         let (root, source) = fixture();
         let destination = root.join("not-created");
         assert_eq!(
-            selected(&source, &destination, &TransferConfig::default().exclude_patterns),
+            selected(
+                &source,
+                &destination,
+                &TransferConfig::default().exclude_patterns
+            ),
             INCLUDED.iter().map(|name| (*name).to_owned()).collect()
         );
         assert!(!destination.exists(), "selection must be read-only");
@@ -214,6 +221,9 @@ mod rsync {
             .set_modified(modified)
             .unwrap();
         assert!(barrier().lines().any(|line| line.ends_with("\tsrc/lib.rs")));
-        assert_eq!(fs::read(destination.join("src/lib.rs")).unwrap(), b"build-input");
+        assert_eq!(
+            fs::read(destination.join("src/lib.rs")).unwrap(),
+            b"build-input"
+        );
     }
 }
