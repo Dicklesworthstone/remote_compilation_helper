@@ -381,45 +381,7 @@ pub fn janitor_work_with_gc(
     mounted: Result<Arc<LiveCas>, String>,
     quota_bytes: Option<u64>,
 ) -> SubsystemWork {
-    Box::new(move |cx, mut shutdown| {
-        Box::pin(async move {
-            let mounted = mounted?;
-            println!(
-                "{{\"v\":1,\"kind\":\"janitor-cas-mounted\",\"root\":{:?},\"serving_refused\":{},\"repaired\":{},\"reported\":{}}}",
-                mounted.cas_root().display().to_string(),
-                mounted.serving_refused,
-                mounted.repaired,
-                mounted.reported,
-            );
-            match mounted.gc_sweep(rabs_cas::gc::GcMode::Normal) {
-                Ok(s) => println!(
-                    "{{\"v\":1,\"kind\":\"janitor-gc-sweep\",\"planned\":{},\"reclaimed\":{},\"skipped\":{}}}",
-                    s.planned, s.reclaimed, s.skipped
-                ),
-                Err(reason) => println!(
-                    "{{\"v\":1,\"kind\":\"janitor-gc-sweep-failed\",\"reason\":{:?}}}",
-                    reason
-                ),
-            }
-            let usage = mounted.store_usage_bytes();
-            if let Some(q) = quota_bytes
-                && usage > q
-            {
-                println!(
-                    "{{\"v\":1,\"kind\":\"janitor-quota-exceeded\",\"bytes\":{},\"quota_bytes\":{}}}",
-                    usage, q
-                );
-            }
-            println!(
-                "{{\"v\":1,\"kind\":\"janitor-store-usage\",\"bytes\":{}}}",
-                usage
-            );
-            cx.trace("janitor region up: store mounted, gc swept, quota checked");
-            let _held = mounted;
-            shutdown.wait().await;
-            Ok(())
-        })
-    })
+    super::maintenance::work(mounted, quota_bytes)
 }
 
 #[cfg(test)]

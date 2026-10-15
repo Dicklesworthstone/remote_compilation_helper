@@ -105,6 +105,10 @@ jobs:
           cargo test --release -p rabsd --test live_replay --test live_class_safety --test live_sprt_budget --locked
           cargo test --release -p rabsd --lib edge::server --locked
           cargo test --release -p rabs-wrap --test live_dependency_e2e --locked
+      - name: Recurring CAS maintenance and physical reclaim
+        run: |
+          cargo test --release -p rabsd --lib janitor --locked
+          cargo test --release -p rabsd --test janitor_gc_live --test janitor_reclaim_live --locked
       - name: Cargo layout projection keys and real split-directory builds
         run: |
           cargo test --release -p rabsd cargo_placement_reuse --locked
