@@ -18,6 +18,7 @@
 //! from a dead incarnation) is removed and taken over, and the takeover
 //! is logged.
 
+mod backpressure;
 mod frame_read;
 mod liveness;
 mod rustc_outputs;
@@ -52,7 +53,8 @@ const SHADOW_WORKERS: usize = 4;
 const MATERIALIZATION_WORKERS: usize = 2;
 const PREPARED_ADMISSION_WORKERS: usize = 2;
 /// Live dependency decisions and hit installs: a compiler is waiting on
-/// each. Saturation answers pass-through, never waits.
+/// each. Pre-decision saturation may carry a bounded wrapper retry hint;
+/// no work is queued or capacity retained while that wrapper backs off.
 const LIVE_DECISION_WORKERS: usize = 8;
 /// Live dependency completions (capture, durable uploads, publication).
 /// Wrappers retain their outputs until capture is acknowledged, but do not
@@ -513,14 +515,8 @@ async fn handle_connection(
             Ok(value) if value.get("kind").and_then(|k| k.as_str()) == Some("rustc-request") => {
                 let decided = match &live {
                     Some(live) => {
-                        let live = std::sync::Arc::clone(live);
-                        match limits
-                            .live
-                            .spawn(move || rustc_request::decide(&live, &value))
-                        {
-                            Ok(mut work) => work.wait().await,
-                            Err(error) => Err(error),
-                        }
+                        backpressure::decide(&limits.live, std::sync::Arc::clone(live), value)
+                            .await
                     }
                     None => Ok(rustc_request::shadow_observation(&value).map_or_else(
                         || {
