@@ -2607,9 +2607,13 @@ pub struct CompilationConfig {
     /// whole fleet, so it is a genuine last resort and can flood that box. This
     /// flag gates it. Default `true` preserves the historical fail-open behavior
     /// (local only when no worker can serve); set to `false` on an orchestrator
-    /// to refuse local fallback and fail the build closed instead. `force_remote`
-    /// / proof mode / `RCH_REQUIRE_REMOTE` still override this by refusing local
-    /// unconditionally.
+    /// to refuse local fallback and fail the build closed instead. It covers
+    /// every local exit after remote placement was attempted: no admissible
+    /// worker, daemon unavailable, dependency preflight failure, transfer skip,
+    /// an unrequested worker, and retry exhaustion (#114). Proof mode,
+    /// `RCH_REQUIRE_REMOTE` and `general.role = "dispatcher"` refuse local
+    /// unconditionally. `force_remote` only skips local-time gating; it still
+    /// fails open.
     #[serde(default = "default_allow_local_fallback")]
     pub allow_local_fallback: bool,
     /// Per-job rustc parallelism cap applied on the WORKER (issue #49).

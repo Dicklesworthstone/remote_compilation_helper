@@ -3973,23 +3973,26 @@ pub async fn run_exec(
                 // ProceedRemote implies `retry` is Some; fail open defensively
                 // rather than panicking if that invariant is ever violated.
                 DaemonRecoveryAction::ProceedRemote => retry.unwrap_or_else(|| {
-                    reporter.summary("[RCH] local (daemon unavailable)");
-                    exit_with_local_fallback(
+                    exit_with_gated_local_fallback(
                         &command,
                         &reporter,
                         "daemon unavailable",
                         require_remote,
+                        config.compilation.allow_local_fallback,
+                        None,
                     );
                 }),
-                // Fail-open convenience lane: run local. exit_with_local_fallback
-                // records the RCH-I011 incident (bd-qawj7).
+                // Fail-open convenience lane: run local unless the operator set
+                // allow_local_fallback = false (#114). The local run records the
+                // RCH-I011 incident (bd-qawj7).
                 DaemonRecoveryAction::LocalFallback => {
-                    reporter.summary("[RCH] local (daemon unavailable)");
-                    exit_with_local_fallback(
+                    exit_with_gated_local_fallback(
                         &command,
                         &reporter,
                         "daemon unavailable",
                         require_remote,
+                        config.compilation.allow_local_fallback,
+                        None,
                     );
                 }
                 // Proof lane: fail closed. exit_with_local_fallback refuses under
@@ -4213,10 +4216,14 @@ pub async fn run_exec(
             } else {
                 reason
             };
-            if !require_remote {
-                reporter.summary(&format!("[RCH] local ({reason})"));
-            }
-            exit_with_local_fallback(&command, &reporter, &reason, require_remote);
+            exit_with_gated_local_fallback(
+                &command,
+                &reporter,
+                &reason,
+                require_remote,
+                allow_local_fallback,
+                None,
+            );
         }
 
         info!(
@@ -4701,7 +4708,14 @@ pub async fn run_exec(
                             error
                         );
                     }
-                    exit_with_local_fallback(&command, &reporter, &fallback_reason, require_remote);
+                    exit_with_gated_local_fallback(
+                        &command,
+                        &reporter,
+                        &fallback_reason,
+                        require_remote,
+                        allow_local_fallback,
+                        None,
+                    );
                 }
 
                 // Transfer skip (a "run locally instead" decision, not a failure).
@@ -4710,7 +4724,6 @@ pub async fn run_exec(
                     && let Some(skip_err) = e.downcast_ref::<TransferError>()
                     && let TransferError::TransferSkipped { reason } = skip_err
                 {
-                    reporter.summary(&format!("[RCH] local ({})", reason));
                     if release_acknowledged && let Err(error) = durable_lease.acknowledge_terminal()
                     {
                         warn!(
@@ -4718,11 +4731,13 @@ pub async fn run_exec(
                             error
                         );
                     }
-                    exit_with_local_fallback(
+                    exit_with_gated_local_fallback(
                         &command,
                         &reporter,
-                        "transfer skipped",
+                        &format!("transfer skipped: {reason}"),
                         require_remote,
+                        allow_local_fallback,
+                        None,
                     );
                 }
 
