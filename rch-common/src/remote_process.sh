@@ -1,4 +1,4 @@
-# Linux process-group identity shared by launch, timeout cleanup, and recovery.
+# Process-group identity shared by launch, timeout cleanup, and recovery.
 # A PID is not durable authority: bind it to the worker boot and leader start.
 set -f
 
@@ -24,6 +24,9 @@ rch_valid_boot() {
 # ID: a command exec'd from a substitution reports it as its parent. Use an
 # absolute path: launch environments may carry a minimal PATH.
 rch_check_procfs_namespace() {
+    # Darwin has one PID view. Never infer this from missing Linux procfs:
+    # Linux must still supply positive namespace evidence at every boundary.
+    case "$(uname -s)" in Darwin) return 0;; Linux) ;; *) return 1;; esac
     rch_self_pid=$(exec /bin/sh -c 'echo "$PPID"') || return 1
     while IFS= read -r rch_status_line; do
         case "$rch_status_line" in
@@ -36,6 +39,37 @@ rch_check_procfs_namespace() {
     return 1
 }
 
+# Native libproc birth time (microseconds), not ps lstart's rounded seconds.
+# The worker binary is required on Darwin; missing/old helpers fail closed.
+rch_darwin_process() {
+    rch_darwin_helper=$(command -v rch-wkr) || return 1
+    rch_darwin_result=$(rch_control_capture 1s "$rch_darwin_helper" process-identity "$1") || return 1
+    set -- $rch_darwin_result
+    [ "$#" = 3 ] && rch_valid_boot "$1" && rch_valid_pgid "$3" || return 1
+    case "$2" in ''|*[!0-9]*|0*) return 1;; esac
+    [ "${#2}" -le 20 ] || return 1
+    rch_observed_boot=$1
+    rch_observed_start=$2
+    rch_observed_pgid=$3
+}
+
+rch_read_boot() {
+    case "$(uname -s)" in
+        Linux) rch_check_procfs_namespace && cat /proc/sys/kernel/random/boot_id;;
+        Darwin) /usr/sbin/sysctl -n kern.bootsessionuuid | tr 'A-F' 'a-f';;
+        *) return 1;;
+    esac
+}
+
+# BSD stat uses -f; do not let GNU-only receipt/output checks break recovery.
+rch_file_size() {
+    case "$(uname -s)" in
+        Darwin) stat -f '%z' "$1";;
+        Linux) stat -c '%s' -- "$1";;
+        *) return 1;;
+    esac
+}
+
 # Read a member of the bound group, including comm with spaces or parentheses.
 # A member may be a non-leader TID: /proc/<tid>/stat has the same birth/group
 # fields. This preserves escalation when a process leader is already a zombie
@@ -43,6 +77,10 @@ rch_check_procfs_namespace() {
 # Function positional arguments do not replace the launcher's command arguments.
 rch_read_process() {
     rch_valid_pgid "$1" && rch_check_procfs_namespace || return 1
+    if [ "$(uname -s)" = Darwin ]; then
+        rch_darwin_process "$1" && [ "$rch_observed_pgid" = "$rch_pgid" ]
+        return $?
+    fi
     rch_proc_pid=$1
     rch_observed_boot=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null) || return 1
     rch_valid_boot "$rch_observed_boot" || return 1
@@ -97,7 +135,7 @@ rch_read_record() {
     rch_scope_reset
     case "$1" in /*) ;; *) return 42;; esac
     [ -f "$1" ] && [ ! -L "$1" ] && [ -r "$1" ] || return 42
-    rch_record_size=$(stat -c '%s' -- "$1") || return 42
+    rch_record_size=$(rch_file_size "$1") || return 42
     [ "$rch_record_size" -le 4096 ] || return 42
     rch_record=$(cat "$1" 2>/dev/null) || return 42
     case "$rch_record" in
@@ -138,6 +176,20 @@ rch_read_record() {
 # enumeration is unknown, never a fallback to a process-only empty-group claim.
 rch_group_state() {
     rch_check_procfs_namespace || return 2
+    if [ "$(uname -s)" = Darwin ]; then
+        # Darwin's process zombie state is terminal for the whole task. Linux
+        # needs the separate LWP census below (a zombie leader can have LWPs).
+        [ "${rch_scope_bound:-0}" != 1 ] || return 2
+        rch_snapshot=$(LC_ALL=C rch_control_capture 1s ps -axo pid=,pgid=,stat=) || return 2
+        printf '%s\n' "$rch_snapshot" | LC_ALL=C awk -v group="$rch_pgid" -v observer="$$" '
+            NF != 3 || $1 !~ /^[1-9][0-9]*$/ || $2 !~ /^[0-9]+$/ || $3 !~ /^[RSDTIUZ][A-Za-z0-9+<>-]*$/ { bad=1; next }
+            seen_pid[$1]++ { bad=1 }
+            $1 == observer { seen=1; if ($2 == group) bad=1 }
+            $2 == group && $3 !~ /^Z/ { live=1 }
+            END { if (bad || !seen) exit 2; exit live ? 1 : 0 }
+        '
+        return $?
+    fi
     # Process observation is evidence, never an unbounded control dependency.
     # Bound the COMPLETE census exchange, including an exited ps whose descendant
     # still holds stdout open. rch_group_timeout prefers the fleet's GNU timeout,
@@ -228,6 +280,14 @@ rch_posix_signal_authorized() (
     rch_requested_signal=$1
     [ "${rch_identified:-0}" = 1 ] || exit 43
     rch_check_procfs_namespace || exit 44
+    if [ "$(uname -s)" = Darwin ]; then
+        rch_self_pid=$(exec /bin/sh -c 'echo "$PPID"') || exit 44
+        rch_darwin_process "$rch_self_pid" && [ "$rch_observed_pgid" != "$rch_pgid" ] || exit 44
+        rch_remote_leader_matches && exit 0
+        [ "$rch_requested_signal" = KILL ] && [ "${rch_term_sent:-0}" = 1 ] &&
+            rch_remote_witness_matches || exit 43
+        exit 0
+    fi
     IFS= read -r rch_observer_stat < "/proc/$rch_self_pid/stat" 2>/dev/null || exit 44
     case "$rch_observer_stat" in "$rch_self_pid ("*") "*) ;; *) exit 44;; esac
     rch_observer_stat=${rch_observer_stat##*) }
@@ -272,7 +332,7 @@ rch_signal_group() {
 # cgroup operation, record mutation, or compiler-success claim occurs here.
 rch_recovery_boot_state() (
     [ "${rch_identified:-0}" = 1 ] && rch_check_procfs_namespace || exit 2
-    current=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null) || exit 2
+    current=$(rch_read_boot 2>/dev/null) || exit 2
     for value in "$rch_boot" "$current"; do
         rch_valid_boot "$value" || exit 2
         # The legacy shape check permits '-' in a UUID's hex groups. That is
@@ -288,7 +348,7 @@ rch_recovery_boot_state() (
     [ "$current" != "$rch_boot" ] || exit 0
     # Repeat both observations before accepting the discontinuity. A changed
     # or inaccessible view is unknown, never a reason to touch a reused PGID.
-    confirmed=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null) || exit 2
+    confirmed=$(rch_read_boot 2>/dev/null) || exit 2
     [ "$confirmed" = "$current" ] && rch_check_procfs_namespace || exit 2
     exit 1
 )
@@ -545,7 +605,13 @@ rch_control_capture() {
 
     rm -f -- "$rch_control_pipe"
 
-    rch_control_metadata=$(LC_ALL=C stat -c '%a:%h:%s' -- "$rch_control_file" 2>/dev/null) || {
+    rch_control_metadata=$(
+        case "$(uname -s)" in
+            Darwin) LC_ALL=C stat -f '%Lp:%l:%z' "$rch_control_file";;
+            Linux) LC_ALL=C stat -c '%a:%h:%s' -- "$rch_control_file";;
+            *) exit 125;;
+        esac
+    ) || {
         rm -f -- "$rch_control_file"
         rmdir -- "$rch_control_dir" 2>/dev/null || :
         return 125

@@ -136,6 +136,53 @@ pub fn current_process_identity() -> Option<ProcessIdentity> {
     }
 }
 
+/// Machine-readable Darwin group witness for the remote shell protocol.
+/// Keep kernel microsecond precision, encoded as one decimal receipt field.
+/// Read birth identity again after group membership to fence exit/PID reuse.
+#[cfg(target_os = "macos")]
+pub fn remote_process_witness(pid: u32) -> Option<String> {
+    if pid <= 1 || i32::try_from(pid).is_err() {
+        return None;
+    }
+    let native_pid = i32::try_from(pid).ok()?;
+    let info = libproc::proc_pid::pidinfo::<libproc::bsd_info::BSDInfo>(native_pid, 0).ok()?;
+    let boot = boot_identity()?;
+    let first = darwin_info(
+        pid,
+        info.pbi_pid,
+        info.pbi_status,
+        info.pbi_start_tvsec,
+        info.pbi_start_tvusec,
+        &boot,
+    );
+    let ProcessObservation::Present(identity) = first else {
+        return None;
+    };
+    let confirmed = libproc::proc_pid::pidinfo::<libproc::bsd_info::BSDInfo>(native_pid, 0).ok()?;
+    if confirmed.pbi_pgid != info.pbi_pgid
+        || darwin_info(
+            pid,
+            confirmed.pbi_pid,
+            confirmed.pbi_status,
+            confirmed.pbi_start_tvsec,
+            confirmed.pbi_start_tvusec,
+            &boot,
+        ) != ProcessObservation::Present(identity)
+    {
+        return None;
+    }
+    let start = info
+        .pbi_start_tvsec
+        .checked_mul(1_000_000)?
+        .checked_add(info.pbi_start_tvusec)?;
+    Some(format!("{boot} {start} {}", info.pbi_pgid))
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn remote_process_witness(_pid: u32) -> Option<String> {
+    None
+}
+
 #[cfg(target_os = "linux")]
 fn boot_identity() -> Option<String> {
     let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
@@ -715,12 +762,30 @@ mod tests {
     fn darwin_native_birth_is_stable_and_a_reaped_child_is_absent() {
         let own = current_process_identity().expect("native own process identity");
         assert!(matches!(own.start, ProcessStart::Darwin { .. }));
-        assert_eq!(current_process_identity(), Some(own));
+        assert_eq!(current_process_identity(), Some(own.clone()));
         let mut child = std::process::Command::new("/bin/sleep")
             .arg("30")
             .spawn()
             .unwrap();
         let observed = observe_process(child.id());
+        let witness = remote_process_witness(child.id()).expect("native shell group witness");
+        let fields: Vec<_> = witness.split_whitespace().collect();
+        assert_eq!(fields.len(), 3);
+        assert_eq!(fields[0], own.boot_id);
+        let ProcessObservation::Present(ref identity) = observed else {
+            panic!("live child identity unavailable: {observed:?}");
+        };
+        let ProcessStart::Darwin {
+            seconds,
+            microseconds,
+        } = &identity.start
+        else {
+            panic!("wrong platform identity");
+        };
+        assert_eq!(
+            fields[1].parse::<u64>().unwrap(),
+            *seconds * 1_000_000 + u64::from(*microseconds)
+        );
         child.kill().unwrap();
         child.wait().unwrap();
         assert!(
@@ -728,5 +793,6 @@ mod tests {
             "{observed:?}"
         );
         assert_eq!(observe_process(child.id()), ProcessObservation::Absent);
+        assert!(remote_process_witness(child.id()).is_none());
     }
 }
