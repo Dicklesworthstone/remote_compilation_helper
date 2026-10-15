@@ -63,7 +63,12 @@ confirm_topology() {
     sh -c "$1" >/dev/null 2>&1 || refuse 'topology validation failed after initialization'
     while IFS= read -r topology_root; do
         [ -d "$topology_root" ] || refuse 'topology root is not a directory'
-        sync -f "$topology_root" && sync -f "$(dirname -- "$topology_root")" \
+        # fdatasync the root and its parent, not syncfs: the roots live on the
+        # worker's data filesystem, and this runs under the registry flock on
+        # every namespace setup. syncfs flushed every concurrent build's dirty
+        # pages first; on a saturated SSD a few setups queued past the 15 s
+        # budget and were killed (#111, hz3/hz4).
+        sync -d -- "$topology_root" && sync -d -- "$(dirname -- "$topology_root")" \
             || refuse 'cannot confirm durable topology'
     done <<RCH_TOPOLOGY_ROOTS
 $requested
