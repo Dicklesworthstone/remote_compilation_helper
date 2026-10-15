@@ -1218,7 +1218,8 @@ commands may still run locally. For several focused checks, run separate direct
 - Sensitive field masking and structured error taxonomy are built in.
 - `rch update` enforces the release's SHA-256 checksums and verifies the
   archive's `.minisig` against a public key pinned in the binary (minisign key
-  `69B3955C8D2E62A8`, which signs every release since 2.0.0); a bad signature
+  `69B3955C8D2E62A8`, which signs every release since 2.1.0; 2.0.x and earlier
+  used `1BBD79B28BF718D0`); a bad signature
   aborts the update. A Sigstore bundle is also verified when the release ships
   one and `cosign` is installed. `--skip-verify` bypasses signature checks only.
   `install.sh` still verifies checksums only.
