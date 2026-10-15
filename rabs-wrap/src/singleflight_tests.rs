@@ -590,9 +590,10 @@ fn disabled_cold_wait_does_not_disable_keyed_waiting() {
 fn cold_preparation_rolls_over_after_sixty_requests() {
     use std::os::unix::net::UnixListener;
     let base = std::env::temp_dir().join(format!(
-        "rabs-rollover-{}-{:?}",
+        "rabs-rollover-{}-{:?}-{:?}",
         std::process::id(),
         std::thread::current().id(),
+        std::time::SystemTime::now(),
     ));
     std::fs::create_dir(&base).unwrap();
     let socket = base.join("edge.sock");
