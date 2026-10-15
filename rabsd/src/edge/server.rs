@@ -18,12 +18,13 @@
 //! from a dead incarnation) is removed and taken over, and the takeover
 //! is logged.
 
+mod frame_read;
 mod liveness;
 mod rustc_outputs;
 mod rustc_request;
 
 use asupersync::cx::Cx;
-use asupersync::io::{AsyncReadExt, AsyncWriteExt};
+use asupersync::io::{AsyncWriteExt, BufReader};
 use asupersync::net::unix::{UnixListener, UnixStream};
 use asupersync::signal::ShutdownReceiver;
 use liveness::{Limit, WorkError};
@@ -42,6 +43,10 @@ pub const MAX_FRAME_BYTES: usize = 64 * 1024;
 pub const MAX_CONNECTIONS: usize = 128;
 pub const MAX_REQUESTS_PER_CONNECTION: usize = 64;
 const FRAME_IO_BUDGET: Duration = Duration::from_secs(5);
+/// One buffer survives every phase, including completion and capture ACK.
+/// The connection cap bounds total read-ahead storage to 2 MiB per listener.
+const FRAME_READ_BUFFER_BYTES: usize = 16 * 1024;
+type EdgeStream = BufReader<UnixStream>;
 const CONTROL_WORKERS: usize = 2;
 const SHADOW_WORKERS: usize = 4;
 const MATERIALIZATION_WORKERS: usize = 2;
@@ -288,54 +293,40 @@ async fn accept_loop(
 }
 
 /// One absolute budget covers the ENTIRE frame, not each trickled byte.
-async fn read_frame_with_budget(stream: &mut UnixStream, budget: Duration) -> Option<Vec<u8>> {
+async fn read_frame_with_budget(stream: &mut EdgeStream, budget: Duration) -> Option<Vec<u8>> {
     read_frame_bounded(stream, budget, MAX_FRAME_BYTES).await
 }
 
 /// [`read_frame_with_budget`] with an explicit frame bound, for the one
 /// frame kind (a live completion carrying its transcript) that may exceed
-/// the ordinary request bound.
+/// the ordinary request bound. Retain read-ahead across every protocol phase.
 async fn read_frame_bounded(
-    stream: &mut UnixStream,
+    stream: &mut EdgeStream,
     budget: Duration,
     max_bytes: usize,
 ) -> Option<Vec<u8>> {
-    asupersync::time::timeout(asupersync::time::wall_now(), budget, async {
-        let mut frame = Vec::new();
-        let mut byte = [0u8; 1];
-        loop {
-            match stream.read(&mut byte).await {
-                Ok(0) => return None,
-                Ok(_) => {
-                    if byte[0] == b'\n' {
-                        return Some(frame);
-                    }
-                    if frame.len() == max_bytes {
-                        return None;
-                    }
-                    frame.push(byte[0]);
-                }
-                Err(_) => return None,
-            }
-        }
-    })
+    asupersync::time::timeout(
+        asupersync::time::wall_now(),
+        budget,
+        frame_read::read_frame(stream, max_bytes),
+    )
     .await
     .ok()
     .flatten()
 }
 
 /// None means EOF, a truncated/oversized frame, or an exhausted read budget.
-async fn read_frame(stream: &mut UnixStream) -> Option<Vec<u8>> {
+async fn read_frame(stream: &mut EdgeStream) -> Option<Vec<u8>> {
     read_frame_with_budget(stream, FRAME_IO_BUDGET).await
 }
 
-async fn write_frame(stream: &mut UnixStream, line: &str) -> bool {
+async fn write_frame(stream: &mut EdgeStream, line: &str) -> bool {
     let mut bytes = line.as_bytes().to_vec();
     bytes.push(b'\n');
     asupersync::time::timeout(
         asupersync::time::wall_now(),
         FRAME_IO_BUDGET,
-        stream.write_all(&bytes),
+        stream.get_mut().write_all(&bytes),
     )
     .await
     .is_ok_and(|result| result.is_ok())
@@ -363,12 +354,13 @@ impl Drop for Flight {
 
 async fn handle_connection(
     id: u64,
-    mut stream: UnixStream,
+    stream: UnixStream,
     policy: AdmissionPolicy,
     socket_evidence: SocketMetadata,
     services: EdgeServices,
     limits: EdgeLimits,
 ) {
+    let mut stream = EdgeStream::with_capacity(FRAME_READ_BUFFER_BYTES, stream);
     let EdgeServices {
         shadow,
         coord,
@@ -377,7 +369,7 @@ async fn handle_connection(
     } = services;
     let trace = format!("edge-conn-{id}");
     // Admission: kernel peer credentials against the policy.
-    let (peer_uid, peer_gid) = match stream.peer_cred() {
+    let (peer_uid, peer_gid) = match stream.get_ref().peer_cred() {
         Ok(cred) => (cred.uid, cred.gid),
         Err(error) => {
             log_line(
@@ -1569,7 +1561,8 @@ mod edge_liveness_tests {
                     std::thread::sleep(Duration::from_millis(5));
                 }
             });
-            let (mut stream, _) = listener.accept().await.unwrap();
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = EdgeStream::with_capacity(FRAME_READ_BUFFER_BYTES, stream);
             let frame = read_frame_with_budget(&mut stream, Duration::from_millis(30)).await;
             assert!(frame.is_none());
             drop(stream);

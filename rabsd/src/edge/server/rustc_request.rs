@@ -631,7 +631,7 @@ fn completion_not_published(detail: &str) -> String {
 /// No CAS lock or blocking-worker permit is retained while waiting for the
 /// wrapper. A lost, truncated, malformed or expired ACK is non-publication.
 async fn acknowledge_capture(
-    stream: &mut asupersync::net::unix::UnixStream,
+    stream: &mut super::EdgeStream,
     attempt: &str,
     capture: &str,
 ) -> Option<CaptureAck> {
@@ -656,7 +656,7 @@ pub(super) async fn complete_on_lane(
     live: Arc<LiveEdge>,
     attempt: Box<LocalAttempt>,
     frame: Vec<u8>,
-    stream: &mut asupersync::net::unix::UnixStream,
+    stream: &mut super::EdgeStream,
 ) -> String {
     let prepared = match lane.spawn(move || {
         let report = completion_report(&frame, &attempt.attempt_hex())
@@ -810,7 +810,11 @@ mod completion_capture_tests {
                             socket.get_mut().write_all(reply.as_bytes()).unwrap();
                         }
                     });
-                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let (socket, _) = listener.accept().await.unwrap();
+                    let mut socket = super::super::EdgeStream::with_capacity(
+                        super::super::FRAME_READ_BUFFER_BYTES,
+                        socket,
+                    );
                     let acknowledged = acknowledge_capture(&mut socket, "a", "c").await.is_some();
                     peer.join().unwrap();
                     acknowledged
