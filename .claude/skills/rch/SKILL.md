@@ -97,7 +97,7 @@ Run in order; stop at the first failing stage.
 | No workers configured | `rch workers discover --add --yes && rch workers setup --all` (or `rch workers init`) |
 | Workers unreachable | `rch workers probe --all`; keys → `references/SSH_KEY_RECOVERY.md` |
 | "all workers unreachable" persists though probes pass | workers are in **temporary bypass**: `rch status --fleet`; they auto-rejoin after N healthy probes + a canary build; `rch workers enable <id>` clears the record |
-| All workers busy | queueing is default (waits 330 s); raise it — `RCH_DAEMON_WAIT_RESPONSE_TIMEOUT_SECS=900 <cmd>` — or raise `total_slots` |
+| All workers busy | queueing is default: a compilation waits up to the daemon's `[queue] timeout_secs` (300 s), an `rch exec --job` up to 6 h. A longer compile wait needs both that daemon key and `RCH_DAEMON_WAIT_RESPONSE_TIMEOUT_SECS`; or raise `total_slots` |
 | `no admissible workers` | `rch admit "<cmd>"` — per-candidate rejection reasons + next action |
 | Requested worker refused (`RCH_WORKER=x`) | the `[RCH-Innn]` line carries a `next_action`; do it — rch never silently swaps workers |
 | Shell-wrapped cargo refused `[RCH-E301]` | never `rch exec -- bash -lc "cargo … && cargo …"`; run separate `rch exec -- cargo …` |
@@ -200,7 +200,7 @@ Every name below is read by 1.0.58 code (`references/CONFIGURATION.md` has the f
 | `RCH_REQUIRE_REMOTE=1` | Fail closed instead of building locally (proof mode). Wins over `RCH_FORCE_REMOTE`. |
 | `RCH_FORCE_REMOTE=1` | Skip local-time/speedup gating, still fail open. |
 | `RCH_QUEUE_WHEN_BUSY` | Wait for a slot instead of local fallback. **Default `1`.** `0` to opt out (benchmarking). |
-| `RCH_DAEMON_WAIT_RESPONSE_TIMEOUT_SECS` (alias `RCH_DAEMON_RESPONSE_TIMEOUT_SECS`) | Max seconds to wait for a queued worker. **Default 330** — set it higher, not lower, to wait longer. |
+| `RCH_DAEMON_WAIT_RESPONSE_TIMEOUT_SECS` (alias `RCH_DAEMON_RESPONSE_TIMEOUT_SECS`) | Max seconds to wait for a queued worker. **Default 330; 6 h for `rch exec --job`.** The daemon caps a compilation's wait at `[queue] timeout_secs` (300 s) and a job's at 24 h, so raising this alone lengthens only job waits. |
 | `RCH_WORKER=id[,id]` (alias `RCH_WORKERS`, merged) | Request specific worker(s); inadmissible ⇒ refused with `RCH-Innn` + next action. |
 | `RCH_PRIORITY=low\|normal\|high` | Scheduler hint. |
 | `RCH_ENV_ALLOWLIST=K1,K2` | Forward env vars to the remote build (`RUSTFLAGS`, `RUST_LOG`, …). |

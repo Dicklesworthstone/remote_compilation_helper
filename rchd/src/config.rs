@@ -87,8 +87,10 @@ pub struct QueueConfig {
     #[serde(default = "default_max_queue_depth")]
     pub max_depth: usize,
 
-    /// Maximum time a build can wait in queue (seconds) before timing out.
-    /// Timed-out builds fall back to local execution.
+    /// Maximum time a compilation can wait in queue (seconds) before timing
+    /// out; a timed-out build falls back to local, or is refused where remote
+    /// is required. An `rch exec --job` request never falls back, so its own
+    /// longer wait is honoured up to 24 h (bd-decdd).
     #[serde(default = "default_queue_timeout")]
     pub timeout_secs: u64,
 }

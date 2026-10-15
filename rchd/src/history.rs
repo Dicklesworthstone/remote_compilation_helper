@@ -328,6 +328,22 @@ pub struct QueuedWaiterClaim {
     nonce: u64,
 }
 
+/// One worker reserved for a starving queued waiter (bd-decdd). While the hold
+/// is live, younger requests are not placed on that worker, so it drains until
+/// the waiter's slots fit instead of being refilled by single-slot jobs.
+/// Transient: a restart drops it, and the waiter claims again once eligible.
+#[derive(Debug, Clone)]
+struct QueueHold {
+    queue_id: u64,
+    worker_id: String,
+    /// The holder's `queued_at_mono`; with `queue_id`, the age order.
+    since: Instant,
+    refreshed: Instant,
+}
+
+/// A hold not refreshed for this long is ignored (its waiter polls every second).
+const QUEUE_HOLD_STALE: Duration = Duration::from_secs(30);
+
 /// Build history manager.
 ///
 /// Thread-safe ring buffer of recent builds with optional persistence.
@@ -350,6 +366,9 @@ pub struct BuildHistory {
     /// Queued builds (waiting for workers). Membership changes take `active`
     /// first, so queue departure, cancellation and admission share one commit.
     queued: RwLock<VecDeque<QueuedBuildState>>,
+    /// At most one worker reserved for the oldest starving waiter (bd-decdd).
+    /// Never held while taking `queued`.
+    queue_hold: Mutex<Option<QueueHold>>,
     /// Maximum capacity for history.
     capacity: usize,
     /// Maximum queue depth (0 = unlimited).
@@ -398,6 +417,7 @@ impl BuildHistory {
             source_fences: Mutex::new(Vec::new()),
             live_checkout_fences: Mutex::new(HashMap::new()),
             queued: RwLock::new(VecDeque::new()),
+            queue_hold: Mutex::new(None),
             capacity,
             max_queue_depth: DEFAULT_MAX_QUEUE_DEPTH,
             next_id: AtomicU64::new(initial_id),
@@ -1527,6 +1547,81 @@ impl BuildHistory {
             })
     }
 
+    fn live_queue_hold(&self) -> std::sync::MutexGuard<'_, Option<QueueHold>> {
+        let mut hold = self.queue_hold.lock().unwrap_or_else(|e| e.into_inner());
+        if hold
+            .as_ref()
+            .is_some_and(|h| h.refreshed.elapsed() >= QUEUE_HOLD_STALE)
+        {
+            *hold = None;
+        }
+        hold
+    }
+
+    /// The worker a live hold reserves against this caller: a fresh request
+    /// (no waiter) or a waiter younger than the holder. `None` for the holder
+    /// itself, for older waiters, and when no hold is live.
+    pub fn queue_hold_against(&self, waiter: Option<&QueuedWaiterClaim>) -> Option<String> {
+        let caller = waiter.map(|claim| {
+            let since = self
+                .queued
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .find(|row| row.id == claim.queue_id)
+                .map(|row| row.queued_at_mono);
+            (claim.queue_id, since)
+        });
+        let hold = self.live_queue_hold();
+        let hold = hold.as_ref()?;
+        match caller {
+            Some((queue_id, _)) if queue_id == hold.queue_id => None,
+            Some((queue_id, Some(since))) if (since, queue_id) < (hold.since, hold.queue_id) => {
+                None
+            }
+            _ => Some(hold.worker_id.clone()),
+        }
+    }
+
+    /// The worker `queue_id` holds, while its hold is live.
+    pub fn queue_hold_of(&self, queue_id: u64) -> Option<String> {
+        self.live_queue_hold()
+            .as_ref()
+            .filter(|hold| hold.queue_id == queue_id)
+            .map(|hold| hold.worker_id.clone())
+    }
+
+    /// Claim, move or refresh `queue_id`'s hold on `worker_id`. A live hold
+    /// owned by an older waiter is never displaced; a younger one is. Returns
+    /// whether the hold changed hands or workers (a refresh returns false).
+    pub fn claim_queue_hold(&self, queue_id: u64, since: Instant, worker_id: String) -> bool {
+        let mut hold = self.live_queue_hold();
+        if let Some(current) = hold.as_ref()
+            && current.queue_id != queue_id
+            && (current.since, current.queue_id) < (since, queue_id)
+        {
+            return false;
+        }
+        let changed = hold
+            .as_ref()
+            .is_none_or(|h| h.queue_id != queue_id || h.worker_id != worker_id);
+        *hold = Some(QueueHold {
+            queue_id,
+            worker_id,
+            since,
+            refreshed: Instant::now(),
+        });
+        changed
+    }
+
+    /// Drop `queue_id`'s hold, if it has one.
+    pub fn release_queue_hold(&self, queue_id: u64) {
+        let mut hold = self.queue_hold.lock().unwrap_or_else(|e| e.into_inner());
+        if hold.as_ref().is_some_and(|h| h.queue_id == queue_id) {
+            *hold = None;
+        }
+    }
+
     /// Dequeue the next build (FIFO).
     ///
     /// Called when a worker becomes available.
@@ -2073,6 +2168,7 @@ impl BuildHistory {
             source_fences: Mutex::new(Vec::new()),
             live_checkout_fences: Mutex::new(HashMap::new()),
             queued: RwLock::new(queued),
+            queue_hold: Mutex::new(None),
             capacity,
             max_queue_depth: DEFAULT_MAX_QUEUE_DEPTH,
             next_id: AtomicU64::new(initial_id),
@@ -3269,6 +3365,52 @@ mod tests {
                 },
             )
             .unwrap()
+    }
+
+    #[test]
+    fn queue_hold_reserves_against_younger_requests_only() {
+        let history = BuildHistory::new(10);
+        let (old, old_claim) = queue_resume_enqueue(&history, Some("old"));
+        let (young, young_claim) = queue_resume_enqueue(&history, Some("young"));
+        assert!(old.queued_at_mono <= young.queued_at_mono && old.id < young.id);
+        assert_eq!(history.queue_hold_against(None), None);
+
+        // The younger waiter claims first; the older one displaces it.
+        assert!(history.claim_queue_hold(young.id, young.queued_at_mono, "w1".into()));
+        assert_eq!(history.queue_hold_against(None).as_deref(), Some("w1"));
+        assert_eq!(history.queue_hold_against(Some(&young_claim)), None);
+        assert_eq!(history.queue_hold_against(Some(&old_claim)), None);
+        assert!(history.claim_queue_hold(old.id, old.queued_at_mono, "w2".into()));
+        assert_eq!(history.queue_hold_of(young.id), None);
+        assert_eq!(history.queue_hold_of(old.id).as_deref(), Some("w2"));
+        assert_eq!(
+            history.queue_hold_against(Some(&young_claim)).as_deref(),
+            Some("w2")
+        );
+        assert_eq!(history.queue_hold_against(Some(&old_claim)), None);
+
+        // A younger waiter cannot take it back; a refresh is not a change.
+        assert!(!history.claim_queue_hold(young.id, young.queued_at_mono, "w1".into()));
+        assert!(!history.claim_queue_hold(old.id, old.queued_at_mono, "w2".into()));
+        assert!(history.claim_queue_hold(old.id, old.queued_at_mono, "w3".into()));
+
+        // Only the holder's release drops it.
+        history.release_queue_hold(young.id);
+        assert_eq!(history.queue_hold_of(old.id).as_deref(), Some("w3"));
+        history.release_queue_hold(old.id);
+        assert_eq!(history.queue_hold_against(None), None);
+
+        // An unrefreshed hold goes stale.
+        assert!(history.claim_queue_hold(old.id, old.queued_at_mono, "w1".into()));
+        history
+            .queue_hold
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .refreshed -= QUEUE_HOLD_STALE;
+        assert_eq!(history.queue_hold_against(None), None);
+        assert!(history.claim_queue_hold(young.id, young.queued_at_mono, "w4".into()));
     }
 
     #[test]

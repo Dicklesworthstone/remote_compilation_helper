@@ -236,7 +236,7 @@ log_level = "info"
 [queue]
 enabled = false                      # daemon-side queue; hook-side RCH_QUEUE_WHEN_BUSY is what agents see
 max_depth = 100                      # 0 = unlimited
-timeout_secs = 300
+timeout_secs = 300                   # cap on a compilation's queue wait; an --job wait may run to 24 h
 
 [cache_cleanup]
 enabled = true
@@ -288,15 +288,15 @@ Placement controls (resolved per command; visible in `rch diagnose --json` → `
 | `RCH_PRESET` | profile name | recorded as `requested_profile` |
 | `RCH_REQUIRE_REMOTE` / `RCH_FORCE_REMOTE` | `0\|1` | strict (fail-closed) vs. force (fail-open) |
 | `RCH_QUEUE_WHEN_BUSY` | `0\|1` (default `1`) | wait for a slot instead of local fallback; unrecognized ⇒ warning, treated as 1 |
-| `RCH_DAEMON_WAIT_RESPONSE_TIMEOUT_SECS` (alias `RCH_DAEMON_RESPONSE_TIMEOUT_SECS`) | secs > 0 | max wait for a queued worker |
+| `RCH_DAEMON_WAIT_RESPONSE_TIMEOUT_SECS` (alias `RCH_DAEMON_RESPONSE_TIMEOUT_SECS`) | secs > 0 | max wait for a queued worker (daemon caps compilations at `[queue] timeout_secs`, jobs at 24 h) |
 | `RCH_DISABLE_TARGET_REUSE` | `0\|1` | legacy per-job remote target dir instead of pooled |
 
 Hook/exec-side knobs that are **not** part of the placement plan (read directly
 in `rch/src/hook.rs`): `RCH_PRIORITY` (`low|normal|high`, default `normal`;
 invalid ⇒ `normal`), `RCH_MAX_REMOTE_ATTEMPTS` (u32 ≥ 1, default 3). The
 queued-wait default behind `RCH_DAEMON_WAIT_RESPONSE_TIMEOUT_SECS` (and its
-alias) is **330 s**; the non-queued daemon IPC default is 30 s and is not
-env-tunable.
+alias) is **330 s**, or **6 h** for `rch exec --job`, which never falls back to
+local; the non-queued daemon IPC default is 30 s and is not env-tunable.
 
 Other runtime: `RCH_CONFIG_DIR`, `RCH_STATE_HOME` (default `$XDG_STATE_HOME/rch`
 → `~/.local/state/rch`), `RCH_PROFILE` (`dev|prod|test`), `RCH_LOG_FORMAT`

@@ -21,7 +21,8 @@ use super::command_parsing::{
 };
 use super::daemon_ipc::{
     DEFAULT_DAEMON_RESPONSE_TIMEOUT_SECS, DEFAULT_DAEMON_WAIT_RESPONSE_TIMEOUT_SECS,
-    daemon_response_timeout_for, queue_when_busy_enabled_from, urlencoding_encode,
+    DEFAULT_JOB_WAIT_RESPONSE_TIMEOUT_SECS, daemon_response_timeout_for,
+    queue_when_busy_enabled_from, urlencoding_encode,
 };
 use super::dependency_closure::{
     DEPENDENCY_PREFLIGHT_CODE_MISSING, DEPENDENCY_PREFLIGHT_CODE_STALE,
@@ -3886,7 +3887,7 @@ async fn test_daemon_query_wait_parameters() {
     let _ = std::fs::remove_file(&socket_path);
 
     let listener = UnixListener::bind(&socket_path).expect("Failed to create test socket");
-    let expected_wait_timeout_secs = daemon_response_timeout_for(true, None, None)
+    let expected_wait_timeout_secs = daemon_response_timeout_for(true, false, None, None)
         .as_secs()
         .saturating_sub(1)
         .max(1);
@@ -10534,24 +10535,37 @@ fn test_queue_when_busy_enabled_parser() {
 fn test_daemon_response_timeout_defaults_and_overrides() {
     let _guard = test_guard!();
     assert_eq!(
-        daemon_response_timeout_for(false, None, None),
+        daemon_response_timeout_for(false, false, None, None),
         Duration::from_secs(DEFAULT_DAEMON_RESPONSE_TIMEOUT_SECS)
     );
     assert_eq!(
-        daemon_response_timeout_for(true, None, None),
+        daemon_response_timeout_for(true, false, None, None),
         Duration::from_secs(DEFAULT_DAEMON_WAIT_RESPONSE_TIMEOUT_SECS)
     );
     assert_eq!(
-        daemon_response_timeout_for(true, None, Some("900")),
+        daemon_response_timeout_for(true, false, None, Some("900")),
         Duration::from_secs(900)
     );
     assert_eq!(
-        daemon_response_timeout_for(true, Some("45"), Some("900")),
+        daemon_response_timeout_for(true, false, Some("45"), Some("900")),
         Duration::from_secs(45)
     );
     assert_eq!(
-        daemon_response_timeout_for(true, Some("invalid"), Some("invalid")),
+        daemon_response_timeout_for(true, false, Some("invalid"), Some("invalid")),
         Duration::from_secs(DEFAULT_DAEMON_WAIT_RESPONSE_TIMEOUT_SECS)
+    );
+    // bd-decdd: a job waits for admission instead of timing out into a refusal.
+    assert_eq!(
+        daemon_response_timeout_for(true, true, None, None),
+        Duration::from_secs(DEFAULT_JOB_WAIT_RESPONSE_TIMEOUT_SECS)
+    );
+    assert_eq!(
+        daemon_response_timeout_for(true, true, None, Some("900")),
+        Duration::from_secs(900)
+    );
+    assert_eq!(
+        daemon_response_timeout_for(false, true, None, None),
+        Duration::from_secs(DEFAULT_DAEMON_RESPONSE_TIMEOUT_SECS)
     );
 }
 

@@ -578,7 +578,7 @@ async fn query_daemon_with_mode(
         // Keep daemon queue timeout aligned with the client-side socket timeout
         // so queued requests return a structured SelectionReason instead of
         // triggering a client communication timeout.
-        let wait_timeout_secs = daemon_response_timeout(wait_for_worker)
+        let wait_timeout_secs = daemon_response_timeout(wait_for_worker, job_mode)
             .as_secs()
             .saturating_sub(1)
             .max(1);
@@ -592,7 +592,7 @@ async fn query_daemon_with_mode(
     // Bound writes independently from the longer, queue-aware response wait.
     let route = selection_route(disk_headroom_gib, false, !required_tools.is_empty());
     let request = format!("GET {route}?{query}\n");
-    let response_budget = daemon_response_timeout(wait_for_worker);
+    let response_budget = daemon_response_timeout(wait_for_worker, job_mode);
     let deadline = tokio::time::Instant::now() + response_budget;
     let result = timeout(
         response_budget,
@@ -931,6 +931,9 @@ pub(super) fn urlencoding_encode(s: &str) -> String {
 
 pub(super) const DEFAULT_DAEMON_RESPONSE_TIMEOUT_SECS: u64 = 30;
 pub(super) const DEFAULT_DAEMON_WAIT_RESPONSE_TIMEOUT_SECS: u64 = 330;
+/// A `--job` never falls back to local, so it waits for admission much longer
+/// than a compilation (bd-decdd). The daemon grants a job up to 24 h.
+pub(super) const DEFAULT_JOB_WAIT_RESPONSE_TIMEOUT_SECS: u64 = 6 * 3600;
 
 pub(super) fn queue_when_busy_enabled_from(value: Option<&str>) -> bool {
     let Some(value) = value else {
@@ -986,6 +989,7 @@ fn parse_timeout_secs(raw: &str) -> Option<u64> {
 
 pub(super) fn daemon_response_timeout_for(
     wait_for_worker: bool,
+    job_mode: bool,
     global_override: Option<&str>,
     wait_override: Option<&str>,
 ) -> Duration {
@@ -996,18 +1000,23 @@ pub(super) fn daemon_response_timeout_for(
     if wait_for_worker {
         let secs = wait_override
             .and_then(parse_timeout_secs)
-            .unwrap_or(DEFAULT_DAEMON_WAIT_RESPONSE_TIMEOUT_SECS);
+            .unwrap_or(if job_mode {
+                DEFAULT_JOB_WAIT_RESPONSE_TIMEOUT_SECS
+            } else {
+                DEFAULT_DAEMON_WAIT_RESPONSE_TIMEOUT_SECS
+            });
         return Duration::from_secs(secs);
     }
 
     Duration::from_secs(DEFAULT_DAEMON_RESPONSE_TIMEOUT_SECS)
 }
 
-fn daemon_response_timeout(wait_for_worker: bool) -> Duration {
+fn daemon_response_timeout(wait_for_worker: bool, job_mode: bool) -> Duration {
     let global_override = std::env::var("RCH_DAEMON_RESPONSE_TIMEOUT_SECS").ok();
     let wait_override = std::env::var("RCH_DAEMON_WAIT_RESPONSE_TIMEOUT_SECS").ok();
     daemon_response_timeout_for(
         wait_for_worker,
+        job_mode,
         global_override.as_deref(),
         wait_override.as_deref(),
     )
@@ -1540,15 +1549,15 @@ mod bounded_ipc_tests {
             .unwrap_err();
         assert!(error.to_string().contains("response timed out"));
         assert_eq!(
-            daemon_response_timeout_for(false, None, None),
+            daemon_response_timeout_for(false, false, None, None),
             Duration::from_secs(30)
         );
         assert_eq!(
-            daemon_response_timeout_for(true, None, None),
+            daemon_response_timeout_for(true, false, None, None),
             Duration::from_secs(330)
         );
         assert_eq!(
-            daemon_response_timeout_for(true, Some("90"), Some("450")),
+            daemon_response_timeout_for(true, false, Some("90"), Some("450")),
             Duration::from_secs(90)
         );
     }
