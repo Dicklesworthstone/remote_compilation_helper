@@ -25,15 +25,22 @@ fn docs(count: usize) -> (tempfile::TempDir, RecoverySession) {
     };
     // Use the real descriptor-bound journal owner in every case. Only the
     // already-completed remote execution is fixture input, not journal I/O.
-    let writer = DurableLeaseWriter::create_in(
-        &directory.path().join("journals"), "cargo doc", true, false,
-    ).unwrap();
+    let writer =
+        DurableLeaseWriter::create_in(&directory.path().join("journals"), "cargo doc", true, false)
+            .unwrap();
     writer.admit(41, &worker.id).unwrap();
     RecoverySession::begin(
-        &writer, &worker, vec!["/data/projects/publication-runtime".into()],
-        None, None, None, TransferConfig::default(), directory.path().to_owned(),
+        &writer,
+        &worker,
+        vec!["/data/projects/publication-runtime".into()],
+        None,
+        None,
+        None,
+        TransferConfig::default(),
+        directory.path().to_owned(),
         identity,
-    ).unwrap();
+    )
+    .unwrap();
     let mut recipe: RecoveryRecipe =
         serde_json::from_value(writer.snapshot().recovery.unwrap()).unwrap();
     recipe.transfer.retrieval_staging_dir = Some(directory.path().join("staging"));
@@ -96,9 +103,15 @@ fn assert_docs(session: &RecoverySession, count: usize) {
     assert!(phase.pending.is_none());
     assert_eq!(phase.published.len(), count);
     for index in 0..count {
-        assert_eq!(std::fs::read_to_string(phase.local.join(relative(index))).unwrap(), bytes(index));
+        assert_eq!(
+            std::fs::read_to_string(phase.local.join(relative(index))).unwrap(),
+            bytes(index)
+        );
     }
-    assert_eq!(std::fs::read(phase.local.join("source-sentinel")).unwrap(), b"not an artifact");
+    assert_eq!(
+        std::fs::read(phase.local.join("source-sentinel")).unwrap(),
+        b"not an artifact"
+    );
     assert_eq!(session.recipe.exit_code, Some(0));
     assert!(!session.recipe.sources_released);
     assert!(!session.recipe.retired);
@@ -107,7 +120,10 @@ fn assert_docs(session: &RecoverySession, count: usize) {
 }
 
 fn reload(session: &RecoverySession) -> RecoverySession {
-    RecoverySession { recipe: load_recipe(&session.writer).unwrap(), writer: session.writer.clone() }
+    RecoverySession {
+        recipe: load_recipe(&session.writer).unwrap(),
+        writer: session.writer.clone(),
+    }
 }
 
 // Block only this invocation at a real publication boundary. A wall-clock
@@ -118,12 +134,17 @@ fn cancellation_gate(
 ) -> impl FnMut(PublicationPoint, &Path) -> anyhow::Result<()> + Send + 'static {
     let mut ready = Some(ready);
     move |observed, _| {
-        if observed == point && let Some(ready) = ready.take() {
+        if observed == point
+            && let Some(ready) = ready.take()
+        {
             let _ = ready.send(());
             let deadline = std::time::Instant::now() + Duration::from_secs(3);
             loop {
                 publication_runtime::checkpoint()?;
-                anyhow::ensure!(std::time::Instant::now() < deadline, "cancellation was not polled");
+                anyhow::ensure!(
+                    std::time::Instant::now() < deadline,
+                    "cancellation was not polled"
+                );
                 std::thread::sleep(Duration::from_millis(1));
             }
         }
@@ -158,17 +179,26 @@ async fn slow_publication_keeps_caller_reactor_and_real_heartbeats_running() {
                 "status": "ok", "build_id": heartbeat.build_id,
                 "worker_id": heartbeat.worker_id, "phase": heartbeat.phase,
             });
-            stream.write_all(format!(
-                "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n\r\n{response}\n"
-            ).as_bytes()).await.unwrap();
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n\r\n{response}\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
             counted.fetch_add(1, Ordering::Release);
         }
     });
     // No durable_lease in the service loop: it must never query an ambient
     // job endpoint. Exercise real durable heartbeats explicitly below instead.
     let heartbeat = BuildHeartbeatLoop::start(
-        socket.to_str().unwrap(), build_id, &worker_id,
-        Some(&session.recipe.wrapper_id), None,
+        socket.to_str().unwrap(),
+        build_id,
+        &worker_id,
+        Some(&session.recipe.wrapper_id),
+        None,
     );
     heartbeat.update_phase(BuildHeartbeatPhase::SyncDown, Some("publication".into()));
     let writer = session.writer.clone();
@@ -184,17 +214,21 @@ async fn slow_publication_keeps_caller_reactor_and_real_heartbeats_running() {
             }
             let writer = writer.clone();
             tokio::task::spawn_blocking(move || writer.heartbeat("sync_down"))
-                .await.unwrap().unwrap();
+                .await
+                .unwrap()
+                .unwrap();
             heartbeat.flush().await;
             counted_ticks.fetch_add(1, Ordering::Release);
         }
     });
-    let result = session.publish_with_observer("docs", |point, _| {
-        if point == PublicationPoint::BeforeFile {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        Ok(())
-    }).await;
+    let result = session
+        .publish_with_observer("docs", |point, _| {
+            if point == PublicationPoint::BeforeFile {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Ok(())
+        })
+        .await;
     let during = ticks.load(Ordering::Acquire);
     let wire = beats.load(Ordering::Acquire);
     let _ = stop.send(());
@@ -202,7 +236,10 @@ async fn slow_publication_keeps_caller_reactor_and_real_heartbeats_running() {
     server.abort();
     let _ = server.await;
     result.unwrap();
-    assert!(during >= 4 && wire >= 4, "caller reactor starved: ticks={during}, wire={wire}");
+    assert!(
+        during >= 4 && wire >= 4,
+        "caller reactor starved: ticks={during}, wire={wire}"
+    );
     assert_docs(&session, 24);
     session.returned(0).unwrap();
     assert_acknowledged(&session);
@@ -211,29 +248,57 @@ async fn slow_publication_keeps_caller_reactor_and_real_heartbeats_running() {
 #[tokio::test(flavor = "current_thread")]
 async fn deadline_drains_pending_renamed_and_published_boundaries_before_retry() {
     let _guard = test_guard!();
-    for point in [PublicationPoint::PendingDurable, PublicationPoint::Renamed, PublicationPoint::PublishedDurable] {
+    for point in [
+        PublicationPoint::PendingDurable,
+        PublicationPoint::Renamed,
+        PublicationPoint::PublishedDurable,
+    ] {
         let (_directory, mut session) = docs(4);
         let (ready, started) = tokio::sync::oneshot::channel();
-        let mut publication = Box::pin(session.publish_with_observer("docs", cancellation_gate(point, ready)));
+        let mut publication =
+            Box::pin(session.publish_with_observer("docs", cancellation_gate(point, ready)));
         tokio::select! {
             result = &mut publication => panic!("publication escaped the cancellation gate: {result:?}"),
             started = started => started.unwrap(),
         }
         let elapsed = std::time::Instant::now();
-        assert!(tokio::time::timeout(Duration::from_millis(25), publication).await.is_err());
-        assert!(elapsed.elapsed() < Duration::from_secs(2), "deadline waited for the whole phase");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), publication)
+                .await
+                .is_err()
+        );
+        assert!(
+            elapsed.elapsed() < Duration::from_secs(2),
+            "deadline waited for the whole phase"
+        );
         let phase = &session.recipe.phases[0];
         assert!(!phase.complete);
-        assert_eq!(phase.published.len(), usize::from(point == PublicationPoint::PublishedDurable));
-        assert_eq!(phase.pending.is_some(), point != PublicationPoint::PublishedDurable);
-        assert_eq!(phase.local.join(relative(0)).exists(), point != PublicationPoint::PendingDurable);
+        assert_eq!(
+            phase.published.len(),
+            usize::from(point == PublicationPoint::PublishedDurable)
+        );
+        assert_eq!(
+            phase.pending.is_some(),
+            point != PublicationPoint::PublishedDurable
+        );
+        assert_eq!(
+            phase.local.join(relative(0)).exists(),
+            point != PublicationPoint::PendingDurable
+        );
         assert!(session.recipe.returned.is_none());
         assert!(session.stage(0).exists());
         assert_acknowledged(&session);
         let journal = std::fs::read(&session.writer.path).unwrap();
         tokio::time::sleep(Duration::from_millis(30)).await;
-        assert_eq!(std::fs::read(&session.writer.path).unwrap(), journal, "detached publication after timeout");
-        let lock = tokio::time::timeout(Duration::from_secs(1), lock_output_root(&phase.local)).await.unwrap().unwrap();
+        assert_eq!(
+            std::fs::read(&session.writer.path).unwrap(),
+            journal,
+            "detached publication after timeout"
+        );
+        let lock = tokio::time::timeout(Duration::from_secs(1), lock_output_root(&phase.local))
+            .await
+            .unwrap()
+            .unwrap();
         drop(lock);
         session.publish("docs").await.unwrap();
         assert_docs(&session, 4);
@@ -252,13 +317,34 @@ async fn aborting_publication_task_drains_the_worker_before_recovery() {
     let root = session.recipe.phases[0].local.clone();
     let (ready, started) = tokio::sync::oneshot::channel();
     let task = tokio::spawn(async move {
-        session.publish_with_observer("docs", cancellation_gate(PublicationPoint::PendingDurable, ready)).await
+        session
+            .publish_with_observer(
+                "docs",
+                cancellation_gate(PublicationPoint::PendingDurable, ready),
+            )
+            .await
     });
-    tokio::time::timeout(Duration::from_secs(2), started).await.unwrap().unwrap();
-    assert!(tokio::time::timeout(Duration::from_millis(25), lock_output_root(&root)).await.is_err());
-    assert!(recovery_owner::acquire_gate(&path).is_err(), "journal gate released during publication");
+    tokio::time::timeout(Duration::from_secs(2), started)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), lock_output_root(&root))
+            .await
+            .is_err()
+    );
+    assert!(
+        recovery_owner::acquire_gate(&path).is_err(),
+        "journal gate released during publication"
+    );
     task.abort();
-    assert!(tokio::time::timeout(Duration::from_secs(2), task).await.unwrap().unwrap_err().is_cancelled());
+    assert!(
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap_err()
+            .is_cancelled()
+    );
     // No original writer is retained here: the cancelled task's scope must
     // drain its worker and release the actual kernel journal gate before join.
     let ownership = recovery_owner::acquire_gate(&path).unwrap();
@@ -268,7 +354,10 @@ async fn aborting_publication_task_drains_the_worker_before_recovery() {
         lease: Arc::new(Mutex::new(disk)),
         recovery_ownership: Some(Arc::new(ownership)),
     };
-    let mut recovered = RecoverySession { recipe: load_recipe(&writer).unwrap(), writer };
+    let mut recovered = RecoverySession {
+        recipe: load_recipe(&writer).unwrap(),
+        writer,
+    };
     assert!(recovered.recipe.phases[0].pending.is_some());
     assert!(!recovered.recipe.phases[0].complete);
     assert_acknowledged(&recovered);
@@ -280,10 +369,15 @@ async fn aborting_publication_task_drains_the_worker_before_recovery() {
 async fn worker_error_preserves_acknowledged_checkpoints_for_same_session_retry() {
     let _guard = test_guard!();
     let (_directory, mut session) = docs(3);
-    let result = session.publish_with_observer("docs", |point, _| {
-        anyhow::ensure!(point != PublicationPoint::PublishedDurable, "injected after durable checkpoint");
-        Ok(())
-    }).await;
+    let result = session
+        .publish_with_observer("docs", |point, _| {
+            anyhow::ensure!(
+                point != PublicationPoint::PublishedDurable,
+                "injected after durable checkpoint"
+            );
+            Ok(())
+        })
+        .await;
     assert!(result.is_err());
     assert_eq!(session.recipe.phases[0].published.len(), 1);
     assert!(!session.recipe.phases[0].complete);
@@ -296,10 +390,16 @@ async fn worker_error_preserves_acknowledged_checkpoints_for_same_session_retry(
 async fn worker_panic_wakes_caller_and_reloads_committed_recipe() {
     let _guard = test_guard!();
     let (_directory, mut session) = docs(3);
-    let result = session.publish_with_observer("docs", |point, _| {
-        assert_ne!(point, PublicationPoint::PublishedDurable, "injected worker panic");
-        Ok(())
-    }).await;
+    let result = session
+        .publish_with_observer("docs", |point, _| {
+            assert_ne!(
+                point,
+                PublicationPoint::PublishedDurable,
+                "injected worker panic"
+            );
+            Ok(())
+        })
+        .await;
     assert!(result.unwrap_err().to_string().contains("panicked"));
     assert_eq!(session.recipe.phases[0].published.len(), 1);
     assert_acknowledged(&session);
@@ -313,14 +413,21 @@ async fn cancellation_is_scoped_to_one_publication() {
     let (_first_directory, mut first) = docs(2);
     let (_second_directory, mut second) = docs(2);
     let (ready, started) = tokio::sync::oneshot::channel();
-    let mut publication = Box::pin(first.publish_with_observer("docs", cancellation_gate(PublicationPoint::PendingDurable, ready)));
+    let mut publication = Box::pin(first.publish_with_observer(
+        "docs",
+        cancellation_gate(PublicationPoint::PendingDurable, ready),
+    ));
     tokio::select! {
         result = &mut publication => panic!("first publication escaped its gate: {result:?}"),
         started = started => started.unwrap(),
     }
     second.publish("docs").await.unwrap();
     assert_docs(&second, 2);
-    assert!(tokio::time::timeout(Duration::from_millis(25), publication).await.is_err());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), publication)
+            .await
+            .is_err()
+    );
     assert_acknowledged(&first);
     publication_runtime::checkpoint().unwrap(); // No cancellation on the caller thread.
     first.publish("docs").await.unwrap();
@@ -330,26 +437,37 @@ async fn cancellation_is_scoped_to_one_publication() {
 #[tokio::test(flavor = "current_thread")]
 async fn concurrent_destination_changes_are_not_overwritten_before_or_after_pending() {
     let _guard = test_guard!();
-    for boundary in [PublicationPoint::BeforeFile, PublicationPoint::PendingDurable] {
+    for boundary in [
+        PublicationPoint::BeforeFile,
+        PublicationPoint::PendingDurable,
+    ] {
         let (_directory, mut session) = docs(1);
         let destination = session.recipe.phases[0].local.join(relative(0));
         std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
         std::fs::write(&destination, b"original baseline").unwrap();
-        let result = session.publish_with_observer("docs", move |point, path| {
-            if point == boundary {
-                std::fs::write(path, b"concurrent owner's output")?;
-            }
-            Ok(())
-        }).await;
+        let result = session
+            .publish_with_observer("docs", move |point, path| {
+                if point == boundary {
+                    std::fs::write(path, b"concurrent owner's output")?;
+                }
+                Ok(())
+            })
+            .await;
         assert!(result.is_err());
-        assert_eq!(std::fs::read(&destination).unwrap(), b"concurrent owner's output");
+        assert_eq!(
+            std::fs::read(&destination).unwrap(),
+            b"concurrent owner's output"
+        );
         assert!(session.recipe.phases[0].published.is_empty());
         assert!(!session.recipe.phases[0].complete);
         assert_acknowledged(&session);
         if boundary == PublicationPoint::PendingDurable {
             // Once a write is pending, recovery must use its old baseline.
             assert!(session.publish("docs").await.is_err());
-            assert_eq!(std::fs::read(&destination).unwrap(), b"concurrent owner's output");
+            assert_eq!(
+                std::fs::read(&destination).unwrap(),
+                b"concurrent owner's output"
+            );
         }
     }
 }
@@ -359,13 +477,22 @@ async fn lock_wait_cancellation_does_not_start_publication_or_change_evidence() 
     let _guard = test_guard!();
     let (_directory, mut session) = docs(2);
     let journal = std::fs::read(&session.writer.path).unwrap();
-    let lock = lock_output_root(&session.recipe.phases[0].local).await.unwrap();
+    let lock = lock_output_root(&session.recipe.phases[0].local)
+        .await
+        .unwrap();
     let observed = Arc::new(AtomicUsize::new(0));
     let counted = Arc::clone(&observed);
-    assert!(tokio::time::timeout(Duration::from_millis(25), session.publish_with_observer("docs", move |_, _| {
-        counted.fetch_add(1, Ordering::Relaxed);
-        Ok(())
-    })).await.is_err());
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(25),
+            session.publish_with_observer("docs", move |_, _| {
+                counted.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            })
+        )
+        .await
+        .is_err()
+    );
     assert_eq!(observed.load(Ordering::Relaxed), 0);
     assert_eq!(std::fs::read(&session.writer.path).unwrap(), journal);
     assert_acknowledged(&session);
@@ -385,33 +512,49 @@ async fn cancelled_chunk_copy_retains_prefix_and_resumes_without_rewriting_it() 
     let hash = blake3::hash(&bytes).to_hex().to_string();
     let destination = session.recipe.phases[0].local.join(relative(0));
     std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
-    let temporary = destination.parent().unwrap().join(format!(".rch-return-{}", session.recipe.identity));
+    let temporary = destination
+        .parent()
+        .unwrap()
+        .join(format!(".rch-return-{}", session.recipe.identity));
     let owned_source = source.clone();
     let owned_temporary = temporary.clone();
     let owned_hash = hash.clone();
-    let lock = lock_output_root(&session.recipe.phases[0].local).await.unwrap();
+    let lock = lock_output_root(&session.recipe.phases[0].local)
+        .await
+        .unwrap();
     let before = std::fs::read(&session.writer.path).unwrap();
     let (ready, started) = tokio::sync::oneshot::channel();
     let mut publication = Box::pin(publication_runtime::run(&mut session, lock, move |_| {
         let mut ready = Some(ready);
-        publication_copy::prepare_with_write(&owned_source, &owned_temporary, &owned_hash, |file, bytes, offset| {
-            let count = file.write_at(&bytes[..bytes.len().min(17)], offset)?;
-            if let Some(ready) = ready.take() {
-                let _ = ready.send(());
-                let deadline = std::time::Instant::now() + Duration::from_secs(3);
-                while publication_runtime::checkpoint().is_ok() && std::time::Instant::now() < deadline {
-                    std::thread::sleep(Duration::from_millis(1));
+        publication_copy::prepare_with_write(
+            &owned_source,
+            &owned_temporary,
+            &owned_hash,
+            |file, bytes, offset| {
+                let count = file.write_at(&bytes[..bytes.len().min(17)], offset)?;
+                if let Some(ready) = ready.take() {
+                    let _ = ready.send(());
+                    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+                    while publication_runtime::checkpoint().is_ok()
+                        && std::time::Instant::now() < deadline
+                    {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
                 }
-            }
-            Ok(count)
-        })?;
+                Ok(count)
+            },
+        )?;
         Ok(())
     }));
     tokio::select! {
         result = &mut publication => panic!("copy escaped its cancellation gate: {result:?}"),
         started = started => started.unwrap(),
     }
-    assert!(tokio::time::timeout(Duration::from_millis(25), publication).await.is_err());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), publication)
+            .await
+            .is_err()
+    );
     assert_eq!(std::fs::read(&session.writer.path).unwrap(), before);
     assert_eq!(std::fs::read(&temporary).unwrap(), bytes[..17]);
     assert!(!destination.exists());
@@ -444,16 +587,18 @@ async fn missing_stage_is_not_empty_success_and_same_session_can_retry() {
 async fn large_set_resumes_after_partial_durable_publication() {
     let _guard = test_guard!();
     let (_directory, mut session) = docs(256);
-    let result = session.publish_with_observer("docs", {
-        let mut count = 0;
-        move |point, _| {
-            if point == PublicationPoint::PublishedDurable {
-                count += 1;
-                anyhow::ensure!(count != 73, "injected interruption after 73 outputs");
+    let result = session
+        .publish_with_observer("docs", {
+            let mut count = 0;
+            move |point, _| {
+                if point == PublicationPoint::PublishedDurable {
+                    count += 1;
+                    anyhow::ensure!(count != 73, "injected interruption after 73 outputs");
+                }
+                Ok(())
             }
-            Ok(())
-        }
-    }).await;
+        })
+        .await;
     assert!(result.is_err());
     assert_eq!(session.recipe.phases[0].published.len(), 73);
     assert_acknowledged(&session);

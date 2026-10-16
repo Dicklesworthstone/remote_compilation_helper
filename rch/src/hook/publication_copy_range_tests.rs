@@ -164,7 +164,10 @@ fn range_storage_failure_retains_prefix_for_production_retry() {
         prepare_output_temporary(&fixture.source, &fixture.temporary, &fixture.hash).unwrap();
     assert_eq!(prepared.file.metadata().unwrap().ino(), inode);
     fixture.delivered(prepared);
-    assert_eq!(std::fs::metadata(&fixture.destination).unwrap().ino(), inode);
+    assert_eq!(
+        std::fs::metadata(&fixture.destination).unwrap().ino(),
+        inode
+    );
 }
 
 #[test]
@@ -202,7 +205,10 @@ fn kernel_copy_cannot_hide_same_length_output_corruption() {
             Ok(Some(copied))
         },
     );
-    assert!(result.is_err(), "kernel byte count replaced content verification");
+    assert!(
+        result.is_err(),
+        "kernel byte count replaced content verification"
+    );
     fixture.unchanged();
     assert_eq!(std::fs::read(&fixture.temporary).unwrap()[0], b'X');
     assert_eq!(
@@ -232,8 +238,14 @@ fn range_copy_refuses_replaced_temporary_without_touching_its_new_owner() {
     );
     assert!(result.is_err());
     assert_eq!(calls, 1);
-    assert_eq!(std::fs::read(&fixture.temporary).unwrap(), b"other owner's output");
-    assert_eq!(std::fs::read(&retained).unwrap(), fixture.bytes[..BUFFER_BYTES]);
+    assert_eq!(
+        std::fs::read(&fixture.temporary).unwrap(),
+        b"other owner's output"
+    );
+    assert_eq!(
+        std::fs::read(&retained).unwrap(),
+        fixture.bytes[..BUFFER_BYTES]
+    );
     fixture.unchanged();
 }
 

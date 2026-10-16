@@ -21,10 +21,10 @@ const BUFFER_BYTES: usize = 64 * 1024;
 // Bounded per artifact, never per inventory; large outputs still stream.
 const VERIFIED_SOURCE_CACHE_BYTES: u64 = 1024 * 1024;
 
-#[path = "staged_inventory.rs"]
-mod staged_inventory;
 #[path = "publication_kernel_copy.rs"]
 mod kernel_copy;
+#[path = "staged_inventory.rs"]
+mod staged_inventory;
 
 #[cfg(test)]
 #[path = "publication_copy_io_tests.rs"]
@@ -230,9 +230,14 @@ fn prepare_with_io(
     write: impl FnMut(&File, &[u8], u64) -> io::Result<usize>,
     sync: impl FnMut(&File) -> io::Result<()>,
 ) -> Result<PreparedOutput> {
-    prepare_with_copier(source_path, temporary, expected, write, sync, |_, _, _, _| {
-        Ok(None)
-    })
+    prepare_with_copier(
+        source_path,
+        temporary,
+        expected,
+        write,
+        sync,
+        |_, _, _, _| Ok(None),
+    )
 }
 
 // Retain cancellation prefixes just like interrupted writes. Storage errors

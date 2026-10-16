@@ -110,7 +110,13 @@ async fn preparation_does_not_fingerprint_a_reused_local_output_inventory() {
         identity,
     )
     .unwrap();
-    assert!(session.recipe.phases.iter().all(|phase| phase.baseline.is_empty()));
+    assert!(
+        session
+            .recipe
+            .phases
+            .iter()
+            .all(|phase| phase.baseline.is_empty())
+    );
     assert_acknowledged(&session);
     let phase_index = session
         .recipe
@@ -130,7 +136,10 @@ async fn preparation_does_not_fingerprint_a_reused_local_output_inventory() {
     session.completed(0).unwrap();
     let error = session
         .publish_with_observer("result:doc", |point, _| {
-            anyhow::ensure!(point != PublicationPoint::PendingDurable, "pending boundary fixture");
+            anyhow::ensure!(
+                point != PublicationPoint::PendingDurable,
+                "pending boundary fixture"
+            );
             Ok(())
         })
         .await
@@ -138,16 +147,25 @@ async fn preparation_does_not_fingerprint_a_reused_local_output_inventory() {
     assert!(error.to_string().contains("pending boundary fixture"));
     let phase = &session.recipe.phases[phase_index];
     assert_eq!(phase.baseline.len(), 1);
-    assert_eq!(phase.baseline[&relative(0)], blake3::hash(later).to_hex().to_string());
+    assert_eq!(
+        phase.baseline[&relative(0)],
+        blake3::hash(later).to_hex().to_string()
+    );
     assert!(phase.pending.is_some());
     assert_eq!(std::fs::read(local.join(relative(0))).unwrap(), later);
     assert_acknowledged(&session);
     session.publish("result:doc").await.unwrap();
     assert!(session.recipe.phases[phase_index].baseline.is_empty());
     assert!(session.recipe.phases[phase_index].complete);
-    assert_eq!(std::fs::read_to_string(local.join(relative(0))).unwrap(), bytes(0));
+    assert_eq!(
+        std::fs::read_to_string(local.join(relative(0))).unwrap(),
+        bytes(0)
+    );
     for index in 1..2048 {
-        assert_eq!(std::fs::read_to_string(local.join(relative(index))).unwrap(), predecessor(index));
+        assert_eq!(
+            std::fs::read_to_string(local.join(relative(index))).unwrap(),
+            predecessor(index)
+        );
     }
     assert_eq!(std::fs::read_link(alias).unwrap(), outside);
     assert_eq!(std::fs::read(&outside).unwrap(), b"outside this invocation");
@@ -167,7 +185,9 @@ async fn legacy_baselines_shrink_at_real_durable_publication_boundaries() {
     let mut published = 0;
     let result = session
         .publish_with_observer("docs", move |point, _| {
-            if point == PublicationPoint::PendingDurable || point == PublicationPoint::PublishedDurable {
+            if point == PublicationPoint::PendingDurable
+                || point == PublicationPoint::PublishedDurable
+            {
                 if point == PublicationPoint::PublishedDurable {
                     published += 1;
                 }
@@ -177,8 +197,16 @@ async fn legacy_baselines_shrink_at_real_durable_publication_boundaries() {
                 assert_eq!(phase.published.len(), published);
                 assert_eq!(phase.baseline.len(), 64 - published);
                 assert!(phase.baseline.keys().all(|path| path.starts_with("doc")));
-                assert!(phase.baseline.keys().all(|path| !phase.published.contains_key(path)));
-                assert_eq!(phase.pending.is_some(), point == PublicationPoint::PendingDurable);
+                assert!(
+                    phase
+                        .baseline
+                        .keys()
+                        .all(|path| !phase.published.contains_key(path))
+                );
+                assert_eq!(
+                    phase.pending.is_some(),
+                    point == PublicationPoint::PendingDurable
+                );
                 if let Some((path, _)) = &phase.pending {
                     assert!(phase.baseline.contains_key(path));
                 }
@@ -193,12 +221,21 @@ async fn legacy_baselines_shrink_at_real_durable_publication_boundaries() {
     assert_acknowledged(&session);
     let first_inode = std::fs::metadata(local.join(relative(0))).unwrap().ino();
     // Reload the actual disk recipe while retaining the exact original owner.
-    let mut recovered = RecoverySession { recipe: disk_recipe(&session), writer: session.writer.clone() };
+    let mut recovered = RecoverySession {
+        recipe: disk_recipe(&session),
+        writer: session.writer.clone(),
+    };
     recovered.publish("docs").await.unwrap();
     assert_docs(&recovered, 64);
     assert!(recovered.recipe.phases[0].baseline.is_empty());
-    assert_eq!(std::fs::metadata(local.join(relative(0))).unwrap().ino(), first_inode);
-    assert_eq!(std::fs::read(untouched).unwrap(), b"unrelated old target artifact");
+    assert_eq!(
+        std::fs::metadata(local.join(relative(0))).unwrap().ino(),
+        first_inode
+    );
+    assert_eq!(
+        std::fs::read(untouched).unwrap(),
+        b"unrelated old target artifact"
+    );
     assert!(directory.path().join("journals").exists());
 }
 
@@ -226,7 +263,10 @@ async fn baseline_compaction_failure_restores_selected_and_discarded_entries() {
         let before_disk = std::fs::read(&session.writer.path).unwrap();
         let _publication = lock_output_root(&local).await.unwrap();
         assert!(session.persist_publication_baseline(0, &selected).is_err());
-        assert_eq!(serde_json::to_value(&session.recipe).unwrap(), before_recipe);
+        assert_eq!(
+            serde_json::to_value(&session.recipe).unwrap(),
+            before_recipe
+        );
         assert_eq!(session.writer.snapshot(), before_lease);
         assert_eq!(std::fs::read(&session.writer.path).unwrap(), before_disk);
         assert_eq!(session.recipe.phases[0].baseline.len(), 130);
@@ -243,7 +283,9 @@ async fn published_checkpoint_failure_keeps_its_pending_predecessor_for_retry() 
         let hash = blake3::hash(bytes(0).as_bytes()).to_hex().to_string();
         session.recipe.phases[0].pending = Some((relative(0), hash.clone()));
         if previously_published {
-            session.recipe.phases[0].published.insert(relative(0), "earlier receipt".into());
+            session.recipe.phases[0]
+                .published
+                .insert(relative(0), "earlier receipt".into());
         }
         session.persist().unwrap();
         let before_recipe = serde_json::to_value(&session.recipe).unwrap();
@@ -251,12 +293,24 @@ async fn published_checkpoint_failure_keeps_its_pending_predecessor_for_retry() 
         let before_disk = std::fs::read(&session.writer.path).unwrap();
         let gate = session.writer.path.with_extension("recovery.lock");
         std::fs::hard_link(&gate, directory.path().join("additional-gate-link")).unwrap();
-        let _publication = lock_output_root(&session.recipe.phases[0].local).await.unwrap();
-        assert!(session.persist_published_output(0, relative(0), hash).is_err());
-        assert_eq!(serde_json::to_value(&session.recipe).unwrap(), before_recipe);
+        let _publication = lock_output_root(&session.recipe.phases[0].local)
+            .await
+            .unwrap();
+        assert!(
+            session
+                .persist_published_output(0, relative(0), hash)
+                .is_err()
+        );
+        assert_eq!(
+            serde_json::to_value(&session.recipe).unwrap(),
+            before_recipe
+        );
         assert_eq!(session.writer.snapshot(), before_lease);
         assert_eq!(std::fs::read(&session.writer.path).unwrap(), before_disk);
-        assert_eq!(std::fs::read_to_string(session.recipe.phases[0].local.join(relative(0))).unwrap(), predecessor(0));
+        assert_eq!(
+            std::fs::read_to_string(session.recipe.phases[0].local.join(relative(0))).unwrap(),
+            predecessor(0)
+        );
     }
 }
 
@@ -265,11 +319,21 @@ async fn pending_conflict_cannot_be_rebaselined_or_compacted_into_permission() {
     let _guard = test_guard!();
     let (directory, mut session) = docs(2);
     old_outputs(&mut session, 2, 128);
-    let result = session.publish_with_observer("docs", |point, _| {
-        anyhow::ensure!(point != PublicationPoint::PendingDurable, "stop before rename");
-        Ok(())
-    }).await;
-    assert!(result.unwrap_err().to_string().contains("stop before rename"));
+    let result = session
+        .publish_with_observer("docs", |point, _| {
+            anyhow::ensure!(
+                point != PublicationPoint::PendingDurable,
+                "stop before rename"
+            );
+            Ok(())
+        })
+        .await;
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("stop before rename")
+    );
     let local = session.recipe.phases[0].local.clone();
     let first = local.join(relative(0));
     let prior = directory.path().join("original-predecessor");
@@ -285,7 +349,10 @@ async fn pending_conflict_cannot_be_rebaselined_or_compacted_into_permission() {
     assert!(error.to_string().contains("cannot prove ownership"));
     assert_eq!(std::fs::read(&session.writer.path).unwrap(), before);
     assert_eq!(std::fs::read(&first).unwrap(), b"another writer's output");
-    assert_eq!(session.recipe.phases[0].baseline[&relative(0)], blake3::hash(predecessor(0).as_bytes()).to_hex().to_string());
+    assert_eq!(
+        session.recipe.phases[0].baseline[&relative(0)],
+        blake3::hash(predecessor(0).as_bytes()).to_hex().to_string()
+    );
     assert_acknowledged(&session);
     // Restore only the original owned fixture, keeping the competing output
     // too. The same pending copy can now finish without replaying a compiler.
@@ -299,16 +366,25 @@ async fn pending_conflict_cannot_be_rebaselined_or_compacted_into_permission() {
 #[tokio::test(flavor = "current_thread")]
 async fn cancellation_keeps_compacted_predecessors_until_publication_is_durable() {
     let _guard = test_guard!();
-    for point in [PublicationPoint::PendingDurable, PublicationPoint::Renamed, PublicationPoint::PublishedDurable] {
+    for point in [
+        PublicationPoint::PendingDurable,
+        PublicationPoint::Renamed,
+        PublicationPoint::PublishedDurable,
+    ] {
         let (_directory, mut session) = docs(3);
         old_outputs(&mut session, 3, 128);
         let (ready, started) = tokio::sync::oneshot::channel();
-        let mut publication = Box::pin(session.publish_with_observer("docs", cancellation_gate(point, ready)));
+        let mut publication =
+            Box::pin(session.publish_with_observer("docs", cancellation_gate(point, ready)));
         tokio::select! {
             result = &mut publication => panic!("publication escaped cancellation boundary: {result:?}"),
             started = started => started.unwrap(),
         }
-        assert!(tokio::time::timeout(Duration::from_millis(25), publication).await.is_err());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), publication)
+                .await
+                .is_err()
+        );
         let published = usize::from(point == PublicationPoint::PublishedDurable);
         let phase = &session.recipe.phases[0];
         assert_eq!(phase.baseline.len(), 3 - published);
@@ -316,10 +392,16 @@ async fn cancellation_keeps_compacted_predecessors_until_publication_is_durable(
         assert_eq!(phase.pending.is_some(), published == 0);
         assert!(phase.baseline.keys().all(|path| path.starts_with("doc")));
         if published == 0 {
-            assert_eq!(phase.baseline[&relative(0)], blake3::hash(predecessor(0).as_bytes()).to_hex().to_string());
+            assert_eq!(
+                phase.baseline[&relative(0)],
+                blake3::hash(predecessor(0).as_bytes()).to_hex().to_string()
+            );
         }
         assert_acknowledged(&session);
-        let mut recovered = RecoverySession { recipe: disk_recipe(&session), writer: session.writer.clone() };
+        let mut recovered = RecoverySession {
+            recipe: disk_recipe(&session),
+            writer: session.writer.clone(),
+        };
         recovered.publish("docs").await.unwrap();
         assert_docs(&recovered, 3);
         assert!(recovered.recipe.phases[0].baseline.is_empty());
@@ -339,10 +421,16 @@ async fn selected_destination_symlink_still_refuses_without_pruning_the_journal(
     let before_disk = std::fs::read(&session.writer.path).unwrap();
     let error = session.publish("docs").await.unwrap_err();
     assert!(error.to_string().contains("not a regular file"));
-    assert_eq!(serde_json::to_value(&session.recipe).unwrap(), before_recipe);
+    assert_eq!(
+        serde_json::to_value(&session.recipe).unwrap(),
+        before_recipe
+    );
     assert_eq!(std::fs::read(&session.writer.path).unwrap(), before_disk);
     assert_eq!(std::fs::read_link(&destination).unwrap(), retained);
     assert_eq!(std::fs::read_to_string(&retained).unwrap(), predecessor(0));
-    assert_eq!(std::fs::read_to_string(session.stage(0).join(relative(0))).unwrap(), bytes(0));
+    assert_eq!(
+        std::fs::read_to_string(session.stage(0).join(relative(0))).unwrap(),
+        bytes(0)
+    );
     assert_acknowledged(&session);
 }
