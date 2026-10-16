@@ -466,8 +466,10 @@ mod tests {
             &specification,
             json!({"kind":"canonical-exec", "request_id":91, "program":"rustc",
                 "toolchain_backing":"/tc", "source_files":["lib.rs"],
-                "artifacts":{"unit":"build", "files":["lib.rlib"]}}).to_string(),
-        ).unwrap();
+                "artifacts":{"unit":"build", "files":["lib.rlib"]}})
+            .to_string(),
+        )
+        .unwrap();
         (source, specification)
     }
 
@@ -475,9 +477,14 @@ mod tests {
         // Callers provide stable borrowed paths below; this helper only tests
         // refusals, so its three paths may deliberately share this root.
         PreparedBuild {
-            address: "127.0.0.1:0", worker: "worker", pin: None,
-            bundle: root, directory: root, output: root,
-            mode: DeliveryMode::Execute, resume_from: None,
+            address: "127.0.0.1:0",
+            worker: "worker",
+            pin: None,
+            bundle: root,
+            directory: root,
+            output: root,
+            mode: DeliveryMode::Execute,
+            resume_from: None,
         }
     }
 
@@ -490,20 +497,31 @@ mod tests {
         let delivery = root.join("delivery");
         let output = root.join("output");
         let build = PreparedBuild {
-            bundle: &bundle, directory: &delivery, output: &output,
+            bundle: &bundle,
+            directory: &delivery,
+            output: &output,
             ..preparation_build(&root)
         };
-        build.prepare_from(source.to_str().unwrap(), specification.to_str().unwrap()).unwrap();
+        build
+            .prepare_from(source.to_str().unwrap(), specification.to_str().unwrap())
+            .unwrap();
         let request = build.request().unwrap();
         assert!(request_manifest(&request).unwrap().is_some());
         assert!(request.get("source_files").is_none());
         assert_eq!(request["request_id"], 91);
         fs::write(source.join("lib.rs"), b"changed original").unwrap();
-        assert_eq!(fs::read(bundle.join("source/lib.rs")).unwrap(), b"pub fn value() -> u32 { 42 }\n");
+        assert_eq!(
+            fs::read(bundle.join("source/lib.rs")).unwrap(),
+            b"pub fn value() -> u32 { 42 }\n"
+        );
         assert_eq!(build.request().unwrap(), request);
         assert!(!delivery.exists());
         assert!(!output.exists());
-        assert!(build.prepare_from(source.to_str().unwrap(), specification.to_str().unwrap()).is_err());
+        assert!(
+            build
+                .prepare_from(source.to_str().unwrap(), specification.to_str().unwrap())
+                .is_err()
+        );
         assert_eq!(build.request().unwrap(), request);
     }
 
@@ -519,12 +537,19 @@ mod tests {
             fs::create_dir(root.join(occupied)).unwrap();
             fs::write(root.join(occupied).join("retained"), b"keep").unwrap();
             let build = PreparedBuild {
-                bundle: &bundle, directory: &delivery, output: &output,
+                bundle: &bundle,
+                directory: &delivery,
+                output: &output,
                 ..preparation_build(&root)
             };
-            let error = build.prepare_from(source.to_str().unwrap(), specification.to_str().unwrap()).unwrap_err();
+            let error = build
+                .prepare_from(source.to_str().unwrap(), specification.to_str().unwrap())
+                .unwrap_err();
             assert!(error.to_string().contains("requires new"));
-            assert_eq!(fs::read(root.join(occupied).join("retained")).unwrap(), b"keep");
+            assert_eq!(
+                fs::read(root.join(occupied).join("retained")).unwrap(),
+                b"keep"
+            );
             assert!(!bundle.join("request.json").exists());
         }
     }
@@ -540,8 +565,17 @@ mod tests {
             (DeliveryMode::Execute, "192.0.2.1:1234", None),
             (DeliveryMode::Execute, "127.0.0.1:0", Some("invalid-pin")),
         ] {
-            let build = PreparedBuild { mode, address, pin, ..preparation_build(&root) };
-            assert!(build.prepare_from(missing.to_str().unwrap(), "not-read.json").is_err());
+            let build = PreparedBuild {
+                mode,
+                address,
+                pin,
+                ..preparation_build(&root)
+            };
+            assert!(
+                build
+                    .prepare_from(missing.to_str().unwrap(), "not-read.json")
+                    .is_err()
+            );
             assert!(fs::read_dir(&root).unwrap().next().is_none());
         }
     }
@@ -555,10 +589,14 @@ mod tests {
         let delivery = root.join("delivery");
         let output = root.join("output");
         let build = PreparedBuild {
-            bundle: &bundle, directory: &delivery, output: &output,
+            bundle: &bundle,
+            directory: &delivery,
+            output: &output,
             ..preparation_build(&root)
         };
-        let error = build.prepare_from(source.to_str().unwrap(), specification.to_str().unwrap()).unwrap_err();
+        let error = build
+            .prepare_from(source.to_str().unwrap(), specification.to_str().unwrap())
+            .unwrap_err();
         assert!(error.to_string().contains("overlap the source"));
         assert!(!bundle.exists());
     }
@@ -573,10 +611,16 @@ mod tests {
         let delivery = root.join("delivery");
         let output = root.join("output");
         let build = PreparedBuild {
-            bundle: &bundle, directory: &delivery, output: &output,
+            bundle: &bundle,
+            directory: &delivery,
+            output: &output,
             ..preparation_build(&root)
         };
-        assert!(build.prepare_from(source.to_str().unwrap(), specification.to_str().unwrap()).is_err());
+        assert!(
+            build
+                .prepare_from(source.to_str().unwrap(), specification.to_str().unwrap())
+                .is_err()
+        );
         assert!(!bundle.exists());
         assert!(!delivery.exists());
         assert!(!output.exists());
@@ -585,11 +629,34 @@ mod tests {
     #[test]
     fn prepare_and_resume_flags_are_mutually_exclusive_before_io() {
         for args in [
-            vec!["--prepare-from", "/source", "/spec", "--resume", "127.0.0.1:1", "worker", "/bundle", "/delivery", "/output"],
-            vec!["--prepare-from", "/source", "/spec", "127.0.0.1:1", "worker", "/bundle", "/delivery", "/output", "--resume"],
+            vec![
+                "--prepare-from",
+                "/source",
+                "/spec",
+                "--resume",
+                "127.0.0.1:1",
+                "worker",
+                "/bundle",
+                "/delivery",
+                "/output",
+            ],
+            vec![
+                "--prepare-from",
+                "/source",
+                "/spec",
+                "127.0.0.1:1",
+                "worker",
+                "/bundle",
+                "/delivery",
+                "/output",
+                "--resume",
+            ],
             vec!["--prepare-from", "/source"],
         ] {
-            assert_eq!(run_build(&args.into_iter().map(str::to_owned).collect::<Vec<_>>()), 2);
+            assert_eq!(
+                run_build(&args.into_iter().map(str::to_owned).collect::<Vec<_>>()),
+                2
+            );
         }
     }
 
@@ -674,6 +741,15 @@ mod tests {
         // Neither a rewritten request nor its newly matching source can replace
         // the identity that the daemon accepted earlier.
         fs::write(bundle.join("request.json"), b"not the accepted JSON").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(
+                bundle.join("source/lib.rs"),
+                fs::Permissions::from_mode(0o600),
+            )
+            .unwrap();
+        }
         fs::write(bundle.join("source/lib.rs"), b"changed source").unwrap();
         let pin = "ab".repeat(32);
         let build = PreparedBuild {
