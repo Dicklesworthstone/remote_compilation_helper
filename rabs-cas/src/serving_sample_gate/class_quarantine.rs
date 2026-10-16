@@ -195,19 +195,6 @@ mod tests {
         let culprit = healthy(store, 2, 11);
         assert_eq!(decide(store, 1), SampleGateDecision::ServeFromCache);
 
-        // process_offer's first accepted divergence write is sufficient. No
-        // feedback sample, incident receipt or post-commit callback is needed.
-        for disposition in ["quarantined", "presentation-quarantined"] {
-            store
-                .set_serving_disposition_key(&culprit, disposition)
-                .unwrap();
-            assert_hold(store, 1, &culprit, "serving-quarantine");
-        }
-        store
-            .set_serving_disposition_key(&culprit, "servable")
-            .unwrap();
-        assert_eq!(decide(store, 1), SampleGateDecision::ServeFromCache);
-
         // K008 instead writes the action-entry quarantine first.
         store
             .add_quarantine(QuarantineScope::ActionEntry, &culprit, "interrupted K008")
@@ -251,10 +238,35 @@ mod tests {
         store.differential_snapshot().unwrap()
     }
 
+    /// process_offer's first accepted divergence write is sufficient. No
+    /// feedback sample, incident receipt or post-commit callback is needed. A
+    /// quarantine disposition is sticky (the store refuses to lift it without
+    /// repair), so each disposition gets its own store.
+    fn disposition_scenario(store: &mut dyn RabsMetadataStore, disposition: &str) -> Vec<String> {
+        healthy(store, 1, 10);
+        let culprit = healthy(store, 2, 11);
+        assert_eq!(decide(store, 1), SampleGateDecision::ServeFromCache);
+        store
+            .set_serving_disposition_key(&culprit, disposition)
+            .unwrap();
+        assert_hold(store, 1, &culprit, "serving-quarantine");
+        assert!(matches!(
+            store.set_serving_disposition_key(&culprit, "servable"),
+            Err(StoreError::QuarantineRequiresRepair)
+        ));
+        assert_hold(store, 1, &culprit, "serving-quarantine");
+        store.differential_snapshot().unwrap()
+    }
+
     #[test]
     fn class_demotion_is_enforced_by_the_existing_sample_gate() {
         let mut store = SqlMetadataStore::open(RusqliteEngine::open_in_memory().unwrap()).unwrap();
         interrupted_and_completed_scenarios(&mut store);
+        for disposition in ["quarantined", "presentation-quarantined"] {
+            let mut store =
+                SqlMetadataStore::open(RusqliteEngine::open_in_memory().unwrap()).unwrap();
+            disposition_scenario(&mut store, disposition);
+        }
     }
 
     #[test]
@@ -283,6 +295,18 @@ mod tests {
             interrupted_and_completed_scenarios(&mut reference),
             interrupted_and_completed_scenarios(&mut candidate)
         );
+        for disposition in ["quarantined", "presentation-quarantined"] {
+            let reference_engine =
+                RusqliteEngine::open(&fresh_path(&format!("class-ref-{disposition}"))).unwrap();
+            let candidate_engine =
+                FsqliteEngine::open(&fresh_path(&format!("class-fsq-{disposition}"))).unwrap();
+            let mut reference = SqlMetadataStore::open(reference_engine).unwrap();
+            let mut candidate = SqlMetadataStore::open(candidate_engine).unwrap();
+            assert_eq!(
+                disposition_scenario(&mut reference, disposition),
+                disposition_scenario(&mut candidate, disposition)
+            );
+        }
     }
 
     #[test]
