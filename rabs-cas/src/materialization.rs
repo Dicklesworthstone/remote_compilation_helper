@@ -39,6 +39,9 @@
 //! - mtime adjustments apply only to private materializations (the
 //!   mode carries the permission).
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub mod staged;
+
 use std::io::{Read, Seek};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -88,7 +91,7 @@ pub fn publish_new_directory(staging: &Path, destination: &Path) -> std::io::Res
         let target = destination.file_name().ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                "output directory needs a name",
+                "destination directory needs a name",
             )
         })?;
         if !std::fs::symlink_metadata(staging)?.is_dir() {
